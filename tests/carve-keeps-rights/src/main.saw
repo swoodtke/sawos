@@ -1,0 +1,78 @@
+// A carved window carries its parent handle's rights (spec §2.5, §3).
+//
+// The parent is a sibling that keeps `Carve` and drops `Map`. A window carved
+// from it, and a window carved from that window, must not be mappable: a
+// handle narrowed to forbid installing a window could not regain the right by
+// carving.
+//
+//   SOS carvekeep: minted a sibling without Map
+//   SOS carvekeep: the window carves again          <- it is a live handle
+//   SOS carvekeep: asking to map the carved window
+//   SOS: process fault: access denied
+//
+// The second carve is the control: a window that could not be used at all
+// would produce the same refusal for the wrong reason. The refusal is a fault,
+// so it is the last thing this program does.
+
+import sos.{System, Process, IoMemory, Mapping, IoMemoryRight, SosStatus}
+
+/// The console page's length, the same on both boards.
+static WINDOW_LEN: UInt = 0x1000
+
+/// `Carve` is kept; `Map` is absent by silence.
+static NARROW: UInt32 = IoMemoryRight.Carve
+
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS carvekeep: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var record = try proc.boot_handle_next() catch {
+        print("SOS carvekeep: no device window: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let window = record.take_iomemory() else {
+        let _ = system.debug_print("SOS carvekeep: boot record is not a window\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try window.mint(rights: NARROW) catch {
+        print("SOS carvekeep: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS carvekeep: minted a sibling without Map\n")
+
+    let first = try narrow.carve(offset: 0, len: WINDOW_LEN) catch {
+        print("SOS carvekeep: first carve failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let second = try first.carve(offset: 0, len: WINDOW_LEN) catch {
+        print("SOS carvekeep: second carve failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS carvekeep: the window carves again\n")
+
+    let _ = system.debug_print("SOS carvekeep: asking to map the carved window\n")
+    match proc.map(iomemory: &second) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS carvekeep: UNREACHABLE mapped\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS carvekeep: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = system.shutdown(EXIT_FAILED)
+}

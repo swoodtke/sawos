@@ -1,0 +1,89 @@
+// Narrowing composes through a chain of splits (spec §2.5, §3).
+//
+// The sibling keeps `Split` and `Map` and drops `MapExecute`. A piece is cut
+// from it and a second piece from that one; the second piece still cannot map
+// executable, because each split hands on the rights of the handle it was
+// invoked through.
+//
+//   SOS splittwice: minted a sibling without MapExecute
+//   SOS splittwice: the piece of a piece maps read-write
+//   SOS splittwice: asking for execute through it
+//   SOS: process fault: access denied
+
+import sos.{System, Process, Memory, Mapping, MapAccess, MemoryRight,
+            SosStatus}
+
+static CHUNK: UInt = 0x1000
+
+static RX: UInt32 = MapAccess.Read | MapAccess.Execute
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// `Split` and `Map` are kept; `MapExecute` is absent by silence.
+static NARROW: UInt32 = (MemoryRight.Split | MemoryRight.Map)
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS splittwice: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS splittwice: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print("SOS splittwice: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // Two pages, so the first piece has a second to give.
+    let region = try pool.split(len: CHUNK * 2) catch {
+        print("SOS splittwice: split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try region.mint(rights: NARROW) catch {
+        print("SOS splittwice: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS splittwice: minted a sibling without MapExecute\n")
+
+    let first = try narrow.split(len: CHUNK * 2) catch {
+        print("SOS splittwice: first split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let second = try first.split(len: CHUNK) catch {
+        print("SOS splittwice: second split failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _data = try proc.map(memory: &second, access: RW) catch {
+        print("SOS splittwice: mapping read-write failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS splittwice: the piece of a piece maps read-write\n")
+
+    let _ = system.debug_print("SOS splittwice: asking for execute through it\n")
+    match proc.map(memory: &second, access: RX) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS splittwice: UNREACHABLE mapped executable\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS splittwice: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

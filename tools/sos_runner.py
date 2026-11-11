@@ -391,6 +391,12 @@ CHILD_PLACED_PKG = os.path.join(TESTS_DIR, "child-placed")
 CHILD_SHARE_PKG = os.path.join(TESTS_DIR, "child-share")
 MAP_EXEC_GATED_PKG = os.path.join(TESTS_DIR, "map-exec-gated")
 MAP_WX_REFUSED_PKG = os.path.join(TESTS_DIR, "map-wx-refused")
+# A derived piece or window carries its parent handle's rights: a narrowed
+# parent never yields a wider child.
+SPLIT_KEEPS_RIGHTS_PKG = os.path.join(TESTS_DIR, "split-keeps-rights")
+SPLIT_KEEPS_RIGHTS_TWICE_PKG = os.path.join(TESTS_DIR,
+                                            "split-keeps-rights-twice")
+CARVE_KEEPS_RIGHTS_PKG = os.path.join(TESTS_DIR, "carve-keeps-rights")
 
 # A typed `mint(rights:)` narrows, and the withheld right is refused. Each is
 # its own image because the refusal is a fault, which ends the process.
@@ -3841,6 +3847,60 @@ TEST_CASES = [
                        "SOS: process teardown handles={eight} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A `Split` piece carries its parent handle's rights. The parent keeps
+        # `Split` and `Map` and drops `MapExecute`, which `map_exec_gated`
+        # cannot reach because it drops `Split` too. The piece maps read-write
+        # (the control) and is refused execute.
+        "name": "split_keeps_rights",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SPLIT_KEEPS_RIGHTS_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS splitkeep: minted a sibling without MapExecute",
+                       "SOS splitkeep: the piece maps read-write",
+                       "SOS splitkeep: asking for execute through the piece",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The narrowing survives a second split: a piece of a piece is still
+        # refused execute.
+        "name": "split_keeps_rights_twice",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SPLIT_KEEPS_RIGHTS_TWICE_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS splittwice: minted a sibling without MapExecute",
+                       "SOS splittwice: the piece of a piece maps read-write",
+                       "SOS splittwice: asking for execute through it",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A `Carve` window carries its parent handle's rights. The parent keeps
+        # `Carve` and drops `Map`; a window carved from it, and one carved from
+        # that, are live (the second carve) and are refused a map.
+        "name": "carve_keeps_rights",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CARVE_KEEPS_RIGHTS_PKG,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS carvekeep: minted a sibling without Map",
+                       "SOS carvekeep: the window carves again",
+                       "SOS carvekeep: asking to map the carved window",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
     },

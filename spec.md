@@ -830,6 +830,8 @@ tag-to-meaning config is, and where a driver's `UART_BASE` comes from.
   cursor, so a piece is allocated once and unavailable until freed.
   Arbitrary-offset carving is refused by the shape rather than by a check,
   since one `{base, len}` slot cannot hold two remainders.
+  The piece is minted with the rights of the handle the split went through,
+  not the kind's default set (§3).
 - **`map(process, access)` installs a protection row and answers with a
   `Mapping`.** It spends `MemoryRight.Map` on the region and `ProcessRight.Map`
   on the target, because possession of bytes must not imply authority over an
@@ -852,11 +854,9 @@ tag-to-meaning config is, and where a driver's `UART_BASE` comes from.
   is monotonic, so a bit not minted at boot could never appear later, and the
   narrowing is a holder's `MINT_OP` keep mask (a launcher writes "this child
   may map its RAM and may never map it executable" with
-  `Memory.mint(rights:)` before the region travels). Not yet enforced: a
-  `Split` piece is minted with `memory_rights()` whatever the parent handle
-  carried (and a `Carve` window with `iomemory_rights()`), so the mask must
-  also drop `MemoryRight.Split` for the policy to hold. A piece is to carry
-  its parent handle's rights.
+  `Memory.mint(rights:)` before the region travels). A `Split` piece carries the
+  rights of the handle the split went through, so a mask that keeps `Split`
+  while dropping `MapExecute` yields pieces that cannot map executable either.
 - **No row is both writable and executable.** `Write | Execute` in one access
   word is a caller-checkable `BadArg` fault, beside the write-without-read
   refusal. It costs nothing expressible,
@@ -887,6 +887,9 @@ beside the universal pair.
 - `IoMemoryOp.Map` takes no access argument at all, so execute-on-device is
   refused vocabulary and there is no `IoMemoryRight.MapExecute`; the
   executable gate does not apply to the kind, by construction.
+- A carved window is minted with the rights of the handle the carve went
+  through, not the kind's default set (§3): a window cut from a handle that
+  dropped `Map` or `Transfer` cannot be mapped or given either.
 - `iomemory_rights()` mints `Transfer`, so a launcher can `give` a driver
   child its device window (`give(iomemory:)`), and the child maps it into
   itself (§9). The kernel's `boot_kind_of` has its `IoMemory` arm for the
@@ -1909,7 +1912,10 @@ Not yet enforced:
 - **Attenuation is monotonic**: any derivation may only strip rights, never add.
   A process's rights ceilings (§2.7) are a second monotonic bound, on what the
   kernel mints into its table from nothing: they only narrow, and a child
-  starts with its creator's.
+  starts with its creator's. An op that derives a new object of the same kind
+  from a held handle (`Memory.Split`, `IoMemory.Carve`) mints it with that
+  handle's rights, so a piece or a carved window is never wider than its
+  parent handle.
   The only rights source is the boot handle set given to the root server, so
   every rights word in the machine is a subset of one of those, reached by some
   path of mints and gives (a statement about the syscall path; a flat-tier
