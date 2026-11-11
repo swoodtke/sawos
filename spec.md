@@ -852,7 +852,11 @@ tag-to-meaning config is, and where a driver's `UART_BASE` comes from.
   is monotonic, so a bit not minted at boot could never appear later, and the
   narrowing is a holder's `MINT_OP` keep mask (a launcher writes "this child
   may map its RAM and may never map it executable" with
-  `Memory.mint(rights:)` before the region travels).
+  `Memory.mint(rights:)` before the region travels). Not yet enforced: a
+  `Split` piece is minted with `memory_rights()` whatever the parent handle
+  carried (and a `Carve` window with `iomemory_rights()`), so the mask must
+  also drop `MemoryRight.Split` for the policy to hold. A piece is to carry
+  its parent handle's rights.
 - **No row is both writable and executable.** `Write | Execute` in one access
   word is a caller-checkable `BadArg` fault, beside the write-without-read
   refusal. It costs nothing expressible,
@@ -1128,7 +1132,8 @@ three groups:
 **The default set.** One Process default set serves all three minters (root's,
 `ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout:
 `ThreadCreate`, `ThreadSelf`, `Exit`, `Wait`, `EventCreate`, `WaiterCreate`,
-`Start`, `BootHandles`, `Give`, `Map`, `PipeCreate` and `Stats`, plus the
+`Start`, `BootHandles`, `Give`, `Map`, `PipeCreate`, `Stats` and
+`RestrictRights` (below), plus the
 universal `Transfer | Mint`. A launcher keeps the child's handle — it is what
 supervises with — and the child derives its own authority from the masked System
 handle it was given (§12), so supervision and self-management are not
@@ -1136,6 +1141,76 @@ alternatives.
 `Process.mint(rights:)` makes each bit attenuable at the typed tier: a
 supervisor may be handed a sibling that learns whether its child is alive and
 may not watch it work.
+
+**Rights ceilings.** Every process carries one rights ceiling per object kind,
+and **every handle the kernel mints into its table is capped by the ceiling for
+the handle's kind**, with two exceptions. A capped handle's rights are the
+rights the op would otherwise mint (a kind's default set, or what the op
+derives), the ceiling and any keep mask the op takes, intersected. The rule is
+stated by result: whatever a mint produces that the process does not already
+hold is bounded by its ceiling. That covers:
+
+- the getters (`ProcessSelf`, `ThreadSelf`, `ClockGet`);
+- the creation ops, through any Process handle (the ceiling is the table the
+  handle lands in, so a cross-process create is capped by the caller's);
+- `SystemOp.ProcessCreate`'s handle on the new process, and
+  `SystemOp.InterruptBind`;
+- the ops that mint a new object from a held one: `Memory.Split`,
+  `IoMemory.Carve` and `Memory.Map`'s Mapping;
+- the handles a pipe mints for the protocol: the claim `Post` returns and the
+  obligation `Take` delivers;
+- every later op that mints.
+
+The two exceptions:
+
+- **A handle the process receives** (a give, a message's carried handles, a
+  boot record) arrives with the rights its sender chose. The sender narrowed
+  it, so capping it again would only make a give lie about what it gave.
+- **A sibling `MINT_OP` derives** from a handle the process holds is a subset
+  of that handle already.
+
+A ceiling therefore bounds what a process can obtain from the kernel, not what
+it can be given.
+
+**A ceiling may leave no rights.** If the intersection is empty, the op still
+succeeds and the handle carries no rights. It names its object and nothing more.
+A ceiling caps what a mint carries; it is not the authority to mint. That
+authority is the op's own right on the handle used (`ProcessRight.EventCreate`
+and the rest, §2.7's default set), and a launcher withdraws it by narrowing the
+child's Process ceiling, which caps the Process handle the child derives through
+`ProcessSelf`.
+
+- **Narrowing.** `ProcessOp.RestrictRights(kind, mask)` sets the named
+  process's ceiling for `kind` to the old ceiling intersected with `mask`. It
+  is gated by `ProcessRight.RestrictRights` on the handle used.
+  - It only narrows, so it is valid at any time, before or after `Start`. It
+    changes future mints and never an existing handle.
+  - A launcher applies it through its child's handle. A process may apply it to
+    itself through its own, the privilege-drop shape `process_self`'s keep mask
+    has for the Process kind alone.
+  - Through a `Gone` process's handle it answers `Revoked` (§2.10).
+  - A kind the op does not know is a `BadArg` fault.
+- **Inheritance.** A new process's ceilings are its creator's, intersected with
+  those of an optional **ceiling source**: a Process handle passed to
+  `ProcessCreate` (§2.8). The intersection means naming a source can only
+  restrict, so any handle naming the source process serves, whatever its rights.
+  A spawn service that creates a child on a client's behalf names the client,
+  and the child is held to the client's ceilings as well as the service's. A
+  client that hands its own Process handle to such a service should hand it a
+  `MINT_OP` sibling narrowed to no rights: the handle serves as a ceiling source
+  with none, and a full-rights one would also give the service `RestrictRights`,
+  `Map`, `Give` and the rest over the client. A source naming a `Gone` process
+  answers `Revoked`, with nothing created. Root's ceilings are unrestricted.
+- **Where it lives.** The ceilings are part of the body, because only a live
+  process mints. A `Gone` process has none to read, which is why a `Gone`
+  source and a `RestrictRights` through a `Gone` handle answer `Revoked`.
+- **No relation is recorded.** The kernel keeps no parent or child (§5.3):
+  inheritance happens once, at the create, and a spawn service that wants a
+  process tree records one itself.
+
+Not yet enforced: no process has ceilings. Every mint takes the kind's default
+set (and the keep mask, where the op has one). `ProcessOp.RestrictRights`,
+`ProcessRight.RestrictRights` and `ProcessCreate`'s ceiling source do not exist.
 
 **`Give` — the courier op.** `give(handle, tag:)` on the child's handle, gated
 by `ProcessRight.Give` there plus the universal `Transfer` right on the handle
@@ -1344,7 +1419,7 @@ a whole.
 | `Shutdown(status)` | `SystemRight.Shutdown` | stops the machine (QEMU: `sifive_test` on Profile A, semihosting on Profile B) |
 | `ProcessSelf` | `SystemRight.ProcessSelf` | mints the caller's own Process handle, narrowed by a keep mask |
 | `ClockGet` | `SystemRight.ClockGet` | mints a Clock handle (§2.6) |
-| `ProcessCreate` | `SystemRight.ProcessCreate` | creates an inert process (§8, §12) |
+| `ProcessCreate` | `SystemRight.ProcessCreate` | creates an inert process (§8, §12); an optional Process handle names a ceiling source the child's rights ceilings are intersected with (§2.7; not yet enforced) |
 | `InterruptBind(line)` | `SystemRight.InterruptBind` | binds an interrupt line to a new Interrupt (§9) |
 | `SlabDonate` | `SystemRight.SlabDonate` | donates a `Memory` region to a kind's slab |
 | `TierGet` | `SystemRight.TierGet` | answers the protection tier (§5b.1) |
@@ -1359,11 +1434,12 @@ a whole.
   takes a keep mask, intersected with the one Process default set (§2.7), so a
   process can narrow the Process handle it derives at the moment it derives it
   — a driver that has made its Waiter dropping the authority to make another,
-  a plugin deriving a handle that cannot start children. The addressee is the
-  deriver, not the launcher: a keep mask on this op is a process narrowing
-  itself, which is the privilege-drop shape a capability system should have,
-  and the launcher's lever remains its mask on the System handle. It is
-  fail-closed like every keep mask: a bit the default set lacks is ignored.
+  a plugin deriving a handle that cannot start children. The keep mask is the
+  deriver's own: a process narrowing itself, the privilege-drop shape a
+  capability system should have. The launcher's levers are its mask on the
+  System handle it gives and the child's rights ceilings (§2.7), which cap
+  what this op can mint whatever mask the child passes. It is fail-closed like
+  every keep mask: a bit the default set lacks is ignored.
 - **`root_system_rights()` includes `Transfer`**, so a launcher mints a masked
   sibling of its System handle (`MINT_OP`, §3) and gives that to a child. A
   child therefore bootstraps exactly as root does (§12): System in the first
@@ -1831,6 +1907,9 @@ Not yet enforced:
   authority over a line is exactly one handle, which moves by `Transfer` and is
   never copied, and releasing it unbinds the line (§2.10).
 - **Attenuation is monotonic**: any derivation may only strip rights, never add.
+  A process's rights ceilings (§2.7) are a second monotonic bound, on what the
+  kernel mints into its table from nothing: they only narrow, and a child
+  starts with its creator's.
   The only rights source is the boot handle set given to the root server, so
   every rights word in the machine is a subset of one of those, reached by some
   path of mints and gives (a statement about the syscall path; a flat-tier
@@ -3267,7 +3346,9 @@ processes (§2.5).
   register, derive its own Process object from it, drain its boot set from
   there. So the kernel has one way in for every process, which is the same
   claim loader-above-boot makes about images, and the differences between root
-  and a child are entirely in a rights word. The launcher keeps the child's
+  and a child are entirely in rights: the masked System handle it is given,
+  and the rights ceilings it inherits and its launcher may narrow before or
+  after `start` (§2.7; not yet enforced). The launcher keeps the child's
   Process handle, so it supervises (`get_status`, and the death wait, §8) while
   the child manages itself. What the mask withholds is enforced at run time by
   the ordinary rights check — a child that asks to `shutdown` is
