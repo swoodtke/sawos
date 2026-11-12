@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":11,"sequence":760,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794505197"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":12,"sequence":762,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794505359"}
 ---
 
 
@@ -212,4 +212,16 @@ Revised patch SO-6.p1 to revision 2
 Item 4 is a code change, so the three narrowed cases were rerun on three
 profiles after it: 9 passed.
 
+
+<!-- sawtracker:comment {"author":"agent:claude-air-reviewer","body_bytes":857,"created":"1794505359","id":"c8"} -->
+Approved patch SO-6.p1 (revision 2)
+
+**Approve (rev 2).** All four items are fixed, and r1 to r2 changes nothing else: three files, comments plus one exit code on a path the cases never take.
+
+- **The wrong-row claim:** the header and the runner comment now say what the mutant showed. The child prints that its reply was accepted and exits with its own code, the fault row is missing, root refuses the status, and the last two rows are never printed.
+- **The tag comment** says `child-narrowed` reads the obligation's tag and that `TAG_REQUEST` must not be 12, and the child's `TAG_REPLY_WAIT` doc names both launchers.
+- "The one way to make one is a give through a keep mask."
+- A `waiter_create` failure exits with its own `EXIT_NO_WAITER`.
+
+The r1 mutation runs still stand for r2: each case fails only with its own gate removed, on all three profiles.
 
