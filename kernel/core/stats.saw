@@ -33,7 +33,8 @@ import hal
 
 import sosabi.{StatsRow, StatsRegionHeader, STATS_REGION_VERSION,
                PROCESS_STATS_RECORD_DOUBLEWORDS, PROCESS_STATS_SYSCALLS_SLOT,
-               PROCESS_STATS_INTERRUPTS_SLOT, PROCESS_STATS_FAULTS_SLOT}
+               PROCESS_STATS_INTERRUPTS_SLOT, PROCESS_STATS_FAULTS_SLOT,
+               PROCESS_STATS_PID_SLOT}
 
 import kcore.mem.{align_up}
 import kcore.diag.{fatal_kernel}
@@ -46,7 +47,7 @@ import kcore.diag.{fatal_kernel}
 // other by the asserts below. A reader overlays `sosabi`'s `StatsRegionHeader`
 // / `StatsRow` and reads by field name, while the writer is the trap path,
 // which must touch one doubleword per trap: a typed read-modify-write of a
-// whole row would be three loads and three stores where one of each will do, on
+// whole row would be four loads and four stores where one of each will do, on
 // the hottest path in the kernel. So the write side indexes by the slot
 // constants `sosabi` publishes for the copy-out record, the same names
 // describing the same layout.
@@ -202,17 +203,19 @@ public(package) func stats_bump(row: Int, column: Int) unsafe {
     STATS_STORAGE[at] = STATS_STORAGE[at] + 1
 }
 
-/// Read `row`'s three columns out of the region: what `ProcessOp.Stats` answers
+/// Read `row`'s four columns out of the region: what `ProcessOp.Stats` answers
 /// with, from the one storage rather than from a copy of it.
 public(package) func stats_read(row: Int) unsafe -> StatsRow {
     if not row_ok(row) {
         fatal_kernel("stats were asked for a process body with no row", row as UInt)
-        return StatsRow(syscalls: 0, interrupts: 0, faults: 0)
+        return StatsRow(syscalls: 0, interrupts: 0, faults: 0, pid: 0)
     }
     let first = stats_first()
     StatsRow(syscalls: STATS_STORAGE[column_at(first, row, PROCESS_STATS_SYSCALLS_SLOT)],
              interrupts: STATS_STORAGE[column_at(first, row, PROCESS_STATS_INTERRUPTS_SLOT)],
-             faults: STATS_STORAGE[column_at(first, row, PROCESS_STATS_FAULTS_SLOT)])
+             faults: STATS_STORAGE[column_at(first, row,
+                                             PROCESS_STATS_FAULTS_SLOT)],
+             pid: STATS_STORAGE[column_at(first, row, PROCESS_STATS_PID_SLOT)])
 }
 
 /// Zero `row`'s columns. A process create does this so a reused body never
@@ -227,6 +230,17 @@ public(package) func stats_clear(row: Int) unsafe {
     STATS_STORAGE[column_at(first, row, PROCESS_STATS_SYSCALLS_SLOT)] = 0
     STATS_STORAGE[column_at(first, row, PROCESS_STATS_INTERRUPTS_SLOT)] = 0
     STATS_STORAGE[column_at(first, row, PROCESS_STATS_FAULTS_SLOT)] = 0
+}
+
+/// Write `pid` into `row`'s pid column: the process now occupying the body.
+/// A create does this after `stats_clear`, and the death leaves it in place.
+public(package) func stats_name(row: Int, pid: UInt64) unsafe {
+    if not row_ok(row) {
+        fatal_kernel("a pid was written to a process body with no stats row",
+                     row as UInt)
+        return
+    }
+    STATS_STORAGE[column_at(stats_first(), row, PROCESS_STATS_PID_SLOT)] = pid
 }
 
 // =============================================================================

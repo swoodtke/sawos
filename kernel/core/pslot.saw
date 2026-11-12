@@ -194,6 +194,12 @@ public(package) struct ProcessRecord {
     /// The spec §8 status word's two halves, written at the death.
     public(package) exit_kind: ProcessStatusKind,
     public(package) exit_code: UInt,
+    /// This process's pid (spec §2.7): assigned from the kernel's counter when
+    /// the record is taken and never zero while a process holds the record.
+    /// A record that is free holds zero, because the reclaim clears it, so a
+    /// pid that was once assigned is held by no record after its process's
+    /// record is reclaimed.
+    public(package) pid: UInt64,
     /// What this process has spent, by `QuotaKind`. The record sits below
     /// `kcore.objects` so `mint_handle` can charge and `unbind_handle` can
     /// credit the `Handle` row.
@@ -232,7 +238,8 @@ public(package) struct ProcessRecord {
     /// region (`kcore.stats`), keyed by the body's index, and nothing is
     /// written here. The teardown copies that row in as the body goes, after
     /// which nothing is charged to the process, so `ProcessOp.Stats` through a
-    /// `Gone` process's handle reads a final answer.
+    /// `Gone` process's handle reads a final answer. The copy's pid column is
+    /// the row's; `ProcessOp.Stats` answers the record's `pid` instead.
     public(package) final_stats: StatsRow,
     /// The body this process runs in, plus one; 0 = no body.
     ///
@@ -334,11 +341,12 @@ public(package) struct ProcessBody {
 public(package) unsafe static var PROCESS_RECORDS: Slab<ProcessRecord, MAX_PROCESS_RECORDS> = Slab<ProcessRecord, MAX_PROCESS_RECORDS>(
     inline: [ProcessRecord(state: ProcessState.Free,
                            exit_kind: ProcessStatusKind.Running, exit_code: 0,
+                           pid: 0,
                            quota_used: [0; QUOTA_KINDS],
                            quota_limit: [0; QUOTA_KINDS],
                            refs: 0, attachment: 0,
                            final_stats: StatsRow(syscalls: 0, interrupts: 0,
-                                                 faults: 0),
+                                                 faults: 0, pid: 0),
                            body_link: 0); MAX_PROCESS_RECORDS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],

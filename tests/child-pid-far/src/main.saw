@@ -1,0 +1,134 @@
+// Test child: the far end of a forwarded request, for the pid cases.
+//
+// A middle process was asked by root and forwarded the obligation in a
+// message. This process is sent that message and holds two obligations: the
+// one the forwarding message arrived with, whose sender is the middle, and the
+// one it carried, whose sender is root, the client that asked.
+//
+// It asks each for its sender handle and checks the pids against the message:
+//
+//   - the message names the middle, the immediate sender, and not root;
+//   - the sender handle on the obligation the message arrived with names the
+//     same process the message names. The middle calls and so is still alive,
+//     which is what makes the handle obtainable here rather than `Revoked`;
+//   - the sender handle on the forwarded obligation names root, whose pid is 1
+//     and whom this process has never heard from.
+//
+// Then it answers the forwarded request with the pid the message named, and the
+// message itself with an empty reply. The verdict travels in the §8 exit code;
+// this child prints nothing.
+
+import sos.{System, Process, PipeOutlet, PipeRequest, PipeHandle, PipeMsg,
+            Waiter, WaitResult, WaitPayload, AttachMode, BootHandle, SosStatus,
+            PIPE_BODY_BYTES}
+
+/// Every check held and the forwarded request was answered.
+static EXIT_ANSWERED: UInt = 81
+/// The boot set held no outlet where its launcher's config says one is.
+static EXIT_NO_OUTLET: UInt = 82
+/// A call that should not have been refused was.
+static EXIT_REFUSED: UInt = 83
+/// The message carried no obligation, or one of another kind.
+static EXIT_NO_HANDLE: UInt = 84
+/// A pid was not the one it should have been.
+static EXIT_BAD_PIDS: UInt = 85
+
+/// Root's pid, the one pid a program may know in advance.
+static ROOT_PID: UInt64 = 1
+
+static KEY_OUTLET: UInt = 6
+
+/// Bytes of a pid in an answer.
+static PID_BYTES: Int = 8
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        return
+    }
+
+    let code = try answer(&proc) catch {
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+    let _ = proc.exit(code)
+}
+
+func answer(proc: &Process) -> Result<UInt, SosStatus> {
+    var rec = try proc.boot_handle_next()
+    guard let outlet = rec.take_outlet() else { return EXIT_NO_OUTLET }
+
+    let waiter = try proc.waiter_create()
+    try waiter.give(outlet: move outlet, key: KEY_OUTLET,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    let wake = try waiter.wait()
+    let (_, what) = (move wake).open()
+    match what {
+        case Message(m, r) -> {
+            var msg = move m
+            let own = move r
+            guard let carried = msg.handles[0].take() else {
+                let _ = move own
+                let _ = move msg
+                return EXIT_NO_HANDLE
+            }
+            let middle = msg.sender
+            let _ = move msg
+            match carried {
+                case Request(rq) -> {
+                    let forwarded = move rq
+                    let good = try pids_hold(&own, &forwarded, middle)
+                    // The answer carries the pid the message named, least
+                    // significant byte first, so root can compare it with the
+                    // middle's. Then the message's own obligation is answered,
+                    // which lets the middle, parked in its call, end.
+                    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+                    var at: Int = 0
+                    while at < PID_BYTES {
+                        let shifted = middle >> ((at * 8) as UInt64)
+                        body[at] = (shifted & 255) as UInt8
+                        at = at + 1
+                    }
+                    try (move forwarded).reply(body: &body,
+                                               len: PID_BYTES as UInt)
+                    var none: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+                    try (move own).reply(body: &none, len: 0)
+                    if good {
+                        return EXIT_ANSWERED
+                    }
+                    return EXIT_BAD_PIDS
+                },
+                case _ -> {
+                    let _ = move own
+                    return EXIT_NO_HANDLE
+                },
+            }
+        },
+        case _ -> { return EXIT_NO_HANDLE },
+    }
+}
+
+/// The checks in the header, with `middle` the pid the message named. The
+/// middle is parked in its call until `own` is answered, so it is alive and the
+/// sender handle on `own` must be had and must name it.
+func pids_hold(own: &PipeRequest, forwarded: &PipeRequest,
+               middle: UInt64) -> Result<Bool, SosStatus> {
+    if middle == 0 || middle == ROOT_PID {
+        return false
+    }
+    let beside = try own.sender()
+    let beside_stats = try beside.stats()
+    if beside_stats.pid != middle {
+        return false
+    }
+    let origin = try forwarded.sender()
+    let origin_stats = try origin.stats()
+    return origin_stats.pid == ROOT_PID
+}

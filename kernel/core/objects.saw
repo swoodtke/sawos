@@ -1852,6 +1852,19 @@ public(package) struct Exchange {
     /// so this field is the whole of how it is reachable. That is why
     /// `exchange_settle` asserts it is clear.
     public(package) caller: Int,
+    /// The pid of the process that sent the message this slot holds: the
+    /// request's sender, then the replier once a reply has been written.
+    ///
+    /// Written by the op that sends, from the record of the process making it
+    /// (`stamp_sender`), and handed over with the message by every door that
+    /// delivers one. It is not a reference: the sender's record may be
+    /// reclaimed while the message is staged.
+    public(package) sender_pid: UInt64,
+    /// The index of that process's record, beside the pid. Only meaningful
+    /// together with it: the record at this index is the sender's if it is
+    /// live and still holds `sender_pid`, and a reclaimed or reused record
+    /// fails that test (`sender_alive`).
+    public(package) sender_rec: Int,
     /// The staged list's link: the next staged exchange in this connection,
     /// plus one, or zero at the end. Only ever appended at the tail and removed
     /// at the head (a take), or cleared whole (the outlet's zero-arm), so it is
@@ -1892,7 +1905,7 @@ extension Exchange {
 public(package) unsafe static var EXCHANGES: Slab<Exchange, PIPE_EXCHANGES> = Slab<Exchange, PIPE_EXCHANGES>(
     inline: [Exchange(state: ExchangeState.Free, len: 0, reply_refs: 0,
                       request_refs: 0, reply_attach: 0, request_attach: 0,
-                      caller: 0, next: 0,
+                      caller: 0, sender_pid: 0, sender_rec: 0, next: 0,
                       held: [StagedRef(obj_type: ObjType.Unbound, rights: 0,
                                        target: 0); PIPE_MSG_HANDLES],
                       body: [0; PIPE_BODY_BYTES]);
@@ -1902,6 +1915,33 @@ public(package) unsafe static var EXCHANGES: Slab<Exchange, PIPE_EXCHANGES> = Sl
     ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
     total: PIPE_EXCHANGES)
+
+/// Record that process `p` sent the message exchange `x` now holds.
+///
+/// Called by each op that sends, with the process whose thread made the op (a
+/// parked call's caller, not whoever is current when it is staged). Neither
+/// field is a counted reference.
+public(package) func stamp_sender(x: Int, p: Int) unsafe {
+    EXCHANGES[x].sender_pid = PROCESS_RECORDS[p].pid
+    EXCHANGES[x].sender_rec = p
+}
+
+/// Is exchange `x`'s sender still a live process?
+///
+/// The record at the stored index must be neither free nor `Gone` and must
+/// still hold the stored pid. A reclaimed record holds no pid and a reused one
+/// holds another, so both fail like a dead one.
+public(package) func sender_alive(x: Int) unsafe -> Bool {
+    let r = EXCHANGES[x].sender_rec
+    if PROCESS_RECORDS[r].pid != EXCHANGES[x].sender_pid {
+        return false
+    }
+    match PROCESS_RECORDS[r].state {
+        case Created -> true,
+        case Running -> true,
+        case _ -> false,
+    }
+}
 
 /// How many references exchange `x` is holding.
 ///
@@ -2189,6 +2229,8 @@ public(package) func exchange_settle(x: Int) unsafe -> StagedRefs {
     EXCHANGES[x].reply_refs = 0
     EXCHANGES[x].request_refs = 0
     EXCHANGES[x].len = 0
+    EXCHANGES[x].sender_pid = 0
+    EXCHANGES[x].sender_rec = 0
     EXCHANGES[x].next = 0
 
     let c = exchange_pipe(x)

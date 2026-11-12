@@ -1,0 +1,151 @@
+// The pid column of the stats region's rows (spec §2.7).
+//
+// A row is the stats record's own layout, so its fourth column names the
+// process occupying the body. Root maps the region and reads every row,
+// matching them against the pids `Process.stats()` answers:
+//
+//   SOS pidrow: root's row names root         the caller's own row carries the
+//                                             pid root reads through `Stats`,
+//                                             and it is 1
+//   SOS pidrow: a created process's row names it
+//                                             exactly one row carries the
+//                                             child's pid, written by the
+//                                             create
+//   SOS pidrow: a body no process occupied reads zero
+//                                             zero is never a pid, so an
+//                                             unoccupied row is told apart
+//   SOS pidrow: the row keeps its pid after the death
+//                                             the dead child's body is free
+//                                             and its row is not cleared
+//   SOS pidrow: a create reuses the body and renames the row
+//                                             the next process lands in that
+//                                             body, and no row carries the
+//                                             dead one's pid any more
+//   SOS pidrow: done
+//
+// No pid's number is asserted beyond root's 1. The case never says which row
+// is which beyond root's own: rows are keyed by body, and a body is the
+// kernel's index.
+
+import sos.{System, Process, Memory, StatsRegion, Waiter, SosStatus,
+            SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static ROOT_PID: UInt64 = 1
+static TAG_BOOT: UInt = 21
+static KEY_DEATH: UInt = 6
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pidrow: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS pidrow: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS pidrow: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    let region = try system.stats_region_map()
+    let mine = try proc.stats()
+    if mine.pid != ROOT_PID || region.mine().pid != ROOT_PID {
+        return BUG
+    }
+    let _ = system.debug_print("SOS pidrow: root's row names root\n")
+
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    let child_stats = try child.stats()
+    let pid = child_stats.pid
+    if pid == 0 || pid == ROOT_PID || rows_naming(&region, pid) != 1 {
+        return BUG
+    }
+    let _ = system.debug_print("SOS pidrow: a created process's row names it\n")
+
+    if rows_naming(&region, 0) < 1 {
+        return BUG
+    }
+    let _ = system.debug_print(
+        "SOS pidrow: a body no process occupied reads zero\n")
+
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    try wait_for_death(&proc, &child)
+    if rows_naming(&region, pid) != 1 {
+        return BUG
+    }
+    let _ = system.debug_print(
+        "SOS pidrow: the row keeps its pid after the death\n")
+
+    // The dead child's body is free, so the next create takes it. Root still
+    // holds the dead child's handle, so the new process has its own record and
+    // its own pid.
+    let next = try system.process_create(image: &image, memory: &ram)
+    let next_stats = try next.stats()
+    if next_stats.pid == pid || rows_naming(&region, pid) != 0 {
+        return BUG
+    }
+    if rows_naming(&region, next_stats.pid) != 1 {
+        return BUG
+    }
+    let _ = system.debug_print(
+        "SOS pidrow: a create reuses the body and renames the row\n")
+    let _ = move next
+    let _ = move child
+    return
+}
+
+/// How many rows of the region carry `pid`.
+func rows_naming(region: &StatsRegion, pid: UInt64) -> Int {
+    var found: Int = 0
+    var at: Int = 0
+    while at < region.rows {
+        if region.row(at).pid == pid {
+            found = found + 1
+        }
+        at = at + 1
+    }
+    found
+}
+
+/// Park until the process `child` names ends. The waiter is dropped on return.
+func wait_for_death(proc: &Process,
+                    child: &Process) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(_) -> {
+            if key != KEY_DEATH { return BUG }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

@@ -338,14 +338,15 @@ public enum SystemOp: UInt {
 ///
 /// `Stats` is the introspection op. It answers through a copy-out record, for
 /// the reason `PipeCreate` and `Clock.Now` do: one op returns one word and the
-/// answer is three 64-bit columns.
+/// answer is four 64-bit columns: three counters and the process's pid.
 ///
-/// The three columns are split by trap kind because the split is what makes
+/// The counters are split by trap kind because the split is what makes
 /// assertions possible. A single "traps" number would be the sum of a
 /// deterministic quantity and a timing-dependent one, so no test could assert
 /// it; separated, `syscalls` is exact for a given program path (a park is one
 /// syscall trap however long it parks) and `interrupts` is the one that moves.
-/// `faults` is exact where a test provokes one on purpose. See
+/// `faults` is exact where a test provokes one on purpose. The fourth column,
+/// `pid`, is the pid the process's messages carry (spec §2.7). See
 /// `PROCESS_STATS_RECORD_DOUBLEWORDS` for the layout and the attribution rule.
 ///
 /// `RestrictRights` and `Ceiling` act on the named process's rights ceilings
@@ -906,6 +907,18 @@ public enum PipeRequestOp: UInt {
     /// the kernel already writes a zero value register, so only the reply leg
     /// has to say anything.
     case ReplyWait = 1,
+    /// Mint a Process handle onto the process that sent the request this
+    /// obligation answers (spec §2.1). Takes no argument and answers the
+    /// handle in the value register.
+    ///
+    /// Gated by `PipeRequestRight.Sender`. The handle carries the observe set
+    /// (`process_observe_rights()`) capped by the caller's Process ceiling, and
+    /// is charged to the caller's `Handle` row. A sender that has died answers
+    /// `Revoked` and mints nothing: the exchange keeps the sender's pid and
+    /// record index and no reference, and the op accepts the record only if
+    /// it is live and still holds that pid. The obligation is not consumed and
+    /// the reply is still owed.
+    case Sender = 2,
 }
 
 /// Which half of a `PipeRequestOp.ReplyWait` produced the answer.

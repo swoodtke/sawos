@@ -1,0 +1,76 @@
+// Test child: a server that takes one message and asks for its sender handle.
+//
+// Its launcher stages the message before it starts and decides what the
+// ceilings allow, so this program is the same under every role and what it
+// prints is what the ceilings left. One role empties this process's own Process
+// ceiling just before it asks, which the tag of the outlet record (`TAG_EMPTY`)
+// selects: the handle it is given then carries no rights. If the obligation it
+// takes lacks the right, the ask ends this process with access denied and it
+// prints nothing more.
+
+import sos.{System, Process, PipeOutlet, SosStatus}
+
+/// The outlet tag that asks for the Process ceiling to be emptied first.
+static TAG_EMPTY: UInt = 23
+
+/// The ask was answered and its rights printed.
+static EXIT_ASKED: UInt = 5
+/// The ask was refused with a status.
+static EXIT_REFUSED: UInt = 6
+/// The boot set held no outlet, or the take found nothing.
+static EXIT_NO_MESSAGE: UInt = 7
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        return
+    }
+
+    var outlet: PipeOutlet? = None
+    var empty = false
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if let got = rec.take_outlet() {
+                    outlet = move got
+                    empty = tag == TAG_EMPTY
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    guard let server = outlet.take() else {
+        let _ = proc.exit(EXIT_NO_MESSAGE)
+        return
+    }
+
+    let got = try server.take() catch {
+        let _ = proc.exit(EXIT_NO_MESSAGE)
+        return
+    }
+    let (msg, request) = move got
+    let _ = move msg
+
+    if empty {
+        let _ = proc.restrict_rights(process: 0)
+    }
+    match request.sender() {
+        case Ok(named) -> {
+            let word = try named.rights() catch {
+                let _ = proc.exit(EXIT_REFUSED)
+                return
+            }
+            print("SOS pidserver: sender handle rights={}\n", word)
+            let _ = proc.exit(EXIT_ASKED)
+        },
+        case Err(why) -> {
+            print("SOS pidserver: the ask was refused: {}\n", why)
+            let _ = proc.exit(EXIT_REFUSED)
+        },
+    }
+}

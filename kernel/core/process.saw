@@ -46,8 +46,8 @@ import kcore.limits.{
     ROOT_PROCESS,
 }
 import kcore.mem.{align_up, copy_bytes, word_bytes}
-import kcore.diag.{console, fatal_image}
-import kcore.stats.{stats_clear}
+import kcore.diag.{console, fatal_image, fatal_kernel}
+import kcore.stats.{stats_clear, stats_name}
 import kcore.time.{start_tick}
 import kcore.pslot.{
     GrantRow,
@@ -187,6 +187,32 @@ public(package) func link_process(p: Int, b: Int) unsafe {
 /// user mode without the loader; linking twice writes the same two fields.
 public(package) func claim_root() unsafe {
     link_process(ROOT_PROCESS, ROOT_BODY)
+    PROCESS_RECORDS[ROOT_PROCESS].pid = ROOT_PID
+}
+
+/// Root's pid (spec §2.7). Zero is never a pid, so the counter's first value
+/// is the one after it.
+public(package) static ROOT_PID: UInt64 = 1
+
+/// The pid the next create assigns. It only increases, so no pid is assigned
+/// twice for as long as the machine runs, whatever becomes of a record.
+unsafe static var NEXT_PID: UInt64 = 2
+
+/// Give record `p` the next pid, and answer it.
+///
+/// A create calls this after it has linked the record, so a refused create
+/// never reaches it and spends no pid. A counter that has run out would have
+/// to assign a pid a second time, which no later reader could detect, so the
+/// machine stops instead.
+public(package) func assign_pid(p: Int) unsafe -> UInt64 {
+    let pid = NEXT_PID
+    if pid == UInt64.max {
+        fatal_kernel("the pid counter is exhausted", p as UInt)
+        return 0
+    }
+    NEXT_PID = pid + 1
+    PROCESS_RECORDS[p].pid = pid
+    pid
 }
 
 /// Raised when a `Created` process's count reaches zero: nothing names it, so
@@ -235,6 +261,7 @@ public(package) func reclaim_process_record(p: Int) unsafe {
     if PROCESS_RECORDS[p].refs != 0 {
         return
     }
+    PROCESS_RECORDS[p].pid = 0
     PROCESS_RECORDS[p].state = ProcessState.Free
 }
 
@@ -1071,6 +1098,7 @@ public func start_process(entry: UInt, stack_top: UInt,
     // Boot-door traps a harness kernel takes before this line are unattributed
     // by `ktrap`, so nothing has been counted against root's row yet.
     stats_clear(b)
+    stats_name(b, PROCESS_RECORDS[p].pid)
 
     // The ledger opens before the first mint, because `mint_handle` consults
     // the handle row and a record with no limits installed can allocate

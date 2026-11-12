@@ -1,0 +1,103 @@
+// Test child: the middle of a forwarded request, for the pid cases.
+//
+// It takes a request, forwards the obligation in a message, and keeps that
+// message's exchange open by calling instead of posting: the call parks until
+// the far process answers the message, so this process is alive, and its pid
+// nameable, for as long as the far process is asking about it. It exits when
+// the answer comes.
+//
+// It prints nothing; the verdict travels in the §8 exit code.
+
+import sos.{System, Process, PipeInlet, PipeOutlet, PipeRequest, PipeHandles,
+            PipeMsg, Waiter, WaitResult, WaitPayload, AttachMode, BootHandle,
+            SosStatus, PIPE_BODY_BYTES}
+
+/// The obligation was forwarded and this process is done with it.
+static EXIT_FORWARDED: UInt = 71
+/// The boot set held no outlet, or no inlet, where its launcher's config says.
+static EXIT_NO_ENDS: UInt = 72
+/// A call that should not have been refused was.
+static EXIT_REFUSED: UInt = 73
+/// The delivery was not a message, which would mean the kernel reported an
+/// attachment this process never made.
+static EXIT_NOT_A_MESSAGE: UInt = 74
+
+/// The key the subscription is registered under.
+static KEY_OUTLET: UInt = 5
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childforward: no process handle: {}\n", error)
+        return
+    }
+
+    let code = try forward(&proc) catch {
+        print("SOS childforward: refused: {}\n", error)
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+    let _ = proc.exit(code)
+}
+
+/// Receive one request, hand its obligation on, and stop.
+func forward(proc: &Process) -> Result<UInt, SosStatus> {
+    var in_rec = try proc.boot_handle_next()
+    var out_rec = try proc.boot_handle_next()
+    guard let outlet = in_rec.take_outlet() else { return EXIT_NO_ENDS }
+    guard let onward = out_rec.take_inlet() else { return EXIT_NO_ENDS }
+
+    let waiter = try proc.waiter_create()
+    try waiter.give(outlet: move outlet, key: KEY_OUTLET,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    let wake = try waiter.wait()
+    var relayed = false
+    match wake.what {
+        case Message(_, _) -> { relayed = true },
+        case _ -> {},
+    }
+    if not relayed {
+        let _ = move wake
+        return EXIT_NOT_A_MESSAGE
+    }
+
+    // Open the record, then match the owned payload. The delivery carried the
+    // message and the obligation to answer it (a completion-queue attach), and
+    // the obligation is what this process is about to give away.
+    let (_, what) = (move wake).open()
+    match what {
+        case Message(m, r) -> {
+            var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+            body[0] = m.bytes[0]
+            let _ = move m
+
+            // The forward. The obligation goes into a message's handle slot and
+            // the post consumes the wrapper, so this process cannot answer the
+            // request below this line. The exchange itself is untouched by the
+            // move: an obligation names a ring slot, and this changes only
+            // which table names it.
+            var carrying = PipeHandles.none()
+            carrying.put(0, request: move r)
+            let answer = try onward.send_with(body: &body, len: 1,
+                                              handles: &var carrying)
+            // The answer to this call says only that the far process is done
+            // with the message; the one the original client waits for comes
+            // back on a connection this process holds no end of.
+            let _ = move answer
+            let _ = move onward
+            return EXIT_FORWARDED
+        },
+        // Unreachable: the borrowing look above established the tag.
+        case _ -> {
+            let _ = move onward
+            return EXIT_NOT_A_MESSAGE
+        },
+    }
+}

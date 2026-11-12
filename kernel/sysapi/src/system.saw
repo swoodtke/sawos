@@ -18,8 +18,8 @@
 //! Everything else this file names comes from modules it imports: the floor's
 //! raw seams, the regions, the pipe types, and the objects a Process mints.
 
-import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
-               SlabKind, HandleKind,
+import sosabi.{SosStatus, SystemOp, ProcessOp, PipeRequestOp, MemoryOp,
+               IoMemoryOp, MINT_OP, SlabKind, HandleKind,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, MemoryHandle,
                IoMemoryHandle, MappingHandle, TimerHandle,
@@ -34,7 +34,7 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, MemoryOp, IoMemoryOp, MINT_OP,
                PIPE_CREATE_OUTLET_WORD, pipe_create_record_bytes,
                PROCESS_STATS_RECORD_DOUBLEWORDS, PROCESS_STATS_SYSCALLS_SLOT,
                PROCESS_STATS_INTERRUPTS_SLOT, PROCESS_STATS_FAULTS_SLOT,
-               process_stats_record_bytes,
+               PROCESS_STATS_PID_SLOT, process_stats_record_bytes,
                StatsRow, StatsRegionHeader, STATS_REGION_VERSION,
                STATS_REGION_MAP_RECORD_WORDS, STATS_REGION_MAP_ROW_WORD,
                stats_region_map_record_bytes}
@@ -536,9 +536,9 @@ func read_stats_row(at: UInt) unsafe -> StatsRow {
 /// What a process has cost the machine, in traps: the answer `Process.stats()`
 /// gives.
 ///
-/// Three columns, not one number, because the split is what makes any of it
-/// usable. A single total would mix a quantity a program determines with one
-/// the machine determines, so nothing could be asserted about it:
+/// Three counter columns, not one number, because the split is what makes any
+/// of it usable. A single total would mix a quantity a program determines with
+/// one the machine determines, so nothing could be asserted about it:
 ///
 ///   `syscalls`    every trap this process took through the syscall
 ///                 instruction: one per call, whatever the op, whatever the
@@ -566,7 +566,12 @@ func read_stats_row(at: UInt) unsafe -> StatsRow {
 /// two readings includes the second reading's own trap; subtract it where the
 /// window is what you are measuring.
 ///
-/// Plain data: three integers, no handle, nothing owned. It is on the automatic
+/// The fourth column, `pid`, is not a count: it is the process's pid (spec
+/// §2.7), the number its messages carry as their sender. It is the same for
+/// every reading of one process, and zero is never a pid, so a row of the stats
+/// region reads zero only for a body no process has occupied.
+///
+/// Plain data: four integers, no handle, nothing owned. It is on the automatic
 /// `Copy` tier and needs no policy; a reading is a fact you took, not a
 /// capability you hold.
 ///
@@ -577,6 +582,33 @@ public struct ProcessStats {
     public syscalls: UInt64,
     public interrupts: UInt64,
     public faults: UInt64,
+    public pid: UInt64,
+}
+
+extension PipeRequest {
+    /// A Process handle onto the process that sent this request: the one
+    /// handle a server can obtain onto a client without a System handle.
+    /// Requires `PipeRequestRight.Sender`.
+    ///
+    /// The handle carries exactly the observe set, `ProcessRight.Wait |
+    /// ProcessRight.Stats`, intersected with this process's Process ceiling: it
+    /// learns whether the sender is alive and how it ended, what it cost, what
+    /// its pid is and what its ceilings are, and it cannot act on the sender or
+    /// move on. Every call mints a fresh handle, and the obligation stays
+    /// owed.
+    ///
+    /// A sender that has died answers `Err(SosStatus.Revoked)`, because the
+    /// server could not have known; `PipeMsg.sender` still names it. A caller
+    /// at its handle quota gets `QuotaExceeded` and a full table `NoResource`.
+    ///
+    /// The request's sender is the process that sent the request, wherever
+    /// the obligation has since travelled: a process that was forwarded an
+    /// obligation obtains the client that first sent it, not the forwarder.
+    public func sender(&self) -> Result<Process, SosStatus> {
+        let raw = try call_value(self.handle, PipeRequestOp.Sender as UInt,
+                                 0, 0, 0)
+        return Process(handle: ProcessHandle(raw))
+    }
 }
 
 /// A handle to a Process: an address-space domain, a handle table and threads.
@@ -2076,7 +2108,8 @@ func process_stats_into_frame(handle: ProcessHandle) unsafe -> Result<ProcessSta
                                   process_stats_record_bytes() as UInt))
     return ProcessStats(syscalls: buf[PROCESS_STATS_SYSCALLS_SLOT],
                         interrupts: buf[PROCESS_STATS_INTERRUPTS_SLOT],
-                        faults: buf[PROCESS_STATS_FAULTS_SLOT])
+                        faults: buf[PROCESS_STATS_FAULTS_SLOT],
+                        pid: buf[PROCESS_STATS_PID_SLOT])
 }
 
 /// The `unsafe` half of `Process.boot_handle_next`, confined to one small named
@@ -2134,15 +2167,15 @@ public struct StatsRegion {
 extension StatsRegion: NoCopy {}
 
 extension StatsRegion {
-    /// Row `index`'s three columns, read out of the mapped page with no syscall
+    /// Row `index`'s four columns, read out of the mapped page with no syscall
     /// at all.
     ///
     /// The numbers mean exactly what `Process.stats()` means (see
     /// `ProcessStats`) and come from the same storage, so the two surfaces
     /// cannot disagree. A row belonging to a body no process currently occupies
-    /// reads as whatever its last occupant left, until a create zeroes it:
-    /// `rows` is a capacity, not a census, and the region publishes no liveness
-    /// column.
+    /// reads as whatever its last occupant left, until a create zeroes it, and
+    /// its pid is zero only if no process has ever occupied it: `rows` is a
+    /// capacity, not a census, and the region publishes no liveness column.
     ///
     /// A 32-bit reader can tear; see `System.stats_region_map` for the whole
     /// statement. The short version is that a torn column is a value between
@@ -2158,7 +2191,7 @@ extension StatsRegion {
         let at = self.base + self.rows_offset + (index as UInt) * self.row_bytes
         let raw = read_stats_row(at)
         ProcessStats(syscalls: raw.syscalls, interrupts: raw.interrupts,
-                     faults: raw.faults)
+                     faults: raw.faults, pid: raw.pid)
     }
 
     /// This process's own row, `row(self.self_row)`. It is named because it is

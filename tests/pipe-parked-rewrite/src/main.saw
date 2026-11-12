@@ -145,12 +145,29 @@ func take(outlet: UInt, rec: &var [UInt; REC_WORDS]) unsafe -> UInt {
                          (REC_WORDS * sizeof<UInt>()) as UInt)
 }
 
-/// Whether every word of the record after the request handle is zero: a
-/// data-free message with no handle kinds and no handle words.
+/// Where the sender's pid sits in a take record, in bytes. The message record
+/// starts on a doubleword after the request word, its packed meta pads to a
+/// word, then come the handle words and then the pid.
+static MSG_OFFSET: Int = 8
+static SENDER_BYTES: Int = 8
+
+func sender_offset() -> Int {
+    let word = sizeof<UInt>()
+    let meta = ((1 + PIPE_MSG_HANDLES + word - 1) / word) * word
+    MSG_OFFSET + meta + PIPE_MSG_HANDLES * word
+}
+
+/// Whether every word of the record after the request handle is zero, the
+/// sender's pid excepted: a data-free message with no handle kinds and no
+/// handle words.
 func bare(rec: &[UInt; REC_WORDS]) -> Bool {
+    let word = sizeof<UInt>()
+    let from = sender_offset()
     var i: Int = 1
     while i < REC_WORDS {
-        if rec[i] != NONE {
+        let at = i * word
+        let in_sender = at >= from && at < from + SENDER_BYTES
+        if rec[i] != NONE && not in_sender {
             return false
         }
         i = i + 1

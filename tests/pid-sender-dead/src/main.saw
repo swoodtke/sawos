@@ -1,0 +1,186 @@
+// The sender handle on a request whose sender is dead (spec §2.1).
+//
+// A client tells once and exits before anybody has taken the message, so the
+// staged message and its pid outlive the process. Root takes it afterwards and
+// asks for the sender through the obligation, three times, in the three states
+// the sender's record can be in:
+//
+//   SOS pidsdead: the sender has exited
+//   SOS pidsdead: a dead sender root still holds answers Revoked
+//                      the record is `Gone` and still pinned by root's handle,
+//                      so only the sender's state says it is dead
+//   SOS pidsdead: a reclaimed record answers Revoked
+//                      root let go of its handle, and nothing names the record
+//   SOS pidsdead: a reused record answers Revoked
+//                      a new process has taken the record, so only the pid the
+//                      message kept tells the two processes apart
+//   SOS pidsdead: done
+//
+// The pid the message carries still names the dead client, which root reads
+// off the message before any of this.
+
+import sos.{System, Process, Memory, PipeInlet, PipeOutlet, PipeRequest,
+            Waiter, WaitResult, WaitPayload, SosStatus, SystemRight,
+            sos_system_process_self, sos_handle_release, ALL_RIGHTS,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly: `Revoked`, the answer
+/// under test, is expected and handled where it is asked for.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The client's System tag, and the inlet tag that makes it tell and exit.
+static TAG_BOOT: UInt = 21
+static MODE_TELL_EXIT: UInt = 3
+
+static KEY_DEATH: UInt = 6
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// `Exited` in the high half of the §8 status word, the client's OK code (7)
+/// in the low.
+static CLIENT_DONE: UInt = 65543
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pidsdead: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc, boot_handle) catch {
+        print("SOS pidsdead: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS pidsdead: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process,
+         word: UInt) unsafe -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move inlet, tag: MODE_TELL_EXIT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let pid_stats = try child.stats()
+    let pid = pid_stats.pid
+    try child.start(boot_tag: TAG_BOOT)
+
+    // The client's death, and nothing else, is what root waits for. The
+    // waiter is dropped before the handle below, because an attachment on a
+    // process is a reference on its record.
+    try wait_for_death(&proc, &child)
+    let _ = system.debug_print("SOS pidsdead: the sender has exited\n")
+
+    let got = try outlet.take()
+    let (msg, request) = move got
+    if msg.sender != pid {
+        print("SOS pidsdead: the message names {} not {}\n", msg.sender, pid)
+        return BUG
+    }
+    let _ = move msg
+
+    try expect_revoked(&request, word)
+    let _ = system.debug_print(
+        "SOS pidsdead: a dead sender root still holds answers Revoked\n")
+
+    let _ = move child
+    try expect_revoked(&request, word)
+    let _ = system.debug_print(
+        "SOS pidsdead: a reclaimed record answers Revoked\n")
+
+    // Any new process takes the lowest free record, which is the one the dead
+    // client left; it is never started, and it is not the dead client.
+    let other = try system.process_create(image: &image, memory: &ram)
+    let seen = try other.stats()
+    if seen.pid == pid {
+        return BUG
+    }
+    try expect_revoked(&request, word)
+    let _ = system.debug_print(
+        "SOS pidsdead: a reused record answers Revoked\n")
+    let _ = move other
+    let _ = move request
+    return
+}
+
+/// Park until the process `child` names has ended, and require the client's OK
+/// status. The waiter is dropped on return.
+func wait_for_death(proc: &Process,
+                    child: &Process) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != CLIENT_DONE { return BUG }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// Asking for the sender answers `Revoked`, and nothing else.
+///
+/// It also requires that nothing was minted: the slot the next mint would take
+/// is the same before and after the ask, so a refused ask left the table as it
+/// found it.
+func expect_revoked(request: &PipeRequest,
+                    word: UInt) unsafe -> Result<Void, SosStatus> {
+    let before = next_slot(word)
+    let answer = request.sender()
+    let after = next_slot(word)
+    if before == 0 || before != after {
+        return BUG
+    }
+    match answer {
+        case Ok(named) -> {
+            let _ = move named
+            return BUG
+        },
+        case Err(why) -> {
+            match why {
+                case Revoked -> { return },
+                case _ -> { return why },
+            }
+        },
+    }
+}
+
+/// The table slot the next mint into this process would take: a throwaway
+/// handle is minted through the System handle `word` and released at once, and
+/// its index bits (the low byte of the word) name the slot.
+func next_slot(word: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_self(
+        word, ALL_RIGHTS as UInt, (&var out) as UnsafePointer<UInt>)
+    if status != 0 {
+        return 0
+    }
+    let _ = sos_handle_release(out)
+    return out & 255
+}

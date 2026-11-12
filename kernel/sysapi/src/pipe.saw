@@ -323,8 +323,12 @@ extension PipeHandles {
     }
 }
 
-/// A message: how many of its bytes are real, the handles it carried, and the
-/// bytes.
+/// A message: how many of its bytes are real, the handles it carried, the pid
+/// of the process that sent it, and the bytes.
+///
+/// `sender` is written by the kernel at the op that sent the message, so it
+/// names the immediate sender and cannot be claimed by it (spec §2.1). A
+/// process that forwards a message is the sender its receiver sees.
 ///
 /// Handles come before bytes, and the Saw struct mirrors the record's order
 /// (declaration-order ABI). It is the same layout the kernel writes, read from
@@ -344,6 +348,7 @@ extension PipeHandles {
 public struct PipeMsg {
     public len: UInt,
     public handles: [PipeHandle?; PIPE_MSG_HANDLES],
+    public sender: UInt64,
     public bytes: [UInt8; PIPE_BODY_BYTES],
 }
 
@@ -513,9 +518,10 @@ func decode_handle(kind: UInt8, word: UInt) -> PipeHandle? {
 /// Build a `PipeMsg` out of a delivered record's meta, handle words and bytes.
 /// The one place a message crosses from words into wrappers.
 func msg_of(meta: &PipeMsgMeta, words: &[UInt; PIPE_MSG_HANDLES],
-            bytes: &[UInt8; PIPE_BODY_BYTES]) -> PipeMsg {
+            sender: UInt64, bytes: &[UInt8; PIPE_BODY_BYTES]) -> PipeMsg {
     var msg = PipeMsg(len: meta.len as UInt,
                       handles: [None, None, None, None],
+                      sender: sender,
                       bytes: bytes)
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
@@ -632,7 +638,7 @@ func wait_message(buf: &WaitBuffer) -> PipeMsg {
         words[i] = buf.handles[WAIT_MSG_SLOT_0 + i]
         i = i + 1
     }
-    msg_of(&buf.meta, &words, &buf.body)
+    msg_of(&buf.meta, &words, buf.sender, &buf.body)
 }
 
 extension Waiter {
@@ -687,6 +693,7 @@ func wait_into_frame(handle: WaiterHandle) unsafe -> Result<WaitResult, SosStatu
     var buf = WaitBuffer(header: [0; WAIT_HEADER_WORDS],
                          meta: PipeMsgMeta(len: 0, kinds: [0; PIPE_MSG_HANDLES]),
                          handles: [NO_HANDLE; WAIT_HANDLE_SLOTS],
+                         sender: 0,
                          body: [0; PIPE_BODY_BYTES])
     try checked(sos_waiter_wait(handle,
                                 (&var buf.header) as UnsafePointer<UInt>,
@@ -1042,6 +1049,7 @@ func call_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
     var reply = PipeMsgRecord(meta: PipeMsgMeta(len: 0,
                                                 kinds: [0; PIPE_MSG_HANDLES]),
                               handles: [NO_HANDLE; PIPE_MSG_HANDLES],
+                              sender: 0,
                               bytes: [0; PIPE_BODY_BYTES])
     var value: UInt = 0
     let raw = sos_pipe_inlet_call(handle,
@@ -1057,7 +1065,7 @@ func call_body(handle: PipeInletHandle, body: &[UInt8; PIPE_BODY_BYTES],
     // delivery comes after they were staged.
     handles.handed_over()
     try checked(raw)
-    return msg_of(&reply.meta, &reply.handles, &reply.bytes)
+    return msg_of(&reply.meta, &reply.handles, reply.sender, &reply.bytes)
 }
 
 /// A handle to a PipeOutlet, the server end of a connection, where requests
@@ -1175,6 +1183,7 @@ func take_into_frame(
         msg: PipeMsgRecord(meta: PipeMsgMeta(len: 0,
                                              kinds: [0; PIPE_MSG_HANDLES]),
                            handles: [NO_HANDLE; PIPE_MSG_HANDLES],
+                           sender: 0,
                            bytes: [0; PIPE_BODY_BYTES]))
     let raw = sos_pipe_outlet_take(handle,
                                    (&var rec) as UnsafePointer<UInt>,
@@ -1184,7 +1193,7 @@ func take_into_frame(
     try checked(raw)
     let request = PipeRequest(handle: PipeRequestHandle(rec.request))
     let got: (PipeMsg, PipeRequest) = (msg_of(&rec.msg.meta, &rec.msg.handles,
-                                              &rec.msg.bytes),
+                                              rec.msg.sender, &rec.msg.bytes),
                                        move request)
     return move got
 }
@@ -1338,6 +1347,7 @@ func resolve_into_frame(handle: PipeReplyHandle) unsafe -> Result<PipeMsg, SosSt
     var rec = PipeMsgRecord(meta: PipeMsgMeta(len: 0,
                                               kinds: [0; PIPE_MSG_HANDLES]),
                             handles: [NO_HANDLE; PIPE_MSG_HANDLES],
+                            sender: 0,
                             bytes: [0; PIPE_BODY_BYTES])
     var value: UInt = 0
     let raw = sos_pipe_reply_resolve(handle,
@@ -1345,7 +1355,7 @@ func resolve_into_frame(handle: PipeReplyHandle) unsafe -> Result<PipeMsg, SosSt
                                      pipe_msg_record_bytes() as UInt,
                                      (&var value) as UnsafePointer<UInt>)
     try checked(raw)
-    return msg_of(&rec.meta, &rec.handles, &rec.bytes)
+    return msg_of(&rec.meta, &rec.handles, rec.sender, &rec.bytes)
 }
 
 /// A handle to a PipeRequest, the server's obligation to send one reply (spec
@@ -1608,6 +1618,7 @@ func reply_wait_body(handle: PipeRequestHandle, body: &[UInt8; PIPE_BODY_BYTES],
     var buf = WaitBuffer(header: [0; WAIT_HEADER_WORDS],
                          meta: PipeMsgMeta(len: 0, kinds: [0; PIPE_MSG_HANDLES]),
                          handles: [NO_HANDLE; WAIT_HANDLE_SLOTS],
+                         sender: 0,
                          body: [0; PIPE_BODY_BYTES])
     var leg: UInt = 0
     let raw = sos_pipe_request_reply_wait(handle,

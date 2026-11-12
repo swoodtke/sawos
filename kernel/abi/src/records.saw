@@ -113,8 +113,8 @@ public static WAIT_REQUEST_SLOT: Int = 0
 public static WAIT_MSG_SLOT_0: Int = 1
 
 /// The buffer a `Waiter.Wait` caller must supply: the header, the packed meta,
-/// the handle region, then a body region big enough for the largest delivery
-/// there is.
+/// the handle region, the sender's pid, then a body region big enough for the
+/// largest delivery there is.
 ///
 /// Handles before bytes: the fixed-prefix / variable-tail rule. Everything
 /// whose size is fixed comes first and the body is the tail, so every copy-out
@@ -132,9 +132,10 @@ public static WAIT_MSG_SLOT_0: Int = 1
 ///   - a word-payload delivery (an Event, an Interrupt, a Timer, a death, a
 ///     room level, an abandoned claim, a readable outlet nobody is taking
 ///     through) writes `wait_meta_end_bytes()` and stops. All the meta bytes
-///     are zero, so a decode reads no handle word and no body byte.
-///   - a message delivery (a reply carrying data or handles, and the
-///     delivery-as-take) writes `wait_prefix_bytes()` plus the meta's `len`.
+///     are zero, so a decode reads no handle word, no sender and no body byte.
+///   - a message delivery (a reply carrying an answer, an empty one included,
+///     and the delivery-as-take) writes `wait_prefix_bytes()` plus the meta's
+///     `len`, so its sender is written whatever it carries.
 ///
 /// So a Timer waiter pays for the message-sized buffer in space and never in
 /// copy time.
@@ -146,11 +147,26 @@ public static WAIT_MSG_SLOT_0: Int = 1
 /// padding is where the per-profile answer lives: the meta occupies one machine
 /// word on the 64-bit profile and two on the 32-bit one, and it is the natural
 /// ABI that says so rather than a number anybody computed.
+///
+/// The sender is a doubleword on every profile, so on a 32-bit profile the
+/// struct's own alignment is a doubleword. The kernel asks only that a buffer
+/// be word-aligned and inside the caller's writable memory, and a word-aligned
+/// buffer is accepted. The handle region ends on a doubleword boundary on both
+/// profiles (asserted below), so the sender follows it with no padding between.
 public struct WaitBuffer {
     public header: [UInt; WAIT_HEADER_WORDS],
     public meta: PipeMsgMeta,
     public handles: [UInt; WAIT_HANDLE_SLOTS],
+    public sender: UInt64,
     public body: [UInt8; PIPE_BODY_BYTES],
+}
+
+/// A wait buffer as far as the handle region, which is what the asserts below
+/// measure the sender's position against.
+struct WaitHead {
+    header: [UInt; WAIT_HEADER_WORDS],
+    meta: PipeMsgMeta,
+    handles: [UInt; WAIT_HANDLE_SLOTS],
 }
 
 /// Bytes in a wait record's header: where the packed meta starts.
@@ -176,7 +192,7 @@ public func wait_meta_end_bytes() -> Int {
     // Saw unless brackets already enclose it, and a newline ends a statement,
     // so the un-bracketed spelling parses as a discarded subtraction followed
     // by a negated tail, which is a silently wrong answer rather than an error.
-    (sizeof<WaitBuffer>() - PIPE_BODY_BYTES
+    (sizeof<WaitBuffer>() - PIPE_BODY_BYTES - sizeof<UInt64>()
      - WAIT_HANDLE_SLOTS * sizeof<UInt>())
 }
 
@@ -200,6 +216,7 @@ public func wait_record_bytes() -> Int {
 static_assert(sizeof<WaitBuffer>() >= WAIT_HEADER_WORDS * sizeof<UInt>()
                                       + sizeof<PipeMsgMeta>()
                                       + WAIT_HANDLE_SLOTS * sizeof<UInt>()
+                                      + sizeof<UInt64>()
                                       + PIPE_BODY_BYTES,
               "a wait buffer must hold the header, the meta, every handle slot AND a whole message body")
 
@@ -213,10 +230,29 @@ static_assert((sizeof<WaitBuffer>() - PIPE_BODY_BYTES) % sizeof<UInt>() == 0,
 
 // And the meta fits the region the short prefix ends at. This catches a
 // `PIPE_MSG_HANDLES` raised past what the padding absorbs.
-static_assert(sizeof<WaitBuffer>() - PIPE_BODY_BYTES
+static_assert(sizeof<WaitBuffer>() - PIPE_BODY_BYTES - sizeof<UInt64>()
                   - WAIT_HANDLE_SLOTS * sizeof<UInt>()
               >= WAIT_HEADER_WORDS * sizeof<UInt>() + sizeof<PipeMsgMeta>(),
               "the packed meta must fit between the header and the handle region")
+
+// The sender sits directly after the handle region and the body directly after
+// the sender: the handle region ends on a doubleword boundary, and the sender
+// is the doubleword that ends the fixed prefix. These two are what make
+// `wait_meta_end_bytes` and `wait_prefix_bytes` offsets rather than estimates.
+static_assert(sizeof<WaitHead>() % sizeof<UInt64>() == 0,
+              "a wait record's handle region must end on a doubleword boundary")
+static_assert(sizeof<WaitBuffer>() - PIPE_BODY_BYTES
+              == sizeof<WaitHead>() + sizeof<UInt64>(),
+              "a wait record's sender must follow its handle region directly")
+
+// The fixed prefix's published size on each word size: 48 bytes on a 32-bit
+// profile and 80 on a 64-bit one.
+static_assert(sizeof<UInt>() != 4
+              || sizeof<WaitBuffer>() - PIPE_BODY_BYTES == 48,
+              "a 32-bit wait record's fixed prefix is 48 bytes")
+static_assert(sizeof<UInt>() != 8
+              || sizeof<WaitBuffer>() - PIPE_BODY_BYTES == 80,
+              "a 64-bit wait record's fixed prefix is 80 bytes")
 
 // The decoded forms (`WaitPayload`, `WaitResult`, `PipeMsg`, `ReplyDelivery`)
 // live in `sos.pipe`, not here. A handle at the typed tier is an owning `sos`
@@ -365,10 +401,23 @@ public func pipe_create_record_bytes() -> Int {
 /// `meta.len`. A handles-only message pays for no part of the body region, and
 /// in a data-only message the handle words it does not use are simply not
 /// written; `meta.kinds` says so.
+///
+/// `sender` is the pid of the process that sent the message (spec §2.1), which
+/// the kernel writes and no argument record carries. It is a doubleword on
+/// every profile, so a 32-bit profile gives the struct an alignment of eight
+/// bytes; the kernel asks of a buffer only word alignment.
 public struct PipeMsgRecord {
     public meta: PipeMsgMeta,
     public handles: [UInt; PIPE_MSG_HANDLES],
+    public sender: UInt64,
     public bytes: [UInt8; PIPE_BODY_BYTES],
+}
+
+/// A message record as far as the handle words, which the asserts below
+/// measure the sender's position against.
+struct PipeMsgHead {
+    meta: PipeMsgMeta,
+    handles: [UInt; PIPE_MSG_HANDLES],
 }
 
 /// A delivered message plus the obligation to answer it: `PipeOutlet.Take`'s
@@ -378,7 +427,9 @@ public struct PipeMsgRecord {
 /// varies: a take's obligation is a `PipeRequest` or the take did not happen,
 /// so it needs no kind byte and it reads best beside the length that follows
 /// it. Everything after it is an ordinary `PipeMsgRecord`, so a server can hand
-/// the message half onward without repacking it.
+/// the message half onward without repacking it. The message record holds a
+/// doubleword, so on a 32-bit profile four bytes of padding follow the request
+/// word, which the kernel writes as zero.
 public struct PipeTakeRecord {
     public request: UInt,
     public msg: PipeMsgRecord,
@@ -416,6 +467,37 @@ static_assert((sizeof<PipeMsgRecord>() - PIPE_BODY_BYTES) % sizeof<UInt>() == 0,
               "a message record's fixed prefix must be a whole number of machine words")
 static_assert((sizeof<PipeTakeRecord>() - PIPE_BODY_BYTES) % sizeof<UInt>() == 0,
               "a take record's fixed prefix must be a whole number of machine words")
+
+// The sender is the doubleword that ends the message record's fixed prefix,
+// directly after the handle words, and the take record is its request word
+// followed by the message record at a doubleword boundary: the padding the
+// 32-bit profile gains is exactly the four bytes between them.
+static_assert(sizeof<PipeMsgHead>() % sizeof<UInt64>() == 0,
+              "a message record's handle words end on a doubleword boundary")
+static_assert(sizeof<PipeMsgRecord>() - PIPE_BODY_BYTES
+              == sizeof<PipeMsgHead>() + sizeof<UInt64>(),
+              "a message record's sender must follow its handle words directly")
+static_assert(sizeof<PipeTakeRecord>() - sizeof<PipeMsgRecord>()
+              == sizeof<UInt64>(),
+              "a take record is a request doubleword, then the message")
+
+// The published sizes on each word size: the message record is 160 bytes on a
+// 32-bit profile and 176 on a 64-bit one, the take record 168 and 184, and the
+// body begins 32 and 48 bytes into the message record.
+static_assert(sizeof<UInt>() != 4 || sizeof<PipeMsgRecord>() == 160,
+              "a 32-bit message record is 160 bytes")
+static_assert(sizeof<UInt>() != 8 || sizeof<PipeMsgRecord>() == 176,
+              "a 64-bit message record is 176 bytes")
+static_assert(sizeof<UInt>() != 4 || sizeof<PipeTakeRecord>() == 168,
+              "a 32-bit take record is 168 bytes")
+static_assert(sizeof<UInt>() != 8 || sizeof<PipeTakeRecord>() == 184,
+              "a 64-bit take record is 184 bytes")
+static_assert(sizeof<UInt>() != 4
+              || sizeof<PipeMsgRecord>() - PIPE_BODY_BYTES == 32,
+              "a 32-bit message record's body begins at byte 32")
+static_assert(sizeof<UInt>() != 8
+              || sizeof<PipeMsgRecord>() - PIPE_BODY_BYTES == 48,
+              "a 64-bit message record's body begins at byte 48")
 
 /// A message to send: the argument record `Post`, `Call` and `Reply` are handed
 /// (spec §2.1's `send(data?, handles?)`).
@@ -516,9 +598,14 @@ public func pipe_reply_wait_record_bytes() -> Int {
 // at `SystemOp.ProcessCreate`, so a reused body never inherits its
 // predecessor's traffic. A dead process's columns are copied into its record
 // at the teardown, and `Process.Stats` through its handle answers that copy.
+//
+// The fourth column, `pid`, is not a counter. It is the pid of the process
+// occupying the body (spec §2.7), written by the create that zeroes the row
+// and left in place at the death, and it reads zero for a body no process has
+// occupied. `Process.Stats` answers the pid its record holds.
 
-/// Doublewords in a `Process.Stats` answer: syscalls, interrupts, faults.
-public static PROCESS_STATS_RECORD_DOUBLEWORDS: Int = 3
+/// Doublewords in a `Process.Stats` answer: syscalls, interrupts, faults, pid.
+public static PROCESS_STATS_RECORD_DOUBLEWORDS: Int = 4
 
 /// Where each column sits. Named rather than written, on both sides of the
 /// boundary. The order is the one the paragraph above reads them in, which is
@@ -526,6 +613,7 @@ public static PROCESS_STATS_RECORD_DOUBLEWORDS: Int = 3
 public static PROCESS_STATS_SYSCALLS_SLOT: Int = 0
 public static PROCESS_STATS_INTERRUPTS_SLOT: Int = 1
 public static PROCESS_STATS_FAULTS_SLOT: Int = 2
+public static PROCESS_STATS_PID_SLOT: Int = 3
 
 /// Bytes in a `Process.Stats` record: the minimum capacity a caller must give
 /// the op, and what the kernel checks the buffer against.
@@ -536,7 +624,7 @@ public func process_stats_record_bytes() -> Int {
     PROCESS_STATS_RECORD_DOUBLEWORDS * sizeof<UInt64>()
 }
 
-/// The three columns as a record: the one declaration both doors read.
+/// The four columns as a record: the one declaration both doors read.
 ///
 /// Declaration order is the layout, so this struct and the doubleword slots
 /// above are one description of one thing: `Process.Stats` copies this record
@@ -547,11 +635,17 @@ public struct StatsRow {
     public syscalls: UInt64,
     public interrupts: UInt64,
     public faults: UInt64,
+    /// The pid of the process the row describes (spec §2.7); zero for a body
+    /// no process has occupied.
+    public pid: UInt64,
 }
 
 static_assert(sizeof<StatsRow>()
               == PROCESS_STATS_RECORD_DOUBLEWORDS * sizeof<UInt64>(),
               "a stats row must be exactly the doublewords sosabi publishes")
+
+static_assert(sizeof<StatsRow>() == 32,
+              "a stats row is four doublewords, 32 bytes on every profile")
 
 /// Bytes in one row. A function for `process_stats_record_bytes`' reason.
 public func stats_row_bytes() -> Int {
@@ -562,7 +656,7 @@ public func stats_row_bytes() -> Int {
 // The shared stats region
 // =============================================================================
 //
-// One storage, two doors, no mirror. The three columns live here, in a
+// One storage, two doors, no mirror. The columns live here, in a
 // kernel-owned, protection-granularity-aligned region, and `Process.Stats`
 // reads this same storage. There is no second copy kept in step, because a
 // second copy is a thing that can skew: the op gives a caller a snapshot copied
@@ -619,7 +713,7 @@ public struct StatsRegionHeader {
 }
 
 /// The layout version this build publishes and this build's readers accept.
-public static STATS_REGION_VERSION: UInt64 = 1
+public static STATS_REGION_VERSION: UInt64 = 2
 
 /// Bytes in the header. A function for `process_stats_record_bytes`' reason.
 public func stats_region_header_bytes() -> Int {

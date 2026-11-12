@@ -1,0 +1,326 @@
+// Pids, the sender's pid in a message, and the sender handle (spec §2.1,
+// §2.7).
+//
+// Root serves clients of one image, one after another, and reads what the
+// kernel wrote:
+//
+//   SOS pids: root is pid 1                 root reads its own pid, and it is
+//                                           the one pid a program may assume
+//   SOS pids: first client ok               a tell and two calls: every
+//                                           message carries the pid root reads
+//                                           through `Stats` on the client's
+//                                           handle, the sender handle names the
+//                                           client and carries exactly the
+//                                           observe set, and every empty reply
+//                                           names root as its sender
+//   SOS pids: second client ok              the same of a second client
+//   SOS pids: the clients differ            two clients, two pids, neither of
+//                                           them root's
+//   SOS pids: a parked call names its client
+//                                           a call that waited for room in a
+//                                           full ring is staged when root frees
+//                                           a slot, and still carries the
+//                                           client's pid, not root's
+//   SOS pids: resolve names the replier     root asks itself: a reply read
+//                                           through `resolve` carries the
+//                                           replier's pid, and so does one
+//                                           delivered through a wait
+//   SOS pids: a delivered reply names the replier
+//   SOS pids: done
+//
+// No pid's number is asserted beyond root's 1: the numbers depend on how many
+// processes were made before, and the case reads each client's from `Stats`.
+
+import sos.{System, Process, Memory, PipeInlet, PipeOutlet, PipeRequest,
+            PipeMsg, Waiter, WaitResult, WaitPayload, AttachMode, SosStatus,
+            SystemRight, ProcessRight, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// Root's pid, which is fixed by the spec.
+static ROOT_PID: UInt64 = 1
+
+/// The tag the client's System handle travels under, and the three the inlet
+/// record may carry, which choose the client's behaviour.
+static TAG_BOOT: UInt = 21
+static MODE_CALLS: UInt = 1
+static MODE_FILL: UInt = 2
+
+/// The keys this case attaches under.
+static KEY_OUTLET: UInt = 5
+static KEY_DEATH: UInt = 6
+static KEY_REPLY: UInt = 7
+
+/// What a client may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The sender handle's rights: the observe set, and nothing else.
+static OBSERVE: UInt32 = ProcessRight.Wait | ProcessRight.Stats
+
+/// `Exited` in the high half of the §8 status word, the client's OK code (7)
+/// in the low.
+static CLIENT_DONE: UInt = 65543
+
+static_assert((1 * 65536) + 7 == 65543,
+              "a client's status word is Exited in the high bits and its code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pids: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS pids: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS pids: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    let mine = try proc.stats()
+    if mine.pid != ROOT_PID {
+        print("SOS pids: root's pid is {}\n", mine.pid)
+        return BUG
+    }
+    let _ = system.debug_print("SOS pids: root is pid 1\n")
+
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let first = try calls_client(&system, &proc, &image, &ram)
+    let _ = system.debug_print("SOS pids: first client ok\n")
+    let second = try calls_client(&system, &proc, &image, &ram)
+    let _ = system.debug_print("SOS pids: second client ok\n")
+    if first == second || first == ROOT_PID || second == ROOT_PID {
+        return BUG
+    }
+    let _ = system.debug_print("SOS pids: the clients differ\n")
+
+    try parked_client(&system, &proc, &image, &ram)
+    let _ = system.debug_print("SOS pids: a parked call names its client\n")
+
+    try self_exchange(&system, &proc)
+    return
+}
+
+/// Root is both ends of a connection, so the pids it reads are its own: the
+/// two doors a client reads a reply through that no child exercises, `resolve`
+/// and a wait that delivers the reply.
+func self_exchange(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 9
+
+    let claim = try inlet.post(body: &body, len: 1)
+    let got = try outlet.take()
+    let (msg, request) = move got
+    if msg.sender != ROOT_PID { return BUG }
+    let _ = move msg
+    try check_handle(&request, ROOT_PID)
+    try (move request).reply(body: &body, len: 0)
+    let answer = try (move claim).resolve()
+    if answer.len != 0 || answer.sender != ROOT_PID { return BUG }
+    let _ = move answer
+    let _ = system.debug_print("SOS pids: resolve names the replier\n")
+
+    let second = try inlet.post(body: &body, len: 1)
+    let got_again = try outlet.take()
+    let (msg_again, request_again) = move got_again
+    let _ = move msg_again
+    try (move request_again).reply(body: &body, len: 0)
+    let waiter = try proc.waiter_create()
+    try waiter.add(reply: &second, key: KEY_REPLY)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Reply(outcome) -> {
+            if key != KEY_REPLY { return BUG }
+            match outcome {
+                case Data(delivered) -> {
+                    if delivered.len != 0 || delivered.sender != ROOT_PID {
+                        return BUG
+                    }
+                },
+                case _ -> { return BUG },
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print(
+        "SOS pids: a delivered reply names the replier\n")
+    return
+}
+
+/// Make a client, give it the inlet of a fresh connection under `mode`, and
+/// start it. Answers the client's handle and the connection's outlet.
+func launch(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+            mode: UInt) -> Result<(Process, PipeOutlet), SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(inlet: move inlet, tag: mode) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return (move child, move outlet)
+}
+
+/// One client that tells once and calls twice. Answers its pid.
+func calls_client(system: &System, proc: &Process, image: &Memory,
+                  ram: &Memory) -> Result<UInt64, SosStatus> {
+    let (child, outlet) = try launch(&system, &proc, &image, &ram, MODE_CALLS)
+    let pid_stats = try child.stats()
+    let pid = pid_stats.pid
+    if pid == 0 {
+        return BUG
+    }
+    let waiter = try proc.waiter_create()
+    try waiter.give(outlet: move outlet, key: KEY_OUTLET,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try waiter.add(process: &child, key: KEY_DEATH)
+
+    // The tell, then the two calls. Every message names the client, and the
+    // sender handle on each obligation names it too.
+    var served: Int = 0
+    while served < 3 {
+        let wake = try waiter.wait()
+        let (key, what) = (move wake).open()
+        match what {
+            case Message(m, r) -> {
+                if key != KEY_OUTLET { return BUG }
+                if m.sender != pid {
+                    print("SOS pids: message {} names {} not {}\n", served,
+                          m.sender, pid)
+                    return BUG
+                }
+                try check_handle(&r, pid)
+                var empty: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+                if served == 0 {
+                    // The tell: the obligation is dropped unanswered.
+                    let _ = move r
+                } else {
+                    try (move r).reply(body: &empty, len: 0)
+                }
+                let _ = move m
+            },
+            case _ -> { return BUG },
+        }
+        served = served + 1
+    }
+    try expect_done(&waiter)
+    return pid
+}
+
+/// The sender handle on `request` names the process with pid `pid` and carries
+/// exactly the observe set.
+func check_handle(request: &PipeRequest,
+                  pid: UInt64) -> Result<Void, SosStatus> {
+    let named = try request.sender()
+    let seen = try named.stats()
+    if seen.pid != pid {
+        print("SOS pids: the sender handle names {} not {}\n", seen.pid, pid)
+        return BUG
+    }
+    let rights = try named.rights()
+    if rights != OBSERVE {
+        print("SOS pids: the sender handle carries {}\n", rights)
+        return BUG
+    }
+    return
+}
+
+/// Wait for the death the waiter watches, and require the client's OK status.
+func expect_done(waiter: &Waiter) -> Result<Void, SosStatus> {
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != CLIENT_DONE {
+                print("SOS pids: the client ended with status {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// A client that fills the ring and then calls. Root waits until something is
+/// staged, which the client does before it parks in the call, then frees a
+/// slot, which stages the call, and takes everything: every message names the
+/// client, the call's included.
+func parked_client(system: &System, proc: &Process, image: &Memory,
+                   ram: &Memory) -> Result<Void, SosStatus> {
+    let (child, outlet) = try launch(&system, &proc, &image, &ram, MODE_FILL)
+    let pid_stats = try child.stats()
+    let pid = pid_stats.pid
+    let waiter = try proc.waiter_create()
+    try waiter.add(outlet: &outlet, key: KEY_OUTLET)
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Readable(_) -> {
+            if key != KEY_OUTLET { return BUG }
+        },
+        case _ -> { return BUG },
+    }
+
+    // Everything the ring holds, and then the call it made room for. The
+    // answers to the tells are refused with `PeerClosed`, which is ignored:
+    // only the call's obligation has a client waiting.
+    var taken: Int = 0
+    var going = true
+    while going {
+        match outlet.take() {
+            case Ok(got) -> {
+                let (m, r) = move got
+                if m.sender != pid {
+                    print("SOS pids: message {} names {} not {}\n", taken,
+                          m.sender, pid)
+                    return BUG
+                }
+                var empty: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+                let _ = (move r).reply(body: &empty, len: 0)
+                let _ = move m
+                taken = taken + 1
+            },
+            case Err(why) -> {
+                match why {
+                    case WouldBlock -> { going = false },
+                    case _ -> { return why },
+                }
+            },
+        }
+    }
+    try expect_done(&waiter)
+    return
+}

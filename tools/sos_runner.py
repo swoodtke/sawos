@@ -605,6 +605,19 @@ DELEGATE_3P_PKG = os.path.join(TESTS_DIR, "delegate-3p")
 CHILD_FORWARD_PKG = os.path.join(TESTS_DIR, "child-forward")
 CHILD_FAR_PKG = os.path.join(TESTS_DIR, "child-far")
 
+# The pid cases (spec §2.1, §2.7). `child-pid-client` is one image that
+# several cases launch under different boot tags; the far end of a forwarded
+# request links at the second child address, as `child-far` does.
+PID_BASICS_PKG = os.path.join(TESTS_DIR, "pid-basics")
+PID_SENDER_DEAD_PKG = os.path.join(TESTS_DIR, "pid-sender-dead")
+PID_SENDER_RIGHTS_PKG = os.path.join(TESTS_DIR, "pid-sender-rights")
+PID_FORWARD_PKG = os.path.join(TESTS_DIR, "pid-forward")
+PID_STATS_ROW_PKG = os.path.join(TESTS_DIR, "pid-stats-row")
+CHILD_PID_CLIENT_PKG = os.path.join(TESTS_DIR, "child-pid-client")
+CHILD_PID_SERVER_PKG = os.path.join(TESTS_DIR, "child-pid-server")
+CHILD_PID_FORWARD_PKG = os.path.join(TESTS_DIR, "child-pid-forward")
+CHILD_PID_FAR_PKG = os.path.join(TESTS_DIR, "child-pid-far")
+
 # Clock and Timer objects. What an object answers and whether a wait parks are
 # separate questions, so they get separate packages: a scheduling bug cannot
 # hide behind an arithmetic one.
@@ -7073,6 +7086,140 @@ TEST_CASES = [
                        "SOS chargereap: connections back=1 windows back=1 "
                        "region back=1",
                        "SOS chargereap: done"],
+        "expect_clean_exit": True,
+    },
+    # =========================================================================
+    # Pids, the sender's pid in a message, and the sender handle
+    # =========================================================================
+    {
+        # Root serves clients of one image, and checks what the kernel wrote.
+        # Two clients each tell once and call twice: every message carries the
+        # pid root reads through `Stats` on that client's handle (so it is the
+        # same across the client's messages), the sender handle on each
+        # obligation names the client and carries exactly `Wait | Stats`, and
+        # every empty reply names root as its sender, which the client checks
+        # against root's pid of 1. The two clients' pids differ. A third client
+        # fills the ring and then calls: the call parks for room and is staged
+        # when root frees a slot, and it must carry the client's pid and not
+        # root's, the process whose op staged it. Last, root asks itself, which
+        # reads a reply through the two doors no child uses (`resolve` and a
+        # wait that delivers it). No pid's number is asserted beyond root's 1.
+        "name": "pid_basics",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PID_BASICS_PKG,
+        "children": [CHILD_PID_CLIENT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS pids: root is pid 1",
+                       "SOS pids: first client ok",
+                       "SOS pids: second client ok",
+                       "SOS pids: the clients differ",
+                       "SOS pids: a parked call names its client",
+                       "SOS pids: resolve names the replier",
+                       "SOS pids: a delivered reply names the replier",
+                       "SOS pids: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The sender handle on a request whose sender is dead. A client tells
+        # once and exits before anyone takes the message; the message still
+        # names it, and the sender handle answers `Revoked` in the three states
+        # the client's record can then be in: `Gone` and pinned by root's
+        # handle, reclaimed, and taken over by a new process. The first needs
+        # only the sender's state, the last needs the pid the message kept
+        # beside the record index, since a live record sits at that index.
+        "name": "pid_sender_dead",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PID_SENDER_DEAD_PKG,
+        "children": [CHILD_PID_CLIENT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS pidsdead: the sender has exited",
+                       "SOS pidsdead: a dead sender root still holds answers "
+                       "Revoked",
+                       "SOS pidsdead: a reclaimed record answers Revoked",
+                       "SOS pidsdead: a reused record answers Revoked",
+                       "SOS pidsdead: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # What bounds the sender handle. A server takes a staged tell and asks
+        # for its sender, under three ceilings root sets through the server's
+        # handle first. Default ceilings: the handle carries the observe set,
+        # `Wait | Stats` (1024 + 1048576 = 1049600). A Process ceiling without
+        # `Stats`: it carries `Wait` alone (1024). A PipeRequest ceiling
+        # without `Sender`: the obligation the server takes lacks the right,
+        # so the ask ends the server with access denied, which root reads in
+        # the status word (`Faulted` in the high half, 3 in the low) and the
+        # server's own line never prints. Last, a server that empties its own
+        # Process ceiling before it asks: the op still succeeds and the handle
+        # reads rights 0, since an empty intersection is a handle with no
+        # rights, not a refusal.
+        "name": "pid_sender_rights",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PID_SENDER_RIGHTS_PKG,
+        "children": [CHILD_PID_SERVER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS pidrights: default ceilings",
+                       "SOS pidserver: sender handle rights=1049600",
+                       "SOS pidrights: a Process ceiling without Stats",
+                       "SOS pidserver: sender handle rights=1024",
+                       "SOS pidrights: a PipeRequest ceiling without Sender",
+                       "SOS: process fault: access denied",
+                       "SOS pidrights: an empty Process ceiling",
+                       "SOS pidserver: sender handle rights=0",
+                       "SOS pidrights: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The sender handle across a forwarded obligation, on the topology of
+        # `pipe_delegate_3p`. The far process finds that the message it was
+        # sent names the middle (the immediate sender), that the sender handle
+        # on the obligation that arrived with it names that process (the
+        # middle calls, so it is alive and the handle is obtainable), and that
+        # the sender handle on the forwarded obligation names root, the client
+        # that asked. Its checks are in its exit code (81 when they hold),
+        # which root reads. Root's own half: the reply it gets names the far
+        # process, which answered, and not the middle that routed, and its
+        # body is the pid the forwarding message carried, which must be the
+        # middle's pid as `Stats` reads it.
+        "name": "pid_forward",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PID_FORWARD_PKG,
+        "children": [CHILD_PID_FORWARD_PKG, CHILD_PID_FAR_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS pidforward: created",
+                       "SOS pidforward: started far and middle",
+                       "SOS pidforward: the forwarding message named the "
+                       "middle",
+                       "SOS pidforward: the reply names the far process",
+                       "SOS pidforward: middle=65607 far=65617",
+                       "SOS pidforward: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The pid column of the stats region's rows. Root maps the region and
+        # reads every row against the pids `Process.stats()` answers: its own
+        # row names it, and the pid is 1; exactly one row names a created
+        # child, a row no process has occupied reads zero, the dead child's
+        # row keeps its pid, and the create that takes the freed body renames
+        # the row, so no row names the dead child any more.
+        "name": "pid_stats_row",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PID_STATS_ROW_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS pidrow: root's row names root",
+                       "SOS pidrow: a created process's row names it",
+                       "SOS pidrow: a body no process occupied reads zero",
+                       "SOS bye: exiting",
+                       "SOS pidrow: the row keeps its pid after the death",
+                       "SOS pidrow: a create reuses the body and renames "
+                       "the row",
+                       "SOS pidrow: done"],
         "expect_clean_exit": True,
     },
 ]

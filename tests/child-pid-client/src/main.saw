@@ -1,0 +1,135 @@
+// Test child: a client of one connection, for the pid cases.
+//
+// The tag of the inlet record its launcher gave it chooses the behaviour:
+//
+//   MODE_CALLS      a tell, then two calls. Every call is answered with an
+//                   empty reply, and the child checks that the reply names
+//                   root as its sender: the replier's pid is on a reply even
+//                   when the reply carries nothing else, and root's pid is 1.
+//   MODE_FILL       tells until the ring refuses one, then a call. The call
+//                   parks for room and is staged later, from whichever
+//                   context frees a slot, so its sender is stamped with this
+//                   process and not with the process that made the room.
+//   MODE_TELL_EXIT  one tell, and an exit before anybody has taken it.
+//
+// The verdict travels in the §8 exit code; this child prints nothing.
+
+import sos.{System, Process, PipeInlet, SosStatus, PIPE_BODY_BYTES}
+
+static MODE_CALLS: UInt = 1
+static MODE_FILL: UInt = 2
+static MODE_TELL_EXIT: UInt = 3
+
+/// Root's pid, the one pid a program may know in advance.
+static ROOT_PID: UInt64 = 1
+
+/// Every call was answered by root, with an empty reply.
+static EXIT_OK: UInt = 7
+/// A reply named another sender, or carried bytes.
+static EXIT_BAD_REPLY: UInt = 8
+/// The boot set held no inlet.
+static EXIT_NO_INLET: UInt = 9
+/// A send was refused.
+static EXIT_REFUSED: UInt = 10
+/// The ring never filled.
+static EXIT_NEVER_FULL: UInt = 11
+
+/// More tells than any ring holds, so a fill that reaches it is a ring that
+/// does not refuse.
+static MAX_FILL: Int = 256
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        return
+    }
+
+    var inlet: PipeInlet? = None
+    var mode: UInt = 0
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if let got = rec.take_inlet() {
+                    inlet = move got
+                    mode = tag
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    guard let client = inlet.take() else {
+        let _ = proc.exit(EXIT_NO_INLET)
+        return
+    }
+
+    let code = try run(&client, mode) catch {
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+    let _ = proc.exit(code)
+}
+
+func run(client: &PipeInlet, mode: UInt) -> Result<UInt, SosStatus> {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 1
+    if mode == MODE_CALLS {
+        let claim = try client.post(body: &body, len: 1)
+        let _ = move claim
+        return try two_calls(&client, &body)
+    }
+    if mode == MODE_FILL {
+        return try fill_then_call(&client, &var body)
+    }
+    let claim = try client.post(body: &body, len: 1)
+    let _ = move claim
+    return EXIT_OK
+}
+
+func two_calls(client: &PipeInlet,
+               body: &[UInt8; PIPE_BODY_BYTES]) -> Result<UInt, SosStatus> {
+    var i: Int = 0
+    while i < 2 {
+        let answer = try client.send(body: &body, len: 1)
+        if answer.len != 0 || answer.sender != ROOT_PID {
+            return EXIT_BAD_REPLY
+        }
+        i = i + 1
+    }
+    return EXIT_OK
+}
+
+func fill_then_call(
+    client: &PipeInlet,
+    body: &var [UInt8; PIPE_BODY_BYTES]
+) -> Result<UInt, SosStatus> {
+    var full = false
+    var posted: Int = 0
+    while not full && posted < MAX_FILL {
+        match client.post(body: &body, len: 1) {
+            case Ok(claim) -> {
+                let _ = move claim
+                posted = posted + 1
+            },
+            case Err(why) -> {
+                match why {
+                    case WouldBlock -> { full = true },
+                    case _ -> { return why },
+                }
+            },
+        }
+    }
+    if not full {
+        return EXIT_NEVER_FULL
+    }
+    body[0] = 2
+    let answer = try client.send(body: &body, len: 1)
+    if answer.len != 0 || answer.sender != ROOT_PID {
+        return EXIT_BAD_REPLY
+    }
+    return EXIT_OK
+}

@@ -1,0 +1,198 @@
+// The sender handle across a forwarded obligation (spec §2.1).
+//
+// The topology is `delegate-3p`'s, with the pids read. The middle keeps its
+// message's exchange open by calling, so it is alive while the far process asks
+// for its sender handle:
+//
+//   root    --call-->  middle    root asks and parks in the call.
+//   middle  --post-->  far       the middle forwards the obligation in a
+//                                message and calls (`child-pid-forward`).
+//   far     --reply--> root      the far process asks for the sender handle on
+//                                both obligations it holds, checks the pids
+//                                (`child-pid-far` carries the checks), and
+//                                answers the request root made.
+//
+// What the far process finds is that the message it was sent names the middle,
+// the immediate sender, while the forwarded obligation names root, the
+// process that asked. Root then reads the other direction: the reply it gets
+// names the far process, which answered, and not the middle that routed.
+//
+//   SOS pidforward: created
+//   SOS pidforward: started far and middle
+//   SOS pidforward: the forwarding message named the middle
+//                      the far process answers with the pid its message
+//                      carried, which is the middle's
+//   SOS pidforward: the reply names the far process
+//   SOS pidforward: middle=65607 far=65617
+//                      both ended well: the far process's pid checks held
+//   SOS pidforward: done
+
+import sos.{System, Process, Memory, PipeInlet, PipeOutlet, PipeReply, PipeMsg,
+            Waiter, WaitResult, WaitPayload, SystemRight, SosStatus,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// Root's config. The middle drains its outlet first and its inlet second; the
+/// far process drains one outlet.
+static TAG_MID_BOOT: UInt = 41
+static TAG_MID_OUTLET: UInt = 42
+static TAG_MID_INLET: UInt = 43
+static TAG_FAR_BOOT: UInt = 51
+static TAG_FAR_OUTLET: UInt = 52
+
+static KEY_MIDDLE: UInt = 91
+static KEY_FAR: UInt = 92
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// `child-pid-forward`'s and `child-pid-far`'s exits: `Exited` in the high
+/// half, 71 and 81 in the low.
+static MIDDLE_STATUS: UInt = 65607
+static FAR_STATUS: UInt = 65617
+
+static_assert((1 * 65536) + 71 == 65607,
+              "the middle's status word is Exited and its code")
+static_assert((1 * 65536) + 81 == 65617,
+              "the far process's status word is Exited and its code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pidforward: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS pidforward: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS pidforward: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var mid_img_rec = try proc.boot_handle_next()
+    var far_img_rec = try proc.boot_handle_next()
+    var mid_ram_rec = try proc.boot_handle_next()
+    var far_ram_rec = try proc.boot_handle_next()
+    guard let mid_img = mid_img_rec.take_memory() else { return BUG }
+    guard let far_img = far_img_rec.take_memory() else { return BUG }
+    guard let mid_ram = mid_ram_rec.take_memory() else { return BUG }
+    guard let far_ram = far_ram_rec.take_memory() else { return BUG }
+
+    let middle = try system.process_create(image: &mid_img, memory: &mid_ram)
+    let far = try system.process_create(image: &far_img, memory: &far_ram)
+    let _ = move mid_img
+    let _ = move far_img
+    let _ = move mid_ram
+    let _ = move far_ram
+
+    // Connection A: root asks, the middle serves. Connection B: the middle
+    // asks, the far process serves. Root keeps neither end of B.
+    let a = try proc.pipe_create()
+    let (a_in, a_out) = move a
+    let b = try proc.pipe_create()
+    let (b_in, b_out) = move b
+    let _ = system.debug_print("SOS pidforward: created\n")
+
+    let far_system = try system.mint(rights: CHILD_SYSTEM)
+    try far.give(system: move far_system, tag: TAG_FAR_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try far.give(outlet: move b_out, tag: TAG_FAR_OUTLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try far.start(boot_tag: TAG_FAR_BOOT)
+
+    let mid_system = try system.mint(rights: CHILD_SYSTEM)
+    try middle.give(system: move mid_system, tag: TAG_MID_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try middle.give(outlet: move a_out, tag: TAG_MID_OUTLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try middle.give(inlet: move b_in, tag: TAG_MID_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try middle.start(boot_tag: TAG_MID_BOOT)
+    let _ = system.debug_print("SOS pidforward: started far and middle\n")
+
+    let far_stats = try far.stats()
+    let mid_stats = try middle.stats()
+    if far_stats.pid == mid_stats.pid {
+        return BUG
+    }
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 63
+    let answer = try a_in.send(body: &msg, len: 1)
+    if answer.sender != far_stats.pid || answer.sender == mid_stats.pid {
+        print("SOS pidforward: the reply names {}\n", answer.sender)
+        return BUG
+    }
+    // The far process answers with the pid the forwarding message named, least
+    // significant byte first, and it must be the middle's.
+    var named: UInt64 = 0
+    var at: Int = 0
+    while at < 8 {
+        named = named | ((answer.bytes[at] as UInt64) << ((at * 8) as UInt64))
+        at = at + 1
+    }
+    if answer.len != 8 || named != mid_stats.pid {
+        return BUG
+    }
+    let _ = move answer
+    let _ = system.debug_print(
+        "SOS pidforward: the forwarding message named the middle\n")
+    let _ = system.debug_print(
+        "SOS pidforward: the reply names the far process\n")
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &middle, key: KEY_MIDDLE)
+    let mid_status = try death_status(&waiter, KEY_MIDDLE)
+    try waiter.remove(KEY_MIDDLE)
+    try waiter.add(process: &far, key: KEY_FAR)
+    let far_status = try death_status(&waiter, KEY_FAR)
+
+    print("SOS pidforward: middle={} far={}\n", mid_status, far_status)
+    if mid_status != MIDDLE_STATUS { return BUG }
+    if far_status != FAR_STATUS { return BUG }
+
+    let _ = move a_in
+    let _ = move middle
+    let _ = move far
+    return
+}
+
+/// The §8 status word of the death the waiter delivers under `key`.
+func death_status(waiter: &Waiter, key: UInt) -> Result<UInt, SosStatus> {
+    let wake = try waiter.wait()
+    let (got, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if got != key { return BUG }
+            return status
+        },
+        case _ -> { return BUG },
+    }
+}

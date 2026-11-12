@@ -275,15 +275,17 @@ static_assert((SystemRight.InterruptBind as UInt32) >= (1 << 8),
 /// caller's).
 ///
 /// `Stats` is an authority to observe. It gates `ProcessOp.Stats`, and reading
-/// three counters is worth a bit of its own rather than riding `Wait`, the
-/// other observation bit. `Wait` answers §8's status word, a fact about whether
-/// the process is alive; `Stats` answers how many traps it has taken, a fact
-/// about what it has been doing. A supervisor that may learn a child died need
-/// not be able to watch it work, and the separation costs one bit. It joins the
-/// one default set below because self-inspection has to compose for free
-/// (`ProcessSelf` -> `proc.stats()`), and withholding it from a supervisor is
-/// a keep mask on the sibling of the child's handle that supervisor holds,
-/// rather than a second default list.
+/// three counters and the process's pid is worth a bit of its own rather than
+/// riding `Wait`, the other observation bit. The pid is why the observe set
+/// (`Wait | Stats`) carries it: a handle that may observe a process may match
+/// it against a server's table by pid. `Wait` answers §8's status word, a fact
+/// about whether the process is alive; `Stats` answers how many traps it has
+/// taken, a fact about what it has been doing. A supervisor that may learn a
+/// child died need not be able to watch it work, and the separation costs one
+/// bit. It joins the one default set below because self-inspection has to
+/// compose for free (`ProcessSelf` -> `proc.stats()`), and withholding it from
+/// a supervisor is a keep mask on the sibling of the child's handle that
+/// supervisor holds, rather than a second default list.
 ///
 /// `Stats` also gates `ProcessOp.Ceiling`, the read of one of the process's
 /// rights ceilings: a ceiling is a fact about the process in the way a trap
@@ -815,6 +817,13 @@ public enum PipeRequestRight: UInt32 {
     /// for the reason every kind-specific bit is: attenuation is monotonic, and
     /// a bit not minted at creation could never appear later.
     case Wait = 1 << 9,
+    /// Gates `PipeRequestOp.Sender`: the Process handle onto the process that
+    /// sent the request (spec §2.1). It is in the default set, so a server
+    /// can name the clients of the requests it takes, and a launcher that does
+    /// not want it to narrows the server's `PipeRequest` ceiling. A forwarded
+    /// obligation arrives with the rights it was forwarded with, so a middle
+    /// process cannot strip the bit before it sends the obligation on.
+    case Sender = 1 << 10,
 }
 
 static_assert((PipeRequestRight.Transfer as UInt32) == (1 << 0),
@@ -825,6 +834,8 @@ static_assert((PipeRequestRight.Reply as UInt32) >= (1 << 8),
               "kind-specific right Reply must start at bit 8 or above")
 static_assert((PipeRequestRight.Wait as UInt32) >= (1 << 8),
               "kind-specific right Wait must start at bit 8 or above")
+static_assert((PipeRequestRight.Sender as UInt32) >= (1 << 8),
+              "kind-specific right Sender must start at bit 8 or above")
 
 /// Whether a rights word carries the universal `Transfer` bit (§3's low byte).
 ///
@@ -1042,7 +1053,20 @@ public func pipe_reply_rights() -> UInt32 {
 /// original client. Withholding the bit would delete the example.
 public func pipe_request_rights() -> UInt32 {
     ((PipeRequestRight.Transfer as UInt32)
-     | (PipeRequestRight.Reply as UInt32) | (PipeRequestRight.Wait as UInt32))
+     | (PipeRequestRight.Reply as UInt32) | (PipeRequestRight.Wait as UInt32)
+     | (PipeRequestRight.Sender as UInt32))
+}
+
+/// The observe set: the rights of a Process handle that comes from no creation,
+/// no `ProcessSelf` and no give (spec §2.7). It learns that a process died and
+/// how, what it cost, what its pid is and what its ceilings are, and it carries
+/// neither `Transfer` nor `Mint`, so the handle stays where it was minted.
+///
+/// Every mint of such a handle takes its rights from here and caps them by the
+/// Process ceiling of the table it lands in; the sender handle is the one such
+/// mint.
+public func process_observe_rights() -> UInt32 {
+    ((ProcessRight.Wait as UInt32) | (ProcessRight.Stats as UInt32))
 }
 
 /// What the kernel mints for a boot RAM-pool root (spec §2.5).

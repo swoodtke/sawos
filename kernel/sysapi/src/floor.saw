@@ -437,14 +437,14 @@ public func sos_process_boot_handle_next(handle: UInt, buf: UnsafePointer<UInt>,
                  (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// Read this process's trap counters into `buf`, a copy-out record because
-/// three 64-bit columns fit no value register on either profile. Requires
-/// `ProcessRight.Stats`.
+/// Read this process's trap counters and pid into `buf`, a copy-out record
+/// because four 64-bit columns fit no value register on either profile.
+/// Requires `ProcessRight.Stats`.
 ///
 /// `cap` is the buffer's size in bytes and must be at least
-/// `process_stats_record_bytes()`. The buffer must be doubleword-aligned and
-/// inside the caller's writable memory; a buffer that is not terminates the
-/// caller, because it is a mistake only the caller could have made.
+/// `process_stats_record_bytes()`. The buffer must be word-aligned and inside
+/// the caller's writable memory; a buffer that is not terminates the caller,
+/// because it is a mistake only the caller could have made.
 ///
 /// The record's layout is public: doubleword 0 the syscall count, doubleword 1
 /// the interrupt count, doubleword 2 the fault count. Which one is worth
@@ -913,6 +913,23 @@ public func sos_pipe_request_reply_wait(handle: UInt, args: UnsafePointer<UInt>,
                                         value_out: UnsafePointer<UInt>) unsafe -> UInt {
     sos_syscall3(handle, PipeRequestOp.ReplyWait as UInt, args as UInt,
                  args_bytes, record as UInt, value_out)
+}
+
+/// Mint a Process handle onto the process that sent the request `handle` is the
+/// obligation for. Requires `PipeRequestRight.Sender`.
+///
+/// The handle carries the observe set, `ProcessRight.Wait |
+/// ProcessRight.Stats`, intersected with the caller's Process ceiling, and
+/// lands in `value_out`. The obligation is not consumed. A sender that has died
+/// answers `SosStatus.Revoked` and mints nothing; a caller at its handle quota
+/// gets `SosStatus.QuotaExceeded`, and a full handle table is
+/// `SosStatus.NoResource`.
+@export("sos_pipe_request_sender")
+public func sos_pipe_request_sender(
+    handle: UInt,
+    value_out: UnsafePointer<UInt>
+) unsafe -> UInt {
+    sos_syscall3(handle, PipeRequestOp.Sender as UInt, 0, 0, 0, value_out)
 }
 
 /// Take: copy the oldest staged message into `rec`, with the obligation to

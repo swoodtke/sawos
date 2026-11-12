@@ -122,6 +122,7 @@ import kcore.objects.{
     stage_peek,
     stage_pop,
     stage_push,
+    stamp_sender,
     table_room,
     unbind_handle,
 }
@@ -979,10 +980,13 @@ public(package) struct StagedHandles {
 /// Every byte is a field. The prefix is copied out whole, and compiler padding
 /// between the meta and the handle words would carry whatever the kernel stack
 /// held there into the receiver's memory, so the gap is `pad`, written zero.
+/// The handle words end on a doubleword boundary on both word sizes (`sosabi`
+/// asserts it), so the sender follows them with no gap of its own.
 public(package) struct PipeMsgPrefix {
     public(package) meta: PipeMsgMeta,
     public(package) pad: [UInt8; MSG_META_PAD],
     public(package) handles: [UInt; PIPE_MSG_HANDLES],
+    public(package) sender: UInt64,
 }
 
 /// The bytes between the meta (one length byte and one kind byte per slot) and
@@ -997,22 +1001,31 @@ static_assert(sizeof<PipeMsgPrefix>() == sizeof<PipeMsgRecord>() - PIPE_BODY_BYT
               "the kernel's message prefix must be exactly the record sosabi publishes, less its body")
 
 /// The same, for a `Take` — an obligation in front of a message.
+///
+/// The request word is a doubleword here. `PipeTakeRecord` is a `UInt` and then
+/// padding up to the message record's doubleword alignment, four bytes of it on
+/// a 32-bit profile, and the profiles the kernel runs on are little-endian, so
+/// the word zero-extended to a doubleword is the same bytes with the padding
+/// written as zero and no stack bytes to leak.
 public(package) struct PipeTakePrefix {
-    public(package) request: UInt,
+    public(package) request: UInt64,
     public(package) msg: PipeMsgPrefix,
 }
 
 static_assert(sizeof<PipeTakePrefix>() == sizeof<PipeTakeRecord>() - PIPE_BODY_BYTES,
               "the kernel's take prefix must be exactly the record sosabi publishes, less its body")
 
-/// Assemble a message prefix out of a length and a completed rendezvous. The
-/// one place the two halves of a delivered message are put together, so a take,
-/// a resolve and a fused call's reply cannot disagree about the layout.
-public(package) func msg_prefix(len: UInt, moved: &StagedHandles) -> PipeMsgPrefix {
+/// Assemble a message prefix out of a length, the sender's pid and a completed
+/// rendezvous. The one place the halves of a delivered message are put
+/// together, so a take, a resolve and a fused call's reply cannot disagree
+/// about the layout.
+public(package) func msg_prefix(len: UInt, sender: UInt64,
+                                moved: &StagedHandles) -> PipeMsgPrefix {
     var rec = PipeMsgPrefix(meta: PipeMsgMeta(len: len as UInt8,
                                               kinds: [0; PIPE_MSG_HANDLES]),
                             pad: [0; MSG_META_PAD],
-                            handles: [NO_HANDLE; PIPE_MSG_HANDLES])
+                            handles: [NO_HANDLE; PIPE_MSG_HANDLES],
+                            sender: sender)
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
         rec.meta.kinds[i] = moved.kinds[i]
@@ -1299,6 +1312,7 @@ struct WaitPrefix {
     meta: PipeMsgMeta,
     pad: [UInt8; MSG_META_PAD],
     handles: [UInt; WAIT_HANDLE_SLOTS],
+    sender: UInt64,
 }
 
 static_assert(sizeof<WaitPrefix>() == sizeof<WaitBuffer>() - PIPE_BODY_BYTES,
@@ -1319,24 +1333,17 @@ static_assert(sizeof<WaitPrefix>() == sizeof<WaitBuffer>() - PIPE_BODY_BYTES,
 /// leave it nowhere to go next. The door reports, and the callers that can kill
 /// are the ones above the switch point.
 ///
-/// The copy is sized to the delivery, in two lengths. A delivery carrying
-/// neither handles nor bytes writes `wait_meta_end_bytes()` and stops, which
-/// covers almost every delivery (Event, Interrupt, Timer, death, room level,
-/// abandoned claim, plain readable outlet). Only a message writes the handle
-/// words, and only a message with data writes a body. The meta, inside the
-/// short length, tells a decode which happened.
+/// The copy is sized to the delivery, in two lengths. A delivery that is not a
+/// message writes `wait_meta_end_bytes()` and stops, which covers almost every
+/// delivery (Event, Interrupt, Timer, death, room level, abandoned claim, plain
+/// readable outlet). A message (`message`: a reply carrying an answer, an empty
+/// one included, or the delivery-as-take) writes the handle words and the
+/// sender, whatever else it carries, and a message with data writes a body. The
+/// meta, inside the short length, tells a decode which happened.
 func deliver_wait_record(p: Int, dst: UInt, rec: &var WaitPrefix,
-                         body_src: UInt) unsafe {
-    var carries = rec.meta.len != 0
-    var i: Int = 0
-    while i < WAIT_HANDLE_SLOTS {
-        if rec.handles[i] != NO_HANDLE {
-            carries = true
-        }
-        i = i + 1
-    }
+                         body_src: UInt, message: Bool) unsafe {
     var bytes = wait_meta_end_bytes() as UInt
-    if carries {
+    if message {
         bytes = wait_prefix_bytes() as UInt
     }
     if let why = copy_out(p, dst, ((&var rec) as UnsafePointer<WaitPrefix>) as UInt,
@@ -1467,9 +1474,12 @@ public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe -> Sos
                          meta: PipeMsgMeta(len: answer.body_len as UInt8,
                                            kinds: [0; PIPE_MSG_HANDLES]),
                          pad: [0; MSG_META_PAD],
-                         handles: [NO_HANDLE; WAIT_HANDLE_SLOTS])
+                         handles: [NO_HANDLE; WAIT_HANDLE_SLOTS],
+                         sender: 0)
 
-    if reply_carries_handles(kind, &answer) {
+    let message = reply_carries_handles(kind, &answer)
+    if message {
+        rec.sender = EXCHANGES[target].sender_pid
         // The pre-flight, before anything is spent. `staged_count` is exact:
         // the refs are the kernel's own, so what the reply carries is what the
         // claimant will be handed.
@@ -1485,7 +1495,7 @@ public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe -> Sos
         }
     }
 
-    deliver_wait_record(p, dst, &var rec, answer.body_src)
+    deliver_wait_record(p, dst, &var rec, answer.body_src, message)
     waitable_consume(kind, target)
 
     if ends {
@@ -1538,7 +1548,8 @@ func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
                          meta: PipeMsgMeta(len: EXCHANGES[x].len as UInt8,
                                            kinds: [0; PIPE_MSG_HANDLES]),
                          pad: [0; MSG_META_PAD],
-                         handles: [NO_HANDLE; WAIT_HANDLE_SLOTS])
+                         handles: [NO_HANDLE; WAIT_HANDLE_SLOTS],
+                         sender: EXCHANGES[x].sender_pid)
     rec.handles[WAIT_REQUEST_SLOT] = request
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
@@ -1546,7 +1557,7 @@ func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
         rec.handles[WAIT_MSG_SLOT_0 + i] = moved.words[i]
         i = i + 1
     }
-    deliver_wait_record(p, dst, &var rec, exchange_body_addr(x))
+    deliver_wait_record(p, dst, &var rec, exchange_body_addr(x), true)
 
     // Consumed by delivery, and only after the copy succeeded (`pipe_take`'s
     // ordering), which makes "a staged message is handed over exactly once"
@@ -1747,7 +1758,8 @@ func wake_call_reply(t: Int, x: Int) unsafe {
             result = op_status(mint_refusal(p))
         } else {
             let moved = mint_staged(x, p)
-            var rec = msg_prefix(answer.body_len, &moved)
+            var rec = msg_prefix(answer.body_len, EXCHANGES[x].sender_pid,
+                                 &moved)
             if let why = copy_out(p, dst,
                                   ((&var rec) as UnsafePointer<PipeMsgPrefix>) as UInt,
                                   sizeof<PipeMsgPrefix>() as UInt) {
@@ -1861,6 +1873,9 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
         }
     }
     EXCHANGES[x].len = len as UInt16
+    // The caller is the process whose thread made the call, not whichever
+    // process freed the room.
+    stamp_sender(x, p)
     // The handle words are re-validated here, and have to be. The record was
     // re-read from the caller's memory just above, so a sibling thread may have
     // rewritten it since `check_send` blessed it; `hold_staged` therefore asks

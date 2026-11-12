@@ -1,0 +1,157 @@
+// What bounds the sender handle (spec §2.1, §2.7).
+//
+// Root stages a tell, launches a server that takes it and asks for the
+// sender, and decides before the server runs what its ceilings allow. The
+// server prints what the handle it was given carries, three times over three
+// ceilings:
+//
+//   SOS pidrights: default ceilings
+//   SOS pidserver: sender handle rights=1049600
+//                      `Wait | Stats` (1024 + 1048576), the observe set
+//   SOS pidrights: a Process ceiling without Stats
+//   SOS pidserver: sender handle rights=1024
+//                      the observe set cut to `Wait`: the ceiling caps the
+//                      handle the op mints
+//   SOS pidrights: a PipeRequest ceiling without Sender
+//                      the obligation the server takes lacks the right, and
+//                      the ask ends the server with access denied (the §8
+//                      status word, `Faulted` in the high half and 3 in the
+//                      low)
+//   SOS pidrights: an empty Process ceiling
+//   SOS pidserver: sender handle rights=0
+//                      the ask still succeeds, and the handle carries nothing:
+//                      an empty intersection is a handle with no rights
+//   SOS pidrights: done
+//
+// Each server keeps `Wait`, `BootHandles` and `Exit` on its Process handle,
+// which it needs to read its boot set and leave.
+
+import sos.{System, Process, Memory, PipeInlet, PipeOutlet, Waiter, SosStatus,
+            SystemRight, ProcessRight, PipeRequestRight, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 21
+static TAG_OUTLET: UInt = 22
+static TAG_EMPTY: UInt = 23
+static KEY_DEATH: UInt = 6
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// What a server keeps when its Process ceiling is narrowed: enough to drain
+/// its boot set and exit, and `Wait` from the observe set.
+static NO_STATS: UInt32 = (ProcessRight.Wait | ProcessRight.BootHandles
+                           | ProcessRight.Exit)
+
+/// A server's PipeRequest ceiling without `Sender`.
+static NO_SENDER: UInt32 = (PipeRequestRight.Transfer | PipeRequestRight.Reply
+                            | PipeRequestRight.Wait)
+
+/// The §8 status words: `Exited` with the server's code 5, and `Faulted` with
+/// `AccessDenied`.
+static ASKED: UInt = 65541
+static DENIED: UInt = 131075
+
+static_assert((1 * 65536) + 5 == 65541,
+              "an asking server's status word is Exited and its code")
+static_assert((2 * 65536) + 3 == 131075,
+              "a refused server's status word is Faulted and AccessDenied")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pidrights: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS pidrights: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS pidrights: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let _ = system.debug_print("SOS pidrights: default ceilings\n")
+    try serve(&system, &proc, &image, &ram, 0, ASKED)
+
+    let _ = system.debug_print(
+        "SOS pidrights: a Process ceiling without Stats\n")
+    try serve(&system, &proc, &image, &ram, 1, ASKED)
+
+    let _ = system.debug_print(
+        "SOS pidrights: a PipeRequest ceiling without Sender\n")
+    try serve(&system, &proc, &image, &ram, 2, DENIED)
+
+    let _ = system.debug_print("SOS pidrights: an empty Process ceiling\n")
+    try serve(&system, &proc, &image, &ram, 3, ASKED)
+    return
+}
+
+/// Launch one server with the ceiling `narrow` chooses (0 none, 1 Process, 2
+/// PipeRequest, 3 the server empties its own Process ceiling), after staging a
+/// tell for it, and require `status` when it ends.
+func serve(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+           narrow: Int, status: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 1
+    let claim = try inlet.post(body: &body, len: 1)
+    let _ = move claim
+    if narrow == 1 {
+        try child.restrict_rights(process: NO_STATS)
+    }
+    if narrow == 2 {
+        try child.restrict_rights(request: NO_SENDER)
+    }
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    var tag = TAG_OUTLET
+    if narrow == 3 {
+        tag = TAG_EMPTY
+    }
+    try child.give(outlet: move outlet, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(ended) -> {
+            if key != KEY_DEATH { return BUG }
+            if ended != status {
+                print("SOS pidrights: the server ended with status {}\n", ended)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = move inlet
+    return
+}

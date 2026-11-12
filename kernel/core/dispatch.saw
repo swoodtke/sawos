@@ -116,6 +116,7 @@ import sosabi.{
     pipe_outlet_rights,
     pipe_reply_rights,
     pipe_request_rights,
+    process_observe_rights,
     NO_HANDLE,
     RELEASE_OP,
     MINT_OP,
@@ -204,6 +205,8 @@ import kcore.objects.{
     stage_peek,
     stage_pop,
     stage_push,
+    sender_alive,
+    stamp_sender,
     compact_mapping_rows,
     boot_handle_room,
     boot_handle_take,
@@ -222,8 +225,8 @@ import kcore.objects.{
     unbind_handle,
 }
 import kcore.diag.{console, fatal_kernel}
-import kcore.stats.{stats_bump, stats_clear, stats_read, stats_region_phys,
-                    stats_region_len}
+import kcore.stats.{stats_bump, stats_clear, stats_name, stats_read,
+                    stats_region_phys, stats_region_len}
 import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment,
                    hold_staged, is_outlet_of, mint_staged, move_entry, msg_prefix,
                    notify_claim, notify_if_ready,
@@ -282,6 +285,7 @@ import kcore.waitables.{
 }
 import kcore.process.{
     alloc_process,
+    assign_pid,
     link_process,
     copy_in,
     copy_in_check,
@@ -682,9 +686,9 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
         // they are written into, so self-inspection is `ProcessSelf` followed
         // by this call and supervision is the same call on a child's handle.
         //
-        // `arg0` is the answer buffer and `arg1` its capacity: three 64-bit
-        // columns do not fit a value register, so the answer rides the copy-out
-        // funnel.
+        // `arg0` is the answer buffer and `arg1` its capacity: four 64-bit
+        // columns (three counters and the pid) do not fit a value register, so
+        // the answer rides the copy-out funnel.
         //
         // A `Gone` process reads normally, which is the point of the `faults`
         // column: a process that faulted is dead and cannot ask, but its
@@ -1117,6 +1121,7 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
         return op_status(mint_refusal(p))
     }
     link_process(slot, body)
+    let pid = assign_pid(slot)
 
     // Only now does anything happen to the destination region.
     //
@@ -1169,13 +1174,14 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     // `Gone` record, so a stale copy here could not be read; it is reset with
     // the rest.
     PROCESS_RECORDS[slot].final_stats = StatsRow(syscalls: 0, interrupts: 0,
-                                                 faults: 0)
+                                                 faults: 0, pid: 0)
     // The columns open at zero. The body may be a reused one, and this is the
     // line that keeps a child from inheriting its predecessor's traffic and
     // reading a first `stats()` that describes a program it never was. It
     // clears the body's row of the shared region; a supervisor watching the
     // page sees the row go to zero exactly here.
     stats_clear(body)
+    stats_name(body, pid)
 
     // The child's ledger opens here, after `place_image`: `free_rows` is what
     // this child's domain has left once its image has spent its own rows, and
@@ -1468,7 +1474,7 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
 // region is an array of the published row, so the op and the region are one
 // declaration and cannot drift.
 
-/// Copy `target`'s three trap columns into `p`'s buffer.
+/// Copy `target`'s trap columns and pid into `p`'s buffer.
 ///
 /// Two processes are involved, and the asymmetry is the op. `target` is whose
 /// counters are read (the handle's record, so a supervisor asking about a
@@ -1487,7 +1493,7 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
 /// your own writable memory is a mistake only you could have made).
 ///
 /// It is the compatibility floor for callers that do not want a mapping or do
-/// not hold `SystemRight.StatsRegionMap`: they get the same three numbers,
+/// not hold `SystemRight.StatsRegionMap`: they get the same numbers,
 /// consistent by construction because, for a live process, this reads the very
 /// storage the region publishes.
 ///
@@ -1508,6 +1514,9 @@ func process_stats(p: Int, target: Int, dst: UInt, cap: UInt) unsafe -> SyscallR
     } else {
         PROCESS_RECORDS[target].final_stats
     }
+    // The pid is the record's: it is what a `Gone` process keeps, and a live
+    // row's copy of it is written once at the create.
+    rec.pid = PROCESS_RECORDS[target].pid
     if let why = copy_out(p, dst,
                           ((&var rec) as UnsafePointer<StatsRow>) as UInt,
                           process_stats_record_bytes() as UInt) {
@@ -3532,6 +3541,7 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
     // width. An out-of-range value here would be a kernel bug, which is when
     // `as` is the right spelling.
     EXCHANGES[x].len = len as UInt16
+    stamp_sender(x, p)
     // The handles leave the sender here (take at post). This is the last line
     // that can change anything the caller owns and every refusal is already
     // behind it, so the message is committed from this point and nothing the
@@ -3643,6 +3653,7 @@ func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
         }
     }
     EXCHANGES[x].len = len as UInt16
+    stamp_sender(x, p)
     hold_staged(p, x, &args, slot)
     // One column at one for a thread rather than for a handle: the only line
     // here that is not `pipe_post`'s. The asymmetry with the request column
@@ -3759,7 +3770,9 @@ func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt) unsafe -> Syscal
     let moved = mint_staged(x, p)
 
     let len = EXCHANGES[x].len as UInt
-    var rec = PipeTakePrefix(request: request, msg: msg_prefix(len, &moved))
+    var rec = PipeTakePrefix(request: request as UInt64,
+                             msg: msg_prefix(len, EXCHANGES[x].sender_pid,
+                                             &moved))
     // The one door outward, twice, as one contiguous prefix ending at the
     // message's length: the fixed part, then the bytes straight out of the ring
     // slot. A short message pays for no part of the body region.
@@ -3905,7 +3918,7 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
                 return op_status(why)
             }
             let moved = mint_staged(x, p)
-            var rec = msg_prefix(len, &moved)
+            var rec = msg_prefix(len, EXCHANGES[x].sender_pid, &moved)
             if let why = copy_out(p, dst,
                                   ((&var rec) as UnsafePointer<PipeMsgPrefix>) as UInt,
                                   sizeof<PipeMsgPrefix>() as UInt) {
@@ -4072,7 +4085,47 @@ func pipe_request_op_decoded(op: PipeRequestOp, obj: &PipeRequestObject,
             }
             pipe_reply_wait(p, obj.handle, obj.slot, arg0, arg1, arg2)
         },
+        // The sender handle (spec §2.1). Holding the obligation is the whole
+        // authority, so the only gate is this bit; the op consumes nothing.
+        case Sender -> {
+            if not obj.allows(PipeRequestRight.Sender) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            pipe_request_sender(p, obj.slot)
+        },
     }
+}
+
+/// Mint `p` a Process handle onto the sender of the request exchange `x`
+/// carries: the observe set, capped by `p`'s Process ceiling.
+///
+/// The answers come in a fixed order. A sender that is no longer live is
+/// `Revoked` and mints nothing: the exchange kept no reference, so the record
+/// is trusted only if it is live and still holds the pid the exchange kept
+/// (`sender_alive`), and a record another handle still pins is as dead as a
+/// reclaimed one. Then the mint: a caller at its handle budget answers
+/// `QuotaExceeded` and one with a full table `NoResource`.
+///
+/// No second name can ask after the reply. The reply rewrites the exchange's
+/// sender fields to the replier's, so a request handle that outlived it would
+/// name the replier; none can, because `pipe_request_rights()` has no `Mint`,
+/// which leaves an obligation one handle, and `Reply` and `ReplyWait` consume
+/// it.
+///
+/// The new handle is a reference on the sender's record, counted as
+/// `SystemOp.ProcessSelf`'s is. The exchange is left alone: the obligation is
+/// not consumed and the reply is still owed.
+func pipe_request_sender(p: Int, x: Int) unsafe -> SyscallResult {
+    if not sender_alive(x) {
+        return op_status(SosStatus.Revoked)
+    }
+    let r = EXCHANGES[x].sender_rec
+    let handle = mint_capped(p, ObjType.Process, process_observe_rights(), r)
+    if handle == NO_HANDLE {
+        return op_status(mint_refusal(p))
+    }
+    ref_object(ObjType.Process, r)
+    op_value(handle)
 }
 
 /// Write the reply and discharge the obligation, either way (spec §2.1).
@@ -4122,6 +4175,10 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
                 }
             }
             EXCHANGES[x].len = len as UInt16
+            // The replier is now the sender of what the slot holds. The
+            // request's sender is read only through the obligation this reply
+            // consumes.
+            stamp_sender(x, p)
             // The reply direction stages into the same slots the request used,
             // and they are provably empty: the take that produced this
             // obligation moved every handle the request carried and cleared the
