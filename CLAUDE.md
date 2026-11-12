@@ -125,15 +125,20 @@ time-based case asserts that some time passed, never how much:
   (a count the kernel keeps, the other thread's progress) and not on the
   clock. That a wait finished at all is the harness timeout's job;
 - a timing-dependent value may be printed for a reader and left out of the
-  expected text. Three cases do:
+  expected text. These do:
   `thread_preempt`'s `SOS: timer tick` lines and its `interrupts=` count;
-  `timer_interval`'s `fires=` counters on the first two waits; and
-  `process_stats`' `interrupts=` count (the column is printed and never
-  asserted, because a tick lands where the host puts it).
+  `timer_interval`'s `fires=` counters on the first two waits;
+  `preempt_tick`'s `ticks taken=` count (the case asserts that the first tick
+  was taken at a preemption point, and a delayed look at the counter can find
+  more than one); and `process_stats`' `interrupts=` count (the column is
+  printed and never asserted, because a tick lands where the host puts it).
+  `timer_masked_in_kernel`'s `ticks taken=0` is asserted: interrupts are
+  masked in the kernel, so no length of section can raise it.
 
-A wake never preempts the running thread (only a tick and a block request a
-reschedule), so a case that parks a launcher on a Timer to let a child run
-orders them by scheduling, not by the clock, and a stall cannot reorder them.
+A wake never preempts the running thread (only a tick, a yield, a block and a
+thread's exit request a reschedule), so a case that parks a launcher on a
+Timer to let a child run orders them by scheduling, not by the clock, and a
+stall cannot reorder them.
 `thread_preempt` asserts `AB`, `BA`, `AB` as ordered adjacent pairs, which is
 "the processor crossed between the two threads at least three times, whoever
 went first". Each worker spins until the other has printed, so the crossings

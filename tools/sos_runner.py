@@ -1319,19 +1319,20 @@ TEST_CASES = [
         # proof: the section runs until the tick counter moves, and in kernel
         # mode nothing but a preemption point can move it (a hardware delivery
         # here is each HAL's kernel-bug path). A broken poll is a timeout, not
-        # a wrong number, and the ticks-taken line asserts the count as well as
-        # the order.
+        # a wrong number. The ticks-taken count is printed and not asserted:
+        # ticks accrue with host time, and a delayed look at the counter can
+        # find more than one.
         #
         # `at {one}` is `PREEMPT_PC`, the sentinel a tick taken at a point
         # reports (the idle poll's is zero, and a real interrupted PC is even
         # on every profile). Asserting it says which of the three deliveries
-        # ran.
+        # ran, for the first tick, which the loop's exit condition requires.
         "name": "preempt_tick",
         "src": os.path.join(TESTS_DIR, "preempt_tick.saw"),
         "asm": "payload_spin.S",
         "expect_out": ["SOS M3: kernel section begin",
                        "SOS: timer tick {one} at {one}",
-                       "SOS M3: kernel section end, ticks taken={one}",
+                       "SOS M3: kernel section end, ticks taken=",
                        "SOS M3: entering U-mode"],
         "expect_clean_exit": True,
     },
