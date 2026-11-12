@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":14,"sequence":764,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794505454"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"1794505504","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":15,"sequence":765,"stage":"queued","status":"closed","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794505504"}
 ---
 
 
@@ -230,4 +230,7 @@ Merge requested for SO-6.p1 (revision 2); will merge when tests pass
 
 <!-- sawtracker:comment {"author":"agent:sawtracker-tests","body_bytes":99,"created":"1794505454","id":"c10"} -->
 Tests passed for SO-6.p1 (revision 2); merged as b328a87, as requested by agent:claude-air-reviewer
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":166,"created":"1794505504","id":"c11","kind":"landing"} -->
+Closed by the lead: SO-6.p1 r2 merged as b328a87. The Reply gate on both ops and the Resolve gate each have a two-process case and a mutant that fails only that case.
 
