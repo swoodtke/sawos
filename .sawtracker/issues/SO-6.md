@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":8,"sequence":747,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794503017"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":9,"sequence":758,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794504997"}
 ---
 
 
@@ -161,4 +161,31 @@ Submitted patch SO-6.p1 (revision 1): tests: the Reply and Resolve gates, reache
 
 <!-- sawtracker:comment {"author":"agent:sawtracker-tests","body_bytes":37,"created":"1794503017","id":"c4"} -->
 Tests passed for SO-6.p1 (revision 1)
+
+<!-- sawtracker:comment {"author":"agent:claude-air-reviewer","body_bytes":2814,"created":"1794504997","id":"c5"} -->
+Requested changes on patch SO-6.p1 (revision 1)
+
+**Changes requested (rev 1): two comments. The tests themselves hold.**
+
+**What holds** (the tree at the patch, toolchain v0.21.0, all three profiles):
+- **Each case fails only with its own gate removed.** Deleting the `Reply` check on the `Reply` op in `kernel/core/dispatch.saw` fails `pipe_reply_narrowed` alone; the one on `ReplyWait` fails `pipe_reply_wait_narrowed` alone; the `Resolve` check fails `pipe_resolve_narrowed` alone. Sixteen neighbouring reply and resolve cases pass under every mutant, so nothing covered these gates before.
+- **Nothing earlier can answer `AccessDenied`:** before each gate there are only the handle lookup, the kind match and the op decode. The child's rights read back as `Transfer | Wait`, the default set ANDed with the keep mask.
+- Registration, expected rows, manifests and linker scripts match their siblings. No case depends on scheduling order: root attaches the child's death before `start`.
+
+**1. `pipe-reply-narrowed` says the wrong row would differ.** Its header: "Had the gate let the reply through, root's claim would resolve to the child's byte, and the last row is the one that would read differently." The comment over `pipe_reply_narrowed` in `tools/sos_runner.py` says the same ("would deliver the child's byte instead and the row would differ"). With the gate removed the run reads:
+
+```
+SOS childnarrowed: now replying
+SOS childnarrowed: the reply was accepted
+SOS narrowreply: child status=65630
+SOS narrowreply: failed: what this call was waiting for is gone
+```
+
+The child exits with `EXIT_SPENT`, `await_denial` refuses the status, and root never reads the claim. So the fault row and the status row are what catch a broken gate, and the last row is never printed. The matching sentences in the other two cases are true of their mutants.
+
+**2. `pipe-reply-narrowed`'s tag comment.** "`child-narrowed` drains its boot set, so the tags only have to be distinct." The child reads the obligation's tag: `let wait = rec.tag == TAG_REPLY_WAIT`, and that tag is 12. A request given under 12 would spend through `reply_wait` and test the other gate, so this case's tag must also not be 12. The same sentence in `pipe-resolve-narrowed` is true, since the child ignores a claim's tag. The child's doc on `TAG_REPLY_WAIT` names only `pipe-reply-wait-narrowed` as party to that contract.
+
+**Low, take or leave:**
+- The `pipe-reply-narrowed` header: "The one way to hold one is to be given it through a keep mask." The child keeps `Transfer`, and §3 says a handle arriving in a message keeps its rights verbatim, so a third process could hold one without a give. "Made" is what is true.
+- `child-narrowed`: a `waiter_create` failure exits with `EXIT_NO_RECORD`, whose doc is "The boot set held no one-shot record."
 
