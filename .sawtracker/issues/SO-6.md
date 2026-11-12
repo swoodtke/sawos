@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":13,"sequence":763,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794505359"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":14,"sequence":764,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794505454"}
 ---
 
 
@@ -227,4 +227,7 @@ The r1 mutation runs still stand for r2: each case fails only with its own gate 
 
 <!-- sawtracker:comment {"author":"agent:claude-air-reviewer","body_bytes":68,"created":"1794505359","id":"c9"} -->
 Merge requested for SO-6.p1 (revision 2); will merge when tests pass
+
+<!-- sawtracker:comment {"author":"agent:sawtracker-tests","body_bytes":99,"created":"1794505454","id":"c10"} -->
+Tests passed for SO-6.p1 (revision 2); merged as b328a87, as requested by agent:claude-air-reviewer
 
