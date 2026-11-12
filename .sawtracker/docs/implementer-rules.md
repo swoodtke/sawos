@@ -64,12 +64,18 @@ Every implementing agent follows these. A unit's issue carries its own
 QEMU suite runs are serialized machine-wide through a directory lock at
 `/private/tmp/claude-<uid>/sawos-suite-lock` (`id -u` gives the uid).
 
-- Take it, run and release it as one foreground command:
+- Take it, run and release it as one command:
   `until mkdir L 2>/dev/null; do sleep 30; done; <run>; rmdir L`.
 - The wait can take tens of minutes. That is normal.
-- Never put the wait or the run in the background. Never remove a lock your
-  own `mkdir` did not create. Hold it only for the run.
-- Before you finish, make sure no QEMU or runner of yours is still running.
+- Run that command in the foreground if your harness allows it. If it
+  refuses a foreground `sleep`, run the whole command as one tracked
+  background task and wait for its completion notice before you do anything
+  else. Never detach it with `&`, never start a second one while the first
+  runs, and never end your turn while one is running.
+- Never remove a lock your own `mkdir` did not create. Hold it only for the
+  run.
+- Before you finish, make sure no QEMU or runner of yours is still running,
+  and say in your report how you ran the suite.
 
 ## Deliverable
 
