@@ -44,7 +44,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. The process-sleep primitive. §2.6. |
 | `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it and ack through the handle. One op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `SystemOp.InterruptBind` on `SystemRight.InterruptBind`, because a line is a machine-wide resource (§2.8). The binding is the object's existence (creation takes the line, there is no rebind), which stops one handle naming two devices over its life. It has one name, its handle, and releasing that handle destroys it (§2.10). A line the board does not have, the timer's line, and a line already bound are all faults. §9. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style). Ops `Add`/`Remove`/`Wait`; rights `WaiterRight.Attach`/`.Wait`; the wait answer is a copy-out record. §2.2. |
-| `Process` | Two entries: a small record (the state, the status word, the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit or fault — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
+| `Process` | Two entries: a small record (the state, the status word, the pid (not yet enforced), the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit or fault — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
 | `System` | Kernel singleton: the object behind system-scoped primitives, so that every syscall is an object op (§5.7). §2.8. |
 
 The kinds are System, Process, Thread, Event, Waiter, Interrupt, Clock, Timer,
@@ -92,7 +92,9 @@ it is lowered at each half — so a transfer changes no count and a message in
 flight changes none either. The price is the unwind: an arm that drops a staged
 message must release what it was holding, which is the outlet's zero-arm and
 every `exchange_settle`. The inlet's zero-arm must not, because
-close-drains-first says the message is still owed to a live outlet.
+close-drains-first says the message is still owed to a live outlet. A message's
+sender is not among what it holds: the pid it carries is a name, not a
+reference (§2.1; not yet enforced).
 
 **Last rites.** Three kinds hold something outside their slab and act on it when
 they are destroyed, whether by a free or by an invalidation (§2.10): an
@@ -241,8 +243,9 @@ A full ring at `Post` and an empty one at `Take` both answer
 and `post` carry no Optionals, and a genuine poller declares itself with a
 `WouldBlock` arm. `PipeReplyOp.Resolve` and `PipeRequestOp.Reply` each spend
 their own right (`PipeReplyRight.Resolve`, `PipeRequestRight.Reply`) and each
-destroy the caller's handle entry. `PipeInletOp.Call`, `PipeRequestOp.ReplyWait`
-and `PipeReplyOp.Ready` are described below.
+destroy the caller's handle entry. `PipeInletOp.Call`,
+`PipeRequestOp.ReplyWait`, `PipeReplyOp.Ready` and `PipeRequestOp.Sender` (not
+yet enforced) are described below.
 
 **Peer-closed is read off the columns** — the peer-gone doctrine (§2.2). The
 outlet column reaching zero drops what is staged, and every later `Post`
@@ -367,8 +370,25 @@ abandoned by its teardown, and the server's later `reply()` answers
 handles on `Post`, `Call`, `Reply` and `ReplyWait` alike — `send` is one
 sentence, and the answering direction is not a different one — and all four
 take the message through one argument record, because a body address, a length
-and the handle words do not fit three registers. `Take` and `Resolve` answer
-through one copy-out record.
+and the handle words do not fit three registers. The answers come back
+through two copy-out records, laid out in declaration order (§5.7):
+
+- **The message record** is what `Resolve` and a fused `Call`'s reply write,
+  and it lays a message out as §2.2's wait record does: the packed meta (one
+  length byte and `PIPE_MSG_HANDLES` kind bytes), then, aligned to a word, the
+  `PIPE_MSG_HANDLES` handle words, then, aligned to a doubleword, the sender's
+  pid (below), then `PIPE_BODY_BYTES` of body.
+- **The take record** is what `Take` writes: the obligation's handle word
+  first, then a message record aligned to a doubleword, since the message
+  record holds a doubleword. On the 32-bit profile that leaves four bytes of
+  padding after the obligation's word; on the 64-bit profile there are none.
+
+Every gap the alignment leaves is padding, and the kernel writes every padding
+byte as zero, so a record carries nothing of the kernel's own memory. `sosabi`
+publishes each record's size and body offset, and a copy-out is the prefix
+that ends at the message's length. Not yet enforced: neither record has the
+sender's pid, so the body follows the handle words and the take record has no
+padding.
 
 **A send is half of a move — take-at-post.** The handles a message carries
 leave the sender at the post: each entry is unbound, the reference it held is
@@ -421,6 +441,99 @@ obligation in a message and exits, and a far process answers it, the bytes
 landing at root's original claim. The middle is a different principal from
 both ends — its own table, its own quota, its own death — and the answer lands
 after that death, which take-at-post makes irrelevant.
+
+**Every message carries its sender's pid.** The kernel writes the pid (§2.7) of
+the sending process into each message at the op that sends it, and the
+receiver reads it in the record the message arrives in. No argument record has
+a field for it, so a sender cannot write it and cannot claim to be another
+process.
+
+- **The sender is the process whose thread made the op**: `Post` and `Call`
+  stamp the client, `Reply` and `ReplyWait` stamp the replier. A `Call` that
+  parked for room is staged later, from whichever context freed the slot, and
+  is stamped with the process that made the call.
+- **It is the immediate sender.** A process that forwards what it received, or
+  answers through an obligation it was handed, is what its receiver sees, and
+  never the process that began the conversation: in `tests/delegate-3p` the
+  middle's message to the far process carries the middle's pid, and the answer
+  root receives carries the far process's.
+- **Every door that hands a message over carries it**: the `Take` record, the
+  reply record of a `Resolve` and of a fused `Call`, and a wait record that
+  delivers a message (tag `Message`, or tag `Reply` carrying an answer, §2.2).
+  A `PeerClosed` reply carries none, since no message arrived.
+- **It outlives the sender.** A message staged by a process that has since died
+  still carries that process's pid, and because no pid is ever assigned twice
+  it names that process and no other.
+- **It costs a ring slot two fields and no reference.** The slot keeps the
+  sender's pid and the index of its record beside the message it holds: the
+  request's sender, then the replier once the reply is written. Neither is a
+  counted reference, so a staged message does not keep its sender's record
+  alive, and a sender that dies with messages in flight is reclaimed on the
+  ordinary rule (§2.7). The index alone could name a reused record, which is
+  what the pid beside it rules out (below).
+
+**The sender handle.** `PipeRequestOp.Sender`, gated by
+`PipeRequestRight.Sender`, mints a Process handle onto the process that sent
+the request an obligation answers. Holding the obligation is the authority: the
+kernel minted it to whoever received the message, and it moves only as a
+capability moves, so no System right is asked for.
+
+- **What it mints.** One Process handle in the caller's table, naming the
+  sender's record, carrying the observe set (`ProcessRight.Wait |
+  ProcessRight.Stats`, §2.7) intersected with the caller's Process ceiling, and
+  charged to the caller's `Handle` row (§2.9). It takes no argument. Every call
+  mints a fresh handle, as every getter does (§3). The observe set carries
+  neither `Transfer` nor `Mint`, so the handle stays where it was minted; with
+  `Stats` it reads the sender's pid (§2.7), and with `Wait` a server that
+  caches it learns when the sender dies and can release it, since a cached
+  handle holds the record once the sender is `Gone` (§2.10).
+- **Which messages it serves.** Every message a take or a delivery hands over
+  comes with an obligation (§2.2), so the op serves every request: a post, a
+  fused call, a delivery-as-take, and a tell, whose abandoned obligation the
+  server holds until it releases it. It works for as long as the obligation
+  exists: `Reply` and `ReplyWait` consume it and a release drops it.
+- **It names the request's sender, wherever the obligation has gone.** The
+  obligation names its exchange and not its holder, so a far process holding a
+  forwarded obligation obtains the original client, while the obligation that
+  arrived with the forwarding message names the middle. A server that forwards
+  an obligation forwards the ability to name its client.
+- **A reply has no obligation**, so its receiver learns the replier's pid from
+  the record and obtains no handle through it.
+- **A dead sender answers `Revoked`**, and nothing is minted. The sender is
+  dead once it is `Gone`, whether or not its record has been reclaimed, so the
+  answer does not depend on whether some other holder keeps the record, and the
+  op never extends the life of a dead process's record. `Revoked` is the word
+  every op acting on a `Gone` process answers (§2.10), and it is a status
+  because the receiver could not have known.
+- **How the kernel knows.** The op reads the record at the index the exchange
+  kept and accepts it only if that record is live and holds the pid the
+  exchange kept beside it. A reclaimed record holds no pid and a reused one
+  holds another, so either answers `Revoked` exactly as a `Gone` one does.
+- **Its answers, in the order they are decided.** A word that names nothing
+  is the `BadHandle` fault, and a handle without `PipeRequestRight.Sender` is
+  `AccessDenied`, both on §5.7's dispatch order. Then a dead sender answers
+  `Revoked`. Then the mint: a caller at its handle budget answers
+  `QuotaExceeded`, and one within it whose table is full answers `NoResource`
+  (§2.9's policy first). So a caller at its budget learns that the sender is
+  dead rather than that it must free a slot.
+- **It leaves the exchange alone.** The obligation is not consumed and the
+  reply is still owed; the exchange's state, its columns and its abandoned
+  level are unchanged.
+- **Who can withhold it.** `PipeRequestRight.Sender` is in
+  `pipe_request_rights()`, and an obligation minted at a take or a delivery is
+  capped by the taker's ceiling for the `PipeRequest` kind (§2.7), so narrowing
+  a server's ceiling stops it naming the senders of the requests it takes. A
+  forwarded obligation is a handle its holder received, so it is not capped
+  again (§2.7): it carries `Sender` if it did when its forwarder took it. A
+  message moves a handle with its rights verbatim and a one-shot has no `Mint`
+  to narrow it through, so a forwarder cannot strip the right from an obligation
+  it sends on in a message, and only the forwarder's own ceiling withholds it
+  from the process that receives the obligation. Narrowing the caller's Process
+  ceiling instead narrows what the minted handle carries.
+
+Not yet enforced: no message carries its sender's pid, the records have no
+place for one, and `PipeRequestOp.Sender` and `PipeRequestRight.Sender` do not
+exist.
 
 **The delivery can be the take.** A server that attaches its outlet consuming
 and persistent is handed each message through `wait` itself, with the
@@ -686,43 +799,54 @@ a reply delivery carries, which is why there is one type and not two — and
   `wait_record_bytes()` is written once and read once, since every typed
   caller's buffer comes out of the wrapper's own frame.
 - **The record layout: fixed prefix, variable tail.** A delivery can carry a
-  message, so the record is four regions in this order, and the order is the
+  message, so the record is five regions in this order, and the order is the
   rule:
   1. a **header** of three words — key, tag, payload;
   2. the **packed meta**, one byte of body length followed by one kind byte
      per message handle slot (a `BootHandleKind` value, 0 = empty);
   3. the **handle region**, one word per slot: the request slot first, then
      one per message slot;
-  4. the **body**, `PIPE_BODY_BYTES` of it, last because it is the only
+  4. the **sender**, one doubleword-aligned doubleword: the pid of the
+     process that sent the message (§2.1), 64 bits on every profile because a
+     pid is;
+  5. the **body**, `PIPE_BODY_BYTES` of it, last because it is the only
      region whose used length varies.
 
-  The published capacity a caller must supply is all four together. Bytes
+  The published capacity a caller must supply is all five together. Bytes
   last is what makes every copy-out a contiguous prefix: a delivery carrying
-  handles and no data writes up to the end of the handle region and stops,
-  rather than skipping the body region to reach a region behind it. There are
+  handles and no data writes up to the end of the sender and stops, rather
+  than skipping the body region to reach a region behind it. There are
   exactly two copy lengths — a word-payload delivery ends at the meta (all
-  meta bytes zero, so the decode reads no handle word and no body byte), and a
-  message delivery writes the whole fixed prefix plus the meta's `len`. The
-  length is a byte and not a word, because a number bounded by
-  `PIPE_BODY_BYTES` fits in a byte and has to travel beside the kind bytes
-  anyway. The per-profile answer is the ABI's rather than anybody's
-  arithmetic: declaration order is layout (§5.7), so the meta bytes sit
-  in the padding the word-aligned handle region needs regardless — one machine
-  word of it on the 64-bit profile, two on the 32-bit one — and the fixed
-  prefix stays a whole number of machine words on both, which is what makes
-  "a prefix ending at the body's length" an arithmetic rather than a hope.
-  `sosabi` publishes the region offsets and `static_assert`s all three facts.
+  meta bytes zero, so the decode reads no handle word, no sender and no body
+  byte), and a message delivery (tag `Message`, or tag `Reply` carrying an
+  answer) writes the whole fixed prefix plus the meta's `len`, so its sender
+  is written whatever it carries, an empty answer included. The length is a
+  byte and not a word, because a number bounded by `PIPE_BODY_BYTES` fits in a
+  byte and has to travel beside the kind bytes anyway. The per-profile answer
+  is the ABI's rather than anybody's arithmetic: declaration order is layout
+  (§5.7), so the meta bytes sit in the padding the word-aligned handle region
+  needs regardless — one machine word of it on the 64-bit profile, two on the
+  32-bit one — and the fixed prefix stays a whole number of machine words on
+  both, which is what makes "a prefix ending at the body's length" an
+  arithmetic rather than a hope. `sosabi` publishes the region offsets and
+  `static_assert`s all three facts.
+
+  Not yet enforced: the record has no sender region, so it is the other four
+  regions in the same order, and a reply delivery carrying neither bytes nor
+  handles ends at the meta.
 - **The delivery may be the take.** A consuming, persistent attachment on a
   `PipeOutlet` is handed each message through `wait` itself: its own tag
   (`WaitTag.Message`, distinct from `Readable` because the two say different
   things about the record's shape), the message's bytes in the body, its handles
-  in the message slots, and — minted at the delivery — the obligation to answer,
-  in the request slot. A server built this way holds zero endpoint handles and
-  spends one trap per message it answers, `wait` then `reply_wait` forever, and
-  two for a message it discards (§2.1). **A delivery that mints can be refused,
-  and the refusal is atomic.** The mints a message delivery needs — the
-  obligation and one per carried handle — can meet a full handle table or a
-  spent quota, and that is a resource condition rather than a protocol one. So
+  in the message slots, its sender's pid in the sender region (not yet
+  enforced), and — minted at the delivery — the obligation to answer, in the
+  request slot. A server built
+  this way holds zero endpoint handles and spends one trap per message it
+  answers, `wait` then `reply_wait` forever, and two for a message it discards
+  (§2.1). **A delivery that mints can be refused, and the refusal is
+  atomic.** The mints a message delivery needs — the obligation and one per
+  carried handle — can meet a full handle table or a spent quota, and that is
+  a resource condition rather than a protocol one. So
   the kernel pre-flights the whole batch: if it will not fit, nothing is copied,
   consumed or detached, the message stays staged with its readable level still
   raised, and the waiter is woken with the status and no record — the shape
@@ -1070,12 +1194,13 @@ is §12.
 dead process has to keep is small and what a live one needs is not.
 
 - **The record** holds what must outlive the process: its state and §8 status
-  word (`exit_kind`, `exit_code`), the quota ledger (§2.9), `refs` and the
-  attachment (§2's counted-kinds table), and the final trap counters (`Stats`,
-  below). It is where per-process identity lives. A Process handle names the
-  record, an attachment on one names it, and so does every object charged to
-  the process (its `process` field, or a Mapping's `target`, §2.9), so a handle
-  to a `Gone` process stays valid and reads the status word.
+  word (`exit_kind`, `exit_code`), its pid (below; not yet enforced), the
+  quota ledger (§2.9), `refs` and the attachment (§2's counted-kinds table),
+  and the final trap counters (`Stats`, below). It is where per-process
+  identity lives. A Process handle names the record, an attachment on one
+  names it, and so does every object charged to the process (its `process`
+  field, or a Mapping's `target`, §2.9), so a handle to a `Gone` process stays
+  valid and reads the status word.
 - **The body** holds what only a live process needs: the handle table, the boot
   set, the protection domain and its grant rows, the recorded entry and stack,
   and the thread bookkeeping. A live record names its body. The body is freed at
@@ -1086,10 +1211,45 @@ dead process has to keep is small and what a live one needs is not.
 `NoResource`, a status with no quota asked first (§2.9); a create that finds one
 and not the other takes neither. Root gets a record and a body at boot as a
 child does at its create, the first of each table, so "process 0" names both
-(§8, §12). An op that needs a body answers through a `Gone` process's handle
-exactly as §2.10 rules for it, since the body is gone: the creation ops and a
-`map` naming it answer `Revoked`, `Start` and `Give` are `BadState` faults
-(below), and the self-only ops are `NotSelf` faults.
+(§8, §12). Those numbers are the kernel's indexes and not names: a process
+sees one only as the index of its own stats row, which is keyed by its body
+(below), and root's pid is 1 (below; not yet enforced). An op that needs a
+body answers through a `Gone` process's handle exactly as §2.10 rules for it,
+since the body is gone: the creation ops and a `map` naming it answer
+`Revoked`, `Start` and `Give` are `BadState` faults (below), and the self-only
+ops are `NotSelf` faults.
+
+**Every process has a pid**, a 64-bit number the kernel assigns when it takes
+the process's record: root's at boot, a child's at `ProcessCreate`. Pids come
+from one kernel counter that only increases, so they increase in creation order
+and no pid is assigned twice for as long as the machine runs, whatever becomes
+of the process or its record.
+
+- **Root's pid is 1, and zero is never a pid**, so zero can stand for "no
+  process": a stats row's pid reads zero exactly when no process has ever
+  occupied its body (below). A create that is refused takes no record and
+  assigns no pid.
+- **It is a counter and not a slot.** A record is reused once nothing names it,
+  and a record index paired with a generation would wrap as §3's handle
+  generations do, so a server's pid-keyed table could confuse a new process
+  with an old one. Sixty-four bits do not wrap within any uptime the create
+  path can reach, and the kernel stops the machine rather than assign a pid a
+  second time.
+- **The pid lives in the record**, so a `Gone` process keeps it for as long as
+  its record lives, and `Stats` reads it through any Process handle carrying
+  `ProcessRight.Stats`, live or `Gone` (below).
+- **A pid identifies and grants nothing.** Knowing one is no authority: every
+  handle still comes from a held handle (§3). The one op that will accept a
+  pid is a System op that looks a process up by it, behind a System right of
+  its own; it is not built and not specified here, and until it is, no op
+  accepts a pid.
+- **Where pids appear:** in every pipe message, as its sender (§2.1), and in
+  the stats record and the stats region's rows (below). A server keys its
+  clients by the pid each message carries, and matches a Process handle it got
+  by another route, a sender handle (§2.1) or a launcher's, against that table
+  by reading the handle's pid.
+
+Not yet enforced: no process has a pid.
 
 **Ops**, each on its own `ProcessRight`: the creation ops `ThreadCreate`,
 `EventCreate`, `WaiterCreate` and `PipeCreate`, then `ThreadSelf`, `Exit`,
@@ -1133,18 +1293,27 @@ three groups:
   that started it knows. No thread of a `Created` child can run (below), so
   none can end it; the loss of its last name does (below).
 
-**The default set.** One Process default set serves all three minters (root's,
-`ProcessSelf`'s and `ProcessCreate`'s), named for its ops throughout:
-`ThreadCreate`, `ThreadSelf`, `Exit`, `Wait`, `EventCreate`, `WaiterCreate`,
-`Start`, `BootHandles`, `Give`, `Map`, `PipeCreate`, `Stats` and
-`RestrictRights` (below), plus the
-universal `Transfer | Mint`. A launcher keeps the child's handle — it is what
-supervises with — and the child derives its own authority from the masked System
-handle it was given (§12), so supervision and self-management are not
-alternatives.
+**The default set.** One Process default set serves the three minters of a
+process's own or its creator's handle (root's, `ProcessSelf`'s and
+`ProcessCreate`'s; the sender handle mints the observe set, below, not yet
+enforced), named for its ops throughout: `ThreadCreate`, `ThreadSelf`, `Exit`,
+`Wait`, `EventCreate`, `WaiterCreate`, `Start`, `BootHandles`, `Give`, `Map`,
+`PipeCreate`, `Stats` and `RestrictRights` (below), plus the universal
+`Transfer | Mint`. A launcher keeps the child's handle — it is what supervises
+with — and the child derives its own authority from the masked System handle it
+was given (§12), so supervision and self-management are not alternatives.
 `Process.mint(rights:)` makes each bit attenuable at the typed tier: a
 supervisor may be handed a sibling that learns whether its child is alive and
 may not watch it work.
+
+**The observe set** is `ProcessRight.Wait | ProcessRight.Stats`: enough to
+learn that a process died and how, what it cost, what its pid is and what its
+rights ceilings are (`ProcessOp.Ceiling` is gated by `Stats`, below), and
+nothing that acts on it or moves the handle on. The kernel mints it for a
+Process handle that comes from no creation, no `ProcessSelf` and no give: the
+sender handle (§2.1), capped like every mint by the Process ceiling of the
+table it lands in, which is the caller's (below). Not yet enforced: nothing
+mints it.
 
 **Rights ceilings.** Every process carries one rights ceiling per object kind,
 and **every handle the kernel mints into its table is capped by the ceiling for
@@ -1163,6 +1332,9 @@ hold is bounded by its ceiling. That covers:
   `IoMemory.Carve` and `Memory.Map`'s Mapping;
 - the handles a pipe mints for the protocol: the claim `Post` returns and the
   obligation `Take` delivers;
+- the sender handle `PipeRequestOp.Sender` mints (§2.1; not yet enforced),
+  by the Process ceiling, so the observe set it carries is the most it can
+  carry;
 - every later op that mints.
 
 The two exceptions:
@@ -1217,7 +1389,7 @@ child's Process ceiling, which caps the Process handle the child derives through
   source and a `RestrictRights` through a `Gone` handle answer `Revoked`.
 - **No relation is recorded.** The kernel keeps no parent or child (§5.3):
   inheritance happens once, at the create, and a spawn service that wants a
-  process tree records one itself.
+  process tree records one itself, keyed by pid (not yet enforced).
 
 **`Give` — the courier op.** `give(handle, tag:)` on the child's handle, gated
 by `ProcessRight.Give` there plus the universal `Transfer` right on the handle
@@ -1276,18 +1448,22 @@ release of a staged message carrying a Process handle, and the teardown of a
 process that held one, which drops its handles and its attachments.
 
 A record is never reclaimed, and so never reused, before its own teardown has
-ended, because that teardown still writes it: the notify that wakes its
-watchers comes first and can consume the last attachment, and the counters are
-copied and the ledger cleared after it. A record whose count reaches zero
-during its own teardown is reclaimed when the teardown ends. `refs` is
-maintained at the same sites as every other kind's count, so a `Gone` process is
-ordinary rather than special. Two rules make the reuse safe, and a record
-carries no generation of its own. The count covers the names that hold a
-reference, so none of them can name a reclaimed record, and a released word
-fails its entry's generation (§3). The teardown's disown (§2.10) covers the
-fields that hold none, so no object that outlives a process still names its
-record, and a refund at a survivor's later free is owed to nobody rather than
-to the record's next occupant.
+ended, because that teardown still writes it: the notify that wakes its watchers
+comes first and can consume the last attachment, and the counters are copied and
+the ledger cleared after it. A record whose count reaches zero during its own
+teardown is reclaimed when the teardown ends. `refs` is maintained at the same
+sites as every other kind's count, so a `Gone` process is ordinary rather than
+special. Two rules make the reuse safe, and a record carries no generation of
+its own. The count covers the names that hold a reference, so none of them can
+name a reclaimed record, and a released word fails its entry's generation (§3).
+The teardown's disown (§2.10) covers the fields that hold none, so no object
+that outlives a process still names its record, and a refund at a survivor's
+later free is owed to nobody rather than to the record's next occupant. One name
+of a record is neither: a message's sender (§2.1; not yet enforced), which a
+staged message keeps as a record index and a pid together. It is read only
+through a test that the record is live and still holds that pid, which a
+reclaimed record fails and a reused one fails too, since no pid is assigned
+twice; so it needs no reference and no disown.
 
 **A `Created` process that nothing names is torn down.** A child that was
 created and never started has no thread to end it, so the loss of its last
@@ -1314,11 +1490,19 @@ longer installed. Where the kernel walks every handle table, the walk is over
 the body table's extent chain and is bounded by `process_slots_usable()` ×
 `MAX_HANDLES`.
 
-**`Stats` — exact trap introspection.** `ProcessOp.Stats` on
-`ProcessRight.Stats` answers through a three-doubleword copy-out record:
-`syscalls`, `interrupts`, `faults`, split by the cause class the trap entry
-decides on.
+**`Stats` — exact trap introspection, and the pid.** `ProcessOp.Stats` on
+`ProcessRight.Stats` answers through a four-doubleword copy-out record:
+`syscalls`, `interrupts` and `faults`, split by the cause class the trap entry
+decides on, then `pid`, the named process's pid (not yet enforced; below).
 
+- **The pid rides the stats record** because reading it needs a doubleword
+  copy-out on a 32-bit profile anyway, which this record already is, and
+  because it is the same kind of fact: something an observer learns about a
+  process without acting on it, which is what `ProcessRight.Stats` gates (the
+  ceiling read, above, spends it on the same reasoning). So every handle
+  carrying the observe set reads it, and a handle without `Stats` learns no
+  pid. It reads the record, so it answers through a `Gone` process's handle as
+  the counters do.
 - The split is what makes the numbers usable: a single total would mix a
   quantity the program determines with one the machine determines, so nothing
   could be asserted about it. Separated, `syscalls` is exact for a given
@@ -1337,17 +1521,18 @@ decides on.
   preemption point is not counted at all, because it arrives through the poll
   rather than through a vector and no process was current.
 - While the process lives, the columns are its body's row of the shared stats
-  region (below), keyed by the body's index, and the row is zeroed at process
-  create, on both doors, so a reused body never inherits its predecessor's
-  traffic. They survive the death: the teardown copies them into the record as
-  the body goes, and `Stats` through a `Gone` process's handle reads that copy,
-  which is how a supervisor observes a fault column, since a faulting process is
-  not around to ask about itself. Nothing is charged to a process once its
-  teardown has begun, so the copy is final. A mapped stats-region reader can
-  also see the dead process's row without any handle, until a create reuses the
-  body and clears it. The reading includes the call that took it (the column is
-  charged at trap entry, ahead of the op), so a delta between two readings
-  carries the second reading's own trap.
+  region (below), keyed by the body's index, and the row is zeroed and given the
+  new process's pid (not yet enforced) at process create, on both doors, so a
+  reused body never inherits its predecessor's traffic or name. They survive the
+  death: the teardown copies them into the record as the body goes, and `Stats`
+  through a `Gone` process's handle reads that copy, which is how a supervisor
+  observes a fault column, since a faulting process is not around to ask about
+  itself. Nothing is charged to a process once its teardown has begun, so the
+  copy is final. A mapped stats-region reader can also see the dead process's
+  row without any handle, until a create reuses the body and clears it. The
+  reading includes the call that took it (the column is charged at trap entry,
+  ahead of the op), so a delta between two readings carries the second reading's
+  own trap.
 - Per-process only: per-thread stats wait for a consumer that names one.
 
 **The stats region.** `SystemOp.StatsRegionMap` on `SystemRight.StatsRegionMap`
@@ -1365,10 +1550,21 @@ another process's counters. Three things about the region:
   build can hand out, not for every record. A row for an unoccupied body reads
   whatever its last occupant left until a create zeroes it, and v1 publishes no
   liveness column.
-- **A row index is not a name.** The op answers the caller's own row and
-  nothing else, so a general `top` that maps an arbitrary process to a row
-  still wants either a per-row identity column or an op resolving a Process
-  handle to its row. Not built.
+- **A row names its process by pid.** A row is the stats record's own layout,
+  so its fourth column is the pid of the process occupying the body, written by
+  the create that zeroes the row and left in place at the death, and zero for a
+  body no process has occupied. The op answers the caller's own row index; a
+  general `top` finds any other process's row by matching the pid that
+  process's handle reads through `Stats`. A row whose process has died keeps
+  its pid until a create reuses the body, so a matching pid says whose counters
+  a row holds and not that the process is alive. A create can reuse a body
+  between two of a reader's loads, so a reader that must not pair one
+  process's counters with another's pid reads the pid before and after the
+  counters and discards a row whose pid changed.
+
+Not yet enforced: the stats record and the region's rows are the three counter
+doublewords with no pid column, and a row index is the only way to find a
+row.
 
 **Capacity.** Two tables, two floors, and a create needs room in both.
 
@@ -1399,12 +1595,12 @@ another process's counters. Three things about the region:
   holders keep dead processes, not how many run, and on a tier whose
   protection-domain pool caps bodies, records still grow.
 
-Per-process state is never a parallel `MAX_PROCESSES ×` array: the handle
-table, the boot-handle queue and the grant record are fields of the body, and
-the quota ledger, the status word and the final trap counters are fields of the
-record (`kcore.pslot`), because a table beside a slab would be left behind by a
-donation. `MAX_ATTACHMENTS` derives from the waitable slabs an attachment can
-name, pipes aside, and a Process attachment names a record:
+Per-process state is never a parallel `MAX_PROCESSES ×` array: the handle table,
+the boot-handle queue and the grant record are fields of the body, and the quota
+ledger, the status word, the pid (not yet enforced) and the final trap counters
+are fields of the record (`kcore.pslot`), because a table beside a slab would be
+left behind by a donation. `MAX_ATTACHMENTS` derives from the waitable slabs an
+attachment can name, pipes aside, and a Process attachment names a record:
 `MAX_EVENTS + MAX_INTERRUPTS + MAX_TIMERS + MAX_PROCESS_RECORDS`. The
 protection-row budget is per domain, so a process adds nothing to another's
 (root's own grant record stays at `IMAGE_GRANT_ROWS` whatever it wires up,
@@ -1437,7 +1633,10 @@ a whole.
 - **`process_self` is §3's derivation rule made real.** The boot register
   stays one handle wide, and a process obtains its Process object through the
   System handle rather than being handed it. Strip `SystemRight.ProcessSelf`
-  and a child may print and tell the time and never learn its own identity. It
+  and a child may print and tell the time and never derive authority over its
+  own process: the one other handle onto itself the kernel can mint it is the
+  sender handle on a message it sent itself (§2.1; not yet enforced), which
+  carries at most the observe set (§2.7). It
   takes a keep mask, intersected with the one Process default set (§2.7), so a
   process can narrow the Process handle it derives at the moment it derives it
   — a driver that has made its Waiter dropping the authority to make another,
@@ -1621,7 +1820,7 @@ handle to make the op that would answer `Revoked`.
 | Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. `Exit` releases the handle it is invoked through: only that handle goes, every other one still reads the slot, and a Thread that exits with no other handle naming it is freed at its exit. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
 | Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) and bound to no process: nothing names its binder's record, so the teardown has nothing to disown |
 | Event, Pipe, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them |
-| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
+| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7; the pid not yet enforced). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1; not yet enforced). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
 | Clock, System | Never destroyed |
 
 **A free of a live object runs its last rites.** The last handle going is a
@@ -1675,6 +1874,12 @@ freed before its disown credits the dying ledger as any free does, and the
 teardown clears that ledger. An Interrupt has no `process` field to disown: it
 is charged to nobody and bound to no process, only to its one handle, so nothing
 names the binder's record once it has bound.
+
+A staged message's sender is the one name of a record that is neither a
+reference nor disowned (§2.1; not yet enforced). It names the record by index
+and pid together and is read only through a test that the record is live and
+holds that pid, which a reused record fails, so it never reaches the record's
+next occupant.
 
 The teardown reports itself on one console line, `SOS: process teardown`, and
 the harness asserts the line. Its fields (`handles=`, `threads=`, `events=`,
@@ -1817,14 +2022,17 @@ have no field.
 
   Three facts hold the invariant, each a line of kernel rather than a
   discipline:
-  - **A mint carries the kind's default set, or a subset of the source.** A
-    getter mints the kind's default rights and nothing else; `MINT_OP` mints
-    the source's rights intersected with a caller-supplied keep mask. Neither
-    spelling can exceed what already exists.
+  - **A mint carries the kind's default set or a fixed part of it, or a subset
+    of the source.** A getter mints the kind's default rights and nothing
+    else, and the sender handle mints the Process kind's observe set (§2.1,
+    §2.7; not yet enforced); `MINT_OP` mints the source's rights intersected
+    with a caller-supplied keep mask. Neither spelling can exceed what already
+    exists.
   - **The authority to mint is itself rights-gated** — `SystemRight.ClockGet`,
     `SystemRight.ProcessSelf`, `SystemRight.ProcessCreate`,
-    `ProcessRight.ThreadSelf`, and the universal `Mint` for `MINT_OP`. A
-    process that cannot spend the bit cannot perform the mint.
+    `ProcessRight.ThreadSelf`, `PipeRequestRight.Sender` (not yet enforced),
+    and the universal `Mint` for `MINT_OP`. A process that cannot spend the bit
+    cannot perform the mint.
   - **A give moves rights verbatim, or narrower** — the same invariant read
     from the transfer side. `ProcessOp.Give` copies the entry's kind, target
     and rights word into the receiver's table, intersected with the giver's
@@ -2154,7 +2362,9 @@ count — apply per message (§2.1).
 Decided by §3: there is no duplicate right, and the invariant is no
 amplification. A second handle onto an object a process holds comes from a
 getter (which mints the kind's default set) or from `MINT_OP` (a subset of
-the source); a handle is a unique entry, which mirrors `NoCopy` exactly.
+the source); a handle is a unique entry, which mirrors `NoCopy` exactly. The
+sender handle (§2.1) is a getter in this sense, minting a Process handle with
+the observe set (§2.7; not yet enforced).
 
 ### 5.3 Process/Job hierarchy
 
@@ -2290,12 +2500,13 @@ tags rather than statuses, keeping their numbers — `SosStatus` leaves 1–3
 unused. The kernel stays up, reports, and runs the teardown (§8). The rule is
 uniform because it has to be: an unbound handle names no kind, so there is no op
 table to ask which rule applies. The caller is the process that faults, through
-whichever process's handle the op was made (§2.7). What is left
-in `SosStatus` is what a caller could not have known — `NoResource` (a full
-slab), `QuotaExceeded` (§2.9), `BadImage` (§8), `Drained` (§12), `Revoked`
-(§2.2, and every op on an invalid object, §2.10), `PeerClosed` and
-`WouldBlock` (§2.1) — with `Unknown` the userspace mapping artifact. A dynamic
-resource condition answers with a status; broken code faults.
+whichever process's handle the op was made (§2.7). What is left in `SosStatus`
+is what a caller could not have known — `NoResource` (a full slab),
+`QuotaExceeded` (§2.9), `BadImage` (§8), `Drained` (§12), `Revoked` (§2.2, every
+op on an invalid object, §2.10, and a sender handle asked of a dead sender,
+§2.1, not yet enforced), `PeerClosed` and `WouldBlock` (§2.1) — with `Unknown`
+the userspace mapping artifact. A dynamic resource condition answers with a
+status; broken code faults.
 
 **Dispatch** is §3's shape verbatim: handle-table lookup → object type → op
 table → rights check → op. The System object (§2.8) is minted to root at boot,
@@ -2802,15 +3013,16 @@ this section specifies the scheduler that is not yet built.
 System handle, gated by `SystemRight.ProcessCreate` — processes are minted by
 the System, §12) takes two Memory regions — a read-only image blob and the
 child's destination RAM — and returns a process with an address space, a
-recorded entry and stack, and no thread. `ProcessOp.Start` (on the child's
-handle, gated by `ProcessRight.Start`) mints the first thread at that recorded
-entry and makes it runnable; the caller keeps running. The ordering is the
-soundness argument for the launch flow: whatever a launcher gives a child must
-be complete at its first instruction, and the start call is the barrier that
-makes a half-populated table unrepresentable — with no synchronization
-invented. The barrier covers threads too: a thread made through a `Created`
-child's handle is inert, and `ThreadOp.Start` on it is a `BadState` fault until
-the child has been started, so no thread of a process runs before its `Start`. **A second `start` is a `BadState` fault**: broken code, and the
+recorded entry and stack, a pid (§2.7; not yet enforced), and no thread.
+`ProcessOp.Start` (on the child's handle, gated by `ProcessRight.Start`) mints
+the first thread at that recorded entry and makes it runnable; the caller keeps
+running. The ordering is the soundness argument for the launch flow: whatever a
+launcher gives a child must be complete at its first instruction, and the start
+call is the barrier that makes a half-populated table unrepresentable — with no
+synchronization invented. The barrier covers threads too: a thread made through
+a `Created` child's handle is inert, and `ThreadOp.Start` on it is a `BadState`
+fault until the child has been started, so no thread of a process runs before
+its `Start`. **A second `start` is a `BadState` fault**: broken code, and the
 caller is the one that started it the first time. **A process that is never
 started is not leaked**: when nothing names it any more it is torn down as if it
 had exited, and its record and body come back (§2.7). **A malformed image is a
@@ -2849,16 +3061,17 @@ arm is a scope line rather than a statement about the object.
 
 **The status word has a neighbour.** `get_status` answers whether and how a
 process ended; `ProcessOp.Stats` answers what it cost, in traps, split by cause
-class (§2.7). The two are separate rights on purpose — `ProcessRight.Wait` and
-`ProcessRight.Stats` — so a supervisor that may learn a child died need not be
-able to watch it work. Both survive the death, in the process record (§2.7).
-The status word is written there at the death and the final trap counters are
-copied there as the teardown frees the body, and the `Gone` record lives while
-some reference names it (a handle entry, including a minted sibling's entry, or
-an attachment). Those holders are the only readers there can be, so the record
-is reclaimed when the last of them goes, however it goes, though never before
-its own teardown has ended (§2.7). A mapped stats-region reader can also see the
-dead process's counters in its body's row until a create reuses the body.
+class, and which process it is, by pid (§2.7; the pid not yet enforced). The two
+are separate rights on purpose — `ProcessRight.Wait` and `ProcessRight.Stats` —
+so a supervisor that may learn a child died need not be able to watch it work.
+Both survive the death, in the process record (§2.7). The status word is written
+there at the death and the final trap counters are copied there as the teardown
+frees the body, and the `Gone` record lives while some reference names it (a
+handle entry, including a minted sibling's entry, or an attachment). Those
+holders are the only readers there can be, so the record is reclaimed when the
+last of them goes, however it goes, though never before its own teardown has
+ended (§2.7). A mapped stats-region reader can also see the dead process's
+counters in its body's row until a create reuses the body.
 
 - **A thread fault kills its process.** The process exits with a
   fault status; there is no per-thread fault recovery (a faulted
@@ -3209,8 +3422,14 @@ loader parses and reports while no process stores either.
   tag its launcher chose.
 - **`Process` and `System` handles in messages** (§2.1): a sysapi module split.
 - **Virtual clocks**, and clock types beyond `Monotonic` (§2.6).
-- **Stats:** a per-row identity column in the stats region, or an op resolving
-  a Process handle to its row (§2.7); per-thread stats.
+- **Pids** (§2.7): the pid itself, its column in the stats record and the stats
+  region's rows, the sender's pid in every message and its region in the
+  message records (§2.1, §2.2), and the sender handle, `PipeRequestOp.Sender`
+  on `PipeRequestRight.Sender` (§2.1).
+- **The observe set's second source** (§2.7): a System lookup of a process by
+  pid and an iteration over processes beside it, behind a System right of
+  their own, each minting the observe set.
+- **Stats:** per-thread stats (§2.7).
 - **Fault forensics a supervisor can read** (the faulting PC and address reach
   only the console's fault report) (§8).
 - **Retiring the image-declared device grant** (`SegFlag.Device` and the
@@ -3289,8 +3508,11 @@ processes (§2.5).
   `process_create` is `SystemOp.ProcessCreate` gated on
   `SystemRight.ProcessCreate`, binding a line is
   `SystemOp.InterruptBind` gated on `SystemRight.InterruptBind` (§2.8), and
-  `SystemOp.ProcessSelf` is the
-  precedent — every Process handle comes from System. With a launcher creating
+  `SystemOp.ProcessSelf` is the precedent — every Process handle that can act
+  on a process comes from System. The one other mint of a Process handle is
+  the sender handle, made from an obligation with no System right and carrying
+  at most the observe set, which acts on nothing (§2.1, §2.7; not yet
+  enforced). With a launcher creating
   every process, a creation right on the caller's own Process handle would gate
   nothing real, and creator-pays accounting through the caller's record would
   attribute everything to root — so attribution is assigned by policy (the quota
