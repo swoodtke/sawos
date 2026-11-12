@@ -1,5 +1,5 @@
 ---
-{"assignee":"","author":"agent:codex-todo-import","body_bytes":2279,"created":"1788791279","id":"SO-2","labels":["todo-import","queued","design","plan","design-proposal"],"priority":"normal","project":"SO","revision":2,"sequence":18,"status":"open","title":"Scope M7 POSIX compatibility with toybox and posix_spawn","updated":"1788791308"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2279,"closed":"","created":"1788791279","id":"SO-2","labels":["todo-import","backlog","design","plan","design-proposal"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":0,"revision":3,"sequence":660,"stage":"backlog","status":"open","title":"Scope M7 POSIX compatibility with toybox and posix_spawn","updated":"1794498236"}
 ---
 
 
