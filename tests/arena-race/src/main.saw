@@ -1,0 +1,273 @@
+// The bump arena under preemption (spec §5c, §7).
+//
+// Two workers of one process each take BLOCKS blocks from `sosrt`'s arena,
+// through the `__saw_rt_alloc` seam itself (declared `extern "C"` below, the
+// same symbol the compiler's allocation path calls). Neither yields: a burn
+// between two allocations keeps each worker running across many ticks, so the
+// preemption harness kernel with a short tick (`tests/threads_fast_tick.saw`)
+// takes the processor away at arbitrary points, including between the
+// cursor's read and its update. Each worker records every block's offset in a
+// table of its own.
+//
+// The runner runs this case on the isolated riscv32 profile only: the window
+// is a few instructions, and on arm64 and riscv32-flat a boot's ticks did not
+// land in it against the unsafe allocator (see the case's comment in
+// `tools/sos_runner.py`), so a pass there would prove nothing.
+//
+// After both are joined the initial thread checks two things:
+//
+//   * disjointness: every 4-byte granule of the arena is claimed by at most
+//     one block, whichever worker took it. A cursor update lost to a switch
+//     hands the same granule out twice.
+//   * markers: after its allocation pass each worker writes its own marker
+//     byte across all of its blocks, and the initial thread reads every byte
+//     back, but only once disjointness has held. Disjoint in-arena blocks
+//     are written by one worker each, so this readback cannot fail on a
+//     correct allocator; it confirms the blocks are real storage that keeps
+//     what was written, and it is the check that would speak up if the
+//     disjointness bookkeeping itself were wrong.
+//
+// A pass reads
+//
+//   SOS arenarace: blocks disjoint, markers intact
+//
+// and a failure names the first granule claimed twice:
+//
+//   SOS arenarace: OVERLAP at N: worker W block I meets V
+//
+// or the first byte that lost its marker.
+//
+// The allocation pass is separated from the marker pass on purpose: the
+// window under test is a few instructions of `rt_alloc`, and the more of a
+// worker's time is spent inside it the likelier a tick lands there.
+
+import sos.{System, Process}
+
+// `__saw_rt_alloc` is declared as `std.alloc` declares it, since a program's
+// declarations of one symbol must agree; `sosrt` defines it.
+extern "C" {
+    func __saw_rt_alloc(size: Int, align: Int) -> UnsafePointer<Int8>?
+    func sos_arena_base() -> UInt
+    func sos_arena_size() -> UInt
+}
+
+/// The boot handle, parked for the workers; see `thread-preempt`.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+unsafe static var BURN_SINK: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static ROLE_A: UInt = 1
+static ROLE_B: UInt = 2
+
+/// A block is one granule: the smallest the allocator hands out here, so the
+/// arena holds as many blocks as it can. Both workers' blocks together
+/// (`2 * BLOCKS * GRANULE` bytes) must fit the `ARENA_SIZE` the package's
+/// linker scripts set, with room left for the allocator's alignment padding.
+/// The root image's region bounds the arena, the tables and the stacks
+/// together.
+static GRANULE: UInt = 4
+static BLOCKS: Int = 11_000
+
+/// Iterations between two allocations, so a worker spans many ticks.
+static SPIN: Int = 60
+
+/// The granule index of every block, worker A's then worker B's. A worker
+/// writes only its own half.
+static TABLE_LEN: Int = 22_000
+unsafe static var BLOCK_GRANULES: [UInt16; TABLE_LEN] = [0; TABLE_LEN]
+
+/// Which worker claimed each granule of the arena (0 = nobody).
+static MAP_LEN: Int = 24_576
+unsafe static var OWNER: [UInt8; MAP_LEN] = [0; MAP_LEN]
+
+/// A block's offset from the arena's base.
+func offset_of(slot: Int) unsafe -> UInt {
+    UInt.from(truncating: BLOCK_GRANULES[slot]) * GRANULE
+}
+
+static MARKER_A: UInt8 = 0xA1
+static MARKER_B: UInt8 = 0xB2
+
+static EXIT_A: UInt = 33
+static EXIT_B: UInt = 44
+static NO_VALUE: UInt = 0
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+/// Burn time without touching the kernel or the arena; see `thread-preempt`
+/// for why the body is a linear-congruential step.
+func burn(iterations: Int) unsafe {
+    var x = BURN_SINK
+    var i = 0
+    while i < iterations {
+        x = (x &* 1_664_525) &+ 1_013_904_223
+        i = i + 1
+    }
+    BURN_SINK = x
+}
+
+func table_base(role: UInt) -> Int {
+    if role == ROLE_A { 0 } else { BLOCKS }
+}
+
+func marker_of(role: UInt) -> UInt8 {
+    if role == ROLE_A { MARKER_A } else { MARKER_B }
+}
+
+func worker(role: UInt) unsafe {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let base = sos_arena_base()
+    let first = table_base(role)
+
+    var i = 0
+    while i < BLOCKS {
+        let block = __saw_rt_alloc(4, 4)! as UInt
+        let granule = (block - base) / GRANULE
+        BLOCK_GRANULES[first + i] = UInt16.from(truncating: granule)
+        burn(SPIN)
+        i = i + 1
+    }
+
+    let marker = marker_of(role)
+    i = 0
+    while i < BLOCKS {
+        let at = base + offset_of(first + i)
+        var byte: UInt = 0
+        while byte < GRANULE {
+            UnsafeMemory<UInt8, Normal>(at + byte).write(marker)
+            byte = byte + 1
+        }
+        i = i + 1
+    }
+    let _ = (move me).exit(if role == ROLE_A { EXIT_A } else { EXIT_B })
+}
+
+/// Claim each of `role`'s blocks in the owner map. True when every block lay
+/// inside the arena on a granule nobody had claimed. Otherwise prints the
+/// first block that did not, with the granule's earlier owner, and returns
+/// false.
+func check_disjoint(role: UInt) unsafe -> Bool {
+    let first = table_base(role)
+    let capacity = sos_arena_size()
+    var i = 0
+    while i < BLOCKS {
+        let off = offset_of(first + i)
+        if off + GRANULE > capacity {
+            print("SOS arenarace: block outside arena: worker {} block {}\n",
+                  role, i)
+            return false
+        }
+        let g = Int.from(truncating: off / GRANULE)
+        if OWNER[g] != 0 {
+            print("SOS arenarace: OVERLAP at {}: worker {} block {} meets {}\n",
+                  off, role, i, OWNER[g])
+            return false
+        }
+        OWNER[g] = UInt8.from(truncating: role)
+        i = i + 1
+    }
+    true
+}
+
+func check_markers(role: UInt) unsafe -> Bool {
+    let first = table_base(role)
+    let base = sos_arena_base()
+    let marker = marker_of(role)
+    var i = 0
+    while i < BLOCKS {
+        let at = base + offset_of(first + i)
+        var byte: UInt = 0
+        while byte < GRANULE {
+            if UnsafeMemory<UInt8, Normal>(at + byte).read() != marker {
+                print("SOS arenarace: marker lost at {}: worker {} block {}\n",
+                      at - base + byte, role, i)
+                return false
+            }
+            byte = byte + 1
+        }
+        i = i + 1
+    }
+    true
+}
+
+func initial(boot_handle: UInt) unsafe {
+    park_boot_handle(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS arenarace: no process handle\n")
+        let _ = system.shutdown(1)
+        return
+    }
+
+    let top_a = stack_a_top()
+    let top_b = stack_b_top()
+    let a = try proc.thread_create(stack_top: top_a, arg: ROLE_A) catch {
+        print("SOS arenarace: create failed: {}\n", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let b = try proc.thread_create(stack_top: top_b, arg: ROLE_B) catch {
+        print("SOS arenarace: create failed: {}\n", error)
+        let _ = system.shutdown(1)
+        return
+    }
+
+    let _ = system.debug_print("SOS arenarace: two allocators, no yields\n")
+    let _ = a.start()
+    let _ = b.start()
+
+    let ra: UInt = try a.join() catch { NO_VALUE }
+    let rb: UInt = try b.join() catch { NO_VALUE }
+    if ra != EXIT_A || rb != EXIT_B {
+        print("SOS arenarace: workers ended a={} b={}\n", ra, rb)
+        let _ = system.shutdown(1)
+        return
+    }
+
+    let disjoint = check_disjoint(ROLE_A) && check_disjoint(ROLE_B)
+    if disjoint && check_markers(ROLE_A) && check_markers(ROLE_B) {
+        let ok = "SOS arenarace: blocks disjoint, markers intact\n"
+        let _ = system.debug_print(ok)
+        let _ = proc.exit(0)
+        return
+    }
+    let _ = system.shutdown(1)
+}
+
+@export("_start")
+func _start(arg: UInt) unsafe {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

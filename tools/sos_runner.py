@@ -165,6 +165,8 @@ FAULT_ROOT_PKG = os.path.join(TESTS_DIR, "faulting-root")
 # module and never through an op number.
 THREAD_BASICS_PKG = os.path.join(TESTS_DIR, "thread-basics")
 THREAD_PREEMPT_PKG = os.path.join(TESTS_DIR, "thread-preempt")
+# Two preempted threads of one process allocating from the bump arena.
+ARENA_RACE_PKG = os.path.join(TESTS_DIR, "arena-race")
 # User FP/SIMD state, arm64 only: two threads' patterns across yields, and a
 # second process's first use after the first has filled the registers.
 FP_THREADS_PKG = os.path.join(TESTS_DIR, "fp-threads")
@@ -1521,6 +1523,37 @@ TEST_CASES = [
         "expect_out": ["SOS M2: preemptive kernel up on",
                        "AB", "BA", "AB",
                        "SOS preempt: joined a=33 b=44"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The bump arena's cursor under preemption. Two workers of one process
+        # take thousands of blocks each from `sosrt`'s arena under the
+        # short-tick preemption kernel (`tests/threads_fast_tick.saw`), and the
+        # initial thread then checks that no two blocks share a granule and
+        # that every block still holds its worker's marker. A cursor update
+        # that a switch can overwrite hands the same block to both workers and
+        # fails the first check with a line naming the offset.
+        #
+        # The kernel's own tick narration lands in the same stream, so the
+        # match runs on the projection `thread_preempt` uses; neither expected
+        # line begins `SOS: `.
+        #
+        # It runs on the isolated riscv32 profile only, because that is the
+        # only profile where it can fail. Against a cursor updated by a plain
+        # read and store, a boot there reports an overlap and a boot on arm64
+        # or riscv32-flat does not: those two run the workload so fast that
+        # too few ticks land in it for one to fall inside a window of a few
+        # instructions, and a shorter period does not add enough. A case that
+        # cannot fail there would pass whatever the allocator did, so it is
+        # not run there.
+        "name": "arena_race",
+        "src": os.path.join(TESTS_DIR, "threads_fast_tick.saw"),
+        "root_pkg": ARENA_RACE_PKG,
+        "arches": ["riscv32"],
+        "strip_kernel_lines": True,
+        "expect_out": ["SOS M2: preemptive kernel up on",
+                       "SOS arenarace: two allocators, no yields",
+                       "SOS arenarace: blocks disjoint, markers intact"],
         "expect_clean_exit": True,
     },
     {
@@ -7667,8 +7700,8 @@ def _run_qemu(qemu, arch, elf, feed=None):
 # process wrote them.
 #
 # It changes what the harness matches and nothing about what the kernel prints.
-# Only `thread_preempt` asks for it, and any case that does must not expect a
-# line beginning `SOS: `.
+# A case asks for it with `strip_kernel_lines`, and any case that does must
+# not expect a line beginning `SOS: `.
 _KERNEL_DIAGNOSTIC_LINE = re.compile(r"SOS: [^\r\n]*(?:\r?\n)?")
 
 

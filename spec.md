@@ -2647,7 +2647,10 @@ and there are only two reasons in the whole system:
    compare-and-swap is no instruction (the ESP32-C3, riscv32 without the A
    extension) the language leaves the `__atomic_*_4` routines to the
    environment; elsewhere the compiler inlines atomic instructions and nothing
-   references them.
+   references them. The bump arena's cursor advances by a compare-and-swap, so
+   it is safe under preemption on a target with atomic instructions. On a part
+   without them the routine is a plain read-modify-write, and word atomics in
+   a user process there are safe only while nothing preempts.
 
 The first half of reason 2 is a language gap: it closes the day Saw can name a
 linker symbol.
@@ -3233,9 +3236,11 @@ loader parses and reports while no process stores either.
 - The object lifecycle is not yet enforced as §2.10 states it: the
   teardown's close-all releases every handle but counts without freeing, the
   sweeps after it invalidate the bound kinds rather than before it.
-- `sosrt`'s bump arena takes no lock, so under a kernel that preempts (today
-  only the preemption harness; §7) two threads of one process allocating at once
-  can race (§5c).
+- On a part without atomic instructions (the ESP32-C3), word atomics in a
+  user process, `sosrt`'s bump arena cursor among them, are safe only while
+  nothing preempts; under a kernel that preempts (today only the preemption
+  harness; §7) two threads of one process allocating at once can be handed
+  overlapping blocks (§5c).
 - Quotas count objects, not bytes, and there is no per-create quota argument
   (§2.9). Slab donation is permanent (§2.8).
 - Handle generations are best-effort bug detection, not a uniqueness

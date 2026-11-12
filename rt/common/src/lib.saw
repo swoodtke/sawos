@@ -320,20 +320,23 @@ func rt_panic(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
 // above read it back. The region is `.bss`-resident, so it costs the image no
 // bytes and the process's region all of them.
 
-/// The cursor over the region. Nothing serializes the bound check against the
-/// cursor store, so the bump is safe only while no involuntary switch can land
-/// between them. In the kernel that is guaranteed: SOS is a uniprocessor kernel
-/// (spec §7) and the kernel runs with interrupts masked. In a user process with
-/// more than one thread it holds only while nothing preempts. The kernel
-/// switches threads involuntarily only on a scheduler tick, which
-/// `kernel/main.saw` does not arm (the preemption harness kernels do, through
-/// `kcore.time.start_tick`). Once a tick is armed, two threads of one process
-/// that both allocate can be handed overlapping blocks, and the cursor needs a
-/// lock.
+/// The cursor over the region, as a byte offset from `sos_arena_base()`.
+/// `rt_alloc` advances it with a compare-and-swap loop: it reads the cursor,
+/// computes the aligned offset and the next cursor from that read, and installs
+/// the next cursor only if the cursor still holds the value it read. A thread
+/// that loses the exchange reads again and recomputes, so two threads, however
+/// they are interleaved or preempted, never receive overlapping blocks.
+///
+/// The exchange is inline atomic instructions on a target that has them (the
+/// riscv32 `virt` board, arm64). On a part without them (the ESP32-C3) it is
+/// the `__atomic_compare_exchange_4` routine in `rt/common_c/support.c`, a
+/// plain read-modify-write, so there the arena is safe only while nothing
+/// preempts a thread between that routine's read and its write.
 ///
 /// It is the only arena state in this module. The extent is a link-time
-/// constant and only the offset moves.
-unsafe static var ARENA_NEXT: UInt = 0
+/// constant and only the offset moves. `Atomic` holds an `Int`; an offset is
+/// bounded by the arena's size, far below the point where the two differ.
+static ARENA_NEXT: Atomic<Int> = Atomic(0)
 
 /// Hand out `size` bytes aligned to `align`, or stop the machine.
 ///
@@ -348,6 +351,11 @@ unsafe static var ARENA_NEXT: UInt = 0
 /// branch inside the allocator for a subtraction that cannot go negative (`rem`
 /// is a remainder of `step`, so `rem < step` always). The compiler cannot see
 /// that, and the allocator is not a place to spend a trap.
+///
+/// The block is the winner's: the cursor is advanced past it by the
+/// compare-and-swap before the pointer is returned, and a thread whose
+/// exchange fails recomputes from the cursor it now sees. A refusal needs no
+/// exchange, since the machine stops.
 @export("__saw_rt_alloc")
 func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
     var step = align
@@ -356,17 +364,23 @@ func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
     }
     let base = sos_arena_base()
     let capacity = sos_arena_size()
-    var offset = ARENA_NEXT
-    let rem = (base &+ offset) % step
-    if rem != 0 {
-        offset = offset &+ (step &- rem)
+    var offset: UInt = 0
+    var won = false
+    while not won {
+        let seen = ARENA_NEXT.load()
+        offset = UInt.from(truncating: seen)
+        let rem = (base &+ offset) % step
+        if rem != 0 {
+            offset = offset &+ (step &- rem)
+        }
+        if size > capacity || offset > capacity - size {
+            let msg = "sos: out of arena memory\n"
+            sos_rt_write(msg.c_string()!, UInt.from(truncating: msg.len()))
+            sos_rt_abort(AbortCode.NoMemory as UInt32)
+        }
+        let next = Int.from(truncating: offset &+ size)
+        won = ARENA_NEXT.compare_exchange(seen, next)
     }
-    if size > capacity || offset > capacity - size {
-        let msg = "sos: out of arena memory\n"
-        sos_rt_write(msg.c_string()!, UInt.from(truncating: msg.len()))
-        sos_rt_abort(AbortCode.NoMemory as UInt32)
-    }
-    ARENA_NEXT = offset &+ size
     (base &+ offset) as UnsafePointer<Int8>
 }
 
