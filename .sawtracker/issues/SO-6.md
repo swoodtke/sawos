@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":5,"sequence":718,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794500579"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":6,"sequence":745,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794502746"}
 ---
 
 
@@ -127,4 +127,7 @@ case that uses `child-resolver`, on three profiles; then `--board esp32c3`.
 
 `tests: the Reply and Resolve gates, reached through a give's keep mask`
 
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":108,"created":"1794502746","id":"c2"} -->
+Submitted patch SO-6.p1 (revision 1): tests: the Reply and Resolve gates, reached through a give's keep mask
 
