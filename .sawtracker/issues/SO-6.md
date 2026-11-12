@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":9,"sequence":758,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794504997"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":10,"sequence":759,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794505197"}
 ---
 
 
@@ -188,4 +188,7 @@ The child exits with `EXIT_SPENT`, `await_denial` refuses the status, and root n
 **Low, take or leave:**
 - The `pipe-reply-narrowed` header: "The one way to hold one is to be given it through a keep mask." The child keeps `Transfer`, and §3 says a handle arriving in a message keeps its rights verbatim, so a third process could hold one without a give. "Made" is what is true.
 - `child-narrowed`: a `waiter_create` failure exits with `EXIT_NO_RECORD`, whose doc is "The boot set held no one-shot record."
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":35,"created":"1794505197","id":"c6"} -->
+Revised patch SO-6.p1 to revision 2
 
