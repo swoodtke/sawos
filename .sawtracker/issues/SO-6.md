@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":6,"sequence":745,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794502746"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":7,"sequence":746,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794502746"}
 ---
 
 
@@ -130,4 +130,32 @@ case that uses `child-resolver`, on three profiles; then `--board esp32c3`.
 
 <!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":108,"created":"1794502746","id":"c2"} -->
 Submitted patch SO-6.p1 (revision 1): tests: the Reply and Resolve gates, reached through a give's keep mask
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":1544,"created":"1794502746","id":"c3"} -->
+**Lead review, SO-6.p1.** Tests only: nothing under `kernel/` changes.
+- **Three cases,** one per site that checks the right:
+  - `pipe_reply_narrowed`: the `Reply` op;
+  - `pipe_reply_wait_narrowed`: the `ReplyWait` op, which checks
+    `PipeRequestRight.Reply` at its own site;
+  - `pipe_resolve_narrowed`: `PipeReplyRight.Resolve`.
+- **Shape:** root gives the one-shot to a child with `keep = Transfer | Wait`.
+  The child reads the rights back with `rights()`, spends the handle and is
+  killed with access denied. Root reads the fault from the status word, and
+  its own end of the exchange then answers `PeerClosed`.
+- **One child image** (`tests/child-narrowed`) serves all three: the record's
+  kind picks obligation or claim, and the boot tag picks `reply` or
+  `reply_wait`.
+- **Mutants, each on three profiles:** with the `Reply` arm's check removed
+  only `pipe_reply_narrowed` fails; with the `ReplyWait` arm's removed only
+  `pipe_reply_wait_narrowed`; with the `Resolve` arm's removed only
+  `pipe_resolve_narrowed`. The first two were run in round one and the third
+  in round two.
+- **Runs:** 33 targeted runs across three profiles after the final rebase,
+  plus the C3 smoke (5 cases). No existing row moved.
+- **Round two was the lead's request:** the first hand-in covered one of the
+  two `Reply` sites and had two lines past 80 columns.
+- **Notes corrected:** the notes pointed at `child-resolver` as a model for a
+  given claim; nothing is given to that child, so the new child was written
+  from `child-narrow` instead.
+
 
