@@ -32,6 +32,14 @@ _start:
     /* Stack: the reservation in .bss made by esp32c3.ld, top-aligned. */
     la      sp, _stack_top
 
+    /* Interrupts are masked for as long as the kernel runs. The kernel is
+     * entered with mstatus.MIE set (ABI.md §7d has the probe), and it has no
+     * handler for an interrupt taken in kernel mode, so the first thing it
+     * does is clear the bit. Nothing sets it again: the only `mret` that
+     * could (`sos_resume_frame`) leaves MPIE clear, and a trap entry clears
+     * MIE. */
+    csrci   mstatus, 8              /* MSTATUS_MIE */
+
     /* We are the kernel: mode witness clear. */
     csrw    mscratch, zero
 

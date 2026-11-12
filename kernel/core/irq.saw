@@ -19,6 +19,8 @@ import kcore.threads.{
     READY_HEAD,
     SLICE_LEFT,
     SLICE_TICKS,
+    THREADS,
+    ThreadState,
 }
 import kcore.time.{NEXT_TICK_NS, TICK_PERIOD_NS, TIMERS, reprogram_timer}
 import kcore.waitables.{INTERRUPTS, WaitableKind, interrupt_by_line}
@@ -92,7 +94,8 @@ func fire_timer(slot: Int, now: UInt64) unsafe {
 // claimed, masked and completed, and how a timer is rearmed. A point adds no
 // seam; it is `irq_poll` again, which the idle path already needs.
 
-/// How many of the first ticks the kernel narrates on the console.
+/// How many of the first ticks the kernel narrates on the console, when
+/// `TICK_REPORT` is on.
 ///
 /// Logging every tick would make the log the workload (at a millisecond
 /// period), so the hook says enough to prove the path ran and then goes quiet.
@@ -112,6 +115,18 @@ static TICK_REPORT_LIMIT: UInt = 4
 /// number nobody was reading into an outage. Deltas across a wrap are still
 /// right.
 unsafe static var TIMER_TICKS: UInt = 0
+
+/// Whether `on_timer_tick` narrates the first `TICK_REPORT_LIMIT` ticks on the
+/// console. Off unless a harness kernel turns it on: the shipping kernel's
+/// console belongs to the process after the handover (spec §9a), and a tick
+/// lands wherever the host puts it.
+unsafe static var TICK_REPORT: Bool = false
+
+/// Turn the tick report on. Harness kernels that arm their own tick call this
+/// first; the shipping kernel never does.
+public func enable_tick_report() unsafe {
+    TICK_REPORT = true
+}
 
 /// Interrupts the controller had nothing to give for. One is not an error (a
 /// line can stop asserting between raising the interrupt and being asked about
@@ -187,6 +202,21 @@ func on_timer_interrupt(pc: UInt) unsafe {
     reprogram_timer()
 }
 
+/// Is a thread on the processor? `CURRENT_THREAD` keeps naming the thread that
+/// last ran while the kernel idles, and that thread is blocked or gone, so a
+/// tick taken then has nobody to charge. Charging it anyway would raise
+/// `NEED_RESCHED` with nothing left to take the processor from, and the flag
+/// would still be set when the thread the idle path wakes starts running.
+func a_thread_is_running() unsafe -> Bool {
+    if CURRENT_THREAD == NO_THREAD {
+        return false
+    }
+    match THREADS[CURRENT_THREAD].state {
+        case Running -> true,
+        case _ -> false,
+    }
+}
+
 /// The timer tick: the arch-free landing point for the periodic timer.
 ///
 /// The timeslice is charged here and nothing else about scheduling is: the tick
@@ -203,7 +233,7 @@ func on_timer_interrupt(pc: UInt) unsafe {
 func on_timer_tick(pc: UInt) unsafe {
     TIMER_TICKS = TIMER_TICKS &+ 1
 
-    if CURRENT_THREAD != NO_THREAD {
+    if a_thread_is_running() {
         if SLICE_LEFT > 0 {
             SLICE_LEFT = SLICE_LEFT - 1
         }
@@ -213,7 +243,7 @@ func on_timer_tick(pc: UInt) unsafe {
         }
     }
 
-    if TIMER_TICKS > TICK_REPORT_LIMIT {
+    if not TICK_REPORT || TIMER_TICKS > TICK_REPORT_LIMIT {
         return
     }
     let uart = console()

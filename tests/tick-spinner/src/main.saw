@@ -1,0 +1,107 @@
+// Preemption of a process that never yields (spec §7).
+//
+// Root launches `child-spin`, a child that loops forever and makes no syscall,
+// then parks on a Timer and prints one line when the Timer fires. The child is
+// ready the whole time and has no reason to give the processor up, so the only
+// way root runs again is the scheduler tick taking the processor away from
+// the child: the Timer wakes root, and the tick's slice running out is what
+// puts it on the processor. On a kernel with no tick the child holds the
+// machine and this program never prints its second line.
+//
+//   SOS tickspin: child started
+//   SOS tickspin: timer fired while the child spun
+//
+// This case's image asks for the tick (the runner's `"tick": True`); the
+// others run cooperatively.
+//
+// The park is generous so a slow host does not read as a failure: the wait
+// ends at the Timer, and a run that works spends only the tick or two it
+// needs.
+
+import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
+            Waiter, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static KEY: UInt = 71
+
+/// Fifty milliseconds, several ticks.
+static PARK_NS: UInt64 = 50_000_000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS tickspin: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // Row 0 is the child's image blob, row 1 the RAM it runs in: this build's
+    // config, which is root's business and never the kernel's.
+    var image = try proc.boot_handle_next() catch {
+        print("SOS tickspin: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS tickspin: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let image_mem = image.take_memory()!
+    let dest_mem = dest.take_memory()!
+
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS tickspin: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The Timer is armed before the child starts, so the child's first slice
+    // is not part of what the deadline measures from.
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS tickspin: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS tickspin: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let timer = try clock.timer_create() catch {
+        print("SOS tickspin: no timer: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(&timer, KEY) catch {
+        print("SOS tickspin: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try timer.arm(after_ns: PARK_NS) catch {
+        print("SOS tickspin: arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try child.start() catch {
+        print("SOS tickspin: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS tickspin: child started\n")
+
+    try waiter.wait() catch {
+        print("SOS tickspin: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print(
+        "SOS tickspin: timer fired while the child spun\n")
+    let _ = proc.exit(EXIT_OK)
+}

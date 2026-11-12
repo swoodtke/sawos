@@ -172,6 +172,9 @@ ARENA_RACE_PKG = os.path.join(TESTS_DIR, "arena-race")
 FP_THREADS_PKG = os.path.join(TESTS_DIR, "fp-threads")
 FP_LEAK_PKG = os.path.join(TESTS_DIR, "fp-leak")
 CHILD_FP_LEAK_PKG = os.path.join(TESTS_DIR, "child-fp-leak")
+# The scheduler tick taking the processor from a process that never yields.
+TICK_SPINNER_PKG = os.path.join(TESTS_DIR, "tick-spinner")
+CHILD_SPIN_PKG = os.path.join(TESTS_DIR, "child-spin")
 # Event and Waiter objects.
 EVENT_BASICS_PKG = os.path.join(TESTS_DIR, "event-basics")
 EVENT_WAKE_PKG = os.path.join(TESTS_DIR, "event-wake")
@@ -895,8 +898,8 @@ ARCHES = [
 # script express the whole layout.
 CHILD_REGION_LEN = 0x40000
 
-# The boot region table's wire format (version 2), frozen: an 8-byte header
-# (magic, version u16, count u8, reserved u8) then `count` rows of {base: u64,
+# The boot region table's wire format (version 3), frozen: an 8-byte header
+# (magic, version u16, count u8, boot flags u8) then `count` rows of {base: u64,
 # len: u64, kind: u8, reserved x 7}, all little-endian. The header's size puts
 # the first row on an 8-byte boundary and the row's padding keeps the next one
 # there, which lets the kernel overlay a struct on the section instead of
@@ -904,11 +907,34 @@ CHILD_REGION_LEN = 0x40000
 # `RegionTableHeader` / `RegionRow` / `RegionKind` and the two `static_assert`s
 # beside them.
 #
-# The kernel accepts exactly version 2, so this constant and that file change
+# The kernel accepts exactly version 3, so this constant and that file change
 # together. An image with no table at all is unaffected: the kernel's `len == 0`
 # short-circuit runs ahead of the header read.
 REGION_TABLE_MAGIC = 0x4E475253          # 'S','R','G','N' read little-endian
-REGION_TABLE_VERSION = 2
+REGION_TABLE_VERSION = 3
+
+# The header's boot flags byte, mirroring `kernel/core/process.saw`'s
+# `BOOT_FLAG_NO_TICK`. The kernel arms the scheduler tick unless this bit is
+# set, so every image asks for none by default and a case that wants the tick
+# says `"tick": True`. An image with no table gets the tick, which is why the
+# default image carries a table even when it has no rows.
+REGION_FLAG_NO_TICK = 0x01
+
+
+def boot_flags(case):
+    """The boot flags byte this case's region table carries."""
+    return 0 if case.get("tick") else REGION_FLAG_NO_TICK
+
+
+def needs_region_table(case):
+    """Does this case's image carry a region table?
+
+    A case with rows does. A case with none still does unless it wants the
+    tick, because a table is the only way an image tells the kernel not to arm
+    it, and the flags it would carry are zero.
+    """
+    return bool(case.get("children") or case.get("pool") or case.get("device")
+                or not case.get("tick"))
 
 # The kind column's values, mirroring `kernel/core/process.saw`'s `RegionKind`.
 # A Ram row mints a Memory and a Device row mints an IoMemory: kind, not a flag,
@@ -1562,6 +1588,27 @@ TEST_CASES = [
         "expect_out": ["SOS M2: preemptive kernel up on",
                        "SOS arenarace: two allocators, no yields",
                        "SOS arenarace: blocks disjoint, markers intact"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The shipping kernel preempts a process that never yields. Root
+        # starts a child that loops forever with no syscall, arms a Timer and
+        # parks. The Timer wakes root, but only the scheduler tick running out
+        # the child's slice puts root back on the processor; with no tick the
+        # child holds the machine and the case runs into the harness timeout.
+        #
+        # `"tick": True` is the case key that leaves the image's boot flags
+        # clear, which is what an image gets by default from the kernel. The
+        # cases that boot the shipping kernel set the "no tick" flag; the
+        # harness-kernel cases boot their own.
+        "name": "tick_spinner",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "tick": True,
+        "root_pkg": TICK_SPINNER_PKG,
+        "children": [CHILD_SPIN_PKG],
+        "expect_out": ["{banner}",
+                       "SOS tickspin: child started",
+                       "SOS tickspin: timer fired while the child spun"],
         "expect_clean_exit": True,
     },
     {
@@ -3878,9 +3925,10 @@ TEST_CASES = [
         #
         # There is no timer anywhere, which matters twice. A driver waits on a
         # human-scale serial port, so a deadline would have to be guessed; and
-        # §9a's one bounded exception to the console handover is a kernel whose
-        # armed tick narrates over a process that owns the device. A case whose
-        # transcript matters after handover arms none.
+        # §9a's one bounded exception to the console handover is a harness
+        # kernel whose tick report narrates over a process that owns the
+        # device. A case whose transcript matters after handover boots an
+        # image that asks for no tick.
         "name": "child_echo_ns16550",
         "arches": ["riscv32", "riscv32-flat"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
@@ -4247,8 +4295,8 @@ TEST_CASES = [
         #
         # Three claims in one ordered transcript, and the order carries two of
         # them. Nothing in this image can move the processor except a thread
-        # giving it up (the kernel booting a root server arms no timer, and
-        # `start` only makes a thread runnable), so:
+        # giving it up (this image asks for no tick, and `start` only makes a
+        # thread runnable), so:
         #
         #   both `parking` lines      the two threads really are on one
         #                             Waiter's blocked list
@@ -7385,7 +7433,7 @@ def _emit_word64(lines, arch, expr):
 
 
 def _emit_row(lines, arch, base_expr, len_expr, kind):
-    """Emit one version 2 region row: {base u64, len u64, kind u8, 7 reserved}.
+    """Emit one region row: {base u64, len u64, kind u8, 7 reserved}.
 
     24 bytes, which keeps the next row 8-aligned without a `.balign` the
     kernel's overlay would have to know about.
@@ -7506,7 +7554,7 @@ def _stitch_regions(case, arch, clang):
         f"    .4byte {REGION_TABLE_MAGIC:#010x}",
         f"    .2byte {REGION_TABLE_VERSION}",
         f"    .byte  {len(rows)}",
-        "    .byte  0",
+        f"    .byte  {boot_flags(case)}",
     ]
     for i, (what, base_expr, len_expr, kind) in enumerate(rows):
         lines.append(f"    /* row {i}: {what} */")
@@ -7580,10 +7628,11 @@ def _build_elf(case, arch, shared_objs, lld, clang):
         objs.append(_stitch_root_image(case["_root_image"][arch["name"]], arch,
                                        clang, name))
     # The child images and the boot region table that names them, the RAM pool
-    # and the device window. A case that asks for none of the three links no
+    # and the device window, and the boot flags in its header. A case that
+    # needs none of them (it asks for no rows and wants the tick) links no
     # `.regions` section, so `_region_table_start` and `_region_table_end` come
-    # out equal and the kernel sees zero regions.
-    if case.get("children") or case.get("pool") or case.get("device"):
+    # out equal and the kernel sees zero regions and the default flags.
+    if needs_region_table(case):
         objs.append(_stitch_regions(case, arch, clang))
 
     # The board's linker script, for `boot.S`'s reason: the memory map, the
@@ -8116,7 +8165,7 @@ def main():
                         f"    .incbin \"{sosimg}\"\n")
             return c3_cc(stub_s, os.path.join(C3_BUILD, f"{name}.rootimg.o"))
 
-        def c3_regions_stub(name, child_images):
+        def c3_regions_stub(name, child_images, flags):
             """The child blobs and the boot region table that names them.
 
             The virt path's `_stitch_regions` cannot be reused: it sizes a
@@ -8144,7 +8193,7 @@ def main():
                       f"    .4byte {REGION_TABLE_MAGIC:#010x}",
                       f"    .2byte {REGION_TABLE_VERSION}",
                       f"    .byte  {len(rows)}",
-                      "    .byte  0"]
+                      f"    .byte  {flags}"]
             for i, (base, length, kind) in enumerate(rows):
                 # 64-bit fields on a 32-bit assembler: low half then a zero
                 # high half, which is the same bytes little-endian.
@@ -8298,6 +8347,31 @@ def main():
                            "SOS c3cas: done",
                            "SOS-C3: halt pass"],
             },
+            {
+                # The tick armed on the board. This case boots the
+                # `isolation` case's images with the tick on (`"tick": True`)
+                # and holds that the kernel gets through the load and the
+                # first entry with it armed, with the same transcript. The
+                # kernel masks interrupts at entry (`boot.S`; ABI.md §7d), so
+                # nothing armed can fault it. This case does not pin that
+                # clear: with it removed the case still passes, because the
+                # fault it prevents is intermittent and needs a short period.
+                # The pin is the stress run ABI.md §7d describes, not this
+                # smoke. The emulator never delivers the interrupt to user
+                # mode, so nothing here shows preemption; `tick_spinner` on
+                # the virt profiles does.
+                "name": "tick_armed",
+                "tick": True,
+                "root_pkg": os.path.join(TESTS_DIR, "c3-isolation"),
+                "children": [os.path.join(TESTS_DIR, "c3-child-poke")],
+                "expect": [C3_ROM, C3_BANNER,
+                           "SOS c3iso: started",
+                           "SOS: fault ",
+                           "SOS c3iso: root survived child status=131072",
+                           "SOS c3iso: child syscalls=0 faults=1",
+                           "SOS c3iso: done",
+                           "SOS-C3: halt pass"],
+            },
         ]
 
         print(f"{BOLD}SOS ESP32-C3 board smoke{RESET} (GATING)")
@@ -8347,10 +8421,13 @@ def main():
                     objs.append(c3_payload_stub(
                         name, _build_root_image(blade_bin, case["root_pkg"],
                                                 c3_arch, clang)))
-                if case["children"]:
+                # Every image but the tick's carries a table, whatever its
+                # rows, because the boot flags live in its header.
+                if case["children"] or not case.get("tick"):
                     objs.append(c3_regions_stub(
                         name, [_build_root_image(blade_bin, pkg, c3_arch, clang)
-                               for pkg in case["children"]]))
+                               for pkg in case["children"]],
+                        boot_flags(case)))
                 flash, size = c3_flash_image(name, objs)
                 out, halted = c3_run(flash)
             except ToolError as e:

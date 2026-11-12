@@ -2457,7 +2457,8 @@ Everything else derives from those handles.
   on every profile, and a 32-bit kernel refuses an entry or segment address that
   does not fit its machine word (`fits_target_word`) rather than narrowing it.
 - **The build also emits a region table** (§12), the second boot input the
-  kernel reads.
+  kernel reads. Its header carries the boot flags: the build's options to the
+  kernel, since no board hands a kernel a command line.
 
 ### 5.7 Syscall ABI
 
@@ -2906,8 +2907,11 @@ memory words, and nothing else.
 **What is built.** The kernel schedules one round-robin FIFO — no levels, no
 ready bitmap — on a one-tick slice. The tick's period is kernel policy (§2.6);
 the tick re-arms from now, so a late tick is one tick, never a burst of
-catch-up. No shipping kernel image arms the tick: `kernel/main.saw` arms none,
-and the harness kernels that test preemption arm their own.
+catch-up. The kernel arms the tick unless the image's boot flags say not to
+(§12): `kernel/main.saw` passes `TICK_PERIOD_US`, 10 ms, to the loader, which
+arms it as the last step before root's first entry to user mode. Interrupts
+are masked in the kernel on every board (§9), so the tick is taken from user
+mode only. The harness kernels that test the tick and timers arm their own.
 
 - **The trap frame is the thread context**, so a context switch is `ktrap`
   returning a different frame than it was called with: one switch point, at the
@@ -2943,7 +2947,21 @@ and the harness kernels that test preemption arm their own.
 - **Nothing runnable is idle or deadlock.** The kernel idles iff something
   outside the thread set can still wake somebody — a bound interrupt line or an
   armed Timer (an unarmed Timer is not one: it will never fire) — and reports
-  deadlock otherwise (§9).
+  deadlock otherwise (§9). The tick is not such a source: with every thread
+  blocked and nothing bound or armed, the machine is deadlocked whether or not
+  a tick is running.
+- **Who a deadlock ends.** The process ended is the one whose thread left the
+  processor last, by blocking or by exiting. When the deadlock is found after a
+  process's death, with no thread left current, the process ended is root. Under
+  the tick the order in which threads block is not fixed: a process waiting on a
+  stalled one can be preempted into blocking after the stalled one's last thread
+  has gone, so the process ended can be the waiter rather than the stalled one,
+  and if that is root the machine stops. The rule says when a deadlock is
+  reported, not which process is the right one to end.
+- **The tick does not stop when the machine idles.** While nothing is runnable
+  the kernel keeps taking the tick, at the same period. A tick taken then has
+  no running thread to charge, so it raises no reschedule. Stopping the tick
+  while idle is not built (§11).
 
 **Not built: priorities.** The priority map is a loader artifact: the loader
 parses the image's priority field and reports it, no process stores it, no
@@ -3237,9 +3255,9 @@ who the driver is.
   its child derives — only the child can narrow that one (`tests/child-narrow`).
 - **The supervisor parks on the death, not on a deadline.** A driver waits on
   a real serial port, so a timer would have to be guessed at — and §9a's one
-  bounded exception to the console handover is a kernel whose armed tick
-  narrates over a process that owns the device. The Process waitable (§8) is
-  what lets a launcher arm nothing.
+  bounded exception to the console handover is a harness kernel whose tick
+  report narrates over a process that owns the device. The Process waitable
+  (§8) is what lets a launcher arm nothing.
 
 **A driver is a service.** Two other processes read and write the console
 through a pipe protocol (§2.1) and hold no device authority at all.
@@ -3279,9 +3297,12 @@ one device interleave mid-word and neither is wrong.
 A `SystemOp.DebugPrint` is not a violation: that is the process asking
 the kernel to place a byte, and the process is the one sequencing it.
 What the protocol forbids is the kernel narrating over a process that is
-using the device. The one bounded exception is a kernel that arms a
-timer, whose first few ticks are narrated after handover — which is why a
-case whose transcript matters after handover arms none.
+using the device. The tick report (`SOS: timer tick`) is a harness kernel's,
+never the shipping kernel's, which arms the tick (§7) and narrates none of it.
+The one bounded exception is a harness kernel that turns the report on
+(`enable_tick_report`), whose first few ticks are narrated after handover —
+which is why a case whose transcript matters after handover boots an image
+whose boot flags turn the tick off.
 
 ## 9b. Kernel sync primitives: IntrSpinLock
 
@@ -3394,6 +3415,7 @@ loader parses and reports while no process stores either.
 **Not built**, one area per line, with the section that specifies it:
 
 - **Priorities and the band map** (§7). The scheduler is one round-robin FIFO.
+- **Tickless idle** (§7). The tick keeps firing while the machine is idle.
 - **Thread waitability, and `kill`** (§8). Attaching a thread is a `NotWaitable`
   fault; `kill` has no op and no right. A supervisor learns a child died by
   reading `get_status` through the handle it holds, or by being woken through an
@@ -3439,11 +3461,17 @@ loader parses and reports while no process stores either.
 
 **Known limits.**
 
+- Which process a deadlock ends is the one whose thread left the processor last
+  (§7), and under the tick that order is not fixed. A process waiting on a
+  stalled one can be the one ended, and if it is root the machine stops where an
+  untimed scheduler would have ended the stalled process and carried on.
 - On a part without atomic instructions (the ESP32-C3), word atomics in a
-  user process, `sosrt`'s bump arena cursor among them, are safe only while
-  nothing preempts; under a kernel that preempts (today only the preemption
-  harness; §7) two threads of one process allocating at once can be handed
-  overlapping blocks (§5c).
+  user process, `sosrt`'s bump arena cursor among them, are plain
+  read-modify-write libcalls, so under the tick (§7) two threads of one
+  process that share one can each be preempted inside it, and two that
+  allocate at once can be handed overlapping blocks (§5c). The emulator the
+  gate runs never delivers the timer interrupt to user mode on that board, so
+  the gate cannot show it.
 - Quotas count objects, not bytes, and there is no per-create quota argument
   (§2.9). Slab donation is permanent (§2.8).
 - Handle generations are best-effort bug detection, not a uniqueness
@@ -3547,7 +3575,12 @@ processes (§2.5).
   region per row and hands them to root through `BootHandleNext`; root's config
   says which ordinal is which. A missing table is zero regions. An image without
   children may still have a table: a root that drives a device boots with its
-  device row.
+  device row, and an image that only sets boot flags has a header and no rows.
+  The header is a magic word, a version, the row count and a **boot flags**
+  byte; the kernel accepts exactly its own version and refuses a flag bit it
+  does not define. Bit 0 is "no tick": the kernel arms the scheduler tick (§7)
+  unless it is set, so an image with no table, or with the flags zero, runs
+  with the tick, and only an image that asks is cooperative.
 - **The boot set is collected, not widened.** The entry register carries exactly
   one handle — System — and everything else the kernel minted for root before it
   ran is drained through `ProcessOp.BootHandleNext`, one `{tag, kind, handle}`

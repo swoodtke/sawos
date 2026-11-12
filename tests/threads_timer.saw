@@ -1,16 +1,18 @@
 // The kernel that arms a timer before loading root.
 //
-// The real kernel (`kernel/main.saw`) does not arm one: a kernel that ticked
-// with one thread would be paying for a scheduler it never used. The preemption
-// case needs one, so this entry is the ordinary boot with two seam calls in
-// front of it.
+// The real kernel (`kernel/main.saw`) arms its tick as the last step before
+// root's first entry to user mode, and only when the image's boot flags allow
+// it. The preemption case wants it armed before the load and its report on, so
+// this entry is the ordinary boot with its own seam calls in front of it, and
+// it passes the loader no period of its own.
 //
 // It names no architecture: which controller and which timer are `hal`'s. What
 // is here is the policy, that the tick exists at all and how often. The HAL
 // owns a counter and a comparator; the kernel owns the period and composes the
 // tick with whatever Timer deadlines processes have armed.
 
-import kcore.{console, load_root_and_enter, start_tick}
+import kcore.{console, load_root_and_enter, start_tick,
+    enable_tick_report}
 import hal
 
 /// A millisecond, the same period the interrupt cases use. With the scheduler's
@@ -26,6 +28,7 @@ func kmain() {
     uart.write_str("\n")
 
     hal.intc_init()
+    enable_tick_report()
     start_tick(TICK_PERIOD_US)
 
     load_root_and_enter()

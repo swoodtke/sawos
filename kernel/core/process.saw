@@ -48,6 +48,7 @@ import kcore.limits.{
 import kcore.mem.{align_up, copy_bytes, word_bytes}
 import kcore.diag.{console, fatal_image}
 import kcore.stats.{stats_clear}
+import kcore.time.{start_tick}
 import kcore.pslot.{
     GrantRow,
     PROCESSES,
@@ -720,13 +721,14 @@ public(package) func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe -
 // A missing or empty table is zero regions, the ordinary reading of a section
 // the linker script always defines and the stitcher usually does not fill. The
 // `len == 0` short-circuit is ahead of every header read so that an image with
-// no table is not refused for a version it never wrote.
+// no table is not refused for a version it never wrote. A header with a count
+// of zero is the same reading, and carries the boot flags.
 //
 // Wire layout (fixed-width little-endian, as the sosimg format): an 8-byte
-// header (magic `u32`, version `u16`, count `u8`, reserved `u8`), then `count`
-// rows of `{base: u64, len: u64, kind: u8, reserved x 7}`. The header's size
-// puts every row on an 8-byte boundary and the row's padding keeps the next one
-// there, which is what makes the overlay below exact.
+// header (magic `u32`, version `u16`, count `u8`, boot flags `u8`), then
+// `count` rows of `{base: u64, len: u64, kind: u8, reserved x 7}`. The
+// header's size puts every row on an 8-byte boundary and the row's padding
+// keeps the next one there, which is what makes the overlay below exact.
 
 /// The region table's header: 8 bytes at the section's start. The version field
 /// is the first thing a reader needs, so its position may never move.
@@ -734,8 +736,21 @@ struct RegionTableHeader {
     magic: UInt32,
     version: UInt16,
     count: UInt8,
-    reserved0: UInt8,
+    flags: UInt8,
 }
+
+/// The header's boot flags: options the build passes the kernel, the only
+/// channel an image has, since no board hands a kernel a command line. A clear
+/// bit is the default, so an image with no table, or with zero flags, runs the
+/// shipping configuration.
+///
+/// Bit 0: do not arm the scheduler tick. The build sets it for an image whose
+/// processes rely on running until they block.
+static BOOT_FLAG_NO_TICK: UInt8 = 0x01
+
+/// Every flag bit this build defines. A bit outside it is a table this kernel
+/// cannot honor, which the loader refuses rather than ignore.
+static BOOT_FLAGS_KNOWN: UInt8 = BOOT_FLAG_NO_TICK
 
 /// A region row's kind. The two kinds are spec §2.5's pool attributes: RAM is
 /// cacheable memory a process runs in, Device is a peripheral's registers, and
@@ -784,7 +799,7 @@ static REGION_TABLE_MAGIC: UInt32 = 0x4E47_5253
 /// row's base as this one's kind. The stitcher and kernel are built together.
 /// An image with no table at all reads as zero regions and never reaches this
 /// comparison.
-static REGION_TABLE_VERSION: UInt16 = 2
+static REGION_TABLE_VERSION: UInt16 = 3
 
 /// Overlay the header on the section's first bytes. One view construction, then
 /// an ordinary safe struct; the unsafety is confined to this line.
@@ -798,6 +813,27 @@ func region_header_at(addr: UInt) unsafe -> RegionTableHeader {
 /// Overlay one row. Same conversion, same reason.
 func region_row_at(addr: UInt) unsafe -> RegionRow {
     UnsafeMemory<RegionRow, Normal>(hal.phys_to_virt(addr)).read()
+}
+
+/// Does this image want the scheduler tick? Yes unless its region table's boot
+/// flags say otherwise; an image with no table, or a table this kernel would
+/// refuse, answers yes. The refusal itself is `mint_boot_regions`'s, which runs
+/// before the first entry to user mode, so a malformed table never reaches a
+/// running process on the strength of this answer.
+public func boot_tick_enabled() unsafe -> Bool {
+    let start = hal.region_table_start()
+    let end = hal.region_table_end()
+    if end < start || end - start < (sizeof<RegionTableHeader>() as UInt) {
+        return true
+    }
+    let header = region_header_at(start)
+    if header.magic != REGION_TABLE_MAGIC {
+        return true
+    }
+    if header.version != REGION_TABLE_VERSION {
+        return true
+    }
+    (header.flags & BOOT_FLAG_NO_TICK) == 0
 }
 
 /// Parse the region table and mint one Memory or IoMemory per row into process
@@ -821,8 +857,8 @@ func mint_boot_regions(p: Int) unsafe {
     let header_len = sizeof<RegionTableHeader>() as UInt
     let row_len = sizeof<RegionRow>() as UInt
 
-    // An image built with no children has an empty section: zero regions, not
-    // an error.
+    // An image built with no children and no flags has an empty section: zero
+    // regions, not an error.
     if len == 0 {
         return
     }
@@ -838,6 +874,10 @@ func mint_boot_regions(p: Int) unsafe {
         fatal_image("region table version is not this build's",
                     header.version as UInt)
     }
+    if (header.flags & (BOOT_FLAGS_KNOWN ^ 0xFF)) != 0 {
+        fatal_image("region table sets boot flags this build cannot honor",
+                    header.flags as UInt)
+    }
     let count = (header.count as UInt)
     // The bound is both slabs' combined: a row mints into one or the other by
     // its kind. The per-row `alloc_*` refusals below catch a table that is
@@ -847,6 +887,11 @@ func mint_boot_regions(p: Int) unsafe {
     }
     if count * row_len > len - header_len {
         fatal_image("region table rows run past the section", count)
+    }
+    // A header with no rows is an image that only sets boot flags: zero
+    // regions, and no report, as with no table at all.
+    if count == 0 {
+        return
     }
 
     var i: UInt = 0
@@ -984,9 +1029,19 @@ func fits_word(v: UInt64) -> Bool {
 /// read+execute only, so the kernel may write nowhere in them and should say so
 /// if asked. Only the loader, which grants a data segment and a stack, passes a
 /// window.
+///
+/// `tick_period_us` is the scheduler tick to arm, or 0 for none. It is armed
+/// as the step before `resume_frame`, after the load. The position is
+/// tidiness, not protection: interrupts are masked in the kernel on every
+/// board, so the tick cannot be taken before the first entry to user mode
+/// however soon it comes due. What masks them is each HAL's: its boot code
+/// leaves them masked (or masks them first thing, where reset does not) and
+/// its first entry to user mode opens them for user mode only. Each HAL's
+/// ABI.md states it under "Interrupts are masked in the kernel".
 public func start_process(entry: UInt, stack_top: UInt,
                           region_base: UInt, region_top: UInt,
-                          rw_base: UInt = 0, rw_top: UInt = 0) unsafe -> Never {
+                          rw_base: UInt = 0, rw_top: UInt = 0,
+                          tick_period_us: UInt = 0) unsafe -> Never {
     let p: Int = ROOT_PROCESS
     claim_root()
     let b = body_of(p)
@@ -1072,6 +1127,9 @@ public func start_process(entry: UInt, stack_top: UInt,
     console().write_str("SOS: console handover\n")
 
     hal.frame_init(frame_slot(main), entry, stack_top, system)
+    if tick_period_us != 0 {
+        start_tick(tick_period_us)
+    }
     // `resume_frame` is `-> Never`: it enters the process and the kernel is
     // only re-entered through a trap. That is this function's divergence.
     hal.resume_frame(frame_slot(main))

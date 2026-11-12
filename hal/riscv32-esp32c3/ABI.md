@@ -401,21 +401,20 @@ The matrix drives the core's request line directly and **never raises
 
 That matters because SOS's idle path is
 `while nothing runnable { wait_for_irq(); irq_poll() }` with
-`mstatus.MIE` never set (interrupts are taken from user mode only), so the
-wake it depends on is `wfi` returning on a pending interrupt. On virt the CLINT
-and PLIC raise `mip`, which is `wfi`'s wake condition (`mip & mie`); here
-nothing does.
+`mstatus.MIE` clear (§7d), so the wake it depends on is `wfi` returning on a
+pending interrupt. On virt the CLINT and PLIC raise `mip`, which is `wfi`'s
+wake condition (`mip & mie`); here nothing does.
 
 The HAL absorbs it: `wait_for_irq()` is empty on this board and the idle loop
 spins, while `irq_poll()` reads the SYSTIMER's own latch — which does work. It
 costs a core burned while idle, invisible under emulation, and this target is
-emulator-only. Nothing above the HAL changes: the kernel still never takes a
-trap in kernel mode. The shared `sink.c`'s `sos_wait_for_irq` is left in place,
-unused and undeclared by this board's `extern` block (the block is split by
-caller, so `--gc-sections` drops the leaf), because on real silicon `wfi` does
-wake from the interrupt matrix (the C3 TRM's low-power section is explicit that
-any enabled interrupt resumes the core) and a hardware bring-up should restore
-the call.
+emulator-only. Nothing above the HAL changes: the kernel never takes a trap
+in kernel mode (§7d). The shared `sink.c`'s `sos_wait_for_irq` is left in
+place, unused and undeclared by this board's `extern` block (the block is
+split by caller, so `--gc-sections` drops the leaf), because on real silicon
+`wfi` does wake from the interrupt matrix (the C3 TRM's low-power section is
+explicit that any enabled interrupt resumes the core) and a hardware bring-up
+should restore the call.
 
 ### 7c. The recipe, as the HAL programs it
 
@@ -444,6 +443,40 @@ the map registers the kernel itself wrote: one device read per source, so slow,
 stateless, and impossible to get out of step with the hardware.
 
 ---
+
+### 7d. Interrupts are masked in the kernel
+
+This part starts with `mstatus.MIE` **set**: probed with the clear removed,
+`mstatus` reads `0x00000008` where the clear now sits, right after the stack
+is set up. A timer
+interrupt taken while it is set lands on `kernel_fault`
+(`SOS-C3: kernel fault mcause=0x80000007`), because the kernel has no handler
+for one. So `boot.S` clears `MIE` as its first instruction after the stack, and
+nothing sets it again: `sos_resume_frame` leaves `MPIE` clear and a trap entry
+clears `MIE`. Probed with the clear in place, `mstatus` reads `0x00000000`
+after the clear and again immediately before the call to `kmain`.
+
+That makes the invariant the rest of the kernel states (spec §9) true on this
+board from that point (the only instruction before it loads the stack
+pointer): the kernel never takes an interrupt, whatever is armed and whenever
+it comes due. The kernel still arms the scheduler tick as
+the last step before the first entry to user mode, but the position is policy,
+not a defence.
+
+The `tick_armed` smoke case boots the isolation images with the tick armed and
+reaches the same transcript as `isolation`. Its mutation check is a stress
+build (tick armed early in `kmain`, a 1 ms period) run repeatedly on the
+unfixed and the fixed `boot.S`: the unfixed build faults intermittently, the
+fixed one never does. The unfixed failure is a race against the load, so one
+passing run proves nothing about it: with the clear removed the whole smoke,
+`tick_armed` included, still passes. The pin on the clear is that stress run,
+which the gate does not run; no gate case holds it.
+
+Observed on the emulator: the matrix interrupt is delivered in M-mode with
+`MIE` set and was never delivered to a user-mode process, with `MPIE` clear or
+set. The scheduler tick therefore does not preempt a process on this board
+under emulation; the `irq_poll` calls at the kernel's preemption points and in
+its idle loop are the only things that see it.
 
 ## 8. The SRAM budget, and why the layout is XIP
 

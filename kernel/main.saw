@@ -15,7 +15,7 @@
 // image, grant it its regions, drop to user mode. With no root image there is
 // nothing to run, and the kernel says so rather than exiting quietly.
 
-import kcore.{console, load_root_and_enter}
+import kcore.{console, load_root_and_enter, boot_tick_enabled, TICK_PERIOD_US}
 import hal
 
 @export("kmain")
@@ -30,10 +30,11 @@ func kmain() {
     // so the controller must already be initialised; masked, nothing is
     // deliverable until a driver asks.
     //
-    // No timer is armed here. The scheduler works without one (a `yield` and a
-    // block both switch), and a tick would narrate over the process for the
-    // first few ticks; see the handover protocol on `kcore`'s `Console`.
+    // The scheduler tick (spec §7) is armed unless the image's boot flags ask
+    // for none (`boot_tick_enabled`). It is not armed here: the loader arms it
+    // as the last step before the first entry to user mode (see
+    // `start_process`). A period of 0 is "no tick".
     hal.intc_init()
 
-    load_root_and_enter()
+    load_root_and_enter(if boot_tick_enabled() { TICK_PERIOD_US } else { 0 })
 }
