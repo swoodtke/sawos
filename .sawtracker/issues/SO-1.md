@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2413,"closed":"","created":"1788791279","id":"SO-1","labels":["todo-import","queued","design","plan","design-proposal"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":40,"revision":2,"sequence":655,"stage":"queued","status":"open","title":"Scope M6 storage, namespace, loader and UART shell","updated":"1794498236"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2413,"closed":"","created":"1788791279","id":"SO-1","labels":["todo-import","queued","design","plan","design-proposal"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":40,"revision":3,"sequence":668,"stage":"queued","status":"open","title":"Scope M6 storage, namespace, loader and UART shell","updated":"1794498261"}
 ---
 
 
@@ -47,4 +47,23 @@ Historical closed subcases are context, not new work. Legacy DF/SL/SO numbers us
 
 
 ## Comments
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":936,"created":"1794498261","id":"c1"} -->
+**Lead, Nov 12: queued for the week of Nov 12–19.** The deliverable this week
+is the scoped milestone brief only, as a sawtracker doc for user review; it
+dispatches no implementation.
+
+The M5-close scoping session this issue waits on never happened: the split
+from sawlang, the pin bumps and the lifecycle work (SO-52, SO-40) came first.
+What changed since the seed, for the brief to account for:
+- Pids and the sender handle (SO-49) and `ProcessObserve` (SO-50) are queued
+  ahead of this. They give a name service a client identity and the shell a
+  `ps`.
+- `kill` is SO-70. The shell needs it to stop a program.
+- A launcher still cannot send a Process or System handle in a message
+  (SO-7), which the loader and launcher split may want.
+- The shipping kernel arms no tick and priorities are not built (§7), so a
+  program that never yields holds the machine. The brief should say whether
+  the shell milestone needs preemption.
+
 
