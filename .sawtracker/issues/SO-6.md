@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":90,"revision":3,"sequence":688,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794499626"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":4,"sequence":712,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794500307"}
 ---
 
 
