@@ -56,6 +56,13 @@ Every implementing agent follows these. A unit's issue carries its own
   line.
 - Never weaken an existing assertion to make a case pass. If a transcript row
   must move, name the row and the reason in your report.
+- **No case asserts anything about run time or wall time** (user ruling). The
+  emulators' clocks follow host time, so an elapsed time, a count of fires or
+  ticks that accumulated while the program ran, or an order that only holds
+  if one thing finishes before a clock moves, fails when the host is loaded.
+  Assert the property instead: that a wake happened, that a count is at
+  least one, that a wait consumed it. Print a timing-dependent value if it
+  helps a reader, and leave it out of the expected text.
 - The flat profile excludes cases by name with a printed reason. Exclude one
   only if what it asserts is a hardware denial.
 
