@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2413,"closed":"","created":"1788791279","id":"SO-1","labels":["todo-import","queued","design","plan","design-proposal"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":40,"revision":3,"sequence":668,"stage":"queued","status":"open","title":"Scope M6 storage, namespace, loader and UART shell","updated":"1794498261"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2413,"closed":"","created":"1788791279","id":"SO-1","labels":["todo-import","queued","design","plan","design-proposal"],"order":0,"parent":"","priority":"high","project":"SO","queue_order":80,"revision":4,"sequence":687,"stage":"queued","status":"open","title":"Scope M6 storage, namespace, loader and UART shell","updated":"1794499626"}
 ---
 
 
