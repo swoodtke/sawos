@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":10,"sequence":759,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794505197"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":11,"sequence":760,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794505197"}
 ---
 
 
@@ -191,4 +191,25 @@ The child exits with `EXIT_SPENT`, `await_denial` refuses the status, and root n
 
 <!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":35,"created":"1794505197","id":"c6"} -->
 Revised patch SO-6.p1 to revision 2
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":1055,"created":"1794505197","id":"c7"} -->
+**Lead, SO-6.p1 r2: the reviewer's four items.**
+1. **The wrong-row claim** in `pipe-reply-narrowed`'s header and over
+   `pipe_reply_narrowed` in the runner: both now say what the mutant shows.
+   With the gate removed the child prints that its reply was accepted and
+   exits with its own code, so the fault row is missing and root, refusing
+   that status, prints neither of the last two rows. The implementer's
+   mutation report had this transcript; the lead's review missed that the
+   header disagreed with it.
+2. **The tag comment** in `pipe-reply-narrowed`: it now says the child reads
+   the obligation's tag, that 12 asks for `reply_wait`, and that this case's
+   tag is therefore not 12. The child's doc on `TAG_REPLY_WAIT` names both
+   root packages as parties to the contract.
+3. **"The one way to hold one"** is now "the one way to make one".
+4. **A `waiter_create` failure** in `child-narrowed` exits with its own
+   `EXIT_NO_WAITER`.
+
+Item 4 is a code change, so the three narrowed cases were rerun on three
+profiles after it: 9 passed.
+
 
