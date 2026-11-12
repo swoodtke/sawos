@@ -1,0 +1,144 @@
+// Test child: a one-shot handle it may hold and may not spend.
+//
+// The boot set carries one record, either an obligation (`PipeRequest`) or a
+// claim (`PipeReply`), given through a keep mask that left out the right the
+// handle's one spending op needs: `Reply` on the obligation, `Resolve` on the
+// claim. The child reads the rights back first, which shows the mask did what
+// it said, and then attempts the spend. A missing right is `AccessDenied`, a
+// mistake the caller could have checked, so the kernel terminates the process
+// rather than answering it, and the launcher reads the fault from the status
+// word.
+//
+// One image serves every case because the launcher decides by what it gives.
+// The record's kind picks obligation or claim, and for an obligation the tag
+// it was given under picks the spend: `TAG_REPLY_WAIT` spends it with
+// `reply_wait` (the `ReplyWait` op), any other tag with `reply` (the `Reply`
+// op). Each op checks `PipeRequestRight.Reply` at its own site.
+
+import sos.{System, Process, PipeRequest, PipeReply, PipeRequestRight,
+            PipeReplyRight, BootHandle, BootHandleKind, SosStatus,
+            PIPE_BODY_BYTES}
+
+/// The boot set held no one-shot record.
+static EXIT_NO_RECORD: UInt = 96
+/// The handle's rights were not what the launcher's mask should have left.
+static EXIT_WRONG_RIGHTS: UInt = 95
+/// The spend succeeded, which is the gate failing.
+static EXIT_SPENT: UInt = 94
+/// No Waiter could be created for the reply-and-wait spend.
+static EXIT_NO_WAITER: UInt = 93
+
+/// The tag that asks for reply-and-wait. `pipe-reply-wait-narrowed` gives its
+/// obligation under this exact word, and `pipe-reply-narrowed` must give its
+/// own under any other, so it is part of the contract with both.
+static TAG_REPLY_WAIT: UInt = 12
+
+/// What each keep mask leaves: the handle may be passed on and waited on, and
+/// may not do the one thing it exists for.
+static REQUEST_RIGHTS: UInt32 = (PipeRequestRight.Transfer
+                                 | PipeRequestRight.Wait)
+static REPLY_RIGHTS: UInt32 = (PipeReplyRight.Transfer | PipeReplyRight.Wait)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childnarrowed: no process handle: {}\n", error)
+        return
+    }
+
+    var spent = false
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                match rec.kind {
+                    case PipeRequest -> {
+                        if let request = rec.take_request() {
+                            let wait = rec.tag == TAG_REPLY_WAIT
+                            spend_request(&system, &proc, move request, wait)
+                            spent = true
+                        }
+                    },
+                    case PipeReply -> {
+                        if let claim = rec.take_reply() {
+                            spend_claim(&system, &proc, move claim)
+                            spent = true
+                        }
+                    },
+                    case _ -> {},
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+
+    if not spent {
+        let _ = system.debug_print("SOS childnarrowed: no one-shot record\n")
+        let _ = proc.exit(EXIT_NO_RECORD)
+    }
+}
+
+/// Read the obligation's rights, then reply through it, with `reply_wait` when
+/// `wait` is set. The spend faults the process; nothing after it runs.
+func spend_request(system: &System, proc: &Process, request: PipeRequest,
+                   wait: Bool) {
+    let rights = try request.rights() catch {
+        print("SOS childnarrowed: rights unreadable: {}\n", error)
+        let _ = proc.exit(EXIT_WRONG_RIGHTS)
+        return
+    }
+    if rights != REQUEST_RIGHTS {
+        print("SOS childnarrowed: obligation rights={}\n", rights)
+        let _ = proc.exit(EXIT_WRONG_RIGHTS)
+        return
+    }
+    let said = "SOS childnarrowed: the obligation reads back without Reply\n"
+    let _ = system.debug_print(said)
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 1
+    if wait {
+        let waiter = try proc.waiter_create() catch {
+            print("SOS childnarrowed: no waiter: {}\n", error)
+            let _ = proc.exit(EXIT_NO_WAITER)
+            return
+        }
+        let going = "SOS childnarrowed: now replying and waiting\n"
+        let _ = system.debug_print(going)
+        let _ = (move request).reply_wait(body: &body, len: 1, waiter: &waiter)
+    } else {
+        let _ = system.debug_print("SOS childnarrowed: now replying\n")
+        let _ = (move request).reply(body: &body, len: 1)
+    }
+
+    // Unreachable: the line above does not return.
+    let _ = system.debug_print("SOS childnarrowed: the reply was accepted\n")
+    let _ = proc.exit(EXIT_SPENT)
+}
+
+/// Read the claim's rights, then resolve it. The resolve faults the process
+/// before it can park; nothing after it runs.
+func spend_claim(system: &System, proc: &Process, claim: PipeReply) {
+    let rights = try claim.rights() catch {
+        print("SOS childnarrowed: rights unreadable: {}\n", error)
+        let _ = proc.exit(EXIT_WRONG_RIGHTS)
+        return
+    }
+    if rights != REPLY_RIGHTS {
+        print("SOS childnarrowed: claim rights={}\n", rights)
+        let _ = proc.exit(EXIT_WRONG_RIGHTS)
+        return
+    }
+    let readback = "SOS childnarrowed: the claim reads back without Resolve\n"
+    let _ = system.debug_print(readback)
+
+    let _ = system.debug_print("SOS childnarrowed: now resolving\n")
+    let _ = (move claim).resolve()
+
+    // Unreachable: the line above does not return.
+    let _ = system.debug_print("SOS childnarrowed: the resolve was accepted\n")
+    let _ = proc.exit(EXIT_SPENT)
+}

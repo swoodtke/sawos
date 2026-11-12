@@ -462,6 +462,11 @@ PIPE_ABANDON_PKG = os.path.join(TESTS_DIR, "pipe-abandon")
 PIPE_DELEGATE_PKG = os.path.join(TESTS_DIR, "pipe-delegate")
 CHILD_REPLY_PKG = os.path.join(TESTS_DIR, "child-reply")
 PIPE_NO_REPLY_PKG = os.path.join(TESTS_DIR, "pipe-no-reply")
+PIPE_REPLY_NARROWED_PKG = os.path.join(TESTS_DIR, "pipe-reply-narrowed")
+PIPE_REPLY_WAIT_NARROWED_PKG = os.path.join(TESTS_DIR,
+                                            "pipe-reply-wait-narrowed")
+PIPE_RESOLVE_NARROWED_PKG = os.path.join(TESTS_DIR, "pipe-resolve-narrowed")
+CHILD_NARROWED_PKG = os.path.join(TESTS_DIR, "child-narrowed")
 PIPE_BIG_REPLY_PKG = os.path.join(TESTS_DIR, "pipe-big-reply")
 PIPE_DEAD_CLAIM_PKG = os.path.join(TESTS_DIR, "pipe-dead-claim")
 PIPE_REPLY_SELF_PKG = os.path.join(TESTS_DIR, "pipe-reply-self")
@@ -4577,7 +4582,8 @@ TEST_CASES = [
         # (`give_keep_mask`).
         #
         # The `Reply` gate is reachable only through a `give` keep mask into
-        # another process, which is a two-process case; no case here covers it.
+        # another process, which is a two-process case: `pipe_reply_narrowed`
+        # for the `Reply` op and `pipe_reply_wait_narrowed` for `ReplyWait`.
         "name": "pipe_no_reply",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PIPE_NO_REPLY_PKG,
@@ -4587,6 +4593,89 @@ TEST_CASES = [
                        "SOS: process teardown handles="],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The `Reply` gate, reached through a give's keep mask. Root gives an
+        # obligation to a child with `Transfer | Wait`, so the child holds an
+        # obligation it may pass on and may not answer. The child reads the
+        # missing bit back and replies anyway: the kernel kills it, which is a
+        # fault because the caller held the handle and could have checked.
+        #
+        # The last row is why the death matters to the exchange. The child's
+        # teardown releases the obligation undischarged, so the claim root
+        # still holds answers `PeerClosed`. A gate that let the reply through
+        # would let the child exit with its own code: the fault row would be
+        # missing and root, refusing that status, would print neither of the
+        # last two rows.
+        "name": "pipe_reply_narrowed",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_REPLY_NARROWED_PKG,
+        "children": [CHILD_NARROWED_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS narrowreply: gave the obligation without Reply",
+                       "SOS childnarrowed: the obligation reads back without "
+                       "Reply",
+                       "SOS childnarrowed: now replying",
+                       "SOS: process fault: access denied process={one}",
+                       "SOS narrowreply: the child died of the denial",
+                       "SOS narrowreply: the claim answers the other end of "
+                       "this connection is gone"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The second `Reply` gate. `PipeRequestRight.Reply` is checked once in
+        # the `Reply` op and once in `ReplyWait`, and `pipe_reply_narrowed`
+        # reaches only the first. Same shape, with the child spending the
+        # obligation through `reply_wait`: root gives it under the tag the
+        # child reads as that choice. The fault comes before the reply is
+        # written or the child parks, so the last row is again the claim's
+        # `PeerClosed`; a gate that let the op through would write the reply
+        # and park the child on its empty Waiter, which dies of the deadlock
+        # rule instead.
+        "name": "pipe_reply_wait_narrowed",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_REPLY_WAIT_NARROWED_PKG,
+        "children": [CHILD_NARROWED_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS narrowreplywait: gave the obligation without "
+                       "Reply",
+                       "SOS childnarrowed: the obligation reads back without "
+                       "Reply",
+                       "SOS childnarrowed: now replying and waiting",
+                       "SOS: process fault: access denied process={one}",
+                       "SOS narrowreplywait: the child died of the denial",
+                       "SOS narrowreplywait: the claim answers the other end "
+                       "of this connection is gone"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The `Resolve` gate, the client's half of the case above. Root keeps
+        # the obligation and gives the claim to a child with `Transfer | Wait`.
+        # The child reads the missing bit back and resolves anyway, and is
+        # killed before the resolve can park.
+        #
+        # The last row is the teardown's decision seen from the other end: the
+        # claim died with the child, so root's reply through the obligation it
+        # kept answers `PeerClosed`. A gate that let the resolve through would
+        # park the child on a question nobody answers, and it would die of the
+        # deadlock rule instead, a different fault.
+        "name": "pipe_resolve_narrowed",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PIPE_RESOLVE_NARROWED_PKG,
+        "children": [CHILD_NARROWED_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS narrowresolve: gave the claim without Resolve",
+                       "SOS childnarrowed: the claim reads back without "
+                       "Resolve",
+                       "SOS childnarrowed: now resolving",
+                       "SOS: process fault: access denied process={one}",
+                       "SOS narrowresolve: the child died of the denial",
+                       "SOS narrowresolve: the obligation answers the other "
+                       "end of this connection is gone"],
+        "expect_clean_exit": True,
     },
     {
         # A reply bigger than the slot (spec §2.1's fixed body):

@@ -1,0 +1,149 @@
+// The `Resolve` gate, reached through a give's keep mask (spec §2.1, §3).
+//
+// The client's half of `pipe-reply-narrowed`. A claim comes out of `post` with
+// the full set and is never minted narrower, so a handle without
+// `PipeReplyRight.Resolve` exists only as the result of a give through a keep
+// mask. Root posts a question, keeps the obligation, and gives the claim to a
+// child with `keep = Transfer | Wait`, leaving `Resolve` out.
+//
+//   SOS narrowresolve: gave the claim without Resolve
+//   SOS childnarrowed: the claim reads back without Resolve
+//   SOS childnarrowed: now resolving
+//   SOS: process fault: access denied process=0x…01
+//   SOS narrowresolve: the child died of the denial
+//   SOS narrowresolve: the obligation answers the other end of this
+//                      connection is gone
+//
+// The child's resolve is refused with a fault before it could park, and the
+// process dies. Its teardown releases the claim, so nobody is left to hear an
+// answer, and root's own reply through the obligation it kept therefore
+// answers `PeerClosed`. Had the gate let the resolve through, the child would
+// have parked on a question nobody answers and died of the deadlock rule
+// instead, a different fault, so the status check would fail.
+//
+// One phase per function, because of the stack ceiling.
+
+import sos.{System, Process, Waiter, WaitResult, WaitPayload, PipeInlet,
+            PipeOutlet, PipeReply, PipeRequest, PipeReplyRight, SosStatus,
+            SystemRight, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status the kernel can never hand this program, so meeting it in the error
+/// channel means an assertion in this file failed rather than a call did.
+static BUG: SosStatus = SosStatus.Revoked
+
+/// §8's word for a process the kernel terminated with
+/// `FaultReason.AccessDenied`: kind 2 in the high half, reason 3 in the low.
+static CHILD_FAULTED: UInt = 131075
+
+static KEY_DEATH: UInt = 94
+
+/// Root's config. `child-narrowed` drains its boot set, so the tags only have
+/// to be distinct.
+static TAG_BOOT: UInt = 7
+static TAG_CLAIM: UInt = 11
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The claim may be passed on and waited on, and not resolved.
+static CLAIM_KEEP: UInt32 = (PipeReplyRight.Transfer | PipeReplyRight.Wait)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS narrowresolve: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS narrowresolve: failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let _ = proc.exit(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image = try proc.boot_handle_next()
+    var dest = try proc.boot_handle_next()
+    guard let image_mem = image.take_memory() else { return BUG }
+    guard let dest_mem = dest.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &image_mem, memory: &dest_mem)
+
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+
+    var msg: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    msg[0] = 63
+    let claim = try inlet.post(body: &msg, len: 1)
+    let taken = try outlet.take()
+    let (_, request) = move taken
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(reply: move claim, tag: TAG_CLAIM,
+                   keep: CLAIM_KEEP) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    print("SOS narrowresolve: gave the claim without Resolve\n")
+    try child.start(boot_tag: TAG_BOOT)
+
+    try await_denial(&waiter)
+    try ask_obligation(move request)
+    return
+}
+
+/// Park until the child ends, and check it ended on the denial.
+func await_denial(waiter: &Waiter) -> Result<Void, SosStatus> {
+    let ended = try waiter.wait()
+    if ended.key != KEY_DEATH {
+        return BUG
+    }
+    match ended.what {
+        case Process(status) -> {
+            if status != CHILD_FAULTED {
+                print("SOS narrowresolve: child status={}\n", status)
+                return BUG
+            }
+        },
+        case _ -> return BUG,
+    }
+    print("SOS narrowresolve: the child died of the denial\n")
+    return
+}
+
+/// Answer the question and see what the teardown decided. A `match` rather
+/// than the guard shape, deliberately: this is a negative assertion on a
+/// specific status.
+func ask_obligation(request: PipeRequest) -> Result<Void, SosStatus> {
+    var out: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    out[0] = 1
+    match (move request).reply(body: &out, len: 1) {
+        case Ok(_) -> {
+            print("SOS narrowresolve: the obligation took a reply\n")
+            return BUG
+        },
+        case Err(status) -> {
+            print("SOS narrowresolve: the obligation answers {}\n", status)
+        },
+    }
+    return
+}
