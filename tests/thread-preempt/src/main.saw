@@ -1,24 +1,28 @@
 // Preemption (spec §7).
 //
-// Two workers print a letter and then spin. Neither yields, blocks, or makes
-// any call that could give the processor up, so if the letters interleave at
-// all, something took it away, and the only thing that can is the timer running
-// out a thread's slice.
+// Two workers print a letter and then wait for the other worker to print its
+// own, spinning on a shared counter. Neither yields, blocks, or makes any call
+// that could give the processor up, so a worker that is waiting for the other
+// can only be answered if something takes the processor away from it, and the
+// only thing that can is the timer running out a thread's slice.
 //
-//   AABBAABB...                 <- the exact grouping is timing; the
-//                                  alternation is the claim
+//   ABBAABBA...                 <- which worker goes first is timing; that the
+//                                  processor changes hands is the claim
 //   SOS preempt: joined a=33 b=44
+//
+// The handoff is forced by construction, not by how long a worker runs. Each
+// worker publishes how many letters it has printed and, after printing, spins
+// until the other has printed as many. The worker that prints first cannot
+// leave its spin until the other has run, so the transcript crosses between
+// the two threads in every round however many ticks the host delivers or how
+// late. A kernel that never preempted would leave the first worker spinning
+// forever and the case would end at the harness timeout.
 //
 // The kernel booting this image is `tests/threads_timer.saw`, which arms the
 // periodic tick before it loads the image. The cooperative twin of this case
 // (`thread-basics`) runs under a kernel that arms nothing, so the two
 // transcripts together separate "the scheduler switches" from "a thread asked
 // it to".
-//
-// The spin length is the only tuned number: long enough that a round outlasts a
-// slice, so a preemption lands between two of a worker's own prints rather than
-// after all of them. Too short and one worker finishes inside a single slice,
-// so the transcript reads AAAA then BBBB; too long only makes the case slower.
 
 import sos.{System, Process, Thread}
 
@@ -29,10 +33,11 @@ import sos.{System, Process, Thread}
 /// thread of an image written in Saw enters at the same address.
 unsafe static var BOOT_HANDLE: UInt = 0
 
-/// Where `burn` leaves its result. A spin loop whose value nothing reads is one
-/// the optimizer deletes, and a deleted spin makes this case pass or fail on
-/// which thread happened to be interrupted first.
-unsafe static var BURN_SINK: UInt = 0
+/// How many letters each worker has printed, published for the other to read.
+/// An atomic load is what keeps a spin on it from being hoisted out of its
+/// loop.
+static PRINTED_A: Atomic<Int> = Atomic(0)
+static PRINTED_B: Atomic<Int> = Atomic(0)
 
 static STACK_WORDS: Int = 1024
 unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
@@ -44,11 +49,6 @@ static STACK_ALIGN: UInt = 16
 static ROLE_A: UInt = 1
 static ROLE_B: UInt = 2
 static ROUNDS: Int = 8
-/// Iterations between two prints. With the kernel's tick and slice lengths
-/// this must be comfortably more than one slice on both machines: a round that
-/// fits inside a slice lets a worker print several times before losing the
-/// processor, and the transcript reads as blocks rather than as alternation.
-static SPIN: Int = 1_500_000
 static EXIT_A: UInt = 33
 static EXIT_B: UInt = 44
 
@@ -75,21 +75,23 @@ func parked_boot_handle() unsafe -> UInt {
     BOOT_HANDLE
 }
 
-/// Burn time without touching the kernel.
-///
-/// The body is a linear-congruential step on purpose: a counter loop has a
-/// closed form and the optimizer writes it, leaving no time burned at all. Each
-/// step depends on the one before it and the result is stored, so the loop has
-/// to run. Arithmetic is wrapped (`&*`, `&+`) because overflow is what an LCG
-/// is made of.
-func burn(iterations: Int) unsafe {
-    var x = BURN_SINK
-    var i = 0
-    while i < iterations {
-        x = (x &* 1_664_525) &+ 1_013_904_223
-        i = i + 1
+/// Publish that `role` has printed `count` letters.
+func publish(role: UInt, count: Int) {
+    if role == ROLE_A {
+        PRINTED_A.store(count)
+    } else {
+        PRINTED_B.store(count)
     }
-    BURN_SINK = x
+}
+
+/// Spin until the worker other than `role` has printed `count` letters. The
+/// loop makes no call into the kernel, so it ends only when the processor goes
+/// to the other worker and back.
+func await_other(role: UInt, count: Int) {
+    var seen = 0
+    while seen < count {
+        seen = if role == ROLE_A { PRINTED_B.load() } else { PRINTED_A.load() }
+    }
 }
 
 func worker(role: UInt) {
@@ -100,8 +102,9 @@ func worker(role: UInt) {
     var round = 0
     while round < ROUNDS {
         let _ = system.debug_print(tag)
-        burn(SPIN)
         round = round + 1
+        publish(role, round)
+        await_other(role, round)
     }
     let _ = (move me).exit(if role == ROLE_A { EXIT_A } else { EXIT_B })
 }

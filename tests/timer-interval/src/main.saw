@@ -1,19 +1,21 @@
 // A periodic timer is ack-free, and missed fires coalesce (spec §2's Timer
 // row).
 //
-// Three claims, in the order the transcript makes them:
+// Claims, in the order the transcript makes them:
 //
 //   SOS interval: tick one fires=N
 //   SOS interval: tick two fires=N ackfree=1
 //   SOS interval: coalesced=1
+//   SOS interval: late=1
 //   SOS interval: drained fires=1
 //   SOS interval: done
 //
-// The periodic counts are `N`, not 1, and that is the feature. A fire delivered
-// more than a period late coalesces, so under an emulator whose timing belongs
-// to the host a correct kernel may report 2 or 3 on either of the first two
-// wakes. Only the last count is deterministic, because it takes the one-shot
-// branch, which counts one fire however late it was.
+// No asserted line depends on how long anything took. The emulator's clock
+// follows the host, so a loaded host stretches every duration and can delay an
+// interrupt's delivery while the guest's clock runs on. The periodic counts
+// are `N` and printed for a reader only: a fire delivered more than a period
+// late coalesces, so any count of one or more is correct. Every claim below is
+// made on something the program waits for, never on how much time passed.
 //
 // 1. The kernel re-arms, not the process. The first two waits are the whole of
 //    what this program does between them: no ack, no re-arm, no re-attach. A
@@ -22,27 +24,32 @@
 //    rather than hanging, so the failure is a red run in milliseconds.
 //    `ackfree=1` records that claim where a reader will see it.
 //
-// 2. Fires coalesce when nobody is waiting. The third phase spins in userspace
-//    for several periods without waiting, then waits. Those expiries did not
-//    queue up as separate wakes and were not dropped: they accumulated into one
-//    count, so the wait answers once with `fires` above one. `coalesced=1` is
-//    that comparison. This is the property that makes a slow consumer degrade
-//    into coarser reporting instead of falling permanently behind.
+// 2. Fires accumulate when nobody is waiting. The third phase spins in
+//    userspace, not waiting, until the kernel has taken two interrupts while
+//    this process ran (`ProcessStats.interrupts`). Each interrupt that finds
+//    the Timer due counts at least one fire, so two of them leave at least two
+//    fires pending however far apart the host delivered them. They did not
+//    queue as separate wakes and were not dropped: the wait answers once with
+//    `fires` above one. `coalesced=1` is that comparison. This is the property
+//    that makes a slow consumer degrade into coarser reporting instead of
+//    falling permanently behind.
 //
-// 3. The wait consumes the count, and the last phase proves it without a
+// 3. One late fire counts every period it missed. The Timer is re-armed with
+//    an interval of one nanosecond, which no interrupt can be on time for: it
+//    is taken some time after the deadline, so the lateness is at least one
+//    interval and the single fire the wait reports counts more than one
+//    period. A host stall only makes the interrupt later, which only raises
+//    the count. A kernel that counted one fire per interrupt, or discarded
+//    the periods it missed, reads one here.
+//
+// 4. The wait consumes the count, and the last phase proves it without a
 //    stopwatch: cancel, re-arm as a one-shot, wait. That count can only be one.
 //    A kernel that never reset the count would report the coalesced total again
 //    there, and a `disarm` that left the fires behind would report them too, so
-//    one line covers both. Comparing counts between the periodic wakes would
-//    race the emulator, since how many periods a `print` takes is not this
-//    program's to know.
-//
-// The counts are compared and not printed raw: how many periods a spin covers
-// is a real machine's business and no assertion can name it, so every line here
-// is a derived fact.
+//    one line covers both.
 
 import sos.{System, Process, Clock, ClockType, Timer, Waiter, WaitResult,
-            WaitPayload}
+            WaitPayload, SosStatus}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -56,10 +63,13 @@ static KEY: UInt = 66
 /// here is a real scheduled one.
 static PERIOD_NS: UInt64 = 1_000_000
 
-/// Spin across this much time without waiting, so several periods expire with
-/// no consumer. Five periods gives the comparison below room to be true on a
-/// slow emulator without being true by accident.
-static SPIN_NS: UInt64 = 5_000_000
+/// How many interrupts the third phase sees taken before it reads the count.
+/// Two is the least that makes "above one" true by construction.
+static SERVICED: UInt = 2
+
+/// An interval no interrupt can be on time for: every fire is late by at
+/// least this many nanoseconds, so it counts at least two periods.
+static LATE_INTERVAL_NS: UInt64 = 1
 
 func flag(b: Bool) -> UInt {
     if b { YES } else { NO }
@@ -72,21 +82,29 @@ func fires_of(r: &WaitResult) -> UInt {
     }
 }
 
-func now_of(clock: &Clock) -> UInt64 {
-    try clock.now() catch { 0u64 }
+/// How many interrupts the kernel has taken while this process was running.
+func interrupts_of(proc: &Process) -> Result<UInt, SosStatus> {
+    let seen = try proc.stats()
+    return seen.interrupts as UInt
 }
 
-/// Spin on the clock until it reads `deadline`. Timer fires land during this
-/// (the line is enabled and the kernel takes each interrupt) and accumulate in
-/// the object rather than waking anybody, which is the state the second claim
-/// is about.
-func spin_to(clock: &Clock, deadline: UInt64) {
+/// Spin, making a call each pass, until `count` more interrupts have been
+/// taken. Timer fires land during this (the line is enabled and the kernel
+/// takes each interrupt) and accumulate in the object rather than waking
+/// anybody, which is the state the second claim is about. What ends the spin is
+/// the kernel's own count and not the clock, so a host that delays the
+/// interrupts only lengthens it.
+func spin_until_serviced(proc: &Process,
+                         count: UInt) -> Result<Void, SosStatus> {
+    let start = try interrupts_of(&proc)
     var done = false
     while not done {
-        if now_of(&clock) >= deadline {
+        let seen = try interrupts_of(&proc)
+        if seen - start >= count {
             done = true
         }
     }
+    return
 }
 
 @export("_start")
@@ -143,8 +161,12 @@ func _start(boot_handle: UInt) {
     print("SOS interval: tick two fires={} ackfree={}\n",
           count_two, flag(count_two >= 1))
 
-    // Now go away for several periods without waiting.
-    spin_to(&clock, now_of(&clock) + SPIN_NS)
+    // Now go away without waiting, until two interrupts have been taken.
+    try spin_until_serviced(&proc, SERVICED) catch {
+        print("SOS interval: spin failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
     let many = try waiter.wait() catch {
         print("SOS interval: third wait failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -152,12 +174,24 @@ func _start(boot_handle: UInt) {
     }
     print("SOS interval: coalesced={}\n", flag(fires_of(&many) > 1))
 
-    // The drain, proved without a stopwatch. Comparing counts between the
-    // periodic wakes above would race the emulator, so the claim is made where
-    // it is deterministic: cancel, re-arm as a one-shot, wait. That count can
-    // only be one. A kernel that never reset the count would report the
-    // coalesced total again here, and a `disarm` that left the fires behind
-    // would report them too, so the single line covers both.
+    // A fire is always late by more than a one-nanosecond interval.
+    let _ = timer.disarm()
+    try timer.arm(after_ns: PERIOD_NS, interval_ns: LATE_INTERVAL_NS) catch {
+        print("SOS interval: late arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let late = try waiter.wait() catch {
+        print("SOS interval: late wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS interval: late={}\n", flag(fires_of(&late) > 1))
+
+    // The drain, proved without a stopwatch: cancel, re-arm as a one-shot,
+    // wait. That count can only be one. A kernel that never reset the count
+    // would report the coalesced total again here, and a `disarm` that left
+    // the fires behind would report them too, so the single line covers both.
     let _ = timer.disarm()
     try timer.arm(after_ns: PERIOD_NS) catch {
         print("SOS interval: rearm failed: {}\n", error)

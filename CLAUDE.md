@@ -106,19 +106,43 @@ order `--case` names them) whatever the completion order, so a parallel
 transcript reads the same as a serial one.
 `-j 1` is the serial harness, kept reachable for exactly that comparison.
 
-Three cases carry timing-dependent console output that moves run to run in
-either mode and that no assertion reads: `thread_preempt`'s `SOS: timer tick`
-lines and its `interrupts=` count; `timer_interval`'s `fires=` counters; and
-`process_stats`' `interrupts=` count (the column is printed and never
-asserted, because a tick lands where the host puts it).
-**`thread_preempt`'s A/B interleave is not on that list; it is asserted**: the
-case matches `AB`, `BA`, `AB` as ordered adjacent pairs, which is "the
-processor crossed between the two threads at least three times, whoever went
-first". It is matched against the letters-only projection of the console (the
-kernel's own `SOS: ` lines stripped, since they land inside the workers' byte
-stream) and with overlapping matches (three crossings can be consecutive) —
-`strip_kernel_lines` and `overlapping_matches` on that case, both documented at
-the site. None of the above appears in the transcript at all on a passing run:
+**No case asserts a value that depends on host time (user ruling).** The
+emulators' clocks follow host time, so a loaded host stretches every duration
+and can delay an interrupt's delivery while the guest's clock runs on. A
+time-based case asserts that some time passed, never how much:
+- never an exact or upper-bounded duration, and never an exact count of
+  something that accrues with time (a periodic Timer's fires, ticks,
+  interrupts);
+- a one-sided bound is the right shape (at least the delay elapsed, at least
+  one fire arrived), but only if a stalled host can move the value in the
+  passing direction alone. Work out the direction for each: a stall raises an
+  elapsed time and lowers the number of interrupts delivered in a given
+  stretch of guest time, so "a spin of several periods saw several fires" is
+  not a safe bound and "the kernel took two interrupts, so two fires are
+  pending" is;
+- a property that needs an event to have happened is made true by
+  construction: the program waits on an observable that says it happened
+  (a count the kernel keeps, the other thread's progress) and not on the
+  clock. That a wait finished at all is the harness timeout's job;
+- a timing-dependent value may be printed for a reader and left out of the
+  expected text. Three cases do:
+  `thread_preempt`'s `SOS: timer tick` lines and its `interrupts=` count;
+  `timer_interval`'s `fires=` counters on the first two waits; and
+  `process_stats`' `interrupts=` count (the column is printed and never
+  asserted, because a tick lands where the host puts it).
+
+A wake never preempts the running thread (only a tick and a block request a
+reschedule), so a case that parks a launcher on a Timer to let a child run
+orders them by scheduling, not by the clock, and a stall cannot reorder them.
+`thread_preempt` asserts `AB`, `BA`, `AB` as ordered adjacent pairs, which is
+"the processor crossed between the two threads at least three times, whoever
+went first". Each worker spins until the other has printed, so the crossings
+are forced and no number of ticks changes them. The pairs are matched against
+the letters-only projection of the console (the kernel's own `SOS: ` lines
+stripped, since they land inside the workers' byte stream) and with
+overlapping matches (three crossings can be consecutive): `strip_kernel_lines`
+and `overlapping_matches` on that case, both documented at the site. None of
+the printed-only values appears in the transcript at all on a passing run:
 the report prints case rows, image sizes and totals, so a console line only
 reaches the screen when a case goes red. Anything moving in a transcript diff
 is a real finding.

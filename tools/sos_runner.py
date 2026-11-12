@@ -1504,35 +1504,35 @@ TEST_CASES = [
     },
     {
         # Preemption. The same shape as thread_basics with the yields removed
-        # and the timer armed: two workers that print and then spin, making no
-        # call that could give the processor up. Every alternation in the
-        # transcript is the scheduler taking it away at a tick, which a
-        # cooperative test cannot show.
+        # and the timer armed: two workers that print a letter and then spin
+        # until the other worker has printed its own, making no call that
+        # could give the processor up. A worker's spin ends only when the
+        # processor has gone to the other, so every round crosses between the
+        # two threads, and that crossing is the scheduler taking the processor
+        # away at a tick, which a cooperative test cannot show. The handoff is
+        # forced rather than timed: no number of ticks, and no delay in
+        # delivering them, changes which letters are printed, and a kernel that
+        # never preempted would leave the case at the harness timeout.
         #
         # The root's own banner is deliberately not asserted: it is written a
         # byte per syscall while the kernel is still narrating its first
         # ticks, so the two interleave mid-word on the console. That is
         # harmless (a shared serial port with no locking) but not something a
-        # substring can match. The tick narration stops after four, so
-        # everything below is written in the quiet that follows.
+        # substring can match.
         "name": "thread_preempt",
         "src": os.path.join(TESTS_DIR, "threads_timer.saw"),
         "root_pkg": THREAD_PREEMPT_PKG,
         #
         # The alternation is asserted as direction changes, not as a fixed
-        # sequence, which is not a weakening. Which worker runs first depends
-        # on where the first tick lands relative to the two `start` calls, so a
-        # sequence starting `A` fails half the time on a claim it was never
-        # making. `AB` then `BA` then `AB` says the processor crossed between
-        # the two threads at least three times, whoever went first; a run with
-        # no preemption at all reads `AAAAAAAABBBBBBBB`, which has one `AB` and
-        # no `BA` after it.
+        # sequence: which worker runs first depends on where the first tick
+        # lands relative to the two `start` calls, so a sequence starting `A`
+        # would fail half the time on a claim it was never making. `AB` then
+        # `BA` then `AB` says the processor crossed between the two threads at
+        # least three times, whoever went first.
         #
-        # The interrupt column is printed and not asserted. This case's point is
-        # that ticks land in user mode, so the column has something to show
-        # here, but a tick lands where the host puts it, so asserting the number
-        # would be asserting the weather. The tick count is unasserted for the
-        # same reason.
+        # The interrupt column is printed and not asserted: a tick lands where
+        # the host puts it, so asserting the number would be asserting the
+        # weather. The tick count is unasserted for the same reason.
         #
         # The three claims are adjacency claims, and two matcher options make
         # them hold on a real run:
@@ -1549,9 +1549,6 @@ TEST_CASES = [
         #      to crossings arranged so as not to overlap. Advancing by one
         #      character is what "three direction changes" means when written
         #      as adjacent pairs.
-        #
-        # The no-preemption control `AAAAAAAABBBBBBBB` still fails, which is
-        # the claim's other end.
         "strip_kernel_lines": True,
         "overlapping_matches": True,
         "expect_out": ["SOS M2: preemptive kernel up on",
@@ -1990,24 +1987,24 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": TIMER_INTERVAL_PKG,
         "expect_out": ["{banner}",
-                       # Neither periodic count is asserted, because of the
-                       # feature under test. A fire delivered more than a
-                       # period late coalesces, by design, so under an
-                       # emulator whose timing is the host's business a correct
-                       # kernel legitimately reports 1, 2 or 3 here, and the
-                       # count moves with how much of the first period is spent
-                       # before the wait. Pinning it would make coalescing
-                       # itself the flake. What is asserted is that each wake
-                       # happened, with no ack and no re-arm between them
-                       # (`ackfree`); the two counts that are deterministic are
-                       # pinned below.
+                       # Neither periodic count is asserted: a fire delivered
+                       # late coalesces, so any count of one or more is
+                       # correct, and no assertion here reads a duration. What
+                       # is asserted is that each wake happened, with no ack
+                       # and no re-arm between them (`ackfree`).
                        "SOS interval: tick one fires=",
                        "SOS interval: tick two fires=",
                        "ackfree=1",
-                       # Expiries that landed while nobody was waiting did not
+                       # Fires that landed while nobody was waiting did not
                        # queue as separate wakes and were not dropped: they
-                       # coalesced into one count above one.
+                       # accumulated into one count above one. The program
+                       # waits for two interrupts to be taken before it reads
+                       # the count, so this holds however late the host
+                       # delivers them.
                        "SOS interval: coalesced=1",
+                       # One fire late by more than a one-nanosecond interval
+                       # counts the periods it missed.
+                       "SOS interval: late=1",
                        # The drain, proved without a stopwatch: cancel, re-arm
                        # one-shot, wait. A kernel that never reset the count
                        # would report the coalesced total here instead.
