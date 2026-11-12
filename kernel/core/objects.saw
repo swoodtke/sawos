@@ -575,8 +575,8 @@ public(package) func table_room(p: Int, n: Int) unsafe -> Bool {
 /// This is the one place a binding is destroyed: the release op and the
 /// teardown's close-all both come through here, so release and teardown do the
 /// same thing to a slot. It never touches the object the entry named or its
-/// reference count; the caller drops the reference (`unref_object` frees at
-/// zero, and the teardown's `unref_teardown` does not).
+/// reference count; the caller drops the reference afterwards (`unref_object`,
+/// or the teardown's own release, which frees at zero the same way).
 ///
 /// The generation wraps at `HANDLE_GENERATION_MODULUS` rather than saturating.
 /// After that many reuses of one slot a word can alias again; this is
@@ -1407,14 +1407,16 @@ public(package) static ROW_TARGET_DIED: Int = -2
 /// One Mapping object: who owns the handle, whose domain holds the row, and
 /// which row it is.
 ///
-/// `process` is the owner, whose teardown reclaims this slot; `target` is the
-/// process whose domain the row sits in. They are usually the same, and differ
-/// when a launcher maps a region into a child it created. Both name records.
-/// An `Unmap` and the target's teardown both leave a husk: `row` is `NO_ROW`
-/// after the first and `ROW_TARGET_DIED` after the second, and `target` is
-/// `NO_PROCESS` in both, so a later process in the target's record or
-/// body is not reachable through it. A Live slot names a target exactly while
-/// it has a row, which the teardown's sweep checks.
+/// `process` is the holder, whose handles are the slot's only references and
+/// whose teardown's close-all releases them; `target` is the process whose
+/// domain the row sits in. They are usually the same, and differ when a
+/// launcher maps a region into a child it created. Both name records. An
+/// `Unmap` and the target's teardown both leave a husk: `row` is `NO_ROW` after
+/// the first and `ROW_TARGET_DIED` after the second, and `target` is
+/// `NO_PROCESS` in both, so a later process in the target's record or body is
+/// not reachable through it. Outside a teardown a Live slot names a target
+/// exactly while it has a row; the target's teardown checks that as it
+/// invalidates the slot, and disowns the target once its close-all is done.
 public(package) struct MappingSlot {
     public(package) state: SlotState,
     public(package) process: Int,

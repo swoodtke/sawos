@@ -181,9 +181,9 @@ public(package) struct InterruptSlot {
 /// messages, not the attachment.
 ///
 /// An attachment drops its reference only after clearing the `attachment`
-/// field (`detach_attachment`, the Waiter's free cascade, the teardown's
-/// attachment sweep), so a drop that arrives with the field set is a name
-/// going and one that arrives with it clear is the attachment going.
+/// field (`detach_attachment`, the Waiter's free cascade, a Waiter's
+/// invalidation in a teardown), so a drop that arrives with the field set is a
+/// name going and one that arrives with it clear is the attachment going.
 public(package) func interrupt_names(slot: Int) unsafe -> UInt16 {
     if INTERRUPTS[slot].attachment != 0 {
         if INTERRUPTS[slot].refs == 0 {
@@ -742,10 +742,13 @@ public(package) func waiter_ready_attachment(w: Int) unsafe -> Int {
 ///
 /// A Waiter can be given, so a thread may be parked on another process's
 /// Waiter, and another process's thread on one of `p`'s. The teardown calls
-/// this before its close-all, so that no delivery and no revocation from then
-/// on can reach one of `p`'s threads, while other processes' threads stay
-/// parked for the invalidation of `p`'s Waiters to answer. A walk with a
-/// trailing pointer, as `unjoin_process` does: a thread is on at most one list.
+/// this before its invalidations and its close-all, so that no delivery and
+/// no revocation they cause can reach one of `p`'s threads, while other
+/// processes' threads stay parked for the invalidation of `p`'s Waiters to
+/// answer. The claims of `p`'s pending calls are dropped before it
+/// (`release_pending_calls`, which says why those drops reach no thread of
+/// `p`). A walk with a trailing pointer, as `unjoin_process` does: a thread is
+/// on at most one list.
 public(package) func unblock_process(p: Int) unsafe {
     var w: Int = 0
     while w < WAITERS.capacity() {

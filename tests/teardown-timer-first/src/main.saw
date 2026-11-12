@@ -1,0 +1,298 @@
+// A dying process's Timer is invalidated before its close-all frees the Waiter
+// the Timer is attached to, so a thread parked on that Waiter is handed the
+// Timer's record (spec §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS timerfirst: parking
+//   SOS timerfirst: started
+//   SOS: process exit: code=55 process=1         <- the attacher
+//   SOS: process teardown ... timers=1 process=1
+//   SOS timerfirst: the parked wait was handed key=74 payload=0
+//   SOS timerfirst: done
+//
+// Root makes a Waiter and parks a second thread on it. Then it gives its one
+// handle onto the Waiter to a child (`child-waitable`, the attacher), so the
+// child holds the Waiter's last name while root's thread is still parked on
+// it. The child makes a Timer, attaches it to that Waiter unarmed, and exits.
+//
+// Its teardown runs §2.10's order. Step 1 invalidates the child's Timer, and
+// an attachment on an invalidated waitable fires: the Waiter is still live, so
+// the parked thread is handed an ordinary Timer record, the attacher's key
+// with a fire count of zero, and is no longer parked. Step 2, the close-all,
+// then drops the Waiter's last name and frees it with nobody on its blocked
+// list. A teardown that released the table first would free the Waiter while
+// the thread was still parked on it, which answers the thread `Revoked`
+// (§2.2). The Timer would be freed in that same release without ever firing,
+// so there would be nothing left to invalidate. The case asserts the teardown
+// line as well as the answer: a teardown in which the Timer goes uncounted,
+// inside the Waiter's free, reads `timers=0` there.
+//
+// It goes through the C altitude for the Waiter, the child and the gives,
+// because the parked thread and the giver are two threads of one process: the
+// parker needs the Waiter's word to wait through, and the typed `sos` surface
+// neither exposes a word nor lets a wrapper be shared between threads. The
+// record layout (word 0 the key, word 2 the payload) is the published contract
+// of `sos_waiter_wait`, written out here as a C caller would.
+//
+// Every thread enters at `_start` and works out which it is from the parked
+// boot handle, as in `thread-basics`.
+
+import sos.{System, SosStatus, SystemRight,
+            sos_system_process_self, sos_process_boot_handle_next,
+            sos_system_process_create, sos_process_give, sos_process_start,
+            sos_process_waiter_create, sos_waiter_wait, sos_handle_mint}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The tags the child's boot records travel under, the attacher role's Waiter
+/// tag among them (`child-waitable`'s `TAG_ATTACH`).
+static TAG_BOOT: UInt = 7
+static TAG_ATTACH: UInt = 55
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// The keep mask that keeps every right, a number at the C altitude.
+static KEEP_ALL: UInt = 0xFFFF_FFFF
+
+/// `ProcessCreate`'s ceiling-source argument when there is none.
+static NO_SOURCE: UInt = 0
+
+/// `sos_process_start`'s form that resolves a boot tag.
+static START_WITH_TAG: UInt = 1
+
+/// The status word a successful raw op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// What names nothing at this altitude.
+static NO_WORD: UInt = 0
+
+/// The boot-handle record: tag, kind, handle.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+/// The wait record's words this program reads, and a buffer comfortably past
+/// the record's size on both profiles (`waiter-revoked` says why a C caller
+/// over-provisions).
+static WAIT_KEY_WORD: Int = 0
+static WAIT_PAYLOAD_WORD: Int = 2
+static WAIT_BUF_WORDS: Int = 48
+
+/// The parked thread's argument and exit code.
+static ROLE_PARKER: UInt = 1
+static EXIT_PARKER: UInt = 61
+
+static NO_VALUE: UInt = 0xDEAD
+
+unsafe static var BOOT_HANDLE: UInt = 0
+unsafe static var SHARED_WAITER: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+func park_boot_handle(word: UInt) unsafe { BOOT_HANDLE = word }
+
+func parked_boot_handle() unsafe -> UInt { BOOT_HANDLE }
+
+func park_waiter(word: UInt) unsafe { SHARED_WAITER = word }
+
+func parked_waiter() unsafe -> UInt { SHARED_WAITER }
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+// -----------------------------------------------------------------------------
+// The C altitude, each call in its own small helper so a pointer never leaves
+// the function that made it. Each answers `NO_WORD` when the call was refused.
+// -----------------------------------------------------------------------------
+
+/// A Process handle onto this process, as a word.
+func process_word(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_self(boot_handle, KEEP_ALL,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// A Waiter owned by this process, as a word.
+func make_waiter(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_waiter_create(process,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// The next boot record's handle word.
+func next_region_word(process: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(process,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+/// A child loaded from `image` into `ram`, as a word.
+func make_child(system: UInt, image: UInt, ram: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_create(system, image, ram, NO_SOURCE,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// A sibling of `source` narrowed by `keep`, as a word.
+func mint_word(source: UInt, keep: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_handle_mint(source, keep,
+                                 (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// Park on the Waiter `handle` names. Answers the raw status, and the key and
+/// payload of the record when one was delivered.
+func park_on_waiter(handle: UInt) unsafe -> (UInt, UInt, UInt) {
+    var buf: [UInt; WAIT_BUF_WORDS] = [0; WAIT_BUF_WORDS]
+    let status = sos_waiter_wait(handle, (&var buf) as UnsafePointer<UInt>,
+                                 (WAIT_BUF_WORDS * sizeof<UInt>()) as UInt)
+    (status, buf[WAIT_KEY_WORD], buf[WAIT_PAYLOAD_WORD])
+}
+
+/// A raw status word as a name, or `None` when this build cannot name it
+/// (`waiter-revoked` explains the narrowing).
+func named_status(raw: UInt) -> SosStatus? {
+    if raw > (UInt8.max as UInt) {
+        return None
+    }
+    SosStatus.from(raw: raw as UInt8)
+}
+
+// -----------------------------------------------------------------------------
+// The threads
+// -----------------------------------------------------------------------------
+
+/// The parked thread: park on root's Waiter and report what answered it.
+func parker() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+
+    let _ = system.debug_print("SOS timerfirst: parking\n")
+    let (raw, key, payload) = park_on_waiter(parked_waiter())
+    if raw == STATUS_OK {
+        print("SOS timerfirst: the parked wait was handed key={} payload={}\n",
+              key, payload)
+    } else {
+        guard let status = named_status(raw) else {
+            print("SOS timerfirst: the parked wait answered status {}\n", raw)
+            let _ = (move me).exit(EXIT_FAILED)
+            return
+        }
+        print("SOS timerfirst: the parked wait answered: {}\n", status)
+    }
+    let _ = (move me).exit(EXIT_PARKER)
+}
+
+/// The initial thread: park the other thread on a Waiter, then give the
+/// Waiter's only handle to the attacher and start it.
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS timerfirst: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let me = try proc.thread_self() catch {
+        let _ = system.debug_print("SOS timerfirst: no thread handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let process = process_word(boot_handle)
+    let waiter = make_waiter(process)
+    if waiter == NO_WORD {
+        let _ = system.debug_print("SOS timerfirst: no Waiter\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    park_waiter(waiter)
+
+    let parked = try proc.thread_create(stack_top: stack_top(),
+                                        arg: ROLE_PARKER) catch {
+        print("SOS timerfirst: thread create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = parked.start()
+    // `start` does not switch; this yield hands the processor over, and the
+    // parker gives it back by blocking on the Waiter.
+    let _ = me.yield_now()
+
+    // Row 0 is the child's image blob and row 1 the RAM it runs in.
+    let image = next_region_word(process)
+    let ram = next_region_word(process)
+    let child = make_child(boot_handle, image, ram)
+    let for_child = mint_word(boot_handle, CHILD_SYSTEM as UInt)
+    if child == NO_WORD || for_child == NO_WORD {
+        let _ = system.debug_print("SOS timerfirst: no child\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // The give moves root's one handle onto the Waiter: from here the child
+    // holds its last name, and root's thread stays parked on it.
+    let gave_system = sos_process_give(child, for_child, TAG_BOOT, KEEP_ALL)
+    let gave_waiter = sos_process_give(child, waiter, TAG_ATTACH, KEEP_ALL)
+    if gave_system != STATUS_OK || gave_waiter != STATUS_OK {
+        let _ = system.debug_print("SOS timerfirst: a give was refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if sos_process_start(child, START_WITH_TAG, TAG_BOOT) != STATUS_OK {
+        let _ = system.debug_print("SOS timerfirst: start refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS timerfirst: started\n")
+
+    // The join parks this thread too; the attacher runs, and its death is what
+    // answers the parker.
+    let code = try parked.join() catch { NO_VALUE }
+    if code != EXIT_PARKER {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS timerfirst: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        parker()
+    }
+}

@@ -1677,36 +1677,36 @@ is charged to nobody and bound to no process, only to its one handle, so nothing
 names the binder's record once it has bound.
 
 The teardown reports itself on one console line, `SOS: process teardown`, and
-the harness asserts the line. Its fields today (`handles=`, `threads=`,
-`events=`, `waiters=`, `interrupts=`, `timers=`, `process=`) count the handles
-the close-all closed and the objects the teardown freed. `events=` counts the
-Events charged to the dying process that the reap's Event scan freed, which are
-those nothing named once its handles and attachments were gone. It does not
-count an Event freed earlier, inside the close-all (one staged on a connection
-whose last outlet the close-all released, say), nor one freed later by the
-reap's exchange scan, nor one still named elsewhere, which survives disowned.
-`threads=` counts the dying process's own threads the thread sweep freed,
-invalidated or `Exited`, which are those nothing named once its handles were
-gone. It does not count an `Exited` thread of its own freed earlier, at its
-exit (`Exit` released the last handle naming it) or inside the close-all (one
-only a staged message named, released when the close-all dropped the
-connection's last outlet, say), nor one still named elsewhere,
-which survives disowned, nor another process's thread whose last name the
-close-all dropped. `waiters=` and `timers=` count the dying process's own
-Waiters and Timers that the Waiter and Timer sweeps freed, which are those
-nothing named once its handles and its Waiters' attachments were gone. They do
-not count one still named elsewhere, which survives invalidated and disowned,
-nor another process's whose last name the dying process held, nor one of its
-own freed earlier, inside the close-all (one only a staged message named,
+the harness asserts the line. Its fields (`handles=`, `threads=`, `events=`,
+`waiters=`, `interrupts=`, `timers=`, `process=`) count the handles the
+close-all (step 2's release of the handle table) closed and the objects the
+teardown freed through references the dying process held. `events=`,
+`waiters=` and `timers=` count the dying process's own Events, Waiters and
+Timers whose last reference was one the teardown dropped itself: a handle in
+the dying table, or an attachment on one of its Waiters, which that Waiter's
+invalidation releases. They do not count one freed by a cascade out of another
+release or free inside the teardown (one only a staged message named, released
+when the close-all dropped the connection's last outlet, or a Timer whose last
+reference was an attachment on another process's Waiter, freed because the
+dying process held that Waiter's last handle, say), nor one still named
+elsewhere, which survives disowned (a Waiter or Timer invalid, an Event live),
+nor another process's whose last name the dying process held. `threads=`
+counts the dying process's own threads freed by the close-all's release of the
+last handle naming them, and those nothing named when the invalidation reached
+them: a thread that had not exited and had no handle, and an `Exited` thread
+with no reference left (the thread whose own exit ended the process, or one
+that exited earlier and whose slot had not yet been freed when the process
+was ended). It does not count an `Exited` thread of its
+own freed earlier, at its exit (`Exit` released the last handle naming it), nor
+one freed by a cascade inside the close-all (one only a staged message named,
 released when the close-all dropped the connection's last outlet, say), nor
-one of its own freed by another object's free inside the teardown (a Timer
-whose last reference was an attachment on another process's Waiter, freed
-because the dying process held that Waiter's last handle, say). `interrupts=`
-counts the Interrupts the close-all destroyed: a handle onto an Interrupt is its
-one name, so each such handle in the dying table is a destruction. It counts
-destructions and not frees, because an Interrupt that an attachment on another
-process's Waiter still holds stays, invalid. The Mappings that are swept have no
-field.
+one still named elsewhere, which survives disowned, nor another process's
+thread whose last name the close-all dropped. `interrupts=` counts the
+Interrupts the close-all destroyed: a handle onto an Interrupt is its one name,
+so each such handle in the dying table is a destruction. It counts destructions
+and not frees, because an Interrupt that an attachment on another process's
+Waiter still holds stays, invalid. The Mappings that are invalidated or freed
+have no field.
 
 **The refund rule.**
 
@@ -1727,18 +1727,6 @@ field.
   no consumer, since creation through a `Gone` process's handle is refused. The
   objects it was charged for do not hold the dead record, which is reclaimed on
   its handles and attachment alone.
-
-Not yet enforced:
-
-- The teardown releases the handle table first, counting without freeing, and
-  then invalidates the dying process's Threads that have not exited and its
-  Waiters and Timers, freeing instead each that nothing else names; frees the
-  Mappings it made and the invalid Interrupts nothing names any more; and frees
-  the Event, Memory, IoMemory, exchanges and connections nothing names any more,
-  disowning the rest it was charged for. That reap ends with a process scan,
-  which reclaims every `Gone` process record whose last reference the teardown
-  dropped. A Mapping that targets the dying process is invalid: its slot is
-  kept, its row cleared and its handles stay in other tables.
 
 ## 3. Handles, rights, derivation
 
@@ -2835,16 +2823,15 @@ the teardown runs unconditionally; what happens after forks. Process 0 — root,
 the one image the kernel loads (§12) — stops the machine. **Any other process
 reschedules**: its threads are removed from the ready queue (leaving everybody
 else's), the objects bound to it are invalidated, its handles are released, its
-protection rows go back and its body is freed (§2.10, which marks what of that
-order is not yet enforced), and the path ends in the scheduler rather than in a
-stopped machine. Children die with the machine when root ends, uncounted. A
-supervisor may read `get_status` through the handle it holds — which outlives
-the child, because the teardown closes the handles in the dead process's table
-and not in its creator's — or be woken by the death (below). The teardown
-(`end_process`) lives in the scheduler module beside `pick_next`, because the
-reschedule can idle, idling delivers, and delivery reaches back down into the
-copy doors; so the copy doors report a bad buffer, and the callers above the
-switch point terminate on it.
+protection rows go back and its body is freed (§2.10), and the path ends in the
+scheduler rather than in a stopped machine. Children die with the machine when
+root ends, uncounted. A supervisor may read `get_status` through the handle it
+holds — which outlives the child, because the teardown closes the handles in
+the dead process's table and not in its creator's — or be woken by the death
+(below). The teardown (`end_process`) lives in the scheduler module beside
+`pick_next`, because the reschedule can idle, idling delivers, and delivery
+reaches back down into the copy doors; so the copy doors report a bad buffer,
+and the callers above the switch point terminate on it.
 
 **`process.kill()` has neither op nor right** (`Exit` through another
 process's handle faults the caller, §2.7). It is specified below; what it
@@ -3233,9 +3220,6 @@ loader parses and reports while no process stores either.
 
 **Known limits.**
 
-- The object lifecycle is not yet enforced as §2.10 states it: the
-  teardown's close-all releases every handle but counts without freeing, the
-  sweeps after it invalidate the bound kinds rather than before it.
 - On a part without atomic instructions (the ESP32-C3), word atomics in a
   user process, `sosrt`'s bump arena cursor among them, are safe only while
   nothing preempts; under a kernel that preempts (today only the preemption

@@ -26,14 +26,12 @@
 //! staged message is still owed to a live outlet whatever became of its claim
 //! (spec §2.1's tell idiom).
 //!
-//! Teardown does not force-free the counted kinds other processes may still
-//! reference (regions, IO windows, pipe connections, Events);
-//! `reap_unreferenced` frees what nobody names and disowns the rest (see the
-//! block above it). Threads, Waiters and Timers are invalidated by owner and
-//! freed by count in `end_process`'s per-kind sweeps. Mappings are swept by
-//! owner. An Interrupt has no owner: releasing its one handle destroys it
-//! (`drop_reference`), including in the close-all, and the Interrupt sweep
-//! frees the invalid ones nothing names any more.
+//! Teardown frees nothing by force. It invalidates the dying process's bound
+//! objects and then releases its table through `drop_reference` and
+//! `free_object`, so every free in it is an ordinary one at zero, and
+//! `disown_shared` disowns the shared objects that survive (see the block above
+//! it). An Interrupt has no owner: releasing its one handle destroys it
+//! (`drop_reference`), in a teardown's release as in any other.
 //!
 //! This file also holds delivery, readiness becoming a woken thread. The ledger
 //! and delivery are mutually recursive: a delivery drops a reference (one-shot
@@ -223,16 +221,16 @@ func pipe_frees_now(slot: Int) unsafe -> Bool {
 
 /// Take one reference away, and answer whether that was the last.
 ///
-/// Split out of `unref_object` for the teardown, which must decrement without
-/// freeing (see `unref_teardown`).
+/// Split out of `unref_object` for the two callers that decide about the free
+/// themselves: `exit_thread`, whose thread is still running when its handle
+/// goes, and the teardown's release, which counts what it frees for its report
+/// line.
 ///
-/// The zero test before the subtraction is not defensive: a teardown zeroes the
-/// slots a process owned, so a later decrement from another process's close-all
-/// can arrive at a slot whose count is already gone. Nothing is taken then, and
-/// nothing reached zero. The Thread and Interrupt arms are the exceptions:
-/// their slots are only ever freed at zero, never zeroed under their namers, so
-/// a decrement at zero there is an undercount, and it stops the machine.
-func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
+/// Most arms answer a decrement at a count already at zero by taking nothing:
+/// nothing reached zero then. The Thread and Interrupt arms stop the machine
+/// instead, because their slots are only ever freed at zero, so a decrement at
+/// zero there is an undercount.
+public(package) func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
     match kind {
         case Event -> {
             if EVENTS[slot].refs == 0 { return false }
@@ -302,9 +300,9 @@ func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
         // One column reaching zero is the peer-gone transition, which this
         // function handles besides counting. It lives here because
         // `free_object` runs only when both columns are zero, and peer-gone is
-        // what happens when exactly one is. `unref_teardown` reaches it too, on
-        // purpose: a dying process's endpoint going away is the same news to
-        // the far end as a release.
+        // what happens when exactly one is. A teardown's release reaches it
+        // the same way: a dying process's endpoint going away is the same news
+        // to the far end as a release.
         case PipeInlet -> {
             if PIPES[slot].inlet_refs == 0 { return false }
             PIPES[slot].inlet_refs = PIPES[slot].inlet_refs - 1
@@ -481,52 +479,14 @@ public(package) func unref_object(kind: ObjType, slot: Int) unsafe {
     }
 }
 
-/// The decrement that counts and does not free, used by the teardown and by
-/// `exit_thread`.
-///
-/// A teardown frees in per-slab sweeps that also count what they freed for the
-/// teardown report, by ownership or by a count the close-all has already
-/// lowered. If the close-all above
-/// those sweeps freed by reference, those counts would collapse. So the
-/// close-all keeps the ledger honest (a handle in a dying table is one
-/// reference fewer, and objects other processes own must see that) and the
-/// sweeps, plus `reap_unreferenced`, do the freeing.
-///
-/// For the objects a sweep frees by owner (the dying process's Mappings) the
-/// two agree by construction: the sweep zeroes the slot, count included, so
-/// nothing is left half-counted.
-///
-/// An Interrupt's destruction is not deferred by this: the close-all's drop of
-/// its one handle runs `destroy_interrupt` like any release, and only the
-/// slot's return waits for the sweep.
-///
-/// A Process whose count reaches zero here is not freed either. A `Gone` record
-/// whose last reference this was (a handle in the close-all, or an attachment
-/// in the attachment sweep) is reclaimed by the process scan at the end of
-/// `reap_unreferenced`, and a `Created` one is owed its teardown by the same
-/// scan (`reclaim_process_record`), which `end_process` runs once its own
-/// teardown has ended (`drain_unstarted`). A Thread whose count reaches zero
-/// here is freed by `end_process`'s thread sweep, whichever process it belongs
-/// to, once it has exited or been invalidated. A Waiter or Timer whose count
-/// reaches zero here is freed by that kind's sweep, whichever process it
-/// belongs to; an Interrupt, which is bound to no process, by the Interrupt
-/// sweep.
-///
-/// `exit_thread` drops the exiting thread's handle this way because the thread
-/// is still running: the free, if that was the last reference, waits for the
-/// switch away from it (`PENDING_FREE`) or for the teardown's thread sweep.
-public(package) func unref_teardown(kind: ObjType, slot: Int) unsafe {
-    let _ = drop_reference(kind, slot)
-}
-
 /// Wake every thread parked on Waiter `w` with `Revoked`.
 ///
 /// This is one of the Waiter's two last rites, and it runs first: it answers
 /// everybody who was watching through the Waiter, and then the cascade releases
 /// what the Waiter was watching. A thread still parked during the cascade could
 /// be handed a delivery mid-walk (see `free_object`'s Waiter arm). Its owner's
-/// death runs it too, before the teardown takes the Waiter's list apart
-/// (`end_process`).
+/// death runs it too, before the teardown's invalidation takes the Waiter's
+/// list apart (`teardown_process`).
 ///
 /// No record is written, which is the difference from a delivery. A delivery
 /// copies a wait record out and then answers `Ok`; a revocation answers
@@ -577,14 +537,13 @@ public(package) func revoke_blocked(w: Int) unsafe {
 ///
 /// The quota is credited against the slot's own `process` field (creator pays)
 /// for the kinds that have one: whoever was charged gets it back, whichever
-/// process dropped the last handle. A shared kind, and a Waiter or Timer,
-/// credits through `credit_shared`, which credits nobody when the charged
-/// process's death has disowned the object: a shared one outlives its owner
-/// live, and a Waiter or Timer outlives it invalid, its charge already
-/// refunded. An `Exited` Thread credits through `credit_shared` too, and an
-/// invalid one credits nothing. `Interrupt`, `Mapping` and `Process` have no
-/// credit here: an Interrupt has no `process` field and no quota column, and
-/// the others for the reason given in their arms.
+/// process dropped the last handle. A shared kind, a live Waiter or Timer and
+/// an `Exited` Thread credit through `credit_shared`, which credits nobody when
+/// the charged process's death has disowned the object. An invalid Waiter,
+/// Timer or Thread credits nothing, whoever it names: its charge came back at
+/// its invalidation. `Interrupt`, `Mapping` and `Process` have no credit here:
+/// an Interrupt has no `process` field and no quota column, and the others for
+/// the reason given in their arms.
 public(package) func free_object(kind: ObjType, slot: Int) unsafe {
     match kind {
         case Event -> {
@@ -646,15 +605,20 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             }
 
             // An invalid Waiter's lists are already empty and its charge came
-            // back at the invalidation; its `process` is `NO_PROCESS`, so the
-            // credit below goes to nobody.
+            // back at the invalidation, so only a live one is credited.
             let owner = WAITERS[slot].process
+            let refund = match WAITERS[slot].state {
+                case Live -> true,
+                case _ -> false,
+            }
             // A reused slot starts with an empty blocked list, so the next
             // Waiter in this slot cannot inherit any thread. The wake above is
             // what makes the list honestly empty.
             WAITERS[slot] = WaiterSlot(state: WaiterState.Free, process: 0,
                                        attached: 0, blocked: 0, refs: 0)
-            credit_shared(owner, QuotaKind.Waiter)
+            if refund {
+                credit_shared(owner, QuotaKind.Waiter)
+            }
         },
         case Interrupt -> {
             if INTERRUPTS[slot].attachment != 0 {
@@ -680,15 +644,21 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
                 fatal_kernel("a timer reached zero references while attached",
                              slot as UInt)
             }
-            // An invalid Timer's charge came back at the invalidation, and its
-            // `process` is `NO_PROCESS`, so the credit below goes to nobody.
+            // An invalid Timer's charge came back at the invalidation, so only
+            // a live one is credited.
             let owner = TIMERS[slot].process
+            let refund = match TIMERS[slot].state {
+                case Live -> true,
+                case _ -> false,
+            }
             TIMERS[slot] = TimerSlot(state: TimerState.Free, process: 0, clock: 0,
                                      armed: false, deadline_ns: 0,
                                      interval_ns: 0, fires: 0, attachment: 0,
                                      refs: 0)
             reprogram_timer()
-            credit_shared(owner, QuotaKind.Timer)
+            if refund {
+                credit_shared(owner, QuotaKind.Timer)
+            }
         },
         case Memory -> {
             // The range goes back to the pool with the slot, but only at the
@@ -698,9 +668,8 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             // mapped region with no handles stays Live here, holding its slot
             // and charge while a domain still grants its bytes, and
             // `unref_region_row` frees it when the last row goes. The callers
-            // do not care: `unref_object` asks nothing about the outcome, and
-            // `reap_unreferenced`'s "give back what nobody names" is the
-            // question this answers, since a row is a namer.
+            // do not care: `unref_object` and the teardown's release ask
+            // nothing about the outcome, since a row is a namer.
             memory_release_if_idle(slot)
         },
         case IoMemory -> {
@@ -813,7 +782,7 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 }
 
 // =============================================================================
-// Teardown write-off: reaping what nobody names (spec §2.9)
+// Teardown disown: what survives the process charged for it (spec §2.10)
 // =============================================================================
 //
 // References govern lifetime, so a teardown never force-frees a counted kind
@@ -822,133 +791,54 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 // holds a reference. Freeing by `process == p` would free a connection under a
 // peer that still holds an end.
 //
-// The close-all counts without freeing (`unref_teardown`), so a slot whose last
-// handle the dying process held reaches zero references with nothing to free
-// it. `reap_unreferenced` therefore frees by condition, "named by nobody",
-// through `free_object`, so every kind's last rites and quota credit run
-// exactly as on the ordinary release path. The same holds for a `Gone`
-// process record whose last reference, handle or attachment, the dying process
-// held: the reap's process scan reclaims it.
+// The teardown's release is ordinary (`drop_reference`, then `free_object` at
+// zero), so what the dying process was the last to name, by a handle or an
+// attachment, is freed inside it with every kind's last rites and quota
+// credit, exactly as on a live process's release. A `Gone` process record
+// whose last reference the dying process held is reclaimed there too.
 //
-// What survives the reap and is charged to the dying process is disowned in
-// the same scans: its `process` field becomes `NO_PROCESS`, its charge goes
-// with the ledger `quota_clear` zeroes, and its eventual free credits nobody
-// (spec §2.10). A dead process's record is reclaimed on its handles and
-// attachment alone, and a refund owed to it must not reach the record's next
-// occupant.
-//
-// The Thread, Waiter and Timer sweeps in `end_process` are not force-frees:
-// each invalidates the dying process's objects of its kind (a thread only if it
-// has not exited), frees what nothing else names and disowns the rest. Each
-// also frees another process's object of its kind that nothing names any more
-// (for a thread, one that has exited or been invalidated). The Interrupt sweep
-// is that second half alone: an Interrupt has no owner, so it only frees the
-// invalid ones nothing names. They live there rather than here because the
-// counts feed the teardown report. Mapping's sweep is not a force-free either:
-// `mapping_rights()` withholds `Transfer`, so a Mapping handle cannot outlive
-// its owner's process, and its second arm (clearing the row of a mapping whose
-// target died) is not a free.
+// What survives the release and is charged to the dying process is disowned
+// afterwards: its `process` field becomes `NO_PROCESS`, its charge goes with
+// the ledger `quota_clear` zeroes, and its eventual free credits nobody (spec
+// §2.10). A dead process's record is reclaimed on its handles and attachment
+// alone, and a refund owed to it must not reach the record's next occupant.
+// The bound kinds (Threads, Waiters, Timers, Mappings) are disowned by the
+// teardown itself (`teardown_process`), which invalidated them.
 
-/// Reap every Event, Memory, IoMemory, exchange and Pipe connection that
-/// nothing names, and disown every one still charged to dying process `p`. It
-/// also reclaims every `Gone` process record that nothing names, and owes a
-/// teardown to every `Created` one (`reclaim_process_record`).
-/// Called by `end_process` after the close-all and the attachment sweep, so
-/// both kinds of reference `p` held on another process are already counted.
+/// Disown every Event, Memory, IoMemory and Pipe connection still charged to
+/// dying process `p`.
 ///
-/// Answers how many Events charged to `p` the Event scan freed, which is what
-/// the teardown line's `events=` reports. Only that scan's own frees are
-/// counted. An Event freed before it (inside the close-all, as when an outlet's
-/// last handle releases a staged message) is not, nor is one the exchange scan
-/// frees later by settling a message nobody will take. An Event a message owed
-/// to a live outlet still names is disowned and stays live.
-///
-/// Inner to outer: an exchange lives inside a connection's row, so exchanges
-/// are given back first and the connections can then answer `pipe_idle`
-/// honestly. `exchange_settle` cascades into `free_pipe` itself, so the
-/// connection loop catches connections with no exchanges (the ordinary case).
-///
-/// `p`'s own record is never reclaimed here: its teardown holds a reference on
-/// it until the teardown ends (`end_process`). Any other `Gone` record is
-/// finished, its teardown having ended, so reclaiming it here cannot disturb
-/// this one.
-///
-/// Each object is disowned after its own free is tried, so an object the dying
-/// process alone named credits its ledger as on any release. An object freed
-/// later in the scan by a cascade may already be disowned; that credits nobody,
-/// and the ledger is cleared either way.
-public(package) func reap_unreferenced(p: Int) unsafe -> UInt {
-    var events_freed: UInt = 0
+/// Called by the teardown after its release, so an object the dying process
+/// alone named has already been freed and has credited its ledger. One freed
+/// after this (a region whose last namer is a grant row in the dying domain,
+/// dropped when the teardown clears the domain) credits nobody, and the ledger
+/// is cleared either way.
+public(package) func disown_shared(p: Int) unsafe {
     var e: Int = 0
     while e < EVENTS.capacity() {
-        match EVENTS[e].state {
-            case Free -> {},
-            case Live -> {
-                if EVENTS[e].refs == 0 {
-                    if EVENTS[e].process == p { events_freed = events_freed + 1 }
-                    free_object(ObjType.Event, e)
-                }
-                disown_event(e, p)
-            },
-        }
+        disown_event(e, p)
         e = e + 1
     }
-
     var m: Int = 0
     while m < MEMORIES.capacity() {
-        match MEMORIES[m].state {
-            case Free -> {},
-            case Live -> {
-                if MEMORIES[m].refs == 0 { free_object(ObjType.Memory, m) }
-                disown_region(m, p)
-            },
-        }
+        disown_region(m, p)
         m = m + 1
     }
-
     var io: Int = 0
     while io < IOMEMORIES.capacity() {
-        match IOMEMORIES[io].state {
-            case Free -> {},
-            case Live -> {
-                if IOMEMORIES[io].refs == 0 { free_object(ObjType.IoMemory, io) }
-                disown_window(io, p)
-            },
-        }
+        disown_window(io, p)
         io = io + 1
     }
-
-    var x: Int = 0
-    while x < EXCHANGES.capacity() {
-        if exchange_can_settle(x) {
-            // Its held handles go back with it. A reap can free the very
-            // objects a later row of this scan concerns, which is why this is a
-            // scan and not a list: it reads each slot's state when it reaches
-            // it.
-            var held = exchange_settle(x)
-            release_staged(&held)
-        }
-        x = x + 1
-    }
-
     var c: Int = 0
     while c < PIPES.capacity() {
-        if pipe_frees_now(c) { free_pipe(c) }
         disown_pipe(c, p)
         c = c + 1
     }
-
-    var q: Int = 0
-    while q < PROCESS_RECORDS.capacity() {
-        reclaim_process_record(q)
-        q = q + 1
-    }
-    events_freed
 }
 
-/// Disown region `m` if dying process `p` is still charged for it. The free
-/// tried just before may have given the slot back, or left it live (a mapped
-/// region keeps its slot, and so does a pool root with pieces on loan).
+/// Disown region `m` if dying process `p` is still charged for it. A region
+/// with no handle left may still be live: a mapped region keeps its slot, and
+/// so does a pool root with pieces on loan.
 func disown_region(m: Int, p: Int) unsafe {
     match MEMORIES[m].state {
         case Free -> {},
@@ -998,7 +888,7 @@ func disown_pipe(c: Int, p: Int) unsafe {
 /// handle entry carries. The enums are numbered differently on purpose
 /// (`WaitableKind.Process` is 3, `ObjType.Process` is not), so this is an
 /// explicit total translation rather than a cast.
-func waitable_obj_type(kind: WaitableKind) -> ObjType {
+public(package) func waitable_obj_type(kind: WaitableKind) -> ObjType {
     match kind {
         case Event -> ObjType.Event,
         case Interrupt -> ObjType.Interrupt,
@@ -1019,18 +909,6 @@ public(package) func ref_waitable(kind: WaitableKind, slot: Int) unsafe {
 /// An attachment no longer names this waitable. Zero frees, as everywhere.
 public(package) func unref_waitable(kind: WaitableKind, slot: Int) unsafe {
     unref_object(waitable_obj_type(kind), slot)
-}
-
-/// The teardown's version: it counts and does not free (`unref_teardown`,
-/// reached through the wait machinery's own enum).
-///
-/// An attachment can span processes (a supervisor's attachment onto a child's
-/// Process record), so the dying supervisor's side owes the other side a
-/// decrement, as the close-all does for a handle onto someone else's object.
-/// Same asymmetry and reason as `unref_teardown`: the ledger stays honest and
-/// the per-slab sweeps do the freeing.
-public(package) func unref_waitable_teardown(kind: WaitableKind, slot: Int) unsafe {
-    unref_teardown(waitable_obj_type(kind), slot)
 }
 
 // =============================================================================
@@ -2015,9 +1893,10 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
 /// already gone from the table and its reference sits on the claim column
 /// exactly where a fused caller's does.
 ///
-/// It runs before the close-all, in two passes. Before, because the close-all
-/// drops endpoint columns and every such transition notifies, and a
-/// notification must never find a thread of the process being torn down. Two
+/// It runs before the teardown drops any other reference, in two passes.
+/// Before, because the invalidation's detaches and the close-all drop endpoint
+/// columns and every such transition notifies, and a notification must never
+/// find a thread of the process being torn down. Two
 /// passes, because the second pass's unrefs can deliver: settling an exchange
 /// raises the room level, and serving a room waiter of this dying process would
 /// resume a thread into a process that no longer has one. Room waiters go first

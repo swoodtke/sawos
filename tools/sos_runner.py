@@ -557,6 +557,9 @@ THREAD_HANG_PKG = os.path.join(TESTS_DIR, "thread-hang")
 # thread of the server is parked on its completion queue.
 TEARDOWN_MINT_PKG = os.path.join(TESTS_DIR, "teardown-mint")
 CHILD_TEARDOWN_MINT_PKG = os.path.join(TESTS_DIR, "child-teardown-mint")
+# A thread only a staged message names is invalidated before the close-all
+# releases the message.
+TEARDOWN_STAGED_THREAD_PKG = os.path.join(TESTS_DIR, "teardown-staged-thread")
 
 # Waiters and Timers are givable and bound to their creator: given, carried in
 # a message, handed back by a refused give, invalidated by their owner's death,
@@ -568,6 +571,9 @@ WAITER_OUTLIVE_PKG = os.path.join(TESTS_DIR, "waiter-outlive")
 TEARDOWN_DETACH_PKG = os.path.join(TESTS_DIR, "teardown-detach")
 FREE_CASCADE_PKG = os.path.join(TESTS_DIR, "free-cascade")
 WAITER_PARKED_PKG = os.path.join(TESTS_DIR, "waiter-parked")
+# A dying process's Timer is invalidated before its close-all frees the Waiter
+# it is attached to.
+TEARDOWN_TIMER_FIRST_PKG = os.path.join(TESTS_DIR, "teardown-timer-first")
 TIMER_DISARM_PKG = os.path.join(TESTS_DIR, "timer-disarm")
 PIPE_REPLY_WAIT_WAITER_PKG = os.path.join(TESTS_DIR, "pipe-reply-wait-waiter")
 CHILD_WAITABLE_PKG = os.path.join(TESTS_DIR, "child-waitable")
@@ -1027,10 +1033,12 @@ def expectations(arch):
         "ended_mark": f"0x{0x32:0{width}x}",
         # `child-waitable`'s exit codes: the peer's in `waitable_give`, the
         # owners' in `timer_outlive`, `waiter_outlive`, `teardown_detach` and
-        # `timer_disarm`, and the parker's in `waiter_parked`.
+        # `timer_disarm`, the parker's in `waiter_parked`, and the attacher's in
+        # `teardown_timer_before_release`.
         "served_mark": f"0x{0x33:0{width}x}",
         "owned_mark": f"0x{0x34:0{width}x}",
         "parked_mark": f"0x{0x35:0{width}x}",
+        "attached_mark": f"0x{0x37:0{width}x}",
         # `child-churn`'s exit code, from its last thread's `Exit`, asserted in
         # `thread_exit`.
         "churn_mark": f"0x{0x36:0{width}x}",
@@ -4131,6 +4139,16 @@ TEST_CASES = [
     {
         # `Waiter.mint(rights:)` narrows. The sibling works (the line before
         # the refusal), and `WaiterRight.Attach` is refused through it.
+        #
+        # The teardown line pins the order of root's teardown (spec 2.10).
+        # Root dies holding two Events, the first also attached to its Waiter.
+        # The Waiter is invalidated before the close-all, so its attachment's
+        # reference goes first and the close-all drops each Event's last
+        # handle itself: `events={two}`. Were the Waiter invalidated after the
+        # close-all, the close-all would drop the first Event's handle while
+        # the attachment still held it, then free the Waiter through its last
+        # handle (the sibling, minted last), and that free's cascade would
+        # drop the Event's last reference uncounted: `events={one}`.
         "name": "mint_narrow_waiter",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MINT_WAITER_PKG,
@@ -4138,7 +4156,9 @@ TEST_CASES = [
                        "SOS mintwaiter: the sibling waits",
                        "SOS mintwaiter: asking to attach through it",
                        "SOS: process fault: access denied",
-                       "SOS: process teardown"],
+                       "SOS: process teardown handles={eight} threads={one} "
+                       "events={two} waiters={one} interrupts={zero} "
+                       "timers={zero} process={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
     },
@@ -5587,9 +5607,9 @@ TEST_CASES = [
     {
         # A dying process counts only its own Events. Root makes an Event and
         # gives it to a keeper that exits holding it; the keeper's close-all
-        # drops the last name and the reap frees the Event, but it is charged to
-        # root, so the keeper's `events=` reads zero (a count that ignored the
-        # owner would read one). Root's slab is whole afterwards.
+        # drops the last name and frees the Event, but it is charged to root,
+        # so the keeper's `events=` reads zero (a count that ignored the owner
+        # would read one). Root's slab is whole afterwards.
         "name": "event_keeper",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": EVENT_KEEPER_PKG,
@@ -5744,6 +5764,25 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # A teardown invalidates before it releases (spec 2.10). Root posts the
+        # only handle onto a thread it never starts in a message on its own
+        # connection, keeps both ends and exits. The thread is invalidated
+        # while the message still names it, and the close-all's release of the
+        # outlet drops the message and frees the thread inside that cascade,
+        # uncounted: `threads={one}` is root's own thread alone. Released
+        # before it was invalidated, the thread would be found unfreed at a
+        # count of zero and counted, and the line would read `threads={two}`.
+        "name": "teardown_staged_thread",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TEARDOWN_STAGED_THREAD_PKG,
+        "expect_out": ["{banner}",
+                       "SOS stagedthread: staged",
+                       "SOS: process teardown handles={six} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
         # A give refused for capacity hands a Thread back usable, as
         # `give_event_returns` does an Event: `gave 12` is the child's handle
         # budget, and the returned thread starts and joins for its code, `7`.
@@ -5829,12 +5868,11 @@ TEST_CASES = [
         # `before` and `after` are the free slab slots, counted by making
         # objects until refused. They agree only if every object of the case
         # was freed: root's pair by the child's teardown, whose close-all drops
-        # their last names and whose Waiter and Timer sweeps then free another
-        # process's objects, and the child's pair by root's releases while the
-        # child lives. The child's teardown line counts none of the four
-        # (`waiters=0 timers=0`): two are root's, and two were already gone.
-        # Nothing here is invalidated; `timer_outlive` and `waiter_outlive`
-        # cover that.
+        # their last names and so frees another process's objects, and the
+        # child's pair by root's releases while the child lives. The child's
+        # teardown line counts none of the four (`waiters=0 timers=0`): two are
+        # root's, and two were already gone. Nothing here is invalidated;
+        # `timer_outlive` and `waiter_outlive` cover that.
         "name": "waitable_give",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": WAITABLE_GIVE_PKG,
@@ -6036,6 +6074,38 @@ TEST_CASES = [
                        "SOS waiterparked: the child is gone",
                        "SOS waiterparked: the Event delivered 5",
                        "SOS waiterparked: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A dying process's Timer is invalidated before its close-all frees the
+        # Waiter the Timer is attached to (spec 2.10). Root parks a thread on a
+        # Waiter of its own and then gives the Waiter's one handle to a child
+        # (`child-waitable`, the attacher), which attaches a Timer of its own
+        # to it unarmed and exits holding the Waiter's last name. The
+        # teardown's first step invalidates the Timer, and an attachment on an
+        # invalidated waitable fires: the Waiter is still live, so the parked
+        # thread is handed the Timer's ordinary record (the attacher's key,
+        # `74`, and a fire count of `0`). The close-all then frees the Waiter
+        # with nobody parked on it. Released first, the Waiter would be freed
+        # under the parked thread, which answers it `Revoked` (spec 2.2), and
+        # the Timer would be freed in that same release without ever firing.
+        # The teardown line is asserted too: a teardown in which the Timer
+        # goes uncounted, inside the Waiter's free, reads `timers=0`.
+        "name": "teardown_timer_before_release",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TEARDOWN_TIMER_FIRST_PKG,
+        "children": [CHILD_WAITABLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS timerfirst: parking",
+                       "SOS timerfirst: started",
+                       "SOS: process exit: code={attached_mark} process={one}",
+                       "SOS: process teardown handles={five} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={one} process={one}",
+                       "SOS timerfirst: the parked wait was handed key=74 "
+                       "payload=0",
+                       "SOS timerfirst: done"],
         "expect_clean_exit": True,
     },
     {
@@ -6929,11 +6999,11 @@ TEST_CASES = [
         # (one with a message staged on it), splits a region, carves a window
         # and exits holding all of it (`handles={nine}`).
         #
-        #   connections back=1   the same counts as before: the teardown freed
-        #   windows back=1       the idle connection in the reap's connection
-        #                        scan, the busy one by the cascade out of
+        #   connections back=1   the same counts as before: the teardown's
+        #   windows back=1       close-all freed the idle connection with its
+        #                        last end, the busy one by the cascade out of
         #                        settling its staged exchange, and the window
-        #                        in the IoMemory scan
+        #                        with its handle
         #   region back=1        root donates its pool whole, which a pool with
         #                        a piece on loan refuses (as a fault)
         #

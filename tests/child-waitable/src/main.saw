@@ -1,4 +1,4 @@
-// Test child: Waiters and Timers across a process boundary, in five roles
+// Test child: Waiters and Timers across a process boundary, in six roles
 // chosen by the boot set (spec §3, §2.1, §2.10).
 //
 // The peer is given a Waiter under `TAG_WAITER`, a Timer under `TAG_TIMER` and
@@ -26,6 +26,10 @@
 // Its main thread parks on that Waiter, and a second thread ends the process
 // while the main thread is still parked there.
 //
+// The attacher is given a launcher's Waiter under `TAG_ATTACH` and nothing
+// else. It makes a Timer, attaches it to that Waiter without arming it, and
+// ends holding the Waiter's last name and the Timer's only handle.
+//
 // The probe is given an inbox under `TAG_PROBE_TIMERS` or `TAG_PROBE_WAITERS`
 // and an outbox. It makes one object of that kind, tells its launcher, waits
 // for the go message, then makes objects of that kind until refused and exits
@@ -47,11 +51,13 @@ static TAG_TIMER: UInt = 51
 static TAG_PROBE_TIMERS: UInt = 52
 static TAG_PROBE_WAITERS: UInt = 53
 static TAG_PARK: UInt = 54
+static TAG_ATTACH: UInt = 55
 
 /// The keys this program attaches under.
 static KEY_GIVEN: UInt = 71
 static KEY_GO: UInt = 72
 static KEY_SLEEP: UInt = 73
+static KEY_ATTACHED: UInt = 74
 
 /// How soon the given Timer fires, the owner's Timer's period, and the firing
 /// owner's period and how long it sleeps after arming.
@@ -69,6 +75,8 @@ static EXIT_SERVED: UInt = 51
 static EXIT_OWNED: UInt = 52
 /// The parker's second thread ended it.
 static EXIT_PARKED: UInt = 53
+/// The attacher ended holding its Timer attached to the launcher's Waiter.
+static EXIT_ATTACHED: UInt = 55
 /// The boot set names no role, or something on the way failed; the line
 /// before it says what.
 static EXIT_MISMATCH: UInt = 98
@@ -127,6 +135,7 @@ func main_thread(boot_handle: UInt) {
     var given_waiter: Waiter? = None
     var given_timer: Timer? = None
     var parking: Waiter? = None
+    var attaching: Waiter? = None
     var outbox: PipeInlet? = None
     var inbox: PipeOutlet? = None
     var spend_timers = false
@@ -143,6 +152,8 @@ func main_thread(boot_handle: UInt) {
                     given_timer = rec.take_timer()
                 } else if tag == TAG_PARK {
                     parking = rec.take_waiter()
+                } else if tag == TAG_ATTACH {
+                    attaching = rec.take_waiter()
                 } else if tag == TAG_OUTBOX {
                     outbox = rec.take_inlet()
                 } else if tag == TAG_OUTBOX_FIRING {
@@ -162,6 +173,16 @@ func main_thread(boot_handle: UInt) {
     if let w = parking.take() {
         let code = try park_elsewhere(&proc, &w) catch {
             print("SOS childwaitable: parker refused: {}\n", error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        let _ = proc.exit(code)
+        return
+    }
+
+    if let w = attaching.take() {
+        let code = try attach_and_end(&proc, &clock, &w) catch {
+            print("SOS childwaitable: attacher refused: {}\n", error)
             let _ = proc.exit(EXIT_MISMATCH)
             return
         }
@@ -216,6 +237,17 @@ func park_elsewhere(proc: &Process, waiter: &Waiter) -> Result<UInt, SosStatus> 
     try ending.start()
     let _ = waiter.wait()
     return EXIT_MISMATCH
+}
+
+/// The attacher: attach a Timer of its own to the launcher's Waiter and end.
+/// `exit` does not return, so the teardown finds the Timer and the Waiter
+/// still held, and the attachment still on the Waiter.
+func attach_and_end(proc: &Process, clock: &Clock,
+                    waiter: &Waiter) -> Result<UInt, SosStatus> {
+    let timer = try clock.timer_create()
+    try waiter.add(timer: &timer, key: KEY_ATTACHED)
+    let _ = proc.exit(EXIT_ATTACHED)
+    return EXIT_ATTACHED
 }
 
 /// The peer: use the launcher's Waiter and Timer, then send a pair of its own.

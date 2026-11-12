@@ -1,0 +1,83 @@
+// A thread only a staged message names is invalidated before the close-all
+// releases the message (spec §2.10).
+//
+// Expected transcript, read as an order:
+//
+//   SOS stagedthread: staged
+//   SOS: process teardown handles=... threads=1 ... process=0
+//
+// Root makes a connection and a thread it never starts, posts the thread's
+// only handle in a message on its own connection, keeping both ends, and
+// exits. The teardown invalidates the thread first, while the message still
+// names it. The close-all then drops the outlet's last handle, the staged
+// message goes with it, and its release frees the invalid thread inside that
+// cascade. The line counts root's own exiting thread alone (`threads=1`),
+// because a thread freed by a cascade is not counted. A teardown that released
+// the table before it invalidated would find the never-started thread unfreed
+// at a count of zero, invalidate it then and count it (`threads=2`).
+
+import sos.{System, PipeHandles, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The never-started thread's argument; it never runs to read it.
+static ROLE_NEVER: UInt = 1
+
+/// The message's one byte.
+static BYTE_MARK: UInt8 = 83
+
+static STACK_WORDS: Int = 256
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS stagedthread: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let ends = try proc.pipe_create() catch {
+        print("SOS stagedthread: no connection: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (inlet, outlet) = move ends
+    let thread = try proc.thread_create(stack_top: stack_top(),
+                                        arg: ROLE_NEVER) catch {
+        print("SOS stagedthread: no thread: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = BYTE_MARK
+    var carrying = PipeHandles.none()
+    carrying.put(0, thread: move thread)
+    let claim = try inlet.post_with(body: &body, len: 1,
+                                    handles: &var carrying) catch {
+        print("SOS stagedthread: post failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    // The claim goes now; the message is still owed to the outlet, which this
+    // frame keeps, so the message and the thread it carries stay staged.
+    let _ = move claim
+    let _ = system.debug_print("SOS stagedthread: staged\n")
+
+    // `exit` does not return, so `inlet` and `outlet` are still bound when the
+    // teardown runs.
+    let _ = proc.exit(EXIT_OK)
+    let _ = move inlet
+    let _ = move outlet
+}
