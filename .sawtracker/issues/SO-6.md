@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":4,"sequence":712,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794500307"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":5,"sequence":718,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794500579"}
 ---
 
 
@@ -57,4 +57,74 @@ Historical closed subcases are context, not new work. Legacy DF/SL/SO numbers us
 
 
 ## Comments
+
+<!-- sawtracker:comment {"author":"agent:claude-sawos","body_bytes":2709,"created":"1794500579","id":"c1"} -->
+## Implementation notes (lead, Nov 12)
+
+**Model:** Sonnet. **Rules:** `.sawtracker/docs/implementer-rules.md`.
+**Depends on:** nothing. Tests only: no kernel or sysapi change.
+
+### What is untested
+
+Two rights gates in `kernel/core/dispatch.saw` have no case:
+- `obj.allows(PipeRequestRight.Reply)`, on the reply ops;
+- `obj.allows(PipeReplyRight.Resolve)`, on resolve.
+
+A handle that lacks the bit can only be made by a `give` with a keep mask
+into another process, so each needs a two-process case. The comment above the
+`pipe_no_reply` case in `tools/sos_runner.py` says so.
+
+### Case 1: `pipe_reply_narrowed`
+
+1. Model it on the `pipe_delegate` case: there root gives an obligation
+   (`PipeRequest`) to a child, which replies. Read that case's root and child
+   packages first.
+2. Here root gives with `keep: PipeRequestRight.Transfer |
+   PipeRequestRight.Wait`, through `Process.give(request:tag:keep:)`
+   (`kernel/sysapi/src/system.saw`).
+3. The child reads the handle's rights back with `rights()` and prints that
+   `Reply` is absent, then calls `reply`. The kernel faults it:
+   `SOS: process fault: access denied process=<child>`.
+4. Root learns of the death (`get_status`, as `give_keep_mask`'s root does),
+   prints what its own claim on that exchange then answers, and exits
+   cleanly. Assert the answer you observe and say in the case header why it
+   is that one.
+
+### Case 2: `pipe_resolve_narrowed`
+
+The same shape for the client's side: root gives a claim (`PipeReply`) with
+`keep: PipeReplyRight.Transfer | PipeReplyRight.Wait`, through
+`Process.give(reply:tag:keep:)`. Find the existing case whose child is
+`tests/child-resolver` for the unnarrowed flow. The child's `resolve` faults
+with access denied.
+
+### Packages
+
+- One new child package per case, or one child that picks its role from the
+  boot tags it was given. `tests/child-narrow/` is the manifest to copy: it
+  names the riscv32 `child.ld` and the arm64 `user.ld`.
+- New root packages beside the existing ones; register each as a
+  `*_PKG` constant and a case entry with `"children": [...]`, as
+  `give_keep_mask` does.
+- These are syscall-path checks, so they run on the flat profile too.
+
+### Mutation checks
+
+For each gate, delete the `allows` check, show the matching case fails (the
+child's reply or resolve succeeds), and restore it.
+
+### Also
+
+Rewrite the sentence above `pipe_no_reply` that says no case covers the
+`Reply` gate, so it names the case that now does.
+
+### Runs
+
+Both new cases, `pipe_delegate`, `pipe_no_reply`, `give_keep_mask` and every
+case that uses `child-resolver`, on three profiles; then `--board esp32c3`.
+
+### Commit
+
+`tests: the Reply and Resolve gates, reached through a give's keep mask`
+
 
