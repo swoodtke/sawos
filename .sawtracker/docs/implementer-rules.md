@@ -56,13 +56,17 @@ Every implementing agent follows these. A unit's issue carries its own
   line.
 - Never weaken an existing assertion to make a case pass. If a transcript row
   must move, name the row and the reason in your report.
-- **No case asserts anything about run time or wall time** (user ruling). The
-  emulators' clocks follow host time, so an elapsed time, a count of fires or
-  ticks that accumulated while the program ran, or an order that only holds
-  if one thing finishes before a clock moves, fails when the host is loaded.
-  Assert the property instead: that a wake happened, that a count is at
-  least one, that a wait consumed it. Print a timing-dependent value if it
-  helps a reader, and leave it out of the expected text.
+- **No case asserts an exact time** (user ruling). The emulators' clocks
+  follow host time, so a loaded host stretches everything. A time-based case
+  asserts that some time passed, never how much:
+  - never an exact or upper-bounded duration, and never an exact count of
+    something that accrues with time (a periodic Timer's fires, ticks);
+  - a one-sided bound is the right shape (at least the delay elapsed, at
+    least one fire arrived), provided a stalled host can only move the value
+    further into the passing side. Work out that direction for each one;
+  - "it finished at all" is the harness timeout's job, not a transcript line.
+  Print a timing-dependent value if it helps a reader, and leave it out of
+  the expected text.
 - The flat profile excludes cases by name with a printed reason. Exclude one
   only if what it asserts is a hardware denial.
 
