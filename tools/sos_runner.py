@@ -6928,11 +6928,12 @@ def _default_jobs():
 def _find_clang(arches):
     """Return the first clang that can assemble every target's boot code.
 
-    macOS's Apple clang mis-drives the riscv integrated assembler, so a real
-    LLVM clang (Homebrew `llvm`) is preferred there; on Linux CI plain `clang`
-    (apt) works. `SOS_CLANG` overrides the search. The probe compiles each
-    architecture's own `boot.S`, because "can target riscv32" and "can target
-    aarch64" are separate questions and one harness needs both answered yes.
+    Plain `clang` is tried before the Homebrew `llvm` ones. macOS's Apple
+    clang mis-drives the riscv integrated assembler, so it fails the probe and
+    a real LLVM clang is found there instead. `SOS_CLANG`, when set, is tried
+    ahead of all of them. The probe compiles each architecture's own `boot.S`,
+    because "can target riscv32" and "can target aarch64" are separate
+    questions and one harness needs both answered yes.
     """
     candidates = []
     if os.environ.get("SOS_CLANG"):
