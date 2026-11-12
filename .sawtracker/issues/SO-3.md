@@ -1,5 +1,5 @@
 ---
-{"assignee":"","author":"agent:codex-todo-import","body_bytes":4108,"created":"1788791279","id":"SO-3","labels":["todo-import","backlog","task","plan"],"priority":"normal","project":"SO","revision":1,"sequence":3,"status":"open","title":"Replace test pool-base constants with actual Mapping addresses","updated":"1788791279"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":4108,"closed":"","created":"1788791279","id":"SO-3","labels":["todo-import","backlog","task","plan"],"order":0,"parent":"","priority":"low","project":"SO","queue_order":0,"revision":2,"sequence":661,"stage":"backlog","status":"open","title":"Replace test pool-base constants with actual Mapping addresses","updated":"1794498236"}
 ---
 
 
