@@ -1,5 +1,5 @@
 ---
-{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":7,"sequence":746,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794502746"}
+{"acceptance":[],"assignee":"","author":"agent:codex-todo-import","body_bytes":2942,"closed":"","created":"1788791281","id":"SO-6","labels":["todo-import","task","plan","tests"],"order":0,"parent":"","priority":"normal","project":"SO","queue_order":150,"revision":8,"sequence":747,"stage":"queued","status":"open","title":"Test attenuated Reply and Resolve rights through child transfers","updated":"1794503017"}
 ---
 
 
@@ -158,4 +158,7 @@ Submitted patch SO-6.p1 (revision 1): tests: the Reply and Resolve gates, reache
   given claim; nothing is given to that child, so the new child was written
   from `child-narrow` instead.
 
+
+<!-- sawtracker:comment {"author":"agent:sawtracker-tests","body_bytes":37,"created":"1794503017","id":"c4"} -->
+Tests passed for SO-6.p1 (revision 1)
 
