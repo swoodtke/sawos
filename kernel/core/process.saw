@@ -638,6 +638,85 @@ public(package) func remove_grant(p: Int, row: Int) unsafe {
     unref_region_row(gone.region)
 }
 
+/// Where row `row` ends physically: its `pa` plus its length, saturating.
+func row_pa_end(row: GrantRow) -> UInt {
+    let span = row.top - row.base
+    if span > UInt.max - row.pa {
+        return UInt.max
+    }
+    row.pa + span
+}
+
+/// Would a cut of `[cut_base, cut_base + cut_len)` out of region `region` leave
+/// every row counted on `region` wholly inside the cut or wholly outside it?
+///
+/// A row is one affine run of frames, so a cut through its middle would leave
+/// one row granting bytes of two regions with one `region` field to name them.
+/// Rows are read from every process body, not only the region's creator's: a
+/// mapping installed in another process counts on the region too.
+///
+/// A region with no rows is answered without a scan.
+public(package) func rows_clear_of_cut(region: Int, cut_base: UInt,
+                                       cut_len: UInt) unsafe -> Bool {
+    if MEMORIES[region].maps == 0 {
+        return true
+    }
+    let cut_end = cut_base + cut_len
+    var b: Int = 0
+    while b < process_slots_usable() {
+        var i: Int = 0
+        while i < PROCESSES[b].grant_count {
+            let row = PROCESSES[b].grants[i]
+            if row.region == region {
+                let end = row_pa_end(row)
+                let inside = row.pa >= cut_base && end <= cut_end
+                let outside = end <= cut_base || row.pa >= cut_end
+                if not inside && not outside {
+                    return false
+                }
+            }
+            i = i + 1
+        }
+        b = b + 1
+    }
+    true
+}
+
+/// Move every row counted on region `parent` that lies inside
+/// `[cut_base, cut_base + cut_len)` over to region `piece`, the piece that was
+/// cut there.
+///
+/// A row is counted on the region whose bytes it grants, so the release of each
+/// piece is governed by the rows that actually lie in it: the piece's range
+/// goes back to its pool only when no row of any process is left in it. The
+/// caller has asked `rows_clear_of_cut`, so no row is partly inside.
+///
+/// `parent` is a region the caller still holds a handle on, so lowering its
+/// count cannot be its second zero and nothing is released here.
+public(package) func rows_move_to_piece(parent: Int, piece: Int,
+                                        cut_base: UInt,
+                                        cut_len: UInt) unsafe {
+    if MEMORIES[parent].maps == 0 {
+        return
+    }
+    let cut_end = cut_base + cut_len
+    var b: Int = 0
+    while b < process_slots_usable() {
+        var i: Int = 0
+        while i < PROCESSES[b].grant_count {
+            let row = PROCESSES[b].grants[i]
+            if row.region == parent && row.pa >= cut_base &&
+               row_pa_end(row) <= cut_end {
+                PROCESSES[b].grants[i].region = piece
+                MEMORIES[parent].maps = MEMORIES[parent].maps - 1
+                ref_region_row(piece)
+            }
+            i = i + 1
+        }
+        b = b + 1
+    }
+}
+
 /// The live-domain rule: any edit to process `p`'s grant record reloads
 /// immediately when `p`'s domain is the one in the hardware.
 ///

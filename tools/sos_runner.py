@@ -306,6 +306,10 @@ MAP_UNMAP_PKG = os.path.join(TESTS_DIR, "map-unmap")
 MAP_INTO_CHILD_PKG = os.path.join(TESTS_DIR, "map-into-child")
 IOMEMORY_CARVE_PKG = os.path.join(TESTS_DIR, "iomemory-carve")
 CHILD_TOUCH_PKG = os.path.join(TESTS_DIR, "child-touch")
+SPLIT_LIVE_BYTES_PKG = os.path.join(TESTS_DIR, "split-live-bytes")
+CHILD_LIVE_DATA_PKG = os.path.join(TESTS_DIR, "child-live-data")
+SPLIT_MAPPED_BYTES_PKG = os.path.join(TESTS_DIR, "split-mapped-bytes")
+SPLIT_ROWS_HELD_PKG = os.path.join(TESTS_DIR, "split-rows-held")
 
 # Quotas and the reference count. The three refcount cases are root's, because
 # free-on-zero is about objects and root may hold any number of them. The two
@@ -3588,6 +3592,95 @@ TEST_CASES = [
                        "SOS mapchild: root observed child status=65596",
                        "SOS mapchild: done"],
         "expect_clean_exit": True,
+    },
+    {
+        # A split does not free bytes a live process's rows cover. Root creates
+        # a child that holds a four-word pattern in its data and parks, cuts a
+        # front piece off the Memory the child runs in (above every segment,
+        # below the stack) and releases it, and takes the next piece of the
+        # same size and looks for the pattern in it.
+        #
+        # `found=0` is the line to read: while the child lives, the bytes of
+        # its image are not on the pool's free list, so a piece cut from the
+        # pool is somebody else's bytes. A kernel that left the child's rows
+        # counted on the region the front was cut from would put the front back
+        # at its release, hand it out again, and `found` would be 1; root's
+        # write through its mapping would then change the child's data and the
+        # child would say `pattern changed`. The case asserts the child's own
+        # verdict and its status word, and that after its death a fresh piece
+        # of the same size is those bytes again (`found=1`): the range comes
+        # home when the rows go.
+        "name": "split_live_bytes",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SPLIT_LIVE_BYTES_PKG,
+        "children": [CHILD_LIVE_DATA_PKG],
+        "expect_out": ["{banner}",
+                       "SOS splitlive: child parked",
+                       "SOS splitlive: front piece cut",
+                       "SOS splitlive: front piece released",
+                       "SOS splitlive: next piece taken and mapped",
+                       "SOS splitlive: while the child lives, witness found=0",
+                       "SOS livedata: pattern intact",
+                       "SOS splitlive: child ended status=65607",
+                       "SOS splitlive: after its death, witness found=1",
+                       "SOS splitlive: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A split does not free bytes an installed mapping covers. Root maps a
+        # two-page region into itself and stamps a mark, and a cut of one page
+        # (through the row) is refused with a status. The whole region is then
+        # cut off, which takes the row with it, and released while mapped; a
+        # fresh two-page piece from the pool is written through a second
+        # mapping and the first is read back.
+        #
+        # `shares the bytes=0` is the line to read: the released piece is a
+        # husk and not a free range, so the fresh piece is other bytes. A
+        # kernel that left the row counted on the region the piece was cut from
+        # would return the range at the release and the fresh piece would be the
+        # same bytes (`=1`). After the first mapping is unmapped the husk's
+        # bytes come home: a piece taken then carries the mark.
+        "name": "split_mapped_bytes",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SPLIT_MAPPED_BYTES_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS splitmap: wrote mark",
+                       "SOS splitmap: cut through the mapping refused: "
+                       "out of kernel objects",
+                       "SOS splitmap: whole region cut and released while "
+                       "mapped",
+                       "SOS splitmap: fresh piece shares the bytes=0",
+                       "SOS splitmap: after the unmap, fresh piece carries "
+                       "the mark=1",
+                       "SOS splitmap: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A split's refusals and the rows a child's region carries. Root creates
+        # a child and leaves it unstarted. A one-page cut runs through the
+        # image's first segment and a cut that leaves the stack's last page out
+        # runs through the stack's row: each is refused with a status, nothing
+        # changes. A cut above every segment and below the stack is accepted
+        # and takes the image's rows with it, so donating that piece to the
+        # kernel's slabs is a `BadState` fault (the piece's bytes are a
+        # child's), the case's last line.
+        "name": "split_rows_held",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SPLIT_ROWS_HELD_PKG,
+        "children": [CHILD_LIVE_DATA_PKG],
+        "expect_out": ["{banner}",
+                       "SOS splitrows: cut through the image refused: "
+                       "out of kernel objects",
+                       "SOS splitrows: cut through the stack refused: "
+                       "out of kernel objects",
+                       "SOS splitrows: front piece cut",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}",
+                       "SOS: process teardown handles="],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
     {
         # Device authority. A window is carved non-exclusively (the same range

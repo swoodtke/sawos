@@ -195,6 +195,7 @@ import kcore.objects.{
     alloc_pipe,
     pool_can_serve,
     pool_cut,
+    pool_cut_base,
     staged_count,
     table_room,
     boot_handle_cursor,
@@ -299,6 +300,8 @@ import kcore.process.{
     meets_image_row,
     record_grant,
     remove_grant,
+    rows_clear_of_cut,
+    rows_move_to_piece,
 }
 import kcore.loader.{
     LoadRegion,
@@ -3031,6 +3034,13 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
         // know how many slots are left. A piece that is split off and dropped
         // returns its slot at once, so a splitting loop meets the pool wall
         // before the slab wall: the bytes are what nothing returns.
+        //
+        // Rows counted on the region go with the bytes they grant. A row lying
+        // wholly inside the cut moves to the piece and the rest stay, so the
+        // piece's range returns to the pool only when no row of any process is
+        // left in it. A cut through the middle of a row is `NoResource`, a
+        // status: where a child's segments lie is not something the launcher
+        // that holds its region can have known, as for `Map` over an image row.
         case Split -> {
             if not obj.allows(MemoryRight.Split) {
                 fault_process(p, FaultReason.AccessDenied)
@@ -3041,6 +3051,13 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             }
             if (len % hal.PROT_GRAIN) != 0 {
                 fault_process(p, FaultReason.BadArg)
+            }
+            // A cut that would run through a row counted on this region is
+            // refused with nothing changed. The rows wholly inside the cut go
+            // with it, below.
+            let cut = pool_cut_base(obj.slot, len)
+            if not rows_clear_of_cut(obj.slot, cut, len) {
+                return op_status(SosStatus.NoResource)
             }
             if not quota_room(p, QuotaKind.Memory) {
                 return op_status(SosStatus.QuotaExceeded)
@@ -3070,6 +3087,7 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
                                         base: base, len: len, refs: 1, maps: 0,
                                         root: MEMORIES[obj.slot].root,
                                         free_head: 0, out_bytes: 0, dropped: 0)
+            rows_move_to_piece(obj.slot, slot, base, len)
             quota_charge(p, QuotaKind.Memory)
             op_value(handle)
         },

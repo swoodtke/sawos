@@ -1,0 +1,101 @@
+// Test child: holds a known pattern in its writable data and reports whether it
+// is still there.
+//
+// The launcher gives it two Events. It signals `TAG_READY` to say it is running
+// and then waits, by yielding, for `TAG_GO`. Once that arrives it reads its
+// pattern back and exits with `EXIT_INTACT` when every word is as it was
+// written and `EXIT_CHANGED` when any is not. Between the two signals the
+// launcher is free to do whatever it likes to the memory this image runs from;
+// the child's verdict is what it observes afterwards.
+//
+// The pattern is four words that appear nowhere else in an image, because the
+// launcher finds it by looking for the four in a row. It is initialized data in
+// `witness.c`, read back through its address so no read can be folded away.
+
+import sos.{System, Process, Event, SosStatus}
+
+/// The launcher's tags.
+static TAG_READY: UInt = 51
+static TAG_GO: UInt = 52
+
+/// The most turns this process yields before it gives up and exits.
+static MAX_TURNS: Int = 100000
+
+static EXIT_INTACT: UInt = 71
+static EXIT_CHANGED: UInt = 72
+static EXIT_NO_EVENTS: UInt = 73
+static EXIT_TIMEOUT: UInt = 74
+
+extern "C" {
+    func sos_test_witness() -> UInt
+}
+
+func word(i: UInt) unsafe -> UInt32 {
+    UnsafeMemory<UInt32, Normal>(sos_test_witness() + 4 * i).read()
+}
+
+/// Do all four words still hold what the image put there?
+func witness_holds() unsafe -> Bool {
+    word(0) == 0x51AB_C0DE && word(1) == 0x0BAD_F00D &&
+        word(2) == 0x1357_9BDF && word(3) == 0x2468_ACE0
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        return
+    }
+
+    var ready: Event? = None
+    var go: Event? = None
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if tag == TAG_READY {
+                    ready = rec.take_event()
+                } else if tag == TAG_GO {
+                    go = rec.take_event()
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    guard let ready_ev = ready.take() else {
+        let _ = proc.exit(EXIT_NO_EVENTS)
+        return
+    }
+    guard let go_ev = go.take() else {
+        let _ = proc.exit(EXIT_NO_EVENTS)
+        return
+    }
+
+    try ready_ev.signal(1) catch {
+        let _ = proc.exit(EXIT_NO_EVENTS)
+        return
+    }
+    let me = try proc.thread_self() catch {
+        let _ = proc.exit(EXIT_NO_EVENTS)
+        return
+    }
+    var turns: Int = 0
+    while turns < MAX_TURNS {
+        let bits = try go_ev.receive() catch { 0 }
+        if bits != 0 {
+            if witness_holds() {
+                let _ = system.debug_print("SOS livedata: pattern intact\n")
+                let _ = proc.exit(EXIT_INTACT)
+            } else {
+                let _ = system.debug_print("SOS livedata: pattern changed\n")
+                let _ = proc.exit(EXIT_CHANGED)
+            }
+            return
+        }
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    let _ = proc.exit(EXIT_TIMEOUT)
+}

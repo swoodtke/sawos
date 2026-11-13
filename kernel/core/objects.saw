@@ -841,8 +841,10 @@ public(package) struct MemorySlot {
     /// different lifetimes (the husk arm frees the slot and leaves the row
     /// installed), so counting objects would lose the row that is still
     /// granting these bytes the moment its last handle went. A row is born in
-    /// `record_grant` and dies in `remove_grant` or `clear_domain`; those three
-    /// sites are where this count moves.
+    /// `record_grant` and dies in `remove_grant` or `clear_domain`, and a split
+    /// hands the rows inside its piece to the piece (`rows_move_to_piece`):
+    /// those are the places this count moves, and a row is always counted on
+    /// the region whose bytes it grants.
     public(package) maps: UInt16,
     /// The pool root these bytes belong to: a boot-minted region names itself,
     /// and a split carries its parent's answer down.
@@ -1009,6 +1011,26 @@ public(package) func pool_can_serve(slot: Int, len: UInt) unsafe -> Bool {
         cur = FREE_RANGES[n].next
     }
     false
+}
+
+/// Where `pool_cut(slot, len)` will cut, without cutting: the front of the
+/// first free range that holds `len` on a pool root, else the region's own
+/// cursor.
+///
+/// It walks as `pool_cut` does and the two must agree: the split asks here
+/// first, to learn which rows lie in the bytes it is about to move.
+public(package) func pool_cut_base(slot: Int, len: UInt) unsafe -> UInt {
+    if MEMORIES[slot].root == slot {
+        var cur = MEMORIES[slot].free_head
+        while cur != 0 {
+            let n = cur - 1
+            if FREE_RANGES[n].len >= len {
+                return FREE_RANGES[n].base
+            }
+            cur = FREE_RANGES[n].next
+        }
+    }
+    MEMORIES[slot].base
 }
 
 /// Cut `len` bytes out of region `slot` and answer where they are.

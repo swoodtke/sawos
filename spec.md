@@ -962,6 +962,17 @@ tag-to-meaning config is, and where a driver's `UART_BASE` comes from.
   since one `{base, len}` slot cannot hold two remainders.
   The piece is minted with the rights of the handle the split went through,
   not the kind's default set (§3).
+- **A split carries a region's rows to whichever piece covers them.** A row is
+  counted on the region whose bytes it grants: a child's image and stack rows, a
+  `Mapping`'s row, and the rows of any process that maps the region. A cut moves
+  the rows that lie wholly inside the piece onto it and leaves the rest on the
+  parent, so the piece's range returns to its pool only when no row of any
+  process lies in it (the second zero, below), and a launcher that splits a
+  child's destination and releases the front leaves a husk, not a free range. A
+  cut through the middle of a row is `NoResource` with nothing changed, a status
+  and not a fault: the launcher that holds a child's destination cannot know
+  where the child's segments lie, the answer `map` gives for the same rows. A
+  `Memory` no row names splits as before.
 - **`map(process, access)` installs a protection row and answers with a
   `Mapping`.** It spends `MemoryRight.Map` on the region and `ProcessRight.Map`
   on the target, because possession of bytes must not imply authority over an

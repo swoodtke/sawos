@@ -1,0 +1,167 @@
+// A split does not free bytes an installed mapping covers (spec §2.5).
+//
+// A mapping's row counts on the region it was installed from. A split cuts a
+// front piece off that region: a cut through the middle of the row is refused,
+// and a cut that holds the whole row takes the row with it, so releasing the
+// piece's handle leaves a husk rather than returning bytes a domain still
+// grants.
+//
+//   SOS splitmap: wrote mark                     <- through the first mapping
+//   SOS splitmap: cut through the mapping refused: <status>
+//   SOS splitmap: whole region cut and released while mapped
+//   SOS splitmap: fresh piece shares the bytes=0 <- a region cut from the pool
+//                                                   after the release is not
+//                                                   the bytes the first mapping
+//                                                   still reaches
+//   SOS splitmap: after the unmap, fresh piece carries the mark=1
+//                                                <- the bytes came home when
+//                                                   the row went
+//   SOS splitmap: done
+//
+// "Shares" is the program's own measurement: a byte written through the fresh
+// piece's mapping is read back through the first mapping, so the answer holds
+// where a mapping's address is its memory's own and where it is not.
+//
+// A kernel that left the row counted on the region the front was cut from would
+// return the front to the pool at its release; the fresh piece would be the
+// same bytes and `shares` would be 1.
+//
+// Each leg is a function of its own, for the reason `tests/memory-recycle`
+// gives about root's stack.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
+
+/// One protection unit's worth on either profile, and two of them.
+static PAGE: UInt = 0x1000
+static TWO_PAGES: UInt = 0x2000
+
+static MARK: UInt8 = 0x5A
+static OTHER: UInt8 = 0xA5
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+func poke(addr: UInt, value: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+}
+
+func peek(addr: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+/// A cut of one page through a two-page mapped region.
+func cut_through(system: &System, region: &Memory) -> Result<Void, SosStatus> {
+    match region.split(len: PAGE) {
+        case Ok(piece) -> {
+            let _ = move piece
+            let _ = system.debug_print(
+                "SOS splitmap: cut through the mapping accepted\n")
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS splitmap: cut through the mapping refused: {}\n", why)
+            return
+        },
+    }
+}
+
+/// Cut the whole region off and drop the piece, then take a fresh piece out of
+/// the pool and say whether it is the bytes `first_base` still reaches.
+func recycle(proc: &Process, region: &Memory, pool: &Memory,
+             first_base: UInt) -> Result<Bool, SosStatus> {
+    let whole = try region.split(len: TWO_PAGES)
+    let _ = move whole
+    let fresh = try pool.split(len: TWO_PAGES)
+    let mapping = try proc.map(memory: &fresh, access: RW)
+    let base = try mapping.base()
+    poke(base, OTHER)
+    let shares = peek(first_base) == OTHER
+    try mapping.unmap()
+    return shares
+}
+
+func report(system: &System, shares: Bool) {
+    if shares {
+        let _ = system.debug_print(
+            "SOS splitmap: fresh piece shares the bytes=1\n")
+    } else {
+        let _ = system.debug_print(
+            "SOS splitmap: fresh piece shares the bytes=0\n")
+    }
+}
+
+func report_home(system: &System, carries: Bool) {
+    if carries {
+        let _ = system.debug_print(
+            "SOS splitmap: after the unmap, fresh piece carries the mark=1\n")
+    } else {
+        let _ = system.debug_print(
+            "SOS splitmap: after the unmap, fresh piece carries the mark=0\n")
+    }
+}
+
+/// Take a piece the size of the husk and say whether it carries the mark the
+/// first mapping wrote.
+func carries_mark(proc: &Process, pool: &Memory) -> Result<Bool, SosStatus> {
+    let again = try pool.split(len: TWO_PAGES)
+    let mapping = try proc.map(memory: &again, access: RW)
+    let base = try mapping.base()
+    let carries = peek(base) == MARK
+    try mapping.unmap()
+    return carries
+}
+
+func run(system: &System, proc: &Process,
+         pool: &Memory) -> Result<Void, SosStatus> {
+    let region = try pool.split(len: TWO_PAGES)
+    let first = try proc.map(memory: &region, access: RW)
+    let first_base = try first.base()
+    poke(first_base, MARK)
+    let _ = system.debug_print("SOS splitmap: wrote mark\n")
+
+    try cut_through(&system, &region)
+
+    let shares = try recycle(&proc, &region, &pool, first_base)
+    let _ = system.debug_print(
+        "SOS splitmap: whole region cut and released while mapped\n")
+    report(&system, shares)
+
+    try first.unmap()
+    let carries = try carries_mark(&proc, &pool)
+    report_home(&system, carries)
+    return
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS splitmap: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS splitmap: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_memory() else {
+        let _ = system.debug_print(
+            "SOS splitmap: pool record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc, &pool) catch {
+        print("SOS splitmap: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS splitmap: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}

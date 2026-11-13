@@ -1,0 +1,276 @@
+// A split does not free bytes a live process's rows cover (spec §2.5).
+//
+// A child's image and stack rows count on the `Memory` it was created in. A
+// launcher that splits that `Memory` cuts a front piece off it, and the rows
+// that lie in the piece go with it, so releasing the piece's handle leaves a
+// husk and does not return the child's bytes to the pool while it runs.
+//
+//   SOS splitlive: child parked                  <- the child printed nothing
+//                                                   yet and waits for `go`
+//   SOS splitlive: front piece cut               <- one cut, wholly above the
+//                                                   child's segments and wholly
+//                                                   below its stack
+//   SOS splitlive: front piece released
+//   SOS splitlive: next piece taken and mapped
+//   SOS splitlive: while the child lives, witness found=0
+//                                                <- what a third party can see:
+//                                                   the next piece is not the
+//                                                   child's bytes
+//   SOS livedata: pattern intact                 <- the child's own voice
+//   SOS splitlive: child ended status=65607
+//   SOS splitlive: after its death, witness found=1
+//                                                <- the child's bytes came
+//                                                   home; a fresh piece of the
+//                                                   same size is them, and
+//                                                   carries the pattern
+//   SOS splitlive: done
+//
+// "Found" is the program's own measurement: the child's pattern is four words
+// that appear nowhere else, and the launcher looks for them through a mapping
+// of the piece it was given. No address is asserted, only whether the pattern
+// is in the bytes a piece names.
+//
+// A kernel that counted the child's rows on the region it was created in and
+// left them there when the front was cut would return the front to the pool at
+// its release. The second cut would be the same bytes, the scan would find the
+// pattern while the child lives, and the launcher's write through its mapping
+// would reach the child's data: the child then reports `pattern changed`.
+//
+// The cut is `CUT` bytes: a power of two so the mapping fits a protection
+// entry on every profile, larger than the child's image (its arena is small,
+// `tests/child-live-data`) and smaller than half the region, so the second cut
+// is served by the remainder whether or not the first range came back.
+//
+// Each leg is a function of its own, for the reason `tests/memory-recycle`
+// gives about root's stack.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, Event, SosStatus,
+            SystemRight}
+
+/// The child's region is this long on every profile, and the kernel's stack
+/// grant takes the top `STACK_LEN` of it.
+static REGION_LEN: UInt = 0x40000
+
+/// The front piece's length.
+static CUT: UInt = 0x10000
+
+/// The tags the child's gives travel under.
+static TAG_BOOT: UInt = 11
+static TAG_READY: UInt = 51
+static TAG_GO: UInt = 52
+
+/// The child's pattern, as it writes it, and the word the launcher writes over
+/// its first.
+static W0: UInt32 = 0x51AB_C0DE
+static W1: UInt32 = 0x0BAD_F00D
+static W2: UInt32 = 0x1357_9BDF
+static W3: UInt32 = 0x2468_ACE0
+static CLOBBER: UInt32 = 0xDEAD_BEEF
+
+/// What `Exited` with the child's intact verdict reads as through the status
+/// word: `Exited` in the high half, the code in the low.
+static STATUS_INTACT: UInt = 65_607
+
+static NOT_FOUND: Int = -1
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The most turns root yields waiting on the child.
+static MAX_TURNS: Int = 100000
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+func peek(addr: UInt) unsafe -> UInt32 {
+    UnsafeMemory<UInt32, Normal>(addr).read()
+}
+
+func poke(addr: UInt, value: UInt32) unsafe {
+    UnsafeMemory<UInt32, Normal>(addr).write(value)
+}
+
+/// The byte offset in `[base, base + CUT)` where the child's four words begin,
+/// or `NOT_FOUND`.
+func find_witness(base: UInt) unsafe -> Int {
+    var off: UInt = 0
+    while off + 16 <= CUT {
+        if peek(base + off) == W0 && peek(base + off + 4) == W1 &&
+           peek(base + off + 8) == W2 && peek(base + off + 12) == W3 {
+            return off as Int
+        }
+        off = off + 4
+    }
+    NOT_FOUND
+}
+
+/// Yield until `event` has been signalled.
+func await_event(proc: &Process, event: &Event) -> Result<Void, SosStatus> {
+    let me = try proc.thread_self()
+    var turns = 0
+    while turns < MAX_TURNS {
+        let bits = try event.receive()
+        if bits != 0 {
+            return
+        }
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    return BUG
+}
+
+/// Yield until `child` has ended and answer its status word.
+func await_end(proc: &Process, child: &Process) -> Result<UInt, SosStatus> {
+    let me = try proc.thread_self()
+    var turns = 0
+    while turns < MAX_TURNS {
+        let status = try child.get_status()
+        if status != 0 {
+            return status
+        }
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    return BUG
+}
+
+/// Give `child` a masked System and the two Events, and start it.
+func launch(system: &System, child: &Process, ready: &Event,
+            go: &Event) -> Result<Void, SosStatus> {
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let ready_sibling = try ready.mint()
+    try child.give(event: move ready_sibling, tag: TAG_READY) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let go_sibling = try go.mint()
+    try child.give(event: move go_sibling, tag: TAG_GO) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return
+}
+
+/// Take a piece of `CUT` bytes off `dest`, map it into this process and say
+/// whether the child's pattern is in it. With `clobber` set the first word of
+/// the pattern is overwritten when found.
+func look(proc: &Process, dest: &Memory,
+         clobber: Bool) -> Result<Bool, SosStatus> {
+    let piece = try dest.split(len: CUT)
+    let mapping = try proc.map(memory: &piece, access: RW)
+    let base = try mapping.base()
+    let at = find_witness(base)
+    if at != NOT_FOUND && clobber {
+        poke(base + (at as UInt), CLOBBER)
+    }
+    try mapping.unmap()
+    return at != NOT_FOUND
+}
+
+func report(system: &System, found: Bool, while_alive: Bool) {
+    if while_alive {
+        if found {
+            let _ = system.debug_print(
+                "SOS splitlive: while the child lives, witness found=1\n")
+        } else {
+            let _ = system.debug_print(
+                "SOS splitlive: while the child lives, witness found=0\n")
+        }
+    } else {
+        if found {
+            let _ = system.debug_print(
+                "SOS splitlive: after its death, witness found=1\n")
+        } else {
+            let _ = system.debug_print(
+                "SOS splitlive: after its death, witness found=0\n")
+        }
+    }
+}
+
+/// The whole sequence against one child.
+func run(system: &System, proc: &Process, image: &Memory,
+         dest: &Memory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &dest)
+    let ready = try proc.event_create()
+    let go = try proc.event_create()
+    try launch(&system, &child, &ready, &go)
+    try await_event(&proc, &ready)
+    let _ = system.debug_print("SOS splitlive: child parked\n")
+
+    // The cut and the release. The front piece's range is the low part of the
+    // child's region: every segment, and none of the stack.
+    let front = try dest.split(len: CUT)
+    let _ = system.debug_print("SOS splitlive: front piece cut\n")
+    let _ = move front
+    let _ = system.debug_print("SOS splitlive: front piece released\n")
+
+    // The next piece of the same size, and whatever it holds.
+    let alive = try look(&proc, &dest, true)
+    let _ = system.debug_print("SOS splitlive: next piece taken and mapped\n")
+    report(&system, alive, true)
+
+    try go.signal(1)
+    let status = try await_end(&proc, &child)
+    print("SOS splitlive: child ended status={}\n", status)
+    if status != STATUS_INTACT {
+        return BUG
+    }
+
+    let after = try look(&proc, &dest, false)
+    report(&system, after, false)
+    return
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS splitlive: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var image_record = try proc.boot_handle_next() catch {
+        print("SOS splitlive: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest_record = try proc.boot_handle_next() catch {
+        print("SOS splitlive: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image = image_record.take_memory() else {
+        let _ = system.debug_print(
+            "SOS splitlive: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest = dest_record.take_memory() else {
+        let _ = system.debug_print(
+            "SOS splitlive: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc, &image, &dest) catch {
+        print("SOS splitlive: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS splitlive: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
