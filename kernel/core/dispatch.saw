@@ -287,6 +287,8 @@ import kcore.process.{
     alloc_process,
     assign_pid,
     link_process,
+    record_above_pid,
+    record_of_pid,
     copy_in,
     copy_in_check,
     copy_out,
@@ -452,7 +454,105 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
             }
             interrupt_bind(p, arg0)
         },
+        // The walk and the lookup by pid. Each reads a pid from the doubleword
+        // at `arg0`; the right is checked before the address is read.
+        case ProcessNext -> {
+            if not obj.allows(SystemRight.ProcessObserve) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_next(p, arg0)
+        },
+        case ProcessByPid -> {
+            if not obj.allows(SystemRight.ProcessObserve) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_by_pid(p, arg0)
+        },
     }
+}
+
+/// Bytes in the doubleword `ProcessNext` and `ProcessByPid` take the address
+/// of: a pid is 64 bits on every profile.
+static PID_BYTES: UInt = 8
+
+static_assert(sizeof<UInt64>() == 8, "a pid is one doubleword")
+
+/// Mint `p` a Process handle onto record `r`: the observe set, capped by `p`'s
+/// Process ceiling, as the sender handle is (`pipe_request_sender`). Neither
+/// op that calls this takes a keep mask. `NO_HANDLE` is the mint's refusal, and
+/// nothing is referenced then (`mint_refusal` says which status it is).
+///
+/// The new handle is a reference on the record, counted as
+/// `SystemOp.ProcessSelf`'s is, so a `Gone` record stays held and a `Created`
+/// process is not torn down for want of a name while the handle lives.
+func mint_observe(p: Int, r: Int) unsafe -> UInt {
+    let handle = mint_capped(p, ObjType.Process, process_observe_rights(), r)
+    if handle != NO_HANDLE {
+        ref_object(ObjType.Process, r)
+    }
+    handle
+}
+
+/// Read the pid in the doubleword at `src` in `p`'s memory. An address that is
+/// misaligned or outside the caller's memory terminates it, as at every copy
+/// door.
+func read_pid(p: Int, src: UInt) unsafe -> UInt64 {
+    var pid: UInt64 = 0
+    if let why = copy_in(p, ((&var pid) as UnsafePointer<UInt64>) as UInt, src,
+                         PID_BYTES) {
+        fault_process(p, why)
+    }
+    pid
+}
+
+/// `SystemOp.ProcessNext` (spec §2.8): answer the process with the smallest pid
+/// above the cursor in the doubleword at `at`, and write its pid back.
+///
+/// The answers come in a fixed order. The cursor is read, and the doubleword
+/// must lie in writable memory as well, because the op writes it: a refused
+/// address terminates the caller before anything is looked up. The end of the
+/// walk is `Drained`, which mints nothing and leaves the doubleword as it was.
+/// Then the mint, whose refusal also leaves it as it was, so a cursor never
+/// passes a process the caller got no handle for. The pid is written only once
+/// the handle exists.
+func process_next(p: Int, at: UInt) unsafe -> SyscallResult {
+    let cursor = read_pid(p, at)
+    if let why = copy_out_check(p, at, PID_BYTES) {
+        fault_process(p, why)
+    }
+    let r = record_above_pid(cursor)
+    if r == NO_PROCESS {
+        return op_status(SosStatus.Drained)
+    }
+    let handle = mint_observe(p, r)
+    if handle == NO_HANDLE {
+        return op_status(mint_refusal(p))
+    }
+    var next = PROCESS_RECORDS[r].pid
+    if let why = copy_out(p, at, ((&var next) as UnsafePointer<UInt64>) as UInt,
+                          PID_BYTES) {
+        fault_process(p, why)
+    }
+    op_value(handle)
+}
+
+/// `SystemOp.ProcessByPid` (spec §2.8): answer the process the pid in the
+/// doubleword at `at` names. The doubleword is only read.
+///
+/// A pid the record table does not hold is `Revoked` and mints nothing: it is
+/// data the caller was passed, so it is a status and not a fault, zero
+/// included.
+func process_by_pid(p: Int, at: UInt) unsafe -> SyscallResult {
+    let pid = read_pid(p, at)
+    let r = record_of_pid(pid)
+    if r == NO_PROCESS {
+        return op_status(SosStatus.Revoked)
+    }
+    let handle = mint_observe(p, r)
+    if handle == NO_HANDLE {
+        return op_status(mint_refusal(p))
+    }
+    op_value(handle)
 }
 
 /// Install a read-only row over the published stats region in `p`'s own domain

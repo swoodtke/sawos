@@ -629,6 +629,14 @@ CHILD_PID_SERVER_PKG = os.path.join(TESTS_DIR, "child-pid-server")
 CHILD_PID_FORWARD_PKG = os.path.join(TESTS_DIR, "child-pid-forward")
 CHILD_PID_FAR_PKG = os.path.join(TESTS_DIR, "child-pid-far")
 
+# The process walk and the lookup by pid (spec §2.8). `child-walk-idle` links
+# at the second child address, so it is listed second where it appears.
+PROCESS_WALK_PKG = os.path.join(TESTS_DIR, "process-walk")
+PROCESS_WALK_CEILING_PKG = os.path.join(TESTS_DIR, "process-walk-ceiling")
+PROCESS_WALK_GATE_PKG = os.path.join(TESTS_DIR, "process-walk-gate")
+CHILD_WALK_IDLE_PKG = os.path.join(TESTS_DIR, "child-walk-idle")
+CHILD_WALK_FAULT_PKG = os.path.join(TESTS_DIR, "child-walk-fault")
+
 # Clock and Timer objects. What an object answers and whether a wait parks are
 # separate questions, so they get separate packages: a scheduling bug cannot
 # hide behind an arithmetic one.
@@ -7383,6 +7391,117 @@ TEST_CASES = [
                        "SOS pidrow: a create reuses the body and renames "
                        "the row",
                        "SOS pidrow: done"],
+        "expect_clean_exit": True,
+    },
+    # =========================================================================
+    # The process walk and the lookup by pid
+    # =========================================================================
+    {
+        # Root keeps one running process that nothing names and one dead
+        # process it still holds, and walks the machine's processes from
+        # cursor 0: root, the running one and the dead one, once each in pid
+        # order, every handle reading the pid the cursor names with exactly
+        # the observe set and the status word root reads itself. The walk ends
+        # in `Drained` after the last pid. Two walkers interleave
+        # while a process is created between their steps: both reach it, in
+        # the same order, before `Drained`. The lookup answers a running
+        # process, a dead one still held and a created one never started
+        # (whose status word reads running), and answers `Revoked` for a pid
+        # never assigned, for zero, and for the never-started one after root
+        # lets it go; a handle the lookup minted keeps a dead record answered
+        # once the creator's handle is gone. No pid's number is asserted
+        # beyond root's 1.
+        "name": "process_walk",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_WALK_PKG,
+        "children": [CHILD_BYE_PKG, CHILD_WALK_IDLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS bye: exiting",
+                       "SOS walk: a walk from zero answers every process "
+                       "once, in order",
+                       "SOS walk: every handle carries exactly the observe "
+                       "set",
+                       "SOS walk: the walk ends in Drained after the last "
+                       "pid",
+                       "SOS walk: a process created mid-walk is reached "
+                       "before Drained",
+                       "SOS walk: a second walker shares no state with the "
+                       "first",
+                       "SOS walk: lookup answers a running process",
+                       "SOS walk: lookup answers a dead process still held",
+                       "SOS walk: lookup answers a process never started",
+                       "SOS walk: lookup of a pid never assigned is Revoked",
+                       "SOS walk: lookup of zero is Revoked",
+                       "SOS walk: a reclaimed process is not answered",
+                       "SOS walk: the loop the sysapi documents ends on "
+                       "Drained",
+                       "SOS walk: a held observe handle keeps a dead record "
+                       "answered",
+                       "SOS walk: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The Process ceiling caps what the walk and the lookup mint, on the
+        # sender handle's terms: root asks for a handle onto itself by each
+        # under three ceilings it sets on itself. The default ceiling leaves
+        # the observe set (1049600); a ceiling of `Wait | Exit` leaves `Wait`
+        # (1024); an empty ceiling still succeeds and the handles carry
+        # nothing, while the walk's cursor still reads root's pid.
+        "name": "process_walk_ceiling",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_WALK_CEILING_PKG,
+        "expect_out": ["{banner}",
+                       "SOS walkceil: default ceiling",
+                       "SOS walkceil: a ceiling with Wait and Exit",
+                       "SOS walkceil: an empty ceiling",
+                       "SOS walkceil: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The faults and refusals of the two ops, one child launched per role
+        # and its ending read in the status word. A System handle without
+        # `ProcessObserve` faults the caller (`AccessDenied`) on either op. An
+        # address that is not word-aligned is `BadAlign` and one outside the
+        # process `BadBuffer`, for the cursor and for the pid. A cursor in
+        # read-only memory is `BadBuffer` too, since the op writes it back,
+        # while a pid there is read and answered. The end of a
+        # walk answers `Drained` and leaves the cursor as it was. A caller
+        # with a full handle table is refused for the table's reason, its
+        # cursor still holds what it held, and once a slot is free the same
+        # cursor answers root and is written with root's pid. A lookup at a
+        # full Handle row is `QuotaExceeded` and mints nothing, and at a full
+        # table `NoResource`. A step refused onto a dead record leaves it
+        # unreferenced: once its launcher lets go it is reclaimed, so neither
+        # the lookup nor the walk answers it.
+        "name": "process_walk_gate",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_WALK_GATE_PKG,
+        "children": [CHILD_WALK_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS walkgate: ProcessNext without ProcessObserve",
+                       "SOS walkgate: ProcessByPid without ProcessObserve",
+                       "SOS walkgate: ProcessNext with a misaligned cursor",
+                       "SOS walkgate: ProcessByPid with a misaligned pid",
+                       "SOS walkgate: ProcessNext with a cursor outside the "
+                       "process",
+                       "SOS walkgate: ProcessByPid with a pid outside the "
+                       "process",
+                       "SOS walkgate: ProcessNext with a cursor in read-only "
+                       "memory",
+                       "SOS walkgate: ProcessByPid reads a pid from read-only "
+                       "memory",
+                       "SOS walkgate: the end of a walk leaves the cursor "
+                       "as it was",
+                       "SOS walkgate: a refused mint writes nothing to the "
+                       "cursor",
+                       "SOS walkgate: a refused lookup answers QuotaExceeded",
+                       "SOS walkgate: a refused step takes no reference on a "
+                       "dead record",
+                       "SOS walkgate: a full table refuses both ops with "
+                       "NoResource",
+                       "SOS walkgate: done"],
         "expect_clean_exit": True,
     },
 ]

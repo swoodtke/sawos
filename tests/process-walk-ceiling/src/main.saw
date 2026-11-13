@@ -1,0 +1,98 @@
+// What a Process ceiling does to the handles the walk and the lookup mint
+// (spec §2.7, §2.8).
+//
+// Root asks for a handle onto itself, by the walk and by the lookup, under
+// three ceilings it sets on itself in turn, and reads the rights each handle
+// carries:
+//
+//   SOS walkceil: default ceiling
+//                     the observe set, `Wait | Stats` (1024 + 1048576 =
+//                     1049600), whose pid the handle reads
+//   SOS walkceil: a ceiling with Wait and Exit
+//                     the intersection, `Wait` (1024): `Exit` is the ceiling's
+//                     and not the observe set's, so it is not carried
+//   SOS walkceil: an empty ceiling
+//                     the ops still succeed and the handles carry no rights;
+//                     the walk's cursor still reads root's pid, which is how a
+//                     tool whose handles can read nothing walks on
+//   SOS walkceil: done
+//
+// Nothing asserts a pid beyond root's 1.
+
+import sos.{System, Process, SosStatus, ProcessRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static ROOT_PID: UInt64 = 1
+
+static OBSERVE: UInt32 = ProcessRight.Wait | ProcessRight.Stats
+
+/// A ceiling that holds one right of the observe set and one outside it.
+static WAIT_AND_EXIT: UInt32 = ProcessRight.Wait | ProcessRight.Exit
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS walkceil: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS walkceil: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS walkceil: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    let _ = system.debug_print("SOS walkceil: default ceiling\n")
+    try expect_rights(&system, OBSERVE)
+    let seen = try system.process_by_pid(pid: ROOT_PID)
+    let stats = try seen.stats()
+    if stats.pid != ROOT_PID {
+        return BUG
+    }
+    let _ = move seen
+
+    // The ceiling is the table's, root's: it caps what the kernel mints into
+    // root's table from now on.
+    try proc.restrict_rights(process: WAIT_AND_EXIT)
+    let _ = system.debug_print("SOS walkceil: a ceiling with Wait and Exit\n")
+    try expect_rights(&system, ProcessRight.Wait)
+
+    try proc.restrict_rights(process: 0)
+    let _ = system.debug_print("SOS walkceil: an empty ceiling\n")
+    try expect_rights(&system, 0)
+    return
+}
+
+/// The walk's first step and the lookup of root each answer a handle carrying
+/// exactly `want`, and the walk's cursor reads root's pid.
+func expect_rights(system: &System, want: UInt32) -> Result<Void, SosStatus> {
+    let step = try system.process_next(after: 0)
+    let (walked, pid) = move step
+    if pid != ROOT_PID {
+        return BUG
+    }
+    let walked_rights = try walked.rights()
+    if walked_rights != want {
+        print("SOS walkceil: the walk's handle carries {}\n", walked_rights)
+        return BUG
+    }
+    let looked = try system.process_by_pid(pid: ROOT_PID)
+    let looked_rights = try looked.rights()
+    if looked_rights != want {
+        print("SOS walkceil: the lookup's handle carries {}\n", looked_rights)
+        return BUG
+    }
+    return
+}

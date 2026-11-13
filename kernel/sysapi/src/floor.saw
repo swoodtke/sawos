@@ -215,6 +215,47 @@ public func sos_system_process_create(handle: UInt, image: UInt, memory: UInt,
                  ceiling_source, value_out)
 }
 
+/// Walk the machine's processes one step: read a cursor from the doubleword at
+/// `cursor`, answer a Process handle onto the process with the smallest pid
+/// above it through `value_out`, and write that pid back over the cursor.
+/// Requires `SystemRight.ProcessObserve`.
+///
+/// A walk starts from a cursor of 0. The end is `SosStatus.Drained`, which
+/// leaves the cursor as it was; it is not final, because the same cursor
+/// answers a process created since. The handle carries the observe set,
+/// `ProcessRight.Wait | ProcessRight.Stats`, intersected with the caller's
+/// Process ceiling. A caller at its handle quota gets `SosStatus.QuotaExceeded`
+/// and a full handle table is `SosStatus.NoResource`, and a refusal writes
+/// nothing, so the same cursor asks again. A `cursor` that is misaligned or
+/// outside this process's writable memory terminates it.
+@export("sos_system_process_next")
+public func sos_system_process_next(
+    handle: UInt,
+    cursor: UnsafePointer<UInt64>,
+    value_out: UnsafePointer<UInt>
+) unsafe -> UInt {
+    sos_syscall3(handle, SystemOp.ProcessNext as UInt, cursor as UInt, 0, 0,
+                 value_out)
+}
+
+/// Look a process up by pid: read a pid from the doubleword at `pid`, and
+/// answer a Process handle onto the process it names through `value_out`.
+/// Requires `SystemRight.ProcessObserve`.
+///
+/// A pid the record table does not hold (reclaimed, never assigned, or zero)
+/// is `SosStatus.Revoked` and mints nothing. The handle and the other answers
+/// are `sos_system_process_next`'s; the doubleword is only read, and a `pid`
+/// that is misaligned or outside this process's memory terminates it.
+@export("sos_system_process_by_pid")
+public func sos_system_process_by_pid(
+    handle: UInt,
+    pid: UnsafePointer<UInt64>,
+    value_out: UnsafePointer<UInt>
+) unsafe -> UInt {
+    sos_syscall3(handle, SystemOp.ProcessByPid as UInt, pid as UInt, 0, 0,
+                 value_out)
+}
+
 /// Give the kernel a Memory region to back the slab `kind` names.
 /// Requires `SystemRight.SlabDonate`.
 ///
@@ -570,13 +611,17 @@ public func sos_system_clock_get(handle: UInt, type: UInt,
     sos_syscall3(handle, SystemOp.ClockGet as UInt, type, 0, 0, value_out)
 }
 
-// There is no stub for `SystemOp.TierGet`, nor for `SystemOp.StatsRegionMap`.
-// An `@export`ed stub is a linker GC root (it lands in `llvm.used`), so it
-// links into every process image whether or not anything calls it, and every
-// such export grows every image: a process that calls none of the stubs here
-// still carries all of them. Making the C altitude opt-in per package is a
-// separate piece of work. The typed `System.tier()` and
-// `System.stats_region_map()` are the surface.
+// There is no stub for `SystemOp.TierGet`, nor for `SystemOp.StatsRegionMap`:
+// the typed `System.tier()` and `System.stats_region_map()` are the surface.
+//
+// A stub is added when something needs the raw door: a case that passes an
+// address no typed call can build, or a C caller. At the pinned toolchain a
+// stub no image calls costs that image nothing. The object file carries each
+// export in a section of its own with no retain flag, and Blade links with
+// `--gc-sections`, so the linker drops the ones nothing references. That is
+// not what sawlang's spec says of an export, which is kept at the link; were
+// the compiler brought into line with it, every stub would link into every
+// image, and a stub would cost each image its size.
 
 /// Read the clock into `buf`, a copy-out record because a nanosecond count is
 /// 64 bits and one profile's registers are not. Requires `ClockRight.Read`.

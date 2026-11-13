@@ -1,0 +1,31 @@
+// Test child: a process that stays alive with nothing naming it, for
+// `process_walk`.
+//
+// It makes an Event and a Waiter through its own Process handle, attaches the
+// Event, and then releases that handle: from then on no handle in any table
+// names this process's record, and it is running. It parks on the Waiter and
+// never wakes, because nothing signals the Event. A running process is never
+// reclaimed however far its count falls (spec §2.7), which is what the walk
+// is asked to answer.
+
+import sos.{System}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        return
+    }
+    let event = try proc.event_create() catch {
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        return
+    }
+    try waiter.add(event: &event, key: 1) catch {
+        return
+    }
+    let _ = move proc
+    let _ = waiter.wait()
+}

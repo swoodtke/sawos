@@ -1,0 +1,362 @@
+// The process walk and the lookup by pid (spec §2.8).
+//
+// Root launches two processes and keeps them in three states: one that is
+// running and that nothing names (`child-walk-idle` releases its own handle,
+// and root releases the creator's), and one that has exited and that root
+// still holds. It then walks the machine's processes from cursor 0 and looks
+// each up by pid. No pid's number is asserted beyond root's 1: the case reads
+// each one through `Stats`, and asserts relations between them.
+//
+//   SOS walk: a walk from zero answers every process once, in order
+//                     root, the running process and the dead one. The idle
+//                     process, whose record nothing names, is
+//                     answered; so is the dead one root still holds; each
+//                     step's pid is the one `Stats` reads through its handle,
+//                     and the status words match what root reads itself
+//   SOS walk: every handle carries exactly the observe set
+//   SOS walk: the walk ends in Drained after the last pid
+//                     that the end leaves the cursor as it was is asserted by
+//                     `process_walk_gate`, which reads the doubleword back
+//   SOS walk: a process created mid-walk is reached before Drained
+//                     it gets a pid above every assigned one, and its status
+//                     word reads running although it was never started
+//   SOS walk: a second walker shares no state with the first
+//                     two walkers interleave and answer the same sequence
+//   SOS walk: lookup answers a running process
+//   SOS walk: lookup answers a dead process still held
+//   SOS walk: lookup answers a process never started
+//   SOS walk: lookup of a pid never assigned is Revoked
+//   SOS walk: lookup of zero is Revoked
+//   SOS walk: a reclaimed process is not answered
+//                     the never-started process, once root lets it go, is
+//                     torn down and its record reclaimed: the lookup answers
+//                     Revoked and the walk no longer reaches it
+//   SOS walk: the loop the sysapi documents ends on Drained
+//                     `System.process_next`'s doc example, compiled here
+//   SOS walk: a held observe handle keeps a dead record answered
+//                     the handle a lookup minted is a name: with the creator's
+//                     handle gone it still holds the record, and once it is
+//                     released too the pid answers Revoked
+//   SOS walk: done
+
+import sos.{System, Process, Memory, Waiter, SosStatus, SystemRight,
+            ProcessRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// Root's pid, which is fixed by the spec.
+static ROOT_PID: UInt64 = 1
+
+static TAG_BOOT: UInt = 21
+static KEY_DEATH: UInt = 6
+
+/// What a launched process may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The rights of every handle the walk and the lookup mint: the observe set.
+static OBSERVE: UInt32 = ProcessRight.Wait | ProcessRight.Stats
+
+/// A pid no process was ever assigned: the counter only reaches it after
+/// 2^64 creates.
+static NEVER_ASSIGNED: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS walk: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS walk: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS walk: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The boot regions come blobs first and destinations second, in the order
+    // the case lists its children: the exiting child, then the idle one.
+    var bye_img_rec = try proc.boot_handle_next()
+    var idle_img_rec = try proc.boot_handle_next()
+    var bye_ram_rec = try proc.boot_handle_next()
+    var idle_ram_rec = try proc.boot_handle_next()
+    guard let bye_img = bye_img_rec.take_memory() else { return BUG }
+    guard let idle_img = idle_img_rec.take_memory() else { return BUG }
+    guard let bye_ram = bye_ram_rec.take_memory() else { return BUG }
+    guard let idle_ram = idle_ram_rec.take_memory() else { return BUG }
+
+    // The status word of a process that is running, as root reads its own.
+    let running = try proc.get_status()
+
+    // The idle process first, so its pid is the lower of the two. Root lets
+    // its own handle go at once: nothing names the process, and it runs.
+    let idle = try launch(&system, &idle_img, &idle_ram)
+    let idle_stats = try idle.stats()
+    let idle_pid = idle_stats.pid
+    let _ = move idle
+
+    let bye = try launch(&system, &bye_img, &bye_ram)
+    let bye_stats = try bye.stats()
+    let bye_pid = bye_stats.pid
+    try wait_for_death(&proc, &bye)
+    let dead = try bye.get_status()
+    if dead == running || idle_pid <= ROOT_PID || bye_pid <= idle_pid {
+        return BUG
+    }
+
+    // A walk from zero: every process the table holds, once, in pid order.
+    var after: UInt64 = 0
+    after = try step_expect(&system, after, ROOT_PID, running)
+    after = try step_expect(&system, after, idle_pid, running)
+    after = try step_expect(&system, after, bye_pid, dead)
+    let _ = system.debug_print(
+        "SOS walk: a walk from zero answers every process once, in order\n")
+    let _ = system.debug_print(
+        "SOS walk: every handle carries exactly the observe set\n")
+    try expect_drained(&system, after)
+    if after != bye_pid {
+        return BUG
+    }
+    let _ = system.debug_print(
+        "SOS walk: the walk ends in Drained after the last pid\n")
+
+    // Two walkers, interleaved, and a process created between their steps.
+    var first: UInt64 = 0
+    var second: UInt64 = 0
+    first = try step_expect(&system, first, ROOT_PID, running)
+    second = try step_expect(&system, second, ROOT_PID, running)
+    let fresh = try system.process_create(image: &bye_img, memory: &bye_ram)
+    let fresh_stats = try fresh.stats()
+    let fresh_pid = fresh_stats.pid
+    if fresh_pid <= bye_pid {
+        return BUG
+    }
+    first = try finish_walk(&system, first, idle_pid, bye_pid, fresh_pid,
+                            running, dead)
+    let _ = system.debug_print(
+        "SOS walk: a process created mid-walk is reached before Drained\n")
+    second = try finish_walk(&system, second, idle_pid, bye_pid, fresh_pid,
+                             running, dead)
+    if first != fresh_pid || second != fresh_pid {
+        return BUG
+    }
+    let _ = system.debug_print(
+        "SOS walk: a second walker shares no state with the first\n")
+
+    // The lookup, for each state a process can be in.
+    try expect_lookup(&system, idle_pid, running)
+    let _ = system.debug_print("SOS walk: lookup answers a running process\n")
+    try expect_lookup(&system, bye_pid, dead)
+    let _ = system.debug_print(
+        "SOS walk: lookup answers a dead process still held\n")
+    let fresh_status = try fresh.get_status()
+    if fresh_status != running {
+        return BUG
+    }
+    try expect_lookup(&system, fresh_pid, running)
+    let _ = system.debug_print(
+        "SOS walk: lookup answers a process never started\n")
+    try expect_revoked(&system, NEVER_ASSIGNED)
+    let _ = system.debug_print(
+        "SOS walk: lookup of a pid never assigned is Revoked\n")
+    try expect_revoked(&system, 0)
+    let _ = system.debug_print("SOS walk: lookup of zero is Revoked\n")
+
+    // Letting go of the only name a never-started process has tears it down.
+    let _ = move fresh
+    try expect_revoked(&system, fresh_pid)
+    try expect_drained(&system, bye_pid)
+    let _ = system.debug_print(
+        "SOS walk: a reclaimed process is not answered\n")
+
+    try walk(&system)
+    let _ = system.debug_print(
+        "SOS walk: the loop the sysapi documents ends on Drained\n")
+
+    // A handle a lookup minted holds a dead record with the creator's gone.
+    let held = try system.process_by_pid(pid: bye_pid)
+    let _ = move bye
+    try expect_lookup(&system, bye_pid, dead)
+    let _ = move held
+    try expect_revoked(&system, bye_pid)
+    let _ = system.debug_print(
+        "SOS walk: a held observe handle keeps a dead record answered\n")
+    return
+}
+
+/// Make a process from `image` and `ram`, give it a System handle and start
+/// it. Answers the launcher's handle.
+func launch(system: &System, image: &Memory,
+            ram: &Memory) -> Result<Process, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return move child
+}
+
+/// Park until the process `child` names ends.
+func wait_for_death(proc: &Process,
+                    child: &Process) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(_) -> {
+            if key != KEY_DEATH { return BUG }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// One step of a walk from `after`: it must answer the process with pid `want`,
+/// and the handle must read that pid, carry exactly the observe set and read
+/// the status word `status`. Answers the new cursor.
+func step_expect(system: &System, after: UInt64, want: UInt64,
+                 status: UInt) -> Result<UInt64, SosStatus> {
+    let step = try system.process_next(after: after)
+    let (found, pid) = move step
+    if pid != want {
+        print("SOS walk: a step after {} answered {}, wanted {}\n", after, pid,
+              want)
+        return BUG
+    }
+    try check_handle(&found, want, status)
+    return pid
+}
+
+/// The rest of a walk that has answered root and nothing else: the idle, dead
+/// and fresh processes in order, then Drained. Answers the last cursor.
+func finish_walk(system: &System, after: UInt64, idle_pid: UInt64,
+                 bye_pid: UInt64, fresh_pid: UInt64, running: UInt,
+                 dead: UInt) -> Result<UInt64, SosStatus> {
+    var cursor = after
+    cursor = try step_expect(&system, cursor, idle_pid, running)
+    cursor = try step_expect(&system, cursor, bye_pid, dead)
+    cursor = try step_expect(&system, cursor, fresh_pid, running)
+    try expect_drained(&system, cursor)
+    return cursor
+}
+
+/// A handle the walk or the lookup answered for pid `want`: it reads that
+/// pid, carries exactly the observe set and reads the status word `status`.
+func check_handle(found: &Process, want: UInt64,
+                  status: UInt) -> Result<Void, SosStatus> {
+    let seen = try found.stats()
+    if seen.pid != want {
+        print("SOS walk: the handle reads pid {}, wanted {}\n", seen.pid, want)
+        return BUG
+    }
+    let rights = try found.rights()
+    if rights != OBSERVE {
+        print("SOS walk: the handle carries {}\n", rights)
+        return BUG
+    }
+    let word = try found.get_status()
+    if word != status {
+        print("SOS walk: the handle reads status {}, wanted {}\n", word, status)
+        return BUG
+    }
+    return
+}
+
+func is_drained(why: SosStatus) -> Bool {
+    match why {
+        case Drained -> true,
+        case _ -> false,
+    }
+}
+
+func is_revoked(why: SosStatus) -> Bool {
+    match why {
+        case Revoked -> true,
+        case _ -> false,
+    }
+}
+
+/// A walk from `after` is over: the answer is `Drained` and mints nothing.
+func expect_drained(system: &System, after: UInt64) -> Result<Void, SosStatus> {
+    match system.process_next(after: after) {
+        case Ok(step) -> {
+            let (found, _) = move step
+            let _ = move found
+            return BUG
+        },
+        case Err(why) -> {
+            if not is_drained(why) {
+                print("SOS walk: the end answered {}\n", why)
+                return BUG
+            }
+        },
+    }
+    return
+}
+
+/// The lookup of `pid` answers a handle that reads it, with the observe set
+/// and the status word `status`.
+func expect_lookup(system: &System, pid: UInt64,
+                   status: UInt) -> Result<Void, SosStatus> {
+    let found = try system.process_by_pid(pid: pid)
+    try check_handle(&found, pid, status)
+    return
+}
+
+/// The lookup of `pid` answers `Revoked` and mints nothing.
+func expect_revoked(system: &System, pid: UInt64) -> Result<Void, SosStatus> {
+    match system.process_by_pid(pid: pid) {
+        case Ok(found) -> {
+            let _ = move found
+            return BUG
+        },
+        case Err(why) -> {
+            if not is_revoked(why) {
+                print("SOS walk: the lookup answered {}\n", why)
+                return BUG
+            }
+        },
+    }
+    return
+}
+
+/// The loop `System.process_next` documents: it ends only on `Drained`, and a
+/// refusal is returned.
+func walk(system: &System) -> Result<Void, SosStatus> {
+    var after: UInt64 = 0
+    var walking = true
+    while walking {
+        match system.process_next(after: after) {
+            case Ok(step) -> {
+                let (proc, pid) = move step
+                after = pid
+                let _ = move proc
+            },
+            case Err(why) -> {
+                match why {
+                    case Drained -> { walking = false },
+                    // A refusal (`QuotaExceeded`, `NoResource`) is not the
+                    // end: the caller releases a handle and asks again with
+                    // the same `after`.
+                    case _ -> { return why },
+                }
+            },
+        }
+    }
+    return
+}

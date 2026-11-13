@@ -1,0 +1,342 @@
+// The faults and refusals of the process walk and the lookup (spec §2.8).
+//
+// Root launches `child-walk-fault` once per role, with a System handle it
+// masks for the role and an Event whose tag names the role, and reads how the
+// child ended in the §8 status word (`Exited` in the high half and the code in
+// the low, or `Faulted` in the high half and the fault reason in the low):
+//
+//   SOS walkgate: ProcessNext without ProcessObserve         `AccessDenied`
+//   SOS walkgate: ProcessByPid without ProcessObserve        `AccessDenied`
+//   SOS walkgate: ProcessNext with a misaligned cursor       `BadAlign`
+//   SOS walkgate: ProcessByPid with a misaligned pid         `BadAlign`
+//   SOS walkgate: ProcessNext with a cursor outside the process
+//                                                            `BadBuffer`
+//   SOS walkgate: ProcessByPid with a pid outside the process
+//                                                            `BadBuffer`
+//   SOS walkgate: ProcessNext with a cursor in read-only memory
+//                                                            `BadBuffer`: the
+//                     op writes the cursor back, so it must be writable
+//   SOS walkgate: ProcessByPid reads a pid from read-only memory
+//                     the lookup only reads it, so the call is answered and
+//                     the child exits with its own OK code
+//   SOS walkgate: the end of a walk leaves the cursor as it was
+//                     the walk answers Drained
+//                     the child exits with its own OK code
+//   SOS walkgate: a refused mint writes nothing to the cursor
+//                     a child with a full handle table is refused for the
+//                     table's reason, its cursor still holds what it held,
+//                     and once a slot is free the same cursor answers root
+//                     and is written with root's pid
+//   SOS walkgate: done
+//
+//   SOS walkgate: a refused lookup answers QuotaExceeded
+//                     a child at its Handle row is refused by the policy
+//                     limit and mints nothing: one slot freed answers the
+//                     lookup once, and it is refused again
+//   SOS walkgate: a refused step takes no reference on a dead record
+//                     a child at its Handle row is refused a step onto a dead
+//                     process root holds; once root lets that handle go the
+//                     record is reclaimed, so neither the lookup nor the walk
+//                     answers it
+//   SOS walkgate: a full table refuses both ops with NoResource
+//                     root fills its own table, whose quota is unlimited, so
+//                     the table refuses; the cursor holds what it held
+//
+// No pid is asserted beyond root's 1, which the child reads.
+
+import sos.{System, Process, Memory, Waiter, SosStatus, SystemRight,
+            sos_handle_mint, sos_system_process_next,
+            sos_system_process_by_pid}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 21
+
+/// Root's pid, which is fixed by the spec.
+static ROOT_PID: UInt64 = 1
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// A keep mask that narrows nothing.
+static KEEP_ALL: UInt = 0xFFFF_FFFF
+
+/// More mints than any handle table holds.
+static MAX_MINTS: Int = 4096
+static KEY_DEATH: UInt = 6
+
+/// The roles `child-walk-fault` knows, by the tag of the Event it is given.
+static ROLE_NEXT_DENIED: UInt = 1
+static ROLE_BYPID_DENIED: UInt = 2
+static ROLE_NEXT_MISALIGNED: UInt = 3
+static ROLE_BYPID_MISALIGNED: UInt = 4
+static ROLE_NEXT_OUTSIDE: UInt = 5
+static ROLE_BYPID_OUTSIDE: UInt = 6
+static ROLE_NEXT_DRAINED: UInt = 7
+static ROLE_NEXT_REFUSED: UInt = 8
+static ROLE_NEXT_READONLY: UInt = 9
+static ROLE_BYPID_READONLY: UInt = 10
+static ROLE_EXIT: UInt = 11
+static ROLE_NEXT_GONE: UInt = 12
+static ROLE_BYPID_REFUSED: UInt = 13
+
+/// Added to the number the second Event's tag carries, so that the tag cannot
+/// meet another in the child's boot set.
+static ARG_BASE: UInt = 1000
+
+/// What the child may ask its System object for, without and with the right
+/// under test.
+static WITHOUT: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                          | SystemRight.Transfer)
+static WITH: UInt32 = WITHOUT | SystemRight.ProcessObserve
+
+/// The §8 status words: `Faulted` in the high half with `AccessDenied` (3),
+/// `BadAlign` (10) and `BadBuffer` (11) in the low, and `Exited` with the
+/// child's OK code (7).
+static DENIED: UInt = 131075
+static MISALIGNED: UInt = 131082
+static OUTSIDE: UInt = 131083
+static OK: UInt = 65543
+
+static_assert((2 * 65536) + 3 == 131075,
+              "a fault word is Faulted in the high bits, then the reason")
+static_assert((2 * 65536) + 10 == 131082,
+              "a fault word is Faulted in the high bits, then the reason")
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+static_assert((1 * 65536) + 7 == 65543,
+              "an exit's status word is Exited in the high bits and the code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS walkgate: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS walkgate: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if not full_table(boot_handle) {
+        let _ = system.debug_print(
+            "SOS walkgate: a full table answered wrongly\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print(
+        "SOS walkgate: a full table refuses both ops with NoResource\n")
+    let _ = system.debug_print("SOS walkgate: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    try run_role(&system, &proc, &image, &ram,
+                 ROLE_NEXT_DENIED, WITHOUT, DENIED)
+    let _ = system.debug_print(
+        "SOS walkgate: ProcessNext without ProcessObserve\n")
+    try run_role(&system, &proc, &image, &ram,
+                 ROLE_BYPID_DENIED, WITHOUT, DENIED)
+    let _ = system.debug_print(
+        "SOS walkgate: ProcessByPid without ProcessObserve\n")
+    try run_role(&system, &proc, &image, &ram,
+                 ROLE_NEXT_MISALIGNED, WITH, MISALIGNED)
+    let _ = system.debug_print(
+        "SOS walkgate: ProcessNext with a misaligned cursor\n")
+    try run_role(&system, &proc, &image, &ram,
+                 ROLE_BYPID_MISALIGNED, WITH, MISALIGNED)
+    let _ = system.debug_print(
+        "SOS walkgate: ProcessByPid with a misaligned pid\n")
+    try run_role(&system, &proc, &image, &ram,
+                 ROLE_NEXT_OUTSIDE, WITH, OUTSIDE)
+    let _ = system.debug_print(
+        "SOS walkgate: ProcessNext with a cursor outside the process\n")
+    try run_role(&system, &proc, &image, &ram,
+                 ROLE_BYPID_OUTSIDE, WITH, OUTSIDE)
+    let _ = system.debug_print(
+        "SOS walkgate: ProcessByPid with a pid outside the process\n")
+    try run_role(&system, &proc, &image, &ram,
+                 ROLE_NEXT_READONLY, WITH, OUTSIDE)
+    let _ = system.debug_print(
+        "SOS walkgate: ProcessNext with a cursor in read-only memory\n")
+    try run_role(&system, &proc, &image, &ram,
+                 ROLE_BYPID_READONLY, WITH, OK)
+    let _ = system.debug_print(
+        "SOS walkgate: ProcessByPid reads a pid from read-only memory\n")
+    try run_role(&system, &proc, &image, &ram,
+                 ROLE_NEXT_DRAINED, WITH, OK)
+    let _ = system.debug_print(
+        "SOS walkgate: the end of a walk leaves the cursor as it was\n")
+    try run_role(&system, &proc, &image, &ram,
+                 ROLE_NEXT_REFUSED, WITH, OK)
+    let _ = system.debug_print(
+        "SOS walkgate: a refused mint writes nothing to the cursor\n")
+    try run_role(&system, &proc, &image, &ram,
+                 ROLE_BYPID_REFUSED, WITH, OK)
+    let _ = system.debug_print(
+        "SOS walkgate: a refused lookup answers QuotaExceeded\n")
+
+    // A step refused onto a dead record must not take a reference on it: once
+    // root lets go of the record's last other name, it is reclaimed.
+    let dead = try launch_wait(&system, &proc, &image, &ram, ROLE_EXIT, 0,
+                               WITHOUT, OK)
+    let dead_stats = try dead.stats()
+    let dead_pid = dead_stats.pid
+    let below = UInt.from(truncating: dead_pid - 1) + ARG_BASE
+    let refuser = try launch_wait(&system, &proc, &image, &ram,
+                                  ROLE_NEXT_GONE, below, WITH, OK)
+    let _ = move refuser
+    let _ = move dead
+    try expect_revoked(&system, dead_pid)
+    try expect_drained(&system, dead_pid - 1)
+    let _ = system.debug_print(
+        "SOS walkgate: a refused step takes no reference on a dead record\n")
+    return
+}
+
+/// Launch the child under `role` with a System handle masked to `mask`, wait
+/// for it to end and require the status word `want`.
+func run_role(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+              role: UInt, mask: UInt32, want: UInt) -> Result<Void, SosStatus> {
+    let child = try launch_wait(&system, &proc, &image, &ram, role, 0, mask,
+                                want)
+    return
+}
+
+/// `run_role`, giving the child a second Event tagged `arg` when `arg` is not
+/// zero, and answering the ended child's handle: its record stays held for as
+/// long as the caller keeps it.
+func launch_wait(system: &System, proc: &Process, image: &Memory,
+                 ram: &Memory, role: UInt, arg: UInt, mask: UInt32,
+                 want: UInt) -> Result<Process, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let boot = try system.mint(rights: mask)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let mark = try proc.event_create()
+    try child.give(event: move mark, tag: role) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    if arg != 0 {
+        let more = try proc.event_create()
+        try child.give(event: move more, tag: arg) catch {
+            let (why, back) = move error
+            let _ = move back
+            return why
+        }
+    }
+    try child.start(boot_tag: TAG_BOOT)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS walkgate: role {} ended with status {}, wanted {}\n",
+                      role, status, want)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return move child
+}
+
+func is_drained(why: SosStatus) -> Bool {
+    match why {
+        case Drained -> true,
+        case _ -> false,
+    }
+}
+
+func is_revoked(why: SosStatus) -> Bool {
+    match why {
+        case Revoked -> true,
+        case _ -> false,
+    }
+}
+
+/// A walk from `after` is over: the answer is `Drained`.
+func expect_drained(system: &System, after: UInt64) -> Result<Void, SosStatus> {
+    match system.process_next(after: after) {
+        case Ok(step) -> {
+            let (found, _) = move step
+            let _ = move found
+            return BUG
+        },
+        case Err(why) -> {
+            if not is_drained(why) {
+                return BUG
+            }
+        },
+    }
+    return
+}
+
+/// The lookup of `pid` answers `Revoked`.
+func expect_revoked(system: &System, pid: UInt64) -> Result<Void, SosStatus> {
+    match system.process_by_pid(pid: pid) {
+        case Ok(found) -> {
+            let _ = move found
+            return BUG
+        },
+        case Err(why) -> {
+            if not is_revoked(why) {
+                return BUG
+            }
+        },
+    }
+    return
+}
+
+/// Fill root's handle table with siblings of its System handle. Root's quota
+/// is unlimited, so the table is what refuses: both ops answer `NoResource`
+/// and the cursor holds what it held.
+func full_table(system: UInt) unsafe -> Bool {
+    let no_resource = SosStatus.NoResource as UInt
+    var refusal: UInt = STATUS_OK
+    var made: Int = 0
+    while refusal == STATUS_OK && made < MAX_MINTS {
+        var out: UInt = 0
+        refusal = sos_handle_mint(system, KEEP_ALL,
+                                  (&var out) as UnsafePointer<UInt>)
+        made = made + 1
+    }
+    if refusal != no_resource {
+        return false
+    }
+    var cursor: [UInt64; 1] = [0]
+    var out: UInt = 0
+    let walked = sos_system_process_next(system,
+                                         (&var cursor) as UnsafePointer<UInt64>,
+                                         (&var out) as UnsafePointer<UInt>)
+    if walked != no_resource || cursor[0] != 0 {
+        return false
+    }
+    var pid: [UInt64; 1] = [ROOT_PID]
+    let looked = sos_system_process_by_pid(system,
+                                           (&var pid) as UnsafePointer<UInt64>,
+                                           (&var out) as UnsafePointer<UInt>)
+    return looked == no_resource
+}

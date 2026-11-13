@@ -249,6 +249,17 @@ public static INFO_OP: UInt = 0xFFFD
 /// no equivalent of: the caller's own row index in the region, without which a
 /// caller holds a table it cannot find itself in. See
 /// `STATS_REGION_MAP_RECORD_WORDS`.
+///
+/// `ProcessNext` and `ProcessByPid` observe the machine's processes, both on
+/// `SystemRight.ProcessObserve`. Each takes the address of a doubleword in the
+/// caller's memory, because a pid is 64 bits and one profile's registers are
+/// not: `ProcessNext` reads a cursor (a pid, zero before the first) from it,
+/// answers the process with the smallest pid above it and writes that pid back,
+/// and `ProcessByPid` reads a pid and answers the process it names. Both answer
+/// a Process handle carrying the observe set, capped by the caller's Process
+/// ceiling, in the value register; neither takes a keep mask. The walk ends in
+/// `Drained` and a pid the record table does not hold is `Revoked`. The kernel
+/// keeps no walk state: the cursor is the caller's.
 public enum SystemOp: UInt {
     case DebugPrint = 0,
     case Shutdown = 1,
@@ -259,6 +270,8 @@ public enum SystemOp: UInt {
     case TierGet = 6,
     case StatsRegionMap = 7,
     case InterruptBind = 8,
+    case ProcessNext = 9,
+    case ProcessByPid = 10,
 }
 
 // =============================================================================
@@ -952,7 +965,7 @@ public enum ReplyWaitLeg: UInt {
 // When an op is added to a table, re-point that table's assert at the new
 // highest case. A bound tested against a case that is no longer the highest
 // passes while the table walks past `INFO_OP`.
-static_assert((SystemOp.InterruptBind as UInt) < INFO_OP,
+static_assert((SystemOp.ProcessByPid as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
 static_assert((ProcessOp.Ceiling as UInt) < INFO_OP,
               "an op table must stay below the universal ops")

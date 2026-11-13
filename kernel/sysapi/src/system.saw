@@ -56,7 +56,8 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_process_start, sos_process_stats,
                   sos_process_restrict_rights, ceiling_word,
                   sos_system_debug_print, sos_system_shutdown,
-                  sos_system_slab_donate, sos_waiter_add, handle_rights}
+                  sos_system_slab_donate, sos_system_process_next,
+                  sos_system_process_by_pid, sos_waiter_add, handle_rights}
 import sos.memory.{Memory}
 import sos.iomemory.{IoMemory}
 import sos.mapping.{Mapping}
@@ -442,6 +443,79 @@ extension System {
         return word
     }
 
+    /// One step of a walk over the machine's processes: the process with the
+    /// smallest pid above `after`, and its pid. Requires
+    /// `SystemRight.ProcessObserve`.
+    ///
+    /// A walk starts from 0, which precedes every pid, and goes on by passing
+    /// back the pid each step answered. The pid is answered beside the handle
+    /// because a Process ceiling that leaves the handle without `Stats` leaves
+    /// it unable to read its own pid, and the walk still has to go on.
+    ///
+    /// ```saw
+    /// func walk(system: &System) -> Result<Void, SosStatus> {
+    ///     var after: UInt64 = 0
+    ///     var walking = true
+    ///     while walking {
+    ///         match system.process_next(after: after) {
+    ///             case Ok(step) -> {
+    ///                 let (proc, pid) = move step
+    ///                 after = pid
+    ///                 let _ = move proc
+    ///             },
+    ///             case Err(why) -> {
+    ///                 match why {
+    ///                     case Drained -> { walking = false },
+    ///                     // A refusal (`QuotaExceeded`, `NoResource`) is not
+    ///                     // the end: the caller releases a handle and asks
+    ///                     // again with the same `after`.
+    ///                     case _ -> { return why },
+    ///                 }
+    ///             },
+    ///         }
+    ///     }
+    ///     return
+    /// }
+    /// ```
+    ///
+    /// The handle carries exactly the observe set, `ProcessRight.Wait |
+    /// ProcessRight.Stats`, intersected with this process's Process ceiling: it
+    /// reads the process's status and counters and acts on nothing. A running
+    /// process is answered whatever names it, and so is a `Gone` record
+    /// something still names and a process created and never started, whose
+    /// status reads running; releasing the handle lets a `Gone` record go.
+    ///
+    /// The end of the walk is `Err(SosStatus.Drained)`. It is not final: the
+    /// same pid asked again answers a process created since. A caller at its
+    /// handle quota gets `QuotaExceeded` and a full handle table `NoResource`,
+    /// and asking again with the same `after` answers the same process. Each
+    /// call scans the kernel's process records, so a walk costs one scan per
+    /// step.
+    public func process_next(
+        &self,
+        after: UInt64
+    ) -> Result<(Process, UInt64), SosStatus> {
+        let step = try process_next_into_frame(self.handle, after)
+        let proc = Process(handle: ProcessHandle(step.0))
+        return (move proc, step.1)
+    }
+
+    /// The process `pid` names, as a Process handle carrying the observe set.
+    /// Requires `SystemRight.ProcessObserve`.
+    ///
+    /// It answers what a walk would answer for that pid, with the handle
+    /// `process_next` describes. A pid the kernel's records do not hold is
+    /// `Err(SosStatus.Revoked)`: one whose record was reclaimed, one never
+    /// assigned, and 0, which is never a pid. A pid is data a caller may have
+    /// read from a stats row or a message, so none of these is a fault.
+    public func process_by_pid(
+        &self,
+        pid: UInt64
+    ) -> Result<Process, SosStatus> {
+        let raw = try process_by_pid_into_frame(self.handle, pid)
+        return Process(handle: ProcessHandle(raw))
+    }
+
     /// Map the machine's trap counters read-only into this process: the shared
     /// stats region. Requires `SystemRight.StatsRegionMap`.
     ///
@@ -497,6 +571,36 @@ extension System {
                            row_bytes: head.row_bytes as UInt,
                            self_row: answer.1)
     }
+}
+
+/// The `unsafe` half of `System.process_next`, confined to one small named
+/// helper. The cursor's address never leaves it.
+///
+/// It answers the pair the op answers: the handle out of the value register and
+/// the next pid out of the doubleword the cursor went in.
+func process_next_into_frame(
+    handle: UInt,
+    after: UInt64
+) unsafe -> Result<(UInt, UInt64), SosStatus> {
+    var cursor: [UInt64; 1] = [after]
+    var out: UInt = 0
+    try checked(sos_system_process_next(handle,
+                                        (&var cursor) as UnsafePointer<UInt64>,
+                                        (&var out) as UnsafePointer<UInt>))
+    let pair: (UInt, UInt64) = (out, cursor[0])
+    return pair
+}
+
+/// The `unsafe` half of `System.process_by_pid`, confined to one small named
+/// helper. The pid's address never leaves it.
+func process_by_pid_into_frame(handle: UInt,
+                               pid: UInt64) unsafe -> Result<UInt, SosStatus> {
+    var word: [UInt64; 1] = [pid]
+    var out: UInt = 0
+    try checked(sos_system_process_by_pid(handle,
+                                          (&var word) as UnsafePointer<UInt64>,
+                                          (&var out) as UnsafePointer<UInt>))
+    return out
 }
 
 /// The `unsafe` half of `System.stats_region_map`, confined to one small named

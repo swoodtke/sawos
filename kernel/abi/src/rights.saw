@@ -144,6 +144,16 @@
 /// mask, because "everything a child normally gets" must not include every
 /// peer's trap counts.
 ///
+/// `ProcessObserve` gates the two ops that answer a Process handle onto a
+/// process the caller was never given: the walk (`ProcessNext`) and the lookup
+/// by pid (`ProcessByPid`). Each mints the observe set, `Wait | Stats`, capped
+/// by the caller's Process ceiling, so what the right grants is the ability to
+/// find processes and watch them, and nothing that acts on one. It is in the
+/// root set because root is the machine's first observer, and it is absent from
+/// the ordinary child mask: a server names its clients through the sender
+/// handle, which asks no System right, and only a system tool (a `ps`, a
+/// debugger) needs to find a process nobody told it about.
+///
 /// `InterruptBind` gates binding an IRQ line, the strongest creation authority
 /// there is: it is what separates a driver from an ordinary process. A line is
 /// a machine-wide resource, so the bit is on System and not on a Process
@@ -165,6 +175,7 @@ public enum SystemRight: UInt32 {
     case TierGet = 1 << 14,
     case StatsRegionMap = 1 << 15,
     case InterruptBind = 1 << 16,
+    case ProcessObserve = 1 << 17,
 }
 
 // The universal low byte, pinned. Every kind's enum repeats these two asserts
@@ -195,6 +206,8 @@ static_assert((SystemRight.StatsRegionMap as UInt32) >= (1 << 8),
               "kind-specific right StatsRegionMap must start at bit 8 or above")
 static_assert((SystemRight.InterruptBind as UInt32) >= (1 << 8),
               "kind-specific right InterruptBind must start at bit 8 or above")
+static_assert((SystemRight.ProcessObserve as UInt32) >= (1 << 8),
+              "kind-specific right ProcessObserve must start at bit 8 or above")
 
 /// A right on a Process object (§2 table row).
 ///
@@ -956,6 +969,12 @@ public func root_system_rights() -> UInt32 {
      // line and gives each Interrupt to its driver, and a deployment strips
      // the bit on the way down to anything that is not a binder.
      | (SystemRight.InterruptBind as UInt32)
+     // `ProcessObserve` is here on `StatsRegionMap`'s terms: it leaks which
+     // processes exist, root is the process meant to supervise the machine,
+     // and a deployment strips the bit on the way down to anything that is not
+     // an observer. The convention mask a launcher builds a child's System
+     // sibling with leaves it out.
+     | (SystemRight.ProcessObserve as UInt32)
      | (SystemRight.Transfer as UInt32))
 }
 
@@ -1063,8 +1082,8 @@ public func pipe_request_rights() -> UInt32 {
 /// neither `Transfer` nor `Mint`, so the handle stays where it was minted.
 ///
 /// Every mint of such a handle takes its rights from here and caps them by the
-/// Process ceiling of the table it lands in; the sender handle is the one such
-/// mint.
+/// Process ceiling of the table it lands in: the sender handle, and the handles
+/// `SystemOp.ProcessNext` and `SystemOp.ProcessByPid` answer.
 public func process_observe_rights() -> UInt32 {
     ((ProcessRight.Wait as UInt32) | (ProcessRight.Stats as UInt32))
 }

@@ -1,0 +1,316 @@
+// Test child: one process-walk or lookup call, in thirteen roles chosen by the
+// boot set (spec §2.8).
+//
+// Its launcher gives it a masked System handle as its boot handle and an
+// Event whose tag names the role. The roles that are caller errors end the
+// process with a fault, which the launcher reads in the §8 status word; the
+// roles that are not end it with `EXIT_OK` when the kernel answered as the
+// spec says and with a distinct code when it did not.
+//
+//   1  `ProcessNext` through a System handle without `ProcessObserve`
+//   2  `ProcessByPid` through the same
+//   3  `ProcessNext` with a misaligned cursor address
+//   4  `ProcessByPid` with a misaligned pid address
+//   5  `ProcessNext` with a cursor address outside this process
+//   6  `ProcessByPid` with a pid address outside this process
+//   7  `ProcessNext` at the end of the walk: `Drained`, the cursor untouched
+//   8  `ProcessNext` with a full handle table: refused, the cursor untouched,
+//      and asking again after a slot is freed answers root and writes root's
+//      pid
+//   9  `ProcessNext` with the cursor in read-only memory: the op writes the
+//      cursor back, so the address must be writable
+//  10  `ProcessByPid` with the pid in read-only memory: it is only read, so
+//      the call is answered (the code bytes name no process: `Revoked`)
+//  11  nothing: it ends with `EXIT_OK`, leaving a dead process its launcher
+//      holds
+//  12  `ProcessNext` at a full Handle row, with the cursor the launcher gave
+//      (the pid just below that dead process): refused with `QuotaExceeded`
+//      and the cursor untouched
+//  13  `ProcessByPid` at a full Handle row: `QuotaExceeded`; one slot freed
+//      and the lookup is answered; asked again, refused again
+//
+// A second Event, given after the role's, carries a number the role reads: the
+// cursor of role 12, plus `ARG_BASE`, which keeps its tag clear of the others
+// in the boot set.
+//
+// It works at the C altitude, as `tests/child-xcaller` does, because the
+// typed calls build the cursor in their own frame, so an address that is
+// wrong or a cursor that is read back after a refusal is not expressible
+// there.
+
+import sos.{System, sos_system_process_next, sos_system_process_by_pid,
+            sos_system_process_self, sos_handle_release, SosStatus}
+
+static ROLE_NEXT_DENIED: UInt = 1
+static ROLE_BYPID_DENIED: UInt = 2
+static ROLE_NEXT_MISALIGNED: UInt = 3
+static ROLE_BYPID_MISALIGNED: UInt = 4
+static ROLE_NEXT_OUTSIDE: UInt = 5
+static ROLE_BYPID_OUTSIDE: UInt = 6
+static ROLE_NEXT_DRAINED: UInt = 7
+static ROLE_NEXT_REFUSED: UInt = 8
+static ROLE_NEXT_READONLY: UInt = 9
+static ROLE_BYPID_READONLY: UInt = 10
+static ROLE_EXIT: UInt = 11
+static ROLE_NEXT_GONE: UInt = 12
+static ROLE_BYPID_REFUSED: UInt = 13
+
+/// Added to the number the second Event's tag carries.
+static ARG_BASE: UInt = 1000
+
+/// How this process ends when the kernel answered as the spec says.
+static EXIT_OK: UInt = 7
+/// The call returned where it had to fault.
+static EXIT_SURVIVED: UInt = 99
+/// The boot set held no role.
+static EXIT_NO_ROLE: UInt = 98
+/// The drained walk answered something else, or wrote the cursor.
+static EXIT_BAD_DRAIN: UInt = 12
+/// The handle table never filled.
+static EXIT_NEVER_FULL: UInt = 13
+/// The refused walk answered another status, or wrote the cursor.
+static EXIT_BAD_REFUSAL: UInt = 14
+/// The walk after a slot was freed answered wrongly.
+static EXIT_BAD_RETRY: UInt = 15
+
+/// The lookup of a pid in read-only memory was not simply answered.
+static EXIT_BAD_LOOKUP: UInt = 16
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// A keep mask that keeps every right.
+static KEEP_ALL: UInt = 0xFFFF_FFFF
+
+/// Root's pid, the first the walk answers.
+static ROOT_PID: UInt64 = 1
+
+/// Rounds a code address down to a doubleword.
+static ALIGN: UInt = 8
+
+/// An address that is not word-aligned on any profile, and one in no
+/// process's memory.
+static MISALIGNED: UInt = 1
+static OUTSIDE: UInt = 8
+
+/// A cursor past every pid a machine can have assigned here: the walk from it
+/// is at its end.
+static PAST_END: UInt64 = 0xFFFF_FFFF_FFFF_FFF0
+
+/// More mints than any handle table holds, so a loop that reaches it is a
+/// table that does not fill.
+static MAX_MINTS: Int = 4096
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        return
+    }
+
+    var role: UInt = 0
+    var arg: UInt = 0
+    var events: Int = 0
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if let ev = rec.take_event() {
+                    let _ = move ev
+                    if events == 0 {
+                        role = tag
+                    } else {
+                        arg = tag
+                    }
+                    events = events + 1
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    if role == 0 {
+        let _ = proc.exit(EXIT_NO_ROLE)
+        return
+    }
+    let code = act(boot_handle, role, arg)
+    let _ = proc.exit(code)
+}
+
+/// The role's call, answering the exit code of a process the kernel did not
+/// end.
+func act(system: UInt, role: UInt, arg: UInt) unsafe -> UInt {
+    if role == ROLE_NEXT_DENIED {
+        let _ = next_raw(system, 0, 0)
+    } else if role == ROLE_BYPID_DENIED {
+        let _ = by_pid_raw(system, 0, 0)
+    } else if role == ROLE_NEXT_MISALIGNED {
+        let _ = next_raw(system, 0, MISALIGNED)
+    } else if role == ROLE_BYPID_MISALIGNED {
+        let _ = by_pid_raw(system, 0, MISALIGNED)
+    } else if role == ROLE_NEXT_OUTSIDE {
+        let _ = next_at(system, OUTSIDE)
+    } else if role == ROLE_BYPID_OUTSIDE {
+        let _ = by_pid_at(system, OUTSIDE)
+    } else if role == ROLE_NEXT_DRAINED {
+        let drained = next_raw(system, PAST_END, 0)
+        if drained.0 != (SosStatus.Drained as UInt) || drained.1 != PAST_END {
+            return EXIT_BAD_DRAIN
+        }
+        return EXIT_OK
+    } else if role == ROLE_NEXT_READONLY {
+        let _ = next_at(system, readonly_address())
+    } else if role == ROLE_BYPID_READONLY {
+        let status = by_pid_at(system, readonly_address())
+        if status != (SosStatus.Revoked as UInt) {
+            return EXIT_BAD_LOOKUP
+        }
+        return EXIT_OK
+    } else if role == ROLE_EXIT {
+        return EXIT_OK
+    } else if role == ROLE_NEXT_GONE {
+        return refused_next_at(system, (arg - ARG_BASE) as UInt64)
+    } else if role == ROLE_BYPID_REFUSED {
+        return refused_by_pid(system)
+    } else {
+        return refused(system)
+    }
+    return EXIT_SURVIVED
+}
+
+/// `ProcessNext` with the cursor `after` in a doubleword of this frame, the
+/// address moved by `shift` bytes. Answers the status and the doubleword's
+/// value once the call has returned.
+func next_raw(system: UInt, after: UInt64,
+              shift: UInt) unsafe -> (UInt, UInt64) {
+    var cursor: [UInt64; 1] = [after]
+    var out: UInt = 0
+    let at = ((&var cursor) as UnsafePointer<UInt64>) as UInt + shift
+    let status = sos_system_process_next(system, at as UnsafePointer<UInt64>,
+                                         (&var out) as UnsafePointer<UInt>)
+    return (status, cursor[0])
+}
+
+/// `ProcessByPid` with pid `pid` in a doubleword of this frame, the address
+/// moved by `shift` bytes. Answers the status.
+func by_pid_raw(system: UInt, pid: UInt64, shift: UInt) unsafe -> UInt {
+    var word: [UInt64; 1] = [pid]
+    var out: UInt = 0
+    let at = ((&var word) as UnsafePointer<UInt64>) as UInt + shift
+    sos_system_process_by_pid(system, at as UnsafePointer<UInt64>,
+                              (&var out) as UnsafePointer<UInt>)
+}
+
+/// The two calls with an address of the caller's choosing, in no memory of
+/// this process.
+func next_at(system: UInt, at: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    sos_system_process_next(system, at as UnsafePointer<UInt64>,
+                            (&var out) as UnsafePointer<UInt>)
+}
+
+func by_pid_at(system: UInt, at: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    sos_system_process_by_pid(system, at as UnsafePointer<UInt64>,
+                              (&var out) as UnsafePointer<UInt>)
+}
+
+/// A word-aligned address in this image's code, which is mapped but not
+/// writable: a function's address rounded down.
+func readonly_address() unsafe -> UInt {
+    let code: FuncPointer<() sync -> Void> = code_marker
+    let at = code.address() as UInt
+    at - (at % ALIGN)
+}
+
+func code_marker() sync {
+}
+
+/// `ProcessSelf`, as a status and the handle it answered.
+func mint_self(system: UInt) unsafe -> (UInt, UInt) {
+    var out: UInt = 0
+    let status = sos_system_process_self(system, KEEP_ALL,
+                                         (&var out) as UnsafePointer<UInt>)
+    return (status, out)
+}
+
+/// Mint until the table refuses: the refusal's status (`STATUS_OK` if it never
+/// does) and the last handle minted.
+func fill(system: UInt) unsafe -> (UInt, UInt) {
+    var last: UInt = 0
+    var refusal: UInt = STATUS_OK
+    var made: Int = 0
+    while refusal == STATUS_OK && made < MAX_MINTS {
+        let minted = mint_self(system)
+        if minted.0 != STATUS_OK {
+            refusal = minted.0
+        } else {
+            last = minted.1
+            made = made + 1
+        }
+    }
+    return (refusal, last)
+}
+
+/// Role 12: fill the Handle row, then walk from `cursor`. The row is the
+/// policy limit, so the refusal is `QuotaExceeded`, and the cursor holds what
+/// it held.
+func refused_next_at(system: UInt, cursor: UInt64) unsafe -> UInt {
+    let filled = fill(system)
+    if filled.0 != (SosStatus.QuotaExceeded as UInt) {
+        return EXIT_NEVER_FULL
+    }
+    let denied = next_raw(system, cursor, 0)
+    if denied.0 != filled.0 || denied.1 != cursor {
+        return EXIT_BAD_REFUSAL
+    }
+    return EXIT_OK
+}
+
+/// Role 13: fill the Handle row, then look root up. The refusal is
+/// `QuotaExceeded` and mints nothing: with one slot freed the lookup is
+/// answered once and refused again.
+func refused_by_pid(system: UInt) unsafe -> UInt {
+    let filled = fill(system)
+    let quota = SosStatus.QuotaExceeded as UInt
+    if filled.0 != quota {
+        return EXIT_NEVER_FULL
+    }
+    if by_pid_raw(system, ROOT_PID, 0) != quota {
+        return EXIT_BAD_REFUSAL
+    }
+    let _ = sos_handle_release(filled.1)
+    if by_pid_raw(system, ROOT_PID, 0) != STATUS_OK {
+        return EXIT_BAD_RETRY
+    }
+    if by_pid_raw(system, ROOT_PID, 0) != quota {
+        return EXIT_BAD_REFUSAL
+    }
+    return EXIT_OK
+}
+
+/// Role 8: fill the handle table, then walk.
+func refused(system: UInt) unsafe -> UInt {
+    let filled = fill(system)
+    let refusal = filled.0
+    let last = filled.1
+    if refusal == STATUS_OK {
+        return EXIT_NEVER_FULL
+    }
+
+    // The walk is refused for the table's reason, as the mint was, and the
+    // cursor holds what it held.
+    let denied = next_raw(system, 0, 0)
+    if denied.0 != refusal || denied.1 != 0 {
+        return EXIT_BAD_REFUSAL
+    }
+
+    // A slot back, and the same cursor answers the first process.
+    let _ = sos_handle_release(last)
+    let again = next_raw(system, 0, 0)
+    if again.0 != STATUS_OK || again.1 != ROOT_PID {
+        return EXIT_BAD_RETRY
+    }
+    return EXIT_OK
+}
