@@ -148,10 +148,11 @@ SECTIONS {
      * profiles, which lets the kernel overlay a struct on them instead of
      * assembling bytes.
      *
-     * No page alignment: neither section is ever granted to a process. A child
-     * image is read by the kernel during the copy (at M-mode here, EL1 on the
-     * other profile), so no grant window constrains where it lands, and the
-     * blob is dead bytes once the copy is done. */
+     * No page alignment. The table is never granted to a process. A child
+     * image is read by the kernel during the copy (at M-mode here), so no
+     * grant window constrains where it lands; a segment of it linked where its
+     * own bytes sit is used in place instead, granted to the child at four-byte
+     * grain (spec 5.6), and the blob holds that child's code for its life. */
     .regions : ALIGN(8) {
         _region_table_start = .;
         KEEP(*(.regions))

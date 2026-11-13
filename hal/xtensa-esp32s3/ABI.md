@@ -124,10 +124,13 @@ QEMU prints `Adding SPI flash device` on stderr when a drive is attached and
 
 A board image is the same bytes cut after the last one placed, written at
 flash offset 0x0 (`tools/sos_runner.py --board esp32s3 --emit-flash CASE
---out PATH`). The image is one contiguous run of flash (`esp32s3.ld`), so it
-is about the size of the kernel plus what is appended to it. Padded back to
-4 MiB it boots under the emulator like the smoke's own image, apart from its
-stop (§10).
+--out PATH`). `esp32s3.ld` places the kernel's read-only data last, at flash
+offset 0x20_0000, after root's and a child's image slots (§13), so a board
+image is a little over 2 MiB whatever the case, its gaps 0xFF, as erased
+flash reads. The build reads each resident image back out of it and refuses
+one not linked for its slot, as for the smoke's images. Padded back to 4 MiB
+it boots under the emulator like the smoke's own image, apart from its stop
+(§10).
 
 ---
 
@@ -277,22 +280,21 @@ super watchdog  key 0x8F1D312A -> 0x6000_80B8 (SWD_WPROTECT)
                 0          -> 0x6000_80B8
 ```
 
-Where each number comes from, all on this machine. No ESP-IDF register
-header (`rtc_cntl_reg.h`, `timer_group_reg.h`) is installed here, so the
-TIMG0 numbers are read from the ROM's own code:
+Where each number comes from. The registers are the ones Espressif's register
+headers for the part name, `soc/rtc_cntl_reg.h` (the RTC watchdog and the
+super watchdog) and `soc/timer_group_reg.h` (the TIMG watchdogs), in
+ESP-IDF's `components/soc/esp32s3/include/`. Neither header was at hand when
+these were written, so each value was read from one of two other sources:
 
-- esptool 5.1.0's S3 target,
-  `~/.espressif/python_env/idf6.1_py3.13_env/lib/python3.13/site-packages/
-  esptool/targets/esp32s3.py`: `RTCCNTL_BASE_REG = 0x60008000` (line 86),
-  `RTC_CNTL_SWD_CONF_REG = +0x00B4` (87), `RTC_CNTL_SWD_AUTO_FEED_EN = 1 <<
-  31` (88), `RTC_CNTL_SWD_WPROTECT_REG = +0x00B8` (89), `RTC_CNTL_SWD_WKEY =
-  0x8F1D312A` (90), `RTC_CNTL_WDTCONFIG0_REG = +0x0098` (92),
-  `RTC_CNTL_WDTWPROTECT_REG = +0x00B0` (94), `RTC_CNTL_WDT_WKEY =
-  0x50D83AA1` (95). Its `disable_watchdogs` (lines 328-344) is the RTC and
-  super-watchdog sequence above: unlock, write the config word 0, relock;
-  unlock, set the auto-feed bit, relock.
-- The ROM ELF, `~/.espressif/tools/esp-rom-elfs/20241011/
-  esp32s3_rev0_rom.elf`: its symbol `TIMERG0` is 0x6001_F000;
+- esptool's ESP32-S3 target (`esptool/targets/esp32s3.py`, version 5.1.0),
+  which names the RTC block's base 0x6000_8000, `RTC_CNTL_WDTCONFIG0_REG`
+  (+0x98), `RTC_CNTL_WDTWPROTECT_REG` (+0xB0) and its key 0x50D83AA1,
+  `RTC_CNTL_SWD_CONF_REG` (+0xB4), its auto-feed bit 31,
+  `RTC_CNTL_SWD_WPROTECT_REG` (+0xB8) and its key 0x8F1D312A. Its
+  `disable_watchdogs` is the RTC and super-watchdog sequence above: unlock,
+  write the config word 0, relock; unlock, set the auto-feed bit, relock.
+- The mask ROM's ELF (`esp32s3_rev0_rom.elf`, from Espressif's
+  `esp-rom-elfs` 20241011): its symbol `TIMERG0` is 0x6001_F000;
   `disable_default_watchdog` (0x4004_3714) clears bit 14 of 0x6001_F048
   (TIMG0's WDTCONFIG0) and bit 12 of 0x6000_8098 (the RTC's), the two
   flash-boot enables; `wdt_hal_write_protect_disable` (0x4004_7944) writes
@@ -372,8 +374,7 @@ Probed: `0xA5A5A5A5` stored at DRAM 0x3FC9_0000 and `0x5A5A5A5A` at IRAM
 silicon's ranges: stores at 0x3FD0_0000 and 0x403E_0000 read back.
 
 Silicon's ranges, from esptool's ESP32-S3 target
-(`esptool/targets/esp32s3.py`, `MEMORY_MAP`, in the ESP-IDF Python
-environment under `~/.espressif/python_env`):
+(`esptool/targets/esp32s3.py`, `MEMORY_MAP`, esptool 5.1.0):
 
 ```
 [0x3FC88000, 0x3FD00000, "DRAM"]     [0x40370000, 0x403E0000, "IRAM"]
@@ -409,7 +410,7 @@ last section, `.data.interface.common`, is 4 bytes at 0x3FCE_FFFC. The
 handover stack is inside it. 0x3FCF_0000 and above is not the ROM's. An image
 that never calls the ROM may reuse the range once off the ROM's stack.
 
-### 3c. What the bus allows (emulator)
+### 3c. What the bus allows
 
 Probed with a recovering kernel vector, one access at a time:
 
@@ -1095,12 +1096,15 @@ a board" is the order to find out in.
   running `timer_tick`, and none after a kernel fault: each capture of a
   faulting stage shows one `ESP-ROM:` banner and then silence. Which
   watchdogs were live before `_start`'s writes was not read.
+  *Unprobed on silicon:* the XTAL32K watchdog and the brownout reset; the
+  kernel writes neither.
 - **Direct boot can be fused off.** The ROM skips it when secure boot is on or
   eFuse 0x6000_703C bit 1 is set (§2a). The emulator's eFuse has it clear.
   *Prepared for:* the README's first step reads `DIS_DIRECT_BOOT` (the
-  espefuse name of that bit, `espefuse/efuse_defs/esp32s3.yaml` line 55),
-  `SECURE_BOOT_EN` (line 46) and `SPI_BOOT_CRYPT_CNT` (line 35, flash
-  encryption, which would hand the ROM ciphertext) with a read-only command.
+  espefuse name of that bit, in espefuse's ESP32-S3 eFuse table,
+  `espefuse/efuse_defs/esp32s3.yaml`), `SECURE_BOOT_EN` and
+  `SPI_BOOT_CRYPT_CNT` (flash encryption, which would hand the ROM
+  ciphertext) with a read-only command.
   *On silicon (rev v0.2, ROM `esp32s3-20210327`):* the three read `False`,
   `False` and `Disable`, and the ROM direct-boots the image (the magic at
   0x400, the entry at 0x408) and prints no loader lines of its own.
@@ -1127,14 +1131,16 @@ a board" is the order to find out in.
   to IRAM addresses, executing from DRAM addresses, data loads from the flash
   IBUS window (which every `l32r` from XIP code is), stores to the mask ROM.
   esptool's S3 memory map lists only DRAM, 0x3FC8_8000 - 0x3FD0_0000, as
-  `BYTE_ACCESSIBLE` (`esptool/targets/esp32s3.py` line 112), and its own S3
-  RAM stub keeps its code at IRAM 0x4037_8000 and its data and `.bss` at DRAM
-  0x3FCA_0000 and above (`esptool/targets/stub_flasher/1/esp32s3.json`).
+  `BYTE_ACCESSIBLE` (`MEMORY_MAP` in `esptool/targets/esp32s3.py`), and its
+  own S3 RAM stub keeps its code at IRAM 0x4037_8000 and its data and
+  `.bss` at DRAM 0x3FCA_0000 and above
+  (`esptool/targets/stub_flasher/1/esp32s3.json`).
   *Prepared for:* a root or child image is read through the data window
-  (`esp32s3.ld` puts a data `.payload` in `.drom`), as are `.rodata`, the
-  region table and child images; the kernel's own data and stack are DRAM;
-  the vectors are copied into IRAM with word stores only. Literal loads stay
-  in IBUS, beside their code.
+  (`esp32s3.ld` puts each in a flash slot linked at its data-window
+  address), as are `.rodata` and the region table; the kernel's own data and
+  stack are DRAM; the vectors are copied into IRAM with word stores only.
+  Literal loads stay in IBUS, beside their code. A process's code is used in
+  place in IBUS and its data is at DRAM addresses (§13).
   *On silicon (rev v0.2, ROM `esp32s3-20210327`):* §3c's second table. Of
   the five, the part allows one, refuses two, splits one by width, and was
   not asked the last:
@@ -1184,25 +1190,40 @@ a board" is the order to find out in.
   is read, not probed. The HAL moves a route only on a take-back, and is
   correct under either answer except for what §6c says a take-back can cost
   here.
-- **Process memory at IRAM addresses** (§13). Every process's code, data,
-  arena and stack sit at IRAM addresses here, and the loader writes images
-  there with ordinary stores, bytes included. The emulator serves data loads
-  and stores of any width at those addresses (§3c).
-  *On silicon (rev v0.2, ROM `esp32s3-20210327`):* the loader's first byte
-  store into root's region is refused: `root_server_boot` stops with a
-  kernel fault, cause 3, EXCVADDR 0x403a0000, EPC1 the `s8i` in
-  `kcore.mem.copy_bytes`. No process can be loaded where the layout puts it.
-  `bus_probe` answers what the fix rests on (§3a, §3c): at both ends of the
-  process range the IRAM and DRAM names are one memory; data at the DRAM
-  name takes every width, unaligned loads and `s32c1i`; code stored by
-  words at the IRAM name runs, in kernel and in user mode, and does not run
-  at its DRAM name; and sub-word loads are refused at the IRAM name as
-  stores are, so read-only data cannot stay beside the code there.
-  The fix is spec §5.6's, not built: a process's code and read-only data
-  are used in place in flash, the code at its instruction-window address
-  and the read-only data at its data-window address, and its writable
-  segments, arena and stack are at DRAM addresses. Nothing of a process
-  sits at an IRAM address.
+- **Process memory** (§13). A process's code and read-only data are used in
+  place in flash, the code at its instruction-window address and the
+  read-only data at its data-window address, and its writable segments,
+  arena and stack are at DRAM addresses. Nothing of a process sits at an
+  IRAM address, and the loader writes nothing but DRAM. The emulator serves
+  every access this needs, and the byte loads in the instruction window it
+  must never make (§3c).
+  *On silicon (rev v0.2, ROM `esp32s3-20210327`):* with every process
+  segment at IRAM addresses, the loader's first byte store into root's
+  region was refused: `root_server_boot` stopped with a kernel fault, cause
+  3, EXCVADDR 0x403a0000, EPC1 the `s8i` in `kcore.mem.copy_bytes`.
+  *On silicon (rev v0.2, ROM `esp32s3-20210327`), with the layout above:*
+  `root_server_boot` and `image_held` run to their end, one ROM banner and
+  no reset in each capture. Root's code is fetched in user mode from its
+  flash slot, `l32r` loads its literals there, and its string literal is
+  read in user mode a byte at a time through the data window; a child's code
+  runs in place from the child's slot, twice. The layout also rests on
+  accesses `bus_probe` showed: every access width, unaligned loads and
+  `s32c1i` at DRAM addresses of the process range (§3c).
+  *Unprobed on silicon:* that a process's own byte load in the instruction
+  window is refused as the kernel's is; nothing in this layout makes one,
+  and the core has no privilege that could tell the modes apart.
+- **Flash past the first pages** (§13). This layout reads root's image at
+  flash 0x10_0000, a child's at 0x18_0000 and the kernel's read-only data at
+  0x20_0000, through both windows, so the kernel's first string is a byte
+  load at 0x3C20_0000. The ROM's direct boot maps 0x200 pages of 64 KiB at
+  each window before it enters the image, as read from its code (§2a), which
+  covers every one of them; the emulator serves them all, which every smoke
+  case shows. A board image is a little over 2 MiB (`--emit-flash` prints
+  its size). *On silicon (rev v0.2, ROM `esp32s3-20210327`, 8 MiB of flash
+  by `flash-id`):* the README's six stages run to their end with this
+  layout, so the part serves the kernel's strings at 0x20_0000 through the
+  data window (`boot`), root's slot at 0x10_0000 through both windows
+  (`root_server_boot`) and the child's at 0x18_0000 (`image_held`).
 - **The interrupt matrix reset value.** Unrouted map registers read 6 here,
   with the ROM or without it (a `-kernel` image reads 6 at sources 0 and 27),
   so 6 is the emulator's reset value and not something the ROM writes.
@@ -1230,9 +1251,10 @@ a board" is the order to find out in.
   writer polls for FIFO room before each store. USB-Serial-JTAG is a written
   plan (§4a). *On silicon (rev v0.2, ROM `esp32s3-20210327`):* UART0 through
   the board's USB-to-UART bridge prints every kernel line at the ROM's
-  divisor with no clock setup of ours, and the FIFO fills (§4).
-  *Unprobed on silicon:* USB-Serial-JTAG, and `kernel_fault`'s wait for FIFO
-  room: no kernel fault outside a probe step has been taken with it.
+  divisor with no clock setup of ours, and the FIFO fills (§4). A kernel
+  fault a scratch image took printed its whole line, 111 bytes, through
+  `kernel_fault`'s wait for FIFO room, on one boot. *Unprobed on silicon:*
+  USB-Serial-JTAG.
 - **`simcall`.** Answered here under `-semihosting`; unknown with no debugger.
   *Prepared for:* a board image never executes it (§10). *On silicon (rev
   v0.2, ROM `esp32s3-20210327`):* every stop seen ends in its quiet loop:
@@ -1283,37 +1305,106 @@ sos-smoke-esp32s3`, the process cases in `tools/sos_runner.py`).
 
 ### 13a. The layout
 
+A process's code and read-only data are used in place in flash, and only
+what it writes takes RAM (spec §5.6):
+
 ```
+flash (offset, instruction window, data window)
+0x00_0000  0x4200_0000  0x3C00_0000  the kernel: magic, entry, code, the
+                                     load images of the vectors and .data
+0x10_0000  0x4210_0000  0x3C10_0000  root's image slot (512 KiB)
+0x18_0000  0x4218_0000  0x3C18_0000  a child's image slot (512 KiB)
+0x20_0000  0x4220_0000  0x3C20_0000  the kernel's .rodata, the region table
+
+RAM
 IRAM 0x4037_8000 - 0x4037_BFFF  kernel vectors + trap path
 DRAM 0x3FC8_C000 - 0x3FCA_FFFF  kernel .data + .bss (arena, 64K stack)
-IRAM 0x403A_0000 - 0x403B_7FFF  root's region: image + arena, the top
-                                16 KiB its stack (`user/root.ld`)
-IRAM 0x403B_8000 - 0x403C_FFFF  a child's region, the same shape
+DRAM 0x3FCB_0000 - 0x3FCC_7FFF  root's region: writable data + arena, the
+                                top 16 KiB its stack (`user/root.ld`)
+DRAM 0x3FCC_8000 - 0x3FCD_FFFF  a child's region, the same shape
                                 (`user/child.ld`)
-IRAM 0x403D_0000 - 0x403D_FFFF  the RAM pool a case may ask for
+DRAM 0x3FCE_0000 - 0x3FCE_FFFF  the RAM pool a case may ask for
 ```
 
-No range above is the DRAM twin of another (§3a's alias, IRAM + n against
-DRAM 0x3FC8_8000 + n), so the layout is the same bytes on silicon. The
-process regions are the twin of DRAM 0x3FCB_0000 - 0x3FCE_FFFF, which
-includes the ROM's RAM (§3b): nothing writes there until the kernel loads a
-process, long after the boot path has left the ROM's stack.
+`kernel/esp32s3.ld` places each part and fails the link if the kernel's code
+reaches root's slot or an image overruns its slot. The kernel holds every
+image by its data-window address: the payload bounds, a region table's blob
+rows, and so every read the loader makes of a header, a record or a
+segment's bytes. Its own reads of flash are all through the data window, so
+it makes none of the byte loads in the instruction window that a part
+refuses (§3c).
 
-Each image is a Blade-built sosimg linked at its region's base: one R+X
-segment (literal pools and code), one R segment (read-only data) and one R+W
-segment (data, then the zero-filled `.bss` and arena). The kernel's link
-script puts the appended root image and the child images in `.drom`, at
-data-bus addresses, so the loader reads every image as data on the data bus.
+Each image is a Blade-built sosimg of three segments: a 24-byte header, three
+24-byte records, then the segments' bytes in order on 4-byte boundaries.
+`user/root.ld` and `user/child.ld` link to that packing:
+
+```
+slot + 0x60          code and literal pools, R+X: linked at the slot's
+                     instruction-window address plus 0x60, used in place
+right behind it      read-only data, R: linked at the data-window address of
+                     its own bytes, used in place
+the region's base    .data, .bss, the arena, R+W: DRAM, copied
+the region's top     the stack the kernel grants, 16 KiB, DRAM
+```
+
+The build holds the link addresses to the bytes three times: the scripts'
+`ASSERT`s (the code at the slot plus 0x60, the read-only data right behind
+it, each of the three sections non-empty, since an empty one would take a
+record out of the table), the runner, which reads each image back out of the
+flash image it built and refuses the build when a segment is not linked at
+its own bytes (`check_in_place` in `tools/sos_runner.py`, which names both
+addresses), and the loader, which uses a segment in place only when
+`hal.same_bytes` says its link address names its bytes and would copy every
+other one, but on this board refuses any segment it would copy to an address
+outside process RAM (`hal.segment_bus_ok`): an executable segment not in
+place, and a read-only or writable one linked in flash but not at its own
+bytes.
+
+No range above is the DRAM twin of another (§3a's alias, IRAM + n against
+DRAM 0x3FC8_8000 + n). The process regions include the ROM's RAM (§3b):
+nothing writes there until the kernel loads a process, long after the boot
+path has left the ROM's stack. Nothing of a process sits at an IRAM address.
+
+A board image (`--emit-flash`) is the flash image cut after its last placed
+byte, which is the kernel's read-only data at 0x20_0000, so it is a little
+over 2 MiB whatever the case; the gaps between the parts are 0xFF, which is
+erased flash.
 
 ### 13b. What the cases showed
 
-- The loader reads a root image and a child's through the data-bus window
-  (0x3C0x_xxxx), and copies both into IRAM with ordinary stores. Each process
-  then runs from IRAM: root reports an `entry` in 0x403A_xxxx on its load
-  line, and its ticks report PCs in 0x403A_xxxx.
-- Under the emulator a process's stack, data and arena at IRAM addresses
-  take loads and stores of every width, `s32c1i` included (the inline word
-  atomics, §8). A part refuses the byte and halfword ones there (§3c).
+- The loader reads a root image and a child's through the data window, uses
+  their code and read-only data in place, and copies only their writable
+  segments into DRAM. Root reports an `entry` in the instruction window on
+  its load line.
+- A process's code runs from the flash instruction window in user mode,
+  `l32r` from its literal pools included, and its byte loads of string
+  literals go through the data window. Under the emulator its stack, data
+  and arena at DRAM addresses take loads and stores of every width,
+  `s32c1i` included (the inline word atomics, §8), as the part's do (§3c).
+- A system call's buffer in a process's code, in the instruction window, is
+  refused without the kernel touching it, and a string literal used in place
+  in the data window is a source (`copy_from_code_refused`). A thread's entry
+  is judged by the rows that permit execute, with the code outside the
+  process's region (`thread_entry_not_exec`).
+- A child runs out of its image in flash after its launcher released the
+  image's handle, and the image's bytes go back to their pool only at the
+  child's teardown (`image_held`). A region over flash is refused as a
+  destination and as a slab donation (`flash_region`).
+- A child's image region cut while it runs: a cut through its code row is
+  `NoResource`, the piece that covers the row carries it and holds the
+  bytes when released, and the bytes come back after the child's death
+  (`image_split_flash`). A program's initialized writable data is copied out
+  of flash into DRAM with its values (`data_init`).
+- The loader refuses an image whose code is linked in DRAM, whose code is in
+  the instruction window but not at its own bytes, whose code is in place at
+  its data-window address, whose read-only data is in place at its
+  instruction-window address, with a writable segment linked in flash, or
+  whose grant would run past the image; the build refuses a root image linked
+  for the child's slot (the smoke's `code_in_dram`, `code_not_in_place`,
+  `code_in_dbus`, `rodata_in_ibus`, `writable_in_flash`, `grant_past_image`,
+  `slot_mismatch`). The emulator fetched at the data window and served the
+  byte-addressed data at the instruction window when a mutant let those two
+  images load, so only the loader keeps them off a part.
 - Two processes run at two link addresses in one address space, and a child
   started from a blob runs at the destination its region-table row names.
 - Two threads of one process, preempted by the tick in the middle of a spin
@@ -1325,6 +1416,8 @@ data-bus addresses, so the loader reads every image as data on the data bus.
   interrupts (§6c) and goes on binding; the slab's `NoResource` is the limit
   it meets (`irq_line_cycle`).
 
-All of this rests on the emulator's generous bus (§3c). On silicon the
-loader's first byte store into root's region is refused, so no process
-loads on a part with this layout (§11).
+The emulator serves a byte load in the instruction window, which a part
+refuses, so the smoke cannot show that nothing makes one; the layout keeps
+every byte load out of that window by construction (§11). On the rev v0.2
+board (ROM `esp32s3-20210327`) `root_server_boot` and `image_held` run to
+their end with this layout (§11, `README.md`).

@@ -1,0 +1,110 @@
+// A launcher of the case's one hand-assembled child (`child_asm`), for the
+// in-place rules that only a child shows (spec §5.6, §2.5).
+//
+// Root creates the child from its image blob into its destination. A refused
+// create is reported and ends the case clean:
+//
+//   SOS inplacelaunch: create refused: not a loadable process image
+//
+// A created child then has its own image blob mapped into it, read-only. The
+// child's code is used in place in that blob, so the mapping would cover an
+// image row, and on a board where a mapping's address is its memory's own it
+// is refused:
+//
+//   SOS inplacelaunch: a mapping over the child's image: out of kernel objects
+//
+// and the child is started and must exit with its own code:
+//
+//   SOS-H                                          the child
+//   SOS inplacelaunch: the child exited from its image
+
+import sos.{System, Process, Mapping, MapAccess, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static TAG_BOOT: UInt = 21
+static KEY_DEATH: UInt = 6
+
+/// What the child may ask its System object for: printing and its own Process
+/// handle; `Transfer` is what lets root give it.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The status word of the child's exit with its own code, 0x48: `Exited` in
+/// the high half and the code in the low.
+static EXITED_MARK: UInt = 65608
+
+static_assert((1 * 65536) + 0x48 == 65608,
+              "an exit's status word is Exited in the high bits and the code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS inplacelaunch: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS inplacelaunch: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var blob_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let blob = blob_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let child = try system.process_create(image: &blob, memory: &ram) catch {
+        print("SOS inplacelaunch: create refused: {}\n", error)
+        return
+    }
+
+    var kept: Mapping? = None
+    match child.map(memory: &blob, access: MapAccess.Read) {
+        case Ok(mapping) -> {
+            kept = move mapping
+            let _ = system.debug_print(
+                "SOS inplacelaunch: a mapping over the child's image: taken\n")
+        },
+        case Err(why) -> {
+            print("SOS inplacelaunch: a mapping over the child's image: {}\n",
+                  why)
+        },
+    }
+
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH || status != EXITED_MARK {
+                print("SOS inplacelaunch: the child ended with status {}\n",
+                      status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = system.debug_print(
+        "SOS inplacelaunch: the child exited from its image\n")
+    let _ = move kept
+    return
+}

@@ -19,10 +19,14 @@ kernel/sink.c       the special-register leaves (INTENABLE, INTERRUPT,
 kernel/lib.saw      the `hal` module: the trap frame and its accessors, the
                     cause decoding, the Flat protection seam, UART0,
                     SYSTIMER, the interrupt matrix, the memory map
-kernel/esp32s3.ld   the flash layout across the two bus windows, IRAM for the
-                    vectors, DRAM for the kernel's data
+kernel/esp32s3.ld   the flash layout across the two bus windows, with an image
+                    slot for root and one for a child, IRAM for the vectors,
+                    DRAM for the kernel's data
 user/syscall.c      the `syscall` stub every root and child links
-user/root.ld        root at 0x403A_0000      user/child.ld  child at 0x403B_8000
+user/root.ld        root: code and read-only data in place in its flash slot
+                    at 0x10_0000, writable data from DRAM 0x3FCB_0000
+user/child.ld       a child: the same, its slot at 0x18_0000 and its DRAM
+                    from 0x3FCC_8000
 ABI.md              every board fact, with the probe that produced it; §13 is
                     the process layout
 ```
@@ -61,12 +65,14 @@ The things most likely to surprise someone arriving here:
   leaves it alone: one that sets it runs FP instructions, and loses its FP
   registers at the next switch.
 - **Flash is two windows.** Code executes in place at 0x4200_0000 (IBUS);
-  read-only data, the appended images and the region table are read at
-  0x3C00_0000 (DBUS). `esp32s3.ld` lays the image out as one run of flash:
-  the fetched sections first, with the load images of `.data` and the
-  vectors, and the sections read in place after. `boot.S` copies `.data` and
-  the vectors out of flash through the data bus. Literal pools sit below
-  their code (`l32r` reaches only backwards).
+  read-only data, the images and the region table are read at 0x3C00_0000
+  (DBUS). `esp32s3.ld` lays the flash out in fixed parts: the kernel's
+  fetched sections first, with the load images of `.data` and the vectors,
+  then root's image slot and a child's, then the kernel's read-only data.
+  `boot.S` copies `.data` and the vectors out of flash through the data bus.
+  Literal pools sit below their code (`l32r` reaches only backwards). The
+  kernel reads every image through the data window; a part refuses a byte
+  load in the instruction window, and the emulator does not (ABI.md §3c).
 - **The watchdogs are switched off first.** `_start` turns off the RTC and
   TIMG0 watchdogs and sets the super watchdog to feed itself before it
   copies anything (ABI.md §2e has every register, key and source).
@@ -97,19 +103,30 @@ The things most likely to surprise someone arriving here:
   transcript. The emulator runs with `-semihosting`; without it the kernel
   halts after the line. A board image is linked so that it never executes
   `simcall` and halts in a quiet loop after the line (ABI.md §10).
-- **Processes run from IRAM at fixed link addresses.** Nothing translates, so
-  root links at `ROOT_LOAD_BASE` and a resident child at the destination the
-  runner's region table names, one linker script per resident image as on
-  riscv32; the region map is in `kernel/lib.saw` above `RAM_BASE`.
+- **Processes run from flash.** A process's code is used in place in its
+  image's flash slot, at the instruction-window address it is linked for,
+  and its read-only data in place at its data-window address; only its
+  writable data, arena and stack are at DRAM addresses, copied or granted
+  there (spec §5.6). Nothing translates, so root's writable data links at
+  `ROOT_LOAD_BASE` and a resident child's at the destination the runner's
+  region table names, one linker script per resident image as on riscv32;
+  the region map is in `kernel/lib.saw` above `RAM_BASE`, and the flash
+  layout in ABI.md §13. The build refuses an image not linked for its slot.
 
 The smoke's cases are in `_esp32s3_smoke` in `tools/sos_runner.py`; `--case`
 narrows it. The kernel-only ones are the gate's harness kernels of the same
 names on hand-assembled payloads from `tests/xtensa/`, and `irq_takeback`,
-which drives this HAL's CPU interrupt table directly. The process ones are
-the gate's own cases, named there, and two of the board's own:
-`irq_line_cycle` (more lines bound over a life than there are CPU
-interrupts) and `frame_hold` (every register of the trap frame held across
-ticks, in `tests/frame-hold/`). Their packages carry a
+which drives this HAL's CPU interrupt table directly, and images the loader
+must refuse (`code_in_dram`, `code_not_in_place`, `writable_in_flash`,
+`grant_past_image`, `rodata_in_ibus`, `code_in_dbus`, each a hand-assembled
+root image whose header says why). The process ones are the gate's own
+cases, named there, and the board's own: `irq_line_cycle` (more lines bound
+over a life than there are CPU interrupts), `frame_hold` (every register of
+the trap frame held across ticks, in `tests/frame-hold/`), `flash_region` (a
+region over flash is no destination and no donation), `image_split_flash`
+(the gate's `image_split` over a flash image) and `slot_mismatch` (a root
+image linked for the child's slot, which the build refuses). Their packages
+carry a
 `[sos.xtensa-esp-unknown-elf]` section naming `user/root.ld` or
 `user/child.ld` and, as native sources, `user/syscall.c` and
 `rt/common_c/support.c`, so the same programs run on this board. Blade builds
@@ -122,9 +139,20 @@ nothing references them and `--gc-sections` drops them.
 
 ## First run on a board
 
-The stages `boot`, `umode_syscall`, `timer_tick` and `bus_probe` below run
-to their end on an ESP32-S3 rev v0.2 board whose ROM is `esp32s3-20210327`;
-`root_server_boot` does not, and `bus_probe` says why. The rest is checked
+All six stages below run to their end on an ESP32-S3 rev v0.2 board whose
+ROM is `esp32s3-20210327` and whose flash is 8 MiB by `flash-id`, from images
+built with this tree's layout (`ABI.md` §13), one ROM banner and no reset in
+each capture. So the part serves what the layout reads: the kernel's strings
+at flash offset 0x20_0000 through the data window (`boot`, from its first
+line), root's image slot at 0x10_0000 through both windows, with root's code
+fetched and its literals loaded there in user mode and its string literals
+read a byte at a time through the data window (`root_server_boot`), and a
+child's code run in place from the child's slot at 0x18_0000
+(`image_held`). A board image is a little over 2 MiB; `--emit-flash` prints
+its size. What no stage shows on a part: that a process's own byte load in
+the instruction window is refused as the kernel's is (`ABI.md` §11).
+
+The rest is checked
 on the emulator or read from Espressif's tools. `ABI.md` §11 lists, item by
 item, what silicon does differently or may, what the board showed and what
 was prepared. Each step reads the board or writes our image to its flash and
@@ -194,19 +222,24 @@ sources.
 
 ```
 SAWLANG_ROOT=/path/to/sawlang python3 tools/sos_runner.py --board esp32s3 \
-    --emit-flash boot --out sos-boot.bin
+    --emit-flash boot --out .build/sos-boot.bin
 ```
 
 and the same with `umode_syscall`, `timer_tick`, `bus_probe` and
-`root_server_boot` for the later stages. Each is the smoke case's image,
-linked without the emulator's exit (it halts in place instead) and trimmed to
-its length, about 110 KiB; the runner checks the direct-boot magic at flash
-offset 0x400 and that byte 0 is not an esptool header.
+`root_server_boot` for the later stages. `.build/` is the tree's build
+directory, which git ignores. Each is the smoke case's image, linked without
+the emulator's exit (it halts in place instead) and trimmed after its last
+byte, which is the kernel's read-only data at flash offset 0x20_0000, after
+the two image slots: a little over 2 MiB, the gaps 0xFF, as erased flash
+reads (`ABI.md` §13). The runner checks the direct-boot magic at flash offset
+0x400, that byte 0 is not an esptool header, and that each process image is
+linked for the slot it sits in, and prints the image's SHA-256.
 
 ### 3. Write the image
 
 ```
-python3 -m esptool --chip esp32s3 --port PORT write-flash 0x0 sos-boot.bin
+python3 -m esptool --chip esp32s3 --port PORT write-flash 0x0 \
+    .build/sos-boot.bin
 ```
 
 The offset is 0x0: the ROM finds the magic at 0x400 and enters at 0x408.
@@ -252,15 +285,16 @@ each.
    SOS-S3: halt pass
    ```
 3. **`timer_tick`**: the timer interrupt taken from user mode. At least two
-   tick lines; the addresses may differ:
+   tick lines, each at an address in the instruction window (0x42…) that
+   moves with the code:
 
    ```
    SOS M2: timer bring-up on xtensa (ESP32-S3)
    SOS M2: timer armed
    SOS M2: entering U-mode
    SOS: console handover
-   SOS: timer tick 0x00000001 at 0x42019680
-   SOS: timer tick 0x00000002 at 0x42019686
+   SOS: timer tick 0x00000001 at <code address>
+   SOS: timer tick 0x00000002 at <code address>
    ...
    SOS-S3: halt pass
    ```
@@ -379,11 +413,13 @@ each.
    differs, and `cause` says how (`ABI.md` §3c has this part's table and
    §11 what each answer means for the process layout). A different answer
    in the user-mode step, at the DRAM names or in the flash-window loads
-   matters most: the process layout spec §5.6 specifies, not built, runs a
-   process's code and reads its read-only data in place in flash and keeps
-   its writable memory at DRAM addresses, and rests on them.
-5. **`root_server_boot`**: the first real process. Expected, if `bus_probe`
-   passed every step:
+   matters most: the process layout runs a process's code and reads its
+   read-only data in place in flash and keeps its writable memory at DRAM
+   addresses (`ABI.md` §13), and rests on them.
+5. **`root_server_boot`**: the first real process, its code run in place
+   from root's flash slot, its read-only data read there through the data
+   window, its writable data, arena and stack in DRAM. Expected, after the
+   ROM's lines:
 
    ```
    SOS M1: kernel up on xtensa (ESP32-S3)
@@ -394,29 +430,53 @@ each.
    SOS-S3: halt pass
    ```
 
-   On the rev v0.2 board this stage stops in the loader instead, at its first
-   byte store into root's region:
+   `<code address>` is in root's slot in the instruction window (0x421…) and
+   moves with root's code. The two `SOS root:` lines are root's own, each
+   handed to the kernel a byte per system call: the first is a string literal
+   root reads a byte at a time through the data window, in user mode, and
+   the second is formatted on root's stack in DRAM. A kernel fault line instead
+   names the access the part refused (the table below).
+6. **`image_held`**: a child, from the child's flash slot. Root launches a
+   hand-assembled child whose code runs in place there, and cuts its image
+   region to show the image's bytes are held while the child runs and come
+   back after it dies (`tests/image-held/src/main.saw` has the steps).
+   Expected, after the ROM's lines:
 
    ```
+   SOS M1: kernel up on xtensa (ESP32-S3)
    SOS: root image ok segments=0x00000003 entry=<code address> prio=0x01010100
-   SOS-S3: kernel fault vector=0x00000300 exccause=0x00000003
-     epc1=0x42011863 excvaddr=0x403a0000 depc=0x00000000
+   SOS: boot regions=0x00000002
+   SOS: console handover
+   SOS imageheld: launched from the image piece, its handle released
+   SOS imageheld: the next piece is not an image: the bytes are held
+   SOS-H
+   SOS: process exit: code=0x00000048 process=0x00000001
+   SOS: process teardown handles=0x00000002 threads=0x00000001 events=0x00000000 waiters=0x00000000 interrupts=0x00000000 timers=0x00000000 process=0x00000001
+   SOS imageheld: the child exited from its image
+   SOS imageheld: after the teardown the next piece is the image again
+   SOS-H
+   SOS: process exit: code=0x00000048 process=0x00000002
+   SOS: process teardown handles=0x00000002 threads=0x00000001 events=0x00000000 waiters=0x00000000 interrupts=0x00000000 timers=0x00000000 process=0x00000002
+   SOS imageheld: done
+   SOS-S3: halt pass
    ```
 
-   (one line on the console; `epc1` moves with the code). The part refuses a
-   byte store at an IRAM address, and the layout places every process
-   segment at IRAM addresses (`ABI.md` §11, §13).
+   The `SOS-H` lines are the child's: a fetch from the child's slot in user
+   mode. It makes no byte load and loads no literal, so what this stage adds
+   to `root_server_boot` is the second slot's flash page and a second
+   process's code in place.
 
 ### If you see X, it means Y
 
 | you see | it means |
 |---|---|
 | nothing at all, not even `ESP-ROM:` | the wrong port (try the other `/dev/cu.*`), the wrong baud (it is 115200), the monitor holding the chip in reset (keep `--dtr 0 --rts 0`), or a board whose UART0 is not on this USB port. Press RST with the monitor open. |
-| `ESP-ROM:` and the `rst:` line, then nothing | the ROM did not enter the image, or the image stopped before its first line. Check step 1, then confirm the flash holds the image: `python3 -m esptool --chip esp32s3 --port PORT verify-flash 0x0 sos-boot.bin`. |
+| `ESP-ROM:` and the `rst:` line, then nothing | the ROM did not enter the image, or the image stopped before its first line. Check step 1, then confirm the flash holds the image: `python3 -m esptool --chip esp32s3 --port PORT verify-flash 0x0 .build/sos-boot.bin`. |
 | the banner over and over, the `rst:` line naming `TG0WDT_SYS_RST`, `RTCWDT_RTC_RST`, `RTCWDT_SYS_RST`, `SUPER_WDT_RST` or another `…WDT…` reset | a watchdog reset the chip: the disable in `_start` did not take. Send the `rst:` line. |
 | `invalid header: 0xffffffff` | the ROM looked for an esptool image instead of direct-booting: one of step 1's eFuses forbids direct boot. |
 | `invalid header:` with another value | the flash at 0x0 holds something other than our image; write it again at 0x0. |
 | `Direct boot returned` | the kernel's entry returned to the ROM: a kernel bug. Send everything. |
 | `boot:0x… (DOWNLOAD(USB/UART0))` or `waiting for download` | the chip is in download mode: release BOOT and press RST. |
-| `SOS-S3: kernel fault vector=… exccause=… epc1=… excvaddr=…` | the kernel trapped. Send the line exactly; `exccause=0x00000003` with `excvaddr` in 0x403a… is a store the bus refused. |
+| `SOS-S3: kernel fault vector=… exccause=… epc1=… excvaddr=…` | the kernel trapped. Send the line exactly; `exccause=0x00000003` is an access width or bus the address does not take, and `excvaddr` is the address (in 0x42… the instruction window, which takes no byte load). |
+| a `kernel fault` line cut short | the fault printer gave up waiting for room in the UART's FIFO (`sink.c`'s `kernel_fault`). No emulator case can show that wait, since the emulator's FIFO is never full, and nothing in the runner checks the printer's code; a board run is its evidence, and on the rev v0.2 board a fault line arrived whole. |
 | garbage characters | a baud mismatch: the monitor is not at 115200, or this part's UART clock differs from what the ROM's divisor assumes. Run the monitor without `--raw` and with `--encoding hexlify`, and send the bytes. |

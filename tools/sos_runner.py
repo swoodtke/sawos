@@ -648,6 +648,18 @@ THREAD_ENTRY_NOT_EXEC_PKG = os.path.join(TESTS_DIR, "thread-entry-not-exec")
 CHILD_EXEC_FAULT_PKG = os.path.join(TESTS_DIR, "child-exec-fault")
 MAP_OVER_IMAGE_PKG = os.path.join(TESTS_DIR, "map-over-image")
 WX_SEGMENT_REFUSED_PKG = os.path.join(TESTS_DIR, "wx-segment-refused")
+
+# A child running out of its image, launched from a hand-assembled image used
+# in place (`tests/<arch>/child_inplace.S`); and, on the ESP32-S3, what a
+# region over flash may not be.
+IMAGE_HELD_PKG = os.path.join(TESTS_DIR, "image-held")
+FLASH_REGION_PKG = os.path.join(TESTS_DIR, "flash-region")
+IMAGE_SPLIT_PKG = os.path.join(TESTS_DIR, "image-split")
+INPLACE_LAUNCH_PKG = os.path.join(TESTS_DIR, "inplace-launch")
+# Initialized writable data, which the loader copies with its bytes; and an
+# empty region donated.
+DATA_INIT_PKG = os.path.join(TESTS_DIR, "data-init")
+DONATE_EMPTY_PKG = os.path.join(TESTS_DIR, "donate-empty")
 CHILD_WX_FAULT_PKG = os.path.join(TESTS_DIR, "child-wx-fault")
 
 # A buffer that is gone when the answer to a parked call arrives (spec §2.2).
@@ -969,17 +981,22 @@ ESP32S3_ARCH = {
     "tests_arch": "xtensa",
     "banner_arch": "xtensa",
     "hex_width": 8,
-    "root_entry": 0x403A0000,
-    # One region above root's; `hal/xtensa-esp32s3/user/child.ld` links there.
-    # The region is the size of root's, smaller than `CHILD_REGION_LEN`
-    # because this part has 400 KiB of SRAM in all.
-    "child_region_base": 0x403B8000,
+    # Where root's code starts: the instruction-window address of its flash
+    # slot plus the image's header and segment table (`user/root.ld`). The
+    # entry is somewhere in that code and moves with it, so no case on this
+    # board asserts `{entry}`.
+    "root_entry": 0x42100060,
+    # The child's writable segment and stack: one region above root's, in
+    # DRAM; `hal/xtensa-esp32s3/user/child.ld` links there. The region is the
+    # size of root's, smaller than `CHILD_REGION_LEN` because this part has
+    # 400 KiB of SRAM in all.
+    "child_region_base": 0x3FCC8000,
     "child_region_len": 0x18000,
     # UART0's matrix source, which `hal.irq_raise_selftest_line()` raises.
     "selftest_line": 27,
-    # Above the one child region, to the top of IRAM; `tests/poolbase_xtensa.c`
+    # Above the one child region, to `hal.RAM_TOP`; `tests/poolbase_xtensa.c`
     # says the same.
-    "pool_base": 0x403D0000,
+    "pool_base": 0x3FCE0000,
     "pool_len": 0x10000,
     # UART0's page, mirroring `hal.DEVICE_GRANT_BASE` / `DEVICE_GRANT_LEN`.
     "device_base": 0x60000000,
@@ -1035,8 +1052,22 @@ def needs_region_table(case):
     tick, because a table is the only way an image tells the kernel not to arm
     it, and the flags it would carry are zero.
     """
-    return bool(case.get("children") or case.get("pool") or case.get("device")
+    return bool(case.get("children") or case.get("child_asm")
+                or case.get("pool") or case.get("device")
                 or not case.get("tick"))
+
+
+def _child_count(case):
+    """How many child images the case's region table names: its Blade-built
+    `children`, or its one hand-assembled `child_asm`, which defines
+    `_sos_child0_start` and `_sos_child0_len` itself and is linked in place
+    of an appended image. A case names one kind or the other."""
+    if case.get("child_asm"):
+        if case.get("children"):
+            raise ToolError(f"case {case['name']!r}: `child_asm` is the "
+                            "case's one child; it cannot have `children` too")
+        return 1
+    return len(case.get("children", ()))
 
 # The kind column's values, mirroring `kernel/core/process.saw`'s `RegionKind`.
 # A Ram row mints a Memory and a Device row mints an IoMemory: kind, not a flag,
@@ -1500,6 +1531,93 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "asm": "payload_badsegment.S",
         "expect_out": "bad root image: segment loads below the root region",
+        "expect_clean_exit": False,
+    },
+    # --- a segment already where it is linked -------------------------------
+    # Each image states its segment's load address and its entry as the
+    # address of its own bytes, through a relocation, so it is in place
+    # wherever the linker puts the payload (spec §5.6). The riscv32 boards use
+    # such a segment in place; arm64 copies every segment. The entry moves
+    # with the build, so `entry=` is asserted up to its value.
+    {
+        # Used in place and running: root's code row names the payload's own
+        # bytes, and only that row lets the program print and shut down.
+        "name": "root_image_in_place",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_inplace.S",
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "root image ok segments={one} entry=",
+                       "SOS-I"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same image on the board that uses nothing in place, its
+        # addresses the physical ones the kernel holds the payload's bytes at:
+        # copied, and judged against root's region, which the kernel's own
+        # memory is below. Used in place, it would be granted the payload's
+        # own page and run, printing `SOS-I`.
+        "name": "root_image_in_place_copied",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_inplace.S",
+        "arches": ["arm64"],
+        "expect_out": "bad root image: segment loads below the root region",
+        "expect_clean_exit": False,
+    },
+    {
+        # Two segments used in place, code and read-only data, and a Timer's
+        # arm record in the read-only one handed to the kernel where it sits:
+        # the copy-in door takes the read-only segments used in place
+        # (spec §2.2), and root goes on to print `SOS-T`.
+        "name": "root_image_in_place_source",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_inplace_rodata.S",
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "root image ok segments={two} entry=",
+                       "SOS-T"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The entry in the read-only data segment: judged by the executable
+        # segments alone, it is refused, though the image grants its bytes.
+        "name": "root_image_entry_not_exec",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_entry_not_exec.S",
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": "bad root image: entry is not inside an executable "
+                      "segment",
+        "expect_clean_exit": False,
+    },
+    {
+        # In place and writable: the grant would let root write the image.
+        "name": "root_image_in_place_writable",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_inplace_writable.S",
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": "bad root image: segment used in place is writable",
+        "expect_clean_exit": False,
+    },
+    {
+        # In place with a zero-filled tail: nothing is placed, so the tail
+        # would be the image's next bytes rather than zeros.
+        "name": "root_image_in_place_tail",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_inplace_tail.S",
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": "bad root image: segment used in place has a "
+                      "zero-filled tail",
+        "expect_clean_exit": False,
+    },
+    {
+        # In place off the grant grain: the row would grant the bytes before
+        # the segment too.
+        "name": "root_image_in_place_grain",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_inplace_grain.S",
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": "bad root image: segment is not aligned to the grant "
+                      "granularity",
         "expect_clean_exit": False,
     },
     # --- the real two-image boot --------------------------------------------
@@ -7642,6 +7760,121 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # A child used in place holds its image's bytes until its teardown
+        # (spec §5.6, §12). Root launches it from the image cut off the front
+        # of the blob, releases that piece's handle, and cuts again: the pool
+        # serves its free list first, so a cut holding filler, not the image,
+        # says the bytes are still held while the child runs, and a cut after
+        # the child's death holding the image again says the teardown gave
+        # them back. The child is hand-assembled and prints `SOS-H` each time
+        # it runs; it is used in place only where the board does that.
+        "name": "image_held",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IMAGE_HELD_PKG,
+        "child_asm": "child_inplace.S",
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS imageheld: launched from the image piece, its "
+                       "handle released",
+                       "SOS imageheld: the next piece is not an image: the "
+                       "bytes are held",
+                       "SOS-H",
+                       "SOS imageheld: the child exited from its image",
+                       "SOS imageheld: after the teardown the next piece is "
+                       "the image again",
+                       "SOS-H",
+                       "SOS imageheld: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The image region cut while a child, started and not yet run, runs
+        # from it in place (spec §2.5's split rule over a row used in place).
+        # A cut ending inside the child's code row is `NoResource`; the whole
+        # image cut off carries the row, so releasing that piece leaves the
+        # bytes held (the blob's next cut is filler, not the image); the child
+        # runs; after its death the image comes back to the pool. Last, the
+        # whole image of a second child, cut off with its row, is donated, and
+        # a region a row grants is no donation: root ends with `BadState`.
+        "name": "image_split",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IMAGE_SPLIT_PKG,
+        "child_asm": "child_inplace.S",
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS imagesplit: a cut through the child's code: out "
+                       "of kernel objects",
+                       "SOS imagesplit: the whole image cut off carries the "
+                       "child's code",
+                       "SOS-H",
+                       "SOS imagesplit: the child exited from its image",
+                       "SOS imagesplit: after its death the image's bytes "
+                       "came back",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A child whose one segment, used in place, ends two bytes past a
+        # word at the blob's end: its grant would run past the image, and the
+        # create is `BadImage`.
+        "name": "child_grant_past_image",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": INPLACE_LAUNCH_PKG,
+        "child_asm": "child_grant_past.S",
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS inplacelaunch: create refused: not a loadable "
+                       "process image"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A child running in place in its blob, and the blob mapped into it:
+        # the mapping would cover the child's code row, an image row, and is
+        # `NoResource` (spec §2.5); the child then runs and exits.
+        "name": "map_over_in_place_image",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": INPLACE_LAUNCH_PKG,
+        "child_asm": "child_inplace.S",
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS inplacelaunch: a mapping over the child's image: "
+                       "out of kernel objects",
+                       "SOS-H",
+                       "SOS inplacelaunch: the child exited from its image"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Initialized writable data arrives with its values: the loader copies
+        # the writable segment's bytes, not only its zero-filled tail.
+        "name": "data_init",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DATA_INIT_PKG,
+        "expect_out": ["{banner}",
+                       "SOS datainit: 1234567 7654321 31337 42",
+                       "SOS datainit: written and read back 43"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A region cut down to nothing and donated is a status with the
+        # region handed back, as for any region too small for a slot; the
+        # region rule asks only of a region with bytes (spec §2.8).
+        "name": "donate_empty",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DONATE_EMPTY_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS donateempty: an empty region is refused: out of "
+                       "kernel objects",
+                       "SOS donateempty: done"],
+        "expect_clean_exit": True,
+    },
+    {
         # A thread's entry must lie in memory the process can execute. A
         # child is launched once per role and makes a thread of its own with
         # an entry in its writable data and then in its read-only data (each
@@ -8220,7 +8453,7 @@ def _region_rows(case, arch):
     be a linker expression rather than a number: that is what makes a blob row
     work at all, since the address is whatever `ld.lld` decides.
     """
-    children = case.get("children", ())
+    children = range(_child_count(case))
     # Two children and a pool cannot coexist, and the refusal is here rather
     # than in a comment because the collision is silent otherwise. The pool
     # base is one region above the one child region above root, so with two
@@ -8234,10 +8467,13 @@ def _region_rows(case, arch):
             f"share a base (see hal/*/user/child2.ld)")
     rows = []
     for i, _pkg in enumerate(children):
+        # A hand-assembled child is another object, and an assembler that
+        # cannot subtract two symbols it does not define (Xtensa's) needs its
+        # length as a symbol of its own, which the child's file defines.
+        length = (f"_sos_child{i}_len" if case.get("child_asm") else
+                  f"_sos_child{i}_end - _sos_child{i}_start")
         rows.append((f"child {i}'s image blob (linker-resolved)",
-                     f"_sos_child{i}_start",
-                     f"_sos_child{i}_end - _sos_child{i}_start",
-                     REGION_KIND_RAM))
+                     f"_sos_child{i}_start", length, REGION_KIND_RAM))
     region_len = _child_region_len(arch)
     for i, _pkg in enumerate(children):
         base = arch["child_region_base"] + i * region_len
@@ -8316,6 +8552,18 @@ def _stitch_regions(case, arch, clang):
     return stub_o
 
 
+def _child_asm_obj(case, arch, clang):
+    """Assemble a case's hand-written child image, from this architecture's
+    test directory. It is its own `.childimg` and defines the symbols the
+    region table's blob row names (`_child_count`)."""
+    dirs = arch_dirs(arch)
+    src = os.path.join(dirs["tests"], case["child_asm"])
+    obj = os.path.join(dirs["build"], f"{case['name']}.child0.o")
+    _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
+          "-nostdlib", "-c", src, "-o", obj])
+    return obj
+
+
 def _build_elf(case, arch, shared_objs, lld, clang):
     """Compile + link one test case for one architecture; return its ELF path.
 
@@ -8370,6 +8618,8 @@ def _build_elf(case, arch, shared_objs, lld, clang):
         _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
               "-nostdlib", "-c", payload_src, "-o", payload_o])
         objs.append(payload_o)
+    if case.get("child_asm"):
+        objs.append(_child_asm_obj(case, arch, clang))
     if case.get("root_pkg"):
         objs.append(_stitch_root_image(case["_root_image"][arch["name"]], arch,
                                        clang, name))
@@ -8828,6 +9078,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
     recorded with its probe in hal/xtensa-esp32s3/ABI.md.
     """
     import glob
+    import hashlib
     import select
     import struct
 
@@ -8839,6 +9090,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
     s3_triple = arch["triple"]
     flash_bytes = 4 * 1024 * 1024
     flash_ibus = 0x42000000
+    flash_dbus = 0x3C000000
     magic_offset = 0x400
     magic = 0xAEDB041D
     timeout_s = 20
@@ -8891,12 +9143,112 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
                             "--module-path", SOSABI_MODULE])
         return obj
 
-    def flash_image(name, objs, board=False):
+    def elf_symbols(data):
+        """Every named symbol in a linked ELF32's symbol table, by value: the
+        kernel's linker symbols that bound the images it carries."""
+        shoff, = struct.unpack_from("<I", data, 32)
+        shentsize, shnum = struct.unpack_from("<HH", data, 46)
+        symbols = {}
+        for i in range(shnum):
+            sh = struct.unpack_from("<10I", data, shoff + shentsize * i)
+            if sh[1] != 2:                      # SHT_SYMTAB
+                continue
+            strtab = struct.unpack_from("<10I", data,
+                                        shoff + shentsize * sh[6])[4]
+            for at in range(sh[4], sh[4] + sh[5], sh[9]):
+                st_name, st_value = struct.unpack_from("<II", data, at)
+                start = strtab + st_name
+                symbols[data[start:data.index(b"\0", start)].decode()] = \
+                    st_value
+        return symbols
+
+    def check_in_place(name, data, image):
+        """The build's own check that every resident image is linked where
+        its bytes sit (spec §5.6): read each image back out of the flash image
+        by the kernel's symbols bounding it, and require each executable
+        segment linked at the instruction-window address of its own flash
+        bytes, each other segment linked in flash at their data-window address
+        and not writable, and nothing else linked in flash, a segment with no
+        bytes in the image included. A segment linked outside both windows is
+        copied into RAM, and the loader judges it. An image the kernel would
+        not read through the data window is refused too.
+        `user/root.ld` says how the scripts make it so; a mismatch names both
+        numbers, since the loader would refuse the image at boot."""
+        symbols = elf_symbols(data)
+        images = []
+        if symbols["_payload_data_end"] > symbols["_payload_data_start"]:
+            images.append(("root's image", symbols["_payload_data_start"],
+                           symbols["_payload_data_end"]))
+        i = 0
+        while f"_sos_child{i}_start" in symbols:
+            images.append((f"child {i}'s image",
+                           symbols[f"_sos_child{i}_start"],
+                           symbols[f"_sos_child{i}_end"]))
+            i += 1
+        window = 32 * 1024 * 1024
+        for what, start, end in images:
+            if not flash_dbus <= start <= end <= flash_dbus + flash_bytes:
+                raise ToolError(
+                    f"{name}: {what} is held at {start:#x}..{end:#x}, outside "
+                    "the flash data window, where the kernel reads every "
+                    "image")
+            at = start - flash_dbus
+            blob = bytes(image[at:at + (end - start)])
+            if len(blob) < 24:
+                raise ToolError(f"{name}: {what} at flash {at:#x} is "
+                                f"{len(blob)} bytes, shorter than a sosimg "
+                                "header")
+            magic, _version, count = struct.unpack_from("<IHB", blob, 0)
+            if magic != 0x49534F53:             # 'S','O','S','I'
+                raise ToolError(f"{name}: {what} at flash {at:#x} is not a "
+                                "sosimg")
+            hint = ("" if count == 3 else
+                    f"; it has {count} segments, and the board's user "
+                    "linker scripts link an image for three")
+            if len(blob) < 24 + 24 * count:
+                raise ToolError(f"{name}: {what}'s segment table runs past "
+                                "its end")
+            for k in range(count):
+                load, off, flen, mlen, flags = struct.unpack_from(
+                    "<QIIIB", blob, 24 + 24 * k)
+                in_flash = (flash_ibus <= load < flash_ibus + window
+                            or flash_dbus <= load < flash_dbus + window)
+                if flags & 8:                   # SegFlag.Device: no bytes
+                    continue
+                if flen == 0 and in_flash:
+                    raise ToolError(
+                        f"{name}: {what}'s segment {k} has no bytes in the "
+                        f"image and is linked in flash, at {load:#x}: its "
+                        f"{mlen} bytes are zero-filled at load, which flash "
+                        "cannot take, so it must be linked in DRAM")
+                if not (flags & 4 or in_flash):
+                    continue
+                bytes_at = at + off
+                if flags & 4:                   # SegFlag.Execute
+                    want, where = flash_ibus + bytes_at, "instruction"
+                else:
+                    want, where = flash_dbus + bytes_at, "data"
+                if load != want:
+                    raise ToolError(
+                        f"{name}: {what}'s segment {k} is linked at "
+                        f"{load:#x}, but its bytes sit at flash "
+                        f"{bytes_at:#x}, whose {where}-window address is "
+                        f"{want:#x}{hint}")
+                if flags & 2:                   # SegFlag.Write
+                    raise ToolError(f"{name}: {what}'s segment {k} is "
+                                    f"writable and linked in flash, at "
+                                    f"{load:#x}")
+
+    def flash_image(name, objs, board=False, check=True):
         """Link, then write each loadable segment into a 4 MiB flash image at
         its load address's flash offset (ABI.md §1e), and check the
         direct-boot magic is really there and byte 0 is not an esptool
         header's. Returns the image, the bytes placed, and the offset one past
         the last of them, which is the length a board needs written.
+
+        Every resident image is then held to its slot (`check_in_place`),
+        unless `check` is off: a case whose image is a fixture the loader must
+        refuse turns it off, and nothing else does.
 
         A board image is linked with no `simcall` in its stops (`board`), and
         is never booted here: QEMU's runs are the emulator's image."""
@@ -8938,6 +9290,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
         if image[0] == 0xE9:
             raise ToolError(f"{name}: flash byte 0 is 0xE9, an esptool "
                             "image header; the ROM would not direct-boot it")
+        if check:
+            check_in_place(name, data, image)
         with open(flash, "wb") as f:
             f.write(image)
         return flash, used, end
@@ -9212,6 +9566,48 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
             "expect_clean_exit": True,
         },
     ]
+    # The loader's half of this board's bus rule and of the in-place rule,
+    # on hand-assembled root images in root's slot (`tests/xtensa/`), each
+    # refused at boot before anything runs. The build's own check would
+    # refuse every one but `grant_past_image` first, so they are built past it
+    # (`loader_fixture`): each is the image a wrong build makes, and the
+    # loader is what stands behind the build. Each file's header says what
+    # would happen were it accepted.
+    def refused(name, asm, reason):
+        return {
+            "name": name,
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "asm": asm,
+            "loader_fixture": True,
+            "expect_out": [rom, banner, f"SOS: bad root image: {reason}",
+                           "SOS-S3: halt fail code=0x00000004"],
+            "expect_clean_exit": False,
+            "expect_status": 4,
+        }
+    kernel_cases += [
+        # Code linked in DRAM, to be copied: the part fetches nothing there.
+        refused("code_in_dram", "payload_code_in_dram.S",
+                "segment is linked where this board cannot serve it"),
+        # Code linked in the instruction window, but not at its own bytes.
+        refused("code_not_in_place", "payload_code_not_in_place.S",
+                "segment is linked where this board cannot serve it"),
+        # A writable segment linked in flash, to be copied there.
+        refused("writable_in_flash", "payload_writable_in_flash.S",
+                "segment is linked where this board cannot serve it"),
+        # Code in place, whose grant rounded to the grain would run two bytes
+        # past the image's end.
+        refused("grant_past_image", "payload_grant_past_image.S",
+                "segment used in place is granted past the image"),
+        # Read-only data in place at the instruction-window name of its bytes:
+        # a process's byte loads there, which the emulator serves and a part
+        # refuses.
+        refused("rodata_in_ibus", "payload_rodata_in_ibus.S",
+                "segment is linked where this board cannot serve it"),
+        # Code in place at the data-window name of its bytes, where the part
+        # fetches nothing.
+        refused("code_in_dbus", "payload_code_in_dbus.S",
+                "segment is linked where this board cannot serve it"),
+    ]
 
     # The process cases: the gate's, by name, each chosen for one thing the
     # board has to get right that no other case here shows.
@@ -9233,6 +9629,20 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
     #                      and returned to the free set by its teardown
     #   tick_spinner       the shipping kernel's own tick preempting a child
     #                      that never traps, so root's Timer wake can run
+    #   copy_from_code_refused  a buffer in a child's code, in the flash
+    #                      instruction window, refused without the kernel
+    #                      touching it; a string literal in place in flash
+    #                      taken as a pipe body through the data window
+    #   thread_entry_not_exec   a thread's entry judged by the executable
+    #                      rows, with the code in flash outside the region
+    #   image_held         a child running out of its image in flash, whose
+    #                      launcher released the image's handle
+    #   data_init          initialized writable data copied out of flash into
+    #                      DRAM with its bytes
+    #
+    # Every process in them runs its code from the flash instruction window
+    # and reads its read-only data through the data window, in place in its
+    # image's slot; only its writable data, arena and stack are in DRAM.
     #
     # Each image's boot flags are the gate's (`boot_flags`): "no tick" unless
     # the case says `"tick": True`, which only `tick_spinner` does.
@@ -9242,7 +9652,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
     process_names = ["root_server_boot", "thread_basics", "thread_preempt",
                      "timer_oneshot", "tier_word", "process_lifecycle",
                      "death_fault", "pipe_pingpong", "map_into_child",
-                     "iomemory_carve", "interrupt_give", "tick_spinner"]
+                     "iomemory_carve", "interrupt_give", "tick_spinner",
+                     "copy_from_code_refused", "thread_entry_not_exec",
+                     "image_held", "data_init"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
     # This board's own process cases, for what only it has: a table of CPU
@@ -9280,6 +9692,65 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
                            "no yields",
                            "SOS framehold: joined a=0 b=0"],
             "expect_clean_exit": True,
+        },
+        {
+            # A region over flash is neither a destination nor a donation
+            # (spec §5.6, §2.8). The image cut off the blob's front is valid
+            # and copies nothing, so only the destination rule refuses the
+            # rest of the blob as its destination; then donating the piece
+            # ends root with `BadArg`.
+            "name": "flash_region",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": FLASH_REGION_PKG,
+            "child_asm": "child_inplace.S",
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={two}",
+                           "SOS flashregion: a destination in flash is "
+                           "refused: not a loadable process image",
+                           "SOS: process fault: argument outside its domain "
+                           "process={zero}"],
+            "expect_clean_exit": False,
+            "expect_status": EXIT_PROCESS_FAULT,
+        },
+        {
+            # The gate's `image_split` over a flash image: the cut through
+            # the child's code, the piece that carries its row and holds the
+            # bytes, the child running, the bytes back after its death. The
+            # donation at its end meets the region rule first here, since the
+            # piece is flash.
+            "name": "image_split_flash",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": IMAGE_SPLIT_PKG,
+            "child_asm": "child_inplace.S",
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={two}",
+                           "SOS imagesplit: a cut through the child's code: "
+                           "out of kernel objects",
+                           "SOS imagesplit: the whole image cut off carries "
+                           "the child's code",
+                           "SOS-H",
+                           "SOS imagesplit: the child exited from its image",
+                           "SOS imagesplit: after its death the image's bytes "
+                           "came back",
+                           "SOS: process fault: argument outside its domain "
+                           "process={zero}"],
+            "expect_clean_exit": False,
+            "expect_status": EXIT_PROCESS_FAULT,
+        },
+        {
+            # A root image linked for the child's slot, stitched into root's:
+            # the build reads it back and refuses it, naming where the code
+            # is linked and where its bytes sit. Every number in the line is
+            # fixed by the two slots and the image's header length.
+            "name": "slot_mismatch",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": CHILD_FAULT_PKG,
+            "expect_build_error": "root's image's segment 0 is linked at "
+                                  "0x42180060, but its bytes sit at flash "
+                                  "0x100060, whose instruction-window "
+                                  "address is 0x42100060",
+            "expect_out": [],
+            "expect_clean_exit": False,
         },
     ]
     for case in process_cases:
@@ -9359,6 +9830,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
         if case.get("asm"):
             objs.append(cc(os.path.join(s3_tests, case["asm"]),
                            os.path.join(s3_build, f"{name}.payload.o")))
+        if case.get("child_asm"):
+            objs.append(_child_asm_obj(case, arch, clang))
         if case.get("root_pkg"):
             objs.append(_stitch_root_image(
                 case["_root_image"][arch["name"]], arch, clang, name))
@@ -9372,8 +9845,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
         # board is hal/xtensa-esp32s3/README.md's "First run on a board".
         case = cases[0]
         try:
-            _flash, used, end = flash_image(case["name"], case_objs(case),
-                                            board=True)
+            _flash, used, end = flash_image(
+                case["name"], case_objs(case), board=True,
+                check=not case.get("loader_fixture"))
         except ToolError as e:
             print(f"{CROSS} {case['name']}: {e}", file=sys.stderr)
             return 1
@@ -9383,6 +9857,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
             f.write(image)
         print(f"{CHECK} {case['name']}: {emit_out}  ({end} bytes, written "
               f"at flash offset 0x0; magic checked at 0x400)")
+        print(f"  sha256 {hashlib.sha256(image).hexdigest()}")
         print("  write it with:")
         print(f"    python3 -m esptool --chip esp32s3 --port PORT "
               f"write-flash 0x0 {emit_out}")
@@ -9392,9 +9867,21 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
     for i, case in enumerate(cases, 1):
         name = case["name"]
         try:
-            flash, size, _end = flash_image(name, case_objs(case))
+            flash, size, _end = flash_image(
+                name, case_objs(case), check=not case.get("loader_fixture"))
+            if case.get("expect_build_error"):
+                print(f"[{i}/{len(cases)}] {CROSS} {name}")
+                print(f"    the build succeeded; it must refuse: "
+                      f"{case['expect_build_error']}")
+                failed += 1
+                continue
             out, status = boot(flash)
         except ToolError as e:
+            if case.get("expect_build_error") and \
+                    case["expect_build_error"] in str(e):
+                print(f"[{i}/{len(cases)}] {CHECK} {name}  (the build "
+                      "refused it)")
+                continue
             print(f"[{i}/{len(cases)}] {CROSS} {name}")
             print(f"    {e}")
             failed += 1

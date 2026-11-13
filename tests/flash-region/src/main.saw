@@ -1,0 +1,72 @@
+// A region over flash is an image source and never memory the kernel or a
+// process writes (spec §5.6, §2.8).
+//
+// The case's child blob is `tests/xtensa/child_inplace.S`: an image whose code
+// is used in place, so it has no segment to copy and asks of its destination
+// only the stack. Root cuts the image off the front of the blob, which leaves
+// the rest of the blob, flash, as a region of its own:
+//
+//   SOS flashregion: a destination in flash is refused: not a loadable
+//                    process image
+//
+// With the image valid and nothing to copy, nothing but the destination rule
+// stands between that call and a child whose stack is flash. Then root
+// donates the image piece to a slab, which the kernel would zero, and the
+// kernel ends root with `BadArg`: the transcript's last word is the kernel's
+// fault line.
+
+import sos.{System, Process, SlabKind, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.NoResource
+
+/// The front of the blob that holds the image (`child_inplace.S`).
+static PIECE: UInt = 0x100
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS flashregion: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS flashregion: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS flashregion: the donation was taken\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var blob_rec = try proc.boot_handle_next()
+    guard let blob = blob_rec.take_memory() else { return BUG }
+
+    // What is left of `blob` after the cut is flash, and longer than the
+    // kernel's stack grant, so no other check refuses it as a destination.
+    let piece = try blob.split(len: PIECE)
+    match system.process_create(image: &piece, memory: &blob) {
+        case Ok(_) -> {
+            let _ = system.debug_print(
+                "SOS flashregion: a destination in flash was taken\n")
+            return BUG
+        },
+        case Err(e) -> {
+            print("SOS flashregion: a destination in flash is refused: {}\n", e)
+        },
+    }
+
+    // The piece has one handle and no rows, so only the region rule can
+    // refuse it.
+    try system.slab_donate(kind: SlabKind.Waiters, memory: move piece) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}

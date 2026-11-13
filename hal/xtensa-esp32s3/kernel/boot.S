@@ -147,9 +147,12 @@ _start:
      * and the super watchdog needs feeding; any of them resets the part
      * mid-boot. The RTC and TIMG0 watchdogs are switched off whole (config
      * word 0), the super watchdog is set to feed itself, and each register is
-     * unlocked with its key for the one write and locked again after. The
-     * emulator models the registers and none of these writes changes what it
-     * runs. */
+     * unlocked with its key for the one write and locked again after.
+     *
+     * No emulator case can hold these writes: with a key wrong, or the RTC
+     * config address a word low, every case still passes, because the
+     * emulator models TIMG0's config and not the RTC watchdog's or
+     * `SWD_CONF`, and starts every watchdog off. A board is the only check. */
     movi    a5, 0
     l32r    a3, .Lwdt_key
     l32r    a2, .Lrtc_wdt_wprotect

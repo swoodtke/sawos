@@ -1038,8 +1038,15 @@ func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
 /// reason: pieces on loan carry a back-reference to the slot, and retiring it
 /// under them would make those references name a stranger.
 ///
+/// A region with bytes must be memory the board can give a process
+/// (`hal.map_source_ok`): the kernel writes its slots there, and a region over
+/// flash takes no store. That is a `BadArg` fault, asked before the state
+/// conditions because it is about the region itself. An empty region holds no
+/// slot, which is the `NoResource` below.
+///
 /// Faults versus statuses: a missing right, an unknown kind, a handle that is
-/// not a Memory, and each of the state conditions are things the caller
+/// not a Memory, a region the board cannot give, and each of the state
+/// conditions are things the caller
 /// could have checked (it minted the siblings, installed the rows, split the
 /// pieces), so they end the process. Whether a region holds a whole slot of
 /// some kind the caller cannot name, and whether the extent chain has room, are
@@ -1050,6 +1057,16 @@ func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
         fault_process(p, FaultReason.BadArg)
     }
     let slot = memory_arg(p, handle)
+    // Only a region with bytes is asked: an empty one has none the kernel
+    // could write, and goes on to the `NoResource` a region too small for a
+    // slot answers.
+    let region_base = MEMORIES[slot].base
+    let region_len = MEMORIES[slot].len
+    if (region_len != 0
+        && (region_wraps(region_base, region_len)
+            || not hal.map_source_ok(region_base, region_base + region_len))) {
+        fault_process(p, FaultReason.BadArg)
+    }
 
     if MEMORIES[slot].refs != 1 {
         fault_process(p, FaultReason.BadState)
@@ -1162,6 +1179,9 @@ func region_wraps(base: UInt, len: UInt) -> Bool {
 ///     policed: regions are capabilities, and a root double-spending what it
 ///     holds corrupts only what it holds. The quota rows count objects, not
 ///     bytes.
+///   - The destination must be memory the board can give a process
+///     (`hal.map_source_ok`), so a region over flash is an image and never a
+///     destination.
 func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
                     ceiling_handle: UInt) unsafe -> SyscallResult {
     let img = memory_arg(p, image_handle)
@@ -1192,6 +1212,14 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
         return op_status(SosStatus.BadImage)
     }
     if img_base < dst_base + dst_len && dst_base < img_base + img_len {
+        return op_status(SosStatus.BadImage)
+    }
+    // A destination is memory the board can give a process: copied segments
+    // and the stack are written there and the process writes it. Flash is an
+    // image source and never one (spec §5.6). A status rather than a fault,
+    // as for the refusals above, because a launcher cannot read a region's
+    // bounds.
+    if not hal.map_source_ok(dst_base, dst_base + dst_len) {
         return op_status(SosStatus.BadImage)
     }
 
@@ -1230,12 +1258,13 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
 
     // Only now does anything happen to the destination region.
     //
-    // The rows it records count against that region. A child's image and stack
-    // live in `dst`'s bytes, so they are references on it in §2.5's sense: a
-    // launcher may release its own handle on a child's memory, and the range
-    // does not go back on the pool's free list while a process is running in
-    // it. It goes back when the child dies.
-    let rw_base = place_image(slot, img_base, &dest, dst)
+    // The rows it records count against the regions they live in. A child's
+    // copied segments and stack live in `dst`'s bytes and its segments used in
+    // place in `img`'s, so they are references on those in §2.5's sense: a
+    // launcher may release its own handle on either while the child runs, and
+    // neither range goes back on its pool's free list while a process is
+    // running out of it. Each goes back when the child dies.
+    let placed = place_image(slot, img_base, &dest, dst, img)
 
     PROCESS_RECORDS[slot].state = ProcessState.Created
     // A child's table starts empty and `give` fills it. There is nothing to
@@ -1261,8 +1290,10 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     PROCESSES[body].stack_top = dest.link_top()
     PROCESSES[body].region_base = dest.link_base
     PROCESSES[body].region_top = dest.link_top()
-    PROCESSES[body].rw_base = rw_base
+    PROCESSES[body].rw_base = placed.rw_base
     PROCESSES[body].rw_top = dest.link_top()
+    PROCESSES[body].ro_base = placed.ro_base
+    PROCESSES[body].ro_top = placed.ro_top
     PROCESS_RECORDS[slot].exit_kind = ProcessStatusKind.Running
     PROCESS_RECORDS[slot].exit_code = 0
     // The launcher's handle is the child's first reference. It outlives the

@@ -1,0 +1,55 @@
+// An empty region is no slab donation, and the caller keeps it (spec §2.8).
+//
+// Root cuts a piece off the pool and cuts that piece down to nothing, then
+// donates the empty piece. The region rule asks only of a region with bytes,
+// so the piece meets the answer a region too small for any slot gets: a
+// status, with the region handed back and root still running:
+//
+//   SOS donateempty: an empty region is refused: out of kernel objects
+//   SOS donateempty: done
+
+import sos.{System, Process, SlabKind, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A piece every board can cut: a page, which is the coarsest grain.
+static PIECE: UInt = 0x1000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS donateempty: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS donateempty: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS donateempty: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_memory() else { return BUG }
+
+    let piece = try pool.split(len: PIECE)
+    let whole = try piece.split(len: PIECE)
+    try system.slab_donate(kind: SlabKind.Waiters, memory: move piece) catch {
+        let (why, back) = move error
+        let _ = move back
+        print("SOS donateempty: an empty region is refused: {}\n", why)
+        let _ = move whole
+        return
+    }
+    let _ = system.debug_print("SOS donateempty: an empty region was taken\n")
+    return BUG
+}

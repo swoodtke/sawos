@@ -130,8 +130,14 @@ func seg_at(addr: UInt) unsafe -> SosimgSeg {
 ///
 /// Checks are ordered so no bound is computed by an addition that could
 /// overflow: a hostile length must produce a diagnostic, not a panic.
-func check_segment(seg: &SosimgSeg, img_len: UInt, dest: &LoadRegion,
-                   allow_device: Bool) -> ImageFault? {
+///
+/// A segment whose link address names its own bytes in the image
+/// (`hal.same_bytes`) is used in place (spec §5.6): `check_in_place` judges it
+/// against the image, and the destination region does not hold it. Every other
+/// segment is copied and judged against the region. Either kind must also be
+/// linked where the board's buses can serve it (`hal.segment_bus_ok`).
+func check_segment(seg: &SosimgSeg, img_base: UInt, img_len: UInt,
+                   dest: &LoadRegion, allow_device: Bool) -> ImageFault? {
     let file_off = seg.file_off as UInt
     let file_len = seg.file_len as UInt
     let mem_len = seg.mem_len as UInt
@@ -179,6 +185,23 @@ func check_segment(seg: &SosimgSeg, img_len: UInt, dest: &LoadRegion,
         return check_device_grant(&seg, load_addr, file_len, mem_len)
     }
 
+    // Asked only once the file range is known to lie in the image, so the
+    // bytes `same_bytes` is asked about are the image's own.
+    let in_place = used_in_place(&seg, img_base)
+    if in_place {
+        if let bad = check_in_place(&seg, img_len, load_addr) {
+            return bad
+        }
+    }
+    if not hal.segment_bus_ok(load_addr, mem_len, seg.flags, in_place) {
+        return ImageFault(
+            reason: "segment is linked where this board cannot serve it",
+            detail: load_addr)
+    }
+    if in_place {
+        return None
+    }
+
     // Judged in the virtual domain: a segment's `load_addr` is what the linker
     // wrote, so the region it must fit is the one the image was linked into
     // (`link_base` and the destination's length), not the frames it is copied
@@ -205,6 +228,63 @@ func check_segment(seg: &SosimgSeg, img_len: UInt, dest: &LoadRegion,
     if mem_len > limit - load_addr {
         return ImageFault(reason: "segment overruns the root region",
                           detail: mem_len)
+    }
+    None
+}
+
+/// Is this segment used in place: does its link address name its own bytes in
+/// the image at `img_base` (spec §5.6)? The one test `check_segment` and
+/// `place_image` both ask, so the two cannot disagree. A segment with no bytes
+/// has nothing to use in place. The caller has held the file range to the
+/// image, so the sum cannot wrap.
+func used_in_place(seg: &SosimgSeg, img_base: UInt) -> Bool {
+    let file_len = seg.file_len as UInt
+    if file_len == 0 {
+        return false
+    }
+    hal.same_bytes(seg.load_addr as UInt, img_base + (seg.file_off as UInt),
+                   file_len)
+}
+
+/// Validate a segment used in place: its grant names the image's own bytes, so
+/// it must be one the image can stand behind (spec §5.6).
+///
+/// Readable and not writable, since the bytes are the image's: flash, or
+/// memory its launcher holds. No zero-filled tail, since nothing is placed
+/// and the bytes past `file_len` are whatever follows in the image. Aligned to
+/// the grain, for `check_segment`'s reason. And its grant, rounded up to the
+/// grain, inside the image, so the rounding reaches no byte the image does not
+/// hold. The file range is already held to the image, so the room after it
+/// cannot underflow.
+func check_in_place(seg: &SosimgSeg, img_len: UInt,
+                    load_addr: UInt) -> ImageFault? {
+    let file_off = seg.file_off as UInt
+    let file_len = seg.file_len as UInt
+    let mem_len = seg.mem_len as UInt
+    if not seg.is_readable() {
+        return ImageFault(reason: "segment used in place is not readable",
+                          detail: seg.flags as UInt)
+    }
+    if seg.is_writable() {
+        return ImageFault(reason: "segment used in place is writable",
+                          detail: seg.flags as UInt)
+    }
+    if mem_len != file_len {
+        return ImageFault(
+            reason: "segment used in place has a zero-filled tail",
+            detail: mem_len)
+    }
+    if (load_addr & (hal.PROT_GRAIN - 1)) != 0 {
+        return ImageFault(
+            reason: "segment is not aligned to the grant granularity",
+            detail: load_addr)
+    }
+    let over = file_len % hal.PROT_GRAIN
+    let pad: UInt = if over == 0 { 0 } else { hal.PROT_GRAIN - over }
+    if pad > img_len - file_off - file_len {
+        return ImageFault(
+            reason: "segment used in place is granted past the image",
+            detail: file_len)
     }
     None
 }
@@ -314,19 +394,18 @@ public(package) func validate_image(img_base: UInt, img_len: UInt,
     var i: UInt = 0
     while i < seg_count {
         let seg = seg_at(img_base + header_len + i * seg_len)
-        if let bad = check_segment(&seg, img_len, &dest, allow_device) {
+        if let bad = check_segment(&seg, img_base, img_len, &dest,
+                                   allow_device) {
             return bad
         }
         i = i + 1
     }
 
-    if entry < dest.link_base || entry >= dest.link_top() - dest.stack_len {
-        return ImageFault(reason: "entry outside the root region", detail: entry)
-    }
-    // The entry must be something the process may execute. Being inside the
-    // region is not enough: an entry in a data segment faults on its first
-    // instruction, which the kernel can see and the image's author cannot.
-    // Checked last so every earlier diagnostic keeps its wording.
+    // The entry must be something the process may execute: an entry in a data
+    // segment faults on its first instruction, which the kernel can see and
+    // the image's author cannot. It is judged by the executable segments alone
+    // and never by the region, since code used in place lies outside the
+    // region. Checked last so every earlier diagnostic keeps its wording.
     if not entry_is_executable(img_base, seg_count, entry) {
         return ImageFault(reason: "entry is not inside an executable segment",
                           detail: entry)
@@ -373,8 +452,18 @@ public(package) func image_prio_map(img_base: UInt) unsafe -> UInt {
 // Placement: copy the bytes, record the domain
 // -----------------------------------------------------------------------------
 
-/// Copy a validated image's segments into `dest` and record process `p`'s grant
-/// rows. Returns the writable window's floor.
+/// What placement leaves for a process body to record: the writable window's
+/// floor, and the span of the read-only segments used in place, which the
+/// copy-in door takes as a source besides the region (zero/zero for none).
+public(package) struct PlacedImage {
+    public(package) rw_base: UInt,
+    public(package) ro_base: UInt,
+    public(package) ro_top: UInt,
+}
+
+/// Copy a validated image's segments into `dest`, use in place the ones that
+/// already are where they are linked (spec §5.6), and record process `p`'s
+/// grant rows.
 ///
 /// The copy goes through `kcore.preempt`'s strided movers (`long_copy`,
 /// `long_zero`), so the loop carries their preemption points, which is where
@@ -395,17 +484,25 @@ public(package) func image_prio_map(img_base: UInt) unsafe -> UInt {
 /// it immediately, and a child's is installed by the scheduler at the switch.
 /// One place installs a domain, and it is not here.
 ///
-/// `region` is the `Memory` the destination is, or `NO_MEMORY`. A placed
+/// `region` is the `Memory` the destination is, or `NO_MEMORY`. A copied
 /// segment and the stack grant live in the destination region's bytes, so their
 /// rows are references on it under the second-zero rule; a launcher that
 /// releases its handle on a child's memory while the child runs leaves a husk
 /// rather than a range on the free list, and the bytes come back when the child
-/// dies and its rows go. The boot path passes `NO_MEMORY` (root's image is
-/// placed at a HAL constant that no `Memory` object names), and so does a
-/// device segment (those bytes are registers elsewhere, and `process_create`
-/// refuses one from a child).
-public(package) func place_image(p: Int, img_base: UInt,
-                                 dest: &LoadRegion, region: Int) unsafe -> UInt {
+/// dies and its rows go. `image` is the `Memory` the image is, or `NO_MEMORY`,
+/// and a segment used in place is a reference on it by the same rule: the
+/// child runs out of the image's bytes, so a launcher may release its image
+/// handle and the bytes stay until the child's teardown. The boot path passes
+/// `NO_MEMORY` for both (root's image and its region are HAL and linker
+/// constants that no `Memory` object names), and a device segment names none
+/// (those bytes are registers elsewhere, and `process_create` refuses one from
+/// a child).
+///
+/// Every row recorded here is an image row (`seal_image_rows`), the in-place
+/// ones included, so no mapping may cover one.
+public(package) func place_image(p: Int, img_base: UInt, dest: &LoadRegion,
+                                 region: Int,
+                                 image: Int) unsafe -> PlacedImage {
     let header_len = sizeof<SosimgHeader>() as UInt
     let seg_len = sizeof<SosimgSeg>() as UInt
     let seg_count = image_seg_count(img_base)
@@ -415,6 +512,10 @@ public(package) func place_image(p: Int, img_base: UInt,
     // it, so it starts at the region's top edge and only grows downward: with
     // no writable segment the process still has somewhere to receive a record.
     var rw_base = dest.link_top() - dest.stack_len
+    // The read-only window over the non-executable segments used in place,
+    // which `copy_in` takes as a source; empty until one is placed.
+    var ro_base: UInt = 0
+    var ro_top: UInt = 0
 
     var s: UInt = 0
     while s < seg_count {
@@ -434,6 +535,22 @@ public(package) func place_image(p: Int, img_base: UInt,
         if seg.is_device_grant() {
             record_grant(p, load_addr, load_addr + mem_len, load_addr,
                          seg.flags, true, NO_MEMORY)
+        } else if used_in_place(&seg, img_base) {
+            // Nothing moves: the row names the image's own bytes, read where
+            // the kernel holds them, and the user sees them at the link
+            // address, which `same_bytes` said names the same bytes.
+            // `check_in_place` held the rounded grant inside the image.
+            let top = align_up(load_addr + mem_len, hal.PROT_GRAIN)
+            record_grant(p, load_addr, top, img_base + (seg.file_off as UInt),
+                         seg.flags, false, image)
+            if (seg.flags & (SegFlag.Execute as UInt8)) == 0 {
+                if ro_top == 0 || load_addr < ro_base {
+                    ro_base = load_addr
+                }
+                if top > ro_top {
+                    ro_top = top
+                }
+            }
         } else {
             // The segment loads at a frame and is mapped at its link address.
             // `load_addr` is what the linker wrote (a user address), and
@@ -469,7 +586,7 @@ public(package) func place_image(p: Int, img_base: UInt,
                  (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), false,
                  region)
     seal_image_rows(p)
-    rw_base
+    PlacedImage(rw_base: rw_base, ro_base: ro_base, ro_top: ro_top)
 }
 
 // -----------------------------------------------------------------------------
@@ -523,7 +640,7 @@ public func load_root_and_enter(tick_period_us: UInt = 0) unsafe {
     // away from and never back into. The device-window row is included, which
     // keeps a driver image's window across a switch.
     claim_root()
-    let rw_base = place_image(ROOT_PROCESS, base, &dest, NO_MEMORY)
+    let placed = place_image(ROOT_PROCESS, base, &dest, NO_MEMORY, NO_MEMORY)
     load_domain(ROOT_PROCESS)
 
     // Spec §7: root's band map applies verbatim from its image. The scheduler
@@ -535,5 +652,6 @@ public func load_root_and_enter(tick_period_us: UInt = 0) unsafe {
     // handle, System; everything else the kernel minted for root is collected
     // through `ProcessOp.BootHandleNext` rather than passed.
     start_process(entry, dest.link_top(), dest.link_base, dest.link_top(),
-                  rw_base, dest.link_top(), tick_period_us)
+                  placed.rw_base, dest.link_top(), placed.ro_base,
+                  placed.ro_top, tick_period_us)
 }

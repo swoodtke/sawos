@@ -1,0 +1,33 @@
+// Initialized writable data arrives with its values (spec §5.6).
+//
+// `VALUES` is writable and initialized. The word root writes, the last, stays
+// in the image's writable segment with its bytes, which the loader copies into
+// root's region (the compiler may fold the words never written into code);
+// every board copies a writable segment, and on the ESP32-S3 the bytes come
+// out of flash into DRAM. Root reads the words, writes the last and reads it
+// back:
+//
+//   SOS datainit: 1234567 7654321 31337 42
+//   SOS datainit: written and read back 43
+
+import sos.{System}
+
+static EXIT_OK: UInt = 0
+
+/// Four words no zero-filled memory holds, so a segment placed without its
+/// bytes prints another number for the last.
+unsafe static var VALUES: [UInt32; 4] = [1234567, 7654321, 31337, 42]
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    report()
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func report() unsafe {
+    print("SOS datainit: {} {} {} {}\n", VALUES[0], VALUES[1], VALUES[2],
+          VALUES[3])
+    VALUES[3] = VALUES[3] + 1
+    print("SOS datainit: written and read back {}\n", VALUES[3])
+}

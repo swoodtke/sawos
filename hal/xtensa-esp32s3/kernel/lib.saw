@@ -30,8 +30,9 @@
 // promotion.
 import sosrt.{ConsoleSink, console_write, abort_status}
 
-// The image-format registry, for this profile's arch tag.
-import imgformat.{SosimgArch}
+// The image-format registry, for this profile's arch tag, and the permission
+// bits the bus rule reads.
+import imgformat.{SosimgArch, SegFlag}
 
 // The native leaves, all in `sink.c` apart from the resume path, which is the
 // tail of `boot.S`'s trap entry.
@@ -112,13 +113,15 @@ public func prot_switch(p: UInt) unsafe {
 
 /// A no-op apart from one assertion.
 ///
-/// An address is the same number in every process here, so a row whose `pa`
-/// drifted from its `base` would mean the placement seams disagree, and a
-/// profile programming no hardware could not otherwise notice.
+/// A row's `base` names the bytes at its `pa`: the same number, or, for code
+/// used in place, the instruction-window name of flash the kernel reads at its
+/// data-window name (`same_bytes`). A row that drifted from that would mean
+/// the placement seams disagree, and a profile programming no hardware could
+/// not otherwise notice.
 public func prot_update(p: UInt, base: UInt, top: UInt, pa: UInt, perms: UInt8,
                         device: Bool) unsafe {
-    assert(pa == base,
-           "a user address on the flat tier IS its physical address")
+    assert(same_bytes(base, pa, top - base),
+           "a user address on the flat tier names the bytes at its row's pa")
 }
 
 /// Nothing to retire: `clear_domain` has already emptied the kernel's record,
@@ -165,7 +168,10 @@ public func device_window_ok(base: UInt, len: UInt) -> Bool {
 // =============================================================================
 //
 // Nothing translates on this machine, so an address is the same number in
-// every process and in the kernel. Each process links at its own base.
+// every process and in the kernel. Each process links at its own base. Flash
+// has two names, one per bus window (../ABI.md §2a), and a process's code and
+// read-only data are used in place there (spec §5.6): `same_bytes` and
+// `segment_bus_ok` below are this board's answers.
 
 /// A physical address as the kernel dereferences it: itself.
 public func phys_to_virt(pa: UInt) -> UInt {
@@ -189,43 +195,103 @@ public func map_place(cursor: UInt, pa: UInt, device: Bool) -> UInt {
     pa
 }
 
+/// Flash offset 0 in each bus window, and how much flash the mask ROM maps at
+/// both before it enters the kernel (../ABI.md §2a). Instructions are fetched
+/// through the first and data is read through the second; the two are one
+/// flash.
+public static FLASH_IBUS: UInt = 0x4200_0000
+public static FLASH_DBUS: UInt = 0x3C00_0000
+public static FLASH_WINDOW_LEN: UInt = 0x0200_0000
+
+/// Does `[addr, addr + len)` lie in the window that starts at `base`?
+func in_flash_window(addr: UInt, len: UInt, base: UInt) -> Bool {
+    (addr >= base && addr - base < FLASH_WINDOW_LEN
+     && len <= FLASH_WINDOW_LEN - (addr - base))
+}
+
+/// Does the user address `link` name the `len` bytes the kernel holds at
+/// physical `at`? When the two are one number, and when `link` is the
+/// instruction-window name of the flash the kernel reads at `at`, its
+/// data-window name. The kernel holds an image by its data-window address, so
+/// code linked at the instruction-window name of its own bytes is used in
+/// place (spec §5.6).
+public func same_bytes(link: UInt, at: UInt, len: UInt) -> Bool {
+    if link == at {
+        return true
+    }
+    (in_flash_window(link, len, FLASH_IBUS)
+     && in_flash_window(at, len, FLASH_DBUS)
+     && link - FLASH_IBUS == at - FLASH_DBUS)
+}
+
+/// Can this board's buses serve a segment of `len` bytes linked at `addr` with
+/// the image permissions `flags`, used in place or copied (spec §5.6)?
+///
+/// An executable segment only in place in the instruction window and not
+/// writable: the part fetches no instruction at a DRAM address, and the
+/// loader writes no IRAM (a part refuses its byte stores). A read-only
+/// segment in place in the data window, or copied into process RAM; a
+/// writable one copied into process RAM. Every width works at the DRAM
+/// addresses process RAM has, and a byte load in the instruction window does
+/// not, so nothing but code is linked there (../ABI.md §3c).
+public func segment_bus_ok(addr: UInt, len: UInt, flags: UInt8,
+                           in_place: Bool) -> Bool {
+    let writes = (flags & (SegFlag.Write as UInt8)) != 0
+    if (flags & (SegFlag.Execute as UInt8)) != 0 {
+        return in_place && not writes && in_flash_window(addr, len, FLASH_IBUS)
+    }
+    if in_place {
+        return not writes && in_flash_window(addr, len, FLASH_DBUS)
+    }
+    addr >= RAM_BASE && addr <= RAM_TOP && len <= RAM_TOP - addr
+}
+
 // =============================================================================
 // The memory map
 // =============================================================================
 //
 // `esp32s3.ld` keeps the kernel's data in DRAM and its vectors in the bottom
-// of IRAM, and leaves the IRAM range `RAM_BASE`..`RAM_TOP` to processes. The
+// of IRAM, and leaves the DRAM range `RAM_BASE`..`RAM_TOP` to processes. The
 // ranges are chosen so that no two overlap on silicon either, where IRAM
-// 0x4037_8000 + n and DRAM 0x3FC8_8000 + n are one SRAM (../ABI.md §3a): the
-// processes' IRAM range is the twin of DRAM the kernel never uses.
+// 0x4037_8000 + n and DRAM 0x3FC8_8000 + n are one SRAM (../ABI.md §3a): no
+// range the kernel uses is the twin of the processes' range.
 
-/// The RAM a process may be given: the process regions in IRAM, which is
-/// where code a process loads can execute on silicon as well as here. The
-/// build divides it (`../user/root.ld`, `../user/child.ld`, and the runner's
-/// region table for the child destination and the pool):
+/// The RAM a process may be given, at DRAM addresses, which take every access
+/// width on the part. It holds only what a process writes: its writable
+/// segments, its arena and its stack. Its code and read-only data are used in
+/// place in flash (`same_bytes`). The build divides it (`../user/root.ld`,
+/// `../user/child.ld`, and the runner's region table for the child
+/// destination and the pool):
 ///
-///   0x403A_0000  root's region      96 KiB, the top 16 KiB its stack
-///   0x403B_8000  a child's region   96 KiB, the same shape
-///   0x403D_0000  the RAM pool       64 KiB
-///   0x403E_0000  the top of IRAM
-public static RAM_BASE: UInt = 0x403A_0000
-public static RAM_TOP: UInt = 0x403E_0000
+///   0x3FCB_0000  root's region      96 KiB, the top 16 KiB its stack
+///   0x3FCC_8000  a child's region   96 KiB, the same shape
+///   0x3FCE_0000  the RAM pool       64 KiB
+///   0x3FCF_0000  the top
+public static RAM_BASE: UInt = 0x3FCB_0000
+public static RAM_TOP: UInt = 0x3FCF_0000
 
 /// The IRAM range silicon also serves through the data bus: IRAM
 /// `SHARED_IRAM_BASE`..`SHARED_IRAM_TOP` and DRAM `IRAM_DRAM_OFFSET` lower are
 /// one SRAM under two names (../ABI.md §3a). The emulator keeps IRAM and DRAM
 /// as two arrays, so there a store through one name is not seen through the
-/// other; nothing in the kernel relies on either answer.
+/// other; nothing in the kernel relies on either answer. `tests/bus_probe.saw`
+/// probes the process range under both names.
 public static SHARED_IRAM_BASE: UInt = 0x4037_8000
 public static SHARED_IRAM_TOP: UInt = 0x403E_0000
 public static IRAM_DRAM_OFFSET: UInt = 0x006F_0000
 
-static_assert(RAM_BASE >= SHARED_IRAM_BASE && RAM_TOP <= SHARED_IRAM_TOP,
-              "the process regions must lie in the IRAM that has a DRAM name")
+static_assert(RAM_BASE + IRAM_DRAM_OFFSET >= SHARED_IRAM_BASE
+              && RAM_TOP + IRAM_DRAM_OFFSET <= SHARED_IRAM_TOP,
+              "the process range must lie in the DRAM that has an IRAM name")
 
 /// The DRAM name of the shared IRAM address `iram`.
 public func dram_name(iram: UInt) -> UInt {
     iram - IRAM_DRAM_OFFSET
+}
+
+/// The IRAM name of the shared DRAM address `dram`.
+public func iram_name(dram: UInt) -> UInt {
+    dram + IRAM_DRAM_OFFSET
 }
 
 /// May `[base, top)` be installed as a RAM row in a user domain? On this tier
@@ -236,16 +302,18 @@ public func map_target_ok(base: UInt, top: UInt) -> Bool {
 }
 
 /// May `[base, top)` be handed to a user domain as physical backing? The same
-/// question as `map_target_ok` on a machine with one address per byte, stated
-/// separately so each reads where it is asked.
+/// question as `map_target_ok` on a machine that does not translate, stated
+/// separately so each reads where it is asked. Flash is not such memory: a
+/// `Memory` over it is an image source and never a destination, a mapping or
+/// a slab donation (spec §5.6, §2.8).
 public func map_source_ok(base: UInt, top: UInt) -> Bool {
     base < top && base >= RAM_BASE && top <= RAM_TOP
 }
 
-/// Root's region, mirrored by `../user/root.ld`: segments load from the base
-/// and the stack occupies the top `ROOT_STACK_LEN` bytes.
+/// Root's region, mirrored by `../user/root.ld`: its writable segment loads
+/// from the base and the stack occupies the top `ROOT_STACK_LEN` bytes.
 public static ROOT_LOAD_BASE: UInt = RAM_BASE
-public static ROOT_REGION_TOP: UInt = 0x403B_8000
+public static ROOT_REGION_TOP: UInt = 0x3FCC_8000
 public static ROOT_STACK_LEN: UInt = 0x4000
 
 /// UART0. The mask ROM leaves it at 115200 (../ABI.md §4), so the console
