@@ -35,7 +35,8 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 |---|---|
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global and external-memory-only, not per-process). Paging targets: page-table root. There is no AddressSpace object: the domain is the process (see below). |
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. Ops `Start`/`Join`/`Exit`/`Yield`; `Exit` releases the handle it is invoked through; rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame is the context, so a switch is the trap handler returning a different frame (§7). Lifecycle: §8. |
-| `MemoryObject` | A range of RAM that can be mapped into AddressSpaces; the kind is `Memory`. Ops `Split`/`Map`; rights `MemoryRight.Split`/`.Map`/`.MapExecute`. Roots are minted at boot from the region table. §2.5. |
+| `Pool` | RAM not yet allocated: what a `MemoryObject` is allocated from. Two ops (`Allocate`, and `Available`, which reads how much it can allocate); rights `PoolRight.Allocate` and the bits it hands down to what it allocates, `.Map`/`.MapExecute`. Minted at boot from the region table. A pool is never mapped and holds no row. Splitting a pool into a smaller one and a revoke are reserved, not built. §2.5 (not yet enforced: pools). |
+| `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. One op (`Map`); rights `MemoryRight.Map`/`.MapExecute`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5 (not yet enforced: pools, split). |
 | `IoMemoryObject` | Physical memory-mapped device registers; the kind is `IoMemory`. A distinct kind rather than a flag on `MemoryObject`, so a driver cannot obtain a cacheable view of a register block by construction. Ops `Carve`/`Map`; rights `IoMemoryRight.Carve`/`.Map`. §2.5. |
 | `Mapping` | One installed protection row, with its own handle. Ops `Unmap`/`Base`; rights `MappingRight.Unmap`/`.Base`. Not givable. §2.5. |
 | `Pipe` | Synchronous message IPC with request/reply built in. Four kinds: `PipeInlet` and `PipeOutlet` (the client and server ends of a connection) and `PipeReply` and `PipeRequest` (the client's claim on one reply and the server's obligation to send it). §2.1. |
@@ -46,14 +47,13 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | `Waiter` | Generic wait aggregator (epoll/Port-style). Ops `Add`/`Remove`/`Wait`; rights `WaiterRight.Attach`/`.Wait`; the wait answer is a copy-out record. §2.2. |
 | `Process` | Two entries: a small record (the state, the status word, the pid, the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit, fault or kill (§8) — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
 | `System` | Kernel singleton: the object behind system-scoped primitives, so that every syscall is an object op (§5.7). §2.8. |
-
 The kinds are System, Process, Thread, Event, Waiter, Interrupt, Clock, Timer,
-Memory, IoMemory, Mapping, PipeInlet, PipeOutlet, PipeReply and PipeRequest
-(`ObjType`, `kernel/abi/`, the kernel-internal numbering §5.7's
-vDSO discipline keeps renumberable). The `Pipe` row is four kinds rather than
-one: a connection is a pair of counted endpoint kinds, and each in-flight
-message is a second pair — the client's claim on a reply and the server's
-obligation to send it — with "Pipe" the collective name.
+Pool, Memory, IoMemory, Mapping, PipeInlet, PipeOutlet, PipeReply and
+PipeRequest (`ObjType`, `kernel/abi/`, the kernel-internal numbering §5.7's vDSO
+discipline keeps renumberable; Pool is not yet enforced: pools). The `Pipe` row
+is four kinds rather than one: a connection is a pair of counted endpoint kinds,
+and each in-flight message is a second pair — the client's claim on a reply and
+the server's obligation to send it — with "Pipe" the collective name.
 
 **Every kind but Clock and System is counted.** Every countable kind's slab
 slot carries the number of references naming it, and reaching zero frees the
@@ -67,7 +67,8 @@ somebody says what references it:
 | Waiter | handle entries |
 | Interrupt | handle entries + its attachment. Only the one handle keeps it live: releasing it destroys the Interrupt, and an attachment then holds the invalid object until it is removed (§2.10). A give or a staged message moves that one name and is not a release |
 | Timer | handle entries + its attachment |
-| MemoryObject / IoMemoryObject | handle entries (a Memory's installed grant rows are a second count, §2.5) |
+| Pool | handle entries. The bytes it has allocated and not had back hold it too: a pool whose handles are all gone stays until its last allocation has come home (§2.5; not yet enforced: pools) |
+| MemoryObject / IoMemoryObject | handle entries (an allocation's installed grant rows are a second count, §2.5) |
 | Mapping | handle entries — not its row, which the Mapping owns rather than the reverse (§2.5) |
 | Process | handle entries + its attachment, on the record. A shared object charged to the process holds no reference on it: the process's death disowns the object (§2.10). A live process is never freed by losing its last handle, and a `Gone` one's record is reclaimed when the count reaches zero (§2.7); its body went back at the teardown, whatever the count. The attachment column is what makes attach-after-death sound against that reclaim: a watched dead record cannot reach zero while somebody is watching it |
 | PipeInlet | handle entries + its attachment, on the connection's inlet column. The two endpoint kinds share one `PIPES` row and count on separate columns, which is what makes "every client handle is gone" askable at all; a side reaching zero raises peer-gone on the other, and the slot frees only when both columns are zero. The attachment is per end, not per connection: a client waits for room and a server waits for a message, so §2.2's at-most-one-Waiter rule holds per column exactly as the count does |
@@ -109,13 +110,14 @@ drop a counted reference (a one-shot attachment detaches at its copy-out) and a
 dropped reference can deliver (a column reaching zero raises a peer-gone
 level) — so both live in one module, `kcore.refs`.
 
-**AddressSpace is implicit, deliberately.** Each process gets one granted range
-plus a writable window, and its protection rows are recorded in its process body
-and installed when the scheduler switches it in (§7). That record is what an
-AddressSpace object would own if one existed, and a `Mapping` is a handle onto
-one row of it. `map` names a target process, because §5b says the domain is the
-process on every profile, so an AddressSpace object would be a second name for a
-thing every op already has. Nothing above it would change if it existed.
+**AddressSpace is implicit, deliberately.** Each process's protection rows (the
+ones its loader recorded and the ones `map` installed) are recorded in its
+process body and installed when the scheduler switches it in (§7). That record
+is what an AddressSpace object would own if one existed, and a `Mapping` is a
+handle onto one row of it. `map` names a target process, because §5b says the
+domain is the process on every profile, so an AddressSpace object would be a
+second name for a thing every op already has. Nothing above it would change if
+it existed.
 
 ### 2.1 Pipes: bounded messages and built-in request/reply
 
@@ -421,9 +423,10 @@ cannot carry the request handle it is invoked through (§3).
 `decode_boot_handle` precedent generalized: the record carries a kind byte per
 slot beside the word, so a receiver matches a `PipeHandle` out instead of
 holding a number. The kinds a message may carry are the givable ones the
-receiving vocabulary can name: `Memory`, `IoMemory`, `PipeInlet`, `PipeOutlet`,
-`PipeReply`, `PipeRequest`, `Event`, `Thread`, `Waiter`, `Timer` and `Interrupt`
-— every kind a boot record can carry but two (`msg_kind_of` is `boot_kind_of`
+receiving vocabulary can name: `Pool` (not yet enforced: pools), `Memory`,
+`IoMemory`, `PipeInlet`, `PipeOutlet`, `PipeReply`, `PipeRequest`, `Event`,
+`Thread`, `Waiter`, `Timer` and `Interrupt` — every kind a boot record can carry
+but two (`msg_kind_of` is `boot_kind_of`
 less those two). `Process` and `System` are refused at the sender, as a scope
 line rather than a rule: both wrappers live above `sos.pipe` in the module
 order, so admitting them is a sysapi module split and a named follow-up (§11).
@@ -670,45 +673,53 @@ a reply delivery carries, which is why there is one type and not two — and
   there is no idle-and-doomed state for it to see. The typed surface needs
   nothing new, since `Waiter.wait` already answers `Result<WaitResult,
   SosStatus>`.
-- **Copy-out is checked, and it is one door.** The destination must be
-  word-aligned, inside the process's writable window, and in a grant row that
-  permits write; one that is not terminates the process (§5.7's faults ruling
-  — a process linked its own image and knows where its data is). A single
-  kernel funnel, `copy_out`, performs that check for everything that copies
-  out, §2.1's message body included; with its mirror `copy_in` it is the only
+- **Copy-out is checked, and it is one door.** The destination must be a
+  buffer the kernel may write (the buffer rule, below); one that is not
+  terminates the process (§5.7's faults ruling — a process knows its own
+  memory: the image it linked and the mappings it holds). A single kernel
+  funnel, `copy_out`, performs that check for everything that copies out,
+  §2.1's message body included; with its mirror `copy_in` it is the only
   place the kernel dereferences a user address, which is what keeps a
-  per-address-space mapping switch a one-place change. A buffer that was valid
-  when a call parked and is not when the answer arrives (a mapping unmapped in
-  between, or replaced by one that does not permit the access) ends its
-  process as a bad buffer does: the delivery asks again before it spends
-  anything, so what it was handing over is disposed of as for a receiver that
-  died, and the process ends with `BadBuffer` at the next switch point rather
-  than inside the delivery.
+  per-address-space mapping switch a one-place change. A buffer that was
+  valid when a call parked and is not when the answer arrives (a mapping
+  unmapped in between, or replaced by one that does not permit the access)
+  ends its process as a bad buffer does: the delivery asks again before it
+  spends anything, so what it was handing over is disposed of as for a
+  receiver that died, and the process ends with `BadBuffer` at the next switch
+  point rather than inside the delivery.
 - **What every copy door keeps true.** The kernel touches a process's memory
   only through a door that, at the moment of the touch and for that direction,
   finds a row of that process covering the whole range with the permission the
   touch needs: read for a source, write for a destination, never a row that
-  permits execute (any such row covering a byte refuses the range), never a
-  device row. A refusal at any door, early or late, is that process's fault and
-  ends that process, never the machine. Nothing the kernel learns about a
-  process's memory outlives a point where another thread can run: a parked call
-  keeps its buffer's user address and never a translation of it, and the late
-  door translates it again at the wake, so a row unmapped and another mapped at
-  the same addresses meanwhile is judged as the row it then is — a read-only one
-  ends the process, a writable one is written, as any buffer is. A record the
-  kernel reads out of a process is copied once and acted on as copied; the one
-  record read twice, a parked call's (§2.1), is asked at its second reading in
-  the call's order (the record, its length, the body, then the connection's
-  state) and held to the call's rules, but for a handle word the call would
-  have faulted on, which arrives empty because the caller is not running to be
-  faulted. A wake that writes a buffer asks it before anything else that could
-  answer the thread with a status (room in its table, for one), so a process
-  whose buffer is gone ends with `BadBuffer` whether or not that answer was
-  owed. A wake that carries only a status (the peer closed) writes no buffer
-  and asks about none: the process is answered and runs on. So a future op
-  that changes a row in place (its permissions, say) must be, to every door,
-  an unmap followed by a map: the grant record and the hardware change
-  together with no preemption point between, nothing caches a row's
+  permits execute (any such row covering a byte refuses the range; the buffer
+  rule below says how rows are compared), never a device row. A refusal at any
+  door, early or late, is that process's fault and ends that process, never the
+  machine. Nothing the kernel learns about a process's memory outlives a point
+  where another thread can run: a parked call keeps its buffer's user address
+  and never a translation of it, and the late door translates it again at the
+  wake, so a row unmapped and another mapped at the same addresses meanwhile (on
+  arm64 a new mapping can be placed at an address an unmap freed, §2.5) is
+  judged as the row it then is, for the permission the door needs: a row that
+  grants it is used, as any buffer is, and one that does not ends the process.
+  That is the program's error, and the kernel still writes only where the
+  process may write at that moment. Bytes another process can also reach (an
+  allocation mapped into both, §2.5) may be rewritten at any moment, during a
+  call that names them included, and nothing the kernel decides depends on them
+  staying still: a record the kernel reads out of a process is copied once and
+  acted on as copied, and the one record read twice, a parked call's (§2.1), is
+  asked at its second reading in the call's order (the record, its length, the
+  body, then the connection's state) and held to the call's rules, but for a
+  handle word the call would have faulted on, which arrives empty because the
+  caller is not running to be faulted. A wake that writes a buffer asks it
+  before anything else that could answer the thread with a status (room in its
+  table, for one), so a process whose buffer is gone ends with `BadBuffer`
+  whether or not that answer was owed. A wake that carries only a status (the
+  peer closed) writes no buffer and asks about none: the process is answered and
+  runs on. A row's access is fixed when it is installed (a `Mapping`'s only ops
+  are `Unmap` and `Base`, §2.5), so a change of access is an unmap and a map,
+  and a future op that changes a row in place (its permissions, say) must be, to
+  every door, an unmap followed by a map: the grant record and the hardware
+  change together with no preemption point between, nothing caches a row's
   permission or translation across a switch point, and the next door to look,
   late doors included, judges the new row.
 - **`write_result` is the only function that writes an answer into a frame** —
@@ -737,8 +748,8 @@ a reply delivery carries, which is why there is one type and not two — and
   waker learns whether to post or to stop without a probe post. It is a plain
   level, not a terminal one: consume clears nothing, and the level's end is
   the poster's own next post. A Thread is not waitable (§8), and attaching one
-  is a `NotWaitable` fault; so is attaching a MemoryObject, which has no state
-  that could become ready.
+  is a `NotWaitable` fault; so is attaching a MemoryObject or a Pool (not yet
+  enforced: pools), neither of which has state that could become ready.
 
   What stays per-kind is five questions — who is watching me, set who is
   watching me, am I ready, what does a record say, and a record was
@@ -770,33 +781,54 @@ a reply delivery carries, which is why there is one type and not two — and
   funnel, so the drain cannot happen on the already-ready path and not on the
   wake path, whichever door the readiness came through.
 - **The copy-in door is the copy-out funnel's mirror twin**, used by
-  `Timer.Arm` and by §2.1's message body. It refuses the same things — a
-  misaligned address, an address outside the process, an address in no row
-  that permits read — and terminates the process for each, on the same
-  reasoning. One asymmetry is deliberate: copy-out's window is the process's
-  writable memory and copy-in's is the whole granted region, because a record
-  may legitimately come out of a process's own rodata, and the two doors guard
-  different hazards (writing
-  outside the writable window corrupts the process; reading outside the
-  granted region reads somebody else). A copy-in length is checked for
-  equality rather than "at least": a capacity may be over-provisioned, but an
-  inbound length is the caller's statement of what it is handing over.
-  **Neither door copies through memory the process may execute**: a buffer
-  any byte of which lies in a grant row that permits execute is `BadBuffer`,
-  whichever door and whatever other rows cover it, even a string kept beside
-  the code, and a segment both writable and executable, which the loader
-  accepts (§2.5), is no buffer either. So every board links
-  a program's read-only data as a segment of its own, readable and neither
-  writable nor executable, which is where its string literals are. The
-  segment costs one grant row, which every board's budget affords. On the
-  isolated profiles it keeps a program's constants, its jump tables among
-  them, unwritable by the program itself; on a flat one it keeps them out of
-  executable memory, so they are a legal source, and nothing stops the
-  process writing them where they sit in RAM (§5b.1). The copy-in window
-  also takes in a process's in-place read-only segments (§5.6), so a literal
-  used in place is a source. On the ESP32-S3 the rule
-  also keeps the kernel from a byte load in the flash instruction window,
-  which the part refuses.
+  `Timer.Arm` and by §2.1's message body. It refuses what copy-out refuses,
+  for the direction it copies in, and terminates the process on the same
+  reasoning. A copy-in length is checked for equality rather than "at
+  least": a capacity may be over-provisioned, but an inbound length is the
+  caller's statement of what it is handing over.
+- **The buffer rule: any memory a process's grant lets it reach is a
+  buffer**, whichever row grants it — a row the loader recorded (a segment,
+  copied or used in place, or the stack) or a row `map` installed (§2.5) —
+  on every profile (not yet enforced: buffers). The row decides, and both
+  doors ask the same questions, each with the permission its direction
+  needs:
+  - **A buffer is word-aligned**; one that is not is `BadAlign`.
+  - **A source lies whole in one non-device row of the process that permits
+    read, and a destination in one that permits write**; anything else is
+    `BadBuffer`. A buffer that runs out of one row into another is `BadBuffer`
+    even where the two are adjacent, because a row is the unit of one
+    translation: arm64 can place two mappings side by side (§2.5), and a program
+    that treats them as one array can hand the kernel no buffer across the seam.
+  - **A device row is never a buffer.** The kernel does not copy through a
+    register window, and a copy over device memory would break the access
+    sizes a driver's own reads keep.
+  - **Neither door copies through memory the process may execute**: a buffer
+    any byte of which a row of the process that permits execute also grants
+    is `BadBuffer`, whichever row the buffer lies in and whatever other rows
+    cover it. The rows are compared by the bytes they grant and not by the
+    addresses the process sees them at (not yet enforced: buffers), because
+    on arm64 one allocation can be mapped at two addresses of one process
+    (§2.5): a buffer in a writable view of bytes the process may fetch from
+    at another address is refused, as the same buffer in the executable view
+    is. A string kept beside the code is no buffer, and a segment both
+    writable and executable, which the loader accepts (§2.5), is none
+    either. So every board links a program's read-only data as a segment of
+    its own, readable and neither writable nor executable, which is where
+    its string literals are. The segment costs one grant row, which every
+    board's budget affords. On the isolated profiles it keeps a program's
+    constants, its jump tables among them, unwritable by the program itself;
+    on a flat one it keeps them out of executable memory, so they are a
+    legal source, and nothing stops the process writing them where they sit
+    in RAM (§5b.1). A read-only segment used in place (§5.6) is a row like
+    any other, so a literal used in place is a source. On the ESP32-S3 the
+    rule also keeps the kernel from a byte load in the flash instruction
+    window, which the part refuses.
+  - **The two directions guard different hazards**, which is why they ask
+    for different permissions: the kernel must not store where the process
+    may not store itself, and a record may legitimately come out of a
+    process's own read-only data. So memory `map` installed read-only, the
+    stats region's row among it (§2.7), is a source and never a
+    destination.
 - **Attach semantics:** **level-triggered** (keeps reporting ready until the
   waiter handles it — no lost edges); attachments are **persistent by
   default** with explicit `remove(key)` (by key, never by the waitable's
@@ -930,24 +962,27 @@ a reply delivery carries, which is why there is one type and not two — and
   completion and takes no interrupt in kernel mode (§9) on one processor (§7);
   one drain reads-and-clears.
 
-### 2.5 Memory: MemoryObject vs Mapping
+### 2.5 Memory: Pool, MemoryObject and Mapping
 
 **Names.** This section's design vocabulary is `MemoryObject`; the kinds the
-kernel declares are **`Memory`** (RAM), **`IoMemory`** (device MMIO) and
-**`Mapping`** (one installed row) — `ObjType` cases in `kernel/abi/`, under
-the numbering §5.7's vDSO discipline keeps renumberable. The verbs are `split`
-(RAM: one cut from the front, the parent becomes the remainder), `carve`
-(device: the parent stays whole), `map` (install a row, answer a `Mapping`)
-and `give` (§3's move of a region into a child's table). The longer spellings
-name the same three kinds wherever they appear.
+kernel declares are **`Pool`** (RAM not yet allocated), **`Memory`** (an
+allocation of RAM), **`IoMemory`** (device MMIO) and **`Mapping`** (one
+installed row) — `ObjType` cases in `kernel/abi/`, under the numbering §5.7's
+vDSO discipline keeps renumberable. The verbs are `allocate` (RAM: a new
+`Memory` out of a pool, which no longer has those bytes), `carve` (device: the
+parent stays whole), `map` (install a row, answer a `Mapping`) and `give` (§3's
+move of a handle into a child's table). The longer spellings name the same
+kinds wherever they appear. The `Pool` kind and its op are not yet enforced:
+pools, and the transition at the end of this section says what the kernel
+does until they are.
 
 **The model.**
 
 - **`MemoryObject`** = authority over a physical page range, allocated
   **from a typed pool**. The pool's attribute governs three things at once:
-  - **RAM pool** (cacheable, `Normal`): unique allocation — a region is
-    allocated once and unavailable until freed; returns to the pool when its
-    last reference drops (see the refcount invariant below). Maps as
+  - **RAM pool** (cacheable, `Normal`): unique allocation — a range is
+    allocated once and unavailable until freed; it returns to its pool when
+    its last reference drops (see the refcount invariant below). Maps as
     `UnsafeMemory<_, Normal>`-class cacheable memory.
   - **Device pool** (uncacheable MMIO, `Device`): a fixed region may be
     handed out many times (multiple drivers can hold handles to the same
@@ -959,8 +994,9 @@ name the same three kinds wherever they appear.
     attribute travels with the handle.
 - Sendable over pipes — so the same physical memory can be mapped into
   multiple address spaces at multiple virtual locations (the shared-memory
-  primitive). Derived by splitting / attenuating a parent; pool roots given
-  to the root server at boot.
+  primitive). Allocated from a pool, or narrowed from another handle onto the
+  same allocation; root's pools and allocations come from the region table at
+  boot (§12).
 - **`map(aspace, ...) -> Mapping`.** Mapping is a distinct kernel object with
   its own handle, recording the virtual placement. **Only the Mapping handle
   can unmap** (`mapping.unmap()`).
@@ -972,100 +1008,319 @@ name the same three kinds wherever they appear.
   drops. This is what makes multi-mapping safe: no mapping can outlive its
   backing.
 
-**The pool attribute is a kind.** A RAM pool root is a `Memory` and a device
-pool root is an `IoMemory`, decided by a kind column in the build-emitted
-region table (§12). The intent marker is therefore not a flag anybody checks:
-an IoMemory's `map` takes no access argument and installs a device-attribute
-row, and there is no other op on the kind, so "a Device MemoryObject can only
-produce Device mappings" holds by construction. The attribute travels with
-the handle because the attribute is the handle's kind.
+**The pool attribute is a kind.** RAM is a `Pool` or a `Memory` and device
+memory is an `IoMemory`, decided by a kind column in the build-emitted region
+table (§12). The intent marker is therefore not a flag anybody checks: an
+IoMemory's `map` takes no access argument and installs a device-attribute row,
+and there is no other op on the kind, so "a Device MemoryObject can only
+produce Device mappings" holds by construction. The attribute travels with the
+handle because the attribute is the handle's kind.
 
 **A region is a capability, not a description.** There is no op that reads a
-MemoryObject's bounds: a process that holds one can hand it to the kernel and
-cannot learn a number from it. What a process knows about where its memory is,
-it knows from the config that gave it the region — which is what root's
-tag-to-meaning config is, and where a driver's `UART_BASE` comes from.
+pool's or an allocation's bounds: a process that holds one can hand it to the
+kernel and cannot learn a number from it. What a process knows about where its
+memory is, it knows from the config that gave it the region — which is what
+root's tag-to-meaning config is, and where a driver's `UART_BASE` comes from.
 
-**`Memory`: ops `Split` and `Map`, rights `MemoryRight.Split`, `.Map` and
-`.MapExecute`** beside the universal `Transfer` and `Mint`.
+**Pools and allocations are two kinds, with disjoint ops** (not yet enforced:
+pools, split). A pool is memory nobody uses yet, and what it does is hand out
+allocations and say how much it can; an allocation is memory in use, and it is
+what is mapped, run in, given and donated. Nothing that can have a grant row is
+ever cut, and nothing that is cut can have a row. A program holding one knows
+which it holds: the handle's kind says so (`INFO_OP`'s `Kind`, §3; a typed
+wrapper is one or the other).
 
-- **`split(len)` is one cut from the front, and the parent becomes the
-  remainder.** Allocation is repeated front-splits and the parent is the pool
-  cursor, so a piece is allocated once and unavailable until freed.
-  Arbitrary-offset carving is refused by the shape rather than by a check,
-  since one `{base, len}` slot cannot hold two remainders.
-  The piece is minted with the rights of the handle the split went through,
-  not the kind's default set (§3).
-- **A split carries a region's rows to whichever piece covers them.** A row is
-  counted on the region whose bytes it grants: a child's image and stack rows, a
-  `Mapping`'s row, and the rows of any process that maps the region. A cut moves
-  the rows that lie wholly inside the piece onto it and leaves the rest on the
-  parent, so the piece's range returns to its pool only when no row of any
-  process lies in it (the second zero, below), and a launcher that splits a
-  child's destination and releases the front leaves a husk, not a free range. A
-  cut through the middle of a row is `NoResource` with nothing changed, a status
-  and not a fault: the launcher that holds a child's destination cannot know
-  where the child's segments lie, the answer `map` gives for the same rows. A
-  `Memory` no row names splits as before.
+**`Pool`: two ops, `Allocate` and `Available`; rights `PoolRight.Allocate` and
+two bits it hands down, `.Map` and `.MapExecute`**, beside the universal
+`Transfer` and `Mint` (not yet enforced: pools). A pool cannot be mapped, passed
+to `process_create` as an image or a destination, or attached to a Waiter, and
+no grant row is ever counted on one. Root receives the build's pools at boot
+(§12), and a pool, or a narrowed sibling of one, can be given to another process
+like any handle; what that process then holds is a byte budget: it can allocate
+no more than the pool holds, and what it releases it can allocate again.
+
+- **`allocate(len, granularity) -> Memory`.** `PoolOp.Allocate` (op 0) takes the
+  length in its first argument and the granularity in its second, and answers a
+  new `Memory` handle in the caller's table. The granularity is the unit the
+  allocation is made of: its base and its length are multiples of it, it is
+  recorded on the allocation for its life (a field of the Memory slot), and
+  anything that later divides the allocation is held to it (§2.5's direction).
+  The granularities a pool accepts are the set its `available` answers (below).
+  Today that set is one value, the profile's protection grain (`hal.PROT_GRAIN`:
+  a page on Profile B, four bytes on Profile A, §5.6). Zero spells the pool's
+  finest accepted granularity, the set's lowest bit, which is the grain, so zero
+  and the grain's own value are the only legal words. The typed
+  `Pool.allocate(len:granularity:)` takes it as a defaulted trailing parameter,
+  zero, as `mint` takes its keep mask. Its answers, in the order they are
+  decided, after §5.7's dispatch order has answered a word that names nothing:
+  - a handle without `PoolRight.Allocate` is the `AccessDenied` fault;
+  - a granularity that is neither zero nor in the pool's accepted set, a
+    `len` of zero, and a `len` that is not a multiple of the granularity
+    asked are each the `BadArg` fault: `available` with a granularity of
+    zero is legal through any handle that may allocate and answers the set,
+    so the caller could have read which granularities it may name and the
+    unit its `len` must be a multiple of;
+  - a caller at its `Memory` quota answers `QuotaExceeded` (§2.9's policy
+    first);
+  - a `len` the pool cannot serve in one aligned run (below) answers
+    `NoMemory`: the pool holds fewer free bytes, or holds them only in ranges
+    none of which has an aligned run that long;
+  - a full Memory slab answers `NoResource`, as does a cut that would need a
+    free-list node (below) when the node slab has none;
+  - a caller at its handle budget answers `QuotaExceeded`, and one within it
+    whose table is full `NoResource`.
+
+  A refusal changes nothing: every test reads, and the bytes are cut and the
+  allocation written only once every answer is behind the op. The order is
+  §2.9's: the caller's own budget first, then the resource it named (its pool),
+  then the machine's (the slab), and the mint last, as at every op that mints.
+  The pool's refusal is a status and not a fault because the caller could not
+  have checked it (§5.7): a holder can read a pool's free bytes only as a
+  snapshot (`available`, below), and another holder of the same pool, or
+  another thread of its own, can change them between any read and the call.
+  So a pool shared between processes is shared state, and any allocation from
+  it may answer that status whatever any holder knew a moment before. No other
+  op answers it.
+- **`available(granularity) -> (total, largest, granularities)`.**
+  `PoolOp.Available` (op 1) answers three words about the pool. The first two
+  are for the granularity it is asked about, accepted and spelled as
+  `allocate`'s, and count only what an `allocate` at that granularity could take
+  at the moment of the call. A range's aligned run is the longest part of it
+  that starts and ends on multiples of the granularity.
+  - `total` is the bytes free: the aligned runs of the ranges on the pool's free
+    list and of its unspent frontier, added up. Bytes dropped for want of a
+    free-list node (§5.9) are not free, and nothing out on loan, donations
+    included, is.
+  - `largest` is the longest of those aligned runs. That is its definition: if
+    nothing changes in between, an `allocate` at the same granularity of exactly
+    `largest` bytes, when it is not zero, does not answer `NoMemory`, and one of
+    `largest` plus one unit of the granularity does, from a caller within its
+    `Memory` quota (one at its quota is answered `QuotaExceeded` first, by the
+    order above). A `largest` of zero means no allocation at that granularity
+    can be served.
+  - `granularities` is the set of granularities this pool accepts, as a bit set:
+    bit `n` set means a granularity of `2^n` bytes is accepted, so one machine
+    word names every power of two a granularity can be. Today exactly one bit is
+    set, the grain's (bit 12 on Profile B, bit 2 on Profile A), and its lowest
+    set bit is always the granularity zero spells. It is the pool's answer and
+    not the machine's: what the kernel will serve from this pool's memory, which
+    today is the same for every pool of a profile and leaves room for a pool
+    whose memory can be mapped in one unit only, or is too small or misaligned
+    for a coarse one. It does not depend on the granularity asked, and it does
+    not change over the pool's life.
+
+  At the grain, with a pool whose base lies on it, every free range is a whole
+  number of grains already, so the alignment drops only the frontier's tail,
+  which no allocation is ever served from.
+
+  It takes the granularity, then the address and capacity of a record in the
+  caller's memory (three argument words), and writes the three words there,
+  `total`, `largest` and `granularities`, one machine word each (a pool's bytes
+  lie in the machine's address space, so a word holds them). Three words do not
+  fit the one value register, so the op answers through a record as `PipeCreate`
+  does (§2.1), and `sosabi` publishes the record's size. The record is a
+  destination under §2.2's buffer rule like any other. Its answers, in order: a
+  handle without `PoolRight.Allocate` is the `AccessDenied` fault, a granularity
+  not accepted and a capacity below the record's size the `BadArg` fault, and a
+  destination the copy-out door refuses its fault (`BadAlign`, `BadBuffer`);
+  then it answers `Ok`, having changed nothing in the pool.
+  - **`total` and `largest` are a snapshot.** Another holder of the pool, or
+    another thread of the caller, can change both before the caller acts on
+    them, which is why `allocate` answers a status for a length the pool cannot
+    serve and not a fault.
+  - **It spends `PoolRight.Allocate`.** The answer is only of use to a holder
+    that can allocate, and one that can allocate learns `total` and `largest`
+    anyway by asking `allocate`; a handle narrowed without the right learns
+    neither how much the pool holds nor how much a sibling's holder has taken. A
+    pool has no observe set (only a Process does, §2.7).
+  - **Cost.** `total` and `largest` come from one walk of the pool's free list,
+    bounded by the free-list node slab's capacity (`SlabKind.FreeRanges`), the
+    same walk `allocate` makes; it takes no preemption point, as the bounded
+    slab scans take none (§9).
+- **Where the bytes come from.** An allocation is the front of the aligned
+  run of the lowest-addressed range on the pool's free list whose aligned run
+  holds `len` (first fit), and, only when no free range's does, the front of
+  the aligned run of the pool's unspent frontier. Taking the list first keeps
+  the frontier whole for as long as possible. The bytes leave the pool: none
+  of them is handed out again until the allocation has come home. The caller
+  passes no address and learns none. The bytes past a pool's last whole
+  grain, and before its first grain boundary when its base is off the grain,
+  are never handed out; the build puts pool rows on the grain (§12).
+  A cut from an aligned run that does not begin where its range begins
+  leaves a free range before the allocation as well as after it, and the one
+  before needs a free-list node of its own (`SlabKind.FreeRanges`); one the
+  node slab cannot give is the `NoResource` above, decided before anything
+  is cut. None of that is reachable while the grain is the one granularity
+  accepted: a pool on the grain hands out only grain multiples, so every
+  free range and the frontier begin on the grain and a cut takes their
+  front.
+- **What it makes.** A new `Memory` over exactly `len` bytes, which records the
+  pool it came from and its granularity. It is charged to the caller's
+  `QuotaKind.Memory` row (§2.9), whoever's pool it is, and the bytes are charged
+  to nobody: they are the pool's outstanding bytes until they come home.
+- **An allocation's rights come from the pool handle it was allocated
+  through.** It is minted with that handle's rights word intersected with
+  the bits a `Memory` has (`Transfer`, `Mint`, `Map` and `MapExecute`), then
+  capped by the caller's `Memory` ceiling (§2.7). A pool handle carries those
+  four bits on behalf of what it allocates, at the bit numbers `MemoryRight`
+  gives them, and its own `Allocate` is not among them. So narrowing a pool
+  handle narrows everything allocated through it: a launcher that gives a
+  child a pool sibling minted without `MapExecute` has given it memory it can
+  allocate, map, read and write and never execute from, and one minted
+  without `Transfer` has given it allocations it cannot give on. An
+  allocation is never wider than the pool handle it came through, and no
+  sequence of ops recovers a bit that handle lacked (§3).
+- **The rights, bit by bit.** `PoolRight.Transfer` (bit 0) and `.Mint` (bit 1)
+  are the universal pair (§3), and they are handed down as well. Bits 8 to 15
+  are `MemoryRight`'s bits, carried for allocations and spent on nothing here:
+  `.Map` (bit 9) and `.MapExecute` (bit 10). A pool's own rights start at bit
+  16, so no bit of `MemoryRight`'s can ever be one of them: `.Allocate` (bit 16)
+  gates `allocate` and `available`, and bits 17 and 18 are reserved for `Split`
+  and `Revoke` (below). `pool_rights()`, the set a boot pool is minted with, is
+  `Transfer | Mint | Allocate | Map | MapExecute`: every defined bit, because
+  attenuation is monotonic and a bit not minted at boot could never appear
+  later.
+- **What holds a pool.** Its handles (and references in staged messages, §2)
+  and its outstanding bytes, and nothing else. Its outstanding bytes are the
+  lengths of its live allocations plus the length of every allocation from it
+  donated to the kernel (§2.8), which never comes back, so a pool from which
+  anything was donated never frees. When its last handle has gone and the
+  last allocation from it has come home, its slot frees, its free
+  list's nodes go back to their slab (`SlabKind.FreeRanges`), and its bytes go
+  nowhere: a pool minted at boot has no pool above it. A pool whose handles
+  are gone while allocations from it are out stays until the last one comes
+  home.
+- **Ceilings.** The kernel mints a pool only at boot, into root, whose
+  ceilings are unrestricted, and a `MINT_OP` sibling and a pool received by a
+  give or in a message are not capped (§2.7). So a process's `Pool` ceiling
+  caps no handle any op mints; it is kept because ceilings are kept per kind
+  (`HandleKind.Pool`, 15), it is read and narrowed as every kind's is, and a
+  sub-pool's mint will be capped by it (below).
+
+**`Memory`: one op, `Map`; rights `MemoryRight.Map` and `.MapExecute`**
+beside the universal `Transfer` and `Mint`. A `Memory` is an allocation: it is
+mapped, used as a process's image or destination (§8, §12), given, sent in a
+message, minted and donated, and it is never cut (not yet enforced: split).
+It comes from a pool's `allocate`, or from a row of the region table typed as
+an allocation (§12).
+
+- **It records its pool and goes back whole.** An allocation's range returns
+  to the pool it was allocated from, all of it at once, when no handle and no
+  grant row names it (the refcount invariant, below); nothing returns part of
+  one. An allocation minted at boot came from no pool, and when it frees its
+  bytes go nowhere; its granularity is the profile's grain (not yet
+  enforced: pools).
+- **The rights, bit by bit.** `MemoryRight.Transfer` (bit 0) and `.Mint`
+  (bit 1) are the universal pair; `.Map` (bit 9) gates `map`, and
+  `.MapExecute` (bit 10) gates an executable `map` (below). Bit 8 is not
+  assigned (not yet enforced: split). `memory_rights()`, the set a boot
+  allocation is minted with, is all four bits; an allocation from a pool
+  carries what its pool handle handed down (above).
 - **`map(process, access)` installs a protection row and answers with a
-  `Mapping`.** It spends `MemoryRight.Map` on the region and `ProcessRight.Map`
-  on the target, because possession of bytes must not imply authority over an
-  address space. `aspace` is a process: §5b says the domain is the process on
-  every profile, so the argument names the process rather than an object that
-  would be a second name for it. A process may be given access without
-  possession: a launcher that keeps a region and installs the child's row
-  itself leaves the child holding no `Memory` handle at all
-  (`tests/share-double-map`), while a driver child given an `IoMemory`
-  installs its own row. Two installation directions, no mode flag.
-- **Access is a property of the mapping.** A region carries no R/W/X triple,
-  and double-mapping one region RO here and RW there is expressible and
-  allowed. An access word asking for write without read is refused.
-- **A mapping does not cover a row of its target's image or stack.** A `map`
-  whose range meets a row the loader recorded for the target answers
-  `NoResource` and installs nothing; mappings may cover one another. A status
-  and not a fault, because the launcher that keeps a child's destination
-  `Memory` could not have known where the child's image lies, and a call that
-  is correct where a mapping takes an address of its own (arm64, where it meets
-  no image row) is not a reason to end the caller on the profiles where a
-  mapping's address is its memory's own, where a launcher's region *is* the
-  child's image. `NoResource` because it is what `map` already answers when the
-  target's address space has no room for the range.
+  `Mapping`.** It spends `MemoryRight.Map` on the allocation and
+  `ProcessRight.Map` on the target, because possession of bytes must not
+  imply authority over an address space. `aspace` is a process: §5b says the
+  domain is the process on every profile, so the argument names the process
+  rather than an object that would be a second name for it. A process may be
+  given access without possession: a launcher that keeps an allocation and
+  installs the child's row itself leaves the child holding no `Memory` handle
+  at all (`tests/share-double-map`), while a driver child given an `IoMemory`
+  installs its own row. Two installation directions, no mode flag. The row
+  covers the whole allocation, its top rounded up to the grain. Its answers,
+  in the order they are decided: a handle without `MemoryRight.Map` is the
+  `AccessDenied` fault; a target word that names no Process is `BadHandle`,
+  and a target handle without `ProcessRight.Map` `AccessDenied`; an access
+  word with a bit outside `MapAccess`, one asking for nothing, for write
+  without read or for write with execute is `BadArg`; execute asked through a
+  handle without `MapExecute` is `AccessDenied`; and an allocation that is
+  empty, runs off the end of the address space, has its base off the grain,
+  or lies in memory the board cannot hand a process (flash, §5.6) is
+  `BadArg`. Then the statuses: a `Gone` target answers `Revoked` (§2.10), a
+  target at its `Mapping` quota `QuotaExceeded` (§2.9), and a target whose
+  address space has no room for the range, or one of whose rows the range
+  meets (below), `NoResource`, as a full Mapping slab does; the caller's
+  handle budget and table answer last, as at every mint.
+- **Access is a property of the mapping.** An allocation carries no R/W/X
+  triple, and mapping one allocation read-only in one place and read-write in
+  another is expressible and allowed, wherever the overlap rule below allows
+  two rows over the same bytes. An access word asking for write without read
+  is refused.
+- **A mapping does not overlap a row its target already holds.** A `map`
+  whose placed range meets any row of the target's grant answers `NoResource`
+  and installs nothing, whatever the row: a segment the loader recorded,
+  copied or used in place, the stack grant, a row an earlier `map`
+  installed, a device row or the stats region's row (not yet enforced:
+  overlap). "Meets" compares user addresses: the range the new row would
+  occupy in the target against the range each existing row occupies there.
+  With the loader's own rule that no two rows of one image meet (§5.6), a
+  process's rows never overlap on any profile, and which row grants an
+  address never depends on which was installed first. (On the PMP boards the
+  lowest-numbered matching region decides an access, so an overlap would
+  have the first row's permissions and not the union, and an access running
+  out of the overlap into the second row's own bytes would fault.) Per
+  profile:
+  - On the identity profiles a row's user address is its memory's own, so a
+    second `map` of an allocation into a process that already maps it, a
+    `map` of a child's destination into that child (its copied segments and
+    its stack lie there), a `map` of a child's image into a child that runs
+    segments of it in place, and a second `map` of one device window, or of
+    two overlapping carves of one, into one process are each refused. The
+    same bytes seen twice takes two processes.
+  - On arm64 a RAM mapping is placed by the kernel at a fresh address, above
+    the image region and clear of every RAM row the target holds (§5.5), so
+    it meets none. A second view of the same bytes in one process is
+    possible there, at a second address, and §2.2's execute test, which
+    compares the bytes rows grant rather than their addresses, governs it. A
+    device window is mapped at its own address on every profile, so a
+    second `map` of one window into one process meets the first there too.
+
+  It is a status and not a fault because the caller cannot always know what
+  the target holds: the launcher that keeps a child's destination could not
+  have known where the child's image lies, another holder may already have
+  mapped the same memory into the target, and a call that is correct where a
+  mapping takes an address of its own (arm64) is not a reason to end the
+  caller on the profiles where it does not. `NoResource` because it is what
+  `map` already answers when the target's address space has no room for the
+  range.
 - **Executable is a right.** `MemoryOp.Map` refuses `MapAccess.Execute`
   unless the Memory handle carries **`MemoryRight.MapExecute`** — the same
   refusal (`AccessDenied`, a fault) every unspent right answers. It is
   capability flow, not identity: "only root maps executable" holds because
   root never grants the bit, not because the kernel asks who is calling, and
-  `memory_rights()` therefore mints it at boot, of necessity — §3's attenuation
-  is monotonic, so a bit not minted at boot could never appear later, and the
-  narrowing is a holder's `MINT_OP` keep mask (a launcher writes "this child
-  may map its RAM and may never map it executable" with
-  `Memory.mint(rights:)` before the region travels). A `Split` piece carries the
-  rights of the handle the split went through, so a mask that keeps `Split`
-  while dropping `MapExecute` yields pieces that cannot map executable either.
+  `memory_rights()` and `pool_rights()` therefore mint it at boot, of
+  necessity — §3's attenuation is monotonic, so a bit not minted at boot could
+  never appear later, and the narrowing is a holder's `MINT_OP` keep mask (a
+  launcher writes "this child may map its RAM and may never map it
+  executable" with `Memory.mint(rights:)` before an allocation travels, or
+  with `Pool.mint(rights:)` before a pool does). An allocation carries the
+  bits of the pool handle it came through, so a pool sibling minted without
+  `MapExecute` allocates memory that cannot map executable either (not yet
+  enforced: pools).
 - **No row is both writable and executable.** `Write | Execute` in one access
   word is a caller-checkable `BadArg` fault, beside the write-without-read
-  refusal. It costs nothing expressible,
-  because the double map is sanctioned: an RW row here and an RX row there
-  over one region is the JIT-shaped pattern in full, and what is removed is
-  only the single row a process could write and then fetch from.
+  refusal. What it removes is only the single row a process could write and
+  then fetch from: a writable view and an executable view of one allocation
+  are still expressible, as two rows, wherever the overlap rule above allows
+  two rows over the same bytes. Where both are in one process the writable
+  view is no buffer (§2.2).
 - **The boundary is the dynamic map.** Neither rule governs a process image's
   own executable segments: those arrive through `process_create`'s loader as
   `SegFlag` bits read out of the image, validated by `imgformat.has_sane_perms`
   (which refuses write-without-read and X-on-device and deliberately not W|X
   — an image's segments are kept apart by its linker script), under
   `SystemRight.ProcessCreate` authority that a driver child does not hold.
-- **It is per handle, not per region.** A second handle that still carries
-  the bit can map the same bytes executable. A region-level immutable flag
-  would be a second mechanism doing overlapping work.
+- **It is per handle, not per allocation.** A second handle that still
+  carries the bit can map the same bytes executable. An allocation-level
+  immutable flag would be a second mechanism doing overlapping work.
 
 **`IoMemory`: ops `Carve` and `Map`, rights `IoMemoryRight.Carve` and `.Map`**
 beside the universal pair.
 
 - It is pinned (never freed — MMIO is not reclaimable), carved
-  non-exclusively — `carve(offset, len)` leaves the parent whole where
-  `split` consumes, which is "a fixed region may be handed out many times" —
-  and it has no contents.
-- The machine's granularity is checked at the carve against a per-profile
+  non-exclusively — `carve(offset, len)` leaves the parent whole where a
+  pool's `allocate` consumes, which is "a fixed region may be handed out many
+  times" — and it has no contents.
+- The machine's grain is checked at the carve against a per-profile
   HAL predicate (Profile A needs a naturally aligned power of two — one
   protection entry; Profile B needs whole pages), because a window that could
   never be installed anywhere is a capability that lies about itself.
@@ -1098,10 +1353,11 @@ one degree of freedom unspent on the MPU tier, not two mechanisms.
   not translate it is also the physical one.
 - **A mapping's address is the kernel's answer and is treated as data.** `map`
   takes no VA hint on any tier; `Mapping.base()` asks. On tier 1 `map` chooses
-  the address, so two processes sharing one region hold two different numbers
-  for the same bytes and `tests/map-placed` asserts both. On tiers 2 and 3 a
-  region is shared at its own address and `share-double-map` reads one
-  constant on both sides.
+  the address, so two processes sharing one allocation hold two different
+  numbers for the same bytes and `tests/map-placed` asserts both, and an
+  address an unmap freed may be handed to a later mapping of other memory. On
+  tiers 2 and 3 an allocation is shared at its own address and
+  `share-double-map` reads one constant on both sides.
 - **Releasing the handle is not an unmap.** Release destroys a table entry and
   never the object's state (§3), so "dropped without unmap = permanent,
   safe-but-leaked" falls out of existing doctrine rather than being a new rule.
@@ -1117,8 +1373,8 @@ one degree of freedom unspent on the MPU tier, not two mechanisms.
   on it (`tests/mapping-slot-free` writes and reads through such a row). The
   mirror case is a husk of the other kind — unmapped but still referenced —
   whose `Unmap` is a `BadState` fault. The row being leaked does not leak the
-  bytes past it: the region survives its own last handle because the row still
-  counts against it, and the range returns when the row goes (below).
+  bytes past it: the allocation survives its own last handle because the row
+  still counts against it, and the range returns when the row goes (below).
 - **The live-domain rule.** Any edit to a grant record reloads immediately
   when that domain is the installed one, because `run_thread` skips equal
   domains and an unmap that waited for the next reschedule would be a
@@ -1132,24 +1388,43 @@ one degree of freedom unspent on the MPU tier, not two mechanisms.
 - **It is not givable** — `mapping_rights()` withholds `Transfer` — because a
   Mapping names a row in one specific domain.
 
-**The refcount invariant, as built.** The region's own slab slot carries two
-counts: `MemorySlot.refs` (handle entries naming the region, and references held
-by a staged pipe message) and `MemorySlot.maps` (installed grant rows naming
-it).
+**The refcount invariant, as built.** An allocation's own slab slot carries two
+counts: `MemorySlot.refs` (handle entries naming it, and references held by a
+staged pipe message) and `MemorySlot.maps` (installed grant rows naming it). A
+row is counted on the allocation whose bytes it grants: a child's copied
+segments and its stack on its destination, its segments used in place on its
+image, and a mapping's row on the allocation mapped. Root's own rows, device
+rows and the stats region's row are counted on nothing, because no allocation
+owns those bytes.
 
 - Reaching zero on `refs` frees the slot synchronously, inside the release
   that drops the last reference (§3) — no deferred reclamation, no cleanup
   queue.
 - The range returns to its pool at the second zero, which is the invariant
-  above executing as written: a region whose handles are all released but
-  whose grant row is still installed stays out of the pool until that row
+  above executing as written: an allocation whose handles are all released
+  but whose grant row is still installed stays out of the pool until that row
   dies. `maps` counts installed grant rows rather than `Mapping` objects,
   because a Mapping's slot and its row have different lifetimes (the husk
   above), and a row cannot die unwitnessed — `record_grant` makes one, and
   `remove_grant` and `clear_domain` are the only two things that take one
-  away.
-- Where a returned range goes (the pool root, coalescing, first fit), how bytes
-  are accounted, and why `IoMemory` is exempt are §5.9.
+  away. The row leaves the record and the hardware before its count drops, so
+  a range is never handed out again while a domain still grants it.
+- A pool has a count of its own besides `refs`: its outstanding bytes
+  (`out_bytes`), what it has allocated and not had back, donations to the
+  kernel included (above). It frees only when both are zero, so the pool
+  every allocation records is always a live one.
+- **A teardown releases memory in §2.10's order.** The dying process's handles
+  go first, so an allocation it alone named and no row grants goes back to
+  its pool there, crediting whichever ledger it is charged to. What survives
+  and is still charged to the dying process is disowned. Then its domain is
+  cleared, which drops its rows' counts, so an allocation whose last namer
+  was a row of the dying domain (a child's destination whose launcher has
+  released its handle, say) goes back to its pool then, crediting its
+  creator, or nobody if its creator was the dying process. A pool goes when
+  its last handle has gone and its last allocation has come home, whichever
+  is later, which may be inside the same teardown.
+- Where a returned range goes (the pool's free list, coalescing, first fit),
+  how bytes are accounted, and why `IoMemory` is exempt are §5.9.
 
 **Device grants.** A driver obtains its device window as an `IoMemory`
 capability — from its boot set, or given by a launcher — and maps it into
@@ -1177,6 +1452,107 @@ checked at the top of teardown ahead of any release, because the halt must
 preempt the free or the window it exists to close reopens inside it. Both v1
 boards' consoles are programmed I/O, so no case in the suite is a DMA driver and
 no capability in the tree is a lie about one.
+
+**The direction: sub-pools and revoke (reserved, not built).** The model is a
+hierarchy of pools, and what is built is its first level. This paragraph says
+where it goes and specifies nothing.
+
+- **A sub-pool.** A pool will be splittable into a smaller pool
+  (`Pool.split(len)`, `PoolOp.Split` on `PoolRight.Split`), so that a memory
+  manager can hand a process, or another manager, a byte budget of its own. A
+  sub-pool is an outstanding range of its parent, as an allocation is, and it
+  returns to its parent whole: the range it was lent, whatever its own free list
+  holds, once its last handle has gone and nothing it lent is out. While it is
+  out its range is outstanding in its parent, so its parent's `available` counts
+  none of it, free in the sub-pool or not. A fixed limit on the depth of pools
+  bounds how far one release can climb.
+- **A revoke.** A holder of a pool will be able to take back what was
+  allocated from it (`PoolOp.Revoke` on `PoolRight.Revoke`), which is how a
+  manager reclaims memory from clients it does not trust to let go. It will
+  walk what the built model already records: every allocation names its pool,
+  and every grant row names its allocation.
+- **Coarser granularities, and a slice.** `allocate` and `available` take a
+  granularity so that one coarser than the grain can be accepted later (a power
+  of two, accepted once its bit is set in a pool's `granularities` word, which
+  `available` answers). arm64's translation blocks of 2 MiB and 1 GiB are units
+  above the protection grain, and so are the pages of 64 KiB in which the
+  ESP32-S3's MMU maps flash and external memory. An allocation of such a
+  granularity would be eligible to be mapped with those larger units where the
+  hardware has them; it is not a promise that `map` uses them, and nothing about
+  `map`, the overlap rule or the buffer rule depends on it. A view of part of an
+  allocation (a slice), if one is added, will be held to the allocation's
+  granularity: its offset and its length multiples of it.
+- **What is reserved now.** `PoolOp` numbers 2 (`Split`) and 3 (`Revoke`)
+  and `PoolRight` bits 17 (`Split`) and 18 (`Revoke`) belong to nothing else.
+  No handle carries those rights, and none needs to: a right is minted when
+  its op exists, and no handle survives a boot.
+
+Both must be designed knowing that a pool can hold a range that never returns:
+an allocation donated to the kernel stays among its pool's outstanding bytes
+for good (§2.8), so a sub-pool with a donation in it can never return whole,
+and no revoke can take a donation back. Until both exist, memory comes back to
+a pool only from holders that let go or die (§11).
+
+**Not yet enforced: the transition to pools.** Every sentence of this
+specification that describes a part of the model above which the kernel does
+not build carries the marker "not yet enforced:" and the part's name. Until a
+part is built the kernel does what its paragraph here says; building it removes
+its markers and its paragraph, and the last part removes this note.
+
+- **Pools.** There is no `Pool` kind: no `PoolOp`, `PoolRight`, `pool_rights()`,
+  `HandleKind.Pool`, `BootHandleKind.Pool`, `Pool` ceiling or `NoMemory` status,
+  and the region table has two kinds, `Ram` and `Device`. Every `Ram` row mints
+  a `Memory` that is a pool root, one object that is both a pool and an
+  allocation: it can be mapped, passed to `process_create`, given, sent and
+  donated as any `Memory` can, and split (below). It is minted with
+  `memory_rights()`, which carries `MemoryRight.Split` (bit 8) besides the four
+  bits above, and its boot record's kind is `BootHandleKind.Memory`. Its range
+  is the pool's unspent frontier, and a split takes from its free list first and
+  its frontier second. Every `Memory` names its pool root: a root names itself
+  and a piece names the root of the region it was cut from. A pool root frees
+  when no handle and no row names it and nothing is on loan from it, and its
+  bytes then go nowhere. Nothing reports a pool's free bytes or the
+  granularities it accepts. `allocate` does not exist: its work is a split of a
+  pool root (which takes no granularity, records none and does not align its
+  cut), which is capped by the caller's `Memory` ceiling and charged to its
+  `Memory` row. `slab_donate` takes only a `Memory`, a pool root or a piece: one
+  with another reference or a row, or a pool root with something on loan, is the
+  `BadState` fault, after the `BadArg` for memory the board cannot give a
+  process.
+- **Split.** A `Memory` has a second op, `MemoryOp.Split(len)` (op 0), on
+  `MemoryRight.Split`. Its answers, in order: a handle without the right is
+  `AccessDenied`; a `len` of zero, one the region cannot serve in one range
+  and one that is not a multiple of the grain are `BadArg`; a cut that would
+  run through the middle of a grant row counted on the region answers
+  `NoResource` with nothing changed (a status, because the launcher holding a
+  child's destination cannot know where the child's segments lie); then the
+  caller's `Memory` quota (`QuotaExceeded`), the Memory slab (`NoResource`)
+  and the handle mint. On a pool root the cut is the allocation above, taken
+  from the root itself. On any other region it is the front of the region,
+  which becomes the remainder, and the pool's outstanding bytes do not move.
+  The new piece names the pool root, carries the rights of the handle the
+  split went through capped by the caller's `Memory` ceiling, and is charged
+  to the caller's `Memory` row. A split moves every row of any process that is
+  counted on the region and lies wholly inside the cut onto the new piece, so
+  a piece's range returns to its pool root only when no row lies in it.
+- **Overlap.** A `map` is refused (`NoResource`) only when its range meets a
+  row the loader recorded for the target: a segment or the stack grant. A
+  mapping may meet another mapping, a device row or the stats region's row,
+  so on the identity profiles one region can be mapped twice into one
+  process. The loader compares no two segments, so an image whose segments
+  meet loads, and its rows overlap.
+- **Buffers.** Each door asks a window before it asks the rows. A destination
+  must lie in the process's writable window, from the lowest address of the
+  stack and the writable segments the loader copied to the top of its region; a
+  source in its region, or in the span of its read-only segments used in place.
+  Within the window the buffer must lie in one non-device row that grants the
+  permission its direction needs, and no row that permits execute may cover any
+  of its bytes at the same user address; rows are not compared by the bytes they
+  grant. So on arm64, where a mapping is placed above the region, a row `map`
+  installed is never a buffer, and on the identity profiles one is a buffer only
+  where it lies inside a window. A thread's stack top must lie in the process's
+  region, above its base and at most its top (`BadEntry` otherwise), and no row
+  is asked about it.
 
 ### 2.6 Clock and Timer
 
@@ -1337,12 +1713,18 @@ three groups:
   process's handle these ops answer `Revoked` (§2.10), after the rights and
   argument checks. `ThreadCreate` answers it before the entry and stack are
   checked, because that check reads the named process's address space and a
-  `Gone` process has no body. A thread's stack top must lie in the process's
-  region and its entry in a row of its grant that permits execute, which an
-  in-place code segment outside the region is (§5.6). A thread
-  created in a `Created` child is inert: `ThreadOp.Start` on it is a
-  `BadState` fault until the child has been started, and the launcher starts
-  it after `ProcessOp.Start`.
+  `Gone` process has no body. A thread's entry must lie in a row of its
+  grant that permits execute, which an in-place code segment outside the
+  region is (§5.6). Its stack top must be one a stack can grow down from:
+  the word below it lies in one non-device row of the process's grant that
+  permits write, and no row that permits execute grants any of its bytes:
+  §2.2's row tests for a destination, whichever kind of row it is, with no
+  alignment asked (not yet enforced: buffers). So a thread can run on memory
+  `map` installed, and a stack unmapped under its thread ends the process by
+  §8's fault rule at the thread's next access to it, on the isolated tiers. A
+  thread created in a `Created` child is inert: `ThreadOp.Start` on it is a
+  `BadState` fault until the child has been started, and the launcher starts it
+  after `ProcessOp.Start`.
 - **`Exit`, `ThreadSelf` and `BootHandleNext` are self-only**: through a handle
   naming another process the kernel faults the caller (`NotSelf`). `Exit` ends
   the calling process, `ThreadSelf` names the caller's running thread, and
@@ -1398,7 +1780,8 @@ hold is bounded by its ceiling. That covers:
   handle lands in, so a cross-process create is capped by the caller's);
 - `SystemOp.ProcessCreate`'s handle on the new process, and
   `SystemOp.InterruptBind`;
-- the ops that mint a new object from a held one: `Memory.Split`,
+- the ops that mint a new object from a held one: `Pool.Allocate`, capped by
+  the `Memory` ceiling, the kind of what it mints (not yet enforced: pools),
   `IoMemory.Carve` and `Memory.Map`'s Mapping;
 - the handles a pipe mints for the protocol: the claim `Post` returns and the
   obligation `Take` delivers;
@@ -1615,8 +1998,10 @@ the map. `ProcessOp.Stats` is independent of it and is what a program uses for
 another process's counters. Three things about the region:
 
 - **No `Memory` handle is minted.** The caller is granted the access and
-  nothing that owns it — a Memory onto kernel storage would carry `Split` and
-  would make the page donatable.
+  nothing that owns it — a Memory onto kernel storage could be given, mapped
+  elsewhere and donated. The row permits read only, so by §2.2's buffer
+  rule it is a legal source and never a destination (not yet enforced:
+  buffers).
 - **`rows` is a capacity, not a census.** There is a row for every body the
   build can hand out, not for every record. A row for an unoccupied body reads
   whatever its last occupant left until a create zeroes it, and v1 publishes no
@@ -1691,7 +2076,7 @@ a whole.
 | `ClockGet` | `SystemRight.ClockGet` | mints a Clock handle (§2.6) |
 | `ProcessCreate` | `SystemRight.ProcessCreate` | creates an inert process (§8, §12); the third argument is a Process handle naming a ceiling source the child's rights ceilings are intersected with, or `NO_HANDLE` for none (§2.7) |
 | `InterruptBind(line)` | `SystemRight.InterruptBind` | binds an interrupt line to a new Interrupt (§9) |
-| `SlabDonate` | `SystemRight.SlabDonate` | donates a `Memory` region to a kind's slab |
+| `SlabDonate` | `SystemRight.SlabDonate` | donates a `Pool` or a `Memory` to a kind's slab (below; a pool is not yet enforced: pools) |
 | `TierGet` | `SystemRight.TierGet` | answers the protection tier (§5b.1) |
 | `StatsRegionMap` | `SystemRight.StatsRegionMap` | maps the trap-counter page read-only, on the isolated tiers (§2.7) |
 | `ProcessNext(address of cursor)` | `SystemRight.ProcessObserve` | reads the cursor from a doubleword in the caller's memory and answers the process with the smallest pid above it, as a Process handle carrying the observe set, and writes its pid back as the next cursor; `Drained` at the end (below) |
@@ -1726,11 +2111,21 @@ a whole.
 - **`SlabDonate`** consumes the donated capability and backs a named object
   kind's slab with it, permanently in v1 — so the compiled limits are a floor
   and capacity is policy, decided by the deployment rather than by the build.
-  The region must have no live mappings and no sibling references (`BadState`
-  otherwise): the kernel never shares slab backing with user-reachable memory.
-  A region with bytes over memory the board cannot give a process, such as
-  flash, is a `BadArg` fault, asked before the state conditions; an empty
-  region holds no slot and answers `NoResource`.
+  It takes a pool or an allocation (not yet enforced: pools), and the
+  kernel never shares slab backing with user-reachable memory, so the handle
+  must be the only reference to its object and nothing may reach its bytes:
+  an allocation with no sibling reference and no grant row, or a pool with no
+  sibling reference and nothing allocated from it outstanding (§2.5). Its
+  answers, in order: a kind that is not a `SlabKind` is the `BadArg` fault; a
+  word naming nothing, or naming neither a pool nor an allocation, is
+  `BadHandle`; memory with bytes the board cannot give a process, such as
+  flash, is `BadArg`; a sibling reference, an allocation's row and a pool's
+  outstanding allocation are each `BadState`. Then the machine's answers,
+  each `NoResource` with nothing consumed: memory too small to hold one slot
+  of the kind (an empty one included), and a slab with no room for another
+  extent or at its ceiling. The bytes never come back: a donated pool's
+  free-list nodes return to their slab, and a donated allocation's length stays
+  among its pool's outstanding bytes for good, so that pool never frees.
 - **`InterruptBind`** binds a line to a new Interrupt and places its one handle
   in the caller's table. A line is a machine-wide resource, which is why the op
   is here, and the bind has no Interrupt quota row (§2.9); its handle is
@@ -1875,7 +2270,10 @@ record (`quota_used` / `quota_limit`, §2.7), the entry a charged object's
 `process` field (a Mapping's `target`) names, not in the body. The `Handle` row
 is charged inside `mint_handle` and credited inside `unbind_handle`. An
 Interrupt has no column: there is at most one live Interrupt per line, and the
-Interrupt slab bounds the objects (§2.8).
+Interrupt slab bounds the objects (§2.8). Pools and allocations share the
+`Memory` column, as they share the Memory slab (not yet enforced: pools): an
+`allocate` charges its caller one, and the boot charges root one for each
+`Ram` and `Pool` row it mints.
 
 - **Policy first.** A quota is checked at every allocation site that answers
   `NoResource`, ahead of the slab, so a process at its budget is told
@@ -1944,6 +2342,11 @@ Interrupt slab bounds the objects (§2.8).
   object that outlives its charge still occupies the slab slot it was charged
   for.
 - Quotas count objects, not bytes, in v1; bytes are the pool's ledger (§2.5).
+  A pool held by a process is the byte bound: it can allocate no more than
+  the pool holds, while its `Memory` row bounds how many allocations it holds
+  at once, and neither bounds the other. A process allocating from a pool it
+  was given pays a `Memory` row per allocation and nothing for the pool,
+  which stays charged to whoever it was charged to.
 
 ### 2.10 Object lifecycle
 
@@ -2007,7 +2410,7 @@ handle to make the op that would answer `Revoked`.
 |---|---|
 | Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. `Exit` releases the handle it is invoked through: only that handle goes, every other one still reads the slot, and a Thread that exits with no other handle naming it is freed at its exit. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
 | Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) and bound to no process: nothing names its binder's record, so the teardown has nothing to disown |
-| Event, Pipe, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them |
+| Event, Pipe, Pool, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them; an allocation also until its last grant row goes, and a pool until its last allocation comes home (§2.5; Pool not yet enforced: pools) |
 | Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1). The process walk and the lookup by pid answer a `Gone` record for as long as something names it, and the handle they mint is one more name that holds it (§2.8); they answer no process before its start (§2.8). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
 | Clock, System | Never destroyed |
 
@@ -2035,7 +2438,8 @@ ordinary ones, so an Interrupt the process held is destroyed by its own handle's
 release, and a shared object or another `Gone` process's record that the dying
 process was the last to name, by a handle or an attachment, is freed by it. The
 disown comes before the domain clear, which drops the grant rows' references
-and can free a region, so that free finds the region already disowned. The
+and can free an allocation (and then its pool), so that free finds both already
+disowned. The
 ledger is cleared after every step that can credit it. The dying process's own
 record outlives the body, `Gone`, for as long as a handle or an attachment
 names it, and the teardown reclaims it if nothing does (§2.7).
@@ -2047,9 +2451,9 @@ death and names the dying record, writing no owner (`NO_PROCESS`) into that
 field:
 
 - the `process` field of a shared object still charged to the dying process (a
-  Memory, an IoMemory, a connection, an Event), of an `Exited` Thread, of any
-  invalid bound object (a Thread, Timer or Waiter), whether another table, a
-  staged message or an attachment holds it;
+  Pool, a Memory, an IoMemory, a connection, an Event), of an `Exited` Thread,
+  of any invalid bound object (a Thread, Timer or Waiter), whether another
+  table, a staged message or an attachment holds it;
 - the `target` of a Mapping whose target is the dying process, so the husk
   names nobody;
 - and the record's own link to its body, cleared as the body goes (§2.7).
@@ -2114,8 +2518,9 @@ have no field.
 - **A shared kind can outlive the process charged for it**, so that process's
   death disowns it (above). The teardown first frees the shared objects nothing
   else names, which credits the dying ledger as any free does; one freed after
-  its disown (a region whose last namer is a grant row in the dying domain, or
-  an object only a staged message named) credits nobody. Either way its charge
+  its disown (an allocation whose last namer is a grant row in the dying
+  domain, a pool whose last allocation comes home after, or an object only a
+  staged message named) credits nobody. Either way its charge
   ends with the ledger, which the teardown clears. A dead process's ledger has
   no consumer, since creation through a `Gone` process's handle is refused. The
   objects it was charged for do not hold the dead record, which is reclaimed on
@@ -2185,8 +2590,9 @@ have no field.
   `rights_allow_transfer` is the one function that reads it. Which kinds'
   default sets mint it is a per-kind ruling: v1 mints it in
   `root_system_rights()`, `process_rights()`, `thread_rights()`,
-  `event_rights()`, `waiter_rights()`, `timer_rights()`, `memory_rights()`,
-  `iomemory_rights()`, `interrupt_rights()`, `pipe_inlet_rights()`,
+  `event_rights()`, `waiter_rights()`, `timer_rights()`, `pool_rights()` (not
+  yet enforced: pools), `memory_rights()`, `iomemory_rights()`,
+  `interrupt_rights()`, `pipe_inlet_rights()`,
   `pipe_outlet_rights()`, `pipe_reply_rights()` and `pipe_request_rights()`,
   so a Clock handle cannot be given (nor a Mapping, §2.5). Root's System
   handle carries it, which is what lets a launcher hand a child a masked
@@ -2330,10 +2736,12 @@ have no field.
 - **Attenuation is monotonic**: any derivation may only strip rights, never add.
   A process's rights ceilings (§2.7) are a second monotonic bound, on what the
   kernel mints into its table from nothing: they only narrow, and a child
-  starts with its creator's. An op that derives a new object of the same kind
-  from a held handle (`Memory.Split`, `IoMemory.Carve`) mints it with that
-  handle's rights, so a piece or a carved window is never wider than its
-  parent handle.
+  starts with its creator's. An op that derives a new object from a held
+  handle mints it with no more than that handle's rights: `IoMemory.Carve`
+  with the handle's own, so a carved window is never wider than its parent
+  handle, and `Pool.Allocate` with the bits the pool handle hands down, so an
+  allocation is never wider than the pool handle it came through (§2.5; not
+  yet enforced: pools).
   The only rights source is the boot handle set given to the root server, so
   every rights word in the machine is a subset of one of those, reached by some
   path of mints and gives (a statement about the syscall path; a flat-tier
@@ -2344,12 +2752,12 @@ have no field.
   **Monotonicity is what makes a right a policy knob.** `MemoryRight.MapExecute`
   gates `MapAccess.Execute` on a `map` (§2.5), so "only root maps executable" is
   a fact about capability flow rather than about identity: `memory_rights()`
-  mints the bit at boot — of necessity, because a bit not minted at boot could
-  never appear later — and root simply never grants it, narrowing a child's
-  region handle with a keep mask before the region travels. The kernel asks no
-  question about who is calling. The policy lives entirely in a mask a launcher
-  writes, which is what a right named for its op buys and what a generic bit
-  could not have expressed at all.
+  and `pool_rights()` mint the bit at boot — of necessity, because a bit not
+  minted at boot could never appear later — and root simply never grants it,
+  narrowing a child's allocation or pool handle with a keep mask before it
+  travels. The kernel asks no question about who is calling. The policy lives
+  entirely in a mask a launcher writes, which is what a right named for its op
+  buys and what a generic bit could not have expressed at all.
 - **Release and close are different acts.** Handle close is explicit in ABI,
   automatic in Saw (`deinit`).
   - **Release** destroys the caller's handle: one universal op number
@@ -2368,8 +2776,10 @@ have no field.
     handle's release does that even while an attachment holds it, §2.10), a
     Timer gives the comparator back, a Waiter detaches its list
     (which may take a waitable to zero in turn — a cascade) and wakes its parked
-    threads, a Memory returns its slot (and its range once no grant row names
-    it, §2.5), and a `Gone` process's record is reclaimed, its body having
+    threads, a Memory returns its slot (and its range to its pool once no
+    grant row names it, §2.5), a Pool returns its slot once nothing it
+    allocated is out (not yet enforced: pools), and a `Gone` process's record
+    is reclaimed, its body having
     gone at the teardown (§2.7). **The one exception is a Mapping**, whose row
     is not a reference back: it frees its slot and leaves the row installed
     (§2.5).
@@ -2619,8 +3029,8 @@ not about SOS** (§5b.1):
   on a non-translating profile the two are asserted equal, so the identity
   tier is the general mechanism with one degree of freedom unspent rather than
   a second mechanism. Addresses-as-data stay physical everywhere they are
-  stored — Memory capabilities, the build-emitted region table, `sosimg`
-  records — and only the moment of kernel dereference converts, through
+  stored — Pool and Memory capabilities, the build-emitted region table,
+  `sosimg` records — and only the moment of kernel dereference converts, through
   `hal.phys_to_virt`.
 
 ### 5.6 Boot protocol
@@ -2632,9 +3042,10 @@ header carrying magic, version, segment count, arch tag, priority map and an
 absolute entry address; then segments of {load_addr, file_off, file_len,
 mem_len, flags}; `imgformat` owns the layout) that Blade emits as a build
 target. Kernel: parse header → map/copy segments (PMP/APM per §5.5) → mint root
-handles (the System handle in the entry register; root `Memory` and `IoMemory`
-regions for RAM and device ranges, collected through the boot set; the root IRQ
-table is a right rather than an object, §12) → enter U-mode at the entry.
+handles (the System handle in the entry register; root's `Pool`, `Memory` and
+`IoMemory` regions for RAM and device ranges, by the kind of each row of the
+region table, collected through the boot set; the root IRQ table is a right
+rather than an object, §12) → enter U-mode at the entry.
 Everything else derives from those handles.
 
 - **The format.** A versioned flat header plus fixed-size segment records
@@ -2652,11 +3063,22 @@ Everything else derives from those handles.
   on both sides.
 - **The kernel validates an image in full before placing a byte of it**, so a
   segment aimed at the kernel is refused rather than obeyed. A segment must be
-  aligned to the target's grant granularity (a page on Profile B, four bytes on
+  aligned to the target's grant grain (a page on Profile B, four bytes on
   Profile A) — without that, code could become writable because data started in
   the same unit. Blade reads ELF32 and ELF64. Image addresses are 64-bit fields
   on every profile, and a 32-bit kernel refuses an entry or segment address that
   does not fit its machine word (`fits_target_word`) rather than narrowing it.
+- **No two rows of one image meet** (not yet enforced: overlap). Two segments
+  whose granted ranges (each rounded up to the grain, as its row will be)
+  meet at the addresses the process sees them at make the image malformed:
+  `BadImage` at `process_create`, a stopped boot for root's image. Copied
+  segments already lie below the stack grant and segments used in place lie
+  in the image, which is disjoint from the destination, so the test is
+  between the segments, every pair of them, bounded by the row budget. With
+  §2.5's overlap rule for `map` it makes a process's rows disjoint on every
+  profile. A single segment may still be both writable and executable
+  (§2.5), which is why §2.2's execute test is still asked of the loader's
+  rows.
 - **A segment already where it is linked is used in place.** The loader asks
   `hal.same_bytes` (§5.5) whether a segment's link address names the
   segment's own bytes in the image. If it does, nothing is
@@ -2736,7 +3158,9 @@ uniform because it has to be: an unbound handle names no kind, so there is no op
 table to ask which rule applies. The caller is the process that faults, through
 whichever process's handle the op was made (§2.7). What is left in `SosStatus`
 is what a caller could not have known — `NoResource` (a full slab),
-`QuotaExceeded` (§2.9), `BadImage` (§8), `Drained` (§12, and the end of a
+`QuotaExceeded` (§2.9), `NoMemory` (11: a pool that cannot serve the length
+asked of it in one range, answered by `Pool.allocate` alone, §2.5; not yet
+enforced: pools), `BadImage` (§8), `Drained` (§12, and the end of a
 process walk, §2.8), `Revoked` (§2.2, every op on an invalid
 object, §2.10, a sender handle asked of a dead sender, §2.1, and a lookup of a
 pid the record table does not hold or holds for a process not yet started,
@@ -2805,14 +3229,14 @@ exports, that is missing.
 `copy_out` (§2.2 — the wait record and every answer wider than the registers,
 including the boot-set record) and its mirror `copy_in` (`Timer.Arm` and the
 message records) are the only code in the kernel that dereferences a user
-address. Each validates alignment and containment and terminates the process
-on a violation, on the faults ruling above; the asymmetry between their
-windows is deliberate and is stated at §2.2. That keeps "where does the kernel
-read user memory" a two-site audit rather than a property of the whole
-dispatch table, and keeps a per-address-space mapping switch a one-place
-change. A handle word arriving through either is data until dispatch resolves
-it against the caller's table, which is the rule every op follows for a handle
-in a register.
+address. Each validates alignment and containment and terminates the process on
+a violation, on the faults ruling above; the asymmetry between what the two
+doors accept is deliberate and is stated at §2.2. That keeps "where does the
+kernel read user memory" a two-site audit rather than a property of the whole
+dispatch table, and keeps a per-address-space mapping switch a one-place change.
+A handle word arriving through either is data until dispatch resolves it against
+the caller's table, which is the rule every op follows for a handle in a
+register.
 
 **Growing an op costs no register and no ABI.** Because the numbers are not ABI,
 a new op takes the next value in its own table and displaces nothing, and each
@@ -2908,27 +3332,37 @@ payload-free one-way primitive, and the TELL idiom (§2.1) carries a payload.
 
 ### 5.9 Memory: the RAM/device distinction and the region refcount
 
-Decided by §2.5's typed pools: RAM is `Memory`, device MMIO is `IoMemory`. The
+Decided by §2.5's typed pools: RAM is a `Pool` (not yet allocated) or a
+`Memory` (an allocation), and device MMIO is an `IoMemory`. The
 per-physical-region refcount, and its reconciliation with device regions that
 are never freed:
 
-- **The counts live on the region's own slab slot**: §2.5's "refcount invariant,
-  as built".
-- **There is no pool-side region descriptor**, and that is the answer rather
-  than a shortcut: a pool is not a fourth object kind. Every region carries a
-  `root` back-reference (a boot-minted region names itself; a split carries its
-  parent's answer down), and the pool's ledger — free-list head, bytes
-  outstanding, bytes dropped — lives on the root's own `MemorySlot`. Return is
-  to the root, never to the intermediate cursor a piece was cut from, because
-  the derivation chain is an artifact of front-cutting and not an ownership
-  tree. Adjacent free ranges coalesce, and `split` serves from the free list
-  before advancing the cursor (first fit).
-- A release is infallible, so a range that finds no free-list node after
-  coalescing is leaked and counted (`dropped`) rather than refused.
+- **The counts live on the object's own slab slot**: §2.5's "refcount
+  invariant, as built".
+- **A pool is its own kind, and its ledger is its own slot** (not yet
+  enforced: pools): the head of its free list, the bytes outstanding and the
+  bytes dropped. Every allocation records the pool it came from and returns
+  its whole range there; an allocation minted at boot came from no pool and
+  returns nowhere. A returned range is inserted into the pool's free list,
+  which is kept sorted by base; it coalesces with a free neighbour on either
+  side, and a free range that touches the pool's unspent frontier folds back
+  into it, so a pool whose every allocation has come home is whole again.
+  `allocate` serves first fit from the free list before it advances the
+  frontier (§2.5).
+- **The free list's nodes come from one slab** (`SlabKind.FreeRanges`,
+  donatable), shared by every pool and charged to nobody. A range needs a node
+  only when it touches no free neighbour, so a pool's list is as long as the
+  pool is fragmented, not as long as it is busy. A release is infallible, so a
+  range that finds no node after coalescing is dropped from its pool and
+  counted (`dropped`) rather than refused: those bytes are lost to the pool
+  until the machine stops, and its outstanding bytes still fall by their
+  length, so the pool can free. Donating nodes is the remedy.
 - **Byte accounting is that ledger**: `MemorySlot.out_bytes` (outstanding)
-  beside `pool_free_bytes(root)` (available). It is the pool's business and not
-  a per-process authority — quotas stay object-counted in v1 (§2.9) — and no op
-  fronts it.
+  beside the free list and the frontier (free). It is the pool's business and
+  not a per-process authority — quotas stay object-counted in v1 (§2.9). The
+  one op that fronts it is a pool's `available` (§2.5; not yet enforced:
+  pools), which reports what is free to a holder that can allocate; nothing
+  reports what is outstanding.
 - **`IoMemory` is the carve-out.** `carve` leaves the parent whole, MMIO is
   pinned and never freed, and a device region's counts are therefore
   effectively pinned.
@@ -3286,9 +3720,9 @@ this section specifies the scheduler that is not yet built.
 
 **Two phases, inert until started.** `SystemOp.ProcessCreate` (on the caller's
 System handle, gated by `SystemRight.ProcessCreate` — processes are minted by
-the System, §12) takes two Memory regions — a read-only image blob and the
-child's destination RAM — and returns a process with an address space, a
-recorded entry and stack, a pid (§2.7), and no thread.
+the System, §12) takes two allocations (`Memory` handles, §2.5) — a read-only
+image blob and the child's destination RAM — and returns a process with an
+address space, a recorded entry and stack, a pid (§2.7), and no thread.
 `ProcessOp.Start` (on the child's handle, gated by `ProcessRight.Start`) mints
 the first thread at that recorded entry and makes it runnable; the caller keeps
 running. The ordering is the soundness argument for the launch flow: whatever a
@@ -3550,8 +3984,9 @@ death, its notification and its teardown holds for it.
   its bound objects invalidated (its Timers disarmed, its Waiters' attachments
   released), its handle table released (an Interrupt it held destroyed and its
   line bindable again), what survives disowned, its domain cleared, its ledger
-  cleared and its body freed. A region it was given comes back as its grant
-  rows' references and its handles go, unless something else still names it.
+  cleared and its body freed. Memory it was given comes back as its grant
+  rows' references and its handles go, unless something else still names it
+  or, for a pool, something allocated from it is still out (§2.5).
   Its record keeps the status word, the final trap counters and the pid while
   a reference names it (§2.7).
 - **Children are not touched.** The kernel records no parent or child (§2.7,
@@ -3889,6 +4324,13 @@ loader parses and reports while no process stores either.
   loader's `allow_device: true` door, dormant) (§2.5): its emitter is
   sawlang-side, so deleting it is a toolchain-pin event.
 - **The tier-2 mapping quota price** (`DEFAULT_QUOTA_MAPPINGS`, §5b.1).
+- **The memory model's remaining parts** (§2.5): the `Pool` kind and typed
+  boot rows, the overlap rule, buffers judged by rows on every profile, and an
+  allocation that is never cut. Until each lands the kernel does what §2.5's
+  transition note says for it.
+- **Sub-pools and revoke** (§2.5): `Pool.split` and a revoke are reserved, not
+  specified. A process given a pool can allocate from it but cannot carve it
+  into budgets for others, and a manager cannot take back what it allocated.
 
 **Known limits.**
 
@@ -3934,12 +4376,24 @@ loader parses and reports while no process stores either.
   count, so it is never torn down (§2.7).
 - A Mapping whose handles are all released leaves its row installed until the
   target's teardown (§2.5).
+- Memory comes back to a pool only from holders that let go or die: there is
+  no revoke (§2.5). An allocation another process holds, maps or runs in keeps
+  its whole range out of its pool until that process releases it or ends, and
+  a pool comes back only once every allocation from it has.
+- An allocation is one contiguous range (§2.5), so a fragmented pool refuses
+  a length it holds enough free bytes for in total; `available` reports both
+  numbers, as a snapshot.
+- An allocation is never cut (§2.5), so the parts of one buffer are released
+  together, and an allocation minted at boot (a child's image or
+  destination) returns its bytes to no pool when it frees.
 - The kernel is uniprocessor (§7).
 
 **The plan.** The standing tail, each item specified in its own section: the
-namespace and its path-attached acceptor object (§2.1), thread waitability
-(§8), priorities and the §7 band map, SMP with `IntrSpinLock` (§9b), the vDSO
-true-mapping (§5.7), and the IOMMU driver with critical processes (§2.5).
+namespace and its path-attached acceptor object (§2.1), the rest of the memory
+model (§2.5), thread waitability (§8), priorities and the §7 band map, SMP with
+`IntrSpinLock` (§9b), the vDSO true-mapping (§5.7), and the IOMMU driver with
+critical processes (§2.5). Sub-pools and revoke follow the memory model; §2.5
+gives their direction and they are specified when they are designed.
 
 ## 12. The root server
 
@@ -3951,19 +4405,23 @@ true-mapping (§5.7), and the IOMMU driver with critical processes (§2.5).
   if the boot handle set can't support that split, the set is wrong.
 - **Boot handle set** (minted by the kernel to root; everything else derives):
   the **System handle** (§2.8), which carries the launch capability
-  `SystemRight.ProcessCreate` (§7); root MemoryObjects — the RAM pool root and
-  the device-range roots (§2.5); and the authority to bind interrupt lines.
-  Root's band map applies verbatim from its image (§7, not built). Two of these
-  are rights rather than objects, both bits on the System handle: binding a line
-  is `SystemRight.InterruptBind` rather than a root IRQ table root is given, and
-  the launch capability is `SystemRight.ProcessCreate`. **The set is one handle
-  wide at the register** — the pool roots are collected, not passed: the
-  build-emitted region table carries a kind column, a Ram row mints a
-  `MemoryObject` and a Device row an `IoMemoryObject`, and both arrive through
-  `BootHandleNext` under their row ordinal. A driver obtains its window instead
-  of declaring it, which is what makes handing one to a driver child possible at
-  all. The kernel assigns no meaning to which ordinal is which; that is root's
-  config.
+  `SystemRight.ProcessCreate` (§7); root's memory — the RAM pools and
+  allocations and the device windows the region table names (§2.5); and the
+  authority to bind interrupt lines. Root's band map applies verbatim from its
+  image (§7, not built). Two of these are rights rather than objects, both bits
+  on the System handle: binding a line is `SystemRight.InterruptBind` rather
+  than a root IRQ table root is given, and the launch capability is
+  `SystemRight.ProcessCreate`. **The set is one handle wide at the register** —
+  the regions are collected, not passed: the build-emitted region table carries
+  a kind column, a `Pool` row mints a `Pool`, a `Ram` row a `MemoryObject` (an
+  allocation) and a `Device` row an `IoMemoryObject` (a `Pool` row is not yet
+  enforced: pools), and each arrives through `BootHandleNext` under its row
+  ordinal, its record's kind naming which it is (`BootHandleKind.Pool` is
+  13). The kernel mints and queues
+  them in row order after root's System, Process and Thread handles, so the
+  drain answers row 0 first. A driver obtains its window instead of declaring
+  it, which is what makes handing one to a driver child possible at all. The
+  kernel assigns no meaning to which ordinal is which; that is root's config.
 - **Creation authority.** The creation-authority model for plain objects is the
   factory capability, spelled as rights bits on the Process object:
   `ThreadCreate`, `EventCreate`, `WaiterCreate` and `PipeCreate` are Process ops
@@ -4011,7 +4469,9 @@ true-mapping (§5.7), and the IOMMU driver with critical processes (§2.5).
   because a launcher must be able to report what it was handed. "No second code
   path" is therefore kept by construction: nowhere else in the tree reads a
   segment record. **Root provides the memory and supplies no numbers.**
-  `process_create(image:memory:)` takes two Memory capabilities, segments are
+  `process_create(image:memory:)` takes two allocations (`Memory`
+  capabilities; a `Pool` in either place is the `BadHandle` fault, not yet
+  enforced: pools), segments are
   copied to their virtual link addresses inside `memory` or used in place in
   `image` (§5.6), whose grant rows then hold `image` as the
   copied ones hold `memory`, so either handle may be released while the child
@@ -4025,15 +4485,46 @@ true-mapping (§5.7), and the IOMMU driver with critical processes (§2.5).
 - **The build emits a region table; the kernel interprets nothing.** The
   stitcher appends each child image as it is and records its rows (`{base, len}`
   and the kind column) in a fixed-symbol section; the kernel mints one sealed
-  region per row and hands them to root through `BootHandleNext`; root's config
-  says which ordinal is which. A missing table is zero regions. An image without
-  children may still have a table: a root that drives a device boots with its
-  device row, and an image that only sets boot flags has a header and no rows.
-  The header is a magic word, a version, the row count and a **boot flags**
-  byte; the kernel accepts exactly its own version and refuses a flag bit it
-  does not define. Bit 0 is "no tick": the kernel arms the scheduler tick (§7)
+  object per row, of the row's kind, and hands them to root through
+  `BootHandleNext`; root's config says which ordinal is which. A missing table
+  is zero regions. An image without children may still have a table: a root
+  that drives a device boots with its device row, and an image that only sets
+  boot flags has a header and no rows. The header is a magic word, a version,
+  the row count and a **boot flags** byte; the kernel accepts exactly its own
+  version and refuses a flag bit it does not define, and a kind byte it does
+  not define. Bit 0 is "no tick": the kernel arms the scheduler tick (§7)
   unless it is set, so an image with no table, or with the flags zero, runs
   with the tick, and only an image that asks is cooperative.
+- **The kind column types every row** (not yet enforced: pools). `Ram` (0)
+  mints an allocation, a `Memory` that came from no pool (§2.5); `Device` (1)
+  an `IoMemory`; `Pool` (2) a `Pool`. Root's boot pools are minted with
+  `pool_rights()`, its boot allocations with `memory_rights()` and its device
+  windows with `iomemory_rights()`, each charged to root. The table's version
+  changes with the kind column, since a table written for two kinds is not one
+  a kernel that knows three may guess at.
+- **The build types each row by its role.** The tree's stitcher
+  (`tools/sos_runner.py`) writes, in this order, which root's config reads as
+  tags: one image blob per child, one destination per child, then the RAM pool
+  if the case has one and the device window if it has one. It puts a pool row's
+  base on the protection grain (§2.5). A child's image blob and its destination
+  are allocations, because `process_create` takes allocations and a launcher
+  cannot allocate a blob from a pool: it would need the blob's length, which it
+  cannot read (§2.5) and which the build writes as a linker expression. The pool
+  row is a pool. A case that allocates from a blob or a destination types that
+  row as a pool instead. On the ESP32-S3 the blob rows lie in flash: an
+  allocation there is an image source and nothing else (a `map` of it is
+  `BadArg`, a destination `BadImage`, a donation `BadArg`, §2.5, §5.6, §2.8), a
+  pool there allocates only such allocations, and the segments a child uses in
+  place count on the image allocation they lie in (§2.5), so a launcher may
+  release its image handle while the child runs out of flash.
+- **A row typed wrong is the build's error, met at root's drain.** The kernel
+  mints what the kind column says. A root that finds a pool under a tag its
+  config gives to an allocation, or the reverse, learns it from the boot
+  record's kind (the typed drain has no `Memory` to hand it for that record),
+  and a handle of the wrong kind passed where the other is wanted is the
+  `BadHandle` fault every op answers a word of the wrong kind with. Two rows
+  over the same bytes are the build's error too, whatever their kinds: the
+  kernel compares no rows.
 - **The boot set is collected, not widened.** The entry register carries exactly
   one handle — System — and everything else the kernel minted for root before it
   ran is drained through `ProcessOp.BootHandleNext`, one `{tag, kind, handle}`
@@ -4100,8 +4591,10 @@ true-mapping (§5.7), and the IOMMU driver with critical processes (§2.5).
   capability and let the child install its own row (the driver child), or keep
   the capability and install the child's row yourself (a shared page the child
   holds no region object for). Attenuation runs the same way on either:
-  `Memory.mint(rights:)` narrows a region before it travels (§2.5's
-  `MemoryRight.MapExecute`).
+  `Memory.mint(rights:)` narrows an allocation before it travels (§2.5's
+  `MemoryRight.MapExecute`), and `Pool.mint(rights:)` narrows a pool, and with
+  it everything allocated through the narrowed handle (not yet enforced:
+  pools).
 - **v1 protocol conventions** (userspace convention, not kernel surface): a
   launched process receives one bootstrap pipe handle at launch; its first
   messages request its initial handle set from the launcher (name-service
