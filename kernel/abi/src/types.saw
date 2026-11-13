@@ -30,12 +30,12 @@ public enum ObjType: UInt8 {
     case Interrupt = 6,
     case Clock = 7,
     case Timer = 8,
-    /// RAM authority: a range of physical memory, derived by `Split` and
-    /// installed by `Map` (spec §2.5).
+    /// An allocation of RAM: a range of physical memory that is mapped, run in
+    /// as a process's image or destination, given and donated (spec §2.5).
     ///
     /// A region is a capability rather than a description: there is no bounds
-    /// reader. Boot regions are §2.5's "pool roots given to the root server at
-    /// boot".
+    /// reader. An allocation comes from a `Pool`'s `Allocate`, or from a
+    /// region-table row typed as one, and `Split` derives pieces of it.
     case Memory = 9,
     /// Device authority: a range of memory-mapped registers (spec §2.5).
     ///
@@ -123,6 +123,15 @@ public enum ObjType: UInt8 {
     /// giving this handle to a third party who replies straight to the original
     /// client, and `Transfer` is minted for exactly that.
     case PipeRequest = 15,
+    /// RAM not yet allocated: what a `Memory` is allocated from (spec §2.5).
+    ///
+    /// A distinct kind from `Memory` because the two have disjoint ops. A pool
+    /// hands out allocations (`Allocate`) and says how much it can
+    /// (`Available`); it is never mapped, never run in and never holds a grant
+    /// row. Its slot lives in the Memory slab beside the allocations it lends,
+    /// and its ledger (the free list, the bytes outstanding, the bytes dropped)
+    /// lives on that slot.
+    case Pool = 16,
 }
 
 // Which kinds are waitable is deliberately not recorded here (§2.2). It cannot
@@ -208,9 +217,13 @@ public type ClockHandle = UInt
 /// that created it. Same discipline again.
 public type TimerHandle = UInt
 
-/// A handle naming a Memory object (spec §2.5): a sealed range of physical
-/// memory. Same discipline again.
+/// A handle naming a Memory object (spec §2.5): an allocation, a sealed range
+/// of physical memory. Same discipline again.
 public type MemoryHandle = UInt
+
+/// A handle naming a Pool object (spec §2.5): RAM an allocation is made from.
+/// Same discipline again.
+public type PoolHandle = UInt
 
 /// A handle naming an IoMemory object (spec §2.5): a range of device registers.
 /// Same discipline again.

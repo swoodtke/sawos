@@ -1,0 +1,89 @@
+// The region table's rows are typed, and root's config reads them by kind
+// (spec §12).
+//
+//   SOS poolboot: row kinds 13 0 13
+//   SOS poolboot: the pool row taken as an allocation: none=1
+//   SOS bye: exiting
+//   SOS poolboot: run from its blob: status=65541
+//   SOS poolboot: done
+//
+// The case types its child's image blob as a pool (the runner's `pool_blobs`),
+// so the three rows are a pool, an allocation (the child's destination) and
+// the RAM pool: `BootHandleKind.Pool` is 13 and `.Memory` 0. A record holds
+// one object, and asking a pool's record for an allocation answers nothing.
+//
+// Root allocates the longest run the blob pool holds, which is the whole blob
+// (the build puts a pool row's base on the grain and pads its length to it),
+// and passes that allocation to `process_create` as the image: the child runs
+// and exits with its own code, 5.
+
+import sos.{System, Process, Pool, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static KEY_DEATH: UInt = 6
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Transfer | SystemRight.ProcessSelf
+                               | SystemRight.Debug)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poolboot: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS poolboot: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poolboot: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var blob_rec = try proc.boot_handle_next()
+    var dest_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    print("SOS poolboot: row kinds {} {} {}\n", blob_rec.kind as UInt,
+          dest_rec.kind as UInt, pool_rec.kind as UInt)
+    let absent = match pool_rec.take_memory() {
+        case None -> true,
+        case _ -> false,
+    }
+    print("SOS poolboot: the pool row taken as an allocation: none={}\n",
+          if absent { 1 } else { 0 })
+    guard let blob = blob_rec.take_pool() else { return BUG }
+    guard let dest = dest_rec.take_memory() else { return BUG }
+
+    let whole = try blob.available()
+    let image = try blob.allocate(len: whole.largest)
+    let child = try system.process_create(image: &image, memory: &dest)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    try child.start(boot_tag: TAG_BOOT)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            print("SOS poolboot: run from its blob: status={}\n", status)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

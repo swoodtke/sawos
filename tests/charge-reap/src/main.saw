@@ -15,16 +15,17 @@
 // refused, and lets them all go. It then launches the keeper (`child-keeper`)
 // with a sibling of its pool and a view of its device window, and hands the
 // keeper's Process handle to a Waiter as a one-shot subscription. The keeper
-// makes two connections of its own (one with a message staged on it), splits a
-// region off the pool, carves a window off the view, and exits holding all of
-// it.
+// makes two connections of its own (one with a message staged on it),
+// allocates a region out of the pool, carves a window off the view, and exits
+// holding all of it.
 //
 // After the death root counts again. `connections back=1` and `windows back=1`
 // are the same counts as before: the teardown's close-all frees the idle
 // connection with its last end, the busy one by the cascade out of settling its
 // staged exchange, and the window with its handle. `region back=1` is the pool
-// donated whole: a donation refuses a pool with any piece on loan (a fault,
-// which would end root here), so it says the close-all gives the piece back.
+// donated whole: a donation refuses a pool with any allocation out (a fault,
+// which would end root here), so it says the close-all gives the allocation
+// back.
 //
 // This pins the no-leak path, not the disown: everything here is charged to
 // the keeper and freed in its own teardown, so the case passes on a kernel
@@ -34,7 +35,7 @@
 // One phase per function: root's stack grant is small, so the phases are split
 // rather than held in one frame.
 
-import sos.{System, Process, Memory, IoMemory, SlabKind, SystemRight,
+import sos.{System, Process, Memory, Pool, IoMemory, SlabKind, SystemRight,
             SosStatus}
 
 static EXIT_OK: UInt = 0
@@ -91,7 +92,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var window_rec = try proc.boot_handle_next()
     guard let image = img_rec.take_memory() else { return BUG }
     guard let ram = ram_rec.take_memory() else { return BUG }
-    guard let pool = pool_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
     guard let window = window_rec.take_iomemory() else { return BUG }
 
     let connections_before = pipe_room(&proc)
@@ -102,7 +103,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
     let connections_back = pipe_room(&proc) == connections_before
     let windows_back = window_room(&window) == windows_before
-    try system.slab_donate(kind: SlabKind.Memories, memory: move pool) catch {
+    try system.slab_donate(kind: SlabKind.Memories, pool: move pool) catch {
         let (why, back) = move error
         let _ = move back
         return why
@@ -116,7 +117,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 /// death is delivered. Answers its §8 status word. Nothing of root's names the
 /// keeper once the delivery is made.
 func outlive(system: &System, proc: &Process, image: &Memory, ram: &Memory,
-             pool: &Memory, window: &IoMemory) -> Result<UInt, SosStatus> {
+             pool: &Pool, window: &IoMemory) -> Result<UInt, SosStatus> {
     let keeper = try system.process_create(image: &image, memory: &ram)
     let for_keeper = try system.mint(rights: CHILD_SYSTEM)
     try keeper.give(system: move for_keeper, tag: TAG_BOOT) catch {
@@ -125,7 +126,7 @@ func outlive(system: &System, proc: &Process, image: &Memory, ram: &Memory,
         return why
     }
     let sibling = try pool.mint()
-    try keeper.give(memory: move sibling, tag: TAG_RAM) catch {
+    try keeper.give(pool: move sibling, tag: TAG_RAM) catch {
         let (why, back) = move error
         let _ = move back
         return why

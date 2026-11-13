@@ -177,6 +177,9 @@ public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
         case Interrupt -> { INTERRUPTS[slot].refs = INTERRUPTS[slot].refs + 1 },
         case Timer -> { TIMERS[slot].refs = TIMERS[slot].refs + 1 },
         case Memory -> { MEMORIES[slot].refs = MEMORIES[slot].refs + 1 },
+        // A pool and an allocation count on the same column of one slab: a
+        // pool's slot is a Memory slot.
+        case Pool -> { MEMORIES[slot].refs = MEMORIES[slot].refs + 1 },
         case IoMemory -> { IOMEMORIES[slot].refs = IOMEMORIES[slot].refs + 1 },
         case Mapping -> { MAPPINGS[slot].refs = MAPPINGS[slot].refs + 1 },
         case Process -> {
@@ -283,6 +286,11 @@ public(package) func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
             TIMERS[slot].refs == 0
         },
         case Memory -> {
+            if MEMORIES[slot].refs == 0 { return false }
+            MEMORIES[slot].refs = MEMORIES[slot].refs - 1
+            MEMORIES[slot].refs == 0
+        },
+        case Pool -> {
             if MEMORIES[slot].refs == 0 { return false }
             MEMORIES[slot].refs = MEMORIES[slot].refs - 1
             MEMORIES[slot].refs == 0
@@ -676,6 +684,12 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             // nothing about the outcome, since a row is a namer.
             memory_release_if_idle(slot)
         },
+        case Pool -> {
+            // A pool frees at its handles' zero only once nothing it allocated
+            // is out: its outstanding bytes are its third count, and the last
+            // allocation to come home releases it (`memory_release_if_idle`).
+            memory_release_if_idle(slot)
+        },
         case IoMemory -> {
             // MMIO is pinned, so this touches no hardware. What actually
             // revokes a driver's reach is the row, and a row is a Mapping.
@@ -842,7 +856,8 @@ public(package) func disown_shared(p: Int) unsafe {
 
 /// Disown region `m` if dying process `p` is still charged for it. A region
 /// with no handle left may still be live: a mapped region keeps its slot, and
-/// so does a pool root with pieces on loan.
+/// so does a pool with allocations out. A pool is charged as an allocation is,
+/// so this covers both kinds of Memory slot.
 func disown_region(m: Int, p: Int) unsafe {
     match MEMORIES[m].state {
         case Free -> {},

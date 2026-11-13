@@ -1,0 +1,71 @@
+// A pool row off the protection grain is a pool of whole grains (spec §2.5):
+// it starts at its first grain boundary, and the bytes past its last whole
+// grain are never handed out.
+//
+//   SOS poolskew: total=<pool less the trimmed grains> largest=<the same>
+//   SOS poolskew: the first page mapped and written: 90
+//   SOS poolskew: the rest in one piece: ok
+//   SOS poolskew: done
+//
+// The runner writes the pool row one byte above the grain and one byte
+// shorter (`pool_skew`), and for one case one byte shorter again at its top
+// (`pool_short_top`). The kernel moves the base up to the next grain
+// boundary, which costs the rest of that first grain, and reports only whole
+// grains, which costs the part of the last one a short top leaves. The first
+// allocation is the front of what is left, and `map` takes it, which it would
+// refuse for a base off the grain. What remains after it is served in one
+// allocation of exactly `largest`, a whole number of grains.
+
+import sos.{System, Process, Pool, MapAccess, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+static MARK: UInt8 = 90
+
+/// Write one byte through a mapping and read it back. `unsafe` because it
+/// names a pointer type.
+func poke_peek(addr: UInt, value: UInt8) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poolskew: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS poolskew: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poolskew: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    let fresh = try pool.available()
+    print("SOS poolskew: total={} largest={}\n", fresh.total, fresh.largest)
+    let page = try pool.allocate(len: PAGE)
+    let view = try proc.map(memory: &page, access: RW)
+    let at = try view.base()
+    print("SOS poolskew: the first page mapped and written: {}\n",
+          poke_peek(at, MARK) as UInt)
+    let left = try pool.available()
+    let rest = try pool.allocate(len: left.largest)
+    let _ = move rest
+    print("SOS poolskew: the rest in one piece: ok\n")
+    return
+}

@@ -65,7 +65,8 @@ import sosabi.{SosStatus, PipeInletHandle, PipeInletOp, PipeOutletHandle,
                PipeOutletOp, PipeReplyHandle, PipeRequestHandle, MINT_OP,
                NO_HANDLE, PIPE_BODY_BYTES, PIPE_MSG_HANDLES,
                BootHandleKind, InletLevel, OutletLevel, ReplyLevel,
-               MemoryHandle, IoMemoryHandle, EventHandle, ThreadHandle,
+               MemoryHandle, PoolHandle, IoMemoryHandle, EventHandle,
+               ThreadHandle,
                TimerHandle, InterruptHandle,
                PipeMsgMeta, PipeMsgRecord, PipeSendRecord, PipeReplyWaitRecord,
                PipeTakeRecord,
@@ -85,6 +86,7 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, polled_ok,
                   sos_waiter_wait, handle_rights}
 import sos.waiter.{AttachMode, Waiter, mode_flag}
 import sos.memory.{Memory}
+import sos.pool.{Pool}
 import sos.iomemory.{IoMemory}
 import sos.event.{Event}
 import sos.timer.{Timer}
@@ -129,6 +131,7 @@ import sos.thread
 /// borrow, and a `move` out of a borrowing arm is a compiler soundness hole.
 public enum PipeHandle {
     case Memory(m: Memory),
+    case Pool(pool: Pool),
     case IoMemory(io: IoMemory),
     case Inlet(i: PipeInlet),
     case Outlet(o: PipeOutlet),
@@ -212,6 +215,14 @@ extension PipeHandles {
         self.kinds[at] = BootHandleKind.Memory as UInt8
         self.words[at] = owned.handle
         owned.handle = MemoryHandle(NO_HANDLE)
+    }
+
+    public func put(&var self, at: Int, pool: Pool) {
+        self.free_slot(at)
+        var owned = move pool
+        self.kinds[at] = BootHandleKind.Pool as UInt8
+        self.words[at] = owned.handle
+        owned.handle = PoolHandle(NO_HANDLE)
     }
 
     public func put(&var self, at: Int, iomemory: IoMemory) {
@@ -496,6 +507,7 @@ func decode_handle(kind: UInt8, word: UInt) -> PipeHandle? {
     }
     match what {
         case Memory -> PipeHandle.Memory(m: Memory(handle: MemoryHandle(word))),
+        case Pool -> PipeHandle.Pool(pool: Pool(handle: PoolHandle(word))),
         case IoMemory -> PipeHandle.IoMemory(io: IoMemory(handle: IoMemoryHandle(word))),
         case PipeInlet -> PipeHandle.Inlet(i: PipeInlet(handle: PipeInletHandle(word))),
         case PipeOutlet -> PipeHandle.Outlet(o: PipeOutlet(handle: PipeOutletHandle(word))),

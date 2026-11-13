@@ -1,14 +1,15 @@
 // Rights ceilings cap the handles minted from a held object (spec §2.7).
 //
 // Root narrows its own ceilings for Memory, Mapping and Process, and then
-// makes one handle of each kind from something it already holds: a piece split
-// off the pool, the Mapping that installs the piece, and a process created
-// from the System. Each carries the rights its op derives, intersected with
-// the ceiling. Rights words are decimal.
+// makes one handle of each kind from something it already holds: a piece
+// allocated out of the pool, the Mapping that installs the piece, and a
+// process created from the System. Each carries the rights its op derives,
+// intersected with the ceiling. Rights words are decimal.
 //
-//   SOS ceilderived: pool rights=1795      a handle already held is untouched
+//   SOS ceilderived: pool rights=67331     a handle already held is untouched
 //   SOS ceilderived: split piece rights=771
-//                       the parent's rights (1795) cut to 771: no MapExecute
+//                       the bits the pool hands down (1795) cut to 771: no
+//                       MapExecute
 //   SOS ceilderived: mapping rights=258    the Mapping's default set (770,
 //                       Mint, Unmap and Base) cut to 258: no Base
 //   SOS ceilderived: created process rights=4177667
@@ -16,7 +17,7 @@
 //
 // The case ends on the created process, which is never started.
 
-import sos.{System, Process, Memory, MapAccess, MemoryRight, MappingRight,
+import sos.{System, Process, Memory, Pool, MapAccess, MemoryRight, MappingRight,
             ProcessRight, SosStatus}
 
 static CHUNK: UInt = 0x1000
@@ -57,7 +58,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var pool_rec = try proc.boot_handle_next()
     guard let image = image_rec.take_memory() else { return SosStatus.BadImage }
     guard let ram = ram_rec.take_memory() else { return SosStatus.BadImage }
-    guard let pool = pool_rec.take_memory() else { return SosStatus.BadImage }
+    guard let pool = pool_rec.take_pool() else { return SosStatus.BadImage }
 
     try proc.restrict_rights(memory: NO_EXEC)
     try proc.restrict_rights(mapping: NO_BASE)
@@ -66,7 +67,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     let held = try pool.rights()
     print("SOS ceilderived: pool rights={}\n", held)
 
-    let piece = try pool.split(len: CHUNK)
+    let piece = try pool.allocate(len: CHUNK)
     let piece_word = try piece.rights()
     print("SOS ceilderived: split piece rights={}\n", piece_word)
 

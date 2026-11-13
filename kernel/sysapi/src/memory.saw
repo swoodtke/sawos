@@ -13,19 +13,20 @@ import sosabi.{SosStatus, MemoryHandle, MemoryOp, MINT_OP, NO_HANDLE}
 
 import sos.floor.{ALL_RIGHTS, call_value, sos_handle_release, handle_rights}
 
-/// A handle to a Memory, a sealed range of physical memory.
+/// A handle to a Memory: an allocation, a sealed range of physical memory.
 ///
-/// §2.5's RAM authority. A process receives pool roots at boot through
-/// `Process.boot_handle_next`, derives pieces of them with `split`, installs
-/// those pieces with `Process.map`, and passes whole regions to
-/// `System.process_create`.
+/// §2.5's RAM in use. A process allocates one out of a `Pool`, or receives one
+/// at boot through `Process.boot_handle_next` (a child's image blob and its
+/// destination are allocations), installs it with `Process.map`, passes it to
+/// `System.process_create` as an image or a destination, gives it and donates
+/// it, and derives pieces of it with `split`.
 ///
 /// There is no way to read the bounds. What a caller names is a length
 /// (`split`) or a target (`map`), and what it gets back is another capability.
 ///
-/// Built by `Process.boot_handle_next`, `split`, `mint`, a message's handle
-/// decode in `sos.pipe`, and a refused `System.slab_donate` handing the region
-/// back: no word constructor, no word extractor.
+/// Built by `Pool.allocate`, `Process.boot_handle_next`, `split`, `mint`, a
+/// message's handle decode in `sos.pipe`, and a refused `System.slab_donate`
+/// handing the region back: no word constructor, no word extractor.
 ///
 /// `NoCopy`, and dropping it releases the handle. A move-only handle's drop
 /// does something, which is the enforcement the discipline needs. See
@@ -56,14 +57,14 @@ extension Memory {
         handle_rights(self.handle)
     }
 
-    /// Cut a `len`-byte piece out of this region. Requires
+    /// Cut a `len`-byte piece out of this allocation. Requires
     /// `MemoryRight.Split`.
     ///
-    /// On a pool root the piece is served first fit from the root's free list
-    /// (ranges released pieces gave back), and only when no free range can
-    /// hold it, off the front of the root's unspent frontier. On a region that
-    /// is not a root it comes off the front, and this region becomes the
-    /// remainder. Allocation is this method in a loop.
+    /// On an allocation minted at boot the piece is served first fit from the
+    /// allocation's own free list (ranges released pieces gave back), and only
+    /// when no free range can hold it, off the front of its unspent frontier.
+    /// On an allocation a pool made it comes off the front, and this region
+    /// becomes the remainder.
     ///
     /// It consumes nothing. `&self`, no `move`, no disarm: the parent handle is
     /// the same handle afterwards. Only kernel-side state changed (a cut off
@@ -71,15 +72,15 @@ extension Memory {
     /// free list shrinks that free range and leaves the root's own range as it
     /// was), so this is not a transfer funnel; no word moved between tables.
     ///
-    /// `len` must be a non-zero multiple of the target's protection
-    /// granularity, and this region must be able to serve it as one range
-    /// (its frontier or, on a root, one free range). Each refusal terminates
-    /// the caller with `BadArg`. A zero or misaligned length is the caller's
-    /// mistake; a root whose free bytes are too fragmented to serve it in one
-    /// range is not something the caller can compute, and it is refused the
-    /// same way. A caller at its Memory or handle quota gets
-    /// `SosStatus.QuotaExceeded`; a full slab or handle table is
-    /// `SosStatus.NoResource`, which the caller could not have known.
+    /// `len` must be a non-zero multiple of the target's protection grain,
+    /// and this region must be able to serve it as one range (its frontier
+    /// or, on a boot allocation, one free range). Each refusal terminates the
+    /// caller with `BadArg`. A zero or misaligned length is the caller's
+    /// mistake; free bytes too fragmented to serve it in one range are not
+    /// something the caller can compute, and are refused the same way. A
+    /// caller at its Memory or handle quota gets `SosStatus.QuotaExceeded`; a
+    /// full slab or handle table is `SosStatus.NoResource`, which the caller
+    /// could not have known.
     ///
     /// Rows installed over this region's bytes (a child's image and stack, a
     /// `Mapping`) travel with the piece that covers them. A cut through the
@@ -87,12 +88,12 @@ extension Memory {
     ///
     /// Dropping the piece gives back the slot and the bytes. The release that
     /// takes a region's last reference to zero returns its kernel slab slot,
-    /// credits the splitter's Memory quota row, and returns its range to its
-    /// pool root's free list, where it coalesces with its free neighbours and,
-    /// if it touches the pool's unspent frontier, folds back into it. A pool
-    /// walked to its end and then released is a pool again
-    /// (`tests/memory-recycle`). A range that needs a free-list node when none
-    /// is left is dropped from the pool and counted, never lost silently.
+    /// credits the splitter's Memory quota row, and returns its range to the
+    /// free list of the pool it names (the pool its allocation came from, or
+    /// the boot allocation it was cut from), where it coalesces with its free
+    /// neighbours and, if it touches the unspent frontier, folds back into it.
+    /// A range that needs a free-list node when none is left is dropped and
+    /// counted, never lost silently.
     ///
     /// The last reference is not always the last handle. §2.5 frees a region
     /// when the last reference of either kind drops, and an installed mapping

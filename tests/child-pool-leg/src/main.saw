@@ -1,0 +1,368 @@
+// Test child: does one thing to the pool its launcher gave it, chosen by the
+// role the launcher signalled, for `pool_faults` (spec §2.5).
+//
+// The launcher gives it a System sibling as its boot tag, an Event carrying
+// the role, and for most roles a pool sibling (narrowed by the give's keep
+// mask where the role needs it) and one allocation out of that pool; the
+// donating roles get the one handle onto what they donate instead. The
+// faulting roles end this process in the kernel, and the launcher reads the
+// reason in the §8 status word; the others print what they found and exit
+// with `EXIT_DONE`.
+//
+// It works at the C altitude because several roles hand the kernel what the
+// typed tier never lets a caller write: a pool where an allocation belongs, a
+// record buffer of the caller's choosing, a capacity short of the record.
+
+import sos.{System, SosStatus, HandleInfo, HandleKind, MapAccess, SlabKind,
+            ALL_RIGHTS, sos_system_process_self, sos_process_boot_handle_next,
+            sos_event_receive, sos_pool_allocate, sos_pool_available,
+            sos_memory_map, sos_system_process_create,
+            sos_process_waiter_create, sos_waiter_add, sos_process_give,
+            sos_handle_info, sos_handle_mint, sos_process_restrict_rights,
+            sos_system_slab_donate, sos_process_exit}
+
+extern "C" {
+    func sos_ro_cell() -> UInt
+}
+
+static TAG_ROLE: UInt = 32
+static TAG_POOL: UInt = 33
+static TAG_MEM: UInt = 34
+
+/// The roles, as `pool-faults` numbers them.
+static ROLE_ALLOCATE: UInt = 1
+static ROLE_AVAILABLE: UInt = 2
+static ROLE_ALLOCATE_ZERO: UInt = 3
+static ROLE_ALLOCATE_OFF_GRAIN: UInt = 4
+static ROLE_ALLOCATE_OTHER_BIT: UInt = 5
+static ROLE_AVAILABLE_OTHER_BIT: UInt = 6
+static ROLE_AVAILABLE_SHORT: UInt = 7
+static ROLE_AVAILABLE_READ_ONLY: UInt = 8
+static ROLE_CREATE_POOL_IMAGE: UInt = 9
+static ROLE_CREATE_POOL_DESTINATION: UInt = 10
+static ROLE_WAIT_POOL: UInt = 11
+static ROLE_MAP_EXECUTE: UInt = 12
+static ROLE_GIVE: UInt = 13
+static ROLE_KINDS: UInt = 14
+static ROLE_CEILING: UInt = 15
+static ROLE_BUDGET: UInt = 16
+static ROLE_QUOTA_FIRST: UInt = 17
+static ROLE_ALLOCATE_TWO_BITS: UInt = 18
+static ROLE_AVAILABLE_TWO_BITS: UInt = 19
+static ROLE_DONATE_POOL: UInt = 20
+static ROLE_DONATE_ALLOCATION: UInt = 21
+static ROLE_SLAB_FULL: UInt = 22
+
+/// How this process ends when a role that does not fault has run.
+static EXIT_DONE: UInt = 7
+/// Something a role needs was refused with a status.
+static EXIT_SETUP: UInt = 97
+/// The boot set held no role, or a role this program does not know.
+static EXIT_NO_ROLE: UInt = 98
+
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+static PAGE: UInt = 0x1000
+
+/// Every Memory right but `MapExecute`: Transfer, Mint, Split and Map.
+static NO_EXECUTE: UInt = 771
+
+/// Read and execute: the access a map asks for when it wants code.
+static RX: UInt32 = MapAccess.Read | MapAccess.Execute
+
+/// The allocations a child may hold at once (`DEFAULT_QUOTA_MEMORIES`).
+static QUOTA: Int = 4
+
+static BOOT_WORDS: Int = 3
+static POOL_WORDS: Int = 3
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+/// A raw status word in the typed vocabulary's words.
+func status_of(raw: UInt) -> SosStatus {
+    if raw > (UInt8.max as UInt) {
+        return SosStatus.Unknown
+    }
+    SosStatus.from(raw: raw as UInt8) ?? SosStatus.Unknown
+}
+
+/// The handles this child was given, by tag.
+struct Given {
+    role: UInt,
+    pool: UInt,
+    mem: UInt,
+}
+
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+func next_record(proc: UInt, rec: &var [UInt; BOOT_WORDS]) unsafe -> UInt {
+    sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                 (BOOT_WORDS as UInt) * word_bytes())
+}
+
+func drain(proc: UInt) unsafe -> Given {
+    var given = Given(role: NONE, pool: NONE, mem: NONE)
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    while next_record(proc, &var rec) == STATUS_OK {
+        if rec[0] == TAG_ROLE {
+            var word: UInt = 0
+            let at = (&var word) as UnsafePointer<UInt>
+            let _ = sos_event_receive(rec[2], at)
+            given.role = word
+        } else if rec[0] == TAG_POOL {
+            given.pool = rec[2]
+        } else if rec[0] == TAG_MEM {
+            given.mem = rec[2]
+        }
+    }
+    given
+}
+
+/// `Pool.Available` into `at`, with capacity `cap`: the raw status.
+func available_at(pool: UInt, granularity: UInt, at: UInt,
+                  cap: UInt) unsafe -> UInt {
+    sos_pool_available(pool, granularity, at as UnsafePointer<UInt>, cap)
+}
+
+/// The pool's report at granularity zero, into `out`, or `false`.
+func report(pool: UInt, out: &var [UInt; POOL_WORDS]) unsafe -> Bool {
+    let at = ((&var out) as UnsafePointer<UInt>) as UInt
+    available_at(pool, 0, at, (POOL_WORDS as UInt) * word_bytes()) == STATUS_OK
+}
+
+/// The lowest granularity the pool accepts, or zero when it cannot be read.
+func lowest_granularity(pool: UInt) unsafe -> UInt {
+    var rec: [UInt; POOL_WORDS] = [0; POOL_WORDS]
+    if not report(pool, &var rec) {
+        return 0
+    }
+    rec[2] & ~(rec[2] - 1)
+}
+
+/// `Pool.Allocate`: the raw status, and the new handle through `out`.
+func allocate(pool: UInt, len: UInt, granularity: UInt,
+              out: &var UInt) unsafe -> UInt {
+    sos_pool_allocate(pool, len, granularity, (&var out) as UnsafePointer<UInt>)
+}
+
+/// `INFO_OP` with `selector` on `handle`, or `UInt.max` when refused.
+func info(handle: UInt, selector: HandleInfo) unsafe -> UInt {
+    var value: UInt = 0
+    let status = sos_handle_info(handle, selector as UInt,
+                                 (&var value) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return UInt.max
+    }
+    value
+}
+
+/// Whether `role` is one whose call the kernel answers by ending this process.
+func faults(role: UInt) -> Bool {
+    not (role == ROLE_KINDS || role == ROLE_CEILING || role == ROLE_BUDGET ||
+         role == ROLE_QUOTA_FIRST || role == ROLE_SLAB_FULL)
+}
+
+/// The faulting roles. Each makes one call the kernel answers by ending this
+/// process; a return means the kernel did not.
+func fault_role(boot_handle: UInt, proc: UInt, given: &Given) unsafe -> UInt {
+    let pool = given.pool
+    let role = given.role
+    var piece: UInt = NONE
+    var rec: [UInt; POOL_WORDS] = [0; POOL_WORDS]
+    let rec_at = ((&var rec) as UnsafePointer<UInt>) as UInt
+    let rec_bytes = (POOL_WORDS as UInt) * word_bytes()
+    if role == ROLE_ALLOCATE {
+        return allocate(pool, PAGE, 0, &var piece)
+    }
+    if role == ROLE_AVAILABLE {
+        return available_at(pool, 0, rec_at, rec_bytes)
+    }
+    if role == ROLE_ALLOCATE_ZERO {
+        return allocate(pool, 0, 0, &var piece)
+    }
+    if role == ROLE_DONATE_POOL {
+        return sos_system_slab_donate(boot_handle, SlabKind.Events as UInt,
+                                      pool)
+    }
+    if role == ROLE_DONATE_ALLOCATION {
+        return sos_system_slab_donate(boot_handle, SlabKind.Events as UInt,
+                                      given.mem)
+    }
+    let g = lowest_granularity(pool)
+    if role == ROLE_ALLOCATE_OFF_GRAIN {
+        return allocate(pool, g + 1, 0, &var piece)
+    }
+    if role == ROLE_ALLOCATE_OTHER_BIT {
+        return allocate(pool, g << 1, g << 1, &var piece)
+    }
+    if role == ROLE_AVAILABLE_OTHER_BIT {
+        return available_at(pool, g << 1, rec_at, rec_bytes)
+    }
+    if role == ROLE_AVAILABLE_SHORT {
+        return available_at(pool, 0, rec_at, rec_bytes - word_bytes())
+    }
+    if role == ROLE_AVAILABLE_READ_ONLY {
+        return available_at(pool, 0, sos_ro_cell(), rec_bytes)
+    }
+    var child: UInt = NONE
+    if role == ROLE_CREATE_POOL_IMAGE {
+        return sos_system_process_create(boot_handle, pool, given.mem, 0,
+                                         (&var child) as UnsafePointer<UInt>)
+    }
+    if role == ROLE_CREATE_POOL_DESTINATION {
+        return sos_system_process_create(boot_handle, given.mem, pool, 0,
+                                         (&var child) as UnsafePointer<UInt>)
+    }
+    if role == ROLE_WAIT_POOL {
+        var waiter: UInt = NONE
+        let made = sos_process_waiter_create(
+            proc, (&var waiter) as UnsafePointer<UInt>)
+        if made != STATUS_OK {
+            return made
+        }
+        return sos_waiter_add(waiter, pool, 1, 0)
+    }
+    if role == ROLE_MAP_EXECUTE {
+        let made = allocate(pool, PAGE, 0, &var piece)
+        if made != STATUS_OK {
+            return made
+        }
+        var mapping: UInt = NONE
+        return sos_memory_map(piece, proc, RX as UInt,
+                              (&var mapping) as UnsafePointer<UInt>)
+    }
+    if role == ROLE_ALLOCATE_TWO_BITS {
+        // The grain with its lowest bit set as well: one of its bits is in
+        // the set, and it is not a single bit.
+        let word = g | 1
+        return allocate(pool, g * word, word, &var piece)
+    }
+    if role == ROLE_AVAILABLE_TWO_BITS {
+        return available_at(pool, g | 1, rec_at, rec_bytes)
+    }
+    if role == ROLE_GIVE {
+        let made = allocate(pool, PAGE, 0, &var piece)
+        if made != STATUS_OK {
+            return made
+        }
+        // Through this process's own handle: a running process takes no give,
+        // so a give that gets past the `Transfer` test ends this process with
+        // `BadState` instead.
+        return sos_process_give(proc, piece, TAG_MEM + 1, ALL_RIGHTS as UInt)
+    }
+    EXIT_NO_ROLE
+}
+
+/// The roles that do not fault: each prints what it found.
+func report_role(proc: UInt, given: &Given) unsafe -> UInt {
+    let pool = given.pool
+    let role = given.role
+    if role == ROLE_KINDS {
+        var piece: UInt = NONE
+        if allocate(given.pool, PAGE, 0, &var piece) != STATUS_OK {
+            return EXIT_SETUP
+        }
+        print("SOS poolleg: kinds pool={} given={} own={}\n",
+              info(pool, HandleInfo.Kind), info(given.mem, HandleInfo.Kind),
+              info(piece, HandleInfo.Kind))
+        return EXIT_DONE
+    }
+    if role == ROLE_CEILING {
+        let narrowed = sos_process_restrict_rights(proc,
+                                                   HandleKind.Memory as UInt,
+                                                   NO_EXECUTE)
+        if narrowed != STATUS_OK {
+            return EXIT_SETUP
+        }
+        var piece: UInt = NONE
+        if allocate(pool, PAGE, 0, &var piece) != STATUS_OK {
+            return EXIT_SETUP
+        }
+        print("SOS poolleg: capped rights pool={} allocation={}\n",
+              info(pool, HandleInfo.Rights), info(piece, HandleInfo.Rights))
+        return EXIT_DONE
+    }
+    if role == ROLE_BUDGET {
+        var rec: [UInt; POOL_WORDS] = [0; POOL_WORDS]
+        if not report(pool, &var rec) {
+            return EXIT_SETUP
+        }
+        var all: UInt = NONE
+        let took = allocate(pool, rec[1], 0, &var all)
+        var more: UInt = NONE
+        let again = allocate(pool, lowest_granularity(pool), 0, &var more)
+        print("SOS poolleg: all it holds: {}; one unit more: {}\n",
+              status_of(took), status_of(again))
+        return EXIT_DONE
+    }
+    if role == ROLE_SLAB_FULL {
+        // Every handle this process may hold, minted as siblings of its own
+        // Process handle, while its launcher keeps the Memory slab full.
+        var last: UInt = STATUS_OK
+        while last == STATUS_OK {
+            var sibling: UInt = NONE
+            last = sos_handle_mint(proc, ALL_RIGHTS as UInt,
+                                   (&var sibling) as UnsafePointer<UInt>)
+        }
+        var piece: UInt = NONE
+        let got = allocate(pool, PAGE, 0, &var piece)
+        print("SOS poolleg: at its handle budget ({}), the slab full: {}\n",
+              status_of(last), status_of(got))
+        return EXIT_DONE
+    }
+    if role == ROLE_QUOTA_FIRST {
+        var held: Int = 0
+        var last: UInt = STATUS_OK
+        while held < QUOTA && last == STATUS_OK {
+            var piece: UInt = NONE
+            last = allocate(pool, PAGE, 0, &var piece)
+            held = held + 1
+        }
+        var rec: [UInt; POOL_WORDS] = [0; POOL_WORDS]
+        if last != STATUS_OK || not report(pool, &var rec) {
+            return EXIT_SETUP
+        }
+        var over: UInt = NONE
+        let refused = allocate(pool, rec[0] * 2, 0, &var over)
+        print("SOS poolleg: at its quota, more than the pool holds: {}\n",
+              status_of(refused))
+        return EXIT_DONE
+    }
+    EXIT_NO_ROLE
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = ask_process(boot_handle)
+    if proc == NONE {
+        let _ = system.debug_print("SOS poolleg: no process handle\n")
+        return
+    }
+    let given = drain(proc)
+    if given.role == NONE {
+        let _ = sos_process_exit(proc, EXIT_NO_ROLE)
+        return
+    }
+    var code: UInt = EXIT_NO_ROLE
+    if faults(given.role) {
+        let status = fault_role(boot_handle, proc, &given)
+        print("SOS poolleg: role {} was answered: {}\n", given.role,
+              status_of(status))
+        code = EXIT_SETUP
+    } else {
+        code = report_role(proc, &given)
+    }
+    let _ = sos_process_exit(proc, code)
+}

@@ -1,14 +1,14 @@
 // An empty region is no slab donation, and the caller keeps it (spec §2.8).
 //
-// Root cuts a piece off the pool and cuts that piece down to nothing, then
-// donates the empty piece. The region rule asks only of a region with bytes,
-// so the piece meets the answer a region too small for any slot gets: a
+// Root allocates a piece out of the pool and cuts that piece down to nothing,
+// then donates the empty piece. The region rule asks only of a region with
+// bytes, so the piece meets the answer a region too small for any slot gets: a
 // status, with the region handed back and root still running:
 //
 //   SOS donateempty: an empty region is refused: out of kernel objects
 //   SOS donateempty: done
 
-import sos.{System, Process, SlabKind, SosStatus}
+import sos.{System, Process, Pool, SlabKind, SosStatus}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -39,9 +39,9 @@ func _start(boot_handle: UInt) {
 
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var pool_rec = try proc.boot_handle_next()
-    guard let pool = pool_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
 
-    let piece = try pool.split(len: PIECE)
+    let piece = try pool.allocate(len: PIECE)
     let whole = try piece.split(len: PIECE)
     try system.slab_donate(kind: SlabKind.Waiters, memory: move piece) catch {
         let (why, back) = move error

@@ -306,6 +306,16 @@ CHILD_OVERSTEPS_PKG = os.path.join(TESTS_DIR, "child-oversteps")
 # publishes and the program expects, as the uart-echo driver does with
 # `UART_BASE`.
 MEMORY_SPLIT_PKG = os.path.join(TESTS_DIR, "memory-split")
+# The pool's own cases: its two ops read against each other, its refusals and
+# the rights it hands down (with a child that does one thing to the pool it is
+# given), what holds it, and the typed rows it comes from.
+POOL_OPS_PKG = os.path.join(TESTS_DIR, "pool-ops")
+POOL_FAULTS_PKG = os.path.join(TESTS_DIR, "pool-faults")
+CHILD_POOL_LEG_PKG = os.path.join(TESTS_DIR, "child-pool-leg")
+POOL_LIFETIME_PKG = os.path.join(TESTS_DIR, "pool-lifetime")
+POOL_BOOT_PKG = os.path.join(TESTS_DIR, "pool-boot")
+POOL_SKEW_PKG = os.path.join(TESTS_DIR, "pool-skew")
+POOL_FREED_PKG = os.path.join(TESTS_DIR, "pool-freed")
 MAP_BASICS_PKG = os.path.join(TESTS_DIR, "map-basics")
 MAP_UNMAP_PKG = os.path.join(TESTS_DIR, "map-unmap")
 MAP_INTO_CHILD_PKG = os.path.join(TESTS_DIR, "map-into-child")
@@ -846,6 +856,9 @@ ARCHES = [
         # Saw cannot name an address any other way, hence C.
         "pool_base": 0x80280000,
         "pool_len": 0x40000,
+        # The protection grain, mirroring `hal.PROT_GRAIN`: the one granularity
+        # a pool accepts, which `available` answers as its set.
+        "prot_grain": 4,
         # The device window a `"device": True` case publishes: the console
         # UART's page, mirroring `hal.DEVICE_GRANT_BASE` / `DEVICE_GRANT_LEN`.
         # The uart-echo cases obtain it rather than declaring it.
@@ -906,6 +919,9 @@ ARCHES = [
         # (`map_target_ok`).
         "pool_base": 0x40280000,
         "pool_len": 0x40000,
+        # The protection grain, mirroring `hal.PROT_GRAIN`: the one granularity
+        # a pool accepts, which `available` answers as its set.
+        "prot_grain": 4096,
         # A mapping here takes an address of its own, so it meets no row of the
         # target's image.
         "map_places": True,
@@ -977,6 +993,9 @@ ARCHES = [
         "selftest_line": 10,
         "pool_base": 0x80280000,
         "pool_len": 0x40000,
+        # The protection grain, mirroring `hal.PROT_GRAIN`: the one granularity
+        # a pool accepts, which `available` answers as its set.
+        "prot_grain": 4,
         "device_base": 0x10000000,
         "device_len": 0x1000,
     },
@@ -1025,6 +1044,9 @@ ESP32S3_ARCH = {
     # says the same.
     "pool_base": 0x3FCE0000,
     "pool_len": 0x10000,
+    # The protection grain, mirroring `hal.PROT_GRAIN`: the one granularity
+    # a pool accepts, which `available` answers as its set.
+    "prot_grain": 4,
     # UART0's page, mirroring `hal.DEVICE_GRANT_BASE` / `DEVICE_GRANT_LEN`.
     "device_base": 0x60000000,
     "device_len": 0x1000,
@@ -1044,7 +1066,7 @@ CHILD_REGION_LEN = 0x40000
 def _child_region_len(arch):
     return arch.get("child_region_len", CHILD_REGION_LEN)
 
-# The boot region table's wire format (version 3), frozen: an 8-byte header
+# The boot region table's wire format (version 4), frozen: an 8-byte header
 # (magic, version u16, count u8, boot flags u8) then `count` rows of {base: u64,
 # len: u64, kind: u8, reserved x 7}, all little-endian. The header's size puts
 # the first row on an 8-byte boundary and the row's padding keeps the next one
@@ -1053,11 +1075,11 @@ def _child_region_len(arch):
 # `RegionTableHeader` / `RegionRow` / `RegionKind` and the two `static_assert`s
 # beside them.
 #
-# The kernel accepts exactly version 3, so this constant and that file change
+# The kernel accepts exactly version 4, so this constant and that file change
 # together. An image with no table at all is unaffected: the kernel's `len == 0`
 # short-circuit runs ahead of the header read.
 REGION_TABLE_MAGIC = 0x4E475253          # 'S','R','G','N' read little-endian
-REGION_TABLE_VERSION = 3
+REGION_TABLE_VERSION = 4
 
 # The header's boot flags byte, mirroring `kernel/core/process.saw`'s
 # `BOOT_FLAG_NO_TICK`. The kernel arms the scheduler tick unless this bit is
@@ -1097,10 +1119,11 @@ def _child_count(case):
     return len(case.get("children", ()))
 
 # The kind column's values, mirroring `kernel/core/process.saw`'s `RegionKind`.
-# A Ram row mints a Memory and a Device row mints an IoMemory: kind, not a flag,
-# at the one place a window enters the system.
+# A Ram row mints a Memory (an allocation), a Pool row a Pool, and a Device row
+# an IoMemory: kind, not a flag, at the one place a window enters the system.
 REGION_KIND_RAM = 0
 REGION_KIND_DEVICE = 1
+REGION_KIND_POOL = 2
 
 
 def arch_dirs(arch):
@@ -1162,6 +1185,17 @@ def expectations(arch):
         "own_map": ("taken at an address of its own"
                     if arch.get("map_places") else "refused with NoResource"),
         "entry": f"0x{arch['root_entry']:0{width}x}",
+        # A pool's numbers as `Pool.available` reports them, in decimal: the
+        # granularity set (one bit, the grain) and a fresh pool's bytes.
+        "grain": str(arch.get("prot_grain")),
+        "pool_bytes": str(arch.get("pool_len")),
+        # A pool row moved off the grain (`pool_skew`) loses the rest of its
+        # first grain, and one whose top is off it too (`pool_short_top`)
+        # loses the part of its last grain as well.
+        "pool_less_grain": str(arch.get("pool_len", 0)
+                               - arch.get("prot_grain", 0)),
+        "pool_less_two_grains": str(arch.get("pool_len", 0)
+                                    - 2 * arch.get("prot_grain", 0)),
         "zero": f"0x{0:0{width}x}",
         "one": f"0x{1:0{width}x}",
         "two": f"0x{2:0{width}x}",
@@ -3521,10 +3555,11 @@ TEST_CASES = [
     {
         # Ceilings cap the handles minted from a held object. Root narrows its
         # Memory (no `MapExecute`), Mapping (no `Base`) and Process (no `Start`)
-        # ceilings; a handle it already held reads 1795, the piece it splits
-        # reads 771, the Mapping that installs the piece 258 (the Mapping
-        # default set is 770), and the process it creates 4177667, the
-        # Process default set without `Start`.
+        # ceilings; the pool it already held reads 67331 (`pool_rights()`,
+        # the Memory default set 1795 and `PoolRight.Allocate`), the piece it
+        # allocates reads 771, the Mapping that installs the piece 258 (the
+        # Mapping default set is 770), and the process it creates 4177667,
+        # the Process default set without `Start`.
         "name": "rights_ceiling_derived",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": CEILING_DERIVED_PKG,
@@ -3532,7 +3567,7 @@ TEST_CASES = [
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
-                       "SOS ceilderived: pool rights=1795",
+                       "SOS ceilderived: pool rights=67331",
                        "SOS ceilderived: split piece rights=771",
                        "SOS ceilderived: mapping rights=258",
                        "SOS ceilderived: created process rights=4177667",
@@ -3648,10 +3683,253 @@ TEST_CASES = [
                        # never runs out here.
                        "SOS split: cuts=20 refused=0",
                        "SOS split: asking for more than is left",
-                       "SOS: process fault: argument outside its domain",
-                       "SOS: process teardown"],
-        "expect_clean_exit": False,
-        "expect_status": EXIT_PROCESS_FAULT,
+                       # A length no free range of the pool can serve is a
+                       # status, `NoMemory`, and the program carries on.
+                       "SOS split: refused: this pool has no free range that "
+                       "long"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A pool's two ops read against each other (spec §2.5): what
+        # `available` reports is what `allocate` serves. A fresh pool reports
+        # its whole length twice and the grain's one bit as its set; the set's
+        # lowest bit as the granularity answers what zero does. Four pages
+        # allocated take four pages off both numbers, and an allocation's
+        # rights are the pool's word (67331) less `Allocate` (1795) under
+        # root's unrestricted ceiling. More than the pool holds
+        # is `NoMemory` and changes nothing the next report sees. With the
+        # frontier spent and the first and third page home, two pages are free
+        # in two ranges: one unit past `largest` and the two pages in one piece
+        # are `NoMemory`, exactly `largest` is served. Releasing the page
+        # between them coalesces the three, releasing the rest folds the pool
+        # whole with the same set, and a donated page stays out for good.
+        "name": "pool_ops",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_OPS_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS poolops: fresh total={pool_bytes} "
+                       "largest={pool_bytes} set={grain}",
+                       "SOS poolops: the lowest set bit as the granularity: "
+                       "same=1",
+                       "SOS poolops: four allocations: total fell by 16384 "
+                       "largest fell by 16384",
+                       "SOS poolops: rights pool=67331 allocation=1795",
+                       "SOS poolops: more than the pool holds: this pool has "
+                       "no free range that long unchanged=1",
+                       "SOS poolops: fragmented total=8192 largest=4096",
+                       "SOS poolops: one unit past largest: this pool has no "
+                       "free range that long",
+                       "SOS poolops: the total in one piece: this pool has no "
+                       "free range that long unchanged=1",
+                       "SOS poolops: exactly largest: ok",
+                       "SOS poolops: coalesced total=12288 largest=12288",
+                       "SOS poolops: all home: total={pool_bytes} set={grain}",
+                       "SOS poolops: a donated allocation stays out: 4096",
+                       "SOS poolops: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # What a pool refuses, and how (spec §2.5, §2.7, §3). Root launches
+        # `child-pool-leg` once per role with a pool sibling, narrowed by the
+        # give's keep mask where the role needs it, and one allocation, and
+        # prints the §8 word the child ends with: `Faulted` (2) in the high
+        # half and the reason in the low, or `Exited` with 7 for a role that
+        # ran to its end. No `Allocate` right refuses both ops
+        # (`AccessDenied`); zero bytes, a length off the grain, a
+        # granularity that is a bit the set lacks, and a record short of the
+        # published size are `BadArg`; a record in read-only data inside the
+        # copy-out window is `BadBuffer`; a pool where `process_create` wants
+        # an allocation is `BadHandle`, and attached to a Waiter `NotWaitable`.
+        # An allocation through a pool without `MapExecute` cannot be mapped
+        # executable, and one through a pool without `Transfer` cannot be
+        # given; the same give through a whole pool passes that test and is
+        # refused for a different reason (`BadState`: a running process takes
+        # no give). Then the roles that run to their end: `INFO_OP` names a
+        # pool 15 and an allocation 8; a child's narrowed `Memory` ceiling caps
+        # what it allocates (771) under a pool word of 67331; a child takes
+        # all the pool holds and is refused one unit more; a child at its
+        # `Memory` quota is answered `QuotaExceeded` before the pool is asked;
+        # and a child at its handle budget with the Memory slab full (root
+        # fills it with staged pages) is answered `NoResource`, the slab asked
+        # before the mint. A granularity of the grain with bit 0 set is
+        # `BadArg` at both ops: one of its bits is in the set, and it is not
+        # one bit. Last, two donations a child is given the only handle for:
+        # root's pool with a page of it out here, and the boot allocation the
+        # child's own destination was cut from. Both are `BadState`, and
+        # root's page then goes home to the pool the donation did not take.
+        "name": "pool_faults",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_FAULTS_PKG,
+        "children": [CHILD_POOL_LEG_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS poolfaults: allocate without Allocate: "
+                       "status=131075",
+                       "SOS poolfaults: available without Allocate: "
+                       "status=131075",
+                       "SOS poolfaults: allocate of zero bytes: status=131081",
+                       "SOS poolfaults: allocate off the grain: status=131081",
+                       "SOS poolfaults: allocate at another granularity: "
+                       "status=131081",
+                       "SOS poolfaults: available at another granularity: "
+                       "status=131081",
+                       "SOS poolfaults: allocate at the grain with bit 0 set: "
+                       "status=131081",
+                       "SOS poolfaults: available at the grain with bit 0 "
+                       "set: status=131081",
+                       "SOS poolfaults: available with a short record: "
+                       "status=131081",
+                       "SOS poolfaults: available into read-only data: "
+                       "status=131083",
+                       "SOS poolfaults: a pool as an image: status=131073",
+                       "SOS poolfaults: a pool as a destination: "
+                       "status=131073",
+                       "SOS poolfaults: a pool attached to a Waiter: "
+                       "status=131080",
+                       "SOS poolfaults: execute, through a pool without "
+                       "MapExecute: status=131075",
+                       "SOS poolfaults: give, through a pool without "
+                       "Transfer: status=131075",
+                       "SOS poolfaults: give, through a whole pool: "
+                       "status=131077",
+                       "SOS poolleg: kinds pool=15 given=8 own=8",
+                       "SOS poolfaults: kinds: status=65543",
+                       "SOS poolleg: capped rights pool=67331 allocation=771",
+                       "SOS poolfaults: a capped allocation: status=65543",
+                       "SOS poolleg: all it holds: ok; one unit more: this "
+                       "pool has no free range that long",
+                       "SOS poolfaults: a budget: status=65543",
+                       "SOS poolleg: at its quota, more than the pool holds: "
+                       "this process is at its quota",
+                       "SOS poolfaults: a quota: status=65543",
+                       "SOS poolleg: at its handle budget (this process is "
+                       "at its quota), the slab full: out of kernel objects",
+                       "SOS poolfaults: the slab full: status=65543",
+                       "SOS poolfaults: donate a pool with an allocation out: "
+                       "status=131077",
+                       "SOS poolfaults: the allocation went home to the pool",
+                       "SOS poolfaults: donate a boot allocation with a piece "
+                       "out: status=131077",
+                       "SOS poolfaults: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # What holds a pool (spec §2.5, §2.10), read as room in the Memory
+        # slab. The child's image blob is typed as a second pool and the child
+        # never runs. Root keeps a page allocated out of the blob pool and
+        # fills the slab with pages out of the RAM pool, staged in messages on
+        # a connection nobody takes from, until an allocation is
+        # `NoResource`; while the slab is full more than the pool holds is
+        # still `NoMemory`, because the pool is asked first. Releasing the
+        # blob pool's only handle frees nothing while its page is out (room
+        # grew by 0); releasing the page frees the page's slot and the pool's
+        # (room grew by 2).
+        "name": "pool_lifetime",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_LIFETIME_PKG,
+        "children": [CHILD_BYE_PKG],
+        "pool_blobs": [0],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS poollife: the slab filled: out of kernel objects",
+                       "SOS poollife: full, and too much: this pool has no "
+                       "free range that long",
+                       "SOS poollife: no handle, a page out: room grew by 0",
+                       "SOS poollife: the page home: room grew by 2",
+                       "SOS poollife: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A pool with nothing out is held by what names it (spec §2.5,
+        # §2.10), read as room in the Memory slab as `pool_lifetime` reads it.
+        # The child's image blob is typed as a second pool and never
+        # allocated from. Its only handle moved into a message nobody takes
+        # holds its slot (room grew by 0); closing that connection releases
+        # the message's handle, the last name, and the pool frees (room grew
+        # by 1).
+        "name": "pool_freed",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_FREED_PKG,
+        "children": [CHILD_BYE_PKG],
+        "pool_blobs": [0],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS poolfreed: held only by a staged message: room "
+                       "grew by 0",
+                       "SOS poolfreed: nothing names it, nothing out: room "
+                       "grew by 1",
+                       "SOS poolfreed: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The region table's rows are typed (spec §12). The child's image blob
+        # is typed as a pool by `pool_blobs`, so root drains a pool (13), an
+        # allocation (0) and the RAM pool (13), and a pool's record answers
+        # no allocation. Root allocates the blob pool's longest run, the whole
+        # blob, and runs the child from that allocation, which exits with its
+        # own code (`Exited` and 5).
+        "name": "pool_boot",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_BOOT_PKG,
+        "children": [CHILD_BYE_PKG],
+        "pool_blobs": [0],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS poolboot: row kinds 13 0 13",
+                       "SOS poolboot: the pool row taken as an allocation: "
+                       "none=1",
+                       "SOS bye: exiting",
+                       "SOS poolboot: run from its blob: status=65541",
+                       "SOS poolboot: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A pool row the build wrote off the protection grain (spec §2.5):
+        # `pool_skew` moves its base one byte up and keeps its top. The kernel
+        # starts the pool at the next grain boundary, so a fresh report is the
+        # usual pool less one grain, and the first page allocated is on the
+        # grain: `map` takes it, which it refuses for a base off the grain.
+        "name": "pool_off_grain",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_SKEW_PKG,
+        "pool": True,
+        "pool_skew": 1,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS poolskew: total={pool_less_grain} "
+                       "largest={pool_less_grain}",
+                       "SOS poolskew: the first page mapped and written: 90",
+                       "SOS poolskew: the rest in one piece: ok",
+                       "SOS poolskew: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A pool row off the grain at both ends (spec §2.5): `pool_skew` moves
+        # its base one byte up and `pool_short_top` brings its top one byte
+        # down. The kernel starts the pool at the next grain boundary and
+        # serves only whole grains below the top, so a fresh report is the
+        # usual pool less two grains, the first page maps, and what is left
+        # after it is served in one allocation of exactly `largest`.
+        "name": "pool_off_grain_top",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_SKEW_PKG,
+        "pool": True,
+        "pool_skew": 1,
+        "pool_short_top": 1,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS poolskew: total={pool_less_two_grains} "
+                       "largest={pool_less_two_grains}",
+                       "SOS poolskew: the first page mapped and written: 90",
+                       "SOS poolskew: the rest in one piece: ok",
+                       "SOS poolskew: done"],
+        "expect_clean_exit": True,
     },
     {
         # Installation. Root maps a page into itself and writes it, the inverse
@@ -7154,13 +7432,11 @@ TEST_CASES = [
                        "SOS slabnodes: donated a page of free ranges",
                        "SOS slabnodes: the range came back",
                        # The assertion. R2's range came home and R1's did not,
-                       # so the second ask of the pair cannot be served and the
-                       # kernel ends the caller: `MemoryOp.Split`'s `BadArg`.
-                       "SOS: process fault: argument outside its domain "
-                       "process={zero}",
-                       "SOS: process teardown handles="],
-        "expect_clean_exit": False,
-        "expect_status": EXIT_PROCESS_FAULT,
+                       # so the second ask of the pair cannot be served:
+                       # `PoolOp.Allocate`'s `NoMemory`.
+                       "SOS slabnodes: the leaked range is gone: this pool has "
+                       "no free range that long"],
+        "expect_clean_exit": True,
     },
 
     # Process-body donation.
@@ -8838,6 +9114,13 @@ def _region_rows(case, arch):
     Each row is (comment, base-expression, length-expression, kind). A base may
     be a linker expression rather than a number: that is what makes a blob row
     work at all, since the address is whatever `ld.lld` decides.
+
+    The kind column types each row by its role (spec §12). A blob and a
+    destination are allocations (`Ram`), because `process_create` takes
+    allocations and a launcher cannot allocate a blob out of a pool without
+    its length, which is a linker expression here. The pool row is a pool. A
+    case that allocates out of a child's blob names that child in
+    `pool_blobs`, and its blob row is typed as a pool instead.
     """
     children = range(_child_count(case))
     # Two children and a pool cannot coexist, and the refusal is here rather
@@ -8851,6 +9134,11 @@ def _region_rows(case, arch):
             f"case {case['name']!r}: a case with two children cannot also ask "
             f"for a pool — the second child's destination region and the pool "
             f"share a base (see hal/*/user/child2.ld)")
+    pool_blobs = case.get("pool_blobs", ())
+    for i in pool_blobs:
+        if i not in children:
+            raise ToolError(f"case {case['name']!r}: `pool_blobs` names child "
+                            f"{i}, which the case does not have")
     rows = []
     for i, _pkg in enumerate(children):
         # A hand-assembled child is another object, and an assembler that
@@ -8858,17 +9146,29 @@ def _region_rows(case, arch):
         # length as a symbol of its own, which the child's file defines.
         length = (f"_sos_child{i}_len" if case.get("child_asm") else
                   f"_sos_child{i}_end - _sos_child{i}_start")
-        rows.append((f"child {i}'s image blob (linker-resolved)",
-                     f"_sos_child{i}_start", length, REGION_KIND_RAM))
+        if i in pool_blobs:
+            rows.append((f"child {i}'s image blob, as a POOL (linker-resolved)",
+                         f"_sos_child{i}_start", length, REGION_KIND_POOL))
+        else:
+            rows.append((f"child {i}'s image blob (linker-resolved)",
+                         f"_sos_child{i}_start", length, REGION_KIND_RAM))
     region_len = _child_region_len(arch)
     for i, _pkg in enumerate(children):
         base = arch["child_region_base"] + i * region_len
         rows.append((f"child {i}'s destination RAM", f"{base:#x}",
                      f"{region_len:#x}", REGION_KIND_RAM))
     if case.get("pool"):
+        # `pool_skew` moves the pool row's base that many bytes up, off the
+        # grain, and shortens it to keep its top. `pool_short_top` shortens
+        # it by that many bytes at its top, so the top is off the grain too.
+        # They write the only rows the build puts off the grain, for the
+        # cases that show the kernel trims a pool to whole grains.
+        skew = case.get("pool_skew", 0)
+        short_top = case.get("pool_short_top", 0)
         rows.append(("the RAM POOL — free memory above every child region",
-                     f"{arch['pool_base']:#x}", f"{arch['pool_len']:#x}",
-                     REGION_KIND_RAM))
+                     f"{arch['pool_base'] + skew:#x}",
+                     f"{arch['pool_len'] - skew - short_top:#x}",
+                     REGION_KIND_POOL))
     if case.get("device"):
         rows.append(("the DEVICE window — the console UART's register page",
                      f"{arch['device_base']:#x}", f"{arch['device_len']:#x}",
@@ -8884,11 +9184,11 @@ def _stitch_regions(case, arch, clang):
     records offsets and lengths in a table. The kernel mints one object per row
     and interprets nothing; root's config says which ordinal is which.
 
-    It emits three kinds of row: a case asks for `children`, a `pool`, a
+    It emits rows for three roles: a case asks for `children`, a `pool`, a
     `device` window, or any combination, and `_region_rows` above is the order
     they land in. The kind column is what the kernel reads (a Ram row mints a
-    Memory, a Device row mints an IoMemory) and it is the only thing in a row
-    the kernel interprets at all.
+    Memory, a Pool row a Pool, a Device row an IoMemory) and it is the only
+    thing in a row the kernel interprets at all.
 
     The stub is generated rather than committed, which is what buys the
     linker-resolved bases: a blob row names the child section's own symbols,
@@ -8917,9 +9217,19 @@ def _stitch_regions(case, arch, clang):
         for i, _pkg in enumerate(children):
             staged = os.path.join(dirs["build"], f"{name}.child{i}.sosimg")
             shutil.copyfile(case["_child_images"][arch["name"]][i], staged)
+            # A pool row's base is on the protection grain (spec §12), and its
+            # length is padded to it, so the pool's longest run is the whole
+            # blob: a page is a multiple of every profile's grain.
+            pool_blob = i in case.get("pool_blobs", ())
+            if pool_blob:
+                lines.append("    .balign 4096")
             lines += [
                 f"_sos_child{i}_start:",
                 f"    .incbin \"{os.path.basename(staged)}\"",
+            ]
+            if pool_blob:
+                lines.append("    .balign 4096")
+            lines += [
                 f"_sos_child{i}_end:",
                 "    .balign 16",
             ]
@@ -10049,7 +10359,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
                      "death_fault", "pipe_pingpong", "map_into_child",
                      "iomemory_carve", "interrupt_give", "tick_spinner",
                      "copy_from_code_refused", "thread_entry_not_exec",
-                     "image_held", "data_init"]
+                     "image_held", "data_init", "pool_ops"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
     # This board's own process cases, for what only it has: a table of CPU

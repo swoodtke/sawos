@@ -41,8 +41,8 @@
 // the other direction (root keeps the region and installs the child's row), and
 // neither program could have asked the child's question.
 
-import sos.{System, Process, Memory, Mapping, MapAccess, Waiter, WaitResult,
-            WaitPayload, SosStatus, SystemRight}
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, Waiter,
+            WaitResult, WaitPayload, SosStatus, SystemRight}
 
 /// One page of the pool, which is the smallest thing either profile grants.
 static CHUNK: UInt = 0x1000
@@ -131,8 +131,8 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let pool = pool_record.take_memory() else {
-        let _ = system.debug_print("SOS placed: pool record is not a region\n")
+    guard let pool = pool_record.take_pool() else {
+        let _ = system.debug_print("SOS placed: pool record is not a pool\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -149,8 +149,8 @@ func _start(boot_handle: UInt) {
     // the child's mapping will land at (see the header). It is a real page and
     // root never touches it; what it takes is a slot in root's own address
     // space, the resource placement hands out.
-    let spacer = try pool.split(len: CHUNK) catch {
-        print("SOS placed: spacer split failed: {}\n", error)
+    let spacer = try pool.allocate(len: CHUNK) catch {
+        print("SOS placed: spacer allocation failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -167,8 +167,8 @@ func _start(boot_handle: UInt) {
     print("SOS placed: spacer at {}\n", spacer_at)
 
     // The shared page, mapped into root second, so it lands above the spacer.
-    let shared = try pool.split(len: CHUNK) catch {
-        print("SOS placed: split failed: {}\n", error)
+    let shared = try pool.allocate(len: CHUNK) catch {
+        print("SOS placed: allocation failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

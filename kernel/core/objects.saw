@@ -29,6 +29,8 @@ import sosabi.{
     TimerRight,
     MemoryHandle,
     MemoryRight,
+    PoolHandle,
+    PoolRight,
     IoMemoryHandle,
     IoMemoryRight,
     MappingHandle,
@@ -230,6 +232,24 @@ public(package) struct MemoryObject {
 
 extension MemoryObject {
     public(package) func allows(&self, right: MemoryRight) -> Bool {
+        (self.rights & (right as UInt32)) != 0
+    }
+}
+
+/// A Pool handle the dispatch has validated, paired with its rights and the
+/// Memory slot the pool lives in (spec §2.5).
+///
+/// A separate wrapper from `MemoryObject` for `IoMemoryObject`'s reason: a
+/// function that takes one of these was handed a pool, so a pool right is
+/// never tested against an allocation and no `MemoryOp` reaches a pool.
+public(package) struct PoolObject {
+    public(package) handle: PoolHandle,
+    public(package) rights: UInt32,
+    public(package) slot: Int,
+}
+
+extension PoolObject {
+    public(package) func allows(&self, right: PoolRight) -> Bool {
         (self.rights & (right as UInt32)) != 0
     }
 }
@@ -519,6 +539,7 @@ public(package) func handle_kind(kind: ObjType) unsafe -> HandleKind {
         case PipeOutlet -> HandleKind.PipeOutlet,
         case PipeReply -> HandleKind.PipeReply,
         case PipeRequest -> HandleKind.PipeRequest,
+        case Pool -> HandleKind.Pool,
     }
 }
 
@@ -804,13 +825,18 @@ public(package) func mint_refusal(p: Int) unsafe -> SosStatus {
 // =============================================================================
 //
 // The Memory, IoMemory and Mapping slabs live here beside the handle table,
-// with storage, an allocator per slab and one index fixup; the verbs (`Split`,
-// `Carve`, `Map`, `Unmap`) live in the dispatch. They sit below `process` as
-// every slab does: ending a process frees what it owned, so the storage has to
-// be reachable from the teardown.
+// with storage, an allocator per slab and one index fixup; the verbs
+// (`Allocate`, `Split`, `Carve`, `Map`, `Unmap`) live in the dispatch. They sit
+// below `process` as every slab does: ending a process frees what it owned, so
+// the storage has to be reachable from the teardown.
+//
+// Pools live in the Memory slab too. A slot is a pool when the handles naming
+// it are of kind `Pool`; the slot itself carries no kind, and the release and
+// the donation ask the same questions of a pool and of an allocation (its
+// handles, its rows, the bytes it has out).
 
-/// One Memory object: a range of physical memory, whose it is, and which pool
-/// the bytes came out of.
+/// One Memory slot: a pool, or an allocation of RAM. A range of physical
+/// memory, whose it is, and which pool the bytes came out of.
 ///
 /// `len` rather than a top address, because that is the shape the region table
 /// carries and a pool hands out. Compute the top where needed, with the bound
@@ -821,10 +847,13 @@ public(package) func mint_refusal(p: Int) unsafe -> SosStatus {
 /// handle or any Mapping) drops: `refs` counts the first kind and `maps` the
 /// second.
 ///
-/// `free_head`, `out_bytes` and `dropped` are the pool's, meaningful only on a
-/// root. A pool is not a separate object kind: it is the boot-minted region
-/// every derived region points back at, so its ledger lives on its own slot.
-/// They read as zero on every derived region and nothing asks them there.
+/// `free_head`, `out_bytes` and `dropped` are the pool's ledger, meaningful
+/// only on a slot that names itself as its pool (`root == slot`): every pool,
+/// and an allocation minted at boot, which serves `Split` from its own range
+/// as a pool serves `Allocate`. They read as zero on every other slot and
+/// nothing asks them there. `parent`, `lent_base`, `lent_len` and `depth`
+/// describe where a pool's own range came from; every pool is minted at boot
+/// and has no pool above it, so they are `NO_MEMORY` and zero.
 public(package) struct MemorySlot {
     public(package) state: SlotState,
     /// The process charged for this region, or `NO_PROCESS` once that process
@@ -844,26 +873,45 @@ public(package) struct MemorySlot {
     /// `record_grant` and dies in `remove_grant` or `clear_domain`, and a split
     /// hands the rows inside its piece to the piece (`rows_move_to_piece`):
     /// those are the places this count moves, and a row is always counted on
-    /// the region whose bytes it grants.
+    /// the region whose bytes it grants. A pool is never mapped and never
+    /// holds an image, so no row is ever counted on one.
     public(package) maps: UInt16,
-    /// The pool root these bytes belong to: a boot-minted region names itself,
-    /// and a split carries its parent's answer down.
+    /// The pool these bytes belong to: a pool names itself, an allocation names
+    /// the pool it was allocated from, and a split carries its parent's answer
+    /// down. An allocation minted at boot names itself too, and its pieces
+    /// return to it.
     ///
     /// The derivation chain is a cursor artifact, not an ownership tree: a
     /// piece cut from a piece returns to the pool, not to the intermediate
     /// region it was cut from.
     public(package) root: Int,
-    /// Root only: the head of this pool's free list, node index + 1, 0 empty.
+    /// The unit this region is made of, in bytes, for its life. An allocation
+    /// from a pool is a whole number of units at a base on one, and a pool
+    /// starts and ends on the grain it records. A boot allocation records the
+    /// protection grain and claims nothing about its own row: a child's image
+    /// blob starts on 16 bytes and its length is the image's. A piece records
+    /// its parent's unit.
+    public(package) granularity: UInt,
+    /// Pool only: the pool this pool's range was lent by, or `NO_MEMORY` for a
+    /// pool minted at boot. The release returns `[lent_base, lent_base +
+    /// lent_len)` to it when this pool frees, and asks it in turn.
+    public(package) parent: Int,
+    public(package) lent_base: UInt,
+    public(package) lent_len: UInt,
+    /// Pool only: how many pools lie above this one. Zero for a boot pool.
+    public(package) depth: UInt8,
+    /// Pool only: the head of this pool's free list, node index + 1, 0 empty.
     public(package) free_head: Int,
-    /// Root only: bytes handed out of this pool and not yet returned.
+    /// Pool only: bytes handed out of this pool and not yet returned, the
+    /// lengths of the allocations out and of every one donated to the kernel.
     ///
     /// With `pool_free_bytes` this is §5.9's byte accounting: outstanding here,
     /// free there. Quotas stay object-counted; bytes are the pool's business.
-    /// It is also the third count in a root's release condition (see
-    /// `memory_release_if_idle`), which keeps a derived region's back-reference
+    /// It is also the third count in a pool's release condition (see
+    /// `memory_release_if_idle`), which keeps an allocation's back-reference
     /// from ever naming a slot that has been given away.
     public(package) out_bytes: UInt,
-    /// Root only: bytes lost to free-node exhaustion, counted rather than
+    /// Pool only: bytes lost to free-node exhaustion, counted rather than
     /// silent.
     ///
     /// Release is infallible: a range that finds no node after coalescing is
@@ -873,13 +921,26 @@ public(package) struct MemorySlot {
     public(package) dropped: UInt,
 }
 
+extension MemorySlot {
+    /// A slot with nothing in it: what the slab starts as and what a free
+    /// writes back.
+    public(package) static func vacant() -> MemorySlot {
+        MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0, refs: 0,
+                   maps: 0, root: NO_MEMORY, granularity: 0, parent: NO_MEMORY,
+                   lent_base: 0, lent_len: 0, depth: 0, free_head: 0,
+                   out_bytes: 0, dropped: 0)
+    }
+}
+
 // `MAX_MEMORIES` is the length of the inline extent; donated extents add slots.
 // A Memory slot is the object: donating slots raises how many regions can exist
 // at once without adding a byte to any pool.
 public(package) unsafe static var MEMORIES: Slab<MemorySlot, MAX_MEMORIES> = Slab<MemorySlot, MAX_MEMORIES>(
     inline: [MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0,
-                        refs: 0, maps: 0, root: NO_MEMORY, free_head: 0,
-                        out_bytes: 0, dropped: 0); MAX_MEMORIES],
+                        refs: 0, maps: 0, root: NO_MEMORY, granularity: 0,
+                        parent: NO_MEMORY, lent_base: 0, lent_len: 0,
+                        depth: 0, free_head: 0, out_bytes: 0,
+                        dropped: 0); MAX_MEMORIES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
@@ -903,20 +964,27 @@ public(package) func alloc_memory() unsafe -> Int {
 // The pool: spent bytes come back (spec §2.5, §5.9)
 // -----------------------------------------------------------------------------
 //
-// A region knows its pool root. When both of its counts are zero its range goes
-// back to that root. A returned range coalesces with its free neighbours, and
-// one that touches the root's unspent frontier folds back into the cursor, so a
-// fully-freed pool returns to its boot state. A `Split` takes the first fit off
-// the free list and falls back to the cursor.
+// A region knows its pool. When both of its counts are zero its range goes back
+// to that pool. A returned range coalesces with its free neighbours, and one
+// that touches the pool's unspent frontier folds back into the cursor, so a
+// fully-freed pool returns to its boot state. An `Allocate` takes the first fit
+// off the free list and falls back to the cursor, and so does a `Split` of an
+// allocation minted at boot, which keeps a pool's ledger on its own slot.
 //
 // The cursor is the empty-free-list fast path and what a fresh pool is. A
 // cut-and-drop loop allocates and frees the same range forever and never
 // touches a node.
 //
-// Only a root draws on the list. This is an authority rule: a derived region
-// names exactly its own range, and serving its `Split` out of the pool's list
-// would hand its holder bytes it never had. A pool root's cut ranges are on
-// loan, and a returned loan is the pool's again.
+// Only a slot that is its own pool draws on the list. This is an authority
+// rule: an allocation names exactly its own range, and serving its `Split` out
+// of the pool's list would hand its holder bytes it never had. A pool's cut
+// ranges are on loan, and a returned loan is the pool's again.
+//
+// Every range on a pool's list and its frontier begin on the protection grain:
+// a pool's base is put on the grain when it is minted, and every length it
+// hands out, and every length that comes back, is a multiple of the grain. So
+// at the grain the first range that holds a length holds it from its own front,
+// and the first fit below serves exactly the aligned run `available` reports.
 //
 // IoMemory is untouched (§5.9's carve-out): a carve leaves the parent whole,
 // MMIO is pinned, and nothing is ever placed in or returned from those bytes.
@@ -988,13 +1056,50 @@ public(package) func pool_free_bytes(root: Int) unsafe -> UInt {
     total
 }
 
-/// Can region `slot` serve a cut of `len` bytes, from its own cursor or (for a
-/// pool root) from one range on its free list?
+/// The longest part of `[base, base + len)` that starts and ends on multiples
+/// of `g` (a power of two): a range's aligned run at that granularity.
 ///
-/// This is the `Split` refusal. The question is whether the pool can hand out
-/// `len` bytes in one range, which is what a region is, not whether it holds
-/// that many in total. Two non-adjacent halves of the ask answer no: that is
-/// fragmentation rather than exhaustion.
+/// Written with remainders so that no sum can overflow, whatever bounds a
+/// boot row carried.
+func aligned_run(base: UInt, len: UInt, g: UInt) -> UInt {
+    let rem = base & (g - 1)
+    let pad: UInt = if rem == 0 { 0 } else { g - rem }
+    if pad >= len {
+        return 0
+    }
+    (len - pad) & ~(g - 1)
+}
+
+/// What pool `root` could serve at granularity `g` right now: the sum of the
+/// aligned runs of its free ranges and of its frontier, and the longest of
+/// them (§2.5's `available`).
+///
+/// One walk of the free list, bounded by the node slab's capacity, the walk
+/// `pool_can_serve` makes. Bytes dropped for want of a node are on no list and
+/// are not counted, and nothing out on loan is.
+public(package) func pool_available(root: Int, g: UInt) unsafe -> (UInt, UInt) {
+    var total = aligned_run(MEMORIES[root].base, MEMORIES[root].len, g)
+    var largest = total
+    var cur = MEMORIES[root].free_head
+    while cur != 0 {
+        let n = cur - 1
+        let run = aligned_run(FREE_RANGES[n].base, FREE_RANGES[n].len, g)
+        total = total + run
+        if run > largest {
+            largest = run
+        }
+        cur = FREE_RANGES[n].next
+    }
+    (total, largest)
+}
+
+/// Can region `slot` serve a cut of `len` bytes, from its own cursor or (for a
+/// slot that is its own pool) from one range on its free list?
+///
+/// This is `Allocate`'s `NoMemory` and the `Split` refusal. The question is
+/// whether the pool can hand out `len` bytes in one range, which is what a
+/// region is, not whether it holds that many in total. Two non-adjacent halves
+/// of the ask answer no: that is fragmentation rather than exhaustion.
 public(package) func pool_can_serve(slot: Int, len: UInt) unsafe -> Bool {
     if MEMORIES[slot].len >= len {
         return true
@@ -1014,8 +1119,8 @@ public(package) func pool_can_serve(slot: Int, len: UInt) unsafe -> Bool {
 }
 
 /// Where `pool_cut(slot, len)` will cut, without cutting: the front of the
-/// first free range that holds `len` on a pool root, else the region's own
-/// cursor.
+/// first free range that holds `len` on a slot that is its own pool, else the
+/// region's own cursor.
 ///
 /// It walks as `pool_cut` does and the two must agree: the split asks here
 /// first, to learn which rows lie in the bytes it is about to move.
@@ -1269,62 +1374,74 @@ public(package) func unref_region_row(region: Int) unsafe {
 ///   - rows first: the ordinary `Unmap` before a release, which frees at the
 ///     handle drop.
 ///
-/// A pool root has a third count, `out_bytes`. A root whose own handles and
-/// rows are gone still cannot be given away while pieces of it are on loan:
-/// each piece carries a back-reference to this slot, and a slot handed to the
-/// next `Split` would make those references name a stranger. The last piece to
-/// come home releases the root through the tail call below, which is one level
-/// deep by construction (a root's root is itself). This path is taken only when
-/// a pool root is released while pieces of it are on loan.
+/// A pool has a third count, `out_bytes`. A pool whose own handles are gone
+/// still cannot be given away while allocations from it are out: each carries
+/// a back-reference to this slot, and a slot handed to the next `Allocate`
+/// would make those references name a stranger. The last allocation to come
+/// home releases the pool. An allocation minted at boot is its own pool for
+/// the pieces `Split` cuts from it, so it waits for them the same way.
+///
+/// The walk is a loop up the chain of pools: an allocation that frees returns
+/// its range to its pool and asks the pool, and a pool that frees returns the
+/// range it was lent to its `parent` and asks that one. Every pool is minted
+/// at boot with no `parent`, so the walk ends at the first pool it reaches.
 public(package) func memory_release_if_idle(slot: Int) unsafe {
-    match MEMORIES[slot].state {
-        case Free -> { return },
-        case Live -> {},
-    }
-    if MEMORIES[slot].refs != 0 {
-        return
-    }
-    if MEMORIES[slot].maps != 0 {
-        return
-    }
-    let root = MEMORIES[slot].root
-    if root == slot {
-        if MEMORIES[slot].out_bytes != 0 {
+    var at = slot
+    while {
+        match MEMORIES[at].state {
+            case Free -> { return },
+            case Live -> {},
+        }
+        if MEMORIES[at].refs != 0 {
             return
         }
-        pool_drop_nodes(slot)
-    } else {
-        // The row is already gone by the time the bytes move, and the order is
-        // the contract: `remove_grant`/`clear_domain` take the row out of the
-        // record before they drop this count, so a range can never be handed to
-        // a new owner while a domain still grants it to the old one.
-        pool_return(root, MEMORIES[slot].base, MEMORIES[slot].len)
-    }
-    let owner = MEMORIES[slot].process
-    MEMORIES[slot] = MemorySlot(state: SlotState.Free, process: 0, base: 0,
-                                len: 0, refs: 0, maps: 0, root: NO_MEMORY,
-                                free_head: 0, out_bytes: 0, dropped: 0)
-    credit_shared(owner, QuotaKind.Memory)
-    if root != slot {
-        memory_release_if_idle(root)
+        if MEMORIES[at].maps != 0 {
+            return
+        }
+        let root = MEMORIES[at].root
+        var next = root
+        if root == at {
+            if MEMORIES[at].out_bytes != 0 {
+                return
+            }
+            pool_drop_nodes(at)
+            next = MEMORIES[at].parent
+            if next != NO_MEMORY {
+                pool_return(next, MEMORIES[at].lent_base, MEMORIES[at].lent_len)
+            }
+        } else {
+            // The row is already gone by the time the bytes move, and the order
+            // is the contract: `remove_grant`/`clear_domain` take the row out
+            // of the record before they drop this count, so a range can never
+            // be handed to a new owner while a domain still grants it to the
+            // old one.
+            pool_return(root, MEMORIES[at].base, MEMORIES[at].len)
+        }
+        let owner = MEMORIES[at].process
+        MEMORIES[at] = MemorySlot.vacant()
+        credit_shared(owner, QuotaKind.Memory)
+        if next == NO_MEMORY {
+            return
+        }
+        at = next
     }
 }
 
 /// Retire a Memory slot whose bytes have become a slab extent.
 ///
 /// The sibling of `memory_release_if_idle`; the difference is the one call it
-/// does not make. A released region gives its range back to its pool root's
-/// free list; a donated region must never, because the kernel now keeps its own
-/// object slots there and the next `Split` would hand them out. So this frees
-/// the slot (the object is gone and nothing can name it) while the range stays
-/// out of every pool forever.
+/// does not make. A released allocation gives its range back to its pool's
+/// free list; a donated one must never, because the kernel now keeps its own
+/// object slots there and the next `Allocate` would hand them out. So this
+/// frees the slot (the object is gone and nothing can name it) while the range
+/// stays out of every pool forever.
 ///
-/// A derived region's length stays counted in its root's `out_bytes`, so the
-/// root still believes those bytes are on loan and can never itself be released
-/// or re-served.
+/// A donated allocation's length stays counted in its pool's `out_bytes`, so
+/// the pool still believes those bytes are on loan and can never itself be
+/// released or re-served.
 ///
-/// A pool root may be donated whole, and then its free-list nodes go back to
-/// the node slab as `memory_release_if_idle` does it; the caller has already
+/// A pool may be donated whole, and then its free-list nodes go back to the
+/// node slab as `memory_release_if_idle` does it; the caller has already
 /// checked `out_bytes == 0`, so nothing on loan is orphaned.
 ///
 /// There is no `refs`/`maps` test here and there must not be: the caller
@@ -1336,9 +1453,7 @@ public(package) func memory_retire_donated(slot: Int) unsafe {
         pool_drop_nodes(slot)
     }
     let owner = MEMORIES[slot].process
-    MEMORIES[slot] = MemorySlot(state: SlotState.Free, process: 0, base: 0,
-                                len: 0, refs: 0, maps: 0, root: NO_MEMORY,
-                                free_head: 0, out_bytes: 0, dropped: 0)
+    MEMORIES[slot] = MemorySlot.vacant()
     credit_shared(owner, QuotaKind.Memory)
 }
 
@@ -1548,6 +1663,9 @@ public(package) func compact_mapping_rows(target: Int, removed: Int) unsafe {
 public(package) func boot_kind_of(kind: ObjType) -> BootHandleKind? {
     match kind {
         case Memory -> BootHandleKind.Memory,
+        // `pool_rights()` mints `Transfer`: a launcher hands a child a budget
+        // of its own to allocate from.
+        case Pool -> BootHandleKind.Pool,
         case Process -> BootHandleKind.Process,
         case System -> BootHandleKind.System,
         // `iomemory_rights()` mints `Transfer`, so a window can travel and the

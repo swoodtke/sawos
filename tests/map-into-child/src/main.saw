@@ -1,5 +1,6 @@
-// Mapping into a child (spec §2.5, §12). Root creates a child, splits a page
-// off its own pool, installs that page in the child's address space, furnishes
+// Mapping into a child (spec §2.5, §12). Root creates a child, allocates a
+// page out of its own pool, installs that page in the child's address space,
+// furnishes
 // the child with a masked System handle and starts it. The child then writes
 // and reads an address its image never declared.
 //
@@ -32,7 +33,7 @@
 // back (0x3C = 60) in the low, read through the Process handle root never gave
 // away: the same round trip the console line states, arriving as a value.
 
-import sos.{System, Process, Memory, Mapping, MapAccess, Clock, ClockType,
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, Clock, ClockType,
             Timer, Waiter, SosStatus, SystemRight}
 
 extern "C" {
@@ -102,8 +103,8 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let pool = pool_record.take_memory() else {
-        let _ = system.debug_print("SOS mapchild: pool record is not a region\n")
+    guard let pool = pool_record.take_pool() else {
+        let _ = system.debug_print("SOS mapchild: pool record is not a pool\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -120,8 +121,8 @@ func _start(boot_handle: UInt) {
     // so the two rights this spends are `ProcessRight.Map` on that handle and
     // `MemoryRight.Map` on the region: holding the page is not enough to
     // install it anywhere.
-    let page = try pool.split(len: CHUNK) catch {
-        print("SOS mapchild: split failed: {}\n", error)
+    let page = try pool.allocate(len: CHUNK) catch {
+        print("SOS mapchild: allocation failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

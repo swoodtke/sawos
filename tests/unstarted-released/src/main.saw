@@ -14,17 +14,18 @@
 //                         handle root kept answers `Revoked`
 //   line bound again      the Interrupt the child held was destroyed
 //   region came back      the region the child held is back in the pool, so
-//                         a cut of the whole pool is possible again
+//                         an allocation of the whole pool is possible again
 //
-// The last two legs end in a fault when the child is not torn down (`LineBound`
-// and a cut larger than the pool holds), so they come last.
+// The last two legs end the run when the child is not torn down (the bind is
+// the `LineBound` fault and the allocation answers `NoMemory`), so they come
+// last.
 //
 // Root first runs a host (`child-xhost`) to learn the address of a thread
 // stack, which only a running process can compute, and ends it. Every loop is
 // bounded.
 
-import sos.{System, Process, Memory, Event, PipeInlet, PipeOutlet, SystemRight,
-            SosStatus, PIPE_BODY_BYTES}
+import sos.{System, Process, Memory, Pool, Event, PipeInlet, PipeOutlet,
+            SystemRight, SosStatus, PIPE_BODY_BYTES}
 
 // The pool's size: its config, per architecture, in C because Saw cannot name
 // an address. See `tests/poolbase_riscv32.c`.
@@ -160,14 +161,14 @@ func spare_slots(system: &System, image: &Memory, ram: &Memory) -> Int {
 }
 
 /// Give the child a pipe's outlet, a cut of the pool and a bound line.
-func give_all(system: &System, child: &Process, pool: &Memory,
+func give_all(system: &System, child: &Process, pool: &Pool,
               outlet: PipeOutlet) -> Result<Void, SosStatus> {
     try child.give(outlet: move outlet, tag: TAG_PIPE) catch {
         let (why, back) = move error
         let _ = move back
         return why
     }
-    let piece = try pool.split(len: CHUNK)
+    let piece = try pool.allocate(len: CHUNK)
     try child.give(memory: move piece, tag: TAG_REGION) catch {
         let (why, back) = move error
         let _ = move back
@@ -198,7 +199,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var pool_rec = try proc.boot_handle_next()
     guard let image = image_rec.take_memory() else { return BUG }
     guard let ram = ram_rec.take_memory() else { return BUG }
-    guard let pool = pool_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
     let addr = try proc.event_create()
     let done = try proc.event_create()
 
@@ -224,11 +225,11 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
         case Err(e) -> { print("SOS unstarted: thread join says {}\n", e) },
     }
 
-    // Both of these end the run in a fault if the child is still there.
+    // Both of these end the run if the child is still there.
     let irq = try system.interrupt_bind(line: LINE)
     let _ = system.debug_print("SOS unstarted: line bound again\n")
     let _ = move irq
-    let whole = try pool.split(len: sos_test_pool_len())
+    let whole = try pool.allocate(len: sos_test_pool_len())
     let _ = move whole
     let _ = system.debug_print("SOS unstarted: region came back\n")
     return

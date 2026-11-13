@@ -8,7 +8,7 @@
 //   - `busy`, a connection of its own with a message staged and the claim
 //     kept: the connection goes back by the cascade out of settling that
 //     exchange.
-//   - `piece`, a region split off a sibling of its launcher's pool: the
+//   - `piece`, a region allocated out of a sibling of its launcher's pool: the
 //     close-all gives it back to the pool with its handle.
 //   - `view`, a window carved off the device view its launcher gave it: the
 //     close-all gives it back with its handle.
@@ -20,13 +20,13 @@
 // so nothing unwinds, and the teardown closes exactly what is listed above
 // plus the boot System and the Process this program derived.
 
-import sos.{System, Process, Memory, IoMemory, PIPE_BODY_BYTES}
+import sos.{System, Process, Pool, IoMemory, PIPE_BODY_BYTES}
 
 /// The launcher's tags.
 static TAG_RAM: UInt = 24
 static TAG_WINDOW: UInt = 25
 
-/// One protection unit on every profile, so the split is grantable.
+/// One protection unit on every profile, so the allocation is grantable.
 static CHUNK: UInt = 0x1000
 
 /// The device window's length, carved whole.
@@ -46,7 +46,7 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    var ram: Memory? = None
+    var ram: Pool? = None
     var window: IoMemory? = None
     var going = true
     while going {
@@ -55,7 +55,7 @@ func _start(boot_handle: UInt) {
                 var rec = move h
                 let tag = rec.tag
                 if tag == TAG_RAM {
-                    ram = rec.take_memory()
+                    ram = rec.take_pool()
                 } else if tag == TAG_WINDOW {
                     window = rec.take_iomemory()
                 }
@@ -76,8 +76,8 @@ func _start(boot_handle: UInt) {
 
     // The piece is charged here; the pool it was cut from stays the
     // launcher's, and stays live while the piece is on loan.
-    let piece = try pool.split(len: CHUNK) catch {
-        print("SOS keeper: split failed: {}\n", error)
+    let piece = try pool.allocate(len: CHUNK) catch {
+        print("SOS keeper: allocation failed: {}\n", error)
         let _ = proc.exit(EXIT_MISMATCH)
         return
     }

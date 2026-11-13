@@ -125,6 +125,16 @@
 /// acts, so a caller could not have checked it in advance. It is `NoResource`'s
 /// neighbour in spirit, a resource edge, and differs in being the peer's to
 /// clear rather than the machine's.
+///
+/// `NoMemory` (11) is a pool that cannot serve the length asked of it in one
+/// run: it holds fewer free bytes, or holds them only in ranges none of which
+/// is long enough. `Pool.Allocate` alone answers it. It is a status because a
+/// pool can be shared, by sibling handles or by another thread of the caller,
+/// and its free state changes between any read of it and the call, so the
+/// caller could not have checked. It is its own word rather than
+/// `NoResource` because the same op answers `NoResource` for a full Memory
+/// slab, and a program does different things about its budget running out
+/// and the machine's.
 public enum SosStatus: UInt8 {
     case Ok = 0,
     case NoResource = 4,
@@ -134,6 +144,7 @@ public enum SosStatus: UInt8 {
     case Revoked = 8,
     case PeerClosed = 9,
     case WouldBlock = 10,
+    case NoMemory = 11,
     case Unknown = 255,
 }
 
@@ -152,6 +163,7 @@ extension SosStatus {
             // docstring): one sentence has to be true of a full ring and of an
             // empty one, because one tag answers both.
             case WouldBlock -> "not right now — try again",
+            case NoMemory -> "this pool has no free range that long",
             case Unknown -> "unknown status",
         }
     }

@@ -17,8 +17,8 @@
 //   SOS quotawall: done
 //
 // Root contributes a region and nothing else. The child maps a page its
-// launcher split off the pool into itself, through its own Process handle, so
-// the two rights the map spends (`MemoryRight.Map` on the page,
+// launcher allocated out of the pool into itself, through its own Process
+// handle, so the two rights the map spends (`MemoryRight.Map` on the page,
 // `ProcessRight.Map` on the target) are both the child's own, and root's
 // allowance has nothing to do with how many rows the child may install. This
 // is the one exception to creator-pays: a mapping charges the target, because
@@ -28,7 +28,7 @@
 // Root parks on a generous timer while the child runs, so the ordering above
 // is forced rather than raced.
 
-import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
+import sos.{System, Process, Memory, Pool, BootHandle, Clock, ClockType, Timer,
             Waiter, SosStatus, SystemRight}
 
 static EXIT_OK: UInt = 0
@@ -89,8 +89,8 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let pool = pool_record.take_memory() else {
-        let _ = system.debug_print("SOS quotawall: pool record is not a region\n")
+    guard let pool = pool_record.take_pool() else {
+        let _ = system.debug_print("SOS quotawall: pool record is not a pool\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -103,8 +103,8 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS quotawall: created\n")
 
-    let page = try pool.split(len: CHUNK) catch {
-        print("SOS quotawall: split failed: {}\n", error)
+    let page = try pool.allocate(len: CHUNK) catch {
+        print("SOS quotawall: allocation failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

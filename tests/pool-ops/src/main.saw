@@ -1,0 +1,153 @@
+// A pool's two ops, read against each other (spec §2.5): what `available`
+// reports is what `allocate` serves.
+//
+//   SOS poolops: fresh total=<pool> largest=<pool> set=<grain>
+//   SOS poolops: the lowest set bit as the granularity: same=1
+//   SOS poolops: four allocations: total fell by 16384 largest fell by 16384
+//   SOS poolops: rights pool=67331 allocation=1795
+//   SOS poolops: more than the pool holds: <NoMemory> unchanged=1
+//   SOS poolops: fragmented total=8192 largest=4096
+//   SOS poolops: one unit past largest: <NoMemory>
+//   SOS poolops: the total in one piece: <NoMemory> unchanged=1
+//   SOS poolops: exactly largest: ok
+//   SOS poolops: coalesced total=12288 largest=12288
+//   SOS poolops: all home: total=<pool> set=<grain>
+//   SOS poolops: a donated allocation stays out: 4096
+//   SOS poolops: done
+//
+// The set is the grain's one bit on every profile, and its lowest bit used as
+// the granularity answers what zero does. Four allocations of a page each
+// take their bytes off the frontier, and each carries the pool handle's word
+// less the pool's own `Allocate`: root's `Memory` ceiling caps nothing, so
+// the intersection with the bits a `Memory` has is what drops it. Asking for
+// twice the pool is `NoMemory` and changes nothing `available` can see.
+//
+// The fragmentation is built by spending the frontier and releasing the first
+// and third of the four pages: 8192 bytes are free in two ranges of 4096. One
+// unit past `largest` is refused and exactly `largest` is served, which is
+// `largest`'s definition from both sides; the whole 8192 in one piece is
+// refused, which is fragmentation and not exhaustion. Releasing the second
+// page joins the three into one range, and releasing everything folds it all
+// back into the frontier. A donated page stays among the pool's outstanding
+// bytes for good, so `total` stays one page short of the fresh pool.
+//
+// A page is 4096 bytes, a multiple of every profile's grain, so every length
+// here is legal at the default granularity. The set is fixed for the pool's
+// life, and the last report reads it again.
+
+import sos.{System, Process, Pool, PoolAvailable, SlabKind, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static PAGE: UInt = 0x1000
+
+func flag(b: Bool) -> UInt {
+    if b { 1 } else { 0 }
+}
+
+/// Whether two reports agree in every word.
+func same(a: &PoolAvailable, b: &PoolAvailable) -> Bool {
+    a.total == b.total && a.largest == b.largest &&
+        a.granularities == b.granularities
+}
+
+/// What `allocate(len:)` answers, as a status: `Ok` when it served one, which
+/// is released again at once.
+func answer(pool: &Pool, len: UInt) -> SosStatus {
+    match pool.allocate(len: len) {
+        case Ok(_) -> SosStatus.Ok,
+        case Err(why) -> why,
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poolops: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS poolops: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poolops: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let fresh = try pool.available()
+    print("SOS poolops: fresh total={} largest={} set={}\n", fresh.total,
+          fresh.largest, fresh.granularities)
+    let set = fresh.granularities
+    let lowest = set & ~(set - 1)
+    let at_lowest = try pool.available(granularity: lowest)
+    print("SOS poolops: the lowest set bit as the granularity: same={}\n",
+          flag(same(&at_lowest, &fresh)))
+
+    let first = try pool.allocate(len: PAGE, granularity: lowest)
+    let second = try pool.allocate(len: PAGE)
+    let third = try pool.allocate(len: PAGE)
+    let fourth = try pool.allocate(len: PAGE)
+    let four = try pool.available()
+    print("SOS poolops: four allocations: total fell by {} largest fell by {}\n",
+          fresh.total - four.total, fresh.largest - four.largest)
+    let pool_word = try pool.rights()
+    let first_word = try first.rights()
+    print("SOS poolops: rights pool={} allocation={}\n", pool_word,
+          first_word)
+
+    let too_much = answer(&pool, fresh.total * 2)
+    let after_refusal = try pool.available()
+    print("SOS poolops: more than the pool holds: {} unchanged={}\n", too_much,
+          flag(same(&after_refusal, &four)))
+
+    // The frontier spent, then the first and third pages home: two free
+    // ranges of a page each, with the second page between them.
+    let rest = try pool.allocate(len: four.largest)
+    let _ = move first
+    let _ = move third
+    let fragmented = try pool.available()
+    print("SOS poolops: fragmented total={} largest={}\n", fragmented.total,
+          fragmented.largest)
+    print("SOS poolops: one unit past largest: {}\n",
+          answer(&pool, fragmented.largest + lowest))
+    let whole = answer(&pool, fragmented.total)
+    let after_whole = try pool.available()
+    print("SOS poolops: the total in one piece: {} unchanged={}\n", whole,
+          flag(same(&after_whole, &fragmented)))
+    print("SOS poolops: exactly largest: {}\n",
+          answer(&pool, fragmented.largest))
+
+    let _ = move second
+    let coalesced = try pool.available()
+    print("SOS poolops: coalesced total={} largest={}\n", coalesced.total,
+          coalesced.largest)
+
+    let _ = move fourth
+    let _ = move rest
+    let home = try pool.available()
+    print("SOS poolops: all home: total={} set={}\n", home.total,
+          home.granularities)
+
+    let gift = try pool.allocate(len: PAGE)
+    try system.slab_donate(kind: SlabKind.Events, memory: move gift) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let after_gift = try pool.available()
+    print("SOS poolops: a donated allocation stays out: {}\n",
+          fresh.total - after_gift.total)
+    return
+}

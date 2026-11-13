@@ -1,0 +1,123 @@
+// What holds a pool, and when its slot comes back, read as room in the Memory
+// slab (spec §2.5, §2.10).
+//
+//   SOS poollife: the slab filled: out of kernel objects
+//   SOS poollife: full, and too much: this pool has no free range that long
+//   SOS poollife: no handle, a page out: room grew by 0
+//   SOS poollife: the page home: room grew by 2
+//   SOS poollife: done
+//
+// The case types its child's image blob as a second pool, and never runs the
+// child: the blob pool is the one whose life is read, and the RAM pool is the
+// measure. Root allocates a page out of the blob pool and keeps it, then fills
+// the slab with pages out of the RAM pool, staging each in a message on a
+// connection of its own so that no table runs out first, until an allocation
+// answers `NoResource`; how many it got is the room. Closing the connection
+// releases the staged pages, and the room is free again for the next count.
+//
+// While the slab is full a length the pool cannot serve is still `NoMemory`:
+// the pool is asked before the slab. Releasing the blob pool's only handle
+// frees nothing while its page is out, so the room is what it was. Releasing
+// the page frees two slots, its own and the pool's, which nothing else held.
+
+import sos.{System, Process, Pool, PipeHandles, SosStatus, PIPE_BODY_BYTES,
+            PIPE_MSG_HANDLES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static PAGE: UInt = 0x1000
+
+/// More than any pool in the tree holds.
+static TOO_MUCH: UInt = 0x1000_0000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poollife: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS poollife: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poollife: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var blob_rec = try proc.boot_handle_next()
+    var dest_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    guard let blob = blob_rec.take_pool() else { return BUG }
+    guard let dest = dest_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    // No child runs here, so its destination is not needed and its slot is
+    // given back before anything is counted.
+    let _ = move dest
+
+    let page = try blob.allocate(len: PAGE)
+    let full = try fill(&proc, &pool, true)
+    let _ = move blob
+    let held = try fill(&proc, &pool, false)
+    print("SOS poollife: no handle, a page out: room grew by {}\n",
+          held - full)
+    let _ = move page
+    let home = try fill(&proc, &pool, false)
+    print("SOS poollife: the page home: room grew by {}\n", home - held)
+    return
+}
+
+/// Allocate pages out of `pool` until one is refused, staging them in messages
+/// on a connection nobody takes from, and answer how many it got. With
+/// `report` it prints the refusal and what a length the pool cannot serve is
+/// answered while the slab is full. The pages go back when the connection
+/// closes.
+func fill(proc: &Process, pool: &Pool,
+          report: Bool) -> Result<Int, SosStatus> {
+    let pipe = try proc.pipe_create()
+    let (inlet, outlet) = move pipe
+    let body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var carrier = PipeHandles.none()
+    var in_carrier: Int = 0
+    var count: Int = 0
+    var going = true
+    while going {
+        match pool.allocate(len: PAGE) {
+            case Ok(piece) -> {
+                carrier.put(at: in_carrier, memory: move piece)
+                in_carrier = in_carrier + 1
+                count = count + 1
+                if in_carrier == PIPE_MSG_HANDLES {
+                    let claim = try inlet.post_with(body: &body, len: 0,
+                                                    handles: &var carrier)
+                    let _ = move claim
+                    in_carrier = 0
+                }
+            },
+            case Err(why) -> {
+                if report {
+                    print("SOS poollife: the slab filled: {}\n", why)
+                    let over = match pool.allocate(len: TOO_MUCH) {
+                        case Ok(_) -> SosStatus.Ok,
+                        case Err(e) -> e,
+                    }
+                    print("SOS poollife: full, and too much: {}\n",
+                          over)
+                }
+                going = false
+            },
+        }
+    }
+    let _ = move carrier
+    let _ = move outlet
+    let _ = move inlet
+    return count
+}

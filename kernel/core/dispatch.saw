@@ -19,6 +19,7 @@ import sosabi.{
     ClockHandle,
     TimerHandle,
     MemoryHandle,
+    PoolHandle,
     IoMemoryHandle,
     MappingHandle,
     PipeInletHandle,
@@ -34,6 +35,7 @@ import sosabi.{
     ClockRight,
     TimerRight,
     MemoryRight,
+    PoolRight,
     IoMemoryRight,
     MappingRight,
     PipeInletRight,
@@ -52,6 +54,7 @@ import sosabi.{
     ClockOp,
     TimerOp,
     MemoryOp,
+    PoolOp,
     IoMemoryOp,
     MappingOp,
     PipeInletOp,
@@ -80,6 +83,8 @@ import sosabi.{
     PIPE_MSG_HANDLES,
     PIPE_CREATE_RECORD_WORDS,
     pipe_create_record_bytes,
+    POOL_AVAILABLE_RECORD_WORDS,
+    pool_available_record_bytes,
     PipeMsgRecord,
     PipeSendRecord,
     PipeReplyWaitRecord,
@@ -112,6 +117,7 @@ import sosabi.{
     timer_rights,
     process_rights,
     mapping_rights,
+    memory_rights,
     pipe_inlet_rights,
     pipe_outlet_rights,
     pipe_reply_rights,
@@ -171,6 +177,7 @@ import kcore.objects.{
     MappingSlot,
     MemoryObject,
     MemorySlot,
+    PoolObject,
     NO_ROW,
     ROW_TARGET_DIED,
     NO_EXCHANGE,
@@ -193,6 +200,7 @@ import kcore.objects.{
     alloc_memory,
     alloc_exchange,
     alloc_pipe,
+    pool_available,
     pool_can_serve,
     pool_cut,
     pool_cut_base,
@@ -940,7 +948,7 @@ func process_arg(p: Int, handle: UInt) unsafe -> Int {
 //
 // The op is three questions and one irreversible step. May this caller do it (a
 // right); is this region safe to absorb (no other reference, no mapping, and
-// for a pool root no pieces on loan); does it hold a whole slot and has the
+// for a pool nothing allocated out); does it hold a whole slot and has the
 // chain room (the machine's two answers). Only then does anything move, and
 // what moves is permanent.
 
@@ -1055,17 +1063,20 @@ func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
     }
 }
 
-/// §2.8's `slab_donate(kind:memory:)`: root hands the kernel memory to back a
-/// named slab, forever.
+/// §2.8's `slab_donate(kind:pool:)` and `slab_donate(kind:memory:)`: root
+/// hands the kernel memory to back a named slab, forever. It takes a pool or
+/// an allocation.
 ///
 /// The kernel is about to write its own object slots into these bytes, so
 /// nothing else may be able to see them: `refs == 1` says the handle being
 /// consumed is the region's only reference, and `maps == 0` says no installed
 /// grant row reaches it from any domain.
 ///
-/// A pool root also needs `out_bytes == 0`, for `memory_release_if_idle`'s
-/// reason: pieces on loan carry a back-reference to the slot, and retiring it
-/// under them would make those references name a stranger.
+/// A pool also needs `out_bytes == 0`, for `memory_release_if_idle`'s reason:
+/// allocations on loan carry a back-reference to the slot, and retiring it
+/// under them would make those references name a stranger. So does an
+/// allocation minted at boot, which is its own pool for the pieces `Split`
+/// cuts from it.
 ///
 /// A region with bytes must be memory the board can give a process
 /// (`hal.map_source_ok`): the kernel writes its slots there, and a region over
@@ -1074,10 +1085,10 @@ func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
 /// slot, which is the `NoResource` below.
 ///
 /// Faults versus statuses: a missing right, an unknown kind, a handle that is
-/// not a Memory, a region the board cannot give, and each of the state
-/// conditions are things the caller
-/// could have checked (it minted the siblings, installed the rows, split the
-/// pieces), so they end the process. Whether a region holds a whole slot of
+/// neither a Pool nor a Memory, a region the board cannot give, and each of
+/// the state conditions are things the caller could have checked (it minted
+/// the siblings, installed the rows, allocated or split the pieces), so they
+/// end the process. Whether a region holds a whole slot of
 /// some kind the caller cannot name, and whether the extent chain has room, are
 /// machine answers: they return `NoResource` with nothing consumed and the
 /// caller's capability untouched.
@@ -1085,7 +1096,7 @@ func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
     guard let kind = SlabKind.from(raw: raw_kind) else {
         fault_process(p, FaultReason.BadArg)
     }
-    let slot = memory_arg(p, handle)
+    let slot = donation_arg(p, handle)
     // Only a region with bytes is asked: an empty one has none the kernel
     // could write, and goes on to the `NoResource` a region too small for a
     // slot answers.
@@ -1163,14 +1174,27 @@ func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
 
     // The consume deliberately does not go through `unref_object`. The ordinary
     // path would reach `memory_release_if_idle`, which returns the range to its
-    // pool root's free list, and the next `Split` would hand a slab's backing
+    // pool's free list, and the next `Allocate` would hand a slab's backing
     // store to somebody else. Donation is permanent: the slot comes back, the
-    // bytes never do, and a derived region's length stays charged to its root's
-    // `out_bytes` forever, so the root can never be handed on with a slab
-    // living inside it.
+    // bytes never do, and a donated allocation's length stays charged to its
+    // pool's `out_bytes` forever, so the pool can never be handed on with a
+    // slab living inside it.
     unbind_handle(p, handle_word_index(handle))
     memory_retire_donated(slot)
     op_ok()
+}
+
+/// Resolve the handle a donation names, or terminate the caller: a Pool or a
+/// Memory, whose slot is a Memory slot either way. A word that names nothing,
+/// or names any other kind, is the `BadHandle` fault, as for `memory_arg`. No
+/// right of the handle is spent; `SystemRight.SlabDonate` is the authority.
+func donation_arg(p: Int, handle: UInt) unsafe -> Int {
+    let entry = lookup_handle(p, handle)
+    match entry.obj_type {
+        case Memory -> entry.target,
+        case Pool -> entry.target,
+        case _ -> fault_process(p, FaultReason.BadHandle),
+    }
 }
 
 /// Would `[base, base + len)` run past the end of the address space?
@@ -2346,14 +2370,17 @@ func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
         // either permanently true or meaningless. Waiting for a time is what
         // the Timer it creates is for.
         case Clock -> fault_process(p, FaultReason.NotWaitable),
-        // None of the three memory kinds is waitable. A region and a window
+        // None of the four memory kinds is waitable. A region and a window
         // have no state (they are sealed pairs, and ops on them succeed or
-        // fault immediately). A Mapping has state (installed or not) but no
-        // readiness: it changes only when its holder asks, so a wait on one
-        // could only report what the caller just did. What would make memory
-        // waitable is a fault or a revocation arriving from elsewhere, and
-        // neither exists until a supervisor can revoke somebody else's mapping.
+        // fault immediately). A pool's free bytes change, but only by its
+        // holders' own ops, and nothing becomes ready when they do. A Mapping
+        // has state (installed or not) but no readiness: it changes only when
+        // its holder asks, so a wait on one could only report what the caller
+        // just did. What would make memory waitable is a fault or a revocation
+        // arriving from elsewhere, and neither exists until a supervisor can
+        // revoke somebody else's mapping.
         case Memory -> fault_process(p, FaultReason.NotWaitable),
+        case Pool -> fault_process(p, FaultReason.NotWaitable),
         case IoMemory -> fault_process(p, FaultReason.NotWaitable),
         case Mapping -> fault_process(p, FaultReason.NotWaitable),
         // The four pipe kinds are waitable (§2.2's waitable list ends here).
@@ -3076,9 +3103,11 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
                        p: Int) unsafe -> SyscallResult {
     match op {
         // Split: one cut from the front, and the parent becomes the remainder.
-        // A pool root serves a cut from its free list first and its cursor
-        // second (`pool_cut`); either way a region is one contiguous range and
-        // the caller supplies no addresses.
+        // An allocation minted at boot is its own pool, and serves a cut from
+        // its free list first and its cursor second (`pool_cut`); either way a
+        // region is one contiguous range and the caller supplies no addresses.
+        // A piece names the pool its parent names and records its parent's
+        // granularity.
         //
         // Three refusals, all `BadArg` faults. A `len` of zero: a region naming
         // no bytes is not a region. A `len` this region cannot serve in one
@@ -3147,10 +3176,14 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             // when both of its counts reach zero, not to this parent; the
             // derivation chain is a cursor artifact, not an ownership tree.
             let base = pool_cut(obj.slot, len)
+            let unit = MEMORIES[obj.slot].granularity
             MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
                                         base: base, len: len, refs: 1, maps: 0,
                                         root: MEMORIES[obj.slot].root,
-                                        free_head: 0, out_bytes: 0, dropped: 0)
+                                        granularity: unit,
+                                        parent: NO_MEMORY, lent_base: 0,
+                                        lent_len: 0, depth: 0, free_head: 0,
+                                        out_bytes: 0, dropped: 0)
             rows_move_to_piece(obj.slot, slot, base, len)
             quota_charge(p, QuotaKind.Memory)
             op_value(handle)
@@ -3205,6 +3238,161 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
                 fault_process(p, FaultReason.BadArg)
             }
             install_row(p, t, base, top, grant_perms(access), false, obj.slot)
+        },
+    }
+}
+
+/// What `PoolOp.Available` copies out: `sosabi`'s three published words, in
+/// their published order.
+struct PoolAvailableRecord {
+    total: UInt,
+    largest: UInt,
+    granularities: UInt,
+}
+
+static_assert(sizeof<PoolAvailableRecord>()
+              == POOL_AVAILABLE_RECORD_WORDS * sizeof<UInt>(),
+              "a pool record must be exactly the words sosabi publishes")
+
+/// The granularities pool `slot` accepts, as §2.5's bit set: bit `n` set means
+/// `2^n` bytes are accepted.
+///
+/// A pool records its finest accepted granularity, the protection grain, in
+/// its `granularity` field, and that is the one granularity it accepts. A
+/// set of one power of two is that number read as a bit set, so the word is
+/// the field. It is never empty, and it does not change over the pool's life.
+func pool_granularities(slot: Int) unsafe -> UInt {
+    MEMORIES[slot].granularity
+}
+
+/// Resolve the granularity word a caller passed to a pool op, or end the
+/// caller: zero names the pool's finest accepted granularity, the set's lowest
+/// bit, and any other word must be a single bit the set holds. Anything else
+/// is the `BadArg` fault, because the caller can read the set first
+/// (`Available` with zero is legal through any handle that may allocate).
+func pool_granularity(p: Int, slot: Int, word: UInt) unsafe -> UInt {
+    let set = pool_granularities(slot)
+    if set == 0 {
+        fatal_kernel("a pool accepts no granularity", slot as UInt)
+        return 0
+    }
+    if word == 0 {
+        return set & ~(set - 1)
+    }
+    if (word & (word - 1)) != 0 || (word & set) == 0 {
+        fault_process(p, FaultReason.BadArg)
+    }
+    word
+}
+
+/// The Pool object's ops (spec §2.5).
+func pool_op(raw_op: UInt, obj: &PoolObject, arg0: UInt, arg1: UInt,
+             arg2: UInt) unsafe -> SyscallResult {
+    let p = calling_process()
+    guard let op = PoolOp.from(raw: raw_op) else {
+        fault_process(p, FaultReason.BadOp)
+    }
+    return pool_op_decoded(op, &obj, arg0, arg1, arg2, p)
+}
+
+func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
+                     arg2: UInt, p: Int) unsafe -> SyscallResult {
+    match op {
+        // Allocate: a new `Memory` over `arg0` bytes of this pool, made of
+        // units of the granularity `arg1` names. The answers come in §2.5's
+        // order, and every one of them is decided before anything is cut, so
+        // a refusal changes nothing:
+        //
+        //   - the faults the caller could have avoided: no `Allocate` right
+        //     (`AccessDenied`), a granularity the pool does not accept, a
+        //     `len` of zero and a `len` that is not a multiple of the
+        //     granularity (`BadArg`);
+        //   - the caller's budget: its `Memory` quota (`QuotaExceeded`);
+        //   - the resource it named: a pool with no free range that long
+        //     (`NoMemory`), a status because a pool may be shared and its free
+        //     state changes between any read of it and this call;
+        //   - the machine's: a full Memory slab (`NoResource`);
+        //   - the mint: the caller's handle budget and table.
+        //
+        // The cut is first fit off the pool's free list, else the front of its
+        // frontier (`pool_cut`). Every free range and the frontier begin on the
+        // grain, which is the one granularity a pool accepts, so the first
+        // range that holds `len` holds it from its own front, and no cut leaves
+        // a free range before the allocation that would need a node of its own.
+        //
+        // The allocation's rights are the pool handle's word intersected with
+        // the bits a `Memory` has, then capped by the caller's `Memory` ceiling
+        // (`mint_capped`): an allocation is never wider than the pool handle it
+        // came through. It names this pool, which its range returns to, and it
+        // is charged to the caller whoever's pool it is.
+        case Allocate -> {
+            if not obj.allows(PoolRight.Allocate) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            let len = arg0
+            let unit = pool_granularity(p, obj.slot, arg1)
+            if len == 0 || (len % unit) != 0 {
+                fault_process(p, FaultReason.BadArg)
+            }
+            if not quota_room(p, QuotaKind.Memory) {
+                return op_status(SosStatus.QuotaExceeded)
+            }
+            if not pool_can_serve(obj.slot, len) {
+                return op_status(SosStatus.NoMemory)
+            }
+            let slot = alloc_memory()
+            if slot == NO_MEMORY {
+                return op_status(SosStatus.NoResource)
+            }
+            let handle = mint_capped(p, ObjType.Memory,
+                                     obj.rights & memory_rights(), slot)
+            if handle == NO_HANDLE {
+                return op_status(mint_refusal(p))
+            }
+            let base = pool_cut(obj.slot, len)
+            MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
+                                        base: base, len: len, refs: 1, maps: 0,
+                                        root: obj.slot, granularity: unit,
+                                        parent: NO_MEMORY, lent_base: 0,
+                                        lent_len: 0, depth: 0, free_head: 0,
+                                        out_bytes: 0, dropped: 0)
+            quota_charge(p, QuotaKind.Memory)
+            op_value(handle)
+        },
+        // Available: what this pool could serve at the granularity `arg0`
+        // names, copied into the caller's record at `arg1` of capacity `arg2`:
+        // the bytes free, the longest run, and the accepted set. It spends
+        // `Allocate`, so a handle narrowed below it learns nothing of what the
+        // pool holds or what a sibling's holder took. The faults come first (no
+        // right, a granularity not accepted, a capacity below the published
+        // record, a destination the copy-out door refuses), and then it answers
+        // `Ok` having changed nothing in the pool. The two counts are one walk
+        // of the free list (`pool_available`), the walk `Allocate` makes.
+        case Available -> {
+            if not obj.allows(PoolRight.Allocate) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            let unit = pool_granularity(p, obj.slot, arg0)
+            let dst = arg1
+            let bytes = pool_available_record_bytes() as UInt
+            if arg2 < bytes {
+                fault_process(p, FaultReason.BadArg)
+            }
+            if let why = copy_out_check(p, dst, bytes) {
+                fault_process(p, why)
+            }
+            let (total, largest) = pool_available(obj.slot, unit)
+            let set = pool_granularities(obj.slot)
+            var rec = PoolAvailableRecord(total: total, largest: largest,
+                                          granularities: set)
+            let src = (&var rec) as UnsafePointer<PoolAvailableRecord>
+            if let why = copy_out(p, dst, src as UInt, bytes) {
+                // Unreachable for `PipeCreate`'s reason: the same destination
+                // passed `copy_out_check` above and nothing between can move a
+                // process's window.
+                fault_process(p, why)
+            }
+            op_ok()
         },
     }
 }
@@ -4685,6 +4873,14 @@ func dispatch(handle: UInt, op: UInt,
             let obj = MemoryObject(handle: MemoryHandle(handle),
                                    rights: entry.rights, slot: entry.target)
             memory_op(op, &obj, arg0, arg1)
+        },
+        // A Pool's two ops are `Allocate` and `Available` (spec §2.5); its
+        // slot is a Memory slot, and the kind is what keeps every `MemoryOp`
+        // away from it.
+        case Pool -> {
+            let obj = PoolObject(handle: PoolHandle(handle),
+                                 rights: entry.rights, slot: entry.target)
+            pool_op(op, &obj, arg0, arg1, arg2)
         },
         case IoMemory -> {
             let obj = IoMemoryObject(handle: IoMemoryHandle(handle),

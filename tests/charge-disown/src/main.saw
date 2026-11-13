@@ -17,15 +17,15 @@
 // One child image plays both parts (`child-disown`), so the case can carry a
 // pool beside it.
 //
-// The charger makes a connection, splits two regions off a sibling of root's
-// pool and carves a window off a view of root's device window, all charged to
-// it. It posts the connection's client end, both regions and the window to
-// root in one message and exits; its teardown disowns all four, which the
-// staged message still names. Root lets go of everything that names the dead
-// charger, its Process handle and the attachment root watched the death
-// through, and slot 1 is reclaimed there, although the four objects charged to
-// it are live: an object charged to a process does not hold its slot. Root
-// then takes them.
+// The charger makes a connection, allocates two regions out of a sibling of
+// root's pool and carves a window off a view of root's device window, all
+// charged to it. It posts the connection's client end, both regions and the
+// window to root in one message and exits; its teardown disowns all four,
+// which the staged message still names. Root lets go of everything that names
+// the dead charger, its Process handle and the attachment root watched the
+// death through, and slot 1 is reclaimed there, although the four objects
+// charged to it are live: an object charged to a process does not hold its
+// slot. Root then takes them.
 //
 // The probe is created next and lands in slot 1, which its teardown line's
 // `process=` field reports. It spends one connection, one region and one
@@ -45,7 +45,7 @@
 // One phase per function: root's stack grant is small and a `PipeMsg` is a
 // message-sized value, so the phases are split rather than held in one frame.
 
-import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeHandle,
+import sos.{System, Process, Memory, Pool, IoMemory, PipeInlet, PipeHandle,
             ClockType, SlabKind, SystemRight, SosStatus, PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
@@ -111,7 +111,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var window_rec = try proc.boot_handle_next()
     guard let image = img_rec.take_memory() else { return BUG }
     guard let ram = ram_rec.take_memory() else { return BUG }
-    guard let pool = pool_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
     guard let window = window_rec.take_iomemory() else { return BUG }
 
     let left = try outlive(&system, &proc, &image, &ram, &pool, &window)
@@ -149,7 +149,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
 /// Give a child what both parts need: a masked System, a sibling of the pool
 /// and a view of the device window. The view is charged to root.
-func furnish(system: &System, child: &Process, pool: &Memory,
+func furnish(system: &System, child: &Process, pool: &Pool,
              window: &IoMemory) -> Result<Void, SosStatus> {
     let for_child = try system.mint(rights: CHILD_SYSTEM)
     try child.give(system: move for_child, tag: TAG_BOOT) catch {
@@ -158,7 +158,7 @@ func furnish(system: &System, child: &Process, pool: &Memory,
         return why
     }
     let sibling = try pool.mint()
-    try child.give(memory: move sibling, tag: TAG_RAM) catch {
+    try child.give(pool: move sibling, tag: TAG_RAM) catch {
         let (why, back) = move error
         let _ = move back
         return why
@@ -176,7 +176,7 @@ func furnish(system: &System, child: &Process, pool: &Memory,
 /// client end, two regions and a window, all charged to it and disowned by its
 /// death. Nothing of root's names the charger when this returns.
 func outlive(system: &System, proc: &Process, image: &Memory, ram: &Memory,
-             pool: &Memory, window: &IoMemory) -> Result<(PipeHandle,
+             pool: &Pool, window: &IoMemory) -> Result<(PipeHandle,
                                                           PipeHandle,
                                                           PipeHandle,
                                                           PipeHandle),

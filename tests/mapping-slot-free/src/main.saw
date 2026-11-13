@@ -14,8 +14,8 @@
 //                                           slot survives the handle drop while
 //                                           a row counts against it
 //   SOS mapfree: recycled read 94        <- the range went back to the pool at
-//                                           the last unmap, and a fresh split
-//                                           produced the same bytes
+//                                           the last unmap, and a fresh
+//                                           allocation produced the same bytes
 //   SOS mapfree: done
 //
 // A Mapping dropped without an unmap frees its slot and leaves its row
@@ -24,25 +24,25 @@
 // the interesting husk is the region's. This program makes one deliberately: it
 // maps a region, marks its bytes, and then destroys every handle onto it. A
 // kernel that counted only handles would have freed the slot and given the
-// range to the next `Split` while a protection row was still reaching those
+// range to the next `Allocate` while a protection row was still reaching those
 // very bytes.
 //
 // The third line is the second zero arriving. The unmap takes the last row,
-// which is the last reference, so the range goes back onto the pool root's free
+// which is the last reference, so the range goes back onto the pool's free
 // list, where it is adjacent to the unspent frontier and folds straight into
-// it, leaving the pool exactly as it was at boot. The next `split(CHUNK)`
+// it, leaving the pool exactly as it was at boot. The next `allocate(CHUNK)`
 // therefore hands out the same `[base, base + CHUNK)` it handed out the first
 // time, and the marker written through the first mapping is read back through
-// the second. Nothing zeroes a split range, so identical bytes at an identical
-// address is what "the same memory came back" looks like from userspace, where
-// a region has no bounds reader to ask.
+// the second. Nothing zeroes an allocated range, so identical bytes at an
+// identical address is what "the same memory came back" looks like from
+// userspace, where a region has no bounds reader to ask.
 //
 // A kernel without pool returns fails this by faulting, not by printing a wrong
-// number: its cursor would have moved past the first chunk, the second split
+// number: its cursor would have moved past the first chunk, the second one
 // would hand out the next page, and the read at `base` would touch an address
 // no row grants any more.
 
-import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, SosStatus}
 
 // The address of this program's first mapping: its config, per architecture, in
 // C because Saw cannot name an address. See `tests/poolbase_riscv32.c`.
@@ -98,14 +98,14 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let pool = record.take_memory() else {
+    guard let pool = record.take_pool() else {
         let _ = system.debug_print("SOS mapfree: boot record is not a region\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
 
-    let chunk = try pool.split(len: CHUNK) catch {
-        print("SOS mapfree: split failed: {}\n", error)
+    let chunk = try pool.allocate(len: CHUNK) catch {
+        print("SOS mapfree: allocation failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -157,12 +157,13 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // And the same bytes come back out. A first-fit split of a pool whose only
-    // hole folded into its frontier is the frontier again, so this region is
+    // And the same bytes come back out. A first-fit allocation from a pool
+    // whose only hole folded into its frontier is the frontier again, so this
+    // region is
     // `[base, base + CHUNK)` for the second time, and the marker is still in
     // it, because a returned range is bytes rather than a promise.
-    let again = try pool.split(len: CHUNK) catch {
-        print("SOS mapfree: re-split failed: {}\n", error)
+    let again = try pool.allocate(len: CHUNK) catch {
+        print("SOS mapfree: re-allocation failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

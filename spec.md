@@ -35,8 +35,8 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 |---|---|
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global and external-memory-only, not per-process). Paging targets: page-table root. There is no AddressSpace object: the domain is the process (see below). |
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. Ops `Start`/`Join`/`Exit`/`Yield`; `Exit` releases the handle it is invoked through; rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame is the context, so a switch is the trap handler returning a different frame (§7). Lifecycle: §8. |
-| `Pool` | RAM not yet allocated: what a `MemoryObject` is allocated from. Two ops (`Allocate`, and `Available`, which reads how much it can allocate); rights `PoolRight.Allocate` and the bits it hands down to what it allocates, `.Map`/`.MapExecute`. Minted at boot from the region table. A pool is never mapped and holds no row. Splitting a pool into a smaller one and a revoke are reserved, not built. §2.5 (not yet enforced: pools). |
-| `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. One op (`Map`); rights `MemoryRight.Map`/`.MapExecute`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5 (not yet enforced: pools, split). |
+| `Pool` | RAM not yet allocated: what a `MemoryObject` is allocated from. Two ops (`Allocate`, and `Available`, which reads how much it can allocate); rights `PoolRight.Allocate` and the bits it hands down to what it allocates, `.Map`/`.MapExecute`. Minted at boot from the region table. A pool is never mapped and holds no row. Splitting a pool into a smaller one and a revoke are reserved, not built. §2.5. |
+| `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. One op (`Map`); rights `MemoryRight.Map`/`.MapExecute`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5 (not yet enforced: split). |
 | `IoMemoryObject` | Physical memory-mapped device registers; the kind is `IoMemory`. A distinct kind rather than a flag on `MemoryObject`, so a driver cannot obtain a cacheable view of a register block by construction. Ops `Carve`/`Map`; rights `IoMemoryRight.Carve`/`.Map`. §2.5. |
 | `Mapping` | One installed protection row, with its own handle. Ops `Unmap`/`Base`; rights `MappingRight.Unmap`/`.Base`. Not givable. §2.5. |
 | `Pipe` | Synchronous message IPC with request/reply built in. Four kinds: `PipeInlet` and `PipeOutlet` (the client and server ends of a connection) and `PipeReply` and `PipeRequest` (the client's claim on one reply and the server's obligation to send it). §2.1. |
@@ -50,10 +50,10 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 The kinds are System, Process, Thread, Event, Waiter, Interrupt, Clock, Timer,
 Pool, Memory, IoMemory, Mapping, PipeInlet, PipeOutlet, PipeReply and
 PipeRequest (`ObjType`, `kernel/abi/`, the kernel-internal numbering §5.7's vDSO
-discipline keeps renumberable; Pool is not yet enforced: pools). The `Pipe` row
-is four kinds rather than one: a connection is a pair of counted endpoint kinds,
-and each in-flight message is a second pair — the client's claim on a reply and
-the server's obligation to send it — with "Pipe" the collective name.
+discipline keeps renumberable). The `Pipe` row is four kinds rather than one: a
+connection is a pair of counted endpoint kinds, and each in-flight message is a
+second pair — the client's claim on a reply and the server's obligation to send
+it — with "Pipe" the collective name.
 
 **Every kind but Clock and System is counted.** Every countable kind's slab
 slot carries the number of references naming it, and reaching zero frees the
@@ -67,7 +67,7 @@ somebody says what references it:
 | Waiter | handle entries |
 | Interrupt | handle entries + its attachment. Only the one handle keeps it live: releasing it destroys the Interrupt, and an attachment then holds the invalid object until it is removed (§2.10). A give or a staged message moves that one name and is not a release |
 | Timer | handle entries + its attachment |
-| Pool | handle entries. The bytes it has allocated and not had back hold it too: a pool whose handles are all gone stays until its last allocation has come home (§2.5; not yet enforced: pools) |
+| Pool | handle entries. The bytes it has allocated and not had back hold it too: a pool whose handles are all gone stays until its last allocation has come home (§2.5) |
 | MemoryObject / IoMemoryObject | handle entries (an allocation's installed grant rows are a second count, §2.5) |
 | Mapping | handle entries — not its row, which the Mapping owns rather than the reverse (§2.5) |
 | Process | handle entries + its attachment, on the record. A shared object charged to the process holds no reference on it: the process's death disowns the object (§2.10). A live process is never freed by losing its last handle, and a `Gone` one's record is reclaimed when the count reaches zero (§2.7); its body went back at the teardown, whatever the count. The attachment column is what makes attach-after-death sound against that reclaim: a watched dead record cannot reach zero while somebody is watching it |
@@ -423,13 +423,13 @@ cannot carry the request handle it is invoked through (§3).
 `decode_boot_handle` precedent generalized: the record carries a kind byte per
 slot beside the word, so a receiver matches a `PipeHandle` out instead of
 holding a number. The kinds a message may carry are the givable ones the
-receiving vocabulary can name: `Pool` (not yet enforced: pools), `Memory`,
-`IoMemory`, `PipeInlet`, `PipeOutlet`, `PipeReply`, `PipeRequest`, `Event`,
-`Thread`, `Waiter`, `Timer` and `Interrupt` — every kind a boot record can carry
-but two (`msg_kind_of` is `boot_kind_of`
-less those two). `Process` and `System` are refused at the sender, as a scope
-line rather than a rule: both wrappers live above `sos.pipe` in the module
-order, so admitting them is a sysapi module split and a named follow-up (§11).
+receiving vocabulary can name: `Pool`, `Memory`, `IoMemory`, `PipeInlet`,
+`PipeOutlet`, `PipeReply`, `PipeRequest`, `Event`, `Thread`, `Waiter`, `Timer`
+and `Interrupt` — every kind a boot record can carry but two (`msg_kind_of` is
+`boot_kind_of` less those two). `Process` and `System` are refused at the
+sender, as a scope line rather than a rule: both wrappers live above `sos.pipe`
+in the module order, so admitting them is a sysapi module split and a named
+follow-up (§11).
 
 **The delegation example is a protocol, across three real processes.** A
 `PipeRequest` travelling in a message is the zero-copy example's own move made
@@ -748,8 +748,8 @@ a reply delivery carries, which is why there is one type and not two — and
   waker learns whether to post or to stop without a probe post. It is a plain
   level, not a terminal one: consume clears nothing, and the level's end is
   the poster's own next post. A Thread is not waitable (§8), and attaching one
-  is a `NotWaitable` fault; so is attaching a MemoryObject or a Pool (not yet
-  enforced: pools), neither of which has state that could become ready.
+  is a `NotWaitable` fault; so is attaching a MemoryObject or a Pool, neither
+  of which has state that could become ready.
 
   What stays per-kind is five questions — who is watching me, set who is
   watching me, am I ready, what does a record say, and a record was
@@ -972,8 +972,8 @@ vDSO discipline keeps renumberable. The verbs are `allocate` (RAM: a new
 `Memory` out of a pool, which no longer has those bytes), `carve` (device: the
 parent stays whole), `map` (install a row, answer a `Mapping`) and `give` (§3's
 move of a handle into a child's table). The longer spellings name the same
-kinds wherever they appear. The `Pool` kind and its op are not yet enforced:
-pools, and the transition at the end of this section says what the kernel
+kinds wherever they appear. Parts of this section's model are not yet
+enforced, and the transition at the end of this section says what the kernel
 does until they are.
 
 **The model.**
@@ -1023,7 +1023,7 @@ memory is, it knows from the config that gave it the region — which is what
 root's tag-to-meaning config is, and where a driver's `UART_BASE` comes from.
 
 **Pools and allocations are two kinds, with disjoint ops** (not yet enforced:
-pools, split). A pool is memory nobody uses yet, and what it does is hand out
+split). A pool is memory nobody uses yet, and what it does is hand out
 allocations and say how much it can; an allocation is memory in use, and it is
 what is mapped, run in, given and donated. Nothing that can have a grant row is
 ever cut, and nothing that is cut can have a row. A program holding one knows
@@ -1032,9 +1032,9 @@ wrapper is one or the other).
 
 **`Pool`: two ops, `Allocate` and `Available`; rights `PoolRight.Allocate` and
 two bits it hands down, `.Map` and `.MapExecute`**, beside the universal
-`Transfer` and `Mint` (not yet enforced: pools). A pool cannot be mapped, passed
-to `process_create` as an image or a destination, or attached to a Waiter, and
-no grant row is ever counted on one. Root receives the build's pools at boot
+`Transfer` and `Mint`. A pool cannot be mapped, passed to `process_create` as an
+image or a destination, or attached to a Waiter, and no grant row is ever
+counted on one. Root receives the build's pools at boot
 (§12), and a pool, or a narrowed sibling of one, can be given to another process
 like any handle; what that process then holds is a byte budget: it can allocate
 no more than the pool holds, and what it releases it can allocate again.
@@ -1100,9 +1100,10 @@ no more than the pool holds, and what it releases it can allocate again.
     can be served.
   - `granularities` is the set of granularities this pool accepts, as a bit set:
     bit `n` set means a granularity of `2^n` bytes is accepted, so one machine
-    word names every power of two a granularity can be. Today exactly one bit is
-    set, the grain's (bit 12 on Profile B, bit 2 on Profile A), and its lowest
-    set bit is always the granularity zero spells. It is the pool's answer and
+    word names every power of two a granularity can be. It is never empty, so
+    it always has a lowest set bit, and that bit is always the granularity zero
+    spells. Today exactly one bit is set, the grain's (bit 12 on Profile B, bit
+    2 on Profile A). It is the pool's answer and
     not the machine's: what the kernel will serve from this pool's memory, which
     today is the same for every pool of a profile and leaves room for a pool
     whose memory can be mapped in one unit only, or is too small or misaligned
@@ -1160,10 +1161,11 @@ no more than the pool holds, and what it releases it can allocate again.
   to nobody: they are the pool's outstanding bytes until they come home.
 - **An allocation's rights come from the pool handle it was allocated
   through.** It is minted with that handle's rights word intersected with
-  the bits a `Memory` has (`Transfer`, `Mint`, `Map` and `MapExecute`), then
-  capped by the caller's `Memory` ceiling (§2.7). A pool handle carries those
-  four bits on behalf of what it allocates, at the bit numbers `MemoryRight`
-  gives them, and its own `Allocate` is not among them. So narrowing a pool
+  the bits a `Memory` has (`Transfer`, `Mint`, `Map` and `MapExecute`; not
+  yet enforced: split), then capped by the caller's `Memory` ceiling (§2.7).
+  A pool handle carries those four bits on behalf of what it allocates, at the
+  bit numbers `MemoryRight` gives them, and its own `Allocate` is not among
+  them. So narrowing a pool
   handle narrows everything allocated through it: a launcher that gives a
   child a pool sibling minted without `MapExecute` has given it memory it can
   allocate, map, read and write and never execute from, and one minted
@@ -1177,9 +1179,9 @@ no more than the pool holds, and what it releases it can allocate again.
   16, so no bit of `MemoryRight`'s can ever be one of them: `.Allocate` (bit 16)
   gates `allocate` and `available`, and bits 17 and 18 are reserved for `Split`
   and `Revoke` (below). `pool_rights()`, the set a boot pool is minted with, is
-  `Transfer | Mint | Allocate | Map | MapExecute`: every defined bit, because
-  attenuation is monotonic and a bit not minted at boot could never appear
-  later.
+  `Transfer | Mint | Allocate | Map | MapExecute` (not yet enforced: split):
+  every defined bit, because attenuation is monotonic and a bit not minted at
+  boot could never appear later.
 - **What holds a pool.** Its handles (and references in staged messages, §2)
   and its outstanding bytes, and nothing else. Its outstanding bytes are the
   lengths of its live allocations plus the length of every allocation from it
@@ -1207,9 +1209,9 @@ an allocation (§12).
 - **It records its pool and goes back whole.** An allocation's range returns
   to the pool it was allocated from, all of it at once, when no handle and no
   grant row names it (the refcount invariant, below); nothing returns part of
-  one. An allocation minted at boot came from no pool, and when it frees its
-  bytes go nowhere; its granularity is the profile's grain (not yet
-  enforced: pools).
+  one (not yet enforced: split). An allocation minted at boot came from no
+  pool, and when it frees its bytes go nowhere; its granularity is the
+  profile's grain.
 - **The rights, bit by bit.** `MemoryRight.Transfer` (bit 0) and `.Mint`
   (bit 1) are the universal pair; `.Map` (bit 9) gates `map`, and
   `.MapExecute` (bit 10) gates an executable `map` (below). Bit 8 is not
@@ -1294,8 +1296,7 @@ an allocation (§12).
   executable" with `Memory.mint(rights:)` before an allocation travels, or
   with `Pool.mint(rights:)` before a pool does). An allocation carries the
   bits of the pool handle it came through, so a pool sibling minted without
-  `MapExecute` allocates memory that cannot map executable either (not yet
-  enforced: pools).
+  `MapExecute` allocates memory that cannot map executable either.
 - **No row is both writable and executable.** `Write | Execute` in one access
   word is a caller-checkable `BadArg` fault, beside the write-without-read
   refusal. What it removes is only the single row a process could write and
@@ -1412,7 +1413,7 @@ owns those bytes.
 - A pool has a count of its own besides `refs`: its outstanding bytes
   (`out_bytes`), what it has allocated and not had back, donations to the
   kernel included (above). It frees only when both are zero, so the pool
-  every allocation records is always a live one.
+  every allocation records is always a live one (not yet enforced: split).
 - **A teardown releases memory in §2.10's order.** The dying process's handles
   go first, so an allocation it alone named and no row grants goes back to
   its pool there, crediting whichever ledger it is charged to. What survives
@@ -1499,42 +1500,37 @@ not build carries the marker "not yet enforced:" and the part's name. Until a
 part is built the kernel does what its paragraph here says; building it removes
 its markers and its paragraph, and the last part removes this note.
 
-- **Pools.** There is no `Pool` kind: no `PoolOp`, `PoolRight`, `pool_rights()`,
-  `HandleKind.Pool`, `BootHandleKind.Pool`, `Pool` ceiling or `NoMemory` status,
-  and the region table has two kinds, `Ram` and `Device`. Every `Ram` row mints
-  a `Memory` that is a pool root, one object that is both a pool and an
-  allocation: it can be mapped, passed to `process_create`, given, sent and
-  donated as any `Memory` can, and split (below). It is minted with
-  `memory_rights()`, which carries `MemoryRight.Split` (bit 8) besides the four
-  bits above, and its boot record's kind is `BootHandleKind.Memory`. Its range
-  is the pool's unspent frontier, and a split takes from its free list first and
-  its frontier second. Every `Memory` names its pool root: a root names itself
-  and a piece names the root of the region it was cut from. A pool root frees
-  when no handle and no row names it and nothing is on loan from it, and its
-  bytes then go nowhere. Nothing reports a pool's free bytes or the
-  granularities it accepts. `allocate` does not exist: its work is a split of a
-  pool root (which takes no granularity, records none and does not align its
-  cut), which is capped by the caller's `Memory` ceiling and charged to its
-  `Memory` row. `slab_donate` takes only a `Memory`, a pool root or a piece: one
-  with another reference or a row, or a pool root with something on loan, is the
-  `BadState` fault, after the `BadArg` for memory the board cannot give a
-  process.
 - **Split.** A `Memory` has a second op, `MemoryOp.Split(len)` (op 0), on
-  `MemoryRight.Split`. Its answers, in order: a handle without the right is
-  `AccessDenied`; a `len` of zero, one the region cannot serve in one range
+  `MemoryRight.Split` (bit 8). Bit 8 is a bit a `Memory` has while the op
+  exists: `memory_rights()` mints it beside the four bits `Memory` lists,
+  `pool_rights()` carries it (it is `memory_rights()` with `PoolRight.Allocate`
+  added), and `allocate` hands it down with the others, so an allocation from
+  a pool can be split. Its answers, in order: a handle without the right is
+  `AccessDenied`; a `len` of zero, one the allocation cannot serve in one range
   and one that is not a multiple of the grain are `BadArg`; a cut that would
-  run through the middle of a grant row counted on the region answers
+  run through the middle of a grant row counted on the allocation answers
   `NoResource` with nothing changed (a status, because the launcher holding a
   child's destination cannot know where the child's segments lie); then the
   caller's `Memory` quota (`QuotaExceeded`), the Memory slab (`NoResource`)
-  and the handle mint. On a pool root the cut is the allocation above, taken
-  from the root itself. On any other region it is the front of the region,
-  which becomes the remainder, and the pool's outstanding bytes do not move.
-  The new piece names the pool root, carries the rights of the handle the
-  split went through capped by the caller's `Memory` ceiling, and is charged
-  to the caller's `Memory` row. A split moves every row of any process that is
-  counted on the region and lies wholly inside the cut onto the new piece, so
-  a piece's range returns to its pool root only when no row lies in it.
+  and the handle mint. It takes no granularity and does not align its cut; the
+  piece records its parent's granularity. The piece carries the rights of the
+  handle the split went through capped by the caller's `Memory` ceiling, and
+  is charged to the caller's `Memory` row. A split moves every row of any
+  process that is counted on the allocation and lies wholly inside the cut onto
+  the new piece, so a piece's range goes back only when no row lies in it.
+  - On an allocation minted at boot, the allocation keeps a pool's ledger on
+    its own slot: the cut is first fit from its own free list, else the front
+    of its unspent range, as `allocate` serves a pool, and its outstanding
+    bytes rise by the piece's length. The piece names that boot allocation as
+    its pool and returns its range there, where it coalesces and folds back as
+    a pool's returned ranges do. The boot allocation frees only once no piece
+    of it is out, and a donation of it with a piece out is the `BadState`
+    fault.
+  - On any other allocation (one a pool made, or a piece), the cut is the
+    allocation's front, and the allocation becomes the remainder. The piece
+    names the pool its parent names, and that pool's outstanding bytes do not
+    move: the piece and the remainder each return their own range to it when
+    they free. Until then a pool's `available` counts neither as free.
 - **Overlap.** A `map` is refused (`NoResource`) only when its range meets a
   row the loader recorded for the target: a segment or the stack grant. A
   mapping may meet another mapping, a device row or the stats region's row,
@@ -1781,8 +1777,8 @@ hold is bounded by its ceiling. That covers:
 - `SystemOp.ProcessCreate`'s handle on the new process, and
   `SystemOp.InterruptBind`;
 - the ops that mint a new object from a held one: `Pool.Allocate`, capped by
-  the `Memory` ceiling, the kind of what it mints (not yet enforced: pools),
-  `IoMemory.Carve` and `Memory.Map`'s Mapping;
+  the `Memory` ceiling, the kind of what it mints, `IoMemory.Carve` and
+  `Memory.Map`'s Mapping;
 - the handles a pipe mints for the protocol: the claim `Post` returns and the
   obligation `Take` delivers;
 - the sender handle `PipeRequestOp.Sender` mints (§2.1), by the Process
@@ -2076,7 +2072,7 @@ a whole.
 | `ClockGet` | `SystemRight.ClockGet` | mints a Clock handle (§2.6) |
 | `ProcessCreate` | `SystemRight.ProcessCreate` | creates an inert process (§8, §12); the third argument is a Process handle naming a ceiling source the child's rights ceilings are intersected with, or `NO_HANDLE` for none (§2.7) |
 | `InterruptBind(line)` | `SystemRight.InterruptBind` | binds an interrupt line to a new Interrupt (§9) |
-| `SlabDonate` | `SystemRight.SlabDonate` | donates a `Pool` or a `Memory` to a kind's slab (below; a pool is not yet enforced: pools) |
+| `SlabDonate` | `SystemRight.SlabDonate` | donates a `Pool` or a `Memory` to a kind's slab (below) |
 | `TierGet` | `SystemRight.TierGet` | answers the protection tier (§5b.1) |
 | `StatsRegionMap` | `SystemRight.StatsRegionMap` | maps the trap-counter page read-only, on the isolated tiers (§2.7) |
 | `ProcessNext(address of cursor)` | `SystemRight.ProcessObserve` | reads the cursor from a doubleword in the caller's memory and answers the process with the smallest pid above it, as a Process handle carrying the observe set, and writes its pid back as the next cursor; `Drained` at the end (below) |
@@ -2111,8 +2107,8 @@ a whole.
 - **`SlabDonate`** consumes the donated capability and backs a named object
   kind's slab with it, permanently in v1 — so the compiled limits are a floor
   and capacity is policy, decided by the deployment rather than by the build.
-  It takes a pool or an allocation (not yet enforced: pools), and the
-  kernel never shares slab backing with user-reachable memory, so the handle
+  It takes a pool or an allocation, and the kernel never shares slab
+  backing with user-reachable memory, so the handle
   must be the only reference to its object and nothing may reach its bytes:
   an allocation with no sibling reference and no grant row, or a pool with no
   sibling reference and nothing allocated from it outstanding (§2.5). Its
@@ -2271,8 +2267,8 @@ record (`quota_used` / `quota_limit`, §2.7), the entry a charged object's
 is charged inside `mint_handle` and credited inside `unbind_handle`. An
 Interrupt has no column: there is at most one live Interrupt per line, and the
 Interrupt slab bounds the objects (§2.8). Pools and allocations share the
-`Memory` column, as they share the Memory slab (not yet enforced: pools): an
-`allocate` charges its caller one, and the boot charges root one for each
+`Memory` column, as they share the Memory slab: an `allocate` charges its
+caller one, and the boot charges root one for each
 `Ram` and `Pool` row it mints.
 
 - **Policy first.** A quota is checked at every allocation site that answers
@@ -2410,7 +2406,7 @@ handle to make the op that would answer `Revoked`.
 |---|---|
 | Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. `Exit` releases the handle it is invoked through: only that handle goes, every other one still reads the slot, and a Thread that exits with no other handle naming it is freed at its exit. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
 | Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) and bound to no process: nothing names its binder's record, so the teardown has nothing to disown |
-| Event, Pipe, Pool, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them; an allocation also until its last grant row goes, and a pool until its last allocation comes home (§2.5; Pool not yet enforced: pools) |
+| Event, Pipe, Pool, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them; an allocation also until its last grant row goes, and a pool until its last allocation comes home (§2.5) |
 | Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1). The process walk and the lookup by pid answer a `Gone` record for as long as something names it, and the handle they mint is one more name that holds it (§2.8); they answer no process before its start (§2.8). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
 | Clock, System | Never destroyed |
 
@@ -2590,8 +2586,8 @@ have no field.
   `rights_allow_transfer` is the one function that reads it. Which kinds'
   default sets mint it is a per-kind ruling: v1 mints it in
   `root_system_rights()`, `process_rights()`, `thread_rights()`,
-  `event_rights()`, `waiter_rights()`, `timer_rights()`, `pool_rights()` (not
-  yet enforced: pools), `memory_rights()`, `iomemory_rights()`,
+  `event_rights()`, `waiter_rights()`, `timer_rights()`, `pool_rights()`,
+  `memory_rights()`, `iomemory_rights()`,
   `interrupt_rights()`, `pipe_inlet_rights()`,
   `pipe_outlet_rights()`, `pipe_reply_rights()` and `pipe_request_rights()`,
   so a Clock handle cannot be given (nor a Mapping, §2.5). Root's System
@@ -2740,8 +2736,7 @@ have no field.
   handle mints it with no more than that handle's rights: `IoMemory.Carve`
   with the handle's own, so a carved window is never wider than its parent
   handle, and `Pool.Allocate` with the bits the pool handle hands down, so an
-  allocation is never wider than the pool handle it came through (§2.5; not
-  yet enforced: pools).
+  allocation is never wider than the pool handle it came through (§2.5).
   The only rights source is the boot handle set given to the root server, so
   every rights word in the machine is a subset of one of those, reached by some
   path of mints and gives (a statement about the syscall path; a flat-tier
@@ -2778,7 +2773,7 @@ have no field.
     (which may take a waitable to zero in turn — a cascade) and wakes its parked
     threads, a Memory returns its slot (and its range to its pool once no
     grant row names it, §2.5), a Pool returns its slot once nothing it
-    allocated is out (not yet enforced: pools), and a `Gone` process's record
+    allocated is out, and a `Gone` process's record
     is reclaimed, its body having
     gone at the teardown (§2.7). **The one exception is a Mapping**, whose row
     is not a reference back: it frees its slot and leaves the row installed
@@ -3159,8 +3154,8 @@ table to ask which rule applies. The caller is the process that faults, through
 whichever process's handle the op was made (§2.7). What is left in `SosStatus`
 is what a caller could not have known — `NoResource` (a full slab),
 `QuotaExceeded` (§2.9), `NoMemory` (11: a pool that cannot serve the length
-asked of it in one range, answered by `Pool.allocate` alone, §2.5; not yet
-enforced: pools), `BadImage` (§8), `Drained` (§12, and the end of a
+asked of it in one range, answered by `Pool.allocate` alone, §2.5),
+`BadImage` (§8), `Drained` (§12, and the end of a
 process walk, §2.8), `Revoked` (§2.2, every op on an invalid
 object, §2.10, a sender handle asked of a dead sender, §2.1, and a lookup of a
 pid the record table does not hold or holds for a process not yet started,
@@ -3339,11 +3334,11 @@ are never freed:
 
 - **The counts live on the object's own slab slot**: §2.5's "refcount
   invariant, as built".
-- **A pool is its own kind, and its ledger is its own slot** (not yet
-  enforced: pools): the head of its free list, the bytes outstanding and the
-  bytes dropped. Every allocation records the pool it came from and returns
-  its whole range there; an allocation minted at boot came from no pool and
-  returns nowhere. A returned range is inserted into the pool's free list,
+- **A pool is its own kind, and its ledger is its own slot**: the head of
+  its free list, the bytes outstanding and the bytes dropped. Every
+  allocation records the pool it came from and returns its whole range there
+  (not yet enforced: split); an allocation minted at boot came from no pool
+  and returns nowhere. A returned range is inserted into the pool's free list,
   which is kept sorted by base; it coalesces with a free neighbour on either
   side, and a free range that touches the pool's unspent frontier folds back
   into it, so a pool whose every allocation has come home is whole again.
@@ -3360,9 +3355,8 @@ are never freed:
 - **Byte accounting is that ledger**: `MemorySlot.out_bytes` (outstanding)
   beside the free list and the frontier (free). It is the pool's business and
   not a per-process authority — quotas stay object-counted in v1 (§2.9). The
-  one op that fronts it is a pool's `available` (§2.5; not yet enforced:
-  pools), which reports what is free to a holder that can allocate; nothing
-  reports what is outstanding.
+  one op that fronts it is a pool's `available` (§2.5), which reports what is
+  free to a holder that can allocate; nothing reports what is outstanding.
 - **`IoMemory` is the carve-out.** `carve` leaves the parent whole, MMIO is
   pinned and never freed, and a device region's counts are therefore
   effectively pinned.
@@ -4324,10 +4318,9 @@ loader parses and reports while no process stores either.
   loader's `allow_device: true` door, dormant) (§2.5): its emitter is
   sawlang-side, so deleting it is a toolchain-pin event.
 - **The tier-2 mapping quota price** (`DEFAULT_QUOTA_MAPPINGS`, §5b.1).
-- **The memory model's remaining parts** (§2.5): the `Pool` kind and typed
-  boot rows, the overlap rule, buffers judged by rows on every profile, and an
-  allocation that is never cut. Until each lands the kernel does what §2.5's
-  transition note says for it.
+- **The memory model's remaining parts** (§2.5): the overlap rule, buffers
+  judged by rows on every profile, and an allocation that is never cut. Until
+  each lands the kernel does what §2.5's transition note says for it.
 - **Sub-pools and revoke** (§2.5): `Pool.split` and a revoke are reserved, not
   specified. A process given a pool can allocate from it but cannot carve it
   into budgets for others, and a manager cannot take back what it allocated.
@@ -4383,9 +4376,9 @@ loader parses and reports while no process stores either.
 - An allocation is one contiguous range (§2.5), so a fragmented pool refuses
   a length it holds enough free bytes for in total; `available` reports both
   numbers, as a snapshot.
-- An allocation is never cut (§2.5), so the parts of one buffer are released
-  together, and an allocation minted at boot (a child's image or
-  destination) returns its bytes to no pool when it frees.
+- An allocation is never cut (§2.5; not yet enforced: split), so the parts of
+  one buffer are released together, and an allocation minted at boot (a
+  child's image or destination) returns its bytes to no pool when it frees.
 - The kernel is uniprocessor (§7).
 
 **The plan.** The standing tail, each item specified in its own section: the
@@ -4414,10 +4407,9 @@ gives their direction and they are specified when they are designed.
   `SystemRight.ProcessCreate`. **The set is one handle wide at the register** —
   the regions are collected, not passed: the build-emitted region table carries
   a kind column, a `Pool` row mints a `Pool`, a `Ram` row a `MemoryObject` (an
-  allocation) and a `Device` row an `IoMemoryObject` (a `Pool` row is not yet
-  enforced: pools), and each arrives through `BootHandleNext` under its row
-  ordinal, its record's kind naming which it is (`BootHandleKind.Pool` is
-  13). The kernel mints and queues
+  allocation) and a `Device` row an `IoMemoryObject`, and each arrives
+  through `BootHandleNext` under its row ordinal, its record's kind naming
+  which it is (`BootHandleKind.Pool` is 13). The kernel mints and queues
   them in row order after root's System, Process and Thread handles, so the
   drain answers row 0 first. A driver obtains its window instead of declaring
   it, which is what makes handing one to a driver child possible at all. The
@@ -4470,8 +4462,8 @@ gives their direction and they are specified when they are designed.
   path" is therefore kept by construction: nowhere else in the tree reads a
   segment record. **Root provides the memory and supplies no numbers.**
   `process_create(image:memory:)` takes two allocations (`Memory`
-  capabilities; a `Pool` in either place is the `BadHandle` fault, not yet
-  enforced: pools), segments are
+  capabilities; a `Pool` in either place is the `BadHandle` fault),
+  segments are
   copied to their virtual link addresses inside `memory` or used in place in
   `image` (§5.6), whose grant rows then hold `image` as the
   copied ones hold `memory`, so either handle may be released while the child
@@ -4495,7 +4487,7 @@ gives their direction and they are specified when they are designed.
   not define. Bit 0 is "no tick": the kernel arms the scheduler tick (§7)
   unless it is set, so an image with no table, or with the flags zero, runs
   with the tick, and only an image that asks is cooperative.
-- **The kind column types every row** (not yet enforced: pools). `Ram` (0)
+- **The kind column types every row**. `Ram` (0)
   mints an allocation, a `Memory` that came from no pool (§2.5); `Device` (1)
   an `IoMemory`; `Pool` (2) a `Pool`. Root's boot pools are minted with
   `pool_rights()`, its boot allocations with `memory_rights()` and its device
@@ -4593,8 +4585,7 @@ gives their direction and they are specified when they are designed.
   holds no region object for). Attenuation runs the same way on either:
   `Memory.mint(rights:)` narrows an allocation before it travels (§2.5's
   `MemoryRight.MapExecute`), and `Pool.mint(rights:)` narrows a pool, and with
-  it everything allocated through the narrowed handle (not yet enforced:
-  pools).
+  it everything allocated through the narrowed handle.
 - **v1 protocol conventions** (userspace convention, not kernel surface): a
   launched process receives one bootstrap pipe handle at launch; its first
   messages request its initial handle set from the launcher (name-service

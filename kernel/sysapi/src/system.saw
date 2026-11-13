@@ -22,6 +22,7 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, PipeRequestOp, MemoryOp,
                IoMemoryOp, MINT_OP, SlabKind, HandleKind,
                SystemHandle, ProcessHandle, ThreadHandle, EventHandle,
                WaiterHandle, InterruptHandle, ClockHandle, MemoryHandle,
+               PoolHandle,
                IoMemoryHandle, MappingHandle, TimerHandle,
                PipeInletHandle, PipeOutletHandle, PipeReplyHandle,
                PipeRequestHandle,
@@ -60,6 +61,7 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_system_slab_donate, sos_system_process_next,
                   sos_system_process_by_pid, sos_waiter_add, handle_rights}
 import sos.memory.{Memory}
+import sos.pool.{Pool}
 import sos.iomemory.{IoMemory}
 import sos.mapping.{Mapping}
 import sos.pipe.{PipeInlet, PipeOutlet, PipeReply, PipeRequest}
@@ -322,9 +324,10 @@ extension System {
     /// kernel object storage, the capability is spent, and no op returns the
     /// range to a pool. The kernel refuses, by ending the caller, a region
     /// it cannot safely absorb: one that any other handle still names, one with
-    /// a mapping row installed, or a pool root with pieces still on loan. The
-    /// caller created those conditions and can see them, so they fault rather
-    /// than answer.
+    /// a mapping row installed, or an allocation minted at boot with pieces
+    /// split from it still out. The caller created those conditions and can
+    /// see them, so they fault rather than answer. An allocation from a pool
+    /// that is donated stays among its pool's outstanding bytes for good.
     ///
     /// On a refusal the region comes back in the error, as with `Waiter.give`.
     /// The refusals that are statuses are all `SosStatus.NoResource`: a region
@@ -339,6 +342,28 @@ extension System {
         region.handle = MemoryHandle(NO_HANDLE)
         try checked(sos_system_slab_donate(self.handle, kind as UInt, word)) catch {
             let back: (SosStatus, Memory) = (error, Memory(handle: MemoryHandle(word)))
+            return move back
+        }
+        return
+    }
+
+    /// Give the kernel `pool` to back the slab `kind` names, for good.
+    /// Requires `SystemRight.SlabDonate`.
+    ///
+    /// `slab_donate(kind:memory:)`'s terms, for a pool: the bytes become kernel
+    /// object storage and nothing gives them back. The kernel refuses, by
+    /// ending the caller, a pool any other handle still names or one with an
+    /// allocation still out. The `NoResource` refusals hand the pool back in
+    /// the error.
+    public func slab_donate(&self, kind: SlabKind,
+                            pool: Pool) -> Result<Void, (SosStatus, Pool)> {
+        var budget = move pool
+        let word: UInt = budget.handle
+        budget.handle = PoolHandle(NO_HANDLE)
+        try checked(sos_system_slab_donate(self.handle, kind as UInt,
+                                           word)) catch {
+            let back: (SosStatus, Pool) = (error,
+                                           Pool(handle: PoolHandle(word)))
             return move back
         }
         return
@@ -1030,6 +1055,29 @@ extension Process {
         return
     }
 
+    /// Give a pool to this process under `tag`, consuming the wrapper.
+    /// Requires `ProcessRight.Give` here and `PoolRight.Transfer` on the pool,
+    /// which every boot pool carries. `give(memory:)`'s contract.
+    ///
+    /// What the child then holds is a byte budget: it can allocate no more than
+    /// the pool holds, and what it allocates carries no more than the handle
+    /// it was given, so a keep mask here is a policy on everything the child
+    /// will allocate.
+    public func give(
+        &self, pool: Pool, tag: UInt, keep: UInt32 = ALL_RIGHTS
+    ) -> Result<Void, (SosStatus, Pool)> {
+        var budget = move pool
+        let word: UInt = budget.handle
+        budget.handle = PoolHandle(NO_HANDLE)
+        let given = sos_process_give(self.handle, word, tag, keep as UInt)
+        try checked(given) catch {
+            let back: (SosStatus, Pool) = (error,
+                                           Pool(handle: PoolHandle(word)))
+            return move back
+        }
+        return
+    }
+
     /// Give a device window to this process under `tag`, consuming the wrapper.
     /// Requires `ProcessRight.Give` here and `IoMemoryRight.Transfer` on the
     /// window, which every boot window and every carved sub-window carries.
@@ -1640,6 +1688,23 @@ extension Process {
                                             memory as UInt))
     }
 
+    /// Narrow this process's rights ceiling for Pools to its old value
+    /// intersected with `pool`, a mask of `PoolRight` bits. Requires
+    /// `ProcessRight.RestrictRights`. `restrict_rights(memory:)`'s terms.
+    ///
+    /// No handle a process gets onto a pool is capped by this column: a pool
+    /// is minted at boot, into root, whose ceilings are unrestricted; a
+    /// `mint` sibling is a subset of a handle already held; and a pool that
+    /// arrives by a give or in a message keeps the rights its sender chose.
+    /// The column is read and narrowed as every kind's is.
+    public func restrict_rights(
+        &self, pool: UInt32
+    ) -> Result<Void, SosStatus> {
+        checked(sos_process_restrict_rights(self.handle,
+                                            HandleKind.Pool as UInt,
+                                            pool as UInt))
+    }
+
     /// Narrow this process's rights ceiling for IoMemories to its old value
     /// intersected with `iomemory`, a mask of `IoMemoryRight` bits. Requires
     /// `ProcessRight.RestrictRights`.
@@ -1785,6 +1850,11 @@ extension Process {
     /// The ceiling for Memories (`system_ceiling`).
     public func memory_ceiling(&self) -> Result<UInt32, SosStatus> {
         ceiling_word(self.handle, HandleKind.Memory)
+    }
+
+    /// The ceiling for Pools (`system_ceiling`).
+    public func pool_ceiling(&self) -> Result<UInt32, SosStatus> {
+        ceiling_word(self.handle, HandleKind.Pool)
     }
 
     /// The ceiling for IoMemories (`system_ceiling`).
@@ -1940,6 +2010,9 @@ public struct BootHandle {
     /// The region itself, until somebody takes it. Private on purpose: the only
     /// way out is `take_memory`, which is what makes the one-owner rule hold.
     memory: Memory?,
+    /// The pool, on the same terms; `take_pool` is its one door. A pool row of
+    /// the build's region table mints a `Pool`, and a launcher may give one.
+    pool: Pool?,
     /// The Process handle, on the same terms; `take_process` is its one door.
     process: Process?,
     /// The System handle, on the same terms; `take_system` is its one door. A
@@ -2003,6 +2076,15 @@ extension BootHandle {
     /// visible in the type rather than in a convention.
     public func take_memory(&var self) -> Memory? {
         self.memory.take()
+    }
+
+    /// Take the pool out of this record, leaving it empty. Same terms as
+    /// `take_memory`: a record whose object is an allocation answers `None`
+    /// here, and one whose object is a pool answers `None` from
+    /// `take_memory`, so a config that gave a tag the wrong kind of row learns
+    /// it from the record.
+    public func take_pool(&var self) -> Pool? {
+        self.pool.take()
     }
 
     /// Take the Process handle out of this record, leaving it empty. Same terms
@@ -2118,89 +2200,44 @@ func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> BootHandle {
         panic("sos: kernel wrote boot handle kind {}, which this build cannot name",
               kind)
     }
+    // Every slot empty, then the one the kind names filled: a record carries
+    // exactly one object.
+    var record = BootHandle(tag: tag, kind: what, memory: None, pool: None,
+                            process: None, system: None, iomemory: None,
+                            inlet: None, outlet: None, reply: None,
+                            request: None, event: None, thread: None,
+                            waiter: None, timer: None, interrupt: None)
     match what {
-        case Memory -> BootHandle(tag: tag, kind: what,
-                                  memory: Memory(handle: MemoryHandle(handle)),
-                                  process: None, system: None, iomemory: None,
-                                  inlet: None, outlet: None, reply: None,
-                                  request: None, event: None, thread: None,
-                                  waiter: None, timer: None, interrupt: None),
-        case Process -> BootHandle(tag: tag, kind: what, memory: None,
-                                   process: Process(handle: ProcessHandle(handle)),
-                                   system: None, iomemory: None, inlet: None,
-                                   outlet: None, reply: None, request: None,
-                                   event: None, thread: None, waiter: None,
-                                   timer: None, interrupt: None),
-        case System -> BootHandle(tag: tag, kind: what, memory: None,
-                                  process: None,
-                                  system: System(handle: SystemHandle(handle)),
-                                  iomemory: None, inlet: None, outlet: None,
-                                  reply: None, request: None, event: None,
-                                  thread: None, waiter: None, timer: None, interrupt: None),
-        case IoMemory -> BootHandle(tag: tag, kind: what, memory: None,
-                                    process: None, system: None,
-                                    iomemory: IoMemory(handle: IoMemoryHandle(handle)),
-                                    inlet: None, outlet: None, reply: None,
-                                    request: None, event: None, thread: None,
-                                    waiter: None, timer: None, interrupt: None),
-        case PipeInlet -> BootHandle(tag: tag, kind: what, memory: None,
-                                     process: None, system: None,
-                                     iomemory: None,
-                                     inlet: PipeInlet(handle: PipeInletHandle(handle)),
-                                     outlet: None, reply: None, request: None,
-                                     event: None, thread: None, waiter: None,
-                                     timer: None, interrupt: None),
-        case PipeOutlet -> BootHandle(tag: tag, kind: what, memory: None,
-                                      process: None, system: None,
-                                      iomemory: None, inlet: None,
-                                      outlet: PipeOutlet(handle: PipeOutletHandle(handle)),
-                                      reply: None, request: None, event: None,
-                                      thread: None, waiter: None, timer: None, interrupt: None),
-        case PipeReply -> BootHandle(tag: tag, kind: what, memory: None,
-                                     process: None, system: None,
-                                     iomemory: None, inlet: None, outlet: None,
-                                     reply: PipeReply(handle: PipeReplyHandle(handle)),
-                                     request: None, event: None, thread: None,
-                                     waiter: None, timer: None, interrupt: None),
-        case PipeRequest -> BootHandle(tag: tag, kind: what, memory: None,
-                                       process: None, system: None,
-                                       iomemory: None, inlet: None,
-                                       outlet: None, reply: None,
-                                       request: PipeRequest(handle: PipeRequestHandle(handle)),
-                                       event: None, thread: None, waiter: None,
-                                       timer: None, interrupt: None),
-        case Event -> BootHandle(tag: tag, kind: what, memory: None,
-                                 process: None, system: None, iomemory: None,
-                                 inlet: None, outlet: None, reply: None,
-                                 request: None,
-                                 event: Event(handle: EventHandle(handle)),
-                                 thread: None, waiter: None, timer: None, interrupt: None),
-        case Thread -> BootHandle(tag: tag, kind: what, memory: None,
-                                  process: None, system: None, iomemory: None,
-                                  inlet: None, outlet: None, reply: None,
-                                  request: None, event: None,
-                                  thread: thread.Thread(handle: ThreadHandle(handle)),
-                                  waiter: None, timer: None, interrupt: None),
-        case Waiter -> BootHandle(tag: tag, kind: what, memory: None,
-                                  process: None, system: None, iomemory: None,
-                                  inlet: None, outlet: None, reply: None,
-                                  request: None, event: None, thread: None,
-                                  waiter: Waiter(handle: WaiterHandle(handle)),
-                                  timer: None, interrupt: None),
-        case Timer -> BootHandle(tag: tag, kind: what, memory: None,
-                                 process: None, system: None, iomemory: None,
-                                 inlet: None, outlet: None, reply: None,
-                                 request: None, event: None, thread: None,
-                                 waiter: None,
-                                 timer: Timer(handle: TimerHandle(handle)),
-                                 interrupt: None),
-        case Interrupt -> BootHandle(tag: tag, kind: what, memory: None,
-                                     process: None, system: None,
-                                     iomemory: None, inlet: None, outlet: None,
-                                     reply: None, request: None, event: None,
-                                     thread: None, waiter: None, timer: None,
-                                     interrupt: Interrupt(handle: InterruptHandle(handle))),
+        case Memory -> { record.memory = Memory(handle: MemoryHandle(handle)) },
+        case Pool -> { record.pool = Pool(handle: PoolHandle(handle)) },
+        case Process -> {
+            record.process = Process(handle: ProcessHandle(handle))
+        },
+        case System -> { record.system = System(handle: SystemHandle(handle)) },
+        case IoMemory -> {
+            record.iomemory = IoMemory(handle: IoMemoryHandle(handle))
+        },
+        case PipeInlet -> {
+            record.inlet = PipeInlet(handle: PipeInletHandle(handle))
+        },
+        case PipeOutlet -> {
+            record.outlet = PipeOutlet(handle: PipeOutletHandle(handle))
+        },
+        case PipeReply -> {
+            record.reply = PipeReply(handle: PipeReplyHandle(handle))
+        },
+        case PipeRequest -> {
+            record.request = PipeRequest(handle: PipeRequestHandle(handle))
+        },
+        case Event -> { record.event = Event(handle: EventHandle(handle)) },
+        case Thread -> { record.thread = thread_of(handle) },
+        case Waiter -> { record.waiter = Waiter(handle: WaiterHandle(handle)) },
+        case Timer -> { record.timer = Timer(handle: TimerHandle(handle)) },
+        case Interrupt -> {
+            record.interrupt = Interrupt(handle: InterruptHandle(handle))
+        },
     }
+    return move record
 }
 
 /// The `unsafe` half of `Process.pipe_create`, confined to one small named

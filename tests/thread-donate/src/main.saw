@@ -49,7 +49,7 @@
 // `sizeof(ThreadSlot) + THREAD_FRAME_STRIDE` and the slot half differs per
 // profile, so the new ceiling is arch-dependent while every claim above is not.
 
-import sos.{System, Process, Thread, Memory, SlabKind, SosStatus}
+import sos.{System, Process, Thread, Memory, Pool, SlabKind, SosStatus}
 
 /// One protection unit's worth on either profile: many thread units, which is
 /// all the donation has to be.
@@ -142,8 +142,9 @@ func initial(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let pool = pool_record.take_memory() else {
-        let _ = system.debug_print("SOS threaddonate: pool record is not a region\n")
+    guard let pool = pool_record.take_pool() else {
+        let _ = system.debug_print(
+            "SOS threaddonate: pool record is not a pool\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -171,7 +172,7 @@ func initial(boot_handle: UInt) {
     }
 
     // ---- CLAIM 2: the donation ------------------------------------------
-    let scratch = try pool.split(len: PAGE) catch {
+    let scratch = try pool.allocate(len: PAGE) catch {
         print("SOS threaddonate: no page to donate: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return

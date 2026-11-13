@@ -30,6 +30,7 @@ import sosabi.{
     root_system_rights,
     process_rights,
     memory_rights,
+    pool_rights,
     iomemory_rights,
     thread_rights,
     NO_HANDLE,
@@ -1087,9 +1088,10 @@ static BOOT_FLAG_NO_TICK: UInt8 = 0x01
 /// cannot honor, which the loader refuses rather than ignore.
 static BOOT_FLAGS_KNOWN: UInt8 = BOOT_FLAG_NO_TICK
 
-/// A region row's kind. The two kinds are spec §2.5's pool attributes: RAM is
-/// cacheable memory a process runs in, Device is a peripheral's registers, and
-/// the kernel mints a different object kind for each (`Memory` / `IoMemory`).
+/// A region row's kind, and so the object the kernel mints for it (spec §2.5,
+/// §12). `Ram` is an allocation, cacheable memory a process runs in or maps
+/// (`Memory`); `Pool` is RAM not yet allocated, which root allocates from
+/// (`Pool`); `Device` is a peripheral's registers (`IoMemory`).
 ///
 /// Raw-backed, so a reorder cannot renumber them, and read at the boundary with
 /// `from(raw:)`, which is total: an unrecognized byte is data the loader
@@ -1098,6 +1100,7 @@ static BOOT_FLAGS_KNOWN: UInt8 = BOOT_FLAG_NO_TICK
 enum RegionKind: UInt8 {
     case Ram = 0,
     case Device = 1,
+    case Pool = 2,
 }
 
 /// One row: a range, what kind of memory it is, and room to grow.
@@ -1133,8 +1136,9 @@ static REGION_TABLE_MAGIC: UInt32 = 0x4E47_5253
 /// safely guessed at, and a version-1 row read as version 2 would take the next
 /// row's base as this one's kind. The stitcher and kernel are built together.
 /// An image with no table at all reads as zero regions and never reaches this
-/// comparison.
-static REGION_TABLE_VERSION: UInt16 = 3
+/// comparison. The kind column is part of the layout: a table written for
+/// fewer kinds is a different version.
+static REGION_TABLE_VERSION: UInt16 = 4
 
 /// Overlay the header on the section's first bytes. One view construction, then
 /// an ordinary safe struct; the unsafety is confined to this line.
@@ -1171,8 +1175,8 @@ public func boot_tick_enabled() unsafe -> Bool {
     (header.flags & BOOT_FLAG_NO_TICK) == 0
 }
 
-/// Parse the region table and mint one Memory or IoMemory per row into process
-/// `p`, queuing a boot-handle record for each.
+/// Parse the region table and mint one Memory, Pool or IoMemory per row, by
+/// the row's kind, into process `p`, queuing a boot-handle record for each.
 ///
 /// Every refusal is `fatal_image`: the table is part of the boot image, written
 /// by the build that produced this kernel, and a machine whose own boot data is
@@ -1267,7 +1271,7 @@ func mint_boot_regions(p: Int) unsafe {
         if not boot_handle_room(p) {
             fatal_image("no boot-record room for the boot regions", i)
         }
-        // Two kinds of row, two kinds of object: the same range becomes a
+        // Three kinds of row, three kinds of object: the same range becomes a
         // different capability depending on the kind byte the build wrote.
         match kind {
             case Ram -> {
@@ -1278,15 +1282,19 @@ func mint_boot_regions(p: Int) unsafe {
                 // `refs: 1` is the mint below: a boot region is created with
                 // exactly one handle onto it, so the count starts at one.
                 //
-                // A boot region is a pool root, and a root names itself (`root:
-                // slot`). This is the one place a pool is created; every other
-                // region is a `Split` off one of these and carries this slot's
-                // index down the chain. The ledger starts empty: nothing lent,
-                // nothing free but the cursor, nothing dropped.
+                // A boot allocation came from no pool, so its bytes go nowhere
+                // when it frees. It names itself as its pool (`root: slot`)
+                // all the same: that is the slot `Split` serves its pieces
+                // from and returns them to, first fit off its own free list.
+                // The ledger starts empty: nothing lent, nothing free but the
+                // cursor, nothing dropped.
                 MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
                                             base: row_base,
                                             len: row.len as UInt,
                                             refs: 1, maps: 0, root: slot,
+                                            granularity: hal.PROT_GRAIN,
+                                            parent: NO_MEMORY, lent_base: 0,
+                                            lent_len: 0, depth: 0,
                                             free_head: 0, out_bytes: 0,
                                             dropped: 0)
                 let handle = mint_handle(p, ObjType.Memory, memory_rights(), slot)
@@ -1295,6 +1303,36 @@ func mint_boot_regions(p: Int) unsafe {
                 }
                 quota_charge(p, QuotaKind.Memory)
                 queue_boot_handle(p, i, BootHandleKind.Memory, handle)
+            },
+            case Pool -> {
+                let slot = alloc_memory()
+                if slot == NO_MEMORY {
+                    fatal_image("out of Memory slots for the boot regions", i)
+                }
+                // A pool starts at its first grain boundary and hands out
+                // whole grains, so every range it ever serves or takes back is
+                // on the grain. The bytes before that boundary are never
+                // handed out; a row too short to reach one is an empty pool.
+                let (pool_base, pool_len) = grain_aligned(row_base,
+                                                          row.len as UInt)
+                // A pool names itself (`root: slot`): it is the one slot every
+                // allocation from it names, and its ledger (the free list, the
+                // bytes out, the bytes dropped) is kept here. A boot pool was
+                // lent by no pool, so it has no `parent` and its depth is zero.
+                MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
+                                            base: pool_base, len: pool_len,
+                                            refs: 1, maps: 0, root: slot,
+                                            granularity: hal.PROT_GRAIN,
+                                            parent: NO_MEMORY, lent_base: 0,
+                                            lent_len: 0, depth: 0,
+                                            free_head: 0, out_bytes: 0,
+                                            dropped: 0)
+                let handle = mint_handle(p, ObjType.Pool, pool_rights(), slot)
+                if handle == NO_HANDLE {
+                    fatal_image("no handle table room for the boot regions", i)
+                }
+                quota_charge(p, QuotaKind.Memory)
+                queue_boot_handle(p, i, BootHandleKind.Pool, handle)
             },
             case Device -> {
                 let slot = alloc_iomemory()
@@ -1321,6 +1359,19 @@ func mint_boot_regions(p: Int) unsafe {
     uart.write_str("SOS: boot regions=")
     uart.write_hex(count)
     uart.write_str("\n")
+}
+
+/// `[base, base + len)` trimmed to start on the protection grain: the first
+/// grain boundary at or above `base`, and what is left of the range from
+/// there. A range that never reaches a boundary, or whose boundary lies past
+/// the end of the address space, is empty and keeps its base.
+func grain_aligned(base: UInt, len: UInt) -> (UInt, UInt) {
+    let rem = base % hal.PROT_GRAIN
+    let pad: UInt = if rem == 0 { 0 } else { hal.PROT_GRAIN - rem }
+    if pad >= len || pad > UInt.max - base {
+        return (base, 0)
+    }
+    (base + pad, len - pad)
 }
 
 /// Can this build's machine word hold `v`?

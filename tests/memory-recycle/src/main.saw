@@ -16,9 +16,10 @@
 //   SOS childtouch: wrote 60 read 60   <- a child writes its mark in a page
 //                                         mapped into it out of that same pool
 //   SOS recycle: reused read 60        <- the child is dead, and the page came
-//                                         home. A fresh split of the same size
-//                                         is the same bytes, carrying the mark
-//                                         the child left in them
+//                                         home. A fresh allocation of the
+//                                         same size is the same bytes,
+//                                         carrying the mark the child left in
+//                                         them
 //   SOS recycle: done
 //
 // Leg 1 is the allocator's arithmetic. Four quarters is the whole pool, so the
@@ -31,19 +32,20 @@
 // `whole=1` says: one region, the size of the entire pool.
 //
 // Leg 2 is the second zero across a process boundary: the range is released
-// only when the last reference of either kind drops. Root splits a page, maps
-// it into a child, and then destroys both objects on its own side: the Memory
-// handle and the Mapping object. Nothing in the system can name that region
-// afterwards; the only thing left holding it is the protection row in the
-// child's domain, §2.5's second kind of reference. A kernel that counted only
-// handles would have put those bytes back on the free list while the child was
-// still writing to them. This one waits for the child to die: its teardown
-// drops the row, the row was the last reference, and the range goes home. The
-// proof is the child's own byte, read back by root through a mapping of a
-// region split out after the child was gone.
+// only when the last reference of either kind drops. Root allocates a page,
+// maps it into a child, and then destroys both objects on its own side: the
+// Memory handle and the Mapping object. Nothing in the system can name that
+// region afterwards; the only thing left holding it is the protection row in
+// the child's domain, §2.5's second kind of reference. A kernel that counted
+// only handles would have put those bytes back on the free list while the
+// child was still writing to them. This one waits for the child to die: its
+// teardown drops the row, the row was the last reference, and the range goes
+// home. The proof is the child's own byte, read back by root through a mapping
+// of a region allocated after the child was gone.
 //
-// A kernel without pool returns fails leg 1 at `whole=1` (a `split` that big is
-// a `BadArg` fault, so the run dies there) and, if it got past, fails leg 2 by
+// A kernel without pool returns fails leg 1 at `whole=1` (an `allocate` that
+// big answers `NoMemory`, and the leg stops there) and, if it got past, fails
+// leg 2 by
 // faulting on the read: its cursor would have moved on and the second page
 // would be somewhere else entirely.
 //
@@ -57,7 +59,7 @@
 // of a literal rather than a formatted line. Don't merge the legs: the shape
 // looks like taste and is not.
 
-import sos.{System, Process, Memory, Mapping, MapAccess, ClockType,
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, ClockType,
             Timer, Waiter, SosStatus, SystemRight}
 
 // The address of this program's first mapping, and the pool's size: its config,
@@ -110,22 +112,22 @@ func peek(addr: UInt) unsafe -> UInt8 {
 /// The four pieces are separate bindings because the order they are released in
 /// is the experiment: 0, 2, 1, 3 makes a hole, a second disjoint hole, a merge
 /// of three into one, and then a fold of everything back into the frontier.
-func pool_comes_back(system: &System, pool: &Memory, pool_bytes: UInt) -> Bool {
+func pool_comes_back(system: &System, pool: &Pool, pool_bytes: UInt) -> Bool {
     let quarter = pool_bytes / PIECES
-    let q0 = try pool.split(len: quarter) catch {
-        let _ = system.debug_print("SOS recycle: quarter split failed\n")
+    let q0 = try pool.allocate(len: quarter) catch {
+        let _ = system.debug_print("SOS recycle: quarter allocation failed\n")
         return false
     }
-    let q1 = try pool.split(len: quarter) catch {
-        let _ = system.debug_print("SOS recycle: quarter split failed\n")
+    let q1 = try pool.allocate(len: quarter) catch {
+        let _ = system.debug_print("SOS recycle: quarter allocation failed\n")
         return false
     }
-    let q2 = try pool.split(len: quarter) catch {
-        let _ = system.debug_print("SOS recycle: quarter split failed\n")
+    let q2 = try pool.allocate(len: quarter) catch {
+        let _ = system.debug_print("SOS recycle: quarter allocation failed\n")
         return false
     }
-    let q3 = try pool.split(len: quarter) catch {
-        let _ = system.debug_print("SOS recycle: quarter split failed\n")
+    let q3 = try pool.allocate(len: quarter) catch {
+        let _ = system.debug_print("SOS recycle: quarter allocation failed\n")
         return false
     }
     print("SOS recycle: quarters={}\n", PIECES)
@@ -139,7 +141,7 @@ func pool_comes_back(system: &System, pool: &Memory, pool_bytes: UInt) -> Bool {
 
     // And out it comes as one range. There is no bounds reader to ask, so the
     // size of the region the kernel is willing to mint is the measurement.
-    let whole = try pool.split(len: pool_bytes) catch {
+    let whole = try pool.allocate(len: pool_bytes) catch {
         let _ = system.debug_print("SOS recycle: the pool did not come back\n")
         return false
     }
@@ -155,9 +157,9 @@ func pool_comes_back(system: &System, pool: &Memory, pool_bytes: UInt) -> Bool {
 /// and the Mapping), so the child's protection row is the only reference left
 /// to that region while it runs.
 func lend_page_and_wait(system: &System, proc: &Process, child: &Process,
-                        pool: &Memory) -> Bool {
-    let page = try pool.split(len: CHUNK) catch {
-        let _ = system.debug_print("SOS recycle: page split failed\n")
+                        pool: &Pool) -> Bool {
+    let page = try pool.allocate(len: CHUNK) catch {
+        let _ = system.debug_print("SOS recycle: page allocation failed\n")
         return false
     }
     let page_map = try child.map(memory: &page, access: RW) catch {
@@ -211,9 +213,9 @@ func lend_page_and_wait(system: &System, proc: &Process, child: &Process,
 }
 
 /// Leg 2, second half: the same bytes, asked for again.
-func page_came_home(system: &System, proc: &Process, pool: &Memory,
+func page_came_home(system: &System, proc: &Process, pool: &Pool,
                     base: UInt) -> Bool {
-    let again = try pool.split(len: CHUNK) catch {
+    let again = try pool.allocate(len: CHUNK) catch {
         let _ = system.debug_print("SOS recycle: the page did not come back\n")
         return false
     }
@@ -262,8 +264,8 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let pool = pool_record.take_memory() else {
-        let _ = system.debug_print("SOS recycle: pool record is not a region\n")
+    guard let pool = pool_record.take_pool() else {
+        let _ = system.debug_print("SOS recycle: pool record is not a pool\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

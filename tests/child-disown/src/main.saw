@@ -3,8 +3,8 @@
 // the charger's reused slot and reads its own ledger back.
 //
 // The charger is given a carrier inlet, a sibling of its launcher's pool and a
-// view of a device window. It makes a connection, splits two regions off the
-// pool and carves a window off the view, all charged to it, posts the
+// view of a device window. It makes a connection, allocates two regions out of
+// the pool and carves a window off the view, all charged to it, posts the
 // connection's client end, both regions and the window in one message, and
 // exits. It exits holding exactly two handles, its boot System and the Process
 // it derived: everything else is released when the posting frame ends or left
@@ -25,7 +25,7 @@
 // of each kind is kept to the exit, so a release cannot muddy the count. The
 // exit code is the total.
 
-import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet,
+import sos.{System, Process, Pool, IoMemory, PipeInlet, PipeOutlet,
             PipeHandles, Waiter, SosStatus, PIPE_BODY_BYTES}
 
 /// The launcher's tags.
@@ -37,7 +37,7 @@ static TAG_WINDOW: UInt = 25
 /// The key the go outlet is attached under.
 static KEY_GO: UInt = 61
 
-/// One protection unit on every profile, so a split is grantable.
+/// One protection unit on every profile, so an allocation is grantable.
 static CHUNK: UInt = 0x1000
 
 /// The device view's length, carved whole.
@@ -78,7 +78,7 @@ func _start(boot_handle: UInt) {
 
     var carrier: PipeInlet? = None
     var go: PipeOutlet? = None
-    var ram: Memory? = None
+    var ram: Pool? = None
     var window: IoMemory? = None
     var going = true
     while going {
@@ -91,7 +91,7 @@ func _start(boot_handle: UInt) {
                 } else if tag == TAG_GO {
                     go = rec.take_outlet()
                 } else if tag == TAG_RAM {
-                    ram = rec.take_memory()
+                    ram = rec.take_pool()
                 } else if tag == TAG_WINDOW {
                     window = rec.take_iomemory()
                 }
@@ -134,8 +134,8 @@ func _start(boot_handle: UInt) {
         let _ = proc.exit(EXIT_MISMATCH)
         return
     }
-    let first_piece = try pool.split(len: CHUNK) catch {
-        print("SOS probe: first split failed: {}\n", error)
+    let first_piece = try pool.allocate(len: CHUNK) catch {
+        print("SOS probe: first allocation failed: {}\n", error)
         let _ = proc.exit(EXIT_MISMATCH)
         return
     }
@@ -170,13 +170,13 @@ func _start(boot_handle: UInt) {
 /// The charger's whole act: make one of each shared kind, charged here, and
 /// post them all to the launcher. Everything this frame holds is released when
 /// it returns.
-func charge(proc: &Process, out: PipeInlet, pool: Memory,
+func charge(proc: &Process, out: PipeInlet, pool: Pool,
             view: IoMemory) -> Result<UInt, SosStatus> {
     let made = try proc.pipe_create()
     let (made_in, made_out) = move made
     let _ = move made_out
-    let piece_a = try pool.split(len: CHUNK)
-    let piece_b = try pool.split(len: CHUNK)
+    let piece_a = try pool.allocate(len: CHUNK)
+    let piece_b = try pool.allocate(len: CHUNK)
     let carved = try view.carve(offset: 0, len: WINDOW_LEN)
 
     var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
@@ -213,9 +213,11 @@ func spend_pipes(proc: &Process) -> (UInt, Bool) {
     return (n + 1, quota)
 }
 
-/// `spend_pipes` for regions split off `pool`.
-func spend_pieces(pool: &Memory) -> (UInt, Bool) {
-    let piece = try pool.split(len: CHUNK) catch { return (0, is_quota(error)) }
+/// `spend_pipes` for regions allocated out of `pool`.
+func spend_pieces(pool: &Pool) -> (UInt, Bool) {
+    let piece = try pool.allocate(len: CHUNK) catch {
+        return (0, is_quota(error))
+    }
     let (n, quota) = spend_pieces(&pool)
     let _ = move piece
     return (n + 1, quota)

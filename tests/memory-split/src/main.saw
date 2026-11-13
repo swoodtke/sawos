@@ -1,7 +1,7 @@
-// The pool, split (spec §2.5). `split(len)` on a pool root mints a region over
-// `len` bytes of the pool (first fit from the pool's free list, else the front
-// cut) and the handle keeps naming the rest, so allocation is this call in a
-// loop. The transcript reads as three claims:
+// The pool, allocated from (spec §2.5). `allocate(len)` on a pool mints a
+// region over `len` bytes of the pool (first fit from the pool's free list,
+// else the front of its frontier) and the handle keeps naming the rest. The
+// transcript reads as three claims:
 //
 //   SOS split: a=170 b=187 a-again=170       <- the pieces are disjoint
 //                                               (0xaa, 0xbb, 0xaa; the bytes
@@ -9,8 +9,9 @@
 //   SOS split: cuts=20 refused=0             <- a dropped piece returns its
 //                                               slot, so the slab is not what a
 //                                               cursor runs into
-//   SOS: process fault: argument outside its domain
-//                                            <- an oversize cut is a fault
+//   SOS split: refused: this pool has no free range that long
+//                                            <- an oversize allocation is a
+//                                               status
 //
 // The second line: `CUT_ROUNDS` is more than the slab has slots
 // (`MAX_MEMORIES`), so completing them all with nothing refused is the
@@ -28,12 +29,11 @@
 // program faults until mapped; the pool is memory this image never declared and
 // the linker never heard of.
 //
-// The last line is deliberately a death. `BadArg` is a fault by the faults
-// rule, spec §5.7 (a caller that asks for more than it holds could have
-// checked), so the only way to assert it is to meet it, and a case that meets
-// a fault ends there. Everything above it has already been proven by then.
+// The last line is a status, `NoMemory`, and not a fault: a pool may be shared
+// with other holders, so what it holds is not something a caller can know when
+// it asks (spec §5.7). The program reports it and shuts down cleanly.
 
-import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, SosStatus}
 
 // The address of this program's first mapping: its config, per architecture, in
 // C because Saw cannot name an address. See `tests/poolbase_riscv32.c`.
@@ -60,6 +60,7 @@ static OVERSIZE: UInt = 0x0100_0000
 /// machine imposed.
 static CUT_ROUNDS: Int = 20
 
+static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 /// Write one byte through a mapping. `unsafe` because it names a pointer type,
@@ -90,7 +91,7 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let pool = record.take_memory() else {
+    guard let pool = record.take_pool() else {
         let _ = system.debug_print("SOS split: boot record is not a region\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -100,8 +101,8 @@ func _start(boot_handle: UInt) {
 
     // Cut one. The piece covers `[base, base + CHUNK)` and `pool` now names
     // everything after it.
-    let first = try pool.split(len: CHUNK) catch {
-        print("SOS split: first cut failed: {}\n", error)
+    let first = try pool.allocate(len: CHUNK) catch {
+        print("SOS split: first allocation failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -113,8 +114,8 @@ func _start(boot_handle: UInt) {
     poke(base, 0xAA)
 
     // Cut two, which lands where the cursor now points.
-    let second = try pool.split(len: CHUNK) catch {
-        print("SOS split: second cut failed: {}\n", error)
+    let second = try pool.allocate(len: CHUNK) catch {
+        print("SOS split: second allocation failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -138,18 +139,21 @@ func _start(boot_handle: UInt) {
     var cuts = 0
     var refused: UInt = 0
     while cuts < CUT_ROUNDS && refused == 0 {
-        match pool.split(len: CHUNK) {
+        match pool.allocate(len: CHUNK) {
             case Ok(_) -> { cuts = cuts + 1 },
             case Err(_) -> { refused = 1 },
         }
     }
     print("SOS split: cuts={} refused={}\n", cuts, refused)
 
-    // An oversize cut is a fault. The caller knows what it has split off;
-    // asking for more than it holds is a mistake it could have checked, so it
-    // ends here.
+    // An oversize allocation is a status: no free range is that long, and a
+    // pool's free state is not something its holder can know in advance.
     let _ = system.debug_print("SOS split: asking for more than is left\n")
-    let _ = pool.split(len: OVERSIZE)
+    let _over = try pool.allocate(len: OVERSIZE) catch {
+        print("SOS split: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_OK)
+        return
+    }
 
     let _ = system.debug_print("SOS split: UNREACHABLE\n")
     let _ = system.shutdown(EXIT_FAILED)

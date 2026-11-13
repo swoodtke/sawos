@@ -19,12 +19,12 @@
 // for execute. One handle, two asks, one refusal: the difference is the bit.
 //
 // This is capability flow, not identity. The kernel never asks who is calling.
-// Root maps executable because root's boot pool root carries the bit
-// (`memory_rights()` mints it, and has to: attenuation is monotonic, so a bit
-// not minted at boot could never appear later); the sibling cannot because the
-// mask that made it left the bit out. "Only root maps executable" is something
-// a launcher arranges once, at the mint where it hands memory over, not a rule
-// enforced per call.
+// Root maps executable because root's boot pool carries the bit and hands it
+// down (`pool_rights()` mints it, and has to: attenuation is monotonic, so a
+// bit not minted at boot could never appear later); the sibling cannot
+// because the mask that made it left the bit out. "Only root maps executable"
+// is something a launcher arranges once, at the mint where it hands memory
+// over, not a rule enforced per call.
 //
 // The mask below is what a launcher would write for a driver child's RAM,
 // applied to a sibling root keeps. That is the only way to observe the refusal
@@ -37,7 +37,7 @@
 // writable and executable". They are two cases because each is a fault and a
 // fault ends the process.
 
-import sos.{System, Process, Memory, Mapping, MapAccess, MemoryRight,
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, MemoryRight,
             SosStatus}
 
 /// One page of the pool, which is the smallest thing either profile grants.
@@ -77,13 +77,13 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let pool = pool_record.take_memory() else {
-        let _ = system.debug_print("SOS execgate: pool record is not a region\n")
+    guard let pool = pool_record.take_pool() else {
+        let _ = system.debug_print("SOS execgate: pool record is not a pool\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let page = try pool.split(len: CHUNK) catch {
-        print("SOS execgate: split failed: {}\n", error)
+    let page = try pool.allocate(len: CHUNK) catch {
+        print("SOS execgate: allocation failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

@@ -1,0 +1,119 @@
+// A pool with nothing out is held by what names it and freed when nothing
+// does (spec §2.5, §2.10), read as room in the Memory slab.
+//
+//   SOS poolfreed: held only by a staged message: room grew by 0
+//   SOS poolfreed: nothing names it, nothing out: room grew by 1
+//   SOS poolfreed: done
+//
+// The case types its child's image blob as a second pool and never runs the
+// child: the blob pool is the one whose life is read, and nothing is ever
+// allocated from it. The RAM pool is the measure, as in `pool-lifetime`: root
+// fills the slab with pages out of it, staged in messages on a connection
+// nobody takes from, until an allocation answers `NoResource`, and closes the
+// connection to give them back.
+//
+// Root moves the blob pool's only handle into a message on a connection of
+// its own. The staged message is a reference, so the pool's slot stays and the
+// room is what it was. Closing that connection releases the message's handle,
+// the last thing naming the pool, and with nothing allocated from it the pool
+// frees at once: one slot more.
+
+import sos.{System, Process, Pool, PipeHandles, SosStatus, PIPE_BODY_BYTES,
+            PIPE_MSG_HANDLES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static PAGE: UInt = 0x1000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poolfreed: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS poolfreed: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poolfreed: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var blob_rec = try proc.boot_handle_next()
+    var dest_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    guard let blob = blob_rec.take_pool() else { return BUG }
+    guard let dest = dest_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    // No child runs here, so its destination is not needed and its slot is
+    // given back before anything is counted.
+    let _ = move dest
+
+    let before = try fill(&proc, &pool)
+
+    let pipe = try proc.pipe_create()
+    let (inlet, outlet) = move pipe
+    var carrier = PipeHandles.none()
+    carrier.put(at: 0, pool: move blob)
+    let body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try inlet.post_with(body: &body, len: 0, handles: &var carrier)
+    let _ = move claim
+    let staged = try fill(&proc, &pool)
+    print("SOS poolfreed: held only by a staged message: room grew by {}\n",
+          staged - before)
+
+    let _ = move outlet
+    let _ = move inlet
+    let freed = try fill(&proc, &pool)
+    print("SOS poolfreed: nothing names it, nothing out: room grew by {}\n",
+          freed - before)
+    return
+}
+
+/// Allocate pages out of `pool` until one is `NoResource`, staging them in
+/// messages on a connection nobody takes from, and answer how many it got.
+/// Any other refusal is returned. The pages go back when the connection
+/// closes.
+func fill(proc: &Process, pool: &Pool) -> Result<Int, SosStatus> {
+    let pipe = try proc.pipe_create()
+    let (inlet, outlet) = move pipe
+    let body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var carrier = PipeHandles.none()
+    var in_carrier: Int = 0
+    var count: Int = 0
+    var going = true
+    while going {
+        match pool.allocate(len: PAGE) {
+            case Ok(piece) -> {
+                carrier.put(at: in_carrier, memory: move piece)
+                in_carrier = in_carrier + 1
+                count = count + 1
+                if in_carrier == PIPE_MSG_HANDLES {
+                    let claim = try inlet.post_with(body: &body, len: 0,
+                                                    handles: &var carrier)
+                    let _ = move claim
+                    in_carrier = 0
+                }
+            },
+            case Err(why) -> {
+                match why {
+                    case NoResource -> { going = false },
+                    case _ -> { return why },
+                }
+            },
+        }
+    }
+    let _ = move carrier
+    let _ = move outlet
+    let _ = move inlet
+    return count
+}

@@ -15,7 +15,8 @@
 //! declaration, one file, and the typed layer above calls the named seams.
 
 import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
-               InterruptOp, ClockOp, TimerOp, MemoryOp, IoMemoryOp, MappingOp,
+               InterruptOp, ClockOp, TimerOp, MemoryOp, PoolOp, IoMemoryOp,
+               MappingOp,
                PipeInletOp, PipeOutletOp, PipeReplyOp, PipeRequestOp,
                RELEASE_OP, MINT_OP, INFO_OP, HandleInfo, HandleKind}
 
@@ -258,18 +259,18 @@ public func sos_system_process_by_pid(
                  value_out)
 }
 
-/// Give the kernel a Memory region to back the slab `kind` names.
+/// Give the kernel a Pool or a Memory region to back the slab `kind` names.
 /// Requires `SystemRight.SlabDonate`.
 ///
-/// The region's capability is consumed on success, and no op gives a donated
-/// range back. `kind` is a `SlabKind`.
+/// The capability is consumed on success, and no op gives a donated range
+/// back. `kind` is a `SlabKind`.
 ///
 /// A kind that is not a `SlabKind`, a handle that names nothing or names
-/// something that is not a Memory, and a region the kernel cannot safely absorb
-/// (one with a sibling handle, one with an installed mapping row, or a pool
-/// root with pieces still on loan) are all faults: the caller minted the
-/// siblings, installed the rows and cut the pieces, so each is something it
-/// could have checked. A region too small to hold one slot of that kind, a
+/// neither a Pool nor a Memory, and memory the kernel cannot safely absorb
+/// (one with a sibling handle, an allocation with an installed mapping row,
+/// or a pool with allocations still out) are all faults: the caller minted the
+/// siblings, installed the rows and allocated the pieces, so each is something
+/// it could have checked. A region too small to hold one slot of that kind, a
 /// slab whose extent chain is already full, and a donation that would take the
 /// kind past its machine-wide ceiling are `SosStatus.NoResource`, a status; the
 /// donation did not happen, so the caller's handle is untouched.
@@ -689,21 +690,59 @@ public func sos_timer_disarm(handle: UInt) -> UInt {
 // Memory, IoMemory and Mapping (spec §2.5)
 // -----------------------------------------------------------------------------
 //
-// Five ops across three kinds. Each memory kind has a derivation verb and an
-// install verb, and the third kind is what an install produces. The verbs
-// differ because the kinds do: a split consumes what it hands out and a carve
-// does not.
+// Seven ops across four kinds. A pool allocates and reports what it could; an
+// allocation is cut and installed; a device window is carved and installed;
+// and a Mapping is what an install produces. The derivation verbs differ
+// because the kinds do: an allocation and a split consume what they hand out
+// and a carve does not.
 
-/// Split: cut a `len`-byte piece out of a region. Requires
+/// Allocate: a new Memory over `len` bytes of this pool, made of units of
+/// `granularity` (zero names the pool's finest accepted one). Requires
+/// `PoolRight.Allocate`.
+///
+/// Served first fit from the pool's free list, and only when no free range
+/// holds it, off the front of the pool's unspent frontier. A granularity the
+/// pool does not accept, a `len` of zero and a `len` that is not a multiple of
+/// the granularity terminate the caller with `BadArg`. A caller at its Memory
+/// or handle quota gets `SosStatus.QuotaExceeded`; a pool with no free range
+/// that long is `SosStatus.NoMemory`; a full Memory slab or handle table is
+/// `SosStatus.NoResource`.
+@export("sos_pool_allocate")
+public func sos_pool_allocate(handle: UInt, len: UInt, granularity: UInt,
+                              value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, PoolOp.Allocate as UInt, len, granularity, 0,
+                 value_out)
+}
+
+/// Available: what this pool could allocate at `granularity` (zero names the
+/// finest it accepts), as a record copied into `buf`. Requires
+/// `PoolRight.Allocate`.
+///
+/// `cap` is the buffer's size in bytes and must be at least
+/// `pool_available_record_bytes()`. The record's layout is public: word 0 the
+/// bytes free, word 1 the longest allocation that could be served, word 2 the
+/// granularities the pool accepts as a bit set. The first two are a snapshot.
+/// A granularity the pool does not accept, a short `cap`, and a buffer that is
+/// misaligned or outside the caller's writable memory terminate the caller.
+@export("sos_pool_available")
+public func sos_pool_available(handle: UInt, granularity: UInt,
+                               buf: UnsafePointer<UInt>,
+                               cap: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, PoolOp.Available as UInt, granularity, buf as UInt,
+                 cap, (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Split: cut a `len`-byte piece out of an allocation. Requires
 /// `MemoryRight.Split`.
 ///
-/// On a pool root the piece is served first fit from the root's free list
-/// (ranges released pieces gave back), and only when no free range can hold
-/// it, off the front of the root's unspent frontier. On any other region it
-/// comes off the front and the parent becomes the remainder. `len` must be a
-/// non-zero multiple of the target's protection granularity, and the region
-/// must be able to serve it as one range; anything else terminates the caller
-/// with `BadArg`, including a root whose free bytes are too fragmented to
+/// On an allocation minted at boot the piece is served first fit from the
+/// allocation's own free list (ranges released pieces gave back), and only
+/// when no free range can hold it, off the front of its unspent frontier. On
+/// an allocation a pool made it comes off the front and the parent becomes
+/// the remainder. `len` must be a non-zero multiple of the target's protection
+/// grain, and the region must be able to serve it as one range; anything else
+/// terminates the caller with `BadArg`, including free bytes too fragmented to
 /// serve it, which the caller cannot compute. A caller at its Memory or handle
 /// quota gets `SosStatus.QuotaExceeded`; a full Memory slab or handle table is
 /// `SosStatus.NoResource`.

@@ -22,7 +22,7 @@
 // has no word to hand.
 
 import sos.{System, SosStatus, SlabKind, sos_handle_release,
-            sos_memory_split, sos_process_boot_handle_next,
+            sos_pool_allocate, sos_process_boot_handle_next,
             sos_process_get_status, sos_process_start,
             sos_process_waiter_create, sos_system_process_create,
             sos_system_slab_donate, sos_thread_yield, sos_waiter_add}
@@ -64,7 +64,7 @@ func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
     // Rows: the child's image, the RAM it runs in, then the pool the two
-    // donations are cut from.
+    // donations are allocated from.
     let image = next_region_word(BOOT_PROCESS_WORD)
     let dest = next_region_word(BOOT_PROCESS_WORD)
     let pool = next_region_word(BOOT_PROCESS_WORD)
@@ -166,10 +166,11 @@ func fill_quiet(system: UInt, image: UInt, dest: UInt, holder: UInt,
     attached
 }
 
-/// A page cut off the front of `pool`, or 0.
+/// A page allocated out of `pool`, or 0.
 func cut(pool: UInt) unsafe -> UInt {
     var piece: UInt = 0
-    let status = sos_memory_split(pool, CHUNK, (&var piece) as UnsafePointer<UInt>)
+    let status = sos_pool_allocate(pool, CHUNK, 0,
+                                   (&var piece) as UnsafePointer<UInt>)
     if status != STATUS_OK {
         return 0
     }

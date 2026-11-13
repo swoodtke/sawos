@@ -6,10 +6,11 @@
 // and its stack, inside its copy-out window. The child parks a wait with its
 // record over the image's second segment record, on a Waiter fed by a Timer of
 // root's. Root writes a two-segment image into the piece, arms the Timer and
-// creates a process from the piece into the pool. The first segment is a long
-// zero-filled tail, so its placement takes many preemption points, and a fire
-// that comes due during it is delivered there: the wait record lands on the
-// image while the kernel is between its two segments.
+// creates a process from the piece into an allocation out of the pool. The
+// first segment is a long zero-filled tail, so its placement takes many
+// preemption points, and a fire that comes due during it is delivered there:
+// the wait record lands on the image while the kernel is between its two
+// segments.
 //
 //   SOS imgreread: a record landed during placement: created
 //   SOS imgreread: done
@@ -22,7 +23,7 @@
 // the image of a create that succeeded. Which attempt that is depends on the
 // host and is not printed.
 
-import sos.{System, Process, Memory, Mapping, Waiter, Timer, Clock,
+import sos.{System, Process, Memory, Pool, Mapping, Waiter, Timer, Clock,
             ClockType, MapAccess, SosStatus, SystemRight}
 
 static EXIT_OK: UInt = 0
@@ -119,13 +120,18 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var pool_rec = try proc.boot_handle_next()
     guard let image = image_rec.take_memory() else { return BUG }
     guard let ram = ram_rec.take_memory() else { return BUG }
-    guard let pool = pool_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    // The second child's destination: one region-sized allocation out of the
+    // pool, placed into on every attempt. The pool's handle goes at once, to
+    // keep root's table within its rows; the allocation holds the pool.
+    let landing = try pool.allocate(len: REGION_LEN)
+    let _ = move pool
 
     let clock = try system.clock_get(type: ClockType.Monotonic)
     var delay = FIRST_DELAY_NS
     var attempt: Int = 0
     while attempt < MAX_ATTEMPTS {
-        let outcome = try attempt_once(&system, &proc, &image, &ram, &pool,
+        let outcome = try attempt_once(&system, &proc, &image, &ram, &landing,
                                        &clock, delay)
         if outcome == OUTCOME_LANDED {
             print("SOS imgreread: a record landed during placement: created\n")
@@ -232,7 +238,7 @@ func ended_with(proc: &Process, child: &Process,
 /// One attempt: a fresh child parked with its record over the image's second
 /// segment record, the Timer armed with `delay`, and the create.
 func attempt_once(system: &System, proc: &Process, image: &Memory,
-                  ram: &Memory, pool: &Memory, clock: &Clock,
+                  ram: &Memory, landing: &Memory, clock: &Clock,
                   delay: UInt64) -> Result<Int, SosStatus> {
     let dst = try ram.split(len: REGION_LEN)
     let child = try system.process_create(image: &image, memory: &dst)
@@ -241,7 +247,7 @@ func attempt_once(system: &System, proc: &Process, image: &Memory,
     let _ = move front
     let _ = move dst
 
-    let target = try base_of(&proc, &pool)
+    let target = try base_of(&proc, &landing)
     let own = try proc.map(memory: &hole, access: RW)
     let at = try own.base()
     write_image(at, target)
@@ -273,7 +279,7 @@ func attempt_once(system: &System, proc: &Process, image: &Memory,
     let _ = me.yield_now()
 
     try timer.arm(after_ns: delay)
-    let made = system.process_create(image: &hole, memory: &pool)
+    let made = system.process_create(image: &hole, memory: &landing)
     let landed = try landed_on(&proc, &hole)
     var outcome = OUTCOME_LATE
     match made {

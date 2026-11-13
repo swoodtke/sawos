@@ -29,7 +29,7 @@
 // Each leg is a function of its own, for the reason `tests/memory-recycle`
 // gives about root's stack.
 
-import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus}
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, SosStatus}
 
 /// One protection unit's worth on either profile, and two of them.
 static PAGE: UInt = 0x1000
@@ -72,11 +72,11 @@ func cut_through(system: &System, region: &Memory) -> Result<Void, SosStatus> {
 
 /// Cut the whole region off and drop the piece, then take a fresh piece out of
 /// the pool and say whether it is the bytes `first_base` still reaches.
-func recycle(proc: &Process, region: &Memory, pool: &Memory,
+func recycle(proc: &Process, region: &Memory, pool: &Pool,
              first_base: UInt) -> Result<Bool, SosStatus> {
     let whole = try region.split(len: TWO_PAGES)
     let _ = move whole
-    let fresh = try pool.split(len: TWO_PAGES)
+    let fresh = try pool.allocate(len: TWO_PAGES)
     let mapping = try proc.map(memory: &fresh, access: RW)
     let base = try mapping.base()
     poke(base, OTHER)
@@ -107,8 +107,8 @@ func report_home(system: &System, carries: Bool) {
 
 /// Take a piece the size of the husk and say whether it carries the mark the
 /// first mapping wrote.
-func carries_mark(proc: &Process, pool: &Memory) -> Result<Bool, SosStatus> {
-    let again = try pool.split(len: TWO_PAGES)
+func carries_mark(proc: &Process, pool: &Pool) -> Result<Bool, SosStatus> {
+    let again = try pool.allocate(len: TWO_PAGES)
     let mapping = try proc.map(memory: &again, access: RW)
     let base = try mapping.base()
     let carries = peek(base) == MARK
@@ -117,8 +117,8 @@ func carries_mark(proc: &Process, pool: &Memory) -> Result<Bool, SosStatus> {
 }
 
 func run(system: &System, proc: &Process,
-         pool: &Memory) -> Result<Void, SosStatus> {
-    let region = try pool.split(len: TWO_PAGES)
+         pool: &Pool) -> Result<Void, SosStatus> {
+    let region = try pool.allocate(len: TWO_PAGES)
     let first = try proc.map(memory: &region, access: RW)
     let first_base = try first.base()
     poke(first_base, MARK)
@@ -151,9 +151,9 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let pool = pool_record.take_memory() else {
+    guard let pool = pool_record.take_pool() else {
         let _ = system.debug_print(
-            "SOS splitmap: pool record is not a region\n")
+            "SOS splitmap: pool record is not a pool\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

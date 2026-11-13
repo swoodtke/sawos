@@ -16,7 +16,7 @@
 //    objects").
 //
 // 2. The donation is ordinary memory. A page is cut out of root's pool with
-//    `split` and handed to `SystemOp.SlabDonate`. It is consumed: `move
+//    `allocate` and handed to `SystemOp.SlabDonate`. It is consumed: `move
 //    scratch` at the call site says so, and there is no way to get it back.
 //
 // 3. The ceiling moved. The same call that was refused now succeeds.
@@ -36,7 +36,7 @@
 // A failure prints and shuts down with a non-zero status, so a broken case
 // cannot pass quietly.
 
-import sos.{System, Process, Memory, Waiter, Event, EventMode, WaitResult,
+import sos.{System, Process, Memory, Pool, Waiter, Event, EventMode, WaitResult,
             SlabKind, SosStatus}
 
 /// One protection unit's worth on either profile; comfortably more than one
@@ -80,8 +80,9 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let pool = pool_record.take_memory() else {
-        let _ = system.debug_print("SOS slabdonate: pool record is not a region\n")
+    guard let pool = pool_record.take_pool() else {
+        let _ = system.debug_print(
+            "SOS slabdonate: pool record is not a pool\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -126,7 +127,7 @@ func _start(boot_handle: UInt) {
     }
 
     // ---- Claim 2: the donation ------------------------------------------
-    let scratch = try pool.split(len: PAGE) catch {
+    let scratch = try pool.allocate(len: PAGE) catch {
         print("SOS slabdonate: no page to donate: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return

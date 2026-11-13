@@ -1,0 +1,169 @@
+//! Pool: RAM not yet allocated, and the two ops it owns (spec §2.5).
+//!
+//! It imports the floor and `sos.memory`, because `allocate` answers with a
+//! `Memory`, and no other `sos` module.
+//!
+//! A pool is a capability rather than a description, as a region is: there is
+//! no way to read its bounds. What a holder may learn is what it could
+//! allocate (`available`), and what it gets back from `allocate` is another
+//! capability.
+
+import sosabi.{SosStatus, PoolHandle, PoolOp, MemoryHandle, MINT_OP, NO_HANDLE,
+               POOL_AVAILABLE_RECORD_WORDS, POOL_AVAILABLE_TOTAL_WORD,
+               POOL_AVAILABLE_LARGEST_WORD, POOL_AVAILABLE_GRANULARITIES_WORD,
+               pool_available_record_bytes}
+
+import sos.floor.{ALL_RIGHTS, call_value, checked, sos_handle_release,
+                  sos_pool_available, handle_rights}
+import sos.memory.{Memory}
+
+/// A handle to a Pool: RAM an allocation is made from.
+///
+/// §2.5's unallocated memory. Root receives the build's pools at boot through
+/// `Process.boot_handle_next`, allocates `Memory` out of them with `allocate`,
+/// and can give a pool, or a narrowed sibling of one, to a child, which then
+/// holds a byte budget of its own: it can allocate no more than the pool
+/// holds, and what it releases it can allocate again.
+///
+/// A pool is never mapped, never run in and never passed to
+/// `System.process_create`: there is no method here that could, and the
+/// kernel answers no `Memory` op on one.
+///
+/// Built by `Process.boot_handle_next` (`BootHandle.take_pool`), `mint`, a
+/// message's handle decode in `sos.pipe`, and a refused `System.slab_donate`
+/// handing the pool back: no word constructor, no word extractor.
+///
+/// `NoCopy`, and dropping it releases the handle. A pool whose handles are all
+/// gone stays while anything allocated from it is out, and goes once the last
+/// allocation has come home.
+public struct Pool {
+    public(package) handle: PoolHandle,
+}
+
+extension Pool: NoCopy {
+    /// Drop is release; see `System`'s deinit for the sentinel and the discard.
+    func deinit(&var self) {
+        if self.handle != NO_HANDLE {
+            let _ = sos_handle_release(self.handle)
+        }
+    }
+}
+
+/// What `Pool.available` answers: three plain numbers about a pool.
+///
+/// `total` and `largest` are for the granularity asked about and are a
+/// snapshot: another holder of the pool, or another thread of this process,
+/// can change both before the caller acts on them. `largest` is the longest
+/// `allocate` at that granularity would serve at the moment of the call, and
+/// zero when it would serve none. `granularities` is the set the pool accepts,
+/// as a bit set (bit `n` set: `2^n` bytes accepted); it is never empty, its
+/// lowest set bit is the granularity zero names, and it does not change over
+/// the pool's life.
+public struct PoolAvailable {
+    total: UInt,
+    largest: UInt,
+    granularities: UInt,
+}
+
+extension Pool {
+    /// This handle's rights word, read from the kernel (`INFO_OP`), to test
+    /// against `PoolRight` bits. The same terms as `Memory.rights`.
+    public func rights(&self) -> Result<UInt32, SosStatus> {
+        handle_rights(self.handle)
+    }
+
+    /// Allocate `len` bytes out of this pool, as a new `Memory`. Requires
+    /// `PoolRight.Allocate`.
+    ///
+    /// The bytes are the front of the lowest-addressed free range that holds
+    /// `len`, and only when none does, the front of the pool's unspent
+    /// frontier. They leave the pool until the allocation comes home: its
+    /// last handle and its last grant row gone, it returns to this pool whole.
+    ///
+    /// `granularity` is the unit the allocation is made of: its base and its
+    /// length are multiples of it. Zero names the pool's finest accepted
+    /// granularity, and any other value must be one of the set `available`
+    /// answers. `len` must be a non-zero multiple of it. Each of those
+    /// refusals terminates the caller with `BadArg`, since the caller can read
+    /// the set first.
+    ///
+    /// The allocation carries this handle's rights intersected with the bits
+    /// a `Memory` has, capped by the caller's `Memory` ceiling: a pool sibling
+    /// minted without `MapExecute` allocates memory that cannot be mapped
+    /// executable either.
+    ///
+    /// A caller at its Memory or handle quota gets `SosStatus.QuotaExceeded`.
+    /// A pool with no free range that long is `SosStatus.NoMemory`, whether it
+    /// holds too few free bytes or holds them only in shorter ranges: a pool
+    /// may be shared, so its free state is not something the caller can know
+    /// when it calls. A full Memory slab or handle table is
+    /// `SosStatus.NoResource`. A refusal changes nothing in the pool.
+    public func allocate(&self, len: UInt,
+                         granularity: UInt = 0) -> Result<Memory, SosStatus> {
+        let raw = try call_value(self.handle, PoolOp.Allocate as UInt, len,
+                                 granularity, 0)
+        return Memory(handle: MemoryHandle(raw))
+    }
+
+    /// What this pool could allocate right now at `granularity` (zero names
+    /// the finest it accepts), and the granularities it accepts. Requires
+    /// `PoolRight.Allocate`: a handle narrowed below it learns nothing of what
+    /// the pool holds.
+    ///
+    /// A granularity the pool does not accept terminates the caller with
+    /// `BadArg`; zero is always accepted, so reading the set is the call that
+    /// cannot fault on it. The answer changes nothing in the pool. See
+    /// `PoolAvailable` for what each number means.
+    public func available(
+        &self, granularity: UInt = 0
+    ) -> Result<PoolAvailable, SosStatus> {
+        available_into_frame(self.handle, granularity)
+    }
+
+    /// Mint a sibling of this pool handle, narrowed by a keep mask: the
+    /// universal `MINT_OP`, on `System.mint`'s exact terms. Requires the
+    /// universal `PoolRight.Mint` on this handle.
+    ///
+    /// This is where a launcher's memory policy is written when it hands out
+    /// a budget rather than an allocation. Everything allocated through the
+    /// sibling carries no more than the sibling holds:
+    ///
+    /// ```saw
+    /// let for_child = pool.mint(rights: PoolRight.Transfer
+    ///                                   | PoolRight.Allocate
+    ///                                   | PoolRight.Map)!
+    /// child.give(pool: move for_child, tag: RAM,
+    ///            keep: PoolRight.Allocate | PoolRight.Map)
+    /// ```
+    ///
+    /// That child can allocate, map, read and write its memory, can never
+    /// execute from it, and cannot give its allocations on: the pool handle it
+    /// holds carries neither `MapExecute` nor `Transfer`, so nothing it
+    /// allocates does.
+    ///
+    /// The mask must keep `Transfer` if the sibling is to be given; the give's
+    /// own keep mask is where the child's entry drops it. A caller
+    /// at its handle quota gets `SosStatus.QuotaExceeded` and a full handle
+    /// table is `SosStatus.NoResource`; a handle without `Mint` terminates the
+    /// caller.
+    public func mint(&self,
+                     rights: UInt32 = ALL_RIGHTS) -> Result<Pool, SosStatus> {
+        let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
+        return Pool(handle: PoolHandle(raw))
+    }
+}
+
+/// The `unsafe` half of `Pool.available`, confined to one small named helper.
+/// The record buffer's address never leaves it.
+func available_into_frame(
+    handle: PoolHandle, granularity: UInt
+) unsafe -> Result<PoolAvailable, SosStatus> {
+    var buf: [UInt; POOL_AVAILABLE_RECORD_WORDS] = (
+        [0; POOL_AVAILABLE_RECORD_WORDS])
+    try checked(sos_pool_available(handle, granularity,
+                                   (&var buf) as UnsafePointer<UInt>,
+                                   pool_available_record_bytes() as UInt))
+    return PoolAvailable(total: buf[POOL_AVAILABLE_TOTAL_WORD],
+                         largest: buf[POOL_AVAILABLE_LARGEST_WORD],
+                         granularities: buf[POOL_AVAILABLE_GRANULARITIES_WORD])
+}
