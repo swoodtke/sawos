@@ -747,6 +747,22 @@ a reply delivery carries, which is why there is one type and not two — and
   granted region reads somebody else). A copy-in length is checked for
   equality rather than "at least": a capacity may be over-provisioned, but an
   inbound length is the caller's statement of what it is handing over.
+  **Neither door copies through memory the process may execute** (not yet
+  enforced): a buffer in a grant row that permits execute is `BadBuffer`,
+  whichever door, even a string kept beside the code, and a segment both
+  writable and executable, which the loader accepts (§2.5), is no buffer
+  either. So every board links a program's read-only data as a segment of
+  its own, readable and neither writable nor executable, which is where its
+  string literals are (not yet built: every user linker script puts them in
+  the code's segment). The segment costs one grant row, which every board's
+  budget affords. On the isolated profiles it keeps a program's constants,
+  its jump tables among them, unwritable by the program itself; on a flat one
+  it keeps them out of executable memory, so they are a legal source, and
+  nothing stops the process writing them where they sit in RAM (§5b.1). The
+  copy-in window also takes in a process's in-place read-only segments
+  (§5.6; not yet built), so a literal used in place is a source. On the
+  ESP32-S3 the rule also keeps the kernel from a byte load in the flash
+  instruction window, which the part refuses.
 - **Attach semantics:** **level-triggered** (keeps reporting ready until the
   waiter handles it — no lost edges); attachments are **persistent by
   default** with explicit `remove(key)` (by key, never by the waitable's
@@ -1265,7 +1281,11 @@ three groups:
   process's handle these ops answer `Revoked` (§2.10), after the rights and
   argument checks. `ThreadCreate` answers it before the entry and stack are
   checked, because that check reads the named process's address space and a
-  `Gone` process has no body. A thread created in a `Created` child is inert:
+  `Gone` process has no body. A thread's stack top must lie in the process's
+  region and its entry in a row of its grant that permits execute, which an
+  in-place code segment outside the region is (§5.6; the entry rule not yet
+  enforced, the entry checked against the region instead). A thread created
+  in a `Created` child is inert:
   `ThreadOp.Start` on it is a `BadState` fault until the child has been
   started, and the launcher starts it after `ProcessOp.Start`.
 - **`Exit`, `ThreadSelf` and `BootHandleNext` are self-only**: through a handle
@@ -1649,6 +1669,8 @@ a whole.
   and capacity is policy, decided by the deployment rather than by the build.
   The region must have no live mappings and no sibling references (`BadState`
   otherwise): the kernel never shares slab backing with user-reachable memory.
+  A region over memory the board cannot give a process, such as flash, is a
+  `BadArg` fault (not yet enforced).
 - **`InterruptBind`** binds a line to a new Interrupt and places its one handle
   in the caller's table. A line is a machine-wide resource, which is why the op
   is here, and the bind has no Interrupt quota row (§2.9); its handle is
@@ -2502,6 +2524,18 @@ not about SOS** (§5b.1):
   riscv32-virt keeps one linker script per resident child image for precisely
   that reason, deliberately, so the two HAL directories side by side are the
   tier split.
+- **A segment can already be where it is linked.** An image that sits at a
+  fixed place and is linked for that place needs no copy, and the loader uses
+  such a segment in place (§5.6; not yet built). `hal.same_bytes(link, at,
+  len)` says whether the user address `link` names the bytes the kernel reads
+  at `at`: the same number on the riscv32 boards; on the ESP32-S3 also an
+  instruction-window address and the data-window address of the same flash
+  byte, since the part maps its flash at both windows; and never on arm64,
+  where a user address names what a translation table maps and the kernel
+  maps no image page, so every segment there is copied (not yet enforced).
+  The rule holds on the ESP32-C3, but nothing in its build links a segment
+  where its image sits: its kernel reads images in the flash instruction
+  window and its processes are linked in SRAM, so they are copied (§11).
 - **The kernel above the seam does not know which of those it is on.**
   `GrantRow` carries a user VA range and the physical base it translates to;
   on a non-translating profile the two are asserted equal, so the identity
@@ -2545,6 +2579,37 @@ Everything else derives from those handles.
   the same unit. Blade reads ELF32 and ELF64. Image addresses are 64-bit fields
   on every profile, and a 32-bit kernel refuses an entry or segment address that
   does not fit its machine word (`fits_target_word`) rather than narrowing it.
+- **A segment already where it is linked is used in place** (not yet
+  enforced). The loader asks `hal.same_bytes` (§5.5) whether a segment's link
+  address names the segment's own bytes in the image. If it does, nothing is
+  copied and the segment's grant names the image's bytes. Such a segment must
+  be readable and not writable, its `mem_len` must equal its `file_len`, and
+  its grant, rounded up to the grain, must stay inside the image; its bytes
+  are inside the image already, because every segment's file range is held
+  to the image before this is asked. Every other segment is copied into the
+  destination region and judged against it, so a launcher's destination needs
+  room only for what is copied and the stack, and the kernel still allocates
+  nothing. A board may refuse a segment linked where its buses cannot serve
+  it (`hal.segment_bus_ok`; every other board accepts every address). On the
+  ESP32-S3 an executable segment must be in place in the flash instruction
+  window and not writable, a read-only segment in place in the flash data
+  window or copied to DRAM, and a writable one copied to DRAM. The entry is
+  checked, as built, against the executable segments by its own address, and
+  only so, since code in place lies outside the destination region (not yet
+  enforced: the entry is also checked against the region). A destination
+  must be memory the board can give a process (`hal.map_source_ok`), so a
+  `Memory` over flash is an image source and never a destination:
+  `ProcessCreate` answers a flash destination `BadImage`, a status as for
+  its other refused destinations, because a launcher cannot read a region's
+  bounds (§2.5).
+- **The build puts each resident image where it is linked** (not yet built).
+  On the ESP32-S3 the kernel's link script gives root's image and a child's
+  fixed slots in flash. A user linker script links the code at its slot's
+  instruction-window address plus the length of the image's header and
+  segment table, and the read-only data directly behind the code, at the
+  data-window address of the same flash bytes. The build reads each image
+  back and fails when a segment's link address is not where its bytes sit in
+  flash, and a mismatch the build missed is refused at load, never run.
 - **The build also emits a region table** (§12), the second boot input the
   kernel reads. Its header carries the boot flags: the build's options to the
   kernel, since no board hands a kernel a command line.
@@ -2885,7 +2950,7 @@ can ask about (`SystemOp.TierGet`, §2.8):
 | riscv32 `virt`, flat build profile | 3 | yes — a third run | a module swap over the same board: `prot_*` no-ops, PMP opened with one TOR entry, `prot_isolated()` false. No new toolchain, and the tier-3 story's test target |
 | ESP32-C3 | 2, at the floor | no — a gating board smoke (`make sos-smoke-esp32c3`) | 16 PMP entries exactly, 400 KB SRAM; XIP is the entry price |
 | ESP32-P4 | 2 | no — no QEMU machine yet | 32 PMP + 16 PMA, 768 KB; the first real tier-2 part |
-| ESP32-S3 (Xtensa LX7, call0) | 3, `Flat` | no — a board smoke (`make sos-smoke-esp32s3`) | the core has no privilege (PS.UM picks a vector, not a permission), so the `prot_*` seam installs nothing and `prot_isolated()` is false; the off-core WORLD0/1 controller is unused. Processes are Blade-built images at fixed IRAM link addresses, one per resident image as on riscv32, and run the gate's own programs. An interrupt line holds one of the board's nine device CPU interrupts (`DEVICE_CPU_INT_COUNT`) while it is unmasked and may lose it to another line once masked, so the limit is at most nine lines unmasked at once, never a count of lines ever bound; the Interrupt slab (`MAX_INTERRUPTS`) stays below it, so a bind meets the slab's `NoResource` first. `hal/xtensa-esp32s3/` |
+| ESP32-S3 (Xtensa LX7, call0) | 3, `Flat` | no — a board smoke (`make sos-smoke-esp32s3`) | the core has no privilege (PS.UM picks a vector, not a permission), so the `prot_*` seam installs nothing and `prot_isolated()` is false; the off-core WORLD0/1 controller is unused. Processes are Blade-built images at fixed link addresses, one per resident image as on riscv32, and run the gate's own programs from flash: code in place in the flash instruction window, read-only data in place in the data window, and only writable memory copied, to DRAM, where the kernel also grants the stack (§5.6; not yet built). A `map` with execute succeeds and its row is recorded, but a region is at DRAM addresses, where the part fetches no instruction (§11). An interrupt line holds one of the board's nine device CPU interrupts (`DEVICE_CPU_INT_COUNT`) while it is unmasked and may lose it to another line once masked, so the limit is at most nine lines unmasked at once, never a count of lines ever bound; the Interrupt slab (`MAX_INTERRUPTS`) stays below it, so a bind meets the slab's `NoResource` first. `hal/xtensa-esp32s3/` |
 
 **Two words and not three.** `Isolated` and `Flat`; MMU-vs-MPU is not
 advertised, because slot pricing and the `map` answer are already the visible
@@ -3563,6 +3628,16 @@ loader parses and reports while no process stores either.
   loader's `allow_device: true` door, dormant) (§2.5): its emitter is
   sawlang-side, so deleting it is a toolchain-pin event.
 - **The tier-2 mapping quota price** (`DEFAULT_QUOTA_MAPPINGS`, §5b.1).
+- **Executable memory refused as a buffer** (§2.2): the copy doors' check,
+  and read-only data as a segment of its own in every board's user linker
+  scripts. Until it is built a buffer in a process's code segment is copied
+  through, and its string literals share that segment.
+- **Segments used in place** (§5.5, §5.6): the loader's in-place branch and
+  its checks, the board bus rule, the copy-in window over in-place segments,
+  the entry rule for threads, the refusal of a flash destination or
+  donation, and the ESP32-S3 build that runs processes from flash. Until it
+  is built every segment is copied, on the ESP32-S3 into IRAM, where a part
+  refuses byte access, so no process loads on a board.
 
 **Known limits.**
 
@@ -3578,6 +3653,24 @@ loader parses and reports while no process stores either.
   allocate at once can be handed overlapping blocks (§5c). The emulator the
   gate runs never delivers the timer interrupt to user mode on that board, so
   the gate cannot show it.
+- On the ESP32-S3 every executable segment is used in place in flash (§5.6;
+  not yet built), so a program cannot be loaded into RAM and run there. A
+  `map` with execute succeeds there and its row is recorded, as on every
+  `Flat` board (§5b.1), but a region is at DRAM addresses, where the part
+  fetches no instruction, so a process cannot run code out of a region it
+  maps.
+- The emulator the ESP32-S3 smoke runs maps flash at both windows as a part
+  does, but serves a byte load in the instruction window, which a part
+  refuses. So the smoke shows processes running from flash (§5.6; not yet
+  built) and the loader's and copy doors' checks; that the kernel's byte load
+  there faults has been seen only on a board.
+- Three things the ESP32-S3 process layout rests on are inferred until
+  `root_server_boot` runs on a part, from probes made in kernel mode on a
+  core with no privilege: that a process's byte load in the flash
+  instruction window is refused as the kernel's is, and that `l32r` in that
+  window and byte loads through the flash data window work in user mode.
+- Whether the ESP32-C3's buses and PMP would serve a process from flash is
+  not established, so nothing there links a segment in place (§5.5).
 - Quotas count objects, not bytes, and there is no per-create quota argument
   (§2.9). Slab donation is permanent (§2.8).
 - Handle generations are best-effort bug detection, not a uniqueness
@@ -3669,7 +3762,10 @@ processes (§2.5).
   path" is therefore kept by construction: nowhere else in the tree reads a
   segment record. **Root provides the memory and supplies no numbers.**
   `process_create(image:memory:)` takes two Memory capabilities, segments are
-  copied to their virtual link addresses inside `memory`, and **the stack is the
+  copied to their virtual link addresses inside `memory` or used in place in
+  `image` (§5.6; not yet enforced), whose grant rows then hold `image` as the
+  copied ones hold `memory`, so either handle may be released while the child
+  runs (§2.5), and **the stack is the
   kernel's grant at that region's top** — root's own loader rule, applied to a
   child. So a launcher never parses an image, never computes a load address and
   never chooses a stack, which is what makes "root never parses" airtight. On a

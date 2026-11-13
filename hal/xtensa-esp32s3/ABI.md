@@ -1194,14 +1194,11 @@ a board" is the order to find out in.
   words at the IRAM name runs, in kernel and in user mode, and does not run
   at its DRAM name; and sub-word loads are refused at the IRAM name as
   stores are, so read-only data cannot stay beside the code there.
-  The fix: a process's code stays at IRAM addresses and its writable
-  segments, arena and stack move to the DRAM twin of the same region. That
-  is two addresses for one region, so it is more than the linker scripts:
-  the loader's region test and `start_process` in `kernel/core/` would need a
-  HAL seam they do not have. It is not built; the tree's spec specifies it
-  when it lands. Storing code through its DRAM name would not do: on the
-  emulator, whose IRAM and DRAM are separate arrays (§3a), code stored that
-  way is not at its IRAM name.
+  The fix is spec §5.6's, not built: a process's code and read-only data
+  are used in place in flash, the code at its instruction-window address
+  and the read-only data at its data-window address, and its writable
+  segments, arena and stack are at DRAM addresses. Nothing of a process
+  sits at an IRAM address.
 - **The interrupt matrix reset value.** Unrouted map registers read 6 here,
   with the ROM or without it (a `-kernel` image reads 6 at sources 0 and 27),
   so 6 is the emulator's reset value and not something the ROM writes.

@@ -377,9 +377,11 @@ each.
    addresses stay the same, so compare line by line: a step that answers
    `ok` here and is refused there, or the reverse, names the access that
    differs, and `cause` says how (`ABI.md` §3c has this part's table and
-   §11 what each answer means for the process layout). A difference in the
-   alias steps, or a refusal in the user-mode step, matters most: a layout
-   with code at IRAM addresses and data at their DRAM names rests on them.
+   §11 what each answer means for the process layout). A different answer
+   in the user-mode step, at the DRAM names or in the flash-window loads
+   matters most: the process layout spec §5.6 specifies, not built, runs a
+   process's code and reads its read-only data in place in flash and keeps
+   its writable memory at DRAM addresses, and rests on them.
 5. **`root_server_boot`**: the first real process. Expected, if `bus_probe`
    passed every step:
 
