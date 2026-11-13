@@ -3031,7 +3031,10 @@ mode only. The harness kernels that test the tick and timers arm their own.
   handle table answers.
 - **User FP/SIMD state travels with the thread, on Profile B.** Profile A has
   no FPU, so there is none to carry, and the ESP32-S3 profile leaves its FPU
-  disabled (`CPENABLE` = 0), so an FP instruction there is a fault. The trap
+  disabled (`CPENABLE` = 0), so an FP instruction there is a fault for a
+  process that leaves `CPENABLE` alone. That tier is `Flat` and cannot stop a
+  process setting it; one that does runs FP instructions with nothing to
+  carry its FP state across a switch, which the tier disclaims. The trap
   frame holds general registers only, and the kernel executes no FP/SIMD
   instruction, so a trap that resumes the same thread (an interrupt included)
   saves nothing. Each thread's

@@ -1,0 +1,405 @@
+// Bus probe: which accesses a board's buses accept, for a first run on
+// silicon, including the answers a process layout with its code at IRAM
+// addresses and its data at DRAM addresses depends on.
+//
+// Each step prints its name and address, then makes its access through a leaf
+// in `tests/xtensa/bus_probe.S` and prints `ok <value>` or
+// `refused cause=<EXCCAUSE> vaddr=<EXCVADDR>`, and the probe goes on to the
+// next step. A refused access is resumed through a vector table that only
+// this image links (that file's header has the mechanism); after each
+// refusal the probe checks that the kernel's PS came back, and stops if it
+// did not. Every other image stops at a kernel fault.
+//
+// The steps run in order, each depending on less than the ones after it:
+//   1. word store and load at process IRAM, bottom and top of the range;
+//   2. the alias: a word stored through one name of a shared IRAM address
+//      read back through the other, both ways, then `shared` or `not shared`;
+//   3. word, halfword and byte store and load at the DRAM name, bottom and
+//      top;
+//   4. an unaligned word load at DRAM;
+//   5. ATOMCTL, then `s32c1i` at DRAM;
+//   6. byte and halfword loads, then stores, at process IRAM, each store
+//      read back as a word;
+//   7. the payload copied into process IRAM by words, and its routine called
+//      there in kernel mode;
+//   8. the same at the DRAM name;
+//   9. word and byte loads through the flash instruction and data windows;
+//  10. user mode, entered at the payload's program in process IRAM. It is
+//      last because a refusal in user mode ends the run; the program prints
+//      the probe's last line itself.
+//
+// Every address comes from the HAL: the process IRAM (`hal.RAM_BASE` to
+// `hal.RAM_TOP`), its DRAM name (`hal.dram_name`), the payload in the flash
+// instruction window and the region table in the data window.
+
+import kcore.{console, align_up, start_process}
+import hal
+import imgformat.{SegFlag}
+import sosabi.{NO_USER_STACK}
+
+// The leaves, all in `tests/xtensa/bus_probe.S`. Each access returns
+// `ACCESS_OK` or a refusal; `probe_value` is what the last allowed access
+// read (or stored), `probe_cause` and `probe_vaddr` what the last refusal
+// was.
+extern "C" {
+    func probe_install()
+    func probe_remove()
+    func probe_load8(addr: UInt) -> UInt
+    func probe_load16(addr: UInt) -> UInt
+    func probe_load32(addr: UInt) -> UInt
+    func probe_store8(addr: UInt, v: UInt) -> UInt
+    func probe_store16(addr: UInt, v: UInt) -> UInt
+    func probe_store32(addr: UInt, v: UInt) -> UInt
+    func probe_s32c1i(addr: UInt, expected: UInt, v: UInt) -> UInt
+    func probe_call(addr: UInt, arg: UInt) -> UInt
+    func probe_value() -> UInt
+    func probe_cause() -> UInt
+    func probe_vaddr() -> UInt
+    func probe_ps() -> UInt
+    func probe_atomctl() -> UInt
+    func probe_user_literal() -> UInt
+    func probe_user_entry() -> UInt
+}
+
+static ACCESS_OK: UInt = 0
+static WORD_BYTES: UInt = 4
+
+/// What the stores write, each chosen to read back as itself and nothing
+/// else. The alias step stores `BEFORE_MARK` through the name it reads and
+/// then `ALIAS_MARK` through the other, so the word it reads says which
+/// store reached it.
+static WORD_MARK: UInt = 0x5A5A_A5A5
+static HALF_MARK: UInt = 0xC33C
+static BYTE_MARK: UInt = 0x96
+static BEFORE_MARK: UInt = 0x0F1E_2D3C
+static ALIAS_MARK: UInt = 0xC3D2_E1F0
+
+/// `s32c1i`: the word is stored as `CAS_OLD`, then swapped for `CAS_NEW` if
+/// it still is `CAS_OLD`.
+static CAS_OLD: UInt = 5
+static CAS_NEW: UInt = 7
+
+/// What the payload's routine is called with; it returns this plus its
+/// addend.
+static ROUTINE_ARG: UInt = 0x1000
+
+/// Where in process IRAM, and at the same offset in its DRAM name, each step
+/// works. A halfword and a byte share the word at the base, so the top's
+/// accesses end exactly at the top of the range.
+static HALF_OFFSET: UInt = 2
+static BYTE_OFFSET: UInt = 3
+static ATOMIC_OFFSET: UInt = 0x10
+static NARROW_OFFSET: UInt = 0x20
+static CODE_OFFSET: UInt = 0x100
+static USER_DATA_OFFSET: UInt = 0x400
+
+/// The failing stops this probe can make.
+static RESUME_FAILED: UInt = 2
+static PAYLOAD_TOO_LARGE: UInt = 3
+static USER_STEP_SKIPPED: UInt = 4
+
+/// The user-mode program's grants: its code, and the word it stores to.
+static USER_CODE_REGION: UInt = 0
+static USER_DATA_REGION: UInt = 1
+
+/// The width of one access.
+enum Width {
+    case Byte,
+    case Half,
+    case Word,
+}
+
+extension Width {
+    func store(&self, addr: UInt, v: UInt) -> UInt {
+        match self {
+            case Byte -> probe_store8(addr, v),
+            case Half -> probe_store16(addr, v),
+            case Word -> probe_store32(addr, v),
+        }
+    }
+
+    func load(&self, addr: UInt) -> UInt {
+        match self {
+            case Byte -> probe_load8(addr),
+            case Half -> probe_load16(addr),
+            case Word -> probe_load32(addr),
+        }
+    }
+}
+
+/// The PS the kernel runs at, read before the first access: every resume
+/// after a refusal must give it back.
+struct Probe {
+    kernel_ps: UInt,
+}
+
+extension Probe {
+    /// Name a step and its address, before its access.
+    func step(&self, name: String, addr: UInt) {
+        let uart = console()
+        uart.write_str("SOS probe: ")
+        uart.write_str(name)
+        uart.write_str(" at ")
+        uart.write_hex(addr)
+        uart.write_str("\n")
+    }
+
+    func say(&self, line: String) {
+        let uart = console()
+        uart.write_str("SOS probe: ")
+        uart.write_str(line)
+        uart.write_str("\n")
+    }
+
+    /// Report a refusal, if `status` is one, and say whether it was. A
+    /// resume that left the processor at another PS stops the probe: nothing
+    /// after it could be trusted.
+    func refused(&self, status: UInt) -> Bool {
+        if status == ACCESS_OK {
+            return false
+        }
+        let uart = console()
+        uart.write_str("SOS probe: refused cause=")
+        uart.write_hex(probe_cause())
+        uart.write_str(" vaddr=")
+        uart.write_hex(probe_vaddr())
+        uart.write_str("\n")
+        let ps = probe_ps()
+        if ps != self.kernel_ps {
+            uart.write_str("SOS probe: resumed at PS ")
+            uart.write_hex(ps)
+            uart.write_str(", not the kernel's ")
+            uart.write_hex(self.kernel_ps)
+            uart.write_str("\n")
+            hal.exit_fail(RESUME_FAILED)
+        }
+        true
+    }
+
+    /// Report what an access gave, and say whether it was allowed.
+    func report(&self, status: UInt) -> Bool {
+        if self.refused(status) {
+            return false
+        }
+        let uart = console()
+        uart.write_str("SOS probe: ok ")
+        uart.write_hex(probe_value())
+        uart.write_str("\n")
+        true
+    }
+
+    /// One load.
+    func load(&self, name: String, width: Width, addr: UInt) -> Bool {
+        self.step(name, addr)
+        self.report(width.load(addr))
+    }
+
+    /// A store, then a load of the same width at the same address.
+    func store_load(&self, name: String, width: Width, addr: UInt,
+                    v: UInt) -> Bool {
+        self.step(name, addr)
+        if self.refused(width.store(addr, v)) {
+            return false
+        }
+        self.report(width.load(addr))
+    }
+
+    /// A store, then a word load of the word holding it: a word load is what
+    /// shows whether a narrow store landed where narrow loads are refused.
+    func store_word_back(&self, name: String, width: Width, addr: UInt,
+                         v: UInt) -> Bool {
+        self.step(name, addr)
+        if self.refused(width.store(addr, v)) {
+            return false
+        }
+        self.report(probe_load32(addr & ~(WORD_BYTES - 1)))
+    }
+
+    /// The alias between two names of one shared word: `BEFORE_MARK`
+    /// through `read_at`, `ALIAS_MARK` through `stored_at`, then a load
+    /// through `read_at`. The word read says which store reached it.
+    func alias(&self, read_at: UInt, stored_at: UInt) {
+        let uart = console()
+        uart.write_str("SOS probe: alias, stored at ")
+        uart.write_hex(read_at)
+        uart.write_str(" then ")
+        uart.write_hex(stored_at)
+        uart.write_str(", read at ")
+        uart.write_hex(read_at)
+        uart.write_str("\n")
+        if self.refused(probe_store32(read_at, BEFORE_MARK)) {
+            return
+        }
+        if self.refused(probe_store32(stored_at, ALIAS_MARK)) {
+            return
+        }
+        if not self.report(probe_load32(read_at)) {
+            return
+        }
+        let seen = probe_value()
+        if seen == ALIAS_MARK {
+            self.say("shared")
+        } else if seen == BEFORE_MARK {
+            self.say("not shared")
+        } else {
+            self.say("neither word read back: the alias is not settled")
+        }
+    }
+
+    /// Copy the payload to `to` with word loads from the flash instruction
+    /// window and word stores, then load the first word back from `to`.
+    func copy_payload(&self, name: String, to: UInt) -> Bool {
+        self.step(name, to)
+        let from = hal.payload_start()
+        let top = hal.payload_end()
+        var at: UInt = 0
+        while from + at < top {
+            if self.refused(probe_load32(from + at)) {
+                return false
+            }
+            if self.refused(probe_store32(to + at, probe_value())) {
+                return false
+            }
+            at = at + WORD_BYTES
+        }
+        self.report(probe_load32(to))
+    }
+
+    /// A word, then a halfword and a byte inside the same word, each stored
+    /// and loaded back at the DRAM name `base`.
+    func widths(&self, base: UInt) {
+        self.store_load("word store and load, DRAM", Width.Word, base,
+                        WORD_MARK)
+        self.store_load("halfword store and load, DRAM", Width.Half,
+                        base + HALF_OFFSET, HALF_MARK)
+        self.store_load("byte store and load, DRAM", Width.Byte,
+                        base + BYTE_OFFSET, BYTE_MARK)
+    }
+
+    /// Call the payload's routine where a copy of it sits.
+    func call(&self, name: String, addr: UInt) -> Bool {
+        self.step(name, addr)
+        self.report(probe_call(addr, ROUTINE_ARG))
+    }
+}
+
+@export("kmain")
+func kmain() unsafe {
+    console().write_str("SOS probe: bus probe on ")
+    console().write_str(hal.arch_name())
+    console().write_str("\n")
+
+    let payload_len = hal.payload_end() - hal.payload_start()
+    if payload_len > USER_DATA_OFFSET - CODE_OFFSET {
+        console().write_str("SOS probe: the payload overlaps the user data\n")
+        hal.exit_fail(PAYLOAD_TOO_LARGE)
+    }
+
+    probe_install()
+    let probe = Probe(kernel_ps: probe_ps())
+
+    let iram_lo = hal.RAM_BASE
+    let iram_hi = hal.RAM_TOP - WORD_BYTES
+    let dram_lo = hal.dram_name(iram_lo)
+    let dram_hi = hal.dram_name(iram_hi)
+
+    // 1. Word access at process IRAM.
+    probe.store_load("word store and load, process IRAM", Width.Word, iram_lo,
+                     WORD_MARK)
+    probe.store_load("word store and load, process IRAM", Width.Word, iram_hi,
+                     WORD_MARK)
+
+    // 2. The alias, IRAM read after a DRAM store and the reverse.
+    probe.alias(iram_lo, dram_lo)
+    probe.alias(dram_hi, iram_hi)
+
+    // 3. Every width at the DRAM name.
+    probe.widths(dram_lo)
+    probe.widths(dram_hi)
+
+    // 4. Unaligned, across the word step 3 left and one stored here, so
+    // every byte it could read is known.
+    probe.store_load("word store and load, DRAM", Width.Word,
+                     dram_lo + WORD_BYTES, WORD_MARK)
+    probe.load("unaligned word load, DRAM", Width.Word, dram_lo + 1)
+
+    // 5. The word atomic, after the ATOMCTL it runs under.
+    let uart = console()
+    uart.write_str("SOS probe: ATOMCTL ")
+    uart.write_hex(probe_atomctl())
+    uart.write_str("\n")
+    let atomic = dram_lo + ATOMIC_OFFSET
+    probe.step("word store, then s32c1i swapping it, DRAM", atomic)
+    if not probe.refused(probe_store32(atomic, CAS_OLD)) {
+        if probe.report(probe_s32c1i(atomic, CAS_OLD, CAS_NEW)) {
+            probe.load("word load after s32c1i, DRAM", Width.Word, atomic)
+        }
+    }
+
+    // 6. Narrow access at process IRAM, on a word stored first.
+    let narrow = iram_lo + NARROW_OFFSET
+    probe.store_load("word store and load, process IRAM", Width.Word, narrow,
+                     WORD_MARK)
+    probe.load("byte load, process IRAM", Width.Byte, narrow + 1)
+    probe.load("halfword load, process IRAM", Width.Half,
+               narrow + HALF_OFFSET)
+    probe.store_word_back("byte store, word loaded back, process IRAM",
+                          Width.Byte, narrow + 1, BYTE_MARK)
+    probe.store_word_back("halfword store, word loaded back, process IRAM",
+                          Width.Half, narrow + HALF_OFFSET, HALF_MARK)
+
+    // 7. Code stored by words into process IRAM, called in kernel mode.
+    let code = iram_lo + CODE_OFFSET
+    let code_placed = probe.copy_payload(
+        "payload copied by words, process IRAM", code)
+    if code_placed {
+        probe.call("call, process IRAM", code)
+    }
+
+    // 8. The same code at the DRAM name.
+    let dram_code = hal.dram_name(code)
+    if probe.copy_payload("payload copied by words, DRAM", dram_code) {
+        probe.call("call, DRAM", dram_code)
+    }
+
+    // 9. The flash windows: the payload is code, the region table data.
+    let flash_code = hal.payload_start()
+    probe.load("word load, instruction window", Width.Word, flash_code)
+    probe.load("byte load, instruction window", Width.Byte, flash_code + 1)
+    let flash_data = hal.region_table_start()
+    probe.load("word load, data window", Width.Word, flash_data)
+    probe.load("byte load, data window", Width.Byte, flash_data + 1)
+
+    // 10. User mode, on the payload's program in its IRAM copy, with the DRAM
+    // address it stores to in its literal slot.
+    let literal = code + (probe_user_literal() - flash_code)
+    let entry = code + (probe_user_entry() - flash_code)
+    let data = dram_lo + USER_DATA_OFFSET
+    var placed = false
+    if code_placed {
+        placed = probe.store_load(
+            "user literal, word store and load, process IRAM", Width.Word,
+            literal, data)
+    }
+    if not placed {
+        probe.say("user mode skipped: the program could not be placed")
+        probe.say("done")
+        hal.exit_fail(USER_STEP_SKIPPED)
+    }
+    probe_remove()
+    uart.write_str("SOS probe: entering user mode at ")
+    uart.write_hex(entry)
+    uart.write_str(", byte access at ")
+    uart.write_hex(data)
+    uart.write_str("\n")
+    probe.say("every line after the console handover is from user mode")
+
+    let code_top = align_up(code + payload_len, hal.PROT_GRAIN)
+    hal.prot_reset()
+    hal.prot_region(USER_CODE_REGION, code, code_top,
+                    (SegFlag.Read as UInt8) | (SegFlag.Execute as UInt8))
+    hal.prot_region(USER_DATA_REGION, data, data + WORD_BYTES,
+                    (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8))
+    hal.prot_commit()
+    start_process(entry, NO_USER_STACK, code, code_top)
+}

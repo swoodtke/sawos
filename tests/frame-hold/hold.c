@@ -3,23 +3,37 @@
 // register holds what across a loop; in a C file as one file-scope `asm`, so
 // the integrated assembler takes it with the rest of the package's C.
 //
-// u32 sos_frame_hold(u32 *mine, u32 *other, u32 rounds, u32 seed)
+// u32 sos_frame_hold(u32 *mine, u32 *other, u32 rounds, u32 seed,
+//                    u32 other_seed)
 //
 // Each round loads a value derived from `seed` and the round into every
-// register it holds, writes round + 1 to `*mine`, then spins until `*other`
-// has passed the round, and checks each held register against what it loaded.
-// The spin makes no call and no syscall, so it ends only when a tick has
-// preempted this thread and the other has run. It answers 0 after `rounds`
-// rounds, or on the first mismatch the register's code:
+// register it holds, publishes the round in `*mine`, then spins until
+// `*other` has passed the round, and checks each held register against what
+// it loaded. The spin makes no call and no syscall, so it ends only when a
+// tick has preempted this thread and the other has run. It answers 0 after
+// `rounds` rounds, or on the first mismatch the register's code:
 //
-//   1 a0, n + 1 for an (a2 to a13), 20 SAR, 21 SCOMPARE1, 22 THREADPTR,
+//   1 a0, n + 1 for an (a2 to a15), 20 SAR, 21 SCOMPARE1, 22 THREADPTR,
 //   23 LBEG, 24 LEND, 25 LCOUNT
 //
 // and then writes 0x7FFFFFFF to `*mine`, so the other thread's spins end.
 //
-// Held: a0, a2 to a13, SAR, SCOMPARE1, THREADPTR, LBEG, LEND, LCOUNT. Not
-// held: a1, the stack pointer every load here goes through, and a14 and a15,
-// which the spin and the checks work in.
+// Held: a0, a2 to a13, SAR, SCOMPARE1, THREADPTR, LBEG, LEND, LCOUNT, and one
+// of a14 and a15 in turn. Not held: a1, the stack pointer every load here
+// goes through.
+//
+// The spin needs one register to load the other thread's word into, so a14
+// and a15 take turns: in an even round a15 holds the round's counter and a14
+// is the scratch, in an odd round the other way about. The counter is the
+// round plus this thread's bias, (seed >> 28) << 16, so the two threads'
+// counters differ; it is what the spin compares the other's word against, it
+// is checked against the value the round implies on every pass of the spin
+// and once more when the spin ends, and it is loaded before the round is
+// published. The thread that publishes first in a round cannot leave its
+// spin until the other has published, so it is preempted with the counter
+// held: every round tests the restore of one of the two registers. Each
+// thread publishes round + 1 plus the other's bias, which is what the other
+// thread's counter is compared with.
 //
 // LCOUNT is non-zero for the whole round, so a pass through the address in
 // LEND would loop back to LBEG. Both point into `.Lhold_dead`, a block after
@@ -46,6 +60,7 @@ __asm__(
 "    .endm\n"
 "sos_frame_hold:\n"
 "    addi    a1, a1, -128\n"
+"    addi    a1, a1, -16\n"
 "    s32i    a0, a1, 0\n"
 "    s32i    a12, a1, 4\n"
 "    s32i    a13, a1, 8\n"
@@ -57,6 +72,9 @@ __asm__(
 "    s32i    a3, a1, 28\n"           // other
 "    s32i    a4, a1, 32\n"           // rounds
 "    s32i    a5, a1, 36\n"           // seed
+"    extui   a14, a6, 28, 4\n"
+"    slli    a14, a14, 16\n"
+"    s32i    a14, a1, 44\n"          // the other's bias
 "    movi    a14, 0\n"
 "    s32i    a14, a1, 40\n"          // round
 "\n"
@@ -85,9 +103,20 @@ __asm__(
 "    s32i    a14, a1, 112\n"
 "    addi    a14, a14, 64\n"
 "    s32i    a14, a1, 116\n"
+// The counter (124) and the word to publish (128).
+"    l32i    a14, a1, 40\n"
+"    extui   a15, a13, 28, 4\n"
+"    slli    a15, a15, 16\n"
+"    add     a15, a15, a14\n"
+"    s32i    a15, a1, 124\n"
+"    l32i    a15, a1, 44\n"
+"    add     a15, a15, a14\n"
+"    addi    a15, a15, 1\n"
+"    s32i    a15, a1, 128\n"
 "\n"
 // Load the special registers, LCOUNT last so the loop bounds are in place
-// first; then publish the round, then the general registers.
+// first; then, by the round's parity, the counter, the publish, the general
+// registers and the spin.
 "    l32i    a14, a1, 100\n"
 "    wsr     a14, sar\n"
 "    l32i    a14, a1, 104\n"
@@ -101,10 +130,16 @@ __asm__(
 "    isync\n"
 "    l32i    a14, a1, 120\n"
 "    loop_wsr 14, 2\n"
-"    l32i    a14, a1, 24\n"
-"    l32i    a15, a1, 40\n"
-"    addi    a15, a15, 1\n"
-"    s32i    a15, a14, 0\n"
+"\n"
+// `hold_wait held, scratch, code`: hold the counter in `held`, publish, load
+// the general registers, and spin while *other <= the counter, checking the
+// counter on every pass and at the end. a13 carries the published word and
+// is loaded from the table after it.
+"    .macro  hold_wait held, scratch, code\n"
+"    l32i    \\held, a1, 124\n"
+"    l32i    \\scratch, a1, 24\n"
+"    l32i    a13, a1, 128\n"
+"    s32i    a13, \\scratch, 0\n"
 "    l32i    a0, a1, 48\n"
 "    l32i    a2, a1, 52\n"
 "    l32i    a3, a1, 56\n"
@@ -118,14 +153,29 @@ __asm__(
 "    l32i    a11, a1, 88\n"
 "    l32i    a12, a1, 92\n"
 "    l32i    a13, a1, 96\n"
-"\n"
-// Spin while *other <= round.
-".Lhold_spin:\n"
-"    l32i    a14, a1, 28\n"
+"1:\n"
+"    l32i    \\scratch, a1, 124\n"
+"    bne     \\scratch, \\held, 2f\n"
+"    l32i    \\scratch, a1, 28\n"
 "    memw\n"
-"    l32i    a14, a14, 0\n"
-"    l32i    a15, a1, 40\n"
-"    bgeu    a15, a14, .Lhold_spin\n"
+"    l32i    \\scratch, \\scratch, 0\n"
+"    bgeu    \\held, \\scratch, 1b\n"
+"    l32i    \\scratch, a1, 124\n"
+"    beq     \\scratch, \\held, 3f\n"
+"2:\n"
+"    movi    a2, \\code\n"
+"    j       .Lhold_fail\n"
+"3:\n"
+"    .endm\n"
+"    l32i    a14, a1, 40\n"
+"    bbci    a14, 0, .Lhold_even\n"
+"    j       .Lhold_odd\n"
+".Lhold_even:\n"
+"    hold_wait a15, a14, 16\n"
+"    j       .Lhold_checks\n"
+".Lhold_odd:\n"
+"    hold_wait a14, a15, 15\n"
+".Lhold_checks:\n"
 "\n"
 "    .macro  hold_check reg, off, code\n"
 "    l32i    a14, a1, \\off\n"
@@ -191,6 +241,7 @@ __asm__(
 "    l32i    a13, a1, 8\n"
 "    l32i    a14, a1, 12\n"
 "    l32i    a15, a1, 16\n"
+"    addi    a1, a1, 16\n"
 "    addi    a1, a1, 128\n"
 "    ret\n"
 "    .size sos_frame_hold, . - sos_frame_hold\n"

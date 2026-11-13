@@ -4,9 +4,9 @@ The record of what the ESP32-S3 emulator does, probe by probe, for the Xtensa
 HAL that will be written against it. Nothing here is from a datasheet unless it
 says so: each fact carries the probe that produced it (what was run and the
 output that matters) or a cited file. "The emulator" means the QEMU below;
-"silicon" means an ESP32-S3 part, and no claim in this file was probed on one.
-Where the two can disagree, the section says so, and §11 collects every such
-place.
+"silicon" means an ESP32-S3 part. A claim probed on a part says so and names
+the board; every other claim is the emulator's or a source's. Where the two
+can disagree, the section says so, and §11 collects every such place.
 
 Oracle:
 
@@ -117,6 +117,13 @@ Flash images are 4 MiB of `0xFF` with each `PT_LOAD` segment written at
 `LMA - 0x4200_0000`, attached as `-drive file=<image>,if=mtd,format=raw`.
 QEMU prints `Adding SPI flash device` on stderr when a drive is attached and
 `Not initializing SPI Flash` without one; stderr is noise for a transcript.
+
+A board image is the same bytes cut after the last one placed, written at
+flash offset 0x0 (`tools/sos_runner.py --board esp32s3 --emit-flash CASE
+--out PATH`). The image is one contiguous run of flash (`esp32s3.ld`), so it
+is about the size of the kernel plus what is appended to it. Padded back to
+4 MiB it boots under the emulator like the smoke's own image, apart from its
+stop (§10).
 
 ---
 
@@ -247,6 +254,57 @@ of the values that fault (§8), and the compiler's word atomics are inline
 `s32c1i`. The direct-boot flash image is the form a real part boots, and it
 inherits the ROM's `0x15`.
 
+### 2e. The watchdogs `_start` switches off
+
+On the emulator every watchdog reads off at handover (§2c); on silicon the
+RTC watchdog, TIMG0's watchdog and the super watchdog are expected live after
+a flash boot (§11). `boot.S`'s `_start` therefore, right after it leaves the
+ROM's register window and before any copy:
+
+```
+RTC watchdog    key 0x50D83AA1 -> 0x6000_80B0 (WDTWPROTECT)
+                0          -> 0x6000_8098 (WDTCONFIG0: off, every stage)
+                0          -> 0x6000_80B0 (locked again)
+TIMG0 watchdog  key 0x50D83AA1 -> 0x6001_F064 (WDTWPROTECT)
+                0          -> 0x6001_F048 (WDTCONFIG0: off)
+                0          -> 0x6001_F064
+super watchdog  key 0x8F1D312A -> 0x6000_80B8 (SWD_WPROTECT)
+                SWD_CONF (0x6000_80B4) |= 1 << 31 (auto-feed)
+                0          -> 0x6000_80B8
+```
+
+Where each number comes from, all on this machine. No ESP-IDF register
+header (`rtc_cntl_reg.h`, `timer_group_reg.h`) is installed here, so the
+TIMG0 numbers are read from the ROM's own code:
+
+- esptool 5.1.0's S3 target,
+  `~/.espressif/python_env/idf6.1_py3.13_env/lib/python3.13/site-packages/
+  esptool/targets/esp32s3.py`: `RTCCNTL_BASE_REG = 0x60008000` (line 86),
+  `RTC_CNTL_SWD_CONF_REG = +0x00B4` (87), `RTC_CNTL_SWD_AUTO_FEED_EN = 1 <<
+  31` (88), `RTC_CNTL_SWD_WPROTECT_REG = +0x00B8` (89), `RTC_CNTL_SWD_WKEY =
+  0x8F1D312A` (90), `RTC_CNTL_WDTCONFIG0_REG = +0x0098` (92),
+  `RTC_CNTL_WDTWPROTECT_REG = +0x00B0` (94), `RTC_CNTL_WDT_WKEY =
+  0x50D83AA1` (95). Its `disable_watchdogs` (lines 328-344) is the RTC and
+  super-watchdog sequence above: unlock, write the config word 0, relock;
+  unlock, set the auto-feed bit, relock.
+- The ROM ELF, `~/.espressif/tools/esp-rom-elfs/20241011/
+  esp32s3_rev0_rom.elf`: its symbol `TIMERG0` is 0x6001_F000;
+  `disable_default_watchdog` (0x4004_3714) clears bit 14 of 0x6001_F048
+  (TIMG0's WDTCONFIG0) and bit 12 of 0x6000_8098 (the RTC's), the two
+  flash-boot enables; `wdt_hal_write_protect_disable` (0x4004_7944) writes
+  0x50D83AA1 to a TIMG block's +0x64 and to the RTC block's +0xB0;
+  `wdt_hal_deinit` (0x4004_7748) clears bit 31 (the enable) of a TIMG
+  block's +0x48. Writing the whole TIMG0 config word 0 clears both bits.
+
+TIMG1's watchdog is left alone: the ROM's `disable_default_watchdog` names
+only TIMG0's and the RTC's, so nothing suggests the ROM starts it.
+
+Probed on the emulator: the smoke passes with the writes in place, and the
+emulator's watchdog registers read 0 before them (§2c). Probed on silicon
+(ESP32-S3 rev v0.2, ROM `esp32s3-20210327`): no reset follows in 120 s of
+running, nor after a kernel fault (§11). Which of the watchdogs was live
+before the writes was not read.
+
 ---
 
 ## 3. Memory map (monitor `info mtree`, machine `esp32s3`)
@@ -302,7 +360,7 @@ reads 0 and drops writes, §9):
 priority -1000 and are hidden under `esp32s3.iomem` in the flat view, so
 they are not reachable. There is no LEDC device (§9).
 
-### 3a. RAM on the emulator is two separate arrays
+### 3a. RAM: two arrays on the emulator, one SRAM on silicon
 
 `esp32s3.dram` and `esp32s3.iram` are two `ram` regions, not an alias.
 Probed: `0xA5A5A5A5` stored at DRAM 0x3FC9_0000 and `0x5A5A5A5A` at IRAM
@@ -320,13 +378,24 @@ environment under `~/.espressif/python_env`):
 ```
 
 On silicon most of IRAM and DRAM are one SRAM seen through two buses (the
-ESP32-S3 Technical Reference Manual, System and Memory chapter); the
-emulator does not model that, so a layout that overlaps an IRAM range with
-its DRAM twin works here and corrupts itself there. The stub keeps IRAM at
-0x4037_8000 (16 KiB) and DRAM from 0x3FC8_C000, which stay disjoint under
-either reading of the alias, and keeps out of 0x4037_0000-0x4037_7FFF, whose
-use on silicon this file did not establish. Both points are for a real board
-to confirm (§11).
+ESP32-S3 Technical Reference Manual, System and Memory chapter): IRAM
+0x4037_8000 + n is DRAM 0x3FC8_8000 + n, an offset of 0x006F_0000
+(`hal.IRAM_DRAM_OFFSET`). The emulator does not model that, so a layout
+that overlaps an IRAM range with its DRAM twin works here and corrupts
+itself there. The stub keeps IRAM at 0x4037_8000 (16 KiB) and DRAM from
+0x3FC8_C000, which stay disjoint under either reading of the alias, and
+keeps out of 0x4037_0000-0x4037_7FFF, whose use on silicon this file did
+not establish.
+
+Probed on silicon (ESP32-S3 rev v0.2, ROM `esp32s3-20210327`), by
+`bus_probe` at the bottom and the top word of the process range, in both
+directions: a word stored at IRAM 0x403A_0000 and then `0xc3d2e1f0` stored
+at DRAM 0x3FCB_0000 reads back `0xc3d2e1f0` at IRAM 0x403A_0000; a word
+stored at DRAM 0x3FCE_FFFC and then `0xc3d2e1f0` stored at IRAM
+0x403D_FFFC reads back `0xc3d2e1f0` at DRAM 0x3FCE_FFFC. Each pair of
+addresses names one word. The same steps here read back the first word
+stored (`not shared`). Between those two words the alias is the manual's
+claim; 0x4037_0000-0x4037_7FFF stays unprobed.
 
 ### 3b. The ROM's RAM
 
@@ -354,10 +423,61 @@ call code copied into DRAM 0x3FCA_0000  ok, returned 42
 call code copied into IRAM 0x4039_0000  ok, returned 42
 ```
 
-The last five are emulator generosity that silicon may not share (§11).
+The last five are emulator generosity that silicon may not share; the table
+below says which of them the part shares (§11).
 These were probed on an image booted through the ROM, which sets up the
 cache and its region attributes first; a `-kernel` image was not probed for
 them.
+
+On silicon (ESP32-S3 rev v0.2, ROM `esp32s3-20210327`), from the smoke's
+board images: the `bus_probe` stage, which makes each access in kernel mode
+and carries on past a refusal (`README.md` has its transcript), booted twice
+with byte-identical output, and the accesses the kernel itself makes. A
+refusal is EXCCAUSE and EXCVADDR as the probe printed them; every EXCVADDR
+was the access's own address. The emulator column is the same probe under
+the emulator.
+
+```
+access                                  emulator     silicon
+load+store 32-bit, IRAM 0x403A_0000     ok           ok
+  and 0x403D_FFFC (process range)
+the alias, IRAM 0x403A_0000 against     not shared   shared (§3a)
+  DRAM 0x3FCB_0000, and DRAM
+  0x3FCE_FFFC against IRAM 0x403D_FFFC
+load+store 32, 16 and 8-bit, DRAM       ok           ok
+  0x3FCB_0000 and 0x3FCE_FFFC
+load 32-bit unaligned, DRAM 0x3FCB_0001 ok, the      ok, the same:
+                                        bytes at     0xa5963ca5
+                                        +1..+4
+s32c1i, DRAM 0x3FCB_0010, ATOMCTL 0x15  ok           ok (§8)
+load 8-bit, IRAM 0x403A_0021            ok           refused, 3
+load 16-bit, IRAM 0x403A_0022           ok           refused, 3
+store 8-bit, IRAM 0x403A_0021           ok           refused, 3 (and the
+                                                     loader's first `s8i`
+                                                     at 0x403A_0000)
+store 16-bit, IRAM 0x403A_0022          ok           refused, 3
+call code word-stored at IRAM           ok           ok, returned
+  0x403A_0100, kernel mode                           0x0000102a
+call the same code at DRAM 0x3FCB_0100  ok           refused, 2
+load 32-bit, flash IBUS (`l32r`, and    ok           ok
+  `bus_probe` at the payload)
+load 8-bit, flash IBUS (payload + 1)    ok           refused, 3
+load 32 and 8-bit, flash DBUS (region   ok           ok
+  table; strings, the loader's image)
+store 32-bit, IRAM 0x4037_8000 up       ok           ok, and the vectors
+  (the vectors and the trap path)                    copied there run
+load and store, DRAM 0x3FC8_C000 up     ok           ok (the kernel runs
+  (the kernel's .data, .bss, stack)                  on them)
+user mode at word-stored IRAM code      ok           ok
+  0x403A_010C: `l32r`, 8-bit store
+  and load at DRAM 0x3FCB_0400, syscall
+```
+
+Six rows differ, all of them refusals on the part: sub-word loads and stores
+at IRAM addresses (cause 3, `LoadStoreError`), an instruction fetch at a
+DRAM address (cause 2, `InstructionFetchError`, §5c) and a byte load through
+the flash IBUS window (cause 3). The alias row differs too, as §3a says. No
+emulator case can show any of them; §11 says what each means.
 
 ---
 
@@ -379,12 +499,48 @@ of which arrived: as on the C3 model, the TX FIFO count is never reported and
 a poll on it cannot spin here; on silicon the FIFO fills. Under `-kernel`
 (no ROM) the same store prints too: the model ignores the divisor.
 
+Probed on silicon (ESP32-S3 rev v0.2, ROM `esp32s3-20210327`): the FIFO
+fills. A kernel fault line stored straight after a burst of console lines,
+with no wait for room, reached the host as 34 of its bytes; every line
+printed through the console's poll arrived whole. So every writer polls
+`UART_STATUS`'s TXFIFO_CNT (bits 25:16) against the 128-byte depth before
+each store: the console (`lib.saw`) without a bound, and `kernel_fault`
+(`sink.c`) with one, so that a UART which never drains cannot keep the
+report from reaching its halt.
+
 **USB-Serial-JTAG** (0x6003_8000, `misc.esp32c3.usb_serial_jtag`): probed by
 writing `USJ: hello\n` byte by byte to `+0x00` (EP1) and 1 to `+0x04`
 (EP1_CONF, write-done). Nothing appeared on UART0's chardev or on three more
 `-serial file:` chardevs, and EP1_CONF reads `0x00000000` before and after.
 The emulator gives no second console here; on silicon USB-Serial-JTAG is the
 dev-board console and its registers are for a real board.
+
+### 4a. The console on a board
+
+**UART0** is the console this kernel drives. The ROM leaves it at 115200
+baud (`UART_CLKDIV` above), and the kernel never touches the divisor or the
+clocks, so a monitor at 115200 8N1 on the board's USB-to-UART bridge reads
+it. The ROM's banner arrives the same way and is the first check.
+
+**USB-Serial-JTAG** is not driven, and is a written plan. A board whose only
+USB port is the chip's native one shows the ROM's banner there (the ROM
+prints to both, eFuses permitting) and then nothing from the kernel. The
+transmit path, read from the ROM ELF's `usb_uart_device_tx_one_char`
+(0x4004_903C) and `usb_uart_device_tx_flush` (0x4004_909C):
+
+```
+0x6003_8000  EP1       store a byte to queue it
+0x6003_8004  EP1_CONF  bit 1: room for a byte (poll before each store)
+                       bit 0: write 1 to send what is queued
+```
+
+The ROM bounds its wait for bit 1 (a counted retry with a delay between
+reads) and, once a wait runs out, records that no host is reading
+(`usb_uart_connected`, 0x3FCE_F130) and stops trying. A kernel sink needs the
+same bound, or an unplugged cable hangs the kernel in its first print, and
+it needs selecting at link time the way `_sos_semihosting` is (§10), so the
+UART path the emulator checks is untouched. Neither is built: nothing here
+can run it, and a board with a USB-to-UART bridge does not need it.
 
 ---
 
@@ -430,13 +586,31 @@ kernel vector instead, `EXCCAUSE = 1`.
 3   LoadStoreError          s32c1i with ATOMCTL = 0 (§8)
 4   Level1Interrupt
 15  LoadStoreAddrError      store to the flash IBUS window
+20  InstFetchProhibited     `callx0` to 0x1000_0000
 28  LoadProhibited          load from 0x1000_0000
 32  Coprocessor0Disabled    `wfr f0, a2` with CPENABLE = 0
 ```
 
-The numbers are what the probes read. The names are the Xtensa ISA's, as
-esp-idf's `xtensa/corebits.h` spells them; `StoreProhibited` is 29 there and
-was not seen.
+The numbers are what the probes read on the emulator. The names are the
+Xtensa ISA's, as esp-idf's `xtensa/corebits.h` spells them; `StoreProhibited`
+is 29 there and was not seen.
+
+On silicon (ESP32-S3 rev v0.2, ROM `esp32s3-20210327`), `bus_probe`'s
+refusals (§3c):
+
+```
+2   InstructionFetchError   `callx0` to code at DRAM 0x3FCB_0100
+3   LoadStoreError          8- and 16-bit load and store at IRAM
+                            0x403A_0021/0x403A_0022; 8-bit load through
+                            the flash IBUS window
+```
+
+The name for 2 is the third entry of the ROM's own exception-name strings,
+which list the causes in order from 0 (`strings` of the ROM ELF,
+`~/.espressif/tools/esp-rom-elfs/20241011/esp32s3_rev0_rom.elf`:
+`IllegalInstruction`, `Syscall`, `InstructionFetchError`, `LoadStoreError`,
+...). The emulator answers the same DRAM fetch with no exception at all; its
+20 above is a fetch from an unmapped address, which no board has made.
 
 ### 5d. PS, EXCM and the interrupt levels
 
@@ -832,8 +1006,14 @@ ATOMCTL 0x01 0x02 0x03 0x15 0x2A 0x3F   old=5 now=7
 
 The emulator reads bits [1:0] only: `s32c1i` faults when they are zero and
 works otherwise, whatever the other fields hold. Without the ROM the register
-starts at `0x28`, a faulting value (§2d). Keep the ROM's `0x15`; which values
-silicon honours for internal SRAM is for a real board.
+starts at `0x28`, a faulting value (§2d). Keep the ROM's `0x15`.
+
+On silicon (ESP32-S3 rev v0.2, ROM `esp32s3-20210327`): `ATOMCTL` reads
+`0x15` after the ROM, and `s32c1i` works at a DRAM address under it.
+`bus_probe` stores 5 at DRAM 0x3FCB_0010, swaps it for 7 with `s32c1i`
+(the old word comes back as 5) and loads 7 back. So word atomics at DRAM
+addresses need no `ATOMCTL` of the kernel's. `s32c1i` at an IRAM address,
+and the other `ATOMCTL` values, are unprobed on silicon.
 
 ---
 
@@ -873,9 +1053,28 @@ So a harness can read the verdict from the exit status when it passes
 deadline, when the guest never gets that far. On silicon `simcall` without a
 debugger attached is not probed; the stub uses it only at the end.
 
+What `simcall` does on a part with no debugger attached is not in any source
+on this machine, so a board image never executes it. `sos_sim_exit` reads
+the linker constant `_sos_semihosting`: `esp32s3.ld` provides 1, and the
+runner's `--emit-flash` links a board image with 0, which turns the call into
+a return. Every stop then ends in its own quiet loop after its line
+(`SOS-S3: halt pass`, `halt fail code=...`, `kernel fault ...`), with the
+watchdogs already off (§2e), so a board halts where it stopped and does not
+reset. Probed by booting an emitted board image under the emulator: the
+transcript ends with the halt line and QEMU runs on until it is killed.
+
 ---
 
-## 11. Where silicon may differ (none of this probed on silicon)
+## 11. Where silicon differs, and where it may
+
+Each entry says what the emulator does, what silicon does or may do instead,
+and what the tree is prepared with. What a part showed is marked
+*On silicon* and names the board: an ESP32-S3 rev v0.2 (QFN56, 40 MHz
+crystal) whose ROM is `esp32s3-20210327`, its console UART0 through the
+board's USB-to-UART bridge, running the smoke's board images in
+`README.md`'s order. What no part has shown yet is marked *Unprobed on
+silicon*, and "prepared for" never means probed. `README.md`'s "First run on
+a board" is the order to find out in.
 
 - **Watchdogs.** The emulator leaves every watchdog config register 0
   (§2c). The ROM's flash path never calls its own
@@ -884,28 +1083,97 @@ debugger attached is not probed; the stub uses it only at the end.
   super-watchdog auto-feed (`RTC_CNTL_SWD_CONF |= 1<<31` under key
   `0x8F1D312A`, `esptool/targets/esp32s3.py`) when the chip is attached
   through USB-Serial-JTAG, with the comment "the RTC WDT and SWD watchdog are
-  not reset". Until a real board says otherwise, a kernel on silicon should
-  expect the RTC watchdog, TIMG0's watchdog and the super watchdog to be live
-  after direct boot, and disable or feed them.
+  not reset". A kernel on silicon should expect the RTC watchdog, TIMG0's
+  watchdog and the super watchdog to be live after direct boot.
+  *Prepared for:* `_start` switches off the RTC and TIMG0 watchdogs and sets
+  the super watchdog to feed itself before anything else (§2e).
+  *On silicon (rev v0.2, ROM `esp32s3-20210327`):* no reset in 120 s of
+  running `timer_tick`, and none after a kernel fault: each capture of a
+  faulting stage shows one `ESP-ROM:` banner and then silence. Which
+  watchdogs were live before `_start`'s writes was not read.
 - **Direct boot can be fused off.** The ROM skips it when secure boot is on or
   eFuse 0x6000_703C bit 1 is set (§2a). The emulator's eFuse has it clear.
-  Read a part's eFuses before relying on direct boot.
+  *Prepared for:* the README's first step reads `DIS_DIRECT_BOOT` (the
+  espefuse name of that bit, `espefuse/efuse_defs/esp32s3.yaml` line 55),
+  `SECURE_BOOT_EN` (line 46) and `SPI_BOOT_CRYPT_CNT` (line 35, flash
+  encryption, which would hand the ROM ciphertext) with a read-only command.
+  *On silicon (rev v0.2, ROM `esp32s3-20210327`):* the three read `False`,
+  `False` and `Disable`, and the ROM direct-boots the image (the magic at
+  0x400, the entry at 0x408) and prints no loader lines of its own.
 - **Clock.** CCOUNT runs at 40 MHz here; what the ROM leaves the CPU clock at
   on silicon, and whether anything changes it, is unprobed. SYSTIMER's 16 MHz
-  is the clock to time with.
+  is the clock to time with. *Prepared for:* nothing to do for a first boot.
+  The kernel times only with SYSTIMER, the UART divisor is the ROM's, and the
+  kernel changes no clock, so a different CPU clock changes only how fast
+  code runs. *On silicon (rev v0.2, ROM `esp32s3-20210327`):* code runs far
+  slower than here: `timer_tick`'s payload spins a fixed count of
+  instructions, which takes on the order of half a minute on the part and
+  well under a second here. Ticks and the UART are unaffected. The CPU clock
+  itself was not read.
 - **SRAM.** IRAM/DRAM are separate arrays here and one SRAM through two buses
   on silicon; both arrays here are also larger than silicon's (§3a).
+  *Prepared for:* no range the image uses is the twin of another (§13);
+  `hal.SHARED_IRAM_BASE`, `SHARED_IRAM_TOP` and `IRAM_DRAM_OFFSET` name the
+  alias. *On silicon (rev v0.2, ROM `esp32s3-20210327`):* a word stored
+  through one name reads back through the other, both ways, at the bottom
+  and the top word of the process range (§3a); `bus_probe` prints `shared`
+  where the emulator prints `not shared`. *Unprobed on silicon:* the words
+  between those two, which rest on the manual, and 0x4037_0000-0x4037_7FFF.
 - **Access rules the emulator forgives** (§3c): unaligned loads, byte access
   to IRAM addresses, executing from DRAM addresses, data loads from the flash
   IBUS window (which every `l32r` from XIP code is), stores to the mask ROM.
-- **ATOMCTL.** Only bits [1:0] matter here (§8).
+  esptool's S3 memory map lists only DRAM, 0x3FC8_8000 - 0x3FD0_0000, as
+  `BYTE_ACCESSIBLE` (`esptool/targets/esp32s3.py` line 112), and its own S3
+  RAM stub keeps its code at IRAM 0x4037_8000 and its data and `.bss` at DRAM
+  0x3FCA_0000 and above (`esptool/targets/stub_flasher/1/esp32s3.json`).
+  *Prepared for:* a root or child image is read through the data window
+  (`esp32s3.ld` puts a data `.payload` in `.drom`), as are `.rodata`, the
+  region table and child images; the kernel's own data and stack are DRAM;
+  the vectors are copied into IRAM with word stores only. Literal loads stay
+  in IBUS, beside their code.
+  *On silicon (rev v0.2, ROM `esp32s3-20210327`):* §3c's second table. Of
+  the five, the part allows one, refuses two, splits one by width, and was
+  not asked the last:
+  - unaligned word loads at DRAM addresses work, as here, and read the four
+    bytes at the address;
+  - 8- and 16-bit loads and stores at IRAM addresses are refused with
+    `LoadStoreError` (cause 3) at the access's own address; word loads and
+    stores there work, and code stored there by words runs;
+  - an instruction fetch at a DRAM address is refused with
+    `InstructionFetchError` (cause 2), so code runs only at its IRAM name;
+  - a word load through the flash IBUS window works, so `l32r` from XIP code
+    does, and an 8-bit load through it is refused (cause 3); 8- and 32-bit
+    loads through the data window work.
+  *Unprobed on silicon:* stores to the mask ROM; nothing in the tree makes
+  one. The sub-word refusals were seen in kernel mode; user mode was asked
+  only for word loads at IRAM and byte access at DRAM, which work.
+- **ATOMCTL.** Only bits [1:0] matter here (§8). *Prepared for:* the kernel
+  leaves the value the ROM hands over (`0x15` here, §2b) and writes none of
+  its own. The compiler's word atomics are inline `s32c1i` (a process's
+  `debug_print` executes one on its string), so a `LoadStoreError` (cause 3)
+  whose EPC1 is an `s32c1i` would mean silicon wants another value for
+  internal SRAM. *On silicon (rev v0.2, ROM `esp32s3-20210327`):* ATOMCTL
+  reads `0x15` and `s32c1i` works at a DRAM address under it (§8).
+  *Unprobed on silicon:* `s32c1i` at an IRAM address, and other ATOMCTL
+  values.
 - **PIE** (`ee.*`): `ee.zero.q q0` executed here with `CPENABLE = 0`, no
   exception. esp-idf's S3 `tie.h` makes PIE coprocessor 3 (`cop_ai`,
   `XCHAL_CP_MASK` 0x09), so expect `CPENABLE` bit 3 to gate it on silicon.
+  Nothing this tree builds emits a PIE instruction.
 - **The CPU's configuration ID.** `CONFIGID1` reads `0x23090f1f` here, which
   is `XCHAL_HW_CONFIGID1` in esp-idf's S3 `core-isa.h`. The ROM ELF's
   `xthals_hw_configid1` is `0x23086d67`, the configuration that ROM was built
-  against (`CONFIGID0` agrees: `0xc2f0fffe` both).
+  against (`CONFIGID0` agrees: `0xc2f0fffe` both). Nothing reads it.
+- **User mode, `syscall` and the timer interrupt.** Here a `syscall` and a
+  level-1 interrupt taken in user mode arrive at the user vector (§5b, §7f),
+  and SYSTIMER TARGET0 reaches CPU interrupt 1 through the matrix (§6c).
+  *On silicon (rev v0.2, ROM `esp32s3-20210327`):* the same: `umode_syscall`
+  and `timer_tick` pass, so the first entry to user mode, the vector table in
+  IRAM, the frame save and restore, the matrix route and execution in place
+  from the IBUS window all hold on the part. `bus_probe`'s last step enters
+  user mode at code stored by words into process IRAM, which loads a literal
+  with `l32r`, stores and loads a byte at a DRAM address and makes system
+  calls to the end.
 - **Rerouting a source.** Here a CPU interrupt stays pending after its
   asserting source is routed away, and a route write raises nothing (§6c).
   Silicon's matrix is combinational, as Espressif's fixed model is, but that
@@ -914,26 +1182,61 @@ debugger attached is not probed; the stub uses it only at the end.
   here.
 - **Process memory at IRAM addresses** (§13). Every process's code, data,
   arena and stack sit at IRAM addresses here, and the loader writes images
-  there with ordinary stores. The emulator serves data loads and stores of
-  any width at those addresses (§3c); whether silicon serves data accesses
-  through the IRAM window at all is unprobed. If it does not, a process's
-  writable segments and stack need the DRAM twin of its region, which is a
-  second address for the same bytes and so a change to the linker scripts
-  and the loader's destination, not to the program.
+  there with ordinary stores, bytes included. The emulator serves data loads
+  and stores of any width at those addresses (§3c).
+  *On silicon (rev v0.2, ROM `esp32s3-20210327`):* the loader's first byte
+  store into root's region is refused: `root_server_boot` stops with a
+  kernel fault, cause 3, EXCVADDR 0x403a0000, EPC1 the `s8i` in
+  `kcore.mem.copy_bytes`. No process can be loaded where the layout puts it.
+  `bus_probe` answers what the fix rests on (§3a, §3c): at both ends of the
+  process range the IRAM and DRAM names are one memory; data at the DRAM
+  name takes every width, unaligned loads and `s32c1i`; code stored by
+  words at the IRAM name runs, in kernel and in user mode, and does not run
+  at its DRAM name; and sub-word loads are refused at the IRAM name as
+  stores are, so read-only data cannot stay beside the code there.
+  The fix: a process's code stays at IRAM addresses and its writable
+  segments, arena and stack move to the DRAM twin of the same region. That
+  is two addresses for one region, so it is more than the linker scripts:
+  the loader's region test and `start_process` in `kernel/core/` would need a
+  HAL seam they do not have. It is not built; the tree's spec specifies it
+  when it lands. Storing code through its DRAM name would not do: on the
+  emulator, whose IRAM and DRAM are separate arrays (§3a), code stored that
+  way is not at its IRAM name.
 - **The interrupt matrix reset value.** Unrouted map registers read 6 here,
   with the ROM or without it (a `-kernel` image reads 6 at sources 0 and 27),
   so 6 is the emulator's reset value and not something the ROM writes.
+  `intc_init` writes every map register itself, so the value does not matter.
 - **The second core.** Here the APP CPU runs ROM code and polls for an entry
   address (§2c). On silicon core 1 leaves reset held in reset with its clock
   gated (esp-idf's `soc/system_reg.h`: `SYSTEM_CONTROL_CORE_1_RESETING`
   defaults to 1 and `SYSTEM_CONTROL_CORE_1_CLKGATE_EN` to 0), so an entry
-  address alone does not start it.
-- **`VECBASE`** read back `0xFFFFFFFF` unmasked here (§5a).
+  address alone does not start it. The kernel never starts it; a core held in
+  reset touches nothing.
+- **`VECBASE`** read back `0xFFFFFFFF` unmasked here (§5a). The table is 1 KiB
+  aligned, which is what the ISA asks, so a masked register reads the same.
+  *On silicon (rev v0.2, ROM `esp32s3-20210327`):* the table at
+  0x4037_8400 receives `syscall` and level-1 interrupts from user mode.
+- **`waiti`.** The kernel never executes it (§6d): idle is a poll loop, so
+  whether a part's `waiti` wakes the way the emulator's does cannot matter
+  for a first boot.
 - **The ROM banner.** Its third line carries the reset reason and the strap
   word (`boot:0x4` here, where `GPIO_STRAP` reads 4), so it differs on a
-  board strapped otherwise.
+  board strapped otherwise. *On silicon (rev v0.2, ROM
+  `esp32s3-20210327`):* `rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)`
+  after power-on; the first two lines read as they do here.
 - **Consoles.** UART0's FIFO never fills here (§4); USB-Serial-JTAG prints
-  nothing here.
+  nothing here. *Prepared for:* UART0 at the ROM's 115200 (§4a); every
+  writer polls for FIFO room before each store. USB-Serial-JTAG is a written
+  plan (§4a). *On silicon (rev v0.2, ROM `esp32s3-20210327`):* UART0 through
+  the board's USB-to-UART bridge prints every kernel line at the ROM's
+  divisor with no clock setup of ours, and the FIFO fills (§4).
+  *Unprobed on silicon:* USB-Serial-JTAG, and `kernel_fault`'s wait for FIFO
+  room: no kernel fault outside a probe step has been taken with it.
+- **`simcall`.** Answered here under `-semihosting`; unknown with no debugger.
+  *Prepared for:* a board image never executes it (§10). *On silicon (rev
+  v0.2, ROM `esp32s3-20210327`):* every stop seen ends in its quiet loop:
+  `boot`, `timer_tick` and `bus_probe` stay on their halt line, and a kernel
+  fault stays on its fault line.
 - **GPIO and LEDC** are absent here (§9): the first LED is a real-board test.
 
 ---
@@ -998,27 +1301,29 @@ process, long after the boot path has left the ROM's stack.
 Each image is a Blade-built sosimg linked at its region's base: one R+X
 segment (literal pools, code, read-only data) and one R+W segment (data, then
 the zero-filled `.bss` and arena). The kernel's link script puts the appended
-root image in `.payload`, at an instruction-bus address, and child images in
-`.childimg`, at a data-bus address.
+root image and the child images in `.drom`, at data-bus addresses, so the
+loader reads every image as data on the data bus.
 
 ### 13b. What the cases showed
 
-- The loader reads a root image through the instruction-bus window
-  (`.payload`, 0x420x_xxxx) and a child's through the data-bus window
-  (0x3C2x_xxxx), and copies both into IRAM with ordinary stores. Each process
+- The loader reads a root image and a child's through the data-bus window
+  (0x3C0x_xxxx), and copies both into IRAM with ordinary stores. Each process
   then runs from IRAM: root reports `entry=0x403a043c` on its load line, and
   its ticks report PCs in 0x403A_xxxx.
-- A process's stack, data and arena at IRAM addresses take loads and stores
-  of every width, `s32c1i` included (the inline word atomics, §8).
+- Under the emulator a process's stack, data and arena at IRAM addresses
+  take loads and stores of every width, `s32c1i` included (the inline word
+  atomics, §8). A part refuses the byte and halfword ones there (§3c).
 - Two processes run at two link addresses in one address space, and a child
   started from a blob runs at the destination its region-table row names.
 - Two threads of one process, preempted by the tick in the middle of a spin
-  that holds a0, a2..a13, `SAR`, `SCOMPARE1`, `THREADPTR`, `LBEG`, `LEND` and
-  `LCOUNT` (non-zero, with `LEND` at an address never executed), find every
-  one as they left it (`frame_hold`, `tests/frame-hold/hold.c`).
+  that holds a0, a2..a13, `SAR`, `SCOMPARE1`, `THREADPTR`, `LBEG`, `LEND`,
+  `LCOUNT` (non-zero, with `LEND` at an address never executed) and, by
+  turns, a14 or a15 as the spin's counter, find every one as they left it
+  (`frame_hold`, `tests/frame-hold/hold.c`).
 - A process binds and releases more distinct lines than there are device CPU
   interrupts (§6c) and goes on binding; the slab's `NoResource` is the limit
   it meets (`irq_line_cycle`).
 
-All of this rests on the emulator's generous bus (§3c); §11 lists what
-silicon may refuse.
+All of this rests on the emulator's generous bus (§3c). On silicon the
+loader's first byte store into root's region is refused, so no process
+loads on a part with this layout (§11).

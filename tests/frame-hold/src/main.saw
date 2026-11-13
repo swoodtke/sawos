@@ -3,7 +3,8 @@
 // Two threads of one process each run `sos_frame_hold` (`../hold.c`): every
 // round it loads values of its own into every register the board's trap frame
 // carries that a loop can hold (a0 and a2 to a13, SAR, SCOMPARE1, THREADPTR,
-// LBEG, LEND, LCOUNT), publishes the round, spins until the other thread has
+// LBEG, LEND, LCOUNT, and a14 or a15 by turns, as the counter its spin
+// compares with), publishes the round, spins until the other thread has
 // published it too, and checks each value. The spin makes no call into the
 // kernel, so the thread that publishes first leaves its spin only after a tick
 // has taken the processor from it and the other thread has run: each round
@@ -22,8 +23,8 @@
 import sos.{System, Process, Thread}
 
 extern "C" {
-    func sos_frame_hold(mine: UInt, other: UInt, rounds: UInt,
-                        seed: UInt) -> UInt
+    func sos_frame_hold(mine: UInt, other: UInt, rounds: UInt, seed: UInt,
+                        other_seed: UInt) -> UInt
 }
 
 /// The boot handle, parked for the workers, and the witness that says which
@@ -46,7 +47,8 @@ static ROLE_B: UInt = 2
 static ROUNDS: UInt = 16
 
 /// Each thread's seed. The top nibbles differ, which places the two threads'
-/// LBEG and LEND apart, and so do the low six bits, which are SAR's.
+/// LBEG and LEND apart and gives their counters different biases, and so do
+/// the low six bits, which are SAR's.
 static SEED_A: UInt = 0x1357_0005
 static SEED_B: UInt = 0x2468_002A
 
@@ -84,9 +86,9 @@ func register_name(code: UInt) -> String {
     if code == 1 {
         return "a0"
     }
-    if code >= 3 && code <= 14 {
+    if code >= 3 && code <= 16 {
         let names = ["a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10",
-                     "a11", "a12", "a13"]
+                     "a11", "a12", "a13", "a14", "a15"]
         return names[(code - 3) as Int]
     }
     if code == 20 {
@@ -116,8 +118,9 @@ func worker(role: UInt) {
     let me = try proc.thread_self() catch { return }
     let other = if role == ROLE_A { ROLE_B } else { ROLE_A }
     let seed = if role == ROLE_A { SEED_A } else { SEED_B }
+    let other_seed = if role == ROLE_A { SEED_B } else { SEED_A }
     let code = sos_frame_hold(progress_word(role), progress_word(other),
-                              ROUNDS, seed)
+                              ROUNDS, seed, other_seed)
     if code != 0 {
         print("\nSOS framehold: thread {} lost {}\n",
               if role == ROLE_A { "A" } else { "B" }, register_name(code))

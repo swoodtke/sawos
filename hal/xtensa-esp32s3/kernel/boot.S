@@ -9,9 +9,10 @@
  *   1. The direct-boot entry. The mask ROM checks two magic words at flash
  *      offset 0x400, maps flash at both bus windows and `callx8`s flash offset
  *      0x408 (../ABI.md §2a); `esp32s3.ld` places `.magic` and `.entry` there.
- *   2. `_start`: leave the ROM's register window, clear `CPENABLE`, copy the
- *      vectors and the trap path into IRAM, copy `.data`, zero `.bss`, point
- *      `VECBASE` at the table and call the Saw `kmain`.
+ *   2. `_start`: leave the ROM's register window, clear `CPENABLE`, quiet
+ *      the watchdogs, copy the vectors and the trap path into IRAM, copy
+ *      `.data`, zero `.bss`, point `VECBASE` at the table and call the Saw
+ *      `kmain`.
  *   3. The vector table (../ABI.md §5a). `syscall`, level-1 interrupts and
  *      faults taken in user mode arrive at the user vector, which is the trap
  *      entry. Every other vector stops the machine through `kernel_fault`
@@ -72,6 +73,18 @@
     /* The kernel's PS: INTLEVEL = 15, EXCM = 0, UM = 0, WOE = 0. */
     .equ PS_KERNEL,     0x0F
 
+    /* The watchdog registers and their write-protect keys. ../ABI.md §2e
+     * gives the source of each number. */
+    .equ WDT_WKEY,              0x50D83AA1  /* RTC and TIMG watchdog key */
+    .equ RTC_WDT_CONFIG0,       0x60008098
+    .equ RTC_WDT_WPROTECT,      0x600080B0
+    .equ SWD_CONF,              0x600080B4
+    .equ SWD_WPROTECT,          0x600080B8
+    .equ SWD_WKEY,              0x8F1D312A
+    .equ SWD_AUTO_FEED_EN,      0x80000000  /* SWD_CONF bit 31 */
+    .equ TIMG0_WDT_CONFIG0,     0x6001F048
+    .equ TIMG0_WDT_WPROTECT,    0x6001F064
+
 /* ---- the direct-boot protocol -------------------------------------------- */
 
     .section .magic, "a"
@@ -97,6 +110,15 @@ _entry:
     .literal .Lvecbase, _vector_base
     .literal .Lstack, _stack_top
     .literal .Lkmain, kmain
+    .literal .Lwdt_key, WDT_WKEY
+    .literal .Lrtc_wdt_wprotect, RTC_WDT_WPROTECT
+    .literal .Lrtc_wdt_config0, RTC_WDT_CONFIG0
+    .literal .Ltimg0_wdt_wprotect, TIMG0_WDT_WPROTECT
+    .literal .Ltimg0_wdt_config0, TIMG0_WDT_CONFIG0
+    .literal .Lswd_key, SWD_WKEY
+    .literal .Lswd_wprotect, SWD_WPROTECT
+    .literal .Lswd_conf, SWD_CONF
+    .literal .Lswd_auto_feed, SWD_AUTO_FEED_EN
     .align  4
     .global _start
 _start:
@@ -118,6 +140,46 @@ _start:
     movi    a9, 0
     wsr     a9, cpenable
     rsync
+
+    /* The watchdogs, before anything slow (../ABI.md §2e). On silicon the ROM
+     * leaves the RTC watchdog and TIMG0's watchdog running after a flash boot,
+     * and the super watchdog needs feeding; any of them resets the part
+     * mid-boot. The RTC and TIMG0 watchdogs are switched off whole (config
+     * word 0), the super watchdog is set to feed itself, and each register is
+     * unlocked with its key for the one write and locked again after. The
+     * emulator models the registers and none of these writes changes what it
+     * runs. */
+    movi    a5, 0
+    l32r    a3, .Lwdt_key
+    l32r    a2, .Lrtc_wdt_wprotect
+    l32r    a4, .Lrtc_wdt_config0
+    memw
+    s32i    a3, a2, 0
+    memw
+    s32i    a5, a4, 0
+    memw
+    s32i    a5, a2, 0
+    l32r    a2, .Ltimg0_wdt_wprotect
+    l32r    a4, .Ltimg0_wdt_config0
+    memw
+    s32i    a3, a2, 0
+    memw
+    s32i    a5, a4, 0
+    memw
+    s32i    a5, a2, 0
+    l32r    a3, .Lswd_key
+    l32r    a2, .Lswd_wprotect
+    l32r    a4, .Lswd_conf
+    l32r    a7, .Lswd_auto_feed
+    memw
+    s32i    a3, a2, 0
+    memw
+    l32i    a6, a4, 0
+    or      a6, a6, a7
+    s32i    a6, a4, 0
+    memw
+    s32i    a5, a2, 0
+    memw
 
     /* The vectors and the trap path: flash -> IRAM. The load addresses are
      * the data-bus aliases of their flash bytes (`esp32s3.ld`), so these are

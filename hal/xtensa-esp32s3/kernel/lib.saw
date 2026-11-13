@@ -211,6 +211,23 @@ public func map_place(cursor: UInt, pa: UInt, device: Bool) -> UInt {
 public static RAM_BASE: UInt = 0x403A_0000
 public static RAM_TOP: UInt = 0x403E_0000
 
+/// The IRAM range silicon also serves through the data bus: IRAM
+/// `SHARED_IRAM_BASE`..`SHARED_IRAM_TOP` and DRAM `IRAM_DRAM_OFFSET` lower are
+/// one SRAM under two names (../ABI.md §3a). The emulator keeps IRAM and DRAM
+/// as two arrays, so there a store through one name is not seen through the
+/// other; nothing in the kernel relies on either answer.
+public static SHARED_IRAM_BASE: UInt = 0x4037_8000
+public static SHARED_IRAM_TOP: UInt = 0x403E_0000
+public static IRAM_DRAM_OFFSET: UInt = 0x006F_0000
+
+static_assert(RAM_BASE >= SHARED_IRAM_BASE && RAM_TOP <= SHARED_IRAM_TOP,
+              "the process regions must lie in the IRAM that has a DRAM name")
+
+/// The DRAM name of the shared IRAM address `iram`.
+public func dram_name(iram: UInt) -> UInt {
+    iram - IRAM_DRAM_OFFSET
+}
+
 /// May `[base, top)` be installed as a RAM row in a user domain? On this tier
 /// nothing is installed, but the range is still checked: a map of a device
 /// window through the RAM door, or of the kernel's own memory, is refused.
@@ -1044,6 +1061,17 @@ func unassigned_entry() unsafe -> UInt {
 /// nothing is lost by moving it, and on the emulator no level is left behind
 /// on the CPU interrupt for its next line to take as a fire. Only when every
 /// masked entry is pending is the lowest of them taken.
+///
+/// That fallback has a cost on the installed emulator (../ABI.md §6c). The
+/// line that takes such an entry inherits a CPU interrupt that is still high:
+/// it gets a fire nobody raised, and again after each ack, because it keeps
+/// the entry and the level has not moved. The old device's level changes go
+/// to its new route, not to this CPU interrupt, so the stale level falls only
+/// when a source routed to it, the new line's own device, sends a level. It
+/// takes more asserting devices left masked at once than the preference can
+/// avoid: every unassigned entry gone and every masked one pending. A
+/// combinational matrix has no such stale level; silicon's is one by
+/// Espressif's fix to the model, which is read, not probed.
 func take_back_entry() unsafe -> UInt {
     let pending = sos_interrupt_read()
     var fallback = DEVICE_CPU_INT_COUNT

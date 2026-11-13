@@ -8367,10 +8367,11 @@ def _root_image_path(pkg_dir, arch):
     return os.path.join(out_dir, images[0])
 
 
-def _esp32s3_smoke(wanted):
+def _esp32s3_smoke(wanted, emit=None, emit_out=None):
     """The ESP32-S3 board smoke: Xtensa, call0, the `Flat` tier. Returns the
     process exit status. `wanted` is the `--case` names (underscored), or
-    empty for every case.
+    empty for every case. `emit`, a case name, builds that case's board image
+    into `emit_out` instead of running anything.
 
     It is not part of `make sos-test`: `make sos-smoke-esp32s3` runs it
     against the Espressif QEMU, beside the C3's smoke and on the same terms.
@@ -8468,21 +8469,28 @@ def _esp32s3_smoke(wanted):
                             "--module-path", SOSABI_MODULE])
         return obj
 
-    def flash_image(name, objs):
+    def flash_image(name, objs, board=False):
         """Link, then write each loadable segment into a 4 MiB flash image at
         its load address's flash offset (ABI.md §1e), and check the
-        direct-boot magic is really there. Returns the image and the bytes
-        placed."""
-        elf = os.path.join(s3_build, f"{name}.elf")
-        flash = os.path.join(s3_build, f"{name}.flash.bin")
+        direct-boot magic is really there and byte 0 is not an esptool
+        header's. Returns the image, the bytes placed, and the offset one past
+        the last of them, which is the length a board needs written.
+
+        A board image is linked with no `simcall` in its stops (`board`), and
+        is never booted here: QEMU's runs are the emulator's image."""
+        tag = "board" if board else "flash"
+        elf = os.path.join(s3_build, f"{name}.{tag}.elf")
+        flash = os.path.join(s3_build, f"{name}.{tag}.bin")
+        board_args = ["--defsym=_sos_semihosting=0"] if board else []
         _run([lld, "-T", os.path.join(s3_hal, "kernel", "esp32s3.ld"),
-              "--gc-sections", "-o", elf, *objs])
+              "--gc-sections", *board_args, "-o", elf, *objs])
         with open(elf, "rb") as f:
             data = f.read()
         phoff, = struct.unpack_from("<I", data, 28)
         phnum, = struct.unpack_from("<H", data, 44)
         image = bytearray(b"\xff" * flash_bytes)
         used = 0
+        end = 0
         for i in range(phnum):
             p_type, offset, _vaddr, paddr, filesz = struct.unpack_from(
                 "<5I", data, phoff + 32 * i)
@@ -8494,6 +8502,7 @@ def _esp32s3_smoke(wanted):
             at = paddr - flash_ibus
             image[at:at + filesz] = data[offset:offset + filesz]
             used += filesz
+            end = max(end, at + filesz)
         # Without these two words the mask ROM never enters the image and the
         # run is a silent timeout; checking here turns that into a sentence.
         m0, m1 = struct.unpack_from("<II", image, magic_offset)
@@ -8502,9 +8511,14 @@ def _esp32s3_smoke(wanted):
                 f"{name}: flash image lacks the direct-boot magic (read "
                 f"{m0:#010x} {m1:#010x}, want {magic:#010x} twice) — check "
                 ".magic in hal/xtensa-esp32s3/kernel/esp32s3.ld")
+        # 0xE9 at byte 0 is an esptool image header: the ROM would take the
+        # image for one and never reach the direct-boot check (ABI.md §2a).
+        if image[0] == 0xE9:
+            raise ToolError(f"{name}: flash byte 0 is 0xE9, an esptool "
+                            "image header; the ROM would not direct-boot it")
         with open(flash, "wb") as f:
             f.write(image)
-        return flash, used
+        return flash, used, end
 
     def boot(flash):
         """Boot the image; collect the console until the emulator exits.
@@ -8625,8 +8639,10 @@ def _esp32s3_smoke(wanted):
         {
             # The same tick, delivered at a preemption point through
             # `irq_poll`: `at 0x00000001` is the sentinel such a tick reports.
-            # The ticks-taken count is printed and not asserted, as on the
-            # gate: ticks accrue with host time.
+            # How many ticks the section took accrues with host time (a
+            # loaded host lets a second period pass between two points), so
+            # the count is printed and not asserted; the section ends only
+            # once the first has been taken.
             "name": "preempt_tick",
             "src": os.path.join(TESTS_DIR, "preempt_tick.saw"),
             "asm": "payload_spin.S",
@@ -8672,6 +8688,105 @@ def _esp32s3_smoke(wanted):
                            "poll=0x00000000",
                            "SOS irqtb: 27 unmasked, poll=0x0000001b",
                            halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # The accesses a board may refuse, one at a time, each named
+            # before it is made, the probe carrying on past a refusal
+            # (hal/xtensa-esp32s3/README.md's bring-up has it as a stage,
+            # with the text a part printed: it refused six of these accesses
+            # and answered `shared`, and ABI.md §3c sets its answers beside
+            # these). The emulator allows every one, so the case asserts the
+            # whole transcript: each value read back, `not shared` from both
+            # alias steps (the emulator keeps IRAM and DRAM as two arrays),
+            # the copied routine's answer in IRAM and at its DRAM name, the
+            # region table's magic through the data window, and the
+            # user-mode program's line and clean stop. The flash addresses
+            # move with the code, so the four flash step lines are asserted
+            # up to the window's top byte.
+            "name": "bus_probe",
+            "src": os.path.join(TESTS_DIR, "bus_probe.saw"),
+            "asm": "bus_probe.S",
+            "expect_out": [
+                rom,
+                "SOS probe: bus probe on xtensa (ESP32-S3)",
+                "SOS probe: word store and load, process IRAM at 0x403a0000",
+                "SOS probe: ok 0x5a5aa5a5",
+                "SOS probe: word store and load, process IRAM at 0x403dfffc",
+                "SOS probe: ok 0x5a5aa5a5",
+                "SOS probe: alias, stored at 0x403a0000 then 0x3fcb0000, "
+                "read at 0x403a0000",
+                "SOS probe: ok 0x0f1e2d3c",
+                "SOS probe: not shared",
+                "SOS probe: alias, stored at 0x3fcefffc then 0x403dfffc, "
+                "read at 0x3fcefffc",
+                "SOS probe: ok 0x0f1e2d3c",
+                "SOS probe: not shared",
+                "SOS probe: word store and load, DRAM at 0x3fcb0000",
+                "SOS probe: ok 0x5a5aa5a5",
+                "SOS probe: halfword store and load, DRAM at 0x3fcb0002",
+                "SOS probe: ok 0x0000c33c",
+                "SOS probe: byte store and load, DRAM at 0x3fcb0003",
+                "SOS probe: ok 0x00000096",
+                "SOS probe: word store and load, DRAM at 0x3fcefffc",
+                "SOS probe: ok 0x5a5aa5a5",
+                "SOS probe: halfword store and load, DRAM at 0x3fcefffe",
+                "SOS probe: ok 0x0000c33c",
+                "SOS probe: byte store and load, DRAM at 0x3fceffff",
+                "SOS probe: ok 0x00000096",
+                "SOS probe: word store and load, DRAM at 0x3fcb0004",
+                "SOS probe: ok 0x5a5aa5a5",
+                # The emulator makes the load, unaligned, across the two
+                # words: the step 3 word's bytes 1..3, then byte 0 of this
+                # one.
+                "SOS probe: unaligned word load, DRAM at 0x3fcb0001",
+                "SOS probe: ok 0xa5963ca5",
+                "SOS probe: ATOMCTL 0x00000015",
+                "SOS probe: word store, then s32c1i swapping it, DRAM at "
+                "0x3fcb0010",
+                "SOS probe: ok 0x00000005",
+                "SOS probe: word load after s32c1i, DRAM at 0x3fcb0010",
+                "SOS probe: ok 0x00000007",
+                "SOS probe: word store and load, process IRAM at 0x403a0020",
+                "SOS probe: ok 0x5a5aa5a5",
+                "SOS probe: byte load, process IRAM at 0x403a0021",
+                "SOS probe: ok 0x000000a5",
+                "SOS probe: halfword load, process IRAM at 0x403a0022",
+                "SOS probe: ok 0x00005a5a",
+                "SOS probe: byte store, word loaded back, process IRAM at "
+                "0x403a0021",
+                "SOS probe: ok 0x5a5a96a5",
+                "SOS probe: halfword store, word loaded back, process IRAM at "
+                "0x403a0022",
+                "SOS probe: ok 0xc33c96a5",
+                "SOS probe: payload copied by words, process IRAM at "
+                "0x403a0100",
+                "SOS probe: ok 0x802ac222",
+                "SOS probe: call, process IRAM at 0x403a0100",
+                "SOS probe: ok 0x0000102a",
+                "SOS probe: payload copied by words, DRAM at 0x3fcb0100",
+                "SOS probe: ok 0x802ac222",
+                "SOS probe: call, DRAM at 0x3fcb0100",
+                "SOS probe: ok 0x0000102a",
+                "SOS probe: word load, instruction window at 0x42",
+                "SOS probe: ok 0x802ac222",
+                "SOS probe: byte load, instruction window at 0x42",
+                "SOS probe: ok 0x000000c2",
+                "SOS probe: word load, data window at 0x3c",
+                f"SOS probe: ok {REGION_TABLE_MAGIC:#010x}",
+                "SOS probe: byte load, data window at 0x3c",
+                f"SOS probe: ok {(REGION_TABLE_MAGIC >> 8) & 0xFF:#010x}",
+                "SOS probe: user literal, word store and load, process IRAM "
+                "at 0x403a0108",
+                "SOS probe: ok 0x3fcb0400",
+                "SOS probe: entering user mode at 0x403a010c, byte access at "
+                "0x3fcb0400",
+                "SOS probe: every line after the console handover is from "
+                "user mode",
+                "SOS: console handover",
+                "SOS-U K",
+                "SOS probe: done",
+                halt_pass],
             "expect_clean_exit": True,
         },
     ]
@@ -8753,7 +8868,9 @@ def _esp32s3_smoke(wanted):
     cases = kernel_cases + process_cases
 
     # `--case` narrows the run, as on the gate, and only the named cases'
-    # packages are built.
+    # packages are built. `--emit-flash` names exactly one.
+    if emit is not None:
+        wanted = [emit]
     if wanted:
         names = [c["name"] for c in cases]
         unknown = [w for w in wanted if w not in names]
@@ -8812,20 +8929,48 @@ def _esp32s3_smoke(wanted):
             case.setdefault("_child_images", {})[arch["name"]] = \
                 [images[c] for c in case["children"]]
 
+    def case_objs(case):
+        """Every object one case's image links: the native half, its kernel,
+        and what is appended to it."""
+        name = case["name"]
+        objs = list(shared) + [kernel_obj(name, case["src"])]
+        if case.get("asm"):
+            objs.append(cc(os.path.join(s3_tests, case["asm"]),
+                           os.path.join(s3_build, f"{name}.payload.o")))
+        if case.get("root_pkg"):
+            objs.append(_stitch_root_image(
+                case["_root_image"][arch["name"]], arch, clang, name))
+        if needs_region_table(case):
+            objs.append(_stitch_regions(case, arch, clang))
+        return objs
+
+    if emit is not None:
+        # A board image: the case's own image, linked without `simcall`,
+        # trimmed to its last byte, never booted here. The first run on a
+        # board is hal/xtensa-esp32s3/README.md's "First run on a board".
+        case = cases[0]
+        try:
+            _flash, used, end = flash_image(case["name"], case_objs(case),
+                                            board=True)
+        except ToolError as e:
+            print(f"{CROSS} {case['name']}: {e}", file=sys.stderr)
+            return 1
+        with open(_flash, "rb") as f:
+            image = f.read(end)
+        with open(emit_out, "wb") as f:
+            f.write(image)
+        print(f"{CHECK} {case['name']}: {emit_out}  ({end} bytes, written "
+              f"at flash offset 0x0; magic checked at 0x400)")
+        print("  write it with:")
+        print(f"    python3 -m esptool --chip esp32s3 --port PORT "
+              f"write-flash 0x0 {emit_out}")
+        return 0
+
     failed = 0
     for i, case in enumerate(cases, 1):
         name = case["name"]
         try:
-            objs = list(shared) + [kernel_obj(name, case["src"])]
-            if case.get("asm"):
-                objs.append(cc(os.path.join(s3_tests, case["asm"]),
-                               os.path.join(s3_build, f"{name}.payload.o")))
-            if case.get("root_pkg"):
-                objs.append(_stitch_root_image(
-                    case["_root_image"][arch["name"]], arch, clang, name))
-            if needs_region_table(case):
-                objs.append(_stitch_regions(case, arch, clang))
-            flash, size = flash_image(name, objs)
+            flash, size, _end = flash_image(name, case_objs(case))
             out, status = boot(flash)
         except ToolError as e:
             print(f"[{i}/{len(cases)}] {CROSS} {name}")
@@ -8884,7 +9029,19 @@ def main():
                              "toolchain on the gate's machine. `esp32s3` "
                              "is the Xtensa board's smoke, on the same "
                              "terms")
+    parser.add_argument("--emit-flash", metavar="CASE",
+                        help="with --board esp32s3: build CASE's image for a "
+                             "real board (no semihosting exit), write it to "
+                             "--out trimmed to its length, and run nothing")
+    parser.add_argument("--out", metavar="PATH",
+                        help="where --emit-flash writes the image")
     args = parser.parse_args()
+
+    if args.emit_flash is not None and (args.board != "esp32s3"
+                                        or args.out is None):
+        print(f"{RED}--emit-flash needs --board esp32s3 and --out PATH"
+              f"{RESET}", file=sys.stderr)
+        sys.exit(2)
 
     if args.board == "esp32s3":
         # Board section: esp32s3, all of it in `_esp32s3_smoke`. `--case`
@@ -8892,7 +9049,9 @@ def main():
         wanted = [w.strip().replace("-", "_")
                   for value in (args.cases or ()) for w in value.split(",")
                   if w.strip()]
-        sys.exit(_esp32s3_smoke(wanted))
+        emit = (args.emit_flash.strip().replace("-", "_")
+                if args.emit_flash is not None else None)
+        sys.exit(_esp32s3_smoke(wanted, emit, args.out))
 
     if args.board != "virt":
         # ------------------------------------------------------------------
