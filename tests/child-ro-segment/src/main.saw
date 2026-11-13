@@ -1,0 +1,105 @@
+// Test child: a pipe-creation record aimed at this image's own memory, which
+// is linked with its read-only data above its writable data (spec §2.2). The
+// role says where:
+//
+//   1  a word of the read-only data, which lies inside the copy-out window
+//   2  a word of the writable data
+//
+// A call the kernel answers leaves this process alive, and it exits with a
+// code of its own that the launcher can tell apart from every fault.
+//
+// It works at the C altitude because the buffer is an address this program
+// picks, which the typed tier never lets a caller name.
+
+import sos.{ALL_RIGHTS, sos_system_process_self, sos_process_boot_handle_next,
+            sos_process_exit, sos_event_receive, sos_process_pipe_create}
+
+extern "C" {
+    func sos_ro_cell() -> UInt
+}
+
+static TAG_ROLE: UInt = 32
+
+static ROLE_READ_ONLY: UInt = 1
+static ROLE_DATA: UInt = 2
+
+/// How this process ends when the kernel answered its call.
+static EXIT_TAKEN: UInt = 7
+/// The call was refused with a status.
+static EXIT_SETUP: UInt = 97
+/// The boot set held no role.
+static EXIT_NO_ROLE: UInt = 98
+
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+static BOOT_WORDS: Int = 3
+/// The record the kernel writes is two words; the capacity is that.
+static RECORD_WORDS: Int = 2
+
+unsafe static var ROLE: UInt = 0
+unsafe static var CELL: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+func event_word(handle: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let _ = sos_event_receive(handle, (&var word) as UnsafePointer<UInt>)
+    word
+}
+
+func next_record(proc: UInt, rec: &var [UInt; BOOT_WORDS]) unsafe -> UInt {
+    sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                 (BOOT_WORDS as UInt) * word_bytes())
+}
+
+func drain(proc: UInt) unsafe {
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    while next_record(proc, &var rec) == STATUS_OK {
+        if rec[0] == TAG_ROLE {
+            ROLE = event_word(rec[2])
+        }
+    }
+}
+
+func create_at(proc: UInt, at: UInt) unsafe -> UInt {
+    let made = sos_process_pipe_create(proc, at as UnsafePointer<UInt>,
+                                       (RECORD_WORDS as UInt) * word_bytes())
+    if made != STATUS_OK {
+        return EXIT_SETUP
+    }
+    EXIT_TAKEN
+}
+
+func act(proc: UInt) unsafe -> UInt {
+    if ROLE == ROLE_READ_ONLY {
+        return create_at(proc, sos_ro_cell())
+    }
+    if ROLE == ROLE_DATA {
+        return create_at(proc, ((&var CELL) as UnsafePointer<UInt>) as UInt)
+    }
+    EXIT_NO_ROLE
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let proc = ask_process(boot_handle)
+    if proc == NONE {
+        return
+    }
+    drain(proc)
+    let code = act(proc)
+    let _ = sos_process_exit(proc, code)
+}

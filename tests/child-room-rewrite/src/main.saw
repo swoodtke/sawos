@@ -1,0 +1,213 @@
+// Test child: a thread parks in a fused call on a full ring, and a second
+// thread of the same process rewrites the call's args record before there is
+// room (spec §2.1).
+//
+// The record stays in this process's memory while the call waits for room,
+// and the kernel reads it again at the resume. The role says what the second
+// thread writes into it:
+//
+//   1  a body length past `PIPE_BODY_BYTES`, with a body that long in this
+//      process's own data
+//   2  a shorter length than the call was made with, which is still a message
+//
+// The second thread runs only once the first has parked (nothing ticks in this
+// case, and a started thread runs when the running one blocks), then signals
+// the launcher's Event and ends. A call the kernel answers leaves this process
+// alive, and it exits with a code of its own the launcher can tell apart from
+// every fault.
+//
+// It works at the C altitude because the record is one this program rewrites
+// behind the kernel's back, which the typed tier never lets a caller do.
+
+import sos.{System, ALL_RIGHTS, PIPE_MSG_HANDLES, PIPE_BODY_BYTES,
+            sos_system_process_self, sos_process_boot_handle_next,
+            sos_process_exit, sos_event_receive, sos_event_signal,
+            sos_pipe_inlet_call, sos_process_thread_self, sos_thread_exit}
+
+static TAG_ROLE: UInt = 32
+static TAG_INLET: UInt = 35
+static TAG_EVENT: UInt = 37
+
+static ROLE_OVERSIZE: UInt = 1
+static ROLE_SHORTER: UInt = 2
+
+/// How this process ends when its call was answered.
+static EXIT_TAKEN: UInt = 7
+/// The boot set held no role, or a step before the call was refused.
+static EXIT_SETUP: UInt = 97
+
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+static BOOT_WORDS: Int = 3
+static REPLY_WORDS: Int = 64
+
+/// The length the call is made with, and the one role 2 rewrites it to.
+static CALL_BYTES: UInt = 8
+static SHORTER_BYTES: UInt = 4
+
+/// The body role 1 points the record at, and the length it gives: past the
+/// one slot a message has, by more than a word.
+static BIG_WORDS: Int = 64
+static OVERSIZE_BYTES: Int = 200
+
+static_assert(OVERSIZE_BYTES > PIPE_BODY_BYTES,
+              "role 1's length must be past what a message may carry")
+static_assert(BIG_WORDS * 8 >= OVERSIZE_BYTES,
+              "role 1's body must hold the length it gives")
+
+/// What fills the big body, so its bytes are recognisable wherever they land.
+static PATTERN: UInt64 = 0xA5A5_A5A5_A5A5_A5A5
+
+unsafe static var BOOT: UInt = 0
+unsafe static var PROC: UInt = 0
+unsafe static var ROLE: UInt = 0
+unsafe static var INLET: UInt = 0
+unsafe static var EVENT: UInt = 0
+
+unsafe static var BODY: [UInt; 2] = [0; 2]
+unsafe static var BIG: [UInt64; BIG_WORDS] = [0; BIG_WORDS]
+unsafe static var ARGS: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+unsafe static var REPLY: [UInt; REPLY_WORDS] = [0; REPLY_WORDS]
+
+/// The second thread's stack, in this process's own zero-init data.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+func event_word(handle: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let _ = sos_event_receive(handle, (&var word) as UnsafePointer<UInt>)
+    word
+}
+
+func next_record(proc: UInt, rec: &var [UInt; BOOT_WORDS]) unsafe -> UInt {
+    sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                 (BOOT_WORDS as UInt) * word_bytes())
+}
+
+func drain(proc: UInt) unsafe {
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    while next_record(proc, &var rec) == STATUS_OK {
+        let tag = rec[0]
+        let word = rec[2]
+        if tag == TAG_ROLE {
+            ROLE = event_word(word)
+        } else if tag == TAG_INLET {
+            INLET = word
+        } else if tag == TAG_EVENT {
+            EVENT = word
+        }
+    }
+}
+
+func args_at() unsafe -> UInt {
+    ((&var ARGS) as UnsafePointer<UInt>) as UInt
+}
+
+/// The record the call is made with: `CALL_BYTES` of this process's data and
+/// no handles.
+func build_args() unsafe {
+    ARGS[0] = ((&var BODY) as UnsafePointer<UInt>) as UInt
+    ARGS[1] = CALL_BYTES
+    var slot: Int = 2
+    while slot < SEND_WORDS {
+        ARGS[slot] = NONE
+        slot = slot + 1
+    }
+}
+
+/// The second thread's write: the role's length, and for role 1 a body that
+/// long.
+func rewrite() unsafe {
+    if ROLE == ROLE_OVERSIZE {
+        var i: Int = 0
+        while i < BIG_WORDS {
+            BIG[i] = PATTERN
+            i = i + 1
+        }
+        ARGS[0] = ((&var BIG) as UnsafePointer<UInt64>) as UInt
+        ARGS[1] = OVERSIZE_BYTES as UInt
+    } else if ROLE == ROLE_SHORTER {
+        ARGS[1] = SHORTER_BYTES
+    }
+}
+
+func first(boot_handle: UInt) unsafe {
+    BOOT = boot_handle
+    let system = System(boot_handle: boot_handle)
+    let proc = ask_process(boot_handle)
+    if proc == NONE {
+        return
+    }
+    PROC = proc
+    drain(proc)
+    if ROLE == 0 || INLET == NONE || EVENT == NONE {
+        let _ = sos_process_exit(proc, EXIT_SETUP)
+        return
+    }
+    let me = try system.process_self() catch {
+        let _ = sos_process_exit(proc, EXIT_SETUP)
+        return
+    }
+    let worker = try me.thread_create(stack_top: stack_top(), arg: 1) catch {
+        let _ = sos_process_exit(proc, EXIT_SETUP)
+        return
+    }
+    let _ = worker.start()
+    build_args()
+    var value: UInt = 0
+    let _ = sos_pipe_inlet_call(INLET, args_at() as UnsafePointer<UInt>,
+                                (SEND_WORDS as UInt) * word_bytes(),
+                                ((&var REPLY) as UnsafePointer<UInt>),
+                                (&var value) as UnsafePointer<UInt>)
+    let _ = sos_process_exit(proc, EXIT_TAKEN)
+}
+
+/// The second thread: rewrite the parked call's record, tell the launcher,
+/// and end.
+func second() unsafe {
+    rewrite()
+    let _ = sos_event_signal(EVENT, 1)
+    var me: UInt = NONE
+    let _ = sos_process_thread_self(PROC, (&var me) as UnsafePointer<UInt>)
+    let _ = sos_thread_exit(me, 0)
+}
+
+/// Whether this thread is the second one: the first records the boot handle.
+func is_second() unsafe -> Bool {
+    BOOT != 0
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if not is_second() {
+        first(arg)
+    } else {
+        second()
+    }
+}

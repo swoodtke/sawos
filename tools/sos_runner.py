@@ -682,6 +682,13 @@ CHILD_WX_FAULT_PKG = os.path.join(TESTS_DIR, "child-wx-fault")
 LATE_DOOR_GONE_PKG = os.path.join(TESTS_DIR, "late-door-gone")
 CHILD_LATE_DOOR_PKG = os.path.join(TESTS_DIR, "child-late-door")
 CHILD_LATE_DOOR2_PKG = os.path.join(TESTS_DIR, "child-late-door2")
+ROOM_REWRITE_PKG = os.path.join(TESTS_DIR, "room-rewrite")
+CHILD_ROOM_REWRITE_PKG = os.path.join(TESTS_DIR, "child-room-rewrite")
+RO_DESTINATION_PKG = os.path.join(TESTS_DIR, "ro-destination")
+CHILD_RO_DESTINATION_PKG = os.path.join(TESTS_DIR, "child-ro-destination")
+RO_SEGMENT_PKG = os.path.join(TESTS_DIR, "ro-segment")
+CHILD_RO_SEGMENT_PKG = os.path.join(TESTS_DIR, "child-ro-segment")
+IMAGE_REREAD_PKG = os.path.join(TESTS_DIR, "image-reread")
 DEVICE_FOUR_BYTES_PKG = os.path.join(TESTS_DIR, "device-four-bytes")
 
 # Clock and Timer objects. What an object answers and whether a wait parks are
@@ -8223,6 +8230,110 @@ TEST_CASES = [
                        "SOS latedoor: two threads of one process: the "
                        "delivery went to the other process",
                        "SOS latedoor: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A call parked for room keeps its args record in the caller's memory,
+        # and the kernel reads it again at the resume, so a sibling thread can
+        # rewrite it in between (spec §2.1). The record the resume reads is
+        # held to the rules the call was: a body length past `PIPE_BODY_BYTES`
+        # ends the process with `BadArg` (131081) and stages nothing, and a
+        # record rewritten into another legal message is that message, staged
+        # with the length the resume read. The child's second thread runs only
+        # once the first has parked, since nothing ticks in this case.
+        "name": "room_record_rewritten",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": ROOM_REWRITE_PKG,
+        "children": [CHILD_ROOM_REWRITE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS roomrewrite: length past a slot: the process "
+                       "ended with BadArg",
+                       "SOS roomrewrite: length past a slot: the ring is "
+                       "whole",
+                       "SOS roomrewrite: shorter length: the message carries "
+                       "the new length",
+                       "SOS roomrewrite: shorter length: the call was "
+                       "answered",
+                       "SOS roomrewrite: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The kernel writes a result only into a row that permits write (spec
+        # §2.2). A launcher maps a piece of its child's own region into the
+        # hole between the child's data and its stack, inside the child's
+        # copy-out window, read-only: a pipe-creation record aimed there ends
+        # the child with `BadBuffer` and leaves the piece as the launcher
+        # stamped it. A wait parked with its record in the piece mapped
+        # read-write, and the piece unmapped and mapped again at the same
+        # address before the wake, is judged by the row there at the wake:
+        # read-only ends the child and writes nothing, read-write is written.
+        # Only where a mapping takes its memory's own address does the piece
+        # lie in the window; where the target translates, a mapping lies
+        # above the child's region and is no buffer at all.
+        "name": "read_only_row_not_destination",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": RO_DESTINATION_PKG,
+        "children": [CHILD_RO_DESTINATION_PKG],
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS rodest: read-write piece, record: taken",
+                       "SOS rodest: read-only piece, record: the process "
+                       "ended with BadBuffer",
+                       "SOS rodest: read-only piece, record: the piece is as "
+                       "root left it",
+                       "SOS rodest: remapped read-only while parked: the "
+                       "process ended with BadBuffer",
+                       "SOS rodest: remapped read-only while parked: the "
+                       "piece is as root left it",
+                       "SOS rodest: remapped read-write while parked: "
+                       "delivered into the new row",
+                       "SOS rodest: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same rule over an image's own rows, on every profile (spec
+        # §2.2): a child linked with its read-only data above its writable
+        # data has that segment inside its copy-out window, which starts at the
+        # lowest writable segment. A pipe-creation record aimed at a word of it
+        # ends the child with `BadBuffer`; the same record aimed at its
+        # writable data is taken.
+        "name": "read_only_segment_not_destination",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": RO_SEGMENT_PKG,
+        "children": [CHILD_RO_SEGMENT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS roseg: a record into the read-only data: "
+                       "BadBuffer",
+                       "SOS roseg: a record into the writable data: taken",
+                       "SOS roseg: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The kernel places the image it validated, whatever is written into
+        # the image's memory while it places it (spec §2.8). The image is a
+        # piece of a child's own region, mapped into that child inside its
+        # copy-out window, and the child parks a wait with its record over the
+        # image's second segment record, fed by a Timer of root's. A fire
+        # during the first segment's long zero-filled tail is delivered at a
+        # preemption point, between the two segments. Root tries until it
+        # finds the record on the image of a create that succeeded, moving the
+        # Timer's delay toward the placement after each miss; how many tries
+        # that takes is the host's and is not printed. Only where a mapping
+        # takes its memory's own address does the piece lie in the window.
+        "name": "image_written_while_placed",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IMAGE_REREAD_PKG,
+        "children": [CHILD_RO_DESTINATION_PKG],
+        "pool": True,
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS imgreread: a record landed during placement: "
+                       "created",
+                       "SOS imgreread: done"],
         "expect_clean_exit": True,
     },
     {

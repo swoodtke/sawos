@@ -71,7 +71,8 @@
 //! know, comes through here.
 
 import hal
-import sosabi.{EventMode, NO_HANDLE, ObjType, OutletLevel, PIPE_BODY_BYTES,
+import sosabi.{EventMode, FaultReason, NO_HANDLE, ObjType, OutletLevel,
+               PIPE_BODY_BYTES,
                PIPE_MSG_HANDLES, PipeMsgMeta, ReplyLevel, SosStatus,
                WAIT_HANDLE_SLOTS, WAIT_MSG_SLOT_0, WAIT_REQUEST_SLOT,
                PipeMsgRecord, PipeSendRecord, PipeTakeRecord, WaitBuffer,
@@ -1858,6 +1859,13 @@ public(package) func notify_room(c: Int) unsafe {
 /// where the teardown closes them), and its process is owed `BadBuffer`. That
 /// counts as the thread having stopped waiting, so the next waiter is served.
 ///
+/// The record is copied once, here, and everything below acts on that copy. It
+/// is the caller's memory, so a sibling thread may have rewritten it since the
+/// call, and the copy is held to every rule `check_send` held the call to: a
+/// body length past `PIPE_BODY_BYTES` is owed `BadArg` exactly as a refused
+/// record is owed `BadBuffer`, before the length sizes any copy, and the
+/// handle words are asked about again in `hold_staged`.
+///
 /// It mints nothing, which is what a fused call buys: the claim is the parked
 /// thread, `Exchange.reply_refs` starts at one for it, and no handle row is
 /// spent.
@@ -1868,12 +1876,20 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     // name the record, so the handle words and the body address come back
     // together. The caller is blocked, so no thread of its own moves them, but
     // a sibling may have written them since `pipe_call` looked, which is what
-    // `hold_staged` asks about below.
+    // the length check and `hold_staged` ask about below.
     var args = PipeSendRecord(body: 0, len: 0,
                               handles: [NO_HANDLE; PIPE_MSG_HANDLES])
     let args_at = ((&var args) as UnsafePointer<PipeSendRecord>) as UInt
     if let why = copy_in(p, args_at, src, THREADS[t].call_len) {
         doom_process(p, why)
+        clear_pending_call(t)
+        return true
+    }
+    // The order `send_args` asks in: the record's own domain before the
+    // connection's state. The length is what sizes the body copy below and the
+    // exchange's length field, both of which assume one slot's worth.
+    if args.len > (PIPE_BODY_BYTES as UInt) {
+        doom_process(p, FaultReason.BadArg)
         clear_pending_call(t)
         return true
     }

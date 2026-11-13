@@ -143,8 +143,9 @@ func run_thread(next: Int) unsafe -> UInt {
 public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     // First, so that what the trap just did is whole before anything is
     // chosen: a `Created` process whose last name it dropped, and a process
-    // whose parked call a delivery found without its buffer, are gone by the
-    // time the caller, or anyone, runs again (`drain_deaths`).
+    // whose parked call a delivery found without its buffer or with its record
+    // rewritten, are gone by the time the caller, or anyone, runs again
+    // (`drain_deaths`).
     drain_deaths()
     let cur = CURRENT_THREAD
     if cur == NO_THREAD {
@@ -1211,9 +1212,10 @@ func drain_doomed() unsafe {
 }
 
 /// Carry out every end the last delivery or syscall owed: the `Created`
-/// processes nothing names any more (`drain_unstarted`) and the processes whose
-/// parked call found its buffer gone (`drain_doomed`). Each can owe the other
-/// another, so it runs until neither is pending.
+/// processes nothing names any more (`drain_unstarted`) and the processes a
+/// delivery found owing a fault (`drain_doomed`): a parked call whose buffer
+/// was gone, or whose record was rewritten out of its domain. Each can owe the
+/// other another, so it runs until neither is pending.
 public(package) func drain_deaths() unsafe {
     while DOOM_PENDING || UNSTARTED_PENDING {
         drain_doomed()

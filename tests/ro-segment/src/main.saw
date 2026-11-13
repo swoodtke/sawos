@@ -1,0 +1,118 @@
+// A result is never written into a process's own read-only data, even where
+// that data lies inside the copy-out window (spec §2.2).
+//
+// Root launches `child-ro-segment`, an image linked with its read-only data
+// above its writable data, once per trial; the child has a pipe-creation
+// record written at a word of the one or the other:
+//
+//   SOS roseg: a record into the read-only data: BadBuffer
+//   SOS roseg: a record into the writable data: taken
+//   SOS roseg: done
+//
+// The copy-out window runs from the lowest writable segment to the region's
+// top, so the read-only segment lies inside it on every profile, and only the
+// row's permission keeps the kernel from writing there.
+
+import sos.{System, Process, Memory, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+
+static KEY_DEATH: UInt = 6
+
+/// The roles `child-ro-segment` knows.
+static ROLE_READ_ONLY: UInt = 1
+static ROLE_DATA: UInt = 2
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
+
+/// The child's destination region. Every profile gives a child a region of
+/// this size.
+static REGION_LEN: UInt = 0x4_0000
+
+/// The §8 status word of a process ended with `BadBuffer`.
+static BAD_BUFFER: UInt = 131083
+
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+
+/// The status word of a child that exited with the code 7, which it does when
+/// the kernel answered its call.
+static TAKEN: UInt = 65543
+
+static_assert((1 * 65536) + 7 == 65543,
+              "an exit word is Exited in the high bits, then the code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS roseg: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS roseg: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS roseg: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    try trial(&system, &proc, &image, &ram, ROLE_READ_ONLY, BAD_BUFFER)
+    print("SOS roseg: a record into the read-only data: BadBuffer\n")
+    try trial(&system, &proc, &image, &ram, ROLE_DATA, TAKEN)
+    print("SOS roseg: a record into the writable data: taken\n")
+    return
+}
+
+/// Launch the child with `role` and require that it ends with `want`.
+func trial(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+           role: UInt, want: UInt) -> Result<Void, SosStatus> {
+    let dst = try ram.split(len: REGION_LEN)
+    let child = try system.process_create(image: &image, memory: &dst)
+    let _ = move dst
+    let ev = try proc.event_create()
+    try ev.signal(bits: role)
+    try child.give(event: move ev, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    try child.start(boot_tag: TAG_BOOT)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS roseg: the child ended with status {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

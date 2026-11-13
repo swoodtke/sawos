@@ -1,0 +1,274 @@
+// The kernel writes a result only into memory the process may write: a row
+// that is mapped read-only is no destination, at the call and at a late door
+// (spec §2.2).
+//
+// Root launches `child-ro-destination` once per trial with a piece of the
+// child's own destination region mapped into the hole between its data and
+// its stack, which is inside the child's copy-out window. Before the child
+// runs, root stamps a marker into the piece through a mapping of its own, and
+// after the child has ended it reads the piece back:
+//
+//   SOS rodest: read-write piece, record: taken
+//   SOS rodest: read-only piece, record: the process ended with BadBuffer
+//   SOS rodest: read-only piece, record: the piece is as root left it
+//   SOS rodest: remapped read-only while parked: the process ended with
+//               BadBuffer
+//   SOS rodest: remapped read-only while parked: the piece is as root left it
+//   SOS rodest: remapped read-write while parked: delivered into the new row
+//   SOS rodest: done
+//
+// The last two trials park the child's wait with its record in the piece
+// mapped read-write, then unmap the piece and map it again at the same
+// address, read-only or read-write, before the wake. The late door judges the
+// row that is there at the wake: a read-only one ends the process, and a
+// read-write one is written as any buffer is.
+//
+// A mapping takes its memory's own address on the profiles that do not
+// translate, so the piece lies in the copy-out window only there; the case is
+// for those.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus,
+            SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_WAITER: UInt = 34
+
+static KEY_DEATH: UInt = 6
+static KEY_EVENT: UInt = 7
+
+/// The roles `child-ro-destination` knows.
+static ROLE_CREATE_AT: UInt = 1
+static ROLE_WAIT_AT: UInt = 2
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+static RO: UInt32 = MapAccess.Read
+
+/// The child's destination region and the piece cut out of it, past its data
+/// and short of its stack.
+static REGION_LEN: UInt = 0x4_0000
+static HOLE_AT: UInt = 0x3_0000
+static HOLE_LEN: UInt = 0x2000
+
+/// What root stamps into the piece's first two words.
+static MARKER: UInt = 0x5A5A_5A5A
+
+/// The bits the wait's Event is signalled with.
+static SIGNAL_BITS: UInt = 0x5a
+
+/// A wait record's first two words for that delivery: the key, then the tag
+/// an Event's delivery carries (`WaitTag.Event`).
+static EVENT_TAG: UInt = 0
+
+/// The §8 status word of a process ended with `BadBuffer`.
+static BAD_BUFFER: UInt = 131083
+
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+
+/// The status word of a child that exited with the code 7, which it does when
+/// the kernel answered its call.
+static TAKEN: UInt = 65543
+
+static_assert((1 * 65536) + 7 == 65543,
+              "an exit word is Exited in the high bits, then the code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS rodest: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS rodest: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS rodest: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    try create_at(&system, &proc, &image, &ram, RW, TAKEN)
+    say("read-write piece, record: taken")
+    try create_at(&system, &proc, &image, &ram, RO, BAD_BUFFER)
+    say("read-only piece, record: the process ended with BadBuffer")
+    say("read-only piece, record: the piece is as root left it")
+    try remapped(&system, &proc, &image, &ram, RO)
+    say("remapped read-only while parked: the process ended with BadBuffer")
+    say("remapped read-only while parked: the piece is as root left it")
+    try remapped(&system, &proc, &image, &ram, RW)
+    say("remapped read-write while parked: delivered into the new row")
+    return
+}
+
+func say(line: String) {
+    print("SOS rodest: {}\n", line)
+}
+
+func peek(at: UInt) unsafe -> UInt {
+    UnsafeMemory<UInt, Device>(at).read()
+}
+
+func poke(at: UInt, value: UInt) unsafe {
+    UnsafeMemory<UInt, Device>(at).write(value)
+}
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+/// A child created in a region cut from the pool, and the piece of that region
+/// that lies between its data and its stack, stamped with the marker through
+/// a mapping of root's own that is gone again by the time this returns.
+func region(system: &System, proc: &Process, image: &Memory,
+            ram: &Memory) -> Result<(Process, Memory), SosStatus> {
+    let dst = try ram.split(len: REGION_LEN)
+    let child = try system.process_create(image: &image, memory: &dst)
+    let front = try dst.split(len: HOLE_AT)
+    let hole = try dst.split(len: HOLE_LEN)
+    let _ = move front
+    let _ = move dst
+    let own = try proc.map(memory: &hole, access: RW)
+    let at = try own.base()
+    poke(at, MARKER)
+    poke(at + word_bytes(), MARKER)
+    try own.unmap()
+    let parts = (move child, move hole)
+    return move parts
+}
+
+/// Require the piece's first two words to hold `first` and `second`, read
+/// through a fresh mapping of root's own.
+func piece_holds(proc: &Process, hole: &Memory, first: UInt,
+                 second: UInt) -> Result<Void, SosStatus> {
+    let view = try proc.map(memory: &hole, access: RW)
+    let at = try view.base()
+    let word0 = peek(at)
+    let word1 = peek(at + word_bytes())
+    try view.unmap()
+    if word0 != first || word1 != second {
+        print("SOS rodest: the piece holds {} {}\n", word0, word1)
+        return BUG
+    }
+    return
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+func brief(system: &System, proc: &Process, child: &Process, role: UInt,
+           at: UInt) -> Result<Void, SosStatus> {
+    try tell(&proc, &child, TAG_ROLE, role)
+    try tell(&proc, &child, TAG_ADDR, at)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Wait for the child to end and require the status word `want`.
+func ended_with(proc: &Process, child: &Process,
+                want: UInt) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS rodest: the child ended with status {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// The child's pipe-creation record into the piece mapped with `access`.
+func create_at(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+               access: UInt32, want: UInt) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &proc, &image, &ram)
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: access)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, ROLE_CREATE_AT, at)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended_with(&proc, &child, want)
+    if want == BAD_BUFFER {
+        try piece_holds(&proc, &hole, MARKER, MARKER)
+    }
+    return
+}
+
+/// The child's wait parks with its record in the piece mapped read-write; the
+/// piece is unmapped and mapped again with `access` before the Event is
+/// signalled.
+func remapped(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+              access: UInt32) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &proc, &image, &ram)
+    let (child, hole) = move parts
+    let first = try child.map(memory: &hole, access: RW)
+    let at = try first.base()
+    try brief(&system, &proc, &child, ROLE_WAIT_AT, at)
+
+    let ev = try proc.event_create()
+    let waiter = try proc.waiter_create()
+    try waiter.add(event: &ev, key: KEY_EVENT)
+    try child.give(waiter: move waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    // Nothing ticks in this case, so a yield returns once the child has
+    // parked.
+    try child.start(boot_tag: TAG_BOOT)
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
+
+    try first.unmap()
+    let second = try child.map(memory: &hole, access: access)
+    let again = try second.base()
+    if again != at { return BUG }
+    try ev.signal(bits: SIGNAL_BITS)
+    if access == RW {
+        try ended_with(&proc, &child, TAKEN)
+        try piece_holds(&proc, &hole, KEY_EVENT, EVENT_TAG)
+    } else {
+        try ended_with(&proc, &child, BAD_BUFFER)
+        try piece_holds(&proc, &hole, MARKER, MARKER)
+    }
+    return
+}

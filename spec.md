@@ -671,18 +671,38 @@ a reply delivery carries, which is why there is one type and not two — and
   nothing new, since `Waiter.wait` already answers `Result<WaitResult,
   SosStatus>`.
 - **Copy-out is checked, and it is one door.** The destination must be
-  word-aligned and inside the process's writable grant; one that is not
-  terminates the process (§5.7's faults ruling — a process linked its own
-  image and knows where its data is). A single kernel funnel, `copy_out`,
-  performs that check for everything that copies out, §2.1's message body
-  included; with its mirror `copy_in` it is the only place the kernel
-  dereferences a user address, which is what keeps a per-address-space
-  mapping switch a one-place change. A buffer that was valid when a call
-  parked and is not when the answer arrives (a mapping unmapped in between)
-  ends its process as a bad buffer does: the delivery asks again before it
-  spends anything, so what it was handing over is disposed of as for a
-  receiver that died, and the process ends with `BadBuffer` at the next
-  switch point rather than inside the delivery.
+  word-aligned, inside the process's writable window, and in a grant row that
+  permits write; one that is not terminates the process (§5.7's faults ruling
+  — a process linked its own image and knows where its data is). A single
+  kernel funnel, `copy_out`, performs that check for everything that copies
+  out, §2.1's message body included; with its mirror `copy_in` it is the only
+  place the kernel dereferences a user address, which is what keeps a
+  per-address-space mapping switch a one-place change. A buffer that was valid
+  when a call parked and is not when the answer arrives (a mapping unmapped in
+  between, or replaced by one that does not permit the access) ends its
+  process as a bad buffer does: the delivery asks again before it spends
+  anything, so what it was handing over is disposed of as for a receiver that
+  died, and the process ends with `BadBuffer` at the next switch point rather
+  than inside the delivery.
+- **What every copy door keeps true.** The kernel touches a process's memory
+  only through a door that, at the moment of the touch and for that direction,
+  finds a row of that process covering the whole range with the permission the
+  touch needs: read for a source, write for a destination, never a row that
+  permits execute (any such row covering a byte refuses the range), never a
+  device row. A refusal at any door, early or late, is that process's fault and
+  ends that process, never the machine. Nothing the kernel learns about a
+  process's memory outlives a point where another thread can run: a parked call
+  keeps its buffer's user address and never a translation of it, and the late
+  door translates it again at the wake, so a row unmapped and another mapped at
+  the same addresses meanwhile is judged as the row it then is — a read-only one
+  ends the process, a writable one is written, as any buffer is. A record the
+  kernel reads out of a process is copied once and acted on as copied; the one
+  record read twice, a parked call's (§2.1), is held at its second reading to
+  every rule the call was. So a future op that changes a row in place (its
+  permissions, say) must be, to every door, an unmap followed by a map: the
+  grant record and the hardware change together with no preemption point
+  between, nothing caches a row's permission or translation across a switch
+  point, and the next door to look, late doors included, judges the new row.
 - **`write_result` is the only function that writes an answer into a frame** —
   its callers are `ktrap` for an op that answered at once and the wake paths
   that answer a parked thread — which is what makes "exactly one write per
@@ -742,12 +762,13 @@ a reply delivery carries, which is why there is one type and not two — and
   funnel, so the drain cannot happen on the already-ready path and not on the
   wake path, whichever door the readiness came through.
 - **The copy-in door is the copy-out funnel's mirror twin**, used by
-  `Timer.Arm` and by §2.1's message body. It refuses the same two things — a
-  misaligned address, an address outside the process — and terminates the
-  process for either, on the same reasoning. One asymmetry is deliberate:
-  copy-out's window is the process's writable memory and copy-in's is the
-  whole granted region, because a record may legitimately come out of a
-  process's own rodata, and the two doors guard different hazards (writing
+  `Timer.Arm` and by §2.1's message body. It refuses the same things — a
+  misaligned address, an address outside the process, an address in no row
+  that permits read — and terminates the process for each, on the same
+  reasoning. One asymmetry is deliberate: copy-out's window is the process's
+  writable memory and copy-in's is the whole granted region, because a record
+  may legitimately come out of a process's own rodata, and the two doors guard
+  different hazards (writing
   outside the writable window corrupts the process; reading outside the
   granted region reads somebody else). A copy-in length is checked for
   equality rather than "at least": a capacity may be over-provisioned, but an
@@ -2865,7 +2886,10 @@ copy-out record:
   record at the resume, since a sibling thread may have rewritten it. The three
   questions are asked again there, and a slot that fails one simply arrives
   empty — there is no honest fault to raise at a resume, because the caller is
-  not the running process.
+  not the running process. The record's length is the exception, because it
+  sizes the body copy: one past `PIPE_BODY_BYTES` at the resume is owed
+  `BadArg` before anything is copied or staged, as a record gone by then is
+  owed `BadBuffer` (§2.2), and the process ends at the next switch point.
 - **`Resolve` parks rather than answering `WouldBlock`**: a pending exchange is
   not a status it returns.
 
@@ -3271,7 +3295,12 @@ started is not leaked**: when nothing names it any more it is torn down as if it
 had exited, and its record and body come back (§2.7). **A malformed image is a
 `BadImage` status, not a fault** — the one caller-supplied thing that does not
 end the caller, because image bytes are data a launcher was handed rather than
-something it wrote (the `from(raw:)` precedent).
+something it wrote (the `from(raw:)` precedent). **What was validated is what
+is placed**: the image's header and segment table are read out of it once,
+judged as read, and placement reads that copy and never the image's records
+again, because the image is memory, which another process may be able to write
+while the kernel places it (a wait record delivered at one of placement's
+preemption points included).
 
 **The fault rule, and how teardown ends.** A thread fault kills its process and
 the teardown runs unconditionally; what happens after forks. Process 0 — root,
@@ -3452,8 +3481,9 @@ death, its notification and its teardown holds for it.
   the caller makes next reads `Killed`. The ends the kill owes others are paid
   at the switch point its return passes, before any thread runs (above): the
   teardowns of the `Created` processes whose last name the target held (§2.7),
-  and the end, with `BadBuffer`, of any process one of whose parked threads the
-  teardown answered and found its buffer gone (§2.2). That process can be the
+  and the end of any process one of whose parked threads the teardown answered
+  and found its buffer gone (`BadBuffer`, §2.2) or its call's record rewritten
+  past what a message may carry (`BadArg`, §5.7). That process can be the
   caller's own, when a sibling of the calling thread was parked watching the
   target with a buffer since unmapped; it ends there, and the kill's answer is
   never read. The target's watchers are notified as at every death (above): once

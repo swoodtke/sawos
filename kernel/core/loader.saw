@@ -23,7 +23,7 @@ import kcore.mem.{align_up}
 import kcore.diag.{console, fatal_image}
 import kcore.stats.{stats_publish}
 import kcore.preempt.{long_copy, long_zero}
-import kcore.limits.{NO_MEMORY, ROOT_PROCESS}
+import kcore.limits.{MAX_GRANT_ROWS, NO_MEMORY, ROOT_PROCESS}
 import kcore.process.{claim_root, load_domain, record_grant, seal_image_rows,
                       start_process}
 
@@ -330,8 +330,58 @@ func check_device_grant(seg: &SosimgSeg, load_addr: UInt, file_len: UInt,
 // Validation: everything, before anything
 // -----------------------------------------------------------------------------
 
+/// An image's header and segment table, as the kernel read them: copied out of
+/// the image once, by `validate_image`, and never read there again.
+///
+/// The image is memory, and memory a process may be able to write while the
+/// kernel places it: a launcher's region mapped into another process, or a
+/// buffer a delivery writes into at one of placement's preemption points. So
+/// what was validated is what is placed only if placement reads the copy that
+/// was validated. The segments' bytes are still read from the image as they
+/// are placed; they are the process's contents, not instructions to the
+/// kernel, and nothing about them was validated.
+///
+/// The table holds every segment an image may have: `kcore.limits` asserts
+/// that `MAX_GRANT_ROWS` covers `hal.MAX_ROOT_SEGMENTS` and the stack.
+public(package) struct ImageTable {
+    public(package) header: SosimgHeader,
+    public(package) segs: [SosimgSeg; MAX_GRANT_ROWS],
+}
+
+extension ImageTable {
+    /// A table with nothing read into it yet.
+    public(package) static func empty() -> ImageTable {
+        let seg = SosimgSeg(load_addr: 0, file_off: 0, file_len: 0, mem_len: 0,
+                            flags: 0, reserved0: 0, reserved1: 0,
+                            reserved2: 0)
+        ImageTable(header: SosimgHeader(magic: 0, version: 0, seg_count: 0,
+                                        arch: 0, prio_map: 0, reserved0: 0,
+                                        entry: 0),
+                   segs: [seg; MAX_GRANT_ROWS])
+    }
+
+    /// The validated header's entry point.
+    public(package) func entry(&self) -> UInt {
+        self.header.entry as UInt
+    }
+
+    /// The validated header's segment count.
+    public(package) func seg_count(&self) -> UInt {
+        self.header.seg_count as UInt
+    }
+
+    /// The validated header's §7 band map.
+    public(package) func prio_map(&self) -> UInt {
+        self.header.prio_map as UInt
+    }
+}
+
 /// Validate a whole image against `img_len` bytes at `img_base` and the
-/// destination `dest`. `None` when every byte of it may be placed.
+/// destination `dest`, reading its header and segment table into `table`.
+/// `None` when every byte of it may be placed.
+///
+/// Each record is read out of the image once, here, and judged as read; the
+/// placement that follows reads `table` and not the image (see `ImageTable`).
 ///
 /// No effect happens in here. A refused image leaves the destination region
 /// untouched, so a launcher that gets `BadImage` back has lost only the call,
@@ -339,9 +389,13 @@ func check_device_grant(seg: &SosimgSeg, load_addr: UInt, file_len: UInt,
 ///
 /// No preemption point: at most `hal.MAX_ROOT_SEGMENTS` iterations of an O(1)
 /// body.
-public(package) func validate_image(img_base: UInt, img_len: UInt,
-                                    dest: &LoadRegion,
-                                    allow_device: Bool) unsafe -> ImageFault? {
+public(package) func validate_image(
+    img_base: UInt,
+    img_len: UInt,
+    dest: &LoadRegion,
+    allow_device: Bool,
+    table: &var ImageTable
+) unsafe -> ImageFault? {
     let header_len = sizeof<SosimgHeader>() as UInt
     let seg_len = sizeof<SosimgSeg>() as UInt
 
@@ -349,7 +403,8 @@ public(package) func validate_image(img_base: UInt, img_len: UInt,
         return ImageFault(reason: "no root image appended", detail: img_len)
     }
 
-    let header = header_at(img_base)
+    table.header = header_at(img_base)
+    let header = table.header
     if not header.has_magic() {
         return ImageFault(reason: "bad magic", detail: header.magic as UInt)
     }
@@ -393,7 +448,8 @@ public(package) func validate_image(img_base: UInt, img_len: UInt,
 
     var i: UInt = 0
     while i < seg_count {
-        let seg = seg_at(img_base + header_len + i * seg_len)
+        table.segs[i as Int] = seg_at(img_base + header_len + i * seg_len)
+        let seg = table.segs[i as Int]
         if let bad = check_segment(&seg, img_base, img_len, &dest,
                                    allow_device) {
             return bad
@@ -406,7 +462,7 @@ public(package) func validate_image(img_base: UInt, img_len: UInt,
     // the image's author cannot. It is judged by the executable segments alone
     // and never by the region, since code used in place lies outside the
     // region. Checked last so every earlier diagnostic keeps its wording.
-    if not entry_is_executable(img_base, seg_count, entry) {
+    if not entry_is_executable(&table, entry) {
         return ImageFault(reason: "entry is not inside an executable segment",
                           detail: entry)
     }
@@ -415,13 +471,12 @@ public(package) func validate_image(img_base: UInt, img_len: UInt,
 
 /// Is `entry` inside the load range of a segment the image asked to be
 /// executable?
-func entry_is_executable(img_base: UInt, seg_count: UInt, entry: UInt) unsafe -> Bool {
-    let header_len = sizeof<SosimgHeader>() as UInt
-    let seg_len = sizeof<SosimgSeg>() as UInt
+func entry_is_executable(table: &ImageTable, entry: UInt) -> Bool {
     var i: UInt = 0
-    while i < seg_count {
-        let seg = seg_at(img_base + header_len + i * seg_len)
-        if not seg.is_device_grant() && (seg.flags & (SegFlag.Execute as UInt8)) != 0 {
+    while i < table.seg_count() {
+        let seg = table.segs[i as Int]
+        let executes = (seg.flags & (SegFlag.Execute as UInt8)) != 0
+        if not seg.is_device_grant() && executes {
             let load_addr = seg.load_addr as UInt
             let mem_len = seg.mem_len as UInt
             if entry >= load_addr && entry - load_addr < mem_len {
@@ -431,21 +486,6 @@ func entry_is_executable(img_base: UInt, seg_count: UInt, entry: UInt) unsafe ->
         i = i + 1
     }
     false
-}
-
-/// The validated header's entry point.
-public(package) func image_entry(img_base: UInt) unsafe -> UInt {
-    header_at(img_base).entry as UInt
-}
-
-/// The validated header's segment count.
-public(package) func image_seg_count(img_base: UInt) unsafe -> UInt {
-    header_at(img_base).seg_count as UInt
-}
-
-/// The validated header's §7 band map.
-public(package) func image_prio_map(img_base: UInt) unsafe -> UInt {
-    header_at(img_base).prio_map as UInt
 }
 
 // -----------------------------------------------------------------------------
@@ -470,7 +510,10 @@ public(package) struct PlacedImage {
 /// the time is. The walk itself takes none. A delivery landing between two
 /// segments reads grant records only through the copy doors (`translate_user`),
 /// and the process being placed has no waiters yet, so it observes nothing in
-/// flight.
+/// flight. A delivery can write, though: the record it hands a parked thread
+/// may land in the image's own memory, which is why the walk reads its
+/// segment records from `table`, the copy `validate_image` judged, and never
+/// from the image.
 ///
 /// A tick can fire mid-load in a harness kernel that arms one first
 /// (`tests/threads_timer.saw`), and that is legal: no thread is current, so the
@@ -500,12 +543,10 @@ public(package) struct PlacedImage {
 ///
 /// Every row recorded here is an image row (`seal_image_rows`), the in-place
 /// ones included, so no mapping may cover one.
-public(package) func place_image(p: Int, img_base: UInt, dest: &LoadRegion,
-                                 region: Int,
+public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
+                                 dest: &LoadRegion, region: Int,
                                  image: Int) unsafe -> PlacedImage {
-    let header_len = sizeof<SosimgHeader>() as UInt
-    let seg_len = sizeof<SosimgSeg>() as UInt
-    let seg_count = image_seg_count(img_base)
+    let seg_count = table.seg_count()
 
     // The writable window, accumulated as segments are placed. `copy_out`
     // checks a kernel-written record against it. The stack is always part of
@@ -519,7 +560,7 @@ public(package) func place_image(p: Int, img_base: UInt, dest: &LoadRegion,
 
     var s: UInt = 0
     while s < seg_count {
-        let seg = seg_at(img_base + header_len + s * seg_len)
+        let seg = table.segs[s as Int]
         let load_addr = seg.load_addr as UInt
         let file_len = seg.file_len as UInt
         let mem_len = seg.mem_len as UInt
@@ -617,13 +658,14 @@ public func load_root_and_enter(tick_period_us: UInt = 0) unsafe {
     // Boot failure vocabulary: a machine whose only image is malformed has
     // nothing else to run, so every refusal stops it with the reason. The
     // create door turns the same `ImageFault` into a status.
-    if let bad = validate_image(base, img_len, &dest, true) {
+    var table = ImageTable.empty()
+    if let bad = validate_image(base, img_len, &dest, true, &var table) {
         fatal_image(bad.reason, bad.detail)
     }
 
-    let entry = image_entry(base)
-    let seg_count = image_seg_count(base)
-    let prio_map = image_prio_map(base)
+    let entry = table.entry()
+    let seg_count = table.seg_count()
+    let prio_map = table.prio_map()
 
     let uart = console()
     uart.write_str("SOS: root image ok segments=")
@@ -640,7 +682,8 @@ public func load_root_and_enter(tick_period_us: UInt = 0) unsafe {
     // away from and never back into. The device-window row is included, which
     // keeps a driver image's window across a switch.
     claim_root()
-    let placed = place_image(ROOT_PROCESS, base, &dest, NO_MEMORY, NO_MEMORY)
+    let placed = place_image(ROOT_PROCESS, base, &table, &dest, NO_MEMORY,
+                             NO_MEMORY)
     load_domain(ROOT_PROCESS)
 
     // Spec §7: root's band map applies verbatim from its image. The scheduler

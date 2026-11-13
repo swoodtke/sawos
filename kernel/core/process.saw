@@ -290,7 +290,8 @@ public(package) unsafe static var UNSTARTED_PENDING: Bool = false
 public(package) unsafe static var DOOM_PENDING: Bool = false
 
 /// Record that process `p` is owed the fault `why`, found by a delivery on its
-/// behalf: a buffer it parked with was gone when the answer arrived.
+/// behalf: a buffer it parked with was gone when the answer arrived, or the
+/// record of a call it parked was no longer a message when the call resumed.
 ///
 /// A delivery runs in whichever context made the thing ready: another
 /// process's syscall, an interrupt, or a teardown's own walk. None of them can
@@ -539,10 +540,20 @@ public(package) func meets_image_row(p: Int, base: UInt,
 }
 
 /// Resolve a user address to the physical one it names in `p`'s domain, or
-/// `BadBuffer` if it names nothing.
+/// `BadBuffer` if it names nothing the kernel may touch for this direction.
 ///
-/// Walks `p`'s grant rows for the one covering `va`; the caller then
-/// dereferences through the linear map. Bounded by `MAX_GRANT_ROWS`.
+/// Walks `p`'s grant rows for the first one covering `va` that grants every
+/// permission in `need`; the caller then dereferences through the linear map.
+/// Bounded by `MAX_GRANT_ROWS`.
+///
+/// `need` is the direction: `SegFlag.Read` for a source the kernel reads,
+/// `SegFlag.Write` for a destination it writes. A row that does not grant it is
+/// not a candidate, so a result is never written into memory the process may
+/// only read, whatever window the address lies in. This is the check, not the
+/// windows: a window is a range of addresses, and the rows inside one need not
+/// all be writable (a mapping installed read-only, a read-only segment linked
+/// above the data). Another row over the same addresses that does grant the
+/// permission is authority the process holds over those bytes, so it serves.
 ///
 /// The whole range must lie in one row. A row is the largest span over which
 /// the user-to-physical mapping is affine (`GrantRow`), so a copy that crossed
@@ -570,8 +581,12 @@ public(package) func meets_image_row(p: Int, base: UInt,
 ///
 /// Both variants of the result are named, so the answer does not depend on how
 /// a bare `FaultReason` would be wrapped.
-public(package) func translate_user(p: Int, va: UInt,
-                                    bytes: UInt) unsafe -> Result<UInt, FaultReason> {
+public(package) func translate_user(
+    p: Int,
+    va: UInt,
+    bytes: UInt,
+    need: UInt8
+) unsafe -> Result<UInt, FaultReason> {
     let nowhere = Result<UInt, FaultReason>.Err(error: FaultReason.BadBuffer)
     if meets_execute(p, va, bytes) {
         return nowhere
@@ -580,7 +595,8 @@ public(package) func translate_user(p: Int, va: UInt,
     var i: Int = 0
     while i < PROCESSES[b].grant_count {
         let row = PROCESSES[b].grants[i]
-        if not row.device && va >= row.base && va < row.top {
+        if not row.device && (row.perms & need) == need &&
+           va >= row.base && va < row.top {
             // Ordered so the subtraction cannot underflow: `row.top - va` is
             // computed only once `va` is known to be inside the row.
             if bytes > row.top - va {
@@ -843,7 +859,8 @@ public(package) func clear_domain(p: Int) unsafe {
 //     a misaligned store traps on some tiers and is merely wrong on others);
 //   - a destination outside the process's writable window (a record placed in
 //     its own code is a misread memory map);
-//   - a destination in memory the process may execute (`translate_user`).
+//   - a destination in no row that permits write, or in memory the process
+//     may execute (`translate_user`).
 //
 // The door reports and its caller faults: ending a process is a scheduling
 // event, so the termination lives above the scheduler and these functions
@@ -889,10 +906,12 @@ public(package) func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe -> Fa
     if bytes > PROCESSES[b].rw_top - dst {
         return FaultReason.BadBuffer
     }
-    // The address must also resolve. The window above is conservative (it
-    // includes the hole between the image's writable end and the stack); the
-    // grant record says which user addresses exist.
-    let _ = try translate_user(p, dst, bytes) catch { return error }
+    // The address must also resolve, through a row that permits write. The
+    // window above is a range of addresses (it includes the hole between the
+    // image's writable end and the stack, and whatever is mapped there); the
+    // grant record says which user addresses exist and what each may do.
+    let _ = try translate_user(p, dst, bytes,
+                               SegFlag.Write as UInt8) catch { return error }
     None
 }
 
@@ -913,7 +932,8 @@ public(package) func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe 
     // (`translate_user`: which bytes) and then reached through the linear map
     // (`phys_to_virt`: how the kernel touches them). `src` is already a kernel
     // address, from a `&var` of a record on this frame, and is neither.
-    let pa = try translate_user(p, dst, bytes) catch { return error }
+    let pa = try translate_user(p, dst, bytes,
+                                SegFlag.Write as UInt8) catch { return error }
     copy_bytes(hal.phys_to_virt(pa), src, bytes)
     None
 }
@@ -935,9 +955,9 @@ public(package) func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe 
 //     learns one alignment rule for kernel records);
 //   - a source outside the process's own memory (this check stops a process
 //     from naming kernel memory or another process's);
-//   - a source in memory the process may execute (`translate_user`); a
-//     program's string literals are not there, because its read-only data is
-//     a segment of its own.
+//   - a source in no row that permits read, or in memory the process may
+//     execute (`translate_user`); a program's string literals are not there,
+//     because its read-only data is a segment of its own.
 //
 // The window is the whole granted region, not the writable one, and the
 // read-only segments used in place besides (spec §5.6), which lie outside the
@@ -972,8 +992,10 @@ public(package) func copy_in_check(p: Int, src: UInt, bytes: UInt) unsafe -> Fau
     if not in_region && not in_read_only {
         return FaultReason.BadBuffer
     }
-    // The address must also resolve, as in `copy_out_check`.
-    let _ = try translate_user(p, src, bytes) catch { return error }
+    // The address must also resolve, as in `copy_out_check`, through a row
+    // that permits read.
+    let _ = try translate_user(p, src, bytes,
+                               SegFlag.Read as UInt8) catch { return error }
     None
 }
 
@@ -1005,7 +1027,8 @@ public(package) func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe -
     // As in `copy_out`: `src` is the process's address, resolved through its
     // record and then reached through the linear map; `dst` is the kernel's own
     // storage and is neither.
-    let pa = try translate_user(p, src, bytes) catch { return error }
+    let pa = try translate_user(p, src, bytes,
+                                SegFlag.Read as UInt8) catch { return error }
     copy_bytes(dst, hal.phys_to_virt(pa), bytes)
     None
 }

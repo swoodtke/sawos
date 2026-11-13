@@ -304,8 +304,8 @@ import kcore.process.{
     rows_move_to_piece,
 }
 import kcore.loader.{
+    ImageTable,
     LoadRegion,
-    image_entry,
     place_image,
     validate_image,
 }
@@ -1262,7 +1262,11 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     let dest = LoadRegion(base: dst_base, top: dst_base + dst_len,
                           stack_len: hal.ROOT_STACK_LEN,
                           link_base: hal.image_link_base(dst_base))
-    if let _ = validate_image(img_base, img_len, &dest, false) {
+    // The image's header and segment table are read once, into `table`, and
+    // everything from here on reads them there: the image is memory a process
+    // may write while it is placed (`ImageTable`).
+    var table = ImageTable.empty()
+    if let _ = validate_image(img_base, img_len, &dest, false, &var table) {
         return op_status(SosStatus.BadImage)
     }
 
@@ -1293,7 +1297,7 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     // launcher may release its own handle on either while the child runs, and
     // neither range goes back on its pool's free list while a process is
     // running out of it. Each goes back when the child dies.
-    let placed = place_image(slot, img_base, &dest, dst, img)
+    let placed = place_image(slot, img_base, &table, &dest, dst, img)
 
     PROCESS_RECORDS[slot].state = ProcessState.Created
     // A child's table starts empty and `give` fills it. There is nothing to
@@ -1302,7 +1306,7 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     // given). Every handle a child holds arrives through `ProcessOp.Give`
     // between this call and `Start`; a child given nothing is a legal sandboxed
     // compute process.
-    PROCESSES[body].entry = image_entry(img_base)
+    PROCESSES[body].entry = table.entry()
     // The child's ceilings are the creator's narrowed by the source's, written
     // word by word: the body may be a reused one, and no create inherits what a
     // previous occupant was bounded to.

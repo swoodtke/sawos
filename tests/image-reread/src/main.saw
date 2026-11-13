@@ -1,0 +1,304 @@
+// An image the kernel is placing can be written while it is placed, and the
+// kernel places what it validated (spec §2.8, §5.6).
+//
+// The image is memory, and memory a process may write: here it is a piece of
+// `child-ro-destination`'s own region, mapped into that child between its data
+// and its stack, inside its copy-out window. The child parks a wait with its
+// record over the image's second segment record, on a Waiter fed by a Timer of
+// root's. Root writes a two-segment image into the piece, arms the Timer and
+// creates a process from the piece into the pool. The first segment is a long
+// zero-filled tail, so its placement takes many preemption points, and a fire
+// that comes due during it is delivered there: the wait record lands on the
+// image while the kernel is between its two segments.
+//
+//   SOS imgreread: a record landed during placement: created
+//   SOS imgreread: done
+//
+// A fire that comes before the call lands on the image before it is
+// validated, and the create is refused (`BadImage`, the record's tag in the
+// high half of a load address); one that comes after the call returned has
+// not landed by the time root looks. Either way root tries again with a fresh
+// child and a delay moved toward the placement, until a record is found on
+// the image of a create that succeeded. Which attempt that is depends on the
+// host and is not printed.
+
+import sos.{System, Process, Memory, Mapping, Waiter, Timer, Clock,
+            ClockType, MapAccess, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_WAITER: UInt = 34
+
+static KEY_DEATH: UInt = 6
+
+/// The role `child-ro-destination` parks a wait in.
+static ROLE_WAIT_AT: UInt = 2
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The child's destination region and the piece cut out of it, past its data
+/// and short of its stack.
+static REGION_LEN: UInt = 0x4_0000
+static HOLE_AT: UInt = 0x3_0000
+static HOLE_LEN: UInt = 0x2000
+
+/// The image root writes, in words. A sosimg header is 24 bytes and a segment
+/// record 24, and the two records' fields are laid out as `imgformat` says.
+static MAGIC: UInt = 0x4953_4F53
+static VERSION: UInt = 3
+static SEG_COUNT: UInt = 2
+static ARCH_RISCV32: UInt = 1
+static PRIO: UInt = 0x0101_0100
+static HEADER_BYTES: UInt = 24
+static SEG_BYTES: UInt = 24
+static READ: UInt = 1
+static WRITE: UInt = 2
+static EXECUTE: UInt = 4
+
+/// Where the bytes the code segment carries are, past the two records.
+static CODE_AT: UInt = 72
+static CODE_BYTES: UInt = 4
+
+/// The code segment's zero-filled length, which is what makes its placement
+/// long, and where the data segment loads, past it and short of the stack.
+static ZERO_TAIL: UInt = 0x3_0000
+static DATA_AT: UInt = 0x3_8000
+static DATA_LEN: UInt = 0x1000
+
+/// Where the wait record lands: the second segment record, so its key and
+/// tag are that segment's load address.
+static RECORD_AT: UInt = 48
+
+/// The key the Timer is attached under, which is the record's first word.
+static KEY_TIMER: UInt = 0x0D0D_0D0D
+
+/// The delay the first attempt arms the Timer with, and the bounds a delay is
+/// moved within. Nothing asserts how long anything takes: a delay only aims
+/// the fire, and each attempt says by its outcome which way to move it.
+static FIRST_DELAY_NS: UInt64 = 200_000
+static MIN_DELAY_NS: UInt64 = 1_000
+static MAX_DELAY_NS: UInt64 = 50_000_000
+static MAX_ATTEMPTS: Int = 64
+
+/// The status word of a child that exited with the code 7, which it does when
+/// its wait was answered.
+static TAKEN: UInt = 65543
+
+static_assert((1 * 65536) + 7 == 65543,
+              "an exit word is Exited in the high bits, then the code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS imgreread: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS imgreread: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS imgreread: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_memory() else { return BUG }
+
+    let clock = try system.clock_get(type: ClockType.Monotonic)
+    var delay = FIRST_DELAY_NS
+    var attempt: Int = 0
+    while attempt < MAX_ATTEMPTS {
+        let outcome = try attempt_once(&system, &proc, &image, &ram, &pool,
+                                       &clock, delay)
+        if outcome == OUTCOME_LANDED {
+            print("SOS imgreread: a record landed during placement: created\n")
+            return
+        }
+        if outcome == OUTCOME_EARLY {
+            if delay < MAX_DELAY_NS {
+                delay = delay * 2
+            }
+        } else {
+            if delay > MIN_DELAY_NS {
+                delay = delay / 2
+            }
+        }
+        attempt = attempt + 1
+    }
+    print("SOS imgreread: no attempt landed a record during a placement\n")
+    return BUG
+}
+
+/// The record landed before the create looked at the image.
+static OUTCOME_EARLY: Int = 1
+/// The create succeeded and the record had not landed when root looked.
+static OUTCOME_LATE: Int = 2
+/// The create succeeded and the record had landed when root looked.
+static OUTCOME_LANDED: Int = 3
+
+func peek(at: UInt) unsafe -> UInt {
+    UnsafeMemory<UInt, Device>(at).read()
+}
+
+func poke(at: UInt, value: UInt) unsafe {
+    UnsafeMemory<UInt, Device>(at).write(value)
+}
+
+/// The image, written word by word at `at` for a process placed at `base`.
+func write_image(at: UInt, base: UInt) unsafe {
+    poke(at, MAGIC)
+    poke(at + 4, VERSION | (SEG_COUNT << 16) | (ARCH_RISCV32 << 24))
+    poke(at + 8, PRIO)
+    poke(at + 12, 0)
+    poke(at + 16, base)
+    poke(at + 20, 0)
+    let code = at + HEADER_BYTES
+    poke(code, base)
+    poke(code + 4, 0)
+    poke(code + 8, CODE_AT)
+    poke(code + 12, CODE_BYTES)
+    poke(code + 16, CODE_BYTES + ZERO_TAIL)
+    poke(code + 20, READ | EXECUTE)
+    let data = code + SEG_BYTES
+    poke(data, base + DATA_AT)
+    poke(data + 4, 0)
+    poke(data + 8, CODE_AT)
+    poke(data + 12, 0)
+    poke(data + 16, DATA_LEN)
+    poke(data + 20, READ | WRITE)
+    poke(at + CODE_AT, 0)
+}
+
+/// Where `memory` lies, learned through a mapping of root's own that is gone
+/// again by the time this returns: a mapping takes its memory's own address on
+/// the profiles this case runs on.
+func base_of(proc: &Process, memory: &Memory) -> Result<UInt, SosStatus> {
+    let view = try proc.map(memory: &memory, access: RW)
+    let at = try view.base()
+    try view.unmap()
+    return at
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Wait for the child to end and require the status word `want`.
+func ended_with(proc: &Process, child: &Process,
+                want: UInt) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS imgreread: the child ended with status {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// One attempt: a fresh child parked with its record over the image's second
+/// segment record, the Timer armed with `delay`, and the create.
+func attempt_once(system: &System, proc: &Process, image: &Memory,
+                  ram: &Memory, pool: &Memory, clock: &Clock,
+                  delay: UInt64) -> Result<Int, SosStatus> {
+    let dst = try ram.split(len: REGION_LEN)
+    let child = try system.process_create(image: &image, memory: &dst)
+    let front = try dst.split(len: HOLE_AT)
+    let hole = try dst.split(len: HOLE_LEN)
+    let _ = move front
+    let _ = move dst
+
+    let target = try base_of(&proc, &pool)
+    let own = try proc.map(memory: &hole, access: RW)
+    let at = try own.base()
+    write_image(at, target)
+    try own.unmap()
+
+    let mapping = try child.map(memory: &hole, access: RW)
+    let again = try mapping.base()
+    if again != at { return BUG }
+    try tell(&proc, &child, TAG_ROLE, ROLE_WAIT_AT)
+    try tell(&proc, &child, TAG_ADDR, at + RECORD_AT)
+    let timer = try clock.timer_create()
+    let waiter = try proc.waiter_create()
+    try waiter.add(timer: &timer, key: KEY_TIMER)
+    try child.give(waiter: move waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    // Nothing ticks in this case, so a yield returns once the child has
+    // parked.
+    try child.start(boot_tag: TAG_BOOT)
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
+
+    try timer.arm(after_ns: delay)
+    let made = system.process_create(image: &hole, memory: &pool)
+    let landed = try landed_on(&proc, &hole)
+    var outcome = OUTCOME_LATE
+    match made {
+        case Ok(placed) -> {
+            let _ = move placed
+            if landed { outcome = OUTCOME_LANDED }
+        },
+        case Err(why) -> {
+            match why {
+                case BadImage -> { outcome = OUTCOME_EARLY },
+                case _ -> { return why },
+            }
+        },
+    }
+    try ended_with(&proc, &child, TAKEN)
+    let _ = move mapping
+    return outcome
+}
+
+/// Has the wait record landed on the image: is its key where the second
+/// segment's load address was?
+func landed_on(proc: &Process, hole: &Memory) -> Result<Bool, SosStatus> {
+    let view = try proc.map(memory: &hole, access: RW)
+    let at = try view.base()
+    let word = peek(at + RECORD_AT)
+    try view.unmap()
+    return word == KEY_TIMER
+}
