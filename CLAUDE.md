@@ -37,6 +37,9 @@ hal/xtensa-esp32s3/  # Xtensa (call0) and the ESP32-S3 board in one
                    # esp32s3.ld) + user/ (the syscall stub, root.ld,
                    # child.ld) + ABI.md, the board facts. Reached by
                    # `make sos-smoke-esp32s3`
+drivers/           # userspace device drivers and the protocol packages their
+                   # clients share (`uartproto`), each an ordinary package like
+                   # those in `tests/`
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 root/              # the root server: a real Blade package, sosimg emit

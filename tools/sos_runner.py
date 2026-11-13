@@ -78,6 +78,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KERNEL_DIR = os.path.join(REPO_ROOT, "kernel")
 CORE_DIR = os.path.join(KERNEL_DIR, "core")
 TESTS_DIR = os.path.join(REPO_ROOT, "tests")
+DRIVERS_DIR = os.path.join(REPO_ROOT, "drivers")
 HAL_DIR = os.path.join(REPO_ROOT, "hal")
 
 # The sawlang side comes from the resolver, not from `REPO_ROOT`: the compiler,
@@ -628,8 +629,8 @@ CHILD_WAITABLE_PKG = os.path.join(TESTS_DIR, "child-waitable")
 # case.
 UART_SERVICE_PKG = os.path.join(TESTS_DIR, "uart-service")
 UART_CANCEL_PKG = os.path.join(TESTS_DIR, "uart-cancel")
-SVC_UART_NS16550_PKG = os.path.join(TESTS_DIR, "svc-uart-ns16550")
-SVC_UART_PL011_PKG = os.path.join(TESTS_DIR, "svc-uart-pl011")
+SVC_UART_NS16550_PKG = os.path.join(DRIVERS_DIR, "svc-uart-ns16550")
+SVC_UART_PL011_PKG = os.path.join(DRIVERS_DIR, "svc-uart-pl011")
 SVC_CLIENT_PKG = os.path.join(TESTS_DIR, "svc-client")
 DELEGATE_3P_PKG = os.path.join(TESTS_DIR, "delegate-3p")
 CHILD_FORWARD_PKG = os.path.join(TESTS_DIR, "child-forward")
