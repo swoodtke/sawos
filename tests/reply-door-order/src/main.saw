@@ -1,0 +1,504 @@
+// A late door asks its questions in the order the call did (spec §2.2).
+//
+// Root launches `child-reply-door-order` once per trial. The child makes one
+// fused call whose reply buffer, or whose body, lies in a piece of its own
+// region that root mapped into the hole between its data and its stack; root
+// unmaps the piece while the call is parked and then makes the answer arrive:
+//
+//   SOS replyorder: reply gone, a handle, table room: BadBuffer
+//   SOS replyorder: reply gone, a handle, table room: the carried Event was
+//                   released
+//   SOS replyorder: reply gone, a handle, table full: BadBuffer
+//   SOS replyorder: reply gone, a handle, table full: the carried Event was
+//                   released
+//   SOS replyorder: reply kept, a handle, table full: answered QuotaExceeded
+//   SOS replyorder: body gone, server end open, parked: BadBuffer
+//   SOS replyorder: body gone, server end closed while parked: BadBuffer
+//   SOS replyorder: body gone, server end closed at the call: BadBuffer
+//   SOS replyorder: body kept, server end closed while parked: answered
+//                   PeerClosed
+//   SOS replyorder: reply gone, the request dropped unanswered: answered
+//                   PeerClosed
+//   SOS replyorder: parked for room, reply gone, server end closed: answered
+//                   PeerClosed
+//   SOS replyorder: parked for room, reply gone, room then a reply: BadBuffer
+//   SOS replyorder: done
+//
+// The reply is asked before the table: with the buffer gone, a reply that
+// carries a handle ends the process whether or not its table has room, and the
+// handle the reply carried is released with the exchange. Each of those trials
+// counts the Events root can still create before and after, which is equal
+// only if the Event the reply carried went back to its slab.
+//
+// A call parked for room asks its record, its length, its body and then the
+// connection's state, as the call did: a body that is gone ends the process
+// even when the server end has closed, where the call without a body that is
+// gone is answered `PeerClosed`.
+//
+// A wake that carries only a status writes no buffer and asks about none: with
+// the reply buffer gone, a request dropped unanswered and a server end closed
+// while the call is parked for room each answer `PeerClosed` and the child runs
+// on, where a reply that writes the buffer ends it.
+//
+// A mapping takes its memory's own address on the profiles that do not
+// translate, so the piece lies in the hole only there; the case is for those.
+// Each trial is a function of its own, to stay under root's stack size
+// (`hal.ROOT_STACK_LEN`).
+
+import sos.{System, Process, Memory, PipeInlet, PipeOutlet, PipeInletRight,
+            PipeHandles, MapAccess, SosStatus, SystemRight, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_INLET: UInt = 35
+
+static KEY_DEATH: UInt = 6
+
+/// The roles `child-reply-door-order` knows.
+static ROLE_REPLY_AT: UInt = 1
+static ROLE_FULL_REPLY_AT: UInt = 2
+static ROLE_BODY_AT: UInt = 3
+static ROLE_PLAIN: UInt = 4
+static ROLE_FULL_PLAIN: UInt = 5
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
+
+/// A sibling of the client end that can post and nothing else.
+static POST_ONLY: UInt32 = PipeInletRight.Post
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The child's destination region, and where in it the piece goes: past its
+/// data and short of its stack, one protection unit of the region's own bytes
+/// at a time. Every profile this case runs on gives a child a region of this
+/// size.
+static REGION_LEN: UInt = 0x4_0000
+static HOLE_AT: UInt = 0x3_0000
+static HOLE_LEN: UInt = 0x2000
+
+/// The most messages a fill posts before it gives up.
+static MAX_FILL: Int = 256
+
+/// The §8 status word of a process ended with `BadBuffer`: `Faulted` in the
+/// high half and the reason (11) in the low.
+static BAD_BUFFER: UInt = 131083
+
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+
+/// The status words of a child that exited with 200 plus the status its call
+/// was answered with (`EXIT_STATUS_BASE` in the child): `QuotaExceeded` is 7
+/// and `PeerClosed` is 9.
+static ANSWERED_QUOTA: UInt = 65743
+static ANSWERED_PEER_CLOSED: UInt = 65745
+
+static_assert((1 * 65536) + 200 + 7 == 65743,
+              "an exit word is Exited in the high bits, then the code")
+static_assert((1 * 65536) + 200 + 9 == 65745,
+              "an exit word is Exited in the high bits, then the code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS replyorder: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS replyorder: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS replyorder: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    try released_after(&system, &proc, &image, &ram, ROLE_REPLY_AT,
+                       "reply gone, a handle, table room")
+    try released_after(&system, &proc, &image, &ram, ROLE_FULL_REPLY_AT,
+                       "reply gone, a handle, table full")
+    try reply_kept(&system, &proc, &image, &ram)
+    try body_gone_parked(&system, &proc, &image, &ram, false,
+                         "body gone, server end open, parked")
+    try body_gone_parked(&system, &proc, &image, &ram, true,
+                         "body gone, server end closed while parked")
+    try body_gone_at_call(&system, &proc, &image, &ram)
+    try body_kept_closed(&system, &proc, &image, &ram)
+    try reply_gone_abandoned(&system, &proc, &image, &ram)
+    try reply_gone_parked(&system, &proc, &image, &ram, true,
+                          "parked for room, reply gone, server end closed",
+                          ANSWERED_PEER_CLOSED)
+    try reply_gone_parked(&system, &proc, &image, &ram, false,
+                          "parked for room, reply gone, room then a reply",
+                          BAD_BUFFER)
+    return
+}
+
+// -----------------------------------------------------------------------------
+// One trial's parts
+// -----------------------------------------------------------------------------
+
+func say(what: String, line: String) {
+    print("SOS replyorder: {}: {}\n", what, line)
+}
+
+/// A child created in a region cut from the pool, and the piece of that region
+/// that goes into the hole between its data and its stack. The rest of the
+/// region is cut and let go at once: a piece that covers a row of the child's
+/// image carries the row (`Memory.split`), so the child keeps its own bytes,
+/// and root's handle table stays small enough for the trials' objects.
+func region(system: &System, image: &Memory,
+            ram: &Memory) -> Result<(Process, Memory), SosStatus> {
+    let dst = try ram.split(len: REGION_LEN)
+    let child = try system.process_create(image: &image, memory: &dst)
+    let front = try dst.split(len: HOLE_AT)
+    let hole = try dst.split(len: HOLE_LEN)
+    let _ = move front
+    let _ = move dst
+    let parts = (move child, move hole)
+    return move parts
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// What every child is given: its role, where its buffer is, and its System
+/// handle as the boot tag.
+func brief(system: &System, proc: &Process, child: &Process, role: UInt,
+           at: UInt) -> Result<Void, SosStatus> {
+    try tell(&proc, &child, TAG_ROLE, role)
+    try tell(&proc, &child, TAG_ADDR, at)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Give `child` the client end of `inlet` as its call's connection.
+func give_inlet(child: &Process, inlet: PipeInlet) -> Result<Void, SosStatus> {
+    try child.give(inlet: move inlet, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Start the child and let it run until it parks: nothing ticks in this case,
+/// so a yield returns when the child has nothing left to do.
+func start_and_park(proc: &Process,
+                    child: &Process) -> Result<Void, SosStatus> {
+    try child.start(boot_tag: TAG_BOOT)
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
+    return
+}
+
+/// Wait for the child to end and require the status word `want`.
+func ended_with(proc: &Process, child: &Process,
+                want: UInt) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS replyorder: the child ended with status {}\n",
+                      status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// Post empty messages through `inlet` until the ring is full, dropping each
+/// claim, and answer how many it took.
+func fill(inlet: &PipeInlet) -> Result<Int, SosStatus> {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var staged: Int = 0
+    while staged < MAX_FILL {
+        match inlet.post(body: &body, len: 0) {
+            case Ok(claim) -> {
+                let _ = move claim
+                staged = staged + 1
+            },
+            case Err(why) -> {
+                match why {
+                    case WouldBlock -> { return staged },
+                    case _ -> { return why },
+                }
+            },
+        }
+    }
+    return BUG
+}
+
+/// Take and drop `count` messages, requests included.
+func drain(outlet: &PipeOutlet, count: Int) -> Result<Void, SosStatus> {
+    var n: Int = 0
+    while n < count {
+        let got = try outlet.take()
+        let (_, request) = move got
+        let _ = move request
+        n = n + 1
+    }
+    return
+}
+
+/// How many Events this process can create before a refusal. Each one is let
+/// go as the recursion unwinds, so the count is the same before and after
+/// anything that gives every Event back.
+func events_creatable(proc: &Process) -> Int {
+    let ev = try proc.event_create() catch { return 0 }
+    let more = events_creatable(&proc)
+    let _ = move ev
+    return more + 1
+}
+
+// -----------------------------------------------------------------------------
+// The trials
+// -----------------------------------------------------------------------------
+
+/// `reply_gone_with_handle`, between two counts of the Events root can make.
+func released_after(system: &System, proc: &Process, image: &Memory,
+                    ram: &Memory, role: UInt,
+                    what: String) -> Result<Void, SosStatus> {
+    let before = events_creatable(&proc)
+    try reply_gone_with_handle(&system, &proc, &image, &ram, role, what)
+    let after = events_creatable(&proc)
+    if after != before {
+        print("SOS replyorder: {}: root can make {} Events, was {}\n", what,
+              after, before)
+        return BUG
+    }
+    say(what, "the carried Event was released")
+    return
+}
+
+/// The child parks in a call with its reply buffer in the piece; the piece is
+/// unmapped; the server replies carrying one Event handle.
+func reply_gone_with_handle(system: &System, proc: &Process, image: &Memory,
+                            ram: &Memory, role: UInt,
+                            what: String) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, role, at)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    try give_inlet(&child, move inlet)
+    try start_and_park(&proc, &child)
+
+    let got = try outlet.take()
+    let (_, request) = move got
+    try mapping.unmap()
+    let cargo = try proc.event_create()
+    var carried = PipeHandles.none()
+    carried.put(0, event: move cargo)
+    var answer: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    try (move request).reply_with(body: &answer, len: 0,
+                                  handles: &var carried)
+    try ended_with(&proc, &child, BAD_BUFFER)
+    say(what, "BadBuffer")
+    let _ = move hole
+    return
+}
+
+/// The control for the table-full trial: the same reply with the buffer still
+/// there is answered the table's refusal, and the child runs on.
+func reply_kept(system: &System, proc: &Process, image: &Memory,
+                ram: &Memory) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let _ = move hole
+    try brief(&system, &proc, &child, ROLE_FULL_PLAIN, 0)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    try give_inlet(&child, move inlet)
+    try start_and_park(&proc, &child)
+
+    let got = try outlet.take()
+    let (_, request) = move got
+    let cargo = try proc.event_create()
+    var carried = PipeHandles.none()
+    carried.put(0, event: move cargo)
+    var answer: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    try (move request).reply_with(body: &answer, len: 0,
+                                  handles: &var carried)
+    try ended_with(&proc, &child, ANSWERED_QUOTA)
+    say("reply kept, a handle, table full", "answered QuotaExceeded")
+    return
+}
+
+/// The child parks for room in a call whose body is in the piece; the piece is
+/// unmapped; then room appears, by a message taken (`closed` false) or by the
+/// server end closing (`closed` true).
+func body_gone_parked(system: &System, proc: &Process, image: &Memory,
+                      ram: &Memory, closed: Bool,
+                      what: String) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, ROLE_BODY_AT, at)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let spare = try inlet.mint(rights: POST_ONLY)
+    let full = try fill(&spare)
+    if full == 0 { return BUG }
+    try give_inlet(&child, move inlet)
+    try start_and_park(&proc, &child)
+
+    try mapping.unmap()
+    if closed {
+        let _ = move outlet
+    } else {
+        try drain(&outlet, 1)
+    }
+    try ended_with(&proc, &child, BAD_BUFFER)
+    say(what, "BadBuffer")
+    let _ = move hole
+    return
+}
+
+/// The same call made with the body already gone and the server end already
+/// closed: the call itself, not a resume.
+func body_gone_at_call(system: &System, proc: &Process, image: &Memory,
+                       ram: &Memory) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try mapping.unmap()
+    try brief(&system, &proc, &child, ROLE_BODY_AT, at)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    try give_inlet(&child, move inlet)
+    let _ = move outlet
+    try child.start(boot_tag: TAG_BOOT)
+    try ended_with(&proc, &child, BAD_BUFFER)
+    say("body gone, server end closed at the call", "BadBuffer")
+    let _ = move hole
+    return
+}
+
+/// The control for the closed-while-parked trial: a call whose buffers are all
+/// there, parked for room, is answered `PeerClosed` when the server end closes.
+func body_kept_closed(system: &System, proc: &Process, image: &Memory,
+                      ram: &Memory) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let _ = move hole
+    try brief(&system, &proc, &child, ROLE_PLAIN, 0)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let spare = try inlet.mint(rights: POST_ONLY)
+    let full = try fill(&spare)
+    if full == 0 { return BUG }
+    try give_inlet(&child, move inlet)
+    try start_and_park(&proc, &child)
+
+    let _ = move outlet
+    try ended_with(&proc, &child, ANSWERED_PEER_CLOSED)
+    say("body kept, server end closed while parked", "answered PeerClosed")
+    return
+}
+
+/// The caller's reply buffer is gone and the server drops the request without
+/// replying: the wake carries only a status, writes no buffer and asks about
+/// none, so the caller is answered `PeerClosed` and runs on.
+func reply_gone_abandoned(system: &System, proc: &Process, image: &Memory,
+                          ram: &Memory) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, ROLE_REPLY_AT, at)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    try give_inlet(&child, move inlet)
+    try start_and_park(&proc, &child)
+
+    let got = try outlet.take()
+    let (_, request) = move got
+    try mapping.unmap()
+    let _ = move request
+    try ended_with(&proc, &child, ANSWERED_PEER_CLOSED)
+    say("reply gone, the request dropped unanswered", "answered PeerClosed")
+    let _ = move hole
+    return
+}
+
+/// A call parked for room with its reply buffer in the piece; the piece is
+/// unmapped; then the server end closes (`closed`: the resume answers a status
+/// and asks no buffer) or room appears and the server replies (the reply
+/// writes a buffer, which is gone). The child must end with `want`.
+func reply_gone_parked(system: &System, proc: &Process, image: &Memory,
+                       ram: &Memory, closed: Bool, what: String,
+                       want: UInt) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, ROLE_REPLY_AT, at)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let spare = try inlet.mint(rights: POST_ONLY)
+    let full = try fill(&spare)
+    if full == 0 { return BUG }
+    try give_inlet(&child, move inlet)
+    try start_and_park(&proc, &child)
+
+    try mapping.unmap()
+    if closed {
+        let _ = move outlet
+    } else {
+        try drain(&outlet, full)
+        let got = try outlet.take()
+        let (_, request) = move got
+        var answer: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+        try (move request).reply(body: &answer, len: 0)
+    }
+    try ended_with(&proc, &child, want)
+    if want == BAD_BUFFER {
+        say(what, "BadBuffer")
+    } else {
+        say(what, "answered PeerClosed")
+    }
+    let _ = move hole
+    return
+}

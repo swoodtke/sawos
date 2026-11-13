@@ -1745,11 +1745,14 @@ public(package) func notify_claim(x: Int) unsafe {
 /// unref reads the exchange.
 ///
 /// The reply buffer was checked at the call and is checked again before the
-/// reply is spent, for `wake_one_waiter`'s reason. A caller whose buffer is
-/// gone is answered as a death would answer it: the reply is consumed and its
-/// handles destroyed with the exchange, as a reply the caller's table had no
-/// room for is, the claim is dropped, and the thread is not woken. Its process
-/// is owed `BadBuffer` (`doom_process`).
+/// reply is spent, for `wake_one_waiter`'s reason, and before the table is
+/// asked about room. A caller whose buffer is gone is answered as a death would
+/// answer it: the reply is consumed and its handles destroyed with the
+/// exchange, as a reply the caller's table had no room for is, the claim is
+/// dropped, and the thread is not woken. Its process is owed `BadBuffer`
+/// (`doom_process`) whether or not its table has room. A reply that is only a
+/// status (the peer closed) writes no buffer and asks about none: the caller is
+/// answered and runs on.
 ///
 /// The copies that follow the check are `deliver_wait_record`'s kind of door:
 /// the same step, no user code between, and a refusal there is a kernel bug.
@@ -1759,6 +1762,18 @@ func wake_call_reply(t: Int, x: Int) unsafe {
     let answer = waitable_answer(WaitableKind.PipeReply, x)
     var result = op_status(SosStatus.PeerClosed)
     if answer.payload == (ReplyLevel.Data as UInt) {
+        // The buffer is asked before the table, as `pipe_call` asked its
+        // buffers before it committed anything: a process whose buffer is gone
+        // is being ended, so nothing is minted for it and no refusal status is
+        // answered to a thread that will not run again.
+        let reply_bytes = pipe_msg_record_bytes() as UInt
+        if let why = copy_out_check(p, dst, reply_bytes) {
+            doom_process(p, why)
+            waitable_consume(WaitableKind.PipeReply, x)
+            clear_pending_call(t)
+            unref_waitable(WaitableKind.PipeReply, x)
+            return
+        }
         // The fused path mints only what the reply carried. A `Call` mints no
         // claim handle; what it may mint is the handles the server attached to
         // its answer.
@@ -1779,14 +1794,6 @@ func wake_call_reply(t: Int, x: Int) unsafe {
         if not table_room(p, staged_count(x)) {
             result = op_status(mint_refusal(p))
         } else {
-            let reply_bytes = pipe_msg_record_bytes() as UInt
-            if let why = copy_out_check(p, dst, reply_bytes) {
-                doom_process(p, why)
-                waitable_consume(WaitableKind.PipeReply, x)
-                clear_pending_call(t)
-                unref_waitable(WaitableKind.PipeReply, x)
-                return
-            }
             let moved = mint_staged(x, p)
             var rec = msg_prefix(answer.body_len, EXCHANGES[x].sender_pid,
                                  &moved)
@@ -1864,7 +1871,11 @@ public(package) func notify_room(c: Int) unsafe {
 /// call, and the copy is held to every rule `check_send` held the call to: a
 /// body length past `PIPE_BODY_BYTES` is owed `BadArg` exactly as a refused
 /// record is owed `BadBuffer`, before the length sizes any copy, and the
-/// handle words are asked about again in `hold_staged`.
+/// handle words are asked about again in `hold_staged`. Two of the call's
+/// questions are not asked here, each for a reason of its own: a handle word
+/// the call would have faulted on arrives empty (the caller is not running to
+/// be faulted), and the reply buffer is asked at the wake that writes it, since
+/// the resume answers at most a status and writes no buffer.
 ///
 /// It mints nothing, which is what a fused call buys: the claim is the parked
 /// thread, `Exchange.reply_refs` starts at one for it, and no handle row is
@@ -1885,13 +1896,22 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
         clear_pending_call(t)
         return true
     }
-    // The order `send_args` asks in: the record's own domain before the
-    // connection's state. The length is what sizes the body copy below and the
-    // exchange's length field, both of which assume one slot's worth.
+    // The order `pipe_call` asks in: the record, its length, the body, and
+    // only then the connection's state. The length is what sizes the body copy
+    // below and the exchange's length field, both of which assume one slot's
+    // worth.
     if args.len > (PIPE_BODY_BYTES as UInt) {
         doom_process(p, FaultReason.BadArg)
         clear_pending_call(t)
         return true
+    }
+    let len = args.len
+    if len != 0 {
+        if let why = copy_in_check(p, args.body, len) {
+            doom_process(p, why)
+            clear_pending_call(t)
+            return true
+        }
     }
     if PIPES[c].outlet_refs == 0 {
         // Terminal, and the message was never staged: the carried handles are
@@ -1903,14 +1923,6 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
         ready_push(t)
         release_carried(p, &args)
         return true
-    }
-    let len = args.len
-    if len != 0 {
-        if let why = copy_in_check(p, args.body, len) {
-            doom_process(p, why)
-            clear_pending_call(t)
-            return true
-        }
     }
     let x = alloc_exchange(c)
     if x == NO_EXCHANGE {

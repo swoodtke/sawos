@@ -1,0 +1,168 @@
+// Test child: one fused `PipeInlet.Call`, its buffers where the launcher says
+// (spec §2.2). The role says what is made and where:
+//
+//   1  an empty message, the reply going to the address the launcher gave
+//   2  as 1, after this process has filled its handle table
+//   3  a message whose body is the bytes at the address the launcher gave,
+//      the reply going to this process's own data
+//   4  an empty message, the reply going to this process's own data
+//   5  as 4, after this process has filled its handle table
+//
+// A call the kernel answers leaves this process alive, and it exits with a
+// code of its own that the launcher can tell apart from every fault: 7 when
+// the call was answered `Ok`, otherwise `EXIT_STATUS_BASE` plus the status.
+//
+// It works at the C altitude because the buffers are addresses this program
+// picks, which the typed tier never lets a caller name.
+
+import sos.{ALL_RIGHTS, PIPE_MSG_HANDLES, sos_system_process_self,
+            sos_process_boot_handle_next, sos_process_exit,
+            sos_event_receive, sos_pipe_inlet_call}
+
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_INLET: UInt = 35
+
+static ROLE_REPLY_AT: UInt = 1
+static ROLE_FULL_REPLY_AT: UInt = 2
+static ROLE_BODY_AT: UInt = 3
+static ROLE_PLAIN: UInt = 4
+static ROLE_FULL_PLAIN: UInt = 5
+
+static BODY_BYTES: UInt = 8
+
+/// More than any reply record the kernel writes.
+static REPLY_WORDS: Int = 64
+
+/// How this process ends when the kernel answered its call `Ok`.
+static EXIT_TAKEN: UInt = 7
+/// What this process adds to a status it was answered, to end with.
+static EXIT_STATUS_BASE: UInt = 200
+/// The boot set held no role.
+static EXIT_NO_ROLE: UInt = 98
+
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+static BOOT_WORDS: Int = 3
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// More mints than any handle table holds.
+static FILL_LIMIT: Int = 4096
+
+unsafe static var BOOT: UInt = 0
+unsafe static var ROLE: UInt = 0
+unsafe static var ADDR: UInt = 0
+unsafe static var INLET: UInt = 0
+unsafe static var ARGS: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+unsafe static var REPLY: [UInt; REPLY_WORDS] = [0; REPLY_WORDS]
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+func event_word(handle: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let _ = sos_event_receive(handle, (&var word) as UnsafePointer<UInt>)
+    word
+}
+
+func next_record(proc: UInt, rec: &var [UInt; BOOT_WORDS]) unsafe -> UInt {
+    sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                 (BOOT_WORDS as UInt) * word_bytes())
+}
+
+func drain(proc: UInt) unsafe {
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    while next_record(proc, &var rec) == STATUS_OK {
+        let tag = rec[0]
+        let word = rec[2]
+        if tag == TAG_ROLE {
+            ROLE = event_word(word)
+        } else if tag == TAG_ADDR {
+            ADDR = event_word(word)
+        } else if tag == TAG_INLET {
+            INLET = word
+        }
+    }
+}
+
+/// Mint Process handles until the kernel refuses one: the table, or this
+/// process's handle quota, is then full.
+func fill_table() unsafe {
+    var n: Int = 0
+    while n < FILL_LIMIT {
+        if ask_process(BOOT) == NONE {
+            return
+        }
+        n = n + 1
+    }
+}
+
+/// One fused call whose message is the `len` bytes at `body`, its reply going
+/// to `reply`.
+func call(body: UInt, len: UInt, reply: UInt) unsafe -> UInt {
+    ARGS[0] = body
+    ARGS[1] = len
+    let args = (&var ARGS) as UnsafePointer<UInt>
+    var value: UInt = 0
+    let status = sos_pipe_inlet_call(INLET, args,
+                                     (SEND_WORDS as UInt) * word_bytes(),
+                                     reply as UnsafePointer<UInt>,
+                                     (&var value) as UnsafePointer<UInt>)
+    if status == STATUS_OK {
+        return EXIT_TAKEN
+    }
+    EXIT_STATUS_BASE + status
+}
+
+func own_reply() unsafe -> UInt {
+    ((&var REPLY) as UnsafePointer<UInt>) as UInt
+}
+
+func act() unsafe -> UInt {
+    if ROLE == ROLE_REPLY_AT {
+        return call(0, 0, ADDR)
+    }
+    if ROLE == ROLE_FULL_REPLY_AT {
+        fill_table()
+        return call(0, 0, ADDR)
+    }
+    if ROLE == ROLE_BODY_AT {
+        return call(ADDR, BODY_BYTES, own_reply())
+    }
+    if ROLE == ROLE_PLAIN {
+        return call(0, 0, own_reply())
+    }
+    if ROLE == ROLE_FULL_PLAIN {
+        fill_table()
+        return call(0, 0, own_reply())
+    }
+    EXIT_NO_ROLE
+}
+
+func remember(boot_handle: UInt) unsafe {
+    BOOT = boot_handle
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    remember(boot_handle)
+    let proc = ask_process(boot_handle)
+    if proc == NONE {
+        return
+    }
+    drain(proc)
+    let code = act()
+    let _ = sos_process_exit(proc, code)
+}

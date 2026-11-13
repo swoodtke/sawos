@@ -62,6 +62,7 @@ per-case staging directory, `_run_qemu`'s own stdin, and `main`'s eager `tc()`.
 """
 
 import argparse
+import ast
 import concurrent.futures
 import os
 import re
@@ -690,6 +691,8 @@ RO_SEGMENT_PKG = os.path.join(TESTS_DIR, "ro-segment")
 CHILD_RO_SEGMENT_PKG = os.path.join(TESTS_DIR, "child-ro-segment")
 IMAGE_REREAD_PKG = os.path.join(TESTS_DIR, "image-reread")
 DEVICE_FOUR_BYTES_PKG = os.path.join(TESTS_DIR, "device-four-bytes")
+REPLY_DOOR_ORDER_PKG = os.path.join(TESTS_DIR, "reply-door-order")
+CHILD_REPLY_DOOR_ORDER_PKG = os.path.join(TESTS_DIR, "child-reply-door-order")
 
 # Clock and Timer objects. What an object answers and whether a wait parks are
 # separate questions, so they get separate packages: a scheduling bug cannot
@@ -8298,7 +8301,10 @@ TEST_CASES = [
         # data has that segment inside its copy-out window, which starts at the
         # lowest writable segment. A pipe-creation record aimed at a word of it
         # ends the child with `BadBuffer`; the same record aimed at its
-        # writable data is taken.
+        # writable data is taken. A wait on an Event already signalled (which
+        # the kernel would deliver at once) is held to the same: its record
+        # in the read-only data ends the child at the call, and its record in
+        # the writable data is delivered.
         "name": "read_only_segment_not_destination",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": RO_SEGMENT_PKG,
@@ -8308,6 +8314,10 @@ TEST_CASES = [
                        "SOS roseg: a record into the read-only data: "
                        "BadBuffer",
                        "SOS roseg: a record into the writable data: taken",
+                       "SOS roseg: a wait record into the read-only data: "
+                       "BadBuffer",
+                       "SOS roseg: a wait record into the writable data: "
+                       "taken",
                        "SOS roseg: done"],
         "expect_clean_exit": True,
     },
@@ -8360,6 +8370,61 @@ TEST_CASES = [
                        "SOS devfour: reading below the window",
                        "SOS: fault "],
         "expect_clean_exit": False,
+    },
+    {
+        # A late door asks its questions in the order the call did (spec
+        # §2.2). A launcher maps a piece of a child's own region into the
+        # hole between its data and its stack, the child parks a fused call
+        # with a buffer in it, and the launcher unmaps the piece before the
+        # answer arrives. A reply carrying a handle ends the child with
+        # `BadBuffer` whether its table has room or is full, since the reply
+        # buffer is asked before the table, and the Event the reply carried
+        # goes back to its slab (root counts the Events it can create before
+        # and after). With the buffer kept, a full table is still answered
+        # `QuotaExceeded`. A call parked for room asks its body before the
+        # connection's state: a body that is gone ends the child with
+        # `BadBuffer` whether the server end is open, closed while parked or
+        # closed at the call, and a call whose buffers are all there is
+        # answered `PeerClosed` when the server end closes. A wake that
+        # carries only a status writes no buffer and asks about none: with the
+        # reply buffer gone, a request dropped unanswered and a server end
+        # closed while the call is parked for room are answered `PeerClosed`
+        # and the child runs on, while a reply after the room appears ends it
+        # with `BadBuffer`. Only where a mapping takes its memory's own
+        # address does the piece lie in the hole.
+        "name": "late_door_order",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": REPLY_DOOR_ORDER_PKG,
+        "children": [CHILD_REPLY_DOOR_ORDER_PKG],
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS replyorder: reply gone, a handle, table room: "
+                       "BadBuffer",
+                       "SOS replyorder: reply gone, a handle, table room: "
+                       "the carried Event was released",
+                       "SOS replyorder: reply gone, a handle, table full: "
+                       "BadBuffer",
+                       "SOS replyorder: reply gone, a handle, table full: "
+                       "the carried Event was released",
+                       "SOS replyorder: reply kept, a handle, table full: "
+                       "answered QuotaExceeded",
+                       "SOS replyorder: body gone, server end open, parked: "
+                       "BadBuffer",
+                       "SOS replyorder: body gone, server end closed while "
+                       "parked: BadBuffer",
+                       "SOS replyorder: body gone, server end closed at the "
+                       "call: BadBuffer",
+                       "SOS replyorder: body kept, server end closed while "
+                       "parked: answered PeerClosed",
+                       "SOS replyorder: reply gone, the request dropped "
+                       "unanswered: answered PeerClosed",
+                       "SOS replyorder: parked for room, reply gone, server "
+                       "end closed: answered PeerClosed",
+                       "SOS replyorder: parked for room, reply gone, room "
+                       "then a reply: BadBuffer",
+                       "SOS replyorder: done"],
+        "expect_clean_exit": True,
     },
 ]
 
@@ -10247,7 +10312,65 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
     return 1 if failed else 0
 
 
+def own_table_problems(source, path):
+    """Mistakes in this file's own tables, found from its syntax tree.
+
+    Python keeps the last value of a key a dict literal names twice and says
+    nothing, so two case entries joined into one literal (a `},` and a `{`
+    lost in an edit) leave one case where two were written, with no error.
+    Two findings, each as `PATH:LINE: message`:
+
+      - a dict literal naming a key twice, wherever it is;
+      - two cases of one list sharing a `name`. A case is a dict literal with
+        a string `name`; a list is one list or tuple literal, so the board
+        sections' own lists may repeat a name another list uses.
+    """
+    problems = []
+    for node in ast.walk(ast.parse(source, filename=path)):
+        if isinstance(node, ast.Dict):
+            seen = {}
+            for key in node.keys:
+                if not isinstance(key, ast.Constant):
+                    continue
+                if key.value in seen:
+                    problems.append(
+                        f"{path}:{key.lineno}: a dict literal names the key "
+                        f"{key.value!r} twice (first at line "
+                        f"{seen[key.value]}); two entries joined into one?")
+                else:
+                    seen[key.value] = key.lineno
+        elif isinstance(node, (ast.List, ast.Tuple)):
+            named = {}
+            for entry in node.elts:
+                if not isinstance(entry, ast.Dict):
+                    continue
+                for key, value in zip(entry.keys, entry.values):
+                    if (isinstance(key, ast.Constant) and key.value == "name"
+                            and isinstance(value, ast.Constant)
+                            and isinstance(value.value, str)):
+                        if value.value in named:
+                            problems.append(
+                                f"{path}:{value.lineno}: the case name "
+                                f"{value.value!r} is used twice in one list "
+                                f"(first at line {named[value.value]})")
+                        else:
+                            named[value.value] = value.lineno
+    return problems
+
+
+def check_own_tables():
+    """Stop, before anything is built, if this file's tables are malformed."""
+    path = os.path.abspath(__file__)
+    with open(path, encoding="utf-8") as f:
+        problems = own_table_problems(f.read(), path)
+    if problems:
+        for line in problems:
+            print(f"{RED}{line}{RESET}", file=sys.stderr)
+        sys.exit(2)
+
+
 def main():
+    check_own_tables()
     parser = argparse.ArgumentParser(description="SOS QEMU test harness")
     parser.add_argument("--arch", metavar="NAME",
                         help="run one architecture (default: every one — the GATE is every one)")

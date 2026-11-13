@@ -7,11 +7,15 @@
 //
 //   SOS roseg: a record into the read-only data: BadBuffer
 //   SOS roseg: a record into the writable data: taken
+//   SOS roseg: a wait record into the read-only data: BadBuffer
+//   SOS roseg: a wait record into the writable data: taken
 //   SOS roseg: done
 //
 // The copy-out window runs from the lowest writable segment to the region's
 // top, so the read-only segment lies inside it on every profile, and only the
-// row's permission keeps the kernel from writing there.
+// row's permission keeps the kernel from writing there. The wait is an op the
+// kernel can park, so its record is asked at the call, and a refusal there ends
+// the child before anything is parked or delivered.
 
 import sos.{System, Process, Memory, SosStatus, SystemRight}
 
@@ -29,6 +33,8 @@ static KEY_DEATH: UInt = 6
 /// The roles `child-ro-segment` knows.
 static ROLE_READ_ONLY: UInt = 1
 static ROLE_DATA: UInt = 2
+static ROLE_WAIT_READ_ONLY: UInt = 3
+static ROLE_WAIT_DATA: UInt = 4
 
 static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
 
@@ -77,6 +83,10 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     print("SOS roseg: a record into the read-only data: BadBuffer\n")
     try trial(&system, &proc, &image, &ram, ROLE_DATA, TAKEN)
     print("SOS roseg: a record into the writable data: taken\n")
+    try trial(&system, &proc, &image, &ram, ROLE_WAIT_READ_ONLY, BAD_BUFFER)
+    print("SOS roseg: a wait record into the read-only data: BadBuffer\n")
+    try trial(&system, &proc, &image, &ram, ROLE_WAIT_DATA, TAKEN)
+    print("SOS roseg: a wait record into the writable data: taken\n")
     return
 }
 

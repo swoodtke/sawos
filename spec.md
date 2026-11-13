@@ -697,12 +697,20 @@ a reply delivery carries, which is why there is one type and not two — and
   the same addresses meanwhile is judged as the row it then is — a read-only one
   ends the process, a writable one is written, as any buffer is. A record the
   kernel reads out of a process is copied once and acted on as copied; the one
-  record read twice, a parked call's (§2.1), is held at its second reading to
-  every rule the call was. So a future op that changes a row in place (its
-  permissions, say) must be, to every door, an unmap followed by a map: the
-  grant record and the hardware change together with no preemption point
-  between, nothing caches a row's permission or translation across a switch
-  point, and the next door to look, late doors included, judges the new row.
+  record read twice, a parked call's (§2.1), is asked at its second reading in
+  the call's order (the record, its length, the body, then the connection's
+  state) and held to the call's rules, but for a handle word the call would
+  have faulted on, which arrives empty because the caller is not running to be
+  faulted. A wake that writes a buffer asks it before anything else that could
+  answer the thread with a status (room in its table, for one), so a process
+  whose buffer is gone ends with `BadBuffer` whether or not that answer was
+  owed. A wake that carries only a status (the peer closed) writes no buffer
+  and asks about none: the process is answered and runs on. So a future op
+  that changes a row in place (its permissions, say) must be, to every door,
+  an unmap followed by a map: the grant record and the hardware change
+  together with no preemption point between, nothing caches a row's
+  permission or translation across a switch point, and the next door to look,
+  late doors included, judges the new row.
 - **`write_result` is the only function that writes an answer into a frame** —
   its callers are `ktrap` for an op that answered at once and the wake paths
   that answer a parked thread — which is what makes "exactly one write per
