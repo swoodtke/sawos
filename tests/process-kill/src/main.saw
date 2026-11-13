@@ -1,0 +1,362 @@
+// `ProcessOp.Kill` through handles with and without the right (spec §8).
+//
+// Root launches `child-walk-idle`, a process that parks for good, and ends it
+// through the handle `ProcessCreate` gave it. Each trial is a function of its
+// own, to stay under root's stack size.
+//
+//   SOS kill: a child parked in a wait is killed; its status reads Killed
+//                     the status word is the kind `Killed` over the killer's
+//                     code, and the kill answers `Ok`
+//   SOS kill: a watcher parked before the kill is woken with Killed
+//                     a process parked on a Waiter with the child attached
+//                     is woken, and exits with the kind and the code it read
+//   SOS kill: a kill of a Gone child answers Revoked and keeps its death
+//                     a second kill, with another code, changes nothing
+//   SOS kill: a lookup handle carries no kill right
+//   SOS kill: a kill through a lookup handle is AccessDenied and the target
+//             lives
+//                     a process kills through the handle `ProcessByPid`
+//                     answers and is ended with `AccessDenied`; the target
+//                     still reads running afterwards
+//   SOS kill: a handle without the right is AccessDenied, naming the caller or
+//             not
+//                     the right is checked before the target
+//   SOS kill: a kill through the caller's own handle is a NotSelf fault
+//                     the handle carries the right, and names the caller
+//   SOS kill: a child whose Process ceiling lacks the right cannot kill its
+//             child
+//                     the handle `ProcessCreate` gave it carries no right
+//   SOS kill: done
+//
+// The numbers a trial reads are the §8 status words: `Killed` is kind 3,
+// `Faulted` kind 2 and `Exited` kind 1, in the high half, and a fault's low
+// half is its `FaultReason`.
+
+import sos.{System, Process, Memory, SosStatus, SystemRight,
+            ProcessRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+
+/// The tags and roles `child-kill` knows.
+static TAG_ROLE: UInt = 40
+static TAG_WAITER: UInt = 41
+static TAG_PID: UInt = 42
+static TAG_IMAGE: UInt = 43
+static TAG_RAM: UInt = 44
+static ROLE_WATCH: UInt = 1
+static ROLE_SELF: UInt = 2
+static ROLE_SELF_DENIED: UInt = 3
+static ROLE_LOOKUP: UInt = 4
+static ROLE_CREATOR: UInt = 5
+
+static KEY_WATCH: UInt = 1
+static KEY_DEATH: UInt = 6
+
+/// The code root kills with, and the §8 status word it leaves: `Killed` (3) in
+/// the high half over the code.
+static KILL_CODE: UInt = 0x2A
+static KILLED: UInt = 196650
+static_assert((3 * 65536) + 0x2A == 196650,
+              "a killed word is Killed in the high bits, then the code")
+
+/// What the watcher exits with: the kind times 256 plus the code's low byte,
+/// in an `Exited` word.
+static WATCHER_EXIT: UInt = 66346
+static_assert((1 * 65536) + (3 * 256) + 0x2A == 66346,
+              "an exit word is Exited in the high bits, then the code")
+
+/// The words of a process that ended with a fault: `Faulted` in the high half
+/// and the reason in the low (`AccessDenied` is 3, `NotSelf` 4).
+static ACCESS_DENIED: UInt = 131075
+static NOT_SELF: UInt = 131076
+static_assert((2 * 65536) + 3 == 131075,
+              "a fault word is Faulted in the high bits, then the reason")
+static_assert((2 * 65536) + 4 == 131076,
+              "a fault word is Faulted in the high bits, then the reason")
+
+/// What a child of this launcher may ask its System object for, and the same
+/// with the authority to find a process by pid, and to create one.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+static OBSERVER_SYSTEM: UInt32 = CHILD_SYSTEM | SystemRight.ProcessObserve
+static CREATOR_SYSTEM: UInt32 = CHILD_SYSTEM | SystemRight.ProcessCreate
+
+/// The Process ceiling that leaves every right but the kill.
+static NO_KILL: UInt32 = 0xFFFF_FFFF ^ ProcessRight.Kill
+
+/// The rights of every handle a lookup mints: the observe set.
+static OBSERVE: UInt32 = ProcessRight.Wait | ProcessRight.Stats
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS kill: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS kill: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS kill: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The boot regions come blobs first and destinations second, in the order
+    // the case lists its children: `child-kill`, then `child-walk-idle`.
+    var kill_img_rec = try proc.boot_handle_next()
+    var idle_img_rec = try proc.boot_handle_next()
+    var kill_ram_rec = try proc.boot_handle_next()
+    var idle_ram_rec = try proc.boot_handle_next()
+    guard let kill_img = kill_img_rec.take_memory() else { return BUG }
+    guard let idle_img = idle_img_rec.take_memory() else { return BUG }
+    guard let kill_ram = kill_ram_rec.take_memory() else { return BUG }
+    guard let idle_ram = idle_ram_rec.take_memory() else { return BUG }
+    let running = try proc.get_status()
+
+    try killed(&system, &proc, &kill_img, &kill_ram, &idle_img, &idle_ram)
+    try refused(&system, &proc, &kill_img, &kill_ram, &idle_img, &idle_ram,
+                running)
+    try ceiling(&system, &proc, &kill_img, &kill_ram, move idle_img,
+                move idle_ram)
+    return
+}
+
+// -----------------------------------------------------------------------------
+// The trials
+// -----------------------------------------------------------------------------
+
+/// A parked child is killed, a watcher parked before the kill is woken, and a
+/// second kill of the dead child changes nothing.
+func killed(system: &System, proc: &Process, kill_img: &Memory,
+            kill_ram: &Memory, idle_img: &Memory,
+            idle_ram: &Memory) -> Result<Void, SosStatus> {
+    let target = try launch_idle(&system, &idle_img, &idle_ram)
+
+    // The watcher parks on a Waiter with the target attached, before the kill.
+    let watcher = try make(&system, &kill_img, &kill_ram)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &target, key: KEY_WATCH)
+    try watcher.give(waiter: move waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try brief(&system, &proc, &watcher, ROLE_WATCH, CHILD_SYSTEM)
+    try watcher.start(boot_tag: TAG_BOOT)
+    try park(&proc)
+
+    try target.kill(code: KILL_CODE)
+    let word = try target.get_status()
+    if word != KILLED {
+        print("SOS kill: the killed child reads status {}\n", word)
+        return BUG
+    }
+    say("a child parked in a wait is killed; its status reads Killed")
+
+    try ended_with(&proc, &watcher, WATCHER_EXIT)
+    say("a watcher parked before the kill is woken with Killed")
+
+    // The target is `Gone`: the kill is answered with a status, and it keeps
+    // the death it recorded.
+    match target.kill(code: 0x55) {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> {
+            if not is_revoked(why) {
+                print("SOS kill: a second kill answered {}\n", why)
+                return BUG
+            }
+        },
+    }
+    let again = try target.get_status()
+    if again != KILLED {
+        print("SOS kill: the second kill left status {}\n", again)
+        return BUG
+    }
+    say("a kill of a Gone child answers Revoked and keeps its death")
+    return
+}
+
+/// Kills that are refused: through a lookup handle, through a handle without
+/// the right that names the caller, and through the caller's own handle.
+func refused(system: &System, proc: &Process, kill_img: &Memory,
+             kill_ram: &Memory, idle_img: &Memory, idle_ram: &Memory,
+             running: UInt) -> Result<Void, SosStatus> {
+    let target = try launch_idle(&system, &idle_img, &idle_ram)
+    let stats = try target.stats()
+    let pid = stats.pid
+
+    // What the lookup answers carries the observe set and no kill right.
+    let found = try system.process_by_pid(pid: pid)
+    let found_rights = try found.rights()
+    let kill_bit = ProcessRight.Kill as UInt32
+    if found_rights != OBSERVE || (found_rights & kill_bit) != 0 {
+        print("SOS kill: the lookup handle carries {}\n", found_rights)
+        return BUG
+    }
+    let _ = move found
+    say("a lookup handle carries no kill right")
+
+    // A process that kills through such a handle is ended, and the target is
+    // not.
+    let asker = try make(&system, &kill_img, &kill_ram)
+    try tell(&proc, &asker, TAG_PID, pid as UInt)
+    try brief(&system, &proc, &asker, ROLE_LOOKUP, OBSERVER_SYSTEM)
+    try asker.start(boot_tag: TAG_BOOT)
+    try ended_with(&proc, &asker, ACCESS_DENIED)
+    let still = try target.get_status()
+    if still != running {
+        print("SOS kill: the target reads status {}\n", still)
+        return BUG
+    }
+    say("a kill through a lookup handle is AccessDenied and the target lives")
+
+    let weak = try make(&system, &kill_img, &kill_ram)
+    try brief(&system, &proc, &weak, ROLE_SELF_DENIED, CHILD_SYSTEM)
+    try weak.start(boot_tag: TAG_BOOT)
+    try ended_with(&proc, &weak, ACCESS_DENIED)
+    say("a handle without the right is AccessDenied, naming the caller or not")
+
+    let own = try make(&system, &kill_img, &kill_ram)
+    try brief(&system, &proc, &own, ROLE_SELF, CHILD_SYSTEM)
+    try own.start(boot_tag: TAG_BOOT)
+    try ended_with(&proc, &own, NOT_SELF)
+    say("a kill through the caller's own handle is a NotSelf fault")
+
+    // The target is still there for the creator's handle to end: its body is
+    // wanted by the next trial.
+    try target.kill(code: KILL_CODE)
+    return
+}
+
+/// A child whose Process ceiling lacks the right is given a region and an
+/// image, creates a process and cannot kill it.
+func ceiling(system: &System, proc: &Process, kill_img: &Memory,
+             kill_ram: &Memory, image: Memory,
+             ram: Memory) -> Result<Void, SosStatus> {
+    let creator = try make(&system, &kill_img, &kill_ram)
+    try creator.restrict_rights(process: NO_KILL)
+    try creator.give(memory: move image, tag: TAG_IMAGE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try creator.give(memory: move ram, tag: TAG_RAM) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try tell(&proc, &creator, TAG_ROLE, ROLE_CREATOR)
+    let boot = try system.mint(rights: CREATOR_SYSTEM)
+    try creator.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try creator.start(boot_tag: TAG_BOOT)
+    try ended_with(&proc, &creator, ACCESS_DENIED)
+    say("a child whose Process ceiling lacks the right cannot kill its child")
+    return
+}
+
+// -----------------------------------------------------------------------------
+// Parts
+// -----------------------------------------------------------------------------
+
+func say(line: String) {
+    print("SOS kill: {}\n", line)
+}
+
+func is_revoked(why: SosStatus) -> Bool {
+    match why {
+        case Revoked -> true,
+        case _ -> false,
+    }
+}
+
+/// Make a process from `image` and `ram`. It is not started.
+func make(system: &System, image: &Memory,
+          ram: &Memory) -> Result<Process, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    return move child
+}
+
+/// A `child-walk-idle` process, started: it parks for good.
+func launch_idle(system: &System, image: &Memory,
+                 ram: &Memory) -> Result<Process, SosStatus> {
+    let child = try make(&system, &image, &ram)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return move child
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// What every `child-kill` is given: its role and its System handle, which is
+/// its boot tag.
+func brief(system: &System, proc: &Process, child: &Process, role: UInt,
+           rights: UInt32) -> Result<Void, SosStatus> {
+    try tell(&proc, &child, TAG_ROLE, role)
+    let boot = try system.mint(rights: rights)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Let every process that can run, run until it parks: nothing ticks in this
+/// case, so a yield returns when the other processes have nothing left to do.
+func park(proc: &Process) -> Result<Void, SosStatus> {
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
+    return
+}
+
+/// Wait for the process `child` names to end and require the status word
+/// `want`.
+func ended_with(proc: &Process, child: &Process,
+                want: UInt) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS kill: the child ended with status {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

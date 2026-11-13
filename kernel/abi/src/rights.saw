@@ -221,10 +221,13 @@ static_assert((SystemRight.ProcessObserve as UInt32) >= (1 << 8),
 /// `ThreadSelf` gates one thing: asking the process for the calling thread's
 /// handle. A handle without it cannot name the calling thread.
 ///
-/// There is no `Kill` right. Spec §8 ratifies one as the capability-gated
-/// escape hatch userspace supervision needs against a wedged peer process, but
-/// no op implements it (`ProcessStatusKind.Killed` is declared and
-/// unreachable).
+/// `Kill` gates `ProcessOp.Kill`, the one way a process ends another (spec
+/// §8). It is in the one default set, so a launcher's handle onto its child
+/// carries it, and it is never in the observe set, so a handle that comes from
+/// a sender, a walk or a lookup cannot end the process it names. A handle
+/// naming the caller's own process carries it too and ends nothing: killing
+/// oneself is a `NotSelf` fault, and a process ends itself with `Exit`. It
+/// moves as every right does: `Transfer` gives it on and a keep mask strips it.
 ///
 /// `Start` and `BootHandles` gate different roles the Process object plays:
 ///
@@ -320,6 +323,7 @@ public enum ProcessRight: UInt32 {
     case Wait = 1 << 10,
     case EventCreate = 1 << 11,
     case WaiterCreate = 1 << 12,
+    case Kill = 1 << 13,
     case Start = 1 << 14,
     case BootHandles = 1 << 15,
     case ThreadSelf = 1 << 16,
@@ -344,6 +348,8 @@ static_assert((ProcessRight.EventCreate as UInt32) >= (1 << 8),
               "kind-specific right EventCreate must start at bit 8 or above")
 static_assert((ProcessRight.WaiterCreate as UInt32) >= (1 << 8),
               "kind-specific right WaiterCreate must start at bit 8 or above")
+static_assert((ProcessRight.Kill as UInt32) >= (1 << 8),
+              "kind-specific right Kill must start at bit 8 or above")
 static_assert((ProcessRight.Start as UInt32) >= (1 << 8),
               "kind-specific right Start must start at bit 8 or above")
 static_assert((ProcessRight.BootHandles as UInt32) >= (1 << 8),
@@ -988,8 +994,8 @@ public func root_system_rights() -> UInt32 {
 ///
 /// What is in it, all named for the op it gates: `ThreadCreate`, `ThreadSelf`,
 /// `Exit`, `Wait`, `EventCreate`, `WaiterCreate`, `Start`,
-/// `BootHandles`, `Give`, `Map`, `PipeCreate`, `Stats`, `RestrictRights`, plus
-/// the two universal bits `Transfer` and `Mint`.
+/// `BootHandles`, `Give`, `Map`, `PipeCreate`, `Stats`, `RestrictRights` and
+/// `Kill`, plus the two universal bits `Transfer` and `Mint`.
 ///
 /// Two bits read oddly on root's own handle and are harmless there, which is
 /// the price of one list. `Start` on a process that is already `Running` is the
@@ -1014,6 +1020,7 @@ public func process_rights() -> UInt32 {
      | (ProcessRight.PipeCreate as UInt32)
      | (ProcessRight.Stats as UInt32)
      | (ProcessRight.RestrictRights as UInt32)
+     | (ProcessRight.Kill as UInt32)
      | (ProcessRight.Transfer as UInt32) | (ProcessRight.Mint as UInt32))
 }
 
@@ -1079,7 +1086,8 @@ public func pipe_request_rights() -> UInt32 {
 /// The observe set: the rights of a Process handle that comes from no creation,
 /// no `ProcessSelf` and no give (spec §2.7). It learns that a process died and
 /// how, what it cost, what its pid is and what its ceilings are, and it carries
-/// neither `Transfer` nor `Mint`, so the handle stays where it was minted.
+/// neither `Transfer` nor `Mint`, so the handle stays where it was minted. It
+/// never carries `ProcessRight.Kill`.
 ///
 /// Every mint of such a handle takes its rights from here and caps them by the
 /// Process ceiling of the table it lands in: the sender handle, and the handles

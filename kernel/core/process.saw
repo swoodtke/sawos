@@ -219,9 +219,11 @@ public(package) func assign_pid(p: Int) unsafe -> UInt64 {
 /// The record holding the smallest pid greater than `after`, or `NO_PROCESS`
 /// when no record the table holds has a greater one.
 ///
-/// Every record that is not `Free` is a candidate: a running process, a
-/// `Created` one never started, and a `Gone` one something still names. A pid
-/// is never reused, so the answer depends on `after` and on what the table
+/// A record is a candidate when it is `Running`, or `Gone` and something still
+/// names it. A `Free` record is passed over, and so is a `Created` one: a
+/// process that has not started is not answered, so its pid is skipped as an
+/// unassigned one is, and the same cursor answers it once it has started. A
+/// pid is never reused, so the answer depends on `after` and on what the table
 /// holds and on nothing else; no state outlives the call. The scan is bounded
 /// by the record slab's capacity and its body is O(1).
 public(package) func record_above_pid(after: UInt64) unsafe -> Int {
@@ -230,6 +232,7 @@ public(package) func record_above_pid(after: UInt64) unsafe -> Int {
     while r < PROCESS_RECORDS.capacity() {
         match PROCESS_RECORDS[r].state {
             case Free -> {},
+            case Created -> {},
             case _ -> {
                 let pid = PROCESS_RECORDS[r].pid
                 if pid > after && (best == NO_PROCESS
@@ -244,15 +247,18 @@ public(package) func record_above_pid(after: UInt64) unsafe -> Int {
 }
 
 /// The record that holds `pid`, or `NO_PROCESS` for a pid the table does not
-/// hold: one whose record was reclaimed, one never assigned, and zero.
+/// hold: one whose record was reclaimed, one never assigned, zero, and one
+/// whose process has not started.
 ///
-/// For a pid the table holds it is the record `record_above_pid(pid - 1)`
-/// answers. For one it does not hold it answers `NO_PROCESS`, where the walk
-/// would go on to the next greater pid.
+/// For a pid the walk answers it is the record `record_above_pid(pid - 1)`
+/// answers. For any other it answers `NO_PROCESS`, where the walk would go on
+/// to the next greater pid.
 ///
 /// Zero is excluded twice: by the early return, which states that zero is
 /// never a pid (spec §2.7) and spares the scan, and by the `Free` filter, since
-/// a free record's pid is zero and must not match.
+/// a free record's pid is zero and must not match. A `Created` record is
+/// filtered as the walk filters it, so the lookup answers nothing the walk
+/// would not.
 public(package) func record_of_pid(pid: UInt64) unsafe -> Int {
     if pid == 0 {
         return NO_PROCESS
@@ -261,6 +267,7 @@ public(package) func record_of_pid(pid: UInt64) unsafe -> Int {
     while r < PROCESS_RECORDS.capacity() {
         match PROCESS_RECORDS[r].state {
             case Free -> {},
+            case Created -> {},
             case _ -> {
                 if PROCESS_RECORDS[r].pid == pid {
                     return r

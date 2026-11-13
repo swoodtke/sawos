@@ -1,0 +1,272 @@
+// Test child: does one thing to another process, for the kill cases.
+//
+// The launcher gives it a role (an Event whose bits are the role number) and
+// whatever the role needs, each under a tag, and the child drains its boot set
+// and acts. A role that ends it with a fault is the point: the launcher reads
+// the status word.
+//
+//   WATCH         a Waiter with a process attached: wait for its death and
+//                 exit with the kind and the low byte of the code it carries
+//   SELF          kill through the handle `ProcessSelf` mints, which names
+//                 this process and carries the kill right
+//   SELF_DENIED   the same through a handle minted without the right
+//   LOOKUP        kill through the handle `ProcessByPid` answers for the pid
+//                 an Event carries, a handle of the observe set
+//   CREATOR       create a process from a given image and region, and kill it
+//                 through the creator's handle, which carries no kill right
+//                 when this process's Process ceiling lacks it
+//   SERVER        hold the server end of a connection without taking from
+//                 it, tell the launcher when a message is staged, and park
+//   TARGET        kill the process a given handle names
+//
+// A kill that is answered, an answer other than a fault, ends the child with
+// `EXIT_ANSWERED` or `EXIT_REFUSED`, which no role's honest outcome produces.
+
+import sos.{System, Process, Waiter, Event, Memory, PipeOutlet, ProcessRight}
+
+/// The tags the launcher gives things under.
+static TAG_ROLE: UInt = 40
+static TAG_WAITER: UInt = 41
+static TAG_PID: UInt = 42
+static TAG_IMAGE: UInt = 43
+static TAG_RAM: UInt = 44
+static TAG_OUTLET: UInt = 45
+static TAG_SIGNAL: UInt = 46
+static TAG_TARGET: UInt = 47
+
+static ROLE_WATCH: UInt = 1
+static ROLE_SELF: UInt = 2
+static ROLE_SELF_DENIED: UInt = 3
+static ROLE_LOOKUP: UInt = 4
+static ROLE_CREATOR: UInt = 5
+static ROLE_SERVER: UInt = 6
+static ROLE_TARGET: UInt = 7
+
+/// The code the killer passes, which nothing else in a transcript is.
+static KILL_CODE: UInt = 0x2B
+
+/// The kill came back `Ok`, and came back with a status.
+static EXIT_ANSWERED: UInt = 70
+static EXIT_REFUSED: UInt = 71
+
+/// A step before the kill, or the boot set, was not what the role needs.
+static EXIT_SETUP: UInt = 72
+static EXIT_RIGHT: UInt = 73
+
+/// What the watcher's exit code is made of: the kind shifted over the low byte
+/// of the code, so the launcher can tell `Killed` and the code from both.
+static KIND_SHIFT: UInt = 16
+static CODE_BYTE: UInt = 0xFF
+
+/// The rights of a handle with `Wait`, `Stats` and `Exit` and no kill.
+static WEAK: UInt32 = ProcessRight.Wait | ProcessRight.Stats | ProcessRight.Exit
+
+static KEY_WATCH: UInt = 1
+static KEY_SERVER: UInt = 2
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        return
+    }
+
+    var role_ev: Event? = None
+    var pid_ev: Event? = None
+    var waiter: Waiter? = None
+    var image: Memory? = None
+    var ram: Memory? = None
+    var outlet: PipeOutlet? = None
+    var signal: Event? = None
+    var target: Process? = None
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if tag == TAG_ROLE {
+                    role_ev = rec.take_event()
+                } else if tag == TAG_PID {
+                    pid_ev = rec.take_event()
+                } else if tag == TAG_WAITER {
+                    waiter = rec.take_waiter()
+                } else if tag == TAG_IMAGE {
+                    image = rec.take_memory()
+                } else if tag == TAG_RAM {
+                    ram = rec.take_memory()
+                } else if tag == TAG_OUTLET {
+                    outlet = rec.take_outlet()
+                } else if tag == TAG_SIGNAL {
+                    signal = rec.take_event()
+                } else if tag == TAG_TARGET {
+                    target = rec.take_process()
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+
+    guard let told = role_ev.take() else {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let role = try told.receive() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+
+    if role == ROLE_WATCH {
+        watch(&proc, &var waiter)
+    } else if role == ROLE_SELF {
+        // The handle `ProcessSelf` mints carries the right, and names this
+        // process, so the kernel faults the caller for it (`NotSelf`).
+        let rights = try proc.rights() catch {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        let kill_bit = ProcessRight.Kill as UInt32
+        if (rights & kill_bit) == 0 {
+            let _ = proc.exit(EXIT_RIGHT)
+            return
+        }
+        kill_through(&proc, &proc)
+    } else if role == ROLE_SELF_DENIED {
+        // The right is checked before the target, so a handle naming this
+        // process that lacks it is `AccessDenied` and not `NotSelf`.
+        let weak = try system.process_self(keep: WEAK) catch {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        kill_through(&proc, &weak)
+    } else if role == ROLE_LOOKUP {
+        guard let asked = pid_ev.take() else {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        let pid = try asked.receive() catch {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        let found = try system.process_by_pid(pid: pid as UInt64) catch {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        kill_through(&proc, &found)
+    } else if role == ROLE_CREATOR {
+        create_and_kill(&system, &proc, &var image, &var ram)
+    } else if role == ROLE_SERVER {
+        serve(&proc, &var outlet, &var signal)
+    } else if role == ROLE_TARGET {
+        guard let victim = target.take() else {
+            let _ = proc.exit(EXIT_SETUP)
+            return
+        }
+        let _ = system.debug_print("SOS killer: killing\n")
+        kill_through(&proc, &victim)
+    } else {
+        let _ = proc.exit(EXIT_SETUP)
+    }
+}
+
+/// Wait for the process the Waiter watches and exit with what it carries.
+func watch(proc: &Process, waiter: &var Waiter?) {
+    guard let w = waiter.take() else {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let woke = try w.wait() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let (key, what) = (move woke).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_WATCH {
+                let _ = proc.exit(EXIT_SETUP)
+                return
+            }
+            let kind = status >> KIND_SHIFT
+            let _ = proc.exit(kind * 256 + (status & CODE_BYTE))
+        },
+        case _ -> {
+            let _ = proc.exit(EXIT_SETUP)
+        },
+    }
+}
+
+/// Kill through `through` and, if the kernel answers at all, say how.
+func kill_through(proc: &Process, through: &Process) {
+    try through.kill(code: KILL_CODE) catch {
+        print("SOS killer: the kill answered {}\n", error)
+        let _ = proc.exit(EXIT_REFUSED)
+        return
+    }
+    let _ = proc.exit(EXIT_ANSWERED)
+}
+
+/// Make a process from the given regions and kill it through the creator's
+/// handle, which must not carry the right.
+func create_and_kill(system: &System, proc: &Process, image: &var Memory?,
+                     ram: &var Memory?) {
+    guard let img = image.take() else {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    guard let dst = ram.take() else {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let made = try system.process_create(image: &img, memory: &dst) catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let rights = try made.rights() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let kill_bit = ProcessRight.Kill as UInt32
+    if (rights & kill_bit) != 0 {
+        let _ = proc.exit(EXIT_RIGHT)
+        return
+    }
+    kill_through(&proc, &made)
+}
+
+/// Hold the server end, say when a message is staged, and park for good.
+func serve(proc: &Process, outlet: &var PipeOutlet?, signal: &var Event?) {
+    guard let server = outlet.take() else {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    guard let tell = signal.take() else {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    try waiter.add(outlet: &server, key: KEY_SERVER) catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let _ = waiter.wait()
+    let _ = tell.signal(bits: 1)
+
+    // Nothing signals this Event, so the wait never ends.
+    let never = try proc.event_create() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let idle = try proc.waiter_create() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    try idle.add(event: &never, key: KEY_SERVER) catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let _ = idle.wait()
+}

@@ -154,6 +154,10 @@ EXIT_PROCESS_FAULT = 5
 # every thread is blocked and nothing can wake one. Kept in step with that enum.
 EXIT_DEADLOCK = 7
 
+# `ExitCode.KilledRoot` in kernel/core/diag.saw: what the machine exits with
+# when root is killed through `ProcessOp.Kill`. Kept in step with that enum.
+EXIT_KILLED_ROOT = 8
+
 # `AbortCode.NoMemory` in rt/common/src/lib.saw: what the runtime stops the
 # machine with when the bump arena cannot serve a request. Deliberately
 # different from the kernel's exit codes, so a transcript can tell "the program
@@ -640,6 +644,18 @@ PROCESS_WALK_CEILING_PKG = os.path.join(TESTS_DIR, "process-walk-ceiling")
 PROCESS_WALK_GATE_PKG = os.path.join(TESTS_DIR, "process-walk-gate")
 CHILD_WALK_IDLE_PKG = os.path.join(TESTS_DIR, "child-walk-idle")
 CHILD_WALK_FAULT_PKG = os.path.join(TESTS_DIR, "child-walk-fault")
+PROCESS_WALK_START_PKG = os.path.join(TESTS_DIR, "process-walk-start")
+
+# `ProcessOp.Kill` (spec §8). `child-kill` does one thing to another process,
+# by role, and links at the first child address; `child-kill-caller` makes one
+# call and links at the second, so the two can run together.
+PROCESS_KILL_PKG = os.path.join(TESTS_DIR, "process-kill")
+CHILD_KILL_PKG = os.path.join(TESTS_DIR, "child-kill")
+CHILD_KILL_CALLER_PKG = os.path.join(TESTS_DIR, "child-kill-caller")
+PROCESS_KILL_CALLS_PKG = os.path.join(TESTS_DIR, "process-kill-calls")
+PROCESS_KILL_CREATED_PKG = os.path.join(TESTS_DIR, "process-kill-created")
+PROCESS_KILL_ROOT_PKG = os.path.join(TESTS_DIR, "process-kill-root")
+KILL_LATE_DOOR_PKG = os.path.join(TESTS_DIR, "kill-late-door")
 
 # Executable memory is not a buffer, and a thread's entry must be executable
 # (spec §2.2, §2.7). Both cases launch `child-exec-fault`, once per role.
@@ -3400,7 +3416,7 @@ TEST_CASES = [
         # `INFO_OP` reads a handle's rights and kind. The default sets of an
         # Event, a boot Memory and the Process handle are the bits their kinds
         # mint (1795 is Transfer, Mint and the three Event or Memory bits,
-        # 4185859 the Process set); a sibling minted through a keep mask
+        # 4194051 the Process set); a sibling minted through a keep mask
         # reports exactly the narrowed set and not the keep bit the source
         # never held; the floor's kind selector answers the published kind
         # numbers (System 0, Process 1) and its rights word equals the typed
@@ -3416,7 +3432,7 @@ TEST_CASES = [
                        "SOS: boot regions={two}",
                        "SOS handleinfo: event rights=1795",
                        "SOS handleinfo: memory rights=1795",
-                       "SOS handleinfo: process rights=4185859",
+                       "SOS handleinfo: process rights=4194051",
                        "SOS handleinfo: a narrowed sibling reports exactly "
                        "the narrowed set",
                        "SOS handleinfo: a keep bit the source lacks is not "
@@ -3497,7 +3513,7 @@ TEST_CASES = [
         # Memory (no `MapExecute`), Mapping (no `Base`) and Process (no `Start`)
         # ceilings; a handle it already held reads 1795, the piece it splits
         # reads 771, the Mapping that installs the piece 258 (the Mapping
-        # default set is 770), and the process it creates 4169475, the
+        # default set is 770), and the process it creates 4177667, the
         # Process default set without `Start`.
         "name": "rights_ceiling_derived",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
@@ -3509,7 +3525,7 @@ TEST_CASES = [
                        "SOS ceilderived: pool rights=1795",
                        "SOS ceilderived: split piece rights=771",
                        "SOS ceilderived: mapping rights=258",
-                       "SOS ceilderived: created process rights=4169475",
+                       "SOS ceilderived: created process rights=4177667",
                        "SOS ceilderived: done"],
         "expect_clean_exit": True,
     },
@@ -7637,15 +7653,16 @@ TEST_CASES = [
         # cursor 0: root, the running one and the dead one, once each in pid
         # order, every handle reading the pid the cursor names with exactly
         # the observe set and the status word root reads itself. The walk ends
-        # in `Drained` after the last pid. Two walkers interleave
-        # while a process is created between their steps: both reach it, in
-        # the same order, before `Drained`. The lookup answers a running
-        # process, a dead one still held and a created one never started
-        # (whose status word reads running), and answers `Revoked` for a pid
-        # never assigned, for zero, and for the never-started one after root
-        # lets it go; a handle the lookup minted keeps a dead record answered
-        # once the creator's handle is gone. No pid's number is asserted
-        # beyond root's 1.
+        # in `Drained` after the last pid. A process that has not been started
+        # is passed over: two walkers interleave while one is created between
+        # their steps and both end at `Drained` without it (its launcher's own
+        # handle still reads running); once root starts it, the cursor that
+        # ended at `Drained` answers it. The lookup answers a running process
+        # and a dead one still held, answers `Revoked` for a process never
+        # started, for a pid never assigned and for zero, and for a started
+        # process once its record is reclaimed; a handle the lookup minted
+        # keeps a dead record answered once the creator's handle is gone. No
+        # pid's number is asserted beyond root's 1.
         "name": "process_walk",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PROCESS_WALK_PKG,
@@ -7659,13 +7676,18 @@ TEST_CASES = [
                        "set",
                        "SOS walk: the walk ends in Drained after the last "
                        "pid",
-                       "SOS walk: a process created mid-walk is reached "
-                       "before Drained",
+                       "SOS walk: a never-started child reads running to "
+                       "its launcher",
+                       "SOS walk: a process created mid-walk is passed over "
+                       "until started",
                        "SOS walk: a second walker shares no state with the "
                        "first",
+                       "SOS walk: the same cursor answers the process once "
+                       "it has started",
                        "SOS walk: lookup answers a running process",
                        "SOS walk: lookup answers a dead process still held",
-                       "SOS walk: lookup answers a process never started",
+                       "SOS walk: lookup of a process never started is "
+                       "Revoked",
                        "SOS walk: lookup of a pid never assigned is Revoked",
                        "SOS walk: lookup of zero is Revoked",
                        "SOS walk: a reclaimed process is not answered",
@@ -7737,6 +7759,168 @@ TEST_CASES = [
                        "SOS walkgate: a full table refuses both ops with "
                        "NoResource",
                        "SOS walkgate: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A process started after a walk has passed its pid is missed by that
+        # walk, and a walk from zero answers it. Root creates a process and
+        # does not start it, starts another created after it (which parks for
+        # good), and walks: root, then the later process, the unstarted one
+        # passed over, then `Drained`. It starts the unstarted one and lets it
+        # end; the cursor that ended at `Drained` still answers nothing, and a
+        # walk from zero answers root, that process and the later one, in pid
+        # order. It is its own case because `process_walk` keeps a process
+        # running throughout, and the kernel has three process bodies.
+        "name": "process_walk_start",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_WALK_START_PKG,
+        "children": [CHILD_BYE_PKG, CHILD_WALK_IDLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS bye: exiting",
+                       "SOS walkstart: a walk that passed its pid misses a "
+                       "started process",
+                       "SOS walkstart: a walk from zero answers it",
+                       "SOS walkstart: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # `ProcessOp.Kill` through handles with and without the right (spec
+        # §8). Root launches `child-walk-idle`, which parks for good, and a
+        # watcher (`child-kill`) parked on a Waiter with it attached, then
+        # kills it through the handle `ProcessCreate` gave it: the status word
+        # reads `Killed` (196650) with the code, and the watcher is woken with
+        # that word. A second kill of the dead child answers `Revoked` and
+        # leaves the word. A process that kills through the handle
+        # `ProcessByPid` answers (the observe set, no kill right), one that
+        # kills through a handle minted without the right that names itself,
+        # and a process that kills through its own full handle are each ended
+        # with a fault (`AccessDenied` 131075, `AccessDenied`, `NotSelf`
+        # 131076) and the target of the first still runs. A child whose Process
+        # ceiling lacks the right creates a process and its handle on it lacks
+        # the right too: the kill is `AccessDenied`.
+        "name": "process_kill",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_KILL_PKG,
+        "children": [CHILD_KILL_PKG, CHILD_WALK_IDLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS kill: a child parked in a wait is killed; its "
+                       "status reads Killed",
+                       "SOS kill: a watcher parked before the kill is woken "
+                       "with Killed",
+                       "SOS kill: a kill of a Gone child answers Revoked and "
+                       "keeps its death",
+                       "SOS kill: a lookup handle carries no kill right",
+                       "SOS kill: a kill through a lookup handle is "
+                       "AccessDenied and the target lives",
+                       "SOS kill: a handle without the right is AccessDenied, "
+                       "naming the caller or not",
+                       "SOS kill: a kill through the caller's own handle is "
+                       "a NotSelf fault",
+                       "SOS kill: a child whose Process ceiling lacks the "
+                       "right cannot kill its child",
+                       "SOS kill: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A kill ends the calls into and out of its target (spec §8). A
+        # server (`child-kill`) holds the outlet of a connection and tells
+        # root when a message is staged; a client (`child-kill-caller`) is
+        # parked in its call on the other end. Root kills the server: the
+        # staged message is abandoned and the client's call comes back
+        # `PeerClosed`, its exit code (65587 in the status word). Then root is
+        # the server: it takes the message a new client's call staged, reads
+        # the sender handle (the observe set, no kill right), kills the client,
+        # and its reply is told `PeerClosed`.
+        "name": "process_kill_calls",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_KILL_CALLS_PKG,
+        "children": [CHILD_KILL_PKG, CHILD_KILL_CALLER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS killcalls: a client parked in a call on a killed "
+                       "server is told PeerClosed",
+                       "SOS killcalls: the sender handle carries no kill "
+                       "right",
+                       "SOS killcalls: a reply to a client killed while it "
+                       "waited is PeerClosed",
+                       "SOS killcalls: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A kill naming a process that was never started is a `BadState`
+        # fault on the caller and changes nothing in it (spec §8). Root creates
+        # `child-walk-idle` and does not start it, gives `child-kill` a handle
+        # onto it that carries the kill right, and starts `child-kill` first.
+        # The killer is ended with the fault (131077); the target reads
+        # running, has made no system call and was not torn down, then starts
+        # and runs, and root kills it through the same handle (196650).
+        "name": "process_kill_created",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_KILL_CREATED_PKG,
+        "children": [CHILD_KILL_PKG, CHILD_WALK_IDLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS killer: killing",
+                       "SOS: process fault: object in the wrong state",
+                       "SOS killcreated: the kill of a Created process is a "
+                       "fault",
+                       "SOS killcreated: nothing in the target changed",
+                       "SOS killcreated: the target starts and runs",
+                       "SOS killcreated: once started it is killed and reads "
+                       "Killed",
+                       "SOS killcreated: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Killing root stops the machine with a failing status of the
+        # kernel's own (`ExitCode.KilledRoot`), whatever code the killer
+        # passed, and root's teardown is the last thing on the console. Root
+        # holds the only name of a process it never started and gives
+        # `child-kill` a handle onto itself with the kill right; the kill's
+        # code is 0, which would read as a pass if it were the machine's
+        # status. The unstarted process's own teardown, owed once root's
+        # handle table is released, is not run: the machine has stopped.
+        "name": "process_kill_root",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_KILL_ROOT_PKG,
+        "children": [CHILD_KILL_PKG, CHILD_WALK_IDLE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS killer: killing",
+                       "SOS: process teardown handles="],
+        "expect_tail": " timers={zero} process={zero}",
+        "expect_clean_exit": False,
+        "expect_status": EXIT_KILLED_ROOT,
+    },
+    {
+        # A kill whose teardown finds a parked watcher's buffer gone ends that
+        # watcher at the switch point the kill returns through (spec §8), with
+        # the setup of `late_door_buffer_gone`: a process (`child-late-door`)
+        # is parked on a Waiter that has another (`child-late-door2`)
+        # attached, with its wait record in a piece of its own region root
+        # has since unmapped. Root kills the other process; the teardown's
+        # notification finds the watcher's buffer gone and owes it a
+        # `BadBuffer` end (131083), and root's first system call after the
+        # kill, a read of the watcher's status word, already finds it ended.
+        # The target reads `Killed` (196650). The watcher is another process
+        # than the killer; the killer's own process owed the end is not built
+        # here (the shared-Waiter trial of `late_door_buffer_gone` shows the
+        # switch point paying the end of the process that owns the running
+        # thread). A mapping takes its memory's own address only on the
+        # profiles that do not translate, so this is for those.
+        "name": "kill_late_door",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": KILL_LATE_DOOR_PKG,
+        "children": [CHILD_LATE_DOOR_PKG, CHILD_LATE_DOOR2_PKG],
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS killdoor: the watcher found without a buffer "
+                       "ends with BadBuffer",
+                       "SOS killdoor: the target reads Killed",
+                       "SOS killdoor: done"],
         "expect_clean_exit": True,
     },
     {
@@ -8890,6 +9074,15 @@ def _check(case, arch, status, out, timed_out):
                 return False, (f"{where} expected output {want!r} "
                                f"(got {out!r})")
             cursor = at + (1 if step_one else len(want))
+    # A case may say how the console ends: the transcript, trailing whitespace
+    # aside, must end with this text. It asserts that nothing was written after
+    # the last line a case expects, which matching in order cannot.
+    tail = case.get("expect_tail")
+    if tail is not None:
+        want = tail.format(**expectations(arch))
+        if not hay.rstrip().endswith(want):
+            return False, (f"the console does not end with {want!r} "
+                           f"(got {out!r})")
     if case["expect_clean_exit"]:
         if status != 0:
             return False, f"expected clean exit (0), got status {status}"

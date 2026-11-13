@@ -7,6 +7,10 @@
 // each up by pid. No pid's number is asserted beyond root's 1: the case reads
 // each one through `Stats`, and asserts relations between them.
 //
+// A process that has not been started is passed over: the walk does not
+// answer it and the lookup answers its pid `Revoked`. It becomes visible when
+// it starts.
+//
 //   SOS walk: a walk from zero answers every process once, in order
 //                     root, the running process and the dead one. The idle
 //                     process, whose record nothing names, is
@@ -17,20 +21,25 @@
 //   SOS walk: the walk ends in Drained after the last pid
 //                     that the end leaves the cursor as it was is asserted by
 //                     `process_walk_gate`, which reads the doubleword back
-//   SOS walk: a process created mid-walk is reached before Drained
-//                     it gets a pid above every assigned one, and its status
-//                     word reads running although it was never started
+//   SOS walk: a never-started child reads running to its launcher
+//                     a process created between two walkers' steps, whose pid
+//                     is above every assigned one
+//   SOS walk: a process created mid-walk is passed over until started
+//                     both walkers answer the idle and the dead process and
+//                     end at Drained, without it
 //   SOS walk: a second walker shares no state with the first
 //                     two walkers interleave and answer the same sequence
+//   SOS walk: the same cursor answers the process once it has started
+//                     root starts it; the walker that ended at Drained asks
+//                     again with the same cursor
 //   SOS walk: lookup answers a running process
 //   SOS walk: lookup answers a dead process still held
-//   SOS walk: lookup answers a process never started
+//   SOS walk: lookup of a process never started is Revoked
 //   SOS walk: lookup of a pid never assigned is Revoked
 //   SOS walk: lookup of zero is Revoked
 //   SOS walk: a reclaimed process is not answered
-//                     the never-started process, once root lets it go, is
-//                     torn down and its record reclaimed: the lookup answers
-//                     Revoked and the walk no longer reaches it
+//                     a started process whose last name goes is reclaimed:
+//                     the lookup answers Revoked and the walk passes it by
 //   SOS walk: the loop the sysapi documents ends on Drained
 //                     `System.process_next`'s doc example, compiled here
 //   SOS walk: a held observe handle keeps a dead record answered
@@ -38,6 +47,10 @@
 //                     handle gone it still holds the record, and once it is
 //                     released too the pid answers Revoked
 //   SOS walk: done
+//
+// A walk that has passed the pid of a process created and not yet started
+// misses it when it starts, and a walk from zero answers it: that is
+// `process_walk_start`, which needs a second process body at once.
 
 import sos.{System, Process, Memory, Waiter, SosStatus, SystemRight,
             ProcessRight}
@@ -84,6 +97,13 @@ func _start(boot_handle: UInt) {
     let _ = system.shutdown(EXIT_OK)
 }
 
+/// The pids of the processes the walk is asked about, in creation order.
+struct Pids {
+    idle: UInt64,
+    bye: UInt64,
+    fresh: UInt64,
+}
+
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     // The boot regions come blobs first and destinations second, in the order
     // the case lists its children: the exiting child, then the idle one.
@@ -103,80 +123,57 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     // its own handle go at once: nothing names the process, and it runs.
     let idle = try launch(&system, &idle_img, &idle_ram)
     let idle_stats = try idle.stats()
-    let idle_pid = idle_stats.pid
+    var pids = Pids(idle: idle_stats.pid, bye: 0, fresh: 0)
     let _ = move idle
 
     let bye = try launch(&system, &bye_img, &bye_ram)
     let bye_stats = try bye.stats()
-    let bye_pid = bye_stats.pid
+    pids.bye = bye_stats.pid
     try wait_for_death(&proc, &bye)
     let dead = try bye.get_status()
-    if dead == running || idle_pid <= ROOT_PID || bye_pid <= idle_pid {
+    if dead == running || pids.idle <= ROOT_PID || pids.bye <= pids.idle {
         return BUG
     }
 
     // A walk from zero: every process the table holds, once, in pid order.
     var after: UInt64 = 0
     after = try step_expect(&system, after, ROOT_PID, running)
-    after = try step_expect(&system, after, idle_pid, running)
-    after = try step_expect(&system, after, bye_pid, dead)
+    after = try step_expect(&system, after, pids.idle, running)
+    after = try step_expect(&system, after, pids.bye, dead)
     let _ = system.debug_print(
         "SOS walk: a walk from zero answers every process once, in order\n")
     let _ = system.debug_print(
         "SOS walk: every handle carries exactly the observe set\n")
     try expect_drained(&system, after)
-    if after != bye_pid {
+    if after != pids.bye {
         return BUG
     }
     let _ = system.debug_print(
         "SOS walk: the walk ends in Drained after the last pid\n")
 
-    // Two walkers, interleaved, and a process created between their steps.
-    var first: UInt64 = 0
-    var second: UInt64 = 0
-    first = try step_expect(&system, first, ROOT_PID, running)
-    second = try step_expect(&system, second, ROOT_PID, running)
-    let fresh = try system.process_create(image: &bye_img, memory: &bye_ram)
-    let fresh_stats = try fresh.stats()
-    let fresh_pid = fresh_stats.pid
-    if fresh_pid <= bye_pid {
-        return BUG
-    }
-    first = try finish_walk(&system, first, idle_pid, bye_pid, fresh_pid,
-                            running, dead)
-    let _ = system.debug_print(
-        "SOS walk: a process created mid-walk is reached before Drained\n")
-    second = try finish_walk(&system, second, idle_pid, bye_pid, fresh_pid,
+    // A process created between two walkers' steps is passed over until root
+    // starts it, and then the same cursor answers it.
+    let fresh = try mid_walk(&system, &proc, &bye_img, &bye_ram, &var pids,
                              running, dead)
-    if first != fresh_pid || second != fresh_pid {
-        return BUG
-    }
-    let _ = system.debug_print(
-        "SOS walk: a second walker shares no state with the first\n")
 
     // The lookup, for each state a process can be in.
-    try expect_lookup(&system, idle_pid, running)
+    try expect_lookup(&system, pids.idle, running)
     let _ = system.debug_print("SOS walk: lookup answers a running process\n")
-    try expect_lookup(&system, bye_pid, dead)
+    try expect_lookup(&system, pids.bye, dead)
     let _ = system.debug_print(
         "SOS walk: lookup answers a dead process still held\n")
-    let fresh_status = try fresh.get_status()
-    if fresh_status != running {
-        return BUG
-    }
-    try expect_lookup(&system, fresh_pid, running)
-    let _ = system.debug_print(
-        "SOS walk: lookup answers a process never started\n")
+    try never_started(&system, &bye_img, &bye_ram, pids, running)
     try expect_revoked(&system, NEVER_ASSIGNED)
     let _ = system.debug_print(
         "SOS walk: lookup of a pid never assigned is Revoked\n")
     try expect_revoked(&system, 0)
     let _ = system.debug_print("SOS walk: lookup of zero is Revoked\n")
 
-    // Letting go of the only name a never-started process has tears it down.
+    // Letting go of the only name of a started process that has died frees its
+    // record: the lookup no longer answers it and the walk passes it by.
     let _ = move fresh
-    try expect_revoked(&system, fresh_pid)
-    try expect_drained(&system, bye_pid)
+    try expect_revoked(&system, pids.fresh)
+    try expect_drained(&system, pids.bye)
     let _ = system.debug_print(
         "SOS walk: a reclaimed process is not answered\n")
 
@@ -185,20 +182,93 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
         "SOS walk: the loop the sysapi documents ends on Drained\n")
 
     // A handle a lookup minted holds a dead record with the creator's gone.
-    let held = try system.process_by_pid(pid: bye_pid)
+    let held = try system.process_by_pid(pid: pids.bye)
     let _ = move bye
-    try expect_lookup(&system, bye_pid, dead)
+    try expect_lookup(&system, pids.bye, dead)
     let _ = move held
-    try expect_revoked(&system, bye_pid)
+    try expect_revoked(&system, pids.bye)
     let _ = system.debug_print(
         "SOS walk: a held observe handle keeps a dead record answered\n")
     return
 }
 
-/// Make a process from `image` and `ram`, give it a System handle and start
-/// it. Answers the launcher's handle.
-func launch(system: &System, image: &Memory,
-            ram: &Memory) -> Result<Process, SosStatus> {
+/// Two walkers have answered root, a process is created (never started) between
+/// their steps, and both walk on without it. Starting it makes the cursor that
+/// ended at `Drained` answer it. Answers the process, which has ended by the
+/// time this returns and is still held, and records its pid.
+func mid_walk(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+              pids: &var Pids, running: UInt,
+              dead: UInt) -> Result<Process, SosStatus> {
+    var first: UInt64 = 0
+    var second: UInt64 = 0
+    first = try step_expect(&system, first, ROOT_PID, running)
+    second = try step_expect(&system, second, ROOT_PID, running)
+    let fresh = try prepare(&system, &image, &ram)
+    let fresh_stats = try fresh.stats()
+    pids.fresh = fresh_stats.pid
+    if pids.fresh <= pids.bye {
+        return BUG
+    }
+    // A launcher's own handle onto a child it has not started reads what a
+    // started one reads: the status word has no state for it.
+    let own = try fresh.get_status()
+    if own != running {
+        return BUG
+    }
+    let _ = system.debug_print(
+        "SOS walk: a never-started child reads running to its launcher\n")
+    first = try finish_walk(&system, first, pids, running, dead)
+    let _ = system.debug_print(
+        "SOS walk: a process created mid-walk is passed over until started\n")
+    second = try finish_walk(&system, second, pids, running, dead)
+    if first != pids.bye || second != pids.bye {
+        return BUG
+    }
+    let _ = system.debug_print(
+        "SOS walk: a second walker shares no state with the first\n")
+
+    // It reads running as soon as it starts, before it has run.
+    try fresh.start(boot_tag: TAG_BOOT)
+    first = try step_expect(&system, first, pids.fresh, running)
+    if first != pids.fresh {
+        return BUG
+    }
+    let _ = system.debug_print(
+        "SOS walk: the same cursor answers the process once it has started\n")
+    try wait_for_death(&proc, &fresh)
+    let word = try fresh.get_status()
+    if word != dead {
+        return BUG
+    }
+    return move fresh
+}
+
+/// A process that has never been started has a pid the lookup answers
+/// `Revoked` and the walk passes over, and it is torn down when its last name
+/// goes.
+func never_started(system: &System, image: &Memory, ram: &Memory, pids: Pids,
+                   running: UInt) -> Result<Void, SosStatus> {
+    let unstarted = try prepare(&system, &image, &ram)
+    let stats = try unstarted.stats()
+    let pid = stats.pid
+    if pid <= pids.fresh {
+        return BUG
+    }
+    try expect_revoked(&system, pid)
+    try expect_drained(&system, pids.fresh)
+    let own = try unstarted.get_status()
+    if own != running {
+        return BUG
+    }
+    let _ = system.debug_print(
+        "SOS walk: lookup of a process never started is Revoked\n")
+    return
+}
+
+/// Make a process from `image` and `ram` and give it a System handle. It is
+/// not started. Answers the launcher's handle.
+func prepare(system: &System, image: &Memory,
+             ram: &Memory) -> Result<Process, SosStatus> {
     let child = try system.process_create(image: &image, memory: &ram)
     let boot = try system.mint(rights: CHILD_SYSTEM)
     try child.give(system: move boot, tag: TAG_BOOT) catch {
@@ -206,6 +276,13 @@ func launch(system: &System, image: &Memory,
         let _ = move back
         return why
     }
+    return move child
+}
+
+/// `prepare`, then start it. Answers the launcher's handle.
+func launch(system: &System, image: &Memory,
+            ram: &Memory) -> Result<Process, SosStatus> {
+    let child = try prepare(&system, &image, &ram)
     try child.start(boot_tag: TAG_BOOT)
     return move child
 }
@@ -242,15 +319,13 @@ func step_expect(system: &System, after: UInt64, want: UInt64,
     return pid
 }
 
-/// The rest of a walk that has answered root and nothing else: the idle, dead
-/// and fresh processes in order, then Drained. Answers the last cursor.
-func finish_walk(system: &System, after: UInt64, idle_pid: UInt64,
-                 bye_pid: UInt64, fresh_pid: UInt64, running: UInt,
+/// The rest of a walk that has answered root and nothing else: the idle and
+/// dead processes in order, then Drained. Answers the last cursor.
+func finish_walk(system: &System, after: UInt64, pids: Pids, running: UInt,
                  dead: UInt) -> Result<UInt64, SosStatus> {
     var cursor = after
-    cursor = try step_expect(&system, cursor, idle_pid, running)
-    cursor = try step_expect(&system, cursor, bye_pid, dead)
-    cursor = try step_expect(&system, cursor, fresh_pid, running)
+    cursor = try step_expect(&system, cursor, pids.idle, running)
+    cursor = try step_expect(&system, cursor, pids.bye, dead)
     try expect_drained(&system, cursor)
     return cursor
 }

@@ -1,0 +1,226 @@
+// A kill whose teardown finds a parked watcher's buffer gone ends that watcher
+// at the switch point the kill returns through (spec §8).
+//
+// Process B is parked on a Waiter that has process A attached, with its wait
+// record in a piece of its own region that root has since unmapped, so the
+// record has no memory behind it. Root kills A. A's teardown notifies the
+// attachment, the delivery to B finds B's buffer gone and owes B an end, and
+// the owed end is paid before any thread runs again: the kill's own return
+// passes the switch point. Root reads B's status word as its first system
+// call after the kill, which is why it reads `BadBuffer` and not `Running`,
+// and A's reads `Killed`.
+//
+//   SOS killdoor: the watcher found without a buffer ends with BadBuffer
+//   SOS killdoor: the target reads Killed
+//   SOS killdoor: done
+//
+// The watcher is another process than the killer, as the case shows; the
+// killer's own process being the one owed the end is a sibling thread of the
+// calling thread parked with a buffer since unmapped, which this case does not
+// build: `late_door_buffer_gone`'s shared-Waiter trial shows the switch point
+// paying the end of the process that owns the running thread.
+//
+// A mapping takes its memory's own address on the profiles that do not
+// translate, so the piece lies in the hole only there; the case is for those.
+
+import sos.{System, Process, Memory, Mapping, SosStatus, SystemRight,
+        MapAccess}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_WAITER: UInt = 34
+
+static KEY_DEATH: UInt = 6
+static KEY_EVENT: UInt = 7
+
+/// The roles `child-late-door` knows: the wait record in the piece, and a wait
+/// into the process's own data.
+static ROLE_WAIT: UInt = 1
+static ROLE_WAIT_GOOD: UInt = 13
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The child's destination region, and where in it the piece goes: past its
+/// data and short of its stack, one protection unit of the region's own bytes
+/// at a time.
+static REGION_LEN: UInt = 0x4_0000
+static HOLE_AT: UInt = 0x3_0000
+static HOLE_LEN: UInt = 0x2000
+
+/// The code root kills with, and the §8 status word it leaves: `Killed` (3) in
+/// the high half over the code.
+static KILL_CODE: UInt = 0x2A
+static KILLED: UInt = 196650
+static_assert((3 * 65536) + 0x2A == 196650,
+              "a killed word is Killed in the high bits, then the code")
+
+/// The §8 status word of a process ended with `BadBuffer`: `Faulted` in the
+/// high half and the reason (11) in the low.
+static BAD_BUFFER: UInt = 131083
+
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS killdoor: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS killdoor: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS killdoor: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The first child's image and its destination, then the second's: the
+    // table lists every image and then every destination.
+    var image_rec = try proc.boot_handle_next()
+    var image_b_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var ram_b_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let image_b = image_b_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let ram_b = ram_b_rec.take_memory() else { return BUG }
+
+    // The watcher, B, is `child-late-door`, with its piece in the hole; the
+    // target, A, is `child-late-door2`, parked on a Waiter nothing signals.
+    let pb = try region(&system, &image, &ram)
+    let pa = try region(&system, &image_b, &ram_b)
+    let b_pair = try mapped_child(&system, &proc, move pb, ROLE_WAIT)
+    let (b, b_map) = move b_pair
+    let (a, a_hole) = move pa
+    let _ = move a_hole
+    try brief(&system, &proc, &a, ROLE_WAIT_GOOD, 0)
+
+    let idle_event = try proc.event_create()
+    let idle = try proc.waiter_create()
+    try idle.add(event: &idle_event, key: KEY_EVENT)
+    try a.give(waiter: move idle, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let watch = try proc.waiter_create()
+    try watch.add(process: &a, key: KEY_DEATH)
+    try b.give(waiter: move watch, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    // Both park: root yields until neither has anything left to do. B's wait
+    // record is in the piece, which root then takes away.
+    try start_and_park(&proc, &a)
+    try start_and_park(&proc, &b)
+    try b_map.unmap()
+
+    // The kill, and then the first system call root makes after it: reading
+    // B's status. The end the kill owed B was paid at the switch point the
+    // kill returned through, so B is already ended.
+    try a.kill(code: KILL_CODE)
+    let b_now = try b.get_status()
+    if b_now != BAD_BUFFER {
+        print("SOS killdoor: B's status is {}\n", b_now)
+        return BUG
+    }
+    say("the watcher found without a buffer ends with BadBuffer")
+    let a_now = try a.get_status()
+    if a_now != KILLED {
+        print("SOS killdoor: A's status is {}\n", a_now)
+        return BUG
+    }
+    say("the target reads Killed")
+    return
+}
+
+/// A child created in a region cut from the pool, and the piece of that region
+/// that goes into the hole between its data and its stack. The rest of the
+/// region is cut and let go at once: a piece that covers a row of the child's
+/// image carries the row (`Memory.split`), so the child keeps its own bytes,
+/// and root's handle table stays small enough for the trials' objects.
+func region(system: &System, image: &Memory,
+            ram: &Memory) -> Result<(Process, Memory), SosStatus> {
+    let dst = try ram.split(len: REGION_LEN)
+    let child = try system.process_create(image: &image, memory: &dst)
+    let front = try dst.split(len: HOLE_AT)
+    let hole = try dst.split(len: HOLE_LEN)
+    let _ = move front
+    let _ = move dst
+    let parts = (move child, move hole)
+    return move parts
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// What every child is given: its role, where its buffer is, and its System
+/// handle as the boot tag.
+func brief(system: &System, proc: &Process, child: &Process, role: UInt,
+           at: UInt) -> Result<Void, SosStatus> {
+    try tell(&proc, &child, TAG_ROLE, role)
+    try tell(&proc, &child, TAG_ADDR, at)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Start the child and let it run until it parks: nothing ticks in this case,
+/// so a yield returns when the child has nothing left to do.
+func start_and_park(proc: &Process,
+                    child: &Process) -> Result<Void, SosStatus> {
+    try child.start(boot_tag: TAG_BOOT)
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
+    return
+}
+
+/// A child with its piece mapped by root and its role and address given: the
+/// pieces of `region`, a Mapping that is then dropped without an unmap (the
+/// row stays until the child ends), and the briefing.
+func mapped_child(system: &System, proc: &Process,
+                  parts: (Process, Memory),
+                  role: UInt) -> Result<(Process, Mapping), SosStatus> {
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, role, at)
+    let pair = (move child, move mapping)
+    return move pair
+}
+
+func say(line: String) {
+    print("SOS killdoor: {}\n", line)
+}

@@ -595,13 +595,15 @@ func disown_bound(p: Int) unsafe {
 /// running (a fault or an exit is on the caller, spec §2.7). Then the running
 /// thread is one of the slots step 1 touches, so nothing is current any more
 /// and `CURRENT_THREAD` and `PENDING_FREE` are cleared. Otherwise `p` is not
-/// the running process, and it is one of two kinds: a `Created` process that
-/// nothing names (`end_unstarted`), which has no thread that ever ran, or a
+/// the running process, and it is one of three kinds: a `Created` process that
+/// nothing names (`end_unstarted`), which has no thread that ever ran, a
 /// started one a delivery found without a buffer its parked thread was to
-/// answer into (`end_doomed`), whose threads are parked or runnable. Either
-/// way the caller's thread stays current and `Running`, and the teardown leaves
-/// the caller's slots alone (`spared`). Clearing `CURRENT_THREAD` for it would
-/// leave the caller's thread on no list and never scheduled.
+/// answer into (`end_doomed`), whose threads are parked or runnable, or a
+/// running one the caller kills (`kill_process`), whose threads are inert,
+/// ready, blocked or parked. In each the caller's thread stays current and
+/// `Running`, and the teardown leaves the caller's slots alone (`spared`).
+/// Clearing `CURRENT_THREAD` for it would leave the caller's thread on no list
+/// and never scheduled.
 ///
 /// A record is never reclaimed before its own teardown has ended, because the
 /// teardown writes it after the point where its last reference can go: the
@@ -1069,6 +1071,32 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
 func end_unstarted(p: Int) unsafe {
     let counts = teardown_process(p, ProcessStatusKind.Exited, 0, false)
     report_teardown(counts, p)
+}
+
+/// End process `p` for a caller that holds a handle onto it with the kill
+/// right (`ProcessOp.Kill`): its status word reads `Killed` with `code`. `p` is
+/// running and is not the caller's process: the dispatch has refused a caller
+/// naming itself, a `Created` process and a `Gone` one.
+///
+/// The teardown is `end_unstarted`'s, run inside the caller's system call, so
+/// no thread of `p` is running and none runs again. It returns, and the call
+/// answers. The ends the teardown owes others (a `Created` process whose last
+/// name `p` held, and a process whose parked thread the teardown answered and
+/// found without its buffer, the caller's own included) are paid by
+/// `pick_next`'s `drain_deaths` as the syscall returns, before any thread runs.
+/// None is paid here, because a teardown never runs inside another.
+///
+/// Root is the exception. Its teardown runs and the machine stops with the
+/// killed-root status, whatever code the killer passed, with nothing else
+/// ended first: every other process dies with the machine, uncounted. The call
+/// does not return for root.
+public(package) func kill_process(p: Int, code: UInt) unsafe {
+    let counts = teardown_process(p, ProcessStatusKind.Killed, code, false)
+    report_teardown(counts, p)
+    if p == ROOT_PROCESS {
+        hal.exit_fail(ExitCode.KilledRoot as UInt)
+        while { }
+    }
 }
 
 /// Tear down every `Created` process whose count has reached zero, until none

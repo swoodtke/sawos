@@ -1,0 +1,219 @@
+// A process started after a walk has passed its pid is missed by that walk
+// (spec §2.8).
+//
+// A pid is assigned when a process is created and a process is visible to a
+// walk from its start. Root creates a process and does not start it, then
+// starts another, which the walk answers while it passes the first over:
+//
+//   SOS walkstart: a walk that passed its pid misses a started process
+//                     the walk answers root and then the later process, whose
+//                     pid is above the unstarted one's, and ends at Drained;
+//                     root starts the unstarted one and runs it to its end,
+//                     and the cursor that ended at Drained still answers
+//                     nothing
+//   SOS walkstart: a walk from zero answers it
+//                     root, the process started after the walk passed it, and
+//                     the later one, in pid order
+//   SOS walkstart: done
+//
+// The two processes exist together so the case is its own: `process_walk`
+// keeps a running process throughout, and the kernel has three process bodies,
+// root's among them.
+
+import sos.{System, Process, Memory, SosStatus, SystemRight, ProcessRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// Root's pid, which is fixed by the spec.
+static ROOT_PID: UInt64 = 1
+
+static TAG_BOOT: UInt = 21
+static KEY_DEATH: UInt = 6
+
+/// What a launched process may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The rights of every handle the walk mints: the observe set.
+static OBSERVE: UInt32 = ProcessRight.Wait | ProcessRight.Stats
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS walkstart: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try run(&system, &proc) catch {
+        print("SOS walkstart: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS walkstart: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The boot regions come blobs first and destinations second, in the order
+    // the case lists its children: the exiting child, then the idle one.
+    var bye_img_rec = try proc.boot_handle_next()
+    var idle_img_rec = try proc.boot_handle_next()
+    var bye_ram_rec = try proc.boot_handle_next()
+    var idle_ram_rec = try proc.boot_handle_next()
+    guard let bye_img = bye_img_rec.take_memory() else { return BUG }
+    guard let idle_img = idle_img_rec.take_memory() else { return BUG }
+    guard let bye_ram = bye_ram_rec.take_memory() else { return BUG }
+    guard let idle_ram = idle_ram_rec.take_memory() else { return BUG }
+
+    // The status word of a process that is running, as root reads its own.
+    let running = try proc.get_status()
+
+    // `early` is created and not started; `later`, created after it, is
+    // started and parks for good. Its creator's handle goes at once.
+    let early = try prepare(&system, &bye_img, &bye_ram)
+    let early_stats = try early.stats()
+    let early_pid = early_stats.pid
+    let later = try launch(&system, &idle_img, &idle_ram)
+    let later_stats = try later.stats()
+    let later_pid = later_stats.pid
+    let _ = move later
+    if early_pid <= ROOT_PID || later_pid <= early_pid {
+        return BUG
+    }
+
+    // A walk answers root, passes `early` over and answers `later`.
+    var cursor: UInt64 = 0
+    cursor = try step_expect(&system, cursor, ROOT_PID, running)
+    cursor = try step_expect(&system, cursor, later_pid, running)
+    try expect_drained(&system, cursor)
+
+    // `early` starts and ends. The walk that passed its pid does not see it.
+    try early.start(boot_tag: TAG_BOOT)
+    try wait_for_death(&proc, &early)
+    let dead = try early.get_status()
+    if dead == running {
+        return BUG
+    }
+    try expect_drained(&system, cursor)
+    let _ = system.debug_print(
+        "SOS walkstart: a walk that passed its pid misses a started process\n")
+
+    // A walk from zero answers it, between root and `later`.
+    var after: UInt64 = 0
+    after = try step_expect(&system, after, ROOT_PID, running)
+    after = try step_expect(&system, after, early_pid, dead)
+    after = try step_expect(&system, after, later_pid, running)
+    try expect_drained(&system, after)
+    let _ = system.debug_print("SOS walkstart: a walk from zero answers it\n")
+    return
+}
+
+/// Make a process from `image` and `ram` and give it a System handle. It is
+/// not started. Answers the launcher's handle.
+func prepare(system: &System, image: &Memory,
+             ram: &Memory) -> Result<Process, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return move child
+}
+
+/// `prepare`, then start it. Answers the launcher's handle.
+func launch(system: &System, image: &Memory,
+            ram: &Memory) -> Result<Process, SosStatus> {
+    let child = try prepare(&system, &image, &ram)
+    try child.start(boot_tag: TAG_BOOT)
+    return move child
+}
+
+/// Park until the process `child` names ends.
+func wait_for_death(proc: &Process,
+                    child: &Process) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(_) -> {
+            if key != KEY_DEATH { return BUG }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// One step of a walk from `after`: it must answer the process with pid `want`,
+/// and the handle must read that pid, carry exactly the observe set and read
+/// the status word `status`. Answers the new cursor.
+func step_expect(system: &System, after: UInt64, want: UInt64,
+                 status: UInt) -> Result<UInt64, SosStatus> {
+    let step = try system.process_next(after: after)
+    let (found, pid) = move step
+    if pid != want {
+        print("SOS walkstart: a step after {} answered {}, wanted {}\n", after,
+              pid, want)
+        return BUG
+    }
+    try check_handle(&found, want, status)
+    return pid
+}
+
+/// A handle the walk or the lookup answered for pid `want`: it reads that
+/// pid, carries exactly the observe set and reads the status word `status`.
+func check_handle(found: &Process, want: UInt64,
+                  status: UInt) -> Result<Void, SosStatus> {
+    let seen = try found.stats()
+    if seen.pid != want {
+        print("SOS walkstart: the handle reads pid {}, wanted {}\n", seen.pid,
+              want)
+        return BUG
+    }
+    let rights = try found.rights()
+    if rights != OBSERVE {
+        print("SOS walkstart: the handle carries {}\n", rights)
+        return BUG
+    }
+    let word = try found.get_status()
+    if word != status {
+        print("SOS walkstart: the handle reads status {}, wanted {}\n", word,
+              status)
+        return BUG
+    }
+    return
+}
+
+func is_drained(why: SosStatus) -> Bool {
+    match why {
+        case Drained -> true,
+        case _ -> false,
+    }
+}
+
+/// A walk from `after` is over: the answer is `Drained` and mints nothing.
+func expect_drained(system: &System, after: UInt64) -> Result<Void, SosStatus> {
+    match system.process_next(after: after) {
+        case Ok(step) -> {
+            let (found, _) = move step
+            let _ = move found
+            return BUG
+        },
+        case Err(why) -> {
+            if not is_drained(why) {
+                print("SOS walkstart: the end answered {}\n", why)
+                return BUG
+            }
+        },
+    }
+    return
+}

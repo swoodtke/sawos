@@ -222,7 +222,8 @@ public func sos_system_process_create(handle: UInt, image: UInt, memory: UInt,
 ///
 /// A walk starts from a cursor of 0. The end is `SosStatus.Drained`, which
 /// leaves the cursor as it was; it is not final, because the same cursor
-/// answers a process created since. The handle carries the observe set,
+/// answers a process started since. A process that has not been started is
+/// passed over. The handle carries the observe set,
 /// `ProcessRight.Wait | ProcessRight.Stats`, intersected with the caller's
 /// Process ceiling. A caller at its handle quota gets `SosStatus.QuotaExceeded`
 /// and a full handle table is `SosStatus.NoResource`, and a refusal writes
@@ -243,7 +244,8 @@ public func sos_system_process_next(
 /// Requires `SystemRight.ProcessObserve`.
 ///
 /// A pid the record table does not hold (reclaimed, never assigned, or zero)
-/// is `SosStatus.Revoked` and mints nothing. The handle and the other answers
+/// and the pid of a process not yet started are `SosStatus.Revoked` and mint
+/// nothing. The handle and the other answers
 /// are `sos_system_process_next`'s; the doubleword is only read, and a `pid`
 /// that is misaligned or outside this process's memory terminates it.
 @export("sos_system_process_by_pid")
@@ -316,6 +318,14 @@ public func sos_process_thread_self(handle: UInt,
 @export("sos_process_exit")
 public func sos_process_exit(handle: UInt, status: UInt) -> UInt {
     sos_syscall1(handle, ProcessOp.Exit as UInt, status)
+}
+
+/// End the process the handle names, with `code` as the code its status word
+/// keeps. Requires `ProcessRight.Kill`. A handle naming the caller or a process
+/// not yet started terminates the caller.
+@export("sos_process_kill")
+public func sos_process_kill(handle: UInt, code: UInt) -> UInt {
+    sos_syscall1(handle, ProcessOp.Kill as UInt, code)
 }
 
 /// This process's §8 status word. Requires `ProcessRight.Wait`.

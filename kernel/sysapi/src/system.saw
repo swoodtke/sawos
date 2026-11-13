@@ -52,7 +52,8 @@ import sosrt.{ascii_byte}
 
 import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_handle_release, sos_process_boot_handle_next,
-                  sos_process_exit, sos_process_give, sos_process_pipe_create,
+                  sos_process_exit, sos_process_give, sos_process_kill,
+                  sos_process_pipe_create,
                   sos_process_start, sos_process_stats,
                   sos_process_restrict_rights, ceiling_word,
                   sos_system_debug_print, sos_system_shutdown,
@@ -482,11 +483,13 @@ extension System {
     /// ProcessRight.Stats`, intersected with this process's Process ceiling: it
     /// reads the process's status and counters and acts on nothing. A running
     /// process is answered whatever names it, and so is a `Gone` record
-    /// something still names and a process created and never started, whose
-    /// status reads running; releasing the handle lets a `Gone` record go.
+    /// something still names; releasing the handle lets a `Gone` record go. A
+    /// process that has not been started is passed over, so every process the
+    /// walk answers has started. One started after the walk passed its pid is
+    /// missed by that walk and answered by the next.
     ///
     /// The end of the walk is `Err(SosStatus.Drained)`. It is not final: the
-    /// same pid asked again answers a process created since. A caller at its
+    /// same pid asked again answers a process started since. A caller at its
     /// handle quota gets `QuotaExceeded` and a full handle table `NoResource`,
     /// and asking again with the same `after` answers the same process. Each
     /// call scans the kernel's process records, so a walk costs one scan per
@@ -506,7 +509,8 @@ extension System {
     /// It answers what a walk would answer for that pid, with the handle
     /// `process_next` describes. A pid the kernel's records do not hold is
     /// `Err(SosStatus.Revoked)`: one whose record was reclaimed, one never
-    /// assigned, and 0, which is never a pid. A pid is data a caller may have
+    /// assigned, 0, which is never a pid, and one whose process has not been
+    /// started. A pid is data a caller may have
     /// read from a stats row or a message, so none of these is a fault.
     public func process_by_pid(
         &self,
@@ -836,6 +840,26 @@ extension Process {
     /// caller.
     public func exit(&self, status: UInt) -> Result<Void, SosStatus> {
         checked(sos_process_exit(self.handle, status))
+    }
+
+    /// End the process this handle names, as its killer: its status word reads
+    /// `ProcessStatusKind.Killed` with the low 16 bits of `code`, and the call
+    /// is answered once the teardown is complete. Requires
+    /// `ProcessRight.Kill`.
+    ///
+    /// The target is torn down as at any death: its watchers are woken, its
+    /// threads never run again and the calls into and out of it end as they do
+    /// when it exits or faults (a peer is told `SosStatus.PeerClosed`). It is
+    /// told nothing and runs nothing after it. A target that has ended answers
+    /// `SosStatus.Revoked` and keeps the death it already recorded.
+    ///
+    /// A handle naming the calling process terminates the caller, so does one
+    /// naming a process that has not been started, and neither changes the
+    /// target: a process ends itself with `exit`, and one never started is
+    /// ended by releasing its handles. Killing root stops the machine with a
+    /// failing status of the kernel's own.
+    public func kill(&self, code: UInt) -> Result<Void, SosStatus> {
+        checked(sos_process_kill(self.handle, code))
     }
 
     /// This process's §8 status word: kind in the high bits, code in the low

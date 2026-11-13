@@ -372,7 +372,14 @@ public enum SystemOp: UInt {
 /// `ProcessRight.RestrictRights` and `Ceiling` by `ProcessRight.Stats`.
 ///
 /// `Exit` is self-only: through a handle naming another process it faults the
-/// caller (`NotSelf`). There is no `Kill` op (see `ProcessRight`).
+/// caller (`NotSelf`).
+///
+/// `Kill` ends the process the handle names, with `arg0` as the code its status
+/// word keeps (low 16 bits, under `ProcessStatusKind.Killed`), and answers `Ok`
+/// once the teardown is done. It is gated by `ProcessRight.Kill`. A handle
+/// naming the caller's own process is a `NotSelf` fault, a `Created` one a
+/// `BadState` fault that changes nothing, and a `Gone` one answers `Revoked`
+/// with its recorded death unchanged. Killing root stops the machine.
 public enum ProcessOp: UInt {
     case ThreadCreate = 0,
     case ThreadSelf = 1,
@@ -387,6 +394,7 @@ public enum ProcessOp: UInt {
     case Stats = 10,
     case RestrictRights = 11,
     case Ceiling = 12,
+    case Kill = 13,
 }
 
 /// Whether `ProcessOp.Start`'s second argument carries a boot tag: the op's
@@ -967,7 +975,7 @@ public enum ReplyWaitLeg: UInt {
 // passes while the table walks past `INFO_OP`.
 static_assert((SystemOp.ProcessByPid as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((ProcessOp.Ceiling as UInt) < INFO_OP,
+static_assert((ProcessOp.Kill as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
 static_assert((ThreadOp.Yield as UInt) < INFO_OP,
               "an op table must stay below the universal ops")

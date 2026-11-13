@@ -1,0 +1,320 @@
+// A kill naming a process that was never started is a `BadState` fault on the
+// caller, and changes nothing in it (spec §8).
+//
+// Root creates a process and does not start it, gives a second process a
+// handle onto it that carries the kill right, and starts that second process
+// before the first. The second process kills through the handle and is ended
+// with the fault; the first is as it was, and root then starts it and it runs.
+//
+//   SOS killcreated: the kill of a Created process is a fault
+//                     the killer is ended with the `BadState` fault
+//   SOS killcreated: nothing in the target changed
+//                     no thread of it ran, its status word still reads running
+//                     and it was not torn down
+//   SOS killcreated: the target starts and runs
+//   SOS killcreated: once started it is killed and reads Killed
+//   SOS killcreated: done
+//
+// Root works at the C altitude, as `tests/create-cross-fault` does, because
+// the Process handle it gives the killer is a raw word: the typed tier has no
+// Process give.
+//
+// Every loop is bounded.
+
+import sos.{System, SystemRight, sos_system_process_self,
+            sos_system_process_create, sos_process_boot_handle_next,
+            sos_process_get_status, sos_process_thread_self, sos_process_start,
+            sos_process_give, sos_process_event_create, sos_process_kill,
+            sos_process_stats, sos_handle_mint, sos_event_signal,
+            sos_thread_yield}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The tags the children's boot records travel under.
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_TARGET: UInt = 47
+
+/// `child-kill`'s role that kills through a handle it was given.
+static ROLE_TARGET: UInt = 7
+
+/// The keep mask that narrows nothing.
+static KEEP_ALL: UInt = 0xFFFF_FFFF
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt = ((SystemRight.Debug | SystemRight.ProcessSelf
+                              | SystemRight.Transfer) as UInt)
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// The `BootTagForm` that names a tag.
+static TAG_PRESENT: UInt = 1
+
+/// The boot-handle record: tag, kind, handle.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+/// A raw word naming nothing, and a status word no process has.
+static NO_WORD: UInt = 0
+static NO_STATUS: UInt = 0xFFFF_FFFF
+
+/// The §8 words this case reads: a process that has not ended, one that ended
+/// with the `BadState` fault (`Faulted` 2 over the reason 5), and one killed
+/// with the code root passes (`Killed` 3 over 0x2A).
+static RUNNING: UInt = 0
+static BAD_STATE: UInt = 131077
+static KILLED: UInt = 196650
+static KILL_CODE: UInt = 0x2A
+static_assert((2 * 65536) + 5 == 131077,
+              "a fault word is Faulted in the high bits, then the reason")
+static_assert((3 * 65536) + 0x2A == 196650,
+              "a killed word is Killed in the high bits, then the code")
+
+/// The most turns root yields waiting on a process.
+static MAX_TURNS: Int = 20000
+
+/// The stats record: syscalls, interrupts, faults and pid.
+static STATS_COLUMNS: Int = 4
+
+func ask_process(system: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_self(system, KEEP_ALL,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// The handle word of the next boot record, or `NO_WORD` when the set is
+/// drained.
+func next_word(process: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(process,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+func create_child(system: UInt, image: UInt, ram: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_create(system, image, ram, NO_WORD,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+func new_event(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_event_create(process, 0,
+                                          (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// A sibling of `handle` carrying `keep`'s rights.
+func sibling(handle: UInt, keep: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_handle_mint(handle, keep,
+                                 (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// The §8 status word of `process`.
+func status_of(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_get_status(process,
+                                        (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_STATUS
+    }
+    out
+}
+
+/// How many system calls `process` has made, or the most a count can say when
+/// the read is refused.
+func syscalls_of(process: UInt) unsafe -> UInt64 {
+    var buf: [UInt64; STATS_COLUMNS] = [0; STATS_COLUMNS]
+    let bytes = (STATS_COLUMNS * sizeof<UInt64>()) as UInt
+    let status = sos_process_stats(process,
+                                   (&var buf) as UnsafePointer<UInt64>, bytes)
+    if status != STATUS_OK {
+        return UInt64.max
+    }
+    buf[0]
+}
+
+func own_thread(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_thread_self(process,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// Give `child` a sibling of `handle` under `tag`.
+func give_sibling(child: UInt, handle: UInt, tag: UInt) unsafe -> Bool {
+    let word = sibling(handle, KEEP_ALL)
+    if word == NO_WORD {
+        return false
+    }
+    sos_process_give(child, word, tag, KEEP_ALL) == STATUS_OK
+}
+
+/// Give `child` a masked System as its boot handle, and start it with it.
+func start_with_system(system: UInt, child: UInt) unsafe -> Bool {
+    let word = sibling(system, CHILD_SYSTEM)
+    if word == NO_WORD {
+        return false
+    }
+    if sos_process_give(child, word, TAG_BOOT, KEEP_ALL) != STATUS_OK {
+        return false
+    }
+    sos_process_start(child, TAG_PRESENT, TAG_BOOT) == STATUS_OK
+}
+
+/// Yield until `process` is no longer running and answer its status word.
+func await_end(process: UInt, thread: UInt) unsafe -> UInt {
+    var turns = 0
+    while turns < MAX_TURNS {
+        let status = status_of(process)
+        if status != RUNNING {
+            return status
+        }
+        let _ = sos_thread_yield(thread)
+        turns = turns + 1
+    }
+    status_of(process)
+}
+
+/// Yield until `process` has made a system call, and answer how many.
+func await_run(process: UInt, thread: UInt) unsafe -> UInt64 {
+    var turns = 0
+    while turns < MAX_TURNS {
+        let made = syscalls_of(process)
+        if made != 0 {
+            return made
+        }
+        let _ = sos_thread_yield(thread)
+        turns = turns + 1
+    }
+    syscalls_of(process)
+}
+
+func fail(system: &System, why: String) {
+    let _ = system.debug_print(why)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let me = ask_process(boot_handle)
+    if me == NO_WORD {
+        fail(&system, "SOS killcreated: no process handle\n")
+        return
+    }
+
+    // The images come first, then the RAMs, in the children's order: the
+    // killer, then the process it is aimed at.
+    let killer_image = next_word(me)
+    let target_image = next_word(me)
+    let killer_ram = next_word(me)
+    let target_ram = next_word(me)
+    if target_ram == NO_WORD {
+        fail(&system, "SOS killcreated: boot regions missing\n")
+        return
+    }
+    let thread = own_thread(me)
+    if thread == NO_WORD {
+        fail(&system, "SOS killcreated: no thread handle\n")
+        return
+    }
+
+    // The target is created and not started; the killer is given a handle onto
+    // it that carries every right, the kill among them, and is started first.
+    let target = create_child(boot_handle, target_image, target_ram)
+    let killer = create_child(boot_handle, killer_image, killer_ram)
+    let role = new_event(me)
+    if target == NO_WORD || killer == NO_WORD || role == NO_WORD {
+        fail(&system, "SOS killcreated: processes not made\n")
+        return
+    }
+    let _ = sos_event_signal(role, ROLE_TARGET)
+    if not give_sibling(killer, target, TAG_TARGET) {
+        fail(&system, "SOS killcreated: killer not furnished\n")
+        return
+    }
+    if not give_sibling(killer, role, TAG_ROLE) {
+        fail(&system, "SOS killcreated: killer not furnished\n")
+        return
+    }
+    if not start_with_system(boot_handle, killer) {
+        fail(&system, "SOS killcreated: killer not started\n")
+        return
+    }
+
+    let ended = await_end(killer, thread)
+    if ended != BAD_STATE {
+        print("SOS killcreated: the killer ended with status {}\n", ended)
+        fail(&system, "SOS killcreated: the kill was not a fault\n")
+        return
+    }
+    let _ = system.debug_print(
+        "SOS killcreated: the kill of a Created process is a fault\n")
+
+    // Nothing in the target changed: no thread of it ran, and its status word
+    // reads what a process that has not ended reads.
+    let before = status_of(target)
+    let ran = syscalls_of(target)
+    if before != RUNNING || ran != 0 {
+        print("SOS killcreated: status {} syscalls {}\n", before, ran)
+        fail(&system, "SOS killcreated: the target changed\n")
+        return
+    }
+    let _ = system.debug_print(
+        "SOS killcreated: nothing in the target changed\n")
+
+    // It can still be started, and it runs.
+    if not start_with_system(boot_handle, target) {
+        fail(&system, "SOS killcreated: the target did not start\n")
+        return
+    }
+    let made = await_run(target, thread)
+    if made == 0 || made == UInt64.max {
+        fail(&system, "SOS killcreated: the target did not run\n")
+        return
+    }
+    let _ = system.debug_print("SOS killcreated: the target starts and runs\n")
+
+    // Once started it is killable by the handle that could not kill it before.
+    if sos_process_kill(target, KILL_CODE) != STATUS_OK {
+        fail(&system, "SOS killcreated: the kill was refused\n")
+        return
+    }
+    let word = status_of(target)
+    if word != KILLED {
+        print("SOS killcreated: the killed target reads {}\n", word)
+        fail(&system, "SOS killcreated: the target was not killed\n")
+        return
+    }
+    let _ = system.debug_print(
+        "SOS killcreated: once started it is killed and reads Killed\n")
+    let _ = system.debug_print("SOS killcreated: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}

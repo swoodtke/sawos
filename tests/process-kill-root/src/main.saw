@@ -1,0 +1,205 @@
+// Killing root stops the machine with a status of its own (spec §8).
+//
+// Root creates a process and never starts it, so that its handle is the only
+// name that process has, and gives a second process a handle onto root itself
+// that carries the kill right. The second process kills root with the code 0:
+// the machine stops with the status for a killed root, not with the killer's
+// code, and stops there. Root's teardown is the last thing on the console,
+// which says that no other end was paid first: the unstarted process, whose
+// last name root's handle table held, is not torn down.
+//
+//   SOS killer: killing
+//   SOS: process teardown ... process={zero}          (the last line)
+//
+// Root works at the C altitude, as `tests/create-cross-fault` does, because
+// the Process handle it gives the killer is a raw word: the typed tier has no
+// Process give.
+//
+// Every loop is bounded.
+
+import sos.{System, SystemRight, sos_system_process_self,
+            sos_system_process_create, sos_process_boot_handle_next,
+            sos_process_thread_self, sos_process_start, sos_process_give,
+            sos_process_event_create, sos_handle_mint, sos_event_signal,
+            sos_thread_yield}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The tags the children's boot records travel under.
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_TARGET: UInt = 47
+
+/// `child-kill`'s role that kills through a handle it was given.
+static ROLE_TARGET: UInt = 7
+
+/// The keep mask that narrows nothing.
+static KEEP_ALL: UInt = 0xFFFF_FFFF
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt = ((SystemRight.Debug | SystemRight.ProcessSelf
+                              | SystemRight.Transfer) as UInt)
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// The `BootTagForm` that names a tag.
+static TAG_PRESENT: UInt = 1
+
+/// The boot-handle record: tag, kind, handle.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+/// A raw word naming nothing.
+static NO_WORD: UInt = 0
+
+/// The most turns root yields waiting on a process.
+static MAX_TURNS: Int = 20000
+
+func ask_process(system: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_self(system, KEEP_ALL,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// The handle word of the next boot record, or `NO_WORD` when the set is
+/// drained.
+func next_word(process: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(process,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+func create_child(system: UInt, image: UInt, ram: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_system_process_create(system, image, ram, NO_WORD,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+func new_event(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_event_create(process, 0,
+                                          (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// A sibling of `handle` carrying `keep`'s rights.
+func sibling(handle: UInt, keep: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_handle_mint(handle, keep,
+                                 (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+func own_thread(process: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_thread_self(process,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// Give `child` a sibling of `handle` under `tag`.
+func give_sibling(child: UInt, handle: UInt, tag: UInt) unsafe -> Bool {
+    let word = sibling(handle, KEEP_ALL)
+    if word == NO_WORD {
+        return false
+    }
+    sos_process_give(child, word, tag, KEEP_ALL) == STATUS_OK
+}
+
+/// Give `child` a masked System as its boot handle, and start it with it.
+func start_with_system(system: UInt, child: UInt) unsafe -> Bool {
+    let word = sibling(system, CHILD_SYSTEM)
+    if word == NO_WORD {
+        return false
+    }
+    if sos_process_give(child, word, TAG_BOOT, KEEP_ALL) != STATUS_OK {
+        return false
+    }
+    sos_process_start(child, TAG_PRESENT, TAG_BOOT) == STATUS_OK
+}
+
+func fail(system: &System, why: String) {
+    let _ = system.debug_print(why)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let me = ask_process(boot_handle)
+    if me == NO_WORD {
+        fail(&system, "SOS killroot: no process handle\n")
+        return
+    }
+
+    // The images come first, then the RAMs, in the children's order: the
+    // killer, then the process root leaves unstarted.
+    let killer_image = next_word(me)
+    let spare_image = next_word(me)
+    let killer_ram = next_word(me)
+    let spare_ram = next_word(me)
+    if spare_ram == NO_WORD {
+        fail(&system, "SOS killroot: boot regions missing\n")
+        return
+    }
+    let thread = own_thread(me)
+    if thread == NO_WORD {
+        fail(&system, "SOS killroot: no thread handle\n")
+        return
+    }
+
+    // `spare` is created and never started: root's handle is its only name.
+    let spare = create_child(boot_handle, spare_image, spare_ram)
+    let killer = create_child(boot_handle, killer_image, killer_ram)
+    let role = new_event(me)
+    if spare == NO_WORD || killer == NO_WORD || role == NO_WORD {
+        fail(&system, "SOS killroot: processes not made\n")
+        return
+    }
+    let _ = sos_event_signal(role, ROLE_TARGET)
+    if not give_sibling(killer, me, TAG_TARGET) {
+        fail(&system, "SOS killroot: killer not furnished\n")
+        return
+    }
+    if not give_sibling(killer, role, TAG_ROLE) {
+        fail(&system, "SOS killroot: killer not furnished\n")
+        return
+    }
+    if not start_with_system(boot_handle, killer) {
+        fail(&system, "SOS killroot: killer not started\n")
+        return
+    }
+
+    // Root stays runnable until the killer ends it.
+    var turns = 0
+    while turns < MAX_TURNS {
+        let _ = sos_thread_yield(thread)
+        turns = turns + 1
+    }
+    fail(&system, "SOS killroot: root was not killed\n")
+}

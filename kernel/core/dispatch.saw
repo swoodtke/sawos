@@ -313,6 +313,7 @@ import kcore.loader.{
 import kcore.irq.{service_irq}
 import kcore.sched.{
     end_process,
+    kill_process,
     exit_thread,
     fault_process,
     fault_trap,
@@ -691,9 +692,9 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
         },
         // Process exit belongs here, not on the System object (spec §5.7).
         // It ends the calling process only: a handle naming any other process
-        // faults the caller (`NotSelf`), since there is no kill. Every thread
-        // of the process goes with it (§8's teardown is unconditional), so
-        // this never returns.
+        // faults the caller (`NotSelf`): ending another process is `Kill`'s.
+        // Every thread of the process goes with it (§8's teardown is
+        // unconditional), so this never returns.
         case Exit -> {
             if not obj.allows(ProcessRight.Exit) {
                 fault_process(p, FaultReason.AccessDenied)
@@ -704,6 +705,34 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             // `end_process` does not return, so this arm diverges and owes the
             // `match` no value.
             end_process(obj.slot, ProcessStatusKind.Exited, arg0, arg0)
+        },
+        // Ends the process the handle names (§8's Kill block). The answers are
+        // decided in this order: the right (`AccessDenied`), then the target.
+        // The caller's own process is a `NotSelf` fault, a `Gone` target is
+        // `Revoked` and keeps the death it recorded, and a `Created` one is a
+        // `BadState` fault that touches nothing: it never ran, and a launcher
+        // that wants it gone releases its handles. A running target is torn
+        // down now, and the call answers `Ok`; the ends the teardown owes
+        // others are paid at the switch point this call returns through.
+        case Kill -> {
+            if not obj.allows(ProcessRight.Kill) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if obj.slot == p {
+                fault_process(p, FaultReason.NotSelf)
+            }
+            match PROCESS_RECORDS[obj.slot].state {
+                case Gone -> {
+                    return op_status(SosStatus.Revoked)
+                },
+                case Created -> {
+                    fault_process(p, FaultReason.BadState)
+                },
+                case _ -> {
+                    kill_process(obj.slot, arg0)
+                },
+            }
+            op_ok()
         },
         // §8's status word: kind in the high bits, code in the low ones. A
         // process asking about itself reads `Running`; the interesting reader

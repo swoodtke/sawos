@@ -1,0 +1,263 @@
+// A kill ends the calls into and out of the target (spec §8).
+//
+// Two trials, each ending a process with a call parked on it:
+//
+//   SOS killcalls: a client parked in a call on a killed server is told
+//                  PeerClosed
+//                     `child-kill` holds the server end of a connection and
+//                     tells root when a message is staged; `child-kill-caller`
+//                     is parked in its call on the other end. Root kills the
+//                     server through its creator's handle: the server's last
+//                     handle on the outlet goes, the staged message is
+//                     abandoned and the client's call comes back
+//                     `PeerClosed`, which is its exit code
+//   SOS killcalls: the sender handle carries no kill right
+//   SOS killcalls: a reply to a client killed while it waited is PeerClosed
+//                     root is the server: it takes the message the client's
+//                     call staged, kills the client, and its reply is told the
+//                     claim is gone
+//   SOS killcalls: done
+//
+// Each trial's client parks before the kill by construction: the server's
+// signal, and root's take, are the messages the client's call staged.
+
+import sos.{System, Process, Memory, SosStatus, SystemRight, ProcessRight,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_INLET: UInt = 32
+
+/// The tags and roles `child-kill` knows.
+static TAG_ROLE: UInt = 40
+static TAG_OUTLET: UInt = 45
+static TAG_SIGNAL: UInt = 46
+static ROLE_SERVER: UInt = 6
+
+static KEY_STAGED: UInt = 3
+static KEY_DEATH: UInt = 6
+
+/// The code root kills with.
+static KILL_CODE: UInt = 0x2A
+
+/// The client's `Exited` word when its call came back `PeerClosed`: `Exited`
+/// (1) in the high half over its exit code, 51.
+static PEER_CLOSED: UInt = 65587
+static_assert((1 * 65536) + 51 == 65587,
+              "an exit word is Exited in the high bits, then the code")
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The rights of the sender handle: the observe set.
+static OBSERVE: UInt32 = ProcessRight.Wait | ProcessRight.Stats
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS killcalls: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS killcalls: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS killcalls: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The boot regions come blobs first and destinations second, in the order
+    // the case lists its children: `child-kill`, then `child-kill-caller`.
+    var kill_img_rec = try proc.boot_handle_next()
+    var caller_img_rec = try proc.boot_handle_next()
+    var kill_ram_rec = try proc.boot_handle_next()
+    var caller_ram_rec = try proc.boot_handle_next()
+    guard let kill_img = kill_img_rec.take_memory() else { return BUG }
+    guard let caller_img = caller_img_rec.take_memory() else { return BUG }
+    guard let kill_ram = kill_ram_rec.take_memory() else { return BUG }
+    guard let caller_ram = caller_ram_rec.take_memory() else { return BUG }
+
+    try server_killed(&system, &proc, &kill_img, &kill_ram, &caller_img,
+                      &caller_ram)
+    try client_killed(&system, &proc, &caller_img, &caller_ram)
+    return
+}
+
+/// The server is killed with a client's message staged and its call parked.
+func server_killed(system: &System, proc: &Process, server_img: &Memory,
+                   server_ram: &Memory, caller_img: &Memory,
+                   caller_ram: &Memory) -> Result<Void, SosStatus> {
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+
+    // The server holds the outlet and tells root through an Event when the
+    // client's message is staged.
+    let server = try system.process_create(image: &server_img,
+                                           memory: &server_ram)
+    let staged = try proc.event_create()
+    let for_server = try staged.mint()
+    try server.give(event: move for_server, tag: TAG_SIGNAL) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try server.give(outlet: move outlet, tag: TAG_OUTLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try tell(&proc, &server, TAG_ROLE, ROLE_SERVER)
+    try give_boot(&system, &server)
+    try server.start(boot_tag: TAG_BOOT)
+    try park(&proc)
+
+    let client = try system.process_create(image: &caller_img,
+                                           memory: &caller_ram)
+    try client.give(inlet: move inlet, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try give_boot(&system, &client)
+    try client.start(boot_tag: TAG_BOOT)
+    try park(&proc)
+
+    // The server has seen the message staged: the client is parked in its call.
+    let waiter = try proc.waiter_create()
+    try waiter.add(event: &staged, key: KEY_STAGED)
+    let woke = try waiter.wait()
+    let _ = move woke
+
+    try server.kill(code: KILL_CODE)
+    try ended_with(&proc, &client, PEER_CLOSED)
+    say("a client parked in a call on a killed server is told PeerClosed")
+    return
+}
+
+/// The client is killed while it waits for a reply root owes it.
+func client_killed(system: &System, proc: &Process, caller_img: &Memory,
+                   caller_ram: &Memory) -> Result<Void, SosStatus> {
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let client = try system.process_create(image: &caller_img,
+                                           memory: &caller_ram)
+    try client.give(inlet: move inlet, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try give_boot(&system, &client)
+    try client.start(boot_tag: TAG_BOOT)
+
+    // Root waits until the client's call has staged its message, and then
+    // takes it: the client is parked for the reply.
+    let readable = try proc.waiter_create()
+    try readable.add(outlet: &outlet, key: KEY_STAGED)
+    let woke = try readable.wait()
+    let _ = move woke
+    let taken = try outlet.take()
+    let (_, request) = move taken
+
+    let sender = try request.sender()
+    let rights = try sender.rights()
+    let kill_bit = ProcessRight.Kill as UInt32
+    if rights != OBSERVE || (rights & kill_bit) != 0 {
+        print("SOS killcalls: the sender handle carries {}\n", rights)
+        return BUG
+    }
+    let _ = move sender
+    say("the sender handle carries no kill right")
+
+    try client.kill(code: KILL_CODE)
+    var answer: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    match (move request).reply(body: &answer, len: 0) {
+        case Ok(_) -> {
+            print("SOS killcalls: the reply was taken\n")
+            return BUG
+        },
+        case Err(why) -> {
+            if not is_peer_closed(why) {
+                print("SOS killcalls: the reply answered {}\n", why)
+                return BUG
+            }
+        },
+    }
+    say("a reply to a client killed while it waited is PeerClosed")
+    return
+}
+
+func say(line: String) {
+    print("SOS killcalls: {}\n", line)
+}
+
+func is_peer_closed(why: SosStatus) -> Bool {
+    match why {
+        case PeerClosed -> true,
+        case _ -> false,
+    }
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Give `child` its System handle, which is its boot tag. Anything the child
+/// drains from its boot set goes before this.
+func give_boot(system: &System, child: &Process) -> Result<Void, SosStatus> {
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Let every process that can run, run until it parks: nothing ticks in this
+/// case, so a yield returns when the other processes have nothing left to do.
+func park(proc: &Process) -> Result<Void, SosStatus> {
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
+    return
+}
+
+/// Wait for the process `child` names to end and require the status word
+/// `want`.
+func ended_with(proc: &Process, child: &Process,
+                want: UInt) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS killcalls: the child ended with status {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
