@@ -85,13 +85,17 @@ ld.lld: error: boot.S.o:(.text.start+0x0): relocation R_XTENSA_SLOT0_OP out
   '.literal.start'
 ```
 
-So every output section that holds code lists `*(.literal .literal.*)` ahead of
-`*(.text .text.*)`, and one output section's code must lie within 256 KiB above
-its pools. The stub's script, which links cleanly:
+So every output section that holds code lists its literals and its code in one
+input pattern, `*(.literal .literal.* .text .text.*)`, which the linker orders
+by input file and, within a file, by section order, so a function follows its
+own pool. Listing every pool ahead of every function instead would put a
+function more than 256 KiB past the pools it reads out of reach, once the code
+is that large. The reset path's pool and code lead, and the vectors' literals
+are named in a section of their own. The kernel's script, which links cleanly:
 
 ```
 .text : { *(.literal.start) *(.text.start)
-          *(.literal .literal.*) *(.text .text.*) } > FLASH
+          *(.literal .literal.* .text .text.*) } > FLASH
 ```
 
 ### 1d. Integer and float helpers: nothing call0 ships
@@ -1296,17 +1300,17 @@ includes the ROM's RAM (§3b): nothing writes there until the kernel loads a
 process, long after the boot path has left the ROM's stack.
 
 Each image is a Blade-built sosimg linked at its region's base: one R+X
-segment (literal pools, code, read-only data) and one R+W segment (data, then
-the zero-filled `.bss` and arena). The kernel's link script puts the appended
-root image and the child images in `.drom`, at data-bus addresses, so the
-loader reads every image as data on the data bus.
+segment (literal pools and code), one R segment (read-only data) and one R+W
+segment (data, then the zero-filled `.bss` and arena). The kernel's link
+script puts the appended root image and the child images in `.drom`, at
+data-bus addresses, so the loader reads every image as data on the data bus.
 
 ### 13b. What the cases showed
 
 - The loader reads a root image and a child's through the data-bus window
   (0x3C0x_xxxx), and copies both into IRAM with ordinary stores. Each process
-  then runs from IRAM: root reports `entry=0x403a043c` on its load line, and
-  its ticks report PCs in 0x403A_xxxx.
+  then runs from IRAM: root reports an `entry` in 0x403A_xxxx on its load
+  line, and its ticks report PCs in 0x403A_xxxx.
 - Under the emulator a process's stack, data and arena at IRAM addresses
   take loads and stores of every width, `s32c1i` included (the inline word
   atomics, §8). A part refuses the byte and halfword ones there (§3c).

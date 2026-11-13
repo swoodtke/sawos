@@ -20,7 +20,7 @@
 //   9  `ProcessNext` with the cursor in read-only memory: the op writes the
 //      cursor back, so the address must be writable
 //  10  `ProcessByPid` with the pid in read-only memory: it is only read, so
-//      the call is answered (the code bytes name no process: `Revoked`)
+//      the call is answered (the data's bytes name no process: `Revoked`)
 //  11  nothing: it ends with `EXIT_OK`, leaving a dead process its launcher
 //      holds
 //  12  `ProcessNext` at a full Handle row, with the cursor the launcher gave
@@ -85,7 +85,7 @@ static KEEP_ALL: UInt = 0xFFFF_FFFF
 /// Root's pid, the first the walk answers.
 static ROOT_PID: UInt64 = 1
 
-/// Rounds a code address down to a doubleword.
+/// Rounds an address down to a doubleword.
 static ALIGN: UInt = 8
 
 /// An address that is not word-aligned on any profile, and one in no
@@ -216,15 +216,13 @@ func by_pid_at(system: UInt, at: UInt) unsafe -> UInt {
                               (&var out) as UnsafePointer<UInt>)
 }
 
-/// A word-aligned address in this image's code, which is mapped but not
-/// writable: a function's address rounded down.
+/// A word-aligned address in this image's read-only data, where its string
+/// literals are: mapped, and neither writable nor executable. The bytes it
+/// holds name no process.
 func readonly_address() unsafe -> UInt {
-    let code: FuncPointer<() sync -> Void> = code_marker
-    let at = code.address() as UInt
+    let literal = "read-only bytes naming no process"
+    let at = literal.c_string()! as UInt
     at - (at % ALIGN)
-}
-
-func code_marker() sync {
 }
 
 /// `ProcessSelf`, as a status and the handle it answered.

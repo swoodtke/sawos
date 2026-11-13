@@ -28,10 +28,10 @@
  * region and refuses an image that does not fit, with a named diagnostic.
  *
  * Protection granularity here is the page. Two segments sharing a page would
- * be granted the union of their permissions, so `.text` and `.data` are each
- * page-aligned; otherwise a program's code could become writable because its
- * data happened to start 200 bytes later. The kernel's loader checks the
- * alignment rather than trusting the linker script.
+ * be granted the union of their permissions, so `.text`, `.rodata` and `.data`
+ * are each page-aligned; otherwise a program's code could become writable
+ * because its data happened to start 200 bytes later. The kernel's loader
+ * checks the alignment rather than trusting the linker script.
  *
  * The riscv32 profile keeps a script per resident image
  * (`hal/riscv32/user/`): there an address is the same number in every process,
@@ -64,9 +64,18 @@ MEMORY {
 SECTIONS {
     . = 0x40200000;
 
-    /* Code + read-only data: one R+X segment, page-aligned at both ends. */
+    /* Code: one R+X segment, page-aligned at both ends. `_text_end` is the
+     * first address past it. */
     .text : ALIGN(4096) {
         *(.text .text.*)
+        . = ALIGN(4096);
+        _text_end = .;
+    } > IMAGE
+
+    /* Read-only data: a segment of its own, readable and neither writable nor
+     * executable, page-aligned at both ends, so a string literal is no part of
+     * executable memory. */
+    .rodata : ALIGN(4096) {
         *(.rodata .rodata.*)
         . = ALIGN(4096);
     } > IMAGE

@@ -747,22 +747,22 @@ a reply delivery carries, which is why there is one type and not two — and
   granted region reads somebody else). A copy-in length is checked for
   equality rather than "at least": a capacity may be over-provisioned, but an
   inbound length is the caller's statement of what it is handing over.
-  **Neither door copies through memory the process may execute** (not yet
-  enforced): a buffer in a grant row that permits execute is `BadBuffer`,
-  whichever door, even a string kept beside the code, and a segment both
-  writable and executable, which the loader accepts (§2.5), is no buffer
-  either. So every board links a program's read-only data as a segment of
-  its own, readable and neither writable nor executable, which is where its
-  string literals are (not yet built: every user linker script puts them in
-  the code's segment). The segment costs one grant row, which every board's
-  budget affords. On the isolated profiles it keeps a program's constants,
-  its jump tables among them, unwritable by the program itself; on a flat one
-  it keeps them out of executable memory, so they are a legal source, and
-  nothing stops the process writing them where they sit in RAM (§5b.1). The
-  copy-in window also takes in a process's in-place read-only segments
-  (§5.6; not yet built), so a literal used in place is a source. On the
-  ESP32-S3 the rule also keeps the kernel from a byte load in the flash
-  instruction window, which the part refuses.
+  **Neither door copies through memory the process may execute**: a buffer
+  any byte of which lies in a grant row that permits execute is `BadBuffer`,
+  whichever door and whatever other rows cover it, even a string kept beside
+  the code, and a segment both writable and executable, which the loader
+  accepts (§2.5), is no buffer either. So every board links
+  a program's read-only data as a segment of its own, readable and neither
+  writable nor executable, which is where its string literals are. The
+  segment costs one grant row, which every board's budget affords. On the
+  isolated profiles it keeps a program's constants, its jump tables among
+  them, unwritable by the program itself; on a flat one it keeps them out of
+  executable memory, so they are a legal source, and nothing stops the
+  process writing them where they sit in RAM (§5b.1). The copy-in window
+  also takes in a process's in-place read-only segments (§5.6; not yet
+  built), so a literal used in place is a source. On the ESP32-S3 the rule
+  also keeps the kernel from a byte load in the flash instruction window,
+  which the part refuses.
 - **Attach semantics:** **level-triggered** (keeps reporting ready until the
   waiter handles it — no lost edges); attachments are **persistent by
   default** with explicit `remove(key)` (by key, never by the waitable's
@@ -975,6 +975,16 @@ tag-to-meaning config is, and where a driver's `UART_BASE` comes from.
 - **Access is a property of the mapping.** A region carries no R/W/X triple,
   and double-mapping one region RO here and RW there is expressible and
   allowed. An access word asking for write without read is refused.
+- **A mapping does not cover a row of its target's image or stack.** A `map`
+  whose range meets a row the loader recorded for the target answers
+  `NoResource` and installs nothing; mappings may cover one another. A status
+  and not a fault, because the launcher that keeps a child's destination
+  `Memory` could not have known where the child's image lies, and a call that
+  is correct where a mapping takes an address of its own (arm64, where it meets
+  no image row) is not a reason to end the caller on the profiles where a
+  mapping's address is its memory's own, where a launcher's region *is* the
+  child's image. `NoResource` because it is what `map` already answers when the
+  target's address space has no room for the range.
 - **Executable is a right.** `MemoryOp.Map` refuses `MapAccess.Execute`
   unless the Memory handle carries **`MemoryRight.MapExecute`** — the same
   refusal (`AccessDenied`, a fault) every unspent right answers. It is
@@ -1283,11 +1293,10 @@ three groups:
   checked, because that check reads the named process's address space and a
   `Gone` process has no body. A thread's stack top must lie in the process's
   region and its entry in a row of its grant that permits execute, which an
-  in-place code segment outside the region is (§5.6; the entry rule not yet
-  enforced, the entry checked against the region instead). A thread created
-  in a `Created` child is inert:
-  `ThreadOp.Start` on it is a `BadState` fault until the child has been
-  started, and the launcher starts it after `ProcessOp.Start`.
+  in-place code segment outside the region is (§5.6; not yet built). A thread
+  created in a `Created` child is inert: `ThreadOp.Start` on it is a
+  `BadState` fault until the child has been started, and the launcher starts
+  it after `ProcessOp.Start`.
 - **`Exit`, `ThreadSelf` and `BootHandleNext` are self-only**: through a handle
   naming another process the kernel faults the caller (`NotSelf`). `Exit` ends
   the calling process, `ThreadSelf` names the caller's running thread, and
@@ -3628,13 +3637,9 @@ loader parses and reports while no process stores either.
   loader's `allow_device: true` door, dormant) (§2.5): its emitter is
   sawlang-side, so deleting it is a toolchain-pin event.
 - **The tier-2 mapping quota price** (`DEFAULT_QUOTA_MAPPINGS`, §5b.1).
-- **Executable memory refused as a buffer** (§2.2): the copy doors' check,
-  and read-only data as a segment of its own in every board's user linker
-  scripts. Until it is built a buffer in a process's code segment is copied
-  through, and its string literals share that segment.
 - **Segments used in place** (§5.5, §5.6): the loader's in-place branch and
   its checks, the board bus rule, the copy-in window over in-place segments,
-  the entry rule for threads, the refusal of a flash destination or
+  the refusal of a flash destination or
   donation, and the ESP32-S3 build that runs processes from flash. Until it
   is built every segment is copied, on the ESP32-S3 into IRAM, where a part
   refuses byte access, so no process loads on a board.

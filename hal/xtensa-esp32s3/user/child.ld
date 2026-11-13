@@ -27,9 +27,17 @@ MEMORY {
 SECTIONS {
     . = 0x403B8000;
 
+    /* Code, each function beside the literals it loads: `l32r` reaches only
+     * backwards, and listing every pool first would put the last functions
+     * out of reach once the code passes its 256 KiB range. */
     .text : {
-        *(.literal .literal.*)
-        *(.text .text.*)
+        *(.literal .literal.* .text .text.*)
+        . = ALIGN(4);
+    } > CHILD
+
+    /* Read-only data: a segment of its own, readable and neither writable nor
+     * executable, so a string literal is no part of executable memory. */
+    .rodata : ALIGN(16) {
         *(.rodata .rodata.*)
         . = ALIGN(4);
     } > CHILD

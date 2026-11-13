@@ -52,9 +52,16 @@ MEMORY {
 SECTIONS {
     . = 0x802C0000;
 
-    /* Code + read-only data: one R+X segment. */
+    /* Code: one R+X segment. */
     .text : {
         *(.text .text.*)
+        . = ALIGN(4);
+    } > CHILD3
+
+    /* Read-only data: a segment of its own, readable and neither
+     * writable nor executable, so a string literal is no part of
+     * executable memory. */
+    .rodata : ALIGN(16) {
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
         . = ALIGN(4);

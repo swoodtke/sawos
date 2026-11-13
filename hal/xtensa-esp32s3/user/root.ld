@@ -1,7 +1,7 @@
 /* SOS root server linker script: Xtensa, ESP32-S3 board.
  *
- * The section layout of hal/riscv32-esp32c3/user/root.ld, with every literal
- * pool ahead of the code that loads it (`l32r` reaches only backwards, up to
+ * The section layout of hal/riscv32-esp32c3/user/root.ld, with each function
+ * after the literal pool it loads from (`l32r` reaches only backwards, up to
  * 256 KiB; ../ABI.md §1c) and this board's addresses.
  *
  * Root is loaded by the kernel at a fixed address: nothing relocates it and
@@ -18,8 +18,8 @@
  * `../kernel/esp32s3.ld`). LENGTH stops at the stack bottom, so the linker
  * cannot place data where the stack will live.
  *
- * Code, literals and read-only data share one segment, and writable data and
- * zero-init another, as on the riscv32 boards.
+ * Code and literals are one segment, read-only data a second and writable
+ * data and zero-init a third, as on the riscv32 boards.
  */
 
 ENTRY(_start)
@@ -37,9 +37,17 @@ MEMORY {
 SECTIONS {
     . = 0x403A0000;
 
+    /* Code, each function beside the literals it loads: `l32r` reaches only
+     * backwards, and listing every pool first would put the last functions
+     * out of reach once the code passes its 256 KiB range. */
     .text : {
-        *(.literal .literal.*)
-        *(.text .text.*)
+        *(.literal .literal.* .text .text.*)
+        . = ALIGN(4);
+    } > ROOT
+
+    /* Read-only data: a segment of its own, readable and neither writable nor
+     * executable, so a string literal is no part of executable memory. */
+    .rodata : ALIGN(16) {
         *(.rodata .rodata.*)
         . = ALIGN(4);
     } > ROOT

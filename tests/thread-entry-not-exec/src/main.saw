@@ -1,0 +1,126 @@
+// A thread's entry must lie in memory the process can execute (spec §2.7).
+//
+// Root launches `child-exec-fault` once per role, each making a thread of its
+// own with an entry at an address in one of the child's own segments, and
+// reads how the child ended in the §8 status word (`Exited` in the high half
+// and the code in the low, or `Faulted` in the high half and the fault reason
+// in the low):
+//
+//   SOS entryexec: an entry in the child's writable data is refused
+//                                                              `BadEntry`
+//   SOS entryexec: an entry in its read-only data is refused   `BadEntry`
+//   SOS entryexec: an entry just past its code is refused     `BadEntry`
+//                     the first address after the code segment, named by a
+//                     linker symbol, which the row's upper bound excludes
+//   SOS entryexec: an entry in its code is made                the child
+//                     exits with its own OK code
+//   SOS entryexec: done
+//
+// Every refused address is inside the child's region, which is all the
+// check asked once, so the refusal is the row's permission and not its place.
+
+import sos.{System, Process, Memory, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 21
+static KEY_DEATH: UInt = 6
+
+/// The roles `child-exec-fault` knows, by the tag of the Event it is given.
+static ROLE_ENTRY_DATA: UInt = 11
+static ROLE_ENTRY_RODATA: UInt = 12
+static ROLE_ENTRY_CODE: UInt = 13
+static ROLE_ENTRY_CODE_END: UInt = 14
+
+/// What the child may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The §8 status words: `Faulted` in the high half with `BadEntry` (6) in the
+/// low, and `Exited` with the child's OK code (7).
+static BAD_ENTRY: UInt = 131078
+static OK: UInt = 65543
+
+static_assert((2 * 65536) + 6 == 131078,
+              "a fault word is Faulted in the high bits, then the reason")
+static_assert((1 * 65536) + 7 == 65543,
+              "an exit's status word is Exited in the high bits and the code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS entryexec: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS entryexec: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS entryexec: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    try run_role(&system, &proc, &image, &ram, ROLE_ENTRY_DATA, BAD_ENTRY)
+    let _ = system.debug_print(
+        "SOS entryexec: an entry in the child's writable data is refused\n")
+    try run_role(&system, &proc, &image, &ram, ROLE_ENTRY_RODATA, BAD_ENTRY)
+    let _ = system.debug_print(
+        "SOS entryexec: an entry in its read-only data is refused\n")
+    try run_role(&system, &proc, &image, &ram, ROLE_ENTRY_CODE_END, BAD_ENTRY)
+    let _ = system.debug_print(
+        "SOS entryexec: an entry just past its code is refused\n")
+    try run_role(&system, &proc, &image, &ram, ROLE_ENTRY_CODE, OK)
+    let _ = system.debug_print("SOS entryexec: an entry in its code is made\n")
+    return
+}
+
+/// Launch the child under `role`, wait for it to end and require the status
+/// word `want`.
+func run_role(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+              role: UInt, want: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let mark = try proc.event_create()
+    try child.give(event: move mark, tag: role) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS entryexec: role {} ended {}, wanted {}\n", role,
+                      status, want)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

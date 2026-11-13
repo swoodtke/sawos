@@ -20,6 +20,7 @@
 //! domain number is the body's index.
 
 import hal
+import imgformat.{SegFlag}
 import sosabi.{
     ObjType,
     FaultReason,
@@ -376,6 +377,13 @@ public(package) func record_grant(p: Int, base: UInt, top: UInt, pa: UInt,
     hal.prot_update(b as UInt, base, top, pa, perms, device)
 }
 
+/// Record that every row `p` holds now is the image's: the loader's segments
+/// and the stack grant. Called when `place_image` has recorded the last one.
+public(package) func seal_image_rows(p: Int) unsafe {
+    let b = body_of(p)
+    PROCESSES[b].image_rows = PROCESSES[b].grant_count
+}
+
 /// Where the next mapping of `len` bytes goes in `p`'s address space: the
 /// kernel's VA policy.
 ///
@@ -428,6 +436,70 @@ public(package) func free_user_va(p: Int, len: UInt) unsafe -> UInt {
     va
 }
 
+/// Does the row's permission set include execute?
+func row_executes(row: GrantRow) -> Bool {
+    (row.perms & (SegFlag.Execute as UInt8)) != 0
+}
+
+/// Does process `p`'s grant record hold a row that permits execute and covers
+/// `va`? A thread's entry must be such an address.
+///
+/// No device row is asked about: a device row never permits execute. An image's
+/// device segment that asks for it is refused by `imgformat`'s permission
+/// check, and a mapped `IoMemory` is installed read and write.
+public(package) func executable_at(p: Int, va: UInt) unsafe -> Bool {
+    let b = body_of(p)
+    var i: Int = 0
+    while i < PROCESSES[b].grant_count {
+        let row = PROCESSES[b].grants[i]
+        if row_executes(row) && va >= row.base && va < row.top {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// Does any row of process `p` that permits execute cover a byte of the `bytes`
+/// bytes at `va`? A range of no bytes asks about `va` alone.
+func meets_execute(p: Int, va: UInt, bytes: UInt) unsafe -> Bool {
+    let b = body_of(p)
+    var end = UInt.max
+    if bytes <= UInt.max - va {
+        end = va + bytes
+    }
+    var i: Int = 0
+    while i < PROCESSES[b].grant_count {
+        let row = PROCESSES[b].grants[i]
+        if row_executes(row) && va < row.top &&
+           (row.base <= va || row.base < end) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// Does `base..top` meet a row of process `p`'s image: a segment the loader
+/// recorded for it, or the stack grant the kernel gave it?
+///
+/// The loader records those rows first and nothing removes one, so they are the
+/// first `image_rows` rows of the record, however the rows after them are
+/// mapped and unmapped.
+public(package) func meets_image_row(p: Int, base: UInt,
+                                     top: UInt) unsafe -> Bool {
+    let b = body_of(p)
+    var i: Int = 0
+    while i < PROCESSES[b].image_rows {
+        let row = PROCESSES[b].grants[i]
+        if base < row.top && row.base < top {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
 /// Resolve a user address to the physical one it names in `p`'s domain, or
 /// `BadBuffer` if it names nothing.
 ///
@@ -443,10 +515,23 @@ public(package) func free_user_va(p: Int, len: UInt) unsafe -> UInt {
 /// window, and a memcpy over device memory would break the access-size
 /// discipline a driver's own reads keep.
 ///
+/// Memory the process may execute is not a buffer. If any row that permits
+/// execute covers a byte of the range, the answer is `BadBuffer` whatever other
+/// rows cover it, so it does not depend on the order the rows were recorded in.
+/// A program's read-only data is a segment of its own, so its string literals
+/// are not in memory that permits execute.
+///
 /// An address in no row is `BadBuffer`, the same answer the window checks give,
 /// because the process handed the kernel an address it does not own.
+///
+/// Both variants of the result are named, so the answer does not depend on how
+/// a bare `FaultReason` would be wrapped.
 public(package) func translate_user(p: Int, va: UInt,
                                     bytes: UInt) unsafe -> Result<UInt, FaultReason> {
+    let nowhere = Result<UInt, FaultReason>.Err(error: FaultReason.BadBuffer)
+    if meets_execute(p, va, bytes) {
+        return nowhere
+    }
     let b = body_of(p)
     var i: Int = 0
     while i < PROCESSES[b].grant_count {
@@ -455,13 +540,13 @@ public(package) func translate_user(p: Int, va: UInt,
             // Ordered so the subtraction cannot underflow: `row.top - va` is
             // computed only once `va` is known to be inside the row.
             if bytes > row.top - va {
-                return FaultReason.BadBuffer
+                return nowhere
             }
-            return row.pa + (va - row.base)
+            return Result<UInt, FaultReason>.Ok(value: row.pa + (va - row.base))
         }
         i = i + 1
     }
-    FaultReason.BadBuffer
+    nowhere
 }
 
 /// Make process `p`'s recorded domain the live one.
@@ -594,6 +679,7 @@ public(package) func clear_domain(p: Int) unsafe {
     let b = body_of(p)
     let rows = PROCESSES[b].grant_count
     PROCESSES[b].grant_count = 0
+    PROCESSES[b].image_rows = 0
     // The standing image goes with the record, before the walk below can return
     // a range to its pool (the same composition as `remove_grant`). Zeroing the
     // count stops a replay tier from granting these bytes again; this call
@@ -633,7 +719,8 @@ public(package) func clear_domain(p: Int) unsafe {
 //   - a destination that is not word-aligned (the kernel writes machine words;
 //     a misaligned store traps on some tiers and is merely wrong on others);
 //   - a destination outside the process's writable window (a record placed in
-//     its own code is a misread memory map).
+//     its own code is a misread memory map);
+//   - a destination in memory the process may execute (`translate_user`).
 //
 // The door reports and its caller faults: ending a process is a scheduling
 // event, so the termination lives above the scheduler and these functions
@@ -719,7 +806,10 @@ public(package) func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe 
 //   - a source that is not word-aligned (the same rule as copy-out, so a caller
 //     learns one alignment rule for kernel records);
 //   - a source outside the process's own memory (this check stops a process
-//     from naming kernel memory or another process's).
+//     from naming kernel memory or another process's);
+//   - a source in memory the process may execute (`translate_user`); a
+//     program's string literals are not there, because its read-only data is
+//     a segment of its own.
 //
 // The window is the whole granted region, not the writable one. A process may
 // hand the kernel a record out of its own rodata, so demanding a writable

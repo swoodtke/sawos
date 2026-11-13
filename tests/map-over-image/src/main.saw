@@ -1,0 +1,164 @@
+// A mapping does not cover a row of the target's image (spec §2.5), and the
+// rules about executable memory (§2.2, §2.7) hold afterwards.
+//
+// A launcher keeps the destination `Memory` it gave `process_create`, so it can
+// `map` it into the child. Where a mapping's address is its memory's own, that
+// row would lie over the child's code and data. Root launches
+// `child-exec-fault` twice, mapping the child's own region into it first:
+//
+//   SOS mapimg: read-write map: {the answer}
+//   SOS mapimg: a send from the child's code is refused         `BadBuffer`
+//   SOS mapimg: read-execute map: {the answer}
+//   SOS mapimg: an entry in the child's data is refused         `BadEntry`
+//   SOS mapimg: done
+//
+// {the answer} is "refused with NoResource" where a mapping's address is its
+// memory's own, and "taken at an address of its own" where the target
+// translates. The child's two rules end it the same way on every profile: it
+// is the mapping, not the profile, that must not change them.
+
+import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus,
+            SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 21
+static KEY_DEATH: UInt = 6
+
+/// The roles `child-exec-fault` knows, by the tag of the Event it is given.
+static ROLE_SEND_CODE: UInt = 1
+static ROLE_ENTRY_DATA: UInt = 11
+
+/// What the child may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+static RX: UInt32 = MapAccess.Read | MapAccess.Execute
+
+/// What the map answered.
+static TAKEN: UInt = 1
+static REFUSED: UInt = 2
+
+/// The §8 status words: `Faulted` in the high half with `BadBuffer` (11) and
+/// `BadEntry` (6) in the low.
+static BAD_BUFFER: UInt = 131083
+static BAD_ENTRY: UInt = 131078
+
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+static_assert((2 * 65536) + 6 == 131078,
+              "a fault word is Faulted in the high bits, then the reason")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mapimg: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS mapimg: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mapimg: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    try trial(&system, &proc, &image, &ram, RW, ROLE_SEND_CODE, BAD_BUFFER)
+    let _ = system.debug_print(
+        "SOS mapimg: a send from the child's code is refused\n")
+    try trial(&system, &proc, &image, &ram, RX, ROLE_ENTRY_DATA, BAD_ENTRY)
+    let _ = system.debug_print(
+        "SOS mapimg: an entry in the child's data is refused\n")
+    return
+}
+
+func is_no_resource(why: SosStatus) -> Bool {
+    match why {
+        case NoResource -> true,
+        case _ -> false,
+    }
+}
+
+/// Launch the child under `role` after mapping its own region into it with
+/// `access`, say what the map answered, wait for the child to end and require
+/// the status word `want`.
+func trial(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+           access: UInt32, role: UInt, want: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    var kept: Mapping? = None
+    match child.map(memory: &ram, access: access) {
+        case Ok(mapping) -> {
+            kept = move mapping
+            say(&system, access, TAKEN)
+        },
+        case Err(why) -> {
+            if not is_no_resource(why) {
+                print("SOS mapimg: the map answered {}\n", why)
+                return BUG
+            }
+            say(&system, access, REFUSED)
+        },
+    }
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let mark = try proc.event_create()
+    try child.give(event: move mark, tag: role) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS mapimg: role {} ended with status {}, wanted {}\n",
+                      role, status, want)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    let _ = move kept
+    return
+}
+
+/// The line that says what the map answered.
+func say(system: &System, access: UInt32, answer: UInt) {
+    if access == RW && answer == TAKEN {
+        let _ = system.debug_print(
+            "SOS mapimg: read-write map: taken at an address of its own\n")
+    } else if access == RW {
+        let _ = system.debug_print(
+            "SOS mapimg: read-write map: refused with NoResource\n")
+    } else if answer == TAKEN {
+        let _ = system.debug_print(
+            "SOS mapimg: read-execute map: taken at an address of its own\n")
+    } else {
+        let _ = system.debug_print(
+            "SOS mapimg: read-execute map: refused with NoResource\n")
+    }
+}

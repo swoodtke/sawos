@@ -14,9 +14,10 @@
  * where the stack will live.
  *
  * Sections are grouped so the image needs few loadable segments: each one
- * costs a PMP region, and the kernel's budget is small (see virt.ld).
- * Read-only data shares the executable segment rather than claiming a region
- * of its own; nothing writable is executable.
+ * costs a PMP region, and the kernel's budget is small (see virt.ld). Three
+ * load: code (R+X), read-only data (R) and writable data (R+W). Read-only data
+ * is not in the executable segment because a system call's buffer may not lie
+ * in memory the process can execute, and a string literal is a buffer.
  */
 
 OUTPUT_ARCH(riscv)
@@ -45,9 +46,16 @@ MEMORY {
 SECTIONS {
     . = 0x80200000;
 
-    /* Code + read-only data: one R+X segment. */
+    /* Code: one R+X segment. */
     .text : {
         *(.text .text.*)
+        . = ALIGN(4);
+    } > ROOT
+
+    /* Read-only data: a segment of its own, readable and neither
+     * writable nor executable, so a string literal is no part of
+     * executable memory. */
+    .rodata : ALIGN(16) {
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
         . = ALIGN(4);

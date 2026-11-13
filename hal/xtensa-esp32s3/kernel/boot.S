@@ -40,7 +40,8 @@
  * `lib.saw`'s `TrapFrame`, whose `static_assert` pins the size.
  *
  * Every `l32r` loads a literal from below it, so each section's literals are
- * declared at its head and `esp32s3.ld` lists `.literal*` ahead of `.text*`.
+ * declared at its head and `esp32s3.ld` lists `.literal*` and `.text*` in one
+ * pattern, so a function follows its literals.
  */
 
     .equ F_PC,          0           /* EPC1: where the context resumes */

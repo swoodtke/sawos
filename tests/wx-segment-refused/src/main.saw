@@ -1,0 +1,121 @@
+// A buffer in memory the process may execute is refused even where the segment
+// is also writable (spec §2.2).
+//
+// Root launches `child-wx-fault` once per role. Its image is linked as one
+// segment that is readable, writable and executable, which the loader accepts,
+// and each role hands the kernel an address in it: a pipe-send body in its
+// code, in its read-only data and in its writable data, and the destination of
+// a `PipeCreate` record, the copy-out door. Each ends the child with
+// `BadBuffer` (status word 131083), read in the §8 status word:
+//
+//   SOS wxseg: a record written into the writable data is refused
+//   SOS wxseg: a body in the code is refused
+//   SOS wxseg: a body in the read-only data is refused
+//   SOS wxseg: a body in the writable data is refused
+//   SOS wxseg: done
+
+import sos.{System, Process, Memory, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 21
+static KEY_DEATH: UInt = 6
+
+/// The roles `child-wx-fault` knows, by the tag of the Event it is given.
+static ROLE_SEND_CODE: UInt = 1
+static ROLE_SEND_RODATA: UInt = 2
+static ROLE_SEND_DATA: UInt = 3
+static ROLE_CREATE_INTO_DATA: UInt = 4
+
+/// What the child may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The §8 status words: `Faulted` in the high half with `BadBuffer` (11) in
+/// the low, and `Exited` with the child's OK code (7).
+static OUTSIDE: UInt = 131083
+static OK: UInt = 65543
+
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+static_assert((1 * 65536) + 7 == 65543,
+              "an exit's status word is Exited in the high bits and the code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS wxseg: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS wxseg: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS wxseg: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    try run_role(&system, &proc, &image, &ram, ROLE_CREATE_INTO_DATA, OUTSIDE)
+    let _ = system.debug_print(
+        "SOS wxseg: a record written into the writable data is refused\n")
+    try run_role(&system, &proc, &image, &ram, ROLE_SEND_CODE, OUTSIDE)
+    let _ = system.debug_print("SOS wxseg: a body in the code is refused\n")
+    try run_role(&system, &proc, &image, &ram, ROLE_SEND_RODATA, OUTSIDE)
+    let _ = system.debug_print(
+        "SOS wxseg: a body in the read-only data is refused\n")
+    try run_role(&system, &proc, &image, &ram, ROLE_SEND_DATA, OUTSIDE)
+    let _ = system.debug_print(
+        "SOS wxseg: a body in the writable data is refused\n")
+    return
+}
+
+/// Launch the child under `role`, wait for it to end and require the status
+/// word `want`.
+func run_role(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+              role: UInt, want: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let mark = try proc.event_create()
+    try child.give(event: move mark, tag: role) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS wxseg: role {} ended with status {}, wanted {}\n",
+                      role, status, want)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

@@ -18,7 +18,7 @@
 
 #include "sos.h"
 
-/* The greeting. `.rodata`, so it rides the image's one R+X segment and the
+/* The greeting. `.rodata`, so it rides the image's read-only segment and the
  * program has no writable data: `.data` and `.bss` are both empty. */
 static const char GREETING[] = "SOS cchild: hello from freestanding C\n";
 

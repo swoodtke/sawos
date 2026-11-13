@@ -1,0 +1,200 @@
+// Test child: an address in one of its own segments handed to the kernel, in
+// the way its boot set's role says (spec §2.2, §2.7).
+//
+// Its launcher gives it a masked System handle as its boot handle and an
+// Event whose tag names the role (and, for role 4, a second Event whose tag is
+// the address). A process's image has three loadable
+// segments, and each role names an address in one of them:
+//
+//   1  `PipeInlet.Post` with a body in this image's code            BadBuffer
+//   2  `PipeInlet.Post` with a body in its read-only data           accepted
+//   3  `PipeInlet.Post` with a body in its writable data            accepted
+//   11 `ThreadCreate` with an entry in its writable data            BadEntry
+//   12 `ThreadCreate` with an entry in its read-only data           BadEntry
+//   13 `ThreadCreate` with an entry in its code                     accepted
+//   14 `ThreadCreate` with an entry at the first address past its code
+//                                                                   BadEntry
+//   4  `PipeInlet.Post` with a body at an address its launcher gave it, as
+//      the tag of a second Event, in memory the launcher mapped into it
+//
+// The kernel faults this process in each role that is a refusal. A kernel that
+// does not lets the call return, and the process exits with a code of its own
+// that the launcher can tell apart from every fault.
+//
+// It works at the C altitude because the buffer and the entry are addresses
+// this program picks, which the typed tier never lets a caller name.
+
+import sos.{System, PIPE_MSG_HANDLES, sos_system_process_self,
+            sos_process_pipe_create, sos_process_thread_create,
+            sos_pipe_inlet_post}
+
+extern "C" {
+    func sos_text_end() -> UInt
+}
+
+static ROLE_SEND_CODE: UInt = 1
+static ROLE_SEND_RODATA: UInt = 2
+static ROLE_SEND_DATA: UInt = 3
+static ROLE_ENTRY_DATA: UInt = 11
+static ROLE_ENTRY_RODATA: UInt = 12
+static ROLE_ENTRY_CODE: UInt = 13
+static ROLE_ENTRY_CODE_END: UInt = 14
+static ROLE_SEND_AT: UInt = 4
+
+/// How this process ends when the kernel answered as the spec says.
+static EXIT_OK: UInt = 7
+/// The call returned where it had to fault.
+static EXIT_SURVIVED: UInt = 99
+/// The boot set held no role.
+static EXIT_NO_ROLE: UInt = 98
+/// A step before the call under test was refused.
+static EXIT_SETUP: UInt = 97
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// A keep mask that keeps every right.
+static KEEP_ALL: UInt = 0xFFFF_FFFF
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// The body's length: one machine word, so it lies in the row at any
+/// word-aligned address in it.
+static BODY_BYTES: UInt = 8
+
+/// Rounds an address down to a doubleword.
+static ALIGN: UInt = 8
+
+/// Writable data.
+unsafe static var WRITABLE: [UInt; 4] = [0; 4]
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        return
+    }
+
+    var role: UInt = 0
+    var arg: UInt = 0
+    var events: Int = 0
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(h) -> {
+                var rec = move h
+                let tag = rec.tag
+                if let ev = rec.take_event() {
+                    let _ = move ev
+                    if events == 0 {
+                        role = tag
+                    } else {
+                        arg = tag
+                    }
+                    events = events + 1
+                }
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    if role == 0 {
+        let _ = proc.exit(EXIT_NO_ROLE)
+        return
+    }
+    let code = act(boot_handle, role, arg)
+    let _ = proc.exit(code)
+}
+
+/// The role's call, answering the exit code of a process the kernel did not
+/// end.
+func act(system: UInt, role: UInt, arg: UInt) unsafe -> UInt {
+    var me: UInt = 0
+    if sos_system_process_self(system, KEEP_ALL,
+                               (&var me) as UnsafePointer<UInt>) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    if role == ROLE_SEND_CODE {
+        return post_from(me, code_address())
+    }
+    if role == ROLE_SEND_AT {
+        return post_from(me, arg)
+    }
+    if role == ROLE_SEND_RODATA {
+        return post_from(me, rodata_address())
+    }
+    if role == ROLE_SEND_DATA {
+        return post_from(me, writable_address())
+    }
+    if role == ROLE_ENTRY_DATA {
+        return create_thread(me, writable_address())
+    }
+    if role == ROLE_ENTRY_RODATA {
+        return create_thread(me, rodata_address())
+    }
+    if role == ROLE_ENTRY_CODE {
+        return create_thread(me, code_address())
+    }
+    if role == ROLE_ENTRY_CODE_END {
+        return create_thread(me, sos_text_end())
+    }
+    EXIT_NO_ROLE
+}
+
+/// Post `BODY_BYTES` bytes from `body` through a pipe of this process's own.
+/// A post the kernel took is `EXIT_OK`.
+func post_from(me: UInt, body: UInt) unsafe -> UInt {
+    var ends: [UInt; 2] = [0; 2]
+    if sos_process_pipe_create(me, (&var ends) as UnsafePointer<UInt>,
+                               (2 * sizeof<UInt>()) as UInt) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var msg: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+    msg[0] = body
+    msg[1] = BODY_BYTES
+    var claim: UInt = 0
+    if sos_pipe_inlet_post(ends[0], (&var msg) as UnsafePointer<UInt>,
+                           (SEND_WORDS * sizeof<UInt>()) as UInt,
+                           (&var claim) as UnsafePointer<UInt>) != STATUS_OK {
+        return EXIT_SURVIVED
+    }
+    EXIT_OK
+}
+
+/// A thread of this process that would start at `entry`, never started. A
+/// thread the kernel made is `EXIT_OK`.
+func create_thread(me: UInt, entry: UInt) unsafe -> UInt {
+    var anchor: UInt = 0
+    // A stack top inside this process's own region: the stack check is not the
+    // one under test.
+    let stack = ((&var anchor) as UnsafePointer<UInt>) as UInt
+    var out: UInt = 0
+    let status = sos_process_thread_create(me, entry, stack, 0,
+                                           (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return EXIT_SURVIVED
+    }
+    EXIT_OK
+}
+
+/// An address in this image's read-only data and one in its writable data.
+func rodata_address() unsafe -> UInt {
+    let literal = "a string literal, which lives in read-only data"
+    let at = literal.c_string()! as UInt
+    at - (at % ALIGN)
+}
+
+func writable_address() unsafe -> UInt {
+    ((&var WRITABLE) as UnsafePointer<UInt>) as UInt
+}
+
+/// A word-aligned address in this image's code: a function's address rounded
+/// down.
+func code_address() unsafe -> UInt {
+    let code: FuncPointer<() sync -> Void> = code_marker
+    let at = code.address() as UInt
+    at - (at % ALIGN)
+}
+
+func code_marker() sync {
+}

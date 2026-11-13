@@ -105,13 +105,13 @@ SECTIONS {
     } > IRAM AT> FLASH
     _iram_load = LOADADDR(.iram) - FLASH_IBUS + FLASH_DBUS;
 
-    /* Every literal pool ahead of every function: `l32r` reaches only
-     * backwards, up to 256 KiB (../ABI.md §1c). The reset path's pool and
-     * code lead so they sit next to `.entry`. */
+    /* Each function beside the literals it loads: `l32r` reaches only
+     * backwards, up to 256 KiB (../ABI.md §1c), so a pool listed ahead of
+     * all the code would put the last functions out of its reach. The reset
+     * path's pool and code lead so they sit next to `.entry`. */
     .text : ALIGN(4) {
         *(.literal.start) *(.text.start)
-        *(.literal .literal.*)
-        *(.text .text.*)
+        *(.literal .literal.* .text .text.*)
     } > FLASH
 
     /* The one section that moves at boot: VMA in DRAM, load image in

@@ -637,6 +637,15 @@ PROCESS_WALK_GATE_PKG = os.path.join(TESTS_DIR, "process-walk-gate")
 CHILD_WALK_IDLE_PKG = os.path.join(TESTS_DIR, "child-walk-idle")
 CHILD_WALK_FAULT_PKG = os.path.join(TESTS_DIR, "child-walk-fault")
 
+# Executable memory is not a buffer, and a thread's entry must be executable
+# (spec §2.2, §2.7). Both cases launch `child-exec-fault`, once per role.
+COPY_FROM_CODE_REFUSED_PKG = os.path.join(TESTS_DIR, "copy-from-code-refused")
+THREAD_ENTRY_NOT_EXEC_PKG = os.path.join(TESTS_DIR, "thread-entry-not-exec")
+CHILD_EXEC_FAULT_PKG = os.path.join(TESTS_DIR, "child-exec-fault")
+MAP_OVER_IMAGE_PKG = os.path.join(TESTS_DIR, "map-over-image")
+WX_SEGMENT_REFUSED_PKG = os.path.join(TESTS_DIR, "wx-segment-refused")
+CHILD_WX_FAULT_PKG = os.path.join(TESTS_DIR, "child-wx-fault")
+
 # Clock and Timer objects. What an object answers and whether a wait parks are
 # separate questions, so they get separate packages: a scheduling bug cannot
 # hide behind an arithmetic one.
@@ -849,6 +858,9 @@ ARCHES = [
         # (`map_target_ok`).
         "pool_base": 0x40280000,
         "pool_len": 0x40000,
+        # A mapping here takes an address of its own, so it meets no row of the
+        # target's image.
+        "map_places": True,
         # The console UART's page, mirroring `hal.DEVICE_GRANT_BASE` / `_LEN`.
         "device_base": 0x09000000,
         "device_len": 0x1000,
@@ -1077,6 +1089,11 @@ def expectations(arch):
         # platform advertised what it can actually deny, and the word is the
         # target's.
         "tier": "Isolated" if arch["tier"] == TIER_ISOLATED else "Flat",
+        # What a `map` over the child's own region answers: where a mapping's
+        # address is its memory's own it is refused over an image row, and where
+        # a mapping has an address of its own it is taken.
+        "own_map": ("taken at an address of its own"
+                    if arch.get("map_places") else "refused with NoResource"),
         "entry": f"0x{arch['root_entry']:0{width}x}",
         "zero": f"0x{0:0{width}x}",
         "one": f"0x{1:0{width}x}",
@@ -1486,7 +1503,7 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": ROOT_PKG,
         "expect_out": ["{banner}",
-                       "root image ok segments={two}",
+                       "root image ok segments={three}",
                        "prio={prio}",
                        # The typed Saw altitude: a method on a handle.
                        "SOS root: hello from U-mode via a System op",
@@ -1885,8 +1902,9 @@ TEST_CASES = [
     #
     # The device window is a device row of the build's region table, minted as
     # an `IoMemory`, drained from the boot set and mapped into the driver by
-    # the driver (spec §2.5). So the transcript shows two segments (code and
-    # data), one boot region, and the driver saying it obtained the window.
+    # the driver (spec §2.5). So the transcript shows three segments (code,
+    # read-only data and data), one boot region, and the driver saying it
+    # obtained the window.
     #
     # These two stay alongside the child versions (`child_echo_ns16550` /
     # `child_echo_pl011` at the end of this file, launched by `driver-child`):
@@ -1906,9 +1924,9 @@ TEST_CASES = [
         "device": True,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
-                       # Two segments: code and data. The device window is a
-                       # region row, not a segment.
-                       "root image ok segments={two}",
+                       # Three segments: code, read-only data and data. The
+                       # device window is a region row, not a segment.
+                       "root image ok segments={three}",
                        # One boot region: the device row. The kernel minted
                        # an IoMemory for it and queued the record the driver
                        # drains.
@@ -1930,7 +1948,7 @@ TEST_CASES = [
         "device": True,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
-                       "root image ok segments={two}",
+                       "root image ok segments={three}",
                        "SOS: boot regions={one}",
                        "SOS: console handover",
                        "SOS echo: window mapped",
@@ -4121,7 +4139,7 @@ TEST_CASES = [
         "device": True,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
-                       "root image ok segments={two}",
+                       "root image ok segments={three}",
                        "SOS: boot regions={three}",
                        "SOS: console handover",
                        "SOS driverchild: created",
@@ -4160,7 +4178,7 @@ TEST_CASES = [
         "device": True,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
-                       "root image ok segments={two}",
+                       "root image ok segments={three}",
                        "SOS: boot regions={three}",
                        "SOS: console handover",
                        "SOS driverchild: created",
@@ -6493,7 +6511,7 @@ TEST_CASES = [
         "device": True,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
-                       "root image ok segments={two}",
+                       "root image ok segments={three}",
                        # Five rows: two image blobs, two destinations, the
                        # device window.
                        "SOS: boot regions={five}",
@@ -6531,7 +6549,7 @@ TEST_CASES = [
         "device": True,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
-                       "root image ok segments={two}",
+                       "root image ok segments={three}",
                        "SOS: boot regions={five}",
                        "SOS: console handover",
                        "SOS uartsvc: created",
@@ -7502,6 +7520,96 @@ TEST_CASES = [
                        "SOS walkgate: a full table refuses both ops with "
                        "NoResource",
                        "SOS walkgate: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A buffer a process hands the kernel may not lie in memory it can
+        # execute. A child is launched once per role and hands a pipe send a
+        # body at an address in its own code (the call ends it with
+        # `BadBuffer`, status word 131083), then in its read-only data and in
+        # its writable data (each sent, and the child exits with its own OK
+        # code). The second row is what the rule leaves alone: the image keeps
+        # read-only data, string literals among it, in a segment of its own,
+        # so the code segment is the only executable one.
+        "name": "copy_from_code_refused",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": COPY_FROM_CODE_REFUSED_PKG,
+        "children": [CHILD_EXEC_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS copyexec: a body in the child's code is refused",
+                       "SOS copyexec: a body in its read-only data is sent",
+                       "SOS copyexec: a body in its writable data is sent",
+                       "SOS copyexec: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A thread's entry must lie in memory the process can execute. A
+        # child is launched once per role and makes a thread of its own with
+        # an entry in its writable data and then in its read-only data (each
+        # ends it with `BadEntry`, status word 131078), then at the first
+        # address past its code (the code row's upper bound excludes it), then
+        # in its code (the thread is made and the child exits with its own OK
+        # code). Every refused address is inside the child's region.
+        "name": "thread_entry_not_exec",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": THREAD_ENTRY_NOT_EXEC_PKG,
+        "children": [CHILD_EXEC_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS entryexec: an entry in the child's writable data "
+                       "is refused",
+                       "SOS entryexec: an entry in its read-only data is "
+                       "refused",
+                       "SOS entryexec: an entry just past its code is refused",
+                       "SOS entryexec: an entry in its code is made",
+                       "SOS entryexec: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A mapping does not cover a row of its target's image or stack. A
+        # launcher keeps the memory it gave `process_create`, so it can map the
+        # child's own region into it; where a mapping's address is its memory's
+        # own that row would lie over the child's code and data. Root maps the
+        # region read-write into one child and read-execute into another: each
+        # map is refused with `NoResource` where addresses are the memory's
+        # own and taken at an address of its own where the target translates.
+        # Either way the child's rules hold: a send from its code ends it with
+        # `BadBuffer` (131083) and a thread entry in its data with `BadEntry`
+        # (131078).
+        "name": "map_over_image_refused",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_OVER_IMAGE_PKG,
+        "children": [CHILD_EXEC_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS mapimg: read-write map: {own_map}",
+                       "SOS mapimg: a send from the child's code is refused",
+                       "SOS mapimg: read-execute map: {own_map}",
+                       "SOS mapimg: an entry in the child's data is refused",
+                       "SOS mapimg: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A buffer in a segment that is writable and executable is refused at
+        # both doors. The child is linked as one such segment (the loader
+        # accepts it), and the destination of a `PipeCreate` record (the
+        # copy-out door) and the bodies of sends from its code, read-only data
+        # and writable data each end it with `BadBuffer` (131083): the segment
+        # is inside the copy-out window, so only its execute permission
+        # refuses the record.
+        "name": "wx_segment_not_buffer",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": WX_SEGMENT_REFUSED_PKG,
+        "children": [CHILD_WX_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS wxseg: a record written into the writable data "
+                       "is refused",
+                       "SOS wxseg: a body in the code is refused",
+                       "SOS wxseg: a body in the read-only data is refused",
+                       "SOS wxseg: a body in the writable data is refused",
+                       "SOS wxseg: done"],
         "expect_clean_exit": True,
     },
 ]

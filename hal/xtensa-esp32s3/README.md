@@ -387,7 +387,7 @@ each.
 
    ```
    SOS M1: kernel up on xtensa (ESP32-S3)
-   SOS: root image ok segments=0x00000002 entry=0x403a043c prio=0x01010100
+   SOS: root image ok segments=0x00000003 entry=<code address> prio=0x01010100
    SOS: console handover
    SOS root: hello from U-mode via a System op
    SOS root: boot handle 1
@@ -398,7 +398,7 @@ each.
    byte store into root's region:
 
    ```
-   SOS: root image ok segments=0x00000002 entry=0x403a043c prio=0x01010100
+   SOS: root image ok segments=0x00000003 entry=<code address> prio=0x01010100
    SOS-S3: kernel fault vector=0x00000300 exccause=0x00000003
      epc1=0x42011863 excvaddr=0x403a0000 depc=0x00000000
    ```

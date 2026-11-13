@@ -294,7 +294,9 @@ import kcore.process.{
     copy_out,
     copy_out_check,
     domain_changed,
+    executable_at,
     free_user_va,
+    meets_image_row,
     record_grant,
     remove_grant,
 }
@@ -1761,12 +1763,12 @@ func waiter_create(p: Int, owner: Int) unsafe -> SyscallResult {
 /// handle goes into the caller `p`'s table (spec §2.7). The owner is charged
 /// against its Thread row and the caller against its `Handle` row.
 ///
-/// The entry and the stack are checked against the owner's granted region,
-/// since that is where the thread runs. Both are caller-checkable (a launcher
-/// knows where the image it launched keeps its stacks), so a bad one
-/// terminates the caller, not the owner, rather than producing a thread that
-/// would fault on its first instruction and take the owner down anyway, with a
-/// worse diagnostic.
+/// The entry must lie in a row of the owner's grants that permits execute, and
+/// the stack in the owner's granted region, since that is where the thread
+/// runs. Both are caller-checkable (a launcher knows where the image it
+/// launched keeps its code and its stacks), so a bad one terminates the caller,
+/// not the owner, rather than producing a thread that would fault on its first
+/// instruction and take the owner down anyway, with a worse diagnostic.
 ///
 /// A `Gone` owner answers `Revoked` (spec §2.10). It is asked before the
 /// entry and the stack are checked: the check needs a body to read the region
@@ -1779,7 +1781,7 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
     }
     let body = body_of(owner)
     let start = if entry == ENTRY_IMAGE { PROCESSES[body].entry } else { entry }
-    if start < PROCESSES[body].region_base || start >= PROCESSES[body].region_top {
+    if not executable_at(owner, start) {
         fault_process(p, FaultReason.BadEntry)
     }
     if stack_top <= PROCESSES[body].region_base || stack_top > PROCESSES[body].region_top {
@@ -2902,6 +2904,12 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
 /// the death. Every fault the caller's own arguments can raise is behind this
 /// line.
 ///
+/// A range that meets a row of the target's image or its stack
+/// (`meets_image_row`) is `NoResource` and installs nothing: where a mapping's
+/// address is its memory's own, a launcher's destination region is the child's
+/// image, and a second row over it would change what the rows already there
+/// mean to the copy doors and the entry check. Mappings may cover one another.
+///
 /// `hal.GRANT_ROW_BUDGET` is what the wall is measured against; the kernel
 /// reads the HAL's number because it is a hardware limit on one target and a
 /// policy one on another. The budget is checked before anything is written,
@@ -2960,6 +2968,13 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     // device row is not asked; its window is the board's, and
     // `device_window_ok` answered for it at the op that named the bounds.
     if not device && not hal.map_target_ok(va_base, va_top) {
+        return op_status(SosStatus.NoResource)
+    }
+    // A mapping does not cover a row of the target's image or its stack. On a
+    // profile where a mapping's address is its memory's own, a launcher's
+    // region is the child's image, and a second row over it would change what
+    // the rows already there mean to the copy doors and the entry check.
+    if meets_image_row(t, va_base, va_top) {
         return op_status(SosStatus.NoResource)
     }
     let slot = alloc_mapping()
