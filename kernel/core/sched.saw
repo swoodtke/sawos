@@ -35,7 +35,7 @@ import kcore.limits.{
     ROOT_PROCESS,
 }
 import kcore.result.{op_status, op_value, write_result}
-import kcore.diag.{ExitCode, console, fatal_kernel}
+import kcore.diag.{ExitCode, console, fatal_deadlock, fatal_kernel}
 import kcore.stats.{stats_read}
 import kcore.pslot.{PROCESSES, PROCESS_RECORDS, ProcessState, QuotaKind,
                     body_of, has_body, unlink_body}
@@ -147,6 +147,16 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     if cur == NO_THREAD {
         return current_frame
     }
+    // The outgoing thread's frame is written below (`fp_switch_out`), so its
+    // slot must still be live: an exiting thread's slot is freed after the
+    // switch (`PENDING_FREE`), never before.
+    match THREADS[cur].state {
+        case Free -> {
+            fatal_kernel("the outgoing slot was freed before the switch",
+                         cur as UInt)
+        },
+        case _ -> {},
+    }
     if stays_running(cur) {
         return current_frame
     }
@@ -169,12 +179,10 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
         // (`has_external_wake_source`), readiness can still arrive from outside
         // the set of runnable threads, so the kernel waits for it in the idle
         // path. With neither, every thread is blocked on something no thread
-        // can now deliver: a deadlock. The process whose thread just blocked
-        // is the one that cannot proceed, so it is the one terminated, and the
-        // machine reschedules. The cascade ends when root dies, which
-        // stops the machine.
+        // can now deliver: a deadlock, which stops the machine. No process is
+        // ended, since which thread blocked last is timing.
         if not has_external_wake_source() {
-            fault_process(THREADS[cur].process, FaultReason.Deadlock)
+            fatal_deadlock()
         }
         idle_until_runnable()
         next = ready_pop()
@@ -203,19 +211,15 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
 /// the thread with it: its slot is freed, or held, `Exited` or invalid, for the
 /// handles still naming it.
 ///
-/// The no-wake-source arm ends root, unlike `pick_next`, which ends the
-/// current process. Here the process that was current is already gone, so
-/// there is nobody to blame: every surviving process is blocked on something no
-/// thread can now deliver. Ending root is a policy (root is init, and ending it
-/// stops the machine), whoever else is in that set. A root parked on its
-/// child's Process handle is woken by the death (`end_process` notifies before
-/// tearing down), so `ready_pop` finds root and this arm is not reached. What
-/// does reach it is a genuine deadlock.
+/// The no-wake-source arm is the same deadlock stop as `pick_next`'s. A root
+/// parked on its child's Process handle is woken by the death (`end_process`
+/// notifies before tearing down), so `ready_pop` finds root and this arm is not
+/// reached. What does reach it is a genuine deadlock.
 func resume_after_death() unsafe -> Never {
     var next = ready_pop()
     if next == NO_THREAD {
         if not has_external_wake_source() {
-            fault_process(ROOT_PROCESS, FaultReason.Deadlock)
+            fatal_deadlock()
         }
         idle_until_runnable()
         next = ready_pop()
@@ -557,10 +561,9 @@ func disown_bound(p: Int) unsafe {
 /// The record stays, `Gone`, for as long as a reference names it.
 ///
 /// `is_caller` says whether `p` owns the running thread or no thread is
-/// running (a fault or an exit is on the caller, spec §2.7, and the deadlock
-/// that ends root is reached with nothing current). Then the running thread is
-/// one of the slots step 1 touches, so nothing is current any more and
-/// `CURRENT_THREAD` and `PENDING_FREE` are cleared. Otherwise `p` is a
+/// running (a fault or an exit is on the caller, spec §2.7). Then the running
+/// thread is one of the slots step 1 touches, so nothing is current any more
+/// and `CURRENT_THREAD` and `PENDING_FREE` are cleared. Otherwise `p` is a
 /// `Created` process that nothing names (`end_unstarted`): it has no thread
 /// that ever ran, the caller's thread stays current and `Running`, and the
 /// teardown leaves the caller's slots alone (`spared`). Clearing

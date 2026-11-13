@@ -9,8 +9,9 @@
 //   SOS: process teardown handles=... threads=1 ...
 //   SOS threadexit: the churn child ended through its last thread
 //   SOS childchurn: parking the main thread
-//   SOS threadexit: the stalled child was ended by a deadlock
-//   SOS threadexit: done
+//   SOS: deadlock: every thread is blocked and nothing can wake one
+//
+// and the machine stops there, with the deadlock exit status.
 //
 // First, root creates a worker and keeps the creator's handle. The worker
 // takes a handle onto itself and exits through it. That handle goes with the
@@ -28,15 +29,14 @@
 // and the teardown line are the process ending cleanly.
 //
 // Fourth, root runs it again in its deadlock role: the child's main thread
-// parks for good and its only other thread exits through its only handle. With
-// nothing left to run the kernel ends the child with a deadlock, naming the
-// process of the thread that just exited. That thread's slot has already lost
-// its last reference, so this shows the free waits for the switch.
+// parks for good and its only other thread exits through its only handle, while
+// root waits on the child with no timeout. Nothing is left to run and nothing
+// can wake a thread, so the kernel stops the machine. This is the last phase,
+// since nothing runs after the stop.
 
 import sos.{System, Process, Memory, Thread, SystemRight, SosStatus,
             WaitPayload}
 
-static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 /// Root's config: the tag the child's boot record travels under.
@@ -52,11 +52,8 @@ static CODE_KEPT: UInt = 71
 /// How many churn workers root makes: more than the slab has room for.
 static WORKERS: UInt = 20
 
-/// The deadlock role's tag, and the §8 status word of a process the kernel
-/// ended with a deadlock: the `Faulted` kind in the high half, the reason in
-/// the low.
+/// The deadlock role's tag.
 static TAG_DEADLOCK: UInt = 40
-static DEADLOCKED: UInt = (2 << 16) + 7
 
 /// The churn child's exit code, from its last thread, and the kind half of a
 /// §8 status word for a process that exited.
@@ -133,8 +130,9 @@ func initial(boot: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let _ = system.debug_print("SOS threadexit: done\n")
-    let _ = system.shutdown(EXIT_OK)
+    // The last phase ends in the deadlock stop, so reaching here is the bug.
+    let _ = system.debug_print("SOS threadexit: the machine did not stop\n")
+    let _ = system.shutdown(EXIT_FAILED)
 }
 
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
@@ -215,8 +213,8 @@ func child(system: &System, proc: &Process, image: &Memory,
 }
 
 /// Run `child-churn` in its deadlock role: its main thread parks for good and
-/// its only other thread exits, so the kernel ends the child with a deadlock.
-/// The ending is the child's, so root goes on.
+/// its only other thread exits, while root waits on the child. The kernel stops
+/// the machine, so the wait does not return.
 func stalled(system: &System, proc: &Process, image: &Memory,
              ram: &Memory) -> Result<Void, SosStatus> {
     let c = try system.process_create(image: &image, memory: &ram)
@@ -238,20 +236,7 @@ func stalled(system: &System, proc: &Process, image: &Memory,
     }
     try c.start(boot_tag: TAG_BOOT)
 
-    let ended = try waiter.wait()
-    if ended.key != KEY_CHILD {
-        return BUG
-    }
-    match ended.what {
-        case Process(status) -> {
-            if status != DEADLOCKED {
-                print("SOS threadexit: the child ended {}\n", status)
-                return BUG
-            }
-        },
-        case _ -> { return BUG },
-    }
-    let _ = system.debug_print(
-        "SOS threadexit: the stalled child was ended by a deadlock\n")
-    return
+    let _ = try waiter.wait()
+    // Returning from the wait is the bug: nothing can wake this thread.
+    return BUG
 }

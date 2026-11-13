@@ -766,7 +766,8 @@ a reply delivery carries, which is why there is one type and not two — and
   wait-once death supervisor all stop owing a trailing `remove`. **The footgun
   is stated rather than guarded**: attach one-shot, take the delivery, and
   wait again on a Waiter with nothing left attached, and the thread parks
-  forever — which the deadlock report names, as it does for any empty Waiter.
+  forever — a deadlock (§7) when nothing else can wake it, as for any empty
+  Waiter.
   **An op that consumes its object detaches it implicitly, and must**:
   `PipeReplyOp.Resolve` and `PipeRequestOp.Reply` destroy the caller's entry,
   and an attachment is a counted reference, so without the implicit detach the
@@ -3044,15 +3045,21 @@ mode only. The harness kernels that test the tick and timers arm their own.
   armed Timer (an unarmed Timer is not one: it will never fire) — and reports
   deadlock otherwise (§9). The tick is not such a source: with every thread
   blocked and nothing bound or armed, the machine is deadlocked whether or not
-  a tick is running.
-- **Who a deadlock ends.** The process ended is the one whose thread left the
-  processor last, by blocking or by exiting. When the deadlock is found after a
-  process's death, with no thread left current, the process ended is root. Under
-  the tick the order in which threads block is not fixed: a process waiting on a
-  stalled one can be preempted into blocking after the stalled one's last thread
-  has gone, so the process ended can be the waiter rather than the stalled one,
-  and if that is root the machine stops. The rule says when a deadlock is
-  reported, not which process is the right one to end.
+  a tick is running. The test is made again whenever the idle finds nothing
+  runnable after a delivery, so the last source going without waking anybody
+  (a one-shot Timer that fires with nothing attached to it) is a deadlock at
+  that moment, not a sleep for good.
+- **A deadlock stops the machine.** The kernel writes one console line,
+  `SOS: deadlock: every thread is blocked and nothing can wake one`, and stops
+  with its own failing exit status, distinct from a process fault's. It ends no
+  process, tears nothing down and attempts no recovery: on a system this small
+  a deadlock is a design error, and which process to end would be a guess,
+  since which thread blocked last depends on when the tick fell. The line names
+  no process for the same reason, so the outcome is the same with the tick
+  armed and without it. A process blocked while others can still run is not a
+  deadlock and is not touched. A supervisor that wants to outlive a child that
+  never finishes waits with a Timer armed, which also keeps the state from
+  being a deadlock.
 - **The tick does not stop when the machine idles.** While nothing is runnable
   the kernel keeps taking the tick, at the same period. A tick taken then has
   no running thread to charge, so it raises no reschedule. Stopping the tick
@@ -3225,9 +3232,10 @@ counters in its body's row until a create reuses the body.
   and one parked on a dead child was already woken.
 - **`process.get_status()`**, gated on the wait right: one fixed-width status
   word — kind in the high bits (`Exited | Faulted | Killed`), code in the low
-  bits (exit code, or a fault-cause tag). The kernel's fault report prints the
-  faulting PC and address on the console (`epc=`, `tval=`); fault forensics a
-  supervisor can read is a later design.
+  bits (exit code, or a fault-cause tag; a deadlock ends no process and is
+  not one). The kernel's fault report prints the faulting PC and address on the
+  console (`epc=`, `tval=`); fault forensics a supervisor can read is a later
+  design.
 - **`process.kill()`**, gated on a kill right. Cooperative-first
   teardown stays the norm; kill is the capability-gated escape hatch
   that makes userspace supervision real against wedged/hostile
@@ -3277,8 +3285,9 @@ counters in its body's row until a create reuses the body.
   is a denial of the device with no diagnostic. What a driver controls is its
   own device's interrupt-enable register, through the window it was granted.
 - **An interrupt line is readiness from outside the thread set**, so a bound
-  line keeps "nothing runnable" from being a deadlock (§7). The kernel idles
-  by parking the core and polling rather than by taking the trap.
+  line keeps "nothing runnable" from being a deadlock (§7), for as long as it
+  stays bound. The kernel idles by parking the core and polling rather than by
+  taking the trap.
 - **The interrupt seam.** Each HAL exposes a small set of names and the kernel
   reaches interrupts through those and nothing else — among them `intc_init`,
   `is_interrupt`, `irq_line_valid`, `irq_claim`/`irq_complete`,
@@ -3552,10 +3561,11 @@ loader parses and reports while no process stores either.
 
 **Known limits.**
 
-- Which process a deadlock ends is the one whose thread left the processor last
-  (§7), and under the tick that order is not fixed. A process waiting on a
-  stalled one can be the one ended, and if it is root the machine stops where an
-  untimed scheduler would have ended the stalled process and carried on.
+- A deadlock is not recovered from (§7): the machine stops and no process is
+  ended for it, so a supervisor waiting without a timeout on a child that
+  blocks forever, with no bound line and no armed Timer, stops the machine
+  rather than carrying on. A process stuck while others can still run is not a
+  deadlock and is not touched; it holds what it holds until something ends it.
 - On a part without atomic instructions (the ESP32-C3), word atomics in a
   user process, `sosrt`'s bump arena cursor among them, are plain
   read-modify-write libcalls, so under the tick (§7) two threads of one

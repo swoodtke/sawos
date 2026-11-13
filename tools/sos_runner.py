@@ -150,6 +150,10 @@ RV32_VIRT_MODULE = f"rv32virt={os.path.join(HAL_DIR, 'riscv32', 'kernel')}"
 # checked. Kept in step with that enum.
 EXIT_PROCESS_FAULT = 5
 
+# `ExitCode.Deadlock` in kernel/core/diag.saw: what the machine exits with when
+# every thread is blocked and nothing can wake one. Kept in step with that enum.
+EXIT_DEADLOCK = 7
+
 # `AbortCode.NoMemory` in rt/common/src/lib.saw: what the runtime stops the
 # machine with when the bump arena cannot serve a request. Deliberately
 # different from the kernel's exit codes, so a transcript can tell "the program
@@ -195,7 +199,8 @@ UART_ECHO_NS16550_PKG = os.path.join(TESTS_DIR, "uart-echo-ns16550")
 UART_ECHO_PL011_PKG = os.path.join(TESTS_DIR, "uart-echo-pl011")
 IRQ_BADLINE_PKG = os.path.join(TESTS_DIR, "irq-badline")
 IRQ_EARLYACK_PKG = os.path.join(TESTS_DIR, "irq-earlyack")
-# With no line bound, "nothing runnable" is still reported as a deadlock.
+# With no line bound, "nothing runnable" is still a deadlock, and it stops the
+# machine.
 WAIT_DEADLOCK_PKG = os.path.join(TESTS_DIR, "wait-deadlock")
 # The process cases use one claim per image, so a bug in the reload cannot hide
 # behind a load that happened to work. The child packages are Blade packages
@@ -388,6 +393,12 @@ DEATH_NOTIFY_PKG = os.path.join(TESTS_DIR, "death-notify")
 DEATH_FAULT_PKG = os.path.join(TESTS_DIR, "death-fault")
 DEATH_LATE_ATTACH_PKG = os.path.join(TESTS_DIR, "death-late-attach")
 CHILD_BYE_PKG = os.path.join(TESTS_DIR, "child-bye")
+# A deadlock found after a process's death: root waits on an Event nobody
+# signals while `child-bye` exits.
+DEADLOCK_AFTER_DEATH_PKG = os.path.join(TESTS_DIR, "deadlock-after-death")
+# A deadlock that arises while the kernel idles: the last wake source, a
+# one-shot Timer nobody holds, runs down without waking anybody.
+DEADLOCK_FROM_IDLE_PKG = os.path.join(TESTS_DIR, "deadlock-from-idle")
 
 # The driver child, shared memory, and the exec gate. A rights refusal and a
 # bad-argument refusal are both faults, so the two exec-gate claims cannot share
@@ -1915,16 +1926,121 @@ TEST_CASES = [
         # that stopped answering immediately would park the only thread in the
         # system, and this is the report that makes that fail in microseconds
         # rather than at the timeout.
+        #
+        # The report names no process and the machine stops with its own exit
+        # status: a deadlock ends nothing.
         "name": "wait_deadlock",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": WAIT_DEADLOCK_PKG,
         "expect_out": ["{banner}",
                        "SOS deadlock: waiting for a signal nobody sends",
-                       "SOS: process fault: every thread blocked",
-                       "SOS: process teardown handles={six} threads={one} "
-                       "events={one} waiters={one} interrupts={zero}"],
+                       "SOS: deadlock: every thread is blocked and nothing "
+                       "can wake one"],
         "expect_clean_exit": False,
-        "expect_status": EXIT_PROCESS_FAULT,
+        "expect_status": EXIT_DEADLOCK,
+    },
+    {
+        # `wait_deadlock` with the scheduler tick armed. The tick is not a wake
+        # source, so the state is still a deadlock with the tick running: the
+        # same report and the same exit status. A kernel that counted the tick
+        # as a wake source would idle here until the harness timeout.
+        "name": "wait_deadlock_tick",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "tick": True,
+        "root_pkg": WAIT_DEADLOCK_PKG,
+        "expect_out": ["{banner}",
+                       "SOS deadlock: waiting for a signal nobody sends",
+                       "SOS: deadlock: every thread is blocked and nothing "
+                       "can wake one"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_DEADLOCK,
+    },
+    {
+        # A deadlock found after a process's death. Root attaches an Event
+        # nobody signals to a Waiter, starts `child-bye` and waits on the
+        # Waiter, not on the child, with no Timer armed and no line bound. The
+        # child runs and exits, its process is torn down, and with no thread
+        # current and none runnable the kernel stops at the deadlock from the
+        # path that resumes after a death. Root's one line precedes the start,
+        # so the order below is fixed.
+        "name": "deadlock_after_death",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLOCK_AFTER_DEATH_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS deadafter: waiting, nothing signals",
+                       "SOS bye: exiting",
+                       "SOS: process exit: code={five} process={one}",
+                       "SOS: process teardown handles={two} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS: deadlock: every thread is blocked and nothing "
+                       "can wake one"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_DEADLOCK,
+    },
+    {
+        # `deadlock_after_death` with the tick armed. Root can now be preempted
+        # between starting the child and waiting, so the child may exit while
+        # root is still runnable, and the deadlock is then found when root
+        # blocks rather than after the death. Either path may find the deadlock
+        # in principle and nothing here asserts which one did; the transcript
+        # is the same either way. `wait_deadlock_tick` is the case that
+        # reaches `pick_next`'s arm under the tick.
+        "name": "deadlock_after_death_tick",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "tick": True,
+        "root_pkg": DEADLOCK_AFTER_DEATH_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS deadafter: waiting, nothing signals",
+                       "SOS bye: exiting",
+                       "SOS: process exit: code={five} process={one}",
+                       "SOS: process teardown handles={two} threads={one} "
+                       "events={zero} waiters={zero} interrupts={zero} "
+                       "timers={zero} process={one}",
+                       "SOS: deadlock: every thread is blocked and nothing "
+                       "can wake one"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_DEADLOCK,
+    },
+    {
+        # A deadlock that arises while the kernel idles. Root waits on a Waiter
+        # holding an Event nobody signals, with a one-shot Timer armed that no
+        # Waiter holds. The armed Timer is a wake source, so the kernel idles;
+        # the Timer fires, disarms itself and wakes nobody, and nothing can wake
+        # a thread any more. The idle asks again after the delivery and stops
+        # the machine. A kernel that decided once, before idling, would sleep
+        # until the harness timeout. The delay is short and only the arrival of
+        # the report is asserted, never how long it took.
+        "name": "deadlock_from_idle",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEADLOCK_FROM_IDLE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS idledead: waiting while a timer nobody holds runs "
+                       "down",
+                       "SOS: deadlock: every thread is blocked and nothing "
+                       "can wake one"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_DEADLOCK,
+    },
+    {
+        # `deadlock_from_idle` with the tick armed: the tick is not a wake
+        # source, so the ticks taken while idling change nothing and the same
+        # report and status arrive.
+        "name": "deadlock_from_idle_tick",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "tick": True,
+        "root_pkg": DEADLOCK_FROM_IDLE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS idledead: waiting while a timer nobody holds runs "
+                       "down",
+                       "SOS: deadlock: every thread is blocked and nothing "
+                       "can wake one"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_DEADLOCK,
     },
     # --- the Clock and Timer objects -----------------------------------------
     # A process can sleep: without a Timer, every wake comes from a thread or
@@ -2041,12 +2157,10 @@ TEST_CASES = [
         "root_pkg": TIMER_DEADLOCK_PKG,
         "expect_out": ["{banner}",
                        "SOS timerdead: waiting on a timer nobody armed",
-                       "SOS: process fault: every thread blocked",
-                       "SOS: process teardown handles={seven} threads={one} "
-                       "events={zero} waiters={one} interrupts={zero} "
-                       "timers={one}"],
+                       "SOS: deadlock: every thread is blocked and nothing "
+                       "can wake one"],
         "expect_clean_exit": False,
-        "expect_status": EXIT_PROCESS_FAULT,
+        "expect_status": EXIT_DEADLOCK,
     },
     {
         # A clock domain this kernel cannot name. `ClockType` is raw-backed so
@@ -3773,7 +3887,7 @@ TEST_CASES = [
         # Process handle to a Waiter and parks on it with no timer armed, so
         # the only thing in the machine that can make root runnable again is the
         # child ending. A kernel that failed to notify would leave nothing
-        # runnable and the run would die with `every thread blocked`; the
+        # runnable and the run would end at the deadlock stop; the
         # failure is loud, which makes a plain `wait()` an assertion.
         #
         # The order of the last three lines is the claim. The kernel notifies
@@ -4743,8 +4857,8 @@ TEST_CASES = [
         # child reads as that choice. The fault comes before the reply is
         # written or the child parks, so the last row is again the claim's
         # `PeerClosed`; a gate that let the op through would write the reply
-        # and park the child on its empty Waiter, which dies of the deadlock
-        # rule instead.
+        # and park the child on its empty Waiter, which stops the machine at
+        # the deadlock instead.
         "name": "pipe_reply_wait_narrowed",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PIPE_REPLY_WAIT_NARROWED_PKG,
@@ -4771,8 +4885,8 @@ TEST_CASES = [
         # The last row is the teardown's decision seen from the other end: the
         # claim died with the child, so root's reply through the obligation it
         # kept answers `PeerClosed`. A gate that let the resolve through would
-        # park the child on a question nobody answers, and it would die of the
-        # deadlock rule instead, a different fault.
+        # park the child on a question nobody answers, and the machine would
+        # stop at the deadlock instead.
         "name": "pipe_resolve_narrowed",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PIPE_RESOLVE_NARROWED_PKG,
@@ -5404,7 +5518,7 @@ TEST_CASES = [
         #
         # The empty Waiter is the assertion. Nothing is attached to the Waiter
         # the op is handed, so a park would have nothing to wake it and the
-        # case would end `every thread blocked`, `wait_deadlock`'s own report.
+        # case would end at the deadlock stop, `wait_deadlock`'s own report.
         # Reaching `done` is the proof that no park happened.
         #
         # `reply` and `reply_wait` are `consumes` methods, so a second use
@@ -5888,12 +6002,11 @@ TEST_CASES = [
         # Thread quota of four (`churned 8`), then ends its process by exiting
         # its last thread; the exit line carries its code and the teardown line
         # follows. A second `child-churn`, in its deadlock role, parks its main
-        # thread and lets its only other thread exit through its only handle:
-        # nothing can run, so the kernel ends that child with a deadlock. The
-        # report reads the exiting thread's process after the exit has dropped
-        # the last reference, so the slot must outlive the drop until the
-        # switch; a slot freed at the drop would blame process zero, which is
-        # root, and stop the machine.
+        # thread and lets its only other thread exit through its only handle,
+        # while root waits on it with no timeout: nothing can run and nothing
+        # can wake a thread, so the kernel stops the machine with its deadlock
+        # report and exit status. That is the last phase, as nothing runs after
+        # the stop.
         "name": "thread_exit",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": THREAD_EXIT_PKG,
@@ -5910,12 +6023,10 @@ TEST_CASES = [
                        "SOS threadexit: the churn child ended through its last "
                        "thread",
                        "SOS childchurn: parking the main thread",
-                       "SOS: process fault: every thread blocked "
-                       "process={one}",
-                       "SOS threadexit: the stalled child was ended by a "
-                       "deadlock",
-                       "SOS threadexit: done"],
-        "expect_clean_exit": True,
+                       "SOS: deadlock: every thread is blocked and nothing "
+                       "can wake one"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_DEADLOCK,
     },
     {
         # A Waiter and a Timer are givable (spec 3) and a message may carry

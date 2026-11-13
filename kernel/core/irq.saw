@@ -12,7 +12,7 @@
 
 import hal
 import kcore.limits.{MAX_INTERRUPTS, MAX_TIMERS, NO_INTERRUPT, NO_THREAD}
-import kcore.diag.{console}
+import kcore.diag.{console, fatal_deadlock}
 import kcore.threads.{
     CURRENT_THREAD,
     NEED_RESCHED,
@@ -379,8 +379,8 @@ func idle_poll() unsafe {
 /// An armed timer counts and a merely existing one does not: a disarmed Timer
 /// will never fire, so a system holding only those is as deadlocked as one
 /// holding none. Counting a sleeping process (one that armed a timer and
-/// parked) as a deadlock would terminate exactly the program that works; the
-/// other error turns a real deadlock into a harness timeout.
+/// parked) as a deadlock would stop the machine on exactly the program that
+/// works; the other error turns a real deadlock into a harness timeout.
 ///
 /// A supervisor attached to a Process adds no arm. A process death arrives from
 /// inside the thread set (some syscall or fault of that process caused it, so
@@ -432,6 +432,14 @@ public(package) func has_external_wake_source() unsafe -> Bool {
 /// back to sleep, which is why the test is on the queue rather than on "an
 /// interrupt happened".
 ///
+/// The callers ask `has_external_wake_source` before they start, but the answer
+/// can change while the kernel idles: a one-shot Timer that fires disarms
+/// itself, and if nobody was parked on it nothing becomes runnable. So each
+/// time a delivery returns with the queue still empty the question is asked
+/// again, and a "no" is a deadlock (the machine stops). The check sits after
+/// `idle_poll` has returned, so a delivery's wake has already been pushed
+/// onto the queue and a wake in progress is never mistaken for none.
+///
 /// No preemption point: this loop is delivery, and the bounded scans beside it
 /// (`has_external_wake_source`) are `MAX_INTERRUPTS` + `MAX_TIMERS` iterations
 /// of O(1) work.
@@ -439,6 +447,9 @@ public(package) func idle_until_runnable() unsafe {
     while READY_HEAD == 0 {
         hal.wait_for_irq()
         idle_poll()
+        if READY_HEAD == 0 && not has_external_wake_source() {
+            fatal_deadlock()
+        }
     }
 }
 

@@ -1,0 +1,115 @@
+// A deadlock found after a process's death (spec §7).
+//
+// Expected transcript:
+//
+//   SOS deadafter: waiting, nothing signals
+//   SOS bye: exiting                              <- the child's last word
+//   SOS: process exit: code=5 process=1
+//   SOS: process teardown ... process=1
+//   SOS: deadlock: every thread is blocked and nothing can wake one
+//
+// Root attaches an Event nobody holds to a Waiter, starts `child-bye` and
+// waits on that Waiter. It does not attach the child's Process handle, so the
+// child's death wakes nobody. The child runs and exits, its process is torn
+// down, and no thread is runnable with no bound line and no armed Timer: the
+// kernel stops the machine.
+//
+// Without the tick, root blocks before the child runs, so the deadlock is found
+// when the child's process has ended and no thread is current. With it, root
+// can be preempted between the start and the wait, the child can exit first,
+// and the deadlock is found when root blocks. The transcript is the same
+// either way, because root prints before it starts the child and nothing after.
+
+import sos.{System, Process, Memory, BootHandle, SystemRight}
+
+static EXIT_FAILED: UInt = 1
+
+static KEY: UInt = 1
+
+/// Root's config: the tag the child's System handle travels under.
+static TAG_BOOT: UInt = 21
+
+/// What the child may ask its System object for: print, learn its own Process
+/// object, and be given the handle (`Transfer`).
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS deadafter: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    var image = try proc.boot_handle_next() catch {
+        print("SOS deadafter: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest = try proc.boot_handle_next() catch {
+        print("SOS deadafter: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image_mem = image.take_memory() else {
+        let _ = system.debug_print("SOS deadafter: image is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest_mem = dest.take_memory() else {
+        let _ = system.debug_print("SOS deadafter: dest is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let child = try system.process_create(image: &image_mem,
+                                          memory: &dest_mem) catch {
+        print("SOS deadafter: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS deadafter: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let event = try proc.event_create() catch {
+        print("SOS deadafter: no event: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(&event, KEY) catch {
+        print("SOS deadafter: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+        print("SOS deadafter: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS deadafter: give failed: {}\n", error.0)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The one line root prints, before the child exists as a running process,
+    // so no scheduling order can move it.
+    let _ = system.debug_print("SOS deadafter: waiting, nothing signals\n")
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS deadafter: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // Does not return: nothing signals the Event, and the child's death is not
+    // attached.
+    let _ = waiter.wait()
+
+    let _ = system.debug_print("SOS deadafter: woke, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

@@ -1,0 +1,74 @@
+// A deadlock that arises while the kernel idles (spec §7).
+//
+// Expected transcript:
+//
+//   SOS idledead: waiting while a timer nobody holds runs down
+//   SOS: deadlock: every thread is blocked and nothing can wake one
+//
+// Root attaches an Event nobody signals to a Waiter and arms a one-shot Timer
+// that it does not attach to anything. When root waits, nothing is runnable but
+// the armed Timer is a wake source, so the kernel idles. The Timer fires,
+// disarms itself and wakes nobody: nothing is runnable, no line is bound and
+// no Timer is armed. The kernel asks again after that delivery and stops.
+//
+// The delay is short and the case asserts only that the report arrives, never
+// how long it took.
+
+import sos.{System, Process, Clock, ClockType, Event, Timer, Waiter}
+
+static KEY: UInt = 1
+
+static EXIT_FAILED: UInt = 1
+
+/// Two milliseconds, long enough that the wait parks first.
+static DELAY_NS: UInt64 = 2_000_000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS idledead: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS idledead: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let waiter = try proc.waiter_create() catch {
+        print("SOS idledead: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let event = try proc.event_create() catch {
+        print("SOS idledead: no event: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(&event, KEY) catch {
+        print("SOS idledead: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let timer = try clock.timer_create() catch {
+        print("SOS idledead: no timer: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try timer.arm(after_ns: DELAY_NS) catch {
+        print("SOS idledead: arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let _ = system.debug_print(
+        "SOS idledead: waiting while a timer nobody holds runs down\n")
+
+    // Does not return: the Timer is not attached, so its fire wakes nobody.
+    let _ = waiter.wait()
+
+    let _ = system.debug_print("SOS idledead: woke, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

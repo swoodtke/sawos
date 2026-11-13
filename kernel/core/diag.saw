@@ -3,7 +3,8 @@
 //! The formatting half of a diagnostic (a string one scalar at a time, a
 //! machine word as fixed-width hex) plus the reports that stop the machine:
 //! `fatal` for a trap the kernel cannot survive, `fatal_kernel` for a broken
-//! kernel invariant and `fatal_image` for a root image it refuses to boot.
+//! kernel invariant, `fatal_image` for a root image it refuses to boot and
+//! `fatal_deadlock` for a system that can make no more progress.
 //!
 //! It calls nothing in the kernel, which is what lets every other seam report.
 //! The reports that tear a process down are not here: they own kernel state and
@@ -122,6 +123,10 @@ public enum ExitCode: UInt {
     /// is a separate number from `BadImage` because the two say opposite things
     /// about who is at fault.
     case KernelBug = 6,
+    /// Every thread is blocked and nothing outside the thread set can wake one
+    /// (spec §7). The system's design is at fault, not a process, so no
+    /// process is ended and none is named.
+    case Deadlock = 7,
 }
 
 // =============================================================================
@@ -164,6 +169,19 @@ public func fatal_kernel(reason: String, detail: UInt) {
     uart.write_hex(detail)
     uart.write_str(")\n")
     hal.exit_fail(ExitCode.KernelBug as UInt)
+}
+
+/// Stop: every thread is blocked and nothing can wake one. Never returns.
+///
+/// The report names no process. Which thread blocked last is an accident of
+/// scheduling, so a line that carried it would differ from run to run, and the
+/// kernel attempts no recovery: nothing is ended and nothing is torn down. The
+/// exit code is its own, so a harness tells this stop from a process fault.
+public func fatal_deadlock() {
+    let uart = console()
+    uart.write_str("SOS: deadlock: every thread is blocked and nothing can ")
+    uart.write_str("wake one\n")
+    hal.exit_fail(ExitCode.Deadlock as UInt)
 }
 
 /// Reject the root image. Never returns.
