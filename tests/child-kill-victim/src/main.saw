@@ -1,0 +1,140 @@
+// Test child: a kill target in the state its role names, for `kill_churn` and
+// `kill_runnable`.
+//
+// The launcher gives it a role (an Event whose word is the role) as its first
+// boot record and, for the role that needs one, an inlet after it. Every role
+// but `BYE` ends only by a kill. A role whose wait or call returns says so on
+// the console and exits with `EXIT_WOKE`, which no kill produces.
+//
+//   SPIN    loop with no system call
+//   PARK    park on a Waiter whose Event nothing signals
+//   SLEEP   park on a Waiter with a one-shot Timer armed an hour out
+//   CALL    call through the given inlet, whose server never takes
+//   BYE     exit with `BYE_CODE`
+//
+// A role makes a fixed number of system calls before it holds still, and the
+// last of them is the one that parks it (SPIN has no such call: it holds
+// still once its boot records are read). The launcher reads the count through
+// `Process.stats` and waits for it, so the numbers are in the launcher's
+// package beside the roles' names.
+
+import sos.{System, Process, ClockType, PipeInlet, PIPE_BODY_BYTES}
+
+static ROLE_SPIN: UInt = 1
+static ROLE_PARK: UInt = 2
+static ROLE_SLEEP: UInt = 3
+static ROLE_CALL: UInt = 4
+static ROLE_BYE: UInt = 9
+
+static BYE_CODE: UInt = 0x33
+
+static EXIT_SETUP: UInt = 90
+static EXIT_WOKE: UInt = 91
+
+static KEY_IDLE: UInt = 1
+static KEY_SLEEP: UInt = 2
+
+/// An hour, for a Timer that must not fire while the case runs.
+static HOUR_NS: UInt64 = 3_600_000_000_000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS victim: no process handle\n")
+        while { }
+    }
+    var rec = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    guard let told = rec.take_event() else {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let role = try told.receive() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let _ = move told
+
+    if role == ROLE_SPIN {
+        while { }
+    } else if role == ROLE_PARK {
+        park_forever(&system, &proc)
+    } else if role == ROLE_SLEEP {
+        sleep_forever(&system, &proc)
+    } else if role == ROLE_CALL {
+        call_forever(&system, &proc)
+    } else if role == ROLE_BYE {
+        let _ = proc.exit(BYE_CODE)
+    } else {
+        let _ = proc.exit(EXIT_SETUP)
+    }
+}
+
+func park_forever(system: &System, proc: &Process) {
+    let never = try proc.event_create() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let idle = try proc.waiter_create() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    try idle.add(event: &never, key: KEY_IDLE) catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let _ = idle.wait()
+    let _ = system.debug_print("SOS victim: a park returned\n")
+    let _ = proc.exit(EXIT_WOKE)
+}
+
+func sleep_forever(system: &System, proc: &Process) {
+    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let timer = try clock.timer_create() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let _ = move clock
+    let nap = try proc.waiter_create() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    try nap.add(timer: &timer, key: KEY_SLEEP) catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    try timer.arm(after_ns: HOUR_NS) catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let _ = nap.wait()
+    let _ = system.debug_print("SOS victim: a sleep returned\n")
+    let _ = proc.exit(EXIT_WOKE)
+}
+
+func call_forever(system: &System, proc: &Process) {
+    var rec = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    guard let inlet = rec.take_inlet() else {
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    call_once(&system, &proc, &inlet)
+}
+
+/// One fused call that must never come back: its server never takes.
+func call_once(system: &System, proc: &Process, inlet: &PipeInlet) {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = 7
+    let _ = inlet.send(&body, 1)
+    let _ = system.debug_print("SOS victim: a call returned\n")
+    let _ = proc.exit(EXIT_WOKE)
+}

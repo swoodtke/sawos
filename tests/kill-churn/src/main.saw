@@ -1,0 +1,219 @@
+// Create, start, kill and release a child, over and over, with the scheduler
+// tick on.
+//
+// Each round launches `child-kill-victim` in one of four states, rotating:
+// spinning, parked on an Event, asleep on a Timer, and parked in a call on a
+// pipe root made for the round. Root yields until the child's system-call
+// count reaches the number its role makes before it holds still (the count is
+// the kernel's, exact for a program path, and a slow machine only makes root
+// yield longer), kills it, checks the word, and releases the child's handle
+// and the round's outlet. Every create, pipe and give must succeed: a body,
+// record, thread, Waiter, Timer, Event, pipe or handle the teardown failed to
+// return would run a slab dry within a few rounds.
+//
+//   SOS killchurn: 200 rounds, every create succeeded
+//   SOS killchurn: a new child runs to its exit
+//   SOS killchurn: done
+
+import sos.{System, Process, Memory, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+
+/// The tags and roles `child-kill-victim` knows.
+static TAG_ROLE: UInt = 40
+static TAG_INLET: UInt = 41
+static ROLE_SPIN: UInt = 1
+static ROLE_PARK: UInt = 2
+static ROLE_SLEEP: UInt = 3
+static ROLE_CALL: UInt = 4
+static ROLE_BYE: UInt = 9
+
+/// The system calls a victim makes before it holds still, by role.
+static HELD_SPIN: UInt64 = 4
+static HELD_PARK: UInt64 = 8
+static HELD_SLEEP: UInt64 = 11
+static HELD_CALL: UInt64 = 6
+
+static KEY_DEATH: UInt = 6
+
+/// A killed word: `Killed` (3) in the high half over the code. Each round
+/// kills with the code `CODE_BASE` plus its number.
+static KILLED_KIND: UInt = 3
+static KIND_SHIFT: UInt = 16
+static CODE_BASE: UInt = 0x100
+
+/// An exited word: `Exited` (1) in the high half over the victim's `BYE_CODE`.
+static BYE_EXITED: UInt = 65587
+static_assert((1 * 65536) + 0x33 == 65587,
+              "an exited word is Exited over the code")
+
+static ROUNDS: Int = 200
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer | SystemRight.ClockGet)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS killchurn: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS killchurn: refused: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS killchurn: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let img = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    var round = 0
+    while round < ROUNDS {
+        try one_round(&system, &proc, &img, &ram, round) catch {
+            print("SOS killchurn: round {} refused: {}", round, error)
+            return error
+        }
+        round = round + 1
+    }
+    print("SOS killchurn: {} rounds, every create succeeded", ROUNDS)
+
+    let next = try launch(&system, &proc, &img, &ram, ROLE_BYE)
+    try ended_with(&proc, &next, BYE_EXITED)
+    print("SOS killchurn: a new child runs to its exit")
+    return
+}
+
+/// One victim, killed in the state this round's number names.
+func one_round(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+               round: Int) -> Result<Void, SosStatus> {
+    let role = ((round % 4) as UInt) + 1
+    let child = try system.process_create(image: &img, memory: &ram)
+    try tell(&proc, &child, role)
+    if role == ROLE_CALL {
+        let pair = try proc.pipe_create()
+        let (inlet, outlet) = move pair
+        try child.give(inlet: move inlet, tag: TAG_INLET) catch {
+            let (why, back) = move error
+            let _ = move back
+            return why
+        }
+        try give_boot(&system, &child)
+        try child.start(boot_tag: TAG_BOOT)
+        try settle(&proc, &child, held(role))
+        try kill_and_check(&child, round)
+        let _ = move outlet
+    } else {
+        try give_boot(&system, &child)
+        try child.start(boot_tag: TAG_BOOT)
+        try settle(&proc, &child, held(role))
+        try kill_and_check(&child, round)
+    }
+    let _ = move child
+    return
+}
+
+func held(role: UInt) -> UInt64 {
+    if role == ROLE_SPIN {
+        HELD_SPIN
+    } else if role == ROLE_PARK {
+        HELD_PARK
+    } else if role == ROLE_SLEEP {
+        HELD_SLEEP
+    } else {
+        HELD_CALL
+    }
+}
+
+func kill_and_check(child: &Process, round: Int) -> Result<Void, SosStatus> {
+    let code = CODE_BASE + (round as UInt)
+    try child.kill(code: code)
+    let word = try child.get_status()
+    if word != (KILLED_KIND << KIND_SHIFT) + code {
+        print("SOS killchurn: round {} reads {}", round, word)
+        return BUG
+    }
+    return
+}
+
+/// Yield until `child` has made `want` system calls. A victim that makes
+/// more has a different path than its role says, and that is refused.
+func settle(proc: &Process, child: &Process,
+            want: UInt64) -> Result<Void, SosStatus> {
+    let me = try proc.thread_self()
+    while {
+        let st = try child.stats()
+        if st.syscalls == want {
+            return
+        }
+        if st.syscalls > want {
+            print("SOS killchurn: the child made {} system calls, not {}",
+                  st.syscalls, want)
+            return BUG
+        }
+        let _ = me.yield_now()
+    }
+}
+
+func launch(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+            role: UInt) -> Result<Process, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    try tell(&proc, &child, role)
+    try give_boot(&system, &child)
+    try child.start(boot_tag: TAG_BOOT)
+    return move child
+}
+
+/// Give `child` its role: an Event whose word is the role.
+func tell(proc: &Process, child: &Process,
+          role: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: role)
+    try child.give(event: move ev, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+func give_boot(system: &System, child: &Process) -> Result<Void, SosStatus> {
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+func ended_with(proc: &Process, child: &Process,
+                want: UInt) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS killchurn: the child ended with status {}", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

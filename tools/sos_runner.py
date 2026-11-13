@@ -667,6 +667,12 @@ CHILD_KILL_CALLER_PKG = os.path.join(TESTS_DIR, "child-kill-caller")
 PROCESS_KILL_CALLS_PKG = os.path.join(TESTS_DIR, "process-kill-calls")
 PROCESS_KILL_CREATED_PKG = os.path.join(TESTS_DIR, "process-kill-created")
 PROCESS_KILL_ROOT_PKG = os.path.join(TESTS_DIR, "process-kill-root")
+# `ProcessOp.Kill` on a child in a chosen state (spec §8). `child-kill-victim`
+# is a role-driven target; `kill-churn` kills one per round over many rounds
+# and `kill-runnable` kills one that is runnable and not running.
+CHILD_KILL_VICTIM_PKG = os.path.join(TESTS_DIR, "child-kill-victim")
+KILL_CHURN_PKG = os.path.join(TESTS_DIR, "kill-churn")
+KILL_RUNNABLE_PKG = os.path.join(TESTS_DIR, "kill-runnable")
 KILL_LATE_DOOR_PKG = os.path.join(TESTS_DIR, "kill-late-door")
 
 # Executable memory is not a buffer, and a thread's entry must be executable
@@ -8182,6 +8188,60 @@ TEST_CASES = [
         "expect_status": EXIT_KILLED_ROOT,
     },
     {
+        # Create, start, kill and release a child, over and over, with the
+        # scheduler tick on. Each round's child (`child-kill-victim`) is
+        # spinning, parked on an Event, asleep on a Timer or parked in a call
+        # on a pipe made for the round, and root kills it once its
+        # system-call count says it holds still. Every create, pipe and give
+        # of every round must succeed, so a body, record, thread, Waiter,
+        # Timer, Event, pipe or handle a teardown failed to return runs a
+        # slab dry and the case goes red. It ends with a child that runs to
+        # its exit.
+        "name": "kill_churn",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "tick": True,
+        "root_pkg": KILL_CHURN_PKG,
+        "children": [CHILD_KILL_VICTIM_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS killchurn: 200 rounds, every create succeeded",
+                       "SOS killchurn: a new child runs to its exit",
+                       "SOS killchurn: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A kill of a child that is runnable and not running. With the tick
+        # on, root launches a spinner (`child-kill-victim`) that makes no
+        # system call once it is set up, and yields until its system-call
+        # count says it is in its loop: the processor comes back to root only
+        # by the tick taking it from the spinner, so the spinner is on the
+        # ready queue when the kill lands. The status word reads `Killed`
+        # (196689) with the code, a second kill answers `Revoked` and leaves
+        # the word, and a watcher attached after the death is woken at once
+        # with it. A new child then runs in the same region to a clean exit,
+        # so the dead child's slots are reused. Three rounds.
+        "name": "kill_runnable",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "tick": True,
+        "root_pkg": KILL_RUNNABLE_PKG,
+        "children": [CHILD_KILL_VICTIM_PKG],
+        "expect_out": (["{banner}", "SOS: boot regions={two}"]
+                       + [line for n in range(3) for line in (
+                           "SOS: process teardown handles=",
+                           f"SOS killrun: round {n}: a spinning child is "
+                           "killed and reads Killed\n",
+                           f"SOS killrun: round {n}: a second kill is "
+                           "Revoked, word kept\n",
+                           f"SOS killrun: round {n}: a late watcher reads "
+                           "Killed\n",
+                           "SOS: process exit: code=",
+                           "SOS: process teardown handles=",
+                           f"SOS killrun: round {n}: a new child runs to its "
+                           "exit\n")]
+                       + ["SOS killrun: done\n"]),
+        "expect_clean_exit": True,
+    },
+    {
         # A kill whose teardown finds a parked watcher's buffer gone ends that
         # watcher at the switch point the kill returns through (spec §8), with
         # the setup of `late_door_buffer_gone`: a process (`child-late-door`)
@@ -10345,6 +10405,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
     #                      launcher released the image's handle
     #   data_init          initialized writable data copied out of flash into
     #                      DRAM with its bytes
+    #   kill_churn         kills over many rounds, on a child in each of four
+    #                      states, with the board's tick on: nothing a
+    #                      teardown owes goes unreturned on this part
+    #   kill_runnable      a kill of a child the tick took the processor from
     #
     # Every process in them runs its code from the flash instruction window
     # and reads its read-only data through the data window, in place in its
@@ -10360,7 +10424,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
                      "death_fault", "pipe_pingpong", "map_into_child",
                      "iomemory_carve", "interrupt_give", "tick_spinner",
                      "copy_from_code_refused", "thread_entry_not_exec",
-                     "image_held", "data_init", "pool_ops"]
+                     "image_held", "data_init", "pool_ops",
+                     "kill_churn", "kill_runnable"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
     # This board's own process cases, for what only it has: a table of CPU

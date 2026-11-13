@@ -1,0 +1,192 @@
+// A kill of a child that is runnable and not running.
+//
+// The image asks for the scheduler tick. Each round root launches
+// `child-kill-victim` as a spinner, which makes no system call once it is set
+// up, and yields until the spinner's system-call count (the kernel's, exact
+// for a program path) says it is in its loop. The processor comes back to
+// root only by the tick taking it from the spinner, so the spinner is on the
+// ready queue when the kill lands. Root kills it, reads `Killed` with the
+// code, kills it again (`Revoked`, the word unchanged), attaches a watcher
+// after the death (woken at once with the same word), releases it, and runs
+// a new child in the same region to a clean exit, so the dead child's thread
+// and body slots are reused.
+//
+//   SOS: process teardown ...
+//   SOS killrun: round N: a spinning child is killed and reads Killed
+//   SOS killrun: round N: a second kill is Revoked, word kept
+//   SOS killrun: round N: a late watcher reads Killed
+//   SOS: process exit: code=0x33 ...
+//   SOS killrun: round N: a new child runs to its exit
+//   SOS killrun: done
+
+import sos.{System, Process, Memory, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+
+/// The tag and roles `child-kill-victim` knows.
+static TAG_ROLE: UInt = 40
+static ROLE_SPIN: UInt = 1
+static ROLE_BYE: UInt = 9
+
+/// The system calls a spinning victim makes before it is in its loop.
+static HELD_SPIN: UInt64 = 4
+
+static KEY_DEATH: UInt = 6
+
+/// The code root kills with, and the status word it leaves: `Killed` (3) in
+/// the high half over the code.
+static KILL_CODE: UInt = 0x51
+static KILLED: UInt = 196689
+static_assert((3 * 65536) + 0x51 == 196689,
+              "a killed word is Killed in the high bits, then the code")
+
+/// An exited word: `Exited` (1) in the high half over the victim's `BYE_CODE`.
+static BYE_EXITED: UInt = 65587
+static_assert((1 * 65536) + 0x33 == 65587,
+              "an exited word is Exited in the high bits, then the code")
+
+static ROUNDS: Int = 3
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS killrun: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS killrun: refused: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS killrun: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let img = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    var round = 0
+    while round < ROUNDS {
+        try one_round(&system, &proc, &img, &ram, round)
+        round = round + 1
+    }
+    return
+}
+
+func one_round(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+               round: Int) -> Result<Void, SosStatus> {
+    let victim = try launch(&system, &proc, &img, &ram, ROLE_SPIN)
+    try settle(&proc, &victim, HELD_SPIN)
+
+    try victim.kill(code: KILL_CODE)
+    let word = try victim.get_status()
+    if word != KILLED {
+        print("SOS killrun: the killed spinner reads {}", word)
+        return BUG
+    }
+    print("SOS killrun: round {}: a spinning child is killed and reads Killed",
+          round)
+
+    match victim.kill(code: 0x77) {
+        case Ok(_) -> { return BUG },
+        case Err(why) -> {
+            if not is_revoked(why) {
+                print("SOS killrun: a second kill answered {}", why)
+                return BUG
+            }
+        },
+    }
+    let again = try victim.get_status()
+    if again != KILLED {
+        print("SOS killrun: after a second kill the word is {}", again)
+        return BUG
+    }
+    print("SOS killrun: round {}: a second kill is Revoked, word kept", round)
+
+    try ended_with(&proc, &victim, KILLED)
+    print("SOS killrun: round {}: a late watcher reads Killed", round)
+    let _ = move victim
+
+    let next = try launch(&system, &proc, &img, &ram, ROLE_BYE)
+    try ended_with(&proc, &next, BYE_EXITED)
+    print("SOS killrun: round {}: a new child runs to its exit", round)
+    return
+}
+
+func is_revoked(why: SosStatus) -> Bool {
+    match why {
+        case Revoked -> true,
+        case _ -> false,
+    }
+}
+
+/// Yield until `child` has made `want` system calls. A victim that makes
+/// more has a different path than its role says, and that is refused.
+func settle(proc: &Process, child: &Process,
+            want: UInt64) -> Result<Void, SosStatus> {
+    let me = try proc.thread_self()
+    while {
+        let st = try child.stats()
+        if st.syscalls == want {
+            return
+        }
+        if st.syscalls > want {
+            print("SOS killrun: the child made {} system calls, not {}",
+                  st.syscalls, want)
+            return BUG
+        }
+        let _ = me.yield_now()
+    }
+}
+
+func launch(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+            role: UInt) -> Result<Process, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    let ev = try proc.event_create()
+    try ev.signal(bits: role)
+    try child.give(event: move ev, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return move child
+}
+
+func ended_with(proc: &Process, child: &Process,
+                want: UInt) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS killrun: the child ended with status {}", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
