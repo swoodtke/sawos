@@ -44,7 +44,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. The process-sleep primitive. §2.6. |
 | `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it and ack through the handle. One op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `SystemOp.InterruptBind` on `SystemRight.InterruptBind`, because a line is a machine-wide resource (§2.8). The binding is the object's existence (creation takes the line, there is no rebind), which stops one handle naming two devices over its life. It has one name, its handle, and releasing that handle destroys it (§2.10). A line the board does not have, the timer's line, and a line already bound are all faults. §9. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style). Ops `Add`/`Remove`/`Wait`; rights `WaiterRight.Attach`/`.Wait`; the wait answer is a copy-out record. §2.2. |
-| `Process` | Two entries: a small record (the state, the status word, the pid, the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit or fault — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
+| `Process` | Two entries: a small record (the state, the status word, the pid, the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit, fault or kill (kill, §8, not yet enforced) — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
 | `System` | Kernel singleton: the object behind system-scoped primitives, so that every syscall is an object op (§5.7). §2.8. |
 
 The kinds are System, Process, Thread, Event, Waiter, Interrupt, Clock, Timer,
@@ -1274,7 +1274,8 @@ of the process or its record.
   handle still comes from a held handle (§3). The one op that answers the
   process a given pid names is `SystemOp.ProcessByPid`, behind
   `SystemRight.ProcessObserve` on a System handle, and it answers nothing a
-  walk of the processes with the same right would not (§2.8).
+  walk of the processes with the same right would not (§2.8). Neither answers
+  a process before its start (§2.8; not yet enforced).
 - **Where pids appear:** in every pipe message, as its sender (§2.1), in the
   stats record and the stats region's rows (below), and as the cursor of a
   process walk (§2.8). A server keys its clients by the pid
@@ -1285,12 +1286,12 @@ of the process or its record.
 **Ops**, each on its own `ProcessRight`: the creation ops `ThreadCreate`,
 `EventCreate`, `WaiterCreate` and `PipeCreate`, then `ThreadSelf`, `Exit`,
 `GetStatus` (on `Wait`), `Start`, `BootHandleNext` (on `BootHandles`), `Give`,
-`Stats`, `RestrictRights` and `Ceiling` (on `Stats`; both below).
+`Kill` (§8; not yet enforced), `Stats`, `RestrictRights` and `Ceiling` (on
+`Stats`; both below).
 `ProcessRight.Map` is the target-side right `MemoryOp.Map` and `IoMemoryOp.Map`
 spend (§2.5). Creating a process is not an op on this object:
 `ProcessCreate` is on System, because a process is a machine-wide resource
 (§12), and binding an interrupt line is on System for the same reason (§2.8).
-`kill` has no op and no right (§8).
 
 **Which process an op acts on is part of its contract**, and the ops fall into
 three groups:
@@ -1320,12 +1321,14 @@ three groups:
   never names the live caller, so through one these are the same `NotSelf`
   fault. The right on the handle used is checked first, so a handle without it
   is `AccessDenied`.
-- **`Start`, `Give`, `GetStatus` and `Stats` act on the named process**, which
-  is what supervision is. `Start` and `Give` require a `Created` child, and
-  naming one that is not, a `Gone` one included, is a `BadState` fault rather
-  than `Revoked` (§2.10): a `Gone` child was always started, and the launcher
-  that started it knows. No thread of a `Created` child can run (below), so
-  none can end it; the loss of its last name does (below).
+- **`Start`, `Give`, `GetStatus`, `Stats` and `Kill` act on the named
+  process**, which is what supervision is; `Kill` naming the caller's own
+  process or a `Created` one faults the caller (§8; not yet enforced). `Start`
+  and `Give` require a `Created` child, and naming one that is not, a `Gone`
+  one included, is a `BadState` fault rather than `Revoked` (§2.10): a `Gone`
+  child was always started, and the launcher that started it knows. No thread
+  of a `Created` child can run (below), so none can end it; the loss of its
+  last name does (below).
 
 **The default set.** One Process default set serves the three minters of a
 process's own or its creator's handle (root's, `ProcessSelf`'s and
@@ -1333,10 +1336,11 @@ process's own or its creator's handle (root's, `ProcessSelf`'s and
 pid, mint the observe set, below), named for its ops
 throughout: `ThreadCreate`, `ThreadSelf`, `Exit`, `Wait`, `EventCreate`,
 `WaiterCreate`, `Start`, `BootHandles`, `Give`, `Map`,
-`PipeCreate`, `Stats` and `RestrictRights` (below), plus the universal
-`Transfer | Mint`. A launcher keeps the child's handle — it is what supervises
-with — and the child derives its own authority from the masked System handle it
-was given (§12), so supervision and self-management are not alternatives.
+`PipeCreate`, `Stats`, `RestrictRights` (below) and `Kill` (§8; not yet
+enforced), plus the universal `Transfer | Mint`. A launcher keeps the child's
+handle — it is what supervises with — and the child derives its own authority
+from the masked System handle it was given (§12), so supervision and
+self-management are not alternatives.
 `Process.mint(rights:)` makes each bit attenuable at the typed tier: a
 supervisor may be handed a sibling that learns whether its child is alive and
 may not watch it work.
@@ -1344,7 +1348,8 @@ may not watch it work.
 **The observe set** is `ProcessRight.Wait | ProcessRight.Stats`: enough to
 learn that a process died and how, what it cost, what its pid is and what its
 rights ceilings are (`ProcessOp.Ceiling` is gated by `Stats`, below), and
-nothing that acts on it or moves the handle on. The kernel mints it for a
+nothing that acts on it or moves the handle on; it never carries
+`ProcessRight.Kill` (§8; not yet enforced). The kernel mints it for a
 Process handle that comes from no creation, no `ProcessSelf` and no give: the
 sender handle (§2.1), capped like every mint by the Process ceiling of the
 table it lands in, which is the caller's (below). The process walk and the
@@ -1722,62 +1727,79 @@ and each answer is a Process handle carrying the observe set (§2.7). They are
 for system tools, a `ps` or a debugger. An ordinary server needs neither: it
 names its clients through the sender handle (§2.1), which asks no System right.
 
-- **What they answer.** Every process the record table holds: a `Created` or
-  running process, and a `Gone` one for as long as something still names its
-  record (§2.7). Held dead records are what fill the record table, so a tool
-  accounting for the table has to be able to see them. A running process is
-  answered whatever names it, since it is never reclaimed while it runs. A
-  `Gone` record is reclaimed when nothing names it, and a `Created` process is
-  torn down then, its record reclaimed with it (§2.7), so neither op answers
-  either once nothing names it. The caller's own process and root (pid 1) are
-  answered like any other.
+- **What they answer.** Every process the record table holds that has been
+  started: a running process, and a `Gone` one for as long as something still
+  names its record (§2.7). Held dead records are what fill the record table, so
+  a tool accounting for the table has to be able to see them. A running process
+  is answered whatever names it, since it is never reclaimed while it runs. A
+  `Gone` record is reclaimed when nothing names it (§2.7), so neither op answers
+  it once nothing does. A `Created` process is passed over as a free record is:
+  neither op answers it before its start, and one torn down unstarted is never
+  answered. So every process a tool lists has started, and none is one a kill
+  would refuse as never started (§8), and a handle onto a never-started process
+  is held only by its creator and by whoever a launcher gave one to. What the
+  rule buys is the list, not a guard: the handle these ops mint carries the
+  observe set, which never carries `ProcessRight.Kill`, so a tool that lists
+  processes cannot kill what it lists. The passing over and the kill are not yet
+  enforced (the end of this section says what the walk does today). The caller's
+  own process and root (pid 1) are answered like any other.
 - **The cursor is a pid.** `ProcessNext` takes the address of a doubleword
   holding a cursor. It answers the process with the smallest pid greater than
-  the cursor, writing that pid over the cursor and answering the new handle in
-  the value register. A walk starts from zero, which precedes every pid, and
-  continues by passing the same doubleword back. Any value is a valid cursor,
-  whether or not a walk answered it or any process ever held it. A pid is
-  never reused and never moves, so a cursor marks a place in creation order and
-  nothing else, and no kernel index reaches the caller. The pid written back is
-  what lets a tool walk on even when its Process ceiling leaves the handles it
-  is given no rights to read a pid with.
-- **The end of a walk is `Drained`**: the record table holds no process whose
-  pid is greater than the cursor. Nothing is minted and the doubleword is left
-  as it was. The kernel keeps no state between calls, so a walk is restarted
-  by passing zero, and `Drained` is not final: the same cursor answers a
-  process created after it. The boot-set drain's `Drained` stays exhausted
-  because a boot set gains nothing once its process has started (§12), while
-  the record table gains a process at every create.
-- **What a walk guarantees.** Every process whose record the table holds for the
-  whole walk is answered exactly once, in increasing pid order. A process
-  created during the walk has a greater pid than every process before it, so the
-  walk reaches it before `Drained` and answers it unless its record has been
-  reclaimed by then. A record reclaimed before the walk reaches its pid is not
-  answered. A walk is not a snapshot. Each answer reads the table as it stands
-  at that call, so a process answered running may be `Gone` by the next.
+  the cursor, of those it answers (above), writing that pid over the cursor and
+  answering the new handle in the value register. A walk starts from zero, which
+  precedes every pid, and continues by passing the same doubleword back. Any
+  value is a valid cursor, whether or not a walk answered it or any process ever
+  held it. A pid is never reused and never moves, so a cursor marks a place in
+  creation order and nothing else, and no kernel index reaches the caller. The
+  pid written back is what lets a tool walk on even when its Process ceiling
+  leaves the handles it is given no rights to read a pid with.
+- **The end of a walk is `Drained`**: no process the walk answers has a pid
+  greater than the cursor. Nothing is minted and the doubleword is left as it
+  was. The kernel keeps no state between calls, so a walk is restarted by
+  passing zero, and `Drained` is not final: the same cursor answers a process
+  created after it, from its start (not yet enforced: from its create). The
+  boot-set drain's `Drained` stays exhausted because a boot set gains nothing
+  once its process has started (§12), while the record table gains a process at
+  every create.
+- **What a walk guarantees.** A process is answered by the call that reaches its
+  pid if it has started by then and its record is still held. So every process
+  started before the walk began whose record the table holds for the whole walk
+  is answered exactly once, in increasing pid order, and none is answered twice,
+  since the cursor only rises. A pid is assigned at the create and a process is
+  visible from its start, so whether a walk sees a process started during it
+  depends on where the walk is: one created during the walk has a pid greater
+  than every pid before it and is answered if it has started by the time the
+  walk reaches it, and one created before the walk passed its pid and started
+  after is missed by this walk and seen by the next. A record reclaimed before
+  the walk reaches its pid is not answered. A walk is not a snapshot. Each
+  answer reads the table as it stands at that call, so a process answered
+  running may be `Gone` by the next. (Not yet enforced: a process is visible
+  from its create, so every process created during the walk is answered unless
+  its record is reclaimed first.)
 - **`ProcessByPid` is the indexed form of the walk** and gives nothing a walk
   would not. It takes the address of a doubleword holding a pid and answers, as
   a new handle in the value register, the process a walk would answer for that
   pid, a `Gone` one that something still names included. A pid the record table
-  does not hold answers `Revoked` and mints nothing: a pid whose record has
-  been reclaimed, a pid never assigned, and zero, which is never a pid (§2.7).
-  Zero is answered as data rather than refused as a caller error, because a
-  pid read out of the stats region or a record is data a tool passes on (an
-  unoccupied stats row reads zero). The doubleword is only read.
+  does not hold answers `Revoked` and mints nothing: a pid whose record has been
+  reclaimed, a pid never assigned, and zero, which is never a pid (§2.7). So
+  does the pid of a process not yet started, which a walk would pass over (not
+  yet enforced); like a pid not yet assigned, it is answered later, once its
+  process has started. Zero is answered as data rather than refused as a caller
+  error, because a pid read out of the stats region or a record is data a tool
+  passes on (an unoccupied stats row reads zero). The doubleword is only read.
 - **A dead process is answered here and not by the sender handle**, which
   answers `Revoked` for a sender that is `Gone` (§2.1). The sender handle asks
   after the process that sent a message and must not hold a dead one's record
   for a server; these ops ask what the record table holds, and a held dead
   record is part of that.
 - **The mint.** One Process handle in the caller's table naming the record,
-  carrying the observe set intersected with the caller's Process ceiling
-  (§2.7), and charged to the caller's `Handle` row (§2.9). Neither op takes a
-  keep mask. Every answer mints a fresh handle, the caller's own process
-  included, so a tool that holds a handle onto itself through `ProcessSelf`
-  gets a second one carrying the observe set. The handle is an ordinary
-  reference: while a tool holds it, a `Gone` record stays held and a `Created`
-  process is not torn down for want of a name (§2.7), so a tool releases what
-  it has read.
+  carrying the observe set intersected with the caller's Process ceiling (§2.7),
+  and charged to the caller's `Handle` row (§2.9). Neither op takes a keep mask.
+  Every answer mints a fresh handle, the caller's own process included, so a
+  tool that holds a handle onto itself through `ProcessSelf` gets a second one
+  carrying the observe set. The handle is an ordinary reference: while a tool
+  holds it, a `Gone` record stays held (§2.7), so a tool releases what it has
+  read. It stays valid whatever happens to the process later.
 - **Their answers, in the order they are decided.** A System word that names
   nothing is the `BadHandle` fault and a handle without
   `SystemRight.ProcessObserve` is `AccessDenied`, on §5.7's dispatch order.
@@ -1794,15 +1816,18 @@ names its clients through the sender handle (§2.1), which asks no System right.
   ceilings (`ProcessOp.Ceiling`, which answers `Revoked` once it is `Gone`);
   with `Wait`, the §8 status word, through `GetStatus` or a Waiter. Nothing
   else: the observe set carries no right to map into, start, give to, create
-  through, exit or restrict the process, and neither `Transfer` nor `Mint`. Like
-  any handle naming a process, it can serve as a ceiling source to
-  `ProcessCreate`, which only ever restricts (§2.7). The kernel records no name,
-  image, argument or parent for a process, so a `ps` built on these ops shows
-  each process's pid, whether it has ended and how, its counters and, while it
-  lives, its ceilings, and anything else is recorded in userspace (a spawn
-  service keeps its own tree, keyed by pid, §2.7). It cannot tell a process
-  that was never started from a running one: a `Created` process's status word
-  reads `Running` (§8), as a started one's does until it ends.
+  through, exit, restrict or kill the process (kill, §8, not yet enforced), and
+  neither `Transfer` nor `Mint`. Like any handle naming a process, it can serve
+  as a ceiling source to `ProcessCreate`, which only ever restricts (§2.7). The
+  kernel records no name, image, argument or parent for a process, so a `ps`
+  built on these ops shows each process's pid, whether it has ended and how, its
+  counters and, while it lives, its ceilings, and anything else is recorded in
+  userspace (a spawn service keeps its own tree, keyed by pid, §2.7). Everything
+  these ops answer was started, so a status word that reads `Running` through
+  their handle is a process that is running (not yet enforced). A handle
+  obtained another way can name a process not yet started, whose status word
+  reads `Running` as a started one's does until it ends (§8): a launcher's own
+  handle onto a child it has not started.
 - **Cost.** Each call scans the record table, bounded by the record slab's
   capacity, for the smallest pid above the cursor or for the pid asked. A walk
   of every process therefore scans the table once per call, the `Drained` one
@@ -1813,6 +1838,14 @@ names its clients through the sender handle (§2.1), which asks no System right.
   it builds a child's System sibling with; §12's convention mask
   (`Debug | ProcessSelf | ClockGet | Transfer`) withholds it, so a process
   holds it only if a holder of the right gave it on.
+
+Not yet enforced: the walk and the lookup pass over no `Created` process. Both
+answer one, until it is torn down for want of a name, as they answer a running
+process, the walk in pid order and the lookup by its pid, so a process created
+during a walk is answered unless its record is reclaimed first. Its status word
+reads `Running`, so a `ps` built on them cannot tell it from a started one, and
+while a tool holds the handle onto it, it is not torn down for want of a name
+(§2.7).
 
 ### 2.9 Quotas
 
@@ -1957,7 +1990,7 @@ handle to make the op that would answer `Revoked`.
 | Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. `Exit` releases the handle it is invoked through: only that handle goes, every other one still reads the slot, and a Thread that exits with no other handle naming it is freed at its exit. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
 | Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) and bound to no process: nothing names its binder's record, so the teardown has nothing to disown |
 | Event, Pipe, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them |
-| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1). The process walk and the lookup by pid answer a `Gone` record for as long as something names it, and the handle they mint is one more name that holds it (§2.8). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
+| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1). The process walk and the lookup by pid answer a `Gone` record for as long as something names it, and the handle they mint is one more name that holds it (§2.8); they answer no process before its start (§2.8; not yet enforced). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
 | Clock, System | Never destroyed |
 
 **A free of a live object runs its last rites.** The last handle going is a
@@ -2505,10 +2538,11 @@ this sense, minting a Process handle with the observe set (§2.7).
 
 ### 5.3 Process/Job hierarchy
 
-Decided by §2: a flat Process, with kernel teardown on exit or fault only, and
-supervision in userspace. The kill-tree question is answered in §8: `kill`
-is specified process-granular only, with no kernel trees — supervision
-topology is userspace's.
+Decided by §2: a flat Process, with kernel teardown on exit or fault, or on a
+kill naming that one process (§8; not yet enforced), and supervision in
+userspace. The kill-tree question is answered in §8: `kill` is specified
+process-granular only, with no kernel trees — supervision topology is
+userspace's.
 
 ### 5.4 The async wait primitive
 
@@ -2687,7 +2721,8 @@ is what a caller could not have known — `NoResource` (a full slab),
 `QuotaExceeded` (§2.9), `BadImage` (§8), `Drained` (§12, and the end of a
 process walk, §2.8), `Revoked` (§2.2, every op on an invalid
 object, §2.10, a sender handle asked of a dead sender, §2.1, and a lookup of a
-pid the record table does not hold, §2.8), `PeerClosed` and
+pid the record table does not hold or, not yet enforced, holds for a process
+not yet started, §2.8), `PeerClosed` and
 `WouldBlock` (§2.1) — with `Unknown` the userspace mapping artifact. A dynamic
 resource condition answers with a status; broken code faults.
 
@@ -3157,7 +3192,8 @@ mode only. The harness kernels that test the tick and timers arm their own.
   armed and without it. A process blocked while others can still run is not a
   deadlock and is not touched. A supervisor that wants to outlive a child that
   never finishes waits with a Timer armed, which also keeps the state from
-  being a deadlock.
+  being a deadlock, and, when the Timer fires first, ends the child with
+  `kill` (§8; not yet enforced).
 - **The tick does not stop when the machine idles.** While nothing is runnable
   the kernel keeps taking the tick, at the same period. A tick taken then has
   no running thread to charge, so it raises no reschedule. Stopping the tick
@@ -3267,10 +3303,11 @@ scheduler ends the process at the next switch point, the idle loop's turns
 included: every return to user mode passes one first, so no instruction of the
 process runs after the trap in which the fault was recorded.
 
-**`process.kill()` has neither op nor right** (`Exit` through another
-process's handle faults the caller, §2.7). It is specified below; what it
-waits on is a ruling about what killing a process that is not the caller does
-to a scheduler that may be running its thread.
+**A process can also be ended by another**, through `ProcessOp.Kill` on a
+handle carrying `ProcessRight.Kill` ("Kill", below; not yet enforced, so a
+process ends only by its own exit or fault, or, never started, by the loss of
+its last name). `Exit` through another process's handle stays the `NotSelf`
+fault (§2.7): ending another process is the kill's, on a right of its own.
 
 **What is built.** The fault rule, whole. `get_status` as
 `ProcessOp.GetStatus`, gated on `ProcessRight.Wait`, answering the one
@@ -3335,17 +3372,188 @@ counters in its body's row until a create reuses the body.
   supervisor parked on a live child is not idle-and-doomed — the child's own
   threads are runnable — and one parked on a dead child was already woken.
 - **`process.get_status()`**, gated on the wait right: one fixed-width status
-  word — kind in the high bits (`Exited | Faulted | Killed`), code in the low
-  bits (exit code, or a fault-cause tag; a deadlock ends no process and is
-  not one). The kernel's fault report prints the faulting PC and address on the
-  console (`epc=`, `tval=`); fault forensics a supervisor can read is a later
-  design.
-- **`process.kill()`**, gated on a kill right. Cooperative-first
-  teardown stays the norm; kill is the capability-gated escape hatch
-  that makes userspace supervision real against wedged/hostile
+  word — kind in the high bits (`Exited | Faulted | Killed`), code in the low 16
+  bits (exit code, or a fault-cause tag; a deadlock ends no process and is not
+  one), so an exit code wider than that is read as its low 16 bits. The kernel's
+  fault report prints the faulting PC and address on the console (`epc=`,
+  `tval=`); fault forensics a supervisor can read is a later design. `Killed` is
+  written only by a kill, with the code its killer passed (below); kill is not
+  yet enforced, so no status word reads `Killed`.
+- **`process.kill(code:)`**, gated on `ProcessRight.Kill` (below).
+  Cooperative-first teardown stays the norm; kill is the capability-gated
+  escape hatch that makes userspace supervision real against wedged/hostile
   processes. This answers §4's kill-tree question: kill is
   process-granular only, with no kernel trees — supervision topology is
-  userspace's. Not built.
+  userspace's. Not yet enforced.
+
+**Kill.** `ProcessOp.Kill(code)`, gated by `ProcessRight.Kill` on the handle
+used, ends the process that handle names. It is the one way a process ends
+another. The death is an exit or a fault in every respect but its cause: the
+status word reads `Killed`, and everything §2.10 and this section say of a
+death, its notification and its teardown holds for it.
+
+- **The right.** `ProcessRight.Kill` is in the one Process default set (§2.7),
+  so the handle `ProcessCreate` mints a launcher carries it, and the launcher
+  supervises with it; so do root's own handle and the one `ProcessSelf` mints.
+  On a process's own handle it ends nothing (below), and it is there because one
+  list serves all three minters and because a process may give a sibling of its
+  own handle to a watchdog it means to be stoppable by. Rights ceilings cap it
+  like every right (§2.7): a process whose Process ceiling lacks it obtains no
+  handle carrying it from `ProcessSelf` or `ProcessCreate`, so it kills only
+  through a handle it was given. The observe set never carries it (§2.7), so the
+  sender handle, the process walk and the lookup by pid (§2.1, §2.8) never kill:
+  a tool cannot kill what it lists (§2.8). It moves as any right moves:
+  `Transfer` gives it on, and a `MINT_OP` keep mask strips it, so a supervisor
+  may be handed a sibling that watches a child and cannot kill it.
+- **The code.** The op takes one argument word, the killer's code. The kernel
+  reads no meaning into it and accepts every word. The status word keeps its
+  low 16 bits, as it keeps an exit code's (above), under the kind `Killed`, so
+  a watcher learns that the process was killed and reads the low 16 bits of
+  the reason its killer recorded.
+- **Its answers, in the order they are decided.** A Process word that names
+  nothing is the `BadHandle` fault and a handle without `ProcessRight.Kill` is
+  `AccessDenied`, on §5.7's dispatch order. Then:
+  - A handle naming the caller's own process is the `NotSelf` fault. A process
+    ends itself with `Exit`, and which process a handle names is its holder's
+    to know, as it is for `Exit` through another process's handle (§2.7). A
+    `Gone` process's handle never names the live caller, so it is never this
+    fault.
+  - A `Gone` target answers `Revoked`, as every op on an invalid object does
+    (§2.10), and nothing changes: its status word keeps the death it already
+    recorded, so a supervisor reads the first cause and never a later kill's.
+    It is a status because the caller could not have checked: the target can
+    exit, fault or be killed by another holder between any check and the kill.
+  - A `Created` target is the `BadState` fault, and nothing changes in it: no
+    teardown runs, no status word is written, and it can still be started.
+    Nothing runs in it, so there is nothing to kill. It is a fault because the
+    early kill is an ordering the programs arranged and could have checked. No
+    observing op answers a never-started process (§2.8), and a Process handle
+    does not travel in a message (§2.1), so a handle carrying the right onto a
+    child reaches a process other than its creator and itself only through
+    `Give` into that process's boot set while that process is `Created`, and
+    such a holder can name the child before the child's start only if it was
+    started first. That is the launch order, chosen by the launchers, and a
+    contract between cooperating programs is theirs to keep, as the one-Waiter
+    rule is (§2.2). It is also how `Start` and `Give` answer a child in the
+    wrong state (§2.7). So a launcher starts a child before it starts, or gives
+    a handle carrying the right onto that child to, any process that may kill
+    it. A launcher that wants a never-started child gone releases its handle
+    instead: the child is torn down once every handle and attachment naming it
+    has gone (§2.7).
+  - A running target is torn down (below).
+  - The kill answers `Ok`, with no value, once the teardown is done; a kill of
+    root does not return (below).
+- **Root.** A handle onto root carrying the right comes only from root: its own
+  handle, given on, or a sibling minted from one. A launcher that gives such a
+  handle away gives the authority to stop the machine, because killing root ends
+  it as root's own exit does: its teardown runs and the machine stops, every
+  other process ending with it, uncounted: no end the kill owes another process
+  (below) is paid first. The machine stops with the kernel's own failing exit
+  status for a killed root, distinct from a process fault's and a deadlock's,
+  whatever code the killer passed: root's status word has no reader once the
+  machine has stopped, and a killed root is not a clean finish. Root's own
+  `Exit` passes its code through as the machine's status, so a root that exits
+  with that number reads as a killed one, as a root exiting with a fault's or a
+  deadlock's number already reads as a fault or a deadlock.
+- **When it is done.** A kill of any process but root, whose kill stops the
+  machine (above), is complete when its call returns. The kernel runs on one
+  processor and takes no interrupt in kernel mode (§9), and the teardown has no
+  preemption point, so from the moment the status word is written until the call
+  returns no other thread runs and no interrupt is delivered. Nobody, the caller
+  included, can observe the target between alive and `Gone`, and a `GetStatus`
+  the caller makes next reads `Killed`. The ends the kill owes others are paid
+  at the switch point its return passes, before any thread runs (above): the
+  teardowns of the `Created` processes whose last name the target held (§2.7),
+  and the end, with `BadBuffer`, of any process one of whose parked threads the
+  teardown answered and found its buffer gone (§2.2). That process can be the
+  caller's own, when a sibling of the calling thread was parked watching the
+  target with a buffer since unmapped; it ends there, and the kill's answer is
+  never read. The target's watchers are notified as at every death (above): once
+  the status word is written and before the teardown, and a notification only
+  queues the woken thread, so a watcher runs after the call returns and finds
+  the target torn down whole.
+- **There is no dying state.** A process ends only inside one trap, which runs
+  its teardown to completion before any thread runs again: its own thread's exit
+  or fault, a kill, the trap that drops a `Created` process's last name, or the
+  trap or idle turn whose delivery found a parked thread's buffer gone, whose
+  switch point pays that end (above). Every return to user mode passes a switch
+  point, so no end is pending when a kill is made, and on one processor the
+  caller's syscall is the only thing running. So there is no target exiting or
+  faulting "at the same instant": a kill finds its target `Created`, running or
+  `Gone`, and one that exited first is a `Gone` target.
+- **No thread of the target is running.** The running thread is the caller's,
+  and a thread of the target runs only while the target is the caller, which is
+  the `NotSelf` fault above. Each of its other threads is inert (made and not
+  started), ready, blocked or parked, or has exited, and the teardown treats
+  each as it does at an exit or a fault (§2.10's order). A ready thread comes
+  off the ready queue, and every other process's ready threads stay. A thread
+  blocked in a wait (on a Waiter, whoever owns it, in a `Join`, or parked in a
+  fused `Call` or a `Resolve`) is taken off that list and never answered, since
+  it never runs again. Every thread that has not exited is invalidated, and
+  another process's thread joining one is answered `Revoked`; one that exited
+  keeps its exit code for a late `Join` (§2.10).
+- **Calls into it and out of it** end by §2.1's abandonment rules, as at any
+  death:
+  - A thread of the target parked in a call on another process's connection
+    has its claim abandoned, so that server's later `reply()` answers
+    `Err(PeerClosed)`; a message it staged that the server has not taken is
+    still owed to the outlet, as any message whose claim has gone is (§2.1). A
+    thread parked for room had staged nothing, and its message is never posted.
+  - The obligations the target holds, in its table or in an attachment on one
+    of its Waiters, are released, so the client each one answers, parked in a
+    `Call` or watching its claim, is told `PeerClosed`. An obligation the
+    target passed on is no longer its own, and its client waits on the process
+    that holds it now.
+  - An outlet whose last handle the target held goes too, and with it what is
+    still staged there (§2.1): each message not yet taken is abandoned, so its
+    client, parked in a `Call` or watching its claim, is told `PeerClosed`, and
+    so is every caller parked for room on that connection. A message already
+    taken is not staged; its client waits on its obligation (above).
+  - Another process's thread parked on one of the target's Waiters is answered
+    `Revoked` (§2.10).
+
+  The caller may be on either side. A thread of the caller's process parked in
+  the target's pipe cannot be the thread making the kill, since a parked thread
+  makes no call, but a sibling of it can: the parked thread is answered
+  `PeerClosed` by the rules above, unless the target passed its obligation on,
+  and runs after the kill returns. A thread of the target parked in a call on
+  the caller's connection, once its message was staged, leaves the caller an
+  obligation, held or still to be taken, whose `reply()` answers
+  `Err(PeerClosed)`.
+- **What else it leaves behind** is what any death leaves, in §2.10's order:
+  its bound objects invalidated (its Timers disarmed, its Waiters' attachments
+  released), its handle table released (an Interrupt it held destroyed and its
+  line bindable again), what survives disowned, its domain cleared, its ledger
+  cleared and its body freed. A region it was given comes back as its grant
+  rows' references and its handles go, unless something else still names it.
+  Its record keeps the status word, the final trap counters and the pid while
+  a reference names it (§2.7).
+- **Children are not touched.** The kernel records no parent or child (§2.7,
+  §5.3), so a kill ends exactly the process its handle names, and the processes
+  the target created run on. The handles the target held on them are released
+  with its table: a `Created` one whose last name that was is torn down (§2.7),
+  and a running one keeps running, killable by any other holder of a handle
+  carrying the right, and by nobody if the target held the last such handle. A
+  supervisor that wants a subtree gone kills each process in it, so it keeps a
+  handle carrying `ProcessRight.Kill` onto each: a pid grants nothing (§2.7),
+  and a spawn service that records the tree by pid keeps the handles with it.
+- **What kill is not.** It is not a thread kill; there is none (above). It is
+  not a signal: the target is not told, runs no code after it, and cannot
+  catch, mask, defer or clean up after it, so state it shares with a survivor
+  (a region, a protocol over a connection) is left as its last instruction
+  left it. It is not asynchronous: it is complete when its call returns
+  (above), and there is no pending kill to observe or to cancel.
+- **Cost.** A kill costs its caller one teardown inside its own call, the work
+  an exit or a fault costs the dying process's trap: the owner sweeps over the
+  slabs and the release of the target's handle table (§2.10), each bounded by
+  the slabs' capacities and `MAX_HANDLES`, then, root aside, the ends it owes
+  others at its switch point (above), each a teardown bounded the same way. None
+  of it has a preemption point, so for its length it is interrupt latency for
+  the whole machine. It counts as one syscall in the caller's `Stats`, and
+  nothing is charged to the target once its teardown has begun (§2.7).
+
+Not yet enforced: `ProcessRight.Kill` and `ProcessOp.Kill` do not exist, and
+no status word reads `Killed`.
 
 ## 9. Interrupt delivery
 
@@ -3624,10 +3832,13 @@ loader parses and reports while no process stores either.
 
 - **Priorities and the band map** (§7). The scheduler is one round-robin FIFO.
 - **Tickless idle** (§7). The tick keeps firing while the machine is idle.
-- **Thread waitability, and `kill`** (§8). Attaching a thread is a `NotWaitable`
-  fault; `kill` has no op and no right. A supervisor learns a child died by
-  reading `get_status` through the handle it holds, or by being woken through an
-  attachment on the same handle.
+- **Thread waitability** (§8). Attaching a thread is a `NotWaitable` fault. A
+  supervisor learns a child died by reading `get_status` through the handle it
+  holds, or by being woken through an attachment on the same handle.
+- **`kill`** (§8): `ProcessOp.Kill` and `ProcessRight.Kill` do not exist, and
+  no status word reads `Killed`. A supervisor cannot end a child; one that
+  never finishes holds its process, its quota and everything it was given
+  until the machine stops.
 - **`IntrSpinLock` and SMP** (§9b, §7). A preemption point is the assertion
   that state is consistent, so nothing yet has a critical section for the type
   to protect.
@@ -3666,7 +3877,8 @@ loader parses and reports while no process stores either.
   ended for it, so a supervisor waiting without a timeout on a child that
   blocks forever, with no bound line and no armed Timer, stops the machine
   rather than carrying on. A process stuck while others can still run is not a
-  deadlock and is not touched; it holds what it holds until something ends it.
+  deadlock and is not touched; it holds what it holds until something ends it,
+  which for a supervisor is `kill` (§8; not yet enforced).
 - On a part without atomic instructions (the ESP32-C3), word atomics in a
   user process, `sosrt`'s bump arena cursor among them, are plain
   read-modify-write libcalls, so under the tick (§7) two threads of one
@@ -3856,10 +4068,11 @@ processes (§2.5).
   and a child are entirely in rights: the masked System handle it is given,
   and the rights ceilings it inherits and its launcher may narrow before or
   after `start` (§2.7). The launcher keeps the child's
-  Process handle, so it supervises (`get_status`, and the death wait, §8) while
-  the child manages itself. What the mask withholds is enforced at run time by
-  the ordinary rights check — a child that asks to `shutdown` is
-  `AccessDenied` and dies, and the machine keeps running.
+  Process handle, so it supervises (`get_status`, the death wait and `kill`,
+  §8; `kill` not yet enforced) while the child manages itself. What the mask
+  withholds is enforced at run time by the ordinary rights check — a child
+  that asks to `shutdown` is `AccessDenied` and dies, and the machine keeps
+  running.
 - **What a launcher furnishes reaches hardware.** `give(iomemory:)` hands a
   child a device's window, over the `Transfer` bit `iomemory_rights()` mints,
   and `give(interrupt:)` hands it the device's line, a bound Interrupt (§2.8),
