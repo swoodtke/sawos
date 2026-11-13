@@ -914,13 +914,62 @@ ARCHES = [
     },
 ]
 
+# The ESP32-S3 board, Xtensa, as an arch entry. Not in `ARCHES`: the gate does
+# not run it, `--board esp32s3` does (`_esp32s3_smoke`). It has the shape of an
+# `ARCHES` entry so that the gate's own helpers serve it unchanged: `arch_dirs`,
+# `expectations`, `_check`, Blade's image build, the root-image and region-table
+# stitchers. Every address mirrors `hal/xtensa-esp32s3/kernel/lib.saw` and the
+# board's `user/` linker scripts.
+ESP32S3_ARCH = {
+    "name": "xtensa-esp32s3",
+    "triple": "xtensa-esp-unknown-elf",
+    # The core has no privilege at all (hal/xtensa-esp32s3/ABI.md §5e).
+    "tier": TIER_FLAT,
+    # Espressif's clang, after `--target=<triple>`: the chip, and the two cc1
+    # features that make C and assembly call0 and FPU-free like sawc's objects
+    # (ABI.md §1a; the driver has no `-mabi`). `-fintegrated-as` keeps `.S`
+    # files off the external assembler, whose compressed debug sections this
+    # board's ld.lld refuses.
+    "cc_args": ["-mcpu=esp32s3",
+                "-Xclang", "-target-feature", "-Xclang", "-windowed",
+                "-Xclang", "-target-feature", "-Xclang", "-fp",
+                "-fintegrated-as", "-ffreestanding", "-fno-builtin",
+                "-ffunction-sections", "-fdata-sections"],
+    "hal_native": os.path.join("xtensa-esp32s3", "kernel"),
+    "build_tag": "esp32s3",
+    "tests_arch": "xtensa",
+    "banner_arch": "xtensa",
+    "hex_width": 8,
+    "root_entry": 0x403A0000,
+    # One region above root's; `hal/xtensa-esp32s3/user/child.ld` links there.
+    # The region is the size of root's, smaller than `CHILD_REGION_LEN`
+    # because this part has 400 KiB of SRAM in all.
+    "child_region_base": 0x403B8000,
+    "child_region_len": 0x18000,
+    # UART0's matrix source, which `hal.irq_raise_selftest_line()` raises.
+    "selftest_line": 27,
+    # Above the one child region, to the top of IRAM; `tests/poolbase_xtensa.c`
+    # says the same.
+    "pool_base": 0x403D0000,
+    "pool_len": 0x10000,
+    # UART0's page, mirroring `hal.DEVICE_GRANT_BASE` / `DEVICE_GRANT_LEN`.
+    "device_base": 0x60000000,
+    "device_len": 0x1000,
+}
+
 # How big a child's destination region is.
 #
 # The same size root gets, for the same reasons: its image plus the kernel's
 # stack grant at the top (`hal.ROOT_STACK_LEN`, the one stack length). Keeping
 # the two the same size lets one number here and one `ORIGIN` per child linker
-# script express the whole layout.
+# script express the whole layout. A board with less RAM states its own
+# (`child_region_len` in its arch entry); `_child_region_len` reads it.
 CHILD_REGION_LEN = 0x40000
+
+
+
+def _child_region_len(arch):
+    return arch.get("child_region_len", CHILD_REGION_LEN)
 
 # The boot region table's wire format (version 3), frozen: an 8-byte header
 # (magic, version u16, count u8, boot flags u8) then `count` rows of {base: u64,
@@ -1109,6 +1158,8 @@ ARCH_WORDS = [
     "sifive", "ns16550", "csr", "m-mode", "u-mode",
     "esr_el", "elr_el", "far_el", "vbar", "ttbr", "sctlr", "tcr_el", "mair",
     "pl011", "psci", "semihost", " svc ", "el0", "el1",
+    "xtensa", "exccause", "excvaddr", "excsave", "epc1", "vecbase", "simcall",
+    "intenable", "scompare1", "windowbase",
     # The interrupt controllers and the timers are spelled to avoid English
     # where they can (`gic` alone would match "magic", which the loader's own
     # diagnostics say), but `plic` still occurs inside English words;
@@ -7600,7 +7651,7 @@ def _build_blade(build_dir):
     return blade_bin
 
 
-def _blade_env(clang):
+def _blade_env(clang, lld=None):
     env = dict(os.environ)
     # The trailing -Oz rides into every blade-driven sawc invocation: the SAWC
     # value is a full command line split on spaces (blade's documented
@@ -7610,10 +7661,14 @@ def _blade_env(clang):
     # macOS's Apple clang mis-drives the riscv integrated assembler; hand Blade
     # the same clang this harness probed for.
     env["SOS_CLANG"] = clang
+    # A board whose images only its vendor's linker can link (the ESP32-S3's
+    # Xtensa objects) names that linker; Blade's default is `ld.lld` on PATH.
+    if lld is not None:
+        env["SOS_LD"] = lld
     return env
 
 
-def _build_root_image(blade_bin, pkg_dir, arch, clang):
+def _build_root_image(blade_bin, pkg_dir, arch, clang, lld=None):
     """`blade build --target <triple>` a root package; return its sosimg path.
 
     Always `--force`: the harness's job is to prove the current tree boots,
@@ -7633,7 +7688,7 @@ def _build_root_image(blade_bin, pkg_dir, arch, clang):
                 os.remove(os.path.join(out_dir, stale))
 
     _run([blade_bin, "build", "--force", "--target", arch["triple"]],
-         cwd=pkg_dir, env=_blade_env(clang))
+         cwd=pkg_dir, env=_blade_env(clang, lld))
 
     # The image is named for the package, which need not match its directory.
     images = []
@@ -7700,6 +7755,28 @@ def _emit_row(lines, arch, base_expr, len_expr, kind):
     lines.append("    .byte  0, 0, 0, 0, 0, 0, 0")
 
 
+def _region_table_section(arch, rows, flags):
+    """The `.regions` section, header and rows, as assembler lines.
+
+    The one place the header is written, for every board's stitcher: magic,
+    version, row count and the boot flags byte (`boot_flags`). `rows` are
+    (comment, base-expression, length-expression, kind), as `_region_rows`
+    makes them.
+    """
+    lines = [
+        "    .section .regions, \"a\", @progbits",
+        "    .balign 8",
+        f"    .4byte {REGION_TABLE_MAGIC:#010x}",
+        f"    .2byte {REGION_TABLE_VERSION}",
+        f"    .byte  {len(rows)}",
+        f"    .byte  {flags}",
+    ]
+    for i, (what, base_expr, len_expr, kind) in enumerate(rows):
+        lines.append(f"    /* row {i}: {what} */")
+        _emit_row(lines, arch, base_expr, len_expr, kind)
+    return lines
+
+
 def _region_rows(case, arch):
     """Which rows this case's table carries, in order: the whole contract.
 
@@ -7739,10 +7816,11 @@ def _region_rows(case, arch):
                      f"_sos_child{i}_start",
                      f"_sos_child{i}_end - _sos_child{i}_start",
                      REGION_KIND_RAM))
+    region_len = _child_region_len(arch)
     for i, _pkg in enumerate(children):
-        base = arch["child_region_base"] + i * CHILD_REGION_LEN
+        base = arch["child_region_base"] + i * region_len
         rows.append((f"child {i}'s destination RAM", f"{base:#x}",
-                     f"{CHILD_REGION_LEN:#x}", REGION_KIND_RAM))
+                     f"{region_len:#x}", REGION_KIND_RAM))
     if case.get("pool"):
         rows.append(("the RAM POOL — free memory above every child region",
                      f"{arch['pool_base']:#x}", f"{arch['pool_len']:#x}",
@@ -7802,19 +7880,9 @@ def _stitch_regions(case, arch, clang):
                 "    .balign 16",
             ]
 
-    rows = _region_rows(case, arch)
-    lines += [
-        "",
-        "    .section .regions, \"a\", @progbits",
-        "    .balign 8",
-        f"    .4byte {REGION_TABLE_MAGIC:#010x}",
-        f"    .2byte {REGION_TABLE_VERSION}",
-        f"    .byte  {len(rows)}",
-        f"    .byte  {boot_flags(case)}",
-    ]
-    for i, (what, base_expr, len_expr, kind) in enumerate(rows):
-        lines.append(f"    /* row {i}: {what} */")
-        _emit_row(lines, arch, base_expr, len_expr, kind)
+    lines.append("")
+    lines += _region_table_section(arch, _region_rows(case, arch),
+                                   boot_flags(case))
     lines.append("")
 
     stub_s = os.path.join(dirs["build"], f"{name}.regions.S")
@@ -8299,6 +8367,502 @@ def _root_image_path(pkg_dir, arch):
     return os.path.join(out_dir, images[0])
 
 
+def _esp32s3_smoke(wanted):
+    """The ESP32-S3 board smoke: Xtensa, call0, the `Flat` tier. Returns the
+    process exit status. `wanted` is the `--case` names (underscored), or
+    empty for every case.
+
+    It is not part of `make sos-test`: `make sos-smoke-esp32s3` runs it
+    against the Espressif QEMU, beside the C3's smoke and on the same terms.
+    What it shares with the gate: `TEST_CASES` (the process cases are the
+    gate's own, by name), the region-table and root-image stitchers, the
+    `boot_flags`/`needs_region_table` predicates, `_build_blade` and
+    `_check`. What it does not: its build directory, `.build/esp32s3/sos`,
+    and its run path, a flash image booted through the ROM under Espressif's
+    QEMU, one case at a time.
+
+    Two kinds of case, one list:
+      * the kernel on its own: boot to the banner, a fault taken in kernel
+        mode, and harness kernels that enter user mode on a hand-assembled
+        payload from `tests/xtensa/` (a syscall round trip; the tick taken from
+        user mode, pending in the kernel, and polled at a preemption point; a
+        device line through the interrupt matrix), and one kernel driving the
+        HAL's CPU interrupt table directly;
+      * real processes: the gate's own cases, named in `process_names` below,
+        whose root and child packages Blade builds for this board's triple and
+        this function stitches in with the gate's stitchers. Their kernel
+        source, packages and assertions are the gate's, formatted for this
+        board by `expectations(ESP32S3_ARCH)` and judged by `_check`. Two
+        more are this board's own, on the shipping kernel the same way.
+
+    The verdict is read twice. The kernel ends the emulator through
+    semihosting with its status (`hal.exit_pass`/`exit_fail`, `kernel_fault`),
+    so the exit status is asserted; and it prints a verdict line first, so the
+    transcript is asserted in order as well. A run that never reaches the
+    door is killed at the deadline and fails.
+
+    Every board fact below was derived from the running emulator and is
+    recorded with its probe in hal/xtensa-esp32s3/ABI.md.
+    """
+    import glob
+    import select
+    import struct
+
+    arch = ESP32S3_ARCH
+    dirs = arch_dirs(arch)
+    s3_hal = os.path.join(HAL_DIR, "xtensa-esp32s3")
+    s3_build = dirs["build"]
+    s3_tests = dirs["tests"]
+    s3_triple = arch["triple"]
+    flash_bytes = 4 * 1024 * 1024
+    flash_ibus = 0x42000000
+    magic_offset = 0x400
+    magic = 0xAEDB041D
+    timeout_s = 20
+
+    def s3_tool(pattern, what, hint):
+        """Find a machine-local Espressif tool, newest version first."""
+        hits = sorted(glob.glob(os.path.expanduser(pattern)), reverse=True)
+        if not hits:
+            print(f"{RED}no {what} found at {pattern}{RESET}", file=sys.stderr)
+            print(f"  {hint}", file=sys.stderr)
+            sys.exit(2)
+        return hits[0]
+
+    qemu = s3_tool(
+        "~/.espressif/tools/qemu-xtensa/*/qemu/bin/qemu-system-xtensa",
+        "Espressif QEMU for Xtensa",
+        "install it with the ESP-IDF tools installer; the `qemu-system-xtensa`"
+        " a package manager installs has no esp32s3 machine")
+    clang = s3_tool(
+        "~/.espressif/tools/esp-clang/*/esp-clang/bin/clang",
+        "esp-clang",
+        "the S3 build needs Espressif's clang and the ld.lld beside it, which "
+        "can link Xtensa; see hal/xtensa-esp32s3/ABI.md §1")
+    lld = os.path.join(os.path.dirname(clang), "ld.lld")
+    if not os.access(lld, os.X_OK):
+        print(f"{RED}no ld.lld beside {clang}{RESET}", file=sys.stderr)
+        print("  the S3 build links with the ld.lld esp-clang ships, which "
+              "can link Xtensa; see hal/xtensa-esp32s3/ABI.md §1",
+              file=sys.stderr)
+        sys.exit(2)
+
+    os.makedirs(s3_build, exist_ok=True)
+
+    def cc(src, obj, extra=()):
+        _run([clang, f"--target={s3_triple}", *arch["cc_args"], "-nostdlib",
+              *extra, "-c", src, "-o", obj])
+        return obj
+
+    def kernel_obj(name, src):
+        obj = os.path.join(s3_build, f"{name}.kernel.o")
+        _run(tc().sawc() + [src, "-o", obj, "-Oz",
+                            "--freestanding", "--no-hidden-alloc",
+                            "--runtime-provider",
+                            "--target", s3_triple,
+                            "--module-path", CORE_MODULE,
+                            "--module-path",
+                            f"hal={os.path.join(s3_hal, 'kernel')}",
+                            "--module-path", tc().module_path_arg("imgformat"),
+                            "--module-path", SOSRT_MODULE,
+                            "--module-path", SOSABI_MODULE])
+        return obj
+
+    def flash_image(name, objs):
+        """Link, then write each loadable segment into a 4 MiB flash image at
+        its load address's flash offset (ABI.md §1e), and check the
+        direct-boot magic is really there. Returns the image and the bytes
+        placed."""
+        elf = os.path.join(s3_build, f"{name}.elf")
+        flash = os.path.join(s3_build, f"{name}.flash.bin")
+        _run([lld, "-T", os.path.join(s3_hal, "kernel", "esp32s3.ld"),
+              "--gc-sections", "-o", elf, *objs])
+        with open(elf, "rb") as f:
+            data = f.read()
+        phoff, = struct.unpack_from("<I", data, 28)
+        phnum, = struct.unpack_from("<H", data, 44)
+        image = bytearray(b"\xff" * flash_bytes)
+        used = 0
+        for i in range(phnum):
+            p_type, offset, _vaddr, paddr, filesz = struct.unpack_from(
+                "<5I", data, phoff + 32 * i)
+            if p_type != 1 or filesz == 0:      # PT_LOAD with bytes to place
+                continue
+            if not flash_ibus <= paddr <= flash_ibus + flash_bytes - filesz:
+                raise ToolError(f"{name}: a segment loads at {paddr:#x}, "
+                                "outside the flash window")
+            at = paddr - flash_ibus
+            image[at:at + filesz] = data[offset:offset + filesz]
+            used += filesz
+        # Without these two words the mask ROM never enters the image and the
+        # run is a silent timeout; checking here turns that into a sentence.
+        m0, m1 = struct.unpack_from("<II", image, magic_offset)
+        if m0 != magic or m1 != magic:
+            raise ToolError(
+                f"{name}: flash image lacks the direct-boot magic (read "
+                f"{m0:#010x} {m1:#010x}, want {magic:#010x} twice) — check "
+                ".magic in hal/xtensa-esp32s3/kernel/esp32s3.ld")
+        with open(flash, "wb") as f:
+            f.write(image)
+        return flash, used
+
+    def boot(flash):
+        """Boot the image; collect the console until the emulator exits.
+
+        Returns the transcript and the exit status, or None for a run killed
+        at the deadline. Stderr is discarded: QEMU writes `Adding SPI flash
+        device` there on every run, which is noise a diff should never see.
+        """
+        proc = subprocess.Popen(
+            [qemu, "-machine", "esp32s3", "-nographic", "-semihosting",
+             "-drive", f"file={flash},if=mtd,format=raw"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL)
+        out = b""
+        deadline = time.time() + timeout_s
+        status = None
+        try:
+            while time.time() < deadline:
+                ready, _, _ = select.select([proc.stdout], [], [], 0.2)
+                if ready:
+                    chunk = os.read(proc.stdout.fileno(), 4096)
+                    if chunk:
+                        out += chunk
+                        continue
+                    # End of output: the emulator is exiting, so wait for its
+                    # status, but never past the deadline.
+                    try:
+                        status = proc.wait(
+                            timeout=max(0.0, deadline - time.time()))
+                    except subprocess.TimeoutExpired:
+                        pass
+                    break
+                if proc.poll() is not None:
+                    # Exited: whatever it wrote is already in the pipe.
+                    while True:
+                        chunk = os.read(proc.stdout.fileno(), 4096)
+                        if not chunk:
+                            break
+                        out += chunk
+                    status = proc.returncode
+                    break
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            proc.stdout.close()
+        return out.decode("utf-8", "replace"), status
+
+    rom = "ESP-ROM:esp32s3-20210327"
+    banner = "SOS M1: kernel up on xtensa (ESP32-S3)"
+    halt_pass = "SOS-S3: halt pass"
+    # The kernel-only cases, in the gate's case shape so `_check` judges them
+    # too. The exit status is the kernel's own semihosting exit, so a failing
+    # stop is non-zero and carries its code.
+    kernel_cases = [
+        {
+            # No image appended: the kernel must say so and fail. Direct boot,
+            # the split flash layout, the vectors and the console in one.
+            "name": "boot",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "expect_out": [rom, banner,
+                           "SOS: bad root image: no root image appended",
+                           "SOS-S3: halt fail code=0x00000004"],
+            "expect_clean_exit": False,
+            "expect_status": 4,
+        },
+        {
+            # A load the kernel cannot make arrives at the kernel vector
+            # (0x300) as LoadProhibited (0x1C) on the probe address, and stops
+            # the machine with 0x80 plus that vector's slot.
+            "name": "trap_fault",
+            "src": os.path.join(TESTS_DIR, "trap.saw"),
+            "expect_out": [rom,
+                           "SOS-S3: kernel fault vector=0x00000300 "
+                           "exccause=0x0000001c",
+                           "excvaddr=0x10000000"],
+            "expect_clean_exit": False,
+            "expect_status": 0x80 | (0x300 >> 6),
+        },
+        {
+            # "SOS-U" is written one character at a time through
+            # `debug_print`, so seeing it at all proves the syscall round trip
+            # resumed past each `syscall`; `shutdown(0)` is the last one.
+            "name": "umode_syscall",
+            "src": os.path.join(TESTS_DIR, "umode.saw"),
+            "asm": "payload_ok.S",
+            "expect_out": [rom, "SOS M1: entering U-mode", "SOS-U",
+                           halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # Ticks land in the arch-free hook after the kernel entered user
+            # mode for good, so each was taken from there, through the matrix
+            # and the user vector.
+            "name": "timer_tick",
+            "src": os.path.join(TESTS_DIR, "timer.saw"),
+            "asm": "payload_spin.S",
+            "expect_out": [rom, "SOS M2: timer armed",
+                           "SOS M2: entering U-mode",
+                           "SOS: timer tick 0x00000001 at ",
+                           "SOS: timer tick 0x00000002 at ",
+                           halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # The tick came due while the kernel spun and was not taken there.
+            "name": "timer_masked_in_kernel",
+            "src": os.path.join(TESTS_DIR, "timer_mask.saw"),
+            "asm": "payload_spin.S",
+            "expect_out": [rom, "SOS M2: kernel section begin",
+                           "SOS M2: kernel section end, timer expired, "
+                           "ticks taken=0x00000000",
+                           "SOS M2: entering U-mode",
+                           "SOS: timer tick 0x00000001 at ",
+                           halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # The same tick, delivered at a preemption point through
+            # `irq_poll`: `at 0x00000001` is the sentinel such a tick reports.
+            # The ticks-taken count is printed and not asserted, as on the
+            # gate: ticks accrue with host time.
+            "name": "preempt_tick",
+            "src": os.path.join(TESTS_DIR, "preempt_tick.saw"),
+            "asm": "payload_spin.S",
+            "expect_out": [rom, "SOS M3: kernel section begin",
+                           "SOS: timer tick 0x00000001 at 0x00000001",
+                           "SOS M3: kernel section end, ticks taken=",
+                           "SOS M3: entering U-mode",
+                           halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # A device line (UART0, source 27) raised in the kernel and taken
+            # from user mode; the number crossing from the raise to the hook
+            # says the claim found the source that was raised. The clean stop
+            # after it says the masked line did not fire again.
+            "name": "external_irq",
+            "src": os.path.join(TESTS_DIR, "extirq.saw"),
+            "asm": "payload_spin.S",
+            "expect_out": [rom, "SOS M2: raised external irq 0x0000001b",
+                           "SOS M2: entering U-mode",
+                           "SOS: external irq 0x0000001b",
+                           halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # CPU interrupts handed between lines by the HAL itself: a masked
+            # line keeps its own, an unmask with none unassigned takes one
+            # back from a masked line and not a pending one, and a line moved
+            # off a CPU interrupt no longer reaches it. The file's header has
+            # each step.
+            "name": "irq_takeback",
+            "src": os.path.join(s3_tests, "irq_takeback.saw"),
+            "expect_out": [rom,
+                           "SOS irqtb: 27 raised, poll=0x0000001b",
+                           "SOS irqtb: 27 masked while asserting, "
+                           "poll=0x00000000",
+                           "SOS irqtb: lines 1-8 unmasked and masked, "
+                           "poll=0x00000000",
+                           "SOS irqtb: line 9 unmasked, poll=0x00000000",
+                           "SOS irqtb: 27 unmasked, poll=0x0000001b",
+                           "SOS irqtb: line 10 unmasked, poll=0x00000000",
+                           "SOS irqtb: 27 raised, line 10 unmasked again, "
+                           "poll=0x00000000",
+                           "SOS irqtb: 27 unmasked, poll=0x0000001b",
+                           halt_pass],
+            "expect_clean_exit": True,
+        },
+    ]
+
+    # The process cases: the gate's, by name, each chosen for one thing the
+    # board has to get right that no other case here shows.
+    #
+    #   root_server_boot   Blade's image for this triple, loaded at
+    #                      `ROOT_LOAD_BASE`, entered, and its boot set drained
+    #   thread_basics      threads of one process, switched as frames
+    #   thread_preempt     the same under a tick harness kernel: preemption
+    #   timer_oneshot      a Timer fire through a Waiter, with the kernel idle
+    #                      on `irq_poll` in between
+    #   tier_word          the platform says `Flat`
+    #   process_lifecycle  a child: its image blob and destination rows, its
+    #                      own link address, created, started, reaped
+    #   death_fault        a child the kernel ends, observed by root as a wake
+    #   pipe_pingpong      a pipe call and its reply across two processes
+    #   map_into_child     the pool row, and `map` placing at the address
+    #   iomemory_carve     the device row and this board's window rule
+    #   interrupt_give     matrix sources bound as Interrupts, given to a child
+    #                      and returned to the free set by its teardown
+    #   tick_spinner       the shipping kernel's own tick preempting a child
+    #                      that never traps, so root's Timer wake can run
+    #
+    # Each image's boot flags are the gate's (`boot_flags`): "no tick" unless
+    # the case says `"tick": True`, which only `tick_spinner` does.
+    #
+    # A case asserting a hardware denial does not belong on a Flat board; the
+    # check below refuses one named here by mistake, with the gate's reason.
+    process_names = ["root_server_boot", "thread_basics", "thread_preempt",
+                     "timer_oneshot", "tier_word", "process_lifecycle",
+                     "death_fault", "pipe_pingpong", "map_into_child",
+                     "iomemory_carve", "interrupt_give", "tick_spinner"]
+    by_name = {c["name"]: c for c in TEST_CASES}
+    process_cases = [by_name[n] for n in process_names]
+    # This board's own process cases, for what only it has: a table of CPU
+    # interrupts that lines are given and give back, and the trap frame of
+    # its own entry path.
+    process_cases += [
+        {
+            # More distinct lines bound and released over the process's life
+            # than the board has CPU interrupts for, one held at a time; then
+            # the slab's limit, `MAX_INTERRUPTS`, is the one the process
+            # meets, as `NoResource`.
+            "name": "irq_line_cycle",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "irq-cycle"),
+            "expect_out": ["{banner}",
+                           "SOS irqcycle: bound and released lines 1 to 12, "
+                           "one at a time",
+                           "SOS irqcycle: the next bind answered NoResource",
+                           "SOS irqcycle: held 4 at once",
+                           "SOS irqcycle: done"],
+            "expect_clean_exit": True,
+        },
+        {
+            # Two threads holding distinct values in every register the trap
+            # frame carries, each round's handoff forced by the other's
+            # progress, so only a tick moves the processor between them
+            # (`thread_preempt` is the shape). A lost register is named, and
+            # the joined codes are not 0.
+            "name": "frame_hold",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "tick": True,
+            "root_pkg": os.path.join(TESTS_DIR, "frame-hold"),
+            "expect_out": ["{banner}",
+                           "SOS framehold: two threads holding registers, "
+                           "no yields",
+                           "SOS framehold: joined a=0 b=0"],
+            "expect_clean_exit": True,
+        },
+    ]
+    for case in process_cases:
+        if case.get("tier", arch["tier"]) != arch["tier"]:
+            print(f"{RED}{case['name']} is isolated-only: "
+                  f"{case['tier_reason']}{RESET}", file=sys.stderr)
+            return 1
+    cases = kernel_cases + process_cases
+
+    # `--case` narrows the run, as on the gate, and only the named cases'
+    # packages are built.
+    if wanted:
+        names = [c["name"] for c in cases]
+        unknown = [w for w in wanted if w not in names]
+        if unknown:
+            print(f"{RED}unknown --case for --board esp32s3: "
+                  f"{', '.join(unknown)}; known: {', '.join(names)}{RESET}",
+                  file=sys.stderr)
+            return 2
+        cases = [c for c in cases if c["name"] in wanted]
+        process_cases = [c for c in process_cases if c["name"] in wanted]
+
+    print(f"{BOLD}SOS ESP32-S3 board smoke{RESET}")
+    print(f"  qemu   {qemu}")
+    print(f"  clang  {clang}")
+    print(f"  target {s3_triple} (call0, no FPU; the Flat tier)")
+    print(f"  sawlang: {tc().source}  {tc().root or tc().sawc_env_value()}")
+
+    # The native half is one compile for every case. `boot.S` holds the
+    # vectors and the trap entry; `support.c` is the shared C floor, whose
+    # word atomics nothing references here (the compiler inlines `s32c1i`).
+    try:
+        shared = [cc(os.path.join(s3_hal, "kernel", "boot.S"),
+                     os.path.join(s3_build, "boot.o")),
+                  cc(os.path.join(s3_hal, "kernel", "sink.c"),
+                     os.path.join(s3_build, "sink.o"), extra=("-O2",)),
+                  cc(os.path.join(RT_COMMON_C_DIR, "support.c"),
+                     os.path.join(s3_build, "support.o"), extra=("-O2",))]
+    except ToolError as e:
+        print(f"{CROSS} failed to build the native half\n{e}", file=sys.stderr)
+        return 1
+
+    # Every root and child package, once, through Blade, with this board's
+    # compiler and linker. The images land under each package's
+    # `.build/<triple>/`, so nothing collides with the gate's builds.
+    pkgs = []
+    for case in process_cases:
+        for pkg in [case["root_pkg"], *case.get("children", ())]:
+            if pkg not in pkgs:
+                pkgs.append(pkg)
+    images = {}
+    try:
+        blade_bin = _build_blade(s3_build)
+        for pkg in pkgs:
+            image = _build_root_image(blade_bin, pkg, arch, clang, lld)
+            images[pkg] = image
+            print(f"  {os.path.relpath(image, REPO_ROOT)}  "
+                  f"({os.path.getsize(image)} bytes)")
+    except ToolError as e:
+        print(f"{CROSS} failed to build an image\n{e}", file=sys.stderr)
+        return 1
+    # The stitchers read a case's images by arch name, as on the gate.
+    for case in process_cases:
+        case.setdefault("_root_image", {})[arch["name"]] = \
+            images[case["root_pkg"]]
+        if case.get("children"):
+            case.setdefault("_child_images", {})[arch["name"]] = \
+                [images[c] for c in case["children"]]
+
+    failed = 0
+    for i, case in enumerate(cases, 1):
+        name = case["name"]
+        try:
+            objs = list(shared) + [kernel_obj(name, case["src"])]
+            if case.get("asm"):
+                objs.append(cc(os.path.join(s3_tests, case["asm"]),
+                               os.path.join(s3_build, f"{name}.payload.o")))
+            if case.get("root_pkg"):
+                objs.append(_stitch_root_image(
+                    case["_root_image"][arch["name"]], arch, clang, name))
+            if needs_region_table(case):
+                objs.append(_stitch_regions(case, arch, clang))
+            flash, size = flash_image(name, objs)
+            out, status = boot(flash)
+        except ToolError as e:
+            print(f"[{i}/{len(cases)}] {CROSS} {name}")
+            print(f"    {e}")
+            failed += 1
+            continue
+
+        if status is None:
+            ok, reason = False, f"the emulator was still running after " \
+                                f"{timeout_s}s"
+        else:
+            ok, reason = _check(case, arch, status, out, False)
+        if ok:
+            print(f"[{i}/{len(cases)}] {CHECK} {name}  "
+                  f"({size} bytes of flash)")
+            continue
+        failed += 1
+        # `_check`'s reason quotes the whole console; the console is printed
+        # below line by line instead, so only its first line is kept.
+        print(f"[{i}/{len(cases)}] {CROSS} {name}")
+        print(f"    {reason.split(' (got ')[0]}")
+        print("    --- console ---")
+        for line in out.splitlines():
+            print(f"    {line}")
+        print("    --- end ---")
+
+    print()
+    print("=" * 60)
+    if failed:
+        print(f"{RED}SOS ESP32-S3 SMOKE FAILED{RESET} "
+              f"({failed} of {len(cases)})")
+    else:
+        print(f"{GREEN}ESP32-S3 SMOKE PASSED{RESET} ({len(cases)} cases)")
+    print("=" * 60)
+    return 1 if failed else 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="SOS QEMU test harness")
     parser.add_argument("--arch", metavar="NAME",
@@ -8317,8 +8881,18 @@ def main():
                         help="board profile (default: virt, the GATE's). "
                              "`esp32c3` is the gating smoke target, run "
                              "after the suite: it needs the Espressif "
-                             "toolchain on the gate's machine")
+                             "toolchain on the gate's machine. `esp32s3` "
+                             "is the Xtensa board's smoke, on the same "
+                             "terms")
     args = parser.parse_args()
+
+    if args.board == "esp32s3":
+        # Board section: esp32s3, all of it in `_esp32s3_smoke`. `--case`
+        # takes the same spellings as on the gate.
+        wanted = [w.strip().replace("-", "_")
+                  for value in (args.cases or ()) for w in value.split(",")
+                  if w.strip()]
+        sys.exit(_esp32s3_smoke(wanted))
 
     if args.board != "virt":
         # ------------------------------------------------------------------
@@ -8327,7 +8901,7 @@ def main():
         # ------------------------------------------------------------------
         if args.board != "esp32c3":
             print(f"{RED}unknown --board {args.board!r}; known: virt, "
-                  f"esp32c3{RESET}", file=sys.stderr)
+                  f"esp32c3, esp32s3{RESET}", file=sys.stderr)
             sys.exit(2)
 
         # ------------------------------------------------------------------
@@ -8424,11 +8998,11 @@ def main():
         def c3_regions_stub(name, child_images, flags):
             """The child blobs and the boot region table that names them.
 
-            The virt path's `_stitch_regions` cannot be reused: it sizes a
-            child's destination row from the module-level `CHILD_REGION_LEN`,
-            which is too large for this board's SRAM. Row order is the same
-            contract (every blob, then every destination) because root's config
-            reads it as tags.
+            This board assembles its own stub, with its own compiler row and
+            child layout; the table itself comes from the shared
+            `_region_table_section`. Row order is the same contract (every
+            blob, then every destination) because root's config reads it as
+            tags.
             """
             lines = ["/* GENERATED by tools/sos_runner.py --board esp32c3 */",
                      "    .section .childimg, \"a\", @progbits",
@@ -8438,26 +9012,18 @@ def main():
                           f"    .incbin \"{img}\"",
                           f"_sos_child{i}_end:",
                           "    .balign 16"]
-            rows = [(f"_sos_child{i}_start",
+            rows = [(f"child {i}'s image blob (linker-resolved)",
+                     f"_sos_child{i}_start",
                      f"_sos_child{i}_end - _sos_child{i}_start",
                      REGION_KIND_RAM) for i in range(len(child_images))]
-            rows += [(f"{C3_CHILD_BASE + i * C3_CHILD_LEN:#x}",
+            rows += [(f"child {i}'s destination RAM",
+                      f"{C3_CHILD_BASE + i * C3_CHILD_LEN:#x}",
                       f"{C3_CHILD_LEN:#x}", REGION_KIND_RAM)
                      for i in range(len(child_images))]
-            lines += ["", "    .section .regions, \"a\", @progbits",
-                      "    .balign 8",
-                      f"    .4byte {REGION_TABLE_MAGIC:#010x}",
-                      f"    .2byte {REGION_TABLE_VERSION}",
-                      f"    .byte  {len(rows)}",
-                      f"    .byte  {flags}"]
-            for i, (base, length, kind) in enumerate(rows):
-                # 64-bit fields on a 32-bit assembler: low half then a zero
-                # high half, which is the same bytes little-endian.
-                lines += [f"    /* row {i} */",
-                          f"    .4byte {base}", "    .4byte 0",
-                          f"    .4byte {length}", "    .4byte 0",
-                          f"    .byte  {kind}",
-                          "    .byte  0, 0, 0, 0, 0, 0, 0"]
+            # The shared writer, with this board's word width: 64-bit fields
+            # as a low half and a zero high half.
+            lines += [""] + _region_table_section(
+                dict(c3_arch, hex_width=8), rows, flags)
             stub_s = os.path.join(C3_BUILD, f"{name}.regions.S")
             with open(stub_s, "w") as f:
                 f.write("\n".join(lines) + "\n")
@@ -8679,7 +9245,7 @@ def main():
                                                 c3_arch, clang)))
                 # Every image but the tick's carries a table, whatever its
                 # rows, because the boot flags live in its header.
-                if case["children"] or not case.get("tick"):
+                if needs_region_table(case):
                     objs.append(c3_regions_stub(
                         name, [_build_root_image(blade_bin, pkg, c3_arch, clang)
                                for pkg in case["children"]],

@@ -1,0 +1,107 @@
+// The ESP32-S3 HAL's CPU interrupts, handed between lines.
+//
+// A line keeps the CPU interrupt it was given while it is masked, and an
+// unmask that finds none unassigned takes one back from a masked line,
+// preferring one that is not pending (hal/xtensa-esp32s3/kernel/lib.saw,
+// `irq_unmask`). This drives the HAL directly, with no process: the device
+// line is UART0 (source 27), made to assert by enabling its "transmit FIFO
+// empty" interrupt, and the other lines are sources the emulator never
+// raises. Each step prints what `irq_poll` answers, which is the claim the
+// kernel would make on a trap:
+//
+//   27 masked while asserting         keeps its CPU interrupt, which stays
+//                                     pending
+//   lines 1-8 unmasked and masked     take the other eight
+//   line 9 unmasked                   takes one back, and not 27's pending
+//                                     one: it reads quiet
+//   27 unmasked                       still holds its own: fires at once
+//   lines 2-9 unmasked, 27 masked
+//   and quiet, line 10 unmasked       takes 27's back: quiet
+//   27 raised, line 10 again          27 no longer routed there: quiet
+//   27 unmasked                       takes line 10's back: fires
+//
+// UART0's model sends its level again on every register access, the console's
+// writes included, and each label is printed before the poll, so a level the
+// emulator's matrix does not move on a route write (../../hal/xtensa-esp32s3/
+// ABI.md §6c) has been sent by the time it is read.
+
+import kcore.{console}
+import hal
+
+struct Word { v: UInt32 }
+
+/// UART0's interrupt enable and clear registers, as the HAL's `EspUartRegs`
+/// lays them out, and the enable bit that asserts at once.
+static UART_INT_ENA: UInt = 0x6000_000C
+static UART_INT_CLR: UInt = 0x6000_0010
+static UART_TXFIFO_EMPTY: UInt32 = 2
+static ALL_CAUSES: UInt32 = 0xFFFF_FFFF
+
+static FIRST_QUIET_LINE: UInt = 1
+static LAST_QUIET_LINE: UInt = 10
+
+func show(label: String) unsafe {
+    let uart = console()
+    uart.write_str("SOS irqtb: ")
+    uart.write_str(label)
+    uart.write_str(", poll=")
+    uart.write_hex(hal.irq_poll())
+    uart.write_str("\n")
+}
+
+func uart_asserting(on: Bool) unsafe {
+    let enable: UInt32 = if on { UART_TXFIFO_EMPTY } else { 0 }
+    UnsafeMemory<Word, Device>(UART_INT_ENA).v.write(enable)
+    UnsafeMemory<Word, Device>(UART_INT_CLR).v.write(ALL_CAUSES)
+}
+
+func unmask_lines(first: UInt, last: UInt) unsafe {
+    var line = first
+    while line <= last {
+        hal.irq_unmask(line)
+        line = line + 1
+    }
+}
+
+func mask_lines(first: UInt, last: UInt) unsafe {
+    var line = first
+    while line <= last {
+        hal.irq_mask(line)
+        line = line + 1
+    }
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.intc_init()
+    let console_line = hal.irq_raise_selftest_line()
+    show("27 raised")
+    hal.irq_mask(console_line)
+    show("27 masked while asserting")
+
+    unmask_lines(FIRST_QUIET_LINE, 8)
+    mask_lines(FIRST_QUIET_LINE, 8)
+    show("lines 1-8 unmasked and masked")
+    hal.irq_unmask(9)
+    show("line 9 unmasked")
+    hal.irq_unmask(console_line)
+    show("27 unmasked")
+
+    hal.irq_mask(console_line)
+    hal.irq_mask(9)
+    uart_asserting(false)
+    unmask_lines(2, 9)
+    hal.irq_unmask(LAST_QUIET_LINE)
+    show("line 10 unmasked")
+    hal.irq_mask(LAST_QUIET_LINE)
+    uart_asserting(true)
+    hal.irq_unmask(LAST_QUIET_LINE)
+    show("27 raised, line 10 unmasked again")
+    hal.irq_mask(LAST_QUIET_LINE)
+    hal.irq_unmask(console_line)
+    show("27 unmasked")
+
+    hal.irq_mask(console_line)
+    uart_asserting(false)
+    hal.exit_pass()
+}

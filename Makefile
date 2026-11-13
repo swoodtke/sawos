@@ -22,3 +22,15 @@ sos-test:
 .PHONY: sos-smoke-esp32c3
 sos-smoke-esp32c3:
 	@python3 tools/sos_runner.py --board esp32c3
+
+# Gating: the ESP32-S3 board smoke — Xtensa, call0, the Flat tier. The server
+# runs it after the C3 smoke. Its cases are `_esp32s3_smoke`'s in
+# tools/sos_runner.py: harness kernels and gate cases with real processes.
+#
+# It needs the Espressif toolchain under ~/.espressif (QEMU with the esp32s3
+# machine, esp-clang and its ld.lld) on the machine that runs the gate; the
+# target says so and exits 2 if either is missing, which is a red gate, not a
+# skip.
+.PHONY: sos-smoke-esp32s3
+sos-smoke-esp32s3:
+	@python3 tools/sos_runner.py --board esp32s3

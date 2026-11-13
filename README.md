@@ -3,8 +3,10 @@
 SawOS (SOS) is a capability-based microkernel for embedded systems. It runs
 on riscv32 and arm64 — the gate is QEMU's `virt` boards for both, plus a
 flat build profile of the riscv32 board that turns its protection off, and
-there is a gating smoke target for the ESP32-C3 — with real hardware as
-the goal.
+there are gating smoke targets for the ESP32-C3 and the ESP32-S3 — with real
+hardware as the goal. The ESP32-S3 is Xtensa, a third architecture: under its
+emulator the kernel boots and runs processes on the flat tier, since the part
+has no protection hardware the kernel uses.
 
 Those three runs are the system's protection tiers, one story told on each:
 arm64 translates (per-process page tables, and a mapping's address is the
@@ -71,6 +73,8 @@ hal/riscv32-common/  the riscv32 architecture, shared by its boards
 hal/riscv32/         the riscv32 `virt` board
 hal/riscv32-flat/    the flat build profile of that board (a facade, not a fork)
 hal/riscv32-esp32c3/ the ESP32-C3 board (smoke target, not part of sos-test)
+hal/xtensa-esp32s3/  the Xtensa architecture and the ESP32-S3 board, on the
+                     flat tier (smoke target, not part of sos-test)
 rt/         the runtime the kernel and every process share
 root/       the root server, a normal package emitting a boot image
 tests/      kernel test entries and hand-assembled payloads

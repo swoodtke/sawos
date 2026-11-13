@@ -1,0 +1,169 @@
+// The trap frame holds every register across a preemption, on the ESP32-S3.
+//
+// Two threads of one process each run `sos_frame_hold` (`../hold.c`): every
+// round it loads values of its own into every register the board's trap frame
+// carries that a loop can hold (a0 and a2 to a13, SAR, SCOMPARE1, THREADPTR,
+// LBEG, LEND, LCOUNT), publishes the round, spins until the other thread has
+// published it too, and checks each value. The spin makes no call into the
+// kernel, so the thread that publishes first leaves its spin only after a tick
+// has taken the processor from it and the other thread has run: each round
+// crosses between the threads with registers held, however many ticks the
+// host delivers or how late. The two threads' values differ in every
+// register, so a register the restore path left as the other thread's, or as
+// the kernel's, is a mismatch.
+//
+//   SOS framehold: two threads holding registers, no yields
+//   SOS framehold: joined a=0 b=0
+//
+// A mismatch prints the register before its thread exits with the register's
+// code, and the case ends red. The kernel booting this image arms the tick
+// (the case's `"tick": True`); without it the first spin never ends.
+
+import sos.{System, Process, Thread}
+
+extern "C" {
+    func sos_frame_hold(mine: UInt, other: UInt, rounds: UInt,
+                        seed: UInt) -> UInt
+}
+
+/// The boot handle, parked for the workers, and the witness that says which
+/// thread `_start` is running as, as in `thread-preempt`.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// Each thread's published round, written and read by `sos_frame_hold`.
+unsafe static var PROGRESS: [UInt32; 2] = [0; 2]
+
+static STACK_WORDS: Int = 512
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+static PROGRESS_BYTES: UInt = 4
+
+static ROLE_A: UInt = 1
+static ROLE_B: UInt = 2
+static ROUNDS: UInt = 16
+
+/// Each thread's seed. The top nibbles differ, which places the two threads'
+/// LBEG and LEND apart, and so do the low six bits, which are SAR's.
+static SEED_A: UInt = 0x1357_0005
+static SEED_B: UInt = 0x2468_002A
+
+static NO_VALUE: UInt = 0xFFFF_FFFF
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+/// The address of `role`'s published round.
+func progress_word(role: UInt) unsafe -> UInt {
+    let base = ((&var PROGRESS) as UnsafePointer<UInt32>) as UInt
+    base + (role - ROLE_A) * PROGRESS_BYTES
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+/// The register a code from `sos_frame_hold` names.
+func register_name(code: UInt) -> String {
+    if code == 1 {
+        return "a0"
+    }
+    if code >= 3 && code <= 14 {
+        let names = ["a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10",
+                     "a11", "a12", "a13"]
+        return names[(code - 3) as Int]
+    }
+    if code == 20 {
+        return "SAR"
+    }
+    if code == 21 {
+        return "SCOMPARE1"
+    }
+    if code == 22 {
+        return "THREADPTR"
+    }
+    if code == 23 {
+        return "LBEG"
+    }
+    if code == 24 {
+        return "LEND"
+    }
+    if code == 25 {
+        return "LCOUNT"
+    }
+    "an unknown register"
+}
+
+func worker(role: UInt) {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let other = if role == ROLE_A { ROLE_B } else { ROLE_A }
+    let seed = if role == ROLE_A { SEED_A } else { SEED_B }
+    let code = sos_frame_hold(progress_word(role), progress_word(other),
+                              ROUNDS, seed)
+    if code != 0 {
+        print("\nSOS framehold: thread {} lost {}\n",
+              if role == ROLE_A { "A" } else { "B" }, register_name(code))
+    }
+    let _ = (move me).exit(code)
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS framehold: no process handle\n")
+        let _ = system.shutdown(1)
+        return
+    }
+
+    let a = try proc.thread_create(stack_top: stack_a_top(),
+                                    arg: ROLE_A) catch {
+        print("SOS framehold: create failed: {}\n", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let b = try proc.thread_create(stack_top: stack_b_top(),
+                                    arg: ROLE_B) catch {
+        print("SOS framehold: create failed: {}\n", error)
+        let _ = system.shutdown(1)
+        return
+    }
+
+    let _ = system.debug_print(
+        "SOS framehold: two threads holding registers, no yields\n")
+    let _ = a.start()
+    let _ = b.start()
+
+    let ra: UInt = try a.join() catch { NO_VALUE }
+    let rb: UInt = try b.join() catch { NO_VALUE }
+    print("SOS framehold: joined a={} b={}\n", ra, rb)
+    let _ = system.shutdown(if ra == 0 && rb == 0 { 0 } else { 1 })
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

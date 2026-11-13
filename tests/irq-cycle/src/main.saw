@@ -1,0 +1,70 @@
+// Interrupt lines bound and released, more of them over a process's life than
+// the board has CPU interrupts to route them to.
+//
+// The ESP32-S3 HAL gives each unmasked line a CPU interrupt of its own, from
+// a table of `DEVICE_CPU_INT_COUNT` (hal/xtensa-esp32s3/kernel/lib.saw), and
+// takes one back from a masked line when none is unassigned. So binding a
+// line, releasing it and binding the next must go on working past the
+// table's size: each released Interrupt's line is masked, and its CPU
+// interrupt can be taken back. Then the slab's own limit is the only one a
+// process meets: it holds `MAX_INTERRUPTS` at once, and the next bind answers
+// `NoResource`.
+//
+//   SOS irqcycle: bound and released lines 1 to 12, one at a time
+//   SOS irqcycle: the next bind answered NoResource
+//   SOS irqcycle: held 4 at once
+//   SOS irqcycle: done
+//
+// Lines 1 to 12 are matrix sources the emulator never raises.
+
+import sos.{System}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static FIRST_LINE: UInt = 1
+static LAST_LINE: UInt = 12
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    var line = FIRST_LINE
+    while line <= LAST_LINE {
+        let irq = try system.interrupt_bind(line: line) catch {
+            print("SOS irqcycle: binding line {} refused: {}\n", line, error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        let _ = move irq
+        line = line + 1
+    }
+    print("SOS irqcycle: bound and released lines {} to {}, one at a time\n",
+          FIRST_LINE, LAST_LINE)
+
+    print("SOS irqcycle: held {} at once\n", hold_until_refused(&system,
+                                                               FIRST_LINE))
+    let _ = system.debug_print("SOS irqcycle: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Bind lines from `line` up until a bind is refused, each Interrupt held in
+/// its own frame while the next is asked for; say what the refusal was, and
+/// answer how many were held.
+func hold_until_refused(system: &System, line: UInt) -> UInt {
+    let irq = try system.interrupt_bind(line: line) catch {
+        match error {
+            case NoResource -> {
+                let _ = system.debug_print(
+                    "SOS irqcycle: the next bind answered NoResource\n")
+            },
+            case _ -> {
+                print("SOS irqcycle: the next bind answered {}\n", error)
+            },
+        }
+        return 0
+    }
+    let n = hold_until_refused(&system, line + 1)
+    let _ = move irq
+    return n + 1
+}

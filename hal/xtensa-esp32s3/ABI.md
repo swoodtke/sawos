@@ -186,7 +186,8 @@ threadptr=0    configid0=0xc2f0fffe configid1=0x23090f1f
 - `a1` is the ROM's stack, inside its `.stack_pro` (0x3FCE_9704, 0x200C
   bytes, from the ROM ELF's section headers).
 - `VECBASE` is the ROM's table at 0x4000_0000; interrupts are all disabled;
-  the FPU is off (`CPENABLE=0`); `PRID=0xCDCD` is the PRO CPU.
+  the FPU is off (`CPENABLE=0`), which `_start` writes again rather than
+  rely on; `PRID=0xCDCD` is the PRO CPU.
 
 The stub's first act is to give up the window and the ROM's vectors:
 
@@ -548,6 +549,79 @@ Three ticks arrived, each with the interrupted user PC (§12). `PS.INTLEVEL`
 is 0 in user mode and the kernel runs at 15, so ticks are only ever taken
 from user mode.
 
+**Rerouting does not lower a line.** Probed by the kernel's `external_irq`
+smoke case with the mask written as a reroute: UART0 (source 27) routed to CPU
+interrupt 2 and asserting (its TX-FIFO-empty interrupt enabled), taken once,
+then its map register rewritten to 6. The next trap read
+
+```
+INTERRUPT=00000004 map27=00000006
+```
+
+and so did every one after it: CPU interrupt 2 stayed pending with no source
+routed to it, and the trap repeated forever. The emulator moves a level when
+the source changes, not when the route does.
+
+**Why: the installed model.** The emulator here is Espressif's
+`esp_develop_9.2.2_20250817`. Its matrix (`hw/xtensa/esp32s3_intc.c` as of
+espressif/qemu `e0bfd39`) does two things:
+
+- a write to a map register stores the number and moves no CPU interrupt's
+  level;
+- a source's level change is sent only to the CPU interrupt the source is
+  routed to at that moment.
+
+espressif/qemu `175bab5` ("drive each CPU line as the OR of its sources",
+on esp-develop) replaces both: each CPU interrupt's level becomes the OR of
+the sources routed to it, recomputed on every level change and every route
+write. That is the combinational matrix silicon has. Read from the two
+sources; the fixed build has not been run here.
+
+Four probes on the installed build, each a scratch kernel printing
+`INTERRUPT` after each step (UART0's level is raised and lowered through its
+`INT_ENA`, and its model sends its level again on every register access,
+console writes included):
+
+```
+UART0 asserting, 27 -> 2, then 27 -> 6         INTERRUPT=00000004
+  then UART0 lowered, raised, lowered (27 -> 6) INTERRUPT=00000004
+  then 27 -> 2, UART0 low                      INTERRUPT=00000000
+UART0 asserting on 3, then 27 -> 6             INTERRUPT=00000008
+  then source 5, quiet, -> 3                   INTERRUPT=00000008
+SYSTIMER alarm fired with 57 -> 6, then 57 -> 3
+  (SYSTIMER sends nothing more)                INTERRUPT=00000000
+a HAL that routed to 6 on mask:
+  2 freed from asserting 27, given to line 5    irq_poll answered 5
+```
+
+So on this build a CPU interrupt left high by a source routed away stays high
+until some source routed to it sends a level, and a source already asserting
+when it is routed somewhere new does not raise its new CPU interrupt until its
+device model sends its level again. UART0's model does on every access;
+SYSTIMER's does not.
+
+**What the HAL does about it.** A line is given a CPU interrupt from a table
+of nine (`DEVICE_CPU_INTS`: 2, 3, 4, 8, 9, 12, 13, 17, 18) when it is
+unmasked, and keeps it, routed, while masked: INTENABLE is the mask, and the
+source's level goes on reaching the CPU interrupt it will be enabled on again.
+An unmask that finds no entry unassigned takes one back from a masked line
+(its source to 6, its assignment cleared), preferring one whose `INTERRUPT`
+bit is clear: the HAL cannot tell a line whose Interrupt is gone from one
+awaiting its driver's ack, and a quiet entry is one where moving the route
+loses nothing and leaves no level behind for its next line. The limit is at
+most nine lines unmasked at once (`DEVICE_CPU_INT_COUNT`), never a count of
+lines ever bound; the kernel unmasks a line only for a live Interrupt, whose
+slab (`MAX_INTERRUPTS`) holds fewer, and for its selftest line.
+
+A take-back happens only once more distinct lines have been unmasked than
+there are CPU interrupts free. What it can cost: on silicon nothing, since
+the matrix is combinational and a source still asserting raises its new CPU
+interrupt at the route write (read from Espressif's fix and the model, not
+probed on a part); on this emulator, a masked line that is still bound, still
+asserting, and loses its CPU interrupt to a take-back does not fire at its
+next unmask unless its device model sends its level again. The smoke's
+`irq_takeback` walks the table through each of these steps.
+
 SYSTIMER's periodic mode (`TARGET0_CONF` bit 30 with the period in the low
 bits) is accepted (readback `0x40003e80` for period 16000), but a polling
 loop counted 3 alarms in 5.5 periods; the stub re-arms a one-shot instead.
@@ -631,7 +705,8 @@ user vector:  xsr a1, excsave1         ; a1 = this thread's frame
                 lbeg, lend, lcount, exccause, excvaddr, scompare1, threadptr
               wsr lcount <- 0          ; see below
               a2 = frame, a3 = exccause, a1 = kernel stack ; callx0 ktrap
-resume:       a1 = returned frame ; restore SRs ; wsr epc1 ; wsr ps ; isync
+resume:       a1 = returned frame ; restore SRs but lcount ; wsr epc1
+              wsr ps ; isync ; wsr lcount ; isync
               restore a0, a2..a15 ; wsr a1, excsave1 ; l32i a1, F_A1 ; rfe
 ```
 
@@ -642,6 +717,9 @@ to the kernel vector (and with EXCM=1, to the double vector) and are fatal
 without a mode witness. `LCOUNT` is zeroed on entry because the zero-overhead
 loop is address-triggered: with `LCOUNT` non-zero, kernel code reaching the
 user's `LEND` address (shared code in a flat image) would branch to `LBEG`.
+For the same reason it is restored last, once the frame's PS has put EXCM
+back: the loop-back is taken only with EXCM clear, so no kernel instruction
+runs with a live count.
 
 ### 7d. What the windowed ABI would add
 
@@ -681,6 +759,56 @@ anywhere. What the convention fixes for the HAL is the hand-written edges:
 the trap entry's call into `ktrap` passes its arguments in `a2` and `a3` and
 reads the returned frame from `a2`, and a syscall stub that is an ordinary
 call0 function receives its arguments in `a2..a7`.
+
+### 7f. Interrupts are masked in the kernel
+
+The kernel never takes an interrupt, whatever is armed and whenever it comes
+due. Every interrupt it enables is a level-1 CPU interrupt (§6c), and every
+instruction it executes runs with level 1 masked:
+
+- **From the ROM to `_start`'s `wsr ps`.** The handover PS is `0x00060320`,
+  INTLEVEL 0, but INTENABLE is 0 (§2b), so nothing can be taken. The first
+  instructions of `_start` write PS = `0x0F` (INTLEVEL 15, EXCM 0, UM 0) after
+  leaving the register window; `intc_init`, which is what first sets an
+  INTENABLE bit, runs much later, from `kmain`.
+- **The whole kernel.** Nothing in the kernel writes PS apart from the trap
+  entry and the restore path, both in `boot.S`; no C leaf in `sink.c` touches
+  it. So PS stays `0x0F` through `kmain`, the loader, `start_tick` and every
+  `ktrap`.
+- **The trap entry.** A trap arrives with PS.EXCM = 1, which masks levels up
+  to `XCHAL_EXCM_LEVEL` (3, §5d), so the save sequence is not interruptible;
+  it then writes PS = `0x0F` before calling `ktrap`.
+- **The restore path, and the first entry to user mode.** `sos_resume_frame`
+  writes the frame's PS, which carries EXCM = 1 (a saved PS always does, and
+  `frame_init` builds `0x30`), so level 1 stays masked until `rfe` clears EXCM
+  in the same instruction that enters user mode at INTLEVEL 0.
+
+Probed by a scratch HAL that prints PS at `kmain` and at `resume_frame` (in
+`start_process`, after `start_tick`, immediately before the first entry to
+user mode), in a scratch kernel that arms a 1 ms tick in `kmain` before the
+root image is loaded, booting the `map_into_child` images (the largest root
+image, with a child and a pool):
+
+```
+PROBE kmain ps=0x0000000f
+PROBE resume_frame ps=0x0000000f intenable=0x00000002 interrupt=0x00000000
+...
+PROBE resume_frame ps=0x0000000f intenable=0x00000002 interrupt=0x00000002
+```
+
+The second `resume_frame` line is the tick pending and enabled (CPU interrupt
+1) at PS = `0x0F`, not taken. Booted 30 times: 30 clean ends, no kernel
+fault. The control is the same build with the kernel's PS written as `0x00`
+(INTLEVEL 0): 30 boots, 30 kernel faults, each
+`SOS-S3: kernel fault vector=0x00000300 exccause=0x00000004`, a level-1
+interrupt taken at the kernel vector. So the masking is what keeps the kernel
+clean, not the timing of the load.
+
+Unlike the ESP32-C3's emulator, this one delivers the matrix interrupt to
+user mode (the smoke's `timer_tick` takes it at the payload's PC), so the
+scheduler tick preempts a process here: the smoke's `tick_spinner` case
+reaches root's Timer wake past a child that never traps, and runs into the
+harness deadline with the image's "no tick" flag set.
 
 ---
 
@@ -778,6 +906,20 @@ debugger attached is not probed; the stub uses it only at the end.
   is `XCHAL_HW_CONFIGID1` in esp-idf's S3 `core-isa.h`. The ROM ELF's
   `xthals_hw_configid1` is `0x23086d67`, the configuration that ROM was built
   against (`CONFIGID0` agrees: `0xc2f0fffe` both).
+- **Rerouting a source.** Here a CPU interrupt stays pending after its
+  asserting source is routed away, and a route write raises nothing (§6c).
+  Silicon's matrix is combinational, as Espressif's fixed model is, but that
+  is read, not probed. The HAL moves a route only on a take-back, and is
+  correct under either answer except for what §6c says a take-back can cost
+  here.
+- **Process memory at IRAM addresses** (§13). Every process's code, data,
+  arena and stack sit at IRAM addresses here, and the loader writes images
+  there with ordinary stores. The emulator serves data loads and stores of
+  any width at those addresses (§3c); whether silicon serves data accesses
+  through the IRAM window at all is unprobed. If it does not, a process's
+  writable segments and stack need the DRAM twin of its region, which is a
+  second address for the same bytes and so a change to the linker scripts
+  and the loader's destination, not to the program.
 - **The interrupt matrix reset value.** Unrouted map registers read 6 here,
   with the ROM or without it (a `-kernel` image reads 6 at sources 0 and 27),
   so 6 is the emulator's reset value and not something the ROM writes.
@@ -826,3 +968,57 @@ word (§11). On the handover line `ps` and `atomctl` are the values
 the ROM left; `vecbase` is the stub's own table, printed after the stub
 installed it (the ROM's is in §2b). Without `-semihosting` the transcript is
 the same and the harness kills QEMU after `STUB: halt pass`.
+
+---
+
+## 13. Processes
+
+Not a probe of the emulator so much as the layout the HAL chose over §3, and
+what the kernel's own smoke cases showed about it (`make
+sos-smoke-esp32s3`, the process cases in `tools/sos_runner.py`).
+
+### 13a. The layout
+
+```
+IRAM 0x4037_8000 - 0x4037_BFFF  kernel vectors + trap path
+DRAM 0x3FC8_C000 - 0x3FCA_FFFF  kernel .data + .bss (arena, 64K stack)
+IRAM 0x403A_0000 - 0x403B_7FFF  root's region: image + arena, the top
+                                16 KiB its stack (`user/root.ld`)
+IRAM 0x403B_8000 - 0x403C_FFFF  a child's region, the same shape
+                                (`user/child.ld`)
+IRAM 0x403D_0000 - 0x403D_FFFF  the RAM pool a case may ask for
+```
+
+No range above is the DRAM twin of another (§3a's alias, IRAM + n against
+DRAM 0x3FC8_8000 + n), so the layout is the same bytes on silicon. The
+process regions are the twin of DRAM 0x3FCB_0000 - 0x3FCE_FFFF, which
+includes the ROM's RAM (§3b): nothing writes there until the kernel loads a
+process, long after the boot path has left the ROM's stack.
+
+Each image is a Blade-built sosimg linked at its region's base: one R+X
+segment (literal pools, code, read-only data) and one R+W segment (data, then
+the zero-filled `.bss` and arena). The kernel's link script puts the appended
+root image in `.payload`, at an instruction-bus address, and child images in
+`.childimg`, at a data-bus address.
+
+### 13b. What the cases showed
+
+- The loader reads a root image through the instruction-bus window
+  (`.payload`, 0x420x_xxxx) and a child's through the data-bus window
+  (0x3C2x_xxxx), and copies both into IRAM with ordinary stores. Each process
+  then runs from IRAM: root reports `entry=0x403a043c` on its load line, and
+  its ticks report PCs in 0x403A_xxxx.
+- A process's stack, data and arena at IRAM addresses take loads and stores
+  of every width, `s32c1i` included (the inline word atomics, §8).
+- Two processes run at two link addresses in one address space, and a child
+  started from a blob runs at the destination its region-table row names.
+- Two threads of one process, preempted by the tick in the middle of a spin
+  that holds a0, a2..a13, `SAR`, `SCOMPARE1`, `THREADPTR`, `LBEG`, `LEND` and
+  `LCOUNT` (non-zero, with `LEND` at an address never executed), find every
+  one as they left it (`frame_hold`, `tests/frame-hold/hold.c`).
+- A process binds and releases more distinct lines than there are device CPU
+  interrupts (§6c) and goes on binding; the slab's `NoResource` is the limit
+  it meets (`irq_line_cycle`).
+
+All of this rests on the emulator's generous bus (§3c); §11 lists what
+silicon may refuse.

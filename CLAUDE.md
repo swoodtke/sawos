@@ -31,6 +31,12 @@ hal/riscv32-flat/  # the flat build profile of that board: a facade, not a
                    # seam. The gate runs this profile
 hal/riscv32-esp32c3/ # the ESP32-C3 board, same shape — reached only by
                    # `make sos-smoke-esp32c3`, which gates after sos-test
+hal/xtensa-esp32s3/  # Xtensa (call0) and the ESP32-S3 board in one
+                   # directory, as arm64's: kernel/ (boot.S with the vectors
+                   # and trap entry, sink.c, lib.saw on the Flat tier,
+                   # esp32s3.ld) + user/ (the syscall stub, root.ld,
+                   # child.ld) + ABI.md, the board facts. Reached by
+                   # `make sos-smoke-esp32s3`
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 root/              # the root server: a real Blade package, sosimg emit
@@ -78,8 +84,9 @@ A `SAWLANG_ROOT` run skips the pin's version check, so it builds with whatever
 compiler that checkout holds, which may not be the one the server's `fetch` run
 uses.
 The sawtracker server runs the full suite. `.sawtracker/tests.json` runs
-`make sos-test sos-smoke-esp32c3` on every SO patch, and a merge needs a green
-run. The server rebases a patch onto current main before its run.
+`make sos-test sos-smoke-esp32c3 sos-smoke-esp32s3` on every SO patch, and a
+merge needs a green run. The server rebases a patch onto current main before
+its run.
 `sawtracker patch log PATCH` prints the run's transcript; the header's
 `sawlang:` line names the resolution step that answered, and a run at the pin
 reads `fetch`.
@@ -98,6 +105,14 @@ isolated profiles enforce both the syscall-path checks and memory protection.
 runs it after `sos-test`, and it needs the Espressif toolchain (QEMU with the
 esp32c3 machine, esp-clang) on the machine that runs the gate. It is not part
 of `sos-test` itself.
+
+`make sos-smoke-esp32s3` is the ESP32-S3 board smoke, on the same terms: it is
+gating, the server runs it after the C3 smoke, it needs the Espressif toolchain
+on the gate's machine (QEMU with the esp32s3 machine, esp-clang and its
+`ld.lld`), and it is not part of `sos-test`. Its cases are the gate's harness
+kernels on hand-assembled payloads from `tests/xtensa/`, and gate cases with
+real processes, whose packages carry a `[sos.xtensa-esp-unknown-elf]` section.
+`--case` narrows it as it does the gate.
 
 The runner is parallel by default: one job per performance core, detected.
 `SOS_JOBS` overrides the detection and `-j N` overrides both; the count is

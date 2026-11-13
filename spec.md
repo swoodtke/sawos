@@ -2561,23 +2561,25 @@ Everything else derives from those handles.
 syscall is `object.method(args)` — there are no bare numbered syscalls. The
 register convention, per profile:
 
-| Role | Profile A (riscv32) | Profile B (arm64) |
-|---|---|---|
-| handle in / status out | `a0` | `x0` |
-| op (a method id on that object's table) | `a7` | `x8` |
-| arguments | `a1`-`a3` | `x1`-`x3` |
-| value/handle out | `a1` | `x1` |
-| trap | `ecall` | `svc #0` |
+| Role | Profile A (riscv32) | Profile B (arm64) | ESP32-S3 (Xtensa) |
+|---|---|---|---|
+| handle in / status out | `a0` | `x0` | `a2` |
+| op (a method id on that object's table) | `a7` | `x8` | `a8` |
+| arguments | `a1`-`a3` | `x1`-`x3` | `a3`-`a5` |
+| value/handle out | `a1` | `x1` | `a3` |
+| trap | `ecall` | `svc #0` | `syscall` |
 
-The two are the same shape one-to-one, deliberately: the op sits in a
-register outside the argument run on both, so arguments are a clean sequence
-and neither profile has to shuffle. `x8` is where AArch64 Linux puts a syscall
-number, so every disassembler and every reader who has seen one arm64 syscall
-reads this one correctly. One difference is not cosmetic and belongs to the
-HAL rather than the kernel: `ecall` leaves the saved PC pointing at the
-instruction and `svc` leaves it pointing past, so advancing on return is a
+They are the same shape one-to-one, deliberately: the op sits in a register
+outside the argument run on each, so arguments are a clean sequence and no
+profile has to shuffle. On Xtensa the run is call0's argument registers,
+which begin at `a2`. `x8` is where AArch64 Linux puts a syscall number, so
+every disassembler and every reader who has seen one arm64 syscall reads this
+one correctly. One difference is not cosmetic and belongs to the HAL rather
+than the kernel: `ecall` and Xtensa's `syscall` leave the saved PC pointing at
+the instruction and `svc` leaves it pointing past, so advancing on return is a
 per-profile decision (a kernel that advanced on Profile B would skip the
-instruction after every syscall).
+instruction after every syscall), and so is by how much (`syscall` is three
+bytes).
 
 **Statuses.** The status word is 0 for ok, else a small **`SosStatus`** enum
 tag. An enum with an `Ok` case is a status, not an error (`SosStatus.Ok`,
@@ -2848,6 +2850,13 @@ profile of §5b.1 — three gate runs — and any run failing is red.
   from a kernel bug in one branch. A U-mode trap saves 31 GPRs + `mepc` into a
   32-word frame (word `i` holds `x<i>`; word 0 holds `mepc`). A kernel-mode trap
   is `kernel_fault`, which reports and fails the run rather than hanging.
+- **The ESP32-S3's trap entry** (Xtensa, call0, every image) is the user
+  vector: `syscall` and level-1 interrupts taken with PS.UM = 1 arrive there,
+  and `EXCSAVE1` holds the running thread's frame address. A 26-word frame
+  saves PC, PS, `a0`-`a15`, `SAR`, the loop registers, `SCOMPARE1` and
+  `THREADPTR`. The kernel runs with PS.UM = 0 and INTLEVEL 15, so a trap it
+  takes arrives at another vector, which is `kernel_fault`, and no interrupt
+  is ever delivered to it. Semihosting `SYS_exit` stops the machine.
 - **Profile B's FP/SIMD contract:** the kernel executes no FP/SIMD instruction
   (sawc builds without them, the kernel's C is built with
   `-mgeneral-regs-only`, and the runner disassembles every arm64 kernel image
@@ -2882,7 +2891,7 @@ can ask about (`SystemOp.TierGet`, §2.8):
 | riscv32 `virt`, flat build profile | 3 | yes — a third run | a module swap over the same board: `prot_*` no-ops, PMP opened with one TOR entry, `prot_isolated()` false. No new toolchain, and the tier-3 story's test target |
 | ESP32-C3 | 2, at the floor | no — a gating board smoke (`make sos-smoke-esp32c3`) | 16 PMP entries exactly, 400 KB SRAM; XIP is the entry price |
 | ESP32-P4 | 2 | no — no QEMU machine yet | 32 PMP + 16 PMA, 768 KB; the first real tier-2 part |
-| ESP32-S3-class | 3 | no | WORLD0/1 only; a `--target` port, not a new backend |
+| ESP32-S3 (Xtensa LX7, call0) | 3, `Flat` | no — a board smoke (`make sos-smoke-esp32s3`) | the core has no privilege (PS.UM picks a vector, not a permission), so the `prot_*` seam installs nothing and `prot_isolated()` is false; the off-core WORLD0/1 controller is unused. Processes are Blade-built images at fixed IRAM link addresses, one per resident image as on riscv32, and run the gate's own programs. An interrupt line holds one of the board's nine device CPU interrupts (`DEVICE_CPU_INT_COUNT`) while it is unmasked and may lose it to another line once masked, so the limit is at most nine lines unmasked at once, never a count of lines ever bound; the Interrupt slab (`MAX_INTERRUPTS`) stays below it, so a bind meets the slab's `NoResource` first. `hal/xtensa-esp32s3/` |
 
 **Two words and not three.** `Isolated` and `Flat`; MMU-vs-MPU is not
 advertised, because slot pricing and the `map` answer are already the visible
@@ -3021,9 +3030,11 @@ mode only. The harness kernels that test the tick and timers arm their own.
   kernel that could enter user mode without a Process would have syscalls no
   handle table answers.
 - **User FP/SIMD state travels with the thread, on Profile B.** Profile A has
-  no FPU, so there is none to carry. The trap frame holds general registers
-  only, and the kernel executes no FP/SIMD instruction, so a trap that resumes
-  the same thread (an interrupt included) saves nothing. Each thread's
+  no FPU, so there is none to carry, and the ESP32-S3 profile leaves its FPU
+  disabled (`CPENABLE` = 0), so an FP instruction there is a fault. The trap
+  frame holds general registers only, and the kernel executes no FP/SIMD
+  instruction, so a trap that resumes the same thread (an interrupt included)
+  saves nothing. Each thread's
   V0-V31, `FPCR` and `FPSR` live in an area after its frame, in its own slot,
   and a new thread's area is zero. EL0 access to FP/SIMD is off for a thread
   that has not used it: the first instruction traps (§5b), the thread's own
