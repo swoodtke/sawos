@@ -666,6 +666,7 @@ CHILD_WX_FAULT_PKG = os.path.join(TESTS_DIR, "child-wx-fault")
 LATE_DOOR_GONE_PKG = os.path.join(TESTS_DIR, "late-door-gone")
 CHILD_LATE_DOOR_PKG = os.path.join(TESTS_DIR, "child-late-door")
 CHILD_LATE_DOOR2_PKG = os.path.join(TESTS_DIR, "child-late-door2")
+DEVICE_FOUR_BYTES_PKG = os.path.join(TESTS_DIR, "device-four-bytes")
 
 # Clock and Timer objects. What an object answers and whether a wait parks are
 # separate questions, so they get separate packages: a scheduling bug cannot
@@ -8039,6 +8040,31 @@ TEST_CASES = [
                        "delivery went to the other process",
                        "SOS latedoor: done"],
         "expect_clean_exit": True,
+    },
+    {
+        # A device window of four bytes grants those four bytes and no more
+        # (spec §2.5). Root carves the console UART's page down to the four
+        # registers at offset 4, maps them, reads the scratch register inside
+        # the carve, and then reads the receive buffer at offset 0, just below
+        # it, which must fault. A window that size is one NA4 PMP entry; as a
+        # NAPOT entry its size would come from the base's trailing ones, here
+        # sixteen bytes from the page's start.
+        #
+        # riscv32 only: the assertion is the hardware's denial, which the flat
+        # profile disclaims, and arm64 grants device memory by the page, so a
+        # four-byte carve is a `BadArg` there before anything is mapped.
+        "name": "device_window_four_bytes",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEVICE_FOUR_BYTES_PKG,
+        "device": True,
+        "arches": ["riscv32"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS devfour: mapped four bytes at offset 4",
+                       "SOS devfour: read inside the window",
+                       "SOS devfour: reading below the window",
+                       "SOS: fault "],
+        "expect_clean_exit": False,
     },
 ]
 

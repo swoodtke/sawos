@@ -1,0 +1,72 @@
+// A device window of four bytes grants those four bytes and no more (spec
+// §2.5).
+//
+// Root carves the console UART's page down to the four bytes at offset 4 (the
+// modem control, line status, modem status and scratch registers), maps the
+// carve into itself, reads the scratch register inside it, and then reads the
+// receive buffer register at offset 0, just below it:
+//
+//   SOS devfour: mapped four bytes at offset 4
+//   SOS devfour: read inside the window
+//   SOS devfour: reading below the window
+//   SOS: fault ...
+//
+// The read below the window must fault. The receive buffer is read with no
+// input pending, so a read that landed would change nothing; the case would
+// then print its own failure line.
+
+import sos.{System, Process, IoMemory, Mapping, SosStatus}
+
+/// Where the carve starts in the page, and how long it is.
+static CARVE_OFFSET: UInt = 4
+static CARVE_LEN: UInt = 4
+
+/// The 16550's scratch register, inside the carve, and its receive buffer,
+/// just below it. Both are the page's own registers.
+static UART_SCR: UInt = 0x1000_0007
+static UART_RBR: UInt = 0x1000_0000
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+func read_byte(at: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Device>(at).read()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS devfour: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var record = try proc.boot_handle_next() catch {
+        print("SOS devfour: no device window: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let window = record.take_iomemory() else {
+        let _ = system.debug_print("SOS devfour: boot record is not a window\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let piece = try window.carve(offset: CARVE_OFFSET, len: CARVE_LEN) catch {
+        print("SOS devfour: carve refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _mapping = try proc.map(iomemory: &piece) catch {
+        print("SOS devfour: map refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS devfour: mapped four bytes at offset 4\n")
+    let _ = read_byte(UART_SCR)
+    let _ = system.debug_print("SOS devfour: read inside the window\n")
+    let _ = system.debug_print("SOS devfour: reading below the window\n")
+    let _ = read_byte(UART_RBR)
+    let _ = system.debug_print("SOS devfour: UNREACHABLE: the read landed\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

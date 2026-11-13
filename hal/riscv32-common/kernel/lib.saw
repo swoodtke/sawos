@@ -245,8 +245,9 @@ public static GRANT_ROW_BUDGET: UInt = 8
 /// granularity rule, checked on caller-chosen numbers.
 ///
 /// A device window costs one naturally-aligned power-of-two entry rather than a
-/// TOR pair, so a carved sub-window must have the same shape the board's static
-/// asserts pin for the board's own window. A violation is a `BadArg` fault at
+/// TOR pair (NAPOT, or NA4 for four bytes: `prot_device`), so a carved
+/// sub-window must have the same shape the board's static asserts pin for the
+/// board's own window. A violation is a `BadArg` fault at
 /// the carve: the caller chose the offset and the length.
 ///
 /// Architectural: it is PMP's NAPOT rule, so the predicate is the same on every
@@ -295,6 +296,7 @@ public func device_window_ok(base: UInt, len: UInt) -> Bool {
 /// `pmp` may not appear in `kernel/core`.
 static PMP_REGIONS: UInt = GRANT_ROW_BUDGET
 static PMP_A_TOR: UInt = 0x8              // cfg bits 4:3 = 1 (top-of-range)
+static PMP_A_NA4: UInt = 0x10             // cfg bits 4:3 = 2 (four bytes)
 static PMP_A_NAPOT: UInt = 0x18           // cfg bits 4:3 = 3 (naturally aligned)
 static PMP_PERM_MASK: UInt = 0x7          // cfg bits 2:0 — R, W, X
 static PMP_PERM_RW: UInt = 0x3            // R | W, with X deliberately clear
@@ -384,9 +386,12 @@ func stage_cfg(entry: UInt, cfg: UInt) unsafe {
 ///
 /// A NAPOT entry encodes a naturally aligned power-of-two region as one address
 /// word (the trailing ones say how big it is), so a device window costs one
-/// entry where a TOR region costs two. `len` is a power of two and `base` is
-/// aligned to it; the loader's own asserts pin both, so nothing is validated
-/// here.
+/// entry where a TOR region costs two. `len` is a power of two of at least
+/// eight and `base` is aligned to it (`device_window_ok`, and the board's own
+/// asserts for its window), so nothing is validated here. Eight is NAPOT's
+/// smallest region: the encoding of four bytes is NA4's, and this arithmetic
+/// handed four bytes would describe a region sized by the base's own trailing
+/// ones (`prot_device` takes that case).
 func napot_bound(base: UInt, len: UInt) -> UInt {
     (base | (len / 2 - 1)) >> PMP_GRAIN_SHIFT
 }
@@ -402,11 +407,20 @@ func napot_bound(base: UInt, len: UInt) -> UInt {
 /// It spends the same numbered region slot a segment would. The entry it
 /// programs is the pair's high one, where `prot_region` puts a TOR region's
 /// permissions, and the pair's low entry stays disabled.
+///
+/// A window of `PROT_GRAIN` bytes, which `device_window_ok` allows (a device
+/// register is commonly one word), is an NA4 entry: the base itself, matching
+/// those four bytes and no more. Every longer window is a NAPOT entry.
 public func prot_device(idx: UInt, base: UInt, len: UInt) unsafe {
     if idx >= PMP_REGIONS {
         return
     }
     let entry = idx * 2 + 1
+    if len == PROT_GRAIN {
+        sos_pmpaddr_write(entry, base >> PMP_GRAIN_SHIFT)
+        stage_cfg(entry, PMP_PERM_RW | PMP_A_NA4)
+        return
+    }
     sos_pmpaddr_write(entry, napot_bound(base, len))
     stage_cfg(entry, PMP_PERM_RW | PMP_A_NAPOT)
 }

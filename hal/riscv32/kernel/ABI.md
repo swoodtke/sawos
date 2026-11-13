@@ -198,8 +198,10 @@ and they are compiled from one definition so they cannot skew.
 - **A device window is one NAPOT entry, not a TOR pair.** PMP encodes a
   naturally aligned power-of-two region as a single address word whose trailing
   ones give its size, so the console's page costs one entry where a bounded
-  region costs two. The budget is `PMP_REGIONS` regions, which uses every entry
-  the part implements, so there is no further widening — and the NAPOT shape is
+  region costs two. NAPOT's smallest region is eight bytes, so a window of four
+  is one NA4 entry instead, matching exactly those bytes. The budget is
+  `PMP_REGIONS` regions, which uses every entry the part implements, so there
+  is no further widening — and the NAPOT shape is
   a rule a caller must satisfy, since `carve` lets a process choose a window's
   bounds (`device_window_ok`). The window is page-aligned and page-sized for a
   speed reason rather than a protection one, and it is the same one `virt.ld` is
