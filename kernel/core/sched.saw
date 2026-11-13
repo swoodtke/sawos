@@ -58,6 +58,7 @@ import kcore.threads.{
     LAST_PROT_PROCESS,
     NEED_RESCHED,
     PENDING_FREE,
+    READY_HEAD,
     SLICE_LEFT,
     SLICE_TICKS,
     THREADS,
@@ -82,9 +83,10 @@ import kcore.waitables.{
     set_waitable_attachment,
     unblock_process,
 }
-import kcore.process.{UNSTARTED_PENDING, clear_domain, load_domain}
+import kcore.process.{DOOM_PENDING, UNSTARTED_PENDING, clear_domain,
+                      load_domain}
 
-import kcore.irq.{has_external_wake_source, idle_until_runnable}
+import kcore.irq.{has_external_wake_source, idle_once}
 
 // =============================================================================
 // The scheduler
@@ -140,9 +142,10 @@ func run_thread(next: Int) unsafe -> UInt {
 /// `run_thread`, and not at the top of this function.
 public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     // First, so that what the trap just did is whole before anything is
-    // chosen: a `Created` process whose last name it dropped is gone by the
-    // time the caller, or anyone, runs again (`drain_unstarted`).
-    drain_unstarted()
+    // chosen: a `Created` process whose last name it dropped, and a process
+    // whose parked call a delivery found without its buffer, are gone by the
+    // time the caller, or anyone, runs again (`drain_deaths`).
+    drain_deaths()
     let cur = CURRENT_THREAD
     if cur == NO_THREAD {
         return current_frame
@@ -201,6 +204,34 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     }
 
     run_thread(next)
+}
+
+/// Park the core until something is runnable again.
+///
+/// The exit condition is the ready queue, not the poll (`idle_once` says why).
+/// The callers ask `has_external_wake_source` before they start, but the answer
+/// can change while the kernel idles: a one-shot Timer that fires disarms
+/// itself, and if nobody was parked on it nothing becomes runnable. So each
+/// time a delivery returns with the queue still empty the question is asked
+/// again, and a "no" is a deadlock (the machine stops).
+///
+/// The deaths a delivery owes come first (`drain_deaths`), and the question is
+/// asked only after them: a process ended here can make its supervisor
+/// runnable, and a deadlock is reported only when nothing else can happen. The
+/// check sits after the delivery has returned, so a wake it made is already on
+/// the queue and a wake in progress is never mistaken for none.
+///
+/// No preemption point: this loop is delivery, and the bounded scans beside it
+/// (`has_external_wake_source`) are `MAX_INTERRUPTS` + `MAX_TIMERS` iterations
+/// of O(1) work.
+func idle_until_runnable() unsafe {
+    while READY_HEAD == 0 {
+        idle_once()
+        drain_deaths()
+        if READY_HEAD == 0 && not has_external_wake_source() {
+            fatal_deadlock()
+        }
+    }
 }
 
 /// Resume whatever should run now, after the thread that was running has
@@ -563,12 +594,14 @@ func disown_bound(p: Int) unsafe {
 /// `is_caller` says whether `p` owns the running thread or no thread is
 /// running (a fault or an exit is on the caller, spec §2.7). Then the running
 /// thread is one of the slots step 1 touches, so nothing is current any more
-/// and `CURRENT_THREAD` and `PENDING_FREE` are cleared. Otherwise `p` is a
-/// `Created` process that nothing names (`end_unstarted`): it has no thread
-/// that ever ran, the caller's thread stays current and `Running`, and the
-/// teardown leaves the caller's slots alone (`spared`). Clearing
-/// `CURRENT_THREAD` for it would leave the caller's thread on no list and
-/// never scheduled.
+/// and `CURRENT_THREAD` and `PENDING_FREE` are cleared. Otherwise `p` is not
+/// the running process, and it is one of two kinds: a `Created` process that
+/// nothing names (`end_unstarted`), which has no thread that ever ran, or a
+/// started one a delivery found without a buffer its parked thread was to
+/// answer into (`end_doomed`), whose threads are parked or runnable. Either
+/// way the caller's thread stays current and `Running`, and the teardown leaves
+/// the caller's slots alone (`spared`). Clearing `CURRENT_THREAD` for it would
+/// leave the caller's thread on no list and never scheduled.
 ///
 /// A record is never reclaimed before its own teardown has ended, because the
 /// teardown writes it after the point where its last reference can go: the
@@ -597,6 +630,9 @@ func disown_bound(p: Int) unsafe {
 /// after another, never inside one.
 func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
                       is_caller: Bool) unsafe -> TeardownCounts {
+    // Whatever end this process was owed, it is having one: a fault left
+    // pending must not outlive the record it was written on.
+    PROCESS_RECORDS[p].doom = 0
     PROCESS_RECORDS[p].state = ProcessState.Gone
     PROCESS_RECORDS[p].exit_kind = kind
     PROCESS_RECORDS[p].exit_code = code
@@ -988,9 +1024,10 @@ func report_teardown(counts: TeardownCounts, p: Int) unsafe {
 ///     body goes back, and the path ends in `resume_after_death`, so root is
 ///     simply the next thing picked. A supervisor parked on the child's Process
 ///     handle is woken by the `notify_ready` at the top of the teardown. The
-///     `Created` processes whose last name the teardown dropped are torn down
-///     before the reschedule (`drain_unstarted`), after this process's own
-///     report.
+///     ends the teardown owes are paid before the reschedule (`drain_deaths`),
+///     after this process's own report: the `Created` processes whose last name
+///     it dropped, and the processes whose parked thread a delivery it made
+///     found without its buffer.
 ///
 /// `code` is what a supervisor reads out of the spec §8 status word.
 /// `machine_status` is what the emulator exits with, which for a fault is the
@@ -1004,7 +1041,7 @@ public(package) func end_process(p: Int, kind: ProcessStatusKind, code: UInt,
     if p != ROOT_PROCESS {
         // A child's death is a scheduling event: the machine has work left, so
         // this path never touches `machine_status` and never stops.
-        drain_unstarted()
+        drain_deaths()
         resume_after_death()
     }
 
@@ -1064,6 +1101,98 @@ public(package) func drain_unstarted() unsafe {
     }
 }
 
+/// End process `p`, which a delivery found without a buffer it parked with
+/// (`doom_process`), with the fault the call would have raised had the buffer
+/// been bad when it was made.
+///
+/// If `p` owns the thread the scheduler is running, or is root, this is a fault
+/// like any other and never returns. Otherwise `p` is not the caller and has
+/// threads that are parked or runnable, none of them current: the teardown is
+/// the one `end_unstarted` runs, with `is_caller` false, so the running thread
+/// and the slot waiting to be freed are left to the switch in progress. It
+/// returns, and the scheduler goes on to choose from what is left.
+///
+/// Where this runs matters: it is called only from `drain_doomed`, at a point
+/// no delivery or teardown is in the middle of, since a teardown inside a walk
+/// of the tables would corrupt the walk.
+func end_doomed(p: Int, why: FaultReason) unsafe {
+    if owns_current_thread(p) || p == ROOT_PROCESS {
+        fault_process(p, why)
+    }
+    report_fault(p, why)
+    let counts = teardown_process(p, ProcessStatusKind.Faulted,
+                                  (why as UInt8) as UInt, false)
+    report_teardown(counts, p)
+}
+
+/// Whether process `p` owns the thread the scheduler is running.
+func owns_current_thread(p: Int) unsafe -> Bool {
+    if CURRENT_THREAD == NO_THREAD {
+        return false
+    }
+    THREADS[CURRENT_THREAD].process == p
+}
+
+/// Take the fault process `r` is owed and end it with it. A record that is not
+/// `Running` owes nothing: its own end already cleared the debt.
+func pay_doom(r: Int) unsafe {
+    let owed = PROCESS_RECORDS[r].doom
+    PROCESS_RECORDS[r].doom = 0
+    match PROCESS_RECORDS[r].state {
+        case Running -> {
+            let known = FaultReason.from(raw: owed - 1)
+            end_doomed(r, known ?? FaultReason.BadBuffer)
+        },
+        case _ -> {},
+    }
+}
+
+/// End every process a delivery owes a fault (`doom_process` raises
+/// `DOOM_PENDING`), so that when this returns, or diverges, no record holds
+/// one.
+///
+/// A pass pays every doomed process that does not own the running thread
+/// first, and the one that does last. The last call does not return (a fault
+/// on the running process ends in the reschedule), so everything else is paid
+/// before it is made: a walk in record order that met the running process
+/// first would leave every record above it unpaid, and those processes would
+/// run on.
+///
+/// The flag is cleared before the pass, as `drain_unstarted`'s is, so a doom
+/// raised while the pass runs (an end here can deliver, and a delivery can owe
+/// another process its own) leaves the flag set. If the pass returns, the loop
+/// takes it. If it diverges, the fault's own end runs `drain_deaths` again with
+/// no running thread left, where every owed process is paid.
+func drain_doomed() unsafe {
+    while DOOM_PENDING {
+        DOOM_PENDING = false
+        var r: Int = 0
+        while r < PROCESS_RECORDS.capacity() {
+            if PROCESS_RECORDS[r].doom != 0 && not owns_current_thread(r) {
+                pay_doom(r)
+            }
+            r = r + 1
+        }
+        if CURRENT_THREAD != NO_THREAD {
+            let running = THREADS[CURRENT_THREAD].process
+            if running != NO_PROCESS && PROCESS_RECORDS[running].doom != 0 {
+                pay_doom(running)
+            }
+        }
+    }
+}
+
+/// Carry out every end the last delivery or syscall owed: the `Created`
+/// processes nothing names any more (`drain_unstarted`) and the processes whose
+/// parked call found its buffer gone (`drain_doomed`). Each can owe the other
+/// another, so it runs until neither is pending.
+public(package) func drain_deaths() unsafe {
+    while DOOM_PENDING || UNSTARTED_PENDING {
+        drain_doomed()
+        drain_unstarted()
+    }
+}
+
 /// Terminate a process for a caller error it could have checked: an invalid
 /// handle, an unknown op, a missing right, or an op aimed at the wrong thread.
 ///
@@ -1072,15 +1201,20 @@ public(package) func drain_unstarted() unsafe {
 /// stopped machine when root is the one that was wrong, and into whatever runs
 /// next when it was a child.
 public(package) func fault_process(p: Int, reason: FaultReason) unsafe -> Never {
+    report_fault(p, reason)
+    end_process(p, ProcessStatusKind.Faulted, (reason as UInt8) as UInt,
+                ExitCode.ProcessFault as UInt)
+}
+
+/// The console line for a process ended by `reason`: the reason reads first, so
+/// the process number follows it.
+func report_fault(p: Int, reason: FaultReason) unsafe {
     let uart = console()
     uart.write_str("SOS: process fault: ")
     uart.write_str(reason.describe())
-    // The process number is appended so the reason reads first.
     uart.write_str(" process=")
     uart.write_hex(p as UInt)
     uart.write_str("\n")
-    end_process(p, ProcessStatusKind.Faulted, (reason as UInt8) as UInt,
-                ExitCode.ProcessFault as UInt)
 }
 
 /// The same termination, reached from a hardware fault rather than a syscall

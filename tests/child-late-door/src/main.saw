@@ -1,0 +1,421 @@
+// Test child: a thread parks in a call whose buffer lies in memory its launcher
+// mapped into it, and the buffer goes before the answer arrives (spec §2.2).
+//
+// The launcher maps a piece of this process's own destination region into the
+// hole between its data and its stack, which is inside both copy windows, and
+// tells this process where. The role names the call that parks with a buffer in
+// that piece:
+//
+//   1  `Waiter.Wait`, its wait record in the piece
+//   2  `PipeInlet.Call`, its reply record in the piece
+//   3  `PipeInlet.Call` on a full ring, its args record in the piece
+//   4  `PipeInlet.Call` on a full ring, its body in the piece
+//   5  as 3, and the server end is closed before there is room
+//   6  as 1, with the piece mapped by this process itself and unmapped by a
+//      second thread of it, which then signals what the first waits for
+//   7  `PipeInlet.Post` of a body in the piece, which does not park
+//   8  `Process.PipeCreate` with its record written into the piece
+//   9  as 1, and a second thread that spins in user mode, so a Timer's fire
+//      is taken from a thread of this process
+//  10  as 6, with the Waiter and the Event the launcher's, shared with
+//      another process
+//  11  as 9 with a second thread that signals the launcher's Event and yields
+//      for as long as the process lives, so the launcher can tell whether it
+//      still runs
+//  12  a `PipeInlet.Call` with everything in this process's own data
+//  13  `Waiter.Wait` on the launcher's Waiter, into this process's own data
+//  14  as 1, and the first thread waits on the same Waiter into its own data
+//
+// A call the kernel answers normally leaves this process alive, and it exits
+// with a code of its own that the launcher can tell apart from every fault.
+//
+// It works at the C altitude because the buffers are addresses this program
+// picks, which the typed tier never lets a caller name.
+
+import sos.{System, MapAccess, EventMode, ALL_RIGHTS, PIPE_MSG_HANDLES,
+            sos_system_process_self, sos_process_boot_handle_next,
+            sos_process_exit, sos_process_waiter_create,
+            sos_process_event_create, sos_waiter_add, sos_waiter_wait,
+            sos_event_receive, sos_event_signal, sos_memory_map,
+            sos_mapping_unmap, sos_pipe_inlet_call, sos_pipe_inlet_post,
+            sos_process_pipe_create, sos_process_thread_self,
+            sos_thread_yield}
+
+/// The tags the launcher gives things under, and the role's.
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_WAITER: UInt = 34
+static TAG_INLET: UInt = 35
+static TAG_PIECE: UInt = 36
+static TAG_EVENT: UInt = 37
+
+static ROLE_WAIT: UInt = 1
+static ROLE_REPLY: UInt = 2
+static ROLE_ROOM_RECORD: UInt = 3
+static ROLE_ROOM_BODY: UInt = 4
+static ROLE_ROOM_CLOSED: UInt = 5
+static ROLE_WAIT_SELF: UInt = 6
+static ROLE_SEND_AT: UInt = 7
+static ROLE_CREATE_AT: UInt = 8
+static ROLE_WAIT_SPIN: UInt = 9
+static ROLE_WAIT_SHARED: UInt = 10
+static ROLE_WAIT_BUSY: UInt = 11
+static ROLE_ROOM_GOOD: UInt = 12
+static ROLE_WAIT_GOOD: UInt = 13
+static ROLE_WAIT_TWO: UInt = 14
+
+/// How this process ends when the kernel took the call of role 7 or 8.
+static EXIT_TAKEN: UInt = 7
+
+/// The call came back where the kernel had to end this process.
+static EXIT_SURVIVED: UInt = 99
+/// The second thread's call after its signal came back: it ran on after the
+/// kernel had recorded its process's fault.
+static EXIT_RAN_ON: UInt = 96
+/// The boot set held no role.
+static EXIT_NO_ROLE: UInt = 98
+/// A step before the call under test was refused.
+static EXIT_SETUP: UInt = 97
+
+static STATUS_OK: UInt = 0
+
+/// A word that names nothing, which also marks an empty handle slot.
+static NONE: UInt = 0
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// The words in a boot-handle record, and in the buffers a call answers into
+/// (more than any record the kernel writes).
+static BOOT_WORDS: Int = 3
+static REPLY_WORDS: Int = 64
+
+/// The body's length.
+static BODY_BYTES: UInt = 8
+
+/// The key the Event is attached under in the self-mapping role.
+static KEY_SELF: UInt = 61
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// What the launcher gave, and what the second thread needs.
+unsafe static var BOOT: UInt = 0
+unsafe static var PROC: UInt = 0
+unsafe static var ROLE: UInt = 0
+unsafe static var ADDR: UInt = 0
+unsafe static var WAITER: UInt = 0
+unsafe static var INLET: UInt = 0
+unsafe static var PIECE: UInt = 0
+unsafe static var MAPPING: UInt = 0
+unsafe static var EVENT: UInt = 0
+unsafe static var SPIN: UInt = 0
+
+unsafe static var BODY: [UInt; 2] = [0; 2]
+unsafe static var ARGS: [UInt; SEND_WORDS] = [0; SEND_WORDS]
+unsafe static var REPLY: [UInt; REPLY_WORDS] = [0; REPLY_WORDS]
+
+/// The second thread's stack, in this process's own zero-init data.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+/// Bytes in a machine word.
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+/// This process's own Process handle as a raw word, or `NONE`.
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// The word an Event holds, drained.
+func event_word(handle: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let _ = sos_event_receive(handle, (&var word) as UnsafePointer<UInt>)
+    word
+}
+
+/// The next record of the boot set, in `rec`.
+func next_record(proc: UInt, rec: &var [UInt; BOOT_WORDS]) unsafe -> UInt {
+    sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                 (BOOT_WORDS as UInt) * word_bytes())
+}
+
+/// Take every record of the boot set and keep what each tag names.
+func drain(proc: UInt) unsafe {
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    while next_record(proc, &var rec) == STATUS_OK {
+        let tag = rec[0]
+        let word = rec[2]
+        if tag == TAG_ROLE {
+            ROLE = event_word(word)
+        } else if tag == TAG_ADDR {
+            ADDR = event_word(word)
+        } else if tag == TAG_WAITER {
+            WAITER = word
+        } else if tag == TAG_INLET {
+            INLET = word
+        } else if tag == TAG_PIECE {
+            PIECE = word
+        } else if tag == TAG_EVENT {
+            EVENT = word
+        }
+    }
+}
+
+/// One fused call through the inlet the launcher gave, with `args` as its
+/// record and `reply` as its reply buffer. It parks.
+func call(args: UInt, reply: UInt) unsafe -> UInt {
+    var value: UInt = 0
+    sos_pipe_inlet_call(INLET, args as UnsafePointer<UInt>,
+                        (SEND_WORDS as UInt) * word_bytes(),
+                        reply as UnsafePointer<UInt>,
+                        (&var value) as UnsafePointer<UInt>)
+}
+
+/// A send record of an empty message, in the process's own data.
+func own_args(body: UInt, len: UInt) unsafe -> UInt {
+    ARGS[0] = body
+    ARGS[1] = len
+    ((&var ARGS) as UnsafePointer<UInt>) as UInt
+}
+
+/// A send record for the `BODY_BYTES` of this process's own data, written at
+/// `at`: the word is placed where the launcher mapped memory.
+func place_args(at: UInt) unsafe {
+    let body = ((&var BODY) as UnsafePointer<UInt>) as UInt
+    UnsafeMemory<UInt, Normal>(at).write(body)
+    UnsafeMemory<UInt, Normal>(at + word_bytes()).write(BODY_BYTES)
+    var slot: Int = 2
+    while slot < SEND_WORDS {
+        let word = at + (slot as UInt) * word_bytes()
+        UnsafeMemory<UInt, Normal>(word).write(NONE)
+        slot = slot + 1
+    }
+}
+
+func reply_buffer() unsafe -> UInt {
+    ((&var REPLY) as UnsafePointer<UInt>) as UInt
+}
+
+func wait_at(waiter: UInt, at: UInt) unsafe -> UInt {
+    sos_waiter_wait(waiter, at as UnsafePointer<UInt>,
+                    (REPLY_WORDS as UInt) * word_bytes())
+}
+
+/// Role 7: post `BODY_BYTES` bytes from the piece through a pipe of this
+/// process's own. A post the kernel took is `EXIT_TAKEN`.
+func send_from_piece(proc: UInt) unsafe -> UInt {
+    var ends: [UInt; 2] = [NONE; 2]
+    let ends_at = (&var ends) as UnsafePointer<UInt>
+    let made = sos_process_pipe_create(proc, ends_at, 2 * word_bytes())
+    if made != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var claim: UInt = NONE
+    let args = own_args(ADDR, BODY_BYTES) as UnsafePointer<UInt>
+    let posted = sos_pipe_inlet_post(ends[0], args,
+                                     (SEND_WORDS as UInt) * word_bytes(),
+                                     (&var claim) as UnsafePointer<UInt>)
+    if posted != STATUS_OK {
+        return EXIT_SETUP
+    }
+    EXIT_TAKEN
+}
+
+/// Role 8: have the kernel write a pipe-creation record into the piece. A
+/// record the kernel wrote is `EXIT_TAKEN`.
+func create_into_piece(proc: UInt) unsafe -> UInt {
+    let made = sos_process_pipe_create(proc, ADDR as UnsafePointer<UInt>,
+                                       (REPLY_WORDS as UInt) * word_bytes())
+    if made != STATUS_OK {
+        return EXIT_SETUP
+    }
+    EXIT_TAKEN
+}
+
+/// The role's call, answering the exit code of a process the kernel did not
+/// end.
+func act(proc: UInt) unsafe -> UInt {
+    if ROLE == ROLE_SEND_AT {
+        return send_from_piece(proc)
+    }
+    if ROLE == ROLE_CREATE_AT {
+        return create_into_piece(proc)
+    }
+    if ROLE == ROLE_WAIT {
+        let _ = wait_at(WAITER, ADDR)
+        return EXIT_SURVIVED
+    }
+    if ROLE == ROLE_WAIT_GOOD {
+        let _ = wait_at(WAITER, reply_buffer())
+        return EXIT_TAKEN
+    }
+    if ROLE == ROLE_ROOM_GOOD {
+        let _ = call(own_args(0, 0), reply_buffer())
+        return EXIT_TAKEN
+    }
+    if ROLE == ROLE_REPLY {
+        let _ = call(own_args(0, 0), ADDR)
+        return EXIT_SURVIVED
+    }
+    if ROLE == ROLE_ROOM_RECORD || ROLE == ROLE_ROOM_CLOSED {
+        place_args(ADDR)
+        let _ = call(ADDR, reply_buffer())
+        return EXIT_SURVIVED
+    }
+    if ROLE == ROLE_ROOM_BODY {
+        let _ = call(own_args(ADDR, BODY_BYTES), reply_buffer())
+        return EXIT_SURVIVED
+    }
+    EXIT_NO_ROLE
+}
+
+/// Map the piece into this process, start the thread that unmaps and signals,
+/// and wait with the wait record in the piece. Role 6 makes its own Waiter and
+/// an Event attached to it; role 10 uses the launcher's, which another process
+/// may be waiting on too.
+func wait_self(system: &System, proc: UInt) unsafe -> UInt {
+    let me = try system.process_self() catch { return EXIT_SETUP }
+    if sos_memory_map(PIECE, proc, RW as UInt,
+                      (&var MAPPING) as UnsafePointer<UInt>) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var waiter: UInt = WAITER
+    if ROLE == ROLE_WAIT_SELF {
+        let waiter_out = (&var waiter) as UnsafePointer<UInt>
+        let made_waiter = sos_process_waiter_create(proc, waiter_out)
+        if made_waiter != STATUS_OK {
+            return EXIT_SETUP
+        }
+        let event_out = (&var EVENT) as UnsafePointer<UInt>
+        let made_event = sos_process_event_create(proc, EventMode.Or as UInt,
+                                                  event_out)
+        if made_event != STATUS_OK {
+            return EXIT_SETUP
+        }
+        if sos_waiter_add(waiter, EVENT, KEY_SELF, 0) != STATUS_OK {
+            return EXIT_SETUP
+        }
+    }
+    let worker = try me.thread_create(stack_top: stack_top(), arg: 1) catch {
+        return EXIT_SETUP
+    }
+    let _ = worker.start()
+    let _ = wait_at(waiter, ADDR)
+    EXIT_SURVIVED
+}
+
+/// Roles 9, 11 and 14: start a second thread and wait with the wait record in
+/// the piece the launcher mapped (role 14 waits into its own data instead, and
+/// its second thread is the one that waits into the piece).
+func wait_with_helper(system: &System) unsafe -> UInt {
+    let me = try system.process_self() catch { return EXIT_SETUP }
+    let worker = try me.thread_create(stack_top: stack_top(), arg: 1) catch {
+        return EXIT_SETUP
+    }
+    let _ = worker.start()
+    if ROLE == ROLE_WAIT_TWO {
+        let _ = wait_at(WAITER, reply_buffer())
+    } else {
+        let _ = wait_at(WAITER, ADDR)
+    }
+    EXIT_SURVIVED
+}
+
+/// Whether the role is one of those `wait_with_helper` serves.
+func has_helper() unsafe -> Bool {
+    ROLE == ROLE_WAIT_SPIN || ROLE == ROLE_WAIT_BUSY || ROLE == ROLE_WAIT_TWO
+}
+
+/// Role 9's second thread: volatile stores in a loop that never traps.
+func spin() unsafe {
+    let at = ((&var SPIN) as UnsafePointer<UInt>) as UInt
+    let cell = UnsafeMemory<UInt, Device>(at)
+    var n: UInt = 0
+    while {
+        n = n &+ 1
+        cell.write(n)
+    }
+}
+
+/// Role 11's second thread: signal the launcher's Event and yield, for as long
+/// as this process runs.
+func busy() unsafe {
+    var me: UInt = NONE
+    let _ = sos_process_thread_self(PROC, (&var me) as UnsafePointer<UInt>)
+    while {
+        let _ = sos_event_signal(EVENT, 1)
+        let _ = sos_thread_yield(me)
+    }
+}
+
+/// The second thread: take the piece out of this process, then signal what the
+/// first thread is waiting for. The signal's delivery finds the first thread's
+/// buffer gone, so this process is ended before this thread runs another
+/// instruction; the exit below is what it would do if it did, and the launcher
+/// reads it as a status other than `BadBuffer`.
+func worker() unsafe {
+    if ROLE == ROLE_WAIT_SPIN {
+        spin()
+    }
+    if ROLE == ROLE_WAIT_BUSY {
+        busy()
+    }
+    if ROLE == ROLE_WAIT_TWO {
+        let _ = wait_at(WAITER, ADDR)
+        let _ = sos_process_exit(PROC, EXIT_SURVIVED)
+        return
+    }
+    let _ = sos_mapping_unmap(MAPPING)
+    let _ = sos_event_signal(EVENT, 1)
+    let _ = sos_process_exit(PROC, EXIT_RAN_ON)
+}
+
+func first(boot_handle: UInt) unsafe {
+    BOOT = boot_handle
+    let system = System(boot_handle: boot_handle)
+    let proc = ask_process(boot_handle)
+    if proc == NONE {
+        return
+    }
+    PROC = proc
+    drain(proc)
+    var code = EXIT_NO_ROLE
+    if ROLE == ROLE_WAIT_SELF || ROLE == ROLE_WAIT_SHARED {
+        code = wait_self(&system, proc)
+    } else if has_helper() {
+        code = wait_with_helper(&system)
+    } else if ROLE != 0 {
+        code = act(proc)
+    }
+    let _ = sos_process_exit(proc, code)
+}
+
+/// Whether this thread is the second one: the first parks the boot handle.
+func is_worker() unsafe -> Bool {
+    BOOT != 0
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if not is_worker() {
+        first(arg)
+    } else {
+        worker()
+    }
+}

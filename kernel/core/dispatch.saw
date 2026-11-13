@@ -3772,16 +3772,18 @@ func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
         // The park remembers the args record, not the body, which keeps
         // `ThreadSlot` small: a message is four handle words plus a body
         // address plus a length, and re-reading the one record the caller
-        // already built is cheaper than more thread fields to keep in step. The
-        // caller is blocked, so nothing it owns can change under the re-read.
+        // already built is cheaper than more thread fields to keep in step. No
+        // thread of the caller runs, but a row can still go while it is parked
+        // (a mapping unmapped by the launcher that made it, or by a sibling),
+        // so the resume checks again and ends the process if the record or the
+        // body is gone (`resume_call_room`).
         block_on_call_room(CURRENT_THREAD, slot, args_src, args_bytes, reply_dst)
         return op_blocked()
     }
     if len != 0 {
         if let why = copy_in(p, exchange_body_addr(x), args.body, len) {
-            // Unreachable: the same source passed `copy_in_check` above and a
-            // process's granted region is fixed for its life. Written rather
-            // than assumed.
+            // Unreachable: the same source passed `copy_in_check` above and
+            // no user code has run since. Written rather than assumed.
             fault_process(p, why)
         }
     }
@@ -4134,8 +4136,8 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
 /// without parking are answerable without one.
 ///
 /// `dst` went through `copy_out_check` at the top of `pipe_resolve`, while the
-/// caller was the running process, so the wake's copy-out cannot fail for a
-/// reason anybody could act on.
+/// caller was the running process. The wake asks again (`wake_call_reply`),
+/// since a mapped row can go while the caller is parked.
 func park_resolve(p: Int, word: UInt, x: Int, dst: UInt) unsafe -> SyscallResult {
     if CURRENT_THREAD == NO_THREAD {
         fault_process(p, FaultReason.BadState)

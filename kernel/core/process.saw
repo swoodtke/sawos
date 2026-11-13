@@ -277,6 +277,30 @@ public(package) func record_of_pid(pid: UInt64) unsafe -> Int {
 /// the flag; this module and `kcore.refs` sit below the teardown and cannot.
 public(package) unsafe static var UNSTARTED_PENDING: Bool = false
 
+/// Raised when a process is owed an end for a fault a delivery found
+/// (`doom_process`). `drain_doomed` (`kcore.sched`) ends each such process and
+/// clears the flag, for the reason `UNSTARTED_PENDING` gives.
+public(package) unsafe static var DOOM_PENDING: Bool = false
+
+/// Record that process `p` is owed the fault `why`, found by a delivery on its
+/// behalf: a buffer it parked with was gone when the answer arrived.
+///
+/// A delivery runs in whichever context made the thing ready: another
+/// process's syscall, an interrupt, or a teardown's own walk. None of them can
+/// end a process, because ending one is a scheduling event and a teardown
+/// inside a walk of the tables corrupts that walk. So the delivery only says
+/// so, disposes of what it was handing over as a receiver's death would, and
+/// leaves the end to the next switch point.
+///
+/// The first fault stands. A second delivery to the same process, before its
+/// end, finds the same record and changes nothing.
+public(package) func doom_process(p: Int, why: FaultReason) unsafe {
+    if PROCESS_RECORDS[p].doom == 0 {
+        PROCESS_RECORDS[p].doom = (why as UInt8) + 1
+    }
+    DOOM_PENDING = true
+}
+
 /// Settle a process record whose count may have reached zero: free a `Gone`
 /// record nothing names, and owe a `Created` one its teardown.
 ///
@@ -813,13 +837,21 @@ public(package) func clear_domain(p: Int) unsafe {
 
 /// Validate a destination the kernel is about to write. `None` when it is fine.
 ///
-/// Split out from `copy_out` for two reasons. Ops that park and copy at a later
-/// wake (`Waiter.Wait`, the fused pipe call) validate while parking, so a bad
-/// buffer ends the process that supplied it while that process is still the
+/// Split out from `copy_out` for three reasons. Ops that park and copy at a
+/// later wake (`Waiter.Wait`, the fused pipe call) validate while parking, so a
+/// bad buffer ends the process that supplied it while that process is still the
 /// running one, rather than at some later wake in another thread's context. Ops
 /// that mint before they copy (`pipe_create`, `pipe_take`) validate first, so a
 /// bad buffer faults before anything is minted. A consumer with neither
 /// concern validates and copies in one step (`copy_out`).
+///
+/// The third is the late door. A buffer that passed when the call parked can be
+/// gone at the wake: a mapping's row may be unmapped, by a sibling thread or by
+/// the launcher that installed it, while the thread is parked. The wake asks
+/// this check again before it spends anything, and a refusal there ends the
+/// process (`doom_process`), as the same refusal at the call would have. The
+/// check and the copy right behind it see one grant record, because no user
+/// code runs between them.
 public(package) func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe -> FaultReason? {
     if (dst % word_bytes()) != 0 {
         return FaultReason.BadAlign
@@ -839,10 +871,7 @@ public(package) func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe -> Fa
     }
     // The address must also resolve. The window above is conservative (it
     // includes the hole between the image's writable end and the stack); the
-    // grant record says which user addresses exist. The early check owes the
-    // same answer the copy will get: `pipe_call` validates when it parks and
-    // copies at the resume, so a destination that passed here and failed there
-    // would be a broken kernel invariant rather than a caller's mistake.
+    // grant record says which user addresses exist.
     let _ = try translate_user(p, dst, bytes) catch { return error }
     None
 }
@@ -905,9 +934,10 @@ public(package) func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe 
 /// whichever context freed the slot. Validating while the caller is still the
 /// running process is both the better diagnostic and simpler to reason about.
 ///
-/// A process's granted region is fixed for its life, so a source that passes
-/// here cannot fail later; `pipe_call`'s resume treats a refusal as a broken
-/// kernel invariant, as `deliver_wait_record` does for its own.
+/// The region is fixed for the process's life but the rows inside it are not: a
+/// mapping's row can be unmapped while the caller is parked, so a source that
+/// passed here can be gone at the resume. The resume asks again before it
+/// stages anything (see `copy_out_check` for what a refusal there does).
 public(package) func copy_in_check(p: Int, src: UInt, bytes: UInt) unsafe -> FaultReason? {
     if (src % word_bytes()) != 0 {
         return FaultReason.BadAlign

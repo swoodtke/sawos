@@ -677,7 +677,12 @@ a reply delivery carries, which is why there is one type and not two — and
   performs that check for everything that copies out, §2.1's message body
   included; with its mirror `copy_in` it is the only place the kernel
   dereferences a user address, which is what keeps a per-address-space
-  mapping switch a one-place change.
+  mapping switch a one-place change. A buffer that was valid when a call
+  parked and is not when the answer arrives (a mapping unmapped in between)
+  ends its process as a bad buffer does: the delivery asks again before it
+  spends anything, so what it was handing over is disposed of as for a
+  receiver that died, and the process ends with `BadBuffer` at the next
+  switch point rather than inside the delivery.
 - **`write_result` is the only function that writes an answer into a frame** —
   its callers are `ktrap` for an op that answered at once and the wake paths
   that answer a parked thread — which is what makes "exactly one write per
@@ -2821,9 +2826,9 @@ copy-out record:
   ring parks with its message still in the caller's memory, so the copy
   happens at the resume, in whichever context freed the slot. So
   `copy_in_check` validates at the call, while the caller is still the running
-  process and a refusal can still terminate it, and the later copy cannot
-  fail. The audit stays two sites: it is the same door, asked its
-  question a moment earlier.
+  process and a refusal can still terminate it, and the resume asks it again
+  (§2.2), since a mapped row can go while the caller is parked. The audit
+  stays two sites: it is the same door, asked its question a moment earlier.
 - **Validation happens before anything is unbound.** A send's handle words are
   resolved, checked for `Transfer`, and checked against the kinds a message may
   carry, all before the ring slot is touched — and the unbinds that take the
@@ -3256,7 +3261,11 @@ the dead process's table and not in its creator's — or be woken by the death
 (below). The teardown (`end_process`) lives in the scheduler module beside
 `pick_next`, because the reschedule can idle, idling delivers, and delivery
 reaches back down into the copy doors; so the copy doors report a bad buffer,
-and the callers above the switch point terminate on it.
+and the callers above the switch point terminate on it. A door reached from a
+delivery has no caller to report to, so it records the fault and the
+scheduler ends the process at the next switch point, the idle loop's turns
+included: every return to user mode passes one first, so no instruction of the
+process runs after the trap in which the fault was recorded.
 
 **`process.kill()` has neither op nor right** (`Exit` through another
 process's handle faults the caller, §2.7). It is specified below; what it
@@ -3320,9 +3329,11 @@ counters in its body's row until a create reuses the body.
   recorded and before the teardown runs, but a notification only queues a
   thread, so the woken supervisor runs after the teardown has completed and no
   observer ever sees a half-dead process. The deadlock predicate has no arm
-  for it: a death arrives from inside the thread set, so a supervisor parked on
-  a live child is not idle-and-doomed — the child's own threads are runnable —
-  and one parked on a dead child was already woken.
+  for it: a death arrives from inside the thread set, or from a delivery made
+  while the kernel idles that finds a parked thread's buffer gone (the idle loop
+  ends that process before it asks, and the end wakes the supervisor), so a
+  supervisor parked on a live child is not idle-and-doomed — the child's own
+  threads are runnable — and one parked on a dead child was already woken.
 - **`process.get_status()`**, gated on the wait right: one fixed-width status
   word — kind in the high bits (`Exited | Faulted | Killed`), code in the low
   bits (exit code, or a fault-cause tag; a deadlock ends no process and is

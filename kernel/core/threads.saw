@@ -170,17 +170,18 @@ public(package) struct ThreadSlot {
     /// `public(package)`: the list a parked thread is on may be a Waiter's,
     /// which `waitables` owns.
     public(package) link: Int,
-    /// Where a parked thread wants its answer written: a user address, already
-    /// validated by `copy_out_check` at the call. Validating at the call rather
-    /// than at the wake makes a bad buffer terminate the process that supplied
-    /// it while it is still the running one. `public(package)` because the wait
-    /// side sets it, at the park.
+    /// Where a parked thread wants its answer written: a user address,
+    /// validated by `copy_out_check` at the call. Validating at the call makes
+    /// a bad buffer terminate the process that supplied it while it is still
+    /// the running one; the wake asks again before it spends anything, because
+    /// a mapped row can be unmapped while the thread is parked.
+    /// `public(package)` because the wait side sets it, at the park.
     ///
     /// Two parks use it, and it is one field because a thread is inside at most
     /// one syscall: a `Waiter.Wait` writes a wait record here, and a fused
     /// `PipeInlet.Call` writes the reply body here. Both are the buffer this
-    /// park will answer into, both were checked while the caller was running,
-    /// and `call_pipe` / `call_claim` say which one it is.
+    /// park will answer into, and `call_pipe` / `call_claim` say which one it
+    /// is.
     public(package) wait_buf: UInt,
     /// The fused call's room park: which connection this thread is waiting for
     /// space on (slot + 1; 0 = it is not).
@@ -204,8 +205,8 @@ public(package) struct ThreadSlot {
     ///
     /// A room-parked call has not staged anything yet, so the message is still
     /// where the caller put it and the resume copies it then. The address went
-    /// through `copy_in_check` at the call, while the caller was running, which
-    /// is what makes the later copy unable to fail.
+    /// through `copy_in_check` at the call, while the caller was running, and
+    /// the resume asks again for the reason `wait_buf` gives.
     public(package) call_src: UInt,
     public(package) call_len: UInt,
     /// Handle entries naming this thread, plus the staged messages that carry

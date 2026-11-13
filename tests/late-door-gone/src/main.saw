@@ -1,0 +1,905 @@
+// A buffer that was good when a call parked and is gone when the answer
+// arrives ends the process whose buffer it was, and the machine carries on
+// (spec §2.2).
+//
+// A call that parks keeps the address of its buffer, and the kernel resolves it
+// again at the wake, in whichever context delivers. Root launches
+// `child-late-door` once per door, maps a piece of the child's own destination
+// region into the hole between its data and its stack (inside both copy
+// windows, and a mapping is the only row that can leave), lets the child park
+// with a buffer in it, unmaps it, and makes the thing the child waits for
+// happen:
+//
+//   SOS latedoor: wait record gone: the process ended with BadBuffer
+//   SOS latedoor: wait record gone: the signal was not spent
+//   SOS latedoor: call reply gone: the process ended with BadBuffer
+//   SOS latedoor: call reply gone: the ring is whole
+//   SOS latedoor: call record gone: the process ended with BadBuffer
+//   SOS latedoor: call record gone: the ring is whole
+//   SOS latedoor: call body gone: the process ended with BadBuffer
+//   SOS latedoor: call body gone: the ring is whole
+//   SOS latedoor: call record gone, server end closed: the process ended
+//                 with BadBuffer
+//   SOS latedoor: wait record unmapped by a sibling: the process ended with
+//                 BadBuffer
+//   SOS latedoor: wait record gone while idle: the process ended with BadBuffer
+//   SOS latedoor: done
+//
+// Each trial is a different late door. The first two rows are the wait record:
+// the readiness the dead thread was to be told of is still there for the next
+// waiter. The reply row is the fused call's answer. The three call rows are
+// the same call parked on a full ring, whose record and body are read at the
+// resume, and whose resume also runs when the server end closes. The last is
+// the wake delivered by the dying process's own thread, so the process that
+// ends is the one running. The very last has the Timer's fire arrive while the
+// kernel is idle, with nothing running to end the process from.
+//
+// A ring is whole when it takes as many messages as a fresh one does: the
+// answer that found its buffer gone settled its exchange.
+//
+// The trials after those map the piece into the child twice and call through
+// it (`exec_rows`: a row that permits execute makes it no buffer, in either
+// order), and then use a second child, linked at the second child base, for
+// what happens when more than one process is owed a fault:
+//
+//   an interrupt taken from the doomed process's own spinning thread;
+//   two processes parked on one Waiter, each with its record gone, so one wake
+//     owes both a fault and one of them owns the running thread (created in
+//     both orders, which orders their records): both must end, and the one
+//     the walk did not stop at must make no further progress;
+//   a death owed by another process's teardown, which must be paid before the
+//     supervisor that teardown wakes runs;
+//   two callers parked for room, the first ended and the second served;
+//   a process with two threads parked, the one parked last with its record
+//     gone: the other thread is passed over, and the delivery goes to a
+//     process that lives.
+//
+// Root observes each death and goes on to the next trial, which is the machine
+// carrying on. Where the launcher is the one that unmaps, the death is of a
+// process that is not the running one.
+//
+// A mapping takes its memory's own address on the profiles that do not
+// translate, so the piece lies in the hole only there; the case is for those.
+//
+// Each trial is a function of its own, to stay under root's stack size
+// (`hal.ROOT_STACK_LEN`).
+
+import sos.{System, Process, Memory, Mapping, Waiter, PipeInlet, PipeOutlet,
+            PipeInletRight, ClockType, MapAccess, SosStatus, SystemRight,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_WAITER: UInt = 34
+static TAG_INLET: UInt = 35
+static TAG_PIECE: UInt = 36
+static TAG_EVENT: UInt = 37
+
+static KEY_DEATH: UInt = 6
+static KEY_EVENT: UInt = 7
+static KEY_PIPE: UInt = 8
+
+/// The roles `child-late-door` knows.
+static ROLE_WAIT: UInt = 1
+static ROLE_REPLY: UInt = 2
+static ROLE_ROOM_RECORD: UInt = 3
+static ROLE_ROOM_BODY: UInt = 4
+static ROLE_ROOM_CLOSED: UInt = 5
+static ROLE_WAIT_SELF: UInt = 6
+static ROLE_SEND_AT: UInt = 7
+static ROLE_CREATE_AT: UInt = 8
+static ROLE_WAIT_SPIN: UInt = 9
+static ROLE_WAIT_SHARED: UInt = 10
+static ROLE_WAIT_BUSY: UInt = 11
+static ROLE_ROOM_GOOD: UInt = 12
+static ROLE_WAIT_GOOD: UInt = 13
+static ROLE_WAIT_TWO: UInt = 14
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
+
+/// A sibling of the client end that can post and nothing else, and one that
+/// can be given away as well.
+static POST_ONLY: UInt32 = PipeInletRight.Post
+static POST_GIVE: UInt32 = PipeInletRight.Post | PipeInletRight.Transfer
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The child's destination region, and where in it the piece goes: past its
+/// data and short of its stack, one protection unit of the region's own bytes
+/// at a time. Every profile this case runs on gives a child a region of this
+/// size.
+static REGION_LEN: UInt = 0x4_0000
+static HOLE_AT: UInt = 0x3_0000
+static HOLE_LEN: UInt = 0x2000
+
+/// The bits the wait record's Event is signalled with.
+static SIGNAL_BITS: UInt = 0x5a
+
+/// How soon the Timer of `idle_door` fires. Nothing depends on how long it
+/// takes: root waits for the child's death, whenever the fire comes.
+static DELAY_NS: UInt64 = 2_000_000
+
+/// The §8 status word of a process ended with `BadBuffer`: `Faulted` in the
+/// high half and the reason (11) in the low.
+static BAD_BUFFER: UInt = 131083
+
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+
+/// The status word of a child that exited with the code 7, which is what it
+/// does when the kernel took its call: `Exited` in the high half.
+static TAKEN: UInt = 65543
+
+static_assert((1 * 65536) + 7 == 65543,
+              "an exit word is Exited in the high bits, then the code")
+
+/// What a mapping of the piece allows, and `NO_ACCESS` for "no second one".
+static RX: UInt32 = MapAccess.Read | MapAccess.Execute
+static NO_ACCESS: UInt32 = 0
+
+/// The most messages a fill posts before it gives up.
+static MAX_FILL: Int = 256
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS latedoor: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS latedoor: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS latedoor: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The first child's image and its destination, then the second's: the
+    // table lists every image and then every destination.
+    var image_rec = try proc.boot_handle_next()
+    var image_b_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var ram_b_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let image_b = image_b_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let ram_b = ram_b_rec.take_memory() else { return BUG }
+
+    try wait_door(&system, &proc, &image, &ram)
+    try reply_door(&system, &proc, &image, &ram)
+    try room_door(&system, &proc, &image, &ram, ROLE_ROOM_RECORD,
+                  "call record gone")
+    try room_door(&system, &proc, &image, &ram, ROLE_ROOM_BODY,
+                  "call body gone")
+    try closed_door(&system, &proc, &image, &ram)
+    try self_door(&system, &proc, &image, &ram)
+    try idle_door(&system, &proc, &image, &ram)
+    try exec_rows(&system, &proc, &image, &ram, ROLE_SEND_AT, "send body")
+    try exec_rows(&system, &proc, &image, &ram, ROLE_CREATE_AT, "record")
+    try interrupted_door(&system, &proc, &image, &ram)
+    try shared_door(&system, &proc, &image, &ram, &image_b, &ram_b, true)
+    try shared_door(&system, &proc, &image, &ram, &image_b, &ram_b, false)
+    try chain_door(&system, &proc, &image, &ram, &image_b, &ram_b)
+    try second_caller(&system, &proc, &image, &ram, &image_b, &ram_b)
+    try two_threads(&system, &proc, &image, &ram, &image_b, &ram_b)
+    return
+}
+
+// -----------------------------------------------------------------------------
+// One trial's parts
+// -----------------------------------------------------------------------------
+
+/// A child created in a region cut from the pool, and the piece of that region
+/// that goes into the hole between its data and its stack. The rest of the
+/// region is cut and let go at once: a piece that covers a row of the child's
+/// image carries the row (`Memory.split`), so the child keeps its own bytes,
+/// and root's handle table stays small enough for the trials' objects.
+func region(system: &System, image: &Memory,
+            ram: &Memory) -> Result<(Process, Memory), SosStatus> {
+    let dst = try ram.split(len: REGION_LEN)
+    let child = try system.process_create(image: &image, memory: &dst)
+    let front = try dst.split(len: HOLE_AT)
+    let hole = try dst.split(len: HOLE_LEN)
+    let _ = move front
+    let _ = move dst
+    let parts = (move child, move hole)
+    return move parts
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// What every child is given: its role, where its buffer is, and its System
+/// handle as the boot tag.
+func brief(system: &System, proc: &Process, child: &Process, role: UInt,
+           at: UInt) -> Result<Void, SosStatus> {
+    try tell(&proc, &child, TAG_ROLE, role)
+    try tell(&proc, &child, TAG_ADDR, at)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Start the child and let it run until it parks: nothing ticks in this case,
+/// so a yield returns when the child has nothing left to do.
+func start_and_park(proc: &Process,
+                    child: &Process) -> Result<Void, SosStatus> {
+    try child.start(boot_tag: TAG_BOOT)
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
+    return
+}
+
+/// Wait for the child to end and require that it ended with `BadBuffer`.
+func ended_bad_buffer(proc: &Process,
+                      child: &Process) -> Result<Void, SosStatus> {
+    try ended_with(&proc, &child, BAD_BUFFER)
+    return
+}
+
+/// Wait for the child to end and require the status word `want`.
+func ended_with(proc: &Process, child: &Process,
+                want: UInt) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS latedoor: the child ended with status {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// Post empty messages through `inlet` until the ring is full, dropping each
+/// claim, and answer how many it took.
+func fill(inlet: &PipeInlet) -> Result<Int, SosStatus> {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var staged: Int = 0
+    while staged < MAX_FILL {
+        match inlet.post(body: &body, len: 0) {
+            case Ok(claim) -> {
+                let _ = move claim
+                staged = staged + 1
+            },
+            case Err(why) -> {
+                match why {
+                    case WouldBlock -> { return staged },
+                    case _ -> { return why },
+                }
+            },
+        }
+    }
+    return BUG
+}
+
+/// How many messages a fresh connection takes before its ring is full.
+func fresh_capacity(proc: &Process) -> Result<Int, SosStatus> {
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let taken = try fill(&inlet)
+    let _ = move outlet
+    return taken
+}
+
+/// Take and drop `count` messages, requests included.
+func drain(outlet: &PipeOutlet, count: Int) -> Result<Void, SosStatus> {
+    var n: Int = 0
+    while n < count {
+        let got = try outlet.take()
+        let (_, request) = move got
+        let _ = move request
+        n = n + 1
+    }
+    return
+}
+
+/// Require the ring behind `inlet` to take as many messages as a fresh one.
+func ring_whole(proc: &Process, inlet: &PipeInlet) -> Result<Bool, SosStatus> {
+    let fresh = try fresh_capacity(&proc)
+    let now = try fill(&inlet)
+    return now == fresh
+}
+
+func say(line: String) {
+    print("SOS latedoor: {}\n", line)
+}
+
+// -----------------------------------------------------------------------------
+// The doors
+// -----------------------------------------------------------------------------
+
+/// A thread parked in `Waiter.Wait` with its record in the piece, and the
+/// readiness it was waiting for arrives after the piece is gone.
+func wait_door(system: &System, proc: &Process, image: &Memory,
+               ram: &Memory) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, ROLE_WAIT, at)
+
+    let ev = try proc.event_create()
+    let waiter = try proc.waiter_create()
+    try waiter.add(event: &ev, key: KEY_EVENT)
+    try child.give(waiter: move waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try start_and_park(&proc, &child)
+
+    try mapping.unmap()
+    try ev.signal(bits: SIGNAL_BITS)
+    try ended_bad_buffer(&proc, &child)
+    say("wait record gone: the process ended with BadBuffer")
+
+    // A delivery to a receiver that is gone spends nothing: the signal is
+    // still in the Event.
+    let word = try ev.receive()
+    if word != SIGNAL_BITS { return BUG }
+    say("wait record gone: the signal was not spent")
+    return
+}
+
+/// A thread parked in a fused call with its reply buffer in the piece, and the
+/// server answers after the piece is gone.
+func reply_door(system: &System, proc: &Process, image: &Memory,
+                ram: &Memory) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, ROLE_REPLY, at)
+
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let spare = try inlet.mint(rights: POST_ONLY)
+    try child.give(inlet: move inlet, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try start_and_park(&proc, &child)
+
+    let got = try outlet.take()
+    let (_, request) = move got
+    try mapping.unmap()
+    var answer: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    try (move request).reply(body: &answer, len: 0)
+    try ended_bad_buffer(&proc, &child)
+    say("call reply gone: the process ended with BadBuffer")
+
+    let whole = try ring_whole(&proc, &spare)
+    if not whole { return BUG }
+    say("call reply gone: the ring is whole")
+    return
+}
+
+/// A thread parked in a fused call for room, with its args record or its body
+/// in the piece (`role` says which), and room appears after the piece is gone.
+func room_door(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+               role: UInt, what: String) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, role, at)
+
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let spare = try inlet.mint(rights: POST_ONLY)
+    let full = try fill(&spare)
+    try child.give(inlet: move inlet, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try start_and_park(&proc, &child)
+
+    // The piece goes, and then one exchange settles, which is the room the
+    // parked call was waiting for.
+    try mapping.unmap()
+    try drain(&outlet, 1)
+    try ended_bad_buffer(&proc, &child)
+    print("SOS latedoor: {}: the process ended with BadBuffer\n", what)
+
+    try drain(&outlet, full - 1)
+    let whole = try ring_whole(&proc, &spare)
+    if not whole { return BUG }
+    print("SOS latedoor: {}: the ring is whole\n", what)
+    return
+}
+
+/// As `room_door` with the record in the piece, and the room is the server end
+/// closing, which resumes the call with the connection gone.
+func closed_door(system: &System, proc: &Process, image: &Memory,
+                 ram: &Memory) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, ROLE_ROOM_CLOSED, at)
+
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let spare = try inlet.mint(rights: POST_ONLY)
+    let full = try fill(&spare)
+    if full == 0 { return BUG }
+    try child.give(inlet: move inlet, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try start_and_park(&proc, &child)
+
+    try mapping.unmap()
+    let _ = move outlet
+    try ended_bad_buffer(&proc, &child)
+    say("call record gone, server end closed: the process ended with BadBuffer")
+    return
+}
+
+/// As `wait_door`, with the piece mapped by the child itself and taken out by a
+/// second thread of it, which then signals the first: the process that ends is
+/// the one whose thread is running.
+func self_door(system: &System, proc: &Process, image: &Memory,
+               ram: &Memory) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+
+    // Where the piece lands is the child's to know once it maps it; a
+    // launcher's mapping tells where, and goes away again.
+    let probe = try child.map(memory: &hole, access: RW)
+    let at = try probe.base()
+    try probe.unmap()
+    try brief(&system, &proc, &child, ROLE_WAIT_SELF, at)
+    try child.give(memory: move hole, tag: TAG_PIECE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try start_and_park(&proc, &child)
+    try ended_bad_buffer(&proc, &child)
+    say("wait record unmapped by a sibling: the process ended with BadBuffer")
+    return
+}
+
+/// As `wait_door`, with a Timer for the readiness. Root has nothing to do but
+/// wait for the death, so the fire arrives while the kernel is idle: the
+/// delivery that finds the buffer gone happens with no thread running, and the
+/// death it owes is what makes root runnable again. A one-shot Timer has
+/// disarmed by then, so a kernel that went back to sleep, or asked whether
+/// anything can still wake somebody before ending the process, would call this
+/// a deadlock.
+func idle_door(system: &System, proc: &Process, image: &Memory,
+               ram: &Memory) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, ROLE_WAIT, at)
+
+    let clock = try system.clock_get(type: ClockType.Monotonic)
+    let timer = try clock.timer_create()
+    let waiter = try proc.waiter_create()
+    try waiter.add(timer: &timer, key: KEY_EVENT)
+    try child.give(waiter: move waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try start_and_park(&proc, &child)
+
+    try mapping.unmap()
+    try timer.arm(after_ns: DELAY_NS)
+    try ended_bad_buffer(&proc, &child)
+    say("wait record gone while idle: the process ended with BadBuffer")
+    return
+}
+
+/// One trial of a buffer in a piece mapped once or twice: `first` is the
+/// access of the first mapping and `second` of the next, over the same bytes
+/// (`NO_ACCESS` for none). The child's call (role 7 or 8) must be refused with
+/// `BadBuffer` when either mapping lets the process execute the piece, in
+/// either order, and taken when neither does.
+func exec_trial(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+                role: UInt, first: UInt32, second: UInt32,
+                want: UInt) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let (child, hole) = move parts
+    let one = try child.map(memory: &hole, access: first)
+    let at = try one.base()
+    if second != NO_ACCESS {
+        let two = try child.map(memory: &hole, access: second)
+        let again = try two.base()
+        if again != at { return BUG }
+    }
+    try brief(&system, &proc, &child, role, at)
+    try start_and_park(&proc, &child)
+    try ended_with(&proc, &child, want)
+    return
+}
+
+/// `exec_trial` for one call, over the control and both orders of the two
+/// mappings. The control, a piece mapped read-write only, is a legal buffer.
+func exec_rows(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+               role: UInt, what: String) -> Result<Void, SosStatus> {
+    try exec_trial(&system, &proc, &image, &ram, role, RW, NO_ACCESS, TAKEN)
+    print("SOS latedoor: exec row, {}, rw only: taken\n", what)
+    try exec_trial(&system, &proc, &image, &ram, role, RW, RX, BAD_BUFFER)
+    print("SOS latedoor: exec row, {}, rw then rx: BadBuffer\n", what)
+    try exec_trial(&system, &proc, &image, &ram, role, RX, RW, BAD_BUFFER)
+    print("SOS latedoor: exec row, {}, rx then rw: BadBuffer\n", what)
+    return
+}
+
+// -----------------------------------------------------------------------------
+// Two processes owed a fault, and what the walk passes over
+// -----------------------------------------------------------------------------
+
+/// The status word of a process that has ended, waiting for it if it has not.
+func death_status(proc: &Process, child: &Process) -> Result<UInt, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            return status
+        },
+        case _ -> { return BUG },
+    }
+}
+
+/// A child with its piece mapped by root and its role and address given: the
+/// pieces of `region`, a Mapping that is then dropped without an unmap (the
+/// row stays until the child ends), and the briefing.
+func mapped_child(system: &System, proc: &Process,
+                  parts: (Process, Memory),
+                  role: UInt) -> Result<(Process, Mapping), SosStatus> {
+    let (child, hole) = move parts
+    let mapping = try child.map(memory: &hole, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, role, at)
+    let pair = (move child, move mapping)
+    return move pair
+}
+
+/// A thread of the child's process spins in user mode while its other thread
+/// is parked with its wait record in the piece, and the Timer that wakes it
+/// fires: the late door is reached from an interrupt taken from a thread of the
+/// process that is owed the fault.
+func interrupted_door(system: &System, proc: &Process, image: &Memory,
+                      ram: &Memory) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &ram)
+    let pair = try mapped_child(&system, &proc, move parts, ROLE_WAIT_SPIN)
+    let (child, mapping) = move pair
+
+    let clock = try system.clock_get(type: ClockType.Monotonic)
+    let timer = try clock.timer_create()
+    let waiter = try proc.waiter_create()
+    try waiter.add(timer: &timer, key: KEY_EVENT)
+    try child.give(waiter: move waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try start_and_park(&proc, &child)
+
+    try mapping.unmap()
+    try timer.arm(after_ns: DELAY_NS)
+    try ended_bad_buffer(&proc, &child)
+    say("wait record gone, door reached from an interrupt: BadBuffer")
+    return
+}
+
+/// Give `child` a Waiter that is `waiter`'s sibling.
+func give_sibling(waiter: &Waiter,
+                  child: &Process) -> Result<Void, SosStatus> {
+    let sibling = try waiter.mint()
+    try child.give(waiter: move sibling, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Two processes parked on one Waiter, each with its wait record in a piece
+/// that is gone by the wake, and one wake owes both a fault. Process A's second
+/// thread unmaps A's piece and signals, so A owns the running thread when the
+/// drain runs; B's piece was unmapped by root. B's second thread signals root's
+/// Event and yields for as long as B runs, which is how root tells whether B
+/// ends. A create takes the lowest free record, so the order the children are
+/// created in is the order of their records, and so the order a walk in record
+/// order meets them: with A first, a walk that stopped at A would leave B
+/// running.
+func shared_door(system: &System, proc: &Process, image_a: &Memory,
+                 ram_a: &Memory, image_b: &Memory, ram_b: &Memory,
+                 a_first: Bool) -> Result<Void, SosStatus> {
+    if a_first {
+        let pa = try region(&system, &image_a, &ram_a)
+        let pb = try region(&system, &image_b, &ram_b)
+        try shared_pair(&system, &proc, move pa, move pb)
+        say("shared waiter, A's record first: both ended with BadBuffer")
+    } else {
+        let pb = try region(&system, &image_b, &ram_b)
+        let pa = try region(&system, &image_a, &ram_a)
+        try shared_pair(&system, &proc, move pa, move pb)
+        say("shared waiter, B's record first: both ended with BadBuffer")
+    }
+    return
+}
+
+func shared_pair(system: &System, proc: &Process,
+                 pa: (Process, Memory),
+                 pb: (Process, Memory)) -> Result<Void,
+                                                                  SosStatus> {
+    let b_pair = try mapped_child(&system, &proc, move pb, ROLE_WAIT_BUSY)
+    let (b, b_map) = move b_pair
+    let evb = try proc.event_create()
+    let evb_for_b = try evb.mint()
+    try b.give(event: move evb_for_b, tag: TAG_EVENT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    // A maps its own piece (it is given the Memory), root having asked where it
+    // would land.
+    let (a, a_hole) = move pa
+    let probe = try a.map(memory: &a_hole, access: RW)
+    let a_at = try probe.base()
+    try probe.unmap()
+    try brief(&system, &proc, &a, ROLE_WAIT_SHARED, a_at)
+    try a.give(memory: move a_hole, tag: TAG_PIECE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let ev = try proc.event_create()
+    let for_a = try ev.mint()
+    try a.give(event: move for_a, tag: TAG_EVENT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let waiter = try proc.waiter_create()
+    try waiter.add(event: &ev, key: KEY_EVENT)
+    try give_sibling(&waiter, &b)
+    try a.give(waiter: move waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    // B parks first, then root takes its piece away, then A runs: its second
+    // thread unmaps A's piece and signals, and that one delivery finds both
+    // buffers gone.
+    try start_and_park(&proc, &b)
+    try b_map.unmap()
+    try a.start(boot_tag: TAG_BOOT)
+    try ended_bad_buffer(&proc, &a)
+    let b_now = try b.get_status()
+    if b_now != BAD_BUFFER {
+        print("SOS latedoor: B's status is {}\n", b_now)
+        return BUG
+    }
+    // B's second thread signalled before it ended; what it signals after A's
+    // death is what it would not do if it had.
+    let _ = try evb.receive()
+    let me = try proc.thread_self()
+    var turns: Int = 0
+    while turns < 8 {
+        let _ = me.yield_now()
+        turns = turns + 1
+    }
+    let later = try evb.receive()
+    if later != 0 { return BUG }
+    return
+}
+
+/// A death that raises another: process B is parked on a Waiter that watches a
+/// pipe whose only client end process A holds, with its wait record in a piece
+/// root has unmapped. A's own thread dooms A; A's teardown closes the end,
+/// which wakes B's Waiter and finds B's buffer gone. B must be ended before
+/// anything runs again, so root, woken by A's death, finds B already ended.
+func chain_door(system: &System, proc: &Process, image_a: &Memory,
+                ram_a: &Memory, image_b: &Memory,
+                ram_b: &Memory) -> Result<Void, SosStatus> {
+    let pa = try region(&system, &image_a, &ram_a)
+    let pb = try region(&system, &image_b, &ram_b)
+    let b_pair = try mapped_child(&system, &proc, move pb, ROLE_WAIT)
+    let (b, b_map) = move b_pair
+    let pipe = try proc.pipe_create()
+    let (inlet, outlet) = move pipe
+    let watch = try proc.waiter_create()
+    try watch.add(outlet: &outlet, key: KEY_PIPE)
+    try b.give(waiter: move watch, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    let (a, a_hole) = move pa
+    let probe = try a.map(memory: &a_hole, access: RW)
+    let a_at = try probe.base()
+    try probe.unmap()
+    try brief(&system, &proc, &a, ROLE_WAIT_SELF, a_at)
+    try a.give(memory: move a_hole, tag: TAG_PIECE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try a.give(inlet: move inlet, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    // Root's Waiter and the wake it returns are kept, so that reading B's
+    // status is the first system call root makes after A's death: dropping a
+    // Waiter is one, and the switch point after it would end B on its own.
+    let mine = try proc.waiter_create()
+    try mine.add(process: &a, key: KEY_DEATH)
+    try start_and_park(&proc, &b)
+    try b_map.unmap()
+    try a.start(boot_tag: TAG_BOOT)
+    let wake = try mine.wait()
+    let b_now = try b.get_status()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH || status != BAD_BUFFER { return BUG }
+        },
+        case _ -> { return BUG },
+    }
+    if b_now != BAD_BUFFER {
+        print("SOS latedoor: B's status is {}\n", b_now)
+        return BUG
+    }
+    say("death owed by a death: ended before its supervisor ran")
+    let _ = move outlet
+    return
+}
+
+/// Whether the ring behind `inlet` is full.
+func ring_full(inlet: &PipeInlet) -> Result<Bool, SosStatus> {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    match inlet.post(body: &body, len: 0) {
+        case Ok(claim) -> {
+            let _ = move claim
+            return false
+        },
+        case Err(why) -> {
+            match why {
+                case WouldBlock -> { return true },
+                case _ -> { return why },
+            }
+        },
+    }
+}
+
+/// Two callers parked for room on one ring, the first (the lower thread slot,
+/// since its process is started first) with its record gone. Room appears: the
+/// first is ended and the second takes the room, so the ring is full again
+/// before root does anything else; then the second's call is answered.
+func second_caller(system: &System, proc: &Process, image_a: &Memory,
+                   ram_a: &Memory, image_b: &Memory,
+                   ram_b: &Memory) -> Result<Void, SosStatus> {
+    let pa = try region(&system, &image_a, &ram_a)
+    let pb = try region(&system, &image_b, &ram_b)
+    let a_pair = try mapped_child(&system, &proc, move pa, ROLE_ROOM_RECORD)
+    let (a, a_map) = move a_pair
+    let b_pair = try mapped_child(&system, &proc, move pb, ROLE_ROOM_GOOD)
+    let (b, b_map) = move b_pair
+    let _ = move b_map
+
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let spare = try inlet.mint(rights: POST_ONLY)
+    let for_b = try inlet.mint(rights: POST_GIVE)
+    let full = try fill(&spare)
+    try a.give(inlet: move inlet, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try b.give(inlet: move for_b, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try start_and_park(&proc, &a)
+    try start_and_park(&proc, &b)
+
+    try a_map.unmap()
+    try drain(&outlet, 1)
+    try ended_bad_buffer(&proc, &a)
+    let taken = try ring_full(&spare)
+    if not taken { return BUG }
+    say("second caller waiting for room: served after the first ended")
+
+    try drain(&outlet, full - 1)
+    let got = try outlet.take()
+    let (_, request) = move got
+    var answer: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    try (move request).reply(body: &answer, len: 0)
+    try ended_with(&proc, &b, TAKEN)
+    return
+}
+
+/// A process with two threads parked on one Waiter, the one parked last with
+/// its record gone and the other with a good buffer, and another process
+/// parked before them. One signal: the first thread is owed a fault, the
+/// second is passed over because its process is, and the delivery goes to the
+/// other process, which lives to use it.
+func two_threads(system: &System, proc: &Process, image_a: &Memory,
+                 ram_a: &Memory, image_b: &Memory,
+                 ram_b: &Memory) -> Result<Void, SosStatus> {
+    let pa = try region(&system, &image_a, &ram_a)
+    let pb = try region(&system, &image_b, &ram_b)
+    let a_pair = try mapped_child(&system, &proc, move pa, ROLE_WAIT_TWO)
+    let (a, a_map) = move a_pair
+    let b_pair = try mapped_child(&system, &proc, move pb, ROLE_WAIT_GOOD)
+    let (b, b_map) = move b_pair
+    let _ = move b_map
+
+    let ev = try proc.event_create()
+    let waiter = try proc.waiter_create()
+    try waiter.add(event: &ev, key: KEY_EVENT)
+    try give_sibling(&waiter, &b)
+    try a.give(waiter: move waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try start_and_park(&proc, &b)
+    try start_and_park(&proc, &a)
+    // A's first thread parked and left its second one to run: another turn
+    // lets that one park too, ahead of it on the Waiter's list.
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
+
+    try a_map.unmap()
+    try ev.signal(bits: SIGNAL_BITS)
+    try ended_bad_buffer(&proc, &a)
+    try ended_with(&proc, &b, TAKEN)
+    say("two threads of one process: the delivery went to the other process")
+    return
+}

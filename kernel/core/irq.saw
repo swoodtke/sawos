@@ -12,11 +12,10 @@
 
 import hal
 import kcore.limits.{MAX_INTERRUPTS, MAX_TIMERS, NO_INTERRUPT, NO_THREAD}
-import kcore.diag.{console, fatal_deadlock}
+import kcore.diag.{console}
 import kcore.threads.{
     CURRENT_THREAD,
     NEED_RESCHED,
-    READY_HEAD,
     SLICE_LEFT,
     SLICE_TICKS,
     THREADS,
@@ -382,10 +381,13 @@ func idle_poll() unsafe {
 /// parked) as a deadlock would stop the machine on exactly the program that
 /// works; the other error turns a real deadlock into a harness timeout.
 ///
-/// A supervisor attached to a Process adds no arm. A process death arrives from
-/// inside the thread set (some syscall or fault of that process caused it, so
-/// one of its threads had to run), which is the negation of what this predicate
-/// asks. The ways the question can come up all resolve without one:
+/// A supervisor attached to a Process adds no arm. A process death arrives
+/// from inside the thread set (some syscall or fault of that process caused
+/// it, so one of its threads had to run), or from a delivery made while the
+/// kernel idles that finds a parked thread's buffer gone. The scheduler ends
+/// that process before it asks this predicate (`idle_until_runnable`), and the
+/// end wakes the supervisor. Neither is what the predicate asks about. The ways
+/// the question can come up all resolve without one:
 ///
 ///   - parked on a live, started child: that child's threads are runnable, so
 ///     the ready queue is not empty and this predicate is never consulted;
@@ -423,34 +425,20 @@ public(package) func has_external_wake_source() unsafe -> Bool {
     false
 }
 
-/// Park the core until something is runnable again.
+/// Park the core until something is pending, and service it: one turn of the
+/// idle loop, which the scheduler runs (`idle_until_runnable`).
 ///
-/// The exit condition is the ready queue, not the poll: a serviced line wakes a
-/// waiter through `deliver_line` -> `on_external_irq` -> `notify_ready`, which
-/// pushes that thread onto the queue. A line that wakes nobody (one bound to an
-/// Interrupt no thread is waiting on) leaves the queue empty and the loop goes
-/// back to sleep, which is why the test is on the queue rather than on "an
-/// interrupt happened".
+/// A serviced line wakes a waiter through `deliver_line` -> `on_external_irq`
+/// -> `notify_ready`, which pushes that thread onto the ready queue. A line
+/// that wakes nobody (one bound to an Interrupt no thread is waiting on) leaves
+/// the queue empty, which is why the loop's exit test is on the queue and not
+/// on "an interrupt happened". The test, and what a delivery may have left to
+/// do, are the scheduler's: this module sits below the teardown.
 ///
-/// The callers ask `has_external_wake_source` before they start, but the answer
-/// can change while the kernel idles: a one-shot Timer that fires disarms
-/// itself, and if nobody was parked on it nothing becomes runnable. So each
-/// time a delivery returns with the queue still empty the question is asked
-/// again, and a "no" is a deadlock (the machine stops). The check sits after
-/// `idle_poll` has returned, so a delivery's wake has already been pushed
-/// onto the queue and a wake in progress is never mistaken for none.
-///
-/// No preemption point: this loop is delivery, and the bounded scans beside it
-/// (`has_external_wake_source`) are `MAX_INTERRUPTS` + `MAX_TIMERS` iterations
-/// of O(1) work.
-public(package) func idle_until_runnable() unsafe {
-    while READY_HEAD == 0 {
-        hal.wait_for_irq()
-        idle_poll()
-        if READY_HEAD == 0 && not has_external_wake_source() {
-            fatal_deadlock()
-        }
-    }
+/// No preemption point: this is delivery.
+public(package) func idle_once() unsafe {
+    hal.wait_for_irq()
+    idle_poll()
 }
 
 // -----------------------------------------------------------------------------

@@ -650,6 +650,11 @@ MAP_OVER_IMAGE_PKG = os.path.join(TESTS_DIR, "map-over-image")
 WX_SEGMENT_REFUSED_PKG = os.path.join(TESTS_DIR, "wx-segment-refused")
 CHILD_WX_FAULT_PKG = os.path.join(TESTS_DIR, "child-wx-fault")
 
+# A buffer that is gone when the answer to a parked call arrives (spec §2.2).
+LATE_DOOR_GONE_PKG = os.path.join(TESTS_DIR, "late-door-gone")
+CHILD_LATE_DOOR_PKG = os.path.join(TESTS_DIR, "child-late-door")
+CHILD_LATE_DOOR2_PKG = os.path.join(TESTS_DIR, "child-late-door2")
+
 # Clock and Timer objects. What an object answers and whether a wait parks are
 # separate questions, so they get separate packages: a scheduling bug cannot
 # hide behind an arithmetic one.
@@ -7703,6 +7708,103 @@ TEST_CASES = [
                        "SOS wxseg: a body in the read-only data is refused",
                        "SOS wxseg: a body in the writable data is refused",
                        "SOS wxseg: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A buffer that was good when a call parked and is gone when the answer
+        # arrives ends the process whose buffer it was, and the machine carries
+        # on (spec §2.2). A call that parks keeps its buffer's address, and the
+        # kernel resolves it again at the wake: a launcher maps a piece of a
+        # child's own region into the hole between its data and its stack,
+        # which is inside both copy windows, the child parks with a buffer in
+        # it, and the launcher unmaps it and makes the answer arrive.
+        #
+        # One trial per late door: a wait record, a fused call's reply, a
+        # fused call's args record and its body when it parked for room, that
+        # record when the room is the server end closing, and a wait record
+        # whose piece a sibling thread of the child unmaps (so the process that
+        # ends is the running one), and a wait record whose Timer fires while
+        # the kernel idles (so nothing is running when the door refuses, and
+        # the death it owes is what makes root runnable). Each ends the child
+        # with `BadBuffer` (131083), which root reads before it starts the next
+        # trial. The `Event` still holding its bits and the rings taking as
+        # many messages as a fresh one are what "disposed of as a dead
+        # receiver's would be" looks like from outside: nothing spent, nothing
+        # pinned.
+        #
+        # The piece mapped into the child twice, over the same bytes, with a
+        # call through it (a send body, a pipe-creation record): mapped
+        # read-write only it is a legal buffer, and mapped read-write and
+        # read-execute, in either order, it is not, since a row that permits
+        # execute covers it whatever the other row says (`translate_user`).
+        #
+        # The trials after those use a second child, linked at the second child
+        # base: a Timer's interrupt taken from the doomed process's own
+        # spinning thread; two processes parked on one Waiter with their
+        # records gone, so one wake owes both a fault and the one that owns the
+        # running thread must not leave the other unpaid (created in both
+        # orders, which fixes the order of their records); a death owed by
+        # another process's teardown, paid before the supervisor that teardown
+        # wakes runs; two callers parked for room, the first ended and the
+        # second served; and a process with two threads parked, whose second is
+        # passed over so that the delivery reaches a process that lives.
+        #
+        # Only where a mapping takes its memory's own address does the piece
+        # lie in the hole; where the target translates, a mapping lies above
+        # the child's region and is no buffer at the call.
+        "name": "late_door_buffer_gone",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LATE_DOOR_GONE_PKG,
+        "children": [CHILD_LATE_DOOR_PKG, CHILD_LATE_DOOR2_PKG],
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS latedoor: wait record gone: the process ended "
+                       "with BadBuffer",
+                       "SOS latedoor: wait record gone: the signal was not "
+                       "spent",
+                       "SOS latedoor: call reply gone: the process ended "
+                       "with BadBuffer",
+                       "SOS latedoor: call reply gone: the ring is whole",
+                       "SOS latedoor: call record gone: the process ended "
+                       "with BadBuffer",
+                       "SOS latedoor: call record gone: the ring is whole",
+                       "SOS latedoor: call body gone: the process ended "
+                       "with BadBuffer",
+                       "SOS latedoor: call body gone: the ring is whole",
+                       "SOS latedoor: call record gone, server end closed: "
+                       "the process ended with BadBuffer",
+                       # The running process's own two threads are both
+                       # freed by its teardown, the running one included.
+                       "SOS: process teardown handles={ten} threads={two} "
+                       "events={one} waiters={one}",
+                       "SOS latedoor: wait record unmapped by a sibling: "
+                       "the process ended with BadBuffer",
+                       "SOS latedoor: wait record gone while idle: the "
+                       "process ended with BadBuffer",
+                       "SOS latedoor: exec row, send body, rw only: taken",
+                       "SOS latedoor: exec row, send body, rw then rx: "
+                       "BadBuffer",
+                       "SOS latedoor: exec row, send body, rx then rw: "
+                       "BadBuffer",
+                       "SOS latedoor: exec row, record, rw only: taken",
+                       "SOS latedoor: exec row, record, rw then rx: "
+                       "BadBuffer",
+                       "SOS latedoor: exec row, record, rx then rw: "
+                       "BadBuffer",
+                       "SOS latedoor: wait record gone, door reached from an "
+                       "interrupt: BadBuffer",
+                       "SOS latedoor: shared waiter, A's record first: both "
+                       "ended with BadBuffer",
+                       "SOS latedoor: shared waiter, B's record first: both "
+                       "ended with BadBuffer",
+                       "SOS latedoor: death owed by a death: ended before its "
+                       "supervisor ran",
+                       "SOS latedoor: second caller waiting for room: served "
+                       "after the first ended",
+                       "SOS latedoor: two threads of one process: the "
+                       "delivery went to the other process",
+                       "SOS latedoor: done"],
         "expect_clean_exit": True,
     },
 ]

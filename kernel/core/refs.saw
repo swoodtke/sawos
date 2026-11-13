@@ -77,7 +77,8 @@ import sosabi.{EventMode, NO_HANDLE, ObjType, OutletLevel, PIPE_BODY_BYTES,
                PipeMsgRecord, PipeSendRecord, PipeTakeRecord, WaitBuffer,
                WaitTag,
                pipe_msg_body_offset, pipe_request_rights, rights_allow_transfer,
-               wait_meta_end_bytes, wait_prefix_bytes}
+               pipe_msg_record_bytes, wait_meta_end_bytes, wait_prefix_bytes,
+               wait_record_bytes}
 import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES,
                      NO_PROCESS, NO_THREAD, PIPE_INFLIGHT}
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
@@ -152,7 +153,8 @@ import kcore.waitables.{
     waitable_consume,
     waitable_ready,
 }
-import kcore.process.{copy_in, copy_out, reclaim_process_record}
+import kcore.process.{copy_in, copy_in_check, copy_out, copy_out_check,
+                      doom_process, reclaim_process_record}
 
 /// Something now names object `slot` of kind `kind`.
 ///
@@ -1321,17 +1323,12 @@ static_assert(sizeof<WaitPrefix>() == sizeof<WaitBuffer>() - PIPE_BODY_BYTES,
 /// Build one and hand it to a process. The only producer of the wire form.
 ///
 /// A refused destination here is a kernel bug, not a process error, so it stops
-/// the machine rather than terminating anybody. `Waiter.Wait` validates the
-/// buffer at the call (`copy_out_check`; see `ThreadSlot.wait_buf`), and a
-/// process's writable window is fixed for its life, so a buffer that passed
-/// then cannot fail now. Both copies lie inside the one checked window: the
-/// check was for `wait_record_bytes()`, the whole prefix plus a whole message
-/// body, and `meta.len` never exceeds `PIPE_BODY_BYTES`.
-///
-/// The wake path runs below the scheduler (a timer expiry reaches here from the
-/// IRQ path with no current thread), so terminating a process from here would
-/// leave it nowhere to go next. The door reports, and the callers that can kill
-/// are the ones above the switch point.
+/// the machine rather than terminating anybody. The caller has asked
+/// `copy_out_check` about the whole record, `wait_record_bytes()`, in the same
+/// step and no user code has run since: a delivery to a thread that parked
+/// asks at the wake (`wake_one_waiter`), and one to the running thread follows
+/// the check `Waiter.Wait` made at the call. Both copies lie inside the one
+/// checked range, since `meta.len` never exceeds `PIPE_BODY_BYTES`.
 ///
 /// The copy is sized to the delivery, in two lengths. A delivery that is not a
 /// message writes `wait_meta_end_bytes()` and stops, which covers almost every
@@ -1590,34 +1587,52 @@ func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
 ///
 /// The writer is a different thread from the one answered, and need not be a
 /// thread at all (the trap path and the idle poll both reach here). That
-/// changes nothing about the write, but it is why the buffer check had to
-/// happen back at the `Wait` call. `copy_out` names the target process
+/// changes nothing about the write: `copy_out` names the target process
 /// explicitly and reaches its memory through the linear map, so the write does
 /// not depend on which process's mappings are active when it runs.
+///
+/// The buffer was checked at the `Wait`, and it is checked again here, because
+/// a row inside the process's window can go while the thread is parked (an
+/// unmap, by a sibling or by the launcher that mapped it). A thread whose
+/// buffer is gone is answered as a death would answer it: it leaves the list
+/// and nothing is delivered or spent, the readiness stays for the next parked
+/// thread, and its process is owed `BadBuffer` (`doom_process`), which the
+/// scheduler delivers at its next switch point. A thread of a process that is
+/// already owed a fault is passed over the same way, whatever its own buffer
+/// says, since the process is about to end and could not use the delivery. The
+/// walk goes on to the next thread, so a wake is never lost to a thread that
+/// will not live to use it.
 ///
 /// The thread leaves the blocked list before the delivery, so cascades from the
 /// delivery (which can free objects and whole connections) cannot reach a walk
 /// this function has already finished.
 public(package) func wake_one_waiter(w: Int, a: Int) unsafe {
-    let head = WAITERS[w].blocked
-    if head == 0 {
+    while WAITERS[w].blocked != 0 {
+        let slot = WAITERS[w].blocked - 1
+        WAITERS[w].blocked = THREADS[slot].link
+        THREADS[slot].link = 0
+        let p = THREADS[slot].process
+        let dst = THREADS[slot].wait_buf
+        THREADS[slot].wait_buf = 0
+        if PROCESS_RECORDS[p].doom != 0 {
+            continue
+        }
+        if let why = copy_out_check(p, dst, wait_record_bytes() as UInt) {
+            doom_process(p, why)
+            continue
+        }
+
+        // The answer is whatever the delivery said. A delivery that carries
+        // handles can be refused by a full table, which wakes the thread with a
+        // status and an untouched buffer (`revoke_blocked`'s shape): the wake
+        // is delivered either way, never a strand. The message stays staged
+        // and its level raised, so waiting again is handed it.
+        let answered = deliver_attachment(p, dst, a)
+        write_result(frame_slot(slot), op_status(answered))
+        THREADS[slot].state = ThreadState.Runnable
+        ready_push(slot)
         return
     }
-    let slot = head - 1
-    WAITERS[w].blocked = THREADS[slot].link
-    THREADS[slot].link = 0
-
-    // The answer is whatever the delivery said. A delivery that carries handles
-    // can be refused by a full table, which wakes the thread with a status and
-    // an untouched buffer (`revoke_blocked`'s shape): the wake is delivered
-    // either way, never a strand. The message stays staged and its level
-    // raised, so waiting again is handed it.
-    let answered = deliver_attachment(THREADS[slot].process,
-                                      THREADS[slot].wait_buf, a)
-    THREADS[slot].wait_buf = 0
-    write_result(frame_slot(slot), op_status(answered))
-    THREADS[slot].state = ThreadState.Runnable
-    ready_push(slot)
 }
 
 /// A waitable just became ready: tell its Waiter, if it has one.
@@ -1728,9 +1743,15 @@ public(package) func notify_claim(x: Int) unsafe {
 /// that nobody is parked, so the tie must be gone first. Nothing after the
 /// unref reads the exchange.
 ///
-/// A refused copy-out is a kernel bug, on `deliver_wait_record`'s terms:
-/// `pipe_call` validated the reply buffer while the caller was running, and a
-/// process's window is fixed for its life.
+/// The reply buffer was checked at the call and is checked again before the
+/// reply is spent, for `wake_one_waiter`'s reason. A caller whose buffer is
+/// gone is answered as a death would answer it: the reply is consumed and its
+/// handles destroyed with the exchange, as a reply the caller's table had no
+/// room for is, the claim is dropped, and the thread is not woken. Its process
+/// is owed `BadBuffer` (`doom_process`).
+///
+/// The copies that follow the check are `deliver_wait_record`'s kind of door:
+/// the same step, no user code between, and a refusal there is a kernel bug.
 func wake_call_reply(t: Int, x: Int) unsafe {
     let p = THREADS[t].process
     let dst = THREADS[t].wait_buf
@@ -1757,6 +1778,14 @@ func wake_call_reply(t: Int, x: Int) unsafe {
         if not table_room(p, staged_count(x)) {
             result = op_status(mint_refusal(p))
         } else {
+            let reply_bytes = pipe_msg_record_bytes() as UInt
+            if let why = copy_out_check(p, dst, reply_bytes) {
+                doom_process(p, why)
+                waitable_consume(WaitableKind.PipeReply, x)
+                clear_pending_call(t)
+                unref_waitable(WaitableKind.PipeReply, x)
+                return
+            }
             let moved = mint_staged(x, p)
             var rec = msg_prefix(answer.body_len, EXCHANGES[x].sender_pid,
                                  &moved)
@@ -1818,53 +1847,62 @@ public(package) func notify_room(c: Int) unsafe {
 /// This is `pipe_post`'s body run in another thread's context, with two
 /// consequences. The questions are asked in `pipe_post`'s order (the outlet
 /// column before the ring, since nobody being able to take is the stronger
-/// fact), and the copy-in must not fault a process that is not running: the
-/// address was checked at the call by `copy_in_check`, so a refusal here stops
-/// the machine.
+/// fact), and the copy-in must not fault a process that is not running.
+///
+/// The record and the body were checked at the call, and both are read here, so
+/// both are checked again before anything is staged or released: a row inside
+/// the process's window can go while the thread is parked, as at
+/// `wake_one_waiter`. A call whose record or body is gone leaves the room wait
+/// as a death would leave it, which is with nothing to undo (nothing was
+/// staged, and the handles the record names are still in the caller's table,
+/// where the teardown closes them), and its process is owed `BadBuffer`. That
+/// counts as the thread having stopped waiting, so the next waiter is served.
 ///
 /// It mints nothing, which is what a fused call buys: the claim is the parked
 /// thread, `Exchange.reply_refs` starts at one for it, and no handle row is
 /// spent.
 func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     let p = THREADS[t].process
+    let src = THREADS[t].call_src
+    // The message is re-read out of its args record. `call_src` and `call_len`
+    // name the record, so the handle words and the body address come back
+    // together. The caller is blocked, so no thread of its own moves them, but
+    // a sibling may have written them since `pipe_call` looked, which is what
+    // `hold_staged` asks about below.
+    var args = PipeSendRecord(body: 0, len: 0,
+                              handles: [NO_HANDLE; PIPE_MSG_HANDLES])
+    let args_at = ((&var args) as UnsafePointer<PipeSendRecord>) as UInt
+    if let why = copy_in(p, args_at, src, THREADS[t].call_len) {
+        doom_process(p, why)
+        clear_pending_call(t)
+        return true
+    }
     if PIPES[c].outlet_refs == 0 {
-        // Terminal, and the message was never staged: the record is re-read to
-        // release the handles it carried, exactly as `pipe_call` releases them
-        // when it meets a closed outlet without parking.
-        var carried = PipeSendRecord(body: 0, len: 0,
-                                     handles: [NO_HANDLE; PIPE_MSG_HANDLES])
-        if let why = copy_in(p, ((&var carried) as UnsafePointer<PipeSendRecord>) as UInt,
-                             THREADS[t].call_src, THREADS[t].call_len) {
-            fatal("parked call record refused by the copy door",
-                  (why as UInt8) as UInt, THREADS[t].call_src, p as UInt,
-                  ExitCode.ProcessFault)
-        }
+        // Terminal, and the message was never staged: the carried handles are
+        // released, exactly as `pipe_call` releases them when it meets a closed
+        // outlet without parking.
         clear_pending_call(t)
         write_result(frame_slot(t), op_status(SosStatus.PeerClosed))
         THREADS[t].state = ThreadState.Runnable
         ready_push(t)
-        release_carried(p, &carried)
+        release_carried(p, &args)
         return true
+    }
+    let len = args.len
+    if len != 0 {
+        if let why = copy_in_check(p, args.body, len) {
+            doom_process(p, why)
+            clear_pending_call(t)
+            return true
+        }
     }
     let x = alloc_exchange(c)
     if x == NO_EXCHANGE {
         return false
     }
-    let src = THREADS[t].call_src
     let dst = THREADS[t].wait_buf
-    // The parked call's message is re-read out of its args record. `call_src`
-    // and `call_len` name the record, so the handle words and the body address
-    // come back together. The caller is blocked, so nothing it owns can have
-    // changed since `pipe_call` validated both addresses; a refusal here is a
-    // kernel bug, for `copy_in_check`'s reason: a process's window is fixed for
-    // its life.
-    var args = PipeSendRecord(body: 0, len: 0, handles: [NO_HANDLE; PIPE_MSG_HANDLES])
-    if let why = copy_in(p, ((&var args) as UnsafePointer<PipeSendRecord>) as UInt,
-                         src, THREADS[t].call_len) {
-        fatal("parked call record refused by the copy door",
-              (why as UInt8) as UInt, src, p as UInt, ExitCode.ProcessFault)
-    }
-    let len = args.len
+    // The body was checked just above, in the same step: a refusal here is a
+    // kernel bug.
     if len != 0 {
         if let why = copy_in(p, exchange_body_addr(x), args.body, len) {
             fatal("parked call body refused by the copy door",
