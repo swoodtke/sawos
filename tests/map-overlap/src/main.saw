@@ -1,0 +1,375 @@
+// A mapping does not overlap a row its target already holds (spec §2.5).
+//
+// Root launches `child-buffer-rule` once per trial and maps into it: the
+// child's own destination, allocations out of the pool, the device window.
+// Each line names a row and says what a `map` meeting it answered:
+//
+//   SOS mapoverlap: the child's destination, over its segments and its
+//                   stack: {own}
+//   SOS mapoverlap: an allocation mapped twice: {own}
+//   SOS mapoverlap: an allocation read-only, then read-write: {own}
+//   SOS mapoverlap: a record at the read-only view: BadBuffer
+//   SOS mapoverlap: a device window mapped twice: refused with NoResource
+//   SOS mapoverlap: the stats region mapped twice: {own}
+//   SOS mapoverlap: an allocation mapped where the last one ends: taken
+//   SOS mapoverlap: an allocation mapped where the next one begins: taken
+//   SOS mapoverlap: refused maps installed nothing and charged nothing
+//   SOS mapoverlap: done
+//
+// {own} is "refused with NoResource" where a mapping takes its memory's own
+// address, so that a second row would lie over the first, and "taken at an
+// address of its own" where the target places a mapping. A device window is
+// mapped at its own address on every profile. A record at the read-only view
+// is refused either way: where the read-write map was refused there is no
+// row over those addresses that permits write, and where it was taken the
+// read-write view is elsewhere. A range that only touches a row, beginning
+// where it ends or ending where it begins, does not meet it.
+//
+// The last line is the child's mapping allowance, which is two: one device
+// window taken, then as many refused maps of it as the largest grant record
+// has rows, then one allocation taken and the next refused by the quota. A
+// refused map that charged would have spent the allowance before the
+// allocation, and one that installed a row would have filled the record and
+// stopped the machine. With the allowance spent, the window mapped once more
+// is refused by the quota too: the quota is asked before the rows are.
+//
+// Each trial is a function of its own, to stay under root's stack size
+// (`hal.ROOT_STACK_LEN`).
+
+import sos.{System, Process, Memory, Pool, IoMemory, Mapping, MapAccess,
+            SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_LEN: UInt = 34
+
+static KEY_DEATH: UInt = 6
+
+/// The role `child-buffer-rule` knows that this case uses: a `PipeCreate`
+/// record written at the address.
+static ROLE_RECORD: UInt = 2
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+static RO: UInt32 = MapAccess.Read
+
+/// An allocation: two pages, a whole number of grains on every profile.
+static PIECE_LEN: UInt = 0x2000
+
+/// How many refused maps the allowance trial makes: as many as the largest
+/// grant record has rows, so that a refusal that installed a row would fill
+/// the record on every profile.
+static REFUSALS: Int = 9
+
+/// What a `map` answered.
+static TAKEN_MAP: UInt = 1
+static REFUSED_MAP: UInt = 2
+
+/// The §8 status word of a child that ended with `BadBuffer` (11).
+static BAD_BUFFER: UInt = 131083
+
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mapoverlap: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS mapoverlap: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mapoverlap: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The child's image, its destination, the pool, then the device window:
+    // the table's order.
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    var window_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    guard let window = window_rec.take_iomemory() else { return BUG }
+
+    let own = try destination(&system, &image, &ram)
+    say_map("the child's destination, over its segments and its stack: ",
+            own)
+    let twice = try allocation_twice(&system, &image, &ram, &pool, RW)
+    say_map("an allocation mapped twice: ", twice)
+    try read_only_then_write(&system, &proc, &image, &ram, &pool)
+    try device_twice(&system, &image, &ram, &window)
+    say("a device window mapped twice: refused with NoResource")
+    let stats = try stats_twice(&system)
+    say_map("the stats region mapped twice: ", stats)
+    try side_by_side(&system, &image, &ram, &pool, false)
+    say("an allocation mapped where the last one ends: taken")
+    try side_by_side(&system, &image, &ram, &pool, true)
+    say("an allocation mapped where the next one begins: taken")
+    try allowance(&system, &image, &ram, &pool, &window)
+    say("refused maps installed nothing and charged nothing")
+    return
+}
+
+func say(line: String) {
+    print("SOS mapoverlap: {}\n", line)
+}
+
+/// A line that ends with what a map answered.
+func say_map(head: String, answer: UInt) {
+    if answer == TAKEN_MAP {
+        print("SOS mapoverlap: {}taken at an address of its own\n", head)
+    } else {
+        print("SOS mapoverlap: {}refused with NoResource\n", head)
+    }
+}
+
+func is_no_resource(why: SosStatus) -> Bool {
+    match why {
+        case NoResource -> true,
+        case _ -> false,
+    }
+}
+
+func is_quota(why: SosStatus) -> Bool {
+    match why {
+        case QuotaExceeded -> true,
+        case _ -> false,
+    }
+}
+
+/// What a map answered, as `TAKEN_MAP` or `REFUSED_MAP`: `NoResource` is the
+/// one refusal this case expects, and any other ends it.
+func answer_of(made: Result<Mapping, SosStatus>) -> Result<UInt, SosStatus> {
+    match made {
+        case Ok(mapping) -> {
+            let _ = move mapping
+            return TAKEN_MAP
+        },
+        case Err(why) -> {
+            if not is_no_resource(why) {
+                print("SOS mapoverlap: a map answered {}\n", why)
+                return BUG
+            }
+            return REFUSED_MAP
+        },
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The trials
+// -----------------------------------------------------------------------------
+
+/// The child's destination mapped into it: the region its copied segments
+/// and its stack lie in. The child is never started.
+func destination(system: &System, image: &Memory,
+                 ram: &Memory) -> Result<UInt, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    return try answer_of(child.map(memory: &ram, access: RW))
+}
+
+/// One allocation mapped into the child twice, the first time with `first`.
+func allocation_twice(system: &System, image: &Memory, ram: &Memory,
+                      pool: &Pool,
+                      first: UInt32) -> Result<UInt, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let piece = try pool.allocate(len: PIECE_LEN)
+    let _one = try child.map(memory: &piece, access: first)
+    return try answer_of(child.map(memory: &piece, access: RW))
+}
+
+/// One allocation mapped read-only and then read-write, and the child's
+/// `PipeCreate` record written at the read-only view: no row there permits
+/// write, whatever the second map answered.
+func read_only_then_write(system: &System, proc: &Process, image: &Memory,
+                          ram: &Memory,
+                          pool: &Pool) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let piece = try pool.allocate(len: PIECE_LEN)
+    let one = try child.map(memory: &piece, access: RO)
+    let at = try one.base()
+    let second = try answer_of(child.map(memory: &piece, access: RW))
+    say_map("an allocation read-only, then read-write: ", second)
+    try brief(&system, &proc, &child, ROLE_RECORD, at, 0)
+    try run_child(&proc, &child, BAD_BUFFER)
+    say("a record at the read-only view: BadBuffer")
+    return
+}
+
+/// The device window mapped into the child twice. It is mapped at its own
+/// address on every profile, so the second map meets the first.
+func device_twice(system: &System, image: &Memory, ram: &Memory,
+                  window: &IoMemory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let _one = try child.map(iomemory: &window)
+    let second = try answer_of(child.map(iomemory: &window))
+    if second != REFUSED_MAP { return BUG }
+    return
+}
+
+/// The stats region mapped into root twice. Both views are unmapped again,
+/// so root's rows are as they were.
+func stats_twice(system: &System) -> Result<UInt, SosStatus> {
+    let one = try system.stats_region_map()
+    var answer = REFUSED_MAP
+    match system.stats_region_map() {
+        case Ok(two) -> {
+            answer = TAKEN_MAP
+            try two.unmap()
+        },
+        case Err(why) -> {
+            if not is_no_resource(why) {
+                print("SOS mapoverlap: the second stats map answered {}\n",
+                      why)
+                return BUG
+            }
+        },
+    }
+    try one.unmap()
+    return answer
+}
+
+/// Two allocations taken in turn from the pool, which lie one after the
+/// other, mapped into the child: the first and then the second, which begins
+/// where the first ends, or with `reversed` the second and then the first,
+/// which ends where the second begins. Where the target places a mapping the
+/// later one goes at the earlier one's top either way. Both are taken.
+func side_by_side(system: &System, image: &Memory, ram: &Memory, pool: &Pool,
+                  reversed: Bool) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let first = try pool.allocate(len: PIECE_LEN)
+    let second = try pool.allocate(len: PIECE_LEN)
+    var earlier: UInt = 0
+    var later: UInt = 0
+    if reversed {
+        let two = try child.map(memory: &second, access: RW)
+        let one = try child.map(memory: &first, access: RW)
+        earlier = try two.base()
+        later = try one.base()
+    } else {
+        let one = try child.map(memory: &first, access: RW)
+        let two = try child.map(memory: &second, access: RW)
+        earlier = try one.base()
+        later = try two.base()
+    }
+    if later + PIECE_LEN != earlier && earlier + PIECE_LEN != later {
+        print("SOS mapoverlap: the two mappings are not side by side\n")
+        return BUG
+    }
+    return
+}
+
+/// The child's mapping allowance, spent around refused maps: the device
+/// window taken, `REFUSALS` maps of it refused, one allocation taken and a
+/// second refused by the quota.
+func allowance(system: &System, image: &Memory, ram: &Memory, pool: &Pool,
+               window: &IoMemory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let _one = try child.map(iomemory: &window)
+    var round: Int = 0
+    while round < REFUSALS {
+        let again = try answer_of(child.map(iomemory: &window))
+        if again != REFUSED_MAP { return BUG }
+        round = round + 1
+    }
+    let first = try pool.allocate(len: PIECE_LEN)
+    let second = try pool.allocate(len: PIECE_LEN)
+    let _two = try child.map(memory: &first, access: RW)
+    try over_quota(child.map(memory: &second, access: RW))
+    // The quota is asked before the rows, so a map that would also meet a
+    // row is answered `QuotaExceeded` here.
+    try over_quota(child.map(iomemory: &window))
+    return
+}
+
+/// A map refused by the target's quota.
+func over_quota(made: Result<Mapping, SosStatus>) -> Result<Void, SosStatus> {
+    match made {
+        case Ok(mapping) -> {
+            let _ = move mapping
+            print("SOS mapoverlap: a map past the allowance was taken\n")
+            return BUG
+        },
+        case Err(why) -> {
+            if not is_quota(why) {
+                print("SOS mapoverlap: a map past the allowance answered {}\n",
+                      why)
+                return BUG
+            }
+        },
+    }
+    return
+}
+
+// -----------------------------------------------------------------------------
+// One trial's parts
+// -----------------------------------------------------------------------------
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// What the child is given: its role, the address and the length it hands
+/// the kernel, and its System handle as the boot tag.
+func brief(system: &System, proc: &Process, child: &Process, role: UInt,
+           at: UInt, len: UInt) -> Result<Void, SosStatus> {
+    try tell(&proc, &child, TAG_ROLE, role)
+    try tell(&proc, &child, TAG_ADDR, at)
+    try tell(&proc, &child, TAG_LEN, len)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Start the child, wait for it to end and require the status word `want`.
+func run_child(proc: &Process, child: &Process,
+               want: UInt) -> Result<Void, SosStatus> {
+    try child.start(boot_tag: TAG_BOOT)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS mapoverlap: the child ended with status {}\n",
+                      status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

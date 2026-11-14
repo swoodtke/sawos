@@ -13,6 +13,12 @@
 //
 //   SOS inplacelaunch: a mapping over the child's image: out of kernel objects
 //
+// Its destination is mapped into it next. Every segment of the child is used
+// in place, so the one row it holds in its destination is the stack grant,
+// and that mapping is refused as well:
+//
+//   SOS inplacelaunch: a mapping over the child's stack: out of kernel objects
+//
 // and the child is started and must exit with its own code:
 //
 //   SOS-H                                          the child
@@ -81,6 +87,18 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
                   why)
         },
     }
+    var kept_stack: Mapping? = None
+    match child.map(memory: &ram, access: MapAccess.Read) {
+        case Ok(mapping) -> {
+            kept_stack = move mapping
+            let _ = system.debug_print(
+                "SOS inplacelaunch: a mapping over the child's stack: taken\n")
+        },
+        case Err(why) -> {
+            print("SOS inplacelaunch: a mapping over the child's stack: {}\n",
+                  why)
+        },
+    }
 
     let boot = try system.mint(rights: CHILD_SYSTEM)
     try child.give(system: move boot, tag: TAG_BOOT) catch {
@@ -106,5 +124,6 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     let _ = system.debug_print(
         "SOS inplacelaunch: the child exited from its image\n")
     let _ = move kept
+    let _ = move kept_stack
     return
 }

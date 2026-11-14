@@ -412,14 +412,6 @@ public(package) func record_grant(p: Int, base: UInt, top: UInt, pa: UInt,
     hal.prot_update(b as UInt, base, top, pa, perms, device)
 }
 
-/// Record that every row `p` holds now is the image's: the loader's segments,
-/// copied or used in place, and the stack grant. Called when `place_image` has
-/// recorded the last one.
-public(package) func seal_image_rows(p: Int) unsafe {
-    let b = body_of(p)
-    PROCESSES[b].image_rows = PROCESSES[b].grant_count
-}
-
 /// Where the next mapping of `len` bytes goes in `p`'s address space: the
 /// kernel's VA policy.
 ///
@@ -525,21 +517,24 @@ func grants_execute(p: Int, pa: UInt, bytes: UInt) unsafe -> Bool {
     false
 }
 
-/// Does `base..top` meet a row of process `p`'s image: a segment the loader
-/// recorded for it, or the stack grant the kernel gave it?
+/// Does the user range `base..top` meet a row of process `p`'s grant record,
+/// whatever the row: a segment the loader recorded, copied or used in place,
+/// the stack grant, a row `map` installed, a device row or the stats region's
+/// row?
 ///
-/// The loader records those rows first and nothing removes one, so they are the
-/// first `image_rows` rows of the record, however the rows after them are
-/// mapped and unmapped. A segment used in place is one of them, so a mapping of
-/// the image's own bytes into the process that runs out of them is refused as
-/// well.
-public(package) func meets_image_row(p: Int, base: UInt,
-                                     top: UInt) unsafe -> Bool {
+/// Rows are compared by the user addresses they occupy, which are what the
+/// hardware filters or translates (spec §2.5). A range that only touches a
+/// row, ending where the row begins or beginning where it ends, does not meet
+/// it. A row of no bytes, which a segment of no bytes records, shares no
+/// address and meets nothing, wherever it lies.
+///
+/// No preemption point: one pass over at most `MAX_GRANT_ROWS` rows.
+public(package) func meets_row(p: Int, base: UInt, top: UInt) unsafe -> Bool {
     let b = body_of(p)
     var i: Int = 0
-    while i < PROCESSES[b].image_rows {
+    while i < PROCESSES[b].grant_count {
         let row = PROCESSES[b].grants[i]
-        if base < row.top && row.base < top {
+        if row.base < row.top && base < row.top && row.base < top {
             return true
         }
         i = i + 1
@@ -561,13 +556,10 @@ public(package) func meets_image_row(p: Int, base: UInt,
 /// `need` is the direction: `SegFlag.Read` for a source the kernel reads,
 /// `SegFlag.Write` for a destination it writes. A row that does not grant it is
 /// not a candidate, so a result is never written into memory no row of the
-/// process lets it write. Another row over the same addresses that does grant
-/// the permission serves. Where two rows cover one address, a tier whose
-/// hardware lets the lowest-numbered matching region decide an access gives
-/// the process the first row's permissions there, so a read-write row
-/// recorded after a read-only one over the same addresses is a destination
-/// the process cannot store to itself; nothing here refuses it, and spec
-/// §2.5's overlap rule is what keeps a process's rows apart.
+/// process lets it write. No two rows of a process meet (the loader refuses
+/// an image whose segments do, and `meets_row` a mapping that would), so the
+/// row found is the one row at those addresses, the one whose permissions the
+/// hardware applies to the process's own accesses there.
 ///
 /// The whole range must lie in one row. A row is the largest span over which
 /// the user-to-physical mapping is affine (`GrantRow`), so a copy that crossed
@@ -858,7 +850,6 @@ public(package) func clear_domain(p: Int) unsafe {
     let b = body_of(p)
     let rows = PROCESSES[b].grant_count
     PROCESSES[b].grant_count = 0
-    PROCESSES[b].image_rows = 0
     // The standing image goes with the record, before the walk below can return
     // a range to its pool (the same composition as `remove_grant`). Zeroing the
     // count stops a replay tier from granting these bytes again; this call

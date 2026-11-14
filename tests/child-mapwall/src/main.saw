@@ -35,7 +35,8 @@ static RW: UInt32 = MapAccess.Read | MapAccess.Write
 /// More rounds than the allowance, so the loop is stopped by the kernel rather
 /// than by its own counter, and fewer than the free rows on either profile, so
 /// a bug that let every round through would not reach the wall and would show
-/// as a wrong number rather than as a kernel stop.
+/// as a wrong number rather than as a kernel stop. The launcher gives a page
+/// for each.
 static ROUNDS: Int = 4
 
 /// What it ends with when the kernel's answers were not the shape this case
@@ -67,29 +68,25 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // One record: the region its launcher gave it. The tag is the launcher's
-    // config and this program does not read it; the drain hands records back in
-    // give order and there is only one.
-    var record = try proc.boot_handle_next() catch {
-        print("SOS childmapwall: no region: {}\n", error)
-        let _ = proc.exit(EXIT_MISMATCH)
-        return
-    }
-    guard let region = record.take_memory() else {
-        print("SOS childmapwall: the record is not a region\n")
-        let _ = proc.exit(EXIT_MISMATCH)
-        return
-    }
-
-    // The same region, mapped into itself again and again. Double-mapping is
-    // allowed (two rows, two Mappings, no aliasing bookkeeping owed on a
-    // machine that does not translate), so this spends rows without needing a
-    // second region.
+    // One page per round, each mapped into this process once. The records are
+    // the pages its launcher gave it, one per round; the tag is the launcher's
+    // config and this program does not read it. Two rows of one process never
+    // overlap (spec §2.5), so each row spends a page of its own.
     var maps: UInt = 0
     var quota = false
     var other = false
     var round = 0
     while round < ROUNDS && not quota && not other {
+        var record = try proc.boot_handle_next() catch {
+            print("SOS childmapwall: no page for round {}: {}\n", round, error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        guard let region = record.take_memory() else {
+            print("SOS childmapwall: the record is not a region\n")
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
         match proc.map(memory: &region, access: RW) {
             case Ok(_) -> { maps = maps + 1 },
             case Err(status) -> {

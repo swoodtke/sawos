@@ -306,7 +306,7 @@ import kcore.process.{
     executable_at,
     stack_top_ok,
     free_user_va,
-    meets_image_row,
+    meets_row,
     record_grant,
     remove_grant,
     rows_clear_of_cut,
@@ -1263,6 +1263,16 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     // A destination that cannot even hold the kernel's stack grant is refused
     // here rather than by an underflow inside `LoadRegion`'s arithmetic.
     if dst_len <= hal.ROOT_STACK_LEN {
+        return op_status(SosStatus.BadImage)
+    }
+    // A destination off the grain is refused. The stack grant is its top
+    // `ROOT_STACK_LEN` bytes, so with a top off the grain the stack's base
+    // lies inside a grain that a copied segment's row, rounded up, also
+    // grants. With a base off the grain a segment's frames begin inside a
+    // grain, and a tier that grants by the grain would reach the bytes before
+    // the destination. With both on the grain every row the loader records for
+    // a child has both ends on it.
+    if (dst_base % hal.PROT_GRAIN) != 0 || (dst_len % hal.PROT_GRAIN) != 0 {
         return op_status(SosStatus.BadImage)
     }
     if img_base < dst_base + dst_len && dst_base < img_base + img_len {
@@ -2901,10 +2911,11 @@ func grant_perms(access: UInt32) -> UInt8 {
 ///     target reserves the encoding outright; this is the same rule
 ///     `imgformat.has_sane_perms` applies to an image, so there is one answer
 ///     to "what is a valid grant".
-///   - Write and execute in one row. It costs nothing expressible: a double map
-///     is allowed (two rows, two Mappings, no aliasing bookkeeping owed), so a
-///     JIT-shaped pattern is an RW row here and an RX row there. Only the
-///     single row a process could write and then fetch from is refused.
+///   - Write and execute in one row. A writable and an executable view of one
+///     allocation are still two rows: in two processes, or at two addresses of
+///     one where the target translates (two rows of one process never meet,
+///     `install_row`). Only the single row a process could write and then
+///     fetch from is refused.
 ///   - No access at all. A row that permits nothing spends a protection slot to
 ///     say what default-deny already says.
 ///
@@ -2996,11 +3007,15 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
 /// the death. Every fault the caller's own arguments can raise is behind this
 /// line.
 ///
-/// A range that meets a row of the target's image or its stack
-/// (`meets_image_row`) is `NoResource` and installs nothing: where a mapping's
-/// address is its memory's own, a launcher's destination region is the child's
-/// image, and a second row over it would change what the rows already there
-/// mean to the copy doors and the entry check. Mappings may cover one another.
+/// A range that meets any row the target already holds (`meets_row`) is
+/// `NoResource` and installs nothing, so a process's rows never overlap (spec
+/// §2.5). Where a mapping's address is its memory's own, a second row over
+/// the same addresses would leave which of the two grants them to the order
+/// the hardware reads rows in, which on a tier where the lowest-numbered
+/// matching region decides is the first row's permissions and not the union.
+/// It is a status because the caller cannot see what the target holds: where
+/// a launcher's destination put the child's segments, or what another holder
+/// mapped there.
 ///
 /// `hal.GRANT_ROW_BUDGET` is what the wall is measured against; the kernel
 /// reads the HAL's number because it is a hardware limit on one target and a
@@ -3062,11 +3077,10 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     if not device && not hal.map_target_ok(va_base, va_top) {
         return op_status(SosStatus.NoResource)
     }
-    // A mapping does not cover a row of the target's image or its stack. On a
-    // profile where a mapping's address is its memory's own, a launcher's
-    // region is the child's image, and a second row over it would change what
-    // the rows already there mean to the copy doors and the entry check.
-    if meets_image_row(t, va_base, va_top) {
+    // A mapping meets no row the target already holds, of any kind. Where
+    // the target translates, `free_user_va` placed a RAM row clear of every
+    // RAM row, so what this can refuse there is a device window's second row.
+    if meets_row(t, va_base, va_top) {
         return op_status(SosStatus.NoResource)
     }
     let slot = alloc_mapping()

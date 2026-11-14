@@ -8,7 +8,7 @@
 // clean run is what says the ordering held.
 //
 //   SOS quotawall: created
-//   SOS quotawall: gave a page
+//   SOS quotawall: gave a page per round
 //   SOS quotawall: started
 //   SOS childmapwall: maps=2 quota=1     <- policy refused, and the machine's
 //                                           row budget was never reached
@@ -16,10 +16,12 @@
 //   SOS quotawall: root observed child status=65538
 //   SOS quotawall: done
 //
-// Root contributes a region and nothing else. The child maps a page its
-// launcher allocated out of the pool into itself, through its own Process
-// handle, so the two rights the map spends (`MemoryRight.Map` on the page,
-// `ProcessRight.Map` on the target) are both the child's own, and root's
+// Root contributes pages and nothing else, one for each of the child's rounds.
+// The child maps each page its launcher allocated out of the pool into itself,
+// once, through its own Process handle: two rows of one process never overlap
+// (spec §2.5), so a row needs an allocation of its own. The two rights the map
+// spends (`MemoryRight.Map` on the page, `ProcessRight.Map` on the target) are
+// both the child's own, and root's
 // allowance has nothing to do with how many rows the child may install. This
 // is the one exception to creator-pays: a mapping charges the target, because
 // the scarce thing it consumes is the target's grant-row budget, and charging
@@ -43,9 +45,13 @@ static KEY: UInt = 64
 /// Twenty milliseconds. See `process_lifecycle`.
 static PARK_NS: UInt64 = 20_000_000
 
-/// Root's config: the tags the child's System handle and its page travel under.
+/// Root's config: the tags the child's System handle and its first page
+/// travel under. Each later page travels under the next tag up.
 static TAG_BOOT: UInt = 31
 static TAG_PAGE: UInt = 33
+
+/// One page for each round the child makes: `child-mapwall`'s `ROUNDS`.
+static PAGES: Int = 4
 
 /// What a child of this launcher may ask its System object for: print, and
 /// learn its own Process object, which is also the handle it maps through.
@@ -103,12 +109,6 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS quotawall: created\n")
 
-    let page = try pool.allocate(len: CHUNK) catch {
-        print("SOS quotawall: allocation failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-
     let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
         print("SOS quotawall: mint failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -119,16 +119,26 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // The page travels, and its rights travel verbatim. A give is a move, so
+    // Each page travels, and its rights travel verbatim. A give is a move, so
     // the child receives `MemoryRight.Map` because root held it, which is what
     // makes the child able to install rows at all and what makes the rows it
     // installs its own business.
-    try child.give(memory: move page, tag: TAG_PAGE) catch {
-        print("SOS quotawall: give page failed: {}\n", error.0)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
+    var given: Int = 0
+    while given < PAGES {
+        let page = try pool.allocate(len: CHUNK) catch {
+            print("SOS quotawall: allocation failed: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        try child.give(memory: move page,
+                       tag: TAG_PAGE + (given as UInt)) catch {
+            print("SOS quotawall: give page failed: {}\n", error.0)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        given = given + 1
     }
-    let _ = system.debug_print("SOS quotawall: gave a page\n")
+    let _ = system.debug_print("SOS quotawall: gave a page per round\n")
 
     try child.start(boot_tag: TAG_BOOT) catch {
         print("SOS quotawall: start failed: {}\n", error)

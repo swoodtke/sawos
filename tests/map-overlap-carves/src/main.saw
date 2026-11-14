@@ -1,0 +1,109 @@
+// Where a mapping meets a row, to the grain (spec §2.5): carves of one device
+// window, which may overlap one another, mapped into root.
+//
+// A carve here is a naturally aligned power of two, so two carves either nest
+// or lie apart, and each row's ends are on the four-byte grain. Root maps the
+// eight bytes at offset 8 and then asks for carves around them:
+//
+//   SOS mapcarves: eight bytes at offset 8: taken
+//   SOS mapcarves: its first four bytes again: refused with NoResource
+//   SOS mapcarves: its last four bytes again: refused with NoResource
+//   SOS mapcarves: thirty-two bytes holding it: refused with NoResource
+//   SOS mapcarves: eight bytes ending where it begins: taken
+//   SOS mapcarves: sixteen bytes beginning where it ends: taken
+//   SOS mapcarves: done
+//
+// A range that meets a row by one grain at either end is refused, and one that
+// only touches it is taken. Each carve that is taken around the first is
+// unmapped again, so only the first stands when the next is asked.
+//
+// riscv32 only: on arm64 a device window is granted by the page, and the
+// window this case is given is one page.
+
+import sos.{System, Process, IoMemory, Mapping, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The carve every other is asked around: eight bytes at offset 8.
+static AT: UInt = 8
+static LEN: UInt = 8
+
+/// The grain: four bytes, the smallest carve a window can be cut to.
+static GRAIN: UInt = 4
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mapcarves: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS mapcarves: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mapcarves: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var record = try proc.boot_handle_next()
+    guard let window = record.take_iomemory() else { return BUG }
+
+    let middle = try window.carve(offset: AT, len: LEN)
+    let _kept = try proc.map(iomemory: &middle)
+    say("eight bytes at offset 8: taken")
+
+    try refused(&proc, &window, AT, GRAIN)
+    say("its first four bytes again: refused with NoResource")
+    try refused(&proc, &window, AT + LEN - GRAIN, GRAIN)
+    say("its last four bytes again: refused with NoResource")
+    try refused(&proc, &window, 0, 4 * LEN)
+    say("thirty-two bytes holding it: refused with NoResource")
+    try taken(&proc, &window, AT - LEN, LEN)
+    say("eight bytes ending where it begins: taken")
+    try taken(&proc, &window, AT + LEN, 2 * LEN)
+    say("sixteen bytes beginning where it ends: taken")
+    return
+}
+
+func say(line: String) {
+    print("SOS mapcarves: {}\n", line)
+}
+
+/// The carve of `len` bytes at `offset` is mapped into root and taken; its
+/// row is unmapped again.
+func taken(proc: &Process, window: &IoMemory, offset: UInt,
+           len: UInt) -> Result<Void, SosStatus> {
+    let carve = try window.carve(offset: offset, len: len)
+    let mapping = try proc.map(iomemory: &carve)
+    try mapping.unmap()
+    return
+}
+
+/// The carve of `len` bytes at `offset` is mapped into root and refused with
+/// `NoResource`.
+func refused(proc: &Process, window: &IoMemory, offset: UInt,
+             len: UInt) -> Result<Void, SosStatus> {
+    let carve = try window.carve(offset: offset, len: len)
+    match proc.map(iomemory: &carve) {
+        case Ok(_) -> {
+            print("SOS mapcarves: the carve at {} of {} bytes was taken\n",
+                  offset, len)
+            return BUG
+        },
+        case Err(why) -> {
+            match why {
+                case NoResource -> { return },
+                case _ -> { return why },
+            }
+        },
+    }
+}

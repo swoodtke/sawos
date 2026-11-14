@@ -38,11 +38,12 @@
 //
 // The trials after those map the piece into the child twice and call through
 // its read-write view (`exec_rows`: a row that permits execute over the same
-// bytes makes it no buffer, in either order). Where a mapping takes its
-// memory's own address the two rows lie over the same addresses; where the
-// target translates they are two views at two addresses, and the read-write
-// one is refused all the same, because rows are compared by the bytes they
-// grant. Then a second child, linked at the second child base, for what
+// bytes makes it no buffer, in either order). Where the target translates
+// they are two views at two addresses, and the read-write one is refused all
+// the same, because rows are compared by the bytes they grant. Where a
+// mapping takes its memory's own address the second map would lie over the
+// first and is refused (spec §2.5), and the call is judged by the first row
+// alone. Then a second child, linked at the second child base, for what
 // happens when more than one process is owed a fault:
 //
 //   an interrupt taken from the doomed process's own spinning thread;
@@ -535,43 +536,76 @@ func idle_door(system: &System, proc: &Process, image: &Memory,
 }
 
 /// One trial of a buffer in a piece mapped once or twice: `first` is the
-/// access of the first mapping and `second` of the next, over the same bytes
+/// access of the first mapping and `second` of the next, of the same bytes
 /// (`NO_ACCESS` for none). The child's call (role 7 or 8) is through the
 /// read-write mapping, and must be refused with `BadBuffer` when either
 /// mapping lets the process execute the piece, in either order, and taken
-/// when neither does. The read-write mapping's address is the one the child
-/// is told: where a mapping takes its memory's own address both mappings are
-/// at it, and where the target translates the second has an address of its
-/// own.
+/// when neither does: `want` is the status word owed. Where the target places
+/// a mapping the second has an address of its own, and the child is told the
+/// read-write one's. Where a mapping takes its memory's own address the second
+/// would lie over the first, so it is refused with `NoResource` and installs
+/// nothing (spec §2.5), and the call is through the first mapping alone:
+/// `want_refused` is the status word owed then. Answers whether the second map
+/// was refused.
 func exec_trial(system: &System, proc: &Process, image: &Memory, pool: &Pool,
-                role: UInt, first: UInt32, second: UInt32,
-                want: UInt) -> Result<Void, SosStatus> {
+                role: UInt, first: UInt32, second: UInt32, want: UInt,
+                want_refused: UInt) -> Result<Bool, SosStatus> {
     let parts = try region(&system, &image, &pool)
     let (child, hole) = move parts
     let one = try child.map(memory: &hole, access: first)
     var at = try one.base()
+    var refused = false
     if second != NO_ACCESS {
-        let two = try child.map(memory: &hole, access: second)
-        if second == RW {
-            at = try two.base()
+        match child.map(memory: &hole, access: second) {
+            case Ok(two) -> {
+                if second == RW {
+                    at = try two.base()
+                }
+            },
+            case Err(why) -> {
+                match why {
+                    case NoResource -> { refused = true },
+                    case _ -> { return why },
+                }
+            },
         }
     }
     try brief(&system, &proc, &child, role, at)
     try start_and_park(&proc, &child)
-    try ended_with(&proc, &child, want)
-    return
+    if refused {
+        try ended_with(&proc, &child, want_refused)
+    } else {
+        try ended_with(&proc, &child, want)
+    }
+    return refused
 }
 
 /// `exec_trial` for one call, over the control and both orders of the two
 /// mappings. The control, a piece mapped read-write only, is a legal buffer.
+/// Where the second map is refused the read-write view stands alone after the
+/// read-execute map, and is taken, and the read-execute view stands alone
+/// after the read-write map, and is no buffer.
 func exec_rows(system: &System, proc: &Process, image: &Memory, pool: &Pool,
                role: UInt, what: String) -> Result<Void, SosStatus> {
-    try exec_trial(&system, &proc, &image, &pool, role, RW, NO_ACCESS, TAKEN)
+    let _ = try exec_trial(&system, &proc, &image, &pool, role, RW, NO_ACCESS,
+                           TAKEN, TAKEN)
     print("SOS latedoor: exec row, {}, rw only: taken\n", what)
-    try exec_trial(&system, &proc, &image, &pool, role, RW, RX, BAD_BUFFER)
-    print("SOS latedoor: exec row, {}, rw then rx: BadBuffer\n", what)
-    try exec_trial(&system, &proc, &image, &pool, role, RX, RW, BAD_BUFFER)
-    print("SOS latedoor: exec row, {}, rx then rw: BadBuffer\n", what)
+    let rx_refused = try exec_trial(&system, &proc, &image, &pool, role, RW,
+                                    RX, BAD_BUFFER, TAKEN)
+    if rx_refused {
+        print("SOS latedoor: exec row, {}, rw then rx: {}\n", what,
+              "the read-execute map refused, taken")
+    } else {
+        print("SOS latedoor: exec row, {}, rw then rx: BadBuffer\n", what)
+    }
+    let rw_refused = try exec_trial(&system, &proc, &image, &pool, role, RX,
+                                    RW, BAD_BUFFER, BAD_BUFFER)
+    if rw_refused {
+        print("SOS latedoor: exec row, {}, rx then rw: {}\n", what,
+              "the read-write map refused, BadBuffer")
+    } else {
+        print("SOS latedoor: exec row, {}, rx then rw: BadBuffer\n", what)
+    }
     return
 }
 

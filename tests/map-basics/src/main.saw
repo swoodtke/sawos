@@ -9,8 +9,9 @@
 //   SOS mapbasics: wrote 0x5a read 90       <- the row installed, immediately
 //                                              (90 is 0x5a; the byte renders as
 //                                              decimal)
-//   SOS mapbasics: double-mapped read-only  <- allowed
-//   SOS mapbasics: still 90                 <- the alias destroyed nothing
+//   SOS mapbasics: mapped read-only into a child
+//                                           <- allowed
+//   SOS mapbasics: still 90                 <- the second view changed nothing
 //
 // The first line also proves the live-domain rule half the time. The scheduler
 // skips equal domains, so a `map` into the running process would never be
@@ -18,14 +19,12 @@
 // (`map_unmap` proves the other direction, the one that matters for
 // revocation.)
 //
-// The double map shows per-mapping access. Access is a property of the mapping,
-// not of the region (`MemoryRight` has no R/W/X pair on purpose), so one region
-// can be installed read-write here and read-only there. On a machine with no
-// translation both rows name the same addresses and the hardware's own matching
-// rule decides which one answers; on a translating machine the second row
-// lands at a second virtual address. Either way this case asserts that both
-// install and that a read at `base` still works, and deliberately does not
-// write again afterwards.
+// The second view shows per-mapping access. Access is a property of the
+// mapping, not of the allocation (`MemoryRight` has no R/W/X pair on purpose),
+// so one allocation can be installed read-write here and read-only there. The
+// second view is in another process, a child created and never started: two
+// rows of one process never overlap (spec §2.5), and where a mapping takes
+// its memory's own address a second view in root would lie over the first.
 
 import sos.{System, Process, Memory, Pool, Mapping, MapAccess, SosStatus}
 
@@ -59,8 +58,30 @@ func _start(boot_handle: UInt) {
         return
     }
 
+    // The boot set, in the table's order: the child's image, its destination
+    // and the pool.
+    var image_rec = try proc.boot_handle_next() catch {
+        print("SOS mapbasics: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var ram_rec = try proc.boot_handle_next() catch {
+        print("SOS mapbasics: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
     var record = try proc.boot_handle_next() catch {
         print("SOS mapbasics: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image = image_rec.take_memory() else {
+        let _ = system.debug_print("SOS mapbasics: no image allocation\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let ram = ram_rec.take_memory() else {
+        let _ = system.debug_print("SOS mapbasics: no dest allocation\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -90,15 +111,20 @@ func _start(boot_handle: UInt) {
     poke(base, 0x5A)
     print("SOS mapbasics: wrote 0x5a read {}\n", peek(base) as Int)
 
-    // The double map. The same region, a second Mapping, read-only. Nothing
-    // refuses it and nothing has to: two rows over one region are two rows,
-    // and the region is not consumed by being installed.
-    let _ro_map = try proc.map(memory: &chunk, access: RO) catch {
-        print("SOS mapbasics: double map failed: {}\n", error)
+    // The second view. The same allocation, a second Mapping, read-only, in
+    // a child. Nothing refuses it and nothing has to: an allocation is not
+    // consumed by being installed.
+    let child = try system.process_create(image: &image, memory: &ram) catch {
+        print("SOS mapbasics: create failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let _ = system.debug_print("SOS mapbasics: double-mapped read-only\n")
+    let _ro_map = try child.map(memory: &chunk, access: RO) catch {
+        print("SOS mapbasics: second map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mapbasics: mapped read-only into a child\n")
     print("SOS mapbasics: still {}\n", peek(base) as Int)
 
     let _ = system.debug_print("SOS mapbasics: done\n")

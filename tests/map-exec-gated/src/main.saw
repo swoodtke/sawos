@@ -94,12 +94,21 @@ func _start(boot_handle: UInt) {
     // gate. What is claimed is that a handle carrying `MemoryRight.MapExecute`
     // may ask for `MapAccess.Execute`, which is a row the kernel installs or a
     // fault it raises, and one of those two things happens on the next line.
-    let _text = try proc.map(memory: &page, access: RX) catch {
+    let text = try proc.map(memory: &page, access: RX) catch {
         print("SOS execgate: mapping executable failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     let _ = system.debug_print("SOS execgate: mapped executable\n")
+    // Unmapped again before the control below maps the same page: two rows of
+    // one process never overlap (spec §2.5), and where a mapping takes its
+    // memory's own address the control's row would lie over this one. The
+    // Mapping handle stays, unmapped.
+    try text.unmap() catch {
+        print("SOS execgate: unmap failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
 
     // The narrowing is the ordinary universal mint: a sibling onto the same
     // region, in root's own table, carrying root's rights intersected with the
@@ -115,7 +124,7 @@ func _start(boot_handle: UInt) {
     let _ = system.debug_print("SOS execgate: minted a sibling without MapExecute\n")
 
     // The control. The narrowed handle is a working Memory handle: it maps
-    // read-write, over the same page, into the same domain. Without this line
+    // read-write, the same page, into the same domain. Without this line
     // the refusal below would be consistent with the sibling being broken in
     // any of a dozen ways.
     let _data = try proc.map(memory: &narrow, access: RW) catch {

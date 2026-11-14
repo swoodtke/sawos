@@ -705,6 +705,12 @@ BUFFER_RULE_PKG = os.path.join(TESTS_DIR, "buffer-rule")
 BUFFER_ALIAS_PKG = os.path.join(TESTS_DIR, "buffer-alias")
 CHILD_BUFFER_RULE_PKG = os.path.join(TESTS_DIR, "child-buffer-rule")
 CHILD_DATA_FIRST_PKG = os.path.join(TESTS_DIR, "child-data-first")
+# A process's rows never overlap (spec §2.5, §5.6).
+MAP_OVERLAP_PKG = os.path.join(TESTS_DIR, "map-overlap")
+MAP_OVERLAP_CARVES_PKG = os.path.join(TESTS_DIR, "map-overlap-carves")
+SEGMENTS_MEET_PKG = os.path.join(TESTS_DIR, "segments-meet")
+DEST_GRAIN_PKG = os.path.join(TESTS_DIR, "dest-grain")
+MAP_USER_ADDRESS_PKG = os.path.join(TESTS_DIR, "map-user-address")
 ROOM_REWRITE_PKG = os.path.join(TESTS_DIR, "room-rewrite")
 CHILD_ROOM_REWRITE_PKG = os.path.join(TESTS_DIR, "child-room-rewrite")
 RO_DESTINATION_PKG = os.path.join(TESTS_DIR, "ro-destination")
@@ -1137,6 +1143,10 @@ REGION_KIND_RAM = 0
 REGION_KIND_DEVICE = 1
 REGION_KIND_POOL = 2
 
+# The top of the pool window an `off_grain_destinations` case gives to its two
+# allocations off the grain, half each.
+OFF_GRAIN_SPAN = 0x2_0000
+
 
 def arch_dirs(arch):
     """The per-profile directories a build reaches into.
@@ -1177,6 +1187,7 @@ def expectations(arch):
     digits are the target's word width.
     """
     width = arch["hex_width"]
+    meet_at = arch["root_entry"] + 2 * arch.get("prot_grain", 0)
     return {
         # `banner_arch` is the architecture's name: the profile's own name for
         # a profile that is a board in its own right, the board's for a variant
@@ -1203,6 +1214,20 @@ def expectations(arch):
         "own_rx_map_end": ("the child's own memory is no buffer"
                            if arch.get("map_places")
                            else "an entry in the child's data is refused"),
+        # How a call through a piece mapped twice into a child ends
+        # (`late_door_buffer_gone`): where a mapping has an address of its own
+        # both views are rows and the read-write one is no buffer beside the
+        # read-execute one; where a mapping takes its memory's own address the
+        # second map is refused and the call is judged by the first row alone.
+        "late_rw_rx": ("BadBuffer" if arch.get("map_places")
+                       else "the read-execute map refused, taken"),
+        "late_rx_rw": ("BadBuffer" if arch.get("map_places")
+                       else "the read-write map refused, BadBuffer"),
+        # The address a refused root image's second meeting segment is named
+        # by: `payload_segments_meet.S` links it two grains above the entry.
+        "segments_meet_at": f"0x{meet_at:0{width}x}",
+        # The device window's base, which `payload_devices_meet.S` declares.
+        "device_grant_base": f"0x{arch.get('device_base', 0):0{width}x}",
         "entry": f"0x{arch['root_entry']:0{width}x}",
         # A pool's numbers as `Pool.available` reports them, in decimal: the
         # granularity set (one bit, the grain) and a fresh pool's bytes.
@@ -1229,6 +1254,7 @@ def expectations(arch):
         "eight": f"0x{8:0{width}x}",
         "nine": f"0x{9:0{width}x}",
         "ten": f"0x{10:0{width}x}",
+        "eleven": f"0x{11:0{width}x}",
         "prio": f"0x{0x01010100:0{width}x}",
         "irq_line": f"0x{arch['selftest_line']:0{width}x}",
         # The byte `child-touch` writes into the page its launcher mapped and
@@ -1698,6 +1724,29 @@ TEST_CASES = [
         "arches": ["riscv32", "riscv32-flat"],
         "expect_out": "bad root image: segment is not aligned to the grant "
                       "granularity",
+        "expect_clean_exit": False,
+    },
+    {
+        # Two segments whose rows would meet: the second, zero-filled and
+        # read-write, is linked two grains into the code segment. No two rows
+        # of one image meet (spec §5.6), so the boot stops, naming the second
+        # segment's address.
+        "name": "root_image_segments_meet",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_segments_meet.S",
+        "expect_out": "bad root image: two segments of the image meet "
+                      "({segments_meet_at})",
+        "expect_clean_exit": False,
+    },
+    {
+        # The board's one device window declared twice: two device segments,
+        # whose rows would grant the same page. The boot stops, naming the
+        # second's address.
+        "name": "root_image_devices_meet",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_devices_meet.S",
+        "expect_out": "bad root image: two segments of the image meet "
+                      "({device_grant_base})",
         "expect_clean_exit": False,
     },
     # --- the real two-image boot --------------------------------------------
@@ -3958,18 +4007,20 @@ TEST_CASES = [
         # process that did not reload would never be installed and the write
         # below would fault instead of printing.
         #
-        # The double map shows two rows over one region with different access,
-        # allowed. The case asserts that both install and that a read still
-        # answers; deliberately not a write afterwards, since which row answers
-        # is the hardware's own matching rule.
+        # The second view shows two rows over one allocation with different
+        # access, allowed: read-write in root and read-only in a child, created
+        # and never started, since two rows of one process never overlap
+        # (spec §2.5). The read afterwards says the second view changed
+        # nothing.
         "name": "map_basics",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MAP_BASICS_PKG,
+        "children": [CHILD_FAULT_PKG],
         "pool": True,
         "expect_out": ["{banner}",
-                       "SOS: boot regions={one}",
+                       "SOS: boot regions={three}",
                        "SOS mapbasics: wrote 0x5a read 90",
-                       "SOS mapbasics: double-mapped read-only",
+                       "SOS mapbasics: mapped read-only into a child",
                        "SOS mapbasics: still 90",
                        "SOS mapbasics: done"],
         "expect_clean_exit": True,
@@ -4483,7 +4534,9 @@ TEST_CASES = [
         #
         # Each Mapping object is dropped and each row stays, which makes this a
         # ledger test: the Mapping slab is untouched at the refusal, so only a
-        # quota that counts installed rows could have refused the third.
+        # quota that counts installed rows could have refused the third. Each
+        # row is a page of its own, one per round, since two rows of one
+        # process never overlap (spec §2.5).
         "name": "quota_vs_wall",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": QUOTA_VS_WALL_PKG,
@@ -4492,7 +4545,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
                        "SOS quotawall: created",
-                       "SOS quotawall: gave a page",
+                       "SOS quotawall: gave a page per round",
                        "SOS quotawall: started",
                        "SOS childmapwall: maps=2 quota=1",
                        "SOS: process exit: code={two} process={one}",
@@ -4787,10 +4840,12 @@ TEST_CASES = [
     },
     {
         # Executable is an authority. Root maps a page read-execute through its
-        # full pool handle and it installs; root then mints a sibling with
-        # `MemoryRight.MapExecute` masked out, proves that sibling is a working
-        # handle by mapping read-write through it, and asks for read-execute
-        # through it, which ends the process.
+        # full allocation handle and it installs, and unmaps it again; root
+        # then mints a sibling with `MemoryRight.MapExecute` masked out, proves
+        # that sibling is a working handle by mapping read-write through it,
+        # and asks for read-execute through it, which ends the process. The
+        # unmap is there because two rows of one process never overlap
+        # (spec §2.5).
         #
         # The read-write line is what makes the refusal mean anything: without
         # it, a sibling broken in any of a dozen ways would produce the same
@@ -4818,10 +4873,11 @@ TEST_CASES = [
                        "SOS: process fault: access denied",
                        # Nine, and the arithmetic is the program: §12's three
                        # boot handles, the pool region, the Process handle
-                       # `process_self` minted, the page the split cut off, the
-                       # executable Mapping, the narrowed sibling, and the
-                       # read-write Mapping it installed. The refused map
-                       # minted nothing, which is what a fault before any
+                       # `process_self` minted, the page allocated, the
+                       # executable Mapping (unmapped before the control maps
+                       # the page, and still a handle), the narrowed sibling,
+                       # and the read-write Mapping it installed. The refused
+                       # map minted nothing, which is what a fault before any
                        # allocation means.
                        "SOS: process teardown handles={nine} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero} "
@@ -4830,11 +4886,12 @@ TEST_CASES = [
         "expect_status": EXIT_PROCESS_FAULT,
     },
     {
-        # W^X, per row. One region is mapped read-write here and read-execute
-        # there (the sanctioned double map), so the JIT-shaped pattern survives
-        # in full while every individual protection row is W^X.
+        # W^X, per row. One allocation is mapped read-write into root and
+        # read-execute into a child, created and never started (two rows of one
+        # process never overlap, spec §2.5), so the JIT-shaped pattern survives
+        # while every individual protection row is W^X.
         #
-        # The refusal goes through root's full pool handle, which carries
+        # The refusal goes through root's full allocation handle, which carries
         # `MemoryRight.MapExecute` and has just proved it. So this cannot be
         # the exec gate wearing a different hat: every right is present and the
         # word is what is wrong, which is what `argument outside its domain`
@@ -4842,18 +4899,22 @@ TEST_CASES = [
         "name": "map_wx_refused",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MAP_WX_REFUSED_PKG,
+        "children": [CHILD_FAULT_PKG],
         "pool": True,
         "expect_out": ["{banner}",
-                       "SOS: boot regions={one}",
+                       "SOS: boot regions={three}",
                        "SOS mapwx: read-write here, wrote 107 read 107",
-                       "SOS mapwx: read-execute there: one region, two rows",
+                       "SOS mapwx: read-execute in a child: one allocation, "
+                       "two rows",
                        "SOS mapwx: asking for write and execute in one row",
                        "SOS: process fault: argument outside its domain",
-                       # Eight: `map_exec_gated`'s nine minus the sibling it
-                       # minted, since this case narrows nothing. Two Mappings
-                       # are among them, over one region, which is the double
-                       # map counted rather than merely printed.
-                       "SOS: process teardown handles={eight} threads={one} "
+                       # Eleven: `map_exec_gated`'s nine minus the sibling it
+                       # minted, since this case narrows nothing, plus the
+                       # child's image, its destination and the child's
+                       # Process handle. Two Mappings are among them, of one
+                       # allocation, which is the second view counted rather
+                       # than merely printed.
+                       "SOS: process teardown handles={eleven} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={zero}"],
         "expect_clean_exit": False,
@@ -8378,8 +8439,10 @@ TEST_CASES = [
     },
     {
         # A child running in place in its blob, and the blob mapped into it:
-        # the mapping would cover the child's code row, an image row, and is
-        # `NoResource` (spec §2.5); the child then runs and exits.
+        # the mapping would meet the child's code row, its first row, and is
+        # `NoResource` (spec §2.5). Then its destination, where the one row
+        # the child holds is its stack grant, every segment being in place:
+        # `NoResource` too. The child then runs and exits.
         "name": "map_over_in_place_image",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": INPLACE_LAUNCH_PKG,
@@ -8388,6 +8451,8 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS inplacelaunch: a mapping over the child's image: "
+                       "out of kernel objects",
+                       "SOS inplacelaunch: a mapping over the child's stack: "
                        "out of kernel objects",
                        "SOS-H",
                        "SOS inplacelaunch: the child exited from its image"],
@@ -8470,6 +8535,187 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # A mapping does not overlap a row its target already holds (spec
+        # §2.5). Root launches `child-buffer-rule` once per trial and maps into
+        # it: its own destination (over its copied segments and its stack), an
+        # allocation twice, an allocation read-only and then read-write, the
+        # device window twice; and the stats region into root twice. Where a
+        # mapping takes its memory's own address each second row would lie
+        # over the first and is refused with `NoResource`; where the target
+        # places a mapping it is taken at an address of its own. A device
+        # window is mapped at its own address on every profile, so its second
+        # map is refused on every profile.
+        #
+        # After the refused read-write map no row over the read-only view
+        # permits write, so a `PipeCreate` record there ends the child with
+        # `BadBuffer`: the kernel does not store where the process cannot.
+        # Two allocations side by side, mapped in either order, only touch and
+        # are both taken.
+        #
+        # The last trial spends the child's mapping allowance, which is two,
+        # around refused maps: the window taken, nine refused maps of it, an
+        # allocation taken, and the next refused by the quota. A refused map
+        # that charged would have spent the allowance early; one that
+        # installed a row would have filled the grant record, which has nine
+        # rows at most, and stopped the machine. The window mapped once more
+        # then is refused by the quota as well, which is asked before the
+        # rows are.
+        "name": "map_overlap_refused",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_OVERLAP_PKG,
+        "children": [CHILD_BUFFER_RULE_PKG],
+        "pool": True,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS mapoverlap: the child's destination, over its "
+                       "segments and its stack: {own_map}",
+                       "SOS mapoverlap: an allocation mapped twice: {own_map}",
+                       "SOS mapoverlap: an allocation read-only, then "
+                       "read-write: {own_map}",
+                       "SOS mapoverlap: a record at the read-only view: "
+                       "BadBuffer",
+                       "SOS mapoverlap: a device window mapped twice: refused "
+                       "with NoResource",
+                       "SOS mapoverlap: the stats region mapped twice: "
+                       "{own_map}",
+                       "SOS mapoverlap: an allocation mapped where the last "
+                       "one ends: taken",
+                       "SOS mapoverlap: an allocation mapped where the next "
+                       "one begins: taken",
+                       "SOS mapoverlap: refused maps installed nothing and "
+                       "charged nothing",
+                       "SOS mapoverlap: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Where a mapping meets a row, to the grain (spec §2.5). Carves of the
+        # console UART's page, each a naturally aligned power of two, mapped
+        # into root around the eight bytes at offset 8: a carve over its first
+        # or its last four bytes, or holding it, is refused with `NoResource`,
+        # and one ending where it begins or beginning where it ends is taken.
+        #
+        # riscv32 only: arm64 grants a device window by the page, and the
+        # window is one page.
+        "name": "map_overlap_carves",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_OVERLAP_CARVES_PKG,
+        "device": True,
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS mapcarves: eight bytes at offset 8: taken",
+                       "SOS mapcarves: its first four bytes again: refused "
+                       "with NoResource",
+                       "SOS mapcarves: its last four bytes again: refused "
+                       "with NoResource",
+                       "SOS mapcarves: thirty-two bytes holding it: refused "
+                       "with NoResource",
+                       "SOS mapcarves: eight bytes ending where it begins: "
+                       "taken",
+                       "SOS mapcarves: sixteen bytes beginning where it ends: "
+                       "taken",
+                       "SOS mapcarves: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # No two rows of one image meet (spec §5.6). Root writes each image
+        # itself and creates a process from it: two segments that meet, whole
+        # or by one grain at either end, or by a segment ending a byte into a
+        # grain that the next is linked at, are `BadImage`, and so are three
+        # whose first and last, or whose last two, meet. Segments that only
+        # touch, in either order, or past a grain the first ends a byte into,
+        # load. A segment's row is rounded up to the grain, so a thread's stack
+        # top at the end of a segment's part-filled last grain is a stack. A
+        # segment of no bytes records a row of no bytes, which holds no
+        # address: inside another segment, listed after it or before it, or at
+        # its base or its top, it meets nothing and the image loads; and a
+        # piece of a child's destination cut around it (`Memory.split`) maps
+        # into that child, where a mapping's range then holds its address.
+        "name": "segments_meet",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SEGMENTS_MEET_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS segmeet: two at one address: BadImage",
+                       "SOS segmeet: the second over the first's last grain: "
+                       "BadImage",
+                       "SOS segmeet: the second under the first's first "
+                       "grain: BadImage",
+                       "SOS segmeet: a byte into a grain, the next at that "
+                       "grain: BadImage",
+                       "SOS segmeet: the first and the last of three: "
+                       "BadImage",
+                       "SOS segmeet: the last two of three: BadImage",
+                       "SOS segmeet: side by side: loaded",
+                       "SOS segmeet: side by side, the second below: loaded",
+                       "SOS segmeet: a byte into a grain, the next past it: "
+                       "loaded",
+                       "SOS segmeet: three side by side: loaded",
+                       "SOS segmeet: no bytes inside another, listed after "
+                       "it: loaded",
+                       "SOS segmeet: no bytes inside another, listed before "
+                       "it: loaded",
+                       "SOS segmeet: no bytes at another's base: loaded",
+                       "SOS segmeet: no bytes at another's top: loaded",
+                       "SOS segmeet: a stack top at a part-filled grain's "
+                       "end: a thread made",
+                       "SOS segmeet: a map holding a row of no bytes: taken",
+                       "SOS segmeet: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A destination is on the grain (spec §5.6). The build gives root two
+        # allocations off the grain (`off_grain_destinations`): one whose
+        # length is not whole grains and one whose base is a byte past the
+        # grain. Root writes an image of one code segment, and a create into
+        # either is `BadImage`. Into an allocation on the grain it loads, and a
+        # thread is made on its stack's top word; with a one-byte executable
+        # segment just below the stack it loads too, and a thread is made on
+        # the stack's lowest grain, which no row the process may execute
+        # grants.
+        "name": "destination_off_grain",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEST_GRAIN_PKG,
+        "pool": True,
+        "off_grain_destinations": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS destgrain: a destination whose length is off the "
+                       "grain: BadImage",
+                       "SOS destgrain: a destination whose base is off the "
+                       "grain: BadImage",
+                       "SOS destgrain: a destination on the grain: loaded",
+                       "SOS destgrain: a thread on its stack's top word: made",
+                       "SOS destgrain: a one-byte executable segment under "
+                       "the stack: loaded",
+                       "SOS destgrain: a thread on the stack's bottom grain: "
+                       "made",
+                       "SOS destgrain: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A mapping meets a row by user address (spec §2.5). arm64 only, where
+        # a mapping's address is not its frames': root maps one allocation,
+        # nearly the pool's length, into itself three times, and the pool's
+        # frames lie just above root's region, so the second view's addresses
+        # hold the allocation's own frame numbers. The third view meets no row
+        # by address and is taken.
+        "name": "map_meets_by_user_address",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_USER_ADDRESS_PKG,
+        "pool": True,
+        "arches": ["arm64"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS mapuser: the second view's addresses hold its own "
+                       "frames",
+                       "SOS mapuser: a third view: taken",
+                       "SOS mapuser: done"],
+        "expect_clean_exit": True,
+    },
+    {
         # A buffer in a segment that is writable and executable is refused at
         # both doors. The child is linked as one such segment (the loader
         # accepts it), and the destination of a `PipeCreate` record (the
@@ -8512,15 +8758,18 @@ TEST_CASES = [
         # receiver's would be" looks like from outside: nothing spent, nothing
         # pinned.
         #
-        # The piece mapped into the child twice, over the same bytes, with a
-        # call through its read-write view (a send body, a pipe-creation
-        # record): mapped read-write only it is a legal buffer, and mapped
-        # read-write and read-execute, in either order, it is not, since a row
-        # that permits execute grants its bytes whatever the other row says
-        # (`translate_user`). Where a mapping takes its memory's own address
-        # the two rows lie over the same addresses; on arm64 they are two
-        # views at two addresses, and the rows are compared by the bytes they
-        # grant.
+        # The piece mapped into the child twice, the same bytes, with a call
+        # through its read-write view (a send body, a pipe-creation record):
+        # mapped read-write only it is a legal buffer. On arm64 the two views
+        # are at two addresses, and mapped read-write and read-execute, in
+        # either order, the read-write view is no buffer, since a row that
+        # permits execute grants its bytes whatever the other row says
+        # (`translate_user`, comparing the bytes rows grant). Where a mapping
+        # takes its memory's own address the second map would lie over the
+        # first and is refused (spec §2.5), so the call is through the first
+        # row alone: the read-write view is taken after a refused read-execute
+        # map, which shows the refusal installed nothing, and the read-execute
+        # view is no buffer after a refused read-write one.
         #
         # The trials after those use a second child, linked at the second child
         # base: a Timer's interrupt taken from the doomed process's own
@@ -8567,14 +8816,14 @@ TEST_CASES = [
                        "process ended with BadBuffer",
                        "SOS latedoor: exec row, send body, rw only: taken",
                        "SOS latedoor: exec row, send body, rw then rx: "
-                       "BadBuffer",
+                       "{late_rw_rx}",
                        "SOS latedoor: exec row, send body, rx then rw: "
-                       "BadBuffer",
+                       "{late_rx_rw}",
                        "SOS latedoor: exec row, record, rw only: taken",
                        "SOS latedoor: exec row, record, rw then rx: "
-                       "BadBuffer",
+                       "{late_rw_rx}",
                        "SOS latedoor: exec row, record, rx then rw: "
-                       "BadBuffer",
+                       "{late_rx_rw}",
                        "SOS latedoor: wait record gone, door reached from an "
                        "interrupt: BadBuffer",
                        "SOS latedoor: shared waiter, A's record first: both "
@@ -9370,10 +9619,29 @@ def _region_rows(case, arch):
         # cases that show the kernel trims a pool to whole grains.
         skew = case.get("pool_skew", 0)
         short_top = case.get("pool_short_top", 0)
+        # `off_grain_destinations` gives the pool window's top half to two
+        # allocations off the grain, after the pool row, so the pool is the
+        # bottom half.
+        if case.get("off_grain_destinations"):
+            short_top += OFF_GRAIN_SPAN
         rows.append(("the RAM POOL — free memory above every child region",
                      f"{arch['pool_base'] + skew:#x}",
                      f"{arch['pool_len'] - skew - short_top:#x}",
                      REGION_KIND_POOL))
+        if case.get("off_grain_destinations"):
+            # A row whose base is on the grain and whose length is three
+            # bytes short of whole grains (a byte past the last whole
+            # four-byte grain, and off a page's), then one whose base is a
+            # byte past the grain and whose length is whole grains
+            # (`tests/dest-grain`).
+            base = arch["pool_base"] + arch["pool_len"] - OFF_GRAIN_SPAN
+            rows.append(("an allocation whose length is off the grain",
+                         f"{base:#x}", f"{OFF_GRAIN_SPAN // 2 - 3:#x}",
+                         REGION_KIND_RAM))
+            rows.append(("an allocation whose base is off the grain",
+                         f"{base + OFF_GRAIN_SPAN // 2 + 1:#x}",
+                         f"{OFF_GRAIN_SPAN // 2 - 0x1000:#x}",
+                         REGION_KIND_RAM))
     if case.get("device"):
         rows.append(("the DEVICE window — the console UART's register page",
                      f"{arch['device_base']:#x}", f"{arch['device_len']:#x}",

@@ -4,15 +4,18 @@
 // no, and the two lines above the refusal show why that is not a restriction:
 //
 //   SOS mapwx: read-write here, wrote 107 read 107
-//   SOS mapwx: read-execute there: one region, two rows
+//   SOS mapwx: read-execute in a child: one allocation, two rows
 //   SOS mapwx: asking for write and execute in one row
 //   SOS: process fault: argument outside its domain
 //
-// The double map is the point of the first two lines. A double map is
-// sanctioned (two rows, two Mappings, no aliasing bookkeeping on a machine that
-// does not translate), so the JIT-shaped pattern is available: write
-// instructions through the RW row, fetch them through the RX row, over one
-// region, with every individual protection row W^X. The refusal removes only
+// The two views are the point of the first two lines. One allocation may be
+// mapped twice (two rows, two Mappings, no aliasing bookkeeping), so the
+// JIT-shaped pattern is available: write instructions through the RW row,
+// fetch them through the RX row, with every individual protection row W^X.
+// Here the RX row is in a child, created and never started: two rows of one
+// process never overlap (spec §2.5), so where a mapping takes its memory's own
+// address the two views are in two processes, and where the target places a
+// mapping they may also be at two addresses of one. The refusal removes only
 // the single row a process could write to and then fetch from, which has no
 // honest use.
 //
@@ -70,9 +73,30 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // One boot region: the RAM pool.
+    // The boot set, in the table's order: the child's image, its destination
+    // and the RAM pool.
+    var image_record = try proc.boot_handle_next() catch {
+        print("SOS mapwx: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var ram_record = try proc.boot_handle_next() catch {
+        print("SOS mapwx: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
     var pool_record = try proc.boot_handle_next() catch {
         print("SOS mapwx: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image = image_record.take_memory() else {
+        let _ = system.debug_print("SOS mapwx: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let ram = ram_record.take_memory() else {
+        let _ = system.debug_print("SOS mapwx: dest record is not a region\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -98,17 +122,20 @@ func _start(boot_handle: UInt) {
     // with a Mapping, not a number, and a region has no bounds reader. The
     // address of this process's first mapping is the build's config, published
     // to this package through one C constant per architecture, as the other map
-    // cases do. Only that first row's address is used: the executable row
-    // below maps the same page again, and where the machine translates it
-    // lands elsewhere.
+    // cases do.
     let page_at = sos_test_pool_base()
     poke(page_at, MARK)
     print("SOS mapwx: read-write here, wrote {} read {}\n",
           MARK as Int, peek(page_at) as Int)
 
-    // The executable row, over the same region: the sanctioned double map, and
-    // the reason W^X-per-row takes nothing away.
-    let _text = try proc.map(memory: &page, access: RX) catch {
+    // The executable row, of the same allocation, in a child: the second view,
+    // and the reason W^X-per-row takes nothing away.
+    let child = try system.process_create(image: &image, memory: &ram) catch {
+        print("SOS mapwx: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _text = try child.map(memory: &page, access: RX) catch {
         print("SOS mapwx: read-execute map failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -116,11 +143,13 @@ func _start(boot_handle: UInt) {
     // ASCII only on a console line: `ascii_byte` renders a non-ASCII scalar as
     // `?`, so an em dash here would reach the transcript as one. Punctuation
     // belongs in the comments.
-    let _ = system.debug_print("SOS mapwx: read-execute there: one region, two rows\n")
+    let _ = system.debug_print(
+        "SOS mapwx: read-execute in a child: one allocation, two rows\n")
 
-    // The refusal. Same region, same full handle, same target; only the access
-    // word differs, and it is the one word the kernel will not install. A
-    // `BadArg` fault ends the process, so this is the last thing that happens.
+    // The refusal. Same allocation, same full handle, root as the target;
+    // only the access word differs, and it is the one word the kernel will not
+    // install. It is a fault, decided before the target's rows are looked at,
+    // and it ends the process, so this is the last thing that happens.
     let _ = system.debug_print("SOS mapwx: asking for write and execute in one row\n")
     match proc.map(memory: &page, access: RWX) {
         case Ok(_) -> {

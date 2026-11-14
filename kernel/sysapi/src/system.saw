@@ -1442,8 +1442,8 @@ extension Process {
     /// number.
     ///
     /// `access` is a mask of `MapAccess` bits, and a property of this mapping
-    /// rather than of the region, so one region can be mapped read-only in one
-    /// place and read-write in another. A double map is allowed: two rows, two
+    /// rather than of the allocation, so one allocation can be mapped
+    /// read-only in one place and read-write in another: two rows, two
     /// Mappings.
     ///
     /// Write without read, no access at all, a bit outside the three, and a
@@ -1452,7 +1452,11 @@ extension Process {
     /// (on one profile a fixed number of hardware regions), so a domain with no
     /// row left is `SosStatus.QuotaExceeded`; so is a caller at its handle
     /// quota. No address space left for the range in the target's domain, a
-    /// full mapping slab or a full handle table is `SosStatus.NoResource`.
+    /// range that meets a row the target already holds (spec §2.5: where a
+    /// mapping takes its memory's own address, the same allocation mapped
+    /// twice into one process, or a child's destination mapped into that
+    /// child), a full mapping slab or a full handle table is
+    /// `SosStatus.NoResource`.
     ///
     /// It works before `start()` and after it. A mapping is not a boot record:
     /// the give-freeze (§12's "the boot set freezes at start") does not apply,
@@ -1485,6 +1489,11 @@ extension Process {
     /// A driver receives its window as a capability and maps it into itself
     /// with this call. Because the window is something a launcher hands over, a
     /// driver child is possible at all.
+    ///
+    /// A window is mapped at its own address on every profile, so a window
+    /// that meets a row the target already holds (one window mapped twice into
+    /// one process, or two overlapping carves of it) is
+    /// `Err(SosStatus.NoResource)`, and installs nothing (spec §2.5).
     public func map(&self, iomemory: &IoMemory) -> Result<Mapping, SosStatus> {
         let raw = try call_value(iomemory.handle, IoMemoryOp.Map as UInt,
                                  self.handle, 0, 0)

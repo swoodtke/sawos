@@ -1,0 +1,208 @@
+// A destination is on the grain (spec §5.6): `process_create` refuses one
+// whose base or whose length is off the protection grain, and makes nothing.
+//
+// The build gives root two boot allocations off the grain beside its pool:
+// one whose base is on the grain and whose length is not, and one whose base
+// is a byte past the grain and whose length is whole grains. Root writes
+// one image, a code segment of two grains at the link base (on the grain
+// above the destination's base where an image links at its destination),
+// into a page out of the pool, and creates from it:
+//
+//   SOS destgrain: a destination whose length is off the grain: BadImage
+//   SOS destgrain: a destination whose base is off the grain: BadImage
+//   SOS destgrain: a destination on the grain: loaded
+//   SOS destgrain: a thread on its stack's top word: made
+//   SOS destgrain: a one-byte executable segment under the stack: loaded
+//   SOS destgrain: a thread on the stack's bottom grain: made
+//   SOS destgrain: done
+//
+// On the grain the stack grant begins on a grain boundary, so a segment just
+// below it, rounded up to the grain, ends where the stack begins: the stack's
+// lowest grain is still memory a thread may run on, and no row the process
+// may execute grants it.
+//
+// The images carry the architecture's tag and its grain, by the word size:
+// a 64-bit word is arm64, whose grain is a page and whose images link at one
+// canonical base (`hal.USER_IMAGE_BASE`), and a 32-bit word is riscv32, whose
+// grain is four bytes and whose images link where their destination is.
+
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, SosStatus}
+
+extern "C" {
+    func sos_test_pool_base() -> UInt
+}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// Where the two allocations off the grain begin, from the pool row's base,
+/// to the grain below each, as the build lays them out.
+static SHORT_AT: UInt = 0x2_0000
+static SKEWED_AT: UInt = 0x3_0000
+
+/// The destination on the grain, the image's page, and the kernel's stack
+/// grant at a destination's top (`hal.ROOT_STACK_LEN`).
+static DEST_LEN: UInt = 0x1_0000
+static IMAGE_LEN: UInt = 0x1000
+static STACK_LEN: UInt = 0x4000
+
+/// The sosimg format as `imgformat` lays it out: a 24-byte header and a
+/// 24-byte record per segment, little-endian.
+static MAGIC: UInt32 = 0x4953_4F53
+static VERSION: UInt32 = 3
+static PRIO: UInt32 = 0x0101_0100
+static HEADER_BYTES: UInt = 24
+static SEG_BYTES: UInt = 24
+static ARCH_RISCV32: UInt32 = 1
+static ARCH_ARM64: UInt32 = 2
+
+/// `SegFlag`'s bits.
+static READ: UInt32 = 1
+static EXECUTE: UInt32 = 4
+static RX_FLAGS: UInt32 = READ | EXECUTE
+
+/// arm64's canonical link base, `hal.USER_IMAGE_BASE`.
+static ARM64_LINK_BASE: UInt = 0x4020_0000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS destgrain: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS destgrain: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS destgrain: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The pool, then the two allocations off the grain: the table's order.
+    var pool_rec = try proc.boot_handle_next()
+    var short_rec = try proc.boot_handle_next()
+    var skewed_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    guard let short = short_rec.take_memory() else { return BUG }
+    guard let skewed = skewed_rec.take_memory() else { return BUG }
+    let wide = sizeof<UInt>() == 8
+    let grain: UInt = if wide { 0x1000 } else { 4 }
+
+    let image = try pool.allocate(len: IMAGE_LEN)
+    let view = try proc.map(memory: &image, access: RW)
+    let at = try view.base()
+
+    // Where an image links at its destination, the first grain boundary at
+    // or above each allocation's base.
+    var short_link = ARM64_LINK_BASE
+    var skewed_link = ARM64_LINK_BASE
+    if not wide {
+        short_link = sos_test_pool_base() + SHORT_AT
+        skewed_link = sos_test_pool_base() + SKEWED_AT + grain
+    }
+    write_image(at, wide, short_link, grain, 0)
+    try refused(&system, &image, &short,
+                "a destination whose length is off the grain: BadImage")
+    write_image(at, wide, skewed_link, grain, 0)
+    try refused(&system, &image, &skewed,
+                "a destination whose base is off the grain: BadImage")
+
+    let dest = try pool.allocate(len: DEST_LEN)
+    var link = ARM64_LINK_BASE
+    if not wide {
+        let probe = try proc.map(memory: &dest, access: RW)
+        link = try probe.base()
+        try probe.unmap()
+    }
+    let top = link + DEST_LEN
+    let stack = top - STACK_LEN
+
+    write_image(at, wide, link, grain, 0)
+    let plain = try system.process_create(image: &image, memory: &dest)
+    say("a destination on the grain: loaded")
+    let first = try plain.thread_create(stack_top: top, arg: 0)
+    say("a thread on its stack's top word: made")
+    let _ = move first
+    let _ = move plain
+
+    write_image(at, wide, link, grain, stack - grain - link)
+    let child = try system.process_create(image: &image, memory: &dest)
+    say("a one-byte executable segment under the stack: loaded")
+    let second = try child.thread_create(stack_top: stack + grain, arg: 0)
+    say("a thread on the stack's bottom grain: made")
+    let _ = move second
+    let _ = move child
+    try view.unmap()
+    return
+}
+
+func say(line: String) {
+    print("SOS destgrain: {}\n", line)
+}
+
+/// A create from `image` into `dest` that answers `BadImage`.
+func refused(system: &System, image: &Memory, dest: &Memory,
+             line: String) -> Result<Void, SosStatus> {
+    match system.process_create(image: &image, memory: &dest) {
+        case Ok(child) -> {
+            let _ = move child
+            let _ = system.debug_print("SOS destgrain: a create was taken\n")
+            return BUG
+        },
+        case Err(why) -> {
+            match why {
+                case BadImage -> {},
+                case _ -> { return why },
+            }
+        },
+    }
+    say(line)
+    return
+}
+
+func poke(at: UInt, value: UInt32) unsafe {
+    UnsafeMemory<UInt32, Device>(at).write(value)
+}
+
+/// One segment record at `at`: zero-filled, `len` bytes at `addr`.
+func write_seg(at: UInt, addr: UInt, len: UInt, flags: UInt32) unsafe {
+    poke(at, addr as UInt32)
+    poke(at + 4, 0)
+    poke(at + 8, 0)
+    poke(at + 12, 0)
+    poke(at + 16, len as UInt32)
+    poke(at + 20, flags)
+}
+
+/// The image at `at`: a code segment of two grains at `link`, where the entry
+/// is, and where `extra` is not zero a one-byte executable segment `extra`
+/// bytes above `link`.
+func write_image(at: UInt, wide: Bool, link: UInt, grain: UInt,
+                 extra: UInt) unsafe {
+    var count: UInt32 = 1
+    if extra != 0 {
+        count = 2
+    }
+    let arch = if wide { ARCH_ARM64 } else { ARCH_RISCV32 }
+    poke(at, MAGIC)
+    poke(at + 4, VERSION | (count << 16) | (arch << 24))
+    poke(at + 8, PRIO)
+    poke(at + 12, 0)
+    poke(at + 16, link as UInt32)
+    poke(at + 20, 0)
+    let table = at + HEADER_BYTES
+    write_seg(table, link, 2 * grain, RX_FLAGS)
+    if extra != 0 {
+        write_seg(table + SEG_BYTES, link + extra, 1, RX_FLAGS)
+    }
+}

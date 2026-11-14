@@ -1,0 +1,65 @@
+// A mapping meets a row by user address, not by the frames it grants
+// (spec §2.5). arm64 only, the one profile where the two differ.
+//
+// Root maps one allocation, nearly as long as the pool, into itself three
+// times. The kernel places each view at the first free address above root's
+// region, and the pool's frames lie just above root's region in physical
+// memory, so the second view's addresses hold the allocation's own frame
+// numbers:
+//
+//   SOS mapuser: the second view's addresses hold its own frames
+//   SOS mapuser: a third view: taken
+//   SOS mapuser: done
+//
+// The third view meets no row by user address and is taken; compared by its
+// frames it would meet the second view's addresses and be refused.
+
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The allocation: the pool less two pages. The pool's frames start at
+/// `POOL_FRAMES` (the runner's `pool_base` for arm64).
+static LEN: UInt = 0x3_E000
+static POOL_FRAMES: UInt = 0x4028_0000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mapuser: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS mapuser: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mapuser: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    let piece = try pool.allocate(len: LEN)
+    let _one = try proc.map(memory: &piece, access: RW)
+    let two = try proc.map(memory: &piece, access: RW)
+    let at = try two.base()
+    if not (at <= POOL_FRAMES && POOL_FRAMES < at + LEN) {
+        print("SOS mapuser: the second view is at {}\n", at)
+        return BUG
+    }
+    print("SOS mapuser: the second view's addresses hold its own frames\n")
+    let _three = try proc.map(memory: &piece, access: RW)
+    print("SOS mapuser: a third view: taken\n")
+    return
+}

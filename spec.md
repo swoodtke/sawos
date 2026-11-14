@@ -702,27 +702,26 @@ a reply delivery carries, which is why there is one type and not two — and
   judged as the row it then is, for the permission the door needs: a row that
   grants it is used, as any buffer is, and one that does not ends the process.
   That is the program's error, and the kernel still writes only where the
-  process may write at that moment (not yet enforced: overlap). Bytes another
-  process can also reach (an allocation mapped into both, §2.5) may be
-  rewritten at any moment, during a call that names them included, and
-  nothing the kernel decides depends on them
-  staying still: a record the kernel reads out of a process is copied once and
-  acted on as copied, and the one record read twice, a parked call's (§2.1), is
-  asked at its second reading in the call's order (the record, its length, the
-  body, then the connection's state) and held to the call's rules, but for a
-  handle word the call would have faulted on, which arrives empty because the
-  caller is not running to be faulted. A wake that writes a buffer asks it
-  before anything else that could answer the thread with a status (room in its
-  table, for one), so a process whose buffer is gone ends with `BadBuffer`
-  whether or not that answer was owed. A wake that carries only a status (the
-  peer closed) writes no buffer and asks about none: the process is answered and
-  runs on. A row's access is fixed when it is installed (a `Mapping`'s only ops
-  are `Unmap` and `Base`, §2.5), so a change of access is an unmap and a map,
-  and a future op that changes a row in place (its permissions, say) must be, to
-  every door, an unmap followed by a map: the grant record and the hardware
-  change together with no preemption point between, nothing caches a row's
-  permission or translation across a switch point, and the next door to look,
-  late doors included, judges the new row.
+  process may write at that moment. Bytes another process can also reach (an
+  allocation mapped into both, §2.5) may be rewritten at any moment, during a
+  call that names them included, and nothing the kernel decides depends on
+  them staying still: a record the kernel reads out of a process is copied
+  once and acted on as copied, and the one record read twice, a parked
+  call's (§2.1), is asked at its second reading in the call's order (the
+  record, its length, the body, then the connection's state) and held to the
+  call's rules, but for a handle word the call would have faulted on, which
+  arrives empty because the caller is not running to be faulted. A wake that
+  writes a buffer asks it before anything else that could answer the thread with
+  a status (room in its table, for one), so a process whose buffer is gone ends
+  with `BadBuffer` whether or not that answer was owed. A wake that carries only
+  a status (the peer closed) writes no buffer and asks about none: the process
+  is answered and runs on. A row's access is fixed when it is installed (a
+  `Mapping`'s only ops are `Unmap` and `Base`, §2.5), so a change of access is
+  an unmap and a map, and a future op that changes a row in place (its
+  permissions, say) must be, to every door, an unmap followed by a map: the
+  grant record and the hardware change together with no preemption point
+  between, nothing caches a row's permission or translation across a switch
+  point, and the next door to look, late doors included, judges the new row.
 - **`write_result` is the only function that writes an answer into a frame** —
   its callers are `ktrap` for an op that answered at once and the wake paths
   that answer a parked thread — which is what makes "exactly one write per
@@ -826,10 +825,9 @@ a reply delivery carries, which is why there is one type and not two — and
     which the part refuses.
   - **The two directions guard different hazards**, which is why they ask
     for different permissions: the kernel must not store where the process
-    may not store itself (not yet enforced: overlap), and a record may
-    legitimately come out of a process's own read-only data. So memory `map`
-    installed read-only, the stats region's row among it (§2.7), is a source
-    and never a destination.
+    may not store itself, and a record may legitimately come out of a
+    process's own read-only data. So memory `map` installed read-only, the
+    stats region's row among it (§2.7), is a source and never a destination.
 - **Attach semantics:** **level-triggered** (keeps reporting ready until the
   waiter handles it — no lost edges); attachments are **persistent by
   default** with explicit `remove(key)` (by key, never by the waitable's
@@ -1252,9 +1250,14 @@ an allocation (§12).
   whose placed range meets any row of the target's grant answers `NoResource`
   and installs nothing, whatever the row: a segment the loader recorded,
   copied or used in place, the stack grant, a row an earlier `map`
-  installed, a device row or the stats region's row (not yet enforced:
-  overlap). "Meets" compares user addresses: the range the new row would
-  occupy in the target against the range each existing row occupies there.
+  installed, a device row or the stats region's row. "Meets" compares user
+  addresses: the range the new row would occupy in the target against the
+  range each existing row occupies there. A row of no bytes, which a segment
+  of no bytes records (§5.6), holds no address and meets nothing. Every row
+  has both ends on the grain (a mapped allocation's base must be on it and
+  its top is rounded up to it, a device window and the stats region's row
+  are whole grains, and so are the loader's rows, §5.6), so two rows that
+  meet share at least a grain.
   With the loader's own rule that no two rows of one image meet (§5.6), a
   process's rows never overlap on any profile, and which row grants an
   address never depends on which was installed first. (On the PMP boards the
@@ -1536,16 +1539,6 @@ its markers and its paragraph, and the last part removes this note.
     names the pool its parent names, and that pool's outstanding bytes do not
     move: the piece and the remainder each return their own range to it when
     they free. Until then a pool's `available` counts neither as free.
-- **Overlap.** A `map` is refused (`NoResource`) only when its range meets a
-  row the loader recorded for the target: a segment or the stack grant. A
-  mapping may meet another mapping, a device row or the stats region's row,
-  so on the identity profiles one region can be mapped twice into one
-  process. The loader compares no two segments, so an image whose segments
-  meet loads, and its rows overlap. One allocation mapped into a process
-  read-only and then read-write at the same address is therefore a legal
-  destination there, because the read-write row serves (§2.2), while a PMP
-  board gives the process the first row's permissions: the kernel can store
-  where the process cannot store itself.
 
 ### 2.6 Clock and Timer
 
@@ -3059,17 +3052,21 @@ Everything else derives from those handles.
   the same unit. Blade reads ELF32 and ELF64. Image addresses are 64-bit fields
   on every profile, and a 32-bit kernel refuses an entry or segment address that
   does not fit its machine word (`fits_target_word`) rather than narrowing it.
-- **No two rows of one image meet** (not yet enforced: overlap). Two segments
-  whose granted ranges (each rounded up to the grain, as its row will be)
-  meet at the addresses the process sees them at make the image malformed:
-  `BadImage` at `process_create`, a stopped boot for root's image. Copied
-  segments already lie below the stack grant and segments used in place lie
-  in the image, which is disjoint from the destination, so the test is
-  between the segments, every pair of them, bounded by the row budget. With
-  §2.5's overlap rule for `map` it makes a process's rows disjoint on every
-  profile. A single segment may still be both writable and executable
-  (§2.5), which is why §2.2's execute test is still asked of the loader's
-  rows.
+- **No two rows of one image meet.** Two segments whose granted ranges (each
+  rounded up to the grain, as its row will be) meet at the addresses the
+  process sees them at make the image malformed: `BadImage` at
+  `process_create`, a stopped boot for root's image. Segments that only
+  touch, one ending where the other begins, do not meet, and a segment of no
+  bytes, whose granted range holds no address, meets none, wherever it lies.
+  Copied segments already lie below the stack grant and segments used in
+  place lie in the image, which is disjoint from the destination, so the test
+  is between the segments, every pair of them, bounded by the row budget.
+  Every row the loader records has both ends on the grain: a segment's link
+  address is on it and its row's top is rounded up to it, and the stack grant
+  is the top of a destination on the grain (below). With §2.5's overlap rule
+  for `map` it makes a process's rows disjoint on every profile. A single
+  segment may still be both writable and executable (§2.5), which is why
+  §2.2's execute test is still asked of the loader's rows.
 - **A segment already where it is linked is used in place.** The loader asks
   `hal.same_bytes` (§5.5) whether a segment's link address names the
   segment's own bytes in the image. If it does, nothing is
@@ -3091,7 +3088,10 @@ Everything else derives from those handles.
   `Memory` over flash is an image source and never a destination:
   `ProcessCreate` answers a flash destination `BadImage`, a status as for
   its other refused destinations, because a launcher cannot read a region's
-  bounds (§2.5).
+  bounds (§2.5). A destination's base and length must both be whole
+  multiples of the protection grain, so that the stack grant at its top
+  begins on the grain and no copied segment's row, rounded up, reaches into
+  it; one that is not is `BadImage` as well, and no process is made.
 - **The build puts each resident image where it is linked.** On the
   ESP32-S3 the kernel's link script gives root's image and a child's fixed
   slots in flash. A user linker script links the code at its slot's
@@ -4314,9 +4314,9 @@ loader parses and reports while no process stores either.
   loader's `allow_device: true` door, dormant) (§2.5): its emitter is
   sawlang-side, so deleting it is a toolchain-pin event.
 - **The tier-2 mapping quota price** (`DEFAULT_QUOTA_MAPPINGS`, §5b.1).
-- **The memory model's remaining parts** (§2.5): the overlap rule, buffers
-  judged by rows on every profile, and an allocation that is never cut. Until
-  each lands the kernel does what §2.5's transition note says for it.
+- **The memory model's remaining part** (§2.5): an allocation that is never
+  cut. Until it lands the kernel does what §2.5's transition note says for
+  it.
 - **Sub-pools and revoke** (§2.5): `Pool.split` and a revoke are reserved, not
   specified. A process given a pool can allocate from it but cannot carve it
   into budgets for others, and a manager cannot take back what it allocated.

@@ -1115,9 +1115,11 @@ public enum ProtectionTier: UInt {
 /// Access is a property of the mapping, not of the region, and this enum is
 /// where that decision becomes API. `MemoryRight` deliberately has no R/W/X
 /// pair (its own docstring says why), so the only place a process names what it
-/// may do with memory is here. That makes double-mapping one region read-only
-/// in one place and read-write in another expressible. A double map is allowed:
-/// two rows and two Mappings, with no aliasing bookkeeping owed.
+/// may do with memory is here. That makes mapping one allocation read-only in
+/// one place and read-write in another expressible: two rows and two Mappings,
+/// with no aliasing bookkeeping owed. Two rows of one process never overlap
+/// (spec §2.5), so the two places are two processes, or two addresses of one
+/// where the target places a mapping.
 ///
 /// It is a flag set, so the values are bits and a combination is the backing
 /// integer; Saw ships no OptionSet and an enum is a set of tags.
@@ -1137,10 +1139,11 @@ public enum ProtectionTier: UInt {
 /// nothing spends a protection slot to say no, which default-deny already
 /// says), and write and execute in one row.
 ///
-/// W^X is per row, and it costs nothing expressible. Double-mapping is
-/// sanctioned, so the JIT-shaped pattern (an RW row here, an RX row there, over
-/// one region) remains available in full while every individual protection row
-/// is W^X. What the refusal removes is the one shape that has no honest use: a
+/// W^X is per row. An allocation may be mapped twice, so the JIT-shaped
+/// pattern (an RW row here, an RX row there, of one allocation) remains
+/// available while every individual protection row is W^X, in two processes,
+/// or in one at two addresses where the target places a mapping. What the
+/// refusal removes is the one shape that has no honest use: a
 /// single row a process can write to and then fetch from. It joins
 /// write-without-read rather than being a different kind of check, because both
 /// are grants the caller assembled out of cases it named, and both are answered

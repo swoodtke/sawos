@@ -24,8 +24,7 @@ import kcore.diag.{console, fatal_image}
 import kcore.stats.{stats_publish}
 import kcore.preempt.{long_copy, long_zero}
 import kcore.limits.{MAX_GRANT_ROWS, NO_MEMORY, ROOT_PROCESS}
-import kcore.process.{claim_root, load_domain, record_grant, seal_image_rows,
-                      start_process}
+import kcore.process.{claim_root, load_domain, record_grant, start_process}
 
 /// What a refused too-high address reports: its top 32 bits. The low half is
 /// what would have survived a narrowing, so it says nothing; the high half is
@@ -388,7 +387,7 @@ extension ImageTable {
 /// and a refused boot image leaves the root region as the linker left it.
 ///
 /// No preemption point: at most `hal.MAX_ROOT_SEGMENTS` iterations of an O(1)
-/// body.
+/// body, then each pair of segments once (`segments_meet`).
 public(package) func validate_image(
     img_base: UInt,
     img_len: UInt,
@@ -457,6 +456,10 @@ public(package) func validate_image(
         i = i + 1
     }
 
+    if let bad = segments_meet(&table) {
+        return bad
+    }
+
     // The entry must be something the process may execute: an entry in a data
     // segment faults on its first instruction, which the kernel can see and
     // the image's author cannot. It is judged by the executable segments alone
@@ -465,6 +468,57 @@ public(package) func validate_image(
     if not entry_is_executable(&table, entry) {
         return ImageFault(reason: "entry is not inside an executable segment",
                           detail: entry)
+    }
+    None
+}
+
+/// The user range segment `seg`'s row occupies: from its link address to its
+/// end, rounded up to the grain as `place_image` records it, but for a device
+/// window, which is recorded at the length the board publishes.
+///
+/// Asked only of a segment `check_segment` accepted, so the end cannot wrap.
+func row_range(seg: &SosimgSeg) -> (UInt, UInt) {
+    let load_addr = seg.load_addr as UInt
+    let end = load_addr + (seg.mem_len as UInt)
+    if seg.is_device_grant() {
+        return (load_addr, end)
+    }
+    (load_addr, align_up(end, hal.PROT_GRAIN))
+}
+
+/// Do two segments of the image meet: do the user ranges their rows will
+/// occupy share an address (spec §5.6)? A fault naming the second segment's
+/// address when they do.
+///
+/// A process's rows never overlap, so which row grants an address never
+/// depends on the order the hardware reads them in. Every pair is asked, so
+/// the answer does not depend on the order the table lists them in. Ranges
+/// that only touch do not meet, and a segment of no bytes, whose row is a
+/// range of no bytes, shares no address and meets nothing, wherever it lies.
+/// The stack grant is not asked about: a copied segment is held below it, and
+/// a segment used in place lies in the image, which `process_create` holds
+/// apart from the destination.
+///
+/// No preemption point: at most `hal.MAX_ROOT_SEGMENTS` segments, each pair
+/// once.
+func segments_meet(table: &ImageTable) -> ImageFault? {
+    let n = table.seg_count()
+    var i: UInt = 0
+    while i < n {
+        let seg = table.segs[i as Int]
+        let (base, top) = row_range(&seg)
+        var j = i + 1
+        while j < n && base < top {
+            let other = table.segs[j as Int]
+            let (other_base, other_top) = row_range(&other)
+            if other_base < other_top && base < other_top &&
+               other_base < top {
+                return ImageFault(reason: "two segments of the image meet",
+                                  detail: other_base)
+            }
+            j = j + 1
+        }
+        i = i + 1
     }
     None
 }
@@ -532,8 +586,9 @@ func entry_is_executable(table: &ImageTable, entry: UInt) -> Bool {
 /// (those bytes are registers elsewhere, and `process_create` refuses one from
 /// a child).
 ///
-/// Every row recorded here is an image row (`seal_image_rows`), the in-place
-/// ones included, so no mapping may cover one.
+/// Every row recorded here occupies the range `row_range` gave
+/// `validate_image`, so no two of them meet, and no later mapping may meet
+/// any of them (`kcore.process.meets_row`).
 public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
                                  dest: &LoadRegion, region: Int,
                                  image: Int) unsafe {
@@ -545,20 +600,21 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
         let load_addr = seg.load_addr as UInt
         let file_len = seg.file_len as UInt
         let mem_len = seg.mem_len as UInt
+        // The row's top, as `validate_image` judged it.
+        let (_, top) = row_range(&seg)
 
         // A device window places no bytes; it is a grant and nothing else, and
         // no copy door takes a buffer in it. A device window is mapped at its
         // own address on every tier, so its row's two halves are one number (as
         // `hal.map_place` does for a mapped `IoMemory`).
         if seg.is_device_grant() {
-            record_grant(p, load_addr, load_addr + mem_len, load_addr,
-                         seg.flags, true, NO_MEMORY)
+            record_grant(p, load_addr, top, load_addr, seg.flags, true,
+                         NO_MEMORY)
         } else if used_in_place(&seg, img_base) {
             // Nothing moves: the row names the image's own bytes, read where
             // the kernel holds them, and the user sees them at the link
             // address, which `same_bytes` said names the same bytes.
             // `check_in_place` held the rounded grant inside the image.
-            let top = align_up(load_addr + mem_len, hal.PROT_GRAIN)
             record_grant(p, load_addr, top, img_base + (seg.file_off as UInt),
                          seg.flags, false, image)
         } else {
@@ -578,9 +634,8 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
             // The sosimg flag bits are the protection vocabulary (`imgformat`
             // states the encoding; each HAL translates it), so a segment's
             // permissions become its grant with nothing in between.
-            record_grant(p, load_addr,
-                         align_up(load_addr + mem_len, hal.PROT_GRAIN),
-                         load_pa, seg.flags, false, region)
+            record_grant(p, load_addr, top, load_pa, seg.flags, false,
+                         region)
         }
         s = s + 1
     }
@@ -592,7 +647,6 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
                  dest.top - dest.stack_len,
                  (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), false,
                  region)
-    seal_image_rows(p)
 }
 
 // -----------------------------------------------------------------------------
