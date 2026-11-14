@@ -1823,12 +1823,15 @@ has started.
   for `RestrictRights`. Then the process: one that is not `Created`, a
   running or `Gone` one included, is the `BadState` fault, as for `Start` and
   `Give`. Then the limit: the sentinel or any larger number, a limit above
-  the caller's own for a kind other than `Mapping`, a `Handle` limit above
-  `MAX_HANDLES`, and a limit below what the child holds of its kind are each
-  the `BadArg` fault. Then the machine's answer: a `Mapping` limit above the
-  child's free grant rows answers `NoResource` and sets nothing, a status
-  because how many rows an image spends is a fact of an image the launcher
-  never parses (§12). Otherwise the row is set and the call answers `Ok`.
+  the caller's own for a kind other than `Mapping`, and a limit below what
+  the child holds of its kind are each the `BadArg` fault: the caller chose
+  the number and can read what bounds it. Then the machine's answer: a
+  `Mapping` limit above the child's free grant rows, and a `Handle` limit
+  above `MAX_HANDLES`, each answer `NoResource` and set nothing. They are
+  statuses because the caller could not have known the bound: how many rows
+  an image spends is a fact of an image the launcher never parses (§12), and
+  no op reports the size of a board's handle table. Otherwise the row is set
+  and the call answers `Ok`.
 - **Reading.** `ProcessOp.QuotaGet(kind)` answers the named process's limit
   and use for one `QuotaKind` as one value word, the limit in bits 0 to 15
   and the use in bits 16 to 31. It is gated by `ProcessRight.Stats` on the
