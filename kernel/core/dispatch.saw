@@ -304,6 +304,7 @@ import kcore.process.{
     copy_out_check,
     domain_changed,
     executable_at,
+    stack_top_ok,
     free_user_va,
     meets_image_row,
     record_grant,
@@ -1321,7 +1322,7 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     // launcher may release its own handle on either while the child runs, and
     // neither range goes back on its pool's free list while a process is
     // running out of it. Each goes back when the child dies.
-    let placed = place_image(slot, img_base, &table, &dest, dst, img)
+    place_image(slot, img_base, &table, &dest, dst, img)
 
     PROCESS_RECORDS[slot].state = ProcessState.Created
     // A child's table starts empty and `give` fills it. There is nothing to
@@ -1341,16 +1342,11 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
         kind = kind + 1
     }
     // Every address on a process body is a user address: the entry goes into a
-    // program counter, the stack top into a stack pointer, and the two windows
-    // are what the copy doors check a process's own buffers against. The frames
-    // behind them live in the grant rows.
+    // program counter, the stack top into a stack pointer, and the region's
+    // top is where mappings start. The frames behind them live in the grant
+    // rows.
     PROCESSES[body].stack_top = dest.link_top()
-    PROCESSES[body].region_base = dest.link_base
     PROCESSES[body].region_top = dest.link_top()
-    PROCESSES[body].rw_base = placed.rw_base
-    PROCESSES[body].rw_top = dest.link_top()
-    PROCESSES[body].ro_base = placed.ro_base
-    PROCESSES[body].ro_top = placed.ro_top
     PROCESS_RECORDS[slot].exit_kind = ProcessStatusKind.Running
     PROCESS_RECORDS[slot].exit_code = 0
     // The launcher's handle is the child's first reference. It outlives the
@@ -1631,7 +1627,7 @@ static_assert(sizeof<BootHandleWire>() == BOOT_HANDLE_RECORD_WORDS * sizeof<UInt
 ///
 /// The record rides the existing copy-out funnel (three machine words) because
 /// that door already answers the two questions an answer-in-memory poses: is
-/// the buffer aligned, and is it inside the process's writable window.
+/// the buffer aligned, and does a row of the process let the kernel write it.
 ///
 /// It is consumed by delivery: the cursor advances only after the copy
 /// succeeds, so "a record is handed over exactly once" is true rather than
@@ -1855,16 +1851,18 @@ func waiter_create(p: Int, owner: Int) unsafe -> SyscallResult {
 /// against its Thread row and the caller against its `Handle` row.
 ///
 /// The entry must lie in a row of the owner's grants that permits execute, and
-/// the stack in the owner's granted region, since that is where the thread
-/// runs. Both are caller-checkable (a launcher knows where the image it
-/// launched keeps its code and its stacks), so a bad one terminates the caller,
-/// not the owner, rather than producing a thread that would fault on its first
-/// instruction and take the owner down anyway, with a worse diagnostic.
+/// the word below the stack top in one that the thread can push to
+/// (`stack_top_ok`): any row of the owner's that permits write, memory `map`
+/// installed included, and none that grants a byte the owner may execute. Both
+/// are caller-checkable (a launcher knows where the image it launched keeps its
+/// code and its stacks), so a bad one terminates the caller, not the owner,
+/// rather than producing a thread that would fault on its first instruction and
+/// take the owner down anyway, with a worse diagnostic.
 ///
 /// A `Gone` owner answers `Revoked` (spec §2.10). It is asked before the
-/// entry and the stack are checked: the check needs a body to read the region
-/// from, and a `Gone` process has none. This is the one argument check that
-/// follows `Revoked`; the rights check comes first as for every op.
+/// entry and the stack are checked: the check needs a body to read the grant
+/// rows from, and a `Gone` process has none. This is the one argument check
+/// that follows `Revoked`; the rights check comes first as for every op.
 func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
                    arg: UInt) unsafe -> SyscallResult {
     if not has_body(owner) {
@@ -1875,7 +1873,7 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
     if not executable_at(owner, start) {
         fault_process(p, FaultReason.BadEntry)
     }
-    if stack_top <= PROCESSES[body].region_base || stack_top > PROCESSES[body].region_top {
+    if not stack_top_ok(owner, stack_top) {
         fault_process(p, FaultReason.BadEntry)
     }
 
@@ -3389,7 +3387,7 @@ func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
             if let why = copy_out(p, dst, src as UInt, bytes) {
                 // Unreachable for `PipeCreate`'s reason: the same destination
                 // passed `copy_out_check` above and nothing between can move a
-                // process's window.
+                // process's rows.
                 fault_process(p, why)
             }
             op_ok()
@@ -3703,7 +3701,7 @@ func pipe_create(caller: Int, owner: Int, dst: UInt, cap: UInt) unsafe -> Syscal
                           pipe_create_record_bytes() as UInt) {
         // Unreachable, and still written: the same destination passed
         // `copy_out_check` before anything was allocated, and nothing between
-        // here and there can move a process's window. The arm reports rather
+        // here and there can move a process's rows. The arm reports rather
         // than assumes.
         fault_process(caller, why)
     }
@@ -4167,7 +4165,7 @@ func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt) unsafe -> Syscal
                           ((&var rec) as UnsafePointer<PipeTakePrefix>) as UInt,
                           sizeof<PipeTakePrefix>() as UInt) {
         // Unreachable, and still written: the same destination passed
-        // `copy_out_check` above and nothing since can move a process's window.
+        // `copy_out_check` above and nothing since can move a process's rows.
         // The arm reports rather than assumes.
         fault_process(p, why)
     }

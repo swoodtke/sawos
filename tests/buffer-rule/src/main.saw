@@ -1,0 +1,487 @@
+// Any memory a row of a process grants is a buffer, judged by the row (spec
+// §2.2), and a thread can run on any of it that it may write (§2.7).
+//
+// Root launches `child-buffer-rule` once per trial, maps allocations out of the
+// pool (or the device window) into it, and tells it which address to hand the
+// kernel, as a buffer or as a stack top. Each trial reads the §8 word the
+// child ends with: its own code 7 where the kernel took the call, or the
+// fault. The pool is the destination row of the second child,
+// `child-data-first`, which runs once, from a destination allocated at the
+// pool's front.
+//
+//   SOS bufrule: a body in a mapped allocation: taken
+//   SOS bufrule: a record in a mapped allocation: taken
+//   SOS bufrule: a wait record in a mapped allocation, written at the wake:
+//                taken
+//   SOS bufrule: a body that ends one byte past a mapping's top: BadBuffer
+//   SOS bufrule: a record one word below a mapping's top: BadBuffer
+//   SOS bufrule: a wait record one word below a mapping's top: BadBuffer at
+//                the call
+//   SOS bufrule: a call's body running out of its mapping, parked for room:
+//                BadBuffer at the call
+//   SOS bufrule: a body in a read-only mapping: taken
+//   SOS bufrule: a record in a read-only mapping: BadBuffer
+//   SOS bufrule: a body at the end of the first of two adjacent mappings: taken
+//   SOS bufrule: a body across two adjacent mappings: BadBuffer
+//   SOS bufrule: a body ending at a read-write mapping's top, a read-execute
+//                one after it: taken
+//   SOS bufrule: a body in a device mapping: BadBuffer
+//   SOS bufrule: a stack in a mapped allocation: the thread ran on it
+//   SOS bufrule: a stack top in a read-only mapping: BadEntry
+//   SOS bufrule: a stack top at zero: BadEntry
+//   SOS bufrule: a body in the stats region: taken
+//   SOS bufrule: a record in the stats region: BadBuffer
+//   SOS bufrule: a record in a child's first segment, its writable data: taken
+//   SOS bufrule: done
+//
+// A row `map` installed is a buffer on every profile: where a mapping takes
+// its memory's own address and where the target places it. A read-only row is
+// a source and never a destination, the stats region's row among them, two
+// rows side by side are two rows, and a device row is never a buffer. A stack
+// top is legal where the word below it lies in a row that permits write. A
+// buffer is judged whole: one that runs a byte past its row's top is refused,
+// at the call where the call would park, and one that ends where a row the
+// process may execute begins is not. Every row is asked, the first one the
+// loader recorded included.
+//
+// Each trial is a function of its own, to stay under root's stack size
+// (`hal.ROOT_STACK_LEN`).
+
+import sos.{System, Process, Memory, Pool, IoMemory, Mapping, PipeInlet,
+            PipeInletRight, MapAccess, SosStatus, SystemRight,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_LEN: UInt = 34
+static TAG_WAITER: UInt = 35
+static TAG_INLET: UInt = 36
+
+static KEY_DEATH: UInt = 6
+static KEY_EVENT: UInt = 7
+
+/// The roles `child-buffer-rule` knows.
+static ROLE_SEND: UInt = 1
+static ROLE_RECORD: UInt = 2
+static ROLE_STACK: UInt = 3
+static ROLE_STACK_REFUSED: UInt = 4
+static ROLE_WAIT: UInt = 5
+static ROLE_STATS_SEND: UInt = 6
+static ROLE_STATS_RECORD: UInt = 7
+static ROLE_CALL: UInt = 8
+
+/// The role `child-data-first` knows that this case uses.
+static ROLE_RECORD_FIRST: UInt = 1
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer
+                               | SystemRight.StatsRegionMap)
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+static RO: UInt32 = MapAccess.Read
+static RX: UInt32 = MapAccess.Read | MapAccess.Execute
+
+/// An allocation: two pages, a whole number of grains on every profile.
+static PIECE_LEN: UInt = 0x2000
+
+/// `child-data-first`'s destination, allocated from the front of the pool,
+/// where that child is linked on the profiles where a mapping takes its
+/// memory's own address.
+static DEST_LEN: UInt = 0x3_0000
+
+/// A body's length, and one that runs a doubleword past it: both whole
+/// doublewords, so a body starting a doubleword below a row's top is aligned
+/// on every profile and the longer one runs out of the row.
+static BODY_BYTES: UInt = 8
+static LONG_BODY_BYTES: UInt = 16
+
+/// A body one byte longer than a doubleword.
+static PAST_BYTES: UInt = 9
+
+/// The most messages a fill posts before it gives up.
+static MAX_FILL: Int = 256
+
+/// The bits the wait record's Event is signalled with.
+static SIGNAL_BITS: UInt = 0x5a
+
+/// The §8 status words: `Exited` with the child's own code 7 when the kernel
+/// took its call, and `Faulted` with `BadBuffer` (11) or `BadEntry` (6).
+static TAKEN: UInt = 65543
+static BAD_BUFFER: UInt = 131083
+static BAD_ENTRY: UInt = 131078
+
+static_assert((1 * 65536) + 7 == 65543,
+              "an exit word is Exited in the high bits, then the code")
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+static_assert((2 * 65536) + 6 == 131078,
+              "a fault word is Faulted in the high bits, then the reason")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS bufrule: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS bufrule: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS bufrule: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The two images, the first child's destination, the second child's
+    // destination row as a pool, then the device window: the table's order.
+    var image_rec = try proc.boot_handle_next()
+    var first_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    var window_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let image_first = first_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    guard let window = window_rec.take_iomemory() else { return BUG }
+    let word = sizeof<UInt>() as UInt
+
+    try one_piece(&system, &proc, &image, &ram, &pool, RW, ROLE_SEND, 0,
+                  BODY_BYTES, TAKEN)
+    say("a body in a mapped allocation: taken")
+    try one_piece(&system, &proc, &image, &ram, &pool, RW, ROLE_RECORD, 0, 0,
+                  TAKEN)
+    say("a record in a mapped allocation: taken")
+    try late_record(&system, &proc, &image, &ram, &pool, 0, TAKEN)
+    say("a wait record in a mapped allocation, written at the wake: taken")
+    try one_piece(&system, &proc, &image, &ram, &pool, RW, ROLE_SEND,
+                  PIECE_LEN - BODY_BYTES, PAST_BYTES, BAD_BUFFER)
+    say("a body that ends one byte past a mapping's top: BadBuffer")
+    try one_piece(&system, &proc, &image, &ram, &pool, RW, ROLE_RECORD,
+                  PIECE_LEN - word, 0, BAD_BUFFER)
+    say("a record one word below a mapping's top: BadBuffer")
+    try late_record(&system, &proc, &image, &ram, &pool, PIECE_LEN - word,
+                    BAD_BUFFER)
+    say("a wait record one word below a mapping's top: BadBuffer at the call")
+    try parked_body(&system, &proc, &image, &ram, &pool)
+    say_long("a call's body running out of its mapping, parked for room: ",
+             "BadBuffer at the call")
+    try one_piece(&system, &proc, &image, &ram, &pool, RO, ROLE_SEND, 0,
+                  BODY_BYTES, TAKEN)
+    say("a body in a read-only mapping: taken")
+    try one_piece(&system, &proc, &image, &ram, &pool, RO, ROLE_RECORD, 0, 0,
+                  BAD_BUFFER)
+    say("a record in a read-only mapping: BadBuffer")
+    try two_pieces(&system, &proc, &image, &ram, &pool, RW, LONG_BODY_BYTES,
+                   LONG_BODY_BYTES, TAKEN)
+    say("a body at the end of the first of two adjacent mappings: taken")
+    try two_pieces(&system, &proc, &image, &ram, &pool, RW, BODY_BYTES,
+                   LONG_BODY_BYTES, BAD_BUFFER)
+    say("a body across two adjacent mappings: BadBuffer")
+    try two_pieces(&system, &proc, &image, &ram, &pool, RX, LONG_BODY_BYTES,
+                   LONG_BODY_BYTES, TAKEN)
+    say_long("a body ending at a read-write mapping's top, a read-execute ",
+             "one after it: taken")
+    try device(&system, &proc, &image, &ram, &window)
+    say("a body in a device mapping: BadBuffer")
+    try stack_trial(&system, &proc, &image, &ram, &pool, RW, ROLE_STACK, TAKEN)
+    say("a stack in a mapped allocation: the thread ran on it")
+    try stack_trial(&system, &proc, &image, &ram, &pool, RO,
+                    ROLE_STACK_REFUSED, BAD_ENTRY)
+    say("a stack top in a read-only mapping: BadEntry")
+    try zero_stack(&system, &proc, &image, &ram)
+    say("a stack top at zero: BadEntry")
+    try stats(&system, &proc, &image, &ram, ROLE_STATS_SEND, TAKEN)
+    say("a body in the stats region: taken")
+    try stats(&system, &proc, &image, &ram, ROLE_STATS_RECORD, BAD_BUFFER)
+    say("a record in the stats region: BadBuffer")
+    try first_segment(&system, &proc, &image_first, &pool)
+    say("a record in a child's first segment, its writable data: taken")
+    return
+}
+
+func say(line: String) {
+    print("SOS bufrule: {}\n", line)
+}
+
+/// One line, in two halves that each fit the source's width.
+func say_long(head: String, tail: String) {
+    print("SOS bufrule: {}{}\n", head, tail)
+}
+
+// -----------------------------------------------------------------------------
+// One trial's parts
+// -----------------------------------------------------------------------------
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// What every child is given: its role, the address and the length it hands
+/// the kernel, and its System handle as the boot tag.
+func brief(system: &System, proc: &Process, child: &Process, role: UInt,
+           at: UInt, len: UInt) -> Result<Void, SosStatus> {
+    try tell(&proc, &child, TAG_ROLE, role)
+    try tell(&proc, &child, TAG_ADDR, at)
+    try tell(&proc, &child, TAG_LEN, len)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Start the child, wait for it to end and require the status word `want`.
+func run_child(proc: &Process, child: &Process,
+               want: UInt) -> Result<Void, SosStatus> {
+    try child.start(boot_tag: TAG_BOOT)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS bufrule: the child ended with status {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+// -----------------------------------------------------------------------------
+// The trials
+// -----------------------------------------------------------------------------
+
+/// One allocation mapped into the child with `access`, and the child's call
+/// (`role`, `len` bytes) `offset` bytes into it.
+func one_piece(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+               pool: &Pool, access: UInt32, role: UInt, offset: UInt,
+               len: UInt, want: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let piece = try pool.allocate(len: PIECE_LEN)
+    let mapping = try child.map(memory: &piece, access: access)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, role, at + offset, len)
+    try run_child(&proc, &child, want)
+    return
+}
+
+/// A wait with its record `offset` bytes into a mapped allocation, and the
+/// Event it waits on signalled once the child has had its turn. A record that
+/// fits is written at the late door, into a row `map` installed; one that does
+/// not is refused at the call, before anything parks, and the signal finds
+/// nobody waiting.
+func late_record(system: &System, proc: &Process, image: &Memory,
+                 ram: &Memory, pool: &Pool, offset: UInt,
+                 want: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let piece = try pool.allocate(len: PIECE_LEN)
+    let mapping = try child.map(memory: &piece, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, ROLE_WAIT, at + offset, 0)
+    let ev = try proc.event_create()
+    let waiter = try proc.waiter_create()
+    try waiter.add(event: &ev, key: KEY_EVENT)
+    try child.give(waiter: move waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    // Nothing ticks in this case, so a yield returns when the child has
+    // parked, and the signal reaches it at the late door.
+    try child.start(boot_tag: TAG_BOOT)
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
+    try ev.signal(bits: SIGNAL_BITS)
+    let watch = try proc.waiter_create()
+    try watch.add(process: &child, key: KEY_DEATH)
+    let wake = try watch.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH || status != want {
+                print("SOS bufrule: the waiting child ended with status {}\n",
+                      status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// Two allocations mapped side by side, the first read-write and the second
+/// with `access`, and a body that starts `end_back` bytes below the first
+/// one's top and is `len` bytes long. Two allocations taken in turn from a
+/// pool are one after the other in memory, so the second one's bytes begin
+/// where the first one's end, and they are mapped one after the other too:
+/// at their own addresses where a mapping takes its memory's own address, and
+/// where the target places a mapping, the second at the first free address,
+/// which is the first one's top.
+func two_pieces(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+                pool: &Pool, access: UInt32, end_back: UInt, len: UInt,
+                want: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let first = try pool.allocate(len: PIECE_LEN)
+    let second = try pool.allocate(len: PIECE_LEN)
+    let one = try child.map(memory: &first, access: RW)
+    let two = try child.map(memory: &second, access: access)
+    let at = try one.base()
+    let next = try two.base()
+    if next != at + PIECE_LEN {
+        print("SOS bufrule: the second mapping is not next to the first\n")
+        return BUG
+    }
+    try brief(&system, &proc, &child, ROLE_SEND, at + PIECE_LEN - end_back,
+              len)
+    try run_child(&proc, &child, want)
+    return
+}
+
+/// Post empty messages through `inlet` until the ring is full, dropping each
+/// claim.
+func fill(inlet: &PipeInlet) -> Result<Void, SosStatus> {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var staged: Int = 0
+    while staged < MAX_FILL {
+        match inlet.post(body: &body, len: 0) {
+            case Ok(claim) -> {
+                let _ = move claim
+                staged = staged + 1
+            },
+            case Err(why) -> {
+                match why {
+                    case WouldBlock -> { return },
+                    case _ -> { return why },
+                }
+            },
+        }
+    }
+    return BUG
+}
+
+/// A fused call on a full ring, with a body that starts a doubleword below a
+/// mapping's top and runs a doubleword past it. The body is asked at the
+/// call, before the call parks for room, so the child ends there; the room
+/// root makes afterwards finds nobody waiting.
+func parked_body(system: &System, proc: &Process, image: &Memory,
+                 ram: &Memory, pool: &Pool) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let piece = try pool.allocate(len: PIECE_LEN)
+    let mapping = try child.map(memory: &piece, access: RW)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, ROLE_CALL, at + PIECE_LEN - BODY_BYTES,
+              LONG_BODY_BYTES)
+    let pair = try proc.pipe_create()
+    let (inlet, outlet) = move pair
+    let spare = try inlet.mint(rights: PipeInletRight.Post)
+    try fill(&spare)
+    try child.give(inlet: move inlet, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    // Nothing ticks in this case, so a yield returns when the child has made
+    // its call; the take makes the room a parked call would wait for.
+    try child.start(boot_tag: TAG_BOOT)
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
+    let got = try outlet.take()
+    let (_, request) = move got
+    let _ = move request
+    let watch = try proc.waiter_create()
+    try watch.add(process: &child, key: KEY_DEATH)
+    let wake = try watch.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH || status != BAD_BUFFER {
+                print("SOS bufrule: the calling child ended with status {}\n",
+                      status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// `child-data-first`, whose first segment is its writable data, created in a
+/// destination from the front of the pool, writes a record into that segment.
+func first_segment(system: &System, proc: &Process, image: &Memory,
+                   pool: &Pool) -> Result<Void, SosStatus> {
+    let dest = try pool.allocate(len: DEST_LEN)
+    let child = try system.process_create(image: &image, memory: &dest)
+    try brief(&system, &proc, &child, ROLE_RECORD_FIRST, 0, 0)
+    try run_child(&proc, &child, TAKEN)
+    return
+}
+
+/// The device window mapped into the child, and a body at its base.
+func device(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+            window: &IoMemory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let mapping = try child.map(iomemory: &window)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, ROLE_SEND, at, BODY_BYTES)
+    try run_child(&proc, &child, BAD_BUFFER)
+    return
+}
+
+/// One allocation mapped into the child with `access`, and a thread of the
+/// child's whose stack top is its top.
+func stack_trial(system: &System, proc: &Process, image: &Memory,
+                 ram: &Memory, pool: &Pool, access: UInt32, role: UInt,
+                 want: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let piece = try pool.allocate(len: PIECE_LEN)
+    let mapping = try child.map(memory: &piece, access: access)
+    let at = try mapping.base()
+    try brief(&system, &proc, &child, role, at + PIECE_LEN, PIECE_LEN)
+    try run_child(&proc, &child, want)
+    return
+}
+
+/// The child maps the stats region itself and makes its call at the base.
+func stats(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+           role: UInt, want: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    try brief(&system, &proc, &child, role, 0, BODY_BYTES)
+    try run_child(&proc, &child, want)
+    return
+}
+
+/// A thread of the child's whose stack top is zero, below every row.
+func zero_stack(system: &System, proc: &Process, image: &Memory,
+                ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    try brief(&system, &proc, &child, ROLE_STACK_REFUSED, 0, 0)
+    try run_child(&proc, &child, BAD_ENTRY)
+    return
+}

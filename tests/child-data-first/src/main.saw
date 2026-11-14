@@ -1,0 +1,155 @@
+// Test child: an image whose first segment is its writable data and whose code
+// comes after it, handing the kernel a buffer the role names (spec §2.2).
+//
+// The launcher gives it two Events whose words are the role and an address:
+//
+//   1  `Process.PipeCreate` with its record written into a word of this
+//      image's writable data, its first segment
+//   2  `PipeInlet.Post` of a body of two doublewords at the address plus the
+//      code's offset into the image, less one doubleword: where the address is
+//      a read-write view of this process's destination, the body starts in the
+//      last doubleword below the code and runs into the code's first
+//
+// A call the kernel takes ends this process with `EXIT_TAKEN`, a code of its
+// own that the launcher can tell apart from every fault; a refusal ends it
+// with the fault.
+//
+// It works at the C altitude because the buffers are addresses this program
+// picks, which the typed tier never lets a caller name.
+
+import sos.{PIPE_MSG_HANDLES, ALL_RIGHTS, sos_system_process_self,
+            sos_process_boot_handle_next, sos_process_exit,
+            sos_process_pipe_create, sos_pipe_inlet_post, sos_event_receive}
+
+extern "C" {
+    func sos_text_offset() -> UInt
+}
+
+/// The tags the launcher gives things under.
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+
+static ROLE_RECORD_FIRST: UInt = 1
+static ROLE_SEND_SEAM: UInt = 2
+
+/// How this process ends when the kernel took the call.
+static EXIT_TAKEN: UInt = 7
+/// The call came back where the kernel had to end this process.
+static EXIT_SURVIVED: UInt = 99
+/// The boot set held no role.
+static EXIT_NO_ROLE: UInt = 98
+/// A step before the call under test was refused.
+static EXIT_SETUP: UInt = 97
+
+static STATUS_OK: UInt = 0
+
+/// A word that names nothing, which also marks an empty handle slot.
+static NONE: UInt = 0
+
+/// A send record's words: body address, length, then the handle words.
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+
+/// The words in a boot-handle record.
+static BOOT_WORDS: Int = 3
+
+/// One doubleword, and the seam body's length.
+static DOUBLE: UInt = 8
+static SEAM_BYTES: UInt = 16
+
+/// What the launcher gave.
+unsafe static var ROLE: UInt = 0
+unsafe static var ADDR: UInt = 0
+
+/// Where role 1's record goes: initialized, so it is in the writable data's
+/// file bytes and not only its zero-filled tail.
+static RECORD_WORDS: Int = 16
+unsafe static var RECORD: [UInt; RECORD_WORDS] = [1; RECORD_WORDS]
+
+/// Bytes in a machine word.
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+/// This process's own Process handle as a raw word, or `NONE`.
+func ask_process(boot_handle: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    let status = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// The word an Event holds, drained.
+func event_word(handle: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let _ = sos_event_receive(handle, (&var word) as UnsafePointer<UInt>)
+    word
+}
+
+/// The next record of the boot set, in `rec`.
+func next_record(proc: UInt, rec: &var [UInt; BOOT_WORDS]) unsafe -> UInt {
+    sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                 (BOOT_WORDS as UInt) * word_bytes())
+}
+
+/// Take every record of the boot set and keep what each tag names.
+func drain(proc: UInt) unsafe {
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    while next_record(proc, &var rec) == STATUS_OK {
+        let tag = rec[0]
+        let word = rec[2]
+        if tag == TAG_ROLE {
+            ROLE = event_word(word)
+        } else if tag == TAG_ADDR {
+            ADDR = event_word(word)
+        }
+    }
+}
+
+/// Role 1: a pipe-creation record into the writable data.
+func record_first(proc: UInt) unsafe -> UInt {
+    let at = (&var RECORD) as UnsafePointer<UInt>
+    let made = sos_process_pipe_create(proc, at,
+                                       (RECORD_WORDS as UInt) * word_bytes())
+    if made != STATUS_OK {
+        return EXIT_SURVIVED
+    }
+    EXIT_TAKEN
+}
+
+/// Role 2: post the seam body through a pipe of this process's own.
+func send_seam(proc: UInt) unsafe -> UInt {
+    var ends: [UInt; 2] = [NONE; 2]
+    if sos_process_pipe_create(proc, (&var ends) as UnsafePointer<UInt>,
+                               2 * word_bytes()) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    msg[0] = ADDR + sos_text_offset() - DOUBLE
+    msg[1] = SEAM_BYTES
+    var claim: UInt = NONE
+    if sos_pipe_inlet_post(ends[0], (&var msg) as UnsafePointer<UInt>,
+                           (SEND_WORDS as UInt) * word_bytes(),
+                           (&var claim) as UnsafePointer<UInt>) != STATUS_OK {
+        return EXIT_SURVIVED
+    }
+    EXIT_TAKEN
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let proc = ask_process(boot_handle)
+    if proc == NONE {
+        return
+    }
+    drain(proc)
+    var code = EXIT_NO_ROLE
+    if ROLE == ROLE_RECORD_FIRST {
+        code = record_first(proc)
+    } else if ROLE == ROLE_SEND_SEAM {
+        code = send_seam(proc)
+    }
+    let _ = sos_process_exit(proc, code)
+}

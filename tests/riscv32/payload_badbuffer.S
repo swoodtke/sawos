@@ -2,14 +2,15 @@
  *
  * `Waiter.Wait` answers by copying a record into memory the caller supplies,
  * so the kernel checks the destination before it writes a byte, and a
- * destination outside the process's writable memory terminates the process.
+ * destination in no row of the process that permits write terminates the
+ * process.
  * That is a fault rather than a status because the caller could have checked:
  * a process linked its own image and knows where its data is.
  *
- * This payload has no writable memory at all: `tests/umode.saw` grants it
- * exactly its own bytes, read+execute, so every address is outside its
- * writable window and the case needs no particular address. Zero is used
- * because it is never in anybody's grant.
+ * This payload has no writable memory at all: `tests/umode.saw` programs the
+ * hardware to grant it exactly its own bytes, read+execute, and records no
+ * grant row, so no address is a destination and the case needs no particular
+ * one. Zero is used because it is never in anybody's grant.
  *
  * The misaligned half of the same check is `payload_misalignbuf.S`; the two
  * cover the copy-out check's two rejection rows.

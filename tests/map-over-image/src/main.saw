@@ -9,13 +9,18 @@
 //   SOS mapimg: read-write map: {the answer}
 //   SOS mapimg: a send from the child's code is refused         `BadBuffer`
 //   SOS mapimg: read-execute map: {the answer}
-//   SOS mapimg: an entry in the child's data is refused         `BadEntry`
+//   SOS mapimg: {the end}
 //   SOS mapimg: done
 //
 // {the answer} is "refused with NoResource" where a mapping's address is its
 // memory's own, and "taken at an address of its own" where the target
-// translates. The child's two rules end it the same way on every profile: it
-// is the mapping, not the profile, that must not change them.
+// translates. A read-write view of the child's code does not make its code a
+// buffer on any profile. Where the read-execute map is refused, {the end} is
+// "an entry in the child's data is refused" (`BadEntry`). Where it is taken,
+// every byte of the child's region is one a row of the child may execute, so
+// none of it is a buffer (spec §2.2 compares rows by the bytes they grant),
+// and the child ends at its first record, the drain of its boot set: {the end}
+// is "the child's own memory is no buffer" (`BadBuffer`).
 
 import sos.{System, Process, Memory, Mapping, MapAccess, SosStatus,
             SystemRight}
@@ -77,12 +82,19 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     guard let image = image_rec.take_memory() else { return BUG }
     guard let ram = ram_rec.take_memory() else { return BUG }
 
-    try trial(&system, &proc, &image, &ram, RW, ROLE_SEND_CODE, BAD_BUFFER)
+    let _ = try trial(&system, &proc, &image, &ram, RW, ROLE_SEND_CODE,
+                      BAD_BUFFER, BAD_BUFFER)
     let _ = system.debug_print(
         "SOS mapimg: a send from the child's code is refused\n")
-    try trial(&system, &proc, &image, &ram, RX, ROLE_ENTRY_DATA, BAD_ENTRY)
-    let _ = system.debug_print(
-        "SOS mapimg: an entry in the child's data is refused\n")
+    let viewed = try trial(&system, &proc, &image, &ram, RX, ROLE_ENTRY_DATA,
+                           BAD_ENTRY, BAD_BUFFER)
+    if viewed {
+        let _ = system.debug_print(
+            "SOS mapimg: the child's own memory is no buffer\n")
+    } else {
+        let _ = system.debug_print(
+            "SOS mapimg: an entry in the child's data is refused\n")
+    }
     return
 }
 
@@ -95,14 +107,20 @@ func is_no_resource(why: SosStatus) -> Bool {
 
 /// Launch the child under `role` after mapping its own region into it with
 /// `access`, say what the map answered, wait for the child to end and require
-/// the status word `want`.
+/// the status word `want`, or `want_viewed` where the map was taken. Answers
+/// whether it was.
 func trial(system: &System, proc: &Process, image: &Memory, ram: &Memory,
-           access: UInt32, role: UInt, want: UInt) -> Result<Void, SosStatus> {
+           access: UInt32, role: UInt, want: UInt,
+           want_viewed: UInt) -> Result<Bool, SosStatus> {
     let child = try system.process_create(image: &image, memory: &ram)
     var kept: Mapping? = None
+    var expect = want
+    var viewed = false
     match child.map(memory: &ram, access: access) {
         case Ok(mapping) -> {
             kept = move mapping
+            expect = want_viewed
+            viewed = true
             say(&system, access, TAKEN)
         },
         case Err(why) -> {
@@ -134,16 +152,16 @@ func trial(system: &System, proc: &Process, image: &Memory, ram: &Memory,
     match what {
         case Process(status) -> {
             if key != KEY_DEATH { return BUG }
-            if status != want {
+            if status != expect {
                 print("SOS mapimg: role {} ended with status {}, wanted {}\n",
-                      role, status, want)
+                      role, status, expect)
                 return BUG
             }
         },
         case _ -> { return BUG },
     }
     let _ = move kept
-    return
+    return viewed
 }
 
 /// The line that says what the map answered.

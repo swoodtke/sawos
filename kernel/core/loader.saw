@@ -492,15 +492,6 @@ func entry_is_executable(table: &ImageTable, entry: UInt) -> Bool {
 // Placement: copy the bytes, record the domain
 // -----------------------------------------------------------------------------
 
-/// What placement leaves for a process body to record: the writable window's
-/// floor, and the span of the read-only segments used in place, which the
-/// copy-in door takes as a source besides the region (zero/zero for none).
-public(package) struct PlacedImage {
-    public(package) rw_base: UInt,
-    public(package) ro_base: UInt,
-    public(package) ro_top: UInt,
-}
-
 /// Copy a validated image's segments into `dest`, use in place the ones that
 /// already are where they are linked (spec §5.6), and record process `p`'s
 /// grant rows.
@@ -545,18 +536,8 @@ public(package) struct PlacedImage {
 /// ones included, so no mapping may cover one.
 public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
                                  dest: &LoadRegion, region: Int,
-                                 image: Int) unsafe -> PlacedImage {
+                                 image: Int) unsafe {
     let seg_count = table.seg_count()
-
-    // The writable window, accumulated as segments are placed. `copy_out`
-    // checks a kernel-written record against it. The stack is always part of
-    // it, so it starts at the region's top edge and only grows downward: with
-    // no writable segment the process still has somewhere to receive a record.
-    var rw_base = dest.link_top() - dest.stack_len
-    // The read-only window over the non-executable segments used in place,
-    // which `copy_in` takes as a source; empty until one is placed.
-    var ro_base: UInt = 0
-    var ro_top: UInt = 0
 
     var s: UInt = 0
     while s < seg_count {
@@ -565,14 +546,10 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
         let file_len = seg.file_len as UInt
         let mem_len = seg.mem_len as UInt
 
-        // A device window places no bytes and joins no writable window; it is a
-        // grant and nothing else. Keeping it out of `rw_base` matters: a
-        // hardware address is below RAM on one profile, so folding it in would
-        // stretch the copy-out window from the device page to the top of the
-        // region and make `copy_out`'s check accept most of the machine. A
-        // device window is mapped at its own address on every tier, so its
-        // row's two halves are one number (as `hal.map_place` does for a mapped
-        // `IoMemory`).
+        // A device window places no bytes; it is a grant and nothing else, and
+        // no copy door takes a buffer in it. A device window is mapped at its
+        // own address on every tier, so its row's two halves are one number (as
+        // `hal.map_place` does for a mapped `IoMemory`).
         if seg.is_device_grant() {
             record_grant(p, load_addr, load_addr + mem_len, load_addr,
                          seg.flags, true, NO_MEMORY)
@@ -584,14 +561,6 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
             let top = align_up(load_addr + mem_len, hal.PROT_GRAIN)
             record_grant(p, load_addr, top, img_base + (seg.file_off as UInt),
                          seg.flags, false, image)
-            if (seg.flags & (SegFlag.Execute as UInt8)) == 0 {
-                if ro_top == 0 || load_addr < ro_base {
-                    ro_base = load_addr
-                }
-                if top > ro_top {
-                    ro_top = top
-                }
-            }
         } else {
             // The segment loads at a frame and is mapped at its link address.
             // `load_addr` is what the linker wrote (a user address), and
@@ -612,9 +581,6 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
             record_grant(p, load_addr,
                          align_up(load_addr + mem_len, hal.PROT_GRAIN),
                          load_pa, seg.flags, false, region)
-            if (seg.flags & (SegFlag.Write as UInt8)) != 0 && load_addr < rw_base {
-                rw_base = load_addr
-            }
         }
         s = s + 1
     }
@@ -627,7 +593,6 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
                  (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), false,
                  region)
     seal_image_rows(p)
-    PlacedImage(rw_base: rw_base, ro_base: ro_base, ro_top: ro_top)
 }
 
 // -----------------------------------------------------------------------------
@@ -682,8 +647,7 @@ public func load_root_and_enter(tick_period_us: UInt = 0) unsafe {
     // away from and never back into. The device-window row is included, which
     // keeps a driver image's window across a switch.
     claim_root()
-    let placed = place_image(ROOT_PROCESS, base, &table, &dest, NO_MEMORY,
-                             NO_MEMORY)
+    place_image(ROOT_PROCESS, base, &table, &dest, NO_MEMORY, NO_MEMORY)
     load_domain(ROOT_PROCESS)
 
     // Spec §7: root's band map applies verbatim from its image. The scheduler
@@ -694,7 +658,5 @@ public func load_root_and_enter(tick_period_us: UInt = 0) unsafe {
     // Spec §12: root's boot handle set. The entry register carries exactly one
     // handle, System; everything else the kernel minted for root is collected
     // through `ProcessOp.BootHandleNext` rather than passed.
-    start_process(entry, dest.link_top(), dest.link_base, dest.link_top(),
-                  placed.rw_base, dest.link_top(), placed.ro_base,
-                  placed.ro_top, tick_period_us)
+    start_process(entry, dest.link_top(), dest.link_top(), tick_period_us)
 }

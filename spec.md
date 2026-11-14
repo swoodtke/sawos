@@ -702,9 +702,10 @@ a reply delivery carries, which is why there is one type and not two — and
   judged as the row it then is, for the permission the door needs: a row that
   grants it is used, as any buffer is, and one that does not ends the process.
   That is the program's error, and the kernel still writes only where the
-  process may write at that moment. Bytes another process can also reach (an
-  allocation mapped into both, §2.5) may be rewritten at any moment, during a
-  call that names them included, and nothing the kernel decides depends on them
+  process may write at that moment (not yet enforced: overlap). Bytes another
+  process can also reach (an allocation mapped into both, §2.5) may be
+  rewritten at any moment, during a call that names them included, and
+  nothing the kernel decides depends on them
   staying still: a record the kernel reads out of a process is copied once and
   acted on as copied, and the one record read twice, a parked call's (§2.1), is
   asked at its second reading in the call's order (the record, its length, the
@@ -789,10 +790,11 @@ a reply delivery carries, which is why there is one type and not two — and
 - **The buffer rule: any memory a process's grant lets it reach is a
   buffer**, whichever row grants it — a row the loader recorded (a segment,
   copied or used in place, or the stack) or a row `map` installed (§2.5) —
-  on every profile (not yet enforced: buffers). The row decides, and both
-  doors ask the same questions, each with the permission its direction
-  needs:
-  - **A buffer is word-aligned**; one that is not is `BadAlign`.
+  on every profile. The row decides, and both doors ask the same questions,
+  each with the permission its direction needs:
+  - **A buffer is word-aligned**; one that is not is `BadAlign`. A body of
+    no bytes is the exception: it is legal at any address, and its address
+    is not looked at, the alignment included.
   - **A source lies whole in one non-device row of the process that permits
     read, and a destination in one that permits write**; anything else is
     `BadBuffer`. A buffer that runs out of one row into another is `BadBuffer`
@@ -806,29 +808,28 @@ a reply delivery carries, which is why there is one type and not two — and
     any byte of which a row of the process that permits execute also grants
     is `BadBuffer`, whichever row the buffer lies in and whatever other rows
     cover it. The rows are compared by the bytes they grant and not by the
-    addresses the process sees them at (not yet enforced: buffers), because
-    on arm64 one allocation can be mapped at two addresses of one process
-    (§2.5): a buffer in a writable view of bytes the process may fetch from
-    at another address is refused, as the same buffer in the executable view
-    is. A string kept beside the code is no buffer, and a segment both
-    writable and executable, which the loader accepts (§2.5), is none
-    either. So every board links a program's read-only data as a segment of
-    its own, readable and neither writable nor executable, which is where
-    its string literals are. The segment costs one grant row, which every
-    board's budget affords. On the isolated profiles it keeps a program's
-    constants, its jump tables among them, unwritable by the program itself;
-    on a flat one it keeps them out of executable memory, so they are a
-    legal source, and nothing stops the process writing them where they sit
-    in RAM (§5b.1). A read-only segment used in place (§5.6) is a row like
-    any other, so a literal used in place is a source. On the ESP32-S3 the
-    rule also keeps the kernel from a byte load in the flash instruction
-    window, which the part refuses.
+    addresses the process sees them at, because on arm64 one allocation can
+    be mapped at two addresses of one process (§2.5): a buffer in a writable
+    view of bytes the process may fetch from at another address is refused,
+    as the same buffer in the executable view is. A string kept beside the code
+    is no buffer, and a segment both writable and executable, which the loader
+    accepts (§2.5), is none either. So every board links a program's read-only
+    data as a segment of its own, readable and neither writable nor executable,
+    which is where its string literals are. The segment costs one grant row,
+    which every board's budget affords. On the isolated profiles it keeps a
+    program's constants, its jump tables among them, unwritable by the program
+    itself; on a flat one it keeps them out of executable memory, so they are a
+    legal source, and nothing stops the process writing them where they sit in
+    RAM (§5b.1). A read-only segment used in place (§5.6) is a row like any
+    other, so a literal used in place is a source. On the ESP32-S3 the rule
+    also keeps the kernel from a byte load in the flash instruction window,
+    which the part refuses.
   - **The two directions guard different hazards**, which is why they ask
     for different permissions: the kernel must not store where the process
-    may not store itself, and a record may legitimately come out of a
-    process's own read-only data. So memory `map` installed read-only, the
-    stats region's row among it (§2.7), is a source and never a
-    destination.
+    may not store itself (not yet enforced: overlap), and a record may
+    legitimately come out of a process's own read-only data. So memory `map`
+    installed read-only, the stats region's row among it (§2.7), is a source
+    and never a destination.
 - **Attach semantics:** **level-triggered** (keeps reporting ready until the
   waiter handles it — no lost edges); attachments are **persistent by
   default** with explicit `remove(key)` (by key, never by the waitable's
@@ -1303,7 +1304,11 @@ an allocation (§12).
   then fetch from: a writable view and an executable view of one allocation
   are still expressible, as two rows, wherever the overlap rule above allows
   two rows over the same bytes. Where both are in one process the writable
-  view is no buffer (§2.2).
+  view is no buffer (§2.2). So a launcher that maps a child's destination
+  into that child for execute, which takes an address of its own on arm64,
+  leaves the child no buffer anywhere in that region and no legal stack top
+  in it for a new thread: a `ThreadCreate` with its stack top anywhere in the
+  child's own stack is `BadEntry` (§2.7).
 - **The boundary is the dynamic map.** Neither rule governs a process image's
   own executable segments: those arrive through `process_create`'s loader as
   `SegFlag` bits read out of the image, validated by `imgformat.has_sane_perms`
@@ -1536,19 +1541,11 @@ its markers and its paragraph, and the last part removes this note.
   mapping may meet another mapping, a device row or the stats region's row,
   so on the identity profiles one region can be mapped twice into one
   process. The loader compares no two segments, so an image whose segments
-  meet loads, and its rows overlap.
-- **Buffers.** Each door asks a window before it asks the rows. A destination
-  must lie in the process's writable window, from the lowest address of the
-  stack and the writable segments the loader copied to the top of its region; a
-  source in its region, or in the span of its read-only segments used in place.
-  Within the window the buffer must lie in one non-device row that grants the
-  permission its direction needs, and no row that permits execute may cover any
-  of its bytes at the same user address; rows are not compared by the bytes they
-  grant. So on arm64, where a mapping is placed above the region, a row `map`
-  installed is never a buffer, and on the identity profiles one is a buffer only
-  where it lies inside a window. A thread's stack top must lie in the process's
-  region, above its base and at most its top (`BadEntry` otherwise), and no row
-  is asked about it.
+  meet loads, and its rows overlap. One allocation mapped into a process
+  read-only and then read-write at the same address is therefore a legal
+  destination there, because the read-write row serves (§2.2), while a PMP
+  board gives the process the first row's permissions: the kernel can store
+  where the process cannot store itself.
 
 ### 2.6 Clock and Timer
 
@@ -1715,9 +1712,9 @@ three groups:
   the word below it lies in one non-device row of the process's grant that
   permits write, and no row that permits execute grants any of its bytes:
   §2.2's row tests for a destination, whichever kind of row it is, with no
-  alignment asked (not yet enforced: buffers). So a thread can run on memory
-  `map` installed, and a stack unmapped under its thread ends the process by
-  §8's fault rule at the thread's next access to it, on the isolated tiers. A
+  alignment asked. So a thread can run on memory `map` installed, and a
+  stack unmapped under its thread ends the process by §8's fault rule at the
+  thread's next access to it, on the isolated tiers. A
   thread created in a `Created` child is inert: `ThreadOp.Start` on it is a
   `BadState` fault until the child has been started, and the launcher starts it
   after `ProcessOp.Start`.
@@ -1996,8 +1993,7 @@ another process's counters. Three things about the region:
 - **No `Memory` handle is minted.** The caller is granted the access and
   nothing that owns it — a Memory onto kernel storage could be given, mapped
   elsewhere and donated. The row permits read only, so by §2.2's buffer
-  rule it is a legal source and never a destination (not yet enforced:
-  buffers).
+  rule it is a legal source and never a destination.
 - **`rows` is a capacity, not a census.** There is a row for every body the
   build can hand out, not for every record. A row for an unoccupied body reads
   whatever its last occupant left until a create zeroes it, and v1 publishes no

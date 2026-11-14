@@ -1,0 +1,260 @@
+// A buffer in a writable view of bytes the process may execute through another
+// view is no buffer (spec §2.2): rows are compared by the bytes they grant,
+// not by the addresses the process sees them at. For a target that places a
+// mapping at an address of its own, where one process can hold two views of
+// the same bytes.
+//
+// Root launches `child-buffer-rule` once per trial. First an allocation out of
+// the pool, mapped into the child read-write and read-execute, in either
+// order, with the child's call made through the read-write view. Then the
+// child's own destination, which root keeps, mapped into the child read-write:
+// a view of the child's code, which the image links at the destination's base
+// on this target, and of its stack, which the kernel grants at the
+// destination's top. Then a body at the first byte of the child's read-only
+// data, which the image links at its code's top, so its bytes begin where the
+// code's end. Last `child-data-first`, whose writable data is linked below its
+// code, with its destination mapped into it read-write and a body through the
+// view that starts in the last doubleword below its code and runs into it.
+// The pool is that child's destination row, which its destination is
+// allocated from too.
+//
+//   SOS bufalias: an allocation, read-write only: a body taken
+//   SOS bufalias: an allocation, read-write then read-execute: a body
+//                 BadBuffer
+//   SOS bufalias: an allocation, read-execute then read-write: a body
+//                 BadBuffer
+//   SOS bufalias: an allocation, read-write then read-execute: a record
+//                 BadBuffer
+//   SOS bufalias: its destination, read-write: taken at an address of its own
+//   SOS bufalias: a body in its code through the view: BadBuffer
+//   SOS bufalias: a record in its code through the view: BadBuffer
+//   SOS bufalias: a body in its stack through the view: taken
+//   SOS bufalias: a body at the first byte of its read-only data, at its
+//                 code's top: taken
+//   SOS bufalias: a body from its data into its code through the view:
+//                 BadBuffer
+//   SOS bufalias: done
+//
+// A writable view of a child's code is a mapping a launcher that keeps the
+// child's destination can make; through it the child's code is no buffer at
+// either door, as it is at its own address.
+
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, SosStatus,
+            SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_LEN: UInt = 34
+
+static KEY_DEATH: UInt = 6
+
+/// The roles `child-buffer-rule` knows that this case uses.
+static ROLE_SEND: UInt = 1
+static ROLE_RECORD: UInt = 2
+static ROLE_SEND_TEXT_END: UInt = 9
+
+/// The role `child-data-first` knows that this case uses.
+static ROLE_SEND_SEAM: UInt = 2
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+static RX: UInt32 = MapAccess.Read | MapAccess.Execute
+/// "No second mapping".
+static NO_ACCESS: UInt32 = 0
+
+/// An allocation: two pages.
+static PIECE_LEN: UInt = 0x2000
+
+/// The child's destination region: the length of the destination row the
+/// table publishes for it.
+static REGION_LEN: UInt = 0x4_0000
+
+/// `child-data-first`'s destination, allocated from the front of the pool.
+static DEST_LEN: UInt = 0x3_0000
+
+/// A body's length: one doubleword.
+static BODY_BYTES: UInt = 8
+
+/// The §8 status words: `Exited` with the child's own code 7 when the kernel
+/// took its call, and `Faulted` with `BadBuffer` (11).
+static TAKEN: UInt = 65543
+static BAD_BUFFER: UInt = 131083
+
+static_assert((1 * 65536) + 7 == 65543,
+              "an exit word is Exited in the high bits, then the code")
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS bufalias: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS bufalias: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS bufalias: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The two images, the first child's destination, then the second child's
+    // destination row as a pool: the table's order.
+    var image_rec = try proc.boot_handle_next()
+    var first_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let image_first = first_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    try two_views(&system, &proc, &image, &ram, &pool, RW, NO_ACCESS,
+                  ROLE_SEND, TAKEN)
+    say("an allocation, read-write only: a body taken")
+    try two_views(&system, &proc, &image, &ram, &pool, RW, RX, ROLE_SEND,
+                  BAD_BUFFER)
+    say("an allocation, read-write then read-execute: a body BadBuffer")
+    try two_views(&system, &proc, &image, &ram, &pool, RX, RW, ROLE_SEND,
+                  BAD_BUFFER)
+    say("an allocation, read-execute then read-write: a body BadBuffer")
+    try two_views(&system, &proc, &image, &ram, &pool, RW, RX, ROLE_RECORD,
+                  BAD_BUFFER)
+    say("an allocation, read-write then read-execute: a record BadBuffer")
+
+    // The view's offset of the child's code is zero: the image links its code
+    // at the base of the region, whose first byte is the destination's first.
+    // The stack's last doubleword is the region's.
+    try own_view(&system, &proc, &image, &ram, ROLE_SEND, 0, BAD_BUFFER)
+    say("its destination, read-write: taken at an address of its own")
+    say("a body in its code through the view: BadBuffer")
+    try own_view(&system, &proc, &image, &ram, ROLE_RECORD, 0, BAD_BUFFER)
+    say("a record in its code through the view: BadBuffer")
+    try own_view(&system, &proc, &image, &ram, ROLE_SEND,
+                 REGION_LEN - BODY_BYTES, TAKEN)
+    say("a body in its stack through the view: taken")
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    try run_child(&system, &proc, &child, ROLE_SEND_TEXT_END, 0, TAKEN)
+    say_long("a body at the first byte of its read-only data, at its code's ",
+             "top: taken")
+    try seam(&system, &proc, &image_first, &pool)
+    say("a body from its data into its code through the view: BadBuffer")
+    return
+}
+
+func say(line: String) {
+    print("SOS bufalias: {}\n", line)
+}
+
+/// One line, in two halves that each fit the source's width.
+func say_long(head: String, tail: String) {
+    print("SOS bufalias: {}{}\n", head, tail)
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Brief the child (its role, the address it hands the kernel, a body's
+/// length, and its System handle as the boot tag), start it, wait for it to
+/// end and require the status word `want`.
+func run_child(system: &System, proc: &Process, child: &Process, role: UInt,
+               at: UInt, want: UInt) -> Result<Void, SosStatus> {
+    try tell(&proc, &child, TAG_ROLE, role)
+    try tell(&proc, &child, TAG_ADDR, at)
+    try tell(&proc, &child, TAG_LEN, BODY_BYTES)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != want {
+                print("SOS bufalias: the child ended with status {}\n", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// An allocation mapped into the child with `first` and then `second`
+/// (`NO_ACCESS` for none), and the child's call through the read-write view.
+/// The two views must be at two addresses.
+func two_views(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+               pool: &Pool, first: UInt32, second: UInt32, role: UInt,
+               want: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let piece = try pool.allocate(len: PIECE_LEN)
+    let one = try child.map(memory: &piece, access: first)
+    var at = try one.base()
+    if second != NO_ACCESS {
+        let two = try child.map(memory: &piece, access: second)
+        let other = try two.base()
+        if other == at { return BUG }
+        if second == RW {
+            at = other
+        }
+    }
+    try run_child(&system, &proc, &child, role, at, want)
+    return
+}
+
+/// `child-data-first` in a destination from the front of the pool, which root
+/// maps into it read-write, and the body that runs from its data into its code
+/// through the view.
+func seam(system: &System, proc: &Process, image: &Memory,
+          pool: &Pool) -> Result<Void, SosStatus> {
+    let dest = try pool.allocate(len: DEST_LEN)
+    let child = try system.process_create(image: &image, memory: &dest)
+    let view = try child.map(memory: &dest, access: RW)
+    let at = try view.base()
+    try run_child(&system, &proc, &child, ROLE_SEND_SEAM, at, BAD_BUFFER)
+    return
+}
+
+/// The child's own destination mapped into it read-write, and the child's call
+/// at `offset` into that view.
+func own_view(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+              role: UInt, offset: UInt,
+              want: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &image, memory: &ram)
+    let view = try child.map(memory: &ram, access: RW)
+    let at = try view.base()
+    try run_child(&system, &proc, &child, role, at + offset, want)
+    return
+}

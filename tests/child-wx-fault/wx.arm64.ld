@@ -2,8 +2,8 @@
  *
  * `hal/arm64/user/user.ld`'s addresses and arena, with every section in ONE
  * loadable segment that is readable, writable and executable (`FLAGS(7)`),
- * which the loader accepts (spec §2.5). Its write bit puts the segment inside
- * the copy-out window, so only the execute rule keeps a buffer out of it.
+ * which the loader accepts (spec §2.5). Its row permits read and write, so
+ * only the execute rule keeps a buffer out of it.
  */
 
 OUTPUT_ARCH(aarch64)

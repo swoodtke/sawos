@@ -700,6 +700,11 @@ CHILD_WX_FAULT_PKG = os.path.join(TESTS_DIR, "child-wx-fault")
 LATE_DOOR_GONE_PKG = os.path.join(TESTS_DIR, "late-door-gone")
 CHILD_LATE_DOOR_PKG = os.path.join(TESTS_DIR, "child-late-door")
 CHILD_LATE_DOOR2_PKG = os.path.join(TESTS_DIR, "child-late-door2")
+# Any memory a row grants is a buffer, judged by the row (spec §2.2).
+BUFFER_RULE_PKG = os.path.join(TESTS_DIR, "buffer-rule")
+BUFFER_ALIAS_PKG = os.path.join(TESTS_DIR, "buffer-alias")
+CHILD_BUFFER_RULE_PKG = os.path.join(TESTS_DIR, "child-buffer-rule")
+CHILD_DATA_FIRST_PKG = os.path.join(TESTS_DIR, "child-data-first")
 ROOM_REWRITE_PKG = os.path.join(TESTS_DIR, "room-rewrite")
 CHILD_ROOM_REWRITE_PKG = os.path.join(TESTS_DIR, "child-room-rewrite")
 RO_DESTINATION_PKG = os.path.join(TESTS_DIR, "ro-destination")
@@ -1191,6 +1196,13 @@ def expectations(arch):
         # a mapping has an address of its own it is taken.
         "own_map": ("taken at an address of its own"
                     if arch.get("map_places") else "refused with NoResource"),
+        # How the child ends after its own region was mapped into it
+        # read-execute: where the map is refused, its data is still no entry;
+        # where it is taken, every byte of the region is one the child may
+        # execute, so none of it is a buffer and its first record ends it.
+        "own_rx_map_end": ("the child's own memory is no buffer"
+                           if arch.get("map_places")
+                           else "an entry in the child's data is refused"),
         "entry": f"0x{arch['root_entry']:0{width}x}",
         # A pool's numbers as `Pool.available` reports them, in decimal: the
         # granularity set (one bit, the grain) and a fresh pool's bytes.
@@ -2049,9 +2061,10 @@ TEST_CASES = [
     # `Waiter.wait` supplies its own buffer out of its frame and never lets a
     # caller name one, so neither mistake is a thing a Saw process can spell.
     {
-        # Row 1: outside the process's writable memory. This payload has no
-        # writable grant at all (umode.saw gives it its own bytes read+execute),
-        # so every address is outside its window and zero says so plainly.
+        # Row 1: in no row of the process that permits write. umode.saw
+        # programs the hardware to give this payload its own bytes
+        # read+execute and records no grant row for it, so no address is a
+        # destination, and zero says so plainly.
         "name": "umode_bad_wait_buffer",
         "src": os.path.join(TESTS_DIR, "umode.saw"),
         "asm": "payload_badbuffer.S",
@@ -3746,8 +3759,8 @@ TEST_CASES = [
         # ran to its end. No `Allocate` right refuses both ops
         # (`AccessDenied`); zero bytes, a length off the grain, a
         # granularity that is a bit the set lacks, and a record short of the
-        # published size are `BadArg`; a record in read-only data inside the
-        # copy-out window is `BadBuffer`; a pool where `process_create` wants
+        # published size are `BadArg`; a record in read-only data is
+        # `BadBuffer`; a pool where `process_create` wants
         # an allocation is `BadHandle`, and attached to a Waiter `NotWaitable`.
         # An allocation through a pool without `MapExecute` cannot be mapped
         # executable, and one through a pool without `Transfer` cannot be
@@ -8246,8 +8259,8 @@ TEST_CASES = [
         # watcher at the switch point the kill returns through (spec §8), with
         # the setup of `late_door_buffer_gone`: a process (`child-late-door`)
         # is parked on a Waiter that has another (`child-late-door2`)
-        # attached, with its wait record in a piece of its own region root
-        # has since unmapped. Root kills the other process; the teardown's
+        # attached, with its wait record in an allocation root mapped into it
+        # and has since unmapped. Root kills the other process; the teardown's
         # notification finds the watcher's buffer gone and owes it a
         # `BadBuffer` end (131083), and root's first system call after the
         # kill, a read of the watcher's status word, already finds it ended.
@@ -8255,13 +8268,13 @@ TEST_CASES = [
         # than the killer; the killer's own process owed the end is not built
         # here (the shared-Waiter trial of `late_door_buffer_gone` shows the
         # switch point paying the end of the process that owns the running
-        # thread). A mapping takes its memory's own address only on the
-        # profiles that do not translate, so this is for those.
+        # thread). Each child's destination and the allocation come from a
+        # pool that is the child's destination row.
         "name": "kill_late_door",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": KILL_LATE_DOOR_PKG,
         "children": [CHILD_LATE_DOOR_PKG, CHILD_LATE_DOOR2_PKG],
-        "arches": ["riscv32", "riscv32-flat"],
+        "pool_destinations": [0, 1],
         "expect_out": ["{banner}",
                        "SOS: boot regions={four}",
                        "SOS killdoor: the watcher found without a buffer "
@@ -8437,9 +8450,12 @@ TEST_CASES = [
         # region read-write into one child and read-execute into another: each
         # map is refused with `NoResource` where addresses are the memory's
         # own and taken at an address of its own where the target translates.
-        # Either way the child's rules hold: a send from its code ends it with
-        # `BadBuffer` (131083) and a thread entry in its data with `BadEntry`
-        # (131078).
+        # Either way a send from the child's code ends it with `BadBuffer`
+        # (131083). Where the read-execute map is refused a thread entry in
+        # the child's data ends it with `BadEntry` (131078); where it is taken
+        # the child's whole region is memory it may execute, so none of it is
+        # a buffer (spec §2.2) and the drain of its boot set ends it with
+        # `BadBuffer`.
         "name": "map_over_image_refused",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MAP_OVER_IMAGE_PKG,
@@ -8449,7 +8465,7 @@ TEST_CASES = [
                        "SOS mapimg: read-write map: {own_map}",
                        "SOS mapimg: a send from the child's code is refused",
                        "SOS mapimg: read-execute map: {own_map}",
-                       "SOS mapimg: an entry in the child's data is refused",
+                       "SOS mapimg: {own_rx_map_end}",
                        "SOS mapimg: done"],
         "expect_clean_exit": True,
     },
@@ -8458,9 +8474,9 @@ TEST_CASES = [
         # both doors. The child is linked as one such segment (the loader
         # accepts it), and the destination of a `PipeCreate` record (the
         # copy-out door) and the bodies of sends from its code, read-only data
-        # and writable data each end it with `BadBuffer` (131083): the segment
-        # is inside the copy-out window, so only its execute permission
-        # refuses the record.
+        # and writable data each end it with `BadBuffer` (131083): the
+        # segment's row permits write, so only its execute permission refuses
+        # the record.
         "name": "wx_segment_not_buffer",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": WX_SEGMENT_REFUSED_PKG,
@@ -8479,10 +8495,9 @@ TEST_CASES = [
         # A buffer that was good when a call parked and is gone when the answer
         # arrives ends the process whose buffer it was, and the machine carries
         # on (spec §2.2). A call that parks keeps its buffer's address, and the
-        # kernel resolves it again at the wake: a launcher maps a piece of a
-        # child's own region into the hole between its data and its stack,
-        # which is inside both copy windows, the child parks with a buffer in
-        # it, and the launcher unmaps it and makes the answer arrive.
+        # kernel resolves it again at the wake: a launcher maps an allocation
+        # (the piece) into a child, the child parks with a buffer in it, and
+        # the launcher unmaps it and makes the answer arrive.
         #
         # One trial per late door: a wait record, a fused call's reply, a
         # fused call's args record and its body when it parked for room, that
@@ -8498,10 +8513,14 @@ TEST_CASES = [
         # pinned.
         #
         # The piece mapped into the child twice, over the same bytes, with a
-        # call through it (a send body, a pipe-creation record): mapped
-        # read-write only it is a legal buffer, and mapped read-write and
-        # read-execute, in either order, it is not, since a row that permits
-        # execute covers it whatever the other row says (`translate_user`).
+        # call through its read-write view (a send body, a pipe-creation
+        # record): mapped read-write only it is a legal buffer, and mapped
+        # read-write and read-execute, in either order, it is not, since a row
+        # that permits execute grants its bytes whatever the other row says
+        # (`translate_user`). Where a mapping takes its memory's own address
+        # the two rows lie over the same addresses; on arm64 they are two
+        # views at two addresses, and the rows are compared by the bytes they
+        # grant.
         #
         # The trials after those use a second child, linked at the second child
         # base: a Timer's interrupt taken from the doomed process's own
@@ -8514,14 +8533,13 @@ TEST_CASES = [
         # second served; and a process with two threads parked, whose second is
         # passed over so that the delivery reaches a process that lives.
         #
-        # Only where a mapping takes its memory's own address does the piece
-        # lie in the hole; where the target translates, a mapping lies above
-        # the child's region and is no buffer at the call.
+        # Each child's destination and its piece are allocated from a pool
+        # that is the child's destination row (`pool_destinations`).
         "name": "late_door_buffer_gone",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": LATE_DOOR_GONE_PKG,
         "children": [CHILD_LATE_DOOR_PKG, CHILD_LATE_DOOR2_PKG],
-        "arches": ["riscv32", "riscv32-flat"],
+        "pool_destinations": [0, 1],
         "expect_out": ["{banner}",
                        "SOS: boot regions={four}",
                        "SOS latedoor: wait record gone: the process ended "
@@ -8573,6 +8591,124 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # Any memory a row of a process grants is a buffer, judged by the row,
+        # on every profile (spec §2.2), and a thread can run on any of it that
+        # it may write (§2.7). Root maps allocations from the pool (and the
+        # device window) into `child-buffer-rule`, launched once per trial,
+        # and reads the §8 word it ends with: `Exited` with 7 (65543) where
+        # the kernel took its call, `BadBuffer` (131083) or `BadEntry`
+        # (131078). A body and a record in a mapped allocation are taken, and
+        # so is a wait record written there at the wake. A buffer is judged
+        # whole: a body ending one byte past a mapping's top, and a record
+        # starting one word below it, are `BadBuffer`; a wait record one word
+        # below it, and the body of a call that would park on a full ring,
+        # are refused at the call, before anything parks. A read-only mapping
+        # is a source and no destination. Two allocations mapped side by side
+        # are two rows: a body ending at the first one's top is taken, and
+        # one running into the second is `BadBuffer`; with the second
+        # read-execute, a body ending where its bytes begin is taken. A device
+        # row is never a buffer. A thread whose stack top is a mapped
+        # allocation's top runs with its stack in it; a stack top in a
+        # read-only mapping, and one of zero, are `BadEntry`. The stats
+        # region's row, which the child maps itself, permits read only: a body
+        # from it is taken and a record into it is `BadBuffer`. Last,
+        # `child-data-first`, whose first segment is its writable data, has a
+        # record written there: the first row the loader recorded is a row
+        # like any other. The pool is that child's destination row
+        # (`pool_destinations`), which its destination is allocated from too.
+        "name": "buffer_rule",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": BUFFER_RULE_PKG,
+        "children": [CHILD_BUFFER_RULE_PKG, CHILD_DATA_FIRST_PKG],
+        "pool_destinations": [1],
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={five}",
+                       "SOS bufrule: a body in a mapped allocation: taken",
+                       "SOS bufrule: a record in a mapped allocation: taken",
+                       "SOS bufrule: a wait record in a mapped allocation, "
+                       "written at the wake: taken",
+                       "SOS bufrule: a body that ends one byte past a "
+                       "mapping's top: BadBuffer",
+                       "SOS bufrule: a record one word below a mapping's top: "
+                       "BadBuffer",
+                       "SOS bufrule: a wait record one word below a mapping's "
+                       "top: BadBuffer at the call",
+                       "SOS bufrule: a call's body running out of its "
+                       "mapping, parked for room: BadBuffer at the call",
+                       "SOS bufrule: a body in a read-only mapping: taken",
+                       "SOS bufrule: a record in a read-only mapping: "
+                       "BadBuffer",
+                       "SOS bufrule: a body at the end of the first of two "
+                       "adjacent mappings: taken",
+                       "SOS bufrule: a body across two adjacent mappings: "
+                       "BadBuffer",
+                       "SOS bufrule: a body ending at a read-write mapping's "
+                       "top, a read-execute one after it: taken",
+                       "SOS bufrule: a body in a device mapping: BadBuffer",
+                       "SOS bufrule: a stack in a mapped allocation: the "
+                       "thread ran on it",
+                       "SOS bufrule: a stack top in a read-only mapping: "
+                       "BadEntry",
+                       "SOS bufrule: a stack top at zero: BadEntry",
+                       "SOS bufrule: a body in the stats region: taken",
+                       "SOS bufrule: a record in the stats region: BadBuffer",
+                       "SOS bufrule: a record in a child's first segment, its "
+                       "writable data: taken",
+                       "SOS bufrule: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A writable view of bytes a process may execute through another view
+        # is no buffer (spec §2.2): rows are compared by the bytes they grant,
+        # not by the addresses the process sees them at. Only arm64 places a
+        # mapping at an address of its own, so only there can one process hold
+        # two views of the same bytes. An allocation mapped into
+        # `child-buffer-rule` read-write and read-execute, in either order, is
+        # no buffer through the read-write view (`BadBuffer`, 131083), and
+        # read-write only it is (`Exited` with 7, 65543). The child's own
+        # destination mapped into it read-write, by the launcher that keeps
+        # it, is a view of the child's code (at its base) and its stack (at its
+        # top): a body or a record in the code through it is `BadBuffer`, a
+        # body in the stack is taken. The image links its read-only data at
+        # its code's top, so a body at the read-only data's first byte, which
+        # starts where the code's bytes end, is taken. `child-data-first`,
+        # with its writable data linked below its code, has its destination
+        # mapped into it read-write: a body through that view that starts in
+        # the last doubleword below the code and runs into it is `BadBuffer`.
+        # The pool is that child's destination row (`pool_destinations`).
+        "name": "buffer_alias",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": BUFFER_ALIAS_PKG,
+        "children": [CHILD_BUFFER_RULE_PKG, CHILD_DATA_FIRST_PKG],
+        "pool_destinations": [1],
+        "arches": ["arm64"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS bufalias: an allocation, read-write only: a body "
+                       "taken",
+                       "SOS bufalias: an allocation, read-write then "
+                       "read-execute: a body BadBuffer",
+                       "SOS bufalias: an allocation, read-execute then "
+                       "read-write: a body BadBuffer",
+                       "SOS bufalias: an allocation, read-write then "
+                       "read-execute: a record BadBuffer",
+                       "SOS bufalias: its destination, read-write: taken at "
+                       "an address of its own",
+                       "SOS bufalias: a body in its code through the view: "
+                       "BadBuffer",
+                       "SOS bufalias: a record in its code through the view: "
+                       "BadBuffer",
+                       "SOS bufalias: a body in its stack through the view: "
+                       "taken",
+                       "SOS bufalias: a body at the first byte of its "
+                       "read-only data, at its code's top: taken",
+                       "SOS bufalias: a body from its data into its code "
+                       "through the view: BadBuffer",
+                       "SOS bufalias: done"],
+        "expect_clean_exit": True,
+    },
+    {
         # A call parked for room keeps its args record in the caller's memory,
         # and the kernel reads it again at the resume, so a sibling thread can
         # rewrite it in between (spec §2.1). The record the resume reads is
@@ -8601,21 +8737,18 @@ TEST_CASES = [
     {
         # The kernel writes a result only into a row that permits write (spec
         # §2.2). A launcher maps a piece of its child's own region into the
-        # hole between the child's data and its stack, inside the child's
-        # copy-out window, read-only: a pipe-creation record aimed there ends
-        # the child with `BadBuffer` and leaves the piece as the launcher
-        # stamped it. A wait parked with its record in the piece mapped
-        # read-write, and the piece unmapped and mapped again at the same
-        # address before the wake, is judged by the row there at the wake:
-        # read-only ends the child and writes nothing, read-write is written.
-        # Only where a mapping takes its memory's own address does the piece
-        # lie in the window; where the target translates, a mapping lies
-        # above the child's region and is no buffer at all.
+        # child read-only: a pipe-creation record aimed there ends the child
+        # with `BadBuffer` and leaves the piece as the launcher stamped it. A
+        # wait parked with its record in the piece mapped read-write, and the
+        # piece unmapped and mapped again at the same address before the
+        # wake, is judged by the row there at the wake: read-only ends the
+        # child and writes nothing, read-write is written. Where the target
+        # places a mapping, the address the unmap freed is the one the new
+        # mapping takes.
         "name": "read_only_row_not_destination",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": RO_DESTINATION_PKG,
         "children": [CHILD_RO_DESTINATION_PKG],
-        "arches": ["riscv32", "riscv32-flat"],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS rodest: read-write piece, record: taken",
@@ -8635,8 +8768,8 @@ TEST_CASES = [
     {
         # The same rule over an image's own rows, on every profile (spec
         # §2.2): a child linked with its read-only data above its writable
-        # data has that segment inside its copy-out window, which starts at the
-        # lowest writable segment. A pipe-creation record aimed at a word of it
+        # data has that segment between two destinations, its data and its
+        # stack. A pipe-creation record aimed at a word of it
         # ends the child with `BadBuffer`; the same record aimed at its
         # writable data is taken. A wait on an Event already signalled (which
         # the kernel would deliver at once) is held to the same: its record
@@ -8661,15 +8794,15 @@ TEST_CASES = [
     {
         # The kernel places the image it validated, whatever is written into
         # the image's memory while it places it (spec §2.8). The image is a
-        # piece of a child's own region, mapped into that child inside its
-        # copy-out window, and the child parks a wait with its record over the
+        # piece of a child's own region, mapped into that child, and the child
+        # parks a wait with its record over the
         # image's second segment record, fed by a Timer of root's. A fire
         # during the first segment's long zero-filled tail is delivered at a
         # preemption point, between the two segments. Root tries until it
         # finds the record on the image of a create that succeeded, moving the
         # Timer's delay toward the placement after each miss; how many tries
-        # that takes is the host's and is not printed. Only where a mapping
-        # takes its memory's own address does the piece lie in the window.
+        # that takes is the host's and is not printed. The image root builds
+        # carries `ARCH_RISCV32` in its header, so arm64's loader refuses it.
         "name": "image_written_while_placed",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": IMAGE_REREAD_PKG,
@@ -8711,7 +8844,7 @@ TEST_CASES = [
     {
         # A late door asks its questions in the order the call did (spec
         # §2.2). A launcher maps a piece of a child's own region into the
-        # hole between its data and its stack, the child parks a fused call
+        # child, the child parks a fused call
         # with a buffer in it, and the launcher unmaps the piece before the
         # answer arrives. A reply carrying a handle ends the child with
         # `BadBuffer` whether its table has room or is full, since the reply
@@ -8727,13 +8860,11 @@ TEST_CASES = [
         # reply buffer gone, a request dropped unanswered and a server end
         # closed while the call is parked for room are answered `PeerClosed`
         # and the child runs on, while a reply after the room appears ends it
-        # with `BadBuffer`. Only where a mapping takes its memory's own
-        # address does the piece lie in the hole.
+        # with `BadBuffer`.
         "name": "late_door_order",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": REPLY_DOOR_ORDER_PKG,
         "children": [CHILD_REPLY_DOOR_ORDER_PKG],
-        "arches": ["riscv32", "riscv32-flat"],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS replyorder: reply gone, a handle, table room: "
@@ -9181,7 +9312,11 @@ def _region_rows(case, arch):
     allocations and a launcher cannot allocate a blob out of a pool without
     its length, which is a linker expression here. The pool row is a pool. A
     case that allocates out of a child's blob names that child in
-    `pool_blobs`, and its blob row is typed as a pool instead.
+    `pool_blobs`, and its blob row is typed as a pool instead. A case that
+    allocates a child's destination, and memory beside it, out of the
+    child's own region names that child in `pool_destinations`, and its
+    destination row is typed as a pool: that is how a case with two children
+    has pools, since the RAM pool row would name the second child's region.
     """
     children = range(_child_count(case))
     # Two children and a pool cannot coexist, and the refusal is here rather
@@ -9213,11 +9348,20 @@ def _region_rows(case, arch):
         else:
             rows.append((f"child {i}'s image blob (linker-resolved)",
                          f"_sos_child{i}_start", length, REGION_KIND_RAM))
+    pool_destinations = case.get("pool_destinations", ())
+    for i in pool_destinations:
+        if i not in children:
+            raise ToolError(f"case {case['name']!r}: `pool_destinations` names "
+                            f"child {i}, which the case does not have")
     region_len = _child_region_len(arch)
     for i, _pkg in enumerate(children):
         base = arch["child_region_base"] + i * region_len
-        rows.append((f"child {i}'s destination RAM", f"{base:#x}",
-                     f"{region_len:#x}", REGION_KIND_RAM))
+        if i in pool_destinations:
+            rows.append((f"child {i}'s destination RAM, as a POOL", f"{base:#x}",
+                         f"{region_len:#x}", REGION_KIND_POOL))
+        else:
+            rows.append((f"child {i}'s destination RAM", f"{base:#x}",
+                         f"{region_len:#x}", REGION_KIND_RAM))
     if case.get("pool"):
         # `pool_skew` moves the pool row's base that many bytes up, off the
         # grain, and shortens it to keep its top. `pool_short_top` shortens

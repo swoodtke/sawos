@@ -15,9 +15,9 @@
 //! taking a record and a body is an action and it is where the domain-pool
 //! limit is applied.
 //!
-//! Every `p` here is a process number, a record's index. The grant record and
-//! the windows are the body's, reached through `body_of(p)`, and the HAL's
-//! domain number is the body's index.
+//! Every `p` here is a process number, a record's index. The grant record is
+//! the body's, reached through `body_of(p)`, and the HAL's domain number is the
+//! body's index.
 
 import hal
 import imgformat.{SegFlag}
@@ -498,19 +498,26 @@ public(package) func executable_at(p: Int, va: UInt) unsafe -> Bool {
     false
 }
 
-/// Does any row of process `p` that permits execute cover a byte of the `bytes`
-/// bytes at `va`? A range of no bytes asks about `va` alone.
-func meets_execute(p: Int, va: UInt, bytes: UInt) unsafe -> Bool {
+/// Does any row of process `p` that permits execute grant a byte of the `bytes`
+/// bytes held at physical `pa`? A range of no bytes asks about `pa` alone.
+///
+/// Rows are compared by the bytes they grant (`row.pa` and the row's length),
+/// not by the user addresses they occupy: on a translating tier one allocation
+/// can be mapped at two addresses of one process, and a writable view of bytes
+/// the process may fetch from at the other address is memory it may execute.
+/// On the tiers that do not translate a row's two halves are one number, so
+/// the comparison is the same there either way.
+func grants_execute(p: Int, pa: UInt, bytes: UInt) unsafe -> Bool {
     let b = body_of(p)
     var end = UInt.max
-    if bytes <= UInt.max - va {
-        end = va + bytes
+    if bytes <= UInt.max - pa {
+        end = pa + bytes
     }
     var i: Int = 0
     while i < PROCESSES[b].grant_count {
         let row = PROCESSES[b].grants[i]
-        if row_executes(row) && va < row.top &&
-           (row.base <= va || row.base < end) {
+        if row_executes(row) && pa < row_pa_end(row) &&
+           (row.pa <= pa || row.pa < end) {
             return true
         }
         i = i + 1
@@ -540,45 +547,54 @@ public(package) func meets_image_row(p: Int, base: UInt,
     false
 }
 
-/// Resolve a user address to the physical one it names in `p`'s domain, or
-/// `BadBuffer` if it names nothing the kernel may touch for this direction.
+/// Resolve a user range to the physical address it names in `p`'s domain, or
+/// `BadBuffer` if it is no buffer the kernel may touch for this direction.
 ///
-/// Walks `p`'s grant rows for the first one covering `va` that grants every
+/// This is the buffer rule (spec §2.2), and the only place it is decided: any
+/// memory a row of the process grants is a buffer, whichever row it is (a
+/// segment the loader recorded, copied or used in place, the stack grant, or a
+/// row `map` installed), judged by the row and by nothing else. Walks `p`'s
+/// grant rows for one that holds all `bytes` bytes at `va` and grants every
 /// permission in `need`; the caller then dereferences through the linear map.
-/// Bounded by `MAX_GRANT_ROWS`.
+/// Bounded by `MAX_GRANT_ROWS`, twice.
 ///
 /// `need` is the direction: `SegFlag.Read` for a source the kernel reads,
 /// `SegFlag.Write` for a destination it writes. A row that does not grant it is
-/// not a candidate, so a result is never written into memory the process may
-/// only read, whatever window the address lies in. This is the check, not the
-/// windows: a window is a range of addresses, and the rows inside one need not
-/// all be writable (a mapping installed read-only, a read-only segment linked
-/// above the data). Another row over the same addresses that does grant the
-/// permission is authority the process holds over those bytes, so it serves.
+/// not a candidate, so a result is never written into memory no row of the
+/// process lets it write. Another row over the same addresses that does grant
+/// the permission serves. Where two rows cover one address, a tier whose
+/// hardware lets the lowest-numbered matching region decide an access gives
+/// the process the first row's permissions there, so a read-write row
+/// recorded after a read-only one over the same addresses is a destination
+/// the process cannot store to itself; nothing here refuses it, and spec
+/// §2.5's overlap rule is what keeps a process's rows apart.
 ///
 /// The whole range must lie in one row. A row is the largest span over which
 /// the user-to-physical mapping is affine (`GrantRow`), so a copy that crossed
 /// a row boundary would need two translations and could not be one
-/// `copy_bytes`.
+/// `copy_bytes`. Two rows side by side are still two: a range running out of
+/// one into the next is `BadBuffer`.
 ///
 /// A device row is not a candidate: the kernel does not copy through a register
 /// window, and a memcpy over device memory would break the access-size
 /// discipline a driver's own reads keep.
 ///
 /// Memory the process may execute is not a buffer. If any row that permits
-/// execute covers a byte of the range, the answer is `BadBuffer` whatever other
-/// rows cover it, so it does not depend on the order the rows were recorded in.
-/// A program's read-only data is a segment of its own, so its string literals
-/// are not in memory that permits execute. Code used in place is such memory,
-/// so the kernel never reads a process's code through its copy doors, which on
-/// the ESP32-S3 keeps it from a byte load in the flash instruction window.
+/// execute grants a byte of the range's bytes, the answer is `BadBuffer`
+/// whatever row the range lies in, so it does not depend on the order the rows
+/// were recorded in or on the address a view of the bytes is mapped at
+/// (`grants_execute`). A program's read-only data is a segment of its own, so
+/// its string literals are not in memory that permits execute. Code used in
+/// place is such memory, so the kernel never reads a process's code through its
+/// copy doors, which on the ESP32-S3 keeps it from a byte load in the flash
+/// instruction window.
 ///
 /// A row's bytes are where the kernel holds them (`row.pa`): for a segment used
 /// in place, the image's own bytes, which on a board with two names for flash
 /// is the data-window name.
 ///
-/// An address in no row is `BadBuffer`, the same answer the window checks give,
-/// because the process handed the kernel an address it does not own.
+/// An address in no row is `BadBuffer`, because the process handed the kernel
+/// an address it does not own.
 ///
 /// Both variants of the result are named, so the answer does not depend on how
 /// a bare `FaultReason` would be wrapped.
@@ -589,25 +605,48 @@ public(package) func translate_user(
     need: UInt8
 ) unsafe -> Result<UInt, FaultReason> {
     let nowhere = Result<UInt, FaultReason>.Err(error: FaultReason.BadBuffer)
-    if meets_execute(p, va, bytes) {
-        return nowhere
-    }
     let b = body_of(p)
     var i: Int = 0
     while i < PROCESSES[b].grant_count {
         let row = PROCESSES[b].grants[i]
+        // Ordered so the subtraction cannot underflow: `row.top - va` is
+        // computed only once `va` is known to be inside the row.
         if not row.device && (row.perms & need) == need &&
-           va >= row.base && va < row.top {
-            // Ordered so the subtraction cannot underflow: `row.top - va` is
-            // computed only once `va` is known to be inside the row.
-            if bytes > row.top - va {
+           va >= row.base && va < row.top && bytes <= row.top - va {
+            let pa = row.pa + (va - row.base)
+            if grants_execute(p, pa, bytes) {
                 return nowhere
             }
-            return Result<UInt, FaultReason>.Ok(value: row.pa + (va - row.base))
+            return Result<UInt, FaultReason>.Ok(value: pa)
         }
         i = i + 1
     }
     nowhere
+}
+
+/// May a thread of process `p` start with its stack pointer at `stack_top`?
+///
+/// A stack grows down from its top, so the word below the top is the first
+/// thing the thread stores, and it must be memory the kernel could write for
+/// the process: `translate_user`'s destination test, which is two tests. The
+/// word lies in one non-device row that permits write, and no row of the
+/// process that permits execute grants any of its bytes. Any kind of row
+/// serves, so a thread can run on memory `map` installed. No alignment is
+/// asked: what a stack pointer must be aligned to is the architecture's
+/// calling convention, which the program keeps.
+///
+/// The kernel never writes the stack itself (a thread's saved frame is in the
+/// kernel's own slab, `frame_slot`), so this is the creating caller's mistake
+/// caught early, not a door: a stack unmapped later faults its thread in user
+/// mode.
+public(package) func stack_top_ok(p: Int, stack_top: UInt) unsafe -> Bool {
+    let word = word_bytes()
+    if stack_top < word {
+        return false
+    }
+    let _ = try translate_user(p, stack_top - word, word,
+                               SegFlag.Write as UInt8) catch { return false }
+    true
 }
 
 /// Make process `p`'s recorded domain the live one.
@@ -858,10 +897,10 @@ public(package) func clear_domain(p: Int) unsafe {
 //
 //   - a destination that is not word-aligned (the kernel writes machine words;
 //     a misaligned store traps on some tiers and is merely wrong on others);
-//   - a destination outside the process's writable window (a record placed in
-//     its own code is a misread memory map);
-//   - a destination in no row that permits write, or in memory the process
-//     may execute (`translate_user`).
+//   - a destination in no row of the process that permits write, one that
+//     runs out of its row, one in a device row, and one in memory the process
+//     may execute (`translate_user`, which decides the buffer rule for both
+//     doors).
 //
 // The door reports and its caller faults: ending a process is a scheduling
 // event, so the termination lives above the scheduler and these functions
@@ -894,23 +933,6 @@ public(package) func copy_out_check(p: Int, dst: UInt, bytes: UInt) unsafe -> Fa
     if (dst % word_bytes()) != 0 {
         return FaultReason.BadAlign
     }
-    let b = body_of(p)
-    if dst < PROCESSES[b].rw_base {
-        return FaultReason.BadBuffer
-    }
-    // Ordered so the subtraction below cannot underflow: `rw_top - dst` is only
-    // computed once `dst` is known to be inside the window. A hostile length
-    // must produce a diagnostic, not a panic.
-    if dst >= PROCESSES[b].rw_top {
-        return FaultReason.BadBuffer
-    }
-    if bytes > PROCESSES[b].rw_top - dst {
-        return FaultReason.BadBuffer
-    }
-    // The address must also resolve, through a row that permits write. The
-    // window above is a range of addresses (it includes the hole between the
-    // image's writable end and the stack, and whatever is mapped there); the
-    // grant record says which user addresses exist and what each may do.
     let _ = try translate_user(p, dst, bytes,
                                SegFlag.Write as UInt8) catch { return error }
     None
@@ -954,19 +976,15 @@ public(package) func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe 
 //
 //   - a source that is not word-aligned (the same rule as copy-out, so a caller
 //     learns one alignment rule for kernel records);
-//   - a source outside the process's own memory (this check stops a process
-//     from naming kernel memory or another process's);
-//   - a source in no row that permits read, or in memory the process may
-//     execute (`translate_user`); a program's string literals are not there,
-//     because its read-only data is a segment of its own.
+//   - a source in no row of the process that permits read, one that runs out
+//     of its row, one in a device row, and one in memory the process may
+//     execute (`translate_user`); a program's string literals are not in the
+//     last, because its read-only data is a segment of its own.
 //
-// The window is the whole granted region, not the writable one, and the
-// read-only segments used in place besides (spec §5.6), which lie outside the
-// region. A process may hand the kernel a record out of its own rodata, so
-// demanding a writable source would refuse correct programs. Writing outside
-// the writable window corrupts the process, while reading outside what the
-// process was granted reads somebody else, so each door checks the window
-// that answers its own question.
+// A source needs read and not write: a process may hand the kernel a record
+// out of its own read-only data, or out of memory `map` installed read-only,
+// so demanding a writable source would refuse correct programs. The kernel
+// reads through a row only what the process could load through it itself.
 
 /// Check a source the kernel is about to read from process `p`;
 /// `copy_out_check`'s twin. `None` when it is fine.
@@ -977,40 +995,16 @@ public(package) func copy_out(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe 
 /// whichever context freed the slot. Validating while the caller is still the
 /// running process is both the better diagnostic and simpler to reason about.
 ///
-/// The region is fixed for the process's life but the rows inside it are not: a
-/// mapping's row can be unmapped while the caller is parked, so a source that
-/// passed here can be gone at the resume. The resume asks again before it
-/// stages anything (see `copy_out_check` for what a refusal there does).
+/// A row can be unmapped while the caller is parked, so a source that passed
+/// here can be gone at the resume. The resume asks again before it stages
+/// anything (see `copy_out_check` for what a refusal there does).
 public(package) func copy_in_check(p: Int, src: UInt, bytes: UInt) unsafe -> FaultReason? {
     if (src % word_bytes()) != 0 {
         return FaultReason.BadAlign
     }
-    let b = body_of(p)
-    let in_region = window_holds(PROCESSES[b].region_base,
-                                 PROCESSES[b].region_top, src, bytes)
-    let in_read_only = window_holds(PROCESSES[b].ro_base, PROCESSES[b].ro_top,
-                                    src, bytes)
-    if not in_region && not in_read_only {
-        return FaultReason.BadBuffer
-    }
-    // The address must also resolve, as in `copy_out_check`, through a row
-    // that permits read.
     let _ = try translate_user(p, src, bytes,
                                SegFlag.Read as UInt8) catch { return error }
     None
-}
-
-/// Do the `bytes` bytes at `at` lie in `[base, top)`? An empty window holds
-/// nothing.
-///
-/// Ordered so the subtraction cannot underflow: `top - at` is computed only
-/// once `at` is known to be inside the window. A hostile length must produce a
-/// diagnostic, not a panic.
-func window_holds(base: UInt, top: UInt, at: UInt, bytes: UInt) -> Bool {
-    if at < base || at >= top {
-        return false
-    }
-    bytes <= top - at
 }
 
 /// Copy `bytes` from process `p` at `src` into kernel memory at `dst`, unless
@@ -1411,11 +1405,8 @@ func fits_word(v: UInt64) -> Bool {
 /// (`ProcessOp.BootHandleNext`) rather than passed, so the entry register stays
 /// one handle wide.
 ///
-/// `rw_base`/`rw_top` default to none: harness payloads are granted
-/// read+execute only, so the kernel may write nowhere in them and should say so
-/// if asked. Only the loader, which grants a data segment and a stack, passes a
-/// window. `ro_base`/`ro_top`, the read-only segments used in place, default
-/// to none for the same reason.
+/// `region_top` is the top of the region the image was placed in, above which
+/// `free_user_va` places mappings.
 ///
 /// `tick_period_us` is the scheduler tick to arm, or 0 for none. It is armed
 /// as the step before `resume_frame`, after the load. The position is
@@ -1425,10 +1416,7 @@ func fits_word(v: UInt64) -> Bool {
 /// leaves them masked (or masks them first thing, where reset does not) and
 /// its first entry to user mode opens them for user mode only. Each HAL's
 /// ABI.md states it under "Interrupts are masked in the kernel".
-public func start_process(entry: UInt, stack_top: UInt,
-                          region_base: UInt, region_top: UInt,
-                          rw_base: UInt = 0, rw_top: UInt = 0,
-                          ro_base: UInt = 0, ro_top: UInt = 0,
+public func start_process(entry: UInt, stack_top: UInt, region_top: UInt,
                           tick_period_us: UInt = 0) unsafe -> Never {
     let p: Int = ROOT_PROCESS
     claim_root()
@@ -1443,12 +1431,7 @@ public func start_process(entry: UInt, stack_top: UInt,
     PROCESS_RECORDS[p].refs = 0
     PROCESSES[b].entry = entry
     PROCESSES[b].stack_top = stack_top
-    PROCESSES[b].region_base = region_base
     PROCESSES[b].region_top = region_top
-    PROCESSES[b].rw_base = rw_base
-    PROCESSES[b].rw_top = rw_top
-    PROCESSES[b].ro_base = ro_base
-    PROCESSES[b].ro_top = ro_top
     // Root is unrestricted: every ceiling is all-ones, so the boot mints below
     // are uncapped whichever helper makes them.
     var kind: Int = 0

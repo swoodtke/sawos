@@ -4,11 +4,10 @@
 //
 // A call that parks keeps the address of its buffer, and the kernel resolves it
 // again at the wake, in whichever context delivers. Root launches
-// `child-late-door` once per door, maps a piece of the child's own destination
-// region into the hole between its data and its stack (inside both copy
-// windows, and a mapping is the only row that can leave), lets the child park
-// with a buffer in it, unmaps it, and makes the thing the child waits for
-// happen:
+// `child-late-door` once per door, maps an allocation into it (any memory a row
+// grants is a buffer, and a mapping is the only row that can leave), lets the
+// child park with a buffer in it, unmaps it, and makes the thing the child
+// waits for happen:
 //
 //   SOS latedoor: wait record gone: the process ended with BadBuffer
 //   SOS latedoor: wait record gone: the signal was not spent
@@ -38,9 +37,13 @@
 // answer that found its buffer gone settled its exchange.
 //
 // The trials after those map the piece into the child twice and call through
-// it (`exec_rows`: a row that permits execute makes it no buffer, in either
-// order), and then use a second child, linked at the second child base, for
-// what happens when more than one process is owed a fault:
+// its read-write view (`exec_rows`: a row that permits execute over the same
+// bytes makes it no buffer, in either order). Where a mapping takes its
+// memory's own address the two rows lie over the same addresses; where the
+// target translates they are two views at two addresses, and the read-write
+// one is refused all the same, because rows are compared by the bytes they
+// grant. Then a second child, linked at the second child base, for what
+// happens when more than one process is owed a fault:
 //
 //   an interrupt taken from the doomed process's own spinning thread;
 //   two processes parked on one Waiter, each with its record gone, so one wake
@@ -58,15 +61,18 @@
 // carrying on. Where the launcher is the one that unmaps, the death is of a
 // process that is not the running one.
 //
-// A mapping takes its memory's own address on the profiles that do not
-// translate, so the piece lies in the hole only there; the case is for those.
+// Each child's destination row is a pool, and each trial allocates the child's
+// destination from the front of it and the piece behind that: everything a
+// trial allocated has come home by the next, so a destination is always at
+// the base the child is linked for where a mapping takes its memory's own
+// address.
 //
 // Each trial is a function of its own, to stay under root's stack size
 // (`hal.ROOT_STACK_LEN`).
 
-import sos.{System, Process, Memory, Mapping, Waiter, PipeInlet, PipeOutlet,
-            PipeInletRight, ClockType, MapAccess, SosStatus, SystemRight,
-            PIPE_BODY_BYTES}
+import sos.{System, Process, Memory, Pool, Mapping, Waiter, PipeInlet,
+            PipeOutlet, PipeInletRight, ClockType, MapAccess, SosStatus,
+            SystemRight, PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -112,12 +118,11 @@ static POST_GIVE: UInt32 = PipeInletRight.Post | PipeInletRight.Transfer
 
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// The child's destination region, and where in it the piece goes: past its
-/// data and short of its stack, one protection unit of the region's own bytes
-/// at a time. Every profile this case runs on gives a child a region of this
-/// size.
-static REGION_LEN: UInt = 0x4_0000
-static HOLE_AT: UInt = 0x3_0000
+/// The child's destination, allocated from the front of its pool, and the
+/// piece, allocated behind it. Both are whole pages, so they are whole grains
+/// on every profile, and together they fit the region every profile this case
+/// runs on gives a child.
+static DEST_LEN: UInt = 0x3_0000
 static HOLE_LEN: UInt = 0x2000
 
 /// The bits the wait record's Event is signalled with.
@@ -167,34 +172,35 @@ func _start(boot_handle: UInt) {
 }
 
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
-    // The first child's image and its destination, then the second's: the
-    // table lists every image and then every destination.
+    // The first child's image and the pool its destination comes from, then
+    // the second's: the table lists every image and then every destination
+    // row, each typed as a pool here.
     var image_rec = try proc.boot_handle_next()
     var image_b_rec = try proc.boot_handle_next()
-    var ram_rec = try proc.boot_handle_next()
-    var ram_b_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    var pool_b_rec = try proc.boot_handle_next()
     guard let image = image_rec.take_memory() else { return BUG }
     guard let image_b = image_b_rec.take_memory() else { return BUG }
-    guard let ram = ram_rec.take_memory() else { return BUG }
-    guard let ram_b = ram_b_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    guard let pool_b = pool_b_rec.take_pool() else { return BUG }
 
-    try wait_door(&system, &proc, &image, &ram)
-    try reply_door(&system, &proc, &image, &ram)
-    try room_door(&system, &proc, &image, &ram, ROLE_ROOM_RECORD,
+    try wait_door(&system, &proc, &image, &pool)
+    try reply_door(&system, &proc, &image, &pool)
+    try room_door(&system, &proc, &image, &pool, ROLE_ROOM_RECORD,
                   "call record gone")
-    try room_door(&system, &proc, &image, &ram, ROLE_ROOM_BODY,
+    try room_door(&system, &proc, &image, &pool, ROLE_ROOM_BODY,
                   "call body gone")
-    try closed_door(&system, &proc, &image, &ram)
-    try self_door(&system, &proc, &image, &ram)
-    try idle_door(&system, &proc, &image, &ram)
-    try exec_rows(&system, &proc, &image, &ram, ROLE_SEND_AT, "send body")
-    try exec_rows(&system, &proc, &image, &ram, ROLE_CREATE_AT, "record")
-    try interrupted_door(&system, &proc, &image, &ram)
-    try shared_door(&system, &proc, &image, &ram, &image_b, &ram_b, true)
-    try shared_door(&system, &proc, &image, &ram, &image_b, &ram_b, false)
-    try chain_door(&system, &proc, &image, &ram, &image_b, &ram_b)
-    try second_caller(&system, &proc, &image, &ram, &image_b, &ram_b)
-    try two_threads(&system, &proc, &image, &ram, &image_b, &ram_b)
+    try closed_door(&system, &proc, &image, &pool)
+    try self_door(&system, &proc, &image, &pool)
+    try idle_door(&system, &proc, &image, &pool)
+    try exec_rows(&system, &proc, &image, &pool, ROLE_SEND_AT, "send body")
+    try exec_rows(&system, &proc, &image, &pool, ROLE_CREATE_AT, "record")
+    try interrupted_door(&system, &proc, &image, &pool)
+    try shared_door(&system, &proc, &image, &pool, &image_b, &pool_b, true)
+    try shared_door(&system, &proc, &image, &pool, &image_b, &pool_b, false)
+    try chain_door(&system, &proc, &image, &pool, &image_b, &pool_b)
+    try second_caller(&system, &proc, &image, &pool, &image_b, &pool_b)
+    try two_threads(&system, &proc, &image, &pool, &image_b, &pool_b)
     return
 }
 
@@ -202,18 +208,15 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 // One trial's parts
 // -----------------------------------------------------------------------------
 
-/// A child created in a region cut from the pool, and the piece of that region
-/// that goes into the hole between its data and its stack. The rest of the
-/// region is cut and let go at once: a piece that covers a row of the child's
-/// image carries the row (`Memory.split`), so the child keeps its own bytes,
-/// and root's handle table stays small enough for the trials' objects.
+/// A child created in a destination allocated from the front of `pool`, and
+/// the piece, allocated behind it. Root lets its handle on the destination go
+/// at once: the child's rows hold it until the child ends, and root's handle
+/// table stays small enough for the trials' objects.
 func region(system: &System, image: &Memory,
-            ram: &Memory) -> Result<(Process, Memory), SosStatus> {
-    let dst = try ram.split(len: REGION_LEN)
+            pool: &Pool) -> Result<(Process, Memory), SosStatus> {
+    let dst = try pool.allocate(len: DEST_LEN)
     let child = try system.process_create(image: &image, memory: &dst)
-    let front = try dst.split(len: HOLE_AT)
-    let hole = try dst.split(len: HOLE_LEN)
-    let _ = move front
+    let hole = try pool.allocate(len: HOLE_LEN)
     let _ = move dst
     let parts = (move child, move hole)
     return move parts
@@ -345,8 +348,8 @@ func say(line: String) {
 /// A thread parked in `Waiter.Wait` with its record in the piece, and the
 /// readiness it was waiting for arrives after the piece is gone.
 func wait_door(system: &System, proc: &Process, image: &Memory,
-               ram: &Memory) -> Result<Void, SosStatus> {
-    let parts = try region(&system, &image, &ram)
+               pool: &Pool) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &pool)
     let (child, hole) = move parts
     let mapping = try child.map(memory: &hole, access: RW)
     let at = try mapping.base()
@@ -378,8 +381,8 @@ func wait_door(system: &System, proc: &Process, image: &Memory,
 /// A thread parked in a fused call with its reply buffer in the piece, and the
 /// server answers after the piece is gone.
 func reply_door(system: &System, proc: &Process, image: &Memory,
-                ram: &Memory) -> Result<Void, SosStatus> {
-    let parts = try region(&system, &image, &ram)
+                pool: &Pool) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &pool)
     let (child, hole) = move parts
     let mapping = try child.map(memory: &hole, access: RW)
     let at = try mapping.base()
@@ -411,9 +414,9 @@ func reply_door(system: &System, proc: &Process, image: &Memory,
 
 /// A thread parked in a fused call for room, with its args record or its body
 /// in the piece (`role` says which), and room appears after the piece is gone.
-func room_door(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+func room_door(system: &System, proc: &Process, image: &Memory, pool: &Pool,
                role: UInt, what: String) -> Result<Void, SosStatus> {
-    let parts = try region(&system, &image, &ram)
+    let parts = try region(&system, &image, &pool)
     let (child, hole) = move parts
     let mapping = try child.map(memory: &hole, access: RW)
     let at = try mapping.base()
@@ -447,8 +450,8 @@ func room_door(system: &System, proc: &Process, image: &Memory, ram: &Memory,
 /// As `room_door` with the record in the piece, and the room is the server end
 /// closing, which resumes the call with the connection gone.
 func closed_door(system: &System, proc: &Process, image: &Memory,
-                 ram: &Memory) -> Result<Void, SosStatus> {
-    let parts = try region(&system, &image, &ram)
+                 pool: &Pool) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &pool)
     let (child, hole) = move parts
     let mapping = try child.map(memory: &hole, access: RW)
     let at = try mapping.base()
@@ -477,8 +480,8 @@ func closed_door(system: &System, proc: &Process, image: &Memory,
 /// second thread of it, which then signals the first: the process that ends is
 /// the one whose thread is running.
 func self_door(system: &System, proc: &Process, image: &Memory,
-               ram: &Memory) -> Result<Void, SosStatus> {
-    let parts = try region(&system, &image, &ram)
+               pool: &Pool) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &pool)
     let (child, hole) = move parts
 
     // Where the piece lands is the child's to know once it maps it; a
@@ -506,8 +509,8 @@ func self_door(system: &System, proc: &Process, image: &Memory,
 /// anything can still wake somebody before ending the process, would call this
 /// a deadlock.
 func idle_door(system: &System, proc: &Process, image: &Memory,
-               ram: &Memory) -> Result<Void, SosStatus> {
-    let parts = try region(&system, &image, &ram)
+               pool: &Pool) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &pool)
     let (child, hole) = move parts
     let mapping = try child.map(memory: &hole, access: RW)
     let at = try mapping.base()
@@ -533,20 +536,25 @@ func idle_door(system: &System, proc: &Process, image: &Memory,
 
 /// One trial of a buffer in a piece mapped once or twice: `first` is the
 /// access of the first mapping and `second` of the next, over the same bytes
-/// (`NO_ACCESS` for none). The child's call (role 7 or 8) must be refused with
-/// `BadBuffer` when either mapping lets the process execute the piece, in
-/// either order, and taken when neither does.
-func exec_trial(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+/// (`NO_ACCESS` for none). The child's call (role 7 or 8) is through the
+/// read-write mapping, and must be refused with `BadBuffer` when either
+/// mapping lets the process execute the piece, in either order, and taken
+/// when neither does. The read-write mapping's address is the one the child
+/// is told: where a mapping takes its memory's own address both mappings are
+/// at it, and where the target translates the second has an address of its
+/// own.
+func exec_trial(system: &System, proc: &Process, image: &Memory, pool: &Pool,
                 role: UInt, first: UInt32, second: UInt32,
                 want: UInt) -> Result<Void, SosStatus> {
-    let parts = try region(&system, &image, &ram)
+    let parts = try region(&system, &image, &pool)
     let (child, hole) = move parts
     let one = try child.map(memory: &hole, access: first)
-    let at = try one.base()
+    var at = try one.base()
     if second != NO_ACCESS {
         let two = try child.map(memory: &hole, access: second)
-        let again = try two.base()
-        if again != at { return BUG }
+        if second == RW {
+            at = try two.base()
+        }
     }
     try brief(&system, &proc, &child, role, at)
     try start_and_park(&proc, &child)
@@ -556,13 +564,13 @@ func exec_trial(system: &System, proc: &Process, image: &Memory, ram: &Memory,
 
 /// `exec_trial` for one call, over the control and both orders of the two
 /// mappings. The control, a piece mapped read-write only, is a legal buffer.
-func exec_rows(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+func exec_rows(system: &System, proc: &Process, image: &Memory, pool: &Pool,
                role: UInt, what: String) -> Result<Void, SosStatus> {
-    try exec_trial(&system, &proc, &image, &ram, role, RW, NO_ACCESS, TAKEN)
+    try exec_trial(&system, &proc, &image, &pool, role, RW, NO_ACCESS, TAKEN)
     print("SOS latedoor: exec row, {}, rw only: taken\n", what)
-    try exec_trial(&system, &proc, &image, &ram, role, RW, RX, BAD_BUFFER)
+    try exec_trial(&system, &proc, &image, &pool, role, RW, RX, BAD_BUFFER)
     print("SOS latedoor: exec row, {}, rw then rx: BadBuffer\n", what)
-    try exec_trial(&system, &proc, &image, &ram, role, RX, RW, BAD_BUFFER)
+    try exec_trial(&system, &proc, &image, &pool, role, RX, RW, BAD_BUFFER)
     print("SOS latedoor: exec row, {}, rx then rw: BadBuffer\n", what)
     return
 }
@@ -605,8 +613,8 @@ func mapped_child(system: &System, proc: &Process,
 /// fires: the late door is reached from an interrupt taken from a thread of the
 /// process that is owed the fault.
 func interrupted_door(system: &System, proc: &Process, image: &Memory,
-                      ram: &Memory) -> Result<Void, SosStatus> {
-    let parts = try region(&system, &image, &ram)
+                      pool: &Pool) -> Result<Void, SosStatus> {
+    let parts = try region(&system, &image, &pool)
     let pair = try mapped_child(&system, &proc, move parts, ROLE_WAIT_SPIN)
     let (child, mapping) = move pair
 
@@ -650,16 +658,16 @@ func give_sibling(waiter: &Waiter,
 /// order meets them: with A first, a walk that stopped at A would leave B
 /// running.
 func shared_door(system: &System, proc: &Process, image_a: &Memory,
-                 ram_a: &Memory, image_b: &Memory, ram_b: &Memory,
+                 pool_a: &Pool, image_b: &Memory, pool_b: &Pool,
                  a_first: Bool) -> Result<Void, SosStatus> {
     if a_first {
-        let pa = try region(&system, &image_a, &ram_a)
-        let pb = try region(&system, &image_b, &ram_b)
+        let pa = try region(&system, &image_a, &pool_a)
+        let pb = try region(&system, &image_b, &pool_b)
         try shared_pair(&system, &proc, move pa, move pb)
         say("shared waiter, A's record first: both ended with BadBuffer")
     } else {
-        let pb = try region(&system, &image_b, &ram_b)
-        let pa = try region(&system, &image_a, &ram_a)
+        let pb = try region(&system, &image_b, &pool_b)
+        let pa = try region(&system, &image_a, &pool_a)
         try shared_pair(&system, &proc, move pa, move pb)
         say("shared waiter, B's record first: both ended with BadBuffer")
     }
@@ -740,10 +748,10 @@ func shared_pair(system: &System, proc: &Process,
 /// which wakes B's Waiter and finds B's buffer gone. B must be ended before
 /// anything runs again, so root, woken by A's death, finds B already ended.
 func chain_door(system: &System, proc: &Process, image_a: &Memory,
-                ram_a: &Memory, image_b: &Memory,
-                ram_b: &Memory) -> Result<Void, SosStatus> {
-    let pa = try region(&system, &image_a, &ram_a)
-    let pb = try region(&system, &image_b, &ram_b)
+                pool_a: &Pool, image_b: &Memory,
+                pool_b: &Pool) -> Result<Void, SosStatus> {
+    let pa = try region(&system, &image_a, &pool_a)
+    let pb = try region(&system, &image_b, &pool_b)
     let b_pair = try mapped_child(&system, &proc, move pb, ROLE_WAIT)
     let (b, b_map) = move b_pair
     let pipe = try proc.pipe_create()
@@ -820,10 +828,10 @@ func ring_full(inlet: &PipeInlet) -> Result<Bool, SosStatus> {
 /// first is ended and the second takes the room, so the ring is full again
 /// before root does anything else; then the second's call is answered.
 func second_caller(system: &System, proc: &Process, image_a: &Memory,
-                   ram_a: &Memory, image_b: &Memory,
-                   ram_b: &Memory) -> Result<Void, SosStatus> {
-    let pa = try region(&system, &image_a, &ram_a)
-    let pb = try region(&system, &image_b, &ram_b)
+                   pool_a: &Pool, image_b: &Memory,
+                   pool_b: &Pool) -> Result<Void, SosStatus> {
+    let pa = try region(&system, &image_a, &pool_a)
+    let pb = try region(&system, &image_b, &pool_b)
     let a_pair = try mapped_child(&system, &proc, move pa, ROLE_ROOM_RECORD)
     let (a, a_map) = move a_pair
     let b_pair = try mapped_child(&system, &proc, move pb, ROLE_ROOM_GOOD)
@@ -870,10 +878,10 @@ func second_caller(system: &System, proc: &Process, image_a: &Memory,
 /// second is passed over because its process is, and the delivery goes to the
 /// other process, which lives to use it.
 func two_threads(system: &System, proc: &Process, image_a: &Memory,
-                 ram_a: &Memory, image_b: &Memory,
-                 ram_b: &Memory) -> Result<Void, SosStatus> {
-    let pa = try region(&system, &image_a, &ram_a)
-    let pb = try region(&system, &image_b, &ram_b)
+                 pool_a: &Pool, image_b: &Memory,
+                 pool_b: &Pool) -> Result<Void, SosStatus> {
+    let pa = try region(&system, &image_a, &pool_a)
+    let pb = try region(&system, &image_b, &pool_b)
     let a_pair = try mapped_child(&system, &proc, move pa, ROLE_WAIT_TWO)
     let (a, a_map) = move a_pair
     let b_pair = try mapped_child(&system, &proc, move pb, ROLE_WAIT_GOOD)

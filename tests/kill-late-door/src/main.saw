@@ -2,7 +2,7 @@
 // at the switch point the kill returns through (spec §8).
 //
 // Process B is parked on a Waiter that has process A attached, with its wait
-// record in a piece of its own region that root has since unmapped, so the
+// record in an allocation root mapped into it and has since unmapped, so the
 // record has no memory behind it. Root kills A. A's teardown notifies the
 // attachment, the delivery to B finds B's buffer gone and owes B an end, and
 // the owed end is paid before any thread runs again: the kill's own return
@@ -20,10 +20,11 @@
 // build: `late_door_buffer_gone`'s shared-Waiter trial shows the switch point
 // paying the end of the process that owns the running thread.
 //
-// A mapping takes its memory's own address on the profiles that do not
-// translate, so the piece lies in the hole only there; the case is for those.
+// Each child's destination row is a pool, and the child's destination is
+// allocated from the front of it, where it is linked on the profiles where a
+// mapping takes its memory's own address, and the piece behind it.
 
-import sos.{System, Process, Memory, Mapping, SosStatus, SystemRight,
+import sos.{System, Process, Memory, Pool, Mapping, SosStatus, SystemRight,
         MapAccess}
 
 static EXIT_OK: UInt = 0
@@ -50,11 +51,9 @@ static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
 
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// The child's destination region, and where in it the piece goes: past its
-/// data and short of its stack, one protection unit of the region's own bytes
-/// at a time.
-static REGION_LEN: UInt = 0x4_0000
-static HOLE_AT: UInt = 0x3_0000
+/// The child's destination, allocated from the front of its pool, and the
+/// piece, allocated behind it: whole pages, so whole grains on every profile.
+static DEST_LEN: UInt = 0x3_0000
 static HOLE_LEN: UInt = 0x2000
 
 /// The code root kills with, and the §8 status word it leaves: `Killed` (3) in
@@ -90,21 +89,22 @@ func _start(boot_handle: UInt) {
 }
 
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
-    // The first child's image and its destination, then the second's: the
-    // table lists every image and then every destination.
+    // The first child's image and the pool its destination comes from, then
+    // the second's: the table lists every image and then every destination
+    // row, each typed as a pool here.
     var image_rec = try proc.boot_handle_next()
     var image_b_rec = try proc.boot_handle_next()
-    var ram_rec = try proc.boot_handle_next()
-    var ram_b_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    var pool_b_rec = try proc.boot_handle_next()
     guard let image = image_rec.take_memory() else { return BUG }
     guard let image_b = image_b_rec.take_memory() else { return BUG }
-    guard let ram = ram_rec.take_memory() else { return BUG }
-    guard let ram_b = ram_b_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    guard let pool_b = pool_b_rec.take_pool() else { return BUG }
 
-    // The watcher, B, is `child-late-door`, with its piece in the hole; the
+    // The watcher, B, is `child-late-door`, with its piece mapped into it; the
     // target, A, is `child-late-door2`, parked on a Waiter nothing signals.
-    let pb = try region(&system, &image, &ram)
-    let pa = try region(&system, &image_b, &ram_b)
+    let pb = try region(&system, &image, &pool)
+    let pa = try region(&system, &image_b, &pool_b)
     let b_pair = try mapped_child(&system, &proc, move pb, ROLE_WAIT)
     let (b, b_map) = move b_pair
     let (a, a_hole) = move pa
@@ -152,18 +152,14 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     return
 }
 
-/// A child created in a region cut from the pool, and the piece of that region
-/// that goes into the hole between its data and its stack. The rest of the
-/// region is cut and let go at once: a piece that covers a row of the child's
-/// image carries the row (`Memory.split`), so the child keeps its own bytes,
-/// and root's handle table stays small enough for the trials' objects.
+/// A child created in a destination allocated from the front of `pool`, and
+/// the piece, allocated behind it. Root lets its handle on the destination go
+/// at once: the child's rows hold it until the child ends.
 func region(system: &System, image: &Memory,
-            ram: &Memory) -> Result<(Process, Memory), SosStatus> {
-    let dst = try ram.split(len: REGION_LEN)
+            pool: &Pool) -> Result<(Process, Memory), SosStatus> {
+    let dst = try pool.allocate(len: DEST_LEN)
     let child = try system.process_create(image: &image, memory: &dst)
-    let front = try dst.split(len: HOLE_AT)
-    let hole = try dst.split(len: HOLE_LEN)
-    let _ = move front
+    let hole = try pool.allocate(len: HOLE_LEN)
     let _ = move dst
     let parts = (move child, move hole)
     return move parts

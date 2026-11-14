@@ -4,8 +4,8 @@
  * linked after the writable data and its zero-init instead of before them,
  * each segment page-aligned at both ends. Three loadable segments as every
  * image has (code R+X, data R+W, read-only R), so the read-only one lies
- * between the data and the stack: inside the copy-out window, which starts at
- * the lowest writable segment and runs to the region's top.
+ * between the data and the stack, both of which are destinations, and only its
+ * own row's permission makes it none.
  */
 
 OUTPUT_ARCH(aarch64)

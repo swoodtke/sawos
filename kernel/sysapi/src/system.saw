@@ -815,13 +815,16 @@ extension Process {
     /// The thread runs in the process this handle names, which is the caller
     /// only on its own handle, and is charged to that process's Thread quota.
     /// The handle goes into the caller's table, charged to the caller's
-    /// `Handle` row, so the caller starts, joins and gives it on. An entry or a
-    /// stack outside the named process's region terminates the caller. A named
-    /// process at its Thread quota, or a caller at its handle quota, is
-    /// `SosStatus.QuotaExceeded`; a full thread slab or handle table is
-    /// `SosStatus.NoResource`; a process that has ended is
-    /// `SosStatus.Revoked`, answered before the entry and stack are checked
-    /// because there is no region left to check them against.
+    /// `Handle` row, so the caller starts, joins and gives it on. An entry in
+    /// no row of the named process that permits execute terminates the
+    /// caller, and so does a stack top that fails either of two tests: the
+    /// word below it lies in one non-device row of that process that permits
+    /// write (a mapping serves), and no row of it that permits execute grants
+    /// any of that word's bytes. A named process at its Thread quota, or a
+    /// caller at its handle quota, is `SosStatus.QuotaExceeded`; a full thread
+    /// slab or handle table is `SosStatus.NoResource`; a process that has ended
+    /// is `SosStatus.Revoked`, answered before the entry and stack are checked
+    /// because there are no rows left to check them against.
     public func thread_create(&self, entry: UInt, stack_top: UInt,
                               arg: UInt) -> Result<thread.Thread, SosStatus> {
         let raw = try call_value(self.handle, ProcessOp.ThreadCreate as UInt,

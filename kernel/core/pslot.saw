@@ -265,25 +265,9 @@ public(package) struct ProcessRecord {
 /// What a live process runs in (spec §2.7): its protection domain, its handle
 /// table, its boot set and its entry. The teardown frees it.
 ///
-/// `region_base`/`region_top` are the destination region's bounds: one range
-/// per process, holding every segment the loader copied and the stack, which
-/// thread creation checks stacks against. `rw_base`/`rw_top` are the writable
-/// window inside it, which `copy_out_check` tests first. It is one window
-/// rather than a per-segment list because the copied segments are contiguous
-/// with the writable ones last, plus a stack at the region's top edge, and that
-/// holds for a child as for root (`process_create` computes it by root's rule).
-///
-/// The window is only a first bound: a gap between the image's writable end and
-/// the stack falls inside the span, and it is `translate_user`, resolving
-/// against the grant rows, that refuses an address in the gap. Zero/zero means
-/// no writable grant (harness kernels that grant a payload only its own bytes
-/// read+execute).
-///
-/// `ro_base`/`ro_top` span the image's read-only, non-executable segments
-/// used in place (spec §5.6), which are the image's own bytes and lie outside
-/// the region. The copy-in door takes a source in that span as well as in the
-/// region, so a string literal used in place is a source. Zero/zero means
-/// none.
+/// `region_top` is the top of the region the image was placed in: the stack
+/// grant ends there, and `free_user_va` places a mapping at or above it. No
+/// copy door reads it; a buffer is judged by the grant rows alone.
 ///
 /// `grants`/`grant_count` are the grant record: the rows this process's domain
 /// is made of, written by whoever grants and replayed by the scheduler when it
@@ -301,12 +285,7 @@ public(package) struct ProcessBody {
     /// grant at the region's top, recorded at create so root supplies no
     /// numbers at start.
     public(package) stack_top: UInt,
-    public(package) region_base: UInt,
     public(package) region_top: UInt,
-    public(package) rw_base: UInt,
-    public(package) rw_top: UInt,
-    public(package) ro_base: UInt,
-    public(package) ro_top: UInt,
     public(package) grant_count: Int,
     /// How many of the first rows are the image's, which the loader recorded:
     /// its segments and then the stack grant. Rows recorded after them are
@@ -386,8 +365,7 @@ public(package) unsafe static var PROCESS_RECORDS: Slab<ProcessRecord, MAX_PROCE
 /// takes the smaller of the two. See `kcore.process.process_slots_usable`.
 public(package) unsafe static var PROCESSES: Slab<ProcessBody, MAX_PROCESSES> = Slab<ProcessBody, MAX_PROCESSES>(
     inline: [ProcessBody(live: false, entry: 0,
-                         stack_top: 0, region_base: 0, region_top: 0,
-                         rw_base: 0, rw_top: 0, ro_base: 0, ro_top: 0,
+                         stack_top: 0, region_top: 0,
                          grant_count: 0, image_rows: 0,
                          grants: [GrantRow(base: 0, top: 0, pa: 0, perms: 0,
                                            device: false,
