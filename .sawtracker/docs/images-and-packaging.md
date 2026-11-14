@@ -1,16 +1,16 @@
 # SO-95: images and packaging (design)
 
-For the owner and the reviewer, before anything is built. This is revision
-5, checked against main at `096dd17`.
+This is revision 6, the design to build from. The owner ruled on Nov 14:
+"agree with all recommendations for so-95" (§15). Every choice that
+earlier revisions put as a question is now written into the rule it
+belongs to.
 
-It takes in:
+This revision also takes in the reviewer's threads t18 to t21 on
+revision 5, and a read-through as the implementer of the formats (U3)
+would make it. It was checked against main at `096dd17`.
 
-- the reviewer's threads t13 to t17 on revision 4;
-- the owner's rulings since revision 4: no fallback, one name for one kind
-  of thing, and devices by type with one process per instance;
-- SO-102's design of the ESP32-S3's PSRAM (`.claude/lead/so102-design.md`),
-  which is written but not yet reviewed. Everything this document takes
-  from it is marked "(depends on SO-102)".
+What it takes from SO-102's design of the ESP32-S3's PSRAM
+(`.claude/lead/so102-design.md`) is marked "(depends on SO-102)".
 
 Section 17 answers every review item, old and new. Every claim about the
 code names the file and function it comes from. Section 16 separates what
@@ -42,57 +42,59 @@ I ran, what I read, what the reviewer ran, and what nobody checked.
     - A board's devices each have a type.
     - An image launches one process per device instance, with that
       instance's settings.
+    - One set of devices and inputs per process for now.
+13. **Per-process limits are deferred to SO-105:** a handle table per
+    process, a pool as a RAM limit, ceilings narrowed to a declaration, and
+    a per-process stack.
 
 ---
 
-## 0. Verdict
+## 0. What is to be built
 
-1. **The seven parts hold.**
-   - A board lives in sawos, as `board.toml` beside its HAL.
-   - A product holds image descriptions, its packages and a `sawos.pin`.
-   - Each process states its boot interface in `process.toml`.
-2. **Devices are bound by type.**
-   - A board lists its devices, each with a `type`.
-   - A driver's declaration names the types it needs, and no board.
-   - An image launches one process per instance, and names the instance
-     only where the board has more than one of that type.
-   - The boards a driver runs on are computed, not listed. sawos's gate
-     checks every in-tree declaration against every board that has its
-     types.
-3. **Slab storage is linked in, at depth (a).**
-   - The builder emits one zero-filled `.bss.sos_slab` area per raised
-     kind, sized from the kernel object's own symbol table, and the kernel
-     installs each as one more extent at boot (prototyped on riscv32,
-     arm64 and the S3).
-   - Revision 5 closes the reviewer's hole: an area's length comes from the
-     section itself, and the kernel checks every area against bounds the
-     board script supplies (t16).
-4. **Limits are per board, and the table is consistent by construction**
-   (§6.4).
-   - Each number is either set or derived. Records derive from processes,
-     attachments from the waitables, the exchange ring from the threads
-     floor, and the mapping slab from the mapping default.
-   - Raising one raises what hangs off it (t13, t15).
-   - The builder checks each kind's boot rows against its capacity, and
-     the row count against the kernel's bound (t14).
-   - The S3's bytes are recounted with its 16-row grant record (t17).
-5. **No fallback.** `present = "probed"`, the boot-row presence check and
-   the on-request SRAM layout are gone.
-   - A board that names PSRAM is a different board (`esp32s3-r8`, depends
-     on SO-102), and its kernel stops if the part does not match.
-   - An image picks the board its part is.
-6. **The box needs nothing new to run first.** On the plain `esp32s3`
-   board, all in SRAM: root peaks at 17 of 32 handles, the kernel SRAM
-   holds 12.0 KiB of linked areas in its 21.9 KiB of slack, and the cap is
-   seven children, by processes.
-7. **The kernel changes in three places:**
-   - the linked-area block, at table version 5, with a bounds check;
-   - per-board constants moved into the HALs and exported in
-     `sos_board_info`, with the row bound and root's mapping allowance read
-     from capacities;
-   - `ProcessOp.QuotaSet`.
-8. **The builder is Saw.** What stays Python, and the twelve Saw gaps, are
-   as in revision 4.
+1. **Three formats, with one set of rules** (§3.0):
+   - `board.toml` in sawos, beside each HAL;
+   - `process.toml` beside each package the stock root launches;
+   - an image description in the product's repository.
+
+   The grammar of a device reference, the uniqueness of every name and the
+   reserved words are stated once, for the parser (t19, t20).
+2. **Devices bound by type.**
+   - A board lists its devices, each with a `type`, and may fix a type's
+     board inputs per instance (t21).
+   - A driver names the types it needs, and no board.
+   - An image launches one process per instance, and names a device only
+     where there is a choice, a part, or the console.
+   - sawos's gate checks every in-tree declaration against every board
+     that has its types.
+3. **Slab storage linked in, beside the board's compiled floor,
+   raise-only.**
+   - One zero-filled `.bss.sos_slab` area per raised kind, sized from the
+     kernel object's symbol table.
+   - Installed at boot as one more extent, after a check against the board
+     script's `.bss` bounds (prototyped on riscv32, arm64 and the S3).
+4. **Per-board limits, consistent by construction** (§6.4).
+   - Each number is set or derived.
+   - The handle table is 32 on every board.
+   - The grant rows are what each board's hardware allows: 8 on the PMP
+     boards, 16 on the S3 and arm64.
+5. **No fallback** (rule 3.6). A part matches its board, or the boot
+   stops. `esp32s3-r8` is a board of its own (depends on SO-102).
+6. **The box, first run, on the plain `esp32s3`:**
+   - all in SRAM;
+   - root peaks at 17 of 32 handles;
+   - 12.0 KiB of linked areas in 21.9 KiB of kernel slack;
+   - the PWM driver holds LEDC and two routing ranges, and root writes
+     the clock gate, reset and pad enable;
+   - it needs nothing from SO-102.
+7. **Kernel changes:**
+   - the linked-area block (table version 5) with its bounds check;
+   - per-board constants in each HAL, exported in `sos_board_info`;
+   - the row bound and root's mapping allowance read from capacities;
+   - riscv32's end-of-kernel assert;
+   - `ProcessOp.QuotaSet` (rule 7.2).
+8. **The builder in Saw;** the resolvers and, for now, the emulator
+   harness and the runner's case table in Python (§10).
+9. **Deferred to SO-105:** per-process limits (rule 7.5).
 
 ### 0.1 Where the rulings, the spec and the code disagree
 
@@ -227,73 +229,165 @@ byte-identical.
 
 ## 3. The formats, and the board description
 
-### 3.0 The naming rule
+### 3.0 Rules every format follows
 
-These rules hold in every format the design defines: `board.toml`,
-`process.toml`, the image description, the runner's JSON test image, and
-the generated `imageplan` that mirrors them.
+These hold in `board.toml`, `process.toml`, the image description, the
+runner's JSON test image, and the generated `imageplan`. The loader
+refuses, by name, a key a format does not define.
 
-1. **A range is `base` and `len`.** This holds wherever a range appears:
-   a RAM range, the flash, the slot range, a device window, a process's
-   region, a pool, a linked area. `top`, `bytes` and `size` are not used.
-2. **`offset` only for a position measured from a base the entry names.**
-   A register within its device is the example. It is never another word
-   for `base`.
-3. **One way to write a size or an address: a TOML integer, in bytes.**
-   Hexadecimal is the usual spelling (`0x2_4000` for 144 KiB), and `_` may
-   group digits. No suffixed strings (`"144K"`); a comment may give the
-   size in words.
+**Naming (owner's ruling, Nov 14).**
+
+1. **A range is `base` and `len`.** This holds for a RAM range, the
+   flash, a flash slot range, a device window, a region, a pool and a
+   linked area. `top`, `bytes` and `size` are not used.
+2. **`offset` is a position measured from a base the entry names:** a
+   register within its device, an array within its device. It is never
+   another word for `base`.
+3. **Every size and address is a TOML integer, in bytes.** Hexadecimal is
+   the usual spelling (`0x2_4000` for 144 KiB), and `_` may group digits.
+   Suffixed strings (`"144K"`) are refused. A comment may give the size
+   in words.
 4. **One word for one idea in every file:**
-   - `type` for a device's type;
-   - `device` for which instance a process gets;
-   - `inputs` for build-time modules;
-   - `ram` for a named RAM range, or for a speed in a declaration;
-   - `quota` for per-process rows;
-   - `limits` for slab totals;
-   - `count` for how many;
-   - `name` for an entry's name.
-5. **One key, one meaning, across files.** A key that appears in two
-   files means the same there. `ram` is the exception named in rule 4: a
-   range in an image, a speed in a declaration. Both say where the process
-   may live, so it keeps one word.
+   - `type`: a device's type;
+   - `device`: which device a process gets;
+   - `inputs`: build-time modules;
+   - `ram`: a named RAM range in an image or board, and a speed (`fast`)
+     in a declaration, the one exception, since both say where a process
+     may live;
+   - `quota`: per-process rows;
+   - `limits`: slab totals;
+   - `count`: how many;
+   - `name`: an entry's name.
+
+**Names.** A name matches `[A-Za-z][A-Za-z0-9_-]*`. It may not contain
+`.`, which separates the parts of a reference. Names are case-sensitive.
+By convention, devices, registers and arrays are upper-case, and
+everything else lower-case.
+
+**Reserved words.** These are refused as names, by name:
+
+- `default`, `fast` and `slow`, as RAM range names, because `[ram.default]`
+  is the defaults table and `fast` and `slow` are speeds;
+- `root`, as a process name, because the stock root reports itself under
+  it.
+
+**Device references.** Used by an image's `device` values, `[[setup]]`'s
+`register`, and `[rows] devices`:
+
+```
+ref    = DEVICE
+       | DEVICE "." REGISTER
+       | DEVICE "." ARRAY "[" INDEX "]"
+       | DEVICE "." ARRAY "[" INDEX "..=" INDEX "]"
+INDEX  = decimal integer
+```
+
+- `DEVICE` names a `[devices.<name>]` of the board: its whole window and
+  its line.
+- `DEVICE.REGISTER` names one 4-byte register. It is allowed only in
+  `[[setup]]`.
+- `DEVICE.ARRAY[i]` is one 4-byte element. `DEVICE.ARRAY[i..=j]` is
+  elements `i` to `j` inclusive, so `[41..=42]` is two registers.
+  - Both forms are allowed for a window record marked `part = true`.
+  - The single element is also allowed in `[[setup]]`.
+  - `..` without `=` is refused, with the message "write `..=`, an
+    inclusive range".
+  - `i <= j < count` is required.
+- A range's bytes run from the array's `offset + i x stride`, for
+  `(j - i) x stride + 4` bytes. A window must be a naturally aligned power
+  of two of at least the board's grain, or it is refused.
+- The builder prints, beside each part it grants, its first and last
+  register and its bytes.
+
+**Other references.**
+
+- `PROCESS.RECORD` names a `serve` record of another process, in
+  `clients` values.
+- A pool's name, in `pools` values and `[rows] pools`.
+- A RAM range's name, in `ram` values.
+
+**Paths.** A path in `board.toml` is relative to its HAL directory, one
+in `process.toml` to its package directory, and one in an image to the
+product repository's root. `sawos:<path>` in an image is relative to the
+pinned sawos tree.
+
+**Uniqueness.** Each list below names what must be unique, and in what.
+
+- **`board.toml`:**
+  - RAM range names;
+  - exactly one range with `use = "kernel"`;
+  - device names;
+  - within one device, its register and array names together;
+  - a type's board input names (rule 4.6), across all of the board's
+    types.
+- **`process.toml`:**
+  - tags;
+  - exactly one `system` record;
+  - names within each of three families: device needs (`window`,
+    `line`), endpoints (`serve`, `client`), and `memory`. One name may
+    appear in two families (the GPIO driver's `gpio` is a device need and
+    a serve).
+  - **one device need per type:** every `window` and `line` record of
+    one type carries the same name, and is one instance with one binding.
+    Two names for one type are refused, because two devices of one type
+    is the list form deferred by rule 4.8;
+  - input names, and `defaults` keys only among them.
+- **Image:**
+  - process names;
+  - pool names;
+  - `device` keys name device needs of that process;
+  - `clients` keys name its client records, and `pools` keys its memory
+    records;
+  - each pool is bound once, to a process or to `[rows] pools`;
+  - a device may be bound to several processes. The stock root mints a
+    sibling for each, and the builder prints every shared binding.
 
 ### 3.1 The board description
 
-**Rule 3.1.** Each board has one `board.toml` in its HAL directory. A
-board that is a variant of another (the flat profile; `esp32s3-r8`)
-has a facade HAL directory of its own and its own `board.toml` (depends
-on SO-102 for the S3).
+**Rule 3.1.** Each board has one complete `board.toml` in its HAL
+directory. There is no inheritance between board files. A board that is
+a variant of another (the flat profile; `esp32s3-r8`, depending on
+SO-102) has a facade HAL directory and a complete `board.toml` of its
+own.
 
 - Each fact the kernel needs lives in the HAL's `lib.saw` and is exported
-  in `sos_board_info`.
-- `board.toml` restates none of those facts. The builder checks it
-  against the export, so a restatement that drifted would be refused.
+  in `sos_board_info` (rule 3.4).
+- `board.toml` restates none of them. The builder checks it against the
+  export, so a restatement that drifted is refused.
 
-**Rule 3.2.** `board.toml` states:
+**Rule 3.2.** `board.toml`'s tables:
 
-- the triple, the tier, the HAL, the C flags, and how to run the board;
-- the placement kind: `copied`, `in-place` or `translated`;
-- its named RAM ranges (rule 3.6);
-- its flash: the part's flash as a range, the two bus windows, and the
-  slot range;
-- its devices, each with a `type`, its window, its line, its named
-  registers and register arrays, and whether the kernel uses it;
-- its reserved lines;
-- its limits: the defaults an image gets, and the most an image may ask
-  for (§6.4).
+- **`[board]`:** `name`, `triple`, `tier` (`isolated` or `flat`), `hal`,
+  `placement` (`copied`, `in-place` or `translated`), `modules` (the extra
+  kernel module paths), and `cflags`;
+- **`[emulator]`:** `program` and `args`;
+- **`[ram.<name>]`** and **`[ram.default]`** (rule 3.6);
+- **`[flash]`** (in-place boards only):
+  - `base` and `len`: the part's flash;
+  - `ibus` and `dbus`: the bus windows, each `base` and `len`;
+  - `root-slot`, as `base` and `len`;
+  - `slots`, as `base`, `len` and `count`;
+- **`[types.<type>]`:** `inputs`, the board inputs each instance of the
+  type may fix (rule 4.6);
+- **`[devices.<name>]`:**
+  - `type`, `base`, `len`;
+  - optional `line`;
+  - optional `kernel = true`;
+  - optional `registers` (name to `{ offset }`) and `arrays` (name to
+    `{ offset, stride, count }`);
+  - optional `inputs` (rule 4.6);
+- **`[limits.default]`:** the defaults a hand-written image gets, with the
+  same keys as an image's `[limits]` (§6.4);
+- **`[lines]`:** `reserved`.
 
-**Rule 3.3. Devices by type.**
+**Rule 3.3. Devices by type** (owner's ruling, Nov 14).
 
-- A device's `type` names its register interface (`esp32s3-uart`).
-  Two UARTs on one board are two devices of one type.
-- A boot row covers exactly one device the board lists, and never a range
-  spanning devices it does not list (thread t1).
-- A device with `kernel = true` is the kernel's (the console). The
-  builder never binds it by default. An image takes it only by naming it,
-  which is the console handover of spec §9a.
-- A register range is named by device and register array
-  (`GPIO.out_sel[41..42]`). The builder refuses one that is not a
-  naturally aligned power of two of at least the grain.
+- A device's `type` names its register interface. Two UARTs are two
+  devices of one type.
+- A boot row covers exactly one device the board lists (t1).
+- A device with `kernel = true` (the console) is bound only when an image
+  names it. That is the console handover of spec §9a.
+- Registers and array elements are 4 bytes.
 
 **Rule 3.4.** `sos_board_info` holds, behind a version word:
 
@@ -302,26 +396,23 @@ on SO-102 for the S3).
 - `GRANT_ROW_BUDGET`, `MAX_GRANT_ROWS`, `MAX_HANDLES` and
   `PROT_DOMAIN_SLOTS`;
 - `MAX_SLAB_EXTENTS`, `THREAD_FRAME_STRIDE`, `PIPE_INFLIGHT`,
-  `PROCESS_RECORDS_PER_BODY` and each slab's floor.
+  `PROCESS_RECORDS_PER_BODY`, and each slab's floor.
 
 Slot sizes are read from the slab statics' symbols (rule 6.3).
 
 **Rule 3.5.** On-chip peripherals are board facts. What is wired to them
-is an image fact: an instance's input module, and the register ranges the
-image names.
+is an image fact (rule 4.6), unless the board fixes it.
 
 **Rule 3.6. Named RAM ranges.**
 
-- Each `[ram.<name>]` states `base`, `len`, its `use` (`kernel` or
-  `process`) and its `speed` (`fast` or `slow`).
-- `[ram.default]` names the board's default range for processes and for
-  pools.
-- **Kernel memory is internal SRAM,** never behind a cache: its data,
-  stacks, slabs and linked areas.
-- **A range the description names is present.** Under fixed point 10
-  there is no `probed`. A board's kernel proves its ranges at boot, or
-  stops naming what differed (SO-102 §5.2 for PSRAM). A part with less
-  is a different board.
+- Each `[ram.<name>]` has `use` (`kernel` or `process`), `speed` (`fast`
+  or `slow`), `base` and `len`.
+- `[ram.default]` has `process` and `pool`, each naming a `use = "process"`
+  range.
+- Kernel memory is internal SRAM, never behind a cache.
+- **A range the description names is present** (owner's ruling, Nov 14).
+  The board's kernel proves its ranges at boot, or stops and names what
+  differed (SO-102 §5.2 for PSRAM). A part with less is a different board.
 
 **The plain ESP32-S3 board,** as the box's first run uses it:
 
@@ -335,6 +426,12 @@ triple = "xtensa-esp-unknown-elf"
 tier = "flat"
 hal = "hal/xtensa-esp32s3"
 placement = "in-place"
+modules = []
+cflags = ["-mcpu=esp32s3", "-fintegrated-as"]     # abridged
+
+[emulator]
+program = "qemu-system-xtensa"
+args = ["-machine", "esp32s3", "-nographic", "-semihosting"]
 
 [ram.kernel]
 use = "kernel"
@@ -355,9 +452,13 @@ pool = "sram"
 [flash]
 base = 0x0
 len = 0x80_0000             # the part's flash: 8 MiB on the Freenove N8R8
-ibus = { base = 0x4200_0000, len = 0x100_0000 }   # 16 MiB windows (SO-102)
+ibus = { base = 0x4200_0000, len = 0x100_0000 }   # 16 MiB (SO-102)
 dbus = { base = 0x3C00_0000, len = 0x100_0000 }
+root-slot = { base = 0x10_0000, len = 0x8_0000 }
 slots = { base = 0x18_0000, len = 0x8_0000, count = 4 }   # 128 KiB each
+
+[types.esp32s3-uart]
+inputs = ["uartpins"]       # each instance's pins, which a board may fix
 
 [devices.UART0]
 type = "esp32s3-uart"
@@ -365,6 +466,7 @@ base = 0x6000_0000
 len = 0x1000
 line = 27
 kernel = true               # the console
+inputs = { uartpins = "config/uart0-pins.saw" }
 
 [devices.UART1]
 type = "esp32s3-uart"
@@ -383,14 +485,14 @@ type = "esp32s3-gpio"
 base = 0x6000_4000
 len = 0x1000
 line = 16
-registers = { ENABLE1_W1TS = { offset = 0x030 } }
-arrays = { out_sel = { offset = 0x554, stride = 4, count = 54 } }
+registers.ENABLE1_W1TS = { offset = 0x030 }
+arrays.out_sel = { offset = 0x554, stride = 4, count = 54 }
 
 [devices.IO_MUX]
 type = "esp32s3-io-mux"
 base = 0x6000_9000
 len = 0x1000
-arrays = { pad = { offset = 0x004, stride = 4, count = 49 } }
+arrays.pad = { offset = 0x004, stride = 4, count = 49 }
 
 [devices.LEDC]
 type = "esp32s3-ledc"
@@ -405,7 +507,7 @@ len = 0x1000
 registers.PERIP_CLK_EN0 = { offset = 0x018 }
 registers.PERIP_RST_EN0 = { offset = 0x020 }
 
-[limits.default]            # §6.4; derived totals are computed, not stated
+[limits.default]            # set numbers only; derived ones are computed
 processes = 8
 waiters = 8
 quota = { handles = 28, mappings = 12 }
@@ -416,19 +518,18 @@ reserved = [57]
 
 Notes on the file:
 
-- **`[flash]` is the part's flash,** 8 MiB on the user's Freenove N8R8.
-  The image's extent, the bytes `flash` writes, is computed and printed;
-  it is not a board fact. Revision 4's `4M` was the runner's image size.
-- **The windows' 16 MiB** and the slot range's current top at the kernel's
-  `.drom` (0x20_0000, so `count = 4` slots) are as `esp32s3.ld` and
-  SO-102 §4.2 have them. U4 moves `.drom` behind the last slot.
-- **The UART1 and UART2 numbers are placeholders**, shown for the shape.
-- **SYSTEM's registers use TOML's dotted keys,** which keeps each line
-  within 80 columns and means the same as an inline table.
+- **`[flash]` is the part's flash.** The image's extent is computed and
+  printed by `flash`.
+- **The slot range ends at the kernel's `.drom`** (0x20_0000) until U4
+  moves `.drom` behind the last slot.
+- **UART1, UART2, `uartpins` and its file are placeholders,** shown for
+  the shape.
+- **Registers and arrays use TOML's dotted keys,** the same as inline
+  tables, so each line fits 80 columns.
 
-**The board with PSRAM** (depends on SO-102 §4.1, §5.4) is a facade
-directory, `hal/xtensa-esp32s3-r8/`, whose `board.toml` is the plain
-board's with:
+**The board with PSRAM** (depends on SO-102 §4.1 and §5.4) is
+`hal/xtensa-esp32s3-r8/board.toml`. It is complete, as every board file
+is. It differs from the plain board's only in:
 
 ```toml
 [board]
@@ -446,103 +547,116 @@ process = "psram"
 pool = "psram"
 ```
 
-- Its kernel brings the PSRAM up before the loader runs, and stops
-  naming the step that failed (SO-102 §5.2).
-- Root's region stays in `sram` on both boards (SO-102 §4.1).
-- **Being a facade, it is a second board,** not a variant key the kernel
-  would have to learn at run time.
+- Its kernel brings the PSRAM up before the loader runs, or stops naming
+  the step (SO-102 §5.2).
+- Root's region stays in `sram`.
 
 ---
 
 ## 4. A process's declaration
 
-**Rule 4.1.** Every process the stock root launches has a `process.toml`.
-It is sawos's file, so a new field is never a toolchain change.
+**Rule 4.1.** Every process the stock root launches has a `process.toml`
+beside its `Saw.toml`. It is sawos's file, so a new field is never a
+toolchain change.
 
-**Rule 4.2. Its boot set,** in the order the launcher gives it. Each
-record has a `name`, a `tag` and a `kind`:
+**Rule 4.2. Its keys.**
 
-- `system`: a masked System sibling, under the start tag;
-- `window`: a device's window, by `type`. With `part = true`, a register
-  range of that device will do;
-- `line`: a device's interrupt line, by `type`. A line and a window of
-  one type in one declaration are the same instance;
-- `serve` and `client`: an outlet or an inlet, by `protocol`;
-- `memory`: a RAM allocation or a pool.
+- **Top level:**
+  - `format`;
+  - `arena`: a size;
+  - optional `ram = "fast"` (rule 4.3).
+- **`[[boot]]`,** in the order the launcher gives them. Each has `name`,
+  `kind` and `tag` (an integer, unique in the file), and by kind:
+  - `system`: nothing more. Exactly one, and its tag is the start tag;
+  - `window`: `type`, and optional `part = true` (a register range of the
+    device will do, and the image must then name it);
+  - `line`: `type`;
+  - `serve` and `client`: `protocol`, the protocol package's name;
+  - `memory`: nothing more. The image binds it to a pool.
+- **`[quota]`:** `threads`, `events`, `waiters`, `timers`, `memories`,
+  `iomemories`, `mappings`, `pipes` and `handles`, the same keys as an
+  image's `quota` (rule 4.3).
+- **`[build]`:** `inputs` (a list of names) and optional `defaults` (name
+  to path).
 
-There is no `boards` list and no `compatible`. The boards a driver runs
-on are those with a device of each type it names, and with limits that
-hold what it declares.
+There is no `boards` list and no `compatible` (owner's ruling, Nov 14).
+The boards a driver runs on are those with a device of each type it
+names, and limits that hold what it declares.
 
 **Rule 4.3. What it needs.**
 
-- `[quota]` states the rows the kernel charges for what the program does
-  (`mappings`, `handles`, `threads`, `waiters`, `timers`, `events`,
-  `pipes`, and `iomemories` only if it carves).
-- The builder computes the `handles` floor itself: one per record, one
-  for the Process handle, one Mapping per window.
-- `ram = "fast"` states that the program needs fast memory. A driver that
+- `[quota]` states the rows the kernel charges for what the program does.
+  `iomemories` is needed only by a program that carves (t4).
+- The builder computes the `handles` floor itself: one per record, one for
+  the Process handle, and one Mapping per window. A declared `handles`
+  below that is refused.
+- `ram = "fast"` says the program needs fast memory. A driver that
   services an interrupt, or anything with a deadline, says so.
-- **The builder refuses, by name, an image on a board that cannot give it
-  what it declares**: a missing type, a quota above the board's maximum,
-  or a `slow` placement for a `fast` process.
+- The builder refuses, by name, an image on a board that cannot give a
+  process what it declares: a missing type, a quota above the board's
+  maximum, or a `slow` placement for a `fast` process.
 
-**Rule 4.4.** Its `arena`. Its region is computed (rule 5.6).
+**Rule 4.4.** A process's region is computed (rule 5.6).
 
 **Rule 4.5.** A driver finds its registers through `Mapping.base()`.
 
-**Rule 4.6. Inputs.** `[build] inputs` lists the modules each instance
-needs, by name (a pin table, a UART's settings).
+**Rule 4.6. Inputs** (owner's ruling, Nov 14, and t21).
 
-- The value comes from the first of:
-  1. the image's process entry;
-  2. the board's default for that device instance, for hardware fixed on
-     the board (the console's pins), as `[devices.UART0] inputs = {...}`;
-  3. the driver's own default in its package, as
-     `[build] defaults = { uartconfig = "config/default.saw" }`.
-- With none of the three, the builder refuses by name.
-- The builder prints which source it took for each.
+- **Two kinds of input.**
+  - A **board input** is one that `[types.<type>] inputs` names for a
+    type the process needs: wiring a board may fix for each instance.
+  - Every other input is the driver's own: settings.
+- **Every driver with a device need of type T** lists each of T's board
+  inputs in its `[build] inputs`, under the board's name for it.
+  `check-tree` and the image build refuse a driver that does not (rule
+  4.9). So the board's value follows the device and not a driver's choice
+  of name.
+- **The value comes from the first of:**
+  1. the image's `inputs` on the process entry;
+  2. for a board input, the `inputs` of the device instance the process is
+     bound to;
+  3. the driver's `[build] defaults`, for its own inputs only. A driver
+     default for a board input is refused: it would be a guess at wiring.
+- **Neither of the three:** the builder refuses by name.
+- **What the builder prints:** the source of every input, and "overrides
+  the board's" when an image replaces a board value. The image comes first
+  by the owner's ruling. An override is for a product that rewired the
+  board's fixed hardware, and the printed line makes it visible.
 
 **Rule 4.7.** `sos` gains `BootSet`, which drains every record and
 answers `take(tag:)`.
 
-**Rule 4.8. One set of devices and inputs per process, for now** (fixed
-point 12, owner's confirmation).
+**Rule 4.8. One set of devices and inputs per process, for now** (owner's
+ruling, Nov 14).
 
-- Each record's need is met by exactly one device. A set may hold devices
-  of several types: GPIO and IO MUX for the GPIO driver.
-- Each input has exactly one value.
-- Two UARTs served means two processes.
-- **The list forms are refused by name:** a record declared with
-  `count`, or an image giving a list for `device` or for an input. The
-  error says they are reserved.
+- Each device need is met by exactly one device, and each input by
+  exactly one value. Two UARTs served means two processes.
+- **The list forms are refused, by name, as reserved:**
+  - a `count` on a record;
+  - two device needs of one type;
+  - a list as an image's `device` or `inputs` value.
 - **What several devices per process would need later:**
-  - a need declared as taking many (`count = "many"`);
-  - the image giving a list for that need, and a list for each input that
-    goes with it;
-  - each boot record carrying an index beside its tag, so the driver can
-    tell its devices apart;
+  - a need declared as taking many;
+  - the image giving a list for that need, and for each input that goes
+    with it;
+  - each boot record carrying an index beside its tag;
   - a driver written to serve them all.
 
   Refusing the list forms today means nothing written now changes meaning
   then.
 
-**Rule 4.9. sawos's gate checks every in-tree declaration.** For every
-`process.toml` in sawos, against every board:
+**Rule 4.9. sawos's gate checks every in-tree declaration**
+(`sosimage check-tree`, in the gate from U6). For every `process.toml`
+in sawos, against every board, it checks:
 
-- the builder computes the boards that have a device of each type it
-  names;
-- it checks that each such board's maximum limits hold what the process
-  declares;
-- it checks that every input has a value from the board or the driver,
-  or is marked image-supplied;
-- it prints the list of boards.
+- that the boards having a device of each type it names exist, and prints
+  them;
+- that each such board's maximum limits hold what the process declares;
+- that every board input of its types is among its `inputs`, and that no
+  default names one;
+- that its file obeys §3.0.
 
-A driver that names a type no board has, or that needs more than every
-board with its types allows, is red in sawos's gate, not first at an
-image build. This is `sosimage check-tree`, in the gate from U6.
-
-The GPIO driver's declaration:
+The GPIO driver:
 
 ```toml
 # drivers/svc-gpio-esp32s3/process.toml
@@ -588,6 +702,54 @@ waiters = 1
 inputs = ["gpioconfig"]
 ```
 
+The PWM driver, with the reach the owner ruled (rule 8.5): LEDC whole, and
+two register ranges for its pads' routing.
+
+```toml
+# drivers/svc-pwm-esp32s3/process.toml
+format = 1
+arena = 0x1000
+
+[[boot]]
+name = "system"
+kind = "system"
+tag = 1
+
+[[boot]]
+name = "ledc"
+kind = "window"
+type = "esp32s3-ledc"
+tag = 2
+
+[[boot]]
+name = "outsel"
+kind = "window"
+type = "esp32s3-gpio"
+part = true
+tag = 3
+
+[[boot]]
+name = "pads"
+kind = "window"
+type = "esp32s3-io-mux"
+part = true
+tag = 4
+
+[[boot]]
+name = "pwm"
+kind = "serve"
+protocol = "pwmproto"
+tag = 5
+
+[quota]
+mappings = 3
+handles = 10                # floor 9: 5 records, Process, 3 Mappings
+waiters = 1
+
+[build]
+inputs = ["pwmconfig"]
+```
+
 ---
 
 ## 5. The image description, and link addresses
@@ -595,44 +757,66 @@ inputs = ["gpioconfig"]
 ### 5.1 The file
 
 **Rule 5.1.** A hand-written image is TOML in the product's `images/`. A
-test image the runner writes is JSON, with more keys (rule 9.3), and the
-same names for the same ideas (§3.0).
+test image the runner writes is JSON, with the same keys for the same
+ideas and more keys of its own (rule 9.3).
 
-**Rule 5.2.** It states:
+**Rule 5.2. Its keys.**
 
-- `[image]`: `name`, `board`, `tick`;
-- `[limits]`: totals within the board's maximum, each the board's default
-  when absent;
-- `[root]`;
-- optional `[[setup]]` register writes (rule 8.5);
-- one `[[process]]` per process. Each gives:
-  - `name` and `package`;
-  - `device`, only where the board has more than one instance of a type
-    the process needs, or to name a `part`;
-  - `inputs` and `ram`;
-  - `quota`, ceilings, `clients` and `on-exit`;
-- `[[pool]]`, each with `name`, `len` and `ram`;
-- for a hand-written root, its `rows`.
+- **`[image]`:** `name`, `board`, `tick` (a boolean).
+- **`[limits]`:** the set numbers of §6.4 (`processes`, `threads`,
+  `events`, `waiters`, `interrupts`, `timers`, `memories`, `iomemories`,
+  `pipes`) and `quota`. Each defaults to the board's
+  `[limits.default]`, then to the floor. A derived total (`records`,
+  `attachments`, `mappings`) may be stated to raise it above its
+  derivation.
+- **`[root]`:** `package`: `"stock"`, or a package for a hand-written root.
+- **`[[setup]]`** (stock root only):
+  - `register`: a device reference to a register or one array element;
+  - exactly one of `set` (OR the bits in), `clear` (AND them out) or
+    `write` (store the word, for write-one-to-set registers), a 32-bit
+    integer;
+  - entries run in file order, before any child starts.
+- **`[[process]]`:** for a hand-written root, `name` and `package` only.
+  For the stock root:
+  - `name`, `package`;
+  - optional `device`: need name to device reference. It is required for a
+    need whose type has several instances on the board, for a `part`
+    window, and for a kernel device;
+  - optional `inputs`: input name to path;
+  - optional `ram`: a range name;
+  - optional `quota`: the keys of rule 4.2;
+  - optional `clients`: client record name to `PROCESS.RECORD`;
+  - optional `pools`: memory record name to pool name;
+  - optional `on-exit`: `report` (the default) or `shutdown`.
+- **`[[pool]]`:** `name`, `len`, optional `ram`.
+- **`[rows]`** (hand-written root only): `devices`, a list of device
+  references naming whole devices; and `pools`, a list of pool names, in
+  row order.
 
-**Rule 5.3.** A package is `sawos:<path>` or a product path.
+Per-process handle tables, pools as RAM limits, narrowed rights ceilings
+and per-process stacks are deferred to SO-105 (§7).
+
+**Rule 5.3.** A package is `sawos:<path>`, or a path in the product.
 
 **Rule 5.4.** The builder refuses, by name and before compiling anything,
 an image in which:
 
-- a type the process declares has no instance on the board, or several
-  and the image names none;
-- a device is bound twice, or a kernel device is bound without being named;
-- a record is unbound, a tag repeated, or protocols disagree;
-- an input has no value (rule 4.6), or a list form is used (rule 4.8);
-- any limit or quota exceeds the board's maximum, a derived total breaks
+- a key, name, reference or path breaks §3.0;
+- a type the process needs has no instance on the board, or several and
+  the image names none, or a `part` window or a kernel device is unbound;
+- a record is unbound, a tag repeated, or a `clients` value names no
+  `serve` of a matching `protocol`;
+- an input has no value, or a list form is used (rules 4.6 and 4.8);
+- any limit or quota exceeds the board's maximum, a derived total is below
   its derivation, or a process's declared needs exceed what it is given
   (§6.4);
-- any named range is over-asked, each range budgeted separately;
+- any named range is over-asked, each budgeted separately;
 - the linked areas exceed the kernel range's slack;
-- **the boot rows exceed the kernel's row bound**, or any kind's rows
-  exceed that kind's boot capacity: blobs, destinations and pools against
+- the boot rows exceed the kernel's row bound, or any kind's rows exceed
+  that kind's boot capacity: blobs, destinations and pools against
   Memories, devices against IoMemories (t14);
-- root's table overflows at any step, or a child's `Handle` row is short.
+- root's table overflows at any step of the plan, or a child's `Handle`
+  row is short.
 
 ### 5.2 Link addresses, regions and instances
 
@@ -640,55 +824,46 @@ an image in which:
 
 - root's region is the board's;
 - each process's region and each pool come from its `ram` range;
-- on an `in-place` board, each process gets a flash slot;
-- a test image's addresses are given by the runner.
+- on an `in-place` board, each process gets a flash slot.
+
+A test image's addresses are given by the runner.
 
 **Rule 5.6.** A region is `round_up(.data + .bss + arena, grain) + stack`,
-measured by a first link. An image may give a larger `len`.
+measured by a first link.
 
 **Rule 5.7.** Per-process scripts are generated from one template per
 board, and the hand-kept child scripts go.
 
 **Rule 5.8.** On an `in-place` board the kernel's script includes a
-generated `image_slots.ld`, and `.drom` moves behind the last slot in U4.
+generated `image_slots.ld`. In U4, `.drom` moves behind the last slot.
 
-**Rule 5.9.** Row order: blobs, destinations, then the image's rows.
+**Rule 5.9.** Row order: blobs, then destinations, then the image's rows.
+For the stock root those are its device rows in first-use order, then its
+pools. For a hand-written root they are `[rows]`.
 
-**Rule 5.10. Where each process lives.**
+**Rule 5.10. Where each process lives** (owner's rulings, Nov 14).
 
-- `ram` on a process or pool names a `process` range of the board. It
-  defaults to the board's default.
-- A process declaring `ram = "fast"` may not be placed in a `slow` range.
+- `ram` on a process or pool names a `use = "process"` range. It defaults
+  to `[ram.default]`.
+- A `fast` process may not be in a `slow` range.
 - Root's region and all kernel memory stay in internal SRAM.
-- **No fallback.**
-  - An image is built for one board.
-  - On `esp32s3-r8` the kernel brings PSRAM up and proves it, or stops
-    (depends on SO-102).
-  - On the plain `esp32s3` there is no PSRAM range, so nothing is placed
-    there.
-- **What a process may assume.** Nothing in the kernel's contract tells a
-  process where it runs. A program that cares states `ram = "fast"`, and
-  the builder guarantees it. `imageplan` records the placement for root's
+- An image is built for one board, and there is no fallback (rule 3.6).
+- A process is not told where it runs. `imageplan` records it for root's
   reports.
 
 **Rule 5.11. One process per instance, and what it costs.**
 
-- Two instances of one driver are two processes. Each costs:
-  - a body: 1436 bytes of kernel SRAM on the S3 (§6.4);
-  - a region: a 16 KiB stack plus data and arena;
+- Each instance costs:
+  - a body (1436 bytes of kernel SRAM on the S3);
+  - a region (a 16 KiB stack plus its data and arena);
   - a flash slot on an `in-place` board;
-  - in root, two boot rows and a Process handle.
-- On a board that does not translate, each instance is a separate link of
-  the same package, at its own addresses. So **the builder names what it
-  builds by instance:** `build/<image>/<process name>.sosimg`, linked
-  from `<package>`. It never names by package alone.
-- On arm64 both instances link at the one base, but they are still
-  separate images, since their inputs differ.
+  - two boot rows and a Process handle in root.
+- Each instance is its own link of its package. The builder names its
+  output by process: `build/<image>/<process name>.sosimg`.
 
 ### 5.3 Worked example: the useless box
 
-`images/box.toml`, for the first run on the plain board, as the simplest
-reading of question 3 has it:
+`images/box.toml`, for the first run on the plain board:
 
 ```toml
 format = 1
@@ -701,6 +876,18 @@ tick = true
 [root]
 package = "stock"
 
+[[setup]]                           # LEDC's clock on
+register = "SYSTEM.PERIP_CLK_EN0"
+set = 0x800
+
+[[setup]]                           # LEDC out of reset
+register = "SYSTEM.PERIP_RST_EN0"
+clear = 0x800
+
+[[setup]]                           # output enable, pads 41 and 42
+register = "GPIO.ENABLE1_W1TS"
+write = 0x600
+
 [[process]]
 name = "gpio"
 package = "sawos:drivers/svc-gpio-esp32s3"
@@ -709,6 +896,7 @@ inputs = { gpioconfig = "config/gpio.saw" }
 [[process]]
 name = "pwm"
 package = "sawos:drivers/svc-pwm-esp32s3"
+device = { outsel = "GPIO.out_sel[41..=42]", pads = "IO_MUX.pad[41..=42]" }
 inputs = { pwmconfig = "config/pwm.saw" }
 
 [[process]]
@@ -722,44 +910,43 @@ name = "heartbeat"
 package = "heartbeat"
 ```
 
-The PWM driver's declaration names four windows by type: `esp32s3-ledc`,
-`esp32s3-gpio`, `esp32s3-io-mux` and `esp32s3-system`. Each type has one
-instance on the board, so the image names no `device`. With every
-default range `sram` on the plain board, the image names no `ram` either.
-
-Under the narrow reading of question 3, the PWM entry instead binds two
-parts, and the image adds three `[[setup]]` writes:
-
-```toml
-device = { outsel = "GPIO.out_sel[41..42]", pads = "IO_MUX.pad[41..42]" }
-```
-
 What the builder makes of it:
 
+- **Bindings.**
+  - `gpio` gets GPIO and IO_MUX whole, by type, each having one instance.
+  - `pwm` gets LEDC whole, plus two parts:
+    - `GPIO.out_sel[41..=42]`: 0x6000_45F8, 8 bytes;
+    - `IO_MUX.pad[41..=42]`: 0x6000_90A8, 8 bytes.
+  - GPIO and IO_MUX are each bound twice, which is printed.
 - **Rows: twelve.**
-  - Four blobs, four destinations: 8 Memory rows, of the S3's 16.
-  - GPIO, IO_MUX, LEDC and SYSTEM: 4 IoMemory rows, of 8.
-  - Within the row bound of 24 (t14).
-- **Placement, and why.**
-  - GPIO driver: `fast` by its declaration, since it services the
-    switch's interrupt.
-  - Controller: its author would pin it for the debounce and the arm's
-    timing; on the plain board it is in `sram` regardless.
-  - PWM driver and heartbeat: the board default. LEDC times the pulses in
-    hardware, and the heartbeat is bulk.
-  - On `esp32s3-r8` (depends on SO-102) the image adds
-    `ram = "sram"` on the controller, and the PWM driver and the
-    heartbeat move to `psram`.
-- **Bytes per range** (estimates: no driver exists; a region is a 16 KiB
-  stack plus about 8 KiB, and the controller about 16):
-  - kernel SRAM: the kernel as linked today, plus 12.0 KiB of linked
-    areas and growth, within 21.9 KiB of slack (§6.3);
+  - Four blobs and four destinations: 8 Memory rows, of the S3's 16.
+  - GPIO, IO_MUX, LEDC and SYSTEM: 4 IoMemory rows, of 8. SYSTEM is a row
+    because a setup write names it.
+  - Within the row bound of 24.
+- **IoMemory objects:** 4 rows, 2 parts, and 1 transient setup carve = 7,
+  within 8.
+- **Mappings:** GPIO's 2, PWM's 3 and root's 1 transient = 6, within the
+  S3's derived 32.
+- **Placement.**
+  - GPIO is `fast` by its declaration, since it services the switch.
+  - The rest take the board's default range, which on the plain board is
+    `sram` too.
+  - On `esp32s3-r8` (depends on SO-102) the image would add `ram = "sram"`
+    on the controller, for its timing. The PWM driver and the heartbeat
+    would go to the default, `psram`: LEDC times the pulses in hardware,
+    and the heartbeat is bulk.
+- **Bytes per range** (estimates; no driver exists):
+  - kernel SRAM: 12.0 KiB of linked areas and growth, within 21.9 KiB of
+    slack (§6.3);
   - process SRAM, plain board: root 96 + GPIO 24 + controller 32 + PWM 24
     + heartbeat 24 = 200 KiB, of 256;
-  - on `esp32s3-r8`: SRAM 152 KiB, and PSRAM 48 KiB of 8 MiB.
-- **The cap.** Seven children: the S3's default 8 processes less root.
-  Memories allow 8 children (16 rows / 2), and root's table allows 11.
-  The builder reports the smallest.
+  - on `esp32s3-r8`: SRAM 152 KiB, and PSRAM 48 KiB.
+- **The cap: seven children.** The builder reports the smallest of four
+  bounds:
+  - processes: 8 less root = 7;
+  - Memory rows: 16 / 2 = 8;
+  - the row bound: (24 - 4) / 2 = 10;
+  - root's table: 11.
 
 **Handle counts** (by reading the plan against §1.3; root's table holds
 32):
@@ -770,28 +957,31 @@ entry: System, Process, Thread, 12 rows                             15
 process_self                                                        16
 create child 1 (+1), release its blob and destination (-2)      17, 15
 children 2, 3 and 4                                 16/14, 15/13, 14/12
-GPIO: System sibling, GPIO and IO_MUX siblings, bound line,
-      each made then given                                13, 12 (x4)
-GPIO: pipe_create (+2), give the outlet (-1)                     14, 13
-PWM: System sibling; the four rows given                      14..9
-PWM: pipe_create, give the outlet                                11, 10
-controller: System sibling; two inlets minted, given, released  11..8
-heartbeat: System sibling; supervise with one Waiter             9, 8, 9
+setup writes: carve (+1), map (+1); unmap, release both (-2)  14, 12 (x3)
+gpio: System, GPIO and IO_MUX siblings, the line; each
+      made then given                                      13, 12 (x4)
+gpio: pipe_create (+2), give the outlet (-1)                     14, 13
+pwm: System sibling; LEDC row given; two parts carved, given 14/13, 12,
+                                                          13/12, 13/12
+pwm: pipe_create (+2), give the outlet (-1)                      14, 13
+controller: System sibling; two inlets minted, given, released  14..11
+heartbeat: System sibling; release GPIO, IO_MUX, SYSTEM rows;
+      supervise with one Waiter                                12..9
 ```
 
 Root peaks at 17 of 32.
 
-Each child against its `Handle` row (S3 default 28):
+Children, against the S3's default `Handle` row of 28:
 
 - GPIO peaks at 11;
-- PWM at 12 with four whole windows, or 10 under the narrow reading;
+- PWM at 10;
 - the controller at 8;
 - the heartbeat at 5.
 
 ### 5.4 Worked example: two UARTs
 
-A product that logs a GPS receiver and a modem, on the plain board. It is
-a sketch: neither the driver nor the UART numbers exist or are checked.
+A sketch, on the plain board: neither the driver nor the UART numbers
+exist or are checked.
 
 ```toml
 # drivers/svc-uart-esp32s3/process.toml
@@ -827,7 +1017,7 @@ handles = 8
 waiters = 1
 
 [build]
-inputs = ["uartconfig"]
+inputs = ["uartpins", "uartconfig"]
 defaults = { uartconfig = "config/default.saw" }   # 115200 8N1
 ```
 
@@ -847,12 +1037,13 @@ package = "stock"
 name = "gps"
 package = "sawos:drivers/svc-uart-esp32s3"
 device = { uart = "UART1" }
-inputs = { uartconfig = "config/gps.saw" }       # 9600 8N1
+inputs = { uartpins = "config/gps-pins.saw", uartconfig = "config/gps.saw" }
 
 [[process]]
 name = "modem"
 package = "sawos:drivers/svc-uart-esp32s3"
-device = { uart = "UART2" }                      # default settings
+device = { uart = "UART2" }
+inputs = { uartpins = "config/modem-pins.saw" }
 
 [[process]]
 name = "logger"
@@ -863,23 +1054,26 @@ on-exit = "shutdown"
 
 What the builder makes of it:
 
-- **Both UART processes name their instance.** The board has three
-  `esp32s3-uart` devices, and UART0 is the kernel's, so it is never bound
-  by default.
-- **`gps` takes the image's settings.** `modem` takes the driver's
-  default, and the build prints that it did.
-- **Two links of one package.** `build/logger/gps.sosimg` and
-  `build/logger/modem.sosimg`, each linked for its own flash slot and
-  region, two of the four slots.
-- **Rows.** Three blobs and three destinations (6 Memory rows), plus
-  UART1 and UART2 (2 IoMemory rows). Root peaks at
+- **The driver.**
+  - It lists `uartpins` because the board's `esp32s3-uart` type names it
+    (rule 4.6).
+  - Its window, line and serve all named `uart` are one need and one
+    serve.
+- **Bindings.** Both UART processes name their instance. The board has
+  three of the type, and UART0 is the kernel's.
+- **Inputs.**
+  - `uartpins` comes from the image for both, since UART1 and UART2 have
+    no board value.
+  - `gps` takes the image's settings, and `modem` the driver's default.
+  - The build prints each source.
+- **Outputs.** `build/logger/gps.sosimg` and `build/logger/modem.sosimg`:
+  two links of one package, in two slots.
+- **Rows:** 6 Memory rows and 2 IoMemory rows. Root peaks at
   3 + 8 + 1 + 1 = 13 of 32.
 
 ### 5.5 Worked example: `uart_service_ns16550`
 
-The case today: a hand-written root (`tests/uart-service`), the children
-`drivers/svc-uart-ns16550` and `tests/svc-client`, one device row, no
-tick. As a hand-written description:
+A hand-written root, as the case is today:
 
 ```toml
 format = 1
@@ -904,13 +1098,10 @@ package = "sawos:tests/svc-client"
 devices = ["UART0"]
 ```
 
-- A hand-written root gets the rows it names, in order, and no
-  declaration is checked.
-- The flat profile is a second description naming `riscv32-virt-flat`.
-- With the stock root, the driver's declaration names type
-  `ns16550` for its window and line. The board's one UART is the
-  kernel's console, so the image must name it (`device = { uart = "UART0"
-  }`): the handover of §9a.
+- **A hand-written root's processes** give only `name` and `package`. No
+  declaration is read, and the root numbers its rows itself (rule 5.9).
+- **The flat profile** is a second description naming
+  `riscv32-virt-flat`.
 
 ---
 
@@ -1042,7 +1233,7 @@ kernel's DRAM .bss (summed from the slab symbols; 13.6 KiB of it is the
 four pipe connections' rings). An image could lower them and get that
 back.
 
-**Recommended: (a).**
+**Ruled (Nov 14): (a).**
 
 - **(b) would buy little.** Under fixed point 7 the board's defaults sit
   above the floors, so no image wants to lower them. The floors stay the
@@ -1109,8 +1300,11 @@ The derivations are:
 - **each quota default** is below its slab's boot capacity.
 - **the mapping quota default** <= `GRANT_ROW_BUDGET` - `IMAGE_GRANT_ROWS`
   (4).
-- **`MAX_HANDLES`** >= 5 + the row bound, and `DEFAULT_QUOTA_HANDLES` <
-  `MAX_HANDLES`.
+- **`DEFAULT_QUOTA_HANDLES`** < `MAX_HANDLES`. `MAX_HANDLES >= 5 +
+  MAX_MEMORIES + MAX_IOMEMORIES` is a compile-time assert over one kernel's
+  floors (below), and not a derivation over an image's totals. What the
+  builder checks for an image is the rows that image has against root's
+  table, step by step (rule 5.4) (t18).
 - **the row bound** = Memories + IoMemories at boot. The kernel reads
   capacities, not floors (t14).
 - **`PIPE_INFLIGHT`** = 2 x the threads *floor*. It is a per-board
@@ -1190,7 +1384,7 @@ mappings is the hardware case. The ESP32-P4's 32 PMP entries would set
 |---|---|---|---|
 | root carving from one peripheral row | 16 handles | policy | withdrawn; 32 handles |
 | the child cap | handles, rows, memories, processes | policy (processes: RAM) | the builder reports the smallest; the box's is 7, by processes |
-| PWM setup moved into root | mapping quota 2 | policy | raised to the board's rows; reach is question 3 |
+| PWM setup moved into root | mapping quota 2 | policy | raised to the board's rows; the reach ruled narrow anyway (rule 8.5) |
 | `QuotaSet` for the box | quota defaults | policy | not needed |
 | S3 grant budget 8 | copied from PMP | policy on S3 | 16 |
 | 96 KiB regions | runner's slot | policy | computed |
@@ -1302,6 +1496,19 @@ more than its board's default and less than its board allows.
 **Rule 7.4.** The `Mapping` row is bounded by the board's budget less the
 image's rows: 4 on riscv32 and the C3, 12 on the S3 and arm64.
 
+**Rule 7.5. Deferred to SO-105** (owner, Nov 14: "all of this can be
+later since it's not strictly needed for the useless box but will be as
+we scale the images e.g. support networking"). These are not designed
+here:
+
+- a handle table sized per process;
+- a pool per process as its RAM limit;
+- rights ceilings narrowed to a declaration;
+- a per-process stack.
+
+For the box, this design stands as ruled. An image's `[[process]]` has no
+key for any of the four, and the loader refuses one as an unknown key.
+
 ---
 
 ## 8. Root's interfaces
@@ -1310,7 +1517,8 @@ image's rows: 4 on riscv32 and the C3, 12 on the S3 and arm64.
 
 1. **Entry:** System in the first argument register (§5.7, §2.8).
 2. **Region and image:** the board's root region; unlimited quotas except
-   the mapping clamp; unrestricted ceilings (§5.6, §2.9, §2.7).
+   the mapping clamp, which reads the Mapping slab's capacity (t13);
+   unrestricted ceilings (§5.6, §2.9, §2.7).
 3. **Boot handles:** words 1 to 3, then one handle per row, each already
    in root's table and announced in row order; `Drained` after the last
    (§12).
@@ -1330,7 +1538,7 @@ image's rows: 4 on riscv32 and the C3, 12 on the S3 and arm64.
    > comes either nothing or the image's linked-area block, which the
    > kernel installs before root runs.
 
-9. **`imageplan`.** For each child: ordinals, ceilings, quota rows, the
+9. **`imageplan`.** For each child: ordinals, quota rows, the
    records to give (tag, source, keep mask, and for a range the carve
    offset and length), the start tag and the exit policy. Also the
    connections and the setup writes. Its types live in `bootplan`.
@@ -1340,8 +1548,8 @@ image's rows: 4 on riscv32 and the C3, 12 on the S3 and arm64.
 > **The launch convention** (userspace). A launcher that follows it gives
 > a child exactly its declared records, under their tags, in declared
 > order, before start. It starts the child with its System record's tag,
-> masked with `Debug | ProcessSelf | ClockGet | Transfer` unless the image
-> grants more. It sets declared quota rows before any give. It gives
+> masked with `Debug | ProcessSelf | ClockGet | Transfer`. It sets declared
+> quota rows before any give. It gives
 > windows, lines and endpoints as capabilities: a client gets an inlet
 > minted with `Post | Transfer`, a server the outlet. It keeps the child's
 > Process handle.
@@ -1374,8 +1582,14 @@ stops the machine.
 
 **Rule 8.5.** Each `[[setup]]` entry names a board register and a `set`,
 `clear` or `write`. Root carves the word from the device's row, maps it,
-writes it, unmaps it, and releases both, before starting anyone. Used only
-under the narrower reading of question 3.
+writes it, unmaps it, and releases both, before starting anyone.
+
+This is how the box's LEDC clock gate, its reset and the pads' output
+enable are written: by root, once, as data in the image (ruled Nov 14).
+The PWM driver holds LEDC and its two pads' routing ranges, and nothing
+of SYSTEM. The pads keep their reset state until the driver's `Setup`
+selects GPIO and routes the channel, then show its idle level, low (read
+from SO-77's notes, not seen on a part).
 
 ---
 
@@ -1458,6 +1672,11 @@ the SHA-256 (through `shasum`), the board the image is for, and the
 As filed after revision 2 (SL-1092 to SL-1101) and revision 3 (11.12).
 Each entry is self-contained. Unless an entry says otherwise, all were run
 against sawlang 0.23.0 on macOS arm64. Nothing is new in this revision.
+
+**As reported by the sawlang lead:** the owner ruled, in the sawlang
+session, that every gap in this section is valid and will be fixed, the
+Blade flags (11.7) first, then `libs/toml` (11.1). The workarounds named
+below stand until each fix reaches sawos's pin.
 
 ### 11.1 `libs/toml` misreads TOML outside its subset, silently (SL-1092)
 
@@ -1621,8 +1840,15 @@ which is a bug in today's tree.
 SO-102's, and not reviewed. An image for `esp32s3-r8` runs only on a part
 that matches that board.
 
-**12.7 sawos moving under a pin; two languages; Saw as the tool
-language.** As in revision 4.
+**12.7 sawos moving under a pin.** Nothing moves until a product bumps
+its pin. The formats are versioned and refused when unknown, and the
+gate's scratch product (U7) catches a break first.
+
+**12.8 Two languages, and Saw as the tool language.**
+- The runner (Python) and the builder (Saw) meet only in the JSON test
+  image.
+- A sawlang release that breaks hosted builds is caught at sawos's pin
+  bump.
 
 ---
 
@@ -1639,12 +1865,26 @@ language.** As in revision 4.
 - **A fallback layout, or a boot-time presence probe.** Ruled out by
   fixed point 10.
 - **Depth (b).** Not needed while defaults sit above floors (§6.2).
-- **Revision 3's reserve; root carving from one peripheral row; minting
-  boot handles at drain; the handle table as a linked area; a kernel per
-  image; a kernel cache keyed by revision; a per-case builder that builds
-  packages; a hand-kept slot-size literal; a Python builder; JSON
-  descriptions; quotas in the sosimg; the kernel as a Blade package; git
-  dependencies; a submodule.** As in revision 4.
+- **A reserve in process RAM.** It spends process RAM and needs the
+  builder trusted for placement (§6.7).
+- **Root carving windows from one peripheral row.** It hands root the
+  megabyte at 0x6000_0000, eFuse and the interrupt matrix included (t1).
+- **Minting boot handles at drain, or the handle table as a linked area.**
+  Both are kernel and §12 changes that a 32-entry table makes unneeded.
+- **A kernel per image.** Every image would boot a kernel the gate never
+  ran.
+- **A kernel cache keyed by revision.** It is stale under any uncommitted
+  edit (t11).
+- **A per-case builder that builds packages.** It races in a shared
+  package directory (t9).
+- **A hand-kept slot-size literal.** The symbol table gives the size (t7).
+- **A builder in Python.** Ruled out: tools are Saw where possible.
+- **JSON for hand-written descriptions.** JSON has no comments and no hex.
+- **Quotas in the sosimg.** That would be an image claiming for itself.
+- **The kernel as a Blade package.** It would teach Blade a recipe sawos
+  already owns.
+- **Git dependencies, or a submodule, for products.** Blade cannot reach a
+  subdirectory (gap 11.8), and the owner asked for a pin.
 
 ---
 
@@ -1654,7 +1894,12 @@ Units marked sawlang are the sawlang lead's. SO-102's units are named by
 its letters (A to D).
 
 - **U1. Kernel, stitching and linking in Saw, transcript-identical
-  (sawos; Sonnet, medium).** As in revision 4.
+  (sawos; Sonnet, medium).**
+  - Rules 9.1 to 9.4 and 9.7.
+  - The runner keeps its package phase, builds each board's kernel once
+    per run per entry, and calls `sosimage link` per case with a JSON test
+    image.
+  - Test: every transcript, total and image size identical to the base.
 - **S1, S2 (sawlang).** Blade's flags and avoidance; `libs/toml`.
 - **U2. Per-board limits and linked slab areas (sawos kernel and spec;
   Opus for the spec, Sonnet to build; medium-large).**
@@ -1675,8 +1920,10 @@ its letters (A to D).
   - `board.toml` per §3, for each board, with devices by type;
   - `process.toml` per §4;
   - the image per §5;
-  - the naming rule (§3.0) enforced by the loader: unknown keys refused,
-    sizes as integers;
+  - §3.0 enforced by the loader: unknown keys, suffixed sizes, bad names,
+    reserved words, the reference grammar (`..` refused, `..=` inclusive)
+    and every uniqueness rule, each refused by name with a test;
+  - `[types.<type>] inputs` and the board-input rules of 4.6;
   - `uart_service_ns16550` from a file, identical to its case.
 
   Beside it, SO-102's A and B.
@@ -1690,9 +1937,11 @@ its letters (A to D).
   - `.drom` behind the last slot;
   - the hand-kept scripts gone;
   - SO-102 D's hand-written PSRAM script generated.
-- **U5. The quota door.**
+- **U5. The quota door (sawos kernel and spec; Opus for the spec).** Rule
+  7.2, with a test per fault and status. Its below-use test gives first.
 - **U6. Declarations and the stock root (sawos; Opus for `bootplan`).**
-  - types, instances and the list-form refusals;
+  - types, instances, shared bindings and the list-form refusals;
+  - parts carved and setup writes made by the stock root (rule 8.5);
   - input precedence (rule 4.6);
   - `BootSet` and `imageplan`;
   - the stock root;
@@ -1720,53 +1969,44 @@ its letters (A to D).
 
 ---
 
-## 15. Questions for the owner
+## 15. The owner's rulings
 
-**Settled by the owner since revision 4, and removed as questions:**
+All from Nov 14. The design's text already applies each.
 
-- per-board limits (fixed point 7);
-- no PSRAM fallback (fixed point 10);
-- where each process lives (fixed point 9);
-- one name for one kind of thing (fixed point 11);
-- devices by type, one process per instance, one set of devices per
-  driver for now (fixed point 12);
-- the reserve, superseded by linked areas.
-
-**Open** (new or changed marked):
-
-1. Linked areas at depth (a), raise-only beside the floors.
-   *Recommended: (a).*
-2. Root's handle table: 32 on every board, rows per listed device; root
-   peaks at 17 of 32 for the box. The alternative hands root the megabyte
-   at 0x6000_0000. *Recommended: 32.*
-3. What the PWM driver may reach, which is authority, not a limit:
-   - four whole windows;
-   - or root's one-time writes plus LEDC and two register ranges.
-
-   *Recommended: the second.*
-4. **(changed)** The per-board values and their derivations (§6.4):
-   - S3: processes 8, Waiters 8, `MAX_HANDLES` 32, grant rows 16, mapping
-     default 12, with records, threads, attachments and mappings derived;
-   - riscv32 and arm64: 16 processes, arm64 16 domains;
-   - the C3: at its floors, with 32 handles pending its slack.
-
-   *Recommended: yes.*
-5. **(new)** Inputs come from the image, then the board's default for
-   that instance, then the driver's default; with none, a refusal by name.
-   *Recommended: yes.*
-6. **(new)** A device the kernel uses (the console) is bound only when an
-   image names it. *Recommended: yes.*
-7. **(new)** `PIPE_INFLIGHT` stays 2 x the threads floor (16 everywhere),
-   with its property stated as holding up to the floor, until a board
-   raises its threads floor. *Recommended: yes.*
-8. Test images keep the floors and today's quotas, and cases that reach a
-   per-board array read it per profile. *Recommended: yes.*
-
-Unchanged, each recommended yes: driver pins as a build-time module; TOML
-with JSON for test images; sawlang S1 and S2 first; the runner moved
-stepwise; the C3 smoke in Python until U9; one board per image; the
-resolvers in Python; a pin and `.sawos`; the stock root's exit policy;
-the box in its own repository.
+1. **Per-board limits,** derived from the hardware where there is a
+   hardware fact (§6.4).
+2. **No fallback:** a part matches its board description, or the boot
+   stops (rule 3.6).
+3. **Each process and pool placed by the image** (rule 5.10).
+4. **One name for one kind of thing** (§3.0).
+5. **Devices by type, one process per instance, one set of devices and
+   inputs per process for now** (rules 3.3, 4.8).
+6. **Per-process limits deferred to SO-105** (rule 7.5).
+7. **"Agree with all recommendations for so-95."** That settles each of
+   these, as follows:
+   - linked areas beside the board's floor, raise-only (§6.2);
+   - a 32-entry handle table on every board, and rows per listed device
+     (§6.4, rule 3.3);
+   - the PWM driver's reach is the narrow one: root's setup writes for
+     LEDC's clock gate, its reset and the pads' output enable, with the
+     driver holding LEDC and two routing ranges (rule 8.5, §5.3);
+   - the per-board values and derivations of §6.4;
+   - inputs from the image, then the board instance, then the driver
+     (rule 4.6);
+   - the console bound only when an image names it (rule 3.3);
+   - `PIPE_INFLIGHT` = 2 x the threads floor, its property holding up to
+     the floor (§6.4);
+   - test images keep the floors and today's quotas (§6.6);
+   - driver pins as a build-time module (rule 4.6);
+   - TOML for hand-written files, JSON for test images (rule 5.1);
+   - sawlang's Blade flags and `libs/toml` ahead of the box (§11, §14);
+   - the runner moved stepwise (§10);
+   - the C3 smoke in Python until U9;
+   - one board per image (rule 5.10);
+   - the resolvers in Python (§10);
+   - a pin and `.sawos` for products (rule 9.8);
+   - the stock root's exit policy (rule 8.1);
+   - the box in its own repository.
 
 ---
 
@@ -1834,22 +2074,28 @@ the box in its own repository.
 | t5 | slots over `.drom` | Accepted; four slots until U4 | §3.1, rule 5.8 |
 | t6 | 24 KiB regions | Accepted; computed | rule 5.6 |
 | t7 | slot sizes from symbols | Accepted; used by the prototype | §6.1 |
-| t8 | the PWM driver's reach | An owner question, two readings | Q3 |
+| t8 | the PWM driver's reach | Ruled narrow: setup writes plus LEDC and two ranges | rule 8.5, §5.3 |
 | t9 | per-case builder races | Accepted; package phase kept | rule 9.2 |
 | t10 | U1's wider input; C3; profiles | Accepted | rule 9.3 |
 | t11 | revision-keyed cache | Accepted; no cache | rule 9.4 |
 | t12 | Blade behaviours | Accepted | rule 9.6 |
 | t13 | mapping default 12 above the slab's 8; root's allowance is the floor | Accepted. The mapping slab is derived (4 x processes, above the default); the assert is restated over boot capacities; root's allowance reads the capacity | §6.4, U2 |
 | t14 | the cap is 10 by rows and 8 by S3 Memories; the builder lacks both checks | Accepted. The row bound reads capacities; the builder checks the row bound and each kind's rows; the box's cap is 7, by processes; "eleven" corrected | rule 5.4, §5.3, 6.4 |
-| t15 | records, attachments and `PIPE_INFLIGHT` left behind | Accepted. Records and attachments derived; `PIPE_INFLIGHT` kept as 2 x the threads floor, its property restated, and threads >= processes | §6.4, Q7 |
+| t15 | records, attachments and `PIPE_INFLIGHT` left behind | Accepted. Records and attachments derived; `PIPE_INFLIGHT` kept as 2 x the threads floor, its property restated, and threads >= processes | §6.4, §15 |
 | t16 | the block, not the section, is what the kernel trusts | Accepted. Length from label difference; kernel checks each area inside `[_bss_start, _arena_start)` and pairwise disjoint | §6.7, U2 |
 | t17 | the S3 body omits its grant-record growth | Accepted. Body 1436 B; total 12.0 KiB with records and attachments; "+160 B" corrected to +140 B; `pipe-consume` added | §6.3, 6.4, 6.6 |
 | owner: no fallback | the part matches or the boot stops | `probed`, the presence check and the SRAM layout removed; `esp32s3-r8` a board of its own | §3.1, rule 5.10 |
 | owner: names | one name for one kind of thing | §3.0; every example rewritten; flash is the part's 8 MiB | §3.0, 3.1 |
 | owner: types | devices by type, one process per instance | `type` on devices and declarations; no `boards` or `compatible`; instances named only when ambiguous; priced | §3.1, 4, 5.4, rule 5.11 |
+| t18 | `MAX_HANDLES >= 5 + row bound`, read from capacities, refuses riscv32 and arm64 | Accepted. It is a compile-time assert over the floors only; an image's rows are checked against root's table; the box's cap lists the row bound's 10 | §6.4, §5.3 |
+| t19 | `[41..42]`: one register or two | Accepted. `..=` is inclusive, as in Saw; `..` is refused by name; the builder prints first and last register and bytes | §3.0, §5.3 |
+| t20 | a record name's uniqueness unstated; three reserved range names | Accepted. Three name families per declaration; one device need per type; reserved `default`, `fast`, `slow` and `root`; uniqueness listed for every file | §3.0, rule 4.2 |
+| t21 | a board's default input keyed by a driver's chosen name | Accepted. `[types.<type>] inputs` names a type's board inputs; every driver of the type must take them; a driver default for one is refused; an image override is printed | rules 3.2, 4.6, 4.9 |
+| owner: all recommendations | Nov 14 | Every open question written into its rule; §15 lists the rulings | §15 |
+| owner: SO-105 | per-process limits later | Deferred, one paragraph | rule 7.5 |
 | owner: gate check | check every in-tree `process.toml` against every board | `sosimage check-tree` | rule 4.9, U6 |
 | owner: one set per driver | devices and inputs singular for now | List forms refused by name; the later shape sketched; deferred | rule 4.8, §13 |
 | SO-102 | two boards, ranges, units | Taken as depending on SO-102: `esp32s3-r8`, `psram` at 0x3D00_0000, 16 MiB windows; SO-102 C before U4 | §3.1, 6.5, 14 |
 
-Disputed: nothing in t13 to t17. From revision 4, the lead's premise
+Disputed: nothing in t13 to t21. From revision 4, the lead's premise
 that a free slot is not all zeros stays disputed (§0.1).
