@@ -1,9 +1,9 @@
 # SO-102: the ESP32-S3's PSRAM (design)
 
 For the owner and the adversarial reviewer, before anything is built. This
-is revision 2, written against main at `891909e2`. Nothing in the
-repository was changed. Section 12 answers the reviewer's six threads on
-revision 1.
+is revision 3, written against main at `891909e2`. Nothing in the
+repository was changed. Section 12 answers the reviewer's threads on
+revisions 1 and 2.
 
 It takes in the owner's ruling of Nov 14 on the fallback: a board described
 as having PSRAM brings it up or stops, and the part must match its
@@ -81,19 +81,21 @@ says so.
 3. **One call does the whole controller part, from IRAM, and compares as it
    goes.** Identity is checked before anything is written to the chip, every
    wait is bounded and has its own stop, and nothing in flash runs between
-   the first command and the last restore (§2.2). A build check fails if
-   any piece of that code, its constants, a jump table or a compiler helper
-   lands in flash; it was run against a scratch build and its five mutants
-   (§2.2).
+   the first command and the last restore (§2.2). The smoke reaches every
+   stop, most by a fault-injecting build of the real call (§6.7). A build
+   check fails if any piece of that code, its constants, a jump table or a
+   compiler helper lands in flash; it was run against a scratch build and
+   its five mutants (§2.2).
 4. **No tuning, no clock change, and a contract with whoever changes the
    clock.** The ROM's own boot path leaves SPI0's and SPI1's clocks at
-   divide by 4 (§1.1) and, by its code, the system clock on the crystal.
-   The commands and the cache's PSRAM fills run at a divider this design
-   sets on SPI1 and on SPI0's PSRAM side, aiming at 20 MHz; SPI1's is
-   restored after. ESP-IDF tunes octal PSRAM only above 40 MHz. What the
-   memory-SPI core clock is on the crystal is not in the sources and is
-   read on the part. A later switch to the PLL (SO-103's K4) must come
-   before `hal.memory_init()`, the description names the clock, and S0.3
+   divide by 4 (§1.1) and, by its code, every system-clock field at reset.
+   What the memory-SPI core clock is on the crystal is not in the sources:
+   three readings are open, 40, 80 or 20 MHz (§3.1). Stages P1 and P2 run
+   at divide by 4, 5 to 20 MHz under every reading; P2 times SPI1 reads
+   against SYSTIMER to settle the reading, and the divider for cache fills
+   is then the one giving 20 MHz. ESP-IDF tunes octal PSRAM only above
+   40 MHz. Any clock change (SO-103's K4) must come before
+   `hal.memory_init()`; the description names every clock field, and S0.3
    stops on any difference (§3).
 5. **PSRAM maps at DBUS 0x3D00_0000, 8 MiB** (MMU entries 256 to 383). The
    flash window the HAL accepts shrinks from 32 MiB to 16 MiB. Processes'
@@ -344,8 +346,8 @@ the steps, so:
   entry); Saw prints the line of §5.2 from it and calls `exit_fail`.
 
 `expect` holds the description's facts (the eFuse codes, the vendor, the
-density, the divider word, and the system clock it was chosen for:
-`SOC_CLK_SEL`, `PLL_FREQ_SEL`, `CORE_CLK_SEL`); `result` is the
+density, the divider word, and the system clock it was chosen for: the
+three masked words of §3.3); `result` is the
 record; `last_step` lets the harness kernels of stages P1 and P2 end the
 call after S8 or S9 (S10 still runs). After the call returns, Saw runs
 S14 (the read-back test, from flash, with SPI1 restored and idle) and S15.
@@ -425,11 +427,13 @@ whether chip select 0 can be driven in it. Stop codes are §5.2's.
    `gpio_pad_unhold` clears for pads 22 and up (bit `pad - 21`) must be
    clear for pads 26 and 33 to 37. Stop 0x52.
 3. The system clock must be the one the description's divider was chosen
-   for (§3.3): `SYSTEM_SYSCLK_CONF_REG` (0x600C_0060) `SOC_CLK_SEL` [11:10],
-   `SYSTEM_CPU_PER_CONF_REG` (0x600C_0010) `PLL_FREQ_SEL` bit 2, and
-   `SPI_MEM_CORE_CLK_SEL_REG` (0x6000_30EC) bits [1:0] must each equal the
-   description's (today: 0, 1, 0, the reset values, which P0 confirms).
-   Stop 0x53.
+   for (§3.3), every field that can change it:
+   `SYSTEM_SYSCLK_CONF_REG` (0x600C_0060) masked with 0x0008_0FFF
+   (`SOC_CLK_SEL` [11:10], `PRE_DIV_CNT` [9:0], `CLK_DIV_EN` bit 19),
+   `SYSTEM_CPU_PER_CONF_REG` (0x600C_0010) masked with 0x7 (`PLL_FREQ_SEL`
+   bit 2, `CPUPERIOD_SEL` [1:0]) and `SPI_MEM_CORE_CLK_SEL_REG`
+   (0x6000_30EC) [1:0] must each equal the description's word (today the
+   reset values, `CLK_DIV_EN` as P0 reads it). Stop 0x53.
 4. `SPI_MEM_CMD_REG(1)` must read 0 within the poll bound (S7's
    `wait_idle`). Stop 0x54.
 - If skipped: on a part without in-package PSRAM the next steps would drive
@@ -473,7 +477,8 @@ set the controller would expect ECC bytes the chip does not hold, and S14
 would stop.
 
 **S4. PSRAM clock for cache fills, SPI0.** `SPI_MEM_SRAM_CLK_REG(0)`
-(0x6000_3050) = the description's divider word (§3), encoded as
+(0x6000_3050) = the description's divider word (§3.2: divide by 4 until
+stage P2 has settled the reading, then the 20 MHz divider), encoded as
 `mspi_timing_ll_set_psram_clock` encodes it. `CORE_CLK_SEL` is not written.
 If wrong: too fast fails S14; too slow risks the chip's maximum
 chip-select-low time (§3). CS0: nothing is sent.
@@ -688,131 +693,207 @@ S7.9, each with its own stop.
 
 ### 3.1 What the memory-SPI core clock comes from
 
-- **Two clocks, one divider.** Commands on SPI1 run at
-  `SPI_MEM_CLOCK_REG(1)` (S5.2) and cache fills from PSRAM on SPI0 at
-  `SPI_MEM_SRAM_CLK_REG(0)` (S4); the flash's cache fills run at
+- **Three clocks, their dividers.** Commands on SPI1 run at
+  `SPI_MEM_CLOCK_REG(1)` (S5.2), cache fills from PSRAM on SPI0 at
+  `SPI_MEM_SRAM_CLK_REG(0)` (S4), the flash's cache fills at
   `SPI_MEM_CLOCK_REG(0)`. Each is the MSPI core clock over its divider
   ([IDF] `spi_mem_reg.h`: "f_SPI_CLK = f_MSPI_CORE_CLK/(SPI_MEM_CLKCNT_N+1)",
-  and the same for `SCLKCNT_N`).
-- **The system clock is the PLL:** the MSPI core clock is set by
-  `SPI_MEM_CORE_CLK_SEL` and the PLL's frequency. With the PLL at 480 MHz,
-  `CORE_CLK_SEL` 0, 1, 2, 3 give 80, 120, 160, 240 MHz; at 320 MHz, 0 and 1
-  give 80, 2 gives 160 (`spi_mem_reg.h`, `SPI_MEM_CORE_CLK_SEL`'s
-  description). The PLL's frequency is `SYSTEM_PLL_FREQ_SEL`
-  (`SYSTEM_CPU_PER_CONF_REG` bit 2: 0 = 320 MHz, 1 = 480 MHz; [IDF]
-  `clk_tree_ll.h`, `clk_ll_bbpll_get_freq_mhz`), and the system clock source
-  is `SYSTEM_SOC_CLK_SEL` (`SYSTEM_SYSCLK_CONF_REG` 0x600C_0060 bits [11:10]:
-  0 crystal, 1 PLL, 2 RC_FAST; `clk_ll_cpu_get_src`).
-- **The system clock is the crystal:** the sources read do not say what the
-  MSPI core clock is. `CORE_CLK_SEL`'s description covers only the PLL.
-  ESP-IDF, before it switches the CPU to a source at or below the crystal's
-  frequency, puts MSPI into its low-speed mode (`clk_utils.c`,
+  and the same for `SCLKCNT_N`); the controller's divide-by-1 bit is named
+  `CLK_EQU_SYSCLK` (`SCLK_EQU_SYSCLK` for `SRAM_CLK`).
+- **The fields that set the system clock**, all of them ([IDF]
+  `system_reg.h`, `clk_tree_ll.h`):
+  - `SYSTEM_SYSCLK_CONF_REG` (0x600C_0060): `SOC_CLK_SEL` [11:10] (0
+    crystal, 1 PLL, 2 RC_FAST; `clk_ll_cpu_get_src`), `PRE_DIV_CNT` [9:0]
+    (the crystal's pre-divider, reset 1), `CLK_DIV_EN` bit 19 (read-only),
+    and `CLK_XTAL_FREQ` [18:12] (read-only, the crystal's frequency in MHz,
+    which the ROM's `ets_get_xtal_freq` reads);
+  - `SYSTEM_CPU_PER_CONF_REG` (0x600C_0010): `PLL_FREQ_SEL` bit 2 (0 =
+    320 MHz, 1 = 480 MHz, reset 1; `clk_ll_bbpll_get_freq_mhz`) and
+    `CPUPERIOD_SEL` [1:0] (the CPU's division of the PLL, reset 0);
+  - `SPI_MEM_CORE_CLK_SEL_REG` (0x6000_30EC) [1:0] (reset 0).
+- **On the PLL** the MSPI core clock is set by `CORE_CLK_SEL` and the PLL:
+  at 480 MHz, 0, 1, 2, 3 give 80, 120, 160, 240 MHz; at 320 MHz, 0 and 1
+  give 80, 2 gives 160 (`spi_mem_reg.h`, `SPI_MEM_CORE_CLK_SEL`).
+- **On the crystal** the sources read do not say. `CORE_CLK_SEL`'s
+  description covers only the PLL. ESP-IDF, before switching the CPU to a
+  source at or below the crystal's frequency, puts MSPI into its low-speed
+  mode (`clk_utils.c`,
   `esp_clk_utils_mspi_speed_mode_sync_before_cpu_freq_switching`, S3
-  branch, calling `mspi_timing_change_speed_mode_cache_safe(true)`), which
-  computes its dividers as if the core were 80 MHz (`mspi_timing_config.c`,
-  `FLASH_LOW_SPEED_CORE_CLOCK_MHZ`), and after a switch above the crystal
-  it restores high-speed mode. That treats the switch as a change of the
-  memory-SPI clock, and does not say by how much. Two readings are open: H1,
-  on the crystal the core clock is the crystal's 40 MHz; H2, it stays at a
-  PLL-derived 80 MHz. **Only the part can settle it** (§3.4).
+  branch), whose dividers assume an 80 MHz core (`mspi_timing_config.c`,
+  `FLASH_LOW_SPEED_CORE_CLOCK_MHZ`), and restores high-speed mode after a
+  switch above the crystal: it treats the switch as a change of the
+  memory-SPI clock without saying by how much.
+- **The pre-divider, read two ways.** ESP-IDF's `clk_ll_cpu_get_divider`
+  answers `PRE_DIV_CNT + 1` with no test of bit 19, and
+  `rtc_clk_cpu_freq_to_xtal(freq, div)` writes the field through
+  `clk_ll_cpu_set_divider(div)`. The ROM's `ets_get_xtal_div` (0x4004_5318)
+  answers 1 when bit 19 is clear and `PRE_DIV_CNT + 1` when it is set, and
+  `ets_get_apb_freq` divides the crystal by that when `SOC_CLK_SEL` is 0. So
+  at the reset value 1, ESP-IDF reads the system clock as 40 / 2 = 20 MHz,
+  and the ROM reads it as 20 MHz only if bit 19 is set, else 40 MHz.
 - **What the ROM leaves.** The ROM's literal references to
   `SYSTEM_SYSCLK_CONF_REG` are all in `ets_get_xtal_div`, `ets_set_xtal_div`,
-  `ets_get_xtal_freq` and `ets_get_apb_freq` ([ROM], 0x4004_5318-0x4004_537F),
-  which read it or set the crystal's pre-divider; none sets `SOC_CLK_SEL`.
-  So on direct boot the system clock is presumably the crystal (its reset
-  value 0) and the PLL frequency select its reset value 1 (480 MHz), and
-  this kernel writes neither. A literal search is not proof; P0 reads both.
+  `ets_get_xtal_freq` and `ets_get_apb_freq` ([ROM], 0x4004_5318-0x4004_537F);
+  none sets `SOC_CLK_SEL`. The one call of `ets_set_xtal_div` is in
+  `usb_download_init` (0x4004_38F6, `ets_set_xtal_div(1)`), on the download
+  path, which a flash boot does not take (the reviewer's disassembly; mine
+  agrees that `ets_run_flash_bootloader` is reached from `main` first,
+  0x4004_3AB6). `SYSTEM_CPU_PER_CONF_REG` and `CORE_CLK_SEL` are named
+  nowhere. So at handover every field is presumably at reset: the crystal,
+  `PRE_DIV_CNT` 1, `PLL_FREQ_SEL` 1, `CPUPERIOD_SEL` 0, `CORE_CLK_SEL` 0, and
+  bit 19 whatever the hardware sets. A literal search is not proof; P0
+  reads both words whole.
+- **One observation fits a slow clock**, without proving it: on the owner's
+  part a fixed spin took about half a minute where the emulator (40 MHz)
+  took under a second (ABI.md §11), and SO-77 §6 noted that the reset
+  pre-divider would make the CPU 20 MHz.
+
+**The readings left open, for the MSPI core clock on the crystal:**
+
+- **H1:** the crystal, 40 MHz.
+- **H2:** a PLL-derived 80 MHz, as ESP-IDF's low-speed arithmetic assumes.
+- **H3:** the system clock after the pre-divider: 20 MHz at the reset
+  `PRE_DIV_CNT` 1 if the divide applies (ESP-IDF's reading, or the ROM's
+  with bit 19 set), 40 MHz if it does not (then the same as H1).
+
+Only the part settles which (§3.4).
 
 ### 3.2 The divider, and what it rests on
 
 - **The assumption.** The PSRAM divider is chosen for the system clock that
-  is in force when `hal.memory_init()` runs, and that clock does not change
-  for the life of the image. Today that is the crystal, presumably, because
-  nothing in the tree switches it.
+  is in force when `hal.memory_init()` runs, which does not change for the
+  life of the image (§3.3). Today that is the crystal at the reset
+  pre-divider, presumably.
 - **The target.** 20 MHz, the speed at which ESP-IDF first talks to the chip
   (`mspi_timing_enter_low_speed_mode`: `set_psram_clock(20, ...)`), never
   above 40 MHz, above which ESP-IDF tunes octal PSRAM
   (`MSPI_TIMING_PSRAM_NEEDS_TUNING (MSPI_TIMING_PSRAM_MODULE_CLOCK > 40)`
-  for DTR, `mspi_timing_tuning_configs.h`). On the crystal that is divide by
-  2 under H1 and by 4 under H2.
-- **If a later unit switches to the PLL with this sequence unchanged**
-  (`CORE_CLK_SEL` left 0, so the core becomes 80 MHz at either PLL
-  frequency):
+  for DTR, `mspi_timing_tuning_configs.h`).
 
-  ```
-                       on the crystal        after the switch (core 80 MHz)
-                       H1 (40)   H2 (80)     from H1's divider  from H2's
-  flash, ROM's div 4   10 MHz    20 MHz      20 MHz             20 MHz
-  PSRAM, div for 20    2: 20     4: 20       40 MHz             20 MHz
-  ```
+**Bus speeds on the crystal, by reading and divider** (the flash runs at the
+ROM's divider 4 throughout; the PSRAM divider is the one written by S4 and
+S5):
 
-  Under H1 the PSRAM doubles to 40 MHz, the edge of what ESP-IDF runs
-  untuned, a speed this design never tested; the flash doubles to 20 MHz,
-  the speed of ESP-IDF's own low-speed mode. If the switch also raised
-  `CORE_CLK_SEL` (to 1 at 480 MHz, 120 MHz core), the H1 divider would put
-  the PSRAM at 60 MHz untuned and the flash at 30 MHz: transfers fail, the
-  kernel faults in its next PSRAM or flash access. Under H2 nothing moves
-  unless `CORE_CLK_SEL` does.
+```
+reading           core   flash, div 4   PSRAM div 1   div 2    div 4
+H1 crystal        40     10 MHz         40 MHz        20 MHz   10 MHz
+H2 PLL-derived    80     20 MHz         80 (untuned)  40 MHz   20 MHz
+H3 pre-divided    20      5 MHz         20 MHz        10 MHz    5 MHz
+```
 
-### 3.3 The contract with whoever switches the clock
+- **Before the reading is known: divide by 4.** It gives 5 to 20 MHz under
+  every reading: never above ESP-IDF's untuned limit and never above its own
+  initialization speed. It is also the ROM's flash divider and the reset
+  value of `SRAM_CLK`, so on SPI0 S4's write is then no change at all, and on
+  SPI1 it is the ROM's word too. Stages P1 and P2, which send only
+  mode-register commands and make no cache fill, run at divide by 4.
+- **At 5 MHz (H3)** a mode-register command (command 1 clock, address 2,
+  latency 10 to 20, data 1 or 2) lasts 14 to 25 clocks, 2.8 to 5 us; a
+  32-byte cache line would last 6 to 8 us. So divide by 4 is right for the
+  commands of P1 and P2 and is not taken for cache fills under H3 (§3.4's
+  chip-select-low limit).
+- **Settling the reading** is stage P2's measurement (§3.4). From P3 on, the
+  divider is the one that gives 20 MHz under the reading found: 2 under H1,
+  4 under H2, 1 (`SCLK_EQU_SYSCLK`) under H3 at 20 MHz. It becomes the
+  `esp32s3-r8` description's divider, beside the `[clock]` it was measured
+  under.
 
-Three ways to keep a clock switch and this sequence from disagreeing
+**If a later unit changes the system clock with this sequence unchanged:**
+
+```
+                         crystal (now)    after a switch to the PLL,
+                                          CORE_CLK_SEL 0 (core 80 MHz)
+reading, PSRAM divider   flash  PSRAM     flash    PSRAM
+H1, div 2                10     20        20       40 (the untuned edge)
+H2, div 4                20     20        20       20
+H3, div 1                 5     20        20       80 (untuned: fails)
+```
+
+Raising `CORE_CLK_SEL` as well (1 at 480 MHz: 120 MHz) multiplies every
+right-hand number by 1.5: the flash at 30 MHz and the PSRAM at 60 to 120 MHz,
+which fails. A change that stays on the crystal moves the pre-divider and
+nothing else: setting `PRE_DIV_CNT` to 0 (divide by 1) under H3 doubles both
+clocks, the PSRAM at divide 1 to 40 MHz and the flash to 10 MHz. Every row
+that moves is caught only if the clock check covers the field that moved,
+which is why S0.3 now compares all of them (§3.3).
+
+### 3.3 The contract with whoever changes the clock
+
+Three ways to keep a clock change and this sequence from disagreeing
 silently:
 
-1. **The switch comes first, and the description names the clock.** A
-   clock-switching unit (SO-103's K4) runs in its own seam,
-   `hal.clock_init()`, called by `kmain` before `hal.memory_init()`; nothing
-   after `memory_init` writes `SOC_CLK_SEL`, `PLL_FREQ_SEL` or
-   `CORE_CLK_SEL`. The board description states the three (§4.1's
-   `[clock]`), the PSRAM divider is chosen for them, and S0.3 compares all
-   three with the description before anything is written. Cost: K4 owns the
-   flash's clock across its own switch (it runs from IRAM and shows the
-   ROM's flash divider is valid at the new core clock, which by the table
-   above it is: 20 MHz); a board with Wi-Fi and one without are two
-   descriptions, as the PSRAM boards already are. No run-time change of a
-   PSRAM register ever happens.
+1. **The change comes first, and the description names the clock.** A
+   clock-changing unit (SO-103's K4, or any unit that moves the CPU on the
+   crystal) runs in its own seam, `hal.clock_init()`, called by `kmain`
+   before `hal.memory_init()`; nothing after `memory_init` writes any field
+   of §3.1's list. The board description states every one of them (§4.1's
+   `[clock]`), the PSRAM divider is chosen for them, and S0.3 compares them
+   all with the description before anything is written. Cost: the changing
+   unit owns the flash's clock across its own change (it runs from IRAM and
+   shows the ROM's flash divider is valid at the new core clock: by the
+   table above, 20 MHz after a switch to the PLL at `CORE_CLK_SEL` 0); a
+   board with Wi-Fi and one without are two descriptions, as the PSRAM
+   boards already are. No PSRAM register changes at run time.
 2. **`memory_init` records the clock, and one HAL function owns every later
-   switch.** `hal.set_system_clock()` refuses unless it also rewrites
-   `SRAM_CLK(0)` (and the flash's divider) with the data cache frozen and no
+   change.** `hal.set_system_clock()` refuses unless it also rewrites
+   `SRAM_CLK(0)` and the flash's divider with the data cache frozen and no
    PSRAM access in flight. Cost: a run-time reconfiguration of a live PSRAM
    bus, which ESP-IDF does with a cache freeze and IPC stalls
-   (`mspi_timing_change_speed_mode_cache_safe`); the riskiest operation in
-   either design, done while processes have data in PSRAM.
-3. **The divider is chosen for the PLL case from the start.** Divide by 4
-   (20 MHz at an 80 MHz core) whatever the source. Cost: under H1 the PSRAM
-   runs at 10 MHz until a switch, inside §3.4's chip-select-low worry, and
-   any `CORE_CLK_SEL` above 0 still breaks it silently.
+   (`mspi_timing_change_speed_mode_cache_safe`), done while processes have
+   data in PSRAM.
+3. **One divider for every clock from the start.** Divide by 4, 5 to 20 MHz
+   on the crystal and 20 MHz on the PLL at `CORE_CLK_SEL` 0. Cost: 5 MHz
+   cache fills under H3, outside the chip-select-low worry; and a raised
+   `CORE_CLK_SEL` still breaks it silently.
 
 **Recommended: 1.** It keeps the one-time, before-any-process shape of this
-whole design, and its check is a comparison, not a reconfiguration. The
-stop, at S0.3, before any write:
+whole design, and its check is a comparison, not a reconfiguration. S0.3
+compares, masked, `SYSTEM_SYSCLK_CONF_REG & 0x0008_0FFF` (`SOC_CLK_SEL`,
+`PRE_DIV_CNT`, `CLK_DIV_EN`), `SYSTEM_CPU_PER_CONF_REG & 0x7`
+(`PLL_FREQ_SEL`, `CPUPERIOD_SEL`) and `CORE_CLK_SEL & 0x3` with the
+description's three words. Its stop, before any write:
 
 ```
-0x53 S0.3  SOS-S3: psram stop: system clock SOC_CLK_SEL=0x. PLL_FREQ_SEL=0x.
-           CORE_CLK_SEL=0x., the board's PSRAM divider is for 0x. 0x. 0x.
+0x53 S0.3  SOS-S3: psram stop: clock SYSCLK_CONF=0x........ CPU_PER_CONF=
+           0x........ CORE_CLK_SEL=0x., the board's PSRAM divider is for
+           SYSCLK_CONF&0x80fff=0x........ CPU_PER_CONF&7=0x. CORE_CLK_SEL=0x.
 ```
 
-A rule only a review can hold is still needed: nothing writes the three
-registers after `memory_init`. A runner check can back it: the HAL's sources
-name `SYSTEM_SYSCLK_CONF_REG`, `SYSTEM_CPU_PER_CONF_REG` and
-`SPI_MEM_CORE_CLK_SEL_REG` only in the file that implements `clock_init`
-and in read-only probes.
+The rule that nothing writes those fields after `memory_init` is a review
+rule; a runner check backs it: the HAL's sources name
+`SYSTEM_SYSCLK_CONF_REG`, `SYSTEM_CPU_PER_CONF_REG` and
+`SPI_MEM_CORE_CLK_SEL_REG` (or their addresses) only in the file that
+implements `clock_init` and in read-only probes. A change after
+`memory_init` that slipped past both would not be caught at boot; it would
+show as the next PSRAM stage's clock line differing (§9).
 
-### 3.4 The chip and the speed
+### 3.4 The chip, and settling the reading
 
 - **The chip's maximum chip-select-low time.** A DRAM must refresh, so a
   burst may not hold CS low too long; the figure is in AP Memory's
   datasheet, which I did not read. A 32-byte line costs about 1 + 2 + 10..20
   + 16 = 29..39 clocks (command, address, read latency with and without the
   doubled variable latency, data at two bytes per clock): 1.5..2 us at
-  20 MHz, 3..4 us at 10 MHz; a 64-byte line adds 16 clocks. If the limit is
-  near 4 us, 10 MHz with 64-byte lines is outside it: one more reason for
-  20 MHz, and for P0 reading the line size (`EXTMEM_DCACHE_CTRL_REG`
+  20 MHz, 3..4 us at 10 MHz, 6..8 us at 5 MHz; a 64-byte line adds 16
+  clocks. If the limit is near 4 us, 10 MHz with 64-byte lines and anything
+  at 5 MHz are outside it: the reason cache fills wait for the 20 MHz
+  divider, and for P0 reading the line size (`EXTMEM_DCACHE_CTRL_REG`
   [4:3]). The figure must be read before unit C is briefed.
-- **Measuring the bus clock on the part.** No register reports the MSPI core
-  clock. Stage P1 times one MR read in CCOUNT cycles (a special register,
-  read with no write); with SO-77 U0's CPU clock and the command's known
-  length in SPI clocks, that gives the SPI1 clock, and so H1 or H2.
+- **Settling the reading on the part (stage P2).** No register reports the
+  MSPI core clock, and SO-77 U0's measurement is of the CPU's clock, which
+  is not it. P2, after the MR0 write, times SPI1 reads of the PSRAM's array
+  (command 0x0000, `OPI_PSRAM_SYNC_READ`, 32-bit address, the read dummy of
+  S11, at divide by 4) against SYSTIMER, which counts the crystal at 16 MHz
+  whatever the CPU runs at: 1000 reads of 2 bytes and 1000 of 64 bytes (the
+  most `W0`-`W15` hold). In octal DTR the 62 extra bytes are 31 SPI clocks,
+  so the difference per read is 31 x 4 / f_core: 3.1 us under H1, 1.55 us
+  under H2, 6.2 us under H3 at 20 MHz, factors of two apart. The overhead
+  of the command, which the design cannot count exactly, cancels. If DTR
+  were not in force the extra bytes would take twice as long; but then S8's
+  mode-register reads, which take two bytes on one clock, would already
+  have read garbage and stopped the boot. These reads only read the array;
+  nothing is written. P1 also prints one MR read's length in CCOUNT cycles,
+  for the record only.
 - **A part that fails** a check stops with its line (§5). No retry at
   another speed: that would be guessing.
 
@@ -849,15 +930,22 @@ process = "psram"
 pool = "psram"
 
 [clock]               # the system clock the PSRAM divider is chosen for
-soc_clk_sel = 0       # crystal (SYSTEM_SYSCLK_CONF SOC_CLK_SEL)
-pll_freq_sel = 1      # 480 MHz, the reset value, unused on the crystal
-core_clk_sel = 0      # SPI_MEM_CORE_CLK_SEL
+soc_clk_sel = 0       # SYSCLK_CONF [11:10]: the crystal
+pre_div_cnt = 1       # SYSCLK_CONF [9:0]: the crystal's pre-divider
+clk_div_en = 1        # SYSCLK_CONF bit 19, read-only: the value P0 reads
+pll_freq_sel = 1      # CPU_PER_CONF bit 2: 480 MHz, unused on the crystal
+cpuperiod_sel = 0     # CPU_PER_CONF [1:0]
+core_clk_sel = 0      # SPI_MEM_CORE_CLK_SEL [1:0]
+psram_divider = 4     # SRAM_CLK(0) and CLOCK(1): 4 until P2 settles it
 ```
 
-`[clock]` is new and is this design's proposal to SO-95: the three values
-S0.3 compares, today the reset values P0 is expected to confirm. A board
-that switches to the PLL (SO-103's K4) states the values after its switch,
-and its PSRAM divider is chosen for them (§3.3).
+`[clock]` is new and is this design's proposal to SO-95: every field that
+can change the system clock, which S0.3 compares, and the divider chosen
+for them. The values shown are the reset values; `clk_div_en` is a
+placeholder until P0 reads it, and `psram_divider` becomes 2, 4 or 1 once
+P2 has settled §3.1's reading. A board that changes the clock (SO-103's K4)
+states the values after its change, and its divider is chosen for them
+(§3.3).
 
 `esp32s3`'s file has the first two ranges and `process = "sram"`,
 `pool = "sram"`. No range carries `present = "probed"`: a range is present
@@ -957,9 +1045,10 @@ printed. `0x...` stands for a value read; each line is printed as one line
             and 0x. (AP 3.3 V)
 0x52 S0.2   SOS-S3: psram stop: pads held, RTC_CNTL_DIG_PAD_HOLD =
             0x........, the board needs pads 26 and 33-37 free
-0x53 S0.3   SOS-S3: psram stop: system clock SOC_CLK_SEL=0x.
-            PLL_FREQ_SEL=0x. CORE_CLK_SEL=0x., the board's PSRAM divider
-            is for 0x. 0x. 0x.
+0x53 S0.3   SOS-S3: psram stop: clock SYSCLK_CONF=0x........
+            CPU_PER_CONF=0x........ CORE_CLK_SEL=0x., the board's PSRAM
+            divider is for SYSCLK_CONF&0x80fff=0x........ CPU_PER_CONF&7=0x.
+            CORE_CLK_SEL=0x.
 0x54 S0.4   SOS-S3: psram stop: SPI1 busy before any command,
             SPI_MEM_CMD = 0x........ after 100000 polls
 0x55 S3     SOS-S3: psram stop: SYSCON_SRAM_ACE0_ATTR = 0x........ still
@@ -1170,12 +1259,10 @@ on the part.
 - **MR identity, the MR0 write, each identity stop:** yes, with `-m 4M` and
   `-m 16M` (an 8 MiB eFuse file and a density that disagrees), the quad
   model, and no `-m`; P1, P2.
-- **The bounded waits (0x54, 0x57, 0x59) and the gate re-check (0x58):** not
-  by the device, which completes every command at once and stores `MISC` as
-  written. The poll and the compare are one routine that takes the
-  register's address; a harness kernel runs it against a DRAM word that
-  never reads 0, and against one that reads 0 at once, and asserts each
-  stop line and the C side's short line. Not shown on the part, by design.
+- **The bounded waits (0x54, 0x57, 0x59), the gate checks (0x56, 0x58) and
+  the other stops the device cannot produce:** by a fault-injecting build
+  of the real call, stop by stop, in §6.7. Not shown on the part, by
+  design.
 - **Pad functions, the input bypass, CS1's drive:** no, the IO MUX and the
   GPIO matrix are not modeled; P1.
 - **Octal DTR line mode, dummy cycles, the SPI1 clock:** no, SPI1 transfers
@@ -1191,6 +1278,81 @@ on the part.
   behave as at DRAM addresses (ABI.md §3c, §8); P4.
 - **Processes, stacks and pools in PSRAM:** yes (memory semantics); P6.
 - **Speed, misses, write-back:** no; P5.
+
+### 6.7 How the smoke reaches every stop
+
+**The fault build.** Every register read in `mspi.c` goes through one
+inline accessor. In the kernel it is a plain volatile load. In a harness
+kernel built with `-DSOS_PSRAM_FAULT`, the accessor first consults a DRAM
+record the harness fills in, `sos_psram_fault` = {the step, the command's
+number, the register's address, the value to return, how many times}: when
+the call is at that step and reads that address, it gets the value instead.
+Writes always reach the real register. So the harness runs the whole real
+call, S0 to S12, with one read lied to; nothing in the call is replaced, and
+the exit path after the lie is the real one. Two runner checks keep the
+build honest: `check_iram` applies to the fault build too, and the runner
+refuses to link or emit any non-harness image (a board image, the shipping
+kernel) that defines `sos_psram_fault`.
+
+**Per stop**, with what the harness does and what it asserts beyond the
+stop line and the halt code. "The trace" is §6.4's flash-model trace, which
+must show the ROM's one select and nothing after. "SPI1 restored" is
+asserted by reading `MISC(1)` after the call: the model stores it (§6.2),
+and S10 puts back the value S5 saved. All runs use `-m 8M -global
+ssi_psram.is_octal=true` and the 8 MiB eFuse file unless said.
+
+- **0x50:** no fault; the harness passes a flash address as `expect`.
+  Asserts that no SPI1 register changed (`MISC(1)` as before the call).
+- **0x51:** no fault; no eFuse file, and a second run with a file saying
+  16M. SPI1 untouched.
+- **0x52:** fault: `RTC_CNTL_DIG_PAD_HOLD_REG` read at S0.2 returns pad
+  26's bit. SPI1 untouched.
+- **0x53:** no fault; a harness description whose `pre_div_cnt` is 0 (and a
+  second whose `core_clk_sel` is 1). SPI1 untouched. Unit B first records
+  what the emulator answers for the two SYSTEM words.
+- **0x54:** fault: `CMD(1)` read at S0.4 returns `0x0004_0000` every time.
+  SPI1 untouched, since S5 has not run.
+- **0x55:** fault: `SYSCON_SRAM_ACE0_ATTR_REG` read at S3 returns bit 8 set
+  every time. SPI1 untouched.
+- **0x56:** fault: `MISC(1)` read at S6 returns 0b00. SPI1 restored; the
+  trace shows no select.
+- **0x57:** fault: `CMD(1)` read at S7.1 of command 2 (the MR2/MR3 read)
+  returns busy every time; command 1 ran for real. SPI1 restored; the trace
+  shows no select.
+- **0x58:** fault: `MISC(1)` read at S7.8 of command 1 returns 0b00. SPI1
+  restored; the trace shows no select; and command 1 was not sent, shown by
+  the fault record's count of `W0` reads staying 0.
+- **0x59:** fault: `CMD(1)` read at S7.9 of command 1 returns busy every
+  time (the model has already run the command). Asserts that the C side's
+  short line came first, then the Saw line, and that `MISC(1)` still reads
+  0b01 after the call: CS0 disabled, S10 not run. This is what holds the
+  no-restore exit: its mutation, a call that runs S10 on 0x59, turns the
+  case red.
+- **0x5A:** no fault; the quad model (`-m 8M` alone), and no `-m`. SPI1
+  restored.
+- **0x5B:** fault: `W0` read after command 2 returns MR2 with bit 7 clear.
+  SPI1 restored.
+- **0x5C:** no fault; `-m 4M` and `-m 16M` with the 8 MiB eFuse file. SPI1
+  restored.
+- **0x5D:** fault: `W0` read after the MR0 read-back returns MR0 0x09. SPI1
+  restored.
+- **0x5E:** fault: the read-back of MMU entry 300 returns another page.
+  SPI1 restored (S10 runs before S11).
+- **0x5F:** fault: `EXTMEM_DCACHE_CTRL1_REG` read at S12.3 returns bit 0
+  set. SPI1 restored.
+- **0x60:** no fault in the call; after it returns, the harness rewrites
+  MMU entry 320 to page 0, so the test's second half aliases the first.
+  Emulator only.
+
+**What no run can reach as a real event.** 0x52, 0x55, 0x56, 0x57, 0x58
+and 0x59 are reached only by the fault build, on the emulator, and none is
+expected on a part. Each is still worth its few instructions: 0x56 and 0x58
+are the gate that keeps every command off the flash; 0x54, 0x57 and 0x59
+turn a hung controller, which would otherwise be a silent halt, into a
+line; 0x52 and 0x55 name a board state (a held pad, ECC stuck on) that
+would otherwise surface as a misleading identity or read-back stop. Their
+code paths are tested by the fault build; the hardware conditions behind
+them are read, not tested.
 
 ---
 
@@ -1341,10 +1503,14 @@ SOS-S3: halt pass
 ```
 
 (each wrapped line is one line.) What it decides: whether the eFuse says
-8 MiB AP 3.3 V; the system clock as the ROM leaves it, `sysclk`
-(`SOC_CLK_SEL`), `cpu_per` (`PLL_FREQ_SEL`) and `core_clk_sel`, which are
-the three facts §3.3's description states and S0.3 compares, and which with
-SO-77 U0's clock measurement and P1's command timing fix §3's divider;
+8 MiB AP 3.3 V; the system clock as the ROM leaves it: `sysclk` is the
+whole of `SYSTEM_SYSCLK_CONF_REG`, so it gives `SOC_CLK_SEL`, `PRE_DIV_CNT`,
+`CLK_DIV_EN` (bit 19, which decides how the ROM reads the pre-divider,
+§3.1) and `CLK_XTAL_FREQ`; `cpu_per` is the whole of
+`SYSTEM_CPU_PER_CONF_REG` (`PLL_FREQ_SEL`, `CPUPERIOD_SEL`); with
+`core_clk_sel` these are every field §4.1's `[clock]` states and S0.3
+compares. They do not settle §3.1's reading, which needs P2's measurement;
+P1 and P2 run at divide by 4, safe under every reading;
 `spi1 clock`, `spi0 clock` and `sram_clk`, which the ROM's code says are
 `0x00030103` (§1.1) and this confirms; the data cache's size
 and line; that entries 256..383 are the ROM's flash pages; the pads' state
@@ -1355,8 +1521,9 @@ are 0. Emulator: SPI0, IO MUX and cache words read 0, SPI1 as §1.1, the
 eFuse word 0x88 with the file.
 
 **P1. `psram_identity`.** The bring-up call with `last_step` = S8: S0 to S6
-and S8's reads and checks, then S10. No write to the chip, no SPI0 change,
-no map.
+and S8's reads and checks, then S10. No write to the chip, no map. The
+divider is 4 (§3.2), so the commands run at 5 to 20 MHz whatever the
+reading; S4 and S5 then write the values the ROM already left.
 
 ```
 SOS psram: efuse PSRAM_CAP=0x1 PSRAM_VENDOR=0x1
@@ -1370,11 +1537,10 @@ SOS-S3: halt pass
 ```
 
 The clock line is printed by `memory_init` on every PSRAM stage, after any
-clock switch an image makes (which by §3.3 comes first), so P1 to P7 each
-show the clocks the bus actually ran at. The cycle count is CCOUNT read
-around one command (a special register, read with no write); with the CPU
-clock and the command's length in SPI clocks it gives SPI1's clock and
-settles §3.1's H1 or H2. It is printed, never asserted.
+clock change an image makes (which by §3.3 comes first), so P1 to P7 each
+show the clocks the bus actually ran at; `sysclk` and `cpu_per` are whole
+words. The cycle count is CCOUNT read around one command, for the record;
+it does not settle the reading (P2 does). Printed, never asserted.
 
 Emulator: `MR0=0x09 MR1=0x0d MR2=0x93 MR3=0x20 MR4=0x20 MR8=0x05`. On the
 part MR1 must be 0x0d and MR2 must have bit 7 set and bits [2:0] = 3.
@@ -1383,16 +1549,27 @@ any boot of P2 or a later stage without one; both are expected, and the
 record notes which. Run P1 once after a power cycle and once after P2.
 
 **P2. `psram_mode`.** `last_step` = S9: P1 plus the MR0 write and its
-read-back.
+read-back, at divide by 4; then the measurement of §3.4 that settles the
+memory-SPI clock: a second IRAM entry, `sos_psram_time_reads`, takes the
+gate again (S5, S6), sends 1000 SPI1 reads of 2 bytes and 1000 of 64 bytes
+of the PSRAM's array, timed by SYSTIMER, and restores SPI1 (S10). It reads
+the array and writes nothing to the chip; its SYSTIMER reads write the
+snapshot bit.
 
 ```
 SOS psram: MR0=<v> before, 0x28 written, MR0=0x28 after
+SOS psram: 1000 reads of 2 bytes took <v> ticks, of 64 bytes <v> ticks
+SOS psram: core clock <v> MHz by 31 clocks x 4 per read: H1|H2|H3
 SOS-S3: halt pass
 ```
 
-(`<v>` as in P1; the low six bits; the top two are kept.)
+(`<v>` as in P1; the low six bits; the top two are kept.) The reading
+named on the third line sets the description's `psram_divider` for P3
+onward (§3.2): 2 for H1, 4 for H2, 1 for H3 at 20 MHz. A value far from
+40, 80 or 20 MHz ends the series until understood.
 
-**P3. `psram_word`.** The full call, S0 to S12, then one word: store
+**P3. `psram_word`.** The full call, S0 to S12, at the divider P2 settled
+(20 MHz by its measurement), then one word: store
 0x5aa5c33c at 0x3D00_0000, store to 128 KiB of other PSRAM lines to evict
 it, load it back.
 
@@ -1462,24 +1639,30 @@ runs as README stage 5: a stop leaves nothing behind.
 **A. The read-only probe (small; Sonnet).** `tests/s3_mem_probe.saw` (or a
 section of SO-77's `s3_periph_probe`), its smoke case asserting the
 emulator's values, board stage P0, the results recorded in ABI.md. Proves
-what the part leaves; with SO-77 U0's clock measurement, decides §3's
-divider and the expected `CORE_CLK_SEL`. Can run beside SO-77's U0 now, or
-be part of it.
+what the part leaves and fills in `[clock]`'s fields (`clk_div_en` among
+them). It does not decide the divider: that is P2's measurement (§3.4).
+Can run beside SO-77's U0 now, or be part of it.
 
 **B. The command layer (medium; Sonnet, Opus review of the register
 words).** `hal/xtensa-esp32s3/kernel/mspi.c` under §2.2's rules:
-`sos_psram_bringup` with S0 to S10 (and `last_step`), the record, the
-bounded `wait_idle` taking a register address, the IRAM short line;
-`esp32s3.ld`'s `.iram` gains `*(.literal.iram .text.iram)`. The runner's
-`check_iram` with its five mutations as mutation checks. Harness kernels
-`psram_identity`, `psram_mode` and the wait harness of §6.6. Runner: an arch
-key for extra QEMU arguments, a per-run eFuse file, and the trace assertion
-("the flash model is selected exactly once"). Smoke cases: the identity
-lines; the stops 0x51 to 0x5D that the emulator can reach (§6.6); the trace
-case, whose mutation (the gate removed) turns it red. Board stages P1, P2.
+`sos_psram_bringup` with S0 to S10 (and `last_step`), S0.3's full clock
+compare, the record, the bounded `wait_idle`, the IRAM short line, the
+register accessor with its `SOS_PSRAM_FAULT` variant, and
+`sos_psram_time_reads` for P2; `esp32s3.ld`'s `.iram` gains
+`*(.literal.iram .text.iram)`. The runner's `check_iram` with its five
+mutations as mutation checks, and its refusal of `sos_psram_fault` outside
+harness images. Harness kernels `psram_identity`, `psram_mode` and the
+fault harness of §6.7. Runner: an arch key for extra QEMU arguments, a
+per-run eFuse file, and the trace assertion ("the flash model is selected
+exactly once"). Smoke cases: the identity lines; every stop from 0x50 to
+0x5D as §6.7 reaches it, each with its SPI1-restored assertion; the trace
+case, whose mutation (the gate removed) turns it red; 0x59's case, whose
+mutation (S10 run on 0x59) turns it red. Board stages P1, P2; P2 settles
+the divider for unit C.
 
 **C. The map, the ranges and the board (medium-large; Opus for the spec
-text, Sonnet to build).** S11, S12 in the call; S14, S15 in Saw; the
+text, Sonnet to build; after P2 has settled the divider).** S11, S12 in
+the call, with stops 0x5E, 0x5F reached as §6.7 says; S14, S15 in Saw; the
 `hal.memory_init()` seam in `kernel/main.saw` and a no-op in every HAL,
 with spec text that any clock switch (a `hal.clock_init()`, SO-103's) runs
 before it and nothing writes the three clock registers after it (§3.3), and
@@ -1550,8 +1733,9 @@ this (SO-95 §6.5).
    vendor, MR1's vendor, MR2's good-die bit and density; print MR3's voltage
    bit and the generation without checking them (the emulator's model
    reports 1.8 V where the part's eFuse says 3.3 V).
-4. **The PSRAM clock.** Recommended: 20 MHz, from P0 and SO-77 U0's
-   readings, with no PLL or core-clock change in this work.
+4. **The PSRAM clock.** Recommended: divide by 4 (5 to 20 MHz) for P1 and
+   P2, then 20 MHz by the divider P2's measurement gives, with no change of
+   the system clock in this work.
 5. **The read-back test at every boot.** Recommended: the full 8 MiB, as
    ESP-IDF's default does, priced by P4.
 6. **Root's region.** Recommended: SRAM by default (SO-95 rule 5.10), now a
@@ -1612,11 +1796,18 @@ the runs.
 - `check_iram` ran against a stand-in, not the real `mspi.c`, and against a
   link script shaped like `esp32s3.ld`, not `esp32s3.ld` itself.
 - What the MSPI core clock is while the system clock is the crystal (§3.1,
-  H1 or H2): open until P1 times a command on the part. Until then the
-  divider, and so the PSRAM's and the flash's speeds before and after any
-  PLL switch, are known only in the table of §3.2.
-- That the ROM leaves the system clock on the crystal and the PLL select at
-  480 MHz: inferred from the ROM's literal references (§3.1); P0 reads it.
+  H1, H2 or H3): open until P2 times SPI1 reads on the part. Until then the
+  PSRAM divider for cache fills, and so the PSRAM's and the flash's speeds
+  before and after any clock change, are known only as the tables of §3.2.
+- P2's measurement rests on octal DTR moving two bytes per SPI clock, which
+  S8's passing is the evidence for, and on SYSTIMER counting the crystal at
+  16 MHz on the part (ABI.md §6a probed it on the emulator).
+- That the ROM leaves every clock field at reset: inferred from the ROM's
+  literal references and from `usb_download_init` being the one caller of
+  `ets_set_xtal_div` (§3.1); P0 reads both words whole. Bit 19
+  (`CLK_DIV_EN`) is known only from P0.
+- Whether the mode-register commands of P1 and P2 are inside the chip's
+  chip-select-low limit at 5 MHz (H3): about 3 to 5 us each (§3.2).
 - What the emulator's `esp32s3.soc.clk` answers for the two SYSTEM
   registers S0.3 reads; unit B records it.
 
@@ -1634,7 +1825,9 @@ the runs.
 | t5, P7's first difference | accepted | P7 now expects the eFuse stop (0x51); the density stop is the emulator's. One description fact, the size, sets both expected codes (§9 P7). |
 | t5, MR0 after P2 | accepted | S8 says the read is made at dummy 8 whatever MR0 holds, with `VAR_DUMMY` on, citing ESP-IDF's boot-time read on every boot including after `esp_restart` (read, not run); P1 and P2 expect either value and P1 runs twice. |
 | t6, P4's alias load | accepted | P4 evicts the line before loading at the alias and asserts the value; why is stated (§9 P4). |
-| SO-103 t2, the PLL switch and the MSPI clock | accepted | §3 is rewritten: what the MSPI core clock comes from on the PLL (`spi_mem_reg.h`, `clk_tree_ll.h`) and that on the crystal it is not in the sources (H1, H2, settled by P1's timing); that the ROM sets no `SOC_CLK_SEL` (§3.1); the divider's assumption and the speeds before and after a switch, in numbers (§3.2); three contracts, option 1 recommended, its stop at S0.3 extended to all three registers (§3.3, §5.2); `[clock]` in the description (§4.1); P0 and every PSRAM stage print the clocks (§9). |
+| SO-103 t2, the PLL switch and the MSPI clock | accepted | §3 is rewritten: what the MSPI core clock comes from on the PLL (`spi_mem_reg.h`, `clk_tree_ll.h`) and that on the crystal it is not in the sources (now three readings, settled by P2's timing, t7); that the ROM sets no `SOC_CLK_SEL` (§3.1); the divider's assumption and the speeds before and after a switch, in numbers (§3.2); three contracts, option 1 recommended, its stop at S0.3 extended to all three registers (§3.3, §5.2); `[clock]` in the description (§4.1); P0 and every PSRAM stage print the clocks (§9). |
 | t6, P0 not write-free | accepted | P0 no longer touches SYSTIMER or `intc_init`; the clock measurement is SO-77 U0's. §9 states exactly what every image writes (`_start`'s registers, IRAM, DRAM, UART) and that P0 writes nothing more. |
+| t7, the pre-divider and a third reading (revision 2) | accepted | S0.3 compares every field that can change the system clock, `SYSCLK_CONF & 0x80FFF` (`SOC_CLK_SEL`, `PRE_DIV_CNT`, `CLK_DIV_EN`), `CPU_PER_CONF & 0x7` (`PLL_FREQ_SEL`, `CPUPERIOD_SEL`) and `CORE_CLK_SEL`, each in `[clock]` (§2.3 S0.3, §3.3, §4.1, §5.2). §3.1 gives both readings of the pre-divider (ESP-IDF's `clk_ll_cpu_get_divider`, the ROM's `ets_get_xtal_div` with its bit-19 test, which I re-read in the ROM) and the third reading, H3. §3.2's tables give every reading and divider, before and after a clock change, and the in-crystal pre-divider change. P1 and P2 run at divide by 4, 5 to 20 MHz under every reading; P2 settles the reading by timing SPI1 reads against SYSTIMER, and the divider (2, 4 or 1) is fixed for P3 on (§3.4, §9). Unit A no longer decides the divider. P0's `sysclk` and `cpu_per` are whole words, and the text says they give bit 19 and the pre-divider (§9). One change of plan beside the reviewer's: the reading is settled in P2, not P1, because the measurement reads the array, which needs MR0 set. |
+| t8, which stops the harness reaches (revision 2) | accepted | The wait harness is replaced by a fault-injecting build of the real call: one register accessor, which in a harness build returns an injected value for one read at one step (§6.7). §6.7 lists, for each stop 0x50 to 0x60, what the harness does and what it asserts, including whether SPI1 is restored; 0x59's case asserts the short line first and `MISC(1)` still 0b01 after the call, with the mutation "S10 run on 0x59" as its check. Every stop is reached in the smoke; §6.7 says which are reached only by fault injection and why each is still kept. The runner refuses the fault record outside harness images. |
 
 Nothing in the review is disputed.
