@@ -1307,6 +1307,15 @@ message, minted and donated, and it is never cut. It comes from a pool's
   leaves the child no buffer anywhere in that region and no legal stack top
   in it for a new thread: a `ThreadCreate` with its stack top anywhere in the
   child's own stack is `BadEntry` (§2.7).
+  Storing to bytes a process executes is a launcher's power, by capability
+  flow and not by a check. The two views need a handle on the allocation,
+  and the executable one needs `MapExecute` besides; a process holds neither
+  for its own image unless its launcher gave it one. So `map` does not look
+  for a writable view of bytes its target executes: a launcher that makes
+  one, or gives the child the handle to make one, has chosen to, as it
+  chose the image; a process given neither cannot store to its own code.
+  In the process that executes the bytes, the kernel never stores through
+  such a view itself (§2.2).
 - **The boundary is the dynamic map.** Neither rule governs a process image's
   own executable segments: those arrive through `process_create`'s loader as
   `SegFlag` bits read out of the image, validated by `imgformat.has_sane_perms`
