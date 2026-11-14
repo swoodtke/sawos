@@ -1,5 +1,41 @@
 # SO-93: every kernel access to a process's memory
 
+## Reading this after the copy doors were widened
+
+This audit describes the kernel as SO-93 left it, when each copy door asked
+a window (a range of addresses on the process body) before it asked the
+rows. SO-92's widening removed the windows, so where the tables below say
+"window", `rw_base`, `rw_top`, `ro_base`, `ro_top`, `region_base`,
+`window_holds`, `meets_execute` or `PlacedImage`, read this instead:
+
+- **One rule, decided in one place.** `translate_user` is the buffer rule
+  for both directions (spec §2.2). A buffer lies whole in one non-device
+  row that grants the direction's permission (read for a source, write for
+  a destination), and no row of the process that permits execute grants any
+  of its bytes. Any row serves: a segment the loader recorded, the stack
+  grant, or a row `map` installed.
+- **Execute is asked of the bytes, not the address.** `grants_execute`
+  (which replaced `meets_execute`) compares each executable row's physical
+  range with the buffer's bytes, so a writable view of bytes that are
+  executable at another address is refused on a translating profile.
+- **The doors are alignment and then that rule.** `copy_in_check` and
+  `copy_out_check` ask nothing else. The findings' fixes stand: the write
+  permission is read (F2), and the late doors ask again at the wake, the
+  buffer before any other state (`wake_call_reply`, `resume_call_room`).
+- **A thread's stack top** is asked the destination test for the word below
+  it (`stack_top_ok`), in place of a test against the region.
+- **Not yet true, until the overlap rule lands:** where two rows of one
+  process cover one address on a profile whose hardware lets the first
+  matching region decide, a read-write row recorded after a read-only one
+  is a destination the process cannot store to itself. Spec §2.2 marks the
+  two sentences this touches.
+
+The cases that hold the rule's edges are `buffer_rule` and `buffer_alias`;
+the late doors are held by `late_door_buffer_gone`, `kill_late_door`,
+`late_door_order` and `read_only_row_not_destination` on every profile that
+runs them.
+
+
 Audit of sawos main at `246c5768` (rebased onto `5e948ec9`; the two commits
 between are tracker-only). Every site where the kernel reads or writes a
 process's memory, keeps an address, a length or a translation that came from
