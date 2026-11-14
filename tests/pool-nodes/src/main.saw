@@ -1,0 +1,248 @@
+// A pool's free-list nodes come back to their slab when the pool goes (spec
+// §2.8, §5.9): released, its last handle dropped with nothing out, and
+// donated whole.
+//
+//   SOS poolnodes: the node slab filled
+//   SOS poolnodes: the blob pool, nothing out, two ranges listed: lost=2 units
+//   SOS poolnodes: while the blob pool has them: nodes free=1.
+//   SOS poolnodes: the blob pool released: nodes free=2.
+//   SOS poolnodes: the destination pool, nothing out, two ranges listed:
+//                  lost=2 units
+//   SOS poolnodes: while the destination pool has them: nodes free=1.
+//   SOS poolnodes: the destination pool donated: nodes free=2.
+//
+// The rows are the child's image blob and its destination, both typed as
+// pools, and the RAM pool; the child never runs.
+//
+// # The room in the node slab
+//
+// The node slab has no reader, so its room is counted: the RAM pool makes
+// holes, each a range released with a live separator on both sides, until one
+// is dropped for want of a node. A hole that takes a node raises the pool's
+// `available` by its length and a dropped one leaves it as it was, so the
+// count of holes kept is the room. Counting spends it: the slab is full after
+// every count.
+//
+// Hole `i` and its separator are each `(i + 1) * UNIT` bytes, cut off the
+// frontier: longer than every free range there is, so neither is served from
+// a hole already made. The separators are staged in messages on a connection
+// nobody takes from, after a page of the pool is donated to the Memory slab,
+// so neither the handle table nor the Memory slab is what runs out. A hole is
+// given its node back by allocating its length again: it is the first fit for
+// that length, and an exact one.
+//
+// # A pool with nothing out and nodes on its list
+//
+// Every range a pool frees coalesces, and one that reaches the frontier folds
+// into it, so a pool with nothing out has nodes only when some of its bytes
+// were dropped. Five units are allocated off the pool's frontier; the second
+// and fourth are released while the slab is full and dropped (`lost=2`); room
+// is made for three nodes; the first and third are released onto the list,
+// and the fifth, beside the frontier, takes a node, folds and gives it back.
+// The pool then holds two nodes with the slab one short of full
+// (`nodes free=1`). When the pool goes, its two nodes come back
+// (`nodes free=2`).
+
+import sos.{System, Process, Memory, Pool, PipeInlet, PipeHandles, SlabKind,
+            SosStatus, PIPE_BODY_BYTES, PIPE_MSG_HANDLES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// The unit every length here is a multiple of: a few protection grains on
+/// this profile.
+static UNIT: UInt = 16
+static PAGE: UInt = 0x1000
+
+/// Past every count this case makes, so a count that never ends is a refusal.
+static MAX_HOLES: Int = 64
+
+/// The counters the hole maker and the stash keep.
+struct Counts {
+    /// Handles in the carrier, not yet posted.
+    held: Int,
+    /// The next hole's index.
+    next: Int,
+    /// How many of the kept holes have been allocated again.
+    taken: Int,
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poolnodes: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS poolnodes: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poolnodes: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Post whatever the carrier holds.
+func flush(inlet: &PipeInlet, carrier: &var PipeHandles,
+           counts: &var Counts) -> Result<Void, SosStatus> {
+    if counts.held == 0 {
+        return
+    }
+    let body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try inlet.post_with(body: &body, len: 0, handles: &var carrier)
+    let _ = move claim
+    counts.held = 0
+    return
+}
+
+/// Keep `m` for the rest of the run: into the carrier, posted when it is full.
+func stash(m: Memory, inlet: &PipeInlet, carrier: &var PipeHandles,
+           counts: &var Counts) -> Result<Void, SosStatus> {
+    carrier.put(at: counts.held, memory: move m)
+    counts.held = counts.held + 1
+    if counts.held == PIPE_MSG_HANDLES {
+        try flush(&inlet, &var carrier, &var counts)
+    }
+    return
+}
+
+/// Cut the next hole and the separator above it, keep the separator, release
+/// the hole, and answer whether the free list took it.
+func make_hole(ram: &Pool, kept: &var Vector<Int>, inlet: &PipeInlet,
+               carrier: &var PipeHandles,
+               counts: &var Counts) -> Result<Bool, SosStatus> {
+    let i = counts.next
+    counts.next = i + 1
+    let len = ((i + 1) as UInt) * UNIT
+    let hole = try ram.allocate(len: len)
+    let sep = try ram.allocate(len: len)
+    try stash(move sep, &inlet, &var carrier, &var counts)
+    let before = try ram.available()
+    let _ = move hole
+    let after = try ram.available()
+    if after.total == before.total {
+        return false
+    }
+    if after.total != before.total + len {
+        return BUG
+    }
+    try kept.push(i) catch { return BUG }
+    return true
+}
+
+/// The node slab's room: holes kept before one is dropped.
+func room(ram: &Pool, kept: &var Vector<Int>, inlet: &PipeInlet,
+          carrier: &var PipeHandles,
+          counts: &var Counts) -> Result<Int, SosStatus> {
+    var n = 0
+    while n < MAX_HOLES {
+        let took = try make_hole(&ram, &var kept, &inlet, &var carrier,
+                                 &var counts)
+        if not took {
+            return n
+        }
+        n = n + 1
+    }
+    return BUG
+}
+
+/// Give `n` nodes back: allocate the `n` shortest kept holes again, each an
+/// exact fit, and keep the allocations.
+func make_room(n: Int, ram: &Pool, kept: &Vector<Int>, inlet: &PipeInlet,
+               carrier: &var PipeHandles,
+               counts: &var Counts) -> Result<Void, SosStatus> {
+    var made = 0
+    while made < n {
+        let len = ((kept[counts.taken] + 1) as UInt) * UNIT
+        let m = try ram.allocate(len: len)
+        try stash(move m, &inlet, &var carrier, &var counts)
+        counts.taken = counts.taken + 1
+        made = made + 1
+    }
+    return
+}
+
+/// Leave pool `p` with nothing out and two ranges on its free list. The node
+/// slab is full on entry and one short of full on return.
+func hold_nodes(what: String, p: &Pool, ram: &Pool, kept: &Vector<Int>,
+                inlet: &PipeInlet, carrier: &var PipeHandles,
+                counts: &var Counts) -> Result<Void, SosStatus> {
+    // The table holds the five units and three room-makers at once.
+    try flush(&inlet, &var carrier, &var counts)
+    let fresh = try p.available()
+    let first = try p.allocate(len: UNIT)
+    let second = try p.allocate(len: UNIT)
+    let third = try p.allocate(len: UNIT)
+    let fourth = try p.allocate(len: UNIT)
+    let fifth = try p.allocate(len: UNIT)
+    // Each between two live units, with the slab full: dropped.
+    let _ = move second
+    let _ = move fourth
+    try make_room(3, &ram, &kept, &inlet, &var carrier, &var counts)
+    let _ = move first
+    let _ = move third
+    let _ = move fifth
+    let r = try p.available()
+    print("SOS poolnodes: {}, nothing out, two ranges listed: lost={} units\n",
+          what, (fresh.total - r.total) / UNIT)
+    return
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var blob_rec = try proc.boot_handle_next()
+    var dest_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let blob = blob_rec.take_pool() else { return BUG }
+    guard let dest = dest_rec.take_pool() else { return BUG }
+    guard let ram = ram_rec.take_pool() else { return BUG }
+
+    let slots = try ram.allocate(len: PAGE)
+    try system.slab_donate(kind: SlabKind.Memories, memory: move slots) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let pipe = try proc.pipe_create()
+    let (inlet, outlet) = move pipe
+    var carrier = PipeHandles.none()
+    var counts = Counts(held: 0, next: 0, taken: 0)
+    var kept = try Vector<Int>(capacity: MAX_HOLES) catch { return BUG }
+
+    let _ = try room(&ram, &var kept, &inlet, &var carrier, &var counts)
+    let _ = system.debug_print("SOS poolnodes: the node slab filled\n")
+
+    try hold_nodes("the blob pool", &blob, &ram, &kept, &inlet, &var carrier,
+                   &var counts)
+    let held = try room(&ram, &var kept, &inlet, &var carrier, &var counts)
+    print("SOS poolnodes: while the blob pool has them: nodes free={}.\n",
+          held)
+    let _ = move blob
+    let freed = try room(&ram, &var kept, &inlet, &var carrier, &var counts)
+    print("SOS poolnodes: the blob pool released: nodes free={}.\n", freed)
+
+    try hold_nodes("the destination pool", &dest, &ram, &kept, &inlet,
+                   &var carrier, &var counts)
+    let held_dest = try room(&ram, &var kept, &inlet, &var carrier,
+                             &var counts)
+    print(
+        "SOS poolnodes: while the destination pool has them: nodes free={}.\n",
+        held_dest)
+    try system.slab_donate(kind: SlabKind.Events, pool: move dest) catch {
+        let (why, back) = move error
+        let _ = move back
+        print("SOS poolnodes: the destination pool's donation refused: {}\n",
+              why)
+        return why
+    }
+    let donated = try room(&ram, &var kept, &inlet, &var carrier, &var counts)
+    print("SOS poolnodes: the destination pool donated: nodes free={}.\n",
+          donated)
+    let _ = move outlet
+    return
+}

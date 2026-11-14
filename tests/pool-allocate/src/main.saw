@@ -3,27 +3,26 @@
 // else the front of its frontier) and the handle keeps naming the rest. The
 // transcript reads as three claims:
 //
-//   SOS split: a=170 b=187 a-again=170       <- the pieces are disjoint
+//   SOS poolalloc: a=170 b=187 a-again=170   <- the allocations are disjoint
 //                                               (0xaa, 0xbb, 0xaa; the bytes
 //                                               render as decimal)
-//   SOS split: cuts=20 refused=0             <- a dropped piece returns its
-//                                               slot, so the slab is not what a
-//                                               cursor runs into
-//   SOS split: refused: this pool has no free range that long
+//   SOS poolalloc: rounds=20 refused=0       <- a dropped allocation returns
+//                                               its slot, so the slab is not
+//                                               what a loop runs into
+//   SOS poolalloc: refused: this pool has no free range that long
 //                                            <- an oversize allocation is a
 //                                               status
 //
-// The second line: `CUT_ROUNDS` is more than the slab has slots
-// (`MAX_MEMORIES`), so completing them all with nothing refused is the
-// claim. Each cut mints a region, the wrapper dies at the end of the arm, the
-// release takes its count to zero, and the slot comes straight back for the
-// next round.
+// The second line: `ROUNDS` is more than the slab has slots (`MAX_MEMORIES`),
+// so completing them all with nothing refused is the claim. Each round mints
+// a region, the wrapper dies at the end of the arm, the release takes its
+// count to zero, and the slot comes straight back for the next round.
 //
 // The first line proves the arithmetic. A region has no bounds reader, so "the
-// parent advanced" cannot be observed by asking. It is observed by using both
-// pieces: write 0xaa into the first, 0xbb into the second, read the first
-// again. A parent that had not advanced would hand out the same range twice and
-// the second write would have destroyed the first.
+// frontier advanced" cannot be observed by asking. It is observed by using
+// both allocations: write 0xaa into the first, 0xbb into the second, read the
+// first again. A pool that had not advanced would hand out the same range
+// twice and the second write would have destroyed the first.
 //
 // The maps are what make the writes possible at all. Every address in this
 // program faults until mapped; the pool is memory this image never declared and
@@ -49,16 +48,16 @@ static CHUNK: UInt = 0x1000
 /// annotated `static` because a fixed-width slot is a const position.
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// A length no remaining pool can satisfy: the oversize cut.
+/// A length no remaining pool can satisfy: the oversize allocation.
 static OVERSIZE: UInt = 0x0100_0000
 
-/// How many cut-and-drop rounds the loop runs. Past `MAX_MEMORIES` on purpose:
-/// a run that completes this many rounds with nothing refused is possible only
-/// because a dropped region gives its slot back. It is also far inside the
-/// pool's own supply (many chunks, two of them already cut above), so the
-/// number this loop stops at is the one this program chose and not one the
-/// machine imposed.
-static CUT_ROUNDS: Int = 20
+/// How many allocate-and-drop rounds the loop runs. Past `MAX_MEMORIES` on
+/// purpose: a run that completes this many rounds with nothing refused is
+/// possible only because a dropped region gives its slot back. It is also far
+/// inside the pool's own supply (many chunks, two of them already allocated
+/// above), so the number this loop stops at is the one this program chose and
+/// not one the machine imposed.
+static ROUNDS: Int = 20
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -79,7 +78,7 @@ func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
     let proc = try system.process_self() catch {
-        let _ = system.debug_print("SOS split: no process handle\n")
+        let _ = system.debug_print("SOS poolalloc: no process handle\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -87,74 +86,75 @@ func _start(boot_handle: UInt) {
     // The boot set carries one row: the RAM pool. Its tag is 0 because it is
     // the only row, which is root's config knowing the build's row order.
     var record = try proc.boot_handle_next() catch {
-        print("SOS split: no pool region: {}\n", error)
+        print("SOS poolalloc: no pool region: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     guard let pool = record.take_pool() else {
-        let _ = system.debug_print("SOS split: boot record is not a region\n")
+        let _ = system.debug_print(
+            "SOS poolalloc: boot record is not a region\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
 
     let base = sos_test_pool_base()
 
-    // Cut one. The piece covers `[base, base + CHUNK)` and `pool` now names
-    // everything after it.
+    // Allocation one covers `[base, base + CHUNK)` and the pool's frontier
+    // now begins after it.
     let first = try pool.allocate(len: CHUNK) catch {
-        print("SOS split: first allocation failed: {}\n", error)
+        print("SOS poolalloc: first allocation failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     let _first_map = try proc.map(memory: &first, access: RW) catch {
-        print("SOS split: first map failed: {}\n", error)
+        print("SOS poolalloc: first map failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     poke(base, 0xAA)
 
-    // Cut two, which lands where the cursor now points.
+    // Allocation two, which lands where the cursor now points.
     let second = try pool.allocate(len: CHUNK) catch {
-        print("SOS split: second allocation failed: {}\n", error)
+        print("SOS poolalloc: second allocation failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     let _second_map = try proc.map(memory: &second, access: RW) catch {
-        print("SOS split: second map failed: {}\n", error)
+        print("SOS poolalloc: second map failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     poke(base + CHUNK, 0xBB)
 
     // The disjointness claim, as a value: the first byte is still what it was.
-    print("SOS split: a={} b={} a-again={}\n", peek(base) as Int,
+    print("SOS poolalloc: a={} b={} a-again={}\n", peek(base) as Int,
           peek(base + CHUNK) as Int, peek(base) as Int)
 
-    // A dropped piece returns its slot. `case Ok(_)` binds nothing, so the
-    // region the kernel just minted dies at the end of the arm and its deinit
-    // releases the only handle onto it, which takes the reference count to zero
-    // inside that release, and the slot is free before the next round asks for
-    // one. `CUT_ROUNDS` is past the slab's slots (`MAX_MEMORIES`), so
+    // A dropped allocation returns its slot. `case Ok(_)` binds nothing, so
+    // the region the kernel just minted dies at the end of the arm and its
+    // deinit releases the only handle onto it, which takes the reference count
+    // to zero inside that release, and the slot is free before the next round
+    // asks for one. `ROUNDS` is past the slab's slots (`MAX_MEMORIES`), so
     // `refused=0` is only possible if the recycling is real.
-    var cuts = 0
+    var rounds = 0
     var refused: UInt = 0
-    while cuts < CUT_ROUNDS && refused == 0 {
+    while rounds < ROUNDS && refused == 0 {
         match pool.allocate(len: CHUNK) {
-            case Ok(_) -> { cuts = cuts + 1 },
+            case Ok(_) -> { rounds = rounds + 1 },
             case Err(_) -> { refused = 1 },
         }
     }
-    print("SOS split: cuts={} refused={}\n", cuts, refused)
+    print("SOS poolalloc: rounds={} refused={}\n", rounds, refused)
 
     // An oversize allocation is a status: no free range is that long, and a
     // pool's free state is not something its holder can know in advance.
-    let _ = system.debug_print("SOS split: asking for more than is left\n")
+    let _ = system.debug_print("SOS poolalloc: asking for more than is left\n")
     let _over = try pool.allocate(len: OVERSIZE) catch {
-        print("SOS split: refused: {}\n", error)
+        print("SOS poolalloc: refused: {}\n", error)
         let _ = system.shutdown(EXIT_OK)
         return
     }
 
-    let _ = system.debug_print("SOS split: UNREACHABLE\n")
+    let _ = system.debug_print("SOS poolalloc: UNREACHABLE\n")
     let _ = system.shutdown(EXIT_FAILED)
 }

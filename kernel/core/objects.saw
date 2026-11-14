@@ -900,8 +900,9 @@ public(package) struct MemorySlot {
     /// Pool only: bytes handed out of this pool and not yet returned, the
     /// lengths of the allocations out and of every one donated to the kernel.
     ///
-    /// With `pool_free_bytes` this is §5.9's byte accounting: outstanding here,
-    /// free there. Quotas stay object-counted; bytes are the pool's business.
+    /// With the free list and the frontier this is §5.9's byte accounting:
+    /// outstanding here, free there. Quotas stay object-counted; bytes are the
+    /// pool's business.
     /// It is also the third count in a pool's release condition (see
     /// `memory_release_if_idle`), which keeps an allocation's back-reference
     /// from ever naming a slot that has been given away.
@@ -1031,22 +1032,6 @@ func alloc_free_range() unsafe -> Int {
 /// Give one node back.
 func free_free_range(n: Int) unsafe {
     FREE_RANGES[n] = FreeRange(state: SlotState.Free, base: 0, len: 0, next: 0)
-}
-
-/// The bytes pool `pool` has ready to hand out: its unspent frontier plus every
-/// free range on its list.
-///
-/// `out_bytes` is what is on loan, this is what is home, and `dropped` is what
-/// was lost; together they are §5.9's byte accounting.
-public(package) func pool_free_bytes(pool: Int) unsafe -> UInt {
-    var total = MEMORIES[pool].len
-    var cur = MEMORIES[pool].free_head
-    while cur != 0 {
-        let n = cur - 1
-        total = total + FREE_RANGES[n].len
-        cur = FREE_RANGES[n].next
-    }
-    total
 }
 
 /// The longest part of `[base, base + len)` that starts and ends on multiples

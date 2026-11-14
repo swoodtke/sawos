@@ -1,0 +1,94 @@
+// Installing a region is `Memory.map`'s own right (spec §2.5, §3).
+//
+//   SOS mapright: the full handle maps read-write
+//   SOS mapright: a sibling without Map: rights=1027
+//   SOS mapright: asking for read-write through it
+//   SOS: process fault: access denied
+//
+// The sibling keeps `Transfer`, `Mint` and `MapExecute` and leaves `Map` out,
+// and its rights word, read from the kernel, says it is a live handle that
+// carries exactly those. The mapping it asks for is read-write, so the exec
+// gate has nothing to say: the one right the ask lacks is `Map`. A refused
+// right is a fault, so the refusal is the last thing this program does.
+
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, MemoryRight,
+            SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// One page of the pool, a whole grain on every profile.
+static CHUNK: UInt = 0x1000
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// Every right a `Memory` has but `Map`.
+static ALL_BUT_MAP: UInt32 = (MemoryRight.Transfer | MemoryRight.Mint
+                              | MemoryRight.MapExecute)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mapright: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS mapright: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_pool() else {
+        let _ = system.debug_print("SOS mapright: the record is not a pool\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let page = try pool.allocate(len: CHUNK) catch {
+        print("SOS mapright: allocation failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The control: the same page, through the handle that carries `Map`.
+    let full = try proc.map(memory: &page, access: RW) catch {
+        print("SOS mapright: the full handle's map failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print(
+        "SOS mapright: the full handle maps read-write\n")
+    // Unmapped again, so the ask below meets no row of its own.
+    try full.unmap() catch {
+        print("SOS mapright: unmap failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let narrow = try page.mint(rights: ALL_BUT_MAP) catch {
+        print("SOS mapright: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let word = try narrow.rights() catch {
+        print("SOS mapright: rights failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS mapright: a sibling without Map: rights={}\n", word)
+
+    let _ = system.debug_print(
+        "SOS mapright: asking for read-write through it\n")
+    match proc.map(memory: &narrow, access: RW) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS mapright: UNREACHABLE\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS mapright: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

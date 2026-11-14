@@ -306,11 +306,14 @@ CHILD_OVERSTEPS_PKG = os.path.join(TESTS_DIR, "child-oversteps")
 # a region has no bounds reader, so where a pool is, is a fact the build
 # publishes and the program expects, as the uart-echo driver does with
 # `UART_BASE`.
-MEMORY_SPLIT_PKG = os.path.join(TESTS_DIR, "memory-split")
-# The pool's own cases: its two ops read against each other, its refusals and
-# the rights it hands down (with a child that does one thing to the pool it is
-# given), what holds it, and the typed rows it comes from.
+POOL_ALLOCATE_PKG = os.path.join(TESTS_DIR, "pool-allocate")
+# The pool's own cases: its two ops read against each other, its free list
+# against a model of first fit, the free-list nodes a pool gives back, its
+# refusals and the rights it hands down (with a child that does one thing to
+# the pool it is given), what holds it, and the typed rows it comes from.
 POOL_OPS_PKG = os.path.join(TESTS_DIR, "pool-ops")
+POOL_FIRST_FIT_PKG = os.path.join(TESTS_DIR, "pool-first-fit")
+POOL_NODES_PKG = os.path.join(TESTS_DIR, "pool-nodes")
 POOL_FAULTS_PKG = os.path.join(TESTS_DIR, "pool-faults")
 CHILD_POOL_LEG_PKG = os.path.join(TESTS_DIR, "child-pool-leg")
 POOL_LIFETIME_PKG = os.path.join(TESTS_DIR, "pool-lifetime")
@@ -441,6 +444,7 @@ CHILD_PLACED_PKG = os.path.join(TESTS_DIR, "child-placed")
 CHILD_SHARE_PKG = os.path.join(TESTS_DIR, "child-share")
 MAP_EXEC_GATED_PKG = os.path.join(TESTS_DIR, "map-exec-gated")
 MAP_WX_REFUSED_PKG = os.path.join(TESTS_DIR, "map-wx-refused")
+MAP_NEEDS_MAP_PKG = os.path.join(TESTS_DIR, "map-needs-map")
 # An allocation or a window carries the rights of the handle it came
 # through: a narrowed pool or parent never yields a wider one.
 POOL_KEEPS_RIGHTS_PKG = os.path.join(TESTS_DIR, "pool-keeps-rights")
@@ -690,6 +694,7 @@ IMAGE_HELD_PKG = os.path.join(TESTS_DIR, "image-held")
 FLASH_REGION_PKG = os.path.join(TESTS_DIR, "flash-region")
 IMAGE_ROWS_HELD_PKG = os.path.join(TESTS_DIR, "image-rows-held")
 INPLACE_LAUNCH_PKG = os.path.join(TESTS_DIR, "inplace-launch")
+STACK_ROW_HELD_PKG = os.path.join(TESTS_DIR, "stack-row-held")
 # Initialized writable data, which the loader copies with its bytes; and an
 # empty pool donated.
 DATA_INIT_PKG = os.path.join(TESTS_DIR, "data-init")
@@ -3737,23 +3742,23 @@ TEST_CASES = [
         # no bounds reader, so "the pool advanced" is proven by using two
         # allocations: 0xaa into the first, 0xbb into the second, and the
         # first still 0xaa.
-        "name": "memory_split",
+        "name": "pool_allocate",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
-        "root_pkg": MEMORY_SPLIT_PKG,
+        "root_pkg": POOL_ALLOCATE_PKG,
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
-                       "SOS split: a=170 b=187 a-again=170",
-                       # Twenty cut-and-drop rounds, past `MAX_MEMORIES`,
+                       "SOS poolalloc: a=170 b=187 a-again=170",
+                       # Twenty allocate-and-drop rounds, past `MAX_MEMORIES`,
                        # complete with nothing refused: free-on-last-reference
                        # returns a dropped allocation's slot, so the Memory slab
                        # never runs out here.
-                       "SOS split: cuts=20 refused=0",
-                       "SOS split: asking for more than is left",
+                       "SOS poolalloc: rounds=20 refused=0",
+                       "SOS poolalloc: asking for more than is left",
                        # A length no free range of the pool can serve is a
                        # status, `NoMemory`, and the program carries on.
-                       "SOS split: refused: this pool has no free range that "
-                       "long"],
+                       "SOS poolalloc: refused: this pool has no free range "
+                       "that long"],
         "expect_clean_exit": True,
     },
     {
@@ -3795,6 +3800,79 @@ TEST_CASES = [
                        "SOS poolops: all home: total={pool_bytes} set={grain}",
                        "SOS poolops: a donated allocation stays out: 4096",
                        "SOS poolops: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The free list against a model of first fit (spec §2.5, §5.9), in
+        # pages counted from the pool's base. Root labels every page with its
+        # own number, lays out holes of one, two, three and four pages with a
+        # page between each two and a cap spending the rest, and releases the
+        # holes. Each allocation then lands where the model says (`at`, read
+        # from the label its mapping sees), `available` agrees after each
+        # allocation and release, and `intact=1` says every live allocation
+        # still holds its own marks, so none shares a byte with another. The
+        # remainder of a range longer than the ask is served next at the page
+        # after the allocation, and a release beside it joins it again. The
+        # releases reach a new node at the head and between two nodes, a range
+        # joining the one above, the one below and both, and the fold into
+        # the frontier with a node before it and with none. Then one page
+        # between two live ones is released and allocated again forty times,
+        # past `MAX_FREE_RANGES`, served every time. Then forty rounds of a
+        # page released between two free pages, joining them with a third
+        # range after them on the list, and the joined range cut again: the
+        # third range stays listed and no node is lost. A page and a grain is
+        # `NoMemory` while every free range is a page and the frontier is
+        # spent, and comes off the frontier once it is back. Last, the whole
+        # pool, its ledger back to nothing, is accepted as a donation.
+        "name": "pool_first_fit",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_FIRST_FIT_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS firstfit: labelled, then home: whole=1",
+                       "SOS firstfit: four holes: free=10 largest=4 pages",
+                       "SOS firstfit: five pages: this pool has no free range "
+                       "that long",
+                       "SOS firstfit: two pages, an exact fit between two "
+                       "ranges: at 2 free=8 largest=4 intact=1",
+                       "SOS firstfit: two pages from a range of three: at 5 "
+                       "free=6 largest=4 intact=1",
+                       "SOS firstfit: one page, an exact fit at the head: at 0 "
+                       "free=5 largest=4 intact=1",
+                       "SOS firstfit: one page, what the range of three kept: "
+                       "at 7 free=4 largest=4 intact=1",
+                       "SOS firstfit: one page from a range of four: at 9 "
+                       "free=3 largest=3 intact=1",
+                       "SOS firstfit: released, it joins what its range kept: "
+                       "free=4 largest=4 pages",
+                       "SOS firstfit: a page released at the head: free=5 "
+                       "largest=4 pages",
+                       "SOS firstfit: a page released between two ranges: "
+                       "free=6 largest=4 pages",
+                       "SOS firstfit: two pages released below a range they "
+                       "touch: free=8 largest=4 pages",
+                       "SOS firstfit: a page released between two ranges it "
+                       "touches: free=9 largest=8 pages",
+                       "SOS firstfit: two pages released between two ranges: "
+                       "free=11 largest=8 pages",
+                       "SOS firstfit: a page released between two ranges, "
+                       "three into one: free=12 largest=11 pages",
+                       "SOS firstfit: cap released, the range folds: out=1 "
+                       "short=2 pages",
+                       "SOS firstfit: the last page released: whole=1",
+                       "SOS firstfit: forty exact fits of one page: served=40 "
+                       "last at 1.",
+                       "SOS firstfit: home again: whole=1",
+                       "SOS firstfit: three into one: rounds=40 free=3 "
+                       "largest=1 pages",
+                       "SOS firstfit: a page and a grain, nothing that long: "
+                       "this pool has no free range that long",
+                       "SOS firstfit: a page and a grain, the frontier back: "
+                       "at 7.",
+                       "SOS firstfit: merged and home: whole=1",
+                       "SOS firstfit: the whole pool donated: accepted",
+                       "SOS firstfit: done"],
         "expect_clean_exit": True,
     },
     {
@@ -3934,6 +4012,48 @@ TEST_CASES = [
                        "SOS poolfreed: nothing names it, nothing out: room "
                        "grew by 1",
                        "SOS poolfreed: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A pool's free-list nodes come back to their slab when the pool goes
+        # (spec §2.8, §5.9), read as the node slab's room: how many holes the
+        # RAM pool's free list takes before a release is dropped for want of a
+        # node. The child's image blob and its destination are typed as pools
+        # and the child never runs. Each of the two is left with nothing out
+        # and two ranges on its list, the slab one node short of full
+        # (`nodes free=1`); the blob pool's last handle is then released and
+        # the destination pool donated, and each time the slab has two nodes
+        # free. The room for the two is made by exact fits off the RAM pool's
+        # list, so the case holds those too: an exact fit gives its node
+        # back.
+        #
+        # riscv32 only, for `slab_donate_free_nodes`' reason: filling the node
+        # slab takes as many holes as it has nodes, each cut longer than the
+        # last so first fit cannot serve it from a hole already made, and at
+        # the other profile's grain, a page, they would not fit in the pool.
+        "name": "pool_nodes_home",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_NODES_PKG,
+        "children": [CHILD_BYE_PKG],
+        "pool_blobs": [0],
+        "pool_destinations": [0],
+        "pool": True,
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS poolnodes: the node slab filled",
+                       "SOS poolnodes: the blob pool, nothing out, two ranges "
+                       "listed: lost=2 units",
+                       "SOS poolnodes: while the blob pool has them: nodes "
+                       "free=1.",
+                       "SOS poolnodes: the blob pool released: nodes free=2.",
+                       "SOS poolnodes: the destination pool, nothing out, two "
+                       "ranges listed: lost=2 units",
+                       "SOS poolnodes: while the destination pool has them: "
+                       "nodes free=1.",
+                       "SOS poolnodes: the destination pool donated: nodes "
+                       "free=2.",
+                       "SOS poolnodes: done"],
         "expect_clean_exit": True,
     },
     {
@@ -4909,6 +5029,27 @@ TEST_CASES = [
                        "SOS: process teardown handles={eleven} threads={one} "
                        "events={zero} waiters={zero} interrupts={zero} "
                        "timers={zero} process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # Installing a region is `Memory.map`'s own right (spec §2.5, §3).
+        # Root maps a page read-write through its full handle and unmaps it,
+        # then mints a sibling keeping every right but `Map`: its word is
+        # `Transfer | Mint | MapExecute` (1027). Read-write through it asks
+        # no execute, so the one right missing is `Map`, and the ask is an
+        # `AccessDenied` fault, the case's last line.
+        "name": "map_needs_map",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_NEEDS_MAP_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS mapright: the full handle maps read-write",
+                       "SOS mapright: a sibling without Map: rights=1027",
+                       "SOS mapright: asking for read-write through it",
+                       "SOS: process fault: access denied",
+                       "SOS: process teardown"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
     },
@@ -8457,6 +8598,34 @@ TEST_CASES = [
                        "out of kernel objects",
                        "SOS-H",
                        "SOS inplacelaunch: the child exited from its image"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A destination held by nothing but its child's stack row (spec §2.5,
+        # §5.6, §2.10). The child is used in place in its blob, so its only
+        # row in its destination is the stack grant. Root allocates the
+        # destination off the destination row, typed as a pool, creates the
+        # child in it and releases its only handle before the start: the pool
+        # reports what it did while the allocation was out (`held=1`), the
+        # row being a reference on it. After the child's death the pool is
+        # whole again. Used in place only where the board does that.
+        "name": "stack_row_held",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": STACK_ROW_HELD_PKG,
+        "child_asm": "child_inplace.S",
+        "pool_destinations": [0],
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS stackheld: a child in its destination, the handle "
+                       "released",
+                       "SOS stackheld: while the child lives, its destination "
+                       "held=1",
+                       "SOS-H",
+                       "SOS stackheld: the child exited from its image",
+                       "SOS stackheld: after its death the destination came "
+                       "home=1",
+                       "SOS stackheld: done"],
         "expect_clean_exit": True,
     },
     {

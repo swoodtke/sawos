@@ -1,0 +1,507 @@
+// A pool's free list against a model of first fit (spec §2.5, §5.9): an
+// allocation is the front of the lowest free range that holds it, a range
+// longer than the ask keeps the rest where it was, a released range coalesces
+// with the free ranges it touches, and one that reaches the frontier folds
+// back into it.
+//
+//   SOS firstfit: labelled, then home: whole=1
+//   SOS firstfit: four holes: free=10 largest=4 pages
+//   SOS firstfit: five pages: <NoMemory>
+//   SOS firstfit: two pages, an exact fit between two ranges: at 2 free=8
+//                 largest=4 intact=1
+//   SOS firstfit: two pages from a range of three: at 5 free=6 largest=4
+//                 intact=1
+//   SOS firstfit: one page, an exact fit at the head: at 0 free=5 largest=4
+//                 intact=1
+//   SOS firstfit: one page, what the range of three kept: at 7 free=4
+//                 largest=4 intact=1
+//   SOS firstfit: one page from a range of four: at 9 free=3 largest=3
+//                 intact=1
+//   SOS firstfit: released, it joins what its range kept: free=4 largest=4
+//                 pages
+//   ... one line per release, then:
+//   SOS firstfit: cap released, the range folds: out=1 short=2 pages
+//   SOS firstfit: the last page released: whole=1
+//   SOS firstfit: forty exact fits of one page: served=40 last at 1.
+//   SOS firstfit: home again: whole=1
+//   SOS firstfit: three into one: rounds=40 free=3 largest=1 pages
+//   SOS firstfit: a page and a grain, nothing that long: <NoMemory>
+//   SOS firstfit: a page and a grain, the frontier back: at 7.
+//   SOS firstfit: merged and home: whole=1
+//   SOS firstfit: the whole pool donated: accepted
+//
+// Every number is in pages and every place is a page of the pool counted from
+// its base. A pool has no bounds reader, so the program learns where an
+// allocation landed from the bytes: before anything else it allocates the
+// whole pool, writes each page's own number into the page's first word (its
+// label), and gives it back. The kernel does not clear what it hands out, so
+// the label read through an allocation's mapping is the page it begins at,
+// and an allocation that begins off a page reads no label at all (`at -1`).
+//
+// The layout is thirteen pages: four holes, of one, two, three and four
+// pages, with a page between each two, and above them a cap that spends the
+// rest of the pool, so the frontier is empty and every free range is one the
+// model names. Each allocation writes its own number into the second word of
+// each of its pages, and after each one every live allocation is read back
+// through its own mapping: `intact=1` says each still holds its labels and its
+// marks, so no two live allocations share a byte.
+//
+// The allocations take an exact fit between two ranges, two pages off the
+// front of the range of three, an exact fit at the head, the page the range
+// of three kept, and a page off the front of the range of four. The releases
+// then reach each way a range comes home: joining the free range above it,
+// a new node at the head of the list and between two nodes, joining the range
+// below and the range above, joining both, and folding into the frontier with
+// a node before it on the list and with none.
+//
+// The exact fits come last, repeated: one page released between two live
+// pages and allocated again, more rounds than `MAX_FREE_RANGES`. Each release
+// takes a free-list node and each exact fit gives it back, so the node slab
+// never runs out and every round is served the same page.
+//
+// Then seven pages and a cap: pages 1, 3 and 5 free, page 2 between the first
+// two. Each round releases page 2, which joins pages 1 to 3 into one range
+// and gives the node of the range above it back, with page 5's range still
+// after it on the list; then pages 1 and 2 are allocated off the joined
+// range's front and page 1 is released again. A round that lost the node, or
+// the range after it, would show in `free` or run the slab out. With every
+// free range a page long and the frontier spent, a page and a grain is
+// `NoMemory`; with the cap released it comes off the frontier at page 7.
+//
+// Last, the whole pool is donated, which a pool with anything on its loan
+// ledger is refused: its ledger came back to nothing.
+
+import sos.{System, Process, Memory, Pool, PoolAvailable, Mapping, MapAccess,
+            SlabKind, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// A page's label is this in the high half and its number in the low half.
+static LABEL: UInt32 = 0x7A6E_0000
+static LABEL_MASK: UInt32 = 0xFFFF_0000
+
+/// What `page_of` answers for a word that is not a label.
+static NO_LABEL: Int = -1
+
+/// The pages the layout uses below the cap.
+static WORK: Int = 13
+
+/// More than `MAX_FREE_RANGES`, the node slab's floor: a release that leaked
+/// its node every round would run the slab out before the last.
+static ROUNDS: Int = 40
+
+/// More than the allocations live at once.
+static MAX_LIVE: Int = 12
+
+// The allocations, by the number each writes into its pages.
+static H1: UInt32 = 1
+static S2: UInt32 = 2
+static H2: UInt32 = 3
+static S3: UInt32 = 4
+static H3: UInt32 = 5
+static S4: UInt32 = 6
+static H4: UInt32 = 7
+static CAP: UInt32 = 8
+static X1: UInt32 = 11
+static X2: UInt32 = 12
+static X3: UInt32 = 13
+static X4: UInt32 = 14
+static X5: UInt32 = 15
+static BELOW: UInt32 = 21
+static HOLE: UInt32 = 22
+static ABOVE: UInt32 = 23
+static REST: UInt32 = 24
+static LOW: UInt32 = 31
+static GAP1: UInt32 = 32
+static GAP2: UInt32 = 33
+static WALL: UInt32 = 34
+static GAP3: UInt32 = 35
+static HIGH: UInt32 = 36
+static TOP: UInt32 = 37
+
+/// One live allocation: its number, the page its label named when it was
+/// allocated, and its length.
+struct Meta {
+    id: UInt32,
+    at: Int,
+    pages: Int,
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS firstfit: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS firstfit: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS firstfit: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func read_word(addr: UInt) unsafe -> UInt32 {
+    UnsafeMemory<UInt32, Normal>(addr).read()
+}
+
+func write_word(addr: UInt, value: UInt32) unsafe {
+    UnsafeMemory<UInt32, Normal>(addr).write(value)
+}
+
+func flag(b: Bool) -> UInt {
+    if b { 1 } else { 0 }
+}
+
+/// The page number the label at `addr` names, or `NO_LABEL`.
+func page_of(addr: UInt) -> Int {
+    let w = read_word(addr)
+    if (w & LABEL_MASK) != LABEL {
+        return NO_LABEL
+    }
+    (w & ~LABEL_MASK) as Int
+}
+
+/// Whether the bytes at `base` are allocation `meta`'s: each page carries the
+/// label of the page the allocation began at counted on, and its number.
+func holds(base: UInt, meta: Meta) -> Bool {
+    if meta.at == NO_LABEL {
+        return false
+    }
+    var i = 0
+    while i < meta.pages {
+        let at = base + (i as UInt) * PAGE
+        if read_word(at) != (LABEL | ((meta.at + i) as UInt32)) {
+            return false
+        }
+        if read_word(at + 4) != meta.id {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// What `allocate(len:)` answers, as a status: `Ok` when it served one, which
+/// is released again at once.
+func answer(pool: &Pool, len: UInt) -> SosStatus {
+    match pool.allocate(len: len) {
+        case Ok(_) -> SosStatus.Ok,
+        case Err(why) -> why,
+    }
+}
+
+/// Allocate `len` bytes, the whole pool, write each page's label, and give it
+/// back.
+func label(proc: &Process, pool: &Pool, len: UInt) -> Result<Void, SosStatus> {
+    let all = try pool.allocate(len: len)
+    let mapping = try proc.map(memory: &all, access: RW)
+    let base = try mapping.base()
+    let pages = (len / PAGE) as Int
+    var i = 0
+    while i < pages {
+        write_word(base + (i as UInt) * PAGE, LABEL | (i as UInt32))
+        i = i + 1
+    }
+    try mapping.unmap()
+    return
+}
+
+/// Write `id` into the second word of each of `m`'s `pages`, and answer the
+/// page its label names.
+func stamp(proc: &Process, m: &Memory, pages: Int,
+           id: UInt32) -> Result<Int, SosStatus> {
+    let mapping = try proc.map(memory: &m, access: RW)
+    let base = try mapping.base()
+    let at = page_of(base)
+    var i = 0
+    while i < pages {
+        write_word(base + (i as UInt) * PAGE + 4, id)
+        i = i + 1
+    }
+    try mapping.unmap()
+    return at
+}
+
+/// The page `m`'s label names.
+func where_is(proc: &Process, m: &Memory) -> Result<Int, SosStatus> {
+    let mapping = try proc.map(memory: &m, access: RW)
+    let base = try mapping.base()
+    let at = page_of(base)
+    try mapping.unmap()
+    return at
+}
+
+/// Allocate `pages` pages as allocation `id`, stamp it, keep it, and answer
+/// the page it begins at.
+func take(proc: &Process, pool: &Pool, pages: Int, id: UInt32,
+          mems: &var Vector<Memory>,
+          metas: &var Vector<Meta>) -> Result<Int, SosStatus> {
+    let m = try pool.allocate(len: (pages as UInt) * PAGE)
+    let at = try stamp(&proc, &m, pages, id)
+    try mems.push(move m) catch { return BUG }
+    try metas.push(Meta(id: id, at: at, pages: pages)) catch { return BUG }
+    return at
+}
+
+/// Release allocation `id`.
+func release(id: UInt32, mems: &var Vector<Memory>,
+             metas: &var Vector<Meta>) -> Result<Void, SosStatus> {
+    var k = 0
+    while k < metas.len() {
+        if metas[k].id == id {
+            let last = mems.len() - 1
+            mems.swap(k, last)
+            metas.swap(k, last)
+            let gone = mems.pop()
+            let _ = move gone
+            let _ = metas.pop()
+            return
+        }
+        k = k + 1
+    }
+    return BUG
+}
+
+/// 1 when every live allocation still holds its own labels and marks, read
+/// through its own mapping.
+func intact(proc: &Process, mems: &Vector<Memory>,
+            metas: &Vector<Meta>) -> Result<UInt, SosStatus> {
+    var k = 0
+    while k < mems.len() {
+        let meta = metas[k]
+        let mapping = try proc.map(memory: &mems[k], access: RW)
+        let base = try mapping.base()
+        let theirs = holds(base, meta)
+        try mapping.unmap()
+        if not theirs {
+            return 0
+        }
+        k = k + 1
+    }
+    return 1
+}
+
+/// Allocate, and print where it landed, what the pool then reports and
+/// whether every live allocation is intact.
+func step(what: String, proc: &Process, pool: &Pool, pages: Int, id: UInt32,
+          mems: &var Vector<Memory>,
+          metas: &var Vector<Meta>) -> Result<Void, SosStatus> {
+    let at = try take(&proc, &pool, pages, id, &var mems, &var metas)
+    let r = try pool.available()
+    let kept = try intact(&proc, &mems, &metas)
+    print("SOS firstfit: {}: at {} free={} largest={} intact={}\n", what, at,
+          r.total / PAGE, r.largest / PAGE, kept)
+    return
+}
+
+/// Release, and print what the pool then reports.
+func give_back(what: String, pool: &Pool, id: UInt32,
+               mems: &var Vector<Memory>,
+               metas: &var Vector<Meta>) -> Result<Void, SosStatus> {
+    try release(id, &var mems, &var metas)
+    let r = try pool.available()
+    print("SOS firstfit: {}: free={} largest={} pages\n", what, r.total / PAGE,
+          r.largest / PAGE)
+    return
+}
+
+/// 1 when a report is the fresh pool's.
+func is_fresh(r: &PoolAvailable, fresh: &PoolAvailable) -> UInt {
+    flag(r.total == fresh.total && r.largest == fresh.largest)
+}
+
+/// Allocate the merged range's first two pages, keep the second and release
+/// the first.
+func split_again(pool: &Pool) -> Result<Memory, SosStatus> {
+    let front = try pool.allocate(len: PAGE)
+    let second = try pool.allocate(len: PAGE)
+    let _ = move front
+    return move second
+}
+
+/// Three ranges into one, again and again, and an ask a grain longer than
+/// every free range.
+func merges(proc: &Process, pool: &Pool, fresh: &PoolAvailable,
+            mems: &var Vector<Memory>,
+            metas: &var Vector<Meta>) -> Result<Void, SosStatus> {
+    let set = fresh.granularities
+    let grain = set & ~(set - 1)
+    // Pages 0 to 6 one each, and the rest from 7.
+    let _ = try take(&proc, &pool, 1, LOW, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 1, GAP1, &var mems, &var metas)
+    var mid: Memory? = try pool.allocate(len: PAGE)
+    let _ = try take(&proc, &pool, 1, GAP2, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 1, WALL, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 1, GAP3, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 1, HIGH, &var mems, &var metas)
+    let _ = try take(&proc, &pool, ((fresh.total / PAGE) as Int) - 7, TOP,
+                     &var mems, &var metas)
+    try release(GAP1, &var mems, &var metas)
+    try release(GAP2, &var mems, &var metas)
+    try release(GAP3, &var mems, &var metas)
+
+    // Page 2 released between the free pages 1 and 3 joins them, with page
+    // 5's range after them on the list; pages 1 and 2 are allocated again
+    // off the joined range's front, and page 1 released.
+    var rounds = 0
+    var going = true
+    while going && rounds < ROUNDS {
+        let gone = mid.take()
+        let _ = move gone
+        match split_again(&pool) {
+            case Ok(m) -> {
+                mid = move m
+                rounds = rounds + 1
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    let r = try pool.available()
+    print("SOS firstfit: three into one: rounds={} free={} largest={} pages\n",
+          rounds, r.total / PAGE, r.largest / PAGE)
+
+    // Three free pages, the frontier spent, then the frontier back.
+    print("SOS firstfit: a page and a grain, nothing that long: {}\n",
+          answer(&pool, PAGE + grain))
+    try release(TOP, &var mems, &var metas)
+    let long = try pool.allocate(len: PAGE + grain)
+    let at = try where_is(&proc, &long)
+    print("SOS firstfit: a page and a grain, the frontier back: at {}.\n", at)
+    let _ = move long
+
+    let last = mid.take()
+    let _ = move last
+    try release(WALL, &var mems, &var metas)
+    try release(HIGH, &var mems, &var metas)
+    try release(LOW, &var mems, &var metas)
+    let home = try pool.available()
+    print("SOS firstfit: merged and home: whole={}\n", is_fresh(&home, &fresh))
+    return
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let fresh = try pool.available()
+    try label(&proc, &pool, fresh.total)
+    let labelled = try pool.available()
+    print("SOS firstfit: labelled, then home: whole={}\n",
+          is_fresh(&labelled, &fresh))
+
+    var mems = try Vector<Memory>(capacity: MAX_LIVE) catch { return BUG }
+    var metas = try Vector<Meta>(capacity: MAX_LIVE) catch { return BUG }
+
+    // Pages 0, 1, 2-3, 4, 5-7, 8, 9-12 and the cap from 13, all off the
+    // frontier in order.
+    let _ = try take(&proc, &pool, 1, H1, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 1, S2, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 2, H2, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 1, S3, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 3, H3, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 1, S4, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 4, H4, &var mems, &var metas)
+    let rest = ((fresh.total / PAGE) as Int) - WORK
+    let _ = try take(&proc, &pool, rest, CAP, &var mems, &var metas)
+
+    // Released in address order, each a node at the tail of the list.
+    try release(H1, &var mems, &var metas)
+    try release(H2, &var mems, &var metas)
+    try release(H3, &var mems, &var metas)
+    try release(H4, &var mems, &var metas)
+    let holes = try pool.available()
+    print("SOS firstfit: four holes: free={} largest={} pages\n",
+          holes.total / PAGE, holes.largest / PAGE)
+    print("SOS firstfit: five pages: {}\n", answer(&pool, 5 * PAGE))
+
+    try step("two pages, an exact fit between two ranges", &proc, &pool, 2,
+             X1, &var mems, &var metas)
+    try step("two pages from a range of three", &proc, &pool, 2, X2, &var mems,
+             &var metas)
+    try step("one page, an exact fit at the head", &proc, &pool, 1, X3,
+             &var mems, &var metas)
+    try step("one page, what the range of three kept", &proc, &pool, 1, X4,
+             &var mems, &var metas)
+    try step("one page from a range of four", &proc, &pool, 1, X5, &var mems,
+             &var metas)
+
+    try give_back("released, it joins what its range kept", &pool, X5,
+                  &var mems, &var metas)
+    try give_back("a page released at the head", &pool, X3, &var mems,
+                  &var metas)
+    try give_back("a page released between two ranges", &pool, X4, &var mems,
+                  &var metas)
+    try give_back("two pages released below a range they touch", &pool, X2,
+                  &var mems, &var metas)
+    try give_back("a page released between two ranges it touches", &pool, S4,
+                  &var mems, &var metas)
+    try give_back("two pages released between two ranges", &pool, X1,
+                  &var mems, &var metas)
+    try give_back("a page released between two ranges, three into one",
+                  &pool, S3, &var mems, &var metas)
+
+    try release(CAP, &var mems, &var metas)
+    let folded = try pool.available()
+    print(
+        "SOS firstfit: cap released, the range folds: out={} short={} pages\n",
+        (fresh.total - folded.total) / PAGE,
+        (fresh.total - folded.largest) / PAGE)
+    try release(S2, &var mems, &var metas)
+    let home = try pool.available()
+    print("SOS firstfit: the last page released: whole={}\n",
+          is_fresh(&home, &fresh))
+
+    // One page between two live ones, released, then allocated and released
+    // again round after round.
+    let _ = try take(&proc, &pool, 1, BELOW, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 1, HOLE, &var mems, &var metas)
+    let _ = try take(&proc, &pool, 1, ABOVE, &var mems, &var metas)
+    let _ = try take(&proc, &pool, ((fresh.total / PAGE) as Int) - 3, REST,
+                     &var mems, &var metas)
+    try release(HOLE, &var mems, &var metas)
+    var served = 0
+    var last = NO_LABEL
+    var going = true
+    while going && served < ROUNDS {
+        match pool.allocate(len: PAGE) {
+            case Ok(m) -> {
+                let page = move m
+                last = try where_is(&proc, &page)
+                served = served + 1
+            },
+            case Err(_) -> { going = false },
+        }
+    }
+    print(
+        "SOS firstfit: forty exact fits of one page: served={} last at {}.\n",
+        served, last)
+    try release(BELOW, &var mems, &var metas)
+    try release(REST, &var mems, &var metas)
+    try release(ABOVE, &var mems, &var metas)
+    let again = try pool.available()
+    print("SOS firstfit: home again: whole={}\n", is_fresh(&again, &fresh))
+
+    try merges(&proc, &pool, &fresh, &var mems, &var metas)
+
+    try system.slab_donate(kind: SlabKind.Events, pool: move pool) catch {
+        let (why, back) = move error
+        let _ = move back
+        print("SOS firstfit: the whole pool's donation refused: {}\n", why)
+        return why
+    }
+    let _ = system.debug_print(
+        "SOS firstfit: the whole pool donated: accepted\n")
+    return
+}
