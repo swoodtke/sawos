@@ -1635,7 +1635,8 @@ of the process or its record.
 `EventCreate`, `WaiterCreate` and `PipeCreate`, then `ThreadSelf`, `Exit`,
 `GetStatus` (on `Wait`), `Start`, `BootHandleNext` (on `BootHandles`), `Give`,
 `Kill` (§8), `Stats`, `RestrictRights` and `Ceiling` (on
-`Stats`; both below).
+`Stats`; both below). `QuotaSet` and `QuotaGet` (on `Stats`) set and read the
+named process's quota rows (below; not yet enforced: quota-door).
 `ProcessRight.Map` is the target-side right `MemoryOp.Map` and `IoMemoryOp.Map`
 spend (§2.5). Creating a process is not an op on this object:
 `ProcessCreate` is on System, because a process is a machine-wide resource
@@ -1691,7 +1692,8 @@ pid, mint the observe set, below), named for its ops
 throughout: `ThreadCreate`, `ThreadSelf`, `Exit`, `Wait`, `EventCreate`,
 `WaiterCreate`, `Start`, `BootHandles`, `Give`, `Map`,
 `PipeCreate`, `Stats`, `RestrictRights` (below) and `Kill` (§8), plus the
-universal `Transfer | Mint`. A launcher keeps the child's
+universal `Transfer | Mint`. It also carries `QuotaSet`
+(below; not yet enforced: quota-door). A launcher keeps the child's
 handle — it is what supervises with — and the child derives its own authority
 from the masked System handle it was given (§12), so supervision and
 self-management are not alternatives.
@@ -1700,10 +1702,11 @@ supervisor may be handed a sibling that learns whether its child is alive and
 may not watch it work.
 
 **The observe set** is `ProcessRight.Wait | ProcessRight.Stats`: enough to
-learn that a process died and how, what it cost, what its pid is and what its
-rights ceilings are (`ProcessOp.Ceiling` is gated by `Stats`, below), and
-nothing that acts on it or moves the handle on; it never carries
-`ProcessRight.Kill` (§8). The kernel mints it for a
+learn that a process died and how, what it cost, what its pid is, what its
+rights ceilings are (`ProcessOp.Ceiling` is gated by `Stats`, below) and what
+its quota rows are (`ProcessOp.QuotaGet`, below;
+not yet enforced: quota-door), and nothing that acts on it or moves the
+handle on; it never carries `ProcessRight.Kill` (§8). The kernel mints it for a
 Process handle that comes from no creation, no `ProcessSelf` and no give: the
 sender handle (§2.1), capped like every mint by the Process ceiling of the
 table it lands in, which is the caller's (below). The process walk and the
@@ -1787,6 +1790,54 @@ child's Process ceiling, which caps the Process handle the child derives through
 - **No relation is recorded.** The kernel keeps no parent or child (§5.3):
   inheritance happens once, at the create, and a spawn service that wants a
   process tree records one itself, keyed by pid.
+
+**Quota rows** (not yet enforced: quota-door). A launcher may set a child's
+quota rows (§2.9) after the create and before the start, through its handle on
+the child. A process never sets its own, and nobody sets a row once its process
+has started.
+
+- **Setting.** `ProcessOp.QuotaSet(kind, limit)` sets the named process's
+  limit for one `QuotaKind` and leaves what it has used as it is. It is gated
+  by `ProcessRight.QuotaSet` on the handle used, which the default set
+  carries, and it acts on the named process, which must be `Created`.
+- **A row is a cap on one process, not a budget.** Nothing is taken from the
+  caller's row and nothing comes back to it when the child dies, so a
+  launcher may give every child it makes a row as large as its own. What
+  bounds them together is the slab, which answers `NoResource` past its
+  capacity (§2.9's policy first).
+- **The bound.** A limit is a number below the unlimited sentinel
+  (`QUOTA_UNLIMITED`, the largest value a row holds), which only root's rows
+  carry (§2.9). For every kind but `Mapping`, a limit is at most the caller's
+  own limit for that kind, and a `Handle` limit is at most `MAX_HANDLES`. A
+  `Mapping` limit is not bounded by the caller's row, because a mapping row
+  prices the target's own domain (§2.9's creator-pays exception); it is
+  bounded by the child's free grant rows, the board's grant-row budget less
+  the rows the child's image spent (§5b.1), which is the clamp its create
+  already applied to its default. A limit is never below what the child
+  already holds of its kind: what a launcher gave it or created or mapped
+  through its handle before the start is charged to it (§2.9).
+- **Its answers, in the order they are decided.** A word that names nothing
+  is the `BadHandle` fault and a handle without `ProcessRight.QuotaSet` is
+  `AccessDenied`, on §5.7's dispatch order. Then the kind: a number that is
+  not a `QuotaKind` is the `BadArg` fault, whatever the process's state, as
+  for `RestrictRights`. Then the process: one that is not `Created`, a
+  running or `Gone` one included, is the `BadState` fault, as for `Start` and
+  `Give`. Then the limit: the sentinel or any larger number, a limit above
+  the caller's own for a kind other than `Mapping`, a `Handle` limit above
+  `MAX_HANDLES`, and a limit below what the child holds of its kind are each
+  the `BadArg` fault. Then the machine's answer: a `Mapping` limit above the
+  child's free grant rows answers `NoResource` and sets nothing, a status
+  because how many rows an image spends is a fact of an image the launcher
+  never parses (§12). Otherwise the row is set and the call answers `Ok`.
+- **Reading.** `ProcessOp.QuotaGet(kind)` answers the named process's limit
+  and use for one `QuotaKind` as one value word, the limit in bits 0 to 15
+  and the use in bits 16 to 31. It is gated by `ProcessRight.Stats` on the
+  handle used, as `Ceiling` is, so a process reads its own rows through its
+  own handle and a launcher reads its child's, before the start and after.
+  A row with no policy cap reads the sentinel as its limit. A kind that is
+  not a `QuotaKind` is the `BadArg` fault, and through a `Gone` process's
+  handle it answers `Revoked`, because the teardown clears the ledger
+  (§2.9).
 
 **`Give` — the courier op.** `give(handle, tag:)` on the child's handle, gated
 by `ProcessRight.Give` there plus the universal `Transfer` right on the handle
@@ -1962,10 +2013,12 @@ another process's counters. Three things about the region:
 
 **Capacity.** Two tables, two floors, and a create needs room in both.
 
-- **Bodies.** `MAX_PROCESSES` is the compiled number of bodies the kernel boots
-  with — the floor of the bound, not the whole of it. A deployment donates
-  memory to back more (`SlabKind.Processes`, through `SystemOp.SlabDonate`,
-  §2.8), and the running bound is `process_slots_usable()` =
+- **Bodies.** `MAX_PROCESSES` is the compiled number of bodies, the same on
+  every board — the floor of the bound, not the whole of it. An image raises
+  the number a machine boots with by linking an area for `SlabKind.Processes`
+  (§2.8, §12; not yet enforced: limits). A deployment donates memory to back
+  more (`SlabKind.Processes`, through `SystemOp.SlabDonate`, §2.8), and the
+  running bound is `process_slots_usable()` =
   `min(PROCESSES.capacity(), hal.PROT_DOMAIN_SLOTS)`. The second term exists
   because a per-process translation-table set comes out of a static HAL pool
   (donation does not reach HAL-internal storage), so a translating tier has a
@@ -2051,8 +2104,9 @@ a whole.
   owning a device; `Shutdown` left out is what stops it halting the machine
   through syscalls (a flat-tier process can write the finisher, §5b.1).
 - **`SlabDonate`** consumes the donated capability and backs a named object
-  kind's slab with it, permanently in v1 — so the compiled limits are a floor
-  and capacity is policy, decided by the deployment rather than by the build.
+  kind's slab with it, permanently in v1. The build decides the capacity a
+  machine boots with, and donation raises it at run time from there (the
+  machine's limits, below).
   It takes a pool or an allocation, and the kernel never shares slab
   backing with user-reachable memory, so the handle
   must be the only reference to its object and nothing may reach its bytes:
@@ -2086,6 +2140,59 @@ a whole.
 - **`TierGet`** answers `Isolated` or `Flat` (§5b.1). It reads no state, spends
   no resource, takes no argument and cannot fail. Info queries of this kind
   belong on this object and are gated like any other op.
+
+**The machine's limits.** Every limit the kernel keeps is set or derived, and
+raising a set number raises what is derived from it.
+
+- **A board's numbers are set in its HAL:** its grant-row budget
+  (`hal.GRANT_ROW_BUDGET`, §5b.1), the most segments an image may have
+  (`hal.MAX_ROOT_SEGMENTS`) and its protection-domain pool
+  (`hal.PROT_DOMAIN_SLOTS`, §2.7). Each is what the board's hardware allows
+  where a hardware fact stands behind it, and the board's policy where none
+  does. The grant record's length (`MAX_GRANT_ROWS`) holds the budget and
+  every segment an image may have plus its stack, which the build asserts.
+- **The handle table's length is a board's number too**
+  (not yet enforced: limits). `MAX_HANDLES` is set in the HAL, and is at
+  least five more than `MAX_MEMORIES` + `MAX_IOMEMORIES`, so root's table
+  holds a region table that fills those two floors beside its first handles
+  (§12).
+- **The slab floors are the kernel's** (`kcore.limits`: `MAX_PROCESSES`,
+  `MAX_THREADS` and the rest), compiled into every kernel and the same on
+  every board. Each is extent 0 of its slab, what a kind holds before
+  anything raises it. The floors keep their relations at compile time:
+  `MAX_PROCESS_RECORDS` is `PROCESS_RECORDS_PER_BODY` × `MAX_PROCESSES`,
+  `MAX_ATTACHMENTS` is the sum of the waitables an attachment can name
+  (§2.7), the floor of bodies fits the domain pool, and each of the
+  compiled quota defaults is below its slab (§2.9). `PIPE_INFLIGHT` is twice
+  `MAX_THREADS` (§2.1), so the ring's property holds up to the threads floor;
+  on a machine with more threads than that, a post into a full ring answers
+  `WouldBlock` as any full ring does.
+- **An image raises what a machine boots with** (not yet enforced: limits).
+  Its region table may name, for each slab kind it raises, one area of the
+  kernel's own memory that the build linked in, sized to the image's limits,
+  and the kernel installs it as one more extent of that kind before the
+  first process exists (§12). A kind's capacity at boot is its floor plus its
+  area. The table also carries the quota defaults the image's children start
+  with (§2.9). A board's description gives the capacities and defaults an
+  image gets when it names none, and the image builder writes them into the
+  image, so to the kernel they are the image's. An image raises a limit and
+  never lowers one: the floor stays extent 0, and a default stays at least
+  the compiled one.
+- **An image's totals keep the floors' relations**
+  (not yet enforced: limits). At boot, records are at least
+  `PROCESS_RECORDS_PER_BODY` × bodies, threads at least bodies (every live
+  process has a main thread), attachments at least events + interrupts +
+  timers + records, bodies within the domain pool, each quota default below
+  its slab's capacity (the `Handle` default below `MAX_HANDLES`), and the
+  `Mapping` default at most the grant-row budget less `IMAGE_GRANT_ROWS`
+  (§5b.1). A pipe's staging
+  rings follow its connections inside the kernel, `PIPE_INFLIGHT` each, as
+  they do at a donation. The image builder computes each derived total from
+  the numbers the image sets, and an image may state a derived total above
+  its derivation and never below it. The kernel stops the boot on a table
+  that breaks a relation it can check (§12).
+- **Donation raises capacity at run time** (`SlabDonate`, above), from
+  whatever the machine booted with.
 
 **Observing processes.** `ProcessNext` walks the machine's processes and
 `ProcessByPid` looks one up by pid, both gated by `SystemRight.ProcessObserve`,
@@ -2176,7 +2283,9 @@ names its clients through the sender handle (§2.1), which asks no System right.
   the same process if the table still holds it.
 - **What a tool reads through the handle.** With `Stats`, the pid and the trap
   counters, live or final (§2.7), and, while the process lives, its rights
-  ceilings (`ProcessOp.Ceiling`, which answers `Revoked` once it is `Gone`);
+  ceilings (`ProcessOp.Ceiling`, which answers `Revoked` once it is `Gone`)
+  and its quota rows (`ProcessOp.QuotaGet`, likewise;
+  not yet enforced: quota-door);
   with `Wait`, the §8 status word, through `GetStatus` or a Waiter. Nothing
   else: the observe set carries no right to map into, start, give to, create
   through, exit, restrict or kill the process (kill, §8), and
@@ -2215,7 +2324,9 @@ Interrupt has no column: there is at most one live Interrupt per line, and the
 Interrupt slab bounds the objects (§2.8). Pools and allocations share the
 `Memory` column, as they share the Memory slab: an `allocate` charges its
 caller one, and the boot charges root one for each
-`Ram` and `Pool` row it mints.
+`Ram` and `Pool` row it mints. Parts of the model this section and §2.7,
+§2.8, §5b.1 and §12 describe are not yet enforced, and the transition at the
+end of this section says what the kernel does until they are.
 
 - **Policy first.** A quota is checked at every allocation site that answers
   `NoResource`, ahead of the slab, so a process at its budget is told
@@ -2233,11 +2344,18 @@ caller one, and the boot charges root one for each
   domain size.
 - **Root's rows are unlimited** — root is init, and its policy cap is the
   machine, so the slab is what refuses it — except its mapping row, which is
-  clamped to its own free grant rows. That clamp makes a `map()` meeting the
+  clamped to its own free grant rows and to the Mapping slab's capacity at
+  boot. That clamp makes a `map()` meeting the
   physical wall with quota headroom left (which would be fatal) unreachable
   rather than merely unlikely.
-- A child gets `kcore.limits`' documented defaults; there is no per-create
-  quota argument in v1.
+- **A child's rows.** A child starts with the quota defaults its image
+  carries (§2.8, §12), which replace `kcore.limits`' compiled defaults
+  (not yet enforced: limits); an image that carries none gives its children the
+  compiled defaults. Its launcher may then set any row before the start
+  (`ProcessOp.QuotaSet`, §2.7; not yet enforced: quota-door). A row is a cap
+  on one process, not a share of its launcher's. A child's mapping row is
+  clamped at its create to the grant rows its domain has left after its
+  image, as root's is. There is no per-create quota argument.
 - **`Pipe` counts a connection.** `ProcessOp.PipeCreate` charges it once, and
   the credit lands when both of the connection's reference columns reach zero
   and the slot goes back. Charging per endpoint would be wrong: two ends of
@@ -2289,6 +2407,30 @@ caller one, and the boot charges root one for each
   at once, and neither bounds the other. A process allocating from a pool it
   was given pays a `Memory` row per allocation and nothing for the pool,
   which stays charged to whoever it was charged to.
+
+**Not yet enforced: the transition to per-board limits and the quota door.**
+Every sentence of this specification that describes a part of the model which
+the kernel does not build carries the marker "not yet enforced:" and the
+part's name; a marker on the lead of a paragraph or a bullet covers all of
+it. Until a part is built the kernel does what its paragraph here says;
+building it removes its markers and its paragraph, and the last part removes
+this note.
+
+- **Limits** (`limits`). One set of compiled numbers serves every board.
+  The slab floors, `MAX_HANDLES` and the quota defaults are `kcore.limits`',
+  the same on every board, and a board's own numbers are its grant-row
+  budget, its segment bound and its domain pool. The compiled mapping
+  default is checked against a minimum every board's budget meets
+  (`MIN_GRANT_ROW_BUDGET`), not against each board's own budget, and the
+  handle table need not hold a full region table beside root's first
+  handles. The region table is at version 4 and the kernel reads nothing
+  after its rows, so an image links no slab area and carries no quota
+  defaults: every kind boots at its floor, only a donation raises one, and
+  every child starts with the compiled defaults.
+- **The quota door** (`quota-door`). No op sets or reads a quota row:
+  `ProcessOp` has neither `QuotaSet` nor `QuotaGet`, and there is no
+  `ProcessRight.QuotaSet`. A child keeps the rows its create installed, its
+  mapping row clamped to its free grant rows, for its whole life.
 
 ### 2.10 Object lifecycle
 
@@ -2353,7 +2495,7 @@ handle to make the op that would answer `Revoked`.
 | Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. `Exit` releases the handle it is invoked through: only that handle goes, every other one still reads the slot, and a Thread that exits with no other handle naming it is freed at its exit. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
 | Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) and bound to no process: nothing names its binder's record, so the teardown has nothing to disown |
 | Event, Pipe, Pool, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them; an allocation also until its last grant row goes, and a pool until its last allocation comes home (§2.5) |
-| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1). The process walk and the lookup by pid answer a `Gone` record for as long as something names it, and the handle they mint is one more name that holds it (§2.8); they answer no process before its start (§2.8). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
+| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7), and so does `QuotaSet` (§2.7; not yet enforced: quota-door). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1). The process walk and the lookup by pid answer a `Gone` record for as long as something names it, and the handle they mint is one more name that holds it (§2.8); they answer no process before its start (§2.8). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
 | Clock, System | Never destroyed |
 
 **A free of a live object runs its last rites.** The last handle going is a
@@ -3059,7 +3201,9 @@ Everything else derives from those handles.
   flash, and a mismatch the build missed is refused at load, never run.
 - **The build also emits a region table** (§12), the second boot input the
   kernel reads. Its header carries the boot flags: the build's options to the
-  kernel, since no board hands a kernel a command line.
+  kernel, since no board hands a kernel a command line. After its rows it
+  carries the image's linked slab areas and its children's quota defaults
+  (§12; not yet enforced: limits).
 
 ### 5.7 Syscall ABI
 
@@ -3440,12 +3584,18 @@ hardware denial, each marked isolated-only in the runner and printed with its
 reason (for example `umode_access_fault`, `root_server_oversteps`,
 `process_isolation`, `map_unmap` and `stats_region_ro`).
 
-**The tier-2 floor: shape decided, number deferred.** A tier-2 part has few
-enough protection slots that a mapping quota must be priced against them, and
+**The grant-row budget is the board's.** A tier-2 part has few enough
+protection slots that a mapping quota must be priced against them, and
 TOR-costs-two / NAPOT-costs-one stays HAL-internal under a conservative quota,
-so a budget never varies by allocation luck. `DEFAULT_QUOTA_MAPPINGS` is to be
-priced at 6–8 when a real tier-2 board asks; no in-tree target consumes that
-price yet, and a number nobody runs is a number nobody believes.
+so a budget never varies by allocation luck. Each board states its own budget
+(`hal.GRANT_ROW_BUDGET`, §2.8): on a tier-2 board it is the rows its
+protection hardware holds, and elsewhere it is the board's policy. A child's
+mapping quota is priced against the budget of the board it runs on: its
+default is at most that budget less the rows an image spends before it runs
+(`IMAGE_GRANT_ROWS`), so a board with more rows gives its children more
+(not yet enforced: limits). Whatever the default, a process's mapping row is
+clamped to the rows its own domain has left after its image (§2.9), so a
+`map` meets the quota before it can meet the hardware's wall.
 
 ## 5c. The native floor
 
@@ -4271,7 +4421,9 @@ loader parses and reports while no process stores either.
 - **Retiring the image-declared device grant** (`SegFlag.Device` and the
   loader's `allow_device: true` door, dormant) (§2.5): its emitter is
   sawlang-side, so deleting it is a toolchain-pin event.
-- **The tier-2 mapping quota price** (`DEFAULT_QUOTA_MAPPINGS`, §5b.1).
+- **Per-board limits and linked slab areas** (§2.8, §12), and **the quota
+  door**, `ProcessOp.QuotaSet` and `QuotaGet` (§2.7). Until each lands the
+  kernel does what §2.9's transition note says for it.
 - **Sub-pools and revoke** (§2.5): `Pool.split` and a revoke are reserved, not
   specified. A process given a pool can allocate from it but cannot carve it
   into budgets for others, and a manager cannot take back what it allocated.
@@ -4308,8 +4460,11 @@ loader parses and reports while no process stores either.
   load has been made there.
 - Whether the ESP32-C3's buses and PMP would serve a process from flash is
   not established, so nothing there links a segment in place (§5.5).
-- Quotas count objects, not bytes, and there is no per-create quota argument
-  (§2.9). Slab donation is permanent (§2.8).
+- Quotas count objects, not bytes (§2.9). A child's rows are the defaults it
+  was created with until its launcher sets them, which it may do only between
+  the create and the start (§2.7; not yet enforced: quota-door); there is no
+  per-create quota argument. Slab donation is permanent, and no capacity goes
+  below its compiled floor (§2.8).
 - Handle generations are best-effort bug detection, not a uniqueness
   guarantee (§3).
 - A cycle of connections, each carrying the next one's outlet in a staged
@@ -4337,7 +4492,13 @@ namespace and its path-attached acceptor object (§2.1), thread waitability
 (§8), priorities and the §7 band map, SMP with `IntrSpinLock` (§9b), the vDSO
 true-mapping (§5.7), and the IOMMU driver with critical processes (§2.5).
 Sub-pools and revoke extend the memory model, which is built; §2.5 gives their
-direction and they are specified when they are designed.
+direction and they are specified when they are designed. Per-process limits
+beyond the quota rows (a handle table sized per process, a pool per process as
+its memory limit, rights ceilings narrowed to what a program declares, and a
+stack length per process) are reserved for a later design. One driver process
+serving several devices of one type, declared and launched as one, is
+reserved. Limits an image can lower below the kernel's compiled floors are
+reserved.
 
 ## 12. The root server
 
@@ -4437,7 +4598,10 @@ direction and they are specified when they are designed.
   version and refuses a flag bit it does not define, and a kind byte it does
   not define. Bit 0 is "no tick": the kernel arms the scheduler tick (§7)
   unless it is set, so an image with no table, or with the flags zero, runs
-  with the tick, and only an image that asks is cooperative.
+  with the tick, and only an image that asks is cooperative. A table whose
+  rows the Memory and IoMemory slabs cannot hold at boot, all together or of
+  one kind, stops the boot, and so does one whose rows root's handle table
+  cannot hold beside its first handles.
 - **The kind column types every row**. `Ram` (0)
   mints an allocation, a `Memory` that came from no pool (§2.5); `Device` (1)
   an `IoMemory`; `Pool` (2) a `Pool`. Root's boot pools are minted with
@@ -4460,6 +4624,44 @@ direction and they are specified when they are designed.
   pool there allocates only such allocations, and the segments a child uses in
   place count on the image allocation they lie in (§2.5), so a launcher may
   release its image handle while the child runs out of flash.
+- **After the rows, the image's slab areas** (not yet enforced: limits). The
+  table is at version 5. After its rows comes nothing, or one whole block: a
+  magic word, the number of areas, one quota default for each `QuotaKind`
+  (the rows the image's children start with, §2.9), then one entry per area
+  naming a `SlabKind`, the area's base and its length. The build links each
+  area into the kernel's own memory, sized to the image's limits (§2.8).
+  Anything else after the rows stops the boot, a partial block and bytes
+  after the block included. The kernel reads the block before the first
+  process exists, before root's record, body or rows are taken, and each of
+  these stops the boot, naming what it found:
+  - a kind that is not a `SlabKind`, or a kind two areas name: a kind is
+    raised by one extent;
+  - an area whose length is not a whole, nonzero number of its kind's slots,
+    counted as a donation counts them (a thread's slot with its saved
+    context, a connection's with its staging ring, §2.8), or whose base is
+    not aligned as those slots need;
+  - an area not wholly inside the kernel's own zero-initialised memory,
+    between the board script's `_bss_start` and `_arena_start`, or an area
+    that meets another;
+  - a kind whose capacity with its area would pass `MAX_SLAB_CAPACITY`;
+  - capacities at boot that break a relation of §2.8's: records below
+    `PROCESS_RECORDS_PER_BODY` × bodies, threads below bodies, attachments
+    below events + interrupts + timers + records, or bodies beyond the
+    domain pool (`hal.PROT_DOMAIN_SLOTS`);
+  - a quota default below `kcore.limits`' compiled default for its kind or
+    not below its slab's capacity at boot, a `Handle` default not below
+    `MAX_HANDLES`, or a `Mapping` default above the grant-row budget less
+    `IMAGE_GRANT_ROWS`.
+
+  Then each area is zeroed again and installed as one more extent of its
+  slab, as a donated region is (§2.8). What a process can observe afterwards
+  is a machine that booted with those extents: a kind's capacity at boot is
+  its floor plus its area, everything that reads a capacity (the bound on
+  bodies, §2.7; root's mapping clamp, §2.9; the row bound above) reads it so,
+  and a donation adds to it as to any other extent. The area takes one of
+  the kind's `MAX_SLAB_EXTENTS`, so a kind raised by its image accepts one
+  donation fewer. No handle names an area and no process can map, give or
+  donate one: its bytes are the kernel's from the first instruction.
 - **A row typed wrong is the build's error, met at root's drain.** The kernel
   mints what the kind column says. A root that finds a pool under a tag its
   config gives to an allocation, or the reverse, learns it from the boot
@@ -4471,13 +4673,16 @@ direction and they are specified when they are designed.
 - **The boot set is collected, not widened.** The entry register carries exactly
   one handle — System — and everything else the kernel minted for root before it
   ran is drained through `ProcessOp.BootHandleNext`, one `{tag, kind, handle}`
-  record per call, through §2.2's copy-out funnel. Exhaustion is a status
-  (`Drained`) that stays exhausted, because a loop that drains an iterator ends
-  by meeting the end. The tag is a region ordinal out of the build-emitted table
-  and the kernel assigns it no meaning: which ordinal is an image, which is a
-  destination, which is a device is root's config. That keeps the kernel's half
-  of the launch flow identical for a hand-built system and for dynamic loading
-  whenever it arrives.
+  record per call, through §2.2's copy-out funnel. The drain answers records
+  in the order they were queued: root's in row order, a child's in the order
+  its launcher gave them. A record `start(boot_tag:)` took is stepped over and
+  never answered, and the records around it keep their order. Exhaustion is a
+  status (`Drained`) that stays exhausted, because a loop that drains an
+  iterator ends by meeting the end. The tag is a region ordinal out of the
+  build-emitted table and the kernel assigns it no meaning: which ordinal is
+  an image, which is a destination, which is a device is root's config. That
+  keeps the kernel's half of the launch flow identical for a hand-built system
+  and for dynamic loading whenever it arrives.
 - **Every process has one.** The boot set is per-process: the kernel writes
   root's at boot and a launcher writes a child's with `ProcessOp.Give`,
   through the same machinery, and a child drains its own through its own
