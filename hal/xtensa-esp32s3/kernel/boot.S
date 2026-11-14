@@ -27,6 +27,8 @@
  *      context switch and the first entry to user mode: `ktrap` returns the
  *      frame to resume and `sos_resume_frame` enters a frame `frame_init`
  *      built.
+ *   5. `sos_clock_store`, the one store that moves the system clock, which
+ *      runs from IRAM (`lib.saw`'s `clock_init`).
  *
  * `EXCSAVE1` holds the running thread's frame address while user mode runs.
  * The user vector swaps it with a1, so the frame is the save area at once and
@@ -423,3 +425,27 @@ sos_resume_frame:
     wsr     a1, excsave1
     l32i    a1, a1, F_A1            /* user a1 last: it retires the frame */
     rfe
+
+/* ---- the clock store (IRAM) ---------------------------------------------- */
+
+/* void sos_clock_store(u32 addr, u32 value)
+ *
+ * Store `value` at the clock register `addr`, read it back so the store has
+ * reached the register, and return. It runs from IRAM, so no instruction is
+ * fetched through the flash cache while the system clock, and with it the
+ * memory-SPI clock, moves; the caller resumes from flash at the new clock.
+ * It loads no literal, which would be a flash read.
+ *
+ * Its section is not kept: `esp32s3.ld` places it in IRAM behind the trap
+ * path, and an image whose clock key writes nothing does not reference it, so
+ * the link drops it and the image is the bytes it would be without it. */
+    .section .iram.text.clock, "ax"
+    .align  4
+    .global sos_clock_store
+sos_clock_store:
+    memw
+    s32i    a3, a2, 0
+    memw
+    l32i    a3, a2, 0
+    memw
+    ret

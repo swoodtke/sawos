@@ -11,10 +11,11 @@ directory, as `hal/arm64/` does.
 
 ```
 kernel/boot.S       the direct-boot entry, the reset path out of the ROM's
-                    register window, the vector table, the trap entry and
-                    the restore path (`sos_resume_frame`)
+                    register window, the vector table, the trap entry, the
+                    restore path (`sos_resume_frame`), and the clock store
+                    an image at a raised clock makes from IRAM
 kernel/sink.c       the special-register leaves (INTENABLE, INTERRUPT,
-                    INTCLEAR), `simcall` SYS_exit, the linker-symbol
+                    INTCLEAR, CCOUNT), `simcall` SYS_exit, the linker-symbol
                     accessors, and `kernel_fault`
 kernel/lib.saw      the `hal` module: the trap frame and its accessors, the
                     cause decoding, the Flat protection seam, UART0,
@@ -27,8 +28,12 @@ user/root.ld        root: code and read-only data in place in its flash slot
                     at 0x10_0000, writable data from DRAM 0x3FCB_0000
 user/child.ld       a child: the same, its slot at 0x18_0000 and its DRAM
                     from 0x3FCC_8000
+keys/               an image's build keys, each a module the runner maps to
+                    one of these directories: `s3clock` (`clock-rom`, the
+                    default, and `clock-xtal40`) and `s3stall` (`stall-off`,
+                    the default, and `stall-on`); ABI.md §14
 ABI.md              every board fact, with the probe that produced it; §13 is
-                    the process layout
+                    the process layout, §14 the system clock
 ```
 
 **Read `ABI.md` before changing anything here.** It is the record of what

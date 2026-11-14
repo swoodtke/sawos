@@ -395,7 +395,7 @@ extension EspUart: ConsoleSink {
 /// `kcore`'s `Console`). Each write is one register store guarded by its own
 /// poll, so the two interleave and neither loses a byte.
 public func console_byte(b: UInt8) unsafe {
-    EspUart(at: UART_BASE).write_byte(b)
+    if s3stall.CONSOLE_STALL_COUNT { s3stall.counted_byte(b) } else { EspUart(at: UART_BASE).write_byte(b) }
 }
 
 /// Write a string to the console, byte at a time, allocating nothing: the stop
@@ -431,7 +431,7 @@ func console_hex(v: UInt) unsafe {
 
 /// Report a clean stop and halt.
 public func exit_pass() unsafe {
-    console_str("SOS-S3: halt pass\n")
+    if s3stall.CONSOLE_STALL_COUNT { s3stall.report_stall() }; console_str("SOS-S3: halt pass\n")
     sos_sim_exit(0)
     while true { }
 }
@@ -1245,3 +1245,29 @@ public func irq_raise_selftest_line() unsafe -> UInt {
     EspUart(at: UART_BASE).regs.int_ena.write(UART_INT_TXFIFO_EMPTY)
     CONSOLE_IRQ
 }
+
+// =============================================================================
+// The build keys
+// =============================================================================
+//
+// An image's build keys (../ABI.md §14) are two modules the runner maps to a
+// key's directory under `../keys/`: `s3clock`, the CPU clock, and `s3stall`,
+// whether the console counts its stalls. In an image built at the defaults
+// (`rom`, the count off) every reference to a key's code folds away, and the
+// image is the bytes it is without the keys. Two things keep it so. The
+// compiler lays out functions and statics in the order the code it lowers
+// first names them, even code an image folds away, so a key's code names
+// nothing in this file: its modules reach their registers through views of
+// their own. And the line of every overflow check in this file is compiled
+// into the image, so the keys are imported down here, below the last one,
+// and `console_byte` and `exit_pass` name the stall count on the line that
+// was there. Nothing else in this file is keyed.
+//
+// `clock_init` is the clock key's, and `kmain` calls it first, before
+// anything prints or is timed; the `rom` key's writes nothing. When the
+// stall count is on, `console_byte` writes through the count's own path,
+// which times each wait for FIFO room once the tick is armed, and
+// `exit_pass` prints the count before its own line.
+
+public import s3clock.{clock_init}
+import s3stall

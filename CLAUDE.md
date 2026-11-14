@@ -37,7 +37,9 @@ hal/xtensa-esp32s3/  # Xtensa (call0) and the ESP32-S3 board in one
                    # directory, as arm64's: kernel/ (boot.S with the vectors
                    # and trap entry, sink.c, lib.saw on the Flat tier,
                    # esp32s3.ld) + user/ (the syscall stub, root.ld,
-                   # child.ld) + ABI.md, the board facts. Reached by
+                   # child.ld) + keys/ (an image's build keys, one module
+                   # directory per value: the CPU clock, the console's stall
+                   # count) + ABI.md, the board facts. Reached by
                    # `make sos-smoke-esp32s3`
 drivers/           # userspace device drivers and the protocol packages their
                    # clients share (`uartproto`), each an ordinary package like

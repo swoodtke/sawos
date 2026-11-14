@@ -680,8 +680,10 @@ PROCESS_KILL_ROOT_PKG = os.path.join(TESTS_DIR, "process-kill-root")
 # `ProcessOp.Kill` on a child in a chosen state (spec §8). `child-kill-victim`
 # is a role-driven target; `kill-churn` kills one per round over many rounds
 # and `kill-runnable` kills one that is runnable and not running.
+# `kill-churn-profile` is the ESP32-S3 board's timed `kill-churn`.
 CHILD_KILL_VICTIM_PKG = os.path.join(TESTS_DIR, "child-kill-victim")
 KILL_CHURN_PKG = os.path.join(TESTS_DIR, "kill-churn")
+KILL_CHURN_PROFILE_PKG = os.path.join(TESTS_DIR, "kill-churn-profile")
 KILL_RUNNABLE_PKG = os.path.join(TESTS_DIR, "kill-runnable")
 KILL_LATE_DOOR_PKG = os.path.join(TESTS_DIR, "kill-late-door")
 
@@ -10697,11 +10699,13 @@ def _root_image_path(pkg_dir, arch):
     return os.path.join(out_dir, images[0])
 
 
-def _esp32s3_smoke(wanted, emit=None, emit_out=None):
+def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     """The ESP32-S3 board smoke: Xtensa, call0, the `Flat` tier. Returns the
     process exit status. `wanted` is the `--case` names (underscored), or
     empty for every case. `emit`, a case name, builds that case's board image
-    into `emit_out` instead of running anything.
+    into `emit_out` instead of running anything, at the clock key
+    `emit_clock` when one is given (`--clock`) and at the case's own
+    otherwise.
 
     It is not part of `make sos-test`: `make sos-smoke-esp32s3` runs it
     against the Espressif QEMU, beside the C3's smoke and on the same terms.
@@ -10734,6 +10738,16 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
     so the exit status is asserted; and it prints a verdict line first, so the
     transcript is asserted in order as well. A run that never reaches the
     door is killed at the deadline and fails.
+
+    Each image is built at its build keys, two modules the HAL imports and
+    the runner maps to a directory under `hal/xtensa-esp32s3/keys/`: the CPU
+    clock (`"clock"`, `rom` unless a case says otherwise; ABI.md §14) and the
+    console's stall count (`"console_stall"`, off unless a case asks). A key
+    changes the kernel's compile, so each combination the cases use is its
+    own profile, with its own build directory; `rom` with the count off is
+    `.build/esp32s3/sos`, and its images are the bytes they are without the
+    keys. A case marked `"board_only"` (with its reason) is built only by
+    `--emit-flash`: the smoke prints the reason and runs nothing for it.
 
     Every board fact below was derived from the running emulator and is
     recorded with its probe in hal/xtensa-esp32s3/ABI.md.
@@ -10792,18 +10806,44 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
               *extra, "-c", src, "-o", obj])
         return obj
 
-    def kernel_obj(name, src):
+    # The build keys. Each names a module the HAL imports, and each value a
+    # directory under `keys/` holding that module for the value.
+    keys_dir = os.path.join(s3_hal, "keys")
+    clock_keys = ("rom", "xtal40")
+
+    def variant(case):
+        """A case's build keys: its clock and whether the console counts its
+        stalls."""
+        return (case.get("clock", "rom"), bool(case.get("console_stall")))
+
+    def variant_arch(key):
+        """The arch entry an image at these keys builds under: this board's,
+        with a build directory of the keys' own unless they are the
+        defaults."""
+        clock, stall = key
+        if key == ("rom", False):
+            return arch
+        tag = f"{arch['build_tag']}-{clock}" + ("-stall" if stall else "")
+        return dict(arch, build_tag=tag)
+
+    def module_paths(key):
+        clock, stall = key
+        return [CORE_MODULE, f"hal={os.path.join(s3_hal, 'kernel')}",
+                tc().module_path_arg("imgformat"), SOSRT_MODULE,
+                SOSABI_MODULE,
+                f"s3clock={os.path.join(keys_dir, 'clock-' + clock)}",
+                "s3stall=" + os.path.join(
+                    keys_dir, "stall-on" if stall else "stall-off")]
+
+    def kernel_obj(name, src, key):
         obj = os.path.join(s3_build, f"{name}.kernel.o")
+        paths = []
+        for path in module_paths(key):
+            paths += ["--module-path", path]
         _run(tc().sawc() + [src, "-o", obj, "-Oz",
                             "--freestanding", "--no-hidden-alloc",
                             "--runtime-provider",
-                            "--target", s3_triple,
-                            "--module-path", CORE_MODULE,
-                            "--module-path",
-                            f"hal={os.path.join(s3_hal, 'kernel')}",
-                            "--module-path", tc().module_path_arg("imgformat"),
-                            "--module-path", SOSRT_MODULE,
-                            "--module-path", SOSABI_MODULE])
+                            "--target", s3_triple, *paths])
         return obj
 
     def elf_symbols(data):
@@ -11009,6 +11049,17 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
     rom = "ESP-ROM:esp32s3-20210327"
     banner = "SOS M1: kernel up on xtensa (ESP32-S3)"
     halt_pass = "SOS-S3: halt pass"
+    # The `xtal40` clock line as the emulator prints it, in two parts around
+    # its two measured speeds, which follow host time and are not asserted.
+    # The emulator answers SYSCLK_CONF with one fixed word whatever is
+    # stored (the PLL selected, the pre-divider at 2), reads 0 for
+    # CPU_PER_CONF, the memory-SPI words and the RTC word, and has a read-only
+    # date word where UART0's clock register is (ABI.md §14).
+    clock_xtal40_lines = [
+        "SOS-S3: clock xtal40 sysclk=0x000a8401->0x000a8401 "
+        "cpu_per=0x00000000->0x00000000 mhz=",
+        " uart_clk=0x15122500 mspi_core=0x00000000 mspi_clock=0x00000000 "
+        "rtc_date=0x00000000\n"]
     # The kernel-only cases, in the gate's case shape so `_check` judges them
     # too. The exit status is the kernel's own semihosting exit, so a failing
     # stop is non-zero and carries its code.
@@ -11019,6 +11070,20 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
             "name": "boot",
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "expect_out": [rom, banner,
+                           "SOS: bad root image: no root image appended",
+                           "SOS-S3: halt fail code=0x00000004"],
+            "expect_clean_exit": False,
+            "expect_status": 4,
+        },
+        {
+            # The same boot at the `xtal40` clock key: the switch is made and
+            # its line printed before the banner, and the console works after
+            # it. The line's words are the emulator's and are asserted; its
+            # two speeds are measured on host time and are not.
+            "name": "boot_xtal40",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "clock": "xtal40",
+            "expect_out": [rom, *clock_xtal40_lines, banner,
                            "SOS: bad root image: no root image appended",
                            "SOS-S3: halt fail code=0x00000004"],
             "expect_clean_exit": False,
@@ -11420,6 +11485,35 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
             "expect_out": [],
             "expect_clean_exit": False,
         },
+        # The gate's `kill_churn` at the `xtal40` clock key: two hundred
+        # creates, starts and kills with the tick on, after the switch, with
+        # the console right throughout.
+        dict(by_name["kill_churn"], name="kill_churn_xtal40", clock="xtal40",
+             expect_out=[*clock_xtal40_lines,
+                         *by_name["kill_churn"]["expect_out"]]),
+        {
+            # `kill_churn` timed: root stamps the clock around each phase of
+            # a round and prints the six totals and the whole once, in
+            # microseconds, and the kernel counts the console's stalls from
+            # the first entry to user mode (`console_stall`, ABI.md §14).
+            # Every number is the part's and is printed for a reader; the
+            # lines below are the order a capture shows. Built for a board
+            # with `--emit-flash` (and `--clock`), never run here.
+            "name": "kill_churn_profile",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "tick": True,
+            "console_stall": True,
+            "board_only": "its numbers are the part's: the emulator runs "
+                          "on host time",
+            "root_pkg": KILL_CHURN_PROFILE_PKG,
+            "children": [CHILD_KILL_VICTIM_PKG],
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={two}",
+                           "SOS killprof: us create=",
+                           "SOS-S3: console stalled ",
+                           halt_pass],
+            "expect_clean_exit": True,
+        },
     ]
     for case in process_cases:
         if case.get("tier", arch["tier"]) != arch["tier"]:
@@ -11442,6 +11536,23 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
             return 2
         cases = [c for c in cases if c["name"] in wanted]
         process_cases = [c for c in process_cases if c["name"] in wanted]
+    # `--clock` gives the one emitted image its clock key.
+    if emit_clock is not None:
+        clocked = dict(cases[0], clock=emit_clock)
+        cases = [clocked]
+        process_cases = [clocked] if process_cases else []
+    for case in cases:
+        if variant(case)[0] not in clock_keys:
+            print(f"{RED}{case['name']}: unknown clock key "
+                  f"{variant(case)[0]!r}; known: {', '.join(clock_keys)}"
+                  f"{RESET}", file=sys.stderr)
+            return 2
+    # A smoke run builds nothing for a board-only case; its row says why.
+    if emit is None:
+        built = [c for c in cases if not c.get("board_only")]
+        process_cases = [c for c in process_cases if not c.get("board_only")]
+    else:
+        built = cases
 
     print(f"{BOLD}SOS ESP32-S3 board smoke{RESET}")
     print(f"  qemu   {qemu}")
@@ -11462,33 +11573,45 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
               file=sys.stderr)
         return 1
 
-    # The native half is one compile for every case. `boot.S` holds the
-    # vectors and the trap entry; `support.c` is the shared C floor, whose
-    # word atomics nothing references here (the compiler inlines `s32c1i`).
-    native = [(os.path.join(s3_hal, "kernel", "boot.S"),
-               os.path.join(s3_build, "boot.o")),
-              (os.path.join(s3_hal, "kernel", "sink.c"),
-               os.path.join(s3_build, "sink.o")),
-              (os.path.join(RT_COMMON_C_DIR, "support.c"),
-               os.path.join(s3_build, "support.o"))]
-    profile = os.path.join(s3_build, "sosimage.profile.json")
+    # The native half is one compile for every case at one set of keys.
+    # `boot.S` holds the vectors and the trap entry; `support.c` is the shared
+    # C floor, whose word atomics nothing references here (the compiler
+    # inlines `s32c1i`). Each set of keys the cases use is a profile of its
+    # own, since the keys are module paths of the kernel's compile.
+    keys_used = []
+    for case in built:
+        if variant(case) not in keys_used:
+            keys_used.append(variant(case))
+    profiles = {}
     try:
         if python_path:
+            native = [(os.path.join(s3_hal, "kernel", "boot.S"),
+                       os.path.join(s3_build, "boot.o")),
+                      (os.path.join(s3_hal, "kernel", "sink.c"),
+                       os.path.join(s3_build, "sink.o")),
+                      (os.path.join(RT_COMMON_C_DIR, "support.c"),
+                       os.path.join(s3_build, "support.o"))]
             shared = [cc(native[0][0], native[0][1]),
                       cc(native[1][0], native[1][1], extra=("-O2",)),
                       cc(native[2][0], native[2][1], extra=("-O2",))]
-        else:
-            _write_json(profile, _profile_description(
+        for key in ([] if python_path else keys_used):
+            key_build = arch_dirs(variant_arch(key))["build"]
+            native = [(os.path.join(s3_hal, "kernel", "boot.S"),
+                       os.path.join(key_build, "boot.o")),
+                      (os.path.join(s3_hal, "kernel", "sink.c"),
+                       os.path.join(key_build, "sink.o")),
+                      (os.path.join(RT_COMMON_C_DIR, "support.c"),
+                       os.path.join(key_build, "support.o"))]
+            profiles[key] = os.path.join(key_build, "sosimage.profile.json")
+            _write_json(profiles[key], _profile_description(
                 arch, clang, lld, native,
                 os.path.join(s3_hal, "kernel", "esp32s3.ld"),
-                [CORE_MODULE, f"hal={os.path.join(s3_hal, 'kernel')}",
-                 tc().module_path_arg("imgformat"), SOSRT_MODULE,
-                 SOSABI_MODULE],
+                module_paths(key),
                 flash={"bytes": flash_bytes, "instruction_window": flash_ibus,
                        "data_window": flash_dbus,
                        "window_bytes": flash_window,
                        "magic_offset": magic_offset, "magic": magic}))
-            _run_sosimage(builder, ["native", profile])
+            _run_sosimage(builder, ["native", profiles[key]])
     except ToolError as e:
         print(f"{CROSS} failed to build the native half\n{e}", file=sys.stderr)
         return 1
@@ -11520,11 +11643,15 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
             case.setdefault("_child_images", {})[arch["name"]] = \
                 [images[c] for c in case["children"]]
 
-    # Each kernel entry the cases boot is compiled once, before any case
-    # links one; an entry that fails is reported by each case that boots it.
+    # Each kernel entry the cases boot is compiled once per set of keys,
+    # before any case links one; an entry that fails is reported by each case
+    # that boots it.
     kernel_failures = {}
-    if not python_path:
-        kernel_failures = _build_kernels(builder, profile, arch, cases, 1)
+    for key in ([] if python_path else keys_used):
+        failures = _build_kernels(builder, profiles[key], variant_arch(key),
+                                  [c for c in built if variant(c) == key], 1)
+        for src, failure in failures.items():
+            kernel_failures[(src, key)] = failure
 
     def build_flash(case, board=False, check=True):
         """`flash_image` over one case's image, through the builder or the
@@ -11534,13 +11661,14 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
         if python_path:
             return flash_image(name, case_objs(case), board=board,
                                check=check)
-        failure = kernel_failures[case["src"]]
+        key = variant(case)
+        failure = kernel_failures[(case["src"], key)]
         if failure is not None:
             raise failure
         tag = "board" if board else "flash"
         flash = os.path.join(s3_build, f"{name}.{tag}.bin")
         printed = _link_image(
-            builder, profile, case, arch,
+            builder, profiles[key], case, variant_arch(key),
             os.path.join(s3_build, f"{name}.{tag}.elf"),
             flash={"output": flash, "check": check},
             link_args=["--defsym=_sos_semihosting=0"] if board else [])
@@ -11554,7 +11682,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
         """Every object one case's image links: the native half, its kernel,
         and what is appended to it."""
         name = case["name"]
-        objs = list(shared) + [kernel_obj(name, case["src"])]
+        objs = list(shared) + [kernel_obj(name, case["src"], variant(case))]
         if case.get("asm"):
             objs.append(cc(os.path.join(s3_tests, case["asm"]),
                            os.path.join(s3_build, f"{name}.payload.o")))
@@ -11584,6 +11712,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
             f.write(image)
         print(f"{CHECK} {case['name']}: {emit_out}  ({end} bytes, written "
               f"at flash offset 0x0; magic checked at 0x400)")
+        print(f"  clock key {variant(case)[0]}")
         print(f"  sha256 {hashlib.sha256(image).hexdigest()}")
         print("  write it with:")
         print(f"    python3 -m esptool --chip esp32s3 --port PORT "
@@ -11593,6 +11722,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
     failed = 0
     for i, case in enumerate(cases, 1):
         name = case["name"]
+        if case.get("board_only"):
+            print(f"[{i}/{len(cases)}] - {name}  (board only, built by "
+                  f"--emit-flash: {case['board_only']})")
+            continue
         try:
             flash, size, _end = build_flash(
                 case, check=not case.get("loader_fixture"))
@@ -11633,13 +11766,17 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
             print(f"    {line}")
         print("    --- end ---")
 
+    ran = len(built)
+    skipped = len(cases) - ran
+    board_only = f", {skipped} board-only not run" if skipped else ""
     print()
     print("=" * 60)
     if failed:
         print(f"{RED}SOS ESP32-S3 SMOKE FAILED{RESET} "
-              f"({failed} of {len(cases)})")
+              f"({failed} of {ran}{board_only})")
     else:
-        print(f"{GREEN}ESP32-S3 SMOKE PASSED{RESET} ({len(cases)} cases)")
+        print(f"{GREEN}ESP32-S3 SMOKE PASSED{RESET} ({ran} cases"
+              f"{board_only})")
     print("=" * 60)
     return 1 if failed else 0
 
@@ -11729,12 +11866,20 @@ def main():
                              "--out trimmed to its length, and run nothing")
     parser.add_argument("--out", metavar="PATH",
                         help="where --emit-flash writes the image")
+    parser.add_argument("--clock", metavar="KEY",
+                        help="with --emit-flash: the CPU clock key the image "
+                             "is built with, in place of the case's own "
+                             "(`rom`, the default, or `xtal40`; "
+                             "hal/xtensa-esp32s3/ABI.md §14)")
     args = parser.parse_args()
 
     if args.emit_flash is not None and (args.board != "esp32s3"
                                         or args.out is None):
         print(f"{RED}--emit-flash needs --board esp32s3 and --out PATH"
               f"{RESET}", file=sys.stderr)
+        sys.exit(2)
+    if args.clock is not None and args.emit_flash is None:
+        print(f"{RED}--clock needs --emit-flash{RESET}", file=sys.stderr)
         sys.exit(2)
 
     if args.board == "esp32s3":
@@ -11745,7 +11890,7 @@ def main():
                   if w.strip()]
         emit = (args.emit_flash.strip().replace("-", "_")
                 if args.emit_flash is not None else None)
-        sys.exit(_esp32s3_smoke(wanted, emit, args.out))
+        sys.exit(_esp32s3_smoke(wanted, emit, args.out, args.clock))
 
     if args.board != "virt":
         # ------------------------------------------------------------------

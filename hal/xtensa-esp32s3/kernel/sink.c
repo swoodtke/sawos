@@ -73,6 +73,19 @@ void sos_intclear_write(u32 mask) {
     __asm__ volatile("wsr %0, intclear\n rsync" :: "a"(mask) : "memory");
 }
 
+// ---- the cycle counter ----------------------------------------------------
+//
+// C because: a special register (reason 1). CCOUNT advances once per CPU
+// cycle on a part; the emulator runs it at 40 MHz of host time whatever the
+// clock registers say (../ABI.md §6a). `clock_init` measures the CPU's speed
+// with it against SYSTIMER.
+
+u32 sos_ccount_read(void) {
+    u32 v;
+    __asm__ volatile("rsr %0, ccount" : "=a"(v));
+    return v;
+}
+
 // ---- stopping the emulator ------------------------------------------------
 //
 // C because: `simcall` is an instruction, and semihosting reads its call
