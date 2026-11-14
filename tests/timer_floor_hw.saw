@@ -1,0 +1,96 @@
+// A thread's calls cannot hold the timer hardware off a tick that is owed,
+// read off the hardware itself.
+//
+// The case runs in the kernel with the tick started and never serviced
+// between the calls, as a thread that holds the processor between two ticks
+// leaves it. Each round services the tick by hand, so the next one is owed a
+// tick period ahead, then makes one call over and over until the clock is a
+// further 200 microseconds past that tick, and reads the hardware once:
+//
+//   - re-arming a one-shot Timer an hour out;
+//   - looking at a Timer at a one-nanosecond interval, which is always due.
+//
+// The hardware is programmed for the tick, or for an instant at most the
+// kernel's lead past a reading taken before the tick came due, and the
+// kernel's lead is shorter than 200 microseconds. So when the loop ends, the
+// counter is past the comparator and the timer reads pending in every round.
+// A kernel that counted a new lead at every call would leave the comparator a
+// lead past the loop's last call, and the read would find it not yet reached.
+//
+// The read is the guest's own comparison of the counter with the comparator
+// (on these boards `timer_pending` reads both registers and compares them),
+// so a correct kernel's answer does not depend on how long the host took: a
+// stall only moves the counter further past the comparator. A stall between
+// the loop's last call and the read could make a wrong kernel's comparator
+// reached too, which is why the rounds are counted rather than one taken.
+
+import kcore.{console, start_tick}
+import kcore.probe.{timer_probe_arm, timer_probe_attach, timer_probe_disarm,
+    timer_probe_interrupt, timer_probe_wait}
+import hal
+
+/// Further past the owed tick that each loop runs, longer than the kernel's
+/// lead.
+static PAST_NS: UInt64 = 200_000
+
+/// An hour, as a deadline nothing here reaches.
+static FAR_NS: UInt64 = 3_600_000_000_000
+
+static ROUNDS: UInt = 8
+
+static TICK_PERIOD_US: UInt = 1000
+static TICK_NS: UInt64 = 1_000_000
+
+func yes(b: Bool) -> UInt {
+    if b { 1 } else { 0 }
+}
+
+/// Service the tick by hand and answer a clock reading the next tick is owed
+/// no later than a tick period after.
+func tick_serviced() unsafe -> UInt64 {
+    timer_probe_interrupt()
+    hal.timer_now_ns()
+}
+
+@export("kmain")
+func kmain() unsafe {
+    let uart = console()
+    uart.write_str("SOS floorhw: on ")
+    uart.write_str(hal.arch_name())
+    uart.write_str("\n")
+
+    timer_probe_attach()
+    start_tick(TICK_PERIOD_US)
+
+    var rearm_pending: UInt = 0
+    var look_pending: UInt = 0
+    var r: UInt = 0
+    while r < ROUNDS {
+        let a = tick_serviced()
+        while hal.timer_now_ns() < a + TICK_NS + PAST_NS {
+            timer_probe_arm(hal.timer_now_ns() + FAR_NS, 0)
+        }
+        if hal.timer_pending() {
+            rearm_pending = rearm_pending + 1
+        }
+        timer_probe_disarm()
+
+        let b = tick_serviced()
+        timer_probe_arm(hal.timer_now_ns(), 1)
+        while hal.timer_now_ns() < b + TICK_NS + PAST_NS {
+            let _ = timer_probe_wait()
+        }
+        if hal.timer_pending() {
+            look_pending = look_pending + 1
+        }
+        timer_probe_disarm()
+        r = r + 1
+    }
+    uart.write_str("SOS floorhw: rearm loop pending=")
+    uart.write_hex(yes(rearm_pending == ROUNDS))
+    uart.write_str(" look loop pending=")
+    uart.write_hex(yes(look_pending == ROUNDS))
+    uart.write_str("\n")
+
+    hal.exit_pass()
+}

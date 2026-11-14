@@ -1,0 +1,168 @@
+// A thread that makes calls programming the timer hardware in a loop cannot
+// hold off the scheduler tick.
+//
+//   SOS reprogram: clock loop, the worker ran
+//   SOS reprogram: wait loop, the worker ran
+//   SOS reprogram: arm loop, the worker ran
+//   SOS reprogram: done
+//
+// The image runs with the tick on. A worker thread counts its own passes. The
+// initial thread never parks, yields or exits during a phase, so the worker
+// runs only when the tick takes the processor from it. Each phase makes one
+// call over and over until the worker's count has moved, and only then prints
+// its line:
+//
+//   clock  reads the clock, which programs nothing: the tick preempts at all;
+//   wait   waits on a Timer armed at a one-nanosecond interval, which the
+//          wait's look finds due, counts and programs the hardware for;
+//   arm    re-arms a one-shot Timer an hour out, which programs the hardware.
+//
+// This is a liveness case, not the check that holds the kernel's rule. A
+// kernel that counted a new lead from every call that programs the hardware
+// would hold the tick off only while every gap between two such calls is
+// shorter than the lead. On a host quiet enough to keep every gap that short,
+// the phase never ends and the case stops at the harness timeout with the
+// phase's line missing; on a busy host the first longer gap lets the tick in
+// and the phase ends anyway. The harness cases `timer_floor` and
+// `timer_floor_hw` hold the rule by construction.
+//
+// Nothing here reads a duration. A phase ends on the worker's progress, which
+// a stalled host can delay and never fake: a late tick only lengthens the
+// phase. The wait phase can also end because a wait parked (a look that found
+// the clock not yet past the Timer's next deadline), which lets the worker run
+// with no tick; that is a correct kernel's other way through, and a kernel
+// that holds the tick off is caught there only where each wait finds the
+// Timer due.
+
+import sos.{System, Process, Thread, Clock, Timer, Waiter, SosStatus}
+
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// The worker's passes. It wraps rather than saturating, so it always moves.
+unsafe static var PASSES: UInt = 0
+
+static STACK_WORDS: Int = 2048
+unsafe static var STACK_W: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static KEY: UInt = 21
+static WORKER_ROLE: UInt = 1
+
+/// An hour, as a deadline nothing here reaches.
+static FAR_NS: UInt64 = 3_600_000_000_000
+
+static CLOCK_LOOP: Int = 0
+static WAIT_LOOP: Int = 1
+static ARM_LOOP: Int = 2
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+func pass() unsafe {
+    PASSES = PASSES &+ 1
+}
+
+func passes() unsafe -> UInt {
+    PASSES
+}
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func worker_stack_top() unsafe -> UInt {
+    stack_top(((&var STACK_W) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+/// The worker: count a pass and make a call, forever. The process's exit ends
+/// it.
+func worker() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    while {
+        pass()
+        let _ = proc.stats()
+    }
+}
+
+/// One phase: `kind`'s call over and over until the worker has made a pass.
+func phase(kind: Int, clock: &Clock, far: &Timer,
+           waiter: &Waiter) -> Result<Void, SosStatus> {
+    let before = passes()
+    while passes() == before {
+        if kind == ARM_LOOP {
+            try far.arm(after_ns: FAR_NS, interval_ns: 0)
+        } else if kind == WAIT_LOOP {
+            let _ = try waiter.wait()
+        } else {
+            let _ = try clock.now()
+        }
+    }
+    return
+}
+
+func phases(proc: &Process, clock: &Clock) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    let far = try clock.timer_create()
+    let fast = try clock.timer_create()
+    try waiter.add(&fast, KEY)
+
+    // Runnable from here, and run only when the tick preempts this thread.
+    let w = try proc.thread_create(stack_top: worker_stack_top(),
+                                   arg: WORKER_ROLE)
+    try w.start()
+
+    try phase(CLOCK_LOOP, &clock, &far, &waiter)
+    print("SOS reprogram: clock loop, the worker ran\n")
+
+    try fast.arm(after_ns: 1, interval_ns: 1)
+    try phase(WAIT_LOOP, &clock, &far, &waiter)
+    print("SOS reprogram: wait loop, the worker ran\n")
+    try fast.disarm()
+
+    try phase(ARM_LOOP, &clock, &far, &waiter)
+    print("SOS reprogram: arm loop, the worker ran\n")
+    try far.disarm()
+    return
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS reprogram: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let clock = try system.clock_get() catch {
+        print("SOS reprogram: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try phases(&proc, &clock) catch {
+        print("SOS reprogram: failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS reprogram: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker()
+    }
+}

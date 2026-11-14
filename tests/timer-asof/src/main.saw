@@ -1,0 +1,319 @@
+// A Timer's count is as of the call that hands it to a thread: a wait that
+// finds the Timer ready, and an attach that answers a wait already parked.
+//
+//   SOS asofproc: wait stale=0
+//   SOS asofproc: attach stale=0
+//   SOS asofproc: done
+//
+// The Timer runs at an interval of one microsecond, so the fires delivered so
+// far, summed, say what instant they are as of: a count of `n` means the
+// clock had not yet reached `first deadline + n * interval` when it was
+// taken, and had reached every deadline before that. The process brackets the
+// arm with two clock readings, so the first deadline is no later than the
+// second reading plus the delay (`ca`).
+//
+// Each round reads the clock (`c0`) and then asks for the count: by a wait in
+// the first part, by attaching the Timer to a Waiter the other thread is
+// parked on in the second. The kernel brings the Timer up to the clock inside
+// that call, which is after `c0`, so the fires delivered reach past `c0`:
+// `total * interval + ca >= c0`. A round where that fails is stale: the count
+// was as of an instant before a reading the process had already taken.
+//
+// Nothing here depends on how long anything took. A host that stalls between
+// `c0` and the call only moves the kernel's reading later, which raises the
+// count; one that stalls around the arm only raises `ca`. The rounds first
+// wait for the kernel to take an interrupt and then read the clock a few
+// times, which is what makes a kernel that reported the count as of its last
+// interrupt show up as stale; a kernel that looks at the clock passes
+// whatever the interrupts did. The count cannot saturate first: at this
+// interval a machine word of fires is far longer than the harness waits.
+//
+// The scheduler tick is off, so the two threads of the second part change
+// places only where one of them parks: the initial thread is parked on its
+// Waiter before the worker attaches, every round.
+
+import sos.{System, Process, Thread, Clock, Timer, Event, EventMode, Waiter,
+            WaitResult, WaitPayload, SosStatus}
+
+unsafe static var BOOT_HANDLE: UInt = 0
+unsafe static var TIMER_AT: UInt = 0
+unsafe static var CLOCK_AT: UInt = 0
+unsafe static var PARK_WAITER_AT: UInt = 0
+unsafe static var DOWN_WAITER_AT: UInt = 0
+
+/// What the worker measured: the bound on its Timer's first deadline, and the
+/// reading it took before its last attach.
+unsafe static var R_CA: UInt64 = 0
+unsafe static var R_C0: UInt64 = 0
+unsafe static var R_FAILED: UInt = 0
+
+static STACK_WORDS: Int = 2048
+unsafe static var STACK_W: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static KEY_A: UInt = 11
+static KEY_B: UInt = 12
+static KEY_DOWN: UInt = 13
+static DOWN_BITS: UInt = 1
+static WORKER_ROLE: UInt = 1
+
+static ROUNDS: Int = 40
+/// The Timer's period.
+static INTERVAL_NS: UInt64 = 1_000
+/// How far out the first deadline is, so no fire lands between the two
+/// readings around the arm.
+static FIRST_NS: UInt64 = 20_000_000
+/// Clock readings made between seeing the interrupt count move and the
+/// reading that is kept, so that reading is after the service.
+static DELAY_READS: Int = 3
+/// Calls made between the kept reading and the ask.
+static GAP_CALLS: Int = 2
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The fires delivered so far in one part, and how many rounds were stale.
+struct Tally {
+    total: UInt64,
+    stale: UInt,
+    worst: UInt64,
+}
+
+extension Tally {
+    /// Count one round's fires, asked for after the reading `c0`, on a
+    /// schedule whose first deadline is no later than `ca`.
+    func round(&var self, fires: UInt, ca: UInt64, c0: UInt64) {
+        self.total = self.total + (fires as UInt64)
+        let reached = self.total * INTERVAL_NS + ca
+        if reached < c0 {
+            self.stale += 1
+            if c0 - reached > self.worst {
+                self.worst = c0 - reached
+            }
+        }
+    }
+}
+
+func fires_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Timer(fires) -> fires,
+        case _ -> panic("this program attached only Timers to this Waiter"),
+    }
+}
+
+func interrupts_of(proc: &Process) -> Result<UInt64, SosStatus> {
+    let seen = try proc.stats()
+    return seen.interrupts
+}
+
+/// Spin until the kernel has taken an interrupt after the count `from`. What
+/// ends the spin is the kernel's own count, so a host that delays the
+/// interrupt only lengthens it.
+func spin_past(proc: &Process, from: UInt64) -> Result<Void, SosStatus> {
+    var seen = try interrupts_of(&proc)
+    while seen <= from {
+        seen = try interrupts_of(&proc)
+    }
+    return
+}
+
+/// The reading a round keeps: the last of a few, taken after an interrupt was
+/// seen to have been serviced.
+func late_reading(proc: &Process, clock: &Clock) -> Result<UInt64, SosStatus> {
+    let from = try interrupts_of(&proc)
+    try spin_past(&proc, from)
+    var k: Int = 0
+    var c: UInt64 = 0
+    while k < DELAY_READS {
+        c = try clock.now()
+        k += 1
+    }
+    k = 0
+    while k < GAP_CALLS {
+        let _ = try proc.stats()
+        k += 1
+    }
+    return c
+}
+
+/// Arm `timer` and answer the bound on its first deadline, then spin until the
+/// clock is well past it, so the Timer is firing before the first round.
+func arm_and_warm(clock: &Clock, timer: &Timer) -> Result<UInt64, SosStatus> {
+    try timer.arm(after_ns: FIRST_NS, interval_ns: INTERVAL_NS)
+    let after = try clock.now()
+    var now = after
+    while now < after + FIRST_NS + FIRST_NS {
+        now = try clock.now()
+    }
+    return after + FIRST_NS
+}
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func worker_stack_top() unsafe -> UInt {
+    stack_top(((&var STACK_W) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+func park_shared(timer: &Timer, clock: &Clock, park: &Waiter,
+                 down: &Waiter) unsafe {
+    TIMER_AT = ((&timer) as UnsafePointer<Timer>) as UInt
+    CLOCK_AT = ((&clock) as UnsafePointer<Clock>) as UInt
+    PARK_WAITER_AT = ((&park) as UnsafePointer<Waiter>) as UInt
+    DOWN_WAITER_AT = ((&down) as UnsafePointer<Waiter>) as UInt
+}
+
+func worker_armed(ca: UInt64) unsafe { R_CA = ca }
+func worker_read(c0: UInt64) unsafe { R_C0 = c0 }
+func worker_failed() unsafe { R_FAILED = 1 }
+func results_ca() unsafe -> UInt64 { R_CA }
+func results_c0() unsafe -> UInt64 { R_C0 }
+func results_failed() unsafe -> UInt { R_FAILED }
+
+/// The second part, the worker's side: arm the unattached Timer, then each
+/// round read the clock, attach the Timer to the Waiter the initial thread is
+/// parked on, detach it again, and park until told to go on.
+func worker_rounds(proc: &Process) unsafe -> Result<Void, SosStatus> {
+    let timer = TIMER_AT as UnsafePointer<Timer>
+    let clock = CLOCK_AT as UnsafePointer<Clock>
+    let park = PARK_WAITER_AT as UnsafePointer<Waiter>
+    let down = DOWN_WAITER_AT as UnsafePointer<Waiter>
+
+    let ca = try arm_and_warm(&clock[0], &timer[0])
+    worker_armed(ca)
+
+    var r: Int = 0
+    while r < ROUNDS {
+        let c0 = try late_reading(&proc, &clock[0])
+        worker_read(c0)
+        // The attach: the parked thread is handed its record here, by this
+        // call.
+        try park[0].add(&timer[0], KEY_B)
+        try park[0].remove(KEY_B)
+        // Park: the initial thread runs, reads its record, and wakes this one
+        // only after it has parked again.
+        let _ = try down[0].wait()
+        r += 1
+    }
+    return
+}
+
+func worker() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    try worker_rounds(&proc) catch {
+        print("SOS asofproc: worker failed: {}\n", error)
+        worker_failed()
+    }
+    let _ = (move me).exit(0)
+}
+
+/// The first part: one thread, the Timer attached from the start, a wait each
+/// round.
+func wait_part(proc: &Process, clock: &Clock) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    let timer = try clock.timer_create()
+    try waiter.add(&timer, KEY_A)
+    let ca = try arm_and_warm(&clock, &timer)
+
+    var t = Tally(total: 0, stale: 0, worst: 0)
+    var r: Int = 0
+    while r < ROUNDS {
+        let c0 = try late_reading(&proc, &clock)
+        let got = try waiter.wait()
+        t.round(fires_of(&got), ca, c0)
+        r += 1
+    }
+    let _ = timer.disarm()
+    print("SOS asofproc: wait stale={}\n", t.stale)
+    if t.stale != 0 {
+        print("SOS asofproc: wait furthest behind {} ns\n", t.worst)
+    }
+    return
+}
+
+/// The second part, the initial thread's side.
+func attach_part(proc: &Process, clock: &Clock) -> Result<Void, SosStatus> {
+    let park = try proc.waiter_create()
+    let down_waiter = try proc.waiter_create()
+    let down = try proc.event_create(mode: EventMode.Or)
+    let timer = try clock.timer_create()
+    try down_waiter.add(&down, KEY_DOWN)
+    park_shared(&timer, &clock, &park, &down_waiter)
+
+    let w = try proc.thread_create(stack_top: worker_stack_top(),
+                                   arg: WORKER_ROLE)
+    try w.start()
+
+    var t = Tally(total: 0, stale: 0, worst: 0)
+    var r: Int = 0
+    while r < ROUNDS {
+        // Nothing is attached to `park`, so this parks; the worker's attach is
+        // what answers it.
+        let got = try park.wait()
+        if results_failed() != 0 {
+            // The worker printed why; `Unknown` only ends this part.
+            return SosStatus.Unknown
+        }
+        t.round(fires_of(&got), results_ca(), results_c0())
+        r += 1
+        // Make the worker runnable; it runs when this thread parks again, or
+        // joins below.
+        try down.signal(DOWN_BITS)
+    }
+    let _ = try w.join()
+    let _ = timer.disarm()
+    print("SOS asofproc: attach stale={}\n", t.stale)
+    if t.stale != 0 {
+        print("SOS asofproc: attach furthest behind {} ns\n", t.worst)
+    }
+    return
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS asofproc: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let clock = try system.clock_get() catch {
+        print("SOS asofproc: no clock: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try wait_part(&proc, &clock) catch {
+        print("SOS asofproc: the wait part failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try attach_part(&proc, &clock) catch {
+        print("SOS asofproc: the attach part failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS asofproc: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker()
+    }
+}

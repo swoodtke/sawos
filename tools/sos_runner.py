@@ -741,6 +741,8 @@ CHILD_REPLY_DOOR_ORDER_PKG = os.path.join(TESTS_DIR, "child-reply-door-order")
 CLOCK_BASICS_PKG = os.path.join(TESTS_DIR, "clock-basics")
 TIMER_ONESHOT_PKG = os.path.join(TESTS_DIR, "timer-oneshot")
 TIMER_INTERVAL_PKG = os.path.join(TESTS_DIR, "timer-interval")
+TIMER_ASOF_PKG = os.path.join(TESTS_DIR, "timer-asof")
+TIMER_REPROGRAM_PKG = os.path.join(TESTS_DIR, "timer-reprogram")
 TIMER_DEADLOCK_PKG = os.path.join(TESTS_DIR, "timer-deadlock")
 TIMER_BADCLOCK_PKG = os.path.join(TESTS_DIR, "timer-badclock")
 TIMER_BADRECORD_PKG = os.path.join(TESTS_DIR, "timer-badrecord")
@@ -2480,8 +2482,10 @@ TEST_CASES = [
                        # the count, so this holds however late the host
                        # delivers them.
                        "SOS interval: coalesced=1",
-                       # One fire late by more than a one-nanosecond interval
-                       # counts the periods it missed.
+                       # A count taken after the first deadline of a
+                       # one-nanosecond interval counts the periods since. The
+                       # program reads the clock past that deadline before it
+                       # waits, and a wait's count is as of the wait.
                        "SOS interval: late=1",
                        # The drain, proved without a stopwatch: cancel, re-arm
                        # one-shot, wait. A kernel that never reset the count
@@ -2491,6 +2495,122 @@ TEST_CASES = [
                        "SOS: process teardown handles={seven} threads={one} "
                        "events={zero} waiters={one} interrupts={zero} "
                        "timers={one}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A wait's count is as of the wait, not as of the last interrupt. The
+        # case runs in the kernel, where no interrupt is taken, so each Timer's
+        # deadline passes with its interrupt unserviced by construction
+        # (`untouched=1` reads the Timer's own count before the look). Every
+        # number is bracketed by clock reads the case takes around the look,
+        # so no assertion reads a duration. `counted-once` is the look and the
+        # interrupt, run by hand afterwards, jointly counting each period
+        # once. The one-shot's interrupt finds it disarmed, and a disarm or a
+        # re-arm after the look clears what the look brought up. `due` and
+        # `quiet` are the hardware: the timer's interrupt is pending before
+        # the look, and after it the hardware has been programmed again, so
+        # no interrupt is left to arrive for a deadline the look counted.
+        "name": "timer_asof",
+        "src": os.path.join(TESTS_DIR, "timer_asof.saw"),
+        "expect_out": ["SOS asof: on ",
+                       "SOS asof: periodic untouched={one} atleast={one} "
+                       "bracketed={one}",
+                       "SOS asof: periodic again counted-once={one}",
+                       "SOS asof: interrupt after wait counted-once={one}",
+                       "SOS asof: oneshot fires={one} disarmed={one} "
+                       "second={zero} due={one} quiet={one}",
+                       "SOS asof: disarmed up={one} gone={zero} quiet={zero}",
+                       "SOS asof: rearmed up={one} reset={zero} quiet={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same property through the system calls, and the attach's half of
+        # it. A Timer at a one-microsecond interval, so the fires delivered,
+        # summed, say what instant they are as of. Each round reads the clock
+        # and then takes the count, by a wait and then by attaching the Timer
+        # to a Waiter another thread is parked on: the count reaches past the
+        # reading, because the kernel looks at the clock inside the call. A
+        # stall between the reading and the call only raises the count. The
+        # tick is off, so the two threads change places only where one parks.
+        "name": "timer_asof_calls",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": TIMER_ASOF_PKG,
+        "expect_out": ["{banner}",
+                       "SOS asofproc: wait stale=0\n",
+                       "SOS asofproc: attach stale=0\n",
+                       "SOS asofproc: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A call made in a loop cannot hold off the scheduler tick, end to end.
+        # With the tick on, a worker thread runs only when the tick takes the
+        # processor from the initial thread, which never parks: it reads the
+        # clock (the control), then waits on a Timer at a one-nanosecond
+        # interval, then re-arms a Timer an hour out, each over and over until
+        # the worker's pass count moves. A phase ends on the worker's progress
+        # and never on the clock, so a late tick only lengthens it.
+        #
+        # It is a liveness case and not the check that holds the rule. A
+        # kernel that counted a new lead at every call holds the tick off only
+        # while every gap between two of the thread's calls is shorter than the
+        # lead, so it hangs here, at the harness timeout, only on a host quiet
+        # enough to keep every gap that short; a busy host ends each phase at
+        # its first longer gap. `timer_floor` and `timer_floor_hw` hold the
+        # rule by construction.
+        "name": "timer_reprogram_tick",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "tick": True,
+        "root_pkg": TIMER_REPROGRAM_PKG,
+        "expect_out": ["{banner}",
+                       "SOS reprogram: clock loop, the worker ran\n",
+                       "SOS reprogram: wait loop, the worker ran\n",
+                       "SOS reprogram: arm loop, the worker ran\n",
+                       "SOS reprogram: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Programming the timer hardware again never delays what it is already
+        # waiting on. A harness kernel, so no interrupt is taken and each one
+        # is run by hand. The hardware legs read `timer_pending` only after a
+        # spin that waits for it to read pending, or straight after a call
+        # that either leaves the hardware alone or programs it. The other legs
+        # read the kernel's remembered instant through the probe module and
+        # compare remembered instants with each other, never with the clock:
+        # re-arms to the same deadline and, with the tick owed, re-arms and
+        # looks at an always-due Timer never move it later; the interrupt's
+        # service forgets it.
+        "name": "timer_floor",
+        "src": os.path.join(TESTS_DIR, "timer_floor.saw"),
+        "expect_out": ["SOS floor: on ",
+                       "SOS floor: sooner earlier={one} fires={one}",
+                       "SOS floor: due again kept={one} fires={one} "
+                       "quiet={one}",
+                       "SOS floor: periodic far fires={one} quiet={one}",
+                       "SOS floor: same deadline remembered={one} "
+                       "later={zero}",
+                       "SOS floor: interrupt forgets={one}",
+                       "SOS floor: tick owed remembered={one} "
+                       "rearm later={zero} look later={zero}"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same, read off the hardware: with the tick owed and never
+        # serviced, re-arming a far Timer and looking at an always-due one in
+        # a loop leave the comparator reached once the clock is past the tick
+        # by more than the kernel's lead, read once after the loop.
+        #
+        # It runs on the two riscv32 profiles only. There `timer_pending` is
+        # the guest's own comparison of the counter with the comparator, so a
+        # late host only moves the counter further past it. This emulator's
+        # arm64 timer raises its status from a host-side callback, so a single
+        # read after a deadline depends on host time there; `timer_floor`'s
+        # bookkeeping legs hold the same line on every profile.
+        "name": "timer_floor_hw",
+        "src": os.path.join(TESTS_DIR, "timer_floor_hw.saw"),
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["SOS floorhw: on ",
+                       "SOS floorhw: rearm loop pending={one} "
+                       "look loop pending={one}"],
         "expect_clean_exit": True,
     },
     {

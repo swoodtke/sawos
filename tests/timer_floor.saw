@@ -1,0 +1,224 @@
+// Programming the timer hardware again never delays what it is already
+// waiting on.
+//
+// The kernel programs the hardware no sooner than a fixed lead past its own
+// reading of the clock, and it remembers the instant it programmed. Calling
+// into the funnel again keeps that instant while it is still good for what is
+// owed, so a sooner deadline moves it earlier and nothing moves it later
+// while something owed is at or before it; only the interrupt's service
+// forgets it and counts a new lead.
+//
+// The case runs in the kernel, where no interrupt is taken, so each deadline
+// passes with its interrupt unserviced by construction, and the interrupt is
+// run by hand where a leg needs it. Two kinds of evidence:
+//
+//   - the hardware, read with `hal.timer_pending()` only after a spin that
+//     waits until it reads pending, or straight after a call that either
+//     leaves the hardware alone (so a status already read as pending stays
+//     so) or programs it (which sets the status from the new comparator on
+//     every machine here);
+//   - the kernel's own bookkeeping, `timer_probe_programmed()`, which the one
+//     store to the hardware follows. Its legs compare remembered instants
+//     with each other and never with the clock, so they hold where a single
+//     read of the hardware's status after a deadline would depend on how soon
+//     an emulator raised it.
+//
+// A spin on the clock only waits for a deadline to pass, so a stalled host
+// lengthens it and changes no answer.
+
+import kcore.{console, start_tick}
+import kcore.probe.{timer_probe_arm, timer_probe_attach, timer_probe_consume,
+    timer_probe_disarm, timer_probe_interrupt, timer_probe_programmed,
+    timer_probe_wait}
+import hal
+
+/// A delay of 200 microseconds, longer than the kernel's lead, so a deadline
+/// this far out is what the hardware is programmed for.
+static PERIOD_NS: UInt64 = 200_000
+
+/// An hour, as a deadline nothing here reaches.
+static FAR_NS: UInt64 = 3_600_000_000_000
+
+/// What the kernel's bookkeeping reads as when it remembers no instant.
+static NONE: UInt64 = UInt64.max
+
+/// Rounds of the legs whose mutants need a call to land in a window.
+static ROUNDS: UInt = 8
+
+/// Calls made in a loop once the tick is owed.
+static CALLS: Int = 200
+
+/// The scheduler tick the last leg owes, in microseconds.
+static TICK_PERIOD_US: UInt = 1000
+static TICK_NS: UInt64 = 1_000_000
+
+func yes(b: Bool) -> UInt {
+    if b { 1 } else { 0 }
+}
+
+/// Spin until the clock has reached `at` and the hardware reads pending.
+func until_pending(at: UInt64) unsafe {
+    while hal.timer_now_ns() < at || not hal.timer_pending() {
+    }
+}
+
+@export("kmain")
+func kmain() unsafe {
+    let uart = console()
+    uart.write_str("SOS floor: on ")
+    uart.write_str(hal.arch_name())
+    uart.write_str("\n")
+
+    timer_probe_attach()
+
+    // A sooner deadline moves the hardware earlier: with an hour programmed,
+    // arming the same Timer 200 microseconds out programs that, and the
+    // hardware reaches it.
+    timer_probe_arm(hal.timer_now_ns() + FAR_NS, 0)
+    let far = timer_probe_programmed()
+    let near_at = hal.timer_now_ns() + PERIOD_NS
+    timer_probe_arm(near_at, 0)
+    let near = timer_probe_programmed()
+    until_pending(near_at)
+    let near_fires = timer_probe_wait()
+    timer_probe_consume()
+    uart.write_str("SOS floor: sooner earlier=")
+    uart.write_hex(yes(near < far))
+    uart.write_str(" fires=")
+    uart.write_hex(near_fires)
+    uart.write_str("\n")
+
+    // A deadline already due is not delayed. Once the hardware's instant has
+    // passed and its interrupt is pending, re-arming to a later deadline that
+    // has also passed leaves the hardware alone, so the interrupt is still
+    // pending. `due` is past every instant the first arm can have programmed:
+    // `at`, or the lead past a reading no later than `t1`.
+    let at = hal.timer_now_ns() + PERIOD_NS
+    timer_probe_arm(at, 0)
+    let t1 = hal.timer_now_ns()
+    let due = t1 + PERIOD_NS + 1
+    until_pending(due)
+    timer_probe_arm(due, 0)
+    let kept = hal.timer_pending()
+    let due_fires = timer_probe_wait()
+    timer_probe_consume()
+    let due_quiet = not hal.timer_pending()
+    uart.write_str("SOS floor: due again kept=")
+    uart.write_hex(yes(kept))
+    uart.write_str(" fires=")
+    uart.write_hex(due_fires)
+    uart.write_str(" quiet=")
+    uart.write_hex(yes(due_quiet))
+    uart.write_str("\n")
+
+    // A look that counts what the hardware was waiting on, with the next
+    // deadline far off, programs the hardware for that deadline: the
+    // interrupt that was pending is gone, because nothing is due.
+    let first = hal.timer_now_ns() + PERIOD_NS
+    timer_probe_arm(first, FAR_NS)
+    until_pending(first)
+    let far_fires = timer_probe_wait()
+    timer_probe_consume()
+    let far_quiet = not hal.timer_pending()
+    timer_probe_disarm()
+    uart.write_str("SOS floor: periodic far fires=")
+    uart.write_hex(far_fires)
+    uart.write_str(" quiet=")
+    uart.write_hex(yes(far_quiet))
+    uart.write_str("\n")
+
+    // Re-arming to the same deadline, over and over, while the clock runs
+    // through the lead before it and past it, never moves the remembered
+    // instant later.
+    var remembered: UInt = 0
+    var rearm_later: UInt = 0
+    var r: UInt = 0
+    while r < ROUNDS {
+        let same = hal.timer_now_ns() + PERIOD_NS
+        timer_probe_arm(same, 0)
+        let p0 = timer_probe_programmed()
+        if p0 != NONE {
+            remembered = remembered + 1
+        }
+        while hal.timer_now_ns() < same + PERIOD_NS {
+            timer_probe_arm(same, 0)
+            if timer_probe_programmed() > p0 {
+                rearm_later = rearm_later + 1
+            }
+        }
+        let _ = timer_probe_wait()
+        timer_probe_consume()
+        r = r + 1
+    }
+    uart.write_str("SOS floor: same deadline remembered=")
+    uart.write_hex(yes(remembered == ROUNDS))
+    uart.write_str(" later=")
+    uart.write_hex(rearm_later)
+    uart.write_str("\n")
+
+    // The interrupt's service forgets what it spent. A Timer at a
+    // one-nanosecond interval is always due; once the remembered instant has
+    // passed, the interrupt, run by hand, programs a new lead past its own
+    // reading, so the remembered instant is later than the spent one.
+    var forgot: UInt = 0
+    r = 0
+    while r < ROUNDS {
+        timer_probe_arm(hal.timer_now_ns(), 1)
+        // Nothing remembered is no instant to wait past, and counts as not
+        // forgotten.
+        let spent = timer_probe_programmed()
+        if spent != NONE {
+            while hal.timer_now_ns() <= spent {
+            }
+            timer_probe_interrupt()
+            if timer_probe_programmed() > spent {
+                forgot = forgot + 1
+            }
+        }
+        timer_probe_disarm()
+        r = r + 1
+    }
+    uart.write_str("SOS floor: interrupt forgets=")
+    uart.write_hex(yes(forgot == ROUNDS))
+    uart.write_str("\n")
+
+    // The starvation shape, as bookkeeping: the tick is owed and has come
+    // due, as it does while a thread holds the processor between ticks. Then
+    // re-arming a Timer an hour out, and looking at a Timer that is always
+    // due, any number of times, leave the remembered instant where it was.
+    // The tick is started last because it stays owed: no interrupt is taken
+    // here to service it.
+    start_tick(TICK_PERIOD_US)
+    let ticked = hal.timer_now_ns()
+    while hal.timer_now_ns() < ticked + TICK_NS + PERIOD_NS {
+    }
+    let owed = timer_probe_programmed()
+    var arm_later: UInt = 0
+    var k: Int = 0
+    while k < CALLS {
+        timer_probe_arm(hal.timer_now_ns() + FAR_NS, 0)
+        if timer_probe_programmed() > owed {
+            arm_later = arm_later + 1
+        }
+        k = k + 1
+    }
+    timer_probe_arm(hal.timer_now_ns(), 1)
+    var look_later: UInt = 0
+    k = 0
+    while k < CALLS {
+        let _ = timer_probe_wait()
+        if timer_probe_programmed() > owed {
+            look_later = look_later + 1
+        }
+        k = k + 1
+    }
+    uart.write_str("SOS floor: tick owed remembered=")
+    uart.write_hex(yes(owed != NONE))
+    uart.write_str(" rearm later=")
+    uart.write_hex(arm_later)
+    uart.write_str(" look later=")
+    uart.write_hex(look_later)
+    uart.write_str("\n")
+
+    hal.exit_pass()
+}

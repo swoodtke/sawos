@@ -34,11 +34,13 @@
 //    that makes a slow consumer degrade into coarser reporting instead of
 //    falling permanently behind.
 //
-// 3. One late fire counts every period it missed. The Timer is re-armed with
-//    an interval of one nanosecond, which no interrupt can be on time for: it
-//    is taken some time after the deadline, so the lateness is at least one
-//    interval and the single fire the wait reports counts more than one
-//    period. A host stall only makes the interrupt later, which only raises
+// 3. A count taken late counts every period it missed. The Timer is re-armed
+//    with an interval of one nanosecond, and the program reads the clock
+//    until a reading is past the latest instant the first deadline can be
+//    (the reading after the arm, plus the delay). The wait that follows is
+//    after that reading, and its count is as of the wait, so it counts the
+//    first deadline and at least one period more, whatever the interrupts in
+//    between did. A host stall only makes the wait later, which only raises
 //    the count. A kernel that counted one fire per interrupt, or discarded
 //    the periods it missed, reads one here.
 //
@@ -67,8 +69,8 @@ static PERIOD_NS: UInt64 = 1_000_000
 /// Two is the least that makes "above one" true by construction.
 static SERVICED: UInt = 2
 
-/// An interval no interrupt can be on time for: every fire is late by at
-/// least this many nanoseconds, so it counts at least two periods.
+/// The shortest interval: any clock reading past the first deadline is at
+/// least one whole period past it.
 static LATE_INTERVAL_NS: UInt64 = 1
 
 func flag(b: Bool) -> UInt {
@@ -103,6 +105,19 @@ func spin_until_serviced(proc: &Process,
         if seen - start >= count {
             done = true
         }
+    }
+    return
+}
+
+/// Read the clock until a reading is past the first deadline of a Timer armed
+/// `delay` out just before this call. The first reading here is after the arm,
+/// so the deadline is no later than it plus `delay`.
+func spin_past_deadline(clock: &Clock,
+                        delay: UInt64) -> Result<Void, SosStatus> {
+    let after = try clock.now()
+    var now = after
+    while now <= after + delay {
+        now = try clock.now()
     }
     return
 }
@@ -174,10 +189,16 @@ func _start(boot_handle: UInt) {
     }
     print("SOS interval: coalesced={}\n", flag(fires_of(&many) > 1))
 
-    // A fire is always late by more than a one-nanosecond interval.
+    // A count taken after the first deadline has passed counts it and every
+    // one-nanosecond period since.
     let _ = timer.disarm()
     try timer.arm(after_ns: PERIOD_NS, interval_ns: LATE_INTERVAL_NS) catch {
         print("SOS interval: late arm failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try spin_past_deadline(&clock, PERIOD_NS) catch {
+        print("SOS interval: late spin failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

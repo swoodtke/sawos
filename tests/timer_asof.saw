@@ -1,0 +1,167 @@
+// A wait that looks at a Timer reports its count as of the wait.
+//
+// The claim under test is that the count does not wait for the Timer's
+// interrupt: the look expires the Timer against the clock first. The case runs
+// in the kernel, where no interrupt is ever taken (the tick is not started and
+// the kernel is never left), so "no interrupt was serviced between the
+// deadline passing and the wait" holds by construction, not by the host being
+// slow. Each section prints whether the Timer's own count was still zero
+// before the look.
+//
+// Nothing here asserts a duration. Every number is bracketed by clock reads
+// the case itself takes around the look: the kernel's reading lies between the
+// two, so the periods owed as of that reading lie between the periods owed as
+// of the readings either side, whatever the host did meanwhile.
+//
+// The interrupt is then run by hand, the same function the trap path calls, to
+// show what it adds to a Timer a wait already brought up to date.
+
+import kcore.{console}
+import kcore.probe.{timer_probe_arm, timer_probe_armed, timer_probe_attach,
+    timer_probe_consume, timer_probe_disarm, timer_probe_held,
+    timer_probe_interrupt, timer_probe_wait}
+import hal
+
+/// A period of 200 microseconds. Short enough that a few periods are quickly
+/// behind the clock; the value is arbitrary, since nothing is asserted about
+/// how long anything takes.
+static PERIOD_NS: UInt64 = 200_000
+
+/// How many periods the case lets pass before it waits.
+static PERIODS: UInt64 = 5
+
+/// An hour, as a deadline nothing here reaches.
+static FAR_NS: UInt64 = 3_600_000_000_000
+
+/// Periods owed on a schedule whose first deadline is `first`, as of the clock
+/// reading `at`: the count `fire` computes.
+func owed(first: UInt64, at: UInt64) -> UInt64 {
+    if at < first { 0 } else { ((at - first) / PERIOD_NS) + 1 }
+}
+
+func yes(b: Bool) -> UInt {
+    if b { 1 } else { 0 }
+}
+
+/// Let the clock pass the point where `PERIODS` periods of a schedule starting
+/// at `first` are owed.
+func spin_periods(first: UInt64) {
+    while hal.timer_now_ns() < first + (PERIODS - 1) * PERIOD_NS {
+    }
+}
+
+@export("kmain")
+func kmain() unsafe {
+    let uart = console()
+    uart.write_str("SOS asof: on ")
+    uart.write_str(hal.arch_name())
+    uart.write_str("\n")
+
+    timer_probe_attach()
+
+    // Periodic: several periods pass on the clock, then one look.
+    let first = hal.timer_now_ns() + PERIOD_NS
+    timer_probe_arm(first, PERIOD_NS)
+    spin_periods(first)
+    let untouched = timer_probe_held() == 0
+    let b1 = hal.timer_now_ns()
+    let n1 = timer_probe_wait() as UInt64
+    let a1 = hal.timer_now_ns()
+    uart.write_str("SOS asof: periodic untouched=")
+    uart.write_hex(yes(untouched))
+    uart.write_str(" atleast=")
+    uart.write_hex(yes(n1 >= PERIODS))
+    uart.write_str(" bracketed=")
+    uart.write_hex(yes(n1 >= owed(first, b1) && n1 <= owed(first, a1)))
+    uart.write_str("\n")
+
+    // Looking again spends nothing and counts nothing twice: the count is the
+    // periods owed as of the second look, whole.
+    let b2 = hal.timer_now_ns()
+    let n2 = timer_probe_wait() as UInt64
+    let a2 = hal.timer_now_ns()
+    uart.write_str("SOS asof: periodic again counted-once=")
+    uart.write_hex(yes(n2 >= n1 && n2 >= owed(first, b2)
+                       && n2 <= owed(first, a2)))
+    uart.write_str("\n")
+
+    // The interrupt, run after the wait consumed what it reported, adds the
+    // periods since the look and no others: what the wait delivered and what
+    // the interrupt counted are every period owed, once.
+    timer_probe_consume()
+    timer_probe_interrupt()
+    let a3 = hal.timer_now_ns()
+    let total = n2 + (timer_probe_held() as UInt64)
+    uart.write_str("SOS asof: interrupt after wait counted-once=")
+    uart.write_hex(yes(total >= owed(first, b2) && total <= owed(first, a3)))
+    uart.write_str("\n")
+
+    // One-shot: the look finds it ready with one fire, and it has disarmed
+    // itself, so its interrupt arriving later finds nothing and the Timer is
+    // not ready a second time. The hardware goes with it: the case waits
+    // until the timer's interrupt is pending (`due`), and after the look
+    // nothing is scheduled, so the hardware has been programmed again and
+    // the interrupt is no longer pending (`quiet`), however long the host
+    // takes to get there.
+    timer_probe_consume()
+    let at = hal.timer_now_ns() + PERIOD_NS
+    timer_probe_arm(at, 0)
+    while hal.timer_now_ns() < at || not hal.timer_pending() {
+    }
+    let due = hal.timer_pending()
+    let one = timer_probe_wait()
+    let settled = not hal.timer_pending()
+    let disarmed = not timer_probe_armed()
+    timer_probe_consume()
+    timer_probe_interrupt()
+    let again = timer_probe_wait()
+    uart.write_str("SOS asof: oneshot fires=")
+    uart.write_hex(one)
+    uart.write_str(" disarmed=")
+    uart.write_hex(yes(disarmed))
+    uart.write_str(" second=")
+    uart.write_hex(again)
+    uart.write_str(" due=")
+    uart.write_hex(yes(due))
+    uart.write_str(" quiet=")
+    uart.write_hex(yes(settled))
+    uart.write_str("\n")
+
+    // Disarm after the look: what the look brought up is cleared with the
+    // schedule, and nothing is left for the interrupt.
+    let first4 = hal.timer_now_ns() + PERIOD_NS
+    timer_probe_arm(first4, PERIOD_NS)
+    spin_periods(first4)
+    let up = timer_probe_wait()
+    timer_probe_disarm()
+    let gone = timer_probe_wait()
+    timer_probe_interrupt()
+    let quiet = timer_probe_wait()
+    uart.write_str("SOS asof: disarmed up=")
+    uart.write_hex(yes(up >= (PERIODS as UInt)))
+    uart.write_str(" gone=")
+    uart.write_hex(gone)
+    uart.write_str(" quiet=")
+    uart.write_hex(quiet)
+    uart.write_str("\n")
+
+    // Re-arm after the look: the new schedule replaces the old and the count
+    // starts again, so a far deadline is not ready.
+    let first5 = hal.timer_now_ns() + PERIOD_NS
+    timer_probe_arm(first5, PERIOD_NS)
+    spin_periods(first5)
+    let up5 = timer_probe_wait()
+    timer_probe_arm(hal.timer_now_ns() + FAR_NS, PERIOD_NS)
+    let reset = timer_probe_wait()
+    timer_probe_interrupt()
+    let quiet5 = timer_probe_wait()
+    uart.write_str("SOS asof: rearmed up=")
+    uart.write_hex(yes(up5 >= (PERIODS as UInt)))
+    uart.write_str(" reset=")
+    uart.write_hex(reset)
+    uart.write_str(" quiet=")
+    uart.write_hex(quiet5)
+    uart.write_str("\n")
+
+    hal.exit_pass()
+}

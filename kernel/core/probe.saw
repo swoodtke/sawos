@@ -1,0 +1,96 @@
+//! A kernel-mode view of one Timer's wait path, for the harness kernel that
+//! runs before any process exists.
+//!
+//! Nothing in the shipping kernel imports this module, so it adds nothing to
+//! an image that does not name it. It builds one Timer attached to one Waiter
+//! in slot zero of each table, and answers what a wait would find: it calls
+//! `waiter_ready_attachment` and `waitable_answer`, the two a wait runs, and
+//! never a copy of them. The harness runs in the kernel, where no interrupt is
+//! taken, so a deadline can pass with its interrupt unserviced by
+//! construction; `timer_probe_interrupt` then runs the interrupt by hand, as
+//! the trap path would, and `timer_probe_programmed` reads what the kernel
+//! remembers programming the hardware for.
+
+import kcore.irq.{on_timer_interrupt}
+import kcore.limits.{NO_ATTACHMENT}
+import kcore.objects.{SlotState}
+import kcore.time.{PROGRAMMED_NS, TIMERS, TimerSlot, TimerState,
+    reprogram_timer}
+import kcore.waitables.{
+    ATTACHMENTS,
+    Attachment,
+    WAITERS,
+    WaiterSlot,
+    WaiterState,
+    WaitableKind,
+    waitable_answer,
+    waitable_consume,
+    waiter_ready_attachment,
+}
+
+/// The slot each object takes. Nothing has been allocated before the harness
+/// runs, so slot zero of every table is free.
+static SLOT: Int = 0
+
+/// Make a live, unarmed Timer and a live Waiter, and attach one to the other.
+public func timer_probe_attach() unsafe {
+    TIMERS[SLOT] = TimerSlot(state: TimerState.Live, process: 0, clock: 0,
+                             armed: false, deadline_ns: 0, interval_ns: 0,
+                             fires: 0, attachment: SLOT + 1, refs: 1)
+    WAITERS[SLOT] = WaiterSlot(state: WaiterState.Live, process: 0,
+                               attached: SLOT + 1, blocked: 0, refs: 1)
+    ATTACHMENTS[SLOT] = Attachment(state: SlotState.Live,
+                                   kind: WaitableKind.Timer, target: SLOT,
+                                   waiter: SLOT, key: 7, oneshot: false,
+                                   owns: false, link: 0)
+}
+
+/// What `Timer.Arm` does to the schedule and to the hardware: `deadline` is
+/// absolute and an `interval` of zero is a one-shot.
+public func timer_probe_arm(deadline: UInt64, interval: UInt64) unsafe {
+    TIMERS[SLOT].arm(deadline, interval)
+    reprogram_timer()
+}
+
+/// What `Timer.Disarm` does.
+public func timer_probe_disarm() unsafe {
+    TIMERS[SLOT].disarm()
+    reprogram_timer()
+}
+
+/// The count the Timer holds now, which is what the interrupt path has left
+/// and no look has added to.
+public func timer_probe_held() unsafe -> UInt {
+    TIMERS[SLOT].fires
+}
+
+/// Whether the Timer still has a schedule.
+public func timer_probe_armed() unsafe -> Bool {
+    TIMERS[SLOT].armed
+}
+
+/// A wait's look: zero when the Waiter has nothing ready, otherwise the count
+/// the record would carry. Nothing is spent.
+public func timer_probe_wait() unsafe -> UInt {
+    if waiter_ready_attachment(SLOT) == NO_ATTACHMENT {
+        return 0
+    }
+    waitable_answer(WaitableKind.Timer, SLOT).payload
+}
+
+/// What the delivery of a wait's record spends.
+public func timer_probe_consume() unsafe {
+    waitable_consume(WaitableKind.Timer, SLOT)
+}
+
+/// The instant the kernel remembers programming the hardware for, or
+/// `UInt64.max` (the kernel's never) when it remembers none. This is the
+/// kernel's bookkeeping, which the one store to the hardware follows.
+public func timer_probe_programmed() unsafe -> UInt64 {
+    PROGRAMMED_NS
+}
+
+/// The timer interrupt, run by hand.
+public func timer_probe_interrupt() unsafe {
+    on_timer_interrupt(0)
+}

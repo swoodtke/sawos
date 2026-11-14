@@ -21,7 +21,8 @@ import kcore.threads.{
     THREADS,
     ThreadState,
 }
-import kcore.time.{NEXT_TICK_NS, TICK_PERIOD_NS, TIMERS, reprogram_timer}
+import kcore.time.{NEXT_TICK_NS, TICK_PERIOD_NS, TIMERS, reprogram_timer,
+    timer_programming_spent}
 import kcore.waitables.{INTERRUPTS, WaitableKind, interrupt_by_line}
 import kcore.refs.{notify_ready}
 
@@ -179,12 +180,15 @@ public func timer_ticks() unsafe -> UInt {
 /// against the same instant: a Timer cannot be late because the tick ran first,
 /// and the tick cannot slip because several Timers came due together.
 /// Programming the next deadline is last, and it also lowers the line (both
-/// machines' timer condition is a level).
+/// machines' timer condition is a level). What the hardware was programmed for
+/// is forgotten first, because this service spends it, so the next deadline
+/// gets a new lead even when it is already due (`timer_programming_spent`).
 ///
 /// `pc` is where the interrupted context resumes, or one of the two poll
 /// sentinels when nothing trapped: `IDLE_PC` when the idle path found the fire,
 /// `PREEMPT_PC` when a preemption point did.
-func on_timer_interrupt(pc: UInt) unsafe {
+public(package) func on_timer_interrupt(pc: UInt) unsafe {
+    timer_programming_spent()
     let now = hal.timer_now_ns()
 
     if TICK_PERIOD_NS != 0 && now >= NEXT_TICK_NS {

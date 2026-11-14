@@ -41,7 +41,7 @@ import kcore.objects.{
     pipe_has_room,
 }
 import kcore.threads.{NEED_RESCHED, THREADS, ThreadState}
-import kcore.time.{TIMERS, saturating_add}
+import kcore.time.{TIMERS, catch_up_timer, saturating_add}
 // Process is a waitable kind, so the per-kind matrix below reads the process
 // slot. `process` must not import this module.
 import kcore.pslot.{PROCESS_RECORDS, ProcessState}
@@ -726,9 +726,25 @@ public(package) struct WaitAnswer {
 /// is O(attachments) and runs with interrupts masked, so its length is
 /// interrupt latency.
 public(package) func waiter_ready_attachment(w: Int) unsafe -> Int {
+    // A Timer is brought up to the clock before it is asked (`catch_up_timer`),
+    // so a wait reports a count as of the wait. The clock is read once, at the
+    // first Timer the scan reaches, and every Timer after it is judged against
+    // that reading.
+    var now: UInt64 = 0
+    var read = false
     var cur = WAITERS[w].attached
     while cur != 0 {
         let a = cur - 1
+        match ATTACHMENTS[a].kind {
+            case Timer -> {
+                if not read {
+                    now = hal.timer_now_ns()
+                    read = true
+                }
+                catch_up_timer(ATTACHMENTS[a].target, now)
+            },
+            case _ -> {},
+        }
         if waitable_ready(ATTACHMENTS[a].kind, ATTACHMENTS[a].target) {
             return a
         }

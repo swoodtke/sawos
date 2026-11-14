@@ -260,6 +260,7 @@ import kcore.time.{
     TimerSlot,
     TimerState,
     alloc_timer,
+    catch_up_timer,
     clock_slot,
     reprogram_timer,
 }
@@ -2583,6 +2584,14 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt,
     // zero and settle the exchange. The other order would leave a
     // settled-but-for-one-entry ring slot held by a handle the very next line
     // destroys.
+    //
+    // A Timer is brought up to the clock first, as a wait's scan does: the
+    // record this hands a parked thread carries the Timer's count, and that
+    // count is as of this attach, not as of the last interrupt serviced.
+    match target.kind {
+        case Timer -> { catch_up_timer(target.slot, hal.timer_now_ns()) },
+        case _ -> {},
+    }
     if waitable_ready(target.kind, target.slot) {
         wake_one_waiter(w, a)
     }

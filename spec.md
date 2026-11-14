@@ -751,6 +751,9 @@ a reply delivery carries, which is why there is one type and not two — and
   is a `NotWaitable` fault; so is attaching a MemoryObject or a Pool, neither
   of which has state that could become ready.
 
+  A Timer's answer to "am I ready" is given as of the wait (§2.6): the wait
+  brings it up to the clock first.
+
   What stays per-kind is five questions — who is watching me, set who is
   watching me, am I ready, what does a record say, and a record was
   delivered — each an exhaustive match, and `waitable_slot` is the only place
@@ -1551,14 +1554,47 @@ at once or blocks forever). Ops `Arm`/`Disarm`; rights `TimerRight.Arm`
   delivered as `WaitPayload.Timer(fires:)`. The count is computed by division
   rather than by a loop, so an interval far below what the machine can serve
   costs one divide; what keeps it from livelocking is a floor on how soon the
-  hardware is ever programmed, which leaves the logical schedule untouched. No
-  minimum interval is imposed and nothing is refused.
+  hardware is ever programmed, which leaves the logical schedule untouched. The
+  floor is a fixed lead counted from the clock reading at which the kernel
+  programs the hardware afresh, and the hardware is programmed afresh only when
+  its interrupt has been serviced or when what it waits on no longer serves:
+  programming it again never delays what it is already waiting on. An instant
+  the hardware waits on is kept while it is no later than the earliest deadline
+  owed with the floor applied, and either no earlier than that deadline or with
+  that deadline already due; a sooner deadline moves it earlier, and it moves
+  later only when nothing owed is at or before it. So a thread that arms a
+  Timer, or waits on one, more often than once a lead cannot hold off the tick
+  or another Timer's fire. No minimum interval is imposed and nothing is
+  refused.
+- **A Timer is ready once its expiry has passed, as of its interrupt or of a
+  wait or an attach that looked.** A wait (`Waiter.Wait`, and the wait leg of
+  `ReplyWait`) reads the clock once and brings every Timer it looks at up to
+  that reading before it asks whether the Timer is ready: a Timer whose
+  deadline has passed counts every period passed as of the wait, by the same
+  division the interrupt uses, and a one-shot counts one and disarms. So the
+  count a wait reports for a Timer it finds ready is as of the wait and does
+  not lag the Timer's interrupt, and a Timer already expired is ready at the
+  wait without waiting for its interrupt to be taken. An attach looks the same
+  way at the Timer it attaches, before the level-triggered check that can hand
+  a thread already parked on the Waiter its record (§2.2), so the count in
+  that record is as of the attach. Those are the calls that hand a process a
+  Timer's count; the third way a count is delivered is the interrupt itself
+  waking a parked thread, as of its own reading. A period is counted once,
+  whichever saw it first: the look moves the deadline past the reading (or
+  disarms the one-shot), and the hardware is programmed again for what is
+  still owed, so it is not left waiting on a deadline a look has counted while
+  nothing else is due. The kernel runs with interrupts masked, so the look and
+  the interrupt never interleave, and the look is one slot's arithmetic per
+  Timer and one pass over the schedule when it counts a fire, with no
+  preemption point. Nothing else about waits changes: only a Timer is looked
+  at against the clock.
 - **There is no ack**: unlike §9's Interrupt there is no mask to release, so
   the wait that reports the fires is what consumes them.
-- Arming an armed timer replaces its schedule and clears the count; disarming
-  an unarmed one is a no-op, deliberately opposite to §9's ack-with-no-fire —
-  a one-shot disarms itself, so cancelling a timeout that just expired is an
-  ordinary race rather than a caller error.
+- Arming an armed timer replaces its schedule and clears the count, including
+  one a wait brought up to date and had not yet delivered; disarming clears it
+  the same way, and disarming an unarmed one is a no-op, deliberately opposite
+  to §9's ack-with-no-fire — a one-shot disarms itself, so cancelling a
+  timeout that just expired is an ordinary race rather than a caller error.
 
 **One hardware timer, two customers.** Both machines have a single
 comparator, and the scheduler tick (§7) and every armed Timer want it. The
