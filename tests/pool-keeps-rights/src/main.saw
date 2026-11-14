@@ -1,0 +1,86 @@
+// An allocation carries the bits of the pool handle it came through (spec
+// §2.5, §3).
+//
+// The pool handle is a sibling that keeps `Allocate` and `Map` and drops
+// `MapExecute`. An allocation through it must not map executable either, or a
+// pool handle narrowed to forbid executable mappings could regain the right by
+// allocating.
+//
+//   SOS poolkeep: minted a pool sibling without MapExecute
+//   SOS poolkeep: its allocation maps read-write  <- it is a live handle
+//   SOS poolkeep: asking for execute through the allocation
+//   SOS: process fault: access denied
+//
+// The read-write map is the control: an allocation that could not map at all
+// would produce the same refusal for the wrong reason. The refusal is a fault,
+// so it is the last thing this program does.
+
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, PoolRight,
+            SosStatus}
+
+static CHUNK: UInt = 0x1000
+
+static RX: UInt32 = MapAccess.Read | MapAccess.Execute
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// `Allocate` and `Map` are kept; `MapExecute` is absent by silence.
+static NARROW: UInt32 = (PoolRight.Allocate | PoolRight.Map)
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poolkeep: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS poolkeep: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_pool() else {
+        let _ = system.debug_print("SOS poolkeep: pool record is not a pool\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try pool.mint(rights: NARROW) catch {
+        print("SOS poolkeep: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print(
+        "SOS poolkeep: minted a pool sibling without MapExecute\n")
+
+    let piece = try narrow.allocate(len: CHUNK) catch {
+        print("SOS poolkeep: allocation failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _data = try proc.map(memory: &piece, access: RW) catch {
+        print("SOS poolkeep: mapping read-write failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print(
+        "SOS poolkeep: its allocation maps read-write\n")
+
+    let _ = system.debug_print(
+        "SOS poolkeep: asking for execute through the allocation\n")
+    match proc.map(memory: &piece, access: RX) {
+        case Ok(_) -> {
+            let _ = system.debug_print(
+                "SOS poolkeep: UNREACHABLE mapped executable\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS poolkeep: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

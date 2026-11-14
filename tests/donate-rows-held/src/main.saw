@@ -1,0 +1,79 @@
+// An allocation a child's rows grant is no slab donation (spec §2.5, §2.8).
+// Root creates a child in its destination and leaves it unstarted, which is
+// all the rows need: they are recorded at the create.
+//
+//   SOS donaterows: a child created in the destination, unstarted
+//   SOS: process fault: object in the wrong state <- root holds the only
+//                                                   handle, and the donation is
+//                                                   refused all the same: the
+//                                                   bytes are a child's, not
+//                                                   the kernel's
+//
+// The last line is a fault, so it is the only way to assert it, and root is
+// the donor. A kernel that did not count the child's copied segments and its
+// stack on the destination would see an idle allocation, accept the donation
+// and put its own slab inside the child's image.
+//
+// The destination is an allocation minted at boot; `tests/pool-faults` makes
+// the same refusal of a destination a pool made, donated by the child that
+// runs in it.
+
+import sos.{System, SlabKind}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS donaterows: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var image_record = try proc.boot_handle_next() catch {
+        print("SOS donaterows: no image region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest_record = try proc.boot_handle_next() catch {
+        print("SOS donaterows: no destination region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image = image_record.take_memory() else {
+        let _ = system.debug_print(
+            "SOS donaterows: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest = dest_record.take_memory() else {
+        let _ = system.debug_print(
+            "SOS donaterows: dest record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _child = try system.process_create(image: &image, memory: &dest) catch {
+        print("SOS donaterows: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print(
+        "SOS donaterows: a child created in the destination, unstarted\n")
+
+    // This call does not return: the donation is a `BadState` fault. Both arms
+    // are unreachable, on `tests/slab-donate-shared`'s pattern.
+    match system.slab_donate(kind: SlabKind.Waiters, memory: move dest) {
+        case Ok(_) -> {
+            let _ = system.debug_print(
+                "SOS donaterows: UNREACHABLE — rows' bytes absorbed\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(_) -> {
+            let _ = system.debug_print(
+                "SOS donaterows: UNREACHABLE — refused with a status\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+}

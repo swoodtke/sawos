@@ -1,0 +1,127 @@
+// An image allocation a child runs from in place is held by the child's rows
+// (spec §2.5, §5.6).
+//
+// The case's one child is hand-assembled (`tests/<arch>/child_inplace.S`):
+// its code is used in place in the image, which root allocates off the front
+// of the blob, whose row is a pool, and launches the child from. Root
+// releases its handle on the image before the child runs, so the child's
+// code row is the last thing naming it:
+//
+//   SOS imagerows: launched from the image, its handle released
+//   SOS-H                               the child, run from the image
+//   SOS imagerows: the child exited from its image
+//   SOS imagerows: after its death the image's bytes came back
+//                                       the next allocation is the image
+//
+// Last, a second child is created from the image that came back, and root
+// donates the image: an allocation a row still grants is no donation, and
+// the kernel ends root (`BadState`; on a board whose blobs are flash, the
+// region rule's `BadArg` comes first). `tests/image-held` shows the image's
+// bytes held while the child runs.
+
+import sos.{System, Process, Pool, SlabKind, SosStatus, SystemRight}
+
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// The front of the blob that holds the image (`child_inplace.S`).
+static PIECE: UInt = 0x100
+
+static TAG_BOOT: UInt = 21
+static KEY_DEATH: UInt = 6
+
+/// What the child may ask its System object for; `Transfer` is what lets root
+/// give it.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The status word of the child's exit with its own code, 0x48.
+static EXITED_MARK: UInt = 65608
+
+static_assert((1 * 65536) + 0x48 == 65608,
+              "an exit's status word is Exited in the high bits and the code")
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS imagerows: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS imagerows: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS imagerows: the donation was taken\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var blob_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let blob = blob_rec.take_pool() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let image = try blob.allocate(len: PIECE)
+    let child = try system.process_create(image: &image, memory: &ram)
+    try start(&system, &child)
+    let _ = move image
+    let _ = system.debug_print(
+        "SOS imagerows: launched from the image, its handle released\n")
+
+    try wait_exit(&proc, &child)
+    let _ = system.debug_print(
+        "SOS imagerows: the child exited from its image\n")
+
+    // The teardown dropped the child's code row, the last thing naming the
+    // image, so the pool serves its bytes again.
+    let back = try blob.allocate(len: PIECE)
+    let again = try system.process_create(image: &back, memory: &ram)
+    let _ = system.debug_print(
+        "SOS imagerows: after its death the image's bytes came back\n")
+
+    try system.slab_donate(kind: SlabKind.Waiters, memory: move back) catch {
+        let (why, back_image) = move error
+        let _ = move back_image
+        print("SOS imagerows: the donation answered {}\n", why)
+        return BUG
+    }
+    let _ = move again
+    return
+}
+
+/// Give `child` a System handle it may print and exit through, and start it.
+func start(system: &System, child: &Process) -> Result<Void, SosStatus> {
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return
+}
+
+/// Wait for `child` to end and require that it exited with its own code.
+func wait_exit(proc: &Process, child: &Process) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH || status != EXITED_MARK {
+                print("SOS imagerows: the child ended with status {}\n",
+                      status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

@@ -203,7 +203,6 @@ import kcore.objects.{
     pool_available,
     pool_can_serve,
     pool_cut,
-    pool_cut_base,
     staged_count,
     table_room,
     boot_handle_cursor,
@@ -309,8 +308,6 @@ import kcore.process.{
     meets_row,
     record_grant,
     remove_grant,
-    rows_clear_of_cut,
-    rows_move_to_piece,
 }
 import kcore.loader.{
     ImageTable,
@@ -917,7 +914,7 @@ func process_ceiling(p: Int, target: Int, raw: UInt) unsafe -> SyscallResult {
 /// No `MemoryRight` is spent. The authority to create a process is
 /// `SystemRight.ProcessCreate` on the caller's System handle, already checked;
 /// these handles are the operation's arguments. Ops that do ask what a holder
-/// may do with a region (`Split`, `Map`) go through `MemoryObject.allows`.
+/// may do with a region (`Map`) go through `MemoryObject.allows`.
 func memory_arg(p: Int, handle: UInt) unsafe -> Int {
     let entry = lookup_handle(p, handle)
     match entry.obj_type {
@@ -1075,9 +1072,8 @@ func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
 ///
 /// A pool also needs `out_bytes == 0`, for `memory_release_if_idle`'s reason:
 /// allocations on loan carry a back-reference to the slot, and retiring it
-/// under them would make those references name a stranger. So does an
-/// allocation minted at boot, which is its own pool for the pieces `Split`
-/// cuts from it.
+/// under them would make those references name a stranger. An allocation
+/// keeps no ledger, so it is asked only for its handles and its rows.
 ///
 /// A region with bytes must be memory the board can give a process
 /// (`hal.map_source_ok`): the kernel writes its slots there, and a region over
@@ -1088,11 +1084,11 @@ func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
 /// Faults versus statuses: a missing right, an unknown kind, a handle that is
 /// neither a Pool nor a Memory, a region the board cannot give, and each of
 /// the state conditions are things the caller could have checked (it minted
-/// the siblings, installed the rows, allocated or split the pieces), so they
-/// end the process. Whether a region holds a whole slot of
-/// some kind the caller cannot name, and whether the extent chain has room, are
-/// machine answers: they return `NoResource` with nothing consumed and the
-/// caller's capability untouched.
+/// the siblings, installed the rows, made the allocations), so they end the
+/// process. Whether a region holds a whole slot of some kind the caller cannot
+/// name, and whether the extent chain has room, are machine answers: they
+/// return `NoResource` with nothing consumed and the caller's capability
+/// untouched.
 func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
     guard let kind = SlabKind.from(raw: raw_kind) else {
         fault_process(p, FaultReason.BadArg)
@@ -1115,8 +1111,7 @@ func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
     if MEMORIES[slot].maps != 0 {
         fault_process(p, FaultReason.BadState)
     }
-    let root = MEMORIES[slot].root
-    if root == slot && MEMORIES[slot].out_bytes != 0 {
+    if MEMORIES[slot].pool == slot && MEMORIES[slot].out_bytes != 0 {
         fault_process(p, FaultReason.BadState)
     }
 
@@ -3114,92 +3109,6 @@ func memory_op(raw_op: UInt, obj: &MemoryObject, arg0: UInt,
 func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
                        p: Int) unsafe -> SyscallResult {
     match op {
-        // Split: one cut from the front, and the parent becomes the remainder.
-        // An allocation minted at boot is its own pool, and serves a cut from
-        // its free list first and its cursor second (`pool_cut`); either way a
-        // region is one contiguous range and the caller supplies no addresses.
-        // A piece names the pool its parent names and records its parent's
-        // granularity.
-        //
-        // Three refusals, all `BadArg` faults. A `len` of zero: a region naming
-        // no bytes is not a region. A `len` this region cannot serve in one
-        // range (`pool_can_serve`): a split that silently clamped would hand
-        // back a region smaller than the number in the call. A misaligned
-        // `len`: a grant covers whole units of the target's protection
-        // granularity, so a cut mid-unit would leave a remainder that could
-        // never be mapped without granting the piece before it too.
-        //
-        // With a free list the second refusal can also mean fragmentation: the
-        // pool holds the bytes but not in one range, which the caller cannot
-        // compute and which is therefore not strictly its mistake. It is
-        // knowingly classed as a fault rather than `NoResource`; moving it
-        // would change behaviour.
-        //
-        // Slab exhaustion is `NoResource`, a status, because a caller cannot
-        // know how many slots are left. A piece that is split off and dropped
-        // returns its slot at once, so a splitting loop meets the pool wall
-        // before the slab wall: the bytes are what nothing returns.
-        //
-        // Rows counted on the region go with the bytes they grant. A row lying
-        // wholly inside the cut moves to the piece and the rest stay, so the
-        // piece's range returns to the pool only when no row of any process is
-        // left in it. A cut through the middle of a row is `NoResource`, a
-        // status: where a child's segments lie is not something the launcher
-        // that holds its region can have known, as for `Map` over an image row.
-        case Split -> {
-            if not obj.allows(MemoryRight.Split) {
-                fault_process(p, FaultReason.AccessDenied)
-            }
-            let len = arg0
-            if len == 0 || not pool_can_serve(obj.slot, len) {
-                fault_process(p, FaultReason.BadArg)
-            }
-            if (len % hal.PROT_GRAIN) != 0 {
-                fault_process(p, FaultReason.BadArg)
-            }
-            // A cut that would run through a row counted on this region is
-            // refused with nothing changed. The rows wholly inside the cut go
-            // with it, below.
-            let cut = pool_cut_base(obj.slot, len)
-            if not rows_clear_of_cut(obj.slot, cut, len) {
-                return op_status(SosStatus.NoResource)
-            }
-            if not quota_room(p, QuotaKind.Memory) {
-                return op_status(SosStatus.QuotaExceeded)
-            }
-            let slot = alloc_memory()
-            if slot == NO_MEMORY {
-                return op_status(SosStatus.NoResource)
-            }
-            // The piece carries the rights of the handle the op came through,
-            // so a derivation never widens: a parent narrowed to drop
-            // `MapExecute` yields pieces that cannot map executable.
-            let handle = mint_capped(p, ObjType.Memory, obj.rights, slot)
-            if handle == NO_HANDLE {
-                return op_status(mint_refusal(p))
-            }
-            // The cut, once both allocations are behind us: first fit off the
-            // pool's free list, else the front-cut cursor (`pool_cut`). The
-            // child takes the front of whichever range served it; a parent
-            // split down to zero is representable and refuses every later
-            // split.
-            //
-            // The child carries the root down. Its bytes go back to the pool
-            // when both of its counts reach zero, not to this parent; the
-            // derivation chain is a cursor artifact, not an ownership tree.
-            let base = pool_cut(obj.slot, len)
-            let unit = MEMORIES[obj.slot].granularity
-            MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
-                                        base: base, len: len, refs: 1, maps: 0,
-                                        root: MEMORIES[obj.slot].root,
-                                        granularity: unit,
-                                        parent: NO_MEMORY, lent_base: 0,
-                                        lent_len: 0, depth: 0, free_head: 0,
-                                        out_bytes: 0, dropped: 0)
-            rows_move_to_piece(obj.slot, slot, base, len)
-            quota_charge(p, QuotaKind.Memory)
-            op_value(handle)
-        },
         // Map: install this region in a domain and answer with the Mapping.
         // `arg0` is the target Process handle and `arg1` the `MapAccess` bits;
         // the two rights it spends are checked on two objects, here and in
@@ -3364,7 +3273,7 @@ func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
             let base = pool_cut(obj.slot, len)
             MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
                                         base: base, len: len, refs: 1, maps: 0,
-                                        root: obj.slot, granularity: unit,
+                                        pool: obj.slot, granularity: unit,
                                         parent: NO_MEMORY, lent_base: 0,
                                         lent_len: 0, depth: 0, free_head: 0,
                                         out_bytes: 0, dropped: 0)
@@ -3420,10 +3329,10 @@ func iomemory_op(raw_op: UInt, obj: &IoMemoryObject, arg0: UInt,
 func iomemory_op_decoded(op: IoMemoryOp, obj: &IoMemoryObject, arg0: UInt,
                          arg1: UInt, p: Int) unsafe -> SyscallResult {
     match op {
-        // Carve leaves the parent alone, unlike `Split` (spec §2.5): MMIO is
-        // pinned, a fixed region may be handed out many times, and several
-        // drivers may legitimately hold windows onto one peripheral. So there
-        // is no cursor and no arithmetic on the parent.
+        // Carve leaves the parent alone, unlike a pool's `Allocate` (spec
+        // §2.5): MMIO is pinned, a fixed region may be handed out many times,
+        // and several drivers may legitimately hold windows onto one
+        // peripheral. So there is no cursor and no arithmetic on the parent.
         //
         // `arg0` is an offset into the parent and `arg1` a length: a caller
         // names a sub-window relative to what it holds and never learns an
@@ -3458,7 +3367,8 @@ func iomemory_op_decoded(op: IoMemoryOp, obj: &IoMemoryObject, arg0: UInt,
                 return op_status(SosStatus.NoResource)
             }
             // The window carries the rights of the handle the op came through,
-            // for the reason a `Split` piece does.
+            // for the reason an allocation carries its pool handle's: a
+            // derivation never widens.
             let handle = mint_capped(p, ObjType.IoMemory, obj.rights, slot)
             if handle == NO_HANDLE {
                 return op_status(mint_refusal(p))
@@ -4878,9 +4788,8 @@ func dispatch(handle: UInt, op: UInt,
                                   rights: entry.rights, slot: entry.target)
             timer_op(op, &obj, arg0, arg1)
         },
-        // A Memory has two ops, derive and install (spec §2.5); an unknown
-        // number aimed at one is `BadOp` inside `memory_op` rather than at this
-        // line.
+        // A Memory has one op, install (spec §2.5); an unknown number aimed
+        // at one is `BadOp` inside `memory_op` rather than at this line.
         case Memory -> {
             let obj = MemoryObject(handle: MemoryHandle(handle),
                                    rights: entry.rights, slot: entry.target)

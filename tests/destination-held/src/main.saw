@@ -1,58 +1,59 @@
-// A split does not free bytes a live process's rows cover (spec §2.5).
+// A destination released while its child runs is held until the child's
+// death (spec §2.5).
 //
-// A child's image and stack rows count on the `Memory` it was created in. A
-// launcher that splits that `Memory` cuts a front piece off it, and the rows
-// that lie in the piece go with it, so releasing the piece's handle leaves a
-// husk and does not return the child's bytes to the pool while it runs.
+// A child's copied segments and its stack are rows counted on the allocation
+// it was created in. A launcher that allocates that destination from a pool,
+// creates the child in it and releases its only handle leaves an allocation
+// the child's rows still name, so its bytes do not go back to the pool while
+// the child runs.
 //
-//   SOS splitlive: child parked                  <- the child printed nothing
+//   SOS desthold: child parked                   <- the child printed nothing
 //                                                   yet and waits for `go`
-//   SOS splitlive: front piece cut               <- one cut, wholly above the
-//                                                   child's segments and wholly
-//                                                   below its stack
-//   SOS splitlive: front piece released
-//   SOS splitlive: next piece taken and mapped
-//   SOS splitlive: while the child lives, witness found=0
+//   SOS desthold: destination released          <- root's only handle on it
+//   SOS desthold: next allocation taken and mapped
+//   SOS desthold: while the child lives, witness found=0
 //                                                <- what a third party can see:
-//                                                   the next piece is not the
-//                                                   child's bytes
+//                                                   the next allocation is not
+//                                                   the child's bytes
 //   SOS livedata: pattern intact                 <- the child's own voice
-//   SOS splitlive: child ended status=65607
-//   SOS splitlive: after its death, witness found=1
+//   SOS desthold: child ended status=65607
+//   SOS desthold: after its death, witness found=1
 //                                                <- the child's bytes came
-//                                                   home; a fresh piece of the
-//                                                   same size is them, and
-//                                                   carries the pattern
-//   SOS splitlive: done
+//                                                   home; a fresh allocation
+//                                                   of the same size is them,
+//                                                   and carries the pattern
+//   SOS desthold: done
 //
 // "Found" is the program's own measurement: the child's pattern is four words
 // that appear nowhere else, and the launcher looks for them through a mapping
-// of the piece it was given. No address is asserted, only whether the pattern
-// is in the bytes a piece names.
+// of the allocation it was given. No address is asserted, only whether the
+// pattern is in the bytes an allocation names.
 //
-// A kernel that counted the child's rows on the region it was created in and
-// left them there when the front was cut would return the front to the pool at
-// its release. The second cut would be the same bytes, the scan would find the
-// pattern while the child lives, and the launcher's write through its mapping
-// would reach the child's data: the child then reports `pattern changed`.
+// The pool is the child's destination row, and the destination is its front
+// `DEST_LEN` bytes, at the address the child is linked at. A pool serves its
+// free list first, so a kernel that let the destination's range go home at the
+// release would serve its front to the next allocation, the scan would find
+// the pattern while the child lives, and the launcher's write through its
+// mapping would reach the child's data: the child then reports `pattern
+// changed`.
 //
-// The cut is `CUT` bytes: a power of two so the mapping fits a protection
+// A look is `LOOK_LEN` bytes: a power of two so the mapping fits a protection
 // entry on every profile, larger than the child's image (its arena is small,
-// `tests/child-live-data`) and smaller than half the region, so the second cut
-// is served by the remainder whether or not the first range came back.
+// `tests/child-live-data`) and no larger than what the pool holds past the
+// destination, so a look is served whether or not the destination came back.
 //
 // Each leg is a function of its own, for the reason `tests/memory-recycle`
 // gives about root's stack.
 
-import sos.{System, Process, Memory, Mapping, MapAccess, Event, SosStatus,
-            SystemRight}
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, Event,
+            SosStatus, SystemRight}
 
-/// The child's region is this long on every profile, and the kernel's stack
-/// grant takes the top `STACK_LEN` of it.
-static REGION_LEN: UInt = 0x40000
+/// The child's destination: the front half of its region, which is twice this
+/// long on every profile this case runs on.
+static DEST_LEN: UInt = 0x2_0000
 
-/// The front piece's length.
-static CUT: UInt = 0x10000
+/// A look's length.
+static LOOK_LEN: UInt = 0x1_0000
 
 /// The tags the child's gives travel under.
 static TAG_BOOT: UInt = 11
@@ -96,11 +97,11 @@ func poke(addr: UInt, value: UInt32) unsafe {
     UnsafeMemory<UInt32, Normal>(addr).write(value)
 }
 
-/// The byte offset in `[base, base + CUT)` where the child's four words begin,
-/// or `NOT_FOUND`.
+/// The byte offset in `[base, base + LOOK_LEN)` where the child's four words
+/// begin, or `NOT_FOUND`.
 func find_witness(base: UInt) unsafe -> Int {
     var off: UInt = 0
-    while off + 16 <= CUT {
+    while off + 16 <= LOOK_LEN {
         if peek(base + off) == W0 && peek(base + off + 4) == W1 &&
            peek(base + off + 8) == W2 && peek(base + off + 12) == W3 {
             return off as Int
@@ -165,12 +166,12 @@ func launch(system: &System, child: &Process, ready: &Event,
     return
 }
 
-/// Take a piece of `CUT` bytes off `dest`, map it into this process and say
-/// whether the child's pattern is in it. With `clobber` set the first word of
+/// Allocate `LOOK_LEN` bytes from `pool`, map them into this process and say
+/// whether the child's pattern is in them. With `clobber` set the first word of
 /// the pattern is overwritten when found.
-func look(proc: &Process, dest: &Memory,
+func look(proc: &Process, pool: &Pool,
          clobber: Bool) -> Result<Bool, SosStatus> {
-    let piece = try dest.split(len: CUT)
+    let piece = try pool.allocate(len: LOOK_LEN)
     let mapping = try proc.map(memory: &piece, access: RW)
     let base = try mapping.base()
     let at = find_witness(base)
@@ -185,52 +186,50 @@ func report(system: &System, found: Bool, while_alive: Bool) {
     if while_alive {
         if found {
             let _ = system.debug_print(
-                "SOS splitlive: while the child lives, witness found=1\n")
+                "SOS desthold: while the child lives, witness found=1\n")
         } else {
             let _ = system.debug_print(
-                "SOS splitlive: while the child lives, witness found=0\n")
+                "SOS desthold: while the child lives, witness found=0\n")
         }
     } else {
         if found {
             let _ = system.debug_print(
-                "SOS splitlive: after its death, witness found=1\n")
+                "SOS desthold: after its death, witness found=1\n")
         } else {
             let _ = system.debug_print(
-                "SOS splitlive: after its death, witness found=0\n")
+                "SOS desthold: after its death, witness found=0\n")
         }
     }
 }
 
 /// The whole sequence against one child.
 func run(system: &System, proc: &Process, image: &Memory,
-         dest: &Memory) -> Result<Void, SosStatus> {
+         pool: &Pool) -> Result<Void, SosStatus> {
+    let dest = try pool.allocate(len: DEST_LEN)
     let child = try system.process_create(image: &image, memory: &dest)
     let ready = try proc.event_create()
     let go = try proc.event_create()
     try launch(&system, &child, &ready, &go)
     try await_event(&proc, &ready)
-    let _ = system.debug_print("SOS splitlive: child parked\n")
+    let _ = system.debug_print("SOS desthold: child parked\n")
 
-    // The cut and the release. The front piece's range is the low part of the
-    // child's region: every segment, and none of the stack.
-    let front = try dest.split(len: CUT)
-    let _ = system.debug_print("SOS splitlive: front piece cut\n")
-    let _ = move front
-    let _ = system.debug_print("SOS splitlive: front piece released\n")
+    let _ = move dest
+    let _ = system.debug_print("SOS desthold: destination released\n")
 
-    // The next piece of the same size, and whatever it holds.
-    let alive = try look(&proc, &dest, true)
-    let _ = system.debug_print("SOS splitlive: next piece taken and mapped\n")
+    // The next allocation of a look's size, and whatever it holds.
+    let alive = try look(&proc, &pool, true)
+    let _ = system.debug_print(
+        "SOS desthold: next allocation taken and mapped\n")
     report(&system, alive, true)
 
     try go.signal(1)
     let status = try await_end(&proc, &child)
-    print("SOS splitlive: child ended status={}\n", status)
+    print("SOS desthold: child ended status={}\n", status)
     if status != STATUS_INTACT {
         return BUG
     }
 
-    let after = try look(&proc, &dest, false)
+    let after = try look(&proc, &pool, false)
     report(&system, after, false)
     return
 }
@@ -240,37 +239,37 @@ func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
 
     let proc = try system.process_self() catch {
-        let _ = system.debug_print("SOS splitlive: no process handle\n")
+        let _ = system.debug_print("SOS desthold: no process handle\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     var image_record = try proc.boot_handle_next() catch {
-        print("SOS splitlive: no image region: {}\n", error)
+        print("SOS desthold: no image region: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    var dest_record = try proc.boot_handle_next() catch {
-        print("SOS splitlive: no destination region: {}\n", error)
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS desthold: no destination pool: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
     guard let image = image_record.take_memory() else {
         let _ = system.debug_print(
-            "SOS splitlive: image record is not a region\n")
+            "SOS desthold: image record is not a region\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let dest = dest_record.take_memory() else {
+    guard let pool = pool_record.take_pool() else {
         let _ = system.debug_print(
-            "SOS splitlive: dest record is not a region\n")
+            "SOS desthold: destination record is not a pool\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    try run(&system, &proc, &image, &dest) catch {
-        print("SOS splitlive: refused: {}\n", error)
+    try run(&system, &proc, &image, &pool) catch {
+        print("SOS desthold: refused: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let _ = system.debug_print("SOS splitlive: done\n")
+    let _ = system.debug_print("SOS desthold: done\n")
     let _ = system.shutdown(EXIT_OK)
 }

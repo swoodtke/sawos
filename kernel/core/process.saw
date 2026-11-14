@@ -526,7 +526,11 @@ func grants_execute(p: Int, pa: UInt, bytes: UInt) unsafe -> Bool {
 /// hardware filters or translates (spec §2.5). A range that only touches a
 /// row, ending where the row begins or beginning where it ends, does not meet
 /// it. A row of no bytes, which a segment of no bytes records, shares no
-/// address and meets nothing, wherever it lies.
+/// address and meets nothing, wherever it lies. No `map` places a range
+/// holding such a row's address: where a mapping takes its memory's own
+/// address only the child's destination holds it, and the destination meets
+/// the child's other rows; where the kernel places a mapping it is placed
+/// above the image region. The guard keeps what a row of no bytes is.
 ///
 /// No preemption point: one pass over at most `MAX_GRANT_ROWS` rows.
 public(package) func meets_row(p: Int, base: UInt, top: UInt) unsafe -> Bool {
@@ -698,8 +702,8 @@ public(package) func load_domain(p: Int) unsafe {
 /// The region is read first and dropped last, and the order is the contract:
 /// the row leaves the record, and the grant is revoked in hardware, before the
 /// region's count drops, so the domain has stopped granting these bytes by the
-/// time they may go back on the pool's free list. The reverse order would let a
-/// `Split` hand a range to a new owner while the old protection row still
+/// time they may go back on the pool's free list. The reverse order would let
+/// an `Allocate` hand a range to a new owner while the old protection row still
 /// reached it.
 public(package) func remove_grant(p: Int, row: Int) unsafe {
     // Read once, and both consumers see that read: the hardware revoke (issued
@@ -737,76 +741,6 @@ func row_pa_end(row: GrantRow) -> UInt {
         return UInt.max
     }
     row.pa + span
-}
-
-/// Would a cut of `[cut_base, cut_base + cut_len)` out of region `region` leave
-/// every row counted on `region` wholly inside the cut or wholly outside it?
-///
-/// A row is one affine run of frames, so a cut through its middle would leave
-/// one row granting bytes of two regions with one `region` field to name them.
-/// Rows are read from every process body, not only the region's creator's: a
-/// mapping installed in another process counts on the region too.
-///
-/// A region with no rows is answered without a scan.
-public(package) func rows_clear_of_cut(region: Int, cut_base: UInt,
-                                       cut_len: UInt) unsafe -> Bool {
-    if MEMORIES[region].maps == 0 {
-        return true
-    }
-    let cut_end = cut_base + cut_len
-    var b: Int = 0
-    while b < process_slots_usable() {
-        var i: Int = 0
-        while i < PROCESSES[b].grant_count {
-            let row = PROCESSES[b].grants[i]
-            if row.region == region {
-                let end = row_pa_end(row)
-                let inside = row.pa >= cut_base && end <= cut_end
-                let outside = end <= cut_base || row.pa >= cut_end
-                if not inside && not outside {
-                    return false
-                }
-            }
-            i = i + 1
-        }
-        b = b + 1
-    }
-    true
-}
-
-/// Move every row counted on region `parent` that lies inside
-/// `[cut_base, cut_base + cut_len)` over to region `piece`, the piece that was
-/// cut there.
-///
-/// A row is counted on the region whose bytes it grants, so the release of each
-/// piece is governed by the rows that actually lie in it: the piece's range
-/// goes back to its pool only when no row of any process is left in it. The
-/// caller has asked `rows_clear_of_cut`, so no row is partly inside.
-///
-/// `parent` is a region the caller still holds a handle on, so lowering its
-/// count cannot be its second zero and nothing is released here.
-public(package) func rows_move_to_piece(parent: Int, piece: Int,
-                                        cut_base: UInt,
-                                        cut_len: UInt) unsafe {
-    if MEMORIES[parent].maps == 0 {
-        return
-    }
-    let cut_end = cut_base + cut_len
-    var b: Int = 0
-    while b < process_slots_usable() {
-        var i: Int = 0
-        while i < PROCESSES[b].grant_count {
-            let row = PROCESSES[b].grants[i]
-            if row.region == parent && row.pa >= cut_base &&
-               row_pa_end(row) <= cut_end {
-                PROCESSES[b].grants[i].region = piece
-                MEMORIES[parent].maps = MEMORIES[parent].maps - 1
-                ref_region_row(piece)
-            }
-            i = i + 1
-        }
-        b = b + 1
-    }
 }
 
 /// The live-domain rule: any edit to process `p`'s grant record reloads
@@ -1267,16 +1201,12 @@ func mint_boot_regions(p: Int) unsafe {
                 // `refs: 1` is the mint below: a boot region is created with
                 // exactly one handle onto it, so the count starts at one.
                 //
-                // A boot allocation came from no pool, so its bytes go nowhere
-                // when it frees. It names itself as its pool (`root: slot`)
-                // all the same: that is the slot `Split` serves its pieces
-                // from and returns them to, first fit off its own free list.
-                // The ledger starts empty: nothing lent, nothing free but the
-                // cursor, nothing dropped.
+                // A boot allocation came from no pool (`pool: NO_MEMORY`), so
+                // its bytes go nowhere when it frees, and it keeps no ledger.
                 MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
                                             base: row_base,
                                             len: row.len as UInt,
-                                            refs: 1, maps: 0, root: slot,
+                                            refs: 1, maps: 0, pool: NO_MEMORY,
                                             granularity: hal.PROT_GRAIN,
                                             parent: NO_MEMORY, lent_base: 0,
                                             lent_len: 0, depth: 0,
@@ -1300,13 +1230,13 @@ func mint_boot_regions(p: Int) unsafe {
                 // handed out; a row too short to reach one is an empty pool.
                 let (pool_base, pool_len) = grain_aligned(row_base,
                                                           row.len as UInt)
-                // A pool names itself (`root: slot`): it is the one slot every
+                // A pool names itself (`pool: slot`): it is the one slot every
                 // allocation from it names, and its ledger (the free list, the
                 // bytes out, the bytes dropped) is kept here. A boot pool was
                 // lent by no pool, so it has no `parent` and its depth is zero.
                 MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
                                             base: pool_base, len: pool_len,
-                                            refs: 1, maps: 0, root: slot,
+                                            refs: 1, maps: 0, pool: slot,
                                             granularity: hal.PROT_GRAIN,
                                             parent: NO_MEMORY, lent_base: 0,
                                             lent_len: 0, depth: 0,

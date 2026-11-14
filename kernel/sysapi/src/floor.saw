@@ -269,7 +269,7 @@ public func sos_system_process_by_pid(
 /// neither a Pool nor a Memory, and memory the kernel cannot safely absorb
 /// (one with a sibling handle, an allocation with an installed mapping row,
 /// or a pool with allocations still out) are all faults: the caller minted the
-/// siblings, installed the rows and allocated the pieces, so each is something
+/// siblings, installed the rows and made the allocations, so each is something
 /// it could have checked. A region too small to hold one slot of that kind, a
 /// slab whose extent chain is already full, and a donation that would take the
 /// kind past its machine-wide ceiling are `SosStatus.NoResource`, a status; the
@@ -693,11 +693,11 @@ public func sos_timer_disarm(handle: UInt) -> UInt {
 // Memory, IoMemory and Mapping (spec §2.5)
 // -----------------------------------------------------------------------------
 //
-// Seven ops across four kinds. A pool allocates and reports what it could; an
-// allocation is cut and installed; a device window is carved and installed;
-// and a Mapping is what an install produces. The derivation verbs differ
-// because the kinds do: an allocation and a split consume what they hand out
-// and a carve does not.
+// Six ops across four kinds. A pool allocates and reports what it could; an
+// allocation is installed; a device window is carved and installed; and a
+// Mapping is what an install produces. The derivation verbs differ because
+// the kinds do: an allocation consumes what it hands out and a carve does
+// not.
 
 /// Allocate: a new Memory over `len` bytes of this pool, made of units of
 /// `granularity` (zero names the pool's finest accepted one). Requires
@@ -736,29 +736,6 @@ public func sos_pool_available(handle: UInt, granularity: UInt,
                  cap, (&var ignored) as UnsafePointer<UInt>)
 }
 
-/// Split: cut a `len`-byte piece out of an allocation. Requires
-/// `MemoryRight.Split`.
-///
-/// On an allocation minted at boot the piece is served first fit from the
-/// allocation's own free list (ranges released pieces gave back), and only
-/// when no free range can hold it, off the front of its unspent frontier. On
-/// an allocation a pool made it comes off the front and the parent becomes
-/// the remainder. `len` must be a non-zero multiple of the target's protection
-/// grain, and the region must be able to serve it as one range; anything else
-/// terminates the caller with `BadArg`, including free bytes too fragmented to
-/// serve it, which the caller cannot compute. A caller at its Memory or handle
-/// quota gets `SosStatus.QuotaExceeded`; a full Memory slab or handle table is
-/// `SosStatus.NoResource`.
-///
-/// There is no cut at an offset the caller chooses, for a representational
-/// reason: a region is one `{base, len}` slot, and a cut from the middle would
-/// leave the parent as two ranges.
-@export("sos_memory_split")
-public func sos_memory_split(handle: UInt, len: UInt,
-                             value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, MemoryOp.Split as UInt, len, 0, 0, value_out)
-}
-
 /// Map: install this region in `process`'s address space, and answer with a
 /// Mapping handle. Requires `MemoryRight.Map` here and `ProcessRight.Map` on
 /// `process`.
@@ -787,7 +764,7 @@ public func sos_memory_map(handle: UInt, process: UInt, access: UInt,
 /// `offset` is relative to the parent, so a caller names a sub-window without
 /// learning an address. The parent is unchanged (MMIO is pinned and a fixed
 /// region may be handed out many times), which is the difference from
-/// `sos_memory_split`.
+/// `sos_pool_allocate`.
 ///
 /// A window this machine cannot express as one protection grant terminates the
 /// caller, and the rule is per-profile: one wants a naturally-aligned power of

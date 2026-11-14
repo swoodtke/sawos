@@ -322,10 +322,10 @@ MAP_UNMAP_PKG = os.path.join(TESTS_DIR, "map-unmap")
 MAP_INTO_CHILD_PKG = os.path.join(TESTS_DIR, "map-into-child")
 IOMEMORY_CARVE_PKG = os.path.join(TESTS_DIR, "iomemory-carve")
 CHILD_TOUCH_PKG = os.path.join(TESTS_DIR, "child-touch")
-SPLIT_LIVE_BYTES_PKG = os.path.join(TESTS_DIR, "split-live-bytes")
+DESTINATION_HELD_PKG = os.path.join(TESTS_DIR, "destination-held")
 CHILD_LIVE_DATA_PKG = os.path.join(TESTS_DIR, "child-live-data")
-SPLIT_MAPPED_BYTES_PKG = os.path.join(TESTS_DIR, "split-mapped-bytes")
-SPLIT_ROWS_HELD_PKG = os.path.join(TESTS_DIR, "split-rows-held")
+MAPPED_BYTES_HELD_PKG = os.path.join(TESTS_DIR, "mapped-bytes-held")
+DONATE_ROWS_HELD_PKG = os.path.join(TESTS_DIR, "donate-rows-held")
 
 # Quotas and the reference count. The three refcount cases are root's, because
 # free-on-zero is about objects and root may hold any number of them. The two
@@ -441,11 +441,11 @@ CHILD_PLACED_PKG = os.path.join(TESTS_DIR, "child-placed")
 CHILD_SHARE_PKG = os.path.join(TESTS_DIR, "child-share")
 MAP_EXEC_GATED_PKG = os.path.join(TESTS_DIR, "map-exec-gated")
 MAP_WX_REFUSED_PKG = os.path.join(TESTS_DIR, "map-wx-refused")
-# A derived piece or window carries its parent handle's rights: a narrowed
-# parent never yields a wider child.
-SPLIT_KEEPS_RIGHTS_PKG = os.path.join(TESTS_DIR, "split-keeps-rights")
-SPLIT_KEEPS_RIGHTS_TWICE_PKG = os.path.join(TESTS_DIR,
-                                            "split-keeps-rights-twice")
+# An allocation or a window carries the rights of the handle it came
+# through: a narrowed pool or parent never yields a wider one.
+POOL_KEEPS_RIGHTS_PKG = os.path.join(TESTS_DIR, "pool-keeps-rights")
+POOL_KEEPS_RIGHTS_TWICE_PKG = os.path.join(TESTS_DIR,
+                                           "pool-keeps-rights-twice")
 CARVE_KEEPS_RIGHTS_PKG = os.path.join(TESTS_DIR, "carve-keeps-rights")
 
 # A typed `mint(rights:)` narrows, and the withheld right is refused. Each is
@@ -688,10 +688,10 @@ WX_SEGMENT_REFUSED_PKG = os.path.join(TESTS_DIR, "wx-segment-refused")
 # region over flash may not be.
 IMAGE_HELD_PKG = os.path.join(TESTS_DIR, "image-held")
 FLASH_REGION_PKG = os.path.join(TESTS_DIR, "flash-region")
-IMAGE_SPLIT_PKG = os.path.join(TESTS_DIR, "image-split")
+IMAGE_ROWS_HELD_PKG = os.path.join(TESTS_DIR, "image-rows-held")
 INPLACE_LAUNCH_PKG = os.path.join(TESTS_DIR, "inplace-launch")
 # Initialized writable data, which the loader copies with its bytes; and an
-# empty region donated.
+# empty pool donated.
 DATA_INIT_PKG = os.path.join(TESTS_DIR, "data-init")
 DONATE_EMPTY_PKG = os.path.join(TESTS_DIR, "donate-empty")
 CHILD_WX_FAULT_PKG = os.path.join(TESTS_DIR, "child-wx-fault")
@@ -1214,7 +1214,7 @@ def expectations(arch):
         "own_rx_map_end": ("the child's own memory is no buffer"
                            if arch.get("map_places")
                            else "an entry in the child's data is refused"),
-        # How a call through a piece mapped twice into a child ends
+        # How a call through an allocation mapped twice into a child ends
         # (`late_door_buffer_gone`): where a mapping has an address of its own
         # both views are rows and the read-write one is no buffer beside the
         # read-execute one; where a mapping takes its memory's own address the
@@ -3528,8 +3528,9 @@ TEST_CASES = [
     {
         # `INFO_OP` reads a handle's rights and kind. The default sets of an
         # Event, a boot Memory and the Process handle are the bits their kinds
-        # mint (1795 is Transfer, Mint and the three Event or Memory bits,
-        # 4194051 the Process set); a sibling minted through a keep mask
+        # mint (1795 is Transfer, Mint and the three Event bits, 1539
+        # Transfer, Mint and the two Memory bits, 4194051 the Process set); a
+        # sibling minted through a keep mask
         # reports exactly the narrowed set and not the keep bit the source
         # never held; the floor's kind selector answers the published kind
         # numbers (System 0, Process 1) and its rights word equals the typed
@@ -3544,7 +3545,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS handleinfo: event rights=1795",
-                       "SOS handleinfo: memory rights=1795",
+                       "SOS handleinfo: memory rights=1539",
                        "SOS handleinfo: process rights=4194051",
                        "SOS handleinfo: a narrowed sibling reports exactly "
                        "the narrowed set",
@@ -3624,9 +3625,9 @@ TEST_CASES = [
     {
         # Ceilings cap the handles minted from a held object. Root narrows its
         # Memory (no `MapExecute`), Mapping (no `Base`) and Process (no `Start`)
-        # ceilings; the pool it already held reads 67331 (`pool_rights()`,
-        # the Memory default set 1795 and `PoolRight.Allocate`), the piece it
-        # allocates reads 771, the Mapping that installs the piece 258 (the
+        # ceilings; the pool it already held reads 67075 (`pool_rights()`,
+        # the Memory default set 1539 and `PoolRight.Allocate`), what it
+        # allocates reads 515, the Mapping that installs that 258 (the
         # Mapping default set is 770), and the process it creates 4177667,
         # the Process default set without `Start`.
         "name": "rights_ceiling_derived",
@@ -3636,8 +3637,8 @@ TEST_CASES = [
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
-                       "SOS ceilderived: pool rights=67331",
-                       "SOS ceilderived: split piece rights=771",
+                       "SOS ceilderived: pool rights=67075",
+                       "SOS ceilderived: allocation rights=515",
                        "SOS ceilderived: mapping rights=258",
                        "SOS ceilderived: created process rights=4177667",
                        "SOS ceilderived: done"],
@@ -3732,13 +3733,10 @@ TEST_CASES = [
     # `irq_early_ack`'s shape: a `BadArg` fault ends the process, so a second
     # probe would never run.
     {
-        # Derivation, and the arithmetic made observable. A region has no
-        # bounds reader, so "the parent advanced" is proven by using both
-        # pieces: 0xaa into the first, 0xbb into the second, and the first
-        # still 0xaa.
-        #
-        # The last line is a death: an oversize cut is caller-checkable, so it
-        # is a fault, so meeting it is the only way to assert it.
+        # Allocation, and the arithmetic made observable. An allocation has
+        # no bounds reader, so "the pool advanced" is proven by using two
+        # allocations: 0xaa into the first, 0xbb into the second, and the
+        # first still 0xaa.
         "name": "memory_split",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MEMORY_SPLIT_PKG,
@@ -3748,7 +3746,7 @@ TEST_CASES = [
                        "SOS split: a=170 b=187 a-again=170",
                        # Twenty cut-and-drop rounds, past `MAX_MEMORIES`,
                        # complete with nothing refused: free-on-last-reference
-                       # returns a dropped piece's slot, so the Memory slab
+                       # returns a dropped allocation's slot, so the Memory slab
                        # never runs out here.
                        "SOS split: cuts=20 refused=0",
                        "SOS split: asking for more than is left",
@@ -3764,7 +3762,7 @@ TEST_CASES = [
         # its whole length twice and the grain's one bit as its set; the set's
         # lowest bit as the granularity answers what zero does. Four pages
         # allocated take four pages off both numbers, and an allocation's
-        # rights are the pool's word (67331) less `Allocate` (1795) under
+        # rights are the pool's word (67075) less `Allocate` (1539) under
         # root's unrestricted ceiling. More than the pool holds
         # is `NoMemory` and changes nothing the next report sees. With the
         # frontier spent and the first and third page home, two pages are free
@@ -3784,7 +3782,7 @@ TEST_CASES = [
                        "same=1",
                        "SOS poolops: four allocations: total fell by 16384 "
                        "largest fell by 16384",
-                       "SOS poolops: rights pool=67331 allocation=1795",
+                       "SOS poolops: rights pool=67075 allocation=1539",
                        "SOS poolops: more than the pool holds: this pool has "
                        "no free range that long unchanged=1",
                        "SOS poolops: fragmented total=8192 largest=4096",
@@ -3817,7 +3815,7 @@ TEST_CASES = [
         # refused for a different reason (`BadState`: a running process takes
         # no give). Then the roles that run to their end: `INFO_OP` names a
         # pool 15 and an allocation 8; a child's narrowed `Memory` ceiling caps
-        # what it allocates (771) under a pool word of 67331; a child takes
+        # what it allocates (515) under a pool word of 67075; a child takes
         # all the pool holds and is refused one unit more; a child at its
         # `Memory` quota is answered `QuotaExceeded` before the pool is asked;
         # and a child at its handle budget with the Memory slab full (root
@@ -3825,13 +3823,16 @@ TEST_CASES = [
         # before the mint. A granularity of the grain with bit 0 set is
         # `BadArg` at both ops: one of its bits is in the set, and it is not
         # one bit. Last, two donations a child is given the only handle for:
-        # root's pool with a page of it out here, and the boot allocation the
-        # child's own destination was cut from. Both are `BadState`, and
+        # root's pool with a page of it out here, and the allocation the
+        # child runs in, which its own rows grant. Both are `BadState`, and
         # root's page then goes home to the pool the donation did not take.
+        # Each child's destination is allocated from a pool that is the
+        # child's destination row.
         "name": "pool_faults",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": POOL_FAULTS_PKG,
         "children": [CHILD_POOL_LEG_PKG],
+        "pool_destinations": [0],
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
@@ -3866,7 +3867,7 @@ TEST_CASES = [
                        "status=131077",
                        "SOS poolleg: kinds pool=15 given=8 own=8",
                        "SOS poolfaults: kinds: status=65543",
-                       "SOS poolleg: capped rights pool=67331 allocation=771",
+                       "SOS poolleg: capped rights pool=67075 allocation=515",
                        "SOS poolfaults: a capped allocation: status=65543",
                        "SOS poolleg: all it holds: ok; one unit more: this "
                        "pool has no free range that long",
@@ -3880,8 +3881,8 @@ TEST_CASES = [
                        "SOS poolfaults: donate a pool with an allocation out: "
                        "status=131077",
                        "SOS poolfaults: the allocation went home to the pool",
-                       "SOS poolfaults: donate a boot allocation with a piece "
-                       "out: status=131077",
+                       "SOS poolfaults: donate the allocation it runs in: "
+                       "status=131077",
                        "SOS poolfaults: done"],
         "expect_clean_exit": True,
     },
@@ -4093,88 +4094,79 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
-        # A split does not free bytes a live process's rows cover. Root creates
-        # a child that holds a four-word pattern in its data and parks, cuts a
-        # front piece off the Memory the child runs in (above every segment,
-        # below the stack) and releases it, and takes the next piece of the
-        # same size and looks for the pattern in it.
+        # A destination released while its child runs is held until the
+        # child's death. Root allocates a destination from the front of the
+        # pool that is the child's destination row, creates a child in it that
+        # holds a four-word pattern in its data and parks, releases its only
+        # handle on the destination, and allocates afresh from the pool and
+        # looks for the pattern in what it gets.
         #
         # `found=0` is the line to read: while the child lives, the bytes of
-        # its image are not on the pool's free list, so a piece cut from the
-        # pool is somebody else's bytes. A kernel that left the child's rows
-        # counted on the region the front was cut from would put the front back
-        # at its release, hand it out again, and `found` would be 1; root's
-        # write through its mapping would then change the child's data and the
-        # child would say `pattern changed`. The case asserts the child's own
-        # verdict and its status word, and that after its death a fresh piece
-        # of the same size is those bytes again (`found=1`): the range comes
-        # home when the rows go.
-        "name": "split_live_bytes",
+        # its image are not on the pool's free list, so a fresh allocation is
+        # somebody else's bytes. A kernel that freed the destination at the
+        # release would serve its front again, first fit, and `found` would be
+        # 1; root's write through its mapping would then change the child's
+        # data and the child would say `pattern changed`. The case asserts the
+        # child's own verdict and its status word, and that after its death a
+        # fresh allocation of the same size is those bytes again (`found=1`):
+        # the range comes home when the rows go.
+        "name": "destination_held",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
-        "root_pkg": SPLIT_LIVE_BYTES_PKG,
+        "root_pkg": DESTINATION_HELD_PKG,
         "children": [CHILD_LIVE_DATA_PKG],
+        "pool_destinations": [0],
         "expect_out": ["{banner}",
-                       "SOS splitlive: child parked",
-                       "SOS splitlive: front piece cut",
-                       "SOS splitlive: front piece released",
-                       "SOS splitlive: next piece taken and mapped",
-                       "SOS splitlive: while the child lives, witness found=0",
+                       "SOS desthold: child parked",
+                       "SOS desthold: destination released",
+                       "SOS desthold: next allocation taken and mapped",
+                       "SOS desthold: while the child lives, witness found=0",
                        "SOS livedata: pattern intact",
-                       "SOS splitlive: child ended status=65607",
-                       "SOS splitlive: after its death, witness found=1",
-                       "SOS splitlive: done"],
+                       "SOS desthold: child ended status=65607",
+                       "SOS desthold: after its death, witness found=1",
+                       "SOS desthold: done"],
         "expect_clean_exit": True,
     },
     {
-        # A split does not free bytes an installed mapping covers. Root maps a
-        # two-page region into itself and stamps a mark, and a cut of one page
-        # (through the row) is refused with a status. The whole region is then
-        # cut off, which takes the row with it, and released while mapped; a
-        # fresh two-page piece from the pool is written through a second
-        # mapping and the first is read back.
+        # Releasing a mapped allocation's handle does not free bytes the
+        # mapping covers. Root maps a two-page allocation into itself, stamps
+        # a mark and releases the allocation's only handle while it is mapped;
+        # a fresh two-page allocation from the pool is written through a
+        # second mapping and the first is read back.
         #
-        # `shares the bytes=0` is the line to read: the released piece is a
-        # husk and not a free range, so the fresh piece is other bytes. A
-        # kernel that left the row counted on the region the piece was cut from
-        # would return the range at the release and the fresh piece would be the
-        # same bytes (`=1`). After the first mapping is unmapped the husk's
-        # bytes come home: a piece taken then carries the mark.
-        "name": "split_mapped_bytes",
+        # `shares the bytes=0` is the line to read: the released allocation
+        # is a husk and not a free range, so the fresh one is other bytes. A
+        # kernel that freed it at the release would serve its range again,
+        # first fit, and `shares` would be 1. After the first mapping is
+        # unmapped the husk's bytes come home: an allocation taken then
+        # carries the mark.
+        "name": "mapped_bytes_held",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
-        "root_pkg": SPLIT_MAPPED_BYTES_PKG,
+        "root_pkg": MAPPED_BYTES_HELD_PKG,
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
-                       "SOS splitmap: wrote mark",
-                       "SOS splitmap: cut through the mapping refused: "
-                       "out of kernel objects",
-                       "SOS splitmap: whole region cut and released while "
-                       "mapped",
-                       "SOS splitmap: fresh piece shares the bytes=0",
-                       "SOS splitmap: after the unmap, fresh piece carries "
-                       "the mark=1",
-                       "SOS splitmap: done"],
+                       "SOS mapheld: wrote mark",
+                       "SOS mapheld: released while mapped",
+                       "SOS mapheld: fresh allocation shares the bytes=0",
+                       "SOS mapheld: unmapped, a fresh allocation carries the "
+                       "mark=1",
+                       "SOS mapheld: done"],
         "expect_clean_exit": True,
     },
     {
-        # A split's refusals and the rows a child's region carries. Root creates
-        # a child and leaves it unstarted. A one-page cut runs through the
-        # image's first segment and a cut that leaves the stack's last page out
-        # runs through the stack's row: each is refused with a status, nothing
-        # changes. A cut above every segment and below the stack is accepted
-        # and takes the image's rows with it, so donating that piece to the
-        # kernel's slabs is a `BadState` fault (the piece's bytes are a
-        # child's), the case's last line.
-        "name": "split_rows_held",
+        # An allocation a child's rows grant is no donation. Root creates a
+        # child in its destination, a boot allocation, and leaves it
+        # unstarted; then it donates the destination, whose only handle it
+        # holds, to the kernel's slabs. The child's copied segments and stack
+        # are rows counted on it, so the donation is a `BadState` fault (the
+        # bytes are a child's), the case's last line.
+        "name": "donate_rows_held",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
-        "root_pkg": SPLIT_ROWS_HELD_PKG,
+        "root_pkg": DONATE_ROWS_HELD_PKG,
         "children": [CHILD_LIVE_DATA_PKG],
         "expect_out": ["{banner}",
-                       "SOS splitrows: cut through the image refused: "
-                       "out of kernel objects",
-                       "SOS splitrows: cut through the stack refused: "
-                       "out of kernel objects",
-                       "SOS splitrows: front piece cut",
+                       "SOS donaterows: a child created in the destination, "
+                       "unstarted",
                        "SOS: process fault: object in the wrong state "
                        "process={zero}",
                        "SOS: process teardown handles="],
@@ -4183,8 +4175,8 @@ TEST_CASES = [
     },
     {
         # Device authority. A window is carved non-exclusively (the same range
-        # twice, which a split could not do), mapped, and then a window the
-        # machine's protection hardware cannot express is a fault.
+        # twice, which an allocation could not do), mapped, and then a window
+        # the machine's protection hardware cannot express is a fault.
         #
         # The refusal is one line for two different rules: one profile needs a
         # naturally-aligned power of two (one protection entry), the other a
@@ -4461,8 +4453,8 @@ TEST_CASES = [
         # kernel counting handles alone would have freed it with a protection
         # row still reaching those bytes. `recycled read 94`: the unmap takes
         # the last row, the range folds back into the pool's frontier, and the
-        # next split of the same size is the same page, proven by the marker
-        # written through the first mapping and read through the second.
+        # next allocation of the same size is the same page, proven by the
+        # marker written through the first mapping and read through the second.
         "name": "mapping_slot_free",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MAPPING_SLOT_FREE_PKG,
@@ -4921,36 +4913,42 @@ TEST_CASES = [
         "expect_status": EXIT_PROCESS_FAULT,
     },
     {
-        # A `Split` piece carries its parent handle's rights. The parent keeps
-        # `Split` and `Map` and drops `MapExecute`, which `map_exec_gated`
-        # cannot reach because it drops `Split` too. The piece maps read-write
-        # (the control) and is refused execute.
-        "name": "split_keeps_rights",
+        # An allocation carries the bits of the pool handle it came through.
+        # A pool sibling keeps `Allocate` and `Map` and drops `MapExecute`; an
+        # allocation through it maps read-write (the control) and is refused
+        # execute.
+        "name": "pool_keeps_rights",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
-        "root_pkg": SPLIT_KEEPS_RIGHTS_PKG,
+        "root_pkg": POOL_KEEPS_RIGHTS_PKG,
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
-                       "SOS splitkeep: minted a sibling without MapExecute",
-                       "SOS splitkeep: the piece maps read-write",
-                       "SOS splitkeep: asking for execute through the piece",
+                       "SOS poolkeep: minted a pool sibling without "
+                       "MapExecute",
+                       "SOS poolkeep: its allocation maps read-write",
+                       "SOS poolkeep: asking for execute through the "
+                       "allocation",
                        "SOS: process fault: access denied",
                        "SOS: process teardown"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
     },
     {
-        # The narrowing survives a second split: a piece of a piece is still
-        # refused execute.
-        "name": "split_keeps_rights_twice",
+        # The narrowing survives a second mint: a sibling of the narrowed
+        # pool sibling, minted with a keep mask of every bit, still allocates
+        # memory that is refused execute.
+        "name": "pool_keeps_rights_twice",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
-        "root_pkg": SPLIT_KEEPS_RIGHTS_TWICE_PKG,
+        "root_pkg": POOL_KEEPS_RIGHTS_TWICE_PKG,
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
-                       "SOS splittwice: minted a sibling without MapExecute",
-                       "SOS splittwice: the piece of a piece maps read-write",
-                       "SOS splittwice: asking for execute through it",
+                       "SOS pooltwice: minted a pool sibling without "
+                       "MapExecute",
+                       "SOS pooltwice: a sibling of that, asking for every "
+                       "bit",
+                       "SOS pooltwice: its allocation maps read-write",
+                       "SOS pooltwice: asking for execute through it",
                        "SOS: process fault: access denied",
                        "SOS: process teardown"],
         "expect_clean_exit": False,
@@ -7297,9 +7295,9 @@ TEST_CASES = [
         # the free list, two disjoint holes and a three-into-one merge rather
         # than a tidy LIFO fold), and what comes out afterwards is one region
         # the size of the pool. A cursor that had not taken all four back could
-        # not serve that split, and a `split` too big is a `BadArg` fault, so a
-        # kernel without pool returns dies on that line instead of printing a
-        # smaller number.
+        # not serve that allocation, and one too big for the pool answers
+        # `NoMemory`, which the case reports as the pool not coming back
+        # instead of printing a smaller number.
         #
         # `reused read 60` is the second zero across a process boundary: root
         # maps a page into a child and then destroys both of its own objects
@@ -7523,14 +7521,16 @@ TEST_CASES = [
     # Process-body donation.
     #
     # It lists three children and asks for no pool, which is why the runner's
-    # two-children-plus-a-pool refusal never comes up: the region root donates
-    # is cut out of the third child's own destination row, after that child's
-    # span has been carved off its front.
+    # two-children-plus-a-pool refusal never comes up: each child's
+    # destination row is a pool (`pool_destinations`), each child's span is
+    # allocated off its front, and the allocation root donates is the third
+    # one's next.
     {
         "name": "process_donate",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": PROCESS_DONATE_PKG,
         "children": [ECHO_CHILD_PKG, ECHO_CHILD2_PKG, ECHO_CHILD3_PKG],
+        "pool_destinations": [0, 1, 2],
         "expect_out": ["{banner}",
                        "SOS: boot regions={six}",
                        # Claim 1: root plus two children is the body
@@ -7796,10 +7796,10 @@ TEST_CASES = [
         # never the dead process's slot's next occupant.
         #
         # One child image plays both parts. The charger makes a connection,
-        # splits two regions off a sibling of root's pool and carves a window
-        # off a device view, posts all four to root and exits, disowning them.
-        # Root drops the charger's Process handle and death attachment, and
-        # record 1 is reclaimed although the four objects are live.
+        # allocates two regions from a sibling of root's pool and carves a
+        # window off a device view, posts all four to root and exits, disowning
+        # them. Root drops the charger's Process handle and death attachment,
+        # and record 1 is reclaimed although the four objects are live.
         #
         #   probe ... process={one}   the probe lands in the charger's record
         #   freed and donated         root gives the four objects back through
@@ -7843,8 +7843,8 @@ TEST_CASES = [
         # connections and windows it can make, launches the keeper with a pool
         # sibling and a device view, and hands the keeper's Process handle to a
         # Waiter as a one-shot subscription. The keeper makes two connections
-        # (one with a message staged on it), splits a region, carves a window
-        # and exits holding all of it (`handles={nine}`).
+        # (one with a message staged on it), allocates a region, carves a
+        # window and exits holding all of it (`handles={nine}`).
         #
         #   connections back=1   the same counts as before: the teardown's
         #   windows back=1       close-all freed the idle connection with its
@@ -8367,55 +8367,56 @@ TEST_CASES = [
     },
     {
         # A child used in place holds its image's bytes until its teardown
-        # (spec §5.6, §12). Root launches it from the image cut off the front
-        # of the blob, releases that piece's handle, and cuts again: the pool
-        # serves its free list first, so a cut holding filler, not the image,
-        # says the bytes are still held while the child runs, and a cut after
-        # the child's death holding the image again says the teardown gave
-        # them back. The child is hand-assembled and prints `SOS-H` each time
-        # it runs; it is used in place only where the board does that.
+        # (spec §5.6, §12). The blob's row is a pool (`pool_blobs`). Root
+        # launches the child from the image allocated off the blob's front,
+        # releases that allocation's handle, and allocates again: the pool
+        # serves its free list first, so an allocation holding filler, not
+        # the image, says the bytes are still held while the child runs, and
+        # one after the child's death holding the image again says the
+        # teardown gave them back. The child is hand-assembled and prints
+        # `SOS-H` each time it runs; it is used in place only where the board
+        # does that.
         "name": "image_held",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": IMAGE_HELD_PKG,
         "child_asm": "child_inplace.S",
+        "pool_blobs": [0],
         "arches": ["riscv32", "riscv32-flat"],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
-                       "SOS imageheld: launched from the image piece, its "
-                       "handle released",
-                       "SOS imageheld: the next piece is not an image: the "
+                       "SOS imageheld: launched from the image, its handle "
+                       "released",
+                       "SOS imageheld: the next allocation is filler: the "
                        "bytes are held",
                        "SOS-H",
                        "SOS imageheld: the child exited from its image",
-                       "SOS imageheld: after the teardown the next piece is "
-                       "the image again",
+                       "SOS imageheld: after the teardown the next "
+                       "allocation is the image",
                        "SOS-H",
                        "SOS imageheld: done"],
         "expect_clean_exit": True,
     },
     {
-        # The image region cut while a child, started and not yet run, runs
-        # from it in place (spec §2.5's split rule over a row used in place).
-        # A cut ending inside the child's code row is `NoResource`; the whole
-        # image cut off carries the row, so releasing that piece leaves the
-        # bytes held (the blob's next cut is filler, not the image); the child
-        # runs; after its death the image comes back to the pool. Last, the
-        # whole image of a second child, cut off with its row, is donated, and
-        # a region a row grants is no donation: root ends with `BadState`.
-        "name": "image_split",
+        # An image allocation a child runs from in place is held by its rows
+        # (spec §2.5, §5.6). The blob's row is a pool. Root launches the child
+        # from the image allocated off its front and releases the image's
+        # handle before the child runs; the child runs, and after its death
+        # the image comes back to the pool. Last, a second child is created
+        # from the image, which is donated, and an allocation a row grants is
+        # no donation: root ends with `BadState`.
+        "name": "image_rows_held",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
-        "root_pkg": IMAGE_SPLIT_PKG,
+        "root_pkg": IMAGE_ROWS_HELD_PKG,
         "child_asm": "child_inplace.S",
+        "pool_blobs": [0],
         "arches": ["riscv32", "riscv32-flat"],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
-                       "SOS imagesplit: a cut through the child's code: out "
-                       "of kernel objects",
-                       "SOS imagesplit: the whole image cut off carries the "
-                       "child's code",
+                       "SOS imagerows: launched from the image, its handle "
+                       "released",
                        "SOS-H",
-                       "SOS imagesplit: the child exited from its image",
-                       "SOS imagesplit: after its death the image's bytes "
+                       "SOS imagerows: the child exited from its image",
+                       "SOS imagerows: after its death the image's bytes "
                        "came back",
                        "SOS: process fault: object in the wrong state "
                        "process={zero}"],
@@ -8470,16 +8471,22 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
-        # A region cut down to nothing and donated is a status with the
-        # region handed back, as for any region too small for a slot; the
-        # region rule asks only of a region with bytes (spec §2.8).
+        # An empty region donated is a status with the region handed back, as
+        # for any region too small for a slot; the region rule asks only of a
+        # region with bytes (spec §2.8). The pool row is three bytes long
+        # (`pool_bytes`) and begins one byte past the grain (`pool_skew`), so
+        # it reaches no grain boundary on any profile and the kernel mints a
+        # pool of no bytes.
         "name": "donate_empty",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": DONATE_EMPTY_PKG,
         "pool": True,
+        "pool_skew": 1,
+        "pool_bytes": 3,
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
-                       "SOS donateempty: an empty region is refused: out of "
+                       "SOS donateempty: the pool holds total=0 largest=0",
+                       "SOS donateempty: an empty pool is refused: out of "
                        "kernel objects",
                        "SOS donateempty: done"],
         "expect_clean_exit": True,
@@ -8629,9 +8636,7 @@ TEST_CASES = [
         # top at the end of a segment's part-filled last grain is a stack. A
         # segment of no bytes records a row of no bytes, which holds no
         # address: inside another segment, listed after it or before it, or at
-        # its base or its top, it meets nothing and the image loads; and a
-        # piece of a child's destination cut around it (`Memory.split`) maps
-        # into that child, where a mapping's range then holds its address.
+        # its base or its top, it meets nothing and the image loads.
         "name": "segments_meet",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": SEGMENTS_MEET_PKG,
@@ -8661,7 +8666,6 @@ TEST_CASES = [
                        "SOS segmeet: no bytes at another's top: loaded",
                        "SOS segmeet: a stack top at a part-filled grain's "
                        "end: a thread made",
-                       "SOS segmeet: a map holding a row of no bytes: taken",
                        "SOS segmeet: done"],
         "expect_clean_exit": True,
     },
@@ -8965,11 +8969,14 @@ TEST_CASES = [
         # ends the process with `BadArg` (131081) and stages nothing, and a
         # record rewritten into another legal message is that message, staged
         # with the length the resume read. The child's second thread runs only
-        # once the first has parked, since nothing ticks in this case.
+        # once the first has parked, since nothing ticks in this case. Each
+        # child's destination is allocated from a pool that is its destination
+        # row.
         "name": "room_record_rewritten",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": ROOM_REWRITE_PKG,
         "children": [CHILD_ROOM_REWRITE_PKG],
+        "pool_destinations": [0],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS roomrewrite: length past a slot: the process "
@@ -8985,9 +8992,11 @@ TEST_CASES = [
     },
     {
         # The kernel writes a result only into a row that permits write (spec
-        # §2.2). A launcher maps a piece of its child's own region into the
-        # child read-only: a pipe-creation record aimed there ends the child
-        # with `BadBuffer` and leaves the piece as the launcher stamped it. A
+        # §2.2). A launcher maps a piece into its child read-only, an
+        # allocation from the child's destination row, a pool, beside the
+        # child's destination: a pipe-creation record aimed there ends the
+        # child with `BadBuffer` and leaves the piece as the launcher stamped
+        # it. A
         # wait parked with its record in the piece mapped read-write, and the
         # piece unmapped and mapped again at the same address before the
         # wake, is judged by the row there at the wake: read-only ends the
@@ -8998,6 +9007,7 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": RO_DESTINATION_PKG,
         "children": [CHILD_RO_DESTINATION_PKG],
+        "pool_destinations": [0],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS rodest: read-write piece, record: taken",
@@ -9028,6 +9038,7 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": RO_SEGMENT_PKG,
         "children": [CHILD_RO_SEGMENT_PKG],
+        "pool_destinations": [0],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS roseg: a record into the read-only data: "
@@ -9043,8 +9054,9 @@ TEST_CASES = [
     {
         # The kernel places the image it validated, whatever is written into
         # the image's memory while it places it (spec §2.8). The image is a
-        # piece of a child's own region, mapped into that child, and the child
-        # parks a wait with its record over the
+        # piece mapped into a child, an allocation from the child's
+        # destination row, a pool, beside the child's destination, and the
+        # child parks a wait with its record over the
         # image's second segment record, fed by a Timer of root's. A fire
         # during the first segment's long zero-filled tail is delivered at a
         # preemption point, between the two segments. Root tries until it
@@ -9056,6 +9068,7 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": IMAGE_REREAD_PKG,
         "children": [CHILD_RO_DESTINATION_PKG],
+        "pool_destinations": [0],
         "pool": True,
         "arches": ["riscv32", "riscv32-flat"],
         "expect_out": ["{banner}",
@@ -9092,11 +9105,12 @@ TEST_CASES = [
     },
     {
         # A late door asks its questions in the order the call did (spec
-        # §2.2). A launcher maps a piece of a child's own region into the
-        # child, the child parks a fused call
-        # with a buffer in it, and the launcher unmaps the piece before the
-        # answer arrives. A reply carrying a handle ends the child with
-        # `BadBuffer` whether its table has room or is full, since the reply
+        # §2.2). A launcher maps a piece into a child, an allocation from the
+        # child's destination row, a pool, beside the child's destination; the
+        # child parks a fused call with a buffer in it, and the launcher
+        # unmaps the piece before the answer arrives. A reply carrying a
+        # handle ends the child with `BadBuffer` whether its table has room or
+        # is full, since the reply
         # buffer is asked before the table, and the Event the reply carried
         # goes back to its slab (root counts the Events it can create before
         # and after). With the buffer kept, a full table is still answered
@@ -9114,6 +9128,7 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": REPLY_DOOR_ORDER_PKG,
         "children": [CHILD_REPLY_DOOR_ORDER_PKG],
+        "pool_destinations": [0],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS replyorder: reply gone, a handle, table room: "
@@ -9615,10 +9630,14 @@ def _region_rows(case, arch):
         # `pool_skew` moves the pool row's base that many bytes up, off the
         # grain, and shortens it to keep its top. `pool_short_top` shortens
         # it by that many bytes at its top, so the top is off the grain too.
-        # They write the only rows the build puts off the grain, for the
-        # cases that show the kernel trims a pool to whole grains.
+        # `pool_bytes` makes the row exactly that many bytes long, from where
+        # `pool_skew` puts its base. They write the only rows the build puts
+        # off the grain, for the cases that show the kernel trims a pool to
+        # whole grains.
         skew = case.get("pool_skew", 0)
         short_top = case.get("pool_short_top", 0)
+        if "pool_bytes" in case:
+            short_top = arch["pool_len"] - skew - case["pool_bytes"]
         # `off_grain_destinations` gives the pool window's top half to two
         # allocations off the grain, after the pool row, so the pool is the
         # bottom half.
@@ -10878,14 +10897,16 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
         },
         {
             # A region over flash is neither a destination nor a donation
-            # (spec §5.6, §2.8). The image cut off the blob's front is valid
-            # and copies nothing, so only the destination rule refuses the
-            # rest of the blob as its destination; then donating the piece
+            # (spec §5.6, §2.8). The blob's row is a pool. The image allocated
+            # off its front is valid and copies nothing, so only the
+            # destination rule refuses the rest of the blob, allocated as a
+            # second allocation, as its destination; then donating the image
             # ends root with `BadArg`.
             "name": "flash_region",
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "root_pkg": FLASH_REGION_PKG,
             "child_asm": "child_inplace.S",
+            "pool_blobs": [0],
             "expect_out": ["{banner}",
                            "SOS: boot regions={two}",
                            "SOS flashregion: a destination in flash is "
@@ -10896,24 +10917,22 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None):
             "expect_status": EXIT_PROCESS_FAULT,
         },
         {
-            # The gate's `image_split` over a flash image: the cut through
-            # the child's code, the piece that carries its row and holds the
-            # bytes, the child running, the bytes back after its death. The
-            # donation at its end meets the region rule first here, since the
-            # piece is flash.
-            "name": "image_split_flash",
+            # The gate's `image_rows_held` over a flash image: the image's
+            # handle released before the child runs, the child running, the
+            # bytes back after its death. The donation at its end meets the
+            # region rule first here, since the image is flash.
+            "name": "image_rows_held_flash",
             "src": os.path.join(KERNEL_DIR, "main.saw"),
-            "root_pkg": IMAGE_SPLIT_PKG,
+            "root_pkg": IMAGE_ROWS_HELD_PKG,
             "child_asm": "child_inplace.S",
+            "pool_blobs": [0],
             "expect_out": ["{banner}",
                            "SOS: boot regions={two}",
-                           "SOS imagesplit: a cut through the child's code: "
-                           "out of kernel objects",
-                           "SOS imagesplit: the whole image cut off carries "
-                           "the child's code",
+                           "SOS imagerows: launched from the image, its "
+                           "handle released",
                            "SOS-H",
-                           "SOS imagesplit: the child exited from its image",
-                           "SOS imagesplit: after its death the image's bytes "
+                           "SOS imagerows: the child exited from its image",
+                           "SOS imagerows: after its death the image's bytes "
                            "came back",
                            "SOS: process fault: argument outside its domain "
                            "process={zero}"],

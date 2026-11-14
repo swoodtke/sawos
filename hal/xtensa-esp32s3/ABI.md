@@ -1390,11 +1390,11 @@ erased flash.
   image's handle, and the image's bytes go back to their pool only at the
   child's teardown (`image_held`). A region over flash is refused as a
   destination and as a slab donation (`flash_region`).
-- A child's image region cut while it runs: a cut through its code row is
-  `NoResource`, the piece that covers the row carries it and holds the
-  bytes when released, and the bytes come back after the child's death
-  (`image_split_flash`). A program's initialized writable data is copied out
-  of flash into DRAM with its values (`data_init`).
+- A child's image allocation in flash, released before the child runs, is
+  held by the child's code row and comes back after the child's death, and
+  donating it while a second child's row grants it meets the region rule
+  first (`image_rows_held_flash`). A program's initialized writable data is
+  copied out of flash into DRAM with its values (`data_init`).
 - The loader refuses an image whose code is linked in DRAM, whose code is in
   the instruction window but not at its own bytes, whose code is in place at
   its data-window address, whose read-only data is in place at its

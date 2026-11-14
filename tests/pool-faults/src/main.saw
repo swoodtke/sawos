@@ -24,14 +24,14 @@
 //   SOS poolfaults: give, through a pool without Transfer: status=131075
 //   SOS poolfaults: give, through a whole pool: status=131077    BadState
 //   SOS poolleg: kinds pool=15 given=8 own=8
-//   SOS poolleg: capped rights pool=67331 allocation=771
+//   SOS poolleg: capped rights pool=67075 allocation=515
 //   SOS poolleg: all it holds: ok; one unit more: <NoMemory>
 //   SOS poolleg: at its quota, more than the pool holds: <QuotaExceeded>
 //   SOS poolleg: at its handle budget (<QuotaExceeded>), the slab full:
 //                <NoResource>
 //   SOS poolfaults: donate a pool with an allocation out: status=131077
 //   SOS poolfaults: the allocation went home to the pool
-//   SOS poolfaults: donate a boot allocation with a piece out: status=131077
+//   SOS poolfaults: donate the allocation it runs in: status=131077
 //   SOS poolfaults: done
 //
 // The rights legs read in pairs. An allocation carries no bit the pool handle
@@ -55,11 +55,15 @@
 //
 // The last two roles donate. The child is given the only handle onto root's
 // pool while root keeps an allocation out of it, and then the only handle
-// onto the boot allocation its own destination was cut from, which a piece of
-// it is therefore out of. Each donation is `BadState`: neither can be the
-// kernel's while something it lent is out. The pool was not taken, so root's
-// allocation goes home to it; a pool the kernel had absorbed would not be
-// there to take it back.
+// onto the allocation it runs in, whose bytes its own rows grant. Each
+// donation is `BadState`: a pool cannot be the kernel's while something it
+// lent is out, and an allocation cannot while a row grants it. The pool was
+// not taken, so root's allocation goes home to it; a pool the kernel had
+// absorbed would not be there to take it back.
+//
+// Each child's destination is allocated from a pool that is the child's
+// destination row, and comes home at the child's teardown, so every trial's
+// destination is at the address the child is linked at.
 
 import sos.{System, Process, Memory, Pool, PoolRight, PipeInlet, PipeHandles,
             SosStatus, SystemRight, ALL_RIGHTS, PIPE_BODY_BYTES}
@@ -115,8 +119,8 @@ static NO_EXECUTE: UInt32 = (PoolRight.Transfer | PoolRight.Mint
 static NO_TRANSFER: UInt32 = (PoolRight.Mint | PoolRight.Allocate
                               | PoolRight.Map | PoolRight.MapExecute)
 
-/// The child's destination region. Every profile gives a child a region of
-/// this size.
+/// The child's destination: the whole of its region, which is this long on
+/// every profile this case runs on.
 static REGION_LEN: UInt = 0x4_0000
 
 static PAGE: UInt = 0x1000
@@ -141,84 +145,84 @@ func _start(boot_handle: UInt) {
 
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var image_rec = try proc.boot_handle_next()
-    var ram_rec = try proc.boot_handle_next()
+    var dests_rec = try proc.boot_handle_next()
     var pool_rec = try proc.boot_handle_next()
     guard let image = image_rec.take_memory() else { return BUG }
-    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let dests = dests_rec.take_pool() else { return BUG }
     guard let pool = pool_rec.take_pool() else { return BUG }
 
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "allocate without Allocate", ROLE_ALLOCATE, NO_ALLOCATE)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "available without Allocate", ROLE_AVAILABLE, NO_ALLOCATE)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "allocate of zero bytes", ROLE_ALLOCATE_ZERO, ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "allocate off the grain", ROLE_ALLOCATE_OFF_GRAIN, ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "allocate at another granularity", ROLE_ALLOCATE_OTHER_BIT,
             ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "available at another granularity", ROLE_AVAILABLE_OTHER_BIT,
             ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "allocate at the grain with bit 0 set", ROLE_ALLOCATE_TWO_BITS,
             ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "available at the grain with bit 0 set", ROLE_AVAILABLE_TWO_BITS,
             ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "available with a short record", ROLE_AVAILABLE_SHORT, ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "available into read-only data", ROLE_AVAILABLE_READ_ONLY,
             ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "a pool as an image", ROLE_CREATE_POOL_IMAGE, ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "a pool as a destination", ROLE_CREATE_POOL_DESTINATION,
             ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "a pool attached to a Waiter", ROLE_WAIT_POOL, ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "execute, through a pool without MapExecute", ROLE_MAP_EXECUTE,
             NO_EXECUTE)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "give, through a pool without Transfer", ROLE_GIVE, NO_TRANSFER)
-    try leg(&system, &proc, &image, &ram, &pool,
+    try leg(&system, &proc, &image, &dests, &pool,
             "give, through a whole pool", ROLE_GIVE, ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool, "kinds", ROLE_KINDS,
+    try leg(&system, &proc, &image, &dests, &pool, "kinds", ROLE_KINDS,
             ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool, "a capped allocation",
+    try leg(&system, &proc, &image, &dests, &pool, "a capped allocation",
             ROLE_CEILING, ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool, "a budget", ROLE_BUDGET,
+    try leg(&system, &proc, &image, &dests, &pool, "a budget", ROLE_BUDGET,
             ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool, "a quota", ROLE_QUOTA_FIRST,
+    try leg(&system, &proc, &image, &dests, &pool, "a quota", ROLE_QUOTA_FIRST,
             ALL_RIGHTS)
-    try leg(&system, &proc, &image, &ram, &pool, "the slab full",
+    try leg(&system, &proc, &image, &dests, &pool, "the slab full",
             ROLE_SLAB_FULL, ALL_RIGHTS)
 
     // The pool's only handle goes to the child, with a page of it out here.
     let page = try pool.allocate(len: PAGE)
-    let gave_pool = try donor_of_pool(&system, &proc, &image, &ram, move pool)
+    let gave_pool = try donor_of_pool(&system, &proc, &image, &dests,
+                                      move pool)
     print("SOS poolfaults: {}: status={}\n",
           "donate a pool with an allocation out", gave_pool)
     let _ = move page
     let _ = system.debug_print(
         "SOS poolfaults: the allocation went home to the pool\n")
 
-    // The boot allocation's only handle, with the child's destination cut
-    // from it and out.
-    let gave_ram = try donor_of_destination(&system, &proc, &image, move ram)
+    // The only handle onto the allocation the child runs in.
+    let gave_dst = try donor_of_destination(&system, &proc, &image, &dests)
     print("SOS poolfaults: {}: status={}\n",
-          "donate a boot allocation with a piece out", gave_ram)
+          "donate the allocation it runs in", gave_dst)
     return
 }
 
 /// Run one trial and print how the child ended.
-func leg(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+func leg(system: &System, proc: &Process, image: &Memory, dests: &Pool,
          pool: &Pool, what: String, role: UInt,
          keep: UInt32) -> Result<Void, SosStatus> {
-    let status = try trial(&system, &proc, &image, &ram, &pool, role, keep)
+    let status = try trial(&system, &proc, &image, &dests, &pool, role, keep)
     print("SOS poolfaults: {}: status={}\n", what, status)
     return
 }
@@ -253,9 +257,9 @@ func fill(pool: &Pool, inlet: &PipeInlet) -> Result<Void, SosStatus> {
 /// allocation, and answer the §8 status word it ends with. For the slab-full
 /// role root fills the Memory slab before the child starts, and empties it
 /// once the child has ended.
-func trial(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+func trial(system: &System, proc: &Process, image: &Memory, dests: &Pool,
            pool: &Pool, role: UInt, keep: UInt32) -> Result<UInt, SosStatus> {
-    let dst = try ram.split(len: REGION_LEN)
+    let dst = try dests.allocate(len: REGION_LEN)
     let child = try system.process_create(image: &image, memory: &dst)
     let _ = move dst
     let ev = try proc.event_create()
@@ -297,8 +301,8 @@ func trial(system: &System, proc: &Process, image: &Memory, ram: &Memory,
 /// Launch the child with the donating role and the only handle onto `pool`,
 /// and answer the §8 status word it ends with.
 func donor_of_pool(system: &System, proc: &Process, image: &Memory,
-                   ram: &Memory, pool: Pool) -> Result<UInt, SosStatus> {
-    let dst = try ram.split(len: REGION_LEN)
+                   dests: &Pool, pool: Pool) -> Result<UInt, SosStatus> {
+    let dst = try dests.allocate(len: REGION_LEN)
     let child = try system.process_create(image: &image, memory: &dst)
     let _ = move dst
     try furnish(&system, &proc, &child, ROLE_DONATE_POOL)
@@ -310,16 +314,14 @@ func donor_of_pool(system: &System, proc: &Process, image: &Memory,
     return outlive(&proc, &child)
 }
 
-/// `donor_of_pool` for the boot allocation the child's own destination is
-/// cut from: the destination is a piece of it, out for as long as the child
-/// lives.
+/// `donor_of_pool` for the allocation the child runs in: its copied segments
+/// and its stack are rows that grant it, for as long as the child lives.
 func donor_of_destination(system: &System, proc: &Process, image: &Memory,
-                          ram: Memory) -> Result<UInt, SosStatus> {
-    let dst = try ram.split(len: REGION_LEN)
+                          dests: &Pool) -> Result<UInt, SosStatus> {
+    let dst = try dests.allocate(len: REGION_LEN)
     let child = try system.process_create(image: &image, memory: &dst)
-    let _ = move dst
     try furnish(&system, &proc, &child, ROLE_DONATE_ALLOCATION)
-    try child.give(memory: move ram, tag: TAG_MEM) catch {
+    try child.give(memory: move dst, tag: TAG_MEM) catch {
         let (why, back) = move error
         let _ = move back
         return why

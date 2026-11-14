@@ -5,8 +5,8 @@
 // it was initialized to across the system calls between two reads: the
 // launcher may change it, and the child's verdict is whether it did.
 //
-// The four words appear nowhere else in an image. `tests/split-live-bytes`
-// looks for them in a region it was given, and mirrors these values.
+// The four words appear nowhere else in an image. `tests/destination-held`
+// looks for them in an allocation it was given, and mirrors these values.
 
 static unsigned int witness[4] = {
     0x51ABC0DEu, 0x0BADF00Du, 0x13579BDFu, 0x2468ACE0u,

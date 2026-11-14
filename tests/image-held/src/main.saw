@@ -7,22 +7,22 @@
 // prints `SOS-H` and exits with `CHILD_MARK`; it has no segment the loader
 // copies, only the stack the kernel grants in its destination.
 //
-// Root cuts the image off the front of the blob as a piece of its own and
-// launches the child from that piece, then releases its handle on it before
-// the child runs. The pool serves the next cut from its free list first and
-// its cursor second, so what the next cut holds says whether the image's bytes
-// went back:
+// The blob's row is a pool. Root allocates the image off the front of it and
+// launches the child from that allocation, then releases its handle on it
+// before the child runs. The pool serves the next allocation from its free
+// list first and its frontier second, so what the next allocation holds says
+// whether the image's bytes went back:
 //
-//   SOS imageheld: launched from the image piece, its handle released
-//   SOS imageheld: the next piece is not an image: the bytes are held
-//                      while the child runs, the next cut is filler
+//   SOS imageheld: launched from the image, its handle released
+//   SOS imageheld: the next allocation is filler: the bytes are held
+//                      while the child runs
 //   SOS-H                                    the child, running in place
 //   SOS imageheld: the child exited from its image
-//   SOS imageheld: after the teardown the next piece is the image again
+//   SOS imageheld: after the teardown the next allocation is the image
 //   SOS-H                                    a second child from it
 //   SOS imageheld: done
 
-import sos.{System, Process, SosStatus, SystemRight}
+import sos.{System, Process, Pool, SosStatus, SystemRight}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -71,23 +71,23 @@ func _start(boot_handle: UInt) {
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var blob_rec = try proc.boot_handle_next()
     var ram_rec = try proc.boot_handle_next()
-    guard let blob = blob_rec.take_memory() else { return BUG }
+    guard let blob = blob_rec.take_pool() else { return BUG }
     guard let ram = ram_rec.take_memory() else { return BUG }
 
-    let first = try blob.split(len: PIECE)
+    let first = try blob.allocate(len: PIECE)
     let child = try system.process_create(image: &first, memory: &ram)
     let _ = move first
     try start(&system, &child)
     let _ = system.debug_print(
-        "SOS imageheld: launched from the image piece, its handle released\n")
+        "SOS imageheld: launched from the image, its handle released\n")
 
     // The child has not run yet: root keeps the processor until it blocks.
-    // Were the piece's bytes back in the pool, this cut would be the image.
-    let second = try blob.split(len: PIECE)
+    // Were the image's bytes back in the pool, this would be the image.
+    let second = try blob.allocate(len: PIECE)
     match system.process_create(image: &second, memory: &ram) {
         case Ok(_) -> {
             let _ = system.debug_print(
-                "SOS imageheld: the next piece is the image while it runs\n")
+                "SOS imageheld: the image came back while it runs\n")
             return BUG
         },
         case Err(e) -> {
@@ -95,19 +95,19 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
         },
     }
     let _ = system.debug_print(
-        "SOS imageheld: the next piece is not an image: the bytes are held\n")
+        "SOS imageheld: the next allocation is filler: the bytes are held\n")
 
     try wait_exit(&proc, &child)
     let _ = system.debug_print(
         "SOS imageheld: the child exited from its image\n")
 
     // The teardown dropped the child's rows, so the image's bytes are back on
-    // the pool's free list, which serves this cut. `second` is still held, so
-    // the free list has nothing else to give.
-    let third = try blob.split(len: PIECE)
+    // the pool's free list, which serves this allocation. `second` is still
+    // held, so the free list has nothing else to give.
+    let third = try blob.allocate(len: PIECE)
     let again = try system.process_create(image: &third, memory: &ram)
     let _ = system.debug_print(
-        "SOS imageheld: after the teardown the next piece is the image again\n")
+        "SOS imageheld: after the teardown the next allocation is the image\n")
     try start(&system, &again)
     try wait_exit(&proc, &again)
     let _ = move second

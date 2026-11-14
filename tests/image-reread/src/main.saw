@@ -1,16 +1,16 @@
 // An image the kernel is placing can be written while it is placed, and the
 // kernel places what it validated (spec §2.8, §5.6).
 //
-// The image is memory, and memory a process may write: here it is a piece of
-// `child-ro-destination`'s own region, mapped into that child between its data
-// and its stack. The child parks a wait with its
-// record over the image's second segment record, on a Waiter fed by a Timer of
-// root's. Root writes a two-segment image into the piece, arms the Timer and
-// creates a process from the piece into an allocation out of the pool. The
-// first segment is a long zero-filled tail, so its placement takes many
-// preemption points, and a fire that comes due during it is delivered there:
-// the wait record lands on the image while the kernel is between its two
-// segments.
+// The image is memory, and memory a process may write: here it is a piece
+// mapped into `child-ro-destination`, an allocation from that child's
+// destination row, a pool, beside the child's destination. The child parks a
+// wait with its record over the image's second segment record, on a Waiter
+// fed by a Timer of root's. Root writes a two-segment image into the piece,
+// arms the Timer and creates a process from the piece into an allocation out
+// of the RAM pool. The first segment is a long zero-filled tail, so its
+// placement takes many preemption points, and a fire that comes due during it
+// is delivered there: the wait record lands on the image while the kernel is
+// between its two segments.
 //
 //   SOS imgreread: a record landed during placement: created
 //   SOS imgreread: done
@@ -45,11 +45,12 @@ static ROLE_WAIT_AT: UInt = 2
 static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// The child's destination region and the piece cut out of it, past its data
-/// and short of its stack.
-static REGION_LEN: UInt = 0x4_0000
-static HOLE_AT: UInt = 0x3_0000
+/// The child's destination, allocated from the front of its pool, and the
+/// piece, allocated behind it; and the allocation a create places into, out of
+/// the RAM pool.
+static DEST_LEN: UInt = 0x3_0000
 static HOLE_LEN: UInt = 0x2000
+static REGION_LEN: UInt = 0x4_0000
 
 /// The image root writes, in words. A sosimg header is 24 bytes and a segment
 /// record 24, and the two records' fields are laid out as `imgformat` says.
@@ -116,10 +117,10 @@ func _start(boot_handle: UInt) {
 
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var image_rec = try proc.boot_handle_next()
-    var ram_rec = try proc.boot_handle_next()
+    var dests_rec = try proc.boot_handle_next()
     var pool_rec = try proc.boot_handle_next()
     guard let image = image_rec.take_memory() else { return BUG }
-    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let dests = dests_rec.take_pool() else { return BUG }
     guard let pool = pool_rec.take_pool() else { return BUG }
     // The second child's destination: one region-sized allocation out of the
     // pool, placed into on every attempt. The pool's handle goes at once, to
@@ -131,7 +132,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var delay = FIRST_DELAY_NS
     var attempt: Int = 0
     while attempt < MAX_ATTEMPTS {
-        let outcome = try attempt_once(&system, &proc, &image, &ram, &landing,
+        let outcome = try attempt_once(&system, &proc, &image, &dests, &landing,
                                        &clock, delay)
         if outcome == OUTCOME_LANDED {
             print("SOS imgreread: a record landed during placement: created\n")
@@ -238,13 +239,11 @@ func ended_with(proc: &Process, child: &Process,
 /// One attempt: a fresh child parked with its record over the image's second
 /// segment record, the Timer armed with `delay`, and the create.
 func attempt_once(system: &System, proc: &Process, image: &Memory,
-                  ram: &Memory, landing: &Memory, clock: &Clock,
+                  dests: &Pool, landing: &Memory, clock: &Clock,
                   delay: UInt64) -> Result<Int, SosStatus> {
-    let dst = try ram.split(len: REGION_LEN)
+    let dst = try dests.allocate(len: DEST_LEN)
     let child = try system.process_create(image: &image, memory: &dst)
-    let front = try dst.split(len: HOLE_AT)
-    let hole = try dst.split(len: HOLE_LEN)
-    let _ = move front
+    let hole = try dests.allocate(len: HOLE_LEN)
     let _ = move dst
 
     let target = try base_of(&proc, &landing)

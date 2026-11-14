@@ -36,7 +36,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global and external-memory-only, not per-process). Paging targets: page-table root. There is no AddressSpace object: the domain is the process (see below). |
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. Ops `Start`/`Join`/`Exit`/`Yield`; `Exit` releases the handle it is invoked through; rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame is the context, so a switch is the trap handler returning a different frame (§7). Lifecycle: §8. |
 | `Pool` | RAM not yet allocated: what a `MemoryObject` is allocated from. Two ops (`Allocate`, and `Available`, which reads how much it can allocate); rights `PoolRight.Allocate` and the bits it hands down to what it allocates, `.Map`/`.MapExecute`. Minted at boot from the region table. A pool is never mapped and holds no row. Splitting a pool into a smaller one and a revoke are reserved, not built. §2.5. |
-| `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. One op (`Map`); rights `MemoryRight.Map`/`.MapExecute`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5 (not yet enforced: split). |
+| `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. One op (`Map`); rights `MemoryRight.Map`/`.MapExecute`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5. |
 | `IoMemoryObject` | Physical memory-mapped device registers; the kind is `IoMemory`. A distinct kind rather than a flag on `MemoryObject`, so a driver cannot obtain a cacheable view of a register block by construction. Ops `Carve`/`Map`; rights `IoMemoryRight.Carve`/`.Map`. §2.5. |
 | `Mapping` | One installed protection row, with its own handle. Ops `Unmap`/`Base`; rights `MappingRight.Unmap`/`.Base`. Not givable. §2.5. |
 | `Pipe` | Synchronous message IPC with request/reply built in. Four kinds: `PipeInlet` and `PipeOutlet` (the client and server ends of a connection) and `PipeReply` and `PipeRequest` (the client's claim on one reply and the server's obligation to send it). §2.1. |
@@ -971,9 +971,7 @@ vDSO discipline keeps renumberable. The verbs are `allocate` (RAM: a new
 `Memory` out of a pool, which no longer has those bytes), `carve` (device: the
 parent stays whole), `map` (install a row, answer a `Mapping`) and `give` (§3's
 move of a handle into a child's table). The longer spellings name the same
-kinds wherever they appear. Parts of this section's model are not yet
-enforced, and the transition at the end of this section says what the kernel
-does until they are.
+kinds wherever they appear.
 
 **The model.**
 
@@ -1021,13 +1019,13 @@ kernel and cannot learn a number from it. What a process knows about where its
 memory is, it knows from the config that gave it the region — which is what
 root's tag-to-meaning config is, and where a driver's `UART_BASE` comes from.
 
-**Pools and allocations are two kinds, with disjoint ops** (not yet enforced:
-split). A pool is memory nobody uses yet, and what it does is hand out
-allocations and say how much it can; an allocation is memory in use, and it is
-what is mapped, run in, given and donated. Nothing that can have a grant row is
-ever cut, and nothing that is cut can have a row. A program holding one knows
-which it holds: the handle's kind says so (`INFO_OP`'s `Kind`, §3; a typed
-wrapper is one or the other).
+**Pools and allocations are two kinds, with disjoint ops.** A pool is memory
+nobody uses yet, and what it does is hand out allocations and say how much it
+can; an allocation is memory in use, and it is what is mapped, run in, given
+and donated. Nothing that can have a grant row is ever cut, and nothing that
+is cut can have a row. A program holding one knows which it holds: the
+handle's kind says so (`INFO_OP`'s `Kind`, §3; a typed wrapper is one or the
+other).
 
 **`Pool`: two ops, `Allocate` and `Available`; rights `PoolRight.Allocate` and
 two bits it hands down, `.Map` and `.MapExecute`**, beside the universal
@@ -1160,11 +1158,10 @@ no more than the pool holds, and what it releases it can allocate again.
   to nobody: they are the pool's outstanding bytes until they come home.
 - **An allocation's rights come from the pool handle it was allocated
   through.** It is minted with that handle's rights word intersected with
-  the bits a `Memory` has (`Transfer`, `Mint`, `Map` and `MapExecute`; not
-  yet enforced: split), then capped by the caller's `Memory` ceiling (§2.7).
-  A pool handle carries those four bits on behalf of what it allocates, at the
-  bit numbers `MemoryRight` gives them, and its own `Allocate` is not among
-  them. So narrowing a pool
+  the bits a `Memory` has (`Transfer`, `Mint`, `Map` and `MapExecute`), then
+  capped by the caller's `Memory` ceiling (§2.7). A pool handle carries those
+  four bits on behalf of what it allocates, at the bit numbers `MemoryRight`
+  gives them, and its own `Allocate` is not among them. So narrowing a pool
   handle narrows everything allocated through it: a launcher that gives a
   child a pool sibling minted without `MapExecute` has given it memory it can
   allocate, map, read and write and never execute from, and one minted
@@ -1178,9 +1175,9 @@ no more than the pool holds, and what it releases it can allocate again.
   16, so no bit of `MemoryRight`'s can ever be one of them: `.Allocate` (bit 16)
   gates `allocate` and `available`, and bits 17 and 18 are reserved for `Split`
   and `Revoke` (below). `pool_rights()`, the set a boot pool is minted with, is
-  `Transfer | Mint | Allocate | Map | MapExecute` (not yet enforced: split):
-  every defined bit, because attenuation is monotonic and a bit not minted at
-  boot could never appear later.
+  `Transfer | Mint | Allocate | Map | MapExecute`: every defined bit, because
+  attenuation is monotonic and a bit not minted at boot could never appear
+  later.
 - **What holds a pool.** Its handles (and references in staged messages, §2)
   and its outstanding bytes, and nothing else. Its outstanding bytes are the
   lengths of its live allocations plus the length of every allocation from it
@@ -1201,22 +1198,20 @@ no more than the pool holds, and what it releases it can allocate again.
 **`Memory`: one op, `Map`; rights `MemoryRight.Map` and `.MapExecute`**
 beside the universal `Transfer` and `Mint`. A `Memory` is an allocation: it is
 mapped, used as a process's image or destination (§8, §12), given, sent in a
-message, minted and donated, and it is never cut (not yet enforced: split).
-It comes from a pool's `allocate`, or from a row of the region table typed as
-an allocation (§12).
+message, minted and donated, and it is never cut. It comes from a pool's
+`allocate`, or from a row of the region table typed as an allocation (§12).
 
 - **It records its pool and goes back whole.** An allocation's range returns
   to the pool it was allocated from, all of it at once, when no handle and no
   grant row names it (the refcount invariant, below); nothing returns part of
-  one (not yet enforced: split). An allocation minted at boot came from no
-  pool, and when it frees its bytes go nowhere; its granularity is the
-  profile's grain.
+  one. An allocation minted at boot came from no pool, and when it frees its
+  bytes go nowhere; its granularity is the profile's grain.
 - **The rights, bit by bit.** `MemoryRight.Transfer` (bit 0) and `.Mint`
   (bit 1) are the universal pair; `.Map` (bit 9) gates `map`, and
   `.MapExecute` (bit 10) gates an executable `map` (below). Bit 8 is not
-  assigned (not yet enforced: split). `memory_rights()`, the set a boot
-  allocation is minted with, is all four bits; an allocation from a pool
-  carries what its pool handle handed down (above).
+  assigned. `memory_rights()`, the set a boot allocation is minted with, is
+  all four bits; an allocation from a pool carries what its pool handle
+  handed down (above).
 - **`map(process, access)` installs a protection row and answers with a
   `Mapping`.** It spends `MemoryRight.Map` on the allocation and
   `ProcessRight.Map` on the target, because possession of bytes must not
@@ -1421,7 +1416,7 @@ owns those bytes.
 - A pool has a count of its own besides `refs`: its outstanding bytes
   (`out_bytes`), what it has allocated and not had back, donations to the
   kernel included (above). It frees only when both are zero, so the pool
-  every allocation records is always a live one (not yet enforced: split).
+  every allocation records is always a live one.
 - **A teardown releases memory in §2.10's order.** The dying process's handles
   go first, so an allocation it alone named and no row grants goes back to
   its pool there, crediting whichever ledger it is charged to. What survives
@@ -1501,44 +1496,6 @@ an allocation donated to the kernel stays among its pool's outstanding bytes
 for good (§2.8), so a sub-pool with a donation in it can never return whole,
 and no revoke can take a donation back. Until both exist, memory comes back to
 a pool only from holders that let go or die (§11).
-
-**Not yet enforced: the transition to pools.** Every sentence of this
-specification that describes a part of the model above which the kernel does
-not build carries the marker "not yet enforced:" and the part's name. Until a
-part is built the kernel does what its paragraph here says; building it removes
-its markers and its paragraph, and the last part removes this note.
-
-- **Split.** A `Memory` has a second op, `MemoryOp.Split(len)` (op 0), on
-  `MemoryRight.Split` (bit 8). Bit 8 is a bit a `Memory` has while the op
-  exists: `memory_rights()` mints it beside the four bits `Memory` lists,
-  `pool_rights()` carries it (it is `memory_rights()` with `PoolRight.Allocate`
-  added), and `allocate` hands it down with the others, so an allocation from
-  a pool can be split. Its answers, in order: a handle without the right is
-  `AccessDenied`; a `len` of zero, one the allocation cannot serve in one range
-  and one that is not a multiple of the grain are `BadArg`; a cut that would
-  run through the middle of a grant row counted on the allocation answers
-  `NoResource` with nothing changed (a status, because the launcher holding a
-  child's destination cannot know where the child's segments lie); then the
-  caller's `Memory` quota (`QuotaExceeded`), the Memory slab (`NoResource`)
-  and the handle mint. It takes no granularity and does not align its cut; the
-  piece records its parent's granularity. The piece carries the rights of the
-  handle the split went through capped by the caller's `Memory` ceiling, and
-  is charged to the caller's `Memory` row. A split moves every row of any
-  process that is counted on the allocation and lies wholly inside the cut onto
-  the new piece, so a piece's range goes back only when no row lies in it.
-  - On an allocation minted at boot, the allocation keeps a pool's ledger on
-    its own slot: the cut is first fit from its own free list, else the front
-    of its unspent range, as `allocate` serves a pool, and its outstanding
-    bytes rise by the piece's length. The piece names that boot allocation as
-    its pool and returns its range there, where it coalesces and folds back as
-    a pool's returned ranges do. The boot allocation frees only once no piece
-    of it is out, and a donation of it with a piece out is the `BadState`
-    fault.
-  - On any other allocation (one a pool made, or a piece), the cut is the
-    allocation's front, and the allocation becomes the remainder. The piece
-    names the pool its parent names, and that pool's outstanding bytes do not
-    move: the piece and the remainder each return their own range to it when
-    they free. Until then a pool's `available` counts neither as free.
 
 ### 2.6 Clock and Timer
 
@@ -3332,9 +3289,9 @@ are never freed:
   invariant, as built".
 - **A pool is its own kind, and its ledger is its own slot**: the head of
   its free list, the bytes outstanding and the bytes dropped. Every
-  allocation records the pool it came from and returns its whole range there
-  (not yet enforced: split); an allocation minted at boot came from no pool
-  and returns nowhere. A returned range is inserted into the pool's free list,
+  allocation records the pool it came from and returns its whole range there;
+  an allocation minted at boot came from no pool and returns nowhere. A
+  returned range is inserted into the pool's free list,
   which is kept sorted by base; it coalesces with a free neighbour on either
   side, and a free range that touches the pool's unspent frontier folds back
   into it, so a pool whose every allocation has come home is whole again.
@@ -4314,9 +4271,6 @@ loader parses and reports while no process stores either.
   loader's `allow_device: true` door, dormant) (§2.5): its emitter is
   sawlang-side, so deleting it is a toolchain-pin event.
 - **The tier-2 mapping quota price** (`DEFAULT_QUOTA_MAPPINGS`, §5b.1).
-- **The memory model's remaining part** (§2.5): an allocation that is never
-  cut. Until it lands the kernel does what §2.5's transition note says for
-  it.
 - **Sub-pools and revoke** (§2.5): `Pool.split` and a revoke are reserved, not
   specified. A process given a pool can allocate from it but cannot carve it
   into budgets for others, and a manager cannot take back what it allocated.
@@ -4372,17 +4326,17 @@ loader parses and reports while no process stores either.
 - An allocation is one contiguous range (§2.5), so a fragmented pool refuses
   a length it holds enough free bytes for in total; `available` reports both
   numbers, as a snapshot.
-- An allocation is never cut (§2.5; not yet enforced: split), so the parts of
+- An allocation is never cut (§2.5), so the parts of
   one buffer are released together, and an allocation minted at boot (a
   child's image or destination) returns its bytes to no pool when it frees.
 - The kernel is uniprocessor (§7).
 
 **The plan.** The standing tail, each item specified in its own section: the
-namespace and its path-attached acceptor object (§2.1), the rest of the memory
-model (§2.5), thread waitability (§8), priorities and the §7 band map, SMP with
-`IntrSpinLock` (§9b), the vDSO true-mapping (§5.7), and the IOMMU driver with
-critical processes (§2.5). Sub-pools and revoke follow the memory model; §2.5
-gives their direction and they are specified when they are designed.
+namespace and its path-attached acceptor object (§2.1), thread waitability
+(§8), priorities and the §7 band map, SMP with `IntrSpinLock` (§9b), the vDSO
+true-mapping (§5.7), and the IOMMU driver with critical processes (§2.5).
+Sub-pools and revoke extend the memory model, which is built; §2.5 gives their
+direction and they are specified when they are designed.
 
 ## 12. The root server
 

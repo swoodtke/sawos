@@ -562,16 +562,12 @@ static_assert((TimerRight.Wait as UInt32) >= (1 << 8),
 /// attenuated sibling. Both are minted at boot because attenuation is
 /// monotonic: a bit not minted at boot could never appear later.
 ///
-/// The kind-specific bits are named for their ops:
-///
-///   - `Split` is the authority to derive: a piece cut out of an allocation.
-///     An allocation a launcher hands out with this bit withheld is a fixed
-///     range and nothing else: "here is your RAM, you may not subdivide it for
-///     anyone".
-///   - `Map` is the authority to install this region in some domain. It is half
-///     of what a map spends: `ProcessRight.Map` on the target process is the
-///     other half, because possession of bytes must not imply authority over an
-///     address space.
+/// The kind-specific bits are named for their op. `Map` is the authority to
+/// install this region in some domain. It is half of what a map spends:
+/// `ProcessRight.Map` on the target process is the other half, because
+/// possession of bytes must not imply authority over an address space. Bit 8
+/// is not assigned: an allocation is never cut, so there is no authority to
+/// derive one from another.
 ///
 /// There is deliberately no `Read`/`Write` pair. Access is a property of the
 /// mapping (`map(access:)`), which is what lets one region be mapped read-only
@@ -608,7 +604,6 @@ static_assert((TimerRight.Wait as UInt32) >= (1 << 8),
 public enum MemoryRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
-    case Split = 1 << 8,
     case Map = 1 << 9,
     case MapExecute = 1 << 10,
 }
@@ -617,8 +612,6 @@ static_assert((MemoryRight.Transfer as UInt32) == (1 << 0),
               "universal right Transfer must be bit 0 in every kind's enum")
 static_assert((MemoryRight.Mint as UInt32) == (1 << 1),
               "universal right Mint must be bit 1 in every kind's enum")
-static_assert((MemoryRight.Split as UInt32) >= (1 << 8),
-              "kind-specific right Split must start at bit 8 or above")
 static_assert((MemoryRight.Map as UInt32) >= (1 << 8),
               "kind-specific right Map must start at bit 8 or above")
 static_assert((MemoryRight.MapExecute as UInt32) >= (1 << 8),
@@ -670,8 +663,6 @@ static_assert((MemoryRight.Transfer as UInt32) < (PoolRight.Allocate as UInt32),
               "a Memory right must lie below a pool's own rights")
 static_assert((MemoryRight.Mint as UInt32) < (PoolRight.Allocate as UInt32),
               "a Memory right must lie below a pool's own rights")
-static_assert((MemoryRight.Split as UInt32) < (PoolRight.Allocate as UInt32),
-              "a Memory right must lie below a pool's own rights")
 static_assert((MemoryRight.Map as UInt32) < (PoolRight.Allocate as UInt32),
               "a Memory right must lie below a pool's own rights")
 static_assert((MemoryRight.MapExecute as UInt32)
@@ -680,14 +671,13 @@ static_assert((MemoryRight.MapExecute as UInt32)
 
 /// A right on an IoMemory object (spec §2.5).
 ///
-/// The same two shapes as `MemoryRight`, with the derivation verb changed, and
-/// the change of verb is the whole difference between the kinds. `Carve` takes
-/// a sub-window and leaves the parent alone (§2.5: "a fixed region may be
-/// handed out many times"), where `Split` consumes what it hands out. No bit
-/// means both, because a holder of one authority is not a holder of the other:
-/// a driver handed a carve right over a peripheral's window can produce views
-/// for its own sub-devices without ever being able to take a range away from
-/// anyone.
+/// `Carve` is a derivation a Memory does not have: it takes a sub-window and
+/// leaves the parent alone (§2.5: "a fixed region may be handed out many
+/// times"), where a pool's `Allocate` consumes what it hands out and an
+/// allocation is never cut. No bit means both, because a holder of one
+/// authority is not a holder of the other: a driver handed a carve right over
+/// a peripheral's window can produce views for its own sub-devices without
+/// ever being able to take a range away from anyone.
 ///
 /// `Map` means what it means on a Memory and spends the same second right
 /// (`ProcessRight.Map`) on the target. What differs is the row it installs: an
@@ -1155,15 +1145,13 @@ public func process_observe_rights() -> UInt32 {
 /// `Memory` can carry.
 ///
 /// An allocation `Pool.Allocate` makes is not minted from this set alone: it
-/// carries the pool handle's rights intersected with this set, and a piece a
-/// `Split` derives carries the rights of the handle the split went through,
-/// because both are derivations and §3 makes derivation monotonic. A caller
-/// that wants a narrower child mints an attenuated sibling of the pool or of
-/// the parent (`MINT_OP`), and everything allocated or cut through that
-/// sibling inherits the narrowing.
+/// carries the pool handle's rights intersected with this set, because it is
+/// a derivation and §3 makes derivation monotonic. A caller that wants a
+/// narrower allocation mints an attenuated sibling of the pool (`MINT_OP`),
+/// and everything allocated through that sibling inherits the narrowing.
 ///
-/// The kind-specific bits are named for the ops they gate (`Split`, `Map`,
-/// `MapExecute`) rather than a generic authority.
+/// The kind-specific bits are named for what they gate (`Map`, `MapExecute`)
+/// rather than a generic authority.
 ///
 /// `MapExecute` is in the set, and it has to be. §3's attenuation is monotonic:
 /// a bit not minted at boot could never appear later by any sequence of ops, so
@@ -1176,7 +1164,7 @@ public func process_observe_rights() -> UInt32 {
 /// what root chose to mint.
 public func memory_rights() -> UInt32 {
     ((MemoryRight.Transfer as UInt32) | (MemoryRight.Mint as UInt32)
-     | (MemoryRight.Split as UInt32) | (MemoryRight.Map as UInt32)
+     | (MemoryRight.Map as UInt32)
      | (MemoryRight.MapExecute as UInt32))
 }
 
@@ -1196,9 +1184,9 @@ public func pool_rights() -> UInt32 {
 /// What the kernel mints for a boot device-pool root (spec §2.5).
 ///
 /// A window a `Carve` derives carries the rights of the handle the carve went
-/// through, as a `Split` piece does (see `memory_rights`). `Transfer` is what
-/// lets root hand a driver child its window, and it is minted at boot because
-/// attenuation only ever narrows.
+/// through, as an allocation carries its pool handle's (see `memory_rights`).
+/// `Transfer` is what lets root hand a driver child its window, and it is
+/// minted at boot because attenuation only ever narrows.
 ///
 /// It gains no `MapExecute`: a device window has no access argument to gate, so
 /// the authority would name an ask nobody can make.

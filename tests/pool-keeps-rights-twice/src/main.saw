@@ -1,0 +1,89 @@
+// Narrowing composes through a chain of pool siblings (spec §2.5, §3).
+//
+// The first sibling keeps `Mint`, `Allocate` and `Map` and drops
+// `MapExecute`. A second sibling is minted from it with a keep mask of every
+// bit, which names `MapExecute` again; an allocation through the second still
+// cannot map executable, because a mint intersects with the rights of the
+// handle it was invoked through and an allocation carries its pool handle's.
+//
+//   SOS pooltwice: minted a pool sibling without MapExecute
+//   SOS pooltwice: a sibling of that, asking for every bit
+//   SOS pooltwice: its allocation maps read-write
+//   SOS pooltwice: asking for execute through it
+//   SOS: process fault: access denied
+
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, PoolRight,
+            SosStatus, ALL_RIGHTS}
+
+static CHUNK: UInt = 0x1000
+
+static RX: UInt32 = MapAccess.Read | MapAccess.Execute
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// `Mint`, `Allocate` and `Map` are kept; `MapExecute` is absent by silence.
+static NARROW: UInt32 = (PoolRight.Mint | PoolRight.Allocate | PoolRight.Map)
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pooltwice: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS pooltwice: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_pool() else {
+        let _ = system.debug_print("SOS pooltwice: pool record is not a pool\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try pool.mint(rights: NARROW) catch {
+        print("SOS pooltwice: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print(
+        "SOS pooltwice: minted a pool sibling without MapExecute\n")
+    let again = try narrow.mint(rights: ALL_RIGHTS) catch {
+        print("SOS pooltwice: second mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print(
+        "SOS pooltwice: a sibling of that, asking for every bit\n")
+
+    let piece = try again.allocate(len: CHUNK) catch {
+        print("SOS pooltwice: allocation failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _data = try proc.map(memory: &piece, access: RW) catch {
+        print("SOS pooltwice: mapping read-write failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print(
+        "SOS pooltwice: its allocation maps read-write\n")
+
+    let _ = system.debug_print("SOS pooltwice: asking for execute through it\n")
+    match proc.map(memory: &piece, access: RX) {
+        case Ok(_) -> {
+            let _ = system.debug_print(
+                "SOS pooltwice: UNREACHABLE mapped executable\n")
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+        case Err(e) -> {
+            print("SOS pooltwice: UNREACHABLE status {}\n", e)
+            let _ = system.shutdown(EXIT_FAILED)
+        },
+    }
+    let _ = proc.exit(EXIT_OK)
+}

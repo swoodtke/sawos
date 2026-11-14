@@ -1,0 +1,142 @@
+// Releasing a mapped allocation's handle does not free bytes an installed
+// mapping covers (spec §2.5).
+//
+// A mapping's row counts on the allocation it was installed from. Releasing
+// the allocation's last handle while the row is installed leaves a husk rather
+// than returning bytes a domain still grants.
+//
+//   SOS mapheld: wrote mark                      <- through the first mapping
+//   SOS mapheld: released while mapped
+//   SOS mapheld: fresh allocation shares the bytes=0
+//                                                <- an allocation from the pool
+//                                                   after the release is not
+//                                                   the bytes the first mapping
+//                                                   still reaches
+//   SOS mapheld: unmapped, a fresh allocation carries the mark=1
+//                                                <- the bytes came home when
+//                                                   the row went
+//   SOS mapheld: done
+//
+// "Shares" is the program's own measurement: a byte written through the fresh
+// allocation's mapping is read back through the first mapping, so the answer
+// holds where a mapping's address is its memory's own and where it is not.
+//
+// The pool serves its free list first, so a kernel that let the range go home
+// at the release would serve it to the fresh allocation and `shares` would be
+// 1.
+//
+// Each leg is a function of its own, for the reason `tests/memory-recycle`
+// gives about root's stack.
+
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess, SosStatus}
+
+/// Two protection units' worth on either profile.
+static TWO_PAGES: UInt = 0x2000
+
+static MARK: UInt8 = 0x5A
+static OTHER: UInt8 = 0xA5
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+func poke(addr: UInt, value: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(addr).write(value)
+}
+
+func peek(addr: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(addr).read()
+}
+
+/// Drop the mapped allocation's only handle, then allocate afresh from the
+/// pool and say whether that is the bytes `first_base` still reaches.
+func recycle(proc: &Process, region: Memory, pool: &Pool,
+             first_base: UInt) -> Result<Bool, SosStatus> {
+    let _ = move region
+    let fresh = try pool.allocate(len: TWO_PAGES)
+    let mapping = try proc.map(memory: &fresh, access: RW)
+    let base = try mapping.base()
+    poke(base, OTHER)
+    let shares = peek(first_base) == OTHER
+    try mapping.unmap()
+    return shares
+}
+
+func report(system: &System, shares: Bool) {
+    if shares {
+        let _ = system.debug_print(
+            "SOS mapheld: fresh allocation shares the bytes=1\n")
+    } else {
+        let _ = system.debug_print(
+            "SOS mapheld: fresh allocation shares the bytes=0\n")
+    }
+}
+
+func report_home(system: &System, carries: Bool) {
+    if carries {
+        let _ = system.debug_print(
+            "SOS mapheld: unmapped, a fresh allocation carries the mark=1\n")
+    } else {
+        let _ = system.debug_print(
+            "SOS mapheld: unmapped, a fresh allocation carries the mark=0\n")
+    }
+}
+
+/// Allocate the husk's size and say whether it carries the mark the first
+/// mapping wrote.
+func carries_mark(proc: &Process, pool: &Pool) -> Result<Bool, SosStatus> {
+    let again = try pool.allocate(len: TWO_PAGES)
+    let mapping = try proc.map(memory: &again, access: RW)
+    let base = try mapping.base()
+    let carries = peek(base) == MARK
+    try mapping.unmap()
+    return carries
+}
+
+func run(system: &System, proc: &Process,
+         pool: &Pool) -> Result<Void, SosStatus> {
+    let region = try pool.allocate(len: TWO_PAGES)
+    let first = try proc.map(memory: &region, access: RW)
+    let first_base = try first.base()
+    poke(first_base, MARK)
+    let _ = system.debug_print("SOS mapheld: wrote mark\n")
+
+    let shares = try recycle(&proc, move region, &pool, first_base)
+    let _ = system.debug_print("SOS mapheld: released while mapped\n")
+    report(&system, shares)
+
+    try first.unmap()
+    let carries = try carries_mark(&proc, &pool)
+    report_home(&system, carries)
+    return
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mapheld: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_record = try proc.boot_handle_next() catch {
+        print("SOS mapheld: no pool region: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_record.take_pool() else {
+        let _ = system.debug_print(
+            "SOS mapheld: pool record is not a pool\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc, &pool) catch {
+        print("SOS mapheld: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mapheld: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}

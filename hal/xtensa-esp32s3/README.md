@@ -123,8 +123,8 @@ root image whose header says why). The process ones are the gate's own
 cases, named there, and the board's own: `irq_line_cycle` (more lines bound
 over a life than there are CPU interrupts), `frame_hold` (every register of
 the trap frame held across ticks, in `tests/frame-hold/`), `flash_region` (a
-region over flash is no destination and no donation), `image_split_flash`
-(the gate's `image_split` over a flash image) and `slot_mismatch` (a root
+region over flash is no destination and no donation), `image_rows_held_flash`
+(the gate's `image_rows_held` over a flash image) and `slot_mismatch` (a root
 image linked for the child's slot, which the build refuses). Their packages
 carry a
 `[sos.xtensa-esp-unknown-elf]` section naming `user/root.ld` or
@@ -437,9 +437,10 @@ each.
    the second is formatted on root's stack in DRAM. A kernel fault line instead
    names the access the part refused (the table below).
 6. **`image_held`**: a child, from the child's flash slot. Root launches a
-   hand-assembled child whose code runs in place there, and cuts its image
-   region to show the image's bytes are held while the child runs and come
-   back after it dies (`tests/image-held/src/main.saw` has the steps).
+   hand-assembled child whose code runs in place there, from an image it
+   allocates off the blob's pool, and allocates from that pool again to show
+   the image's bytes are held while the child runs and come back after it dies
+   (`tests/image-held/src/main.saw` has the steps).
    Expected, after the ROM's lines:
 
    ```
@@ -447,13 +448,13 @@ each.
    SOS: root image ok segments=0x00000003 entry=<code address> prio=0x01010100
    SOS: boot regions=0x00000002
    SOS: console handover
-   SOS imageheld: launched from the image piece, its handle released
-   SOS imageheld: the next piece is not an image: the bytes are held
+   SOS imageheld: launched from the image, its handle released
+   SOS imageheld: the next allocation is filler: the bytes are held
    SOS-H
    SOS: process exit: code=0x00000048 process=0x00000001
    SOS: process teardown handles=0x00000002 threads=0x00000001 events=0x00000000 waiters=0x00000000 interrupts=0x00000000 timers=0x00000000 process=0x00000001
    SOS imageheld: the child exited from its image
-   SOS imageheld: after the teardown the next piece is the image again
+   SOS imageheld: after the teardown the next allocation is the image
    SOS-H
    SOS: process exit: code=0x00000048 process=0x00000002
    SOS: process teardown handles=0x00000002 threads=0x00000001 events=0x00000000 waiters=0x00000000 interrupts=0x00000000 timers=0x00000000 process=0x00000002

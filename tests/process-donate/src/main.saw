@@ -28,14 +28,13 @@
 //     `NoResource`, a status, because the caller cannot know how full the
 //     machine's table is.
 //
-//  2. The donation is ordinary memory, cut out of a region root was given.
+//  2. The donation is ordinary memory, allocated from a pool root was given.
 //
-//     The piece donated is a fresh cut, not a split's remainder. A region that
-//     has lent bytes out is a pool root with `out_bytes != 0`, and donating one
-//     faults (retiring a root under its own pieces would leave their
-//     back-references naming a stranger). A freshly cut piece has lent nothing,
-//     is named by exactly one handle and is mapped nowhere, so it satisfies all
-//     three counts by construction.
+//     Each child's destination row is a pool, and the donation is a fresh
+//     allocation from the third one, beside that child's destination. A fresh
+//     allocation is named by exactly one handle and is mapped nowhere, so it
+//     satisfies both of a donated allocation's counts by construction, and its
+//     length stays among its pool's outstanding bytes for good.
 //
 //  3. The ceiling moved: the create that was refused now succeeds, and the
 //     process it makes is the fourth live process on a machine compiled for
@@ -71,8 +70,8 @@
 // the next one is deliberately left unspent so the gate does not sit exactly
 // on the wall. The wall's own refusal is not witnessed here.
 
-import sos.{System, Process, Memory, SlabKind, SystemRight, Waiter, WaitResult,
-            SosStatus}
+import sos.{System, Process, Memory, Pool, SlabKind, SystemRight, Waiter,
+            WaitResult, SosStatus}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -82,16 +81,16 @@ static EXIT_FAILED: UInt = 1
 static FLOOR: UInt = 3
 
 /// What each child's address space gets: part of the destination region the
-/// build hands root. It holds an echo child's image and the stack the kernel
-/// puts at the top with room to spare, and it is a multiple of every profile's
-/// protection grain, which `split` requires.
+/// build hands root as a pool. It holds an echo child's image and the stack the
+/// kernel puts at the top with room to spare, and it is a multiple of every
+/// profile's protection grain, which `allocate` requires.
 ///
-/// It is cut off the front: `split` serves from the front, so the piece keeps
-/// the destination row's own base, and on riscv32 a child image runs at exactly
-/// the address it was linked at, so a child's region base is not a free choice.
+/// It is allocated first from a fresh pool, so it is the pool's front and keeps
+/// the destination row's own base: on riscv32 a child image runs at exactly the
+/// address it was linked at, so a child's region base is not a free choice.
 static CHILD_SPAN: UInt = 0x20000
 
-/// The donation: the next cut after the third child's span. Many process
+/// The donation: the allocation after the third child's span. Many process
 /// bodies on either profile and far more than this case spends, so the
 /// machine's remaining bound is the tier's domain pool rather than the slab.
 static GIFT: UInt = 0x2000
@@ -194,12 +193,12 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    guard let dst2 = dst2_rec.take_memory() else {
-        let _ = system.debug_print("SOS procdonate: destination 2 is not a region\n")
+    guard let dst2 = dst2_rec.take_pool() else {
+        let _ = system.debug_print("SOS procdonate: destination 2 is not a pool\n")
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let piece2 = try dst2.split(len: CHILD_SPAN) catch {
+    let piece2 = try dst2.allocate(len: CHILD_SPAN) catch {
         print("SOS procdonate: no third child region: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -218,9 +217,8 @@ func _start(boot_handle: UInt) {
 
     // ---- Claim 2: the donation ---------------------------------------------
     //
-    // A fresh cut rather than what is left of `dst2`: see the header. `dst2`
-    // has lent bytes to `piece2` and is therefore a pool root the op refuses.
-    let gift = try dst2.split(len: GIFT) catch {
+    // A fresh allocation: see the header.
+    let gift = try dst2.allocate(len: GIFT) catch {
         print("SOS procdonate: no region to donate: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -329,16 +327,17 @@ func _start(boot_handle: UInt) {
     let _ = system.shutdown(EXIT_FAILED)
 }
 
-/// Drain one destination row, carve the child's span off its front, and create.
+/// Drain one destination pool, allocate the child's span off its front, and
+/// create.
 ///
-/// The destination remainder is dropped on the way out: root has no further use
-/// for it, and a region root stops naming is bytes the child's own grant rows
-/// still hold, so nothing is lost and nothing is freed early.
+/// The pool and the allocation are dropped on the way out: root has no further
+/// use for them, the child's own grant rows hold the allocation, and the
+/// allocation, while it is out, holds the pool, so nothing is freed early.
 func make_child(system: &System, proc: &Process,
                 image: &Memory) -> Result<Process, SosStatus> {
     var dst_rec = try proc.boot_handle_next()
-    guard let dst = dst_rec.take_memory() else { return BUG }
-    let piece = try dst.split(len: CHILD_SPAN)
+    guard let dst = dst_rec.take_pool() else { return BUG }
+    let piece = try dst.allocate(len: CHILD_SPAN)
     return system.process_create(image: &image, memory: &piece)
 }
 

@@ -1,8 +1,9 @@
 // Carve (spec §2.5): a carve leaves the parent whole, which is the difference
-// from a split. §2.5: "a fixed region may be handed out many times". MMIO is
-// pinned, nothing is consumed, and several drivers may legitimately hold
-// windows onto one peripheral. So this program carves the same range twice and
-// both succeed, which is the sequence `Memory.split` must refuse.
+// from a pool's allocate. §2.5: "a fixed region may be handed out many times".
+// MMIO is pinned, nothing is consumed, and several drivers may legitimately
+// hold windows onto one peripheral. So this program carves the same range
+// twice and both succeed, where a pool hands out a range once until it comes
+// back.
 //
 // The transcript reads as three claims:
 //
@@ -22,8 +23,8 @@
 // argument, so an IoMemory can only produce a read-write, never-executable,
 // device-attribute row and there is nothing to refuse.
 //
-// The last line is deliberately a death, as in `memory_split`: `BadArg` is a
-// fault, so the only way to assert it is to meet it.
+// The last line is deliberately a death: `BadArg` is a fault, so the only way
+// to assert it is to meet it.
 
 import sos.{System, Process, IoMemory, Mapping, SosStatus}
 
@@ -65,8 +66,8 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // The same range again. A split would have nothing left to give; a carve
-    // does, because the parent was never spent.
+    // The same range again. A pool would have nothing left at that range; a
+    // carve does, because the parent was never spent.
     let _second = try window.carve(offset: 0, len: WINDOW_LEN) catch {
         print("SOS carve: second carve failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

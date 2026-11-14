@@ -32,7 +32,6 @@
 //   SOS segmeet: no bytes at another's top: loaded            [0,2) [2)
 //   SOS segmeet: a stack top at a part-filled grain's end: a thread made
 //                                                       [0,2) [4,5g+1)
-//   SOS segmeet: a map holding a row of no bytes: taken
 //   SOS segmeet: done
 //
 // A segment's range is its row's, rounded up to the grain: one that ends a
@@ -40,22 +39,16 @@
 // grain meets it, and one linked at the next grain does not, and a thread may
 // keep its stack in that grain past the segment's bytes. A segment of no
 // bytes records a row of no bytes, which holds no address and so meets no
-// segment and no later mapping, wherever it lies. Every pair is asked,
-// whatever order the table lists them in. An image that loads is a process
-// that is created and never started; its handle goes at once.
-//
-// The map is of a piece cut out of a child's destination, between its code
-// and its stack, around the address of its segment of no bytes. Where a
-// mapping takes its memory's own address the piece's range holds that
-// address, and it meets no row; where the target places a mapping it lands
-// above the child's image.
+// segment, wherever it lies. Every pair is asked, whatever order the table
+// lists them in. An image that loads is a process that is created and never
+// started; its handle goes at once.
 //
 // The images carry the architecture's tag and its grain, by the word size:
 // a 64-bit word is arm64, whose grain is a page and whose images link at one
 // canonical base (`hal.USER_IMAGE_BASE`), and a 32-bit word is riscv32, whose
 // grain is four bytes and whose images link where their destination is.
 
-import sos.{System, Process, Memory, Pool, Mapping, MapAccess, SosStatus}
+import sos.{System, Process, Memory, Pool, MapAccess, SosStatus}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -70,13 +63,6 @@ static RW: UInt32 = MapAccess.Read | MapAccess.Write
 /// and segment table, in a page.
 static DEST_LEN: UInt = 0x1_0000
 static IMAGE_LEN: UInt = 0x1000
-
-/// The piece cut out of a destination, past the code and short of the stack,
-/// and the segment of no bytes inside it, each a whole number of pages from
-/// the link base, so of grains on every profile.
-static HOLE_AT: UInt = 0x4000
-static HOLE_LEN: UInt = 0x2000
-static EMPTY_AT: UInt = 0x5000
 
 /// The sosimg format as `imgformat` lays it out: a 24-byte header and a
 /// 24-byte record per segment, little-endian.
@@ -195,9 +181,6 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     print("SOS segmeet: a stack top at a part-filled grain's end: {}\n",
           "a thread made")
     try view.unmap()
-    try empty_row_mapped(&system, &proc, &pool, &image)
-    let _ = system.debug_print(
-        "SOS segmeet: a map holding a row of no bytes: taken\n")
     return
 }
 
@@ -216,29 +199,6 @@ func part_filled_grain(system: &System, image: &Memory, dest: &Memory,
     let thread = try child.thread_create(stack_top: target.link + 6 * g,
                                          arg: 0)
     let _ = move thread
-    return
-}
-
-/// A child whose image has a segment of no bytes at `EMPTY_AT`, between its
-/// code and its stack, and the piece of its destination around that address,
-/// cut off as `HOLE_LEN` bytes at `HOLE_AT` and mapped into it read-write.
-func empty_row_mapped(system: &System, proc: &Process, pool: &Pool,
-                      image: &Memory) -> Result<Void, SosStatus> {
-    let dest = try pool.allocate(len: DEST_LEN)
-    let target = try target_of(&proc, &dest)
-    let g = target.grain
-    let view = try proc.map(memory: &image, access: RW)
-    let at = try view.base()
-    let code = seg(0, 2 * g, RX_FLAGS)
-    let empty = seg(EMPTY_AT, 0, RW_FLAGS)
-    let unused = none()
-    write_image(at, &target, &code, &empty, &unused, 2)
-    try view.unmap()
-    let child = try system.process_create(image: &image, memory: &dest)
-    let front = try dest.split(len: HOLE_AT)
-    let hole = try dest.split(len: HOLE_LEN)
-    let _ = move front
-    let _mapping = try child.map(memory: &hole, access: RW)
     return
 }
 

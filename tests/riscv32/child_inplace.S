@@ -7,8 +7,9 @@
  * the loader uses it in place wherever the linker puts the blob (spec 5.6),
  * and the child's only other row is the stack the kernel grants in its
  * destination. The blob is zero-filled behind the image to `BLOB_LEN`, so a
- * launcher can cut the image off its front (`IMAGE_PIECE` bytes) and find
- * filler in the cut after it: `tests/image-held` relies on both lengths.
+ * launcher whose blob row is a pool can allocate the image off its front
+ * (`IMAGE_PIECE` bytes) and find filler in the allocation after it:
+ * `tests/image-held` relies on both lengths.
  *
  * The program prints "SOS-H" through the System handle its launcher gave it,
  * derives its own Process handle and exits with `CHILD_MARK`. It touches no

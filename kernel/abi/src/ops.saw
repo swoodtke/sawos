@@ -39,8 +39,7 @@
 /// exited keeps running in its slot (it frees once it has exited or been
 /// invalidated and nothing names it), a Memory region stays while an installed
 /// mapping row still grants its bytes, a pool stays while an allocation from
-/// it is out (and a boot allocation while a piece split from it is), and a
-/// pipe connection or one-shot exchange frees only once both
+/// it is out, and a pipe connection or one-shot exchange frees only once both
 /// of its halves are gone and nothing in flight remains: a connection lives
 /// while any of its exchanges does, and a staged exchange settles only once its
 /// connection's outlet is gone.
@@ -232,8 +231,8 @@ public static INFO_OP: UInt = 0xFFFD
 /// to obtain a mapping starts from a Memory or an IoMemory: possession of
 /// bytes, then authority over an address space, two rights on two objects. The
 /// stats region is neither: it is kernel storage, so a Memory handle onto it
-/// would carry `Split` and make it donatable, and neither could mean anything
-/// over the page the kernel counts traps into. What the caller is granted is
+/// would make it givable and donatable, and neither could mean anything over
+/// the page the kernel counts traps into. What the caller is granted is
 /// the access and nothing that owns it.
 ///
 /// One right, because there is one object. The two-rights doctrine exists
@@ -620,30 +619,16 @@ public enum TimerOp: UInt {
 
 /// A method id on a Memory object: an allocation.
 ///
-/// Two ops: derive, and install. Neither reads the region. There is no op that
-/// hands back a Memory's bounds, so a region stays a capability rather than a
+/// One op, install. It does not read the region, and there is no op that hands
+/// back a Memory's bounds, so a region stays a capability rather than a
 /// description (spec §2.5).
 ///
-/// `Split` cuts `len` bytes out of an allocation and mints a new Memory over
-/// them. On an allocation minted at boot the cut is served as a pool serves
-/// `PoolOp.Allocate`: first fit from the allocation's own free list, and only
-/// when no free range can hold it, from the front of its unspent frontier. On
-/// an allocation a pool made it comes off the front, `[base, base + len)`, and
-/// the parent becomes the remainder `[base + len, top)`. Every piece stays
-/// representable in the one `{base, len}` slot shape the object already has.
-///
-/// Arbitrary-offset carving is refused by the shape, not by a check: a cut from
-/// the middle would fragment the parent into two remainders, and one slot
-/// cannot hold two ranges. The restriction is not a rule somebody could relax
-/// without noticing; it is what the representation permits.
-///
-/// It is exclusive, which is the difference from `IoMemoryOp.Carve`: what a
-/// split hands out, the parent no longer has. A region is freed when no handle
-/// names it and no installed row maps it, and a boot allocation also waits
-/// until none of its pieces are out. A freed piece's range returns to the free
-/// list of the slot it names as its pool; a freed boot allocation's range has
-/// no pool to return to, and its free-list nodes go back to their slab. A
-/// range that needs a free-list node when none is left is dropped and counted.
+/// There is no op that cuts an allocation. An allocation is made whole by a
+/// pool's `Allocate` or at boot, and goes back whole: when no handle names it
+/// and no installed row maps it, its whole range returns to the pool it came
+/// from, and a boot allocation's range, which came from no pool, goes nowhere.
+/// A range that needs a free-list node when none is left is dropped and
+/// counted.
 ///
 /// `Map` installs the region in a domain and answers with a Mapping handle to
 /// the caller. Its arguments are a target Process handle and the access bits
@@ -656,8 +641,7 @@ public enum TimerOp: UInt {
 /// bit about what is being asked for rather than about the op: a caller mapping
 /// RW spends exactly what it always did.
 public enum MemoryOp: UInt {
-    case Split = 0,
-    case Map = 1,
+    case Map = 0,
 }
 
 // =============================================================================
