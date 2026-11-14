@@ -1634,9 +1634,13 @@ dead process has to keep is small and what a live one needs is not.
 
 `ProcessCreate` takes one record and one body, and either table full answers
 `NoResource`, a status with no quota asked first (§2.9); a create that finds one
-and not the other takes neither. Root gets a record and a body at boot as a
-child does at its create, the first of each table, so "process 0" names both
-(§8, §12). Those numbers are the kernel's indexes and not names: a process
+and not the other takes neither. A destination whose rows the profile cannot
+grant at the addresses the child would see them at is `BadImage` before either
+is taken, as every refused destination is (§5.6): on arm64, one that reaches
+past the page-granular window a process's RAM rows lie in (§5b.1). Root gets a
+record and a body at boot as a child does at its create, the first of each
+table, so "process 0" names both (§8, §12). Those numbers are the kernel's
+indexes and not names: a process
 sees one only as the index of its own stats row, which is keyed by its body
 (below), and root's pid is 1 (below). An op that needs a
 body answers through a `Gone` process's handle exactly as §2.10 rules for it,
@@ -3600,7 +3604,7 @@ can ask about (`SystemOp.TierGet`, §2.8):
 
 | target | tier | in the gate? | notes |
 |---|---|---|---|
-| arm64 `virt` | 1 | yes — Profile B | per-process table sets, higher-half kernel, `map` places |
+| arm64 `virt` | 1 | yes — Profile B | per-process table sets, higher-half kernel, `map` places. A process's RAM rows lie in a page-granular window of the first 4 MiB of RAM, and a child is linked at `hal.USER_IMAGE_BASE`, 2 MiB into it, so a destination longer than 2 MiB is one this profile cannot grant, and `ProcessCreate` answers it `BadImage` (§2.7) |
 | riscv32 `virt` | 2 | yes — Profile A | PMP regions replayed through the one seam; keeps its per-child linker scripts, deliberately, as the living identity-tier demonstration |
 | riscv32 `virt`, flat build profile | 3 | yes — a third run | a module swap over the same board: `prot_*` no-ops, PMP opened with one TOR entry, `prot_isolated()` false. No new toolchain, and the tier-3 story's test target |
 | ESP32-C3 | 2, at the floor | no — a gating board smoke (`make sos-smoke-esp32c3`) | 16 PMP entries exactly, 400 KB SRAM; XIP is the entry price |

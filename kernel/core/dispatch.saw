@@ -1232,6 +1232,9 @@ func region_wraps(base: UInt, len: UInt) -> Bool {
 ///   - The destination must be memory the board can give a process
 ///     (`hal.map_source_ok`), so a region over flash is an image and never a
 ///     destination.
+///   - The range the child sees the destination at must be one the profile
+///     can grant (`hal.map_target_ok`), so a destination longer than a
+///     translating profile's window is refused rather than met at placement.
 func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
                     ceiling_handle: UInt) unsafe -> SyscallResult {
     let img = memory_arg(p, image_handle)
@@ -1293,6 +1296,19 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     let dest = LoadRegion(base: dst_base, top: dst_base + dst_len,
                           stack_len: hal.ROOT_STACK_LEN,
                           link_base: hal.image_link_base(dst_base))
+    // The rows the destination holds must be ones the profile can install at
+    // the addresses the child sees them at: a copied segment's lies below the
+    // stack grant and the stack grant's ends at `link_top`, so both lie in
+    // the linked range, which is asked about once, here, as a `map` asks
+    // about its range. Otherwise the protection primitive would meet the
+    // range at placement, and it stops the machine on a grant it cannot
+    // express. On a profile that does not translate the linked range is the
+    // destination itself and this is the question `map_source_ok` answered.
+    // A segment used in place is no row of the destination's: it is granted
+    // at the image's own address, which `check_in_place` judges.
+    if not hal.map_target_ok(dest.link_base, dest.link_top()) {
+        return op_status(SosStatus.BadImage)
+    }
     // The image's header and segment table are read once, into `table`, and
     // everything from here on reads them there: the image is memory a process
     // may write while it is placed (`ImageTable`).

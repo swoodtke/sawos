@@ -723,6 +723,7 @@ MAP_OVERLAP_PKG = os.path.join(TESTS_DIR, "map-overlap")
 MAP_OVERLAP_CARVES_PKG = os.path.join(TESTS_DIR, "map-overlap-carves")
 SEGMENTS_MEET_PKG = os.path.join(TESTS_DIR, "segments-meet")
 DEST_GRAIN_PKG = os.path.join(TESTS_DIR, "dest-grain")
+DEST_WINDOW_PKG = os.path.join(TESTS_DIR, "dest-window")
 MAP_USER_ADDRESS_PKG = os.path.join(TESTS_DIR, "map-user-address")
 ROOM_REWRITE_PKG = os.path.join(TESTS_DIR, "room-rewrite")
 CHILD_ROOM_REWRITE_PKG = os.path.join(TESTS_DIR, "child-room-rewrite")
@@ -958,6 +959,11 @@ ARCHES = [
         # A mapping here takes an address of its own, so it meets no row of the
         # target's image.
         "map_places": True,
+        # How long a child's destination may be: a process's RAM rows lie in
+        # the HAL's page-granular window (`map_target_ok`), which ends this far
+        # above `hal.USER_IMAGE_BASE`, and a destination's top is its stack
+        # grant's. The riscv32 profiles have no such window; any RAM serves.
+        "image_window_len": 0x200000,
         # The console UART's page, mirroring `hal.DEVICE_GRANT_BASE` / `_LEN`.
         "device_base": 0x09000000,
         "device_len": 0x1000,
@@ -1230,6 +1236,15 @@ def expectations(arch):
         "own_rx_map_end": ("the child's own memory is no buffer"
                            if arch.get("map_places")
                            else "an entry in the child's data is refused"),
+        # What a create into a destination of two MiB and a grain answers
+        # (`destination_past_window`): `BadImage` where a child's rows must
+        # fit a window shorter than that above its link base, and loaded where
+        # any RAM can be granted.
+        "wide_destination": ("BadImage"
+                             if arch.get("image_window_len") is not None
+                             and arch["image_window_len"]
+                             < 0x200000 + arch["prot_grain"]
+                             else "loaded"),
         # How a call through an allocation mapped twice into a child ends
         # (`late_door_buffer_gone`): where a mapping has an address of its own
         # both views are rows and the read-write one is no buffer beside the
@@ -9002,6 +9017,33 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # A destination is memory the profile can grant at the addresses the
+        # child sees it at (spec §2.7, §5.6). Root writes an image of one code
+        # segment and creates from it into a destination of two MiB and a
+        # grain, out of a pool long enough to hold it: on arm64, where every
+        # image links at one base and a process's RAM rows lie in a
+        # page-granular window that ends two MiB above it, that is
+        # `BadImage`; on the riscv32 profiles it loads
+        # (`{wide_destination}`). The room for processes and for handles,
+        # each counted by holding what it makes until one is refused, is the
+        # same after it as before. A destination of exactly two MiB then
+        # loads on every profile.
+        "name": "destination_past_window",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEST_WINDOW_PKG,
+        "pool": True,
+        "pool_bytes": 0x50_0000,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS destwin: a destination of two MiB and a grain: "
+                       "{wide_destination}",
+                       "SOS destwin: the same room after it, for processes "
+                       "and for handles",
+                       "SOS destwin: a destination of two MiB: loaded",
+                       "SOS destwin: done"],
+        "expect_clean_exit": True,
+    },
+    {
         # A mapping meets a row by user address (spec §2.5). arm64 only, where
         # a mapping's address is not its frames': root maps one allocation,
         # nearly the pool's length, into itself three times, and the pool's
@@ -9932,9 +9974,9 @@ def _region_row_specs(case, arch):
         # grain, and shortens it to keep its top. `pool_short_top` shortens
         # it by that many bytes at its top, so the top is off the grain too.
         # `pool_bytes` makes the row exactly that many bytes long, from where
-        # `pool_skew` puts its base. They write the only rows the build puts
-        # off the grain, for the cases that show the kernel trims a pool to
-        # whole grains.
+        # `pool_skew` puts its base, longer than the arch's own pool as well
+        # as shorter. They write the only rows the build puts off the grain,
+        # for the cases that show the kernel trims a pool to whole grains.
         skew = case.get("pool_skew", 0)
         short_top = case.get("pool_short_top", 0)
         if "pool_bytes" in case:
