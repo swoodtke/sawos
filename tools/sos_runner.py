@@ -3058,12 +3058,12 @@ TEST_CASES = [
         "children": [CHILD_FAULT_PKG],
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
-                       "SOS records: pass 1 held=11 room=1, then out of "
-                       "kernel objects",
+                       "SOS records: pass 1 held=11 room=1, then "
+                       "no room for what was asked",
                        "SOS records: every held child answered status=131073 "
                        "syscalls=1 faults=0",
-                       "SOS records: pass 2 held=11 room=1, then out of "
-                       "kernel objects",
+                       "SOS records: pass 2 held=11 room=1, then "
+                       "no room for what was asked",
                        "SOS records: done"],
         "expect_clean_exit": True,
     },
@@ -3081,9 +3081,10 @@ TEST_CASES = [
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
-                       "SOS recdonate: held=11, then out of kernel objects",
-                       "SOS recdonate: after a body donation, out of kernel "
-                       "objects",
+                       "SOS recdonate: held=11, then no room for "
+                       "what was asked",
+                       "SOS recdonate: after a body donation, no room "
+                       "for what was asked",
                        "SOS recdonate: after a record donation, held one more",
                        "SOS recdonate: done"],
         "expect_clean_exit": True,
@@ -3431,7 +3432,8 @@ TEST_CASES = [
                        "quota",
                        "SOS xbudget: thread with the row full: this process "
                        "is at its quota",
-                       "SOS xbudget: thread with room: out of kernel objects",
+                       "SOS xbudget: thread with room: no room for "
+                       "what was asked",
                        "SOS budget: child ended=40",
                        "SOS budget: done"],
         "expect_clean_exit": True,
@@ -3954,7 +3956,8 @@ TEST_CASES = [
                        "this process is at its quota",
                        "SOS poolfaults: a quota: status=65543",
                        "SOS poolleg: at its handle budget (this process is "
-                       "at its quota), the slab full: out of kernel objects",
+                       "at its quota), the slab full: no room for "
+                       "what was asked",
                        "SOS poolfaults: the slab full: status=65543",
                        "SOS poolfaults: donate a pool with an allocation out: "
                        "status=131077",
@@ -3983,7 +3986,8 @@ TEST_CASES = [
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
-                       "SOS poollife: the slab filled: out of kernel objects",
+                       "SOS poollife: the slab filled: no room for "
+                       "what was asked",
                        "SOS poollife: full, and too much: this pool has no "
                        "free range that long",
                        "SOS poollife: no handle, a page out: room grew by 0",
@@ -7482,7 +7486,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
                        "SOS slabdonate: floor=4 fifth refused: "
-                       "out of kernel objects",
+                       "no room for what was asked",
                        "SOS slabdonate: donated a page of waiters",
                        "SOS slabdonate: fifth waiter created",
                        "SOS slabdonate: extent waiter woke key=77 word=4",
@@ -7566,7 +7570,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
                        "SOS threaddonate: floor=8 ninth refused: "
-                       "out of kernel objects",
+                       "no room for what was asked",
                        "SOS threaddonate: donated a page of threads",
                        "SOS threaddonate: extent thread created",
                        "TTT",
@@ -7586,7 +7590,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
                        "SOS pipedonate: floor=4 fifth refused: "
-                       "out of kernel objects",
+                       "no room for what was asked",
                        "SOS pipedonate: donated a region of pipes",
                        "SOS pipedonate: fifth connection created",
                        "SOS pipedonate: server took len=5 byte0=80",
@@ -7677,7 +7681,7 @@ TEST_CASES = [
                        # Claim 1: root plus two children is the body
                        # table.
                        "SOS procdonate: floor=3 third child refused: "
-                       "out of kernel objects",
+                       "no room for what was asked",
                        # Claims 2 and 3.
                        "SOS procdonate: donated a region of process bodies",
                        "SOS procdonate: third child created past the floor",
@@ -8593,9 +8597,9 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS inplacelaunch: a mapping over the child's image: "
-                       "out of kernel objects",
+                       "no room for what was asked",
                        "SOS inplacelaunch: a mapping over the child's stack: "
-                       "out of kernel objects",
+                       "no room for what was asked",
                        "SOS-H",
                        "SOS inplacelaunch: the child exited from its image"],
         "expect_clean_exit": True,
@@ -8655,8 +8659,8 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
                        "SOS donateempty: the pool holds total=0 largest=0",
-                       "SOS donateempty: an empty pool is refused: out of "
-                       "kernel objects",
+                       "SOS donateempty: an empty pool is refused: "
+                       "no room for what was asked",
                        "SOS donateempty: done"],
         "expect_clean_exit": True,
     },

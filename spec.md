@@ -3105,7 +3105,8 @@ unused. The kernel stays up, reports, and runs the teardown (§8). The rule is
 uniform because it has to be: an unbound handle names no kind, so there is no op
 table to ask which rule applies. The caller is the process that faults, through
 whichever process's handle the op was made (§2.7). What is left in `SosStatus`
-is what a caller could not have known — `NoResource` (a full slab),
+is what a caller could not have known — `NoResource` (no room for what
+was asked: a full slab or table, or a range a row already holds),
 `QuotaExceeded` (§2.9), `NoMemory` (11: a pool that cannot serve the length
 asked of it in one range, answered by `Pool.allocate` alone, §2.5),
 `BadImage` (§8), `Drained` (§12, and the end of a

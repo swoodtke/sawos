@@ -591,16 +591,12 @@ public(package) func meets_row(p: Int, base: UInt, top: UInt) unsafe -> Bool {
 ///
 /// An address in no row is `BadBuffer`, because the process handed the kernel
 /// an address it does not own.
-///
-/// Both variants of the result are named, so the answer does not depend on how
-/// a bare `FaultReason` would be wrapped.
 public(package) func translate_user(
     p: Int,
     va: UInt,
     bytes: UInt,
     need: UInt8
 ) unsafe -> Result<UInt, FaultReason> {
-    let nowhere = Result<UInt, FaultReason>.Err(error: FaultReason.BadBuffer)
     let b = body_of(p)
     var i: Int = 0
     while i < PROCESSES[b].grant_count {
@@ -611,13 +607,13 @@ public(package) func translate_user(
            va >= row.base && va < row.top && bytes <= row.top - va {
             let pa = row.pa + (va - row.base)
             if grants_execute(p, pa, bytes) {
-                return nowhere
+                return FaultReason.BadBuffer
             }
-            return Result<UInt, FaultReason>.Ok(value: pa)
+            return pa
         }
         i = i + 1
     }
-    nowhere
+    return FaultReason.BadBuffer
 }
 
 /// May a thread of process `p` start with its stack pointer at `stack_top`?

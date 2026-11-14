@@ -65,16 +65,27 @@
 /// table gains a process at every create: the same cursor later answers a
 /// process created since.
 ///
-/// `QuotaExceeded` (7) is policy's voice, and `NoResource` is the machine's. A
-/// caller can act on the difference: `NoResource` says the slab is full (a
-/// machine-wide edge, nothing this process can do about it), while
-/// `QuotaExceeded` says this process has spent its budget, which a release of
-/// something it already holds will fix. A launcher meeting the first has met
-/// the end of the machine; a program meeting the second has met the end of its
-/// allowance, and the two want different code. It is a status and not a fault
-/// because quota headroom is dynamic resource vocabulary: it changes as objects
-/// the process does not own are freed and as its peers release, so it is
-/// precisely what a caller could not have checked.
+/// `QuotaExceeded` (7) is policy's voice, and `NoResource` is capacity's. The
+/// first says this process has spent its own budget for a kind of object, the
+/// allowance policy set for it; the second says there is no room for what was
+/// asked, in one of three places, and a caller can act on which:
+///   - the machine's: a slab of a kind with no free slot, or a translating
+///     profile's pool of address-space tables. A donation may move a slab's
+///     floor, up to the kind's ceiling, and cannot move a HAL's pool;
+///   - one process's: a handle table, or on a translating profile a target's
+///     address window, with no free slot or range. Freeing one there (a
+///     handle, or an `unmap` in the target) makes room, and the same call then
+///     succeeds. A child's table or boot set is one process's too, but nothing
+///     frees a slot in a child not yet started and its boot set freezes at
+///     start, so there the launcher gives less;
+///   - what was offered or where: a donation with no room for one slot, or a
+///     `map` over a range a row of the target already holds. The caller
+///     offers something else, or asks elsewhere.
+/// The two want different code, because a budget is the process's to spend and
+/// a capacity is not. Both are statuses and not faults because a caller could
+/// not have checked first: what is left of a slab, a table or a budget changes
+/// as other holders act and release, what a target's rows hold is not the
+/// caller's to see, and a donor cannot know a kernel slot's size or alignment.
 ///
 /// `Revoked` (8) is the peer-gone doctrine's one word. It answers a call that
 /// was parked on something which can no longer happen: for example, a
@@ -123,8 +134,9 @@
 /// `describe()` is worded for the condition rather than for either op. It is a
 /// status and not a fault because how full a shared ring is changes as the peer
 /// acts, so a caller could not have checked it in advance. It is `NoResource`'s
-/// neighbour in spirit, a resource edge, and differs in being the peer's to
-/// clear rather than the machine's.
+/// neighbour in spirit, a resource edge, and differs in whose it is to clear:
+/// always the peer's, where `NoResource`'s is the machine's, one process's or
+/// the caller's own offer (above).
 ///
 /// `NoMemory` (11) is a pool that cannot serve the length asked of it in one
 /// run: it holds fewer free bytes, or holds them only in ranges none of which
@@ -153,7 +165,7 @@ extension SosStatus {
     public func describe(&self) -> String {
         match self {
             case Ok -> "ok",
-            case NoResource -> "out of kernel objects",
+            case NoResource -> "no room for what was asked",
             case BadImage -> "not a loadable process image",
             case Drained -> "nothing left to hand over",
             case QuotaExceeded -> "this process is at its quota",
