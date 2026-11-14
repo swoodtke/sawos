@@ -10,6 +10,13 @@
 //!         it then writes the flash image and prints
 //!         `flash used=USED end=END`, the bytes the ELF placed in it and the
 //!         offset one past the last of them
+//!     sosimage slabs KERNEL
+//!         prints what the kernel object KERNEL says an image's limits are
+//!         sized and checked against (`sosimage.kernel`): for each slab kind
+//!         `NAME kind=K floor=F unit=U align=A` (its value, its floor, the
+//!         bytes one unit of an area takes, the alignment the builder links
+//!         an area at), for each quota kind `quota NAME kind=K default=D`,
+//!         and one `limits ...` line of the kernel's other numbers
 //!
 //! PROFILE and IMAGE are JSON files: `sosimage.profile` and `sosimage.image`
 //! state their schemas. A failure prints `error: ` and its reason on standard
@@ -19,6 +26,8 @@ import std.env.{Env}
 import sosimage.build.{build_kernel, build_native, link}
 import sosimage.failure.{BuildError}
 import sosimage.image.{ImageSpec}
+import sosimage.kernel.{KernelFacts, QUOTA_KINDS, SLAB_KINDS, quota_kind_name,
+                       slab_kind_name}
 import sosimage.profile.{Profile}
 import sosimage.tool.{read_text}
 
@@ -46,6 +55,21 @@ func run() -> Result<Void, BuildError> {
         let profile = try load_profile(args.get(2) ?? "")
         return build_kernel(&profile, args.get(3) ?? "", args.get(4) ?? "")
     }
+    if command.equals("slabs") && args.len() == 3 {
+        let facts = try KernelFacts.read(args.get(2) ?? "")
+        var k = 0
+        while k < SLAB_KINDS {
+            print("{slab_kind_name(k)} kind={k} floor={facts.floors.get(k) ?? 0} unit={facts.units.get(k) ?? 0} align={facts.aligns.get(k) ?? 0}")
+            k = k + 1
+        }
+        var q = 0
+        while q < QUOTA_KINDS {
+            print("quota {quota_kind_name(q)} kind={q} default={facts.defaults.get(q) ?? 0}")
+            q = q + 1
+        }
+        print("limits capacity={facts.capacity} extents={facts.extents} records_per_body={facts.records_per_body} handles={facts.handles} image_rows={facts.image_rows} budget={facts.budget} domains={facts.domains} stride={facts.stride} inflight={facts.inflight}")
+        return
+    }
     if command.equals("link") && args.len() == 4 {
         let profile = try load_profile(args.get(2) ?? "")
         let path = args.get(3) ?? ""
@@ -56,7 +80,7 @@ func run() -> Result<Void, BuildError> {
         }
         return
     }
-    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE")
+    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | slabs KERNEL")
 }
 
 func load_profile(path: String) -> Result<Profile, BuildError> {

@@ -2068,7 +2068,7 @@ another process's counters. Three things about the region:
 - **Bodies.** `MAX_PROCESSES` is the compiled number of bodies, the same on
   every board — the floor of the bound, not the whole of it. An image raises
   the number a machine boots with by linking an area for `SlabKind.Processes`
-  (§2.8, §12; not yet enforced: limits). A deployment donates memory to back
+  (§2.8, §12). A deployment donates memory to back
   more (`SlabKind.Processes`, through `SystemOp.SlabDonate`, §2.8), and the
   running bound is `process_slots_usable()` =
   `min(PROCESSES.capacity(), hal.PROT_DOMAIN_SLOTS)`. The second term exists
@@ -2219,7 +2219,7 @@ raising a set number raises what is derived from it.
   `MAX_THREADS` (§2.1), so the ring's property holds up to the threads floor;
   on a machine with more threads than that, a post into a full ring answers
   `WouldBlock` as any full ring does.
-- **An image raises what a machine boots with** (not yet enforced: limits).
+- **An image raises what a machine boots with.**
   Its region table may name, for each slab kind it raises, one area of the
   kernel's own memory that the build linked in, sized to the image's limits,
   and the kernel installs it as one more extent of that kind before the
@@ -2227,13 +2227,12 @@ raising a set number raises what is derived from it.
   area. The table also carries the quota defaults the image's children start
   with (§2.9). A board's description gives the capacities and defaults an
   image gets when it names none, and the image builder writes them into the
-  image, so to the kernel they are the image's. An image raises a limit and
-  never lowers one: the floor stays extent 0, and a default stays at least
-  the compiled one.
-- **An image's totals keep the floors' relations**
-  (not yet enforced: limits). At boot, records are at least
-  `PROCESS_RECORDS_PER_BODY` × bodies, threads at least bodies (every live
-  process has a main thread), attachments at least events + interrupts +
+  image, so to the kernel they are the image's (not yet enforced: limits).
+  An image raises a limit and never lowers one: the floor stays extent 0,
+  and a default stays at least the compiled one.
+- **An image's totals keep the floors' relations.** At boot, records are at
+  least `PROCESS_RECORDS_PER_BODY` × bodies, threads at least bodies (every
+  live process has a main thread), attachments at least events + interrupts +
   timers + records, bodies within the domain pool, each quota default below
   its slab's capacity (the `Handle` default below `MAX_HANDLES`), and the
   `Mapping` default at most the grant-row budget less `IMAGE_GRANT_ROWS`
@@ -2400,14 +2399,14 @@ end of this section says what the kernel does until they are.
   boot. That clamp makes a `map()` meeting the
   physical wall with quota headroom left (which would be fatal) unreachable
   rather than merely unlikely.
-- **A child's rows.** A child starts with the quota defaults its image
-  carries (§2.8, §12), which replace `kcore.limits`' compiled defaults
-  (not yet enforced: limits); an image that carries none gives its children the
-  compiled defaults. Its launcher may then set any row before the start
-  (`ProcessOp.QuotaSet`, §2.7; not yet enforced: quota-door). A row is a cap
-  on one process, not a share of its launcher's. A child's mapping row is
-  clamped at its create to the grant rows its domain has left after its
-  image, as root's is. There is no per-create quota argument.
+- **A child's rows.** A child starts with the quota defaults its image carries
+  (§2.8, §12), which replace `kcore.limits`' compiled defaults; an image that
+  carries none gives its children the compiled defaults. Its launcher may then
+  set any row before the start (`ProcessOp.QuotaSet`, §2.7; not yet enforced:
+  quota-door). A row is a cap on one process, not a share of its launcher's. A
+  child's mapping row is clamped at its create to the grant rows its domain
+  has left after its image, as root's is. There is no per-create quota
+  argument.
 - **`Pipe` counts a connection.** `ProcessOp.PipeCreate` charges it once, and
   the credit lands when both of the connection's reference columns reach zero
   and the slot goes back. Charging per endpoint would be wrong: two ends of
@@ -2469,16 +2468,17 @@ building it removes its markers and its paragraph, and the last part removes
 this note.
 
 - **Limits** (`limits`). One set of compiled numbers serves every board.
-  The slab floors, `MAX_HANDLES` and the quota defaults are `kcore.limits`',
-  the same on every board, and a board's own numbers are its grant-row
-  budget, its segment bound and its domain pool. The compiled mapping
-  default is checked against a minimum every board's budget meets
+  The slab floors, `MAX_HANDLES` and the compiled quota defaults are
+  `kcore.limits`', the same on every board, and a board's own numbers are
+  its grant-row budget, its segment bound and its domain pool. The compiled
+  mapping default is checked against a minimum every board's budget meets
   (`MIN_GRANT_ROW_BUDGET`), not against each board's own budget, and the
   handle table need not hold a full region table beside root's first
-  handles. The region table is at version 4 and the kernel reads nothing
-  after its rows, so an image links no slab area and carries no quota
-  defaults: every kind boots at its floor, only a donation raises one, and
-  every child starts with the compiled defaults.
+  handles. No board has a description: an image's limits are the ones the
+  image itself states, which the image builder writes into its slab block
+  (§12), and an image that states none links no area and carries no
+  defaults, so every kind boots at its floor and every child starts with the
+  compiled defaults.
 - **The quota door** (`quota-door`). No op sets or reads a quota row:
   `ProcessOp` has neither `QuotaSet` nor `QuotaGet`, and there is no
   `ProcessRight.QuotaSet`. A child keeps the rows its create installed, its
@@ -3254,8 +3254,9 @@ Everything else derives from those handles.
 - **The build also emits a region table** (§12), the second boot input the
   kernel reads. Its header carries the boot flags: the build's options to the
   kernel, since no board hands a kernel a command line. After its rows it
-  carries the image's linked slab areas and its children's quota defaults
-  (§12; not yet enforced: limits).
+  carries a block naming the image's linked slab areas, which the build
+  links into the kernel's own memory, and its children's quota defaults
+  (§12).
 
 ### 5.7 Syscall ABI
 
@@ -4676,16 +4677,15 @@ reserved.
   pool there allocates only such allocations, and the segments a child uses in
   place count on the image allocation they lie in (§2.5), so a launcher may
   release its image handle while the child runs out of flash.
-- **After the rows, the image's slab areas** (not yet enforced: limits). The
-  table is at version 5. After its rows comes nothing, or one whole block: a
-  magic word, the number of areas, one quota default for each `QuotaKind`
-  (the rows the image's children start with, §2.9), then one entry per area
-  naming a `SlabKind`, the area's base and its length. The build links each
-  area into the kernel's own memory, sized to the image's limits (§2.8).
-  Anything else after the rows stops the boot, a partial block and bytes
-  after the block included. The kernel reads the block before the first
-  process exists, before root's record, body or rows are taken, and each of
-  these stops the boot, naming what it found:
+- **After the rows, the image's slab areas.** The table is at version 5. After
+  its rows comes nothing, or one whole block: a magic word, the number of
+  areas, one quota default for each `QuotaKind` (the rows the image's children
+  start with, §2.9), then one entry per area naming a `SlabKind`, the area's
+  base and its length. The build links each area into the kernel's own memory,
+  sized to the image's limits (§2.8). Anything else after the rows stops the
+  boot, a partial block and bytes after the block included. The kernel reads
+  the block before the first process exists, before root's record, body or
+  rows are taken, and each of these stops the boot, naming what it found:
   - a kind that is not a `SlabKind`, or a kind two areas name: a kind is
     raised by one extent;
   - an area whose length is not a whole, nonzero number of its kind's slots,
@@ -4693,17 +4693,22 @@ reserved.
     context, a connection's with its staging ring, §2.8), or whose base is
     not aligned as those slots need;
   - an area not wholly inside the kernel's own zero-initialised memory,
-    between the board script's `_bss_start` and `_arena_start`, or an area
-    that meets another;
-  - a kind whose capacity with its area would pass `MAX_SLAB_CAPACITY`;
+    between the board script's `_bss_start` and `_arena_start` (a base or a
+    length the machine's word cannot hold is outside it, and so is a base
+    that is neither physical nor the kernel's own address for a physical
+    one), or an area that meets another;
+  - a kind whose capacity with its area would pass `MAX_SLAB_CAPACITY`, and
+    for `Pipes` a count of connections whose exchanges would pass it, which
+    at `PIPE_INFLIGHT` exchanges a connection comes at a smaller count;
   - capacities at boot that break a relation of §2.8's: records below
     `PROCESS_RECORDS_PER_BODY` × bodies, threads below bodies, attachments
     below events + interrupts + timers + records, or bodies beyond the
     domain pool (`hal.PROT_DOMAIN_SLOTS`);
-  - a quota default below `kcore.limits`' compiled default for its kind or
-    not below its slab's capacity at boot, a `Handle` default not below
-    `MAX_HANDLES`, or a `Mapping` default above the grant-row budget less
-    `IMAGE_GRANT_ROWS`.
+  - a quota default below `kcore.limits`' compiled default for its kind,
+    one that is not a limit (at or above `QUOTA_UNLIMITED`, which a row
+    reads as no cap at all, §2.7), one not below its slab's capacity at
+    boot, a `Handle` default not below `MAX_HANDLES`, or a `Mapping` default
+    above the grant-row budget less `IMAGE_GRANT_ROWS`.
 
   Then each area is zeroed again and installed as one more extent of its
   slab, as a donated region is (§2.8). What a process can observe afterwards
@@ -4713,7 +4718,11 @@ reserved.
   and a donation adds to it as to any other extent. The area takes one of
   the kind's `MAX_SLAB_EXTENTS`, so a kind raised by its image accepts one
   donation fewer. No handle names an area and no process can map, give or
-  donate one: its bytes are the kernel's from the first instruction.
+  donate one: its bytes are the kernel's from the first instruction. What
+  the containment check does not catch is an area inside that memory that
+  lies over the kernel's own statics, which the boot then zeroes: the build
+  gives each area a section of its own, and a block made any other way is
+  as trusted as the kernel it is linked into.
 - **A row typed wrong is the build's error, met at root's drain.** The kernel
   mints what the kind column says. A root that finds a pool under a tag its
   config gives to an allocation, or the reverse, learns it from the boot

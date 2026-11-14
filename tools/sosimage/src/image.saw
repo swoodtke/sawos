@@ -20,6 +20,10 @@
 //!            "base": 2149842944, "len": 262144}
 //!         ]
 //!       },
+//!       "limits": {
+//!         "slabs": {"processes": 1, "waiters": 1, "memories": 4},
+//!         "quotas": {"event": 6}
+//!       },
 //!       "link_args": ["--defsym=_sos_semihosting=0"],
 //!       "flash": {"output": "/path/to/case.flash.bin", "check": true}
 //!     }
@@ -45,19 +49,26 @@
 //!   `len`. A blob row's base and length
 //!   are the linker's; a blob whose row is a pool is placed on a page boundary
 //!   and padded to one, so the pool's longest run is the whole blob.
+//! - `limits` is what the image raises the machine to (`sosimage.limits`):
+//!   `slabs` names each slab kind it raises and by how many slots, `quotas`
+//!   each quota default its children start with. An image that states limits
+//!   carries the slab block after its table's rows and links an area for each
+//!   kind its limits raise; one without them carries no block, and its kinds
+//!   boot at their floors. An image with `limits` has `regions`.
 //! - `link_args` are given to the linker after `--gc-sections`.
 //! - `flash`, for a profile with a flash layout, writes the flash image to
 //!   `output`; `check` holds every resident image to its slot.
 //!
 //! Every path is absolute. `asm`, `child_asm`, `root_image`, `children`,
-//! `regions`, `link_args` and `flash` may be left out, and every other key is
-//! required, inside `regions`, its rows and `flash` too; an image has
-//! `children` or a `child_asm`, never both. An unknown key is refused.
+//! `regions`, `limits`, `link_args` and `flash` may be left out, and every
+//! other key is required, inside `regions`, its rows and `flash` too; an image
+//! has `children` or a `child_asm`, never both. An unknown key is refused.
 
 import std.json.{JsonValue}
 import sosimage.failure.{BuildError}
 import sosimage.fields.{Fields}
 import sosimage.regions.{RegionKind, RegionRow, RowWord}
+import sosimage.limits.{ImageLimits}
 
 public static IMAGE_VERSION: Int = 1
 
@@ -88,6 +99,11 @@ public struct ImageSpec {
     has_regions: Bool
     flags: UInt64
     rows: Vector<RowSpec>
+    /// Whether the image states limits, and so carries a slab block.
+    has_limits: Bool
+    /// What the image raises the machine to; nothing when `has_limits` is
+    /// false.
+    limits: ImageLimits
     link_args: Vector<String>
     flash: FlashOutput?
 }
@@ -133,6 +149,15 @@ extension ImageSpec {
             }
             try table.finish()
         }
+        var has_limits = false
+        var limits = ImageLimits.none()
+        if var l = try top.object("limits", "the image's `limits`") {
+            if not has_regions {
+                return BuildError(message: "the image {origin}: `limits` ride after the region table's rows, and the image has no `regions`")
+            }
+            has_limits = true
+            limits = try ImageLimits.read(&var l)
+        }
         let link_args = try top.texts_or_empty("link_args")
         var flash: FlashOutput? = None
         if var f = try top.object("flash", "the image's `flash`") {
@@ -144,8 +169,29 @@ extension ImageSpec {
                          output: output, asm: asm, child_asm: child_asm,
                          root_image: root_image, children: move children,
                          has_regions: has_regions, flags: flags,
-                         rows: move rows, link_args: move link_args,
-                         flash: flash)
+                         rows: move rows, has_limits: has_limits,
+                         limits: move limits,
+                         link_args: move link_args, flash: flash)
+    }
+
+    /// How many Memory objects and how many IoMemory objects the table's rows
+    /// mint at boot: a `ram` or `pool` row mints the first, a `device` row the
+    /// second.
+    public func row_kinds(&self) -> (Int, Int) {
+        var memory = 0
+        var device = 0
+        var r = 0
+        while r < self.rows.len() {
+            if let row = self.rows.get(r) {
+                if row.kind == RegionKind.Device {
+                    device = device + 1
+                } else {
+                    memory = memory + 1
+                }
+            }
+            r = r + 1
+        }
+        (memory, device)
     }
 
     /// Whether child `i`'s blob row is a pool, which places the blob on a

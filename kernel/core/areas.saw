@@ -1,0 +1,556 @@
+//! An image's slab areas, and the geometry an area and a donation share.
+//!
+//! An image raises what a machine boots with (spec §2.8, §12). The build links
+//! zeroed storage for each slab kind it raises into the kernel's own `.bss`
+//! and names it in a block after the region table's rows; `install_image_slabs`
+//! reads the block before the first process exists, checks it, and installs
+//! each area as one more extent of its slab, exactly as a donated region is
+//! installed (`slab_geometry`, `slab_install`). A kind's capacity at boot is
+//! then its floor plus its area, and every reader of a capacity reads it so.
+//!
+//! The block also carries the quota defaults the image's children start with,
+//! which replace `kcore.limits`' compiled ones (`set_image_quota_defaults`).
+//!
+//! # The block
+//!
+//! Wire layout, little-endian, starting at the first byte past the table's last
+//! row (8-aligned, since the header and every row are multiples of 8):
+//!
+//!   - a 48-byte header: magic `u32` (`SLAB_BLOCK_MAGIC`), the number of areas
+//!     `u32`, one quota default `u32` per `QuotaKind` in its value's order, and
+//!     a reserved `u32`;
+//!   - one 24-byte entry per area: the `SlabKind` `u32`, a reserved `u32`, the
+//!     area's base `u64` and its length `u64`.
+//!
+//! The section ends with the last entry. An image with no block ends with the
+//! last row, which is every image that raises nothing.
+//!
+//! # The exported limits
+//!
+//! `sos_image_limits` is the record the image builder reads out of a compiled
+//! kernel object to size and check an image's areas before it links them: the
+//! numbers below, the floors and the compiled quota defaults. No code in the
+//! kernel reads it, so the link discards it.
+
+import hal
+import sosabi.{SlabKind}
+import kcore.limits.{
+    DEFAULT_QUOTA_EVENTS,
+    DEFAULT_QUOTA_HANDLES,
+    DEFAULT_QUOTA_IOMEMORIES,
+    DEFAULT_QUOTA_MAPPINGS,
+    DEFAULT_QUOTA_MEMORIES,
+    DEFAULT_QUOTA_PIPES,
+    DEFAULT_QUOTA_THREADS,
+    DEFAULT_QUOTA_TIMERS,
+    DEFAULT_QUOTA_WAITERS,
+    IMAGE_GRANT_ROWS,
+    MAX_ATTACHMENTS,
+    MAX_EVENTS,
+    MAX_FREE_RANGES,
+    MAX_HANDLES,
+    MAX_INTERRUPTS,
+    MAX_IOMEMORIES,
+    MAX_MAPPINGS,
+    MAX_MEMORIES,
+    MAX_PIPES,
+    MAX_PROCESSES,
+    MAX_PROCESS_RECORDS,
+    MAX_SLAB_CAPACITY,
+    MAX_SLAB_EXTENTS,
+    MAX_THREADS,
+    MAX_TIMERS,
+    MAX_WAITERS,
+    PIPE_INFLIGHT,
+    PROCESS_RECORDS_PER_BODY,
+    THREAD_FRAME_STRIDE,
+}
+import kcore.mem.{zero_bytes}
+import kcore.diag.{console, fatal_image, fatal_kernel}
+import kcore.pslot.{PROCESSES, PROCESS_RECORDS, QUOTA_KINDS, QuotaKind}
+import kcore.objects.{
+    EXCHANGES,
+    FREE_RANGES,
+    IOMEMORIES,
+    MAPPINGS,
+    MEMORIES,
+    PIPES,
+    QUOTA_UNLIMITED,
+    compiled_quota_default,
+    set_image_quota_defaults,
+}
+import kcore.threads.{THREADS}
+import kcore.time.{TIMERS}
+import kcore.waitables.{ATTACHMENTS, EVENTS, INTERRUPTS, WAITERS}
+import kcore.process.{fits_word, region_table}
+
+// =============================================================================
+// The geometry a donated region and a linked area share
+// =============================================================================
+
+/// One donatable slab's geometry: how many bytes one unit needs, what the
+/// extent's base must be aligned to, how many more extents the kind can take,
+/// and how many more units its ceiling still allows.
+///
+/// Four numbers in one match rather than four matches, because they are asked
+/// together and a kind that answered one of them from a different slab than the
+/// others would be a silent corruption rather than a compile error.
+///
+/// A unit is not always a slot. Most kinds take one array and a unit is a slot.
+/// `Threads` and `Pipes` take a slot and the per-slot storage that belongs to
+/// it, so a unit is the pair and the stride is the pair's size. It is one
+/// region, carved by `slab_install`, so a donor or a build never has to know two
+/// kernel-internal sizes and their alignment.
+///
+/// The fourth number is headroom, not the held count: a kind with two chains
+/// has two ceilings and only the kind knows which binds, so the kind answers
+/// "how many more units may I take" and the caller compares. For `Pipes` the
+/// exchange chain binds, by a factor of `PIPE_INFLIGHT`.
+public(package) func slab_geometry(kind: SlabKind) unsafe -> (Int, Int, Int, Int) {
+    match kind {
+        case Events -> (EVENTS.slot_bytes(), EVENTS.slot_align(), EVENTS.extents_left(), MAX_SLAB_CAPACITY - EVENTS.capacity()),
+        case Waiters -> (WAITERS.slot_bytes(), WAITERS.slot_align(), WAITERS.extents_left(), MAX_SLAB_CAPACITY - WAITERS.capacity()),
+        case Interrupts -> (INTERRUPTS.slot_bytes(), INTERRUPTS.slot_align(), INTERRUPTS.extents_left(), MAX_SLAB_CAPACITY - INTERRUPTS.capacity()),
+        case Attachments -> (ATTACHMENTS.slot_bytes(), ATTACHMENTS.slot_align(), ATTACHMENTS.extents_left(), MAX_SLAB_CAPACITY - ATTACHMENTS.capacity()),
+        case Timers -> (TIMERS.slot_bytes(), TIMERS.slot_align(), TIMERS.extents_left(), MAX_SLAB_CAPACITY - TIMERS.capacity()),
+        case Memories -> (MEMORIES.slot_bytes(), MEMORIES.slot_align(), MEMORIES.extents_left(), MAX_SLAB_CAPACITY - MEMORIES.capacity()),
+        case IoMemories -> (IOMEMORIES.slot_bytes(), IOMEMORIES.slot_align(), IOMEMORIES.extents_left(), MAX_SLAB_CAPACITY - IOMEMORIES.capacity()),
+        case Mappings -> (MAPPINGS.slot_bytes(), MAPPINGS.slot_align(), MAPPINGS.extents_left(), MAX_SLAB_CAPACITY - MAPPINGS.capacity()),
+        case FreeRanges -> (FREE_RANGES.slot_bytes(), FREE_RANGES.slot_align(), FREE_RANGES.extents_left(), MAX_SLAB_CAPACITY - FREE_RANGES.capacity()),
+        // A thread unit is a slot plus a frame. The frame's stride is also the
+        // extent's alignment: it is the strictest of the two and so serves
+        // both, since `THREAD_FRAME_STRIDE` is a multiple of every slot
+        // alignment.
+        case Threads -> (THREADS.slot_bytes() + THREAD_FRAME_STRIDE,
+                         THREAD_FRAME_STRIDE,
+                         THREADS.extents_left(),
+                         MAX_SLAB_CAPACITY - THREADS.capacity()),
+        // A pipe unit is a connection plus its whole staging ring. Both chains
+        // must have an extent free, and the exchange ceiling binds:
+        // `PIPE_INFLIGHT` exchanges are spent per connection, so the headroom
+        // in connections is the exchange headroom divided by it.
+        case Pipes -> (PIPES.slot_bytes() + PIPE_INFLIGHT * EXCHANGES.slot_bytes(),
+                       max_int(PIPES.slot_align(), EXCHANGES.slot_align()),
+                       min_int(PIPES.extents_left(), EXCHANGES.extents_left()),
+                       min_int(MAX_SLAB_CAPACITY - PIPES.capacity(),
+                               (MAX_SLAB_CAPACITY - EXCHANGES.capacity()) / PIPE_INFLIGHT)),
+        // A process body unit is a slot. The handle table, the boot set and the
+        // grant record live inside `ProcessBody`, so this is a plain one-array
+        // chain and needs neither a side arena nor a second ceiling. The
+        // domain-pool ceiling is not the slab's business: the allocator
+        // applies it (`process_slots_usable`).
+        case Processes -> (PROCESSES.slot_bytes(), PROCESSES.slot_align(), PROCESSES.extents_left(), MAX_SLAB_CAPACITY - PROCESSES.capacity()),
+        // A record unit is a slot of its own chain, the same one-array shape.
+        // Records have no domain behind them, so the slab is the whole bound.
+        case ProcessRecords -> (PROCESS_RECORDS.slot_bytes(), PROCESS_RECORDS.slot_align(), PROCESS_RECORDS.extents_left(), MAX_SLAB_CAPACITY - PROCESS_RECORDS.capacity()),
+    }
+}
+
+/// The larger / smaller of two counts, for `slab_geometry`'s two-chain kinds.
+func max_int(a: Int, b: Int) -> Int { if a > b { a } else { b } }
+
+func min_int(a: Int, b: Int) -> Int { if a < b { a } else { b } }
+
+/// Append the extent. The caller has validated everything and zeroed the bytes;
+/// this is the step that makes them reachable.
+///
+/// The two-chain kinds carve here, and the order matters. `slab_geometry`
+/// already refused a region either chain has no room for, so once the first
+/// `donate` has run the second cannot fail. If it did, the chains would skew,
+/// so that refusal is `fatal_kernel`: a kernel invariant, not a caller
+/// condition.
+public(package) func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
+    match kind {
+        case Events -> EVENTS.donate(base, slots),
+        case Waiters -> WAITERS.donate(base, slots),
+        case Interrupts -> INTERRUPTS.donate(base, slots),
+        case Attachments -> ATTACHMENTS.donate(base, slots),
+        case Timers -> TIMERS.donate(base, slots),
+        case Memories -> MEMORIES.donate(base, slots),
+        case IoMemories -> IOMEMORIES.donate(base, slots),
+        case Mappings -> MAPPINGS.donate(base, slots),
+        case FreeRanges -> FREE_RANGES.donate(base, slots),
+        // Frames first, at the extent's own base: the base is aligned to
+        // `THREAD_FRAME_STRIDE` (the geometry says so) and each frame is
+        // exactly a stride, so every frame is stride-aligned, which
+        // `frame_slot` requires. The slots follow at
+        // `slots * THREAD_FRAME_STRIDE`, itself a multiple of the stride and
+        // therefore of any slot alignment.
+        case Threads -> THREADS.donate_paired(
+            base + ((slots * THREAD_FRAME_STRIDE) as UInt), slots, base),
+        // Connections first, then their exchanges. `slots * sizeof(PipeSlot)`
+        // is a multiple of the slot's alignment, which is the alignment
+        // `Exchange` wants too (the geometry took the larger of the two for the
+        // base), so the second array lands aligned with no pad.
+        case Pipes -> {
+            let ex_base = base + ((slots * PIPES.slot_bytes()) as UInt)
+            if not PIPES.donate(base, slots) {
+                return false
+            }
+            if not EXCHANGES.donate(ex_base, slots * PIPE_INFLIGHT) {
+                fatal_kernel("a pipe donation installed connections without exchanges",
+                             slots as UInt)
+                return false
+            }
+            true
+        },
+        case Processes -> PROCESSES.donate(base, slots),
+        case ProcessRecords -> PROCESS_RECORDS.donate(base, slots),
+    }
+}
+
+// =============================================================================
+// The slab block
+// =============================================================================
+
+/// How many `SlabKind`s there are: one past the largest kind's value.
+static SLAB_KINDS: Int = 13
+
+static_assert(SLAB_KINDS == (SlabKind.ProcessRecords as Int) + 1,
+              "the block's per-kind tables have one entry per SlabKind")
+
+/// 'S','L','A','B' as a little-endian word.
+static SLAB_BLOCK_MAGIC: UInt32 = 0x4241_4C53
+
+/// The block's header: what follows the table's last row when the image
+/// raises anything. `quota` is indexed by a `QuotaKind`'s value.
+struct SlabBlockHeader {
+    magic: UInt32,
+    count: UInt32,
+    quota: [UInt32; QUOTA_KINDS],
+    reserved: UInt32,
+}
+
+/// One area: the kind it raises, and where the build linked its storage. The
+/// base is the linker's, a link address on a higher-half kernel, and is
+/// normalized to physical before anything compares it.
+struct SlabArea {
+    kind: UInt32,
+    reserved: UInt32,
+    base: UInt64,
+    len: UInt64,
+}
+
+// ABI pin, as the region table's: a layout edit stops the build here rather
+// than misreading a block at boot.
+static_assert(sizeof<SlabBlockHeader>() == 48,
+              "the slab block header must be exactly 48 bytes")
+static_assert(sizeof<SlabArea>() == 24,
+              "a slab block entry must be exactly 24 bytes")
+
+func block_header_at(addr: UInt) unsafe -> SlabBlockHeader {
+    UnsafeMemory<SlabBlockHeader, Normal>(hal.phys_to_virt(addr)).read()
+}
+
+func block_area_at(addr: UInt) unsafe -> SlabArea {
+    UnsafeMemory<SlabArea, Normal>(hal.phys_to_virt(addr)).read()
+}
+
+/// Read the image's slab block, if it carries one, and install each area as
+/// one more extent of its slab and each quota default as what a child starts
+/// with. Called once, before root's record, body or rows are taken.
+///
+/// Every refusal is `fatal_image` naming what it found, in this order: the
+/// block's own shape (cut short, not a block, bytes after it); then each area
+/// in the block's order (a kind this build cannot name, a kind named twice, a
+/// base or length past the address space, a base that is neither physical nor
+/// the kernel's address for its physical one, no length, a capacity past
+/// `MAX_SLAB_CAPACITY`, a misaligned base, an area outside the kernel's zeroed
+/// memory, an area meeting an earlier one, a length that is not whole slots);
+/// then the capacities at boot against §2.8's relations; then each quota
+/// default against its bounds. Nothing is installed until every check has
+/// passed, so a refused block changes no slab.
+///
+/// No preemption point: at most `SLAB_KINDS` areas, each checked against the
+/// ones before it, and a zeroing loop over the area's bytes, all before any
+/// process exists to be preempted for.
+public func install_image_slabs() unsafe {
+    let table = region_table()
+    let header_len = sizeof<SlabBlockHeader>() as UInt
+    let area_len = sizeof<SlabArea>() as UInt
+
+    let rest = table.end - table.rows_end
+    if rest == 0 {
+        return
+    }
+    if rest < header_len {
+        fatal_image("the slab block is cut short", rest)
+    }
+    let header = block_header_at(table.rows_end)
+    if header.magic != SLAB_BLOCK_MAGIC {
+        fatal_image("bytes after the region table's rows are not a slab block",
+                    header.magic as UInt)
+    }
+    let count = header.count as UInt
+    let room = rest - header_len
+    if count > room / area_len {
+        fatal_image("the slab block is cut short", count)
+    }
+    if room != count * area_len {
+        fatal_image("bytes follow the slab block", room - count * area_len)
+    }
+
+    let low = hal.kernel_bss_start()
+    let high = hal.kernel_arena_start()
+    var seen: UInt32 = 0
+    var kinds: [Int; SLAB_KINDS] = [0; SLAB_KINDS]
+    var bases: [UInt; SLAB_KINDS] = [0; SLAB_KINDS]
+    var lens: [UInt; SLAB_KINDS] = [0; SLAB_KINDS]
+    var slots: [Int; SLAB_KINDS] = [0; SLAB_KINDS]
+    var raised: [Int; SLAB_KINDS] = [0; SLAB_KINDS]
+
+    var i: UInt = 0
+    while i < count {
+        let area = block_area_at(table.rows_end + header_len + i * area_len)
+        guard let kind = SlabKind.from(raw: area.kind as UInt) else {
+            fatal_image("a slab area names a kind this build cannot name",
+                        area.kind as UInt)
+            return
+        }
+        let k = kind as Int
+        let bit: UInt32 = 1u32 << (k as UInt32)
+        if (seen & bit) != 0 {
+            fatal_image("two slab areas name one kind", k as UInt)
+        }
+        seen = seen | bit
+        if not fits_word(area.base) || not fits_word(area.len) {
+            fatal_image("a slab area lies outside the kernel's zeroed memory", i)
+        }
+        // A base is physical already, or the kernel's own address for a
+        // physical one (a linker-resolved symbol on a higher-half kernel), and
+        // nothing else: `virt_to_phys` drops bits it does not expect, so a
+        // base it changes into something whose kernel address is not the base
+        // would name bytes nobody linked there.
+        let linked = area.base as UInt
+        let base = hal.virt_to_phys(linked)
+        if linked != base && linked != hal.phys_to_virt(base) {
+            fatal_image("a slab area lies outside the kernel's zeroed memory",
+                        linked)
+        }
+        let len = area.len as UInt
+        if len == 0 {
+            fatal_image("a slab area has no length", k as UInt)
+        }
+        let (stride_i, align_i, _, headroom) = slab_geometry(kind)
+        let stride = stride_i as UInt
+        let count_here = len / stride
+        // Compared as unsigned before it is narrowed: a length that is not
+        // whole slots is refused below, and one too long for the ceiling is
+        // refused here whatever its remainder.
+        if count_here > (headroom as UInt) {
+            fatal_image("a slab area would take its slab past MAX_SLAB_CAPACITY",
+                        k as UInt)
+        }
+        if base % (align_i as UInt) != 0 {
+            fatal_image("a slab area's base is not aligned for its slots", base)
+        }
+        if base < low || base > high || len > high - base {
+            fatal_image("a slab area lies outside the kernel's zeroed memory",
+                        base)
+        }
+        var j: UInt = 0
+        while j < i {
+            let other_base = bases[j as Int]
+            let other_top = other_base + lens[j as Int]
+            if base < other_top && other_base < base + len {
+                fatal_image("two slab areas meet", base)
+            }
+            j = j + 1
+        }
+        if len % stride != 0 {
+            fatal_image("a slab area is not a whole number of slots", len)
+        }
+        kinds[i as Int] = k
+        bases[i as Int] = base
+        lens[i as Int] = len
+        slots[i as Int] = count_here as Int
+        raised[k] = count_here as Int
+        i = i + 1
+    }
+
+    check_relations(&raised)
+    let defaults = check_quota_defaults(&header, &raised)
+
+    let uart = console()
+    var a: UInt = 0
+    while a < count {
+        let at = a as Int
+        guard let kind = SlabKind.from(raw: kinds[at] as UInt) else {
+            fatal_kernel("a checked slab area lost its kind", a)
+            return
+        }
+        // Zeroed again whatever the link did with it: a slot must start Free,
+        // and zero is Free for every kind, which is `slab_donate`'s reasoning.
+        // The extent records the physical base; only the write converts.
+        zero_bytes(hal.phys_to_virt(bases[at]), lens[at])
+        if not slab_install(kind, bases[at], slots[at]) {
+            fatal_kernel("a checked slab area was refused", kinds[at] as UInt)
+        }
+        uart.write_str("SOS: slab area kind=")
+        uart.write_hex(kinds[at] as UInt)
+        uart.write_str(" slots=")
+        uart.write_hex(slots[at] as UInt)
+        uart.write_str("\n")
+        a = a + 1
+    }
+    set_image_quota_defaults(&defaults)
+}
+
+/// The capacity `kind` boots with: what its slab holds now (its floor, since
+/// nothing has donated before the first process) plus its area.
+func boot_capacity(kind: SlabKind, raised: &[Int; SLAB_KINDS]) unsafe -> Int {
+    let held = match kind {
+        case Events -> EVENTS.capacity(),
+        case Waiters -> WAITERS.capacity(),
+        case Interrupts -> INTERRUPTS.capacity(),
+        case Attachments -> ATTACHMENTS.capacity(),
+        case Timers -> TIMERS.capacity(),
+        case Memories -> MEMORIES.capacity(),
+        case IoMemories -> IOMEMORIES.capacity(),
+        case Mappings -> MAPPINGS.capacity(),
+        case FreeRanges -> FREE_RANGES.capacity(),
+        case Threads -> THREADS.capacity(),
+        case Pipes -> PIPES.capacity(),
+        case Processes -> PROCESSES.capacity(),
+        case ProcessRecords -> PROCESS_RECORDS.capacity(),
+    }
+    held + raised[kind as Int]
+}
+
+/// §2.8's relations over the capacities the image boots with. The floors keep
+/// them at compile time (`kcore.limits`' asserts); an image's areas must keep
+/// them too, or the machine would boot with a table no create could fill.
+func check_relations(raised: &[Int; SLAB_KINDS]) unsafe {
+    let bodies = boot_capacity(SlabKind.Processes, &raised)
+    let records = boot_capacity(SlabKind.ProcessRecords, &raised)
+    let threads = boot_capacity(SlabKind.Threads, &raised)
+    let attachments = boot_capacity(SlabKind.Attachments, &raised)
+    let waitables = (boot_capacity(SlabKind.Events, &raised)
+                     + boot_capacity(SlabKind.Interrupts, &raised)
+                     + boot_capacity(SlabKind.Timers, &raised) + records)
+    if records < PROCESS_RECORDS_PER_BODY * bodies {
+        fatal_image("the image's process records are fewer than its bodies need",
+                    records as UInt)
+    }
+    if threads < bodies {
+        fatal_image("the image's threads are fewer than its process bodies",
+                    threads as UInt)
+    }
+    if attachments < waitables {
+        fatal_image("the image's attachments are fewer than its waitables",
+                    attachments as UInt)
+    }
+    if bodies > hal.PROT_DOMAIN_SLOTS {
+        fatal_image("the image's process bodies pass the domain pool",
+                    bodies as UInt)
+    }
+}
+
+/// The slab a quota kind draws from, for the bound a default must stay under.
+/// `Handle` has no slab: its bound is the table, `MAX_HANDLES`.
+func quota_slab(kind: QuotaKind) -> SlabKind? {
+    match kind {
+        case Thread -> SlabKind.Threads,
+        case Event -> SlabKind.Events,
+        case Waiter -> SlabKind.Waiters,
+        case Timer -> SlabKind.Timers,
+        case Memory -> SlabKind.Memories,
+        case IoMemory -> SlabKind.IoMemories,
+        case Mapping -> SlabKind.Mappings,
+        case Handle -> None,
+        case Pipe -> SlabKind.Pipes,
+    }
+}
+
+/// Check each of the block's quota defaults and answer them, one per ledger
+/// column. A default is at least `kcore.limits`' compiled one (an image raises
+/// and never lowers), fits the ledger's row without reading as
+/// `QUOTA_UNLIMITED`, is below its slab's capacity at boot (the `Handle`
+/// default below `MAX_HANDLES`), and for `Mapping` leaves the rows an image
+/// spends before it runs (spec §2.9, §5b.1).
+func check_quota_defaults(header: &SlabBlockHeader,
+                          raised: &[Int; SLAB_KINDS]) unsafe -> [Int; QUOTA_KINDS] {
+    var out: [Int; QUOTA_KINDS] = [0; QUOTA_KINDS]
+    let mapping_room = (hal.GRANT_ROW_BUDGET as Int) - IMAGE_GRANT_ROWS
+    var c: Int = 0
+    while c < QUOTA_KINDS {
+        guard let kind = QuotaKind.from(raw: c as UInt8) else {
+            fatal_kernel("a ledger column has no QuotaKind", c as UInt)
+            return out
+        }
+        let value = header.quota[c] as UInt
+        if value < (compiled_quota_default(kind) as UInt) {
+            fatal_image("a quota default is below its compiled default",
+                        c as UInt)
+        }
+        if value >= (QUOTA_UNLIMITED as UInt) {
+            fatal_image("a quota default does not fit the ledger", c as UInt)
+        }
+        let d = value as Int
+        if let slab = quota_slab(kind) {
+            if d >= boot_capacity(slab, &raised) {
+                fatal_image("a quota default is not below its slab's capacity",
+                            c as UInt)
+            }
+        } else if d >= MAX_HANDLES {
+            fatal_image("the Handle quota default is not below MAX_HANDLES",
+                        value)
+        }
+        if c == (QuotaKind.Mapping as Int) && d > mapping_room {
+            fatal_image("the Mapping quota default passes the rows an image leaves",
+                        value)
+        }
+        out[c] = d
+        c = c + 1
+    }
+    out
+}
+
+// =============================================================================
+// The record the image builder reads
+// =============================================================================
+
+/// How the builder recognizes the record's layout.
+static IMAGE_LIMITS_VERSION: UInt = 1
+
+/// The numbers an image's areas are sized and checked against, in a fixed
+/// order the builder reads by index: the record's version, the slab ceiling,
+/// the extents a slab may take, records per body, the handle table, the grant
+/// rows an image spends, the board's grant-row budget and domain pool, the
+/// thread frame stride and the staging ring's depth; then each slab's floor in
+/// `SlabKind` order; then each compiled quota default in `QuotaKind` order.
+@export("sos_image_limits")
+static IMAGE_LIMITS: [UInt; 32] = [
+    IMAGE_LIMITS_VERSION,
+    MAX_SLAB_CAPACITY as UInt,
+    MAX_SLAB_EXTENTS as UInt,
+    PROCESS_RECORDS_PER_BODY as UInt,
+    MAX_HANDLES as UInt,
+    IMAGE_GRANT_ROWS as UInt,
+    hal.GRANT_ROW_BUDGET,
+    hal.PROT_DOMAIN_SLOTS as UInt,
+    THREAD_FRAME_STRIDE as UInt,
+    PIPE_INFLIGHT as UInt,
+    MAX_EVENTS as UInt,
+    MAX_WAITERS as UInt,
+    MAX_INTERRUPTS as UInt,
+    MAX_ATTACHMENTS as UInt,
+    MAX_TIMERS as UInt,
+    MAX_MEMORIES as UInt,
+    MAX_IOMEMORIES as UInt,
+    MAX_MAPPINGS as UInt,
+    MAX_FREE_RANGES as UInt,
+    MAX_THREADS as UInt,
+    MAX_PIPES as UInt,
+    MAX_PROCESSES as UInt,
+    MAX_PROCESS_RECORDS as UInt,
+    DEFAULT_QUOTA_THREADS as UInt,
+    DEFAULT_QUOTA_EVENTS as UInt,
+    DEFAULT_QUOTA_WAITERS as UInt,
+    DEFAULT_QUOTA_TIMERS as UInt,
+    DEFAULT_QUOTA_MEMORIES as UInt,
+    DEFAULT_QUOTA_IOMEMORIES as UInt,
+    DEFAULT_QUOTA_MAPPINGS as UInt,
+    DEFAULT_QUOTA_HANDLES as UInt,
+    DEFAULT_QUOTA_PIPES as UInt,
+]

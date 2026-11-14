@@ -44,6 +44,7 @@ own restore path.
 | `exit_pass()` / `exit_fail(code)` | Stop the machine, zero / non-zero. Never return. A zero `code` is promoted so a failing exit never reads as a passing one. |
 | `payload_start()` / `payload_end()` | Bounds of the appended root image. Equal when there is none. |
 | `region_table_start()` / `region_table_end()` | Bounds of the build-emitted boot region table. Equal when there is none, which is zero regions and the ordinary state of an image that appends no child images. |
+| `kernel_bss_start()` / `kernel_arena_start()` | Bounds of the kernel's own zeroed memory, the `.bss` input sections between the board script's `_bss_start` and `_arena_start`: where an image's slab areas must lie (spec §12). |
 | `PROT_GRAIN: UInt` | Protection granularity — what a region bound is rounded up to. |
 | `MAX_ROOT_SEGMENTS: UInt` | How many segments a root image may ask for, i.e. the grant budget minus the stack. |
 | `GRANT_ROW_BUDGET: UInt` | **How many protection rows one process's domain may hold** — what `MemoryOp.Map` checks a target's `grant_count` against. **On this profile it is the physical wall**: a row is a numbered hardware region and there are only `PMP_REGIONS` of them, so a map meeting it is a map the machine cannot install. The target's `Mapping` quota is clamped to its free rows, so the answer a caller sees is `QuotaExceeded` and the wall itself is a kernel stop. Profile B publishes the same name meaning a policy cap, which is why the kernel reads the HAL's number rather than a shared constant. |
@@ -157,6 +158,7 @@ The **Where** column names the file: `boot.S` is this board's, `trap.S` and
 | `sos_pmpcfg_write(w0, w1, w2, w3)` | sink.c (shared) | Publish all four config registers together — entries 0-3, 4-7, 8-11, 12-15. | Same: `csrw pmpcfg0` names its register. The config words are staged in Saw, in four shadow variables rather than an array, because a `static` is not an array element. |
 | `sos_payload_start()` / `sos_payload_end()` | sink.c (shared) | Bounds of the appended payload. | A linker symbol's address, which Saw cannot name. |
 | `sos_region_table_start()` / `sos_region_table_end()` | sink.c (shared) | Bounds of the `.regions` section — the boot region table. The table's blob rows carry bases the linker resolved when it placed the generated stub, so no per-child symbol has to be nameable here. | Same reason. |
+| `sos_kernel_bss_start()` / `sos_kernel_arena_start()` | sink.c (shared) | `_bss_start` and `_arena_start`: the kernel's own zeroed memory, where an image's slab areas must lie. | Same reason. |
 | `sos_wait_for_irq()` | sink.c (shared) | Park the core until an interrupt is pending, behind `wait_for_irq`. | `wfi` is an instruction. |
 | `virt.ld` | this board | Places the image at this board's RAM base, first section first, and bounds the appended payload on page boundaries at both ends. The rounding is a speed property under emulation rather than a protection one: a PMP region covering part of a page defeats the emulator's per-page translation cache, and the cost under emulation is large enough to matter. | Not a program. |
 

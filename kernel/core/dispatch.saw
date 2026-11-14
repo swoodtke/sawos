@@ -133,7 +133,6 @@ import sosabi.{
 }
 import kcore.limits.{
     MAX_HANDLES,
-    MAX_SLAB_CAPACITY,
     NO_ATTACHMENT,
     NO_EVENT,
     NO_INTERRUPT,
@@ -146,10 +145,10 @@ import kcore.limits.{
     NO_TIMER,
     NO_WAITER,
     PIPE_INFLIGHT,
-    THREAD_FRAME_STRIDE,
 }
 import kcore.mem.{align_up}
 import kcore.preempt.{long_zero}
+import kcore.areas.{slab_geometry, slab_install}
 import imgformat.{SegFlag}
 import kcore.result.{
     SyscallResult,
@@ -165,7 +164,6 @@ import kcore.pslot.{HandleEntry, PROCESSES, PROCESS_RECORDS, ProcessState,
 import kcore.objects.{
     ClockObject,
     EventObject,
-    FREE_RANGES,
     IOMEMORIES,
     InterruptObject,
     IoMemoryObject,
@@ -951,117 +949,6 @@ func process_arg(p: Int, handle: UInt) unsafe -> Int {
 // chain room (the machine's two answers). Only then does anything move, and
 // what moves is permanent.
 
-/// One donatable slab's geometry: how many bytes one donated unit needs, what
-/// the extent's base must be aligned to, how many more extents the kind can
-/// take, and how many more units its ceiling still allows.
-///
-/// Four numbers in one match rather than four matches, because they are asked
-/// together and a kind that answered one of them from a different slab than the
-/// others would be a silent corruption rather than a compile error.
-///
-/// A unit is not always a slot. Most kinds donate one array and a unit is a
-/// slot. `Threads` and `Pipes` donate a slot and the per-slot storage that
-/// belongs to it, so a unit is the pair and the stride is the pair's size. It
-/// is one region, carved by `slab_install`, so a caller never has to know two
-/// kernel-internal sizes and their alignment.
-///
-/// The fourth number is headroom, not the held count: a kind with two chains
-/// has two ceilings and only the kind knows which binds, so the kind answers
-/// "how many more units may I take" and the caller compares. For `Pipes` the
-/// exchange chain binds, by a factor of `PIPE_INFLIGHT`.
-func slab_geometry(kind: SlabKind) unsafe -> (Int, Int, Int, Int) {
-    match kind {
-        case Events -> (EVENTS.slot_bytes(), EVENTS.slot_align(), EVENTS.extents_left(), MAX_SLAB_CAPACITY - EVENTS.capacity()),
-        case Waiters -> (WAITERS.slot_bytes(), WAITERS.slot_align(), WAITERS.extents_left(), MAX_SLAB_CAPACITY - WAITERS.capacity()),
-        case Interrupts -> (INTERRUPTS.slot_bytes(), INTERRUPTS.slot_align(), INTERRUPTS.extents_left(), MAX_SLAB_CAPACITY - INTERRUPTS.capacity()),
-        case Attachments -> (ATTACHMENTS.slot_bytes(), ATTACHMENTS.slot_align(), ATTACHMENTS.extents_left(), MAX_SLAB_CAPACITY - ATTACHMENTS.capacity()),
-        case Timers -> (TIMERS.slot_bytes(), TIMERS.slot_align(), TIMERS.extents_left(), MAX_SLAB_CAPACITY - TIMERS.capacity()),
-        case Memories -> (MEMORIES.slot_bytes(), MEMORIES.slot_align(), MEMORIES.extents_left(), MAX_SLAB_CAPACITY - MEMORIES.capacity()),
-        case IoMemories -> (IOMEMORIES.slot_bytes(), IOMEMORIES.slot_align(), IOMEMORIES.extents_left(), MAX_SLAB_CAPACITY - IOMEMORIES.capacity()),
-        case Mappings -> (MAPPINGS.slot_bytes(), MAPPINGS.slot_align(), MAPPINGS.extents_left(), MAX_SLAB_CAPACITY - MAPPINGS.capacity()),
-        case FreeRanges -> (FREE_RANGES.slot_bytes(), FREE_RANGES.slot_align(), FREE_RANGES.extents_left(), MAX_SLAB_CAPACITY - FREE_RANGES.capacity()),
-        // A thread unit is a slot plus a frame. The frame's stride is also the
-        // extent's alignment: it is the strictest of the two and so serves
-        // both, since `THREAD_FRAME_STRIDE` is a multiple of every slot
-        // alignment.
-        case Threads -> (THREADS.slot_bytes() + THREAD_FRAME_STRIDE,
-                         THREAD_FRAME_STRIDE,
-                         THREADS.extents_left(),
-                         MAX_SLAB_CAPACITY - THREADS.capacity()),
-        // A pipe unit is a connection plus its whole staging ring. Both chains
-        // must have an extent free, and the exchange ceiling binds:
-        // `PIPE_INFLIGHT` exchanges are spent per connection, so the headroom
-        // in connections is the exchange headroom divided by it.
-        case Pipes -> (PIPES.slot_bytes() + PIPE_INFLIGHT * EXCHANGES.slot_bytes(),
-                       max_int(PIPES.slot_align(), EXCHANGES.slot_align()),
-                       min_int(PIPES.extents_left(), EXCHANGES.extents_left()),
-                       min_int(MAX_SLAB_CAPACITY - PIPES.capacity(),
-                               (MAX_SLAB_CAPACITY - EXCHANGES.capacity()) / PIPE_INFLIGHT)),
-        // A process body unit is a slot. The handle table, the boot set and the
-        // grant record live inside `ProcessBody`, so this is a plain one-array
-        // chain and needs neither a side arena nor a second ceiling. The
-        // domain-pool ceiling is not a donation's business: the allocator
-        // applies it (`process_slots_usable`).
-        case Processes -> (PROCESSES.slot_bytes(), PROCESSES.slot_align(), PROCESSES.extents_left(), MAX_SLAB_CAPACITY - PROCESSES.capacity()),
-        // A record unit is a slot of its own chain, the same one-array shape.
-        // Records have no domain behind them, so the slab is the whole bound.
-        case ProcessRecords -> (PROCESS_RECORDS.slot_bytes(), PROCESS_RECORDS.slot_align(), PROCESS_RECORDS.extents_left(), MAX_SLAB_CAPACITY - PROCESS_RECORDS.capacity()),
-    }
-}
-
-/// The larger / smaller of two counts, for `slab_geometry`'s two-chain kinds.
-func max_int(a: Int, b: Int) -> Int { if a > b { a } else { b } }
-
-func min_int(a: Int, b: Int) -> Int { if a < b { a } else { b } }
-
-/// Append the extent. The caller has validated everything and zeroed the bytes;
-/// this is the step that makes them reachable.
-///
-/// The two-chain kinds carve here, and the order matters. `slab_geometry`
-/// already refused a donation either chain has no room for, so once the first
-/// `donate` has run the second cannot fail. If it did, the chains would skew,
-/// so that refusal is `fatal_kernel`: a kernel invariant, not a caller
-/// condition.
-func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
-    match kind {
-        case Events -> EVENTS.donate(base, slots),
-        case Waiters -> WAITERS.donate(base, slots),
-        case Interrupts -> INTERRUPTS.donate(base, slots),
-        case Attachments -> ATTACHMENTS.donate(base, slots),
-        case Timers -> TIMERS.donate(base, slots),
-        case Memories -> MEMORIES.donate(base, slots),
-        case IoMemories -> IOMEMORIES.donate(base, slots),
-        case Mappings -> MAPPINGS.donate(base, slots),
-        case FreeRanges -> FREE_RANGES.donate(base, slots),
-        // Frames first, at the extent's own base: the base is aligned to
-        // `THREAD_FRAME_STRIDE` (the geometry says so) and each frame is
-        // exactly a stride, so every frame is stride-aligned, which
-        // `frame_slot` requires. The slots follow at
-        // `slots * THREAD_FRAME_STRIDE`, itself a multiple of the stride and
-        // therefore of any slot alignment.
-        case Threads -> THREADS.donate_paired(
-            base + ((slots * THREAD_FRAME_STRIDE) as UInt), slots, base),
-        // Connections first, then their exchanges. `slots * sizeof(PipeSlot)`
-        // is a multiple of the slot's alignment, which is the alignment
-        // `Exchange` wants too (the geometry took the larger of the two for the
-        // base), so the second array lands aligned with no pad.
-        case Pipes -> {
-            let ex_base = base + ((slots * PIPES.slot_bytes()) as UInt)
-            if not PIPES.donate(base, slots) {
-                return false
-            }
-            if not EXCHANGES.donate(ex_base, slots * PIPE_INFLIGHT) {
-                fatal_kernel("a pipe donation installed connections without exchanges",
-                             slots as UInt)
-                return false
-            }
-            true
-        },
-        case Processes -> PROCESSES.donate(base, slots),
-        case ProcessRecords -> PROCESS_RECORDS.donate(base, slots),
-    }
-}
-
 /// §2.8's `slab_donate(kind:pool:)` and `slab_donate(kind:memory:)`: root
 /// hands the kernel memory to back a named slab, forever. It takes a pool or
 /// an allocation.
@@ -1396,8 +1283,9 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
 
     // The child's ledger opens here, after `place_image`: `free_rows` is what
     // this child's domain has left once its image has spent its own rows, and
-    // the image's rows are recorded by that call. A child gets `kcore.limits`'
-    // documented defaults; there is no per-create argument.
+    // the image's rows are recorded by that call. A child gets the image's
+    // quota defaults, or `kcore.limits`' compiled ones for an image that
+    // carries none; there is no per-create argument.
     install_quota_limits(slot, false,
                          (hal.GRANT_ROW_BUDGET as Int) - PROCESSES[body].grant_count)
 

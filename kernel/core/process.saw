@@ -38,8 +38,6 @@ import sosabi.{
 }
 import kcore.limits.{
     MAX_GRANT_ROWS,
-    MAX_IOMEMORIES,
-    MAX_MEMORIES,
     NO_BODY,
     NO_IOMEMORY,
     NO_MEMORY,
@@ -980,6 +978,9 @@ public(package) func copy_in(p: Int, dst: UInt, src: UInt, bytes: UInt) unsafe -
 // `count` rows of `{base: u64, len: u64, kind: u8, reserved x 7}`. The
 // header's size puts every row on an 8-byte boundary and the row's padding
 // keeps the next one there, which is what makes the overlay below exact.
+//
+// After the rows comes nothing, or the image's slab block, which `kcore.areas`
+// reads; `region_table` is where both readers find the rows' end.
 
 /// The region table's header: 8 bytes at the section's start. The version field
 /// is the first thing a reader needs, so its position may never move.
@@ -1052,8 +1053,8 @@ static REGION_TABLE_MAGIC: UInt32 = 0x4E47_5253
 /// row's base as this one's kind. The stitcher and kernel are built together.
 /// An image with no table at all reads as zero regions and never reaches this
 /// comparison. The kind column is part of the layout: a table written for
-/// fewer kinds is a different version.
-static REGION_TABLE_VERSION: UInt16 = 4
+/// fewer kinds is a different version, and so is what may follow the rows.
+static REGION_TABLE_VERSION: UInt16 = 5
 
 /// Overlay the header on the section's first bytes. One view construction, then
 /// an ordinary safe struct; the unsafety is confined to this line.
@@ -1090,8 +1091,20 @@ public func boot_tick_enabled() unsafe -> Bool {
     (header.flags & BOOT_FLAG_NO_TICK) == 0
 }
 
-/// Parse the region table and mint one Memory, Pool or IoMemory per row, by
-/// the row's kind, into process `p`, queuing a boot-handle record for each.
+/// Where the region table's parts lie: the section's bounds, how many rows its
+/// header counts, and the first byte past the last row, where the slab block
+/// begins if the image carries one. Addresses are physical.
+public(package) struct RegionTable {
+    start: UInt,
+    end: UInt,
+    count: UInt,
+    rows_end: UInt,
+}
+
+/// Find the region table and check its header: the bounds, the magic, the
+/// version, the boot flags, and that the rows the header counts lie inside the
+/// section. An image built with no table has an empty section, which is zero
+/// rows and nothing after them, not an error.
 ///
 /// Every refusal is `fatal_image`: the table is part of the boot image, written
 /// by the build that produced this kernel, and a machine whose own boot data is
@@ -1099,9 +1112,10 @@ public func boot_tick_enabled() unsafe -> Bool {
 /// `process_create`, where the bytes came from a region root handed over at run
 /// time.
 ///
-/// No preemption point: at most `MAX_MEMORIES + MAX_IOMEMORIES` iterations of
-/// an O(1) body, before any thread exists.
-func mint_boot_regions(p: Int) unsafe {
+/// Both readers of the table call it, the slab block's (`kcore.areas`, before
+/// root exists) and the rows' (`mint_boot_regions`). It reads nothing a process
+/// can change, so the two get the same answer.
+public(package) func region_table() unsafe -> RegionTable {
     let start = hal.region_table_start()
     let end = hal.region_table_end()
     if end < start {
@@ -1111,10 +1125,8 @@ func mint_boot_regions(p: Int) unsafe {
     let header_len = sizeof<RegionTableHeader>() as UInt
     let row_len = sizeof<RegionRow>() as UInt
 
-    // An image built with no children and no flags has an empty section: zero
-    // regions, not an error.
     if len == 0 {
-        return
+        return RegionTable(start: start, end: end, count: 0, rows_end: end)
     }
     if len < header_len {
         fatal_image("region table is shorter than its header", len)
@@ -1133,17 +1145,38 @@ func mint_boot_regions(p: Int) unsafe {
                     header.flags as UInt)
     }
     let count = (header.count as UInt)
-    // The bound is both slabs' combined: a row mints into one or the other by
-    // its kind. The per-row `alloc_*` refusals below catch a table that is
-    // small enough overall but lopsided.
-    if count > ((MAX_MEMORIES + MAX_IOMEMORIES) as UInt) {
-        fatal_image("more boot regions than the kernel can hold", count)
-    }
     if count * row_len > len - header_len {
         fatal_image("region table rows run past the section", count)
     }
-    // A header with no rows is an image that only sets boot flags: zero
-    // regions, and no report, as with no table at all.
+    RegionTable(start: start, end: end, count: count,
+                rows_end: start + header_len + count * row_len)
+}
+
+/// Mint one Memory, Pool or IoMemory per region table row, by the row's kind,
+/// into process `p`, queuing a boot-handle record for each.
+///
+/// The bound on rows is the Memory and IoMemory slabs' capacity at boot: their
+/// floors plus the slab areas the image linked, which `kcore.areas` installs
+/// before root exists. Root's rows are minted once, at boot, before any
+/// donation can have raised either slab.
+///
+/// No preemption point: at most 255 iterations (the header's one-byte count) of
+/// an O(1) body, before any thread exists.
+func mint_boot_regions(p: Int) unsafe {
+    let table = region_table()
+    let start = table.start
+    let count = table.count
+    let header_len = sizeof<RegionTableHeader>() as UInt
+    let row_len = sizeof<RegionRow>() as UInt
+
+    // The bound is both slabs' combined: a row mints into one or the other by
+    // its kind. The per-row `alloc_*` refusals below catch a table that is
+    // small enough overall but lopsided.
+    if count > ((MEMORIES.capacity() + IOMEMORIES.capacity()) as UInt) {
+        fatal_image("more boot regions than the kernel can hold", count)
+    }
+    // A header with no rows, or no table at all, is an image that only sets
+    // boot flags or none: zero regions, and no report.
     if count == 0 {
         return
     }
@@ -1291,7 +1324,7 @@ func grain_aligned(base: UInt, len: UInt) -> (UInt, UInt) {
 /// this copy exists because the region table is sawos's format, not the shared
 /// image format, and the two must be free to version apart. It folds to a
 /// constant `true` on a 64-bit profile.
-func fits_word(v: UInt64) -> Bool {
+public(package) func fits_word(v: UInt64) -> Bool {
     if sizeof<UInt>() >= 8 {
         return true
     }

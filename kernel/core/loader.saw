@@ -25,6 +25,7 @@ import kcore.stats.{stats_publish}
 import kcore.preempt.{long_copy, long_zero}
 import kcore.limits.{MAX_GRANT_ROWS, NO_MEMORY, ROOT_PROCESS}
 import kcore.process.{claim_root, load_domain, record_grant, start_process}
+import kcore.areas.{install_image_slabs}
 
 /// What a refused too-high address reports: its top 32 bits. The low half is
 /// what would have survived a narrowing, so it says nothing; the high half is
@@ -668,6 +669,11 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
 /// `tick_period_us` is the scheduler tick's period, or 0 for a kernel that arms
 /// none (see `start_process` for where it is armed).
 public func load_root_and_enter(tick_period_us: UInt = 0) unsafe {
+    // The image's slab areas first: they are what the machine boots with, so
+    // they are installed before root's record, body or rows are taken, and a
+    // block the kernel refuses stops the boot before anything else is read.
+    install_image_slabs()
+
     // Publish the stats region's header (version, row count, two offsets)
     // before anything can count. This is the door into user mode and nothing
     // traps before it. It is done at boot rather than in the static's

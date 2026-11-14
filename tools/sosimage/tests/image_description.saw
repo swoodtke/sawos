@@ -89,6 +89,36 @@ func main() {
     expect_refusal(described(", \"child_asm\": \"/c.S\""),
                    "the image t.json: `child_asm` is the image's one child; it cannot have `children` too")
 
+    // Limits: read by kind name, a kind not stated left at -1; an image with
+    // none carries no block.
+    assert(not spec.has_limits, "no limits")
+    let raised = try! ImageSpec.parse(described(", \"limits\": \{\"slabs\": \{\"processes\": 2, \"free_ranges\": 1\}, \"quotas\": \{\"event\": 6\}\}"), "t.json")
+    assert(raised.has_limits, "limits")
+    assert(raised.limits.raise.get(11)! == 2, "processes by two")
+    assert(raised.limits.raise.get(8)! == 1, "free ranges by one")
+    assert(raised.limits.raise.get(1)! == -1, "waiters not stated")
+    assert(raised.limits.quota.get(1)! == 6, "the event default")
+    assert(raised.limits.quota.get(7)! == -1, "the handle default not stated")
+    let (memory, device) = raised.row_kinds()
+    assert(memory == 2 && device == 0, "two Memory rows, no IoMemory row")
+    let empty_limits = try! ImageSpec.parse(described(", \"limits\": \{\}"), "t.json")
+    assert(empty_limits.has_limits, "an empty `limits` still carries a block")
+
+    // Limits that cannot be read: an unknown kind, an unknown quota, a
+    // lowering, an unknown key, and limits with no table to ride after.
+    expect_refusal(described(", \"limits\": \{\"slabs\": \{\"process\": 1\}\}"),
+                   "the image's `limits.slabs` has unknown keys: `process`")
+    expect_refusal(described(", \"limits\": \{\"quotas\": \{\"events\": 6\}\}"),
+                   "the image's `limits.quotas` has unknown keys: `events`")
+    expect_refusal(described(", \"limits\": \{\"slabs\": \{\"waiters\": -1\}\}"),
+                   "the image's `limits.slabs`: `waiters` is negative (-1); an image raises a limit and never lowers one")
+    expect_refusal(described(", \"limits\": \{\"quotas\": \{\"event\": -1\}\}"),
+                   "the image's `limits.quotas`: `event` is negative (-1)")
+    expect_refusal(described(", \"limits\": \{\"slab\": \{\}\}"),
+                   "the image's `limits` has unknown keys: `slab`")
+    expect_refusal("\{\"version\": 1, \"name\": \"n\", \"kernel\": \"/k.o\", \"staging\": \"/s\", \"output\": \"/o\", \"limits\": \{\}\}",
+                   "the image t.json: `limits` ride after the region table's rows, and the image has no `regions`")
+
     // Not JSON at all, and JSON that is not an object.
     assert(refusal("\{\"version\": 1,").starts_with("t.json is not JSON: "), "malformed JSON")
     expect_refusal("[1]", "the image t.json is not a JSON object")

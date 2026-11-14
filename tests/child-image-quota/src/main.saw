@@ -1,0 +1,109 @@
+// A child that meets the Event quota its image gave it.
+//
+// The case's image carries quota defaults (spec §2.9, §12): every child it
+// launches starts with an Event row of six, where `kcore.limits`' compiled
+// default is four. This child creates Events until the kernel refuses and
+// reports what it got:
+//
+//   SOS childimgquota: made=6 quota=1 pipe=1
+//
+// `made=6` is two past the compiled default, so the image's number is the one
+// the child's row was written from; `quota=1` says the seventh was refused by
+// policy (`QuotaExceeded`), not by the Event slab, whose floor of eight still
+// had room since root creates no events in this case. `pipe=1` is the last
+// column, which the image left at its compiled default, read from the image's
+// defaults all the same. The exit code is the count, so root reads the same
+// fact through the status word.
+//
+// The events are held in named bindings, as `child-quota` holds its four:
+// there is no allocator here to keep them in a collection.
+
+import sos.{System, Process, Event, SosStatus}
+
+/// What it ends with when the kernel's answers were not the shape this case
+/// claims: a number that could not be a count.
+static EXIT_MISMATCH: UInt = 98
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+/// Was this refusal the policy one?
+func is_quota(status: SosStatus) -> Bool {
+    match status {
+        case QuotaExceeded -> true,
+        case _ -> false,
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS childimgquota: no process handle: {}\n", error)
+        return
+    }
+
+    let e1 = try proc.event_create() catch {
+        print("SOS childimgquota: create 1 failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let e2 = try proc.event_create() catch {
+        print("SOS childimgquota: create 2 failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let e3 = try proc.event_create() catch {
+        print("SOS childimgquota: create 3 failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let e4 = try proc.event_create() catch {
+        print("SOS childimgquota: create 4 failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let e5 = try proc.event_create() catch {
+        print("SOS childimgquota: create 5 failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let e6 = try proc.event_create() catch {
+        print("SOS childimgquota: create 6 failed: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    var made: UInt = 6
+
+    // The seventh, which is the point. A kernel that wrongly served it leaves
+    // the count one higher, and the flag carries the verdict.
+    let quota = match proc.event_create() {
+        case Ok(_) -> {
+            made = made + 1
+            false
+        },
+        case Err(status) -> is_quota(status),
+    }
+
+    // The last ledger column, which the image did not state: the compiled
+    // Pipe default of two lets one connection be made.
+    let piped = match proc.pipe_create() {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+
+    print("SOS childimgquota: made={} quota={} pipe={}\n", made,
+          if quota { YES } else { NO }, if piped { YES } else { NO })
+
+    let _ = move e6
+    let _ = move e5
+    let _ = move e4
+    let _ = move e3
+    let _ = move e2
+    let _ = move e1
+    if not quota {
+        let _ = proc.exit(EXIT_MISMATCH)
+    }
+    let _ = proc.exit(made)
+}

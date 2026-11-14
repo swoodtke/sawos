@@ -53,9 +53,10 @@ tools/             # sos_runner.py (the harness: packages, cases, QEMU, every
                    # sosimg_dump.py
 tools/sosimage/    # the image builder, a hosted Saw package Blade builds: it
                    # compiles a kernel, stitches root's image, the child
-                   # images and the boot region table into it and links it,
-                   # and on the ESP32-S3 writes the flash image; src/main.saw
-                   # lists its commands, tests/ its own tests
+                   # images, the boot region table and the slab areas an
+                   # image's limits raise into it and links it, and on the
+                   # ESP32-S3 writes the flash image; src/main.saw lists its
+                   # commands, tests/ its own tests
 .sawlang           # (git-ignored) the runner's link to the sawlang checkout
                    # the toolchain resolved; the builder's manifest reaches
                    # `imgformat` through it
@@ -93,14 +94,20 @@ The runner does not build images itself: `tools/sosimage/` does. The runner
 builds Blade, points `.sawlang` at the resolved checkout, builds the builder
 (`blade build --force` in `tools/sosimage/`), and in a full `make sos-test`
 runs its own tests (`blade test` there: the description readers' refusals, the
-region table's bytes, the in-place check), which need no emulator and print
-nothing when they pass. Per profile it writes a profile description (JSON)
+region table's and slab block's bytes, an image's limits and each refusal of
+them, the in-place check), which need no emulator and print nothing when they
+pass. Per profile it writes a profile description (JSON)
 and calls `sosimage native`, then `sosimage kernel` once for each kernel entry
 the cases use; per case it writes an image description into the case's
 staging directory and calls `sosimage link`. `src/profile.saw` and
 `src/image.saw` state the two schemas. A builder failure is the case's build
-error, with the builder's message. `SOS_IMAGE_BUILDER=python` builds every
-image through the runner's own code instead, so the two can be compared.
+error, with the builder's message. A case may state `limits`, which the image
+description carries and the builder turns into linked slab areas and the
+block after the table's rows, or carry a hand-made `slab_block` the runner
+writes from the slab sizes `sosimage slabs` reads out of the kernel object.
+`SOS_IMAGE_BUILDER=python` builds every image through the runner's own code
+instead, so the two can be compared, except those two kinds of case, which
+that path refuses by name.
 
 Implementers run targeted tests while implementing: the cases the change
 affects, selected with `--case a,b` (comma-separated or repeated) and, for one

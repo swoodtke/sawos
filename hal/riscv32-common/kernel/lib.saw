@@ -50,6 +50,8 @@ extern "C" {
     func sos_payload_end() -> UInt
     func sos_region_table_start() -> UInt
     func sos_region_table_end() -> UInt
+    func sos_kernel_bss_start() -> UInt
+    func sos_kernel_arena_start() -> UInt
 }
 
 // =============================================================================
@@ -504,9 +506,10 @@ static PMP_OPEN_TOP: UInt = 0xFFFF_FFFF
 /// Not a storage limit here. On Profile B the matching constant sizes a static
 /// pool of persistent table sets; this profile stores no per-process image and
 /// reprograms sixteen registers from the kernel's record at every switch, so
-/// the only bound is how many process bodies the kernel has. The value is
-/// chosen to never bind, and `kernel/core/limits.saw`'s assert against it holds
-/// for any `MAX_PROCESSES` this kernel will hold.
+/// the only bound is how many process bodies the kernel has. The value is a
+/// policy bound: `kernel/core/limits.saw`'s assert holds the floor of bodies
+/// under it, and an image whose slab areas raise the bodies past it is refused
+/// at boot (spec §12) and by the image builder.
 public static PROT_DOMAIN_SLOTS: Int = 256
 
 /// Make `p`'s domain live. Nothing to do: the replay `load_domain` just
@@ -625,6 +628,20 @@ public func region_table_start() -> UInt {
 /// and not an error.
 public func region_table_end() -> UInt {
     sos_region_table_end()
+}
+
+/// First byte of the kernel's own zero-initialised memory: the board script's
+/// `_bss_start`, where the `.bss` input sections begin. An image's slab areas
+/// are linked there, and the kernel installs only an area that lies wholly
+/// between this and `kernel_arena_start()`.
+public func kernel_bss_start() -> UInt {
+    sos_kernel_bss_start()
+}
+
+/// One past the last byte of the `.bss` input sections: the board script's
+/// `_arena_start`, behind which the runtime's arena and the boot stack lie.
+public func kernel_arena_start() -> UInt {
+    sos_kernel_arena_start()
 }
 
 // =============================================================================

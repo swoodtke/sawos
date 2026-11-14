@@ -158,6 +158,10 @@ RV32_VIRT_MODULE = f"rv32virt={os.path.join(HAL_DIR, 'riscv32', 'kernel')}"
 # checked. Kept in step with that enum.
 EXIT_PROCESS_FAULT = 5
 
+# `ExitCode.BadImage` in kernel/core/diag.saw: what the machine exits with when
+# its boot image is refused (`fatal_image`). Kept in step with that enum.
+EXIT_BAD_IMAGE = 4
+
 # `ExitCode.Deadlock` in kernel/core/diag.saw: what the machine exits with when
 # every thread is blocked and nothing can wake one. Kept in step with that enum.
 EXIT_DEADLOCK = 7
@@ -407,6 +411,9 @@ ECHO_CHILD_PKG = os.path.join(TESTS_DIR, "echo-child")
 ECHO_CHILD2_PKG = os.path.join(TESTS_DIR, "echo-child2")
 ECHO_CHILD3_PKG = os.path.join(TESTS_DIR, "echo-child3")
 CHILD_QUOTA_PKG = os.path.join(TESTS_DIR, "child-quota")
+# An image that raises what the machine boots with (spec §2.8, §12).
+IMAGE_LIMITS_PKG = os.path.join(TESTS_DIR, "image-limits")
+CHILD_IMAGE_QUOTA_PKG = os.path.join(TESTS_DIR, "child-image-quota")
 CHILD_MAPWALL_PKG = os.path.join(TESTS_DIR, "child-mapwall")
 
 # Death notifications. The two notify cases differ only in how the child dies:
@@ -1106,20 +1113,22 @@ CHILD_REGION_LEN = 0x40000
 def _child_region_len(arch):
     return arch.get("child_region_len", CHILD_REGION_LEN)
 
-# The boot region table's wire format (version 4), frozen: an 8-byte header
+# The boot region table's wire format (version 5), frozen: an 8-byte header
 # (magic, version u16, count u8, boot flags u8) then `count` rows of {base: u64,
 # len: u64, kind: u8, reserved x 7}, all little-endian. The header's size puts
 # the first row on an 8-byte boundary and the row's padding keeps the next one
 # there, which lets the kernel overlay a struct on the section instead of
 # assembling bytes. Kept in step with `kernel/core/process.saw`'s
 # `RegionTableHeader` / `RegionRow` / `RegionKind` and the two `static_assert`s
-# beside them.
+# beside them. After the rows comes nothing, or the image's slab block
+# (`kernel/core/areas.saw`), which only the image builder writes: this path
+# writes tables that end with their rows.
 #
-# The kernel accepts exactly version 4, so this constant and that file change
+# The kernel accepts exactly version 5, so this constant and that file change
 # together. An image with no table at all is unaffected: the kernel's `len == 0`
 # short-circuit runs ahead of the header read.
 REGION_TABLE_MAGIC = 0x4E475253          # 'S','R','G','N' read little-endian
-REGION_TABLE_VERSION = 4
+REGION_TABLE_VERSION = 5
 
 # The header's boot flags byte, mirroring `kernel/core/process.saw`'s
 # `BOOT_FLAG_NO_TICK`. The kernel arms the scheduler tick unless this bit is
@@ -1135,15 +1144,30 @@ def boot_flags(case):
 
 
 def needs_region_table(case):
-    """Does this case's image carry a region table?
+    """Does this case's image carry a region table the build writes?
 
-    A case with rows does. A case with none still does unless it wants the
-    tick, because a table is the only way an image tells the kernel not to arm
-    it, and the flags it would carry are zero.
+    A case with rows does, and so does one that states `limits`, whose slab
+    block rides after the rows. A case with none still does unless it wants
+    the tick, because a table is the only way an image tells the kernel not to
+    arm it, and the flags it would carry are zero. A `slab_block` case writes
+    its own whole table (`_slab_block_asm`), so the build writes none.
     """
+    if case.get("slab_block"):
+        return False
     return bool(case.get("children") or case.get("child_asm")
                 or case.get("pool") or case.get("device")
-                or not case.get("tick"))
+                or case.get("limits") or not case.get("tick"))
+
+
+def _builder_only(case):
+    """Refuse, on the runner's own image path, a case only the image builder
+    can build: one that states `limits` or carries a hand-made `slab_block`.
+    This path writes region tables that end with their rows."""
+    for key in ("limits", "slab_block"):
+        if case.get(key):
+            raise ToolError(f"case {case['name']!r} has `{key}`, which only "
+                            "the image builder builds (unset "
+                            "SOS_IMAGE_BUILDER=python)")
 
 
 def _child_count(case):
@@ -1286,6 +1310,7 @@ def expectations(arch):
         "nine": f"0x{9:0{width}x}",
         "ten": f"0x{10:0{width}x}",
         "eleven": f"0x{11:0{width}x}",
+        "twelve": f"0x{12:0{width}x}",
         "prio": f"0x{0x01010100:0{width}x}",
         "irq_line": f"0x{arch['selftest_line']:0{width}x}",
         # The byte `child-touch` writes into the page its launcher mapped and
@@ -1405,6 +1430,75 @@ CROSS = f"{RED}✗{RESET}"
 # substrings (or None), and whether the emulator should exit cleanly (True →
 # status 0) or fail (False). Expected strings are `str.format`ed with
 # `expectations(arch)`.
+
+def _slab_stop(name, spec, reason, arches=None):
+    """A case whose hand-made slab block (`slab_block`, `_slab_block_asm`)
+    the kernel refuses before the first process exists, with `reason`."""
+    case = {"name": name,
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "tick": True,
+            "slab_block": spec,
+            "expect_out": ["{banner}", f"SOS: bad root image: {reason}"],
+            "expect_clean_exit": False,
+            "expect_status": EXIT_BAD_IMAGE}
+    if arches is not None:
+        case["arches"] = arches
+    return case
+
+
+def _slab_taken(name, spec, areas):
+    """A case whose hand-made slab block the kernel takes: each area installed
+    (`areas`, the kinds and slot counts it prints, in the block's order), and
+    the boot going on to the root image, which the image has none of."""
+    return {"name": name,
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "tick": True,
+            "slab_block": spec,
+            "expect_out": (["{banner}"]
+                           + [f"SOS: slab area kind={kind} slots={slots}"
+                              for kind, slots in areas]
+                           + ["SOS: bad root image: no root image appended"]),
+            "expect_clean_exit": False,
+            "expect_status": EXIT_BAD_IMAGE}
+
+
+# The areas of `slab_block_at_edges` and the quota legs beside it. Every slab
+# boots with a capacity no other one has (processes 4, pipes 5, waiters 6,
+# interrupts 7, threads 9, events 10, timers 11, iomemories 12, mappings 13,
+# records 16, memories 17, free ranges 33, attachments 44), so a bound read
+# from the wrong slab moves some leg: one below a quota slab's capacity is
+# taken here and one at it refused beside it, whichever slab it was read
+# from instead. Records are exactly four per body and attachments exactly
+# one per waitable (10 events + 7 interrupts + 11 timers + 16 records). The
+# free-range area is last and a multiple of 16 bytes, so it ends at
+# `_arena_start`.
+_EDGE_AREAS = [{"kind": "processes", "slots": 1},
+               {"kind": "process_records", "slots": 4},
+               {"kind": "threads", "slots": 1},
+               {"kind": "events", "slots": 2},
+               {"kind": "timers", "slots": 3},
+               {"kind": "iomemories", "slots": 4},
+               {"kind": "mappings", "slots": 5},
+               {"kind": "pipes", "slots": 1},
+               {"kind": "waiters", "slots": 2},
+               {"kind": "interrupts", "slots": 3},
+               {"kind": "memories", "slots": 1},
+               {"kind": "attachments", "slots": 12},
+               {"kind": "free_ranges", "slots": 1}]
+
+# The largest default each quota kind may carry over `_EDGE_AREAS`: one below
+# its slab's capacity, the handle table's for `handle`, and for `mapping` the
+# grant rows an image leaves, which binds before the Mapping slab does.
+_EDGE_QUOTAS = {"thread": 8, "event": 9, "waiter": 5, "timer": 10,
+                "memory": 16, "iomemory": 11,
+                "mapping": lambda f: (f["limits"]["budget"]
+                                      - f["limits"]["image_rows"]),
+                "handle": lambda f: f["limits"]["handles"] - 1, "pipe": 4}
+
+# Each quota kind's default at its slab's capacity over `_EDGE_AREAS`: refused.
+_SLAB_QUOTAS = {"thread": 9, "event": 10, "waiter": 6, "timer": 11,
+                "memory": 17, "iomemory": 12, "mapping": 13, "pipe": 5}
+
 
 TEST_CASES = [
     {
@@ -7845,6 +7939,401 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
 
+    # =========================================================================
+    # An image raises what a machine boots with (spec §2.8, §12)
+    # =========================================================================
+    #
+    # The case states limits, so the image builder links an area for each kind
+    # they raise and names it in the slab block after the region table's rows,
+    # and the kernel installs each one as an extent before root exists. The
+    # `slab area` lines are the kernel's, one per area in kind order: Waiters
+    # (1) by one, Memories (5) by four and process bodies (11) by one, as
+    # stated, and the totals the builder derives from them: records (12) at
+    # four per body, attachments (3) at one per waitable, and Mappings (7) at
+    # four per body, the builder's sizing when an image states none.
+    #
+    # Root's three counts are the capacities at boot, before any donation
+    # (`tests/image-limits`): five Waiters, three children beside root, and
+    # three donations to the raised Memory slab before the fourth meets the
+    # extent table, which the area took one row of.
+    {
+        "name": "image_limits",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": IMAGE_LIMITS_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "pool": True,
+        "limits": {"slabs": {"processes": 1, "waiters": 1, "memories": 4}},
+        "expect_out": ["{banner}",
+                       "SOS: slab area kind={one} slots={one}",
+                       "SOS: slab area kind={three} slots={four}",
+                       "SOS: slab area kind={five} slots={four}",
+                       "SOS: slab area kind={seven} slots={eight}",
+                       "SOS: slab area kind={eleven} slots={one}",
+                       "SOS: slab area kind={twelve} slots={four}",
+                       "SOS: boot regions={three}",
+                       "SOS imglimits: waiters before any donation=5",
+                       "SOS imglimits: the next waiter refused: "
+                       "no room for what was asked",
+                       "SOS imglimits: children before any donation=3",
+                       "SOS imglimits: the next child refused: "
+                       "no room for what was asked",
+                       "SOS imglimits: memory donations taken=3",
+                       "SOS imglimits: the next donation refused: "
+                       "no room for what was asked",
+                       "SOS imglimits: done"],
+        "expect_clean_exit": True,
+    },
+
+    # An image's quota defaults reach its children (spec §2.9). The image
+    # states an Event default of six where the compiled one is four, and the
+    # child (`tests/child-image-quota`) makes six before the seventh is
+    # refused by policy: its row was written from the image's number. The
+    # Mapping area is the builder's sizing of an image that states no Mapping
+    # slab: four per body, three bodies.
+    {
+        "name": "image_quota_defaults",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_EXCEEDED_PKG,
+        "children": [CHILD_IMAGE_QUOTA_PKG],
+        "limits": {"quotas": {"event": 6}},
+        "expect_out": ["{banner}",
+                       "SOS: slab area kind={seven} slots={four}",
+                       "SOS: boot regions={two}",
+                       "SOS quotaex: created",
+                       "SOS quotaex: started",
+                       "SOS childimgquota: made=6 quota=1 pipe=1",
+                       "SOS: process exit: code={six} process={one}",
+                       "SOS quotaex: root observed child status=65542",
+                       "SOS quotaex: done"],
+        "expect_clean_exit": True,
+    },
+
+    # An image's Mapping default reaches its child the same way: stated at
+    # three, past the compiled two and within every profile's free rows, it
+    # is the row `tests/child-mapwall` maps to before its launcher's pages
+    # run out of quota.
+    {
+        "name": "image_mapping_default",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_VS_WALL_PKG,
+        "children": [CHILD_MAPWALL_PKG],
+        "pool": True,
+        "limits": {"quotas": {"mapping": 3}},
+        "expect_out": ["{banner}",
+                       "SOS: slab area kind={seven} slots={four}",
+                       "SOS: boot regions={three}",
+                       "SOS quotawall: created",
+                       "SOS quotawall: gave a page per round",
+                       "SOS quotawall: started",
+                       "SOS childmapwall: maps=3 quota=1",
+                       "SOS: process exit: code={three} process={one}",
+                       "SOS quotawall: root observed child status=65539",
+                       "SOS quotawall: done"],
+        "expect_clean_exit": True,
+    },
+
+    # Every kind the builder can raise, raised in one image: each area's
+    # length is whole slots of the unit the builder read out of the kernel
+    # object, which the kernel checks against its own, and root then boots.
+    # Attachments follow the raised waitables and records (9 events, 5
+    # interrupts, 9 timers, 16 records).
+    {
+        "name": "image_limits_all_kinds",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": ROOT_PKG,
+        "limits": {"slabs": {"events": 1, "waiters": 1, "interrupts": 1,
+                             "timers": 1, "memories": 1, "iomemories": 1,
+                             "mappings": 1, "free_ranges": 1, "threads": 2,
+                             "pipes": 1, "processes": 1}},
+        "expect_out": ["{banner}",
+                       "SOS: slab area kind={zero} slots={one}",
+                       "SOS: slab area kind={one} slots={one}",
+                       "SOS: slab area kind={two} slots={one}",
+                       "SOS: slab area kind={three} slots={seven}",
+                       "SOS: slab area kind={four} slots={one}",
+                       "SOS: slab area kind={five} slots={one}",
+                       "SOS: slab area kind={six} slots={one}",
+                       "SOS: slab area kind={seven} slots={one}",
+                       "SOS: slab area kind={eight} slots={one}",
+                       "SOS: slab area kind={nine} slots={two}",
+                       "SOS: slab area kind={ten} slots={one}",
+                       "SOS: slab area kind={eleven} slots={one}",
+                       "SOS: slab area kind={twelve} slots={four}",
+                       "root image ok segments={three}",
+                       "SOS root: hello from U-mode via a System op",
+                       "SOS root: boot handle 1"],
+        "expect_clean_exit": True,
+    },
+
+    # An image whose areas outgrow the kernel's memory is a link error naming
+    # it, on every board's script: the kernel's `.bss` would run into root's
+    # region. A hundred thousand Events, and the attachments derived from
+    # them, are more than any profile's kernel region holds.
+    {
+        "name": "image_limits_overrun",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "limits": {"slabs": {"events": 100000}},
+        "expect_build_error": "kernel .bss overruns ROOT_LOAD_BASE",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+
+    # The bound on boot rows reads the capacity at boot. Each image is a
+    # hand-made table (`slab_block`) whose Memory slab is raised by nine, so
+    # the two slabs hold 33 rows. A table of 33 rows passes that bound and
+    # meets root's handle table, which holds 13 beside root's first handles; a
+    # table of 34 is refused at the bound. Against the floors (24) both would
+    # meet the bound.
+    {
+        "name": "image_rows_at_capacity",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": ROOT_PKG,
+        "tick": True,
+        "slab_block": {"rows": 33, "areas": [{"kind": "memories", "slots": 9}]},
+        "expect_out": ["{banner}",
+                       "SOS: slab area kind={five} slots={nine}",
+                       "SOS: bad root image: no handle table room for the "
+                       "boot regions"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_BAD_IMAGE,
+    },
+    {
+        "name": "image_rows_past_capacity",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": ROOT_PKG,
+        "tick": True,
+        "slab_block": {"rows": 34, "areas": [{"kind": "memories", "slots": 9}]},
+        "expect_out": ["{banner}",
+                       "SOS: slab area kind={five} slots={nine}",
+                       "SOS: bad root image: more boot regions than the "
+                       "kernel can hold"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_BAD_IMAGE,
+    },
+
+    # A hand-made block the kernel takes, every number at the edge it may
+    # reach (`_EDGE_AREAS`, `_EDGE_QUOTAS`). Its areas are installed and the
+    # boot goes on to the root image, which this image has none of.
+    _slab_taken("slab_block_at_edges",
+                {"areas": _EDGE_AREAS, "quotas": _EDGE_QUOTAS},
+                [("{eleven}", "{one}"), ("{twelve}", "{four}"),
+                 ("{nine}", "{one}"), ("{zero}", "{two}"),
+                 ("{four}", "{three}"), ("{six}", "{four}"),
+                 ("{seven}", "{five}"), ("{ten}", "{one}"),
+                 ("{one}", "{two}"), ("{two}", "{three}"),
+                 ("{five}", "{one}"), ("{three}", "{twelve}"),
+                 ("{eight}", "{one}")]),
+
+    # Process bodies exactly at the domain pool, with records, threads and
+    # attachments exactly what that many bodies need: taken. On riscv32 the
+    # pool is 256 bodies, so the threads are raised to 256 too and meet their
+    # relation exactly.
+    _slab_taken("slab_block_at_domain_pool", {"areas": [
+        {"kind": "processes", "slots": lambda f: f["limits"]["domains"] - 3},
+        {"kind": "process_records",
+         "slots": lambda f: 4 * f["limits"]["domains"] - 12},
+        {"kind": "attachments",
+         "slots": lambda f: 4 * f["limits"]["domains"] - 12},
+        {"kind": "threads",
+         "slots": lambda f: max(f["limits"]["domains"] - 8, 1)}]}, []),
+
+    # Two areas that touch, the later one in the block lying just below the
+    # earlier, in the bytes padded in front of it: ranges that only touch do
+    # not meet.
+    _slab_taken("slab_areas_touch", {"areas": [
+        {"kind": "waiters",
+         "pad": lambda f: f["slabs"]["free_ranges"]["unit"]},
+        {"kind": "free_ranges",
+         "at": lambda f: f"_sos_hand0 - {f['slabs']['free_ranges']['unit']}"}]},
+        [("{one}", "{one}"), ("{eight}", "{one}")]),
+
+    # An area at the first byte of the kernel's zeroed memory is inside it.
+    _slab_taken("slab_area_at_bss_start",
+                {"areas": [{"kind": "waiters", "at": "_bss_start"}]},
+                [("{one}", "{one}")]),
+
+    # Each stop of spec §12, by its message. Where a block breaks two checks,
+    # the one named first in `install_image_slabs`' order is the one met, and
+    # the second is named beside the case: that is what holds the order.
+    _slab_stop("slab_block_header_cut",       # and a bad magic
+               {"header_only": True, "magic": 0x12345678},
+               "the slab block is cut short"),
+    _slab_stop("slab_block_not_a_block",      # and a count past the bytes
+               {"magic": 0x12345678, "count": 2},
+               "bytes after the region table's rows are not a slab block"),
+    _slab_stop("slab_block_areas_cut",        # and bytes left over
+               {"count": 2, "areas": [{"kind": "waiters"}]},
+               "the slab block is cut short"),
+    _slab_stop("slab_block_bytes_after", {"areas": [], "tail": 8},
+               "bytes follow the slab block"),
+    _slab_stop("slab_area_unknown_kind", {"areas": [{"kind_raw": 13}]},
+               "a slab area names a kind this build cannot name"),
+    _slab_stop("slab_area_kind_twice",        # and past the address space
+               {"areas": [{"kind": "waiters"},
+                          {"kind": "waiters", "base": 0x1_0000_0000}]},
+               "two slab areas name one kind"),
+    # The same kind again with another between: the walk remembers every
+    # kind it has met, not only the last.
+    _slab_stop("slab_area_kind_twice_apart",
+               {"areas": [{"kind": "waiters"}, {"kind": "mappings"},
+                          {"kind": "waiters"}]},
+               "two slab areas name one kind"),
+    _slab_stop("slab_area_past_address_space",
+               {"areas": [{"kind": "waiters", "base": 0x1_0000_0000}]},
+               "a slab area lies outside the kernel's zeroed memory"),
+    # Only a 32-bit kernel cannot address the base, and finds that first.
+    _slab_stop("slab_area_past_address_space_empty",
+               {"areas": [{"kind": "waiters", "base": 0x1_0000_0000,
+                           "len": 0}]},
+               "a slab area lies outside the kernel's zeroed memory",
+               arches=["riscv32", "riscv32-flat"]),
+    # And a length a 32-bit kernel cannot hold, with a base it can.
+    _slab_stop("slab_area_len_past_word",
+               {"areas": [{"kind": "waiters", "len": 0x1_0000_0000 + 20,
+                           "storage": 20}]},
+               "a slab area lies outside the kernel's zeroed memory",
+               arches=["riscv32", "riscv32-flat"]),
+    _slab_stop("slab_area_empty",             # and misaligned
+               {"areas": [{"kind": "waiters", "len": 0, "skew": 1}]},
+               "a slab area has no length"),
+    _slab_stop("slab_area_past_ceiling",      # and misaligned
+               {"areas": [{"kind": "waiters", "storage": 16, "skew": 1,
+                           "slots": lambda f: f["limits"]["capacity"] - 3}]},
+               "a slab area would take its slab past MAX_SLAB_CAPACITY"),
+    # Exactly at the ceiling is taken by that check, and met by the next.
+    _slab_stop("slab_area_at_ceiling",
+               {"areas": [{"kind": "waiters", "storage": 16,
+                           "slots": lambda f: f["limits"]["capacity"] - 4}]},
+               "a slab area lies outside the kernel's zeroed memory"),
+    # A pipe area's ceiling is its exchange chain's: `PIPE_INFLIGHT` exchanges
+    # a connection reach `MAX_SLAB_CAPACITY` at a smaller count than the
+    # connections do. One connection past that count is refused there; at it
+    # the check is passed and the next one met.
+    _slab_stop("slab_area_pipes_past_exchanges",
+               {"areas": [{"kind": "pipes", "storage": 16,
+                           "slots": lambda f: (f["limits"]["capacity"]
+                                               - f["slabs"]["pipes"]["floor"]
+                                               * f["limits"]["inflight"])
+                                              // f["limits"]["inflight"] + 1}]},
+               "a slab area would take its slab past MAX_SLAB_CAPACITY"),
+    _slab_stop("slab_area_pipes_at_exchanges",
+               {"areas": [{"kind": "pipes", "storage": 16,
+                           "slots": lambda f: (f["limits"]["capacity"]
+                                               - f["slabs"]["pipes"]["floor"]
+                                               * f["limits"]["inflight"])
+                                              // f["limits"]["inflight"]}]},
+               "a slab area lies outside the kernel's zeroed memory"),
+    _slab_stop("slab_area_misaligned",        # and outside
+               {"areas": [{"kind": "waiters", "skew": 1, "place": "data"}]},
+               "a slab area's base is not aligned for its slots"),
+    # A thread area is aligned to the frame stride, not to its slot.
+    _slab_stop("slab_area_thread_off_stride",
+               {"areas": [{"kind": "threads", "skew": 16}]},
+               "a slab area's base is not aligned for its slots"),
+    _slab_stop("slab_area_in_data",
+               {"areas": [{"kind": "waiters", "place": "data"}]},
+               "a slab area lies outside the kernel's zeroed memory"),
+    # A base with a bit set that the linear map's mask drops: masked, it would
+    # name the area's own bytes, but it is neither physical nor the kernel's
+    # address for them. Only arm64 has a mask to drop it.
+    _slab_stop("slab_area_base_stray_bits",
+               {"areas": [{"kind": "waiters", "skew": 1 << 50,
+                           "storage": 64}]},
+               "a slab area lies outside the kernel's zeroed memory",
+               arches=["arm64"]),
+    _slab_stop("slab_area_at_arena",
+               {"areas": [{"kind": "waiters", "at": "_arena_start"}]},
+               "a slab area lies outside the kernel's zeroed memory"),
+    # An area one byte longer than the room before `_arena_start`: its 16
+    # bytes of storage are the last of the kernel's `.bss` sections.
+    _slab_stop("slab_area_one_past_arena",    # and not whole slots
+               {"areas": [{"kind": "free_ranges", "storage": 16, "len": 17}]},
+               "a slab area lies outside the kernel's zeroed memory"),
+    _slab_stop("slab_area_past_arena",
+               {"areas": [{"kind": "waiters", "at": "_arena_end"}]},
+               "a slab area lies outside the kernel's zeroed memory"),
+    _slab_stop("slab_area_outside_and_meeting",
+               {"areas": [{"kind": "waiters"},
+                          {"kind": "events", "at": "_sos_hand0",
+                           "slots": 200000}]},
+               "a slab area lies outside the kernel's zeroed memory"),
+    # Area 0 links room past its own length, so area 1 lies inside the
+    # kernel's zeroed memory and over area 0.
+    _slab_stop("slab_areas_meet",             # and not whole slots
+               {"areas": [{"kind": "waiters", "storage": 256},
+                          {"kind": "events", "at": "_sos_hand0",
+                           "extra": 1}]},
+               "two slab areas meet"),
+    _slab_stop("slab_area_not_whole",
+               {"areas": [{"kind": "waiters", "extra": 1}]},
+               "a slab area is not a whole number of slots"),
+    # Every area is checked before the relations are.
+    _slab_stop("slab_area_before_relations",
+               {"areas": [{"kind": "processes"},
+                          {"kind": "waiters", "len": 0}]},
+               "a slab area has no length"),
+    _slab_stop("image_records_short",         # and threads, past 8 bodies
+               {"areas": [{"kind": "processes", "slots": 6}]},
+               "the image's process records are fewer than its bodies need"),
+    _slab_stop("image_threads_short",         # and attachments
+               {"areas": [{"kind": "processes", "slots": 6},
+                          {"kind": "process_records", "slots": 24}]},
+               "the image's threads are fewer than its process bodies"),
+    _slab_stop("image_records_one_short",     # and attachments
+               {"areas": [{"kind": "processes"},
+                          {"kind": "process_records", "slots": 3}]},
+               "the image's process records are fewer than its bodies need"),
+    _slab_stop("image_attachments_short",     # and the arm64 domain pool
+               {"areas": [{"kind": "processes", "slots": 3},
+                          {"kind": "process_records", "slots": 12}]},
+               "the image's attachments are fewer than its waitables"),
+    _slab_stop("image_attachments_one_short",
+               {"areas": [{"kind": "events"}]},
+               "the image's attachments are fewer than its waitables"),
+    _slab_stop("image_domain_pool_passed",
+               {"areas": [
+                   {"kind": "processes",
+                    "slots": lambda f: f["limits"]["domains"] - 2},
+                   {"kind": "process_records",
+                    "slots": lambda f: 4 * f["limits"]["domains"] - 8},
+                   {"kind": "attachments",
+                    "slots": lambda f: 4 * f["limits"]["domains"] - 8},
+                   {"kind": "threads",
+                    "slots": lambda f: max(f["limits"]["domains"] - 7, 1)}]},
+               "the image's process bodies pass the domain pool"),
+    # The relations are checked before the quota defaults.
+    _slab_stop("image_relations_before_quotas",
+               {"areas": [{"kind": "processes"}], "quotas": {"event": 3}},
+               "the image's process records are fewer than its bodies need"),
+    _slab_stop("quota_default_below_compiled", {"quotas": {"event": 3}},
+               "a quota default is below its compiled default"),
+    # The first and the last ledger column are both checked.
+    _slab_stop("quota_default_thread_below", {"quotas": {"thread": 3}},
+               "a quota default is below its compiled default"),
+    _slab_stop("quota_default_pipe_below", {"quotas": {"pipe": 1}},
+               "a quota default is below its compiled default"),
+    _slab_stop("quota_default_past_ledger",   # and past its slab
+               {"quotas": {"event": 0xFFFF}},
+               "a quota default does not fit the ledger"),
+    *[_slab_stop(f"quota_default_{name}_at_slab",
+                 {"areas": _EDGE_AREAS,
+                  "quotas": {**_EDGE_QUOTAS, name: value}},
+                 "a quota default is not below its slab's capacity")
+      for name, value in _SLAB_QUOTAS.items()],
+    # A Waiter default above the slab's floor, below its raised capacity:
+    # taken, so the bound is the Waiter slab's own, raised.
+    _slab_taken("quota_default_waiter_raised",
+                {"areas": [{"kind": "waiters"}], "quotas": {"waiter": 4}},
+                [("{one}", "{one}")]),
+    _slab_stop("quota_default_at_handles",
+               {"quotas": {"handle": lambda f: f["limits"]["handles"]}},
+               "the Handle quota default is not below MAX_HANDLES"),
+    _slab_stop("quota_default_past_rows",
+               {"quotas": {"mapping": lambda f: (f["limits"]["budget"]
+                                                 - f["limits"]["image_rows"]
+                                                 + 1)}},
+               "the Mapping quota default passes the rows an image leaves"),
+
     {
         # =====================================================================
         # The tier word itself
@@ -10130,6 +10619,7 @@ def _build_elf(case, arch, shared_objs, lld, clang):
     bounds: raw user-mode code or a hand-assembled sosimg fixture. A root
     image arrives through `root_pkg` and `kernel/rootimg.S`'s `.incbin`.
     """
+    _builder_only(case)
     dirs = arch_dirs(arch)
     os.makedirs(dirs["build"], exist_ok=True)
     name = case["name"]
@@ -10493,6 +10983,8 @@ def _image_description(case, arch, kernel_obj, output, flash=None,
     if needs_region_table(case):
         image["regions"] = {"flags": boot_flags(case),
                             "rows": _region_row_specs(case, arch)}
+    if case.get("limits"):
+        image["limits"] = case["limits"]
     if link_args:
         image["link_args"] = list(link_args)
     if flash is not None:
@@ -10503,13 +10995,179 @@ def _image_description(case, arch, kernel_obj, output, flash=None,
 def _link_image(builder, profile, case, arch, output, flash=None,
                 link_args=()):
     """Write a case's image description into its staging directory and have
-    the builder link it; return what the builder printed."""
-    description = _image_description(
-        case, arch, _kernel_object(arch, case["src"]), output, flash,
-        link_args)
+    the builder link it; return what the builder printed.
+
+    A `slab_block` case's payload is its hand-made table, written into the
+    staging directory from the kernel's own slab sizes (`_slab_block_asm`).
+    """
+    kernel_obj = _kernel_object(arch, case["src"])
+    description = _image_description(case, arch, kernel_obj, output, flash,
+                                     link_args)
+    if case.get("slab_block"):
+        os.makedirs(description["staging"], exist_ok=True)
+        payload = os.path.join(description["staging"], "slab_block.S")
+        with open(payload, "w") as f:
+            f.write(_slab_block_asm(case, arch,
+                                    _slab_facts(builder, kernel_obj)))
+        description["asm"] = payload
     path = os.path.join(description["staging"], "image.json")
     _write_json(path, description)
     return _run_sosimage(builder, ["link", profile, path])
+
+
+# What `sosimage slabs` says about each compiled kernel object, read once per
+# object: the cases of one profile link in parallel and share it.
+_SLAB_FACTS = {}
+_SLAB_FACTS_LOCK = threading.Lock()
+
+
+def _slab_facts(builder, kernel_obj):
+    """The kernel object's slab kinds, quota defaults and numbers, as the
+    image builder reads them (`sosimage slabs`): a dict with `slabs` (name ->
+    {kind, floor, unit, align}), `quotas` (name -> {kind, default}) and
+    `limits` (name -> number)."""
+    with _SLAB_FACTS_LOCK:
+        if kernel_obj in _SLAB_FACTS:
+            return _SLAB_FACTS[kernel_obj]
+    printed = _run_sosimage(builder, ["slabs", kernel_obj])
+    facts = {"slabs": {}, "quotas": {}, "limits": {}}
+    for line in printed.splitlines():
+        words = line.split()
+        if not words:
+            continue
+        if words[0] == "limits":
+            facts["limits"] = {k: int(v) for k, v in
+                               (w.split("=") for w in words[1:])}
+        elif words[0] == "quota":
+            facts["quotas"][words[1]] = {k: int(v) for k, v in
+                                         (w.split("=") for w in words[2:])}
+        else:
+            facts["slabs"][words[0]] = {k: int(v) for k, v in
+                                        (w.split("=") for w in words[1:])}
+    with _SLAB_FACTS_LOCK:
+        _SLAB_FACTS[kernel_obj] = facts
+    return facts
+
+
+# The slab block's magic, mirroring `kernel/core/areas.saw`'s
+# `SLAB_BLOCK_MAGIC`: 'S','L','A','B' read little-endian.
+SLAB_BLOCK_MAGIC = 0x42414C53
+
+
+def _slab_block_asm(case, arch, facts):
+    """A `slab_block` case's payload: a whole region table at version 5, with
+    a hand-made slab block after its rows and the storage its areas name, as
+    assembly. It writes what the image builder would refuse to, so the
+    kernel's own stops are what the case meets.
+
+    The spec (`case["slab_block"]`) is a dict:
+
+      `rows`     zero-length `Ram` rows in the table, before the block
+      `quotas`   quota defaults by name; the others are the compiled ones
+      `areas`    a list of areas, each a dict: `kind` (a slab kind's name) or
+                 `kind_raw` (any number); `slots`, the slots it holds, or
+                 `len`, its length in bytes; `extra`, bytes added to the
+                 length; and where its base is. By default that is storage
+                 of its own, a `.bss` section (or a `.data` one, outside the
+                 kernel's zeroed memory, with `place: "data"`) holding
+                 `storage` bytes (the length, unless stated), `pad` bytes of
+                 which come before the base, and the base `skew` bytes past
+                 its aligned start. Otherwise `at` is a symbol expression
+                 (`"_arena_start"`, `"_sos_hand0 - 32"`, area 0's base being
+                 `_sos_hand0`), or `base` a literal, and nothing is linked
+      `count`    the header's area count, when it is not the list's length
+      `magic`    the block's magic, when it is not the block's
+      `header_only`  write only the block's first 8 bytes
+      `tail`     zero bytes written after the last area
+
+    Any number may be a function of `facts` (`_slab_facts`), for one that is
+    the kernel's: `lambda f: f["limits"]["domains"] + 1`.
+
+    Each area's storage, in a section of its own, is linked after every
+    kernel `.bss` section, since this payload's object follows the kernel's
+    in the link: the last one ends at `_arena_start` when its length is a
+    multiple of 16.
+    """
+    spec = case["slab_block"]
+    wide = arch["hex_width"] != 8
+
+    def value(v):
+        return v(facts) if callable(v) else v
+
+    def word64(expr):
+        if wide:
+            return [f"    .8byte {expr}"]
+        return [f"    .4byte {expr}", "    .4byte 0"]
+
+    rows = spec.get("rows", 0)
+    lines = ["/* GENERATED by tools/sos_runner.py: a hand-made slab block */",
+             "    .section .regions, \"a\", @progbits",
+             "    .balign 8",
+             f"    .4byte {REGION_TABLE_MAGIC:#010x}",
+             f"    .2byte {REGION_TABLE_VERSION}",
+             f"    .byte  {rows}",
+             f"    .byte  {boot_flags(case)}"]
+    for _ in range(rows):
+        lines += word64("0") + word64("0")
+        lines += ["    .byte  0, 0, 0, 0, 0, 0, 0, 0"]
+    areas = [] if spec.get("header_only") else spec.get("areas", [])
+    lines += [f"    .4byte {value(spec.get('magic', SLAB_BLOCK_MAGIC)):#010x}",
+              f"    .4byte {value(spec.get('count', len(areas)))}"]
+    if not spec.get("header_only"):
+        quotas = dict(spec.get("quotas", {}))
+        for name, q in sorted(facts["quotas"].items(),
+                              key=lambda kv: kv[1]["kind"]):
+            lines.append(f"    .4byte {value(quotas.pop(name, q['default']))}")
+        if quotas:
+            raise ToolError(f"case {case['name']!r}: `slab_block` names "
+                            f"quotas the kernel has not: {sorted(quotas)}")
+        lines.append("    .4byte 0")
+    storage = []
+    for i, area in enumerate(areas):
+        if "kind" in area:
+            slab = facts["slabs"][area["kind"]]
+            kind, unit, align = slab["kind"], slab["unit"], slab["align"]
+        else:
+            kind, unit, align = value(area["kind_raw"]), 1, 16
+        if "len" in area:
+            length = value(area["len"])
+        else:
+            length = value(area.get("slots", 1)) * unit
+        length += area.get("extra", 0)
+        skew = area.get("skew", 0)
+        pad = value(area.get("pad", 0))
+        label = f"_sos_hand{i}"
+        literal = None
+        if "base" in area:
+            literal = value(area["base"])
+        elif "at" in area:
+            base = value(area["at"])
+        else:
+            base = f"{label} + {skew}" if skew else label
+            # `storage` links fewer bytes than the length says, for an area
+            # the kernel refuses before its bytes matter.
+            reserve = max(area.get("storage", length + skew), 1)
+            if area.get("place") == "data":
+                section = [f"    .section .data.sos_hand{i}, \"aw\", "
+                           "@progbits", f"    .balign {align}"]
+                fill = ".zero"
+            else:
+                section = [f"    .section .bss.sos_hand{i}, \"aw\", "
+                           "@nobits", f"    .balign {align}"]
+                fill = ".skip"
+            if pad:
+                section.append(f"    {fill} {pad}")
+            storage += section + [f"{label}:", f"    {fill} {reserve}"]
+        lines += [f"    /* area {i}: {area.get('kind', kind)} */",
+                  f"    .4byte {kind}", "    .4byte 0"]
+        if literal is not None:
+            lines += [f"    .8byte {literal:#x}"]
+        else:
+            lines += word64(base)
+        lines += [f"    .8byte {length}"]
+    if spec.get("tail"):
+        lines.append(f"    .zero {spec['tail']}")
+    return "\n".join(lines + [""] + storage + [""])
 
 
 def _run_qemu(qemu, arch, elf, feed=None):
@@ -10803,6 +11461,7 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
     # run's report is the serial run's report.
     def run_case(case):
         name = case["name"]
+        refusal = case.get("expect_build_error")
         try:
             if builder is None:
                 elf = _build_elf(case, arch, shared_objs, lld, clang)
@@ -10815,8 +11474,15 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
                 if arch.get("kernel_fp_free"):
                     _check_kernel_fp_free(elf, clang)
         except ToolError as e:
+            # A case that asserts the build's refusal passes on it, and only
+            # on it: its text must be in what the build said.
+            if refusal is not None and refusal in str(e):
+                return True, f"{CHECK} {name}  (the build refused it)", []
             return (False, f"{CROSS} {name}  (build error)",
                     [f"    {line}" for line in str(e).splitlines()])
+        if refusal is not None:
+            return (False, f"{CROSS} {name}  (the build succeeded; it must "
+                           f"refuse: {refusal})", [])
         status, out, timed_out = _run_qemu(qemu, arch, elf, case.get("stdin"))
         ok, reason = _check(case, arch, status, out, timed_out)
         if ok:
@@ -11533,6 +12199,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #                      states, with the board's tick on: nothing a
     #                      teardown owes goes unreturned on this part
     #   kill_runnable      a kill of a child the tick took the processor from
+    #   image_limits       slab areas the image linked into the kernel's DRAM
+    #                      `.bss`, installed before root and raising what it
+    #                      can create before any donation
     #
     # Every process in them runs its code from the flash instruction window
     # and reads its read-only data through the data window, in place in its
@@ -11549,7 +12218,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "iomemory_carve", "interrupt_give", "tick_spinner",
                      "copy_from_code_refused", "thread_entry_not_exec",
                      "image_held", "data_init", "pool_ops",
-                     "kill_churn", "kill_runnable"]
+                     "kill_churn", "kill_runnable", "image_limits"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
     # This board's own process cases, for what only it has: a table of CPU
@@ -11844,6 +12513,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         """Every object one case's image links: the native half, its kernel,
         and what is appended to it."""
         name = case["name"]
+        _builder_only(case)
         objs = list(shared) + [kernel_obj(name, case["src"], variant(case))]
         if case.get("asm"):
             objs.append(cc(os.path.join(s3_tests, case["asm"]),

@@ -191,4 +191,14 @@ SECTIONS {
         *(.eh_frame .eh_frame_hdr)
         *(.note .note.*)
     }
+
+    /* The kernel must end below root's region. Overrunning 0x80200000 puts the
+     * kernel's own .bss (an image's linked slab areas, the arena, the boot
+     * stack) and root's image at the same addresses, and the loader would copy
+     * root over the kernel with no diagnostic anywhere.
+     *
+     * `ROOT_LOAD_BASE` in hal/riscv32/kernel/lib.saw is the same number; this
+     * is the linker's copy of it. */
+    ASSERT(_bss_end <= 0x80200000,
+           "kernel .bss overruns ROOT_LOAD_BASE (0x80200000)")
 }

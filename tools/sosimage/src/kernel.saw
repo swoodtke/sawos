@@ -1,0 +1,375 @@
+//! What a compiled kernel object says about the slabs an image can raise: the
+//! kernel's own numbers, and the bytes one slot of each kind takes.
+//!
+//! The numbers come from the record the kernel exports as `sos_image_limits`
+//! (`kernel/core/areas.saw` states its order). A slot's size comes from the
+//! slab's own symbol: a `Slab<T, N>` is `N` slots followed by the extent
+//! table, `3 * MAX_SLAB_EXTENTS + 2` machine words, so the symbol's size less
+//! those words, over the floor, is one slot. A thread's unit adds its frame
+//! stride and a pipe's its staging ring, as the kernel's `slab_geometry` does.
+//! The kernel checks every area against its own geometry at boot, so a
+//! disagreement here stops the boot by name rather than misreading memory.
+//!
+//! The object is a relocatable ELF, 32- or 64-bit, little-endian.
+
+import std.data.{Data}
+import sosimage.failure.{BuildError}
+import sosimage.tool.{read_file}
+
+/// How many `SlabKind`s there are, and how many `QuotaKind`s.
+public static SLAB_KINDS: Int = 13
+public static QUOTA_KINDS: Int = 9
+
+// `SlabKind` values, as `kernel/abi/src/ops.saw` numbers them.
+public static EVENTS: Int = 0
+public static WAITERS: Int = 1
+public static INTERRUPTS: Int = 2
+public static ATTACHMENTS: Int = 3
+public static TIMERS: Int = 4
+public static MEMORIES: Int = 5
+public static IOMEMORIES: Int = 6
+public static MAPPINGS: Int = 7
+public static FREE_RANGES: Int = 8
+public static THREADS: Int = 9
+public static PIPES: Int = 10
+public static PROCESSES: Int = 11
+public static PROCESS_RECORDS: Int = 12
+
+// `QuotaKind` values, as `kernel/core/pslot.saw` numbers them.
+public static QUOTA_MAPPING: Int = 6
+public static QUOTA_HANDLE: Int = 7
+
+/// The record's layout version this builder reads, and its length in words.
+static LIMITS_VERSION: UInt64 = 1
+static LIMITS_WORDS: Int = 32
+/// Where the floors and the compiled quota defaults start in the record.
+static LIMITS_FLOORS_AT: Int = 10
+static LIMITS_QUOTAS_AT: Int = 23
+
+/// The alignment the builder links every area but a thread area at: at least
+/// any slot's alignment on every target. A thread area is aligned to its
+/// frame stride, which the kernel requires.
+static AREA_ALIGN: Int = 16
+
+/// The kind's name in an image description.
+public func slab_kind_name(kind: Int) -> String {
+    match kind {
+        case 0 -> "events",
+        case 1 -> "waiters",
+        case 2 -> "interrupts",
+        case 3 -> "attachments",
+        case 4 -> "timers",
+        case 5 -> "memories",
+        case 6 -> "iomemories",
+        case 7 -> "mappings",
+        case 8 -> "free_ranges",
+        case 9 -> "threads",
+        case 10 -> "pipes",
+        case 11 -> "processes",
+        case 12 -> "process_records",
+        case _ -> "",
+    }
+}
+
+/// The quota kind's name in an image description.
+public func quota_kind_name(kind: Int) -> String {
+    match kind {
+        case 0 -> "thread",
+        case 1 -> "event",
+        case 2 -> "waiter",
+        case 3 -> "timer",
+        case 4 -> "memory",
+        case 5 -> "iomemory",
+        case 6 -> "mapping",
+        case 7 -> "handle",
+        case 8 -> "pipe",
+        case _ -> "",
+    }
+}
+
+/// The kernel object's symbol for the slab holding `kind`.
+func slab_symbol(kind: Int) -> String {
+    match kind {
+        case 0 -> "static kcore.waitables.EVENTS",
+        case 1 -> "static kcore.waitables.WAITERS",
+        case 2 -> "static kcore.waitables.INTERRUPTS",
+        case 3 -> "static kcore.waitables.ATTACHMENTS",
+        case 4 -> "static kcore.time.TIMERS",
+        case 5 -> "static kcore.objects.MEMORIES",
+        case 6 -> "static kcore.objects.IOMEMORIES",
+        case 7 -> "static kcore.objects.MAPPINGS",
+        case 8 -> "static kcore.objects.FREE_RANGES",
+        case 9 -> "static kcore.threads.THREADS",
+        case 10 -> "static kcore.objects.PIPES",
+        case 11 -> "static kcore.pslot.PROCESSES",
+        case 12 -> "static kcore.pslot.PROCESS_RECORDS",
+        case _ -> "",
+    }
+}
+
+/// The exchange slab's symbol: a pipe's unit carries its staging ring.
+func exchanges_symbol() -> String { "static kcore.objects.EXCHANGES" }
+
+/// The record of the kernel's numbers.
+func limits_symbol() -> String { "sos_image_limits" }
+
+/// The kernel's numbers an image is sized and checked against.
+public struct KernelFacts {
+    /// The target's machine word, in bytes.
+    word: Int
+    capacity: Int
+    extents: Int
+    records_per_body: Int
+    handles: Int
+    image_rows: Int
+    budget: Int
+    domains: Int
+    stride: Int
+    inflight: Int
+    /// Each slab's floor, by `SlabKind` value.
+    floors: Vector<Int>
+    /// Each compiled quota default, by `QuotaKind` value.
+    defaults: Vector<Int>
+    /// The bytes one unit of each kind takes, by `SlabKind` value.
+    units: Vector<Int>
+    /// The alignment the builder links each kind's area at.
+    aligns: Vector<Int>
+}
+
+@synthesize
+extension KernelFacts: ExplicitCopy {}
+
+/// One symbol of a relocatable object: its section, its offset in it, and
+/// its size.
+struct ObjSymbol {
+    section: Int
+    value: Int
+    size: Int
+}
+
+extension KernelFacts {
+    /// Reads the kernel object at `path`.
+    public static func read(path: String) -> Result<KernelFacts, BuildError> {
+        let data = try read_file(path)
+        let what = "the kernel object {path}"
+        let wide = try elf_class(&data, what)
+        let word = if wide { 8 } else { 4 }
+        var wanted = Vector<String>()
+        try! wanted.push(limits_symbol())
+        try! wanted.push(exchanges_symbol())
+        var k = 0
+        while k < SLAB_KINDS {
+            try! wanted.push(slab_symbol(k))
+            k = k + 1
+        }
+        let symbols = try object_symbols(&data, wide, &wanted, what)
+
+        guard let limits = symbols.get(limits_symbol()) else {
+            return BuildError(message: "{what} has no `{limits_symbol()}`: it is not a kernel this builder can size an image for")
+        }
+        if limits.size != LIMITS_WORDS * word {
+            return BuildError(message: "{what}: `{limits_symbol()}` is {limits.size} bytes; this builder reads {LIMITS_WORDS} words")
+        }
+        let at = try section_offset(&data, wide, limits.section, what) + limits.value
+        var record = Vector<Int>()
+        var w = 0
+        while w < LIMITS_WORDS {
+            try! record.push(try le(&data, at + w * word, word, what) as Int)
+            w = w + 1
+        }
+        if (record.get(0) ?? 0) as UInt64 != LIMITS_VERSION {
+            return BuildError(message: "{what}: `{limits_symbol()}` is version {record.get(0) ?? 0}; this builder reads version {LIMITS_VERSION}")
+        }
+        var floors = Vector<Int>()
+        k = 0
+        while k < SLAB_KINDS {
+            try! floors.push(record.get(LIMITS_FLOORS_AT + k) ?? 0)
+            k = k + 1
+        }
+        var defaults = Vector<Int>()
+        var q = 0
+        while q < QUOTA_KINDS {
+            try! defaults.push(record.get(LIMITS_QUOTAS_AT + q) ?? 0)
+            q = q + 1
+        }
+        let extents = record.get(2) ?? 0
+        let stride = record.get(8) ?? 0
+        let inflight = record.get(9) ?? 0
+        let header = (3 * extents + 2) * word
+
+        var slots = Vector<Int>()
+        k = 0
+        while k < SLAB_KINDS {
+            let floor = floors.get(k) ?? 0
+            try! slots.push(try slot_bytes(&symbols, slab_symbol(k), floor, header, what))
+            k = k + 1
+        }
+        let exchange = try slot_bytes(&symbols, exchanges_symbol(),
+                                      (floors.get(PIPES) ?? 0) * inflight,
+                                      header, what)
+        var units = Vector<Int>()
+        var aligns = Vector<Int>()
+        k = 0
+        while k < SLAB_KINDS {
+            let slot = slots.get(k) ?? 0
+            if k == THREADS {
+                try! units.push(slot + stride)
+                try! aligns.push(stride)
+            } else if k == PIPES {
+                try! units.push(slot + inflight * exchange)
+                try! aligns.push(AREA_ALIGN)
+            } else {
+                try! units.push(slot)
+                try! aligns.push(AREA_ALIGN)
+            }
+            k = k + 1
+        }
+        return KernelFacts(word: word, capacity: record.get(1) ?? 0,
+                           extents: extents,
+                           records_per_body: record.get(3) ?? 0,
+                           handles: record.get(4) ?? 0,
+                           image_rows: record.get(5) ?? 0,
+                           budget: record.get(6) ?? 0,
+                           domains: record.get(7) ?? 0,
+                           stride: stride, inflight: inflight,
+                           floors: move floors, defaults: move defaults,
+                           units: move units, aligns: move aligns)
+    }
+}
+
+/// One slot's bytes in the slab `symbol`, which holds `floor` slots and the
+/// extent table's `header` bytes.
+func slot_bytes(symbols: &Map<String, ObjSymbol>, symbol: String, floor: Int,
+                header: Int, what: String) -> Result<Int, BuildError> {
+    guard let found = symbols.get(symbol) else {
+        return BuildError(message: "{what} has no `{symbol}`")
+    }
+    if floor <= 0 || found.size <= header || (found.size - header) % floor != 0 {
+        return BuildError(message: "{what}: `{symbol}` is {found.size} bytes, which is not {floor} slots and the extent table's {header} bytes")
+    }
+    return (found.size - header) / floor
+}
+
+// ELF fields read here, by offset: the identification's class byte, the file
+// header's section table, a section header's offset, and a symbol's fields,
+// for each class.
+static EI_CLASS: Int = 4
+static ELFCLASS32: UInt64 = 1
+static ELFCLASS64: UInt64 = 2
+static SHT_SYMTAB: UInt64 = 2
+
+/// Whether the object is 64-bit.
+func elf_class(data: &Data, what: String) -> Result<Bool, BuildError> {
+    let class = try le(&data, EI_CLASS, 1, what)
+    if class == ELFCLASS32 {
+        return false
+    }
+    if class == ELFCLASS64 {
+        return true
+    }
+    return BuildError(message: "{what} is not an ELF object")
+}
+
+/// The section table: its file offset, entry size and entry count.
+func section_table(data: &Data, wide: Bool, what: String) -> Result<(Int, Int, Int), BuildError> {
+    if wide {
+        return (try le(&data, 40, 8, what) as Int, try le(&data, 58, 2, what) as Int,
+                try le(&data, 60, 2, what) as Int)
+    }
+    return (try le(&data, 32, 4, what) as Int, try le(&data, 46, 2, what) as Int,
+            try le(&data, 48, 2, what) as Int)
+}
+
+/// Section `index`'s offset in the file.
+func section_offset(data: &Data, wide: Bool, index: Int, what: String) -> Result<Int, BuildError> {
+    let (shoff, shentsize, shnum) = try section_table(&data, wide, what)
+    if index <= 0 || index >= shnum {
+        return BuildError(message: "{what}: a symbol names section {index}, which the object does not have")
+    }
+    let sh = shoff + shentsize * index
+    if wide {
+        return try le(&data, sh + 24, 8, what) as Int
+    }
+    return try le(&data, sh + 16, 4, what) as Int
+}
+
+/// The symbols of the object named in `wanted`, by name.
+func object_symbols(data: &Data, wide: Bool, wanted: &Vector<String>,
+                    what: String) -> Result<Map<String, ObjSymbol>, BuildError> {
+    let (shoff, shentsize, shnum) = try section_table(&data, wide, what)
+    var out = Map<String, ObjSymbol>()
+    var i = 0
+    while i < shnum {
+        let sh = shoff + shentsize * i
+        i = i + 1
+        if (try le(&data, sh + 4, 4, what)) != SHT_SYMTAB {
+            continue
+        }
+        let offset = if wide { try le(&data, sh + 24, 8, what) as Int } else { try le(&data, sh + 16, 4, what) as Int }
+        let size = if wide { try le(&data, sh + 32, 8, what) as Int } else { try le(&data, sh + 20, 4, what) as Int }
+        let link_at = if wide { sh + 40 } else { sh + 24 }
+        let link = try le(&data, link_at, 4, what) as Int
+        let entsize = if wide { try le(&data, sh + 56, 8, what) as Int } else { try le(&data, sh + 36, 4, what) as Int }
+        if entsize == 0 {
+            return BuildError(message: "{what}'s symbol table has entries of no size")
+        }
+        let strsh = shoff + shentsize * link
+        let strtab = if wide { try le(&data, strsh + 24, 8, what) as Int } else { try le(&data, strsh + 16, 4, what) as Int }
+        var at = offset
+        while at < offset + size {
+            let name = c_string_at(&data, strtab + (try le(&data, at, 4, what) as Int))
+            if names_one_of(&wanted, name) {
+                let sym = if wide {
+                    ObjSymbol(section: try le(&data, at + 6, 2, what) as Int,
+                              value: try le(&data, at + 8, 8, what) as Int,
+                              size: try le(&data, at + 16, 8, what) as Int)
+                } else {
+                    ObjSymbol(section: try le(&data, at + 14, 2, what) as Int,
+                              value: try le(&data, at + 4, 4, what) as Int,
+                              size: try le(&data, at + 8, 4, what) as Int)
+                }
+                let _ = try! out.insert(name, sym)
+            }
+            at = at + entsize
+        }
+    }
+    return move out
+}
+
+/// Whether `name` is one of `wanted`.
+func names_one_of(wanted: &Vector<String>, name: String) -> Bool {
+    var i = 0
+    while i < wanted.len() {
+        if (wanted.get(i) ?? "").equals(name) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// The `bytes`-wide little-endian number at `off`, or a truncation refusal.
+func le(data: &Data, off: Int, bytes: Int, what: String) -> Result<UInt64, BuildError> {
+    var v: UInt64 = 0
+    var i = bytes
+    while i > 0 {
+        i = i - 1
+        guard let b = data.get(off + i) else {
+            return BuildError(message: "{what} is truncated at byte {off + i}")
+        }
+        v = (v << 8) | (b as UInt64)
+    }
+    return v
+}
+
+/// The NUL-terminated string at `off`.
+func c_string_at(data: &Data, off: Int) -> String {
+    var end = off
+    while (data.get(end) ?? 0) != 0 {
+        end = end + 1
+    }
+    guard let bytes = data.slice(off, end) else {
+        return ""
+    }
+    try bytes.to_string() catch { "" }
+}

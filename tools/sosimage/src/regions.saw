@@ -1,13 +1,21 @@
 //! The boot region table: its wire format, and the assembly that puts it in
 //! an image.
 //!
-//! Version 4, frozen: an 8-byte header (magic u32, version u16, row count u8,
+//! Version 5, frozen: an 8-byte header (magic u32, version u16, row count u8,
 //! boot flags u8), then one 24-byte row per region (base u64, length u64,
 //! kind u8, seven reserved bytes), all little-endian. The header's size puts
 //! the first row on an 8-byte boundary and the row's padding keeps the next
 //! one there, which lets the kernel overlay a struct on the section. Kept in
 //! step with `kernel/core/process.saw`'s `RegionTableHeader`, `RegionRow` and
 //! `RegionKind`; the kernel accepts exactly this version.
+//!
+//! After the rows comes nothing, or the slab block of an image that states
+//! limits: a 48-byte header (magic u32, area count u32, one quota default u32
+//! per quota kind in its value's order, a reserved u32), then one 24-byte
+//! entry per area (its slab kind u32, a reserved u32, base u64, length u64).
+//! An area's base is the symbol its section starts at, which the linker fills
+//! in. Kept in step with `kernel/core/areas.saw`'s `SlabBlockHeader` and
+//! `SlabArea`.
 //!
 //! The table is encoded here as fields, each a number or a linker expression:
 //! a child image's row names the symbols bounding its blob, whose values only
@@ -17,10 +25,15 @@
 
 import sosimage.failure.{BuildError}
 import sosimage.hex.{hex, hex_padded}
+import sosimage.kernel.{slab_kind_name}
+import sosimage.limits.{SlabPlan}
 
 /// 'S','R','G','N' read little-endian.
 public static REGION_TABLE_MAGIC: UInt64 = 0x4E47_5253
-public static REGION_TABLE_VERSION: UInt64 = 4
+public static REGION_TABLE_VERSION: UInt64 = 5
+
+/// 'S','L','A','B' read little-endian.
+public static SLAB_BLOCK_MAGIC: UInt64 = 0x4241_4C53
 
 /// The header's boot flags bit that keeps the kernel from arming the
 /// scheduler tick, mirroring `kernel/core/process.saw`'s `BOOT_FLAG_NO_TICK`.
@@ -142,6 +155,64 @@ public func encode_table(rows: &Vector<RegionRow>, flags: UInt64,
         i = i + 1
     }
     return move out
+}
+
+/// The slab block `plan` describes, as fields in order: the header with every
+/// quota default, then an entry per area naming the symbol `area_symbol`
+/// gives its section's start.
+public func encode_block(plan: &SlabPlan,
+                         word_bytes: Int) -> Result<Vector<TableField>, BuildError> {
+    var out = Vector<TableField>()
+    try! out.push(TableField(bytes: 4, value: SLAB_BLOCK_MAGIC, symbol: "", note: "slab block: magic"))
+    try! out.push(TableField(bytes: 4, value: plan.areas.len() as UInt64, symbol: "", note: "areas"))
+    var q = 0
+    while q < plan.defaults.len() {
+        let d = plan.defaults.get(q) ?? 0
+        let note = if q == 0 { "quota defaults" } else { "" }
+        try! out.push(TableField(bytes: 4, value: d as UInt64, symbol: "", note: note))
+        q = q + 1
+    }
+    try! out.push(TableField(bytes: 4, value: 0, symbol: "", note: ""))
+    var a = 0
+    while a < plan.areas.len() {
+        guard let area = plan.areas.get(a) else {
+            return BuildError(message: "internal: area {a} vanished")
+        }
+        try! out.push(TableField(bytes: 4, value: area.kind as UInt64, symbol: "",
+                                 note: "area {a}: {slab_kind_name(area.kind)}, {area.slots} slots"))
+        try! out.push(TableField(bytes: 4, value: 0, symbol: "", note: ""))
+        try push_word(&var out, RowWord.linked(area_symbol(area.kind)), word_bytes, "")
+        try! out.push(TableField(bytes: 8, value: area.bytes as UInt64, symbol: "", note: ""))
+        a = a + 1
+    }
+    return move out
+}
+
+/// The symbol at the start of the section holding `kind`'s area.
+public func area_symbol(kind: Int) -> String {
+    "_sos_slab{kind}_start"
+}
+
+/// The assembly that links each of `plan`'s areas into the kernel's `.bss`:
+/// one zero-filled section per kind, named `.bss.sos_slab<kind>` so every
+/// board script's `.bss.*` rule places it with the kernel's own zeroed
+/// storage.
+public func area_assembly(plan: &SlabPlan) -> Vector<String> {
+    var lines = Vector<String>()
+    var a = 0
+    while a < plan.areas.len() {
+        guard let area = plan.areas.get(a) else {
+            a = a + 1
+            continue
+        }
+        try! lines.push("    /* {slab_kind_name(area.kind)}: {area.slots} slots */")
+        try! lines.push("    .section .bss.sos_slab{area.kind}, \"aw\", @nobits")
+        try! lines.push("    .balign {area.align}")
+        try! lines.push("{area_symbol(area.kind)}:")
+        try! lines.push("    .skip {area.bytes}")
+        a = a + 1
+    }
+    move lines
 }
 
 func push_word(out: &var Vector<TableField>, word: RowWord, word_bytes: Int,

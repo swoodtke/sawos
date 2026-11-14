@@ -2,21 +2,30 @@
 """Dump SawOS binary artifacts, human-readably.
 
   tools/sosimg_dump.py <file.sosimg>          the image header + segment table
-  tools/sosimg_dump.py --regions <blob>       a raw region table (v2), e.g. from
-                                              llvm-objcopy -O binary --only-section=.regions <elf> <blob>
+  tools/sosimg_dump.py --regions <blob>       a raw region table (v5) and the
+                                              slab block after its rows, if any,
+                                              e.g. from llvm-objcopy -O binary
+                                              --only-section=.regions <elf> <blob>
 
 Formats: sosimg v3 (imgformat, sawlang libs/imgformat) and the sawos region
-table v2 (kernel/core/process.saw + tools/sos_runner.py — kept in step by the
-static_asserts beside each).
+table v5 (kernel/core/process.saw + tools/sos_runner.py, kept in step by the
+static_asserts beside each), with its slab block (kernel/core/areas.saw). An
+area's base is what the linker wrote, a link address on a higher-half kernel.
 """
 import struct
 import sys
 
 SEG_FLAGS = [(1, "R"), (2, "W"), (4, "X"), (8, "DEVICE")]
 ARCHES = {1: "riscv32", 2: "arm64"}
-REGION_KINDS = {0: "ram", 1: "device"}
+REGION_KINDS = {0: "ram", 1: "device", 2: "pool"}
 SOSIMG_MAGIC = 0x4953_4F53   # 'S','O','S','I' LE
 REGION_MAGIC = 0x4E47_5253   # 'S','R','G','N' LE
+SLAB_MAGIC = 0x4241_4C53     # 'S','L','A','B' LE
+SLAB_KINDS = ["events", "waiters", "interrupts", "attachments", "timers",
+              "memories", "iomemories", "mappings", "free_ranges", "threads",
+              "pipes", "processes", "process_records"]
+QUOTA_KINDS = ["thread", "event", "waiter", "timer", "memory", "iomemory",
+               "mapping", "handle", "pipe"]
 
 
 def flags_str(f):
@@ -48,17 +57,49 @@ def dump_regions(path):
     if len(blob) == 0:
         print("empty table (zero regions)")
         return
-    magic, version, count, _res = struct.unpack_from("<IHBB", blob, 0)
+    magic, version, count, flags = struct.unpack_from("<IHBB", blob, 0)
     ok = "ok" if magic == REGION_MAGIC else f"BAD (want 0x{REGION_MAGIC:08x})"
     print(f"magic     0x{magic:08x} ({ok})")
     print(f"version   {version}")
     print(f"regions   {count}")
+    print(f"flags     0x{flags:02x}")
     off = 8
     for i in range(count):
         base, length, kind = struct.unpack_from("<QQB", blob, off)
         print(f"  row {i}: base 0x{base:016x}  len 0x{length:x} ({length})  "
               f"kind {kind} ({REGION_KINDS.get(kind, '?')})")
         off += 24
+    dump_block(blob, off)
+
+
+def dump_block(blob, off):
+    """The slab block after the rows: nothing, or a header and its areas."""
+    rest = len(blob) - off
+    if rest == 0:
+        print("no slab block")
+        return
+    if rest < 48:
+        print(f"slab block cut short: {rest} bytes")
+        return
+    magic, count = struct.unpack_from("<II", blob, off)
+    quotas = struct.unpack_from("<9I", blob, off + 8)
+    ok = "ok" if magic == SLAB_MAGIC else f"BAD (want 0x{SLAB_MAGIC:08x})"
+    print(f"slab block magic 0x{magic:08x} ({ok})")
+    print("quota defaults " + " ".join(
+        f"{name}={q}" for name, q in zip(QUOTA_KINDS, quotas)))
+    print(f"areas     {count}")
+    off += 48
+    for i in range(count):
+        if len(blob) - off < 24:
+            print(f"  area {i}: cut short")
+            return
+        kind, _res, base, length = struct.unpack_from("<IIQQ", blob, off)
+        name = SLAB_KINDS[kind] if kind < len(SLAB_KINDS) else "?"
+        print(f"  area {i}: kind {kind} ({name})  base 0x{base:016x}  "
+              f"len 0x{length:x} ({length})")
+        off += 24
+    if off < len(blob):
+        print(f"{len(blob) - off} bytes after the slab block")
 
 
 def main():

@@ -1,0 +1,220 @@
+// An image's limits: what they come to against a kernel's numbers, and each
+// refusal by its message, since the message is what reaches the runner's
+// report. The kernel here is riscv32's at the time of writing, its numbers
+// written out (`sosimage slabs` prints them for a real object).
+
+import sosimage.failure.{BuildError}
+import sosimage.fields.{Fields}
+import sosimage.kernel.{KernelFacts}
+import sosimage.limits.{ImageLimits, SlabPlan, plan_limits}
+import sosimage.regions.{encode_block}
+import std.json.{JsonValue}
+
+func ints(values: &[Int]) -> Vector<Int> {
+    var out = Vector<Int>()
+    var i = 0
+    while i < values.len() {
+        try! out.push(values[i])
+        i = i + 1
+    }
+    move out
+}
+
+func kernel() -> KernelFacts {
+    let floors: [Int; 13] = [8, 4, 4, 32, 8, 16, 8, 8, 32, 8, 4, 3, 12]
+    let defaults: [Int; 9] = [4, 4, 2, 4, 4, 2, 2, 12, 2]
+    let units: [Int; 13] = [24, 20, 20, 24, 48, 56, 20, 20, 16, 556, 3480, 784, 104]
+    let aligns: [Int; 13] = [16, 16, 16, 16, 16, 16, 16, 16, 16, 512, 16, 16, 16]
+    KernelFacts(word: 4, capacity: 1 << 20, extents: 4, records_per_body: 4,
+                handles: 16, image_rows: 4, budget: 8, domains: 256,
+                stride: 512, inflight: 16, floors: ints(&floors),
+                defaults: ints(&defaults), units: ints(&units),
+                aligns: ints(&aligns))
+}
+
+// The limits a `limits` object states.
+func stated(text: String) -> ImageLimits {
+    let doc = try! JsonValue.parse(text)
+    var fields = try! Fields(move doc, "limits")
+    try! ImageLimits.read(&var fields)
+}
+
+// The message `text`'s limits are refused with, or "" when they are taken.
+func refusal(text: String) -> String {
+    let facts = kernel()
+    let limits = stated(text)
+    match plan_limits(&facts, &limits, "img", 2, 1) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect_refusal(text: String, message: String) {
+    let got = refusal(text)
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the refusal's message")
+}
+
+func plan(text: String) -> SlabPlan {
+    let facts = kernel()
+    let limits = stated(text)
+    try! plan_limits(&facts, &limits, "img", 2, 1)
+}
+
+func main() {
+    // A process body raised: the derived totals follow it, each area in kind
+    // order, each length whole slots of its unit.
+    let p = plan("\{\"slabs\": \{\"processes\": 1, \"waiters\": 1\}\}")
+    assert(p.block, "a block")
+    assert(p.areas.len() == 5, "waiters, attachments, mappings, processes, records")
+    let w = p.areas.get(0)!
+    assert(w.kind == 1 && w.slots == 1 && w.bytes == 20 && w.align == 16, "waiters")
+    let a = p.areas.get(1)!
+    assert(a.kind == 3 && a.slots == 4, "attachments: one per waitable, 36")
+    let m = p.areas.get(2)!
+    assert(m.kind == 7 && m.slots == 8, "mappings: four per body, 16")
+    let b = p.areas.get(3)!
+    assert(b.kind == 11 && b.slots == 1 && b.bytes == 784, "a body")
+    let r = p.areas.get(4)!
+    assert(r.kind == 12 && r.slots == 4, "records: four per body, 16")
+    assert(p.defaults.get(1)! == 4, "an unstated default is the compiled one")
+
+    // A thread area is aligned to the frame stride. It follows the Mapping
+    // area the builder sizes at four per body.
+    let t = plan("\{\"slabs\": \{\"threads\": 2\}\}")
+    let ta = t.areas.get(1)!
+    assert(ta.kind == 9 && ta.bytes == 2 * 556 && ta.align == 512, "threads")
+
+    // A derived total stated above its derivation is taken as stated.
+    let above = plan("\{\"slabs\": \{\"processes\": 1, \"process_records\": 10\}\}")
+    let rec = above.areas.get(above.areas.len() - 1)!
+    assert(rec.kind == 12 && rec.slots == 10, "records stated above")
+
+    // Quota defaults at each edge their bounds allow.
+    let edge = plan("\{\"quotas\": \{\"event\": 7, \"handle\": 15, \"mapping\": 4\}\}")
+    assert(edge.defaults.get(1)! == 7 && edge.defaults.get(7)! == 15
+           && edge.defaults.get(6)! == 4, "the edges")
+
+    // The block's bytes: the header with every default, then each area, its
+    // base left to the linker.
+    let fields = try! encode_block(&p, 4)
+    assert(fields.len() == 12 + 5 * 5, "a header of 12 fields, 5 an area")
+    let head = fields.get(0)!
+    assert(head.bytes == 4 && head.value == 0x4241_4C53, "the magic")
+    assert(fields.get(1)!.value == 5, "the area count")
+    var q = 0
+    while q < 9 {
+        let d = fields.get(2 + q)!
+        assert(d.bytes == 4 && d.value == (p.defaults.get(q)! as UInt64),
+               "each quota default")
+        q = q + 1
+    }
+    assert(fields.get(11)!.bytes == 4 && fields.get(11)!.value == 0,
+           "the reserved word")
+    assert(fields.get(12)!.value == 1, "area 0's kind")
+    assert(fields.get(14)!.symbol.equals("_sos_slab1_start"), "area 0's base")
+    assert(fields.get(15)!.bytes == 4 && fields.get(15)!.value == 0,
+           "a 32-bit base's high half")
+    assert(fields.get(16)!.bytes == 8 && fields.get(16)!.value == 20,
+           "area 0's length")
+    let wide = try! encode_block(&p, 8)
+    assert(wide.len() == 12 + 5 * 4, "a 64-bit base is one field")
+    assert(wide.get(14)!.bytes == 8, "the base's 8 bytes")
+
+    // Every bound's edge is taken: a total at the ceiling, pipes whose
+    // exchanges reach it exactly, bodies filling the domain pool, derived
+    // totals stated at their derivation, a default at the compiled one, and
+    // the region table's rows filling both slabs.
+    let at_ceiling = plan("\{\"slabs\": \{\"waiters\": 1048572\}\}")
+    assert(at_ceiling.areas.get(0)!.slots == 1048572, "waiters to the ceiling")
+    let pipes = plan("\{\"slabs\": \{\"pipes\": 65532\}\}")
+    assert(pipes.areas.len() == 2, "pipes to the exchanges' ceiling, and mappings")
+    let full = plan("\{\"slabs\": \{\"processes\": 253\}\}")
+    assert(full.areas.get(full.areas.len() - 2)!.slots == 253, "bodies to the pool")
+    let exact = plan("\{\"slabs\": \{\"processes\": 1, \"process_records\": 4, \"threads\": 0, \"attachments\": 4\}, \"quotas\": \{\"thread\": 4\}\}")
+    assert(exact.defaults.get(0)! == 4, "a default at the compiled one")
+    let eight = plan("\{\"slabs\": \{\"processes\": 5, \"threads\": 0\}\}")
+    assert(eight.block, "threads stated at exactly the bodies")
+    let stated_mappings = plan("\{\"slabs\": \{\"processes\": 1, \"mappings\": 0\}\}")
+    var i = 0
+    while i < stated_mappings.areas.len() {
+        assert(stated_mappings.areas.get(i)!.kind != 7,
+               "a Mapping slab the image states is not sized for it")
+        i = i + 1
+    }
+    let facts_rows = kernel()
+    let quiet_rows = stated("\{\}")
+    let filled = try! plan_limits(&facts_rows, &quiet_rows, "img", 16, 8)
+    assert(filled.block, "rows filling both slabs")
+
+    // Each quota kind's bound is its own slab's capacity. Over slabs raised so
+    // that no two share a capacity (threads 9, events 10, timers 11,
+    // iomemories 13, mappings 14, pipes 5, waiters 6, memories 17, beside
+    // interrupts 7, records 12, free ranges 32 and attachments 40), a
+    // default at its slab's capacity is refused naming that capacity, and a
+    // bound read from any other slab would name another or take it.
+    let raised = "\"slabs\": \{\"threads\": 1, \"events\": 2, \"timers\": 3, \"iomemories\": 5, \"mappings\": 6, \"pipes\": 1, \"waiters\": 2, \"memories\": 1, \"interrupts\": 3\}"
+    expect_refusal("\{{raised}, \"quotas\": \{\"thread\": 9\}\}",
+                   "img: the image's thread quota default is 9, not below its slab's capacity (9)")
+    expect_refusal("\{{raised}, \"quotas\": \{\"event\": 10\}\}",
+                   "img: the image's event quota default is 10, not below its slab's capacity (10)")
+    expect_refusal("\{{raised}, \"quotas\": \{\"waiter\": 6\}\}",
+                   "img: the image's waiter quota default is 6, not below its slab's capacity (6)")
+    expect_refusal("\{{raised}, \"quotas\": \{\"timer\": 11\}\}",
+                   "img: the image's timer quota default is 11, not below its slab's capacity (11)")
+    expect_refusal("\{{raised}, \"quotas\": \{\"memory\": 17\}\}",
+                   "img: the image's memory quota default is 17, not below its slab's capacity (17)")
+    expect_refusal("\{{raised}, \"quotas\": \{\"iomemory\": 13\}\}",
+                   "img: the image's iomemory quota default is 13, not below its slab's capacity (13)")
+    expect_refusal("\{{raised}, \"quotas\": \{\"mapping\": 14\}\}",
+                   "img: the image's mapping quota default is 14, not below its slab's capacity (14)")
+    expect_refusal("\{{raised}, \"quotas\": \{\"pipe\": 5\}\}",
+                   "img: the image's pipe quota default is 5, not below its slab's capacity (5)")
+
+    // Each refusal, by name.
+    expect_refusal("\{\"slabs\": \{\"waiters\": 1048576\}\}",
+                   "img: the image's waiters come to 1048580, past MAX_SLAB_CAPACITY (1048576)")
+    expect_refusal("\{\"slabs\": \{\"waiters\": 1048577\}\}",
+                   "img: the image raises waiters by 1048577, past MAX_SLAB_CAPACITY (1048576)")
+    expect_refusal("\{\"slabs\": \{\"waiters\": 1048573\}\}",
+                   "img: the image's waiters come to 1048577, past MAX_SLAB_CAPACITY (1048576)")
+    expect_refusal("\{\"slabs\": \{\"pipes\": 65533\}\}",
+                   "img: the image's 65537 pipes need 1048592 exchanges, past MAX_SLAB_CAPACITY (1048576)")
+    expect_refusal("\{\"slabs\": \{\"processes\": 1, \"process_records\": 3\}\}",
+                   "img: the image's process_records come to 15, below 16: 4 records per process body, for 4 bodies")
+    expect_refusal("\{\"slabs\": \{\"processes\": 6, \"threads\": 0\}\}",
+                   "img: the image's threads come to 8, below 9: a main thread for each of 9 process bodies")
+    expect_refusal("\{\"slabs\": \{\"events\": 1, \"attachments\": 0\}\}",
+                   "img: the image's attachments come to 32, below 33: one for each event, interrupt, timer and record")
+    expect_refusal("\{\"slabs\": \{\"processes\": 254\}\}",
+                   "img: the image's 257 process bodies pass this board's domain pool (256)")
+    expect_refusal("\{\"quotas\": \{\"event\": 3\}\}",
+                   "img: the image's event quota default is 3, below the compiled default (4)")
+    expect_refusal("\{\"quotas\": \{\"event\": 65535\}\}",
+                   "img: the image's event quota default is 65535, which the ledger's row cannot hold below its unlimited mark (65535)")
+    expect_refusal("\{\"quotas\": \{\"event\": 8\}\}",
+                   "img: the image's event quota default is 8, not below its slab's capacity (8)")
+    expect_refusal("\{\"quotas\": \{\"handle\": 16\}\}",
+                   "img: the image's handle quota default is 16, not below MAX_HANDLES (16)")
+    expect_refusal("\{\"quotas\": \{\"mapping\": 5\}\}",
+                   "img: the image's mapping quota default is 5, past the 4 grant rows an image leaves of this board's 8")
+
+    // The rows the region table mints are held against the image's slabs.
+    let facts = kernel()
+    let quiet = stated("\{\}")
+    let rows = match plan_limits(&facts, &quiet, "img", 17, 0) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(rows.equals("img: the region table mints 17 Memory objects at boot, past the image's 16"),
+           "the Memory rows")
+    let devices = match plan_limits(&facts, &quiet, "img", 0, 9) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(devices.equals("img: the region table mints 9 IoMemory objects at boot, past the image's 8"),
+           "the IoMemory rows")
+}

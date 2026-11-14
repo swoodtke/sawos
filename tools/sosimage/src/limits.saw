@@ -1,0 +1,274 @@
+//! An image's limits: the slab kinds it raises and the quota defaults its
+//! children start with, checked against the kernel's numbers and turned into
+//! the areas the build links and the block after the region table's rows
+//! (spec §2.8, §12).
+//!
+//! An image raises a kind by a number of slots above its floor and never
+//! lowers one. Some totals are derived from others, and the builder computes
+//! them: records are `records_per_body` per process body, threads at least the
+//! bodies, attachments at least events + interrupts + timers + records. An
+//! image may state a derived total above its derivation and never below it.
+//! The Mapping slab is sized at four per process body when the image states
+//! none; that is how the builder sizes a default, and nothing checks it.
+//!
+//! Each quota default an image states is at least the compiled one, below its
+//! slab's capacity at boot (the `handle` default below the handle table), fits
+//! the ledger's 16-bit row without reading as unlimited, and for `mapping`
+//! leaves the rows an image spends before it runs. A default the image does
+//! not state is the compiled one.
+
+import sosimage.failure.{BuildError}
+import sosimage.fields.{Fields}
+import sosimage.kernel.{
+    ATTACHMENTS, EVENTS, INTERRUPTS, IOMEMORIES, KernelFacts, MAPPINGS,
+    MEMORIES, PIPES, PROCESSES, PROCESS_RECORDS, QUOTA_HANDLE, QUOTA_KINDS,
+    QUOTA_MAPPING, SLAB_KINDS, THREADS, TIMERS, WAITERS, quota_kind_name,
+    slab_kind_name,
+}
+
+/// The Mapping slab's size per process body when an image states none.
+static MAPPINGS_PER_BODY: Int = 4
+
+/// The ledger's unlimited marker, which no default may reach: a row is 16
+/// bits wide (`kernel/core/objects.saw`'s `QUOTA_UNLIMITED`).
+static QUOTA_UNLIMITED: Int = 0xFFFF
+
+/// What an image description asks for, by kind value; -1 is not stated.
+public struct ImageLimits {
+    raise: Vector<Int>
+    quota: Vector<Int>
+}
+
+@synthesize
+extension ImageLimits: ExplicitCopy {}
+
+extension ImageLimits {
+    /// Limits that state nothing.
+    public static func none() -> ImageLimits {
+        var raise = Vector<Int>()
+        var quota = Vector<Int>()
+        var k = 0
+        while k < SLAB_KINDS {
+            try! raise.push(-1)
+            k = k + 1
+        }
+        var q = 0
+        while q < QUOTA_KINDS {
+            try! quota.push(-1)
+            q = q + 1
+        }
+        ImageLimits(raise: move raise, quota: move quota)
+    }
+
+    /// Reads the description's `limits` object: `slabs`, the slots each named
+    /// kind is raised by, and `quotas`, each named default. Both may be left
+    /// out; an unknown name is refused.
+    public static func read(limits: &var Fields) -> Result<ImageLimits, BuildError> {
+        let empty = ImageLimits.none()
+        var raise = empty.raise.copy()
+        var quota = empty.quota.copy()
+        var k = 0
+        var q = 0
+        if var slabs = try limits.object("slabs", "the image's `limits.slabs`") {
+            k = 0
+            while k < SLAB_KINDS {
+                let name = slab_kind_name(k)
+                if slabs.has(name) {
+                    let n = try slabs.integer(name)
+                    if n < 0 {
+                        return BuildError(message: "the image's `limits.slabs`: `{name}` is negative ({n}); an image raises a limit and never lowers one")
+                    }
+                    raise[k] = n
+                }
+                k = k + 1
+            }
+            try slabs.finish()
+        }
+        if var quotas = try limits.object("quotas", "the image's `limits.quotas`") {
+            q = 0
+            while q < QUOTA_KINDS {
+                let name = quota_kind_name(q)
+                if quotas.has(name) {
+                    let n = try quotas.integer(name)
+                    if n < 0 {
+                        return BuildError(message: "the image's `limits.quotas`: `{name}` is negative ({n})")
+                    }
+                    quota[q] = n
+                }
+                q = q + 1
+            }
+            try quotas.finish()
+        }
+        try limits.finish()
+        return ImageLimits(raise: move raise, quota: move quota)
+    }
+}
+
+/// One area the build links: the kind it raises, by how many slots, how many
+/// bytes that is, and the alignment its base needs.
+public struct SlabArea {
+    kind: Int
+    slots: Int
+    bytes: Int
+    align: Int
+}
+
+/// What an image's limits come to: whether it carries a block at all, the
+/// areas, in kind order, and every quota default, by kind value.
+public struct SlabPlan {
+    block: Bool
+    areas: Vector<SlabArea>
+    defaults: Vector<Int>
+}
+
+@synthesize
+extension SlabPlan: ExplicitCopy {}
+
+extension SlabPlan {
+    /// The plan of an image that states no limits: no block, no areas.
+    public static func none() -> SlabPlan {
+        SlabPlan(block: false, areas: Vector<SlabArea>(),
+                 defaults: Vector<Int>())
+    }
+}
+
+/// The totals and the areas `limits` asks of the kernel `facts` describes,
+/// for an image of `name` whose region table mints `memory_rows` Memory
+/// objects and `device_rows` IoMemory objects at boot. Every refusal names
+/// the image, the number and the bound it breaks.
+public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, name: String,
+                        memory_rows: Int, device_rows: Int) -> Result<SlabPlan, BuildError> {
+    var total = Vector<Int>()
+    var k = 0
+    while k < SLAB_KINDS {
+        let floor = facts.floors.get(k) ?? 0
+        let stated = limits.raise.get(k) ?? -1
+        if stated > facts.capacity {
+            return BuildError(message: "{name}: the image raises {slab_kind_name(k)} by {stated}, past MAX_SLAB_CAPACITY ({facts.capacity})")
+        }
+        try! total.push(if stated < 0 { floor } else { floor + stated })
+        k = k + 1
+    }
+
+    let bodies = total.get(PROCESSES) ?? 0
+    try derive(&var total, &limits, PROCESS_RECORDS,
+               facts.records_per_body * bodies, name,
+               "{facts.records_per_body} records per process body, for {bodies} bodies")
+    try derive(&var total, &limits, THREADS, bodies, name,
+               "a main thread for each of {bodies} process bodies")
+    let waitables = ((total.get(EVENTS) ?? 0) + (total.get(INTERRUPTS) ?? 0)
+                     + (total.get(TIMERS) ?? 0) + (total.get(PROCESS_RECORDS) ?? 0))
+    try derive(&var total, &limits, ATTACHMENTS, waitables, name,
+               "one for each event, interrupt, timer and record")
+    if (limits.raise.get(MAPPINGS) ?? -1) < 0 {
+        let sized = MAPPINGS_PER_BODY * bodies
+        if sized > (total.get(MAPPINGS) ?? 0) {
+            total[MAPPINGS] = sized
+        }
+    }
+
+    k = 0
+    while k < SLAB_KINDS {
+        let t = total.get(k) ?? 0
+        if t > facts.capacity {
+            return BuildError(message: "{name}: the image's {slab_kind_name(k)} come to {t}, past MAX_SLAB_CAPACITY ({facts.capacity})")
+        }
+        k = k + 1
+    }
+    let pipes = total.get(PIPES) ?? 0
+    if pipes * facts.inflight > facts.capacity {
+        return BuildError(message: "{name}: the image's {pipes} pipes need {pipes * facts.inflight} exchanges, past MAX_SLAB_CAPACITY ({facts.capacity})")
+    }
+    if bodies > facts.domains {
+        return BuildError(message: "{name}: the image's {bodies} process bodies pass this board's domain pool ({facts.domains})")
+    }
+    let memories = total.get(MEMORIES) ?? 0
+    if memory_rows > memories {
+        return BuildError(message: "{name}: the region table mints {memory_rows} Memory objects at boot, past the image's {memories}")
+    }
+    let iomemories = total.get(IOMEMORIES) ?? 0
+    if device_rows > iomemories {
+        return BuildError(message: "{name}: the region table mints {device_rows} IoMemory objects at boot, past the image's {iomemories}")
+    }
+
+    var defaults = Vector<Int>()
+    var q = 0
+    while q < QUOTA_KINDS {
+        let compiled = facts.defaults.get(q) ?? 0
+        let stated = limits.quota.get(q) ?? -1
+        if stated < 0 {
+            try! defaults.push(compiled)
+            q = q + 1
+            continue
+        }
+        let label = quota_kind_name(q)
+        if stated < compiled {
+            return BuildError(message: "{name}: the image's {label} quota default is {stated}, below the compiled default ({compiled})")
+        }
+        if stated >= QUOTA_UNLIMITED {
+            return BuildError(message: "{name}: the image's {label} quota default is {stated}, which the ledger's row cannot hold below its unlimited mark ({QUOTA_UNLIMITED})")
+        }
+        if q == QUOTA_HANDLE {
+            if stated >= facts.handles {
+                return BuildError(message: "{name}: the image's handle quota default is {stated}, not below MAX_HANDLES ({facts.handles})")
+            }
+        } else {
+            let slab = quota_slab(q)
+            let cap = total.get(slab) ?? 0
+            if stated >= cap {
+                return BuildError(message: "{name}: the image's {label} quota default is {stated}, not below its slab's capacity ({cap})")
+            }
+        }
+        if q == QUOTA_MAPPING && stated > facts.budget - facts.image_rows {
+            return BuildError(message: "{name}: the image's mapping quota default is {stated}, past the {facts.budget - facts.image_rows} grant rows an image leaves of this board's {facts.budget}")
+        }
+        try! defaults.push(stated)
+        q = q + 1
+    }
+
+    var areas = Vector<SlabArea>()
+    k = 0
+    while k < SLAB_KINDS {
+        let slots = (total.get(k) ?? 0) - (facts.floors.get(k) ?? 0)
+        if slots > 0 {
+            try! areas.push(SlabArea(kind: k, slots: slots,
+                                     bytes: slots * (facts.units.get(k) ?? 0),
+                                     align: facts.aligns.get(k) ?? 0))
+        }
+        k = k + 1
+    }
+    return SlabPlan(block: true, areas: move areas, defaults: move defaults)
+}
+
+/// Settle derived kind `kind`'s total against `derivation`: the derivation
+/// when the image states none, the stated total when it is at least that, and
+/// a refusal naming `why` when it is below.
+func derive(total: &var Vector<Int>, limits: &ImageLimits, kind: Int,
+            derivation: Int, name: String, why: String) -> Result<Void, BuildError> {
+    let t = total.get(kind) ?? 0
+    if (limits.raise.get(kind) ?? -1) < 0 {
+        if derivation > t {
+            total[kind] = derivation
+        }
+        return
+    }
+    if t < derivation {
+        return BuildError(message: "{name}: the image's {slab_kind_name(kind)} come to {t}, below {derivation}: {why}")
+    }
+    return
+}
+
+/// The slab a quota kind draws from, by `SlabKind` value. `handle` has none.
+func quota_slab(q: Int) -> Int {
+    match q {
+        case 0 -> THREADS,
+        case 1 -> EVENTS,
+        case 2 -> WAITERS,
+        case 3 -> TIMERS,
+        case 4 -> MEMORIES,
+        case 5 -> IOMEMORIES,
+        case 6 -> MAPPINGS,
+        case 8 -> PIPES,
+        case _ -> -1,
+    }
+}

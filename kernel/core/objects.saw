@@ -754,11 +754,57 @@ func set_limit(p: Int, kind: QuotaKind, value: UInt16) unsafe {
     PROCESS_RECORDS[p].quota_limit[quota_column(kind)] = value
 }
 
+/// `kcore.limits`' compiled default for `kind`: what a child starts with on an
+/// image that carries no slab block.
+public(package) func compiled_quota_default(kind: QuotaKind) -> Int {
+    match kind {
+        case Thread -> DEFAULT_QUOTA_THREADS,
+        case Event -> DEFAULT_QUOTA_EVENTS,
+        case Waiter -> DEFAULT_QUOTA_WAITERS,
+        case Timer -> DEFAULT_QUOTA_TIMERS,
+        case Memory -> DEFAULT_QUOTA_MEMORIES,
+        case IoMemory -> DEFAULT_QUOTA_IOMEMORIES,
+        case Mapping -> DEFAULT_QUOTA_MAPPINGS,
+        case Handle -> DEFAULT_QUOTA_HANDLES,
+        case Pipe -> DEFAULT_QUOTA_PIPES,
+    }
+}
+
+/// The quota defaults the image's slab block carries, one per ledger column,
+/// once `IMAGE_QUOTA_SET` says the block was read. Written only by
+/// `set_image_quota_defaults`, before the first process exists.
+unsafe static var IMAGE_QUOTA_DEFAULTS: [Int; QUOTA_KINDS] = [0; QUOTA_KINDS]
+
+/// Whether the image carried a slab block, and so its own quota defaults.
+unsafe static var IMAGE_QUOTA_SET: Bool = false
+
+/// Replace the defaults every child starts with by the image's, `defaults`
+/// holding one per ledger column. `kcore.areas` calls it once, at boot, with
+/// numbers it has already held to their bounds (spec §12).
+public(package) func set_image_quota_defaults(defaults: &[Int; QUOTA_KINDS]) unsafe {
+    var i: Int = 0
+    while i < QUOTA_KINDS {
+        IMAGE_QUOTA_DEFAULTS[i] = defaults[i]
+        i = i + 1
+    }
+    IMAGE_QUOTA_SET = true
+}
+
+/// The row a child starts with for `kind`: the image's default when its slab
+/// block carried one, and the compiled default otherwise (spec §2.9).
+func child_quota_default(kind: QuotaKind) unsafe -> UInt16 {
+    if IMAGE_QUOTA_SET {
+        return IMAGE_QUOTA_DEFAULTS[quota_column(kind)] as UInt16
+    }
+    compiled_quota_default(kind) as UInt16
+}
+
 /// Give process `p` its allowance, and zero what it has spent.
 ///
 /// Root's cap is the machine, so every row but the mapping row is
-/// `QUOTA_UNLIMITED` and the slab is what refuses it. A child gets
-/// `kcore.limits`' documented defaults, all visibly under their slabs.
+/// `QUOTA_UNLIMITED` and the slab is what refuses it. A child gets the image's
+/// quota defaults (`child_quota_default`), all under their slabs' capacities
+/// at boot.
 ///
 /// The mapping row is clamped for both. `free_rows` is what the target's domain
 /// has left after its image spent its own, which no `static_assert` can know
@@ -767,7 +813,8 @@ func set_limit(p: Int, kind: QuotaKind, value: UInt16) unsafe {
 /// construction, so `install_row` cannot meet the physical wall with quota
 /// headroom left and its `fatal` is a consequence rather than a hope. Root is
 /// capped too: the row budget is the machine, stated in the ledger's
-/// vocabulary.
+/// vocabulary, and so is the Mapping slab's capacity, which root's row is read
+/// against at boot, when nothing has donated to it.
 ///
 /// Call once per process life (at boot for root, at `process_create` for a
 /// child), always after the image's rows are recorded, because `free_rows` is
@@ -789,20 +836,25 @@ public(package) func install_quota_limits(p: Int, root: Bool, free_rows: Int) un
         set_limit(p, QuotaKind.Handle, QUOTA_UNLIMITED)
         set_limit(p, QuotaKind.Pipe, QUOTA_UNLIMITED)
     } else {
-        set_limit(p, QuotaKind.Thread, DEFAULT_QUOTA_THREADS as UInt16)
-        set_limit(p, QuotaKind.Event, DEFAULT_QUOTA_EVENTS as UInt16)
-        set_limit(p, QuotaKind.Waiter, DEFAULT_QUOTA_WAITERS as UInt16)
-        set_limit(p, QuotaKind.Timer, DEFAULT_QUOTA_TIMERS as UInt16)
-        set_limit(p, QuotaKind.Memory, DEFAULT_QUOTA_MEMORIES as UInt16)
-        set_limit(p, QuotaKind.IoMemory, DEFAULT_QUOTA_IOMEMORIES as UInt16)
-        set_limit(p, QuotaKind.Handle, DEFAULT_QUOTA_HANDLES as UInt16)
-        set_limit(p, QuotaKind.Pipe, DEFAULT_QUOTA_PIPES as UInt16)
+        set_limit(p, QuotaKind.Thread, child_quota_default(QuotaKind.Thread))
+        set_limit(p, QuotaKind.Event, child_quota_default(QuotaKind.Event))
+        set_limit(p, QuotaKind.Waiter, child_quota_default(QuotaKind.Waiter))
+        set_limit(p, QuotaKind.Timer, child_quota_default(QuotaKind.Timer))
+        set_limit(p, QuotaKind.Memory, child_quota_default(QuotaKind.Memory))
+        set_limit(p, QuotaKind.IoMemory,
+                  child_quota_default(QuotaKind.IoMemory))
+        set_limit(p, QuotaKind.Handle, child_quota_default(QuotaKind.Handle))
+        set_limit(p, QuotaKind.Pipe, child_quota_default(QuotaKind.Pipe))
     }
 
     // A record that somehow holds more rows than the profile grants would make
     // this negative, and a negative allowance is not a number — zero is.
     let rows = if free_rows < 0 { 0 } else { free_rows }
-    let want = if root { MAX_MAPPINGS } else { DEFAULT_QUOTA_MAPPINGS }
+    let want = if root {
+        MAPPINGS.capacity()
+    } else {
+        child_quota_default(QuotaKind.Mapping) as Int
+    }
     let mappings = if want < rows { want } else { rows }
     set_limit(p, QuotaKind.Mapping, mappings as UInt16)
 }

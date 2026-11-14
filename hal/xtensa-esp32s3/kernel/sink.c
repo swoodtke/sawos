@@ -49,6 +49,22 @@ u32 sos_region_table_end(void) {
     return (u32)(unsigned long)_region_table_end;
 }
 
+// ---- the kernel's own zeroed memory ---------------------------------------
+//
+// C because: a linker symbol's address (reason 2). `[_bss_start, _arena_start)`
+// is the `.bss` input sections, where the build links an image's slab areas;
+// the arena and the boot stack behind them are not part of it.
+
+extern unsigned char _bss_start[];
+extern unsigned char _arena_start[];
+
+u32 sos_kernel_bss_start(void) {
+    return (u32)(unsigned long)_bss_start;
+}
+u32 sos_kernel_arena_start(void) {
+    return (u32)(unsigned long)_arena_start;
+}
+
 // ---- the core's interrupt registers ---------------------------------------
 //
 // C because: special registers (reason 1). INTENABLE gates each CPU interrupt

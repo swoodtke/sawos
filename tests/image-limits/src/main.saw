@@ -1,0 +1,188 @@
+// An image raises what a machine boots with, before any donation.
+//
+// The transcript:
+//
+//   SOS imglimits: waiters before any donation=5
+//   SOS imglimits: the next waiter refused: no room for what was asked
+//   SOS imglimits: children before any donation=3
+//   SOS imglimits: the next child refused: no room for what was asked
+//   SOS imglimits: memory donations taken=3
+//   SOS imglimits: the next donation refused: no room for what was asked
+//   SOS imglimits: done
+//
+// The case's image raises the Waiter slab by one slot over its floor of four,
+// the body slab by one over its floor of three, and the Memory slab by four,
+// and the kernel installs each linked area as one extent of its slab before
+// root exists (spec §12). Three claims follow, each a count the slab's
+// capacity decides and no profile's slot size moves.
+//
+//  1. The capacity at boot is the floor plus the area. Root makes Waiters
+//     until the slab refuses, and holds five; then process bodies, and with
+//     root's own that is four, so three children are made where the floor
+//     holds two. Every one of those is made before anything is donated.
+//
+//  2. An area is an extent. A slab takes `MAX_SLAB_EXTENTS` (four) donated
+//     extents, and the Memory slab's area is one of them, so three donations
+//     to it are taken and the fourth answers `NoResource`, a page of Memory
+//     slots being far below the slab's ceiling.
+//
+//  3. A donation after the areas still works, which is the second claim's
+//     first half: a slab an image raised grows at run time as any other.
+//
+// The children are created and never started: a body is spent at the create,
+// and each is made from the one image into the one destination, which a
+// create may name again. They are released before the donations.
+
+import sos.{System, Process, Memory, Pool, SlabKind, Waiter, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// One donation: a page, a multiple of every profile's protection grain.
+static GIFT: UInt = 0x1000
+
+/// How many donations root tries: one more than a slab with an area has
+/// extents for.
+static GIFTS: UInt = 4
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS imglimits: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The build's region table, in `_region_rows`' order: the child's image
+    // blob, its destination, then the RAM pool.
+    var image_rec = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS imglimits: no image\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest_rec = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS imglimits: no destination\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_rec = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS imglimits: no pool\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image = image_rec.take_memory() else {
+        let _ = system.debug_print("SOS imglimits: the image is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest = dest_rec.take_memory() else {
+        let _ = system.debug_print("SOS imglimits: the destination is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_rec.take_pool() else {
+        let _ = system.debug_print("SOS imglimits: the pool is not a pool\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // ---- Claim 1: Waiters ---------------------------------------------------
+    let w1 = try proc.waiter_create() catch {
+        print("SOS imglimits: waiter 1 refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let w2 = try proc.waiter_create() catch {
+        print("SOS imglimits: waiter 2 refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let w3 = try proc.waiter_create() catch {
+        print("SOS imglimits: waiter 3 refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let w4 = try proc.waiter_create() catch {
+        print("SOS imglimits: waiter 4 refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let w5 = try proc.waiter_create() catch {
+        print("SOS imglimits: waiter 5 refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS imglimits: waiters before any donation=5\n")
+    match proc.waiter_create() {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS imglimits: a sixth waiter was made\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> print("SOS imglimits: the next waiter refused: {}\n", e),
+    }
+    let _ = move w5
+    let _ = move w4
+    let _ = move w3
+    let _ = move w2
+    let _ = move w1
+
+    // ---- Claim 1: process bodies --------------------------------------------
+    let c1 = try system.process_create(image: &image, memory: &dest) catch {
+        print("SOS imglimits: child 1 refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let c2 = try system.process_create(image: &image, memory: &dest) catch {
+        print("SOS imglimits: child 2 refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let c3 = try system.process_create(image: &image, memory: &dest) catch {
+        print("SOS imglimits: child 3 refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS imglimits: children before any donation=3\n")
+    match system.process_create(image: &image, memory: &dest) {
+        case Ok(_) -> {
+            let _ = system.debug_print("SOS imglimits: a fourth child was made\n")
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        },
+        case Err(e) -> print("SOS imglimits: the next child refused: {}\n", e),
+    }
+    let _ = move c3
+    let _ = move c2
+    let _ = move c1
+
+    // ---- Claims 2 and 3: the Memory slab's extents --------------------------
+    var taken: UInt = 0
+    var i: UInt = 0
+    while i < GIFTS {
+        let gift = try pool.allocate(len: GIFT) catch {
+            print("SOS imglimits: no page to donate: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        match system.slab_donate(kind: SlabKind.Memories, memory: move gift) {
+            case Ok(_) -> { taken = taken + 1 },
+            case Err(refused) -> {
+                // A refused donation consumes nothing: the page comes back.
+                let (why, page) = move refused
+                let _ = move page
+                print("SOS imglimits: memory donations taken={}\n", taken)
+                print("SOS imglimits: the next donation refused: {}\n", why)
+                let _ = system.debug_print("SOS imglimits: done\n")
+                let _ = proc.exit(EXIT_OK)
+                let _ = system.shutdown(EXIT_FAILED)
+                return
+            },
+        }
+        i = i + 1
+    }
+    print("SOS imglimits: every donation was taken, {} of them\n", taken)
+    let _ = system.shutdown(EXIT_FAILED)
+}
