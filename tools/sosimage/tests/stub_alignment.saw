@@ -1,0 +1,76 @@
+// The child-image stub's alignment: a blob that a pool row names is placed on
+// a page and padded to one, so the pool's longest run is the whole blob; a
+// blob an ordinary row names is only word-aligned like the rest.
+
+import sosimage.build.{regions_stub}
+import sosimage.image.{ImageSpec}
+import sosimage.profile.{Profile}
+
+func profile() -> Profile {
+    try! Profile.parse("\{\"version\": 1, \"triple\": \"riscv32-unknown-none-elf\", \"word_bytes\": 4, \"sawc\": [\"/bin/sawc\"], \"clang\": \"/bin/clang\", \"lld\": \"/bin/ld.lld\", \"cc_args\": [], \"module_paths\": [], \"linker_script\": \"/virt.ld\"\}", "p.json")
+}
+
+// An image with two children, child 0's blob named by a row of `kind0` and
+// child 1's by one of `kind1`.
+func spec(kind0: String, kind1: String) -> ImageSpec {
+    try! ImageSpec.parse("\{\"version\": 1, \"name\": \"n\", \"kernel\": \"/k.o\", \"staging\": \"/s\", \"output\": \"/o\", \"children\": [\"/c0.sosimg\", \"/c1.sosimg\"], \"regions\": \{\"flags\": 0, \"rows\": [\{\"what\": \"a\", \"kind\": \"{kind0}\", \"blob\": 0\}, \{\"what\": \"b\", \"kind\": \"{kind1}\", \"blob\": 1\}]\}\}", "t.json")
+}
+
+// The stub's lines from the one that starts with `from` through the one that
+// starts with `to`, joined with newlines.
+func between(lines: &Vector<String>, from: String, to: String) -> String {
+    var out = ""
+    var on = false
+    var i = 0
+    while i < lines.len() {
+        let line = lines.get(i)!
+        if line.starts_with(from) {
+            on = true
+        }
+        if on {
+            out = "{out}{line}\n"
+        }
+        if on && line.starts_with(to) {
+            return out
+        }
+        i = i + 1
+    }
+    out
+}
+
+func expect(got: String, want: String) {
+    if not got.equals(want) {
+        print("expected: {want}")
+        print("got:      {got}")
+    }
+    assert(got.equals(want), "the stub's text")
+}
+
+func main() {
+    let p = profile()
+    // A pool blob is on a page before it and padded to one after it; an
+    // ordinary row's blob has neither.
+    let mixed = spec("pool", "ram")
+    let lines = try! regions_stub(&p, &mixed)
+    expect(between(&lines, "    .balign 4096", "_sos_child0_end:"),
+           "    .balign 4096\n_sos_child0_start:\n    .incbin \"/c0.sosimg\"\n    .balign 4096\n_sos_child0_end:\n")
+    expect(between(&lines, "_sos_child1_start:", "_sos_child1_end:"),
+           "_sos_child1_start:\n    .incbin \"/c1.sosimg\"\n_sos_child1_end:\n")
+    var pages = 0
+    var i = 0
+    while i < lines.len() {
+        if lines.get(i)!.contains("4096") {
+            pages = pages + 1
+        }
+        i = i + 1
+    }
+    assert(pages == 2, "only the pool blob is page-aligned, before and after")
+
+    // The alignment follows the row, not the position.
+    let flipped = spec("ram", "pool")
+    let other = try! regions_stub(&p, &flipped)
+    expect(between(&other, "_sos_child0_start:", "_sos_child0_end:"),
+           "_sos_child0_start:\n    .incbin \"/c0.sosimg\"\n_sos_child0_end:\n")
+    expect(between(&other, "    .balign 4096", "_sos_child1_end:"),
+           "    .balign 4096\n_sos_child1_start:\n    .incbin \"/c1.sosimg\"\n    .balign 4096\n_sos_child1_end:\n")
+}
