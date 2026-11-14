@@ -6,10 +6,12 @@ develop here.
 
 ## Repo map
 ```
-kernel/            # main.saw (the kernel entry) + rootimg.S (stitches the root
-                   # image in) + core/ (`kcore`, the arch-free kernel every
-                   # image shares: console, ktrap, object-op dispatch, the
-                   # sosimg loader; core/lib.saw is its facade)
+kernel/            # main.saw (the kernel entry) + rootimg.S (the root-image
+                   # stub of the runner's own image build, for
+                   # `SOS_IMAGE_BUILDER=python`) + core/ (`kcore`, the
+                   # arch-free kernel every image shares: console, ktrap,
+                   # object-op dispatch, the sosimg loader; core/lib.saw is
+                   # its facade)
 kernel/abi/        # kernel-internal: every op number/right/status, one place
 kernel/sysapi/     # the public `sos` module exported to userspace (vDSO
                    # discipline: numbers are not ABI)
@@ -44,8 +46,17 @@ rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 root/              # the root server: a real Blade package, sosimg emit
 tests/             # kernel entries, test packages, hand-assembled payloads
-tools/             # sos_runner.py (build+boot harness, QEMU, every profile)
-                   # + toolchain.py (the sawlang resolver) + sosimg_dump.py
+tools/             # sos_runner.py (the harness: packages, cases, QEMU, every
+                   # profile) + toolchain.py (the sawlang resolver) +
+                   # sosimg_dump.py
+tools/sosimage/    # the image builder, a hosted Saw package Blade builds: it
+                   # compiles a kernel, stitches root's image, the child
+                   # images and the boot region table into it and links it,
+                   # and on the ESP32-S3 writes the flash image; src/main.saw
+                   # lists its commands, tests/ its own tests
+.sawlang           # (git-ignored) the runner's link to the sawlang checkout
+                   # the toolchain resolved; the builder's manifest reaches
+                   # `imgformat` through it
 ```
 
 ## The toolchain
@@ -76,6 +87,19 @@ make sos-test        # tools/sos_runner.py: builds the kernel and root,
                      # stitches them, boots three profiles under QEMU —
                      # riscv32, arm64 and riscv32-flat. The full suite.
 ```
+The runner does not build images itself: `tools/sosimage/` does. The runner
+builds Blade, points `.sawlang` at the resolved checkout, builds the builder
+(`blade build --force` in `tools/sosimage/`), and in a full `make sos-test`
+runs its own tests (`blade test` there: the description readers' refusals, the
+region table's bytes, the in-place check), which need no emulator and print
+nothing when they pass. Per profile it writes a profile description (JSON)
+and calls `sosimage native`, then `sosimage kernel` once for each kernel entry
+the cases use; per case it writes an image description into the case's
+staging directory and calls `sosimage link`. `src/profile.saw` and
+`src/image.saw` state the two schemas. A builder failure is the case's build
+error, with the builder's message. `SOS_IMAGE_BUILDER=python` builds every
+image through the runner's own code instead, so the two can be compared.
+
 Implementers run targeted tests while implementing: the cases the change
 affects, selected with `--case a,b` (comma-separated or repeated) and, for one
 profile, `--arch NAME`:

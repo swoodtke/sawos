@@ -1,0 +1,136 @@
+// The in-place check over a flash image: a resident image linked where its
+// bytes sit passes, and each way of not being so is refused with its message.
+
+import std.data.{Data}
+import sosimage.flash.{check_in_place}
+import sosimage.profile.{FlashLayout}
+
+func layout() -> FlashLayout {
+    FlashLayout(bytes: 0x2000, instruction_window: 0x4200_0000,
+                data_window: 0x3C00_0000, window_bytes: 0x200_0000,
+                magic_offset: 0x400, magic: 0xAEDB_041D)
+}
+
+func put(image: &var Data, at: Int, value: UInt64, bytes: Int) {
+    var rest = value
+    var i = 0
+    while i < bytes {
+        try! image.set(at + i, (rest & 0xFF) as UInt8)
+        rest = rest >> 8
+        i = i + 1
+    }
+}
+
+// A flash image holding one sosimg at flash offset 0x1000: its header, and
+// segment `k` loading at `loads[k]` with `flags[k]`, its bytes at image
+// offset 0x60 + 0x20 * k, 0x10 of them (none for a zero-filled one).
+func flash_with(loads: [UInt64; 3], flags: [UInt64; 3], file_lens: [UInt64; 3],
+                count: UInt64, magic: UInt64) -> Data {
+    var image = Data()
+    var n = 0
+    while n < 0x2000 {
+        try! image.push(0xFF)
+        n = n + 1
+    }
+    let base = 0x1000
+    put(&var image, base, magic, 4)
+    put(&var image, base + 4, 3, 2)
+    put(&var image, base + 6, count, 1)
+    var k = 0
+    while k < 3 {
+        let seg = base + 24 + 24 * k
+        put(&var image, seg, loads[k], 8)
+        put(&var image, seg + 8, (0x60 + 0x20 * k) as UInt64, 4)
+        put(&var image, seg + 12, file_lens[k], 4)
+        put(&var image, seg + 16, 0x10, 4)
+        put(&var image, seg + 20, flags[k], 1)
+        k = k + 1
+    }
+    move image
+}
+
+func symbols_for(start: UInt, end: UInt) -> Map<String, UInt> {
+    var symbols = Map<String, UInt>()
+    let _ = try! symbols.insert("_payload_data_start", start)
+    let _ = try! symbols.insert("_payload_data_end", end)
+    move symbols
+}
+
+func verdict(image: &Data, start: UInt, end: UInt) -> String {
+    let symbols = symbols_for(start, end)
+    let l = layout()
+    match check_in_place("case", &symbols, &image, &l) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect(got: String, want: String) {
+    if not got.equals(want) {
+        print("expected: {want}")
+        print("got:      {got}")
+    }
+    assert(got.equals(want), "the check's verdict")
+}
+
+static SOSI: UInt64 = 0x4953_4F53
+static RX: UInt64 = 5
+static R: UInt64 = 1
+static RW: UInt64 = 3
+
+func main() {
+    let start: UInt = 0x3C00_1000
+    let end: UInt = 0x3C00_1100
+    // Code at the instruction-window name of its bytes, read-only data at
+    // the data-window name of its own, and writable data in DRAM: in place.
+    let good = flash_with([0x4200_1060, 0x3C00_1080, 0x3FC8_8000], [RX, R, RW],
+                          [0x10, 0x10, 0x10], 3, SOSI)
+    expect(verdict(&good, start, end), "")
+    // Nothing to check when root's image is empty.
+    expect(verdict(&good, start, start), "")
+
+    // Code linked at another slot's address.
+    let moved = flash_with([0x4218_0060, 0x3C00_1080, 0x3FC8_8000], [RX, R, RW],
+                           [0x10, 0x10, 0x10], 3, SOSI)
+    expect(verdict(&moved, start, end),
+           "case: root's image's segment 0 is linked at 0x42180060, but its bytes sit at flash 0x1060, whose instruction-window address is 0x42001060")
+    // ...and with a segment count the scripts do not make, the hint says so.
+    let four = flash_with([0x4218_0060, 0x3C00_1080, 0x3FC8_8000], [RX, R, RW],
+                          [0x10, 0x10, 0x10], 2, SOSI)
+    expect(verdict(&four, start, end),
+           "case: root's image's segment 0 is linked at 0x42180060, but its bytes sit at flash 0x1060, whose instruction-window address is 0x42001060; it has 2 segments, and the board's user linker scripts link an image for three")
+    // Read-only data at the wrong data-window address.
+    let data_off = flash_with([0x4200_1060, 0x3C00_2080, 0x3FC8_8000], [RX, R, RW],
+                              [0x10, 0x10, 0x10], 3, SOSI)
+    expect(verdict(&data_off, start, end),
+           "case: root's image's segment 1 is linked at 0x3c002080, but its bytes sit at flash 0x1080, whose data-window address is 0x3c001080")
+    // Writable data in place in flash.
+    let writable = flash_with([0x4200_1060, 0x3C00_1080, 0x3FC8_8000], [RX, RW, RW],
+                              [0x10, 0x10, 0x10], 3, SOSI)
+    expect(verdict(&writable, start, end),
+           "case: root's image's segment 1 is writable and linked in flash, at 0x3c001080")
+    // A zero-filled segment linked in flash.
+    let zeroed = flash_with([0x4200_1060, 0x3C00_1080, 0x3FC8_8000], [RX, R, RW],
+                            [0x10, 0, 0x10], 3, SOSI)
+    expect(verdict(&zeroed, start, end),
+           "case: root's image's segment 1 has no bytes in the image and is linked in flash, at 0x3c001080: its 16 bytes are zero-filled at load, which flash cannot take, so it must be linked in DRAM")
+    // Bytes that are not a sosimg, an image shorter than a header, and one
+    // held outside the data window.
+    let foreign = flash_with([0x4200_1060, 0x3C00_1080, 0x3FC8_8000], [RX, R, RW],
+                             [0x10, 0x10, 0x10], 3, 0x464C_457F)
+    expect(verdict(&foreign, start, end), "case: root's image at flash 0x1000 is not a sosimg")
+    expect(verdict(&good, start, start + 8),
+           "case: root's image at flash 0x1000 is 8 bytes, shorter than a sosimg header")
+    expect(verdict(&good, 0x3FC8_0000, 0x3FC8_0100),
+           "case: root's image is held at 0x3fc80000..0x3fc80100, outside the flash data window, where the kernel reads every image")
+
+    // A child image is read the same way, by its own symbols.
+    var with_child = symbols_for(start, start)
+    let _ = try! with_child.insert("_sos_child0_start", start)
+    let _ = try! with_child.insert("_sos_child0_end", end)
+    let l = layout()
+    match check_in_place("case", &with_child, &moved, &l) {
+        case Ok(_) -> assert(false, "child 0 is not in place"),
+        case Err(e) -> expect(e.message, "case: child 0's image's segment 0 is linked at 0x42180060, but its bytes sit at flash 0x1060, whose instruction-window address is 0x42001060")
+    }
+}

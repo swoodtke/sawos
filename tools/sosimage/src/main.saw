@@ -1,0 +1,64 @@
+//! sosimage: builds an SOS kernel image.
+//!
+//!     sosimage native PROFILE
+//!         compiles the profile's native units, each to its object
+//!     sosimage kernel PROFILE ENTRY OUTPUT
+//!         compiles the kernel entry ENTRY to the object OUTPUT
+//!     sosimage link PROFILE IMAGE
+//!         stitches root's image, the child images and the region table into
+//!         the kernel and links the image IMAGE describes; for a flash board
+//!         it then writes the flash image and prints
+//!         `flash used=USED end=END`, the bytes the ELF placed in it and the
+//!         offset one past the last of them
+//!
+//! PROFILE and IMAGE are JSON files: `sosimage.profile` and `sosimage.image`
+//! state their schemas. A failure prints `error: ` and its reason on standard
+//! output and exits 1.
+
+import std.env.{Env}
+import sosimage.build.{build_kernel, build_native, link}
+import sosimage.failure.{BuildError}
+import sosimage.image.{ImageSpec}
+import sosimage.profile.{Profile}
+import sosimage.tool.{read_text}
+
+// The reason is printed here rather than returned from `main`, whose error
+// path cuts a long message short, and a failed tool's reason carries
+// everything the tool printed.
+func main() -> Int {
+    try run() catch {
+        print("error: {error}")
+        return 1
+    }
+    0
+}
+
+func run() -> Result<Void, BuildError> {
+    let args = try Env.args() catch {
+        return BuildError(message: "could not read the arguments: {error}")
+    }
+    let command = args.get(1) ?? ""
+    if command.equals("native") && args.len() == 3 {
+        let profile = try load_profile(args.get(2) ?? "")
+        return build_native(&profile)
+    }
+    if command.equals("kernel") && args.len() == 5 {
+        let profile = try load_profile(args.get(2) ?? "")
+        return build_kernel(&profile, args.get(3) ?? "", args.get(4) ?? "")
+    }
+    if command.equals("link") && args.len() == 4 {
+        let profile = try load_profile(args.get(2) ?? "")
+        let path = args.get(3) ?? ""
+        let spec = try ImageSpec.parse(try read_text(path), path)
+        let linked = try link(&profile, &spec)
+        if not linked.flash.is_empty() {
+            print("flash used={linked.used} end={linked.end}")
+        }
+        return
+    }
+    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE")
+}
+
+func load_profile(path: String) -> Result<Profile, BuildError> {
+    Profile.parse(try read_text(path), path)
+}

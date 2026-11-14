@@ -1,0 +1,215 @@
+//! The boot region table: its wire format, and the assembly that puts it in
+//! an image.
+//!
+//! Version 4, frozen: an 8-byte header (magic u32, version u16, row count u8,
+//! boot flags u8), then one 24-byte row per region (base u64, length u64,
+//! kind u8, seven reserved bytes), all little-endian. The header's size puts
+//! the first row on an 8-byte boundary and the row's padding keeps the next
+//! one there, which lets the kernel overlay a struct on the section. Kept in
+//! step with `kernel/core/process.saw`'s `RegionTableHeader`, `RegionRow` and
+//! `RegionKind`; the kernel accepts exactly this version.
+//!
+//! The table is encoded here as fields, each a number or a linker expression:
+//! a child image's row names the symbols bounding its blob, whose values only
+//! the linker knows. Every number becomes literal bytes in the assembly, so the
+//! bytes the kernel reads are the bytes `literal_bytes` computes, and the
+//! assembler fills in only the symbols.
+
+import sosimage.failure.{BuildError}
+import sosimage.hex.{hex, hex_padded}
+
+/// 'S','R','G','N' read little-endian.
+public static REGION_TABLE_MAGIC: UInt64 = 0x4E47_5253
+public static REGION_TABLE_VERSION: UInt64 = 4
+
+/// The header's boot flags bit that keeps the kernel from arming the
+/// scheduler tick, mirroring `kernel/core/process.saw`'s `BOOT_FLAG_NO_TICK`.
+public static BOOT_FLAG_NO_TICK: UInt64 = 1 << 0
+
+/// The most rows the header's one-byte count can describe.
+static MAX_ROWS: Int = 255
+static ROW_RESERVED_BYTES: Int = 7
+static BITS_PER_BYTE: UInt64 = 8
+static BYTE_MASK: UInt64 = 0xFF
+
+/// What the kernel mints for a row: a Memory for `Ram`, an IoMemory for
+/// `Device`, a Pool for `Pool`. The values are the kernel's `RegionKind`.
+public enum RegionKind: UInt8 {
+    case Ram = 0,
+    case Device = 1,
+    case Pool = 2,
+}
+
+extension RegionKind {
+    /// The kind a description names: `ram`, `device` or `pool`.
+    public static func named(name: String) -> RegionKind? {
+        if name.equals("ram") {
+            return RegionKind.Ram
+        }
+        if name.equals("device") {
+            return RegionKind.Device
+        }
+        if name.equals("pool") {
+            return RegionKind.Pool
+        }
+        None
+    }
+}
+
+/// One row's base or length: a number, or a linker expression.
+public struct RowWord {
+    value: UInt64
+    /// The linker expression, or "" when the word is `value`.
+    symbol: String
+}
+
+extension RowWord {
+    public static func number(value: UInt64) -> RowWord {
+        RowWord(value: value, symbol: "")
+    }
+
+    public static func linked(expression: String) -> RowWord {
+        RowWord(value: 0, symbol: expression)
+    }
+}
+
+/// One row of the table, with a comment saying what it is.
+public struct RegionRow {
+    what: String
+    base: RowWord
+    len: RowWord
+    kind: RegionKind
+}
+
+/// One field of the encoded table: `bytes` wide, holding `value`, or the
+/// linker expression `symbol` when that is not "".
+public struct TableField {
+    bytes: Int
+    value: UInt64
+    symbol: String
+    /// The comment the assembly carries above this field, or "".
+    note: String
+}
+
+extension TableField {
+    /// The field's little-endian bytes, or `None` when the linker decides
+    /// them.
+    public func literal_bytes(&self) -> Vector<UInt8>? {
+        if not self.symbol.is_empty() {
+            return None
+        }
+        var out = Vector<UInt8>()
+        var rest = self.value
+        var i = 0
+        while i < self.bytes {
+            try! out.push((rest & BYTE_MASK) as UInt8)
+            rest = rest >> BITS_PER_BYTE
+            i = i + 1
+        }
+        move out
+    }
+}
+
+/// The table for `rows` with boot flags `flags`, as fields in order.
+///
+/// `word_bytes` is the target's address width in bytes. A row's fields are
+/// 64-bit on every target, so both kernels read one layout; a 32-bit
+/// assembler has no 8-byte relocation to point at a symbol with, so there a
+/// linked field is its low half and a zero high half, which is the same bytes
+/// little-endian.
+public func encode_table(rows: &Vector<RegionRow>, flags: UInt64,
+                         word_bytes: Int) -> Result<Vector<TableField>, BuildError> {
+    if rows.len() > MAX_ROWS {
+        return BuildError(message: "the region table has {rows.len()} rows; its header counts at most {MAX_ROWS}")
+    }
+    if flags > BYTE_MASK {
+        return BuildError(message: "the region table's boot flags {hex(flags)} do not fit its one byte")
+    }
+    var out = Vector<TableField>()
+    try! out.push(TableField(bytes: 4, value: REGION_TABLE_MAGIC, symbol: "", note: "magic"))
+    try! out.push(TableField(bytes: 2, value: REGION_TABLE_VERSION, symbol: "", note: "version"))
+    try! out.push(TableField(bytes: 1, value: rows.len() as UInt64, symbol: "", note: "rows"))
+    try! out.push(TableField(bytes: 1, value: flags, symbol: "", note: "boot flags"))
+    var i = 0
+    while i < rows.len() {
+        guard let row = rows.get(i) else {
+            return BuildError(message: "internal: row {i} vanished")
+        }
+        try push_word(&var out, row.base, word_bytes, "row {i}: {row.what}")
+        try push_word(&var out, row.len, word_bytes, "")
+        try! out.push(TableField(bytes: 1, value: (row.kind as UInt8) as UInt64, symbol: "", note: ""))
+        try! out.push(TableField(bytes: ROW_RESERVED_BYTES, value: 0, symbol: "", note: ""))
+        i = i + 1
+    }
+    return move out
+}
+
+func push_word(out: &var Vector<TableField>, word: RowWord, word_bytes: Int,
+               note: String) -> Result<Void, BuildError> {
+    if word.symbol.is_empty() {
+        try! out.push(TableField(bytes: 8, value: word.value, symbol: "", note: note))
+        return
+    }
+    if word_bytes == 8 {
+        try! out.push(TableField(bytes: 8, value: 0, symbol: word.symbol, note: note))
+        return
+    }
+    if word_bytes == 4 {
+        try! out.push(TableField(bytes: 4, value: 0, symbol: word.symbol, note: note))
+        try! out.push(TableField(bytes: 4, value: 0, symbol: "", note: ""))
+        return
+    }
+    return BuildError(message: "a {word_bytes}-byte address has no assembler directive here")
+}
+
+/// The table's bytes when every field is a number; a linked field is
+/// refused, since only the linker knows it.
+public func table_bytes(fields: &Vector<TableField>) -> Result<Vector<UInt8>, BuildError> {
+    var out = Vector<UInt8>()
+    var i = 0
+    while i < fields.len() {
+        guard let field = fields.get(i) else {
+            return BuildError(message: "internal: field {i} vanished")
+        }
+        guard let bytes = field.literal_bytes() else {
+            return BuildError(message: "field {i} is the linker expression `{field.symbol}`")
+        }
+        var b = 0
+        while b < bytes.len() {
+            try! out.push(bytes.get(b) ?? 0)
+            b = b + 1
+        }
+        i = i + 1
+    }
+    return move out
+}
+
+/// The `.regions` section holding `fields`, as assembler lines.
+public func table_assembly(fields: &Vector<TableField>) -> Vector<String> {
+    var lines = Vector<String>()
+    try! lines.push("    .section .regions, \"a\", @progbits")
+    try! lines.push("    .balign 8")
+    var i = 0
+    while i < fields.len() {
+        guard let field = fields.get(i) else {
+            i = i + 1
+            continue
+        }
+        if not field.note.is_empty() {
+            try! lines.push("    /* {field.note} */")
+        }
+        if let bytes = field.literal_bytes() {
+            var listed = Vector<String>()
+            var b = 0
+            while b < bytes.len() {
+                try! listed.push(hex_padded((bytes.get(b) ?? 0) as UInt64, 2))
+                b = b + 1
+            }
+            try! lines.push("    .byte  {listed.join(", ")}")
+        } else {
+            try! lines.push("    .{field.bytes}byte {field.symbol}")
+        }
+        i = i + 1
+    }
+    move lines
+}

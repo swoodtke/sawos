@@ -1,0 +1,225 @@
+//! An image description: what one image is made of, as the runner states it
+//! for one case.
+//!
+//! The runner writes it into the case's staging directory as a JSON object:
+//!
+//!     {
+//!       "version": 1,
+//!       "name": "process_lifecycle",
+//!       "kernel": "/path/to/kernels/kernel-main.o",
+//!       "staging": "/path/to/.build/riscv32-unknown-none-elf/sos/process_lifecycle.image",
+//!       "output": "/path/to/.build/riscv32-unknown-none-elf/sos/process_lifecycle.elf",
+//!       "asm": "/path/to/tests/riscv32/payload_ok.S",
+//!       "root_image": "/path/to/root/.build/riscv32-unknown-none-elf/sos-root.sosimg",
+//!       "children": ["/path/to/tests/child-bye/.build/.../child-bye.sosimg"],
+//!       "regions": {
+//!         "flags": 1,
+//!         "rows": [
+//!           {"what": "child 0's image blob", "kind": "ram", "blob": 0},
+//!           {"what": "child 0's destination RAM", "kind": "ram",
+//!            "base": 2149842944, "len": 262144}
+//!         ]
+//!       },
+//!       "link_args": ["--defsym=_sos_semihosting=0"],
+//!       "flash": {"output": "/path/to/case.flash.bin", "check": true}
+//!     }
+//!
+//! - `version` is this schema's, and the builder reads only 1.
+//! - `name` names the image in messages.
+//! - `kernel` is the compiled kernel entry (`sosimage kernel`'s object).
+//! - `staging` is a directory of the case's own, where the builder writes the
+//!   stubs it generates and the objects it assembles.
+//! - `output` is the linked ELF.
+//! - `asm` is a hand-written payload assembled into the image (user code, or
+//!   a hand-assembled root image); `child_asm` a hand-written child image,
+//!   which defines `_sos_child0_start`, `_sos_child0_end` and
+//!   `_sos_child0_len` itself and is the image's one child.
+//! - `root_image` is root's sosimg, appended in the `.payload` section.
+//! - `children` are child sosimgs, appended in the `.childimg` section in
+//!   order; child `i`'s blob is bounded by `_sos_child<i>_start` and
+//!   `_sos_child<i>_end`.
+//! - `regions` is the boot region table, absent for an image that carries
+//!   none. `flags` is its boot flags byte. Each row has a `what`, its comment
+//!   in the stub, a `kind` (`ram`, `device` or `pool`), and either `blob`,
+//!   the index of the child whose image it covers, or a numeric `base` and
+//!   `len`. A blob row's base and length
+//!   are the linker's; a blob whose row is a pool is placed on a page boundary
+//!   and padded to one, so the pool's longest run is the whole blob.
+//! - `link_args` are given to the linker after `--gc-sections`.
+//! - `flash`, for a profile with a flash layout, writes the flash image to
+//!   `output`; `check` holds every resident image to its slot.
+//!
+//! Every path is absolute. `asm`, `child_asm`, `root_image`, `children`,
+//! `regions`, `link_args` and `flash` may be left out, and every other key is
+//! required, inside `regions`, its rows and `flash` too; an image has
+//! `children` or a `child_asm`, never both. An unknown key is refused.
+
+import std.json.{JsonValue}
+import sosimage.failure.{BuildError}
+import sosimage.fields.{Fields}
+import sosimage.regions.{RegionKind, RegionRow, RowWord}
+
+public static IMAGE_VERSION: Int = 1
+
+/// One row as described: a blob row names a child, any other row its numbers.
+public struct RowSpec {
+    what: String
+    kind: RegionKind
+    /// The child whose blob this row covers; a numeric row covers none.
+    blob: Int?
+    base: UInt64
+    len: UInt64
+}
+
+public struct FlashOutput {
+    output: String
+    check: Bool
+}
+
+public struct ImageSpec {
+    name: String
+    kernel: String
+    staging: String
+    output: String
+    asm: String
+    child_asm: String
+    root_image: String
+    children: Vector<String>
+    has_regions: Bool
+    flags: UInt64
+    rows: Vector<RowSpec>
+    link_args: Vector<String>
+    flash: FlashOutput?
+}
+
+@synthesize
+extension ImageSpec: ExplicitCopy {}
+
+extension ImageSpec {
+    /// Reads an image description from its JSON text; `origin` names it in
+    /// messages.
+    public static func parse(text: String, origin: String) -> Result<ImageSpec, BuildError> {
+        let doc = try JsonValue.parse(text) catch {
+            return BuildError(message: "{origin} is not JSON: {error}")
+        }
+        var top = try Fields(move doc, "the image {origin}")
+        let version = try top.integer("version")
+        if version != IMAGE_VERSION {
+            return BuildError(message: "the image {origin} is version {version}; this builder reads version {IMAGE_VERSION}")
+        }
+        let name = try top.text("name")
+        let kernel = try top.text("kernel")
+        let staging = try top.text("staging")
+        let output = try top.text("output")
+        let asm = try top.text_or("asm", "")
+        let child_asm = try top.text_or("child_asm", "")
+        let root_image = try top.text_or("root_image", "")
+        let children = try top.texts_or_empty("children")
+        if not child_asm.is_empty() && children.len() > 0 {
+            return BuildError(message: "the image {origin}: `child_asm` is the image's one child; it cannot have `children` too")
+        }
+        let child_count = if child_asm.is_empty() { children.len() } else { 1 }
+        var has_regions = false
+        var flags: UInt64 = 0
+        var rows = Vector<RowSpec>()
+        if var table = try top.object("regions", "the image's `regions`") {
+            has_regions = true
+            flags = try table.word("flags")
+            var specs = try table.objects("rows", "row")
+            var i = 0
+            while i < specs.len() {
+                try! rows.push(try read_row(&var specs[i], child_count))
+                i = i + 1
+            }
+            try table.finish()
+        }
+        let link_args = try top.texts_or_empty("link_args")
+        var flash: FlashOutput? = None
+        if var f = try top.object("flash", "the image's `flash`") {
+            flash = FlashOutput(output: try f.text("output"), check: try f.boolean("check"))
+            try f.finish()
+        }
+        try top.finish()
+        return ImageSpec(name: name, kernel: kernel, staging: staging,
+                         output: output, asm: asm, child_asm: child_asm,
+                         root_image: root_image, children: move children,
+                         has_regions: has_regions, flags: flags,
+                         rows: move rows, link_args: move link_args,
+                         flash: flash)
+    }
+
+    /// Whether child `i`'s blob row is a pool, which places the blob on a
+    /// page boundary.
+    public func blob_is_pool(&self, i: Int) -> Bool {
+        var r = 0
+        while r < self.rows.len() {
+            if let row = self.rows.get(r) {
+                if let b = row.blob {
+                    if b == i && row.kind == RegionKind.Pool {
+                        return true
+                    }
+                }
+            }
+            r = r + 1
+        }
+        false
+    }
+
+    /// The table's rows, with each blob row's words named by the symbols
+    /// bounding that child's blob. A hand-written child states its length as
+    /// a symbol of its own, since an assembler that cannot subtract two
+    /// symbols it does not define (Xtensa's) could not compute it.
+    public func region_rows(&self) -> Vector<RegionRow> {
+        var out = Vector<RegionRow>()
+        var r = 0
+        while r < self.rows.len() {
+            guard let spec = self.rows.get(r) else {
+                r = r + 1
+                continue
+            }
+            if let i = spec.blob {
+                let len = if self.child_asm.is_empty() {
+                    "_sos_child{i}_end - _sos_child{i}_start"
+                } else {
+                    "_sos_child{i}_len"
+                }
+                try! out.push(RegionRow(what: spec.what,
+                                        base: RowWord.linked("_sos_child{i}_start"),
+                                        len: RowWord.linked(len),
+                                        kind: spec.kind))
+            } else {
+                try! out.push(RegionRow(what: spec.what,
+                                        base: RowWord.number(spec.base),
+                                        len: RowWord.number(spec.len),
+                                        kind: spec.kind))
+            }
+            r = r + 1
+        }
+        move out
+    }
+}
+
+/// One row of `regions.rows`, which names a blob of one of `child_count`
+/// children or states its numbers, never both.
+func read_row(row: &var Fields, child_count: Int) -> Result<RowSpec, BuildError> {
+    let what = try row.text("what")
+    let kind_name = try row.text("kind")
+    guard let kind = RegionKind.named(kind_name) else {
+        return BuildError(message: "{row.what}: `kind` is `{kind_name}`, not ram, device or pool")
+    }
+    if row.has("blob") {
+        let blob = try row.integer("blob")
+        if blob < 0 || blob >= child_count {
+            return BuildError(message: "{row.what} names the blob of child {blob}, which the image does not have")
+        }
+        if row.has("base") || row.has("len") {
+            return BuildError(message: "{row.what} names a blob, whose base and length are the linker's, and numbers too")
+        }
+        try row.finish()
+        return RowSpec(what: what, kind: kind, blob: blob, base: 0, len: 0)
+    }
+    let base = try row.word("base")
+    let len = try row.word("len")
+    try row.finish()
+    return RowSpec(what: what, kind: kind, blob: None, base: base, len: len)
+}

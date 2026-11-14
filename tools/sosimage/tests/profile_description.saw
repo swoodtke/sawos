@@ -1,0 +1,62 @@
+// The profile description's reader: what it accepts, and each refusal by its
+// message.
+
+import sosimage.profile.{Profile}
+
+func profile_text(extra: String) -> String {
+    "\{\"version\": 1, \"triple\": \"riscv32-unknown-none-elf\", \"word_bytes\": 4, \"sawc\": [\"/bin/sawc\"], \"clang\": \"/bin/clang\", \"lld\": \"/bin/ld.lld\", \"cc_args\": [\"-march=rv32imac_zicsr\", \"-mabi=ilp32\"], \"module_paths\": [\"kcore=/k\"], \"native\": [\{\"source\": \"/b.S\", \"object\": \"/b.o\"\}], \"linker_script\": \"/virt.ld\"{extra}\}"
+}
+
+func refusal(text: String) -> String {
+    match Profile.parse(text, "p.json") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect_refusal(text: String, message: String) {
+    let got = refusal(text)
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the refusal's message")
+}
+
+func main() {
+    let p = try! Profile.parse(profile_text(""), "p.json")
+    assert(p.triple.equals("riscv32-unknown-none-elf"), "the triple")
+    assert(p.word_bytes == 4, "the word")
+    assert(p.features.is_empty(), "no features unless stated")
+    assert(p.kernel_c_args.len() == 0, "no kernel C arguments unless stated")
+    assert(p.native.len() == 1, "one native unit")
+    assert(p.native.get(0)!.object.equals("/b.o"), "its object")
+    assert(p.flash == None, "no flash layout unless stated")
+    let clang = p.clang_command()
+    assert(clang.len() == 4, "clang, the target, and the two cc_args")
+    assert(clang.get(1)!.equals("--target=riscv32-unknown-none-elf"), "the target first")
+
+    let flashed = try! Profile.parse(profile_text(", \"flash\": \{\"bytes\": 4194304, \"instruction_window\": 1107296256, \"data_window\": 1006632960, \"window_bytes\": 33554432, \"magic_offset\": 1024, \"magic\": 2933589021\}"), "p.json")
+    assert(flashed.flash!.magic == 0xAEDB_041D, "the flash layout's magic")
+
+    expect_refusal(profile_text(", \"opt\": \"-O2\""),
+                   "the profile p.json has unknown keys: `opt`")
+    expect_refusal(profile_text(", \"flash\": \{\"bytes\": 1\}"),
+                   "the profile's `flash` has no `instruction_window`")
+    expect_refusal(profile_text("").replace("\"version\": 1", "\"version\": 0"),
+                   "the profile p.json is version 0; this builder reads version 1")
+    expect_refusal(profile_text("").replace(", \"lld\": \"/bin/ld.lld\"", ""),
+                   "the profile p.json has no `lld`")
+    expect_refusal(profile_text("").replace(", \"cc_args\": [\"-march=rv32imac_zicsr\", \"-mabi=ilp32\"]", ""),
+                   "the profile p.json has no `cc_args`")
+    expect_refusal(profile_text("").replace("[\"kcore=/k\"]", "\"kcore=/k\""),
+                   "the profile p.json: `module_paths` is not an array")
+    expect_refusal(profile_text("").replace("\"word_bytes\": 4", "\"word_bytes\": 2"),
+                   "the profile p.json: `word_bytes` is 2, not 4 or 8")
+    expect_refusal(profile_text("").replace("[\"/bin/sawc\"]", "[]"),
+                   "the profile p.json: `sawc` names no program")
+    expect_refusal(profile_text("").replace("\"object\": \"/b.o\"", "\"output\": \"/b.o\""),
+                   "native unit 0 has no `object`")
+    expect_refusal(profile_text(", \"flash\": \{\"bytes\": -1\}"),
+                   "the profile's `flash`: `bytes` is negative (-1)")
+}

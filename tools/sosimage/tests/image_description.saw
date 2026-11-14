@@ -1,0 +1,95 @@
+// The image description's reader: what it accepts, and each refusal by its
+// message, since the message is what reaches the runner's report.
+
+import sosimage.failure.{BuildError}
+import sosimage.image.{ImageSpec}
+import sosimage.regions.{RegionKind}
+
+// A whole description, with `extra` spliced in after its last key.
+func described(extra: String) -> String {
+    "\{\"version\": 1, \"name\": \"pipe_pingpong\", \"kernel\": \"/k.o\", \"staging\": \"/s\", \"output\": \"/o.elf\", \"children\": [\"/c0.sosimg\"], \"regions\": \{\"flags\": 1, \"rows\": [\{\"what\": \"blob\", \"kind\": \"pool\", \"blob\": 0\}, \{\"what\": \"ram\", \"kind\": \"ram\", \"base\": 2149842944, \"len\": 262144\}]\}{extra}\}"
+}
+
+// The message a description is refused with, or "" when it is accepted.
+func refusal(text: String) -> String {
+    match ImageSpec.parse(text, "t.json") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect_refusal(text: String, message: String) {
+    let got = refusal(text)
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the refusal's message")
+}
+
+func main() {
+    // Accepted, with every row read as it was written.
+    let spec = try! ImageSpec.parse(described(""), "t.json")
+    assert(spec.name.equals("pipe_pingpong"), "the name")
+    assert(spec.children.len() == 1, "one child")
+    assert(spec.has_regions, "a region table")
+    assert(spec.flags == 1, "the boot flags")
+    assert(spec.rows.len() == 2, "two rows")
+    assert(spec.blob_is_pool(0), "child 0's blob row is a pool")
+    let rows = spec.region_rows()
+    let blob = rows.get(0)!
+    assert(blob.base.symbol.equals("_sos_child0_start"), "a blob's base is linked")
+    assert(blob.len.symbol.equals("_sos_child0_end - _sos_child0_start"),
+           "an appended blob's length is the difference of its bounds")
+    assert(blob.kind == RegionKind.Pool, "the kind as written")
+    let ram = rows.get(1)!
+    assert(ram.base.symbol.is_empty() && ram.base.value == 0x8024_0000, "a numeric base")
+    assert(ram.len.value == 0x4_0000, "a numeric length")
+
+    // A hand-written child names its own length.
+    let asm_child = try! ImageSpec.parse("\{\"version\": 1, \"name\": \"n\", \"kernel\": \"/k.o\", \"staging\": \"/s\", \"output\": \"/o\", \"child_asm\": \"/c.S\", \"regions\": \{\"flags\": 0, \"rows\": [\{\"what\": \"b\", \"kind\": \"ram\", \"blob\": 0\}]\}\}", "t.json")
+    assert(asm_child.region_rows().get(0)!.len.symbol.equals("_sos_child0_len"),
+           "a hand-written child's length is its own symbol")
+
+    // An unknown key, at the top and inside a row, named in byte order.
+    expect_refusal(described(", \"tick\": true, \"pool\": 1"),
+                   "the image t.json has unknown keys: `pool`, `tick`")
+    expect_refusal("\{\"version\": 1, \"name\": \"n\", \"kernel\": \"/k.o\", \"staging\": \"/s\", \"output\": \"/o\", \"regions\": \{\"flags\": 0, \"rows\": [\{\"what\": \"r\", \"kind\": \"ram\", \"base\": 1, \"len\": 2, \"size\": 3\}]\}\}",
+                   "row 0 has unknown keys: `size`")
+
+    // A version this builder does not read.
+    expect_refusal("\{\"version\": 2, \"name\": \"n\"\}",
+                   "the image t.json is version 2; this builder reads version 1")
+
+    // A required key missing, and one of the wrong type.
+    expect_refusal("\{\"version\": 1, \"name\": \"n\", \"staging\": \"/s\", \"output\": \"/o\"\}",
+                   "the image t.json has no `kernel`")
+    expect_refusal("\{\"version\": 1, \"name\": 7\}",
+                   "the image t.json: `name` is not a string")
+    expect_refusal("\{\"version\": 1, \"name\": \"n\", \"kernel\": \"/k.o\", \"staging\": \"/s\", \"output\": \"/o\", \"regions\": \{\"rows\": []\}\}",
+                   "the image's `regions` has no `flags`")
+    expect_refusal("\{\"version\": 1, \"name\": \"n\", \"kernel\": \"/k.o\", \"staging\": \"/s\", \"output\": \"/o\", \"regions\": \{\"flags\": 0\}\}",
+                   "the image's `regions` has no `rows`")
+    expect_refusal(described(", \"flash\": \{\"output\": \"/f.bin\", \"check\": 1\}"),
+                   "the image's `flash`: `check` is not true or false")
+
+    // Rows that cannot be built: a blob of a child the image does not have, a
+    // blob row with numbers too, a kind the kernel has no row for, and a
+    // numeric row with no length.
+    expect_refusal("\{\"version\": 1, \"name\": \"n\", \"kernel\": \"/k.o\", \"staging\": \"/s\", \"output\": \"/o\", \"regions\": \{\"flags\": 0, \"rows\": [\{\"what\": \"b\", \"kind\": \"ram\", \"blob\": 0\}]\}\}",
+                   "row 0 names the blob of child 0, which the image does not have")
+    expect_refusal(described(", \"link_args\": []").replace("\"blob\": 0", "\"blob\": 0, \"base\": 4"),
+                   "row 0 names a blob, whose base and length are the linker's, and numbers too")
+    expect_refusal(described("").replace("\"kind\": \"pool\"", "\"kind\": \"rom\""),
+                   "row 0: `kind` is `rom`, not ram, device or pool")
+    expect_refusal(described("").replace(", \"len\": 262144", ""),
+                   "row 1 has no `len`")
+
+    // One hand-written child or appended ones, never both.
+    expect_refusal(described(", \"child_asm\": \"/c.S\""),
+                   "the image t.json: `child_asm` is the image's one child; it cannot have `children` too")
+
+    // Not JSON at all, and JSON that is not an object.
+    assert(refusal("\{\"version\": 1,").starts_with("t.json is not JSON: "), "malformed JSON")
+    expect_refusal("[1]", "the image t.json is not a JSON object")
+}

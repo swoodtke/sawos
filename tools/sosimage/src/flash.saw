@@ -1,0 +1,338 @@
+//! A flash image built from a linked ELF32, and the check that every resident
+//! image in it is linked where its bytes sit.
+//!
+//! A board that boots from flash maps it twice: once for instruction fetches
+//! and once for loads. Each loadable segment's bytes are placed at the flash
+//! offset of its load address in the instruction window (spec §5b; the
+//! board's ABI.md says how its script makes that so), and the rest of the
+//! flash is erased bytes.
+
+import std.data.{Data}
+import imgformat.{SOSIMG_MAGIC, SegFlag}
+import sosimage.failure.{BuildError}
+import sosimage.hex.{hex, hex_padded}
+import sosimage.profile.{FlashLayout}
+
+static ERASED: UInt8 = 0xFF
+/// An esptool image header's first byte. A flash image starting with it is
+/// taken for one by the ROM, which then never reaches the direct-boot check.
+static ESPTOOL_HEADER_BYTE: UInt = 0xE9
+
+// The ELF32 fields read here, by offset: the file header's, a program
+// header's, a section header's and a symbol's.
+static ELF32_PHOFF: Int = 28
+static ELF32_SHOFF: Int = 32
+static ELF32_PHNUM: Int = 44
+static ELF32_SHENTSIZE: Int = 46
+static ELF32_SHNUM: Int = 48
+static ELF32_PHDR_BYTES: Int = 32
+static PH_TYPE: Int = 0
+static PH_OFFSET: Int = 4
+static PH_PADDR: Int = 12
+static PH_FILESZ: Int = 16
+static SH_TYPE: Int = 4
+static SH_OFFSET: Int = 16
+static SH_SIZE: Int = 20
+static SH_LINK: Int = 24
+static SH_ENTSIZE: Int = 36
+static ST_NAME: Int = 0
+static ST_VALUE: Int = 4
+static PT_LOAD: UInt = 1
+static SHT_SYMTAB: UInt = 2
+
+// The sosimg fields read here, by offset (`imgformat`'s `SosimgHeader` and
+// `SosimgSeg`).
+static SOSIMG_HEADER_BYTES: Int = 24
+static SOSIMG_SEG_BYTES: Int = 24
+static HEADER_MAGIC: Int = 0
+static HEADER_SEG_COUNT: Int = 6
+static SEG_LOAD: Int = 0
+static SEG_FILE_OFF: Int = 8
+static SEG_FILE_LEN: Int = 12
+static SEG_MEM_LEN: Int = 16
+static SEG_FLAGS: Int = 20
+/// How many segments the board's user linker scripts link an image for.
+static SCRIPTED_SEGMENTS: UInt = 3
+
+extension Data {
+    func u8_at(&self, off: Int) -> UInt? {
+        guard let b = self.get(off) else {
+            return None
+        }
+        b as UInt
+    }
+
+    func u16_at(&self, off: Int) -> UInt? {
+        guard let lo = self.u8_at(off) else {
+            return None
+        }
+        guard let hi = self.u8_at(off + 1) else {
+            return None
+        }
+        lo | (hi << 8)
+    }
+
+    func u32_at(&self, off: Int) -> UInt? {
+        guard let lo = self.u16_at(off) else {
+            return None
+        }
+        guard let hi = self.u16_at(off + 2) else {
+            return None
+        }
+        lo | (hi << 16)
+    }
+
+    func u64_at(&self, off: Int) -> UInt? {
+        guard let lo = self.u32_at(off) else {
+            return None
+        }
+        guard let hi = self.u32_at(off + 4) else {
+            return None
+        }
+        lo | (hi << 32)
+    }
+
+    /// A field the caller has already bounded, or a truncation refusal.
+    func field(&self, off: Int, bytes: Int, what: String) -> Result<UInt, BuildError> {
+        let got = if bytes == 1 {
+            self.u8_at(off)
+        } else if bytes == 2 {
+            self.u16_at(off)
+        } else if bytes == 4 {
+            self.u32_at(off)
+        } else {
+            self.u64_at(off)
+        }
+        guard let v = got else {
+            return BuildError(message: "{what} is truncated at byte {off}")
+        }
+        return v
+    }
+
+    /// The NUL-terminated string at `off`.
+    func c_string_at(&self, off: Int) -> String {
+        var end = off
+        while (self.u8_at(end) ?? 0) != 0 {
+            end = end + 1
+        }
+        guard let bytes = self.slice(off, end) else {
+            return ""
+        }
+        try bytes.to_string() catch { "" }
+    }
+}
+
+/// Every named symbol in a linked ELF32's symbol table, by value: among them
+/// the kernel's linker symbols that bound the images it carries.
+public func elf_symbols(elf: &Data, what: String) -> Result<Map<String, UInt>, BuildError> {
+    let shoff = try elf.field(ELF32_SHOFF, 4, what) as Int
+    let shentsize = try elf.field(ELF32_SHENTSIZE, 2, what) as Int
+    let shnum = try elf.field(ELF32_SHNUM, 2, what) as Int
+    var symbols = Map<String, UInt>()
+    var i = 0
+    while i < shnum {
+        let sh = shoff + shentsize * i
+        if (try elf.field(sh + SH_TYPE, 4, what)) == SHT_SYMTAB {
+            let offset = try elf.field(sh + SH_OFFSET, 4, what) as Int
+            let size = try elf.field(sh + SH_SIZE, 4, what) as Int
+            let link = try elf.field(sh + SH_LINK, 4, what) as Int
+            let entsize = try elf.field(sh + SH_ENTSIZE, 4, what) as Int
+            if entsize == 0 {
+                return BuildError(message: "{what}'s symbol table has entries of no size")
+            }
+            let strtab = try elf.field(shoff + shentsize * link + SH_OFFSET, 4, what) as Int
+            var at = offset
+            while at < offset + size {
+                let name = try elf.field(at + ST_NAME, 4, what) as Int
+                let value = try elf.field(at + ST_VALUE, 4, what)
+                let _ = try! symbols.insert(elf.c_string_at(strtab + name), value)
+                at = at + entsize
+            }
+        }
+        i = i + 1
+    }
+    return move symbols
+}
+
+/// What `flash_image` made: the image, how many bytes of it the ELF placed,
+/// and the offset one past the last of them, which is how much of it a board
+/// needs written.
+public struct FlashImage {
+    image: Data
+    used: Int
+    end: Int
+}
+
+extension FlashImage: NoCopy {}
+
+/// Places each loadable segment of `elf` at its flash offset, and checks that
+/// the direct-boot magic is there and that byte 0 is not an esptool header's.
+/// `name` and `script` name the image and its linker script in messages.
+public func flash_image(elf: &Data, layout: &FlashLayout, name: String,
+                        script: String) -> Result<FlashImage, BuildError> {
+    let flash_bytes = layout.bytes as Int
+    var image = try! Data(capacity: flash_bytes)
+    var n = 0
+    while n < flash_bytes {
+        try! image.push(ERASED)
+        n = n + 1
+    }
+    let what = "{name}'s linked image"
+    let phoff = try elf.field(ELF32_PHOFF, 4, what) as Int
+    let phnum = try elf.field(ELF32_PHNUM, 2, what) as Int
+    let ibus = layout.instruction_window as UInt
+    var used = 0
+    var end = 0
+    var i = 0
+    while i < phnum {
+        let ph = phoff + ELF32_PHDR_BYTES * i
+        let p_type = try elf.field(ph + PH_TYPE, 4, what)
+        let offset = try elf.field(ph + PH_OFFSET, 4, what) as Int
+        let paddr = try elf.field(ph + PH_PADDR, 4, what)
+        let filesz = try elf.field(ph + PH_FILESZ, 4, what)
+        i = i + 1
+        if p_type != PT_LOAD || filesz == 0 {
+            continue
+        }
+        if paddr < ibus || paddr + filesz > ibus + (flash_bytes as UInt) {
+            return BuildError(message: "{name}: a segment loads at {hex(paddr as UInt64)}, outside the flash window")
+        }
+        let at = (paddr - ibus) as Int
+        var b = 0
+        while b < (filesz as Int) {
+            guard let byte = elf.get(offset + b) else {
+                return BuildError(message: "{what}: a segment runs past the end of the file")
+            }
+            try! image.set(at + b, byte)
+            b = b + 1
+        }
+        used = used + (filesz as Int)
+        if at + (filesz as Int) > end {
+            end = at + (filesz as Int)
+        }
+    }
+    let magic_at = layout.magic_offset as Int
+    let m0 = try image.field(magic_at, 4, "the flash image")
+    let m1 = try image.field(magic_at + 4, 4, "the flash image")
+    let magic = layout.magic as UInt
+    if m0 != magic || m1 != magic {
+        return BuildError(message: "{name}: flash image lacks the direct-boot magic (read {hex_padded(m0 as UInt64, 8)} {hex_padded(m1 as UInt64, 8)}, want {hex_padded(magic as UInt64, 8)} twice) — check .magic in {script}")
+    }
+    if (image.u8_at(0) ?? 0) == ESPTOOL_HEADER_BYTE {
+        return BuildError(message: "{name}: flash byte 0 is 0xE9, an esptool image header; the ROM would not direct-boot it")
+    }
+    return FlashImage(image: image, used: used, end: end)
+}
+
+/// One resident image: what it is, and the data-window addresses bounding it.
+struct Resident {
+    what: String
+    start: UInt
+    end: UInt
+}
+
+/// Holds every resident image in `image` to its slot (spec §5.6), reading
+/// each back out of the flash image by the kernel's symbols bounding it.
+///
+/// Each executable segment must be linked at the instruction-window address
+/// of its own flash bytes, each other segment linked in flash at their
+/// data-window address and not writable, and nothing else linked in flash, a
+/// segment with no bytes in the image included. A segment linked outside both
+/// windows is copied into RAM, and the loader judges it. An image the kernel
+/// would not read through the data window is refused too. A mismatch names
+/// both numbers, since the loader would refuse the image at boot.
+public func check_in_place(name: String, symbols: &Map<String, UInt>,
+                           image: &Data, layout: &FlashLayout) -> Result<Void, BuildError> {
+    var residents = Vector<Resident>()
+    let root_start = try symbol(&symbols, "_payload_data_start", name)
+    let root_end = try symbol(&symbols, "_payload_data_end", name)
+    if root_end > root_start {
+        try! residents.push(Resident(what: "root's image", start: root_start, end: root_end))
+    }
+    var c = 0
+    while symbols.contains_key("_sos_child{c}_start") {
+        try! residents.push(Resident(
+            what: "child {c}'s image",
+            start: try symbol(&symbols, "_sos_child{c}_start", name),
+            end: try symbol(&symbols, "_sos_child{c}_end", name)))
+        c = c + 1
+    }
+    let ibus = layout.instruction_window as UInt
+    let dbus = layout.data_window as UInt
+    let window = layout.window_bytes as UInt
+    let flash_bytes = layout.bytes as UInt
+    var r = 0
+    while r < residents.len() {
+        guard let res = residents.get(r) else {
+            return BuildError(message: "internal: resident {r} vanished")
+        }
+        r = r + 1
+        let what = res.what
+        let start = res.start
+        let end = res.end
+        if not (dbus <= start && start <= end && end <= dbus + flash_bytes) {
+            return BuildError(message: "{name}: {what} is held at {hex(start as UInt64)}..{hex(end as UInt64)}, outside the flash data window, where the kernel reads every image")
+        }
+        let at = (start - dbus) as Int
+        let length = (end - start) as Int
+        guard let blob = image.slice(at, at + length) else {
+            return BuildError(message: "{name}: {what} at flash {hex(at as UInt64)} runs past the flash")
+        }
+        if blob.len() < SOSIMG_HEADER_BYTES {
+            return BuildError(message: "{name}: {what} at flash {hex(at as UInt64)} is {blob.len()} bytes, shorter than a sosimg header")
+        }
+        let magic = try blob.field(HEADER_MAGIC, 4, what)
+        let count = try blob.field(HEADER_SEG_COUNT, 1, what)
+        if magic != (SOSIMG_MAGIC as UInt) {
+            return BuildError(message: "{name}: {what} at flash {hex(at as UInt64)} is not a sosimg")
+        }
+        let hint = if count == SCRIPTED_SEGMENTS {
+            ""
+        } else {
+            "; it has {count} segments, and the board's user linker scripts link an image for three"
+        }
+        if blob.len() < SOSIMG_HEADER_BYTES + SOSIMG_SEG_BYTES * (count as Int) {
+            return BuildError(message: "{name}: {what}'s segment table runs past its end")
+        }
+        var k = 0
+        while k < (count as Int) {
+            let seg = SOSIMG_HEADER_BYTES + SOSIMG_SEG_BYTES * k
+            let load = try blob.field(seg + SEG_LOAD, 8, what)
+            let off = try blob.field(seg + SEG_FILE_OFF, 4, what)
+            let flen = try blob.field(seg + SEG_FILE_LEN, 4, what)
+            let mlen = try blob.field(seg + SEG_MEM_LEN, 4, what)
+            let flags = try blob.field(seg + SEG_FLAGS, 1, what)
+            let in_flash = (ibus <= load && load < ibus + window) ||
+                (dbus <= load && load < dbus + window)
+            let segment = k
+            k = k + 1
+            if (flags & (SegFlag.Device as UInt)) != 0 {
+                continue
+            }
+            if flen == 0 && in_flash {
+                return BuildError(message: "{name}: {what}'s segment {segment} has no bytes in the image and is linked in flash, at {hex(load as UInt64)}: its {mlen} bytes are zero-filled at load, which flash cannot take, so it must be linked in DRAM")
+            }
+            let executes = (flags & (SegFlag.Execute as UInt)) != 0
+            if not (executes || in_flash) {
+                continue
+            }
+            let bytes_at = (at as UInt) + off
+            let want = if executes { ibus + bytes_at } else { dbus + bytes_at }
+            let where_ = if executes { "instruction" } else { "data" }
+            if load != want {
+                return BuildError(message: "{name}: {what}'s segment {segment} is linked at {hex(load as UInt64)}, but its bytes sit at flash {hex(bytes_at as UInt64)}, whose {where_}-window address is {hex(want as UInt64)}{hint}")
+            }
+            if (flags & (SegFlag.Write as UInt)) != 0 {
+                return BuildError(message: "{name}: {what}'s segment {segment} is writable and linked in flash, at {hex(load as UInt64)}")
+            }
+        }
+    }
+    return
+}
+
+func symbol(symbols: &Map<String, UInt>, key: String, name: String) -> Result<UInt, BuildError> {
+    guard let value = symbols.get(key) else {
+        return BuildError(message: "{name}: the linked image has no symbol `{key}`")
+    }
+    return value
+}

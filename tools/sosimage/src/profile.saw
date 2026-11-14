@@ -1,0 +1,146 @@
+//! A profile: what every image built for one board shares, the toolchain
+//! included.
+//!
+//! The runner writes one per board per run, as a JSON object:
+//!
+//!     {
+//!       "version": 1,
+//!       "triple": "riscv32-unknown-none-elf",
+//!       "word_bytes": 4,
+//!       "sawc": ["/path/to/sawlang/bin/sawc"],
+//!       "clang": "/path/to/clang",
+//!       "lld": "/path/to/ld.lld",
+//!       "cc_args": ["-march=rv32imac_zicsr", "-mabi=ilp32"],
+//!       "kernel_c_args": [],
+//!       "features": "+m,+a,+c",
+//!       "module_paths": ["kcore=/path/to/kernel/core", "hal=/path/to/..."],
+//!       "native": [{"source": "/path/to/boot.S", "object": "/path/to/boot.o"}],
+//!       "linker_script": "/path/to/virt.ld",
+//!       "flash": {...}
+//!     }
+//!
+//! - `version` is this schema's, and the builder reads only 1.
+//! - `word_bytes` is the target's address width, 4 or 8.
+//! - `sawc` is the argument vector that runs the compiler.
+//! - `cc_args` are given to every clang run after `--target=<triple>`;
+//!   `kernel_c_args` to the kernel's C units only.
+//! - `features` is sawc's `--target-features`, or "" for none.
+//! - `module_paths` are sawc's `--module-path` values for a kernel entry.
+//! - `native` lists the kernel's native units, each compiled to its object:
+//!   a `.S` unit is assembled, a `.c` unit compiled freestanding at `-O2`.
+//! - `flash` is present for a board that boots a flash image built from the
+//!   linked ELF (`sosimage.flash`); its keys are `bytes` (the flash's size),
+//!   `instruction_window` and `data_window` (where the flash is mapped for
+//!   fetches and for loads), `window_bytes` (how much each window maps),
+//!   `magic_offset` and `magic` (the direct-boot word, which the mask ROM
+//!   reads twice at that offset).
+//!
+//! Every path is absolute, and every key is required but `kernel_c_args`,
+//! `features`, `native` and `flash`. An unknown key is refused.
+
+import std.json.{JsonValue}
+import sosimage.failure.{BuildError}
+import sosimage.fields.{Fields}
+
+public static PROFILE_VERSION: Int = 1
+
+/// One native unit of the kernel, and the object it compiles to.
+public struct NativeUnit {
+    source: String
+    object: String
+}
+
+/// A board's flash, for a profile whose image is booted from one.
+public struct FlashLayout {
+    bytes: UInt64
+    instruction_window: UInt64
+    data_window: UInt64
+    window_bytes: UInt64
+    magic_offset: UInt64
+    magic: UInt64
+}
+
+public struct Profile {
+    triple: String
+    word_bytes: Int
+    sawc: Vector<String>
+    clang: String
+    lld: String
+    cc_args: Vector<String>
+    kernel_c_args: Vector<String>
+    features: String
+    module_paths: Vector<String>
+    native: Vector<NativeUnit>
+    linker_script: String
+    flash: FlashLayout?
+}
+
+@synthesize
+extension Profile: ExplicitCopy {}
+
+extension Profile {
+    /// Reads a profile from its JSON text; `origin` names it in messages.
+    public static func parse(text: String, origin: String) -> Result<Profile, BuildError> {
+        let doc = try JsonValue.parse(text) catch {
+            return BuildError(message: "{origin} is not JSON: {error}")
+        }
+        var top = try Fields(move doc, "the profile {origin}")
+        let version = try top.integer("version")
+        if version != PROFILE_VERSION {
+            return BuildError(message: "the profile {origin} is version {version}; this builder reads version {PROFILE_VERSION}")
+        }
+        let triple = try top.text("triple")
+        let word_bytes = try top.integer("word_bytes")
+        if word_bytes != 4 && word_bytes != 8 {
+            return BuildError(message: "the profile {origin}: `word_bytes` is {word_bytes}, not 4 or 8")
+        }
+        let sawc = try top.texts("sawc")
+        if sawc.len() == 0 {
+            return BuildError(message: "the profile {origin}: `sawc` names no program")
+        }
+        let clang = try top.text("clang")
+        let lld = try top.text("lld")
+        let cc_args = try top.texts("cc_args")
+        let kernel_c_args = try top.texts_or_empty("kernel_c_args")
+        let features = try top.text_or("features", "")
+        let module_paths = try top.texts("module_paths")
+        var units = try top.objects_or_empty("native", "native unit")
+        var native = Vector<NativeUnit>()
+        var i = 0
+        while i < units.len() {
+            let source = try units[i].text("source")
+            let object = try units[i].text("object")
+            try units[i].finish()
+            try! native.push(NativeUnit(source: source, object: object))
+            i = i + 1
+        }
+        let linker_script = try top.text("linker_script")
+        var flash: FlashLayout? = None
+        if var f = try top.object("flash", "the profile's `flash`") {
+            flash = FlashLayout(
+                bytes: try f.word("bytes"),
+                instruction_window: try f.word("instruction_window"),
+                data_window: try f.word("data_window"),
+                window_bytes: try f.word("window_bytes"),
+                magic_offset: try f.word("magic_offset"),
+                magic: try f.word("magic"),
+            )
+            try f.finish()
+        }
+        try top.finish()
+        return Profile(triple: triple, word_bytes: word_bytes, sawc: move sawc,
+                       clang: clang, lld: lld, cc_args: move cc_args,
+                       kernel_c_args: move kernel_c_args, features: features,
+                       module_paths: move module_paths, native: move native,
+                       linker_script: linker_script, flash: flash)
+    }
+
+    /// The start of every clang command line for this target.
+    public func clang_command(&self) -> Vector<String> {
+        var argv = Vector<String>()
+        try! argv.push(self.clang)
+        try! argv.push("--target={self.triple}")
+        try! argv.append(&self.cc_args)
+        move argv
+    }
+}

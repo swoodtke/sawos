@@ -1,0 +1,172 @@
+//! Reading a JSON object into a struct, strictly.
+//!
+//! Each key is taken out of the object as it is read, so what is left once a
+//! reader has taken every key it knows is exactly the keys it does not, and
+//! `finish` refuses them by name. A missing required key, a value of the wrong
+//! type and an unknown key are all refusals naming the object and the key: a
+//! description the builder half-understood would build some other image.
+
+import std.json.{JsonValue}
+import sosimage.failure.{BuildError}
+
+/// One JSON object, owned, being read key by key.
+public struct Fields {
+    fields: Map<String, JsonValue>
+    /// What the object is, for messages: `the profile`, `row 2`.
+    what: String
+}
+
+extension Fields: NoCopy {}
+
+extension Fields {
+    /// Takes `value` as an object; anything else is refused.
+    public init(value: JsonValue, what: String) -> Result<Fields, BuildError> {
+        match move value {
+            case Object(fields) -> { return Fields(fields: move fields, what: what) },
+            case _ -> { return BuildError(message: "{what} is not a JSON object") }
+        }
+    }
+
+    /// Whether `key` is still in the object.
+    public func has(&self, key: String) -> Bool {
+        self.fields.contains_key(key)
+    }
+
+    /// Takes `key` out of the object, or `None` when it is absent.
+    public func take(&var self, key: String) -> JsonValue? {
+        self.fields.remove(key)
+    }
+
+    /// Takes `key`, which must be present.
+    public func require(&var self, key: String) -> Result<JsonValue, BuildError> {
+        guard let value = self.fields.remove(key) else {
+            return BuildError(message: "{self.what} has no `{key}`")
+        }
+        return move value
+    }
+
+    public func text(&var self, key: String) -> Result<String, BuildError> {
+        let value = try self.require(key)
+        guard let s = value.as_text() else {
+            return BuildError(message: "{self.what}: `{key}` is not a string")
+        }
+        return s
+    }
+
+    /// `key`'s string, or `fallback` when the key is absent.
+    public func text_or(&var self, key: String, fallback: String) -> Result<String, BuildError> {
+        if not self.fields.contains_key(key) {
+            return fallback
+        }
+        self.text(key)
+    }
+
+    public func integer(&var self, key: String) -> Result<Int, BuildError> {
+        let value = try self.require(key)
+        guard let n = value.as_int() else {
+            return BuildError(message: "{self.what}: `{key}` is not an integer")
+        }
+        return n
+    }
+
+    /// `key`'s integer as an address or a length: never negative.
+    public func word(&var self, key: String) -> Result<UInt64, BuildError> {
+        let n = try self.integer(key)
+        if n < 0 {
+            return BuildError(message: "{self.what}: `{key}` is negative ({n})")
+        }
+        return n as UInt64
+    }
+
+    public func boolean(&var self, key: String) -> Result<Bool, BuildError> {
+        let value = try self.require(key)
+        guard let b = value.as_bool() else {
+            return BuildError(message: "{self.what}: `{key}` is not true or false")
+        }
+        return b
+    }
+
+    /// `key`'s array of strings, which must be present.
+    public func texts(&var self, key: String) -> Result<Vector<String>, BuildError> {
+        let value = try self.require(key)
+        self.strings_of(move value, key)
+    }
+
+    /// `key`'s array of strings, or an empty one when the key is absent.
+    public func texts_or_empty(&var self, key: String) -> Result<Vector<String>, BuildError> {
+        guard let value = self.take(key) else {
+            return Vector<String>()
+        }
+        self.strings_of(move value, key)
+    }
+
+    func strings_of(&self, value: JsonValue, key: String) -> Result<Vector<String>, BuildError> {
+        let items = try array_items(move value, "{self.what}: `{key}`")
+        var out = Vector<String>()
+        var i = 0
+        while i < items.len() {
+            guard let s = borrow items[i].as_text() else {
+                return BuildError(message: "{self.what}: `{key}` item {i} is not a string")
+            }
+            try! out.push(s)
+            i = i + 1
+        }
+        return move out
+    }
+
+    /// `key`'s array of objects, which must be present. Item `i` is
+    /// described as `{noun} {i}` in messages.
+    public func objects(&var self, key: String, noun: String) -> Result<Vector<Fields>, BuildError> {
+        let value = try self.require(key)
+        self.objects_of(move value, key, noun)
+    }
+
+    /// `key`'s array of objects, or an empty one when the key is absent.
+    public func objects_or_empty(&var self, key: String, noun: String) -> Result<Vector<Fields>, BuildError> {
+        guard let value = self.take(key) else {
+            return Vector<Fields>()
+        }
+        self.objects_of(move value, key, noun)
+    }
+
+    func objects_of(&self, value: JsonValue, key: String, noun: String) -> Result<Vector<Fields>, BuildError> {
+        var items = try array_items(move value, "{self.what}: `{key}`")
+        var out = Vector<Fields>()
+        var i = 0
+        while i < items.len() {
+            let item = items.swap_out(i, JsonValue.Null)
+            try! out.push(try Fields(move item, "{noun} {i}"))
+            i = i + 1
+        }
+        return move out
+    }
+
+    /// `key`'s object, or `None` when the key is absent.
+    public func object(&var self, key: String, what: String) -> Result<Fields?, BuildError> {
+        guard let value = self.take(key) else {
+            let absent: Fields? = None
+            return move absent
+        }
+        let found: Fields? = try Fields(move value, what)
+        return move found
+    }
+
+    /// Refuses whatever keys no reader took, naming them in byte order.
+    public func finish(&self) -> Result<Void, BuildError> {
+        if self.fields.len() == 0 {
+            return
+        }
+        var keys = try! self.fields.keys()
+        keys.sort()
+        let listed = keys.join("`, `")
+        return BuildError(message: "{self.what} has unknown keys: `{listed}`")
+    }
+}
+
+/// The items of `value`, which must be an array.
+func array_items(value: JsonValue, what: String) -> Result<Vector<JsonValue>, BuildError> {
+    match move value {
+        case Array(items) -> { return move items },
+        case _ -> { return BuildError(message: "{what} is not an array") }
+    }
+}

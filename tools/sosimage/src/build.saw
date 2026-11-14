@@ -1,0 +1,266 @@
+//! The three things the builder does: compile a profile's native units,
+//! compile a kernel entry, and stitch and link one image.
+
+import std.directory.{Directory}
+import std.path.{Path}
+import sosimage.failure.{BuildError}
+import sosimage.flash.{check_in_place, elf_symbols, flash_image}
+import sosimage.image.{ImageSpec}
+import sosimage.profile.{Profile}
+import sosimage.regions.{encode_table, table_assembly}
+import sosimage.tool.{read_file, require_input, run_tool, write_file, write_lines}
+
+/// Compiles each of the profile's native units to its object: a `.S` unit is
+/// assembled, and a C unit compiled freestanding at `-O2` with the profile's
+/// `kernel_c_args`. `-fno-builtin` keeps freestanding C from being rewritten
+/// into calls to `memcpy` and its kin.
+public func build_native(profile: &Profile) -> Result<Void, BuildError> {
+    var i = 0
+    while i < profile.native.len() {
+        guard let unit = profile.native.get(i) else {
+            return BuildError(message: "internal: native unit {i} vanished")
+        }
+        i = i + 1
+        try require_input(unit.source, "the native unit")
+        var argv = profile.clang_command()
+        if unit.source.ends_with(".c") {
+            try! argv.append(&profile.kernel_c_args)
+            try! argv.push("-ffreestanding")
+            try! argv.push("-fno-builtin")
+            try! argv.push("-ffunction-sections")
+            try! argv.push("-fdata-sections")
+            try! argv.push("-nostdlib")
+            try! argv.push("-O2")
+        } else {
+            try! argv.push("-nostdlib")
+        }
+        try! argv.push("-c")
+        try! argv.push(unit.source)
+        try! argv.push("-o")
+        try! argv.push(unit.object)
+        try run_tool(&argv)
+    }
+    return
+}
+
+/// Compiles the kernel entry `entry` to the object `output`.
+///
+/// Every kernel is built at `-Oz`, freestanding, and under
+/// `--no-hidden-alloc`, so an allocation the source does not name fails the
+/// build rather than reaching for an allocator the kernel may not have.
+/// `--runtime-provider` says this compile defines the `__saw_rt_*` seams
+/// (`sosrt` carries them), which sawc then checks against its runtime ABI.
+public func build_kernel(profile: &Profile, entry: String, output: String) -> Result<Void, BuildError> {
+    try require_input(entry, "the kernel entry")
+    var argv = profile.sawc.copy()
+    try! argv.push(entry)
+    try! argv.push("-o")
+    try! argv.push(output)
+    try! argv.push("-Oz")
+    try! argv.push("--freestanding")
+    try! argv.push("--no-hidden-alloc")
+    try! argv.push("--runtime-provider")
+    try! argv.push("--target")
+    try! argv.push(profile.triple)
+    if not profile.features.is_empty() {
+        try! argv.push("--target-features")
+        try! argv.push(profile.features)
+    }
+    var m = 0
+    while m < profile.module_paths.len() {
+        try! argv.push("--module-path")
+        try! argv.push(profile.module_paths.get(m) ?? "")
+        m = m + 1
+    }
+    run_tool(&argv)
+}
+
+/// What `link` made, for the runner: the ELF, and for a flash board the
+/// flash image with how many of its bytes the ELF placed and where they end.
+public struct Linked {
+    elf: String
+    flash: String
+    used: Int
+    end: Int
+}
+
+/// Stitches and links the image `spec` describes.
+///
+/// The objects are linked in a fixed order: the profile's native units, the
+/// kernel, the payload, the hand-written child, the root image's stub, then
+/// the stub holding the child images and the region table.
+public func link(profile: &Profile, spec: &ImageSpec) -> Result<Linked, BuildError> {
+    try require_input(spec.kernel, "the kernel object")
+    try ensure_directory(spec.staging)
+    var objects = Vector<String>()
+    var u = 0
+    while u < profile.native.len() {
+        guard let unit = profile.native.get(u) else {
+            return BuildError(message: "internal: native unit {u} vanished")
+        }
+        try require_input(unit.object, "the native object")
+        try! objects.push(unit.object)
+        u = u + 1
+    }
+    try! objects.push(spec.kernel)
+    if not spec.asm.is_empty() {
+        try! objects.push(try assemble(&profile, spec.asm, "{spec.staging}/payload.o", "the payload"))
+    }
+    if not spec.child_asm.is_empty() {
+        try! objects.push(try assemble(&profile, spec.child_asm, "{spec.staging}/child0.o", "the hand-written child"))
+    }
+    if not spec.root_image.is_empty() {
+        try require_input(spec.root_image, "root's image")
+        let stub = "{spec.staging}/root.S"
+        let lines = try root_stub(spec.root_image)
+        try write_lines(stub, &lines)
+        try! objects.push(try assemble(&profile, stub, "{spec.staging}/root.o", "root's stub"))
+    }
+    if spec.has_regions {
+        var c = 0
+        while c < spec.children.len() {
+            try require_input(spec.children.get(c) ?? "", "child {c}'s image")
+            c = c + 1
+        }
+        let stub = "{spec.staging}/regions.S"
+        let lines = try regions_stub(&profile, &spec)
+        try write_lines(stub, &lines)
+        try! objects.push(try assemble(&profile, stub, "{spec.staging}/regions.o", "the region table's stub"))
+    } else if spec.children.len() > 0 {
+        return BuildError(message: "{spec.name}: child images ride beside the region table that names them, and the image has none")
+    }
+
+    var argv = Vector<String>()
+    try! argv.push(profile.lld)
+    try! argv.push("-T")
+    try! argv.push(profile.linker_script)
+    try! argv.push("--gc-sections")
+    try! argv.append(&spec.link_args)
+    try! argv.push("-o")
+    try! argv.push(spec.output)
+    try! argv.append(&objects)
+    try run_tool(&argv)
+
+    guard let wanted = spec.flash else {
+        return Linked(elf: spec.output, flash: "", used: 0, end: 0)
+    }
+    guard let layout = profile.flash else {
+        return BuildError(message: "{spec.name} asks for a flash image, and the profile has no flash layout")
+    }
+    let elf = try read_file(spec.output)
+    let made = try flash_image(&elf, &layout, spec.name, profile.linker_script)
+    if wanted.check {
+        let symbols = try elf_symbols(&elf, "{spec.name}'s linked image")
+        try check_in_place(spec.name, &symbols, &made.image, &layout)
+    }
+    try write_file(wanted.output, made.image)
+    return Linked(elf: spec.output, flash: wanted.output, used: made.used, end: made.end)
+}
+
+/// Assembles `source` to `object` for the profile's target.
+func assemble(profile: &Profile, source: String, object: String,
+              what: String) -> Result<String, BuildError> {
+    try require_input(source, what)
+    var argv = profile.clang_command()
+    try! argv.push("-nostdlib")
+    try! argv.push("-c")
+    try! argv.push(source)
+    try! argv.push("-o")
+    try! argv.push(object)
+    try run_tool(&argv)
+    return object
+}
+
+/// The stub that appends root's image in the `.payload` section, which the
+/// board's script bounds for the loader. The image is data, not code: the
+/// loader copies each segment and only then grants it execute.
+public func root_stub(image: String) -> Result<Vector<String>, BuildError> {
+    var lines = Vector<String>()
+    try! lines.push("/* Generated by sosimage: root's image. */")
+    try! lines.push("    .section .payload, \"a\", @progbits")
+    try! lines.push("    .balign 16")
+    try! lines.push("    .globl _root_image")
+    try! lines.push("_root_image:")
+    try! lines.push("    .incbin {try incbin_operand(image)}")
+    return move lines
+}
+
+/// The page a pool blob is placed on and padded to: a multiple of every
+/// profile's protection grain.
+static POOL_BLOB_ALIGN: Int = 4096
+
+/// The stub holding the child images, each appended as it is, and the region
+/// table that names them. A blob lands wherever the linker puts it; its row
+/// names the symbols bounding it, which the linker fills in.
+///
+/// An image with no children links no `.childimg` section at all.
+public func regions_stub(profile: &Profile, spec: &ImageSpec) -> Result<Vector<String>, BuildError> {
+    var lines = Vector<String>()
+    try! lines.push("/* Generated by sosimage: the child images and the region table. */")
+    try! lines.push("")
+    if spec.children.len() > 0 {
+        try! lines.push("    .section .childimg, \"a\", @progbits")
+        try! lines.push("    .balign 16")
+        var i = 0
+        while i < spec.children.len() {
+            let image = spec.children.get(i) ?? ""
+            let pool = spec.blob_is_pool(i)
+            if pool {
+                try! lines.push("    .balign {POOL_BLOB_ALIGN}")
+            }
+            try! lines.push("_sos_child{i}_start:")
+            try! lines.push("    .incbin {try incbin_operand(image)}")
+            if pool {
+                try! lines.push("    .balign {POOL_BLOB_ALIGN}")
+            }
+            try! lines.push("_sos_child{i}_end:")
+            try! lines.push("    .balign 16")
+            i = i + 1
+        }
+        try! lines.push("")
+    }
+    let rows = spec.region_rows()
+    let fields = try encode_table(&rows, spec.flags, profile.word_bytes)
+    try! lines.append(&table_assembly(&fields))
+    return move lines
+}
+
+/// Makes `path` a directory, with its parents.
+func ensure_directory(path: String) -> Result<Void, BuildError> {
+    let dir = Path(s: path)
+    if Directory.exists(dir) {
+        if not is_directory(dir) {
+            return BuildError(message: "{path} exists and is not a directory")
+        }
+        return
+    }
+    if let up = dir.parent() {
+        try ensure_directory(up.as_string())
+    }
+    try Directory.create(dir) catch {
+        // Another image's build may have made it in between.
+        if is_directory(dir) {
+            return
+        }
+        return BuildError(message: "could not create the directory {path}: {error}")
+    }
+    return
+}
+
+/// Whether `path` is a directory. `Directory.exists` answers for a file too,
+/// and std has no way to tell the two apart but listing one.
+func is_directory(path: Path) -> Bool {
+    let _ = try Directory.list(path) catch {
+        return false
+    }
+    true
+}
+
+/// `path` as an assembler string operand. The builder writes paths into its
+/// stubs verbatim, so one the assembler would read differently is refused.
+func incbin_operand(path: String) -> Result<String, BuildError> {
+    if path.contains("\"") || path.contains("\\") || path.contains("\n") {
+        return BuildError(message: "the path {path} cannot be written into an assembler string")
+    }
+    return "\"{path}\""
+}

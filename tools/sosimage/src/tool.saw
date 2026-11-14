@@ -1,0 +1,89 @@
+//! Running the compilers and the linker, and reading and writing files.
+
+import std.data.{Data}
+import std.file.{File}
+import std.path.{Path}
+import std.process.{Command}
+import sosimage.failure.{BuildError}
+
+/// Runs `argv` (the program, then its arguments) to completion.
+///
+/// A program that cannot be started, or that exits with anything but 0, is a
+/// failure carrying the exit code, the command line and everything the
+/// program printed on either stream, in the order it printed it.
+public func run_tool(argv: &Vector<String>) -> Result<Void, BuildError> {
+    guard let program = argv.get(0) else {
+        return BuildError(message: "internal: a command with no program")
+    }
+    var cmd = Command(program: program)
+    var i = 1
+    while i < argv.len() {
+        try! cmd.arg(argv.get(i) ?? "")
+        i = i + 1
+    }
+    cmd.merge_stderr()
+    let out = try cmd.output() catch {
+        return BuildError(message: "could not run {argv.join(" ")}: {error}")
+    }
+    if not out.success() {
+        return BuildError(message: "command failed ({out.exit_code}): {argv.join(" ")}\n{out.stdout}")
+    }
+    return
+}
+
+/// The whole of the file at `path`.
+public func read_file(path: String) -> Result<Data, BuildError> {
+    var f = try File.open(Path(s: path)) catch {
+        return BuildError(message: "could not open {path}: {error}")
+    }
+    let bytes = try f.read() catch {
+        return BuildError(message: "could not read {path}: {error}")
+    }
+    return bytes
+}
+
+/// The file at `path` as text.
+public func read_text(path: String) -> Result<String, BuildError> {
+    let bytes = try read_file(path)
+    let text = try bytes.to_string() catch {
+        return BuildError(message: "{path} is not UTF-8 text")
+    }
+    return text
+}
+
+/// Replaces the file at `path` with `bytes`.
+public func write_file(path: String, bytes: Data) -> Result<Void, BuildError> {
+    let size = bytes.len()
+    let f = try File.create(Path(s: path)) catch {
+        return BuildError(message: "could not create {path}: {error}")
+    }
+    let written = try f.write(bytes) catch {
+        return BuildError(message: "could not write {path}: {error}")
+    }
+    if written != size {
+        return BuildError(message: "short write to {path} ({written} of {size} bytes)")
+    }
+    return
+}
+
+/// Replaces the file at `path` with `lines`, each ended by a newline.
+public func write_lines(path: String, lines: &Vector<String>) -> Result<Void, BuildError> {
+    var text = StringBuilder()
+    var i = 0
+    while i < lines.len() {
+        try! text.append(lines.get(i) ?? "")
+        try! text.append("\n")
+        i = i + 1
+    }
+    let bytes = try! text.build().to_data()
+    write_file(path, bytes)
+}
+
+/// Refuses an input that is not there, before any tool is run on it, so a
+/// missing image is named as one rather than as a tool's complaint.
+public func require_input(path: String, what: String) -> Result<Void, BuildError> {
+    if not File.exists(Path(s: path)) {
+        return BuildError(message: "{what} {path} does not exist")
+    }
+    return
+}

@@ -1,0 +1,131 @@
+// The boot region table's encoding: its bytes for a fixed table, which are
+// the kernel's `RegionTableHeader` and `RegionRow` layout, and the linked
+// fields a child image's row leaves to the linker on each address width.
+
+import sosimage.regions.{
+    RegionKind, RegionRow, RowWord, TableField, encode_table, table_assembly,
+    table_bytes,
+}
+
+func numeric_rows() -> Vector<RegionRow> {
+    var rows = Vector<RegionRow>()
+    try! rows.push(RegionRow(what: "child 0's destination RAM",
+                             base: RowWord.number(0x8024_0000),
+                             len: RowWord.number(0x4_0000),
+                             kind: RegionKind.Ram))
+    try! rows.push(RegionRow(what: "the device window",
+                             base: RowWord.number(0x1_0900_0000),
+                             len: RowWord.number(0x1000),
+                             kind: RegionKind.Device))
+    move rows
+}
+
+func blob_rows() -> Vector<RegionRow> {
+    var rows = Vector<RegionRow>()
+    try! rows.push(RegionRow(what: "child 0's image blob",
+                             base: RowWord.linked("_sos_child0_start"),
+                             len: RowWord.linked("_sos_child0_end - _sos_child0_start"),
+                             kind: RegionKind.Pool))
+    move rows
+}
+
+func expect_bytes(got: &Vector<UInt8>, want: &[UInt8]) {
+    assert(got.len() == want.len(), "the table's length")
+    var i = 0
+    while i < want.len() {
+        if got.get(i)! != want[i] {
+            print("byte {i}: got {got.get(i)!}, want {want[i]}")
+        }
+        assert(got.get(i)! == want[i], "each byte")
+        i = i + 1
+    }
+}
+
+func expect_field(fields: &Vector<TableField>, i: Int, bytes: Int, symbol: String) {
+    let f = fields.get(i)!
+    assert(f.bytes == bytes, "field {i}'s width")
+    assert(f.symbol.equals(symbol), "field {i}'s linker expression")
+}
+
+func main() {
+    // Two numeric rows, the tick off: an 8-byte header, then 24 bytes a row,
+    // little-endian, whatever the target's word.
+    let rows = numeric_rows()
+    let want: [UInt8; 56] = [
+        0x53, 0x52, 0x47, 0x4E, 0x04, 0x00, 0x02, 0x01,
+        0x00, 0x00, 0x24, 0x80, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x09, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]
+    let narrow = try! encode_table(&rows, 1, 4)
+    expect_bytes(&try! table_bytes(&narrow), &want)
+    let wide = try! encode_table(&rows, 1, 8)
+    expect_bytes(&try! table_bytes(&wide), &want)
+
+    // No rows, the tick on: the header alone, with zero flags.
+    let none = Vector<RegionRow>()
+    let header: [UInt8; 8] = [0x53, 0x52, 0x47, 0x4E, 0x04, 0x00, 0x00, 0x00]
+    expect_bytes(&try! table_bytes(&try! encode_table(&none, 0, 4)), &header)
+
+    // A child image's row: on a 32-bit target each linked word is its low
+    // half and a zero high half; on a 64-bit one, one 8-byte word.
+    let blobs = blob_rows()
+    let fields32 = try! encode_table(&blobs, 1, 4)
+    assert(fields32.len() == 10, "header, two split words, kind, reserved")
+    expect_field(&fields32, 4, 4, "_sos_child0_start")
+    expect_field(&fields32, 5, 4, "")
+    expect_field(&fields32, 6, 4, "_sos_child0_end - _sos_child0_start")
+    expect_field(&fields32, 7, 4, "")
+    expect_field(&fields32, 8, 1, "")
+    assert(fields32.get(8)!.value == 2, "a pool row's kind")
+    expect_field(&fields32, 9, 7, "")
+    let fields64 = try! encode_table(&blobs, 1, 8)
+    assert(fields64.len() == 8, "header, two words, kind, reserved")
+    expect_field(&fields64, 4, 8, "_sos_child0_start")
+    expect_field(&fields64, 5, 8, "_sos_child0_end - _sos_child0_start")
+
+    // Its bytes are the linker's, so asking for them is refused.
+    match table_bytes(&fields32) {
+        case Ok(_) -> assert(false, "a linked field has no bytes yet"),
+        case Err(e) -> assert(e.message.equals("field 4 is the linker expression `_sos_child0_start`"),
+                              "the refusal names the field")
+    }
+
+    // The assembly states the numbers as bytes and the linked words as
+    // directives the assembler resolves.
+    let lines = table_assembly(&fields32)
+    assert(lines.get(0)!.equals("    .section .regions, \"a\", @progbits"), "the section")
+    assert(lines.get(1)!.equals("    .balign 8"), "8-aligned")
+    assert(lines.get(3)!.equals("    .byte  0x53, 0x52, 0x47, 0x4e"), "the magic's bytes")
+    var linked = 0
+    var i = 0
+    while i < lines.len() {
+        if lines.get(i)!.equals("    .4byte _sos_child0_start") {
+            linked = linked + 1
+        }
+        i = i + 1
+    }
+    assert(linked == 1, "the blob's base as a 4-byte linked word")
+
+    // The header counts rows and flags in one byte each.
+    var many = Vector<RegionRow>()
+    var n = 0
+    while n < 256 {
+        try! many.push(RegionRow(what: "r", base: RowWord.number(0),
+                                 len: RowWord.number(0), kind: RegionKind.Ram))
+        n = n + 1
+    }
+    match encode_table(&many, 0, 4) {
+        case Ok(_) -> assert(false, "256 rows do not fit"),
+        case Err(e) -> assert(e.message.equals("the region table has 256 rows; its header counts at most 255"),
+                              "too many rows")
+    }
+    match encode_table(&rows, 0x100, 4) {
+        case Ok(_) -> assert(false, "flags past a byte do not fit"),
+        case Err(e) -> assert(e.message.equals("the region table's boot flags 0x100 do not fit its one byte"),
+                              "flags too wide")
+    }
+}
