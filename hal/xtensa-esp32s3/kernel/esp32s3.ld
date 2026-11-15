@@ -199,6 +199,14 @@ SECTIONS {
 
     .bss (NOLOAD) : ALIGN(16) {
         _bss_start = .;
+        /* The slab region: the sections an image links its slab areas into
+         * (`.bss.sos_slab<kind>`), gathered ahead of every other static so
+         * that nothing else of the kernel's lies between the two symbols.
+         * An image with no areas leaves it empty. */
+        _sos_slabs_start = .;
+        *(.bss.sos_slab*)
+        _sos_slabs_end = .;
+
         *(.bss .bss.*)
         *(COMMON)
 
@@ -217,6 +225,11 @@ SECTIONS {
         . = ALIGN(16);
         _bss_end = .;
     } > DRAM
+
+/* The slab region is a span of `.bss`, ahead of the arena. */
+ASSERT(_bss_start <= _sos_slabs_start && _sos_slabs_start <= _sos_slabs_end
+       && _sos_slabs_end <= _arena_start,
+       "the slab region does not lie inside .bss ahead of the arena")
 
     /DISCARD/ : {
         *(.comment)

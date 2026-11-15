@@ -145,16 +145,16 @@ extern unsigned char _region_table_end[];
 u64 sos_region_table_start(void) { return (u64)_region_table_start & SOS_LINMAP_PHYS_MASK; }
 u64 sos_region_table_end(void)   { return (u64)_region_table_end   & SOS_LINMAP_PHYS_MASK; }
 
-// The kernel's own zeroed memory, `[_bss_start, _arena_start)`: the `.bss`
-// input sections, where the build links an image's slab areas, and not the
-// arena or the boot stack behind them. Masked to physical as the table's
-// bounds are; the kernel compares an area's base after `hal.virt_to_phys`.
+// The kernel's slab region, `[_sos_slabs_start, _sos_slabs_end)`: the
+// `.bss.sos_slab*` input sections, where the build links an image's slab
+// areas, and no other static. Masked to physical as the table's bounds are;
+// the kernel compares an area's base after `hal.virt_to_phys`.
 
-extern unsigned char _bss_start[];
-extern unsigned char _arena_start[];
+extern unsigned char _sos_slabs_start[];
+extern unsigned char _sos_slabs_end[];
 
-u64 sos_kernel_bss_start(void)   { return (u64)_bss_start   & SOS_LINMAP_PHYS_MASK; }
-u64 sos_kernel_arena_start(void) { return (u64)_arena_start & SOS_LINMAP_PHYS_MASK; }
+u64 sos_kernel_slabs_start(void) { return (u64)_sos_slabs_start & SOS_LINMAP_PHYS_MASK; }
+u64 sos_kernel_slabs_end(void)   { return (u64)_sos_slabs_end   & SOS_LINMAP_PHYS_MASK; }
 
 // ---- the real translation tables -------------------------------------------
 //

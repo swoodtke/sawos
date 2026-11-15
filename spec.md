@@ -4687,11 +4687,11 @@ reserved.
     counted as a donation counts them (a thread's slot with its saved
     context, a connection's with its staging ring, §2.8), or whose base is
     not aligned as those slots need;
-  - an area not wholly inside the kernel's own zero-initialised memory,
-    between the board script's `_bss_start` and `_arena_start` (a base or a
-    length the machine's word cannot hold is outside it, and so is a base
-    that is neither physical nor the kernel's own address for a physical
-    one), or an area that meets another;
+  - an area not wholly inside the kernel's slab region, the span of its
+    zero-initialised memory between the board script's `_sos_slabs_start` and
+    `_sos_slabs_end` (a base or a length the machine's word cannot hold is
+    outside it, and so is a base that is neither physical nor the kernel's
+    own address for a physical one), or an area that meets another;
   - a kind whose capacity with its area would pass `MAX_SLAB_CAPACITY`, and
     for `Pipes` a count of connections whose exchanges would pass it, which
     at `PIPE_INFLIGHT` exchanges a connection comes at a smaller count;
@@ -4713,11 +4713,14 @@ reserved.
   and a donation adds to it as to any other extent. The area takes one of
   the kind's `MAX_SLAB_EXTENTS`, so a kind raised by its image accepts one
   donation fewer. No handle names an area and no process can map, give or
-  donate one: its bytes are the kernel's from the first instruction. What
-  the containment check does not catch is an area inside that memory that
-  lies over the kernel's own statics, which the boot then zeroes: the build
-  gives each area a section of its own, and a block made any other way is
-  as trusted as the kernel it is linked into.
+  donate one: its bytes are the kernel's from the first instruction. The
+  slab region is the one place the build links areas: each area is a section
+  named `.bss.sos_slab<kind>`, and every board's link script gathers those
+  sections, and only those, between the region's two symbols, apart from
+  every other static of the kernel's, the arena and the boot stack. An area
+  the containment check takes therefore lies over no static, and one that
+  lies over a static, or over the arena or the stack, is outside the region
+  and stops the boot. An image that links no area has an empty region.
 - **A row typed wrong is the build's error, met at root's drain.** The kernel
   mints what the kind column says. A root that finds a pool under a tag its
   config gives to an allocation, or the reverse, learns it from the boot

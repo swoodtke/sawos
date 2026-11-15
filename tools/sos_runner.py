@@ -1497,7 +1497,7 @@ def _slab_taken(name, spec, areas):
 # from instead. Records are exactly four per body and attachments exactly
 # one per waitable (10 events + 7 interrupts + 11 timers + 16 records). The
 # free-range area is last and a multiple of 16 bytes, so it ends at
-# `_arena_start`.
+# `_sos_slabs_end`.
 _EDGE_AREAS = [{"kind": "processes", "slots": 1},
                {"kind": "process_records", "slots": 4},
                {"kind": "threads", "slots": 1},
@@ -8523,10 +8523,29 @@ TEST_CASES = [
          "at": lambda f: f"_sos_hand0 - {f['slabs']['free_ranges']['unit']}"}]},
         [("{one}", "{one}"), ("{eight}", "{one}")]),
 
-    # An area at the first byte of the kernel's zeroed memory is inside it.
-    _slab_taken("slab_area_at_bss_start",
-                {"areas": [{"kind": "waiters", "at": "_bss_start"}]},
+    # An area at the first byte of the slab region, filling the storage the
+    # image linked there, is inside it.
+    _slab_taken("slab_area_at_region_start",
+                {"areas": [{"kind": "waiters", "at": "_sos_slabs_start",
+                            "reserve": lambda f: f["slabs"]["waiters"]["unit"]}]},
                 [("{one}", "{one}")]),
+    # An area below the region's first byte lies over what precedes it, the
+    # kernel's own statics, which the old bounds took.
+    _slab_stop("slab_area_below_region",
+               {"areas": [{"kind": "waiters", "at": "_sos_slabs_start - 16",
+                           "reserve": 64}]},
+               "a slab area lies outside the kernel's slab region"),
+    # An area one slot past the region's last byte: its base is outside the
+    # region, whatever its length.
+    _slab_stop("slab_area_past_region",
+               {"areas": [{"kind": "waiters", "at": "_sos_slabs_end + 16",
+                           "reserve": 16}]},
+               "a slab area lies outside the kernel's slab region"),
+    # An area over a static of the kernel's, in `.bss` and outside the
+    # region: the boot would zero it, so it is refused.
+    _slab_stop("slab_area_over_static",
+               {"areas": [{"kind": "waiters", "place": "bss"}]},
+               "a slab area lies outside the kernel's slab region"),
 
     # Each stop of spec §12, by its message. Where a block breaks two checks,
     # the one named first in `install_image_slabs`' order is the one met, and
@@ -8556,18 +8575,18 @@ TEST_CASES = [
                "two slab areas name one kind"),
     _slab_stop("slab_area_past_address_space",
                {"areas": [{"kind": "waiters", "base": 0x1_0000_0000}]},
-               "a slab area lies outside the kernel's zeroed memory"),
+               "a slab area lies outside the kernel's slab region"),
     # Only a 32-bit kernel cannot address the base, and finds that first.
     _slab_stop("slab_area_past_address_space_empty",
                {"areas": [{"kind": "waiters", "base": 0x1_0000_0000,
                            "len": 0}]},
-               "a slab area lies outside the kernel's zeroed memory",
+               "a slab area lies outside the kernel's slab region",
                arches=["riscv32", "riscv32-flat"]),
     # And a length a 32-bit kernel cannot hold, with a base it can.
     _slab_stop("slab_area_len_past_word",
                {"areas": [{"kind": "waiters", "len": 0x1_0000_0000 + 20,
                            "storage": 20}]},
-               "a slab area lies outside the kernel's zeroed memory",
+               "a slab area lies outside the kernel's slab region",
                arches=["riscv32", "riscv32-flat"]),
     _slab_stop("slab_area_empty",             # and misaligned
                {"areas": [{"kind": "waiters", "len": 0, "skew": 1}]},
@@ -8580,7 +8599,7 @@ TEST_CASES = [
     _slab_stop("slab_area_at_ceiling",
                {"areas": [{"kind": "waiters", "storage": 16,
                            "slots": lambda f: f["limits"]["capacity"] - 4}]},
-               "a slab area lies outside the kernel's zeroed memory"),
+               "a slab area lies outside the kernel's slab region"),
     # A pipe area's ceiling is its exchange chain's: `PIPE_INFLIGHT` exchanges
     # a connection reach `MAX_SLAB_CAPACITY` at a smaller count than the
     # connections do. One connection past that count is refused there; at it
@@ -8598,7 +8617,7 @@ TEST_CASES = [
                                                - f["slabs"]["pipes"]["floor"]
                                                * f["limits"]["inflight"])
                                               // f["limits"]["inflight"]}]},
-               "a slab area lies outside the kernel's zeroed memory"),
+               "a slab area lies outside the kernel's slab region"),
     _slab_stop("slab_area_misaligned",        # and outside
                {"areas": [{"kind": "waiters", "skew": 1, "place": "data"}]},
                "a slab area's base is not aligned for its slots"),
@@ -8608,33 +8627,33 @@ TEST_CASES = [
                "a slab area's base is not aligned for its slots"),
     _slab_stop("slab_area_in_data",
                {"areas": [{"kind": "waiters", "place": "data"}]},
-               "a slab area lies outside the kernel's zeroed memory"),
+               "a slab area lies outside the kernel's slab region"),
     # A base with a bit set that the linear map's mask drops: masked, it would
     # name the area's own bytes, but it is neither physical nor the kernel's
     # address for them. Only arm64 has a mask to drop it.
     _slab_stop("slab_area_base_stray_bits",
                {"areas": [{"kind": "waiters", "skew": 1 << 50,
                            "storage": 64}]},
-               "a slab area lies outside the kernel's zeroed memory",
+               "a slab area lies outside the kernel's slab region",
                arches=["arm64"]),
     _slab_stop("slab_area_at_arena",
                {"areas": [{"kind": "waiters", "at": "_arena_start"}]},
-               "a slab area lies outside the kernel's zeroed memory"),
-    # An area one byte longer than the room before `_arena_start`: its 16
-    # bytes of storage are the last of the kernel's `.bss` sections.
+               "a slab area lies outside the kernel's slab region"),
+    # An area one byte longer than the region: its 16 bytes of storage are
+    # the last of the slab sections, and the byte past them is a static's.
     _slab_stop("slab_area_one_past_arena",    # and not whole slots
                {"areas": [{"kind": "free_ranges", "storage": 16, "len": 17}]},
-               "a slab area lies outside the kernel's zeroed memory"),
+               "a slab area lies outside the kernel's slab region"),
     _slab_stop("slab_area_past_arena",
                {"areas": [{"kind": "waiters", "at": "_arena_end"}]},
-               "a slab area lies outside the kernel's zeroed memory"),
+               "a slab area lies outside the kernel's slab region"),
     _slab_stop("slab_area_outside_and_meeting",
                {"areas": [{"kind": "waiters"},
                           {"kind": "events", "at": "_sos_hand0",
                            "slots": 200000}]},
-               "a slab area lies outside the kernel's zeroed memory"),
+               "a slab area lies outside the kernel's slab region"),
     # Area 0 links room past its own length, so area 1 lies inside the
-    # kernel's zeroed memory and over area 0.
+    # kernel's slab region and over area 0.
     _slab_stop("slab_areas_meet",             # and not whole slots
                {"areas": [{"kind": "waiters", "storage": 256},
                           {"kind": "events", "at": "_sos_hand0",
@@ -11444,13 +11463,16 @@ def _slab_block_asm(case, arch, facts):
                  `kind_raw` (any number); `slots`, the slots it holds, or
                  `len`, its length in bytes; `extra`, bytes added to the
                  length; and where its base is. By default that is storage
-                 of its own, a `.bss` section (or a `.data` one, outside the
-                 kernel's zeroed memory, with `place: "data"`) holding
-                 `storage` bytes (the length, unless stated), `pad` bytes of
-                 which come before the base, and the base `skew` bytes past
-                 its aligned start. Otherwise `at` is a symbol expression
-                 (`"_arena_start"`, `"_sos_hand0 - 32"`, area 0's base being
-                 `_sos_hand0`), or `base` a literal, and nothing is linked
+                 of its own, a slab section (`.bss.sos_slab*`, inside the
+                 kernel's slab region; a plain `.bss` static with `place:
+                 "bss"`, or a `.data` section with `place: "data"`, both
+                 outside it) holding `storage` bytes (the length, unless
+                 stated), `pad` bytes of which come before the base, and the
+                 base `skew` bytes past its aligned start. Otherwise `at` is
+                 a symbol expression (`"_arena_start"`, `"_sos_hand0 - 32"`,
+                 area 0's base being `_sos_hand0`), or `base` a literal, and
+                 nothing is linked, unless `reserve` names a number of bytes
+                 of slab section to link anyway
       `count`    the header's area count, when it is not the list's length
       `magic`    the block's magic, when it is not the block's
       `header_only`  write only the block's first 8 bytes
@@ -11459,10 +11481,9 @@ def _slab_block_asm(case, arch, facts):
     Any number may be a function of `facts` (`_slab_facts`), for one that is
     the kernel's: `lambda f: f["limits"]["domains"] + 1`.
 
-    Each area's storage, in a section of its own, is linked after every
-    kernel `.bss` section, since this payload's object follows the kernel's
-    in the link: the last one ends at `_arena_start` when its length is a
-    multiple of 16.
+    Each area's storage, in a section of its own, is gathered into the slab
+    region in link order, and the payload's object follows the kernel's:
+    the last one ends at `_sos_slabs_end`.
     """
     spec = case["slab_block"]
     wide = arch["hex_width"] != 8
@@ -11528,12 +11549,22 @@ def _slab_block_asm(case, arch, facts):
                            "@progbits", f"    .balign {align}"]
                 fill = ".zero"
             else:
-                section = [f"    .section .bss.sos_hand{i}, \"aw\", "
+                # `bss` is an ordinary static of the kernel's, outside the
+                # slab region; the default is a slab section, inside it.
+                name = "sos_hand" if area.get("place") == "bss" \
+                    else "sos_slab_hand"
+                section = [f"    .section .bss.{name}{i}, \"aw\", "
                            "@nobits", f"    .balign {align}"]
                 fill = ".skip"
             if pad:
                 section.append(f"    {fill} {pad}")
             storage += section + [f"{label}:", f"    {fill} {reserve}"]
+        if "reserve" in area:
+            # Slab-region storage of its own for an area placed `at` a symbol;
+            # nothing refers to it, so `R` keeps the link from collecting it.
+            storage += [f"    .section .bss.sos_slab_room{i}, \"awR\", "
+                        "@nobits", f"    .balign {align}",
+                        f"    .skip {value(area['reserve'])}"]
         lines += [f"    /* area {i}: {area.get('kind', kind)} */",
                   f"    .4byte {kind}", "    .4byte 0"]
         if literal is not None:

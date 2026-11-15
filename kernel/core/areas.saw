@@ -1,12 +1,15 @@
 //! An image's slab areas, and the geometry an area and a donation share.
 //!
 //! An image raises what a machine boots with (spec §2.8, §12). The build links
-//! zeroed storage for each slab kind it raises into the kernel's own `.bss`
-//! and names it in a block after the region table's rows; `install_image_slabs`
-//! reads the block before the first process exists, checks it, and installs
-//! each area as one more extent of its slab, exactly as a donated region is
-//! installed (`slab_geometry`, `slab_install`). A kind's capacity at boot is
-//! then its floor plus its area, and every reader of a capacity reads it so.
+//! zeroed storage for each slab kind it raises into the kernel's slab region
+//! (the board script's `.bss.sos_slab*` sections, bounded by
+//! `hal.kernel_slabs_start`/`hal.kernel_slabs_end`, with no other static in
+//! it) and names it in a block after the region table's rows;
+//! `install_image_slabs` reads the block before the first process exists,
+//! checks it, and installs each area as one more extent of its slab, exactly
+//! as a donated region is installed (`slab_geometry`, `slab_install`). A
+//! kind's capacity at boot is then its floor plus its area, and every reader
+//! of a capacity reads it so.
 //!
 //! The block also carries the quota defaults the image's children start with,
 //! which replace `kcore.limits`' compiled ones (`set_image_quota_defaults`).
@@ -254,8 +257,8 @@ func block_area_at(addr: UInt) unsafe -> SlabArea {
 /// in the block's order (a kind this build cannot name, a kind named twice, a
 /// base or length past the address space, a base that is neither physical nor
 /// the kernel's address for its physical one, no length, a capacity past
-/// `MAX_SLAB_CAPACITY`, a misaligned base, an area outside the kernel's zeroed
-/// memory, an area meeting an earlier one, a length that is not whole slots);
+/// `MAX_SLAB_CAPACITY`, a misaligned base, an area outside the kernel's slab
+/// region, an area meeting an earlier one, a length that is not whole slots);
 /// then the capacities at boot against §2.8's relations; then each quota
 /// default against its bounds. Nothing is installed until every check has
 /// passed, so a refused block changes no slab.
@@ -289,8 +292,8 @@ public func install_image_slabs() unsafe {
         fatal_image("bytes follow the slab block", room - count * area_len)
     }
 
-    let low = hal.kernel_bss_start()
-    let high = hal.kernel_arena_start()
+    let low = hal.kernel_slabs_start()
+    let high = hal.kernel_slabs_end()
     var seen: UInt32 = 0
     var kinds: [Int; SLAB_KINDS] = [0; SLAB_KINDS]
     var bases: [UInt; SLAB_KINDS] = [0; SLAB_KINDS]
@@ -313,7 +316,7 @@ public func install_image_slabs() unsafe {
         }
         seen = seen | bit
         if not fits_word(area.base) || not fits_word(area.len) {
-            fatal_image("a slab area lies outside the kernel's zeroed memory", i)
+            fatal_image("a slab area lies outside the kernel's slab region", i)
         }
         // A base is physical already, or the kernel's own address for a
         // physical one (a linker-resolved symbol on a higher-half kernel), and
@@ -323,7 +326,7 @@ public func install_image_slabs() unsafe {
         let linked = area.base as UInt
         let base = hal.virt_to_phys(linked)
         if linked != base && linked != hal.phys_to_virt(base) {
-            fatal_image("a slab area lies outside the kernel's zeroed memory",
+            fatal_image("a slab area lies outside the kernel's slab region",
                         linked)
         }
         let len = area.len as UInt
@@ -344,7 +347,7 @@ public func install_image_slabs() unsafe {
             fatal_image("a slab area's base is not aligned for its slots", base)
         }
         if base < low || base > high || len > high - base {
-            fatal_image("a slab area lies outside the kernel's zeroed memory",
+            fatal_image("a slab area lies outside the kernel's slab region",
                         base)
         }
         var j: UInt = 0
