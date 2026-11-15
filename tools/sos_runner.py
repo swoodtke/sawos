@@ -11527,6 +11527,31 @@ def _root_image_path(pkg_dir, arch):
     return os.path.join(out_dir, images[0])
 
 
+def check_read_only_probe(path):
+    """Refuse a read-only probe's source unless it can store nothing to a
+    peripheral: every load is one `UnsafeMemory` (whose view is `ReadOnly`, so
+    the compiler refuses a store through it), no `.write(` appears, and the
+    only call into the HAL is the one that halts. Comments are not read."""
+    with open(path) as f:
+        code = [line.split("//", 1)[0] for line in f.read().splitlines()]
+    code = "\n".join(code)
+    name = os.path.basename(path)
+    views = len(re.findall(r"\bUnsafeMemory\b", code))
+    if views != 1:
+        raise ToolError(f"{name} is a read-only probe and holds {views} "
+                        "UnsafeMemory views; it may hold exactly one, the "
+                        "ReadOnly view its `load` reads through")
+    if "ReadOnly<UInt32>" not in code:
+        raise ToolError(f"{name} is a read-only probe: its one view must "
+                        "be a ReadOnly<UInt32> field")
+    if re.search(r"\.write\(", code):
+        raise ToolError(f"{name} is a read-only probe and names `.write(`")
+    calls = sorted(set(re.findall(r"\bhal\.(\w+)", code)))
+    if calls != ["exit_pass"]:
+        raise ToolError(f"{name} is a read-only probe; the only HAL entry it "
+                        f"may call is exit_pass, and it calls {calls}")
+
+
 def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     """The ESP32-S3 board smoke: Xtensa, call0, the `Flat` tier. Returns the
     process exit status. `wanted` is the `--case` names (underscored), or
@@ -11575,7 +11600,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     own profile, with its own build directory; `rom` with the count off is
     `.build/esp32s3/sos`, and its images are the bytes they are without the
     keys. A case marked `"board_only"` (with its reason) is built only by
-    `--emit-flash`: the smoke prints the reason and runs nothing for it.
+    `--emit-flash`: the smoke prints the reason and runs nothing for it. A
+    case marked `"read_only_probe"` has its source held to
+    `check_read_only_probe` before it is built.
 
     Every board fact below was derived from the running emulator and is
     recorded with its probe in hal/xtensa-esp32s3/ABI.md.
@@ -12020,6 +12047,56 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "poll=0x00000000",
                            "SOS irqtb: 27 unmasked, poll=0x0000001b",
                            halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # The read-only board probe: the registers the boot ROM leaves,
+            # printed, with nothing written beyond what every image writes
+            # (`check_read_only_probe`). It is built for a board with
+            # `--emit-flash`; here it runs for the emulator's values. The
+            # eFuse reads 0 (the smoke gives it no file), SPI0, the IO MUX and
+            # the GPIO matrix are not modelled and read 0, the cache
+            # controller reads its reset values (the data cache's autoload is
+            # DONE, bit 3), the MMU table holds each entry's own index, and
+            # SPI1's clock and control are the words the ROM's flash driver
+            # wrote. Every other word is the emulator's own and the part's
+            # differ: the system and CPU clock words (the emulator runs the
+            # PLL), the strap, the peripheral enables, SPI1's command
+            # registers, pad hold, the ECC attribute, RTC pad 21 and the
+            # ROM's dummy bytes. Those lines are asserted as far as their
+            # first word's name.
+            "name": "s3_mem_probe",
+            "src": os.path.join(s3_tests, "s3_mem_probe.saw"),
+            "read_only_probe": True,
+            "expect_out": [
+                rom,
+                "SOS memprobe: efuse sys3=0x00000000 sys4=0x00000000 "
+                "PSRAM_CAP=0x00000000 PSRAM_VENDOR=0x00000000",
+                "SOS memprobe: clock strap=0x",
+                "SOS memprobe: spi0 clock=0x00000000 sram_clk=0x00000000 "
+                "core_clk_sel=0x00000000 ctrl=0x00000000 user=0x00000000 "
+                "user1=0x00000000 user2=0x00000000 misc=0x00000000",
+                "SOS memprobe: spi0 fctrl=0x00000000 sctrl=0x00000000 "
+                "sram_cmd=0x00000000 drd=0x00000000 dwr=0x00000000 "
+                "ddr=0x00000000 smem_ddr=0x00000000 smem_ac=0x00000000 "
+                "date=0x00000000",
+                "SOS memprobe: spi1 clock=0x00030103 ctrl=0x00208000 user=0x",
+                "SOS memprobe: cache dcache_ctrl=0x00000000 "
+                "dcache_ctrl1=0x00000000 dcache_autoload=0x00000008 "
+                "icache_ctrl=0x00000000",
+                "SOS memprobe: mmu 0=0x00000000 32=0x00000020 127=0x0000007f "
+                "128=0x00000080 255=0x000000ff 256=0x00000100 "
+                "383=0x0000017f 511=0x000001ff",
+                "SOS memprobe: iomux pin_ctrl=0x00000000 14=0x00000000 "
+                "21=0x00000000 26=0x00000000 27=0x00000000 28=0x00000000 "
+                "29=0x00000000 30=0x00000000 31=0x00000000 32=0x00000000",
+                "SOS memprobe: iomux 33=0x00000000 34=0x00000000 "
+                "35=0x00000000 36=0x00000000 37=0x00000000 41=0x00000000 "
+                "42=0x00000000 47=0x00000000",
+                "SOS memprobe: insel 7=0x00000000 8=0x00000000 "
+                "9=0x00000000 10=0x00000000 11=0x00000000",
+                "SOS memprobe: misc pad_hold=0x",
+                halt_pass],
             "expect_clean_exit": True,
         },
         {
@@ -12489,6 +12566,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         runner's own path. A board image is linked with no `simcall` in its
         stops."""
         name = case["name"]
+        if case.get("read_only_probe"):
+            check_read_only_probe(case["src"])
         if python_path:
             return flash_image(name, case_objs(case), board=board,
                                check=check)

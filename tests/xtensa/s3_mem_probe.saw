@@ -1,0 +1,322 @@
+// Board probe: what the boot ROM leaves in the eFuse, clock, memory-SPI,
+// cache, MMU and pad registers, read and printed, for a first look at a part
+// before anything drives its PSRAM or its pads.
+//
+// The image reads and writes nothing beyond what every image of this tree
+// writes: `_start`'s registers, the kernel's own RAM and the console's FIFO.
+// It does not call `intc_init`, never touches SYSTIMER (a read of its counter
+// takes a write of its snapshot bit), sends no command on the memory-SPI bus,
+// routes no interrupt and writes no pad, clock, cache or MMU register. It
+// does not change the clock: it runs at whatever the ROM left.
+//
+// That is held in two places. Every load goes through `load`, whose view is
+// a `ReadOnly` field, so a store through it is a compile error. And the
+// runner (`check_read_only_probe` in tools/sos_runner.py) refuses this file
+// unless `load` holds its only `UnsafeMemory`, it names no `.write(`, and the
+// only HAL entry it calls is the one that halts.
+//
+// Every address below is a register's address in ESP-IDF's `soc` headers
+// (components/soc/esp32s3/register/soc/, `reg_base.h`, `soc.h`), spelled as
+// the base the header gives plus the offset it gives; the comment on each
+// names the header's own symbol. The one value that is not a register is the
+// ROM's extra-dummy bytes, which sit in the ROM's RAM (see `rom_dummy`).
+//
+// The lines, in order (ABI.md "The board probe" says what each word decides):
+//   efuse     two eFuse words and the PSRAM fields they carry
+//   clock     the pad strap, the flash supply, the system and CPU clock
+//             words, and the peripheral clock and reset enables
+//   spi0      the cache-side controller
+//   spi1      the command-side controller
+//   cache     the data and instruction caches' configuration
+//   mmu       eight of the 512 translation entries
+//   iomux     the pad words of the pins the PSRAM, the flash and the board's
+//             GPIO work use
+//   insel     the GPIO matrix's input selects for signals 7 to 11
+//   misc      pad hold, ECC attribute, RTC pad 21, the ROM's extra dummy
+
+import kcore.{console}
+import hal
+
+/// One register as a read-only word. `ReadOnly` gates `read()` and withholds
+/// `write(v)`, so nothing in this file can store through it.
+struct Reg {
+    v: ReadOnly<UInt32>,
+}
+
+/// The only access to a peripheral address in this image.
+func load(addr: UInt) unsafe -> UInt32 {
+    UnsafeMemory<Reg, Device>(addr).v.read()
+}
+
+// -- Bases: reg_base.h and soc.h
+static SPI1_BASE: UInt = 0x6000_2000         // DR_REG_SPI1_BASE
+static SPI0_BASE: UInt = 0x6000_3000         // DR_REG_SPI0_BASE
+static GPIO_BASE: UInt = 0x6000_4000         // DR_REG_GPIO_BASE
+static EFUSE_BASE: UInt = 0x6000_7000        // DR_REG_EFUSE_BASE
+static RTC_CNTL_BASE: UInt = 0x6000_8000     // DR_REG_RTCCNTL_BASE
+static RTC_IO_BASE: UInt = 0x6000_8400       // DR_REG_RTCIO_BASE
+static IO_MUX_BASE: UInt = 0x6000_9000       // DR_REG_IO_MUX_BASE
+static SYSCON_BASE: UInt = 0x6002_6000       // DR_REG_SYSCON_BASE
+static SYSTEM_BASE: UInt = 0x600C_0000       // DR_REG_SYSTEM_BASE
+static EXTMEM_BASE: UInt = 0x600C_4000       // DR_REG_EXTMEM_BASE
+static MMU_TABLE: UInt = 0x600C_5000         // DR_REG_MMU_TABLE (soc.h)
+
+// -- efuse_reg.h
+static EFUSE_SYS_3: UInt = EFUSE_BASE + 0x50 // EFUSE_RD_MAC_SPI_SYS_3_REG
+static EFUSE_SYS_4: UInt = EFUSE_BASE + 0x54 // EFUSE_RD_MAC_SPI_SYS_4_REG
+static PSRAM_CAP_SHIFT: UInt32 = 3           // EFUSE_PSRAM_CAP_S, 2 bits
+static PSRAM_VENDOR_SHIFT: UInt32 = 7        // EFUSE_PSRAM_VENDOR_S, 2 bits
+
+// -- gpio_reg.h
+static GPIO_STRAP: UInt = GPIO_BASE + 0x38   // GPIO_STRAP_REG
+static GPIO_FUNC0_IN_SEL: UInt = GPIO_BASE + 0x154 // GPIO_FUNC0_IN_SEL_CFG_REG
+
+// -- rtc_cntl_reg.h, syscon_reg.h, rtc_io_reg.h
+static SDIO_CONF: UInt = RTC_CNTL_BASE + 0x7C   // RTC_CNTL_SDIO_CONF_REG
+static DIG_PAD_HOLD: UInt = RTC_CNTL_BASE + 0xDC // RTC_CNTL_DIG_PAD_HOLD_REG
+static SRAM_ACE0_ATTR: UInt = SYSCON_BASE + 0x58 // SYSCON_SRAM_ACE0_ATTR_REG
+static RTC_PAD21: UInt = RTC_IO_BASE + 0xD8     // RTC_IO_RTC_PAD21_REG
+static RTC_PAD21_MUX_SEL_SHIFT: UInt32 = 19     // RTC_IO_PAD21_MUX_SEL_S
+
+// -- system_reg.h
+static CPU_PER_CONF: UInt = SYSTEM_BASE + 0x10  // SYSTEM_CPU_PER_CONF_REG
+static PERIP_CLK_EN0: UInt = SYSTEM_BASE + 0x18 // SYSTEM_PERIP_CLK_EN0_REG
+static PERIP_RST_EN0: UInt = SYSTEM_BASE + 0x20 // SYSTEM_PERIP_RST_EN0_REG
+static SYSCLK_CONF: UInt = SYSTEM_BASE + 0x60   // SYSTEM_SYSCLK_CONF_REG
+
+// -- spi_mem_reg.h: offsets of SPI_MEM_<NAME>_REG(i), from SPI1 (i = 1) or
+// SPI0 (i = 0)
+static SPI_CMD: UInt = 0x0               // SPI_MEM_CMD_REG
+static SPI_CTRL: UInt = 0x8              // SPI_MEM_CTRL_REG
+static SPI_CLOCK: UInt = 0x14            // SPI_MEM_CLOCK_REG
+static SPI_USER: UInt = 0x18             // SPI_MEM_USER_REG
+static SPI_USER1: UInt = 0x1C            // SPI_MEM_USER1_REG
+static SPI_USER2: UInt = 0x20            // SPI_MEM_USER2_REG
+static SPI_MISC: UInt = 0x34             // SPI_MEM_MISC_REG
+static SPI_CACHE_FCTRL: UInt = 0x3C      // SPI_MEM_CACHE_FCTRL_REG
+static SPI_CACHE_SCTRL: UInt = 0x40      // SPI_MEM_CACHE_SCTRL_REG
+static SPI_SRAM_CMD: UInt = 0x44         // SPI_MEM_SRAM_CMD_REG
+static SPI_SRAM_DRD_CMD: UInt = 0x48     // SPI_MEM_SRAM_DRD_CMD_REG
+static SPI_SRAM_DWR_CMD: UInt = 0x4C     // SPI_MEM_SRAM_DWR_CMD_REG
+static SPI_SRAM_CLK: UInt = 0x50         // SPI_MEM_SRAM_CLK_REG
+static SPI_SMEM_AC: UInt = 0xDC          // SPI_MEM_SPI_SMEM_AC_REG
+static SPI_DDR: UInt = 0xE0              // SPI_MEM_DDR_REG
+static SPI_SMEM_DDR: UInt = 0xE4         // SPI_MEM_SPI_SMEM_DDR_REG
+static SPI_CORE_CLK_SEL: UInt = 0xEC     // SPI_MEM_CORE_CLK_SEL_REG
+static SPI_DATE: UInt = 0x3FC            // SPI_MEM_DATE_REG
+
+// -- extmem_reg.h
+static DCACHE_CTRL: UInt = EXTMEM_BASE + 0x0       // EXTMEM_DCACHE_CTRL_REG
+static DCACHE_CTRL1: UInt = EXTMEM_BASE + 0x4      // EXTMEM_DCACHE_CTRL1_REG
+// EXTMEM_DCACHE_AUTOLOAD_CTRL_REG
+static DCACHE_AUTOLOAD: UInt = EXTMEM_BASE + 0x4C
+static ICACHE_CTRL: UInt = EXTMEM_BASE + 0x60      // EXTMEM_ICACHE_CTRL_REG
+
+// -- io_mux_reg.h: `PIN_CTRL` is the base, and the pad of GPIO n is the word
+// after the n words that precede it (PERIPHS_IO_MUX_GPIO0_U is +0x04, and
+// IO_MUX_GPIOn_REG follows at four bytes a pad).
+static IO_MUX_PIN_CTRL: UInt = IO_MUX_BASE + 0x0   // PIN_CTRL
+static IO_MUX_GPIO0: UInt = IO_MUX_BASE + 0x4      // IO_MUX_GPIO0_REG
+
+// -- The ROM's RAM, not a register: `rom_spiflash_legacy_data`, a pointer
+// the ROM keeps at ROM_LEGACY_POINTER to a structure whose bytes at +24 and
+// +25 are the extra dummy it adds to SPI0's and SPI1's commands.
+static ROM_LEGACY_POINTER: UInt = 0x3FCE_FFE4
+static ROM_DUMMY_SPI0: UInt = 24
+static SRAM_LOW: UInt = 0x3FC8_8000      // the data bus's window on SRAM
+static SRAM_END: UInt = 0x3FD0_0000
+
+func text(s: String) unsafe {
+    console().write_str(s)
+}
+
+func line(name: String) unsafe {
+    text("SOS memprobe: ")
+    text(name)
+}
+
+func eol() unsafe {
+    text("\n")
+}
+
+func show(name: String, v: UInt32) unsafe {
+    text(" ")
+    text(name)
+    text("=")
+    console().write_hex(v as UInt)
+}
+
+func reg(name: String, addr: UInt) unsafe {
+    show(name, load(addr))
+}
+
+func spi_reg(name: String, base: UInt, offset: UInt) unsafe {
+    reg(name, base + offset)
+}
+
+func pad(name: String, gpio: UInt) unsafe {
+    reg(name, IO_MUX_GPIO0 + 4 * gpio)
+}
+
+func entry(name: String, n: UInt) unsafe {
+    reg(name, MMU_TABLE + 4 * n)
+}
+
+func in_sel(name: String, signal: UInt) unsafe {
+    reg(name, GPIO_FUNC0_IN_SEL + 4 * signal)
+}
+
+func probe_efuse() unsafe {
+    let sys4 = load(EFUSE_SYS_4)
+    line("efuse")
+    reg("sys3", EFUSE_SYS_3)
+    show("sys4", sys4)
+    show("PSRAM_CAP", (sys4 >> PSRAM_CAP_SHIFT) & 3)
+    show("PSRAM_VENDOR", (sys4 >> PSRAM_VENDOR_SHIFT) & 3)
+    eol()
+}
+
+func probe_clock() unsafe {
+    line("clock")
+    reg("strap", GPIO_STRAP)
+    reg("sdio_conf", SDIO_CONF)
+    reg("sysclk", SYSCLK_CONF)
+    reg("cpu_per", CPU_PER_CONF)
+    reg("perip_clk_en0", PERIP_CLK_EN0)
+    reg("perip_rst_en0", PERIP_RST_EN0)
+    eol()
+}
+
+func probe_spi0() unsafe {
+    line("spi0")
+    spi_reg("clock", SPI0_BASE, SPI_CLOCK)
+    spi_reg("sram_clk", SPI0_BASE, SPI_SRAM_CLK)
+    spi_reg("core_clk_sel", SPI0_BASE, SPI_CORE_CLK_SEL)
+    spi_reg("ctrl", SPI0_BASE, SPI_CTRL)
+    spi_reg("user", SPI0_BASE, SPI_USER)
+    spi_reg("user1", SPI0_BASE, SPI_USER1)
+    spi_reg("user2", SPI0_BASE, SPI_USER2)
+    spi_reg("misc", SPI0_BASE, SPI_MISC)
+    eol()
+    line("spi0")
+    spi_reg("fctrl", SPI0_BASE, SPI_CACHE_FCTRL)
+    spi_reg("sctrl", SPI0_BASE, SPI_CACHE_SCTRL)
+    spi_reg("sram_cmd", SPI0_BASE, SPI_SRAM_CMD)
+    spi_reg("drd", SPI0_BASE, SPI_SRAM_DRD_CMD)
+    spi_reg("dwr", SPI0_BASE, SPI_SRAM_DWR_CMD)
+    spi_reg("ddr", SPI0_BASE, SPI_DDR)
+    spi_reg("smem_ddr", SPI0_BASE, SPI_SMEM_DDR)
+    spi_reg("smem_ac", SPI0_BASE, SPI_SMEM_AC)
+    spi_reg("date", SPI0_BASE, SPI_DATE)
+    eol()
+}
+
+func probe_spi1() unsafe {
+    line("spi1")
+    spi_reg("clock", SPI1_BASE, SPI_CLOCK)
+    spi_reg("ctrl", SPI1_BASE, SPI_CTRL)
+    spi_reg("user", SPI1_BASE, SPI_USER)
+    spi_reg("user1", SPI1_BASE, SPI_USER1)
+    spi_reg("user2", SPI1_BASE, SPI_USER2)
+    spi_reg("misc", SPI1_BASE, SPI_MISC)
+    spi_reg("fctrl", SPI1_BASE, SPI_CACHE_FCTRL)
+    spi_reg("ddr", SPI1_BASE, SPI_DDR)
+    spi_reg("cmd", SPI1_BASE, SPI_CMD)
+    eol()
+}
+
+func probe_cache() unsafe {
+    line("cache")
+    reg("dcache_ctrl", DCACHE_CTRL)
+    reg("dcache_ctrl1", DCACHE_CTRL1)
+    reg("dcache_autoload", DCACHE_AUTOLOAD)
+    reg("icache_ctrl", ICACHE_CTRL)
+    eol()
+}
+
+func probe_mmu() unsafe {
+    line("mmu")
+    entry("0", 0)
+    entry("32", 32)
+    entry("127", 127)
+    entry("128", 128)
+    entry("255", 255)
+    entry("256", 256)
+    entry("383", 383)
+    entry("511", 511)
+    eol()
+}
+
+func probe_iomux() unsafe {
+    line("iomux")
+    reg("pin_ctrl", IO_MUX_PIN_CTRL)
+    pad("14", 14)
+    pad("21", 21)
+    pad("26", 26)
+    pad("27", 27)
+    pad("28", 28)
+    pad("29", 29)
+    pad("30", 30)
+    pad("31", 31)
+    pad("32", 32)
+    eol()
+    line("iomux")
+    pad("33", 33)
+    pad("34", 34)
+    pad("35", 35)
+    pad("36", 36)
+    pad("37", 37)
+    pad("41", 41)
+    pad("42", 42)
+    pad("47", 47)
+    eol()
+}
+
+func probe_in_sel() unsafe {
+    line("insel")
+    in_sel("7", 7)
+    in_sel("8", 8)
+    in_sel("9", 9)
+    in_sel("10", 10)
+    in_sel("11", 11)
+    eol()
+}
+
+/// The ROM's extra-dummy byte for SPI0 and the one after it for SPI1, or the
+/// word `unreadable` when the pointer is not a word address in SRAM (it is
+/// never dereferenced then).
+func rom_dummy() unsafe {
+    let at = load(ROM_LEGACY_POINTER) as UInt
+    show("rom_dummy_ptr", at as UInt32)
+    if at < SRAM_LOW || at >= SRAM_END - ROM_DUMMY_SPI0 - 4 || (at & 3) != 0 {
+        text(" rom_dummy=unreadable")
+        return
+    }
+    let word = load(at + ROM_DUMMY_SPI0)
+    show("rom_dummy_spi0", word & 0xFF)
+    show("rom_dummy_spi1", (word >> 8) & 0xFF)
+}
+
+func probe_misc() unsafe {
+    line("misc")
+    reg("pad_hold", DIG_PAD_HOLD)
+    reg("ace0", SRAM_ACE0_ATTR)
+    reg("rtc_pad21", RTC_PAD21)
+    show("rtc_pad21_mux_sel", (load(RTC_PAD21) >> RTC_PAD21_MUX_SEL_SHIFT) & 1)
+    rom_dummy()
+    eol()
+}
+
+@export("kmain")
+func kmain() unsafe {
+    probe_efuse()
+    probe_clock()
+    probe_spi0()
+    probe_spi1()
+    probe_cache()
+    probe_mmu()
+    probe_iomux()
+    probe_in_sel()
+    probe_misc()
+    hal.exit_pass()
+}

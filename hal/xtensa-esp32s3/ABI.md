@@ -1852,3 +1852,139 @@ xtal40     208906   31314
 
 Every phase is about twice as fast at twice the clock, and the console's
 wait for FIFO room is under two percent of the run at either.
+
+---
+
+## 15. The board probe
+
+`tests/xtensa/s3_mem_probe.saw`, the smoke's `s3_mem_probe`, reads the
+registers the boot ROM leaves and prints them: the eFuse, the clock, the
+memory-SPI controllers, the caches, the MMU and the pads. It is the first look
+at a part before anything drives its PSRAM or its pads, and its words are what
+a board description's clock and pad facts will be written from.
+
+It writes nothing beyond what every image of this tree writes (`_start`'s
+registers, the kernel's RAM, the console's FIFO). It does not call
+`intc_init`, does not touch SYSTIMER (a read of its counter takes a write of
+its snapshot bit), sends no command on the memory-SPI bus, routes no
+interrupt, writes no pad, clock, cache or MMU register, and leaves the clock
+at the `rom` key's. Two things hold that: every load goes through one
+accessor whose view is a `ReadOnly` field, so a store through it is a compile
+error, and the runner refuses the source unless that view is its only
+`UnsafeMemory`, it names no `.write(`, and the only HAL entry it calls is the
+one that halts (`check_read_only_probe`).
+
+`python3 tools/sos_runner.py --board esp32s3 --emit-flash s3_mem_probe --out
+PATH` builds the flashable image. Every address is the header's: a register's
+address in ESP-IDF's `soc` headers (`reg_base.h` base plus the register's
+offset), named in the probe's file by the header's own symbol.
+
+### 15a. The lines
+
+Each word is printed as `name=0x%08x`. In order:
+
+```
+SOS memprobe: efuse sys3= sys4= PSRAM_CAP= PSRAM_VENDOR=
+SOS memprobe: clock strap= sdio_conf= sysclk= cpu_per= perip_clk_en0=
+              perip_rst_en0=
+SOS memprobe: spi0 clock= sram_clk= core_clk_sel= ctrl= user= user1= user2=
+              misc=
+SOS memprobe: spi0 fctrl= sctrl= sram_cmd= drd= dwr= ddr= smem_ddr= smem_ac=
+              date=
+SOS memprobe: spi1 clock= ctrl= user= user1= user2= misc= fctrl= ddr= cmd=
+SOS memprobe: cache dcache_ctrl= dcache_ctrl1= dcache_autoload= icache_ctrl=
+SOS memprobe: mmu 0= 32= 127= 128= 255= 256= 383= 511=
+SOS memprobe: iomux pin_ctrl= 14= 21= 26= 27= 28= 29= 30= 31= 32=
+SOS memprobe: iomux 33= 34= 35= 36= 37= 41= 42= 47=
+SOS memprobe: insel 7= 8= 9= 10= 11=
+SOS memprobe: misc pad_hold= ace0= rtc_pad21= rtc_pad21_mux_sel=
+              rom_dummy_ptr= rom_dummy_spi0= rom_dummy_spi1=
+SOS-S3: halt pass
+```
+
+(a wrapped line is one line.) What each word decides:
+
+- `sys4`, `PSRAM_CAP`, `PSRAM_VENDOR`: the in-package PSRAM's size and
+  vendor, as the eFuse says them (`EFUSE_RD_MAC_SPI_SYS_4_REG`, the two
+  fields at bits [4:3] and [8:7]). The code for 8 MiB is 1 and for an AP
+  3.3 V part is 1. `sys3` is the word before it.
+- `sysclk` is the whole of `SYSTEM_SYSCLK_CONF_REG`: `SOC_CLK_SEL` [11:10],
+  `PRE_DIV_CNT` [9:0], `CLK_DIV_EN` bit 19 and `CLK_XTAL_FREQ`. `cpu_per` is
+  the whole of `SYSTEM_CPU_PER_CONF_REG` (`PLL_FREQ_SEL`, `CPUPERIOD_SEL`).
+  With `core_clk_sel` these are every field that sets the CPU's and the
+  memory-SPI core's clock. They say what clock the ROM left; §14h has the
+  words the part printed for them.
+- `spi0 clock`, `spi0 sram_clk`, `spi1 clock`: the dividers of the flash,
+  the PSRAM's cache-fill side and SPI1; they say what the ROM's flash driver
+  set. `core_clk_sel` is the one core clock both controllers share.
+- `spi0 smem_ac`, `smem_ddr`, `sram_cmd`, `drd`, `dwr`, `fctrl`, `sctrl`:
+  what SPI0 holds for the PSRAM side before anything configures it.
+  `spi0 date` carries the clock-pad drive enable (`SPICLK_PAD_DRV_CTL_EN`).
+- `spi1 user`, `user1`, `user2`, `misc`, `fctrl`, `ddr`, `cmd`: SPI1's
+  command setup as the ROM left it, and whether a command is pending (`cmd`).
+- `cache`: the data cache's size, ways and line (`dcache_ctrl`), whether its
+  bus is shut (`dcache_ctrl1` bit 0), whether an autoload is in flight
+  (`dcache_autoload`, DONE at bit 3) and the instruction cache's shape.
+- `mmu`: the translation table's entries, which pages the ROM mapped. An
+  entry is a page number, bit 14 set for invalid, bit 15 set for PSRAM; the
+  entries 256 to 383 are the ones a PSRAM map would replace.
+- `iomux pin_ctrl`, and a pad's word per pin: the function, pulls, input
+  enable and drive of the flash's pads (27 to 32; pad 30's drive is the
+  clock's), the PSRAM's (26, 33 to 37), and the pins the board's GPIO work
+  uses (14, 21, 41, 42, 47).
+- `insel`: whether the GPIO matrix's input selects for signals 7 to 11
+  (the PSRAM's D4 to D7 and DQS) route straight from the IO MUX (bit 7
+  clear).
+- `strap`: the pad straps (`GPIO_STRAP_REG`); `sdio_conf`: the VDD_SPI
+  supply's source and force bits (`RTC_CNTL_SDIO_CONF_REG`), with `strap`
+  and the eFuse, what voltage the package runs at.
+- `perip_clk_en0`, `perip_rst_en0`: which peripherals' clocks run and which
+  are held in reset before any driver turns one on.
+- `pad_hold`: whether any pad is held (`RTC_CNTL_DIG_PAD_HOLD_REG`); `ace0`:
+  the PSRAM ECC attribute (`SYSCON_SRAM_ACE0_ATTR_REG`, bit 8);
+  `rtc_pad21` and `rtc_pad21_mux_sel` (bit 19): whether RTC pad 21 is routed
+  to the RTC domain or to the IO MUX.
+- `rom_dummy_ptr`, `rom_dummy_spi0`, `rom_dummy_spi1`: the ROM's pointer to
+  its flash-driver state, and the extra dummy bytes it keeps there for SPI0
+  and SPI1 (at offsets 24 and 25 of what it points to). Not a register. The
+  pointer is read at 0x3FCE_FFE4 and followed only if it is a word address in
+  SRAM; otherwise the line says `rom_dummy=unreadable`.
+
+### 15b. On the emulator
+
+The eFuse reads 0 (the smoke gives it no file); `spi0`, `iomux` and `insel`
+read 0 (no model); `spi1 clock` and `ctrl` are `0x00030103` and `0x00208000`,
+the words the ROM's flash driver writes; the cache controller reads its reset
+values (`dcache_autoload` is `0x00000008`, DONE, the others 0); each `mmu`
+entry holds its own index. `sysclk` reads `0x000a8401` (the emulator runs the
+PLL) and `cpu_per` 0. The smoke asserts all of these but the last two, and
+prints every word it does not assert.
+
+### 15c. On the part
+
+The cells are empty until a board run fills them. The clock words are in
+§14h and are not repeated here; this run's `sysclk`, `cpu_per`,
+`core_clk_sel` and `spi1 clock` should agree with them.
+
+| word | part |
+|---|---|
+| `sys3`, `sys4` | |
+| `PSRAM_CAP`, `PSRAM_VENDOR` | |
+| `strap`, `sdio_conf` | |
+| `sysclk`, `cpu_per`, `core_clk_sel` | |
+| `perip_clk_en0`, `perip_rst_en0` | |
+| `spi0 clock`, `sram_clk`, `ctrl`, `user`, `user1`, `user2`, `misc` | |
+| `spi0 fctrl`, `sctrl`, `sram_cmd`, `drd`, `dwr` | |
+| `spi0 ddr`, `smem_ddr`, `smem_ac`, `date` | |
+| `spi1 clock`, `ctrl`, `user`, `user1`, `user2` | |
+| `spi1 misc`, `fctrl`, `ddr`, `cmd` | |
+| `dcache_ctrl`, `dcache_ctrl1`, `dcache_autoload`, `icache_ctrl` | |
+| `mmu` 0, 32, 127, 128, 255, 256, 383, 511 | |
+| `iomux pin_ctrl`, pads 14, 21 | |
+| `iomux` pads 26 to 32 (CS1, then the flash's) | |
+| `iomux` pads 33 to 37 (the PSRAM's D4 to D7, DQS) | |
+| `iomux` pads 41, 42, 47 | |
+| `insel` 7 to 11 | |
+| `pad_hold`, `ace0` | |
+| `rtc_pad21`, `rtc_pad21_mux_sel` | |
+| `rom_dummy_ptr`, `rom_dummy_spi0`, `rom_dummy_spi1` | |
