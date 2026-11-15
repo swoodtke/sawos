@@ -30,8 +30,10 @@ user/child.ld       a child: the same, its slot at 0x18_0000 and its DRAM
                     from 0x3FCC_8000
 keys/               an image's build keys, each a module the runner maps to
                     one of these directories: `s3clock` (`clock-rom`, the
-                    default, and `clock-xtal40`) and `s3stall` (`stall-off`,
-                    the default, and `stall-on`); ABI.md §14
+                    default, `clock-xtal40` and `clock-pll80`) and `s3stall`
+                    (`stall-off`, the default, and `stall-on`); ABI.md §14.
+                    `clock-common` is `s3clockkit`, what the clock keys
+                    that write share
 ABI.md              every board fact, with the probe that produced it; §13 is
                     the process layout, §14 the system clock
 ```

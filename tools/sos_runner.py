@@ -12219,9 +12219,11 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         return obj
 
     # The build keys. Each names a module the HAL imports, and each value a
-    # directory under `keys/` holding that module for the value.
+    # directory under `keys/` holding that module for the value. The clock
+    # keys that write share `s3clockkit` (`keys/clock-common`), mapped for
+    # every image and compiled only into one whose key imports it.
     keys_dir = os.path.join(s3_hal, "keys")
-    clock_keys = ("rom", "xtal40")
+    clock_keys = ("rom", "xtal40", "pll80")
 
     def variant(case):
         """A case's build keys: its clock and whether the console counts its
@@ -12244,6 +12246,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                 tc().module_path_arg("imgformat"), SOSRT_MODULE,
                 SOSABI_MODULE,
                 f"s3clock={os.path.join(keys_dir, 'clock-' + clock)}",
+                f"s3clockkit={os.path.join(keys_dir, 'clock-common')}",
                 "s3stall=" + os.path.join(
                     keys_dir, "stall-on" if stall else "stall-off")]
 
@@ -12472,6 +12475,16 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         "cpu_per=0x00000000->0x00000000 mhz=",
         " uart_clk=0x15122500 mspi_core=0x00000000 mspi_clock=0x00000000 "
         "rtc_date=0x00000000\n"]
+    # The `pll80` clock line as the emulator prints it, the same way. The
+    # emulator's word has the CPU on the PLL already, so the key keeps it and
+    # brings nothing up (`bbpll=kept`); its three clock stores are dropped,
+    # and RTC_CNTL_OPTIONS0 and the analog master read 0 (ABI.md §14e).
+    clock_pll80_lines = [
+        "SOS-S3: clock pll80 sysclk=0x000a8401->0x000a8401 "
+        "cpu_per=0x00000000->0x00000000 options0=0x00000000->0x00000000 "
+        "bbpll=kept ana_conf0=0x00000000 mhz=",
+        " uart_clk=0x15122500 mspi_core=0x00000000 mspi_clock=0x00000000 "
+        "rtc_date=0x00000000\n"]
     # The kernel-only cases, in the gate's case shape so `_check` judges them
     # too. The exit status is the kernel's own semihosting exit, so a failing
     # stop is non-zero and carries its code.
@@ -12496,6 +12509,20 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "clock": "xtal40",
             "expect_out": [rom, *clock_xtal40_lines, banner,
+                           "SOS: bad root image: no root image appended",
+                           "SOS-S3: halt fail code=0x00000004"],
+            "expect_clean_exit": False,
+            "expect_status": 4,
+        },
+        {
+            # The same boot at the `pll80` clock key, on the emulator's path:
+            # the CPU found on the PLL keeps it, the three stores are made,
+            # the line is printed before the banner and the console works
+            # after it. `pll_bringup` runs the bring-up itself.
+            "name": "boot_pll80",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "clock": "pll80",
+            "expect_out": [rom, *clock_pll80_lines, banner,
                            "SOS: bad root image: no root image appended",
                            "SOS-S3: halt fail code=0x00000004"],
             "expect_clean_exit": False,
@@ -12820,7 +12847,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             # The kernel calling windowed code through `sos_windowed_call`
             # (ABI.md §7g): the mask ROM's `crc32_le`; a chain deep enough to
             # spill and fill the stub's own frame; a12..a15 kept across a
-            # callee that writes them; four arguments; the kernel's PS put
+            # callee that writes them; six arguments; the kernel's PS put
             # back; the Alloca exception under the stub, handled at the
             # kernel vector; the chain and the Alloca again with the stub
             # entered at WINDOWBASE 1; and the ROM again with every
@@ -12837,7 +12864,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "0x40035880",
                            "SOS rom: deep=0x00181000",
                            "SOS rom: a12-a15 lost=0x00000000",
-                           "SOS rom: four arguments=0x44332211",
+                           "SOS rom: six arguments=0x00654321",
                            # WOE, CALLINC 2 (the `callx8`), INTLEVEL 15.
                            "SOS rom: ps inside=0x0006000f",
                            "SOS rom: ps after=0x0000000f",
@@ -12880,6 +12907,20 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "expect_tail": "SOS-S3: halt fail code=0x00000006",
             "expect_clean_exit": False,
             "expect_status": 6,
+        },
+        {
+            # The BBPLL's bring-up (ABI.md §14d): its ROM calls go through
+            # the stub and return; the emulator has no analog block, so the
+            # calibration is never reported done and the bring-up answers
+            # that (1) instead of waiting for ever; and the three power-down
+            # bits it clears in RTC_CNTL_OPTIONS0, which the emulator keeps,
+            # come back clear with the bits beside them as they were.
+            "name": "pll_bringup",
+            "src": os.path.join(s3_tests, "pll_bringup.saw"),
+            "expect_out": [rom, "SOS pll: bringup=0x00000001 "
+                           "options0=0x1c000000",
+                           halt_pass],
+            "expect_clean_exit": True,
         },
     ]
 
@@ -13156,6 +13197,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         # the console right throughout.
         dict(by_name["kill_churn"], name="kill_churn_xtal40", clock="xtal40",
              expect_out=[*clock_xtal40_lines,
+                         *by_name["kill_churn"]["expect_out"]]),
+        # And at the `pll80` clock key, on the emulator's path (`boot_pll80`).
+        dict(by_name["kill_churn"], name="kill_churn_pll80", clock="pll80",
+             expect_out=[*clock_pll80_lines,
                          *by_name["kill_churn"]["expect_out"]]),
         {
             # `kill_churn` timed: root stamps the clock around each phase of
@@ -13538,7 +13583,7 @@ def main():
     parser.add_argument("--clock", metavar="KEY",
                         help="with --emit-flash: the CPU clock key the image "
                              "is built with, in place of the case's own "
-                             "(`rom`, the default, or `xtal40`; "
+                             "(`rom`, the default, `xtal40` or `pll80`; "
                              "hal/xtensa-esp32s3/ABI.md §14)")
     args = parser.parse_args()
 

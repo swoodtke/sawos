@@ -12,8 +12,8 @@
  * u32 wtest_clobber(void): writes its a4..a7, which are the stub's a12..a15,
  * and answers 0.
  *
- * u32 wtest_args(u32 a, u32 b, u32 c, u32 d): a ^ b << 8 ^ c << 16 ^ d << 24,
- * so each of the four arguments shows.
+ * u32 wtest_args(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f): a ^ b << 4 ^
+ * c << 8 ^ d << 12 ^ e << 16 ^ f << 20, so each of the six arguments shows.
  *
  * u32 wtest_ps_inside(void): PS as the callee runs.
  *
@@ -112,12 +112,16 @@ wtest_clobber:
     .type   wtest_args, @function
 wtest_args:
     entry   a1, 32
-    slli    a3, a3, 8
-    slli    a4, a4, 16
-    slli    a5, a5, 24
+    slli    a3, a3, 4
+    slli    a4, a4, 8
+    slli    a5, a5, 12
+    slli    a6, a6, 16
+    slli    a7, a7, 20
     xor     a2, a2, a3
     xor     a2, a2, a4
     xor     a2, a2, a5
+    xor     a2, a2, a6
+    xor     a2, a2, a7
     retw
 
     .section .text.wtest_ps_inside, "ax"

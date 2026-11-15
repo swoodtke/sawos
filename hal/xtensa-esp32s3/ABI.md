@@ -962,7 +962,8 @@ round trip                     87              212
 .text.vectors (IRAM)        1303 B          1777 B
 ```
 
-`sos_windowed_call` (§7g) adds 135 bytes of flash and its close 9.
+`sos_windowed_call` (§7g) is 144 bytes of IRAM and two literal words, in an
+image that calls it, and its close 9 bytes of flash.
 
 Every added instruction is a load, a store, a `rotw`, a `mov` or a special
 register access, but for the user vector's cause test and the resume's `addi
@@ -1191,10 +1192,15 @@ harness deadline with the image's "no tick" flag set.
 
 ### 7g. The kernel calling a windowed function
 
-`sos_windowed_call(fn, a, b, c, d)` (`kernel/boot.S`) is how the call0
-kernel calls a windowed function, which every mask-ROM function is (§1d): a
-call0 function in flash that `callx8`s `fn` with four arguments and returns
-its `a2`.
+`sos_windowed_call(fn, a, b, c, d, e, f)` (`kernel/boot.S`) is how the
+call0 kernel calls a windowed function, which every mask-ROM function is
+(§1d): a call0 function that `callx8`s `fn` with six arguments, every
+argument register a `callx8` passes, and returns its `a2`. The sixth is the
+call0 caller's seventh argument word, on its stack (§7e); a callee reads
+only the arguments it takes, so a caller may pass fewer. It sits in IRAM
+(an `.iram.text.*` section, which the link drops from an image that never
+calls it), so the PLL's bring-up can call the ROM without a fetch through
+the flash cache (§14d).
 
 - **Only before the loader.** The ROM's functions read tables in the ROM's
   RAM (0x3FCD_7E04 up, §3b): the phy table `rom_i2c_writeReg` calls through,
@@ -1236,10 +1242,10 @@ its `a2`.
   the stub and execute no `movsp`, `rotw`, `rsil`, `waiti` or PS write (read
   from the ROM's disassembly); neither case is reached by them.
 - **The return.** `retw` takes the top two bits of its target from its own
-  PC, so the stub sits where they are 01, as flash and IRAM both are.
+  PC, so the stub sits where they are 01, as IRAM is.
 
 The cases: `rom_call` (the ROM's `crc32_le`; a chain deep enough to spill and
-fill the stub's frame; `a12..a15` held; four arguments; PS inside the call
+fill the stub's frame; `a12..a15` held; six arguments; PS inside the call
 and after it; the Alloca exception under the stub; the chain and the Alloca
 again from WINDOWBASE 1; the ROM again with every WINDOWSTART bit set, which
 is set again after), `rom_spill_fault` (a spill fault under the stub stops
@@ -1714,7 +1720,25 @@ SPI_MEM_CORE_CLK_SEL_REG(0) 0x6000_30EC [1:0] reset 0
 UART0 UART_CLK_CONF_REG 0x6000_0078   soc/esp32s3/register/soc/uart_reg.h
   SCLK_SEL     [21:20]  R/W  reset 3   1 APB, 2 RC_FAST, 3 the crystal
   SCLK_DIV_NUM [19:12]  R/W  reset 1
+RTC_CNTL_OPTIONS0_REG 0x6000_8000     soc/esp32s3/register/soc/rtc_cntl_reg.h
+  BBPLL_FORCE_PD [10], BBPLL_I2C_FORCE_PD [8], BB_I2C_FORCE_PD [6]
+                        R/W  reset 0   the BBPLL and its analog bus held
+                                       powered down (clk_ll_bbpll_enable,
+                                       clk_ll_bbpll_disable)
+I2C_MST_ANA_CONF0_REG 0x6000_E040     soc/esp32s3/include/soc/regi2c_defs.h
+  BBPLL_STOP_FORCE_HIGH [2], BBPLL_STOP_FORCE_LOW [3]
+                                       the BBPLL's calibration held stopped
+                                       or let run (regi2c_ctrl_ll.h)
+  BBPLL_CAL_DONE [24]                  the calibration has finished
+ANA_CONFIG_REG 0x6000_E044 [17:8]     a bit per analog block, holding its
+                                       bus off; [17] is the BBPLL's
+                                       (regi2c_defs.h, I2C_BBPLL_M)
 ```
+
+The BBPLL's own registers are on the chip's internal analog bus, block 0x66
+(`I2C_BBPLL`, soc/esp32s3/include/soc/regi2c_bbpll.h), reached through the
+analog master at 0x6000_E000; ESP-IDF writes them only through the mask
+ROM's `rom_i2c_writeReg` and `rom_i2c_writeReg_Mask` (below).
 
 APB follows the CPU on the crystal and is 80 MHz on the PLL:
 `rtc_clk_cpu_freq_to_xtal` calls `rtc_clk_apb_freq_update(cpu_freq * MHZ)`
@@ -1765,10 +1789,13 @@ the crystal, and the PLL path (`rtc_clk_bbpll_enable`,
 240 MHz, which `rtc_clk_cpu_freq_mhz_to_config` maps to the PLL at 480 MHz
 divided by 6, 3 and 2. The bootloader calls `rtc_clk_init` only when the
 reset was not a CPU software reset or APB reads below 80 MHz (the condition
-around the call in bootloader_clock_init.c). Every step, in order:
+around the call in bootloader_clock_init.c). Every step, in order, and what
+each key takes of it: the B and R rows belong to both keys that write, the X
+rows are the crystal path, `xtal40`'s, and the S, P and Q rows the PLL path,
+`pll80`'s.
 
 ```
-step                     register, field = value              taken by xtal40
+step                     register, field = value              taken
 -- bootloader_clock_configure (bootloader_clock_init.c) -----------------------
 B1 esp_rom_output_tx_    poll UART0 until the FIFO is empty   yes: the drain,
    wait_idle(0)          and the transmitter idle: STATUS     the same test
@@ -1785,9 +1812,9 @@ R1 RTC_CNTL_REG.SCK_DCAP, RTC_CNTL_CLK_CONF.CK8M_DFREQ        no: tune the RC
                                                               the CPU's clock
 R2 RTC_CNTL_SLOW_CLK_CONF.ANA_CLK_DIV, RTC_CNTL_CLK_CONF.     no: the same
    CK8M_DIV_SEL (rtc_clk_divider_set, rtc_clk_8m_divider_set)
-R3 ANA_CONFIG_REG 0x6000_E044 [17:8] = 0x3FF                  no: PLL only
-   (regi2c_ctrl_ll_i2c_reset), then [17] = 0
-   (regi2c_ctrl_ll_i2c_bbpll_enable; soc/regi2c_defs.h)
+R3 ANA_CONFIG_REG 0x6000_E044 [17:8] = 0x3FF                  pll80: yes, in
+   (regi2c_ctrl_ll_i2c_reset), then [17] = 0                  the bring-up;
+   (regi2c_ctrl_ll_i2c_bbpll_enable; soc/regi2c_defs.h)       xtal40: no
 R4 esp_rom_output_tx_wait_idle(0)                             as B1
 R5 RTC_XTAL_FREQ_REG (RTC_CNTL_STORE4) = 40 | 40 << 16        no: bookkeeping
    (rtc_clk_xtal_freq_update), and the APB frequency          for ROM and IDF
@@ -1829,37 +1856,55 @@ X7 RTC_CNTL_DATE_REG.SLAVE_PD [18:13] = DEFAULT_LDO_SLAVE     no: see below
    it (s_bbpll_digi_consumers_ref_count), calls
    rtc_clk_bbpll_disable: RTC_CNTL_OPTIONS0
    BB_I2C_FORCE_PD, BBPLL_FORCE_PD, BBPLL_I2C_FORCE_PD set
+-- rtc_clk_cpu_freq_set_config, the PLL path (rtc_clk.c) ----------------------
+S1 P1 to P7 only when the old source, clk_ll_cpu_get_src,     yes: the same
+   is not the PLL; then the Q rows                            test, on the
+                                                              source read first
 -- rtc_clk_bbpll_enable (rtc_clk.c, clk_tree_ll.h) -----------------------------
-P1 RTC_CNTL_OPTIONS0 0x6000_8000: clear BB_I2C_FORCE_PD [6],  not built
-   BBPLL_I2C_FORCE_PD [8], BBPLL_FORCE_PD [10] (each reset 0)
+P1 RTC_CNTL_OPTIONS0 0x6000_8000: clear BB_I2C_FORCE_PD [6],  yes, in the
+   BBPLL_I2C_FORCE_PD [8], BBPLL_FORCE_PD [10], each reset 0  bring-up
+   (clk_ll_bbpll_enable)
 -- rtc_clk_bbpll_configure(40, 480) -------------------------------------------
-P2 CPU_PER_CONF.PLL_FREQ_SEL = 1 (clk_ll_bbpll_set_freq_mhz)  not built
-P3 I2C_MST_ANA_CONF0 0x6000_E040: clear [2] STOP_FORCE_HIGH,  not built
-   set [3] STOP_FORCE_LOW (regi2c_ctrl_ll_bbpll_calibration_start)
-P4 the BBPLL's analog words, block 0x66, host 1               not built
-   (clk_ll_bbpll_set_config; soc/regi2c_bbpll.h):
-     reg 4 MODE_HF = 0x6B
-     reg 2 OC_REF_DIV = (DCHGP 5 << 4) | DIV_REF 0 = 0x50
-     reg 3 OC_DIV_7_0 = 8
-     reg 5 OC_DR1 [2:0] = 0, OC_DR3 [6:4] = 0 (masked)
-     reg 6 OC_DCUR = (1 << 6) | (3 << 4) | 3 = 0x73
-     reg 9 OC_VCO_DBIAS [1:0] = 3 (masked)
-   each through ROM `rom_i2c_writeReg` / `rom_i2c_writeReg_Mask`
-P5 poll I2C_MST_ANA_CONF0 [24] BBPLL_CAL_DONE                 not built
-P6 esp_rom_delay_us(10)                                       not built
-P7 I2C_MST_ANA_CONF0: clear [3], set [2] (calibration_stop)   not built
+P2 CPU_PER_CONF.PLL_FREQ_SEL = 1 (clk_ll_bbpll_set_freq_mhz)  yes, in the
+                                                              bring-up
+P3 I2C_MST_ANA_CONF0 0x6000_E040: clear [2] STOP_FORCE_HIGH,  yes, two stores
+   set [3] STOP_FORCE_LOW (regi2c_ctrl_ll_bbpll_calibration_
+   start)
+P4 the BBPLL's analog words, block 0x66, host 1, in order     yes: through the
+   (clk_ll_bbpll_set_config(480, 40); soc/regi2c_bbpll.h):    ROM's functions,
+     reg 4 MODE_HF = 0x6B                       writeReg      by way of
+     reg 2 OC_REF_DIV = (DCHGP 5 << 4) | DIV_REF 0            sos_windowed_call
+           = 0x50                               writeReg
+     reg 3 OC_DIV_7_0 = 8                       writeReg
+     reg 5 [2:0] OC_DR1 = 0                     writeReg_Mask
+     reg 5 [6:4] OC_DR3 = 0                     writeReg_Mask
+     reg 6 OC_DCUR = (DLREF_SEL 1 << 6)
+           | (DHREF_SEL 3 << 4) | DCUR 3 = 0x73 writeReg
+     reg 9 [1:0] OC_VCO_DBIAS = 3               writeReg_Mask
+P5 poll I2C_MST_ANA_CONF0 [24] BBPLL_CAL_DONE                 yes, bounded
+                                                              (below)
+P6 esp_rom_delay_us(10)                                       yes: 400 CCOUNT
+                                                              cycles, at least
+                                                              10 us at 40 MHz
+                                                              or less
+P7 I2C_MST_ANA_CONF0: clear [3], set [2] (calibration_stop)   yes, after a
+                                                              timeout too
 -- rtc_clk_cpu_freq_to_pll_mhz(f), f = 80, 160 or 240 -------------------------
-Q1 240 only, going up: I2C_DIG_REG (block 0x6D) reg 4         not built
+Q1 240 only, going up: I2C_DIG_REG (block 0x6D) reg 4         no: 240 only
    EXT_RTC_DREG [4:0] = g_rtc_dbias_pvt_240m, reg 6
    EXT_DIG_DREG [4:0] = g_dig_dbias_pvt_240m (regi2c), 40 us;
    the values come from eFuse calibration (rtc_init.c,
    rtc_set_stored_dbias; 28 by default)
-Q2 going up: RTC_CNTL_DATE_REG.SLAVE_PD = 0x7 >> (f / 80)     not built
-Q3 CPU_PER_CONF.CPUPERIOD_SEL = 0, 1, 2 for 80, 160, 240      not built
-Q4 SYSCLK_CONF.PRE_DIV_CNT = 0                                not built
-Q5 SYSCLK_CONF.SOC_CLK_SEL = 1                                not built
-Q6 the APB variable (80 MHz), esp_rom_set_cpu_ticks_per_us    not built
-Q7 going down: the reverse of Q1 and Q2                       not built
+Q2 going up: RTC_CNTL_DATE_REG.SLAVE_PD = 0x7 >> (f / 80),    no: see below
+   3 at 80
+Q3 CPU_PER_CONF.CPUPERIOD_SEL = 0, 1, 2 for 80, 160, 240      yes: 0, a store
+   (clk_ll_cpu_set_freq_mhz_from_pll)                         from IRAM
+Q4 SYSCLK_CONF.PRE_DIV_CNT = 0 (clk_ll_cpu_set_divider(1))    yes, a store
+                                                              from IRAM
+Q5 SYSCLK_CONF.SOC_CLK_SEL = 1 (clk_ll_cpu_set_src)           yes, a store
+                                                              from IRAM
+Q6 the APB variable (80 MHz), esp_rom_set_cpu_ticks_per_us    no: software
+Q7 going down: the reverse of Q1 and Q2                       no: see below
 ```
 
 ESP-IDF's REGI2C_WRITE and REGI2C_WRITE_MASK on this chip are
@@ -1869,55 +1914,109 @@ esp_rom/esp32s3/ld/esp32s3.rom.api.ld provides as `rom_i2c_writeReg` and
 `rom_i2c_writeReg_Mask`; esp32s3.rom.ld puts those at 0x4000_5D60 and
 0x4000_5D6C, which are jump-table entries (`l32r a9; jx a9`) into bodies at
 0x4003_5880 and 0x4003_58D8 that open with `entry a1, 32` and `entry a1,
-48`: windowed functions.
+48`: windowed functions. Read from the ROM's disassembly:
+`rom_i2c_writeReg(block, host, reg, data)` calls, through the phy table,
+`rom_chip_i2c_writeReg`, which takes the host from `rom_get_i2c_hostid(block)`
+rather than its argument, waits for the analog master's busy bit (bit 25 of
+the master's word at 0x6000_E000 plus 4 times the host), and writes the
+command there; `rom_get_i2c_hostid` also sets ANA_CONFIG2_REG (0x6000_E048)
+to `(word & 0xFFFE_000F) | 0x0001_FF40` on every call. `rom_i2c_writeReg_Mask
+(block, host, reg, msb, lsb, data)` reads the register with `rom_i2c_readReg`
+and writes it back with the field replaced. The read stores to ANA_CONFIG
+(0x6000_E044) first: `rom_chip_i2c_readReg_org` (0x4003_54FC) writes the
+complement of the block's read mask (`rom_get_i2c_read_mask`), which for the
+BBPLL, bit 17, is 0xFFFD_FFFF, every analog block's bus held off but the
+BBPLL's. So after each masked write of P4, and after the key's read of the
+BBPLL's register 8, ANA_CONFIG holds that word, not the one R3 left.
+ESP-IDF v5.4.1 has no replacement for these routines on this chip
+(`esp_rom/patches` has none for it), so its applications leave the same
+word. In a bootloader build ESP-IDF
+calls them bare; an application wraps them in a critical section, which the
+kernel, at INTLEVEL 15 with one core, has.
 
-**What is left out of `xtal40`, and why that is safe:**
+**The bring-up runs from IRAM** (`sos_pll_bringup`, `kernel/boot.S`): P1, R3
+and P2 to P7, in that order. ESP-IDF makes R3 before P1: `rtc_clk_init` calls
+`regi2c_ctrl_ll_i2c_reset` and `regi2c_ctrl_ll_i2c_bbpll_enable` before
+`rtc_clk_cpu_freq_set_config` reaches `rtc_clk_bbpll_enable`. Both orders make
+P1 and R3 before the analog bus's first use (P4), and the part locks in this
+one (§14h). The ROM is reached through `sos_windowed_call`, which is in IRAM
+too, so no instruction is fetched through the flash cache while the PLL is
+powered, set and calibrated. Whether the memory-SPI core clock comes from the
+PLL while the CPU is on the crystal is not in the sources (§14d's H readings),
+and ESP-IDF keeps the code that powers the BBPLL down and up again in IRAM
+"because disabling BBPLL may influence the cache"
+(esp_system/port/soc/esp32s3/clk.c, `recalib_bbpll`); its bootloader runs the
+whole sequence from RAM. The ROM functions run from the mask ROM, and the data
+the bring-up reaches is the kernel stack and the ROM's phy table (§7g), neither
+in flash. Once P7 is made the PLL is calibrated, and the key continues from
+flash; Q3 to Q5, which move the CPU's clock, are each a store by
+`sos_clock_store` from IRAM.
 
-- X7's SLAVE_PD. RTC_CNTL_DATE_REG's field resets to 0, all six LDO slaves
-  on (rtc_cntl_reg.h, "LDO SLAVE ... default: 6'd0", and the register's
-  default 0x2101271 has 0 in [18:13]); the ROM names the register nowhere,
-  so it runs the chip with all six on. ESP-IDF writes 0x7 on the crystal to
-  power three down, which saves power; more slaves on is the direction
-  ESP-IDF takes before raising the clock (Q2), so leaving them all on is the
-  side that cannot droop. It is also an RTC register, which this kernel
-  writes only for the watchdogs (§2e). The line prints the word.
+**P5 is bounded.** ESP-IDF waits for CAL_DONE without a bound. The bring-up
+waits at most 4,000,000 CCOUNT cycles, which with the CPU on the crystal at
+40 MHz or less is at least 100 ms; no source states how long the
+calibration takes. Past the bound it makes P7 and answers a timeout, nothing
+switches to the PLL, and `pll80` prints its `not taken` line (§14d) and lets
+the boot go on at the clock the ROM left. Every write made before the
+timeout stays: P1's, R3's, P2's, P3's, P4's seven words, P7's, and the ROM's
+own stores to ANA_CONFIG, ANA_CONFIG2 and the analog master.
+
+**What is left out, and why that is safe:**
+
+- X7's and Q2's SLAVE_PD. RTC_CNTL_DATE_REG's field resets to 0, all six LDO
+  slaves on (rtc_cntl_reg.h, "LDO SLAVE ... default: 6'd0", and the
+  register's default 0x2101271 has 0 in [18:13]); the ROM names the register
+  nowhere, so it runs the chip with all six on, and the part reads 0x02101271
+  (§14h). ESP-IDF writes 0x7 on the crystal to power three down and 0x3 at
+  80 MHz to power two down ("CPU frequency <= 40M : just open 3 LDO slaves;
+  CPU frequency = 80M : open 4 LDO slaves", `rtc_clk_cpu_freq_to_pll_mhz`).
+  Slaves damp the LDO's voltage change at a switch, and ESP-IDF opens more of
+  them the faster the CPU runs, so all six at 80 MHz is the side that cannot
+  droop. It is also an RTC register, which this kernel writes only for the
+  watchdogs (§2e) and P1. Each line prints the word.
 - R5's RTC_XTAL_FREQ_REG is a store word that survives every reset but a
   power cycle, read back by ESP-IDF and ROM functions this kernel never
-  calls; and X1, X5, R7 keep software values in step.
+  calls; and X1, X5, Q6, R7 keep software values in step.
 - R1, R2, R8 configure the RTC's own oscillators and its fast and slow
   clocks, which neither the CPU, APB, SYSTIMER nor UART0 reads.
-- X6 and the BBPLL power-down apply only when leaving the PLL; on the part
-  the CPU starts on the crystal (the emulator's word says PLL, §14e).
+- X6, Q1 and Q7 apply only at 240 MHz or going down; the BBPLL's power-down
+  applies only when leaving the PLL. On the part the CPU starts on the
+  crystal (the emulator's word says PLL, §14e).
+- R3's first write holds off the buses of the blocks in ANA_CONFIG [17:8]
+  (`ANA_CONFIG_S` 8, `ANA_CONFIG_M` 0x3FF, regi2c_defs.h); the ROM's read
+  stores above hold off every other bit's too, the SAR ADC's (bit 18,
+  `I2C_SAR_M`) among them. The kernel uses none of those blocks.
+- Q7. The key is written for a CPU the ROM left on the crystal. On the kept
+  path, a CPU already on the PLL, it stores CPUPERIOD_SEL 0 whatever it read,
+  so a CPU found at 160 or 240 MHz would go down to 80 without Q7's voltage
+  steps. The ROM leaves the crystal, so nothing reaches that.
 
-### 14c. Why the PLL speeds are not built
+### 14c. What is not built: 160 and 240 MHz
 
-Every PLL speed needs steps P1 to P7, and 160 and 240 MHz need more:
+`pll80` is the PLL's first speed. 160 and 240 MHz are the same sequence with
+CPUPERIOD_SEL 1 or 2 at Q3, and more:
 
-- **The analog words.** P4 writes six registers of the BBPLL's analog block
-  over the chip's internal I2C, and ESP-IDF does it only through the ROM's
-  `rom_i2c_writeReg`/`_Mask`, which are windowed. The call0 kernel reaches
-  them through `sos_windowed_call` (§7g), only before the loader, since the
-  ROM's function table in its RAM (`l32r a8; l32i a8, a8, 0` at the body's
-  head) lies where a process may be given memory; the other way is the I2C
-  master's protocol re-derived from the ROM's disassembly, which no ESP-IDF
-  source for this chip states.
-- **RTC writes.** P1 clears power-down bits in RTC_CNTL_OPTIONS0 (each
-  resets to 0, so it may be a no-op that only a read can show), and Q2
-  writes SLAVE_PD; both are RTC registers beyond `_start`'s.
-- **The voltage.** 240 MHz raises the digital LDO through I2C_DIG_REG to a
-  value ESP-IDF reads from eFuse calibration (Q1). 160 MHz is reached in an
-  application only after `rtc_init` has set the LDO to
-  `g_dig_dbias_pvt_non_240m` (rtc_init.c), which the bootloader's 80 MHz
-  never does; the ROM's own setting is unread.
-
-So 80 MHz is the PLL speed with the fewest steps, and each of those steps
-is an analog or RTC write. They are not built here.
+- **The voltage.** 240 MHz raises the digital LDO through I2C_DIG_REG
+  (block 0x6D) to values ESP-IDF reads from eFuse calibration (Q1), and puts
+  them back when leaving it. 160 MHz is reached in an application only after
+  `rtc_init` has set the LDO to `g_dig_dbias_pvt_non_240m` (rtc_init.c),
+  which the bootloader's 80 MHz never does; the ROM's own setting is unread.
+  Both want the owner's word: the eFuse reads are reads only, but the LDO
+  write is a voltage change.
+- **The slaves.** Q2 opens five slaves at 160 and six at 240; all six are on
+  as the ROM leaves them, so nothing changes here.
+- **The flash** does not move: the memory-SPI core clock follows
+  CORE_CLK_SEL and the PLL, not CPUPERIOD_SEL (`spi_mem_reg.h`), so it stays
+  80 MHz and the flash 20 MHz at every PLL speed.
 
 ### 14d. What each key sets
 
 The key is chosen per image at build time (`s3clock`, `keys/clock-*/`);
 `rom` is the default everywhere. The case key `"clock"` sets it, and
-`--emit-flash CASE --clock KEY` overrides it for a board image.
+`--emit-flash CASE --clock KEY` overrides it for a board image. The keys
+that write share `s3clockkit` (`keys/clock-common/`): the console's drain,
+the measurement and the line's writer. Each starts SYSTIMER and takes one
+snapshot it throws away before it measures (§14h).
 
 ```
 key     registers written, in order                    from
@@ -1937,17 +2036,48 @@ xtal40  SYSTIMER_CONF |= CLK_EN | UNIT0_WORK_EN        what the kernel's own
                                                        is written (SYSTIMER's
                                                        two rows above have
                                                        been)
+pll80   SYSTIMER and UART0 as xtal40                   as xtal40
+        `sos_pll_bringup`, from IRAM, only if the      S1
+        source read is the crystal:
+          RTC_CNTL_OPTIONS0 &= ~0x540                  P1
+          ANA_CONFIG |= 0x3FF << 8, then               R3
+            ANA_CONFIG &= ~(1 << 17)
+          CPU_PER_CONF |= 0x4 (PLL_FREQ_SEL 1)         P2
+          I2C_MST_ANA_CONF0 &= ~0x4, then |= 0x8       P3
+          the BBPLL's seven words, through the ROM     P4
+          read I2C_MST_ANA_CONF0 until [24] is set,    P5
+            at most 4,000,000 cycles
+          400 cycles                                   P6
+          I2C_MST_ANA_CONF0 &= ~0x8, then |= 0x4       P7
+        on a timeout nothing below is written
+        BBPLL register 8 read through the ROM          for the line
+        CPU_PER_CONF = read & ~0x3 (CPUPERIOD_SEL 0)   Q3, from IRAM
+        SYSCLK_CONF = first read & ~0x3FF              Q4, from IRAM
+        SYSCLK_CONF = that & ~0xC00 | 0x400            Q5, from IRAM
+          (SOC_CLK_SEL 1)
+        RC_FAST or 3 stops before the bring-up and any clock word, as
+          xtal40 does (SYSTIMER's rows and the first measurement have
+          been made)
 ```
+
+Each of the ROM's analog-bus calls also makes the ROM's own writes (§14b):
+ANA_CONFIG2 (0x6000_E048) through `rom_get_i2c_hostid`, the command word of
+the analog master at 0x6000_E000 plus 4 times the host, and, for each read
+(each masked write, and the line's read of register 8), ANA_CONFIG
+(0x6000_E044) = 0xFFFD_FFFF.
 
 Clocks before and after, for each reading of the memory-SPI core clock on
 the crystal, which no source states and no run has measured: H1 the
 crystal, H2 a PLL-derived 80 MHz (the core clock ESP-IDF's low-speed flash
 mode assumes, `FLASH_LOW_SPEED_CORE_CLOCK_MHZ` in esp_hw_support/port/
 esp32s3/mspi_timing_config.c), H3 the system clock after the pre-divider.
+On the PLL there is one reading: CORE_CLK_SEL 0 with the PLL at 480 MHz is
+80 MHz (`SPI_MEM_CORE_CLK_SEL`, soc/esp32s3/register/soc/spi_mem_reg.h).
 The flash's divider is the ROM's: `spi_flash_boot_attach` (0x4004_A8CC)
 calls `SPI_init(5, 4)` (0x4004_A4A8), which stores one word to SPI1's and
 SPI0's SPI_MEM_CLOCK_REG (0x6000_2014 and 0x6000_3014, its pool at
-0x4004_A480), divide by 4. No key writes it.
+0x4004_A480), divide by 4. No key writes it. SYSTIMER counts the crystal at
+16 MHz under every key.
 
 ```
                  CPU        APB        UART0                flash
@@ -1955,68 +2085,146 @@ rom              20         = CPU      crystal, 115,212 bd  H1 10, H2 20,
                                                             H3 5 MHz
 xtal40           40         40         crystal, 115,212 bd  H1 10, H2 20,
                                                             H3 10 MHz
+pll80            80         80         crystal, 115,212 bd  20 MHz
 ```
 
 The console stays at the ROM's 115200 for every key because its clock is
-the crystal, which no key moves, and its divisor is the ROM's; `xtal40`
+the crystal, which no key moves, and its divisor is the ROM's; each key
 waits for the transmitter to go idle before its stores and prints nothing
 until after them. Flash execution through the cache stays valid because
 the divider, the read mode and the dummy cycles the ROM set are untouched
 and the flash's clock after the switch is at most 20 MHz in every reading:
 ESP-IDF tunes the timing of a flash in STR mode only above 80 MHz
 (`MSPI_TIMING_FLASH_NEEDS_TUNING`, esp_hw_support/port/esp32s3/
-mspi_timing_tuning_configs.h), and the switch's own store runs from IRAM.
+mspi_timing_tuning_configs.h), and every store that moves the clock runs
+from IRAM.
 
-SYSTIMER is the crystal's, so ticks, Timers and `Clock.now` do not move.
+**The flash at `pll80` is 20 MHz, and is not raised.** The core clock at 80
+MHz over the ROM's divide by 4 is ESP-IDF's own low-speed mode:
+`mspi_timing_enter_low_speed_mode` (esp_hw_support/mspi_timing_tuning.c)
+sets the core to 80 MHz and the flash to 20 MHz with the timing tuning
+cleared, and `mspi_timing_ll_set_flash_clock(0, 4)` (hal/esp32s3/include/
+hal/mspi_timing_tuning_ll.h) encodes that divider as 0x0003_0103, the word
+the ROM leaves. The ROM reads its divider the same way: "Pll is 80M, 4 for
+20M, 3 for 26.7M, 2 for 40M, 1 for 80M" (`esp_rom_spiflash_fix_dummylen`,
+esp_rom/esp32s3/include/esp32s3/rom/spi_flash.h). ESP-IDF's bootloader runs
+the flash faster only at the speed its image header names
+(`bootloader_flash_clock_config`, divide by 1, 2, 3 or 4 of 80 MHz;
+bootloader_support/bootloader_flash/src/bootloader_flash_config_esp32s3.c)
+and only together with the read mode, the dummy output, the pads' drive and
+the chip-select timing (`bootloader_init_flash_configure`,
+`bootloader_flash_set_dummy_out`). The part's board probe read SPI0 in slow
+read (SPI_MEM_CTRL 0x0020_0000: no fast-read or multi-line bit) with no
+extra dummy bytes from the ROM (the part's run of `s3_mem_probe` read
+`rom_dummy_spi0` 0; §15a describes the line); the sources give
+no reading that those settings hold at 40 or 80 MHz, so the flash stays at
+the 20 MHz the ROM's own divider names.
+
 The TIMG watchdogs count APB-derived clocks (`TIMER_SRC_CLK_APB` is the
 timer groups' default, soc/esp32s3/include/soc/clk_tree_defs.h); `_start`
 writes TIMG0's config 0, and TIMG1's is left as §2e says. The RTC watchdog
 is off and the super watchdog feeds itself (§2e), so no period anything
 waits on moves with a key.
 
-**Every register a key writes is volatile.** SYSCLK_CONF, UART0's and
-SYSTIMER's registers are reset by a chip reset (power, or the EN pin, which
-the board's reset button and esptool pull) and by a system reset. A CPU-only
-reset (a TIMG watchdog's) leaves the clock as it was, as ESP-IDF's
-bootloader notes ("in case of TG WDT reset, CPU may still be running at >80
-MHZ"); the watchdogs are off, so nothing here makes one. Nothing written is
-RTC-retained or non-volatile, and no eFuse is read or written.
+**Every register a key writes is volatile.** SYSCLK_CONF, CPU_PER_CONF,
+UART0's and SYSTIMER's registers are reset by a chip reset (power, or the EN
+pin, which the board's reset button and esptool pull) and by a system reset.
+A CPU-only reset (a TIMG watchdog's) leaves the clock as it was, as
+ESP-IDF's bootloader notes ("in case of TG WDT reset, CPU may still be
+running at >80 MHZ"); the watchdogs are off, so nothing here makes one.
+`pll80` also writes the analog master's words, the BBPLL's analog registers
+and one RTC register, RTC_CNTL_OPTIONS0, whose three BBPLL power-down bits
+it clears. Each of those bits resets to 0, so on a part that reads them 0
+the store writes the word back unchanged. A power cycle restores all of them.
+An EN-pin reset restores the clock words: on the part each reset through the
+serial port's RTS line printed `rst:0x1 (POWERON)`, and a run that found
+`sysclk=0x000a8001` followed one that had left 0x000a8400 (§14h). Whether it
+restores OPTIONS0, ANA_CONFIG and the analog words has not been observed
+(OPTIONS0's three bits read 0 before every run) and is the reference manual's
+to say, not ESP-IDF's sources'; an image that does not write them leaves them
+as it finds them. The PLL powered and set to 480 MHz is the state ESP-IDF runs
+every application in. Nothing written is non-volatile, no LDO or voltage word
+is written, and no eFuse is read or written.
 
 **A wrong value on a part.** A PRE_DIV_CNT too large slows the CPU, and
 under H3 the flash with it, down to 40 MHz / 1024; a SOC_CLK_SEL of 3 names
-no source. Either looks like a hang: no line after the ROM's banner, or one
-that crawls. A wrong UART word garbles the console and stops nothing. The
-part stays that way until reset: the board's reset button or `esptool`'s
-EN-pin reset is a chip reset that restores every word, and the ROM's
-download mode (strapping GPIO0 low at that reset) runs before any image
-code, so `write-flash` puts a good image back.
+no source. A PLL set to the wrong frequency, or switched to before it has
+locked, clocks the CPU, APB and the flash wrongly. Any of these looks like a
+hang: no line after the ROM's banner, or one that crawls; the console's
+clock is the crystal, so whatever does print is readable. `pll80` switches
+only after the PLL has reported its calibration done, and prints its `not
+taken` line instead when it has not. A wrong UART word garbles the console
+and stops nothing. The part stays that way until reset: the board's reset
+button or `esptool`'s EN-pin reset is a chip reset that restores every
+clock word, and the ROM's download mode (strapping GPIO0 low at that reset)
+runs before any image code, so `write-flash` puts a good image back.
+
+**The line.** `xtal40`'s and `pll80`'s each print one line after the switch:
+the clock words before and after, the measured speed before and after, and
+the words the change could move. `pll80` adds `options0=` (before and
+after), `bbpll=` (the BBPLL's register 8 after the bring-up, read through
+`rom_i2c_readReg`: OR_LOCK is bit 7 and OR_CAL_END bit 6; `kept` when the
+CPU was already on the PLL) and `ana_conf0=` (I2C_MST_ANA_CONF0 after P7,
+CAL_DONE at bit 24). When the calibration is not reported done it prints
+instead
+
+```
+SOS-S3: clock pll80 not taken: the BBPLL did not report its calibration
+done; the CPU stays on the crystal sysclk=... options0=...->...
+ana_conf0=... mhz=...
+```
+
+(one line) and the boot goes on at the clock the ROM left.
 
 ### 14e. The emulator
 
-Booted by the smoke's `boot_xtal40` and `kill_churn_xtal40` (§14g):
+Booted by the smoke's clock cases (§14g):
 
 ```
 register             what the emulator does
-SYSCLK_CONF          reads 0x000a8401 before and after both stores: the PLL
+SYSCLK_CONF          reads 0x000a8401 before and after every store: the PLL
                      selected, PRE_DIV_CNT 1, the crystal 40, CLK_DIV_EN set;
                      a store is dropped. So `xtal40` takes its two-store path
-                     here and its one-store path on a part
-CPU_PER_CONF         reads 0
+                     here and its one-store path on a part, and `pll80` finds
+                     the CPU on the PLL and keeps it (S1): its bring-up does
+                     not run here
+CPU_PER_CONF         reads 0; a store is dropped
 UART0 + 0x78         reads 0x15122500 before and after a store: the model has
-                     a date word there, not UART_CLK_CONF, so `xtal40` writes
+                     a date word there, not UART_CLK_CONF, so both keys write
                      the ROM's two words, and the model drops the first and
                      ignores the divisor (§4)
 UART0 FSM_STATUS     reads 0: the transmitter is always idle
 SPI0 0x6000_30EC,    read 0: SPI0 falls in `esp32s3.iomem` (§3)
   0x6000_3014
 RTC_CNTL_DATE        reads 0
+RTC_CNTL_OPTIONS0    reads 0 at boot, and keeps what is stored
+0x6000_E000 to       the analog master, I2C_MST_ANA_CONF0, ANA_CONFIG and
+  0x6000_E048        ANA_CONFIG2: in `esp32s3.iomem`, read 0 and drop every
+                     store. There is no analog block, so CAL_DONE is never
+                     set
+the ROM's analog-    run, being the ROM's own code: each finds the master's
+  bus functions      busy bit clear and returns; `rom_i2c_readReg` answers 0
 SYSTIMER             modelled (§6a)
 CCOUNT               40 MHz of host time whatever is stored: `mhz=` reads
                      about 40.00 on both sides
 ```
 
-Its line, up to the two speeds and after them, is asserted; the speeds are
-host time and are not.
+Each key's line, up to the two speeds and after them, is asserted; the
+speeds are host time and are not. `pll_bringup` runs the bring-up itself, a
+harness kernel that calls `sos_pll_bringup`: its seven ROM calls go through
+the stub and return, the calibration is never reported done, the bring-up
+answers its timeout (1) after the bound, and RTC_CNTL_OPTIONS0's three
+power-down bits, set first, come back clear with the bits beside them kept
+(`options0=0x1c000000`). The timeout's outcome does not depend on the
+host's speed: CAL_DONE never comes, and the bound only says when to stop.
+
+**What the emulator cannot judge**, and only a part can: the analog words
+(P4: values, order, and that the ROM's functions deliver them), R3, P2, P3,
+P6 and P7, which land in registers the emulator drops; the calibration and
+the PLL's lock (P5's done path and `bbpll=`); the three clock stores Q3 to
+Q5 and the speed they give; the bring-up's path through `pll80` (the
+emulator's source is the PLL); that the bring-up and the stub need IRAM; the
+flash at 20 MHz; and the snapshot thrown away before a measurement.
 
 ### 14f. The profile: where a round of `kill_churn` goes
 
@@ -2053,14 +2261,17 @@ the largest phase, a little over a third of a round (§14h).
 
 ### 14g. The images
 
-The smoke's clock cases are `boot_xtal40` (the kernel alone at `xtal40`: the
-line, the banner, the refusal of an empty image) and `kill_churn_xtal40`
-(`kill_churn` at `xtal40`). `kill_churn_profile` is board-only: the smoke
-prints its reason and builds nothing for it. A board image of each is
+The smoke's clock cases are `boot_xtal40` and `boot_pll80` (the kernel alone
+at the key: the line, the banner, the refusal of an empty image),
+`kill_churn_xtal40` and `kill_churn_pll80` (`kill_churn` at the key), and
+`pll_bringup` (the bring-up, §14e). `kill_churn_profile` is board-only: the
+smoke prints its reason and builds nothing for it. A board image of each is
 `--emit-flash CASE --clock KEY --out PATH`.
 
-An image at the `rom` key is the bytes it is without the keys: every image
-the smoke builds at the defaults has the SHA-256 it had before them.
+An image at the `rom` key is the bytes it is without the keys: it compiles
+no key's code, and the link drops the IRAM code only a key calls
+(`sos_clock_store`, `sos_pll_bringup`) and the stub, which only a case that
+calls the ROM keeps.
 
 ### 14h. Measured on the part
 
@@ -2084,10 +2295,13 @@ kill_churn_profile, xtal40   19.54        40.01
 
 So the ROM leaves the CPU on the crystal divided by two, and one store
 makes it the crystal. The figure before the store reads about 2.5% under
-the 20 MHz the registers say, and the one after reads true. Why is not
-shown by a run; the first SYSTIMER snapshot after its clock is enabled may
-take longer than the later ones, which would cost the first measurement
-that many cycles.
+the 20 MHz the registers say, and the one after reads true. The images
+above took their first SYSTIMER snapshot inside the first measurement, just
+after enabling its clock; if that first handshake is the slow one, the
+measurement counts its time in SYSTIMER's interval and not in CCOUNT's. The
+keys take one snapshot first and throw it away (`systimer_start`), so an
+`xtal40` image built that way reads its figure before the store without the
+first handshake (the table below).
 
 `kill_churn`, from the reset to `200 rounds, every create succeeded`:
 26.05 s at `rom`, 13.44 s at `xtal40`.
@@ -2107,6 +2321,47 @@ xtal40     208906   31314
 
 Every phase is about twice as fast at twice the clock, and the console's
 wait for FIFO room is under two percent of the run at either.
+
+**At 80 MHz**, from the `pll80` images and an `xtal40` `kill_churn` built
+from the same tree (§14d's line), each written and reset through the serial
+port's RTS line, which the ROM reports as `rst:0x1 (POWERON)`:
+
+```
+pll80 line   both images
+sysclk       0x000a8001 -> 0x000a8400   SOC_CLK_SEL 1 (the PLL),
+                                        CLK_DIV_EN reads 1 on the PLL too
+cpu_per      0x0000000c -> 0x0000000c   CPUPERIOD_SEL 0, 80 MHz
+options0     0x1c00a000 -> 0x1c00a000   the three power-down bits already 0
+bbpll        0x000000c3                 OR_LOCK [7] and OR_CAL_END [6] set
+ana_conf0    0x2100e404                 CAL_DONE [24] set, [2] set, [3] clear
+uart_clk     0x03700000
+mspi_core    0x00000000
+mspi_clock   0x00030103
+rtc_date     0x02101271                 SLAVE_PD [18:13] 0, all six on
+
+image                        mhz before   mhz after   reset to `200 rounds`
+kill_churn, pll80            19.84        80.01        7.88 s
+kill_churn_profile, pll80    19.76        80.01        -
+kill_churn, xtal40           19.84        40.01       14.17 s
+```
+
+The figure before the store now reads about 1% under 20 MHz where the first
+images read 2.5% under: the discarded snapshot accounts for part of it.
+The `xtal40` image from this tree took 14.17 s where the first took
+13.44 s, with the same clock words.
+
+```
+          create    give     start   settle   kill     release  all
+pll80      2463616  1102880  319297  2027393  1682409   312024   7907622
+
+          stalled   bytes written after the tick was armed
+pll80      335750   31313
+```
+
+Against the crystal's row above, the whole run takes 0.56 of the time:
+creating a child 0.49, settling and killing about 0.56, releasing 0.62,
+giving 0.74 and starting 0.84. The flash's clock stays 20 MHz under every
+PLL speed (§14c); how much of each phase waits on it has not been measured.
 
 ---
 

@@ -4,10 +4,10 @@
  * Where things run
  * ---------------------------------------------------------------------------
  * Code executes in place from the flash instruction window; read-only data is
- * read through the flash data window; only the vectors and the trap path (with
- * the clock store, when an image uses it), the kernel's `.data` and its
- * `.bss` live in SRAM. `boot.S` copies the first two out of flash and zeroes
- * the third.
+ * read through the flash data window; only the vectors and the trap path
+ * (with the clock store, the windowed-call stub and the PLL's bring-up, each
+ * when an image uses it), the kernel's `.data` and its `.bss` live in SRAM.
+ * `boot.S` copies the first two out of flash and zeroes the third.
  *
  * The mask ROM maps flash offset 0 at 0x4200_0000 (IBUS, instructions) and at
  * 0x3C00_0000 (DBUS, data) before it jumps in (../ABI.md §2a). This script
@@ -111,11 +111,12 @@ SECTIONS {
     .magic 0x42000400 : { KEEP(*(.magic)) } > FLASH
     .entry 0x42000408 : { KEEP(*(.entry)) } > FLASH
 
-    /* The vectors and the trap path, then the clock store. Listed ahead of
-     * `.text` so its literal and code wildcards cannot claim them. `boot.S`
-     * aligns the table itself to 1 KiB, behind the literals the trap path
-     * loads. The clock store is not kept: an image that never calls it
-     * leaves it out. */
+    /* The vectors and the trap path, then every `.iram.text.*` section: the
+     * clock store, the windowed-call stub and the PLL's bring-up. Listed
+     * ahead of `.text` so its literal and code wildcards cannot claim them.
+     * `boot.S` aligns the table itself to 1 KiB, behind the literals the
+     * trap path loads. The `.iram.text.*` sections are not kept: an image
+     * that never calls one leaves it out. */
     .iram : ALIGN(4) {
         _iram_start = .;
         *(.literal.vectors)

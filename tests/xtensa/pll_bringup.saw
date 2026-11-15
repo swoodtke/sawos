@@ -1,0 +1,37 @@
+// The BBPLL's bring-up, `sos_pll_bringup` in `boot.S`, run on the emulator,
+// which has no analog block: its analog master reads 0, so the calibration
+// is never reported done, and the bring-up must answer that rather than
+// wait for ever. What the emulator does keep is RTC_CNTL_OPTIONS0, so the
+// power-down bits are set first and must come back clear, with every other
+// bit as it was.
+//
+//   SOS pll: bringup=0x00000001 options0=0x1c000000
+//
+// For the emulator only: on a part, the bits set here power the BBPLL down.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_pll_bringup() -> UInt
+}
+
+/// RTC_CNTL_OPTIONS0, with BB_I2C_FORCE_PD [6], BBPLL_I2C_FORCE_PD [8] and
+/// BBPLL_FORCE_PD [10] set over ANALOG_FORCE_NOISO, PLL_FORCE_NOISO and
+/// XTL_FORCE_NOISO [28:26], those three at their reset value.
+static RTC_CNTL_OPTIONS0: UInt = 0x6000_8000
+static OPTIONS0_POWERED_DOWN: UInt32 = 0x1C00_0540
+
+@export("kmain")
+func kmain() unsafe {
+    let options0 = UnsafeMemory<UInt32, Device>(RTC_CNTL_OPTIONS0)
+    options0.write(OPTIONS0_POWERED_DOWN)
+    let status = sos_pll_bringup()
+    let uart = console()
+    uart.write_str("SOS pll: bringup=")
+    uart.write_hex(status)
+    uart.write_str(" options0=")
+    uart.write_hex(options0.read() as UInt)
+    uart.write_str("\n")
+    hal.exit_pass()
+}

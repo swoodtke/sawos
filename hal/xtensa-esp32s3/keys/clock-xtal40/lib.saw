@@ -33,81 +33,21 @@
 //! clock, the memory-SPI core clock's select and the flash's divider, and the
 //! RTC word holding the LDO slaves.
 //!
-//! It reaches every register through its own views rather than the HAL's
-//! drivers: the HAL names nothing here, so an image built at the `rom` key is
-//! the bytes it would be without the keys.
+//! It reaches every register through its own views and `s3clockkit`'s
+//! (`../clock-common/`) rather than the HAL's drivers: the HAL names nothing
+//! here, so an image built at the `rom` key is the bytes it would be without
+//! the keys.
+
+import s3clockkit.{SYSCLK_CONF, SOC_CLK_SEL_SHIFT, SOC_CLK_SEL_MASK,
+                   SOC_CLK_SEL_XTAL, SOC_CLK_SEL_PLL, PRE_DIV_CNT_MASK,
+                   CPU_PER_CONF, UART0_CLK_CONF, SPI0_CORE_CLK_SEL, SPI0_CLOCK,
+                   RTC_CNTL_DATE, device_word, systimer_start,
+                   console_on_crystal, console_drain, cpu_centi_mhz,
+                   write_byte, write_str, write_hex, write_centi}
 
 extern "C" {
     func sos_clock_store(addr: UInt, value: UInt)
-    func sos_ccount_read() -> UInt
 }
-
-/// SYSTEM_SYSCLK_CONF_REG: SOC_CLK_SEL [11:10] (0 the crystal, 1 the PLL, 2
-/// RC_FAST) and PRE_DIV_CNT [9:0], the crystal's divider less one.
-static SYSCLK_CONF: UInt = 0x600C_0060
-static SOC_CLK_SEL_SHIFT: UInt32 = 10
-static SOC_CLK_SEL_MASK: UInt32 = 0x3
-static SOC_CLK_SEL_XTAL: UInt32 = 0
-static SOC_CLK_SEL_PLL: UInt32 = 1
-static PRE_DIV_CNT_MASK: UInt32 = 0x3FF
-
-/// SYSTEM_CPU_PER_CONF_REG: PLL_FREQ_SEL [2] and CPUPERIOD_SEL [1:0]. Read
-/// for the line; nothing writes it.
-static CPU_PER_CONF: UInt = 0x600C_0010
-
-/// UART0: the transmit FIFO, the status word with the FIFO's occupancy in
-/// [25:16], the divisor, FSM_STATUS with ST_UTX_OUT in [7:4] (zero with the
-/// transmitter idle), and CLK_CONF with SCLK_SEL in [21:20] (1 APB, 2
-/// RC_FAST, 3 the crystal).
-static UART0_FIFO: UInt = 0x6000_0000
-static UART0_CLKDIV: UInt = 0x6000_0014
-static UART0_STATUS: UInt = 0x6000_001C
-static UART0_FSM_STATUS: UInt = 0x6000_006C
-static UART0_CLK_CONF: UInt = 0x6000_0078
-static TXFIFO_CNT_SHIFT: UInt32 = 16
-static TXFIFO_CNT_MASK: UInt32 = 0x3FF
-static TX_FIFO_DEPTH: UInt32 = 128
-static ST_UTX_OUT_SHIFT: UInt32 = 4
-static ST_UTX_OUT_MASK: UInt32 = 0xF
-static SCLK_SEL_SHIFT: UInt32 = 20
-static SCLK_SEL_MASK: UInt32 = 0x3
-static SCLK_XTAL: UInt32 = 3
-
-/// The words the mask ROM's `Uart_Init` (0x4004_89F0) writes for UART0: the
-/// clock enables, SCLK_SEL 3 and no pre-divide; and the divisor, 40 MHz
-/// times 16 over 115200 = 5555, the integer part 347 in [11:0] and the
-/// sixteenths, 3, in [23:20], as ESP-IDF's `uart_ll_set_baudrate` computes it.
-static UART_CLK_CONF_ROM: UInt32 = 0x0370_0000
-static UART_CLKDIV_ROM: UInt32 = (3 << 20) | 347
-static_assert((40_000_000 * 16) / 115_200 == (347 * 16) + 3,
-              "the console's divisor is 40 MHz over 115200, in sixteenths")
-
-/// SPI0's SPI_MEM_CORE_CLK_SEL_REG and SPI_MEM_CLOCK_REG: the memory-SPI core
-/// clock's select and the flash's divider over it. Read for the line only.
-static SPI0_CORE_CLK_SEL: UInt = 0x6000_30EC
-static SPI0_CLOCK: UInt = 0x6000_3014
-
-/// RTC_CNTL_DATE_REG, whose bits [18:13] are the LDO slaves ESP-IDF powers
-/// down by CPU speed. Read for the line only.
-static RTC_CNTL_DATE: UInt = 0x6000_81FC
-
-/// SYSTIMER: CONF's CLK_EN and UNIT0_WORK_EN start UNIT0, which is read by
-/// handshake: write UPDATE to UNIT0_OP, poll VALUE_VALID, read the halves
-/// (../../ABI.md §6a).
-static SYSTIMER_CONF: UInt = 0x6002_3000
-static SYSTIMER_CLK_EN: UInt32 = 0x8000_0000
-static SYSTIMER_UNIT0_WORK_EN: UInt32 = 1 << 30
-static SYSTIMER_UNIT0_OP: UInt = 0x6002_3004
-static SYSTIMER_UNIT0_VALUE_HI: UInt = 0x6002_3040
-static SYSTIMER_UNIT0_VALUE_LO: UInt = 0x6002_3044
-static UNIT0_UPDATE: UInt32 = 1 << 30
-static UNIT0_VALUE_VALID: UInt32 = 1 << 29
-static WORD_BITS: Int = 32
-
-/// How long one measurement of the CPU's speed lasts: 5 ms of SYSTIMER, which
-/// counts at 16 MHz.
-static MEASURE_TICKS: UInt64 = 80000
-static TICKS_PER_US: UInt64 = 16
 
 /// Set the CPU clock this image is built for: the crystal, undivided. From
 /// RC_FAST, or a select no source names, it prints why and stops in a quiet
@@ -118,8 +58,7 @@ public func clock_init() unsafe {
     let sysclk_before = sysclk.read()
     let cpu_per_before = cpu_per.read()
     let uart_clk = device_word(UART0_CLK_CONF).read()
-    let systimer = device_word(SYSTIMER_CONF)
-    systimer.write(systimer.read() | SYSTIMER_CLK_EN | SYSTIMER_UNIT0_WORK_EN)
+    systimer_start()
     let centi_before = cpu_centi_mhz()
 
     let source = (sysclk_before >> SOC_CLK_SEL_SHIFT) & SOC_CLK_SEL_MASK
@@ -165,126 +104,4 @@ public func clock_init() unsafe {
     write_str(" rtc_date=0x")
     write_hex(device_word(RTC_CNTL_DATE).read())
     write_byte(10)
-}
-
-/// One 32-bit device register.
-func device_word(addr: UInt) unsafe -> UnsafeMemory<UInt32, Device> {
-    UnsafeMemory<UInt32, Device>(addr)
-}
-
-/// Keep the console's clock off the CPU's: UART0 clocked by the crystal at
-/// 115200, which is what the mask ROM leaves, so on a part this finds
-/// SCLK_SEL at the crystal and writes nothing. Any other select is put back
-/// to the ROM's words, with the transmitter idle.
-func console_on_crystal(clk_conf: UInt32) unsafe {
-    if ((clk_conf >> SCLK_SEL_SHIFT) & SCLK_SEL_MASK) == SCLK_XTAL {
-        return
-    }
-    device_word(UART0_CLK_CONF).write(UART_CLK_CONF_ROM)
-    device_word(UART0_CLKDIV).write(UART_CLKDIV_ROM)
-}
-
-/// Wait until UART0 has sent every byte it holds, the test the ROM's
-/// `uart_tx_wait_idle` makes: the FIFO empty and the transmitter idle.
-///
-/// No preemption point: it runs once, at boot, before anything else.
-func console_drain() unsafe {
-    let status = device_word(UART0_STATUS)
-    let fsm = device_word(UART0_FSM_STATUS)
-    while {
-        let fifo = (status.read() >> TXFIFO_CNT_SHIFT) & TXFIFO_CNT_MASK
-        let tx = (fsm.read() >> ST_UTX_OUT_SHIFT) & ST_UTX_OUT_MASK
-        if fifo == 0 && tx == 0 {
-            break
-        }
-    }
-}
-
-/// SYSTIMER's UNIT0 now.
-///
-/// No preemption point: the poll waits on a hardware latch.
-func systimer_now() unsafe -> UInt64 {
-    let op = device_word(SYSTIMER_UNIT0_OP)
-    op.write(UNIT0_UPDATE)
-    while (op.read() & UNIT0_VALUE_VALID) == 0 { }
-    let hi = device_word(SYSTIMER_UNIT0_VALUE_HI).read()
-    let lo = device_word(SYSTIMER_UNIT0_VALUE_LO).read()
-    ((hi as UInt64) << WORD_BITS) | (lo as UInt64)
-}
-
-/// The CPU's speed in hundredths of a MHz: CCOUNT's advance over at least
-/// `MEASURE_TICKS` of SYSTIMER. The division goes through microseconds so
-/// every step stays in one word however long a slow host stretches the
-/// interval.
-///
-/// No preemption point: it runs at boot, before anything else.
-func cpu_centi_mhz() unsafe -> UInt {
-    let start = systimer_now()
-    let cycles_start = sos_ccount_read()
-    var at = start
-    while at - start < MEASURE_TICKS {
-        at = systimer_now()
-    }
-    let cycles = sos_ccount_read() &- cycles_start
-    let us = UInt.from(truncating: (at - start) / TICKS_PER_US)
-    (cycles / us) * 100 + (cycles % us) * 100 / us
-}
-
-/// Write one console byte: wait for room, then store it, as the HAL's console
-/// does.
-func write_byte(b: UInt8) unsafe {
-    let status = device_word(UART0_STATUS)
-    while {
-        let count = (status.read() >> TXFIFO_CNT_SHIFT) & TXFIFO_CNT_MASK
-        if count < TX_FIFO_DEPTH {
-            break
-        }
-    }
-    device_word(UART0_FIFO).write(b as UInt32)
-}
-
-func write_str(s: String) unsafe {
-    var i = 0
-    while i < s.len() {
-        write_byte(s.byte_at(i))
-        i += 1
-    }
-}
-
-/// Write a word as eight hex digits.
-func write_hex(v: UInt32) unsafe {
-    var shift: Int = 28
-    while shift >= 0 {
-        let d = UInt8.from(truncating: (v >> shift) & 0xF)
-        write_byte(if d < 10 { d + 48 } else { d + 87 })
-        shift -= 4
-    }
-}
-
-/// Write `v` in decimal, allocating nothing.
-func write_decimal(v: UInt) unsafe {
-    var digits: [UInt8; 10] = [0; 10]
-    var count: Int = 0
-    var rest = v
-    while {
-        digits[count] = UInt8.from(truncating: rest % 10) + 48
-        count += 1
-        rest = rest / 10
-        if rest == 0 {
-            break
-        }
-    }
-    while count > 0 {
-        count -= 1
-        write_byte(digits[count])
-    }
-}
-
-/// Write hundredths as a decimal with two places.
-func write_centi(v: UInt) unsafe {
-    write_decimal(v / 100)
-    write_byte(46)
-    let frac = v % 100
-    write_byte(UInt8.from(truncating: frac / 10) + 48)
-    write_byte(UInt8.from(truncating: frac % 10) + 48)
 }

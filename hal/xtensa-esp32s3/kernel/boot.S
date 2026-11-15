@@ -38,6 +38,8 @@
  *      runs from IRAM (`lib.saw`'s `clock_init`).
  *   6. `sos_windowed_call`, by which the kernel calls a windowed function
  *      (one in the mask ROM) before the loader runs.
+ *   7. `sos_pll_bringup`, which powers the BBPLL and sets it to 480 MHz
+ *      without a fetch through the flash cache (the `pll80` clock key).
  *
  * `EXCSAVE1` holds the running thread's frame address while user mode runs.
  * The user vector swaps it with a1, so the frame is the save area at once and
@@ -693,11 +695,15 @@ sos_resume_frame:
 
 /* ---- calling a windowed function from the kernel ------------------------- */
 
-/* u32 sos_windowed_call(u32 fn, u32 a, u32 b, u32 c, u32 d)
+/* u32 sos_windowed_call(u32 fn, u32 a, u32 b, u32 c, u32 d, u32 e, u32 f)
  *
- * A call0 function that calls the windowed function `fn` with four
- * arguments and returns its result: how the call0 kernel reaches a function
- * in the mask ROM. It is refused once the loader has begun
+ * A call0 function that calls the windowed function `fn` with six arguments
+ * and returns its result: how the call0 kernel reaches a function in the
+ * mask ROM. The six are every argument register a `callx8` passes; `f` is
+ * the call0 caller's seventh argument word, on its stack. A callee reads
+ * only the arguments it takes, so a caller may pass fewer. It sits in IRAM,
+ * so a caller that must not fetch through the flash cache while it runs (the
+ * PLL's bring-up below) can call it. It is refused once the loader has begun
  * (`sos_windowed_call_close`): the ROM's functions read tables in the ROM's
  * RAM, which a process may be given, so after that the call stops the
  * machine through `sos_windowed_call_refused` (`lib.saw`) before `fn` runs.
@@ -723,43 +729,49 @@ sos_resume_frame:
  * Alloca exception under it is handled at the kernel vector.
  *
  * `retw` takes the top two bits of its return address from its own PC, so
- * this function must sit where those bits are 01, as flash and IRAM do. */
-    .section .text.sos_windowed_call, "ax"
+ * this function must sit where those bits are 01, as IRAM does.
+ *
+ * Its section is not kept: `esp32s3.ld` places it in IRAM behind the trap
+ * path, and an image that never calls the ROM leaves it out. */
+    .section .iram.text.windowed_call, "ax"
     .literal .Lwindowed_call_closed, sos_windowed_call_closed
     .literal .Lwindowed_call_refused, sos_windowed_call_refused
     .align  4
     .global sos_windowed_call
     .type   sos_windowed_call, @function
 sos_windowed_call:
-    l32r    a7, .Lwindowed_call_closed
-    l32i    a7, a7, 0
-    bnez    a7, 1f
+    l32r    a8, .Lwindowed_call_closed
+    l32i    a8, a8, 0
+    bnez    a8, 1f
+    l32i    a9, a1, 0               /* f */
     addi    a1, a1, -64
     s32i    a12, a1, 4
     s32i    a13, a1, 8
     s32i    a14, a1, 12
     s32i    a15, a1, 16
-    rsr     a7, ps
-    s32i    a7, a1, 20
-    rsr     a7, windowstart
-    s32i    a7, a1, 24
-    addi    a7, a1, 64
-    addi    a8, a1, -16
-    s32i    a7, a8, 4
-    rsr     a7, windowbase
-    ssl     a7
-    movi    a8, 1
-    sll     a8, a8
-    wsr     a8, windowstart
-    movi    a8, 1
-    slli    a8, a8, PS_WOE_SHIFT
-    addi    a8, a8, PS_KERNEL
-    wsr     a8, ps
+    rsr     a8, ps
+    s32i    a8, a1, 20
+    rsr     a8, windowstart
+    s32i    a8, a1, 24
+    addi    a8, a1, 64
+    addi    a10, a1, -16
+    s32i    a8, a10, 4
+    rsr     a8, windowbase
+    ssl     a8
+    movi    a10, 1
+    sll     a10, a10
+    wsr     a10, windowstart
+    movi    a10, 1
+    slli    a10, a10, PS_WOE_SHIFT
+    addi    a10, a10, PS_KERNEL
+    wsr     a10, ps
     rsync
     mov     a10, a3
     mov     a11, a4
     mov     a12, a5
     mov     a13, a6
+    mov     a14, a7
+    mov     a15, a9
     callx8  a2
     mov     a2, a10
     l32i    a7, a1, 20
@@ -804,7 +816,6 @@ sos_windowed_call_closed:
  * reached the register, and return. It runs from IRAM, so no instruction is
  * fetched through the flash cache while the system clock, and with it the
  * memory-SPI clock, moves; the caller resumes from flash at the new clock.
- * It loads no literal, which would be a flash read.
  *
  * Its section is not kept: `esp32s3.ld` places it in IRAM behind the trap
  * path, and an image whose clock key writes nothing does not reference it, so
@@ -818,4 +829,211 @@ sos_clock_store:
     memw
     l32i    a3, a2, 0
     memw
+    ret
+
+/* ---- the BBPLL's bring-up (IRAM) ----------------------------------------- */
+
+/* u32 sos_pll_bringup(void)
+ *
+ * Power the BBPLL and set it to 480 MHz from the 40 MHz crystal, as ESP-IDF
+ * v5.4.1 does before it moves the CPU onto the PLL: `rtc_clk_bbpll_enable`
+ * and `rtc_clk_bbpll_configure(40, 480)` (esp_hw_support/port/esp32s3/
+ * rtc_clk.c), with the analog bus enabled as `rtc_clk_init` does
+ * (rtc_clk_init.c), though after P1 where ESP-IDF makes it before; both
+ * precede the bus's first use. Each step's register and value, and the source
+ * each is read from, are in ../ABI.md §14b (P1 to P7, R3). The CPU stays on
+ * its clock; the caller makes the switch. Answers PLL_CAL_DONE, or
+ * PLL_CAL_TIMEOUT when the BBPLL has not reported its calibration done within
+ * PLL_CAL_BOUND cycles, after which nothing may switch to it.
+ *
+ * It runs from IRAM and calls only the mask ROM, through the stub, which is
+ * IRAM too, so nothing is fetched through the flash cache while the PLL
+ * moves: whether the memory-SPI core clock is drawn from the PLL while the
+ * CPU is on the crystal is not in the sources, and ESP-IDF keeps the code
+ * that powers the BBPLL down and up again in IRAM "because disabling BBPLL
+ * may influence the cache" (esp_system/port/soc/esp32s3/clk.c,
+ * `recalib_bbpll`). Its data is the kernel stack and the ROM's phy table,
+ * neither in flash.
+ *
+ * Every register written is volatile: a power cycle restores it (ABI.md
+ * §14d says what an EN-pin reset has been seen to restore). The one RTC
+ * register is RTC_CNTL_OPTIONS0, whose three power-down bits it clears.
+ *
+ * Its section is not kept, as the clock store's is not. */
+    .equ RTC_CNTL_OPTIONS0,     0x60008000
+    /* BB_I2C_FORCE_PD [6], BBPLL_I2C_FORCE_PD [8], BBPLL_FORCE_PD [10]. */
+    .equ BBPLL_FORCE_PD_BITS,   0x540
+    .equ I2C_MST_ANA_CONF0,     0x6000E040
+    .equ BBPLL_STOP_FORCE_HIGH, 0x4         /* [2] */
+    .equ BBPLL_STOP_FORCE_LOW,  0x8         /* [3] */
+    .equ BBPLL_CAL_DONE_BIT,    24
+    /* ANA_CONFIG [17:8], each bit holding one analog block's bus off;
+     * [17] is the BBPLL's. The ROM's register read stores the whole word
+     * (ABI.md §14b). */
+    .equ ANA_CONFIG,            0x6000E044
+    .equ ANA_CONFIG_ALL,        0x3FF
+    .equ ANA_CONFIG_SHIFT,      8
+    .equ ANA_CONFIG_BBPLL_BIT,  17
+    /* SYSTEM_CPU_PER_CONF: PLL_FREQ_SEL [2], 1 for 480 MHz. */
+    .equ CPU_PER_CONF,          0x600C0010
+    .equ PLL_FREQ_SEL_480,      0x4
+    /* The ROM's analog-bus writers (esp32s3.rom.ld), windowed:
+     * rom_i2c_writeReg(block, host, reg, data) and
+     * rom_i2c_writeReg_Mask(block, host, reg, msb, lsb, data). */
+    .equ ROM_I2C_WRITE,         0x40005D60
+    .equ ROM_I2C_WRITE_MASK,    0x40005D6C
+    /* The BBPLL's block on the analog bus, its host, and its registers
+     * (soc/esp32s3/include/soc/regi2c_bbpll.h). */
+    .equ I2C_BBPLL,             0x66
+    .equ I2C_BBPLL_HOSTID,      1
+    .equ BBPLL_OC_REF_DIV,      2
+    .equ BBPLL_OC_DIV_7_0,      3
+    .equ BBPLL_MODE_HF,         4
+    .equ BBPLL_OC_DR,           5           /* OC_DR1 [2:0], OC_DR3 [6:4] */
+    .equ BBPLL_OC_DCUR,         6
+    .equ BBPLL_OC_VCO_DBIAS,    9           /* [1:0] */
+    /* How long to wait for the calibration: ESP-IDF waits without a bound.
+     * The CPU is on the crystal, at 40 MHz or less, so this is at least
+     * 100 ms. */
+    .equ PLL_CAL_BOUND,         4000000
+    /* ESP-IDF's `esp_rom_delay_us(10)` after the calibration: at 40 MHz or
+     * less, 400 cycles are at least 10 us. */
+    .equ PLL_SETTLE_CYCLES,     400
+    .equ PLL_CAL_DONE,          0
+    .equ PLL_CAL_TIMEOUT,       1
+
+    /* Clear, or set, the bits of register `reg` that `mask` holds. */
+    .macro  REG_CLEAR reg, mask
+    memw
+    l32i    a9, \reg, 0
+    or      a9, a9, \mask
+    xor     a9, a9, \mask
+    memw
+    s32i    a9, \reg, 0
+    memw
+    .endm
+    .macro  REG_SET reg, mask
+    memw
+    l32i    a9, \reg, 0
+    or      a9, a9, \mask
+    memw
+    s32i    a9, \reg, 0
+    memw
+    .endm
+
+    /* One BBPLL register through the ROM, whole or a field of it. */
+    .macro  BBPLL_WRITE reg, value
+    l32r    a2, .Lpll_rom_write
+    movi    a3, I2C_BBPLL
+    movi    a4, I2C_BBPLL_HOSTID
+    movi    a5, \reg
+    movi    a6, \value
+    l32r    a0, .Lpll_windowed_call
+    callx0  a0
+    .endm
+    .macro  BBPLL_WRITE_MASK reg, msb, lsb, value
+    l32r    a2, .Lpll_rom_write_mask
+    movi    a3, I2C_BBPLL
+    movi    a4, I2C_BBPLL_HOSTID
+    movi    a5, \reg
+    movi    a6, \msb
+    movi    a7, \lsb
+    movi    a8, \value
+    s32i    a8, a1, 0               /* the seventh argument word */
+    l32r    a0, .Lpll_windowed_call
+    callx0  a0
+    .endm
+
+    .section .iram.text.pll_bringup, "ax"
+    .literal .Lpll_options0, RTC_CNTL_OPTIONS0
+    .literal .Lpll_ana_config, ANA_CONFIG
+    .literal .Lpll_ana_conf0, I2C_MST_ANA_CONF0
+    .literal .Lpll_cpu_per_conf, CPU_PER_CONF
+    .literal .Lpll_rom_write, ROM_I2C_WRITE
+    .literal .Lpll_rom_write_mask, ROM_I2C_WRITE_MASK
+    .literal .Lpll_windowed_call, sos_windowed_call
+    .literal .Lpll_cal_bound, PLL_CAL_BOUND
+    .align  4
+    .global sos_pll_bringup
+    .type   sos_pll_bringup, @function
+sos_pll_bringup:
+    addi    a1, a1, -32
+    s32i    a0, a1, 16
+    s32i    a12, a1, 20
+    s32i    a13, a1, 24
+
+    /* P1, `clk_ll_bbpll_enable`: the BBPLL and its analog bus powered. */
+    l32r    a12, .Lpll_options0
+    movi    a10, BBPLL_FORCE_PD_BITS
+    REG_CLEAR a12, a10
+
+    /* R3, `regi2c_ctrl_ll_i2c_reset` then `regi2c_ctrl_ll_i2c_bbpll_enable`
+     * (hal/esp32s3/include/hal/regi2c_ctrl_ll.h): the buses of the blocks
+     * in [17:8] held off, then the BBPLL's let on. ESP-IDF makes these
+     * before P1. */
+    l32r    a12, .Lpll_ana_config
+    movi    a10, ANA_CONFIG_ALL
+    slli    a10, a10, ANA_CONFIG_SHIFT
+    REG_SET a12, a10
+    movi    a10, 1
+    slli    a10, a10, ANA_CONFIG_BBPLL_BIT
+    REG_CLEAR a12, a10
+
+    /* P2, `clk_ll_bbpll_set_freq_mhz(480)`. */
+    l32r    a12, .Lpll_cpu_per_conf
+    movi    a10, PLL_FREQ_SEL_480
+    REG_SET a12, a10
+
+    /* P3, `regi2c_ctrl_ll_bbpll_calibration_start`. */
+    l32r    a12, .Lpll_ana_conf0
+    movi    a10, BBPLL_STOP_FORCE_HIGH
+    REG_CLEAR a12, a10
+    movi    a10, BBPLL_STOP_FORCE_LOW
+    REG_SET a12, a10
+
+    /* P4, `clk_ll_bbpll_set_config(480, 40)`, in its order: MODE_HF 0x6B;
+     * OC_REF_DIV (DCHGP 5 << 4) | DIV_REF 0; OC_DIV_7_0 8; OC_DR1 0; OC_DR3
+     * 0; OC_DCUR (DLREF_SEL 1 << 6) | (DHREF_SEL 3 << 4) | DCUR 3;
+     * OC_VCO_DBIAS 3. */
+    BBPLL_WRITE BBPLL_MODE_HF, 0x6B
+    BBPLL_WRITE BBPLL_OC_REF_DIV, 0x50
+    BBPLL_WRITE BBPLL_OC_DIV_7_0, 8
+    BBPLL_WRITE_MASK BBPLL_OC_DR, 2, 0, 0
+    BBPLL_WRITE_MASK BBPLL_OC_DR, 6, 4, 0
+    BBPLL_WRITE BBPLL_OC_DCUR, 0x73
+    BBPLL_WRITE_MASK BBPLL_OC_VCO_DBIAS, 1, 0, 3
+
+    /* P5, `regi2c_ctrl_ll_bbpll_calibration_is_done`, polled. */
+    l32r    a12, .Lpll_ana_conf0
+    rsr     a13, ccount
+1:  memw
+    l32i    a9, a12, 0
+    bbsi    a9, BBPLL_CAL_DONE_BIT, 2f
+    rsr     a9, ccount
+    sub     a9, a9, a13
+    l32r    a10, .Lpll_cal_bound
+    bltu    a9, a10, 1b
+    movi    a13, PLL_CAL_TIMEOUT
+    j       4f
+
+    /* P6, the settling delay. */
+2:  rsr     a13, ccount
+3:  rsr     a9, ccount
+    sub     a9, a9, a13
+    movi    a10, PLL_SETTLE_CYCLES
+    bltu    a9, a10, 3b
+    movi    a13, PLL_CAL_DONE
+
+    /* P7, `regi2c_ctrl_ll_bbpll_calibration_stop`, made on either path so
+     * the analog master is left as ESP-IDF leaves it. */
+4:  movi    a10, BBPLL_STOP_FORCE_LOW
+    REG_CLEAR a12, a10
+    movi    a10, BBPLL_STOP_FORCE_HIGH
+    REG_SET a12, a10
+
+    mov     a2, a13
+    l32i    a0, a1, 16
+    l32i    a12, a1, 20
+    l32i    a13, a1, 24
+    addi    a1, a1, 32
     ret
