@@ -226,9 +226,11 @@ expiry has passed, so parking a launcher on a Timer orders nothing under a
 stalled host: the Timer can be expired at the wait, and the launcher never
 parks. An ordering a case needs is made true by waiting on what the other side
 does: attach the child's `Process` to the Waiter and wait for its death, wait
-on an Event or a message it sends, or yield on an image with no tick, where a
-yield returns once everything else has parked. The Timer stays in a case that
-is about the Timer.
+on an Event or a message it sends, or yield on an image with no tick. The ready
+list is one FIFO, so a yield returns once every thread that was runnable at
+the yield has run until it blocked, yielded or exited; a thread woken in those
+turns runs after the yielder, and one that yields hands back early. The
+Timer stays in a case that is about the Timer.
 `thread_preempt` asserts `AB`, `BA`, `AB` as ordered adjacent pairs, which is
 "the processor crossed between the two threads at least three times, whoever
 went first". Each worker spins until the other has printed, so the crossings

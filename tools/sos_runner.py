@@ -2135,10 +2135,11 @@ TEST_CASES = [
     },
     {
         # The shipping kernel preempts a process that never yields. Root
-        # starts a child that loops forever with no syscall, arms a Timer and
-        # parks. The Timer wakes root, but only the scheduler tick running out
-        # the child's slice puts root back on the processor; with no tick the
-        # child holds the machine and the case runs into the harness timeout.
+        # starts a child that loops forever with no syscall and yields. Only
+        # the scheduler tick running out the child's slice puts root back on
+        # the processor, and root then requires the child's `interrupts`
+        # column to be at least one; with no tick the child holds the machine
+        # and the case runs into the harness timeout.
         #
         # `"tick": True` is the case key that leaves the image's boot flags
         # clear, which is what an image gets by default from the kernel. The
@@ -2151,7 +2152,8 @@ TEST_CASES = [
         "children": [CHILD_SPIN_PKG],
         "expect_out": ["{banner}",
                        "SOS tickspin: child started",
-                       "SOS tickspin: timer fired while the child spun"],
+                       "SOS tickspin: the tick took the processor from the "
+                       "child"],
         "expect_clean_exit": True,
     },
     {
@@ -6064,10 +6066,9 @@ TEST_CASES = [
         # and `Transfer` is minted in `pipe_inlet_rights()` for exactly this.
         #
         # The order is the claim. `SOS childpost: posted`, the child's exit and
-        # its teardown all come before root reads the bytes: root's first take
-        # necessarily answered `Ok(None)` (the child was runnable and had not
-        # run), so root parked on the child's death and the child ran to
-        # completion. So the message outlives its sender, which is
+        # its teardown all come before root reads the bytes: root parks on the
+        # child's death before it takes anything, so the child runs to
+        # completion first. So the message outlives its sender, which is
         # `pipe_peer_gone`'s drain-first rule proved across a real process
         # boundary.
         #
@@ -6239,11 +6240,10 @@ TEST_CASES = [
         # forwarding a read to the flash driver, at its smallest.
         #
         # The order is the claim. `SOS childreply: replied`, the child's exit
-        # and its teardown all come before root reads the bytes: root's first
-        # look for the reply necessarily finds none (the child was runnable and
-        # had not run), so root parked on the child's death and the child ran
-        # to completion. So a reply outlives the process that wrote it, which is
-        # what putting it in the exchange's own ring slot buys.
+        # and its teardown all come before root reads the bytes: root parks on
+        # the child's death before it looks for the reply, so the child runs
+        # to completion first. So a reply outlives the process that wrote it,
+        # which is what putting it in the exchange's own ring slot buys.
         #
         # `code={four}` and `len=4` are the same fact from the two sides of the
         # boundary, and `b=68,79,78,69` is `DONE` in ASCII: the bytes, so that

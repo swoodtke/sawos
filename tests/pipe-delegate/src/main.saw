@@ -154,11 +154,6 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    if not answer.have {
-        let _ = system.debug_print("SOS delegate: nothing came back\n")
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
     print("SOS delegate: reply len={} b={},{},{},{}\n", answer.length,
           answer.b0, answer.b1, answer.b2, answer.b3)
 
@@ -168,7 +163,6 @@ func _start(boot_handle: UInt) {
 
 /// What the read below found, flattened out of the message it came in.
 struct Answer {
-    have: Bool,
     length: UInt,
     b0: UInt,
     b1: UInt,
@@ -190,13 +184,13 @@ func reply_after_death(claim: PipeReply,
     try waiter.wait()
     let arrived = try claim.ready()
     if not arrived {
-        // The claim is dropped rather than resolved: resolving would park on an
-        // answer the child's death has just shown is not coming.
+        // The child replied before it died, so a claim that is not ready is a
+        // failure. It is dropped rather than resolved, which would park.
         let _ = move claim
-        return Answer(have: false, length: 0, b0: 0, b1: 0, b2: 0, b3: 0)
+        return SosStatus.WouldBlock
     }
     let answer = try (move claim).resolve()
-    return Answer(have: true, length: answer.len,
+    return Answer(length: answer.len,
                   b0: answer.bytes[0] as UInt,
                   b1: answer.bytes[1] as UInt,
                   b2: answer.bytes[2] as UInt,
