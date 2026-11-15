@@ -1,0 +1,79 @@
+// A limit above the unlimited sentinel is no limit either (spec §2.7): any
+// number at or above it is a `BadArg` fault, and one that does not fit a row
+// is not narrowed into one.
+//
+// The kind is `Mapping`, whose limit the caller's own row does not bound, so
+// the only bound before the machine's is the sentinel's: a kernel that tested
+// for the sentinel alone would pass the number on to the free-row bound and
+// answer `NoResource`, and one that narrowed it first would set a row of zero.
+//
+//   SOS quotapast: created
+//   SOS quotapast: setting a mapping limit above the sentinel
+//   SOS: process fault: argument outside its domain
+//
+// It is asked through the C floor: the typed method takes a `UInt16`, so a
+// number above the sentinel cannot be written there.
+
+import sos.{System, QuotaKind, QUOTA_UNLIMITED, ALL_RIGHTS,
+            sos_system_process_self, sos_process_boot_handle_next,
+            sos_system_process_create, sos_process_quota_set}
+
+static EXIT_FAILED: UInt = 1
+
+static STATUS_OK: UInt = 0
+
+/// The first number above the sentinel.
+static PAST_SENTINEL: UInt = (QUOTA_UNLIMITED as UInt) + 1
+
+/// `NO_HANDLE`: no ceiling source.
+static NO_WORD: UInt = 0
+
+/// The boot-handle record: tag, kind, handle.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    probe(&system, boot_handle)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// The handle word of the next record of `me`'s boot set, or `NO_WORD`.
+func next_word(me: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(me,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+/// Create the child, then set its mapping row past the sentinel. The set does
+/// not return.
+func probe(system: &System, boot_handle: UInt) unsafe {
+    var me: UInt = 0
+    let made = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                       (&var me) as UnsafePointer<UInt>)
+    if made != STATUS_OK {
+        let _ = system.debug_print("SOS quotapast: no process handle\n")
+        return
+    }
+    let image = next_word(me)
+    let ram = next_word(me)
+    var child: UInt = 0
+    let created = sos_system_process_create(boot_handle, image, ram, NO_WORD,
+                                            (&var child) as UnsafePointer<UInt>)
+    if created != STATUS_OK {
+        let _ = system.debug_print("SOS quotapast: create refused\n")
+        return
+    }
+    let _ = system.debug_print("SOS quotapast: created\n")
+    let _ = system.debug_print("SOS quotapast: setting a mapping limit above the sentinel\n")
+    let _ = sos_process_quota_set(child, QuotaKind.Mapping as UInt,
+                                  PAST_SENTINEL)
+    let _ = system.debug_print("SOS quotapast: UNREACHABLE the limit was taken\n")
+}

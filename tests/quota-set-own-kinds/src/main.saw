@@ -1,0 +1,115 @@
+// A launcher's own limit bounds the limit it gives a child for every kind but
+// `Mapping` (spec §2.7), each kind on its own.
+//
+// Root's rows have no cap, so the launcher is a child (`child-quota-launcher`)
+// whose rows are the compiled defaults. Root launches it once per kind but
+// `Mapping`, naming the kind in the grandchild image's tag. Each launch creates
+// a grandchild and sets its row for that kind at the launcher's own limit
+// (taken) and then one above it, which ends the launcher with the `BadArg`
+// fault: `status=131081` is `Faulted` (2) << 16 | `BadArg` (9).
+//
+//   SOS quotalauncher: kind 0 at its own 4: taken
+//   SOS quotalauncher: setting kind 0 one above its own
+//   SOS: process fault: argument outside its domain
+//   SOS quotaownkinds: kind 0 launcher ended status=131081
+//   ... and the same for kinds 1 to 5, 7 and 8
+//   SOS quotaownkinds: done
+
+import sos.{System, Process, Memory, AttachMode, QuotaKind,
+            SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tag the launcher's System travels under, the base of
+/// the role tags on the grandchild's image (`child-quota-launcher`'s
+/// `TAG_KIND_BASE`), and the tag on its RAM.
+static TAG_BOOT: UInt = 7
+static TAG_KIND_BASE: UInt = 100
+static TAG_RAM: UInt = 33
+
+/// The key root watches each launcher's death under.
+static KEY: UInt = 76
+
+/// What the launcher may ask its System object for. `ProcessCreate` is what
+/// lets it make the grandchild.
+static LAUNCHER_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                                  | SystemRight.ProcessCreate
+                                  | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS quotaownkinds: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS quotaownkinds: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    // Rows: the grandchild's image, the launcher's image, then the RAM of
+    // each.
+    var gc_image_rec = try proc.boot_handle_next()
+    var image_rec = try proc.boot_handle_next()
+    var gc_ram_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let gc_image = gc_image_rec.take_memory() else { return BUG }
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let gc_ram = gc_ram_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    // Every kind there is: the loop stops at the first number `QuotaKind`
+    // refuses.
+    var k: UInt = 0
+    while let kind = QuotaKind.from(raw: k) {
+        match kind {
+            case Mapping -> {},
+            case _ -> {
+                let status = try launch(&system, &proc, &image, &ram,
+                                        &gc_image, &gc_ram, k)
+                print("SOS quotaownkinds: kind {} launcher ended status={}\n",
+                      k, status)
+            },
+        }
+        k = k + 1
+    }
+    return
+}
+
+/// Launch the launcher for kind `k` with siblings of the grandchild's image
+/// and RAM, wait for its death and answer its §8 status word.
+func launch(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+            gc_image: &Memory, gc_ram: &Memory,
+            k: UInt) -> Result<UInt, SosStatus> {
+    let launcher = try system.process_create(image: &image, memory: &ram)
+    let for_launcher = try system.mint(rights: LAUNCHER_SYSTEM)
+    try launcher.give(system: move for_launcher, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let gift_image = try gc_image.mint()
+    try launcher.give(memory: move gift_image, tag: TAG_KIND_BASE + k) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let gift_ram = try gc_ram.mint()
+    try launcher.give(memory: move gift_ram, tag: TAG_RAM) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &launcher, key: KEY, mode: AttachMode.OneShot)
+    try launcher.start(boot_tag: TAG_BOOT)
+    let _ = try waiter.wait()
+    return try launcher.get_status()
+}

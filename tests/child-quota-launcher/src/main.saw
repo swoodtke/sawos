@@ -1,0 +1,143 @@
+// Test child: a launcher whose own quota rows have caps, setting its own
+// child's rows. Root is init and its rows have no cap, so a launcher that can
+// meet its own limit has to be a child.
+//
+// It is given a System handle that may create processes, and two regions, an
+// image and the RAM to run it in. It creates a process from them and never
+// starts it. The tag of the image record says which role it plays:
+//
+//   TAG_ABOVE_OWN  the grandchild's Mapping row above its own (taken: a
+//                  mapping row is bounded by the grandchild's free grant rows,
+//                  not by the caller's row), its Event row at its own limit
+//                  (taken), and then one above it (the fault)
+//   TAG_ORDER      the grandchild's Handle row above both its own limit and
+//                  the handle table (the fault: the limit's faults are decided
+//                  before the machine's bound, which would be a status)
+//   TAG_KIND_BASE + k
+//                  for the `QuotaKind` numbered k, the grandchild's row at its
+//                  own limit (taken) and then one above it (the fault)
+//
+// The fault ends this process, and the case's root reads the spec.md §8 status
+// word. An exit code instead says how far it got without the fault.
+
+import sos.{System, Process, QuotaKind, SosStatus}
+
+/// The image record's tags, which choose the role.
+static TAG_ABOVE_OWN: UInt = 41
+static TAG_ORDER: UInt = 42
+static TAG_KIND_BASE: UInt = 100
+
+/// `kcore.limits`' `MAX_HANDLES`, the handle table's size on every board.
+static TABLE: UInt16 = 16
+
+/// The op that should have faulted this process answered instead.
+static EXIT_SURVIVED: UInt = 89
+
+/// The boot set was not two regions, or a step before the role's op failed.
+/// Distinct so the launcher's status names the step.
+static EXIT_NO_RECORD: UInt = 90
+static EXIT_NOT_MEMORY: UInt = 91
+static EXIT_STEP: UInt = 92
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS quotalauncher: no process handle: {}\n", error)
+        return
+    }
+
+    var image_rec = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_RECORD)
+        return
+    }
+    var ram_rec = try proc.boot_handle_next() catch {
+        let _ = proc.exit(EXIT_NO_RECORD)
+        return
+    }
+    let role = image_rec.tag
+    guard let image = image_rec.take_memory() else {
+        let _ = proc.exit(EXIT_NOT_MEMORY)
+        return
+    }
+    guard let ram = ram_rec.take_memory() else {
+        let _ = proc.exit(EXIT_NOT_MEMORY)
+        return
+    }
+    let grandchild = try system.process_create(image: &image,
+                                               memory: &ram) catch {
+        print("SOS quotalauncher: create refused: {}\n", error)
+        let _ = proc.exit(EXIT_STEP)
+        return
+    }
+
+    if role == TAG_ABOVE_OWN {
+        try above_own(&proc, &grandchild) catch {
+            print("SOS quotalauncher: refused: {}\n", error)
+            let _ = proc.exit(EXIT_STEP)
+            return
+        }
+    } else if role == TAG_ORDER {
+        try order(&proc, &grandchild) catch {
+            print("SOS quotalauncher: refused: {}\n", error)
+            let _ = proc.exit(EXIT_STEP)
+            return
+        }
+    } else if role >= TAG_KIND_BASE {
+        guard let kind = QuotaKind.from(raw: role - TAG_KIND_BASE) else {
+            let _ = proc.exit(EXIT_STEP)
+            return
+        }
+        try at_and_above_own(&proc, &grandchild, kind) catch {
+            print("SOS quotalauncher: refused: {}\n", error)
+            let _ = proc.exit(EXIT_STEP)
+            return
+        }
+    }
+    let _ = proc.exit(EXIT_SURVIVED)
+}
+
+/// Mapping above this process's own row, Event at it, then Event above it.
+/// The last set does not return.
+func above_own(proc: &Process, grandchild: &Process) -> Result<Void, SosStatus> {
+    let own_mapping = try proc.quota_get(kind: QuotaKind.Mapping)
+    let mapping = own_mapping.limit + 1
+    try grandchild.quota_set(kind: QuotaKind.Mapping, limit: mapping)
+    print("SOS quotalauncher: mapping limit {} above its own {}: taken\n",
+          mapping, own_mapping.limit)
+    let own_events = try proc.quota_get(kind: QuotaKind.Event)
+    try grandchild.quota_set(kind: QuotaKind.Event, limit: own_events.limit)
+    print("SOS quotalauncher: event limit {}, its own: taken\n",
+          own_events.limit)
+    print("SOS quotalauncher: setting event limit {}, one above its own\n",
+          own_events.limit + 1)
+    let _ = grandchild.quota_set(kind: QuotaKind.Event,
+                                 limit: own_events.limit + 1)
+    return
+}
+
+/// Handle above this process's own row and the table. The set does not
+/// return.
+func order(proc: &Process, grandchild: &Process) -> Result<Void, SosStatus> {
+    let own = try proc.quota_get(kind: QuotaKind.Handle)
+    print("SOS quotalauncher: own handle limit={}\n", own.limit)
+    print("SOS quotalauncher: setting handle limit {}, past own and table\n",
+          TABLE + 1)
+    let _ = grandchild.quota_set(kind: QuotaKind.Handle, limit: TABLE + 1)
+    return
+}
+
+/// `kind`'s row at this process's own limit, then one above it. The second set
+/// does not return.
+func at_and_above_own(proc: &Process, grandchild: &Process,
+                      kind: QuotaKind) -> Result<Void, SosStatus> {
+    let own = try proc.quota_get(kind: kind)
+    try grandchild.quota_set(kind: kind, limit: own.limit)
+    print("SOS quotalauncher: kind {} at its own {}: taken\n", kind as UInt,
+          own.limit)
+    print("SOS quotalauncher: setting kind {} one above its own\n",
+          kind as UInt)
+    let _ = grandchild.quota_set(kind: kind, limit: own.limit + 1)
+    return
+}

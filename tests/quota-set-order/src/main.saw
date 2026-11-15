@@ -1,0 +1,102 @@
+// Where two answers overlap, the limit's faults come before the machine's
+// statuses (spec §2.7): a `Handle` limit above both the caller's own and the
+// handle table is the caller's `BadArg` fault, not a `NoResource` it could
+// read and carry on from.
+//
+// Root's Handle row has no cap, so the caller is a child launcher
+// (`child-quota-launcher`) whose Handle row is the compiled default, below the
+// table. It creates a grandchild and sets its Handle row one past the table,
+// which ends the launcher; answered the table's status instead, the launcher
+// would have exited with a code of its own.
+//
+//   SOS quotalauncher: own handle limit=12
+//   SOS quotalauncher: setting handle limit 17, past own and table
+//   SOS: process fault: argument outside its domain process=1
+//   SOS quotaorder: launcher ended status=131081  <- Faulted << 16 | BadArg
+//   SOS quotaorder: done
+//
+// The grandchild is created and never started, so the launcher's teardown
+// takes it with it.
+
+import sos.{System, Process, Memory, AttachMode, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Root's config: the tag the launcher's System travels under, the role tag
+/// on the grandchild's image (`child-quota-launcher`'s `TAG_ORDER`), and
+/// the tag on its RAM.
+static TAG_BOOT: UInt = 7
+static TAG_ROLE: UInt = 42
+static TAG_RAM: UInt = 33
+
+/// The key root watches the launcher's death under.
+static KEY: UInt = 73
+
+/// What the launcher may ask its System object for. `ProcessCreate` is what
+/// lets it make the grandchild.
+static LAUNCHER_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                                  | SystemRight.ProcessCreate
+                                  | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS quotaorder: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS quotaorder: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    // Rows: the grandchild's image, the launcher's image, then the RAM of
+    // each.
+    var gc_image_rec = try proc.boot_handle_next()
+    var image_rec = try proc.boot_handle_next()
+    var gc_ram_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let gc_image = gc_image_rec.take_memory() else { return BUG }
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let gc_ram = gc_ram_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    let status = try launch(&system, &proc, &image, &ram, move gc_image,
+                            move gc_ram)
+    print("SOS quotaorder: launcher ended status={}\n", status)
+    return
+}
+
+/// Launch the launcher with the grandchild's image and RAM, wait for its death
+/// and answer its §8 status word.
+func launch(system: &System, proc: &Process, image: &Memory, ram: &Memory,
+            gc_image: Memory, gc_ram: Memory) -> Result<UInt, SosStatus> {
+    let launcher = try system.process_create(image: &image, memory: &ram)
+    let for_launcher = try system.mint(rights: LAUNCHER_SYSTEM)
+    try launcher.give(system: move for_launcher, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try launcher.give(memory: move gc_image, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try launcher.give(memory: move gc_ram, tag: TAG_RAM) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &launcher, key: KEY, mode: AttachMode.OneShot)
+    try launcher.start(boot_tag: TAG_BOOT)
+    let _ = try waiter.wait()
+    return try launcher.get_status()
+}

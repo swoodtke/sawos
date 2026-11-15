@@ -315,6 +315,14 @@ static_assert((SystemRight.ProcessObserve as UInt32) >= (1 << 8),
 /// that a process can drop its own authority through the handle `ProcessSelf`
 /// gives it, and withholding it from a sibling keeps that handle's holder from
 /// narrowing the process.
+///
+/// `QuotaSet` is an authority to budget. It gates `ProcessOp.QuotaSet`, which
+/// sets one of the named process's quota limits between its create and its
+/// start (spec §2.7). It is in the default set, so a launcher's handle onto its
+/// child carries it, and it is never in the observe set. On any handle naming a
+/// started process it sets nothing: that process is not `Created`, a process's
+/// own included. Reading a row needs no bit of its own: `ProcessOp.QuotaGet` is
+/// gated by `Stats`, as `Ceiling` is, because a row is a fact about the process.
 public enum ProcessRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
@@ -332,6 +340,7 @@ public enum ProcessRight: UInt32 {
     case PipeCreate = 1 << 19,
     case Stats = 1 << 20,
     case RestrictRights = 1 << 21,
+    case QuotaSet = 1 << 22,
 }
 
 static_assert((ProcessRight.Transfer as UInt32) == (1 << 0),
@@ -366,6 +375,8 @@ static_assert((ProcessRight.Stats as UInt32) >= (1 << 8),
               "kind-specific right Stats must start at bit 8 or above")
 static_assert((ProcessRight.RestrictRights as UInt32) >= (1 << 8),
               "kind-specific right RestrictRights must start at bit 8 or above")
+static_assert((ProcessRight.QuotaSet as UInt32) >= (1 << 8),
+              "kind-specific right QuotaSet must start at bit 8 or above")
 
 /// A right on a Thread object (§2 table row).
 ///
@@ -1039,14 +1050,15 @@ public func root_system_rights() -> UInt32 {
 ///
 /// What is in it, all named for the op it gates: `ThreadCreate`, `ThreadSelf`,
 /// `Exit`, `Wait`, `EventCreate`, `WaiterCreate`, `Start`,
-/// `BootHandles`, `Give`, `Map`, `PipeCreate`, `Stats`, `RestrictRights` and
-/// `Kill`, plus the two universal bits `Transfer` and `Mint`.
+/// `BootHandles`, `Give`, `Map`, `PipeCreate`, `Stats`, `RestrictRights`,
+/// `Kill` and `QuotaSet`, plus the two universal bits `Transfer` and `Mint`.
 ///
-/// Two bits read oddly on root's own handle and are harmless there, which is
+/// Three bits read oddly on root's own handle and are harmless there, which is
 /// the price of one list. `Start` on a process that is already `Running` is the
 /// ordinary `BadState`, and nobody starts root. `Give` into a process that is
-/// not `Created` is the same refusal. The state word answers both better than a
-/// rights word could, because it answers them for a child too.
+/// not `Created` is the same refusal, and so is `QuotaSet`. The state word
+/// answers all three better than a rights word could, because it answers them
+/// for a child too.
 ///
 /// A process narrows the Process handle it derives through a keep mask:
 /// `SystemOp.ProcessSelf` mints this set intersected with the mask the
@@ -1066,6 +1078,7 @@ public func process_rights() -> UInt32 {
      | (ProcessRight.Stats as UInt32)
      | (ProcessRight.RestrictRights as UInt32)
      | (ProcessRight.Kill as UInt32)
+     | (ProcessRight.QuotaSet as UInt32)
      | (ProcessRight.Transfer as UInt32) | (ProcessRight.Mint as UInt32))
 }
 

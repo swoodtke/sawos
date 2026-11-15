@@ -1,0 +1,81 @@
+// A `Mapping` limit is bounded by the child's free grant rows, the board's
+// grant-row budget less the rows its image spent, and not by the caller's own
+// row (spec §2.7, §5b.1). A limit above them answers `NoResource` and sets
+// nothing: how many rows an image spends is a fact the launcher never parses.
+//
+// The case learns the bound without naming a board's number. Root's own
+// `Mapping` limit is the rows its domain has left after its image, and root's
+// image spends as many rows as this child's, so root's limit is the child's
+// free rows too. Root first maps a page into the child, so the child holds a
+// row its image did not spend: the free rows are the image's leftovers, not
+// what is left today. That limit is taken, which says it is no more than the
+// free rows; one more is refused, which says it is no less. The row then still
+// reads the limit taken before the refusal.
+//
+//   SOS quotarows: child mapping row limit=2 used=1
+//   SOS quotarows: root's own free rows taken
+//   SOS quotarows: one row more: no room for what was asked
+//   SOS quotarows: the row still reads root's own free rows
+//   SOS quotarows: done
+
+import sos.{System, MapAccess, QuotaKind, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// One page, the smallest allocation every profile's grain divides.
+static CHUNK: UInt = 0x1000
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS quotarows: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS quotarows: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    let child = try system.process_create(image: &image, memory: &ram)
+    let page = try pool.allocate(len: CHUNK)
+    let row = try child.map(memory: &page,
+                            access: MapAccess.Read | MapAccess.Write)
+
+    let before = try child.quota_get(kind: QuotaKind.Mapping)
+    print("SOS quotarows: child mapping row limit={} used={}\n", before.limit,
+          before.used)
+    let own = try proc.quota_get(kind: QuotaKind.Mapping)
+    let free = own.limit
+    try child.quota_set(kind: QuotaKind.Mapping, limit: free)
+    print("SOS quotarows: root's own free rows taken\n")
+    match child.quota_set(kind: QuotaKind.Mapping, limit: free + 1) {
+        case Ok(_) -> {
+            print("SOS quotarows: UNEXPECTED one row more was taken\n")
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS quotarows: one row more: {}\n", why)
+        },
+    }
+    let after = try child.quota_get(kind: QuotaKind.Mapping)
+    if after.limit != free {
+        print("SOS quotarows: UNEXPECTED the row moved to {}\n", after.limit)
+        return BUG
+    }
+    print("SOS quotarows: the row still reads root's own free rows\n")
+    let _ = move row
+    return
+}

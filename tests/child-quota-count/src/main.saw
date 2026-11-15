@@ -1,0 +1,51 @@
+// Test child: makes Events until its quota refuses one, and exits with the
+// count.
+//
+// It holds every Event it makes until the refusal, one per frame of `make`'s
+// recursion, so the count is how many it could hold at once: its Event limit,
+// whatever its launcher set it to. The refusal must be the policy one
+// (`QuotaExceeded`); the machine's (`NoResource`) or any other ends it with
+// `EXIT_MISMATCH` instead of the count, and so does a failure to start.
+//
+//   SOS quotacount: made=2, then over its quota
+
+import sos.{System, Process, SosStatus}
+
+/// What it ends with when the refusal was not the quota's. A number that
+/// could not be a count, so the launcher's status word tells the two apart.
+static EXIT_MISMATCH: UInt = 98
+
+/// Make Events until one is refused, holding each in this frame until the
+/// refusal, and answer how many were made. A refusal that is not the quota's
+/// is the error. The recursion is bounded by the Event slab.
+func make(proc: &Process, made: UInt) -> Result<UInt, SosStatus> {
+    match proc.event_create() {
+        case Ok(event) -> {
+            let held = move event
+            return make(&proc, made + 1)
+        },
+        case Err(why) -> {
+            if why != SosStatus.QuotaExceeded {
+                return why
+            }
+            return made
+        },
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS quotacount: no process handle: {}\n", error)
+        return
+    }
+    let made = try make(&proc, 0) catch {
+        print("SOS quotacount: refused otherwise: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    print("SOS quotacount: made={}, then over its quota\n", made)
+    let _ = proc.exit(made)
+}

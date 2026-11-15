@@ -1,0 +1,51 @@
+// A limit is a number below the unlimited sentinel, which only root's rows
+// carry (spec §2.7, §2.9): `QuotaSet` with the sentinel is a `BadArg` fault,
+// so a launcher gives a cap and never the absence of one.
+//
+// Root's own Thread row has no cap, so the caller's own limit refuses nothing
+// here, and the Thread row has no machine bound. The largest limit below the
+// sentinel is taken and reads back; the sentinel is the fault.
+//
+//   SOS quotasentinel: root's thread limit=65535
+//   SOS quotasentinel: thread limit 65534 taken, reads limit=65534 used=0
+//   SOS quotasentinel: setting the sentinel
+//   SOS: process fault: argument outside its domain
+
+import sos.{System, QuotaKind, QUOTA_UNLIMITED, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS quotasentinel: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// Set the largest limit, then the sentinel. The second set does not return.
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    let child = try system.process_create(image: &image, memory: &ram)
+
+    let own = try proc.quota_get(kind: QuotaKind.Thread)
+    print("SOS quotasentinel: root's thread limit={}\n", own.limit)
+    try child.quota_set(kind: QuotaKind.Thread, limit: QUOTA_UNLIMITED - 1)
+    let row = try child.quota_get(kind: QuotaKind.Thread)
+    print("SOS quotasentinel: thread limit 65534 taken, reads limit={} used={}\n",
+          row.limit, row.used)
+    print("SOS quotasentinel: setting the sentinel\n")
+    let _ = child.quota_set(kind: QuotaKind.Thread, limit: QUOTA_UNLIMITED)
+    print("SOS quotasentinel: UNREACHABLE the sentinel was set\n")
+    return
+}

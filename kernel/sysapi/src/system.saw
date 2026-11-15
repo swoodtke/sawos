@@ -27,7 +27,7 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, PipeRequestOp, MemoryOp,
                PipeInletHandle, PipeOutletHandle, PipeReplyHandle,
                PipeRequestHandle,
                NO_HANDLE, BootTagForm, EventMode, ClockType, ProtectionTier,
-               BootHandleKind,
+               BootHandleKind, QuotaKind, QUOTA_WORD_USE_SHIFT,
                BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
                BOOT_HANDLE_KIND_WORD, BOOT_HANDLE_HANDLE_WORD,
                boot_handle_record_bytes,
@@ -57,6 +57,7 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_process_pipe_create,
                   sos_process_start, sos_process_stats,
                   sos_process_restrict_rights, ceiling_word,
+                  sos_process_quota_set,
                   sos_system_debug_print, sos_system_shutdown,
                   sos_system_slab_donate, sos_system_process_next,
                   sos_system_process_by_pid, sos_waiter_add, handle_rights}
@@ -715,6 +716,22 @@ public struct ProcessStats {
     public interrupts: UInt64,
     public faults: UInt64,
     public pid: UInt64,
+}
+
+/// One of a process's quota rows (spec §2.9), as `Process.quota_get` reads it:
+/// how many of one `QuotaKind` the process may hold, and how many it holds.
+///
+/// `limit` reads `QUOTA_UNLIMITED` for a row with no policy cap, which is how
+/// root's rows read but its mapping row: the machine is what refuses there.
+/// `used` counts what the process is charged for, which is not always what it
+/// made: creator-pays, so an object made through its handle counts here, and a
+/// handle given to it counts against its `Handle` row.
+///
+/// Plain data, on the automatic `Copy` tier, like `ProcessStats`: a reading is
+/// a fact you took, not a capability you hold.
+public struct QuotaRow {
+    public limit: UInt16,
+    public used: UInt16,
 }
 
 extension PipeRequest {
@@ -1921,6 +1938,63 @@ extension Process {
     public func stats(&self) -> Result<ProcessStats, SosStatus> {
         process_stats_into_frame(self.handle)
     }
+
+    // -------------------------------------------------------------------------
+    // Quota rows (spec §2.7, §2.9)
+    // -------------------------------------------------------------------------
+
+    /// Set this process's limit for `kind` to `limit`, leaving what it has
+    /// used as it is. Requires `ProcessRight.QuotaSet`, and the process must be
+    /// `Created`: a launcher budgets its child between `process_create` and
+    /// `start`, and no row is set once its process has started, a process's
+    /// own included.
+    ///
+    /// A row is a cap on this process, not a share of the caller's: nothing is
+    /// taken from the caller's row, and nothing comes back to it when the
+    /// process dies. The number is bounded all the same, and a number outside
+    /// these bounds terminates the caller, which chose it:
+    ///
+    ///   - below `QUOTA_UNLIMITED`: a launcher gives a cap, never the absence
+    ///     of one;
+    ///   - at most the caller's own limit for `kind`, except for `Mapping`,
+    ///     whose row prices this process's own domain;
+    ///   - at least what this process already holds of `kind`: what was given
+    ///     to it, or created or mapped through its handle, is charged to it.
+    ///
+    /// Naming a process that is not `Created` terminates the caller too, and
+    /// is decided before the number is looked at. `SosStatus.NoResource` is a
+    /// `Mapping` limit above the grant rows this process's image left free, or
+    /// a `Handle` limit above the handle table's size: bounds the caller could
+    /// not have known. Nothing is set then.
+    public func quota_set(&self, kind: QuotaKind,
+                          limit: UInt16) -> Result<Void, SosStatus> {
+        checked(sos_process_quota_set(self.handle, kind as UInt, limit as UInt))
+    }
+
+    /// This process's quota row for `kind`: its limit and what it holds.
+    /// Requires `ProcessRight.Stats`, the bit `stats()` and the ceiling reads
+    /// spend, so a process reads its own rows and a launcher its child's,
+    /// before the start and after. A row with no policy cap reads
+    /// `QUOTA_UNLIMITED` as its limit. Through the handle of a process that has
+    /// ended it is `SosStatus.Revoked`: its rows went with it.
+    public func quota_get(&self, kind: QuotaKind) -> Result<QuotaRow, SosStatus> {
+        quota_row(self.handle, kind)
+    }
+}
+
+/// `ProcessOp.QuotaGet`'s word, decoded: the limit below
+/// `QUOTA_WORD_USE_SHIFT` and the use above it, each a row's width. A word
+/// wider than the two is a kernel skew, `SosStatus.Unknown`, as
+/// `ceiling_word` answers one.
+func quota_row(handle: UInt, kind: QuotaKind) unsafe -> Result<QuotaRow, SosStatus> {
+    let raw = try call_value(handle, ProcessOp.QuotaGet as UInt, kind as UInt,
+                             0, 0)
+    if raw > (UInt32.max as UInt) {
+        return SosStatus.Unknown
+    }
+    let limit = UInt16.from(truncating: raw)
+    let used = UInt16.from(truncating: raw >> QUOTA_WORD_USE_SHIFT)
+    return QuotaRow(limit: limit, used: used)
 }
 
 // The `Waiter.add(process:, key:)` overload lives here because it reads

@@ -347,6 +347,32 @@ DONATE_ROWS_HELD_PKG = os.path.join(TESTS_DIR, "donate-rows-held")
 # a launched process, so proving one costs a launcher and a child.
 QUOTA_EXCEEDED_PKG = os.path.join(TESTS_DIR, "quota-exceeded")
 QUOTA_VS_WALL_PKG = os.path.join(TESTS_DIR, "quota-vs-wall")
+# The quota door (spec §2.7): one root per answer of `QuotaSet` and
+# `QuotaGet`, a launcher child for the answers only a capped caller meets, and
+# a child that counts what its limit lets it hold.
+QUOTA_SET_GATE_PKG = os.path.join(TESTS_DIR, "quota-set-gate")
+QUOTA_SET_BADKIND_PKG = os.path.join(TESTS_DIR, "quota-set-badkind")
+QUOTA_SET_STARTED_PKG = os.path.join(TESTS_DIR, "quota-set-started")
+QUOTA_SET_GONE_PKG = os.path.join(TESTS_DIR, "quota-set-gone")
+QUOTA_SET_SENTINEL_PKG = os.path.join(TESTS_DIR, "quota-set-sentinel")
+QUOTA_SET_PAST_SENTINEL_PKG = os.path.join(TESTS_DIR,
+                                           "quota-set-past-sentinel")
+QUOTA_SET_ABOVE_OWN_PKG = os.path.join(TESTS_DIR, "quota-set-above-own")
+QUOTA_SET_BELOW_HELD_PKG = os.path.join(TESTS_DIR, "quota-set-below-held")
+QUOTA_SET_ROWS_PKG = os.path.join(TESTS_DIR, "quota-set-rows")
+QUOTA_SET_HANDLES_PKG = os.path.join(TESTS_DIR, "quota-set-handles")
+QUOTA_SET_ORDER_PKG = os.path.join(TESTS_DIR, "quota-set-order")
+QUOTA_SET_HELD_PKG = os.path.join(TESTS_DIR, "quota-set-held")
+QUOTA_GET_PKG = os.path.join(TESTS_DIR, "quota-get")
+QUOTA_GET_GATE_PKG = os.path.join(TESTS_DIR, "quota-get-gate")
+QUOTA_GET_BADKIND_PKG = os.path.join(TESTS_DIR, "quota-get-badkind")
+QUOTA_SET_WIDE_PKG = os.path.join(TESTS_DIR, "quota-set-wide")
+QUOTA_SET_ZERO_PKG = os.path.join(TESTS_DIR, "quota-set-zero")
+QUOTA_SET_OWN_KINDS_PKG = os.path.join(TESTS_DIR, "quota-set-own-kinds")
+QUOTA_SET_ROWS_CHILD_PKG = os.path.join(TESTS_DIR, "quota-set-rows-child")
+CHILD_QUOTA_TWOSEG_PKG = os.path.join(TESTS_DIR, "child-quota-twoseg")
+CHILD_QUOTA_LAUNCHER_PKG = os.path.join(TESTS_DIR, "child-quota-launcher")
+CHILD_QUOTA_COUNT_PKG = os.path.join(TESTS_DIR, "child-quota-count")
 REFCOUNT_FREE_PKG = os.path.join(TESTS_DIR, "refcount-free")
 INTERRUPT_UNBIND_PKG = os.path.join(TESTS_DIR, "interrupt-unbind")
 
@@ -3774,7 +3800,7 @@ TEST_CASES = [
         # `INFO_OP` reads a handle's rights and kind. The default sets of an
         # Event, a boot Memory and the Process handle are the bits their kinds
         # mint (1795 is Transfer, Mint and the three Event bits, 1539
-        # Transfer, Mint and the two Memory bits, 4194051 the Process set); a
+        # Transfer, Mint and the two Memory bits, 8388355 the Process set); a
         # sibling minted through a keep mask
         # reports exactly the narrowed set and not the keep bit the source
         # never held; the floor's kind selector answers the published kind
@@ -3791,7 +3817,7 @@ TEST_CASES = [
                        "SOS: boot regions={two}",
                        "SOS handleinfo: event rights=1795",
                        "SOS handleinfo: memory rights=1539",
-                       "SOS handleinfo: process rights=4194051",
+                       "SOS handleinfo: process rights=8388355",
                        "SOS handleinfo: a narrowed sibling reports exactly "
                        "the narrowed set",
                        "SOS handleinfo: a keep bit the source lacks is not "
@@ -3873,7 +3899,7 @@ TEST_CASES = [
         # ceilings; the pool it already held reads 67075 (`pool_rights()`,
         # the Memory default set 1539 and `PoolRight.Allocate`), what it
         # allocates reads 515, the Mapping that installs that 258 (the
-        # Mapping default set is 770), and the process it creates 4177667,
+        # Mapping default set is 770), and the process it creates 8371971,
         # the Process default set without `Start`.
         "name": "rights_ceiling_derived",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
@@ -3885,7 +3911,7 @@ TEST_CASES = [
                        "SOS ceilderived: pool rights=67075",
                        "SOS ceilderived: allocation rights=515",
                        "SOS ceilderived: mapping rights=258",
-                       "SOS ceilderived: created process rights=4177667",
+                       "SOS ceilderived: created process rights=8371971",
                        "SOS ceilderived: done"],
         "expect_clean_exit": True,
     },
@@ -4906,6 +4932,354 @@ TEST_CASES = [
                        "SOS quotawall: root observed child status=65538",
                        "SOS quotawall: done"],
         "expect_clean_exit": True,
+    },
+    # -------------------------------------------------------------------------
+    # The quota door (spec §2.7): `QuotaSet`'s answers in the order they are
+    # decided, one case each, then the limits it sets holding, then `QuotaGet`.
+    # A fault case ends with the caller's fault line; an answer arriving in
+    # its place prints a line no expectation contains.
+    # -------------------------------------------------------------------------
+    {
+        # The right, and that bit alone: a sibling of the child's handle
+        # carrying `QuotaSet` and nothing else sets a row, and one carrying
+        # every right but `QuotaSet` is an `AccessDenied` fault on root.
+        "name": "quota_set_gate",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_GATE_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS quotagate: event limit set through QuotaSet "
+                       "alone, reads limit=3",
+                       "SOS quotagate: setting it through every right but "
+                       "QuotaSet",
+                       "SOS: process fault: access denied process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The kind: one past the last `QuotaKind` is a `BadArg` fault, and
+        # through root's own handle, a running process that any real kind
+        # would answer `BadState` for, so the kind is decided first.
+        "name": "quota_set_badkind",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_BADKIND_PKG,
+        "expect_out": ["{banner}",
+                       "SOS quotabadkind: the last kind reads limit=65535",
+                       "SOS quotabadkind: setting a kind past the last on a "
+                       "running process",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The state: a started child is a `BadState` fault, and asked with
+        # the sentinel, itself a `BadArg` limit, so the state is decided
+        # before the limit.
+        "name": "quota_set_started",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_STARTED_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS quotastarted: started",
+                       "SOS quotastarted: setting the sentinel on a started "
+                       "child",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The state, `Gone`: the same `BadState` fault, not `Revoked`.
+        # `status=131073` is the child's own death, `Faulted` (2) << 16 |
+        # `BadHandle` (1), read before the set.
+        "name": "quota_set_gone",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_GONE_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: process fault: bad handle process={one}",
+                       "SOS quotagone: child ended status=131073",
+                       "SOS quotagone: setting a row of a gone child",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The limit, the sentinel: one below it is taken, the sentinel is a
+        # `BadArg` fault. Root's own row has no cap and the Thread row has no
+        # machine bound, so nothing else refuses either number.
+        "name": "quota_set_sentinel",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_SENTINEL_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS quotasentinel: root's thread limit=65535",
+                       "SOS quotasentinel: thread limit 65534 taken, reads "
+                       "limit=65534 used=0",
+                       "SOS quotasentinel: setting the sentinel",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The limit, past the sentinel: a `Mapping` limit one above it is
+        # the same `BadArg` fault, not the free-row `NoResource` and not a
+        # row narrowed to zero.
+        "name": "quota_set_past_sentinel",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_PAST_SENTINEL_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS quotapast: created",
+                       "SOS quotapast: setting a mapping limit above the "
+                       "sentinel",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The limit is the whole register: on a 64-bit profile, a `Mapping`
+        # limit of 2^32 + 3 is above the sentinel and the `BadArg` fault, not
+        # a limit of 3. A 32-bit register cannot carry the number.
+        "name": "quota_set_wide",
+        "arches": ["arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_WIDE_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS quotawide: mapping limit 3 status=0 reads "
+                       "limit=3 read=0",
+                       "SOS quotawide: setting a mapping limit of 4294967299",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The limit, above the caller's own: a launcher child sets its own
+        # child's Mapping row above its own (taken: the free rows bound it),
+        # its Event row at its own (taken) and one above (the fault, on the
+        # launcher). `status=131081` is `Faulted` (2) << 16 | `BadArg` (9).
+        "name": "quota_set_above_own",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_ABOVE_OWN_PKG,
+        "children": [CHILD_BYE_PKG, CHILD_QUOTA_LAUNCHER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS quotalauncher: mapping limit 3 above its own 2: "
+                       "taken",
+                       "SOS quotalauncher: event limit 4, its own: taken",
+                       "SOS quotalauncher: setting event limit 5, one above "
+                       "its own",
+                       "SOS: process fault: argument outside its domain "
+                       "process={one}",
+                       "SOS quotaown: launcher ended status=131081",
+                       "SOS quotaown: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The limit, above the caller's own, for every kind it bounds: the
+        # launcher child sets one kind per launch, at its own limit (taken)
+        # and one above (the fault). Every kind but `Mapping` (6) is asked.
+        "name": "quota_set_own_kinds",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_OWN_KINDS_PKG,
+        "children": [CHILD_BYE_PKG, CHILD_QUOTA_LAUNCHER_PKG],
+        "expect_out": ["{banner}"] + [
+            line
+            for kind, own in ((0, 4), (1, 4), (2, 2), (3, 4), (4, 4),
+                              (5, 2), (7, 12), (8, 2))
+            for line in (
+                f"SOS quotalauncher: kind {kind} at its own {own}: taken",
+                f"SOS quotalauncher: setting kind {kind} one above its own",
+                "SOS: process fault: argument outside its domain "
+                "process={one}",
+                f"SOS quotaownkinds: kind {kind} launcher ended "
+                "status=131081")
+        ] + ["SOS quotaownkinds: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The limit, below what the child holds: two Events made through
+        # the child's handle make a limit of two the least it takes.
+        "name": "quota_set_below_held",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_BELOW_HELD_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS quotaheld: child event row limit=4 used=2",
+                       "SOS quotaheld: limit 2, what it holds, taken",
+                       "SOS quotaheld: setting limit 1, below what it holds",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The machine, the free rows: a `Mapping` limit of exactly the
+        # child's free grant rows is taken and one more answers `NoResource`,
+        # setting nothing. Root's own `Mapping` limit is the free-row count
+        # of an image like the child's, which is how the case names the bound
+        # without printing a board's number. A page root mapped into the child
+        # first does not lower the bound: it is the rows the image left.
+        "name": "quota_set_rows",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_ROWS_PKG,
+        "children": [CHILD_BYE_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS quotarows: child mapping row limit=2 used=1",
+                       "SOS quotarows: root's own free rows taken",
+                       "SOS quotarows: one row more: no room for what was "
+                       "asked",
+                       "SOS quotarows: the row still reads root's own free "
+                       "rows",
+                       "SOS quotarows: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The free rows are the named child's, not the caller's: a child
+        # whose image spends one row fewer than root's takes a `Mapping`
+        # limit one above root's own, and one more answers `NoResource`.
+        "name": "quota_set_rows_child",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_ROWS_CHILD_PKG,
+        "children": [CHILD_QUOTA_TWOSEG_PKG],
+        "expect_out": ["{banner}",
+                       "SOS quotarowschild: one above root's own free rows: "
+                       "taken",
+                       "SOS quotarowschild: two above root's own free rows: "
+                       "no room for what was asked",
+                       "SOS quotarowschild: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The machine, the handle table: a `Handle` limit of `MAX_HANDLES`
+        # is taken and one more answers `NoResource`, setting nothing.
+        "name": "quota_set_handles",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_HANDLES_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS quotahandles: child handle row limit=12 used=0",
+                       "SOS quotahandles: limit 16, the table, taken",
+                       "SOS quotahandles: limit 17: no room for what was "
+                       "asked",
+                       "SOS quotahandles: the row still reads limit=16",
+                       "SOS quotahandles: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Where two answers overlap: a `Handle` limit past both the launcher's
+        # own row and the table is its `BadArg` fault, not the table's
+        # `NoResource`, because the limit's faults are decided first.
+        "name": "quota_set_order",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_ORDER_PKG,
+        "children": [CHILD_BYE_PKG, CHILD_QUOTA_LAUNCHER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS quotalauncher: own handle limit=12",
+                       "SOS quotalauncher: setting handle limit 17, past own "
+                       "and table",
+                       "SOS: process fault: argument outside its domain "
+                       "process={one}",
+                       "SOS quotaorder: launcher ended status=131081",
+                       "SOS quotaorder: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A limit set and then held: a child given an Event limit below its
+        # default is refused one past it, and one given a limit above its
+        # default makes more. Each count is the child's exit code, so it
+        # arrives twice: on the child's line and in root's status word.
+        "name": "quota_set_held",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_HELD_PKG,
+        "children": [CHILD_QUOTA_COUNT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS quotalimit: lower: event limit 2, default 4",
+                       "SOS quotacount: made=2, then over its quota",
+                       "SOS quotalimit: lower ended status=65538",
+                       "SOS quotalimit: higher: event limit 6, default 4",
+                       "SOS quotacount: made=6, then over its quota",
+                       "SOS quotalimit: higher ended status=65542",
+                       "SOS quotalimit: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A limit of zero, for a kind the child holds none of, is taken and
+        # holds: the first Event made through the child's handle is refused
+        # by the child's quota.
+        "name": "quota_set_zero",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_ZERO_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS quotazero: event limit 0 taken, reads limit=0 "
+                       "used=0",
+                       "SOS quotazero: an event through the child: this "
+                       "process is at its quota",
+                       "SOS quotazero: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # `QuotaGet` on root's own rows and a child's, limit and use, before
+        # and after a use; through a sibling carrying `Stats` alone; and
+        # `Revoked` through a `Gone` child's handle.
+        "name": "quota_get",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_GET_PKG,
+        "children": [CHILD_FAULT_PKG],
+        "expect_out": ["{banner}",
+                       "SOS quotaget: own event row limit=65535 used=0",
+                       "SOS quotaget: own event row after a create "
+                       "limit=65535 used=1",
+                       "SOS quotaget: child event row limit=4 used=0",
+                       "SOS quotaget: child event row after a create "
+                       "through its handle limit=4 used=1",
+                       "SOS quotaget: child handle row limit=12 used=0",
+                       "SOS quotaget: child handle row after a give "
+                       "limit=12 used=1",
+                       "SOS quotaget: through a sibling with Stats alone "
+                       "limit=12 used=1",
+                       "SOS: process fault: bad handle process={one}",
+                       "SOS quotaget: a gone child's row: what this call was "
+                       "waiting for is gone",
+                       "SOS quotaget: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # `QuotaGet` needs `Stats` on the handle used; `QuotaSet` on it is no
+        # authority to read.
+        "name": "quota_get_gate",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_GET_GATE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS quotaread: event row through the full handle "
+                       "limit=65535",
+                       "SOS quotaread: reading through a sibling without "
+                       "Stats",
+                       "SOS: process fault: access denied process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A kind past the last on the read is a `BadArg` fault too.
+        "name": "quota_get_badkind",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_GET_BADKIND_PKG,
+        "expect_out": ["{banner}",
+                       "SOS quotagetkind: the last kind reads limit=65535",
+                       "SOS quotagetkind: reading a kind past the last",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
     {
         # A supervisor woken by a death. The launcher attaches the child's own

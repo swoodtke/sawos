@@ -1,0 +1,95 @@
+// A quota row is read through any Process handle carrying `Stats` (spec §2.7):
+// the limit and the use in one word, a process's own and a child's, before the
+// start and after a use. A row with no policy cap reads the sentinel, and a
+// `Gone` process answers `Revoked`, because its teardown cleared the ledger.
+//
+//   SOS quotaget: own event row limit=65535 used=0
+//   SOS quotaget: own event row after a create limit=65535 used=1
+//   SOS quotaget: child event row limit=4 used=0
+//   SOS quotaget: child event row after a create through its handle limit=4 used=1
+//   SOS quotaget: child handle row limit=12 used=0
+//   SOS quotaget: child handle row after a give limit=12 used=1
+//   SOS quotaget: through a sibling with Stats alone limit=12 used=1
+//   SOS: process fault: bad handle            <- the child, at its first call
+//   SOS quotaget: a gone child's row: <Revoked>
+//   SOS quotaget: done
+//
+// Root's own Event row has no cap, so it reads `QUOTA_UNLIMITED`. The Event
+// made through the child's handle is root's to hold and the child's to pay
+// for, so it moves the child's row and not root's; the give moves the
+// child's Handle row, since a handle given is a handle held.
+
+import sos.{System, ProcessRight, QuotaKind, QuotaRow, AttachMode, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The tag the Event is given under, and the key the child's death is watched
+/// under.
+static TAG_EVENT: UInt = 5
+static KEY: UInt = 75
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS quotaget: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS quotaget: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func show(what: String, row: QuotaRow) {
+    print("SOS quotaget: {} limit={} used={}\n", what, row.limit, row.used)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    show("own event row", try proc.quota_get(kind: QuotaKind.Event))
+    let mine = try proc.event_create()
+    show("own event row after a create",
+         try proc.quota_get(kind: QuotaKind.Event))
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    show("child event row", try child.quota_get(kind: QuotaKind.Event))
+    let theirs = try child.event_create()
+    show("child event row after a create through its handle",
+         try child.quota_get(kind: QuotaKind.Event))
+    show("child handle row", try child.quota_get(kind: QuotaKind.Handle))
+    try child.give(event: move theirs, tag: TAG_EVENT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    show("child handle row after a give",
+         try child.quota_get(kind: QuotaKind.Handle))
+    let observer = try child.mint(rights: ProcessRight.Stats)
+    show("through a sibling with Stats alone",
+         try observer.quota_get(kind: QuotaKind.Handle))
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY, mode: AttachMode.OneShot)
+    try child.start()
+    let _ = try waiter.wait()
+    match child.quota_get(kind: QuotaKind.Event) {
+        case Ok(_) -> {
+            print("SOS quotaget: UNEXPECTED a gone child's row read\n")
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS quotaget: a gone child's row: {}\n", why)
+        },
+    }
+    let _ = move mine
+    return
+}

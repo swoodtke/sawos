@@ -1,0 +1,97 @@
+// A `QuotaSet` limit is the whole register (spec §2.7), on a 64-bit profile
+// (the case runs on arm64 alone). A `Mapping` limit of 3 is taken and reads
+// back; a limit of 2^32 + 3, whose low 32 bits are 3, is above the sentinel
+// and so the `BadArg` fault, not a limit of 3.
+//
+//   SOS quotawide: mapping limit 3 status=0 reads limit=3 read=0
+//   SOS quotawide: setting a mapping limit of 4294967299
+//   SOS: process fault: argument outside its domain
+//
+// It is asked through the C floor: the typed method takes a `UInt16`, so a
+// number this wide cannot be written there.
+
+import sos.{System, QuotaKind, ALL_RIGHTS,
+            sos_system_process_self, sos_process_boot_handle_next,
+            sos_system_process_create, sos_process_quota_set,
+            sos_process_quota_get}
+
+static EXIT_FAILED: UInt = 1
+
+static STATUS_OK: UInt = 0
+
+/// `NO_HANDLE`: no ceiling source.
+static NO_WORD: UInt = 0
+
+/// The boot-handle record: tag, kind, handle.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+/// The bits of the read that are the limit.
+static LIMIT_MASK: UInt = 0xFFFF
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    probe(&system, boot_handle)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// 2^32 + 3, computed at run time so the source also builds for a 32-bit
+/// profile, where the case does not run.
+func wide_limit() -> UInt {
+    var v: UInt = 1
+    var i: Int = 0
+    while i < 32 {
+        v = v * 2
+        i = i + 1
+    }
+    v + 3
+}
+
+/// The handle word of the next record of `me`'s boot set, or `NO_WORD`.
+func next_word(me: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(me,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+/// Create the child, set its mapping row to 3, then to 2^32 + 3. The second
+/// set does not return.
+func probe(system: &System, boot_handle: UInt) unsafe {
+    var me: UInt = 0
+    let made = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                       (&var me) as UnsafePointer<UInt>)
+    if made != STATUS_OK {
+        let _ = system.debug_print("SOS quotawide: no process handle\n")
+        return
+    }
+    let image = next_word(me)
+    let ram = next_word(me)
+    var child: UInt = 0
+    let created = sos_system_process_create(boot_handle, image, ram, NO_WORD,
+                                            (&var child) as UnsafePointer<UInt>)
+    if created != STATUS_OK {
+        let _ = system.debug_print("SOS quotawide: create refused\n")
+        return
+    }
+    let small = sos_process_quota_set(child, QuotaKind.Mapping as UInt, 3)
+    var row: UInt = 0
+    let read = sos_process_quota_get(child, QuotaKind.Mapping as UInt,
+                                     (&var row) as UnsafePointer<UInt>)
+    print("SOS quotawide: mapping limit 3 status={} reads limit={} read={}\n",
+          small, row & LIMIT_MASK, read)
+    let wide = wide_limit()
+    print("SOS quotawide: setting a mapping limit of {}\n", wide)
+    let answer = sos_process_quota_set(child, QuotaKind.Mapping as UInt, wide)
+    var after: UInt = 0
+    let _ = sos_process_quota_get(child, QuotaKind.Mapping as UInt,
+                                  (&var after) as UnsafePointer<UInt>)
+    print("SOS quotawide: UNREACHABLE status={} reads limit={}\n", answer,
+          after & LIMIT_MASK)
+}

@@ -30,7 +30,7 @@
 //! it: a zeroed record is a `Free` record with no body.
 
 import sosabi.{BootHandleKind, HANDLE_KINDS, ObjType, ProcessStatusKind,
-               StatsRow}
+               QUOTA_KINDS, StatsRow}
 import kcore.limits.{
     MAX_GRANT_ROWS,
     MAX_HANDLES,
@@ -81,44 +81,6 @@ public(package) struct BootHandleSlot {
     public(package) handle: UInt,
     public(package) taken: Bool,
 }
-
-/// What a process may be charged for.
-///
-/// Raw-backed and dense from zero, because the value is the column index in the
-/// two quota rows of `ProcessRecord`.
-///
-/// `Handle` has no slab: a handle entry lives in the per-process table, so this
-/// row alone bounds it.
-///
-/// `Mapping` counts installed grant rows, not Mapping objects. A mapping
-/// charges its target, whose scarce resource is its grant-row budget, and a row
-/// outlives its Mapping object (freeing the slot leaves the row). Counting rows
-/// keeps `quota_used` and the target's `grant_count` in step, which is what
-/// makes `install_row`'s `fatal` unreachable. `Thread` has a slab and no
-/// refcount, so its row is charged and only credited by teardown.
-///
-/// `Pipe` is charged to the creator once per connection, not per endpoint: one
-/// charge at `ProcessOp.PipeCreate`, credited when both reference columns reach
-/// zero and the connection's slot is returned. The two ends are two handle
-/// entries, which the `Handle` row already counts; charging each endpoint would
-/// double-charge one slab slot and make giving an end away look like a refund.
-public(package) enum QuotaKind: UInt8 {
-    case Thread = 0,
-    case Event = 1,
-    case Waiter = 2,
-    case Timer = 3,
-    case Memory = 4,
-    case IoMemory = 5,
-    case Mapping = 6,
-    case Handle = 7,
-    case Pipe = 8,
-}
-
-/// Columns in the ledger: one per `QuotaKind`, and the length of the two rows.
-public(package) static QUOTA_KINDS: Int = 9
-
-static_assert(QUOTA_KINDS == (QuotaKind.Pipe as Int) + 1,
-              "the ledger has one column per QuotaKind")
 
 /// What a process record is doing.
 ///

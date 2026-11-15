@@ -1,0 +1,61 @@
+// Setting a quota row is gated by `ProcessRight.QuotaSet` on the handle used
+// and by no other bit (spec §2.7).
+//
+// Root creates a child and mints two siblings of the handle the create
+// answered. The first carries `QuotaSet` and nothing else, and sets the
+// child's Event row, which root reads back through its own handle. The second
+// carries every right but `QuotaSet`, and setting the row through it is a
+// missing right and so a fault.
+//
+//   SOS quotagate: event limit set through QuotaSet alone, reads limit=3
+//   SOS quotagate: setting it through every right but QuotaSet
+//   SOS: process fault: access denied
+
+import sos.{System, Process, ProcessRight, QuotaKind, SosStatus, ALL_RIGHTS}
+
+static EXIT_FAILED: UInt = 1
+
+/// The first sibling's rights: `QuotaSet` and nothing else, so no other bit
+/// can be what lets the set through.
+static ONLY: UInt32 = ProcessRight.QuotaSet as UInt32
+
+/// The second sibling's rights: every right but `QuotaSet`, so the one bit
+/// missing is the one the op checks.
+static SIBLING: UInt32 = ALL_RIGHTS & ~(ProcessRight.QuotaSet as UInt32)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS quotagate: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// Set a row through the full handle, then through the sibling. The second
+/// call does not return.
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    let child = try system.process_create(image: &image, memory: &ram)
+
+    let only = try child.mint(rights: ONLY)
+    try only.quota_set(kind: QuotaKind.Event, limit: 3)
+    let row = try child.quota_get(kind: QuotaKind.Event)
+    print("SOS quotagate: event limit set through QuotaSet alone, reads limit={}\n",
+          row.limit)
+    let sibling = try child.mint(rights: SIBLING)
+    print("SOS quotagate: setting it through every right but QuotaSet\n")
+    let _ = sibling.quota_set(kind: QuotaKind.Event, limit: 2)
+    print("SOS quotagate: UNREACHABLE the sibling set a limit\n")
+    let _ = move only
+    return
+}

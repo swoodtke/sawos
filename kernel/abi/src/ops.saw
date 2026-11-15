@@ -380,6 +380,20 @@ public enum SystemOp: UInt {
 /// naming the caller's own process is a `NotSelf` fault, a `Created` one a
 /// `BadState` fault that changes nothing, and a `Gone` one answers `Revoked`
 /// with its recorded death unchanged. Killing root stops the machine.
+///
+/// `QuotaSet` and `QuotaGet` act on the named process's quota rows (spec §2.7,
+/// §2.9), one per `QuotaKind`. `QuotaSet(kind, limit)` sets the limit for
+/// `kind` of a `Created` process and answers a status alone; it is gated by
+/// `ProcessRight.QuotaSet`. Its answers are decided in this order: a `kind`
+/// that is not a `QuotaKind` is a `BadArg` fault; a process that is not
+/// `Created` is a `BadState` fault, as for `Start` and `Give`; a limit at or
+/// above `QUOTA_UNLIMITED`, above the caller's own limit for a kind other than
+/// `Mapping`, or below what the process already holds of the kind is a
+/// `BadArg` fault; and a `Mapping` limit above the process's free grant rows,
+/// or a `Handle` limit above the handle table's size, answers `NoResource` and
+/// sets nothing. `QuotaGet(kind)` answers the limit and the use in one value
+/// word (`QUOTA_WORD_USE_SHIFT`); it is gated by `ProcessRight.Stats`, a bad
+/// `kind` is a `BadArg` fault, and a process that has ended answers `Revoked`.
 public enum ProcessOp: UInt {
     case ThreadCreate = 0,
     case ThreadSelf = 1,
@@ -395,6 +409,8 @@ public enum ProcessOp: UInt {
     case RestrictRights = 11,
     case Ceiling = 12,
     case Kill = 13,
+    case QuotaSet = 14,
+    case QuotaGet = 15,
 }
 
 /// Whether `ProcessOp.Start`'s second argument carries a boot tag: the op's
@@ -988,7 +1004,7 @@ public enum ReplyWaitLeg: UInt {
 // passes while the table walks past `INFO_OP`.
 static_assert((SystemOp.ProcessByPid as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
-static_assert((ProcessOp.Kill as UInt) < INFO_OP,
+static_assert((ProcessOp.QuotaGet as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
 static_assert((ThreadOp.Yield as UInt) < INFO_OP,
               "an op table must stay below the universal ops")
@@ -1238,6 +1254,61 @@ public static HANDLE_KINDS: Int = 16
 
 static_assert((HandleKind.Pool as UInt) == ((HANDLE_KINDS - 1) as UInt),
               "HANDLE_KINDS must be one past the highest HandleKind")
+
+/// What a process may be charged for: the columns of its two quota rows (spec
+/// §2.9), and the kind `ProcessOp.QuotaSet` and `ProcessOp.QuotaGet` name.
+///
+/// Dense from zero, because the value is the column index in the two rows the
+/// kernel keeps on a process record. Backed by `UInt`, the width of the
+/// register the kind arrives in, for the reason `SystemOp` gives: the value is
+/// process-controlled, so the decode is exact and `from(raw:)` rejects every
+/// number that is not a kind.
+///
+/// `Handle` has no slab: a handle entry lives in the per-process table, so this
+/// row alone bounds it.
+///
+/// `Mapping` counts installed grant rows, not Mapping objects. A mapping
+/// charges its target, whose scarce resource is its grant-row budget, and a row
+/// outlives its Mapping object (freeing the slot leaves the row). Counting rows
+/// keeps the target's use and its grant count in step, which is what makes the
+/// kernel's row-budget stop unreachable. `Thread` has a slab and no refcount,
+/// so its row is charged and only credited by teardown.
+///
+/// `Pipe` is charged to the creator once per connection, not per endpoint: one
+/// charge at `ProcessOp.PipeCreate`, credited when both reference columns reach
+/// zero and the connection's slot is returned. The two ends are two handle
+/// entries, which the `Handle` row already counts; charging each endpoint would
+/// double-charge one slab slot and make giving an end away look like a refund.
+public enum QuotaKind: UInt {
+    case Thread = 0,
+    case Event = 1,
+    case Waiter = 2,
+    case Timer = 3,
+    case Memory = 4,
+    case IoMemory = 5,
+    case Mapping = 6,
+    case Handle = 7,
+    case Pipe = 8,
+}
+
+/// How many `QuotaKind` cases there are: the length of a process's two quota
+/// rows, which are indexed by the kind's number.
+public static QUOTA_KINDS: Int = 9
+
+static_assert((QuotaKind.Pipe as UInt) == ((QUOTA_KINDS - 1) as UInt),
+              "QUOTA_KINDS must be one past the highest QuotaKind")
+
+/// "No policy cap on this row: the machine answers." The largest value a quota
+/// row holds, and the limit `ProcessOp.QuotaGet` reads for a row without a cap.
+///
+/// Root's rows carry it (spec §2.9), so the slab is what refuses root. No
+/// limit `ProcessOp.QuotaSet` takes can be it or anything above it: a launcher
+/// gives a child a cap, never the absence of one.
+public static QUOTA_UNLIMITED: UInt16 = 0xFFFF
+
+/// Where the use sits in the word `ProcessOp.QuotaGet` answers: the limit is
+/// the low 16 bits, the use the 16 above them, each a row's width.
+public static QUOTA_WORD_USE_SHIFT: UInt = 16
 
 /// Which slab a `SystemOp.SlabDonate` is feeding.
 ///

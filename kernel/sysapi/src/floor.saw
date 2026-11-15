@@ -547,6 +547,36 @@ public func sos_process_ceiling(handle: UInt, kind: UInt,
     sos_syscall3(handle, ProcessOp.Ceiling as UInt, kind, 0, 0, value_out)
 }
 
+/// Set a process's quota limit for `kind`, a `QuotaKind`, to `limit` (spec
+/// §2.7). Requires `ProcessRight.QuotaSet`, and the process must be `Created`:
+/// a launcher sets its child's rows between the create and the start.
+///
+/// A `kind` that is not a `QuotaKind`, a process that is not `Created`, and a
+/// limit at or above `QUOTA_UNLIMITED`, above the caller's own for a kind other
+/// than `Mapping`, or below what the process already holds each terminate the
+/// caller. A `Mapping` limit above the process's free grant rows and a
+/// `Handle` limit above the handle table answer `SosStatus.NoResource` and set
+/// nothing.
+@export("sos_process_quota_set")
+public func sos_process_quota_set(handle: UInt, kind: UInt,
+                                  limit: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, ProcessOp.QuotaSet as UInt, kind, limit, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Read a process's quota row for `kind`, a `QuotaKind`, into `value_out`: the
+/// limit in bits 0 to 15 (`QUOTA_UNLIMITED` for no cap) and the use in bits 16
+/// to 31 (spec §2.7). Requires `ProcessRight.Stats`.
+///
+/// A `kind` that is not a `QuotaKind` terminates the caller, and a process
+/// that has ended answers `SosStatus.Revoked`.
+@export("sos_process_quota_get")
+public func sos_process_quota_get(handle: UInt, kind: UInt,
+                                  value_out: UnsafePointer<UInt>) unsafe -> UInt {
+    sos_syscall3(handle, ProcessOp.QuotaGet as UInt, kind, 0, 0, value_out)
+}
+
 /// Accumulate `bits` into an Event. Never blocks. Requires `EventRight.Signal`.
 @export("sos_event_signal")
 public func sos_event_signal(handle: UInt, bits: UInt) -> UInt {

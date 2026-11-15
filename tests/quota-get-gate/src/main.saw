@@ -1,0 +1,46 @@
+// Reading a quota row is gated by `ProcessRight.Stats` on the handle used
+// (spec §2.7), as reading a ceiling is.
+//
+// Root reads its own Event row through its own handle first, as the control.
+// Then it mints a sibling without `Stats`, but with `QuotaSet`, and reads
+// through that, which is a missing right and so a fault: setting a row is no
+// authority to read one.
+//
+//   SOS quotaread: event row through the full handle limit=65535
+//   SOS quotaread: reading through a sibling without Stats
+//   SOS: process fault: access denied
+
+import sos.{System, ProcessRight, QuotaKind}
+
+static EXIT_FAILED: UInt = 1
+
+/// The sibling's rights: everything it needs to be a handle worth holding,
+/// and `QuotaSet`, but not `Stats`.
+static SIBLING: UInt32 = (ProcessRight.Transfer | ProcessRight.Mint
+                          | ProcessRight.Wait | ProcessRight.QuotaSet)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS quotaread: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let full = try proc.quota_get(kind: QuotaKind.Event) catch {
+        print("SOS quotaread: the full handle refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS quotaread: event row through the full handle limit={}\n",
+          full.limit)
+    let sibling = try proc.mint(rights: SIBLING) catch {
+        print("SOS quotaread: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS quotaread: reading through a sibling without Stats\n")
+    let _ = sibling.quota_get(kind: QuotaKind.Event)
+    let _ = system.debug_print("SOS quotaread: UNREACHABLE the sibling read\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

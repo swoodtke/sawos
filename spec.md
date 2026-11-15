@@ -1684,8 +1684,8 @@ of the process or its record.
 `EventCreate`, `WaiterCreate` and `PipeCreate`, then `ThreadSelf`, `Exit`,
 `GetStatus` (on `Wait`), `Start`, `BootHandleNext` (on `BootHandles`), `Give`,
 `Kill` (§8), `Stats`, `RestrictRights` and `Ceiling` (on
-`Stats`; both below). `QuotaSet` and `QuotaGet` (on `Stats`) set and read the
-named process's quota rows (below; not yet enforced: quota-door).
+`Stats`; both below). `QuotaSet` sets and `QuotaGet` (on `Stats`) reads the
+named process's quota rows (below).
 `ProcessRight.Map` is the target-side right `MemoryOp.Map` and `IoMemoryOp.Map`
 spend (§2.5). Creating a process is not an op on this object:
 `ProcessCreate` is on System, because a process is a machine-wide resource
@@ -1740,9 +1740,8 @@ process's own or its creator's handle (root's, `ProcessSelf`'s and
 pid, mint the observe set, below), named for its ops
 throughout: `ThreadCreate`, `ThreadSelf`, `Exit`, `Wait`, `EventCreate`,
 `WaiterCreate`, `Start`, `BootHandles`, `Give`, `Map`,
-`PipeCreate`, `Stats`, `RestrictRights` (below) and `Kill` (§8), plus the
-universal `Transfer | Mint`. It also carries `QuotaSet`
-(below; not yet enforced: quota-door). A launcher keeps the child's
+`PipeCreate`, `Stats`, `RestrictRights`, `QuotaSet` (both below) and `Kill`
+(§8), plus the universal `Transfer | Mint`. A launcher keeps the child's
 handle — it is what supervises with — and the child derives its own authority
 from the masked System handle it was given (§12), so supervision and
 self-management are not alternatives.
@@ -1753,10 +1752,10 @@ may not watch it work.
 **The observe set** is `ProcessRight.Wait | ProcessRight.Stats`: enough to
 learn that a process died and how, what it cost, what its pid is, what its
 rights ceilings are (`ProcessOp.Ceiling` is gated by `Stats`, below) and what
-its quota rows are (`ProcessOp.QuotaGet`, below;
-not yet enforced: quota-door), and nothing that acts on it or moves the
-handle on; it never carries `ProcessRight.Kill` (§8). The kernel mints it for a
-Process handle that comes from no creation, no `ProcessSelf` and no give: the
+its quota rows are (`ProcessOp.QuotaGet`, below), and nothing that acts on
+it or moves the handle on; it never carries `ProcessRight.Kill` (§8). The
+kernel mints it for a Process handle that comes from no creation, no
+`ProcessSelf` and no give: the
 sender handle (§2.1), capped like every mint by the Process ceiling of the
 table it lands in, which is the caller's (below). The process walk and the
 lookup by pid on `SystemRight.ProcessObserve` (§2.8) mint it too, on the same
@@ -1840,10 +1839,9 @@ child's Process ceiling, which caps the Process handle the child derives through
   inheritance happens once, at the create, and a spawn service that wants a
   process tree records one itself, keyed by pid.
 
-**Quota rows** (not yet enforced: quota-door). A launcher may set a child's
-quota rows (§2.9) after the create and before the start, through its handle on
-the child. A process never sets its own, and nobody sets a row once its process
-has started.
+**Quota rows.** A launcher may set a child's quota rows (§2.9) after the
+create and before the start, through its handle on the child. A process never
+sets its own, and nobody sets a row once its process has started.
 
 - **Setting.** `ProcessOp.QuotaSet(kind, limit)` sets the named process's
   limit for one `QuotaKind` and leaves what it has used as it is. It is gated
@@ -2335,8 +2333,7 @@ names its clients through the sender handle (§2.1), which asks no System right.
 - **What a tool reads through the handle.** With `Stats`, the pid and the trap
   counters, live or final (§2.7), and, while the process lives, its rights
   ceilings (`ProcessOp.Ceiling`, which answers `Revoked` once it is `Gone`)
-  and its quota rows (`ProcessOp.QuotaGet`, likewise;
-  not yet enforced: quota-door);
+  and its quota rows (`ProcessOp.QuotaGet`, likewise);
   with `Wait`, the §8 status word, through `GetStatus` or a Waiter. Nothing
   else: the observe set carries no right to map into, start, give to, create
   through, exit, restrict or kill the process (kill, §8), and
@@ -2375,9 +2372,9 @@ Interrupt has no column: there is at most one live Interrupt per line, and the
 Interrupt slab bounds the objects (§2.8). Pools and allocations share the
 `Memory` column, as they share the Memory slab: an `allocate` charges its
 caller one, and the boot charges root one for each
-`Ram` and `Pool` row it mints. Parts of the model this section and §2.7,
-§2.8, §5b.1 and §12 describe are not yet enforced, and the transition at the
-end of this section says what the kernel does until they are.
+`Ram` and `Pool` row it mints. Parts of the model this section and §2.8,
+§5b.1 and §12 describe are not yet enforced, and the transition at the end of
+this section says what the kernel does until they are.
 
 - **Policy first.** A quota is checked at every allocation site that answers
   `NoResource`, ahead of the slab, so a process at its budget is told
@@ -2402,11 +2399,10 @@ end of this section says what the kernel does until they are.
 - **A child's rows.** A child starts with the quota defaults its image carries
   (§2.8, §12), which replace `kcore.limits`' compiled defaults; an image that
   carries none gives its children the compiled defaults. Its launcher may then
-  set any row before the start (`ProcessOp.QuotaSet`, §2.7; not yet enforced:
-  quota-door). A row is a cap on one process, not a share of its launcher's. A
-  child's mapping row is clamped at its create to the grant rows its domain
-  has left after its image, as root's is. There is no per-create quota
-  argument.
+  set any row before the start (`ProcessOp.QuotaSet`, §2.7). A row is a cap
+  on one process, not a share of its launcher's. A child's mapping row is
+  clamped at its create to the grant rows its domain has left after its
+  image, as root's is. There is no per-create quota argument.
 - **`Pipe` counts a connection.** `ProcessOp.PipeCreate` charges it once, and
   the credit lands when both of the connection's reference columns reach zero
   and the slot goes back. Charging per endpoint would be wrong: two ends of
@@ -2459,7 +2455,7 @@ end of this section says what the kernel does until they are.
   was given pays a `Memory` row per allocation and nothing for the pool,
   which stays charged to whoever it was charged to.
 
-**Not yet enforced: the transition to per-board limits and the quota door.**
+**Not yet enforced: the transition to per-board limits.**
 Every sentence of this specification that describes a part of the model which
 the kernel does not build carries the marker "not yet enforced:" and the
 part's name; a marker on the lead of a paragraph or a bullet covers all of
@@ -2479,10 +2475,6 @@ this note.
   (§12), and an image that states none links no area and carries no
   defaults, so every kind boots at its floor and every child starts with the
   compiled defaults.
-- **The quota door** (`quota-door`). No op sets or reads a quota row:
-  `ProcessOp` has neither `QuotaSet` nor `QuotaGet`, and there is no
-  `ProcessRight.QuotaSet`. A child keeps the rows its create installed, its
-  mapping row clamped to its free grant rows, for its whole life.
 
 ### 2.10 Object lifecycle
 
@@ -2547,7 +2539,7 @@ handle to make the op that would answer `Revoked`.
 | Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. `Exit` releases the handle it is invoked through: only that handle goes, every other one still reads the slot, and a Thread that exits with no other handle naming it is freed at its exit. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
 | Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) and bound to no process: nothing names its binder's record, so the teardown has nothing to disown |
 | Event, Pipe, Pool, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them; an allocation also until its last grant row goes, and a pool until its last allocation comes home (§2.5) |
-| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7), and so does `QuotaSet` (§2.7; not yet enforced: quota-door). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1). The process walk and the lookup by pid answer a `Gone` record for as long as something names it, and the handle they mint is one more name that holds it (§2.8); they answer no process before its start (§2.8). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
+| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7), and so does `QuotaSet` (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1). The process walk and the lookup by pid answer a `Gone` record for as long as something names it, and the handle they mint is one more name that holds it (§2.8); they answer no process before its start (§2.8). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
 | Clock, System | Never destroyed |
 
 **A free of a live object runs its last rites.** The last handle going is a
@@ -4474,9 +4466,8 @@ loader parses and reports while no process stores either.
 - **Retiring the image-declared device grant** (`SegFlag.Device` and the
   loader's `allow_device: true` door, dormant) (§2.5): its emitter is
   sawlang-side, so deleting it is a toolchain-pin event.
-- **Per-board limits and linked slab areas** (§2.8, §12), and **the quota
-  door**, `ProcessOp.QuotaSet` and `QuotaGet` (§2.7). Until each lands the
-  kernel does what §2.9's transition note says for it.
+- **Per-board limits and linked slab areas** (§2.8, §12). Until they land
+  the kernel does what §2.9's transition note says.
 - **Sub-pools and revoke** (§2.5): `Pool.split` and a revoke are reserved, not
   specified. A process given a pool can allocate from it but cannot carve it
   into budgets for others, and a manager cannot take back what it allocated.
@@ -4515,9 +4506,9 @@ loader parses and reports while no process stores either.
   not established, so nothing there links a segment in place (§5.5).
 - Quotas count objects, not bytes (§2.9). A child's rows are the defaults it
   was created with until its launcher sets them, which it may do only between
-  the create and the start (§2.7; not yet enforced: quota-door); there is no
-  per-create quota argument. Slab donation is permanent, and no capacity goes
-  below its compiled floor (§2.8).
+  the create and the start (§2.7); there is no per-create quota argument.
+  Slab donation is permanent, and no capacity goes below its compiled floor
+  (§2.8).
 - Handle generations are best-effort bug detection, not a uniqueness
   guarantee (§3).
 - A cycle of connections, each carrying the next one's outlet in a staged

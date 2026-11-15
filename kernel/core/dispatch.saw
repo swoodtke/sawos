@@ -10,6 +10,8 @@
 import hal
 import sosabi.{
     ObjType,
+    QuotaKind,
+    QUOTA_UNLIMITED,
     SystemHandle,
     ProcessHandle,
     ThreadHandle,
@@ -160,7 +162,7 @@ import kcore.result.{
     write_result,
 }
 import kcore.pslot.{HandleEntry, PROCESSES, PROCESS_RECORDS, ProcessState,
-                    QuotaKind, body_of, has_body}
+                    body_of, has_body}
 import kcore.objects.{
     ClockObject,
     EventObject,
@@ -227,7 +229,11 @@ import kcore.objects.{
     quota_charge,
     quota_credit,
     quota_room,
+    quota_limit_of,
     quota_room_for,
+    quota_set_limit,
+    quota_used_of,
+    quota_word,
     unbind_handle,
 }
 import kcore.diag.{console, fatal_kernel}
@@ -856,6 +862,24 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             process_ceiling(p, obj.slot, arg0)
         },
+        // Sets one of the named process's quota limits (§2.7). It acts on the
+        // process the handle names, which must be `Created`: a launcher budgets
+        // its child between the create and the start, and nobody sets a row
+        // once its process runs.
+        case QuotaSet -> {
+            if not obj.allows(ProcessRight.QuotaSet) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_quota_set(p, obj.slot, arg0, arg1)
+        },
+        // Reads one of the named process's quota rows. Gated by `Stats`, as
+        // `Ceiling` is: a row is a fact about the process.
+        case QuotaGet -> {
+            if not obj.allows(ProcessRight.Stats) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_quota_get(p, obj.slot, arg0)
+        },
     }
 }
 
@@ -897,6 +921,92 @@ func process_ceiling(p: Int, target: Int, raw: UInt) unsafe -> SyscallResult {
         return op_status(SosStatus.Revoked)
     }
     op_value(PROCESSES[body_of(target)].ceilings[kind] as UInt)
+}
+
+/// `ProcessOp.QuotaSet`: process `child`'s limit for the kind `raw` names
+/// becomes `limit`, and what it has used stays as it is (spec §2.7).
+///
+/// The answers are decided in the spec's order, and nothing is written until
+/// all of them are behind: the kind, a `BadArg` fault whatever the state, as
+/// `process_restrict_rights` decodes it; the state, a `BadState` fault unless
+/// the child is `Created`, a `Gone` one included, as `Start` and `Give`
+/// answer; the limit's faults, each `BadArg` because the caller chose the
+/// number and can read what bounds it; then the machine's bounds, each
+/// `NoResource` because the caller could not have known them.
+///
+/// A row is a cap on one process and not a share of the caller's: the caller's
+/// own limit bounds the number, and nothing is charged to the caller. `Mapping`
+/// is the exception to that bound, because a mapping row prices the child's own
+/// domain (the creator-pays exception of spec §2.9); its bound is the child's
+/// free grant rows, which keeps `install_row`'s stop unreachable. The sentinel
+/// bound comes first, so no limit set here reads as no cap and the narrowing to
+/// a row's width at the write is exact.
+func process_quota_set(p: Int, child: Int, raw: UInt,
+                       limit: UInt) unsafe -> SyscallResult {
+    guard let kind = QuotaKind.from(raw: raw) else {
+        fault_process(p, FaultReason.BadArg)
+    }
+    match PROCESS_RECORDS[child].state {
+        case Created -> {},
+        case _ -> fault_process(p, FaultReason.BadState),
+    }
+    if limit >= (QUOTA_UNLIMITED as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    match kind {
+        case Mapping -> {},
+        case _ -> {
+            if limit > (quota_limit_of(p, kind) as UInt) {
+                fault_process(p, FaultReason.BadArg)
+            }
+        },
+    }
+    if limit < (quota_used_of(child, kind) as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    match kind {
+        case Mapping -> {
+            if limit > free_grant_rows(child) {
+                return op_status(SosStatus.NoResource)
+            }
+        },
+        case Handle -> {
+            if limit > (MAX_HANDLES as UInt) {
+                return op_status(SosStatus.NoResource)
+            }
+        },
+        case _ -> {},
+    }
+    quota_set_limit(child, kind, limit as UInt16)
+    op_ok()
+}
+
+/// The grant rows process `p`'s domain has left after its image's (spec §2.7,
+/// §5b.1): the bound a `Mapping` limit meets, and the clamp its create applied.
+///
+/// The rows a process holds beyond its image's are exactly the ones its
+/// `Mapping` row is charged for (see `install_row`), so the image's are the
+/// difference, whatever was mapped into the process since its create.
+func free_grant_rows(p: Int) unsafe -> UInt {
+    let image_rows = (PROCESSES[body_of(p)].grant_count
+                      - (quota_used_of(p, QuotaKind.Mapping) as Int))
+    let free = (hal.GRANT_ROW_BUDGET as Int) - image_rows
+    if free < 0 { 0 } else { free as UInt }
+}
+
+/// `ProcessOp.QuotaGet`: process `target`'s row for the kind `raw` names, as
+/// `quota_word` packs it. The kind is decoded first, as for
+/// `process_quota_set`. A `Gone` target answers `Revoked`: its teardown cleared
+/// the ledger, and a cleared row would read as a limit of zero.
+func process_quota_get(p: Int, target: Int, raw: UInt) unsafe -> SyscallResult {
+    guard let kind = QuotaKind.from(raw: raw) else {
+        fault_process(p, FaultReason.BadArg)
+    }
+    match PROCESS_RECORDS[target].state {
+        case Gone -> { return op_status(SosStatus.Revoked) },
+        case _ -> {},
+    }
+    op_value(quota_word(target, kind))
 }
 
 // -----------------------------------------------------------------------------
@@ -1285,7 +1395,8 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     // this child's domain has left once its image has spent its own rows, and
     // the image's rows are recorded by that call. A child gets the image's
     // quota defaults, or `kcore.limits`' compiled ones for an image that
-    // carries none; there is no per-create argument.
+    // carries none; there is no per-create argument, and the launcher sets
+    // any row it wants otherwise before the start (`process_quota_set`).
     install_quota_limits(slot, false,
                          (hal.GRANT_ROW_BUDGET as Int) - PROCESSES[body].grant_count)
 

@@ -11,6 +11,10 @@
 
 import sosabi.{
     ObjType,
+    QUOTA_KINDS,
+    QUOTA_UNLIMITED,
+    QUOTA_WORD_USE_SHIFT,
+    QuotaKind,
     SystemHandle,
     ProcessHandle,
     ThreadHandle,
@@ -93,8 +97,6 @@ import kcore.pslot.{
     HandleEntry,
     PROCESSES,
     PROCESS_RECORDS,
-    QUOTA_KINDS,
-    QuotaKind,
     body_of,
 }
 
@@ -646,22 +648,36 @@ public(package) func unbind_handle(p: Int, index: Int) unsafe {
 // and handles are counted though they have no slab), so this is its own closed
 // set. A new `QuotaKind` case needs a line in `install_quota_limits`; without
 // one its limit stays zero and a process can hold none of it.
-
-/// "No policy cap on this row: the machine answers."
-///
-/// This is how root's limits are the slab sizes. Writing root's rows as the
-/// slab sizes would put a policy cap exactly where the machine refuses, and
-/// since the quota is asked first, every `NoResource` root was answered with
-/// would become a `QuotaExceeded`. With the sentinel the slab is what refuses
-/// root.
-public(package) static QUOTA_UNLIMITED: UInt16 = 0xFFFF
+//
+// `QUOTA_UNLIMITED` (from `sosabi`) is how root's limits are the slab sizes.
+// Writing root's rows as the slab sizes would put a policy cap exactly where
+// the machine refuses, and since the quota is asked first, every `NoResource`
+// root was answered with would become a `QuotaExceeded`. With the sentinel the
+// slab is what refuses root.
 
 /// Which column of a process's two ledger rows `kind` is.
 ///
 /// The value of `QuotaKind` is the column index; this keeps that cast in one
 /// place rather than at every site.
 func quota_column(kind: QuotaKind) -> Int {
-    (kind as UInt8) as Int
+    kind as Int
+}
+
+/// What `p` may spend of `kind`: its limit, `QUOTA_UNLIMITED` for no cap.
+public(package) func quota_limit_of(p: Int, kind: QuotaKind) unsafe -> UInt16 {
+    PROCESS_RECORDS[p].quota_limit[quota_column(kind)]
+}
+
+/// What `p` has spent of `kind`.
+public(package) func quota_used_of(p: Int, kind: QuotaKind) unsafe -> UInt16 {
+    PROCESS_RECORDS[p].quota_used[quota_column(kind)]
+}
+
+/// `p`'s row for `kind` as `ProcessOp.QuotaGet` answers it: the limit in the
+/// low 16 bits and the use above it, at `QUOTA_WORD_USE_SHIFT`.
+public(package) func quota_word(p: Int, kind: QuotaKind) unsafe -> UInt {
+    (((quota_used_of(p, kind) as UInt) << QUOTA_WORD_USE_SHIFT)
+     | (quota_limit_of(p, kind) as UInt))
 }
 
 /// Has `p` room for one more of `kind`?
@@ -749,8 +765,10 @@ public(package) func quota_clear(p: Int) unsafe {
     }
 }
 
-/// Write one row of `p`'s allowance.
-func set_limit(p: Int, kind: QuotaKind, value: UInt16) unsafe {
+/// Write one row of `p`'s allowance: at its create (`install_quota_limits`)
+/// and through `ProcessOp.QuotaSet` before its start.
+public(package) func quota_set_limit(p: Int, kind: QuotaKind,
+                                     value: UInt16) unsafe {
     PROCESS_RECORDS[p].quota_limit[quota_column(kind)] = value
 }
 
@@ -814,7 +832,9 @@ func child_quota_default(kind: QuotaKind) unsafe -> UInt16 {
 /// headroom left and its `fatal` is a consequence rather than a hope. Root is
 /// capped too: the row budget is the machine, stated in the ledger's
 /// vocabulary, and so is the Mapping slab's capacity, which root's row is read
-/// against at boot, when nothing has donated to it.
+/// against at boot, when nothing has donated to it. `ProcessOp.QuotaSet` keeps
+/// the bound: a launcher's `Mapping` limit for its child is held to the same
+/// free rows.
 ///
 /// Call once per process life (at boot for root, at `process_create` for a
 /// child), always after the image's rows are recorded, because `free_rows` is
@@ -827,24 +847,31 @@ public(package) func install_quota_limits(p: Int, root: Bool, free_rows: Int) un
     }
 
     if root {
-        set_limit(p, QuotaKind.Thread, QUOTA_UNLIMITED)
-        set_limit(p, QuotaKind.Event, QUOTA_UNLIMITED)
-        set_limit(p, QuotaKind.Waiter, QUOTA_UNLIMITED)
-        set_limit(p, QuotaKind.Timer, QUOTA_UNLIMITED)
-        set_limit(p, QuotaKind.Memory, QUOTA_UNLIMITED)
-        set_limit(p, QuotaKind.IoMemory, QUOTA_UNLIMITED)
-        set_limit(p, QuotaKind.Handle, QUOTA_UNLIMITED)
-        set_limit(p, QuotaKind.Pipe, QUOTA_UNLIMITED)
+        quota_set_limit(p, QuotaKind.Thread, QUOTA_UNLIMITED)
+        quota_set_limit(p, QuotaKind.Event, QUOTA_UNLIMITED)
+        quota_set_limit(p, QuotaKind.Waiter, QUOTA_UNLIMITED)
+        quota_set_limit(p, QuotaKind.Timer, QUOTA_UNLIMITED)
+        quota_set_limit(p, QuotaKind.Memory, QUOTA_UNLIMITED)
+        quota_set_limit(p, QuotaKind.IoMemory, QUOTA_UNLIMITED)
+        quota_set_limit(p, QuotaKind.Handle, QUOTA_UNLIMITED)
+        quota_set_limit(p, QuotaKind.Pipe, QUOTA_UNLIMITED)
     } else {
-        set_limit(p, QuotaKind.Thread, child_quota_default(QuotaKind.Thread))
-        set_limit(p, QuotaKind.Event, child_quota_default(QuotaKind.Event))
-        set_limit(p, QuotaKind.Waiter, child_quota_default(QuotaKind.Waiter))
-        set_limit(p, QuotaKind.Timer, child_quota_default(QuotaKind.Timer))
-        set_limit(p, QuotaKind.Memory, child_quota_default(QuotaKind.Memory))
-        set_limit(p, QuotaKind.IoMemory,
-                  child_quota_default(QuotaKind.IoMemory))
-        set_limit(p, QuotaKind.Handle, child_quota_default(QuotaKind.Handle))
-        set_limit(p, QuotaKind.Pipe, child_quota_default(QuotaKind.Pipe))
+        quota_set_limit(p, QuotaKind.Thread,
+                        child_quota_default(QuotaKind.Thread))
+        quota_set_limit(p, QuotaKind.Event,
+                        child_quota_default(QuotaKind.Event))
+        quota_set_limit(p, QuotaKind.Waiter,
+                        child_quota_default(QuotaKind.Waiter))
+        quota_set_limit(p, QuotaKind.Timer,
+                        child_quota_default(QuotaKind.Timer))
+        quota_set_limit(p, QuotaKind.Memory,
+                        child_quota_default(QuotaKind.Memory))
+        quota_set_limit(p, QuotaKind.IoMemory,
+                        child_quota_default(QuotaKind.IoMemory))
+        quota_set_limit(p, QuotaKind.Handle,
+                        child_quota_default(QuotaKind.Handle))
+        quota_set_limit(p, QuotaKind.Pipe,
+                        child_quota_default(QuotaKind.Pipe))
     }
 
     // A record that somehow holds more rows than the profile grants would make
@@ -856,7 +883,7 @@ public(package) func install_quota_limits(p: Int, root: Bool, free_rows: Int) un
         child_quota_default(QuotaKind.Mapping) as Int
     }
     let mappings = if want < rows { want } else { rows }
-    set_limit(p, QuotaKind.Mapping, mappings as UInt16)
+    quota_set_limit(p, QuotaKind.Mapping, mappings as UInt16)
 }
 
 /// Which refusal a `mint_handle` that answered `NO_HANDLE` was.

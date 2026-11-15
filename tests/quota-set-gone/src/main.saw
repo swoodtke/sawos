@@ -1,0 +1,55 @@
+// `QuotaSet` through a `Gone` child's handle is a `BadState` fault, as `Start`
+// and `Give` are, and not `Revoked` (spec §2.7, §2.10): a `Gone` child was
+// always started, and the launcher that started it knows.
+//
+// Root starts a child that faults at its first syscall, waits for its death,
+// and then sets one of its rows with a limit that would fit.
+//
+//   SOS: process fault: bad handle            <- the child
+//   SOS quotagone: child ended status=131073
+//   SOS quotagone: setting a row of a gone child
+//   SOS: process fault: object in the wrong state
+
+import sos.{System, AttachMode, QuotaKind, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+/// The key root watches the child's death under.
+static KEY: UInt = 71
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS quotagone: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// Run the child to its death, then set one of its rows. The set does not
+/// return.
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    let child = try system.process_create(image: &image, memory: &ram)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY, mode: AttachMode.OneShot)
+    try child.start()
+    let _ = try waiter.wait()
+    let status = try child.get_status()
+    print("SOS quotagone: child ended status={}\n", status)
+
+    print("SOS quotagone: setting a row of a gone child\n")
+    let _ = child.quota_set(kind: QuotaKind.Event, limit: 1)
+    print("SOS quotagone: UNREACHABLE the row was set\n")
+    return
+}

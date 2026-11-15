@@ -1,0 +1,58 @@
+// A quota row is named by a `QuotaKind` (spec §2.7). One past the last kind is
+// a number no kind has, and the caller chose it, so the kernel ends the caller
+// with `BadArg`, whatever the named process's state: the kind is decided
+// before the state.
+//
+// The handle used is root's own, a running process, which `QuotaSet` refuses
+// with `BadState` for any kind there is. That it answers `BadArg` here instead
+// is the order.
+//
+//   SOS quotabadkind: the last kind reads limit=65535
+//   SOS quotabadkind: setting a kind past the last on a running process
+//   SOS: process fault: argument outside its domain
+//
+// It is asked through the C floor, which is where a kind is a bare number: the
+// typed methods take a `QuotaKind`, so a bad number cannot be written there.
+
+import sos.{System, QuotaKind, ALL_RIGHTS, sos_system_process_self,
+            sos_process_quota_get, sos_process_quota_set}
+
+static EXIT_FAILED: UInt = 1
+
+/// The first number that is not a `QuotaKind`.
+static PAST_LAST: UInt = (QuotaKind.Pipe as UInt) + 1
+
+static STATUS_OK: UInt = 0
+
+/// The bits of the read that are the limit.
+static LIMIT_MASK: UInt = 0xFFFF
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    probe(&system, boot_handle)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// Read the last kind, then set a kind past it. The second call does not
+/// return.
+func probe(system: &System, boot_handle: UInt) unsafe {
+    var word: UInt = 0
+    let made = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                       (&var word) as UnsafePointer<UInt>)
+    if made != STATUS_OK {
+        let _ = system.debug_print("SOS quotabadkind: no process handle\n")
+        return
+    }
+    var row: UInt = 0
+    let read = sos_process_quota_get(word, QuotaKind.Pipe as UInt,
+                                     (&var row) as UnsafePointer<UInt>)
+    if read != STATUS_OK {
+        let _ = system.debug_print("SOS quotabadkind: the last kind refused\n")
+        return
+    }
+    print("SOS quotabadkind: the last kind reads limit={}\n", row & LIMIT_MASK)
+    let _ = system.debug_print("SOS quotabadkind: setting a kind past the last on a running process\n")
+    let _ = sos_process_quota_set(word, PAST_LAST, 1)
+    let _ = system.debug_print("SOS quotabadkind: UNREACHABLE the kind was accepted\n")
+}
