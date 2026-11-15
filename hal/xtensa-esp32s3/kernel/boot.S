@@ -1,9 +1,12 @@
-/* SOS boot, vectors and trap entry: Xtensa LX7, ESP32-S3 board, call0.
+/* SOS boot, vectors and trap entry: Xtensa LX7, ESP32-S3 board.
  *
- * Every image on this board is call0: one register window, rotated by nothing
- * after the reset path below gives up the window the ROM arrived in. `ktrap`
- * and every other compiled function are ordinary call0 functions (arguments
- * in a2..a7, result in a2, return address in a0, stack in a1).
+ * The kernel is call0: it runs on one register window with PS.WOE = 0, and
+ * rotates the window only on the trap path below. `ktrap` and every other
+ * compiled kernel function are ordinary call0 functions (arguments in
+ * a2..a7, result in a2, return address in a0, stack in a1). A process may be
+ * call0 or windowed (../ABI.md §7d): the window exceptions a windowed thread
+ * raises are handled at their vectors, in the thread's own context, without
+ * entering the kernel.
  *
  * What this file owns:
  *   1. The direct-boot entry. The mask ROM checks two magic words at flash
@@ -13,16 +16,19 @@
  *      the watchdogs, copy the vectors and the trap path into IRAM, copy
  *      `.data`, zero `.bss`, point `VECBASE` at the table and call the Saw
  *      `kmain`.
- *   3. The vector table (../ABI.md §5a). `syscall`, level-1 interrupts and
- *      faults taken in user mode arrive at the user vector, which is the trap
- *      entry. Every other vector stops the machine through `kernel_fault`
- *      (`sink.c`). Most of them mean a kernel bug or a window exception call0
- *      never raises, but not all: a `break` executed in user mode reaches the
- *      debug vector (0x280) and stops the machine too. Compiled code traps
- *      with `ill`, never `break`, so only hand-written assembly gets there,
- *      and the Flat tier has no privilege to deny it; nor to deny `rsil`,
- *      with which a process raises its own INTLEVEL and turns the tick off
- *      for as long as it runs.
+ *   3. The vector table (../ABI.md §5a). The six window vectors spill and
+ *      fill a windowed thread's frames on its own stack. `syscall`, level-1
+ *      interrupts and faults taken in user mode arrive at the user vector,
+ *      which is the trap entry, apart from the Alloca exception, which it
+ *      handles in place. A double exception inside a window handler that a
+ *      user thread raised is that thread's fault and enters the kernel as
+ *      one. Every other vector stops the machine through `kernel_fault`
+ *      (`sink.c`). Most of them mean a kernel bug, but not all: a `break`
+ *      executed in user mode reaches the debug vector (0x280) and stops the
+ *      machine too. Compiled code traps with `ill`, never `break`, so only
+ *      hand-written assembly gets there, and the Flat tier has no privilege
+ *      to deny it; nor to deny `rsil`, with which a process raises its own
+ *      INTLEVEL and turns the tick off for as long as it runs.
  *   4. The trap entry and the restore path. The restore path is the whole
  *      context switch and the first entry to user mode: `ktrap` returns the
  *      frame to resume and `sos_resume_frame` enters a frame `frame_init`
@@ -33,10 +39,16 @@
  * `EXCSAVE1` holds the running thread's frame address while user mode runs.
  * The user vector swaps it with a1, so the frame is the save area at once and
  * the user's a1 waits in `EXCSAVE1` until it is stored. The kernel runs with
- * PS.UM = 0, PS.EXCM = 0 and PS.INTLEVEL = 15: no interrupt is delivered to
- * it, and a fault it takes arrives at the kernel vector (or at the double
- * vector before PS is rewritten), never at the user one, so the vector itself
- * is the mode witness.
+ * PS.UM = 0, PS.EXCM = 0, PS.WOE = 0 and PS.INTLEVEL = 15: no interrupt is
+ * delivered to it, no window exception is raised in it, and a fault it takes
+ * arrives at the kernel vector (or at the double vector before PS is
+ * rewritten), never at the user one, so the vector itself is the mode
+ * witness.
+ *
+ * The window rules the handlers rely on (../ABI.md §7d): physical register
+ * `aN` is AR[(4 * WINDOWBASE + N) mod 64]; WINDOWSTART has a bit per pane of
+ * four registers, set where a live frame begins; with PS.EXCM = 1 no window
+ * exception is raised, whatever WINDOWBASE and WINDOWSTART hold.
  *
  * The frame layout (`F_*` below) is described once here and once in Saw, as
  * `lib.saw`'s `TrapFrame`, whose `static_assert` pins the size.
@@ -72,9 +84,53 @@
     .equ F_EXCVADDR,    92
     .equ F_SCOMPARE1,   96
     .equ F_THREADPTR,   100
+    .equ F_WINDOWBASE,  104
+    .equ F_WINDOWSTART, 108
+    /* The other 48 physical registers: word k is AR[(4 * WINDOWBASE + 16 + k)
+     * mod 64], panes WINDOWBASE + 4 to + 15 in order. */
+    .equ F_AR,          112
 
     /* The kernel's PS: INTLEVEL = 15, EXCM = 0, UM = 0, WOE = 0. */
     .equ PS_KERNEL,     0x0F
+
+    .equ EXCCAUSE_ALLOCA, 5
+    .equ PS_UM_BIT,     5
+    .equ PS_OWB_SHIFT,  8
+    .equ PS_OWB_BITS,   4
+
+    /* One past the last window handler's slot, from VECBASE. */
+    .equ WINDOW_VECTORS_END, 0x180
+
+    /* a4..a15 of the current window to or from 12 words of the frame's
+     * register area, starting `off` bytes in. */
+    .macro  SAVE12 off
+    s32i    a4, a1, F_AR + \off + 0
+    s32i    a5, a1, F_AR + \off + 4
+    s32i    a6, a1, F_AR + \off + 8
+    s32i    a7, a1, F_AR + \off + 12
+    s32i    a8, a1, F_AR + \off + 16
+    s32i    a9, a1, F_AR + \off + 20
+    s32i    a10, a1, F_AR + \off + 24
+    s32i    a11, a1, F_AR + \off + 28
+    s32i    a12, a1, F_AR + \off + 32
+    s32i    a13, a1, F_AR + \off + 36
+    s32i    a14, a1, F_AR + \off + 40
+    s32i    a15, a1, F_AR + \off + 44
+    .endm
+    .macro  LOAD12 off
+    l32i    a4, a1, F_AR + \off + 0
+    l32i    a5, a1, F_AR + \off + 4
+    l32i    a6, a1, F_AR + \off + 8
+    l32i    a7, a1, F_AR + \off + 12
+    l32i    a8, a1, F_AR + \off + 16
+    l32i    a9, a1, F_AR + \off + 20
+    l32i    a10, a1, F_AR + \off + 24
+    l32i    a11, a1, F_AR + \off + 28
+    l32i    a12, a1, F_AR + \off + 32
+    l32i    a13, a1, F_AR + \off + 36
+    l32i    a14, a1, F_AR + \off + 40
+    l32i    a15, a1, F_AR + \off + 44
+    .endm
 
     /* The watchdog registers and their write-protect keys. ../ABI.md §2e
      * gives the source of each number. */
@@ -125,17 +181,20 @@ _entry:
     .align  4
     .global _start
 _start:
-    /* The ROM arrives windowed (`callx8`, PS.WOE = 1). Leave exactly one live
-     * window and turn window exceptions off. Writing WINDOWBASE renames every
-     * address register, so nothing is kept in one across it; nothing needs to
-     * be, since this path never returns to the ROM. */
-    movi    a9, 1
-    wsr     a9, windowstart
-    movi    a9, 0
-    wsr     a9, windowbase
+    /* The ROM arrives windowed (`callx8`, PS.WOE = 1). Turn window
+     * exceptions off, then leave exactly one live window. Until PS is
+     * written, an instruction naming a4 or above would raise an overflow if
+     * the ROM's WINDOWSTART had a bit in the panes above its window, so this
+     * names a2 alone, which no window check reads. Writing WINDOWBASE renames
+     * every address register, so nothing is kept in one across it; nothing
+     * needs to be, since this path never returns to the ROM. */
+    movi    a2, PS_KERNEL
+    wsr     a2, ps
     rsync
-    movi    a9, PS_KERNEL
-    wsr     a9, ps
+    movi    a2, 1
+    wsr     a2, windowstart
+    movi    a2, 0
+    wsr     a2, windowbase
     rsync
 
     /* The FPU off, whatever the ROM left: no image on this profile is built
@@ -244,29 +303,95 @@ _start:
     .literal .Lkstack, _stack_top
     .literal .Lktrap, ktrap
     .literal .Lfault, kernel_fault
+    .literal .Lvecbase_lit, _vector_base
 
     /* VECBASE is the table's first byte. The ISA wants it 1 KiB aligned. */
     .align  1024
     .global _vector_base
 _vector_base:
+
+    /* The window handlers. Each runs with PS.EXCM = 1, WINDOWBASE rotated to
+     * the frame k being spilled or filled, and PS.OWB the window to return
+     * to; `rfwo` and `rfwu` return there and re-execute the instruction that
+     * raised the exception. In frame k's numbering, n its call size in panes,
+     * a(4n + 1) is its callee's stack pointer, and k's a0..a3 live in the 16
+     * bytes below that (the base save area). A call8 or call12 frame's a4..
+     * live in the 16 or 32 bytes below its caller's stack pointer less 16,
+     * and that pointer is the word at k's own stack pointer less 12: the
+     * caller is always spilled before k, so its base save area holds it.
+     * They store and load through the thread's own registers only, so a bad
+     * stack is a fault inside a handler, which the double vector below
+     * reports as the thread's. */
     .org    0x000
-    movi    a2, 0x000               /* WindowOverflow4 */
-    j       vec_fatal
+_WindowOverflow4:
+    s32e    a0, a5, -16
+    s32e    a1, a5, -12
+    s32e    a2, a5, -8
+    s32e    a3, a5, -4
+    rfwo
     .org    0x040
-    movi    a2, 0x040               /* WindowUnderflow4 */
-    j       vec_fatal
+_WindowUnderflow4:
+    l32e    a0, a5, -16
+    l32e    a1, a5, -12
+    l32e    a2, a5, -8
+    l32e    a3, a5, -4
+    rfwu
     .org    0x080
-    movi    a2, 0x080               /* WindowOverflow8 */
-    j       vec_fatal
+_WindowOverflow8:
+    s32e    a0, a9, -16
+    l32e    a0, a1, -12             /* a0 = the caller's stack pointer */
+    s32e    a1, a9, -12
+    s32e    a2, a9, -8
+    s32e    a3, a9, -4
+    s32e    a4, a0, -32
+    s32e    a5, a0, -28
+    s32e    a6, a0, -24
+    s32e    a7, a0, -20
+    rfwo
     .org    0x0C0
-    movi    a2, 0x0C0               /* WindowUnderflow8 */
-    j       vec_fatal
+_WindowUnderflow8:
+    l32e    a1, a9, -12             /* k's stack pointer first: the caller's */
+    l32e    a0, a9, -16             /* is found through it */
+    l32e    a7, a1, -12
+    l32e    a2, a9, -8
+    l32e    a3, a9, -4
+    l32e    a4, a7, -32
+    l32e    a5, a7, -28
+    l32e    a6, a7, -24
+    l32e    a7, a7, -20             /* the carrier last */
+    rfwu
     .org    0x100
-    movi    a2, 0x100               /* WindowOverflow12 */
-    j       vec_fatal
+_WindowOverflow12:
+    s32e    a0, a13, -16
+    l32e    a0, a1, -12
+    s32e    a1, a13, -12
+    s32e    a2, a13, -8
+    s32e    a3, a13, -4
+    s32e    a4, a0, -48
+    s32e    a5, a0, -44
+    s32e    a6, a0, -40
+    s32e    a7, a0, -36
+    s32e    a8, a0, -32
+    s32e    a9, a0, -28
+    s32e    a10, a0, -24
+    s32e    a11, a0, -20
+    rfwo
     .org    0x140
-    movi    a2, 0x140               /* WindowUnderflow12 */
-    j       vec_fatal
+_WindowUnderflow12:
+    l32e    a1, a13, -12
+    l32e    a0, a13, -16
+    l32e    a11, a1, -12
+    l32e    a2, a13, -8
+    l32e    a3, a13, -4
+    l32e    a4, a11, -48
+    l32e    a5, a11, -44
+    l32e    a6, a11, -40
+    l32e    a7, a11, -36
+    l32e    a8, a11, -32
+    l32e    a9, a11, -28
+    l32e    a10, a11, -24
+    l32e    a11, a11, -20
+    rfwu
     .org    0x180
     movi    a2, 0x180               /* Level 2 */
     j       vec_fatal
@@ -289,11 +414,16 @@ _vector_base:
     movi    a2, 0x300               /* Kernel: a trap taken with PS.UM = 0 */
     j       vec_fatal
     .org    0x340
+_UserExceptionVector:
     xsr     a1, excsave1            /* User: a1 = frame, EXCSAVE1 = user a1 */
-    j       trap_entry
+    s32i    a0, a1, F_A0
+    rsr     a0, exccause
+    bnei    a0, EXCCAUSE_ALLOCA, 1f
+    j       user_alloca
+1:  j       trap_entry
     .org    0x3C0
-    movi    a2, 0x3C0               /* Double: a trap taken with PS.EXCM = 1 */
-    j       vec_fatal
+    rsr     a0, depc                /* Double: a trap taken with PS.EXCM = 1 */
+    j       double_entry
     .org    0x400
 
 /* A trap the kernel took: report it and stop. There is no context worth
@@ -310,10 +440,74 @@ vec_fatal:
     callx0  a0
 1:  j       1b
 
+/* The double exception, DEPC in a0. Neither path resumes the context the
+ * exception interrupted, so a0 and a2 are free, and none of its registers is
+ * parked in a special register a later thread could read. A fault a window
+ * handler took for a user thread (DEPC in the six window vectors, PS.UM = 1)
+ * is that thread's own bad access to its stack: it goes through the user
+ * vector as an ordinary user trap, with EXCCAUSE and EXCVADDR the access's
+ * and EPC1 still the user instruction whose window exception it was, since a
+ * double exception leaves EPC1 alone, and the kernel ends the thread's
+ * process. EXCSAVE1 is a frame only while user context runs, which
+ * PS.UM = 1 vouches for. Every other double exception is the kernel's and
+ * stops the machine. */
+double_entry:
+    l32r    a2, .Lvecbase_lit
+    sub     a0, a0, a2
+    movi    a2, WINDOW_VECTORS_END
+    bgeu    a0, a2, 1f
+    rsr     a0, ps
+    bbci    a0, PS_UM_BIT, 1f
+    j       _UserExceptionVector
+1:  movi    a2, 0x3C0
+    j       vec_fatal
+
+/* The Alloca exception from user mode: `movsp` found every pane of its
+ * caller's frame spilled. a1 is the frame and the user's a0 is in it. The
+ * frame's WINDOWBASE word, which the next trap rewrites, carries the
+ * faulting window's WINDOWBASE across the rotation, and a0 the frame's
+ * address; the user's a1 goes back where it was. */
+user_alloca:
+    rsr     a0, windowbase
+    s32i    a0, a1, F_WINDOWBASE
+    mov     a0, a1
+    xsr     a1, excsave1            /* a1 = user a1, EXCSAVE1 = frame */
+    rotw    -1
+    l32i    a3, a4, F_WINDOWBASE
+    l32i    a4, a4, F_A0            /* the faulting window's a0 back */
+    /* Fall through. */
+
+/* Fill the caller's frame as a window underflow would, then retry the
+ * `movsp`, which finds its caller live. Entered rotated one pane back from
+ * the faulting window, with that window's registers intact as a4.. and its
+ * WINDOWBASE in a3: the pane rotated to is the caller's, which is spilled,
+ * so a0..a3 are dead and free. PS.OWB is set to the faulting window, the
+ * window rotated to the caller's base by its call size, read from the top
+ * bits of the faulting window's a0 (now a4), and the underflow handler for
+ * that size returns through `rfwu` to the `movsp`. A size of 0 is read as
+ * call4. */
+alloca_fill:
+    rsr     a2, ps
+    extui   a1, a2, PS_OWB_SHIFT, PS_OWB_BITS
+    slli    a1, a1, PS_OWB_SHIFT
+    xor     a2, a2, a1              /* PS.OWB cleared */
+    slli    a3, a3, PS_OWB_SHIFT
+    or      a2, a2, a3
+    wsr     a2, ps
+    rsync
+    bbsi    a4, 31, 1f
+    j       _WindowUnderflow4
+1:  rotw    -1                      /* the faulting window's a0 is a8 now */
+    bbsi    a8, 30, 2f
+    j       _WindowUnderflow8
+2:  rotw    -1
+    j       _WindowUnderflow12
+
 /* A syscall, a level-1 interrupt or a fault, from user mode. a1 is the
- * running thread's frame. */
+ * running thread's frame and the user's a0 is in it, except from the double
+ * path, whose thread is never resumed. PS.EXCM is 1 for the whole save, so no
+ * window exception is raised whatever window state the thread left. */
 trap_entry:
-    s32i    a0, a1, F_A0
     s32i    a2, a1, F_A2
     s32i    a3, a1, F_A3
     s32i    a4, a1, F_A4
@@ -350,6 +544,10 @@ trap_entry:
     s32i    a2, a1, F_SCOMPARE1
     rur     a2, threadptr
     s32i    a2, a1, F_THREADPTR
+    rsr     a2, windowbase
+    s32i    a2, a1, F_WINDOWBASE
+    rsr     a2, windowstart
+    s32i    a2, a1, F_WINDOWSTART
 
     /* The zero-overhead loop is address-triggered: with LCOUNT non-zero,
      * kernel code reaching the user's LEND address (shared code in a flat
@@ -357,9 +555,28 @@ trap_entry:
     movi    a2, 0
     wsr     a2, lcount
 
-    /* Become the kernel. The context is saved, so EXCM can drop: a fault from
-     * here on arrives at the kernel vector with its own EPC1, and INTLEVEL 15
-     * keeps every interrupt pending until user mode runs again. */
+    /* The other 48 physical registers, panes WINDOWBASE + 4 to + 15, three
+     * panes at a time. `rotw 3` makes a12..a15 the new a0..a3, so the frame's
+     * address, copied into a13 (already saved), is a1 again after it. */
+    mov     a13, a1
+    rotw    3
+    SAVE12  0
+    mov     a13, a1
+    rotw    3
+    SAVE12  48
+    mov     a13, a1
+    rotw    3
+    SAVE12  96
+    mov     a13, a1
+    rotw    3
+    SAVE12  144
+
+    /* Become the kernel, on this window (WINDOWBASE + 12) with the thread's
+     * WINDOWSTART left in place: with PS.WOE = 0 neither is read. The context
+     * is saved, so EXCM can drop: a fault from here on arrives at the kernel
+     * vector with its own EPC1, PS.WOE = 0 keeps every window exception off,
+     * and INTLEVEL 15 keeps every interrupt pending until user mode runs
+     * again. */
     movi    a2, PS_KERNEL
     wsr     a2, ps
     rsync
@@ -378,10 +595,12 @@ trap_entry:
  *
  * Restore the context in `frame` and `rfe` into it. The frame's PS carries
  * EXCM = 1 (a saved PS always does, and `frame_init` builds one that does),
- * so writing it keeps interrupts masked until `rfe`, which clears EXCM and
- * resumes at the frame's PC with its UM and INTLEVEL. Re-arming EXCSAVE1 with
- * the frame makes the next trap save into the thread that is actually
- * running. */
+ * so writing it keeps interrupts masked and window exceptions off until
+ * `rfe`, which clears EXCM and resumes at the frame's PC with its UM,
+ * INTLEVEL and window fields. Every one of the 64 physical registers is
+ * loaded from the frame, so nothing of the kernel's or another thread's
+ * stays readable. Re-arming EXCSAVE1 with the frame makes the next trap save
+ * into the thread that is actually running. */
     .global sos_resume_frame
 sos_resume_frame:
     mov     a1, a2
@@ -407,6 +626,34 @@ sos_resume_frame:
     l32i    a2, a1, F_LCOUNT
     wsr     a2, lcount
     isync
+    l32i    a2, a1, F_WINDOWSTART
+    wsr     a2, windowstart
+    /* To the frame's WINDOWBASE + 12, the window whose a4..a15 are its top
+     * three panes; WINDOWBASE is four bits wide, so the write keeps the sum
+     * mod 16. Writing WINDOWBASE renames every register, so the frame's
+     * address rides across it in EXCSAVE1, where it stays. */
+    wsr     a1, excsave1
+    l32i    a2, a1, F_WINDOWBASE
+    addi    a2, a2, 12
+    wsr     a2, windowbase
+    rsync
+    rsr     a1, excsave1
+    /* Top down, three panes at a time: after each `rotw -3` the frame's
+     * address is a13 of the group about to be loaded, so it moves to a1 first,
+     * a register of the next group down or of the frame's own window. */
+    LOAD12  144
+    rotw    -3
+    mov     a1, a13
+    LOAD12  96
+    rotw    -3
+    mov     a1, a13
+    LOAD12  48
+    rotw    -3
+    mov     a1, a13
+    LOAD12  0
+    rotw    -3
+    mov     a1, a13
+    /* The frame's own window. */
     l32i    a0, a1, F_A0
     l32i    a2, a1, F_A2
     l32i    a3, a1, F_A3
@@ -422,7 +669,6 @@ sos_resume_frame:
     l32i    a13, a1, F_A13
     l32i    a14, a1, F_A14
     l32i    a15, a1, F_A15
-    wsr     a1, excsave1
     l32i    a1, a1, F_A1            /* user a1 last: it retires the frame */
     rfe
 

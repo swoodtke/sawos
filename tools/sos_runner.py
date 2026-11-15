@@ -12387,6 +12387,22 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "expect_status": 0x80 | (0x300 >> 6),
         },
         {
+            # A process that points EXCSAVE1 at nothing before it traps: the
+            # user vector's first store faults with PS.EXCM = 1, a double
+            # exception with PS.UM = 1 outside the window handlers, which is
+            # the kernel's and stops the machine at the double vector rather
+            # than entering the trap entry again (ABI.md §5e, §7d).
+            "name": "excsave_fault",
+            "src": os.path.join(TESTS_DIR, "umode.saw"),
+            "asm": "payload_excsave.S",
+            "expect_out": [rom, "SOS M1: entering U-mode",
+                           "SOS-S3: kernel fault vector=0x000003c0 "
+                           "exccause=0x0000001d",
+                           "excvaddr=0x10000008"],
+            "expect_clean_exit": False,
+            "expect_status": 0x80 | (0x3C0 >> 6),
+        },
+        {
             # "SOS-U" is written one character at a time through
             # `debug_print`, so seeing it at all proves the syscall round trip
             # resumed past each `syscall`; `shutdown(0)` is the last one.
@@ -12727,6 +12743,27 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "kill_churn", "kill_runnable", "image_limits"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
+
+    # The windowed children's cases: `death-notify`'s root, call0 Saw,
+    # launches the one child and wakes on its end, and every case asserts the
+    # same frame around the child's own lines.
+    def windowed_child(name, child, lines, status):
+        return {
+            "name": name,
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": DEATH_NOTIFY_PKG,
+            "children": [os.path.join(TESTS_DIR, child)],
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={two}",
+                           "SOS deathnotify: started",
+                           *lines,
+                           f"SOS deathnotify: woke key=44 status={status}\n",
+                           "SOS deathnotify: done"],
+            "expect_clean_exit": True,
+        }
+    # The status word (spec §8) of a process the kernel ended for a fault the
+    # hardware raised: `Faulted` (2) << 16, with no reason code.
+    windowed_fault_status = 2 << 16
     # This board's own process cases, for what only it has: a table of CPU
     # interrupts that lines are given and give back, and the trap frame of
     # its own entry path.
@@ -12763,6 +12800,102 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "SOS framehold: joined a=0 b=0"],
             "expect_clean_exit": True,
         },
+        {
+            # A windowed C root (ABI.md §7d): the start state its `_start`
+            # reads; overflow and underflow at each call size, 40 frames
+            # deep; a system call from 30 frames deep; `movsp` with its call8
+            # caller spilled; and two threads preempted deep in call4, call8
+            # and call12 chains, then between a call and its callee's
+            # `entry`. Every crossing waits on the other thread's progress,
+            # so only a tick moves the processor.
+            "name": "windowed_process",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "tick": True,
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-windowed"),
+            "expect_out": ["{banner}",
+                           "SOS win: start ps=0x00050020 wb=0x00000001 "
+                           "ws=0x00000003",
+                           "SOS win: chain4 ok",
+                           "SOS win: chain8 ok",
+                           "SOS win: chain12 ok",
+                           "SOS win: syscall from depth",
+                           "SOS win: syscall chain ok",
+                           "SOS win: alloca ok",
+                           "SOS win: threads joined a=0x00000000 "
+                           "b=0x00000000",
+                           "SOS win: done"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The Alloca exception under each call size: in a thread's first
+            # frame, whose caller is the start state's, and under a call4, a
+            # call8 and a call12 caller holding every register it owns.
+            "name": "windowed_alloca",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-windowed-alloca"),
+            "expect_out": ["{banner}",
+                           "SOS alloca: first frame p0=0x51ce0001 "
+                           "p11=0x51ce000b",
+                           "SOS alloca: under call4 0x00000400",
+                           "SOS alloca: under call8 0x00000800",
+                           "SOS alloca: under call12 0x00001200",
+                           "SOS alloca: done"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A thread's first instructions find every physical register
+            # zero but its stack pointer, its argument in a2 and a6, and a
+            # windowed entry's return address in a4, although the thread
+            # that ran just before filled all 64 with a pattern.
+            "name": "register_file_clean",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-windowed-regs"),
+            "expect_out": ["{banner}",
+                           "SOS regs: a thread fills all 64 registers, then "
+                           "starts the probe",
+                           "SOS regs: ar[1]=stack top\n",
+                           "SOS regs: ar[2]=0x5eed0001\n",
+                           "SOS regs: ar[4]=0x7ffffffc\n",
+                           "SOS regs: ar[6]=0x5eed0001\n",
+                           "SOS regs: 4 nonzero, 0 unexpected"],
+            "expect_clean_exit": True,
+        },
+        # A windowed C child beside a call0 Saw root, which wakes on the
+        # child's end and runs to its own.
+        windowed_child(
+            # The child exits from deep in a chain.
+            "windowed_child_exit", "xtensa-windowed-child",
+            ["SOS winchild: exiting from depth 30",
+             "SOS: process exit: code={five} process={one}"],
+            # `Exited` (1) << 16 | 5.
+            65541),
+        windowed_child(
+            # The child's entry returns: `retw` to the return address the
+            # start state gave it, which faults on the fetch, after an
+            # underflow has filled the pane it started in.
+            "windowed_entry_returns", "xtensa-windowed-returns",
+            ["SOS winchild: returning from the entry",
+             "SOS: fault instruction-address-error cause=0x0000000e "
+             "epc=0x7ffffffc tval=0x7ffffffc"],
+            windowed_fault_status),
+        # A spill to an address that takes no store, through each overflow
+        # handler: the process's own fault, with the store's reason and the
+        # base save area's first word as the address.
+        *[windowed_child(
+            f"windowed_spill_fault{n}", f"xtensa-windowed-spill{n}",
+            [f"SOS winchild: spilling below 0x10000010 through call{n}",
+             "SOS: fault store-access-fault cause=0x0000001d epc=",
+             " tval=0x10000000\n"],
+            windowed_fault_status) for n in (4, 8, 12)],
+        # The same for a fill, through each underflow handler, with the
+        # load's reason; the first word a handler loads is a0's for call4
+        # and a1's for call8 and call12.
+        *[windowed_child(
+            f"windowed_fill_fault{n}", f"xtensa-windowed-fill{n}",
+            [f"SOS winchild: filling from below 0x10000010 through call{n}",
+             "SOS: fault load-access-fault cause=0x0000001c epc=",
+             f" tval={0x10000000 if n == 4 else 0x10000004:#010x}\n"],
+            windowed_fault_status) for n in (4, 8, 12)],
         {
             # A region over flash is neither a destination nor a donation
             # (spec §5.6, §2.8). The blob's row is a pool. The image allocated

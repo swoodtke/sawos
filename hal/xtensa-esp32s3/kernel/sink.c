@@ -15,8 +15,8 @@
 // from Saw in `lib.saw`; this file only places words in special registers and
 // decides nothing. `boot.S` is the reset path, the vectors and the trap entry.
 //
-// Built call0 with no FPU (`-windowed`, `-fp`), as every image on this board
-// is, so nothing here may reach a libgcc or ROM helper: those are windowed.
+// Built call0 with no FPU (`-windowed`, `-fp`), as the whole kernel is, so
+// nothing here may reach a libgcc or ROM helper: those are windowed.
 
 typedef unsigned int u32;
 

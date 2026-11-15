@@ -3561,11 +3561,15 @@ profile of §5b.1 — three gate runs — and any run failing is red.
   from a kernel bug in one branch. A U-mode trap saves 31 GPRs + `mepc` into a
   32-word frame (word `i` holds `x<i>`; word 0 holds `mepc`). A kernel-mode trap
   is `kernel_fault`, which reports and fails the run rather than hanging.
-- **The ESP32-S3's trap entry** (Xtensa, call0, every image) is the user
-  vector: `syscall` and level-1 interrupts taken with PS.UM = 1 arrive there,
-  and `EXCSAVE1` holds the running thread's frame address. A 26-word frame
-  saves PC, PS, `a0`-`a15`, `SAR`, the loop registers, `SCOMPARE1` and
-  `THREADPTR`. The kernel runs with PS.UM = 0 and INTLEVEL 15, so a trap it
+- **The ESP32-S3's trap entry** (Xtensa, a call0 kernel, call0 or windowed
+  images) is the user vector: `syscall` and level-1 interrupts taken with
+  PS.UM = 1 arrive there, and `EXCSAVE1` holds the running thread's frame
+  address. A 76-word frame saves PC, PS, the whole 64-register file (the
+  current window and the other 48 by their position from `WINDOWBASE`),
+  `WINDOWBASE`, `WINDOWSTART`, `SAR`, the loop registers, `SCOMPARE1` and
+  `THREADPTR`; a windowed thread's window spill and fill handlers run in its
+  own context without entering the kernel. The kernel runs with PS.UM = 0 and
+  INTLEVEL 15, so a trap it
   takes arrives at another vector, which is `kernel_fault`, and no interrupt
   is ever delivered to it. Semihosting `SYS_exit` stops the machine.
 - **Profile B's FP/SIMD contract:** the kernel executes no FP/SIMD instruction

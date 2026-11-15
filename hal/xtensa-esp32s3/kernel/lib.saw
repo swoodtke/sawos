@@ -1,5 +1,6 @@
 //! The Xtensa kernel HAL, Saw half: the ESP32-S3 board under Espressif QEMU,
-//! call0, on the `Flat` protection tier.
+//! a call0 kernel running call0 and windowed processes, on the `Flat`
+//! protection tier.
 //!
 //! One directory holds the architecture and the board together, as
 //! `hal/arm64/` does: there is one Xtensa board. The kernel core above this
@@ -478,14 +479,18 @@ public func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
 // The trap frame
 // =============================================================================
 
-/// The context `boot.S` saves on a trap from user mode: 26 words. Declaration
+/// The context `boot.S` saves on a trap from user mode: 76 words. Declaration
 /// order is the layout, so these fields and `boot.S`'s `F_*` offsets are one
 /// description.
 ///
-/// Under call0 a switch must keep a0..a15, the PC, PS, SAR and SCOMPARE1
-/// (../ABI.md §7c). LBEG, LEND and LCOUNT are kept because user code built
-/// elsewhere may use the zero-overhead loop, and THREADPTR because it is
-/// per-thread by definition. EXCCAUSE and EXCVADDR are what the trap was.
+/// A switch keeps the whole register file, call0 thread or windowed
+/// (../ABI.md §7c): a0..a15 are the window that trapped, the other 48
+/// physical registers follow it in `ar` by their position from WINDOWBASE,
+/// and WINDOWBASE and WINDOWSTART are saved beside them; PS carries the
+/// window fields. SAR and SCOMPARE1 are kept as compiled code uses them, LBEG,
+/// LEND and LCOUNT because user code built elsewhere may use the zero-overhead
+/// loop, and THREADPTR because it is per-thread by definition. EXCCAUSE and
+/// EXCVADDR are what the trap was.
 struct TrapFrame {
     pc: UInt,               // EPC1: where the context resumes
     ps: UInt,               // PS, with EXCM set; `rfe` clears it
@@ -513,23 +518,39 @@ struct TrapFrame {
     excvaddr: UInt,
     scompare1: UInt,
     threadptr: UInt,
+    windowbase: UInt,
+    windowstart: UInt,
+    ar: [UInt; 48],         // panes WINDOWBASE + 4 to + 15
 }
 
 /// Bytes in one saved context. Public because the kernel reserves a slot per
 /// thread: the kernel owns the storage and the HAL owns the layout.
-public static FRAME_BYTES: Int = 104
+public static FRAME_BYTES: Int = 304
 
 /// Words in a frame, for `frame_init`'s zeroing loop.
-static FRAME_WORDS: UInt = 26
+static FRAME_WORDS: UInt = 76
 static WORD_BYTES: UInt = 4
 
 static_assert(sizeof<TrapFrame>() == FRAME_BYTES,
-              "the Xtensa trap frame is 26 words, as boot.S lays it out")
+              "the Xtensa trap frame is 76 words, as boot.S lays it out")
 
 /// PS for a context's first entry: UM = 1 so its traps arrive at the user
 /// vector, EXCM = 1 so `rfe` is what clears it, INTLEVEL = 0 so interrupts
-/// are taken, WOE = 0 because every image is call0.
-static PS_USER_ENTRY: UInt = 0x30
+/// are taken, WOE = 1 and CALLINC = 1 so an entry that opens with `entry`
+/// runs as a function `call4` reached. A call0 entry never reads either.
+static PS_USER_ENTRY: UInt = 0x0005_0030
+
+/// The pane a context starts in, WINDOWBASE 0, as its one live frame: the
+/// caller a windowed entry's `entry` rotates away from (../ABI.md §7d).
+static WINDOWSTART_ENTRY: UInt = 1
+
+/// The return address a windowed entry finds in its a0: the a4 of the pane it
+/// starts in, which its `entry` makes a0. Its top two bits say call4, so the
+/// entry's `retw` is an ordinary return, and the address it returns to,
+/// 0x7FFF_FFFC with the top bits of a flash or IRAM PC, is one nothing is
+/// mapped at: the fetch faults, the windowed form of a call0 entry's return
+/// to address zero.
+static WINDOWED_ENTRY_RETURN: UInt = 0x7FFF_FFFC
 
 /// Overlay the saved context.
 func frame_at(frame_addr: UInt) unsafe -> UnsafeMemory<TrapFrame, Normal> {
@@ -537,12 +558,17 @@ func frame_at(frame_addr: UInt) unsafe -> UnsafeMemory<TrapFrame, Normal> {
 }
 
 /// Build a fresh user context in `frame_addr`: `entry` as the resume address,
-/// `stack_top` as the stack pointer, `arg0` in the first argument register.
+/// `stack_top` as the stack pointer, `arg0` in the first argument register of
+/// either convention.
 ///
-/// Every other word is zeroed, so nothing of the kernel's or another thread's
-/// crosses into it. The return address is zero on purpose: a thread entry that
-/// returns jumps to address zero and takes an instruction fault, which spec §8
-/// turns into the death of its process.
+/// One start state serves a call0 entry and a windowed one (../ABI.md §7d):
+/// a call0 entry finds `arg0` in a2 and never rotates the window; a windowed
+/// entry's `entry` rotates by one pane, as if `call4` had reached it, and
+/// finds `arg0` in its a2 (a6 here) and `WINDOWED_ENTRY_RETURN` in its a0 (a4
+/// here). Every other word is zeroed, so nothing of the kernel's or another
+/// thread's crosses into it. A call0 entry's return address is zero on
+/// purpose: an entry that returns jumps to address zero and takes an
+/// instruction fault, which spec §8 turns into the death of its process.
 ///
 /// No preemption point: a fixed count of word stores, and a half-built
 /// context is an in-flight invariant the trap path can reach.
@@ -558,6 +584,9 @@ public func frame_init(frame_addr: UInt, entry: UInt, stack_top: UInt,
     frame.ps.write(PS_USER_ENTRY)
     frame.a1.write(stack_top)
     frame.a2.write(arg0)
+    frame.a4.write(WINDOWED_ENTRY_RETURN)
+    frame.a6.write(arg0)
+    frame.windowstart.write(WINDOWSTART_ENTRY)
 }
 
 /// Resume the context saved in `frame_addr`, in user mode. Never returns.
@@ -671,7 +700,8 @@ public func trap_pc(frame_addr: UInt) unsafe -> UInt {
 // first argument registers of the call0 ABI, a2 then a3..a5, and the op in
 // a8, the first register outside the argument run, which is the shape the
 // other profiles keep. The answer comes back as the status in a2 and the
-// value in a3.
+// value in a3. They are the registers of the window that executed `syscall`,
+// so a windowed stub uses the same ones of its own window.
 
 /// The handle the call is made through: a2.
 public func syscall_handle(frame_addr: UInt) unsafe -> UInt {

@@ -1,4 +1,4 @@
-// SOS Xtensa user-side HAL: the syscall instruction, ESP32-S3 board, call0.
+// SOS Xtensa user-side HAL: the syscall instruction, ESP32-S3 board.
 //
 // This is the entire architecture-dependent surface of an SOS process. A
 // `syscall` is not expressible in Saw, and neither is naming the registers the
@@ -16,8 +16,11 @@
 // other profiles keep. Every syscall is an object op, so there is no form of
 // this that does not take a handle.
 //
-// Built call0 with no FPU, as every image on this board is: libgcc and the
-// ROM's helpers are windowed, and nothing here may reach them.
+// Built with no FPU, call0 or windowed as the image that links it is (a
+// package's `target-features = "+windowed"`, ../ABI.md §7d). Either way the
+// register variables name the registers of the window that executes
+// `syscall`, which are the ones the kernel reads. A call0 image must not reach
+// libgcc or the ROM's helpers, which are windowed; nothing here does.
 
 typedef unsigned int u32;
 
