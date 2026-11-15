@@ -23,23 +23,19 @@
 // record table refuses a create, releases them, and fills it again: at this
 // scale the record table is too large to fill.
 //
-// Root parks on a generous timer while the child runs, so the ordering above
-// is forced rather than raced: this image's kernel arms no scheduler tick, so
-// the only way root gives the processor up is the wait, and the only way it
-// gets it back is the timer it armed.
+// Root waits on the child's death before it reads anything, so the ordering
+// above is forced rather than raced: this image's kernel arms no scheduler
+// tick, so the wait is how root gives the processor up, and the child's death
+// is what brings it back. A wait on a Timer would order nothing, since a
+// Timer whose expiry has passed answers the wait at once.
 
-import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
-            Waiter, SosStatus}
+import sos.{System, Process, Memory, BootHandle, Waiter, SosStatus}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// The key this case attaches its timer under.
+/// The key this case attaches the child's Process under.
 static KEY: UInt = 88
-
-/// Twenty milliseconds, three orders of magnitude more than the child needs to
-/// be scheduled, run its one syscall and die. See `process-lifecycle`.
-static PARK_NS: UInt64 = 20_000_000
 
 @export("_start")
 func _start(boot_handle: UInt) {
@@ -85,24 +81,18 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS reclaim: started\n")
 
-    // Park, so the child gets the processor and dies before anything below runs.
-    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
-        print("SOS reclaim: no clock: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
+    // Park until the child is dead, so it has lived and died before anything
+    // below runs.
     let waiter = try proc.waiter_create() catch {
         print("SOS reclaim: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let timer = try clock.timer_create() catch {
-        print("SOS reclaim: no timer: {}\n", error)
+    try waiter.add(process: &child, key: KEY) catch {
+        print("SOS reclaim: attach failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let _ = waiter.add(&timer, KEY)
-    let _ = timer.arm(after_ns: PARK_NS)
     try waiter.wait() catch {
         print("SOS reclaim: wait failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)

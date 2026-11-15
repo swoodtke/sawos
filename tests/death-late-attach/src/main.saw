@@ -18,8 +18,9 @@
 //   SOS: process teardown ... process=1
 //   SOS deathlate: done
 //
-// `first=` is the late attach. Root sleeps on a timer until the child is
-// already gone, and only then attaches its Process handle. An edge-triggered
+// `first=` is the late attach. Root waits on a scratch Waiter that watches the
+// child until it is already gone, drops that attachment, and only then
+// attaches its Process handle to the Waiter under test. An edge-triggered
 // design would have nothing left to report, and this line would print a wait
 // that never returned. It returns immediately, because readiness is
 // `state == Gone` and that is still true.
@@ -44,8 +45,8 @@
 //     record, so the kernel's own exit line names process 1 again; had the
 //     record been held it would name process 2.
 
-import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
-            Waiter, WaitResult, WaitPayload, AttachMode, SosStatus, SystemRight}
+import sos.{System, Process, Memory, BootHandle, Waiter, WaitResult, WaitPayload,
+            AttachMode, SosStatus, SystemRight}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -53,17 +54,13 @@ static EXIT_FAILED: UInt = 1
 static YES: UInt = 1
 static NO: UInt = 0
 
-/// The key the park timer is attached under, the key the dead child is, and the
-/// key the second child's death is watched under. Distinct numbers, because
-/// the attachments live on one Waiter, which is what §2.2's key uniqueness is
-/// for.
-static KEY_TIMER: UInt = 46
+/// The key the scratch Waiter watches the child under, the key the dead child
+/// is attached under late, and the key the second child's death is watched
+/// under. Distinct numbers, because the late attachments live on one Waiter,
+/// which is what §2.2's key uniqueness is for.
+static KEY_SCRATCH: UInt = 46
 static KEY_DEATH: UInt = 47
 static KEY_AGAIN: UInt = 48
-
-/// Twenty milliseconds: three orders of magnitude more than the child needs to
-/// print one line and exit. See `process-lifecycle`.
-static PARK_NS: UInt64 = 20_000_000
 
 /// Root's config: the tag the child's System handle travels under.
 static TAG_BOOT: UInt = 21
@@ -77,10 +74,8 @@ func flag(b: Bool) -> UInt {
     if b { YES } else { NO }
 }
 
-/// The §8 status word out of the record. The Timer arm panics like the other
-/// two even though this program does attach a timer: by the time this is
-/// called the timer has already fired and been consumed, so a Timer record
-/// here would mean the wait answered from the wrong attachment.
+/// The §8 status word out of the record. The other arms panic: this program
+/// attaches only Processes.
 func status_of(r: &WaitResult) -> UInt {
     match r.what {
         case Process(status) -> status,
@@ -145,32 +140,45 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS deathlate: started\n")
 
-    // The park is a timer, deliberately. This case must attach late, so root
-    // has to give the processor up by some means that is not the death itself.
-    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
-        print("SOS deathlate: no clock: {}\n", error)
+    // This case must attach late, so root first waits for the death on a
+    // scratch Waiter of its own, and takes that attachment away again: the
+    // Waiter under test has never seen the child, and the record's references
+    // are the handle's alone.
+    let scratch = try proc.waiter_create() catch {
+        print("SOS deathlate: no scratch waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
+    try scratch.add(process: &child, key: KEY_SCRATCH) catch {
+        print("SOS deathlate: scratch attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try scratch.wait() catch {
+        print("SOS deathlate: park failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try scratch.remove(KEY_SCRATCH) catch {
+        print("SOS deathlate: scratch remove failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = move scratch
+
     let waiter = try proc.waiter_create() catch {
         print("SOS deathlate: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let timer = try clock.timer_create() catch {
-        print("SOS deathlate: no timer: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    let _ = waiter.add(&timer, KEY_TIMER)
-    let _ = timer.arm(after_ns: PARK_NS)
-    try waiter.wait() catch {
-        print("SOS deathlate: park failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
 
-    // The late attach. The child has been dead for a while.
+    // The late attach. The child is already dead: its status word, polled
+    // before the attach, is the one the wait below reports.
+    let polled = try child.get_status() catch {
+        print("SOS deathlate: status failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
     try waiter.add(process: &child, key: KEY_DEATH) catch {
         print("SOS deathlate: attach failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
@@ -184,6 +192,11 @@ func _start(boot_handle: UInt) {
             let _ = system.shutdown(EXIT_FAILED)
             return
         },
+    }
+    if polled != first {
+        print("SOS deathlate: not dead at the attach, status={}\n", polled)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
     }
     let second = match waiter.wait() {
         case Ok(r) -> status_of(&r),

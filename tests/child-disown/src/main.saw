@@ -10,10 +10,11 @@
 // it derived: everything else is released when the posting frame ends or left
 // this table at the post.
 //
-// The probe is given a go outlet, a pool sibling and a device view. It spends
-// one of each kind (a connection, a region, a window) and parks. Its launcher
-// then frees and donates the charger's objects, which the charger's death
-// disowned, and posts go. The probe then spends each kind until refused:
+// The probe is given a go outlet, a ready inlet, a pool sibling and a device
+// view. It spends one of each kind (a connection, a region, a window), posts
+// on the ready inlet and parks. Its launcher, told by that post, then frees
+// and donates the charger's objects, which the charger's death disowned, and
+// posts go. The probe then spends each kind until refused:
 //
 //   SOS probe: pipes=2 regions=4 windows=2 quota=1
 //
@@ -31,6 +32,7 @@ import sos.{System, Process, Pool, IoMemory, PipeInlet, PipeOutlet,
 /// The launcher's tags.
 static TAG_CARRIER: UInt = 21
 static TAG_GO: UInt = 23
+static TAG_READY: UInt = 26
 static TAG_RAM: UInt = 24
 static TAG_WINDOW: UInt = 25
 
@@ -78,6 +80,7 @@ func _start(boot_handle: UInt) {
 
     var carrier: PipeInlet? = None
     var go: PipeOutlet? = None
+    var ready: PipeInlet? = None
     var ram: Pool? = None
     var window: IoMemory? = None
     var going = true
@@ -90,6 +93,8 @@ func _start(boot_handle: UInt) {
                     carrier = rec.take_inlet()
                 } else if tag == TAG_GO {
                     go = rec.take_outlet()
+                } else if tag == TAG_READY {
+                    ready = rec.take_inlet()
                 } else if tag == TAG_RAM {
                     ram = rec.take_pool()
                 } else if tag == TAG_WINDOW {
@@ -126,6 +131,11 @@ func _start(boot_handle: UInt) {
         let _ = proc.exit(EXIT_MISMATCH)
         return
     }
+    guard let report = ready.take() else {
+        let _ = system.debug_print("SOS disown: no ready inlet\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
 
     // The probe. The first of each kind is spent before the park, so a refund
     // landing on this ledger would have a row to lower.
@@ -145,12 +155,13 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    try park(&proc, &signal) catch {
+    try park(&proc, &report, &signal) catch {
         print("SOS probe: park failed: {}\n", error)
         let _ = proc.exit(EXIT_MISMATCH)
         return
     }
     let _ = move signal
+    let _ = move report
 
     let (more_pipes, pipes_quota) = spend_pipes(&proc)
     let (more_pieces, pieces_quota) = spend_pieces(&pool)
@@ -191,8 +202,13 @@ func charge(proc: &Process, out: PipeInlet, pool: Pool,
     return EXIT_SENT
 }
 
-/// Wait for the launcher's go message, and take it.
-func park(proc: &Process, signal: &PipeOutlet) -> Result<Void, SosStatus> {
+/// Tell the launcher the first of each kind is spent, then wait for its go
+/// message and take it.
+func park(proc: &Process, report: &PipeInlet,
+          signal: &PipeOutlet) -> Result<Void, SosStatus> {
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try report.post(body: &body, len: 1)
+    let _ = move claim
     let waiter = try proc.waiter_create()
     try waiter.add(outlet: &signal, key: KEY_GO)
     let _ = try waiter.wait()

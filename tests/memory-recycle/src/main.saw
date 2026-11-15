@@ -59,8 +59,8 @@
 // of a literal rather than a formatted line. Don't merge the legs: the shape
 // looks like taste and is not.
 
-import sos.{System, Process, Memory, Pool, Mapping, MapAccess, ClockType,
-            Timer, Waiter, SosStatus, SystemRight}
+import sos.{System, Process, Memory, Pool, Mapping, MapAccess,
+            Waiter, SosStatus, SystemRight}
 
 // The address of this program's first mapping, and the pool's size: its config,
 // per architecture, in C because Saw cannot name an address. See
@@ -81,13 +81,9 @@ static PIECES: UInt = 4
 /// Read and write, which is what a scratch region wants.
 static RW: UInt32 = MapAccess.Read | MapAccess.Write
 
-/// The key this case attaches its park timer under, a number that appears
+/// The key this case attaches the child's Process under, a number that appears
 /// nowhere else in the transcript.
 static KEY: UInt = 93
-
-/// Twenty milliseconds: three orders of magnitude more than the child needs to
-/// be scheduled, touch a page, print and exit. See `map_into_child`.
-static PARK_NS: UInt64 = 20_000_000
 
 /// Root's config: the tag the child's System handle travels under.
 static TAG_BOOT: UInt = 11
@@ -182,27 +178,15 @@ func lend_page_and_wait(system: &System, proc: &Process, child: &Process,
         return false
     }
 
-    // Park, so the child gets the processor. Everything after this call happens
-    // once the child has marked its page, printed, exited and been torn down;
-    // its teardown is what gives the page back.
-    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
-        let _ = system.debug_print("SOS recycle: no clock\n")
-        return false
-    }
+    // Park until the child is dead, so the child gets the processor. Everything
+    // after this call happens once the child has marked its page, printed,
+    // exited and been torn down; its teardown is what gives the page back.
     let waiter = try proc.waiter_create() catch {
         let _ = system.debug_print("SOS recycle: no waiter\n")
         return false
     }
-    let timer = try clock.timer_create() catch {
-        let _ = system.debug_print("SOS recycle: no timer\n")
-        return false
-    }
-    try waiter.add(&timer, KEY) catch {
+    try waiter.add(process: &child, key: KEY) catch {
         let _ = system.debug_print("SOS recycle: attach failed\n")
-        return false
-    }
-    try timer.arm(after_ns: PARK_NS) catch {
-        let _ = system.debug_print("SOS recycle: arm failed\n")
         return false
     }
     try waiter.wait() catch {

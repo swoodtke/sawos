@@ -29,8 +29,9 @@
 //
 // The probe is created next and lands in slot 1, which its teardown line's
 // `process=` field reports. It spends one connection, one region and one
-// window, and parks. Root then gives back the charger's objects, each through
-// a different free path: it releases the connection (`free_pipe`), releases
+// window, says so on a connection of its own and parks. Root waits for that
+// message before it gives back the charger's objects, each through a
+// different free path: it releases the connection (`free_pipe`), releases
 // one region (`memory_release_if_idle`), donates the other to the Memory slab
 // (`memory_retire_donated`) and releases the window (the IoMemory free). Each
 // was disowned, so each credits nobody.
@@ -45,8 +46,8 @@
 // One phase per function: root's stack grant is small and a `PipeMsg` is a
 // message-sized value, so the phases are split rather than held in one frame.
 
-import sos.{System, Process, Memory, Pool, IoMemory, PipeInlet, PipeHandle,
-            ClockType, SlabKind, SystemRight, SosStatus, PIPE_BODY_BYTES}
+import sos.{System, Process, Memory, Pool, IoMemory, PipeInlet, PipeOutlet,
+            PipeHandle, SlabKind, SystemRight, SosStatus, PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -55,17 +56,14 @@ static EXIT_FAILED: UInt = 1
 static TAG_BOOT: UInt = 7
 static TAG_CARRIER: UInt = 21
 static TAG_GO: UInt = 23
+static TAG_READY: UInt = 26
 static TAG_RAM: UInt = 24
 static TAG_WINDOW: UInt = 25
 
 /// The keys root's attachments live under.
 static KEY_CHARGER: UInt = 52
 static KEY_PROBE: UInt = 53
-static KEY_PARK: UInt = 54
-
-/// Twenty milliseconds: far longer than the probe needs to spend its first
-/// connection, region and window and park. See `process-lifecycle`.
-static PARK_NS: UInt64 = 20_000_000
+static KEY_READY: UInt = 54
 
 /// The length of each view of the device window root hands out.
 static WINDOW_LEN: UInt = 0x1000
@@ -124,14 +122,21 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     let _ = move ram
     let go = try proc.pipe_create()
     let (go_in, go_out) = move go
+    let ready = try proc.pipe_create()
+    let (ready_in, ready_out) = move ready
     try furnish(&system, &probe, &pool, &window)
     try probe.give(outlet: move go_out, tag: TAG_GO) catch {
         let (why, back) = move error
         let _ = move back
         return why
     }
+    try probe.give(inlet: move ready_in, tag: TAG_READY) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
     try probe.start(boot_tag: TAG_BOOT)
-    try park(&system, &proc)
+    try await_ready(&proc, &ready_out)
 
     // The charger's objects go back, each through its own free path. All four
     // were disowned, so nobody is credited.
@@ -250,15 +255,17 @@ func donate(system: &System, h: PipeHandle) -> Result<Void, SosStatus> {
     }
 }
 
-/// Give the processor up long enough for the probe to spend its first
-/// connection, region and window, and park.
-func park(system: &System, proc: &Process) -> Result<Void, SosStatus> {
-    let clock = try system.clock_get(type: ClockType.Monotonic)
+/// Wait for the probe's message that it has spent its first connection,
+/// region and window, and take it.
+func await_ready(proc: &Process,
+                  ready: &PipeOutlet) -> Result<Void, SosStatus> {
     let waiter = try proc.waiter_create()
-    let timer = try clock.timer_create()
-    try waiter.add(&timer, KEY_PARK)
-    try timer.arm(after_ns: PARK_NS)
+    try waiter.add(outlet: &ready, key: KEY_READY)
     let _ = try waiter.wait()
+    let got = try ready.take()
+    let (msg, request) = move got
+    let _ = move msg
+    let _ = move request
     return
 }
 

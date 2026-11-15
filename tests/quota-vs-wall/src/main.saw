@@ -27,11 +27,11 @@
 // the scarce thing it consumes is the target's grant-row budget, and charging
 // the caller would let a launcher's quota gate another process's domain size.
 //
-// Root parks on a generous timer while the child runs, so the ordering above
+// Root waits on the child's death while the child runs, so the ordering above
 // is forced rather than raced.
 
-import sos.{System, Process, Memory, Pool, BootHandle, Clock, ClockType, Timer,
-            Waiter, SosStatus, SystemRight}
+import sos.{System, Process, Memory, Pool, BootHandle, Waiter, SosStatus,
+            SystemRight}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -39,11 +39,8 @@ static EXIT_FAILED: UInt = 1
 /// One protection unit's worth on either profile.
 static CHUNK: UInt = 0x1000
 
-/// The key this case attaches its park timer under.
+/// The key this case attaches the child's Process under.
 static KEY: UInt = 64
-
-/// Twenty milliseconds. See `process_lifecycle`.
-static PARK_NS: UInt64 = 20_000_000
 
 /// Root's config: the tags the child's System handle and its first page
 /// travel under. Each later page travels under the next tag up.
@@ -147,28 +144,13 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS quotawall: started\n")
 
-    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
-        print("SOS quotawall: no clock: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
     let waiter = try proc.waiter_create() catch {
         print("SOS quotawall: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let timer = try clock.timer_create() catch {
-        print("SOS quotawall: no timer: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try waiter.add(&timer, KEY) catch {
+    try waiter.add(process: &child, key: KEY) catch {
         print("SOS quotawall: attach failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try timer.arm(after_ns: PARK_NS) catch {
-        print("SOS quotawall: arm failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

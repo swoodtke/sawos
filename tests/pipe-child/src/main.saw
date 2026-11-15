@@ -1,8 +1,9 @@
 // A connection that crosses a process boundary (spec §2.1, §12). Root creates a
 // pair, keeps the outlet and gives the inlet to a child; the child posts one
-// message and exits; root polls until it arrives and prints the bytes. Expected
-// outcome: root prints `received len=... b=...` with the child's bytes and
-// exits cleanly. Every mechanism involved is one the other cases prove:
+// message and exits; root waits for the child's death, takes the message and
+// prints the bytes. Expected outcome: root prints `received len=... b=...` with
+// the child's bytes and exits cleanly. Every mechanism involved is one the
+// other cases prove:
 //
 //   `pipe_create`      one op, two ends, through a copy-out record
 //   `give(inlet:)`     the courier op over a new kind; `Transfer` is minted in
@@ -10,18 +11,17 @@
 //   the boot drain     the child collects the end the same way it would
 //                      collect a region (§12), with the tag as the only
 //                      cross-process vocabulary
-//   post / take        data-only, polling, no waitability anywhere
+//   post / take        data-only, no waitability on the pipe itself
 //
 // The launch flow is the usual one: mint a masked System sibling, give it, give
 // the pipe end, start naming the boot tag. A connection end is a capability
 // like any other, so it rides the machinery `give-boot-drain` proves.
 //
-// The poll is bounded and parks between rounds. This image's kernel arms no
-// scheduler tick, so the only thing that takes the processor away from root is
-// root parking, and a spin would be a hang the deadlock report cannot see. So
-// root takes, and if the ring is empty it arms a timer and waits, at most
-// `POLL_ROUNDS` times. The first take necessarily finds nothing: the child has
-// been made runnable and has not run.
+// This image's kernel arms no scheduler tick, so the only thing that takes the
+// processor away from root is root parking. Root parks on the child's death,
+// an observable that says the child has posted and gone, and takes once
+// afterwards. A wait on a Timer would order nothing, since a Timer whose expiry
+// has passed answers the wait at once.
 //
 // The message outlives its sender. By the time root reads it the child has
 // dropped its inlet and exited (the transcript shows the exit and the teardown
@@ -29,25 +29,14 @@
 // across a real process boundary rather than inside one program.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
-            PipeMsg,
-            Clock, ClockType, Timer, Waiter, SosStatus, SystemRight,
-            PIPE_BODY_BYTES}
+            PipeMsg, Waiter, SosStatus, SystemRight, PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// The key root attaches its timer under. A number that appears nowhere else in
-/// the transcript.
+/// The key root attaches the child's Process under. A number that appears
+/// nowhere else in the transcript.
 static KEY: UInt = 81
-
-/// Five milliseconds per poll round — long enough for the child to be scheduled,
-/// drain one record, post and exit, and short enough that a broken run ends
-/// rather than hanging.
-static PARK_NS: UInt64 = 5_000_000
-
-/// The ceiling on the poll. A run that needs more than this has a bug, and
-/// printing a miss is a better failure than a spin.
-static POLL_ROUNDS: Int = 8
 
 /// Root's config, and the whole of the contract with the child. `child-post`
 /// expects exactly these words; the kernel supplies no meaning for either.
@@ -150,24 +139,19 @@ func _start(boot_handle: UInt) {
     let _ = system.debug_print("SOS pipechild: started\n")
 
     // The parking machinery. Root does not wait on the pipe here; it waits on
-    // a timer, and the poll stands in for a blocking receive.
-    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
-        print("SOS pipechild: no clock: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
+    // the child's death, after which the message is in the ring.
     let waiter = try proc.waiter_create() catch {
         print("SOS pipechild: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let timer = try clock.timer_create() catch {
-        print("SOS pipechild: no timer: {}\n", error)
+    try waiter.add(process: &child, key: KEY) catch {
+        print("SOS pipechild: attach failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    try waiter.add(&timer, KEY) catch {
-        print("SOS pipechild: attach failed: {}\n", error)
+    try waiter.wait() catch {
+        print("SOS pipechild: wait failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -178,33 +162,18 @@ func _start(boot_handle: UInt) {
     var b2: UInt = 0
     var b3: UInt = 0
     var have = false
-    var rounds: Int = 0
-    while (not have) && rounds < POLL_ROUNDS {
-        rounds = rounds + 1
-        let got = try take_message(&outlet) catch {
-            print("SOS pipechild: take refused: {}\n", error)
-            let _ = system.shutdown(EXIT_FAILED)
-            return
-        }
-        if let arrived = move got {
-            length = arrived.len
-            b0 = arrived.bytes[0] as UInt
-            b1 = arrived.bytes[1] as UInt
-            b2 = arrived.bytes[2] as UInt
-            b3 = arrived.bytes[3] as UInt
-            have = true
-        } else {
-            try timer.arm(after_ns: PARK_NS) catch {
-                print("SOS pipechild: arm failed: {}\n", error)
-                let _ = system.shutdown(EXIT_FAILED)
-                return
-            }
-            try waiter.wait() catch {
-                print("SOS pipechild: wait failed: {}\n", error)
-                let _ = system.shutdown(EXIT_FAILED)
-                return
-            }
-        }
+    let got = try take_message(&outlet) catch {
+        print("SOS pipechild: take refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if let arrived = move got {
+        length = arrived.len
+        b0 = arrived.bytes[0] as UInt
+        b1 = arrived.bytes[1] as UInt
+        b2 = arrived.bytes[2] as UInt
+        b3 = arrived.bytes[3] as UInt
+        have = true
     }
 
     if not have {

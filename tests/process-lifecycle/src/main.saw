@@ -30,25 +30,20 @@
 // high half, reason 1 in the low (2 * 65536 + 1). Root learns how its child
 // died as a value rather than an inference from the console.
 //
-// Root parks on a generous timer while the child runs, so the ordering above is
-// forced rather than raced: this image's kernel arms no scheduler tick, so the
-// only way root gives the processor up is the wait below, and the only way it
-// gets it back is the timer it armed.
+// Root waits on the child's death while the child runs, so the ordering above
+// is forced rather than raced: this image's kernel arms no scheduler tick, so
+// the only way root gives the processor up is the wait below, and the only way
+// it gets it back is the child's death. A wait on a Timer would order nothing:
+// a Timer whose expiry has passed answers the wait at once.
 
-import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
-            Waiter, SosStatus}
+import sos.{System, Process, Memory, BootHandle, Waiter, SosStatus}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// The key this case attaches its timer under. A number that appears nowhere
-/// else in the transcript.
+/// The key this case attaches the child's Process under. A number that appears
+/// nowhere else in the transcript.
 static KEY: UInt = 77
-
-/// Twenty milliseconds. The child needs microseconds to be scheduled, run its
-/// one syscall and die; this is three orders of magnitude of slack, so the case
-/// does not depend on how fast the emulator happens to be.
-static PARK_NS: UInt64 = 20_000_000
 
 @export("_start")
 func _start(boot_handle: UInt) {
@@ -107,28 +102,13 @@ func _start(boot_handle: UInt) {
 
     // Park, so the child gets the processor. Everything below the wait happens
     // after the child has lived and died.
-    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
-        print("SOS lifecycle: no clock: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
     let waiter = try proc.waiter_create() catch {
         print("SOS lifecycle: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let timer = try clock.timer_create() catch {
-        print("SOS lifecycle: no timer: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try waiter.add(&timer, KEY) catch {
+    try waiter.add(process: &child, key: KEY) catch {
         print("SOS lifecycle: attach failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try timer.arm(after_ns: PARK_NS) catch {
-        print("SOS lifecycle: arm failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

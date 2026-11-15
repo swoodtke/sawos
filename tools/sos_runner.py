@@ -4782,7 +4782,8 @@ TEST_CASES = [
     {
         # A parked Waiter is woken when the holder of an attached Interrupt
         # dies (spec 2.2, 2.10). Root attaches the Interrupt, gives it to a
-        # child that sleeps, and parks: the Interrupt's destruction wakes root
+        # child that runs only once root has parked (the image arms no tick),
+        # and parks: the Interrupt's destruction wakes root
         # with its key and `line=0`, the no-line value. Round 0 is a
         # persistent attachment and the child exits holding the Interrupt, so
         # its teardown destroys it: the level is terminal
@@ -5361,8 +5362,9 @@ TEST_CASES = [
         # Nothing un-dies: the terminal level, and the reference count observed
         # through the supervision flow.
         #
-        # `first=65541 second=65541` is two claims in one line. Root sleeps on
-        # a timer until the child is already dead and only then attaches, so an
+        # `first=65541 second=65541` is two claims in one line. Root waits for
+        # the child's death on a scratch Waiter, drops that attachment and only
+        # then attaches to the Waiter under test, so an
         # edge-triggered design would have nothing left to report and this wait
         # would never return; it returns immediately, because readiness is
         # `state == Gone` and that is still true. And the second wait on the
@@ -6026,9 +6028,10 @@ TEST_CASES = [
         # The order is the claim. `SOS childpost: posted`, the child's exit and
         # its teardown all come before root reads the bytes: root's first take
         # necessarily answered `Ok(None)` (the child was runnable and had not
-        # run), so root parked on a timer and the child ran to completion. So
-        # the message outlives its sender, which is `pipe_peer_gone`'s
-        # drain-first rule proved across a real process boundary.
+        # run), so root parked on the child's death and the child ran to
+        # completion. So the message outlives its sender, which is
+        # `pipe_peer_gone`'s drain-first rule proved across a real process
+        # boundary.
         #
         # `code={four}` and `len=4` are the same fact from the two sides of the
         # boundary: the child exits with its payload's length, and root reads
@@ -6200,8 +6203,8 @@ TEST_CASES = [
         # The order is the claim. `SOS childreply: replied`, the child's exit
         # and its teardown all come before root reads the bytes: root's first
         # look for the reply necessarily finds none (the child was runnable and
-        # had not run), so root parked on a timer and the child ran to
-        # completion. So a reply outlives the process that wrote it, which is
+        # had not run), so root parked on the child's death and the child ran
+        # to completion. So a reply outlives the process that wrote it, which is
         # what putting it in the exchange's own ring slot buys.
         #
         # `code={four}` and `len=4` are the same fact from the two sides of the
@@ -7941,11 +7944,10 @@ TEST_CASES = [
         # request-abandoned level it was already watching because it was
         # already holding the obligation, and `abandoned=1` is that arm firing.
         #
-        # The order is forced. When the timer fires the driver has been parked
-        # in `wait` for twenty milliseconds, so root's release wakes it there
-        # with that record, before root's next message is even posted. Twenty
-        # milliseconds is three orders of magnitude more than the driver needs
-        # to reach its park, which is `process-lifecycle`'s own argument.
+        # The order is forced. Root yields after posting, and this image arms
+        # no tick, so the driver has taken the request and parked in `wait`
+        # before the timer is looked at, and root's release wakes it there with
+        # that record, before root's next message is even posted.
         #
         # `served=5` is the read, the mark, two writes and the sync, and the
         # window numbers are the ones the money shot prints, from the same

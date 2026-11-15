@@ -187,9 +187,14 @@ time-based case asserts that some time passed, never how much:
   masked in the kernel, so no length of section can raise it.
 
 A wake never preempts the running thread (only a tick, a yield, a block and a
-thread's exit request a reschedule), so a case that parks a launcher on a
-Timer to let a child run orders them by scheduling, not by the clock, and a
-stall cannot reorder them.
+thread's exit request a reschedule). A wait answers at once for a Timer whose
+expiry has passed, so parking a launcher on a Timer orders nothing under a
+stalled host: the Timer can be expired at the wait, and the launcher never
+parks. An ordering a case needs is made true by waiting on what the other side
+does: attach the child's `Process` to the Waiter and wait for its death, wait
+on an Event or a message it sends, or yield on an image with no tick, where a
+yield returns once everything else has parked. The Timer stays in a case that
+is about the Timer.
 `thread_preempt` asserts `AB`, `BA`, `AB` as ordered adjacent pairs, which is
 "the processor crossed between the two threads at least three times, whoever
 went first". Each worker spins until the other has printed, so the crossings

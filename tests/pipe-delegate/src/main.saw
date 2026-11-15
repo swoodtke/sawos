@@ -17,37 +17,27 @@
 // read to a flash driver without the payload ever transiting the filesystem.
 //
 // The order matters. The child's reply, its exit and its teardown all come
-// before root reads the bytes: root's first `ready()` is false (the child was
-// runnable and had not run), so root parks on a timer and the child runs to
-// completion. A reply lives in the exchange's own ring slot, so it outlives the
-// process that wrote it exactly as a staged message outlives its sender.
+// before root reads the bytes: root parks on the child's death, so the child
+// runs to completion first. A wait on a Timer would order nothing, since a
+// Timer whose expiry has passed answers the wait at once. A reply lives in the
+// exchange's own ring slot, so it outlives the process that wrote it exactly as
+// a staged message outlives its sender.
 //
 // `code={four}` and `len=4` are the same fact from the two sides of the
 // boundary.
 //
-// The poll is bounded and parks between rounds. Root polls the claim and waits
-// on a timer between polls, rather than waiting on the claim; a spin would be a
-// hang the deadlock report could not see.
+// Root waits on the child's death and then asks the claim's level once, rather
+// than waiting on the claim itself.
 
 import sos.{System, Process, PipeInlet, PipeOutlet, PipeReply, PipeRequest,
-            Clock, ClockType, Timer, Waiter, SosStatus, SystemRight,
-            PIPE_BODY_BYTES}
+            Waiter, SosStatus, SystemRight, PIPE_BODY_BYTES}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// The key root attaches its timer under. A number that appears nowhere else in
-/// the transcript.
+/// The key root attaches the child's Process under. A number that appears
+/// nowhere else in the transcript.
 static KEY: UInt = 83
-
-/// Five milliseconds per poll round: long enough for the child to be scheduled,
-/// drain one record, reply and exit, and short enough that a broken run ends
-/// rather than hanging.
-static PARK_NS: UInt64 = 5_000_000
-
-/// The ceiling on the poll. A run that needs more than this has a bug, and
-/// printing a miss is a better failure than a spin.
-static POLL_ROUNDS: Int = 8
 
 /// Root's config, and the whole of the contract with the child. `child-reply`
 /// expects exactly these words; the kernel supplies no meaning for either.
@@ -146,30 +136,20 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // The parking machinery. Root polls the claim and waits on a timer between
-    // polls, and the poll stands in for a blocking `send`.
-    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
-        print("SOS delegate: no clock: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
+    // The parking machinery. Root waits on the child's death, after which the
+    // reply is in the claim.
     let waiter = try proc.waiter_create() catch {
         print("SOS delegate: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let timer = try clock.timer_create() catch {
-        print("SOS delegate: no timer: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try waiter.add(&timer, KEY) catch {
+    try waiter.add(process: &child, key: KEY) catch {
         print("SOS delegate: attach failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
 
-    let answer = try poll_reply(move claim, &timer, &waiter) catch {
+    let answer = try reply_after_death(move claim, &waiter) catch {
         print("SOS delegate: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
@@ -186,7 +166,7 @@ func _start(boot_handle: UInt) {
     let _ = proc.exit(EXIT_OK)
 }
 
-/// What the poll below found, flattened out of the message it came in.
+/// What the read below found, flattened out of the message it came in.
 struct Answer {
     have: Bool,
     length: UInt,
@@ -196,32 +176,22 @@ struct Answer {
     b3: UInt,
 }
 
-/// The poll, in its own frame. It is a phase rather than a block because a
-/// `PipeMsg` is a message-sized value and every `print` with format arguments
-/// reserves its own scratch, so a `_start` holding both would exhaust root's
-/// stack grant on the 64-bit profile.
+/// The wait and the read, in their own frame. It is a phase rather than a block
+/// because a `PipeMsg` is a message-sized value and every `print` with format
+/// arguments reserves its own scratch, so a `_start` holding both would
+/// exhaust root's stack grant on the 64-bit profile.
 ///
-/// It is a `ready()` loop with one resolve at the end. A resolve parks, which
-/// would make the loop a blocking receive with a timer attached to nothing. So
-/// the loop asks the level (non-consuming, as many times as it likes) and the
-/// single consuming act happens once, after the answer is known to be there.
+/// The wait ends with the child's death, and the level is asked once. A
+/// resolve parks, so it happens only after the answer is known to be there.
 /// The claim is taken by value for that reason: a `&var` parameter could not be
 /// moved into a consuming method.
-func poll_reply(claim: PipeReply, timer: &Timer,
-                waiter: &Waiter) -> Result<Answer, SosStatus> {
-    var rounds: Int = 0
-    var arrived = false
-    while rounds < POLL_ROUNDS && not arrived {
-        rounds = rounds + 1
-        arrived = try claim.ready()
-        if not arrived {
-            try timer.arm(after_ns: PARK_NS)
-            try waiter.wait()
-        }
-    }
+func reply_after_death(claim: PipeReply,
+                       waiter: &Waiter) -> Result<Answer, SosStatus> {
+    try waiter.wait()
+    let arrived = try claim.ready()
     if not arrived {
         // The claim is dropped rather than resolved: resolving would park on an
-        // answer this loop has just spent its whole budget not seeing.
+        // answer the child's death has just shown is not coming.
         let _ = move claim
         return Answer(have: false, length: 0, b0: 0, b1: 0, b2: 0, b3: 0)
     }

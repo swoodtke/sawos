@@ -26,18 +26,16 @@
 // with `Mint` a sibling's rights are a subset of its source's, so no sequence
 // of ops recovers `Shutdown`.
 //
-// Root parks on a generous timer while the child runs, so the ordering is
+// Root waits on the child's death while the child runs, so the ordering is
 // forced rather than raced.
 
-import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
-            Waiter, SosStatus, SystemRight}
+import sos.{System, Process, Memory, BootHandle, Waiter, SosStatus,
+            SystemRight}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 static KEY: UInt = 77
-static PARK_NS: UInt64 = 20_000_000
-
 static TAG_BOOT: UInt = 7
 
 /// The policy: print, name yourself, tell the time. `Shutdown` is not here,
@@ -96,28 +94,13 @@ func _start(boot_handle: UInt) {
         "SOS noshutdown: started a child that may print and not stop the machine\n")
 
     // Park, so the child gets the processor and oversteps.
-    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
-        print("SOS noshutdown: no clock: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
     let waiter = try proc.waiter_create() catch {
         print("SOS noshutdown: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let timer = try clock.timer_create() catch {
-        print("SOS noshutdown: no timer: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try waiter.add(&timer, KEY) catch {
+    try waiter.add(process: &child, key: KEY) catch {
         print("SOS noshutdown: attach failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try timer.arm(after_ns: PARK_NS) catch {
-        print("SOS noshutdown: arm failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

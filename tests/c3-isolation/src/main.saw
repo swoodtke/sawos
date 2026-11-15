@@ -25,23 +25,16 @@
 // kernel through the syscall door, and the one trap it took was the refused
 // store.
 //
-// Root parks on a generous timer because this image's kernel arms no
+// Root waits on the child's death because this image's kernel arms no
 // scheduler tick: the wait below is the only way root gives up the processor
-// and the timer the only way it gets it back. The case therefore depends on
-// the `timer` case's machinery too: if the SYSTIMER path were broken this
-// would hang rather than report, and the two cases would fail together.
+// and the child's death the only way it gets it back.
 
-import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
-            Waiter, SosStatus}
+import sos.{System, Process, Memory, BootHandle, Waiter, SosStatus}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
 static KEY: UInt = 88
-
-/// Twenty milliseconds: three orders of magnitude more than the child needs
-/// to be scheduled and take one fault.
-static PARK_NS: UInt64 = 20_000_000
 
 @export("_start")
 func _start(boot_handle: UInt) {
@@ -82,28 +75,13 @@ func _start(boot_handle: UInt) {
     }
     let _ = system.debug_print("SOS c3iso: started\n")
 
-    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
-        print("SOS c3iso: no clock: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
     let waiter = try proc.waiter_create() catch {
         print("SOS c3iso: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let timer = try clock.timer_create() catch {
-        print("SOS c3iso: no timer: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try waiter.add(&timer, KEY) catch {
+    try waiter.add(process: &child, key: KEY) catch {
         print("SOS c3iso: attach failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try timer.arm(after_ns: PARK_NS) catch {
-        print("SOS c3iso: arm failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }

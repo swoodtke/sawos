@@ -16,13 +16,14 @@
 //                                      <- the loop served the next request
 //   SOS uartsvc drv: served=5 abandoned=1
 //
-// The order is forced, not raced. When root's timer fires the driver is parked
-// in `wait` with nothing else to do (it has been since it attached root's
-// obligation), so the release that abandons the claim wakes it there, with
-// that record, before anything else is posted. Root's next message cannot
-// overtake a delivery that has already happened. The twenty-millisecond
-// deadline is three orders of magnitude more than the driver needs to reach
-// its park, as in `process-lifecycle`.
+// The order is forced, not raced. Root yields after posting, and this image
+// arms no scheduler tick, so the yield returns only once the driver has taken
+// the request and parked in `wait` with nothing else to do. When root's timer
+// is ready, whenever that is, the release that abandons the claim wakes the
+// driver there, with that record, before anything else is posted. Root's next
+// message cannot overtake a delivery that has already happened. The deadline
+// is the case's subject and orders nothing: a Timer whose expiry has passed
+// answers the wait at once.
 //
 // The guest gets no serial input, so the device never raises its line: the
 // transcript contains no interrupt and the driver's trap accounting is exact.
@@ -56,8 +57,8 @@ static KEY_CLAIM: UInt = 81
 static KEY_TIMER: UInt = 82
 static KEY_DRIVER: UInt = 83
 
-/// Twenty milliseconds: three orders of magnitude more than the driver needs
-/// to reach its park. See `process-lifecycle`.
+/// Root's deadline on the read. Nothing depends on how long it is: the driver
+/// holds the request before root looks at the clock.
 static PARK_NS: UInt64 = 20_000_000
 
 /// What a child of this launcher may ask its System object for.
@@ -136,6 +137,12 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     let n = req.bare(UartOp.Read)
     let claim = try inlet.post(body: &req.bytes, len: n)
     let _ = system.debug_print("SOS uartcancel: read posted\n")
+
+    // Let the driver run until it has taken the request and parked. Nothing
+    // ticks in this image, so a yield returns once the driver has nothing left
+    // to do.
+    let me = try proc.thread_self()
+    let _ = me.yield_now()
 
     // The deadline is root's own. A Waiter holds two things, the claim and a
     // Timer, and whichever is ready first is the answer. The pipe surface has

@@ -28,23 +28,19 @@
 // `status=65540` is `Exited` (1) in the high half and the child's own count (4)
 // in the low, read through the Process handle root never gave away.
 //
-// Root parks on a generous timer while the child runs, so the ordering above
+// Root waits on the child's death while the child runs, so the ordering above
 // is forced rather than raced: this image's kernel arms no scheduler tick, so
 // the only way root gives the processor up is the wait below.
 
-import sos.{System, Process, Memory, BootHandle, Clock, ClockType, Timer,
-            Waiter, SosStatus, SystemRight}
+import sos.{System, Process, Memory, BootHandle, Waiter, SosStatus,
+            SystemRight}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// The key this case attaches its park timer under, a number that appears
-/// nowhere else in the transcript.
+/// The key this case attaches the child's Process under, a number that
+/// appears nowhere else in the transcript.
 static KEY: UInt = 63
-
-/// Twenty milliseconds: three orders of magnitude more than the child needs to
-/// make four events, meet its limit, print and exit. See `process-lifecycle`.
-static PARK_NS: UInt64 = 20_000_000
 
 /// Root's config: the tag the child's System handle travels under.
 static TAG_BOOT: UInt = 21
@@ -120,28 +116,13 @@ func _start(boot_handle: UInt) {
 
     // Park, so the child gets the processor. Everything below happens after the
     // child has met its limit, reported and exited.
-    let clock = try system.clock_get(type: ClockType.Monotonic) catch {
-        print("SOS quotaex: no clock: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
     let waiter = try proc.waiter_create() catch {
         print("SOS quotaex: no waiter: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let timer = try clock.timer_create() catch {
-        print("SOS quotaex: no timer: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try waiter.add(&timer, KEY) catch {
+    try waiter.add(process: &child, key: KEY) catch {
         print("SOS quotaex: attach failed: {}\n", error)
-        let _ = system.shutdown(EXIT_FAILED)
-        return
-    }
-    try timer.arm(after_ns: PARK_NS) catch {
-        print("SOS quotaex: arm failed: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
