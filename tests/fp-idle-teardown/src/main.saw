@@ -1,0 +1,232 @@
+// A thread's FP/SIMD state is saved while the thread is still its process's,
+// before the processor idles (spec §7, arm64).
+//
+// Root starts `child-fp-idle` and parks on its death. The child's second
+// thread fills V0-V31 (`fp_fill`), takes out of the child the memory its first
+// thread's wait record lies in, arms a Timer, and parks, the last thread to
+// block. Nothing is runnable, so the kernel idles with that thread as the
+// outgoing one. The Timer's fire is delivered in the idle path, finds the wait
+// record gone and ends the child with `BadBuffer`, which tears down the very
+// process whose thread is outgoing. Root wakes, starts a thread of its own and
+// checks that its first FP/SIMD use sees zeros, and that its own pattern
+// survives a yield:
+//
+//   SOS fpidle: the child ended with BadBuffer
+//   SOS fpidle: new thread nonzero=0
+//   SOS fpidle: new thread bad=0
+//   SOS fpidle: done
+//
+// This is a liveness check, not a discriminating one. The outgoing thread is
+// still the current one during the idle wait, so the death is the running
+// process's: it ends through the fault path and the kernel resumes in
+// `resume_after_death`, never returning to the switch that was idling. A save
+// placed after the wait would not run, and one that did would write a slot the
+// next thread's `frame_init` overwrites whole before anything reads it. So the
+// transcript is the same whichever side of the wait the save is on, and what
+// the case shows is that the path (an idle-time teardown of the outgoing
+// thread's own process, then a later thread running FP) works.
+
+import sos.{System, Process, Memory, Pool, Waiter, ClockType, MapAccess,
+            SosStatus, SystemRight}
+
+extern "C" {
+    func fp_fill(seed: UInt)
+    func fp_check(seed: UInt) -> UInt
+    func fp_zero_count() -> UInt
+}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ADDR: UInt = 33
+static TAG_WAITER: UInt = 34
+static TAG_PIECE: UInt = 36
+static TAG_TIMER: UInt = 38
+
+static KEY_DEATH: UInt = 6
+static KEY_TIMER: UInt = 7
+
+/// What a child of this launcher may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer)
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The child's destination, allocated from the front of its pool, and the
+/// piece behind it. Both are whole pages.
+static DEST_LEN: UInt = 0x3_0000
+static HOLE_LEN: UInt = 0x2000
+
+/// The §8 status word of a process ended with `BadBuffer`: `Faulted` in the
+/// high half and the reason (11) in the low.
+static BAD_BUFFER: UInt = 131083
+
+static_assert((2 * 65536) + 11 == 131083,
+              "a fault word is Faulted in the high bits, then the reason")
+
+static SEED: UInt = 0x4444_0000_0000_0003
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+/// The boot handle, parked by the initial thread for the new thread, and the
+/// witness that a thread is the new one.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+func say(line: String) {
+    print("SOS fpidle: {}", line)
+}
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// The child's setup, its run and its death. Everything the child holds is
+/// given before it starts, and root parks on its death before the child's
+/// threads get the processor.
+func end_child(system: &System, proc: &Process, image: &Memory,
+               pool: &Pool) -> Result<Void, SosStatus> {
+    let dst = try pool.allocate(len: DEST_LEN)
+    let child = try system.process_create(image: &image, memory: &dst)
+    let hole = try pool.allocate(len: HOLE_LEN)
+    let _ = move dst
+
+    // Where the piece lands is the child's to know once it maps it; a
+    // launcher's mapping tells where, and goes away again.
+    let probe = try child.map(memory: &hole, access: RW)
+    let at = try probe.base()
+    try probe.unmap()
+    try tell(&proc, &child, TAG_ADDR, at)
+    try child.give(memory: move hole, tag: TAG_PIECE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    let clock = try system.clock_get(type: ClockType.Monotonic)
+    let timer = try clock.timer_create()
+    let waiter = try proc.waiter_create()
+    try waiter.add(timer: &timer, key: KEY_TIMER)
+    let arm = try timer.mint()
+    try child.give(timer: move arm, tag: TAG_TIMER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(waiter: move waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+
+    let deaths = try proc.waiter_create()
+    try deaths.add(process: &child, key: KEY_DEATH)
+    try child.start(boot_tag: TAG_BOOT)
+    let wake = try deaths.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            if status != BAD_BUFFER {
+                print("SOS fpidle: the child ended with status {}", status)
+                return BUG
+            }
+        },
+        case _ -> { return BUG },
+    }
+    say("the child ended with BadBuffer")
+    return
+}
+
+/// The thread root starts after the child's death: its first FP/SIMD use must
+/// see zeros, and its own pattern must survive a yield.
+func new_thread() unsafe {
+    let system = System(boot_handle: BOOT_HANDLE)
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    print("SOS fpidle: new thread nonzero={}", fp_zero_count())
+    fp_fill(SEED)
+    let _ = me.yield_now()
+    print("SOS fpidle: new thread bad={}", fp_check(SEED))
+    let _ = (move me).exit(0)
+}
+
+func initial(boot_handle: UInt) unsafe {
+    BOOT_HANDLE = boot_handle
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS fpidle: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var image_rec = try proc.boot_handle_next() catch {
+        print("SOS fpidle: no image region: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_rec = try proc.boot_handle_next() catch {
+        print("SOS fpidle: no pool region: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image = image_rec.take_memory() else {
+        let _ = system.debug_print("SOS fpidle: image record is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_rec.take_pool() else {
+        let _ = system.debug_print("SOS fpidle: pool record is not a pool\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try end_child(&system, &proc, &image, &pool) catch {
+        print("SOS fpidle: refused: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    let thread = try proc.thread_create(stack_top: stack_top(), arg: 1) catch {
+        print("SOS fpidle: create failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = thread.start()
+    let _ = try thread.join() catch { 0 }
+    let _ = system.debug_print("SOS fpidle: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+@export("_start")
+func _start(arg: UInt) unsafe {
+    if BOOT_HANDLE == 0 {
+        initial(arg)
+    } else {
+        new_thread()
+    }
+}

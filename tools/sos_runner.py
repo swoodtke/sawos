@@ -192,6 +192,10 @@ ARENA_RACE_PKG = os.path.join(TESTS_DIR, "arena-race")
 FP_THREADS_PKG = os.path.join(TESTS_DIR, "fp-threads")
 FP_LEAK_PKG = os.path.join(TESTS_DIR, "fp-leak")
 CHILD_FP_LEAK_PKG = os.path.join(TESTS_DIR, "child-fp-leak")
+# A child whose last thread to block has used FP/SIMD, ended while the kernel
+# idles, then a thread of the launcher's that uses it.
+FP_IDLE_TEARDOWN_PKG = os.path.join(TESTS_DIR, "fp-idle-teardown")
+CHILD_FP_IDLE_PKG = os.path.join(TESTS_DIR, "child-fp-idle")
 # The scheduler tick taking the processor from a process that never yields.
 TICK_SPINNER_PKG = os.path.join(TESTS_DIR, "tick-spinner")
 CHILD_SPIN_PKG = os.path.join(TESTS_DIR, "child-spin")
@@ -2008,6 +2012,38 @@ TEST_CASES = [
                        "SOS fpleak child: nonzero=0\n",
                        "SOS fpleak: woke key=44 status=65536\n",
                        "SOS fpleak: done\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The outgoing thread's FP/SIMD state is saved before the idle wait. A
+        # child's second thread fills the registers, takes the memory its first
+        # thread's wait record lies in out of the child, arms a Timer and
+        # parks, the last thread to block: the kernel idles with it outgoing.
+        # The fire finds the record gone and ends the child during the idle
+        # wait, so the outgoing thread's slot is released there. Root then runs
+        # a thread of its own that uses FP/SIMD.
+        #
+        # A liveness check, not a discriminating one. The death the fire owes
+        # is the running process's (the outgoing thread is still current in
+        # the idle wait), so it ends through the fault path and resumes in
+        # `resume_after_death`, and `pick_next`'s tail is not reached; a save
+        # placed after the wait would simply not run, and one that did run
+        # would write a slot the next thread's `frame_init` overwrites whole.
+        # The transcript is the same on either side of the wait, so the case
+        # asserts that the path completes and the new thread's state is its
+        # own.
+        "name": "fp_idle_teardown",
+        "arches": ["arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": FP_IDLE_TEARDOWN_PKG,
+        "children": [CHILD_FP_IDLE_PKG],
+        "pool_destinations": [0],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS fpidle: the child ended with BadBuffer\n",
+                       "SOS fpidle: new thread nonzero=0\n"
+                       "SOS fpidle: new thread bad=0\n",
+                       "SOS fpidle: done\n"],
         "expect_clean_exit": True,
     },
     {

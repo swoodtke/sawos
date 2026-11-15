@@ -178,6 +178,14 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     }
     NEED_RESCHED = false
 
+    // The outgoing thread's floating-point state is saved before anything can
+    // wait, while the thread is still its process's. The idle wait below runs
+    // deliveries and the deaths they owe, and a death of the outgoing
+    // thread's own process releases its slot and leaves through
+    // `resume_after_death`, not back here. The save therefore never depends on
+    // what a teardown leaves of the slot.
+    hal.fp_switch_out(current_frame)
+
     var next = ready_pop()
     if next == NO_THREAD {
         // Nothing runnable. With a bound IRQ line or an armed Timer
@@ -192,10 +200,6 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
         idle_until_runnable()
         next = ready_pop()
     }
-
-    // The outgoing thread's floating-point state is saved while its slot is
-    // still live, so a freed slot's frame is never written.
-    hal.fp_switch_out(current_frame)
 
     // The outgoing thread is not read past this point. An exited thread that
     // nothing names goes now (`PENDING_FREE`).

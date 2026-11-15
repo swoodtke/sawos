@@ -3764,7 +3764,9 @@ mode only. The harness kernels that test the tick and timers arm their own.
   that has not used it: the first instruction traps (§5b), the thread's own
   state is loaded and access is enabled, and the thread resumes at that
   instruction. A switch saves the outgoing thread's state if it has used FP/SIMD
-  (before the slot of an exited thread is released) and loads the incoming
+  (before the processor idles and before the slot of an exited thread is
+  released, so a teardown during the idle wait never meets a pending save) and
+  loads the incoming
   thread's, enabling or disabling EL0 access to match; a thread that never uses
   FP/SIMD pays nothing. The first-use trap is not a syscall, interrupt or fault
   and no `Stats` column counts it.

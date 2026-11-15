@@ -206,8 +206,8 @@ entered once has no storage a second thread could have.
   - At a switch `kcore.sched.pick_next` calls `fp_switch_out` (save the
     outgoing thread if it is active) and `run_thread` calls `fp_switch_in`
     (load the incoming thread and leave EL0 access on if it is active, else
-    turn EL0 access off). The save runs before an exited thread's deferred
-    free, so a freed slot is never written, and a thread that never uses FP/SIMD
+    turn EL0 access off). The save runs before the idle wait and before an
+    exited thread's deferred free, so a freed slot is never written, and a thread that never uses FP/SIMD
     costs one compare per switch. Exit and invalidation need nothing: the area
     dies with the slot.
 - **Semihosting, not PSCI, for shutdown.** PSCI `SYSTEM_OFF` over the HVC
