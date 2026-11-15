@@ -66,7 +66,7 @@ host-time values and moved code addresses, and the new windowed cases pass
 with every mutant red but the few §10 names (§8, §10, §11, §11a).
 
 The trap path saves and restores all 64 physical registers and never writes
-a user stack. It costs 126 more instructions per trap and switch (87 to 213)
+a user stack. It costs 125 more instructions per trap and switch (87 to 212)
 and 200 more bytes per frame (104 to 304), which stays inside the 512-byte
 `THREAD_FRAME_STRIDE`, so the kernel's RAM does not change.
 
@@ -128,9 +128,12 @@ know them **[read, from memory of the reference]**. Each rule the design
 depends on is confirmed by a run on the emulator, named beside it, and the
 emulator is the executable reference here; where a rule is only read it says
 so. The reviewer checked them against three implementations instead of the
-manual: the six handlers of §3 are the mask ROM's own at 0x4000_0000
-instruction for instruction (`esp32s3_rev0_rom.elf`), the Alloca path is the
-ROM's and ESP-IDF v5.4.1's `_xt_alloca_exc`, the start state of §5 is
+manual: four of the six handlers of §3 are the mask ROM's own at
+0x4000_0000 instruction for instruction (`esp32s3_rev0_rom.elf`), and the
+ROM's Underflow8 and Underflow12 load a0 before a1 where these load a1 first
+(sound, since a1 is loaded before the load through it; the fill cases'
+tval 0x1000_0004 for call8 and call12 is that first load), the Alloca path
+is the ROM's and ESP-IDF v5.4.1's `_xt_alloca_exc`, the start state of §5 is
 ESP-IDF's for a windowed task plus a2 (`port.c`), and the overflow vector's
 choice is Espressif QEMU's `window_check`.
 
