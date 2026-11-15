@@ -11527,15 +11527,70 @@ def _root_image_path(pkg_dir, arch):
     return os.path.join(out_dir, images[0])
 
 
+# The only imports a read-only probe may hold: the console it prints on, and
+# the HAL by its module name, so that every call into the HAL is spelled
+# `hal.NAME` and the check below sees it.
+READ_ONLY_PROBE_IMPORTS = ["import kcore.{console}", "import hal"]
+
+# A read-only probe's one accessor, as it must be written: a register is a
+# struct whose one field is `ReadOnly`, and the only unsafe value the file
+# makes is a `Device` view of that struct, read once. Compared after
+# comments are dropped and each line's trailing space is trimmed.
+READ_ONLY_PROBE_ACCESSOR = (
+    "struct Reg {\n"
+    "    v: ReadOnly<UInt32>,\n"
+    "}",
+    "func load(addr: UInt) unsafe -> UInt32 {\n"
+    "    UnsafeMemory<Reg, Device>(addr).v.read()\n"
+    "}",
+)
+
+
 def check_read_only_probe(path):
-    """Refuse a read-only probe's source unless it can store nothing to a
-    peripheral: every load is one `UnsafeMemory` (whose view is `ReadOnly`, so
-    the compiler refuses a store through it), no `.write(` appears, and the
-    only call into the HAL is the one that halts. Comments are not read."""
+    """Refuse a read-only probe's source if it takes one of the direct routes
+    to a store to a peripheral: a store through its view, a second view, an
+    unsafe type named outside the accessor, a call into the HAL other than the
+    one that halts, a call through `kcore.`, an import beyond
+    `READ_ONLY_PROBE_IMPORTS`, `extern` or `asm`. The accessor is held to its
+    text (`READ_ONLY_PROBE_ACCESSOR`). Comments are not read.
+
+    This guards against an honest mistake; it does not show that the file
+    can store nothing, since a raw pointer from a safe name (an allocator's,
+    say) and an index reach any address. What holds that for an image is the
+    compiler's refusal of a store through the one `ReadOnly` view, and a trace
+    of the built image's device writes under the emulator before it is
+    flashed."""
     with open(path) as f:
         code = [line.split("//", 1)[0] for line in f.read().splitlines()]
-    code = "\n".join(code)
     name = os.path.basename(path)
+    imports = [line.strip() for line in code
+               if re.match(r"\s*(public\s+)?import\b", line)]
+    if imports != READ_ONLY_PROBE_IMPORTS:
+        raise ToolError(f"{name} is a read-only probe; its imports must be "
+                        f"exactly {READ_ONLY_PROBE_IMPORTS}, and they are "
+                        f"{imports}")
+    code = "\n".join(line.rstrip() for line in code)
+    rest = code
+    for part in READ_ONLY_PROBE_ACCESSOR:
+        if rest.count(part) != 1:
+            raise ToolError(f"{name} is a read-only probe and must hold its "
+                            f"accessor exactly as written:\n{part}")
+        rest = rest.replace(part, "", 1)
+    for word in (r"\bUnsafe\w*", r"\bReadOnly\b", r"\bReg\b", r"\.ptr\("):
+        found = re.search(word, rest)
+        if found:
+            raise ToolError(f"{name} is a read-only probe and names "
+                            f"`{found.group(0)}` outside its accessor")
+    for word in ("extern", "asm"):
+        if re.search(rf"\b{word}\b", code):
+            raise ToolError(f"{name} is a read-only probe and names `{word}`")
+    if re.search(r"\bkcore\.\w+\s*\(", code):
+        raise ToolError(f"{name} is a read-only probe and calls into the "
+                        "kernel through `kcore.`")
+    unsafe = sorted(set(re.findall(r"\bUnsafe\w*", code)))
+    if unsafe != ["UnsafeMemory"]:
+        raise ToolError(f"{name} is a read-only probe; the only unsafe type "
+                        f"it may name is UnsafeMemory, and it names {unsafe}")
     views = len(re.findall(r"\bUnsafeMemory\b", code))
     if views != 1:
         raise ToolError(f"{name} is a read-only probe and holds {views} "

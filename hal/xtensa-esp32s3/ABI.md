@@ -1868,11 +1868,16 @@ registers, the kernel's RAM, the console's FIFO). It does not call
 `intc_init`, does not touch SYSTIMER (a read of its counter takes a write of
 its snapshot bit), sends no command on the memory-SPI bus, routes no
 interrupt, writes no pad, clock, cache or MMU register, and leaves the clock
-at the `rom` key's. Two things hold that: every load goes through one
-accessor whose view is a `ReadOnly` field, so a store through it is a compile
-error, and the runner refuses the source unless that view is its only
-`UnsafeMemory`, it names no `.write(`, and the only HAL entry it calls is the
-one that halts (`check_read_only_probe`).
+at the `rom` key's. What holds that for an image is a trace of the built
+image's device writes under the emulator, made before it is flashed: it
+must write no device address an ordinary boot does not. Every load goes
+through one accessor whose view is a `ReadOnly` field, so a store through it
+is a compile error; and the runner refuses the source if it takes a direct
+route to a store (a second view, an unsafe type named outside the accessor,
+a HAL call but the one that halts, an import beyond the console and the HAL,
+`extern`, `asm`), which catches a mistake but cannot prove the property: a
+raw pointer from a safe name and an index reach any address
+(`check_read_only_probe`).
 
 `python3 tools/sos_runner.py --board esp32s3 --emit-flash s3_mem_probe --out
 PATH` builds the flashable image. Every address is the header's: a register's
