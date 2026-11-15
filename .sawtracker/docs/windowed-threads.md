@@ -18,17 +18,52 @@ has run. The prototype this design was checked with is
 
 ## 0. Verdict
 
+**Revision 2.** What changed from revision 1, which the reviewer read:
+
+- The owner's rulings are in (§15): all 64 registers saved and restored on
+  every trap, never a spill to a user's stack; one start state, nothing
+  declared in the image; a fault in a spill or fill reported with the
+  access's own cause; the kernel calls the ROM only before the loader,
+  checked at the stub; a windowed entry that returns faults by a return
+  address that faults on fetch. The lazy save of §12a is the alternative
+  considered, deferred to SO-115 with lazy FP state.
+- §2 gains the reviewer's two `retw` rules (a size that disagrees with the
+  nearest live frame behind is illegal; a `retw` that does not underflow
+  clears its frame's WINDOWSTART bit), and says what the rules were checked
+  against.
+- §5: the start state gains a4 = 0x7FFF_FFFC, the windowed entry's return
+  address; and an entry point that does not open with `entry` must make only
+  `call4` calls from its first frame (ABI.md §7d says so).
+- §3.6: the Alloca path is the ROM's and ESP-IDF's shape, rotating into the
+  spilled caller's dead pane for scratch; it serves the user vector and,
+  since the stub, the kernel vector.
+- §6: the double path parks nothing in EXCSAVE2 or EXCSAVE3: neither path
+  resumes the interrupted context, so a0 and a2 are scratch and nothing of a
+  faulting window is left where a later thread could read it.
+- §7: the stub refuses a call once the loader has begun (`hal.payload_start`
+  closes it); its a12 restore is held by a case, its WINDOWSTART restore has
+  an observer, and an Alloca exception under it is handled at the kernel
+  vector rather than stopping the machine.
+- §10: the cases as built (fourteen new, the reviewer's asks among them)
+  and every new line of the trap path, the handlers and the stub under a
+  mutant; §11a records what the build ran; §4.5 the costs as built.
+- §2b of ABI.md: `_start` writes PS (WOE = 0) before WINDOWSTART and
+  WINDOWBASE, and through a2, so it no longer relies on the ROM's handover
+  window having no WINDOWSTART bit in reach of `a9`.
+
 The approach is sound on the emulator, and nothing found needs the scope
 changed. One start state serves both conventions: PS.WOE = 1, PS.CALLINC = 1,
 WINDOWBASE 0, WINDOWSTART 1, the entry argument in both `a2` and `a6`, the
-stack top in `a1` and a zero return address. A call0 entry never rotates the
-window, and a windowed entry's `entry` behaves as if the thread had been
-`call4`ed by a frame that can be spilled into the thread's own stack and is
-never returned into. No process declares its convention. **[run]**: the
-whole S3 smoke (46 cases, 41 of them the existing ones) passes on the
-prototype, every existing case's console is byte-identical to main's apart
-from host-time values and moved code addresses, and the new windowed cases
-pass with every mutant tried red but none (§8, §11).
+stack top in `a1`, a zero `a0` (a call0 entry's return address) and
+0x7FFF_FFFC in `a4` (a windowed entry's, which faults on fetch). A call0
+entry never rotates the window, and a windowed entry's `entry` behaves as if
+the thread had been `call4`ed by a frame that can be spilled into the
+thread's own stack and is never returned into. No process that opens with
+`entry` (or keeps to `call4` from its first frame) declares its convention.
+**[run]**: the whole S3 smoke passed on the prototype and passes on the
+build, every existing case's console is identical to main's apart from
+host-time values and moved code addresses, and the new windowed cases pass
+with every mutant red but the few §10 names (§8, §10, §11, §11a).
 
 The trap path saves and restores all 64 physical registers and never writes
 a user stack. It costs 126 more instructions per trap and switch (87 to 213)
@@ -49,6 +84,11 @@ the ROM ELF and **[run]** where marked:
   all `call8`, and write no PS **[read]**; the register file holds six such
   frames below the stub before anything overflows. The stub is safe if one
   does overflow anyway **[run: `rom_call`'s deep chain from the kernel]**.
+
+§12a is the lazy alternative (save the other 48 only at a switch),
+evaluated by reading and by assembled instruction counts, not by a run, with
+a recommendation and the units under either choice. The owner chose the
+eager save; §12a stays as the starting point for SO-115.
 
 ---
 
@@ -87,7 +127,12 @@ public copy failed (a 403 and a 404), so the rules below are the ISA's as I
 know them **[read, from memory of the reference]**. Each rule the design
 depends on is confirmed by a run on the emulator, named beside it, and the
 emulator is the executable reference here; where a rule is only read it says
-so.
+so. The reviewer checked them against three implementations instead of the
+manual: the six handlers of §3 are the mask ROM's own at 0x4000_0000
+instruction for instruction (`esp32s3_rev0_rom.elf`), the Alloca path is the
+ROM's and ESP-IDF v5.4.1's `_xt_alloca_exc`, the start state of §5 is
+ESP-IDF's for a windowed task plus a2 (`port.c`), and the overflow vector's
+choice is Espressif QEMU's `window_check`.
 
 - **Registers.** 64 physical address registers (`XCHAL_NUM_AREGS 64`, ABI.md
   §7a). WINDOWBASE (SR 72) counts panes of four; `aN` is physical register
@@ -111,6 +156,19 @@ so.
   ← the old WINDOWBASE, EXCM ← 1, EPC1 ← the `retw`, vector WindowUnderflow4n
   with WINDOWBASE at the caller. `rfwu`: WINDOWSTART[WINDOWBASE] ← 1,
   WINDOWBASE ← PS.OWB, EXCM ← 0, jump to EPC1, which re-executes `retw`.
+- **A `retw` whose size disagrees with the nearest live frame behind it is
+  illegal.** With m the distance from WINDOWBASE back to the nearest set
+  WINDOWSTART bit one to three panes back (0 when there is none), the
+  emulator raises IllegalInstruction when n = 0 or when m ≠ 0 and m ≠ n
+  (Espressif QEMU, `target/xtensa/win_helper.c`, `test_ill_retw`, read by
+  the reviewer). Nothing here relies on it going the other way; a process
+  with a corrupt a0 reaches it, and the IllegalInstruction is that
+  process's.
+- **A `retw` that does not underflow clears the returning frame's
+  WINDOWSTART bit.** `movsp`'s test and the stub's one-bit WINDOWSTART both
+  rest on WINDOWSTART naming live frames only. **[run, by the reviewer on
+  the prototype: WINDOWSTART read at one depth before and after a call two
+  frames deep has returned is the same, `0x0000000b`]**.
 - **`entry as, imm`.** Requires PS.WOE = 1 and EXCM = 0 (otherwise
   undefined; IllegalInstruction on the emulator **[run, §1]**). It writes
   `a(4·CALLINC + 1)` ← the caller's a1 − imm, then WINDOWBASE += CALLINC and
@@ -255,34 +313,43 @@ spilled below the new stack pointer when its turn comes. The user vector
        s32i a0, a1, F_A0        a0 is the one scratch
        rsr  a0, exccause
        bnei a0, 5, 1f
-       j    alloca_exc
+       j    user_alloca
     1: j    trap_entry          a syscall, an interrupt, a fault
 ```
 
 ```
-alloca_exc:                     a1 = frame, user a0 in F_A0
-    s32i  a2, a1, F_A2          a2 scratch, in the frame
-    rsr   a0, ps
-    extui a2, a0, 8, 4
-    slli  a2, a2, 8
-    xor   a0, a0, a2            PS.OWB cleared
-    rsr   a2, windowbase
-    slli  a2, a2, 8
-    or    a0, a0, a2            PS.OWB = this frame's WINDOWBASE
-    wsr   a0, ps                (EXCM stays 1)
-    rsync
-    l32i  a2, a1, F_A0
-    extui a2, a2, 30, 2         n = the caller's call size, in panes
-    l32i  a0, a1, F_A0          user a0 back
-    beqi  a2, 2, 8f
-    beqi  a2, 3, 12f
-    l32i  a2, a1, F_A2          n = 1, or 0: see below
+user_alloca:                    a1 = frame, user a0 in F_A0
+    rsr   a0, windowbase
+    s32i  a0, a1, F_WINDOWBASE  the faulting window's WINDOWBASE, in a
+                                frame word the next trap rewrites
+    mov   a0, a1                the frame's address rides the rotation
     xsr   a1, excsave1          user a1 back, EXCSAVE1 = frame again
-    rotw  -1                    to the caller
-    j     _WindowUnderflow4     fills it; rfwu returns to the movsp
- 8: (the same with rotw -2, j _WindowUnderflow8)
-12: (the same with rotw -3, j _WindowUnderflow12)
+    rotw  -1                    one pane back: the caller's, spilled, so
+                                a0..a3 are dead and free; the faulting
+                                window's a0..a3 are a4..a7
+    l32i  a3, a4, F_WINDOWBASE
+    l32i  a4, a4, F_A0          the faulting window's a0 back
+alloca_fill:
+    rsr   a2, ps
+    extui a1, a2, 8, 4; slli a1, a1, 8
+    xor   a2, a2, a1            PS.OWB cleared
+    slli  a3, a3, 8; or a2, a2, a3
+    wsr   a2, ps; rsync         PS.OWB = the faulting window (EXCM stays 1)
+    bbsi  a4, 31, 1f
+    j     _WindowUnderflow4     n = 1, or 0: see below
+ 1: rotw  -1                    the faulting window's a0 is a8 now
+    bbsi  a8, 30, 2f
+    j     _WindowUnderflow8
+ 2: rotw  -1
+    j     _WindowUnderflow12
 ```
+
+This is the mask ROM's and ESP-IDF's shape (`_xt_alloca_exc`): the scratch
+is the dead pane, so no register of the faulting window is stored anywhere,
+and the size test is a0's bit 31, then bit 30. The kernel vector's Alloca
+(§7.2) enters `alloca_fill` the same way, with the faulting window's a0
+parked in EXCSAVE1 (free in the kernel) instead of the frame and its
+WINDOWBASE read before the rotation.
 
 After the rotation, the underflow handler's a(4n+1) is the faulting frame's
 a1, the old stack pointer the caller was spilled below, which is what a fill
@@ -291,9 +358,9 @@ WINDOWBASE−1, which are dead: the caller is spilled, so every older frame is
 too. `rfwu` sets the caller's WINDOWSTART bit, returns WINDOWBASE to PS.OWB
 and re-executes the `movsp`, which now finds a live caller.
 
-n = 0 occurs only in a thread's first frame, whose a0 is the 0 the start
-state gives it (§5); that frame was entered as if by `call4`, so 0 is read as
-1. Any other frame with n = 0 has a corrupt a0, and the fill reads that
+n = 0 reaches the call4 branch. With the start state's a4 (§5) a thread's
+first frame has a0 = 0x7FFF_FFFC, whose top bits say call4, so no valid
+frame has n = 0; a frame that does has a corrupt a0, and the fill reads that
 process's own stack.
 
 **[run]**: `windowed_process`'s alloca test calls `holder`, which holds four
@@ -304,6 +371,8 @@ the buffer, runs a 10-deep call12 chain (spilling again, now below the new
 stack pointer), and checks the buffer; `holder` then checks its four values.
 The `alloca` mutant (cause 5 sent to the ordinary trap path) ends the
 process with `cause=0x00000005` at the `movsp`, so the exception is taken.
+`windowed_alloca` (§10) adds the other two sizes and the first frame, each
+held by its own mutant.
 
 ---
 
@@ -394,7 +463,7 @@ renames the old a12..a15 as a0..a3.
     l32i a2, F_LCOUNT; wsr lcount; isync          as today
     l32i a2, F_WINDOWSTART; wsr a2, windowstart
     wsr  a1, excsave1                   the frame rides the rename here
-    l32i a2, F_WINDOWBASE; addi a2, a2, 12; extui a2, a2, 0, 4
+    l32i a2, F_WINDOWBASE; addi a2, a2, 12  WINDOWBASE is four bits
     wsr  a2, windowbase; rsync          to the frame's WINDOWBASE + 12
     rsr  a1, excsave1
     l32i a4..a15, a1, F_AR + 144..      panes +13..+15
@@ -422,17 +491,26 @@ Counted on the assembled code, straight-line paths **[run: `count.sh`,
 objdump mis-decodes the padded vector table]**:
 
 ```
-                      main    prototype
-vector to ktrap        50       112
-resume to rfe          37       101
-round trip             87       213     +126 instructions per trap
-.text.vectors (IRAM)  1303 B    1795 B  +492 B of IRAM's 16 KiB
-sos_windowed_call       -       126 B  flash
-frame                 104 B     304 B  per thread; stride 512 either way
+                      main    prototype   build
+vector to ktrap        50       112        112
+resume to rfe          37       101        100
+round trip             87       213        212   +125 instructions per trap
+.text.vectors (IRAM)  1303 B    1795 B    1777 B  +474 B of IRAM's 16 KiB
+sos_windowed_call       -       126 B      135 B  flash, + 9 B its close
+frame                 104 B     304 B      304 B  per thread; stride 512
 ```
 
-Every added instruction is a `s32i`, `l32i`, `rotw`, `mov` or SR access in
-IRAM against the kernel's DRAM; none branches. A window exception costs its
+The build's figures are counted on its assembled `boot.S` (`trap_entry` to
+`callx0` and `sos_resume_frame` to `rfe` from `llvm-objdump`, plus the
+user vector's five) **[run]**. The restore is one shorter than the
+prototype's because the four-bit WINDOWBASE takes the sum mod 16 without a
+mask; the vectors are smaller because the double path parks nothing and the
+Alloca path borrows the caller's dead pane rather than frame words, and the
+kernel vector's Alloca dispatch adds back a little.
+
+Every added instruction on the trap path is a `s32i`, `l32i`, `rotw`, `mov`
+or SR access in IRAM against the kernel's DRAM, apart from the user
+vector's cause test. A window exception costs its
 handler, 5 to 14 instructions, and no kernel entry; an Alloca costs about 25
 plus an underflow handler.
 
@@ -448,6 +526,7 @@ F_PS          0x0005_0030   UM, EXCM (rfe clears it), INTLEVEL 0,
                             WOE = 1, CALLINC = 1, OWB 0
 F_A1          stack_top
 F_A2, F_A6    arg0
+F_A4          0x7FFF_FFFC   a windowed entry's return address
 F_WINDOWBASE  0
 F_WINDOWSTART 1
 ```
@@ -463,11 +542,10 @@ F_WINDOWSTART 1
   (`new_call0_state.console`).
 - **A windowed entry** opens with `entry a1, N`. CALLINC = 1 makes it a
   `call4`ed function: its stack pointer is stack_top − N, WINDOWBASE becomes
-  1, WINDOWSTART 3, its a0 is the old a4 = 0 and its a2 the old a6 = arg0.
-  Pane 0 is a fake caller: a live frame (its WINDOWSTART bit) that the
-  thread never returns to (its own `retw` has n = 0, an IllegalInstruction
-  **[read]**, the windowed form of today's "a returning entry faults"), and
-  that is spilled first when the register file wraps, into the 16 bytes
+  1, WINDOWSTART 3, its a0 is the old a4 = 0x7FFF_FFFC and its a2 the old
+  a6 = arg0. Pane 0 is a fake caller: a live frame (its WINDOWSTART bit)
+  that the thread never returns to (below), and that is spilled first when
+  the register file wraps, into the 16 bytes
   below the first frame's stack pointer, which the windowed ABI reserves.
   That spill writes stack_top into the first frame's base save area at
   sp − 12, which is what the first frame's own call8 or call12 spill reads
@@ -479,6 +557,32 @@ F_WINDOWSTART 1
   with CALLINC 0 the first frame's call8 spill reads the zeroed word at
   sp − 12 and faults storing at 0xFFFFFFE0, which is exactly the hazard the
   fake caller removes.
+
+**A windowed entry that returns** executes `retw` with a0 = 0x7FFF_FFFC:
+n = 1, a call4 return and an ordinary one, to pane 0 (filled by an
+Underflow4 first if it was spilled), at 0x7FFF_FFFC under the top two bits
+of the `retw`'s own PC, 01 for flash and IRAM, where nothing is mapped. The
+fetch faults, the windowed form of a call0 entry's return to address 0. With
+a0 = 0, as revision 1 had it, the `retw` is n = 0, undefined in the ISA: the
+emulator raises IllegalInstruction, and a part that did not would land in
+the mask ROM's WindowOverflow4 at 0x4000_0000. **[run: build,
+`windowed_entry_returns`]**: a child that wraps the register file (so pane
+0 is spilled) and returns ends with `SOS: fault instruction-address-error
+cause=0x0000000e epc=0x7ffffffc tval=0x7ffffffc`; `lib_a4` (the a4 store
+dropped) turns it red. A call0 entry sees a4 = 0x7FFF_FFFC where it saw 0,
+which no one-argument entry reads; every call0 case passes.
+
+**An entry point that does not open with `entry`** runs in pane 0 itself, so
+pane 0 is a real frame, and its call size is the size of the calls it makes.
+A call8 or call12 from it makes its spill an Overflow8 or 12, which reads
+its caller's stack pointer at stack_top − 12, a word nothing wrote: the
+reviewer's `so112_noentry8` faults storing at 0xFFFFFFE0 at the first wrap.
+A `call4` makes its spill an Overflow4, which reads nothing (the reviewer's
+`so112_noentry4` returns). So such an entry must make only `call4` calls
+from the frame it starts in, and ABI.md §7d says so; `register_file_clean`'s
+two entries keep to it. Every compiled function opens with `entry`, so only
+hand-written entries are bound, and "no process declares its convention"
+holds for an entry that opens with `entry` or keeps to `call4`.
 
 **Why CALLINC 0 is not an option.** With CALLINC 0 `entry` does not rotate
 and the first frame has no caller, so the word its call8 or call12 spill
@@ -499,25 +603,32 @@ from one that does not take the load. Anything else, including the same
 fault with PS.UM = 0 (the kernel's own windowed call, §7), is a kernel bug.
 
 ```
-0x3C0: wsr  a0, excsave2        two scratch registers; no level-2 or -3
-       wsr  a2, excsave3        interrupt is used, so their EXCSAVEs are free
-       j    double_entry
+0x3C0: rsr  a0, depc            a0 and a2 are scratch: neither path
+       j    double_entry        resumes the context the exception took
 double_entry:
-       rsr  a0, depc
        l32r a2, =_vector_base
        sub  a0, a0, a2
        movi a2, 0x180
        bgeu a0, a2, 1f          not a window handler
        rsr  a0, ps
        bbci a0, 5, 1f           PS.UM clear: the kernel's
-       rsr  a0, excsave2
-       rsr  a2, excsave3
        xsr  a1, excsave1        a1 = the running thread's frame
-       s32i a0, a1, F_A0
        j    trap_entry          an ordinary user trap
     1: movi a2, 0x3C0
        j    vec_fatal           kernel_fault: the machine stops
 ```
+
+Revision 1 parked the window's a0 and a2 in EXCSAVE2 and EXCSAVE3 and put
+them back before the trap entry, and question 5 asked to zero the two
+afterwards, since a later process can `rsr` them. Neither path resumes the
+context the double exception interrupted (the user path ends the process,
+the other stops the machine), so the two registers' values are never needed:
+the build uses a0 and a2 as scratch outright, parks nothing, and leaves
+nothing of the faulting window in any special register, which is what the
+ruling on question 5 asks for, by construction. The frame's a0 and a2 words
+then hold the double path's scratch rather than the window's; nothing reads
+a dead thread's frame. Revision 1's restore lines could be held by no case
+for the same reason: their values reached nothing observable.
 
 EXCSAVE1 is a frame only while user context runs; the UM test is what makes
 it safe to use. **[run]**: with the test removed (`dbl_um`), the kernel's own
@@ -543,10 +654,15 @@ SOS: fault load-access-fault cause=0x0000001c epc=0x421800fc tval=0x10000004
   (epc: the `retw`; tval: UnderflowN's first load, sp - 12)
 ```
 
-**[run: `windowed_spill_fault`, `windowed_fill_fault`]**: a windowed C child
-of a call0 launcher (`death-notify`'s root) faults; the teardown line, the
-launcher's wake with the status word and its `done` follow, and the machine
-ends in `halt pass`.
+**[run: `windowed_spill_fault4`, `8`, `12` and `windowed_fill_fault4`, `8`,
+`12` on the build]**: a windowed C child of a call0 launcher (`death-notify`'s
+root) faults through the handler of each size; the teardown line, the
+launcher's wake with the status word (`Faulted` << 16, 131072) and its
+`done` follow, and the machine ends in `halt pass`. A fill's first load is
+a0's (sp − 16, tval 0x10000000) through Underflow4 and a1's (sp − 12, tval
+0x10000004) through Underflow8 and 12; a spill's first store is a0's (sp −
+16) through each Overflow. The window-handler bound is held at each slot
+(`bound100`, `bound0c0`, `bound040`, §10).
 
 The dead thread's frame holds the window of the frame being spilled or
 filled, with WINDOWBASE rotated to it and the handler's partial work (an
@@ -563,8 +679,10 @@ resumable state and is never resumed: the process ends.
 function in flash (`.text.sos_windowed_call`):
 
 ```
+l32r a7, closed; l32i a7; bnez a7, refused   the loader has begun: refuse
 addi a1, a1, -64
-s32i a0, a12, a13, a14, a15 -> 0..16     call0's callee-saved and a0
+s32i a12, a13, a14, a15 -> 4..16         call0's callee-saved; a0..a7 are a
+                                         call8 caller's, which the callee keeps
 rsr  a7, ps;          s32i -> 20
 rsr  a7, windowstart; s32i -> 24
 addi a7, a1, 64; addi a8, a1, -16; s32i a7, a8, 4
@@ -580,8 +698,20 @@ callx8 a2
 mov  a2, a10                  the callee's a2
 l32i a7 -> wsr ps; rsync      back to PS 0x0F
 l32i a7 -> wsr windowstart; rsync
-l32i a0, a12..a15; addi a1, a1, 64; ret
+l32i a12..a15; addi a1, a1, 64; ret
+refused: callx0 sos_windowed_call_refused(fn)     never returns
 ```
+
+- **Only before the loader** (question 4): a word in the kernel's `.bss`,
+  set by `sos_windowed_call_close`, which `lib.saw`'s `payload_start` (the
+  loader's first read of the root image) calls. Once it is set the stub
+  calls `sos_windowed_call_refused(fn)`, a Saw function in `lib.saw` that
+  prints `SOS-S3: kernel bug: windowed call to 0x... after the loader` and
+  stops the machine with the core's `KernelBug` status, 6, before `fn` runs.
+  The check is in the stub, so no caller can skip it. **[run, build:
+  `rom_call_refused`]**: a CRC before `hal.payload_start()` and the refusal
+  after it; the `lib_close` mutant (the close call dropped) and every line of
+  the check are red.
 
 - **Masking**: INTLEVEL stays 15 throughout, so no interrupt is taken during
   the ROM call; the stub writes PS only to set WOE and back **[run]**.
@@ -590,11 +720,18 @@ l32i a0, a12..a15; addi a1, a1, 64; ret
   kernel's WINDOWSTART after a trap is the user's (§4.3) and a stale bit
   would make the callee's first reference spill a frame that does not
   exist. **[run]**: `rom_call` sets every WINDOWSTART bit, then calls the
-  ROM again, and gets the same CRC.
+  ROM again, and gets the same CRC. The stub puts the WINDOWSTART it found
+  back afterwards; nothing in the kernel reads it while WOE is 0 and every
+  resume loads the thread's, so nothing depends on the restore, but it is
+  observed: `rom_call` reads WINDOWSTART after the dirty call and asserts
+  `0x0000ffff`, and `stub_wsr4` (the restore dropped) is red.
 - **Registers**: `callx8` makes the callee's window this frame's a8..a23, so
   the callee clobbers a8..a15; a12..a15 are call0 callee-saved and are
   restored. The 48 registers outside the kernel's window are clobbered, and
-  the kernel keeps nothing there; the next resume reloads all 64.
+  the kernel keeps nothing there; the next resume reloads all 64. **[run,
+  build]**: `rom_call`'s `wtest_hold` keeps a value in each of a12..a15
+  across a callee that writes its a4..a7 (the stub's a12..a15) and reports
+  none lost; each of the four restore lines dropped is red, a12's included.
 - **Stack**: the ROM function runs on the kernel stack below the stub's 64
   bytes. The ROM's own `.stack_pro` is not used.
 - **The return**: `retw` makes PC[31:30] the caller's, so the stub must sit
@@ -612,6 +749,22 @@ mutant (no a1 − 12 word) stops the kernel at the double vector with
 EXCVADDR 0xFFFFFFE1. A fault there is the kernel's (§6.1), and
 `rom_spill_fault` shows it: `SOS-S3: kernel fault vector=0x000003c0
 exccause=0x0000001d ... excvaddr=0x10000000 depc=0x40378480`.
+
+**An Alloca exception under the stub** (a windowed callee's `movsp` with its
+caller spilled) arrives at the kernel vector, since PS.UM is 0. Revision 1
+stopped the machine there. The build handles it: the kernel vector parks
+the faulting window's a0 in EXCSAVE1 (free in the kernel: the trap entry
+has stored the user a1 it carried, and every resume writes it again), and
+`kernel_alloca` reads WINDOWBASE, rotates one pane back and joins the user
+path's `alloca_fill` (§3.6). Making it impossible by construction was not
+open: an Alloca needs only a callee that spills its caller and then moves
+its stack pointer, and the stub cannot bound how deep a callee nests. The
+PLL's ROM functions execute no `movsp` (the reviewer's scan), so they do
+not reach it either way. **[run, build: `rom_call`]**: `wtest_alloca12`,
+reached through the stub, holds a3..a11 across a call12 to a frame that
+spills every older frame, the stub's own included, and then executes
+`movsp`; every value comes back. Each line of the kernel vector's dispatch
+and of `kernel_alloca` is red when dropped.
 
 The stub does not also need to guarantee no overflow, but the PLL's calls
 cannot overflow anyway. From the ROM ELF's disassembly and the initial phy
@@ -720,71 +873,135 @@ more.
 
 ## 10. The cases
 
-All in the S3 smoke; all run on the emulator except where marked. The
-fixture packages are C (`tests/xtensa-windowed*`), plus kernel tests in
-`tests/xtensa/`.
+All in the S3 smoke and run on the emulator. The fixture packages are C and
+assembly (`tests/xtensa-windowed*`; eight children share
+`tests/xtensa-windowed-child/`'s sources, each package's linker script
+choosing the act), plus kernel tests and payloads in `tests/xtensa/`.
+**[run, build]**: every case passes, in the gate after each commit.
 
 ```
-case                  holds                                 forced by
-windowed_process      start state (ps/wb/ws asserted);      depth 40 > 64/N
-                      overflow+underflow at call4/8/12;     registers;
-                      syscall from depth 30 through the     a call before the
-                      windowed stub, status and value       alloca that spills
-                      checked; movsp with caller spilled;   its caller; spins
-                      two windowed threads switched deep    that end only
-                      in chains; a tick between callN and   when the other
-                      entry (call8 and call12)              thread has run
-windowed_spill_fault  a spill to an unmapped address ends   sp set by hand,
-                      only that process, with the store's   then a chain that
-                      reason; its launcher goes on          wraps the file
-windowed_fill_fault   the same for a fill (the load's)      spill, return,
-                                                            sp by hand, retw
-rom_call              the kernel calls the ROM's crc32_le   a 24-deep chain
-                      ("123456789" -> 0xcbf43926), a        from the kernel;
-                      windowed chain deep enough to         WINDOWSTART set
-                      overflow from the kernel, and the     to all ones
-                      ROM again after a dirty WINDOWSTART
-rom_spill_fault       a spill fault under the kernel's      sp set by hand
-                      call stops the machine at 0x3C0
-every existing case   call0 unchanged: consoles identical   -
-                      to main's but for host time and
-                      code addresses
+case                    holds                                forced by
+windowed_process        start state (ps/wb/ws asserted);     depth 40 > 64/N
+                        overflow+underflow at call4/8/12;    registers; a call
+                        syscall from depth 30 through the    that spills the
+                        windowed stub; movsp under a call8   caller before the
+                        caller; two windowed threads         alloca; spins that
+                        switched deep in chains; a tick      end only when the
+                        between callN and entry (call8,      other thread has
+                        call12)                              run
+windowed_alloca         the Alloca exception in a first      a wrap of the file
+(reviewer's ask 3)      frame and under call4, call8 and     before each movsp;
+                        call12 callers holding every         one callee wraps
+                        register they own                    again after it, one
+                                                             returns at once
+register_file_clean     a thread's first instructions find   a thread that filled
+                        every register zero but a1, a2, a4   all 64 and exited
+                        and a6, each the start state's       from the slot the
+                                                             probe reuses; a
+                                                             filler that hands
+                                                             the probe the CPU
+windowed_child_exit     a windowed child exits from depth    death-notify's call0
+                        30 beside a call0 Saw root, which    root waits on it
+                        wakes with status 65541 and ends
+windowed_entry_returns  a windowed entry that returns        a wrap first, so
+                        faults on fetch at 0x7ffffffc        pane 0 is spilled
+windowed_spill_fault4,  a spill below 0x10000010 through     sp set by hand; the
+  8, 12 (ask 4)         each overflow handler ends only      size of the call
+                        that process, store-access-fault,    into the frame that
+                        tval 0x10000000; its launcher        spills picks the
+                        goes on                              handler
+windowed_fill_fault4,   the same for a fill through each     a wrap, then sp by
+  8, 12 (ask 4)         underflow handler, load-access-      hand and `retw`
+                        fault, tval 0x10000000 (call4) or
+                        0x10000004
+excsave_fault           a double exception with PS.UM = 1    a payload writes
+                        outside the window handlers stops    EXCSAVE1 = 0x10000000
+                        the machine at 0x3C0                 and traps
+rom_call (U3, ask 5)    the ROM's crc32_le; the phy table;   a 24-deep chain;
+                        a chain that spills and fills the    wtest_hold's four
+                        stub's frame; a12..a15 held; four    values; a callee
+                        arguments; PS inside and after; an   that spills the stub
+                        Alloca under the stub; the chain     and then movsp; a
+                        and the Alloca again from            call0 helper that
+                        WINDOWBASE 1; WINDOWSTART all ones   rotates the kernel's
+                        before a call and after it           window one pane
+rom_spill_fault         a spill fault under the stub stops   sp set by hand
+                        the machine at 0x3C0
+rom_call_refused (U3)   a call after hal.payload_start()     the loader's first
+                        stops the machine, status 6, before  call, made by hand
+                        the callee runs
+every existing case     call0 unchanged: consoles identical  -
+                        to main's but for host time and
+                        code addresses (§11a)
 ```
 
 `windowed_process` has `tick` on, which the thread rounds need. The mixed
-case the issue asks for (a windowed and a call0 process side by side) is the
-two fault cases: a call0 Saw launcher and a windowed C child. A case with a
-call0 and a windowed process both running to completion is cheap to add
-(`death-notify`'s root launching a windowed child that exits) and is the
-first thing the build should add (U2).
+case the issue asks for is `windowed_child_exit` and the six fault cases: a
+call0 Saw launcher (`death-notify`'s root, which gains an S3 section) and a
+windowed C child.
 
-**Mutants, each run [run: `mutants.txt`]**:
+**Mutants [run, build].** Every new or changed instruction line of the
+handlers, the user, kernel and double vectors, the double path, the Alloca
+paths, the 64-register entry and restore and the stub was replaced by a
+`nop` (a label kept), one at a time, and the cases run: red, the source put
+back byte for byte (its sha256 checked), green. The value mutants are the
+design's thirteen (`save48`/`load48` as every line of `SAVE12` and
+`LOAD12`, each a register in all four groups; `ws`, `wb`, `of4`, `of8`,
+`of12`, `alloca`, `a6`, `callinc`, `callinc_restore`, `stub12`, `dbl_um`),
+the reviewer's (`dbl_100` as `bound100`, `alloca_4`/`alloca_12` as
+`af_size4as8`/`af_size12as8`, the underflow swaps as every underflow line,
+`stub_a12`..`stub_a15`, `stub_ws`, `stub_ps`, `stub_wsback`), and new ones
+(`bound0c0`, `bound040`, `af_size8as4`, `rs_wb0`, `lib_woe0`, `lib_a4`,
+`lib_ws`, `lib_words26`, `lib_close`, `lib_refused_exit`). The whole table,
+is `build/mutation-table.txt` beside this file (the logs are in
+`build/logs-*`); the summary, by the final source:
 
 ```
-mutant           change                                result
-save48           a9 of each 3-pane group not saved     red (fault at start)
-load48           ... not loaded                        red
-ws               WINDOWSTART not restored              red (thread rounds)
-wb               WINDOWBASE restored as 0              red
-of4              overflow4 swaps a2/a3 slots           red (chain4)
-of8              overflow8 swaps a5/a6 extra slots     red (chain8)
-of12             overflow12 swaps a9/a10 extra slots   red (chain12, alloca)
-alloca           cause 5 sent to the trap path         red (cause 5 at movsp)
-a6               arg0 only in a2                       red
-callinc          start PS with CALLINC 0               red (spill at
-                                                       0xFFFFFFE0)
-callinc_restore  CALLINC forced to 1 on resume         red (pre-entry rounds)
-stub12           stub writes no a1 - 12 word           red (rom_call)
-dbl_um           double path ignores PS.UM             red (rom_spill_fault,
-                                                       once DEPC and EXCVADDR
-                                                       are asserted)
+group                              mutants  red  survive
+the six window handlers               58     58   0
+user, kernel and double vectors,      23     23   0  (dbl_bbci1 is red
+  double path, handler bound                           with rom_spill_fault,
+                                                       commit 2)
+Alloca: user, fill, kernel            30     29   1  af_rsync1
+entry: WB/WS save, groups, SAVE12     28     28   0
+restore: WS, WB, groups, LOAD12,      34     33   1  rs_rsync1
+  callinc_restore
+start state and frame (lib.saw)        8      8   0
+stub, its close, the refusal          48     45   3  stub_rsync1..3
 ```
 
-`of4` survived a first version of the chains whose answer was symmetric in
-a2 and a3; the chains now answer seed + (depth << 16), and it is red. The
-underflow handlers have no mutant of their own: a mutant that swaps two
-slots in an overflow handler is the same defect seen from the other side,
-and the fills are checked by every chain's values on the way back out.
+Six more were run on lines the build then removed (below), seven on
+`_start`'s reordered lines, and a control (`none`, an unchanged file) that
+survives.
+
+The survivors are the `rsync` after a `wsr` (to PS, WINDOWBASE or
+WINDOWSTART) before a dependent instruction: the ISA requires the
+synchronisation and the emulator does not model the hazard, so no emulator
+case can hold one. Mutants that survived at first and changed the build:
+`dbl_xsr1` (a double path that put a1 back itself: a trap entry that saved
+into the dying window's stack still reported the right fault; the path now
+jumps to the user vector, whose `xsr` every trap runs); `dbl_movi1` and
+`dbl_bgeu1` (the window-handler bound: held once `excsave_fault` gave a
+double exception with PS.UM = 1 outside the handlers); `af_bbsi1`,
+`af_bbsi2`, `af_j2` (a fill of the wrong size, masked because the callee's
+second wrap re-spilled the stray pane: held once `windowed_alloca`'s second
+callee returns straight after its `movsp`); `rs_extui1` (a mask the four-bit
+WINDOWBASE makes redundant: dropped); `lib_words26` (`frame_init` zeroing
+only 26 words: held once `register_file_clean`'s probe reuses a slot a
+pattern-filled thread died in); `ka_rsr1`, `stub_sll1`, `stub_movi2`
+(right only because the kernel stood at WINDOWBASE 0: held once `rom_call`
+also calls from WINDOWBASE 1); `stub_rsr1`, `stub_s32i6`, `stub_l32i2`,
+`stub_addi4` (PS saved, put back and kept at INTLEVEL 15: held once
+`rom_call` reads PS inside and after); `stub_mov4` (held once a callee takes
+four arguments); `kvec_bnei1` (held by `trap_fault`); `stub_s32i1`,
+`stub_l32i4`, `close_movi1`, `close_memw1` (lines that did nothing: the
+stub's a0 is a call8 caller's register, which the callee keeps, and the
+close needs no constant or barrier; dropped).
+
+The `_start` lines that write PS, WINDOWSTART and WINDOWBASE were reordered
+(PS first, through a2) and are not trap-path lines; with the 64-register
+restore nothing reads WINDOWSTART or WINDOWBASE before the first resume
+loads them, so only `wsr ps` is held (by the timer cases).
 
 **Board stage** (not runnable here): every case above on the part, and the
 cost (§12).
@@ -832,8 +1049,8 @@ functions; anything on the part.
 - window exception, `entry` and `retw` behaviour where the ISA says
   "undefined" (WOE = 0, n = 0): the emulator raises IllegalInstruction;
   the part may not;
-- EXCSAVE2 and EXCSAVE3 on the part (used by the double path; present on the
-  emulator, run; ESP-IDF's S3 port uses EXCSAVE_2..7 **[read]**);
+- EXCSAVE2 and EXCSAVE3 on the part (revision 1's double path used them;
+  the build's uses neither; ESP-IDF's S3 port uses EXCSAVE_2..7 **[read]**);
 - cycles: the emulator's clock is host time, so every cost here is in
   instructions;
 - that the ROM initializes `.data_phyrom` before direct boot on a real
@@ -842,12 +1059,36 @@ functions; anything on the part.
 
 ---
 
+## 11a. What the build ran
+
+The build is two commits on one branch from `74584aca`: `19b48a4d` (U1 and
+U2) and `2bb7eda7` (U3). Scripts, logs and transcripts are in `build/`
+beside this file.
+
+- The gate, `make sos-test sos-smoke-esp32c3 sos-smoke-esp32s3`, after each
+  commit: 979 passed across riscv32, arm64 and riscv32-flat; the C3 smoke's
+  6; the S3 smoke's 54 after the first commit and 57 after the second, each
+  with the one board-only case not run (`gate1.log`, `gate2.log`).
+- The consoles of main's 41 S3 emulator cases, booted from main's images and
+  from each commit's (`transcripts/main`, `c1`, `c2`; `compare.py`): 33
+  identical; the rest differ only in host-time values (`boot_xtal40`'s and
+  `kill_churn_xtal40`'s `mhz=`, `thread_preempt`'s tick lines, letter
+  interleaving and `interrupts=`, all printed-only) and code addresses moved
+  by the new code (`bus_probe`'s flash-window addresses, the timer cases'
+  tick PCs, `trap_fault`'s EPC1).
+- The mutants of §10 (`mutate.py`, `spec1.py`, `spec2.py`,
+  `mutation-table.txt`).
+- The costs of §4.5, from the assembled `boot.S` (`asm.sh`).
+
+The S3's images all change: the trap path, the frame and the start state
+are in every one.
+
 ## 12. What it costs every thread
 
 - Frame 104 → 304 bytes per thread; `THREAD_FRAME_STRIDE` stays 512, so the
   kernel's frame arena does not grow.
-- +126 instructions per trap, switch and first entry, straight-line in
-  IRAM; +492 bytes of IRAM, +126 bytes of flash.
+- +125 instructions per trap, switch and first entry, straight-line in
+  IRAM; +474 bytes of IRAM, +144 bytes of flash (the stub and its close).
 - `kill_churn` should lose very little. At about 24 traps per round, 200
   rounds is about 4,840 traps, so about 610,000 more instructions. At one to
   three cycles each that is 30 to 90 ms at `rom` (20 MHz) against the 26.05 s
@@ -856,6 +1097,293 @@ functions; anything on the part.
   second of run on the part, another 0.06 to 0.2% at `rom`. This is an
   estimate from instruction counts; the board images of §11 measure it
   against SO-110's numbers.
+
+---
+
+## 12a. The alternative: save the other 48 only at a switch
+
+**Deferred to SO-115.** The owner chose the eager save of §4 for this unit
+(§15, question 7); this section is the alternative considered, kept as the
+starting point for SO-115, which builds the lazy windowed registers with
+lazy FP state on the S3. Nothing below was built here.
+
+The owner asked whether the trap entry should save only the current
+window's sixteen registers, and save the other 48 only when the thread
+leaves the processor, as arm64 does for FP and SIMD state. This section
+evaluates that choice on its own terms, so the owner can pick it instead of
+§4's eager save. Nothing in it has run as a kernel: the worktree this unit
+had was removed, and creating another was refused by the permission
+classifier. So `prototype-lazy.diff` is assembled and counted but has never
+been booted. Each claim says which.
+
+### 12a.1 The arm64 model, and the S3's seams
+
+On arm64 the kernel executes no FP instruction, so a trap disturbs no FP
+register **[read, `hal/arm64/kernel/lib.saw`]**:
+
+- `fp_trap` marks a thread active at its first FP use and loads its area.
+- At every switch, `pick_next` calls `fp_switch_out(outgoing)` while the
+  slot is live; it saves the area if the thread is active.
+- `run_thread` calls `fp_switch_in(incoming)`; it loads the area and enables
+  EL0 access, or disables access.
+
+There is no owner word: after `fp_switch_in` the registers are by
+definition the incoming thread's. The S3 has the same two seams as no-ops
+in `lib.saw`.
+
+The S3 version of the same model treats the other 48 registers, WINDOWBASE
+and WINDOWSTART as switch state:
+
+- **Entry** saves the sixteen and the SRs: today's call0 entry plus the
+  cause test. The kernel then runs on the trapping thread's own window with
+  PS.WOE = 0 and never rotates, so the 48 stay that thread's while it runs
+  **[read: nothing in the call0 kernel, its C or `boot.S` past the entry
+  names a window or rotates]**.
+- **Switch out** (`fp_switch_out`'s place): an assembly leaf saves the
+  outgoing thread's 48 and its WINDOWBASE and WINDOWSTART into its frame.
+  It rotates `rotw 3` four times and back by `rotw 4`, so it returns on the
+  kernel's own window; it must keep a12..a15, which call0 preserves, and its
+  return address, both of which sit in the panes it rotates away from and
+  back to.
+- **Switch in** (`fp_switch_in`'s place): sets a HAL word, "full load
+  pending". It cannot load the 48 itself, because writing WINDOWBASE inside
+  a Saw call would rename the kernel's own registers.
+- **Resume** (`sos_resume_frame`): if the word is set, clear it and load the
+  whole file as §4.4 does (101 instructions). Otherwise restore the sixteen
+  as today.
+
+The pending word starts at 1, because the first entry at boot (`process.saw`,
+`start_process`) calls `frame_init` and `resume_frame` without
+`run_thread`. Those are the only two callers of `resume_frame`; the other is
+`run_thread`'s **[read]**.
+
+`prototype-lazy.diff` is the other shape, L1: an owner word (`sos_live_frame`)
+that the resume path compares with the frame it resumes, saving the owner's
+48 there when the two differ. L1 needs no core seam. L2, the arm64 shape
+above, is what I recommend should lazy be chosen, for the reasons in
+12a.6. Both shapes have the same entry and the same costs to within a few
+instructions.
+
+### 12a.2 Soundness, and every event that touches the state (L2) [read]
+
+The invariant is that every resume of a thread other than the one whose
+registers are in the file is preceded by `fp_switch_in`, and every switch
+away from a live thread is preceded by `fp_switch_out` while its slot is
+live. The core already promises both for FP; this design relies on the same
+promise.
+
+```
+event                     what happens
+trap, same thread back    stays_running: no switch_out or switch_in; short
+                          restore. The 48 never left the file.
+switch (pick_next)        switch_out saves the outgoing thread's 48;
+                          switch_in sets pending; full load
+idle, then the same       switch_out saved; switch_in sets pending; full load
+thread                    of what was just saved: correct, slower
+idle, then another        as a switch
+thread exits, current     PENDING_FREE is freed after switch_out: its 48 are
+                          saved into a slot about to be freed, then the next
+                          thread is fully loaded
+process ends under its    resume_after_death -> run_thread -> switch_in:
+running thread (exit,     full load. No switch_out: the dead thread's 48 are
+fault, kill of own        dropped
+process)
+killed by another         never the running thread, so its 48 are not in
+thread                    the file: the killer's are
+slot freed and reused     frame_init zeroes the frame; the new thread's first
+                          resume is through run_thread: full load of zeros
+first entry at boot       pending starts at 1: full load
+double-exception path     the window is rotated, the thread dies: as "process
+                          ends" above
+Alloca, window handlers   no kernel entry
+ROM stub                  refused once any thread has run (12a.4)
+```
+
+With no owner word there is no stale owner: nothing ever saves into a frame
+except `switch_out` into the outgoing thread's own, live slot.
+
+**A hazard in the core's ordering [read]:** `pick_next` calls
+`fp_switch_out(current_frame)` *after* `idle_until_runnable`. During idle,
+`drain_deaths` can end the outgoing thread's process, if a delivery dooms it.
+The save then writes a slot that may have been freed. That is harmless only
+because frames are kernel memory for good (slab donation is permanent,
+`slab.saw`) and a freed slot is reused only through `frame_init`, which does
+not run in idle. It is the same for lazy FP on arm64 today. The cleaner fix,
+for both, is to call `fp_switch_out` before idling; it is a one-line core
+change that any lazy unit should take.
+
+**Leaks [read]:** a thread runs only after a short restore of itself, or a
+full load of its own frame (zeros at its start). So the 48 another thread
+can see are only ever its own. The kernel never rotates, so no kernel value
+reaches the 48. The ROM stub runs only before the first entry, which is a
+full load. The frame's 48-register area is stale for the running thread;
+nothing reads it, and anything that ever does (a register dump) must force a
+`switch_out` first.
+
+**Attacks, each against the table above [read]:**
+
+- Killing the thread whose registers are in the file from another thread is
+  impossible: the killer is that thread.
+- A thread exiting while current: its 48 are saved into its own slot before
+  the deferred free.
+- A tick inside a window handler: masked, as in §9.
+- Two windowed threads ping-ponging: save 48, load 64, every switch.
+- A call0 thread and a windowed one alternating: the call0 thread's 48 are
+  whatever its frame held (zeros, or what it was switched out with), never
+  the other thread's.
+- A spill fault, then a switch: the faulting thread's process ends, and the
+  switch is through `resume_after_death`, a full load.
+
+### 12a.3 The L1 owner-word shape, for the record [read]
+
+In L1 the resume path keeps `sos_live_frame` and compares it with the frame
+it resumes. Every resume names the resumed frame. Exit, kill and teardown
+need no update, because a later save into a dead slot writes free kernel
+memory. Only `frame_init` must forget a slot it reuses; otherwise the new
+thread would inherit the dead thread's 48, WINDOWBASE and WINDOWSTART
+through the short path. No path in today's scheduler frees a slot and
+initialises it again before the next resume, so no case can turn that guard
+red. L1 avoids the idle-ordering hazard, because it saves in the resume
+path. It shares nothing with FP.
+
+### 12a.4 The ROM stub
+
+`callx8` rotates the file into whatever thread's 48 are there. Under L2 that
+is the last thread run, at any time after the first entry. Two options:
+
+- refuse the call once any thread has run: a HAL word set at the first
+  resume, checked by `hal.windowed_call`, a stop if set (the prototype does
+  this with L1's owner word);
+- save first: a `switch_out` of the current thread, then set pending so the
+  next resume reloads it.
+
+Recommend refusing. It is the same rule as question 4 ("ROM only before the
+loader"), which the phy table in the ROM's RAM already forces.
+
+### 12a.5 Numbers
+
+Counted on `prototype-lazy.diff`'s `boot.S` (L1), assembled
+**[run: assembled, paths counted from the source and objdump]**:
+
+```
+path                         today   eager (§4)   lazy L1
+trap back to the same thread   87       213        93   (52 + 41)
+trap that switches threads     87       213       221   (52 + 169)
+first entry, nothing live       -        101      107   (resume only)
+.text.vectors (IRAM)        1303 B    1795 B     1879 B
+```
+
+L2 is the same apart from the switch's hook calls, about 5 to 10 more
+instructions on a switch and 0 to 3 more on a same-thread return (reading
+the pending word) **[read, estimate]**.
+
+`kill_churn` under QEMU's exception log **[run]**: 4,839 user-mode traps
+over 200 rounds. Consecutive traps change process 402 times, so at least
+8% of traps switch threads (switches between threads of one process are
+not visible in the log). Weighted, a `kill_churn` trap costs about
+0.92 × 93 + 0.08 × 221 ≈ 103 instructions under lazy, against 213 under
+eager and 87 today.
+
+A system call from a driver that returns to the same thread, which is the
+common case, costs 93 instead of 213: 120 instructions saved, about 6 µs
+at the ROM's 20 MHz and 1.5 µs at 80 MHz. In `kill_churn` terms, that
+turns the estimated 0.1 to 0.35% loss of §12 into about 0.01 to 0.05%.
+
+### 12a.6 Sharing with lazy FP (K2)
+
+L2 is the arm64 model, on the same two seams, so K2 slots in beside it:
+
+- `fp_trap` claims the S3's coprocessor-disabled cause (32), marks the
+  thread active, loads its FP and BR area and sets CPENABLE bit 0.
+- `fp_switch_out` saves the 48 always, and the FP area if active.
+- `fp_switch_in` sets pending, and loads FP and enables CPENABLE if active
+  or clears it if not.
+
+The FP area follows the 64-register area in the same frame; 304 + 76 =
+380 bytes, inside the 512-byte stride **[read]**. The two halves share the
+seams, the frame, the core's switch-out ordering fix, and the leak case
+below. They do not share a word: the windows have no "active" bit, because
+every thread has 48 registers.
+
+Building the windowed half now makes the FP half easier. It turns the S3's
+seams from no-ops into real code and proves them under the windowed cases.
+K2 then adds an "if active" branch to each hook and the cause-32 claim.
+Building eager now and lazy later means writing the S3's switch path twice;
+the eager save code is reusable as the `switch_out` leaf, so the second time
+costs little.
+
+### 12a.7 Cases and mutants for lazy
+
+On top of §10's cases, which all stay:
+
+- **`register_file_clean`** (worth having under either choice): a fresh
+  windowed thread rotates through all 16 panes and checks every register is
+  the zero `frame_init` promises; it runs after another process has filled
+  its own file with a pattern.
+- **`lazy_switch_deaths`**: one thread exits while current, then another
+  runs; a process ends under its running thread, then another runs; each
+  survivor checks its registers through a deep chain.
+- `windowed_process`'s thread rounds (ping-pong), `frame_hold` beside a
+  windowed thread (call0 and windowed alternating), and
+  `windowed_spill_fault` (a spill fault, then a switch) as they are.
+
+Mutants, to be run once the prototype boots:
+
+```
+mutant (L2 / L1)                         expected to turn red
+switch_in does not set pending /         thread rounds; register_file_clean
+  owner not updated at a resume
+switch_out does not save the 48 /        thread rounds
+  outgoing 48 not saved
+full load skipped (short path always)    thread rounds; register_file_clean
+pending starts at 0 (L2)                 register_file_clean only: the
+                                         first thread's start state is
+                                         otherwise what the kernel left
+frame_init does not forget (L1)          none: unreachable today (12a.3)
+switch_out after a death in idle         not forceable on the emulator
+  (the ordering hazard)                  without a scratch kernel; read
+```
+
+### 12a.8 Recommendation, and the units under each choice
+
+Lazy (L2) is sound by reading, but none of it has run. It wins about 120
+instructions on every system call that returns to its caller, and loses
+about 8 on a switch. Its correctness rests on the same switch-seam promise
+lazy FP rests on, plus one core ordering fix.
+
+**Recommendation: build eager (§4) now, and build lazy as one unit with
+K2's FP state, in the L2 shape.**
+
+- Eager is the only one of the two that has run: 46 smoke cases and 13
+  mutants.
+- Its cost is under half a percent of `kill_churn`.
+- The radio driver's system-call rate is not yet known.
+- Lazy and K2 share every seam, so they are cheapest and best tested
+  together.
+
+I would choose lazy now instead if the owner wants the per-trap cost gone
+before K2, or if a measured driver turns out to make system calls fast
+enough that 6 µs each matters at the ROM clock.
+
+**Units if eager now** (as §14):
+
+- U1, U2 and U3 as listed;
+- U2 also gains `register_file_clean`;
+- U4 board and U5 windowed Saw unchanged;
+- **U6 (M), later with K2**: L2 lazy windows and lazy FP, the core's
+  switch-out ordering fix, `lazy_switch_deaths` and the lazy mutants. The
+  eager save becomes the `switch_out` leaf.
+
+**Units if lazy now**:
+
+- **U1' (M)**: entry without the 48; `switch_out` leaf, `switch_in`
+  pending word, the resume's two paths; the core's switch-out ordering fix
+  (`kernel/core/sched.saw`); the ROM-refused-after-first-entry rule;
+  ABI.md and the spec sentence. Gated by U2' on the emulator.
+- **U2' (S)**: §10's cases plus `register_file_clean` and
+  `lazy_switch_deaths`, and the lazy mutants.
+- U3, U4 and U5 as before.
+- K2 adds FP to the same hooks.
 
 ---
 
@@ -874,12 +1402,16 @@ anywhere; that hole is today's (§5e) and not widened. **[read]**
 registers, WINDOWBASE and WINDOWSTART from the incoming frame, and
 `frame_init` zeroes all 76 words, so no register of another thread, of the
 kernel's (which runs in panes the restore reloads) or of a ROM call reaches a
-thread. Two special registers do: after a double path, EXCSAVE2 and EXCSAVE3
-hold the faulting window's a0 and a2, and any later process can `rsr` them.
-On the Flat tier memory is readable anyway, but the fix is three
-instructions (zero both once a0 is in the frame) and the build should take it
-(question 5). EXCSAVE1 holds the running frame's address while user code
-runs, as today.
+thread. Revision 1 had two special registers do: its double path parked
+the faulting window's a0 and a2 in EXCSAVE2 and EXCSAVE3, which any later
+process can `rsr`. The build parks nothing there (§6.1, question 5), so no
+special register carries a faulting window's values. EXCSAVE1 holds the
+running frame's address while user code runs, as today. **[run, build:
+`register_file_clean`]**: a thread's first instructions read all 64
+physical registers after another thread filled every one with a pattern and
+handed the processor over by blocking; only a1, a2, a4 and a6 are nonzero,
+each the start state's. With one register of the restore's `LOAD12` dropped,
+the pattern shows through (the `ld_*` mutants, §10).
 
 **Holding off the kernel.** Window handlers and the Alloca path run with
 interrupts masked for at most about 30 instructions and always end in
@@ -938,38 +1470,47 @@ U5    S     windowed Saw cases.                       W0, U2    emulator
 U1 and U2 are one patch in practice (the cases are U1's gate); U3 can be the
 same patch or the first part of SO-113.
 
+**As built (SO-112):** U1 and U2 are the first commit, U3 the second, on
+one branch. U2 has the reviewer's cases (Alloca in a first frame and under
+call4 and call12, a spill and a fill fault at every size) and
+`register_file_clean`; U1's double path parks nothing in EXCSAVE2/3 rather
+than zeroing them (§6.1). The mutants are recorded in §10, not in the cases'
+comments. U4 and U5 are not started; the lazy save is SO-115.
+
 ---
 
-## 15. Questions for the owner
+## 15. Questions for the owner, answered
+
+The owner ruled on Nov 15, every question as recommended but 6, which took
+the reviewer's alternative, and 7, which chose eager now.
 
 1. **Save all 64 registers on every trap, or spill live windows to the
-   user's stack?** Recommend all 64 (built, §4.1): straight-line, no user
-   memory touched by the kernel, and the only way the restore clears every
-   register anyway.
+   user's stack?** *Answered: all 64, on every trap; never spill to a user's
+   stack* (§4.1).
 2. **One start state for both conventions (CALLINC 1, arg0 in a2 and a6),
-   with no declaration in the image?** Recommend yes (§5): it ran for every
-   existing call0 case and the windowed ones.
+   with no declaration in the image?** *Answered: yes* (§5). An entry that
+   does not open with `entry` keeps to `call4` from its first frame
+   (ABI.md §7d).
 3. **Report a fault inside a spill or fill with the access's own cause and
-   the user instruction as the PC** (`store-access-fault`, `epc` the
-   reference that overflowed), or as a distinct reason? Recommend the
-   access's own: it is the bad access the spec already names, and the PC is
-   the thread's.
-4. **The ROM's RAM.** The phy table the PLL's ROM calls read is in the RAM
-   pool processes may be given. Recommend: the kernel calls the ROM only
-   before the loader (in `clock_init`), with a kernel check that refuses a
-   ROM call once a process has been loaded, and the pool stays where it is.
-   Two alternatives: end the pool below the table (0x3FCE_F000, 4 KiB less
-   pool), which protects this path's table and nothing else of the ROM's
-   RAM; or keep every process range out of the ROM's RAM (0x3FCD_7E04 up,
-   which also takes the top of the child region and its stack), about
-   96 KiB of the 256 KiB process range.
-5. **Zero EXCSAVE2/3 after the double path?** Recommend yes: three
-   instructions, no reader of another process's registers left.
-6. **What a windowed entry that returns should be.** Today a call0 entry
-   that returns jumps to 0 and faults; a windowed one executes `retw` with
-   n = 0, undefined in the ISA and an IllegalInstruction on the emulator.
-   Recommend accepting that as the windowed form of the same rule, with a
-   case (cheap) so the part's behaviour is seen at the board stage.
+   the user instruction as the PC, or as a distinct reason?** *Answered: the
+   access's own cause* (§6.2).
+4. **The ROM's RAM.** *Answered: the kernel calls the ROM only before the
+   loader, checked at the stub, and the pool stays where it is* (§7.1): the
+   loader's first read of the root image (`hal.payload_start`) closes
+   `sos_windowed_call`, which refuses a call after that and stops the
+   machine. The reviewer's option of writing the analog I2C master directly
+   and calling no ROM function for the PLL is SO-113's to weigh.
+5. **Zero EXCSAVE2/3 after the double path?** *Answered: yes.* Built by
+   construction instead: the double path parks nothing in them, since
+   neither of its paths resumes the interrupted context (§6.1), so nothing
+   of a faulting window is ever in either.
+6. **What a windowed entry that returns should be.** *Answered: the
+   reviewer's method, not an untrapped `retw`*: the start state's a4 =
+   0x7FFF_FFFC, a call4 return address that faults on fetch (§5), with a
+   case (`windowed_entry_returns`).
+7. **Save the other 48 only when the thread leaves the processor, as arm64
+   saves FP state?** *Answered: eager for now.* The lazy variant (§12a) is
+   deferred to SO-115, to be built with lazy FP state on the S3.
 
 ---
 
@@ -992,3 +1533,6 @@ text.
 - A fault inside a spill is a bad access to the process's own stack, which
   §2.7 and §8's fault rule already cover in arch-free terms. How the kernel
   tells it from its own fault (DEPC, PS.UM) is ABI.md's, §5 and §7.
+
+**As built:** the §5b paragraph changed as above, in the first commit; §5.7
+is unchanged.
