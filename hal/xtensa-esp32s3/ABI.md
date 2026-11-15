@@ -587,7 +587,9 @@ read it back unmasked; the stub aligns the table to 1 KiB anyway.
 What the kernel's table (`kernel/boot.S`) does at each: the six window
 vectors spill and fill a windowed thread's frames in its own context (§7d);
 the user vector takes the Alloca exception (`EXCCAUSE` 5) in place and
-everything else into the trap entry (§7c); the double vector sends a fault a
+everything else into the trap entry (§7c); the kernel vector takes the
+Alloca exception windowed code under `sos_windowed_call` raises (§7g) and
+stops the machine for anything else; the double vector sends a fault a
 window handler took for a user thread through the user vector as that
 thread's own, and stops the machine for any other (§7d); every other vector
 stops the machine through `kernel_fault`.
@@ -902,7 +904,8 @@ first instruction). `LBEG`/`LEND`/`LCOUNT` are saved because user code built
 elsewhere may loop, and `THREADPTR` because it is per-thread by definition.
 MAC16, `BR`, `MISC0..3` and the FPU need saving only if a thread is allowed
 to use them; with `CPENABLE = 0` an FP instruction traps (cause 32), which is
-where a lazy FP switch would hook in. The kernel never writes a user stack.
+where a lazy FP switch would hook in. The trap path never writes a user
+stack; the window vectors (§7d) do, through the thread's own registers.
 
 The entry and exit:
 
@@ -932,9 +935,10 @@ to the kernel vector (and with EXCM=1, to the double vector) and are fatal
 without a mode witness. `LCOUNT` is zeroed on entry because the zero-overhead
 loop is address-triggered: with `LCOUNT` non-zero, kernel code reaching the
 user's `LEND` address (shared code in a flat image) would branch to `LBEG`.
-For the same reason it is restored last, once the frame's PS has put EXCM
+For the same reason it is restored only once the frame's PS has put EXCM
 back: the loop-back is taken only with EXCM clear, so no kernel instruction
-runs with a live count.
+runs with a live count. WINDOWSTART, `EXCSAVE1` and WINDOWBASE are written
+after it, under the same PS.
 
 The window state the thread left needs no care on the way in: the trap
 arrives with PS.EXCM = 1, which turns every window check off, and the entry
@@ -955,13 +959,16 @@ The cost, counted on the assembled code (straight-line, the user vector to
 vector to ktrap                50              112
 resume to rfe                  37              100
 round trip                     87              212
-.text.vectors (IRAM)        1303 B          1762 B
+.text.vectors (IRAM)        1303 B          1777 B
 ```
 
-Every added instruction but the user vector's cause test is a load, a store,
-a `rotw`, a `mov` or a special register access. A window exception costs its
-handler, 5 to 14 instructions, and no kernel entry; an Alloca exception about
-25 and an underflow handler.
+`sos_windowed_call` (§7g) adds 135 bytes of flash and its close 9.
+
+Every added instruction is a load, a store, a `rotw`, a `mov` or a special
+register access, but for the user vector's cause test and the resume's `addi
+a2, a2, 12` and `rsync`. A window exception costs its handler, 5 to 14
+instructions with its `rfwo` or `rfwu`, and no kernel entry; an Alloca
+exception about 25 and an underflow handler.
 
 ### 7d. Windowed threads
 
@@ -1009,10 +1016,15 @@ frame), and the caller's stack pointer is read from the caller's own base
 save area: overflow spills the oldest frame first, so the caller is always
 spilled before its callee.
 
-**The handlers.** The six window vectors (§5a) are those sequences, the mask
-ROM's instruction for instruction: 5 to 14 word accesses through the
-thread's own registers and one `rfwo` or `rfwu`, with PS.EXCM = 1 (so no
-interrupt is taken inside one) and no kernel entry. The Alloca exception is
+**The handlers.** The six window vectors (§5a) are those sequences: 4, 9 or
+13 word accesses through the thread's own registers and one `rfwo` or
+`rfwu`, with PS.EXCM = 1 (so no interrupt is taken inside one) and no kernel
+entry. Four are the mask ROM's instruction for instruction (0x4000_0000 on);
+Underflow8 and Underflow12 differ in order: the ROM's load `a0` first, these
+load `a1` first, before the load that goes through it. A fill from below an
+address that answers no load therefore faults on the `a1` word, the stack
+pointer less 12, and `windowed_fill_fault8` and `12` expect that address
+(tval 0x1000_0004, where the ROM's order gives 0x1000_0000). The Alloca exception is
 handled from the user vector, also without entering the kernel: the
 faulting window's WINDOWBASE and `a0` are kept, the window is rotated one
 pane back into the spilled caller's dead registers, PS.OWB is set to the
@@ -1053,8 +1065,10 @@ entry's return to 0.
 calls from the frame it starts in.** Its first frame is then the pane it
 starts in; a call8 or call12 from there makes that pane a call8 or call12
 frame, whose spill reads its caller's stack pointer at the stack top less
-12, a word nothing wrote, and the process faults at the first wrap of the
-register file. A `call4` makes it a call4 frame, whose spill reads nothing.
+12, a word nothing wrote, at the first wrap of the register file. The
+process faults there if that word is an address that takes no store; if the
+process put a writable address there, the spill writes 16 or 32 bytes
+through it. A `call4` makes it a call4 frame, whose spill reads nothing.
 Every compiled function opens with `entry`, so only hand-written entries are
 bound by this, and "no image declares its convention" holds for an entry
 that opens with `entry` or keeps to `call4`.
@@ -1132,9 +1146,10 @@ instruction it executes runs with level 1 masked:
   WOE 0) before leaving the register window (§2b); `intc_init`, which is
   what first sets an INTENABLE bit, runs much later, from `kmain`.
 - **The whole kernel.** Nothing in the kernel writes PS apart from the trap
-  entry, the restore path and the Alloca path, all in `boot.S`; no C leaf in
-  `sink.c` touches it. So PS stays `0x0F` through `kmain`, the loader,
-  `start_tick` and every `ktrap`.
+  entry, the restore path, the Alloca path and `sos_windowed_call`, all in
+  `boot.S`; no C leaf in `sink.c` touches it. So PS stays `0x0F` through
+  `kmain`, the loader, `start_tick` and every `ktrap`, but for a windowed
+  call (§7g), which sets WOE and keeps INTLEVEL 15, and puts PS back.
 - **The trap entry.** A trap arrives with PS.EXCM = 1, which masks levels up
   to `XCHAL_EXCM_LEVEL` (3, §5d), so the save sequence is not interruptible;
   it then writes PS = `0x0F` before calling `ktrap`.
@@ -1173,6 +1188,62 @@ user mode (the smoke's `timer_tick` takes it at the payload's PC), so the
 scheduler tick preempts a process here: the smoke's `tick_spinner` case
 reaches root's Timer wake past a child that never traps, and runs into the
 harness deadline with the image's "no tick" flag set.
+
+### 7g. The kernel calling a windowed function
+
+`sos_windowed_call(fn, a, b, c, d)` (`kernel/boot.S`) is how the call0
+kernel calls a windowed function, which every mask-ROM function is (§1d): a
+call0 function in flash that `callx8`s `fn` with four arguments and returns
+its `a2`.
+
+- **Only before the loader.** The ROM's functions read tables in the ROM's
+  RAM (0x3FCD_7E04 up, §3b): the phy table `rom_i2c_writeReg` calls through,
+  `rom_phyFuns` at 0x3FCE_F3D4, is inside the RAM pool a case may give to
+  processes (§13a). Called after a process could have written there, a ROM
+  function would jump through a word a process chose. So the loader's first
+  read of the root image (`lib.saw`'s `payload_start`) closes the stub, and a
+  call after that stops the machine before `fn` runs:
+  `SOS-S3: kernel bug: windowed call to 0x... after the loader`, status 6.
+  The check is in the stub, the one way in.
+- **The window state.** For the call the stub's frame is the only live
+  window (WINDOWSTART = 1 << WINDOWBASE): the kernel's WINDOWSTART after a
+  trap is the thread's, and a stale bit would make the callee's first
+  reference spill a frame that does not exist. PS gets WOE = 1 with EXCM = 0
+  (`entry` needs both) and keeps INTLEVEL 15, so no interrupt is taken during
+  the call. Both are written back as they were afterwards; nothing in the
+  kernel reads either while WOE is 0, and `rom_call` observes the
+  WINDOWSTART put back. Every register the stub names lies in its own window
+  or its callee's, where WINDOWSTART has no bit, so no window exception is
+  raised outside the call.
+- **Registers.** `callx8` makes the callee's window the stub's `a8..a23`, so
+  the stub keeps `a12..a15`, which call0 preserves, in its 64-byte frame
+  (`rom_call` holds each across a callee that writes them); its `a0..a7`,
+  its return address among them, are a call8 caller's, which the windowed
+  callee keeps. The 48 registers outside the stub's window are the callee's
+  to clobber, so the kernel keeps nothing there (`rom_call` calls from
+  WINDOWBASE 1 too, with its caller's stack pointer kept in memory), and the
+  next resume reloads all 64.
+- **Spills.** The stub's frame is a call8 window, so the six handlers spill
+  and fill it like any other when the callee nests deep enough: the stub
+  writes its top into the word at its `a1` less 12, which is where its spill
+  reads its caller's stack pointer, so its extra save area is bytes 32..47
+  of its own 64. A fault in such a spill or fill is the kernel's (PS.UM = 0)
+  and stops the machine at the double vector. An Alloca exception under the
+  stub (a callee's `movsp` with its caller spilled) arrives at the kernel
+  vector, which handles it as the user vector does, with the faulting
+  window's `a0` parked in `EXCSAVE1`, which the kernel does not otherwise
+  use. The PLL path's ROM functions nest at most four `callx8` frames below
+  the stub and execute no `movsp`, `rotw`, `rsil`, `waiti` or PS write (read
+  from the ROM's disassembly); neither case is reached by them.
+- **The return.** `retw` takes the top two bits of its target from its own
+  PC, so the stub sits where they are 01, as flash and IRAM both are.
+
+The cases: `rom_call` (the ROM's `crc32_le`; a chain deep enough to spill and
+fill the stub's frame; `a12..a15` held; four arguments; PS inside the call
+and after it; the Alloca exception under the stub; the chain and the Alloca
+again from WINDOWBASE 1; the ROM again with every WINDOWSTART bit set, which
+is set again after), `rom_spill_fault` (a spill fault under the stub stops
+the machine at 0x3C0) and `rom_call_refused`.
 
 ---
 
@@ -1824,12 +1895,12 @@ Every PLL speed needs steps P1 to P7, and 160 and 240 MHz need more:
 
 - **The analog words.** P4 writes six registers of the BBPLL's analog block
   over the chip's internal I2C, and ESP-IDF does it only through the ROM's
-  `rom_i2c_writeReg`/`_Mask`, which are windowed. This kernel is call0 and
-  runs no windowed code of its own (§7d), so it would need either a
-  windowed-call trampoline into the ROM, which must also leave the ROM's
-  function table in its RAM (`l32r a8; l32i a8, a8, 0` at the body's head)
-  intact, or the I2C master's protocol re-derived from the ROM's
-  disassembly, which no ESP-IDF source for this chip states.
+  `rom_i2c_writeReg`/`_Mask`, which are windowed. The call0 kernel reaches
+  them through `sos_windowed_call` (§7g), only before the loader, since the
+  ROM's function table in its RAM (`l32r a8; l32i a8, a8, 0` at the body's
+  head) lies where a process may be given memory; the other way is the I2C
+  master's protocol re-derived from the ROM's disassembly, which no ESP-IDF
+  source for this chip states.
 - **RTC writes.** P1 clears power-down bits in RTC_CNTL_OPTIONS0 (each
   resets to 0, so it may be a no-op that only a read can show), and Q2
   writes SLAVE_PD; both are RTC registers beyond `_start`'s.

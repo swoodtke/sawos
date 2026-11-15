@@ -1,0 +1,23 @@
+// A window spill that faults while the kernel is the caller, on the
+// ESP32-S3: the double exception is the kernel's own and stops the machine at
+// the double vector. `wtest_spill_fault` is in `rom_call.S`.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_windowed_call(fn_addr: UInt, a: UInt, b: UInt, c: UInt,
+                           d: UInt) -> UInt
+    func wtest_spill_fault_addr() -> UInt
+}
+
+/// Unmapped: a store there faults.
+static BAD_STACK: UInt = 0x1000_0010
+
+@export("kmain")
+func kmain() unsafe {
+    console().write_str("SOS rom: spilling below 0x10000010 from the kernel\n")
+    let _ = sos_windowed_call(wtest_spill_fault_addr(), BAD_STACK, 0, 0, 0)
+    console().write_str("SOS rom: the spill did not fault\n")
+    hal.exit_pass()
+}

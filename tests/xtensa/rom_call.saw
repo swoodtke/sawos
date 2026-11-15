@@ -1,0 +1,111 @@
+// The kernel calling windowed code through `sos_windowed_call`, on the
+// ESP32-S3: a mask-ROM function and the windowed functions of `rom_call.S`.
+//
+//   SOS rom: crc32_le=0xcbf43926                the ROM's CRC of "123456789"
+//   SOS rom: phy table at ...                   the ROM's phy function table,
+//                                               as its RAM holds it at boot
+//   SOS rom: deep=0x00181000                    wtest_deep(24, 0x1000), deep
+//                                               enough to spill the stub's
+//                                               own frame and fill it back
+//   SOS rom: a12-a15 lost=0x00000000            each held across a call whose
+//                                               callee writes them
+//   SOS rom: four arguments=0x44332211          each reaches the callee
+//   SOS rom: ps inside=0x0006000f               the callee's PS: WOE set,
+//                                               CALLINC 2, INTLEVEL still 15
+//   SOS rom: ps after=0x0000000f                the kernel's PS, put back
+//   SOS rom: alloca under the stub=0x00001200   `movsp` with its caller
+//                                               spilled, the stub's frame
+//                                               among the spilled
+//   SOS rom: from WINDOWBASE 1, deep=0x00180000 alloca=0x00001200
+//                                               the same two (the chain
+//                                               with seed 0), the stub
+//                                               entered one pane on
+//   SOS rom: dirty windowstart, crc32_le=0xcbf43926 windowstart=0x0000ffff
+//                                               every WINDOWSTART bit set
+//                                               before the call, and the
+//                                               same after it
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_windowed_call(fn_addr: UInt, a: UInt, b: UInt, c: UInt,
+                           d: UInt) -> UInt
+    func wtest_deep_addr() -> UInt
+    func wtest_clobber_addr() -> UInt
+    func wtest_args_addr() -> UInt
+    func wtest_ps_inside_addr() -> UInt
+    func wtest_rotated_call(fn_addr: UInt, a: UInt) -> UInt
+    func wtest_ps() -> UInt
+    func wtest_alloca12_addr() -> UInt
+    func wtest_hold(fn_addr: UInt) -> UInt
+    func wtest_dirty_windowstart()
+    func wtest_windowstart() -> UInt
+    func wtest_crc_input() -> UInt
+}
+
+struct Word { v: UInt32 }
+
+/// `crc32_le(crc, buf, len)` in the mask ROM (its ELF's symbol), windowed.
+static ROM_CRC32_LE: UInt = 0x4004_5C0C
+/// `rom_phyFuns`, the ROM's pointer to its phy function table.
+static ROM_PHY_FUNS: UInt = 0x3FCE_F3D4
+/// The offsets in that table of the functions the PLL's ROM calls reach.
+static PHY_SLOT_COUNT: Int = 6
+static PHY_SLOTS: [UInt; PHY_SLOT_COUNT] = [0x15C, 0x160, 0x164, 0x188, 0x18C,
+                                            0x190]
+
+static DEEP_DEPTH: UInt = 24
+static DEEP_SEED: UInt = 0x1000
+static ALLOCA_SEED: UInt = 0x1200
+
+func word(addr: UInt) unsafe -> UInt {
+    UnsafeMemory<Word, Normal>(addr).v.read() as UInt
+}
+
+func crc() unsafe -> UInt {
+    sos_windowed_call(ROM_CRC32_LE, 0, wtest_crc_input(), 9, 0)
+}
+
+func line(label: String, value: UInt) unsafe {
+    let uart = console()
+    uart.write_str(label)
+    uart.write_hex(value)
+    uart.write_str("\n")
+}
+
+@export("kmain")
+func kmain() unsafe {
+    let uart = console()
+    line("SOS rom: crc32_le=", crc())
+
+    let table = word(ROM_PHY_FUNS)
+    uart.write_str("SOS rom: phy table at ")
+    uart.write_hex(table)
+    for i in 0..PHY_SLOT_COUNT {
+        uart.write_str(" ")
+        uart.write_hex(word(table + PHY_SLOTS[i]))
+    }
+    uart.write_str("\n")
+
+    line("SOS rom: deep=",
+         sos_windowed_call(wtest_deep_addr(), DEEP_DEPTH, DEEP_SEED, 0, 0))
+    line("SOS rom: a12-a15 lost=", wtest_hold(wtest_clobber_addr()))
+    line("SOS rom: four arguments=",
+         sos_windowed_call(wtest_args_addr(), 0x11, 0x22, 0x33, 0x44))
+    line("SOS rom: ps inside=",
+         sos_windowed_call(wtest_ps_inside_addr(), 0, 0, 0, 0))
+    line("SOS rom: ps after=", wtest_ps())
+    line("SOS rom: alloca under the stub=",
+         sos_windowed_call(wtest_alloca12_addr(), ALLOCA_SEED, 0, 0, 0))
+    uart.write_str("SOS rom: from WINDOWBASE 1, deep=")
+    uart.write_hex(wtest_rotated_call(wtest_deep_addr(), DEEP_DEPTH))
+    line(" alloca=", wtest_rotated_call(wtest_alloca12_addr(), ALLOCA_SEED))
+
+    wtest_dirty_windowstart()
+    let dirty = crc()
+    uart.write_str("SOS rom: dirty windowstart, crc32_le=")
+    uart.write_hex(dirty)
+    line(" windowstart=", wtest_windowstart())
+    hal.exit_pass()
+}

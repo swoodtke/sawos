@@ -1,7 +1,8 @@
 /* SOS boot, vectors and trap entry: Xtensa LX7, ESP32-S3 board.
  *
  * The kernel is call0: it runs on one register window with PS.WOE = 0, and
- * rotates the window only on the trap path below. `ktrap` and every other
+ * rotates the window only on the trap path below and in
+ * `sos_windowed_call`, its one way into windowed code. `ktrap` and every other
  * compiled kernel function are ordinary call0 functions (arguments in
  * a2..a7, result in a2, return address in a0, stack in a1). A process may be
  * call0 or windowed (../ABI.md §7d): the window exceptions a windowed thread
@@ -35,6 +36,8 @@
  *      built.
  *   5. `sos_clock_store`, the one store that moves the system clock, which
  *      runs from IRAM (`lib.saw`'s `clock_init`).
+ *   6. `sos_windowed_call`, by which the kernel calls a windowed function
+ *      (one in the mask ROM) before the loader runs.
  *
  * `EXCSAVE1` holds the running thread's frame address while user mode runs.
  * The user vector swaps it with a1, so the frame is the save area at once and
@@ -97,6 +100,7 @@
     .equ PS_UM_BIT,     5
     .equ PS_OWB_SHIFT,  8
     .equ PS_OWB_BITS,   4
+    .equ PS_WOE_SHIFT,  18
 
     /* One past the last window handler's slot, from VECBASE. */
     .equ WINDOW_VECTORS_END, 0x180
@@ -411,7 +415,11 @@ _WindowUnderflow12:
     movi    a2, 0x2C0               /* NMI */
     j       vec_fatal
     .org    0x300
-    movi    a2, 0x300               /* Kernel: a trap taken with PS.UM = 0 */
+    wsr     a0, excsave1            /* Kernel: a trap taken with PS.UM = 0 */
+    rsr     a0, exccause
+    bnei    a0, EXCCAUSE_ALLOCA, 1f
+    j       kernel_alloca
+1:  movi    a2, 0x300
     j       vec_fatal
     .org    0x340
 _UserExceptionVector:
@@ -461,6 +469,17 @@ double_entry:
     j       _UserExceptionVector
 1:  movi    a2, 0x3C0
     j       vec_fatal
+
+/* The Alloca exception in the kernel, which only windowed code reached
+ * through `sos_windowed_call` raises. The faulting window's a0 is in
+ * EXCSAVE1, which the kernel holds nothing in: the trap entry has stored the
+ * user's a1 it carried, and every resume writes it again. */
+kernel_alloca:
+    rsr     a0, windowbase
+    rotw    -1
+    mov     a3, a4                  /* the faulting window's WINDOWBASE */
+    rsr     a4, excsave1            /* and its a0 */
+    j       alloca_fill
 
 /* The Alloca exception from user mode: `movsp` found every pane of its
  * caller's frame spilled. a1 is the frame and the user's a0 is in it. The
@@ -619,7 +638,7 @@ sos_resume_frame:
     l32i    a2, a1, F_PS
     wsr     a2, ps
     isync
-    /* LCOUNT last, with the frame's PS and its EXCM in place: the loop-back
+    /* LCOUNT once the frame's PS and its EXCM are in place: the loop-back
      * at LEND is taken only with EXCM clear, so from here to `rfe` a live
      * count cannot send this code to the user's LBEG, which the entry's own
      * zeroing guards against on the way in. */
@@ -671,6 +690,111 @@ sos_resume_frame:
     l32i    a15, a1, F_A15
     l32i    a1, a1, F_A1            /* user a1 last: it retires the frame */
     rfe
+
+/* ---- calling a windowed function from the kernel ------------------------- */
+
+/* u32 sos_windowed_call(u32 fn, u32 a, u32 b, u32 c, u32 d)
+ *
+ * A call0 function that calls the windowed function `fn` with four
+ * arguments and returns its result: how the call0 kernel reaches a function
+ * in the mask ROM. It is refused once the loader has begun
+ * (`sos_windowed_call_close`): the ROM's functions read tables in the ROM's
+ * RAM, which a process may be given, so after that the call stops the
+ * machine through `sos_windowed_call_refused` (`lib.saw`) before `fn` runs.
+ *
+ * The kernel runs with PS.WOE = 0 and whatever WINDOWSTART the last trap
+ * left. For the call this frame is the only live window (WINDOWSTART = 1 <<
+ * WINDOWBASE), so the callee's first reference spills no frame that does not
+ * exist, and PS.WOE = 1 with EXCM = 0, so `entry` is legal; INTLEVEL stays
+ * 15, so no interrupt is taken. Both are put back as they were afterwards.
+ * `callx8` makes the callee's window this frame's a8..a23, so a12..a15,
+ * which call0 keeps, are saved here; a0..a7 are this frame's own, which the
+ * windowed callee keeps, its return address among them. The 48 registers
+ * outside the kernel's window are the callee's to clobber, and the next
+ * resume reloads all 64.
+ *
+ * This frame is a call8 window to the callee, so it can be spilled and
+ * filled like any other if the callee nests deep enough: the word at a1 - 12,
+ * in the 16 bytes below this frame that the windowed ABI keeps for its
+ * caller's spill, is the stack-pointer slot its own spill reads to find its
+ * extra save area, and names this frame's top, so that area is bytes 32..47
+ * of its 64. A fault in
+ * such a spill or fill is the kernel's (the double vector's PS.UM test); an
+ * Alloca exception under it is handled at the kernel vector.
+ *
+ * `retw` takes the top two bits of its return address from its own PC, so
+ * this function must sit where those bits are 01, as flash and IRAM do. */
+    .section .text.sos_windowed_call, "ax"
+    .literal .Lwindowed_call_closed, sos_windowed_call_closed
+    .literal .Lwindowed_call_refused, sos_windowed_call_refused
+    .align  4
+    .global sos_windowed_call
+    .type   sos_windowed_call, @function
+sos_windowed_call:
+    l32r    a7, .Lwindowed_call_closed
+    l32i    a7, a7, 0
+    bnez    a7, 1f
+    addi    a1, a1, -64
+    s32i    a12, a1, 4
+    s32i    a13, a1, 8
+    s32i    a14, a1, 12
+    s32i    a15, a1, 16
+    rsr     a7, ps
+    s32i    a7, a1, 20
+    rsr     a7, windowstart
+    s32i    a7, a1, 24
+    addi    a7, a1, 64
+    addi    a8, a1, -16
+    s32i    a7, a8, 4
+    rsr     a7, windowbase
+    ssl     a7
+    movi    a8, 1
+    sll     a8, a8
+    wsr     a8, windowstart
+    movi    a8, 1
+    slli    a8, a8, PS_WOE_SHIFT
+    addi    a8, a8, PS_KERNEL
+    wsr     a8, ps
+    rsync
+    mov     a10, a3
+    mov     a11, a4
+    mov     a12, a5
+    mov     a13, a6
+    callx8  a2
+    mov     a2, a10
+    l32i    a7, a1, 20
+    wsr     a7, ps
+    rsync
+    l32i    a7, a1, 24
+    wsr     a7, windowstart
+    rsync
+    l32i    a12, a1, 4
+    l32i    a13, a1, 8
+    l32i    a14, a1, 12
+    l32i    a15, a1, 16
+    addi    a1, a1, 64
+    ret
+1:  l32r    a0, .Lwindowed_call_refused
+    callx0  a0                      /* sos_windowed_call_refused(fn): stops */
+
+/* void sos_windowed_call_close(void): from here on `sos_windowed_call`
+ * refuses. `lib.saw`'s `payload_start`, the loader's first read of the root
+ * image, calls it. Any non-zero word closes the stub; the word's own address
+ * is one. */
+    .section .text.sos_windowed_call_close, "ax"
+    .literal .Lwindowed_call_closed2, sos_windowed_call_closed
+    .align  4
+    .global sos_windowed_call_close
+    .type   sos_windowed_call_close, @function
+sos_windowed_call_close:
+    l32r    a2, .Lwindowed_call_closed2
+    s32i    a2, a2, 0
+    ret
+
+    .section .bss.sos_windowed_call_closed, "aw", @nobits
+    .align  4
+sos_windowed_call_closed:
+    .space  4
 
 /* ---- the clock store (IRAM) ---------------------------------------------- */
 

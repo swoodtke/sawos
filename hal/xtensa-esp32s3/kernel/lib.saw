@@ -36,7 +36,8 @@ import sosrt.{ConsoleSink, console_write, abort_status}
 import imgformat.{SosimgArch, SegFlag}
 
 // The native leaves, all in `sink.c` apart from the resume path, which is the
-// tail of `boot.S`'s trap entry.
+// tail of `boot.S`'s trap entry, and the windowed-call stub's close, beside
+// the stub in `boot.S`.
 extern "C" {
     func sos_resume_frame(frame_addr: UInt)
     func sos_payload_start() -> UInt
@@ -47,6 +48,7 @@ extern "C" {
     func sos_interrupt_read() -> UInt
     func sos_intclear_write(mask: UInt)
     func sos_sim_exit(status: UInt)
+    func sos_windowed_call_close()
 }
 
 // =============================================================================
@@ -745,7 +747,13 @@ public func syscall_return(frame_addr: UInt, status: UInt, value: UInt) unsafe {
 // through `sink.c`.
 
 /// First byte of the appended payload.
+///
+/// This is the loader's first read of the root image, so it is also where
+/// the kernel stops calling the ROM: from here on `sos_windowed_call` refuses
+/// (`boot.S`, ../ABI.md §7g), because the ROM's functions read tables in RAM
+/// a process may be given.
 public func payload_start() -> UInt {
+    sos_windowed_call_close()
     sos_payload_start()
 }
 
@@ -1326,4 +1334,25 @@ public func kernel_slabs_start() -> UInt {
 /// `_sos_slabs_end`. The region holds no static of the kernel's.
 public func kernel_slabs_end() -> UInt {
     sos_kernel_slabs_end()
+}
+
+// =============================================================================
+// The kernel's windowed calls, refused after the loader
+// =============================================================================
+
+/// The status a refused windowed call stops the machine with: the core's
+/// `ExitCode.KernelBug`, which this file cannot name, since the core imports
+/// it.
+static WINDOWED_CALL_REFUSED_STATUS: UInt = 6
+
+/// Stop the machine: the kernel called `sos_windowed_call` (`boot.S`) after
+/// the loader began, when the ROM function `fn_addr` may read RAM a process
+/// was given (../ABI.md §7g). The stub comes here instead of calling it.
+@export("sos_windowed_call_refused")
+public func windowed_call_refused(fn_addr: UInt) unsafe -> Never {
+    console_str("SOS-S3: kernel bug: windowed call to 0x")
+    console_hex(fn_addr)
+    console_str(" after the loader\n")
+    exit_fail(WINDOWED_CALL_REFUSED_STATUS)
+    while { }
 }

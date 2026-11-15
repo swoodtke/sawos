@@ -1,0 +1,34 @@
+// A windowed call once the loader has run is refused, on the ESP32-S3: the
+// loader's first read of the root image (`hal.payload_start`) closes
+// `sos_windowed_call`, and a call after it stops the machine before the
+// callee runs, so no ROM function reads the ROM's RAM once that RAM may be a
+// process's. The CRC before the loader is the control.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_windowed_call(fn_addr: UInt, a: UInt, b: UInt, c: UInt,
+                           d: UInt) -> UInt
+    func wtest_crc_input() -> UInt
+}
+
+/// `crc32_le(crc, buf, len)` in the mask ROM, windowed.
+static ROM_CRC32_LE: UInt = 0x4004_5C0C
+
+func crc_line(label: String) unsafe {
+    let uart = console()
+    let crc = sos_windowed_call(ROM_CRC32_LE, 0, wtest_crc_input(), 9, 0)
+    uart.write_str(label)
+    uart.write_hex(crc)
+    uart.write_str("\n")
+}
+
+@export("kmain")
+func kmain() unsafe {
+    crc_line("SOS rom: before the loader, crc32_le=")
+    let _ = hal.payload_start()
+    console().write_str("SOS rom: the loader has run\n")
+    crc_line("SOS rom: after the loader, crc32_le=")
+    hal.exit_pass()
+}

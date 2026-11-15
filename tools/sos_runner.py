@@ -12815,6 +12815,74 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                 "segment is linked where this board cannot serve it"),
     ]
 
+    kernel_cases += [
+        {
+            # The kernel calling windowed code through `sos_windowed_call`
+            # (ABI.md §7g): the mask ROM's `crc32_le`; a chain deep enough to
+            # spill and fill the stub's own frame; a12..a15 kept across a
+            # callee that writes them; four arguments; the kernel's PS put
+            # back; the Alloca exception under the stub, handled at the
+            # kernel vector; the chain and the Alloca again with the stub
+            # entered at WINDOWBASE 1; and the ROM again with every
+            # WINDOWSTART bit set before the call and the same after it.
+            "name": "rom_call",
+            "src": os.path.join(s3_tests, "rom_call.saw"),
+            "asm": "rom_call.S",
+            "expect_out": [rom, "SOS rom: crc32_le=0xcbf43926",
+                           # The ROM ELF's own initial table, as its RAM
+                           # holds it at boot: the pointer, and the six
+                           # functions the PLL's ROM calls reach.
+                           "SOS rom: phy table at 0x3fcef3d8 0x400354bc "
+                           "0x40055bb8 0x40055bc0 0x400357f8 0x40035818 "
+                           "0x40035880",
+                           "SOS rom: deep=0x00181000",
+                           "SOS rom: a12-a15 lost=0x00000000",
+                           "SOS rom: four arguments=0x44332211",
+                           # WOE, CALLINC 2 (the `callx8`), INTLEVEL 15.
+                           "SOS rom: ps inside=0x0006000f",
+                           "SOS rom: ps after=0x0000000f",
+                           "SOS rom: alloca under the stub=0x00001200",
+                           "SOS rom: from WINDOWBASE 1, deep=0x00180000 "
+                           "alloca=0x00001200",
+                           "SOS rom: dirty windowstart, "
+                           "crc32_le=0xcbf43926 windowstart=0x0000ffff",
+                           halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # A spill that faults with the kernel as the caller is the
+            # kernel's own: it stops at the double vector (0x3C0). The
+            # access is the overflow handler's first store, below `bad`,
+            # and DEPC is that store: WindowOverflow8 is VECBASE + 0x80.
+            "name": "rom_spill_fault",
+            "src": os.path.join(s3_tests, "rom_spill_fault.saw"),
+            "asm": "rom_call.S",
+            "expect_out": [rom, "SOS rom: spilling below 0x10000010 from "
+                           "the kernel",
+                           "SOS-S3: kernel fault vector=0x000003c0 "
+                           "exccause=0x0000001d",
+                           "excvaddr=0x10000000 depc=0x40378480"],
+            "expect_clean_exit": False,
+            "expect_status": 0x80 | (0x3C0 >> 6),
+        },
+        {
+            # Once the loader has begun, a windowed call is refused before
+            # the callee runs, and the machine stops.
+            "name": "rom_call_refused",
+            "src": os.path.join(s3_tests, "rom_call_refused.saw"),
+            "asm": "rom_call.S",
+            "expect_out": [rom, "SOS rom: before the loader, "
+                           "crc32_le=0xcbf43926",
+                           "SOS rom: the loader has run",
+                           "SOS-S3: kernel bug: windowed call to 0x40045c0c "
+                           "after the loader",
+                           "SOS-S3: halt fail code=0x00000006"],
+            "expect_tail": "SOS-S3: halt fail code=0x00000006",
+            "expect_clean_exit": False,
+            "expect_status": 6,
+        },
+    ]
+
     # The process cases: the gate's, by name, each chosen for one thing the
     # board has to get right that no other case here shows.
     #
