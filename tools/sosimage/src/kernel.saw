@@ -293,6 +293,32 @@ func section_offset(data: &Data, wide: Bool, index: Int, what: String) -> Result
     return try le(&data, sh + 16, 4, what) as Int
 }
 
+/// The `count` machine words of the record an object exports as `symbol`,
+/// in order: the object at `path` is a relocatable ELF, 32- or 64-bit.
+public func exported_words(path: String, symbol: String, count: Int) -> Result<Vector<UInt64>, BuildError> {
+    let data = try read_file(path)
+    let what = "the object {path}"
+    let wide = try elf_class(&data, what)
+    let word = if wide { 8 } else { 4 }
+    var wanted = Vector<String>()
+    try! wanted.push(symbol)
+    let symbols = try object_symbols(&data, wide, &wanted, what)
+    guard let found = symbols.get(symbol) else {
+        return BuildError(message: "{what} has no `{symbol}`")
+    }
+    if found.size != count * word {
+        return BuildError(message: "{what}: `{symbol}` is {found.size} bytes; this builder reads {count} words")
+    }
+    let at = try section_offset(&data, wide, found.section, what) + found.value
+    var out = Vector<UInt64>()
+    var w = 0
+    while w < count {
+        try! out.push(try le(&data, at + w * word, word, what))
+        w = w + 1
+    }
+    return move out
+}
+
 /// The symbols of the object named in `wanted`, by name.
 func object_symbols(data: &Data, wide: Bool, wanted: &Vector<String>,
                     what: String) -> Result<Map<String, ObjSymbol>, BuildError> {

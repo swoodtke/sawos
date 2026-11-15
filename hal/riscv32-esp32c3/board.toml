@@ -1,0 +1,47 @@
+# The ESP32-C3, riscv32 (RV32IMC), under Espressif's QEMU: what an image is
+# built against. tools/sosimage/src/board.saw states the format. The
+# kernel executes in place from flash; processes are copied into SRAM.
+format = 1
+
+[board]
+name = "esp32c3"
+triple = "riscv32-unknown-none-elf"
+tier = "isolated"
+hal = "hal/riscv32-esp32c3"
+placement = "copied"
+modules = ["rv32core=../riscv32-common/kernel"]
+cflags = ["-march=rv32imc_zicsr_zifencei", "-mabi=ilp32"]
+
+[emulator]
+program = "qemu-system-riscv32"
+args = ["-machine", "esp32c3", "-nographic"]
+
+# The kernel's .data and .bss (kernel/esp32c3.ld's SRAM region), then the
+# processes' SRAM from root's region to `RAM_TOP`.
+[ram.kernel]
+use = "kernel"
+speed = "fast"
+base = 0x4037_C000
+len = 0x2_A000              # 168 KiB
+
+[ram.sram]
+use = "process"
+speed = "fast"
+base = 0x403A_6000
+len = 0x3_A000              # 232 KiB
+
+[ram.default]
+process = "sram"
+pool = "sram"
+
+# The console: UART0, on interrupt-matrix source 21.
+[devices.UART0]
+type = "esp32c3-uart"
+base = 0x6000_0000
+len = 0x1000
+line = 21
+kernel = true
+
+# SYSTIMER target 0's source, the kernel's tick.
+[lines]
+reserved = [37]

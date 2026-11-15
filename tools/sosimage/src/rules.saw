@@ -1,0 +1,467 @@
+//! The rules every hand-written description follows: a board's
+//! (`board.toml`), a process's (`process.toml`) and an image's. Each is TOML
+//! read through `toml`, and each refuses, by name:
+//!
+//! - a key its format does not define;
+//! - a size or an address that is not a TOML integer in bytes (`"144K"`);
+//! - a size, an address, a tag or a line that the word of the board it is
+//!   read against cannot hold (`fits_word`): a board's own numbers as the
+//!   board is read, a declaration's when it is checked against a board, an
+//!   image's against the board it names;
+//! - a name outside `[A-Za-z][A-Za-z0-9_-]*`, and a reserved word where it is
+//!   reserved: `default`, `fast` and `slow` as RAM range names, `root` as a
+//!   process name;
+//! - a device reference outside its grammar (`parse_ref`);
+//! - a path that is empty, absolute or climbs out with `..` (`check_path`).
+//!
+//! A refusal names the file, then the line and the column:
+//! `hal/riscv32/board.toml: line 3, column 1: ...`. A repeated key, a table
+//! defined twice and a name used as two kinds are `toml`'s refusals, which name
+//! both places; the builder adds the file in front.
+
+import toml.{TomlArray, TomlDoc, TomlError, TomlKind, TomlPosition, TomlTable}
+import sosimage.failure.{BuildError}
+import sosimage.hex.{hex}
+
+/// The one version of each format this builder reads, as its `format` key.
+public static FORMAT_VERSION: Int64 = 1
+
+/// The largest address or length a 32-bit machine word holds, and the end of
+/// its address space.
+static WORD32_MAX: UInt64 = 0xFFFF_FFFF
+static WORD32_END: UInt64 = 0x1_0000_0000
+
+/// A refusal at `at` in `file`.
+public func refused(file: String, at: TomlPosition, message: String) -> BuildError {
+    BuildError(message: "{file}: {at}: {message}")
+}
+
+/// `toml`'s refusal, with the file it was reading in front.
+public func toml_refused(file: String, error: TomlError) -> BuildError {
+    BuildError(message: "{file}: {error}")
+}
+
+/// The document `text` holds; `file` names it in a refusal.
+public func parse_description(text: String, file: String) -> Result<TomlDoc, BuildError> {
+    let doc = try TomlDoc.parse(text) catch {
+        return toml_refused(file, error)
+    }
+    return move doc
+}
+
+/// Refuses a `format` other than the one this builder reads.
+public func check_format(root: &TomlTable, file: String) -> Result<Void, BuildError> {
+    let format = try root.integer("format") catch {
+        return toml_refused(file, error)
+    }
+    if format != FORMAT_VERSION {
+        return refused(file, where_is(&root, "format"),
+                       "this is format {format}; this builder reads format {FORMAT_VERSION}")
+    }
+    return
+}
+
+/// Where `key` was written in `t`, or where `t` was when it is absent.
+public func where_is(t: &TomlTable, key: String) -> TomlPosition {
+    t.position(key) ?? t.defined_at()
+}
+
+/// Whether `list` holds `s`.
+public func holds(list: &Vector<String>, s: String) -> Bool {
+    var i = 0
+    while i < list.len() {
+        if (list.get(i) ?? "").equals(s) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// Refuses the first key of `t` that `known` does not hold, naming it and the
+/// keys `what` takes.
+public func only_keys(t: &TomlTable, known: &Vector<String>, file: String,
+                      what: String) -> Result<Void, BuildError> {
+    let keys = try! t.keys()
+    var i = 0
+    while i < keys.len() {
+        let key = keys.get(i) ?? ""
+        if not holds(&known, key) {
+            return refused(file, where_is(&t, key),
+                           "`{key}` is not a key of {what}, which takes `{known.join("`, `")}`")
+        }
+        i = i + 1
+    }
+    return
+}
+
+/// The string at the required `key`.
+public func text(t: &TomlTable, key: String, file: String) -> Result<String, BuildError> {
+    let s = try t.string(key) catch {
+        return toml_refused(file, error)
+    }
+    return s
+}
+
+/// The string at `key`, or `None` when `t` has no `key`.
+public func optional_text(t: &TomlTable, key: String, file: String) -> Result<String?, BuildError> {
+    let s = try t.optional_string(key) catch {
+        return toml_refused(file, error)
+    }
+    return s
+}
+
+/// The boolean at `key`, or `fallback` when `t` has no `key`.
+public func flag(t: &TomlTable, key: String, fallback: Bool, file: String) -> Result<Bool, BuildError> {
+    let b = try t.optional_boolean(key) catch {
+        return toml_refused(file, error)
+    }
+    return b ?? fallback
+}
+
+/// The integer at the required `key`, which counts something and so is never
+/// negative.
+public func count(t: &TomlTable, key: String, file: String, what: String) -> Result<Int, BuildError> {
+    let n = try t.integer(key) catch {
+        return toml_refused(file, error)
+    }
+    if n < 0 {
+        return refused(file, where_is(&t, key), "`{key}` in {what} is {n}, which is negative")
+    }
+    return n as Int
+}
+
+/// `count`, for a number a `word`-byte machine word must hold: a tag or a
+/// line.
+public func word_count(t: &TomlTable, key: String, word: Int, file: String,
+                       what: String) -> Result<Int, BuildError> {
+    let n = try count(&t, key, file, what)
+    try fits_word(n as UInt64, word, file, where_is(&t, key), "`{key}` in {what}")
+    return n
+}
+
+/// The array of strings at `key`; an empty one when `t` has no `key`.
+public func strings(t: &TomlTable, key: String, file: String) -> Result<Vector<String>, BuildError> {
+    var out = Vector<String>()
+    let present = try t.expect(key, TomlKind.Array) catch {
+        return toml_refused(file, error)
+    }
+    if not present {
+        return move out
+    }
+    if let a = t.array(key) {
+        var i = 0
+        while i < a.len() {
+            let s = try a.string(i) catch {
+                return toml_refused(file, error)
+            }
+            try! out.push(s)
+            i = i + 1
+        }
+    }
+    return move out
+}
+
+/// The array of strings at `key`, each a name and none twice; an empty one
+/// when `t` has no `key`.
+public func name_list(t: &TomlTable, key: String, file: String, what: String) -> Result<Vector<String>, BuildError> {
+    let list = try strings(&t, key, file)
+    var i = 0
+    while i < list.len() {
+        let name = list.get(i) ?? ""
+        let at = element_at(&t, key, i)
+        try check_name(name, file, at, what)
+        var j = 0
+        while j < i {
+            if (list.get(j) ?? "").equals(name) {
+                return refused(file, at, "`{name}` is in `{key}` twice")
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return move list
+}
+
+/// Where element `i` of the array at `key` starts.
+public func element_at(t: &TomlTable, key: String, i: Int) -> TomlPosition {
+    if let a = t.array(key) {
+        return a.position(i) ?? a.defined_at()
+    }
+    where_is(&t, key)
+}
+
+/// The size or the address at the required `key` in `what`: a TOML integer,
+/// in bytes, that a `word`-byte machine word holds. A string is refused as a
+/// suffixed size, whatever it says; one that reads as a number with a `K`, `M`
+/// or `G` suffix is answered with its spelling in bytes.
+public func size(t: &TomlTable, key: String, word: Int, file: String,
+                 what: String) -> Result<UInt64, BuildError> {
+    if t.kind(key) == TomlKind.Text {
+        let s = try text(&t, key, file)
+        return refused(file, where_is(&t, key),
+                       "`{key}` in {what} is the string \"{s}\": a size or an address is a TOML integer in bytes{suffix_hint(s)}")
+    }
+    let v = try t.unsigned(key) catch {
+        return toml_refused(file, error)
+    }
+    try fits_word(v, word, file, where_is(&t, key), "`{key}` in {what}")
+    return v
+}
+
+/// `size` for a key `t` need not have.
+public func optional_size(t: &TomlTable, key: String, word: Int, file: String,
+                          what: String) -> Result<UInt64?, BuildError> {
+    if not t.contains(key) {
+        return None
+    }
+    let v = try size(&t, key, word, file, what)
+    return v
+}
+
+/// Refuses `value`, which `what` names, when a `word`-byte word cannot hold it.
+public func fits_word(value: UInt64, word: Int, file: String, at: TomlPosition,
+                      what: String) -> Result<Void, BuildError> {
+    if word == 4 && value > WORD32_MAX {
+        return refused(file, at, "{what} is {hex(value)}, past what this board's 32-bit word holds ({hex(WORD32_MAX)})")
+    }
+    return
+}
+
+/// `fits_word`, for a number read before its board was known: a
+/// declaration's, checked against the board `board` it is bound to.
+public func fits_board_word(value: UInt64, board: String, word: Int, file: String,
+                            at: TomlPosition, what: String) -> Result<Void, BuildError> {
+    if word == 4 && value > WORD32_MAX {
+        return refused(file, at, "{what} is {hex(value)}, past what the 32-bit word of the board {board} holds ({hex(WORD32_MAX)})")
+    }
+    return
+}
+
+/// Refuses a range of `len` bytes from `base`, which `what` names, that runs
+/// past the end of a `word`-byte address space.
+public func fits_space(base: UInt64, len: UInt64, word: Int, file: String,
+                       at: TomlPosition, what: String) -> Result<Void, BuildError> {
+    let past = if word == 4 {
+        len > WORD32_END - base
+    } else {
+        len > UInt64.max - base
+    }
+    if past {
+        return refused(file, at, "{what} runs from {hex(base)} for {hex(len)} bytes, past the end of this board's address space")
+    }
+    return
+}
+
+/// `": write 0x2_4000"` for a suffixed size that reads as a number of bytes,
+/// and nothing for any other string.
+func suffix_hint(s: String) -> String {
+    if s.len() < 2 {
+        return ""
+    }
+    let unit: UInt64 = if s.ends_with("K") {
+        0x400
+    } else if s.ends_with("M") {
+        0x10_0000
+    } else if s.ends_with("G") {
+        0x4000_0000
+    } else {
+        0
+    }
+    if unit == 0 {
+        return ""
+    }
+    let digits = s.substring(0, s.len() - 1)
+    if not all_digits(digits) || digits.len() > 9 {
+        return ""
+    }
+    guard let n = digits.to_uint() else {
+        return ""
+    }
+    ": write {grouped_hex((n as UInt64) * unit)}"
+}
+
+/// Whether `s` is one or more decimal digits.
+public func all_digits(s: String) -> Bool {
+    if s.is_empty() {
+        return false
+    }
+    var i = 0
+    while i < s.len() {
+        let b = s.byte_at(i)
+        if b < 48 || b > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// `value` in hexadecimal with its digits grouped in fours from the right, as
+/// a description spells an address: `0x2_4000`.
+public func grouped_hex(value: UInt64) -> String {
+    let plain = hex(value)
+    let digits = plain.substring(2, plain.len())
+    var out = StringBuilder()
+    try! out.append("0x")
+    var i = 0
+    while i < digits.len() {
+        if i > 0 && (digits.len() - i) % 4 == 0 {
+            try! out.append("_")
+        }
+        try! out.append(digits.substring(i, i + 1))
+        i = i + 1
+    }
+    out.build()
+}
+
+/// Whether `s` is a name: a letter, then letters, digits, `_` and `-`.
+public func is_name(s: String) -> Bool {
+    if s.is_empty() || not is_letter(s.byte_at(0)) {
+        return false
+    }
+    var i = 1
+    while i < s.len() {
+        let b = s.byte_at(i)
+        if not (is_letter(b) || (b >= 48 && b <= 57) || b == 95 || b == 45) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+func is_letter(b: Byte) -> Bool {
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+}
+
+/// Refuses `s`, which `what` is, when it is not a name.
+public func check_name(s: String, file: String, at: TomlPosition, what: String) -> Result<Void, BuildError> {
+    if not is_name(s) {
+        return refused(file, at, "`{s}` is not a name: {what} is a letter, then letters, digits, `_` and `-`")
+    }
+    return
+}
+
+/// Refuses `s` as a RAM range's name when it is not a name or is reserved:
+/// `default` names the defaults table, and `fast` and `slow` are speeds.
+public func check_ram_name(s: String, file: String, at: TomlPosition) -> Result<Void, BuildError> {
+    try check_name(s, file, at, "a RAM range's name")
+    if s.equals("default") || s.equals("fast") || s.equals("slow") {
+        let why = if s.equals("default") { "`[ram.default]` is the defaults table" } else { "`{s}` is a speed" }
+        return refused(file, at, "`{s}` is reserved and names no RAM range: {why}")
+    }
+    return
+}
+
+/// Refuses `s` as a process's name when it is not a name or is `root`, which
+/// the stock root reports itself under.
+public func check_process_name(s: String, file: String, at: TomlPosition) -> Result<Void, BuildError> {
+    try check_name(s, file, at, "a process's name")
+    if s.equals("root") {
+        return refused(file, at, "`root` is reserved and names no process: the stock root reports itself under it")
+    }
+    return
+}
+
+/// Refuses `path`, which `what` is, when it names no file under the
+/// directory it is relative to: empty, absolute, or with a `..` part. An
+/// image's `sawos:` path is held to the same rule after its prefix.
+public func check_path(path: String, file: String, at: TomlPosition,
+                       what: String) -> Result<Void, BuildError> {
+    let rest = if path.starts_with("sawos:") { path.substring(6, path.len()) } else { path }
+    if rest.is_empty() {
+        return refused(file, at, "{what} is \"{path}\", which names no path")
+    }
+    if rest.starts_with("/") {
+        return refused(file, at, "{what} is \"{path}\", an absolute path: a path is relative to the directory its file names it from")
+    }
+    let parts = try! rest.split("/")
+    var i = 0
+    while i < parts.len() {
+        if (parts.get(i) ?? "").equals("..") {
+            return refused(file, at, "{what} is \"{path}\", which climbs out with `..`: a path stays under the directory it is relative to")
+        }
+        i = i + 1
+    }
+    return
+}
+
+/// A device reference as written:
+///
+///     DEVICE                      the whole device: its window and its line
+///     DEVICE.REGISTER             one 4-byte register
+///     DEVICE.ARRAY[i]             one 4-byte element
+///     DEVICE.ARRAY[i..=j]         elements i to j, inclusive
+///
+/// Whether each form is allowed where it is written, and whether the device,
+/// the register or the array and its elements exist, is the board's to say
+/// (`Board.resolve`).
+public struct DeviceRef {
+    text: String
+    device: String
+    /// The register or the array; empty for the whole device.
+    member: String
+    /// Whether an index follows the member, whether it is a range, and the
+    /// first and last element it names: the same element for a single index.
+    indexed: Bool
+    ranged: Bool
+    first: Int
+    last: Int
+}
+
+/// The reference `text`, at `at` in `file`, read by its grammar. `..` alone is
+/// refused, since the range is inclusive and is written `..=`.
+public func parse_ref(text: String, file: String, at: TomlPosition) -> Result<DeviceRef, BuildError> {
+    let grammar = "`{text}` is not a device reference: write DEVICE, DEVICE.REGISTER, DEVICE.ARRAY[i] or DEVICE.ARRAY[i..=j]"
+    guard let dot = text.index_of(46) else {
+        if not is_name(text) {
+            return refused(file, at, grammar)
+        }
+        return DeviceRef(text: text, device: text, member: "", indexed: false, ranged: false, first: 0, last: 0)
+    }
+    let device = text.substring(0, dot)
+    let rest = text.substring(dot + 1, text.len())
+    if not is_name(device) {
+        return refused(file, at, grammar)
+    }
+    guard let open = rest.index_of(91) else {
+        if not is_name(rest) {
+            return refused(file, at, grammar)
+        }
+        return DeviceRef(text: text, device: device, member: rest, indexed: false, ranged: false, first: 0, last: 0)
+    }
+    let member = rest.substring(0, open)
+    if not is_name(member) || not rest.ends_with("]") {
+        return refused(file, at, grammar)
+    }
+    let inner = rest.substring(open + 1, rest.len() - 1)
+    if inner.contains("..=") {
+        let parts = try! inner.split("..=")
+        let first = parts.get(0) ?? ""
+        let last = parts.get(1) ?? ""
+        if parts.len() != 2 || not all_digits(first) || not all_digits(last) {
+            return refused(file, at, grammar)
+        }
+        return DeviceRef(text: text, device: device, member: member, indexed: true,
+                         ranged: true, first: try index_of_text(first, text, file, at),
+                         last: try index_of_text(last, text, file, at))
+    }
+    if inner.contains("..") {
+        return refused(file, at, "`{text}`: write `..=`, an inclusive range")
+    }
+    if not all_digits(inner) {
+        return refused(file, at, grammar)
+    }
+    let only = try index_of_text(inner, text, file, at)
+    return DeviceRef(text: text, device: device, member: member, indexed: true,
+                     ranged: false, first: only, last: only)
+}
+
+/// The decimal index `digits` of the reference `text`.
+func index_of_text(digits: String, text: String, file: String, at: TomlPosition) -> Result<Int, BuildError> {
+    guard let n = digits.to_int() else {
+        return refused(file, at, "`{text}`: the index {digits} is too large")
+    }
+    return n
+}

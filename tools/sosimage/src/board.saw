@@ -1,0 +1,1090 @@
+//! A board description: `board.toml`, one complete file in each board's HAL
+//! directory. A board that is a variant of another (a build profile) has a
+//! HAL directory and a file of its own; nothing is inherited.
+//!
+//!     format = 1
+//!
+//!     [board]
+//!     name = "riscv32-virt"              the name an image's `board` gives
+//!     triple = "riscv32-unknown-none-elf"
+//!     tier = "isolated"                  or "flat"
+//!     hal = "hal/riscv32"                this file's directory, in the tree
+//!     placement = "copied"               or "in-place", "translated"
+//!     modules = ["rv32core=../riscv32-common/kernel"]
+//!     cflags = ["-march=rv32imac_zicsr", "-mabi=ilp32"]
+//!
+//!     [emulator]
+//!     program = "qemu-system-riscv32"
+//!     args = ["-M", "virt", "-bios", "none"]
+//!
+//!     [ram.kernel]                       one range with use = "kernel"
+//!     use = "kernel"                     or "process"
+//!     speed = "fast"                     or "slow"
+//!     base = 0x8000_0000
+//!     len = 0x20_0000
+//!
+//!     [ram.default]                      the ranges a process and a pool
+//!     process = "ram"                    take when an image names none
+//!     pool = "ram"
+//!
+//!     [flash]                            an in-place board's, and only its
+//!     base = 0x0                         the part's flash
+//!     len = 0x40_0000
+//!     ibus = { base = 0x4200_0000, len = 0x200_0000 }
+//!     dbus = { base = 0x3C00_0000, len = 0x200_0000 }
+//!     root-slot = { base = 0x10_0000, len = 0x8_0000 }
+//!     slots = { base = 0x18_0000, len = 0x8_0000, count = 1 }
+//!
+//!     [types.ns16550]                    the board inputs each instance of
+//!     inputs = ["uartpins"]              the type may fix
+//!
+//!     [devices.UART0]
+//!     type = "ns16550"
+//!     base = 0x1000_0000
+//!     len = 0x1000
+//!     line = 10                          optional
+//!     kernel = true                      optional: the console
+//!     registers.LSR = { offset = 0x14 }  optional, 4 bytes each
+//!     arrays.pad = { offset = 0x4, stride = 4, count = 49 }
+//!     inputs = { uartpins = "config/uart0-pins.saw" }
+//!
+//!     [limits.default]                   optional: an image's `[limits]`
+//!
+//!     [lines]
+//!     reserved = [57]                    lines no device may have
+//!
+//! `modules` are the kernel's extra module paths, `NAME=PATH`. A keyed
+//! module, whose directory each image chooses from several, ends its path in
+//! `*` after the part every choice's name starts with: `s3clock=keys/clock-*`.
+//! A path is relative to the HAL directory, but `hal`, which names that
+//! directory from the tree's top. A size, an address, an offset, a stride or
+//! a line is a TOML integer that the triple's word holds, and a range runs no
+//! further than its address space.
+//!
+//! Beyond the rules of `sosimage.rules`, a board is refused by name for: a
+//! `tier`, `placement`, `use` or `speed` outside its words; not exactly one
+//! kernel range, or a kernel range that is slow; two RAM ranges sharing
+//! bytes; a `[ram.default]` naming a range that is not a process range;
+//! `[flash]` on a board that is not in-place, or its absence on one that is;
+//! a slot range its count does not divide, or a slot range outside the flash;
+//! a type no device has; a board input named by two types; a device's input
+//! that is not one of its type's, or whose value is not a path; a register
+//! and an array of one device under one name; a register or an element
+//! outside its device's window or off a 4-byte boundary; and a device on a
+//! reserved line.
+
+import std.path.{Path}
+import toml.{TomlKind, TomlPosition, TomlTable}
+import sosimage.failure.{BuildError}
+import sosimage.hex.{hex}
+import sosimage.rules.{
+    DeviceRef, check_format, check_name, check_path, check_ram_name, count,
+    fits_space, fits_word, flag, name_list, only_keys, optional_size,
+    parse_description, refused, size, strings, text, toml_refused, where_is,
+    word_count,
+}
+
+/// A named RAM range.
+public struct RamRange {
+    name: String
+    /// `use = "kernel"`; a process range otherwise.
+    kernel: Bool
+    /// `speed = "fast"`; slow otherwise.
+    fast: Bool
+    base: UInt64
+    len: UInt64
+    at: TomlPosition
+}
+
+/// A device the board lists.
+public struct BoardDevice {
+    name: String
+    type_name: String
+    base: UInt64
+    len: UInt64
+    /// Its interrupt line; a device need not have one.
+    line: Int?
+    /// The kernel's own device: the console, bound only when an image names
+    /// it.
+    kernel: Bool
+    at: TomlPosition
+}
+
+/// A register (4 bytes at `offset` into its device) or an array (`count`
+/// 4-byte elements, `stride` bytes apart, from `offset`).
+public struct Member {
+    device: String
+    name: String
+    array: Bool
+    offset: UInt64
+    stride: UInt64
+    count: Int
+    at: TomlPosition
+}
+
+/// A board input one device fixes, and the file it fixes it to.
+public struct DeviceInput {
+    device: String
+    input: String
+    path: String
+    at: TomlPosition
+}
+
+/// A board input a type names.
+public struct TypeInput {
+    type_name: String
+    input: String
+    at: TomlPosition
+}
+
+/// A range given as `{ base, len }`.
+public struct Span {
+    base: UInt64
+    len: UInt64
+}
+
+/// An in-place board's flash: the part's, the two bus windows over it,
+/// root's slot, and the slots the other processes' images take.
+public struct FlashSpec {
+    base: UInt64
+    len: UInt64
+    ibus: Span
+    dbus: Span
+    root_slot: Span
+    slots: Span
+    slot_count: Int
+}
+
+/// A named count, as a `[limits]` or a `[quota]` table states it.
+public struct NamedCount {
+    name: String
+    value: Int
+}
+
+/// The keys of a `[limits]` table: the set numbers, then the derived totals
+/// it may raise, and its `quota` table.
+public func limits_keys() -> Vector<String> {
+    ["processes", "threads", "events", "waiters", "interrupts", "timers",
+     "memories", "iomemories", "pipes", "records", "attachments", "mappings",
+     "quota"]
+}
+
+/// The keys of a quota: a process's `[quota]`, a process entry's `quota`, and
+/// a `[limits]` table's `quota`.
+public func quota_keys() -> Vector<String> {
+    ["threads", "events", "waiters", "timers", "memories", "iomemories",
+     "mappings", "pipes", "handles"]
+}
+
+/// The counts `t` states, each one of `keys`, in file order.
+public func read_counts(t: &TomlTable, keys: &Vector<String>, file: String,
+                        what: String) -> Result<Vector<NamedCount>, BuildError> {
+    try only_keys(&t, &keys, file, what)
+    var out = Vector<NamedCount>()
+    let names = try! t.keys()
+    var i = 0
+    while i < names.len() {
+        let name = names.get(i) ?? ""
+        try! out.push(NamedCount(name: name, value: try count(&t, name, file, what)))
+        i = i + 1
+    }
+    return move out
+}
+
+/// A `[limits]` table: its counts, and its `quota` table's.
+public struct LimitsSpec {
+    totals: Vector<NamedCount>
+    quota: Vector<NamedCount>
+}
+
+@synthesize
+extension LimitsSpec: ExplicitCopy {}
+
+extension LimitsSpec {
+    /// Limits that state nothing.
+    public static func none() -> LimitsSpec {
+        LimitsSpec(totals: Vector<NamedCount>(), quota: Vector<NamedCount>())
+    }
+
+    /// Reads the `[limits]` table `t`, which `what` names.
+    public static func read(t: &TomlTable, file: String, what: String) -> Result<LimitsSpec, BuildError> {
+        let keys = limits_keys()
+        try only_keys(&t, &keys, file, what)
+        var totals = Vector<NamedCount>()
+        var quota = Vector<NamedCount>()
+        let names = try! t.keys()
+        var i = 0
+        while i < names.len() {
+            let name = names.get(i) ?? ""
+            i = i + 1
+            if name.equals("quota") {
+                try expect_table(&t, "quota", file)
+                if let q = t.table("quota") {
+                    let qk = quota_keys()
+                    quota = try read_counts(&q, &qk, file, "`quota` in {what}")
+                }
+                continue
+            }
+            try! totals.push(NamedCount(name: name, value: try count(&t, name, file, what)))
+        }
+        return LimitsSpec(totals: move totals, quota: move quota)
+    }
+}
+
+/// Refuses `key` in `t` when it is present and not a table.
+public func expect_table(t: &TomlTable, key: String, file: String) -> Result<Void, BuildError> {
+    let _ = try t.expect(key, TomlKind.Table) catch {
+        return toml_refused(file, error)
+    }
+    return
+}
+
+/// Refuses `key` in `t` when it is absent or not a table.
+public func require_table(t: &TomlTable, key: String, file: String) -> Result<Void, BuildError> {
+    try t.require(key, TomlKind.Table) catch {
+        return toml_refused(file, error)
+    }
+    return
+}
+
+/// What a device reference may name where it is written.
+public enum RefUse {
+    /// A process's device need: the whole device.
+    case Need,
+    /// A `part = true` window: the whole device, an element or a range.
+    case Part,
+    /// A `[[setup]]` write: a register or one element.
+    case Setup,
+    /// A hand-written root's `[rows] devices`: the whole device.
+    case Row
+}
+
+@synthesize
+extension RefUse: Equatable {}
+
+/// What a reference names: a device's whole window, or the bytes of one
+/// register, one element or a range of elements of it.
+public struct Window {
+    device: String
+    base: UInt64
+    len: UInt64
+    /// Whether this is less than the device's whole window.
+    part: Bool
+}
+
+/// A board, as its description states it.
+public struct Board {
+    /// The file, as it was named.
+    file: String
+    /// The HAL directory the file is in.
+    dir: String
+    name: String
+    triple: String
+    tier: String
+    hal: String
+    placement: String
+    modules: Vector<String>
+    cflags: Vector<String>
+    program: String
+    args: Vector<String>
+    /// The triple's machine word, in bytes.
+    word: Int
+    ram: Vector<RamRange>
+    default_process: String
+    default_pool: String
+    flash: FlashSpec?
+    type_inputs: Vector<TypeInput>
+    devices: Vector<BoardDevice>
+    members: Vector<Member>
+    device_inputs: Vector<DeviceInput>
+    /// `[limits.default]`, and whether the board states one.
+    has_limits: Bool
+    limits: LimitsSpec
+    reserved_lines: Vector<Int>
+}
+
+@synthesize
+extension Board: ExplicitCopy {}
+
+/// The machine word of `triple`'s architecture, in bytes, or `None` for one
+/// this builder does not know.
+public func word_of(triple: String) -> Int? {
+    let arch = triple.substring(0, triple.index_of(45) ?? triple.len())
+    if arch.equals("riscv32") || arch.equals("xtensa") || arch.equals("arm") ||
+       arch.equals("thumbv7m") || arch.equals("thumbv7em") {
+        return 4
+    }
+    if arch.equals("aarch64") || arch.equals("riscv64") || arch.equals("x86_64") {
+        return 8
+    }
+    None
+}
+
+/// Refuses `value` at `key` in `t` when it is not one of `words`.
+func one_of(t: &TomlTable, key: String, value: String, words: &Vector<String>,
+            file: String, what: String) -> Result<Void, BuildError> {
+    var i = 0
+    while i < words.len() {
+        if (words.get(i) ?? "").equals(value) {
+            return
+        }
+        i = i + 1
+    }
+    return refused(file, where_is(&t, key),
+                   "`{key}` in {what} is \"{value}\", not one of \"{words.join("\", \"")}\"")
+}
+
+/// `[board]`'s keys, read.
+struct Head {
+    name: String
+    triple: String
+    word: Int
+    tier: String
+    hal: String
+    placement: String
+    modules: Vector<String>
+    cflags: Vector<String>
+    placement_at: TomlPosition
+}
+
+@synthesize
+extension Head: ExplicitCopy {}
+
+/// `[ram]`, read.
+struct RamSet {
+    ranges: Vector<RamRange>
+    process: String
+    pool: String
+}
+
+@synthesize
+extension RamSet: ExplicitCopy {}
+
+/// `[devices]`, read.
+struct DeviceSet {
+    devices: Vector<BoardDevice>
+    members: Vector<Member>
+    inputs: Vector<DeviceInput>
+}
+
+@synthesize
+extension DeviceSet: ExplicitCopy {}
+
+extension Board {
+    /// Reads a board description from its text; `file` names it, and its
+    /// directory is the board's HAL directory.
+    public static func parse(text: String, file: String) -> Result<Board, BuildError> {
+        let doc = try parse_description(text, file)
+        borrow let root = doc.root() {
+            return Board.read(&root, file)
+        }
+    }
+
+    /// Reads a board description's top-level table.
+    public static func read(root: &TomlTable, file: String) -> Result<Board, BuildError> {
+        let top_keys: Vector<String> = ["format", "board", "emulator", "ram", "flash",
+                                        "types", "devices", "limits", "lines"]
+        try only_keys(&root, &top_keys, file, "a board description")
+        try check_format(&root, file)
+
+        try require_table(&root, "board", file)
+        var head = Head(name: "", triple: "", word: 0, tier: "", hal: "", placement: "",
+                        modules: Vector<String>(), cflags: Vector<String>(),
+                        placement_at: root.defined_at())
+        if let b = root.table("board") {
+            head = try read_head(&b, file)
+        }
+        let word = head.word
+
+        try require_table(&root, "emulator", file)
+        var program = ""
+        var args = Vector<String>()
+        if let e = root.table("emulator") {
+            let emulator_keys: Vector<String> = ["program", "args"]
+            try only_keys(&e, &emulator_keys, file, "[emulator]")
+            program = try text(&e, "program", file)
+            try e.require("args", TomlKind.Array) catch {
+                return toml_refused(file, error)
+            }
+            args = try strings(&e, "args", file)
+        }
+
+        var reserved_lines = Vector<Int>()
+        try expect_table(&root, "lines", file)
+        if let l = root.table("lines") {
+            reserved_lines = try read_lines(&l, word, file)
+        }
+
+        try require_table(&root, "ram", file)
+        var ram = RamSet(ranges: Vector<RamRange>(), process: "", pool: "")
+        if let r = root.table("ram") {
+            ram = try read_ram(&r, word, file)
+        }
+
+        var flash: FlashSpec? = None
+        try expect_table(&root, "flash", file)
+        if let f = root.table("flash") {
+            if not head.placement.equals("in-place") {
+                return refused(file, f.defined_at(),
+                               "[flash] is an in-place board's, and this board's placement is \"{head.placement}\"")
+            }
+            flash = try read_flash(&f, word, file)
+        } else if head.placement.equals("in-place") {
+            return refused(file, head.placement_at,
+                           "an in-place board describes its flash, and this board has no [flash]")
+        }
+
+        var type_inputs = Vector<TypeInput>()
+        try expect_table(&root, "types", file)
+        if let ts = root.table("types") {
+            type_inputs = try read_types(&ts, file)
+        }
+
+        var devices = DeviceSet(devices: Vector<BoardDevice>(), members: Vector<Member>(),
+                                inputs: Vector<DeviceInput>())
+        try expect_table(&root, "devices", file)
+        if let ds = root.table("devices") {
+            devices = try read_devices(&ds, word, &type_inputs, &reserved_lines, file)
+        }
+        if let ts = root.table("types") {
+            let names = try! ts.keys()
+            var y = 0
+            while y < names.len() {
+                let type_name = names.get(y) ?? ""
+                y = y + 1
+                var used = false
+                var d = 0
+                while d < devices.devices.len() {
+                    if (devices.devices.get(d)!).type_name.equals(type_name) {
+                        used = true
+                    }
+                    d = d + 1
+                }
+                if not used {
+                    return refused(file, where_is(&ts, type_name),
+                                   "[types.{type_name}] is a type no device of this board has")
+                }
+            }
+        }
+
+        var limits = LimitsSpec.none()
+        var has_limits = false
+        try expect_table(&root, "limits", file)
+        if let l = root.table("limits") {
+            let limit_tables: Vector<String> = ["default"]
+            try only_keys(&l, &limit_tables, file, "[limits]")
+            try require_table(&l, "default", file)
+            if let d = l.table("default") {
+                limits = try LimitsSpec.read(&d, file, "[limits.default]")
+                has_limits = true
+            }
+        }
+
+        let dir = Path(s: file).parent()?.as_string() ?? "."
+        return Board(file: file, dir: dir, name: head.name, triple: head.triple,
+                     tier: head.tier, hal: head.hal, placement: head.placement,
+                     modules: head.modules.copy(), cflags: head.cflags.copy(),
+                     program: program, args: move args, word: word,
+                     ram: ram.ranges.copy(), default_process: ram.process,
+                     default_pool: ram.pool, flash: flash,
+                     type_inputs: move type_inputs, devices: devices.devices.copy(),
+                     members: devices.members.copy(), device_inputs: devices.inputs.copy(),
+                     has_limits: has_limits, limits: move limits,
+                     reserved_lines: move reserved_lines)
+    }
+
+    /// The device named `name`.
+    public func device(&self, name: String) -> BoardDevice? {
+        var i = 0
+        while i < self.devices.len() {
+            if let d = self.devices.get(i) {
+                if d.name.equals(name) {
+                    return d
+                }
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// The RAM range named `name`.
+    public func range(&self, name: String) -> RamRange? {
+        var i = 0
+        while i < self.ram.len() {
+            if let r = self.ram.get(i) {
+                if r.name.equals(name) {
+                    return r
+                }
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// The board inputs of the type `type_name`, in the order its
+    /// `[types.<type>]` lists them.
+    public func board_inputs(&self, type_name: String) -> Vector<String> {
+        var out = Vector<String>()
+        var i = 0
+        while i < self.type_inputs.len() {
+            if let t = self.type_inputs.get(i) {
+                if t.type_name.equals(type_name) {
+                    try! out.push(t.input)
+                }
+            }
+            i = i + 1
+        }
+        move out
+    }
+
+    /// The devices of the type `type_name`, in file order.
+    public func instances(&self, type_name: String) -> Vector<BoardDevice> {
+        var out = Vector<BoardDevice>()
+        var i = 0
+        while i < self.devices.len() {
+            if let d = self.devices.get(i) {
+                if d.type_name.equals(type_name) {
+                    try! out.push(d)
+                }
+            }
+            i = i + 1
+        }
+        move out
+    }
+
+    /// The value the device `device` fixes for the board input `input`.
+    public func device_input(&self, device: String, input: String) -> DeviceInput? {
+        var i = 0
+        while i < self.device_inputs.len() {
+            if let d = self.device_inputs.get(i) {
+                if d.device.equals(device) && d.input.equals(input) {
+                    return d
+                }
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// The device names, for messages.
+    public func device_names(&self) -> String {
+        var names = Vector<String>()
+        var i = 0
+        while i < self.devices.len() {
+            try! names.push((self.devices.get(i)!).name)
+            i = i + 1
+        }
+        names.join(", ")
+    }
+
+    /// What the reference `r`, written at `at` in `file`, names on this
+    /// board where it is used as `use`.
+    ///
+    /// A part (an element or a range of an array) must be a naturally aligned
+    /// power of two of at least `grain` bytes, since it becomes a window of
+    /// its own.
+    public func resolve(&self, r: &DeviceRef, role: RefUse, grain: UInt64, file: String,
+                        at: TomlPosition) -> Result<Window, BuildError> {
+        guard let d = self.device(r.device) else {
+            return refused(file, at, "`{r.text}` names no device of the board {self.name}, whose devices are {self.device_names()}")
+        }
+        if r.member.is_empty() {
+            if role == RefUse.Setup {
+                return refused(file, at, "`{r.text}` is a whole device, and a [[setup]] writes one register: write DEVICE.REGISTER or DEVICE.ARRAY[i]")
+            }
+            return Window(device: d.name, base: d.base, len: d.len, part: false)
+        }
+        guard let m = self.member(d.name, r.member) else {
+            return refused(file, at, "`{r.text}`: {d.name} has no register or array `{r.member}`")
+        }
+        if not m.array {
+            if r.indexed {
+                return refused(file, at, "`{r.text}`: `{m.name}` is a register of {d.name}, not an array")
+            }
+            if role != RefUse.Setup {
+                return refused(file, at, "`{r.text}` is a register, which only a [[setup]] names: {where_whole(role)}")
+            }
+            return Window(device: d.name, base: d.base + m.offset, len: 4, part: true)
+        }
+        if not r.indexed {
+            return refused(file, at, "`{r.text}`: `{m.name}` is an array of {d.name}; name an element, `{r.text}[i]`, or a range, `{r.text}[i..=j]`")
+        }
+        if r.first > r.last || r.last >= m.count {
+            return refused(file, at, "`{r.text}`: an array range is i..=j with i <= j < {m.count}, the count of `{m.name}`")
+        }
+        if role == RefUse.Need || role == RefUse.Row {
+            return refused(file, at, "`{r.text}` is part of a device: {where_whole(role)}")
+        }
+        if role == RefUse.Setup && r.ranged {
+            return refused(file, at, "`{r.text}` is a range, and a [[setup]] writes one register: name one element")
+        }
+        let base = d.base + m.offset + (r.first as UInt64) * m.stride
+        let len = ((r.last - r.first) as UInt64) * m.stride + 4
+        if role == RefUse.Part {
+            if (len & (len - 1)) != 0 || base % len != 0 || len < grain {
+                return refused(file, at, "`{r.text}` is {len} bytes at {hex(base)}, and a part is a naturally aligned power of two of at least {grain} bytes, this board's grain")
+            }
+        }
+        return Window(device: d.name, base: base, len: len, part: true)
+    }
+
+    /// The register or array `name` of the device `device`.
+    public func member(&self, device: String, name: String) -> Member? {
+        var i = 0
+        while i < self.members.len() {
+            if let m = self.members.get(i) {
+                if m.device.equals(device) && m.name.equals(name) {
+                    return m
+                }
+            }
+            i = i + 1
+        }
+        None
+    }
+}
+
+/// What may be written where a whole device is wanted, for a refusal.
+func where_whole(role: RefUse) -> String {
+    match role {
+        case Need -> "a device need that is not `part = true` takes a whole device",
+        case Row -> "[rows] devices names whole devices",
+        case Part -> "a part window takes the device, an element or a range",
+        case Setup -> "a [[setup]] writes a register or one element"
+    }
+}
+
+/// Whether `name` is a module's name: a letter or `_`, then letters, digits
+/// and `_`.
+func is_module_name(name: String) -> Bool {
+    if name.is_empty() {
+        return false
+    }
+    var i = 0
+    while i < name.len() {
+        let b = name.byte_at(i)
+        let letter = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+        if not letter && not (i > 0 && b >= 48 && b <= 57) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Where element `i` of the array at `key` in `t` starts.
+func element_position(t: &TomlTable, key: String, i: Int) -> TomlPosition {
+    if let a = t.array(key) {
+        return a.position(i) ?? a.defined_at()
+    }
+    where_is(&t, key)
+}
+
+/// Whether `input` is a board input of the type `type_name`.
+func is_input_of(inputs: &Vector<TypeInput>, type_name: String, input: String) -> Bool {
+    var i = 0
+    while i < inputs.len() {
+        if let t = inputs.get(i) {
+            if t.type_name.equals(type_name) && t.input.equals(input) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// Refuses `[ram.default]`'s `key` when `name` is not a process range.
+func default_range(ram: &Vector<RamRange>, name: String, file: String, at: TomlPosition,
+                   key: String) -> Result<Void, BuildError> {
+    var i = 0
+    while i < ram.len() {
+        if let r = ram.get(i) {
+            if r.name.equals(name) {
+                if r.kernel {
+                    return refused(file, at, "[ram.default]'s `{key}` is \"{name}\", the kernel's range: a {key} takes a range with use = \"process\"")
+                }
+                return
+            }
+        }
+        i = i + 1
+    }
+    return refused(file, at, "[ram.default]'s `{key}` is \"{name}\", which names no range of [ram]")
+}
+
+/// A device's registers and arrays, appended to `members`: each a name, no
+/// two of one device under one name, each 4-byte aligned and inside the
+/// device's `len`-byte window.
+func read_members(t: &TomlTable, device: String, len: UInt64, word: Int,
+                  members: &var Vector<Member>, file: String, what: String) -> Result<Void, BuildError> {
+    var family = 0
+    while family < 2 {
+        let array = family == 1
+        family = family + 1
+        let key = if array { "arrays" } else { "registers" }
+        try expect_table(&t, key, file)
+        if let group = t.table(key) {
+            let names = try! group.keys()
+            var i = 0
+            while i < names.len() {
+                let name = names.get(i) ?? ""
+                i = i + 1
+                let at = where_is(&group, name)
+                try check_name(name, file, at, "a register's or an array's name")
+                var o = 0
+                while o < members.len() {
+                    let other = members.get(o)!
+                    if other.device.equals(device) && other.name.equals(name) {
+                        return refused(file, at, "{what} names `{name}` twice, as a register and as an array (the other at {other.at})")
+                    }
+                    o = o + 1
+                }
+                try require_table(&group, name, file)
+                if let m = group.table(name) {
+                    try! members.push(try read_member(&m, device, name, array, len, word, key, at,
+                                                      file, what))
+                }
+            }
+        }
+    }
+    return
+}
+
+/// One register or array of a device whose window is `len` bytes.
+func read_member(m: &TomlTable, device: String, name: String, array: Bool, len: UInt64,
+                 word: Int,
+                 key: String, at: TomlPosition, file: String,
+                 what: String) -> Result<Member, BuildError> {
+    let member_what = "`{key}.{name}` in {what}"
+    let member_keys: Vector<String> = if array { ["offset", "stride", "count"] } else { ["offset"] }
+    try only_keys(&m, &member_keys, file, member_what)
+    let offset = try size(&m, "offset", word, file, member_what)
+    var stride: UInt64 = 4
+    var n = 1
+    if array {
+        stride = try size(&m, "stride", word, file, member_what)
+        n = try count(&m, "count", file, member_what)
+        if n == 0 || stride < 4 || stride % 4 != 0 {
+            return refused(file, at, "{member_what} has {n} elements {stride} bytes apart: an array has at least one 4-byte element, a multiple of 4 bytes apart")
+        }
+    }
+    if offset % 4 != 0 || offset > len {
+        return refused(file, at, "{member_what} is at offset {hex(offset)}, off a 4-byte boundary or past the device's {hex(len)} bytes")
+    }
+    let room = (len - offset) / stride
+    if len - offset < 4 || (n as UInt64) - 1 > room || len - offset - ((n as UInt64) - 1) * stride < 4 {
+        return refused(file, at, "{member_what} runs past the device's {hex(len)} bytes")
+    }
+    return Member(device: device, name: name, array: array, offset: offset, stride: stride,
+                  count: n, at: at)
+}
+
+/// An in-place board's `[flash]`.
+func read_flash(f: &TomlTable, word: Int, file: String) -> Result<FlashSpec, BuildError> {
+    let flash_keys: Vector<String> = ["base", "len", "ibus", "dbus", "root-slot", "slots"]
+    try only_keys(&f, &flash_keys, file, "[flash]")
+    let base = try size(&f, "base", word, file, "[flash]")
+    let len = try size(&f, "len", word, file, "[flash]")
+    try fits_space(base, len, word, file, where_is(&f, "len"), "[flash]")
+    let ibus = try read_span(&f, "ibus", false, word, file)
+    let dbus = try read_span(&f, "dbus", false, word, file)
+    let root_slot = try read_span(&f, "root-slot", false, word, file)
+    let slots = try read_span(&f, "slots", true, word, file)
+    var slot_count = 0
+    if let s = f.table("slots") {
+        slot_count = try count(&s, "count", file, "`slots` in [flash]")
+    }
+    if slot_count == 0 || slots.len % (slot_count as UInt64) != 0 {
+        return refused(file, where_is(&f, "slots"),
+                       "`slots` in [flash] is {hex(slots.len)} bytes in {slot_count} slots: a slot range holds at least one slot, each the same length")
+    }
+    try within_flash(root_slot, base, len, file, where_is(&f, "root-slot"), "root-slot")
+    try within_flash(slots, base, len, file, where_is(&f, "slots"), "slots")
+    return FlashSpec(base: base, len: len, ibus: ibus, dbus: dbus, root_slot: root_slot,
+                     slots: slots, slot_count: slot_count)
+}
+
+/// Refuses a slot range that does not lie in the flash.
+func within_flash(span: Span, base: UInt64, len: UInt64, file: String, at: TomlPosition,
+                  key: String) -> Result<Void, BuildError> {
+    if span.base < base || span.base - base > len || span.len > len - (span.base - base) {
+        return refused(file, at, "`{key}` in [flash] runs from {hex(span.base)} for {hex(span.len)} bytes, outside the flash")
+    }
+    return
+}
+
+/// The `{ base, len }` table at `key` in `[flash]`; `slots` also has `count`.
+func read_span(f: &TomlTable, key: String, counted: Bool, word: Int, file: String) -> Result<Span, BuildError> {
+    try require_table(&f, key, file)
+    if let t = f.table(key) {
+        let what = "`{key}` in [flash]"
+        let span_keys: Vector<String> = if counted { ["base", "len", "count"] } else { ["base", "len"] }
+        try only_keys(&t, &span_keys, file, what)
+        let base = try size(&t, "base", word, file, what)
+        let len = try size(&t, "len", word, file, what)
+        try fits_space(base, len, word, file, where_is(&t, "len"), what)
+        return Span(base: base, len: len)
+    }
+    return BuildError(message: "{file}: internal: `{key}` in [flash] vanished")
+}
+
+/// `[board]`.
+func read_head(b: &TomlTable, file: String) -> Result<Head, BuildError> {
+    let board_keys: Vector<String> = ["name", "triple", "tier", "hal", "placement",
+                                      "modules", "cflags"]
+    try only_keys(&b, &board_keys, file, "[board]")
+    let name = try text(&b, "name", file)
+    try check_name(name, file, where_is(&b, "name"), "a board's name")
+    let triple = try text(&b, "triple", file)
+    guard let word = word_of(triple) else {
+        return refused(file, where_is(&b, "triple"),
+                       "`triple` is \"{triple}\", whose architecture's word this builder does not know")
+    }
+    let tier = try text(&b, "tier", file)
+    let tiers: Vector<String> = ["isolated", "flat"]
+    try one_of(&b, "tier", tier, &tiers, file, "[board]")
+    let hal = try text(&b, "hal", file)
+    let placement = try text(&b, "placement", file)
+    let placements: Vector<String> = ["copied", "in-place", "translated"]
+    try one_of(&b, "placement", placement, &placements, file, "[board]")
+    try b.require("modules", TomlKind.Array) catch {
+        return toml_refused(file, error)
+    }
+    let modules = try strings(&b, "modules", file)
+    var m = 0
+    while m < modules.len() {
+        let module = modules.get(m) ?? ""
+        let eq = module.index_of(61) ?? 0
+        if eq == 0 || eq + 1 >= module.len() || not is_module_name(module.substring(0, eq)) {
+            return refused(file, element_position(&b, "modules", m),
+                           "`{module}` in `modules` is not NAME=PATH, a module's name and its directory")
+        }
+        let path = module.substring(eq + 1, module.len())
+        let star = path.index_of(42) ?? path.len()
+        if star < path.len() - 1 || star == 0 {
+            return refused(file, element_position(&b, "modules", m),
+                           "`{module}` in `modules`: a `*` ends a keyed module's path, after the part every key's directory starts with")
+        }
+        m = m + 1
+    }
+    try b.require("cflags", TomlKind.Array) catch {
+        return toml_refused(file, error)
+    }
+    let cflags = try strings(&b, "cflags", file)
+    return Head(name: name, triple: triple, word: word, tier: tier, hal: hal,
+                placement: placement, modules: move modules, cflags: move cflags,
+                placement_at: where_is(&b, "placement"))
+}
+
+/// `[lines]`.
+func read_lines(l: &TomlTable, word: Int, file: String) -> Result<Vector<Int>, BuildError> {
+    let line_keys: Vector<String> = ["reserved"]
+    try only_keys(&l, &line_keys, file, "[lines]")
+    let _ = try l.expect("reserved", TomlKind.Array) catch {
+        return toml_refused(file, error)
+    }
+    var out = Vector<Int>()
+    if let a = l.array("reserved") {
+        var i = 0
+        while i < a.len() {
+            let n = try a.integer(i) catch {
+                return toml_refused(file, error)
+            }
+            if n < 0 {
+                return refused(file, a.position(i) ?? a.defined_at(),
+                               "a reserved line is {n}, which is negative")
+            }
+            try fits_word(n as UInt64, word, file, a.position(i) ?? a.defined_at(),
+                          "a reserved line")
+            try! out.push(n as Int)
+            i = i + 1
+        }
+    }
+    return move out
+}
+
+/// `[ram]`: its ranges, exactly one the kernel's and fast, and its defaults,
+/// each a process range.
+func read_ram(r: &TomlTable, word: Int, file: String) -> Result<RamSet, BuildError> {
+    var ranges = Vector<RamRange>()
+    let names = try! r.keys()
+    var i = 0
+    while i < names.len() {
+        let range = names.get(i) ?? ""
+        i = i + 1
+        try require_table(&r, range, file)
+        if range.equals("default") {
+            continue
+        }
+        try check_ram_name(range, file, where_is(&r, range))
+        if let t = r.table(range) {
+            try! ranges.push(try read_range(&t, range, word, file, where_is(&r, range)))
+        }
+    }
+    var kernel_ranges = 0
+    var k = 0
+    while k < ranges.len() {
+        let one = ranges.get(k)!
+        if one.kernel {
+            kernel_ranges = kernel_ranges + 1
+        }
+        var o = 0
+        while o < k {
+            let other = ranges.get(o)!
+            if one.base < other.base + other.len && other.base < one.base + one.len {
+                return refused(file, one.at, "[ram.{one.name}] and [ram.{other.name}] (at {other.at}) share bytes: RAM ranges are disjoint")
+            }
+            o = o + 1
+        }
+        k = k + 1
+    }
+    if kernel_ranges != 1 {
+        return refused(file, r.defined_at(),
+                       "[ram] has {kernel_ranges} ranges with use = \"kernel\"; a board has exactly one")
+    }
+    var process = ""
+    var pool = ""
+    if let d = r.table("default") {
+        let default_keys: Vector<String> = ["process", "pool"]
+        try only_keys(&d, &default_keys, file, "[ram.default]")
+        process = try text(&d, "process", file)
+        pool = try text(&d, "pool", file)
+        try default_range(&ranges, process, file, where_is(&d, "process"), "process")
+        try default_range(&ranges, pool, file, where_is(&d, "pool"), "pool")
+    } else {
+        return refused(file, r.defined_at(),
+                       "[ram] has no `default`: a board names the ranges a process and a pool take")
+    }
+    return RamSet(ranges: move ranges, process: process, pool: pool)
+}
+
+/// One `[ram.<name>]`.
+func read_range(t: &TomlTable, range: String, word: Int, file: String,
+                at: TomlPosition) -> Result<RamRange, BuildError> {
+    let what = "[ram.{range}]"
+    let range_keys: Vector<String> = ["use", "speed", "base", "len"]
+    try only_keys(&t, &range_keys, file, what)
+    let use_word = try text(&t, "use", file)
+    let uses: Vector<String> = ["kernel", "process"]
+    try one_of(&t, "use", use_word, &uses, file, what)
+    let speed = try text(&t, "speed", file)
+    let speeds: Vector<String> = ["fast", "slow"]
+    try one_of(&t, "speed", speed, &speeds, file, what)
+    let base = try size(&t, "base", word, file, what)
+    let len = try size(&t, "len", word, file, what)
+    try fits_space(base, len, word, file, where_is(&t, "len"), what)
+    if use_word.equals("kernel") && speed.equals("slow") {
+        return refused(file, where_is(&t, "speed"),
+                       "{what} is the kernel's and slow: kernel memory is internal SRAM, never behind a cache")
+    }
+    return RamRange(name: range, kernel: use_word.equals("kernel"), fast: speed.equals("fast"),
+                    base: base, len: len, at: at)
+}
+
+/// `[types]`: each type's board inputs, no input named by two types.
+func read_types(ts: &TomlTable, file: String) -> Result<Vector<TypeInput>, BuildError> {
+    var out = Vector<TypeInput>()
+    let names = try! ts.keys()
+    var n = 0
+    while n < names.len() {
+        let type_name = names.get(n) ?? ""
+        n = n + 1
+        try check_name(type_name, file, where_is(&ts, type_name), "a device type")
+        try require_table(&ts, type_name, file)
+        if let t = ts.table(type_name) {
+            let type_keys: Vector<String> = ["inputs"]
+            try only_keys(&t, &type_keys, file, "[types.{type_name}]")
+            let inputs = try name_list(&t, "inputs", file, "a board input's name")
+            var j = 0
+            while j < inputs.len() {
+                let input = inputs.get(j) ?? ""
+                let at = element_position(&t, "inputs", j)
+                j = j + 1
+                var o = 0
+                while o < out.len() {
+                    let other = out.get(o)!
+                    if other.input.equals(input) {
+                        return refused(file, at, "the board input `{input}` is [types.{other.type_name}]'s too, at {other.at}: a board input belongs to one type")
+                    }
+                    o = o + 1
+                }
+                try! out.push(TypeInput(type_name: type_name, input: input, at: at))
+            }
+        }
+    }
+    return move out
+}
+
+/// `[devices]`.
+func read_devices(ds: &TomlTable, word: Int, type_inputs: &Vector<TypeInput>,
+                  reserved_lines: &Vector<Int>, file: String) -> Result<DeviceSet, BuildError> {
+    var devices = Vector<BoardDevice>()
+    var members = Vector<Member>()
+    var inputs = Vector<DeviceInput>()
+    let names = try! ds.keys()
+    var n = 0
+    while n < names.len() {
+        let device = names.get(n) ?? ""
+        n = n + 1
+        let device_at = where_is(&ds, device)
+        try check_name(device, file, device_at, "a device's name")
+        try require_table(&ds, device, file)
+        if let t = ds.table(device) {
+            try! devices.push(try read_device(&t, device, device_at, word, &type_inputs,
+                                              &reserved_lines, &var members, &var inputs, file))
+        }
+    }
+    return DeviceSet(devices: move devices, members: move members, inputs: move inputs)
+}
+
+/// One `[devices.<name>]`; its registers, arrays and inputs are appended to
+/// `members` and `inputs`.
+func read_device(t: &TomlTable, device: String, device_at: TomlPosition, word: Int,
+                 type_inputs: &Vector<TypeInput>, reserved_lines: &Vector<Int>,
+                 members: &var Vector<Member>, inputs: &var Vector<DeviceInput>,
+                 file: String) -> Result<BoardDevice, BuildError> {
+    let what = "[devices.{device}]"
+    let device_keys: Vector<String> = ["type", "base", "len", "line", "kernel",
+                                       "registers", "arrays", "inputs"]
+    try only_keys(&t, &device_keys, file, what)
+    let type_name = try text(&t, "type", file)
+    try check_name(type_name, file, where_is(&t, "type"), "a device type")
+    let base = try size(&t, "base", word, file, what)
+    let len = try size(&t, "len", word, file, what)
+    try fits_space(base, len, word, file, where_is(&t, "len"), what)
+    var line: Int? = None
+    if t.contains("line") {
+        let l = try word_count(&t, "line", word, file, what)
+        var q = 0
+        while q < reserved_lines.len() {
+            if (reserved_lines.get(q) ?? -1) == l {
+                return refused(file, where_is(&t, "line"),
+                               "{what} is on line {l}, which [lines] reserves")
+            }
+            q = q + 1
+        }
+        line = l
+    }
+    let kernel = try flag(&t, "kernel", false, file)
+    try read_members(&t, device, len, word, &var members, file, what)
+    try expect_table(&t, "inputs", file)
+    if let ins = t.table("inputs") {
+        let input_names = try! ins.keys()
+        var j = 0
+        while j < input_names.len() {
+            let input = input_names.get(j) ?? ""
+            j = j + 1
+            let at = where_is(&ins, input)
+            if ins.kind(input) == TomlKind.Array {
+                return refused(file, at, "`{input}` in {what}'s inputs is a list: an input takes one value, and the list form is reserved")
+            }
+            let path = try text(&ins, input, file)
+            try check_path(path, file, at, "`{input}` in {what}'s inputs")
+            if not is_input_of(&type_inputs, type_name, input) {
+                return refused(file, at, "`{input}` is not a board input of the type `{type_name}`, so {what} cannot fix it")
+            }
+            try! inputs.push(DeviceInput(device: device, input: input, path: path, at: at))
+        }
+    }
+    return BoardDevice(name: device, type_name: type_name, base: base, len: len, line: line,
+                  kernel: kernel, at: device_at)
+}

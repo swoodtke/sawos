@@ -1,0 +1,207 @@
+// The process declaration's reader, and its board-input rules against a
+// board: what each accepts, and each refusal by its message.
+
+import sosimage.board.{Board}
+import sosimage.declaration.{Declaration, RecordKind}
+
+// The GPIO driver's declaration, one key per line.
+func gpio_lines() -> Vector<String> {
+    ["format = 1",                         // 1
+     "arena = 0x1000",                     // 2
+     "ram = \"fast\"",                     // 3
+     "[[boot]]",                           // 4
+     "name = \"system\"",                  // 5
+     "kind = \"system\"",                  // 6
+     "tag = 1",                            // 7
+     "[[boot]]",                           // 8
+     "name = \"gpio\"",                    // 9
+     "kind = \"window\"",                  // 10
+     "type = \"gpio\"",                    // 11
+     "tag = 2",                            // 12
+     "[[boot]]",                           // 13
+     "name = \"gpio\"",                    // 14
+     "kind = \"line\"",                    // 15
+     "type = \"gpio\"",                    // 16
+     "tag = 3",                            // 17
+     "[[boot]]",                           // 18
+     "name = \"gpio\"",                    // 19
+     "kind = \"serve\"",                   // 20
+     "protocol = \"gpioproto\"",           // 21
+     "tag = 4",                            // 22
+     "[quota]",                            // 23
+     "handles = 6",                        // 24
+     "waiters = 1",                        // 25
+     "[build]",                            // 26
+     "inputs = [\"gpioconfig\"]",          // 27
+     "defaults = \{ gpioconfig = \"config/default.saw\" \}"]  // 28
+}
+
+func text_of(lines: &Vector<String>) -> String {
+    "{lines.join("\n")}\n"
+}
+
+func with_line(n: Int, with: String) -> String {
+    var lines = gpio_lines()
+    lines[n - 1] = with
+    text_of(&lines)
+}
+
+func with_extra(extra: String) -> String {
+    let lines = gpio_lines()
+    "{text_of(&lines)}{extra}\n"
+}
+
+func refusal(text: String) -> String {
+    match Declaration.parse(text, "p.toml") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect_refusal(text: String, message: String) {
+    let got = refusal(text)
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the refusal's message")
+}
+
+// A board with a gpio type whose instances fix `gpiopins`, and a uart type.
+func board() -> Board {
+    let lines: Vector<String> = ["format = 1",
+                "[board]",
+                "name = \"b\"",
+                "triple = \"riscv32-unknown-none-elf\"",
+                "tier = \"flat\"",
+                "hal = \"hal/b\"",
+                "placement = \"copied\"",
+                "modules = []",
+                "cflags = []",
+                "[emulator]",
+                "program = \"q\"",
+                "args = []",
+                "[ram.kernel]",
+                "use = \"kernel\"",
+                "speed = \"fast\"",
+                "base = 0",
+                "len = 0x1000",
+                "[ram.main]",
+                "use = \"process\"",
+                "speed = \"fast\"",
+                "base = 0x1000",
+                "len = 0x1000",
+                "[ram.default]",
+                "process = \"main\"",
+                "pool = \"main\"",
+                "[types.gpio]",
+                "inputs = [\"gpiopins\"]",
+                "[devices.GPIO]",
+                "type = \"gpio\"",
+                "base = 0x6000_4000",
+                "len = 0x1000",
+                "arrays.out_sel = \{ offset = 0x554, stride = 4, count = 54 \}",
+                "inputs = \{ gpiopins = \"pins.saw\" \}",
+                "[devices.UART0]",
+                "type = \"uart\"",
+                "base = 0x6000_0000",
+                "len = 0x1000"]
+    try! Board.parse(lines.join("\n"), "board.toml")
+}
+
+func check_refusal(text: String, message: String) {
+    let b = board()
+    let d = try! Declaration.parse(text, "p.toml")
+    let got = match d.check_against(&b) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the board check's message")
+}
+
+func main() {
+    let lines = gpio_lines()
+    let d = try! Declaration.parse(text_of(&lines), "drivers/gpio/process.toml")
+    assert(d.dir.equals("drivers/gpio"), "the package directory is the file's")
+    assert(d.arena == 0x1000, "the arena")
+    assert(d.fast, "fast memory")
+    assert(d.records.len() == 4, "four records")
+    assert(d.needs().len() == 1, "the window and the line are one need")
+    assert(d.record(RecordKind.Serve, "gpio")!.protocol.equals("gpioproto"), "the serve's protocol")
+    assert(d.handle_floor() == 6, "four records, the Process handle, one Mapping")
+    assert(d.default_for("gpioconfig")!.path.equals("config/default.saw"), "a default")
+
+    // Keys the format does not define, by kind, and the reserved list form.
+    expect_refusal(with_line(21, "type = \"gpio\""),
+                   "p.toml: line 21, column 1: `type` is not a key of a [[boot]] record of kind serve, which takes `name`, `kind`, `tag`, `protocol`")
+    expect_refusal(with_line(7, "count = 2"),
+                   "p.toml: line 7, column 1: `count` on a [[boot]] record is the list form, which is reserved: a record is one instance")
+    expect_refusal(with_extra("boards = [\"esp32s3\"]").replace("[build]", "[build]\ncompatible = 1"),
+                   "p.toml: line 27, column 1: `compatible` is not a key of [build], which takes `inputs`, `defaults`")
+    expect_refusal(with_line(2, "arena = \"4K\""),
+                   "p.toml: line 2, column 1: `arena` in the declaration is the string \"4K\": a size or an address is a TOML integer in bytes: write 0x1000")
+    expect_refusal(with_line(3, "ram = \"slow\""),
+                   "p.toml: line 3, column 1: `ram` is \"slow\": a declaration's `ram` is \"fast\", for a program that needs fast memory, or absent")
+    expect_refusal(with_line(10, "kind = \"pipe\""),
+                   "p.toml: line 10, column 1: `kind` in [[boot]] is \"pipe\", not one of \"system\", \"window\", \"line\", \"serve\", \"client\", \"memory\"")
+
+    // Uniqueness: tags, the one system record, names within each family, and
+    // one need per type.
+    expect_refusal(with_line(12, "tag = 1"),
+                   "p.toml: line 8, column 3: the tag 1 is given twice, here and at line 4, column 3: a tag is unique in a declaration")
+    expect_refusal(with_line(6, "kind = \"memory\""),
+                   "p.toml: line 4, column 3: the declaration has 0 system records; a process has exactly one")
+    expect_refusal(with_extra("[[boot]]\nname = \"gpio\"\nkind = \"client\"\nprotocol = \"p\"\ntag = 9"),
+                   "p.toml: line 29, column 3: `gpio` names a serve record at line 18, column 3 and a client record here: a serve and a client share one set of names")
+    expect_refusal(with_extra("[[boot]]\nname = \"gpio\"\nkind = \"window\"\ntype = \"gpio\"\ntag = 9"),
+                   "p.toml: line 29, column 3: `gpio` names two window records, here and at line 8, column 3")
+    expect_refusal(with_line(16, "type = \"iomux\""),
+                   "p.toml: line 13, column 3: the device need `gpio` is of the type `iomux` here and `gpio` at line 8, column 3: one need is one device")
+    expect_refusal(with_line(14, "name = \"irq\""),
+                   "p.toml: line 13, column 3: `irq` and `gpio` (at line 8, column 3) are two device needs of the type `gpio`: two devices of one type is the list form, which is reserved")
+    expect_refusal(with_line(28, "defaults = \{ other = \"x.saw\" \}"),
+                   "p.toml: line 28, column 14: `other` has a default and is not one of [build] inputs")
+    expect_refusal(with_line(27, "inputs = [\"a\", \"a\"]").replace("defaults = \{ gpioconfig = \"config/default.saw\" \}", ""),
+                   "p.toml: line 27, column 16: `a` is in `inputs` twice")
+    expect_refusal(with_line(19, "name = \"gp io\""),
+                   "p.toml: line 19, column 1: `gp io` is not a name: a record's name is a letter, then letters, digits, `_` and `-`")
+
+    // A declared handle row below what the process starts holding.
+    expect_refusal(with_line(24, "handles = 5"),
+                   "p.toml: line 24, column 1: `handles` in [quota] is 5, below the 6 the process holds when it starts: one per [[boot]] record, its Process handle and one Mapping per window")
+    expect_refusal(with_line(25, "rows = 1"),
+                   "p.toml: line 25, column 1: `rows` is not a key of [quota], which takes `threads`, `events`, `waiters`, `timers`, `memories`, `iomemories`, `mappings`, `pipes`, `handles`")
+
+    // Against a board: the board input `gpiopins` must be listed, and has no
+    // default; a part window alone owes it nothing; a type the board lacks.
+    check_refusal(text_of(&lines),
+                  "p.toml: line 27, column 1: `gpiopins` is a board input of the type `gpio` on the board b, and [build] inputs does not list it")
+    check_refusal(with_line(27, "inputs = [\"gpioconfig\", \"gpiopins\"]").replace("gpioconfig = \"config/default.saw\"", "gpiopins = \"p.saw\""),
+                  "p.toml: line 28, column 14: `gpiopins` is a board input of the type `gpio` on the board b, and a driver's default for it would be a guess at wiring: its value comes from the image or the device")
+    check_refusal(with_line(27, "inputs = [\"gpioconfig\", \"gpiopins\"]"), "")
+    check_refusal(with_line(16, "type = \"spi\"").replace("inputs = [\"gpioconfig\"]", "inputs = [\"gpioconfig\", \"gpiopins\"]").replace("name = \"gpio\"\nkind = \"line\"", "name = \"bus\"\nkind = \"line\""),
+                  "p.toml: line 13, column 3: the line `bus` needs a device of the type `spi`, and the board b has none")
+    let part = with_line(11, "type = \"gpio\"\npart = true").replace("kind = \"line\"\ntype = \"gpio\"", "kind = \"line\"\ntype = \"uart\"").replace("name = \"gpio\"\nkind = \"line\"", "name = \"uart\"\nkind = \"line\"")
+    check_refusal(part, "")
+
+    // Unknown keys at the top, a default as a list, a default's path.
+    expect_refusal(with_line(2, "arena = 0x1000\nboards = [\"esp32s3\"]"),
+                   "p.toml: line 3, column 1: `boards` is not a key of a process declaration, which takes `format`, `arena`, `ram`, `boot`, `quota`, `build`")
+    expect_refusal(with_line(28, "defaults = \{ gpioconfig = [\"a.saw\"] \}"),
+                   "p.toml: line 28, column 14: the default for `gpioconfig` is a list: an input takes one value, and the list form is reserved")
+    expect_refusal(with_line(28, "defaults = \{ gpioconfig = \"../config/default.saw\" \}"),
+                   "p.toml: line 28, column 14: the default for `gpioconfig` is \"../config/default.saw\", which climbs out with `..`: a path stays under the directory it is relative to")
+    expect_refusal(with_line(7, "tag = -1"),
+                   "p.toml: line 7, column 1: `tag` in [[boot]] is -1, which is negative")
+
+    // Against a 32-bit board: the arena and each tag fit its word.
+    let listed = with_line(27, "inputs = [\"gpioconfig\", \"gpiopins\"]")
+    check_refusal(listed.replace("arena = 0x1000", "arena = 0x1_0000_0000"),
+                  "p.toml: line 2, column 1: `arena` is 0x100000000, past what the 32-bit word of the board b holds (0xffffffff)")
+    check_refusal(listed.replace("tag = 4", "tag = 0x1_0000_0000"),
+                  "p.toml: line 22, column 1: the tag of `gpio` is 0x100000000, past what the 32-bit word of the board b holds (0xffffffff)")
+}

@@ -1,0 +1,285 @@
+//! An image built from its hand-written description (`sosimage.imagefile`),
+//! the board it names (`sosimage.board`) and, for the stock root, its
+//! processes' declarations (`sosimage.declaration`).
+//!
+//! The board is the one whose `board.toml`, in a directory under the sawos
+//! tree's `hal/`, has the image's `board` as its name. It is held to the
+//! profile and its HAL (`sosimage.boardcheck`) before the image is read.
+//!
+//! A package is `sawos:PATH` in the sawos tree, or a path from the product's
+//! root. Its image is the one Blade built for the board's triple, in the
+//! package's `.build/<triple>/`, named for the package as its `Saw.toml`
+//! names it; a package not yet built is refused, naming the command that
+//! builds it.
+//!
+//! A hand-written root's image is linked like a test image (`link`). Its
+//! region table's rows are, in order: one image blob per process, one
+//! destination per process, then `[rows] devices`. Process `i`'s destination
+//! is the `i`-th region above root's, each as long as root's: the regions
+//! the processes' link scripts are written for. A destination outside the
+//! board's default process range is refused at the process's line, as every
+//! refusal of the description is, before any package's image is looked for
+//! or the kernel is compiled; only the HAL's numbers, which root's region is,
+//! are compiled first. The image's `[limits]` over the
+//! board's `[limits.default]`, each a total, become the slots each kind is
+//! raised by above the kernel's floor; a total below the floor is refused,
+//! since an image raises and never lowers.
+//!
+//! An image with the stock root is read and bound, and what binding found is
+//! printed; building it is refused, since the stock root is not part of this
+//! builder. So is an image with pools: a pool's address comes from computed
+//! regions, which this builder does not compute.
+
+import std.directory.{Directory}
+import std.file.{File}
+import std.path.{Path}
+import toml.{TomlDoc}
+import sosimage.board.{Board, LimitsSpec, NamedCount}
+import sosimage.boardcheck.{HalFacts, check_board, hal_facts}
+import sosimage.build.{Linked, build_kernel, ensure_directory, link}
+import sosimage.declaration.{Declaration}
+import sosimage.failure.{BuildError}
+import sosimage.hex.{hex}
+import sosimage.image.{FlashOutput, ImageSpec, RowSpec}
+import sosimage.imagefile.{ImageFile, bind, image_board}
+import sosimage.kernel.{
+    ATTACHMENTS, EVENTS, INTERRUPTS, IOMEMORIES, KernelFacts, MAPPINGS, MEMORIES,
+    PIPES, PROCESSES, PROCESS_RECORDS, THREADS, TIMERS, WAITERS,
+}
+import sosimage.limits.{ImageLimits}
+import sosimage.profile.{Profile}
+import sosimage.regions.{BOOT_FLAG_NO_TICK, RegionKind}
+import sosimage.rules.{refused}
+import sosimage.tool.{read_text}
+
+/// The board under `<sawos>/hal/` whose description names `name`.
+public func find_board(sawos: String, name: String) -> Result<Board, BuildError> {
+    let hal = "{sawos}/hal"
+    var entries = try Directory.list(Path(s: hal)) catch {
+        return BuildError(message: "could not list {hal}: {error}")
+    }
+    var dirs = Vector<String>()
+    var i = 0
+    while i < entries.len() {
+        try! dirs.push((entries.get(i)!).as_string())
+        i = i + 1
+    }
+    dirs.sort()
+    var names = Vector<String>()
+    i = 0
+    while i < dirs.len() {
+        let file = "{dirs.get(i) ?? ""}/board.toml"
+        i = i + 1
+        if not File.exists(Path(s: file)) {
+            continue
+        }
+        let board = try Board.parse(try read_text(file), file)
+        if board.name.equals(name) {
+            return move board
+        }
+        try! names.push(board.name)
+    }
+    return BuildError(message: "no board.toml under {hal} names the board {name}; the boards are {names.join(", ")}")
+}
+
+/// The directory a package path names: `sawos:PATH` in the sawos tree, or a
+/// path from the product's root.
+public func package_dir(package: String, sawos: String, product: String) -> String {
+    if package.starts_with("sawos:") {
+        return "{sawos}/{package.substring(6, package.len())}"
+    }
+    "{product}/{package}"
+}
+
+/// The image Blade built of the package in `dir` for `triple`.
+public func package_image(dir: String, triple: String) -> Result<String, BuildError> {
+    let manifest = "{dir}/Saw.toml"
+    let text = try read_text(manifest)
+    let doc = try TomlDoc.parse(text) catch {
+        return BuildError(message: "{manifest}: {error}")
+    }
+    var name = ""
+    borrow let root = doc.root() {
+        if let p = root.table("package") {
+            name = try p.string("name") catch {
+                return BuildError(message: "{manifest}: {error}")
+            }
+        } else {
+            return BuildError(message: "{manifest} has no [package]")
+        }
+    }
+    let image = "{dir}/.build/{triple}/{name}.sosimg"
+    if not File.exists(Path(s: image)) {
+        return BuildError(message: "the package {dir} has no image for {triple} at {image}: build it first (`blade build --target {triple}` in {dir})")
+    }
+    return image
+}
+
+/// The `SlabKind` a `[limits]` key totals.
+func slab_of(key: String) -> Int {
+    if key.equals("processes") { return PROCESSES }
+    if key.equals("threads") { return THREADS }
+    if key.equals("events") { return EVENTS }
+    if key.equals("waiters") { return WAITERS }
+    if key.equals("interrupts") { return INTERRUPTS }
+    if key.equals("timers") { return TIMERS }
+    if key.equals("memories") { return MEMORIES }
+    if key.equals("iomemories") { return IOMEMORIES }
+    if key.equals("pipes") { return PIPES }
+    if key.equals("records") { return PROCESS_RECORDS }
+    if key.equals("attachments") { return ATTACHMENTS }
+    MAPPINGS
+}
+
+/// The `QuotaKind` a quota key names.
+func quota_of(key: String) -> Int {
+    if key.equals("threads") { return 0 }
+    if key.equals("events") { return 1 }
+    if key.equals("waiters") { return 2 }
+    if key.equals("timers") { return 3 }
+    if key.equals("memories") { return 4 }
+    if key.equals("iomemories") { return 5 }
+    if key.equals("mappings") { return 6 }
+    if key.equals("handles") { return 7 }
+    8
+}
+
+/// The limits `stated` (the board's defaults, then the image's over them)
+/// come to against the kernel `facts`: each total as the slots it raises its
+/// kind by, each quota as stated. A total below its floor is refused.
+public func image_limits(stated: &Vector<LimitsSpec>, facts: &KernelFacts,
+                         name: String) -> Result<ImageLimits, BuildError> {
+    var limits = ImageLimits.none()
+    var s = 0
+    while s < stated.len() {
+        borrow let spec = stated[s] {
+            var i = 0
+            while i < spec.totals.len() {
+                let total = spec.totals.get(i)!
+                i = i + 1
+                let kind = slab_of(total.name)
+                let floor = facts.floors.get(kind) ?? 0
+                if total.value < floor {
+                    return BuildError(message: "{name}: `{total.name}` is {total.value}, below the kernel's floor of {floor}: an image raises a limit and never lowers one")
+                }
+                limits.raise[kind] = total.value - floor
+            }
+            var q = 0
+            while q < spec.quota.len() {
+                let quota = spec.quota.get(q)!
+                q = q + 1
+                limits.quota[quota_of(quota.name)] = quota.value
+            }
+        }
+        s = s + 1
+    }
+    return move limits
+}
+
+/// Builds the image the description at `path` states, for the board its
+/// profile is, into `out`: `<out>/kernel-main.o`, then `<out>/<name>.elf`
+/// and, for a board with a flash, `<out>/<name>.flash.bin`; the generated
+/// files go in `<out>/<name>.image/`.
+public func build_image(profile: &Profile, sawos: String, product: String, path: String,
+                        out: String) -> Result<Linked, BuildError> {
+    let text = try read_text(path)
+    let board_name = try image_board(text, path)
+    let board = try find_board(sawos, board_name)
+    try ensure_directory(out)
+    let facts = try hal_facts(&profile, "{out}/hal")
+    try check_board(&board, &profile, &facts, sawos)
+    let image = try ImageFile.parse(text, path, &board, facts.grain)
+
+    if image.stock {
+        var decls = Vector<Declaration>()
+        var i = 0
+        while i < image.processes.len() {
+            let process = image.processes.get(i)!
+            i = i + 1
+            let file = "{package_dir(process.package, sawos, product)}/process.toml"
+            try! decls.push(try Declaration.parse(try read_text(file), file))
+        }
+        let bound = try bind(&image, &board, &decls, facts.grain)
+        var n = 0
+        while n < bound.notes.len() {
+            print(bound.notes.get(n) ?? "")
+            n = n + 1
+        }
+        return BuildError(message: "{path}: an image with the stock root is read and bound, and this builder does not build the stock root")
+    }
+    if image.pools.len() > 0 {
+        return BuildError(message: "{path}: the image has pools, and this builder places none: a pool's address comes from computed regions")
+    }
+
+    // The rows, and every refusal of the layout, before anything is built.
+    var rows = Vector<RowSpec>()
+    var i = 0
+    while i < image.processes.len() {
+        let process = image.processes.get(i)!
+        try! rows.push(RowSpec(what: "{process.name}'s image blob", kind: RegionKind.Ram,
+                               blob: i, base: 0, len: 0))
+        i = i + 1
+    }
+    let region = facts.root_top - facts.root_base
+    guard let range = board.range(board.default_process) else {
+        return BuildError(message: "{path}: internal: the default process range vanished")
+    }
+    i = 0
+    while i < image.processes.len() {
+        let process = image.processes.get(i)!
+        let base = facts.root_top + (i as UInt64) * region
+        if base + region > range.base + range.len {
+            return refused(path, process.at, "the process {process.name}'s region, {hex(region)} bytes at {hex(base)}, runs past the board's {range.name} range, which ends at {hex(range.base + range.len)}")
+        }
+        try! rows.push(RowSpec(what: "{process.name}'s destination RAM", kind: RegionKind.Ram,
+                               blob: None, base: base, len: region))
+        i = i + 1
+    }
+    i = 0
+    while i < image.row_devices.len() {
+        let row = image.row_devices.get(i)!
+        try! rows.push(RowSpec(what: "{row.window.device}'s window", kind: RegionKind.Device,
+                               blob: None, base: row.window.base, len: row.window.len))
+        i = i + 1
+    }
+
+    let triple = board.triple
+    let root_image = try package_image(package_dir(image.root_package, sawos, product), triple)
+    var children = Vector<String>()
+    i = 0
+    while i < image.processes.len() {
+        let process = image.processes.get(i)!
+        i = i + 1
+        try! children.push(try package_image(package_dir(process.package, sawos, product), triple))
+    }
+
+    let kernel = "{out}/kernel-main.o"
+    try build_kernel(&profile, "{sawos}/kernel/main.saw", kernel)
+
+
+    var stated = Vector<LimitsSpec>()
+    if board.has_limits {
+        try! stated.push(board.limits.copy())
+    }
+    if image.has_limits {
+        try! stated.push(image.limits.copy())
+    }
+    var limits = ImageLimits.none()
+    if stated.len() > 0 {
+        let kernel_facts = try KernelFacts.read(kernel)
+        limits = try image_limits(&stated, &kernel_facts, image.name)
+    }
+
+    var flash: FlashOutput? = None
+    if profile.flash != None {
+        flash = FlashOutput(output: "{out}/{image.name}.flash.bin", check: true)
+    }
+    let spec = ImageSpec(name: image.name, kernel: kernel,
+                         staging: "{out}/{image.name}.image",
+                         output: "{out}/{image.name}.elf", asm: "", child_asm: "",
+                         root_image: root_image, children: move children,
+                         has_regions: true, flags: if image.tick { 0 } else { BOOT_FLAG_NO_TICK },
+                         rows: move rows, has_limits: stated.len() > 0,
+                         limits: move limits, link_args: Vector<String>(), flash: flash)
+    link(&profile, &spec)
+}

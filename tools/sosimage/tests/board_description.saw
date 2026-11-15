@@ -1,0 +1,297 @@
+// The board description's reader: what it accepts, and each refusal by its
+// message, which names the file, the line and the column.
+
+import sosimage.board.{Board, RefUse}
+import sosimage.rules.{parse_ref}
+import toml.{TomlPosition}
+
+// A whole board, one key per line, with `extra` lines after the rest.
+func board_lines() -> Vector<String> {
+    ["format = 1",                                              // 1
+     "[board]",                                                 // 2
+     "name = \"testboard\"",                                    // 3
+     "triple = \"riscv32-unknown-none-elf\"",                   // 4
+     "tier = \"isolated\"",                                     // 5
+     "hal = \"hal/test\"",                                      // 6
+     "placement = \"copied\"",                                  // 7
+     "modules = [\"rv32core=../riscv32-common/kernel\"]",       // 8
+     "cflags = [\"-march=rv32imac_zicsr\"]",                    // 9
+     "[emulator]",                                              // 10
+     "program = \"qemu-system-riscv32\"",                       // 11
+     "args = [\"-M\", \"virt\"]",                               // 12
+     "[ram.kernel]",                                            // 13
+     "use = \"kernel\"",                                        // 14
+     "speed = \"fast\"",                                        // 15
+     "base = 0x8000_0000",                                      // 16
+     "len = 0x20_0000",                                         // 17
+     "[ram.main]",                                              // 18
+     "use = \"process\"",                                       // 19
+     "speed = \"fast\"",                                        // 20
+     "base = 0x8020_0000",                                      // 21
+     "len = 0x7E0_0000",                                        // 22
+     "[ram.default]",                                           // 23
+     "process = \"main\"",                                      // 24
+     "pool = \"main\"",                                         // 25
+     "[types.uart]",                                            // 26
+     "inputs = [\"uartpins\"]",                                 // 27
+     "[devices.UART0]",                                         // 28
+     "type = \"uart\"",                                         // 29
+     "base = 0x1000_0000",                                      // 30
+     "len = 0x1000",                                            // 31
+     "line = 10",                                               // 32
+     "kernel = true",                                           // 33
+     "inputs = \{ uartpins = \"config/uart0.saw\" \}",          // 34
+     "[devices.UART1]",                                         // 35
+     "type = \"uart\"",                                         // 36
+     "base = 0x1000_1000",                                      // 37
+     "len = 0x1000",                                            // 38
+     "line = 11",                                               // 39
+     "[devices.GPIO]",                                          // 40
+     "type = \"gpio\"",                                         // 41
+     "base = 0x6000_4000",                                      // 42
+     "len = 0x1000",                                            // 43
+     "registers.ENABLE = \{ offset = 0x30 \}",                  // 44
+     "arrays.out_sel = \{ offset = 0x554, stride = 4, count = 54 \}", // 45
+     "[lines]",                                                 // 46
+     "reserved = [57]"]                                         // 47
+}
+
+func text_of(lines: &Vector<String>) -> String {
+    "{lines.join("\n")}\n"
+}
+
+// The board with line `n` (1-based) replaced by `with`.
+func with_line(n: Int, with: String) -> String {
+    var lines = board_lines()
+    lines[n - 1] = with
+    text_of(&lines)
+}
+
+// The board with `extra` appended.
+func with_extra(extra: String) -> String {
+    let lines = board_lines()
+    "{text_of(&lines)}{extra}\n"
+}
+
+func refusal(text: String) -> String {
+    match Board.parse(text, "b.toml") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect_refusal(text: String, message: String) {
+    let got = refusal(text)
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the refusal's message")
+}
+
+func main() {
+    let lines = board_lines()
+    let b = try! Board.parse(text_of(&lines), "hal/test/board.toml")
+    assert(b.name.equals("testboard"), "the name")
+    assert(b.word == 4, "a 32-bit word")
+    assert(b.dir.equals("hal/test"), "the HAL directory is the file's")
+    assert(b.ram.len() == 2, "two ranges")
+    assert(b.default_process.equals("main"), "the default process range")
+    assert(b.devices.len() == 3, "three devices")
+    assert(b.instances("uart").len() == 2, "two of one type")
+    assert(b.board_inputs("uart").len() == 1, "one board input")
+    assert(b.device_input("UART0", "uartpins")!.path.equals("config/uart0.saw"), "UART0 fixes its pins")
+    assert(b.device_input("UART1", "uartpins") == None, "UART1 fixes nothing")
+    assert(b.members.len() == 2, "a register and an array")
+    assert(b.device("UART0")!.line! == 10, "UART0's line")
+    assert(b.device("GPIO")!.line == None, "GPIO has no line")
+    assert(b.flash == None, "no flash on a copied board")
+
+    // A reference, resolved: a range of elements and the whole device.
+    let at = TomlPosition(line: 1, column: 1)
+    let part = try! b.resolve(&try! parse_ref("GPIO.out_sel[41..=42]", "i.toml", at),
+                              RefUse.Part, 4, "i.toml", at)
+    assert(part.base == 0x6000_45F8 && part.len == 8, "two elements from 0x5F8")
+    let whole = try! b.resolve(&try! parse_ref("UART1", "i.toml", at), RefUse.Need, 4, "i.toml", at)
+    assert(whole.base == 0x1000_1000 && whole.len == 0x1000 && not whole.part, "the whole window")
+
+    // Keys the format does not define.
+    expect_refusal(with_extra("[board2]"),
+                   "b.toml: line 48, column 2: `board2` is not a key of a board description, which takes `format`, `board`, `emulator`, `ram`, `flash`, `types`, `devices`, `limits`, `lines`")
+    expect_refusal(with_line(31, "size = 0x1000"),
+                   "b.toml: line 31, column 1: `size` is not a key of [devices.UART0], which takes `type`, `base`, `len`, `line`, `kernel`, `registers`, `arrays`, `inputs`")
+    expect_refusal(with_line(17, "top = 0x8020_0000"),
+                   "b.toml: line 17, column 1: `top` is not a key of [ram.kernel], which takes `use`, `speed`, `base`, `len`")
+
+    // The format's version.
+    expect_refusal(with_line(1, "format = 2"),
+                   "b.toml: line 1, column 1: this is format 2; this builder reads format 1")
+
+    // Sizes: a suffixed string, and a number the 32-bit word cannot hold.
+    expect_refusal(with_line(17, "len = \"2M\""),
+                   "b.toml: line 17, column 1: `len` in [ram.kernel] is the string \"2M\": a size or an address is a TOML integer in bytes: write 0x20_0000")
+    expect_refusal(with_line(17, "len = \"lots\""),
+                   "b.toml: line 17, column 1: `len` in [ram.kernel] is the string \"lots\": a size or an address is a TOML integer in bytes")
+    expect_refusal(with_line(30, "base = 0x1_0000_0000"),
+                   "b.toml: line 30, column 1: `base` in [devices.UART0] is 0x100000000, past what this board's 32-bit word holds (0xffffffff)")
+    expect_refusal(with_line(22, "len = 0x8000_0000"),
+                   "b.toml: line 22, column 1: [ram.main] runs from 0x80200000 for 0x80000000 bytes, past the end of this board's address space")
+
+    // Names, and the reserved words.
+    expect_refusal(with_line(28, "[devices.\"UART 0\"]"),
+                   "b.toml: line 28, column 10: `UART 0` is not a name: a device's name is a letter, then letters, digits, `_` and `-`")
+    expect_refusal(with_line(28, "[devices.0UART]"),
+                   "b.toml: line 28, column 10: `0UART` is not a name: a device's name is a letter, then letters, digits, `_` and `-`")
+    expect_refusal(with_line(28, "[devices.\"UART.0\"]"),
+                   "b.toml: line 28, column 10: `UART.0` is not a name: a device's name is a letter, then letters, digits, `_` and `-`")
+    expect_refusal(with_line(18, "[ram.fast]").replace("\"main\"", "\"fast\""),
+                   "b.toml: line 18, column 6: `fast` is reserved and names no RAM range: `fast` is a speed")
+    expect_refusal(with_line(18, "[ram.slow]").replace("\"main\"", "\"slow\""),
+                   "b.toml: line 18, column 6: `slow` is reserved and names no RAM range: `slow` is a speed")
+    expect_refusal(with_line(3, "name = \"test board\""),
+                   "b.toml: line 3, column 1: `test board` is not a name: a board's name is a letter, then letters, digits, `_` and `-`")
+
+    // Words outside their sets.
+    expect_refusal(with_line(5, "tier = \"half\""),
+                   "b.toml: line 5, column 1: `tier` in [board] is \"half\", not one of \"isolated\", \"flat\"")
+    expect_refusal(with_line(7, "placement = \"xip\""),
+                   "b.toml: line 7, column 1: `placement` in [board] is \"xip\", not one of \"copied\", \"in-place\", \"translated\"")
+    expect_refusal(with_line(4, "triple = \"mips-unknown-none-elf\""),
+                   "b.toml: line 4, column 1: `triple` is \"mips-unknown-none-elf\", whose architecture's word this builder does not know")
+    expect_refusal(with_line(8, "modules = [\"rv32core\"]"),
+                   "b.toml: line 8, column 12: `rv32core` in `modules` is not NAME=PATH, a module's name and its directory")
+
+    // RAM: exactly one kernel range, fast, and defaults naming process ranges.
+    expect_refusal(with_line(19, "use = \"kernel\""),
+                   "b.toml: line 13, column 6: [ram] has 2 ranges with use = \"kernel\"; a board has exactly one")
+    expect_refusal(with_line(14, "use = \"process\""),
+                   "b.toml: line 13, column 6: [ram] has 0 ranges with use = \"kernel\"; a board has exactly one")
+    expect_refusal(with_line(15, "speed = \"slow\""),
+                   "b.toml: line 15, column 1: [ram.kernel] is the kernel's and slow: kernel memory is internal SRAM, never behind a cache")
+    expect_refusal(with_line(24, "process = \"kernel\""),
+                   "b.toml: line 24, column 1: [ram.default]'s `process` is \"kernel\", the kernel's range: a process takes a range with use = \"process\"")
+    expect_refusal(with_line(25, "pool = \"psram\""),
+                   "b.toml: line 25, column 1: [ram.default]'s `pool` is \"psram\", which names no range of [ram]")
+    expect_refusal(with_line(1, "format = 1").replace("[ram.default]\nprocess = \"main\"\npool = \"main\"\n", ""),
+                   "b.toml: line 13, column 6: [ram] has no `default`: a board names the ranges a process and a pool take")
+
+    // Flash belongs to an in-place board, and an in-place board has it.
+    expect_refusal(with_extra("[flash]\nbase = 0"),
+                   "b.toml: line 48, column 2: [flash] is an in-place board's, and this board's placement is \"copied\"")
+    expect_refusal(with_line(7, "placement = \"in-place\""),
+                   "b.toml: line 7, column 1: an in-place board describes its flash, and this board has no [flash]")
+
+    // Types and their board inputs.
+    expect_refusal(with_extra("[types.spi]\ninputs = [\"spipins\"]"),
+                   "b.toml: line 48, column 8: [types.spi] is a type no device of this board has")
+    expect_refusal(with_extra("[types.gpio]\ninputs = [\"uartpins\"]"),
+                   "b.toml: line 49, column 11: the board input `uartpins` is [types.uart]'s too, at line 27, column 11: a board input belongs to one type")
+    expect_refusal(with_line(27, "inputs = [\"pins\", \"pins\"]"),
+                   "b.toml: line 27, column 19: `pins` is in `inputs` twice")
+    expect_refusal(with_line(34, "inputs = \{ clock = \"c.saw\" \}"),
+                   "b.toml: line 34, column 12: `clock` is not a board input of the type `uart`, so [devices.UART0] cannot fix it")
+    expect_refusal(with_line(34, "inputs = \{ uartpins = [\"a.saw\", \"b.saw\"] \}"),
+                   "b.toml: line 34, column 12: `uartpins` in [devices.UART0]'s inputs is a list: an input takes one value, and the list form is reserved")
+
+    // Registers and arrays.
+    expect_refusal(with_line(45, "arrays.ENABLE = \{ offset = 0x554, stride = 4, count = 54 \}"),
+                   "b.toml: line 45, column 8: [devices.GPIO] names `ENABLE` twice, as a register and as an array (the other at line 44, column 11)")
+    expect_refusal(with_line(44, "registers.ENABLE = \{ offset = 0x1000 \}"),
+                   "b.toml: line 44, column 11: `registers.ENABLE` in [devices.GPIO] runs past the device's 0x1000 bytes")
+    expect_refusal(with_line(44, "registers.ENABLE = \{ offset = 0x31 \}"),
+                   "b.toml: line 44, column 11: `registers.ENABLE` in [devices.GPIO] is at offset 0x31, off a 4-byte boundary or past the device's 0x1000 bytes")
+    expect_refusal(with_line(45, "arrays.out_sel = \{ offset = 0x554, stride = 4, count = 700 \}"),
+                   "b.toml: line 45, column 8: `arrays.out_sel` in [devices.GPIO] runs past the device's 0x1000 bytes")
+    expect_refusal(with_line(45, "arrays.out_sel = \{ offset = 0x4, stride = 8, count = 512 \}"), "")
+    expect_refusal(with_line(45, "arrays.out_sel = \{ offset = 0x8, stride = 8, count = 512 \}"),
+                   "b.toml: line 45, column 8: `arrays.out_sel` in [devices.GPIO] runs past the device's 0x1000 bytes")
+
+    // A device on a reserved line.
+    expect_refusal(with_line(39, "line = 57"),
+                   "b.toml: line 39, column 1: [devices.UART1] is on line 57, which [lines] reserves")
+
+    // A repeated key and a table given twice name both places (`toml`'s).
+    expect_refusal(with_line(31, "base = 0x1000_0000"),
+                   "b.toml: line 31, column 1: duplicate key `base` in [devices.UART0]; first defined at line 30, column 1")
+    expect_refusal(with_line(35, "[devices.UART0]"),
+                   "b.toml: line 35, column 10: table [devices.UART0] is defined twice; first defined at line 28, column 10")
+
+    // Arrays of at least one element, a multiple of 4 bytes apart.
+    expect_refusal(with_line(45, "arrays.out_sel = \{ offset = 0x554, stride = 4, count = 0 \}"),
+                   "b.toml: line 45, column 8: `arrays.out_sel` in [devices.GPIO] has 0 elements 4 bytes apart: an array has at least one 4-byte element, a multiple of 4 bytes apart")
+    expect_refusal(with_line(45, "arrays.out_sel = \{ offset = 0x554, stride = 0, count = 2 \}"),
+                   "b.toml: line 45, column 8: `arrays.out_sel` in [devices.GPIO] has 2 elements 0 bytes apart: an array has at least one 4-byte element, a multiple of 4 bytes apart")
+    expect_refusal(with_line(45, "arrays.out_sel = \{ offset = 0x554, stride = 4, count = -1 \}"),
+                   "b.toml: line 45, column 48: `count` in `arrays.out_sel` in [devices.GPIO] is -1, which is negative")
+    expect_refusal(with_line(44, "registers.ENABLE = \{ offset = 0x30, size = 4 \}"),
+                   "b.toml: line 44, column 37: `size` is not a key of `registers.ENABLE` in [devices.GPIO], which takes `offset`")
+
+    // Numbers the board's 32-bit word cannot hold, and ranges past its space.
+    expect_refusal(with_line(39, "line = 0x1_0000_0000"),
+                   "b.toml: line 39, column 1: `line` in [devices.UART1] is 0x100000000, past what this board's 32-bit word holds (0xffffffff)")
+    expect_refusal(with_line(47, "reserved = [0x1_0000_0000]"),
+                   "b.toml: line 47, column 13: a reserved line is 0x100000000, past what this board's 32-bit word holds (0xffffffff)")
+    expect_refusal(with_line(47, "reserved = [-1]"),
+                   "b.toml: line 47, column 13: a reserved line is -1, which is negative")
+    expect_refusal(with_line(37, "base = 0xFFFF_F000").replace("len = 0x1000\nline = 11", "len = 0x2000\nline = 11"),
+                   "b.toml: line 38, column 1: [devices.UART1] runs from 0xfffff000 for 0x2000 bytes, past the end of this board's address space")
+    expect_refusal(with_line(44, "registers.ENABLE = \{ offset = 0x1_0000_0000 \}"),
+                   "b.toml: line 44, column 22: `offset` in `registers.ENABLE` in [devices.GPIO] is 0x100000000, past what this board's 32-bit word holds (0xffffffff)")
+
+    // RAM ranges are disjoint.
+    expect_refusal(with_line(21, "base = 0x801F_F000"),
+                   "b.toml: line 18, column 6: [ram.main] and [ram.kernel] (at line 13, column 6) share bytes: RAM ranges are disjoint")
+
+    // Modules: NAME=PATH, and a keyed module's `*` last.
+    expect_refusal(with_line(8, "modules = [\"x=\"]"),
+                   "b.toml: line 8, column 12: `x=` in `modules` is not NAME=PATH, a module's name and its directory")
+    expect_refusal(with_line(8, "modules = [\"1x=y\"]"),
+                   "b.toml: line 8, column 12: `1x=y` in `modules` is not NAME=PATH, a module's name and its directory")
+    expect_refusal(with_line(8, "modules = [\"s3clock=keys/clock-*\"]"), "")
+    expect_refusal(with_line(8, "modules = [\"s3clock=keys/*-clock\"]"),
+                   "b.toml: line 8, column 12: `s3clock=keys/*-clock` in `modules`: a `*` ends a keyed module's path, after the part every key's directory starts with")
+    expect_refusal(with_line(8, "modules = [\"s3clock=*\"]"),
+                   "b.toml: line 8, column 12: `s3clock=*` in `modules`: a `*` ends a keyed module's path, after the part every key's directory starts with")
+
+    // A device input's path.
+    expect_refusal(with_line(34, "inputs = \{ uartpins = \"/etc/pins.saw\" \}"),
+                   "b.toml: line 34, column 12: `uartpins` in [devices.UART0]'s inputs is \"/etc/pins.saw\", an absolute path: a path is relative to the directory its file names it from")
+
+    // An in-place board's flash: slots and root-slot inside it, slots
+    // dividing their range, and no unknown key in a span.
+    expect_refusal(flash_board(0, ""), "")
+    expect_refusal(flash_board(53, "root-slot = \{ base = 0x40_0000, len = 0x8_0000 \}"),
+                   "b.toml: line 53, column 1: `root-slot` in [flash] runs from 0x400000 for 0x80000 bytes, outside the flash")
+    expect_refusal(flash_board(54, "slots = \{ base = 0x18_0000, len = 0x30_0000, count = 1 \}"),
+                   "b.toml: line 54, column 1: `slots` in [flash] runs from 0x180000 for 0x300000 bytes, outside the flash")
+    expect_refusal(flash_board(54, "slots = \{ base = 0x18_0000, len = 0x8_0000, count = 0 \}"),
+                   "b.toml: line 54, column 1: `slots` in [flash] is 0x80000 bytes in 0 slots: a slot range holds at least one slot, each the same length")
+    expect_refusal(flash_board(54, "slots = \{ base = 0x18_0000, len = 0x8_0000, count = 3 \}"),
+                   "b.toml: line 54, column 1: `slots` in [flash] is 0x80000 bytes in 3 slots: a slot range holds at least one slot, each the same length")
+    expect_refusal(flash_board(51, "ibus = \{ base = 0x4200_0000, len = 0x200_0000, top = 0 \}"),
+                   "b.toml: line 51, column 48: `top` is not a key of `ibus` in [flash], which takes `base`, `len`")
+}
+
+// The board, made in-place, with a [flash] after the rest whose line `n`
+// (48 to 54) is replaced by `with`; 0 replaces none.
+func flash_board(n: Int, with: String) -> String {
+    var lines = board_lines()
+    lines[6] = "placement = \"in-place\""
+    let flash: Vector<String> = ["[flash]",                                                    // 48
+                                 "base = 0x0",                                                 // 49
+                                 "len = 0x40_0000",                                            // 50
+                                 "ibus = \{ base = 0x4200_0000, len = 0x200_0000 \}",         // 51
+                                 "dbus = \{ base = 0x3C00_0000, len = 0x200_0000 \}",         // 52
+                                 "root-slot = \{ base = 0x10_0000, len = 0x8_0000 \}",        // 53
+                                 "slots = \{ base = 0x18_0000, len = 0x8_0000, count = 1 \}"] // 54
+    var i = 0
+    while i < flash.len() {
+        if i + 48 == n {
+            try! lines.push(with)
+        } else {
+            try! lines.push(flash.get(i) ?? "")
+        }
+        i = i + 1
+    }
+    text_of(&lines)
+}

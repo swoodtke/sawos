@@ -1,0 +1,557 @@
+// The hand-written image description's reader and the stock root's binding:
+// three images read clean (a useless box: setup writes, parts and clients; a
+// logger on two UARTs; the UART service, with a hand-written root), and each
+// refusal by its message.
+
+import sosimage.board.{Board}
+import sosimage.declaration.{Declaration}
+import sosimage.imagefile.{ImageFile, InputSource, bind, image_board}
+
+func join(lines: &Vector<String>) -> String {
+    "{lines.join("\n")}\n"
+}
+
+// An ESP32-S3 board with UART1 and UART2 beside the console, the devices a
+// useless box drives, and a slow range.
+func board() -> Board {
+    let lines: Vector<String> = [
+        "format = 1",
+        "[board]",
+        "name = \"esp32s3\"",
+        "triple = \"xtensa-esp-unknown-elf\"",
+        "tier = \"flat\"",
+        "hal = \"hal/xtensa-esp32s3\"",
+        "placement = \"copied\"",
+        "modules = []",
+        "cflags = []",
+        "[emulator]",
+        "program = \"qemu-system-xtensa\"",
+        "args = []",
+        "[ram.kernel]",
+        "use = \"kernel\"",
+        "speed = \"fast\"",
+        "base = 0x3FC8_C000",
+        "len = 0x2_4000",
+        "[ram.sram]",
+        "use = \"process\"",
+        "speed = \"fast\"",
+        "base = 0x3FCB_0000",
+        "len = 0x4_0000",
+        "[ram.psram]",
+        "use = \"process\"",
+        "speed = \"slow\"",
+        "base = 0x3D00_0000",
+        "len = 0x80_0000",
+        "[ram.default]",
+        "process = \"sram\"",
+        "pool = \"sram\"",
+        "[types.esp32s3-uart]",
+        "inputs = [\"uartpins\"]",
+        "[devices.UART0]",
+        "type = \"esp32s3-uart\"",
+        "base = 0x6000_0000",
+        "len = 0x1000",
+        "line = 27",
+        "kernel = true",
+        "inputs = \{ uartpins = \"config/uart0-pins.saw\" \}",
+        "[devices.UART1]",
+        "type = \"esp32s3-uart\"",
+        "base = 0x6001_0000",
+        "len = 0x1000",
+        "line = 28",
+        "[devices.UART2]",
+        "type = \"esp32s3-uart\"",
+        "base = 0x6002_E000",
+        "len = 0x1000",
+        "line = 29",
+        "[devices.GPIO]",
+        "type = \"esp32s3-gpio\"",
+        "base = 0x6000_4000",
+        "len = 0x1000",
+        "line = 16",
+        "registers.ENABLE1_W1TS = \{ offset = 0x030 \}",
+        "arrays.out_sel = \{ offset = 0x554, stride = 4, count = 54 \}",
+        "[devices.IO_MUX]",
+        "type = \"esp32s3-io-mux\"",
+        "base = 0x6000_9000",
+        "len = 0x1000",
+        "arrays.pad = \{ offset = 0x004, stride = 4, count = 49 \}",
+        "[devices.LEDC]",
+        "type = \"esp32s3-ledc\"",
+        "base = 0x6001_9000",
+        "len = 0x1000",
+        "line = 35",
+        "[devices.SYSTEM]",
+        "type = \"esp32s3-system\"",
+        "base = 0x600C_0000",
+        "len = 0x1000",
+        "registers.PERIP_CLK_EN0 = \{ offset = 0x018 \}",
+        "registers.PERIP_RST_EN0 = \{ offset = 0x020 \}",
+        "[lines]",
+        "reserved = [57]"]
+    try! Board.parse(join(&lines), "hal/xtensa-esp32s3/board.toml")
+}
+
+func gpio_decl() -> Declaration {
+    let lines: Vector<String> = [
+        "format = 1", "arena = 0x1000", "ram = \"fast\"",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"gpio\"", "kind = \"window\"", "type = \"esp32s3-gpio\"", "tag = 2",
+        "[[boot]]", "name = \"iomux\"", "kind = \"window\"", "type = \"esp32s3-io-mux\"", "tag = 3",
+        "[[boot]]", "name = \"gpio\"", "kind = \"line\"", "type = \"esp32s3-gpio\"", "tag = 4",
+        "[[boot]]", "name = \"gpio\"", "kind = \"serve\"", "protocol = \"gpioproto\"", "tag = 5",
+        "[quota]", "mappings = 2", "handles = 11", "waiters = 1",
+        "[build]", "inputs = [\"gpioconfig\"]"]
+    try! Declaration.parse(join(&lines), "drivers/svc-gpio-esp32s3/process.toml")
+}
+
+func pwm_decl() -> Declaration {
+    let lines: Vector<String> = [
+        "format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"ledc\"", "kind = \"window\"", "type = \"esp32s3-ledc\"", "tag = 2",
+        "[[boot]]", "name = \"outsel\"", "kind = \"window\"", "type = \"esp32s3-gpio\"", "part = true", "tag = 3",
+        "[[boot]]", "name = \"pads\"", "kind = \"window\"", "type = \"esp32s3-io-mux\"", "part = true", "tag = 4",
+        "[[boot]]", "name = \"pwm\"", "kind = \"serve\"", "protocol = \"pwmproto\"", "tag = 5",
+        "[quota]", "mappings = 3", "handles = 10", "waiters = 1",
+        "[build]", "inputs = [\"pwmconfig\"]"]
+    try! Declaration.parse(join(&lines), "drivers/svc-pwm-esp32s3/process.toml")
+}
+
+func controller_decl() -> Declaration {
+    let lines: Vector<String> = [
+        "format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"switch\"", "kind = \"client\"", "protocol = \"gpioproto\"", "tag = 2",
+        "[[boot]]", "name = \"servos\"", "kind = \"client\"", "protocol = \"pwmproto\"", "tag = 3"]
+    try! Declaration.parse(join(&lines), "controller/process.toml")
+}
+
+func heartbeat_decl() -> Declaration {
+    let lines: Vector<String> = [
+        "format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1"]
+    try! Declaration.parse(join(&lines), "heartbeat/process.toml")
+}
+
+func uart_decl() -> Declaration {
+    let lines: Vector<String> = [
+        "format = 1", "arena = 0x1000", "ram = \"fast\"",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"uart\"", "kind = \"window\"", "type = \"esp32s3-uart\"", "tag = 2",
+        "[[boot]]", "name = \"uart\"", "kind = \"line\"", "type = \"esp32s3-uart\"", "tag = 3",
+        "[[boot]]", "name = \"uart\"", "kind = \"serve\"", "protocol = \"uartproto\"", "tag = 4",
+        "[quota]", "handles = 8", "waiters = 1",
+        "[build]", "inputs = [\"uartpins\", \"uartconfig\"]",
+        "defaults = \{ uartconfig = \"config/default.saw\" \}"]
+    try! Declaration.parse(join(&lines), "drivers/svc-uart-esp32s3/process.toml")
+}
+
+func logger_decl() -> Declaration {
+    let lines: Vector<String> = [
+        "format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"gps\"", "kind = \"client\"", "protocol = \"uartproto\"", "tag = 2",
+        "[[boot]]", "name = \"modem\"", "kind = \"client\"", "protocol = \"uartproto\"", "tag = 3"]
+    try! Declaration.parse(join(&lines), "logger/process.toml")
+}
+
+// A useless box: the stock root, three setup writes, a part-window driver.
+func box_lines() -> Vector<String> {
+    ["format = 1",                                                       // 1
+     "[image]",                                                          // 2
+     "name = \"useless-box\"",                                           // 3
+     "board = \"esp32s3\"",                                              // 4
+     "tick = true",                                                      // 5
+     "[root]",                                                           // 6
+     "package = \"stock\"",                                              // 7
+     "[[setup]]",                                                        // 8
+     "register = \"SYSTEM.PERIP_CLK_EN0\"",                              // 9
+     "set = 0x800",                                                      // 10
+     "[[setup]]",                                                        // 11
+     "register = \"SYSTEM.PERIP_RST_EN0\"",                              // 12
+     "clear = 0x800",                                                    // 13
+     "[[setup]]",                                                        // 14
+     "register = \"GPIO.ENABLE1_W1TS\"",                                 // 15
+     "write = 0x600",                                                    // 16
+     "[[process]]",                                                      // 17
+     "name = \"gpio\"",                                                  // 18
+     "package = \"sawos:drivers/svc-gpio-esp32s3\"",                     // 19
+     "inputs = \{ gpioconfig = \"config/gpio.saw\" \}",                  // 20
+     "[[process]]",                                                      // 21
+     "name = \"pwm\"",                                                   // 22
+     "package = \"sawos:drivers/svc-pwm-esp32s3\"",                      // 23
+     "device = \{ outsel = \"GPIO.out_sel[41..=42]\", pads = \"IO_MUX.pad[41..=42]\" \}", // 24
+     "inputs = \{ pwmconfig = \"config/pwm.saw\" \}",                    // 25
+     "[[process]]",                                                      // 26
+     "name = \"controller\"",                                            // 27
+     "package = \"controller\"",                                         // 28
+     "clients = \{ switch = \"gpio.gpio\", servos = \"pwm.pwm\" \}",     // 29
+     "on-exit = \"shutdown\"",                                           // 30
+     "[[process]]",                                                      // 31
+     "name = \"heartbeat\"",                                             // 32
+     "package = \"heartbeat\""]                                          // 33
+}
+
+func box_decls() -> Vector<Declaration> {
+    var out = Vector<Declaration>()
+    try! out.push(gpio_decl())
+    try! out.push(pwm_decl())
+    try! out.push(controller_decl())
+    try! out.push(heartbeat_decl())
+    move out
+}
+
+// A logger with two UART drivers, one per instance.
+func logger_lines() -> Vector<String> {
+    ["format = 1",                                                       // 1
+     "[image]",                                                          // 2
+     "name = \"logger\"",                                                // 3
+     "board = \"esp32s3\"",                                              // 4
+     "tick = true",                                                      // 5
+     "[root]",                                                           // 6
+     "package = \"stock\"",                                              // 7
+     "[[process]]",                                                      // 8
+     "name = \"gps\"",                                                   // 9
+     "package = \"sawos:drivers/svc-uart-esp32s3\"",                     // 10
+     "device = \{ uart = \"UART1\" \}",                                  // 11
+     "inputs = \{ uartpins = \"config/gps-pins.saw\", uartconfig = \"config/gps.saw\" \}", // 12
+     "[[process]]",                                                      // 13
+     "name = \"modem\"",                                                 // 14
+     "package = \"sawos:drivers/svc-uart-esp32s3\"",                     // 15
+     "device = \{ uart = \"UART2\" \}",                                  // 16
+     "inputs = \{ uartpins = \"config/modem-pins.saw\" \}",              // 17
+     "[[process]]",                                                      // 18
+     "name = \"logger\"",                                                // 19
+     "package = \"logger\"",                                             // 20
+     "clients = \{ gps = \"gps.uart\", modem = \"modem.uart\" \}",       // 21
+     "on-exit = \"shutdown\""]                                           // 22
+}
+
+func logger_decls() -> Vector<Declaration> {
+    var out = Vector<Declaration>()
+    try! out.push(uart_decl())
+    try! out.push(uart_decl())
+    try! out.push(logger_decl())
+    move out
+}
+
+// The UART service of the gate, with a hand-written root, on this board.
+func service_lines() -> Vector<String> {
+    ["format = 1",                                       // 1
+     "[image]",                                          // 2
+     "name = \"uart_service\"",                          // 3
+     "board = \"esp32s3\"",                              // 4
+     "tick = false",                                     // 5
+     "[root]",                                           // 6
+     "package = \"sawos:tests/uart-service\"",           // 7
+     "[[process]]",                                      // 8
+     "name = \"driver\"",                                // 9
+     "package = \"sawos:drivers/svc-uart-ns16550\"",     // 10
+     "[[process]]",                                      // 11
+     "name = \"client\"",                                // 12
+     "package = \"sawos:tests/svc-client\"",             // 13
+     "[rows]",                                           // 14
+     "devices = [\"UART0\"]"]                            // 15
+}
+
+// `lines` with line `n` (1-based) replaced by `with`.
+func with_line(lines: Vector<String>, n: Int, with: String) -> String {
+    var l = lines.copy()
+    l[n - 1] = with
+    join(&l)
+}
+
+func with_extra(lines: Vector<String>, extra: String) -> String {
+    "{join(&lines)}{extra}\n"
+}
+
+func read_refusal(text: String) -> String {
+    let b = board()
+    match ImageFile.parse(text, "i.toml", &b, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect_read_refusal(text: String, message: String) {
+    let got = read_refusal(text)
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the reader's refusal")
+}
+
+func bind_refusal(text: String, decls: &Vector<Declaration>) -> String {
+    let b = board()
+    let image = try! ImageFile.parse(text, "i.toml", &b, 4)
+    match bind(&image, &b, &decls, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect_bind_refusal(text: String, decls: &Vector<Declaration>, message: String) {
+    let got = bind_refusal(text, &decls)
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the binding's refusal")
+}
+
+func has_note(notes: &Vector<String>, note: String) -> Bool {
+    var i = 0
+    while i < notes.len() {
+        if (notes.get(i) ?? "").equals(note) {
+            return true
+        }
+        i = i + 1
+    }
+    print("no note: {note}; the notes:")
+    i = 0
+    while i < notes.len() {
+        print("  {notes.get(i) ?? ""}")
+        i = i + 1
+    }
+    false
+}
+
+func main() {
+    let b = board()
+
+    // The useless box: three setup writes, four processes, two parts.
+    let box_text = join(&box_lines())
+    assert(try! image_board(box_text, "box.toml") == "esp32s3", "the board is read first")
+    let image = try! ImageFile.parse(box_text, "box.toml", &b, 4)
+    assert(image.stock, "the stock root")
+    assert(image.setup.len() == 3, "three setup writes")
+    assert((image.setup.get(0)!).register.base == 0x600C_0018, "PERIP_CLK_EN0")
+    assert((image.setup.get(2)!).value == 0x600, "the write's word")
+    assert(image.processes.len() == 4, "four processes")
+    assert((image.process("controller")!).on_exit.equals("shutdown"), "on-exit")
+    let boxed = box_decls()
+    let bound = try! bind(&image, &b, &boxed, 4)
+    assert(bound.windows.len() == 5, "gpio's two needs and pwm's three")
+    assert(has_note(&bound.notes, "pwm: part `outsel` is GPIO.out_sel[41..=42]: 0x600045f8 to 0x600045fc, 8 bytes"), "the first part")
+    assert(has_note(&bound.notes, "pwm: part `pads` is IO_MUX.pad[41..=42]: 0x600090a8 to 0x600090ac, 8 bytes"), "the second part")
+    assert(has_note(&bound.notes, "GPIO is bound to gpio, pwm"), "GPIO shared")
+    assert(has_note(&bound.notes, "IO_MUX is bound to gpio, pwm"), "IO_MUX shared")
+    assert(has_note(&bound.notes, "gpio: input `gpioconfig` from the image: config/gpio.saw"), "an input's source")
+
+    // Two UARTs: each named, each input from its source.
+    let logger_text = join(&logger_lines())
+    let logger = try! ImageFile.parse(logger_text, "logger.toml", &b, 4)
+    let logged_decls = logger_decls()
+    let logged = try! bind(&logger, &b, &logged_decls, 4)
+    assert((logged.windows.get(0)!).window.device.equals("UART1"), "gps has UART1")
+    assert((logged.windows.get(1)!).window.device.equals("UART2"), "modem has UART2")
+    assert(has_note(&logged.notes, "gps: input `uartconfig` from the image: config/gps.saw"), "gps's settings")
+    assert(has_note(&logged.notes, "modem: input `uartconfig` from the driver's default: config/default.saw"), "modem's default")
+    assert((logged.inputs.get(3)!).source == InputSource.Driver, "a default")
+
+    // The UART service: a hand-written root, its one device row.
+    let service = try! ImageFile.parse(join(&service_lines()), "service.toml", &b, 4)
+    assert(not service.stock, "a hand-written root")
+    assert(service.row_devices.len() == 1, "one device row")
+    assert((service.row_devices.get(0)!).window.base == 0x6000_0000, "UART0's window")
+
+    // Keys.
+    expect_read_refusal(with_line(service_lines(), 5, "tic = false"),
+                        "i.toml: line 5, column 1: `tic` is not a key of [image], which takes `name`, `board`, `tick`")
+    expect_read_refusal(with_extra(service_lines(), "inputs = \{ a = \"b\" \}").replace("[rows]\ndevices = [\"UART0\"]\n", ""),
+                        "i.toml: line 14, column 1: `inputs` is a stock root's process's: a hand-written root's process gives only `name` and `package`")
+    expect_read_refusal(with_line(box_lines(), 30, "on-exit = \"halt\""),
+                        "i.toml: line 30, column 1: `on-exit` is \"halt\", not one of \"report\", \"shutdown\"")
+    expect_read_refusal(with_line(box_lines(), 30, "exit = \"report\""),
+                        "i.toml: line 30, column 1: `exit` is not a key of [[process]], which takes `name`, `package`, `device`, `inputs`, `ram`, `quota`, `clients`, `pools`, `on-exit`")
+    expect_read_refusal(with_line(service_lines(), 4, "board = \"esp32c3\""),
+                        "i.toml: line 4, column 1: the image is for the board esp32c3, and it is being read against esp32s3")
+
+    // Which root has what.
+    expect_read_refusal(with_line(box_lines(), 7, "package = \"sawos:tests/uart-service\""),
+                        "i.toml: line 8, column 3: [[setup]] is the stock root's: a hand-written root makes its own writes")
+    expect_read_refusal(with_line(service_lines(), 7, "package = \"stock\""),
+                        "i.toml: line 14, column 2: [rows] is a hand-written root's: the stock root numbers its own rows")
+
+    // Process and pool names: unique, names, and `root` reserved.
+    expect_read_refusal(with_line(service_lines(), 12, "name = \"driver\""),
+                        "i.toml: line 12, column 1: the process `driver` is named twice, here and at line 9, column 1")
+    expect_read_refusal(with_line(service_lines(), 12, "name = \"root\""),
+                        "i.toml: line 12, column 1: `root` is reserved and names no process: the stock root reports itself under it")
+    expect_read_refusal(with_line(service_lines(), 12, "name = \"the client\""),
+                        "i.toml: line 12, column 1: `the client` is not a name: a process's name is a letter, then letters, digits, `_` and `-`")
+    expect_read_refusal(with_extra(service_lines(), "pools = [\"a\"]\n[[pool]]\nname = \"a\"\nlen = 0x1000\n[[pool]]\nname = \"a\"\nlen = 0x1000"),
+                        "i.toml: line 21, column 1: the pool `a` is named twice, here and at line 18, column 1")
+    expect_read_refusal(with_extra(service_lines(), "[[pool]]\nname = \"a\"\nlen = 0x1000"),
+                        "i.toml: line 17, column 1: the pool `a` is bound to nothing: bind it to a process's memory record, or list it in [rows] pools")
+    expect_read_refusal(with_extra(service_lines(), "pools = [\"a\", \"a\"]\n[[pool]]\nname = \"a\"\nlen = 0x1000"),
+                        "i.toml: line 16, column 15: the pool `a` is bound twice: a pool is bound once")
+    expect_read_refusal(with_extra(service_lines(), "pools = [\"b\"]"),
+                        "i.toml: line 16, column 10: [rows] pools names `b`, which no [[pool]] is")
+    expect_read_refusal(with_extra(service_lines(), "pools = [\"a\"]\n[[pool]]\nname = \"a\"\nlen = \"16K\""),
+                        "i.toml: line 19, column 1: `len` in [[pool]] is the string \"16K\": a size or an address is a TOML integer in bytes: write 0x4000")
+    expect_read_refusal(with_extra(service_lines(), "pools = [\"a\"]\n[[pool]]\nname = \"a\"\nlen = 0x1000\nram = \"kernel\""),
+                        "i.toml: line 20, column 1: `ram` is \"kernel\", the kernel's range: a process or a pool takes a range with use = \"process\"")
+    expect_read_refusal(with_extra(service_lines(), "pools = [\"a\"]\n[[pool]]\nname = \"a\"\nlen = 0x1000\nram = \"dram\""),
+                        "i.toml: line 20, column 1: `ram` is \"dram\", which names no RAM range of the board esp32s3")
+
+    // References: the grammar, `..` refused, and what the board has.
+    expect_read_refusal(with_line(box_lines(), 24, "device = \{ outsel = \"GPIO.out_sel[41..42]\", pads = \"IO_MUX.pad[41..=42]\" \}"),
+                        "i.toml: line 24, column 12: `GPIO.out_sel[41..42]`: write `..=`, an inclusive range")
+    expect_read_refusal(with_line(box_lines(), 24, "device = \{ outsel = \"GPIO..out_sel\", pads = \"IO_MUX.pad[41..=42]\" \}"),
+                        "i.toml: line 24, column 12: `GPIO..out_sel` is not a device reference: write DEVICE, DEVICE.REGISTER, DEVICE.ARRAY[i] or DEVICE.ARRAY[i..=j]")
+    expect_read_refusal(with_line(box_lines(), 24, "device = \{ outsel = \"GPIO.out_sel[-1]\", pads = \"IO_MUX.pad[41..=42]\" \}"),
+                        "i.toml: line 24, column 12: `GPIO.out_sel[-1]` is not a device reference: write DEVICE, DEVICE.REGISTER, DEVICE.ARRAY[i] or DEVICE.ARRAY[i..=j]")
+    expect_read_refusal(with_line(service_lines(), 15, "devices = [\"UART9\"]"),
+                        "i.toml: line 15, column 12: `UART9` names no device of the board esp32s3, whose devices are UART0, UART1, UART2, GPIO, IO_MUX, LEDC, SYSTEM")
+    expect_read_refusal(with_line(service_lines(), 15, "devices = [\"GPIO.out_sel[1]\"]"),
+                        "i.toml: line 15, column 12: `GPIO.out_sel[1]` is part of a device: [rows] devices names whole devices")
+    expect_read_refusal(with_line(service_lines(), 15, "devices = [\"UART0\", \"UART0\"]"),
+                        "i.toml: line 15, column 21: [rows] devices names UART0 twice, here and at line 15, column 12")
+    expect_read_refusal(with_line(box_lines(), 9, "register = \"SYSTEM\""),
+                        "i.toml: line 9, column 1: `SYSTEM` is a whole device, and a [[setup]] writes one register: write DEVICE.REGISTER or DEVICE.ARRAY[i]")
+    expect_read_refusal(with_line(box_lines(), 9, "register = \"SYSTEM.PERIP_CLK_EN9\""),
+                        "i.toml: line 9, column 1: `SYSTEM.PERIP_CLK_EN9`: SYSTEM has no register or array `PERIP_CLK_EN9`")
+    expect_read_refusal(with_line(box_lines(), 9, "register = \"GPIO.out_sel[3..=4]\""),
+                        "i.toml: line 9, column 1: `GPIO.out_sel[3..=4]` is a range, and a [[setup]] writes one register: name one element")
+    expect_read_refusal(with_line(box_lines(), 9, "register = \"GPIO.out_sel\""),
+                        "i.toml: line 9, column 1: `GPIO.out_sel`: `out_sel` is an array of GPIO; name an element, `GPIO.out_sel[i]`, or a range, `GPIO.out_sel[i..=j]`")
+    expect_read_refusal(with_line(box_lines(), 9, "register = \"SYSTEM.PERIP_CLK_EN0[0]\""),
+                        "i.toml: line 9, column 1: `SYSTEM.PERIP_CLK_EN0[0]`: `PERIP_CLK_EN0` is a register of SYSTEM, not an array")
+    expect_read_refusal(with_line(box_lines(), 24, "device = \{ outsel = \"GPIO.out_sel[42..=41]\", pads = \"IO_MUX.pad[41..=42]\" \}"),
+                        "")
+    expect_read_refusal(with_line(box_lines(), 10, "set = 0x1_0000_0000"),
+                        "i.toml: line 10, column 1: `set` in [[setup]] is 0x100000000, past 32 bits: a register is 4 bytes")
+    expect_read_refusal(with_line(box_lines(), 13, "set = 0x800\nclear = 0x800"),
+                        "i.toml: line 11, column 3: a [[setup]] has 2 of `set`, `clear` and `write`; it has exactly one")
+
+    // The list forms, reserved.
+    expect_read_refusal(with_line(logger_lines(), 11, "device = \{ uart = [\"UART1\", \"UART2\"] \}"),
+                        "i.toml: line 11, column 12: `uart` in the `device` of the process gps is a list: one value per device need, and the list form is reserved")
+    expect_read_refusal(with_line(logger_lines(), 17, "inputs = \{ uartpins = [\"a.saw\"] \}"),
+                        "i.toml: line 17, column 12: `uartpins` in the `inputs` of the process modem is a list: one value per input, and the list form is reserved")
+
+    // Binding: ranges past the array, misaligned parts, device types, and
+    // what an image must name.
+    let decls = box_decls()
+    expect_bind_refusal(with_line(box_lines(), 24, "device = \{ outsel = \"GPIO.out_sel[42..=41]\", pads = \"IO_MUX.pad[41..=42]\" \}"), &decls,
+                        "i.toml: line 24, column 12: `GPIO.out_sel[42..=41]`: an array range is i..=j with i <= j < 54, the count of `out_sel`")
+    expect_bind_refusal(with_line(box_lines(), 24, "device = \{ outsel = \"GPIO.out_sel[41..=54]\", pads = \"IO_MUX.pad[41..=42]\" \}"), &decls,
+                        "i.toml: line 24, column 12: `GPIO.out_sel[41..=54]`: an array range is i..=j with i <= j < 54, the count of `out_sel`")
+    expect_bind_refusal(with_line(box_lines(), 24, "device = \{ outsel = \"GPIO.out_sel[42..=43]\", pads = \"IO_MUX.pad[41..=42]\" \}"), &decls,
+                        "i.toml: line 24, column 12: `GPIO.out_sel[42..=43]` is 8 bytes at 0x600045fc, and a part is a naturally aligned power of two of at least 4 bytes, this board's grain")
+    expect_bind_refusal(with_line(box_lines(), 24, "device = \{ outsel = \"GPIO.out_sel[40..=42]\", pads = \"IO_MUX.pad[41..=42]\" \}"), &decls,
+                        "i.toml: line 24, column 12: `GPIO.out_sel[40..=42]` is 12 bytes at 0x600045f4, and a part is a naturally aligned power of two of at least 4 bytes, this board's grain")
+    expect_bind_refusal(with_line(box_lines(), 24, "device = \{ outsel = \"LEDC\", pads = \"IO_MUX.pad[41..=42]\" \}"), &decls,
+                        "i.toml: line 24, column 12: `LEDC` is a device of the type `esp32s3-ledc`, and the need `outsel` of the process pwm takes a `esp32s3-gpio`")
+    expect_bind_refusal(with_line(box_lines(), 24, "device = \{ pads = \"IO_MUX.pad[41..=42]\" \}"), &decls,
+                        "i.toml: line 22, column 1: the need `outsel` of the process pwm is a part window: name its registers in `device`")
+    expect_bind_refusal(with_line(box_lines(), 24, "device = \{ outsel = \"GPIO.out_sel[41..=42]\", pads = \"IO_MUX.pad[41..=42]\", led = \"LEDC\" \}"), &decls,
+                        "i.toml: line 24, column 76: `led` in the `device` of the process pwm is no device need of sawos:drivers/svc-pwm-esp32s3")
+    expect_bind_refusal(with_line(box_lines(), 20, "device = \{ gpio = \"GPIO.out_sel[0]\" \}\ninputs = \{ gpioconfig = \"config/gpio.saw\" \}"), &decls,
+                        "i.toml: line 20, column 12: `GPIO.out_sel[0]` is part of a device: a device need that is not `part = true` takes a whole device")
+    expect_bind_refusal(with_line(box_lines(), 20, "device = \{ gpio = \"GPIO.ENABLE1_W1TS\" \}\ninputs = \{ gpioconfig = \"config/gpio.saw\" \}"), &decls,
+                        "i.toml: line 20, column 12: `GPIO.ENABLE1_W1TS` is a register, which only a [[setup]] names: a device need that is not `part = true` takes a whole device")
+    let ldecls = logger_decls()
+    expect_bind_refusal(with_line(logger_lines(), 11, "ram = \"sram\""), &ldecls,
+                        "i.toml: line 9, column 1: the board esp32s3 has 3 devices of the type `esp32s3-uart`: name the one the need `uart` of the process gps takes in `device`")
+    expect_bind_refusal(with_line(logger_lines(), 11, "ram = \"psram\"\ndevice = \{ uart = \"UART1\" \}"), &ldecls,
+                        "i.toml: line 9, column 1: the process gps declares ram = \"fast\" and is placed in psram, a slow range")
+
+    // Clients and memory records.
+    expect_bind_refusal(with_line(box_lines(), 29, "clients = \{ switch = \"gpio.gpio\" \}"), &decls,
+                        "i.toml: line 27, column 1: the client record `servos` of the process controller is unbound: bind it in `clients`")
+    expect_bind_refusal(with_line(box_lines(), 29, "clients = \{ switch = \"gpio.gpio\", servos = \"gpio.gpio\" \}"), &decls,
+                        "i.toml: line 29, column 35: `gpio.gpio` serves `gpioproto`, and the client `servos` of the process controller speaks `pwmproto`")
+    expect_bind_refusal(with_line(box_lines(), 29, "clients = \{ switch = \"gpio.gpio\", servos = \"pwm.servo\" \}"), &decls,
+                        "i.toml: line 29, column 35: `pwm.servo` names no serve record of the process pwm")
+    expect_bind_refusal(with_line(box_lines(), 29, "clients = \{ switch = \"gpio.gpio\", servos = \"motor.pwm\" \}"), &decls,
+                        "i.toml: line 29, column 35: `motor.pwm` names no process of this image: there is no `motor`")
+    expect_bind_refusal(with_line(box_lines(), 29, "clients = \{ switch = \"gpio.gpio\", servos = \"pwm.pwm\", lamp = \"pwm.pwm\" \}"), &decls,
+                        "i.toml: line 29, column 55: `lamp` in the `clients` of the process controller is no client record of controller")
+
+    // Pools: bound once, and only to memory records.
+    let twice = with_line(box_lines(), 30, "on-exit = \"shutdown\"\npools = \{ buf = \"a\" \}")
+    expect_read_refusal("{twice}pools = \{ buf = \"a\" \}\n[[pool]]\nname = \"a\"\nlen = 0x1000\n",
+                        "i.toml: line 35, column 11: the pool `a` is bound twice: a pool is bound once")
+    expect_bind_refusal(with_extra(box_lines(), "pools = \{ buf = \"a\" \}\n[[pool]]\nname = \"a\"\nlen = 0x1000"), &decls,
+                        "i.toml: line 34, column 11: `buf` in the `pools` of the process heartbeat is no memory record of heartbeat")
+    var buffered = box_decls()
+    let memory: Vector<String> = ["format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"buf\"", "kind = \"memory\"", "tag = 2"]
+    buffered[3] = try! Declaration.parse(join(&memory), "heartbeat/process.toml")
+    expect_bind_refusal(join(&box_lines()), &buffered,
+                        "i.toml: line 32, column 1: the memory record `buf` of the process heartbeat is unbound: bind it in `pools`")
+    expect_bind_refusal(with_extra(box_lines(), "pools = \{ buf = \"a\" \}\n[[pool]]\nname = \"a\"\nlen = 0x1000"), &buffered, "")
+
+    // Inputs: one the process does not have, and one with no value.
+    expect_bind_refusal(with_line(box_lines(), 20, "inputs = \{ gpioconfig = \"config/gpio.saw\", pins = \"p.saw\" \}"), &decls,
+                        "i.toml: line 20, column 44: `pins` is not an input of sawos:drivers/svc-gpio-esp32s3, whose inputs are `gpioconfig`")
+    expect_bind_refusal(with_line(box_lines(), 20, "ram = \"sram\""), &decls,
+                        "i.toml: line 18, column 1: the input `gpioconfig` of the process gpio has no value: the image gives none, no device it is bound to fixes it, and sawos:drivers/svc-gpio-esp32s3 has no default for it")
+
+    // A kernel device is bound only when named; then its board input applies,
+    // and an image value overrides it, printed.
+    expect_bind_refusal(with_line(logger_lines(), 11, "device = \{ uart = \"UART0\" \}").replace("uartpins = \"config/gps-pins.saw\", ", ""), &ldecls, "")
+    let on_console = try! ImageFile.parse(with_line(logger_lines(), 11, "device = \{ uart = \"UART0\" \}"), "i.toml", &b, 4)
+    let console = try! bind(&on_console, &b, &ldecls, 4)
+    assert(has_note(&console.notes, "gps: input `uartpins` from the image: config/gps-pins.saw, which overrides the board's (UART0's config/uart0-pins.saw)"), "an override, printed")
+    let from_board = try! ImageFile.parse(with_line(logger_lines(), 11, "device = \{ uart = \"UART0\" \}").replace("uartpins = \"config/gps-pins.saw\", ", ""), "i.toml", &b, 4)
+    let fixed = try! bind(&from_board, &b, &ldecls, 4)
+    assert(has_note(&fixed.notes, "gps: input `uartpins` from the board's UART0: config/uart0-pins.saw"), "the board's value")
+
+    // Unknown keys: at the top, in [[setup]], in [[pool]], and a hand-written
+    // root's process's typo, which is no stock root's key either.
+    expect_read_refusal(with_line(service_lines(), 1, "format = 1\nimages = 2"),
+                        "i.toml: line 2, column 1: `images` is not a key of an image description, which takes `format`, `image`, `limits`, `root`, `setup`, `process`, `pool`, `rows`")
+    expect_read_refusal(with_line(box_lines(), 10, "set = 0x800\nmask = 0x800"),
+                        "i.toml: line 11, column 1: `mask` is not a key of [[setup]], which takes `register`, `set`, `clear`, `write`")
+    expect_read_refusal(with_extra(service_lines(), "pools = [\"a\"]\n[[pool]]\nname = \"a\"\nlen = 0x1000\nsize = 4"),
+                        "i.toml: line 20, column 1: `size` is not a key of [[pool]], which takes `name`, `len`, `ram`")
+    expect_read_refusal(with_line(service_lines(), 13, "pakage = \"sawos:tests/svc-client\""),
+                        "i.toml: line 13, column 1: `pakage` is not a key of [[process]], which takes `name`, `package`, `device`, `inputs`, `ram`, `quota`, `clients`, `pools`, `on-exit`")
+
+    // A reserved RAM name; a pool past the 32-bit word; a pool binding
+    // naming no [[pool]].
+    expect_read_refusal(with_line(logger_lines(), 22, "on-exit = \"shutdown\"\nram = \"default\""),
+                        "i.toml: line 23, column 1: `default` is reserved and names no RAM range: `[ram.default]` is the defaults table")
+    expect_read_refusal(with_extra(service_lines(), "pools = [\"a\"]\n[[pool]]\nname = \"a\"\nlen = 0x1_0000_0000"),
+                        "i.toml: line 19, column 1: `len` in [[pool]] is 0x100000000, past what this board's 32-bit word holds (0xffffffff)")
+    expect_read_refusal(with_extra(box_lines(), "pools = \{ buf = \"zz\" \}\n[[pool]]\nname = \"a\"\nlen = 0x1000\n[[process]]\nname = \"spare\"\npackage = \"spare\"\npools = \{ buf = \"a\" \}"),
+                        "i.toml: line 34, column 11: `buf` is bound to the pool `zz`, which no [[pool]] is")
+
+    // [[setup]] takes one element, never a range, even of one.
+    expect_read_refusal(with_line(box_lines(), 9, "register = \"GPIO.out_sel[3..=3]\""),
+                        "i.toml: line 9, column 1: `GPIO.out_sel[3..=3]` is a range, and a [[setup]] writes one register: name one element")
+    expect_read_refusal(with_line(box_lines(), 9, "register = \"GPIO.out_sel[3]\""), "")
+
+    // Paths: a package, the root's, an input.
+    expect_read_refusal(with_line(service_lines(), 13, "package = \"\""),
+                        "i.toml: line 13, column 1: `package` of the process client is \"\", which names no path")
+    expect_read_refusal(with_line(service_lines(), 13, "package = \"sawos:\""),
+                        "i.toml: line 13, column 1: `package` of the process client is \"sawos:\", which names no path")
+    expect_read_refusal(with_line(service_lines(), 7, "package = \"/etc\""),
+                        "i.toml: line 7, column 1: `package` in [root] is \"/etc\", an absolute path: a path is relative to the directory its file names it from")
+    expect_read_refusal(with_line(service_lines(), 13, "package = \"sawos:../../x\""),
+                        "i.toml: line 13, column 1: `package` of the process client is \"sawos:../../x\", which climbs out with `..`: a path stays under the directory it is relative to")
+    expect_read_refusal(with_line(box_lines(), 20, "inputs = \{ gpioconfig = \"../gpio.saw\" \}"),
+                        "i.toml: line 20, column 12: the input `gpioconfig` of the process gpio is \"../gpio.saw\", which climbs out with `..`: a path stays under the directory it is relative to")
+
+    // A client binding that is not PROCESS.RECORD.
+    expect_bind_refusal(with_line(box_lines(), 29, "clients = \{ switch = \"gpio\", servos = \"pwm.pwm\" \}"), &decls,
+                        "i.toml: line 29, column 13: `gpio` is not PROCESS.RECORD, a process and its serve record")
+
+    // A part smaller than the board's grain.
+    let one = with_line(box_lines(), 24, "device = \{ outsel = \"GPIO.out_sel[41]\", pads = \"IO_MUX.pad[41..=42]\" \}")
+    let coarse = try! ImageFile.parse(one, "i.toml", &b, 8)
+    let small = match bind(&coarse, &b, &decls, 8) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(small.equals("i.toml: line 24, column 12: `GPIO.out_sel[41]` is 4 bytes at 0x600045f8, and a part is a naturally aligned power of two of at least 8 bytes, this board's grain"), "a part under the grain: {small}")
+    let fine = try! ImageFile.parse(one, "i.toml", &b, 4)
+    let _ = try! bind(&fine, &b, &decls, 4)
+}

@@ -1,0 +1,45 @@
+# The flat build profile of the QEMU `virt` board, riscv32: the same machine
+# with protection opened, a board of its own for an image to name.
+# tools/sosimage/src/board.saw states the format; `sosimage board` holds
+# this file to the runner's profile and to this HAL's numbers.
+format = 1
+
+[board]
+name = "riscv32-virt-flat"
+triple = "riscv32-unknown-none-elf"
+tier = "flat"
+hal = "hal/riscv32-flat"
+placement = "copied"
+modules = ["rv32core=../riscv32-common/kernel", "rv32virt=../riscv32/kernel"]
+cflags = ["-march=rv32imac_zicsr", "-mabi=ilp32"]
+
+[emulator]
+program = "qemu-system-riscv32"
+args = ["-M", "virt", "-bios", "none"]
+
+# RAM is 128 MiB from 0x8000_0000 (hal/riscv32/kernel/virt.ld). The kernel,
+# its payload and its blobs sit below root's region; processes have the
+# rest, to `RAM_TOP`.
+[ram.kernel]
+use = "kernel"
+speed = "fast"
+base = 0x8000_0000
+len = 0x20_0000             # 2 MiB
+
+[ram.ram]
+use = "process"
+speed = "fast"
+base = 0x8020_0000
+len = 0x7E0_0000            # 126 MiB
+
+[ram.default]
+process = "ram"
+pool = "ram"
+
+# The console: an NS16550A, on PLIC source 10.
+[devices.UART0]
+type = "ns16550"
+base = 0x1000_0000
+len = 0x1000
+line = 10
+kernel = true

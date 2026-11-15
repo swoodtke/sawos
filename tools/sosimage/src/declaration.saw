@@ -1,0 +1,478 @@
+//! A process's declaration: `process.toml`, beside the `Saw.toml` of each
+//! package the stock root launches.
+//!
+//!     format = 1
+//!     arena = 0x1000                     a size
+//!     ram = "fast"                       optional: it needs fast memory
+//!
+//!     [[boot]]                           in the order the launcher gives them
+//!     name = "uart"
+//!     kind = "window"                    system, window, line, serve, client
+//!     type = "esp32s3-uart"              or memory
+//!     tag = 2
+//!
+//!     [quota]                            optional, each key optional
+//!     handles = 8
+//!     waiters = 1
+//!
+//!     [build]                            optional
+//!     inputs = ["uartpins", "uartconfig"]
+//!     defaults = { uartconfig = "config/default.saw" }
+//!
+//! By kind, a record also has: `system`, nothing (exactly one, whose tag is
+//! the start tag); `window`, `type` and an optional `part = true` (a register
+//! range of the device will do, and the image names it); `line`, `type`;
+//! `serve` and `client`, `protocol`, the protocol package's name; `memory`,
+//! nothing (the image binds it to a pool). A path is relative to the
+//! package's directory.
+//!
+//! Beyond the rules of `sosimage.rules`, a declaration is refused by name
+//! for: a `count` on a record (the list form, reserved); a tag given twice;
+//! not exactly one `system` record; a name given twice within its family
+//! (device needs; endpoints, a serve and a client sharing one set of names;
+//! memory), where a window and a line of one type under one name are one
+//! need; two names for one type, which would be two devices of one type
+//! (reserved); a `defaults` key that is not an input, or whose value is not a
+//! path; a `ram` other than `fast`; and a declared `handles` below what the
+//! process holds when it starts (one per record, its Process handle, and one
+//! Mapping per window).
+//!
+//! Against a board (`check_against`), a process is also refused for an
+//! `arena` or a tag the board's word cannot hold, a type the board has no
+//! device of, a board input of a type it needs (other than through a `part`
+//! window alone) that its `inputs` does not list, and a default for any board
+//! input of a type it needs: the board input's value follows the device.
+
+import std.path.{Path}
+import toml.{TomlKind, TomlPosition, TomlTable}
+import sosimage.board.{Board, NamedCount, expect_table, quota_keys, read_counts}
+import sosimage.failure.{BuildError}
+import sosimage.rules.{
+    check_format, check_name, check_path, count, fits_board_word, flag, holds,
+    name_list, only_keys, parse_description, refused, size, text, toml_refused,
+    where_is,
+}
+
+/// What a boot record is.
+public enum RecordKind {
+    case System,
+    case Window,
+    case Line,
+    case Serve,
+    case Client,
+    case Memory
+}
+
+@synthesize
+extension RecordKind: Equatable {}
+
+/// The kind named `word`.
+public func record_kind(word: String) -> RecordKind? {
+    if word.equals("system") { return RecordKind.System }
+    if word.equals("window") { return RecordKind.Window }
+    if word.equals("line") { return RecordKind.Line }
+    if word.equals("serve") { return RecordKind.Serve }
+    if word.equals("client") { return RecordKind.Client }
+    if word.equals("memory") { return RecordKind.Memory }
+    None
+}
+
+/// A kind's word, as a declaration writes it.
+public func kind_word(kind: RecordKind) -> String {
+    match kind {
+        case System -> "system",
+        case Window -> "window",
+        case Line -> "line",
+        case Serve -> "serve",
+        case Client -> "client",
+        case Memory -> "memory"
+    }
+}
+
+/// One `[[boot]]` record.
+public struct BootRecord {
+    name: String
+    kind: RecordKind
+    tag: Int
+    tag_at: TomlPosition
+    /// A window's or a line's device type; empty for the other kinds.
+    type_name: String
+    /// A window that a register range of its device will do for.
+    part: Bool
+    /// A serve's or a client's protocol package; empty for the other kinds.
+    protocol: String
+    at: TomlPosition
+}
+
+/// An input's default, and the file it names.
+public struct InputDefault {
+    input: String
+    path: String
+    at: TomlPosition
+}
+
+/// A process, as its declaration states it.
+public struct Declaration {
+    /// The file, as it was named.
+    file: String
+    /// The package's directory: the file's.
+    dir: String
+    arena: UInt64
+    arena_at: TomlPosition
+    /// `ram = "fast"`.
+    fast: Bool
+    records: Vector<BootRecord>
+    quota: Vector<NamedCount>
+    inputs: Vector<String>
+    inputs_at: TomlPosition
+    defaults: Vector<InputDefault>
+}
+
+@synthesize
+extension Declaration: ExplicitCopy {}
+
+/// Whether a record is a device need: a window or a line.
+public func is_need(kind: RecordKind) -> Bool {
+    kind == RecordKind.Window || kind == RecordKind.Line
+}
+
+/// The family a record's name is unique in.
+func family(kind: RecordKind) -> Int {
+    match kind {
+        case Window -> 0,
+        case Line -> 0,
+        case Serve -> 1,
+        case Client -> 1,
+        case System -> 2,
+        case Memory -> 3
+    }
+}
+
+extension Declaration {
+    /// Reads a declaration from its text; `file` names it, and its directory
+    /// is the package's.
+    public static func parse(text: String, file: String) -> Result<Declaration, BuildError> {
+        let doc = try parse_description(text, file)
+        borrow let root = doc.root() {
+            return Declaration.read(&root, file)
+        }
+    }
+
+    /// Reads a declaration's top-level table.
+    public static func read(root: &TomlTable, file: String) -> Result<Declaration, BuildError> {
+        let top_keys: Vector<String> = ["format", "arena", "ram", "boot", "quota", "build"]
+        try only_keys(&root, &top_keys, file, "a process declaration")
+        try check_format(&root, file)
+        let arena = try size(&root, "arena", 8, file, "the declaration")
+        var fast = false
+        if root.contains("ram") {
+            let ram = try text(&root, "ram", file)
+            if not ram.equals("fast") {
+                return refused(file, where_is(&root, "ram"),
+                               "`ram` is \"{ram}\": a declaration's `ram` is \"fast\", for a program that needs fast memory, or absent")
+            }
+            fast = true
+        }
+
+        try root.require("boot", TomlKind.Array) catch {
+            return toml_refused(file, error)
+        }
+        var records = Vector<BootRecord>()
+        if let boot = root.array("boot") {
+            var i = 0
+            while i < boot.len() {
+                if let r = boot.table(i) {
+                    try! records.push(try read_record(&r, file))
+                } else {
+                    return refused(file, boot.position(i) ?? boot.defined_at(),
+                                   "`boot` is an array of tables: write each record as [[boot]]")
+                }
+                i = i + 1
+            }
+        }
+        try check_records(&records, file, where_is(&root, "boot"))
+
+        var quota = Vector<NamedCount>()
+        try expect_table(&root, "quota", file)
+        if let q = root.table("quota") {
+            let keys = quota_keys()
+            quota = try read_counts(&q, &keys, file, "[quota]")
+            try check_handles(&records, &quota, file, where_is(&q, "handles"))
+        }
+
+        var inputs = Vector<String>()
+        var inputs_at = root.defined_at()
+        var defaults = Vector<InputDefault>()
+        try expect_table(&root, "build", file)
+        if let b = root.table("build") {
+            let build_keys: Vector<String> = ["inputs", "defaults"]
+            try only_keys(&b, &build_keys, file, "[build]")
+            inputs = try name_list(&b, "inputs", file, "an input's name")
+            inputs_at = where_is(&b, "inputs")
+            try expect_table(&b, "defaults", file)
+            if let d = b.table("defaults") {
+                let names = try! d.keys()
+                var i = 0
+                while i < names.len() {
+                    let input = names.get(i) ?? ""
+                    i = i + 1
+                    let at = where_is(&d, input)
+                    if not holds(&inputs, input) {
+                        return refused(file, at, "`{input}` has a default and is not one of [build] inputs")
+                    }
+                    if d.kind(input) == TomlKind.Array {
+                        return refused(file, at, "the default for `{input}` is a list: an input takes one value, and the list form is reserved")
+                    }
+                    let path = try text(&d, input, file)
+                    try check_path(path, file, at, "the default for `{input}`")
+                    try! defaults.push(InputDefault(input: input, path: path, at: at))
+                }
+            }
+        }
+
+        let dir = Path(s: file).parent()?.as_string() ?? "."
+        return Declaration(file: file, dir: dir, arena: arena, arena_at: where_is(&root, "arena"), fast: fast,
+                           records: move records, quota: move quota,
+                           inputs: move inputs, inputs_at: inputs_at,
+                           defaults: move defaults)
+    }
+
+    /// The handles the process holds when it starts: one per record, its
+    /// Process handle, and one Mapping per window.
+    public func handle_floor(&self) -> Int {
+        handles_at_start(&self.records)
+    }
+
+    /// The device needs, each named once, with its type: the first record of
+    /// each.
+    public func needs(&self) -> Vector<BootRecord> {
+        var out = Vector<BootRecord>()
+        var i = 0
+        while i < self.records.len() {
+            let r = self.records.get(i)!
+            i = i + 1
+            if not is_need(r.kind) {
+                continue
+            }
+            var seen = false
+            var j = 0
+            while j < out.len() {
+                if (out.get(j)!).name.equals(r.name) {
+                    seen = true
+                }
+                j = j + 1
+            }
+            if not seen {
+                try! out.push(r)
+            }
+        }
+        move out
+    }
+
+    /// Whether `name` is one of the device needs.
+    public func has_need(&self, name: String) -> Bool {
+        var i = 0
+        while i < self.records.len() {
+            let r = self.records.get(i)!
+            if is_need(r.kind) && r.name.equals(name) {
+                return true
+            }
+            i = i + 1
+        }
+        false
+    }
+
+    /// Whether the need `name` is met by a register range alone: every record
+    /// of it is a `part` window.
+    public func need_is_part(&self, name: String) -> Bool {
+        var i = 0
+        while i < self.records.len() {
+            let r = self.records.get(i)!
+            if is_need(r.kind) && r.name.equals(name) && not (r.kind == RecordKind.Window && r.part) {
+                return false
+            }
+            i = i + 1
+        }
+        true
+    }
+
+    /// The record of `kind` named `name`.
+    public func record(&self, kind: RecordKind, name: String) -> BootRecord? {
+        var i = 0
+        while i < self.records.len() {
+            if let r = self.records.get(i) {
+                if r.kind == kind && r.name.equals(name) {
+                    return r
+                }
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// This input's default.
+    public func default_for(&self, input: String) -> InputDefault? {
+        var i = 0
+        while i < self.defaults.len() {
+            if let d = self.defaults.get(i) {
+                if d.input.equals(input) {
+                    return d
+                }
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// Refuses the declaration on `board` for an `arena` or a tag its word
+    /// cannot hold, a type the board has no device of, a board input of a
+    /// needed type that `inputs` does not list (a need met by a part window
+    /// alone owes none), and a default for any board input of a needed type.
+    public func check_against(&self, board: &Board) -> Result<Void, BuildError> {
+        try fits_board_word(self.arena, board.name, board.word, self.file, self.arena_at,
+                            "`arena`")
+        var t = 0
+        while t < self.records.len() {
+            let r = self.records.get(t)!
+            try fits_board_word(r.tag as UInt64, board.name, board.word, self.file, r.tag_at,
+                                "the tag of `{r.name}`")
+            t = t + 1
+        }
+        let needs = self.needs()
+        var i = 0
+        while i < needs.len() {
+            let need = needs.get(i)!
+            i = i + 1
+            if board.instances(need.type_name).len() == 0 {
+                return refused(self.file, need.at,
+                               "the {kind_word(need.kind)} `{need.name}` needs a device of the type `{need.type_name}`, and the board {board.name} has none")
+            }
+            let board_inputs = board.board_inputs(need.type_name)
+            var j = 0
+            while j < board_inputs.len() {
+                let input = board_inputs.get(j) ?? ""
+                j = j + 1
+                if let d = self.default_for(input) {
+                    return refused(self.file, d.at,
+                                   "`{input}` is a board input of the type `{need.type_name}` on the board {board.name}, and a driver's default for it would be a guess at wiring: its value comes from the image or the device")
+                }
+                if not holds(&self.inputs, input) && not self.need_is_part(need.name) {
+                    return refused(self.file, self.inputs_at,
+                                   "`{input}` is a board input of the type `{need.type_name}` on the board {board.name}, and [build] inputs does not list it")
+                }
+            }
+        }
+        return
+    }
+}
+
+/// The handles a process with `records` holds when it starts.
+func handles_at_start(records: &Vector<BootRecord>) -> Int {
+    var windows = 0
+    var i = 0
+    while i < records.len() {
+        if (records.get(i)!).kind == RecordKind.Window {
+            windows = windows + 1
+        }
+        i = i + 1
+    }
+    records.len() + 1 + windows
+}
+
+/// One `[[boot]]` record.
+func read_record(r: &TomlTable, file: String) -> Result<BootRecord, BuildError> {
+    if r.contains("count") {
+        return refused(file, where_is(&r, "count"),
+                       "`count` on a [[boot]] record is the list form, which is reserved: a record is one instance")
+    }
+    let kind_text = try text(&r, "kind", file)
+    guard let kind = record_kind(kind_text) else {
+        return refused(file, where_is(&r, "kind"),
+                       "`kind` in [[boot]] is \"{kind_text}\", not one of \"system\", \"window\", \"line\", \"serve\", \"client\", \"memory\"")
+    }
+    let what = "a [[boot]] record of kind {kind_text}"
+    let known: Vector<String> = match kind {
+        case Window -> ["name", "kind", "tag", "type", "part"],
+        case Line -> ["name", "kind", "tag", "type"],
+        case Serve -> ["name", "kind", "tag", "protocol"],
+        case Client -> ["name", "kind", "tag", "protocol"],
+        case _ -> ["name", "kind", "tag"]
+    }
+    try only_keys(&r, &known, file, what)
+    let name = try text(&r, "name", file)
+    try check_name(name, file, where_is(&r, "name"), "a record's name")
+    let tag = try count(&r, "tag", file, "[[boot]]")
+    var type_name = ""
+    if is_need(kind) {
+        type_name = try text(&r, "type", file)
+        try check_name(type_name, file, where_is(&r, "type"), "a device type")
+    }
+    var protocol = ""
+    if kind == RecordKind.Serve || kind == RecordKind.Client {
+        protocol = try text(&r, "protocol", file)
+        try check_name(protocol, file, where_is(&r, "protocol"), "a protocol package's name")
+    }
+    let part = try flag(&r, "part", false, file)
+    return BootRecord(name: name, kind: kind, tag: tag, tag_at: where_is(&r, "tag"),
+                      type_name: type_name, part: part,
+                      protocol: protocol, at: r.defined_at())
+}
+
+/// Refuses a tag given twice, not exactly one system record, a name given
+/// twice in its family, and two names for one device type.
+func check_records(records: &Vector<BootRecord>, file: String, at: TomlPosition) -> Result<Void, BuildError> {
+    var systems = 0
+    var i = 0
+    while i < records.len() {
+        let r = records.get(i)!
+        if r.kind == RecordKind.System {
+            systems = systems + 1
+        }
+        var j = 0
+        while j < i {
+            let o = records.get(j)!
+            j = j + 1
+            if o.tag == r.tag {
+                return refused(file, r.at, "the tag {r.tag} is given twice, here and at {o.at}: a tag is unique in a declaration")
+            }
+            if family(o.kind) == family(r.kind) && o.name.equals(r.name) {
+                if is_need(r.kind) && o.kind != r.kind && o.type_name.equals(r.type_name) {
+                    continue
+                }
+                if is_need(r.kind) && o.kind != r.kind {
+                    return refused(file, r.at, "the device need `{r.name}` is of the type `{r.type_name}` here and `{o.type_name}` at {o.at}: one need is one device")
+                }
+                if o.kind != r.kind {
+                    return refused(file, r.at, "`{r.name}` names a {kind_word(o.kind)} record at {o.at} and a {kind_word(r.kind)} record here: a serve and a client share one set of names")
+                }
+                return refused(file, r.at, "`{r.name}` names two {kind_word(r.kind)} records, here and at {o.at}")
+            }
+            if is_need(r.kind) && is_need(o.kind) && r.type_name.equals(o.type_name) {
+                return refused(file, r.at, "`{r.name}` and `{o.name}` (at {o.at}) are two device needs of the type `{r.type_name}`: two devices of one type is the list form, which is reserved")
+            }
+        }
+        i = i + 1
+    }
+    if systems != 1 {
+        return refused(file, at, "the declaration has {systems} system records; a process has exactly one")
+    }
+    return
+}
+
+/// Refuses a declared `handles` below what the process holds when it starts.
+func check_handles(records: &Vector<BootRecord>, quota: &Vector<NamedCount>, file: String,
+                   at: TomlPosition) -> Result<Void, BuildError> {
+    var i = 0
+    while i < quota.len() {
+        let q = quota.get(i)!
+        i = i + 1
+        if not q.name.equals("handles") {
+            continue
+        }
+        let floor = handles_at_start(&records)
+        if q.value < floor {
+            return refused(file, at, "`handles` in [quota] is {q.value}, below the {floor} the process holds when it starts: one per [[boot]] record, its Process handle and one Mapping per window")
+        }
+    }
+    return
+}

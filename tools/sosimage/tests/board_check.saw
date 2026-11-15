@@ -1,0 +1,333 @@
+// A board description held to the tree, its profile, its linker script and
+// its HAL's numbers: the riscv32 and ESP32-S3 descriptions agree with
+// profiles shaped as the runner writes them, and each disagreement is refused
+// naming both values, first against numbers given here and then against the
+// riscv32 HAL compiled (`hal_facts`, with the compiler `SAWC` names, as
+// `blade test` runs). The test runs in the package's directory, two below the
+// tree's top.
+
+import std.env.{Env}
+import sosimage.board.{Board}
+import sosimage.boardcheck.{HalFacts, check_board, facts_symbol, hal_facts, read_hal_facts}
+import sosimage.build.{build_kernel, ensure_directory}
+import sosimage.limits.{ImageLimits}
+import sosimage.kernel.{KernelFacts}
+import sosimage.product.{image_limits}
+import sosimage.board.{LimitsSpec, NamedCount}
+import sosimage.profile.{Profile}
+import sosimage.tool.{read_text, write_lines}
+
+func profile_text(triple: String, cc_args: String, modules: String, script: String,
+                  extra: String) -> String {
+    "\{\"version\": 1, \"triple\": \"{triple}\", \"word_bytes\": 4, \"sawc\": [{sawc_argv()}], \"clang\": \"/bin/clang\", \"lld\": \"/bin/ld.lld\", \"cc_args\": [{cc_args}], \"features\": \"+m,+a,+c\", \"module_paths\": [{modules}], \"linker_script\": \"{script}\"{extra}\}"
+}
+
+// The compiler `blade test` runs with, as a JSON list; a placeholder when the
+// test runs without one, for the checks that compile nothing.
+func sawc_argv() -> String {
+    let named = try Env.get("SAWC") catch { None }
+    guard let sawc = named else {
+        return "\"/bin/sawc\""
+    }
+    let words = try! sawc.split(" ")
+    var quoted = Vector<String>()
+    var i = 0
+    while i < words.len() {
+        let w = words.get(i) ?? ""
+        if not w.is_empty() {
+            try! quoted.push("\"{w}\"")
+        }
+        i = i + 1
+    }
+    quoted.join(", ")
+}
+
+func virt_modules() -> String {
+    "\"kcore=../../kernel/core\", \"hal=../../hal/riscv32/kernel\", \"imgformat=../../.sawlang/libs/imgformat/src\", \"sosrt=../../rt/common/src\", \"sosabi=../../kernel/abi/src\", \"rv32core=../../hal/riscv32-common/kernel\""
+}
+
+func virt_profile(cc_args: String, modules: String, extra: String) -> Profile {
+    try! Profile.parse(profile_text("riscv32-unknown-none-elf", cc_args, modules,
+                                    "../../hal/riscv32/kernel/virt.ld", extra), "p.json")
+}
+
+func virt_args() -> String {
+    "\"-march=rv32imac_zicsr\", \"-mabi=ilp32\""
+}
+
+func virt_facts() -> HalFacts {
+    HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 4,
+             console_base: 0x1000_0000, console_len: 0x1000)
+}
+
+func board_file(dir: String, name: String, text: String) -> Board {
+    match Board.parse(text, "{dir}/{name}") {
+        case Ok(b) -> move b,
+        case Err(e) -> panic("{e.message}")
+    }
+}
+
+func virt_text() -> String {
+    try! read_text("../../hal/riscv32/board.toml")
+}
+
+// The riscv32 board with `old` replaced by `new` in its file.
+func virt_with(old: String, new: String) -> Board {
+    board_file("../../hal/riscv32", "board.toml", virt_text().replace(old, new))
+}
+
+func refusal(board: &Board, profile: &Profile, facts: &HalFacts) -> String {
+    match check_board(&board, &profile, &facts, "../..") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect(board: &Board, profile: &Profile, facts: &HalFacts, message: String) {
+    let got = refusal(&board, &profile, &facts)
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the board check's message")
+}
+
+func expect_part(board: &Board, profile: &Profile, facts: &HalFacts, start: String, part: String) {
+    let got = refusal(&board, &profile, &facts)
+    if not got.starts_with(start) || not got.contains(part) {
+        print("expected: {start}...{part}...")
+        print("got:      {got}")
+    }
+    assert(got.starts_with(start) && got.contains(part), "the board check's message")
+}
+
+func s3_args() -> String {
+    "\"-mcpu=esp32s3\", \"-Xclang\", \"-target-feature\", \"-Xclang\", \"-windowed\", \"-Xclang\", \"-target-feature\", \"-Xclang\", \"-fp\", \"-fintegrated-as\", \"-ffreestanding\", \"-fno-builtin\", \"-ffunction-sections\", \"-fdata-sections\""
+}
+
+func s3_modules(clock: String) -> String {
+    "\"kcore=../../kernel/core\", \"hal=../../hal/xtensa-esp32s3/kernel\", \"s3clock=../../hal/xtensa-esp32s3/keys/{clock}\", \"s3stall=../../hal/xtensa-esp32s3/keys/stall-off\""
+}
+
+func s3_flash(bytes: String, ibus: String, dbus: String, window: String) -> String {
+    ", \"flash\": \{\"bytes\": {bytes}, \"instruction_window\": {ibus}, \"data_window\": {dbus}, \"window_bytes\": {window}, \"magic_offset\": 1024, \"magic\": 2933589021\}"
+}
+
+func s3_profile(modules: String, extra: String) -> Profile {
+    try! Profile.parse(profile_text("xtensa-esp-unknown-elf", s3_args(), modules,
+                                    "../../hal/xtensa-esp32s3/kernel/esp32s3.ld", extra), "p.json")
+}
+
+func s3_text() -> String {
+    try! read_text("../../hal/xtensa-esp32s3/board.toml")
+}
+
+func s3_with(old: String, new: String) -> Board {
+    board_file("../../hal/xtensa-esp32s3", "board.toml", s3_text().replace(old, new))
+}
+
+func main() {
+    let virt = board_file("../../hal/riscv32", "board.toml", virt_text())
+    let profile = virt_profile(virt_args(), virt_modules(), "")
+    let facts = virt_facts()
+    expect(&virt, &profile, &facts, "")
+    let file = "../../hal/riscv32/board.toml"
+
+    // The tree: `hal` is the file's own directory, not a suffix of it.
+    expect(&virt_with("hal = \"hal/riscv32\"", "hal = \"riscv32\""), &profile, &facts,
+           "{file}: `hal` is \"riscv32\", which names no directory of the tree ../..")
+    let moved = board_file("../../hal/riscv32-flat", "board.toml", virt_text())
+    expect_part(&moved, &profile, &facts,
+                "../../hal/riscv32-flat/board.toml: `hal` is \"hal/riscv32\", which is ",
+                "hal/riscv32-flat: `hal` names the board's own HAL directory")
+    // Another tree with a `hal/riscv32` of its own: the path ends the same,
+    // and is not the file's directory.
+    let other = "../../.build/sosimage-tests/tree"
+    try! ensure_directory("{other}/hal/riscv32")
+    let elsewhere_tree = match check_board(&virt, &profile, &facts, other) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(elsewhere_tree.starts_with("{file}: `hal` is \"hal/riscv32\", which is ") &&
+           elsewhere_tree.contains(".build/sosimage-tests/tree/hal/riscv32, and the description is in "),
+           "another tree's hal/riscv32: {elsewhere_tree}")
+
+    // The profile's view.
+    let arm = try! Profile.parse(profile_text("aarch64-unknown-none-elf", virt_args(), virt_modules(), "/virt.ld", ""), "p.json")
+    expect(&virt, &arm, &facts,
+           "{file}: the board's triple is riscv32-unknown-none-elf, and the profile's is aarch64-unknown-none-elf")
+    let flags = virt_profile("\"-march=rv32imc\", \"-mabi=ilp32\"", virt_modules(), "")
+    expect(&virt, &flags, &facts,
+           "{file}: the board's cflags are `-march=rv32imac_zicsr -mabi=ilp32`, and the profile's cc_args are `-march=rv32imc -mabi=ilp32`")
+    let elsewhere = virt_profile(virt_args(), virt_modules().replace("rv32core=../../hal/riscv32-common/kernel", "rv32core=../../hal/arm64/kernel"), "")
+    expect_part(&virt, &elsewhere, &facts, "{file}: the board's module rv32core is ",
+                "hal/riscv32-common/kernel, and the profile maps it to ")
+    let hal_elsewhere = virt_profile(virt_args(), virt_modules().replace("hal=../../hal/riscv32/kernel", "hal=../../hal/riscv32-flat/kernel"), "")
+    expect_part(&virt, &hal_elsewhere, &facts, "{file}: the board's module hal is ",
+                "hal/riscv32/kernel, and the profile maps it to ")
+    let missing = virt_profile(virt_args(), "\"hal=../../hal/riscv32/kernel\"", "")
+    expect(&virt, &missing, &facts,
+           "{file}: the board names the module rv32core, and the profile maps no module of that name")
+    let extra = virt_profile(virt_args(), "{virt_modules()}, \"rv32virt=../../hal/riscv32/kernel\"", "")
+    expect(&virt, &extra, &facts,
+           "{file}: the profile maps the module rv32virt, and the board's `modules` does not name it")
+    let flashed = virt_profile(virt_args(), virt_modules(), s3_flash("4194304", "1107296256", "1006632960", "33554432"))
+    expect(&virt, &flashed, &facts,
+           "{file}: the profile has a flash layout, and the board describes no flash")
+
+    // The HAL's numbers.
+    let console = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 4,
+                           console_base: 0x1000_1000, console_len: 0x1000)
+    expect(&virt, &profile, &console,
+           "{file}: [devices.UART0] is the kernel's, 0x1000 bytes at 0x10000000, and the HAL's console window (DEVICE_GRANT_BASE, DEVICE_GRANT_LEN) is 0x1000 bytes at 0x10001000")
+    let console_len = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 4,
+                               console_base: 0x1000_0000, console_len: 0x2000)
+    expect(&virt, &profile, &console_len,
+           "{file}: [devices.UART0] is the kernel's, 0x1000 bytes at 0x10000000, and the HAL's console window (DEVICE_GRANT_BASE, DEVICE_GRANT_LEN) is 0x2000 bytes at 0x10000000")
+    expect(&virt_with("kernel = true", "kernel = false"), &profile, &facts,
+           "{file}: no device has kernel = true, and the HAL's console window is 0x1000 bytes at 0x10000000")
+    let coarse = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 0x2000,
+                          console_base: 0x1000_0000, console_len: 0x1000)
+    expect(&virt, &profile, &coarse,
+           "{file}: [devices.UART0] is 0x1000 bytes at 0x10000000, off the HAL's grain (8192 bytes)")
+    let offset = virt_with("base = 0x1000_0000", "base = 0x1000_0800")
+    let page = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 0x800,
+                        console_base: 0x1000_0800, console_len: 0x1000)
+    expect(&offset, &profile, &page, "")
+    let page_grain = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 0x1000,
+                              console_base: 0x1000_0800, console_len: 0x1000)
+    expect(&offset, &profile, &page_grain,
+           "{file}: [devices.UART0] is 0x1000 bytes at 0x10000800, off the HAL's grain (4096 bytes)")
+    let shifted = HalFacts(root_base: 0x8030_0000, root_top: 0x8034_0000, grain: 4,
+                           console_base: 0x1000_0000, console_len: 0x1000)
+    expect(&virt, &profile, &shifted,
+           "{file}: [ram.kernel], the kernel's, runs from 0x80000000 to 0x80200000, and root's region begins at 0x80300000 (ROOT_LOAD_BASE): the kernel range ends where root's region begins")
+    let top = HalFacts(root_base: 0x8020_0000, root_top: 0x9000_0000, grain: 4,
+                       console_base: 0x1000_0000, console_len: 0x1000)
+    expect(&virt, &profile, &top,
+           "{file}: root's region (ROOT_LOAD_BASE to ROOT_REGION_TOP, 0x80200000 to 0x90000000) is not inside the default process range ram, 0x80200000 to 0x88000000")
+    let empty = HalFacts(root_base: 0x8020_0000, root_top: 0x8020_0000, grain: 4,
+                         console_base: 0x1000_0000, console_len: 0x1000)
+    expect(&virt, &profile, &empty,
+           "{file}: root's region (ROOT_LOAD_BASE to ROOT_REGION_TOP, 0x80200000 to 0x80200000) is not inside the default process range ram, 0x80200000 to 0x88000000")
+    expect(&virt_with("len = 0x20_0000", "len = 0x10_0000"), &profile, &facts,
+           "{file}: [ram.kernel], the kernel's, runs from 0x80000000 to 0x80100000, and root's region begins at 0x80200000 (ROOT_LOAD_BASE): the kernel range ends where root's region begins")
+    expect(&virt_with("base = 0x8000_0000", "base = 0x7FFF_F000"), &profile, &facts,
+           "{file}: [ram.kernel], the kernel's, runs from 0x7ffff000 to 0x801ff000, and root's region begins at 0x80200000 (ROOT_LOAD_BASE): the kernel range ends where root's region begins")
+    expect(&virt_with("len = 0x7E0_0000", "len = 0x2_0000"), &profile, &facts,
+           "{file}: root's region (ROOT_LOAD_BASE to ROOT_REGION_TOP, 0x80200000 to 0x80240000) is not inside the default process range ram, 0x80200000 to 0x80220000")
+
+    // The ESP32-S3: its keyed modules, its flash against the profile's layout
+    // and against its linker script.
+    let s3 = board_file("../../hal/xtensa-esp32s3", "board.toml", s3_text())
+    let s3_facts = HalFacts(root_base: 0x3FCB_0000, root_top: 0x3FCC_8000, grain: 4,
+                            console_base: 0x6000_0000, console_len: 0x1000)
+    let layout = s3_flash("4194304", "1107296256", "1006632960", "33554432")
+    let s3_file = "../../hal/xtensa-esp32s3/board.toml"
+    expect(&s3, &s3_profile(s3_modules("clock-rom"), layout), &s3_facts, "")
+    expect(&s3, &s3_profile(s3_modules("clock-xtal40"), layout), &s3_facts, "")
+    expect_part(&s3, &s3_profile(s3_modules("clock-rom").replace("keys/clock-rom", "kernel"), layout), &s3_facts,
+                "{s3_file}: the board's keyed module s3clock is ", "keys/clock-*, and the profile maps it to ")
+    expect(&s3, &s3_profile(s3_modules("clock-rom"), layout.replace("4194304", "2097152")), &s3_facts,
+           "{s3_file}: [flash] is 0x400000 bytes, ibus 0x42000000 and dbus 0x3c000000 for 0x2000000 and 0x2000000; the profile's flash is 0x200000 bytes, windows 0x42000000 and 0x3c000000 for 0x2000000")
+    expect(&s3, &s3_profile(s3_modules("clock-rom"), layout.replace("1107296256", "1107300352")), &s3_facts,
+           "{s3_file}: [flash] is 0x400000 bytes, ibus 0x42000000 and dbus 0x3c000000 for 0x2000000 and 0x2000000; the profile's flash is 0x400000 bytes, windows 0x42001000 and 0x3c000000 for 0x2000000")
+    expect(&s3, &s3_profile(s3_modules("clock-rom"), layout.replace("1006632960", "1006637056")), &s3_facts,
+           "{s3_file}: [flash] is 0x400000 bytes, ibus 0x42000000 and dbus 0x3c000000 for 0x2000000 and 0x2000000; the profile's flash is 0x400000 bytes, windows 0x42000000 and 0x3c001000 for 0x2000000")
+    expect(&s3, &s3_profile(s3_modules("clock-rom"), layout.replace("33554432", "16777216")), &s3_facts,
+           "{s3_file}: [flash] is 0x400000 bytes, ibus 0x42000000 and dbus 0x3c000000 for 0x2000000 and 0x2000000; the profile's flash is 0x400000 bytes, windows 0x42000000 and 0x3c000000 for 0x1000000")
+    expect(&s3_with("dbus = \{ base = 0x3C00_0000, len = 0x200_0000 \}", "dbus = \{ base = 0x3C00_0000, len = 0x100_0000 \}"),
+           &s3_profile(s3_modules("clock-rom"), layout), &s3_facts,
+           "{s3_file}: [flash] is 0x400000 bytes, ibus 0x42000000 and dbus 0x3c000000 for 0x2000000 and 0x1000000; the profile's flash is 0x400000 bytes, windows 0x42000000 and 0x3c000000 for 0x2000000")
+    expect(&s3_with("ibus = \{ base = 0x4200_0000, len = 0x200_0000 \}", "ibus = \{ base = 0x4200_0000, len = 0x100_0000 \}"),
+           &s3_profile(s3_modules("clock-rom"), layout), &s3_facts,
+           "{s3_file}: [flash] is 0x400000 bytes, ibus 0x42000000 and dbus 0x3c000000 for 0x1000000 and 0x2000000; the profile's flash is 0x400000 bytes, windows 0x42000000 and 0x3c000000 for 0x2000000")
+    expect(&s3, &s3_profile(s3_modules("clock-rom"), ""), &s3_facts,
+           "{s3_file}: the board is in-place and has a [flash], and the profile has no flash layout")
+    let s3_ok = s3_profile(s3_modules("clock-rom"), layout)
+    let script = "../../hal/xtensa-esp32s3/kernel/esp32s3.ld"
+    expect(&s3_with("base = 0x0\n", "base = 0x1000\n"), &s3_ok, &s3_facts,
+           "{s3_file}: [flash] base is 0x1000, and the flash image starts at offset 0")
+    expect(&s3_with("root-slot = \{ base = 0x10_0000, len = 0x8_0000 \}", "root-slot = \{ base = 0x8_0000, len = 0x8_0000 \}"), &s3_ok, &s3_facts,
+           "{s3_file}: `root-slot` base is 0x80000, and {script} has ROOT_IMAGE_SLOT = 0x100000")
+    expect(&s3_with("root-slot = \{ base = 0x10_0000, len = 0x8_0000 \}", "root-slot = \{ base = 0x10_0000, len = 0x4_0000 \}"), &s3_ok, &s3_facts,
+           "{s3_file}: `root-slot` len is 0x40000, and {script} has IMAGE_SLOT_LEN = 0x80000")
+    expect(&s3_with("slots = \{ base = 0x18_0000, len = 0x8_0000, count = 1 \}", "slots = \{ base = 0x20_0000, len = 0x8_0000, count = 1 \}"), &s3_ok, &s3_facts,
+           "{s3_file}: `slots` base is 0x200000, and {script} has CHILD_IMAGE_SLOT = 0x180000")
+    expect(&s3_with("slots = \{ base = 0x18_0000, len = 0x8_0000, count = 1 \}", "slots = \{ base = 0x18_0000, len = 0x8_0000, count = 2 \}"), &s3_ok, &s3_facts,
+           "{s3_file}: `slots` holds 2 slots, and {script} places one child image (CHILD_IMAGE_SLOT)")
+    expect(&s3_with("slots = \{ base = 0x18_0000, len = 0x8_0000, count = 1 \}", "slots = \{ base = 0x18_0000, len = 0x4_0000, count = 1 \}"), &s3_ok, &s3_facts,
+           "{s3_file}: `slots` len is 0x40000, and {script} has IMAGE_SLOT_LEN = 0x80000")
+
+    // The riscv32 HAL, compiled: its numbers as read, and a board that
+    // disagrees with them refused.
+    let staging = "../../.build/sosimage-tests/hal"
+    let compiled = try! hal_facts(&profile, staging)
+    assert(compiled.root_base == 0x8020_0000 && compiled.root_top == 0x8024_0000,
+           "riscv32's root region, as compiled")
+    assert(compiled.grain == 4 && compiled.console_base == 0x1000_0000 &&
+           compiled.console_len == 0x1000, "riscv32's grain and console, as compiled")
+    expect(&virt, &profile, &compiled, "")
+    expect(&virt_with("len = 0x1000\nline", "len = 0x2000\nline"), &profile, &compiled,
+           "{file}: [devices.UART0] is the kernel's, 0x2000 bytes at 0x10000000, and the HAL's console window (DEVICE_GRANT_BASE, DEVICE_GRANT_LEN) is 0x1000 bytes at 0x10000000")
+    expect(&virt_with("base = 0x1000_0000", "base = 0x1000_0002"), &profile, &compiled,
+           "{file}: [devices.UART0] is 0x1000 bytes at 0x10000002, off the HAL's grain (4 bytes)")
+    expect(&virt_with("len = 0x7E0_0000", "len = 0x3_0000"), &profile, &compiled,
+           "{file}: root's region (ROOT_LOAD_BASE to ROOT_REGION_TOP, 0x80200000 to 0x80240000) is not inside the default process range ram, 0x80200000 to 0x80230000")
+    expect(&virt_with("len = 0x20_0000", "len = 0x10_0000"), &profile, &compiled,
+           "{file}: [ram.kernel], the kernel's, runs from 0x80000000 to 0x80100000, and root's region begins at 0x80200000 (ROOT_LOAD_BASE): the kernel range ends where root's region begins")
+
+    // A record of another version is refused.
+    try! ensure_directory(staging)
+    var module = Vector<String>()
+    try! module.push("@export(\"{facts_symbol()}\")")
+    try! module.push("static FACTS: [UInt; 6] = [2, 0, 0, 0, 0, 0]")
+    try! write_lines("{staging}/v2.saw", &module)
+    try! build_kernel(&profile, "{staging}/v2.saw", "{staging}/v2.o")
+    let v2 = match read_hal_facts("{staging}/v2.o") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(v2.equals("{staging}/v2.o: `sosimage_hal_facts` is version 2; this builder reads version 1"), "another version: {v2}")
+
+    // An image's limits over a board's defaults: totals become raises above
+    // the floor, and a total below the floor is refused.
+    var floors = Vector<Int>()
+    var k = 0
+    while k < 13 {
+        try! floors.push(4)
+        k = k + 1
+    }
+    let kernel = KernelFacts(word: 4, capacity: 255, extents: 4, records_per_body: 4, handles: 32,
+                             image_rows: 4, budget: 8, domains: 256, stride: 0, inflight: 16,
+                             floors: move floors, defaults: Vector<Int>(), units: Vector<Int>(),
+                             aligns: Vector<Int>())
+    var stated = Vector<LimitsSpec>()
+    let lines: Vector<String> = ["format = 1", "[board]", "name = \"b\"",
+        "triple = \"riscv32-unknown-none-elf\"", "tier = \"flat\"", "hal = \"hal/b\"",
+        "placement = \"copied\"", "modules = []", "cflags = []", "[emulator]",
+        "program = \"q\"", "args = []", "[ram.kernel]", "use = \"kernel\"", "speed = \"fast\"",
+        "base = 0", "len = 0x1000", "[ram.main]", "use = \"process\"", "speed = \"fast\"",
+        "base = 0x1000", "len = 0x1000", "[ram.default]", "process = \"main\"",
+        "pool = \"main\"", "[limits.default]", "processes = 8", "waiters = 6",
+        "quota = \{ handles = 28 \}"]
+    let defaulted = try! Board.parse(lines.join("\n"), "b.toml")
+    try! stated.push(defaulted.limits.copy())
+    var over = defaulted.limits.copy()
+    over.totals[1] = NamedCount(name: "waiters", value: 10)
+    try! stated.push(move over)
+    let limits = try! image_limits(&stated, &kernel, "img")
+    assert(limits.raise.get(11)! == 4, "processes 8 over a floor of 4")
+    assert(limits.raise.get(1)! == 6, "the image's waiters, 10, over the board's 6")
+    assert(limits.raise.get(0)! == -1, "events not stated")
+    assert(limits.quota.get(7)! == 28, "the handle quota")
+    var low = Vector<LimitsSpec>()
+    let low_lines = lines.join("\n").replace("waiters = 6", "waiters = 2")
+    let lowered = try! Board.parse(low_lines, "b.toml")
+    try! low.push(lowered.limits.copy())
+    let refused = match image_limits(&low, &kernel, "img") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(refused.equals("img: `waiters` is 2, below the kernel's floor of 4: an image raises a limit and never lowers one"), "a lowering: {refused}")
+}

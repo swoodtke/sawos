@@ -1,0 +1,92 @@
+// Every description in the sawos tree reads clean: each board's
+// `board.toml`, each `process.toml` against the boards that have its types,
+// and each hand-written image under `tests/images/` against its board. The
+// test runs in the package's directory, two below the tree's top.
+
+import sosimage.board.{Board}
+import sosimage.declaration.{Declaration}
+import sosimage.imagefile.{ImageFile, bind, image_board}
+import sosimage.product.{find_board}
+import sosimage.tool.{read_text}
+
+func board_at(dir: String) -> Board {
+    let file = "../../hal/{dir}/board.toml"
+    let text = try! read_text(file)
+    match Board.parse(text, file) {
+        case Ok(b) -> move b,
+        case Err(e) -> panic("{e.message}")
+    }
+}
+
+func declaration_at(dir: String) -> Declaration {
+    let file = "../../{dir}/process.toml"
+    let text = try! read_text(file)
+    match Declaration.parse(text, file) {
+        case Ok(d) -> move d,
+        case Err(e) -> panic("{e.message}")
+    }
+}
+
+func serves(d: &Declaration, b: &Board) {
+    match d.check_against(&b) {
+        case Ok(_) -> {},
+        case Err(e) -> panic("{e.message}")
+    }
+}
+
+func image_at(name: String) {
+    let file = "../../tests/images/{name}"
+    let text = try! read_text(file)
+    let board = try! find_board("../..", try! image_board(text, file))
+    match ImageFile.parse(text, file, &board, 4) {
+        case Ok(_) -> {},
+        case Err(e) -> panic("{e.message}")
+    }
+}
+
+func main() {
+    let virt = board_at("riscv32")
+    assert(virt.name.equals("riscv32-virt"), "the riscv32 board")
+    let flat = board_at("riscv32-flat")
+    assert(flat.name.equals("riscv32-virt-flat"), "its flat profile")
+    let arm = board_at("arm64")
+    assert(arm.word == 8, "arm64's word")
+    let c3 = board_at("riscv32-esp32c3")
+    assert(c3.name.equals("esp32c3"), "the ESP32-C3")
+    let s3 = board_at("xtensa-esp32s3")
+    assert(s3.flash!.slot_count == 1, "the ESP32-S3's one child slot")
+
+    let ns16550 = declaration_at("drivers/svc-uart-ns16550")
+    serves(&ns16550, &virt)
+    serves(&ns16550, &flat)
+    let pl011 = declaration_at("drivers/svc-uart-pl011")
+    serves(&pl011, &arm)
+    let client = declaration_at("tests/svc-client")
+    serves(&client, &virt)
+    serves(&client, &arm)
+
+    image_at("uart_service_ns16550.toml")
+    image_at("uart_service_ns16550_flat.toml")
+
+    // The UART service with the stock root on riscv32-virt: the console is
+    // the board's one NS16550, so the driver gets it only by naming it.
+    var decls = Vector<Declaration>()
+    try! decls.push(ns16550.copy())
+    try! decls.push(client.copy())
+    let lines: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"service\"", "board = \"riscv32-virt\"", "tick = false",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"driver\"", "package = \"sawos:drivers/svc-uart-ns16550\"",
+        "[[process]]", "name = \"client\"", "package = \"sawos:tests/svc-client\"",
+        "clients = \{ uart = \"driver.uart\" \}"]
+    let unnamed = try! ImageFile.parse(lines.join("\n"), "s.toml", &virt, 4)
+    let refused = match bind(&unnamed, &virt, &decls, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(refused.equals("s.toml: line 9, column 1: UART0 is the kernel's own device, bound only when an image names it: name it in the `device` of the process driver"), "the console unnamed: {refused}")
+    let named = try! ImageFile.parse(lines.join("\n").replace("package = \"sawos:drivers/svc-uart-ns16550\"", "package = \"sawos:drivers/svc-uart-ns16550\"\ndevice = \{ uart = \"UART0\" \}"), "s.toml", &virt, 4)
+    let bound = try! bind(&named, &virt, &decls, 4)
+    assert((bound.windows.get(0)!).window.base == 0x1000_0000, "the console, named")
+}

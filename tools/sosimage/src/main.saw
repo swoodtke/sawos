@@ -17,13 +17,30 @@
 //!         bytes one unit of an area takes, the alignment the builder links
 //!         an area at), for each quota kind `quota NAME kind=K default=D`,
 //!         and one `limits ...` line of the kernel's other numbers
+//!     sosimage board PROFILE SAWOS BOARD STAGING
+//!         reads the board description BOARD (a `board.toml` of the sawos tree
+//!         SAWOS) and holds it to PROFILE, to its linker script and to the
+//!         board's HAL, compiled in STAGING; `sosimage.boardcheck` lists
+//!         what is held and what is not. Prints nothing when they agree
+//!     sosimage build PROFILE SAWOS PRODUCT IMAGE OUT
+//!         builds the image the hand-written description IMAGE states, for
+//!         the board it names, into the directory OUT (`sosimage.product`):
+//!         SAWOS is the sawos tree, which holds the boards and every `sawos:`
+//!         path, and PRODUCT the directory the image's other paths are from;
+//!         for a flash board it prints `flash used=USED end=END` as `link`
+//!         does
 //!
-//! PROFILE and IMAGE are JSON files: `sosimage.profile` and `sosimage.image`
-//! state their schemas. A failure prints `error: ` and its reason on standard
-//! output and exits 1.
+//! PROFILE, and the IMAGE `link` reads, are JSON files: `sosimage.profile` and
+//! `sosimage.image` state their schemas. A board description, a process
+//! declaration and a hand-written image are TOML: `sosimage.board`,
+//! `sosimage.declaration` and `sosimage.imagefile` state theirs. A failure
+//! prints `error: ` and its reason on standard output and exits 1.
 
 import std.env.{Env}
+import sosimage.board.{Board}
+import sosimage.boardcheck.{check_board, hal_facts}
 import sosimage.build.{build_kernel, build_native, link}
+import sosimage.product.{build_image}
 import sosimage.failure.{BuildError}
 import sosimage.image.{ImageSpec}
 import sosimage.kernel.{KernelFacts, QUOTA_KINDS, SLAB_KINDS, quota_kind_name,
@@ -80,7 +97,23 @@ func run() -> Result<Void, BuildError> {
         }
         return
     }
-    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | slabs KERNEL")
+    if command.equals("board") && args.len() == 6 {
+        let profile = try load_profile(args.get(2) ?? "")
+        let path = args.get(4) ?? ""
+        let board = try Board.parse(try read_text(path), path)
+        let facts = try hal_facts(&profile, args.get(5) ?? "")
+        return check_board(&board, &profile, &facts, args.get(3) ?? "")
+    }
+    if command.equals("build") && args.len() == 7 {
+        let profile = try load_profile(args.get(2) ?? "")
+        let linked = try build_image(&profile, args.get(3) ?? "", args.get(4) ?? "",
+                                     args.get(5) ?? "", args.get(6) ?? "")
+        if not linked.flash.is_empty() {
+            print("flash used={linked.used} end={linked.end}")
+        }
+        return
+    }
+    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | slabs KERNEL | board PROFILE SAWOS BOARD STAGING | build PROFILE SAWOS PRODUCT IMAGE OUT")
 }
 
 func load_profile(path: String) -> Result<Profile, BuildError> {

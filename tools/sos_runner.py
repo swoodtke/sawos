@@ -21,6 +21,8 @@ program; see "The image builder" below). Per architecture:
   1. sosimage native : boot.S, any trap entry split out of it, sink.c (board
                        hooks + protection) and support.c (the arena accessors
                        and the word atomics — the C that must stay C), once
+     sosimage board  : the profile's `hal/<profile>/board.toml`, held to the
+                       profile and to the HAL's numbers, once
   2. blade           : every root and child package the cases name, once
   3. sosimage kernel : each kernel entry the cases boot, once (sawc
                        --freestanding --no-hidden-alloc --target <triple>,
@@ -11838,6 +11840,23 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
               file=sys.stderr)
         return 0, len(cases)
 
+    # The board's description (`hal/<profile>/board.toml`), held to this
+    # profile and to the HAL it names, compiled: its triple, C flags, modules
+    # and directory, its console window and device grain, its kernel range's
+    # end and root's region in its process range fail the profile here when
+    # they disagree, naming both values. The kernel range's base and the
+    # process range's top are not held (`tools/sosimage/src/boardcheck.saw`).
+    if builder is not None:
+        try:
+            _run_sosimage(builder, [
+                "board", profile, REPO_ROOT,
+                os.path.join(HAL_DIR, arch["name"], "board.toml"),
+                os.path.join(arch_dirs(arch)["build"], "board")])
+        except ToolError as e:
+            print(f"{CROSS} the {arch['name']} board description disagrees "
+                  f"with its profile or its HAL\n{e}", file=sys.stderr)
+            return 0, len(cases)
+
     # Root packages are built by Blade, per architecture, so build them first,
     # but only if some case that runs here needs one. The arch filter is
     # applied first because some packages are per-device: a driver names its
@@ -11951,6 +11970,7 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
 
     passed = 0
     failed = 0
+    green = set()
     for i, (ok, headline, detail) in enumerate(
             _map_ordered(jobs, cases, run_case), 1):
         print(f"[{i}/{len(cases)}] {headline}")
@@ -11958,10 +11978,49 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
             print(line)
         if ok:
             passed += 1
+            green.add(cases[i - 1]["name"])
         else:
             failed += 1
+    if builder is not None:
+        for (profile_name, name), image in FROM_FILES.items():
+            if profile_name != arch["name"] or name not in green:
+                continue
+            problem = _built_from_files(builder, profile, arch, name, image)
+            if problem is not None:
+                print(f"{CROSS} {name} from tests/images/{image}  ({problem})")
+                failed += 1
     print()
     return passed, failed
+
+
+# The gate cases a hand-written description in `tests/images/` also states,
+# by profile and case name. After the case passes, `sosimage build` builds
+# the description from its files, and the image it links must be the case's,
+# byte for byte. A match prints nothing.
+FROM_FILES = {
+    ("riscv32", "uart_service_ns16550"): "uart_service_ns16550.toml",
+    ("riscv32-flat", "uart_service_ns16550"): "uart_service_ns16550_flat.toml",
+}
+
+
+def _built_from_files(builder, profile, arch, name, image):
+    """Build `tests/images/<image>` with `sosimage build` and compare its ELF
+    with the case `name`'s; return what differed, or None."""
+    build = arch_dirs(arch)["build"]
+    out = os.path.join(build, "fromfiles", name)
+    try:
+        _run_sosimage(builder, ["build", profile, REPO_ROOT, REPO_ROOT,
+                                os.path.join(TESTS_DIR, "images", image), out])
+    except ToolError as e:
+        return f"build error: {e}"
+    with open(os.path.join(build, f"{name}.elf"), "rb") as f:
+        case = f.read()
+    with open(os.path.join(out, f"{name}.elf"), "rb") as f:
+        built = f.read()
+    if case != built:
+        return (f"its ELF is {len(built)} bytes and differs from the case's, "
+                f"{len(case)} bytes")
+    return None
 
 
 def _root_image_path(pkg_dir, arch):

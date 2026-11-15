@@ -1,0 +1,49 @@
+# The QEMU `virt` board, arm64, isolated by page tables: what an image is
+# built against. tools/sosimage/src/board.saw states the format;
+# `sosimage board` holds this file to the runner's profile and to this HAL's
+# numbers.
+format = 1
+
+[board]
+name = "arm64-virt"
+triple = "aarch64-unknown-none-elf"
+tier = "isolated"
+hal = "hal/arm64"
+placement = "translated"
+modules = []
+cflags = []
+
+[emulator]
+program = "qemu-system-aarch64"
+args = ["-M", "virt,gic-version=2", "-cpu", "cortex-a53", "-semihosting"]
+
+# RAM is 128 MiB from 0x4000_0000 (kernel/virt.ld, `RAM_BASE`, `RAM_LEN`).
+# The kernel, its payload and its blobs sit below root's region; process
+# frames are the rest.
+[ram.kernel]
+use = "kernel"
+speed = "fast"
+base = 0x4000_0000
+len = 0x20_0000             # 2 MiB
+
+[ram.ram]
+use = "process"
+speed = "fast"
+base = 0x4020_0000
+len = 0x7E0_0000            # 126 MiB
+
+[ram.default]
+process = "ram"
+pool = "ram"
+
+# The console: a PL011, on GIC interrupt 33.
+[devices.UART0]
+type = "pl011"
+base = 0x0900_0000
+len = 0x1000
+line = 33
+kernel = true
+
+# The EL1 physical timer's private interrupt, the kernel's tick.
+[lines]
+reserved = [30]

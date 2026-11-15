@@ -41,13 +41,20 @@ hal/xtensa-esp32s3/  # Xtensa (call0) and the ESP32-S3 board in one
                    # directory per value: the CPU clock, the console's stall
                    # count) + ABI.md, the board facts. Reached by
                    # `make sos-smoke-esp32s3`
+hal/*/board.toml   # each board's description, one complete file per HAL
+                   # directory (the flat profile's too): the TOML an image is
+                   # built against; tools/sosimage/src/board.saw states it
 drivers/           # userspace device drivers and the protocol packages their
                    # clients share (`uartproto`), each an ordinary package like
-                   # those in `tests/`
+                   # those in `tests/`; a process's `process.toml` beside its
+                   # Saw.toml says what a stock root gives it
+                   # (tools/sosimage/src/declaration.saw)
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 root/              # the root server: a real Blade package, sosimg emit
-tests/             # kernel entries, test packages, hand-assembled payloads
+tests/             # kernel entries, test packages, hand-assembled payloads;
+                   # images/ holds hand-written image descriptions (TOML,
+                   # tools/sosimage/src/imagefile.saw)
 tools/             # sos_runner.py (the harness: packages, cases, QEMU, every
                    # profile) + toolchain.py (the sawlang resolver) +
                    # sosimg_dump.py
@@ -55,11 +62,13 @@ tools/sosimage/    # the image builder, a hosted Saw package Blade builds: it
                    # compiles a kernel, stitches root's image, the child
                    # images, the boot region table and the slab areas an
                    # image's limits raise into it and links it, and on the
-                   # ESP32-S3 writes the flash image; src/main.saw lists its
-                   # commands, tests/ its own tests
+                   # ESP32-S3 writes the flash image; it reads the board,
+                   # process and image descriptions and builds an image from
+                   # a hand-written one; src/main.saw lists its commands,
+                   # tests/ its own tests
 .sawlang           # (git-ignored) the runner's link to the sawlang checkout
                    # the toolchain resolved; the builder's manifest reaches
-                   # `imgformat` through it
+                   # `imgformat` and `toml` through it
 ```
 
 ## The toolchain
@@ -95,16 +104,41 @@ builds Blade, points `.sawlang` at the resolved checkout, builds the builder
 (`blade build --force` in `tools/sosimage/`), and in a full `make sos-test`
 runs its own tests (`blade test` there: the description readers' refusals, the
 region table's and slab block's bytes, an image's limits and each refusal of
-them, the in-place check), which need no emulator and print nothing when they
+them, the in-place check, and every board, process and image description in
+the tree read clean), which need no emulator and print nothing when they
 pass. Per profile it writes a profile description (JSON)
-and calls `sosimage native`, then `sosimage kernel` once for each kernel entry
+and calls `sosimage native`, then `sosimage board` on the profile's
+`hal/<profile>/board.toml`, then `sosimage kernel` once for each kernel entry
 the cases use; per case it writes an image description into the case's
 staging directory and calls `sosimage link`. `src/profile.saw` and
 `src/image.saw` state the two schemas. A builder failure is the case's build
-error, with the builder's message. A case may state `limits`, which the image
-description carries and the builder turns into linked slab areas and the
-block after the table's rows, or carry a hand-made `slab_block` the runner
-writes from the slab sizes `sosimage slabs` reads out of the kernel object.
+error, with the builder's message.
+
+`sosimage board` holds a board file to the tree (`hal` is the file's own
+directory), to the profile (triple, C flags, every module but the kernel's
+own both ways, the flash's length and windows), to the board's linker script
+on an in-place board (the flash's base, root's slot and the child slots),
+and to the HAL's numbers, read by compiling a module that exports them (the
+console window, the device grain, the kernel range ending where root's region
+begins, root's region inside the default process range). It does not hold
+the kernel range's base or any process range's top: no HAL constant states
+them on every board. `src/boardcheck.saw` is the list. A keyed module, chosen
+per image (the ESP32-S3's clock and stall keys), is written
+`NAME=DIR/PREFIX*`. The gate runs it on the three gate profiles. The
+builder's tests hold the S3 file to profiles shaped as the smoke's and to its
+linker script, with the HAL's numbers given rather than compiled; the C3 file
+is read, and held to nothing else.
+
+`sosimage build` builds an image from a hand-written description
+(`tests/images/`). After `uart_service_ns16550` passes on riscv32 and on
+riscv32-flat, the runner builds its description with it and fails the profile
+unless the ELF is the case's, byte for byte (`FROM_FILES`); a match prints
+nothing.
+
+A case may state `limits`, which the image description carries and the
+builder turns into linked slab areas and the block after the table's rows, or
+carry a hand-made `slab_block` the runner writes from the slab sizes
+`sosimage slabs` reads out of the kernel object.
 `SOS_IMAGE_BUILDER=python` builds every image through the runner's own code
 instead, so the two can be compared, except those two kinds of case, which
 that path refuses by name.

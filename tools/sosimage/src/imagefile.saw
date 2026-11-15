@@ -1,0 +1,941 @@
+//! A hand-written image description: TOML, in a product's `images/`.
+//!
+//!     format = 1
+//!
+//!     [image]
+//!     name = "logger"
+//!     board = "esp32s3"                  a board description's `name`
+//!     tick = true
+//!
+//!     [limits]                           optional: a board's [limits.default]
+//!
+//!     [root]
+//!     package = "stock"                  or a hand-written root's package
+//!
+//!     [[setup]]                          the stock root's, in file order
+//!     register = "SYSTEM.PERIP_CLK_EN0"  a register or one array element
+//!     set = 0x800                        or `clear`, or `write`: 32 bits
+//!
+//!     [[process]]
+//!     name = "gps"
+//!     package = "sawos:drivers/svc-uart-esp32s3"
+//!     device = { uart = "UART1" }        need to device reference
+//!     inputs = { uartpins = "config/gps-pins.saw" }
+//!     ram = "sram"                       a process range of the board
+//!     quota = { handles = 10 }
+//!     clients = { log = "logger.log" }   client record to PROCESS.RECORD
+//!     pools = { buffer = "frames" }      memory record to pool
+//!     on-exit = "report"                 or "shutdown"
+//!
+//!     [[pool]]
+//!     name = "frames"
+//!     len = 0x4000
+//!     ram = "sram"                       optional
+//!
+//!     [rows]                             a hand-written root's, in row order
+//!     devices = ["UART0"]                whole devices
+//!     pools = ["frames"]
+//!
+//! A hand-written root's processes give only `name` and `package`, and only
+//! a hand-written root has `[rows]`; only the stock root has `[[setup]]`. A
+//! package is `sawos:` and a path in the sawos tree, or a path from the
+//! product's root.
+//!
+//! Reading (`ImageFile.read`) holds the image to the rules of
+//! `sosimage.rules` and to its board: a process name given twice or `root`; a
+//! pool name given twice; a reference outside its grammar; a `[[setup]]` or
+//! `[rows]` reference naming what the board does not have; a list where one
+//! value goes (the list forms, reserved); a RAM name that is reserved or not
+//! a process range of the board; a package or an input that is not a path
+//! (`check_path`); a pool length the board's word cannot hold; a pool bound
+//! twice or bound to nothing. Binding a stock root's processes to their
+//! declarations (`bind`) is the rest of it, a `device` reference against the
+//! board included: device needs to devices, by type; client records to
+//! serves; memory records to pools; and every input to its value.
+
+import toml.{TomlKind, TomlPosition, TomlTable}
+import sosimage.board.{Board, LimitsSpec, NamedCount, RefUse, Window, expect_table,
+                       quota_keys, read_counts, require_table}
+import sosimage.declaration.{BootRecord, Declaration, RecordKind, kind_word}
+import sosimage.failure.{BuildError}
+import sosimage.hex.{hex}
+import sosimage.rules.{
+    check_format, check_name, check_path, check_process_name, check_ram_name,
+    element_at, holds, only_keys, parse_description, parse_ref, refused, size,
+    strings, text, toml_refused, where_is,
+}
+
+/// A stock-root process's device need, as the image binds it.
+public struct NeedRef {
+    process: String
+    need: String
+    reference: String
+    at: TomlPosition
+}
+
+/// One `NAME = value` entry of a process's `inputs`, `clients` or `pools`.
+public struct Entry {
+    process: String
+    key: String
+    value: String
+    at: TomlPosition
+}
+
+/// A process the image launches.
+public struct ProcessEntry {
+    name: String
+    package: String
+    /// The RAM range it is placed in; the board's default when empty.
+    ram: String
+    on_exit: String
+    at: TomlPosition
+}
+
+/// A pool the image makes.
+public struct PoolEntry {
+    name: String
+    len: UInt64
+    /// The RAM range it is placed in; the board's default when empty.
+    ram: String
+    at: TomlPosition
+}
+
+/// What a `[[setup]]` does to its register.
+public enum SetupOp {
+    /// OR the bits in.
+    case Set,
+    /// AND them out.
+    case Clear,
+    /// Store the word.
+    case Write
+}
+
+@synthesize
+extension SetupOp: Equatable {}
+
+/// One `[[setup]]` write.
+public struct SetupEntry {
+    register: Window
+    op: SetupOp
+    value: UInt64
+    at: TomlPosition
+}
+
+/// A named reference in `[rows]`, as resolved.
+public struct RowDevice {
+    window: Window
+    at: TomlPosition
+}
+
+/// An image, as its description states it.
+public struct ImageFile {
+    file: String
+    name: String
+    board: String
+    tick: Bool
+    has_limits: Bool
+    limits: LimitsSpec
+    /// The stock root, or a hand-written one in `root_package`.
+    stock: Bool
+    root_package: String
+    root_at: TomlPosition
+    setup: Vector<SetupEntry>
+    processes: Vector<ProcessEntry>
+    devices: Vector<NeedRef>
+    inputs: Vector<Entry>
+    clients: Vector<Entry>
+    pool_bindings: Vector<Entry>
+    quotas: Vector<Entry>
+    pools: Vector<PoolEntry>
+    row_devices: Vector<RowDevice>
+    row_pools: Vector<String>
+}
+
+@synthesize
+extension ImageFile: ExplicitCopy {}
+
+/// The board an image description names, read before the rest, since the
+/// rest is read against it.
+public func image_board(text: String, file: String) -> Result<String, BuildError> {
+    let doc = try parse_description(text, file)
+    borrow let root = doc.root() {
+        try require_table(&root, "image", file)
+        if let i = root.table("image") {
+            return text_at(&i, "board", file)
+        }
+        return BuildError(message: "{file}: internal: [image] vanished")
+    }
+}
+
+func text_at(t: &TomlTable, key: String, file: String) -> Result<String, BuildError> {
+    text(&t, key, file)
+}
+
+extension ImageFile {
+    /// Reads an image description from its text, against `board`, whose
+    /// `name` its `board` must be; `grain` is the board's protection grain,
+    /// which a part window is held to.
+    public static func parse(text: String, file: String, board: &Board,
+                             grain: UInt64) -> Result<ImageFile, BuildError> {
+        let doc = try parse_description(text, file)
+        borrow let root = doc.root() {
+            return ImageFile.read(&root, file, &board, grain)
+        }
+    }
+
+    /// Reads an image description's top-level table.
+    public static func read(root: &TomlTable, file: String, board: &Board,
+                            grain: UInt64) -> Result<ImageFile, BuildError> {
+        let top_keys: Vector<String> = ["format", "image", "limits", "root", "setup",
+                                        "process", "pool", "rows"]
+        try only_keys(&root, &top_keys, file, "an image description")
+        try check_format(&root, file)
+
+        try require_table(&root, "image", file)
+        var name = ""
+        var board_name = ""
+        var tick = false
+        if let i = root.table("image") {
+            let image_keys: Vector<String> = ["name", "board", "tick"]
+            try only_keys(&i, &image_keys, file, "[image]")
+            name = try text(&i, "name", file)
+            try check_name(name, file, where_is(&i, "name"), "an image's name")
+            board_name = try text(&i, "board", file)
+            if not board_name.equals(board.name) {
+                return refused(file, where_is(&i, "board"),
+                               "the image is for the board {board_name}, and it is being read against {board.name}")
+            }
+            tick = try i.boolean("tick") catch {
+                return toml_refused(file, error)
+            }
+        }
+
+        var limits = LimitsSpec.none()
+        var has_limits = false
+        try expect_table(&root, "limits", file)
+        if let l = root.table("limits") {
+            limits = try LimitsSpec.read(&l, file, "[limits]")
+            has_limits = true
+        }
+
+        try require_table(&root, "root", file)
+        var root_package = ""
+        if let r = root.table("root") {
+            let root_keys: Vector<String> = ["package"]
+            try only_keys(&r, &root_keys, file, "[root]")
+            root_package = try text(&r, "package", file)
+            if not root_package.equals("stock") {
+                try check_path(root_package, file, where_is(&r, "package"), "`package` in [root]")
+            }
+        }
+        let stock = root_package.equals("stock")
+        let root_at = where_is(&root, "root")
+
+        var setup = Vector<SetupEntry>()
+        if root.contains("setup") {
+            if not stock {
+                return refused(file, where_is(&root, "setup"),
+                               "[[setup]] is the stock root's: a hand-written root makes its own writes")
+            }
+            try root.require("setup", TomlKind.Array) catch {
+                return toml_refused(file, error)
+            }
+            if let a = root.array("setup") {
+                var i = 0
+                while i < a.len() {
+                    if let s = a.table(i) {
+                        try! setup.push(try read_setup(&s, &board, grain, file))
+                    } else {
+                        return refused(file, a.position(i) ?? a.defined_at(),
+                                       "`setup` is an array of tables: write each as [[setup]]")
+                    }
+                    i = i + 1
+                }
+            }
+        }
+
+        var parts = Parts(processes: Vector<ProcessEntry>(), devices: Vector<NeedRef>(),
+                          inputs: Vector<Entry>(), clients: Vector<Entry>(),
+                          pool_bindings: Vector<Entry>(), quotas: Vector<Entry>())
+        try root.require("process", TomlKind.Array) catch {
+            return toml_refused(file, error)
+        }
+        if let a = root.array("process") {
+            var i = 0
+            while i < a.len() {
+                if let p = a.table(i) {
+                    try read_process(&p, stock, &board, &var parts, file)
+                } else {
+                    return refused(file, a.position(i) ?? a.defined_at(),
+                                   "`process` is an array of tables: write each as [[process]]")
+                }
+                i = i + 1
+            }
+        }
+
+        var pools = Vector<PoolEntry>()
+        let _ = try root.expect("pool", TomlKind.Array) catch {
+            return toml_refused(file, error)
+        }
+        if let a = root.array("pool") {
+            var i = 0
+            while i < a.len() {
+                if let p = a.table(i) {
+                    let pool = try read_pool(&p, &board, file)
+                    var j = 0
+                    while j < pools.len() {
+                        let other = pools.get(j)!
+                        if other.name.equals(pool.name) {
+                            return refused(file, pool.at, "the pool `{pool.name}` is named twice, here and at {other.at}")
+                        }
+                        j = j + 1
+                    }
+                    try! pools.push(pool)
+                } else {
+                    return refused(file, a.position(i) ?? a.defined_at(),
+                                   "`pool` is an array of tables: write each as [[pool]]")
+                }
+                i = i + 1
+            }
+        }
+
+        var row_devices = Vector<RowDevice>()
+        var row_pools = Vector<String>()
+        try expect_table(&root, "rows", file)
+        if let r = root.table("rows") {
+            if stock {
+                return refused(file, r.defined_at(),
+                               "[rows] is a hand-written root's: the stock root numbers its own rows")
+            }
+            let rows_keys: Vector<String> = ["devices", "pools"]
+            try only_keys(&r, &rows_keys, file, "[rows]")
+            let refs = try strings(&r, "devices", file)
+            var i = 0
+            while i < refs.len() {
+                let at = element_at(&r, "devices", i)
+                let reference = try parse_ref(refs.get(i) ?? "", file, at)
+                let window = try board.resolve(&reference, RefUse.Row, grain, file, at)
+                var j = 0
+                while j < row_devices.len() {
+                    let other = row_devices.get(j)!
+                    if other.window.device.equals(window.device) {
+                        return refused(file, at, "[rows] devices names {window.device} twice, here and at {other.at}")
+                    }
+                    j = j + 1
+                }
+                try! row_devices.push(RowDevice(window: window, at: at))
+                i = i + 1
+            }
+            row_pools = try strings(&r, "pools", file)
+            i = 0
+            while i < row_pools.len() {
+                let pool = row_pools.get(i) ?? ""
+                let at = element_at(&r, "pools", i)
+                if not has_pool(&pools, pool) {
+                    return refused(file, at, "[rows] pools names `{pool}`, which no [[pool]] is")
+                }
+                var j = 0
+                while j < i {
+                    if (row_pools.get(j) ?? "").equals(pool) {
+                        return refused(file, at, "the pool `{pool}` is bound twice: a pool is bound once")
+                    }
+                    j = j + 1
+                }
+                i = i + 1
+            }
+        }
+
+        // Each pool is bound once: to a process's memory record, or to a row.
+        var p = 0
+        while p < pools.len() {
+            let pool = pools.get(p)!
+            p = p + 1
+            var bound = 0
+            var b = 0
+            while b < parts.pool_bindings.len() {
+                let e = parts.pool_bindings.get(b)!
+                b = b + 1
+                if e.value.equals(pool.name) {
+                    bound = bound + 1
+                    if bound > 1 {
+                        return refused(file, e.at, "the pool `{pool.name}` is bound twice: a pool is bound once")
+                    }
+                }
+            }
+            b = 0
+            while b < row_pools.len() {
+                if (row_pools.get(b) ?? "").equals(pool.name) {
+                    bound = bound + 1
+                }
+                b = b + 1
+            }
+            if bound == 0 {
+                return refused(file, pool.at, "the pool `{pool.name}` is bound to nothing: bind it to a process's memory record, or list it in [rows] pools")
+            }
+        }
+        var e = 0
+        while e < parts.pool_bindings.len() {
+            let binding = parts.pool_bindings.get(e)!
+            if not has_pool(&pools, binding.value) {
+                return refused(file, binding.at, "`{binding.key}` is bound to the pool `{binding.value}`, which no [[pool]] is")
+            }
+            e = e + 1
+        }
+
+        return ImageFile(file: file, name: name, board: board_name, tick: tick,
+                         has_limits: has_limits, limits: move limits, stock: stock,
+                         root_package: root_package, root_at: root_at,
+                         setup: move setup, processes: parts.processes.copy(),
+                         devices: parts.devices.copy(), inputs: parts.inputs.copy(),
+                         clients: parts.clients.copy(),
+                         pool_bindings: parts.pool_bindings.copy(),
+                         quotas: parts.quotas.copy(), pools: move pools,
+                         row_devices: move row_devices, row_pools: move row_pools)
+    }
+
+    /// The process named `name`.
+    public func process(&self, name: String) -> ProcessEntry? {
+        var i = 0
+        while i < self.processes.len() {
+            if let p = self.processes.get(i) {
+                if p.name.equals(name) {
+                    return p
+                }
+            }
+            i = i + 1
+        }
+        None
+    }
+}
+
+/// The processes and what each binds, as read.
+struct Parts {
+    processes: Vector<ProcessEntry>
+    devices: Vector<NeedRef>
+    inputs: Vector<Entry>
+    clients: Vector<Entry>
+    pool_bindings: Vector<Entry>
+    quotas: Vector<Entry>
+}
+
+@synthesize
+extension Parts: ExplicitCopy {}
+
+/// Whether `pools` has one named `name`.
+func has_pool(pools: &Vector<PoolEntry>, name: String) -> Bool {
+    var i = 0
+    while i < pools.len() {
+        if (pools.get(i)!).name.equals(name) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// Refuses a `ram` naming no process range of `board`.
+func check_ram(board: &Board, ram: String, file: String, at: TomlPosition) -> Result<Void, BuildError> {
+    try check_ram_name(ram, file, at)
+    guard let r = board.range(ram) else {
+        return refused(file, at, "`ram` is \"{ram}\", which names no RAM range of the board {board.name}")
+    }
+    if r.kernel {
+        return refused(file, at, "`ram` is \"{ram}\", the kernel's range: a process or a pool takes a range with use = \"process\"")
+    }
+    return
+}
+
+/// One `[[process]]`, appended to `parts`.
+func read_process(p: &TomlTable, stock: Bool, board: &Board, parts: &var Parts,
+                  file: String) -> Result<Void, BuildError> {
+    let known: Vector<String> = ["name", "package", "device", "inputs", "ram", "quota", "clients",
+                                 "pools", "on-exit"]
+    try only_keys(&p, &known, file, "[[process]]")
+    let keys = try! p.keys()
+    var k = 0
+    while k < keys.len() {
+        let key = keys.get(k) ?? ""
+        k = k + 1
+        if not stock && not key.equals("name") && not key.equals("package") {
+            return refused(file, where_is(&p, key),
+                           "`{key}` is a stock root's process's: a hand-written root's process gives only `name` and `package`")
+        }
+    }
+    let name = try text(&p, "name", file)
+    let at = where_is(&p, "name")
+    try check_process_name(name, file, at)
+    var i = 0
+    while i < parts.processes.len() {
+        let other = parts.processes.get(i)!
+        if other.name.equals(name) {
+            return refused(file, at, "the process `{name}` is named twice, here and at {other.at}")
+        }
+        i = i + 1
+    }
+    let package = try text(&p, "package", file)
+    try check_path(package, file, where_is(&p, "package"), "`package` of the process {name}")
+    var ram = ""
+    if p.contains("ram") {
+        ram = try text(&p, "ram", file)
+        try check_ram(&board, ram, file, where_is(&p, "ram"))
+    }
+    var on_exit = "report"
+    if p.contains("on-exit") {
+        on_exit = try text(&p, "on-exit", file)
+        if not on_exit.equals("report") && not on_exit.equals("shutdown") {
+            return refused(file, where_is(&p, "on-exit"),
+                           "`on-exit` is \"{on_exit}\", not one of \"report\", \"shutdown\"")
+        }
+    }
+    var devices = Vector<Entry>()
+    try read_entries(&p, "device", name, &var devices, file)
+    var d = 0
+    while d < devices.len() {
+        let e = devices.get(d)!
+        d = d + 1
+        let reference = try parse_ref(e.value, file, e.at)
+        try! parts.devices.push(NeedRef(process: name, need: e.key, reference: reference.text,
+                                        at: e.at))
+    }
+    try read_entries(&p, "inputs", name, &var parts.inputs, file)
+    var g = 0
+    while g < parts.inputs.len() {
+        let given = parts.inputs.get(g)!
+        g = g + 1
+        if given.process.equals(name) {
+            try check_path(given.value, file, given.at, "the input `{given.key}` of the process {name}")
+        }
+    }
+    try read_entries(&p, "clients", name, &var parts.clients, file)
+    try read_entries(&p, "pools", name, &var parts.pool_bindings, file)
+    try expect_table(&p, "quota", file)
+    if let q = p.table("quota") {
+        let qk = quota_keys()
+        let counts = try read_counts(&q, &qk, file, "`quota` of the process {name}")
+        var c = 0
+        while c < counts.len() {
+            let n = counts.get(c)!
+            try! parts.quotas.push(Entry(process: name, key: n.name, value: "{n.value}",
+                                         at: where_is(&q, n.name)))
+            c = c + 1
+        }
+    }
+    try! parts.processes.push(ProcessEntry(name: name, package: package, ram: ram,
+                                           on_exit: on_exit, at: at))
+    return
+}
+
+/// The `NAME = "value"` table at `key` in a `[[process]]`, appended to
+/// `out`. A list where a value goes is the list form, reserved.
+func read_entries(p: &TomlTable, key: String, process: String, out: &var Vector<Entry>,
+                  file: String) -> Result<Void, BuildError> {
+    try expect_table(&p, key, file)
+    if let t = p.table(key) {
+        let names = try! t.keys()
+        var i = 0
+        while i < names.len() {
+            let entry = names.get(i) ?? ""
+            i = i + 1
+            let at = where_is(&t, entry)
+            try check_name(entry, file, at, "a record's or an input's name")
+            if t.kind(entry) == TomlKind.Array {
+                return refused(file, at, "`{entry}` in the `{key}` of the process {process} is a list: one value per {key_noun(key)}, and the list form is reserved")
+            }
+            try! out.push(Entry(process: process, key: entry, value: try text(&t, entry, file),
+                                at: at))
+        }
+    }
+    return
+}
+
+/// What one entry of a process's `key` table binds, for a refusal.
+func key_noun(key: String) -> String {
+    if key.equals("device") { return "device need" }
+    if key.equals("inputs") { return "input" }
+    if key.equals("clients") { return "client record" }
+    "memory record"
+}
+
+/// One `[[pool]]`.
+func read_pool(p: &TomlTable, board: &Board, file: String) -> Result<PoolEntry, BuildError> {
+    let pool_keys: Vector<String> = ["name", "len", "ram"]
+    try only_keys(&p, &pool_keys, file, "[[pool]]")
+    let name = try text(&p, "name", file)
+    let at = where_is(&p, "name")
+    try check_name(name, file, at, "a pool's name")
+    let len = try size(&p, "len", board.word, file, "[[pool]]")
+    var ram = ""
+    if p.contains("ram") {
+        ram = try text(&p, "ram", file)
+        try check_ram(&board, ram, file, where_is(&p, "ram"))
+    }
+    return PoolEntry(name: name, len: len, ram: ram, at: at)
+}
+
+/// One `[[setup]]`: a register or one element, and exactly one of `set`,
+/// `clear` and `write`, a 32-bit word.
+func read_setup(s: &TomlTable, board: &Board, grain: UInt64, file: String) -> Result<SetupEntry, BuildError> {
+    let setup_keys: Vector<String> = ["register", "set", "clear", "write"]
+    try only_keys(&s, &setup_keys, file, "[[setup]]")
+    let reference_text = try text(&s, "register", file)
+    let at = where_is(&s, "register")
+    let reference = try parse_ref(reference_text, file, at)
+    let window = try board.resolve(&reference, RefUse.Setup, grain, file, at)
+    var ops = 0
+    var op = SetupOp.Set
+    var key = "set"
+    if s.contains("set") { ops = ops + 1 }
+    if s.contains("clear") {
+        ops = ops + 1
+        op = SetupOp.Clear
+        key = "clear"
+    }
+    if s.contains("write") {
+        ops = ops + 1
+        op = SetupOp.Write
+        key = "write"
+    }
+    if ops != 1 {
+        return refused(file, s.defined_at(),
+                       "a [[setup]] has {ops} of `set`, `clear` and `write`; it has exactly one")
+    }
+    let value = try size(&s, key, 8, file, "[[setup]]")
+    if value > 0xFFFF_FFFF {
+        return refused(file, where_is(&s, key),
+                       "`{key}` in [[setup]] is {hex(value)}, past 32 bits: a register is 4 bytes")
+    }
+    return SetupEntry(register: window, op: op, value: value, at: at)
+}
+
+/// A device need, bound: the process, the need, and the window it gets.
+public struct Bound {
+    process: String
+    need: String
+    window: Window
+}
+
+/// Where an input's value came from.
+public enum InputSource {
+    /// The image's process entry: a path from the product's root.
+    case Image,
+    /// The device instance the need is bound to: a path from the board's HAL
+    /// directory.
+    case Board,
+    /// The driver's `[build] defaults`: a path from its package's directory.
+    case Driver
+}
+
+@synthesize
+extension InputSource: Equatable {}
+
+/// One input of one process, and its value.
+public struct InputValue {
+    process: String
+    input: String
+    path: String
+    source: InputSource
+}
+
+/// What binding a stock root's processes made: each device need's window,
+/// each input's value, and the lines the builder prints (each input's
+/// source, each part it grants, each device bound more than once).
+public struct Bindings {
+    windows: Vector<Bound>
+    inputs: Vector<InputValue>
+    notes: Vector<String>
+}
+
+@synthesize
+extension Bindings: ExplicitCopy {}
+
+/// Binds a stock-root image's processes to their declarations (`decls`, one
+/// per process, in order) on `board`. Refused by name: a declaration the board
+/// cannot serve (`Declaration.check_against`); a `device` key that is no need
+/// of the process; a need of a type with several instances, a part window or
+/// a kernel device, that `device` does not name; a reference to a device of
+/// another type; a client or memory record unbound, or a binding naming no
+/// such record; a client bound to no serve of its protocol; a fast process
+/// placed in a slow range; an input with no value, or an image input that is
+/// none of the process's.
+public func bind(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
+                 grain: UInt64) -> Result<Bindings, BuildError> {
+    let file = image.file
+    var windows = Vector<Bound>()
+    var values = Vector<InputValue>()
+    var notes = Vector<String>()
+    var p = 0
+    while p < image.processes.len() {
+        let process = image.processes.get(p)!
+        p = p + 1
+        borrow let d = decls[p - 1] {
+            try bind_process(&image, &board, &d, &decls, &process, grain, &var windows,
+                             &var values, &var notes)
+        }
+    }
+
+    // Every device bound to more than one process, printed.
+    var w = 0
+    while w < windows.len() {
+        let b = windows.get(w)!
+        var first = true
+        var j = 0
+        while j < w {
+            if (windows.get(j)!).window.device.equals(b.window.device) {
+                first = false
+            }
+            j = j + 1
+        }
+        w = w + 1
+        if not first {
+            continue
+        }
+        var holders = Vector<String>()
+        j = 0
+        while j < windows.len() {
+            let o = windows.get(j)!
+            if o.window.device.equals(b.window.device) && not holds(&holders, o.process) {
+                try! holders.push(o.process)
+            }
+            j = j + 1
+        }
+        if holders.len() > 1 {
+            try! notes.push("{b.window.device} is bound to {holders.join(", ")}")
+        }
+    }
+    return Bindings(windows: move windows, inputs: move values, notes: move notes)
+}
+
+/// `bind` for one process and its declaration `d`.
+func bind_process(image: &ImageFile, board: &Board, d: &Declaration,
+                  decls: &Vector<Declaration>, process: &ProcessEntry, grain: UInt64,
+                  windows: &var Vector<Bound>, values: &var Vector<InputValue>,
+                  notes: &var Vector<String>) -> Result<Void, BuildError> {
+    let file = image.file
+    try d.check_against(&board)
+
+    // The process's placement against its speed.
+    let ram = if process.ram.is_empty() { board.default_process } else { process.ram }
+    if let r = board.range(ram) {
+        if d.fast && not r.fast {
+            return refused(file, process.at, "the process {process.name} declares ram = \"fast\" and is placed in {ram}, a slow range")
+        }
+    }
+
+    // `device` names needs of this process.
+    var e = 0
+    while e < image.devices.len() {
+        let n = image.devices.get(e)!
+        e = e + 1
+        if n.process.equals(process.name) && not d.has_need(n.need) {
+            return refused(file, n.at, "`{n.need}` in the `device` of the process {process.name} is no device need of {process.package}")
+        }
+    }
+
+    // Each need, to one device of its type.
+    let needs = d.needs()
+    var i = 0
+    while i < needs.len() {
+        let need = needs.get(i)!
+        i = i + 1
+        let part = d.need_is_part(need.name)
+        let instances = board.instances(need.type_name)
+        var window = Window(device: "", base: 0, len: 0, part: false)
+        if let named = image.need_ref(process.name, need.name) {
+            let reference = try parse_ref(named.reference, file, named.at)
+            let role = if part { RefUse.Part } else { RefUse.Need }
+            window = try board.resolve(&reference, role, grain, file, named.at)
+            let device = board.device(window.device)!
+            if not device.type_name.equals(need.type_name) {
+                return refused(file, named.at, "`{named.reference}` is a device of the type `{device.type_name}`, and the need `{need.name}` of the process {process.name} takes a `{need.type_name}`")
+            }
+            if window.part {
+                try! notes.push("{process.name}: part `{need.name}` is {named.reference}: {hex(window.base)} to {hex(window.base + window.len - 4)}, {window.len} bytes")
+            }
+        } else {
+            if part {
+                return refused(file, process.at, "the need `{need.name}` of the process {process.name} is a part window: name its registers in `device`")
+            }
+            if instances.len() > 1 {
+                return refused(file, process.at, "the board {board.name} has {instances.len()} devices of the type `{need.type_name}`: name the one the need `{need.name}` of the process {process.name} takes in `device`")
+            }
+            let only = instances.get(0)!
+            if only.kernel {
+                return refused(file, process.at, "{only.name} is the kernel's own device, bound only when an image names it: name it in the `device` of the process {process.name}")
+            }
+            window = Window(device: only.name, base: only.base, len: only.len, part: false)
+        }
+        try! windows.push(Bound(process: process.name, need: need.name, window: window))
+    }
+
+    // Client records, to serves of their protocol; memory records, to pools.
+    try bind_records(&image, &d, &process, RecordKind.Client, &image.clients, &decls)
+    try bind_records(&image, &d, &process, RecordKind.Memory, &image.pool_bindings, &decls)
+
+    // Every input, from the image, then the bound device, then the driver's
+    // default.
+    var k = 0
+    while k < image.inputs.len() {
+        let given = image.inputs.get(k)!
+        k = k + 1
+        if given.process.equals(process.name) && not holds(&d.inputs, given.key) {
+            return refused(file, given.at, "`{given.key}` is not an input of {process.package}, whose inputs are {inputs_listed(&d)}")
+        }
+    }
+    var n = 0
+    while n < d.inputs.len() {
+        let input = d.inputs.get(n) ?? ""
+        n = n + 1
+        let board_value = board_value_of(&board, &windows, process.name, input)
+        if let given = image.entry(&image.inputs, process.name, input) {
+            try! values.push(InputValue(process: process.name, input: input,
+                                        path: given.value, source: InputSource.Image))
+            if let fixed = board_value {
+                try! notes.push("{process.name}: input `{input}` from the image: {given.value}, which overrides the board's ({fixed.device}'s {fixed.path})")
+            } else {
+                try! notes.push("{process.name}: input `{input}` from the image: {given.value}")
+            }
+            continue
+        }
+        if let fixed = board_value {
+            try! values.push(InputValue(process: process.name, input: input,
+                                        path: fixed.path, source: InputSource.Board))
+            try! notes.push("{process.name}: input `{input}` from the board's {fixed.device}: {fixed.path}")
+            continue
+        }
+        if let fallback = d.default_for(input) {
+            try! values.push(InputValue(process: process.name, input: input,
+                                        path: fallback.path, source: InputSource.Driver))
+            try! notes.push("{process.name}: input `{input}` from the driver's default: {fallback.path}")
+            continue
+        }
+        return refused(file, process.at, "the input `{input}` of the process {process.name} has no value: the image gives none, no device it is bound to fixes it, and {process.package} has no default for it")
+    }
+    return
+}
+
+/// A device input a bound device fixes.
+struct Fixed {
+    device: String
+    path: String
+}
+
+/// The value a device bound to one of `process`'s needs fixes for the board
+/// input `input`.
+func board_value_of(board: &Board, windows: &Vector<Bound>, process: String,
+                    input: String) -> Fixed? {
+    var i = 0
+    while i < windows.len() {
+        let b = windows.get(i)!
+        i = i + 1
+        if not b.process.equals(process) {
+            continue
+        }
+        if let fixed = board.device_input(b.window.device, input) {
+            return Fixed(device: b.window.device, path: fixed.path)
+        }
+    }
+    None
+}
+
+func inputs_listed(d: &Declaration) -> String {
+    if d.inputs.len() == 0 {
+        return "none"
+    }
+    "`{d.inputs.join("`, `")}`"
+}
+
+/// Refuses an unbound record of `kind` (a client or a memory record) of the
+/// process, a binding in `entries` naming no such record, and a client bound
+/// to anything but a serve of its protocol.
+func bind_records(image: &ImageFile, d: &Declaration, process: &ProcessEntry, kind: RecordKind,
+                  entries: &Vector<Entry>, decls: &Vector<Declaration>) -> Result<Void, BuildError> {
+    let file = image.file
+    let key = if kind == RecordKind.Client { "clients" } else { "pools" }
+    var e = 0
+    while e < entries.len() {
+        let entry = entries.get(e)!
+        e = e + 1
+        if not entry.process.equals(process.name) {
+            continue
+        }
+        guard let record = d.record(kind, entry.key) else {
+            return refused(file, entry.at, "`{entry.key}` in the `{key}` of the process {process.name} is no {kind_word(kind)} record of {process.package}")
+        }
+        if kind == RecordKind.Client {
+            try serve_of(&image, &decls, &record, &entry, process.name)
+        }
+    }
+    var r = 0
+    while r < d.records.len() {
+        let record = d.records.get(r)!
+        r = r + 1
+        if record.kind != kind {
+            continue
+        }
+        if image.entry(&entries, process.name, record.name) == None {
+            return refused(file, process.at, "the {kind_word(kind)} record `{record.name}` of the process {process.name} is unbound: bind it in `{key}`")
+        }
+    }
+    return
+}
+
+/// Refuses a client binding whose `PROCESS.RECORD` names no serve of the
+/// client's protocol.
+func serve_of(image: &ImageFile, decls: &Vector<Declaration>, client: &BootRecord,
+              entry: &Entry, process: String) -> Result<Void, BuildError> {
+    let file = image.file
+    let target = entry.value
+    guard let dot = target.index_of(46) else {
+        return refused(file, entry.at, "`{target}` is not PROCESS.RECORD, a process and its serve record")
+    }
+    let server = target.substring(0, dot)
+    let record = target.substring(dot + 1, target.len())
+    var i = 0
+    while i < image.processes.len() {
+        let p = image.processes.get(i)!
+        i = i + 1
+        if not p.name.equals(server) {
+            continue
+        }
+        borrow let sd = decls[i - 1] {
+            guard let serve = sd.record(RecordKind.Serve, record) else {
+                return refused(file, entry.at, "`{target}` names no serve record of the process {server}")
+            }
+            if not serve.protocol.equals(client.protocol) {
+                return refused(file, entry.at, "`{target}` serves `{serve.protocol}`, and the client `{client.name}` of the process {process} speaks `{client.protocol}`")
+            }
+        }
+        return
+    }
+    return refused(file, entry.at, "`{target}` names no process of this image: there is no `{server}`")
+}
+
+extension ImageFile {
+    /// The reference the image names for the need `need` of `process`.
+    public func need_ref(&self, process: String, need: String) -> NeedRef? {
+        var i = 0
+        while i < self.devices.len() {
+            if let n = self.devices.get(i) {
+                if n.process.equals(process) && n.need.equals(need) {
+                    return n
+                }
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// The entry of `process` keyed `key` in `entries`.
+    public func entry(&self, entries: &Vector<Entry>, process: String, key: String) -> Entry? {
+        var i = 0
+        while i < entries.len() {
+            if let e = entries.get(i) {
+                if e.process.equals(process) && e.key.equals(key) {
+                    return e
+                }
+            }
+            i = i + 1
+        }
+        None
+    }
+}
