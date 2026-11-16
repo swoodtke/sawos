@@ -21,7 +21,14 @@
 //!         reads the board description BOARD (a `board.toml` of the sawos tree
 //!         SAWOS) and holds it to PROFILE, to its linker script and to the
 //!         board's HAL, compiled in STAGING; `sosimage.boardcheck` lists
-//!         what is held and what is not. Prints nothing when they agree
+//!         what is held. Prints nothing when they agree
+//!     sosimage defaults KERNEL BOARD
+//!         plans the board description BOARD's `[limits.default]` against
+//!         the kernel object KERNEL as an image that states no limits of its
+//!         own is planned, refusing a default that breaks a derivation or a
+//!         bound (`sosimage.product.board_defaults`), and prints them as the
+//!         `limits` object of an image description (`sosimage.image`), or
+//!         `null` for a board that states none
 //!     sosimage build PROFILE SAWOS PRODUCT IMAGE OUT
 //!         builds the image the hand-written description IMAGE states, for
 //!         the board it names, into the directory OUT (`sosimage.product`):
@@ -40,7 +47,7 @@ import std.env.{Env}
 import sosimage.board.{Board}
 import sosimage.boardcheck.{check_board, hal_facts}
 import sosimage.build.{build_kernel, build_native, link}
-import sosimage.product.{build_image}
+import sosimage.product.{board_defaults, build_image}
 import sosimage.failure.{BuildError}
 import sosimage.image.{ImageSpec}
 import sosimage.kernel.{KernelFacts, QUOTA_KINDS, SLAB_KINDS, quota_kind_name,
@@ -104,6 +111,18 @@ func run() -> Result<Void, BuildError> {
         let facts = try hal_facts(&profile, args.get(5) ?? "")
         return check_board(&board, &profile, &facts, args.get(3) ?? "")
     }
+    if command.equals("defaults") && args.len() == 4 {
+        let facts = try KernelFacts.read(args.get(2) ?? "")
+        let path = args.get(3) ?? ""
+        let board = try Board.parse(try read_text(path), path)
+        let limits = try board_defaults(&board, &facts)
+        if board.has_limits {
+            print(limits.json())
+        } else {
+            print("null")
+        }
+        return
+    }
     if command.equals("build") && args.len() == 7 {
         let profile = try load_profile(args.get(2) ?? "")
         let linked = try build_image(&profile, args.get(3) ?? "", args.get(4) ?? "",
@@ -113,7 +132,7 @@ func run() -> Result<Void, BuildError> {
         }
         return
     }
-    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | slabs KERNEL | board PROFILE SAWOS BOARD STAGING | build PROFILE SAWOS PRODUCT IMAGE OUT")
+    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | slabs KERNEL | board PROFILE SAWOS BOARD STAGING | defaults KERNEL BOARD | build PROFILE SAWOS PRODUCT IMAGE OUT")
 }
 
 func load_profile(path: String) -> Result<Profile, BuildError> {

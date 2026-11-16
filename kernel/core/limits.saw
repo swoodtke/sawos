@@ -5,10 +5,12 @@
 //! These are one decision. Every number is a fixed-size table's dimension and
 //! they are chosen against each other (`MAX_ATTACHMENTS` is the sum of the
 //! waitables, because an attachment is one (Waiter, waitable) pair and spec
-//! §2.2 allows an object at most one Waiter). A derived `static` built from an
-//! imported const is not a compile-time length, so a derived size and its
-//! operands cannot be split across modules; `MAX_ATTACHMENTS` has to sit beside
-//! the terms it adds.
+//! §2.2 allows an object at most one Waiter). The slab floors are the same on
+//! every board; the two per-body array lengths are the board's, read from the
+//! HAL and held here: `MAX_HANDLES` against the Memory and IoMemory floors
+//! (a region table filling them beside root's first handles), and
+//! `MAX_GRANT_ROWS` against the board's grant-row budget and an image's
+//! segments plus its stack.
 //!
 //! No slab scan or handle walk in the kernel takes a preemption point. Every
 //! free-slot search, by-line or by-key lookup and teardown sweep is bounded by
@@ -166,23 +168,26 @@ public(package) static NO_MAPPING: Int = -1
 /// Rows in a process's grant record: the protection map the scheduler replays
 /// when it switches into that process.
 ///
-/// This is only the array length. What a process may actually hold is a
-/// per-profile budget the HAL publishes (`hal.GRANT_ROW_BUDGET`), and this
-/// number is the storage that has to cover the larger of them. One profile's
-/// limit is hardware (a fixed number of numbered protection regions), so a map
-/// meeting it is a map the machine cannot install. The other has no such limit
-/// and its limit is this policy number, chosen so one array serves both. A map
-/// checks the HAL's number and never this one; the asserts below stop the array
-/// being too short.
+/// This is only the array length, and the board's (`hal.MAX_GRANT_ROWS`). What
+/// a process may actually hold is the board's budget (`hal.GRANT_ROW_BUDGET`):
+/// on a board with numbered protection regions it is the hardware's, so a map
+/// meeting it is a map the machine cannot install, and elsewhere it is a policy
+/// number. A map checks the budget and never this one. The array is the larger
+/// of the budget and an image's segments plus its stack, which the asserts
+/// below hold, so it is never too short and no longer than it must be.
 ///
 /// Raising it costs every process body a row of storage.
-public(package) static MAX_GRANT_ROWS: Int = 9
+public(package) static MAX_GRANT_ROWS: Int = hal.MAX_GRANT_ROWS
 
-static_assert(hal.MAX_ROOT_SEGMENTS + 1 <= 9,
+static_assert(hal.MAX_ROOT_SEGMENTS + 1 <= (hal.MAX_GRANT_ROWS as UInt),
               "a process's grant record must hold every segment plus its stack")
 
-static_assert(hal.GRANT_ROW_BUDGET <= 9,
-              "a process's grant record must hold every row its profile may install")
+static_assert(hal.GRANT_ROW_BUDGET <= (hal.MAX_GRANT_ROWS as UInt),
+              "a process's grant record must hold every row its board may install")
+
+static_assert((hal.MAX_GRANT_ROWS as UInt) == hal.GRANT_ROW_BUDGET
+              || (hal.MAX_GRANT_ROWS as UInt) == hal.MAX_ROOT_SEGMENTS + 1,
+              "a process's grant record is the larger of the budget and the segments plus the stack")
 
 // Every body needs a protection domain to live in. On a tier that keeps a
 // persistent table set per process, the HAL sizes a static pool and advertises
@@ -306,8 +311,17 @@ static_assert(PIPE_INFLIGHT >= 1,
 static_assert(PIPE_INFLIGHT <= 64,
               "the staging ring is inline per connection — keep the storage bounded")
 
-/// Handles one process's table can hold (§3).
-public(package) static MAX_HANDLES: Int = 16
+/// Handles one process's table can hold (§3): the board's number
+/// (`hal.MAX_HANDLES`), since a table is a field of every process body.
+public(package) static MAX_HANDLES: Int = hal.MAX_HANDLES
+
+// Root's table takes a region table that fills the Memory and IoMemory floors,
+// one handle per row, beside its first handles: System, Process and Thread at
+// start, its own Process handle from `process_self`, and one to make
+// something with (spec §2.8, §12). The handle word's index field bounds the
+// table from above (`kcore.objects`).
+static_assert(MAX_HANDLES >= 5 + MAX_MEMORIES + MAX_IOMEMORIES,
+              "root's handle table must hold a region table filling the Memory and IoMemory floors beside its first handles")
 
 // =============================================================================
 // The extent chain
@@ -464,29 +478,21 @@ public(package) static DEFAULT_QUOTA_HANDLES: Int = 12
 /// segments (code, read-only data, writable data) plus the kernel's stack grant
 /// at the region's top. Root's image and children's images spend the same.
 ///
-/// Its one reader is the `static_assert` below, which checks that a child's
-/// default mapping quota fits in the rows left after its image.
+/// It prices a mapping quota default: the compiled one in the `static_assert`
+/// below, and an image's at boot (`kcore.areas`), each of which must fit the
+/// rows left after an image.
 public(package) static IMAGE_GRANT_ROWS: Int = 4
 
-/// The smaller of the two profiles' row budgets, written down so the assert
-/// below can be compile-time. `hal.GRANT_ROW_BUDGET` is a `UInt` and the quota
-/// numbers are `Int`s; the minimum is stated here and pinned against the HAL on
-/// the next line rather than cast in a `static_assert`.
-public(package) static MIN_GRANT_ROW_BUDGET: Int = 8
-
-static_assert(hal.GRANT_ROW_BUDGET >= 8,
-              "MIN_GRANT_ROW_BUDGET is stale — this profile grants fewer rows than it claims")
-
 // The mapping default is chosen so that a child on it can always spend its
-// whole budget without the machine refusing first, on either profile (the
-// smaller is what is tested). That makes `install_row`'s `fatal` a statement
-// about a kernel bug rather than a number picked too large.
+// whole budget on this board without the machine refusing first. That makes
+// `install_row`'s `fatal` a statement about a kernel bug rather than a number
+// picked too large.
 //
 // The run-time half is `install_quota_limits`, which clamps every process's
 // mapping row to what its own domain has left after its image, something a
 // compile-time test cannot know.
-static_assert(DEFAULT_QUOTA_MAPPINGS + IMAGE_GRANT_ROWS <= MIN_GRANT_ROW_BUDGET,
-              "a child's mapping quota must fit the smaller profile's free grant rows")
+static_assert(DEFAULT_QUOTA_MAPPINGS + IMAGE_GRANT_ROWS <= (hal.GRANT_ROW_BUDGET as Int),
+              "a child's mapping quota must fit this board's free grant rows")
 
 // Every default is under the slab it draws from, so a child meets its own
 // budget rather than the machine's. A default at or above its slab would make

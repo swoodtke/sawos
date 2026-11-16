@@ -22,14 +22,11 @@
 //!   `IMAGE_SLOT_LEN`;
 //! - against the HAL: a console (`kernel = true`) whose window is not
 //!   `DEVICE_GRANT_BASE` for `DEVICE_GRANT_LEN`, or no console; a device
-//!   window off `PROT_GRAIN`; a kernel range that does not end where root's
-//!   region begins (`ROOT_LOAD_BASE`); root's region (`ROOT_LOAD_BASE` to
-//!   `ROOT_REGION_TOP`) empty, or not inside the default process range.
-//!
-//! Not held: the kernel range's base, and the top of each process range. No
-//! HAL constant states either on every board (`RAM_TOP` is not arm64's, and
-//! a kernel range's base is its linker script's `MEMORY`), so a process range
-//! drawn past the RAM is not refused here.
+//!   window off `PROT_GRAIN`; a kernel range that does not begin at
+//!   `KERNEL_RAM_BASE`, or does not end where root's region begins
+//!   (`ROOT_LOAD_BASE`); a range that runs past `RAM_TOP`; root's
+//!   region (`ROOT_LOAD_BASE` to `ROOT_REGION_TOP`) empty, or not inside the
+//!   default process range.
 //!
 //! A keyed module, one whose directory is chosen per image from several
 //! (the ESP32-S3's clock and stall keys), is written in `modules` with a
@@ -47,8 +44,8 @@ import sosimage.tool.{read_text, write_lines}
 
 /// The layout version of the record `hal_facts` reads, its first word, and
 /// its length in words.
-public static HAL_FACTS_VERSION: UInt64 = 1
-public static HAL_FACTS_WORDS: Int = 6
+public static HAL_FACTS_VERSION: UInt64 = 2
+public static HAL_FACTS_WORDS: Int = 8
 
 /// The record's symbol.
 public func facts_symbol() -> String { "sosimage_hal_facts" }
@@ -71,6 +68,9 @@ public struct HalFacts {
     /// The console's window, which the kernel hands over.
     console_base: UInt64
     console_len: UInt64
+    /// Where the kernel's own RAM begins, and where the board's RAM ends.
+    kernel_base: UInt64
+    ram_top: UInt64
 }
 
 /// The HAL's numbers, read by compiling a module that exports them with the
@@ -94,6 +94,8 @@ public func hal_facts(profile: &Profile, staging: String) -> Result<HalFacts, Bu
     try! lines.push("    hal.PROT_GRAIN,")
     try! lines.push("    hal.DEVICE_GRANT_BASE,")
     try! lines.push("    hal.DEVICE_GRANT_LEN,")
+    try! lines.push("    hal.KERNEL_RAM_BASE,")
+    try! lines.push("    hal.RAM_TOP,")
     try! lines.push("]")
     try write_lines(source, &lines)
     try build_kernel(&profile, source, object)
@@ -109,7 +111,8 @@ public func read_hal_facts(object: String) -> Result<HalFacts, BuildError> {
     }
     return HalFacts(root_base: words.get(1) ?? 0, root_top: words.get(2) ?? 0,
                     grain: words.get(3) ?? 0, console_base: words.get(4) ?? 0,
-                    console_len: words.get(5) ?? 0)
+                    console_len: words.get(5) ?? 0, kernel_base: words.get(6) ?? 0,
+                    ram_top: words.get(7) ?? 0)
 }
 
 /// Refuses a board description that disagrees with the sawos tree at
@@ -257,8 +260,8 @@ public func script_number(text: &String, symbol: String) -> UInt64? {
     None
 }
 
-/// The HAL's numbers: the console, the grain, the kernel range's end and
-/// root's region.
+/// The HAL's numbers: the console, the grain, the RAM's bounds, the kernel
+/// range's end and root's region.
 func check_hal(board: &Board, facts: &HalFacts) -> Result<Void, BuildError> {
     let file = board.file
     var console = false
@@ -283,8 +286,14 @@ func check_hal(board: &Board, facts: &HalFacts) -> Result<Void, BuildError> {
     while r < board.ram.len() {
         let range = board.ram.get(r)!
         r = r + 1
+        if range.kernel && range.base != facts.kernel_base {
+            return BuildError(message: "{file}: [ram.{range.name}], the kernel's, begins at {hex(range.base)}, and the HAL's kernel RAM begins at {hex(facts.kernel_base)} (KERNEL_RAM_BASE)")
+        }
         if range.kernel && range.base + range.len != facts.root_base {
             return BuildError(message: "{file}: [ram.{range.name}], the kernel's, runs from {hex(range.base)} to {hex(range.base + range.len)}, and root's region begins at {hex(facts.root_base)} (ROOT_LOAD_BASE): the kernel range ends where root's region begins")
+        }
+        if range.base + range.len > facts.ram_top {
+            return BuildError(message: "{file}: [ram.{range.name}] runs from {hex(range.base)} to {hex(range.base + range.len)}, past the end of the HAL's RAM at {hex(facts.ram_top)} (RAM_TOP)")
         }
     }
     guard let range = board.range(board.default_process) else {

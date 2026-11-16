@@ -2199,13 +2199,14 @@ raising a set number raises what is derived from it.
   (`hal.MAX_ROOT_SEGMENTS`) and its protection-domain pool
   (`hal.PROT_DOMAIN_SLOTS`, §2.7). Each is what the board's hardware allows
   where a hardware fact stands behind it, and the board's policy where none
-  does. The grant record's length (`MAX_GRANT_ROWS`) holds the budget and
-  every segment an image may have plus its stack, which the build asserts.
-- **The handle table's length is a board's number too**
-  (not yet enforced: limits). `MAX_HANDLES` is set in the HAL, and is at
-  least five more than `MAX_MEMORIES` + `MAX_IOMEMORIES`, so root's table
-  holds a region table that fills those two floors beside its first handles
-  (§12).
+  does. The grant record's length (`hal.MAX_GRANT_ROWS`) is the larger of
+  the budget and every segment an image may have plus its stack, which the
+  build asserts.
+- **The handle table's length is a board's number too.** `MAX_HANDLES` is
+  set in the HAL, and is at least five more than `MAX_MEMORIES` +
+  `MAX_IOMEMORIES`, so root's table holds a region table that fills those
+  two floors beside its first handles (§12). The build asserts that, and
+  that the handle word's index field can name every entry.
 - **The slab floors are the kernel's** (`kcore.limits`: `MAX_PROCESSES`,
   `MAX_THREADS` and the rest), compiled into every kernel and the same on
   every board. Each is extent 0 of its slab, what a kind holds before
@@ -2224,8 +2225,13 @@ raising a set number raises what is derived from it.
   first process exists (§12). A kind's capacity at boot is its floor plus its
   area. The table also carries the quota defaults the image's children start
   with (§2.9). A board's description gives the capacities and defaults an
-  image gets when it names none, and the image builder writes them into the
-  image, so to the kernel they are the image's (not yet enforced: limits).
+  image built for it gets, number by number, wherever the image's own
+  description states none: the image builder takes the board's numbers, lays
+  the image's over them, and writes the result into the image, so to the
+  kernel they are the image's. (The test harness's images are described by
+  their cases instead: a case that states no limits carries none, so it boots
+  at the kernel's floors and compiled defaults; a case may state numbers of
+  its own, or ask for its board's.)
   An image raises a limit and never lowers one: the floor stays extent 0,
   and a default stays at least the compiled one.
 - **An image's totals keep the floors' relations.** At boot, records are at
@@ -2372,9 +2378,7 @@ Interrupt has no column: there is at most one live Interrupt per line, and the
 Interrupt slab bounds the objects (§2.8). Pools and allocations share the
 `Memory` column, as they share the Memory slab: an `allocate` charges its
 caller one, and the boot charges root one for each
-`Ram` and `Pool` row it mints. Parts of the model this section and §2.8,
-§5b.1 and §12 describe are not yet enforced, and the transition at the end of
-this section says what the kernel does until they are.
+`Ram` and `Pool` row it mints.
 
 - **Policy first.** A quota is checked at every allocation site that answers
   `NoResource`, ahead of the slab, so a process at its budget is told
@@ -2454,27 +2458,6 @@ this section says what the kernel does until they are.
   at once, and neither bounds the other. A process allocating from a pool it
   was given pays a `Memory` row per allocation and nothing for the pool,
   which stays charged to whoever it was charged to.
-
-**Not yet enforced: the transition to per-board limits.**
-Every sentence of this specification that describes a part of the model which
-the kernel does not build carries the marker "not yet enforced:" and the
-part's name; a marker on the lead of a paragraph or a bullet covers all of
-it. Until a part is built the kernel does what its paragraph here says;
-building it removes its markers and its paragraph, and the last part removes
-this note.
-
-- **Limits** (`limits`). One set of compiled numbers serves every board.
-  The slab floors, `MAX_HANDLES` and the compiled quota defaults are
-  `kcore.limits`', the same on every board, and a board's own numbers are
-  its grant-row budget, its segment bound and its domain pool. The compiled
-  mapping default is checked against a minimum every board's budget meets
-  (`MIN_GRANT_ROW_BUDGET`), not against each board's own budget, and the
-  handle table need not hold a full region table beside root's first
-  handles. No board has a description: an image's limits are the ones the
-  image itself states, which the image builder writes into its slab block
-  (§12), and an image that states none links no area and carries no
-  defaults, so every kind boots at its floor and every child starts with the
-  compiled defaults.
 
 ### 2.10 Object lifecycle
 
@@ -3640,9 +3623,10 @@ so a budget never varies by allocation luck. Each board states its own budget
 (`hal.GRANT_ROW_BUDGET`, §2.8): on a tier-2 board it is the rows its
 protection hardware holds, and elsewhere it is the board's policy. A child's
 mapping quota is priced against the budget of the board it runs on: its
-default is at most that budget less the rows an image spends before it runs
-(`IMAGE_GRANT_ROWS`), so a board with more rows gives its children more
-(not yet enforced: limits). Whatever the default, a process's mapping row is
+default, the compiled one and the one a board's description gives an image
+(§2.8), is at most that budget less the rows an image spends before it runs
+(`IMAGE_GRANT_ROWS`), so a board with more rows gives its children more.
+Whatever the default, a process's mapping row is
 clamped to the rows its own domain has left after its image (§2.9), so a
 `map` meets the quota before it can meet the hardware's wall.
 
@@ -4472,8 +4456,6 @@ loader parses and reports while no process stores either.
 - **Retiring the image-declared device grant** (`SegFlag.Device` and the
   loader's `allow_device: true` door, dormant) (§2.5): its emitter is
   sawlang-side, so deleting it is a toolchain-pin event.
-- **Per-board limits and linked slab areas** (§2.8, §12). Until they land
-  the kernel does what §2.9's transition note says.
 - **Sub-pools and revoke** (§2.5): `Pool.split` and a revoke are reserved, not
   specified. A process given a pool can allocate from it but cannot carve it
   into budgets for others, and a manager cannot take back what it allocated.

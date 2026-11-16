@@ -447,6 +447,10 @@ CHILD_QUOTA_PKG = os.path.join(TESTS_DIR, "child-quota")
 IMAGE_LIMITS_PKG = os.path.join(TESTS_DIR, "image-limits")
 CHILD_IMAGE_QUOTA_PKG = os.path.join(TESTS_DIR, "child-image-quota")
 CHILD_MAPWALL_PKG = os.path.join(TESTS_DIR, "child-mapwall")
+# An image given its board's defaults (`BOARD_LIMITS`), and the child that maps
+# to the board's grant budget under them.
+BOARD_LIMITS_PKG = os.path.join(TESTS_DIR, "board-limits")
+CHILD_BOARD_LIMITS_PKG = os.path.join(TESTS_DIR, "child-board-limits")
 
 # Death notifications. The two notify cases differ only in how the child dies:
 # the same attachment and park deliver `Exited` for one and `Faulted` for the
@@ -880,6 +884,29 @@ QEMU_TIMEOUT_S = 10
 TIER_ISOLATED = "isolated"
 TIER_FLAT = "flat"
 
+# A case's `limits` when it asks for its board's defaults: the `[limits.default]`
+# of the profile's `hal/<name>/board.toml`, as an image that states no limits
+# of its own is given them (`_board_defaults`). A test image otherwise gets
+# none of a board's defaults: it states its limits, or boots at the kernel's
+# floors, so a case that reaches a floor reads the same on every board.
+BOARD_LIMITS = "board"
+
+# The slab areas an image given the riscv32 and arm64 boards' defaults links
+# (`BOARD_LIMITS`), as `(kind, slots above the floor)` in the order the kernel
+# installs them: sixteen bodies, events, Waiters and timers, 32 Memories, 16
+# IoMemories and eight pipes, and what derives from the bodies (threads 16,
+# records 64, Mappings 64) and from the waitables (attachments 100).
+VIRT_BOARD_AREAS = [(0, 8), (1, 12), (3, 68), (4, 8), (5, 16), (6, 8),
+                    (7, 56), (9, 8), (10, 4), (11, 13), (12, 52)]
+
+
+def _board_area_lines(arch):
+    """The kernel's `slab area` lines for the areas a profile's board
+    defaults come to (`board_areas`), in the order it installs them."""
+    width = arch["hex_width"]
+    return [f"SOS: slab area kind=0x{kind:0{width}x} slots=0x{slots:0{width}x}"
+            for kind, slots in arch["board_areas"]]
+
 ARCHES = [
     {
         "name": "riscv32",
@@ -937,6 +964,10 @@ ARCHES = [
         # The uart-echo cases obtain it rather than declaring it.
         "device_base": 0x10000000,
         "device_len": 0x1000,
+        # What the board's `[limits.default]` comes to (`board_limits`): its
+        # areas, and the PMP budget's eight rows less an image's four.
+        "board_areas": VIRT_BOARD_AREAS,
+        "board_mappings": 4,
     },
     {
         "name": "arm64",
@@ -1006,6 +1037,11 @@ ARCHES = [
         # The console UART's page, mirroring `hal.DEVICE_GRANT_BASE` / `_LEN`.
         "device_base": 0x09000000,
         "device_len": 0x1000,
+        # What the board's `[limits.default]` comes to (`board_limits`): the
+        # riscv32 board's areas, and the grant budget's sixteen rows less an
+        # image's four.
+        "board_areas": VIRT_BOARD_AREAS,
+        "board_mappings": 12,
     },
     # =========================================================================
     # The flat build profile
@@ -1076,6 +1112,10 @@ ARCHES = [
         "prot_grain": 4,
         "device_base": 0x10000000,
         "device_len": 0x1000,
+        # What the board's `[limits.default]` comes to (`board_limits`): the
+        # riscv32 board's.
+        "board_areas": VIRT_BOARD_AREAS,
+        "board_mappings": 4,
     },
 ]
 
@@ -1129,6 +1169,12 @@ ESP32S3_ARCH = {
     # UART0's page, mirroring `hal.DEVICE_GRANT_BASE` / `DEVICE_GRANT_LEN`.
     "device_base": 0x60000000,
     "device_len": 0x1000,
+    # What the board's `[limits.default]` comes to (`board_limits`): eight
+    # bodies and a Waiter each, the derived totals following (records 32,
+    # attachments 52, Mappings 32), every other kind at its floor; and the
+    # grant budget's sixteen rows less an image's four.
+    "board_areas": [(1, 4), (3, 20), (7, 24), (11, 5), (12, 20)],
+    "board_mappings": 12,
 }
 
 # How big a child's destination region is.
@@ -1327,6 +1373,12 @@ def expectations(arch):
                                - arch.get("prot_grain", 0)),
         "pool_less_two_grains": str(arch.get("pool_len", 0)
                                     - 2 * arch.get("prot_grain", 0)),
+        # A child's Mapping default under the board's defaults (`board_limits`):
+        # in decimal as the child prints it, as the kernel's exit line prints
+        # it, and in the §8 status word of a child that exited with it.
+        "board_mappings": str(arch.get("board_mappings")),
+        "board_mappings_word": f"0x{arch.get('board_mappings', 0):0{width}x}",
+        "board_exit_status": str(0x10000 | arch.get("board_mappings", 0)),
         "zero": f"0x{0:0{width}x}",
         "one": f"0x{1:0{width}x}",
         "two": f"0x{2:0{width}x}",
@@ -1343,6 +1395,8 @@ def expectations(arch):
         "ten": f"0x{10:0{width}x}",
         "eleven": f"0x{11:0{width}x}",
         "twelve": f"0x{12:0{width}x}",
+        "seventeen": f"0x{17:0{width}x}",
+        "twenty_nine": f"0x{29:0{width}x}",
         "prio": f"0x{0x01010100:0{width}x}",
         "irq_line": f"0x{arch['selftest_line']:0{width}x}",
         # The byte `child-touch` writes into the page its launcher mapped and
@@ -4872,9 +4926,10 @@ TEST_CASES = [
         # Mapping slots recycle.
         #
         # `rounds=12` is past `MAX_MAPPINGS`, so the slab is demonstrably
-        # recycling, and past root's own row allowance too (its free rows, five
-        # on the smaller profile), so `Unmap` is demonstrably crediting the
-        # ledger as well as returning the row. One number carries both halves.
+        # recycling, and past root's own row allowance too (its free rows,
+        # clamped to the Mapping slab's capacity, so no more than
+        # `MAX_MAPPINGS`), so `Unmap` is demonstrably crediting the ledger as
+        # well as returning the row. One number carries both halves.
         #
         # The other two lines are the second-zero condition from both sides.
         # `husk wrote 94 read 94`: every handle on the region is destroyed and
@@ -5166,12 +5221,16 @@ TEST_CASES = [
         # setting nothing. Root's own `Mapping` limit is the free-row count
         # of an image like the child's, which is how the case names the bound
         # without printing a board's number. A page root mapped into the child
-        # first does not lower the bound: it is the rows the image left.
+        # first does not lower the bound: it is the rows the image left. Root's
+        # limit is clamped to the Mapping slab's capacity too (§2.9), so the
+        # image raises the slab past every board's free rows, and the rows
+        # are what bind.
         "name": "quota_set_rows",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": QUOTA_SET_ROWS_PKG,
         "children": [CHILD_BYE_PKG],
         "pool": True,
+        "limits": {"slabs": {"mappings": 8}},
         "expect_out": ["{banner}",
                        "SOS quotarows: child mapping row limit=2 used=1",
                        "SOS quotarows: root's own free rows taken",
@@ -5185,11 +5244,14 @@ TEST_CASES = [
     {
         # The free rows are the named child's, not the caller's: a child
         # whose image spends one row fewer than root's takes a `Mapping`
-        # limit one above root's own, and one more answers `NoResource`.
+        # limit one above root's own, and one more answers `NoResource`. The
+        # image raises the Mapping slab past every board's free rows, so
+        # root's own limit is its free rows and not the slab's capacity.
         "name": "quota_set_rows_child",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": QUOTA_SET_ROWS_CHILD_PKG,
         "children": [CHILD_QUOTA_TWOSEG_PKG],
+        "limits": {"slabs": {"mappings": 8}},
         "expect_out": ["{banner}",
                        "SOS quotarowschild: one above root's own free rows: "
                        "taken",
@@ -5207,10 +5269,10 @@ TEST_CASES = [
         "children": [CHILD_BYE_PKG],
         "expect_out": ["{banner}",
                        "SOS quotahandles: child handle row limit=12 used=0",
-                       "SOS quotahandles: limit 16, the table, taken",
-                       "SOS quotahandles: limit 17: no room for what was "
+                       "SOS quotahandles: limit 32, the table, taken",
+                       "SOS quotahandles: limit 33: no room for what was "
                        "asked",
-                       "SOS quotahandles: the row still reads limit=16",
+                       "SOS quotahandles: the row still reads limit=32",
                        "SOS quotahandles: done"],
         "expect_clean_exit": True,
     },
@@ -5225,7 +5287,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={four}",
                        "SOS quotalauncher: own handle limit=12",
-                       "SOS quotalauncher: setting handle limit 17, past own "
+                       "SOS quotalauncher: setting handle limit 33, past own "
                        "and table",
                        "SOS: process fault: argument outside its domain "
                        "process={one}",
@@ -7907,6 +7969,9 @@ TEST_CASES = [
         "root_pkg": UART_SERVICE_PKG,
         "children": [SVC_UART_NS16550_PKG, SVC_CLIENT_PKG],
         "device": True,
+        # Its board's defaults, which its hand-written description
+        # (`FROM_FILES`), stating no limits, is given: the two images are one.
+        "limits": BOARD_LIMITS,
         "stdin": ECHO_INPUT,
         "expect_out": ["{banner}",
                        "root image ok segments={three}",
@@ -8398,6 +8463,41 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
 
+    # An image that states no limits is given its board's (`BOARD_LIMITS`),
+    # and they reach the machine. The `slab area` lines are the kernel's, one
+    # per area the board's `[limits.default]` comes to (`board_areas`, per
+    # profile). A child made under them starts with the board's Handle and
+    # Mapping defaults, maps until its quota refuses with the board's whole
+    # grant budget installed (`board_mappings`: the budget's rows less an
+    # image's four), and ends with that count; then root fills its handle
+    # table, `MAX_HANDLES` deep, from the nine handles it holds
+    # (`tests/board-limits`).
+    {
+        "name": "board_limits",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": BOARD_LIMITS_PKG,
+        "children": [CHILD_BOARD_LIMITS_PKG],
+        "pool": True,
+        "limits": BOARD_LIMITS,
+        "expect_out": ["{banner}",
+                       _board_area_lines,
+                       "SOS: boot regions={three}",
+                       "SOS boardlimits: the child's quotas handle=28 "
+                       "mapping={board_mappings}",
+                       "SOS boardlimits: gave a page for each mapping and one "
+                       "more",
+                       "SOS boardlimits: started",
+                       "SOS childboardlimits: maps={board_mappings} quota=1",
+                       "SOS: process exit: code={board_mappings_word} "
+                       "process={one}",
+                       "SOS boardlimits: root observed child "
+                       "status={board_exit_status}",
+                       "SOS boardlimits: the table took 23 more handles, then "
+                       "no room for what was asked",
+                       "SOS boardlimits: done"],
+        "expect_clean_exit": True,
+    },
+
     # An image's quota defaults reach its children (spec §2.9). The image
     # states an Event default of six where the compiled one is four, and the
     # child (`tests/child-image-quota`) makes six before the seventh is
@@ -8511,21 +8611,24 @@ TEST_CASES = [
     },
 
     # The bound on boot rows reads the capacity at boot. Each image is a
-    # hand-made table (`slab_block`) whose Memory slab is raised by nine, so
-    # the two slabs hold 33 rows. A table of 33 rows passes that bound and
-    # meets root's handle table, which holds 13 beside root's first handles; a
-    # table of 34 is refused at the bound. Against the floors (24) both would
-    # meet the bound.
+    # hand-made table (`slab_block`) whose Memory slab is raised by 17, so the
+    # two slabs hold 41 rows. A table of 41 `Ram` rows passes that bound and
+    # meets root's handle table, which holds 29 beside root's first handles,
+    # before the 33 Memories: the stop names row 29 (0-based), the 30th, which
+    # is the count the image builder refuses an image at (`plan_limits`'s
+    # boot handles: three, and one per row, past `MAX_HANDLES`). A hand-made
+    # block is how the kernel's own stop is reached. A table of 42 is refused
+    # at the bound. Against the floors (24) both would meet the bound.
     {
         "name": "image_rows_at_capacity",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": ROOT_PKG,
         "tick": True,
-        "slab_block": {"rows": 33, "areas": [{"kind": "memories", "slots": 9}]},
+        "slab_block": {"rows": 41, "areas": [{"kind": "memories", "slots": 17}]},
         "expect_out": ["{banner}",
-                       "SOS: slab area kind={five} slots={nine}",
+                       "SOS: slab area kind={five} slots={seventeen}",
                        "SOS: bad root image: no handle table room for the "
-                       "boot regions"],
+                       "boot regions ({twenty_nine})"],
         "expect_clean_exit": False,
         "expect_status": EXIT_BAD_IMAGE,
     },
@@ -8534,9 +8637,9 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": ROOT_PKG,
         "tick": True,
-        "slab_block": {"rows": 34, "areas": [{"kind": "memories", "slots": 9}]},
+        "slab_block": {"rows": 42, "areas": [{"kind": "memories", "slots": 17}]},
         "expect_out": ["{banner}",
-                       "SOS: slab area kind={five} slots={nine}",
+                       "SOS: slab area kind={five} slots={seventeen}",
                        "SOS: bad root image: more boot regions than the "
                        "kernel can hold"],
         "expect_clean_exit": False,
@@ -8735,9 +8838,16 @@ TEST_CASES = [
                {"areas": [{"kind": "processes"},
                           {"kind": "process_records", "slots": 3}]},
                "the image's process records are fewer than its bodies need"),
-    _slab_stop("image_attachments_short",     # and the arm64 domain pool
-               {"areas": [{"kind": "processes", "slots": 3},
-                          {"kind": "process_records", "slots": 12}]},
+    # Its bodies pass the domain pool by one on every board, as
+    # `image_domain_pool_passed`'s do, and the attachments are asked first.
+    _slab_stop("image_attachments_short",     # and the domain pool
+               {"areas": [
+                   {"kind": "processes",
+                    "slots": lambda f: f["limits"]["domains"] - 2},
+                   {"kind": "process_records",
+                    "slots": lambda f: 4 * f["limits"]["domains"] - 8},
+                   {"kind": "threads",
+                    "slots": lambda f: max(f["limits"]["domains"] - 7, 1)}]},
                "the image's attachments are fewer than its waitables"),
     _slab_stop("image_attachments_one_short",
                {"areas": [{"kind": "events"}]},
@@ -8780,8 +8890,12 @@ TEST_CASES = [
     _slab_stop("quota_default_at_handles",
                {"quotas": {"handle": lambda f: f["limits"]["handles"]}},
                "the Handle quota default is not below MAX_HANDLES"),
+    # The Mapping slab is raised past the default, so the row bound is the one
+    # it meets on a board whose budget's free rows outnumber the slab's floor.
     _slab_stop("quota_default_past_rows",
-               {"quotas": {"mapping": lambda f: (f["limits"]["budget"]
+               {"areas": [{"kind": "mappings",
+                           "slots": lambda f: f["limits"]["budget"]}],
+                "quotas": {"mapping": lambda f: (f["limits"]["budget"]
                                                  - f["limits"]["image_rows"]
                                                  + 1)}},
                "the Mapping quota default passes the rows an image leaves"),
@@ -9818,10 +9932,10 @@ TEST_CASES = [
         # are both taken.
         #
         # The last trial spends the child's mapping allowance, which is two,
-        # around refused maps: the window taken, nine refused maps of it, an
+        # around refused maps: the window taken, 16 refused maps of it, an
         # allocation taken, and the next refused by the quota. A refused map
         # that charged would have spent the allowance early; one that
-        # installed a row would have filled the grant record, which has nine
+        # installed a row would have filled the grant record, which has 16
         # rows at most, and stopped the machine. The window mapped once more
         # then is refused by the quota as well, which is asked before the
         # rows are.
@@ -11417,8 +11531,10 @@ def _build_kernels(builder, profile, arch, cases, jobs):
 
 
 def _image_description(case, arch, kernel_obj, output, flash=None,
-                       link_args=()):
-    """The image description of one case on one profile."""
+                       link_args=(), board_limits=None):
+    """The image description of one case on one profile. A case whose
+    `limits` is `BOARD_LIMITS` states its board's defaults, `board_limits`
+    (`_board_defaults`), or none when the board has none."""
     dirs = arch_dirs(arch)
     name = case["name"]
     image = dict(version=SOSIMAGE_SCHEMA_VERSION, name=name, kernel=kernel_obj,
@@ -11435,7 +11551,10 @@ def _image_description(case, arch, kernel_obj, output, flash=None,
     if needs_region_table(case):
         image["regions"] = {"flags": boot_flags(case),
                             "rows": _region_row_specs(case, arch)}
-    if case.get("limits"):
+    if case.get("limits") == BOARD_LIMITS:
+        if board_limits is not None:
+            image["limits"] = board_limits
+    elif case.get("limits"):
         image["limits"] = case["limits"]
     if link_args:
         image["link_args"] = list(link_args)
@@ -11453,8 +11572,11 @@ def _link_image(builder, profile, case, arch, output, flash=None,
     staging directory from the kernel's own slab sizes (`_slab_block_asm`).
     """
     kernel_obj = _kernel_object(arch, case["src"])
+    board_limits = None
+    if case.get("limits") == BOARD_LIMITS:
+        board_limits = _board_defaults(builder, arch, kernel_obj)
     description = _image_description(case, arch, kernel_obj, output, flash,
-                                     link_args)
+                                     link_args, board_limits)
     if case.get("slab_block"):
         os.makedirs(description["staging"], exist_ok=True)
         payload = os.path.join(description["staging"], "slab_block.S")
@@ -11524,6 +11646,29 @@ def _slab_facts(builder, kernel_obj):
     with _SLAB_FACTS_LOCK:
         _SLAB_FACTS[kernel_obj] = facts
     return facts
+
+
+# What `sosimage defaults` printed for each (kernel object, board), read once:
+# the cases of one profile link in parallel and share it.
+_BOARD_DEFAULTS = {}
+_BOARD_DEFAULTS_LOCK = threading.Lock()
+
+
+def _board_defaults(builder, arch, kernel_obj):
+    """The profile's board's `[limits.default]`, planned against the kernel
+    object as an image stating no limits of its own is (`sosimage
+    defaults`): the `limits` object of an image description, or None for a
+    board that states none. A default that breaks a bound or a derivation is
+    the builder's refusal, naming the file, and so a `ToolError`."""
+    board = os.path.join(HAL_DIR, arch["name"], "board.toml")
+    key = (kernel_obj, board)
+    with _BOARD_DEFAULTS_LOCK:
+        if key in _BOARD_DEFAULTS:
+            return _BOARD_DEFAULTS[key]
+    limits = json.loads(_run_sosimage(builder, ["defaults", kernel_obj, board]))
+    with _BOARD_DEFAULTS_LOCK:
+        _BOARD_DEFAULTS[key] = limits
+    return limits
 
 
 # The slab block's magic, mirroring `kernel/core/areas.saw`'s
@@ -11778,6 +11923,10 @@ def _check(case, arch, status, out, timed_out):
         # lines without rebuilding the kernel once per assertion.
         if isinstance(expected, str):
             expected = [expected]
+        # An entry may be a function of the profile, for lines whose number
+        # differs by board (`board_limits`): it gives the lines in its place.
+        expected = [line for want in expected
+                    for line in (want(arch) if callable(want) else [want])]
         fmt = expectations(arch)
         # Matched in order: each expectation starts where the previous one
         # ended. A console transcript is a sequence, and a case like the task
@@ -11887,9 +12036,9 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
     # The board's description (`hal/<profile>/board.toml`), held to this
     # profile and to the HAL it names, compiled: its triple, C flags, modules
     # and directory, its console window and device grain, its kernel range's
-    # end and root's region in its process range fail the profile here when
-    # they disagree, naming both values. The kernel range's base and the
-    # process range's top are not held (`tools/sosimage/src/boardcheck.saw`).
+    # base and end, each process range's top and root's region in its process
+    # range fail the profile here when they disagree, naming both values
+    # (`tools/sosimage/src/boardcheck.saw`).
     if builder is not None:
         try:
             _run_sosimage(builder, [
@@ -11957,9 +12106,26 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
 
     # Each kernel entry the cases boot is compiled once, here, before any case
     # links one.
+    # The shipping kernel is among them whatever the cases are: the board's
+    # `[limits.default]` is planned against it below.
+    main_src = os.path.join(KERNEL_DIR, "main.saw")
     kernel_failures = {}
     if builder is not None:
-        kernel_failures = _build_kernels(builder, profile, arch, cases, jobs)
+        kernel_failures = _build_kernels(builder, profile, arch,
+                                         [*cases, {"src": main_src}], jobs)
+
+    # The board's `[limits.default]`, planned against the shipping kernel as
+    # an image that states no limits is: a default below its floor, past a
+    # bound or below a derivation fails the profile here, naming the file,
+    # whether or not a case asks for the defaults. A kernel that did not
+    # compile is reported by each case that boots it.
+    if builder is not None and kernel_failures[main_src] is None:
+        try:
+            _board_defaults(builder, arch, _kernel_object(arch, main_src))
+        except ToolError as e:
+            print(f"{CROSS} the {arch['name']} board's [limits.default] is "
+                  f"refused\n{e}", file=sys.stderr)
+            return 0, len(cases)
 
     # One case = one unit of work: link it, boot it, judge it. A worker
     # returns its verdict and the lines it owns and prints nothing, so the
@@ -13007,6 +13173,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #   image_limits       slab areas the image linked into the kernel's DRAM
     #                      `.bss`, installed before root and raising what it
     #                      can create before any donation
+    #   board_limits       this board's `[limits.default]`, planned against
+    #                      its kernel and linked in: a child's quotas start
+    #                      at them and its maps fill the board's grant budget,
+    #                      and root's table is `MAX_HANDLES` deep
     #
     # Every process in them runs its code from the flash instruction window
     # and reads its read-only data through the data window, in place in its
@@ -13023,7 +13193,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "iomemory_carve", "interrupt_give", "tick_spinner",
                      "copy_from_code_refused", "thread_entry_not_exec",
                      "image_held", "data_init", "pool_ops",
-                     "kill_churn", "kill_runnable", "image_limits"]
+                     "kill_churn", "kill_runnable", "image_limits",
+                     "board_limits"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 
@@ -14014,6 +14185,16 @@ def main():
         except ToolError as e:
             print(f"{CROSS} failed to build the image builder\n{e}",
                   file=sys.stderr)
+            sys.exit(1)
+
+        # The board's `[limits.default]`, planned against this kernel as an
+        # image that states no limits is, as the gate plans each of its
+        # boards': a refused default fails the smoke, naming the file.
+        try:
+            _board_defaults(builder, c3_arch, kobj)
+        except ToolError as e:
+            print(f"{CROSS} the ESP32-C3 board's [limits.default] is "
+                  f"refused\n{e}", file=sys.stderr)
             sys.exit(1)
 
         failed = 0

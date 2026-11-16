@@ -104,15 +104,16 @@ builds Blade, points `.sawlang` at the resolved checkout, builds the builder
 (`blade build --force` in `tools/sosimage/`), and in a full `make sos-test`
 runs its own tests (`blade test` there: the description readers' refusals, the
 region table's and slab block's bytes, an image's limits and each refusal of
-them, the in-place check, the slab-region check, and every board, process and
-image description in the tree read clean), which need no emulator and print nothing when they
-pass. Per profile it writes a profile description (JSON)
-and calls `sosimage native`, then `sosimage board` on the profile's
+them, the in-place check, the slab-region check, and every board, process
+and image description in the tree read clean), which need no emulator and
+print nothing when they pass. Per profile it writes a profile description
+(JSON) and calls `sosimage native`, then `sosimage board` on the profile's
 `hal/<profile>/board.toml`, then `sosimage kernel` once for each kernel entry
-the cases use; per case it writes an image description into the case's
-staging directory and calls `sosimage link`, which refuses an image whose
-slab areas lie outside the board's slab region (a script that does not gather
-`.bss.sos_slab*`). `src/profile.saw` and
+the cases use and for the shipping kernel, then `sosimage defaults`; per case
+it writes an image description into the case's staging directory and calls
+`sosimage link`, which refuses an image whose slab areas lie outside the
+board's slab region (a script that does not gather `.bss.sos_slab*`).
+`src/profile.saw` and
 `src/image.saw` state the two schemas. A builder failure is the case's build
 error, with the builder's message.
 
@@ -121,15 +122,16 @@ directory), to the profile (triple, C flags, every module but the kernel's
 own both ways, the flash's length and windows), to the board's linker script
 on an in-place board (the flash's base, root's slot and the child slots),
 and to the HAL's numbers, read by compiling a module that exports them (the
-console window, the device grain, the kernel range ending where root's region
-begins, root's region inside the default process range). It does not hold
-the kernel range's base or any process range's top: no HAL constant states
-them on every board. `src/boardcheck.saw` is the list. A keyed module, chosen
+console window, the device grain, the kernel range beginning at
+`KERNEL_RAM_BASE` and ending where root's region begins, each process range
+ending by `RAM_TOP`, root's region inside the default process range).
+`src/boardcheck.saw` is the list. A keyed module, chosen
 per image (the ESP32-S3's clock and stall keys), is written
 `NAME=DIR/PREFIX*`. The gate runs it on the three gate profiles. The
 builder's tests hold the S3 file to profiles shaped as the smoke's and to its
 linker script, with the HAL's numbers given rather than compiled; the C3 file
-is read, and held to nothing else.
+is held to no profile or HAL, and only its `[limits.default]` is planned
+(below).
 
 `sosimage build` builds an image from a hand-written description
 (`tests/images/`). After `uart_service_ns16550` passes on riscv32 and on
@@ -140,9 +142,18 @@ nothing.
 A case may state `limits`, which the image description carries and the
 builder turns into linked slab areas and the block after the table's rows, or
 carry a hand-made `slab_block` the runner writes from the slab sizes
-`sosimage slabs` reads out of the kernel object.
+`sosimage slabs` reads out of the kernel object. A case with no `limits`
+boots at the kernel's floors and compiled quota defaults on every board; one
+whose `limits` is `BOARD_LIMITS` gets its board's `[limits.default]`, as a
+hand-written image that states none does (`board_limits`, and
+`uart_service_ns16550`, whose description states none). Per profile the
+runner plans the board's `[limits.default]` against the shipping kernel
+(`sosimage defaults`) whether or not a case asks, and a refused default fails
+the profile, as a refused C3 default fails the C3 smoke, which plans it
+against its own kernel. The builder's tests plan every board's against
+numbers given there.
 `SOS_IMAGE_BUILDER=python` builds every image through the runner's own code
-instead, so the two can be compared, except those two kinds of case, which
+instead, so the two can be compared, except those kinds of case, which
 that path refuses by name.
 
 Implementers run targeted tests while implementing: the cases the change

@@ -16,6 +16,15 @@
 //! the ledger's 16-bit row without reading as unlimited, and for `mapping`
 //! leaves the rows an image spends before it runs. A default the image does
 //! not state is the compiled one.
+//!
+//! The region table's rows are held against the image's Memory and IoMemory
+//! capacities, and against root's handle table: the kernel mints root's
+//! System, Process and Thread handles and then one handle for every row
+//! (`kcore.process`'s `start_process` and `mint_boot_regions`, spec §12), so
+//! root holds `ROOT_BOOT_HANDLES` plus the rows before it runs, and more than
+//! `MAX_HANDLES` stops the boot. An image that raises neither slab cannot
+//! reach it: `kcore.limits` asserts the table holds the floors' rows beside
+//! five handles.
 
 import sosimage.failure.{BuildError}
 import sosimage.fields.{Fields}
@@ -25,6 +34,10 @@ import sosimage.kernel.{
     QUOTA_MAPPING, SLAB_KINDS, THREADS, TIMERS, WAITERS, quota_kind_name,
     slab_kind_name,
 }
+
+/// The handles root holds at boot before its rows' (spec §12): System,
+/// Process and Thread.
+static ROOT_BOOT_HANDLES: Int = 3
 
 /// The Mapping slab's size per process body when an image states none.
 static MAPPINGS_PER_BODY: Int = 4
@@ -101,6 +114,31 @@ extension ImageLimits {
         }
         try limits.finish()
         return ImageLimits(raise: move raise, quota: move quota)
+    }
+
+    /// The `limits` object of an image description that `read` reads back as
+    /// these limits: each stated kind under `slabs`, each stated default under
+    /// `quotas`, in kind order.
+    public func json(&self) -> String {
+        var slabs = Vector<String>()
+        var k = 0
+        while k < SLAB_KINDS {
+            let n = self.raise.get(k) ?? -1
+            if n >= 0 {
+                try! slabs.push("\"{slab_kind_name(k)}\": {n}")
+            }
+            k = k + 1
+        }
+        var quotas = Vector<String>()
+        var q = 0
+        while q < QUOTA_KINDS {
+            let n = self.quota.get(q) ?? -1
+            if n >= 0 {
+                try! quotas.push("\"{quota_kind_name(q)}\": {n}")
+            }
+            q = q + 1
+        }
+        "\{\"slabs\": \{{slabs.join(", ")}\}, \"quotas\": \{{quotas.join(", ")}\}\}"
     }
 }
 
@@ -189,6 +227,10 @@ public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, name: String,
     let iomemories = total.get(IOMEMORIES) ?? 0
     if device_rows > iomemories {
         return BuildError(message: "{name}: the region table mints {device_rows} IoMemory objects at boot, past the image's {iomemories}")
+    }
+    let boot_handles = ROOT_BOOT_HANDLES + memory_rows + device_rows
+    if boot_handles > facts.handles {
+        return BuildError(message: "{name}: root holds {boot_handles} handles at boot, its System, Process and Thread and one for each of the region table's {memory_rows + device_rows} rows, past MAX_HANDLES ({facts.handles})")
     }
 
     var defaults = Vector<Int>()

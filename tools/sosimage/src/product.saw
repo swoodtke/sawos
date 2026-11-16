@@ -46,7 +46,7 @@ import sosimage.kernel.{
     ATTACHMENTS, EVENTS, INTERRUPTS, IOMEMORIES, KernelFacts, MAPPINGS, MEMORIES,
     PIPES, PROCESSES, PROCESS_RECORDS, THREADS, TIMERS, WAITERS,
 }
-import sosimage.limits.{ImageLimits}
+import sosimage.limits.{ImageLimits, plan_limits}
 import sosimage.profile.{Profile}
 import sosimage.regions.{BOOT_FLAG_NO_TICK, RegionKind}
 import sosimage.rules.{refused}
@@ -173,6 +173,24 @@ public func image_limits(stated: &Vector<LimitsSpec>, facts: &KernelFacts,
         }
         s = s + 1
     }
+    return move limits
+}
+
+/// What the board's `[limits.default]` comes to against the kernel `facts`:
+/// the limits an image that states none of its own is given, each total as
+/// the slots it raises its kind by, each quota as stated. They are planned as
+/// such an image's would be (`sosimage.limits.plan_limits`), so a default
+/// below its floor or breaking a derivation (a derived total below it, a
+/// quota default at or past its bound, more bodies than the domain pool) is
+/// refused here, naming the file. A board with no `[limits.default]` states
+/// nothing, and an image on it that states nothing carries no limits at all
+/// (`Board.has_limits`).
+public func board_defaults(board: &Board, facts: &KernelFacts) -> Result<ImageLimits, BuildError> {
+    let what = "{board.file}: [limits.default]"
+    var stated = Vector<LimitsSpec>()
+    try! stated.push(board.limits.copy())
+    let limits = try image_limits(&stated, &facts, what)
+    let _ = try plan_limits(&facts, &limits, what, 0, 0)
     return move limits
 }
 

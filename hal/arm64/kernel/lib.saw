@@ -537,13 +537,19 @@ static_assert((DEVICE_GRANT_BASE % PROT_GRAIN) == 0,
 /// Here it is a policy number, not a hardware one. There are no numbered
 /// regions to run out of: a grant is a walk of page descriptors, so the
 /// hardware's only limit is the window's own size. What bounds a domain is the
-/// kernel's grant record, a fixed array per process body, and this is that
-/// array's length (`kcore.limits.MAX_GRANT_ROWS`), restated as a HAL fact so
-/// one number serves both profiles at the map check.
-///
-/// Don't widen it past the array: raising it means raising the storage every
-/// process body carries.
-public static GRANT_ROW_BUDGET: UInt = 9
+/// kernel's grant record, a fixed array per process body of `MAX_GRANT_ROWS`
+/// rows, and raising the budget raises the storage every body carries.
+public static GRANT_ROW_BUDGET: UInt = 16
+
+/// Rows in a process's grant record (`kcore.limits.MAX_GRANT_ROWS`): the
+/// larger of `GRANT_ROW_BUDGET` and an image's segments plus its stack, which
+/// `kcore.limits` asserts. Here that is the budget.
+public static MAX_GRANT_ROWS: Int = 16
+
+/// Handles one process's table holds (`kcore.limits.MAX_HANDLES`): a policy
+/// number, the same on every board, that `kcore.limits` holds against the
+/// region table root's table must take beside its first handles.
+public static MAX_HANDLES: Int = 32
 
 /// May `[base, top)` be installed as a RAM row in a user domain?
 ///
@@ -1130,14 +1136,13 @@ static PT_SET_BYTES: UInt = (512 + 512 + 1024 + 512 + 512) * 8
 ///
 /// The cost is paid in `.bss` only. The pool holds this many sets of
 /// `PT_SET_DESCRIPTORS` descriptors, plus the linear map's descriptors and one
-/// table of alignment slack (512). The slot count is also a margin: the
-/// harness's largest case stays one slot below the wall rather than on it.
-/// `.bss` is `NOLOAD`, so this costs no image bytes; it costs `boot.S`'s
-/// zerofill and a set-build per slot.
+/// table of alignment slack (512): 24 KiB a slot. `.bss` is `NOLOAD`, so this
+/// costs no image bytes; it costs `boot.S`'s zerofill and a set-build per
+/// slot.
 ///
 /// `virt.ld`'s `ASSERT` on `_bss_end` against `ROOT_LOAD_BASE` is what catches
 /// a raise that goes too far, which is why that assert names this constant.
-public static PROT_DOMAIN_SLOTS: Int = 5
+public static PROT_DOMAIN_SLOTS: Int = 16
 
 // The ASID is the body index (see `prot_switch`), and `TCR_EL1.AS` = 0 makes
 // the field 8 bits wide. Exceeding it would silently alias two domains' TLB
@@ -1213,6 +1218,13 @@ static RAM_BASE: UInt = 0x4000_0000
 /// kernel dereference past the end of memory a translation fault instead of a
 /// read of nothing.
 static RAM_LEN: UInt = 128 * 1024 * 1024
+
+/// Where the kernel's own RAM begins and where RAM ends. The kernel's image,
+/// `.data` and `.bss` run from `KERNEL_RAM_BASE` to root's region (`virt.ld`),
+/// and processes have the rest. The image builder holds a board description's
+/// kernel range to the first, and every process range to the second.
+public static KERNEL_RAM_BASE: UInt = RAM_BASE
+public static RAM_TOP: UInt = RAM_BASE + RAM_LEN
 
 // The linear map's own bound: every byte of RAM must fit under the offset for
 // `pa | LINMAP_OFFSET` to be a pure OR. The device asserts sit with the seam.

@@ -1,0 +1,159 @@
+// A board's `[limits.default]`: what each board in the tree gives an image
+// that states no limits, against its kernel's numbers given here (the gate
+// and the C3 smoke plan each file against its compiled kernel, and the S3
+// smoke in `board_limits`), the `limits` object it is printed as, and each
+// refusal of a default that breaks a bound or a derivation, naming the file.
+// The test runs in the package's directory, two below the tree's top.
+
+import std.json.{JsonValue}
+import sosimage.board.{Board}
+import sosimage.fields.{Fields}
+import sosimage.kernel.{KernelFacts}
+import sosimage.limits.{ImageLimits, SlabPlan, plan_limits}
+import sosimage.product.{board_defaults}
+import sosimage.tool.{read_text}
+
+func ints(values: &[Int]) -> Vector<Int> {
+    var out = Vector<Int>()
+    var i = 0
+    while i < values.len() {
+        try! out.push(values[i])
+        i = i + 1
+    }
+    move out
+}
+
+// A kernel with the tree's floors and compiled defaults, and a board's
+// handle table, grant-row budget and domain pool.
+func kernel(budget: Int, domains: Int) -> KernelFacts {
+    let floors: [Int; 13] = [8, 4, 4, 32, 8, 16, 8, 8, 32, 8, 4, 3, 12]
+    let defaults: [Int; 9] = [4, 4, 2, 4, 4, 2, 2, 12, 2]
+    let units: [Int; 13] = [24, 20, 20, 24, 48, 56, 20, 20, 16, 556, 3480, 1276, 104]
+    let aligns: [Int; 13] = [16, 16, 16, 16, 16, 16, 16, 16, 16, 512, 16, 16, 16]
+    KernelFacts(word: 4, capacity: 1 << 20, extents: 4, records_per_body: 4,
+                handles: 32, image_rows: 4, budget: budget, domains: domains,
+                stride: 512, inflight: 16, floors: ints(&floors),
+                defaults: ints(&defaults), units: ints(&units),
+                aligns: ints(&aligns))
+}
+
+func board_text(dir: String) -> String {
+    try! read_text("../../hal/{dir}/board.toml")
+}
+
+func board_of(dir: String, text: String) -> Board {
+    match Board.parse(text, "../../hal/{dir}/board.toml") {
+        case Ok(b) -> move b,
+        case Err(e) -> panic("{e.message}")
+    }
+}
+
+// The board in `dir`'s defaults, planned, as their `limits` object.
+func defaults_json(dir: String, facts: &KernelFacts) -> String {
+    let board = board_of(dir, board_text(dir))
+    assert(board.has_limits, "{dir} states [limits.default]")
+    let limits = match board_defaults(&board, &facts) {
+        case Ok(l) -> move l,
+        case Err(e) -> panic("{e.message}")
+    }
+    limits.json()
+}
+
+// The plan of an image that states `json`, its limits object.
+func plan_of(json: String, facts: &KernelFacts) -> SlabPlan {
+    let doc = try! JsonValue.parse(json)
+    var fields = try! Fields(move doc, "limits")
+    let limits = try! ImageLimits.read(&var fields)
+    try! plan_limits(&facts, &limits, "img", 0, 0)
+}
+
+// The slots `plan` raises `kind` by; 0 when it links no area for it.
+func slots(plan: &SlabPlan, kind: Int) -> Int {
+    var i = 0
+    while i < plan.areas.len() {
+        let area = plan.areas.get(i)!
+        if area.kind == kind {
+            return area.slots
+        }
+        i = i + 1
+    }
+    0
+}
+
+// The riscv32 board's defaults with `old` replaced by `new`, refused with
+// `message` against `facts`.
+func expect_refusal(old: String, new: String, facts: &KernelFacts, message: String) {
+    let text = board_text("riscv32")
+    assert(text.contains(old), "the riscv32 file says `{old}`")
+    let board = board_of("riscv32", text.replace(old, new))
+    let got = match board_defaults(&board, &facts) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the refusal's message")
+}
+
+func main() {
+    let pmp = kernel(8, 256)
+    let virt = defaults_json("riscv32", &pmp)
+    assert(virt.equals("\{\"slabs\": \{\"events\": 8, \"waiters\": 12, \"timers\": 8, \"memories\": 16, \"iomemories\": 8, \"pipes\": 4, \"processes\": 13\}, \"quotas\": \{\"mapping\": 4, \"handle\": 28\}\}"),
+           "riscv32's defaults: {virt}")
+    assert(defaults_json("riscv32-flat", &pmp).equals(virt), "the flat profile's are riscv32's")
+    // Read back, they plan to the totals of the design: 16 bodies, and what
+    // derives from them.
+    let p = plan_of(virt, &pmp)
+    assert(slots(&p, 11) == 13 && slots(&p, 12) == 52 && slots(&p, 9) == 8,
+           "16 bodies, 64 records, 16 threads")
+    assert(slots(&p, 3) == 68 && slots(&p, 7) == 56, "100 attachments, 64 Mappings")
+    assert(p.defaults.get(6)! == 4 && p.defaults.get(7)! == 28, "the quotas")
+
+    let pages = kernel(16, 16)
+    let arm = defaults_json("arm64", &pages)
+    assert(arm.equals(virt.replace("\"mapping\": 4", "\"mapping\": 12")), "arm64's defaults: {arm}")
+
+    let s3_facts = kernel(16, 256)
+    let s3 = defaults_json("xtensa-esp32s3", &s3_facts)
+    assert(s3.equals("\{\"slabs\": \{\"waiters\": 4, \"processes\": 5\}, \"quotas\": \{\"mapping\": 12, \"handle\": 28\}\}"),
+           "the ESP32-S3's defaults: {s3}")
+    let sp = plan_of(s3, &s3_facts)
+    assert(slots(&sp, 12) == 20 && slots(&sp, 3) == 20 && slots(&sp, 7) == 24 && slots(&sp, 9) == 0,
+           "32 records, 52 attachments, 32 Mappings, the threads floor")
+
+    let c3 = defaults_json("riscv32-esp32c3", &pmp)
+    assert(c3.equals("\{\"slabs\": \{\}, \"quotas\": \{\"mapping\": 4, \"handle\": 28\}\}"),
+           "the ESP32-C3's defaults: {c3}")
+    assert(slots(&plan_of(c3, &pmp), 7) == 4, "12 Mappings for its 3 bodies")
+
+    // A number stated as 0 is stated, and reads back so: a kind raised by
+    // none, and a quota default (which a plan would refuse).
+    var zeros = ImageLimits.none()
+    zeros.raise[2] = 0
+    zeros.quota[0] = 0
+    assert(zeros.json().equals("\{\"slabs\": \{\"interrupts\": 0\}, \"quotas\": \{\"thread\": 0\}\}"),
+           "zeros: {zeros.json()}")
+
+    // Each refusal names the file's table.
+    let file = "../../hal/riscv32/board.toml: [limits.default]"
+    expect_refusal("processes = 16", "processes = 2", &pmp,
+                   "{file}: `processes` is 2, below the kernel's floor of 3: an image raises a limit and never lowers one")
+    expect_refusal("processes = 16", "processes = 16\nrecords = 63", &pmp,
+                   "{file}: the image's process_records come to 63, below 64: 4 records per process body, for 16 bodies")
+    expect_refusal("processes = 16", "processes = 16\nthreads = 15", &pmp,
+                   "{file}: the image's threads come to 15, below 16: a main thread for each of 16 process bodies")
+    expect_refusal("processes = 16", "processes = 16\nattachments = 99", &pmp,
+                   "{file}: the image's attachments come to 99, below 100: one for each event, interrupt, timer and record")
+    expect_refusal("processes = 16", "processes = 17", &pages,
+                   "{file}: the image's 17 process bodies pass this board's domain pool (16)")
+    expect_refusal("mappings = 4", "mappings = 5", &pmp,
+                   "{file}: the image's mapping quota default is 5, past the 4 grant rows an image leaves of this board's 8")
+    expect_refusal("handles = 28", "handles = 32", &pmp,
+                   "{file}: the image's handle quota default is 32, not below MAX_HANDLES (32)")
+    expect_refusal("handles = 28", "handles = 11", &pmp,
+                   "{file}: the image's handle quota default is 11, below the compiled default (12)")
+    expect_refusal("handles = 28,", "handles = 28, waiters = 16,", &pmp,
+                   "{file}: the image's waiter quota default is 16, not below its slab's capacity (16)")
+}

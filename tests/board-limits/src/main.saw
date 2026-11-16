@@ -1,0 +1,215 @@
+// An image given its board's defaults: they reach the machine.
+//
+// The transcript, with the numbers of the riscv32 board:
+//
+//   SOS boardlimits: the child's quotas handle=28 mapping=4
+//   SOS boardlimits: gave a page for each mapping and one more
+//   SOS boardlimits: started
+//   SOS childboardlimits: maps=4 quota=1
+//   SOS boardlimits: root observed child status=65540
+//   SOS boardlimits: the table took 23 more handles, then no room for what was asked
+//   SOS boardlimits: done
+//
+// The case's image states no limits of its own and is given its board's
+// `[limits.default]`; the kernel prints each area it installs before root
+// runs, which is the slab half. Three claims follow.
+//
+//  1. A child's quota rows start at the board's defaults. Root reads the
+//     `Handle` and `Mapping` rows of a child it made and has not started.
+//
+//  2. A child at its mapping default fills its board's grant budget. The
+//     default is the budget's rows less the four an image spends, so the
+//     child maps that many pages and the next map is refused by its quota
+//     with every row of the budget installed: four on a PMP board, twelve on
+//     a board whose budget is sixteen. The exit code is the count.
+//
+//  3. Root's handle table holds `MAX_HANDLES`, 32. Root holds nine handles
+//     when it starts minting (System, Process and Thread from its start, its
+//     three rows, its own Process handle, the child's and the Waiter), and
+//     its quota is unlimited, so the table is what refuses the 24th mint.
+//
+// Root gives the child one page more than its mapping row, so the refusal
+// that ends the child is the quota's and never a page short.
+
+import sos.{System, Process, Memory, Pool, Waiter, SosStatus, SystemRight,
+            QuotaKind, sos_handle_mint}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// One protection unit's worth on every profile.
+static CHUNK: UInt = 0x1000
+
+/// The key the child's Process is attached under.
+static KEY: UInt = 64
+
+/// Root's config: the tags the child's System handle and its first page
+/// travel under. Each later page travels under the next tag up.
+static TAG_BOOT: UInt = 31
+static TAG_PAGE: UInt = 33
+
+/// What the child may ask its System object for: print, and learn its own
+/// Process object, which is the handle it maps through.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// A keep mask that narrows nothing.
+static KEEP_ALL: UInt = 0xFFFF_FFFF
+
+/// More mints than any handle table holds.
+static MAX_MINTS: Int = 4096
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS boardlimits: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // The build's region table, in `_region_rows`' order: the child's image
+    // blob, its destination, then the RAM pool.
+    var image_rec = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS boardlimits: no image\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var dest_rec = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS boardlimits: no destination\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var pool_rec = try proc.boot_handle_next() catch {
+        let _ = system.debug_print("SOS boardlimits: no pool\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let image = image_rec.take_memory() else {
+        let _ = system.debug_print("SOS boardlimits: the image is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let dest = dest_rec.take_memory() else {
+        let _ = system.debug_print("SOS boardlimits: the destination is not a region\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_rec.take_pool() else {
+        let _ = system.debug_print("SOS boardlimits: the pool is not a pool\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    // ---- Claim 1: the child's rows --------------------------------------
+    let child = try system.process_create(image: &image, memory: &dest) catch {
+        print("SOS boardlimits: create failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let handles = try child.quota_get(kind: QuotaKind.Handle) catch {
+        print("SOS boardlimits: no Handle row: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let mappings = try child.quota_get(kind: QuotaKind.Mapping) catch {
+        print("SOS boardlimits: no Mapping row: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS boardlimits: the child's quotas handle={} mapping={}\n",
+          handles.limit, mappings.limit)
+
+    // ---- Claim 2: the child maps to the board's budget -------------------
+    let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+        print("SOS boardlimits: mint failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        print("SOS boardlimits: give system failed: {}\n", error.0)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let pages = (mappings.limit as UInt) + 1
+    var given: UInt = 0
+    while given < pages {
+        let page = try pool.allocate(len: CHUNK) catch {
+            print("SOS boardlimits: allocation failed: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        try child.give(memory: move page, tag: TAG_PAGE + given) catch {
+            print("SOS boardlimits: give page failed: {}\n", error.0)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        given = given + 1
+    }
+    let _ = system.debug_print("SOS boardlimits: gave a page for each mapping and one more\n")
+
+    try child.start(boot_tag: TAG_BOOT) catch {
+        print("SOS boardlimits: start failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS boardlimits: started\n")
+
+    let waiter = try proc.waiter_create() catch {
+        print("SOS boardlimits: no waiter: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.add(process: &child, key: KEY) catch {
+        print("SOS boardlimits: attach failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try waiter.wait() catch {
+        print("SOS boardlimits: wait failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let status = try child.get_status() catch {
+        print("SOS boardlimits: status failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS boardlimits: root observed child status={}\n", status)
+
+    // ---- Claim 3: root's table ------------------------------------------
+    let (made, refusal) = fill_table(boot_handle)
+    if refusal == STATUS_OK {
+        print("SOS boardlimits: {} mints and no refusal\n", made)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    guard let why = SosStatus.from(raw: refusal as UInt8) else {
+        print("SOS boardlimits: the table refused with status {}\n", refusal)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS boardlimits: the table took {} more handles, then {}\n", made, why)
+    print("SOS boardlimits: done\n")
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// Mint siblings of the System handle `system` until one is refused: how many
+/// were made, and the refusal's status word. The siblings are never released
+/// here; the process's end releases its table.
+func fill_table(system: UInt) unsafe -> (Int, UInt) {
+    var refusal: UInt = STATUS_OK
+    var made: Int = 0
+    while refusal == STATUS_OK && made < MAX_MINTS {
+        var out: UInt = 0
+        refusal = sos_handle_mint(system, KEEP_ALL, (&var out) as UnsafePointer<UInt>)
+        if refusal == STATUS_OK {
+            made = made + 1
+        }
+    }
+    (made, refusal)
+}

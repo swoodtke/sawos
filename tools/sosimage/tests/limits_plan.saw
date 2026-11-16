@@ -1,7 +1,7 @@
 // An image's limits: what they come to against a kernel's numbers, and each
 // refusal by its message, since the message is what reaches the runner's
-// report. The kernel here is riscv32's at the time of writing, its numbers
-// written out (`sosimage slabs` prints them for a real object).
+// report. The kernel here is riscv32's, its numbers written out as
+// `sosimage slabs` prints them for that board's kernel object.
 
 import sosimage.failure.{BuildError}
 import sosimage.fields.{Fields}
@@ -23,10 +23,10 @@ func ints(values: &[Int]) -> Vector<Int> {
 func kernel() -> KernelFacts {
     let floors: [Int; 13] = [8, 4, 4, 32, 8, 16, 8, 8, 32, 8, 4, 3, 12]
     let defaults: [Int; 9] = [4, 4, 2, 4, 4, 2, 2, 12, 2]
-    let units: [Int; 13] = [24, 20, 20, 24, 48, 56, 20, 20, 16, 556, 3480, 784, 104]
+    let units: [Int; 13] = [24, 20, 20, 24, 48, 56, 20, 20, 16, 556, 3480, 1276, 104]
     let aligns: [Int; 13] = [16, 16, 16, 16, 16, 16, 16, 16, 16, 512, 16, 16, 16]
     KernelFacts(word: 4, capacity: 1 << 20, extents: 4, records_per_body: 4,
-                handles: 16, image_rows: 4, budget: 8, domains: 256,
+                handles: 32, image_rows: 4, budget: 8, domains: 256,
                 stride: 512, inflight: 16, floors: ints(&floors),
                 defaults: ints(&defaults), units: ints(&units),
                 aligns: ints(&aligns))
@@ -77,7 +77,7 @@ func main() {
     let m = p.areas.get(2)!
     assert(m.kind == 7 && m.slots == 8, "mappings: four per body, 16")
     let b = p.areas.get(3)!
-    assert(b.kind == 11 && b.slots == 1 && b.bytes == 784, "a body")
+    assert(b.kind == 11 && b.slots == 1 && b.bytes == 1276, "a body")
     let r = p.areas.get(4)!
     assert(r.kind == 12 && r.slots == 4, "records: four per body, 16")
     assert(p.defaults.get(1)! == 4, "an unstated default is the compiled one")
@@ -94,8 +94,8 @@ func main() {
     assert(rec.kind == 12 && rec.slots == 10, "records stated above")
 
     // Quota defaults at each edge their bounds allow.
-    let edge = plan("\{\"quotas\": \{\"event\": 7, \"handle\": 15, \"mapping\": 4\}\}")
-    assert(edge.defaults.get(1)! == 7 && edge.defaults.get(7)! == 15
+    let edge = plan("\{\"quotas\": \{\"event\": 7, \"handle\": 31, \"mapping\": 4\}\}")
+    assert(edge.defaults.get(1)! == 7 && edge.defaults.get(7)! == 31
            && edge.defaults.get(6)! == 4, "the edges")
 
     // The block's bytes: the header with every default, then each area, its
@@ -197,8 +197,8 @@ func main() {
                    "img: the image's event quota default is 65535, which the ledger's row cannot hold below its unlimited mark (65535)")
     expect_refusal("\{\"quotas\": \{\"event\": 8\}\}",
                    "img: the image's event quota default is 8, not below its slab's capacity (8)")
-    expect_refusal("\{\"quotas\": \{\"handle\": 16\}\}",
-                   "img: the image's handle quota default is 16, not below MAX_HANDLES (16)")
+    expect_refusal("\{\"quotas\": \{\"handle\": 32\}\}",
+                   "img: the image's handle quota default is 32, not below MAX_HANDLES (32)")
     expect_refusal("\{\"quotas\": \{\"mapping\": 5\}\}",
                    "img: the image's mapping quota default is 5, past the 4 grant rows an image leaves of this board's 8")
 
@@ -217,4 +217,25 @@ func main() {
     }
     assert(devices.equals("img: the region table mints 9 IoMemory objects at boot, past the image's 8"),
            "the IoMemory rows")
+
+    // Root's handle table holds its three boot handles and one per row: with
+    // the Memory slab raised past the table, 29 rows fill it and 30 are
+    // refused, whichever slab they mint into.
+    let memories_raised = stated("\{\"slabs\": \{\"memories\": 17\}\}")
+    let full_table = try! plan_limits(&facts, &memories_raised, "img", 29, 0)
+    assert(full_table.block, "29 rows beside root's three handles")
+    let mixed = try! plan_limits(&facts, &memories_raised, "img", 25, 4)
+    assert(mixed.block, "25 Memory and 4 IoMemory rows")
+    let past = match plan_limits(&facts, &memories_raised, "img", 30, 0) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(past.equals("img: root holds 33 handles at boot, its System, Process and Thread and one for each of the region table's 30 rows, past MAX_HANDLES (32)"),
+           "30 rows: {past}")
+    let past_mixed = match plan_limits(&facts, &memories_raised, "img", 25, 5) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(past_mixed.equals("img: root holds 33 handles at boot, its System, Process and Thread and one for each of the region table's 30 rows, past MAX_HANDLES (32)"),
+           "25 and 5 rows: {past_mixed}")
 }
