@@ -17,10 +17,11 @@ import std.path.{Path}
 import sosimage.build.{ensure_directory}
 import sosimage.image.{RowSpec}
 import sosimage.imagefile.{Bindings, Bound, InputValue}
-import sosimage.plan.{ImagePlan, PlanRecord, Source, check_plan, plan_image, plan_module}
+import sosimage.plan.{ImagePlan, PlanRecord, PlanSlabs, Source, check_plan, plan_image,
+                      plan_module}
 import sosimage.limits.{ImageLimits}
-import sosimage.product.{described_spec, input_path, iomemory_total, process_extras,
-                         quota_defaults, stock_region_rows}
+import sosimage.product.{described_spec, input_path, plan_slabs, process_extras,
+                         quota_defaults, slab_total, stock_region_rows}
 import sosimage.regions.{RegionKind}
 import sosimage.tool.{write_lines}
 
@@ -235,9 +236,17 @@ func defaults(handles: Int) -> Vector<Int> {
 // starting at `handles` and an IoMemory slab of `iomemories`; "" when it
 // holds.
 func fits_io(plan: &ImagePlan, table: Int, handles: Int, iomemories: Int) -> String {
+    fits_slabs(&plan, table, handles,
+               PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: iomemories))
+}
+
+// What `check_plan` says of `plan` against a table of `table`, with
+// children starting at `handles` handles, and slabs `slabs`; "" when it
+// holds.
+func fits_slabs(plan: &ImagePlan, table: Int, handles: Int, slabs: PlanSlabs) -> String {
     let f = facts(table)
     let d = defaults(handles)
-    match check_plan(&plan, &f, &d, iomemories, "box.toml") {
+    match check_plan(&plan, &f, &d, &slabs, "box.toml") {
         case Ok(_) -> "",
         case Err(e) -> e.message
     }
@@ -265,7 +274,8 @@ func checked(json: String, table: Int, handles: Int) -> String {
     }
     let f = facts(table)
     let d = defaults(handles)
-    match check_plan(&plan, &f, &d, 100, "p.json") {
+    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100)
+    match check_plan(&plan, &f, &d, &slabs, "p.json") {
         case Ok(_) -> "",
         case Err(e) -> e.message
     }
@@ -538,9 +548,19 @@ func main() {
     assert((given.get(1) ?? 0) == 4, "and the compiled ones beside them")
     // The IoMemory slab: the kernel's floor, raised by the limits.
     kernel.floors[6] = 8
-    assert(iomemory_total(&stated, &kernel) == 8, "the floor")
+    assert(slab_total(&stated, &kernel, 6) == 8, "the floor")
     stated.raise[6] = 3
-    assert(iomemory_total(&stated, &kernel) == 11, "raised")
+    assert(slab_total(&stated, &kernel, 6) == 11, "raised")
+    assert(slab_total(&stated, &kernel, 2) == 0, "another kind's own")
+    // The slabs a stock root's plan is held to, each its own kind's total.
+    kernel.floors[11] = 5
+    kernel.floors[10] = 6
+    kernel.floors[2] = 7
+    let slabs = plan_slabs(&stated, &kernel)
+    assert(slabs.processes == 5, "the Process slab")
+    assert(slabs.pipes == 6, "the Pipe slab")
+    assert(slabs.interrupts == 7, "the Interrupt slab")
+    assert(slabs.iomemories == 11, "the IoMemory slab")
 
     // Where an input's file is, by where its value came from.
     assert(input_path(InputSource.Image, "c/x.saw", "/pkg", "hal/b", "/sawos", "/product").equals("/product/c/x.saw"), "the image's")
@@ -613,6 +633,9 @@ func more() {
         assert((zc.quota.get(0)!).kind == 1 && (zc.quota.get(0)!).limit == 0, "events 0")
         assert((zc.quota.get(1)!).kind == 8 && (zc.quota.get(1)!).limit == 2, "pipes")
     }
+    // Both are the declaration's, so neither is held to the rows children
+    // start with.
+    assert(fits(&z, 32, 28).is_empty(), "declared rows below the defaults")
 
     // Two processes taking one device whole: the earlier is given a sibling,
     // the later the row itself.
@@ -640,6 +663,15 @@ func more() {
     }
     assert(fits_io(&box, 32, 28, 6).is_empty(), "six hold the box")
     assert(fits_io(&box, 32, 28, 5).equals("box.toml: the stock root would make the IoMemory objects 6 at `give pwm record 4`, past the image's 5"), "the second carve")
+    // Process objects: root's and one per child, the box's four.
+    let roomy = PlanSlabs(processes: 5, pipes: 2, interrupts: 1, iomemories: 6)
+    assert(fits_slabs(&box, 32, 28, roomy).is_empty(), "each slab at the box's own count")
+    assert(fits_slabs(&box, 32, 28, PlanSlabs(processes: 4, pipes: 2, interrupts: 1, iomemories: 6)).equals("box.toml: the stock root would make the Process objects 5 at `create heartbeat`, past the image's 4"), "a child too many")
+    // Pipe objects: one per connection, the second made at pwm's serve.
+    assert(fits_slabs(&box, 32, 28, PlanSlabs(processes: 5, pipes: 1, interrupts: 1, iomemories: 6)).equals("box.toml: the stock root would make the Pipe objects 2 at `give pwm record 5`, past the image's 1"), "a connection too many")
+    // Interrupt objects: one per line, gpio's. No board's lines reach the
+    // slab's floor, so this has no case.
+    assert(fits_slabs(&box, 32, 28, PlanSlabs(processes: 5, pipes: 2, interrupts: 0, iomemories: 6)).equals("box.toml: the stock root would make the Interrupt objects 1 at `give gpio record 4`, past the image's 0"), "a line too many")
     assert(fits_io(&box, 32, 28, 4).equals("box.toml: the stock root would make the IoMemory objects 5 at `setup SYSTEM.PERIP_CLK_EN0`, past the image's 4"), "a setup write's carve")
 
     // The rows of a stock image: a blob and a destination per process at the

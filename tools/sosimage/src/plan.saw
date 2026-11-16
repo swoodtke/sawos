@@ -34,8 +34,10 @@
 //! gives below the row the image's children start with (an image raises a
 //! row and never lowers one), a child whose `Handle` row is short of what it
 //! holds when it starts, and a step at which root would hold more handles
-//! than its table has or make more IoMemory objects than the image's slab
-//! holds.
+//! than its table has or make more objects of a kind than the image's slab
+//! of it holds: Process objects (root and each child), Pipe objects (one per
+//! connection), Interrupt objects (one per line) and IoMemory objects (one
+//! per device row, carve given and setup write's carve).
 //!
 //! A test image states a plan of its own, unchecked, as JSON
 //! (`ImagePlan.read`), so a case can reach each of the stock root's stops:
@@ -64,6 +66,7 @@ import sosimage.fields.{Fields}
 import sosimage.hex.{hex}
 import sosimage.imagefile.{Bindings, ImageFile, SetupOp}
 import sosimage.kernel.{KernelFacts, QUOTA_HANDLE, QUOTA_KINDS, QUOTA_MAPPING}
+import sosimage.limits.{QUOTA_UNLIMITED}
 import sosimage.regions.{RegionKind}
 import sosimage.rules.{refused}
 
@@ -71,8 +74,6 @@ import sosimage.rules.{refused}
 /// Process and Thread.
 static ROOT_BOOT_HANDLES: Int = 3
 
-/// The ledger's unlimited mark, which no row may reach.
-static QUOTA_UNLIMITED: Int = 0xFFFF
 
 /// `QuotaKind.Thread`'s value.
 static QUOTA_THREAD: Int = 0
@@ -188,6 +189,17 @@ public struct ImagePlan {
 
 @synthesize
 extension ImagePlan: ExplicitCopy {}
+
+/// The objects of the four kinds the stock root makes for a plan that an
+/// image's slabs hold: Process (root and each child), Pipe (one per
+/// connection), Interrupt (one per line) and IoMemory (one per device row,
+/// carve given and setup write's carve).
+public struct PlanSlabs {
+    processes: Int
+    pipes: Int
+    interrupts: Int
+    iomemories: Int
+}
 
 /// The `QuotaKind` value a quota key names.
 public func quota_of(key: String) -> Int {
@@ -499,7 +511,7 @@ func quota_rows(image: &ImageFile, d: &Declaration, process: String,
     }
     var declared = Vector<Bool>()
     k = 0
-    while k <= 8 {
+    while k < QUOTA_KINDS {
         try! declared.push(false)
         k = k + 1
     }
@@ -542,13 +554,13 @@ func quota_rows(image: &ImageFile, d: &Declaration, process: String,
 
 /// Holds `plan` to the kernel `facts` describes, for an image named by `what`
 /// whose children start with the quota rows `defaults` (by `QuotaKind`
-/// value) and whose IoMemory slab holds `iomemories`: each quota row against
-/// its bound, and a row the image alone gives against the row it would
-/// lower; each child's `Handle` row against what it holds when it starts;
-/// and root at every step of the plan, its handle table and the IoMemory
-/// objects it has made.
+/// value) and whose slabs hold `slabs`: each quota row against its bound,
+/// and a row the image alone gives against the row it would lower; each
+/// child's `Handle` row against what it holds when it starts; and root at
+/// every step of the plan, its handle table and the objects it has made of
+/// each kind `slabs` counts.
 public func check_plan(plan: &ImagePlan, facts: &KernelFacts, defaults: &Vector<Int>,
-                       iomemories: Int, what: String) -> Result<Void, BuildError> {
+                       slabs: &PlanSlabs, what: String) -> Result<Void, BuildError> {
     var c = 0
     while c < plan.children.len() {
         borrow let child = plan.children[c] {
@@ -556,7 +568,7 @@ public func check_plan(plan: &ImagePlan, facts: &KernelFacts, defaults: &Vector<
         }
         c = c + 1
     }
-    return root_steps(&plan, facts.handles, iomemories, what)
+    return root_steps(&plan, facts.handles, &slabs, what)
 }
 
 /// `check_plan` for one child.
@@ -597,10 +609,12 @@ func check_child(child: &PlanChild, facts: &KernelFacts, defaults: &Vector<Int>,
 /// Process handle, each child created and its two rows released, each setup
 /// write's carve and mapping, each record made and given, and its Waiter,
 /// made before it releases what is left of the rows and connections. Refuses
-/// one at which the IoMemory objects would number more than `iomemories`:
+/// one at which the objects of a kind would number more than `slabs` holds:
+/// Process objects, root's and one for each child created; IoMemory objects,
 /// one per device row, made at boot, one for each setup write's carve while
-/// it is written, and one for each carve given.
-func root_steps(plan: &ImagePlan, table: Int, iomemories: Int,
+/// it is written, and one for each carve given; a Pipe for each connection
+/// made; and an Interrupt for each line bound.
+func root_steps(plan: &ImagePlan, table: Int, slabs: &PlanSlabs,
                 what: String) -> Result<Void, BuildError> {
     let count = plan.children.len()
     var devices = 0
@@ -612,12 +626,15 @@ func root_steps(plan: &ImagePlan, table: Int, iomemories: Int,
         d = d + 1
     }
     var steps = Steps(held: ROOT_BOOT_HANDLES + 2 * count + plan.rows.len() + 1,
-                      made: Vector<Bool>(), objects: devices, slab: iomemories)
+                      made: Vector<Bool>(), iomemories: devices, pipes: 0, interrupts: 0,
+                      slabs: slabs)
     try within(steps.held, table, what, "derive")
     var c = 0
     while c < count {
         borrow let child = plan.children[c] {
-            try within(steps.held + 1, table, what, "create {child.name}")
+            let step = "create {child.name}"
+            try within(steps.held + 1, table, what, step)
+            try objects_within(c + 2, slabs.processes, "Process", what, step)
         }
         steps.held = steps.held - 1
         c = c + 1
@@ -626,7 +643,8 @@ func root_steps(plan: &ImagePlan, table: Int, iomemories: Int,
     while s < plan.setup.len() {
         let step = "setup {(plan.setup.get(s)!).register}"
         try within(steps.held + 2, table, what, step)
-        try objects_within(steps.objects + 1, iomemories, what, step)
+        try objects_within(steps.iomemories + 1, slabs.iomemories, "IoMemory", what,
+                           step)
         s = s + 1
     }
     var k = 0
@@ -651,12 +669,15 @@ func root_steps(plan: &ImagePlan, table: Int, iomemories: Int,
 }
 
 /// What root holds as `root_steps` walks the plan, which connections it has
-/// made, and how many IoMemory objects there are of the slab's `slab`.
+/// made, and how many IoMemory, Pipe and Interrupt objects there are of the
+/// image's `slabs`.
 struct Steps {
     held: Int
     made: Vector<Bool>
-    objects: Int
-    slab: Int
+    iomemories: Int
+    pipes: Int
+    interrupts: Int
+    slabs: PlanSlabs
 }
 
 @synthesize
@@ -676,10 +697,16 @@ func give_step(steps: &var Steps, record: &PlanRecord, table: Int, what: String,
             try within(steps.held + 1, table, what, step)
         },
         case Carve -> {
-            steps.objects = steps.objects + 1
-            try objects_within(steps.objects, steps.slab, what, step)
+            steps.iomemories = steps.iomemories + 1
+            try objects_within(steps.iomemories, steps.slabs.iomemories, "IoMemory", what,
+                               step)
         },
-        // A System sibling, a row's sibling, a carve's handle or a line is
+        case Line -> {
+            steps.interrupts = steps.interrupts + 1
+            try objects_within(steps.interrupts, steps.slabs.interrupts, "Interrupt", what,
+                               step)
+        },
+        // A System sibling, a row's sibling, a carve's handle or a line's is
         // made and given at once, and never takes root's table past a step
         // before it: root held at least one more at its first create, and
         // since the last connection it made it has held no more than it held
@@ -697,14 +724,16 @@ func connect(steps: &var Steps, index: Int, table: Int, what: String,
     }
     steps.made[index] = true
     steps.held = steps.held + 2
-    within(steps.held, table, what, step)
+    try within(steps.held, table, what, step)
+    steps.pipes = steps.pipes + 1
+    objects_within(steps.pipes, steps.slabs.pipes, "Pipe", what, step)
 }
 
-/// Refuses `objects` IoMemory objects past the slab's `slab` at `step`.
-func objects_within(objects: Int, slab: Int, what: String,
+/// Refuses `objects` objects of `kind` past the slab's `slab` at `step`.
+func objects_within(objects: Int, slab: Int, kind: String, what: String,
                     step: String) -> Result<Void, BuildError> {
     if objects > slab {
-        return BuildError(message: "{what}: the stock root would make the IoMemory objects {objects} at `{step}`, past the image's {slab}")
+        return BuildError(message: "{what}: the stock root would make the {kind} objects {objects} at `{step}`, past the image's {slab}")
     }
     return
 }

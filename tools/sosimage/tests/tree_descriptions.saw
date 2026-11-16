@@ -1,120 +1,296 @@
-// Every description in the sawos tree reads clean: each board's
-// `board.toml`, each `process.toml` against the boards that have its types,
-// and each hand-written image under `tests/images/` against its board. The
-// test runs in the package's directory, two below the tree's top.
+// Every description in the sawos tree reads clean (`sosimage.tree`): each
+// board's `board.toml`, each `process.toml` against the boards that have its
+// types, and each hand-written image under `tests/images/` against its board,
+// at the board's grain. Then each refusal of the tree's check, on a tree of
+// its own, the check of one board against its kernel's numbers on that tree,
+// and a declaration held to a kernel's numbers. The test runs in the
+// package's directory, two below the tree's top.
 
 import sosimage.board.{Board}
+import sosimage.build.{ensure_directory}
 import sosimage.declaration.{Declaration}
-import sosimage.imagefile.{ImageFile, bind, image_board}
-import sosimage.product.{find_board}
-import sosimage.tool.{read_text}
+import sosimage.imagefile.{ImageFile, bind}
+import sosimage.kernel.{KernelFacts}
+import std.file.{File}
+import std.path.{Path}
+import sosimage.tool.{read_text, write_lines}
+import sosimage.tree.{check_images, check_tree_board, hold_quota, read_tree, runs_on}
 
-func board_at(dir: String) -> Board {
-    let file = "../../hal/{dir}/board.toml"
-    let text = try! read_text(file)
-    match Board.parse(text, file) {
-        case Ok(b) -> move b,
-        case Err(e) -> panic("{e.message}")
+/// The protection grain of each board of the tree, by its name: a page on
+/// arm64, a word elsewhere.
+func grain_of(name: String) -> UInt64 {
+    if name.equals("arm64-virt") { 0x1000 } else { 4 }
+}
+
+func has_line(lines: &Vector<String>, line: String) -> Bool {
+    var i = 0
+    while i < lines.len() {
+        if (lines.get(i) ?? "").equals(line) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// What `read_tree` says of the tree at `dir`; "" when it reads clean.
+func tree_refusal(dir: String) -> String {
+    match read_tree(dir) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
     }
 }
 
-func declaration_at(dir: String) -> Declaration {
-    let file = "../../{dir}/process.toml"
-    let text = try! read_text(file)
-    match Declaration.parse(text, file) {
-        case Ok(d) -> move d,
-        case Err(e) -> panic("{e.message}")
+func expect(got: String, want: String) {
+    if not got.equals(want) {
+        print("expected: {want}")
+        print("got:      {got}")
+    }
+    assert(got.equals(want), "the refusal")
+}
+
+/// A tree at `dir` with one board (a device of the type `uart`, whose
+/// board input is `pins`) and one driver, `drivers/d`, whose declaration is
+/// `decl`.
+/// A board `name` of the fixture tree, with one device, `D0`, of `type`,
+/// whose board input is `pins`.
+func fixture_board(name: String, type: String) -> Vector<String> {
+    ["format = 1",
+     "[board]", "name = \"{name}\"", "triple = \"riscv32-unknown-none-elf\"",
+     "tier = \"isolated\"", "hal = \"hal/{name}\"", "placement = \"copied\"",
+     "modules = []", "cflags = []",
+     "[emulator]", "program = \"qemu\"", "args = []",
+     "[ram.kernel]", "use = \"kernel\"", "speed = \"fast\"", "base = 0x8000_0000",
+     "len = 0x20_0000",
+     "[ram.ram]", "use = \"process\"", "speed = \"fast\"", "base = 0x8020_0000",
+     "len = 0x20_0000",
+     "[ram.default]", "process = \"ram\"", "pool = \"ram\"",
+     "[types.{type}]", "inputs = [\"pins\"]",
+     "[devices.D0]", "type = \"{type}\"", "base = 0x1000_0000", "len = 0x1000",
+     "line = 10"]
+}
+
+/// A tree at `dir` with two boards, `b` with a device of the type `uart` and
+/// `c` with one of the type `spi` (each type's board input is `pins`), the
+/// driver `drivers/d`, whose declaration is `decl`, the driver `drivers/e`,
+/// whose declaration is `spi`, and no image.
+func fixture_with(dir: String, decl: Vector<String>, spi: Vector<String>) {
+    try! ensure_directory("{dir}/hal/b")
+    try! ensure_directory("{dir}/hal/c")
+    try! ensure_directory("{dir}/drivers/d")
+    try! ensure_directory("{dir}/drivers/e")
+    try! ensure_directory("{dir}/tests/images")
+    let b = fixture_board("b", "uart")
+    let c = fixture_board("c", "spi")
+    try! write_lines("{dir}/hal/b/board.toml", &b)
+    try! write_lines("{dir}/hal/c/board.toml", &c)
+    try! write_lines("{dir}/drivers/d/process.toml", &decl)
+    try! write_lines("{dir}/drivers/e/process.toml", &spi)
+    let images: Vector<String> = ["i.toml", "o.toml", "u.toml"]
+    var i = 0
+    while i < images.len() {
+        let path = Path(s: "{dir}/tests/images/{images.get(i) ?? ""}")
+        if File.exists(path) {
+            try! File.remove(path)
+        }
+        i = i + 1
     }
 }
 
-func serves(d: &Declaration, b: &Board) {
-    match d.check_against(&b) {
-        case Ok(_) -> {},
-        case Err(e) -> panic("{e.message}")
-    }
+func fixture(dir: String, decl: Vector<String>) {
+    fixture_with(dir, move decl, driver("spi", "\"pins\""))
 }
 
-func image_at(name: String) {
-    let file = "../../tests/images/{name}"
-    let text = try! read_text(file)
-    let board = try! find_board("../..", try! image_board(text, file))
-    match ImageFile.parse(text, file, &board, 4) {
-        case Ok(_) -> {},
-        case Err(e) -> panic("{e.message}")
+/// `driver`'s declaration with `[quota]` `quota`.
+func with_quota(decl: Vector<String>, quota: String) -> Vector<String> {
+    var out = decl.copy()
+    try! out.push("[quota]")
+    try! out.push(quota)
+    move out
+}
+
+func driver(kind_type: String, inputs: String) -> Vector<String> {
+    ["format = 1", "arena = 0x1000",
+     "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+     "[[boot]]", "name = \"uart\"", "kind = \"window\"", "type = \"{kind_type}\"", "tag = 2",
+     "[build]", "inputs = [{inputs}]"]
+}
+
+// A kernel whose handle table holds 32, whose budget leaves 12 grant rows,
+// and whose slabs an image may raise to 255.
+func facts() -> KernelFacts {
+    KernelFacts(word: 4, capacity: 255, extents: 4, records_per_body: 4, handles: 32,
+                image_rows: 4, budget: 16, domains: 16, stride: 0, inflight: 2,
+                floors: Vector<Int>(), defaults: Vector<Int>(), units: Vector<Int>(),
+                aligns: Vector<Int>())
+}
+
+/// What `hold_quota` says of a declaration with `[quota]` `quota`; "" when it
+/// holds.
+func quota_refusal(quota: String) -> String {
+    let lines: Vector<String> = [
+        "format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[quota]", quota]
+    let d = try! Declaration.parse(lines.join("\n"), "q.toml")
+    let f = facts()
+    match hold_quota(&d, "b", &f) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
     }
 }
 
 func main() {
-    let virt = board_at("riscv32")
-    assert(virt.name.equals("riscv32-virt"), "the riscv32 board")
-    let flat = board_at("riscv32-flat")
-    assert(flat.name.equals("riscv32-virt-flat"), "its flat profile")
-    let arm = board_at("arm64")
-    assert(arm.word == 8, "arm64's word")
-    let c3 = board_at("riscv32-esp32c3")
-    assert(c3.name.equals("esp32c3"), "the ESP32-C3")
-    let s3 = board_at("xtensa-esp32s3")
-    assert(s3.flash!.slot_count == 4, "the ESP32-S3's four child slots")
-
-    let ns16550 = declaration_at("drivers/svc-uart-ns16550")
-    serves(&ns16550, &virt)
-    serves(&ns16550, &flat)
-    let pl011 = declaration_at("drivers/svc-uart-pl011")
-    serves(&pl011, &arm)
-    let client = declaration_at("tests/svc-client")
-    serves(&client, &virt)
-    serves(&client, &arm)
-
-    image_at("uart_service_ns16550.toml")
-    image_at("uart_service_ns16550_flat.toml")
-
-    // The stock-root images' children, and the images.
-    let server = declaration_at("tests/stock-server")
-    let asker = declaration_at("tests/stock-client")
-    serves(&server, &virt)
-    serves(&server, &flat)
-    serves(&server, &arm)
-    serves(&server, &s3)
-    serves(&asker, &virt)
-    serves(&asker, &s3)
-    let goldfish = declaration_at("tests/stock-goldfish")
-    serves(&goldfish, &virt)
-    serves(&goldfish, &flat)
-    let part = declaration_at("tests/stock-goldfish-part")
-    serves(&part, &virt)
-    serves(&part, &flat)
-    let pl031 = declaration_at("tests/stock-pl031")
-    serves(&pl031, &arm)
-    let timg = declaration_at("tests/stock-timg")
-    serves(&timg, &s3)
-    image_at("stock_root.toml")
-    image_at("stock_root_flat.toml")
-    image_at("stock_root_arm64.toml")
-    image_at("stock_root_s3.toml")
-    image_at("stock_refused.toml")
-    image_at("stock_takers.toml")
-    image_at("stock_carves.toml")
-    image_at("stock_carves_over.toml")
+    let tree = match read_tree("../..") {
+        case Ok(t) -> move t,
+        case Err(e) -> panic("{e.message}")
+    }
+    assert(tree.boards.len() == 5, "the tree's five boards")
+    var b = 0
+    while b < tree.boards.len() {
+        borrow let board = tree.boards[b] {
+            match check_images("../..", &board, grain_of(board.name)) {
+                case Ok(_) -> {},
+                case Err(e) -> panic("{e.message}")
+            }
+        }
+        b = b + 1
+    }
+    let lines = runs_on(&tree)
+    assert(has_line(&lines, "../../drivers/svc-uart-ns16550/process.toml runs on riscv32-virt, riscv32-virt-flat"), "the NS16550 driver's boards")
+    assert(has_line(&lines, "../../drivers/svc-uart-pl011/process.toml runs on arm64-virt"), "the PL011 driver's")
+    assert(has_line(&lines, "../../tests/stock-timg/process.toml runs on esp32s3"), "a device the S3 alone has")
+    assert(has_line(&lines, "../../tests/stock-server/process.toml runs on arm64-virt, riscv32-virt, esp32c3, riscv32-virt-flat, esp32s3"), "no device: every board")
 
     // The UART service with the stock root on riscv32-virt: the console is
     // the board's one NS16550, so the driver gets it only by naming it.
+    let virt = try! Board.parse(try! read_text("../../hal/riscv32/board.toml"), "virt.toml")
     var decls = Vector<Declaration>()
-    try! decls.push(ns16550.copy())
-    try! decls.push(client.copy())
-    let lines: Vector<String> = [
+    try! decls.push(try! Declaration.parse(try! read_text("../../drivers/svc-uart-ns16550/process.toml"), "d.toml"))
+    try! decls.push(try! Declaration.parse(try! read_text("../../tests/svc-client/process.toml"), "c.toml"))
+    let service: Vector<String> = [
         "format = 1",
         "[image]", "name = \"service\"", "board = \"riscv32-virt\"", "tick = false",
         "[root]", "package = \"stock\"",
         "[[process]]", "name = \"driver\"", "package = \"sawos:drivers/svc-uart-ns16550\"",
         "[[process]]", "name = \"client\"", "package = \"sawos:tests/svc-client\"",
         "clients = \{ uart = \"driver.uart\" \}"]
-    let unnamed = try! ImageFile.parse(lines.join("\n"), "s.toml", &virt, 4)
+    let unnamed = try! ImageFile.parse(service.join("\n"), "s.toml", &virt, 4)
     let refused = match bind(&unnamed, &virt, &decls, 4) {
         case Ok(_) -> "",
         case Err(e) -> e.message
     }
     assert(refused.equals("s.toml: line 9, column 1: UART0 is the kernel's own device, bound only when an image names it: name it in the `device` of the process driver"), "the console unnamed: {refused}")
-    let named = try! ImageFile.parse(lines.join("\n").replace("package = \"sawos:drivers/svc-uart-ns16550\"", "package = \"sawos:drivers/svc-uart-ns16550\"\ndevice = \{ uart = \"UART0\" \}"), "s.toml", &virt, 4)
+    let named = try! ImageFile.parse(service.join("\n").replace("package = \"sawos:drivers/svc-uart-ns16550\"", "package = \"sawos:drivers/svc-uart-ns16550\"\ndevice = \{ uart = \"UART0\" \}"), "s.toml", &virt, 4)
     let bound = try! bind(&named, &virt, &decls, 4)
     assert((bound.windows.get(0)!).window.base == 0x1000_0000, "the console, named")
+
+    // A tree of its own: a driver of a type a board has reads clean and runs
+    // on that board, one of a type no board has is refused, and so is one
+    // that does not list its type's board input.
+    let dir = ".build/tree-fixture"
+    fixture(dir, driver("uart", "\"pins\""))
+    let clean = match read_tree(dir) {
+        case Ok(t) -> move t,
+        case Err(e) -> panic("{e.message}")
+    }
+    let clean_lines = runs_on(&clean)
+    assert(has_line(&clean_lines, "{dir}/drivers/d/process.toml runs on b"), "it runs on b")
+    assert(has_line(&clean_lines, "{dir}/drivers/e/process.toml runs on c"), "the other on c")
+    // An image for a board the tree does not have is refused: no board's
+    // check would read it.
+    let nowhere: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"u\"", "board = \"nowhere\"", "tick = false",
+        "[root]", "package = \"stock\""]
+    try! write_lines("{dir}/tests/images/u.toml", &nowhere)
+    expect(tree_refusal(dir), "{dir}/tests/images/u.toml: the image is for the board nowhere, and no board.toml under hal/ names it; the boards are b, c")
+
+    // An image for the board is read and its processes bound: one that
+    // gives the driver no value for its board input is refused, and one for
+    // another board is not read against this one.
+    fixture(dir, driver("uart", "\"pins\""))
+    let board = try! Board.parse(try! read_text("{dir}/hal/b/board.toml"), "b.toml")
+    let image: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"i\"", "board = \"b\"", "tick = false",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"d\"", "package = \"sawos:drivers/d\""]
+    try! write_lines("{dir}/tests/images/i.toml", &image)
+    let other: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"o\"", "board = \"c\"", "tick = false",
+        "[root]", "package = \"stock\"", "unknown = 1"]
+    try! write_lines("{dir}/tests/images/o.toml", &other)
+    let unbound_message = "{dir}/tests/images/i.toml: line 9, column 1: the input `pins` of the process d has no value: the image gives none, no device it is bound to fixes it, and sawos:drivers/d has no default for it"
+    let unbound = match check_images(dir, &board, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect(unbound, unbound_message)
+
+    // One board against its kernel's numbers: a declaration that runs on it
+    // is held to them, one that runs elsewhere is not, and every image for
+    // it is read.
+    let f = facts()
+    fixture_with(dir, driver("uart", "\"pins\""),
+                 with_quota(driver("spi", "\"pins\""), "handles = 33"))
+    expect(board_refusal(dir, &board, &f), "")
+    fixture(dir, with_quota(driver("uart", "\"pins\""), "mappings = 13"))
+    expect(board_refusal(dir, &board, &f), "{dir}/drivers/d/process.toml: `mappings` in [quota] is 13, past the 12 grant rows an image leaves of the board b's 16")
+    fixture(dir, driver("uart", "\"pins\""))
+    try! write_lines("{dir}/tests/images/i.toml", &image)
+    expect(board_refusal(dir, &board, &f), unbound_message)
+
+    fixture(dir, driver("can", ""))
+    expect(tree_refusal(dir), "{dir}/drivers/d/process.toml: no board has a device of each type it needs (`can`); the boards are b, c")
+    fixture(dir, driver("uart", ""))
+    expect(tree_refusal(dir), "{dir}/drivers/d/process.toml: line 13, column 1: `pins` is a board input of the type `uart` on the board b, and [build] inputs does not list it")
+
+    // A declaration held to a kernel's numbers.
+    expect(quota_refusal("handles = 32"), "")
+    expect(quota_refusal("handles = 33"), "q.toml: `handles` in [quota] is 33, past the 32 the board b's handle table holds")
+    expect(quota_refusal("mappings = 12"), "")
+    expect(quota_refusal("mappings = 13"), "q.toml: `mappings` in [quota] is 13, past the 12 grant rows an image leaves of the board b's 16")
+    expect(quota_refusal("waiters = 255"), "")
+    expect(quota_refusal("waiters = 256"), "q.toml: `waiters` in [quota] is 256, past the 255 an image on the board b can raise any slab to")
+    expect(quota_refusal("events = 65535"), "q.toml: `events` in [quota] is 65535, which the ledger's row cannot hold below its unlimited mark (65535)")
+    expect(quota_refusal("events = 65534"), "q.toml: `events` in [quota] is 65534, past the 255 an image on the board b can raise any slab to")
+    // What it holds when it starts, against the handle table.
+    expect(start_refusal(31), "")
+    expect(start_refusal(32), "big.toml: the process holds 33 handles when it starts, past the 32 the board b's handle table holds")
+}
+
+/// What `check_tree_board` says of the tree at `dir` on `board` against the
+/// kernel `f`; "" when it holds.
+func board_refusal(dir: String, board: &Board, f: &KernelFacts) -> String {
+    let tree = match read_tree(dir) {
+        case Ok(t) -> move t,
+        case Err(e) -> panic("{e.message}")
+    }
+    match check_tree_board(&tree, dir, &board, &f, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+/// What `hold_quota` says of a declaration with `records` records, which it
+/// holds when it starts with its Process handle.
+func start_refusal(records: Int) -> String {
+    var lines: Vector<String> = ["format = 1", "arena = 0x1000",
+                                 "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1"]
+    var t = 2
+    while t <= records {
+        try! lines.push("[[boot]]")
+        try! lines.push("name = \"e{t}\"")
+        try! lines.push("kind = \"memory\"")
+        try! lines.push("tag = {t}")
+        t = t + 1
+    }
+    let big = try! Declaration.parse(lines.join("\n"), "big.toml")
+    let f = facts()
+    match hold_quota(&big, "b", &f) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
 }

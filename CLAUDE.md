@@ -53,7 +53,10 @@ drivers/           # userspace device drivers and the protocol packages their
                    # (tools/sosimage/src/declaration.saw)
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
-root/              # the root server: a real Blade package, sosimg emit
+root/              # the stock root: it launches an image's processes as
+                   # the plan the image builder writes for the image
+                   # (`imageplan`) says; bootplan/ holds the plan's types.
+                   # It builds only with a plan (tools/sosimage/src/plan.saw)
 tests/             # kernel entries, test packages, hand-assembled payloads;
                    # images/ holds hand-written image descriptions (TOML,
                    # tools/sosimage/src/imagefile.saw)
@@ -119,7 +122,12 @@ script (its region, and on the S3 its flash slot, from `_process_placement`)
 and has Blade link the package through it into
 `<package>/.build/<triple>/<role>.sosimg`, then `sosimage kernel` once for
 each kernel entry the cases use and for the shipping kernel, then
-`sosimage defaults`; per case it writes an image
+`sosimage defaults`, then `sosimage check-tree`, which reads every
+description in the tree and holds each process's declaration to every board
+it runs on and to this board's kernel, each image to a board of the tree,
+and each image for this board to the board (`src/tree.saw`; a refusal fails
+the profile, and the C3 and S3 smokes run it for their boards); per case it
+writes an image
 description into the case's staging directory and calls `sosimage link`,
 which refuses an image whose slab areas lie outside the board's slab region
 (a script that does not gather `.bss.sos_slab*`). A case with an

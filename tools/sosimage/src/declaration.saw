@@ -32,11 +32,12 @@
 //! (device needs; endpoints, a serve and a client sharing one set of names;
 //! memory), where a window and a line of one type under one name are one
 //! need; two names for one type, which would be two devices of one type
-//! (reserved); a `defaults` key that is not an input, or whose value is not a
-//! path; a `ram` other than `fast`; a `threads` of 0, since a process's first
-//! thread is charged to it; and a declared `handles` below what the process
-//! holds when it starts (one per record, its Process handle, and one Mapping
-//! per window).
+//! (reserved); an input whose name is no Saw identifier (it has a `-`),
+//! since the program imports the input by it; a `defaults` key that is not
+//! an input, or whose value is not a path; a `ram` other than `fast`; a
+//! `threads` of 0, since a process's first thread is charged to it; and a
+//! declared `handles` below what the process holds when it starts (one per
+//! record, its Process handle, and one Mapping per window).
 //!
 //! Against a board (`check_against`), a process is also refused for an
 //! `arena` or a tag the board's word cannot hold, a type the board has no
@@ -49,7 +50,7 @@ import toml.{TomlKind, TomlPosition, TomlTable}
 import sosimage.board.{Board, NamedCount, expect_table, quota_keys, read_counts}
 import sosimage.failure.{BuildError}
 import sosimage.rules.{
-    check_format, check_name, check_path, count, fits_board_word, flag, holds,
+    check_format, check_input_name, check_name, check_path, count, element_at, fits_board_word, flag, holds,
     name_list, only_keys, parse_description, refused, size, text, toml_refused,
     where_is,
 }
@@ -219,6 +220,11 @@ extension Declaration {
             try only_keys(&b, &build_keys, file, "[build]")
             inputs = try name_list(&b, "inputs", file, "an input's name")
             inputs_at = where_is(&b, "inputs")
+            var n = 0
+            while n < inputs.len() {
+                try check_input_name(inputs.get(n) ?? "", file, element_at(&b, "inputs", n))
+                n = n + 1
+            }
             try expect_table(&b, "defaults", file)
             if let d = b.table("defaults") {
                 let names = try! d.keys()

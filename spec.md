@@ -4699,16 +4699,18 @@ reserved.
   its bits), sets each child's quota rows and gives its records under the launch
   convention below, starts every child, and supervises. The builder refuses a
   plan the stock root could not carry out: one at whose steps root's handle
-  table would overflow, or the IoMemory objects (one per device row, one per
-  carve given, and one for each setup write's carve while it is written) would
-  pass the image's IoMemory slab; a quota row past its bound, a row the image
-  gives below the declaration's or, for a kind the declaration leaves out, below
-  the one the image's children start with (an image raises a row and never
-  lowers one), a `threads` row of 0 (a child's first thread is charged to it),
-  and a child whose `Handle` row is short of what it holds when it starts. A
-  step that fails prints the step, the child and the status and stops the
-  machine; a child whose image says `on-exit = "shutdown"` stops the machine
-  when it ends, and the machine stops when every child has ended.
+  table would overflow, or the objects root makes of a kind would pass the
+  image's slab of it: Process objects (root's and one per child), Pipe objects
+  (one per connection), Interrupt objects (one per line), and IoMemory objects
+  (one per device row, one per carve given, and one for each setup write's carve
+  while it is written); a quota row past its bound, a row the image gives below
+  the declaration's or, for a kind the declaration leaves out, below the one the
+  image's children start with (an image raises a row and never lowers one), a
+  `threads` row of 0 (a child's first thread is charged to it), and a child
+  whose `Handle` row is short of what it holds when it starts. A step that fails
+  prints the step, the child and the status and stops the machine; a child whose
+  image says `on-exit = "shutdown"` stops the machine when it ends, and the
+  machine stops when every child has ended.
 - **After the rows, the image's slab areas.** The table is at version 5. After
   its rows comes nothing, or one whole block: a magic word, the number of
   areas, one quota default for each `QuotaKind` (the rows the image's children

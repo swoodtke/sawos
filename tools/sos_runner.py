@@ -8247,6 +8247,52 @@ TEST_CASES = [
         "expect_out": [],
         "expect_clean_exit": False,
     },
+    # Two children beside root in an image whose Process slab holds three:
+    # both run. A third is refused at its create.
+    {
+        "name": "stock_processes",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_processes.toml"},
+        "expect_out": ["{banner}",
+                       *["SOS alarm: record 2 word 0 = 0"] * 2,
+                       "root: a0 ended status=65536",
+                       "root: a1 ended status=65536"],
+        "expect_clean_exit": True,
+    },
+    {
+        "name": "stock_processes_over",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_processes_over.toml"},
+        "expect_build_error": "the stock root would make the Process objects 4 "
+                              "at `create a2`, past the image's 3",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+    # Four servers, a connection each, in an image whose Pipe slab holds
+    # four: each runs, and ends once root has let go of its end. A fifth is
+    # refused where root would make its connection.
+    {
+        "name": "stock_pipes",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_pipes.toml"},
+        "expect_out": ["{banner}",
+                       *["SOS default-server: no client is left"] * 4,
+                       *[f"root: s{i} ended status=65536" for i in (0, 3, 2, 1)]],
+        "expect_clean_exit": True,
+    },
+    {
+        "name": "stock_pipes_over",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_pipes_over.toml"},
+        "expect_build_error": "the stock root would make the Pipe objects 5 at "
+                              "`give s4 record 2`, past the image's 4",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
     # Root lets go of the rows it still holds before it waits: the console's
     # row, which only a carve of it was given from, is the IoMemory object
     # the carver's last carve takes. Its plan raises its IoMemory row past
@@ -12221,6 +12267,16 @@ def _board_defaults(builder, arch, kernel_obj):
     return limits
 
 
+def _check_tree(builder, profile, board_dir, kernel_obj, staging):
+    """Hold every description in the tree to the board in `hal/<board_dir>/`
+    and its kernel object (`sosimage check-tree`): each declaration to every
+    board it runs on and to this board's kernel, each image for this board
+    read and bound. A refusal names the file, and is a `ToolError`."""
+    _run_sosimage(builder, ["check-tree", profile, REPO_ROOT,
+                            os.path.join(HAL_DIR, board_dir, "board.toml"),
+                            kernel_obj, staging])
+
+
 # The slab block's magic, mirroring `kernel/core/areas.saw`'s
 # `SLAB_BLOCK_MAGIC`: 'S','L','A','B' read little-endian.
 SLAB_BLOCK_MAGIC = 0x42414C53
@@ -12711,6 +12767,15 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
         except ToolError as e:
             print(f"{CROSS} the {arch['name']} board's [limits.default] is "
                   f"refused\n{e}", file=sys.stderr)
+            return 0, len(cases)
+        # The tree's descriptions, held to this board and its kernel.
+        try:
+            _check_tree(builder, profile, arch["name"],
+                        _kernel_object(arch, main_src),
+                        os.path.join(dirs["build"], "check-tree"))
+        except ToolError as e:
+            print(f"{CROSS} the tree's descriptions are refused on the "
+                  f"{arch['name']} board\n{e}", file=sys.stderr)
             return 0, len(cases)
 
     # One case = one unit of work: link it, boot it, judge it. A worker
@@ -14361,11 +14426,32 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # before any case links one; an entry that fails is reported by each case
     # that boots it.
     kernel_failures = {}
+    # The first set of keys also compiles the shipping kernel, which the
+    # tree's descriptions are held to below.
+    main_src = os.path.join(KERNEL_DIR, "main.saw")
     for key in ([] if python_path else keys_used):
+        entries = [c for c in built if variant(c) == key]
+        if key == keys_used[0]:
+            entries.append({"src": main_src})
         failures = _build_kernels(builder, profiles[key], variant_arch(key),
-                                  [c for c in built if variant(c) == key], 1)
+                                  entries, 1)
         for src, failure in failures.items():
             kernel_failures[(src, key)] = failure
+
+    # The tree's descriptions, held to this board and its kernel.
+    if not python_path and keys_used:
+        first = keys_used[0]
+        failure = kernel_failures[(main_src, first)]
+        try:
+            if failure is not None:
+                raise failure
+            _check_tree(builder, profiles[first], arch["name"],
+                        _kernel_object(variant_arch(first), main_src),
+                        os.path.join(s3_build, "check-tree"))
+        except ToolError as e:
+            print(f"{CROSS} the tree's descriptions are refused on the "
+                  f"ESP32-S3 board\n{e}", file=sys.stderr)
+            return 1
 
     def build_flash(case, board=False, check=True):
         """`flash_image` over one case's image, through the builder or the
@@ -15017,6 +15103,14 @@ def main():
         except ToolError as e:
             print(f"{CROSS} the ESP32-C3 board's [limits.default] is "
                   f"refused\n{e}", file=sys.stderr)
+            sys.exit(1)
+        # The tree's descriptions, held to this board and its kernel.
+        try:
+            _check_tree(builder, c3_profile, c3_arch["name"], kobj,
+                        os.path.join(C3_BUILD, "check-tree"))
+        except ToolError as e:
+            print(f"{CROSS} the tree's descriptions are refused on the "
+                  f"ESP32-C3 board\n{e}", file=sys.stderr)
             sys.exit(1)
 
         failed = 0

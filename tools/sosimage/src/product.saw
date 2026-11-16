@@ -60,7 +60,7 @@ import sosimage.flash.{load_segments}
 import sosimage.layout.{Ask, Placement, child_slots, choose_range, first_placement, place,
                         ram_span, region_align}
 import sosimage.package.{Extras, ModulePath, absolute, build_process, write_plan}
-import sosimage.plan.{ImagePlan, check_plan, plan_image, quota_of}
+import sosimage.plan.{ImagePlan, PlanSlabs, check_plan, plan_image, quota_of}
 import sosimage.declaration.{Declaration}
 import sosimage.failure.{BuildError}
 import sosimage.hex.{hex}
@@ -244,8 +244,8 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
             limits = try image_limits(&stated, &kernel_facts, image.name)
         }
         let defaults = quota_defaults(&limits, &kernel_facts)
-        try check_plan(&plan, &kernel_facts, &defaults, iomemory_total(&limits, &kernel_facts),
-                       path)
+        let slabs = plan_slabs(&limits, &kernel_facts)
+        try check_plan(&plan, &kernel_facts, &defaults, &slabs, path)
 
         i = 0
         while i < count {
@@ -387,11 +387,20 @@ public func quota_defaults(limits: &ImageLimits, facts: &KernelFacts) -> Vector<
     move out
 }
 
-/// How many IoMemory objects an image's slab holds: the kernel's floor,
-/// raised by its limits.
-public func iomemory_total(limits: &ImageLimits, facts: &KernelFacts) -> Int {
-    let floor = facts.floors.get(IOMEMORIES) ?? 0
-    let raised = limits.raise.get(IOMEMORIES) ?? -1
+/// The objects an image's slabs hold of each kind a stock root's plan makes
+/// (`sosimage.plan.PlanSlabs`), each its slab's total (`slab_total`).
+public func plan_slabs(limits: &ImageLimits, facts: &KernelFacts) -> PlanSlabs {
+    PlanSlabs(processes: slab_total(&limits, &facts, PROCESSES),
+              pipes: slab_total(&limits, &facts, PIPES),
+              interrupts: slab_total(&limits, &facts, INTERRUPTS),
+              iomemories: slab_total(&limits, &facts, IOMEMORIES))
+}
+
+/// How many objects an image's slab of `kind` (a `SlabKind` value) holds:
+/// the kernel's floor, raised by its limits.
+public func slab_total(limits: &ImageLimits, facts: &KernelFacts, kind: Int) -> Int {
+    let floor = facts.floors.get(kind) ?? 0
+    let raised = limits.raise.get(kind) ?? -1
     if raised > 0 { floor + raised } else { floor }
 }
 

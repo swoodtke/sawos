@@ -42,6 +42,14 @@
 //!         path, and PRODUCT the directory the image's other paths are from;
 //!         for a flash board it prints `flash used=USED end=END` as `link`
 //!         does, and a line with each process's and each pool's addresses
+//!     sosimage check-tree PROFILE SAWOS BOARD KERNEL STAGING
+//!         reads every description in the sawos tree SAWOS and holds each
+//!         process's declaration to every board it runs on, and to the board
+//!         description BOARD and the kernel object KERNEL compiled for it,
+//!         with the board's HAL compiled in STAGING for its grain
+//!         (`sosimage.tree`), and refuses an image for a board the tree does
+//!         not have; prints `FILE runs on BOARD, BOARD` for each
+//!         declaration
 //!
 //! PROFILE, the IMAGE `link` reads and the PROCESS `package` reads are JSON
 //! files: `sosimage.profile`, `sosimage.image` and `sosimage.package` state
@@ -62,6 +70,7 @@ import sosimage.kernel.{KernelFacts, QUOTA_KINDS, SLAB_KINDS, quota_kind_name,
                        slab_kind_name}
 import sosimage.profile.{Profile}
 import sosimage.tool.{read_text}
+import sosimage.tree.{check_tree_board, read_tree, runs_on}
 
 // The reason is printed here rather than returned from `main`, whose error
 // path cuts a long message short, and a failed tool's reason carries
@@ -153,7 +162,24 @@ func run() -> Result<Void, BuildError> {
         }
         return
     }
-    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | package PROFILE PROCESS | slabs KERNEL | board PROFILE SAWOS BOARD STAGING | defaults KERNEL BOARD | build PROFILE SAWOS PRODUCT IMAGE OUT")
+    if command.equals("check-tree") && args.len() == 7 {
+        let profile = try load_profile(args.get(2) ?? "")
+        let sawos = args.get(3) ?? ""
+        let path = args.get(4) ?? ""
+        let board = try Board.parse(try read_text(path), path)
+        let facts = try KernelFacts.read(args.get(5) ?? "")
+        let hal = try hal_facts(&profile, args.get(6) ?? "")
+        let tree = try read_tree(sawos)
+        try check_tree_board(&tree, sawos, &board, &facts, hal.grain)
+        let lines = runs_on(&tree)
+        var i = 0
+        while i < lines.len() {
+            print(lines.get(i) ?? "")
+            i = i + 1
+        }
+        return
+    }
+    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | package PROFILE PROCESS | slabs KERNEL | board PROFILE SAWOS BOARD STAGING | defaults KERNEL BOARD | build PROFILE SAWOS PRODUCT IMAGE OUT | check-tree PROFILE SAWOS BOARD KERNEL STAGING")
 }
 
 func load_profile(path: String) -> Result<Profile, BuildError> {
