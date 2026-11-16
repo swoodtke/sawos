@@ -42,15 +42,14 @@
 //!         bound (`sosimage.product.board_defaults`), and prints them as the
 //!         `limits` object of an image description (`sosimage.image`), or
 //!         `null` for a board that states none
-//!     sosimage build PROFILE SAWOS PRODUCT IMAGE OUT [LINK_ARG...]
+//!     sosimage build PROFILE SAWOS PRODUCT IMAGE OUT
 //!         builds the image the hand-written description IMAGE states, for
 //!         the board it names, into the directory OUT (`sosimage.product`;
 //!         for the stock root, with the plan `sosimage.plan` writes for it):
 //!         SAWOS is the sawos tree, which holds the boards and every `sawos:`
 //!         path, and PRODUCT the directory the image's other paths are from;
 //!         for a flash board it prints `flash used=USED end=END` as `link`
-//!         does, and a line with each process's and each pool's addresses;
-//!         each LINK_ARG goes to the linker after `--gc-sections`
+//!         does, and a line with each process's and each pool's addresses
 //!     sosimage check-tree PROFILE SAWOS BOARD KERNEL STAGING
 //!         reads every description in the sawos tree SAWOS and holds each
 //!         process's declaration to every board it runs on, and to the board
@@ -59,6 +58,12 @@
 //!         (`sosimage.tree`), and refuses an image for a board the tree does
 //!         not have; prints `FILE runs on BOARD, BOARD` for each
 //!         declaration
+//!     sosimage flash PROFILE SAWOS PRODUCT IMAGE OUT
+//!         builds the image as `build` does, as a board image, for a board
+//!         with a flash, trims its flash image into `OUT/NAME.board.bin` and
+//!         prints `flash used=USED end=END` as `build` does, then its
+//!         SHA-256, its board and the command that writes it to a part
+//!         (`sosimage.board_image`), which it does not run
 //!
 //! PROFILE, the IMAGE `link` reads and the PROCESS `package` reads are JSON
 //! files: `sosimage.profile`, `sosimage.image` and `sosimage.package` state
@@ -71,6 +76,7 @@ import std.env.{Env}
 import sosimage.board.{Board, device_lines}
 import sosimage.declaration.{Declaration, input_lines}
 import sosimage.boardcheck.{check_board, hal_facts}
+import sosimage.board_image.{board_image}
 import sosimage.build.{build_kernel, build_native, link}
 import sosimage.package.{Extras, ProcessSpec, build_process, write_input, write_plan}
 import sosimage.product.{board_defaults, build_image}
@@ -181,16 +187,10 @@ func run() -> Result<Void, BuildError> {
         }
         return
     }
-    if command.equals("build") && args.len() >= 7 {
+    if command.equals("build") && args.len() == 7 {
         let profile = try load_profile(args.get(2) ?? "")
-        var link_args = Vector<String>()
-        var a = 7
-        while a < args.len() {
-            try! link_args.push(args.get(a) ?? "")
-            a = a + 1
-        }
         let linked = try build_image(&profile, args.get(3) ?? "", args.get(4) ?? "",
-                                     args.get(5) ?? "", args.get(6) ?? "", &link_args)
+                                     args.get(5) ?? "", args.get(6) ?? "", false)
         if not linked.flash.is_empty() {
             print("flash used={linked.used} end={linked.end}")
         }
@@ -208,7 +208,14 @@ func run() -> Result<Void, BuildError> {
         print_lines(&runs_on(&tree))
         return
     }
-    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | package PROFILE PROCESS | slabs KERNEL | board PROFILE SAWOS BOARD STAGING | devices BOARD | declared PROCESS | defaults KERNEL BOARD | build PROFILE SAWOS PRODUCT IMAGE OUT [LINK_ARG...] | check-tree PROFILE SAWOS BOARD KERNEL STAGING")
+    if command.equals("flash") && args.len() == 7 {
+        let profile = try load_profile(args.get(2) ?? "")
+        let lines = try board_image(&profile, args.get(3) ?? "", args.get(4) ?? "",
+                                    args.get(5) ?? "", args.get(6) ?? "")
+        print_lines(&lines)
+        return
+    }
+    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | package PROFILE PROCESS | slabs KERNEL | board PROFILE SAWOS BOARD STAGING | devices BOARD | declared PROCESS | defaults KERNEL BOARD | build PROFILE SAWOS PRODUCT IMAGE OUT | check-tree PROFILE SAWOS BOARD KERNEL STAGING | flash PROFILE SAWOS PRODUCT IMAGE OUT")
 }
 
 func print_lines(lines: &Vector<String>) {

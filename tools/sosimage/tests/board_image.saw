@@ -1,0 +1,123 @@
+// A board image's parts: the chip a board's flash names, and a board with no
+// flash refused; the flash image trimmed to its end, and an end past it
+// refused; the digest `shasum` prints, read from its standard output alone,
+// and output of another shape refused; and the three lines `sosimage flash`
+// prints, for the S3 and for a board whose name and chip are two other
+// words. The test runs in the package's directory, two below the tree's top.
+
+import std.data.{Data}
+import sosimage.board.{Board}
+import sosimage.failure.{BuildError}
+import sosimage.board_image.{board_lines, digest_of, digest_with, flash_chip, flash_lines,
+                             sha256_of, trimmed}
+import sosimage.tool.{read_text, write_file}
+
+// The SHA-256 of `abc`.
+func abc_sha256() -> String {
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+}
+
+func board_at(dir: String) -> Board {
+    let file = "../../hal/{dir}/board.toml"
+    match Board.parse(try! read_text(file), file) {
+        case Ok(b) -> move b,
+        case Err(e) -> panic("{e.message}")
+    }
+}
+
+/// `abc_sha256()` with the byte at `at` made `c`.
+func with_byte(at: Int, c: String) -> String {
+    let d = abc_sha256()
+    "{d.substring(0, at)}{c}{d.substring(at + 1, d.len())}"
+}
+
+func refusal<T>(r: Result<T, BuildError>) -> String {
+    match r {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect(got: String, want: String) {
+    if not got.equals(want) {
+        print("expected: {want}")
+        print("got:      {got}")
+    }
+    assert(got.equals(want), "the message")
+}
+
+func main() {
+    let s3 = board_at("xtensa-esp32s3")
+    assert((try! flash_chip(&s3)).equals("esp32s3"), "the S3's chip")
+    let virt = board_at("riscv32")
+    expect(refusal(flash_chip(&virt)),
+           "../../hal/riscv32/board.toml: the board riscv32-virt has no [flash], so an image for it is not written to a part")
+
+    var image = try! Data(capacity: 10)
+    var i = 0
+    while i < 10 {
+        try! image.push(i as UInt8)
+        i = i + 1
+    }
+    let four = try! trimmed(&image, 4, "f.bin")
+    assert(four.len() == 4 && four.get(3)! == 3, "trimmed to its end")
+    assert((try! trimmed(&image, 10, "f.bin")).len() == 10, "an end at the image's own")
+    expect(refusal(trimmed(&image, 11, "f.bin")),
+           "f.bin is 10 bytes, and its placed bytes are said to end at 11")
+    expect(refusal(trimmed(&image, -1, "f.bin")),
+           "f.bin is 10 bytes, and its placed bytes are said to end at -1")
+
+    assert((try! digest_of("{abc_sha256()}  f.bin\n", "s")).equals(abc_sha256()), "a digest")
+    expect(refusal(digest_of("ba7816bf  f.bin\n", "s")), "s printed `ba7816bf  f.bin\n`, not a SHA-256")
+    let upper = abc_sha256().replace("ba78", "BA78")
+    expect(refusal(digest_of("{upper}  f\n", "s")), "s printed `{upper}  f\n`, not a SHA-256")
+    expect(refusal(digest_of(abc_sha256(), "s")), "s printed `{abc_sha256()}`, not a SHA-256")
+    // One space after the digest is enough, and nothing need follow it.
+    assert((try! digest_of("{abc_sha256()} f", "s")).equals(abc_sha256()), "one space")
+    assert((try! digest_of("{abc_sha256()} ", "s")).equals(abc_sha256()), "a space alone")
+    // Exactly 64 digits.
+    expect(refusal(digest_of("{abc_sha256()}0  f", "s")), "s printed `{abc_sha256()}0  f`, not a SHA-256")
+    // Every digit is looked at, the first and the last too, and each end
+    // of both ranges holds: `/` and `:` around the digits, a backquote and
+    // `g` around the letters.
+    let edges: Vector<String> = [with_byte(0, "/"), with_byte(63, ":"), with_byte(10, "`"),
+                                 with_byte(20, "g"), with_byte(0, "g"), with_byte(63, "/")]
+    var k = 0
+    while k < edges.len() {
+        let bad = edges.get(k) ?? ""
+        expect(refusal(digest_of("{bad}  f", "s")), "s printed `{bad}  f`, not a SHA-256")
+        k = k + 1
+    }
+
+    let file = ".build/board_image_abc.txt"
+    try! write_file(file, try! "abc".to_data())
+    assert((try! sha256_of(file)).equals(abc_sha256()), "shasum's digest of `abc`")
+    // A warning on standard error is not the digest: one written ahead of
+    // shasum's output, and shasum's own under a locale the machine lacks.
+    let warned: Vector<String> = ["sh", "-c", "echo 'perl: warning: Setting locale failed.' >&2; shasum -a 256 {file}"]
+    assert((try! digest_with(&warned, "w")).equals(abc_sha256()), "the digest behind a warning")
+    let unlocaled: Vector<String> = ["sh", "-c", "LC_ALL=xx_XX.nothing shasum -a 256 {file}"]
+    assert((try! digest_with(&unlocaled, "l")).equals(abc_sha256()), "the digest under an unknown locale")
+    assert(refusal(sha256_of(".build/no-such-file")).starts_with("command failed"),
+           "a file shasum cannot read")
+
+    let lines = flash_lines(abc_sha256(), "/p/b.board.bin", "plank", "oak")
+    assert(lines.len() == 3, "three lines")
+    expect(lines.get(0)!, "sha256 {abc_sha256()}  /p/b.board.bin")
+    expect(lines.get(1)!, "board plank")
+    expect(lines.get(2)!, "python3 -m esptool --chip oak --port PORT write-flash 0x0 /p/b.board.bin")
+
+    // A board whose name and chip are two other words: the chip is the
+    // board's own, read through, and each line names what it should.
+    let s3_file = "../../hal/xtensa-esp32s3/board.toml"
+    let renamed = (try! read_text(s3_file)).replace("name = \"esp32s3\"", "name = \"plank\"")
+    let other_text = renamed.replace("chip = \"esp32s3\"", "chip = \"oak\"")
+    let other = match Board.parse(other_text, s3_file) {
+        case Ok(b) -> move b,
+        case Err(e) -> panic("{e.message}")
+    }
+    assert((try! flash_chip(&other)).equals("oak"), "the other board's chip")
+    let other_lines = try! board_lines(&other, abc_sha256(), "/p/o.board.bin")
+    expect(other_lines.get(1)!, "board plank")
+    expect(other_lines.get(2)!, "python3 -m esptool --chip oak --port PORT write-flash 0x0 /p/o.board.bin")
+}

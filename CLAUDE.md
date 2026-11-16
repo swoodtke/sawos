@@ -136,9 +136,11 @@ and has Blade link the package through it into
 `<package>/.build/<triple>/<role>.sosimg`, then `sosimage kernel` once for
 each kernel entry the cases use and for the shipping kernel, then
 `sosimage defaults`, then `sosimage check-tree`, which reads every
-description in the tree and holds each process's declaration to every board
-it runs on and to this board's kernel, each image to a board of the tree,
-and each image for this board to the board (`src/tree.saw`; a refusal fails
+description in the tree, the products `templates/product/` and
+`tests/product/` read as products, and holds each process's declaration to
+every board it runs on and to this board's kernel, each image to a board of
+the tree, and each image for this board to the board (`src/tree.saw`; a
+refusal fails
 the profile, and the C3 and S3 smokes run it for their boards); per case it
 writes an image
 description into the case's staging directory and calls `sosimage link`,
@@ -208,15 +210,19 @@ sawos (`templates/product/README.md`). Its `tools/sawos.py` links `.sawos`
 to the tree `SAWOS_ROOT` names, or to the commit its `sawos.pin` names,
 fetched into `~/.cache/sawos/<sha>/`, and runs the tree's `tools/product.py`
 through the link, which builds Blade and the builder as the runner does and
-boots with the runner's own code. After every profile, `make sos-test` runs
-the product phase (`_product_phase`): `tools/product.py new` makes a scratch
-product outside the tree, `tests/product/` is copied in, and its
+boots with the runner's own code; its `flash` has `sosimage flash` build a
+board image (the profile's `board_link_args`) and print its SHA-256, board
+and `esptool` line, and runs nothing. After every profile, `make sos-test`
+runs the product phase (`_product_phase`): `tools/product.py new` makes a
+scratch product outside the tree, `tests/product/` is copied in, and its
 `tools/sawos.py` builds, tests and runs its images on riscv32 with
 `SAWOS_ROOT` naming the tree, beside a row for each refusal of the two
 tools. Nothing reaches the network: every run has a sawos cache of its own
-and a git limited to local transports (`_product_run`). The phase rebuilds
+and a git limited to local transports (`_product_run`). The S3 smoke ends
+with the same phase for the template's ESP32-S3 image: `test`, and
+`flash`'s three lines held to the board image it wrote. Each phase rebuilds
 the builder in place, as a product does, and fails unless it is the same
-binary. `--case product` runs the phase alone.
+binary. `--case product` runs a phase alone.
 
 Implementers run targeted tests while implementing: the cases the change
 affects, selected with `--case a,b` (comma-separated or repeated) and, for one

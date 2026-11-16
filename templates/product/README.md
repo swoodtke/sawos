@@ -18,11 +18,19 @@ That copies this directory and pins the checkout's commit.
 python3 tools/sawos.py build [IMAGE...]   # every image in images/ when none
 python3 tools/sawos.py run IMAGE          # boot it under its board's emulator
 python3 tools/sawos.py test [IMAGE...]    # boot each, pass when it exits 0
+python3 tools/sawos.py flash IMAGE        # build it for a part
 ```
 
 `IMAGE` is a file in `images/` without its `.toml`. Outputs go in `build/`.
 `run` hands the terminal to the emulator and exits with its status; `test`
-prints each console and `test IMAGE: passed` or `failed`.
+prints each console and `test IMAGE: passed` or `failed`. `flash`, for a
+board with a flash, writes `build/IMAGE.board/NAME.board.bin` and prints its
+SHA-256, its board and the `esptool` command that writes it; it runs
+nothing, so connecting and writing the part is yours.
+
+`images/hello-riscv32.toml` launches sawos's UART driver and `hello`, its
+client; `images/hello-esp32s3.toml`, on a board with no UART driver,
+launches `greeter`, which prints through the kernel's console.
 
 `tools/sawos.py` needs Python 3.11 or later. It links `.sawos` to the sawos
 tree and runs that tree's `tools/product.py`, which says what each command

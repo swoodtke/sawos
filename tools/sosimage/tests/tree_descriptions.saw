@@ -3,15 +3,15 @@
 // types, and each hand-written image under `tests/images/` against its board,
 // at the board's grain. Then each refusal of the tree's check, on a tree of its
 // own, the check of one board against its kernel's numbers on that tree, and a
-// declaration held to a kernel's numbers. The product template's and the gate's
-// product fixture's descriptions, which no walk of the tree reaches, are read
-// here too. The test runs in the package's directory, two below the tree's top.
+// declaration held to a kernel's numbers. The tree's products, the template
+// and the gate's fixture, are read as products are, on the tree and on a
+// tree of their own. The test runs in the package's directory, two below the
+// tree's top.
 
 import sosimage.board.{Board}
 import sosimage.build.{ensure_directory}
 import sosimage.declaration.{Declaration}
-import sosimage.imagefile.{ImageFile, bind, image_board}
-import sosimage.product.{find_board}
+import sosimage.imagefile.{ImageFile, bind}
 import sosimage.kernel.{KernelFacts}
 import std.file.{File}
 import std.path.{Path}
@@ -142,25 +142,10 @@ func quota_refusal(quota: String) -> String {
     }
 }
 
-/// The declaration in the package `dir` (from the tree's top) reads clean
-/// and holds on `board`, and the image `image` reads clean against the board
-/// it names.
-func product_reads_clean(dir: String, board: &Board, image: String) {
-    let decl_file = "../../{dir}/process.toml"
-    let decl = match Declaration.parse(try! read_text(decl_file), decl_file) {
-        case Ok(d) -> move d,
-        case Err(e) -> panic("{e.message}")
-    }
-    match decl.check_against(&board) {
-        case Ok(_) -> {},
-        case Err(e) -> panic("{e.message}")
-    }
-    let file = "../../{image}"
-    let text = try! read_text(file)
-    let named = try! find_board("../..", try! image_board(text, file))
-    match ImageFile.parse(text, file, &named, 4) {
-        case Ok(_) -> {},
-        case Err(e) -> panic("{e.message}")
+/// Removes the file at `path` when there is one.
+func remove_if(path: String) {
+    if File.exists(Path(s: path)) {
+        try! File.remove(Path(s: path))
     }
 }
 
@@ -171,28 +156,40 @@ func main() {
     }
     assert(tree.boards.len() == 5, "the tree's five boards")
     var b = 0
+    var read_virt = Vector<String>()
+    var read_s3 = Vector<String>()
     while b < tree.boards.len() {
         borrow let board = tree.boards[b] {
-            match check_images("../..", &board, grain_of(board.name)) {
-                case Ok(_) -> {},
+            let read = match check_images("../..", &board, grain_of(board.name)) {
+                case Ok(r) -> move r,
                 case Err(e) -> panic("{e.message}")
+            }
+            if board.name.equals("riscv32-virt") {
+                read_virt = move read
+            } else if board.name.equals("esp32s3") {
+                read_s3 = move read
             }
         }
         b = b + 1
     }
+    // The products' images, each bound from its own product's root.
+    assert(has_line(&read_virt, "../../templates/product/images/hello-riscv32.toml"), "the template's riscv32 image")
+    assert(has_line(&read_virt, "../../tests/product/images/fails.toml"), "the gate's product fixture's image")
+    assert(has_line(&read_s3, "../../templates/product/images/hello-esp32s3.toml"), "the template's S3 image")
     let lines = runs_on(&tree)
     assert(has_line(&lines, "../../drivers/svc-uart-ns16550/process.toml runs on riscv32-virt, riscv32-virt-flat"), "the NS16550 driver's boards")
     assert(has_line(&lines, "../../drivers/svc-uart-pl011/process.toml runs on arm64-virt"), "the PL011 driver's")
     assert(has_line(&lines, "../../tests/stock-timg/process.toml runs on esp32s3"), "a device the S3 alone has")
     assert(has_line(&lines, "../../tests/stock-server/process.toml runs on arm64-virt, riscv32-virt, esp32c3, riscv32-virt-flat, esp32s3"), "no device: every board")
+    // The products' packages.
+    let every = "arm64-virt, riscv32-virt, esp32c3, riscv32-virt-flat, esp32s3"
+    assert(has_line(&lines, "../../templates/product/hello/process.toml runs on {every}"), "the template's hello")
+    assert(has_line(&lines, "../../templates/product/greeter/process.toml runs on {every}"), "the template's greeter")
+    assert(has_line(&lines, "../../tests/product/fails/process.toml runs on {every}"), "the gate's product fixture's package")
 
     // The UART service with the stock root on riscv32-virt: the console is
     // the board's one NS16550, so the driver gets it only by naming it.
     let virt = try! Board.parse(try! read_text("../../hal/riscv32/board.toml"), "virt.toml")
-    product_reads_clean("templates/product/hello", &virt,
-                        "templates/product/images/hello-riscv32.toml")
-    product_reads_clean("tests/product/fails", &virt,
-                        "tests/product/images/fails.toml")
     var decls = Vector<Declaration>()
     try! decls.push(try! Declaration.parse(try! read_text("../../drivers/svc-uart-ns16550/process.toml"), "d.toml"))
     try! decls.push(try! Declaration.parse(try! read_text("../../tests/svc-client/process.toml"), "c.toml"))
@@ -274,6 +271,41 @@ func main() {
     expect(tree_refusal(dir), "{dir}/drivers/d/process.toml: no board has a device of each type it needs (`can`); the boards are b, c")
     fixture(dir, driver("uart", ""))
     expect(tree_refusal(dir), "{dir}/drivers/d/process.toml: line 13, column 1: `pins` is a board input of the type `uart` on the board b, and [build] inputs does not list it")
+
+    // A tree's products: a package directly under a product's root is held
+    // as the tree's are; an image in its `images/` is read with its paths from
+    // that root, and refused like the tree's when its board is not the tree's.
+    let pdir = ".build/tree-product-fixture"
+    remove_if("{pdir}/templates/product/images/i.toml")
+    remove_if("{pdir}/tests/product/images/u.toml")
+    fixture(pdir, driver("uart", "\"pins\""))
+    try! ensure_directory("{pdir}/templates/product/p")
+    try! ensure_directory("{pdir}/templates/product/images")
+    try! ensure_directory("{pdir}/tests/product/images")
+    let p = driver("uart", "\"pins\"")
+    try! write_lines("{pdir}/templates/product/p/process.toml", &p)
+    let with_product = match read_tree(pdir) {
+        case Ok(t) -> move t,
+        case Err(e) -> panic("{e.message}")
+    }
+    let product_lines = runs_on(&with_product)
+    assert(has_line(&product_lines, "{pdir}/templates/product/p/process.toml runs on b"), "a product's package runs on b")
+    let in_product: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"i\"", "board = \"b\"", "tick = false",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"d\"", "package = \"p\""]
+    try! write_lines("{pdir}/templates/product/images/i.toml", &in_product)
+    let product_board = try! Board.parse(try! read_text("{pdir}/hal/b/board.toml"), "b.toml")
+    let product_unbound = match check_images(pdir, &product_board, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect(product_unbound, "{pdir}/templates/product/images/i.toml: line 9, column 1: the input `pins` of the process d has no value: the image gives none, no device it is bound to fixes it, and p has no default for it")
+    remove_if("{pdir}/templates/product/images/i.toml")
+    try! write_lines("{pdir}/tests/product/images/u.toml", &nowhere)
+    expect(tree_refusal(pdir), "{pdir}/tests/product/images/u.toml: the image is for the board nowhere, and no board.toml under hal/ names it; the boards are b, c")
+    remove_if("{pdir}/tests/product/images/u.toml")
 
     // A declaration held to a kernel's numbers.
     expect(quota_refusal("handles = 32"), "")

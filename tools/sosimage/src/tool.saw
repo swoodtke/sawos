@@ -12,6 +12,20 @@ import sosimage.failure.{BuildError}
 /// failure carrying the exit code, the command line and everything the
 /// program printed on either stream, in the order it printed it.
 public func run_tool(argv: &Vector<String>) -> Result<Void, BuildError> {
+    let _ = try run_command(&argv, true)
+    return
+}
+
+/// Runs `argv` to completion, as `run_tool` does, and answers what the
+/// program printed on its standard output alone; its standard error is this
+/// program's. A failure carries the program's standard output.
+public func tool_stdout(argv: &Vector<String>) -> Result<String, BuildError> {
+    run_command(&argv, false)
+}
+
+/// Runs `argv` to completion and answers what it printed on its standard
+/// output, with its standard error in it when `merged`.
+func run_command(argv: &Vector<String>, merged: Bool) -> Result<String, BuildError> {
     guard let program = argv.get(0) else {
         return BuildError(message: "internal: a command with no program")
     }
@@ -21,14 +35,16 @@ public func run_tool(argv: &Vector<String>) -> Result<Void, BuildError> {
         try! cmd.arg(argv.get(i) ?? "")
         i = i + 1
     }
-    cmd.merge_stderr()
+    if merged {
+        cmd.merge_stderr()
+    }
     let out = try cmd.output() catch {
         return BuildError(message: "could not run {argv.join(" ")}: {error}")
     }
     if not out.success() {
         return BuildError(message: "command failed ({out.exit_code}): {argv.join(" ")}\n{out.stdout}")
     }
-    return
+    return out.stdout
 }
 
 /// The whole of the file at `path`.

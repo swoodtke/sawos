@@ -289,10 +289,18 @@ func main() {
                    "b.toml: line 54, column 1: `slots` in [flash] (0xc0000 for 0x80000 bytes) and `root-slot` (0x100000 for 0x80000 bytes) share flash: each image has a slot of its own")
     expect_refusal(flash_board(51, "ibus = \{ base = 0x4200_0000, len = 0x200_0000, top = 0 \}"),
                    "b.toml: line 51, column 48: `top` is not a key of `ibus` in [flash], which takes `base`, `len`")
+
+    // The part a flash belongs to, as the flashing tool names it: required,
+    // a string, and the one key of its name.
+    let flashed = try! Board.parse(flash_board(0, ""), "b.toml")
+    assert(flashed.flash!.chip.equals("esp32s3"), "the flash's chip")
+    expect_refusal(flash_board(55, ""), "b.toml: line 48, column 2: `chip` is missing from [flash]")
+    expect_refusal(flash_board(55, "chip = 3"), "b.toml: line 55, column 8: `chip` in [flash] is an integer, not a string")
+    expect_refusal(flash_board(55, "chip = \"esp32s3\"\nchips = \"esp32s3\""), "b.toml: line 56, column 1: `chips` is not a key of [flash], which takes `chip`, `base`, `len`, `ibus`, `dbus`, `root-slot`, `slots`")
 }
 
 // The board, made in-place, with a [flash] after the rest whose line `n`
-// (48 to 54) is replaced by `with`; 0 replaces none.
+// (48 to 55) is replaced by `with`; 0 replaces none.
 func flash_board(n: Int, with: String) -> String {
     var lines = board_lines()
     lines[6] = "placement = \"in-place\""
@@ -302,7 +310,8 @@ func flash_board(n: Int, with: String) -> String {
                                  "ibus = \{ base = 0x4200_0000, len = 0x200_0000 \}",         // 51
                                  "dbus = \{ base = 0x3C00_0000, len = 0x200_0000 \}",         // 52
                                  "root-slot = \{ base = 0x10_0000, len = 0x8_0000 \}",        // 53
-                                 "slots = \{ base = 0x18_0000, len = 0x8_0000, count = 1 \}"] // 54
+                                 "slots = \{ base = 0x18_0000, len = 0x8_0000, count = 1 \}", // 54
+                                 "chip = \"esp32s3\""]                                       // 55
     var i = 0
     while i < flash.len() {
         if i + 48 == n {

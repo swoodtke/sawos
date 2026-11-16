@@ -13211,17 +13211,19 @@ def _built_from_files(arch, name):
     return None
 
 
-def _build_image_file(packager, profile, arch, case, env, link_args=()):
+def _build_image_file(packager, profile, arch, case, env, board=False):
     """Build the case's hand-written description, `tests/images/<file>`, its
     `image_file` for this profile, with `sosimage build`, which places every
-    process and builds every package itself; return the ELF it linked and
-    what the builder printed. A flash board's flash image is beside the ELF
-    (`<name>.flash.bin`); the description's image is named for the case."""
+    process and builds every package itself, or as a board image with
+    `sosimage flash`, which links it with the profile's `board_link_args`;
+    return the ELF it linked and what the builder printed. A flash board's
+    flash image is beside the ELF (`<name>.flash.bin`); the description's
+    image is named for the case."""
     out = os.path.join(arch_dirs(arch)["build"], "images", case["name"])
     printed = _run_sosimage(packager, [
-        "build", profile, REPO_ROOT, REPO_ROOT,
+        "flash" if board else "build", profile, REPO_ROOT, REPO_ROOT,
         os.path.join(TESTS_DIR, "images", case["image_file"][arch["name"]]),
-        out, *link_args], env=env)
+        out], env=env)
     return os.path.join(out, f"{case['name']}.elf"), printed
 
 
@@ -13515,6 +13517,175 @@ def _efuse_file(path, which):
     with open(path, "wb") as f:
         f.write(image)
 
+# The ESP32-S3's flash, as its profile describes it: 4 MiB, the windows
+# mapping it for instructions and for data and how much of the address space
+# each maps, and the direct-boot magic the mask ROM reads twice at its offset
+# (hal/xtensa-esp32s3/ABI.md §1e).
+ESP32S3_FLASH_BYTES = 4 * 1024 * 1024
+ESP32S3_FLASH_IBUS = 0x42000000
+ESP32S3_FLASH_DBUS = 0x3C000000
+ESP32S3_FLASH_WINDOW = 32 * 1024 * 1024
+ESP32S3_MAGIC_OFFSET = 0x400
+ESP32S3_MAGIC = 0xAEDB041D
+
+# The S3's default build keys: the ROM's clock, the console's stall count
+# off, and the PSRAM command layer's own build, not its fault build.
+ESP32S3_DEFAULT_KEYS = ("rom", False, False)
+
+# How long an S3 image may run under the emulator before it is killed.
+ESP32S3_TIMEOUT_S = 20
+
+# What a board image of the S3 is linked with besides: no `simcall` in its
+# stops, which no debugger answers on a part (ABI.md §10).
+ESP32S3_BOARD_LINK_ARGS = ["--defsym=_sos_semihosting=0"]
+
+
+def _espressif_tool(pattern, what, hint):
+    """Find a machine-local Espressif tool, newest version first; print the
+    hint and exit 2 when there is none."""
+    import glob
+
+    hits = sorted(glob.glob(os.path.expanduser(pattern)), reverse=True)
+    if not hits:
+        print(f"{RED}no {what} found at {pattern}{RESET}", file=sys.stderr)
+        print(f"  {hint}", file=sys.stderr)
+        sys.exit(2)
+    return hits[0]
+
+
+def _esp32s3_tools():
+    """The Espressif QEMU, esp-clang and the ld.lld beside it, as (qemu,
+    clang, lld); a missing one is named, with its hint, and exits 2."""
+    qemu = _espressif_tool(
+        "~/.espressif/tools/qemu-xtensa/*/qemu/bin/qemu-system-xtensa",
+        "Espressif QEMU for Xtensa",
+        "install it with the ESP-IDF tools installer; the `qemu-system-xtensa`"
+        " a package manager installs has no esp32s3 machine")
+    clang = _espressif_tool(
+        "~/.espressif/tools/esp-clang/*/esp-clang/bin/clang",
+        "esp-clang",
+        "the S3 build needs Espressif's clang and the ld.lld beside it, which "
+        "can link Xtensa; see hal/xtensa-esp32s3/ABI.md §1")
+    lld = os.path.join(os.path.dirname(clang), "ld.lld")
+    if not os.access(lld, os.X_OK):
+        print(f"{RED}no ld.lld beside {clang}{RESET}", file=sys.stderr)
+        print("  the S3 build links with the ld.lld esp-clang ships, which "
+              "can link Xtensa; see hal/xtensa-esp32s3/ABI.md §1",
+              file=sys.stderr)
+        sys.exit(2)
+    return qemu, clang, lld
+
+
+def _esp32s3_module_paths(key):
+    """The S3 kernel's module paths at the build keys `key`, (clock, whether
+    the console counts its stalls, and whether the PSRAM's command layer is
+    its fault build): `_esp32s3_smoke` says what each is."""
+    clock, stall = key[0], key[1]
+    s3_hal = os.path.join(HAL_DIR, "xtensa-esp32s3")
+    keys_dir = os.path.join(s3_hal, "keys")
+    return [CORE_MODULE, f"hal={os.path.join(s3_hal, 'kernel')}",
+            tc().module_path_arg("imgformat"), SOSRT_MODULE,
+            SOSABI_MODULE,
+            f"s3clock={os.path.join(keys_dir, 'clock-' + clock)}",
+            f"s3clockkit={os.path.join(keys_dir, 'clock-common')}",
+            "s3stall=" + os.path.join(
+                keys_dir, "stall-on" if stall else "stall-off")]
+
+
+def _esp32s3_profile(clang, lld, blade, key, build):
+    """The S3's profile description at the build keys `key`, written into
+    `build` with its native units' objects beside it; returns its path."""
+    arch = ESP32S3_ARCH
+    s3_hal = os.path.join(HAL_DIR, "xtensa-esp32s3")
+    native = [(os.path.join(s3_hal, "kernel", "boot.S"),
+               os.path.join(build, "boot.o")),
+              (os.path.join(s3_hal, "kernel", "sink.c"),
+               os.path.join(build, "sink.o")),
+              (os.path.join(s3_hal, "kernel", "mspi.c"),
+               os.path.join(build, "mspi.o")),
+              (os.path.join(RT_COMMON_C_DIR, "support.c"),
+               os.path.join(build, "support.o"))]
+    path = os.path.join(build, "sosimage.profile.json")
+    profile = _profile_description(
+        arch, clang, lld, native,
+        os.path.join(s3_hal, "kernel", "esp32s3.ld"),
+        _esp32s3_module_paths(key),
+        kernel_c_args=["-DSOS_PSRAM_FAULT"] if key[2] else [],
+        flash={"bytes": ESP32S3_FLASH_BYTES,
+               "instruction_window": ESP32S3_FLASH_IBUS,
+               "data_window": ESP32S3_FLASH_DBUS,
+               "window_bytes": ESP32S3_FLASH_WINDOW,
+               "magic_offset": ESP32S3_MAGIC_OFFSET, "magic": ESP32S3_MAGIC,
+               "root_slot": {"base": arch["root_slot"][0],
+                             "len": arch["root_slot"][1]},
+               "slots": {"base": arch["slots"][0],
+                         "len": arch["slots"][1],
+                         "count": arch["slots"][2]}},
+        blade=blade)
+    profile["board_link_args"] = list(ESP32S3_BOARD_LINK_ARGS)
+    _write_json(path, profile)
+    return path
+
+
+def _esp32s3_qemu_command(qemu, flash, extra=()):
+    """The command line that boots the flash image `flash` under the
+    Espressif QEMU `qemu`, its kernel's stops ending it through
+    semihosting, with `extra` after the board's own arguments."""
+    return [qemu, "-machine", "esp32s3", "-nographic", "-semihosting",
+            "-drive", f"file={flash},if=mtd,format=raw", *extra]
+
+
+def _boot_esp32s3(qemu, flash, timeout_s, extra=()):
+    """Boot the flash image `flash` under the Espressif QEMU `qemu`, with
+    `extra` after the board's own arguments; collect the console until the
+    emulator exits, for at most `timeout_s` seconds.
+
+    Returns the transcript and the exit status, or None for a run killed
+    at the deadline. Stderr is discarded: QEMU writes `Adding SPI flash
+    device` there on every run, which is noise a diff should never see.
+    """
+    import select
+
+    proc = subprocess.Popen(
+        _esp32s3_qemu_command(qemu, flash, extra),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL)
+    out = b""
+    deadline = time.time() + timeout_s
+    status = None
+    try:
+        while time.time() < deadline:
+            ready, _, _ = select.select([proc.stdout], [], [], 0.2)
+            if ready:
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if chunk:
+                    out += chunk
+                    continue
+                # End of output: the emulator is exiting, so wait for its
+                # status, but never past the deadline.
+                try:
+                    status = proc.wait(
+                        timeout=max(0.0, deadline - time.time()))
+                except subprocess.TimeoutExpired:
+                    pass
+                break
+            if proc.poll() is not None:
+                # Exited: whatever it wrote is already in the pipe.
+                while True:
+                    chunk = os.read(proc.stdout.fileno(), 4096)
+                    if not chunk:
+                        break
+                    out += chunk
+                status = proc.returncode
+                break
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        proc.stdout.close()
+    return out.decode("utf-8", "replace"), status
+
+
 
 def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     """The ESP32-S3 board smoke: Xtensa, call0, the `Flat` tier. Returns the
@@ -13583,7 +13754,6 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     """
     import glob
     import hashlib
-    import select
 
     arch = ESP32S3_ARCH
     dirs = arch_dirs(arch)
@@ -13591,41 +13761,15 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     s3_build = dirs["build"]
     s3_tests = dirs["tests"]
     s3_triple = arch["triple"]
-    flash_bytes = 4 * 1024 * 1024
-    flash_ibus = 0x42000000
-    flash_dbus = 0x3C000000
-    # How much of the address space each window maps.
-    flash_window = 32 * 1024 * 1024
-    magic_offset = 0x400
-    magic = 0xAEDB041D
-    timeout_s = 20
+    flash_bytes = ESP32S3_FLASH_BYTES
+    flash_ibus = ESP32S3_FLASH_IBUS
+    flash_dbus = ESP32S3_FLASH_DBUS
+    flash_window = ESP32S3_FLASH_WINDOW
+    magic_offset = ESP32S3_MAGIC_OFFSET
+    magic = ESP32S3_MAGIC
+    timeout_s = ESP32S3_TIMEOUT_S
 
-    def s3_tool(pattern, what, hint):
-        """Find a machine-local Espressif tool, newest version first."""
-        hits = sorted(glob.glob(os.path.expanduser(pattern)), reverse=True)
-        if not hits:
-            print(f"{RED}no {what} found at {pattern}{RESET}", file=sys.stderr)
-            print(f"  {hint}", file=sys.stderr)
-            sys.exit(2)
-        return hits[0]
-
-    qemu = s3_tool(
-        "~/.espressif/tools/qemu-xtensa/*/qemu/bin/qemu-system-xtensa",
-        "Espressif QEMU for Xtensa",
-        "install it with the ESP-IDF tools installer; the `qemu-system-xtensa`"
-        " a package manager installs has no esp32s3 machine")
-    clang = s3_tool(
-        "~/.espressif/tools/esp-clang/*/esp-clang/bin/clang",
-        "esp-clang",
-        "the S3 build needs Espressif's clang and the ld.lld beside it, which "
-        "can link Xtensa; see hal/xtensa-esp32s3/ABI.md §1")
-    lld = os.path.join(os.path.dirname(clang), "ld.lld")
-    if not os.access(lld, os.X_OK):
-        print(f"{RED}no ld.lld beside {clang}{RESET}", file=sys.stderr)
-        print("  the S3 build links with the ld.lld esp-clang ships, which "
-              "can link Xtensa; see hal/xtensa-esp32s3/ABI.md §1",
-              file=sys.stderr)
-        sys.exit(2)
+    qemu, clang, lld = _esp32s3_tools()
 
     os.makedirs(s3_build, exist_ok=True)
 
@@ -13637,8 +13781,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # The build keys. Each names a module the HAL imports, and each value a
     # directory under `keys/` holding that module for the value. The clock
     # keys that write share `s3clockkit` (`keys/clock-common`), mapped for
-    # every image and compiled only into one whose key imports it.
-    keys_dir = os.path.join(s3_hal, "keys")
+    # every image and compiled only into one whose key imports it
+    # (`_esp32s3_module_paths`).
     clock_keys = ("rom", "xtal40", "pll80")
 
     def variant(case):
@@ -13665,15 +13809,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             return os.path.join(s3_build, "mspi.o")
         return os.path.join(arch_dirs(variant_arch(key))["build"], "mspi.o")
 
-    def module_paths(key):
-        clock, stall, _fault = key
-        return [CORE_MODULE, f"hal={os.path.join(s3_hal, 'kernel')}",
-                tc().module_path_arg("imgformat"), SOSRT_MODULE,
-                SOSABI_MODULE,
-                f"s3clock={os.path.join(keys_dir, 'clock-' + clock)}",
-                f"s3clockkit={os.path.join(keys_dir, 'clock-common')}",
-                "s3stall=" + os.path.join(
-                    keys_dir, "stall-on" if stall else "stall-off")]
+    module_paths = _esp32s3_module_paths
 
     def kernel_obj(name, src, key):
         obj = os.path.join(s3_build, f"{name}.kernel.o")
@@ -13842,52 +13978,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         return flash, used, end
 
     def boot(flash, extra=()):
-        """Boot the image, with `extra` after the board's own arguments;
-        collect the console until the emulator exits.
-
-        Returns the transcript and the exit status, or None for a run killed
-        at the deadline. Stderr is discarded: QEMU writes `Adding SPI flash
-        device` there on every run, which is noise a diff should never see.
-        """
-        proc = subprocess.Popen(
-            [qemu, "-machine", "esp32s3", "-nographic", "-semihosting",
-             "-drive", f"file={flash},if=mtd,format=raw", *extra],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL)
-        out = b""
-        deadline = time.time() + timeout_s
-        status = None
-        try:
-            while time.time() < deadline:
-                ready, _, _ = select.select([proc.stdout], [], [], 0.2)
-                if ready:
-                    chunk = os.read(proc.stdout.fileno(), 4096)
-                    if chunk:
-                        out += chunk
-                        continue
-                    # End of output: the emulator is exiting, so wait for its
-                    # status, but never past the deadline.
-                    try:
-                        status = proc.wait(
-                            timeout=max(0.0, deadline - time.time()))
-                    except subprocess.TimeoutExpired:
-                        pass
-                    break
-                if proc.poll() is not None:
-                    # Exited: whatever it wrote is already in the pipe.
-                    while True:
-                        chunk = os.read(proc.stdout.fileno(), 4096)
-                        if not chunk:
-                            break
-                        out += chunk
-                    status = proc.returncode
-                    break
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-            proc.wait()
-            proc.stdout.close()
-        return out.decode("utf-8", "replace"), status
+        return _boot_esp32s3(qemu, flash, timeout_s, extra)
 
     rom = "ESP-ROM:esp32s3-20210327"
     banner = "SOS M1: kernel up on xtensa (ESP32-S3)"
@@ -15461,6 +15552,14 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # packages are built. `--emit-flash` names exactly one.
     if emit is not None:
         wanted = [emit]
+    # `--case product` names the product phase (`_product_rows_esp32s3`),
+    # which a run that builds a board image leaves out.
+    run_product = emit is None and (not wanted or PRODUCT_PHASE in wanted)
+    only_product = bool(wanted) and all(w == PRODUCT_PHASE for w in wanted)
+    wanted = [w for w in wanted if w != PRODUCT_PHASE]
+    if only_product:
+        cases = []
+        process_cases = []
     if wanted:
         names = [c["name"] for c in cases]
         unknown = [w for w in wanted if w not in names]
@@ -15537,31 +15636,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                       cc(native[2][0], native[2][1], extra=("-O2",)),
                       cc(native[3][0], native[3][1], extra=("-O2",))]
         for key in keys_used:
-            key_build = arch_dirs(variant_arch(key))["build"]
-            native = [(os.path.join(s3_hal, "kernel", "boot.S"),
-                       os.path.join(key_build, "boot.o")),
-                      (os.path.join(s3_hal, "kernel", "sink.c"),
-                       os.path.join(key_build, "sink.o")),
-                      (os.path.join(s3_hal, "kernel", "mspi.c"),
-                       os.path.join(key_build, "mspi.o")),
-                      (os.path.join(RT_COMMON_C_DIR, "support.c"),
-                       os.path.join(key_build, "support.o"))]
-            profiles[key] = os.path.join(key_build, "sosimage.profile.json")
-            _write_json(profiles[key], _profile_description(
-                arch, clang, lld, native,
-                os.path.join(s3_hal, "kernel", "esp32s3.ld"),
-                module_paths(key),
-                kernel_c_args=["-DSOS_PSRAM_FAULT"] if key[2] else [],
-                flash={"bytes": flash_bytes, "instruction_window": flash_ibus,
-                       "data_window": flash_dbus,
-                       "window_bytes": flash_window,
-                       "magic_offset": magic_offset, "magic": magic,
-                       "root_slot": {"base": arch["root_slot"][0],
-                                     "len": arch["root_slot"][1]},
-                       "slots": {"base": arch["slots"][0],
-                                 "len": arch["slots"][1],
-                                 "count": arch["slots"][2]}},
-                blade=blade_bin))
+            profiles[key] = _esp32s3_profile(
+                clang, lld, blade_bin, key,
+                arch_dirs(variant_arch(key))["build"])
             if not python_path:
                 _run_sosimage(builder, ["native", profiles[key]])
     except ToolError as e:
@@ -15674,8 +15751,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         if case.get("image_file"):
             elf, printed = _build_image_file(
                 packager, profiles[variant(case)], variant_arch(variant(case)),
-                case, _blade_env(clang, lld),
-                ["--defsym=_sos_semihosting=0"] if board else [])
+                case, _blade_env(clang, lld), board)
             found = re.search(r"^flash used=(\d+) end=(\d+)$", printed, re.M)
             if not found:
                 raise ToolError(f"{name}: the image builder did not say how "
@@ -15975,6 +16051,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     skipped = len(cases) - ran
     board_only = f", {skipped} board-only not run" if skipped else ""
     print()
+    if run_product:
+        passed, product_failed = _product_phase(_product_rows_esp32s3)
+        ran += passed + product_failed
+        failed += product_failed
     print("=" * 60)
     if failed:
         print(f"{RED}SOS ESP32-S3 SMOKE FAILED{RESET} "
@@ -16213,16 +16293,38 @@ def _product_rows(scratch, builder_before):
         return _refused(_sawos_py(path, ["build"], tree), 1,
                         "exists and is not a link")
 
+    def fenced():
+        # What a run of the phase is given, read back from a run: a sawos
+        # cache of its own, empty and in the scratch directory, and a git
+        # that takes only local transports.
+        probe = ("import os\nfor k in ('SAWOS_CACHE', 'GIT_ALLOW_PROTOCOL'):\n"
+                 "    print(os.environ.get(k, ''))\n")
+        first = _product_run([sys.executable, "-c", probe]).stdout.splitlines()
+        second = _product_run([sys.executable, "-c", probe]).stdout.splitlines()
+        if len(first) != 2 or len(second) != 2:
+            return f"the probe printed {first!r} and {second!r}"
+        cache, protocols = first
+        if protocols != "file":
+            return f"a run's GIT_ALLOW_PROTOCOL is {protocols!r}, not 'file'"
+        if (not cache or os.path.dirname(cache) != scratch
+                or not os.path.isdir(cache) or os.listdir(cache)):
+            return (f"a run's SAWOS_CACHE is {cache!r}, not an empty "
+                    f"directory of its own in {scratch}")
+        if second[0] == cache:
+            return f"two runs share the SAWOS_CACHE {cache}"
+        return None
+
     def root_wins_over_pin():
         path = bare("root-and-pin", f'sha = "{head}"\n')
         env = offline("root-and-pin")
         env.update(tree)
         why = _refused(_sawos_py(path, ["frobnicate"], env), 2,
                        "unknown command `frobnicate`")
-        linked = os.readlink(os.path.join(path, ".sawos"))
-        if why is None and linked != REPO_ROOT:
+        if why is not None:
+            return why
+        if os.readlink(os.path.join(path, ".sawos")) != REPO_ROOT:
             return "its .sawos does not name the tree SAWOS_ROOT names"
-        return why
+        return None
 
     def fetch_publishes():
         # The fetch's own steps, without a fetch: each fetch of one pin
@@ -16260,6 +16362,16 @@ def _product_rows(scratch, builder_before):
             return None
         return "a checkout was published over a directory that is no tree"
 
+    def flash_no_flash():
+        # Refused before anything is built: no board image's directory.
+        why = _refused(_sawos_py(product, ["flash", "hello-riscv32"], tree), 1,
+                       "the board riscv32-virt has no [flash], so an image for "
+                       "it is not written to a part")
+        out = os.path.join(product, "build", "hello-riscv32.board")
+        if why is None and os.path.exists(out):
+            return f"the refusal came after a build: {out} exists"
+        return why
+
     def builder_refuses():
         image("x-refused", '[image]\nname = "x"\nboard = "riscv32-virt"\n'
               'tick = false\n')
@@ -16278,10 +16390,11 @@ def _product_rows(scratch, builder_before):
         os.symlink(scratch, os.path.join(path, ".sawos"))
         why = _refused(_sawos_py(path, ["frobnicate"], tree), 2,
                        "unknown command `frobnicate`")
-        linked = os.readlink(os.path.join(path, ".sawos"))
-        if why is None and linked != REPO_ROOT:
+        if why is not None:
+            return why
+        if os.readlink(os.path.join(path, ".sawos")) != REPO_ROOT:
             return "its .sawos does not name the tree SAWOS_ROOT names"
-        return why
+        return None
 
     def pinned_from_cache():
         path = bare("pinned", f'sha = "{head}"\n')
@@ -16328,6 +16441,9 @@ def _product_rows(scratch, builder_before):
                         "there is no image description in")
 
     def builds():
+        # The ESP32-S3's image is the S3 smoke's to build, with Espressif's
+        # tools, which this run does not need.
+        os.remove(os.path.join(product, "images", "hello-esp32s3.toml"))
         shutil.copytree(PRODUCT_FIXTURE, product, dirs_exist_ok=True)
         r = _sawos_py(product, ["build"], tree)
         if r.returncode != 0:
@@ -16410,6 +16526,7 @@ def _product_rows(scratch, builder_before):
         ("sawos_link_not_a_link", link_not_a_link),
         ("sawos_relinks", relinks),
         ("sawos_root_wins_over_pin", root_wins_over_pin),
+        ("product_runs_fenced", fenced),
         ("sawos_pinned_from_cache", pinned_from_cache),
         ("sawos_cache_not_sawos", cache_not_sawos),
         ("sawos_fetch_needs_git", fetch_needs_git),
@@ -16421,6 +16538,9 @@ def _product_rows(scratch, builder_before):
             ["run"], "run takes one image")),
         ("product_run_takes_only_one", product_refused(
             ["run", "hello-riscv32", "hello-riscv32"], "run takes one image")),
+        ("product_flash_takes_one", product_refused(
+            ["flash"], "flash takes one image")),
+        ("product_flash_no_flash", flash_no_flash),
         ("product_image_unreadable", image_refused(
             "x-unreadable", "[image\n", "cannot read")),
         ("product_image_names_no_board", image_refused(
@@ -16445,8 +16565,105 @@ def _product_rows(scratch, builder_before):
     ]
 
 
-def _product_phase():
-    """Run the product phase; returns (passed, failed)."""
+# What `test hello-esp32s3` prints, in order: the kernel's banner, the
+# greeter's line, and root's line for its end.
+PRODUCT_GREETER = ["{banner}",
+                   "greeter: hello from a product",
+                   "root: greeter ended status=65536"]
+
+
+def _product_rows_esp32s3(scratch, builder_before):
+    """The S3 smoke's product phase's rows, as `_product_rows`' are: the
+    template's ESP32-S3 image tested, and written as a board image by
+    `flash`, whose three lines are held to the file, the SHA-256 recomputed
+    here, and the image to one linked for a part rather than the emulator."""
+    product = os.path.join(scratch, "product")
+    tree = {"SAWOS_ROOT": REPO_ROOT}
+    image = "hello-esp32s3"
+
+    def made():
+        r = _product_run([sys.executable, PRODUCT_TOOL, "new", product])
+        if r.returncode != 0:
+            return f"new failed ({r.returncode}): {r.stdout}{r.stderr}"
+        return None
+
+    def tests_pass():
+        r = _sawos_py(product, ["test", image], tree)
+        ok, reason = _check({"expect_out": [*PRODUCT_GREETER,
+                                            f"test {image}: passed"],
+                             "expect_clean_exit": True},
+                            ESP32S3_ARCH, r.returncode, r.stdout, False)
+        return None if ok else f"{reason}; stderr {r.stderr!r}"
+
+    def flashes():
+        r = _sawos_py(product, ["flash", image], tree)
+        if r.returncode != 0:
+            return f"flash failed ({r.returncode}): {r.stdout}{r.stderr}"
+        lines = r.stdout.splitlines()[-3:]
+        placed = re.search(r"^flash used=\d+ end=(\d+)$", r.stdout, re.M)
+        if not placed:
+            return f"it did not say where its placed bytes end: {r.stdout}"
+        out = os.path.join(product, "build", f"{image}.board")
+        board_bin = os.path.join(out, f"{image}.board.bin")
+        if not os.path.isfile(board_bin):
+            return f"flash wrote no board image at {board_bin}: {r.stdout}"
+        want = [f"sha256 {_file_sha256(board_bin)}  {board_bin}",
+                "board esp32s3",
+                "python3 -m esptool --chip esp32s3 --port PORT write-flash "
+                f"0x0 {board_bin}"]
+        if lines != want:
+            return f"its last three lines are {lines!r}, not {want!r}"
+        with open(board_bin, "rb") as f:
+            board = f.read()
+        with open(os.path.join(out, f"{image}.flash.bin"), "rb") as f:
+            whole = f.read()
+        if len(board) != int(placed.group(1)) or \
+                whole[:len(board)] != board or \
+                whole[len(board):] != b"\xff" * (len(whole) - len(board)):
+            return (f"{board_bin} ({len(board)} bytes) is not its flash "
+                    "image up to the last byte placed in it")
+        with open(os.path.join(product, "build", image,
+                               f"{image}.flash.bin"), "rb") as f:
+            emulated = f.read()
+        if emulated[:len(board)] == board:
+            return (f"{board_bin} is the emulator's image: it was not linked "
+                    "for a part")
+        # Built at the S3's default build keys, the smoke's own.
+        with open(os.path.join(product, "build", ESP32S3_ARCH["name"],
+                               "sosimage.profile.json")) as f:
+            built = json.load(f)
+        keys = sorted(os.path.relpath(path.split("=", 1)[1],
+                                      os.path.join(product, ".sawos"))
+                      for path in built["module_paths"]
+                      if path.startswith(("s3clock=", "s3stall=")))
+        want = sorted(os.path.relpath(path.split("=", 1)[1], REPO_ROOT)
+                      for path in _esp32s3_module_paths(ESP32S3_DEFAULT_KEYS)
+                      if path.startswith(("s3clock=", "s3stall=")))
+        if keys != want or built.get("kernel_c_args"):
+            return (f"the product's S3 profile is at the keys {keys} with "
+                    f"{built.get('kernel_c_args')!r}, not the default's "
+                    f"{want} with none")
+        return None
+
+    def builder_unchanged():
+        after = _file_sha256(SOSIMAGE_BINARY)
+        if after != builder_before:
+            return (f"{SOSIMAGE_BINARY} is not the builder this run built "
+                    f"(sha256 {after}, was {builder_before})")
+        return None
+
+    return [
+        ("product_new", made),
+        ("product_test_passes", tests_pass),
+        ("product_flash", flashes),
+        ("product_builder_unchanged", builder_unchanged),
+    ]
+
+
+def _product_phase(rows_of):
+    """Run a product phase whose rows `rows_of(scratch, builder)` makes, in
+    a scratch directory of its own, given the image builder's sha256 before
+    the phase; returns (passed, failed)."""
     import tempfile
 
     print(f"{BOLD}product{RESET}  (templates/product, made by "
@@ -16457,7 +16674,7 @@ def _product_phase():
     _PRODUCT_SCRATCH = scratch
     passed = failed = 0
     try:
-        rows = _product_rows(scratch, builder_before)
+        rows = rows_of(scratch, builder_before)
         for i, (name, check) in enumerate(rows, 1):
             try:
                 why = check()
@@ -17179,7 +17396,7 @@ def main():
         total_passed += passed
         total_failed += failed
     if run_product:
-        passed, failed = _product_phase()
+        passed, failed = _product_phase(_product_rows)
         total_passed += passed
         total_failed += failed
 

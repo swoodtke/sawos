@@ -28,6 +28,7 @@
 //!     pool = "ram"
 //!
 //!     [flash]                            an in-place board's, and only its
+//!     chip = "esp32s3"                   the part, as esptool names it
 //!     base = 0x0                         the part's flash
 //!     len = 0x40_0000
 //!     ibus = { base = 0x4200_0000, len = 0x200_0000 }
@@ -146,8 +147,10 @@ public struct Span {
 }
 
 /// An in-place board's flash: the part's, the two bus windows over it,
-/// root's slot, and the slots the other processes' images take.
+/// root's slot, and the slots the other processes' images take. `chip` is
+/// the part, as the flashing tool's `--chip` names it.
 public struct FlashSpec {
+    chip: String
     base: UInt64
     len: UInt64
     ibus: Span
@@ -800,8 +803,9 @@ func read_member(m: &TomlTable, device: String, name: String, array: Bool, len: 
 
 /// An in-place board's `[flash]`.
 func read_flash(f: &TomlTable, word: Int, file: String) -> Result<FlashSpec, BuildError> {
-    let flash_keys: Vector<String> = ["base", "len", "ibus", "dbus", "root-slot", "slots"]
+    let flash_keys: Vector<String> = ["chip", "base", "len", "ibus", "dbus", "root-slot", "slots"]
     try only_keys(&f, &flash_keys, file, "[flash]")
+    let chip = try text(&f, "chip", file)
     let base = try size(&f, "base", word, file, "[flash]")
     let len = try size(&f, "len", word, file, "[flash]")
     try fits_space(base, len, word, file, where_is(&f, "len"), "[flash]")
@@ -823,7 +827,7 @@ func read_flash(f: &TomlTable, word: Int, file: String) -> Result<FlashSpec, Bui
         return refused(file, where_is(&f, "slots"),
                        "`slots` in [flash] ({hex(slots.base)} for {hex(slots.len)} bytes) and `root-slot` ({hex(root_slot.base)} for {hex(root_slot.len)} bytes) share flash: each image has a slot of its own")
     }
-    return FlashSpec(base: base, len: len, ibus: ibus, dbus: dbus, root_slot: root_slot,
+    return FlashSpec(chip: chip, base: base, len: len, ibus: ibus, dbus: dbus, root_slot: root_slot,
                      slots: slots, slot_count: slot_count)
 }
 

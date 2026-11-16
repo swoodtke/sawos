@@ -1,0 +1,121 @@
+//! A board image: an image as it is written to a part's flash, and how to
+//! write it.
+//!
+//! `sosimage flash` builds the image a hand-written description states as
+//! `sosimage build` does, linked as a board image (`sosimage.product`'s
+//! `for_board`: the profile's `board_link_args` after the image's own),
+//! trims its flash image to the offset one past its last placed byte into
+//! `OUT/NAME.board.bin`, and prints `flash used=USED end=END` as `link`
+//! does (END is the board image's length), then three lines:
+//!
+//!     sha256 HEX  FILE
+//!     board NAME
+//!     python3 -m esptool --chip CHIP --port PORT write-flash 0x0 FILE
+//!
+//! the file's SHA-256, as `shasum -a 256` prints it; the board the image is
+//! for; and the command that writes it at the part's flash offset 0, its
+//! `CHIP` the board's `[flash] chip` and `PORT` the reader's to fill in.
+//! Nothing is written to a part: the builder runs no tool but `shasum` beyond
+//! what a build runs. A board with no `[flash]` is refused by name before
+//! anything is built.
+
+import std.data.{Data}
+import sosimage.board.{Board}
+import sosimage.failure.{BuildError}
+import sosimage.imagefile.{image_board}
+import sosimage.product.{build_image, find_board}
+import sosimage.profile.{Profile}
+import sosimage.tool.{read_file, read_text, tool_stdout, write_file}
+
+/// The part the board's flash is, as the flashing tool's `--chip` names it;
+/// a board with no flash is refused, naming it.
+public func flash_chip(board: &Board) -> Result<String, BuildError> {
+    guard let flash = board.flash else {
+        return BuildError(message: "{board.file}: the board {board.name} has no [flash], so an image for it is not written to a part")
+    }
+    return flash.chip
+}
+
+/// The first `end` bytes of the flash image `image`, which `what` names; an
+/// `end` past the image is refused.
+public func trimmed(image: &Data, end: Int, what: String) -> Result<Data, BuildError> {
+    if end < 0 || end > image.len() {
+        return BuildError(message: "{what} is {image.len()} bytes, and its placed bytes are said to end at {end}")
+    }
+    var out = try! Data(capacity: end)
+    var i = 0
+    while i < end {
+        try! out.push(image.get(i) ?? 0)
+        i = i + 1
+    }
+    return move out
+}
+
+/// The SHA-256 of the file at `path`, as `shasum -a 256` prints it
+/// (`digest_with`).
+public func sha256_of(path: String) -> Result<String, BuildError> {
+    let argv: Vector<String> = ["shasum", "-a", "256", path]
+    digest_with(&argv, "shasum -a 256 {path}")
+}
+
+/// The digest the command `argv`, which `what` names, prints on its
+/// standard output (`digest_of`). What it writes on standard error, a
+/// warning about the locale say, is not read.
+public func digest_with(argv: &Vector<String>, what: String) -> Result<String, BuildError> {
+    digest_of(try tool_stdout(&argv), what)
+}
+
+/// The digest `printed`, what `what` printed, begins with: 64 lowercase
+/// hexadecimal digits, then a space. Output of any other shape is refused.
+public func digest_of(printed: String, what: String) -> Result<String, BuildError> {
+    var ok = printed.len() > DIGEST_DIGITS && printed.byte_at(DIGEST_DIGITS) == 32
+    var i = 0
+    while ok && i < DIGEST_DIGITS {
+        let b = printed.byte_at(i)
+        ok = (b >= 48 && b <= 57) || (b >= 97 && b <= 102)
+        i = i + 1
+    }
+    if not ok {
+        return BuildError(message: "{what} printed `{printed}`, not a SHA-256")
+    }
+    return printed.substring(0, DIGEST_DIGITS)
+}
+
+/// How many hexadecimal digits a SHA-256 is.
+static DIGEST_DIGITS: Int = 64
+
+/// The three lines `sosimage flash` prints for `board`'s board image `file`,
+/// whose SHA-256 is `sha` (`flash_lines`).
+public func board_lines(board: &Board, sha: String,
+                        file: String) -> Result<Vector<String>, BuildError> {
+    return flash_lines(sha, file, board.name, try flash_chip(&board))
+}
+
+/// The three lines `sosimage flash` prints for the board image `file`.
+public func flash_lines(sha: String, file: String, board: String,
+                        chip: String) -> Vector<String> {
+    [
+        "sha256 {sha}  {file}",
+        "board {board}",
+        "python3 -m esptool --chip {chip} --port PORT write-flash 0x0 {file}",
+    ]
+}
+
+/// Builds the board image the description at `path` states into `out` and
+/// answers the lines `sosimage flash` prints: what the build placed in the
+/// flash, then how to write it (`flash_lines`).
+public func board_image(profile: &Profile, sawos: String, product: String, path: String,
+                        out: String) -> Result<Vector<String>, BuildError> {
+    let board = try find_board(sawos, try image_board(try read_text(path), path))
+    // A board with no flash is refused before anything is built.
+    let _ = try flash_chip(&board)
+    let linked = try build_image(&profile, sawos, product, path, out, true)
+    let suffix = ".flash.bin"
+    let file = "{linked.flash.substring(0, linked.flash.len() - suffix.len())}.board.bin"
+    let image = try read_file(linked.flash)
+    try write_file(file, try trimmed(&image, linked.end, linked.flash))
+    let how = try board_lines(&board, try sha256_of(file), file)
+    var lines: Vector<String> = ["flash used={linked.used} end={linked.end}"]
+    try! lines.append(&how)
+    return move lines
+}

@@ -17,7 +17,8 @@
 //!       "native": [{"source": "/path/to/boot.S", "object": "/path/to/boot.o"}],
 //!       "linker_script": "/path/to/virt.ld",
 //!       "blade": "/path/to/blade",
-//!       "flash": {...}
+//!       "flash": {...},
+//!       "board_link_args": ["--defsym=_sos_semihosting=0"]
 //!     }
 //!
 //! - `version` is this schema's, and the builder reads only 1.
@@ -40,9 +41,13 @@
 //!   reads twice at that offset), `root_slot` (`base` and `len`: the flash
 //!   root's image takes) and `slots` (`base`, `len` and `count`: the range the
 //!   other processes' images take, `count` slots of equal length).
+//! - `board_link_args` are given to the linker for a board image, the one
+//!   `sosimage flash` builds to be written to a part (`sosimage.board_image`),
+//!   after the image's own.
 //!
 //! Every path is absolute, and every key is required but `kernel_c_args`,
-//! `features`, `native`, `blade` and `flash`. An unknown key is refused.
+//! `features`, `native`, `blade`, `flash` and `board_link_args`. An unknown
+//! key is refused.
 
 import std.json.{JsonValue}
 import sosimage.board.{Span}
@@ -85,6 +90,7 @@ public struct Profile {
     /// The Blade binary, or "" for a profile that builds no package.
     blade: String
     flash: FlashLayout?
+    board_link_args: Vector<String>
 }
 
 @synthesize
@@ -156,12 +162,14 @@ extension Profile {
                                 root_slot: root_slot, slots: slots, slot_count: slot_count)
             try f.finish()
         }
+        let board_link_args = try top.texts_or_empty("board_link_args")
         try top.finish()
         return Profile(triple: triple, word_bytes: word_bytes, sawc: move sawc,
                        clang: clang, lld: lld, cc_args: move cc_args,
                        kernel_c_args: move kernel_c_args, features: features,
                        module_paths: move module_paths, native: move native,
-                       linker_script: linker_script, blade: blade, flash: flash)
+                       linker_script: linker_script, blade: blade, flash: flash,
+                       board_link_args: move board_link_args)
     }
 
     /// The start of every clang command line for this target.

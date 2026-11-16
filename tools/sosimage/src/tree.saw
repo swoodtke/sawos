@@ -3,7 +3,12 @@
 //!
 //! The tree's descriptions are each board's `hal/*/board.toml`, each
 //! process's `process.toml` beside a package directly under `drivers/` or
-//! `tests/`, and each hand-written image under `tests/images/`.
+//! `tests/`, and each hand-written image under `tests/images/`. The products
+//! the tree holds, `templates/product/` and `tests/product/`, are read as a
+//! product is (`product_roots`): each process's `process.toml` beside a
+//! package directly under the product's root, held as the tree's are, and
+//! each image under its `images/`, whose paths are from the product's root
+//! and whose `sawos:` paths are from the tree's (`image_dirs`).
 //!
 //! `read_tree` reads every board and every declaration (each format's own
 //! rules). A declaration runs on the boards that have a device of each type
@@ -70,6 +75,60 @@ func listed(dir: String) -> Result<Vector<String>, BuildError> {
     return move out
 }
 
+/// The roots of the products the tree at `sawos` holds.
+func product_roots(sawos: String) -> Vector<String> {
+    ["{sawos}/templates/product", "{sawos}/tests/product"]
+}
+
+/// A directory of hand-written images, and the product root their paths are
+/// from.
+public struct ImageDir {
+    dir: String
+    product: String
+}
+
+/// Where the tree at `sawos` keeps hand-written images: `tests/images/`,
+/// whose paths are from the tree's top, then each product's `images/`.
+public func image_dirs(sawos: String) -> Vector<ImageDir> {
+    var out: Vector<ImageDir> = [ImageDir(dir: "{sawos}/tests/images", product: sawos)]
+    let roots = product_roots(sawos)
+    var r = 0
+    while r < roots.len() {
+        let root = roots.get(r) ?? ""
+        try! out.push(ImageDir(dir: "{root}/images", product: root))
+        r = r + 1
+    }
+    move out
+}
+
+/// A hand-written image, and the product root its paths are from.
+struct ImageAt {
+    file: String
+    product: String
+}
+
+/// The image descriptions in the directories `image_dirs` names, each with
+/// the product root its paths are from.
+func image_files(sawos: String) -> Result<Vector<ImageAt>, BuildError> {
+    var out = Vector<ImageAt>()
+    let dirs = image_dirs(sawos)
+    var d = 0
+    while d < dirs.len() {
+        let at = dirs.get(d)!
+        d = d + 1
+        let files = try listed(at.dir)
+        var i = 0
+        while i < files.len() {
+            let file = files.get(i) ?? ""
+            i = i + 1
+            if file.ends_with(".toml") {
+                try! out.push(ImageAt(file: file, product: at.product))
+            }
+        }
+    }
+    return move out
+}
+
 /// Reads every board and every declaration of the tree at `sawos`, and holds
 /// each declaration to every board it runs on; refuses a declaration no board
 /// can run.
@@ -85,10 +144,11 @@ public func read_tree(sawos: String) -> Result<Tree, BuildError> {
         }
     }
     var processes = Vector<TreeProcess>()
-    let parents: Vector<String> = ["drivers", "tests"]
+    var parents: Vector<String> = ["{sawos}/drivers", "{sawos}/tests"]
+    try! parents.append(&product_roots(sawos))
     var p = 0
     while p < parents.len() {
-        let dirs = try listed("{sawos}/{parents.get(p) ?? ""}")
+        let dirs = try listed(parents.get(p) ?? "")
         p = p + 1
         var d = 0
         while d < dirs.len() {
@@ -106,7 +166,8 @@ public func read_tree(sawos: String) -> Result<Tree, BuildError> {
     return Tree(boards: move boards, processes: move processes)
 }
 
-/// Refuses an image under `tests/images/` whose board is none of `boards`.
+/// Refuses an image of the tree (`image_files`) whose board is none of
+/// `boards`.
 func images_on_boards(sawos: String, boards: &Vector<Board>) -> Result<Void, BuildError> {
     var names = Vector<String>()
     var b = 0
@@ -116,14 +177,11 @@ func images_on_boards(sawos: String, boards: &Vector<Board>) -> Result<Void, Bui
         }
         b = b + 1
     }
-    let images = try listed("{sawos}/tests/images")
+    let images = try image_files(sawos)
     var i = 0
     while i < images.len() {
-        let file = images.get(i) ?? ""
+        let file = (images.get(i)!).file
         i = i + 1
-        if not file.ends_with(".toml") {
-            continue
-        }
         let board = try image_board(try read_text(file), file)
         var known = false
         var n = 0
@@ -254,27 +312,29 @@ public func check_tree_board(tree: &Tree, sawos: String, board: &Board,
         }
         i = i + 1
     }
-    check_images(sawos, &board, grain)
+    let _ = try check_images(sawos, &board, grain)
+    return
 }
 
-/// Reads every image under `tests/images/` for `board` at its protection
-/// grain `grain`, binding a stock-root image's processes to their
-/// declarations.
+/// Reads every image of the tree (`image_files`) for `board` at its
+/// protection grain `grain`, binding a stock-root image's processes to their
+/// declarations, each package from its image's product root; answers the
+/// images it read.
 public func check_images(sawos: String, board: &Board,
-                         grain: UInt64) -> Result<Void, BuildError> {
-    let images = try listed("{sawos}/tests/images")
+                         grain: UInt64) -> Result<Vector<String>, BuildError> {
+    var read = Vector<String>()
+    let images = try image_files(sawos)
     var i = 0
     while i < images.len() {
-        let file = images.get(i) ?? ""
+        let at = images.get(i)!
+        let file = at.file
         i = i + 1
-        if not file.ends_with(".toml") {
-            continue
-        }
         let text = try read_text(file)
         if not (try image_board(text, file)).equals(board.name) {
             continue
         }
         let image = try ImageFile.parse(text, file, &board, grain)
+        try! read.push(file)
         if not image.stock {
             continue
         }
@@ -283,10 +343,10 @@ public func check_images(sawos: String, board: &Board,
         while k < image.processes.len() {
             let process = image.processes.get(k)!
             k = k + 1
-            let declared = "{package_dir(process.package, sawos, sawos)}/process.toml"
+            let declared = "{package_dir(process.package, sawos, at.product)}/process.toml"
             try! decls.push(try Declaration.parse(try read_text(declared), declared))
         }
         let _ = try bind(&image, &board, &decls, grain)
     }
-    return
+    return move read
 }
