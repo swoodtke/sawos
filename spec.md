@@ -4668,14 +4668,15 @@ reserved.
 - **The build types each row by its role.** The tree's stitcher
   (`tools/sos_runner.py`) writes, in this order, which root's config reads as
   tags: one image blob per child, one destination per child, then the RAM pool
-  if the case has one and the device window if it has one. It puts a pool row's
-  base on the protection grain (§2.5). A child's image blob and its destination
-  are allocations, because `process_create` takes allocations and a launcher
-  cannot allocate a blob from a pool: it would need the blob's length, which it
-  cannot read (§2.5) and which the build writes as a linker expression. The pool
-  row is a pool. A case that allocates from a blob or a destination types that
-  row as a pool instead. On the ESP32-S3 the blob rows lie in flash: an
-  allocation there is an image source and nothing else (a `map` of it is
+  if the case has one, the console's device window if it has one, then each
+  device row the case names, in its order, as the board states it. It puts a
+  pool row's base on the protection grain (§2.5). A child's image blob and its
+  destination are allocations, because `process_create` takes allocations and a
+  launcher cannot allocate a blob from a pool: it would need the blob's length,
+  which it cannot read (§2.5) and which the build writes as a linker expression.
+  The pool row is a pool. A case that allocates from a blob or a destination
+  types that row as a pool instead. On the ESP32-S3 the blob rows lie in flash:
+  an allocation there is an image source and nothing else (a `map` of it is
   `BadArg`, a destination `BadImage`, a donation `BadArg`, §2.5, §5.6, §2.8), a
   pool there allocates only such allocations, and the segments a child uses in
   place count on the image allocation they lie in (§2.5), so a launcher may

@@ -4,7 +4,7 @@
 
 import sosimage.build.{ensure_directory}
 import sosimage.failure.{BuildError}
-import sosimage.package.{ProcessSpec, manifest_script, package_name}
+import sosimage.package.{ProcessSpec, manifest_script, package_name, write_input}
 import sosimage.profile.{Profile}
 import sosimage.package.{build_process, Extras}
 import sosimage.layout.{Placement}
@@ -49,6 +49,16 @@ func main() {
     assert(slotted.placement.slot!.base == 0x18_0000 && slotted.placement.slot!.len == 0x2_0000,
            "the slot")
 
+    assert(spec.inputs.len() == 0, "no inputs")
+    let given = try! ProcessSpec.parse(text(", \"inputs\": [\{\"name\": \"a\", \"path\": \"/x/a.saw\"\}, \{\"name\": \"b\", \"path\": \"/x/b.saw\"\}]"), "c.json")
+    assert(given.inputs.len() == 2, "two inputs")
+    assert(given.inputs.get(0)!.name.equals("a") && given.inputs.get(0)!.path.equals("/x/a.saw") &&
+           given.inputs.get(1)!.name.equals("b") && given.inputs.get(1)!.path.equals("/x/b.saw"),
+           "each input's name and file, in order")
+    expect(refusal(text(", \"inputs\": [\{\"name\": \"a\"\}]")), "input 0 has no `path`")
+    expect(refusal(text(", \"inputs\": [\{\"name\": \"a\", \"path\": \"/x\", \"default\": 1\}]")),
+           "input 0 has unknown keys: `default`")
+
     expect(refusal(text("").replace("\"version\": 1", "\"version\": 2")),
            "the process c.json is version 2; this builder reads version 1")
     expect(refusal(text("").replace(", \"region\": \{\"base\": 2149842944, \"len\": 262144\}", "")),
@@ -76,6 +86,15 @@ func main() {
     let nameless: Vector<String> = ["[sos]"]
     try! write_lines("{dir}/Saw.toml", &nameless)
     expect(message(package_name(dir)), "{dir}/Saw.toml has no [package]")
+
+    // An input's file, written as the module of its name.
+    let config: Vector<String> = ["public static N: Int = 7"]
+    try! write_lines("{dir}/config.saw", &config)
+    let module = try! write_input(dir, "child0", "gpioconfig", "{dir}/config.saw")
+    assert(module.name.equals("gpioconfig"), "the module's name")
+    assert(module.dir.ends_with("/package/child0.inputs/gpioconfig"), "the module's directory")
+    let written = try! read_text("{module.dir}/lib.saw")
+    assert(written.equals("public static N: Int = 7\n"), "the module is the file")
 
     // A profile that names no Blade builds no process.
     let profile = try! Profile.parse("\{\"version\": 1, \"triple\": \"riscv32-unknown-none-elf\", \"word_bytes\": 4, \"sawc\": [\"/bin/sawc\"], \"clang\": \"/bin/clang\", \"lld\": \"/bin/ld.lld\", \"cc_args\": [], \"module_paths\": [], \"linker_script\": \"/virt.ld\"\}", "p.json")

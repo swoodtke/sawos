@@ -1,0 +1,207 @@
+// The GPIO and PWM drivers' configuration checks: one accepted configuration
+// of each, and each refusal by its value, with the count bounds at the
+// greatest frame.
+
+import esp32s3io.{ConfigError, GpioPin, PinMode, Servo, check_gpio_config, check_pwm_config}
+
+func gpio_refusal<const N: Int>(pins: &[GpioPin; N]) -> ConfigError? {
+    match check_gpio_config(&pins) {
+        case Ok(_) -> None,
+        case Err(e) -> e
+    }
+}
+
+func pwm_refusal<const N: Int>(frame_us: UInt32, servos: &[Servo; N]) -> ConfigError? {
+    match check_pwm_config(frame_us, &servos) {
+        case Ok(_) -> None,
+        case Err(e) -> e
+    }
+}
+
+func expect(what: String, got: ConfigError?, want: ConfigError?) {
+    if got != want {
+        let said = if let e = got { e.describe() } else { "accepted" }
+        print("{what}: {said}")
+    }
+    assert(got == want, what)
+}
+
+func expect_line(e: ConfigError, line: String) {
+    if not e.describe().equals(line) {
+        print("expected: {line}")
+        print("got:      {e.describe()}")
+    }
+    assert(e.describe().equals(line), line)
+}
+
+func input(pin: UInt8) -> GpioPin {
+    GpioPin(pin: pin, mode: PinMode.InputPullUp, level: 0)
+}
+
+func servo(channel: UInt8, pin: UInt8) -> Servo {
+    Servo(channel: channel, pin: pin, min_us: 500, max_us: 2500)
+}
+
+func main() {
+    // The GPIO smoke's configuration.
+    let smoke: [GpioPin; 5] = [
+        GpioPin(pin: 21, mode: PinMode.InputPullUp, level: 0),
+        GpioPin(pin: 14, mode: PinMode.InputPullDown, level: 0),
+        GpioPin(pin: 1, mode: PinMode.InputFloating, level: 0),
+        GpioPin(pin: 2, mode: PinMode.Output, level: 1),
+        GpioPin(pin: 47, mode: PinMode.OutputLoopback, level: 0)]
+    expect("the GPIO smoke's pins", gpio_refusal(&smoke), None)
+    // The part's edges, with pins no S3 board holds: GPIO 0, 18 and 21 beside
+    // the USB pair, 38 and 42 below the console, 45. 48 is the part's last
+    // GPIO; a board that holds a pin of the part says so itself.
+    expect("0, 18, 21, 38, 42, 45", gpio_refusal(&[input(0), input(18), input(21), input(38),
+                                                   input(42), input(45)]), None)
+    expect("48", gpio_refusal(&[input(48)]), None)
+
+    // Not a GPIO of the part: 22 to 25, and above 48.
+    expect("22", gpio_refusal(&[input(22)]), ConfigError.NotAGpio(pin: 22))
+    expect("25", gpio_refusal(&[input(25)]), ConfigError.NotAGpio(pin: 25))
+    expect("49", gpio_refusal(&[input(49)]), ConfigError.NotAGpio(pin: 49))
+    // The SPI flash bus, 26 to 32.
+    expect("26", gpio_refusal(&[input(26)]), ConfigError.FlashPin(pin: 26))
+    expect("30", gpio_refusal(&[input(30)]), ConfigError.FlashPin(pin: 30))
+    expect("32", gpio_refusal(&[input(32)]), ConfigError.FlashPin(pin: 32))
+    // The console's pads, and the USB-Serial-JTAG's.
+    expect("43", gpio_refusal(&[input(43)]), ConfigError.ConsolePin(pin: 43))
+    expect("44", gpio_refusal(&[input(44)]), ConfigError.ConsolePin(pin: 44))
+    expect("19", gpio_refusal(&[input(19)]), ConfigError.UsbPin(pin: 19))
+    expect("20", gpio_refusal(&[input(20)]), ConfigError.UsbPin(pin: 20))
+    // Every pin of a configuration is checked, the second as the first.
+    expect("21, then 30", gpio_refusal(&[input(21), input(30)]), ConfigError.FlashPin(pin: 30))
+    // A pin named twice, and an output's level other than 0 or 1.
+    expect("21 twice", gpio_refusal(&[input(21), input(14), input(21)]),
+           ConfigError.PinTwice(pin: 21))
+    expect("level 2", gpio_refusal(&[GpioPin(pin: 2, mode: PinMode.Output, level: 2)]),
+           ConfigError.BadLevel(pin: 2, level: 2))
+    expect("a loopback's level 2",
+           gpio_refusal(&[GpioPin(pin: 47, mode: PinMode.OutputLoopback, level: 2)]),
+           ConfigError.BadLevel(pin: 47, level: 2))
+    expect("an output's level 1", gpio_refusal(&[GpioPin(pin: 2, mode: PinMode.Output, level: 1)]),
+           None)
+    // An input's level is 0.
+    expect("an input's level 1",
+           gpio_refusal(&[GpioPin(pin: 21, mode: PinMode.InputPullUp, level: 1)]),
+           ConfigError.InputLevel(pin: 21, level: 1))
+    expect("a floating input's level 2",
+           gpio_refusal(&[GpioPin(pin: 1, mode: PinMode.InputFloating, level: 2)]),
+           ConfigError.InputLevel(pin: 1, level: 2))
+
+    // The PWM smoke's configuration, and the box's.
+    let pair: [Servo; 2] = [
+        Servo(channel: 0, pin: 41, min_us: 500, max_us: 2500),
+        Servo(channel: 1, pin: 42, min_us: 1000, max_us: 2000)]
+    expect("the PWM smoke's servos", pwm_refusal(20000, &pair), None)
+    expect("pins 1 and 2", pwm_refusal(20000, &[servo(3, 2), servo(5, 1)]), None)
+    expect("one servo", pwm_refusal(20000, &[servo(0, 47)]), None)
+    expect("four servos from 3", pwm_refusal(20000, &[servo(0, 3), servo(1, 4), servo(2, 5),
+                                                       servo(3, 6)]), None)
+    expect("the frame's bounds", pwm_refusal(416, &[Servo(channel: 0, pin: 41, min_us: 1,
+                                                            max_us: 415)]), None)
+
+    // The frame: its range, then a multiple of 8.
+    expect("frame 1000000", pwm_refusal(1_000_000, &pair),
+           ConfigError.FrameOutOfRange(frame_us: 1_000_000))
+    expect("frame 200008", pwm_refusal(200_008, &pair),
+           ConfigError.FrameOutOfRange(frame_us: 200_008))
+    expect("frame 408", pwm_refusal(408, &pair), ConfigError.FrameOutOfRange(frame_us: 408))
+    expect("frame 20004", pwm_refusal(20004, &pair),
+           ConfigError.FrameNotMultipleOf8(frame_us: 20004))
+    expect("frame 20008", pwm_refusal(20008, &pair), None)
+
+    // Channels: 0 to 7, each once.
+    expect("channel 8", pwm_refusal(20000, &[servo(8, 41), servo(1, 42)]),
+           ConfigError.ChannelOutOfRange(channel: 8))
+    expect("channel 0 twice", pwm_refusal(20000, &[servo(0, 41), servo(0, 42)]),
+           ConfigError.ChannelTwice(channel: 0))
+    expect("pin 41 twice", pwm_refusal(20000, &[servo(0, 41), servo(1, 41)]),
+           ConfigError.PinTwice(pin: 41))
+
+    // The pulse range, in microseconds.
+    expect("min above max", pwm_refusal(20000, &[Servo(channel: 0, pin: 41, min_us: 2000,
+                                                       max_us: 1000)]),
+           ConfigError.PulseRangeInverted(channel: 0))
+    expect("min at max", pwm_refusal(20000, &[Servo(channel: 0, pin: 41, min_us: 1500,
+                                                    max_us: 1500)]), None)
+    expect("max at the frame", pwm_refusal(20000, &[Servo(channel: 0, pin: 41, min_us: 500,
+                                                          max_us: 20000)]),
+           ConfigError.PulseNotBelowFrame(channel: 0))
+    // And in counts, at the greatest frame: 6 us is no counts and 7 is one;
+    // 199994 us is the whole frame and 199993 is one count short.
+    expect("min 6 us", pwm_refusal(200_000, &[Servo(channel: 0, pin: 41, min_us: 6,
+                                                   max_us: 1000)]),
+           ConfigError.MinPulseNoCounts(channel: 0))
+    expect("min 7 us", pwm_refusal(200_000, &[Servo(channel: 0, pin: 41, min_us: 7,
+                                                   max_us: 1000)]), None)
+    expect("max 199994 us", pwm_refusal(200_000, &[Servo(channel: 0, pin: 41, min_us: 7,
+                                                        max_us: 199_994)]),
+           ConfigError.MaxPulseWholeFrame(channel: 0))
+    expect("max 199993 us", pwm_refusal(200_000, &[Servo(channel: 0, pin: 41, min_us: 7,
+                                                        max_us: 199_993)]), None)
+
+    // Each pin as a GPIO's.
+    expect("servo pin 22", pwm_refusal(20000, &[servo(0, 22)]), ConfigError.NotAGpio(pin: 22))
+    expect("servo pin 30", pwm_refusal(20000, &[servo(0, 30)]), ConfigError.FlashPin(pin: 30))
+    expect("servo pin 43", pwm_refusal(20000, &[servo(0, 43)]), ConfigError.ConsolePin(pin: 43))
+    expect("servo pin 20", pwm_refusal(20000, &[servo(0, 20)]), ConfigError.UsbPin(pin: 20))
+
+    // One window: consecutive, a power of two, aligned. 47 and 14 are not
+    // consecutive; three are not a power of two; 42 and 43's registers
+    // straddle an 8-byte boundary.
+    expect("47 and 14", pwm_refusal(20000, &[servo(0, 47), servo(1, 14)]),
+           ConfigError.PinsNotConsecutive(pin: 47))
+    expect("39 and 41", pwm_refusal(20000, &[servo(0, 39), servo(1, 41)]),
+           ConfigError.PinsNotConsecutive(pin: 41))
+    expect("three servos", pwm_refusal(20000, &[servo(0, 1), servo(1, 2), servo(2, 3)]),
+           ConfigError.PinCountNotPowerOfTwo(count: 3))
+    let none: [Servo; 0] = []
+    expect("no servo", pwm_refusal(20000, &none), ConfigError.PinCountNotPowerOfTwo(count: 0))
+    expect("40 and 41", pwm_refusal(20000, &[servo(0, 40), servo(1, 41)]),
+           ConfigError.PinsNotAligned(pin: 40))
+    // Eight servos are one window in neither both blocks: pad 7's word is on
+    // a 32-byte boundary and its output select is not, and the other way
+    // round for pad 3.
+    expect("pins 7 to 14", pwm_refusal(20000, &[servo(0, 7), servo(1, 8), servo(2, 9),
+                                                 servo(3, 10), servo(4, 11), servo(5, 12),
+                                                 servo(6, 13), servo(7, 14)]),
+           ConfigError.PinsNotAligned(pin: 7))
+    expect("pins 3 to 10", pwm_refusal(20000, &[servo(0, 3), servo(1, 4), servo(2, 5),
+                                                 servo(3, 6), servo(4, 7), servo(5, 8),
+                                                 servo(6, 9), servo(7, 10)]),
+           ConfigError.PinsNotAligned(pin: 3))
+    expect("pins 2 to 5", pwm_refusal(20000, &[servo(0, 2), servo(1, 3), servo(2, 4),
+                                                servo(3, 5)]),
+           ConfigError.PinsNotAligned(pin: 2))
+
+    // Each refusal's line, as a driver prints it after `config refused: `.
+    expect_line(ConfigError.NotAGpio(pin: 22), "pin 22 is not a GPIO of the part")
+    expect_line(ConfigError.FlashPin(pin: 30), "pin 30 is held by the chip (the SPI flash bus)")
+    expect_line(ConfigError.ConsolePin(pin: 43), "pin 43 is held by the chip (the console)")
+    expect_line(ConfigError.UsbPin(pin: 19), "pin 19 is held by the chip (the USB-Serial-JTAG)")
+    expect_line(ConfigError.PinTwice(pin: 21), "pin 21 is named twice")
+    expect_line(ConfigError.BadLevel(pin: 2, level: 2), "pin 2's level is 2, not 0 or 1")
+    expect_line(ConfigError.InputLevel(pin: 21, level: 1),
+                "pin 21 is an input, and its level is 1, not 0")
+    expect_line(ConfigError.FrameOutOfRange(frame_us: 1_000_000),
+                "frame 1000000 us is outside 416..200000")
+    expect_line(ConfigError.FrameNotMultipleOf8(frame_us: 20004),
+                "frame 20004 us is not a multiple of 8")
+    expect_line(ConfigError.ChannelOutOfRange(channel: 8), "channel 8 is above 7")
+    expect_line(ConfigError.ChannelTwice(channel: 0), "channel 0 is named twice")
+    expect_line(ConfigError.PulseRangeInverted(channel: 0),
+                "channel 0's least pulse is above its greatest")
+    expect_line(ConfigError.PulseNotBelowFrame(channel: 0),
+                "channel 0's greatest pulse is not shorter than the frame")
+    expect_line(ConfigError.MinPulseNoCounts(channel: 0), "channel 0's least pulse is no counts")
+    expect_line(ConfigError.MaxPulseWholeFrame(channel: 0),
+                "channel 0's greatest pulse is the whole frame")
+    expect_line(ConfigError.PinsNotConsecutive(pin: 47),
+                "pin 47 is not consecutive with the other servos'")
+    expect_line(ConfigError.PinCountNotPowerOfTwo(count: 3), "3 servos are not a power of two")
+    expect_line(ConfigError.PinsNotAligned(pin: 40),
+                "the servo pins from 40 are not one aligned window")
+}

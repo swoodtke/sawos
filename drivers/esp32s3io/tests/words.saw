@@ -1,0 +1,118 @@
+// The words the drivers write and the registers they write them to, against
+// the part's numbers (hal/xtensa-esp32s3/ABI.md §9), and the PWM timer's
+// arithmetic.
+
+import esp32s3io.{
+    Block, PinMode, Register, divider, out_clear, out_sel_ledc, out_sel_register,
+    out_set, pad_register, pad_word, pin_bit, pin_cfg, pin_register, pulse_counts,
+    servo_pad_word,
+    channel_register, enable_clear, enable_set, status_clear, timer_word,
+    CH_DUTY_R, FRAME_MAX_US, IN, IN1, OUT_SEL_GPIO, OUT_SEL_RESET, PCPU_INT, PCPU_INT1,
+    TIMER0_VALUE,
+}
+
+func expect(what: String, got: UInt32, want: UInt32) {
+    if got != want {
+        print("{what}: got {got}, want {want}")
+    }
+    assert(got == want, what)
+}
+
+func main() {
+    // Each pad word: function 1, 20 mA, and the mode's input enable and pull.
+    expect("pull-up", pad_word(21, PinMode.InputPullUp), 0x1B00)
+    expect("pull-down", pad_word(14, PinMode.InputPullDown), 0x1A80)
+    expect("floating", pad_word(1, PinMode.InputFloating), 0x1A00)
+    expect("output", pad_word(2, PinMode.Output), 0x1800)
+    expect("loopback", pad_word(47, PinMode.OutputLoopback), 0x1A00)
+    expect("a servo pad", servo_pad_word(41), 0x1A00)
+    // Pads 16 and 19 drive as every pad does; on 17 and 18 the two drive
+    // bits are the other way round, so their ~20 mA is the field's 1.
+    expect("pad 16's output", pad_word(16, PinMode.Output), 0x1800)
+    expect("pad 17's output", pad_word(17, PinMode.Output), 0x1400)
+    expect("pad 18's pull-up", pad_word(18, PinMode.InputPullUp), 0x1700)
+    expect("pad 19's output", pad_word(19, PinMode.Output), 0x1800)
+    expect("pad 17 as a servo's", servo_pad_word(17), 0x1600)
+    expect("pad 18 as a servo's", servo_pad_word(18), 0x1600)
+    expect("pad 42 as a servo's", servo_pad_word(42), 0x1A00)
+
+    // `PINn`: an any-edge interrupt to the CPU for a pin that is read.
+    expect("an input's PIN", pin_cfg(PinMode.InputPullUp), 0x2180)
+    expect("a floating input's PIN", pin_cfg(PinMode.InputFloating), 0x2180)
+    expect("a pulled-down input's PIN", pin_cfg(PinMode.InputPullDown), 0x2180)
+    expect("a loopback's PIN", pin_cfg(PinMode.OutputLoopback), 0x2180)
+    expect("an output's PIN", pin_cfg(PinMode.Output), 0)
+
+    // Output selects: the reset word, a plain output, LEDC channels 0 and 7.
+    expect("the reset select", OUT_SEL_RESET, 0x100)
+    expect("a plain output's select", OUT_SEL_GPIO, 0x500)
+    expect("channel 0's select", out_sel_ledc(0), 0x449)
+    expect("channel 1's select", out_sel_ledc(1), 0x44A)
+    expect("channel 7's select", out_sel_ledc(7), 0x450)
+
+    // Each array element's address, for pins 0, 21, 31, 32 and 47.
+    expect("PIN0", pin_register(0).address(), 0x6000_4074)
+    expect("PIN21", pin_register(21).address(), 0x6000_40C8)
+    expect("PIN31", pin_register(31).address(), 0x6000_40F0)
+    expect("PIN32", pin_register(32).address(), 0x6000_40F4)
+    expect("PIN47", pin_register(47).address(), 0x6000_4130)
+    expect("FUNC0_OUT_SEL", out_sel_register(0).address(), 0x6000_4554)
+    expect("FUNC21_OUT_SEL", out_sel_register(21).address(), 0x6000_45A8)
+    expect("FUNC31_OUT_SEL", out_sel_register(31).address(), 0x6000_45D0)
+    expect("FUNC32_OUT_SEL", out_sel_register(32).address(), 0x6000_45D4)
+    expect("FUNC41_OUT_SEL", out_sel_register(41).address(), 0x6000_45F8)
+    expect("FUNC47_OUT_SEL", out_sel_register(47).address(), 0x6000_4610)
+    expect("pad 0", pad_register(0).address(), 0x6000_9004)
+    expect("pad 21", pad_register(21).address(), 0x6000_9058)
+    expect("pad 31", pad_register(31).address(), 0x6000_9080)
+    expect("pad 32", pad_register(32).address(), 0x6000_9084)
+    expect("pad 41", pad_register(41).address(), 0x6000_90A8)
+    expect("pad 47", pad_register(47).address(), 0x6000_90C0)
+
+    // The banked registers: pin 31 is bank 0's last bit, 32 bank 1's first.
+    expect("pin 31's bit", pin_bit(31), 0x8000_0000)
+    expect("pin 32's bit", pin_bit(32), 1)
+    expect("pin 47's bit", pin_bit(47), 0x8000)
+    expect("OUT_W1TS", out_set(31).address(), 0x6000_4008)
+    expect("OUT_W1TC", out_clear(31).address(), 0x6000_400C)
+    expect("OUT1_W1TS", out_set(32).address(), 0x6000_4014)
+    expect("OUT1_W1TC", out_clear(32).address(), 0x6000_4018)
+    expect("ENABLE_W1TS", enable_set(31).address(), 0x6000_4024)
+    expect("ENABLE_W1TC", enable_clear(31).address(), 0x6000_4028)
+    expect("ENABLE1_W1TS", enable_set(32).address(), 0x6000_4030)
+    expect("ENABLE1_W1TC", enable_clear(32).address(), 0x6000_4034)
+    expect("STATUS_W1TC", status_clear(31).address(), 0x6000_404C)
+    expect("STATUS1_W1TC", status_clear(32).address(), 0x6000_4058)
+    let gpio = Register(block: Block.Gpio, offset: 0)
+    expect("IN", gpio.address() + IN, 0x6000_403C)
+    expect("IN1", gpio.address() + IN1, 0x6000_4040)
+    expect("PCPU_INT", gpio.address() + PCPU_INT, 0x6000_405C)
+    expect("PCPU_INT1", gpio.address() + PCPU_INT1, 0x6000_4068)
+
+    // LEDC: channel 1's duty, channel 7's first word, the read-only words.
+    expect("CH1_DUTY", channel_register(1, 0x08).address(), 0x6001_901C)
+    expect("CH7_CONF0", channel_register(7, 0).address(), 0x6001_908C)
+    expect("CH0_DUTY_R", channel_register(0, CH_DUTY_R).address(), 0x6001_9010)
+    expect("TIMER0_VALUE", Register(block: Block.Ledc, offset: TIMER0_VALUE).address(),
+           0x6001_90A4)
+
+    // The timer: a 20 ms frame is a divider of exactly 12500/256.
+    expect("divider(20000)", divider(20000), 12500)
+    expect("timer_word(20000)", timer_word(20000), 0x0003_0D4E)
+    // The divider's range: 1.0 (256) at the least frame, and the greatest
+    // frame's inside the field's 18 bits.
+    expect("divider(416)", divider(416), 260)
+    expect("divider(FRAME_MAX_US)", divider(FRAME_MAX_US), 125_000)
+
+    // Pulses at 20 ms, rounded to the nearest count.
+    expect("500 us", pulse_counts(500, 20000), 410)
+    expect("1000 us", pulse_counts(1000, 20000), 819)
+    expect("1500 us", pulse_counts(1500, 20000), 1229)
+    // An exact half count rounds up: 1 us of a 32768 us frame is 0.5.
+    expect("half a count", pulse_counts(1, 32768), 1)
+    expect("2000 us", pulse_counts(2000, 20000), 1638)
+    expect("2500 us", pulse_counts(2500, 20000), 2048)
+    // The largest frame and pulse: the product stays inside 32 bits.
+    expect("199999 us of 200000", pulse_counts(199_999, FRAME_MAX_US), 16384)
+    expect("199993 us of 200000", pulse_counts(199_993, FRAME_MAX_US), 16383)
+}

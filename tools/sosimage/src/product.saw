@@ -59,7 +59,7 @@ import sosimage.build.{Linked, build_kernel, ensure_directory, link}
 import sosimage.flash.{load_segments}
 import sosimage.layout.{Ask, Placement, child_slots, choose_range, first_placement, place,
                         ram_span, region_align}
-import sosimage.package.{Extras, ModulePath, absolute, build_process, write_plan}
+import sosimage.package.{Extras, ModulePath, build_process, write_input, write_plan}
 import sosimage.plan.{ImagePlan, PlanSlabs, check_plan, plan_image, quota_of}
 import sosimage.declaration.{Declaration}
 import sosimage.failure.{BuildError}
@@ -73,7 +73,7 @@ import sosimage.kernel.{
 import sosimage.limits.{ImageLimits, plan_limits}
 import sosimage.profile.{Profile}
 import sosimage.regions.{BOOT_FLAG_NO_TICK, RegionKind}
-import sosimage.tool.{read_file, read_text, write_file}
+import sosimage.tool.{read_file, read_text}
 
 /// The board under `<sawos>/hal/` whose description names `name`.
 public func find_board(sawos: String, name: String) -> Result<Board, BuildError> {
@@ -433,13 +433,7 @@ public func process_extras(d: &Declaration, bound: &Bindings, board: &Board, pro
             continue
         }
         let from = input_path(value.source, value.path, d.dir, board.hal, sawos, product)
-        let dir = "{out}/{process}.inputs/{value.input}"
-        try ensure_directory(dir)
-        try write_file("{dir}/lib.saw", try read_file(from))
-        // Blade runs in the package's directory, so the module's is named
-        // whole.
-        try! modules.push(ModulePath(name: value.input,
-                                     dir: try absolute(dir, "the input's directory")))
+        try! modules.push(try write_input(out, process, value.input, from))
     }
     return Extras(arena: d.arena, modules: move modules)
 }

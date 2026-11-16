@@ -13,8 +13,8 @@
 //!     sosimage package PROFILE PROCESS
 //!         builds the package the process description PROCESS names, linked
 //!         for the placement it states, through a script the builder writes
-//!         (`sosimage.package`), with the stock root's plan it states, and
-//!         prints `image PATH`, the image it made
+//!         (`sosimage.package`), with the stock root's plan and the build
+//!         inputs it states, and prints `image PATH`, the image it made
 //!     sosimage slabs KERNEL
 //!         prints what the kernel object KERNEL says an image's limits are
 //!         sized and checked against (`sosimage.kernel`): for each slab kind
@@ -27,6 +27,14 @@
 //!         SAWOS) and holds it to PROFILE, to its linker script and to the
 //!         board's HAL, compiled in STAGING; `sosimage.boardcheck` lists
 //!         what is held. Prints nothing when they agree
+//!     sosimage devices BOARD
+//!         prints each device of the board description BOARD, in the file's
+//!         order, as `NAME type=TYPE base=BASE len=LEN line=LINE`, the line
+//!         `none` for a device with none (`sosimage.board.device_lines`)
+//!     sosimage declared PROCESS
+//!         prints the build inputs of the process declaration PROCESS (a
+//!         `process.toml`), one `input NAME` line each, in its order
+//!         (`sosimage.declaration.input_lines`)
 //!     sosimage defaults KERNEL BOARD
 //!         plans the board description BOARD's `[limits.default]` against
 //!         the kernel object KERNEL as an image that states no limits of its
@@ -59,10 +67,11 @@
 //! prints `error: ` and its reason on standard output and exits 1.
 
 import std.env.{Env}
-import sosimage.board.{Board}
+import sosimage.board.{Board, device_lines}
+import sosimage.declaration.{Declaration, input_lines}
 import sosimage.boardcheck.{check_board, hal_facts}
 import sosimage.build.{build_kernel, build_native, link}
-import sosimage.package.{Extras, ProcessSpec, build_process, write_plan}
+import sosimage.package.{Extras, ProcessSpec, build_process, write_input, write_plan}
 import sosimage.product.{board_defaults, build_image}
 import sosimage.failure.{BuildError}
 import sosimage.image.{ImageSpec}
@@ -129,6 +138,12 @@ func run() -> Result<Void, BuildError> {
         if let plan = spec.plan.take() {
             try! extras.modules.push(try write_plan(&plan, spec.out, spec.name, spec.name))
         }
+        var i = 0
+        while i < spec.inputs.len() {
+            let input = spec.inputs.get(i)!
+            try! extras.modules.push(try write_input(spec.out, spec.name, input.name, input.path))
+            i = i + 1
+        }
         let built = try build_process(&profile, spec.name, spec.package, spec.out, &spec.placement,
                                       &extras)
         print("image {built.image}")
@@ -140,6 +155,18 @@ func run() -> Result<Void, BuildError> {
         let board = try Board.parse(try read_text(path), path)
         let facts = try hal_facts(&profile, args.get(5) ?? "")
         return check_board(&board, &profile, &facts, args.get(3) ?? "")
+    }
+    if command.equals("devices") && args.len() == 3 {
+        let path = args.get(2) ?? ""
+        let board = try Board.parse(try read_text(path), path)
+        print_lines(&device_lines(&board))
+        return
+    }
+    if command.equals("declared") && args.len() == 3 {
+        let path = args.get(2) ?? ""
+        let declaration = try Declaration.parse(try read_text(path), path)
+        print_lines(&input_lines(&declaration))
+        return
     }
     if command.equals("defaults") && args.len() == 4 {
         let facts = try KernelFacts.read(args.get(2) ?? "")
@@ -171,15 +198,18 @@ func run() -> Result<Void, BuildError> {
         let hal = try hal_facts(&profile, args.get(6) ?? "")
         let tree = try read_tree(sawos)
         try check_tree_board(&tree, sawos, &board, &facts, hal.grain)
-        let lines = runs_on(&tree)
-        var i = 0
-        while i < lines.len() {
-            print(lines.get(i) ?? "")
-            i = i + 1
-        }
+        print_lines(&runs_on(&tree))
         return
     }
-    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | package PROFILE PROCESS | slabs KERNEL | board PROFILE SAWOS BOARD STAGING | defaults KERNEL BOARD | build PROFILE SAWOS PRODUCT IMAGE OUT | check-tree PROFILE SAWOS BOARD KERNEL STAGING")
+    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | package PROFILE PROCESS | slabs KERNEL | board PROFILE SAWOS BOARD STAGING | devices BOARD | declared PROCESS | defaults KERNEL BOARD | build PROFILE SAWOS PRODUCT IMAGE OUT | check-tree PROFILE SAWOS BOARD KERNEL STAGING")
+}
+
+func print_lines(lines: &Vector<String>) {
+    var i = 0
+    while i < lines.len() {
+        print(lines.get(i) ?? "")
+        i = i + 1
+    }
 }
 
 func load_profile(path: String) -> Result<Profile, BuildError> {

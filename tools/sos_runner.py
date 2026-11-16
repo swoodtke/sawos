@@ -198,6 +198,11 @@ STOCK_ROOT_PKG = os.path.join(REPO_ROOT, "root")
 # A stock root's child that carves its window until the kernel refuses
 # (`tests/stockkit`).
 STOCK_CARVER_PKG = os.path.join(TESTS_DIR, "stock-carver")
+# Stock-root children that print one word of a device's window under the
+# name their build input gives (`tests/stockkit`): the riscv32 `virt` board's
+# RTC, and the ESP32-S3's timer group 1.
+STOCK_GOLDFISH_PKG = os.path.join(TESTS_DIR, "stock-goldfish")
+STOCK_TIMG_PKG = os.path.join(TESTS_DIR, "stock-timg")
 FAULT_ROOT_PKG = os.path.join(TESTS_DIR, "faulting-root")
 # Thread and Process objects. Test processes reach the kernel through the `sos`
 # module and never through an op number.
@@ -1229,7 +1234,8 @@ STACK_LEN = 0x4000
 
 def _process_placement(arch, role):
     """Where a test image's process is linked: `role` is `root` (or
-    `root-<case>`, a stock root built with that case's plan) or `child<i>`.
+    `root-<case>`, a stock root built with that case's plan) or `child<i>`
+    (or `child<i>-<case>`, built with that case's inputs).
 
     Root's region is the HAL's; child i's is the i-th region from
     `child_region_base`, which the case's region table publishes as its
@@ -1241,7 +1247,7 @@ def _process_placement(arch, role):
         base, length = arch["root_region"]
         index = None
     else:
-        index = int(role[len("child"):])
+        index = int(role[len("child"):].split("-")[0])
         length = _child_region_len(arch)
         base = arch["child_region_base"] + index * length
     placement = {"region": {"base": base, "len": length}, "stack": STACK_LEN}
@@ -1260,21 +1266,151 @@ def _case_processes(case):
     """A case's processes as (package, role), root first: `root`, unless the
     case links root's package for another role (`root_link`) or hands the
     stock root a plan of its own (`root_plan`, as `root-<case>`), then
-    `child<i>` for each of its children."""
+    `child<i>` for each of its children, or `child<i>-<case>` for one built
+    with build inputs (`_resolve_case`), since the inputs are the case's."""
     out = []
     if case.get("root_plan") is not None:
         out.append((case["root_pkg"], f"root-{case['name']}"))
     elif case.get("root_pkg"):
         out.append((case["root_pkg"], case.get("root_link", "root")))
+    inputs = case.get("_inputs", {})
     for i, pkg in enumerate(case.get("children", ())):
-        out.append((pkg, f"child{i}"))
+        if inputs.get(i):
+            out.append((pkg, f"child{i}-{case['name']}"))
+        else:
+            out.append((pkg, f"child{i}"))
     return out
 
 
-def _build_process(packager, profile, arch, pkg, role, env, plan=None):
+def _case_builds(cases):
+    """What each role of the cases' processes is built with beyond its
+    placement: a stock root's plan (`root_plan`) and a child's build inputs
+    (`_resolve_case`), as `{role: (plan, inputs)}`."""
+    builds = {}
+    for case in cases:
+        if case.get("root_plan") is not None:
+            builds[f"root-{case['name']}"] = (case["root_plan"], None)
+        for i, inputs in case.get("_inputs", {}).items():
+            if inputs:
+                builds[f"child{i}-{case['name']}"] = (None, inputs)
+    return builds
+
+
+# What `sosimage devices` printed for each board file, and what `sosimage
+# declared` printed for each declaration, read once per run.
+_DEVICES = {}
+_DECLARED = {}
+_DESCRIBED_LOCK = threading.Lock()
+
+
+def _board_devices(packager, arch):
+    """The devices of the profile's board (`hal/<profile>/board.toml`), as
+    `sosimage devices` prints them: `{name: (base, len)}`, in the file's
+    order."""
+    board = os.path.join(HAL_DIR, arch["name"], "board.toml")
+    with _DESCRIBED_LOCK:
+        if board in _DEVICES:
+            return _DEVICES[board]
+    devices = {}
+    for line in _run_sosimage(packager, ["devices", board]).splitlines():
+        name, *fields = line.split()
+        values = dict(field.split("=", 1) for field in fields)
+        devices[name] = (int(values["base"], 16), int(values["len"], 16))
+    with _DESCRIBED_LOCK:
+        _DEVICES[board] = devices
+    return devices
+
+
+def _declared_inputs(packager, pkg):
+    """The build inputs the package `pkg`'s `process.toml` declares, as
+    `sosimage declared` prints them, in order; none for a package with no
+    declaration."""
+    declaration = os.path.join(pkg, "process.toml")
+    with _DESCRIBED_LOCK:
+        if declaration in _DECLARED:
+            return _DECLARED[declaration]
+    inputs = []
+    if os.path.exists(declaration):
+        for line in _run_sosimage(packager,
+                                  ["declared", declaration]).splitlines():
+            inputs.append(line.split()[1])
+    with _DESCRIBED_LOCK:
+        _DECLARED[declaration] = inputs
+    return inputs
+
+
+def _resolve_case(case, arch, packager):
+    """Read what a case's `devices` and `inputs` name, before anything of the
+    case is built; a refusal is the case's build error.
+
+    `devices` names devices of the profile's board, each a device row of the
+    case's region table (`_region_row_specs`); a name the board does not have
+    is refused. `inputs` maps a build input's name to a file, from the tree's
+    top: each child whose declaration lists the input is built with the file
+    as the module of its name (`sosimage package`). A case states every input
+    its children declare, a default included, so a child's input the case
+    does not give is refused; so is a file that does not exist, and an input
+    no child declares, which no build would read. Root takes none.
+    """
+    name = case["name"]
+    wanted = case.get("devices", ())
+    if wanted:
+        devices = _board_devices(packager, arch)
+        rows = []
+        for device in wanted:
+            if device not in devices:
+                raise ToolError(
+                    f"case {name!r}: `devices` names {device}, which the "
+                    f"{arch['name']} board does not have; its devices are "
+                    f"{', '.join(devices)}")
+            base, length = devices[device]
+            rows.append((device, base, length))
+        case.setdefault("_device_rows", {})[arch["name"]] = rows
+    given = case.get("inputs", {})
+    for input_name, path in given.items():
+        if not os.path.isfile(os.path.join(REPO_ROOT, path)):
+            raise ToolError(f"case {name!r}: the input {input_name} is "
+                            f"{path}, which is not a file in the tree")
+    used = set()
+    resolved = {}
+    for i, pkg in enumerate(case.get("children", ())):
+        inputs = []
+        for input_name in _declared_inputs(packager, pkg):
+            if input_name not in given:
+                raise ToolError(
+                    f"case {name!r}: child {i} "
+                    f"({os.path.relpath(pkg, REPO_ROOT)}) declares the input "
+                    f"{input_name}, which the case does not give")
+            used.add(input_name)
+            inputs.append({"name": input_name,
+                           "path": os.path.join(REPO_ROOT, given[input_name])})
+        resolved[i] = inputs
+    unused = [n for n in given if n not in used]
+    if unused:
+        raise ToolError(f"case {name!r} gives the input {unused[0]}, which "
+                        "no child declares")
+    case["_inputs"] = resolved
+
+
+def _resolve_cases(cases, arch, packager):
+    """`_resolve_case` for each case, before any is built: answers the
+    refusals by case name. A refused case's processes are not built."""
+    errors = {}
+    for case in cases:
+        try:
+            _resolve_case(case, arch, packager)
+        except ToolError as e:
+            errors[case["name"]] = e
+    return errors
+
+
+def _build_process(packager, profile, arch, pkg, role, env, plan=None,
+                   inputs=None):
     """Have the builder build the package `pkg` as the process `role` of a
     test image (`sosimage package`); return its image's path. `plan` is a
-    stock root's plan, which the builder writes as its `imageplan`.
+    stock root's plan, which the builder writes as its `imageplan`; `inputs`
+    are its build inputs, `[{"name": ..., "path": ...}]`, each file the
+    module of its name.
 
     Its outputs land under the package's `.build/<triple>/`: the process
     description `<role>.process.json`, the script `<role>.ld`, Blade's own
@@ -1286,6 +1422,8 @@ def _build_process(packager, profile, arch, pkg, role, env, plan=None):
                        **_process_placement(arch, role))
     if plan is not None:
         description["plan"] = plan
+    if inputs:
+        description["inputs"] = inputs
     path = os.path.join(out, f"{role}.process.json")
     _write_json(path, description)
     _run_sosimage(packager, ["package", profile, path], env=env)
@@ -1666,6 +1804,40 @@ def _stock_system(name):
 # What a stock root's client prints of the inlet it was given: every right of
 # `PipeInletRight`, held by the launch convention's mask or withheld.
 _STOCK_INLET = "SOS client: its inlet: Transfer yes, Mint no, Post yes, Wait no"
+
+
+def _stock_timg_plan(row, first=()):
+    """A stock root's plan on the ESP32-S3 whose timer group 1 is row `row`:
+    root makes the setup writes `first`, then writes the alarm word through
+    the row, then gives it whole to the child it starts."""
+    return {
+        "children": [{"name": "probe", "image": 0, "destination": 1,
+                      "start": 1,
+                      "records": [{"tag": 1, "source": "system"},
+                                  {"tag": 2, "source": "row", "from": row}]}],
+        "setup": [*first,
+                  {"register": "TIMG1.T0ALARMLO", "row": row, "offset": 16,
+                   "len": 4, "at": 0, "op": "write", "value": 4660}]}
+
+
+# `stock_plan_rows`' plan: timer group 1 is row 3, after the GPIO block,
+# whose pad 41 output select root first writes its reset word, through a
+# carve 0x5F8 bytes into the row.
+_STOCK_TIMG_PLAN = _stock_timg_plan(3, [
+    {"register": "GPIO.out_sel[41]", "row": 2, "offset": 0x5F8, "len": 4,
+     "at": 0, "op": "write", "value": 0x100}])
+
+# `stock_plan_rows` as a case the build refuses, which each refusal of its
+# `devices` and `inputs` overrides.
+_STOCK_TIMG_REFUSED = {
+    "src": os.path.join(KERNEL_DIR, "main.saw"),
+    "root_pkg": STOCK_ROOT_PKG,
+    "root_plan": _STOCK_TIMG_PLAN,
+    "children": [STOCK_TIMG_PKG],
+    "devices": ["GPIO", "TIMG1"],
+    "inputs": {"stockconfig": "tests/stock-timg/config/timer.saw"},
+    "expect_out": [],
+    "expect_clean_exit": False}
 
 
 # What a stock root's plan gives a child it only starts: its System record.
@@ -8408,6 +8580,36 @@ TEST_CASES = [
                 "root: the plan uses row 2 after giving it whole",
                 EXIT_PANIC, children=[CHILD_BYE_PKG], device=True),
     {
+        # The stock root on a plan of the case's own (`root_plan`), over rows
+        # the case names (`devices`): the console's UART, then the RTC, rows
+        # 2 and 3 after the child's blob and destination. Root writes the
+        # alarm's upper word through row 3 and gives the row whole to a child
+        # built with the case's input, which names it `alarm`; the child
+        # reads back the word root wrote. The ESP32-S3 smoke's case of this
+        # name holds each refusal of the two keys.
+        "name": "stock_plan_rows",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": STOCK_ROOT_PKG,
+        "root_plan": {
+            "children": [{"name": "probe", "image": 0, "destination": 1,
+                          "start": 1,
+                          "records": [{"tag": 1, "source": "system"},
+                                      {"tag": 2, "source": "row",
+                                       "from": 3}]}],
+            "setup": [{"register": "RTC.ALARM_HIGH", "row": 3, "offset": 12,
+                       "len": 4, "at": 0, "op": "write", "value": 4660}]},
+        "children": [STOCK_GOLDFISH_PKG],
+        "devices": ["UART0", "RTC"],
+        "inputs": {"stockconfig": "tests/images/stock/alarm-whole.saw"},
+        "expect_out": ["{banner}",
+                       "SOS alarm: record 2 IoMemory",
+                       _stock_system("alarm"),
+                       "SOS alarm: record 2 word 12 = 4660",
+                       "root: probe ended status=65536"],
+        "expect_clean_exit": True,
+    },
+    {
         # The money shot on riscv32. Read the transcript as an order:
         #
         #   read posted      root's `Read` is staged before the client process
@@ -11584,6 +11786,12 @@ def _region_row_specs(case, arch):
                              "page",
                      "kind": "device", "base": arch["device_base"],
                      "len": arch["device_len"]})
+    # `devices`: a row per device the case names, in its order, as the
+    # board states it (`_resolve_case`).
+    if case.get("devices"):
+        for device, base, length in case["_device_rows"][arch["name"]]:
+            rows.append({"what": f"the {device} window", "kind": "device",
+                         "base": base, "len": length})
     # `spare_rows`: that many rows of no bytes after the others, each a
     # handle in root's table, so a case can bring root's table to its edge
     # at a step of its choosing.
@@ -11946,6 +12154,10 @@ def _check_kernel_fp_free(elf, clang):
 
 SOSIMAGE_DIR = os.path.join(REPO_ROOT, "tools", "sosimage")
 
+# Packages whose own tests run on the host in a full run, beside the
+# builder's: `blade test` in each.
+HOSTED_TESTS = [os.path.join(DRIVERS_DIR, "esp32s3io")]
+
 # The link the builder's manifest reaches the sawlang checkout's packages
 # through: `imgformat = { path = "../../.sawlang/libs/imgformat" }`.
 SAWLANG_LINK = os.path.join(REPO_ROOT, ".sawlang")
@@ -12008,12 +12220,13 @@ def _build_sosimage(blade_bin):
 
 
 def _test_sosimage(blade_bin):
-    """`blade test` the image builder's own tests: its description readers'
-    refusals, the region table's bytes and the in-place check, which need no
-    emulator."""
+    """`blade test` the image builder's own tests (its description readers'
+    refusals, the region table's bytes and the in-place check) and each
+    package of `HOSTED_TESTS`, none of which needs an emulator."""
     env = dict(os.environ)
     env["SAWC"] = tc().sawc_env_value()
-    _run([blade_bin, "test"], cwd=SOSIMAGE_DIR, env=env)
+    for package in [SOSIMAGE_DIR, *HOSTED_TESTS]:
+        _run([blade_bin, "test"], cwd=package, env=env)
 
 
 def _run_sosimage(builder, args, env=None):
@@ -12686,9 +12899,14 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
         from_files[case["name"]] = _place_from_files(packager, profile, arch,
                                                      case, image,
                                                      _blade_env(clang))
+    # What each case's `devices` and `inputs` name, read before anything is
+    # built; a refused case builds nothing and reports the refusal.
+    refused = {}
+    if packager is not None:
+        refused = _resolve_cases(cases, arch, packager)
     processes = []
     for case in cases:
-        if case["name"] in from_files:
+        if case["name"] in from_files or case["name"] in refused:
             continue
         for process in _case_processes(case):
             if process not in processes:
@@ -12706,18 +12924,19 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
             if pkg not in packages:
                 packages.append(pkg)
         env = _blade_env(clang)
-        # A stock root's plan, by the role it is built as.
-        plans = {f"root-{case['name']}": case["root_plan"] for case in cases
-                 if case.get("root_plan") is not None}
+        # A stock root's plan and a child's inputs, by the role it is built
+        # as.
+        builds = _case_builds(cases)
 
         def build_pkg(pkg):
             built = []
             for owner, role in processes:
                 if owner != pkg:
                     continue
+                plan, inputs = builds.get(role, (None, None))
                 try:
                     image = _build_process(packager, profile, arch, pkg, role,
-                                           env, plans.get(role))
+                                           env, plan, inputs)
                 except ToolError as e:
                     return built, e
                 built.append((os.path.relpath(image, REPO_ROOT),
@@ -12739,7 +12958,7 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
         # one table every worker reads, so the only writes into them happen
         # here, where there is exactly one writer.
         for case in cases:
-            if case["name"] in from_files:
+            if case["name"] in from_files or case["name"] in refused:
                 continue
             images = [_process_image(pkg, role, arch)
                       for pkg, role in _case_processes(case)]
@@ -12790,6 +13009,8 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
         name = case["name"]
         refusal = case.get("expect_build_error")
         try:
+            if name in refused:
+                raise refused[name]
             placed = from_files.get(name)
             if placed is not None and placed["error"] is not None:
                 raise placed["error"]
@@ -14283,6 +14504,74 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            halt_pass],
             "expect_clean_exit": True,
         },
+        {
+            # The stock root on a plan of the case's own (`root_plan`), over
+            # rows the case names (`devices`): the GPIO block, then timer
+            # group 1, rows 2 and 3 after the child's blob and destination.
+            # Root writes a word past the GPIO row's first 256 bytes, which
+            # only the block's whole row holds, then the alarm word through
+            # row 3, and gives row 3 whole to a child built with the case's
+            # input, which names it `timer`; the child reads back the word
+            # root wrote. A row order other than the case's gives the child
+            # the GPIO block, whose words read 0 here.
+            "name": "stock_plan_rows",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": STOCK_ROOT_PKG,
+            "root_plan": _STOCK_TIMG_PLAN,
+            "children": [STOCK_TIMG_PKG],
+            "devices": ["GPIO", "TIMG1"],
+            "inputs": {"stockconfig": "tests/stock-timg/config/timer.saw"},
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={four}",
+                           "SOS timer: record 2 IoMemory",
+                           _stock_system("timer"),
+                           "SOS timer: record 2 word 16 = 4660",
+                           "root: probe ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The same child and plan over the one row, given the package's
+            # default as its input: the two cases' builds of the child are
+            # two images, each named for its case, so each prints its own
+            # name.
+            "name": "stock_plan_one_row",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": STOCK_ROOT_PKG,
+            "root_plan": _stock_timg_plan(2),
+            "children": [STOCK_TIMG_PKG],
+            "devices": ["TIMG1"],
+            "inputs": {"stockconfig": "tests/stock-timg/config/default.saw"},
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={three}",
+                           "SOS probe: record 2 IoMemory",
+                           _stock_system("probe"),
+                           "SOS probe: record 2 word 16 = 4660",
+                           "root: probe ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        # Each refusal of what a case's `devices` and `inputs` name, before
+        # anything of the case is built.
+        dict(_STOCK_TIMG_REFUSED, name="devices_unknown",
+             devices=["GPIO", "PWM"],
+             expect_build_error="case 'devices_unknown': `devices` names "
+                                "PWM, which the xtensa-esp32s3 board does "
+                                "not have; its devices are UART0, TIMG1, "
+                                "GPIO, IO_MUX, LEDC, SYSTEM"),
+        dict(_STOCK_TIMG_REFUSED, name="input_not_given", inputs={},
+             expect_build_error="case 'input_not_given': child 0 "
+                                "(tests/stock-timg) declares the input "
+                                "stockconfig, which the case does not give"),
+        dict(_STOCK_TIMG_REFUSED, name="input_not_declared",
+             inputs={"stockconfig": "tests/stock-timg/config/timer.saw",
+                     "timgconfig": "tests/stock-timg/config/timer.saw"},
+             expect_build_error="case 'input_not_declared' gives the input "
+                                "timgconfig, which no child declares"),
+        dict(_STOCK_TIMG_REFUSED, name="input_not_a_file",
+             inputs={"stockconfig": "tests/stock-timg/config/none.saw"},
+             expect_build_error="case 'input_not_a_file': the input "
+                                "stockconfig is "
+                                "tests/stock-timg/config/none.saw, which is "
+                                "not a file in the tree"),
     ]
     for case in process_cases:
         if case.get("tier", arch["tier"]) != arch["tier"]:
@@ -14400,16 +14689,24 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # (`_process_placement`). The images land under each package's
     # `.build/<triple>/`, so nothing collides with the gate's builds. The
     # profile is the first set of keys': a package's build reads no key.
+    # What each case's `devices` and `inputs` name, read before anything is
+    # built; a refused case builds nothing and reports the refusal. A stock
+    # root's plan and a child's inputs are the role's it is built as.
+    refused = _resolve_cases(process_cases, arch, packager)
+    builds = _case_builds(process_cases)
     processes = []
     for case in process_cases:
+        if case["name"] in refused:
+            continue
         for process in _case_processes(case):
             if process not in processes:
                 processes.append(process)
     try:
         env = _blade_env(clang, lld)
         for pkg, role in processes:
+            plan, inputs = builds.get(role, (None, None))
             image = _build_process(packager, profiles[keys_used[0]], arch,
-                                   pkg, role, env)
+                                   pkg, role, env, plan, inputs)
             print(f"  {os.path.relpath(image, REPO_ROOT)}  "
                   f"({os.path.getsize(image)} bytes)")
     except ToolError as e:
@@ -14418,7 +14715,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # The image descriptions read a case's images by arch name, as on the
     # gate.
     for case in process_cases:
-        if not case.get("root_pkg"):
+        if not case.get("root_pkg") or case["name"] in refused:
             continue
         images = [_process_image(pkg, role, arch)
                   for pkg, role in _case_processes(case)]
@@ -14470,6 +14767,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         """`build_flash`'s image, and the ELF it was made from."""
         name = case["name"]
         tag = "board" if board else "flash"
+        if name in refused:
+            raise refused[name]
         if case.get("read_only_probe"):
             check_read_only_probe(case["src"])
         if case.get("image_file"):
@@ -15783,8 +16082,8 @@ def main():
                 if not args.cases and not args.arch:
                     _test_sosimage(blade_bin)
         except ToolError as e:
-            print(f"{CROSS} failed to build or test the image builder"
-                  f"\n{e}", file=sys.stderr)
+            print(f"{CROSS} failed to build or test the image builder, or "
+                  f"to test a hosted package\n{e}", file=sys.stderr)
             sys.exit(1)
         if packages:
             print()

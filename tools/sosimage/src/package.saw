@@ -23,15 +23,17 @@
 //!       "region": {"base": 2149842944, "len": 262144},
 //!       "stack": 16384,
 //!       "slot": {"base": 1572864, "len": 131072},
-//!       "plan": {"children": [], "connections": 0}
+//!       "plan": {"children": [], "connections": 0},
+//!       "inputs": [{"name": "stockconfig", "path": "/path/to/config.saw"}]
 //!     }
 //!
 //! `slot` is an in-place board's, and absent on any other. `plan` is a stock
 //! root's: the builder writes it as the module `imageplan`
 //! (`sosimage.plan.plan_module`) into `OUT/NAME.imageplan/` and builds the
 //! package with it, unchecked, so a case can hand the stock root a plan the
-//! builder would refuse. Every other key is required, and an unknown key is
-//! refused.
+//! builder would refuse. `inputs` are the process's build inputs: each file is
+//! the module of its name (`write_input`). `plan` and `inputs` may be left
+//! out; every other key is required, and an unknown key is refused.
 
 import std.file.{File}
 import std.path.{Path}
@@ -55,6 +57,14 @@ public struct ProcessSpec {
     out: String
     placement: Placement
     plan: ImagePlan?
+    inputs: Vector<InputFile>
+}
+
+/// A build input a process description gives: the file that is the module
+/// `name`.
+public struct InputFile {
+    name: String
+    path: String
 }
 
 @synthesize
@@ -121,13 +131,23 @@ extension ProcessSpec {
         if var given = try top.object("plan", "the process's `plan`") {
             plan = try ImagePlan.read(&var given)
         }
+        var inputs = Vector<InputFile>()
+        var given = try top.objects_or_empty("inputs", "input")
+        var i = 0
+        while i < given.len() {
+            borrow var f = given[i] {
+                try! inputs.push(InputFile(name: try f.text("name"), path: try f.text("path")))
+                try f.finish()
+            }
+            i = i + 1
+        }
         try top.finish()
         if stack > region.len {
             return BuildError(message: "the process {origin}: its {stack}-byte stack is longer than its {region.len}-byte region")
         }
         return ProcessSpec(name: name, package: package, out: out,
                            placement: Placement(region: region, stack: stack, slot: slot),
-                           plan: move plan)
+                           plan: move plan, inputs: move inputs)
     }
 }
 
@@ -187,6 +207,17 @@ public func write_plan(plan: &ImagePlan, out: String, name: String,
     let lines = plan_module(&plan, image)
     try write_lines("{dir}/lib.saw", &lines)
     return ModulePath(name: "imageplan", dir: try absolute(dir, "the plan's directory"))
+}
+
+/// Writes the file `from` as the module `input` of the process `name`, into
+/// `OUT/NAME.inputs/INPUT/lib.saw`; answers the module's path.
+public func write_input(out: String, name: String, input: String,
+                        from: String) -> Result<ModulePath, BuildError> {
+    let dir = "{out}/{name}.inputs/{input}"
+    try ensure_directory(dir)
+    try write_file("{dir}/lib.saw", try read_file(from))
+    // Blade runs in the package's directory, so the module's is named whole.
+    return ModulePath(name: input, dir: try absolute(dir, "the input's directory"))
 }
 
 /// Builds the package in `package` as the process `name` placed at `p`, into

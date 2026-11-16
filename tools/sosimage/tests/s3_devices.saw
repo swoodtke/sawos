@@ -1,0 +1,71 @@
+// The ESP32-S3 board's GPIO, IO MUX, LEDC and SYSTEM, as the tree's
+// `board.toml` states them (hal/xtensa-esp32s3/ABI.md §9): each device's
+// window and line as `sosimage devices` prints them, and the address of each
+// register and part an image names for the GPIO and PWM drivers. The test
+// runs in the package's directory, two below the tree's top.
+
+import sosimage.board.{Board, RefUse, device_lines}
+import sosimage.rules.{parse_ref}
+import sosimage.tool.{read_text}
+import toml.{TomlPosition}
+
+func expect_window(b: &Board, reference: String, role: RefUse, base: UInt64, len: UInt64) {
+    let at = TomlPosition(line: 1, column: 1)
+    let r = try! parse_ref(reference, "i.toml", at)
+    let w = try! b.resolve(&r, role, 4, "i.toml", at)
+    if w.base != base || w.len != len {
+        print("{reference}: {w.base} for {w.len}")
+    }
+    assert(w.base == base && w.len == len, reference)
+}
+
+func resolves(b: &Board, reference: String) -> Bool {
+    let at = TomlPosition(line: 1, column: 1)
+    let r = try! parse_ref(reference, "i.toml", at)
+    match b.resolve(&r, RefUse.Setup, 4, "i.toml", at) {
+        case Ok(_) -> true,
+        case Err(_) -> false
+    }
+}
+
+func main() {
+    let file = "../../hal/xtensa-esp32s3/board.toml"
+    let b = try! Board.parse(try! read_text(file), file)
+
+    let printed = device_lines(&b)
+    let expected: Vector<String> = [
+        "UART0 type=esp32s3-uart base=0x60000000 len=0x1000 line=27",
+        "TIMG1 type=esp32s3-timg base=0x60020000 len=0x1000 line=none",
+        "GPIO type=esp32s3-gpio base=0x60004000 len=0x1000 line=16",
+        "IO_MUX type=esp32s3-io-mux base=0x60009000 len=0x1000 line=none",
+        "LEDC type=esp32s3-ledc base=0x60019000 len=0x1000 line=35",
+        "SYSTEM type=esp32s3-system base=0x600c0000 len=0x1000 line=none"]
+    if not printed.join("\n").equals(expected.join("\n")) {
+        print("got: {printed.join(" | ")}")
+    }
+    assert(printed.join("\n").equals(expected.join("\n")), "the board's devices")
+
+    // The setup writes the PWM path makes before any child starts.
+    expect_window(&b, "SYSTEM.PERIP_CLK_EN0", RefUse.Setup, 0x600C_0018, 4)
+    expect_window(&b, "SYSTEM.PERIP_RST_EN0", RefUse.Setup, 0x600C_0020, 4)
+    expect_window(&b, "GPIO.OUT_W1TC", RefUse.Setup, 0x6000_400C, 4)
+    expect_window(&b, "GPIO.OUT1_W1TC", RefUse.Setup, 0x6000_4018, 4)
+    expect_window(&b, "GPIO.ENABLE_W1TS", RefUse.Setup, 0x6000_4024, 4)
+    expect_window(&b, "GPIO.ENABLE1_W1TS", RefUse.Setup, 0x6000_4030, 4)
+
+    // The servo pads' parts: two output selects and two pad words.
+    expect_window(&b, "GPIO.out_sel[41..=42]", RefUse.Part, 0x6000_45F8, 8)
+    expect_window(&b, "IO_MUX.pad[41..=42]", RefUse.Part, 0x6000_90A8, 8)
+    // `BT_SELECT` (0x00) to `IN` (0x3C): both banks' levels and enables, in
+    // one part.
+    expect_window(&b, "GPIO.word[0..=15]", RefUse.Part, 0x6000_4000, 64)
+    // The last element of each array.
+    expect_window(&b, "GPIO.out_sel[53]", RefUse.Setup, 0x6000_4628, 4)
+    expect_window(&b, "IO_MUX.pad[48]", RefUse.Setup, 0x6000_90C4, 4)
+    expect_window(&b, "IO_MUX.pad[21]", RefUse.Setup, 0x6000_9058, 4)
+
+    // Past each array's end.
+    assert(not resolves(&b, "GPIO.out_sel[54]"), "54 pads have an output select")
+    assert(not resolves(&b, "IO_MUX.pad[49]"), "49 pads have an IO MUX word")
+    assert(not resolves(&b, "GPIO.word[16]"), "`word` is sixteen registers")
+}

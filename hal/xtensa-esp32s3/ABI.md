@@ -1296,19 +1296,241 @@ and the other `ATOMCTL` values, are unprobed on silicon.
 
 ## 9. GPIO, LEDC, the rest
 
+### 9a. On the emulator
+
 **GPIO** (`esp32.gpio`, 0x6000_4000) models one register. Probed:
 `GPIO_STRAP` (`+0x38`, esptool's `GPIO_STRAP_REG = 0x60004038`) reads
 `0x00000004`. Every other register tried reads 0 before and after a write:
 `ENABLE` (`+0x20`), `OUT` (`+0x04`), `OUT_W1TS`/`OUT_W1TC`, `IN`/`IN1`
 (`+0x3C`/`+0x40`), `PIN2` with a rising-edge interrupt enabled (`+0x7C`),
 `STATUS` (`+0x44`, still 0 after toggling the output), `FUNC2_OUT_SEL`
-(`+0x55C`). So an output write goes nowhere, an input reads 0, and no GPIO
-interrupt is raised. An LED cannot be observed under this emulator.
+(`+0x55C`). The second bank is the same: `OUT1` (`+0x10`) and `ENABLE1`
+(`+0x2C`) read 0 after a plain write of `0x600` and after the same word
+written to `OUT1_W1TS` (`+0x14`) or `ENABLE1_W1TS` (`+0x30`). So an output
+write goes nowhere, an input reads 0, no GPIO interrupt is raised, and no
+read of a level or an enable shows what was written to it. An LED cannot be
+observed under this emulator.
+
+**The IO MUX** (0x6000_9000), `PERIP_CLK_EN0` and `PERIP_RST_EN0` read 0
+before and after a write, as GPIO does.
 
 **LEDC** (silicon's PWM, 0x6001_9000) has no device: the address falls in
 `esp32s3.iomem`, `LEDC_CONF` (`+0xD0`) and `CH0_CONF0` (`+0x00`) drop writes
 and read 0, and `-d unimp,guest_errors` logs nothing for them. RMT is hidden
 the same way (§3). No PWM device exists here.
+
+### 9b. The blocks, and where each number is from
+
+Every number in 9b to 9f is from ESP-IDF's `soc` headers for the chip
+(`components/soc/esp32s3/`: `reg_base.h`, `gpio_reg.h`, `gpio_struct.h`,
+`gpio_sig_map.h`, `io_mux_reg.h`, `ledc_reg.h`, `ledc_struct.h`,
+`system_reg.h`, `rtc_io_reg.h`, `soc_caps.h`, `soc.h`; at v5.4.1 the register
+headers are under `register/soc/` and the interrupt sources in
+`interrupts.h`, at v5.1 all under `include/soc/` with the sources in
+`periph_defs.h`), from its HAL (`components/hal/esp32s3/include/hal/`:
+`gpio_ll.h`, `ledc_ll.h`, `clk_gate_ll.h`) and LEDC driver (`ledc.c`, under
+`components/esp_driver_ledc/src/` at v5.4.1 and `components/driver/ledc/` at
+v5.1), or from Espressif's `esp32s3.svd` for a field's meaning and reset
+value. Each was read at both tags, and they agree but where 9f says. The
+words "as the part leaves them" are §15c's.
+
+```
+block      base         registers used   the board's device
+GPIO       0x6000_4000  0x004..0x62B     GPIO, line 16
+IO MUX     0x6000_9000  0x004..0x0C7     IO_MUX
+LEDC       0x6001_9000  0x000..0x0D3     LEDC, line 35
+SYSTEM     0x600C_0000  0x018, 0x020     SYSTEM
+```
+
+Each is a 4 KiB window. The interrupt matrix's sources, counted from the
+header's enumeration: `ETS_GPIO_INTR_SOURCE` is 16, a level; LEDC's is 35.
+The same count gives UART0 27 and SYSTIMER target 0 57, the two §6c found by
+probing. SYSTEM's next block, SENSITIVE, is at 0x600C_1000; SYSTEM also holds
+the CPU's clock registers (§14).
+
+### 9c. The IO MUX
+
+Pad n's word is at `0x004 + 4n`, n 0 to 48; the header's named pads agree (1
+at 0x08, 14 at 0x3C, 21 at 0x58, 41 at 0xA8 `MTDI`, 42 at 0xAC `MTMS`, 47 at
+0xC0 `SPICLK_P`).
+
+```
+bit  15     FILTER_EN   filters pulses shorter than two cycles of a clock the
+                        header does not name: nanoseconds, not contact bounce
+bits 14:12  MCU_SEL     the pad's function; GPIO is function 1 on every pad
+                        (PIN_FUNC_GPIO); pads 19 and 20 want more (9d)
+bits 11:10  FUN_DRV     drive: 0 ~5 mA, 1 ~10 mA, 2 ~20 mA, 3 ~40 mA (SVD);
+                        on pads 17 and 18 the two bits are the other way
+                        round, 1 ~20 mA and 2 ~10 mA
+bit   9     FUN_IE      input enable
+bit   8     FUN_PU      pull-up
+bit   7     FUN_PD      pull-down
+bits  6:0   the sleep copies
+```
+
+The words a driver writes: an input with its pull-up `0x1B00`, with its
+pull-down `0x1A80`, floating `0x1A00`; an output `0x1800`; an output whose
+input is read back (a servo's pad, a loopback) `0x1A00`. Each is function 1,
+~20 mA. On pads 17 and 18 each has its two drive bits the other way round
+(an output `0x1400`, a servo's pad `0x1600`): v5.4.1's
+`gpio_ll_set_drive_capability` swaps them there ("DRV = 1 and DRV = 2
+register bits are flipped for IO17, IO18 on the target"); v5.1's does not.
+
+As the part leaves them: pad 14 `0x0A00` (function 0, IE, 20 mA, no pull),
+pad 21 `0x0800` (function 0, no IE), pads 41 and 42 `0x0A00` (function 0,
+which on these two is JTAG, IE, no pull), pad 47 `0x1A00` (function 1, IE).
+No pad read has a pull, and the SVD's single reset word for the array,
+`0x0B00`, is not what the part shows. Pads 14, 21, 41 and 42 are not GPIO
+until a driver writes `MCU_SEL` 1, and a line on 41 or 42 floats until then.
+
+GPIO 0 to 21 are also RTC pads. The part reads RTC pad 21's `MUX_SEL`
+(`RTC_IO_RTC_PAD21_REG` bit 19) as 0, so the digital IO MUX has the pad; the
+word is `0x5000_0000`, `DRV` 2 and `RDE` 1, the RTC side's pull-down at its
+default. The digital IO MUX's pulls are its own on this chip
+(`SOC_GPIO_SUPPORT_RTC_INDEPENDENT`), and ESP-IDF sets a digital pad's pulls
+through the IO MUX alone (`gpio_ll_pullup_en`). Whether `RDE` still loads the
+pad while `MUX_SEL` is 0 is not stated anywhere here.
+
+### 9d. GPIO
+
+```
+off    register             use
+0x004  OUT / 0x008 W1TS / 0x00C W1TC         output level, pins 0-31
+0x010  OUT1 / 0x014 W1TS / 0x018 W1TC        pins 32-53
+0x020  ENABLE / 0x024 W1TS / 0x028 W1TC      output enable, pins 0-31
+0x02C  ENABLE1 / 0x030 W1TS / 0x034 W1TC     pins 32-53
+0x038  STRAP                (read-only)
+0x03C  IN / 0x040 IN1       pad input, pins 0-31 and 32-53 (read-only)
+0x044  STATUS / 0x048 W1TS / 0x04C W1TC      interrupt status, pins 0-31
+0x050  STATUS1 / 0x054 W1TS / 0x058 W1TC     pins 32-53
+0x05C  PCPU_INT             status of pins enabled for the CPU, 0-31 (RO)
+0x068  PCPU_INT1            the same, 32-53 (RO)
+0x074  PINn                 0x074 + 4n: pin n's interrupt configuration
+0x554  FUNCn_OUT_SEL_CFG    0x554 + 4n, n 0-53: pad n's output signal
+0x62C  CLOCK_GATE           bit 0 the GPIO clock, reset 1
+```
+
+`PINn`: `INT_ENA` (bits 17:13), whose bit 13 is the CPU's interrupt and bit
+14 the CPU's NMI (`GPIO_LL_INTR_ENA`, `GPIO_LL_NMI_INTR_ENA`, bits 0 and 1 of
+the field, at both tags); `INT_TYPE` (bits 9:7), 0 off, 1 rising, 2 falling, 3
+any edge, 4 low level, 5 high level (`gpio_types.h`); `PAD_DRIVER` (bit 2),
+open drain. `PCPU_INT` and `PCPU_INT1` are both cores' status on this chip;
+`STATUS_W1TC` and `STATUS1_W1TC` clear it (`gpio_ll_clear_intr_status`). The
+source is the level `PCPU_INT & INT_ENA`, which falls when the status is
+cleared: the kernel's mask on delivery and rearm on ack (spec §9) serve it
+as they are.
+
+`FUNCn_OUT_SEL_CFG`, reset `0x100`: `OUT_SEL` (bits 8:0) the signal, 256 the
+plain GPIO signal (`OUT`/`ENABLE`); `OUT_INV_SEL` (bit 9); `OEN_SEL` (bit
+10), whose 1 takes the output enable from `ENABLE[n]` and whose 0 from the
+signal's peripheral (SVD); `OEN_INV_SEL` (bit 11). LEDC's channels 0 to 7
+are signals 73 to 80 (`LEDC_LS_SIG_OUT0_IDX`). So a plain output's select is
+`0x500`, LEDC channel 0's `0x449`. At function 1 with the select at `0x100`
+a pad is ESP-IDF's plain GPIO output: its data from `OUT`, its enable from
+`ENABLE` (`gpio_ll_output_enable` sets the `ENABLE` bit; the `0x100` is
+v5.1's `gpio_ll_output_disable`, and at v5.4.1 the same write is
+`gpio_ll_matrix_out_default`).
+
+The valid GPIOs are 0 to 48 but 22 to 25, and every one can drive
+(`SOC_GPIO_VALID_GPIO_MASK`, `SOC_GPIO_VALID_OUTPUT_GPIO_MASK`). 26 to 32 are
+the SPI bus the code runs from (`SPICS1`, `SPIHD`, `SPIWP`, `SPICS0`,
+`SPICLK`, `SPIQ`, `SPID`) and 43 and 44 UART0's (`U0TXD`, `U0RXD`), the
+console. GPIO 26 to 48 are powered from VDD_SPI.
+
+Pads 19 and 20 are the USB-Serial-JTAG's D- and D+
+(`USB_INT_PHY0_DM_GPIO_NUM`, `USB_INT_PHY0_DP_GPIO_NUM`). ESP-IDF's
+`gpio_ll_func_sel` clears `USB_SERIAL_JTAG_USB_PAD_ENABLE` before it selects a
+function on either, at v5.1 and at v5.4.1, and its `gpio_ll_pullup_dis`
+overrides pad 20's D+ pull-up. The drivers here write no USB_SERIAL_JTAG
+register, so they refuse 19 and 20 as held by the chip, as they do the
+console's pads, and the IO MUX word alone never configures either.
+
+**The order that drives no level nobody wrote.** A plain output: its enable
+cleared, its level, its output select, its IO MUX word, then its enable set.
+The select comes before the IO MUX word: with the enable clear and `OEN_SEL`
+1 the select drives nothing, while a pad given function 1 under another
+select would. A pad routed to a peripheral: its select to `0x100`, its IO
+MUX word, then its select to the signal. ESP-IDF writes the IO MUX function
+first: v5.1's `ledc_set_pin` selects the GPIO function, sets the direction
+(`gpio_set_direction`, whose `gpio_output_enable` connects
+`SIG_GPIO_OUT_IDX`), then connects the signal; v5.4.1's `_ledc_set_pin`
+selects the function, reserves the pin (`esp_gpio_reserve`), then connects
+the signal. The signal last is ESP-IDF's order; the select to `0x100` first
+is this tree's, for the plain output's reason: `gpio_ll_iomux_out` writes
+`OEN_SEL` for a pad in another function, so the enable select is live for a
+pad that is not yet GPIO, and a pad given function 1 under a select left by
+an earlier run could drive.
+
+### 9e. LEDC, and its clock
+
+LEDC has low-speed mode only: 8 channels, 4 timers, a 14-bit counter
+(`SOC_LEDC_CHANNEL_NUM`, `SOC_LEDC_TIMER_BIT_WIDTH`,
+`SOC_LEDC_SUPPORT_XTAL_CLOCK`).
+
+```
+off           register         fields
+0x00 + 0x14c  CHc_CONF0        1:0 TIMER_SEL, 2 SIG_OUT_EN, 3 IDLE_LV,
+                               4 PARA_UP (write-only)
+0x04 + 0x14c  CHc_HPOINT       13:0
+0x08 + 0x14c  CHc_DUTY         18:0; the low 4 bits are a fraction
+0x0C + 0x14c  CHc_CONF1        31 DUTY_START, 30 DUTY_INC, 29:20 DUTY_NUM,
+                               19:10 DUTY_CYCLE, 9:0 DUTY_SCALE
+0x10 + 0x14c  CHc_DUTY_R       18:0 the duty in force (read-only)
+0xA0 + 8t     TIMERt_CONF      3:0 DUTY_RES, 21:4 CLK_DIV (10.8 fixed
+                               point), 22 PAUSE, 23 RST (resets to 1),
+                               24 TICK_SEL, 25 PARA_UP (write-only)
+0xA4 + 8t     TIMERt_VALUE     13:0 the counter (read-only)
+0xD0          CONF             1:0 APB_CLK_SEL, 31 CLK_EN
+```
+
+Channel 8's `CONF0` slot would be `TIMER0_CONF`, so a channel is checked
+before an address is formed from it. `APB_CLK_SEL` selects every timer's
+clock: 1 APB_CLK, 2 RC_FAST_CLK, 3 XTAL_CLK; its reset 0 selects nothing, and
+ESP-IDF selects one before it touches a channel (`ledc.c`). `TICK_SEL` 0 is
+that clock. `IDLE_LV` is the output while `SIG_OUT_EN` is 0, and is not
+among the fields `PARA_UP` latches (SVD). A fixed duty
+(`ledc_set_duty_with_hpoint`, `_ledc_update_duty`) is `HPOINT`, `DUTY` =
+counts << 4, `CONF1` = `0xC010_0400`, then `CONF0` with `SIG_OUT_EN |
+PARA_UP`; a stop (`ledc_stop`) is `CONF1` with `DUTY_START` clear and `CONF0`
+with `SIG_OUT_EN` clear and `PARA_UP`. A new setting takes effect at the next
+PWM cycle, so an update never cuts a pulse short.
+
+**The clock.** XTAL_CLK is the 40 MHz crystal (`XTAL_CLK_FREQ`; esptool
+reported a 40 MHz crystal on the part), and it reaches the peripherals
+undivided under every clock key: UART0 runs from it at the ROM's divisor
+under `rom`, `xtal40` and `pll80` alike, and SYSTIMER counts it at 16 MHz
+(§14). APB follows the CPU's clock (20, 40 or 80 MHz by key), so a divider
+computed on APB would change the frame with the key. On XTAL_CLK, 14 bits
+and a frame of F us, the divider field is `F * 5 / 8`: 12500 for 20 ms,
+exactly. The field runs from 256 (1.0) to 0x3FFFF, a frame of 409.6 us to
+419 428 us. LEDC on XTAL_CLK while APB runs at 20 MHz (`rom`) is a
+combination ESP-IDF never runs; no source forbids it.
+
+**SYSTEM's gate.** `PERIP_CLK_EN0` (0x018) bit 11 is `LEDC_CLK_EN` and
+`PERIP_RST_EN0` (0x020) bit 11 `LEDC_RST`: enabling LEDC is setting the
+first and clearing the second (`periph_module_enable`, `clk_gate_ll.h`). The
+part reads `0xf9c1e06f` and `0x00000000`: LEDC gated, as the SVD's reset
+value says, and not held in reset. Both words gate every peripheral on the
+chip (bit 1 the flash's SPI, bit 2 UART0, bit 29 SYSTIMER), so a set or a
+clear of one bit reads the word first; a plain store would turn the flash,
+the console and the tick off.
+
+### 9f. What rests on one source
+
+- **The SVD alone:** the drive strengths, but for pads 17 and 18's swapped
+  bits, which are v5.4.1's HAL alone (9c);
+  the meaning of `OEN_SEL`, `IDLE_LV`, `CLK_EN` and `TICK_SEL`; which fields
+  `PARA_UP` latches. The SVD's `PERIP_CLK_EN0` reset value is confirmed on
+  the part; its IO MUX reset value is contradicted by the part for every pad
+  read.
+- **ESP-IDF's HAL alone:** the `INT_TYPE` values, the LEDC sequences, and
+  that a plain output's enable is `ENABLE[n]` with its select at `0x100`.
+  The function that writes the `0x100` differs by tag (9d).
+- **Header defaults not read on the part:** `OUT1` and `ENABLE` reset to 0.
+- **No source:** whether LEDC drives the peripheral output enable that
+  `OEN_SEL` 0 selects; what a pad in function 0 drives on 41 and 42; which
+  clock `FILTER_EN` counts; whether RTC pad 21's `RDE` loads the pad while
+  the digital IO MUX has it.
 
 ---
 
@@ -2504,9 +2726,11 @@ prints every word it does not assert.
 
 ### 15c. On the part
 
-The cells are empty until a board run fills them. The clock words are in
-§14h and are not repeated here; this run's `sysclk`, `cpu_per`,
-`core_clk_sel` and `spi1 clock` should agree with them.
+A cell is empty until a board run fills it. The filled cells are a run on
+an ESP32-S3 rev v0.2 whose ROM is `esp32s3-20210327`; the pad words are
+decoded in §9c. The clock words are in §14h and are not repeated here; a
+run's `sysclk`, `cpu_per`, `core_clk_sel` and `spi1 clock` should agree with
+them.
 
 | word | part |
 |---|---|
@@ -2514,7 +2738,7 @@ The cells are empty until a board run fills them. The clock words are in
 | `PSRAM_CAP`, `PSRAM_VENDOR` | |
 | `strap`, `sdio_conf` | |
 | `sysclk`, `cpu_per`, `core_clk_sel` | |
-| `perip_clk_en0`, `perip_rst_en0` | |
+| `perip_clk_en0`, `perip_rst_en0` | `0xf9c1e06f`, `0x00000000` |
 | `spi0 clock`, `sram_clk`, `ctrl`, `user`, `user1`, `user2`, `misc` | |
 | `spi0 fctrl`, `sctrl`, `sram_cmd`, `drd`, `dwr` | |
 | `spi0 ddr`, `smem_ddr`, `smem_ac`, `date` | |
@@ -2522,11 +2746,11 @@ The cells are empty until a board run fills them. The clock words are in
 | `spi1 misc`, `fctrl`, `ddr`, `cmd` | |
 | `dcache_ctrl`, `dcache_ctrl1`, `dcache_autoload`, `icache_ctrl` | |
 | `mmu` 0, 32, 127, 128, 255, 256, 383, 511 | |
-| `iomux pin_ctrl`, pads 14, 21 | |
+| `iomux pin_ctrl`, pads 14, 21 | `0x0000a7ff`, `0x00000a00`, `0x00000800` |
 | `iomux` pads 26 to 32 (CS1, then the flash's) | |
 | `iomux` pads 33 to 37 (the PSRAM's D4 to D7, DQS) | |
-| `iomux` pads 41, 42, 47 | |
+| `iomux` pads 41, 42, 47 | `0x00000a00`, `0x00000a00`, `0x00001a00` |
 | `insel` 7 to 11 | |
 | `pad_hold`, `ace0` | |
-| `rtc_pad21`, `rtc_pad21_mux_sel` | |
+| `rtc_pad21`, `rtc_pad21_mux_sel` | `0x50000000`, `0x00000000` |
 | `rom_dummy_ptr`, `rom_dummy_spi0`, `rom_dummy_spi1` | |

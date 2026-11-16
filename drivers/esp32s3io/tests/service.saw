@@ -1,0 +1,118 @@
+// The GPIO interrupt service's order through fake ports: which pins fired,
+// a clear of exactly those, the levels, then the acknowledgement, and the held
+// waits it answers; and, through a port where an edge lands just after the
+// clear, that the levels it answers by are read after the clear.
+
+import esp32s3io.{GpioPort, PinSet, PinWait, MAX_HELD, service_interrupt}
+
+// Reports `fired` and `levels`, and records each call.
+struct Recording {
+    fired: PinSet
+    levels: PinSet
+    calls: Vector<String>
+}
+
+extension Recording: NoCopy {}
+
+extension Recording: GpioPort {
+    func pcpu_int(&var self) -> PinSet {
+        try! self.calls.push("pcpu_int")
+        self.fired
+    }
+
+    func clear_status(&var self, fired: PinSet) {
+        try! self.calls.push("clear_status {fired.low} {fired.high}")
+    }
+
+    func levels(&var self) -> PinSet {
+        try! self.calls.push("levels")
+        self.levels
+    }
+
+    func ack(&var self) {
+        try! self.calls.push("ack")
+    }
+}
+
+// Pin 21 has fired, reading 1; the clear is followed at once by an edge to
+// 0, which sets its status again.
+struct EdgeAfterClear {
+    status: PinSet
+    pad: PinSet
+}
+
+extension EdgeAfterClear: GpioPort {
+    func pcpu_int(&var self) -> PinSet {
+        self.status
+    }
+
+    func clear_status(&var self, fired: PinSet) {
+        self.status = PinSet(low: self.status.low & ~fired.low,
+                             high: self.status.high & ~fired.high)
+        self.pad = PinSet(low: self.pad.low & ~(1u32 << 21), high: self.pad.high)
+        self.status = PinSet(low: self.status.low | (1u32 << 21), high: self.status.high)
+    }
+
+    func levels(&var self) -> PinSet {
+        self.pad
+    }
+
+    func ack(&var self) {}
+}
+
+func main() {
+    // A set with a pin in one bank alone is not empty, and pin 31 is the
+    // first bank's last, 32 the second's first.
+    assert(not PinSet(low: 1 << 31, high: 0).is_empty(), "a pin of bank 0 alone")
+    assert(not PinSet(low: 0, high: 1).is_empty(), "a pin of bank 1 alone")
+    assert(PinSet.empty().is_empty(), "no pin")
+    assert(PinSet(low: 1 << 31, high: 0).level(31) == 1, "pin 31 is in bank 0")
+    assert(PinSet(low: 1 << 31, high: 0).level(32) == 0, "pin 32 is not")
+    assert(PinSet(low: 0, high: 1).level(32) == 1, "pin 32 is bank 1's first")
+
+
+    // Pins 21 (bank 0) and 47 (bank 1, bit 15) have fired; 21 reads 0 and
+    // 47 reads 1. Held: 21 for 0, nothing, 47 for 0, 47 for 1.
+    var port = Recording(fired: PinSet(low: 1 << 21, high: 1 << 15),
+                         levels: PinSet(low: 0, high: 1 << 15), calls: Vector<String>())
+    let held: [PinWait?; MAX_HELD] = [PinWait(pin: 21, level: 0), None,
+                                      PinWait(pin: 47, level: 0), PinWait(pin: 47, level: 1)]
+    let s = service_interrupt(&var port, &held)
+    let calls = port.calls.join(", ")
+    if not calls.equals("pcpu_int, clear_status 2097152 32768, levels, ack") {
+        print("calls: {calls}")
+    }
+    assert(calls.equals("pcpu_int, clear_status 2097152 32768, levels, ack"),
+           "the fired pins, a clear of exactly them, the levels, then the ack")
+    assert(s.fired, "a pin fired")
+    assert(s.answered[0], "21 reads 0")
+    assert(not s.answered[1], "an empty slot answers nothing")
+    assert(not s.answered[2], "47 does not read 0")
+    assert(s.answered[3], "47 reads 1")
+    assert(s.levels == PinSet(low: 0, high: 1 << 15), "the levels read")
+
+    // Nothing fired: no fire is counted, and a held wait whose pin reads its
+    // level is still answered.
+    var quiet = Recording(fired: PinSet.empty(), levels: PinSet.empty(), calls: Vector<String>())
+    let one: [PinWait?; MAX_HELD] = [None, None, None, PinWait(pin: 2, level: 0)]
+    let q = service_interrupt(&var quiet, &one)
+    assert(not q.fired, "no pin fired")
+    assert(q.answered[3], "2 reads 0")
+
+    // A fire in one bank alone is a fire, in either bank.
+    var low_bank = Recording(fired: PinSet(low: 1 << 21, high: 0), levels: PinSet.empty(),
+                             calls: Vector<String>())
+    assert(service_interrupt(&var low_bank, &one).fired, "a fire in bank 0 alone")
+    var high_bank = Recording(fired: PinSet(low: 0, high: 1 << 15), levels: PinSet.empty(),
+                              calls: Vector<String>())
+    assert(service_interrupt(&var high_bank, &one).fired, "a fire in bank 1 alone")
+
+    // An edge just after the clear: the levels the waits are answered by are
+    // the edge's, and its status is left set, to fire again after the ack.
+    var edge = EdgeAfterClear(status: PinSet(low: 1 << 21, high: 0),
+                              pad: PinSet(low: 1 << 21, high: 0))
+    let low: [PinWait?; MAX_HELD] = [PinWait(pin: 21, level: 0), None, None, None]
+    let e = service_interrupt(&var edge, &low)
+    assert(e.answered[0], "the levels were read after the clear")
+    assert(edge.status.level(21) == 1, "the edge after the clear is still pending")
+}

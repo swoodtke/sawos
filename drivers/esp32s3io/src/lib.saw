@@ -1,0 +1,648 @@
+//! The ESP32-S3's GPIO, IO MUX and LEDC as the GPIO and PWM drivers use them.
+//!
+//! Every number here is the part's, with its source in
+//! `hal/xtensa-esp32s3/ABI.md` §9: the blocks' bases, the registers' offsets,
+//! the signals, and the words the drivers write. Beside them are the checks a
+//! driver runs on its configuration before it maps anything, and the orders
+//! the GPIO start, the PWM start, `Set`, `Stop` and the GPIO interrupt service
+//! follow, each written once over a port (`RegisterPort`, `GpioPort`) so a
+//! driver writes its registers through it and a hosted test records them.
+//!
+//! A driver holds its blocks as mapped windows, whose bases are its own; a
+//! `Register` names a register by its block and its offset in it, and its
+//! `address` is the part's, which is what a driver's log and the tests show.
+
+/// The GPIO block: pad levels, output enables, interrupts and the output
+/// matrix.
+public static GPIO_BASE: UInt32 = 0x6000_4000
+/// The IO MUX: each pad's function, pulls, input enable and drive.
+public static IO_MUX_BASE: UInt32 = 0x6000_9000
+/// LEDC, the PWM block.
+public static LEDC_BASE: UInt32 = 0x6001_9000
+
+/// The block a register is in.
+public enum Block {
+    case Gpio,
+    case IoMux,
+    case Ledc
+}
+
+@synthesize
+extension Block: Equatable {}
+
+/// A register: its block, and its offset in the block.
+public struct Register {
+    block: Block
+    offset: UInt32
+}
+
+@synthesize
+extension Register: Equatable {}
+
+extension Register {
+    /// The register's address on the part.
+    public func address(&self) -> UInt32 {
+        let base = match self.block {
+            case Gpio -> GPIO_BASE,
+            case IoMux -> IO_MUX_BASE,
+            case Ledc -> LEDC_BASE
+        }
+        base + self.offset
+    }
+}
+
+// GPIO's registers. Pins 0 to 31 are bank 0, `OUT`, `ENABLE`, `STATUS` and
+// `IN`; pins 32 to 53 are bank 1, the `1` forms; a pin's bit is its number
+// modulo 32. The W1TS and W1TC forms set and clear the bits written.
+static OUT_W1TS: UInt32 = 0x008
+static OUT_W1TC: UInt32 = 0x00C
+static OUT1_W1TS: UInt32 = 0x014
+static OUT1_W1TC: UInt32 = 0x018
+static ENABLE_W1TS: UInt32 = 0x024
+static ENABLE_W1TC: UInt32 = 0x028
+static ENABLE1_W1TS: UInt32 = 0x030
+static ENABLE1_W1TC: UInt32 = 0x034
+static STATUS_W1TC: UInt32 = 0x04C
+static STATUS1_W1TC: UInt32 = 0x058
+/// Pad input levels, pins 0 to 31 (read-only).
+public static IN: UInt32 = 0x03C
+/// Pad input levels, pins 32 to 53 (read-only).
+public static IN1: UInt32 = 0x040
+/// Interrupt status of the pins enabled for the CPU, 0 to 31 (read-only).
+public static PCPU_INT: UInt32 = 0x05C
+/// The same for 32 to 53.
+public static PCPU_INT1: UInt32 = 0x068
+// `PINn`, pin n's interrupt configuration, at 0x074 + 4n.
+static PIN0: UInt32 = 0x074
+// `FUNCn_OUT_SEL_CFG`, pad n's output signal, at 0x554 + 4n.
+static FUNC0_OUT_SEL: UInt32 = 0x554
+// IO MUX pad n's word at 0x004 + 4n.
+static PAD0: UInt32 = 0x004
+
+/// Pin `pin`'s bit in its bank's registers.
+public func pin_bit(pin: UInt8) -> UInt32 {
+    1u32 << ((pin % 32) as UInt32)
+}
+
+func banked(pin: UInt8, low: UInt32, high: UInt32) -> Register {
+    Register(block: Block.Gpio, offset: if pin < 32 { low } else { high })
+}
+
+/// The register that sets `pin`'s output level to 1 (`OUT_W1TS`/`OUT1_W1TS`).
+public func out_set(pin: UInt8) -> Register { banked(pin, OUT_W1TS, OUT1_W1TS) }
+/// The register that sets it to 0.
+public func out_clear(pin: UInt8) -> Register { banked(pin, OUT_W1TC, OUT1_W1TC) }
+/// The register that enables `pin`'s output.
+public func enable_set(pin: UInt8) -> Register { banked(pin, ENABLE_W1TS, ENABLE1_W1TS) }
+/// The register that disables it.
+public func enable_clear(pin: UInt8) -> Register { banked(pin, ENABLE_W1TC, ENABLE1_W1TC) }
+/// The register that clears `pin`'s interrupt status.
+public func status_clear(pin: UInt8) -> Register { banked(pin, STATUS_W1TC, STATUS1_W1TC) }
+
+/// `PINn`: pin `pin`'s interrupt configuration.
+public func pin_register(pin: UInt8) -> Register {
+    Register(block: Block.Gpio, offset: PIN0 + 4 * (pin as UInt32))
+}
+
+/// `FUNCn_OUT_SEL_CFG`: pad `pin`'s output signal.
+public func out_sel_register(pin: UInt8) -> Register {
+    Register(block: Block.Gpio, offset: FUNC0_OUT_SEL + 4 * (pin as UInt32))
+}
+
+/// Pad `pin`'s IO MUX word.
+public func pad_register(pin: UInt8) -> Register {
+    Register(block: Block.IoMux, offset: PAD0 + 4 * (pin as UInt32))
+}
+
+// The IO MUX word's fields.
+static MCU_SEL_GPIO: UInt32 = 1 << 12     // function 1, GPIO, on every pad
+static FUN_DRV_20MA: UInt32 = 2 << 10
+// Pads 17 and 18 have the two `FUN_DRV` bits the other way round, so their
+// ~20 mA is the field's 1 (ABI.md §9c).
+static FUN_DRV_20MA_SWAPPED: UInt32 = 1 << 10
+static FUN_IE: UInt32 = 1 << 9
+static FUN_PU: UInt32 = 1 << 8
+static FUN_PD: UInt32 = 1 << 7
+
+/// How a GPIO pin is configured.
+public enum PinMode {
+    /// An input with the pad's pull-up.
+    case InputPullUp,
+    /// An input with the pad's pull-down.
+    case InputPullDown,
+    /// An input with neither pull.
+    case InputFloating,
+    /// An output, driven from its configured level at start.
+    case Output,
+    /// An output with its input enabled and an any-edge interrupt, so its
+    /// input follows the driven level and a change raises the line.
+    case OutputLoopback
+}
+
+@synthesize
+extension PinMode: Equatable {}
+
+/// Whether a pin of `mode` is an output.
+public func is_output(mode: PinMode) -> Bool {
+    mode == PinMode.Output || mode == PinMode.OutputLoopback
+}
+
+/// The `FUN_DRV` bits that drive pad `pin` at ~20 mA.
+func drive_20ma(pin: UInt8) -> UInt32 {
+    if pin == 17 || pin == 18 { FUN_DRV_20MA_SWAPPED } else { FUN_DRV_20MA }
+}
+
+/// The IO MUX word of pad `pin` in `mode`: function 1 (GPIO), ~20 mA, the
+/// input enable and the pull the mode wants.
+public func pad_word(pin: UInt8, mode: PinMode) -> UInt32 {
+    let base = MCU_SEL_GPIO | drive_20ma(pin)
+    match mode {
+        case InputPullUp -> base | FUN_IE | FUN_PU,
+        case InputPullDown -> base | FUN_IE | FUN_PD,
+        case InputFloating -> base | FUN_IE,
+        case Output -> base,
+        case OutputLoopback -> base | FUN_IE
+    }
+}
+
+/// Servo pad `pin`'s IO MUX word: function 1 (GPIO), ~20 mA, its input
+/// enabled so its level can be read back.
+public func servo_pad_word(pin: UInt8) -> UInt32 {
+    MCU_SEL_GPIO | drive_20ma(pin) | FUN_IE
+}
+
+// `PINn`'s fields: `INT_TYPE` (bits 9:7) 3 is any edge; `INT_ENA` bit 13 is
+// the CPU's interrupt.
+static INT_ANY_EDGE: UInt32 = 3 << 7
+static INT_ENA_CPU: UInt32 = 1 << 13
+
+/// `PINn` for a pin of `mode`: an any-edge interrupt to the CPU for a pin
+/// that is read, none for a plain output.
+public func pin_cfg(mode: PinMode) -> UInt32 {
+    if mode == PinMode.Output { 0 } else { INT_ANY_EDGE | INT_ENA_CPU }
+}
+
+// `FUNCn_OUT_SEL_CFG`'s fields: `OUT_SEL` (bits 8:0) the signal, and
+// `OEN_SEL` (bit 10), whose 1 takes the output enable from `ENABLE[n]`.
+static SIG_GPIO_OUT: UInt32 = 256
+static LEDC_LS_SIG_OUT0: UInt32 = 73
+static OEN_SEL: UInt32 = 1 << 10
+
+/// The output select's reset word: the plain GPIO signal, with the
+/// peripheral's own output enable.
+public static OUT_SEL_RESET: UInt32 = 0x100
+
+/// The output select of a plain GPIO output: the GPIO signal, enabled by
+/// `ENABLE[n]`.
+public static OUT_SEL_GPIO: UInt32 = (256 | (1 << 10))
+
+/// The output select of LEDC channel `channel`'s signal, enabled by
+/// `ENABLE[n]`.
+public func out_sel_ledc(channel: UInt8) -> UInt32 {
+    (LEDC_LS_SIG_OUT0 + (channel as UInt32)) | OEN_SEL
+}
+
+static_assert(OUT_SEL_GPIO == (SIG_GPIO_OUT | OEN_SEL), "the plain output's select")
+
+/// What a driver writes its registers through, one whole word each.
+public trait RegisterPort {
+    func write(&var self, reg: Register, word: UInt32)
+}
+
+/// One GPIO pin a driver serves, as its configuration states it.
+public struct GpioPin {
+    pin: UInt8
+    mode: PinMode
+    /// An output's level at start, 0 or 1; an input's is 0, and any other is
+    /// refused.
+    level: UInt8
+}
+
+/// Configures `pin` through `port`, whole words in an order that never drives
+/// a level nobody wrote, never a read-modify-write.
+///
+/// An output's enable is cleared first and set last, after its level, its
+/// output select and its function, so the pad drives nothing until it drives
+/// the written level, whatever function it had: the output select comes
+/// before the IO MUX word, the order that cannot glitch the pad. A pin that is
+/// read has its interrupt enabled last, after its input enable and its pull
+/// are set and its status is cleared, so no stale edge is left pending.
+public func start_gpio_pin<P: RegisterPort>(port: &var P, pin: &GpioPin) {
+    let n = pin.pin
+    let bit = pin_bit(n)
+    port.write(enable_clear(n), bit)
+    if is_output(pin.mode) {
+        port.write(if pin.level == 1 { out_set(n) } else { out_clear(n) }, bit)
+        port.write(out_sel_register(n), OUT_SEL_GPIO)
+        port.write(pad_register(n), pad_word(n, pin.mode))
+        port.write(enable_set(n), bit)
+    } else {
+        port.write(out_sel_register(n), OUT_SEL_RESET)
+        port.write(pad_register(n), pad_word(n, pin.mode))
+    }
+    if pin.mode != PinMode.Output {
+        port.write(status_clear(n), bit)
+    }
+    port.write(pin_register(n), pin_cfg(pin.mode))
+}
+
+/// Configures every pin of `pins`, in their order (`start_gpio_pin`).
+public func start_gpio<P: RegisterPort, const N: Int>(port: &var P, pins: &[GpioPin; N]) {
+    var i = 0
+    while i < N {
+        start_gpio_pin(&var port, &pins[i])
+        i = i + 1
+    }
+}
+
+/// Why a configuration is refused.
+public enum ConfigError {
+    /// Not a GPIO of the part: above 48, or 22 to 25.
+    case NotAGpio(pin: UInt8),
+    /// One of 26 to 32, the SPI bus the code runs from.
+    case FlashPin(pin: UInt8),
+    /// 43 or 44, UART0's pads: the kernel's console.
+    case ConsolePin(pin: UInt8),
+    /// 19 or 20, the USB-Serial-JTAG's D- and D+.
+    case UsbPin(pin: UInt8),
+    /// A pin named twice.
+    case PinTwice(pin: UInt8),
+    /// An output's level other than 0 or 1.
+    case BadLevel(pin: UInt8, level: UInt8),
+    /// An input's level other than 0.
+    case InputLevel(pin: UInt8, level: UInt8),
+    /// A frame outside `FRAME_MIN_US` to `FRAME_MAX_US`.
+    case FrameOutOfRange(frame_us: UInt32),
+    /// A frame that is not a multiple of 8 microseconds, which would cut the
+    /// divider short.
+    case FrameNotMultipleOf8(frame_us: UInt32),
+    /// A channel above 7.
+    case ChannelOutOfRange(channel: UInt8),
+    /// A channel named twice.
+    case ChannelTwice(channel: UInt8),
+    /// A servo whose least pulse is above its greatest.
+    case PulseRangeInverted(channel: UInt8),
+    /// A servo whose greatest pulse is not shorter than the frame.
+    case PulseNotBelowFrame(channel: UInt8),
+    /// A servo whose least pulse rounds to no counts: no pulse.
+    case MinPulseNoCounts(channel: UInt8),
+    /// A servo whose greatest pulse rounds to the whole frame, a duty the
+    /// timer cannot make at its full resolution.
+    case MaxPulseWholeFrame(channel: UInt8),
+    /// Servo pins that are not consecutive from the lowest.
+    case PinsNotConsecutive(pin: UInt8),
+    /// A servo count that is not a power of two, which no one window holds.
+    case PinCountNotPowerOfTwo(count: Int),
+    /// Servo pins whose registers are not one naturally aligned window in
+    /// the output selects and the IO MUX.
+    case PinsNotAligned(pin: UInt8)
+}
+
+@synthesize
+extension ConfigError: Equatable {}
+
+extension ConfigError {
+    /// What a driver prints, after `config refused: `.
+    public func describe(&self) -> String {
+        match self {
+            case NotAGpio(pin) -> "pin {pin} is not a GPIO of the part",
+            case FlashPin(pin) -> "pin {pin} is held by the chip (the SPI flash bus)",
+            case ConsolePin(pin) -> "pin {pin} is held by the chip (the console)",
+            case UsbPin(pin) -> "pin {pin} is held by the chip (the USB-Serial-JTAG)",
+            case PinTwice(pin) -> "pin {pin} is named twice",
+            case BadLevel(pin, level) -> "pin {pin}'s level is {level}, not 0 or 1",
+            case InputLevel(pin, level) -> "pin {pin} is an input, and its level is {level}, not 0",
+            case FrameOutOfRange(frame_us) -> "frame {frame_us} us is outside {FRAME_MIN_US}..{FRAME_MAX_US}",
+            case FrameNotMultipleOf8(frame_us) -> "frame {frame_us} us is not a multiple of 8",
+            case ChannelOutOfRange(channel) -> "channel {channel} is above 7",
+            case ChannelTwice(channel) -> "channel {channel} is named twice",
+            case PulseRangeInverted(channel) -> "channel {channel}'s least pulse is above its greatest",
+            case PulseNotBelowFrame(channel) -> "channel {channel}'s greatest pulse is not shorter than the frame",
+            case MinPulseNoCounts(channel) -> "channel {channel}'s least pulse is no counts",
+            case MaxPulseWholeFrame(channel) -> "channel {channel}'s greatest pulse is the whole frame",
+            case PinsNotConsecutive(pin) -> "pin {pin} is not consecutive with the other servos'",
+            case PinCountNotPowerOfTwo(count) -> "{count} servos are not a power of two",
+            case PinsNotAligned(pin) -> "the servo pins from {pin} are not one aligned window"
+        }
+    }
+}
+
+/// Refuses `pin` unless it is a GPIO of the part that no S3 image holds for
+/// the chip: the SPI flash bus (26 to 32), the console's pads (43, 44) and
+/// the USB-Serial-JTAG's (19, 20), whose pad enable a driver here does not
+/// write. Every GPIO of the part can drive.
+public func check_pin(pin: UInt8) -> Result<Void, ConfigError> {
+    if pin > 48 || (pin >= 22 && pin <= 25) {
+        return ConfigError.NotAGpio(pin: pin)
+    }
+    if pin >= 26 && pin <= 32 {
+        return ConfigError.FlashPin(pin: pin)
+    }
+    if pin == 43 || pin == 44 {
+        return ConfigError.ConsolePin(pin: pin)
+    }
+    if pin == 19 || pin == 20 {
+        return ConfigError.UsbPin(pin: pin)
+    }
+}
+
+/// Checks a GPIO driver's configuration, pin by pin in order: each a pin
+/// `check_pin` takes, none named twice, an output's level 0 or 1 and an
+/// input's 0.
+public func check_gpio_config<const N: Int>(pins: &[GpioPin; N]) -> Result<Void, ConfigError> {
+    var i = 0
+    while i < N {
+        let p = pins[i]
+        try check_pin(p.pin)
+        var j = 0
+        while j < i {
+            if pins[j].pin == p.pin {
+                return ConfigError.PinTwice(pin: p.pin)
+            }
+            j = j + 1
+        }
+        if is_output(p.mode) && p.level > 1 {
+            return ConfigError.BadLevel(pin: p.pin, level: p.level)
+        }
+        if not is_output(p.mode) && p.level != 0 {
+            return ConfigError.InputLevel(pin: p.pin, level: p.level)
+        }
+        i = i + 1
+    }
+}
+
+/// The interrupt status, the levels or the enables of every pin: bank 0's
+/// word and bank 1's.
+public struct PinSet {
+    low: UInt32
+    high: UInt32
+}
+
+@synthesize
+extension PinSet: Equatable {}
+
+extension PinSet {
+    /// No pin.
+    public static func empty() -> PinSet {
+        PinSet(low: 0, high: 0)
+    }
+
+    /// `pin`'s bit, 0 or 1.
+    public func level(&self, pin: UInt8) -> UInt8 {
+        let word = if pin < 32 { self.low } else { self.high }
+        if (word & pin_bit(pin)) != 0 { 1 } else { 0 }
+    }
+
+    /// Whether no pin's bit is set.
+    public func is_empty(&self) -> Bool {
+        self.low == 0 && self.high == 0
+    }
+}
+
+/// What the GPIO interrupt service reads and writes, and its acknowledgement.
+public trait GpioPort {
+    /// `PCPU_INT` and `PCPU_INT1`: the pins whose interrupt fired.
+    func pcpu_int(&var self) -> PinSet
+    /// Writes exactly `fired`'s bits to `STATUS_W1TC` and `STATUS1_W1TC`.
+    func clear_status(&var self, fired: PinSet)
+    /// `IN` and `IN1`: every pad's level.
+    func levels(&var self) -> PinSet
+    /// Acknowledges the interrupt, which rearms its line.
+    func ack(&var self)
+}
+
+/// A level a client waits for on a pin.
+public struct PinWait {
+    pin: UInt8
+    level: UInt8
+}
+
+/// How many waits a GPIO driver holds at once.
+public static MAX_HELD: Int = 4
+
+/// What one interrupt service found.
+public struct Serviced {
+    /// Whether any pin's status was set.
+    fired: Bool
+    /// For each held wait, by its slot, whether its pin now reads its level.
+    answered: [Bool; MAX_HELD]
+    /// The levels read.
+    levels: PinSet
+}
+
+/// Services the GPIO interrupt through `port`, for the waits `held`, in an
+/// order that loses no edge: reads which pins fired, clears exactly those,
+/// reads the levels, then acknowledges, and answers each held wait whose pin
+/// reads its level.
+///
+/// The clear comes before the levels are read, so an edge after the clear
+/// sets the status again and fires again after the acknowledgement: the
+/// levels read are never stale without a fire still to come. Every device
+/// access comes before the acknowledgement (spec §9).
+public func service_interrupt<P: GpioPort>(port: &var P, held: &[PinWait?; MAX_HELD]) -> Serviced {
+    let fired = port.pcpu_int()
+    port.clear_status(fired)
+    let levels = port.levels()
+    port.ack()
+    var answered = [false; MAX_HELD]
+    var i = 0
+    while i < MAX_HELD {
+        if let w = held[i] {
+            answered[i] = levels.level(w.pin) == w.level
+        }
+        i = i + 1
+    }
+    Serviced(fired: not fired.is_empty(), answered: answered, levels: levels)
+}
+
+/// The least frame, in microseconds: the divider's least, 1.0, gives
+/// 409.6 us at 40 MHz and 14 bits, and a frame is a multiple of 8.
+public static FRAME_MIN_US: UInt32 = 416
+/// The greatest frame. It keeps a pulse's count arithmetic inside 32 bits
+/// (`pulse_counts`), since a 64-bit divide is a call no call0 library has.
+public static FRAME_MAX_US: UInt32 = 200_000
+/// The timer's counts per frame: 14 bits.
+public static FRAME_COUNTS: UInt32 = 1 << 14
+static DUTY_RES_BITS: UInt32 = 14
+
+/// The LEDC timer's divider field for a frame of `frame_us`: 10.8 fixed
+/// point, `40 * frame_us * 256 / 16384` cycles of the 40 MHz crystal per
+/// count.
+public func divider(frame_us: UInt32) -> UInt32 {
+    frame_us * 5 / 8
+}
+
+/// The counts of a pulse of `pulse_us` in a frame of `frame_us`, rounded to
+/// the nearest. With `pulse_us` below `frame_us` and `frame_us` at most
+/// `FRAME_MAX_US`, the product stays inside 32 bits.
+public func pulse_counts(pulse_us: UInt32, frame_us: UInt32) -> UInt32 {
+    (pulse_us * FRAME_COUNTS + frame_us / 2) / frame_us
+}
+
+/// The LEDC channels: 0 to 7.
+public static CHANNELS: UInt8 = 8
+
+/// One servo a PWM driver drives: its LEDC channel, its pad, and the pulse
+/// range it may be commanded to.
+public struct Servo {
+    channel: UInt8
+    pin: UInt8
+    min_us: UInt32
+    max_us: UInt32
+}
+
+/// Checks a PWM driver's configuration: the frame, then each servo in order
+/// (its channel, its pulse range in microseconds and in counts, its pin),
+/// then the servos' pins as one window: consecutive from the lowest, a power
+/// of two of them, and the lowest pin's output select and IO MUX word aligned
+/// to the window's length, so one part of each block holds them.
+public func check_pwm_config<const N: Int>(frame_us: UInt32, servos: &[Servo; N]) -> Result<Void, ConfigError> {
+    if frame_us < FRAME_MIN_US || frame_us > FRAME_MAX_US {
+        return ConfigError.FrameOutOfRange(frame_us: frame_us)
+    }
+    if frame_us % 8 != 0 {
+        return ConfigError.FrameNotMultipleOf8(frame_us: frame_us)
+    }
+    var lowest: UInt8 = 255
+    var i = 0
+    while i < N {
+        let s = servos[i]
+        if s.channel >= CHANNELS {
+            return ConfigError.ChannelOutOfRange(channel: s.channel)
+        }
+        var j = 0
+        while j < i {
+            if servos[j].channel == s.channel {
+                return ConfigError.ChannelTwice(channel: s.channel)
+            }
+            if servos[j].pin == s.pin {
+                return ConfigError.PinTwice(pin: s.pin)
+            }
+            j = j + 1
+        }
+        if s.min_us > s.max_us {
+            return ConfigError.PulseRangeInverted(channel: s.channel)
+        }
+        if s.max_us >= frame_us {
+            return ConfigError.PulseNotBelowFrame(channel: s.channel)
+        }
+        if pulse_counts(s.min_us, frame_us) == 0 {
+            return ConfigError.MinPulseNoCounts(channel: s.channel)
+        }
+        if pulse_counts(s.max_us, frame_us) >= FRAME_COUNTS {
+            return ConfigError.MaxPulseWholeFrame(channel: s.channel)
+        }
+        try check_pin(s.pin)
+        if s.pin < lowest {
+            lowest = s.pin
+        }
+        i = i + 1
+    }
+    if N == 0 || (N & (N - 1)) != 0 {
+        return ConfigError.PinCountNotPowerOfTwo(count: N)
+    }
+    i = 0
+    while i < N {
+        if (servos[i].pin - lowest) as Int >= N {
+            return ConfigError.PinsNotConsecutive(pin: servos[i].pin)
+        }
+        i = i + 1
+    }
+    let window = 4 * (N as UInt32)
+    if out_sel_register(lowest).offset % window != 0 || pad_register(lowest).offset % window != 0 {
+        return ConfigError.PinsNotAligned(pin: lowest)
+    }
+}
+
+// LEDC's registers: channel c's five words at 0x14 c, timer t's two at
+// 0xA0 + 8 t, and `CONF`.
+static CHANNEL_STRIDE: UInt32 = 0x14
+static CH_CONF0: UInt32 = 0x00
+static CH_HPOINT: UInt32 = 0x04
+static CH_DUTY: UInt32 = 0x08
+static CH_CONF1: UInt32 = 0x0C
+/// Channel c's duty in force, at 0x10 from the channel's first word
+/// (read-only).
+public static CH_DUTY_R: UInt32 = 0x10
+static TIMER0_CONF: UInt32 = 0xA0
+/// Timer 0's counter (read-only).
+public static TIMER0_VALUE: UInt32 = 0xA4
+static LEDC_CONF: UInt32 = 0xD0
+
+/// Channel `channel`'s register at `offset` from its first.
+public func channel_register(channel: UInt8, offset: UInt32) -> Register {
+    Register(block: Block.Ledc, offset: CHANNEL_STRIDE * (channel as UInt32) + offset)
+}
+
+// `CONF`'s `APB_CLK_SEL` 3: every timer counts XTAL_CLK, the 40 MHz crystal,
+// which reaches the peripherals undivided under every clock key.
+static CONF_XTAL: UInt32 = 3
+// `TIMERt_CONF`: `DUTY_RES` (3:0), `CLK_DIV` (21:4), `RST` (23, which resets
+// to 1), `PARA_UP` (25, write-only).
+static TIMER_RST: UInt32 = 1 << 23
+static TIMER_PARA_UP: UInt32 = 1 << 25
+// `CHc_CONF0`: `SIG_OUT_EN` (2), `IDLE_LV` (3, left 0) and `PARA_UP` (4);
+// `TIMER_SEL` 0 is timer 0.
+static CONF0_SIG_OUT_EN: UInt32 = 1 << 2
+static CONF0_PARA_UP: UInt32 = 1 << 4
+// `CHc_CONF1` for a fixed duty: `DUTY_START` (31), `DUTY_INC` (30),
+// `DUTY_NUM` 1 (29:20), `DUTY_CYCLE` 1 (19:10), `DUTY_SCALE` 0.
+static CONF1_DUTY_START: UInt32 = 1 << 31
+static CONF1_FIXED: UInt32 = (1 << 30) | (1 << 20) | (1 << 10)
+// `CHc_DUTY`'s low four bits are a fraction.
+static DUTY_FRACTION_BITS: UInt32 = 4
+
+/// `TIMERt_CONF` for a frame of `frame_us`, `RST` and `PARA_UP` clear.
+public func timer_word(frame_us: UInt32) -> UInt32 {
+    DUTY_RES_BITS | (divider(frame_us) << 4)
+}
+
+/// Starts the PWM through `port` for `servos` in a frame of `frame_us`:
+/// timer 0 counts the crystal in 14 bits; every channel is idle, its output
+/// `IDLE_LV`, low; and only then is each servo's pad routed, function first:
+/// its output select to the plain GPIO signal, its IO MUX word, then its
+/// output select to its channel.
+///
+/// The timer's fields are loaded with `RST` held, latched, then released, so
+/// the counter starts at the new divider. A pad that becomes GPIO drives
+/// root's written 0 until its select names its channel, which drives the idle
+/// channel's 0, so no step drives a level nobody wrote.
+public func start_pwm<P: RegisterPort, const N: Int>(port: &var P, frame_us: UInt32,
+                                                      servos: &[Servo; N]) {
+    let conf = Register(block: Block.Ledc, offset: TIMER0_CONF)
+    port.write(Register(block: Block.Ledc, offset: LEDC_CONF), CONF_XTAL)
+    port.write(conf, timer_word(frame_us) | TIMER_RST)
+    port.write(conf, timer_word(frame_us) | TIMER_RST | TIMER_PARA_UP)
+    port.write(conf, timer_word(frame_us))
+    var i = 0
+    while i < N {
+        let channel = servos[i].channel
+        port.write(channel_register(channel, CH_HPOINT), 0)
+        port.write(channel_register(channel, CH_CONF0), CONF0_PARA_UP)
+        i = i + 1
+    }
+    i = 0
+    while i < N {
+        let pin = servos[i].pin
+        port.write(out_sel_register(pin), OUT_SEL_RESET)
+        port.write(pad_register(pin), servo_pad_word(pin))
+        port.write(out_sel_register(pin), out_sel_ledc(servos[i].channel))
+        i = i + 1
+    }
+}
+
+/// Sets `channel` to a fixed duty of `counts` through `port`: the duty, then
+/// a duty update with `DUTY_START`, then the output enabled, latched at the
+/// next frame boundary, so the frame in progress finishes at its old width.
+public func set_pwm<P: RegisterPort>(port: &var P, channel: UInt8, counts: UInt32) {
+    port.write(channel_register(channel, CH_DUTY), counts << DUTY_FRACTION_BITS)
+    port.write(channel_register(channel, CH_CONF1), CONF1_DUTY_START | CONF1_FIXED)
+    port.write(channel_register(channel, CH_CONF0), CONF0_SIG_OUT_EN | CONF0_PARA_UP)
+}
+
+/// Stops `channel` through `port`: no duty update, and its output idle,
+/// low, from the next frame boundary.
+public func stop_pwm<P: RegisterPort>(port: &var P, channel: UInt8) {
+    port.write(channel_register(channel, CH_CONF1), CONF1_FIXED)
+    port.write(channel_register(channel, CH_CONF0), CONF0_PARA_UP)
+}

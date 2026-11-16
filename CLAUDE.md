@@ -50,7 +50,9 @@ drivers/           # userspace device drivers and the protocol packages their
                    # clients share (`uartproto`), each an ordinary package like
                    # those in `tests/`; a process's `process.toml` beside its
                    # Saw.toml says what a stock root gives it
-                   # (tools/sosimage/src/declaration.saw)
+                   # (tools/sosimage/src/declaration.saw). esp32s3io/ is the
+                   # ESP32-S3's GPIO, IO MUX and LEDC as its drivers use
+                   # them, with hosted tests a full run `blade test`s
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 root/              # the stock root: it launches an image's processes as
@@ -118,8 +120,9 @@ builds Blade, points `.sawlang` at the resolved checkout, builds the builder
 runs its own tests (`blade test` there: the description readers' refusals, the
 region table's and slab block's bytes, an image's limits and each refusal of
 them, the in-place check, the slab-region check, and every board, process
-and image description in the tree read clean), which need no emulator and
-print nothing when they pass. Per profile it writes a profile description
+and image description in the tree read clean) and the hosted packages'
+(`HOSTED_TESTS`: `drivers/esp32s3io/`), which need no emulator and print
+nothing when they pass. Per profile it writes a profile description
 (JSON) and calls `sosimage native`, then `sosimage board` on the profile's
 `hal/<profile>/board.toml`, then `sosimage package` once for each package
 and role (root, or child i) the cases give it, which writes the process's
@@ -168,6 +171,15 @@ case the images and regions it placed; after the case passes, it fails the
 profile unless the description's ELF is the case's, byte for byte
 (`FROM_FILES`), which holds the rows, the limits and the link the two make
 apart, the images and their placements being shared; a match prints nothing.
+
+A case may name devices of its board (`devices`), each a device row of its
+table in the case's order, read with `sosimage devices`, and give the build
+inputs its children declare (`inputs`, read with `sosimage declared`), each
+file the module of its name in that child's build; a name the board does
+not have, an input a child declares and the case does not give, one no child
+declares and a file that is not there are the case's build errors
+(`_resolve_case`). With `root_plan` they make a stock-root case whose plan
+the builder would refuse, on the gate and on the ESP32-S3.
 
 A case may state `limits`, which the image description carries and the
 builder turns into linked slab areas and the block after the table's rows, or

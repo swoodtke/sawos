@@ -1,0 +1,179 @@
+// The GPIO start, the PWM start, `Set` and `Stop`, through a port that
+// records each write's address and word: every word and its order.
+
+import esp32s3io.{
+    GpioPin, PinMode, Register, RegisterPort, Servo, pulse_counts, set_pwm, start_gpio,
+    start_gpio_pin, start_pwm, stop_pwm,
+}
+
+struct Write {
+    address: UInt32
+    word: UInt32
+}
+
+struct Recorder {
+    writes: Vector<Write>
+}
+
+extension Recorder: NoCopy {}
+
+extension Recorder: RegisterPort {
+    func write(&var self, reg: Register, word: UInt32) {
+        try! self.writes.push(Write(address: reg.address(), word: word))
+    }
+}
+
+extension Recorder {
+    static func fresh() -> Recorder {
+        Recorder(writes: Vector<Write>())
+    }
+
+    // The writes from `from` on, as `ADDRESS <- WORD` lines.
+    func lines(&self, from: Int) -> String {
+        var out = Vector<String>()
+        var i = from
+        while i < self.writes.len() {
+            let w = self.writes.get(i)!
+            try! out.push("{hex(w.address)} <- {hex(w.word)}")
+            i = i + 1
+        }
+        out.join("\n")
+    }
+}
+
+func hex(v: UInt32) -> String {
+    var out = "0x"
+    var shift: UInt32 = 32
+    while shift > 0 {
+        shift = shift - 4
+        let d = ((v >> shift) & 0xF) as Int
+        out = "{out}{"0123456789abcdef".substring(d, d + 1)}"
+    }
+    out
+}
+
+func expect(what: String, got: String, want: Vector<String>) {
+    let w = want.join("\n")
+    if not got.equals(w) {
+        print("{what}, expected:\n{w}\ngot:\n{got}")
+    }
+    assert(got.equals(w), what)
+}
+
+func main() {
+    // An input with its pull-up: the enable cleared, the output select reset,
+    // the pad, the status cleared, and the interrupt enabled last.
+    var r = Recorder.fresh()
+    start_gpio_pin(&var r, &GpioPin(pin: 21, mode: PinMode.InputPullUp, level: 0))
+    expect("pin 21, pulled up", r.lines(0), [
+        "0x60004028 <- 0x00200000",     // ENABLE_W1TC, bit 21
+        "0x600045a8 <- 0x00000100",     // FUNC21_OUT_SEL_CFG
+        "0x60009058 <- 0x00001b00",     // IO MUX pad 21
+        "0x6000404c <- 0x00200000",     // STATUS_W1TC, bit 21
+        "0x600040c8 <- 0x00002180"])    // PIN21
+
+    // A loopback output, low: the enable cleared, the level, the output
+    // select before the pad, the enable set, then its interrupt.
+    r = Recorder.fresh()
+    start_gpio_pin(&var r, &GpioPin(pin: 47, mode: PinMode.OutputLoopback, level: 0))
+    expect("pin 47, loopback", r.lines(0), [
+        "0x60004034 <- 0x00008000",     // ENABLE1_W1TC, bit 15
+        "0x60004018 <- 0x00008000",     // OUT1_W1TC, bit 15
+        "0x60004610 <- 0x00000500",     // FUNC47_OUT_SEL_CFG
+        "0x600090c0 <- 0x00001a00",     // IO MUX pad 47
+        "0x60004030 <- 0x00008000",     // ENABLE1_W1TS, bit 15
+        "0x60004058 <- 0x00008000",     // STATUS1_W1TC, bit 15
+        "0x60004130 <- 0x00002180"])    // PIN47
+
+    // A plain output, high: its enable cleared first and set last, its
+    // output select before its pad, and no interrupt.
+    r = Recorder.fresh()
+    start_gpio_pin(&var r, &GpioPin(pin: 2, mode: PinMode.Output, level: 1))
+    expect("pin 2, output", r.lines(0), [
+        "0x60004028 <- 0x00000004",     // ENABLE_W1TC, bit 2
+        "0x60004008 <- 0x00000004",     // OUT_W1TS, bit 2
+        "0x6000455c <- 0x00000500",     // FUNC2_OUT_SEL_CFG
+        "0x6000900c <- 0x00001800",     // IO MUX pad 2
+        "0x60004024 <- 0x00000004",     // ENABLE_W1TS, bit 2
+        "0x6000407c <- 0x00000000"])    // PIN2
+
+    // The other inputs' pads, and the pins in their configuration's order.
+    r = Recorder.fresh()
+    let pins: [GpioPin; 2] = [GpioPin(pin: 14, mode: PinMode.InputPullDown, level: 0),
+                              GpioPin(pin: 1, mode: PinMode.InputFloating, level: 0)]
+    start_gpio(&var r, &pins)
+    expect("pins 14 and 1", r.lines(0), [
+        "0x60004028 <- 0x00004000",
+        "0x6000458c <- 0x00000100",
+        "0x6000903c <- 0x00001a80",
+        "0x6000404c <- 0x00004000",
+        "0x600040ac <- 0x00002180",
+        "0x60004028 <- 0x00000002",
+        "0x60004558 <- 0x00000100",
+        "0x60009008 <- 0x00001a00",
+        "0x6000404c <- 0x00000002",
+        "0x60004078 <- 0x00002180"])
+
+    // The PWM start for the PWM smoke's servos: the clock, the timer's
+    // three words, every channel idle, then each pad plain, function,
+    // channel.
+    r = Recorder.fresh()
+    let servos: [Servo; 2] = [
+        Servo(channel: 0, pin: 41, min_us: 500, max_us: 2500),
+        Servo(channel: 1, pin: 42, min_us: 1000, max_us: 2000)]
+    start_pwm(&var r, 20000, &servos)
+    expect("the PWM start", r.lines(0), [
+        "0x600190d0 <- 0x00000003",     // CONF: XTAL_CLK
+        "0x600190a0 <- 0x00830d4e",     // TIMER0_CONF, RST held
+        "0x600190a0 <- 0x02830d4e",     // the same with PARA_UP
+        "0x600190a0 <- 0x00030d4e",     // RST released
+        "0x60019004 <- 0x00000000",     // CH0_HPOINT
+        "0x60019000 <- 0x00000010",     // CH0_CONF0: idle, PARA_UP
+        "0x60019018 <- 0x00000000",     // CH1_HPOINT
+        "0x60019014 <- 0x00000010",     // CH1_CONF0
+        "0x600045f8 <- 0x00000100",     // FUNC41_OUT_SEL_CFG: plain
+        "0x600090a8 <- 0x00001a00",     // IO MUX pad 41
+        "0x600045f8 <- 0x00000449",     // FUNC41_OUT_SEL_CFG: channel 0
+        "0x600045fc <- 0x00000100",     // FUNC42_OUT_SEL_CFG
+        "0x600090ac <- 0x00001a00",     // IO MUX pad 42
+        "0x600045fc <- 0x0000044a"])    // FUNC42_OUT_SEL_CFG: channel 1
+
+    // Pads 17 and 18, whose drive bits are the other way round: a plain
+    // output on 17, and servos on the pair.
+    r = Recorder.fresh()
+    start_gpio_pin(&var r, &GpioPin(pin: 17, mode: PinMode.Output, level: 0))
+    expect("pin 17, output", r.lines(0), [
+        "0x60004028 <- 0x00020000",     // ENABLE_W1TC, bit 17
+        "0x6000400c <- 0x00020000",     // OUT_W1TC, bit 17
+        "0x60004598 <- 0x00000500",     // FUNC17_OUT_SEL_CFG
+        "0x60009048 <- 0x00001400",     // IO MUX pad 17: ~20 mA is 1 here
+        "0x60004024 <- 0x00020000",     // ENABLE_W1TS, bit 17
+        "0x600040b8 <- 0x00000000"])    // PIN17
+    var pair = Recorder.fresh()
+    let low_pair: [Servo; 2] = [
+        Servo(channel: 2, pin: 17, min_us: 500, max_us: 2500),
+        Servo(channel: 3, pin: 18, min_us: 500, max_us: 2500)]
+    start_pwm(&var pair, 20000, &low_pair)
+    expect("the PWM start on 17 and 18", pair.lines(8), [
+        "0x60004598 <- 0x00000100",
+        "0x60009048 <- 0x00001600",     // IO MUX pad 17
+        "0x60004598 <- 0x0000044b",
+        "0x6000459c <- 0x00000100",
+        "0x6000904c <- 0x00001600",     // IO MUX pad 18
+        "0x6000459c <- 0x0000044c"])
+
+    // `Set` and `Stop`.
+    let mark = r.writes.len()
+    set_pwm(&var r, 0, pulse_counts(1500, 20000))
+    set_pwm(&var r, 1, pulse_counts(1000, 20000))
+    stop_pwm(&var r, 0)
+    expect("Set and Stop", r.lines(mark), [
+        "0x60019008 <- 0x00004cd0",     // CH0_DUTY: 1229 counts
+        "0x6001900c <- 0xc0100400",     // CH0_CONF1: DUTY_START
+        "0x60019000 <- 0x00000014",     // CH0_CONF0: SIG_OUT_EN, PARA_UP
+        "0x6001901c <- 0x00003330",     // CH1_DUTY: 819 counts
+        "0x60019020 <- 0xc0100400",
+        "0x60019014 <- 0x00000014",
+        "0x6001900c <- 0x40100400",     // CH0_CONF1: DUTY_START clear
+        "0x60019000 <- 0x00000010"])    // CH0_CONF0: idle, PARA_UP
+}

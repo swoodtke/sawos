@@ -2,7 +2,7 @@
 // board: what each accepts, and each refusal by its message.
 
 import sosimage.board.{Board}
-import sosimage.declaration.{Declaration, RecordKind}
+import sosimage.declaration.{Declaration, RecordKind, input_lines}
 
 // The GPIO driver's declaration, one key per line.
 func gpio_lines() -> Vector<String> {
@@ -134,6 +134,16 @@ func main() {
     assert(d.record(RecordKind.Serve, "gpio")!.protocol.equals("gpioproto"), "the serve's protocol")
     assert(d.handle_floor() == 6, "four records, the Process handle, one Mapping")
     assert(d.default_for("gpioconfig")!.path.equals("config/default.saw"), "a default")
+
+    // What `sosimage declared` prints: each input, in order.
+    assert(input_lines(&d).join(" | ").equals("input gpioconfig"), "one input")
+    let two = try! Declaration.parse(with_line(27, "inputs = [\"gpioconfig\", \"pins\"]"),
+                                     "drivers/gpio/process.toml")
+    assert(input_lines(&two).join(" | ").equals("input gpioconfig | input pins"),
+           "each input, in order")
+    let none = try! Declaration.parse(text_of(&lines).replace("[build]\ninputs = [\"gpioconfig\"]\ndefaults = \{ gpioconfig = \"config/default.saw\" \}\n", ""),
+                                      "drivers/gpio/process.toml")
+    assert(input_lines(&none).len() == 0, "a declaration with no inputs prints nothing")
 
     // Keys the format does not define, by kind, and the reserved list form.
     expect_refusal(with_line(21, "type = \"gpio\""),
