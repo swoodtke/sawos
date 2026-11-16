@@ -1,0 +1,61 @@
+//! The product's own process. It writes its greeting (the input `greeting`)
+//! through the UART driver it is a client of, waits until the driver has
+//! written every byte, says how many that was, and exits with 0. A step that
+//! fails prints `hello: STEP: STATUS` and exits with 1.
+
+import sos.{System, Process, BootSet, SosStatus}
+import uartproto.{UartOp, UartBody}
+import greeting.{text}
+
+/// The client end of the driver's connection, as `process.toml` declares it.
+static TAG_CONSOLE: UInt = 2
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("hello: no process handle\n")
+        return
+    }
+    let written = try greet(&proc) catch {
+        print("hello: {}: {}", error.step, error.status)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    print("hello: the driver wrote {} bytes", written)
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// A step that failed, and the status it answered.
+struct Failed {
+    step: String
+    status: SosStatus
+}
+
+/// Writes the greeting and a newline through the driver, then asks it to
+/// `Sync`: a connection is served in order, so the answer means every byte
+/// before it is written. Answers how many bytes were written.
+func greet(proc: &Process) -> Result<UInt, Failed> {
+    var set = try BootSet(process: &proc) catch {
+        return Failed(step: "drain", status: error)
+    }
+    // The stock root gives what the declaration names, so a record missing
+    // or of another kind is a skew between the two, and a panic names it.
+    var record = set.take(TAG_CONSOLE)!
+    let inlet = record.take_inlet()!
+    var body = UartBody.empty()
+    let n = body.text(UartOp.Write, "{text()}\n")
+    let claim = try inlet.post(body: &body.bytes, len: n) catch {
+        return Failed(step: "write", status: error)
+    }
+    let _ = move claim
+    let s = body.bare(UartOp.Sync)
+    let settled = try inlet.send(body: &body.bytes, len: s) catch {
+        return Failed(step: "sync", status: error)
+    }
+    let _ = move settled
+    return n - 1
+}

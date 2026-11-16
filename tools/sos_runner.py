@@ -11186,7 +11186,7 @@ def _default_jobs():
     return os.cpu_count() or 1
 
 
-def _find_clang(arches):
+def _find_clang(arches, scratch=None):
     """Return the first clang that can assemble every target's boot code.
 
     Plain `clang` is tried before the Homebrew `llvm` ones. macOS's Apple
@@ -11194,7 +11194,8 @@ def _find_clang(arches):
     a real LLVM clang is found there instead. `SOS_CLANG`, when set, is tried
     ahead of all of them. The probe compiles each architecture's own `boot.S`,
     because "can target riscv32" and "can target aarch64" are separate
-    questions and one harness needs both answered yes.
+    questions and one harness needs both answered yes. Its object goes in
+    each profile's build directory, or in `scratch` when one is given.
     """
     candidates = []
     if os.environ.get("SOS_CLANG"):
@@ -11207,14 +11208,15 @@ def _find_clang(arches):
         ok = True
         for arch in arches:
             dirs = arch_dirs(arch)
-            os.makedirs(dirs["build"], exist_ok=True)
+            build = scratch or dirs["build"]
+            os.makedirs(build, exist_ok=True)
             # The board's boot.S: a profile that is a variant of an existing
             # board has none of its own.
             probe_src = os.path.join(dirs["hal_board"], "boot.S")
             try:
                 _run([path, f"--target={arch['triple']}", *arch["cc_args"],
                       "-nostdlib", "-c", probe_src,
-                      "-o", os.path.join(dirs["build"], "_probe.o")])
+                      "-o", os.path.join(build, "_probe.o")])
             except ToolError:
                 ok = False
                 break
@@ -11223,8 +11225,9 @@ def _find_clang(arches):
     return None
 
 
-def _probe_tools(arches):
-    """Locate every qemu, ld.lld and a clang; print hints and exit on any miss."""
+def _probe_tools(arches, scratch=None):
+    """Locate every qemu, ld.lld and a clang; print hints and exit on any miss.
+    `scratch` is where the clang probe writes (`_find_clang`)."""
     missing = []
 
     qemus = {}
@@ -11237,7 +11240,7 @@ def _probe_tools(arches):
     lld = shutil.which("ld.lld")
     if not lld:
         missing.append("ld.lld")
-    clang = _find_clang(arches)
+    clang = _find_clang(arches, scratch)
     if not clang:
         missing.append("clang")
 
@@ -12063,16 +12066,17 @@ def _profile_description(arch, clang, lld, native, linker_script,
     return profile
 
 
-def _gate_profile(arch, clang, lld, blade):
+def _gate_profile(arch, clang, lld, blade, build=None):
     """The profile description of one of the gate's `ARCHES`, written into
-    its build directory; returns its path.
+    its build directory, or into `build` when one is given, with the native
+    units' objects beside it; returns its path.
 
     The native units are the HAL's: the board's `boot.S`, any assembly the
     architecture splits out of it (`hal_asm`), and the C every kernel links,
     `sink.c` from `hal_native` and the shared `support.c`.
     """
     dirs = arch_dirs(arch)
-    build = dirs["build"]
+    build = build or dirs["build"]
     native = [(os.path.join(dirs["hal_board"], "boot.S"),
                os.path.join(build, "boot.o"))]
     for rel in arch["hal_asm"]:
@@ -14601,6 +14605,498 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     return 1 if failed else 0
 
 
+# The product phase: the gate's scratch product. `tools/product.py new` makes
+# a product from `templates/product/` in a directory of its own outside the
+# tree, the fixture `tests/product/` (a package that exits with 3, and its
+# image) is copied into it, and the product's own `tools/sawos.py` builds,
+# boots and tests its images against this tree, named by `SAWOS_ROOT`, as a
+# product does, so a change here that breaks a product is red here first.
+# Every refusal of `tools/sawos.py` and `tools/product.py` has a row
+# (`product_pinned_from_cache` takes the pinned path through a cache that
+# already holds the tree). Nothing the phase runs can reach the network,
+# whatever the tools do: every run has a `SAWOS_CACHE` of its own in the
+# scratch directory, and a git that takes only `file` transports
+# (`_product_run`). The directory is removed whether the phase passes or
+# fails.
+#
+# It runs after every profile, alone: `tools/sawos.py` builds the image
+# builder in place, in `tools/sosimage/`, as any product's does, and a case
+# of a profile could be linking with it. The builder it leaves must be the
+# one the run built, byte for byte (`product_builder_unchanged`), so whatever
+# runs after it, in this run or the next, runs the same builder.
+#
+# `--case product` runs the phase alone; a run narrowed to other cases, or to
+# a profile that is not riscv32, leaves it out.
+PRODUCT_PHASE = "product"
+PRODUCT_FIXTURE = os.path.join(TESTS_DIR, "product")
+PRODUCT_TOOL = os.path.join(REPO_ROOT, "tools", "product.py")
+SOSIMAGE_BINARY = os.path.join(SOSIMAGE_DIR, ".build", "host", "sosimage")
+
+# The harness's deadline on one `tools/sawos.py` command, which may build
+# Blade, the image builder and every image before it boots one.
+PRODUCT_TIMEOUT_S = 1800
+
+# What `test hello-riscv32` prints, in order: the kernel's banner, the
+# greeting the driver wrote for `hello`, `hello`'s count, root's line for its
+# end, and the verdict.
+PRODUCT_HELLO = ["{banner}",
+                 "hello from a product",
+                 "hello: the driver wrote 21 bytes",
+                 "root: hello ended status=65536"]
+
+
+# The scratch directory of the product phase that is running, which every
+# run it makes keeps its sawos cache in (`_product_run`).
+_PRODUCT_SCRATCH = None
+
+
+def _product_run(argv, env=None):
+    """Run `argv` with the environment this run has, less `SAWOS_ROOT`, plus
+    the phase's fence, plus `env`; answer the finished process.
+
+    The fence: a `SAWOS_CACHE` of the run's own, an empty directory in the
+    phase's scratch directory, so no run finds or fills the user's cache;
+    and `GIT_ALLOW_PROTOCOL=file`, so a git any tool runs refuses every
+    transport but a local one. Standard input is an empty pipe this process
+    holds open, so an emulator's console sees no byte and no end of file
+    (`_run_qemu`)."""
+    import tempfile
+
+    full = {k: v for k, v in os.environ.items() if k != "SAWOS_ROOT"}
+    full["SAWOS_CACHE"] = tempfile.mkdtemp(prefix="cache-",
+                                           dir=_PRODUCT_SCRATCH)
+    full["GIT_ALLOW_PROTOCOL"] = "file"
+    full.update(env or {})
+    read_fd, write_fd = os.pipe()
+    try:
+        return subprocess.run(argv, env=full, stdin=read_fd,
+                              capture_output=True, text=True,
+                              timeout=PRODUCT_TIMEOUT_S)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def _sawos_py(product, args, env=None):
+    return _product_run([sys.executable,
+                         os.path.join(product, "tools", "sawos.py"), *args],
+                        env)
+
+
+def _refused(proc, status, text):
+    """Whether `proc` exited with `status` and said `text` on standard
+    error; the reason when not."""
+    if proc.returncode == status and text in proc.stderr:
+        return None
+    return (f"expected exit {status} and {text!r} on stderr; got exit "
+            f"{proc.returncode}, stdout {proc.stdout!r}, stderr "
+            f"{proc.stderr!r}")
+
+
+def _head_commit():
+    return subprocess.run(["git", "-C", REPO_ROOT, "rev-parse", "HEAD"],
+                          capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def _file_sha256(path):
+    import hashlib
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def _product_rows(scratch, builder_before):
+    """The phase's rows, in order, as (name, check); a check answers None
+    when it holds and its reason when not."""
+    import product as tool
+
+    product = os.path.join(scratch, "product")
+    tree = {"SAWOS_ROOT": REPO_ROOT}
+    head = _head_commit()
+
+    # A tree reached through a pin is looked for in a cache of the row's own,
+    # with no `git` to fetch it by, so no row and no mutation of the tools
+    # can reach the network.
+    empty = os.path.join(scratch, "empty-path")
+    os.makedirs(empty)
+
+    def offline(name):
+        return {"SAWOS_CACHE": os.path.join(scratch, f"{name}-cache"),
+                "PATH": empty}
+
+    def bare(name, pin=None):
+        """A product of `tools/sawos.py` alone, with `pin` as its pin."""
+        path = os.path.join(scratch, name)
+        os.makedirs(os.path.join(path, "tools"))
+        shutil.copy(os.path.join(product, "tools", "sawos.py"),
+                    os.path.join(path, "tools", "sawos.py"))
+        if pin is not None:
+            with open(os.path.join(path, "sawos.pin"), "w") as f:
+                f.write(pin)
+        return path
+
+    def image(name, text):
+        with open(os.path.join(product, "images", f"{name}.toml"), "w") as f:
+            f.write(text)
+
+    def made():
+        r = _product_run([sys.executable, PRODUCT_TOOL, "new", product])
+        if r.returncode != 0:
+            return f"new failed ({r.returncode}): {r.stdout}{r.stderr}"
+        with open(os.path.join(product, "sawos.pin")) as f:
+            if f'sha = "{head}"' not in f.read():
+                return f"its sawos.pin does not pin {head}"
+        for rel in ("tools/sawos.py", "images/hello-riscv32.toml",
+                    "hello/Saw.toml"):
+            if not os.path.isfile(os.path.join(product, rel)):
+                return f"it has no {rel}"
+        for _root, dirs, files in os.walk(product):
+            for name in [*dirs, *files]:
+                if name in tool.LEFT_BEHIND:
+                    return f"it carries {name}"
+        return None
+
+    def made_twice():
+        r = _product_run([sys.executable, PRODUCT_TOOL, "new", product])
+        return _refused(r, 1, "exists; a product is made in a new directory")
+
+    def not_a_checkout(env=None):
+        # A tree inside this checkout, so a search for a repository that
+        # went past the tree's top would find this one.
+        fixture = os.path.join(REPO_ROOT, ".build", "product-fixture")
+        shutil.rmtree(fixture, ignore_errors=True)
+        try:
+            os.makedirs(os.path.join(fixture, "tools"))
+            shutil.copy(PRODUCT_TOOL, os.path.join(fixture, "tools"))
+            shutil.copytree(tool.TEMPLATE,
+                            os.path.join(fixture, "templates", "product"))
+            out = os.path.join(fixture, "made")
+            r = _product_run([sys.executable,
+                              os.path.join(fixture, "tools", "product.py"),
+                              "new", out], env)
+            if os.path.exists(out):
+                return f"it made {out}: {r.stdout}{r.stderr}"
+            return _refused(r, 1, "is not a git checkout")
+        finally:
+            shutil.rmtree(fixture, ignore_errors=True)
+
+    def under_another_repository():
+        # Git named this checkout's repository outright, which the search
+        # for the tree's own must not take.
+        git_dir = subprocess.run(
+            ["git", "-C", REPO_ROOT, "rev-parse", "--absolute-git-dir"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        return not_a_checkout({"GIT_DIR": git_dir, "GIT_WORK_TREE": REPO_ROOT})
+
+    def leaves_build_state():
+        source = os.path.join(scratch, "copy-source")
+        dest = os.path.join(scratch, "copy-dest")
+        for rel in ("keep.txt", "pkg/src/main.saw", "pkg/Saw.lock",
+                    "pkg/.build/x", "build/x", "pkg/__pycache__/x"):
+            os.makedirs(os.path.dirname(os.path.join(source, rel)),
+                        exist_ok=True)
+            with open(os.path.join(source, rel), "w") as f:
+                f.write("x\n")
+        os.symlink(REPO_ROOT, os.path.join(source, ".sawos"))
+        tool.copy_template(source, dest)
+        for rel in ("keep.txt", "pkg/src/main.saw"):
+            if not os.path.isfile(os.path.join(dest, rel)):
+                return f"the copy has no {rel}"
+        for rel in ("pkg/Saw.lock", "pkg/.build", "build", "pkg/__pycache__",
+                    ".sawos"):
+            if os.path.lexists(os.path.join(dest, rel)):
+                return f"the copy carries {rel}"
+        return None
+
+    def usages():
+        for args in ([], ["new"], ["build"]):
+            r = _product_run([sys.executable, PRODUCT_TOOL, *args])
+            why = _refused(r, 2, "usage: python3 tools/product.py")
+            if why is not None:
+                return f"product.py {' '.join(args)}: {why}"
+        return _refused(_sawos_py(product, []), 2,
+                        "usage: python3 tools/sawos.py")
+
+    def pin_refused(name, pin, text):
+        return lambda: _refused(_sawos_py(bare(name, pin), ["build"],
+                                          offline(name)), 1, text)
+
+    def root_not_sawos():
+        path = bare("not-sawos")
+        return _refused(_sawos_py(path, ["build"], {"SAWOS_ROOT": path}), 1,
+                        "is not a sawos tree")
+
+    def link_not_a_link():
+        path = bare("not-a-link")
+        os.makedirs(os.path.join(path, ".sawos"))
+        return _refused(_sawos_py(path, ["build"], tree), 1,
+                        "exists and is not a link")
+
+    def root_wins_over_pin():
+        path = bare("root-and-pin", f'sha = "{head}"\n')
+        env = offline("root-and-pin")
+        env.update(tree)
+        why = _refused(_sawos_py(path, ["frobnicate"], env), 2,
+                       "unknown command `frobnicate`")
+        linked = os.readlink(os.path.join(path, ".sawos"))
+        if why is None and linked != REPO_ROOT:
+            return "its .sawos does not name the tree SAWOS_ROOT names"
+        return why
+
+    def fetch_publishes():
+        # The fetch's own steps, without a fetch: each fetch of one pin
+        # checks out into a directory of its own, and one that finds a tree
+        # already published takes it.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "product_sawos", os.path.join(product, "tools", "sawos.py"))
+        sawos = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sawos)
+        cache = os.path.join(scratch, "publish-cache")
+        first, second = sawos.partial(cache, head), sawos.partial(cache, head)
+        if first == second or not (os.path.isdir(first)
+                                   and os.path.isdir(second)):
+            return f"two fetches share a partial directory: {first}"
+        for tmp in (first, second):
+            os.makedirs(os.path.join(tmp, "tools"))
+            with open(os.path.join(tmp, "tools", "product.py"), "w") as f:
+                f.write("\n")
+        dest = os.path.join(cache, head)
+        if sawos.publish(first, dest) != dest or not sawos.is_sawos(dest):
+            return "the first fetch's tree was not published"
+        if sawos.publish(second, dest) != dest or os.path.exists(second):
+            return "the second fetch did not take the published tree"
+        if os.path.exists(first):
+            return "the first fetch's directory is still there"
+        junk = os.path.join(cache, "junk")
+        os.makedirs(os.path.join(junk, "x"))
+        third = sawos.partial(cache, head)
+        try:
+            sawos.publish(third, junk)
+        except sawos.Refusal as e:
+            if "is not a sawos tree" not in str(e) or os.path.exists(third):
+                return f"publishing over a non-tree: {e}"
+            return None
+        return "a checkout was published over a directory that is no tree"
+
+    def builder_refuses():
+        image("x-refused", '[image]\nname = "x"\nboard = "riscv32-virt"\n'
+              'tick = false\n')
+        try:
+            r = _sawos_py(product, ["build", "x-refused"], tree)
+        finally:
+            os.remove(os.path.join(product, "images", "x-refused.toml"))
+        why = _refused(r, 1, "error: ")
+        if why is None and ("Traceback" in r.stderr
+                            or "x-refused.toml" not in r.stderr):
+            return f"the builder's refusal is not the tool's: {r.stderr!r}"
+        return why
+
+    def relinks():
+        path = bare("relinked")
+        os.symlink(scratch, os.path.join(path, ".sawos"))
+        why = _refused(_sawos_py(path, ["frobnicate"], tree), 2,
+                       "unknown command `frobnicate`")
+        linked = os.readlink(os.path.join(path, ".sawos"))
+        if why is None and linked != REPO_ROOT:
+            return "its .sawos does not name the tree SAWOS_ROOT names"
+        return why
+
+    def pinned_from_cache():
+        path = bare("pinned", f'sha = "{head}"\n')
+        cache = os.path.join(scratch, "cache")
+        os.makedirs(cache)
+        os.symlink(REPO_ROOT, os.path.join(cache, head))
+        why = _refused(_sawos_py(path, ["frobnicate"],
+                                 {"SAWOS_CACHE": cache, "PATH": empty}),
+                       2, "unknown command `frobnicate`")
+        if why is None and (os.readlink(os.path.join(path, ".sawos"))
+                            != os.path.join(cache, head)):
+            return "its .sawos does not name the cached tree"
+        return why
+
+    def cache_not_sawos():
+        path = bare("cached-junk", f'sha = "{head}"\n')
+        cache = os.path.join(scratch, "junk-cache")
+        os.makedirs(os.path.join(cache, head))
+        return _refused(_sawos_py(path, ["build"],
+                                  {"SAWOS_CACHE": cache, "PATH": empty}), 1,
+                        "is in the sawos cache and is not a sawos tree")
+
+    def fetch_needs_git():
+        path = bare("no-git", f'sha = "{head}"\n')
+        return _refused(_sawos_py(path, ["build"], offline("no-git")), 1,
+                        "needs `git`")
+
+    def product_refused(args, text, status=1):
+        return lambda: _refused(_sawos_py(product, args, tree), status, text)
+
+    def image_refused(name, text, refusal):
+        def check():
+            image(name, text)
+            try:
+                return _refused(_sawos_py(product, ["build", name], tree), 1,
+                                refusal)
+            finally:
+                os.remove(os.path.join(product, "images", f"{name}.toml"))
+        return check
+
+    def no_images():
+        path = bare("no-images")
+        return _refused(_sawos_py(path, ["build"], tree), 1,
+                        "there is no image description in")
+
+    def builds():
+        shutil.copytree(PRODUCT_FIXTURE, product, dirs_exist_ok=True)
+        r = _sawos_py(product, ["build"], tree)
+        if r.returncode != 0:
+            return f"build failed ({r.returncode}): {r.stdout}{r.stderr}"
+        for rel in ("hello-riscv32/hello-riscv32.elf", "fails/fails.elf",
+                    "riscv32/sosimage.profile.json"):
+            if not os.path.isfile(os.path.join(product, "build", rel)):
+                return f"it built no build/{rel}"
+        return None
+
+    def tests_pass():
+        r = _sawos_py(product, ["test", "hello-riscv32"], tree)
+        ok, reason = _check({"expect_out": [*PRODUCT_HELLO,
+                                            "test hello-riscv32: passed"],
+                             "expect_clean_exit": True},
+                            ARCHES[0], r.returncode, r.stdout, False)
+        return None if ok else f"{reason}; stderr {r.stderr!r}"
+
+    def tests_fail():
+        r = _sawos_py(product, ["test", "fails", "hello-riscv32"], tree)
+        ok, reason = _check({"expect_out": [
+                                "test fails: failed (the kernel's exit "
+                                "status is 3)",
+                                *PRODUCT_HELLO,
+                                "test hello-riscv32: passed"],
+                             "expect_clean_exit": False, "expect_status": 1},
+                            ARCHES[0], r.returncode, r.stdout, False)
+        return None if ok else f"{reason}; stderr {r.stderr!r}"
+
+    def runs():
+        r = _sawos_py(product, ["run", "fails"], tree)
+        if r.returncode != 3:
+            return (f"run fails exited {r.returncode}, not the kernel's 3: "
+                    f"{r.stdout}{r.stderr}")
+        return None
+
+    def verdicts():
+        for args, want in (
+                (("x", 0, False, 10), (True, "test x: passed")),
+                (("x", 3, False, 10),
+                 (False, "test x: failed (the kernel's exit status is 3)")),
+                (("x", 0, True, 10),
+                 (False, "test x: failed (still running after 10 s)"))):
+            got = tool.verdict(*args)
+            if got != want:
+                return f"verdict{args} is {got!r}, not {want!r}"
+        return None
+
+    def builder_unchanged():
+        after = _file_sha256(SOSIMAGE_BINARY)
+        if after != builder_before:
+            return (f"{SOSIMAGE_BINARY} is not the builder this run built "
+                    f"(sha256 {after}, was {builder_before})")
+        return None
+
+    return [
+        ("product_new", made),
+        ("product_new_exists", made_twice),
+        ("product_new_not_a_checkout", not_a_checkout),
+        ("product_new_under_another_repository", under_another_repository),
+        ("product_copy_leaves_build_state", leaves_build_state),
+        ("product_usage", usages),
+        ("sawos_no_tree", pin_refused(
+            "no-pin", None, "SAWOS_ROOT is unset, and there is no sawos.pin")),
+        ("sawos_pin_no_sha", pin_refused(
+            "pin-no-sha", "# no sha\n", "names no `sha`")),
+        ("sawos_pin_bad_sha", pin_refused(
+            "pin-bad-sha", 'sha = "abc"\n', "not a commit's 40")),
+        ("sawos_pin_unknown_key", pin_refused(
+            "pin-unknown-key", f'sha = "{head}"\nversion = "1"\n',
+            "unknown key `version`")),
+        ("sawos_pin_malformed", pin_refused(
+            "pin-malformed", "sha abc\n", 'expected `key = "value"`')),
+        ("sawos_pin_long_sha", pin_refused(
+            "pin-long-sha", f'sha = "{head}0"\n', "not a commit's 40")),
+        ("sawos_pin_uppercase_sha", pin_refused(
+            "pin-uppercase-sha", f'sha = "{"A" * 40}"\n',
+            "not a commit's 40")),
+        ("sawos_root_not_sawos", root_not_sawos),
+        ("sawos_link_not_a_link", link_not_a_link),
+        ("sawos_relinks", relinks),
+        ("sawos_root_wins_over_pin", root_wins_over_pin),
+        ("sawos_pinned_from_cache", pinned_from_cache),
+        ("sawos_cache_not_sawos", cache_not_sawos),
+        ("sawos_fetch_needs_git", fetch_needs_git),
+        ("sawos_fetch_publishes", fetch_publishes),
+        ("product_unknown_image", product_refused(
+            ["test", "nosuch"], "there is no image `nosuch`")),
+        ("product_no_images", no_images),
+        ("product_run_takes_one", product_refused(
+            ["run"], "run takes one image")),
+        ("product_run_takes_only_one", product_refused(
+            ["run", "hello-riscv32", "hello-riscv32"], "run takes one image")),
+        ("product_image_unreadable", image_refused(
+            "x-unreadable", "[image\n", "cannot read")),
+        ("product_image_names_no_board", image_refused(
+            "x-no-board", '[image]\nname = "x"\n',
+            "names no image and board in `[image]`")),
+        ("product_image_names_no_name", image_refused(
+            "x-no-name", '[image]\nboard = "riscv32-virt"\n',
+            "names no image and board in `[image]`")),
+        ("product_board_unknown", image_refused(
+            "x-unknown-board", '[image]\nname = "x"\nboard = "nosuch"\n',
+            "names the board nosuch")),
+        ("product_board_without_profile", image_refused(
+            "x-c3", '[image]\nname = "x"\nboard = "esp32c3"\n',
+            "a product cannot build for the board esp32c3")),
+        ("product_builder_refuses", builder_refuses),
+        ("product_build", builds),
+        ("product_test_passes", tests_pass),
+        ("product_test_fails", tests_fail),
+        ("product_run_status", runs),
+        ("product_verdict", verdicts),
+        ("product_builder_unchanged", builder_unchanged),
+    ]
+
+
+def _product_phase():
+    """Run the product phase; returns (passed, failed)."""
+    import tempfile
+
+    print(f"{BOLD}product{RESET}  (templates/product, made by "
+          f"tools/product.py new outside the tree)")
+    global _PRODUCT_SCRATCH
+    builder_before = _file_sha256(SOSIMAGE_BINARY)
+    scratch = tempfile.mkdtemp(prefix="sawos-product-")
+    _PRODUCT_SCRATCH = scratch
+    passed = failed = 0
+    try:
+        rows = _product_rows(scratch, builder_before)
+        for i, (name, check) in enumerate(rows, 1):
+            try:
+                why = check()
+            except (OSError, subprocess.SubprocessError) as e:
+                why = f"{type(e).__name__}: {e}"
+            if why is None:
+                passed += 1
+                print(f"[{i}/{len(rows)}] {CHECK} {name}")
+            else:
+                failed += 1
+                print(f"[{i}/{len(rows)}] {CROSS} {name}")
+                for line in why.splitlines():
+                    print(f"    {line}")
+    finally:
+        _PRODUCT_SCRATCH = None
+        shutil.rmtree(scratch, ignore_errors=True)
+    print()
+    return passed, failed
+
+
 def own_table_problems(source, path):
     """Mistakes in this file's own tables, found from its syntax tree.
 
@@ -15206,9 +15702,12 @@ def main():
     # are matched with '-' and '_' interchangeable because the case names use
     # underscores while the tests/ directories use hyphens.
     selected_cases = TEST_CASES
+    run_product = any(arch["name"] == "riscv32" for arch in arches)
     if args.cases:
         wanted = [w.strip().replace("-", "_")
                   for value in args.cases for w in value.split(",") if w.strip()]
+        run_product = run_product and PRODUCT_PHASE in wanted
+        wanted = [w for w in wanted if w != PRODUCT_PHASE]
         by_name = {c["name"].replace("-", "_"): c for c in TEST_CASES}
         unknown = [w for w in wanted if w not in by_name]
         if unknown:
@@ -15264,7 +15763,7 @@ def main():
     packager = None
     packages = any(case.get("root_pkg") or case.get("children")
                    for case in selected_cases)
-    if packages or not python_path:
+    if packages or not python_path or run_product:
         shared_build = os.path.join(REPO_ROOT, ".build", "sos-host")
         os.makedirs(shared_build, exist_ok=True)
         try:
@@ -15292,16 +15791,21 @@ def main():
 
     total_passed = 0
     total_failed = 0
-    for arch in arches:
+    for arch in arches if selected_cases else ():
         passed, failed = _run_arch(arch, qemus[arch["name"]], lld, clang,
                                    blade_bin, builder, packager,
                                    selected_cases, args.jobs)
         total_passed += passed
         total_failed += failed
+    if run_product:
+        passed, failed = _product_phase()
+        total_passed += passed
+        total_failed += failed
 
     print("=" * 60)
     if total_failed == 0:
-        names = " + ".join(a["name"] for a in arches)
+        names = " + ".join([*(a["name"] for a in arches if selected_cases),
+                            *([PRODUCT_PHASE] if run_product else [])])
         print(f"{GREEN}{BOLD}ALL SOS TESTS PASSED{RESET} "
               f"({total_passed} passed across {names})")
         print("=" * 60)

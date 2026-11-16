@@ -1,15 +1,17 @@
 // Every description in the sawos tree reads clean (`sosimage.tree`): each
 // board's `board.toml`, each `process.toml` against the boards that have its
 // types, and each hand-written image under `tests/images/` against its board,
-// at the board's grain. Then each refusal of the tree's check, on a tree of
-// its own, the check of one board against its kernel's numbers on that tree,
-// and a declaration held to a kernel's numbers. The test runs in the
-// package's directory, two below the tree's top.
+// at the board's grain. Then each refusal of the tree's check, on a tree of its
+// own, the check of one board against its kernel's numbers on that tree, and a
+// declaration held to a kernel's numbers. The product template's and the gate's
+// product fixture's descriptions, which no walk of the tree reaches, are read
+// here too. The test runs in the package's directory, two below the tree's top.
 
 import sosimage.board.{Board}
 import sosimage.build.{ensure_directory}
 import sosimage.declaration.{Declaration}
-import sosimage.imagefile.{ImageFile, bind}
+import sosimage.imagefile.{ImageFile, bind, image_board}
+import sosimage.product.{find_board}
 import sosimage.kernel.{KernelFacts}
 import std.file.{File}
 import std.path.{Path}
@@ -140,6 +142,28 @@ func quota_refusal(quota: String) -> String {
     }
 }
 
+/// The declaration in the package `dir` (from the tree's top) reads clean
+/// and holds on `board`, and the image `image` reads clean against the board
+/// it names.
+func product_reads_clean(dir: String, board: &Board, image: String) {
+    let decl_file = "../../{dir}/process.toml"
+    let decl = match Declaration.parse(try! read_text(decl_file), decl_file) {
+        case Ok(d) -> move d,
+        case Err(e) -> panic("{e.message}")
+    }
+    match decl.check_against(&board) {
+        case Ok(_) -> {},
+        case Err(e) -> panic("{e.message}")
+    }
+    let file = "../../{image}"
+    let text = try! read_text(file)
+    let named = try! find_board("../..", try! image_board(text, file))
+    match ImageFile.parse(text, file, &named, 4) {
+        case Ok(_) -> {},
+        case Err(e) -> panic("{e.message}")
+    }
+}
+
 func main() {
     let tree = match read_tree("../..") {
         case Ok(t) -> move t,
@@ -165,6 +189,10 @@ func main() {
     // The UART service with the stock root on riscv32-virt: the console is
     // the board's one NS16550, so the driver gets it only by naming it.
     let virt = try! Board.parse(try! read_text("../../hal/riscv32/board.toml"), "virt.toml")
+    product_reads_clean("templates/product/hello", &virt,
+                        "templates/product/images/hello-riscv32.toml")
+    product_reads_clean("tests/product/fails", &virt,
+                        "tests/product/images/fails.toml")
     var decls = Vector<Declaration>()
     try! decls.push(try! Declaration.parse(try! read_text("../../drivers/svc-uart-ns16550/process.toml"), "d.toml"))
     try! decls.push(try! Declaration.parse(try! read_text("../../tests/svc-client/process.toml"), "c.toml"))

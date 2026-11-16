@@ -57,12 +57,17 @@ root/              # the stock root: it launches an image's processes as
                    # the plan the image builder writes for the image
                    # (`imageplan`) says; bootplan/ holds the plan's types.
                    # It builds only with a plan (tools/sosimage/src/plan.saw)
+templates/product/ # the product template `tools/product.py new` copies: a
+                   # product's tools/sawos.py, a process package and an image
+                   # (its README says how a product builds)
 tests/             # kernel entries, test packages, hand-assembled payloads;
                    # images/ holds hand-written image descriptions (TOML,
-                   # tools/sosimage/src/imagefile.saw)
+                   # tools/sosimage/src/imagefile.saw); product/ the gate's
+                   # product fixture
 tools/             # sos_runner.py (the harness: packages, cases, QEMU, every
                    # profile) + toolchain.py (the sawlang resolver) +
-                   # sosimg_dump.py
+                   # product.py (a product's commands, run through its
+                   # `.sawos` link, and `new`) + sosimg_dump.py
 tools/sosimage/    # the image builder, a hosted Saw package Blade builds: it
                    # builds each process's package through a script of the
                    # process's own (its region and flash slot, the runner's
@@ -180,6 +185,21 @@ numbers given there.
 `SOS_IMAGE_BUILDER=python` builds every image through the runner's own code
 instead, so the two can be compared, except those kinds of case, which
 that path refuses by name.
+
+A product is a repository of its own whose images build against a pinned
+sawos (`templates/product/README.md`). Its `tools/sawos.py` links `.sawos`
+to the tree `SAWOS_ROOT` names, or to the commit its `sawos.pin` names,
+fetched into `~/.cache/sawos/<sha>/`, and runs the tree's `tools/product.py`
+through the link, which builds Blade and the builder as the runner does and
+boots with the runner's own code. After every profile, `make sos-test` runs
+the product phase (`_product_phase`): `tools/product.py new` makes a scratch
+product outside the tree, `tests/product/` is copied in, and its
+`tools/sawos.py` builds, tests and runs its images on riscv32 with
+`SAWOS_ROOT` naming the tree, beside a row for each refusal of the two
+tools. Nothing reaches the network: every run has a sawos cache of its own
+and a git limited to local transports (`_product_run`). The phase rebuilds
+the builder in place, as a product does, and fails unless it is the same
+binary. `--case product` runs the phase alone.
 
 Implementers run targeted tests while implementing: the cases the change
 affects, selected with `--case a,b` (comma-separated or repeated) and, for one
