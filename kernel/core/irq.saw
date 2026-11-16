@@ -73,7 +73,11 @@ func fire_timer(slot: Int, now: UInt64) unsafe {
 // them again on trap entry in hardware, and each machine's return to user mode
 // is where they come back on. Nothing below arranges any of that; each HAL
 // states in its ABI.md that an interrupt arriving in kernel mode lands on its
-// kernel-bug path rather than on this code. So there are no critical sections
+// kernel-bug path rather than on this code. The one exception is a HAL whose
+// core wakes from its idle sleep only by taking an interrupt (the ESP32-S3's
+// `waiti`): it takes it at that one instruction inside `wait_for_irq` and
+// returns from it there, masked, without running any of this code, and the
+// line is left pending for the poll. So there are no critical sections
 // here, no interrupt masking vocabulary, and no `IntrSpinLock` (spec §9b) until
 // SMP needs one.
 //
@@ -357,13 +361,15 @@ public(package) func service_irq(frame_addr: UInt, cause: UInt) unsafe {
 // slower to diagnose (a hang at the harness timeout instead of a report). What
 // it never does is call a real wait a deadlock.
 //
-// The idle loop polls instead of taking the interrupt. Interrupts are taken
-// from user mode only, enforced by the machines, so an interrupt arriving while
-// the kernel idles is pending rather than delivered. `wait_for_irq` parks the
-// core until one is pending (both machines wake from it on a pending interrupt
-// whether or not it is deliverable), and `irq_poll` then asks the controller
-// for it directly. The kernel still never takes a trap in kernel mode, and the
-// same `deliver_line` services the line either way.
+// The idle loop polls instead of delivering from a trap. Interrupts are
+// delivered from user mode only, enforced by the machines, so an interrupt
+// arriving while the kernel idles is pending rather than delivered.
+// `wait_for_irq` parks the core until one is pending, and `irq_poll` then asks
+// the controller for it directly. Most cores wake from the park on a pending
+// interrupt whether or not it is deliverable; the ESP32-S3's `waiti` wakes
+// only by taking it, and its HAL returns from that interrupt inside
+// `wait_for_irq`, masked, with the line still pending. Either way no trap in
+// kernel mode reaches `ktrap`, and the same `deliver_line` services the line.
 /// Ask the controller for a line, and service it if there is one.
 func idle_poll() unsafe {
     let line = hal.irq_poll()

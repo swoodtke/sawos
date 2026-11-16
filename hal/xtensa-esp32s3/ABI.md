@@ -588,8 +588,9 @@ What the kernel's table (`kernel/boot.S`) does at each: the six window
 vectors spill and fill a windowed thread's frames in its own context (§7d);
 the user vector takes the Alloca exception (`EXCCAUSE` 5) in place and
 everything else into the trap entry (§7c); the kernel vector takes the
-Alloca exception windowed code under `sos_windowed_call` raises (§7g) and
-stops the machine for anything else; the double vector sends a fault a
+Alloca exception windowed code under `sos_windowed_call` raises (§7g) and the
+interrupt that ends the idle `waiti` (§6d), and stops the machine for
+anything else; the double vector sends a fault a
 window handler took for a user thread through the user vector as that
 thread's own, and stops the machine for any other (§7d); every other vector
 stops the machine through `kernel_fault`.
@@ -745,8 +746,8 @@ on the tick: SYSTIMER INT_CLR bit 0 (lowers the line), re-arm
 ```
 
 Three ticks arrived, each with the interrupted user PC (§12). `PS.INTLEVEL`
-is 0 in user mode and the kernel runs at 15, so ticks are only ever taken
-from user mode.
+is 0 in user mode and the kernel runs at 15, so ticks are taken from user
+mode, and in the kernel only at the idle `waiti` (§6d).
 
 **Rerouting does not lower a line.** Probed by the kernel's `external_irq`
 smoke case with the mask written as a reroute: UART0 (source 27) routed to CPU
@@ -845,6 +846,64 @@ take; a masked pending interrupt does not end it. So the C3's idle shape
 either sleeps at a level that lets the tick in and takes it in kernel mode,
 or spins reading the `INTERRUPT` SR, which shows pending bits whether or not
 they are enabled (§6b, §6c).
+
+**What is built: the kernel sleeps, and takes the interrupt that wakes it.**
+
+- **The level.** Every CPU interrupt the kernel enables is level 1 and
+  level-triggered: the tick's (1) and the nine a device line may be given
+  (`DEVICE_CPU_INTS`, §6c), so `waiti 0` is the one level that lets every
+  line in. With PS.UM = 0 a level-1 interrupt arrives at the kernel vector
+  (+0x300) with `EXCCAUSE` 4. No CPU interrupt of level 2 to 5 is enabled,
+  nor the NMI (14), so their vectors stay fatal.
+- **The sleep.** `wait_for_irq` (`lib.saw`) calls `boot.S`'s
+  `sos_idle_wait`, a call0 leaf in IRAM: `waiti 0`, then `ret` at
+  `sos_idle_resume`. The interrupt that ends the sleep has EPC1 =
+  `sos_idle_resume`, the instruction after the `waiti`; one pending already
+  is taken at once.
+- **The entry.** The kernel vector, past its Alloca test, compares EPC1 with
+  `sos_idle_resume`. Equal, it adds one to `sos_idle_wakes`, writes PS =
+  `0x1F` (INTLEVEL 15, EXCM 1, UM 0, WOE 0) and returns with `rfe`, which
+  leaves PS = `0x0F` at the `ret`. It uses a0, through `EXCSAVE1`, which the
+  kernel holds nothing in by then (§7c), and a8, a scratch register of the
+  leaf. Nothing is delivered: the line, level-triggered, stays pending and
+  masked, and the idle loop's `irq_poll` finds it as it finds any line.
+  Anything else at the kernel vector stops the machine as before: an
+  interrupt taken anywhere else in the kernel is `SOS-S3: kernel fault
+  vector=0x00000300 exccause=0x00000004`, status 0x8C. No EXCCAUSE test is
+  needed: the instruction at `sos_idle_resume` is a `ret` in IRAM, which
+  raises nothing, so EPC1 there is the wake.
+- **An expired deadline is not slept on.** `wait_for_irq` returns without
+  sleeping while the timer reads expired (`irq_poll`'s own test), so the
+  idle poll delivers the timer at once, without a round trip through the
+  kernel vector. It is not needed to wake at all: SYSTIMER's alarm fires for
+  a target already behind the counter. On the emulator, probed: a scratch
+  kernel set TARGET0 to 1 ns, and to 1 ms behind the counter, and read
+  `INT_RAW = 1` and `INTERRUPT = 0x00000002` 20 ms later in both, as for a
+  target 2 ms ahead. On the part, by ESP-IDF v5.4.1's code (read, not
+  probed): the ESP32-S3 sets `SOC_SYSTIMER_ALARM_MISS_COMPENSATE`
+  (`soc/esp32s3/include/soc/soc_caps.h:378`, "Systimer peripheral can
+  generate interrupt immediately" for a target already passed), so
+  `systimer_hal_set_alarm_target` takes its first form
+  (`hal/systimer_hal.c:78`: write the target, enable the alarm); the form
+  that reprograms a target found behind the counter (`:89`) is compiled only
+  for chips without that capability. The part's `idle_wake` showed the
+  guard taken: a first arm whose wait came after its deadline read `did not
+  sleep`.
+
+The smoke's `idle_wake` drives the seam in the idle loop's order (wait,
+then poll): a deadline 1 ms ahead and UART0's line each end a sleep, and a
+deadline behind the counter is answered with none, by `hal.idle_wakes()`;
+PS after each wait reads `0x0F`, so the vector's write-back is held to
+INTLEVEL 15 and not merely to a level that masks level 1.
+The timer's step arms its deadline again until a wait is one the `waiti`
+ended: a wait reached after the deadline is answered without a sleep. On
+the part (rev v0.2, the `rom` clock key) a single arm's wait came after its
+deadline in each of three boots, which the emulator's never has; nothing is
+printed between the arm and the wait, and the path between them runs there
+for the first time, its code fetched through the flash cache.
+`kernel_irq_fault` takes the interrupt at INTLEVEL 0 in a kernel leaf and
+`kernel_irq_stray_waiti` at a `waiti` of the test's own; both stop at the
+kernel vector.
 
 ---
 
@@ -1147,9 +1206,10 @@ call0 function receives its arguments in `a2..a7`.
 
 ### 7f. Interrupts are masked in the kernel
 
-The kernel never takes an interrupt, whatever is armed and whenever it comes
-due. Every interrupt it enables is a level-1 CPU interrupt (§6c), and every
-instruction it executes runs with level 1 masked:
+The kernel never takes an interrupt but at the idle `waiti` (§6d), whatever
+is armed and whenever it comes due. Every interrupt it enables is a level-1
+CPU interrupt (§6c), and every instruction it executes but that `waiti` runs
+with level 1 masked:
 
 - **From the ROM to `_start`'s `wsr ps`.** The handover PS is `0x00060320`,
   INTLEVEL 0, but INTENABLE is 0 (§2b), so nothing can be taken. The first
@@ -1157,10 +1217,13 @@ instruction it executes runs with level 1 masked:
   WOE 0) before leaving the register window (§2b); `intc_init`, which is
   what first sets an INTENABLE bit, runs much later, from `kmain`.
 - **The whole kernel.** Nothing in the kernel writes PS apart from the trap
-  entry, the restore path, the Alloca path and `sos_windowed_call`, all in
-  `boot.S`; no C leaf in `sink.c` touches it. So PS stays `0x0F` through
+  entry, the restore path, the Alloca path, `sos_windowed_call`, and the
+  idle sleep's `waiti 0` and the kernel vector's return from it (§6d), all
+  in `boot.S`; no C leaf in `sink.c` touches it. So PS stays `0x0F` through
   `kmain`, the loader, `start_tick` and every `ktrap`, but for a windowed
-  call (§7g), which sets WOE and keeps INTLEVEL 15, and puts PS back.
+  call (§7g), which sets WOE and keeps INTLEVEL 15, and puts PS back, and
+  for the idle `waiti` itself, after which the kernel vector writes INTLEVEL
+  15 back before it returns.
 - **The trap entry.** A trap arrives with PS.EXCM = 1, which masks levels up
   to `XCHAL_EXCM_LEVEL` (3, §5d), so the save sequence is not interruptible;
   it then writes PS = `0x0F` before calling `ktrap`.
@@ -1734,9 +1797,15 @@ a board" is the order to find out in.
   aligned, which is what the ISA asks, so a masked register reads the same.
   *On silicon (rev v0.2, ROM `esp32s3-20210327`):* the table at
   0x4037_8400 receives `syscall` and level-1 interrupts from user mode.
-- **`waiti`.** The kernel never executes it (§6d): idle is a poll loop, so
-  whether a part's `waiti` wakes the way the emulator's does cannot matter
-  for a first boot.
+- **`waiti`.** The kernel sleeps in `waiti 0` when idle (§6d). Here it
+  wakes for the tick's interrupt and a device line's, and takes each at the
+  kernel vector with EPC1 the instruction after it. A deadline already
+  behind the counter is not slept on: the poll delivers it without a wake
+  (§6d). *On silicon (rev v0.2, ROM `esp32s3-20210327`):* `idle_wake` ran to
+  its end with no fault line, UART0's line woke the `waiti`, and a deadline
+  armed 1 ms ahead was behind the counter by the first wait, which read `did
+  not sleep`, in each of three boots; `kill_churn` at `pll80`, which never
+  idles in its rounds, ran to its end.
 - **The ROM banner.** Its third line carries the reset reason and the strap
   word (`boot:0x4` here, where `GPIO_STRAP` reads 4), so it differs on a
   board strapped otherwise. *On silicon (rev v0.2, ROM

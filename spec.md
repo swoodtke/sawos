@@ -2018,8 +2018,10 @@ decides on, then `pid`, the named process's pid (below).
   made it and an interrupt that preempts is charged to the one it interrupted.
   Traps taken through the boot door before any process exists are
   unattributed, and an interrupt taken while the kernel is idle or at a
-  preemption point is not counted at all, because it arrives through the poll
-  rather than through a vector and no process was current.
+  preemption point is not counted at all, because it is delivered through the
+  poll rather than through `ktrap` and no process was current. (On the
+  ESP32-S3 the vector that ends the idle sleep is taken, but it returns to
+  the poll without entering `ktrap`; §9.)
 - While the process lives, the columns are its body's row of the shared stats
   region (below), keyed by the body's index, and the row is zeroed and given the
   new process's pid at process create, on both doors, so a
@@ -3743,9 +3745,11 @@ ready bitmap — on a one-tick slice. The tick's period is kernel policy (§2.6)
 the tick re-arms from now, so a late tick is one tick, never a burst of
 catch-up. The kernel arms the tick unless the image's boot flags say not to
 (§12): `kernel/main.saw` passes `TICK_PERIOD_US`, 10 ms, to the loader, which
-arms it as the last step before root's first entry to user mode. Interrupts
-are masked in the kernel on every board (§9), so the tick is taken from user
-mode only. The harness kernels that test the tick and timers arm their own.
+arms it as the last step before root's first entry to user mode. Interrupts are
+masked in the kernel on every board (§9), so the tick is taken from user mode
+only, but for the one instruction of the ESP32-S3's idle sleep, whose interrupt
+is returned from and left for the idle poll (§9). The harness kernels that test
+the tick and timers arm their own.
 
 - **The trap frame is the thread context**, so a context switch is `ktrap`
   returning a different frame than it was called with: one switch point, at the
@@ -4214,7 +4218,10 @@ death, its notification and its teardown holds for it.
 - **An interrupt line is readiness from outside the thread set**, so a bound
   line keeps "nothing runnable" from being a deadlock (§7), for as long as it
   stays bound. The kernel idles by parking the core and polling rather than by
-  taking the trap.
+  delivering from a trap. A core that wakes from its sleep only by taking an
+  interrupt (the ESP32-S3's `waiti`) takes it at the sleep instruction, and
+  its HAL returns from it to the poll at once, masked, with the line still
+  pending.
 - **The interrupt seam.** Each HAL exposes a small set of names and the kernel
   reaches interrupts through those and nothing else — among them `intc_init`,
   `is_interrupt`, `irq_line_valid`, `irq_claim`/`irq_complete`,
@@ -4224,13 +4231,18 @@ death, its notification and its teardown holds for it.
   return path that steps the saved PC — and `service_irq` is the one arch-free
   entry: claim, rearm or mask, run the hook, complete.
 
-**The hardware never delivers an interrupt in kernel mode; the kernel asks,
-at named points.** The first half is enforced by both machines — an interrupt
+**The hardware never delivers an interrupt in kernel mode; the kernel asks, at
+named points.** The first half is enforced by both machines — an interrupt
 arriving in kernel mode is each HAL's kernel-bug path, which stays a live
-tripwire rather than becoming a delivery path. Delivery has three entry
-points: the trap path from user mode, the idle poll, and a preemption point
-inside a long kernel operation, which polls through the same `irq_poll` and
-the same delivery funnel. No new seam, no brief unmask, no nested trap frame.
+tripwire rather than becoming a delivery path. The one exception is a HAL whose
+core wakes from sleep only by taking an interrupt (the ESP32-S3's `waiti`):
+there the idle wait's own instruction may take it, and the HAL returns from it
+to the idle poll at once, masked, without delivering it. An interrupt anywhere
+else in kernel mode is still that HAL's kernel-bug path. Delivery has three
+entry points: the trap path from user mode, the idle poll, and a preemption
+point inside a long kernel operation, which polls through the same `irq_poll`
+and the same delivery funnel. No new seam, no brief unmask, no nested trap
+frame.
 
 - **A point interrupts latency, not atomicity.** A reschedule the delivery
   signals is honored where it always is, at the user-return boundary; the
@@ -4354,8 +4366,10 @@ whose boot flags turn the tick off.
   cheap; a failed acquire on uniprocessor signals reentrancy — panic,
   never spin forever).
 - **Not built, and correctly so.** Interrupts are taken from user mode only,
-  enforced by both machines, and the idle path polls rather than taking the
-  trap (§9), so the kernel holds no state an ISR could interrupt. Kernel
+  enforced by both machines, and the idle path polls rather than delivering
+  from a trap (§9), so the kernel holds no state an ISR could interrupt. The
+  ESP32-S3's idle sleep takes an interrupt at its `waiti` and returns from it
+  without running any kernel code, so it changes nothing here. Kernel
   interruptibility is explicit preemption points, and a point is the
   assertion that state is consistent, so it needs no lock — what it needs is a
   placement sentence per site plus one reentrancy guard for the code the two

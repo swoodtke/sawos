@@ -1,0 +1,120 @@
+// The ESP32-S3's idle sleep: `hal.wait_for_irq` sleeps in `waiti 0`, and the
+// interrupt that ends the sleep is left pending for the poll.
+//
+// This drives the HAL's idle seam directly, in the idle loop's own order
+// (`kcore.irq.idle_once`: wait, then poll), with no process. Each step waits
+// until the poll answers a line, and reads the HAL's count of interrupts the
+// idle `waiti` took (`hal.idle_wakes`) around it:
+//
+//   a deadline 1 ms ahead          the timer's line woke the waiti
+//   UART0's line raised            the device line woke the waiti
+//   a deadline behind the counter  the timer reads expired, so the core
+//                                  does not sleep
+//
+// The first two say `woke the idle waiti` when the count rose by at least
+// one, and print the rise for a reader. Each step also prints PS as the last
+// wait returned it (`ps=`): 0x0F, the kernel's, which the kernel vector
+// writes back before it returns from the wake. Every line the kernel enables
+// is level 1, so INTLEVEL 1 would mask as much as 15 does; the PS read is
+// what holds the vector to 15.
+//
+// The timer's step is made true by construction rather than by its 1 ms.
+// `wait_for_irq` does not sleep on a deadline already behind the counter, so
+// a wait that reaches it late, after the deadline, is answered with no sleep,
+// and a stalled host, or a part fetching the path's code through a cold flash
+// cache, makes it late. So the step arms a deadline 1 ms ahead and waits,
+// again, until a wait is ended by the `waiti`; how many arms it took is
+// printed for a reader. That the step ends at all is the harness deadline's
+// to judge.
+//
+// The device line's step needs no such loop: no deadline is armed, and a
+// level line pending when `waiti` runs is taken at once, so the wait sleeps
+// whenever it comes. The third's `did not sleep` is a rise of zero, which no
+// stall changes: an expired timer is never slept on.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func ktest_ps() -> UInt
+}
+
+static DEADLINE_AHEAD_NS: UInt64 = 1_000_000
+static NEVER_NS: UInt64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// PS as the last `wait_for_irq` returned it, read by `idle_until_line`.
+unsafe static var PS_AFTER_WAIT: UInt = 0
+
+/// Wait and poll until the poll answers a line, as the idle loop does.
+func idle_until_line() unsafe -> UInt {
+    var line = hal.IRQ_NONE
+    while line == hal.IRQ_NONE {
+        hal.wait_for_irq()
+        PS_AFTER_WAIT = ktest_ps()
+        line = hal.irq_poll()
+    }
+    line
+}
+
+/// Print a step's line: which line the poll answered, PS after the last
+/// wait, and what the idle `waiti` did meanwhile.
+func report(label: String, line: UInt, wakes: UInt) unsafe {
+    let uart = console()
+    uart.write_str("SOS idle: ")
+    uart.write_str(label)
+    uart.write_str(", poll=")
+    uart.write_hex(line)
+    uart.write_str(", ps=")
+    uart.write_hex(PS_AFTER_WAIT)
+    if wakes == 0 {
+        uart.write_str(", did not sleep")
+    } else {
+        uart.write_str(", woke the idle waiti, wakes=")
+        uart.write_hex(wakes)
+    }
+}
+
+/// One wait for a line, with the `waiti`'s interrupts counted around it.
+func step(label: String) unsafe {
+    let before = hal.idle_wakes()
+    let line = idle_until_line()
+    report(label, line, hal.idle_wakes() - before)
+    console().write_str("\n")
+}
+
+/// The timer's step: arm a deadline 1 ms ahead and wait for it, until a wait
+/// is one the `waiti` ended.
+func timer_step() unsafe {
+    var arms: UInt = 0
+    var wakes: UInt = 0
+    var line = hal.IRQ_NONE
+    while wakes == 0 {
+        hal.timer_set_deadline_ns(hal.timer_now_ns() + DEADLINE_AHEAD_NS)
+        arms = arms + 1
+        let before = hal.idle_wakes()
+        line = idle_until_line()
+        wakes = hal.idle_wakes() - before
+    }
+    report("a deadline 1 ms ahead", line, wakes)
+    let uart = console()
+    uart.write_str(", arms=")
+    uart.write_hex(arms)
+    uart.write_str("\n")
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.intc_init()
+
+    timer_step()
+    // Programming the deadline clears the alarm, which lowers its line.
+    hal.timer_set_deadline_ns(NEVER_NS)
+
+    let line = hal.irq_raise_selftest_line()
+    step("UART0's line raised")
+    hal.irq_mask(line)
+
+    hal.timer_set_deadline_ns(0)
+    step("a deadline behind the counter")
+    hal.exit_pass()
+}

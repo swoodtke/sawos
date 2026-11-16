@@ -23,7 +23,10 @@
  *      which is the trap entry, apart from the Alloca exception, which it
  *      handles in place. A double exception inside a window handler that a
  *      user thread raised is that thread's fault and enters the kernel as
- *      one. Every other vector stops the machine through `kernel_fault`
+ *      one. The kernel vector takes two things and stops the machine for
+ *      anything else: the Alloca exception under `sos_windowed_call`, and
+ *      the interrupt that ends the idle `waiti` (8. below). Every other
+ *      vector stops the machine through `kernel_fault`
  *      (`sink.c`). Most of them mean a kernel bug, but not all: a `break`
  *      executed in user mode reaches the debug vector (0x280) and stops the
  *      machine too. Compiled code traps with `ill`, never `break`, so only
@@ -40,15 +43,17 @@
  *      (one in the mask ROM) before the loader runs.
  *   7. `sos_pll_bringup`, which powers the BBPLL and sets it to 480 MHz
  *      without a fetch through the flash cache (the `pll80` clock key).
+ *   8. `sos_idle_wait`, the kernel's idle sleep: `waiti 0`, and the kernel
+ *      vector's return from the interrupt that ends it.
  *
  * `EXCSAVE1` holds the running thread's frame address while user mode runs.
  * The user vector swaps it with a1, so the frame is the save area at once and
  * the user's a1 waits in `EXCSAVE1` until it is stored. The kernel runs with
  * PS.UM = 0, PS.EXCM = 0, PS.WOE = 0 and PS.INTLEVEL = 15: no interrupt is
- * delivered to it, no window exception is raised in it, and a fault it takes
- * arrives at the kernel vector (or at the double vector before PS is
- * rewritten), never at the user one, so the vector itself is the mode
- * witness.
+ * taken in it but at the idle `waiti`, no window exception is raised in it,
+ * and a fault it takes arrives at the kernel vector (or at the double vector
+ * before PS is rewritten), never at the user one, so the vector itself is the
+ * mode witness.
  *
  * The window rules the handlers rely on (../ABI.md §7d): physical register
  * `aN` is AR[(4 * WINDOWBASE + N) mod 64]; WINDOWSTART has a bit per pane of
@@ -97,6 +102,8 @@
 
     /* The kernel's PS: INTLEVEL = 15, EXCM = 0, UM = 0, WOE = 0. */
     .equ PS_KERNEL,     0x0F
+    /* The same with EXCM = 1, which `rfe` clears to give PS_KERNEL. */
+    .equ PS_KERNEL_EXCM, 0x1F
 
     .equ EXCCAUSE_ALLOCA, 5
     .equ PS_UM_BIT,     5
@@ -310,6 +317,8 @@ _start:
     .literal .Lktrap, ktrap
     .literal .Lfault, kernel_fault
     .literal .Lvecbase_lit, _vector_base
+    .literal .Lidle_resume, sos_idle_resume
+    .literal .Lidle_wakes, sos_idle_wakes
 
     /* VECBASE is the table's first byte. The ISA wants it 1 KiB aligned. */
     .align  1024
@@ -421,8 +430,7 @@ _WindowUnderflow12:
     rsr     a0, exccause
     bnei    a0, EXCCAUSE_ALLOCA, 1f
     j       kernel_alloca
-1:  movi    a2, 0x300
-    j       vec_fatal
+1:  j       kernel_idle_wake
     .org    0x340
 _UserExceptionVector:
     xsr     a1, excsave1            /* User: a1 = frame, EXCSAVE1 = user a1 */
@@ -471,6 +479,52 @@ double_entry:
     j       _UserExceptionVector
 1:  movi    a2, 0x3C0
     j       vec_fatal
+
+/* The interrupt that ends the idle `waiti`, or a kernel fault. The kernel
+ * takes an interrupt only at `sos_idle_wait`'s `waiti 0`, which returns to
+ * `sos_idle_resume`, so EPC1 at that address is that interrupt and nothing
+ * else: the instruction there is a `ret` in IRAM, which raises no exception,
+ * and the kernel runs at INTLEVEL 15 everywhere else. Any other trap here,
+ * an interrupt included, stops the machine.
+ *
+ * The wake is counted and returns to `sos_idle_resume` at INTLEVEL 15
+ * without delivering anything: every CPU interrupt the kernel enables is
+ * level-triggered, so the line stays pending, masked, and the idle poll that
+ * follows the wait finds it. a0 is back from EXCSAVE1; a8 is a scratch
+ * register of the call0 leaf the interrupt arrived in. */
+kernel_idle_wake:
+    rsr     a0, epc1
+    l32r    a8, .Lidle_resume
+    bne     a0, a8, 1f
+    l32r    a8, .Lidle_wakes
+    l32i    a0, a8, 0
+    addi    a0, a0, 1
+    s32i    a0, a8, 0
+    movi    a0, PS_KERNEL_EXCM
+    wsr     a0, ps
+    rsync
+    rsr     a0, excsave1
+    rfe
+1:  movi    a2, 0x300
+    j       vec_fatal
+
+/* void sos_idle_wait(void): sleep until an enabled interrupt is pending.
+ *
+ * `waiti 0` drops INTLEVEL to 0 and sleeps until an interrupt it will take
+ * (../ABI.md §6d), or takes one pending already at once. Every interrupt the
+ * kernel enables is level 1, so it arrives at the kernel vector with EPC1
+ * here, at `sos_idle_resume`, and `kernel_idle_wake` returns to it with
+ * INTLEVEL 15 again. A call0 leaf that may lose a8.
+ *
+ * `sos_idle_wakes` counts the interrupts the wait has taken. */
+    .align  4
+    .global sos_idle_wait
+    .type   sos_idle_wait, @function
+sos_idle_wait:
+    waiti   0
+    .global sos_idle_resume
+sos_idle_resume:
+    ret
 
 /* The Alloca exception in the kernel, which only windowed code reached
  * through `sos_windowed_call` raises. The faulting window's a0 is in
@@ -806,6 +860,12 @@ sos_windowed_call_close:
     .section .bss.sos_windowed_call_closed, "aw", @nobits
     .align  4
 sos_windowed_call_closed:
+    .space  4
+
+    .section .bss.sos_idle_wakes, "aw", @nobits
+    .align  4
+    .global sos_idle_wakes
+sos_idle_wakes:
     .space  4
 
 /* ---- the clock store (IRAM) ---------------------------------------------- */

@@ -18,8 +18,9 @@
 //!   * no FPU use: every image is built without it, and CPENABLE stays 0
 //!     (`boot.S`'s `_start` writes it), so an FP instruction is a fault;
 //!   * interrupts through the interrupt matrix onto level-1 CPU interrupts,
-//!     taken at the user vector with EXCCAUSE 4, and only from user mode: the
-//!     kernel runs at INTLEVEL 15.
+//!     taken at the user vector with EXCCAUSE 4. The kernel runs at INTLEVEL
+//!     15 and takes one only to end its idle `waiti`, at the kernel vector,
+//!     which returns to the idle poll without delivering it (`wait_for_irq`).
 //!
 //! Addresses and machine words are `UInt` throughout, never `Int`, the
 //! discipline the riscv32 HALs keep. On this target `Int` is 32-bit signed,
@@ -49,6 +50,8 @@ extern "C" {
     func sos_intclear_write(mask: UInt)
     func sos_sim_exit(status: UInt)
     func sos_windowed_call_close()
+    func sos_idle_wait()
+    func sos_idle_wake_count() -> UInt
 }
 
 // =============================================================================
@@ -699,8 +702,9 @@ public func is_syscall(cause: UInt) -> Bool {
 }
 
 /// Is this trap an interrupt? Every interrupt this kernel enables is a level-1
-/// CPU interrupt, which reaches the user vector with EXCCAUSE 4; the kernel
-/// runs at INTLEVEL 15, so it never takes one itself.
+/// CPU interrupt, which reaches the user vector with EXCCAUSE 4. The kernel
+/// takes one itself only at the idle `waiti`, and `boot.S` returns from that
+/// one without entering `ktrap`.
 public func is_interrupt(cause: UInt) -> Bool {
     cause == (TrapCause.Level1Interrupt as UInt)
 }
@@ -984,7 +988,8 @@ public func timer_pending() unsafe -> Bool {
 // routed there changes level, not when a route changes (../ABI.md §6c).
 // Unrouted sources go to `INTMATRIX_UNROUTED`, CPU interrupt 6, CCOMPARE0's
 // internal line, which takes no matrix input and is never enabled. The kernel
-// runs at INTLEVEL 15, so an enabled interrupt reaches only user mode.
+// runs at INTLEVEL 15, so an enabled interrupt reaches the kernel only at the
+// idle `waiti` (`wait_for_irq`).
 
 static INTMATRIX_BASE: UInt = 0x600C_2000
 static REGISTER_BYTES: UInt = 4
@@ -1273,20 +1278,44 @@ public func irq_line_valid(line: UInt) -> Bool {
 /// it. Device lines come from INTERRUPT, which shows a pending bit with the
 /// kernel at INTLEVEL 15 as well as at 0.
 public func irq_poll() unsafe -> UInt {
-    if TIMER_PROGRAMMED {
-        if Systimer().expired() {
-            return IRQ_TIMER
-        }
+    if timer_due() {
+        return IRQ_TIMER
     }
     pending_device_line()
 }
 
-/// Park the core until an interrupt is pending: here, return at once.
+/// Park the core until an interrupt is pending.
 ///
-/// `waiti` sleeps only until an interrupt it will then take, and lowering
-/// INTLEVEL to take one would deliver it in kernel mode (../ABI.md §6d). So the
-/// idle loop spins on `irq_poll`, as on the ESP32-C3 board.
+/// `waiti` sleeps only until an interrupt it will then take (../ABI.md §6d),
+/// so the sleep is `boot.S`'s `sos_idle_wait`: `waiti 0`, which every line
+/// the kernel enables can end, since all are level 1. The interrupt is taken
+/// at the kernel vector, which counts it and returns here at INTLEVEL 15
+/// without delivering it; the line stays pending, being level-triggered, and
+/// the idle loop's `irq_poll` finds it as it finds any other.
+///
+/// While the timer reads expired (`irq_poll`'s own test) the core does not
+/// sleep: the poll that follows delivers the timer at once, without a round
+/// trip through the kernel vector. The alarm fires for a target already
+/// behind the counter on the emulator (../ABI.md §6d) and, by ESP-IDF's
+/// code, on the part, so the guard saves that round trip and is not what
+/// keeps such a deadline from being slept on for good.
 public func wait_for_irq() unsafe {
+    if timer_due() {
+        return
+    }
+    sos_idle_wait()
+}
+
+/// Has a deadline been programmed and has it expired? `irq_poll`'s timer
+/// test.
+func timer_due() unsafe -> Bool {
+    TIMER_PROGRAMMED && Systimer().expired()
+}
+
+/// How many interrupts the idle `waiti` has taken since boot. Each ends one
+/// sleep of `wait_for_irq`; the count wraps.
+public func idle_wakes() unsafe -> UInt {
+    sos_idle_wake_count()
 }
 
 /// Raise a line from software, for interrupt bring-up. Returns the line.

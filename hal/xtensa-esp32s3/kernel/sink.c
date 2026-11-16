@@ -73,7 +73,8 @@ u32 sos_kernel_slabs_end(void) {
 // INTCLEAR drops an edge-triggered or software interrupt's latch.
 //
 // None of these touches PS. The kernel runs at INTLEVEL 15 and user mode at
-// 0, so an enabled interrupt is only ever taken from user mode.
+// 0, so an enabled interrupt is taken from user mode, or at the idle `waiti`
+// (`boot.S`'s `sos_idle_wait`).
 
 void sos_intenable_write(u32 mask) {
     __asm__ volatile("wsr %0, intenable\n rsync" :: "a"(mask) : "memory");
@@ -87,6 +88,17 @@ u32 sos_interrupt_read(void) {
 
 void sos_intclear_write(u32 mask) {
     __asm__ volatile("wsr %0, intclear\n rsync" :: "a"(mask) : "memory");
+}
+
+// ---- the idle wake count --------------------------------------------------
+//
+// C because: a linker symbol (reason 2). `boot.S`'s kernel vector adds one to
+// `sos_idle_wakes` for each interrupt the idle `waiti` takes.
+
+extern u32 sos_idle_wakes;
+
+u32 sos_idle_wake_count(void) {
+    return *(volatile u32 *)&sos_idle_wakes;
 }
 
 // ---- the cycle counter ----------------------------------------------------

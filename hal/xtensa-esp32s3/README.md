@@ -104,10 +104,10 @@ The things most likely to surprise someone arriving here:
   INTENABLE, not the matrix: this emulator moves a CPU interrupt's level only
   when a source changes level, not when a route does (ABI.md §6c).
   The kernel runs at INTLEVEL 15 from `_start` on (ABI.md §7f has the probe
-  and the stress run), so interrupts are taken from user mode only, and
-  `wait_for_irq()` is empty because `waiti` would take the interrupt in
-  kernel mode (ABI.md §6d): the idle loop spins on `irq_poll`, which reads
-  SYSTIMER and the INTERRUPT register.
+  and the stress run), so interrupts are taken from user mode, and in the
+  kernel only at the idle sleep: `wait_for_irq()` executes `waiti 0`, the
+  kernel vector returns from the interrupt that ends it without delivering
+  it, and the idle loop's `irq_poll` then finds the line (ABI.md §6d).
 - **The scheduler tick preempts processes here.** This emulator delivers the
   timer's level-1 interrupt to user mode, so the shipping kernel's tick takes
   the processor from a process that never traps; the smoke's `tick_spinner`

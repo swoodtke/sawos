@@ -14298,6 +14298,57 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            halt_pass],
             "expect_clean_exit": True,
         },
+        {
+            # The idle sleep (ABI.md §6d): `wait_for_irq` sleeps in `waiti 0`
+            # and the interrupt that ends it is left for the poll, which
+            # answers the timer, then the device line. Each says the HAL's
+            # count of the idle `waiti`'s interrupts rose; by how much is
+            # printed and not asserted. The timer's step arms its deadline
+            # again until a wait is one the `waiti` ended, since a wait
+            # reached after the deadline does not sleep; how many arms it
+            # took is printed and not asserted. A deadline already behind the
+            # counter is answered without a sleep. After each wait PS is the
+            # kernel's own, 0x0F: the vector puts INTLEVEL 15 back.
+            "name": "idle_wake",
+            "src": os.path.join(s3_tests, "idle_wake.saw"),
+            "asm": "idle_ps.S",
+            "expect_out": [rom,
+                           "SOS idle: a deadline 1 ms ahead, poll=0x00000400, "
+                           "ps=0x0000000f, woke the idle waiti, wakes=",
+                           "SOS idle: UART0's line raised, poll=0x0000001b, "
+                           "ps=0x0000000f, woke the idle waiti, wakes=",
+                           "SOS idle: a deadline behind the counter, "
+                           "poll=0x00000400, ps=0x0000000f, did not sleep\n",
+                           halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # An interrupt taken in kernel mode outside the idle wait, at
+            # INTLEVEL 0 in a kernel path, is a kernel fault: a level-1
+            # interrupt (EXCCAUSE 4) at the kernel vector (0x300).
+            "name": "kernel_irq_fault",
+            "src": os.path.join(s3_tests, "kernel_irq_fault.saw"),
+            "asm": "kernel_irq.S",
+            "expect_out": [rom, "SOS kirq: line 0x0000001b pending, "
+                           "INTLEVEL 0 in a kernel path",
+                           "SOS-S3: kernel fault vector=0x00000300 "
+                           "exccause=0x00000004"],
+            "expect_clean_exit": False,
+            "expect_status": 0x80 | (0x300 >> 6),
+        },
+        {
+            # The same for a `waiti` that is not the idle wait's: the kernel
+            # vector holds the interrupt to the idle wait's own address.
+            "name": "kernel_irq_stray_waiti",
+            "src": os.path.join(s3_tests, "kernel_irq_stray_waiti.saw"),
+            "asm": "kernel_irq.S",
+            "expect_out": [rom, "SOS kirq: line 0x0000001b pending, "
+                           "a waiti that is not the idle wait's",
+                           "SOS-S3: kernel fault vector=0x00000300 "
+                           "exccause=0x00000004"],
+            "expect_clean_exit": False,
+            "expect_status": 0x80 | (0x300 >> 6),
+        },
     ]
 
     # The PSRAM's command layer (ABI.md §16): the bring-up's identity and its

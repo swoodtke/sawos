@@ -1,0 +1,32 @@
+// An interrupt that ends a `waiti` other than the idle wait's stops the
+// machine: the kernel vector holds the interrupt to the one address the idle
+// wait resumes at (`sos_idle_resume`), not to `waiti` as such.
+//
+// UART0's line (source 27) is raised, so an enabled level-1 interrupt is
+// pending, and then the kernel calls `ktest_stray_waiti` (`kernel_irq.S`):
+//
+//   SOS kirq: line 0x0000001b pending, a waiti that is not the idle wait's
+//   SOS-S3: kernel fault vector=0x00000300 exccause=0x00000004 ...
+//
+// Were the interrupt taken and returned from, the leaf would return and the
+// kernel would print `SOS kirq: returned` and stop with a pass.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func ktest_stray_waiti()
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.intc_init()
+    let line = hal.irq_raise_selftest_line()
+    let uart = console()
+    uart.write_str("SOS kirq: line ")
+    uart.write_hex(line)
+    uart.write_str(" pending, a waiti that is not the idle wait's\n")
+    ktest_stray_waiti()
+    uart.write_str("SOS kirq: returned\n")
+    hal.exit_pass()
+}
