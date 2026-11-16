@@ -1,0 +1,84 @@
+// The check that a linked kernel holds an image's slab areas inside its slab
+// region: each area's symbol and bytes between the board script's
+// `_sos_slabs_start` and `_sos_slabs_end`, and the refusal naming the area.
+
+import sosimage.limits.{SlabArea, SlabPlan}
+import sosimage.regions.{area_symbol, check_slab_region}
+
+// Kind 1 (waiters) with 16 bytes, and kind 5 with 32.
+func plan() -> SlabPlan {
+    var areas = Vector<SlabArea>()
+    try! areas.push(SlabArea(kind: 1, slots: 1, bytes: 16, align: 16))
+    try! areas.push(SlabArea(kind: 5, slots: 2, bytes: 32, align: 16))
+    SlabPlan(block: true, areas: move areas, defaults: Vector<Int>())
+}
+
+func symbols(low: UInt, high: UInt, first: UInt, second: UInt) -> Map<String, UInt> {
+    var m = Map<String, UInt>()
+    let _ = try! m.insert("_sos_slabs_start", low)
+    let _ = try! m.insert("_sos_slabs_end", high)
+    let _ = try! m.insert(area_symbol(1), first)
+    let _ = try! m.insert(area_symbol(5), second)
+    move m
+}
+
+func verdict(m: &Map<String, UInt>) -> String {
+    let p = plan()
+    match check_slab_region("case", &m, &p) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect(got: String, want: String) {
+    if not got.equals(want) {
+        print("expected: {want}")
+        print("got:      {got}")
+    }
+    assert(got.equals(want), "the check's verdict")
+}
+
+func main() {
+    // Both areas fill the region exactly.
+    var held = symbols(0x1000, 0x1030, 0x1000, 0x1010)
+    expect(verdict(&held), "")
+
+    // The script gathers nothing: the region is empty and the areas lie
+    // elsewhere.
+    var empty = symbols(0x2000, 0x2000, 0x1000, 0x1010)
+    expect(verdict(&empty),
+           "case: the waiters area (_sos_slab1_start = 0x1000, 16 bytes) lies outside the kernel's slab region [0x2000, 0x2000): the board's link script does not gather .bss.sos_slab* around it")
+
+    // The last area runs one byte past the end.
+    var past = symbols(0x1000, 0x102F, 0x1000, 0x1010)
+    expect(verdict(&past),
+           "case: the memories area (_sos_slab5_start = 0x1010, 32 bytes) lies outside the kernel's slab region [0x1000, 0x102f): the board's link script does not gather .bss.sos_slab* around it")
+
+    // The first area starts one byte below the region.
+    var below = symbols(0x1001, 0x1031, 0x1000, 0x1011)
+    expect(verdict(&below),
+           "case: the waiters area (_sos_slab1_start = 0x1000, 16 bytes) lies outside the kernel's slab region [0x1001, 0x1031): the board's link script does not gather .bss.sos_slab* around it")
+
+    // The last area lies above the region: the direction a script that
+    // gathers nothing fails in, where `high - base` would be below zero.
+    var above = symbols(0x1000, 0x1030, 0x1000, 0x1040)
+    expect(verdict(&above),
+           "case: the memories area (_sos_slab5_start = 0x1040, 32 bytes) lies outside the kernel's slab region [0x1000, 0x1030): the board's link script does not gather .bss.sos_slab* around it")
+
+    // The start is defined and the end is not.
+    var no_end = Map<String, UInt>()
+    let _ = try! no_end.insert("_sos_slabs_start", 0x1000)
+    expect(verdict(&no_end), "case: the board's link script defines no _sos_slabs_end")
+
+    // An area the linked kernel has no symbol for.
+    var no_symbol = Map<String, UInt>()
+    let _ = try! no_symbol.insert("_sos_slabs_start", 0x1000)
+    let _ = try! no_symbol.insert("_sos_slabs_end", 0x1030)
+    let _ = try! no_symbol.insert(area_symbol(1), 0x1000)
+    expect(verdict(&no_symbol),
+           "case: the linked kernel has no symbol _sos_slab5_start for the memories area")
+
+    // No region symbols at all.
+    var none = Map<String, UInt>()
+    expect(verdict(&none), "case: the board's link script defines no _sos_slabs_start")
+}

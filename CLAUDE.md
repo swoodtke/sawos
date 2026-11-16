@@ -104,13 +104,15 @@ builds Blade, points `.sawlang` at the resolved checkout, builds the builder
 (`blade build --force` in `tools/sosimage/`), and in a full `make sos-test`
 runs its own tests (`blade test` there: the description readers' refusals, the
 region table's and slab block's bytes, an image's limits and each refusal of
-them, the in-place check, and every board, process and image description in
-the tree read clean), which need no emulator and print nothing when they
+them, the in-place check, the slab-region check, and every board, process and
+image description in the tree read clean), which need no emulator and print nothing when they
 pass. Per profile it writes a profile description (JSON)
 and calls `sosimage native`, then `sosimage board` on the profile's
 `hal/<profile>/board.toml`, then `sosimage kernel` once for each kernel entry
 the cases use; per case it writes an image description into the case's
-staging directory and calls `sosimage link`. `src/profile.saw` and
+staging directory and calls `sosimage link`, which refuses an image whose
+slab areas lie outside the board's slab region (a script that does not gather
+`.bss.sos_slab*`). `src/profile.saw` and
 `src/image.saw` state the two schemas. A builder failure is the case's build
 error, with the builder's message.
 

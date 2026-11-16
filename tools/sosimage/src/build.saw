@@ -9,8 +9,8 @@ import sosimage.image.{ImageSpec}
 import sosimage.profile.{Profile}
 import sosimage.kernel.{KernelFacts}
 import sosimage.limits.{SlabPlan, plan_limits}
-import sosimage.regions.{area_assembly, encode_block, encode_table,
-                         table_assembly}
+import sosimage.regions.{area_assembly, check_slab_region, encode_block,
+                         encode_table, table_assembly}
 import sosimage.tool.{read_file, require_input, run_tool, write_file, write_lines}
 
 /// Compiles each of the profile's native units to its object: a `.S` unit is
@@ -119,13 +119,14 @@ public func link(profile: &Profile, spec: &ImageSpec) -> Result<Linked, BuildErr
         try write_lines(stub, &lines)
         try! objects.push(try assemble(&profile, stub, "{spec.staging}/root.o", "root's stub"))
     }
+    var plan = SlabPlan.none()
     if spec.has_regions {
         var c = 0
         while c < spec.children.len() {
             try require_input(spec.children.get(c) ?? "", "child {c}'s image")
             c = c + 1
         }
-        let plan = try image_plan(&spec)
+        plan = try image_plan(&spec)
         let stub = "{spec.staging}/regions.S"
         let lines = try regions_stub(&profile, &spec, &plan)
         try write_lines(stub, &lines)
@@ -144,6 +145,12 @@ public func link(profile: &Profile, spec: &ImageSpec) -> Result<Linked, BuildErr
     try! argv.push(spec.output)
     try! argv.append(&objects)
     try run_tool(&argv)
+
+    if plan.block {
+        let linked = try read_file(spec.output)
+        let symbols = try elf_symbols(&linked, "{spec.name}'s linked image")
+        try check_slab_region(spec.name, &symbols, &plan)
+    }
 
     guard let wanted = spec.flash else {
         return Linked(elf: spec.output, flash: "", used: 0, end: 0)

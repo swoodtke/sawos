@@ -8479,6 +8479,24 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
 
+    # The builder refuses an image whose areas lie outside the kernel's slab
+    # region, naming the area and the bounds. The board's script is copied
+    # without the rule that gathers the areas, so the region is empty and
+    # every area lies above it.
+    {
+        "name": "image_limits_no_slab_region",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "limits": {"slabs": {"waiters": 1}},
+        "script_without_slab_gathering": True,
+        "expect_build_error": ["the waiters area (_sos_slab1_start = 0x",
+                               " bytes) lies outside the kernel's slab "
+                               "region [0x",
+                               "): the board's link script does not gather "
+                               ".bss.sos_slab* around it"],
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+
     # An image whose areas outgrow the kernel's memory is a link error naming
     # it, on every board's script: the kernel's `.bss` would run into root's
     # region. A hundred thousand Events, and the attachments derived from
@@ -8567,8 +8585,9 @@ TEST_CASES = [
                 {"areas": [{"kind": "waiters", "at": "_sos_slabs_start",
                             "reserve": lambda f: f["slabs"]["waiters"]["unit"]}]},
                 [("{one}", "{one}")]),
-    # An area below the region's first byte lies over what precedes it, the
-    # kernel's own statics, which the old bounds took.
+    # An area below the region's first byte lies before the kernel's zeroed
+    # memory. The region starts where `.bss` does, so the lower bound is the
+    # one the region did not move.
     _slab_stop("slab_area_below_region",
                {"areas": [{"kind": "waiters", "at": "_sos_slabs_start - 16",
                            "reserve": 64}]},
@@ -11445,7 +11464,32 @@ def _link_image(builder, profile, case, arch, output, flash=None,
         description["asm"] = payload
     path = os.path.join(description["staging"], "image.json")
     _write_json(path, description)
+    if case.get("script_without_slab_gathering"):
+        profile = _profile_without_slab_gathering(profile,
+                                                  description["staging"])
     return _run_sosimage(builder, ["link", profile, path])
+
+
+def _profile_without_slab_gathering(profile, staging):
+    """A copy of `profile`'s description, in `staging`, whose linker script is
+    a copy of the board's without the rule that gathers `.bss.sos_slab*`;
+    returns its path. The board's script is the one that is read, so a script
+    that stops carrying the rule fails here rather than passing quietly."""
+    with open(profile) as f:
+        description = json.load(f)
+    with open(description["linker_script"]) as f:
+        lines = f.readlines()
+    kept = [line for line in lines if line.strip() != "*(.bss.sos_slab*)"]
+    if len(kept) != len(lines) - 1:
+        raise ToolError(f"{description['linker_script']} does not carry "
+                        "exactly one `*(.bss.sos_slab*)` rule")
+    script = os.path.join(staging, "no_slab_gathering.ld")
+    with open(script, "w") as f:
+        f.writelines(kept)
+    description["linker_script"] = script
+    path = os.path.join(staging, "profile_no_slab_gathering.json")
+    _write_json(path, description)
+    return path
 
 
 # What `sosimage slabs` says about each compiled kernel object, read once per
@@ -11938,7 +11982,9 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
         except ToolError as e:
             # A case that asserts the build's refusal passes on it, and only
             # on it: its text must be in what the build said.
-            if refusal is not None and refusal in str(e):
+            if refusal is not None and all(
+                    part in str(e) for part in
+                    ([refusal] if isinstance(refusal, str) else refusal)):
                 return True, f"{CHECK} {name}  (the build refused it)", []
             return (False, f"{CROSS} {name}  (build error)",
                     [f"    {line}" for line in str(e).splitlines()])
@@ -13882,6 +13928,21 @@ def main():
                            "SOS-C3: halt pass"],
             },
             {
+                # An area linked into the kernel's slab region, taken at
+                # boot. The case holds the board script's gathering of
+                # `.bss.sos_slab*`: without it the area lies outside the
+                # region and the kernel refuses it. The block is hand-made
+                # (`_slab_block_asm`), so no root image follows.
+                "name": "slab_area",
+                "root_pkg": None,
+                "children": [],
+                "slab_block": {"areas": [{"kind": "waiters"}]},
+                "expect": [C3_ROM, C3_BANNER,
+                           "SOS: slab area kind=0x00000001 slots=0x00000001",
+                           "SOS: bad root image: no root image appended",
+                           "SOS-C3: halt fail code=0x00000004"],
+            },
+            {
                 # The tick armed on the board. This case boots the
                 # `isolation` case's images with the tick on (`"tick": True`)
                 # and holds that the kernel gets through the load and the
@@ -13946,11 +14007,29 @@ def main():
                             "--module-path", SOSRT_MODULE,
                             "--module-path", SOSABI_MODULE])
 
+        # The builder reads the kernel's slab sizes for a hand-made block.
+        try:
+            _link_sawlang()
+            builder = _build_sosimage(blade_bin)
+        except ToolError as e:
+            print(f"{CROSS} failed to build the image builder\n{e}",
+                  file=sys.stderr)
+            sys.exit(1)
+
         failed = 0
         for i, case in enumerate(c3_cases, 1):
             name = case["name"]
             try:
                 objs = list(shared) + [kobj]
+                if case.get("slab_block"):
+                    stub_s = os.path.join(C3_BUILD, f"{name}.slabs.S")
+                    with open(stub_s, "w") as f:
+                        f.write(_slab_block_asm(
+                            dict(case, name=name),
+                            dict(c3_arch, hex_width=8),
+                            _slab_facts(builder, kobj)))
+                    objs.append(c3_cc(
+                        stub_s, os.path.join(C3_BUILD, f"{name}.slabs.o")))
                 if case["root_pkg"]:
                     objs.append(c3_payload_stub(
                         name, _build_root_image(blade_bin, case["root_pkg"],

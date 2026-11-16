@@ -18,8 +18,23 @@ static ERASED: UInt8 = 0xFF
 /// taken for one by the ROM, which then never reaches the direct-boot check.
 static ESPTOOL_HEADER_BYTE: UInt = 0xE9
 
-// The ELF32 fields read here, by offset: the file header's, a program
-// header's, a section header's and a symbol's.
+// The ELF fields read here, by offset. The class byte in the file header
+// says which layout the rest is; the ELF64 names carry a `64`.
+static ELF_CLASS: Int = 4
+static ELFCLASS64: UInt = 2
+static ELF64_SHOFF: Int = 40
+static ELF64_SHENTSIZE: Int = 58
+static ELF64_SHNUM: Int = 60
+// An ELF64 section header's fields and a symbol's value, which `elf_symbols`
+// reads in place of `SH_OFFSET`, `SH_SIZE`, `SH_LINK`, `SH_ENTSIZE` and
+// `ST_VALUE`.
+static SH64_OFFSET: Int = 24
+static SH64_SIZE: Int = 32
+static SH64_LINK: Int = 40
+static SH64_ENTSIZE: Int = 56
+static ST64_VALUE: Int = 8
+// The ELF32 fields: the file header's, a program header's, a section
+// header's and a symbol's.
 static ELF32_PHOFF: Int = 28
 static ELF32_SHOFF: Int = 32
 static ELF32_PHNUM: Int = 44
@@ -122,29 +137,37 @@ extension Data {
     }
 }
 
-/// Every named symbol in a linked ELF32's symbol table, by value: among them
-/// the kernel's linker symbols that bound the images it carries.
+/// Every named symbol in a linked ELF's symbol table, by value: among them
+/// the kernel's linker symbols that bound the images it carries. An ELF32 or
+/// an ELF64 (its class byte says which), little-endian.
 public func elf_symbols(elf: &Data, what: String) -> Result<Map<String, UInt>, BuildError> {
-    let shoff = try elf.field(ELF32_SHOFF, 4, what) as Int
-    let shentsize = try elf.field(ELF32_SHENTSIZE, 2, what) as Int
-    let shnum = try elf.field(ELF32_SHNUM, 2, what) as Int
+    let wide = (try elf.field(ELF_CLASS, 1, what)) == ELFCLASS64
+    let shoff = if wide { try elf.field(ELF64_SHOFF, 8, what) as Int } else { try elf.field(ELF32_SHOFF, 4, what) as Int }
+    let shentsize = try elf.field(if wide { ELF64_SHENTSIZE } else { ELF32_SHENTSIZE }, 2, what) as Int
+    let shnum = try elf.field(if wide { ELF64_SHNUM } else { ELF32_SHNUM }, 2, what) as Int
+    let word = if wide { 8 } else { 4 }
+    let sh_offset = if wide { SH64_OFFSET } else { SH_OFFSET }
+    let sh_size = if wide { SH64_SIZE } else { SH_SIZE }
+    let sh_link = if wide { SH64_LINK } else { SH_LINK }
+    let sh_entsize = if wide { SH64_ENTSIZE } else { SH_ENTSIZE }
+    let st_value = if wide { ST64_VALUE } else { ST_VALUE }
     var symbols = Map<String, UInt>()
     var i = 0
     while i < shnum {
         let sh = shoff + shentsize * i
         if (try elf.field(sh + SH_TYPE, 4, what)) == SHT_SYMTAB {
-            let offset = try elf.field(sh + SH_OFFSET, 4, what) as Int
-            let size = try elf.field(sh + SH_SIZE, 4, what) as Int
-            let link = try elf.field(sh + SH_LINK, 4, what) as Int
-            let entsize = try elf.field(sh + SH_ENTSIZE, 4, what) as Int
+            let offset = try elf.field(sh + sh_offset, word, what) as Int
+            let size = try elf.field(sh + sh_size, word, what) as Int
+            let link = try elf.field(sh + sh_link, 4, what) as Int
+            let entsize = try elf.field(sh + sh_entsize, word, what) as Int
             if entsize == 0 {
                 return BuildError(message: "{what}'s symbol table has entries of no size")
             }
-            let strtab = try elf.field(shoff + shentsize * link + SH_OFFSET, 4, what) as Int
+            let strtab = try elf.field(shoff + shentsize * link + sh_offset, word, what) as Int
             var at = offset
             while at < offset + size {
                 let name = try elf.field(at + ST_NAME, 4, what) as Int
-                let value = try elf.field(at + ST_VALUE, 4, what)
+                let value = try elf.field(at + st_value, word, what)
                 let _ = try! symbols.insert(elf.c_string_at(strtab + name), value)
                 at = at + entsize
             }

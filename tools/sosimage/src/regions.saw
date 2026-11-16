@@ -215,6 +215,37 @@ public func area_assembly(plan: &SlabPlan) -> Vector<String> {
     move lines
 }
 
+/// Refuses a linked kernel that does not hold each of `plan`'s areas inside
+/// its slab region, the span its board script bounds with `_sos_slabs_start`
+/// and `_sos_slabs_end`: the kernel's containment check would refuse such an
+/// area at boot, and a script that gathers no `.bss.sos_slab*` sections would
+/// leave every area outside. The refusal names the area and the bounds.
+public func check_slab_region(name: String, symbols: &Map<String, UInt>,
+                              plan: &SlabPlan) -> Result<Void, BuildError> {
+    guard let low = symbols.get("_sos_slabs_start") else {
+        return BuildError(message: "{name}: the board's link script defines no _sos_slabs_start")
+    }
+    guard let high = symbols.get("_sos_slabs_end") else {
+        return BuildError(message: "{name}: the board's link script defines no _sos_slabs_end")
+    }
+    var a = 0
+    while a < plan.areas.len() {
+        guard let area = plan.areas.get(a) else {
+            a = a + 1
+            continue
+        }
+        let key = area_symbol(area.kind)
+        guard let base = symbols.get(key) else {
+            return BuildError(message: "{name}: the linked kernel has no symbol {key} for the {slab_kind_name(area.kind)} area")
+        }
+        if base < low || base > high || (area.bytes as UInt) > high - base {
+            return BuildError(message: "{name}: the {slab_kind_name(area.kind)} area ({key} = {hex(base as UInt64)}, {area.bytes} bytes) lies outside the kernel's slab region [{hex(low as UInt64)}, {hex(high as UInt64)}): the board's link script does not gather .bss.sos_slab* around it")
+        }
+        a = a + 1
+    }
+    return
+}
+
 func push_word(out: &var Vector<TableField>, word: RowWord, word_bytes: Int,
                note: String) -> Result<Void, BuildError> {
     if word.symbol.is_empty() {
