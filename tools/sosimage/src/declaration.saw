@@ -33,9 +33,10 @@
 //! memory), where a window and a line of one type under one name are one
 //! need; two names for one type, which would be two devices of one type
 //! (reserved); a `defaults` key that is not an input, or whose value is not a
-//! path; a `ram` other than `fast`; and a declared `handles` below what the
-//! process holds when it starts (one per record, its Process handle, and one
-//! Mapping per window).
+//! path; a `ram` other than `fast`; a `threads` of 0, since a process's first
+//! thread is charged to it; and a declared `handles` below what the process
+//! holds when it starts (one per record, its Process handle, and one Mapping
+//! per window).
 //!
 //! Against a board (`check_against`), a process is also refused for an
 //! `arena` or a tag the board's word cannot hold, a type the board has no
@@ -197,6 +198,15 @@ extension Declaration {
         if let q = root.table("quota") {
             let keys = quota_keys()
             quota = try read_counts(&q, &keys, file, "[quota]")
+            var r = 0
+            while r < quota.len() {
+                let row = quota.get(r)!
+                if row.name.equals("threads") && row.value == 0 {
+                    return refused(file, where_is(&q, "threads"),
+                                   "`threads` in [quota] is 0: a process's first thread is charged to its row, and with none it cannot start")
+                }
+                r = r + 1
+            }
             try check_handles(&records, &quota, file, where_is(&q, "handles"))
         }
 

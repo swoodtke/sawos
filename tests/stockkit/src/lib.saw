@@ -1,0 +1,294 @@
+//! What the children of the gate's stock-root images do.
+//!
+//! Each child drains its boot set and prints every record in the order the
+//! drain meets it, `SOS NAME: record TAG KIND`, which is the order its
+//! launcher gave them: the launch convention's declared order. It prints,
+//! for each right of `SystemRight` by name, whether the System handle it was
+//! started with has it, which holds the convention's mask whole. Then it uses
+//! what it was given:
+//!
+//! - `probe` maps each device window it holds and prints the word at an
+//!   offset into it, which is how a setup write root made is seen;
+//! - `serve` prints its `Waiter` quota row and tries for a second Waiter, so a
+//!   declared row is seen in force; takes from its arena more than the user
+//!   scripts' default arena holds, so its declared `arena` is seen; allocates a
+//!   page from its pool; answers each request on its connection with the
+//!   byte it was sent plus one; and ends when its last client's end is gone,
+//!   which it is only once its launcher has let go of its own;
+//! - `ask` prints, for each right of `PipeInletRight` by name, whether its
+//!   inlet has it, sends one byte on its connection and prints the answer;
+//! - `carve_all` carves its device window again and again until the kernel
+//!   refuses, and prints how many carves it got, which is how many IoMemory
+//!   objects the machine had left.
+//!
+//! A child that cannot do one of these prints `SOS NAME: STEP: STATUS` and
+//! exits with status 1; one that does them all exits with 0.
+
+import sos.{System, Process, BootSet, BootHandleKind, IoMemory, PipeOutlet, Pool,
+            SosStatus, Waiter, QuotaKind, SystemRight, PipeInletRight,
+            PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// How much `serve` allocates from its pool.
+static PIECE: UInt = 0x1000
+
+/// How much `serve` takes from its arena: more than the 64 KiB the user
+/// scripts give a package that states none, less than its declaration's.
+static ARENA_TAKE: Int = 0x1_1000
+
+/// The key `serve` attaches its server end under.
+static KEY_OUTLET: UInt = 1
+
+/// What `carve_all` carves: one register.
+static CARVE_LEN: UInt = 4
+
+/// `NAME yes` or `NAME no`: whether `rights` has `bit`.
+func right(name: String, rights: UInt32, bit: UInt32) -> String {
+    if (rights & bit) != 0 { "{name} yes" } else { "{name} no" }
+}
+
+/// Every right of `SystemRight`, by name, and whether `r` has it.
+func system_rights(r: UInt32) -> String {
+    let parts: Vector<String> = [
+        right("Transfer", r, SystemRight.Transfer as UInt32),
+        right("Mint", r, SystemRight.Mint as UInt32),
+        right("Debug", r, SystemRight.Debug as UInt32),
+        right("Shutdown", r, SystemRight.Shutdown as UInt32),
+        right("ClockGet", r, SystemRight.ClockGet as UInt32),
+        right("ProcessCreate", r, SystemRight.ProcessCreate as UInt32),
+        right("ProcessSelf", r, SystemRight.ProcessSelf as UInt32),
+        right("SlabDonate", r, SystemRight.SlabDonate as UInt32),
+        right("TierGet", r, SystemRight.TierGet as UInt32),
+        right("StatsRegionMap", r, SystemRight.StatsRegionMap as UInt32),
+        right("InterruptBind", r, SystemRight.InterruptBind as UInt32),
+        right("ProcessObserve", r, SystemRight.ProcessObserve as UInt32)]
+    parts.join(", ")
+}
+
+/// Every right of `PipeInletRight`, by name, and whether `r` has it.
+func inlet_rights(r: UInt32) -> String {
+    let parts: Vector<String> = [
+        right("Transfer", r, PipeInletRight.Transfer as UInt32),
+        right("Mint", r, PipeInletRight.Mint as UInt32),
+        right("Post", r, PipeInletRight.Post as UInt32),
+        right("Wait", r, PipeInletRight.Wait as UInt32)]
+    parts.join(", ")
+}
+
+/// A child's start: its System and Process handles, and its boot set.
+public struct Started {
+    system: System
+    proc: Process
+    set: BootSet
+}
+
+extension Started: NoCopy {}
+
+/// A record kind's name.
+func kind_name(kind: BootHandleKind) -> String {
+    match kind {
+        case Memory -> "Memory",
+        case Process -> "Process",
+        case System -> "System",
+        case IoMemory -> "IoMemory",
+        case PipeInlet -> "PipeInlet",
+        case PipeOutlet -> "PipeOutlet",
+        case PipeReply -> "PipeReply",
+        case PipeRequest -> "PipeRequest",
+        case Event -> "Event",
+        case Thread -> "Thread",
+        case Waiter -> "Waiter",
+        case Timer -> "Timer",
+        case Interrupt -> "Interrupt",
+        case _ -> "Pool"
+    }
+}
+
+/// Print the failed step and end the process.
+func fail(system: &System, proc: &Process, name: String, step: String, status: SosStatus) {
+    print("SOS {}: {}: {}", name, step, status)
+    let _ = proc.exit(EXIT_FAILED)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// The child's start, its boot set drained and each record printed; `None`
+/// when the drain failed, which is printed and ends the process.
+func begin(boot_handle: UInt, name: String) -> Started? {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS stockkit: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return None
+    }
+    let set = try BootSet(process: &proc) catch {
+        fail(&system, &proc, name, "drain", error)
+        return None
+    }
+    let entries = set.entries()
+    var i = 0
+    while i < entries.len() {
+        let e = entries.get(i)!
+        print("SOS {}: record {} {}", name, e.tag, kind_name(e.kind))
+        i = i + 1
+    }
+    let rights = try system.rights() catch {
+        fail(&system, &proc, name, "rights", error)
+        return None
+    }
+    print("SOS {}: its System: {}", name, system_rights(rights))
+    Started(system: move system, proc: move proc, set: move set)
+}
+
+/// A register's word, as a mapped window shows it.
+struct Word {
+    v: ReadOnly<UInt32>,
+}
+
+func read_word(address: UInt) unsafe -> UInt32 {
+    UnsafeMemory<Word, Device>(address).v.read()
+}
+
+/// Map each device window this child holds, in drain order, and print the
+/// word `offset` bytes into it.
+public func probe(boot_handle: UInt, name: String, offset: UInt) {
+    guard var s = begin(boot_handle, name) else { return }
+    let entries = s.set.entries()
+    var i = 0
+    while i < entries.len() {
+        let e = entries.get(i)!
+        i = i + 1
+        if e.kind != BootHandleKind.IoMemory {
+            continue
+        }
+        var record = s.set.take(e.tag)!
+        let window = record.take_iomemory()!
+        let mapping = try s.proc.map(iomemory: &window) catch {
+            fail(&s.system, &s.proc, name, "map", error)
+            return
+        }
+        let base = try mapping.base() catch {
+            fail(&s.system, &s.proc, name, "base", error)
+            return
+        }
+        print("SOS {}: record {} word {} = {}", name, e.tag, offset, read_word(base + offset))
+    }
+    let _ = s.proc.exit(EXIT_OK)
+}
+
+/// Show the `Waiter` row in force, allocate from the pool `pool_tag`, and
+/// answer every request on the server end `outlet_tag` until no client is
+/// left.
+public func serve(boot_handle: UInt, name: String, outlet_tag: UInt, pool_tag: UInt) {
+    guard var s = begin(boot_handle, name) else { return }
+    var outlet_record = s.set.take(outlet_tag)!
+    let outlet = outlet_record.take_outlet()!
+    var pool_record = s.set.take(pool_tag)!
+    let pool = pool_record.take_pool()!
+
+    let row = try s.proc.quota_get(QuotaKind.Waiter) catch {
+        fail(&s.system, &s.proc, name, "quota", error)
+        return
+    }
+    print("SOS {}: waiters limit={}", name, row.limit)
+    let waiter = try s.proc.waiter_create() catch {
+        fail(&s.system, &s.proc, name, "waiter", error)
+        return
+    }
+    match s.proc.waiter_create() {
+        case Ok(second) -> {
+            let _ = move second
+            print("SOS {}: a second waiter was made", name)
+        },
+        case Err(why) -> print("SOS {}: a second waiter: {}", name, why),
+    }
+    var held = Vector<UInt8>()
+    try held.reserve(ARENA_TAKE) catch {
+        print("SOS {}: the arena gave nothing: {}", name, error)
+        let _ = s.proc.exit(EXIT_FAILED)
+        return
+    }
+    print("SOS {}: its arena gave {} bytes", name, ARENA_TAKE)
+    answer(&s, name, &outlet, &waiter, &pool)
+}
+
+func answer(s: &Started, name: String, outlet: &PipeOutlet, waiter: &Waiter, pool: &Pool) {
+    let piece = try pool.allocate(len: PIECE) catch {
+        fail(&s.system, &s.proc, name, "allocate", error)
+        return
+    }
+    let _ = move piece
+    print("SOS {}: the pool gave {} bytes", name, PIECE)
+    try waiter.add(outlet: &outlet, key: KEY_OUTLET) catch {
+        fail(&s.system, &s.proc, name, "attach", error)
+        return
+    }
+    while {
+        let ready = try waiter.wait() catch {
+            fail(&s.system, &s.proc, name, "wait", error)
+            return
+        }
+        let _ = move ready
+        let (msg, request) = try outlet.take() catch {
+            if error == SosStatus.PeerClosed {
+                break
+            }
+            if error == SosStatus.WouldBlock {
+                continue
+            }
+            fail(&s.system, &s.proc, name, "take", error)
+            return
+        }
+        let asked = msg.bytes[0]
+        let _ = move msg
+        print("SOS {}: asked {}", name, asked)
+        var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+        body[0] = asked + 1
+        try (move request).reply(body: &body, len: 1) catch {
+            fail(&s.system, &s.proc, name, "reply", error)
+            return
+        }
+    }
+    print("SOS {}: no client is left", name)
+    let _ = s.proc.exit(EXIT_OK)
+}
+
+/// Send `byte` on the client end `inlet_tag` and print the answer.
+public func ask(boot_handle: UInt, name: String, inlet_tag: UInt, byte: UInt8) {
+    guard var s = begin(boot_handle, name) else { return }
+    var record = s.set.take(inlet_tag)!
+    let inlet = record.take_inlet()!
+    let rights = try inlet.rights() catch {
+        fail(&s.system, &s.proc, name, "rights", error)
+        return
+    }
+    print("SOS {}: its inlet: {}", name, inlet_rights(rights))
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    body[0] = byte
+    let reply = try inlet.send(body: &body, len: 1) catch {
+        fail(&s.system, &s.proc, name, "send", error)
+        return
+    }
+    print("SOS {}: sent {}, answered {}", name, byte, reply.bytes[0])
+    let _ = move reply
+    let _ = s.proc.exit(EXIT_OK)
+}
+
+/// Carve the first word of the device window `tag` again and again, keeping
+/// every carve, until the kernel refuses one, and print how many it got and
+/// the refusal.
+public func carve_all(boot_handle: UInt, name: String, tag: UInt) {
+    guard var s = begin(boot_handle, name) else { return }
+    var record = s.set.take(tag)!
+    let window = record.take_iomemory()!
+    var carves = Vector<IoMemory>()
+    while {
+        let carve = try window.carve(offset: 0, len: CARVE_LEN) catch {
+            print("SOS {}: carved {}, then: {}", name, carves.len(), error)
+            break
+        }
+        try! carves.push(move carve)
+    }
+    let _ = s.proc.exit(EXIT_OK)
+}

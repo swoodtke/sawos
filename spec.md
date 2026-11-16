@@ -4680,6 +4680,35 @@ reserved.
   pool there allocates only such allocations, and the segments a child uses in
   place count on the image allocation they lie in (§2.5), so a launcher may
   release its image handle while the child runs out of flash.
+- **The table of an image built from its description.** The image builder
+  (`tools/sosimage`) writes, in this order, which root's config reads as tags:
+  one image blob per child, one destination per child, then the image's rows,
+  for a hand-written root in the order its description lists them, and for
+  the stock root a row per device the image uses, in the order it first uses
+  each, then a row per pool. After the rows comes nothing, or the image's
+  slab block, below.
+- **The stock root's plan.** For an image whose root is the stock root
+  (`root/`), the builder also writes the module `imageplan`, in the types of
+  `bootplan`: for each child, the tags of its image and destination rows, its
+  quota rows, the records to give it (each with its tag, its source, and for a
+  carve the offset and length), the tag it is started with and its exit policy;
+  the connections; and the setup writes. The stock root holds no device code,
+  address or line of its own: it creates every child, makes the setup writes (a
+  carve of the register's grain from its device's row, mapped, written, unmapped
+  and released; a `set` or a `clear` reads the register first and changes only
+  its bits), sets each child's quota rows and gives its records under the launch
+  convention below, starts every child, and supervises. The builder refuses a
+  plan the stock root could not carry out: one at whose steps root's handle
+  table would overflow, or the IoMemory objects (one per device row, one per
+  carve given, and one for each setup write's carve while it is written) would
+  pass the image's IoMemory slab; a quota row past its bound, a row the image
+  gives below the declaration's or, for a kind the declaration leaves out, below
+  the one the image's children start with (an image raises a row and never
+  lowers one), a `threads` row of 0 (a child's first thread is charged to it),
+  and a child whose `Handle` row is short of what it holds when it starts. A
+  step that fails prints the step, the child and the status and stops the
+  machine; a child whose image says `on-exit = "shutdown"` stops the machine
+  when it ends, and the machine stops when every child has ended.
 - **After the rows, the image's slab areas.** The table is at version 5. After
   its rows comes nothing, or one whole block: a magic word, the number of
   areas, one quota default for each `QuotaKind` (the rows the image's children
@@ -4809,6 +4838,16 @@ reserved.
   `Memory.mint(rights:)` narrows an allocation before it travels (§2.5's
   `MemoryRight.MapExecute`), and `Pool.mint(rights:)` narrows a pool, and with
   it everything allocated through the narrowed handle.
+- **The launch convention** (userspace convention, not kernel surface). A
+  launcher that follows it gives a child exactly the records its declaration
+  lists (`process.toml`), under their tags, in declared order, before start.
+  It sets the declared quota rows before any give (§2.7, `QuotaSet`). It
+  gives windows, lines and endpoints as capabilities: a client gets an inlet
+  minted with `Post | Transfer`, a server the outlet. It starts the child
+  with its System record's tag, a sibling masked with `Debug | ProcessSelf |
+  ClockGet | Transfer`, and keeps the child's Process handle. A child that
+  knows its records by tag drains them all at once (`sos.BootSet`) and takes
+  each by its tag.
 - **v1 protocol conventions** (userspace convention, not kernel surface): a
   launched process receives one bootstrap pipe handle at launch; its first
   messages request its initial handle set from the launcher (name-service

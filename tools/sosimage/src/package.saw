@@ -22,11 +22,16 @@
 //!       "out": "/path/to/tests/child-bye/.build/riscv32-unknown-none-elf",
 //!       "region": {"base": 2149842944, "len": 262144},
 //!       "stack": 16384,
-//!       "slot": {"base": 1572864, "len": 131072}
+//!       "slot": {"base": 1572864, "len": 131072},
+//!       "plan": {"children": [], "connections": 0}
 //!     }
 //!
-//! `slot` is an in-place board's, and absent on any other. Every key but it
-//! is required, and an unknown key is refused.
+//! `slot` is an in-place board's, and absent on any other. `plan` is a stock
+//! root's: the builder writes it as the module `imageplan`
+//! (`sosimage.plan.plan_module`) into `OUT/NAME.imageplan/` and builds the
+//! package with it, unchecked, so a case can hand the stock root a plan the
+//! builder would refuse. Every other key is required, and an unknown key is
+//! refused.
 
 import std.file.{File}
 import std.path.{Path}
@@ -37,6 +42,7 @@ import sosimage.build.{ensure_directory}
 import sosimage.failure.{BuildError}
 import sosimage.fields.{Fields}
 import sosimage.layout.{Placement, process_script}
+import sosimage.plan.{ImagePlan, plan_module}
 import sosimage.profile.{Profile}
 import sosimage.tool.{read_file, read_text, run_tool, write_file, write_lines}
 
@@ -48,6 +54,35 @@ public struct ProcessSpec {
     package: String
     out: String
     placement: Placement
+    plan: ImagePlan?
+}
+
+@synthesize
+extension ProcessSpec: ExplicitCopy {}
+
+/// A module a process's build hands the compiler beside its package's own:
+/// `name` is the directory `dir`, which holds its `lib.saw`.
+public struct ModulePath {
+    name: String
+    dir: String
+}
+
+/// What a process's build takes beyond its placement: the arena its
+/// declaration states, when it states one, and the modules the image gives
+/// it (its inputs, or a stock root's plan).
+public struct Extras {
+    arena: UInt64?
+    modules: Vector<ModulePath>
+}
+
+@synthesize
+extension Extras: ExplicitCopy {}
+
+extension Extras {
+    /// Nothing beyond the placement.
+    public static func none() -> Extras {
+        Extras(arena: None, modules: Vector<ModulePath>())
+    }
 }
 
 /// What a process's build made: its image and the ELF it was made from.
@@ -82,12 +117,17 @@ extension ProcessSpec {
             slot = Span(base: try s.word("base"), len: try s.word("len"))
             try s.finish()
         }
+        var plan: ImagePlan? = None
+        if var given = try top.object("plan", "the process's `plan`") {
+            plan = try ImagePlan.read(&var given)
+        }
         try top.finish()
         if stack > region.len {
             return BuildError(message: "the process {origin}: its {stack}-byte stack is longer than its {region.len}-byte region")
         }
         return ProcessSpec(name: name, package: package, out: out,
-                           placement: Placement(region: region, stack: stack, slot: slot))
+                           placement: Placement(region: region, stack: stack, slot: slot),
+                           plan: move plan)
     }
 }
 
@@ -130,19 +170,31 @@ public func manifest_script(dir: String, triple: String) -> Result<String, Build
 }
 
 /// `path`, which exists, as an absolute path with no `.` or `..` in it.
-func absolute(path: String, what: String) -> Result<String, BuildError> {
+public func absolute(path: String, what: String) -> Result<String, BuildError> {
     let p = try Path(s: path).canonical() catch {
         return BuildError(message: "{what} {path} cannot be resolved: {error}")
     }
     return p.as_string()
 }
 
+/// Writes `plan` as the module `imageplan` into `OUT/NAME.imageplan/`, for
+/// the stock root built as the process `name` of the image `image`; answers
+/// the module's path.
+public func write_plan(plan: &ImagePlan, out: String, name: String,
+                       image: String) -> Result<ModulePath, BuildError> {
+    let dir = "{out}/{name}.imageplan"
+    try ensure_directory(dir)
+    let lines = plan_module(&plan, image)
+    try write_lines("{dir}/lib.saw", &lines)
+    return ModulePath(name: "imageplan", dir: try absolute(dir, "the plan's directory"))
+}
+
 /// Builds the package in `package` as the process `name` placed at `p`, into
-/// `out` (the module's header lays the directory out). The image a previous
-/// build left is removed first, so a build that fails leaves none to be
-/// taken for this one's.
+/// `out` (the module's header lays the directory out), with `extras`. The
+/// image a previous build left is removed first, so a build that fails
+/// leaves none to be taken for this one's.
 public func build_process(profile: &Profile, name: String, package: String, out: String,
-                          p: &Placement) -> Result<Built, BuildError> {
+                          p: &Placement, extras: &Extras) -> Result<Built, BuildError> {
     if profile.blade.is_empty() {
         return BuildError(message: "the profile names no Blade (`blade`), and the process {name} is built by one")
     }
@@ -154,7 +206,7 @@ public func build_process(profile: &Profile, name: String, package: String, out:
     try ensure_directory(out)
     let at = try absolute(out, "the output directory")
     let script = "{at}/{name}.ld"
-    let lines = try process_script(name, &p, script_named)
+    let lines = try process_script(name, &p, extras.arena, script_named)
     try write_lines(script, &lines)
     let image = "{at}/{name}.sosimg"
     if File.exists(Path(s: image)) {
@@ -179,6 +231,13 @@ public func build_process(profile: &Profile, name: String, package: String, out:
     try! argv.push(script)
     try! argv.push("--out-dir")
     try! argv.push(blade_out)
+    var m = 0
+    while m < extras.modules.len() {
+        let module = extras.modules.get(m)!
+        try! argv.push("--module-path")
+        try! argv.push("{module.name}={module.dir}")
+        m = m + 1
+    }
     try run_tool(&argv)
     let made = "{blade_out}/{pkg}.sosimg"
     if not File.exists(Path(s: made)) {

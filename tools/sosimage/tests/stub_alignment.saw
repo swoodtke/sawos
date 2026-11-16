@@ -5,6 +5,7 @@
 import sosimage.build.{regions_stub}
 import sosimage.image.{ImageSpec}
 import sosimage.limits.{SlabPlan}
+import sosimage.product.{blob_align}
 import sosimage.profile.{Profile}
 
 func profile() -> Profile {
@@ -76,4 +77,22 @@ func main() {
            "_sos_child0_start:\n    .incbin \"/c0.sosimg\"\n_sos_child0_end:\n")
     expect(between(&other, "    .balign 4096", "_sos_child1_end:"),
            "    .balign 4096\n_sos_child1_start:\n    .incbin \"/c1.sosimg\"\n    .balign 4096\n_sos_child1_end:\n")
+
+    // An image built from its description on a board that runs images in
+    // place at a page's grain places every blob on the grain and pads it to
+    // one, since its root maps it.
+    var granular = spec("ram", "ram")
+    granular.blob_align = 0x2000
+    let paged = try! regions_stub(&p, &granular, &none)
+    expect(between(&paged, "    .balign 8192", "_sos_child0_end:"),
+           "    .balign 8192\n_sos_child0_start:\n    .incbin \"/c0.sosimg\"\n    .balign 8192\n_sos_child0_end:\n")
+    expect(between(&paged, "_sos_child0_end:", "_sos_child1_end:"),
+           "_sos_child0_end:\n    .balign 16\n    .balign 8192\n_sos_child1_start:\n    .incbin \"/c1.sosimg\"\n    .balign 8192\n_sos_child1_end:\n")
+
+    // Which boards that is: one that runs images in place, at a grain
+    // coarser than 16 bytes.
+    assert(blob_align(0x1000, "in-place") == 0x1000, "in place, a page")
+    assert(blob_align(4, "in-place") == 16, "in place, a word")
+    assert(blob_align(0x1000, "translated") == 16, "translated")
+    assert(blob_align(0x1000, "copied") == 16, "copied")
 }

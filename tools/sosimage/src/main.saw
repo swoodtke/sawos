@@ -13,7 +13,8 @@
 //!     sosimage package PROFILE PROCESS
 //!         builds the package the process description PROCESS names, linked
 //!         for the placement it states, through a script the builder writes
-//!         (`sosimage.package`), and prints `image PATH`, the image it made
+//!         (`sosimage.package`), with the stock root's plan it states, and
+//!         prints `image PATH`, the image it made
 //!     sosimage slabs KERNEL
 //!         prints what the kernel object KERNEL says an image's limits are
 //!         sized and checked against (`sosimage.kernel`): for each slab kind
@@ -35,7 +36,8 @@
 //!         `null` for a board that states none
 //!     sosimage build PROFILE SAWOS PRODUCT IMAGE OUT
 //!         builds the image the hand-written description IMAGE states, for
-//!         the board it names, into the directory OUT (`sosimage.product`):
+//!         the board it names, into the directory OUT (`sosimage.product`;
+//!         for the stock root, with the plan `sosimage.plan` writes for it):
 //!         SAWOS is the sawos tree, which holds the boards and every `sawos:`
 //!         path, and PRODUCT the directory the image's other paths are from;
 //!         for a flash board it prints `flash used=USED end=END` as `link`
@@ -52,7 +54,7 @@ import std.env.{Env}
 import sosimage.board.{Board}
 import sosimage.boardcheck.{check_board, hal_facts}
 import sosimage.build.{build_kernel, build_native, link}
-import sosimage.package.{ProcessSpec, build_process}
+import sosimage.package.{Extras, ProcessSpec, build_process, write_plan}
 import sosimage.product.{board_defaults, build_image}
 import sosimage.failure.{BuildError}
 import sosimage.image.{ImageSpec}
@@ -113,8 +115,13 @@ func run() -> Result<Void, BuildError> {
     if command.equals("package") && args.len() == 4 {
         let profile = try load_profile(args.get(2) ?? "")
         let path = args.get(3) ?? ""
-        let spec = try ProcessSpec.parse(try read_text(path), path)
-        let built = try build_process(&profile, spec.name, spec.package, spec.out, &spec.placement)
+        var spec = try ProcessSpec.parse(try read_text(path), path)
+        var extras = Extras.none()
+        if let plan = spec.plan.take() {
+            try! extras.modules.push(try write_plan(&plan, spec.out, spec.name, spec.name))
+        }
+        let built = try build_process(&profile, spec.name, spec.package, spec.out, &spec.placement,
+                                      &extras)
         print("image {built.image}")
         return
     }

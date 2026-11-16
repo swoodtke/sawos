@@ -1,0 +1,877 @@
+//! The stock root's plan for an image: what an image description whose root
+//! is the stock root comes to once its processes are bound to their
+//! declarations (`sosimage.imagefile.bind`), the checks it is held to, and the
+//! module `imageplan` the builder writes for root's build in `bootplan`'s
+//! terms (`root/bootplan`).
+//!
+//! The region table's rows, which are root's boot set (spec §12): one image
+//! blob per process, one destination per process, then a row per device, in
+//! the order the image first uses each (every window need of each process, in
+//! image order and declaration order, then each `[[setup]]` write's device),
+//! then a row per pool, in `[[pool]]` order. A row is tagged with its ordinal.
+//!
+//! Each process's records, in its declaration's order, each under its tag:
+//! its `system` record is a sibling of root's System; a whole `window` is the
+//! row of the device it is bound to, given to the last process that takes
+//! that row whole when no carve of it follows, and a sibling of it for every
+//! other; a `part` window is a carve of its device's row; a `line` is the
+//! bound device's interrupt line, which root binds; a `serve` is the server
+//! end of a connection of its own, and a `client` an inlet of the connection
+//! of the serve it is bound to; a `memory` record is its pool's row. Its quota
+//! rows are its declaration's `[quota]`, each replaced by the image's
+//! `quota` for it, which may raise a row and not lower it.
+//!
+//! A `[[setup]]` write carves from its device's row the window of the board's
+//! grain (four bytes at least) that holds its register, and writes the
+//! register at its offset into that window.
+//!
+//! Refused by name: a line two processes need, which the kernel binds once;
+//! a `line` need bound to a device with no line; an image `quota` row below
+//! its declaration's; and an image `threads` row of 0, since a process's
+//! first thread is charged to it. Against the kernel (`check_plan`): a
+//! `handles` row past `MAX_HANDLES`, a `mappings` row past the grant rows an
+//! image leaves, a row at the ledger's unlimited mark, a row the image alone
+//! gives below the row the image's children start with (an image raises a
+//! row and never lowers one), a child whose `Handle` row is short of what it
+//! holds when it starts, and a step at which root would hold more handles
+//! than its table has or make more IoMemory objects than the image's slab
+//! holds.
+//!
+//! A test image states a plan of its own, unchecked, as JSON
+//! (`ImagePlan.read`), so a case can reach each of the stock root's stops:
+//!
+//!     {
+//!       "connections": 1,
+//!       "children": [{"name": "first", "image": 0, "destination": 1,
+//!                     "start": 1, "shutdown": false,
+//!                     "quota": {"waiters": 1},
+//!                     "records": [{"tag": 1, "source": "system"},
+//!                                 {"tag": 2, "source": "carve", "from": 4,
+//!                                  "offset": 12, "len": 4}]}],
+//!       "setup": [{"register": "RTC.ALARM_HIGH", "row": 4, "offset": 12,
+//!                  "len": 4, "at": 0, "op": "set", "value": 90}]
+//!     }
+//!
+//! A record's `from`, `offset` and `len`, a child's `quota`, `records` and
+//! `shutdown`, and `children`, `connections` and `setup` may be left out
+//! (zero, none, false); an unknown key is refused.
+
+import toml.{TomlPosition}
+import sosimage.board.{Board, Window, quota_keys}
+import sosimage.declaration.{Declaration, RecordKind}
+import sosimage.failure.{BuildError}
+import sosimage.fields.{Fields}
+import sosimage.hex.{hex}
+import sosimage.imagefile.{Bindings, ImageFile, SetupOp}
+import sosimage.kernel.{KernelFacts, QUOTA_HANDLE, QUOTA_KINDS, QUOTA_MAPPING}
+import sosimage.regions.{RegionKind}
+import sosimage.rules.{refused}
+
+/// The handles root holds at boot before its rows' (spec §12): System,
+/// Process and Thread.
+static ROOT_BOOT_HANDLES: Int = 3
+
+/// The ledger's unlimited mark, which no row may reach.
+static QUOTA_UNLIMITED: Int = 0xFFFF
+
+/// `QuotaKind.Thread`'s value.
+static QUOTA_THREAD: Int = 0
+
+/// The least window a setup write carves: one register.
+static REGISTER_BYTES: UInt64 = 4
+
+/// What a record is made from (`bootplan.Source`).
+public enum Source {
+    case System,
+    case Row,
+    case Sibling,
+    case Carve,
+    case Line,
+    case Outlet,
+    case Inlet
+}
+
+@synthesize
+extension Source: Equatable {}
+
+/// A source's case name in `bootplan.Source`.
+public func source_word(source: Source) -> String {
+    match source {
+        case System -> "System",
+        case Row -> "Row",
+        case Sibling -> "Sibling",
+        case Carve -> "Carve",
+        case Line -> "Line",
+        case Outlet -> "Outlet",
+        case Inlet -> "Inlet"
+    }
+}
+
+/// The source a test image's plan names.
+func source_named(word: String) -> Source? {
+    if word.equals("system") { return Source.System }
+    if word.equals("row") { return Source.Row }
+    if word.equals("sibling") { return Source.Sibling }
+    if word.equals("carve") { return Source.Carve }
+    if word.equals("line") { return Source.Line }
+    if word.equals("outlet") { return Source.Outlet }
+    if word.equals("inlet") { return Source.Inlet }
+    None
+}
+
+/// One record a child is given.
+public struct PlanRecord {
+    tag: Int
+    source: Source
+    /// A row's tag, a line, or a connection's index, by `source`.
+    from: UInt64
+    offset: UInt64
+    len: UInt64
+}
+
+/// One quota row, by `QuotaKind` value.
+public struct PlanQuota {
+    kind: Int
+    limit: Int
+    /// Whether the process's declaration states the row; one only the image
+    /// gives may not lower the row the image's children start with.
+    declared: Bool
+}
+
+/// One child.
+public struct PlanChild {
+    name: String
+    image: Int
+    destination: Int
+    quota: Vector<PlanQuota>
+    records: Vector<PlanRecord>
+    start: Int
+    shutdown: Bool
+    /// The handles it holds when it starts (`Declaration.handle_floor`); 0
+    /// for a test image's child, which nothing holds to it.
+    floor: Int
+}
+
+@synthesize
+extension PlanChild: ExplicitCopy {}
+
+/// One setup write.
+public struct PlanSetup {
+    register: String
+    row: Int
+    offset: UInt64
+    len: UInt64
+    at: UInt64
+    op: SetupOp
+    value: UInt64
+}
+
+/// A row after the blobs and destinations: a device's or a pool's.
+public struct PlanRow {
+    what: String
+    kind: RegionKind
+    /// A device row's window; a pool's is placed with the processes.
+    base: UInt64
+    len: UInt64
+    /// The pool a pool row is; "" for a device row.
+    pool: String
+}
+
+/// An image's plan.
+public struct ImagePlan {
+    children: Vector<PlanChild>
+    setup: Vector<PlanSetup>
+    connections: Int
+    /// The rows after the blobs and destinations, in order.
+    rows: Vector<PlanRow>
+}
+
+@synthesize
+extension ImagePlan: ExplicitCopy {}
+
+/// The `QuotaKind` value a quota key names.
+public func quota_of(key: String) -> Int {
+    if key.equals("threads") { return 0 }
+    if key.equals("events") { return 1 }
+    if key.equals("waiters") { return 2 }
+    if key.equals("timers") { return 3 }
+    if key.equals("memories") { return 4 }
+    if key.equals("iomemories") { return 5 }
+    if key.equals("mappings") { return 6 }
+    if key.equals("handles") { return 7 }
+    8
+}
+
+/// `bootplan.QuotaName`'s case for a `QuotaKind` value.
+func quota_name(kind: Int) -> String {
+    match kind {
+        case 0 -> "Thread",
+        case 1 -> "Event",
+        case 2 -> "Waiter",
+        case 3 -> "Timer",
+        case 4 -> "Memory",
+        case 5 -> "IoMemory",
+        case 6 -> "Mapping",
+        case 7 -> "Handle",
+        case _ -> "Pipe"
+    }
+}
+
+/// The quota key of a `QuotaKind` value.
+func quota_key(kind: Int) -> String {
+    let keys = quota_keys()
+    var i = 0
+    while i < keys.len() {
+        let key = keys.get(i) ?? ""
+        if quota_of(key) == kind {
+            return key
+        }
+        i = i + 1
+    }
+    "?"
+}
+
+/// The tag of the row named `what` in `rows`, after `first` blob and
+/// destination rows.
+func row_tag(rows: &Vector<PlanRow>, first: Int, device: String, pool: String) -> Int? {
+    var i = 0
+    while i < rows.len() {
+        let r = rows.get(i)!
+        if (not device.is_empty() && r.pool.is_empty() && r.what.equals(device)) ||
+           (not pool.is_empty() && r.pool.equals(pool)) {
+            return first + i
+        }
+        i = i + 1
+    }
+    None
+}
+
+/// The plan of a stock-root image, from its processes' declarations (`decls`,
+/// one per process, in order) and what binding them found (`bound`), on
+/// `board`, whose protection grain is `grain`.
+public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
+                       bound: &Bindings, grain: UInt64) -> Result<ImagePlan, BuildError> {
+    let file = image.file
+    let count = image.processes.len()
+    let first = 2 * count
+
+    // The device rows, in first-use order, then the pool rows.
+    var rows = Vector<PlanRow>()
+    var p = 0
+    while p < count {
+        let process = image.processes.get(p)!
+        borrow let d = decls[p] {
+            var r = 0
+            while r < d.records.len() {
+                let record = d.records.get(r)!
+                r = r + 1
+                if record.kind != RecordKind.Window {
+                    continue
+                }
+                let device = bound_device(&bound, process.name, record.name)
+                add_device_row(&var rows, &board, device, first)
+            }
+        }
+        p = p + 1
+    }
+    var s = 0
+    while s < image.setup.len() {
+        let entry = image.setup.get(s)!
+        add_device_row(&var rows, &board, entry.register.device, first)
+        s = s + 1
+    }
+    var q = 0
+    while q < image.pools.len() {
+        let pool = image.pools.get(q)!
+        try! rows.push(PlanRow(what: "the pool {pool.name}", kind: RegionKind.Pool, base: 0,
+                               len: pool.len, pool: pool.name))
+        q = q + 1
+    }
+
+    // A connection per serve record, in image order and declaration order.
+    var connections = Vector<String>()
+    p = 0
+    while p < count {
+        let process = image.processes.get(p)!
+        borrow let d = decls[p] {
+            var r = 0
+            while r < d.records.len() {
+                let record = d.records.get(r)!
+                if record.kind == RecordKind.Serve {
+                    try! connections.push("{process.name}.{record.name}")
+                }
+                r = r + 1
+            }
+        }
+        p = p + 1
+    }
+
+    var children = Vector<PlanChild>()
+    var lines = Vector<String>()
+    var line_holders = Vector<String>()
+    p = 0
+    while p < count {
+        let process = image.processes.get(p)!
+        borrow let d = decls[p] {
+            var records = Vector<PlanRecord>()
+            var start = 0
+            var r = 0
+            while r < d.records.len() {
+                let record = d.records.get(r)!
+                r = r + 1
+                var made = PlanRecord(tag: record.tag, source: Source.System, from: 0, offset: 0,
+                                      len: 0)
+                match record.kind {
+                    case System -> { start = record.tag },
+                    case Window -> {
+                        let w = bound_window(&bound, process.name, record.name)!
+                        let device = board.device(w.device)!
+                        made.from = (row_tag(&rows, first, w.device, "")!) as UInt64
+                        if w.part {
+                            made.source = Source.Carve
+                            made.offset = w.base - device.base
+                            made.len = w.len
+                        } else {
+                            made.source = Source.Row
+                        }
+                    },
+                    case Line -> {
+                        let name = bound_device(&bound, process.name, record.name)
+                        let device = board.device(name)!
+                        guard let line = device.line else {
+                            return refused(file, process.at, "the line `{record.name}` of the process {process.name} is bound to {name}, which has no interrupt line")
+                        }
+                        let key = "{line}"
+                        var k = 0
+                        while k < lines.len() {
+                            if (lines.get(k) ?? "").equals(key) {
+                                return refused(file, process.at, "the processes {line_holders.get(k) ?? ""} and {process.name} both need the line {line} of {name}: the kernel binds a line once, to one holder")
+                            }
+                            k = k + 1
+                        }
+                        try! lines.push(key)
+                        try! line_holders.push(process.name)
+                        made.source = Source.Line
+                        made.from = line as UInt64
+                    },
+                    case Serve -> {
+                        made.source = Source.Outlet
+                        made.from = (index_of(&connections, "{process.name}.{record.name}")!) as UInt64
+                    },
+                    case Client -> {
+                        let target = image.entry(&image.clients, process.name, record.name)!
+                        made.source = Source.Inlet
+                        made.from = (index_of(&connections, target.value)!) as UInt64
+                    },
+                    case Memory -> {
+                        let pool = image.entry(&image.pool_bindings, process.name, record.name)!
+                        made.source = Source.Row
+                        made.from = (row_tag(&rows, first, "", pool.value)!) as UInt64
+                    }
+                }
+                try! records.push(made)
+            }
+            let quota = try quota_rows(&image, &d, process.name, process.at)
+            try! children.push(PlanChild(name: process.name, image: p, destination: count + p,
+                                         quota: move quota, records: move records, start: start,
+                                         shutdown: process.on_exit.equals("shutdown"),
+                                         floor: d.handle_floor()))
+        }
+        p = p + 1
+    }
+    last_takers(&var children)
+
+    var setup = Vector<PlanSetup>()
+    let window = if grain > REGISTER_BYTES { grain } else { REGISTER_BYTES }
+    s = 0
+    while s < image.setup.len() {
+        let entry = image.setup.get(s)!
+        s = s + 1
+        let device = board.device(entry.register.device)!
+        let at = entry.register.base - device.base
+        let offset = at / window * window
+        try! setup.push(PlanSetup(register: entry.reference, row: row_tag(&rows, first, device.name, "")!,
+                                  offset: offset, len: window, at: at - offset, op: entry.op,
+                                  value: entry.value))
+    }
+    return ImagePlan(children: move children, setup: move setup,
+                     connections: connections.len(), rows: move rows)
+}
+
+/// The device bound to the need `need` of `process`.
+func bound_device(bound: &Bindings, process: String, need: String) -> String {
+    (bound_window(&bound, process, need)!).device
+}
+
+/// The window bound to the need `need` of `process`.
+func bound_window(bound: &Bindings, process: String, need: String) -> Window? {
+    var i = 0
+    while i < bound.windows.len() {
+        let b = bound.windows.get(i)!
+        if b.process.equals(process) && b.need.equals(need) {
+            return b.window
+        }
+        i = i + 1
+    }
+    None
+}
+
+/// A row for `device`, unless it has one.
+func add_device_row(rows: &var Vector<PlanRow>, board: &Board, device: String, first: Int) {
+    if row_tag(&rows, first, device, "") != None {
+        return
+    }
+    let d = board.device(device)!
+    try! rows.push(PlanRow(what: device, kind: RegionKind.Device, base: d.base, len: d.len,
+                           pool: ""))
+}
+
+/// The index of `name` in `names`.
+func index_of(names: &Vector<String>, name: String) -> Int? {
+    var i = 0
+    while i < names.len() {
+        if (names.get(i) ?? "").equals(name) {
+            return i
+        }
+        i = i + 1
+    }
+    None
+}
+
+/// Each whole window given as its row's sibling, but the last record that
+/// takes its row when nothing after it carves or takes that row: that one is
+/// the row.
+func last_takers(children: &var Vector<PlanChild>) {
+    var c = 0
+    while c < children.len() {
+        var r = 0
+        var count = 0
+        borrow let child = children[c] {
+            count = child.records.len()
+        }
+        while r < count {
+            var record = PlanRecord(tag: 0, source: Source.System, from: 0, offset: 0, len: 0)
+            borrow let child = children[c] {
+                record = child.records.get(r)!
+            }
+            if record.source == Source.Row && later_use(&children, c, r, record.from) {
+                borrow var child = children[c] {
+                    child.records[r] = PlanRecord(tag: record.tag, source: Source.Sibling,
+                                                  from: record.from, offset: 0, len: 0)
+                }
+            }
+            r = r + 1
+        }
+        c = c + 1
+    }
+}
+
+/// Whether a record after child `c`'s record `r` takes the row `row`.
+func later_use(children: &Vector<PlanChild>, c: Int, r: Int, row: UInt64) -> Bool {
+    var i = c
+    while i < children.len() {
+        borrow let child = children[i] {
+            var j = if i == c { r + 1 } else { 0 }
+            while j < child.records.len() {
+                let other = child.records.get(j)!
+                let takes = other.source == Source.Row || other.source == Source.Sibling ||
+                            other.source == Source.Carve
+                if takes && other.from == row {
+                    return true
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// A process's quota rows, in kind order: its declaration's, each replaced by
+/// the image's, which may not lower one.
+func quota_rows(image: &ImageFile, d: &Declaration, process: String,
+                at: TomlPosition) -> Result<Vector<PlanQuota>, BuildError> {
+    var limits = Vector<Int>()
+    var k = 0
+    while k < QUOTA_KINDS {
+        try! limits.push(-1)
+        k = k + 1
+    }
+    var declared = Vector<Bool>()
+    k = 0
+    while k <= 8 {
+        try! declared.push(false)
+        k = k + 1
+    }
+    var i = 0
+    while i < d.quota.len() {
+        let row = d.quota.get(i)!
+        limits[quota_of(row.name)] = row.value
+        declared[quota_of(row.name)] = true
+        i = i + 1
+    }
+    i = 0
+    while i < image.quotas.len() {
+        let given = image.quotas.get(i)!
+        i = i + 1
+        if not given.process.equals(process) {
+            continue
+        }
+        let kind = quota_of(given.key)
+        let value = given.value.to_int() ?? 0
+        if kind == QUOTA_THREAD && value == 0 {
+            return refused(image.file, given.at, "the image gives the process {process} `threads` = 0: a process's first thread is charged to its row, and with none it cannot start")
+        }
+        let stated = limits.get(kind) ?? -1
+        if value < stated {
+            return refused(image.file, given.at, "the image gives the process {process} `{given.key}` = {value}, below the {stated} its declaration ({d.file}) needs")
+        }
+        limits[kind] = value
+    }
+    var out = Vector<PlanQuota>()
+    k = 0
+    while k < QUOTA_KINDS {
+        let limit = limits.get(k) ?? -1
+        if limit >= 0 {
+            try! out.push(PlanQuota(kind: k, limit: limit, declared: declared.get(k) ?? false))
+        }
+        k = k + 1
+    }
+    move out
+}
+
+/// Holds `plan` to the kernel `facts` describes, for an image named by `what`
+/// whose children start with the quota rows `defaults` (by `QuotaKind`
+/// value) and whose IoMemory slab holds `iomemories`: each quota row against
+/// its bound, and a row the image alone gives against the row it would
+/// lower; each child's `Handle` row against what it holds when it starts;
+/// and root at every step of the plan, its handle table and the IoMemory
+/// objects it has made.
+public func check_plan(plan: &ImagePlan, facts: &KernelFacts, defaults: &Vector<Int>,
+                       iomemories: Int, what: String) -> Result<Void, BuildError> {
+    var c = 0
+    while c < plan.children.len() {
+        borrow let child = plan.children[c] {
+            try check_child(&child, &facts, &defaults, what)
+        }
+        c = c + 1
+    }
+    return root_steps(&plan, facts.handles, iomemories, what)
+}
+
+/// `check_plan` for one child.
+func check_child(child: &PlanChild, facts: &KernelFacts, defaults: &Vector<Int>,
+                 what: String) -> Result<Void, BuildError> {
+    let mapping_bound = facts.budget - facts.image_rows
+    var handles = defaults.get(QUOTA_HANDLE) ?? 0
+    var q = 0
+    while q < child.quota.len() {
+        let row = child.quota.get(q)!
+        q = q + 1
+        let key = quota_key(row.kind)
+        if row.limit >= QUOTA_UNLIMITED {
+            return BuildError(message: "{what}: the process {child.name}'s `{key}` row is {row.limit}, which the ledger's row cannot hold below its unlimited mark ({QUOTA_UNLIMITED})")
+        }
+        let boots = defaults.get(row.kind) ?? 0
+        if not row.declared && row.limit < boots {
+            return BuildError(message: "{what}: the image gives the process {child.name} `{key}` = {row.limit}, below the {boots} the image's children start with: an image raises a row and never lowers one")
+        }
+        if row.kind == QUOTA_HANDLE {
+            if row.limit > facts.handles {
+                return BuildError(message: "{what}: the process {child.name}'s `handles` row is {row.limit}, past MAX_HANDLES ({facts.handles})")
+            }
+            handles = row.limit
+        }
+        if row.kind == QUOTA_MAPPING && row.limit > mapping_bound {
+            return BuildError(message: "{what}: the process {child.name}'s `mappings` row is {row.limit}, past the {mapping_bound} grant rows an image leaves of this board's {facts.budget}")
+        }
+    }
+    if handles < child.floor {
+        return BuildError(message: "{what}: the process {child.name}'s `Handle` row is {handles}, short of the {child.floor} handles it holds when it starts")
+    }
+    return
+}
+
+/// Refuses a step of `plan` at which root would hold more than `table`
+/// handles, as `root/` takes them: its boot handles and one per row, its own
+/// Process handle, each child created and its two rows released, each setup
+/// write's carve and mapping, each record made and given, and its Waiter,
+/// made before it releases what is left of the rows and connections. Refuses
+/// one at which the IoMemory objects would number more than `iomemories`:
+/// one per device row, made at boot, one for each setup write's carve while
+/// it is written, and one for each carve given.
+func root_steps(plan: &ImagePlan, table: Int, iomemories: Int,
+                what: String) -> Result<Void, BuildError> {
+    let count = plan.children.len()
+    var devices = 0
+    var d = 0
+    while d < plan.rows.len() {
+        if (plan.rows.get(d)!).kind == RegionKind.Device {
+            devices = devices + 1
+        }
+        d = d + 1
+    }
+    var steps = Steps(held: ROOT_BOOT_HANDLES + 2 * count + plan.rows.len() + 1,
+                      made: Vector<Bool>(), objects: devices, slab: iomemories)
+    try within(steps.held, table, what, "derive")
+    var c = 0
+    while c < count {
+        borrow let child = plan.children[c] {
+            try within(steps.held + 1, table, what, "create {child.name}")
+        }
+        steps.held = steps.held - 1
+        c = c + 1
+    }
+    var s = 0
+    while s < plan.setup.len() {
+        let step = "setup {(plan.setup.get(s)!).register}"
+        try within(steps.held + 2, table, what, step)
+        try objects_within(steps.objects + 1, iomemories, what, step)
+        s = s + 1
+    }
+    var k = 0
+    while k < plan.connections {
+        try! steps.made.push(false)
+        k = k + 1
+    }
+    c = 0
+    while c < count {
+        borrow let child = plan.children[c] {
+            var r = 0
+            while r < child.records.len() {
+                let record = child.records.get(r)!
+                r = r + 1
+                try give_step(&var steps, &record, table, what,
+                              "give {child.name} record {record.tag}")
+            }
+        }
+        c = c + 1
+    }
+    return within(steps.held + 1, table, what, "supervise")
+}
+
+/// What root holds as `root_steps` walks the plan, which connections it has
+/// made, and how many IoMemory objects there are of the slab's `slab`.
+struct Steps {
+    held: Int
+    made: Vector<Bool>
+    objects: Int
+    slab: Int
+}
+
+@synthesize
+extension Steps: ExplicitCopy {}
+
+/// One record made and given, at `step`.
+func give_step(steps: &var Steps, record: &PlanRecord, table: Int, what: String,
+               step: String) -> Result<Void, BuildError> {
+    match record.source {
+        case Row -> { steps.held = steps.held - 1 },
+        case Outlet -> {
+            try connect(&var steps, record.from as Int, table, what, step)
+            steps.held = steps.held - 1
+        },
+        case Inlet -> {
+            try connect(&var steps, record.from as Int, table, what, step)
+            try within(steps.held + 1, table, what, step)
+        },
+        case Carve -> {
+            steps.objects = steps.objects + 1
+            try objects_within(steps.objects, steps.slab, what, step)
+        },
+        // A System sibling, a row's sibling, a carve's handle or a line is
+        // made and given at once, and never takes root's table past a step
+        // before it: root held at least one more at its first create, and
+        // since the last connection it made it has held no more than it held
+        // then.
+        case _ -> {}
+    }
+    return
+}
+
+/// Connection `index` made, if it is not yet.
+func connect(steps: &var Steps, index: Int, table: Int, what: String,
+             step: String) -> Result<Void, BuildError> {
+    if steps.made.get(index) ?? true {
+        return
+    }
+    steps.made[index] = true
+    steps.held = steps.held + 2
+    within(steps.held, table, what, step)
+}
+
+/// Refuses `objects` IoMemory objects past the slab's `slab` at `step`.
+func objects_within(objects: Int, slab: Int, what: String,
+                    step: String) -> Result<Void, BuildError> {
+    if objects > slab {
+        return BuildError(message: "{what}: the stock root would make the IoMemory objects {objects} at `{step}`, past the image's {slab}")
+    }
+    return
+}
+
+/// Refuses `held` handles past `table` at `step`.
+func within(held: Int, table: Int, what: String, step: String) -> Result<Void, BuildError> {
+    if held > table {
+        return BuildError(message: "{what}: the stock root would hold {held} handles at `{step}`, past MAX_HANDLES ({table})")
+    }
+    return
+}
+
+extension ImagePlan {
+    /// Reads a test image's plan, `fields`.
+    public static func read(fields: &var Fields) -> Result<ImagePlan, BuildError> {
+        var children = Vector<PlanChild>()
+        var given = try fields.objects_or_empty("children", "a plan's child")
+        var c = 0
+        while c < given.len() {
+            borrow var f = given[c] {
+                try! children.push(try read_child(&var f))
+            }
+            c = c + 1
+        }
+        var setup = Vector<PlanSetup>()
+        var writes = try fields.objects_or_empty("setup", "a plan's setup write")
+        var s = 0
+        while s < writes.len() {
+            borrow var f = writes[s] {
+                let word = try f.text("op")
+                let op = if word.equals("set") { SetupOp.Set } else if word.equals("clear") {
+                    SetupOp.Clear
+                } else if word.equals("write") { SetupOp.Write } else {
+                    return BuildError(message: "a plan's setup write has the op `{word}`, not one of `set`, `clear`, `write`")
+                }
+                try! setup.push(PlanSetup(register: try f.text("register"), row: try f.integer("row"),
+                                          offset: try f.word("offset"), len: try f.word("len"),
+                                          at: try f.word("at"), op: op, value: try f.word("value")))
+                try f.finish()
+            }
+            s = s + 1
+        }
+        var connections = 0
+        if fields.has("connections") {
+            connections = try fields.integer("connections")
+        }
+        try fields.finish()
+        return ImagePlan(children: move children, setup: move setup, connections: connections,
+                         rows: Vector<PlanRow>())
+    }
+}
+
+/// One child of a test image's plan.
+func read_child(f: &var Fields) -> Result<PlanChild, BuildError> {
+    let name = try f.text("name")
+    var quota = Vector<PlanQuota>()
+    if var q = try f.object("quota", "a plan child's `quota`") {
+        let keys = quota_keys()
+        var k = 0
+        while k < keys.len() {
+            let key = keys.get(k) ?? ""
+            if q.has(key) {
+                try! quota.push(PlanQuota(kind: quota_of(key), limit: try q.integer(key),
+                                         declared: true))
+            }
+            k = k + 1
+        }
+        try q.finish()
+    }
+    var records = Vector<PlanRecord>()
+    var given = try f.objects_or_empty("records", "a plan child's record")
+    var r = 0
+    while r < given.len() {
+        borrow var g = given[r] {
+            let word = try g.text("source")
+            guard let source = source_named(word) else {
+                return BuildError(message: "a plan's record has the source `{word}`, not one of `system`, `row`, `sibling`, `carve`, `line`, `outlet`, `inlet`")
+            }
+            var from: UInt64 = 0
+            var offset: UInt64 = 0
+            var len: UInt64 = 0
+            if g.has("from") { from = try g.word("from") }
+            if g.has("offset") { offset = try g.word("offset") }
+            if g.has("len") { len = try g.word("len") }
+            try! records.push(PlanRecord(tag: try g.integer("tag"), source: source, from: from,
+                                         offset: offset, len: len))
+            try g.finish()
+        }
+        r = r + 1
+    }
+    var shutdown = false
+    if f.has("shutdown") {
+        shutdown = try f.boolean("shutdown")
+    }
+    let child = PlanChild(name: name, image: try f.integer("image"),
+                          destination: try f.integer("destination"), quota: move quota,
+                          records: move records, start: try f.integer("start"),
+                          shutdown: shutdown, floor: 0)
+    try f.finish()
+    return move child
+}
+
+/// `text` as a Saw string literal.
+func literal(text: String) -> String {
+    let quoted = text.replace("\\", "\\\\").replace("\"", "\\\"")
+    let escaped = quoted.replace("\{", "\\\{").replace("\}", "\\\}")
+    let quote = "\""
+    "{quote}{escaped}{quote}"
+}
+
+/// The module `imageplan` for `plan`, as the lines of its `lib.saw`; `name`
+/// names the image.
+public func plan_module(plan: &ImagePlan, name: String) -> Vector<String> {
+    var out = Vector<String>()
+    try! out.push("//! Generated by sosimage: the stock root's plan for the image {name}.")
+    try! out.push("")
+    try! out.push("import bootplan.\{Plan, Child, Record, Source, Setup, SetupOp, Quota, QuotaName\}")
+    try! out.push("")
+    try! out.push("public func plan() -> Plan \{")
+    try! out.push("    var children = Vector<Child>()")
+    var c = 0
+    while c < plan.children.len() {
+        try! out.push("    try! children.push(child_{c}())")
+        c = c + 1
+    }
+    try! out.push("    var setup = Vector<Setup>()")
+    var s = 0
+    while s < plan.setup.len() {
+        let w = plan.setup.get(s)!
+        let op = match w.op { case Set -> "Set", case Clear -> "Clear", case Write -> "Write" }
+        try! out.push("    try! setup.push(Setup(register: {literal(w.register)}, row: {w.row}, offset: {hex(w.offset)}, len: {hex(w.len)}, at: {hex(w.at)}, op: SetupOp.{op}, value: {hex(w.value)}))")
+        s = s + 1
+    }
+    try! out.push("    Plan(children: move children, setup: move setup, connections: {plan.connections})")
+    try! out.push("\}")
+    c = 0
+    while c < plan.children.len() {
+        borrow let child = plan.children[c] {
+            try! out.append(&child_function(&child, c))
+        }
+        c = c + 1
+    }
+    move out
+}
+
+/// The function `plan_module` writes for child `index`.
+func child_function(child: &PlanChild, index: Int) -> Vector<String> {
+    var out = Vector<String>()
+    try! out.push("")
+    try! out.push("func child_{index}() -> Child \{")
+    try! out.push("    var quota = Vector<Quota>()")
+    var q = 0
+    while q < child.quota.len() {
+        let row = child.quota.get(q)!
+        try! out.push("    try! quota.push(Quota(kind: QuotaName.{quota_name(row.kind)}, limit: {row.limit}))")
+        q = q + 1
+    }
+    try! out.push("    var records = Vector<Record>()")
+    var r = 0
+    while r < child.records.len() {
+        let record = child.records.get(r)!
+        try! out.push("    try! records.push(Record(tag: {record.tag}, source: Source.{source_word(record.source)}, from: {hex(record.from)}, offset: {hex(record.offset)}, len: {hex(record.len)}))")
+        r = r + 1
+    }
+    try! out.push("    Child(name: {literal(child.name)}, image: {child.image}, destination: {child.destination},")
+    try! out.push("          quota: move quota, records: move records, start: {child.start},")
+    try! out.push("          shutdown: {child.shutdown})")
+    try! out.push("\}")
+    move out
+}

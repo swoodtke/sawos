@@ -1,37 +1,435 @@
-// SOS root server (spec.md §12), U-mode.
-//
-// Root is the first process, and the only one the kernel loads on its own.
-// Everything else (the launcher, the name service, every later process) is
-// root's job, not the kernel's.
-//
-// Root prints a banner and stops the machine. It holds no memory grant for the
-// UART: a character reaches the console only because root asks the System
-// object to put it there, through a handle carrying `SystemRight.Debug`.
-// Without that handle root is mute.
-//
-// This file has no op numbers, no `ecall`, no syscall stub and no
-// architecture. Those belong to the kernel package and are reached through the
-// `sos` module it exports (spec.md §5.7: numbers are not ABI). It builds for
-// either architecture unchanged.
+//! The stock root (spec §12): it launches an image's processes as the image's
+//! plan says. The image builder writes the plan for each image, the module
+//! `imageplan` in `bootplan`'s terms; this file holds no device code, no
+//! address and no interrupt line of its own, and every one it uses is the
+//! plan's.
+//!
+//! The steps, in order (the launch convention, spec §12):
+//!
+//!   derive     derive its Process handle and drain its rows into a BootSet;
+//!   create     create every child from its image blob and destination, and
+//!              release both rows;
+//!   setup      make each `[[setup]]` write: carve the register's window from
+//!              its device row, map it, write the register (reading it first
+//!              for a `set` or a `clear`), unmap it and release both;
+//!   quota      set each child's declared quota rows;
+//!   give       give each child its records under their tags, in its declared
+//!              order: a System sibling, a row or a sibling of one, a carve of
+//!              one, an interrupt line it binds, a connection's server end or
+//!              an inlet minted from it;
+//!   start      start every child with its System record's tag;
+//!   supervise  make a Waiter and attach every child to it, release every row
+//!              and connection end root still holds, and wait for the
+//!              children's ends.
+//!
+//! A step that fails prints `root: STEP WHO: STATUS` (WHO is the child, with
+//! the record's tag for a give; the register for a setup write; or `root`)
+//! and stops the machine with status 1. A child's end is reported as
+//! `root: NAME ended status=WORD`, the §8 status word. Root stops the machine
+//! when a child whose image entry says `on-exit = "shutdown"` ends, with its
+//! exit code if it exited and 1 if it did not, and with 0 when every child has
+//! ended.
+//!
+//! A plan that gives one connection's server end twice, names a row root's
+//! boot set does not hold, or holds as another kind, or uses a row after
+//! giving it whole, is a skew between the plan and the region table the
+//! builder wrote beside it, and root panics naming it.
 
-import sos.{System}
+import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet,
+            WaitResult, BootSet, BootHandle, SosStatus, SystemRight,
+            PipeInletRight, QuotaKind}
+import bootplan.{Plan, Child, Record, Source, Setup, SetupOp, QuotaName,
+                 setup_word, reads_first}
+import imageplan
 
-/// Root's exit status when its work is done.
+/// The machine's status when every child has ended.
 static EXIT_OK: UInt = 0
+/// The machine's status when a step fails, or a `shutdown` child ends other
+/// than by exiting.
+static EXIT_STOPPED: UInt = 1
+
+/// A child's System handle: print, learn its own Process object, read the
+/// clock, and the bit `give` checks on the thing given. A System right added
+/// later is withheld by silence.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+/// A client's inlet: it may post and hand the end on.
+static CLIENT_INLET: UInt32 = (PipeInletRight.Post | PipeInletRight.Transfer)
+
+/// The §8 status word's reason for a process that exited, in its high half.
+static REASON_EXITED: UInt = 1
+static REASON_SHIFT: UInt = 16
+static CODE_MASK: UInt = 0xFFFF
+
+/// A step that failed: which, for whom, and the status it answered.
+struct Stop {
+    step: String
+    who: String
+    status: SosStatus
+}
 
 @export("_start")
 func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
+    let plan = imageplan.plan()
+    let code = try run(&system, &plan) catch {
+        print("root: {} {}: {}", error.step, error.who, error.status)
+        let _ = system.shutdown(EXIT_STOPPED)
+        return
+    }
+    let _ = system.shutdown(code)
+}
 
-    // Typed altitude: a method on a handle. A failure has nowhere to be
-    // reported, since the console is what would have failed, so it is dropped.
-    let _ = system.debug_print("SOS root: hello from U-mode via a System op\n")
+func stop(step: String, who: String, status: SosStatus) -> Stop {
+    Stop(step: step, who: who, status: status)
+}
 
-    // Runtime-seam altitude. `print` reaches the console through
-    // `__saw_rt_write`, which `sosrt` implements over the `sos_rt_write` hook,
-    // which the kernel's `sos` module implements over a System op. The format
-    // argument is rendered into stack scratch, so `print` allocates nothing.
-    print("SOS root: boot handle {}", boot_handle)
+/// Every step; answers the machine's status.
+func run(system: &System, plan: &Plan) -> Result<UInt, Stop> {
+    let (proc, set) = try derive(&system) catch {
+        return stop("derive", "root", error)
+    }
+    var rows = Rows(set: move set, tags: Vector<UInt>(), windows: Vector<IoMemory?>())
 
-    let _ = system.shutdown(EXIT_OK)
+    var children = Vector<Process>()
+    var i = 0
+    while i < plan.children.len() {
+        borrow let c = plan.children[i] {
+            let child = try create(&system, &var rows, &c) catch {
+                return stop("create", c.name, error)
+            }
+            try! children.push(move child)
+        }
+        i = i + 1
+    }
+
+    i = 0
+    while i < plan.setup.len() {
+        borrow let s = plan.setup[i] {
+            try setup_write(&proc, &var rows, &s) catch {
+                return stop("setup", s.register, error)
+            }
+        }
+        i = i + 1
+    }
+
+    var ends = Vector<Ends>()
+    i = 0
+    while i < plan.connections {
+        try! ends.push(Ends(inlet: None, outlet: None))
+        i = i + 1
+    }
+    i = 0
+    while i < plan.children.len() {
+        borrow let c = plan.children[i] {
+            borrow let child = children[i] {
+                try set_quota(&child, &c) catch {
+                    return stop("quota", c.name, error)
+                }
+                var r = 0
+                while r < c.records.len() {
+                    borrow let record = c.records[r] {
+                        try give(&system, &proc, &child, &var rows, &var ends, &record) catch {
+                            return stop("give", "{c.name} record {record.tag}", error)
+                        }
+                    }
+                    r = r + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < plan.children.len() {
+        borrow let c = plan.children[i] {
+            borrow let child = children[i] {
+                try child.start(boot_tag: c.start) catch {
+                    return stop("start", c.name, error)
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    let code = try supervise(&proc, &plan, &children, move rows, move ends) catch {
+        return stop("supervise", "root", error)
+    }
+    return code
+}
+
+/// Root's Process handle, and its rows drained.
+func derive(system: &System) -> Result<(Process, BootSet), SosStatus> {
+    let proc = try system.process_self()
+    let set = try BootSet(process: &proc)
+    return (move proc, move set)
+}
+
+/// Root's rows: the boot set, and the device rows taken out of it, each kept
+/// while a later record or write still carves or mints from it.
+struct Rows {
+    set: BootSet
+    tags: Vector<UInt>
+    windows: Vector<IoMemory?>
+}
+
+extension Rows: NoCopy {}
+
+extension Rows {
+    /// The record of the row `tag`, taken out of the set.
+    func take(&var self, tag: UInt) -> BootHandle {
+        guard let record = self.set.take(tag) else {
+            panic("root: the plan names row {}, which root's boot set does not hold", tag)
+        }
+        move record
+    }
+
+    /// The allocation of the row `tag`, taken out of the set.
+    func allocation(&var self, tag: UInt) -> Memory {
+        var record = self.take(tag)
+        guard let memory = record.take_memory() else {
+            panic("root: the plan names row {} as an allocation, and it is not one", tag)
+        }
+        move memory
+    }
+
+    /// The index in `windows` of the device row `tag`, or -1 when it was
+    /// never taken out of the set.
+    func find(&self, tag: UInt) -> Int {
+        var k = 0
+        while k < self.tags.len() {
+            if (self.tags.get(k) ?? 0) == tag {
+                return k
+            }
+            k = k + 1
+        }
+        -1
+    }
+
+    /// The index in `windows` of the device row `tag`, taken out of the set
+    /// the first time it is asked for.
+    func window(&var self, tag: UInt) -> Int {
+        let k = self.find(tag)
+        if k >= 0 {
+            self.held(k, tag)
+            return k
+        }
+        var record = self.take(tag)
+        guard let w = record.take_iomemory() else {
+            panic("root: the plan names row {} as a device's, and it is not one", tag)
+        }
+        try! self.tags.push(tag)
+        try! self.windows.push(move w)
+        self.tags.len() - 1
+    }
+}
+
+extension Rows {
+    /// Panics when the device row `tag`, at `k` in `windows`, was given
+    /// whole already.
+    func held(&self, k: Int, tag: UInt) {
+        if self.windows[k].is_none() {
+            panic("root: the plan uses row {} after giving it whole", tag)
+        }
+    }
+}
+
+/// One child, created from its rows; both rows are released.
+func create(system: &System, rows: &var Rows, c: &Child) -> Result<Process, SosStatus> {
+    let blob = rows.allocation(c.image)
+    let memory = rows.allocation(c.destination)
+    system.process_create(image: &blob, memory: &memory)
+}
+
+/// A register's word, as a mapped device window shows it.
+struct Word {
+    v: UInt32,
+}
+
+/// One setup write.
+func setup_write(proc: &Process, rows: &var Rows, s: &Setup) -> Result<Void, SosStatus> {
+    let k = rows.window(s.row)
+    let part = try rows.windows[k]!.carve(offset: s.offset, len: s.len)
+    let mapping = try proc.map(iomemory: &part)
+    let base = try mapping.base()
+    write_register(base + s.at, s.op, s.value)
+    try mapping.unmap()
+    return
+}
+
+/// Write the register at `address` as `op` says.
+func write_register(address: UInt, op: SetupOp, value: UInt32) unsafe {
+    let register = UnsafeMemory<Word, Device>(address)
+    var old: UInt32 = 0
+    if reads_first(op) {
+        old = register.v.read()
+    }
+    register.v.write(setup_word(op, old, value))
+}
+
+/// `sos`'s name for a plan's quota kind.
+func quota_kind(name: QuotaName) -> QuotaKind {
+    match name {
+        case Thread -> QuotaKind.Thread,
+        case Event -> QuotaKind.Event,
+        case Waiter -> QuotaKind.Waiter,
+        case Timer -> QuotaKind.Timer,
+        case Memory -> QuotaKind.Memory,
+        case IoMemory -> QuotaKind.IoMemory,
+        case Mapping -> QuotaKind.Mapping,
+        case Handle -> QuotaKind.Handle,
+        case Pipe -> QuotaKind.Pipe
+    }
+}
+
+/// A child's declared quota rows.
+func set_quota(child: &Process, c: &Child) -> Result<Void, SosStatus> {
+    var q = 0
+    while q < c.quota.len() {
+        let row = c.quota.get(q)!
+        try child.quota_set(quota_kind(row.kind), row.limit)
+        q = q + 1
+    }
+    return
+}
+
+/// A connection's two ends, while root holds them: made at the first record
+/// that needs one, the server end given to the server, and an inlet minted
+/// from root's for each client.
+struct Ends {
+    inlet: PipeInlet?
+    outlet: PipeOutlet?
+}
+
+extension Ends: NoCopy {}
+
+/// Connection `index`'s ends, made if they are not yet.
+func connection(proc: &Process, ends: &var Vector<Ends>, index: Int) -> Result<Void, SosStatus> {
+    borrow var e = ends[index] {
+        if e.inlet.is_none() && e.outlet.is_none() {
+            let (inlet, outlet) = try proc.pipe_create()
+            e.inlet = move inlet
+            e.outlet = move outlet
+        }
+    }
+    return
+}
+
+/// One record, made as its source says and given under its tag.
+func give(system: &System, proc: &Process, child: &Process, rows: &var Rows,
+          ends: &var Vector<Ends>, r: &Record) -> Result<Void, SosStatus> {
+    match r.source {
+        case System -> {
+            let sibling = try system.mint(rights: CHILD_SYSTEM)
+            try child.give(system: move sibling, tag: r.tag) catch { return error.0 }
+        },
+        case Row -> {
+            let k = rows.find(r.from)
+            if k >= 0 {
+                rows.held(k, r.from)
+                let w = rows.windows[k].take()!
+                try child.give(iomemory: move w, tag: r.tag) catch { return error.0 }
+            } else {
+                var record = rows.take(r.from)
+                try give_row(&child, &var record, r.tag)
+            }
+        },
+        case Sibling -> {
+            let k = rows.window(r.from)
+            let sibling = try rows.windows[k]!.mint()
+            try child.give(iomemory: move sibling, tag: r.tag) catch { return error.0 }
+        },
+        case Carve -> {
+            let k = rows.window(r.from)
+            let part = try rows.windows[k]!.carve(offset: r.offset, len: r.len)
+            try child.give(iomemory: move part, tag: r.tag) catch { return error.0 }
+        },
+        case Line -> {
+            let line = try system.interrupt_bind(line: r.from)
+            try child.give(interrupt: move line, tag: r.tag) catch { return error.0 }
+        },
+        case Outlet -> {
+            let index = r.from as Int
+            try connection(&proc, &var ends, index)
+            borrow var e = ends[index] {
+                guard let outlet = e.outlet.take() else {
+                    panic("root: the plan gives connection {}'s server end twice", index)
+                }
+                try child.give(outlet: move outlet, tag: r.tag) catch { return error.0 }
+            }
+        },
+        case Inlet -> {
+            let index = r.from as Int
+            try connection(&proc, &var ends, index)
+            borrow let e = ends[index] {
+                let minted = try e.inlet!.mint(rights: CLIENT_INLET)
+                try child.give(inlet: move minted, tag: r.tag) catch { return error.0 }
+            }
+        }
+    }
+    return
+}
+
+/// A whole row given as it is: a device's window, a pool or an allocation.
+func give_row(child: &Process, record: &var BootHandle, tag: UInt) -> Result<Void, SosStatus> {
+    match record.kind {
+        case IoMemory -> {
+            try child.give(iomemory: record.take_iomemory()!, tag: tag) catch { return error.0 }
+        },
+        case Pool -> {
+            try child.give(pool: record.take_pool()!, tag: tag) catch { return error.0 }
+        },
+        case Memory -> {
+            try child.give(memory: record.take_memory()!, tag: tag) catch { return error.0 }
+        },
+        case _ -> panic("root: the plan gives row {}, which is not a row's kind", record.tag)
+    }
+    return
+}
+
+/// Wait for the children's ends, reporting each; answers the machine's
+/// status.
+func supervise(proc: &Process, plan: &Plan, children: &Vector<Process>, rows: Rows,
+             ends: Vector<Ends>) -> Result<UInt, SosStatus> {
+    let waiter = try proc.waiter_create()
+    var i = 0
+    while i < children.len() {
+        borrow let child = children[i] {
+            try waiter.add(process: &child, key: i as UInt)
+        }
+        i = i + 1
+    }
+    // What root still holds of the rows and the connections is no child's:
+    // releasing it leaves each connection to the ends its children hold. A
+    // child that ended before it was attached is still reported: attaching
+    // a dead Process answers its death at the first wait.
+    let _ = move rows
+    let _ = move ends
+    var ended = 0
+    while ended < children.len() {
+        let record = try waiter.wait()
+        let index = record.key as Int
+        let word = status_of(&record)
+        let _ = move record
+        try waiter.remove(index as UInt)
+        borrow let c = plan.children[index] {
+            print("root: {} ended status={}", c.name, word)
+            if c.shutdown {
+                if (word >> REASON_SHIFT) == REASON_EXITED {
+                    return word & CODE_MASK
+                }
+                return EXIT_STOPPED
+            }
+        }
+        ended = ended + 1
+    }
+    return EXIT_OK
+}
+
+/// The §8 status word out of a wait record: root attaches only Processes.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("root attached only Processes"),
+    }
 }

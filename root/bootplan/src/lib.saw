@@ -1,0 +1,147 @@
+//! `bootplan`: what the stock root does with an image, as data.
+//!
+//! The image builder writes a module `imageplan` for each image whose root is
+//! the stock root, with one function, `plan() -> Plan`, built from these
+//! types; the stock root (`root/`) reads it and does what it says. A row is
+//! named by its tag in root's boot set (its ordinal in the region table), a
+//! record by the tag the child drains it under, and a quota kind by its name.
+//! The numbers a plan does carry are the board's and the image's: a line's
+//! number, a carve's offset and length, a register's offset in its carve and
+//! the word written to it, and a quota row's limit. No op number, right or
+//! kind's encoding is among them: which rights a record keeps is the launch
+//! convention's, decided in root by the record's source, so the plan carries
+//! no rights word.
+//!
+//! The plan's order is the launch order (spec §12): every child is created,
+//! the setup writes are made, each child's quota rows are set and its records
+//! given in its declared order, and then every child is started.
+
+/// What a `[[setup]]` write does to its register.
+public enum SetupOp {
+    /// OR the value's bits into the register.
+    case Set,
+    /// Clear the value's bits from the register.
+    case Clear,
+    /// Store the value.
+    case Write
+}
+
+@synthesize
+extension SetupOp: Equatable {}
+
+/// The word a setup write stores, given the register's word `old` before it.
+///
+/// `Set` and `Clear` change only the value's bits and keep every other bit of
+/// `old`: a register that gates several peripherals' clocks, for one, holds
+/// the flash's and the console's bits beside the one a setup write names, and
+/// a plain store of the value would turn those off. `Write` stores the value,
+/// for a register whose bits act when written (a write-one-to-set register).
+public func setup_word(op: SetupOp, old: UInt32, value: UInt32) -> UInt32 {
+    match op {
+        case Set -> old | value,
+        case Clear -> old & ~value,
+        case Write -> value
+    }
+}
+
+/// Whether a setup write reads its register before it writes it.
+public func reads_first(op: SetupOp) -> Bool {
+    op != SetupOp.Write
+}
+
+/// One `[[setup]]` write, made by root before any child starts.
+///
+/// Root carves `len` bytes at `offset` from the device row `row`, a window of
+/// the board's protection grain that holds the register, maps it, writes the
+/// register `at` bytes into it, unmaps it and releases both.
+public struct Setup {
+    /// The register, as the image names it, for root's messages.
+    register: String
+    row: UInt
+    offset: UInt
+    len: UInt
+    at: UInt
+    op: SetupOp
+    value: UInt32
+}
+
+/// What a record a child is given is made from.
+public enum Source {
+    /// A sibling of root's System handle; the record whose tag the child is
+    /// started with.
+    case System,
+    /// The row `from` itself: its last taker gets it.
+    case Row,
+    /// A sibling of the row `from`, for a taker a later one follows.
+    case Sibling,
+    /// A carve of the row `from`: `len` bytes at `offset`.
+    case Carve,
+    /// The interrupt line `from`, which root binds.
+    case Line,
+    /// The server end of connection `from`.
+    case Outlet,
+    /// An inlet of connection `from`, minted from root's.
+    case Inlet
+}
+
+@synthesize
+extension Source: Equatable {}
+
+/// One record a child is given, under `tag`.
+public struct Record {
+    tag: UInt
+    source: Source
+    /// A row's tag, a line, or a connection's index, by `source`.
+    from: UInt
+    /// A carve's offset into its row, and its length; zero for the others.
+    offset: UInt
+    len: UInt
+}
+
+/// A quota kind, by the name `sos.QuotaKind` gives it.
+public enum QuotaName {
+    case Thread,
+    case Event,
+    case Waiter,
+    case Timer,
+    case Memory,
+    case IoMemory,
+    case Mapping,
+    case Handle,
+    case Pipe
+}
+
+/// One quota row root sets on a child before it gives it anything.
+public struct Quota {
+    kind: QuotaName
+    limit: UInt16
+}
+
+/// One process root launches.
+public struct Child {
+    name: String
+    /// The tags of its image blob's row and its destination's row.
+    image: UInt
+    destination: UInt
+    quota: Vector<Quota>
+    /// In the order the child's declaration lists them.
+    records: Vector<Record>
+    /// The tag of its System record, which it is started with.
+    start: UInt
+    /// Whether its end stops the machine (`on-exit = "shutdown"`); otherwise
+    /// root reports it.
+    shutdown: Bool
+}
+
+extension Child: NoCopy {}
+
+/// An image's plan.
+public struct Plan {
+    children: Vector<Child>
+    setup: Vector<Setup>
+    /// How many connections root makes: one per serve record some image
+    /// process declares.
+    connections: Int
+}
+
+extension Plan: NoCopy {}

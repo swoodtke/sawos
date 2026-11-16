@@ -76,7 +76,9 @@ hal/riscv32-esp32c3/ the ESP32-C3 board (smoke target, not part of sos-test)
 hal/xtensa-esp32s3/  the Xtensa architecture and the ESP32-S3 board, on the
                      flat tier (smoke target, not part of sos-test)
 rt/         the runtime the kernel and every process share
-root/       the root server, a normal package emitting a boot image
+root/       the stock root server, which launches an image's processes as
+            the image builder's plan for it says (bootplan/: the plan's
+            types)
 tests/      kernel test entries and hand-assembled payloads
 tools/      the QEMU harness and the toolchain resolver
 ```

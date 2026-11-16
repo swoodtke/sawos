@@ -179,9 +179,25 @@ EXIT_KILLED_ROOT = 8
 # enum.
 EXIT_ARENA_EXHAUSTED = 65
 
+# `AbortCode.Panic` in rt/common/src/lib.saw: what the runtime stops the
+# machine with when a process panics. Kept in step with that enum.
+EXIT_PANIC = 64
+
+# What the stock root (`root/`) stops the machine with when a step of its
+# launch fails. Kept in step with its `EXIT_STOPPED`.
+EXIT_ROOT_STOPPED = 1
+
 # Root-server packages: real Blade packages built through the same pipeline any
 # SOS process uses. (Blade and its packages come through `tc()` above.)
-ROOT_PKG = os.path.join(REPO_ROOT, "root")
+# `ROOT_PKG` prints a banner and stops the machine.
+ROOT_PKG = os.path.join(TESTS_DIR, "hello-root")
+# The stock root (`root/`), which builds only with an image's plan: the image
+# builder's, for an image built from its description, or a case's own
+# (`root_plan`), unchecked, which the builder writes as its `imageplan`.
+STOCK_ROOT_PKG = os.path.join(REPO_ROOT, "root")
+# A stock root's child that carves its window until the kernel refuses
+# (`tests/stockkit`).
+STOCK_CARVER_PKG = os.path.join(TESTS_DIR, "stock-carver")
 FAULT_ROOT_PKG = os.path.join(TESTS_DIR, "faulting-root")
 # Thread and Process objects. Test processes reach the kernel through the `sos`
 # module and never through an op number.
@@ -1212,7 +1228,8 @@ STACK_LEN = 0x4000
 
 
 def _process_placement(arch, role):
-    """Where a test image's process is linked: `role` is `root` or `child<i>`.
+    """Where a test image's process is linked: `role` is `root` (or
+    `root-<case>`, a stock root built with that case's plan) or `child<i>`.
 
     Root's region is the HAL's; child i's is the i-th region from
     `child_region_base`, which the case's region table publishes as its
@@ -1220,7 +1237,7 @@ def _process_placement(arch, role):
     image is in root's slot and child i's in slot i. The builder writes the
     process's script from these numbers (`sosimage package`).
     """
-    if role == "root":
+    if role == "root" or role.startswith("root-"):
         base, length = arch["root_region"]
         index = None
     else:
@@ -1241,19 +1258,23 @@ def _process_placement(arch, role):
 
 def _case_processes(case):
     """A case's processes as (package, role), root first: `root`, unless the
-    case links root's package for another role (`root_link`), then
+    case links root's package for another role (`root_link`) or hands the
+    stock root a plan of its own (`root_plan`, as `root-<case>`), then
     `child<i>` for each of its children."""
     out = []
-    if case.get("root_pkg"):
+    if case.get("root_plan") is not None:
+        out.append((case["root_pkg"], f"root-{case['name']}"))
+    elif case.get("root_pkg"):
         out.append((case["root_pkg"], case.get("root_link", "root")))
     for i, pkg in enumerate(case.get("children", ())):
         out.append((pkg, f"child{i}"))
     return out
 
 
-def _build_process(packager, profile, arch, pkg, role, env):
+def _build_process(packager, profile, arch, pkg, role, env, plan=None):
     """Have the builder build the package `pkg` as the process `role` of a
-    test image (`sosimage package`); return its image's path.
+    test image (`sosimage package`); return its image's path. `plan` is a
+    stock root's plan, which the builder writes as its `imageplan`.
 
     Its outputs land under the package's `.build/<triple>/`: the process
     description `<role>.process.json`, the script `<role>.ld`, Blade's own
@@ -1263,6 +1284,8 @@ def _build_process(packager, profile, arch, pkg, role, env):
     description = dict(version=SOSIMAGE_SCHEMA_VERSION, name=role,
                        package=pkg, out=out,
                        **_process_placement(arch, role))
+    if plan is not None:
+        description["plan"] = plan
     path = os.path.join(out, f"{role}.process.json")
     _write_json(path, description)
     _run_sosimage(packager, ["package", profile, path], env=env)
@@ -1607,6 +1630,53 @@ def _slab_stop(name, spec, reason, arches=None):
     if arches is not None:
         case["arches"] = arches
     return case
+
+
+def _stock_stop(name, plan, says, status=EXIT_ROOT_STOPPED, **keys):
+    """A case that hands the stock root `plan`, a plan of the case's own
+    (`root_plan`), unchecked, so it may be one the image builder would
+    refuse, and whose console says `says`: the line root prints at a stop,
+    or a panic's message (`status` then `EXIT_PANIC`), or what a child
+    prints on a machine that ends clean (`status` 0). Its rows are the test
+    image's (`_region_row_specs`), so `keys` say what they are. The root is
+    arch-free, so one profile runs it."""
+    case = {"name": name,
+            "arches": ["riscv32"],
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": STOCK_ROOT_PKG,
+            "root_plan": plan,
+            "expect_out": ["{banner}", says],
+            "expect_clean_exit": status == 0}
+    if status != 0:
+        case["expect_status"] = status
+    case.update(keys)
+    return case
+
+
+def _stock_system(name):
+    """What a child of a stock root prints of the System handle it was
+    started with: every right of `SystemRight`, held by the launch
+    convention's mask or withheld (`tests/stockkit`)."""
+    return (f"SOS {name}: its System: Transfer yes, Mint no, Debug yes, "
+            "Shutdown no, ClockGet yes, ProcessCreate no, ProcessSelf yes, "
+            "SlabDonate no, TierGet no, StatsRegionMap no, InterruptBind no, "
+            "ProcessObserve no")
+
+
+# What a stock root's client prints of the inlet it was given: every right of
+# `PipeInletRight`, held by the launch convention's mask or withheld.
+_STOCK_INLET = "SOS client: its inlet: Transfer yes, Mint no, Post yes, Wait no"
+
+
+# What a stock root's plan gives a child it only starts: its System record.
+_STOCK_START = {"name": "first", "image": 0, "destination": 1, "start": 1,
+                "records": [{"tag": 1, "source": "system"}]}
+
+# Root's table holds `MAX_HANDLES` (32): its System, Process and Thread and a
+# handle per row at entry, and its own Process handle once it derives it. A
+# stop case brings the table to its edge with rows of no bytes
+# (`spare_rows`), which the Memory slab, raised for them, can hold.
+_SPARE_ROW_LIMITS = {"slabs": {"memories": 17}}
 
 
 def _slab_taken(name, spec, areas):
@@ -8051,6 +8121,247 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # The stock root (`root/`) running an image built from its description
+        # (`tests/images/stock_root*.toml`), with the plan the builder wrote for
+        # it. Each child prints its records in the order the drain meets them,
+        # which is the order root gave them: its declaration's (the System
+        # record is the one `start` consumed). The three setup writes leave the
+        # RTC's word at 0xF0F0, less 0xF0, with 0xA set: 61450, which only a
+        # `clear` and a `set` that read the word first can make. Each child
+        # prints every right its System handle has, and the client every right
+        # its inlet has, which holds the launch convention's two masks whole.
+        # The server's declared `Waiter` row is 1, and its second Waiter is
+        # refused; it allocates from the pool the image binds to it, and answers
+        # the client's 41 with 42 over the connection root made. On riscv32 and
+        # flat the RTC is given whole to `probe`, with its line, as a sibling of
+        # the row, since `alarm` takes a carve of the same row after it (one
+        # register, the alarm word again), and the server's end stops the
+        # machine; on arm64 the RTC row itself goes to `probe`, its last taker,
+        # and the machine stops when every child has ended. The server serves
+        # until its last client's end is gone, which it is only once root has
+        # let go of its own inlet. With no tick, a process runs until it blocks,
+        # so the interleaving is the scheduler's order and nothing else.
+        "name": "stock_root",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_root.toml",
+                       "riscv32-flat": "stock_root_flat.toml",
+                       "arm64": "stock_root_arm64.toml"},
+        "expect_out": ["{banner}",
+                       lambda arch: (
+                           # Eight rows: three image blobs, three
+                           # destinations, the RTC, the pool.
+                           ["SOS: boot regions={eight}"]
+                           if arch["name"] == "arm64" else
+                           # Ten: four of each, the RTC, the pool.
+                           ["SOS: boot regions={ten}"]),
+                       "SOS server: record 2 PipeOutlet",
+                       "SOS server: record 3 Pool",
+                       # The launch convention's masks, whole.
+                       _stock_system("server"),
+                       "SOS server: waiters limit=1",
+                       "SOS server: a second waiter: this process is at its "
+                       "quota",
+                       # More than the default arena: its declared one.
+                       "SOS server: its arena gave 69632 bytes",
+                       "SOS server: the pool gave 4096 bytes",
+                       "SOS client: record 2 PipeInlet",
+                       _stock_system("client"),
+                       _STOCK_INLET,
+                       "SOS probe: record 2 IoMemory",
+                       "SOS probe: record 3 Interrupt",
+                       _stock_system("probe"),
+                       lambda arch: (
+                           ["SOS probe: record 2 word 4 = 61450"]
+                           if arch["name"] == "arm64" else
+                           ["SOS probe: record 2 word 12 = 61450",
+                            "SOS alarm: record 2 IoMemory",
+                            "SOS alarm: record 2 word 0 = 61450"]),
+                       "SOS server: asked 41",
+                       "root: probe ended status=65536",
+                       lambda arch: ([] if arch["name"] == "arm64" else
+                                     ["root: alarm ended status=65536"]),
+                       "SOS client: sent 41, answered 42",
+                       "root: client ended status=65536",
+                       # The client's end was its last: root let go of its
+                       # own inlet when it began to wait.
+                       "SOS server: no client is left",
+                       "root: server ended status=65536"],
+        "expect_tail": "root: server ended status=65536",
+        "expect_clean_exit": True,
+    },
+
+    # A stock-root image whose plan the kernel's numbers refuse: the builder
+    # holds each child's quota rows to their bounds before it builds any
+    # package (`sosimage.plan.check_plan`).
+    {
+        "name": "stock_root_refused",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_refused.toml"},
+        "expect_build_error": "the process client's `handles` row is 33, "
+                              "past MAX_HANDLES (32)",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+
+    # Two processes taking the RTC whole (`tests/images/stock_takers.toml`):
+    # the first is given a sibling of the row and the second the row itself,
+    # which a setup write had put in root's hands; both see the word it set.
+    {
+        "name": "stock_takers",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_takers.toml"},
+        "expect_out": ["{banner}",
+                       "SOS probe: record 2 IoMemory",
+                       "SOS probe: record 3 Interrupt",
+                       "SOS probe: record 2 word 12 = 5",
+                       "SOS alarm: record 2 IoMemory",
+                       "SOS alarm: record 2 word 12 = 5",
+                       "root: probe ended status=65536",
+                       "root: alarm ended status=65536"],
+        "expect_clean_exit": True,
+    },
+    # Seven processes given a carve of one RTC word each, in an image whose
+    # IoMemory slab holds eight: the RTC's row and the seven carves. All
+    # seven run.
+    {
+        "name": "stock_carves",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_carves.toml"},
+        "expect_out": ["{banner}",
+                       *["SOS alarm: record 2 word 0 = 0"] * 7,
+                       *[f"root: a{i} ended status=65536" for i in (0, 6, 5, 4, 3, 2, 1)]],
+        "expect_clean_exit": True,
+    },
+    # An eighth: nine IoMemory objects in a slab of eight, which the builder
+    # refuses at the give that would make the ninth.
+    {
+        "name": "stock_carves_over",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_carves_over.toml"},
+        "expect_build_error": "the stock root would make the IoMemory objects 9 at "
+                              "`give a7 record 2`, past the image's 8",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+    # Root lets go of the rows it still holds before it waits: the console's
+    # row, which only a carve of it was given from, is the IoMemory object
+    # the carver's last carve takes. Its plan raises its IoMemory row past
+    # the slab, so the slab is what refuses it.
+    _stock_stop("stock_release_rows",
+                {"children": [dict(_STOCK_START, name="carver",
+                                   quota={"iomemories": 100},
+                                   records=[{"tag": 1, "source": "system"},
+                                            {"tag": 2, "source": "carve",
+                                             "from": 2, "offset": 0,
+                                             "len": 4}])]},
+                # The slab's floor of 8, less the carver's carve.
+                "SOS carver: carved 7, then: no room for what was asked", 0,
+                children=[STOCK_CARVER_PKG], device=True),
+
+    # Each step of the stock root's launch failing, and the machine stopping
+    # with its message: `root: STEP WHO: STATUS`. A plan of the case's own
+    # reaches what the builder's plan never would.
+    #
+    # Its table full at entry (three handles and 29 rows), root cannot derive
+    # its Process handle.
+    _stock_stop("stock_stop_derive", {"children": []},
+                "root: derive root: no room for what was asked",
+                spare_rows=29, limits=_SPARE_ROW_LIMITS),
+    # The image row is the other child's destination, which holds no image.
+    _stock_stop("stock_stop_create",
+                {"children": [dict(_STOCK_START, image=3, destination=2)]},
+                "root: create first: not a loadable process image",
+                children=[CHILD_BYE_PKG, CHILD_BYE_PKG]),
+    # A `Mapping` row past the grant rows the child's image leaves.
+    _stock_stop("stock_stop_quota",
+                {"children": [dict(_STOCK_START, quota={"mappings": 200})]},
+                "root: quota first: no room for what was asked",
+                children=[CHILD_BYE_PKG]),
+    # The console's row and 27 of no bytes: root's table is full once it has
+    # derived its Process handle, and the write's carve finds no room.
+    _stock_stop("stock_stop_setup",
+                {"setup": [{"register": "UART0.SCRATCH", "row": 0,
+                            "offset": 4, "len": 4, "at": 0, "op": "set",
+                            "value": 0}]},
+                "root: setup UART0.SCRATCH: no room for what was asked",
+                device=True, spare_rows=27, limits=_SPARE_ROW_LIMITS),
+    # A `Handle` row of one, and two records to give.
+    _stock_stop("stock_stop_give",
+                {"children": [dict(_STOCK_START, quota={"handles": 1},
+                                   records=[{"tag": 1, "source": "system"},
+                                            {"tag": 5, "source": "system"}])]},
+                "root: give first record 5: this process is at its quota",
+                children=[CHILD_BYE_PKG]),
+    # A `Thread` row of none: the child's first thread is charged to it.
+    _stock_stop("stock_stop_start",
+                {"children": [dict(_STOCK_START, quota={"threads": 0})]},
+                "root: start first: this process is at its quota",
+                children=[CHILD_BYE_PKG]),
+    # 28 rows of no bytes, which root still holds when it makes its Waiter:
+    # its table is full.
+    _stock_stop("stock_stop_supervise", {"children": []},
+                "root: supervise root: no room for what was asked",
+                spare_rows=28, limits=_SPARE_ROW_LIMITS),
+
+    # A child whose end stops the machine: with its exit code when it exits
+    # (`tests/child-bye`, 5), and with 1 when it does not. Started with the
+    # tag of a Memory record (a spare row, given whole), `child-bye` takes it
+    # for a System handle and faults at its first call.
+    _stock_stop("stock_shutdown_exited",
+                {"children": [dict(_STOCK_START, shutdown=True)]},
+                "root: first ended status=65541", 5,
+                children=[CHILD_BYE_PKG]),
+    _stock_stop("stock_shutdown_faulted",
+                {"children": [dict(_STOCK_START, shutdown=True, start=2,
+                                   records=[{"tag": 1, "source": "system"},
+                                            {"tag": 2, "source": "row",
+                                             "from": 2}])]},
+                "root: first ended status=", EXIT_ROOT_STOPPED,
+                children=[CHILD_BYE_PKG], spare_rows=1),
+
+    # A plan that names a row the region table does not hold as it says is a
+    # skew between the two, and root panics naming it.
+    _stock_stop("stock_skew_no_row",
+                {"children": [dict(_STOCK_START, image=9)]},
+                "root: the plan names row 9, which root's boot set does not "
+                "hold",
+                EXIT_PANIC, children=[CHILD_BYE_PKG]),
+    _stock_stop("stock_skew_not_allocation",
+                {"children": [dict(_STOCK_START, image=2)]},
+                "root: the plan names row 2 as an allocation, and it is not "
+                "one",
+                EXIT_PANIC, children=[CHILD_BYE_PKG], device=True),
+    _stock_stop("stock_skew_not_device",
+                {"setup": [{"register": "R.W", "row": 0, "offset": 0,
+                            "len": 4, "at": 0, "op": "set", "value": 0}]},
+                "root: the plan names row 0 as a device's, and it is not one",
+                EXIT_PANIC, spare_rows=1),
+    _stock_stop("stock_skew_outlet_twice",
+                {"connections": 1,
+                 "children": [dict(_STOCK_START,
+                                   records=[{"tag": 1, "source": "system"},
+                                            {"tag": 2, "source": "outlet",
+                                             "from": 0},
+                                            {"tag": 3, "source": "outlet",
+                                             "from": 0}])]},
+                "root: the plan gives connection 0's server end twice",
+                EXIT_PANIC, children=[CHILD_BYE_PKG]),
+    _stock_stop("stock_skew_used_after_given",
+                {"children": [dict(_STOCK_START,
+                                   records=[{"tag": 1, "source": "system"},
+                                            {"tag": 2, "source": "sibling",
+                                             "from": 2},
+                                            {"tag": 3, "source": "row",
+                                             "from": 2},
+                                            {"tag": 4, "source": "sibling",
+                                             "from": 2}])]},
+                "root: the plan uses row 2 after giving it whole",
+                EXIT_PANIC, children=[CHILD_BYE_PKG], device=True),
+    {
         # The money shot on riscv32. Read the transcript as an order:
         #
         #   read posted      root's `Read` is staged before the client process
@@ -11224,6 +11535,12 @@ def _region_row_specs(case, arch):
                              "page",
                      "kind": "device", "base": arch["device_base"],
                      "len": arch["device_len"]})
+    # `spare_rows`: that many rows of no bytes after the others, each a
+    # handle in root's table, so a case can bring root's table to its edge
+    # at a step of its choosing.
+    for i in range(case.get("spare_rows", 0)):
+        rows.append({"what": f"spare row {i}", "kind": "ram", "base": 0,
+                     "len": 0})
     return rows
 
 
@@ -12329,6 +12646,9 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
             if pkg not in packages:
                 packages.append(pkg)
         env = _blade_env(clang)
+        # A stock root's plan, by the role it is built as.
+        plans = {f"root-{case['name']}": case["root_plan"] for case in cases
+                 if case.get("root_plan") is not None}
 
         def build_pkg(pkg):
             built = []
@@ -12337,7 +12657,7 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
                     continue
                 try:
                     image = _build_process(packager, profile, arch, pkg, role,
-                                           env)
+                                           env, plans.get(role))
                 except ToolError as e:
                     return built, e
                 built.append((os.path.relpath(image, REPO_ROOT),
@@ -13781,6 +14101,42 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "SOS launch: child 2 ended status=65543",
                            "SOS launch: the pool gave 4096 bytes",
                            "SOS launch: done"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The gate's `stock_root` on this board
+            # (`tests/images/stock_root_s3.toml`): the stock root, three
+            # children in flash slots, three setup writes to timer group 1's
+            # alarm word (61450, as on the gate's boards), a connection, a
+            # pool, a declared `Waiter` row, and the timer group given whole
+            # to its one taker. The machine stops when every child has ended.
+            "name": "stock_root",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "stock_root_s3.toml"},
+            "expect_out": ["{banner}",
+                           # Eight rows: three image blobs, three
+                           # destinations, the timer group, the pool.
+                           "SOS: boot regions={eight}",
+                           "SOS server: record 2 PipeOutlet",
+                           "SOS server: record 3 Pool",
+                           _stock_system("server"),
+                           "SOS server: waiters limit=1",
+                           "SOS server: a second waiter: this process is at "
+                           "its quota",
+                           "SOS server: its arena gave 69632 bytes",
+                           "SOS server: the pool gave 4096 bytes",
+                           "SOS client: record 2 PipeInlet",
+                           _stock_system("client"),
+                           _STOCK_INLET,
+                           "SOS probe: record 2 IoMemory",
+                           _stock_system("probe"),
+                           "SOS probe: record 2 word 16 = 61450",
+                           "SOS server: asked 41",
+                           "root: probe ended status=65536",
+                           "SOS client: sent 41, answered 42",
+                           "root: client ended status=65536",
+                           "SOS server: no client is left",
+                           "root: server ended status=65536"],
             "expect_clean_exit": True,
         },
         {

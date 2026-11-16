@@ -5,7 +5,7 @@ import std.directory.{Directory}
 import std.path.{Path}
 import sosimage.failure.{BuildError}
 import sosimage.flash.{check_in_place, elf_symbols, flash_image}
-import sosimage.image.{ImageSpec}
+import sosimage.image.{BLOB_ALIGN, ImageSpec}
 import sosimage.profile.{Profile}
 import sosimage.kernel.{KernelFacts}
 import sosimage.layout.{child_slots, image_slots}
@@ -259,13 +259,14 @@ public func regions_stub(profile: &Profile, spec: &ImageSpec,
                 try! lines.push("    .balign 16")
             }
             let pool = spec.blob_is_pool(i)
-            if pool {
-                try! lines.push("    .balign {POOL_BLOB_ALIGN}")
+            let align = if pool { POOL_BLOB_ALIGN } else { spec.blob_align }
+            if align > BLOB_ALIGN {
+                try! lines.push("    .balign {align}")
             }
             try! lines.push("_sos_child{i}_start:")
             try! lines.push("    .incbin {try incbin_operand(image)}")
-            if pool {
-                try! lines.push("    .balign {POOL_BLOB_ALIGN}")
+            if align > BLOB_ALIGN {
+                try! lines.push("    .balign {align}")
             }
             try! lines.push("_sos_child{i}_end:")
             try! lines.push("    .balign 16")

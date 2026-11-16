@@ -1,0 +1,39 @@
+// A root server (spec.md §12) that launches nothing: the root of the cases
+// about the boot itself.
+//
+// Root is the first process, and the only one the kernel loads on its own.
+// Everything else (the launcher, the name service, every later process) is
+// root's job, not the kernel's; the stock root (`root/`) is the one that does
+// it.
+//
+// This root prints a banner and stops the machine. It holds no memory grant for
+// the UART: a character reaches the console only because root asks the System
+// object to put it there, through a handle carrying `SystemRight.Debug`.
+// Without that handle root is mute.
+//
+// This file has no op numbers, no `ecall`, no syscall stub and no
+// architecture. Those belong to the kernel package and are reached through the
+// `sos` module it exports (spec.md §5.7: numbers are not ABI). It builds for
+// either architecture unchanged.
+
+import sos.{System}
+
+/// Root's exit status when its work is done.
+static EXIT_OK: UInt = 0
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    // Typed altitude: a method on a handle. A failure has nowhere to be
+    // reported, since the console is what would have failed, so it is dropped.
+    let _ = system.debug_print("SOS root: hello from U-mode via a System op\n")
+
+    // Runtime-seam altitude. `print` reaches the console through
+    // `__saw_rt_write`, which `sosrt` implements over the `sos_rt_write` hook,
+    // which the kernel's `sos` module implements over a System op. The format
+    // argument is rendered into stack scratch, so `print` allocates nothing.
+    print("SOS root: boot handle {}", boot_handle)
+
+    let _ = system.shutdown(EXIT_OK)
+}

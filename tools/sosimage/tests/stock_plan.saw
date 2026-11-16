@@ -1,0 +1,741 @@
+// The stock root's plan: what a useless box comes to (rows, records, setup
+// writes, quota rows), each refusal of the plan, its checks against the
+// kernel's numbers at every step root takes, the module the builder writes,
+// a test image's plan, and the rule a setup write follows.
+
+import std.json.{JsonValue}
+import bootplan
+import sosimage.board.{Board}
+import sosimage.declaration.{Declaration}
+import sosimage.fields.{Fields}
+import sosimage.imagefile.{ImageFile, InputSource, SetupOp, bind}
+import sosimage.kernel.{KernelFacts}
+import sosimage.layout.{Placement, process_script}
+import sosimage.board.{Span}
+import std.file.{File}
+import std.path.{Path}
+import sosimage.build.{ensure_directory}
+import sosimage.image.{RowSpec}
+import sosimage.imagefile.{Bindings, Bound, InputValue}
+import sosimage.plan.{ImagePlan, PlanRecord, Source, check_plan, plan_image, plan_module}
+import sosimage.limits.{ImageLimits}
+import sosimage.product.{described_spec, input_path, iomemory_total, process_extras,
+                         quota_defaults, stock_region_rows}
+import sosimage.regions.{RegionKind}
+import sosimage.tool.{write_lines}
+
+func join(lines: &Vector<String>) -> String {
+    "{lines.join("\n")}\n"
+}
+
+func board() -> Board {
+    try! Board.parse(board_text(), "hal/xtensa-esp32s3/board.toml")
+}
+
+func board_text() -> String {
+    let lines: Vector<String> = [
+        "format = 1",
+        "[board]",
+        "name = \"esp32s3\"",
+        "triple = \"xtensa-esp-unknown-elf\"",
+        "tier = \"flat\"",
+        "hal = \"hal/xtensa-esp32s3\"",
+        "placement = \"copied\"",
+        "modules = []",
+        "cflags = []",
+        "[emulator]",
+        "program = \"qemu-system-xtensa\"",
+        "args = []",
+        "[ram.kernel]",
+        "use = \"kernel\"",
+        "speed = \"fast\"",
+        "base = 0x3FC8_C000",
+        "len = 0x2_4000",
+        "[ram.sram]",
+        "use = \"process\"",
+        "speed = \"fast\"",
+        "base = 0x3FCB_0000",
+        "len = 0x4_0000",
+        "[ram.default]",
+        "process = \"sram\"",
+        "pool = \"sram\"",
+        "[devices.UART0]",
+        "type = \"esp32s3-uart\"",
+        "base = 0x6000_0000",
+        "len = 0x1000",
+        "line = 27",
+        "kernel = true",
+        "[devices.GPIO]",
+        "type = \"esp32s3-gpio\"",
+        "base = 0x6000_4000",
+        "len = 0x1000",
+        "line = 16",
+        "registers.OUT1_W1TC = \{ offset = 0x018 \}",
+        "registers.ENABLE1_W1TS = \{ offset = 0x030 \}",
+        "arrays.out_sel = \{ offset = 0x554, stride = 4, count = 54 \}",
+        "[devices.IO_MUX]",
+        "type = \"esp32s3-io-mux\"",
+        "base = 0x6000_9000",
+        "len = 0x1000",
+        "arrays.pad = \{ offset = 0x004, stride = 4, count = 49 \}",
+        "[devices.LEDC]",
+        "type = \"esp32s3-ledc\"",
+        "base = 0x6001_9000",
+        "len = 0x1000",
+        "line = 35",
+        "[devices.SYSTEM]",
+        "type = \"esp32s3-system\"",
+        "base = 0x600C_0000",
+        "len = 0x1000",
+        "registers.PERIP_CLK_EN0 = \{ offset = 0x018 \}",
+        "registers.PERIP_RST_EN0 = \{ offset = 0x020 \}"]
+    join(&lines)
+}
+
+func decl(lines: Vector<String>, file: String) -> Declaration {
+    try! Declaration.parse(join(&lines), file)
+}
+
+func gpio_lines() -> Vector<String> {
+    ["format = 1", "arena = 0x1000", "ram = \"fast\"",
+     "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+     "[[boot]]", "name = \"gpio\"", "kind = \"window\"", "type = \"esp32s3-gpio\"", "tag = 2",
+     "[[boot]]", "name = \"iomux\"", "kind = \"window\"", "type = \"esp32s3-io-mux\"", "tag = 3",
+     "[[boot]]", "name = \"gpio\"", "kind = \"line\"", "type = \"esp32s3-gpio\"", "tag = 4",
+     "[[boot]]", "name = \"gpio\"", "kind = \"serve\"", "protocol = \"gpioproto\"", "tag = 5",
+     "[quota]", "mappings = 2", "handles = 11", "waiters = 1",
+     "[build]", "inputs = [\"gpioconfig\"]"]
+}
+
+func pwm_lines() -> Vector<String> {
+    ["format = 1", "arena = 0x1000",
+     "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+     "[[boot]]", "name = \"ledc\"", "kind = \"window\"", "type = \"esp32s3-ledc\"", "tag = 2",
+     "[[boot]]", "name = \"outsel\"", "kind = \"window\"", "type = \"esp32s3-gpio\"", "part = true", "tag = 3",
+     "[[boot]]", "name = \"pads\"", "kind = \"window\"", "type = \"esp32s3-io-mux\"", "part = true", "tag = 4",
+     "[[boot]]", "name = \"pwm\"", "kind = \"serve\"", "protocol = \"pwmproto\"", "tag = 5",
+     "[quota]", "mappings = 3", "handles = 10", "waiters = 1",
+     "[build]", "inputs = [\"pwmconfig\"]"]
+}
+
+func controller_lines() -> Vector<String> {
+    ["format = 1", "arena = 0x1000",
+     "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+     "[[boot]]", "name = \"switch\"", "kind = \"client\"", "protocol = \"gpioproto\"", "tag = 2",
+     "[[boot]]", "name = \"servos\"", "kind = \"client\"", "protocol = \"pwmproto\"", "tag = 3",
+     "[[boot]]", "name = \"log\"", "kind = \"memory\"", "tag = 4"]
+}
+
+func heartbeat_lines() -> Vector<String> {
+    ["format = 1", "arena = 0x1000",
+     "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1"]
+}
+
+// The useless box, with its four setup writes (the pads' outputs driven low
+// before they are enabled) and a pool for the controller.
+func box_lines() -> Vector<String> {
+    ["format = 1",
+     "[image]", "name = \"useless-box\"", "board = \"esp32s3\"", "tick = true",
+     "[root]", "package = \"stock\"",
+     "[[setup]]", "register = \"SYSTEM.PERIP_CLK_EN0\"", "set = 0x800",
+     "[[setup]]", "register = \"SYSTEM.PERIP_RST_EN0\"", "clear = 0x800",
+     "[[setup]]", "register = \"GPIO.OUT1_W1TC\"", "write = 0x600",
+     "[[setup]]", "register = \"GPIO.ENABLE1_W1TS\"", "write = 0x600",
+     "[[process]]", "name = \"gpio\"", "package = \"sawos:drivers/svc-gpio-esp32s3\"",
+     "inputs = \{ gpioconfig = \"config/gpio.saw\" \}",
+     "[[process]]", "name = \"pwm\"", "package = \"sawos:drivers/svc-pwm-esp32s3\"",
+     "device = \{ outsel = \"GPIO.out_sel[41..=42]\", pads = \"IO_MUX.pad[41..=42]\" \}",
+     "inputs = \{ pwmconfig = \"config/pwm.saw\" \}",
+     "[[process]]", "name = \"controller\"", "package = \"controller\"",
+     "clients = \{ switch = \"gpio.gpio\", servos = \"pwm.pwm\" \}",
+     "pools = \{ log = \"journal\" \}",
+     "on-exit = \"shutdown\"",
+     "[[process]]", "name = \"heartbeat\"", "package = \"heartbeat\"",
+     "[[pool]]", "name = \"journal\"", "len = 0x1000"]
+}
+
+func box_decls() -> Vector<Declaration> {
+    var out = Vector<Declaration>()
+    try! out.push(decl(gpio_lines(), "gpio/process.toml"))
+    try! out.push(decl(pwm_lines(), "pwm/process.toml"))
+    try! out.push(decl(controller_lines(), "controller/process.toml"))
+    try! out.push(decl(heartbeat_lines(), "heartbeat/process.toml"))
+    move out
+}
+
+// The plan of an image's text with these declarations, at `grain`.
+func planned(text: String, decls: &Vector<Declaration>, grain: UInt64) -> Result<ImagePlan, String> {
+    let b = board()
+    let image = try! ImageFile.parse(text, "box.toml", &b, grain)
+    let bound = try! bind(&image, &b, &decls, grain)
+    match plan_image(&image, &b, &decls, &bound, grain) {
+        case Ok(plan) -> Result<ImagePlan, String>.Ok(value: move plan),
+        case Err(e) -> Result<ImagePlan, String>.Err(error: e.message)
+    }
+}
+
+func plan_refusal(text: String, decls: &Vector<Declaration>, message: String) {
+    let got = match planned(text, &decls, 4) {
+        case Ok(_) -> "",
+        case Err(m) -> m
+    }
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the plan's refusal")
+}
+
+func record_is(plan: &ImagePlan, child: Int, index: Int, tag: Int, source: Source, from: UInt64,
+               offset: UInt64, len: UInt64) {
+    borrow let c = plan.children[child] {
+        let r = c.records.get(index)!
+        let ok = r.tag == tag && r.source == source && r.from == from && r.offset == offset &&
+                 r.len == len
+        if not ok {
+            print("child {child} record {index}: tag {r.tag} from {r.from} offset {r.offset} len {r.len}")
+        }
+        assert(ok, "a record")
+    }
+}
+
+// A kernel whose root table holds `table` handles, whose budget leaves 12
+// grant rows, and whose children start with 16 handles.
+func facts(table: Int) -> KernelFacts {
+    var zeros = Vector<Int>()
+    var k = 0
+    while k < 13 {
+        try! zeros.push(0)
+        k = k + 1
+    }
+    var defaults = Vector<Int>()
+    k = 0
+    while k < 9 {
+        try! defaults.push(if k == 7 { 16 } else { 4 })
+        k = k + 1
+    }
+    KernelFacts(word: 4, capacity: 255, extents: 4, records_per_body: 4, handles: table,
+                image_rows: 4, budget: 16, domains: 16, stride: 0, inflight: 2,
+                floors: zeros.copy(), defaults: move defaults, units: zeros.copy(),
+                aligns: move zeros)
+}
+
+// The rows children start with: 4 of each kind, and `handles` handles.
+func defaults(handles: Int) -> Vector<Int> {
+    var out = Vector<Int>()
+    var k = 0
+    while k < 9 {
+        try! out.push(if k == 7 { handles } else { 4 })
+        k = k + 1
+    }
+    move out
+}
+
+// What `check_plan` says of `plan` against a table of `table`, with children
+// starting at `handles` and an IoMemory slab of `iomemories`; "" when it
+// holds.
+func fits_io(plan: &ImagePlan, table: Int, handles: Int, iomemories: Int) -> String {
+    let f = facts(table)
+    let d = defaults(handles)
+    match check_plan(&plan, &f, &d, iomemories, "box.toml") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func fits(plan: &ImagePlan, table: Int, handles: Int) -> String {
+    fits_io(&plan, table, handles, 100)
+}
+
+func read_plan(text: String) -> Result<ImagePlan, String> {
+    let doc = try! JsonValue.parse(text)
+    var fields = try! Fields(move doc, "the plan")
+    match ImagePlan.read(&var fields) {
+        case Ok(plan) -> Result<ImagePlan, String>.Ok(value: move plan),
+        case Err(e) -> Result<ImagePlan, String>.Err(error: e.message)
+    }
+}
+
+// What `check_plan` says of a test plan's JSON against a table of `table`,
+// with children starting at `handles`; "" when it holds.
+func checked(json: String, table: Int, handles: Int) -> String {
+    let plan = match read_plan(json) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the plan did not read: {m}")
+    }
+    let f = facts(table)
+    let d = defaults(handles)
+    match check_plan(&plan, &f, &d, 100, "p.json") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect_checked(json: String, table: Int, message: String) {
+    let got = checked(json, table, 16)
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the check")
+}
+
+// A plan of one child whose records are `records`, over `connections`.
+func one_child(records: String, connections: Int) -> String {
+    "\{\"connections\": {connections}, \"children\": [\{\"name\": \"c\", \"image\": 0, \"destination\": 1, \"start\": 1, \"records\": [{records}]\}]\}"
+}
+
+func main() {
+    // The box: rows, records, connections, setup writes, quota rows.
+    let decls = box_decls()
+    let box = match planned(join(&box_lines()), &decls, 4) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the box did not plan: {m}")
+    }
+    // Four blobs and four destinations, then GPIO, IO_MUX and LEDC in the
+    // order the processes first take them, SYSTEM for the setup writes, and
+    // the pool.
+    assert(box.rows.len() == 5, "five rows after the blobs and destinations")
+    assert((box.rows.get(0)!).what.equals("GPIO"), "GPIO first")
+    assert((box.rows.get(0)!).base == 0x6000_4000, "GPIO's window")
+    assert((box.rows.get(1)!).what.equals("IO_MUX"), "IO_MUX second")
+    assert((box.rows.get(2)!).what.equals("LEDC"), "LEDC third")
+    assert((box.rows.get(3)!).what.equals("SYSTEM"), "SYSTEM, a setup write's")
+    assert((box.rows.get(3)!).kind == RegionKind.Device, "a device row")
+    assert((box.rows.get(4)!).kind == RegionKind.Pool, "the pool's row last")
+    assert((box.rows.get(4)!).pool.equals("journal"), "the journal")
+    assert(box.connections == 2, "a connection per serve")
+
+    // gpio: its GPIO and IO_MUX windows are siblings, since pwm carves both
+    // rows after it; its line is GPIO's; its serve is connection 0.
+    borrow let gpio = box.children[0] {
+        assert(gpio.image == 0 && gpio.destination == 4, "gpio's rows")
+        assert(gpio.start == 1, "its System record's tag")
+        assert(not gpio.shutdown, "reported")
+        assert(gpio.floor == 8, "five records, its Process, two windows")
+        assert(gpio.quota.len() == 3, "three quota rows")
+        assert((gpio.quota.get(0)!).kind == 2 && (gpio.quota.get(0)!).limit == 1, "waiters")
+        assert((gpio.quota.get(1)!).kind == 6 && (gpio.quota.get(1)!).limit == 2, "mappings")
+        assert((gpio.quota.get(2)!).kind == 7 && (gpio.quota.get(2)!).limit == 11, "handles")
+    }
+    record_is(&box, 0, 0, 1, Source.System, 0, 0, 0)
+    record_is(&box, 0, 1, 2, Source.Sibling, 8, 0, 0)
+    record_is(&box, 0, 2, 3, Source.Sibling, 9, 0, 0)
+    record_is(&box, 0, 3, 4, Source.Line, 16, 0, 0)
+    record_is(&box, 0, 4, 5, Source.Outlet, 0, 0, 0)
+    // pwm: LEDC's row itself, its last taker; two carves; connection 1.
+    record_is(&box, 1, 1, 2, Source.Row, 10, 0, 0)
+    record_is(&box, 1, 2, 3, Source.Carve, 8, 0x5F8, 8)
+    record_is(&box, 1, 3, 4, Source.Carve, 9, 0xA8, 8)
+    record_is(&box, 1, 4, 5, Source.Outlet, 1, 0, 0)
+    // controller: an inlet of each connection, and the pool's row.
+    record_is(&box, 2, 1, 2, Source.Inlet, 0, 0, 0)
+    record_is(&box, 2, 2, 3, Source.Inlet, 1, 0, 0)
+    record_is(&box, 2, 3, 4, Source.Row, 12, 0, 0)
+    borrow let controller = box.children[2] {
+        assert(controller.shutdown, "on-exit = \"shutdown\"")
+    }
+    // The setup writes, in file order, each a register's word of its row.
+    assert(box.setup.len() == 4, "four setup writes")
+    let clock = box.setup.get(0)!
+    assert(clock.register.equals("SYSTEM.PERIP_CLK_EN0") && clock.row == 11, "the clock gate")
+    assert(clock.offset == 0x18 && clock.len == 4 && clock.at == 0, "one register")
+    assert(clock.op == SetupOp.Set && clock.value == 0x800, "set")
+    assert((box.setup.get(1)!).op == SetupOp.Clear, "clear")
+    let low = box.setup.get(2)!
+    assert(low.register.equals("GPIO.OUT1_W1TC") && low.row == 8 && low.offset == 0x18, "GPIO's row")
+    assert(low.op == SetupOp.Write && low.value == 0x600, "write")
+
+    // At a page's grain a setup write carves the page that holds its
+    // register, and writes it at its offset into that page.
+    let paged_lines: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"paged\"", "board = \"esp32s3\"", "tick = true",
+        "[root]", "package = \"stock\"",
+        "[[setup]]", "register = \"SYSTEM.PERIP_RST_EN0\"", "set = 1",
+        "[[process]]", "name = \"heartbeat\"", "package = \"heartbeat\""]
+    var heartbeat_only = Vector<Declaration>()
+    try! heartbeat_only.push(decl(heartbeat_lines(), "heartbeat/process.toml"))
+    let paged = match planned(join(&paged_lines), &heartbeat_only, 0x1000) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the paged image did not plan: {m}")
+    }
+    let page = paged.setup.get(0)!
+    assert(page.row == 2 && page.offset == 0 && page.len == 0x1000 && page.at == 0x20, "a page")
+
+    // The last taker of a row takes it whole when nothing carves it after.
+    var gpio_alone = Vector<Declaration>()
+    try! gpio_alone.push(decl(gpio_lines(), "gpio/process.toml"))
+    let alone_lines: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"alone\"", "board = \"esp32s3\"", "tick = true",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"gpio\"", "package = \"gpio\"",
+        "inputs = \{ gpioconfig = \"c.saw\" \}"]
+    let alone = match planned(join(&alone_lines), &gpio_alone, 4) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("one driver did not plan: {m}")
+    }
+    record_is(&alone, 0, 1, 2, Source.Row, 2, 0, 0)
+    record_is(&alone, 0, 2, 3, Source.Row, 3, 0, 0)
+
+    // Refused: two processes needing one line.
+    var two_gpio = Vector<Declaration>()
+    try! two_gpio.push(decl(gpio_lines(), "gpio/process.toml"))
+    try! two_gpio.push(decl(gpio_lines(), "gpio/process.toml"))
+    let twice: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"twice\"", "board = \"esp32s3\"", "tick = true",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"one\"", "package = \"gpio\"",
+        "inputs = \{ gpioconfig = \"c.saw\" \}",
+        "[[process]]", "name = \"two\"", "package = \"gpio\"",
+        "inputs = \{ gpioconfig = \"c.saw\" \}"]
+    plan_refusal(join(&twice), &two_gpio,
+                 "box.toml: line 13, column 1: the processes one and two both need the line 16 of GPIO: the kernel binds a line once, to one holder")
+    // Refused: a line need bound to a device with no line.
+    let iomux_line: Vector<String> = [
+        "format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"mux\"", "kind = \"line\"", "type = \"esp32s3-io-mux\"", "tag = 2"]
+    var lineless = Vector<Declaration>()
+    try! lineless.push(decl(move iomux_line, "mux/process.toml"))
+    let mux_image: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"mux\"", "board = \"esp32s3\"", "tick = true",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"mux\"", "package = \"mux\""]
+    plan_refusal(join(&mux_image), &lineless,
+                 "box.toml: line 9, column 1: the line `mux` of the process mux is bound to IO_MUX, which has no interrupt line")
+    // Refused: an image `quota` below the declaration's; one above replaces
+    // it.
+    var below = box_lines()
+    below[22] = "inputs = \{ gpioconfig = \"config/gpio.saw\" \}\nquota = \{ waiters = 0 \}"
+    plan_refusal(join(&below), &decls,
+                 "box.toml: line 24, column 11: the image gives the process gpio `waiters` = 0, below the 1 its declaration (gpio/process.toml) needs")
+    var above = box_lines()
+    above[22] = "inputs = \{ gpioconfig = \"config/gpio.saw\" \}\nquota = \{ waiters = 3, events = 2 \}"
+    let raised = match planned(join(&above), &decls, 4) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the raised box did not plan: {m}")
+    }
+    borrow let g = raised.children[0] {
+        assert(g.quota.len() == 4, "events added")
+        assert((g.quota.get(0)!).kind == 1 && (g.quota.get(0)!).limit == 2, "events")
+        assert((g.quota.get(1)!).kind == 2 && (g.quota.get(1)!).limit == 3, "waiters raised")
+    }
+
+    // The box against a 32-entry table: root peaks at 18 (13 rows), at its
+    // first create, and a table of 17 refuses it there.
+    assert(fits(&box, 32, 28).is_empty(), "the box fits 32")
+    assert(fits(&box, 18, 28).is_empty(), "the box fits 18")
+    assert(fits(&box, 17, 28).equals("box.toml: the stock root would hold 18 handles at `create gpio`, past MAX_HANDLES (17)"), "18 at the first create")
+    // A child whose `Handle` row is short of what it holds when it starts:
+    // the controller holds 5 (its four records and its Process handle).
+    assert(fits(&box, 32, 4).equals("box.toml: the process controller's `Handle` row is 4, short of the 5 handles it holds when it starts"), "a short row")
+    assert(fits(&box, 32, 5).is_empty(), "a row of exactly the floor")
+
+    // Each quota row's bound.
+    let quota_plan = "\{\"children\": [\{\"name\": \"q\", \"image\": 0, \"destination\": 1, \"start\": 1, \"quota\": QUOTA, \"records\": []\}]\}"
+    expect_checked(quota_plan.replace("QUOTA", "\{\"handles\": 33\}"), 32,
+                   "p.json: the process q's `handles` row is 33, past MAX_HANDLES (32)")
+    expect_checked(quota_plan.replace("QUOTA", "\{\"handles\": 32\}"), 32, "")
+    expect_checked(quota_plan.replace("QUOTA", "\{\"mappings\": 13\}"), 32,
+                   "p.json: the process q's `mappings` row is 13, past the 12 grant rows an image leaves of this board's 16")
+    expect_checked(quota_plan.replace("QUOTA", "\{\"mappings\": 12\}"), 32, "")
+    expect_checked(quota_plan.replace("QUOTA", "\{\"events\": 65535\}"), 32,
+                   "p.json: the process q's `events` row is 65535, which the ledger's row cannot hold below its unlimited mark (65535)")
+    expect_checked(quota_plan.replace("QUOTA", "\{\"events\": 65534\}"), 32, "")
+    // A test image's child is held to no floor.
+    expect_checked(quota_plan.replace("QUOTA", "\{\"handles\": 0\}"), 32, "")
+
+    // Root's table at each step. No children: 4 after derive, 5 with the
+    // Waiter.
+    expect_checked("\{\"children\": []\}", 3,
+                   "p.json: the stock root would hold 4 handles at `derive`, past MAX_HANDLES (3)")
+    expect_checked("\{\"children\": []\}", 4,
+                   "p.json: the stock root would hold 5 handles at `supervise`, past MAX_HANDLES (4)")
+    expect_checked("\{\"children\": []\}", 5, "")
+    // A child: two rows, 6 after derive, 7 as it is created, then 5.
+    expect_checked(one_child("", 0), 6,
+                   "p.json: the stock root would hold 7 handles at `create c`, past MAX_HANDLES (6)")
+    // Two: 8, 9 at the first create, then 7; 8 at the second, then 6.
+    expect_checked("\{\"children\": [\{\"name\": \"a\", \"image\": 0, \"destination\": 2, \"start\": 1\}, \{\"name\": \"b\", \"image\": 1, \"destination\": 3, \"start\": 1\}]\}", 9, "")
+    // A setup write's carve and mapping: 6.
+    expect_checked("\{\"setup\": [\{\"register\": \"R\", \"row\": 0, \"offset\": 0, \"len\": 4, \"at\": 0, \"op\": \"write\", \"value\": 1\}]\}", 5,
+                   "p.json: the stock root would hold 6 handles at `setup R`, past MAX_HANDLES (5)")
+    // A server end made (7) and given (6): with a second (8, then 7) root
+    // fits 8, and the Waiter is its eighth.
+    let outlets = "\{\"tag\": 2, \"source\": \"outlet\", \"from\": 0\}, \{\"tag\": 3, \"source\": \"outlet\", \"from\": 1\}"
+    expect_checked(one_child(outlets, 2), 8, "")
+    // A row given away (4) leaves room for both connections in 7.
+    expect_checked(one_child("\{\"tag\": 4, \"source\": \"row\", \"from\": 0\}, {outlets}", 2), 7, "")
+    // An inlet: the connection made (7) and an inlet minted from it (8).
+    expect_checked(one_child("\{\"tag\": 2, \"source\": \"inlet\", \"from\": 0\}", 1), 7,
+                   "p.json: the stock root would hold 8 handles at `give c record 2`, past MAX_HANDLES (7)")
+    // A connection is made once, whoever takes its ends.
+    expect_checked(one_child("\{\"tag\": 2, \"source\": \"outlet\", \"from\": 0\}, \{\"tag\": 3, \"source\": \"inlet\", \"from\": 0\}, \{\"tag\": 4, \"source\": \"inlet\", \"from\": 0\}", 1), 7, "")
+    // The second connection made: 8.
+    expect_checked(one_child(outlets, 2), 7,
+                   "p.json: the stock root would hold 8 handles at `give c record 3`, past MAX_HANDLES (7)")
+
+    // A test image's plan, read: every key, and each refusal.
+    let full = match read_plan("\{\"connections\": 1, \"children\": [\{\"name\": \"a\", \"image\": 2, \"destination\": 3, \"start\": 5, \"shutdown\": true, \"quota\": \{\"waiters\": 1, \"handles\": 6\}, \"records\": [\{\"tag\": 5, \"source\": \"system\"\}, \{\"tag\": 6, \"source\": \"carve\", \"from\": 4, \"offset\": 12, \"len\": 8\}]\}], \"setup\": [\{\"register\": \"D.R\", \"row\": 4, \"offset\": 16, \"len\": 4, \"at\": 0, \"op\": \"clear\", \"value\": 2\}]\}") {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the plan did not read: {m}")
+    }
+    assert(full.connections == 1, "connections")
+    borrow let a = full.children[0] {
+        assert(a.name.equals("a") && a.image == 2 && a.destination == 3 && a.start == 5, "a child")
+        assert(a.shutdown, "shutdown")
+        assert(a.quota.len() == 2 && (a.quota.get(1)!).kind == 7, "its quota")
+    }
+    record_is(&full, 0, 1, 6, Source.Carve, 4, 12, 8)
+    let w = full.setup.get(0)!
+    assert(w.register.equals("D.R") && w.row == 4 && w.offset == 16 && w.op == SetupOp.Clear, "a write")
+    assert(read_refusal("\{\"setup\": [\{\"register\": \"R\", \"row\": 0, \"offset\": 0, \"len\": 4, \"at\": 0, \"op\": \"or\", \"value\": 1\}]\}").equals("a plan's setup write has the op `or`, not one of `set`, `clear`, `write`"), "an op")
+    assert(read_refusal(one_child("\{\"tag\": 1, \"source\": \"window\"\}", 0)).equals("a plan's record has the source `window`, not one of `system`, `row`, `sibling`, `carve`, `line`, `outlet`, `inlet`"), "a source")
+    assert(read_refusal("\{\"childs\": []\}").contains("childs"), "an unknown key")
+
+    // The module the builder writes.
+    let module = plan_module(&full, "img")
+    let text = module.join("\n")
+    assert(text.contains("import bootplan.\{Plan, Child, Record, Source, Setup, SetupOp, Quota, QuotaName\}"), "its import")
+    assert(text.contains("    try! setup.push(Setup(register: \"D.R\", row: 4, offset: 0x10, len: 0x4, at: 0x0, op: SetupOp.Clear, value: 0x2))"), "a setup write")
+    assert(text.contains("    Plan(children: move children, setup: move setup, connections: 1)"), "the plan")
+    assert(text.contains("    try! quota.push(Quota(kind: QuotaName.Handle, limit: 6))"), "a quota row")
+    assert(text.contains("    try! records.push(Record(tag: 6, source: Source.Carve, from: 0x4, offset: 0xc, len: 0x8))"), "a record")
+    assert(text.contains("    Child(name: \"a\", image: 2, destination: 3,"), "a child")
+    assert(text.contains("          shutdown: true)"), "its exit policy")
+
+    // A setup write's word: `set` and `clear` keep every other bit of the
+    // register. The ESP32-S3's PERIP_CLK_EN0 out of reset, with LEDC's clock
+    // (bit 11) set, keeps the flash's, the console's and SYSTIMER's.
+    assert(bootplan.setup_word(bootplan.SetupOp.Set, 0xf9c1_e06f, 0x800) == 0xf9c1_e86f, "set")
+    assert(bootplan.setup_word(bootplan.SetupOp.Clear, 0xf9c1_e86f, 0x800) == 0xf9c1_e06f, "clear")
+    assert(bootplan.setup_word(bootplan.SetupOp.Write, 0xf9c1_e06f, 0x600) == 0x600, "write")
+    assert(bootplan.reads_first(bootplan.SetupOp.Set), "set reads")
+    assert(bootplan.reads_first(bootplan.SetupOp.Clear), "clear reads")
+    assert(not bootplan.reads_first(bootplan.SetupOp.Write), "write does not")
+
+    // A process's script states its declaration's arena.
+    let p = Placement(region: Span(base: 0x1000, len: 0x8000), stack: 0x4000, slot: None)
+    let script = try! process_script("p", &p, 0x2000, "/u.ld")
+    assert(script.join("\n").contains("ARENA_SIZE = 0x2000;\nINCLUDE \"/u.ld\""), "the arena")
+    let unstated = try! process_script("p", &p, None, "/u.ld")
+    assert(not unstated.join("\n").contains("ARENA_SIZE"), "no arena")
+
+    // The `Handle` row children start with: the image's limits', else the
+    // kernel's.
+    var kernel = facts(32)
+    var stated = ImageLimits.none()
+    let compiled = quota_defaults(&stated, &kernel)
+    assert((compiled.get(7) ?? 0) == 16 && (compiled.get(2) ?? 0) == 4, "the compiled defaults")
+    stated.quota[7] = 28
+    stated.quota[8] = 6
+    let given = quota_defaults(&stated, &kernel)
+    assert((given.get(7) ?? 0) == 28 && (given.get(8) ?? 0) == 6, "the stated ones")
+    assert((given.get(1) ?? 0) == 4, "and the compiled ones beside them")
+    // The IoMemory slab: the kernel's floor, raised by the limits.
+    kernel.floors[6] = 8
+    assert(iomemory_total(&stated, &kernel) == 8, "the floor")
+    stated.raise[6] = 3
+    assert(iomemory_total(&stated, &kernel) == 11, "raised")
+
+    // Where an input's file is, by where its value came from.
+    assert(input_path(InputSource.Image, "c/x.saw", "/pkg", "hal/b", "/sawos", "/product").equals("/product/c/x.saw"), "the image's")
+    assert(input_path(InputSource.Board, "c/x.saw", "/pkg", "hal/b", "/sawos", "/product").equals("/sawos/hal/b/c/x.saw"), "the board's")
+    assert(input_path(InputSource.Driver, "c/x.saw", "/pkg", "hal/b", "/sawos", "/product").equals("/pkg/c/x.saw"), "the driver's")
+
+    more()
+}
+
+// A process that takes GPIO whole and nothing else.
+func watcher() -> Declaration {
+    decl(["format = 1", "arena = 0x1000",
+          "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+          "[[boot]]", "name = \"gpio\"", "kind = \"window\"", "type = \"esp32s3-gpio\"", "tag = 2"],
+         "watcher/process.toml")
+}
+
+func more() {
+    let decls = box_decls()
+
+    // An image's row equal to its declaration's is taken.
+    var equal = box_lines()
+    equal[22] = "inputs = \{ gpioconfig = \"config/gpio.saw\" \}\nquota = \{ waiters = 1 \}"
+    match planned(join(&equal), &decls, 4) {
+        case Ok(_) -> {},
+        case Err(m) -> panic("an equal row: {m}")
+    }
+    // A `threads` row of 0 is refused: the first thread is charged to it.
+    var no_thread = box_lines()
+    no_thread[22] = "inputs = \{ gpioconfig = \"config/gpio.saw\" \}\nquota = \{ threads = 0 \}"
+    plan_refusal(join(&no_thread), &decls,
+                 "box.toml: line 24, column 11: the image gives the process gpio `threads` = 0: a process's first thread is charged to its row, and with none it cannot start")
+
+    // A row only the image gives may not lower the row the children start
+    // with; at it, it is taken.
+    let heartbeat_at = 36
+    var lowered = box_lines()
+    lowered[heartbeat_at] = "package = \"heartbeat\"\nquota = \{ events = 3 \}"
+    let low = match planned(join(&lowered), &decls, 4) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the lowered box did not plan: {m}")
+    }
+    assert(fits(&low, 32, 28).equals("box.toml: the image gives the process heartbeat `events` = 3, below the 4 the image's children start with: an image raises a row and never lowers one"), "lowered")
+    var kept = box_lines()
+    kept[heartbeat_at] = "package = \"heartbeat\"\nquota = \{ events = 4 \}"
+    let at_default = match planned(join(&kept), &decls, 4) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the kept box did not plan: {m}")
+    }
+    assert(fits(&at_default, 32, 28).is_empty(), "at the default")
+
+    // A declared row of 0 is a row, and so is `pipes`, the last kind.
+    let zero_lines: Vector<String> = [
+        "format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[quota]", "events = 0", "pipes = 2"]
+    var zeroed = Vector<Declaration>()
+    try! zeroed.push(decl(move zero_lines, "z/process.toml"))
+    let zero_image: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"z\"", "board = \"esp32s3\"", "tick = true",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"z\"", "package = \"z\""]
+    let z = match planned(join(&zero_image), &zeroed, 4) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the zero image did not plan: {m}")
+    }
+    borrow let zc = z.children[0] {
+        assert(zc.quota.len() == 2, "two rows")
+        assert((zc.quota.get(0)!).kind == 1 && (zc.quota.get(0)!).limit == 0, "events 0")
+        assert((zc.quota.get(1)!).kind == 8 && (zc.quota.get(1)!).limit == 2, "pipes")
+    }
+
+    // Two processes taking one device whole: the earlier is given a sibling,
+    // the later the row itself.
+    var two = Vector<Declaration>()
+    try! two.push(watcher())
+    try! two.push(watcher())
+    let takers: Vector<String> = [
+        "format = 1",
+        "[image]", "name = \"two\"", "board = \"esp32s3\"", "tick = true",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"one\"", "package = \"watcher\"",
+        "[[process]]", "name = \"two\"", "package = \"watcher\""]
+    let both = match planned(join(&takers), &two, 4) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("two takers did not plan: {m}")
+    }
+    record_is(&both, 0, 1, 2, Source.Sibling, 4, 0, 0)
+    record_is(&both, 1, 1, 2, Source.Row, 4, 0, 0)
+
+    // The IoMemory objects: the box's four device rows, a fifth while a setup
+    // write's carve is made, and the two carves given to pwm.
+    let box = match planned(join(&box_lines()), &decls, 4) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the box did not plan: {m}")
+    }
+    assert(fits_io(&box, 32, 28, 6).is_empty(), "six hold the box")
+    assert(fits_io(&box, 32, 28, 5).equals("box.toml: the stock root would make the IoMemory objects 6 at `give pwm record 4`, past the image's 5"), "the second carve")
+    assert(fits_io(&box, 32, 28, 4).equals("box.toml: the stock root would make the IoMemory objects 5 at `setup SYSTEM.PERIP_CLK_EN0`, past the image's 4"), "a setup write's carve")
+
+    // The rows of a stock image: a blob and a destination per process at the
+    // regions placed, then the plan's, a pool's at its region.
+    let b = board()
+    let image = try! ImageFile.parse(join(&box_lines()), "box.toml", &b, 4)
+    var plan_rows = Vector<RowSpec>()
+    try! plan_rows.push(RowSpec(what: "GPIO's window", kind: RegionKind.Device, blob: None,
+                                base: 0x6000_4000, len: 0x1000))
+    try! plan_rows.push(RowSpec(what: "journal", kind: RegionKind.Pool, blob: None, base: 0,
+                                len: 0x1000))
+    var regions = Vector<Span>()
+    var r = 0
+    while r < 5 {
+        try! regions.push(Span(base: 0x3FCC_0000 + (r as UInt64) * 0x1_0000, len: 0x8000))
+        r = r + 1
+    }
+    let rows = stock_region_rows(&image, &plan_rows, &regions)
+    assert(rows.len() == 10, "four blobs, four destinations, two of the plan's")
+    assert((rows.get(0)!).blob == 0 && (rows.get(3)!).blob == 3, "the blobs")
+    assert((rows.get(4)!).base == 0x3FCC_0000, "the first destination")
+    assert((rows.get(8)!).base == 0x6000_4000, "a device row as planned")
+    assert((rows.get(9)!).base == 0x3FD0_0000 && (rows.get(9)!).len == 0x8000, "the pool at its region")
+
+    // The image description: on a board that runs images in place at a
+    // page's grain, each blob is padded to the page; on another, not.
+    let paged = described_spec(&image, "/k.o", "/out", "/root.sosimg", Vector<String>(),
+                               Vector<RowSpec>(), false, ImageLimits.none(), true, 0x1000,
+                               "in-place")
+    assert(paged.blob_align == 0x1000, "padded")
+    assert(paged.output.equals("/out/useless-box.elf"), "its ELF")
+    assert(paged.flash != None, "a flash image")
+    assert(paged.flags == 0, "the tick")
+    let copied = described_spec(&image, "/k.o", "/out", "/root.sosimg", Vector<String>(),
+                                Vector<RowSpec>(), false, ImageLimits.none(), false, 0x1000,
+                                "copied")
+    assert(copied.blob_align == 16 && copied.flash == None, "not padded, no flash")
+
+    // An input's module is handed to Blade by an absolute path, whatever the
+    // output directory was given as: Blade runs in the package's directory.
+    try! ensure_directory(".build/extras/pkg")
+    let source: Vector<String> = ["public static N: Int = 1"]
+    try! write_lines(".build/extras/pkg/x.saw", &source)
+    let d = decl(heartbeat_lines(), ".build/extras/pkg/process.toml")
+    var inputs = Vector<InputValue>()
+    try! inputs.push(InputValue(process: "p", input: "cfg", path: "x.saw",
+                                source: InputSource.Driver))
+    let bound = Bindings(windows: Vector<Bound>(), inputs: move inputs,
+                         ranges: Vector<String>(), notes: Vector<String>())
+    let extras = try! process_extras(&d, &bound, &b, "p", "/sawos", "/product", ".build/extras/out")
+    let module = extras.modules.get(0)!
+    assert(module.name.equals("cfg"), "the input's module")
+    assert(module.dir.starts_with("/") && module.dir.ends_with(".build/extras/out/p.inputs/cfg"),
+           "an absolute path: {module.dir}")
+    assert(File.exists(Path(s: "{module.dir}/lib.saw")), "the module's file")
+
+    // Every key of a test plan's objects is one the reader knows.
+    let unknown_top = read_refusal("\{\"children\": [], \"extra\": 1\}")
+    assert(unknown_top.contains("extra"), "the plan: {unknown_top}")
+    let unknown_child = read_refusal("\{\"children\": [\{\"name\": \"c\", \"image\": 0, \"destination\": 1, \"start\": 1, \"extra\": 1\}]\}")
+    assert(unknown_child.contains("extra"), "a child: {unknown_child}")
+    let unknown_record = read_refusal(one_child("\{\"tag\": 1, \"source\": \"system\", \"extra\": 1\}", 0))
+    assert(unknown_record.contains("extra"), "a record: {unknown_record}")
+    let unknown_quota = read_refusal("\{\"children\": [\{\"name\": \"c\", \"image\": 0, \"destination\": 1, \"start\": 1, \"quota\": \{\"threads\": 1, \"extra\": 1\}\}]\}")
+    assert(unknown_quota.contains("extra"), "a quota: {unknown_quota}")
+    let unknown_setup = read_refusal("\{\"setup\": [\{\"register\": \"R\", \"row\": 0, \"offset\": 0, \"len\": 4, \"at\": 0, \"op\": \"set\", \"value\": 1, \"extra\": 1\}]\}")
+    assert(unknown_setup.contains("extra"), "a setup write: {unknown_setup}")
+
+    // Every quota kind's name in the module, and a name that would
+    // interpolate written as it is.
+    let kinds = match read_plan("\{\"children\": [\{\"name\": \"a\{b\}\", \"image\": 0, \"destination\": 1, \"start\": 1, \"quota\": \{\"threads\": 1, \"events\": 2, \"waiters\": 3, \"timers\": 4, \"memories\": 5, \"iomemories\": 6, \"mappings\": 7, \"handles\": 8, \"pipes\": 9\}\}]\}") {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the kinds did not read: {m}")
+    }
+    let text = plan_module(&kinds, "k").join("\n")
+    let names: Vector<String> = ["Thread", "Event", "Waiter", "Timer", "Memory", "IoMemory",
+                                 "Mapping", "Handle", "Pipe"]
+    var n = 0
+    while n < names.len() {
+        let line = "try! quota.push(Quota(kind: QuotaName.{names.get(n) ?? ""}, limit: {n + 1}))"
+        assert(text.contains(line), "the row {line}")
+        n = n + 1
+    }
+    assert(text.contains("Child(name: \"a\\\{b\\\}\", image: 0"), "braces escaped")
+    // ...and so are a quote and a backslash.
+    let quoted = match read_plan("\{\"children\": [\{\"name\": \"q\\\"r\\\\s\", \"image\": 0, \"destination\": 1, \"start\": 1\}]\}") {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the quoted name did not read: {m}")
+    }
+    let quoted_text = plan_module(&quoted, "q").join("\n")
+    assert(quoted_text.contains("Child(name: \"q\\\"r\\\\s\", image: 0"), "a quote and a backslash")
+}
+
+func read_refusal(text: String) -> String {
+    match read_plan(text) {
+        case Ok(_) -> "",
+        case Err(m) -> m
+    }
+}

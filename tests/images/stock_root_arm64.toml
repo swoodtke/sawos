@@ -1,0 +1,47 @@
+# The stock root on the arm64 `virt` board: three setup writes to the RTC's
+# match register (a store, then a clear and a set that keep the other bits),
+# a server and a client joined by a connection, the server's pool and its
+# declared `Waiter` row, and the RTC given whole, with its line, to the one
+# process that takes it. The server serves until its last client's end is
+# gone. Root stops the machine when every child has ended.
+# The gate's `stock_root` case builds it with `sosimage build`.
+format = 1
+
+[image]
+name = "stock_root"
+board = "arm64-virt"
+tick = false
+
+[root]
+package = "stock"
+
+[[setup]]
+register = "RTC.MATCH"
+write = 0xF0F0
+
+[[setup]]
+register = "RTC.MATCH"
+clear = 0xF0
+
+[[setup]]
+register = "RTC.MATCH"
+set = 0xA
+
+[[process]]
+name = "server"
+package = "sawos:tests/stock-server"
+pools = { scratch = "spare" }
+inputs = { stockconfig = "tests/images/stock/server.saw" }
+
+[[process]]
+name = "client"
+package = "sawos:tests/stock-client"
+clients = { peer = "server.echo" }
+
+[[process]]
+name = "probe"
+package = "sawos:tests/stock-pl031"
+
+[[pool]]
+name = "spare"
+len = 0x1000

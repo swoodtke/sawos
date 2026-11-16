@@ -1,0 +1,80 @@
+//! BootSet: a process's whole boot set, drained at once and taken by tag.
+//!
+//! A launcher that follows the launch convention (spec §12) gives a child
+//! its records in the order its declaration lists them, each under the tag
+//! the declaration names. A child that knows its records by tag has no use
+//! for that order: it drains everything here and takes each record by its
+//! tag, so a record it does not ask for is released with the set.
+
+import sosabi.{SosStatus, BootHandleKind}
+import sos.system.{Process, BootHandle}
+
+/// One record of a drained set, as the drain met it: its tag and its kind.
+public struct BootEntry {
+    tag: UInt
+    kind: BootHandleKind
+}
+
+/// Every record of a process's boot set, in the order the drain answered
+/// them: a child's in the order its launcher gave them, root's in row order.
+///
+/// `NoCopy`: it owns every record not yet taken, and dropping it releases
+/// them.
+public struct BootSet {
+    entries: Vector<BootEntry>
+    records: Vector<BootHandle?>
+}
+
+extension BootSet: NoCopy {}
+
+extension BootSet {
+    /// Drain `process`'s boot set to its end. Requires
+    /// `ProcessRight.BootHandles`, and `process` must be the caller's own
+    /// (`boot_handle_next`'s terms). A drain that ends other than by
+    /// `SosStatus.Drained` answers that status, and the records drained
+    /// before it are released.
+    public init(process: &Process) -> Result<BootSet, SosStatus> {
+        var entries = Vector<BootEntry>()
+        var records = Vector<BootHandle?>()
+        while {
+            let record = try process.boot_handle_next() catch {
+                if error == SosStatus.Drained {
+                    break
+                }
+                return error
+            }
+            try entries.push(BootEntry(tag: record.tag, kind: record.kind)) catch {
+                return SosStatus.NoMemory
+            }
+            try records.push(move record) catch {
+                return SosStatus.NoMemory
+            }
+        }
+        return BootSet(entries: move entries, records: move records)
+    }
+
+    /// How many records the drain met, taken or not.
+    public func len(&self) -> Int {
+        self.entries.len()
+    }
+
+    /// The tag and kind of every record, in drain order, taken or not.
+    public func entries(&self) -> Vector<BootEntry> {
+        self.entries.copy()
+    }
+
+    /// Take the record given under `tag`, leaving the set without it. `None`
+    /// when no record has that tag or it was taken already: a tag is the
+    /// giver's word, and asking for one it did not give is a question with an
+    /// answer.
+    public func take(&var self, tag: UInt) -> BootHandle? {
+        var i = 0
+        while i < self.entries.len() {
+            if (self.entries.get(i)!).tag == tag {
+                return self.records[i].take()
+            }
+            i = i + 1
+        }
+        None
+    }
+}
