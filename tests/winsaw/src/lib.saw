@@ -1,0 +1,112 @@
+//! Deep recursion for the windowed Saw cases on the ESP32-S3.
+//!
+//! `descend` recurses `depth` frames below its caller. Each frame derives
+//! four values from its depth and its seed before its call and folds all six
+//! into the result after it, so the frame keeps values live across the call
+//! in the registers a call8 caller keeps (`a2`..`a7`), and a frame whose
+//! registers came back wrong changes the answer. Compiled windowed,
+//! each call opens a frame with `entry` and the register file holds sixteen
+//! panes, so a chain this deep overflows the file on the way down and
+//! underflows it on the way back up, many times over. `expected` computes the
+//! same answer with loops in one frame, so it needs no window exception to be
+//! right.
+//!
+//! `windowed` says which convention the code runs, through `window.c`'s
+//! probe: the cases assert it, so a package that lost its `+windowed` runs
+//! call0 and fails rather than passing on the call0 path.
+
+/// What runs at the bottom of a chain, called from the deepest frame.
+public trait Bottom {
+    func reached(&self)
+}
+
+static MIX: UInt32 = 0x9E37_79B9
+static STIR: UInt32 = 0x2545_F491
+static TWIST: UInt32 = 0x7F4A_7C15
+static BOTTOM_MARK: UInt32 = 0x5A5A_0F0F
+
+/// The four values a frame derives from its depth and its seed.
+func value_a(depth: UInt32, seed: UInt32) -> UInt32 {
+    (seed &* MIX) &+ depth
+}
+
+func value_b(depth: UInt32, a: UInt32) -> UInt32 {
+    a ^ (depth << 7)
+}
+
+func value_c(b: UInt32) -> UInt32 {
+    ((b << 13) | (b >> 19)) &+ TWIST
+}
+
+func value_d(depth: UInt32, seed: UInt32) -> UInt32 {
+    seed ^ (depth &* STIR)
+}
+
+/// One frame's contribution, folded over what the frames below it answered.
+/// Each step mixes in one value after a rotation or a multiplication of what
+/// came before, so no value can be combined with another ahead of the call,
+/// and the whole is no accumulation the compiler could turn the recursion
+/// into a loop with.
+func fold(below: UInt32, depth: UInt32, seed: UInt32, a: UInt32, b: UInt32,
+          c: UInt32, d: UInt32) -> UInt32 {
+    let x = below ^ a
+    let y = ((x << 5) | (x >> 27)) &+ b
+    let z = (y ^ c) &* (depth | 1)
+    let w = ((z << 11) | (z >> 21)) ^ d
+    w &+ seed
+}
+
+/// The chain: `depth` more frames below this one, `bottom.reached()` in the
+/// last, and each frame's values folded in on the way back out.
+public func descend<B: Bottom>(depth: UInt32, seed: UInt32,
+                               bottom: &B) -> UInt32 {
+    let a = value_a(depth, seed)
+    let b = value_b(depth, a)
+    let c = value_c(b)
+    let d = value_d(depth, seed)
+    let below = if depth == 0 {
+        bottom.reached()
+        c ^ BOTTOM_MARK
+    } else {
+        descend(depth - 1, c, &bottom)
+    }
+    fold(below, depth, seed, a, b, c, d)
+}
+
+/// The seed the frame at `d` receives in a chain started at `depth`.
+func seed_at(d: UInt32, depth: UInt32, seed: UInt32) -> UInt32 {
+    var s = seed
+    var k = depth
+    while k > d {
+        s = value_c(value_b(k, value_a(k, s)))
+        k = k - 1
+    }
+    s
+}
+
+/// What `descend(depth, seed, _)` answers, computed in one frame.
+public func expected(depth: UInt32, seed: UInt32) -> UInt32 {
+    var result: UInt32 = 0
+    var k: UInt32 = 0
+    while k <= depth {
+        let s = seed_at(k, depth, seed)
+        let a = value_a(k, s)
+        let b = value_b(k, a)
+        let c = value_c(b)
+        let below = if k == 0 { c ^ BOTTOM_MARK } else { result }
+        result = fold(below, k, s, a, b, c, value_d(k, s))
+        k = k + 1
+    }
+    result
+}
+
+extern "C" {
+    func sos_window_start() -> UInt32
+}
+
+/// Whether this code runs windowed: WINDOWSTART names more than one live
+/// frame at the probe, which call0 code never makes (`window.c`).
+public func windowed() -> Bool {
+    let ws = sos_window_start()
+    (ws & (ws &- 1)) != 0
+}

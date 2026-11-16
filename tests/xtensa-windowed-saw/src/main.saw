@@ -1,0 +1,177 @@
+// Windowed Saw on the ESP32-S3: a root built whole for the windowed ABI, its
+// runtime and system-call stub included (see `Saw.toml`).
+//
+//   SOS winsaw: windowed code
+//   SOS winsaw: printed from 100 frames down
+//   SOS winsaw: 100 frames answered N, expected N
+//   SOS winsaw: two threads 64 frames down, 4 rounds, no yields
+//   SOS winsaw: threads answered a=A b=B, expected a=A b=B
+//
+// The first line is `winsaw.windowed()`: this code runs windowed. The next two
+// are one chain of `winsaw.descend`, a system call made from its bottom and its
+// answer printed beside `winsaw.expected`'s; a chain that deep overflows the
+// register file going down and underflows it coming back.
+//
+// Then two threads each descend 64 frames and, at the bottom, take turns: each
+// publishes a round and spins until the other has published it too, making no
+// call into the kernel. The thread that publishes first leaves its spin only
+// after a tick has taken the processor from it, 64 frames down, and the other
+// thread has run its own chain through the same physical registers, so every
+// round crosses between the threads with both chains live, however many ticks
+// the host delivers or how late. Each thread then unwinds and exits with its
+// answer, which this thread prints beside `expected`'s. The kernel booting
+// this image arms the tick (the case's `"tick": True`); without it the first
+// spin never ends.
+//
+// The answers are printed, not judged here: a fault that corrupts a frame's
+// registers can corrupt the frame holding a verdict as easily, so the case
+// asserts the numbers themselves. Each is a fixed function of its seed and
+// depth.
+
+import sos.{System, Process, Thread}
+import winsaw.{Bottom, descend, expected, windowed}
+
+/// The boot handle, parked for the workers, and the witness that says which
+/// thread `_start` is running as, as in `thread-preempt`.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// How many rounds each thread has published, for the other to read. An atomic
+/// load is what keeps a spin on it from being hoisted out of its loop.
+static PUBLISHED_A: Atomic<Int> = Atomic(0)
+static PUBLISHED_B: Atomic<Int> = Atomic(0)
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static ROLE_A: UInt = 1
+static ROLE_B: UInt = 2
+
+static ONE_DEPTH: UInt32 = 100
+static THREAD_DEPTH: UInt32 = 64
+static ROUNDS: Int = 4
+
+static SEED_ONE: UInt32 = 0x0BAD_5EED
+static SEED_A: UInt32 = 0x1357_9BDF
+static SEED_B: UInt32 = 0x2468_ACE0
+
+static NO_VALUE: UInt = 0xFFFF_FFFF
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+/// The bottom of the first chain: a system call from `ONE_DEPTH` frames down.
+struct Report {}
+
+extension Report: Bottom {
+    func reached(&self) {
+        print("SOS winsaw: printed from {} frames down\n", ONE_DEPTH)
+    }
+}
+
+/// The bottom of a thread's chain: the rounds, each crossing to the other
+/// thread.
+struct Rendezvous {
+    role: UInt
+}
+
+extension Rendezvous: Bottom {
+    func reached(&self) {
+        var round = 0
+        while round < ROUNDS {
+            round = round + 1
+            if self.role == ROLE_A {
+                PUBLISHED_A.store(round)
+            } else {
+                PUBLISHED_B.store(round)
+            }
+            var seen = 0
+            while seen < round {
+                seen = if self.role == ROLE_A { PUBLISHED_B.load() }
+                       else { PUBLISHED_A.load() }
+            }
+        }
+    }
+}
+
+func worker(role: UInt) {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let seed = if role == ROLE_A { SEED_A } else { SEED_B }
+    let answer = descend(THREAD_DEPTH, seed, &Rendezvous(role: role))
+    let _ = (move me).exit(answer as UInt)
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS winsaw: no process handle\n")
+        let _ = system.shutdown(1)
+        return
+    }
+
+    let _ = system.debug_print(if windowed() { "SOS winsaw: windowed code\n" }
+                               else { "SOS winsaw: call0 code\n" })
+
+    let answer = descend(ONE_DEPTH, SEED_ONE, &Report())
+    print("SOS winsaw: {} frames answered {}, expected {}\n", ONE_DEPTH, answer,
+          expected(ONE_DEPTH, SEED_ONE))
+
+    let a = try proc.thread_create(stack_top: stack_a_top(),
+                                    arg: ROLE_A) catch {
+        print("SOS winsaw: create failed: {}\n", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let b = try proc.thread_create(stack_top: stack_b_top(),
+                                    arg: ROLE_B) catch {
+        print("SOS winsaw: create failed: {}\n", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    print("SOS winsaw: two threads {} frames down, {} rounds, no yields\n",
+          THREAD_DEPTH, ROUNDS)
+    let _ = a.start()
+    let _ = b.start()
+
+    let ra: UInt = try a.join() catch { NO_VALUE }
+    let rb: UInt = try b.join() catch { NO_VALUE }
+    let want_a = expected(THREAD_DEPTH, SEED_A) as UInt
+    let want_b = expected(THREAD_DEPTH, SEED_B) as UInt
+    print("SOS winsaw: threads answered a={} b={}, expected a={} b={}\n", ra,
+          rb, want_a, want_b)
+    let _ = system.shutdown(if ra == want_a && rb == want_b { 0 } else { 1 })
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

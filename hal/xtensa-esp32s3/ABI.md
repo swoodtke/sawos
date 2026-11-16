@@ -1094,9 +1094,13 @@ executes `syscall`, which are the frame's `a2..a8`, so the kernel side does
 not change. Blade passes the triple's `-windowed` and then the manifest's
 `+windowed` to each C unit, the last winning, and the integrated assembler
 then accepts `rsr windowbase` and the windowed instructions in the unit's
-inline assembly; a `.S` file takes them under either. No Saw is compiled
-windowed: the compiler at the pinned release uses a frame pointer that is an
-argument register under the windowed ABI.
+inline assembly; a `.S` file takes them under either. A Saw process is
+built windowed the same way: Blade hands sawc the manifest's list as
+`--target-features +windowed`, and sawc compiles the package's whole module
+graph windowed (the program, `sos`, `sosrt` and its panic path) with no
+frame pointer, beside `rt/common_c/support.c` and the stub compiled
+windowed by the same list. Every compiled function opens with `entry`,
+`_start` included, so the call4 rule above never binds a Saw entry.
 
 **The cases** (`make sos-smoke-esp32s3`): `windowed_process` (overflow and
 underflow at each call size past the register file, a system call from 30
@@ -1106,7 +1110,13 @@ Alloca exception in a first frame and under call4, call8 and call12
 callers), `register_file_clean`, `windowed_child_exit` (a windowed child
 beside a call0 root), `windowed_entry_returns`, and a spill fault and a fill
 fault through each of the six handlers (`windowed_spill_fault4`, `8`, `12`
-and `windowed_fill_fault4`, `8`, `12`).
+and `windowed_fill_fault4`, `8`, `12`). Three run windowed Saw (`tests/winsaw`
+holds their recursion): `windowed_saw_threads` (a root: a chain of 100
+frames with a system call from its bottom, and two threads 64 frames down
+crossing by tick at the bottom, each chain's answer checked),
+`windowed_saw_child` (a windowed Saw child beside a call0 Saw root) and
+`windowed_saw_fault` (that child's load fault 64 frames down, ended as its
+own).
 
 ### 7e. The call0 calling convention
 

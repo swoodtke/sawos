@@ -1,0 +1,64 @@
+// A windowed Saw child that faults 64 frames down (ESP32-S3).
+//
+//   SOS winsawfault: windowed code
+//   SOS winsawfault: loading from 268435456, 64 frames down
+//   SOS: fault load-access-fault cause=0x0000001c epc=... tval=0x10000000
+//
+// `death-notify`'s root launches it and parks on its death. It says which
+// convention it runs, descends 64 frames through `winsaw.descend` and, at
+// the bottom, loads from `NO_LOAD`, an address that answers no load on this
+// board (hal/xtensa-esp32s3/ABI.md §3c). The kernel ends this process for the
+// fault and goes on: the teardown line names it, and the root wakes with
+// `Faulted`. A load that answered would print its value and exit with
+// `EXIT_LOADED`, which the root's wake line would carry instead.
+
+import sos.{System}
+import winsaw.{Bottom, descend, windowed}
+
+// The depth the stack holds. The bottom's prints are inlined into this
+// package's instance of `descend`, so each of its frames is wider than the
+// other packages' (an `entry a1, 192` where theirs open with 80): 64 frames
+// and `_start` take about 13 KiB of `child.ld`'s 16 KiB stack, and 100 would
+// run past its bottom before the load. Measure again if the bottom changes.
+static DEPTH: UInt32 = 64
+static SEED: UInt32 = 0x0FA0_17ED
+static NO_LOAD: UInt = 0x1000_0000
+static EXIT_LOADED: UInt = 7
+
+struct Word {
+    v: UInt32
+}
+
+func load(address: UInt) unsafe -> UInt32 {
+    UnsafeMemory<Word, Device>(address).v.read()
+}
+
+struct Fault {}
+
+extension Fault: Bottom {
+    func reached(&self) {
+        print("SOS winsawfault: loading from {}, {} frames down\n", NO_LOAD,
+              DEPTH)
+        let value = load(NO_LOAD)
+        print("SOS winsawfault: the load answered {}\n", value)
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS winsawfault: no process handle: {}\n", error)
+        // Returning from a windowed entry faults this process on the fetch at
+        // its start state's return address.
+        return
+    }
+
+    let _ = system.debug_print(
+        if windowed() { "SOS winsawfault: windowed code\n" }
+        else { "SOS winsawfault: call0 code\n" })
+
+    let _ = descend(DEPTH, SEED, &Fault())
+    let _ = proc.exit(EXIT_LOADED)
+}

@@ -44,12 +44,14 @@ may differ, and marks what was probed on a board.
 
 The things most likely to surprise someone arriving here:
 
-- **Everything is call0.** The ROM enters the image windowed (`callx8`);
+- **The kernel is call0.** The ROM enters the image windowed (`callx8`);
   `_start` resets the register window and turns window exceptions off, and
-  nothing after it is windowed. The compiler's objects are call0 with no FPU
+  the kernel's own code after it is call0 (it reaches the windowed ROM only
+  through a stub, ABI.md §7g). The compiler's objects are call0 with no FPU
   (the triple's default features), and so is every C and assembly file here
-  (`-Xclang -target-feature -Xclang -windowed`, the same for `-fp`). No call0
-  libgcc, compiler-rt or ROM helper exists, so no image may link one.
+  (`-Xclang -target-feature -Xclang -windowed`, the same for `-fp`).
+  No call0 libgcc, compiler-rt or ROM helper exists, so no call0 image may
+  link one. A process, Saw or C, may be built windowed (ABI.md §7d).
 - **There is no privilege.** PS.UM selects which vector a trap takes, not what
   code may do: user code can write every special register (ABI.md §5e). So the
   tier is `Flat`: `prot_isolated()` answers false and every `prot_*` call

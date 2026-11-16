@@ -13314,6 +13314,32 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "SOS regs: 4 nonzero, 0 unexpected"],
             "expect_clean_exit": True,
         },
+        {
+            # A windowed Saw root, its runtime and stub windowed with it: the
+            # probe says the code runs windowed; a chain of 100 frames makes a
+            # system call from its bottom; and two threads, each 64 frames
+            # down, cross by tick at the bottom in every round and then
+            # unwind. Every crossing waits on the other thread's progress, so
+            # only a tick moves the processor. Each chain's answer is asserted
+            # as a number, beside the one `winsaw.expected` computes with
+            # loops: the numbers are fixed by the seeds and depths in
+            # `tests/xtensa-windowed-saw`.
+            "name": "windowed_saw_threads",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "tick": True,
+            "root_pkg": os.path.join(TESTS_DIR, "xtensa-windowed-saw"),
+            "expect_out": ["{banner}",
+                           "SOS winsaw: windowed code\n",
+                           "SOS winsaw: printed from 100 frames down\n",
+                           "SOS winsaw: 100 frames answered 3644919033, "
+                           "expected 3644919033\n",
+                           "SOS winsaw: two threads 64 frames down, "
+                           "4 rounds, no yields\n",
+                           "SOS winsaw: threads answered a=685981353 "
+                           "b=1275536650, expected a=685981353 "
+                           "b=1275536650\n"],
+            "expect_clean_exit": True,
+        },
         # A windowed C child beside a call0 Saw root, which wakes on the
         # child's end and runs to its own.
         windowed_child(
@@ -13331,6 +13357,32 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             ["SOS winchild: returning from the entry",
              "SOS: fault instruction-address-error cause=0x0000000e "
              "epc=0x7ffffffc tval=0x7ffffffc"],
+            windowed_fault_status),
+        # A windowed Saw child beside the call0 Saw root: it says it runs
+        # windowed, makes a system call from 100 frames down, prints its
+        # chain's answer beside the loop's (fixed by the child's seed and
+        # depth), and exits with 5 only when they agree.
+        windowed_child(
+            "windowed_saw_child", "xtensa-windowed-saw-child",
+            ["SOS winsawchild: windowed code\n",
+             "SOS winsawchild: printed from 100 frames down\n",
+             "SOS winsawchild: answered 393937586, expected 393937586\n",
+             "SOS winsawchild: exiting\n",
+             "SOS: process exit: code={five} process={one}"],
+            65541),
+        # A windowed Saw child's fault, 64 frames down: the kernel ends that
+        # process, the teardown names it, and the call0 root wakes and goes
+        # on.
+        windowed_child(
+            "windowed_saw_fault", "xtensa-windowed-saw-fault",
+            ["SOS winsawfault: windowed code\n",
+             "SOS winsawfault: loading from 268435456, 64 frames down\n",
+             # The faulting load is the child's: its code runs in place in
+             # the child slot's instruction window, 0x4218_0000 up.
+             "SOS: fault load-access-fault cause=0x0000001c epc=0x4218",
+             " tval=0x10000000\n",
+             "SOS: process teardown ",
+             " process={one}\n"],
             windowed_fault_status),
         # A spill to an address that takes no store, through each overflow
         # handler: the process's own fault, with the store's reason and the

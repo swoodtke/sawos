@@ -1,0 +1,56 @@
+// A windowed Saw child beside a call0 Saw root (ESP32-S3).
+//
+//   SOS winsawchild: windowed code
+//   SOS winsawchild: printed from 100 frames down
+//   SOS winsawchild: answered N, expected N
+//   SOS winsawchild: exiting
+//
+// `death-notify`'s root launches it and parks on its death. It says which
+// convention it runs, descends 100 frames through `winsaw.descend` with a
+// system call at the bottom, prints the chain's answer beside
+// `winsaw.expected`'s, and exits with `EXIT_OK` when they agree and
+// `EXIT_WRONG` when they do not: the root's wake line carries the code. The
+// case asserts the two numbers as well as the code, since a fault that
+// corrupts a frame's registers can corrupt the frame holding a verdict as
+// easily.
+
+import sos.{System}
+import winsaw.{Bottom, descend, expected, windowed}
+
+static DEPTH: UInt32 = 100
+static SEED: UInt32 = 0x0C0F_FEE5
+
+/// `Exited` (1) << 16 | 5 on the root's side, the code `death-notify` expects.
+static EXIT_OK: UInt = 5
+static EXIT_WRONG: UInt = 6
+
+struct Report {}
+
+extension Report: Bottom {
+    func reached(&self) {
+        print("SOS winsawchild: printed from {} frames down\n", DEPTH)
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        print("SOS winsawchild: no process handle: {}\n", error)
+        // Returning from a windowed entry faults this process on the fetch at
+        // its start state's return address, which the root reads as
+        // `Faulted`.
+        return
+    }
+
+    let _ = system.debug_print(
+        if windowed() { "SOS winsawchild: windowed code\n" }
+        else { "SOS winsawchild: call0 code\n" })
+
+    let answer = descend(DEPTH, SEED, &Report())
+    let want = expected(DEPTH, SEED)
+    print("SOS winsawchild: answered {}, expected {}\n", answer, want)
+    let _ = system.debug_print("SOS winsawchild: exiting\n")
+    let _ = proc.exit(if answer == want { EXIT_OK } else { EXIT_WRONG })
+}
