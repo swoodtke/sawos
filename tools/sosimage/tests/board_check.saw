@@ -57,7 +57,7 @@ func virt_args() -> String {
 
 func virt_facts() -> HalFacts {
     HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 4,
-             console_base: 0x1000_0000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000)
+             console_base: 0x1000_0000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000, stack_len: 0x4000)
 }
 
 func board_file(dir: String, name: String, text: String) -> Board {
@@ -112,11 +112,11 @@ func s3_args() -> String {
 }
 
 func s3_modules(clock: String) -> String {
-    "\"kcore=../../kernel/core\", \"hal=../../hal/xtensa-esp32s3/kernel\", \"s3clock=../../hal/xtensa-esp32s3/keys/{clock}\", \"s3stall=../../hal/xtensa-esp32s3/keys/stall-off\""
+    "\"kcore=../../kernel/core\", \"hal=../../hal/xtensa-esp32s3/kernel\", \"s3clock=../../hal/xtensa-esp32s3/keys/{clock}\", \"s3stall=../../hal/xtensa-esp32s3/keys/stall-off\", \"s3clockkit=../../hal/xtensa-esp32s3/keys/clock-common\""
 }
 
 func s3_flash(bytes: String, ibus: String, dbus: String, window: String) -> String {
-    ", \"flash\": \{\"bytes\": {bytes}, \"instruction_window\": {ibus}, \"data_window\": {dbus}, \"window_bytes\": {window}, \"magic_offset\": 1024, \"magic\": 2933589021\}"
+    ", \"flash\": \{\"bytes\": {bytes}, \"instruction_window\": {ibus}, \"data_window\": {dbus}, \"window_bytes\": {window}, \"magic_offset\": 1024, \"magic\": 2933589021, \"root_slot\": \{\"base\": 1048576, \"len\": 524288\}, \"slots\": \{\"base\": 1572864, \"len\": 524288, \"count\": 4\}\}"
 }
 
 func s3_profile(modules: String, extra: String) -> Profile {
@@ -183,37 +183,37 @@ func main() {
 
     // The HAL's numbers.
     let console = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 4,
-                           console_base: 0x1000_1000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000)
+                           console_base: 0x1000_1000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000, stack_len: 0x4000)
     expect(&virt, &profile, &console,
            "{file}: [devices.UART0] is the kernel's, 0x1000 bytes at 0x10000000, and the HAL's console window (DEVICE_GRANT_BASE, DEVICE_GRANT_LEN) is 0x1000 bytes at 0x10001000")
     let console_len = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 4,
-                               console_base: 0x1000_0000, console_len: 0x2000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000)
+                               console_base: 0x1000_0000, console_len: 0x2000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000, stack_len: 0x4000)
     expect(&virt, &profile, &console_len,
            "{file}: [devices.UART0] is the kernel's, 0x1000 bytes at 0x10000000, and the HAL's console window (DEVICE_GRANT_BASE, DEVICE_GRANT_LEN) is 0x2000 bytes at 0x10000000")
     expect(&virt_with("kernel = true", "kernel = false"), &profile, &facts,
            "{file}: no device has kernel = true, and the HAL's console window is 0x1000 bytes at 0x10000000")
     let coarse = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 0x2000,
-                          console_base: 0x1000_0000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000)
+                          console_base: 0x1000_0000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000, stack_len: 0x4000)
     expect(&virt, &profile, &coarse,
            "{file}: [devices.UART0] is 0x1000 bytes at 0x10000000, off the HAL's grain (8192 bytes)")
     let offset = virt_with("base = 0x1000_0000", "base = 0x1000_0800")
     let page = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 0x800,
-                        console_base: 0x1000_0800, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000)
+                        console_base: 0x1000_0800, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000, stack_len: 0x4000)
     expect(&offset, &profile, &page, "")
     let page_grain = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 0x1000,
-                              console_base: 0x1000_0800, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000)
+                              console_base: 0x1000_0800, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000, stack_len: 0x4000)
     expect(&offset, &profile, &page_grain,
            "{file}: [devices.UART0] is 0x1000 bytes at 0x10000800, off the HAL's grain (4096 bytes)")
     let shifted = HalFacts(root_base: 0x8030_0000, root_top: 0x8034_0000, grain: 4,
-                           console_base: 0x1000_0000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000)
+                           console_base: 0x1000_0000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000, stack_len: 0x4000)
     expect(&virt, &profile, &shifted,
            "{file}: [ram.kernel], the kernel's, runs from 0x80000000 to 0x80200000, and root's region begins at 0x80300000 (ROOT_LOAD_BASE): the kernel range ends where root's region begins")
     let top = HalFacts(root_base: 0x8020_0000, root_top: 0x9000_0000, grain: 4,
-                       console_base: 0x1000_0000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000)
+                       console_base: 0x1000_0000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000, stack_len: 0x4000)
     expect(&virt, &profile, &top,
            "{file}: root's region (ROOT_LOAD_BASE to ROOT_REGION_TOP, 0x80200000 to 0x90000000) is not inside the default process range ram, 0x80200000 to 0x88000000")
     let empty = HalFacts(root_base: 0x8020_0000, root_top: 0x8020_0000, grain: 4,
-                         console_base: 0x1000_0000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000)
+                         console_base: 0x1000_0000, console_len: 0x1000, kernel_base: 0x8000_0000, ram_top: 0x8800_0000, stack_len: 0x4000)
     expect(&virt, &profile, &empty,
            "{file}: root's region (ROOT_LOAD_BASE to ROOT_REGION_TOP, 0x80200000 to 0x80200000) is not inside the default process range ram, 0x80200000 to 0x88000000")
     expect(&virt_with("len = 0x20_0000", "len = 0x10_0000"), &profile, &facts,
@@ -224,12 +224,12 @@ func main() {
     // and its base is not the HAL's.
     let low_kernel = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 4,
                               console_base: 0x1000_0000, console_len: 0x1000,
-                              kernel_base: 0x8010_0000, ram_top: 0x8800_0000)
+                              kernel_base: 0x8010_0000, ram_top: 0x8800_0000, stack_len: 0x4000)
     expect(&virt, &profile, &low_kernel,
            "{file}: [ram.kernel], the kernel's, begins at 0x80000000, and the HAL's kernel RAM begins at 0x80100000 (KERNEL_RAM_BASE)")
     let high_kernel = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 4,
                                console_base: 0x1000_0000, console_len: 0x1000,
-                               kernel_base: 0x7FF0_0000, ram_top: 0x8800_0000)
+                               kernel_base: 0x7FF0_0000, ram_top: 0x8800_0000, stack_len: 0x4000)
     expect(&virt, &profile, &high_kernel,
            "{file}: [ram.kernel], the kernel's, begins at 0x80000000, and the HAL's kernel RAM begins at 0x7ff00000 (KERNEL_RAM_BASE)")
     // A kernel range running past root's base, the process range beginning
@@ -247,7 +247,7 @@ func main() {
            "{file}: [ram.ram] runs from 0x80200000 to 0x88001000, past the end of the HAL's RAM at 0x88000000 (RAM_TOP)")
     let short_ram = HalFacts(root_base: 0x8020_0000, root_top: 0x8024_0000, grain: 4,
                              console_base: 0x1000_0000, console_len: 0x1000,
-                             kernel_base: 0x8000_0000, ram_top: 0x87FF_F000)
+                             kernel_base: 0x8000_0000, ram_top: 0x87FF_F000, stack_len: 0x4000)
     expect(&virt, &profile, &short_ram,
            "{file}: [ram.ram] runs from 0x80200000 to 0x88000000, past the end of the HAL's RAM at 0x87fff000 (RAM_TOP)")
     expect(&virt_with("len = 0x7E0_0000", "len = 0x2_0000"), &profile, &facts,
@@ -258,7 +258,7 @@ func main() {
     let s3 = board_file("../../hal/xtensa-esp32s3", "board.toml", s3_text())
     let s3_facts = HalFacts(root_base: 0x3FCB_0000, root_top: 0x3FCC_8000, grain: 4,
                             console_base: 0x6000_0000, console_len: 0x1000, kernel_base: 0x3FC8_C000,
-                            ram_top: 0x3FCF_0000)
+                            ram_top: 0x3FCF_0000, stack_len: 0x4000)
     let layout = s3_flash("4194304", "1107296256", "1006632960", "33554432")
     let s3_file = "../../hal/xtensa-esp32s3/board.toml"
     expect(&s3, &s3_profile(s3_modules("clock-rom"), layout), &s3_facts, "")
@@ -285,16 +285,23 @@ func main() {
     let script = "../../hal/xtensa-esp32s3/kernel/esp32s3.ld"
     expect(&s3_with("base = 0x0\n", "base = 0x1000\n"), &s3_ok, &s3_facts,
            "{s3_file}: [flash] base is 0x1000, and the flash image starts at offset 0")
-    expect(&s3_with("root-slot = \{ base = 0x10_0000, len = 0x8_0000 \}", "root-slot = \{ base = 0x8_0000, len = 0x8_0000 \}"), &s3_ok, &s3_facts,
-           "{s3_file}: `root-slot` base is 0x80000, and {script} has ROOT_IMAGE_SLOT = 0x100000")
-    expect(&s3_with("root-slot = \{ base = 0x10_0000, len = 0x8_0000 \}", "root-slot = \{ base = 0x10_0000, len = 0x4_0000 \}"), &s3_ok, &s3_facts,
-           "{s3_file}: `root-slot` len is 0x40000, and {script} has IMAGE_SLOT_LEN = 0x80000")
-    expect(&s3_with("slots = \{ base = 0x18_0000, len = 0x8_0000, count = 1 \}", "slots = \{ base = 0x20_0000, len = 0x8_0000, count = 1 \}"), &s3_ok, &s3_facts,
-           "{s3_file}: `slots` base is 0x200000, and {script} has CHILD_IMAGE_SLOT = 0x180000")
-    expect(&s3_with("slots = \{ base = 0x18_0000, len = 0x8_0000, count = 1 \}", "slots = \{ base = 0x18_0000, len = 0x8_0000, count = 2 \}"), &s3_ok, &s3_facts,
-           "{s3_file}: `slots` holds 2 slots, and {script} places one child image (CHILD_IMAGE_SLOT)")
-    expect(&s3_with("slots = \{ base = 0x18_0000, len = 0x8_0000, count = 1 \}", "slots = \{ base = 0x18_0000, len = 0x4_0000, count = 1 \}"), &s3_ok, &s3_facts,
-           "{s3_file}: `slots` len is 0x40000, and {script} has IMAGE_SLOT_LEN = 0x80000")
+    // The slots are the profile's to agree with, not the script's: the
+    // builder writes them for each image.
+    let slots_differ = "{s3_file}: [flash] root-slot is 0x80000 bytes at 0x100000 and slots 4 in 0x80000 bytes at 0x180000; the profile's are "
+    expect(&s3, &s3_profile(s3_modules("clock-rom"), layout.replace("\"base\": 1048576", "\"base\": 524288")), &s3_facts,
+           "{slots_differ}0x80000 bytes at 0x80000 and 4 in 0x80000 bytes at 0x180000")
+    expect(&s3, &s3_profile(s3_modules("clock-rom"), layout.replace("\"len\": 524288\}, \"slots", "\"len\": 262144\}, \"slots")), &s3_facts,
+           "{slots_differ}0x40000 bytes at 0x100000 and 4 in 0x80000 bytes at 0x180000")
+    expect(&s3, &s3_profile(s3_modules("clock-rom"), layout.replace("\"base\": 1572864", "\"base\": 2097152")), &s3_facts,
+           "{slots_differ}0x80000 bytes at 0x100000 and 4 in 0x80000 bytes at 0x200000")
+    expect(&s3, &s3_profile(s3_modules("clock-rom"), layout.replace("\"len\": 524288, \"count", "\"len\": 262144, \"count")), &s3_facts,
+           "{slots_differ}0x80000 bytes at 0x100000 and 4 in 0x40000 bytes at 0x180000")
+    expect(&s3, &s3_profile(s3_modules("clock-rom"), layout.replace("\"count\": 4", "\"count\": 2")), &s3_facts,
+           "{slots_differ}0x80000 bytes at 0x100000 and 2 in 0x80000 bytes at 0x180000")
+    // The script's flash and bus numbers.
+    expect(&s3_with("len = 0x40_0000             # 4 MiB", "len = 0x80_0000"),
+           &s3_profile(s3_modules("clock-rom"), layout.replace("4194304", "8388608")), &s3_facts,
+           "{s3_file}: [flash] len is 0x800000, and {script} has FLASH_BYTES = 0x400000")
 
     // The riscv32 HAL, compiled: its numbers as read, and a board that
     // disagrees with them refused.
@@ -306,6 +313,7 @@ func main() {
            compiled.console_len == 0x1000, "riscv32's grain and console, as compiled")
     assert(compiled.kernel_base == 0x8000_0000 && compiled.ram_top == 0x8800_0000,
            "riscv32's RAM, as compiled")
+    assert(compiled.stack_len == 0x4000, "riscv32's stack, as compiled")
     expect(&virt, &profile, &compiled, "")
     expect(&virt_with("base = 0x8000_0000", "base = 0x7FFF_F000"), &profile, &compiled,
            "{file}: [ram.kernel], the kernel's, begins at 0x7ffff000, and the HAL's kernel RAM begins at 0x80000000 (KERNEL_RAM_BASE)")
@@ -324,14 +332,14 @@ func main() {
     try! ensure_directory(staging)
     var module = Vector<String>()
     try! module.push("@export(\"{facts_symbol()}\")")
-    try! module.push("static FACTS: [UInt; 8] = [1, 0, 0, 0, 0, 0, 0, 0]")
+    try! module.push("static FACTS: [UInt; 9] = [1, 0, 0, 0, 0, 0, 0, 0, 0]")
     try! write_lines("{staging}/v1.saw", &module)
     try! build_kernel(&profile, "{staging}/v1.saw", "{staging}/v1.o")
     let v1 = match read_hal_facts("{staging}/v1.o") {
         case Ok(_) -> "",
         case Err(e) -> e.message
     }
-    assert(v1.equals("{staging}/v1.o: `sosimage_hal_facts` is version 1; this builder reads version 2"), "another version: {v1}")
+    assert(v1.equals("{staging}/v1.o: `sosimage_hal_facts` is version 1; this builder reads version 3"), "another version: {v1}")
 
     // An image's limits over a board's defaults: totals become raises above
     // the floor, and a total below the floor is refused.

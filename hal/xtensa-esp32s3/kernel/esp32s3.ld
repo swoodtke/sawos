@@ -14,7 +14,7 @@
  * lays the image out in fixed parts of flash: first everything fetched as
  * instructions, with the load images of the vectors and of `.data`, which
  * `boot.S` copies out, all linked in the instruction window; then root's
- * image and a child's, each at the start of a slot of its own; then
+ * image and each child's, each at the start of a slot of its own; then
  * everything else read in place as data. Each part read as data is linked at
  * the data-bus address of its own flash bytes. Each section's load address is
  * its offset in the instruction window, which is where the runner writes it
@@ -26,9 +26,21 @@
  *   flash 0x00_0408  0x4200_0408  .entry    the ROM `callx8`s here
  *         ...                     .iram, .data load images; .text; a
  *                                 hand-assembled user payload
- *   flash 0x10_0000  0x3C10_0000  .rootimg  root's image (512 KiB slot)
- *   flash 0x18_0000  0x3C18_0000  .childimg a child's image (512 KiB slot)
- *   flash 0x20_0000  0x3C20_0000  .drom     .rodata, .regions
+ *   flash 0x10_0000  0x3C10_0000  .rootimg    root's image (512 KiB slot)
+ *   flash 0x18_0000  0x3C18_0000  .childimg0  child 0's image (128 KiB slot)
+ *         ...                     .childimg<i> child i's, slot i
+ *   flash 0x20_0000  0x3C20_0000  .drom       .rodata, .regions
+ *
+ * The slots are the board's (`../board.toml`'s `[flash]`), and this script
+ * does not state them: the image builder writes them for each image into
+ * `image_slots.ld`, which this script INCLUDEs twice, the symbols at the top
+ * and a section per child's slot in `SECTIONS` (`image_slot_sections.ld`),
+ * from the image's staging directory, where the linker is told to look
+ * (`tools/sosimage/src/layout.saw`). A slot is one of the board's `count`
+ * equal parts of its slot range, and child i takes slot i. `.drom` begins at
+ * the end of the board's slot range (`DROM_FLASH`), behind every slot, so it
+ * lies at one flash offset whatever the image's process count, and an image
+ * with fewer children than slots leaves the slots it does not use erased.
  *
  * The two load images that `boot.S` copies are read through their DBUS
  * aliases (`_iram_load`, `_data_load`), so the copy is a data load on the
@@ -38,7 +50,7 @@
  * instruction window (../ABI.md §1c, §3c). A hand-assembled payload stays in
  * IBUS because it executes in place, and so does a process's code: the image
  * links it at the instruction-window address of its own bytes in the slot
- * (`../user/root.ld`), and the loader uses it there.
+ * (`../user/user.ld`), and the loader uses it there.
  *
  * ---------------------------------------------------------------------------
  * SRAM
@@ -59,8 +71,9 @@
  * RAM, 0x3FCD_7E04 - 0x3FCE_FFFF, holds the stack the ROM enters on; it falls
  * in the process regions, which nothing touches until a process is loaded,
  * long after `_start` has left the ROM's stack. The process regions are not
- * set here: `../user/root.ld`, `../user/child.ld` and `lib.saw`
- * (`ROOT_LOAD_BASE`, `RAM_BASE`) own them.
+ * set here: the image builder places them in the range `lib.saw` bounds
+ * (`ROOT_LOAD_BASE` to `RAM_TOP`) and links each process for its own
+ * (`../user/user.ld`).
  *
  * The kernel's .data + .bss must fit `DRAM`. An overshoot is a link error
  * ("will not fit in region"), never a silent overlap; `ARENA_SIZE` and
@@ -96,15 +109,13 @@ FLASH_DBUS = 0x3C000000;
 FLASH_BYTES = 4M;
 
 /* The flash layout. The kernel's code and the load images `boot.S` copies
- * take flash from 0 up to root's slot. Each resident image has a fixed slot,
- * and its linker script links its code and read-only data for the slot's
- * address (`../user/root.ld`, `../user/child.ld` state the same two numbers),
- * so the loader uses them in place. The kernel's read-only data follows the
- * slots. */
-ROOT_IMAGE_SLOT = 0x100000;
-CHILD_IMAGE_SLOT = 0x180000;
-IMAGE_SLOT_LEN = 512K;
-DROM_FLASH = 0x200000;
+ * take flash from 0 up to root's slot. Each resident image has a slot of its
+ * own, and the builder links its code and read-only data for the slot's
+ * address (`../user/user.ld`), so the loader uses them in place. The slots
+ * and `DROM_FLASH`, where the kernel's read-only data follows them, are the
+ * image's `image_slots.ld`: `ROOT_IMAGE_SLOT`, `ROOT_IMAGE_SLOT_LEN` and
+ * `DROM_FLASH`. */
+INCLUDE image_slots.ld
 
 SECTIONS {
     /* The direct-boot magic, then the instruction the ROM enters at. */
@@ -166,7 +177,7 @@ SECTIONS {
     /* Root's image, at the start of its slot: the root sosimg is a data
      * `.payload`. Its code is linked at the slot's instruction-window address
      * plus the image's header and segment table and its read-only data right
-     * behind the code, so both are used in place (`../user/root.ld`). The end
+     * behind the code, so both are used in place (`../user/user.ld`). The end
      * is the image's own, so the kernel bounds it exactly. */
     .rootimg (FLASH_DBUS + ROOT_IMAGE_SLOT)
         : AT(FLASH_IBUS + ROOT_IMAGE_SLOT) {
@@ -175,12 +186,10 @@ SECTIONS {
         _payload_data_end = .;
     }
 
-    /* A child's image, at the start of its slot, the same way
-     * (`../user/child.ld`): the region table's first blob row names it. */
-    .childimg (FLASH_DBUS + CHILD_IMAGE_SLOT)
-        : AT(FLASH_IBUS + CHILD_IMAGE_SLOT) {
-        KEEP(*(.childimg))
-    }
+    /* Each child's image, at the start of its slot, the same way: a section
+     * `.childimg<i>` at slot i, holding the child's `.childimg.<i>`, with an
+     * ASSERT that it fits. The region table's blob rows name them. */
+    INCLUDE image_slot_sections.ld
 
     /* The kernel's read-only data and the boot region table. */
     .drom (FLASH_DBUS + DROM_FLASH) : AT(FLASH_IBUS + DROM_FLASH) {
@@ -245,12 +254,9 @@ ASSERT(_bss_start <= _sos_slabs_start && _sos_slabs_start <= _sos_slabs_end
 ASSERT(LOADADDR(.payload_code) + SIZEOF(.payload_code)
        <= FLASH_IBUS + ROOT_IMAGE_SLOT,
        "esp32s3.ld: the kernel's code runs into root's image slot")
-ASSERT(SIZEOF(.rootimg) <= IMAGE_SLOT_LEN,
+ASSERT(SIZEOF(.rootimg) <= ROOT_IMAGE_SLOT_LEN,
        "esp32s3.ld: root's image does not fit its slot")
-ASSERT(SIZEOF(.childimg) <= IMAGE_SLOT_LEN,
-       "esp32s3.ld: the child images do not fit the child's slot")
-ASSERT(ROOT_IMAGE_SLOT + IMAGE_SLOT_LEN <= CHILD_IMAGE_SLOT
-       && CHILD_IMAGE_SLOT + IMAGE_SLOT_LEN <= DROM_FLASH,
-       "esp32s3.ld: the image slots overlap")
+ASSERT(ROOT_IMAGE_SLOT + ROOT_IMAGE_SLOT_LEN <= DROM_FLASH,
+       "esp32s3.ld: root's slot runs into the kernel's read-only data")
 ASSERT(LOADADDR(.drom) + SIZEOF(.drom) <= FLASH_IBUS + FLASH_BYTES,
        "esp32s3.ld: the image does not fit the flash it is written to")

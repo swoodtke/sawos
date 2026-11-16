@@ -14,6 +14,15 @@ func join(lines: &Vector<String>) -> String {
 // An ESP32-S3 board with UART1 and UART2 beside the console, the devices a
 // useless box drives, and a slow range.
 func board() -> Board {
+    try! Board.parse(board_text(), "hal/xtensa-esp32s3/board.toml")
+}
+
+// `board()`'s file, with `old` replaced by `new`.
+func board_with(old: String, new: String) -> Board {
+    try! Board.parse(board_text().replace(old, new), "hal/xtensa-esp32s3/board.toml")
+}
+
+func board_text() -> String {
     let lines: Vector<String> = [
         "format = 1",
         "[board]",
@@ -89,7 +98,7 @@ func board() -> Board {
         "registers.PERIP_RST_EN0 = \{ offset = 0x020 \}",
         "[lines]",
         "reserved = [57]"]
-    try! Board.parse(join(&lines), "hal/xtensa-esp32s3/board.toml")
+    join(&lines)
 }
 
 func gpio_decl() -> Declaration {
@@ -380,6 +389,12 @@ func main() {
                         "i.toml: line 12, column 1: the process `driver` is named twice, here and at line 9, column 1")
     expect_read_refusal(with_line(service_lines(), 12, "name = \"root\""),
                         "i.toml: line 12, column 1: `root` is reserved and names no process: the stock root reports itself under it")
+    // Names that differ only by case would name one file on a volume that
+    // does not tell case apart: refused, `root`'s too.
+    expect_read_refusal(with_line(service_lines(), 12, "name = \"Driver\""),
+                        "i.toml: line 12, column 1: the process `Driver` differs from `driver`, at line 9, column 1, only by case: a process's name names its files, and a volume that does not tell case apart would make them one")
+    expect_read_refusal(with_line(service_lines(), 12, "name = \"Root\""),
+                        "i.toml: line 12, column 1: `Root` differs from `root`, which is reserved, only by case: root's own image is named for it, and a volume that does not tell case apart would make them one")
     expect_read_refusal(with_line(service_lines(), 12, "name = \"the client\""),
                         "i.toml: line 12, column 1: `the client` is not a name: a process's name is a letter, then letters, digits, `_` and `-`")
     expect_read_refusal(with_extra(service_lines(), "pools = [\"a\"]\n[[pool]]\nname = \"a\"\nlen = 0x1000\n[[pool]]\nname = \"a\"\nlen = 0x1000"),
@@ -459,6 +474,29 @@ func main() {
                         "i.toml: line 9, column 1: the board esp32s3 has 3 devices of the type `esp32s3-uart`: name the one the need `uart` of the process gps takes in `device`")
     expect_bind_refusal(with_line(logger_lines(), 11, "ram = \"psram\"\ndevice = \{ uart = \"UART1\" \}"), &ldecls,
                         "i.toml: line 9, column 1: the process gps declares ram = \"fast\" and is placed in psram, a slow range")
+
+    // Placement: the range an image names, else the board's default, and a
+    // fast range for a process that declares `ram = "fast"` on a board whose
+    // default is slow; with no fast process range it is refused.
+    let on_default = try! ImageFile.parse(join(&logger_lines()), "i.toml", &b, 4)
+    let placed_default = try! bind(&on_default, &b, &ldecls, 4)
+    assert(placed_default.ranges.join(" ").equals("sram sram sram"), "the default, fast")
+    let slow_default = board_with("process = \"sram\"", "process = \"psram\"")
+    let on_slow = try! ImageFile.parse(join(&logger_lines()), "i.toml", &slow_default, 4)
+    let placed_fast = try! bind(&on_slow, &slow_default, &ldecls, 4)
+    assert(placed_fast.ranges.join(" ").equals("sram sram psram"),
+           "the drivers in the fast range, the logger in the slow default: {placed_fast.ranges.join(" ")}")
+    let named = try! ImageFile.parse(with_line(logger_lines(), 20, "package = \"logger\"\nram = \"sram\""), "i.toml", &slow_default, 4)
+    let placed_named = try! bind(&named, &slow_default, &ldecls, 4)
+    assert(placed_named.ranges.join(" ").equals("sram sram sram"), "the range the image names")
+    let no_fast = board_with("[ram.sram]\nuse = \"process\"\nspeed = \"fast\"", "[ram.sram]\nuse = \"process\"\nspeed = \"slow\"")
+    let on_no_fast = try! ImageFile.parse(join(&logger_lines()), "i.toml", &no_fast, 4)
+    let unplaced = match bind(&on_no_fast, &no_fast, &ldecls, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(unplaced.equals("i.toml: line 9, column 1: the process gps declares ram = \"fast\", and the board esp32s3 has no fast process range: its default, sram, is slow"),
+           "no fast range: {unplaced}")
 
     // Clients and memory records.
     expect_bind_refusal(with_line(box_lines(), 29, "clients = \{ switch = \"gpio.gpio\" \}"), &decls,

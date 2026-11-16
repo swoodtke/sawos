@@ -10,6 +10,10 @@
 //!         it then writes the flash image and prints
 //!         `flash used=USED end=END`, the bytes the ELF placed in it and the
 //!         offset one past the last of them
+//!     sosimage package PROFILE PROCESS
+//!         builds the package the process description PROCESS names, linked
+//!         for the placement it states, through a script the builder writes
+//!         (`sosimage.package`), and prints `image PATH`, the image it made
 //!     sosimage slabs KERNEL
 //!         prints what the kernel object KERNEL says an image's limits are
 //!         sized and checked against (`sosimage.kernel`): for each slab kind
@@ -35,10 +39,11 @@
 //!         SAWOS is the sawos tree, which holds the boards and every `sawos:`
 //!         path, and PRODUCT the directory the image's other paths are from;
 //!         for a flash board it prints `flash used=USED end=END` as `link`
-//!         does
+//!         does, and a line with each process's and each pool's addresses
 //!
-//! PROFILE, and the IMAGE `link` reads, are JSON files: `sosimage.profile` and
-//! `sosimage.image` state their schemas. A board description, a process
+//! PROFILE, the IMAGE `link` reads and the PROCESS `package` reads are JSON
+//! files: `sosimage.profile`, `sosimage.image` and `sosimage.package` state
+//! their schemas. A board description, a process
 //! declaration and a hand-written image are TOML: `sosimage.board`,
 //! `sosimage.declaration` and `sosimage.imagefile` state theirs. A failure
 //! prints `error: ` and its reason on standard output and exits 1.
@@ -47,6 +52,7 @@ import std.env.{Env}
 import sosimage.board.{Board}
 import sosimage.boardcheck.{check_board, hal_facts}
 import sosimage.build.{build_kernel, build_native, link}
+import sosimage.package.{ProcessSpec, build_process}
 import sosimage.product.{board_defaults, build_image}
 import sosimage.failure.{BuildError}
 import sosimage.image.{ImageSpec}
@@ -104,6 +110,14 @@ func run() -> Result<Void, BuildError> {
         }
         return
     }
+    if command.equals("package") && args.len() == 4 {
+        let profile = try load_profile(args.get(2) ?? "")
+        let path = args.get(3) ?? ""
+        let spec = try ProcessSpec.parse(try read_text(path), path)
+        let built = try build_process(&profile, spec.name, spec.package, spec.out, &spec.placement)
+        print("image {built.image}")
+        return
+    }
     if command.equals("board") && args.len() == 6 {
         let profile = try load_profile(args.get(2) ?? "")
         let path = args.get(4) ?? ""
@@ -132,7 +146,7 @@ func run() -> Result<Void, BuildError> {
         }
         return
     }
-    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | slabs KERNEL | board PROFILE SAWOS BOARD STAGING | defaults KERNEL BOARD | build PROFILE SAWOS PRODUCT IMAGE OUT")
+    return BuildError(message: "usage: sosimage native PROFILE | kernel PROFILE ENTRY OUTPUT | link PROFILE IMAGE | package PROFILE PROCESS | slabs KERNEL | board PROFILE SAWOS BOARD STAGING | defaults KERNEL BOARD | build PROFILE SAWOS PRODUCT IMAGE OUT")
 }
 
 func load_profile(path: String) -> Result<Profile, BuildError> {

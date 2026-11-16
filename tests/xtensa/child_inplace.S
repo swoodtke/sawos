@@ -1,8 +1,9 @@
 /* Fixture: a child image used in place, as a case's first child blob.
  *
  * The riscv32 twin's image on this board. The runner links this object in
- * place of a Blade-built child (a case's `child_asm`), so `.childimg` puts it
- * at the start of the child's flash slot, read through the data window, and
+ * place of a Blade-built child (a case's `child_asm`), so `.childimg.0`, child
+ * 0's section, puts it at the start of child 0's flash slot, read through the
+ * data window, and
  * the region table's first blob row names `_sos_child0_start` and
  * `_sos_child0_len`. The header and one R+X segment come first, the segment
  * linked at the instruction-window address of its own bytes, so the loader
@@ -37,7 +38,7 @@
     .equ OP_EXIT,         2                 /* ProcessOp.Exit              */
     .equ KEEP_ALL,        -1
 
-    .section .childimg, "a", @progbits
+    .section .childimg.0, "a", @progbits
     .balign 16
     .globl _sos_child0_start
     .globl _sos_child0_end

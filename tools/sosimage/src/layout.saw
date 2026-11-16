@@ -1,0 +1,276 @@
+//! Where each process of an image is linked, and the scripts that link it.
+//!
+//! A process is linked for a placement: its region, with its stack at the
+//! region's top, and on an in-place board its flash slot. The region holds
+//! what the loader places in RAM: every segment on a board that copies or
+//! translates an image, the writable one on a board that runs it in place.
+//! The board's one user script (`hal/<board>/user/user.ld`) names no address;
+//! it reads the placement from symbols that a script of the process's own
+//! assigns before it INCLUDEs the script the package's manifest names
+//! (`process_script`).
+//!
+//! A test image's placements are the runner's. A hand-written image's are the
+//! builder's (`place`, used by `sosimage.product`):
+//!
+//! - root's region is the HAL's (`ROOT_LOAD_BASE` to `ROOT_REGION_TOP`) and
+//!   root's slot the board's `root-slot`;
+//! - each other process's region is the RAM its image takes, measured by a
+//!   first link (`ram_span`), rounded up to `region_align` with the stack
+//!   added; the regions follow one another in image order inside each
+//!   process's range, after root's region in the range that holds it and from
+//!   the range's base in any other, each range budgeted on its own, and the
+//!   pools follow the processes;
+//! - process `i`'s slot is the board's slot `i`: `count` slots of equal length
+//!   from the slot range's base (`child_slots`).
+//!
+//! On an in-place board the kernel's script INCLUDEs `image_slots.ld`, which
+//! the builder writes for each image (`image_slots`): root's slot, a section
+//! for each child's slot, and `DROM_FLASH`, where the kernel's read-only data
+//! goes, the end of the board's slot range, so it lies behind every slot
+//! whatever the image's process count.
+
+import sosimage.board.{Board, Span}
+import sosimage.failure.{BuildError}
+import sosimage.flash.{LoadSegment}
+import sosimage.hex.{hex}
+import sosimage.rules.{refused}
+import toml.{TomlPosition}
+
+/// The least alignment of a region: a stack pointer's on every board.
+static STACK_ALIGN: UInt64 = 16
+/// The page the linker lays an image's segments out by.
+static PAGE: UInt64 = 0x1000
+
+/// Where one process is linked.
+public struct Placement {
+    /// Its region, its stack included.
+    region: Span
+    /// The stack at the region's top.
+    stack: UInt64
+    /// Its flash slot, on an in-place board; `None` on any other.
+    slot: Span?
+}
+
+/// What one process or pool asks of a RAM range.
+public struct Ask {
+    name: String
+    /// The range's name.
+    range: String
+    /// A process's measured RAM, before rounding and the stack; a pool's
+    /// length.
+    bytes: UInt64
+    /// A pool, whose region carries no stack and is exactly its length.
+    pool: Bool
+    at: TomlPosition
+}
+
+/// A region's alignment on a board whose protection grain is `grain` and
+/// whose `placement` is the board's: the grain, or a stack pointer's
+/// alignment where that is coarser, and a page on a board that copies an
+/// image. There a region begins with the code, and below code that does not
+/// begin a page the linker loads the image's ELF headers, a fourth segment
+/// outside the region.
+public func region_align(grain: UInt64, placement: String) -> UInt64 {
+    var align = if grain > STACK_ALIGN { grain } else { STACK_ALIGN }
+    if placement.equals("copied") && align < PAGE {
+        align = PAGE
+    }
+    align
+}
+
+/// `value` rounded up to a multiple of `align`.
+public func round_up(value: UInt64, align: UInt64) -> UInt64 {
+    (value + align - 1) / align * align
+}
+
+/// The range a process is placed in: the one the image names, or the board's
+/// default; for a process that declares `ram = "fast"` and names none, the
+/// first fast process range in the board's file when the default is slow.
+/// With no fast process range on the board, such a process is refused by
+/// name. (A fast process the image places in a slow range is `bind`'s
+/// refusal.)
+public func choose_range(board: &Board, named: String, fast: Bool, process: String,
+                         file: String, at: TomlPosition) -> Result<String, BuildError> {
+    if not named.is_empty() {
+        return named
+    }
+    guard let default_range = board.range(board.default_process) else {
+        return BuildError(message: "{file}: internal: the board's default process range vanished")
+    }
+    if not fast || default_range.fast {
+        return default_range.name
+    }
+    var i = 0
+    while i < board.ram.len() {
+        let r = board.ram.get(i)!
+        i = i + 1
+        if not r.kernel && r.fast {
+            return r.name
+        }
+    }
+    return refused(file, at, "the process {process} declares ram = \"fast\", and the board {board.name} has no fast process range: its default, {default_range.name}, is slow")
+}
+
+/// The RAM a linked image takes, from its `segments`: the span from the
+/// first to the end of the last of those the loader places in RAM, every one
+/// on a board whose `placement` is `copied` or `translated`, the writable
+/// ones on an `in-place` board. An image with none of them is refused.
+public func ram_span(segments: &Vector<LoadSegment>, placement: String,
+                     what: String) -> Result<UInt64, BuildError> {
+    let writable_only = placement.equals("in-place")
+    var first: UInt64 = 0
+    var last: UInt64 = 0
+    var any = false
+    var i = 0
+    while i < segments.len() {
+        let s = segments.get(i)!
+        i = i + 1
+        if writable_only && not s.writable {
+            continue
+        }
+        if not any || s.vaddr < first {
+            first = s.vaddr
+        }
+        if not any || s.vaddr + s.memsz > last {
+            last = s.vaddr + s.memsz
+        }
+        any = true
+    }
+    if not any {
+        return BuildError(message: "{what} has no segment the loader places in RAM")
+    }
+    return last - first
+}
+
+/// Places each of `asks`, in order, in its range of `board`: a process's
+/// region is `bytes` rounded up to `align`, with `stack` added; a pool's is
+/// its `bytes`. Each region starts on `align`, after `root` in the range that
+/// holds it and from the range's base in any other, and follows the one
+/// before it in its range. One that runs past its range is refused, naming
+/// the process or the pool and the range.
+public func place(board: &Board, root: Span, align: UInt64, stack: UInt64,
+                  asks: &Vector<Ask>, file: String) -> Result<Vector<Span>, BuildError> {
+    var names = Vector<String>()
+    var cursors = Vector<UInt64>()
+    var out = Vector<Span>()
+    var a = 0
+    while a < asks.len() {
+        let ask = asks.get(a)!
+        a = a + 1
+        guard let r = board.range(ask.range) else {
+            return refused(file, ask.at, "`{ask.range}` names no RAM range of the board {board.name}")
+        }
+        var k = 0
+        while k < names.len() && not (names.get(k) ?? "").equals(r.name) {
+            k = k + 1
+        }
+        if k == names.len() {
+            try! names.push(r.name)
+            try! cursors.push(range_start(root, r.base, r.len))
+        }
+        let base = round_up(cursors.get(k) ?? 0, align)
+        let len = if ask.pool { ask.bytes } else { round_up(ask.bytes, align) + stack }
+        let end = r.base + r.len
+        if base > end || len > end - base {
+            let what = if ask.pool { "the pool {ask.name}" } else { "the process {ask.name}'s region" }
+            return refused(file, ask.at, "{what}, {hex(len)} bytes at {hex(base)}, runs past the board's {r.name} range, which ends at {hex(end)}")
+        }
+        cursors[k] = base + len
+        try! out.push(Span(base: base, len: len))
+    }
+    return move out
+}
+
+/// Where a process is linked first, to be measured: at the start of its
+/// range `range` (after `root` in the range that holds it, from its base in
+/// any other), the rest of the range its region, with `slot`. A range with no
+/// room left at that start is refused, naming the process and the range.
+public func first_placement(board: &Board, root: Span, align: UInt64, stack: UInt64,
+                            range: String, slot: Span?, process: String, file: String,
+                            at: TomlPosition) -> Result<Placement, BuildError> {
+    guard let r = board.range(range) else {
+        return refused(file, at, "`{range}` names no RAM range of the board {board.name}")
+    }
+    let end = r.base + r.len
+    let start = round_up(range_start(root, r.base, r.len), align)
+    if start >= end || end - start <= stack {
+        return refused(file, at, "the process {process}'s region would start at {hex(start)}, and the board's {r.name} range ends at {hex(end)}: no room is left for it")
+    }
+    return Placement(region: Span(base: start, len: end - start), stack: stack, slot: slot)
+}
+
+/// Where the first region of a range from `base` for `len` bytes starts: at
+/// the end of `root` when the range holds it, at its base otherwise.
+func range_start(root: Span, base: UInt64, len: UInt64) -> UInt64 {
+    if root.base >= base && root.base + root.len <= base + len {
+        return root.base + root.len
+    }
+    base
+}
+
+/// The slots of an image's `children` other processes, in a slot range
+/// `slots` of `count` equal slots: child `i` takes slot `i`. More children
+/// than slots is refused, `what` naming the image.
+public func child_slots(slots: Span, count: Int, children: Int,
+                        what: String) -> Result<Vector<Span>, BuildError> {
+    if children > count {
+        return BuildError(message: "{what} has {children} processes besides root, and the board's flash has {count} slots for them")
+    }
+    let len = slots.len / (count as UInt64)
+    var out = Vector<Span>()
+    var i = 0
+    while i < children {
+        try! out.push(Span(base: slots.base + (i as UInt64) * len, len: len))
+        i = i + 1
+    }
+    move out
+}
+
+/// The script process `name` is linked through: the symbols the board's user
+/// script reads, from `p`, then an INCLUDE of `include`, the script the
+/// package's manifest names, by its absolute path.
+public func process_script(name: String, p: &Placement,
+                           include: String) -> Result<Vector<String>, BuildError> {
+    if include.contains("\"") || include.contains("\n") {
+        return BuildError(message: "the script {include} cannot be named in an INCLUDE")
+    }
+    var lines = Vector<String>()
+    try! lines.push("/* Generated by sosimage: where the process {name} is linked. */")
+    try! lines.push("SOS_REGION_BASE = {hex(p.region.base)};")
+    try! lines.push("SOS_REGION_LEN = {hex(p.region.len)};")
+    try! lines.push("SOS_STACK_LEN = {hex(p.stack)};")
+    if let slot = p.slot {
+        try! lines.push("SOS_SLOT_BASE = {hex(slot.base)};")
+        try! lines.push("SOS_SLOT_LEN = {hex(slot.len)};")
+    }
+    try! lines.push("INCLUDE \"{include}\"")
+    return move lines
+}
+
+/// The two files the kernel's script of an in-place board INCLUDEs, for an
+/// image whose root has `root` and whose children have `children`: first
+/// `image_slots.ld`, the symbols (`ROOT_IMAGE_SLOT`, `ROOT_IMAGE_SLOT_LEN`,
+/// `DROM_FLASH`, `drom`); then `image_slot_sections.ld`, an output section
+/// per child at its slot, in flash's data window and loaded at its
+/// instruction-window address, which takes the child's `.childimg.<i>`, and
+/// an ASSERT that it fits.
+public func image_slots(root: Span, children: &Vector<Span>,
+                        drom: UInt64) -> (Vector<String>, Vector<String>) {
+    var symbols = Vector<String>()
+    try! symbols.push("/* Generated by sosimage: the image's flash slots. */")
+    try! symbols.push("ROOT_IMAGE_SLOT = {hex(root.base)};")
+    try! symbols.push("ROOT_IMAGE_SLOT_LEN = {hex(root.len)};")
+    try! symbols.push("DROM_FLASH = {hex(drom)};")
+    var sections = Vector<String>()
+    try! sections.push("/* Generated by sosimage: each child's image at its flash slot. */")
+    var i = 0
+    while i < children.len() {
+        let slot = children.get(i)!
+        try! sections.push("    .childimg{i} (FLASH_DBUS + {hex(slot.base)}) : AT(FLASH_IBUS + {hex(slot.base)}) \{")
+        try! sections.push("        KEEP(*(.childimg.{i}))")
+        try! sections.push("    \}")
+        try! sections.push("    ASSERT(SIZEOF(.childimg{i}) <= {hex(slot.len)}, \"image_slot_sections.ld: child {i}'s image does not fit its slot\")")
+        i = i + 1
+    }
+    (move symbols, move sections)
+}

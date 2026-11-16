@@ -1,29 +1,21 @@
-/* SOS child process linker script: riscv32, ESP32-C3 board.
+/* SOS process linker script: riscv32, ESP32-C3 board.
  *
- * Same section layout as hal/riscv32/user/child.ld; only the addresses differ,
- * to fit the C3's SRAM budget (see ../kernel/esp32c3.ld). Keep the pair in
- * step.
+ * The same section layout as hal/riscv32/user/user.ld, which says how the
+ * image builder links each process through it: a script of the process's own
+ * assigns `SOS_REGION_BASE`, `SOS_REGION_LEN` and `SOS_STACK_LEN` and then
+ * INCLUDEs this one. Keep the pair in step.
  *
- * This is root's script with a different base and region size. Under the PMP
- * no-translation contract every process shares one physical address space
- * (spec §5.5), so two images cannot both be linked at `ROOT_LOAD_BASE`. Each
- * child is linked at a distinct base assigned in the build's config, and
- * `process_create` validates every segment against the destination region
- * root hands it.
+ * Processes are copied into SRAM and run at the addresses they are linked
+ * for, so each resident image is linked for its own region. Root's is the
+ * HAL's (`ROOT_LOAD_BASE` to `ROOT_REGION_TOP`, ../kernel/lib.saw). The region
+ * is small on this part (../kernel/esp32c3.ld says why), and its LENGTH stops
+ * at the stack bottom, so an image too big for it is a link error.
  *
- *   0x403C_5000  CHILD_LOAD_BASE  - one region above root's, and the base of
- *                the free-RAM row the harness's region table publishes
- *   0x403D_8000  stack bottom     - the kernel grants this RW separately
- *   0x403D_C000  CHILD_REGION_TOP - initial sp (92 KiB region, 16 KiB stack)
- *
- * The base equals `ROOT_REGION_TOP`. Don't rely on that: it is only the
- * simplest assignment disjoint from root's region. A second child would need a
- * base of its own, assigned in the config rather than in this file.
- *
- * LENGTH stops exactly at the stack bottom, so the linker cannot place data
- * where the stack will live. Sections are grouped so the image needs few
- * loadable segments, for the reason root's script gives: each costs a PMP
- * region, and a context switch reloads one process's rows at a time.
+ * Sections are grouped so the image needs few loadable segments: each costs a
+ * PMP region, and the budget is small. Three load: code (R+X), read-only data
+ * (R) and writable data (R+W). Read-only data is not in the executable segment
+ * because a system call's buffer may not lie in memory the process can
+ * execute, and a string literal is a buffer.
  */
 
 OUTPUT_ARCH(riscv)
@@ -48,17 +40,18 @@ ENTRY(_start)
 PROVIDE(ARENA_SIZE = 64K);
 
 MEMORY {
-    CHILD (rwxa) : ORIGIN = 0x403C5000, LENGTH = 76K
+    REGION (rwxa) : ORIGIN = SOS_REGION_BASE, LENGTH = SOS_REGION_LEN - SOS_STACK_LEN
 }
 
 SECTIONS {
-    . = 0x403C5000;
+    . = SOS_REGION_BASE;
 
-    /* Code: one R+X segment. */
+    /* Code: one R+X segment. `_text_end` is the first address past it. */
     .text : {
         *(.text .text.*)
         . = ALIGN(4);
-    } > CHILD
+        _text_end = .;
+    } > REGION
 
     /* Read-only data: a segment of its own, readable and neither
      * writable nor executable, so a string literal is no part of
@@ -67,7 +60,7 @@ SECTIONS {
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
         . = ALIGN(4);
-    } > CHILD
+    } > REGION
 
     /* Writable data + zero-init: one R+W segment. `.bss` is NOLOAD, so its
      * bytes are not in the image: the sosimg segment's mem_len exceeds its
@@ -76,7 +69,7 @@ SECTIONS {
         *(.data .data.*)
         *(.sdata .sdata.*)
         . = ALIGN(4);
-    } > CHILD
+    } > REGION
 
     .bss (NOLOAD) : {
         *(.sbss .sbss.*)
@@ -87,7 +80,7 @@ SECTIONS {
         . = . + ARENA_SIZE;
         _arena_end = .;
         . = ALIGN(16);
-    } > CHILD
+    } > REGION
 
     /DISCARD/ : {
         *(.riscv.attributes)

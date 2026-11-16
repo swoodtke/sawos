@@ -20,8 +20,9 @@
  *   0x8023_C000  root stack bottom
  *   0x8024_0000  root region top (256 KiB region, 16 KiB stack)
  *
- * The root numbers are not set here: root.ld and the HAL's `lib.saw`
- * (`ROOT_LOAD_BASE`, `ROOT_REGION_TOP`) own them, and the kernel validates
+ * The root numbers are not set here: the HAL's `lib.saw` (`ROOT_LOAD_BASE`,
+ * `ROOT_REGION_TOP`) owns them, the image builder links root for them
+ * through `../user/user.ld`, and the kernel validates
  * every segment against the region before placing it. They are recorded here
  * because this file fixes the kernel side of the map.
  *
@@ -66,7 +67,7 @@ ENTRY(_start)
  *
  * ARENA_SIZE: `sosrt`'s bump-allocator region, the storage behind
  *   `__saw_rt_alloc`. `PROVIDE`d rather than assigned because the user scripts
- *   let a package override it (see `hal/riscv32/user/root.ld`); nothing
+ *   let a package override it (see `hal/riscv32/user/user.ld`); nothing
  *   overrides the kernel's.
  *
  * KERNEL_STACK_SIZE: the boot stack `boot.S` sets `sp` to and `trap.S` reloads

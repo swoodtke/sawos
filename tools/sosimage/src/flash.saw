@@ -22,6 +22,13 @@ static ESPTOOL_HEADER_BYTE: UInt = 0xE9
 // says which layout the rest is; the ELF64 names carry a `64`.
 static ELF_CLASS: Int = 4
 static ELFCLASS64: UInt = 2
+static ELF64_PHOFF: Int = 32
+static ELF64_PHNUM: Int = 56
+static ELF64_PHDR_BYTES: Int = 56
+// An ELF64 program header's fields: its flags lead, its words are 8 bytes.
+static PH64_FLAGS: Int = 4
+static PH64_VADDR: Int = 16
+static PH64_MEMSZ: Int = 40
 static ELF64_SHOFF: Int = 40
 static ELF64_SHENTSIZE: Int = 58
 static ELF64_SHNUM: Int = 60
@@ -44,7 +51,12 @@ static ELF32_PHDR_BYTES: Int = 32
 static PH_TYPE: Int = 0
 static PH_OFFSET: Int = 4
 static PH_PADDR: Int = 12
+static PH_VADDR: Int = 8
 static PH_FILESZ: Int = 16
+static PH_MEMSZ: Int = 20
+static PH_FLAGS: Int = 24
+/// A program header's writable flag.
+static PF_W: UInt = 2
 static SH_TYPE: Int = 4
 static SH_OFFSET: Int = 16
 static SH_SIZE: Int = 20
@@ -175,6 +187,42 @@ public func elf_symbols(elf: &Data, what: String) -> Result<Map<String, UInt>, B
         i = i + 1
     }
     return move symbols
+}
+
+/// One loadable segment of a linked ELF: where it is linked, how many bytes
+/// it takes there, and whether it is writable.
+public struct LoadSegment {
+    vaddr: UInt64
+    memsz: UInt64
+    writable: Bool
+}
+
+/// Every loadable segment of `elf`, an ELF32 or an ELF64, little-endian, in
+/// program-header order; `what` names it in messages.
+public func load_segments(elf: &Data, what: String) -> Result<Vector<LoadSegment>, BuildError> {
+    let wide = (try elf.field(ELF_CLASS, 1, what)) == ELFCLASS64
+    let phoff = if wide { try elf.field(ELF64_PHOFF, 8, what) as Int } else { try elf.field(ELF32_PHOFF, 4, what) as Int }
+    let phnum = try elf.field(if wide { ELF64_PHNUM } else { ELF32_PHNUM }, 2, what) as Int
+    let entry = if wide { ELF64_PHDR_BYTES } else { ELF32_PHDR_BYTES }
+    let word = if wide { 8 } else { 4 }
+    var out = Vector<LoadSegment>()
+    var i = 0
+    while i < phnum {
+        let ph = phoff + entry * i
+        i = i + 1
+        if (try elf.field(ph + PH_TYPE, 4, what)) != PT_LOAD {
+            continue
+        }
+        let flags_at = if wide { PH64_FLAGS } else { PH_FLAGS }
+        let vaddr_at = if wide { PH64_VADDR } else { PH_VADDR }
+        let memsz_at = if wide { PH64_MEMSZ } else { PH_MEMSZ }
+        let flags = try elf.field(ph + flags_at, 4, what)
+        let vaddr = try elf.field(ph + vaddr_at, word, what)
+        let memsz = try elf.field(ph + memsz_at, word, what)
+        try! out.push(LoadSegment(vaddr: vaddr as UInt64, memsz: memsz as UInt64,
+                                  writable: (flags & PF_W) != 0))
+    }
+    return move out
 }
 
 /// What `flash_image` made: the image, how many bytes of it the ELF placed,

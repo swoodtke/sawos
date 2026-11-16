@@ -9,22 +9,20 @@ That file is `hal/riscv32-common/user/syscall.c`. It names the ISA's syscall
 instruction and the ABI's registers and nothing about a board, so it is one
 copy for every riscv32 board and every root and child manifest points at that
 path whichever board it targets. This document is the seam it implements. What
-is in this directory is the QEMU `virt` board's own user-side linker scripts
-(`root.ld`, `child.ld`, `child2.ld`, `child3.ld`), which differ per board
-because the load addresses do.
+is in this directory is the QEMU `virt` board's own user-side linker script,
+`user.ld`, which names no address: the image builder links each process
+through a script of its own that assigns the process's region and then
+INCLUDEs it (`tools/sosimage/src/layout.saw`).
 
-There are four scripts, and the count is a property of the tier. This profile
-does not translate, so a user address is its physical address and two resident
-images cannot share a base — each process must be linked where its own frames
-are, and a script per resident child is the cost of the tier. Root plus three
-children alive at once takes four scripts. The arm64 board has one `user.ld`,
-because there the kernel places each image's frames under a canonical virtual
-base and another child costs no file at all. The riscv Sv32 climb is
-deliberately not taken, so that this board keeps giving §5.5's original answer
-("an address is the same number in every process"); §5.5 scopes that answer to
-the tiers that keep it. The two directories side by side are the tier split:
-four scripts here and growing with the process count, one there whatever the
-count.
+This profile does not translate, so a user address is its physical address
+and two resident images cannot share a base: each process must be linked
+where its own frames are, and the builder links each resident image for its
+own region, which is the cost of the tier. The arm64 board's `user.ld` links
+every image at one base, because there the kernel places each image's frames
+under a canonical virtual base. The riscv Sv32 climb is deliberately not
+taken, so that this board keeps giving §5.5's original answer ("an address is
+the same number in every process"); §5.5 scopes that answer to the tiers that
+keep it.
 
 The other symbols a process needs — `sos_rt_write` and `sos_rt_abort`, and the
 System handle's parking — name no architecture: a byte reaches the console

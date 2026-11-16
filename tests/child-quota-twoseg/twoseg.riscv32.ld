@@ -1,4 +1,4 @@
-/* `hal/riscv32/user/child.ld` with `.rodata` folded into `.text`, so the
+/* `hal/riscv32/user/user.ld` with `.rodata` folded into `.text`, so the
  * image has two loadable segments (RX, RW) where every other test image has
  * three, and spends one grant row fewer. `quota_set_rows_child` needs a child
  * whose free rows differ from its launcher's. */
@@ -9,11 +9,11 @@ ENTRY(_start)
 PROVIDE(ARENA_SIZE = 64K);
 
 MEMORY {
-    CHILD (rwxa) : ORIGIN = 0x80240000, LENGTH = 240K
+    CHILD (rwxa) : ORIGIN = SOS_REGION_BASE, LENGTH = SOS_REGION_LEN - SOS_STACK_LEN
 }
 
 SECTIONS {
-    . = 0x80240000;
+    . = SOS_REGION_BASE;
 
     .text : {
         *(.text .text.*)

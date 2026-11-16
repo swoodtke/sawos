@@ -16,6 +16,7 @@
 //!       "module_paths": ["kcore=/path/to/kernel/core", "hal=/path/to/..."],
 //!       "native": [{"source": "/path/to/boot.S", "object": "/path/to/boot.o"}],
 //!       "linker_script": "/path/to/virt.ld",
+//!       "blade": "/path/to/blade",
 //!       "flash": {...}
 //!     }
 //!
@@ -28,17 +29,23 @@
 //! - `module_paths` are sawc's `--module-path` values for a kernel entry.
 //! - `native` lists the kernel's native units, each compiled to its object:
 //!   a `.S` unit is assembled, a `.c` unit compiled freestanding at `-O2`.
+//! - `blade` is the Blade binary that builds a process's package
+//!   (`sosimage.package`), run with this process's environment, which names
+//!   the compiler and the tools Blade drives.
 //! - `flash` is present for a board that boots a flash image built from the
 //!   linked ELF (`sosimage.flash`); its keys are `bytes` (the flash's size),
 //!   `instruction_window` and `data_window` (where the flash is mapped for
 //!   fetches and for loads), `window_bytes` (how much each window maps),
 //!   `magic_offset` and `magic` (the direct-boot word, which the mask ROM
-//!   reads twice at that offset).
+//!   reads twice at that offset), `root_slot` (`base` and `len`: the flash
+//!   root's image takes) and `slots` (`base`, `len` and `count`: the range the
+//!   other processes' images take, `count` slots of equal length).
 //!
 //! Every path is absolute, and every key is required but `kernel_c_args`,
-//! `features`, `native` and `flash`. An unknown key is refused.
+//! `features`, `native`, `blade` and `flash`. An unknown key is refused.
 
 import std.json.{JsonValue}
+import sosimage.board.{Span}
 import sosimage.failure.{BuildError}
 import sosimage.fields.{Fields}
 
@@ -58,6 +65,9 @@ public struct FlashLayout {
     window_bytes: UInt64
     magic_offset: UInt64
     magic: UInt64
+    root_slot: Span
+    slots: Span
+    slot_count: Int
 }
 
 public struct Profile {
@@ -72,6 +82,8 @@ public struct Profile {
     module_paths: Vector<String>
     native: Vector<NativeUnit>
     linker_script: String
+    /// The Blade binary, or "" for a profile that builds no package.
+    blade: String
     flash: FlashLayout?
 }
 
@@ -115,16 +127,33 @@ extension Profile {
             i = i + 1
         }
         let linker_script = try top.text("linker_script")
+        let blade = try top.text_or("blade", "")
         var flash: FlashLayout? = None
         if var f = try top.object("flash", "the profile's `flash`") {
-            flash = FlashLayout(
-                bytes: try f.word("bytes"),
-                instruction_window: try f.word("instruction_window"),
-                data_window: try f.word("data_window"),
-                window_bytes: try f.word("window_bytes"),
-                magic_offset: try f.word("magic_offset"),
-                magic: try f.word("magic"),
-            )
+            let bytes = try f.word("bytes")
+            let instruction_window = try f.word("instruction_window")
+            let data_window = try f.word("data_window")
+            let window_bytes = try f.word("window_bytes")
+            let magic_offset = try f.word("magic_offset")
+            let magic = try f.word("magic")
+            guard var r = try f.object("root_slot", "the profile's `flash.root_slot`") else {
+                return BuildError(message: "the profile {origin}: `flash` has no `root_slot`")
+            }
+            let root_slot = Span(base: try r.word("base"), len: try r.word("len"))
+            try r.finish()
+            guard var s = try f.object("slots", "the profile's `flash.slots`") else {
+                return BuildError(message: "the profile {origin}: `flash` has no `slots`")
+            }
+            let slots = Span(base: try s.word("base"), len: try s.word("len"))
+            let slot_count = try s.integer("count")
+            try s.finish()
+            if slot_count < 1 || slots.len % (slot_count as UInt64) != 0 {
+                return BuildError(message: "the profile {origin}: `flash.slots` is {slots.len} bytes in {slot_count} slots: at least one slot, each the same length")
+            }
+            flash = FlashLayout(bytes: bytes, instruction_window: instruction_window,
+                                data_window: data_window, window_bytes: window_bytes,
+                                magic_offset: magic_offset, magic: magic,
+                                root_slot: root_slot, slots: slots, slot_count: slot_count)
             try f.finish()
         }
         try top.finish()
@@ -132,7 +161,7 @@ extension Profile {
                        clang: clang, lld: lld, cc_args: move cc_args,
                        kernel_c_args: move kernel_c_args, features: features,
                        module_paths: move module_paths, native: move native,
-                       linker_script: linker_script, flash: flash)
+                       linker_script: linker_script, blade: blade, flash: flash)
     }
 
     /// The start of every clang command line for this target.

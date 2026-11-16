@@ -5,10 +5,12 @@
  * process is current, and the kernel maps each image's frames at this one
  * canonical base:
  *
- *   0x4020_0000  hal.USER_IMAGE_BASE  segments are linked from here
- *   0x4023_C000  stack bottom         the kernel grants this RW separately
- *   0x4024_0000  region top           initial sp, and the floor the kernel
- *                                     places mappings above
+ *   0x4020_0000           segments are linked from here (hal.USER_IMAGE_BASE)
+ *   region top - stack    stack bottom: the kernel grants this RW separately
+ *   region top            initial sp, and the floor the kernel places
+ *                         mappings above
+ *
+ * where the region top is the base plus the process's region length.
  *
  * Where the bytes actually go is not written here: the kernel copies each
  * segment to a frame in the destination region it was handed (root's is
@@ -17,10 +19,13 @@
  * frames. `hal.image_link_base` answers "linked where"; this file is its arm64
  * answer written in the other language.
  *
- * LENGTH is 240K so the image stops exactly at the stack bottom, which keeps
- * the linker from placing data where the stack will live. Every process's
- * region is the same 256 KiB on this board (the child region length the
- * build's region table hands out), so one script fits root and child alike.
+ * The image builder links each process with a script of its own that assigns
+ * `SOS_REGION_BASE`, `SOS_REGION_LEN` and `SOS_STACK_LEN` and then INCLUDEs
+ * the script the package's manifest names, this one or a package's own that
+ * INCLUDEs it (`sosimage package`, `tools/sosimage/src/layout.saw`). Only the
+ * region's length matters here: the base is the frames', which no program
+ * sees. LENGTH stops at the stack bottom, which keeps the linker from placing
+ * data where the stack will live.
  *
  * Nothing at build time compares this base with `hal.USER_IMAGE_BASE`, since a
  * Saw static's value is not a linker symbol. The loader catches a
@@ -33,9 +38,9 @@
  * because its data happened to start 200 bytes later. The kernel's loader
  * checks the alignment rather than trusting the linker script.
  *
- * The riscv32 profile keeps a script per resident image
- * (`hal/riscv32/user/`): there an address is the same number in every process,
- * so two images at one base could not both be resident.
+ * On the riscv32 board an address is the same number in every process, so
+ * there the builder links each resident image for its own region
+ * (`hal/riscv32/user/user.ld`); here every image shares this base.
  */
 
 OUTPUT_ARCH(aarch64)
@@ -58,7 +63,7 @@ ENTRY(_start)
 PROVIDE(ARENA_SIZE = 64K);
 
 MEMORY {
-    IMAGE (rwxa) : ORIGIN = 0x40200000, LENGTH = 240K
+    IMAGE (rwxa) : ORIGIN = 0x40200000, LENGTH = SOS_REGION_LEN - SOS_STACK_LEN
 }
 
 SECTIONS {

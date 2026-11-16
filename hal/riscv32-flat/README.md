@@ -26,7 +26,7 @@ them where they live:
 | `boot.S`, `virt.ld` | `hal/riscv32/kernel/` (the `hal_board` key) | the stack, the payload section, the region table and the memory map are the board's |
 | `trap.S`, `sink.c` | `hal/riscv32-common/kernel/` | the trap entry and the CSR leaves are the arch's |
 | `user/syscall.c` | `hal/riscv32-common/user/` | the `ecall` stub is the arch's |
-| `user/root.ld`, `child*.ld` | `hal/riscv32/user/` | the link bases are the board's, and identity addresses are what both riscv32 profiles use |
+| `user/user.ld` | `hal/riscv32/user/` | the section layout is the board's, and identity addresses are what both riscv32 profiles use |
 | `tests/riscv32/*.S` | shared (the `tests_arch` key) | the hand-assembled payloads are riscv32 instructions |
 | root and child `.sosimg`s | shared (same target triple) | userspace is byte-identical; nothing about a process image knows the tier |
 

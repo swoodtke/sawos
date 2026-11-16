@@ -42,8 +42,8 @@
 //! product's root.
 //!
 //! Reading (`ImageFile.read`) holds the image to the rules of
-//! `sosimage.rules` and to its board: a process name given twice or `root`; a
-//! pool name given twice; a reference outside its grammar; a `[[setup]]` or
+//! `sosimage.rules` and to its board: a process name given twice, or twice
+//! but for case, or `root` in any case; a pool name given twice; a reference outside its grammar; a `[[setup]]` or
 //! `[rows]` reference naming what the board does not have; a list where one
 //! value goes (the list forms, reserved); a RAM name that is reserved or not
 //! a process range of the board; a package or an input that is not a path
@@ -51,7 +51,8 @@
 //! twice or bound to nothing. Binding a stock root's processes to their
 //! declarations (`bind`) is the rest of it, a `device` reference against the
 //! board included: device needs to devices, by type; client records to
-//! serves; memory records to pools; and every input to its value.
+//! serves; memory records to pools; every input to its value; and each
+//! process to a RAM range (`choose_range`).
 
 import toml.{TomlKind, TomlPosition, TomlTable}
 import sosimage.board.{Board, LimitsSpec, NamedCount, RefUse, Window, expect_table,
@@ -59,6 +60,7 @@ import sosimage.board.{Board, LimitsSpec, NamedCount, RefUse, Window, expect_tab
 import sosimage.declaration.{BootRecord, Declaration, RecordKind, kind_word}
 import sosimage.failure.{BuildError}
 import sosimage.hex.{hex}
+import sosimage.layout.{choose_range}
 import sosimage.rules.{
     check_format, check_name, check_path, check_process_name, check_ram_name,
     element_at, holds, only_keys, parse_description, parse_ref, refused, size,
@@ -464,11 +466,16 @@ func read_process(p: &TomlTable, stock: Bool, board: &Board, parts: &var Parts,
     let name = try text(&p, "name", file)
     let at = where_is(&p, "name")
     try check_process_name(name, file, at)
+    // A process's name names its files, and two names that differ only by
+    // case name one file on a volume that does not tell case apart.
     var i = 0
     while i < parts.processes.len() {
         let other = parts.processes.get(i)!
         if other.name.equals(name) {
             return refused(file, at, "the process `{name}` is named twice, here and at {other.at}")
+        }
+        if other.name.to_lowercase().equals(name.to_lowercase()) {
+            return refused(file, at, "the process `{name}` differs from `{other.name}`, at {other.at}, only by case: a process's name names its files, and a volume that does not tell case apart would make them one")
         }
         i = i + 1
     }
@@ -637,11 +644,13 @@ public struct InputValue {
 }
 
 /// What binding a stock root's processes made: each device need's window,
-/// each input's value, and the lines the builder prints (each input's
-/// source, each part it grants, each device bound more than once).
+/// each input's value, the RAM range each process is placed in (in the
+/// image's order), and the lines the builder prints (each input's source,
+/// each part it grants, each device bound more than once).
 public struct Bindings {
     windows: Vector<Bound>
     inputs: Vector<InputValue>
+    ranges: Vector<String>
     notes: Vector<String>
 }
 
@@ -655,21 +664,24 @@ extension Bindings: ExplicitCopy {}
 /// a kernel device, that `device` does not name; a reference to a device of
 /// another type; a client or memory record unbound, or a binding naming no
 /// such record; a client bound to no serve of its protocol; a fast process
-/// placed in a slow range; an input with no value, or an image input that is
-/// none of the process's.
+/// the image places in a slow range, or one it names no range for on a board
+/// with no fast process range (`choose_range`, which places a fast process
+/// that names none in a fast range); an input with no value, or an image
+/// input that is none of the process's.
 public func bind(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
                  grain: UInt64) -> Result<Bindings, BuildError> {
     let file = image.file
     var windows = Vector<Bound>()
     var values = Vector<InputValue>()
+    var ranges = Vector<String>()
     var notes = Vector<String>()
     var p = 0
     while p < image.processes.len() {
         let process = image.processes.get(p)!
         p = p + 1
         borrow let d = decls[p - 1] {
-            try bind_process(&image, &board, &d, &decls, &process, grain, &var windows,
-                             &var values, &var notes)
+            try! ranges.push(try bind_process(&image, &board, &d, &decls, &process, grain,
+                                              &var windows, &var values, &var notes))
         }
     }
 
@@ -702,19 +714,23 @@ public func bind(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
             try! notes.push("{b.window.device} is bound to {holders.join(", ")}")
         }
     }
-    return Bindings(windows: move windows, inputs: move values, notes: move notes)
+    return Bindings(windows: move windows, inputs: move values, ranges: move ranges,
+                    notes: move notes)
 }
 
-/// `bind` for one process and its declaration `d`.
+/// `bind` for one process and its declaration `d`; returns the range the
+/// process is placed in.
 func bind_process(image: &ImageFile, board: &Board, d: &Declaration,
                   decls: &Vector<Declaration>, process: &ProcessEntry, grain: UInt64,
                   windows: &var Vector<Bound>, values: &var Vector<InputValue>,
-                  notes: &var Vector<String>) -> Result<Void, BuildError> {
+                  notes: &var Vector<String>) -> Result<String, BuildError> {
     let file = image.file
     try d.check_against(&board)
 
-    // The process's placement against its speed.
-    let ram = if process.ram.is_empty() { board.default_process } else { process.ram }
+    // The process's placement: the range the image names, else one its speed
+    // allows (`choose_range`); a fast process the image places in a slow
+    // range is refused.
+    let ram = try choose_range(&board, process.ram, d.fast, process.name, file, process.at)
     if let r = board.range(ram) {
         if d.fast && not r.fast {
             return refused(file, process.at, "the process {process.name} declares ram = \"fast\" and is placed in {ram}, a slow range")
@@ -810,7 +826,7 @@ func bind_process(image: &ImageFile, board: &Board, d: &Declaration,
         }
         return refused(file, process.at, "the input `{input}` of the process {process.name} has no value: the image gives none, no device it is bound to fixes it, and {process.package} has no default for it")
     }
-    return
+    return ram
 }
 
 /// A device input a bound device fixes.

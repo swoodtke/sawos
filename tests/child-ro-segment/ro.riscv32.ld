@@ -1,6 +1,6 @@
 /* SOS test child linker script: riscv32, read-only data above the data.
  *
- * `hal/riscv32/user/child.ld`'s addresses and arena, with the read-only data
+ * `hal/riscv32/user/user.ld`'s addresses and arena, with the read-only data
  * linked after the writable data and its zero-init instead of before them.
  * Three loadable segments as every image has (code R+X, data R+W, read-only
  * R), so the read-only one lies between the data and the stack, both of
@@ -19,11 +19,11 @@ PHDRS {
 }
 
 MEMORY {
-    CHILD (rwxa) : ORIGIN = 0x80240000, LENGTH = 240K
+    CHILD (rwxa) : ORIGIN = SOS_REGION_BASE, LENGTH = SOS_REGION_LEN - SOS_STACK_LEN
 }
 
 SECTIONS {
-    . = 0x80240000;
+    . = SOS_REGION_BASE;
 
     .text : {
         *(.text .text.*)

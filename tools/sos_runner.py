@@ -226,10 +226,10 @@ IRQ_EARLYACK_PKG = os.path.join(TESTS_DIR, "irq-earlyack")
 WAIT_DEADLOCK_PKG = os.path.join(TESTS_DIR, "wait-deadlock")
 # The process cases use one claim per image, so a bug in the reload cannot hide
 # behind a load that happened to work. The child packages are Blade packages
-# built as a root is. On riscv32 each concurrent child links at its own base
-# (`hal/riscv32/user/child.ld`, `child2.ld`, ...), because that profile does not
-# translate and every process shares one physical address space; arm64
-# translates and links every image from `user.ld`. Neither child here holds a
+# built as a root is. On riscv32 each concurrent child is linked for its own
+# region (`_process_placement`), because that profile does not translate and
+# every process shares one physical address space; arm64 translates and links
+# every image at one base. Neither child here holds a
 # handle: `start()` hands a child `NO_HANDLE`, so its observable behaviour is
 # faulting.
 PROCESS_LIFECYCLE_PKG = os.path.join(TESTS_DIR, "process-lifecycle")
@@ -675,16 +675,15 @@ CHILD_WAITABLE_PKG = os.path.join(TESTS_DIR, "child-waitable")
 # The driver is per chip and the client and launchers are arch-free: a driver
 # names its device, a launcher moves a capability, and a capability has no
 # datasheet.
-#
-# On riscv32 `svc-client` is linked at the second child base
-# (`hal/riscv32/user/child2.ld`), and because `_region_rows` assigns
-# destinations by index, a package linked there must be listed second in its
-# case.
 UART_SERVICE_PKG = os.path.join(TESTS_DIR, "uart-service")
 UART_CANCEL_PKG = os.path.join(TESTS_DIR, "uart-cancel")
 SVC_UART_NS16550_PKG = os.path.join(DRIVERS_DIR, "svc-uart-ns16550")
 SVC_UART_PL011_PKG = os.path.join(DRIVERS_DIR, "svc-uart-pl011")
 SVC_CLIENT_PKG = os.path.join(TESTS_DIR, "svc-client")
+# The root of the images built from descriptions, which launches every child
+# its image carries, and the child those images launch more than once.
+LAUNCH_ALL_PKG = os.path.join(TESTS_DIR, "launch-all")
+CHILD_INSTANCE_PKG = os.path.join(TESTS_DIR, "child-instance")
 DELEGATE_3P_PKG = os.path.join(TESTS_DIR, "delegate-3p")
 CHILD_FORWARD_PKG = os.path.join(TESTS_DIR, "child-forward")
 CHILD_FAR_PKG = os.path.join(TESTS_DIR, "child-far")
@@ -934,11 +933,14 @@ ARCHES = [
         "hal_asm": [os.path.join("riscv32-common", "kernel", "trap.S")],
         "hex_width": 8,
         "root_entry": 0x80200000,
+        # Root's region, mirroring `hal.ROOT_LOAD_BASE` and `ROOT_REGION_TOP`:
+        # what root's package is linked for (`_process_placement`).
+        "root_region": (0x80200000, 0x40000),
         # Where a child process's memory is. The build assigns this destination
         # range: the kernel never knows it, the region table publishes it as an
         # ordinary free-RAM row, and root learns it as a capability. It is one
-        # region above root's top, and the child linker script
-        # (`hal/riscv32/user/child.ld`) is linked at exactly this base.
+        # region above root's top, and child 0's package is linked for exactly
+        # this region, child i's for the i-th from it.
         "child_region_base": 0x80240000,
         # The line `hal.irq_raise_selftest_line()` raises. It is per-machine
         # because what a board can interrupt itself with is: this one has no
@@ -1007,6 +1009,7 @@ ARCHES = [
         # also root's physical destination: root is the one process whose two
         # addresses coincide.
         "root_entry": 0x40200000,
+        "root_region": (0x40200000, 0x40000),
         # A child's destination frames: physical, and not an address any
         # program sees (the kernel translates, and a child links at
         # `root_entry`). One region above root's, as on riscv32. The build's
@@ -1105,6 +1108,7 @@ ARCHES = [
         "banner_arch": "riscv32",
         "hex_width": 8,
         "root_entry": 0x80200000,
+        "root_region": (0x80200000, 0x40000),
         "child_region_base": 0x80240000,
         "selftest_line": 10,
         "pool_base": 0x80280000,
@@ -1149,16 +1153,24 @@ ESP32S3_ARCH = {
     "banner_arch": "xtensa",
     "hex_width": 8,
     # Where root's code starts: the instruction-window address of its flash
-    # slot plus the image's header and segment table (`user/root.ld`). The
+    # slot plus the image's header and segment table (`user/user.ld`). The
     # entry is somewhere in that code and moves with it, so no case on this
     # board asserts `{entry}`.
     "root_entry": 0x42100060,
+    "root_region": (0x3FCB0000, 0x18000),
     # The child's writable segment and stack: one region above root's, in
-    # DRAM; `hal/xtensa-esp32s3/user/child.ld` links there. The region is the
-    # size of root's, smaller than `CHILD_REGION_LEN` because this part has
-    # 400 KiB of SRAM in all.
+    # DRAM, where child 0's package is linked. The region is the size of
+    # root's, smaller than `CHILD_REGION_LEN` because this part has 400 KiB of
+    # SRAM in all.
     "child_region_base": 0x3FCC8000,
     "child_region_len": 0x18000,
+    # The board's flash slots (`board.toml`'s `[flash]`): root's, and the range
+    # of `count` equal slots child i takes the i-th of.
+    "root_slot": (0x100000, 0x80000),
+    "slots": (0x180000, 0x80000, 4),
+    # Flash offset 0 in the data window, where the kernel reads its
+    # read-only data and every image (`FLASH_DBUS`).
+    "flash_dbus": 0x3C000000,
     # UART0's matrix source, which `hal.irq_raise_selftest_line()` raises.
     "selftest_line": 27,
     # Above the one child region, to `hal.RAM_TOP`; `tests/poolbase_xtensa.c`
@@ -1192,6 +1204,69 @@ CHILD_REGION_LEN = 0x40000
 
 def _child_region_len(arch):
     return arch.get("child_region_len", CHILD_REGION_LEN)
+
+
+# The stack at the top of every process's region, mirroring each HAL's
+# `ROOT_STACK_LEN`.
+STACK_LEN = 0x4000
+
+
+def _process_placement(arch, role):
+    """Where a test image's process is linked: `role` is `root` or `child<i>`.
+
+    Root's region is the HAL's; child i's is the i-th region from
+    `child_region_base`, which the case's region table publishes as its
+    destination (`_region_row_specs`). On a board with flash slots root's
+    image is in root's slot and child i's in slot i. The builder writes the
+    process's script from these numbers (`sosimage package`).
+    """
+    if role == "root":
+        base, length = arch["root_region"]
+        index = None
+    else:
+        index = int(role[len("child"):])
+        length = _child_region_len(arch)
+        base = arch["child_region_base"] + index * length
+    placement = {"region": {"base": base, "len": length}, "stack": STACK_LEN}
+    if "slots" in arch:
+        if index is None:
+            slot_base, slot_len = arch["root_slot"]
+        else:
+            first, total, count = arch["slots"]
+            slot_len = total // count
+            slot_base = first + index * slot_len
+        placement["slot"] = {"base": slot_base, "len": slot_len}
+    return placement
+
+
+def _case_processes(case):
+    """A case's processes as (package, role), root first: `root`, unless the
+    case links root's package for another role (`root_link`), then
+    `child<i>` for each of its children."""
+    out = []
+    if case.get("root_pkg"):
+        out.append((case["root_pkg"], case.get("root_link", "root")))
+    for i, pkg in enumerate(case.get("children", ())):
+        out.append((pkg, f"child{i}"))
+    return out
+
+
+def _build_process(packager, profile, arch, pkg, role, env):
+    """Have the builder build the package `pkg` as the process `role` of a
+    test image (`sosimage package`); return its image's path.
+
+    Its outputs land under the package's `.build/<triple>/`: the process
+    description `<role>.process.json`, the script `<role>.ld`, Blade's own
+    directory `<role>/` and the image, `<role>.sosimg`.
+    """
+    out = os.path.join(pkg, ".build", arch["triple"])
+    description = dict(version=SOSIMAGE_SCHEMA_VERSION, name=role,
+                       package=pkg, out=out,
+                       **_process_placement(arch, role))
+    path = os.path.join(out, f"{role}.process.json")
+    _write_json(path, description)
+    _run_sosimage(packager, ["package", profile, path], env=env)
+    return os.path.join(out, f"{role}.sosimg")
 
 # The boot region table's wire format (version 5), frozen: an 8-byte header
 # (magic, version u16, count u8, boot flags u8) then `count` rows of {base: u64,
@@ -7944,10 +8019,37 @@ TEST_CASES = [
     # what changes between them is never the driver's device half.
     #
     # `uart_service_*` and `pipe_delegate_3p` run two children at once, which
-    # `MAX_PROCESSES` allows. `_region_rows` assigns destinations by index, so
-    # the order a case lists its children is a contract; on riscv32 each
-    # position also has its own linker script (`hal/riscv32/user/child2.ld`
-    # for the second).
+    # `MAX_PROCESSES` allows. `_region_rows` assigns destinations by index, and
+    # each child is linked for the region at its index (`_process_placement`).
+    {
+        # An image built from its hand-written description, every address the
+        # image builder's (`tests/images/launch_all*.toml`): root and four
+        # processes, three of them instances of one package, each its own link
+        # at its own region, and a pool placed after them. Root launches each
+        # in turn and waits for its end, so a child that runs ran in the
+        # region its image was linked for; then it allocates from the pool.
+        "name": "launch_all",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "launch_all.toml",
+                       "riscv32-flat": "launch_all_flat.toml",
+                       "arm64": "launch_all_arm64.toml"},
+        "expect_out": ["{banner}",
+                       # Nine rows: four image blobs, four destinations, the
+                       # pool.
+                       "SOS: boot regions={nine}",
+                       "SOS launch: 4 children, 1 pool",
+                       "SOS instance: running",
+                       "SOS launch: child 0 ended status=65543",
+                       "SOS instance: running",
+                       "SOS launch: child 1 ended status=65543",
+                       "SOS instance: running",
+                       "SOS launch: child 2 ended status=65543",
+                       "SOS bye: exiting",
+                       "SOS launch: child 3 ended status=65541",
+                       "SOS launch: the pool gave 4096 bytes",
+                       "SOS launch: done"],
+        "expect_clean_exit": True,
+    },
     {
         # The money shot on riscv32. Read the transcript as an order:
         #
@@ -9063,8 +9165,8 @@ TEST_CASES = [
         # A package that chose its own arena. `sosrt`'s bump arena is a linker
         # region, `PROVIDE`d at a default size by every shared user script, and
         # this package's manifest names a two-line script of its own that
-        # assigns `ARENA_SIZE = 8K` and then INCLUDEs exactly the `root.ld`
-        # every other root package names. On a small part the arena size is the
+        # assigns `ARENA_SIZE = 8K` and then INCLUDEs exactly the `user.ld`
+        # every other package names. On a small part the arena size is the
         # biggest lever on how many processes fit.
         #
         # The case is the mechanism's only proof, and it is a pair of brackets.
@@ -10923,37 +11025,6 @@ def _blade_env(clang, lld=None):
     return env
 
 
-def _build_root_image(blade_bin, pkg_dir, arch, clang, lld=None):
-    """`blade build --target <triple>` a root package; return its sosimg path.
-
-    Always `--force`: the harness's job is to prove the current tree boots,
-    and Blade's build avoidance keys on content it cannot see change here (the
-    kernel side, the linker script's meaning).
-    """
-    # Artifacts live under `<package>/.build/<target>/`, never beside the
-    # source, which also lets one package hold two architectures' images at
-    # once.
-    out_dir = os.path.join(pkg_dir, ".build", arch["triple"])
-
-    # Delete first: a build that fails must not leave the previous image lying
-    # around to be booted as if it were current.
-    if os.path.isdir(out_dir):
-        for stale in os.listdir(out_dir):
-            if stale.endswith(".sosimg"):
-                os.remove(os.path.join(out_dir, stale))
-
-    _run([blade_bin, "build", "--force", "--target", arch["triple"]],
-         cwd=pkg_dir, env=_blade_env(clang, lld))
-
-    # The image is named for the package, which need not match its directory.
-    images = []
-    if os.path.isdir(out_dir):
-        images = [f for f in os.listdir(out_dir) if f.endswith(".sosimg")]
-    if len(images) != 1:
-        raise ToolError(f"expected exactly one .sosimg in {out_dir}, found {images}")
-    return os.path.join(out_dir, images[0])
-
-
 def _stitch_root_image(image, arch, clang, name):
     """Assemble the `.incbin` stub that pulls `image` into `.payload`.
 
@@ -11078,7 +11149,7 @@ def _region_row_specs(case, arch):
         raise ToolError(
             f"case {case['name']!r}: a case with two children cannot also ask "
             f"for a pool — the second child's destination region and the pool "
-            f"share a base (see hal/*/user/child2.ld)")
+            f"share a base (`_process_placement`)")
     pool_blobs = case.get("pool_blobs", ())
     for i in pool_blobs:
         if i not in children:
@@ -11098,15 +11169,21 @@ def _region_row_specs(case, arch):
         if i not in children:
             raise ToolError(f"case {case['name']!r}: `pool_destinations` names "
                             f"child {i}, which the case does not have")
+    # A case whose images the builder placed (`FROM_FILES`) publishes the
+    # regions it placed them in.
+    placed = case.get("_destinations", {}).get(arch["name"])
     region_len = _child_region_len(arch)
     for i, _pkg in enumerate(children):
         base = arch["child_region_base"] + i * region_len
+        length = region_len
+        if placed is not None:
+            base, length = placed[i]
         if i in pool_destinations:
             rows.append({"what": f"child {i}'s destination RAM, as a POOL",
-                         "kind": "pool", "base": base, "len": region_len})
+                         "kind": "pool", "base": base, "len": length})
         else:
             rows.append({"what": f"child {i}'s destination RAM",
-                         "kind": "ram", "base": base, "len": region_len})
+                         "kind": "ram", "base": base, "len": length})
     if case.get("pool"):
         # `pool_skew` moves the pool row's base that many bytes up, off the
         # grain, and shortens it to keep its top. `pool_short_top` shortens
@@ -11208,13 +11285,20 @@ def _stitch_regions(case, arch, clang):
         "",
     ]
     # A case with no children links no `.childimg` section at all, which is what
-    # keeps a pool-only or device-only case from carrying an empty one.
-    if children:
+    # keeps a pool-only or device-only case from carrying an empty one. On a
+    # board with flash slots each child is a section of its own,
+    # `.childimg.<i>`, which the kernel's script places at slot i.
+    slotted = "slots" in arch
+    if children and not slotted:
         lines += [
             "    .section .childimg, \"a\", @progbits",
             "    .balign 16",
         ]
+    if children:
         for i, _pkg in enumerate(children):
+            if slotted:
+                lines += [f"    .section .childimg.{i}, \"a\", @progbits",
+                          "    .balign 16"]
             staged = os.path.join(dirs["build"], f"{name}.child{i}.sosimg")
             shutil.copyfile(case["_child_images"][arch["name"]][i], staged)
             # A pool row's base is on the protection grain (spec §12), and its
@@ -11246,6 +11330,66 @@ def _stitch_regions(case, arch, clang):
     _run([clang, f"--target={arch['triple']}", *arch["cc_args"],
           "-nostdlib", "-I", dirs["build"], "-c", stub_s, "-o", stub_o])
     return stub_o
+
+
+def _write_image_slots(arch, children, staging):
+    """Write the two files a slotted board's kernel script INCLUDEs for an
+    image with `children` children into `staging`, as the image builder does
+    (`tools/sosimage/src/layout.saw`'s `image_slots`): root's slot and
+    `DROM_FLASH`, the end of the slot range, then a section per child at its
+    slot. Returns `staging`, the directory the linker is told to look in."""
+    first, total, count = arch["slots"]
+    if children > count:
+        raise ToolError(f"the image has {children} processes besides root, "
+                        f"and the board's flash has {count} slots for them")
+    slot_len = total // count
+    root_base, root_len = arch["root_slot"]
+    os.makedirs(staging, exist_ok=True)
+    with open(os.path.join(staging, "image_slots.ld"), "w") as f:
+        f.write("/* GENERATED by tools/sos_runner.py */\n"
+                f"ROOT_IMAGE_SLOT = {root_base:#x};\n"
+                f"ROOT_IMAGE_SLOT_LEN = {root_len:#x};\n"
+                f"DROM_FLASH = {first + total:#x};\n")
+    with open(os.path.join(staging, "image_slot_sections.ld"), "w") as f:
+        f.write("/* GENERATED by tools/sos_runner.py */\n")
+        for i in range(children):
+            base = first + i * slot_len
+            f.write(f"    .childimg{i} (FLASH_DBUS + {base:#x}) : "
+                    f"AT(FLASH_IBUS + {base:#x}) {{\n"
+                    f"        KEEP(*(.childimg.{i}))\n"
+                    "    }\n"
+                    f"    ASSERT(SIZEOF(.childimg{i}) <= {slot_len:#x}, "
+                    f"\"image_slot_sections.ld: child {i}'s image does not "
+                    "fit its slot\")\n")
+    return staging
+
+
+def _check_drom(elf, name, arch):
+    """Refuse an S3 image whose `.drom`, the kernel's read-only data, is not
+    at the end of the board's slot range in the flash data window: it lies
+    there whatever the image's process count (`hal/xtensa-esp32s3/board.toml`),
+    so no image's read-only data moves with how many slots it uses."""
+    import struct
+    with open(elf, "rb") as f:
+        data = f.read()
+    shoff, = struct.unpack_from("<I", data, 32)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 46)
+    names_at, = struct.unpack_from("<I", data, shoff + shentsize * shstrndx + 16)
+    first, total, _count = arch["slots"]
+    want = arch["flash_dbus"] + first + total
+    for i in range(shnum):
+        sh = shoff + shentsize * i
+        name_off, = struct.unpack_from("<I", data, sh)
+        end = data.index(b"\0", names_at + name_off)
+        if data[names_at + name_off:end] != b".drom":
+            continue
+        addr, = struct.unpack_from("<I", data, sh + 12)
+        if addr != want:
+            raise ToolError(f"{name}: the kernel's read-only data is at "
+                            f"{addr:#x}, and the end of the board's slot range "
+                            f"is {want:#x}")
+        return
+    raise ToolError(f"{name}: the linked image has no `.drom`")
 
 
 def _child_asm_obj(case, arch, clang):
@@ -11506,14 +11650,16 @@ def _test_sosimage(blade_bin):
     _run([blade_bin, "test"], cwd=SOSIMAGE_DIR, env=env)
 
 
-def _run_sosimage(builder, args):
+def _run_sosimage(builder, args, env=None):
     """Run the image builder; return what it printed.
 
     A failure is the builder's own message, which says what was refused or
     which tool failed and how; the command line that ran the builder adds
-    nothing to it.
+    nothing to it. `env` is the environment of a command that runs Blade
+    (`_blade_env`), which Blade inherits through the builder.
     """
-    proc = subprocess.run([builder, *args], capture_output=True, text=True)
+    proc = subprocess.run([builder, *args], capture_output=True, text=True,
+                          env=env)
     if proc.returncode != 0:
         out = ((proc.stdout or "") + (proc.stderr or "")).strip()
         raise ToolError(out or f"sosimage {args[0]} exited {proc.returncode} "
@@ -11529,8 +11675,10 @@ def _write_json(path, value):
 
 
 def _profile_description(arch, clang, lld, native, linker_script,
-                         module_paths, kernel_c_args=(), flash=None):
-    """A profile description: every fact about the board an image needs."""
+                         module_paths, kernel_c_args=(), flash=None,
+                         blade=None):
+    """A profile description: every fact about the board an image needs, and
+    the Blade that builds its processes' packages."""
     profile = {
         "version": SOSIMAGE_SCHEMA_VERSION,
         "triple": arch["triple"],
@@ -11545,12 +11693,14 @@ def _profile_description(arch, clang, lld, native, linker_script,
         "native": [{"source": src, "object": obj} for src, obj in native],
         "linker_script": linker_script,
     }
+    if blade is not None:
+        profile["blade"] = blade
     if flash is not None:
         profile["flash"] = flash
     return profile
 
 
-def _gate_profile(arch, clang, lld):
+def _gate_profile(arch, clang, lld, blade):
     """The profile description of one of the gate's `ARCHES`, written into
     its build directory; returns its path.
 
@@ -11577,7 +11727,7 @@ def _gate_profile(arch, clang, lld):
     _write_json(path, _profile_description(
         arch, clang, lld, native,
         os.path.join(dirs["hal_board"], "virt.ld"), module_paths,
-        kernel_c_args=arch.get("kernel_c_args", [])))
+        kernel_c_args=arch.get("kernel_c_args", []), blade=blade))
     return path
 
 
@@ -12055,19 +12205,19 @@ def _check(case, arch, status, out, timed_out):
     return True, ""
 
 
-def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
-              jobs):
+def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
+              selected_cases, jobs):
     """Build and run every case for one architecture. Returns (passed, failed).
 
     `builder` is the image builder's binary, or None for the runner's own
-    image build (`SOS_IMAGE_BUILDER=python`).
+    image build (`SOS_IMAGE_BUILDER=python`). `packager` is the image
+    builder's binary either way: it builds every process's package.
 
     The architectures stay sequential. Two of them at once would build the
     same Blade package for two triples concurrently, and a package's `.build/`
     tree is per-package with the target only one level down: the artifacts
-    would not collide, but the stale `.sosimg` sweep at the top of
-    `_build_root_image` and the lock/stamp files beside them are one directory
-    for both. `jobs` buys its parallelism inside an architecture, where every
+    would not collide, but the lock Blade writes beside the package's manifest
+    is one file for both. `jobs` buys its parallelism inside an architecture, where every
     unit of work already has a name of its own, and an arch block's report
     stays contiguous.
     """
@@ -12106,10 +12256,11 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
     cases = runnable
 
     try:
+        if packager is not None:
+            profile = _gate_profile(arch, clang, lld, blade_bin)
         if builder is None:
             shared_objs = _build_shared(arch, clang)
         else:
-            profile = _gate_profile(arch, clang, lld)
             _run_sosimage(builder, ["native", profile])
     except ToolError as e:
         print(f"{CROSS} failed to build the {arch['name']} kernel HAL / runtime support\n{e}",
@@ -12133,59 +12284,91 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
                   f"with its profile or its HAL\n{e}", file=sys.stderr)
             return 0, len(cases)
 
-    # Root packages are built by Blade, per architecture, so build them first,
-    # but only if some case that runs here needs one. The arch filter is
-    # applied first because some packages are per-device: a driver names its
-    # device, so each echo package has a `[sos.<triple>]` section for one
-    # machine only and building it for the other is a refusal rather than
-    # wasted work.
+    # Every process's package is built by Blade, per architecture, through a
+    # script the image builder writes from where the process is linked
+    # (`_process_placement`), so build them first, but only those some case
+    # that runs here needs. The arch filter is applied first because some
+    # packages are per-device: a driver names its device, so each echo package
+    # has a `[sos.<triple>]` section for one machine only and building it for
+    # the other is a refusal rather than wasted work.
     #
-    # Child packages ride the same list. They are not root servers (nothing
-    # loads one at boot) but they are built by exactly the same call: a child
-    # image goes through the pipeline every SOS process goes through, and the
-    # only thing that differs is the linker script its manifest names.
-    root_pkgs = []
+    # A package is built once for each role a case gives it: root, or child i,
+    # whose region is the i-th from `child_region_base`. A child is not a root
+    # server (nothing loads one at boot) but it goes through the pipeline every
+    # SOS process goes through; what differs is only where it is linked.
+    # A case a hand-written description also states (`FROM_FILES`) is built
+    # from the description first, and the case takes the images the builder
+    # made and the regions it placed them in. The two share those images and
+    # their placements, so what the comparison after the case holds is the
+    # rest of the image: the region table's rows, the limits and the link.
+    from_files = {}
     for case in cases:
-        if case.get("root_pkg") and case["root_pkg"] not in root_pkgs:
-            root_pkgs.append(case["root_pkg"])
-        for child in case.get("children", ()):
-            if child not in root_pkgs:
-                root_pkgs.append(child)
-    if root_pkgs:
-        # Each package is a separate directory and a separate Blade invocation,
-        # so the only thing the pool has to preserve is the order these lines
-        # print in, which `_map_ordered` does. The failure arm keeps the serial
-        # shape too: the first package to fail in list order is the one
-        # reported, and the run gives up on this architecture there.
+        image = FROM_FILES.get((arch["name"], case["name"]))
+        if image is None:
+            continue
+        from_files[case["name"]] = _place_from_files(packager, profile, arch,
+                                                     case, image,
+                                                     _blade_env(clang))
+    processes = []
+    for case in cases:
+        if case["name"] in from_files:
+            continue
+        for process in _case_processes(case):
+            if process not in processes:
+                processes.append(process)
+    if processes:
+        # Each (package, role) is a separate Blade invocation into a directory
+        # of its own, and one package's roles are built in one job, in order,
+        # since Blade writes the package's lock beside its manifest; the only
+        # thing the pool has to preserve is the order these lines print in,
+        # which `_map_ordered` does. The failure arm keeps the serial shape
+        # too: the first package to fail in list order is the one reported,
+        # and the run gives up on this architecture there.
+        packages = []
+        for pkg, _role in processes:
+            if pkg not in packages:
+                packages.append(pkg)
+        env = _blade_env(clang)
+
         def build_pkg(pkg):
-            try:
-                image = _build_root_image(blade_bin, pkg, arch, clang)
-                return (os.path.relpath(image, REPO_ROOT),
-                        os.path.getsize(image), None)
-            except ToolError as e:
-                return (None, None, e)
+            built = []
+            for owner, role in processes:
+                if owner != pkg:
+                    continue
+                try:
+                    image = _build_process(packager, profile, arch, pkg, role,
+                                           env)
+                except ToolError as e:
+                    return built, e
+                built.append((os.path.relpath(image, REPO_ROOT),
+                              os.path.getsize(image)))
+            return built, None
 
         build_error = None
-        for rel, size, err in _map_ordered(jobs, root_pkgs, build_pkg):
+        for built, err in _map_ordered(jobs, packages, build_pkg):
+            for rel, size in built:
+                print(f"  {rel}  ({size} bytes)")
             if err is not None:
                 build_error = err
                 break
-            print(f"  {rel}  ({size} bytes)")
         if build_error is not None:
-            print(f"{CROSS} failed to build a {arch['name']} root image"
+            print(f"{CROSS} failed to build a {arch['name']} process image"
                   f"\n{build_error}", file=sys.stderr)
             return 0, len(cases)
         # On this thread, before any case starts: the case dictionaries are the
         # one table every worker reads, so the only writes into them happen
         # here, where there is exactly one writer.
         for case in cases:
+            if case["name"] in from_files:
+                continue
+            images = [_process_image(pkg, role, arch)
+                      for pkg, role in _case_processes(case)]
             if case.get("root_pkg"):
                 holder = case.setdefault("_root_image", {})
-                holder[arch["name"]] = _root_image_path(case["root_pkg"], arch)
+                holder[arch["name"]] = images.pop(0)
             if case.get("children"):
                 holder = case.setdefault("_child_images", {})
-                holder[arch["name"]] = [_root_image_path(c, arch)
-                                        for c in case["children"]]
+                holder[arch["name"]] = images
 
     # Each kernel entry the cases boot is compiled once, here, before any case
     # links one.
@@ -12218,7 +12401,13 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
         name = case["name"]
         refusal = case.get("expect_build_error")
         try:
-            if builder is None:
+            placed = from_files.get(name)
+            if placed is not None and placed["error"] is not None:
+                raise placed["error"]
+            if case.get("image_file"):
+                elf, _printed = _build_image_file(packager, profile, arch,
+                                                  case, _blade_env(clang))
+            elif builder is None:
                 elf = _build_elf(case, arch, shared_objs, lld, clang)
             else:
                 failure = kernel_failures[case["src"]]
@@ -12280,7 +12469,7 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
         for (profile_name, name), image in FROM_FILES.items():
             if profile_name != arch["name"] or name not in green:
                 continue
-            problem = _built_from_files(builder, profile, arch, name, image)
+            problem = _built_from_files(arch, name)
             if problem is not None:
                 print(f"{CROSS} {name} from tests/images/{image}  ({problem})")
                 failed += 1
@@ -12289,25 +12478,52 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, selected_cases,
 
 
 # The gate cases a hand-written description in `tests/images/` also states,
-# by profile and case name. After the case passes, `sosimage build` builds
-# the description from its files, and the image it links must be the case's,
-# byte for byte. A match prints nothing.
+# by profile and case name. Before the case is linked, `sosimage build` builds
+# the description from its files, and the case takes its process images and
+# their regions (`_place_from_files`); after the case passes, the image the
+# description links must be the case's, byte for byte, which holds the rows,
+# the limits and the link the two make apart. A match prints nothing.
 FROM_FILES = {
     ("riscv32", "uart_service_ns16550"): "uart_service_ns16550.toml",
     ("riscv32-flat", "uart_service_ns16550"): "uart_service_ns16550_flat.toml",
 }
 
 
-def _built_from_files(builder, profile, arch, name, image):
-    """Build `tests/images/<image>` with `sosimage build` and compare its ELF
-    with the case `name`'s; return what differed, or None."""
+# A line `sosimage build` prints for each process it placed.
+PLACED_PROCESS = re.compile(r"^process (\S+) region=(0x[0-9a-f]+)\+(0x[0-9a-f]+)",
+                            re.M)
+
+
+def _place_from_files(packager, profile, arch, case, image, env):
+    """Build `tests/images/<image>` with `sosimage build`, before the case
+    `case` it also states is linked, and give the case the images the builder
+    made and the regions it printed for them (`_destinations`). Returns
+    `{"error": ...}`, the build's failure or None; a failure is the case's
+    build error."""
+    out = os.path.join(arch_dirs(arch)["build"], "fromfiles", case["name"])
+    try:
+        printed = _run_sosimage(packager, [
+            "build", profile, REPO_ROOT, REPO_ROOT,
+            os.path.join(TESTS_DIR, "images", image), out],
+            env=env)
+    except ToolError as e:
+        return {"error": ToolError(f"tests/images/{image}: {e}")}
+    placed = PLACED_PROCESS.findall(printed)
+    case.setdefault("_root_image", {})[arch["name"]] = \
+        os.path.join(out, "root.sosimg")
+    case.setdefault("_child_images", {})[arch["name"]] = \
+        [os.path.join(out, f"{p[0]}.sosimg") for p in placed]
+    case.setdefault("_destinations", {})[arch["name"]] = \
+        [(int(p[1], 16), int(p[2], 16)) for p in placed]
+    return {"error": None}
+
+
+def _built_from_files(arch, name):
+    """Compare the ELF `sosimage build` made of the case `name`'s description
+    (`_place_from_files`) with the case's own; return what differed, or
+    None."""
     build = arch_dirs(arch)["build"]
     out = os.path.join(build, "fromfiles", name)
-    try:
-        _run_sosimage(builder, ["build", profile, REPO_ROOT, REPO_ROOT,
-                                os.path.join(TESTS_DIR, "images", image), out])
-    except ToolError as e:
-        return f"build error: {e}"
     with open(os.path.join(build, f"{name}.elf"), "rb") as f:
         case = f.read()
     with open(os.path.join(out, f"{name}.elf"), "rb") as f:
@@ -12318,10 +12534,23 @@ def _built_from_files(builder, profile, arch, name, image):
     return None
 
 
-def _root_image_path(pkg_dir, arch):
-    out_dir = os.path.join(pkg_dir, ".build", arch["triple"])
-    images = [f for f in os.listdir(out_dir) if f.endswith(".sosimg")]
-    return os.path.join(out_dir, images[0])
+def _build_image_file(packager, profile, arch, case, env):
+    """Build the case's hand-written description, `tests/images/<file>`, its
+    `image_file` for this profile, with `sosimage build`, which places every
+    process and builds every package itself; return the ELF it linked and
+    what the builder printed. A flash board's flash image is beside the ELF
+    (`<name>.flash.bin`); the description's image is named for the case."""
+    out = os.path.join(arch_dirs(arch)["build"], "images", case["name"])
+    printed = _run_sosimage(packager, [
+        "build", profile, REPO_ROOT, REPO_ROOT,
+        os.path.join(TESTS_DIR, "images", case["image_file"][arch["name"]]),
+        out], env=env)
+    return os.path.join(out, f"{case['name']}.elf"), printed
+
+
+def _process_image(pkg, role, arch):
+    """The image `_build_process` made of `pkg` as the process `role`."""
+    return os.path.join(pkg, ".build", arch["triple"], f"{role}.sosimg")
 
 
 # The only imports a read-only probe may hold: the console it prints on, and
@@ -12585,7 +12814,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         bytes in the image included. A segment linked outside both windows is
         copied into RAM, and the loader judges it. An image the kernel would
         not read through the data window is refused too.
-        `user/root.ld` says how the scripts make it so; a mismatch names both
+        `user/user.ld` says how the script makes it so; a mismatch names both
         numbers, since the loader would refuse the image at boot."""
         symbols = elf_symbols(data)
         images = []
@@ -12652,7 +12881,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                                     f"writable and linked in flash, at "
                                     f"{load:#x}")
 
-    def flash_image(name, objs, board=False, check=True):
+    def flash_image(name, objs, children, board=False, check=True):
         """Link, then write each loadable segment into a 4 MiB flash image at
         its load address's flash offset (ABI.md §1e), and check the
         direct-boot magic is really there and byte 0 is not an esptool
@@ -12669,8 +12898,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         elf = os.path.join(s3_build, f"{name}.{tag}.elf")
         flash = os.path.join(s3_build, f"{name}.{tag}.bin")
         board_args = ["--defsym=_sos_semihosting=0"] if board else []
+        slots = _write_image_slots(arch, children,
+                                   os.path.join(s3_build, f"{name}.slots"))
         _run([lld, "-T", os.path.join(s3_hal, "kernel", "esp32s3.ld"),
-              "--gc-sections", *board_args, "-o", elf, *objs])
+              "--gc-sections", "-L", slots, *board_args, "-o", elf, *objs])
         with open(elf, "rb") as f:
             data = f.read()
         phoff, = struct.unpack_from("<I", data, 28)
@@ -13530,13 +13761,63 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "expect_status": EXIT_PROCESS_FAULT,
         },
         {
-            # A root image linked for the child's slot, stitched into root's:
-            # the build reads it back and refuses it, naming where the code
-            # is linked and where its bytes sit. Every number in the line is
-            # fixed by the two slots and the image's header length.
+            # The gate's `launch_all` on this board: root and three processes
+            # from a hand-written description, every address the image
+            # builder's, each child an instance of one package in a flash slot
+            # and a region of its own, then a pool placed after them.
+            "name": "launch_all",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "launch_all_s3.toml"},
+            "expect_out": ["{banner}",
+                           # Seven rows: three image blobs, three
+                           # destinations, the pool.
+                           "SOS: boot regions={seven}",
+                           "SOS launch: 3 children, 1 pool",
+                           "SOS instance: running",
+                           "SOS launch: child 0 ended status=65543",
+                           "SOS instance: running",
+                           "SOS launch: child 1 ended status=65543",
+                           "SOS instance: running",
+                           "SOS launch: child 2 ended status=65543",
+                           "SOS launch: the pool gave 4096 bytes",
+                           "SOS launch: done"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A test image with more children than the board has flash slots:
+            # the link refuses it, naming the counts.
+            "name": "too_many_children",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": LAUNCH_ALL_PKG,
+            "children": [CHILD_INSTANCE_PKG] * 5,
+            "expect_build_error": "too_many_children has 5 processes besides "
+                                  "root, and the board's flash has 4 slots "
+                                  "for them",
+            "expect_out": [],
+            "expect_clean_exit": False,
+        },
+        {
+            # More processes besides root than the board has flash slots:
+            # the builder refuses the description before it builds anything.
+            "name": "too_many_processes",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "too_many_s3.toml"},
+            "expect_build_error": "too_many_s3.toml has 5 processes besides "
+                                  "root, and the board's flash has 4 slots "
+                                  "for them",
+            "expect_out": [],
+            "expect_clean_exit": False,
+        },
+        {
+            # A root image linked for child 0's slot (`root_link`), stitched
+            # into root's: the build reads it back and refuses it, naming
+            # where the code is linked and where its bytes sit. Every number
+            # in the line is fixed by the two slots and the image's header
+            # length.
             "name": "slot_mismatch",
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "root_pkg": CHILD_FAULT_PKG,
+            "root_link": "child0",
             "expect_build_error": "root's image's segment 0 is linked at "
                                   "0x42180060, but its bytes sit at flash "
                                   "0x100060, whose instruction-window "
@@ -13623,14 +13904,16 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     print(f"  target {s3_triple} (call0, no FPU; the Flat tier)")
     print(f"  sawlang: {tc().source}  {tc().root or tc().sawc_env_value()}")
 
-    # Blade builds the packages and the image builder.
+    # Blade builds the packages and the image builder, which builds every
+    # process's package (`packager`) on the runner's own image path too.
     python_path = _python_builder()
     builder = None
     try:
         blade_bin = _build_blade(s3_build)
+        _link_sawlang()
+        packager = _build_sosimage(blade_bin)
         if not python_path:
-            _link_sawlang()
-            builder = _build_sosimage(blade_bin)
+            builder = packager
     except ToolError as e:
         print(f"{CROSS} failed to build blade or the image builder\n{e}",
               file=sys.stderr)
@@ -13657,7 +13940,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             shared = [cc(native[0][0], native[0][1]),
                       cc(native[1][0], native[1][1], extra=("-O2",)),
                       cc(native[2][0], native[2][1], extra=("-O2",))]
-        for key in ([] if python_path else keys_used):
+        for key in keys_used:
             key_build = arch_dirs(variant_arch(key))["build"]
             native = [(os.path.join(s3_hal, "kernel", "boot.S"),
                        os.path.join(key_build, "boot.o")),
@@ -13673,25 +13956,35 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                 flash={"bytes": flash_bytes, "instruction_window": flash_ibus,
                        "data_window": flash_dbus,
                        "window_bytes": flash_window,
-                       "magic_offset": magic_offset, "magic": magic}))
-            _run_sosimage(builder, ["native", profiles[key]])
+                       "magic_offset": magic_offset, "magic": magic,
+                       "root_slot": {"base": arch["root_slot"][0],
+                                     "len": arch["root_slot"][1]},
+                       "slots": {"base": arch["slots"][0],
+                                 "len": arch["slots"][1],
+                                 "count": arch["slots"][2]}},
+                blade=blade_bin))
+            if not python_path:
+                _run_sosimage(builder, ["native", profiles[key]])
     except ToolError as e:
         print(f"{CROSS} failed to build the native half\n{e}", file=sys.stderr)
         return 1
 
-    # Every root and child package, once, through Blade, with this board's
-    # compiler and linker. The images land under each package's
-    # `.build/<triple>/`, so nothing collides with the gate's builds.
-    pkgs = []
+    # Every root and child package, once for each role a case gives it,
+    # through Blade, with this board's compiler and linker and a script the
+    # image builder writes for the role's slot and region
+    # (`_process_placement`). The images land under each package's
+    # `.build/<triple>/`, so nothing collides with the gate's builds. The
+    # profile is the first set of keys': a package's build reads no key.
+    processes = []
     for case in process_cases:
-        for pkg in [case["root_pkg"], *case.get("children", ())]:
-            if pkg not in pkgs:
-                pkgs.append(pkg)
-    images = {}
+        for process in _case_processes(case):
+            if process not in processes:
+                processes.append(process)
     try:
-        for pkg in pkgs:
-            image = _build_root_image(blade_bin, pkg, arch, clang, lld)
-            images[pkg] = image
+        env = _blade_env(clang, lld)
+        for pkg, role in processes:
+            image = _build_process(packager, profiles[keys_used[0]], arch,
+                                   pkg, role, env)
             print(f"  {os.path.relpath(image, REPO_ROOT)}  "
                   f"({os.path.getsize(image)} bytes)")
     except ToolError as e:
@@ -13700,11 +13993,13 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # The image descriptions read a case's images by arch name, as on the
     # gate.
     for case in process_cases:
-        case.setdefault("_root_image", {})[arch["name"]] = \
-            images[case["root_pkg"]]
+        if not case.get("root_pkg"):
+            continue
+        images = [_process_image(pkg, role, arch)
+                  for pkg, role in _case_processes(case)]
+        case.setdefault("_root_image", {})[arch["name"]] = images.pop(0)
         if case.get("children"):
-            case.setdefault("_child_images", {})[arch["name"]] = \
-                [images[c] for c in case["children"]]
+            case.setdefault("_child_images", {})[arch["name"]] = images
 
     # Each kernel entry the cases boot is compiled once per set of keys,
     # before any case links one; an entry that fails is reported by each case
@@ -13718,30 +14013,47 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
 
     def build_flash(case, board=False, check=True):
         """`flash_image` over one case's image, through the builder or the
-        runner's own path. A board image is linked with no `simcall` in its
-        stops."""
+        runner's own path, with the kernel's read-only data held to the end
+        of the board's slot range (`_check_drom`). A board image is linked
+        with no `simcall` in its stops."""
+        made, elf = link_flash(case, board, check)
+        _check_drom(elf, case["name"], arch)
+        return made
+
+    def link_flash(case, board, check):
+        """`build_flash`'s image, and the ELF it was made from."""
         name = case["name"]
+        tag = "board" if board else "flash"
         if case.get("read_only_probe"):
             check_read_only_probe(case["src"])
+        if case.get("image_file"):
+            elf, printed = _build_image_file(
+                packager, profiles[variant(case)], variant_arch(variant(case)),
+                case, _blade_env(clang, lld))
+            found = re.search(r"^flash used=(\d+) end=(\d+)$", printed, re.M)
+            if not found:
+                raise ToolError(f"{name}: the image builder did not say how "
+                                f"much of the flash image it placed:\n{printed}")
+            return (elf[:-len(".elf")] + ".flash.bin", int(found.group(1)),
+                    int(found.group(2))), elf
+        elf = os.path.join(s3_build, f"{name}.{tag}.elf")
         if python_path:
-            return flash_image(name, case_objs(case), board=board,
-                               check=check)
+            return flash_image(name, case_objs(case), _child_count(case),
+                               board=board, check=check), elf
         key = variant(case)
         failure = kernel_failures[(case["src"], key)]
         if failure is not None:
             raise failure
-        tag = "board" if board else "flash"
         flash = os.path.join(s3_build, f"{name}.{tag}.bin")
         printed = _link_image(
-            builder, profiles[key], case, variant_arch(key),
-            os.path.join(s3_build, f"{name}.{tag}.elf"),
+            builder, profiles[key], case, variant_arch(key), elf,
             flash={"output": flash, "check": check},
             link_args=["--defsym=_sos_semihosting=0"] if board else [])
         found = re.search(r"^flash used=(\d+) end=(\d+)$", printed, re.M)
         if not found:
             raise ToolError(f"{name}: the image builder did not say how much "
                             f"of the flash image it placed:\n{printed}")
-        return flash, int(found.group(1)), int(found.group(2))
+        return (flash, int(found.group(1)), int(found.group(2))), elf
 
     def case_objs(case):
         """Every object one case's image links: the native half, its kernel,
@@ -14038,11 +14350,16 @@ def main():
 
         os.makedirs(C3_BUILD, exist_ok=True)
 
-        # The arch dict `_build_root_image` wants. Its `triple` is what blade
-        # and sawc are told; a root package's own artifacts live under
+        # The arch dict `_build_process` wants. Its `triple` is what blade
+        # and sawc are told; a package's own artifacts live under
         # `<package>/.build/<triple>/`, and the C3 packages are distinct
-        # packages, so nothing collides with the gate there.
-        c3_arch = {"name": "riscv32-esp32c3", "triple": C3_TRIPLE}
+        # packages, so nothing collides with the gate there. Root's region is
+        # the HAL's; child i's is the i-th from `C3_CHILD_BASE`, shorter than
+        # root's because this part's SRAM is small.
+        c3_arch = {"name": "riscv32-esp32c3", "triple": C3_TRIPLE,
+                   "root_region": (0x403A6000, 0x1F000),
+                   "child_region_base": C3_CHILD_BASE,
+                   "child_region_len": C3_CHILD_LEN}
 
         def c3_cc(src, obj, extra=()):
             _run([clang, f"--target={C3_ESP_TRIPLE}", C3_MARCH, C3_MABI,
@@ -14313,7 +14630,9 @@ def main():
                             "--module-path", SOSRT_MODULE,
                             "--module-path", SOSABI_MODULE])
 
-        # The builder reads the kernel's slab sizes for a hand-made block.
+        # The builder builds every process's package and reads the kernel's
+        # slab sizes for a hand-made block. Its profile is this board's, as
+        # far as a package's build reads one: the triple and the tools.
         try:
             _link_sawlang()
             builder = _build_sosimage(blade_bin)
@@ -14321,6 +14640,18 @@ def main():
             print(f"{CROSS} failed to build the image builder\n{e}",
                   file=sys.stderr)
             sys.exit(1)
+        c3_profile = os.path.join(C3_BUILD, "sosimage.profile.json")
+        _write_json(c3_profile, {
+            "version": SOSIMAGE_SCHEMA_VERSION, "triple": C3_TRIPLE,
+            "word_bytes": 4, "sawc": tc().sawc(), "clang": clang, "lld": lld,
+            "cc_args": [C3_MARCH, C3_MABI], "features": C3_FEATURES,
+            "module_paths": [CORE_MODULE,
+                             f"hal={os.path.join(C3_HAL, 'kernel')}",
+                             RV32_CORE_MODULE, tc().module_path_arg("imgformat"),
+                             SOSRT_MODULE, SOSABI_MODULE],
+            "linker_script": os.path.join(C3_HAL, "kernel", "esp32c3.ld"),
+            "blade": blade_bin})
+        c3_env = _blade_env(clang)
 
         # The board's `[limits.default]`, planned against this kernel as an
         # image that states no limits is, as the gate plans each of its
@@ -14348,14 +14679,16 @@ def main():
                         stub_s, os.path.join(C3_BUILD, f"{name}.slabs.o")))
                 if case["root_pkg"]:
                     objs.append(c3_payload_stub(
-                        name, _build_root_image(blade_bin, case["root_pkg"],
-                                                c3_arch, clang)))
+                        name, _build_process(builder, c3_profile, c3_arch,
+                                             case["root_pkg"], "root",
+                                             c3_env)))
                 # Every image but the tick's carries a table, whatever its
                 # rows, because the boot flags live in its header.
                 if needs_region_table(case):
                     objs.append(c3_regions_stub(
-                        name, [_build_root_image(blade_bin, pkg, c3_arch, clang)
-                               for pkg in case["children"]],
+                        name, [_build_process(builder, c3_profile, c3_arch,
+                                              pkg, f"child{i}", c3_env)
+                               for i, pkg in enumerate(case["children"])],
                         boot_flags(case)))
                 flash, size = c3_flash_image(name, objs)
                 out, halted = c3_run(flash)
@@ -14474,9 +14807,11 @@ def main():
     # Blade is architecture-neutral (a host binary), so it is built once and
     # driven per target. It builds the image builder too, which is why it is
     # built whenever the builder is used, whatever the cases need; only a run
-    # that builds packages says so.
+    # that builds packages says so. The builder builds every process's package
+    # (`packager`), on the runner's own image path too.
     blade_bin = None
     builder = None
+    packager = None
     packages = any(case.get("root_pkg") or case.get("children")
                    for case in selected_cases)
     if packages or not python_path:
@@ -14489,18 +14824,19 @@ def main():
         except ToolError as e:
             print(f"{CROSS} failed to build blade\n{e}", file=sys.stderr)
             sys.exit(1)
-        if not python_path:
-            # The builder's own tests run in the gate, which is every case on
-            # every profile; a run narrowed to some is a development run.
-            try:
-                _link_sawlang()
-                builder = _build_sosimage(blade_bin)
+        # The builder's own tests run in the gate, which is every case on
+        # every profile; a run narrowed to some is a development run.
+        try:
+            _link_sawlang()
+            packager = _build_sosimage(blade_bin)
+            if not python_path:
+                builder = packager
                 if not args.cases and not args.arch:
                     _test_sosimage(blade_bin)
-            except ToolError as e:
-                print(f"{CROSS} failed to build or test the image builder"
-                      f"\n{e}", file=sys.stderr)
-                sys.exit(1)
+        except ToolError as e:
+            print(f"{CROSS} failed to build or test the image builder"
+                  f"\n{e}", file=sys.stderr)
+            sys.exit(1)
         if packages:
             print()
 
@@ -14508,8 +14844,8 @@ def main():
     total_failed = 0
     for arch in arches:
         passed, failed = _run_arch(arch, qemus[arch["name"]], lld, clang,
-                                   blade_bin, builder, selected_cases,
-                                   args.jobs)
+                                   blade_bin, builder, packager,
+                                   selected_cases, args.jobs)
         total_passed += passed
         total_failed += failed
 

@@ -21,13 +21,14 @@ kernel/lib.saw      the `hal` module: the trap frame and its accessors, the
                     cause decoding, the Flat protection seam, UART0,
                     SYSTIMER, the interrupt matrix, the memory map
 kernel/esp32s3.ld   the flash layout across the two bus windows, with an image
-                    slot for root and one for a child, IRAM for the vectors,
+                    slot for root and the image's slots for the other
+                    processes (generated per image), IRAM for the vectors,
                     DRAM for the kernel's data
 user/syscall.c      the `syscall` stub every root and child links
-user/root.ld        root: code and read-only data in place in its flash slot
-                    at 0x10_0000, writable data from DRAM 0x3FCB_0000
-user/child.ld       a child: the same, its slot at 0x18_0000 and its DRAM
-                    from 0x3FCC_8000
+user/user.ld        every process: code and read-only data in place in its
+                    flash slot, writable data in its DRAM region, both
+                    assigned by the image builder (root's slot at 0x10_0000,
+                    its region from DRAM 0x3FCB_0000)
 keys/               an image's build keys, each a module the runner maps to
                     one of these directories: `s3clock` (`clock-rom`, the
                     default, `clock-xtal40` and `clock-pll80`) and `s3stall`
@@ -77,7 +78,8 @@ The things most likely to surprise someone arriving here:
   read-only data, the images and the region table are read at 0x3C00_0000
   (DBUS). `esp32s3.ld` lays the flash out in fixed parts: the kernel's
   fetched sections first, with the load images of `.data` and the vectors,
-  then root's image slot and a child's, then the kernel's read-only data.
+  then root's image slot and the other processes' slots (`board.toml`'s
+  `[flash]`), then the kernel's read-only data.
   `boot.S` copies `.data` and the vectors out of flash through the data bus.
   Literal pools sit below their code (`l32r` reaches only backwards). The
   kernel reads every image through the data window; a part refuses a byte
@@ -117,10 +119,11 @@ The things most likely to surprise someone arriving here:
   and its read-only data in place at its data-window address; only its
   writable data, arena and stack are at DRAM addresses, copied or granted
   there (spec §5.6). Nothing translates, so root's writable data links at
-  `ROOT_LOAD_BASE` and a resident child's at the destination the runner's
-  region table names, one linker script per resident image as on riscv32;
-  the region map is in `kernel/lib.saw` above `RAM_BASE`, and the flash
-  layout in ABI.md §13. The build refuses an image not linked for its slot.
+  `ROOT_LOAD_BASE` and a resident child's at the destination the region
+  table names, each process linked for its own slot and region by the image
+  builder through `user/user.ld`, as on riscv32; the region map is in
+  `kernel/lib.saw` above `RAM_BASE`, and the flash layout in ABI.md §13. The
+  build refuses an image not linked for its slot.
 
 The smoke's cases are in `_esp32s3_smoke` in `tools/sos_runner.py`; `--case`
 narrows it. The kernel-only ones are the gate's harness kernels of the same
@@ -133,11 +136,13 @@ cases, named there, and the board's own: `irq_line_cycle` (more lines bound
 over a life than there are CPU interrupts), `frame_hold` (every register of
 the trap frame held across ticks, in `tests/frame-hold/`), `flash_region` (a
 region over flash is no destination and no donation), `image_rows_held_flash`
-(the gate's `image_rows_held` over a flash image) and `slot_mismatch` (a root
-image linked for the child's slot, which the build refuses). Their packages
-carry a
-`[sos.xtensa-esp-unknown-elf]` section naming `user/root.ld` or
-`user/child.ld` and, as native sources, `user/syscall.c` and
+(the gate's `image_rows_held` over a flash image), `slot_mismatch` (a root
+image linked for child 0's slot, which the build refuses), `launch_all` (root
+and three processes from a hand-written description, every address the
+image builder's) and `too_many_processes` (more processes than slots,
+refused). Their packages carry a `[sos.xtensa-esp-unknown-elf]` section
+naming `user/user.ld` (or a script of their own that INCLUDEs it) and, as
+native sources, `user/syscall.c` and
 `rt/common_c/support.c`, so the same programs run on this board. Blade builds
 them with Espressif's clang and `ld.lld` (`SOS_CLANG`, `SOS_LD`) and tags them
 with the image format's Xtensa tag, which `arch_tag()` answers.
@@ -239,7 +244,7 @@ and the same with `umode_syscall`, `timer_tick`, `bus_probe` and
 directory, which git ignores. Each is the smoke case's image, linked without
 the emulator's exit (it halts in place instead) and trimmed after its last
 byte, which is the kernel's read-only data at flash offset 0x20_0000, after
-the two image slots: a little over 2 MiB, the gaps 0xFF, as erased flash
+the image slots: a little over 2 MiB, the gaps 0xFF, as erased flash
 reads (`ABI.md` §13). The runner checks the direct-boot magic at flash offset
 0x400, that byte 0 is not an esptool header, and that each process image is
 linked for the slot it sits in, and prints the image's SHA-256.

@@ -24,9 +24,10 @@ hal/riscv32-common/  # split arch/board — the arch half both riscv32 boards
                    # stub); see its README.md
 hal/riscv32/       # the riscv32 `virt` board: kernel/ (boot.S, lib.saw =
                    # the `hal` facade re-exporting rv32core, virt.ld, ABI.md)
-                   # + user/ (root.ld, child.ld/child2.ld/child3.ld, ABI.md
-                   # — one script per resident image, because an address is
-                   # the same number in every process)
+                   # + user/ (user.ld, the one script every process is
+                   # linked through, at addresses the image builder assigns
+                   # each process, because an address is the same number in
+                   # every process; ABI.md)
 hal/riscv32-flat/  # the flat build profile of that board: a facade, not a
                    # fork — it re-exports rv32core and the virt board (mapped
                    # a second time as `rv32virt`) and overrides the protection
@@ -36,8 +37,9 @@ hal/riscv32-esp32c3/ # the ESP32-C3 board, same shape — reached only by
 hal/xtensa-esp32s3/  # Xtensa (call0) and the ESP32-S3 board in one
                    # directory, as arm64's: kernel/ (boot.S with the vectors
                    # and trap entry, sink.c, lib.saw on the Flat tier,
-                   # esp32s3.ld) + user/ (the syscall stub, root.ld,
-                   # child.ld) + keys/ (an image's build keys, one module
+                   # esp32s3.ld, which INCLUDEs each image's generated
+                   # flash slots) + user/ (the syscall stub, user.ld)
+                   # + keys/ (an image's build keys, one module
                    # directory per value: the CPU clock, the console's stall
                    # count) + ABI.md, the board facts. Reached by
                    # `make sos-smoke-esp32s3`
@@ -59,13 +61,16 @@ tools/             # sos_runner.py (the harness: packages, cases, QEMU, every
                    # profile) + toolchain.py (the sawlang resolver) +
                    # sosimg_dump.py
 tools/sosimage/    # the image builder, a hosted Saw package Blade builds: it
-                   # compiles a kernel, stitches root's image, the child
-                   # images, the boot region table and the slab areas an
-                   # image's limits raise into it and links it, and on the
-                   # ESP32-S3 writes the flash image; it reads the board,
-                   # process and image descriptions and builds an image from
-                   # a hand-written one; src/main.saw lists its commands,
-                   # tests/ its own tests
+                   # builds each process's package through a script of the
+                   # process's own (its region and flash slot, the runner's
+                   # for a test image, its own for a described one, where it
+                   # measures and places them), compiles a kernel, stitches
+                   # root's image, the child images, the boot region table
+                   # and the slab areas an image's limits raise into it and
+                   # links it, and on the ESP32-S3 writes the flash image; it
+                   # reads the board, process and image descriptions and
+                   # builds an image from a hand-written one; src/main.saw
+                   # lists its commands, tests/ its own tests
 .sawlang           # (git-ignored) the runner's link to the sawlang checkout
                    # the toolchain resolved; the builder's manifest reaches
                    # `imgformat` and `toml` through it
@@ -108,19 +113,27 @@ them, the in-place check, the slab-region check, and every board, process
 and image description in the tree read clean), which need no emulator and
 print nothing when they pass. Per profile it writes a profile description
 (JSON) and calls `sosimage native`, then `sosimage board` on the profile's
-`hal/<profile>/board.toml`, then `sosimage kernel` once for each kernel entry
-the cases use and for the shipping kernel, then `sosimage defaults`; per case
-it writes an image description into the case's staging directory and calls
-`sosimage link`, which refuses an image whose slab areas lie outside the
-board's slab region (a script that does not gather `.bss.sos_slab*`).
-`src/profile.saw` and
-`src/image.saw` state the two schemas. A builder failure is the case's build
-error, with the builder's message.
+`hal/<profile>/board.toml`, then `sosimage package` once for each package
+and role (root, or child i) the cases give it, which writes the process's
+script (its region, and on the S3 its flash slot, from `_process_placement`)
+and has Blade link the package through it into
+`<package>/.build/<triple>/<role>.sosimg`, then `sosimage kernel` once for
+each kernel entry the cases use and for the shipping kernel, then
+`sosimage defaults`; per case it writes an image
+description into the case's staging directory and calls `sosimage link`,
+which refuses an image whose slab areas lie outside the board's slab region
+(a script that does not gather `.bss.sos_slab*`). A case with an
+`image_file` is built from its description instead (`sosimage build`, which
+measures and places every process itself), and `FROM_FILES` cases take the
+images and regions their description's build placed. `src/profile.saw`,
+`src/image.saw` and `src/package.saw` state the three schemas. A builder
+failure is the case's build error, with the builder's message.
 
 `sosimage board` holds a board file to the tree (`hal` is the file's own
 directory), to the profile (triple, C flags, every module but the kernel's
-own both ways, the flash's length and windows), to the board's linker script
-on an in-place board (the flash's base, root's slot and the child slots),
+own both ways, the flash's length, windows, root's slot and the slot range),
+to the board's linker script on an in-place board (the flash's base, length
+and windows; the slots are each image's, which the builder writes),
 and to the HAL's numbers, read by compiling a module that exports them (the
 console window, the device grain, the kernel range beginning at
 `KERNEL_RAM_BASE` and ending where root's region begins, each process range
@@ -134,10 +147,14 @@ is held to no profile or HAL, and only its `[limits.default]` is planned
 (below).
 
 `sosimage build` builds an image from a hand-written description
-(`tests/images/`). After `uart_service_ns16550` passes on riscv32 and on
-riscv32-flat, the runner builds its description with it and fails the profile
-unless the ELF is the case's, byte for byte (`FROM_FILES`); a match prints
-nothing.
+(`tests/images/`). It builds each process's package itself, once where the
+process would go first, to measure it, then where the regions put it
+(`tools/sosimage/src/layout.saw`). Before `uart_service_ns16550` is linked on
+riscv32 and on riscv32-flat, the runner builds its description and gives the
+case the images and regions it placed; after the case passes, it fails the
+profile unless the description's ELF is the case's, byte for byte
+(`FROM_FILES`), which holds the rows, the limits and the link the two make
+apart, the images and their placements being shared; a match prints nothing.
 
 A case may state `limits`, which the image description carries and the
 builder turns into linked slab areas and the block after the table's rows, or

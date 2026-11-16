@@ -125,7 +125,7 @@ QEMU prints `Adding SPI flash device` on stderr when a drive is attached and
 A board image is the same bytes cut after the last one placed, written at
 flash offset 0x0 (`tools/sos_runner.py --board esp32s3 --emit-flash CASE
 --out PATH`). `esp32s3.ld` places the kernel's read-only data last, at flash
-offset 0x20_0000, after root's and a child's image slots (§13), so a board
+offset 0x20_0000, after root's image slot and the children's (§13), so a board
 image is a little over 2 MiB whatever the case, its gaps 0xFF, as erased
 flash reads. The build reads each resident image back out of it and refuses
 one not linked for its slot, as for the smoke's images. Padded back to 4 MiB
@@ -1487,7 +1487,7 @@ a board" is the order to find out in.
   window is refused as the kernel's is; nothing in this layout makes one,
   and the core has no privilege that could tell the modes apart.
 - **Flash past the first pages** (§13). This layout reads root's image at
-  flash 0x10_0000, a child's at 0x18_0000 and the kernel's read-only data at
+  flash 0x10_0000, a child's from 0x18_0000 and the kernel's read-only data at
   0x20_0000, through both windows, so the kernel's first string is a byte
   load at 0x3C20_0000. The ROM's direct boot maps 0x200 pages of 64 KiB at
   each window before it enters the image, as read from its code (§2a), which
@@ -1587,18 +1587,34 @@ flash (offset, instruction window, data window)
 0x00_0000  0x4200_0000  0x3C00_0000  the kernel: magic, entry, code, the
                                      load images of the vectors and .data
 0x10_0000  0x4210_0000  0x3C10_0000  root's image slot (512 KiB)
-0x18_0000  0x4218_0000  0x3C18_0000  a child's image slot (512 KiB)
+0x18_0000  0x4218_0000  0x3C18_0000  child 0's image slot (128 KiB)
+0x1A_0000  0x421A_0000  0x3C1A_0000  child 1's, then 2's and 3's
 0x20_0000  0x4220_0000  0x3C20_0000  the kernel's .rodata, the region table
 
 RAM
 IRAM 0x4037_8000 - 0x4037_BFFF  kernel vectors + trap path
 DRAM 0x3FC8_C000 - 0x3FCA_FFFF  kernel .data + .bss (arena, 64K stack)
 DRAM 0x3FCB_0000 - 0x3FCC_7FFF  root's region: writable data + arena, the
-                                top 16 KiB its stack (`user/root.ld`)
-DRAM 0x3FCC_8000 - 0x3FCD_FFFF  a child's region, the same shape
-                                (`user/child.ld`)
-DRAM 0x3FCE_0000 - 0x3FCE_FFFF  the RAM pool a case may ask for
+                                top 16 KiB its stack
+DRAM 0x3FCC_8000 - ...          the other processes' regions, the same shape
 ```
+
+A slot is one of the `count` equal parts of the board's slot range
+(`board.toml`'s `[flash] slots`), and child i of an image takes slot i, so an
+image has at most `count` processes besides root; the builder refuses one with
+more. The image builder writes the slots for each image into the
+`image_slots.ld` the kernel's script INCLUDEs (`tools/sosimage/src/layout.saw`).
+The kernel's read-only data begins at the end of the slot range, behind every
+slot, so it lies at one offset whatever an image's process count, and a slot
+an image does not use is erased flash.
+
+A process's region is the RAM it takes: on this board, where code and
+read-only data stay in flash, its writable segment (`.data`, `.bss`, the
+arena) rounded up to 16 bytes, with the 16 KiB stack on top. That is the
+in-place case of the rule a copied board's region follows with every segment
+in it. A test image's regions are the runner's; for one built from a
+description the builder measures each process by a first link and places the
+regions one after another from root's top (`tools/sosimage/src/layout.saw`).
 
 `kernel/esp32s3.ld` places each part and fails the link if the kernel's code
 reaches root's slot or an image overruns its slot. The kernel holds every
@@ -1610,7 +1626,8 @@ refuses (§3c).
 
 Each image is a Blade-built sosimg of three segments: a 24-byte header, three
 24-byte records, then the segments' bytes in order on 4-byte boundaries.
-`user/root.ld` and `user/child.ld` link to that packing:
+`user/user.ld`, the one script every process is linked through, links to
+that packing:
 
 ```
 slot + 0x60          code and literal pools, R+X: linked at the slot's
@@ -1621,18 +1638,18 @@ the region's base    .data, .bss, the arena, R+W: DRAM, copied
 the region's top     the stack the kernel grants, 16 KiB, DRAM
 ```
 
-The build holds the link addresses to the bytes three times: the scripts'
+The build holds the link addresses to the bytes three times: the script's
 `ASSERT`s (the code at the slot plus 0x60, the read-only data right behind
 it, each of the three sections non-empty, since an empty one would take a
-record out of the table), the runner, which reads each image back out of the
-flash image it built and refuses the build when a segment is not linked at
-its own bytes (`check_in_place` in `tools/sos_runner.py`, which names both
-addresses), and the loader, which uses a segment in place only when
-`hal.same_bytes` says its link address names its bytes and would copy every
-other one, but on this board refuses any segment it would copy to an address
-outside process RAM (`hal.segment_bus_ok`): an executable segment not in
-place, and a read-only or writable one linked in flash but not at its own
-bytes.
+record out of the table), the image builder, which reads each image back out
+of the flash image it built and refuses the build when a segment is not
+linked at its own bytes (`check_in_place` in `tools/sosimage/src/flash.saw`,
+which names both addresses), and the loader, which uses a segment in place
+only when `hal.same_bytes` says its link address names its bytes and would
+copy every other one, but on this board refuses any segment it would copy to
+an address outside process RAM (`hal.segment_bus_ok`): an executable segment
+not in place, and a read-only or writable one linked in flash but not at its
+own bytes.
 
 No range above is the DRAM twin of another (§3a's alias, IRAM + n against
 DRAM 0x3FC8_8000 + n). The process regions include the ROM's RAM (§3b):

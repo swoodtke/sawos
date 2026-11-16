@@ -1,6 +1,6 @@
 /* SOS test child linker script: riscv32, one writable and executable segment.
  *
- * `hal/riscv32/user/child.ld`'s addresses and arena, with every section in ONE
+ * `hal/riscv32/user/user.ld`'s addresses and arena, with every section in ONE
  * loadable segment that is readable, writable and executable (`FLAGS(7)`),
  * which the loader accepts (spec §2.5). Its row permits read and write, so
  * only the execute rule keeps a buffer out of it.
@@ -16,11 +16,11 @@ PHDRS {
 }
 
 MEMORY {
-    CHILD (rwxa) : ORIGIN = 0x80240000, LENGTH = 240K
+    CHILD (rwxa) : ORIGIN = SOS_REGION_BASE, LENGTH = SOS_REGION_LEN - SOS_STACK_LEN
 }
 
 SECTIONS {
-    . = 0x80240000;
+    . = SOS_REGION_BASE;
 
     .text : {
         *(.text .text.*)

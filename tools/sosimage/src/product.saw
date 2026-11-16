@@ -7,41 +7,52 @@
 //! profile and its HAL (`sosimage.boardcheck`) before the image is read.
 //!
 //! A package is `sawos:PATH` in the sawos tree, or a path from the product's
-//! root. Its image is the one Blade built for the board's triple, in the
-//! package's `.build/<triple>/`, named for the package as its `Saw.toml`
-//! names it; a package not yet built is refused, naming the command that
-//! builds it.
+//! root. The builder builds every process's package itself, each instance
+//! its own link named for its process (`sosimage.package`), at the addresses
+//! it assigns (`sosimage.layout`): root's region is the HAL's and root's
+//! slot the board's; each other process is linked once where it would go
+//! first, its RAM measured from that link, and linked again where the
+//! regions put it when that is elsewhere. A process whose package has a
+//! `process.toml` that declares `ram = "fast"` is placed in a fast range, or
+//! refused by name on a board with none (`declares_fast`, `choose_range`); a
+//! hand-written root's process names no range, and no other part of its
+//! declaration is read. Every address is printed, a line per process and per
+//! pool:
 //!
-//! A hand-written root's image is linked like a test image (`link`). Its
-//! region table's rows are, in order: one image blob per process, one
-//! destination per process, then `[rows] devices`. Process `i`'s destination
-//! is the `i`-th region above root's, each as long as root's: the regions
-//! the processes' link scripts are written for. A destination outside the
-//! board's default process range is refused at the process's line, as every
-//! refusal of the description is, before any package's image is looked for
-//! or the kernel is compiled; only the HAL's numbers, which root's region is,
-//! are compiled first. The image's `[limits]` over the
-//! board's `[limits.default]`, each a total, become the slots each kind is
-//! raised by above the kernel's floor; a total below the floor is refused,
-//! since an image raises and never lowers.
+//!     process NAME region=BASE+LEN slot=BASE+LEN
+//!     pool NAME region=BASE+LEN
 //!
-//! An image with the stock root is read and bound, and what binding found is
-//! printed; building it is refused, since the stock root is not part of this
-//! builder. So is an image with pools: a pool's address comes from computed
-//! regions, which this builder does not compute.
+//! `slot` only on an in-place board. An image with more processes besides
+//! root than the board has slots is refused before anything is built, and a
+//! region or a pool that runs past its range once the processes are measured,
+//! naming it and the range, before the kernel is compiled.
+//!
+//! A hand-written root's region table's rows are, in order: one image blob per
+//! process, one destination per process (its region), then `[rows] devices`,
+//! then `[rows] pools`, each its pool's region (`image_rows`). The image's `[limits]` over the board's
+//! `[limits.default]`, each a total, become the slots each kind is raised by
+//! above the kernel's floor; a total below the floor is refused, since an
+//! image raises and never lowers.
+//!
+//! An image with the stock root is read and bound, which places each process
+//! in a range (`bind`), and what binding found is printed; building it is
+//! refused, since the stock root is not part of this builder.
 
 import std.directory.{Directory}
 import std.file.{File}
 import std.path.{Path}
-import toml.{TomlDoc}
-import sosimage.board.{Board, LimitsSpec, NamedCount}
+import sosimage.board.{Board, LimitsSpec, NamedCount, Span}
 import sosimage.boardcheck.{HalFacts, check_board, hal_facts}
 import sosimage.build.{Linked, build_kernel, ensure_directory, link}
+import sosimage.flash.{load_segments}
+import sosimage.layout.{Ask, Placement, child_slots, choose_range, first_placement, place,
+                        ram_span, region_align}
+import sosimage.package.{build_process}
 import sosimage.declaration.{Declaration}
 import sosimage.failure.{BuildError}
 import sosimage.hex.{hex}
 import sosimage.image.{FlashOutput, ImageSpec, RowSpec}
-import sosimage.imagefile.{ImageFile, bind, image_board}
+import sosimage.imagefile.{ImageFile, ProcessEntry, bind, image_board}
 import sosimage.kernel.{
     ATTACHMENTS, EVENTS, INTERRUPTS, IOMEMORIES, KernelFacts, MAPPINGS, MEMORIES,
     PIPES, PROCESSES, PROCESS_RECORDS, THREADS, TIMERS, WAITERS,
@@ -49,8 +60,7 @@ import sosimage.kernel.{
 import sosimage.limits.{ImageLimits, plan_limits}
 import sosimage.profile.{Profile}
 import sosimage.regions.{BOOT_FLAG_NO_TICK, RegionKind}
-import sosimage.rules.{refused}
-import sosimage.tool.{read_text}
+import sosimage.tool.{read_file, read_text}
 
 /// The board under `<sawos>/hal/` whose description names `name`.
 public func find_board(sawos: String, name: String) -> Result<Board, BuildError> {
@@ -89,30 +99,6 @@ public func package_dir(package: String, sawos: String, product: String) -> Stri
         return "{sawos}/{package.substring(6, package.len())}"
     }
     "{product}/{package}"
-}
-
-/// The image Blade built of the package in `dir` for `triple`.
-public func package_image(dir: String, triple: String) -> Result<String, BuildError> {
-    let manifest = "{dir}/Saw.toml"
-    let text = try read_text(manifest)
-    let doc = try TomlDoc.parse(text) catch {
-        return BuildError(message: "{manifest}: {error}")
-    }
-    var name = ""
-    borrow let root = doc.root() {
-        if let p = root.table("package") {
-            name = try p.string("name") catch {
-                return BuildError(message: "{manifest}: {error}")
-            }
-        } else {
-            return BuildError(message: "{manifest} has no [package]")
-        }
-    }
-    let image = "{dir}/.build/{triple}/{name}.sosimg"
-    if not File.exists(Path(s: image)) {
-        return BuildError(message: "the package {dir} has no image for {triple} at {image}: build it first (`blade build --target {triple}` in {dir})")
-    }
-    return image
 }
 
 /// The `SlabKind` a `[limits]` key totals.
@@ -195,9 +181,10 @@ public func board_defaults(board: &Board, facts: &KernelFacts) -> Result<ImageLi
 }
 
 /// Builds the image the description at `path` states, for the board its
-/// profile is, into `out`: `<out>/kernel-main.o`, then `<out>/<name>.elf`
-/// and, for a board with a flash, `<out>/<name>.flash.bin`; the generated
-/// files go in `<out>/<name>.image/`.
+/// profile is, into `out`: each process's package as the module's header
+/// lays out (`sosimage.package`, root's as `root`), `<out>/kernel-main.o`,
+/// then `<out>/<name>.elf` and, for a board with a flash,
+/// `<out>/<name>.flash.bin`; the generated files go in `<out>/<name>.image/`.
 public func build_image(profile: &Profile, sawos: String, product: String, path: String,
                         out: String) -> Result<Linked, BuildError> {
     let text = try read_text(path)
@@ -225,55 +212,84 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
         }
         return BuildError(message: "{path}: an image with the stock root is read and bound, and this builder does not build the stock root")
     }
-    if image.pools.len() > 0 {
-        return BuildError(message: "{path}: the image has pools, and this builder places none: a pool's address comes from computed regions")
-    }
 
-    // The rows, and every refusal of the layout, before anything is built.
-    var rows = Vector<RowSpec>()
+    // Every refusal that needs no build, before anything is built.
+    let count = image.processes.len()
+    var slots = Vector<Span>()
+    var root_slot: Span? = None
+    if let flash = board.flash {
+        slots = try child_slots(flash.slots, flash.slot_count, count, path)
+        root_slot = flash.root_slot
+    }
+    let align = region_align(facts.grain, board.placement)
+    let root_region = Span(base: facts.root_base, len: facts.root_top - facts.root_base)
+    let stack = facts.stack_len
+
+    let root = try build_process(&profile, "root", package_dir(image.root_package, sawos, product),
+                                 out, &Placement(region: root_region, stack: stack, slot: root_slot))
+
+    // Each process linked where it would go first, and measured.
+    var asks = Vector<Ask>()
+    var firsts = Vector<Placement>()
     var i = 0
-    while i < image.processes.len() {
+    while i < count {
         let process = image.processes.get(i)!
-        try! rows.push(RowSpec(what: "{process.name}'s image blob", kind: RegionKind.Ram,
-                               blob: i, base: 0, len: 0))
+        let range_name = try process_range(&board, &process, package_dir(process.package, sawos, product),
+                                           path)
+        let first = try first_placement(&board, root_region, align, stack, range_name,
+                                        slots.get(i), process.name, path, process.at)
+        let built = try build_process(&profile, process.name, package_dir(process.package, sawos, product),
+                                      out, &first)
+        let elf = try read_file(built.elf)
+        let segments = try load_segments(&elf, built.elf)
+        let bytes = try ram_span(&segments, board.placement, "the process {process.name}'s image {built.elf}")
+        try! asks.push(Ask(name: process.name, range: range_name, bytes: bytes, pool: false,
+                           at: process.at))
+        try! firsts.push(first)
         i = i + 1
     }
-    let region = facts.root_top - facts.root_base
-    guard let range = board.range(board.default_process) else {
-        return BuildError(message: "{path}: internal: the default process range vanished")
+    var p = 0
+    while p < image.pools.len() {
+        let pool = image.pools.get(p)!
+        p = p + 1
+        let range_name = if pool.ram.is_empty() { board.default_pool } else { pool.ram }
+        try! asks.push(Ask(name: pool.name, range: range_name, bytes: pool.len, pool: true,
+                           at: pool.at))
     }
-    i = 0
-    while i < image.processes.len() {
-        let process = image.processes.get(i)!
-        let base = facts.root_top + (i as UInt64) * region
-        if base + region > range.base + range.len {
-            return refused(path, process.at, "the process {process.name}'s region, {hex(region)} bytes at {hex(base)}, runs past the board's {range.name} range, which ends at {hex(range.base + range.len)}")
-        }
-        try! rows.push(RowSpec(what: "{process.name}'s destination RAM", kind: RegionKind.Ram,
-                               blob: None, base: base, len: region))
-        i = i + 1
-    }
-    i = 0
-    while i < image.row_devices.len() {
-        let row = image.row_devices.get(i)!
-        try! rows.push(RowSpec(what: "{row.window.device}'s window", kind: RegionKind.Device,
-                               blob: None, base: row.window.base, len: row.window.len))
-        i = i + 1
-    }
+    let regions = try place(&board, root_region, align, stack, &asks, path)
 
-    let triple = board.triple
-    let root_image = try package_image(package_dir(image.root_package, sawos, product), triple)
+    // Each process linked again where its region is, unless that is where it
+    // was first linked; a translated board links every image at one base.
     var children = Vector<String>()
     i = 0
-    while i < image.processes.len() {
+    while i < count {
         let process = image.processes.get(i)!
+        let region = regions.get(i)!
+        let final_ = Placement(region: region, stack: stack, slot: slots.get(i))
+        let first = firsts.get(i)!
+        var line = "process {process.name} region={hex(region.base)}+{hex(region.len)}"
+        if let slot = final_.slot {
+            line = "{line} slot={hex(slot.base)}+{hex(slot.len)}"
+        }
+        print(line)
+        if not board.placement.equals("translated") && region.base != first.region.base {
+            let _ = try build_process(&profile, process.name, package_dir(process.package, sawos, product),
+                                      out, &final_)
+        }
+        try! children.push("{out}/{process.name}.sosimg")
         i = i + 1
-        try! children.push(try package_image(package_dir(process.package, sawos, product), triple))
     }
+    p = 0
+    while p < image.pools.len() {
+        let region = regions.get(count + p)!
+        print("pool {(image.pools.get(p)!).name} region={hex(region.base)}+{hex(region.len)}")
+        p = p + 1
+    }
+
+    let rows = image_rows(&image, &regions)
 
     let kernel = "{out}/kernel-main.o"
     try build_kernel(&profile, "{sawos}/kernel/main.saw", kernel)
-
 
     var stated = Vector<LimitsSpec>()
     if board.has_limits {
@@ -295,9 +311,73 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
     let spec = ImageSpec(name: image.name, kernel: kernel,
                          staging: "{out}/{image.name}.image",
                          output: "{out}/{image.name}.elf", asm: "", child_asm: "",
-                         root_image: root_image, children: move children,
+                         root_image: root.image, children: move children,
                          has_regions: true, flags: if image.tick { 0 } else { BOOT_FLAG_NO_TICK },
                          rows: move rows, has_limits: stated.len() > 0,
                          limits: move limits, link_args: Vector<String>(), flash: flash)
     link(&profile, &spec)
+}
+
+/// The range a hand-written root's process is placed in: the one its image
+/// names, else one its package's declaration allows (`declares_fast`,
+/// `choose_range`); `dir` is the package's directory and `file` the image's.
+public func process_range(board: &Board, process: &ProcessEntry, dir: String,
+                          file: String) -> Result<String, BuildError> {
+    let fast = try declares_fast(dir)
+    choose_range(&board, process.ram, fast, process.name, file, process.at)
+}
+
+/// Whether the package in `dir` declares `ram = "fast"` in a `process.toml`
+/// beside its manifest; a package with none declares nothing.
+public func declares_fast(dir: String) -> Result<Bool, BuildError> {
+    let file = "{dir}/process.toml"
+    if not File.exists(Path(s: file)) {
+        return false
+    }
+    let d = try Declaration.parse(try read_text(file), file)
+    return d.fast
+}
+
+/// A hand-written root's region table, from its image and the `regions`
+/// placed for it (each process's, in order, then each pool's): an image blob
+/// per process, a destination per process, then `[rows] devices`, then
+/// `[rows] pools`, each pool's row its own region.
+public func image_rows(image: &ImageFile, regions: &Vector<Span>) -> Vector<RowSpec> {
+    let count = image.processes.len()
+    var rows = Vector<RowSpec>()
+    var i = 0
+    while i < count {
+        let process = image.processes.get(i)!
+        try! rows.push(RowSpec(what: "{process.name}'s image blob", kind: RegionKind.Ram,
+                               blob: i, base: 0, len: 0))
+        i = i + 1
+    }
+    i = 0
+    while i < count {
+        let process = image.processes.get(i)!
+        let region = regions.get(i)!
+        try! rows.push(RowSpec(what: "{process.name}'s destination RAM", kind: RegionKind.Ram,
+                               blob: None, base: region.base, len: region.len))
+        i = i + 1
+    }
+    i = 0
+    while i < image.row_devices.len() {
+        let row = image.row_devices.get(i)!
+        try! rows.push(RowSpec(what: "{row.window.device}'s window", kind: RegionKind.Device,
+                               blob: None, base: row.window.base, len: row.window.len))
+        i = i + 1
+    }
+    i = 0
+    while i < image.row_pools.len() {
+        let name = image.row_pools.get(i) ?? ""
+        i = i + 1
+        var k = 0
+        while k < image.pools.len() && not (image.pools.get(k)!).name.equals(name) {
+            k = k + 1
+        }
+        let region = regions.get(count + k)!
+        try! rows.push(RowSpec(what: "the pool {name}", kind: RegionKind.Pool,
+                               blob: None, base: region.base, len: region.len))
+    }
+    move rows
 }

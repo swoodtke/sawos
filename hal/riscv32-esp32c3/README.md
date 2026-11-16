@@ -19,7 +19,8 @@ kernel/lib.saw      Espressif UART, SYSTIMER, the interrupt matrix, the
                     shared `rv32core` as `hal`
 kernel/esp32c3.ld   the XIP layout; its `.magic` section is the
                     direct-boot protocol
-user/root.ld        root at 0x403A_6000    user/child.ld  child at 0x403C_5000
+user/user.ld        every process, linked for the region the image builder
+                    gives it: root at 0x403A_6000, a child from 0x403C_5000
 ABI.md              every address, with the probe that produced it
 
   ../riscv32-common/kernel/trap.S    trap entry + M->U transition, shared
@@ -58,9 +59,9 @@ The things most likely to surprise someone arriving here:
 Every board difference in `kernel/lib.saw` is marked `BOARD (C3)` where it sits.
 
 The linker scripts are the one thing still copied from the virt board:
-`kernel/esp32c3.ld`, `user/root.ld` and `user/child.ld` are sibling copies of
-`hal/riscv32/kernel/virt.ld`, `hal/riscv32/user/root.ld` and
-`hal/riscv32/user/child.ld`. The section layout, wildcards and the
+`kernel/esp32c3.ld` and `user/user.ld` are sibling copies of
+`hal/riscv32/kernel/virt.ld` and `hal/riscv32/user/user.ld`. The section
+layout, wildcards and the
 `.payload`/`.regions`/`.childimg` contract are the virt scripts'; what differs
 is the memory map and, in `esp32c3.ld`, the arena size (16K against `virt.ld`'s)
 and the XIP split with its `.magic` section. The pairs are not generated from

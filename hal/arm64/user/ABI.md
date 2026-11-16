@@ -22,10 +22,10 @@ the other language, and nothing at build time compares the two (a Saw static's
 value is not a linker symbol). The loader's `check_segment` catches a
 disagreement with a named diagnostic rather than a silent misplacement.
 
-`hal/riscv32/user/` carries four scripts: `root.ld` plus
-`child.ld`/`child2.ld`/`child3.ld`. That is the shape of the cost: on a tier
-that does not translate, a script per resident image; here, one script whatever
-the process count.
+On riscv32 the image builder links each resident image for its own region,
+since on a tier that does not translate an address is the same number in
+every process; here every image links at one base whatever the process
+count, and only its region's length reaches the script.
 
 ## Which altitude is supported for whom
 

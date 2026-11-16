@@ -3,4 +3,4 @@
 ARENA_SIZE = 0;
 WINDOWED_CHILD_ACT = 6;
 
-INCLUDE ../../hal/xtensa-esp32s3/user/child.ld
+INCLUDE ../../hal/xtensa-esp32s3/user/user.ld

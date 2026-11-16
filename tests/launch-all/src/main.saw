@@ -1,0 +1,166 @@
+// A hand-written root that launches every child its image carries.
+//
+// It is the root of the images built from descriptions (`tests/images/`),
+// whose region tables the builder writes in the order a hand-written root's
+// image has: an image blob per process, a destination per process, then the
+// image's pools. This root holds that order as its config: it drains its
+// boot set, takes every allocation in order and the pool rows apart, and
+// reads the first half of the allocations as images and the second as their
+// destinations, child i's image beside child i's destination.
+//
+// Each child is created, given a masked System handle, started, and waited
+// for: its Process handle is attached to a Waiter of its own before the
+// start, so the only thing that wakes root is that child's end, and the
+// children run one at a time, in order. Every destination is a region the builder placed, so a
+// child that runs at all ran in the region its image was linked for.
+//
+// Then, with a pool, root allocates a page out of it, which is the pool the
+// builder placed after the processes in its range.
+//
+//   SOS launch: 4 children, 1 pool
+//   ...each child's own lines...
+//   SOS launch: child 0 ended status=65543
+//   ...
+//   SOS launch: the pool gave 4096 bytes
+//   SOS launch: done
+
+import sos.{System, Process, Memory, Pool, Waiter, WaitResult, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The key each child's Process handle is attached under.
+static KEY: UInt = 50
+
+/// The tag a child's System handle travels under.
+static TAG_BOOT: UInt = 21
+
+/// What a child may ask its System object for: print, and learn its own
+/// Process object, which its `exit` goes through. `Transfer` is the bit
+/// `give` checks on the thing given.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// How much root allocates out of a pool.
+static POOL_PIECE: UInt = 0x1000
+
+/// The §8 status word out of a record: this program attaches only Processes.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this program attached only a Process"),
+    }
+}
+
+func fail(system: &System) {
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS launch: no process handle\n")
+        fail(&system)
+        return
+    }
+
+    var regions = Vector<Memory>()
+    var pools = Vector<Pool>()
+    var going = true
+    while going {
+        match proc.boot_handle_next() {
+            case Ok(record) -> {
+                var r = move record
+                if let pool = r.take_pool() {
+                    try! pools.push(move pool)
+                } else if let memory = r.take_memory() {
+                    try! regions.push(move memory)
+                } else {
+                    let _ = system.debug_print("SOS launch: a boot record is neither an allocation nor a pool\n")
+                    fail(&system)
+                    return
+                }
+            },
+            case Err(status) -> {
+                if status != SosStatus.Drained {
+                    print("SOS launch: the boot set: {}\n", status)
+                    fail(&system)
+                    return
+                }
+                going = false
+            },
+        }
+    }
+    if regions.len() % 2 != 0 {
+        print("SOS launch: {} allocations, not an image and a destination per child\n",
+              regions.len())
+        fail(&system)
+        return
+    }
+    let count = regions.len() / 2
+    print("SOS launch: {} children, {} pool\n", count, pools.len())
+
+    var i = 0
+    while i < count {
+        borrow let image = regions[i] {
+            borrow let dest = regions[count + i] {
+                let child = try system.process_create(image: &image, memory: &dest) catch {
+                    print("SOS launch: child {} not created: {}\n", i, error)
+                    fail(&system)
+                    return
+                }
+                // A Waiter of its own: a death is a level, so a Waiter that
+                // held the last child would answer for it again.
+                let waiter = try proc.waiter_create() catch {
+                    print("SOS launch: no waiter: {}\n", error)
+                    fail(&system)
+                    return
+                }
+                try waiter.add(process: &child, key: KEY + (i as UInt)) catch {
+                    print("SOS launch: child {} not attached: {}\n", i, error)
+                    fail(&system)
+                    return
+                }
+                let for_child = try system.mint(rights: CHILD_SYSTEM) catch {
+                    print("SOS launch: mint failed: {}\n", error)
+                    fail(&system)
+                    return
+                }
+                try child.give(system: move for_child, tag: TAG_BOOT) catch {
+                    print("SOS launch: give failed: {}\n", error.0)
+                    fail(&system)
+                    return
+                }
+                try child.start(boot_tag: TAG_BOOT) catch {
+                    print("SOS launch: child {} not started: {}\n", i, error)
+                    fail(&system)
+                    return
+                }
+                let record = try waiter.wait() catch {
+                    print("SOS launch: wait failed: {}\n", error)
+                    fail(&system)
+                    return
+                }
+                print("SOS launch: child {} ended status={}\n", record.key - KEY, status_of(&record))
+            }
+        }
+        i = i + 1
+    }
+
+    var p = 0
+    while p < pools.len() {
+        borrow let pool = pools[p] {
+            let _piece = try pool.allocate(len: POOL_PIECE) catch {
+                print("SOS launch: the pool gave nothing: {}\n", error)
+                fail(&system)
+                return
+            }
+            print("SOS launch: the pool gave {} bytes\n", POOL_PIECE)
+        }
+        p = p + 1
+    }
+    print("SOS launch: done\n")
+    let _ = proc.exit(EXIT_OK)
+}

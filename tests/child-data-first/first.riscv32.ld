@@ -1,6 +1,6 @@
 /* SOS test child linker script: riscv32, writable data first.
  *
- * `hal/riscv32/user/child2.ld`'s addresses and arena, with the writable data
+ * `hal/riscv32/user/user.ld`'s addresses and arena, with the writable data
  * and its zero-init linked at the base and the code and read-only data after
  * them. The writable segment is the image's first, so it is the first grant
  * row the loader records for the process. `_image_start` and `_text_start`
@@ -19,11 +19,11 @@ PHDRS {
 }
 
 MEMORY {
-    CHILD2 (rwxa) : ORIGIN = 0x80280000, LENGTH = 240K
+    CHILD2 (rwxa) : ORIGIN = SOS_REGION_BASE, LENGTH = SOS_REGION_LEN - SOS_STACK_LEN
 }
 
 SECTIONS {
-    . = 0x80280000;
+    . = SOS_REGION_BASE;
     _image_start = .;
 
     .data : {

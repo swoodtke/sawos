@@ -19,4 +19,4 @@
  */
 ARENA_SIZE = 8K;
 
-INCLUDE ../../hal/riscv32/user/root.ld
+INCLUDE ../../hal/riscv32/user/user.ld

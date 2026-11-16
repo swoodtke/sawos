@@ -49,8 +49,9 @@
  * `ARENA_SIZE` and `KERNEL_STACK_SIZE` knobs below are the levers when it does
  * not fit.
  *
- * The root and child numbers are not set here: root.ld, child.ld and the HAL's
- * `lib.saw` (`ROOT_LOAD_BASE`, `ROOT_REGION_TOP`) own them, the harness's
+ * The root and child numbers are not set here: the HAL's `lib.saw`
+ * (`ROOT_LOAD_BASE`, `ROOT_REGION_TOP`) owns root's, the image builder links
+ * each process for its region through `../user/user.ld`, the harness's
  * region table publishes the child's destination, and the kernel validates
  * every segment against its region before placing it. The pool is a reservation
  * in this budget only; this board's region table has no pool row.

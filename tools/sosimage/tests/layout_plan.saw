@@ -1,0 +1,224 @@
+// Where a process is linked: the range a process is placed in, the RAM a
+// linked image takes, regions placed in their ranges and each overrun
+// refused by name, the flash slots and their refusal, and the scripts the
+// builder writes.
+
+import toml.{TomlPosition}
+import sosimage.board.{Board, Span}
+import sosimage.failure.{BuildError}
+import sosimage.flash.{LoadSegment}
+import sosimage.layout.{Ask, Placement, child_slots, choose_range, first_placement, image_slots,
+                        place, process_script, ram_span, region_align, round_up}
+
+func at() -> TomlPosition {
+    TomlPosition(line: 3, column: 1)
+}
+
+// A board with a kernel range, a fast process range `main` from 0x1000 for
+// 0x8000 bytes and a slow one `bulk` from 0x10000 for 0x1000; `default_range`
+// is the process default.
+func board(default_range: String, main_speed: String) -> Board {
+    let lines: Vector<String> = ["format = 1", "[board]", "name = \"b\"",
+        "triple = \"riscv32-unknown-none-elf\"", "tier = \"flat\"", "hal = \"hal/b\"",
+        "placement = \"copied\"", "modules = []", "cflags = []", "[emulator]",
+        "program = \"q\"", "args = []", "[ram.kernel]", "use = \"kernel\"", "speed = \"fast\"",
+        "base = 0", "len = 0x1000", "[ram.main]", "use = \"process\"",
+        "speed = \"{main_speed}\"", "base = 0x1000", "len = 0x8000", "[ram.bulk]",
+        "use = \"process\"", "speed = \"slow\"", "base = 0x1_0000", "len = 0x1000",
+        "[ram.default]", "process = \"{default_range}\"", "pool = \"bulk\""]
+    try! Board.parse(lines.join("\n"), "b.toml")
+}
+
+func message(r: Result<String, BuildError>) -> String {
+    match r {
+        case Ok(v) -> "ok {v}",
+        case Err(e) -> e.message
+    }
+}
+
+func span_message(r: Result<UInt64, BuildError>) -> String {
+    match r {
+        case Ok(v) -> "ok {v}",
+        case Err(e) -> e.message
+    }
+}
+
+func expect(got: String, want: String) {
+    if not got.equals(want) {
+        print("expected: {want}")
+        print("got:      {got}")
+    }
+    assert(got.equals(want), "the layout's answer")
+}
+
+func spans(asks: &Vector<Ask>, b: &Board) -> String {
+    spans_aligned(&asks, &b, 16)
+}
+
+func spans_aligned(asks: &Vector<Ask>, b: &Board, align: UInt64) -> String {
+    match place(&b, Span(base: 0x1000, len: 0x2000), align, 0x400, &asks, "i.toml") {
+        case Ok(placed) -> {
+            var parts = Vector<String>()
+            var i = 0
+            while i < placed.len() {
+                let s = placed.get(i)!
+                try! parts.push("{s.base}+{s.len}")
+                i = i + 1
+            }
+            parts.join(" ")
+        },
+        case Err(e) -> e.message
+    }
+}
+
+func ask(name: String, range: String, bytes: UInt64, pool: Bool) -> Ask {
+    Ask(name: name, range: range, bytes: bytes, pool: pool, at: at())
+}
+
+func main() {
+    // A region's alignment: the grain, or a stack pointer's where coarser.
+    assert(region_align(4, "in-place") == 16 && region_align(16, "in-place") == 16 &&
+           region_align(0x1000, "translated") == 0x1000 && region_align(0x2000, "translated") == 0x2000,
+           "the region alignment: the grain, or a stack pointer's")
+    assert(region_align(4, "copied") == 0x1000 && region_align(0x2000, "copied") == 0x2000,
+           "a copied board's: a page at least")
+    assert(round_up(0, 16) == 0 && round_up(1, 16) == 16 && round_up(32, 16) == 32, "round_up")
+
+    // The range: the image's, the default, or a fast one for a fast process.
+    let fast_default = board("main", "fast")
+    expect(message(choose_range(&fast_default, "bulk", true, "p", "i.toml", at())), "ok bulk")
+    expect(message(choose_range(&fast_default, "", true, "p", "i.toml", at())), "ok main")
+    let slow_default = board("bulk", "fast")
+    expect(message(choose_range(&slow_default, "", false, "p", "i.toml", at())), "ok bulk")
+    expect(message(choose_range(&slow_default, "", true, "p", "i.toml", at())), "ok main")
+    let all_slow = board("bulk", "slow")
+    expect(message(choose_range(&all_slow, "", true, "gps", "i.toml", at())),
+           "i.toml: line 3, column 1: the process gps declares ram = \"fast\", and the board b has no fast process range: its default, bulk, is slow")
+
+    // The RAM a linked image takes: every segment on a board that copies or
+    // translates, the writable ones on one that runs in place.
+    var segments = Vector<LoadSegment>()
+    try! segments.push(LoadSegment(vaddr: 0x1000, memsz: 0x100, writable: false))
+    try! segments.push(LoadSegment(vaddr: 0x1200, memsz: 0x40, writable: false))
+    try! segments.push(LoadSegment(vaddr: 0x2000, memsz: 0x300, writable: true))
+    try! segments.push(LoadSegment(vaddr: 0x2400, memsz: 0x20, writable: true))
+    expect(span_message(ram_span(&segments, "copied", "img")), "ok {0x1420}")
+    expect(span_message(ram_span(&segments, "translated", "img")), "ok {0x1420}")
+    expect(span_message(ram_span(&segments, "in-place", "img")), "ok {0x420}")
+    var text_only = Vector<LoadSegment>()
+    try! text_only.push(LoadSegment(vaddr: 0x4200_0060, memsz: 0x100, writable: false))
+    expect(span_message(ram_span(&text_only, "in-place", "img")),
+           "img has no segment the loader places in RAM")
+
+    // Regions after root's in its range, in order, each rounded and with its
+    // stack; another range's from its base; a pool exactly its length.
+    var asks = Vector<Ask>()
+    try! asks.push(ask("a", "main", 0x101, false))
+    try! asks.push(ask("frames", "bulk", 0x100, true))
+    try! asks.push(ask("b", "main", 0x200, false))
+    try! asks.push(ask("c", "bulk", 0x10, false))
+    expect(spans(&asks, &fast_default),
+           "{0x3000}+{0x510} {0x1_0000}+{0x100} {0x3510}+{0x600} {0x1_0100}+{0x410}")
+    // A region that runs past its range, named with the range.
+    var over = Vector<Ask>()
+    try! over.push(ask("a", "main", 0x5000, false))
+    try! over.push(ask("big", "main", 0x1000, false))
+    expect(spans(&over, &fast_default),
+           "i.toml: line 3, column 1: the process big's region, 0x1400 bytes at 0x8400, runs past the board's main range, which ends at 0x9000")
+    // Each range is budgeted on its own: `bulk` is full though `main` is not.
+    var pools = Vector<Ask>()
+    try! pools.push(ask("a", "main", 0x10, false))
+    try! pools.push(ask("frames", "bulk", 0x800, true))
+    try! pools.push(ask("more", "bulk", 0x900, true))
+    expect(spans(&pools, &fast_default),
+           "i.toml: line 3, column 1: the pool more, 0x900 bytes at 0x10800, runs past the board's bulk range, which ends at 0x11000")
+    // A region that ends exactly at its range's end fits; a pool one byte
+    // longer than the room left does not.
+    var exact = Vector<Ask>()
+    try! exact.push(ask("a", "main", 0x5C00, false))
+    try! exact.push(ask("frames", "bulk", 0x1000, true))
+    expect(spans(&exact, &fast_default), "{0x3000}+{0x6000} {0x1_0000}+{0x1000}")
+    var one_past = Vector<Ask>()
+    try! one_past.push(ask("frames", "bulk", 0x1001, true))
+    expect(spans(&one_past, &fast_default),
+           "i.toml: line 3, column 1: the pool frames, 0x1001 bytes at 0x10000, runs past the board's bulk range, which ends at 0x11000")
+    // A region whose aligned base is already past its range's end.
+    var past = Vector<Ask>()
+    try! past.push(ask("a", "main", 0x10, false))
+    expect(spans_aligned(&past, &fast_default, 0x1_0000),
+           "i.toml: line 3, column 1: the process a's region, 0x10400 bytes at 0x10000, runs past the board's main range, which ends at 0x9000")
+    var unknown = Vector<Ask>()
+    try! unknown.push(ask("a", "psram", 0x10, false))
+    expect(spans(&unknown, &fast_default),
+           "i.toml: line 3, column 1: `psram` names no RAM range of the board b")
+
+    // Where a process is linked first: the rest of its range from where its
+    // region would start.
+    let root = Span(base: 0x1000, len: 0x2000)
+    let first = try! first_placement(&fast_default, root, 16, 0x400, "main", None, "a",
+                                     "i.toml", at())
+    assert(first.region.base == 0x3000 && first.region.len == 0x6000 && first.stack == 0x400,
+           "the first link's placement")
+    let elsewhere = try! first_placement(&fast_default, root, 16, 0x400, "bulk",
+                                         Span(base: 0x18_0000, len: 0x2_0000), "a", "i.toml", at())
+    assert(elsewhere.region.base == 0x1_0000 && elsewhere.region.len == 0x1000 &&
+           elsewhere.slot!.base == 0x18_0000, "a first placement in another range, with its slot")
+    let full = match first_placement(&fast_default, Span(base: 0x1000, len: 0x7D00), 16, 0x400,
+                                     "main", None, "a", "i.toml", at()) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect(full, "i.toml: line 3, column 1: the process a's region would start at 0x8d00, and the board's main range ends at 0x9000: no room is left for it")
+    // Room for the stack and nothing else is no room.
+    let all_stack = match first_placement(&fast_default, Span(base: 0x1000, len: 0x7C00), 16, 0x400,
+                                          "main", None, "a", "i.toml", at()) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect(all_stack, "i.toml: line 3, column 1: the process a's region would start at 0x8c00, and the board's main range ends at 0x9000: no room is left for it")
+    // A start already past the range's end.
+    let beyond = match first_placement(&fast_default, root, 0x1_0000, 0x400, "main", None, "a",
+                                       "i.toml", at()) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect(beyond, "i.toml: line 3, column 1: the process a's region would start at 0x10000, and the board's main range ends at 0x9000: no room is left for it")
+
+    // The slots: child i in slot i of `count` equal slots, more children
+    // than slots refused.
+    let slots = try! child_slots(Span(base: 0x18_0000, len: 0x8_0000), 4, 3, "img")
+    assert(slots.len() == 3 && slots.get(0)!.base == 0x18_0000 && slots.get(2)!.base == 0x1C_0000 &&
+           slots.get(1)!.len == 0x2_0000, "three of four slots")
+    let every = try! child_slots(Span(base: 0x18_0000, len: 0x8_0000), 4, 4, "img")
+    assert(every.len() == 4 && every.get(3)!.base == 0x1E_0000, "as many children as slots")
+    let none = try! child_slots(Span(base: 0x18_0000, len: 0x8_0000), 4, 0, "img")
+    assert(none.len() == 0, "no child, no slot")
+    let too_many = match child_slots(Span(base: 0x18_0000, len: 0x8_0000), 4, 5, "img") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect(too_many, "img has 5 processes besides root, and the board's flash has 4 slots for them")
+
+    // The script a process is linked through.
+    let copied = Placement(region: Span(base: 0x8024_0000, len: 0x4_0000), stack: 0x4000, slot: None)
+    let script = try! process_script("child0", &copied, "/tree/hal/riscv32/user/user.ld")
+    expect(script.join("\n"), "/* Generated by sosimage: where the process child0 is linked. */\nSOS_REGION_BASE = 0x80240000;\nSOS_REGION_LEN = 0x40000;\nSOS_STACK_LEN = 0x4000;\nINCLUDE \"/tree/hal/riscv32/user/user.ld\"")
+    let in_place = Placement(region: Span(base: 0x3FCC_8000, len: 0x1_8000), stack: 0x4000,
+                             slot: Span(base: 0x18_0000, len: 0x2_0000))
+    let slotted = try! process_script("gpio", &in_place, "/t/user.ld")
+    assert(slotted.get(4)!.equals("SOS_SLOT_BASE = 0x180000;") && slotted.get(5)!.equals("SOS_SLOT_LEN = 0x20000;"),
+           "an in-place process's slot")
+    let quoted = match process_script("p", &copied, "/a\"b.ld") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect(quoted, "the script /a\"b.ld cannot be named in an INCLUDE")
+
+    // The kernel's slots for an image with two children.
+    let (symbols, sections) = image_slots(Span(base: 0x10_0000, len: 0x8_0000), &slots, 0x20_0000)
+    expect(symbols.join("\n"), "/* Generated by sosimage: the image's flash slots. */\nROOT_IMAGE_SLOT = 0x100000;\nROOT_IMAGE_SLOT_LEN = 0x80000;\nDROM_FLASH = 0x200000;")
+    assert(sections.len() == 13, "a section and an ASSERT per child")
+    expect(sections.get(5)!, "    .childimg1 (FLASH_DBUS + 0x1a0000) : AT(FLASH_IBUS + 0x1a0000) \{")
+    expect(sections.get(6)!, "        KEEP(*(.childimg.1))")
+    expect(sections.get(8)!, "    ASSERT(SIZEOF(.childimg1) <= 0x20000, \"image_slot_sections.ld: child 1's image does not fit its slot\")")
+}

@@ -3121,9 +3121,10 @@ not about SOS** (§5b.1):
 - **On tiers 2 and 3 an address is the same number in every process**,
   because those platforms do not translate: a grant row's input range is its
   output range, and two resident images therefore cannot share a link base.
-  riscv32-virt keeps one linker script per resident child image for precisely
-  that reason, deliberately, so the two HAL directories side by side are the
-  tier split.
+  The build links each resident image on these tiers for its own region, for
+  precisely that reason: one user linker script per board names no address,
+  and a script of each process's own, which the build writes, assigns its
+  region (and on the ESP32-S3 its flash slot) before it INCLUDEs the board's.
 - **A segment can already be where it is linked.** An image that sits at a
   fixed place and is linked for that place needs no copy, and the loader uses
   such a segment in place (§5.6). `hal.same_bytes(link, at,
@@ -3226,13 +3227,25 @@ Everything else derives from those handles.
   begins on the grain and no copied segment's row, rounded up, reaches into
   it; one that is not is `BadImage` as well, and no process is made.
 - **The build puts each resident image where it is linked.** On the
-  ESP32-S3 the kernel's link script gives root's image and a child's fixed
-  slots in flash. A user linker script links the code at its slot's
+  ESP32-S3 the board describes root's slot in flash and a range of equal
+  slots for the other processes, child i in slot i, and the build writes them
+  into the kernel's link script for each image, with the kernel's read-only
+  data behind the last of the range. A user linker script links the code at
+  its slot's
   instruction-window address plus the length of the image's header and
   segment table, and the read-only data directly behind the code, at the
   data-window address of the same flash bytes. The build reads each image
   back and fails when a segment's link address is not where its bytes sit in
   flash, and a mismatch the build missed is refused at load, never run.
+- **The build sizes and places each region.** A process's region holds
+  what the loader places in RAM, with the stack at its top: on a board that
+  copies or translates an image, every segment; on one that runs code and
+  read-only data in place, only the writable segment (its data, its zeroed
+  data and its arena). An image the build assembles from a description has
+  each region measured from a first link of its process, rounded up to the
+  protection grain (to a page on a board that copies, and at least to a
+  stack pointer's alignment), and placed after root's region in its range;
+  a test image's regions are its harness's.
 - **The build also emits a region table** (§12), the second boot input the
   kernel reads. Its header carries the boot flags: the build's options to the
   kernel, since no board hands a kernel a command line. After its rows it
@@ -3596,7 +3609,7 @@ can ask about (`SystemOp.TierGet`, §2.8):
 | target | tier | in the gate? | notes |
 |---|---|---|---|
 | arm64 `virt` | 1 | yes — Profile B | per-process table sets, higher-half kernel, `map` places. A process's RAM rows lie in a page-granular window of the first 4 MiB of RAM, and a child is linked at `hal.USER_IMAGE_BASE`, 2 MiB into it, so a destination longer than 2 MiB is one this profile cannot grant, and `ProcessCreate` answers it `BadImage` (§2.7) |
-| riscv32 `virt` | 2 | yes — Profile A | PMP regions replayed through the one seam; keeps its per-child linker scripts, deliberately, as the living identity-tier demonstration |
+| riscv32 `virt` | 2 | yes — Profile A | PMP regions replayed through the one seam; each resident image linked for its own region, the living identity-tier demonstration |
 | riscv32 `virt`, flat build profile | 3 | yes — a third run | a module swap over the same board: `prot_*` no-ops, PMP opened with one TOR entry, `prot_isolated()` false. No new toolchain, and the tier-3 story's test target |
 | ESP32-C3 | 2, at the floor | no — a gating board smoke (`make sos-smoke-esp32c3`) | 16 PMP entries exactly, 400 KB SRAM; XIP is the entry price |
 | ESP32-P4 | 2 | no — no QEMU machine yet | 32 PMP + 16 PMA, 768 KB; the first real tier-2 part |

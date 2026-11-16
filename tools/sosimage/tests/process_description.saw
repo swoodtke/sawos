@@ -1,0 +1,123 @@
+// The process description's reader, and what a package's manifest gives the
+// builder: its name, and the script it names for a triple. The test runs in
+// the package's directory, two below the tree's top.
+
+import sosimage.build.{ensure_directory}
+import sosimage.failure.{BuildError}
+import sosimage.package.{ProcessSpec, manifest_script, package_name}
+import sosimage.profile.{Profile}
+import sosimage.package.{build_process}
+import sosimage.layout.{Placement}
+import sosimage.board.{Span}
+import std.file.{File}
+import std.path.{Path}
+import sosimage.tool.{read_text, write_lines}
+
+func text(extra: String) -> String {
+    "\{\"version\": 1, \"name\": \"child0\", \"package\": \"/p\", \"out\": \"/o\", \"region\": \{\"base\": 2149842944, \"len\": 262144\}, \"stack\": 16384{extra}\}"
+}
+
+func refusal(t: String) -> String {
+    match ProcessSpec.parse(t, "c.json") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect(got: String, want: String) {
+    if not got.equals(want) {
+        print("expected: {want}")
+        print("got:      {got}")
+    }
+    assert(got.equals(want), "the message")
+}
+
+func message(r: Result<String, BuildError>) -> String {
+    match r {
+        case Ok(v) -> "ok {v}",
+        case Err(e) -> e.message
+    }
+}
+
+func main() {
+    let spec = try! ProcessSpec.parse(text(""), "c.json")
+    assert(spec.name.equals("child0") && spec.package.equals("/p") && spec.out.equals("/o"),
+           "the names")
+    assert(spec.placement.region.base == 0x8024_0000 && spec.placement.region.len == 0x4_0000 &&
+           spec.placement.stack == 0x4000 && spec.placement.slot == None, "the placement")
+    let slotted = try! ProcessSpec.parse(text(", \"slot\": \{\"base\": 1572864, \"len\": 131072\}"), "c.json")
+    assert(slotted.placement.slot!.base == 0x18_0000 && slotted.placement.slot!.len == 0x2_0000,
+           "the slot")
+
+    expect(refusal(text("").replace("\"version\": 1", "\"version\": 2")),
+           "the process c.json is version 2; this builder reads version 1")
+    expect(refusal(text("").replace(", \"region\": \{\"base\": 2149842944, \"len\": 262144\}", "")),
+           "the process c.json has no `region`")
+    expect(refusal(text("").replace("\"stack\": 16384", "\"stack\": 262145")),
+           "the process c.json: its 262145-byte stack is longer than its 262144-byte region")
+    expect(refusal(text(", \"base\": 1")), "the process c.json has unknown keys: `base`")
+    expect(refusal(text(", \"slot\": \{\"base\": 1\}")), "the process's `slot` has no `len`")
+
+    // A manifest's name and its script for a triple, and each absence named.
+    let dir = "../../.build/sosimage-tests/package"
+    try! ensure_directory(dir)
+    let lines: Vector<String> = ["[package]", "name = \"pkg\"", "version = \"0.1.0\"", "[sos]",
+                                 "emit = \"sosimg\"", "[sos.riscv32-unknown-none-elf]",
+                                 "linker-script = \"../../hal/riscv32/user/user.ld\""]
+    try! write_lines("{dir}/Saw.toml", &lines)
+    expect(message(package_name(dir)), "ok pkg")
+    expect(message(manifest_script(dir, "riscv32-unknown-none-elf")), "ok ../../hal/riscv32/user/user.ld")
+    expect(message(manifest_script(dir, "aarch64-unknown-none-elf")),
+           "{dir}/Saw.toml has no [sos.aarch64-unknown-none-elf]: the package builds no image for aarch64-unknown-none-elf")
+    let hosted: Vector<String> = ["[package]", "name = \"tool\"", "version = \"0.1.0\""]
+    try! write_lines("{dir}/Saw.toml", &hosted)
+    expect(message(manifest_script(dir, "riscv32-unknown-none-elf")),
+           "{dir}/Saw.toml has no [sos]: the package builds no process image")
+    let nameless: Vector<String> = ["[sos]"]
+    try! write_lines("{dir}/Saw.toml", &nameless)
+    expect(message(package_name(dir)), "{dir}/Saw.toml has no [package]")
+
+    // A profile that names no Blade builds no process.
+    let profile = try! Profile.parse("\{\"version\": 1, \"triple\": \"riscv32-unknown-none-elf\", \"word_bytes\": 4, \"sawc\": [\"/bin/sawc\"], \"clang\": \"/bin/clang\", \"lld\": \"/bin/ld.lld\", \"cc_args\": [], \"module_paths\": [], \"linker_script\": \"/virt.ld\"\}", "p.json")
+    let placement = Placement(region: Span(base: 0x8024_0000, len: 0x4_0000), stack: 0x4000, slot: None)
+    let unbuilt = match build_process(&profile, "child0", dir, "{dir}/out", &placement) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect(unbuilt, "the profile names no Blade (`blade`), and the process child0 is built by one")
+
+    // A Blade that fails: the image a previous build left is gone, so it
+    // cannot be taken for this one's. A Blade that makes nothing: refused.
+    let scripted: Vector<String> = ["[package]", "name = \"pkg\"", "version = \"0.1.0\"", "[sos]",
+                                    "emit = \"sosimg\"", "[sos.riscv32-unknown-none-elf]",
+                                    "linker-script = \"s.ld\""]
+    try! write_lines("{dir}/Saw.toml", &scripted)
+    let script: Vector<String> = ["/* a script */"]
+    try! write_lines("{dir}/s.ld", &script)
+    let out = "{dir}/out"
+    try! ensure_directory(out)
+    let stale: Vector<String> = ["stale"]
+    try! write_lines("{out}/child0.sosimg", &stale)
+    let failing = try! Profile.parse("\{\"version\": 1, \"triple\": \"riscv32-unknown-none-elf\", \"word_bytes\": 4, \"sawc\": [\"/bin/sawc\"], \"clang\": \"/bin/clang\", \"lld\": \"/bin/ld.lld\", \"cc_args\": [], \"module_paths\": [], \"linker_script\": \"/virt.ld\", \"blade\": \"/usr/bin/false\"\}", "p.json")
+    let failed = match build_process(&failing, "child0", dir, out, &placement) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(failed.starts_with("command failed (1): /bin/sh -c "), "Blade's failure: {failed}")
+    assert(not File.exists(Path(s: "{out}/child0.sosimg")), "the previous image removed")
+    let script_written = try! read_text("{out}/child0.ld")
+    assert(script_written.contains("SOS_REGION_BASE = 0x80240000;") && script_written.ends_with("s.ld\"\n"),
+           "the process's script: {script_written}")
+    let silent = try! Profile.parse("\{\"version\": 1, \"triple\": \"riscv32-unknown-none-elf\", \"word_bytes\": 4, \"sawc\": [\"/bin/sawc\"], \"clang\": \"/bin/clang\", \"lld\": \"/bin/ld.lld\", \"cc_args\": [], \"module_paths\": [], \"linker_script\": \"/virt.ld\", \"blade\": \"/usr/bin/true\"\}", "p.json")
+    let nothing = match build_process(&silent, "child0", dir, out, &placement) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(nothing.starts_with("Blade built ") && nothing.ends_with(" as the process child0 and left no {out_abs(out)}/child0/pkg.sosimg"),
+           "nothing made: {nothing}")
+}
+
+// `dir`, resolved, as the builder names its outputs.
+func out_abs(dir: String) -> String {
+    (try! Path(s: dir).canonical()).as_string()
+}

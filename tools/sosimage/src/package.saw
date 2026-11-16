@@ -1,0 +1,189 @@
+//! A process's package, built by Blade for one placement.
+//!
+//! The builder writes the process's own script (`sosimage.layout`'s
+//! `process_script`), which assigns the placement's symbols and INCLUDEs the
+//! script the package's manifest names for the triple, and has Blade link the
+//! package through it into a directory of the process's own:
+//!
+//!     OUT/NAME.ld          the process's script
+//!     OUT/NAME/            Blade's output: the object, the ELF, the sosimg
+//!     OUT/NAME.sosimg      the image, named for the process
+//!
+//! Each instance of a package is its own link, named for its process, so two
+//! instances of one package are two images.
+//!
+//! The runner states a test image's placements in a process description, a
+//! JSON object `sosimage package` reads:
+//!
+//!     {
+//!       "version": 1,
+//!       "name": "child0",
+//!       "package": "/path/to/tests/child-bye",
+//!       "out": "/path/to/tests/child-bye/.build/riscv32-unknown-none-elf",
+//!       "region": {"base": 2149842944, "len": 262144},
+//!       "stack": 16384,
+//!       "slot": {"base": 1572864, "len": 131072}
+//!     }
+//!
+//! `slot` is an in-place board's, and absent on any other. Every key but it
+//! is required, and an unknown key is refused.
+
+import std.file.{File}
+import std.path.{Path}
+import std.json.{JsonValue}
+import toml.{TomlDoc}
+import sosimage.board.{Span}
+import sosimage.build.{ensure_directory}
+import sosimage.failure.{BuildError}
+import sosimage.fields.{Fields}
+import sosimage.layout.{Placement, process_script}
+import sosimage.profile.{Profile}
+import sosimage.tool.{read_file, read_text, run_tool, write_file, write_lines}
+
+public static PROCESS_VERSION: Int = 1
+
+/// A process to build, as a process description states it.
+public struct ProcessSpec {
+    name: String
+    package: String
+    out: String
+    placement: Placement
+}
+
+/// What a process's build made: its image and the ELF it was made from.
+public struct Built {
+    image: String
+    elf: String
+}
+
+extension ProcessSpec {
+    /// Reads a process description from its JSON text; `origin` names it in
+    /// messages.
+    public static func parse(text: String, origin: String) -> Result<ProcessSpec, BuildError> {
+        let doc = try JsonValue.parse(text) catch {
+            return BuildError(message: "{origin} is not JSON: {error}")
+        }
+        var top = try Fields(move doc, "the process {origin}")
+        let version = try top.integer("version")
+        if version != PROCESS_VERSION {
+            return BuildError(message: "the process {origin} is version {version}; this builder reads version {PROCESS_VERSION}")
+        }
+        let name = try top.text("name")
+        let package = try top.text("package")
+        let out = try top.text("out")
+        guard var r = try top.object("region", "the process's `region`") else {
+            return BuildError(message: "the process {origin} has no `region`")
+        }
+        let region = Span(base: try r.word("base"), len: try r.word("len"))
+        try r.finish()
+        let stack = try top.word("stack")
+        var slot: Span? = None
+        if var s = try top.object("slot", "the process's `slot`") {
+            slot = Span(base: try s.word("base"), len: try s.word("len"))
+            try s.finish()
+        }
+        try top.finish()
+        if stack > region.len {
+            return BuildError(message: "the process {origin}: its {stack}-byte stack is longer than its {region.len}-byte region")
+        }
+        return ProcessSpec(name: name, package: package, out: out,
+                           placement: Placement(region: region, stack: stack, slot: slot))
+    }
+}
+
+/// The package's name, as the `Saw.toml` in `dir` gives it.
+public func package_name(dir: String) -> Result<String, BuildError> {
+    let manifest = "{dir}/Saw.toml"
+    let doc = try TomlDoc.parse(try read_text(manifest)) catch {
+        return BuildError(message: "{manifest}: {error}")
+    }
+    borrow let root = doc.root() {
+        if let p = root.table("package") {
+            let name = try p.string("name") catch {
+                return BuildError(message: "{manifest}: {error}")
+            }
+            return name
+        }
+        return BuildError(message: "{manifest} has no [package]")
+    }
+}
+
+/// The script the `Saw.toml` in `dir` names for `triple`, as a path from the
+/// package's directory.
+public func manifest_script(dir: String, triple: String) -> Result<String, BuildError> {
+    let manifest = "{dir}/Saw.toml"
+    let doc = try TomlDoc.parse(try read_text(manifest)) catch {
+        return BuildError(message: "{manifest}: {error}")
+    }
+    borrow let root = doc.root() {
+        if let sos = root.table("sos") {
+            if let target = sos.table(triple) {
+                let script = try target.string("linker-script") catch {
+                    return BuildError(message: "{manifest}: {error}")
+                }
+                return script
+            }
+            return BuildError(message: "{manifest} has no [sos.{triple}]: the package builds no image for {triple}")
+        }
+        return BuildError(message: "{manifest} has no [sos]: the package builds no process image")
+    }
+}
+
+/// `path`, which exists, as an absolute path with no `.` or `..` in it.
+func absolute(path: String, what: String) -> Result<String, BuildError> {
+    let p = try Path(s: path).canonical() catch {
+        return BuildError(message: "{what} {path} cannot be resolved: {error}")
+    }
+    return p.as_string()
+}
+
+/// Builds the package in `package` as the process `name` placed at `p`, into
+/// `out` (the module's header lays the directory out). The image a previous
+/// build left is removed first, so a build that fails leaves none to be
+/// taken for this one's.
+public func build_process(profile: &Profile, name: String, package: String, out: String,
+                          p: &Placement) -> Result<Built, BuildError> {
+    if profile.blade.is_empty() {
+        return BuildError(message: "the profile names no Blade (`blade`), and the process {name} is built by one")
+    }
+    let dir = try absolute(package, "the package of the process {name},")
+    let pkg = try package_name(dir)
+    let manifest_named = try manifest_script(dir, profile.triple)
+    let included = if manifest_named.starts_with("/") { manifest_named } else { "{dir}/{manifest_named}" }
+    let script_named = try absolute(included, "the script {dir}/Saw.toml names,")
+    try ensure_directory(out)
+    let at = try absolute(out, "the output directory")
+    let script = "{at}/{name}.ld"
+    let lines = try process_script(name, &p, script_named)
+    try write_lines(script, &lines)
+    let image = "{at}/{name}.sosimg"
+    if File.exists(Path(s: image)) {
+        try File.remove(Path(s: image)) catch {
+            return BuildError(message: "could not remove the previous image {image}: {error}")
+        }
+    }
+    let blade_out = "{at}/{name}"
+    // Blade builds the package in its own directory, and the builder cannot
+    // start a program in another, so a shell changes into it first.
+    var argv = Vector<String>()
+    try! argv.push("/bin/sh")
+    try! argv.push("-c")
+    try! argv.push("cd \"$0\" && exec \"$@\"")
+    try! argv.push(dir)
+    try! argv.push(profile.blade)
+    try! argv.push("build")
+    try! argv.push("--force")
+    try! argv.push("--target")
+    try! argv.push(profile.triple)
+    try! argv.push("--linker-script")
+    try! argv.push(script)
+    try! argv.push("--out-dir")
+    try! argv.push(blade_out)
+    try run_tool(&argv)
+    let made = "{blade_out}/{pkg}.sosimg"
+    if not File.exists(Path(s: made)) {
+        return BuildError(message: "Blade built {dir} as the process {name} and left no {made}")
+    }
+    try write_file(image, try read_file(made))
+    return Built(image: image, elf: "{blade_out}/{pkg}.elf")
+}

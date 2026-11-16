@@ -209,7 +209,7 @@ restates all three keys in its `[sos.<triple>]` section:
 
 ```toml
 [sos.riscv32-unknown-none-elf]
-linker-script = "../../hal/riscv32-esp32c3/user/root.ld"
+linker-script = "../../hal/riscv32-esp32c3/user/user.ld"
 native = "../../hal/riscv32-common/user/syscall.c ../../rt/common_c/support.c"
 march = "rv32imc_zicsr_zifencei"
 mabi = "ilp32"
@@ -504,7 +504,7 @@ same limit before booting.
 In a freestanding process image the `.bss` is dominated by one number: the
 arena, `ARENA_SIZE` in the linker script. A process package may choose its own
 size (`tests/arena-small/`); a package that says nothing gets the default in
-`root.ld` / `child.ld`. The kernel's arena is `PROVIDE(ARENA_SIZE = 16K)` in
+`user.ld`. The kernel's arena is `PROVIDE(ARENA_SIZE = 16K)` in
 `esp32c3.ld`: the kernel allocates nothing on its steady path (every kernel
 source builds under `--no-hidden-alloc`; the arena backs only the compiler's
 panic path), so the arena is the first lever to pull when the kernel's `.data` +

@@ -1,0 +1,77 @@
+// A hand-written root's image: its region table, each pool's row its own
+// region; and where its processes are placed, a package's declaration of
+// `ram = "fast"` read. The test runs in the package's directory, two below
+// the tree's top.
+
+import sosimage.board.{Board, Span}
+import sosimage.build.{ensure_directory}
+import sosimage.imagefile.{ImageFile}
+import sosimage.product.{declares_fast, image_rows, process_range}
+import sosimage.regions.{RegionKind}
+import sosimage.tool.{read_text, write_lines}
+
+// A board with a fast process range `main` and a slow default, `bulk`.
+func slow_default() -> Board {
+    let lines: Vector<String> = ["format = 1", "[board]", "name = \"b\"",
+        "triple = \"riscv32-unknown-none-elf\"", "tier = \"flat\"", "hal = \"hal/b\"",
+        "placement = \"copied\"", "modules = []", "cflags = []", "[emulator]",
+        "program = \"q\"", "args = []", "[ram.kernel]", "use = \"kernel\"", "speed = \"fast\"",
+        "base = 0", "len = 0x1000", "[ram.main]", "use = \"process\"", "speed = \"fast\"",
+        "base = 0x1000", "len = 0x8000", "[ram.bulk]", "use = \"process\"", "speed = \"slow\"",
+        "base = 0x1_0000", "len = 0x1000", "[ram.default]", "process = \"bulk\"",
+        "pool = \"bulk\""]
+    try! Board.parse(lines.join("\n"), "b.toml")
+}
+
+func main() {
+    // The rows: blobs, destinations, devices, then pools in `[rows]`'s order,
+    // each pool's row its own region.
+    let virt = try! Board.parse(try! read_text("../../hal/riscv32/board.toml"), "board.toml")
+    let text: Vector<String> = ["format = 1", "[image]", "name = \"i\"", "board = \"riscv32-virt\"",
+        "tick = false", "[root]", "package = \"sawos:tests/launch-all\"",
+        "[[process]]", "name = \"a\"", "package = \"p\"",
+        "[[process]]", "name = \"b\"", "package = \"p\"",
+        "[[pool]]", "name = \"first\"", "len = 0x1000",
+        "[[pool]]", "name = \"second\"", "len = 0x2000",
+        "[rows]", "devices = [\"UART0\"]", "pools = [\"second\", \"first\"]"]
+    let image = try! ImageFile.parse(text.join("\n"), "i.toml", &virt, 4)
+    var regions = Vector<Span>()
+    try! regions.push(Span(base: 0x8024_0000, len: 0x1_0000))
+    try! regions.push(Span(base: 0x8025_0000, len: 0x2_0000))
+    try! regions.push(Span(base: 0x8027_0000, len: 0x1000))
+    try! regions.push(Span(base: 0x8027_1000, len: 0x2000))
+    let rows = image_rows(&image, &regions)
+    assert(rows.len() == 7, "two blobs, two destinations, a device, two pools")
+    assert(rows.get(0)!.blob! == 0 && rows.get(1)!.blob! == 1, "the blobs")
+    assert(rows.get(2)!.base == 0x8024_0000 && rows.get(3)!.base == 0x8025_0000 &&
+           rows.get(3)!.len == 0x2_0000 && rows.get(3)!.kind == RegionKind.Ram, "the destinations")
+    assert(rows.get(4)!.base == 0x1000_0000 && rows.get(4)!.kind == RegionKind.Device, "the device")
+    assert(rows.get(5)!.base == 0x8027_1000 && rows.get(5)!.len == 0x2000 &&
+           rows.get(5)!.kind == RegionKind.Pool, "the pool `second`, its own region")
+    assert(rows.get(6)!.base == 0x8027_0000 && rows.get(6)!.len == 0x1000, "the pool `first`")
+
+    // A process whose package declares `ram = "fast"` is placed in a fast
+    // range on a board whose default is slow; one with no declaration, or
+    // one that declares nothing, takes the default.
+    let dir = "../../.build/sosimage-tests/fast"
+    try! ensure_directory("{dir}/fast")
+    try! ensure_directory("{dir}/plain")
+    try! ensure_directory("{dir}/none")
+    let fast: Vector<String> = ["format = 1", "arena = 0x1000", "ram = \"fast\"",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1"]
+    try! write_lines("{dir}/fast/process.toml", &fast)
+    let plain: Vector<String> = ["format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1"]
+    try! write_lines("{dir}/plain/process.toml", &plain)
+    assert(try! declares_fast("{dir}/fast"), "a fast declaration")
+    assert(not try! declares_fast("{dir}/plain"), "a declaration that is not fast")
+    assert(not try! declares_fast("{dir}/none"), "no declaration")
+    let b = slow_default()
+    let process = image.processes.get(0)!
+    let placed = try! process_range(&b, &process, "{dir}/fast", "i.toml")
+    assert(placed.equals("main"), "a fast process in the fast range: {placed}")
+    let plain_placed = try! process_range(&b, &process, "{dir}/plain", "i.toml")
+    assert(plain_placed.equals("bulk"), "a process that declares nothing in the default: {plain_placed}")
+    let none_placed = try! process_range(&b, &process, "{dir}/none", "i.toml")
+    assert(none_placed.equals("bulk"), "a package with no declaration in the default: {none_placed}")
+}

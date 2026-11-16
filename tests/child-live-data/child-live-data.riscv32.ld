@@ -1,4 +1,4 @@
-/* Per-package arena override, riscv32: a small arena, then the shared child
+/* Per-package arena override, riscv32: a small arena, then the board's
  * script. `tests/arena-small` explains the mechanism.
  *
  * The image stays small so that every segment lies in the front of the
@@ -6,4 +6,4 @@
  */
 ARENA_SIZE = 4K;
 
-INCLUDE ../../hal/riscv32/user/child.ld
+INCLUDE ../../hal/riscv32/user/user.ld

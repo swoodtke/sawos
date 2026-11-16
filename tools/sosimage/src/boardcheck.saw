@@ -12,14 +12,14 @@
 //! - against the profile: another triple; other C flags; a `hal` module or a
 //!   module of `modules` the profile maps elsewhere or not at all; a module
 //!   the profile maps that `modules` does not name (all but the kernel's
-//!   own, `KERNEL_MODULES`); a flash whose length, bus windows or window
-//!   length differ from the profile's layout, or a flash on one side only;
+//!   own, `KERNEL_MODULES`); a flash whose length, bus windows, window
+//!   length, root's slot or slot range differ from the profile's layout, or a
+//!   flash on one side only;
 //! - against the linker script, on an in-place board: a `[flash]` whose base
 //!   is not 0, where the flash image starts; a length other than the
 //!   script's `FLASH_BYTES`, bus bases other than its `FLASH_IBUS` and
-//!   `FLASH_DBUS`, a `root-slot` other than `ROOT_IMAGE_SLOT` for
-//!   `IMAGE_SLOT_LEN`, a `slots` other than one slot at `CHILD_IMAGE_SLOT` for
-//!   `IMAGE_SLOT_LEN`;
+//!   `FLASH_DBUS`. The slots are not the script's: the builder writes them
+//!   for each image (`sosimage.layout.image_slots`);
 //! - against the HAL: a console (`kernel = true`) whose window is not
 //!   `DEVICE_GRANT_BASE` for `DEVICE_GRANT_LEN`, or no console; a device
 //!   window off `PROT_GRAIN`; a kernel range that does not begin at
@@ -44,8 +44,8 @@ import sosimage.tool.{read_text, write_lines}
 
 /// The layout version of the record `hal_facts` reads, its first word, and
 /// its length in words.
-public static HAL_FACTS_VERSION: UInt64 = 2
-public static HAL_FACTS_WORDS: Int = 8
+public static HAL_FACTS_VERSION: UInt64 = 3
+public static HAL_FACTS_WORDS: Int = 9
 
 /// The record's symbol.
 public func facts_symbol() -> String { "sosimage_hal_facts" }
@@ -71,6 +71,8 @@ public struct HalFacts {
     /// Where the kernel's own RAM begins, and where the board's RAM ends.
     kernel_base: UInt64
     ram_top: UInt64
+    /// The stack at the top of every process's region.
+    stack_len: UInt64
 }
 
 /// The HAL's numbers, read by compiling a module that exports them with the
@@ -96,6 +98,7 @@ public func hal_facts(profile: &Profile, staging: String) -> Result<HalFacts, Bu
     try! lines.push("    hal.DEVICE_GRANT_LEN,")
     try! lines.push("    hal.KERNEL_RAM_BASE,")
     try! lines.push("    hal.RAM_TOP,")
+    try! lines.push("    hal.ROOT_STACK_LEN,")
     try! lines.push("]")
     try write_lines(source, &lines)
     try build_kernel(&profile, source, object)
@@ -112,7 +115,7 @@ public func read_hal_facts(object: String) -> Result<HalFacts, BuildError> {
     return HalFacts(root_base: words.get(1) ?? 0, root_top: words.get(2) ?? 0,
                     grain: words.get(3) ?? 0, console_base: words.get(4) ?? 0,
                     console_len: words.get(5) ?? 0, kernel_base: words.get(6) ?? 0,
-                    ram_top: words.get(7) ?? 0)
+                    ram_top: words.get(7) ?? 0, stack_len: words.get(8) ?? 0)
 }
 
 /// Refuses a board description that disagrees with the sawos tree at
@@ -176,6 +179,11 @@ func check_profile(board: &Board, profile: &Profile) -> Result<Void, BuildError>
            flash.dbus.len != layout.window_bytes {
             return BuildError(message: "{file}: [flash] is {hex(flash.len)} bytes, ibus {hex(flash.ibus.base)} and dbus {hex(flash.dbus.base)} for {hex(flash.ibus.len)} and {hex(flash.dbus.len)}; the profile's flash is {hex(layout.bytes)} bytes, windows {hex(layout.instruction_window)} and {hex(layout.data_window)} for {hex(layout.window_bytes)}")
         }
+        if flash.root_slot.base != layout.root_slot.base || flash.root_slot.len != layout.root_slot.len ||
+           flash.slots.base != layout.slots.base || flash.slots.len != layout.slots.len ||
+           flash.slot_count != layout.slot_count {
+            return BuildError(message: "{file}: [flash] root-slot is {hex(flash.root_slot.len)} bytes at {hex(flash.root_slot.base)} and slots {flash.slot_count} in {hex(flash.slots.len)} bytes at {hex(flash.slots.base)}; the profile's are {hex(layout.root_slot.len)} bytes at {hex(layout.root_slot.base)} and {layout.slot_count} in {hex(layout.slots.len)} bytes at {hex(layout.slots.base)}")
+        }
     } else if profile.flash != None {
         return BuildError(message: "{file}: the profile has a flash layout, and the board describes no flash")
     }
@@ -197,13 +205,6 @@ func check_script(board: &Board, profile: &Profile) -> Result<Void, BuildError> 
     try script_agrees(file, script, &text, "FLASH_BYTES", "[flash] len", flash.len)
     try script_agrees(file, script, &text, "FLASH_IBUS", "[flash] ibus base", flash.ibus.base)
     try script_agrees(file, script, &text, "FLASH_DBUS", "[flash] dbus base", flash.dbus.base)
-    try script_agrees(file, script, &text, "ROOT_IMAGE_SLOT", "`root-slot` base", flash.root_slot.base)
-    try script_agrees(file, script, &text, "IMAGE_SLOT_LEN", "`root-slot` len", flash.root_slot.len)
-    try script_agrees(file, script, &text, "CHILD_IMAGE_SLOT", "`slots` base", flash.slots.base)
-    if flash.slot_count != 1 {
-        return BuildError(message: "{file}: `slots` holds {flash.slot_count} slots, and {script} places one child image (CHILD_IMAGE_SLOT)")
-    }
-    try script_agrees(file, script, &text, "IMAGE_SLOT_LEN", "`slots` len", flash.slots.len)
     return
 }
 
