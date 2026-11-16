@@ -1,0 +1,264 @@
+// A segment of no bytes loads and records no row (spec §5.6), so it grants
+// nothing and takes nothing away: a buffer and a stack top across its address
+// are judged by the rows around it alone.
+//
+// Root takes `child-buffer-rule`'s image whole out of its blob, a pool, and
+// adds two segments to it in place: a zero-filled read-write segment of two
+// pages above the image's last row, and inside it, at its second page, a
+// read-execute segment of no bytes. It creates the child from that image and
+// starts it to post a body that runs from a doubleword below the address to a
+// doubleword above it, and reads the status word it ends with. Then it
+// creates the child again and has a thread of it made with its stack top half
+// a word above the address.
+//
+//   SOS emptyseg: an executable segment of no bytes inside a data segment:
+//                 loaded
+//   SOS emptyseg: a body across its address, from the child: taken
+//   SOS emptyseg: a stack top across its address: a thread made
+//   SOS emptyseg: done
+//
+// A row of no bytes that permits execute would have made both the body and
+// the word below the stack top memory the process may execute, which is no
+// buffer (§2.2): the child would have ended with `BadBuffer`, which is
+// printed as its status word, and the thread's create would have been the
+// `BadEntry` fault that ends root.
+//
+// The image grows by two segment records, so the bytes after its table move
+// up by their length and every segment's file offset with them; the blob is
+// padded to a page, which leaves the room. The image's segments link where
+// its destination is on the riscv32 profiles, and at the canonical base on
+// arm64, so the new segments link above the last of them.
+
+import sos.{System, Process, Memory, Pool, MapAccess, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_LEN: UInt = 34
+
+static KEY_DEATH: UInt = 6
+
+/// `child-buffer-rule`'s role 1: post a body of the given length from the
+/// given address.
+static ROLE_SEND: UInt = 1
+
+/// What the child may ask its System object for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer
+                               | SystemRight.StatsRegionMap)
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The body: a doubleword on each side of the address.
+static HALF_BODY: UInt = 8
+
+/// The §8 status word of the child's exit with its own code 7, which it ends
+/// with when the kernel took its call.
+static TAKEN: UInt = 65543
+
+static_assert((1 * 65536) + 7 == 65543,
+              "an exit word is Exited in the high bits, then the code")
+
+/// The sosimg format as `imgformat` lays it out: a 24-byte header, whose
+/// second word holds the segment count in its third byte, and a 24-byte
+/// record per segment, little-endian.
+static HEADER_BYTES: UInt = 24
+static SEG_BYTES: UInt = 24
+static COUNT_SHIFT: UInt32 = 16
+static COUNT_MASK: UInt32 = 0xFF
+
+/// The two records this case adds.
+static ADDED: UInt = 2
+
+/// A page: a whole number of grains on every profile, the unit the added
+/// segments are laid out in.
+static PAGE: UInt = 0x1000
+
+/// The most segments an image may have on the riscv32 profiles
+/// (`hal.MAX_ROOT_SEGMENTS`), the lower of the two.
+static MAX_SEGMENTS: UInt = 7
+
+/// `SegFlag`'s bits.
+static READ: UInt32 = 1
+static WRITE: UInt32 = 2
+static EXECUTE: UInt32 = 4
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS emptyseg: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS emptyseg: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS emptyseg: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The child's image blob, a pool, then its destination: the table's
+    // order.
+    var blob_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let blob = blob_rec.take_pool() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    let word = sizeof<UInt>() as UInt
+
+    let room = try blob.available()
+    let image = try blob.allocate(len: room.largest)
+    let view = try proc.map(memory: &image, access: RW)
+    let at = try view.base()
+    let empty = add_segments(at, room.largest)
+    try view.unmap()
+    if empty == 0 {
+        let _ = system.debug_print("SOS emptyseg: no room for two records\n")
+        return BUG
+    }
+
+    let child = try system.process_create(image: &image, memory: &ram)
+    print("SOS emptyseg: {}: loaded\n",
+          "an executable segment of no bytes inside a data segment")
+    let status = try run_child(&system, &proc, &child, empty)
+    if status == TAKEN {
+        say("a body across its address, from the child: taken")
+    } else {
+        print("SOS emptyseg: a body across its address: status {}\n", status)
+    }
+
+    // The same image again, in the destination the first child's death gave
+    // back. The answer to a stack top the kernel refuses is a fault that ends
+    // root, so this comes last.
+    let second = try system.process_create(image: &image, memory: &ram)
+    let thread = try second.thread_create(stack_top: empty + word / 2, arg: 0)
+    let _ = move thread
+    say("a stack top across its address: a thread made")
+    return
+}
+
+/// Start `child` posting a body across `empty` and answer the status word it
+/// ends with.
+func run_child(system: &System, proc: &Process, child: &Process,
+               empty: UInt) -> Result<UInt, SosStatus> {
+    try tell(&proc, &child, TAG_ROLE, ROLE_SEND)
+    try tell(&proc, &child, TAG_ADDR, empty - HALF_BODY)
+    try tell(&proc, &child, TAG_LEN, 2 * HALF_BODY)
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            return status
+        },
+        case _ -> { return BUG },
+    }
+}
+
+func say(line: String) {
+    print("SOS emptyseg: {}\n", line)
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(proc: &Process, child: &Process, tag: UInt,
+          value: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+func peek(at: UInt) unsafe -> UInt32 {
+    UnsafeMemory<UInt32, Device>(at).read()
+}
+
+func poke(at: UInt, value: UInt32) unsafe {
+    UnsafeMemory<UInt32, Device>(at).write(value)
+}
+
+/// Write one segment record at `rec`: zero-filled, `len` bytes at `addr`.
+/// Every link address here is below 4 GiB, so a record's high address word
+/// is zero.
+func write_seg(rec: UInt, addr: UInt, len: UInt, flags: UInt32) unsafe {
+    poke(rec, addr as UInt32)
+    poke(rec + 4, 0)
+    poke(rec + 8, 0)
+    poke(rec + 12, 0)
+    poke(rec + 16, len as UInt32)
+    poke(rec + 20, flags)
+}
+
+/// Add the two segments to the image at `at`, which has `cap` bytes of room,
+/// and answer the segment of no bytes' address, or 0 where the records do not
+/// fit.
+func add_segments(at: UInt, cap: UInt) unsafe -> UInt {
+    let second = peek(at + 4)
+    let count = ((second >> COUNT_SHIFT) & COUNT_MASK) as UInt
+    let table_end = HEADER_BYTES + count * SEG_BYTES
+    let added = ADDED * SEG_BYTES
+
+    // Where the image's bytes end, and where its last row ends.
+    var end = table_end
+    var top: UInt = 0
+    var i: UInt = 0
+    while i < count {
+        let rec = at + HEADER_BYTES + i * SEG_BYTES
+        let file_end = (peek(rec + 8) as UInt) + (peek(rec + 12) as UInt)
+        if file_end > end {
+            end = file_end
+        }
+        let row_end = (peek(rec) as UInt) + (peek(rec + 16) as UInt)
+        if row_end > top {
+            top = row_end
+        }
+        i = i + 1
+    }
+    let words = (end - table_end + 3) / 4
+    if count + ADDED > MAX_SEGMENTS || table_end + 4 * words + added > cap {
+        return 0
+    }
+
+    // The bytes after the table move up by the two records, last word first,
+    // and every file offset with them.
+    var k = words
+    while k > 0 {
+        k = k - 1
+        poke(at + table_end + added + 4 * k, peek(at + table_end + 4 * k))
+    }
+    i = 0
+    while i < count {
+        let rec = at + HEADER_BYTES + i * SEG_BYTES
+        poke(rec + 8, peek(rec + 8) + (added as UInt32))
+        i = i + 1
+    }
+
+    let data = (top + PAGE - 1) & ~(PAGE - 1)
+    let empty = data + PAGE
+    write_seg(at + table_end, data, 2 * PAGE, READ | WRITE)
+    write_seg(at + table_end + SEG_BYTES, empty, 0, READ | EXECUTE)
+    let rest = second & ~(COUNT_MASK << COUNT_SHIFT)
+    poke(at + 4, rest | (((count + ADDED) as UInt32) << COUNT_SHIFT))
+    empty
+}

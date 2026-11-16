@@ -148,7 +148,6 @@ import kcore.limits.{
     NO_WAITER,
     PIPE_INFLIGHT,
 }
-import kcore.mem.{align_up}
 import kcore.preempt.{long_zero}
 import kcore.areas.{slab_geometry, slab_install}
 import imgformat.{SegFlag}
@@ -3138,10 +3137,11 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
         // the two rights it spends are checked on two objects, here and in
         // `map_target`.
         //
-        // The range is the region's own, since a caller supplies no addresses.
-        // The top is rounded up to the protection granularity as the loader
-        // rounds a segment's, so a region shorter than one grant unit still
-        // gets a whole one.
+        // The range is the region's own, since a caller supplies no addresses,
+        // and the row is exactly that range. A region whose base or length is
+        // off the protection grain is refused rather than rounded: a tier that
+        // grants by the grain would hand over the bytes beside the region in
+        // its first or last grain, which are not the caller's.
         case Map -> {
             if not obj.allows(MemoryRight.Map) {
                 fault_process(p, FaultReason.AccessDenied)
@@ -3165,10 +3165,10 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             if len == 0 || region_wraps(base, len) {
                 fault_process(p, FaultReason.BadArg)
             }
-            if (base % hal.PROT_GRAIN) != 0 {
+            if (base % hal.PROT_GRAIN) != 0 || (len % hal.PROT_GRAIN) != 0 {
                 fault_process(p, FaultReason.BadArg)
             }
-            let top = align_up(base + len, hal.PROT_GRAIN)
+            let top = base + len
             // Ask the HAL's window predicate rather than relying on its loader
             // path: one target's grant window cannot express every address, and
             // its loader path stops the machine, which is right for a memory
@@ -3300,7 +3300,7 @@ func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
                                         pool: obj.slot, granularity: unit,
                                         parent: NO_MEMORY, lent_base: 0,
                                         lent_len: 0, depth: 0, free_head: 0,
-                                        out_bytes: 0, dropped: 0)
+                                        out_bytes: 0)
             quota_charge(p, QuotaKind.Memory)
             op_value(handle)
         },

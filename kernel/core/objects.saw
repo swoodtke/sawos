@@ -926,12 +926,12 @@ public(package) func mint_refusal(p: Int) unsafe -> SosStatus {
 /// handle or any Mapping) drops: `refs` counts the first kind and `maps` the
 /// second.
 ///
-/// `free_head`, `out_bytes` and `dropped` are the pool's ledger, meaningful
-/// only on a slot that names itself as its pool (`pool == slot`), which is
-/// exactly a pool. They read as zero on every allocation and nothing asks them
-/// there. `parent`, `lent_base`, `lent_len` and `depth` describe where a
-/// pool's own range came from; every pool is minted at boot and has no pool
-/// above it, so they are `NO_MEMORY` and zero.
+/// `free_head` and `out_bytes` are the pool's ledger, meaningful only on a
+/// slot that names itself as its pool (`pool == slot`), which is exactly a
+/// pool. They read as zero on every allocation and nothing asks them there.
+/// `parent`, `lent_base`, `lent_len` and `depth` describe where a pool's own
+/// range came from; every pool is minted at boot and has no pool above it, so
+/// they are `NO_MEMORY` and zero.
 public(package) struct MemorySlot {
     public(package) state: SlotState,
     /// The process charged for this region, or `NO_PROCESS` once that process
@@ -986,14 +986,6 @@ public(package) struct MemorySlot {
     /// `memory_release_if_idle`), which keeps an allocation's back-reference
     /// from ever naming a slot that has been given away.
     public(package) out_bytes: UInt,
-    /// Pool only: bytes lost to free-node exhaustion, counted rather than
-    /// silent.
-    ///
-    /// Release is infallible: a range that finds no node after coalescing is
-    /// leaked and counted here, because refusing a release would mean an object
-    /// that cannot be given up. Reaching this takes a pool fragmented into more
-    /// than `MAX_FREE_RANGES` holes.
-    public(package) dropped: UInt,
 }
 
 extension MemorySlot {
@@ -1003,7 +995,7 @@ extension MemorySlot {
         MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0, refs: 0,
                    maps: 0, pool: NO_MEMORY, granularity: 0, parent: NO_MEMORY,
                    lent_base: 0, lent_len: 0, depth: 0, free_head: 0,
-                   out_bytes: 0, dropped: 0)
+                   out_bytes: 0)
     }
 }
 
@@ -1014,8 +1006,7 @@ public(package) unsafe static var MEMORIES: Slab<MemorySlot, MAX_MEMORIES> = Sla
     inline: [MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0,
                         refs: 0, maps: 0, pool: NO_MEMORY, granularity: 0,
                         parent: NO_MEMORY, lent_base: 0, lent_len: 0,
-                        depth: 0, free_head: 0, out_bytes: 0,
-                        dropped: 0); MAX_MEMORIES],
+                        depth: 0, free_head: 0, out_bytes: 0); MAX_MEMORIES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
@@ -1042,8 +1033,10 @@ public(package) func alloc_memory() unsafe -> Int {
 // An allocation knows its pool. When both of its counts are zero its whole
 // range goes back to that pool. A returned range coalesces with its free
 // neighbours, and one that touches the pool's unspent frontier folds back into
-// the cursor, so a fully-freed pool returns to its boot state. An `Allocate`
-// takes the first fit off the free list and falls back to the cursor.
+// the cursor, so a fully-freed pool returns to its boot state. The frontier is
+// a free neighbour like any other, and folding into it needs no node. An
+// `Allocate` takes the first fit off the free list and falls back to the
+// cursor.
 //
 // The cursor is the empty-free-list fast path and what a fresh pool is. An
 // allocate-and-drop loop allocates and frees the same range forever and never
@@ -1078,8 +1071,8 @@ public(package) struct FreeRange {
     public(package) next: Int,
 }
 
-// A donatable slab: a returned range that coalesces into nothing and finds no
-// node is added to its pool's `dropped` and lost, because release is
+// A donatable slab: a returned range that touches neither a free neighbour nor
+// the frontier and finds no node is lost to its pool, because release is
 // infallible. Donating nodes lets the same release find a node and the bytes
 // come home.
 //
@@ -1132,7 +1125,7 @@ func aligned_run(base: UInt, len: UInt, g: UInt) -> UInt {
 /// them (§2.5's `available`).
 ///
 /// One walk of the free list, bounded by the node slab's capacity, the walk
-/// `pool_can_serve` makes. Bytes dropped for want of a node are on no list and
+/// `pool_can_serve` makes. Bytes lost for want of a node are on no list and
 /// are not counted, and nothing out on loan is.
 public(package) func pool_available(pool: Int, g: UInt) unsafe -> (UInt, UInt) {
     var total = aligned_run(MEMORIES[pool].base, MEMORIES[pool].len, g)
@@ -1225,7 +1218,9 @@ public(package) func pool_cut(pool: Int, len: UInt) unsafe -> UInt {
 /// touches the neighbour above grows that one; one that touches both merges
 /// three into one and gives a node back. Only a range with free space on
 /// neither side needs a node of its own, so the list is as long as the pool is
-/// fragmented, not as long as it is busy.
+/// fragmented, not as long as it is busy. A range that touches the frontier
+/// never reaches here (`pool_return` folds it in first), so the neighbour
+/// above is always a node.
 func pool_insert_range(pool: Int, base: UInt, len: UInt) unsafe {
     var prev: Int = NO_FREE_RANGE
     var cur = MEMORIES[pool].free_head
@@ -1271,9 +1266,9 @@ func pool_insert_range(pool: Int, base: UInt, len: UInt) unsafe {
     let n = alloc_free_range()
     if n == NO_FREE_RANGE {
         // A release cannot fail: an object whose last reference cannot be given
-        // up is worse than a hole in a pool, and a silent hole is worse than a
-        // counted one.
-        MEMORIES[pool].dropped = MEMORIES[pool].dropped + l
+        // up is worse than a hole in a pool. The bytes are on no list and out
+        // on no loan, which a holder sees as the pool's `available` total
+        // falling by their length.
         return
     }
     FREE_RANGES[n] = FreeRange(state: SlotState.Live, base: b, len: l, next: cur)
@@ -1316,6 +1311,15 @@ func pool_fold_frontier(pool: Int) unsafe {
 
 /// Give `[base, base + len)` back to pool `pool`, and take it off the loan
 /// ledger.
+///
+/// A range that ends where the unspent frontier begins lowers the frontier to
+/// its own base and needs no node: the frontier is free memory, a neighbour
+/// the range joins as it would join a free range. It is asked before the list
+/// is, so such a range comes home with the node slab full, and the fold that
+/// follows then takes in the listed range just below it, if that one now
+/// touches the frontier. Any other range goes on the list, and there the fold
+/// finds nothing to do: that range does not touch the frontier, and between
+/// two calls here no listed range does.
 func pool_return(pool: Int, base: UInt, len: UInt) unsafe {
     // A pool that is not there is a kernel bug, not a case to handle: a pool's
     // own release refuses while any of its bytes are out (see
@@ -1334,7 +1338,12 @@ func pool_return(pool: Int, base: UInt, len: UInt) unsafe {
         return
     }
     MEMORIES[pool].out_bytes = MEMORIES[pool].out_bytes - len
-    pool_insert_range(pool, base, len)
+    if base + len == MEMORIES[pool].base {
+        MEMORIES[pool].base = base
+        MEMORIES[pool].len = MEMORIES[pool].len + len
+    } else {
+        pool_insert_range(pool, base, len)
+    }
     pool_fold_frontier(pool)
 }
 

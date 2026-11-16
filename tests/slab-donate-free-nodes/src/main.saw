@@ -1,5 +1,6 @@
-// Free-range node exhaustion: a release past a full node slab leaks its range
-// into the pool's `dropped` counter, and donating `FreeRanges` stops the leak.
+// Free-range node exhaustion: a release past a full node slab that touches
+// neither a free neighbour nor the frontier loses its range to the pool, and
+// donating `FreeRanges` stops the leak.
 //
 // Transcript:
 //
@@ -11,9 +12,9 @@
 //   SOS slabnodes: the leaked range is gone: this pool has no free range that
 //                  long
 //
-// A pool's free list is made of `FREE_RANGES` nodes. A release that finds none
-// leaks its range into the pool's `dropped` counter rather than failing
-// (release is infallible). This case builds that path with donations that make
+// A pool's free list is made of `FREE_RANGES` nodes. A release that needs one
+// and finds none loses its range to the pool rather than failing (release is
+// infallible). This case builds that path with donations that make
 // separators, then donates `FreeRanges` nodes: the leak stops and the pair of
 // releases becomes observable.
 //
@@ -48,7 +49,7 @@
 // that cannot grow (the other profile's grant window caps it). The construction
 // is arithmetically impossible there.
 //
-// # How the leak is observed, given that `dropped` has no op
+// # How the leak is observed
 //
 // By a controlled pair: two identical releases of two identical regions, one
 // before the `FreeRanges` donation and one after.
@@ -258,9 +259,9 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    // The node slab holds exactly `HOLES` live nodes at this point, so this
-    // release finds none and the range is added to the pool's `dropped` and
-    // lost.
+    // The node slab holds exactly `HOLES` live nodes at this point, and both
+    // of this range's neighbours are donated bytes, so this release needs a
+    // node, finds none, and the range is lost.
     let _ = move r1
     let _ = system.debug_print(
         "SOS slabnodes: released one more past the node slab\n")

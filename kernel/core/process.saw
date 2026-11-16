@@ -380,6 +380,11 @@ public(package) func reclaim_process_record(p: Int) unsafe {
 /// knows both: the loader computes the destination frame from the region it was
 /// handed, and `install_row` asks `hal.map_place`. On a tier that does not
 /// translate the two are equal, which `hal.prot_update` asserts.
+///
+/// Every row holds at least one byte (`base < top`), so a range test over the
+/// record never has an empty row to step around: the loader records no row
+/// for a segment of no bytes, `map` refuses an empty region, `carve` an empty
+/// window, and the stack grant and the stats region's row are whole grains.
 public(package) func record_grant(p: Int, base: UInt, top: UInt, pa: UInt,
                                   perms: UInt8,
                                   device: Bool, region: Int) unsafe {
@@ -523,12 +528,7 @@ func grants_execute(p: Int, pa: UInt, bytes: UInt) unsafe -> Bool {
 /// Rows are compared by the user addresses they occupy, which are what the
 /// hardware filters or translates (spec §2.5). A range that only touches a
 /// row, ending where the row begins or beginning where it ends, does not meet
-/// it. A row of no bytes, which a segment of no bytes records, shares no
-/// address and meets nothing, wherever it lies. No `map` places a range
-/// holding such a row's address: where a mapping takes its memory's own
-/// address only the child's destination holds it, and the destination meets
-/// the child's other rows; where the kernel places a mapping it is placed
-/// above the image region. The guard keeps what a row of no bytes is.
+/// it. Every row holds at least one byte (`record_grant`).
 ///
 /// No preemption point: one pass over at most `MAX_GRANT_ROWS` rows.
 public(package) func meets_row(p: Int, base: UInt, top: UInt) unsafe -> Bool {
@@ -536,7 +536,7 @@ public(package) func meets_row(p: Int, base: UInt, top: UInt) unsafe -> Bool {
     var i: Int = 0
     while i < PROCESSES[b].grant_count {
         let row = PROCESSES[b].grants[i]
-        if row.base < row.top && base < row.top && row.base < top {
+        if base < row.top && row.base < top {
             return true
         }
         i = i + 1
@@ -1239,8 +1239,7 @@ func mint_boot_regions(p: Int) unsafe {
                                             granularity: hal.PROT_GRAIN,
                                             parent: NO_MEMORY, lent_base: 0,
                                             lent_len: 0, depth: 0,
-                                            free_head: 0, out_bytes: 0,
-                                            dropped: 0)
+                                            free_head: 0, out_bytes: 0)
                 let handle = mint_handle(p, ObjType.Memory, memory_rights(), slot)
                 if handle == NO_HANDLE {
                     fatal_image("no handle table room for the boot regions", i)
@@ -1260,17 +1259,16 @@ func mint_boot_regions(p: Int) unsafe {
                 let (pool_base, pool_len) = grain_aligned(row_base,
                                                           row.len as UInt)
                 // A pool names itself (`pool: slot`): it is the one slot every
-                // allocation from it names, and its ledger (the free list, the
-                // bytes out, the bytes dropped) is kept here. A boot pool was
-                // lent by no pool, so it has no `parent` and its depth is zero.
+                // allocation from it names, and its ledger (the free list and
+                // the bytes out) is kept here. A boot pool was lent by no pool,
+                // so it has no `parent` and its depth is zero.
                 MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
                                             base: pool_base, len: pool_len,
                                             refs: 1, maps: 0, pool: slot,
                                             granularity: hal.PROT_GRAIN,
                                             parent: NO_MEMORY, lent_base: 0,
                                             lent_len: 0, depth: 0,
-                                            free_head: 0, out_bytes: 0,
-                                            dropped: 0)
+                                            free_head: 0, out_bytes: 0)
                 let handle = mint_handle(p, ObjType.Pool, pool_rights(), slot)
                 if handle == NO_HANDLE {
                     fatal_image("no handle table room for the boot regions", i)

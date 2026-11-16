@@ -502,8 +502,8 @@ func row_range(seg: &SosimgSeg) -> (UInt, UInt) {
 /// A process's rows never overlap, so which row grants an address never
 /// depends on the order the hardware reads them in. Every pair is asked, so
 /// the answer does not depend on the order the table lists them in. Ranges
-/// that only touch do not meet, and a segment of no bytes, whose row is a
-/// range of no bytes, shares no address and meets nothing, wherever it lies.
+/// that only touch do not meet, and a segment of no bytes, which records no
+/// row (`place_image`) and holds no address, meets nothing, wherever it lies.
 /// The stack grant is not asked about: a copied segment is held below it, and
 /// a segment used in place lies in the image, which `process_create` holds
 /// apart from the destination.
@@ -597,7 +597,8 @@ func entry_is_executable(table: &ImageTable, entry: UInt) -> Bool {
 ///
 /// Every row recorded here occupies the range `row_range` gave
 /// `validate_image`, so no two of them meet, and no later mapping may meet
-/// any of them (`kcore.process.meets_row`).
+/// any of them (`kcore.process.meets_row`). A segment of no bytes records no
+/// row, so every row here holds at least one byte.
 public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
                                  dest: &LoadRegion, region: Int,
                                  image: Int) unsafe {
@@ -611,6 +612,13 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
         let mem_len = seg.mem_len as UInt
         // The row's top, as `validate_image` judged it.
         let (_, top) = row_range(&seg)
+
+        // A segment of no bytes grants nothing, so it places nothing and
+        // records no row (spec §5.6).
+        if mem_len == 0 {
+            s = s + 1
+            continue
+        }
 
         // A device window places no bytes; it is a grant and nothing else, and
         // no copy door takes a buffer in it. A device window is mapped at its

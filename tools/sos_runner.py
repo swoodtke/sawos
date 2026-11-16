@@ -765,7 +765,9 @@ CHILD_DATA_FIRST_PKG = os.path.join(TESTS_DIR, "child-data-first")
 MAP_OVERLAP_PKG = os.path.join(TESTS_DIR, "map-overlap")
 MAP_OVERLAP_CARVES_PKG = os.path.join(TESTS_DIR, "map-overlap-carves")
 SEGMENTS_MEET_PKG = os.path.join(TESTS_DIR, "segments-meet")
+EMPTY_SEGMENT_PKG = os.path.join(TESTS_DIR, "empty-segment")
 DEST_GRAIN_PKG = os.path.join(TESTS_DIR, "dest-grain")
+MAP_OFF_GRAIN_PKG = os.path.join(TESTS_DIR, "map-off-grain")
 DEST_WINDOW_PKG = os.path.join(TESTS_DIR, "dest-window")
 MAP_USER_ADDRESS_PKG = os.path.join(TESTS_DIR, "map-user-address")
 ROOM_REWRITE_PKG = os.path.join(TESTS_DIR, "room-rewrite")
@@ -4389,6 +4391,15 @@ TEST_CASES = [
         # list, so the case holds those too: an exact fit gives its node
         # back.
         #
+        # A range needs a node only when it touches neither a free neighbour
+        # nor the frontier (§5.9). Before the count, two units off the
+        # frontier released lower first leave the longest run as it was: the
+        # upper joins the frontier and the lower, listed, follows it. With the
+        # slab full after the count, a range off the frontier released joins
+        # it without a node, and a range cut from a listed hole's front and
+        # released joins what is left of the hole: `available`'s total loses
+        # nothing either time.
+        #
         # riscv32 only, for `slab_donate_free_nodes`' reason: filling the node
         # slab takes as many holes as it has nodes, each cut longer than the
         # last so first fit cannot serve it from a hole already made, and at
@@ -4403,7 +4414,13 @@ TEST_CASES = [
         "arches": ["riscv32", "riscv32-flat"],
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
+                       "SOS poolnodes: two ranges off the frontier released, "
+                       "the lower first: largest back",
                        "SOS poolnodes: the node slab filled",
+                       "SOS poolnodes: with the node slab full, a range off "
+                       "the frontier released: lost=0 bytes",
+                       "SOS poolnodes: with the node slab full, a range below "
+                       "a listed one released: lost=0 bytes",
                        "SOS poolnodes: the blob pool, nothing out, two ranges "
                        "listed: lost=2 units",
                        "SOS poolnodes: while the blob pool has them: nodes "
@@ -10006,9 +10023,12 @@ TEST_CASES = [
         # touch, in either order, or past a grain the first ends a byte into,
         # load. A segment's row is rounded up to the grain, so a thread's stack
         # top at the end of a segment's part-filled last grain is a stack. A
-        # segment of no bytes records a row of no bytes, which holds no
-        # address: inside another segment, listed after it or before it, or at
-        # its base or its top, it meets nothing and the image loads.
+        # segment of no bytes records no row and holds no address: inside
+        # another segment, listed after it or before it, or at its base or its
+        # top, it meets nothing and the image loads. It is still validated as
+        # every segment is: one off the grain, one a grain below the
+        # destination's link base, and one a grain above the room below the
+        # kernel's stack grant are each `BadImage`.
         "name": "segments_meet",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": SEGMENTS_MEET_PKG,
@@ -10036,9 +10056,43 @@ TEST_CASES = [
                        "it: loaded",
                        "SOS segmeet: no bytes at another's base: loaded",
                        "SOS segmeet: no bytes at another's top: loaded",
+                       "SOS segmeet: no bytes off the grain: BadImage",
+                       "SOS segmeet: no bytes below the destination: "
+                       "BadImage",
+                       "SOS segmeet: no bytes above the room below the "
+                       "stack: BadImage",
                        "SOS segmeet: a stack top at a part-filled grain's "
                        "end: a thread made",
                        "SOS segmeet: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A segment of no bytes loads and records no row (spec §5.6). Root
+        # adds two segments to `child-buffer-rule`'s image, in place in its
+        # blob (a pool, so the image is an allocation it can write): a
+        # zero-filled read-write segment of two pages above the image's last
+        # row, and a read-execute segment of no bytes at its second page.
+        # The image loads; the child, started, posts a body from a doubleword
+        # below that address to a doubleword above it, which is taken
+        # (`Exited` with 7, 65543); and a thread of the child, created again,
+        # whose stack top is half a word above the address is made. A row of
+        # no bytes there that permitted execute would have made both the body
+        # and the stack's word memory the process may execute, which is no
+        # buffer (§2.2).
+        "name": "empty_segment_no_row",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": EMPTY_SEGMENT_PKG,
+        "children": [CHILD_BUFFER_RULE_PKG],
+        "pool_blobs": [0],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS emptyseg: an executable segment of no bytes "
+                       "inside a data segment: loaded",
+                       "SOS emptyseg: a body across its address, from the "
+                       "child: taken",
+                       "SOS emptyseg: a stack top across its address: a "
+                       "thread made",
+                       "SOS emptyseg: done"],
         "expect_clean_exit": True,
     },
     {
@@ -10050,7 +10104,10 @@ TEST_CASES = [
         # thread is made on its stack's top word; with a one-byte executable
         # segment just below the stack it loads too, and a thread is made on
         # the stack's lowest grain, which no row the process may execute
-        # grants.
+        # grants. Last, root maps the allocation whose length is off the
+        # grain into itself: a row covers exactly its allocation, so `map`
+        # refuses it with the `BadArg` fault (spec §2.5), which ends root,
+        # rather than round the row's top up past the allocation's end.
         "name": "destination_off_grain",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": DEST_GRAIN_PKG,
@@ -10068,8 +10125,34 @@ TEST_CASES = [
                        "the stack: loaded",
                        "SOS destgrain: a thread on the stack's bottom grain: "
                        "made",
-                       "SOS destgrain: done"],
-        "expect_clean_exit": True,
+                       "SOS destgrain: the allocation whose length is off "
+                       "the grain, mapped",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A mapping covers exactly its allocation (spec §2.5). The build
+        # gives root the same two allocations off the grain as
+        # `destination_off_grain`; root maps an allocation out of its pool,
+        # which is taken, and then the allocation whose base is a byte past
+        # the grain, which is the `BadArg` fault and ends root.
+        "name": "map_base_off_grain",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_OFF_GRAIN_PKG,
+        "pool": True,
+        "off_grain_destinations": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS mapgrain: an allocation on the grain, mapped: "
+                       "taken",
+                       "SOS mapgrain: the allocation whose base is off the "
+                       "grain, mapped",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
     {
         # A destination is memory the profile can grant at the addresses the

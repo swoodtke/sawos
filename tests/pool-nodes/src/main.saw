@@ -1,8 +1,16 @@
 // A pool's free-list nodes come back to their slab when the pool goes (spec
 // §2.8, §5.9): released, its last handle dropped with nothing out, and
-// donated whole.
+// donated whole. And a range needs a node only when it touches neither a free
+// neighbour nor the pool's frontier, so a range beside either comes home with
+// the node slab full.
 //
+//   SOS poolnodes: two ranges off the frontier released, the lower first:
+//                  largest back
 //   SOS poolnodes: the node slab filled
+//   SOS poolnodes: with the node slab full, a range off the frontier
+//                  released: lost=0 bytes
+//   SOS poolnodes: with the node slab full, a range below a listed one
+//                  released: lost=0 bytes
 //   SOS poolnodes: the blob pool, nothing out, two ranges listed: lost=2 units
 //   SOS poolnodes: while the blob pool has them: nodes free=1.
 //   SOS poolnodes: the blob pool released: nodes free=2.
@@ -31,6 +39,19 @@
 // given its node back by allocating its length again: it is the first fit for
 // that length, and an exact one.
 //
+// # Ranges beside free memory
+//
+// Before the count, two units are cut off the RAM pool's frontier and
+// released, the lower first: it takes a node, and the upper one, beside the
+// frontier, joins the frontier and takes the lower one with it, so the pool's
+// longest run is what it was. With the slab full after the count, a range
+// cut off the frontier, longer than every hole, is released beside it and
+// joins it without a node: `available`'s total is what it was, where a range
+// that waited for a node would have been lost. Then a range three quarters of
+// the first hole's length is cut from that hole's front and released beside
+// what is left of it, and joins that range without a node too. Neither moves
+// a node, so the slab is still full when the pools below are held.
+//
 // # A pool with nothing out and nodes on its list
 //
 // Every range a pool frees coalesces, and one that reaches the frontier folds
@@ -38,7 +59,7 @@
 // were dropped. Five units are allocated off the pool's frontier; the second
 // and fourth are released while the slab is full and dropped (`lost=2`); room
 // is made for three nodes; the first and third are released onto the list,
-// and the fifth, beside the frontier, takes a node, folds and gives it back.
+// and the fifth, beside the frontier, folds into it without a node.
 // The pool then holds two nodes with the slab one short of full
 // (`nodes free=1`). When the pool goes, its two nodes come back
 // (`nodes free=2`).
@@ -56,6 +77,10 @@ static BUG: SosStatus = SosStatus.Unknown
 /// this profile.
 static UNIT: UInt = 16
 static PAGE: UInt = 0x1000
+
+/// Three quarters of a unit: whole protection grains on this profile, and
+/// shorter than the first hole, so it is cut from that hole's front.
+static PART: UInt = 12
 
 /// Past every count this case makes, so a count that never ends is a refusal.
 static MAX_HOLES: Int = 64
@@ -168,6 +193,39 @@ func make_room(n: Int, ram: &Pool, kept: &Vector<Int>, inlet: &PipeInlet,
     return
 }
 
+/// Two units cut off `ram`'s frontier and released, the lower first: the lower
+/// takes a node and the upper joins the frontier, and the lower must follow it
+/// there, leaving the pool's longest run as it was.
+func frontier_follows(ram: &Pool) -> Result<Void, SosStatus> {
+    let before = try ram.available()
+    let lower = try ram.allocate(len: UNIT)
+    let upper = try ram.allocate(len: UNIT)
+    let _ = move lower
+    let _ = move upper
+    let after = try ram.available()
+    if after.largest != before.largest || after.total != before.total {
+        print("SOS poolnodes: total={} largest={} after, {} {} before\n",
+              after.total, after.largest, before.total, before.largest)
+        return BUG
+    }
+    print("SOS poolnodes: {}: largest back\n",
+          "two ranges off the frontier released, the lower first")
+    return
+}
+
+/// With the node slab full, `len` bytes allocated from `ram` and released at
+/// once: the bytes `available`'s total lost across the two.
+func lost_by(ram: &Pool, len: UInt) -> Result<UInt, SosStatus> {
+    let before = try ram.available()
+    let m = try ram.allocate(len: len)
+    let _ = move m
+    let after = try ram.available()
+    if after.total > before.total {
+        return BUG
+    }
+    return before.total - after.total
+}
+
 /// Leave pool `p` with nothing out and two ranges on its free list. The node
 /// slab is full on entry and one short of full on return.
 func hold_nodes(what: String, p: &Pool, ram: &Pool, kept: &Vector<Int>,
@@ -214,8 +272,18 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var counts = Counts(held: 0, next: 0, taken: 0)
     var kept = try Vector<Int>(capacity: MAX_HOLES) catch { return BUG }
 
+    try frontier_follows(&ram)
     let _ = try room(&ram, &var kept, &inlet, &var carrier, &var counts)
     let _ = system.debug_print("SOS poolnodes: the node slab filled\n")
+
+    // Longer than every hole, so it is cut off the frontier.
+    let beyond = ((counts.next + 1) as UInt) * UNIT
+    let at_frontier = try lost_by(&ram, beyond)
+    print("SOS poolnodes: with the node slab full, {}: lost={} bytes\n",
+          "a range off the frontier released", at_frontier)
+    let in_hole = try lost_by(&ram, PART)
+    print("SOS poolnodes: with the node slab full, {}: lost={} bytes\n",
+          "a range below a listed one released", in_hole)
 
     try hold_nodes("the blob pool", &blob, &ram, &kept, &inlet, &var carrier,
                    &var counts)

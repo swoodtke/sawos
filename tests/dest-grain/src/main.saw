@@ -1,5 +1,7 @@
 // A destination is on the grain (spec §5.6): `process_create` refuses one
 // whose base or whose length is off the protection grain, and makes nothing.
+// And so is a mapping (§2.5): `map` refuses an allocation whose length is off
+// the grain rather than round its row's top up past the allocation.
 //
 // The build gives root two boot allocations off the grain beside its pool:
 // one whose base is on the grain and whose length is not, and one whose base
@@ -14,12 +16,17 @@
 //   SOS destgrain: a thread on its stack's top word: made
 //   SOS destgrain: a one-byte executable segment under the stack: loaded
 //   SOS destgrain: a thread on the stack's bottom grain: made
-//   SOS destgrain: done
+//   SOS destgrain: the allocation whose length is off the grain, mapped
+//   SOS: process fault: argument outside its domain process=0
 //
 // On the grain the stack grant begins on a grain boundary, so a segment just
 // below it, rounded up to the grain, ends where the stack begins: the stack's
 // lowest grain is still memory a thread may run on, and no row the process
 // may execute grants it.
+//
+// The map is root's own last call: the `BadArg` fault ends root, and the
+// machine with it. The image's page, mapped above, is the allocation on the
+// grain that maps.
 //
 // The images carry the architecture's tag and its grain, by the word size:
 // a 64-bit word is arm64, whose grain is a page and whose images link at one
@@ -143,6 +150,14 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     let _ = move second
     let _ = move child
     try view.unmap()
+
+    // Last, since the answer ends root: a `map` covers exactly its allocation,
+    // so one whose length is off the grain is the `BadArg` fault.
+    let _ = system.debug_print(
+        "SOS destgrain: the allocation whose length is off the grain, mapped\n")
+    let mapped = try proc.map(memory: &short, access: RW)
+    say("a map whose top would be rounded up: taken")
+    let _ = move mapped
     return
 }
 

@@ -30,6 +30,10 @@
 //                                                             [1) [0,2)
 //   SOS segmeet: no bytes at another's base: loaded           [0,2) [0)
 //   SOS segmeet: no bytes at another's top: loaded            [0,2) [2)
+//   SOS segmeet: no bytes off the grain: BadImage           [0,2) [4g+2)
+//   SOS segmeet: no bytes below the destination: BadImage     [0,2) [-1)
+//   SOS segmeet: no bytes above the room below the stack: BadImage
+//                                                        [0,2) [stack+1)
 //   SOS segmeet: a stack top at a part-filled grain's end: a thread made
 //                                                       [0,2) [4,5g+1)
 //   SOS segmeet: done
@@ -38,10 +42,14 @@
 // byte into a grain is granted that whole grain, so a segment linked at that
 // grain meets it, and one linked at the next grain does not, and a thread may
 // keep its stack in that grain past the segment's bytes. A segment of no
-// bytes records a row of no bytes, which holds no address and so meets no
-// segment, wherever it lies. Every pair is asked, whatever order the table
-// lists them in. An image that loads is a process that is created and never
-// started; its handle goes at once.
+// bytes records no row and holds no address, and so meets no segment,
+// wherever it lies, but it is validated as every segment is: one off the
+// grain, below the destination's link base, or above the room below the
+// kernel's stack grant (`stack` is that room's top) is `BadImage`. The one
+// off the grain lies clear of the code segment's grains, so its refusal is
+// the grain's and not a meeting. Every pair is asked, whatever order the
+// table lists them in. An image that loads is a process that is created and
+// never started; its handle goes at once.
 //
 // The images carry the architecture's tag and its grain, by the word size:
 // a 64-bit word is arm64, whose grain is a page and whose images link at one
@@ -63,6 +71,10 @@ static RW: UInt32 = MapAccess.Read | MapAccess.Write
 /// and segment table, in a page.
 static DEST_LEN: UInt = 0x1_0000
 static IMAGE_LEN: UInt = 0x1000
+
+/// The kernel's stack grant at a destination's top (`hal.ROOT_STACK_LEN`),
+/// the same on every profile here.
+static STACK_LEN: UInt = 0x4000
 
 /// The sosimg format as `imgformat` lays it out: a 24-byte header and a
 /// 24-byte record per segment, little-endian.
@@ -177,6 +189,14 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     try expect(&system, &image, &dest, at, &target,
                seg(0, 2 * g, RX_FLAGS), seg(2 * g, 0, RW_FLAGS), none(), 2,
                LOADED, "no bytes at another's top: loaded")
+    try empty_refused(&system, &image, &dest, at, &target,
+                      target.link + 4 * g + 2,
+                      "no bytes off the grain: BadImage")
+    try empty_refused(&system, &image, &dest, at, &target, target.link - g,
+                      "no bytes below the destination: BadImage")
+    try empty_refused(&system, &image, &dest, at, &target,
+                      target.link + DEST_LEN - STACK_LEN + g,
+                      "no bytes above the room below the stack: BadImage")
     try part_filled_grain(&system, &image, &dest, at, &target)
     print("SOS segmeet: a stack top at a part-filled grain's end: {}\n",
           "a thread made")
@@ -231,6 +251,29 @@ func expect(system: &System, image: &Memory, dest: &Memory, at: UInt,
             target: &Target, a: Seg, b: Seg, c: Seg, count: UInt,
             want: UInt, line: String) -> Result<Void, SosStatus> {
     write_image(at, &target, &a, &b, &c, count)
+    try answer(&system, &image, &dest, want, line)
+    return
+}
+
+/// An image of a code segment of two grains at the link base and a segment
+/// of no bytes linked at `addr` itself, which may lie below the link base:
+/// a create from it into `dest` must answer `BadImage`.
+func empty_refused(system: &System, image: &Memory, dest: &Memory, at: UInt,
+                   target: &Target, addr: UInt,
+                   line: String) -> Result<Void, SosStatus> {
+    let code = seg(0, 2 * target.grain, RX_FLAGS)
+    let empty = seg(0, 0, RW_FLAGS)
+    let unused = none()
+    write_image(at, &target, &code, &empty, &unused, 2)
+    poke(at + HEADER_BYTES + SEG_BYTES, addr as UInt32)
+    try answer(&system, &image, &dest, REFUSED, line)
+    return
+}
+
+/// Create a process from `image` into `dest`, require the answer `want` and
+/// print `line`.
+func answer(system: &System, image: &Memory, dest: &Memory, want: UInt,
+            line: String) -> Result<Void, SosStatus> {
     var got = REFUSED
     match system.process_create(image: &image, memory: &dest) {
         case Ok(child) -> {

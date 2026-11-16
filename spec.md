@@ -1088,7 +1088,7 @@ no more than the pool holds, and what it releases it can allocate again.
   at the moment of the call. A range's aligned run is the longest part of it
   that starts and ends on multiples of the granularity.
   - `total` is the bytes free: the aligned runs of the ranges on the pool's free
-    list and of its unspent frontier, added up. Bytes dropped for want of a
+    list and of its unspent frontier, added up. Bytes lost for want of a
     free-list node (§5.9) are not free, and nothing out on loan, donations
     included, is.
   - `largest` is the longest of those aligned runs. That is its definition: if
@@ -1225,20 +1225,23 @@ message, minted and donated, and it is never cut. It comes from a pool's
   installs the child's row itself leaves the child holding no `Memory` handle
   at all (`tests/share-double-map`), while a driver child given an `IoMemory`
   installs its own row. Two installation directions, no mode flag. The row
-  covers the whole allocation, its top rounded up to the grain. Its answers,
-  in the order they are decided: a handle without `MemoryRight.Map` is the
-  `AccessDenied` fault; a target word that names no Process is `BadHandle`,
-  and a target handle without `ProcessRight.Map` `AccessDenied`; an access
-  word with a bit outside `MapAccess`, one asking for nothing, for write
-  without read or for write with execute is `BadArg`; execute asked through a
-  handle without `MapExecute` is `AccessDenied`; and an allocation that is
-  empty, runs off the end of the address space, has its base off the grain,
-  or lies in memory the board cannot hand a process (flash, §5.6) is
-  `BadArg`. Then the statuses: a `Gone` target answers `Revoked` (§2.10), a
-  target at its `Mapping` quota `QuotaExceeded` (§2.9), and a target whose
-  address space has no room for the range, or one of whose rows the range
-  meets (below), `NoResource`, as a full Mapping slab does; the caller's
-  handle budget and table answer last, as at every mint.
+  covers exactly the allocation: an allocation whose base or length is off
+  the grain is refused, not rounded, so no row grants a byte outside its
+  object. Only a boot allocation can be off the grain (a pool serves whole
+  grains). Its answers, in the order they are decided: a handle without
+  `MemoryRight.Map` is the `AccessDenied` fault; a target word that names no
+  Process is `BadHandle`, and a target handle without `ProcessRight.Map`
+  `AccessDenied`; an access word with a bit outside `MapAccess`, one asking
+  for nothing, for write without read or for write with execute is `BadArg`;
+  execute asked through a handle without `MapExecute` is `AccessDenied`; and
+  an allocation that is empty, runs off the end of the address space, has its
+  base or its length off the grain, or lies in memory the board cannot hand a
+  process (flash, §5.6) is `BadArg`. Then the statuses: a `Gone` target
+  answers `Revoked` (§2.10), a target at its `Mapping` quota
+  `QuotaExceeded` (§2.9), and a target whose address space has no room for
+  the range, or one of whose rows the range meets (below), `NoResource`, as
+  a full Mapping slab does; the caller's handle budget and table answer last,
+  as at every mint.
 - **Access is a property of the mapping.** An allocation carries no R/W/X
   triple, and mapping one allocation read-only in one place and read-write in
   another is expressible and allowed, wherever the overlap rule below allows
@@ -1250,12 +1253,11 @@ message, minted and donated, and it is never cut. It comes from a pool's
   copied or used in place, the stack grant, a row an earlier `map`
   installed, a device row or the stats region's row. "Meets" compares user
   addresses: the range the new row would occupy in the target against the
-  range each existing row occupies there. A row of no bytes, which a segment
-  of no bytes records (§5.6), holds no address and meets nothing. Every row
-  has both ends on the grain (a mapped allocation's base must be on it and
-  its top is rounded up to it, a device window and the stats region's row
-  are whole grains, and so are the loader's rows, §5.6), so two rows that
-  meet share at least a grain.
+  range each existing row occupies there. Every row holds at least one byte
+  (a segment of no bytes records none, §5.6), and every row has both ends on
+  the grain (a mapped allocation's base and length must be on it, a device
+  window and the stats region's row are whole grains, and so are the
+  loader's rows, §5.6), so two rows that meet share at least a grain.
   With the loader's own rule that no two rows of one image meet (§5.6), a
   process's rows never overlap on any profile, and which row grants an
   address never depends on which was installed first. (On the PMP boards the
@@ -3184,6 +3186,11 @@ Everything else derives from those handles.
   `process_create`, a stopped boot for root's image. Segments that only
   touch, one ending where the other begins, do not meet, and a segment of no
   bytes, whose granted range holds no address, meets none, wherever it lies.
+  **A segment of no bytes loads and records no row:** it grants nothing, so
+  there is nothing to record, the grant record never holds a row of no bytes,
+  and no grant row is spent on it, though it still counts against the
+  image's segment limit. It is validated as every segment is (its address on
+  the grain and inside the destination).
   Copied segments already lie below the stack grant and segments used in
   place lie in the image, which is disjoint from the destination, so the test
   is between the segments, every pair of them, bounded by the row budget.
@@ -3461,23 +3468,27 @@ are never freed:
 - **The counts live on the object's own slab slot**: §2.5's "refcount
   invariant, as built".
 - **A pool is its own kind, and its ledger is its own slot**: the head of
-  its free list, the bytes outstanding and the bytes dropped. Every
-  allocation records the pool it came from and returns its whole range there;
+  its free list and the bytes outstanding. Every allocation records the pool
+  it came from and returns its whole range there;
   an allocation minted at boot came from no pool and returns nowhere. A
   returned range is inserted into the pool's free list,
   which is kept sorted by base; it coalesces with a free neighbour on either
   side, and a free range that touches the pool's unspent frontier folds back
   into it, so a pool whose every allocation has come home is whole again.
+  The frontier is a free neighbour: a returned range that ends where the
+  frontier begins joins it directly, without a free-list node.
   `allocate` serves first fit from the free list before it advances the
   frontier (§2.5).
 - **The free list's nodes come from one slab** (`SlabKind.FreeRanges`,
   donatable), shared by every pool and charged to nobody. A range needs a node
-  only when it touches no free neighbour, so a pool's list is as long as the
-  pool is fragmented, not as long as it is busy. A release is infallible, so a
-  range that finds no node after coalescing is dropped from its pool and
-  counted (`dropped`) rather than refused: those bytes are lost to the pool
-  until the machine stops, and its outstanding bytes still fall by their
-  length, so the pool can free. Donating nodes is the remedy.
+  only when it touches neither a free neighbour nor the frontier, so a pool's
+  list is as long as the pool is fragmented, not as long as it is busy, and a
+  range beside either comes home even when the slab is full. A release is
+  infallible, so a range that finds no node after coalescing is lost to its
+  pool rather than refused: those bytes are on no list until the machine
+  stops, which a holder sees as `available`'s total falling by their length
+  (§2.5), and the pool's outstanding bytes still fall by their length, so the
+  pool can free. Donating nodes is the remedy.
 - **Byte accounting is that ledger**: `MemorySlot.out_bytes` (outstanding)
   beside the free list and the frontier (free). It is the pool's business and
   not a per-process authority — quotas stay object-counted in v1 (§2.9). The

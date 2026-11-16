@@ -1,0 +1,72 @@
+// A mapping covers exactly its allocation (spec §2.5): `map` refuses an
+// allocation whose base is off the protection grain with the `BadArg` fault,
+// rather than grant the bytes before it in its first grain.
+//
+// The build gives root two boot allocations off the grain beside its pool
+// (`off_grain_destinations`): one whose length is off the grain, which
+// `tests/dest-grain` maps, and one whose base is a byte past the grain and
+// whose length is whole grains, which this case maps. An allocation out of
+// the pool, on the grain, is mapped first:
+//
+//   SOS mapgrain: an allocation on the grain, mapped: taken
+//   SOS mapgrain: the allocation whose base is off the grain, mapped
+//   SOS: process fault: argument outside its domain process=0
+//
+// The second map is root's last call: the fault ends root, and the machine
+// with it.
+
+import sos.{System, Process, Memory, Pool, MapAccess, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mapgrain: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS mapgrain: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mapgrain: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    // The pool, then the two allocations off the grain: the table's order.
+    var pool_rec = try proc.boot_handle_next()
+    var short_rec = try proc.boot_handle_next()
+    var skewed_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    guard let short = short_rec.take_memory() else { return BUG }
+    guard let skewed = skewed_rec.take_memory() else { return BUG }
+    let _ = move short
+
+    let piece = try pool.allocate(len: PAGE)
+    let view = try proc.map(memory: &piece, access: RW)
+    let _ = system.debug_print(
+        "SOS mapgrain: an allocation on the grain, mapped: taken\n")
+    let _ = move view
+
+    let _ = system.debug_print(
+        "SOS mapgrain: the allocation whose base is off the grain, mapped\n")
+    let mapped = try proc.map(memory: &skewed, access: RW)
+    let _ = system.debug_print(
+        "SOS mapgrain: a map whose base is off the grain: taken\n")
+    let _ = move mapped
+    return
+}
