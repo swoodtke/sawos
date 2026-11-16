@@ -204,6 +204,8 @@ STOCK_CARVER_PKG = os.path.join(TESTS_DIR, "stock-carver")
 # RTC, and the ESP32-S3's timer group 1.
 STOCK_GOLDFISH_PKG = os.path.join(TESTS_DIR, "stock-goldfish")
 STOCK_TIMG_PKG = os.path.join(TESTS_DIR, "stock-timg")
+# The ESP32-S3's GPIO driver, a child of a stock root (`drivers/`).
+GPIO_DRIVER_PKG = os.path.join(REPO_ROOT, "drivers", "svc-gpio-esp32s3")
 FAULT_ROOT_PKG = os.path.join(TESTS_DIR, "faulting-root")
 # Thread and Process objects. Test processes reach the kernel through the `sos`
 # module and never through an op number.
@@ -1846,6 +1848,55 @@ _STOCK_TIMG_REFUSED = {
     "expect_out": [],
     "expect_clean_exit": False}
 
+
+# What `gpio_service`'s client prints, in order
+# (`tests/gpio-service-client`). The words the device answers to `Inspect`
+# are the part's and are printed for a reader, so the line is held to its
+# start.
+_GPIO_SERVICE_LINES = [
+    "SOS gpioclient: log 0: 15 entries ok",
+    "SOS gpioclient: log 15: 13 entries ok",
+    "SOS gpioclient: read 21 = 0",
+    "SOS gpioclient: wait_level 21 0 answered at once",
+    "SOS gpioclient: read 22: BadPin",
+    "SOS gpioclient: read 19: NotMine",
+    "SOS gpioclient: read 25: BadPin",
+    "SOS gpioclient: read 26: NotMine",
+    "SOS gpioclient: read 48: NotMine",
+    "SOS gpioclient: read 255: BadPin",
+    "SOS gpioclient: read 49: BadPin",
+    "SOS gpioclient: write 22: BadPin",
+    "SOS gpioclient: write 19: NotMine",
+    "SOS gpioclient: wait_level 22: BadPin",
+    "SOS gpioclient: wait_level 19: NotMine",
+    "SOS gpioclient: inspect 22: BadPin",
+    "SOS gpioclient: inspect 19: NotMine",
+    "SOS gpioclient: write 21: BadMode",
+    "SOS gpioclient: wait_level 2: BadMode",
+    "SOS gpioclient: write 2 level 2: BadArg",
+    "SOS gpioclient: wait_level 21 level 2: BadArg",
+    "SOS gpioclient: write 22 level 2: BadArg",
+    "SOS gpioclient: op 0x7f: BadOp",
+    "SOS gpioclient: read, no pin: BadOp",
+    "SOS gpioclient: read, two bytes: BadOp",
+    "SOS gpioclient: status, a byte: BadOp",
+    "SOS gpioclient: refusals wrote nothing",
+    "SOS gpioclient: log 28: OUT_W1TC <- 0x00000004, OUT1_W1TS <- 0x00008000",
+    "SOS gpioclient: read 2 answered, level ",
+    "SOS gpioclient: wait_level 21 1 held=1",
+    "SOS gpioclient: the deadline came first",
+    "SOS gpioclient: dropped, held=0 abandoned=1",
+    "SOS gpioclient: four held, held=4",
+    "SOS gpioclient: fifth wait_level 21 1: Busy",
+    "SOS gpioclient: wait_level 21 0 answered at once with four held",
+    "SOS gpioclient: four handles carried with four held, driver up held=4",
+    "SOS gpioclient: dropped four, held=0 abandoned=5",
+    "SOS gpioclient: wait_level 47 1 held=1",
+    "SOS gpioclient: dropped, held=0 abandoned=6",
+    "SOS gpioclient: log kept 64 and dropped 6",
+    "SOS gpioclient: inspect 21 iomux=",
+    "SOS gpioclient: done",
+]
 
 # What a stock root's plan gives a child it only starts: its System record.
 _STOCK_START = {"name": "first", "image": 0, "destination": 1, "start": 1,
@@ -12163,7 +12214,8 @@ SOSIMAGE_DIR = os.path.join(REPO_ROOT, "tools", "sosimage")
 
 # Packages whose own tests run on the host in a full run, beside the
 # builder's: `blade test` in each.
-HOSTED_TESTS = [os.path.join(DRIVERS_DIR, "esp32s3io")]
+HOSTED_TESTS = [os.path.join(DRIVERS_DIR, "esp32s3io"),
+                os.path.join(DRIVERS_DIR, "gpioproto")]
 
 # The link the builder's manifest reaches the sawlang checkout's packages
 # through: `imgformat = { path = "../../.sawlang/libs/imgformat" }`.
@@ -13159,7 +13211,7 @@ def _built_from_files(arch, name):
     return None
 
 
-def _build_image_file(packager, profile, arch, case, env):
+def _build_image_file(packager, profile, arch, case, env, link_args=()):
     """Build the case's hand-written description, `tests/images/<file>`, its
     `image_file` for this profile, with `sosimage build`, which places every
     process and builds every package itself; return the ELF it linked and
@@ -13169,7 +13221,7 @@ def _build_image_file(packager, profile, arch, case, env):
     printed = _run_sosimage(packager, [
         "build", profile, REPO_ROOT, REPO_ROOT,
         os.path.join(TESTS_DIR, "images", case["image_file"][arch["name"]]),
-        out], env=env)
+        out, *link_args], env=env)
     return os.path.join(out, f"{case['name']}.elf"), printed
 
 
@@ -15127,6 +15179,134 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "expect_clean_exit": True,
         },
         {
+            # The GPIO driver under the stock root (`gpio_service_s3.toml`):
+            # the driver, its configuration and a client that makes every
+            # request of the protocol. This emulator models none of GPIO's
+            # behavior (`IN` reads 0, no GPIO interrupt can be raised), so the
+            # case reads what the driver wrote through its own log, every
+            # refusal, and the waits it holds and discards; the interrupt
+            # path is the board stages'.
+            "name": "gpio_service",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "gpio_service_s3.toml"},
+            "expect_out": ["{banner}",
+                           *_GPIO_SERVICE_LINES,
+                           "root: client ended status=65536",
+                           "SOS gpiosvc drv: served=92 abandoned=6 fires=",
+                           "root: driver ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The GPIO driver stops on a configuration that names a pin the
+            # chip holds, before it maps anything: its Mapping row is 0, so a
+            # driver that mapped first would end on that refusal instead.
+            "name": "gpio_bad_config",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": STOCK_ROOT_PKG,
+            "root_plan": {
+                "connections": 1,
+                "children": [{"name": "driver", "image": 0, "destination": 1,
+                              "start": 1,
+                              "quota": {"handles": 17, "mappings": 0,
+                                        "waiters": 1},
+                              "records": [
+                                  {"tag": 1, "source": "system"},
+                                  {"tag": 2, "source": "row", "from": 2},
+                                  {"tag": 3, "source": "row", "from": 3},
+                                  {"tag": 4, "source": "line", "from": 16},
+                                  {"tag": 5, "source": "outlet",
+                                   "from": 0}]}]},
+            "children": [GPIO_DRIVER_PKG],
+            "devices": ["GPIO", "IO_MUX"],
+            "inputs": {"gpioconfig": "tests/images/gpio/bad.saw"},
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={four}",
+                           # The refusal is the driver's last word: the next
+                           # line is the kernel's account of its exit, so a
+                           # driver that went on would print more between.
+                           "SOS gpiosvc drv: config refused: pin 30 is held "
+                           "by the chip (the SPI flash bus)\n"
+                           "SOS: process exit: code=0x00000001",
+                           "root: driver ended status=65537"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The GPIO driver stops on a configuration that names a pin the
+            # chip holds and goes no further: with every row it declares, a
+            # driver that carried on would serve and end clean (status 0).
+            "name": "gpio_refused_config",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": STOCK_ROOT_PKG,
+            "root_plan": {
+                "connections": 1,
+                "children": [{"name": "driver", "image": 0, "destination": 1,
+                              "start": 1,
+                              "quota": {"handles": 17, "mappings": 2,
+                                        "waiters": 1},
+                              "records": [
+                                  {"tag": 1, "source": "system"},
+                                  {"tag": 2, "source": "row", "from": 2},
+                                  {"tag": 3, "source": "row", "from": 3},
+                                  {"tag": 4, "source": "line", "from": 16},
+                                  {"tag": 5, "source": "outlet",
+                                   "from": 0}]}]},
+            "children": [GPIO_DRIVER_PKG],
+            "devices": ["GPIO", "IO_MUX"],
+            "inputs": {"gpioconfig": "tests/images/gpio/bad.saw"},
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={four}",
+                           # The refusal is the driver's last word: the next
+                           # line is the kernel's account of its exit, so a
+                           # driver that went on would print more between.
+                           "SOS gpiosvc drv: config refused: pin 30 is held "
+                           "by the chip (the SPI flash bus)\n"
+                           "SOS: process exit: code=0x00000001",
+                           "root: driver ended status=65537"],
+            "expect_clean_exit": True,
+        },
+        {
+            # Stage G1, for a board (`--emit-flash`): the interrupt path with
+            # nothing wired. Pin 14 is its own loopback; ten times the client
+            # holds a wait for the level the pin is not at, writes it, and the
+            # answer can only have come from GPIO's interrupt.
+            "name": "gpio_loopback_board",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "gpio_loopback_s3.toml"},
+            "board_only": "this emulator raises no GPIO interrupt and its "
+                          "`IN` reads 0",
+            "expect_out": ["{banner}",
+                           *[f"SOS gpioboard: 14 -> {level} answered by "
+                             "interrupt" for level in (1, 0) * 5],
+                           "SOS gpioboard: inspect 14 iomux=6656 pin=8576 "
+                           "out_sel=1280 ok",
+                           "SOS gpioboard: inspect 21 iomux=6912 pin=8576 "
+                           "out_sel=256 ok",
+                           "SOS gpioboard: output 2 reads 1 after 1 and 0 "
+                           "after 0",
+                           "SOS gpioboard: done",
+                           "root: client ended status=65536",
+                           "root: driver ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # Stage G2, for a board: the switch, wired from GPIO 21 to ground,
+            # read through the driver. The owner flips it ten times; with it
+            # open at boot the first flip closes it.
+            "name": "gpio_switch_board",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "gpio_switch_s3.toml"},
+            "board_only": "it needs the switch wired, which this emulator "
+                          "cannot show",
+            "expect_out": ["{banner}",
+                           "SOS gpioswitch: at boot the switch is off",
+                           *[f"SOS gpioswitch: switch {word} fires="
+                             for word in ("on", "off") * 5],
+                           "SOS gpioswitch: done",
+                           "root: client ended status=65536",
+                           "root: driver ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
             # A test image with more children than the board has flash slots:
             # the link refuses it, naming the counts.
             "name": "too_many_children",
@@ -15494,7 +15674,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         if case.get("image_file"):
             elf, printed = _build_image_file(
                 packager, profiles[variant(case)], variant_arch(variant(case)),
-                case, _blade_env(clang, lld))
+                case, _blade_env(clang, lld),
+                ["--defsym=_sos_semihosting=0"] if board else [])
             found = re.search(r"^flash used=(\d+) end=(\d+)$", printed, re.M)
             if not found:
                 raise ToolError(f"{name}: the image builder did not say how "

@@ -1,0 +1,144 @@
+// The GPIO wire, as bytes: each op and status value, each builder's bytes and
+// lengths, and the decoders' guards. A shared enum would change client and
+// driver together and no case would notice, so the numbers are written here.
+
+import gpioproto.{BODY_BYTES, Frame, GpioBody, GpioOp, GpioStatus, LOG_ENTRIES,
+                  LOG_PER_REPLY}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func is_op(frame: &Frame, want: GpioOp) -> Bool {
+    if let op = frame.op() { op == want } else { false }
+}
+
+func is_status(frame: &Frame, want: GpioStatus) -> Bool {
+    if let status = frame.status() { status == want } else { false }
+}
+
+func message(len: UInt, fill: UInt8) -> Frame {
+    Frame(len: len, bytes: [fill; BODY_BYTES])
+}
+
+func main() {
+    // Op and status numbers.
+    check(GpioOp.Read as UInt8 == 1, "Read is 1")
+    check(GpioOp.Write as UInt8 == 2, "Write is 2")
+    check(GpioOp.WaitLevel as UInt8 == 3, "WaitLevel is 3")
+    check(GpioOp.Inspect as UInt8 == 4, "Inspect is 4")
+    check(GpioOp.Log as UInt8 == 5, "Log is 5")
+    check(GpioOp.Status as UInt8 == 6, "Status is 6")
+    check(GpioStatus.Ok as UInt8 == 0, "Ok is 0")
+    check(GpioStatus.BadOp as UInt8 == 1, "BadOp is 1")
+    check(GpioStatus.BadArg as UInt8 == 2, "BadArg is 2")
+    check(GpioStatus.BadPin as UInt8 == 3, "BadPin is 3")
+    check(GpioStatus.NotMine as UInt8 == 4, "NotMine is 4")
+    check(GpioStatus.BadMode as UInt8 == 5, "BadMode is 5")
+    check(GpioStatus.Busy as UInt8 == 6, "Busy is 6")
+    check(GpioOp.from(raw: 7).is_none(), "no op 7")
+    check(GpioOp.from(raw: 0).is_none(), "no op 0")
+    check(GpioStatus.from(raw: 7).is_none(), "no status 7")
+
+    // How many payload bytes each op carries.
+    check(GpioOp.Read.payload_bytes() == 1, "Read: a pin")
+    check(GpioOp.Write.payload_bytes() == 2, "Write: a pin and a level")
+    check(GpioOp.WaitLevel.payload_bytes() == 2, "WaitLevel: a pin and a level")
+    check(GpioOp.Inspect.payload_bytes() == 1, "Inspect: a pin")
+    check(GpioOp.Log.payload_bytes() == 1, "Log: a start")
+    check(GpioOp.Status.payload_bytes() == 0, "Status: nothing")
+
+    // Request builders.
+    var b = GpioBody.empty()
+    var n = b.read(21)
+    check(n == 2 && b.bytes[0] == 1 && b.bytes[1] == 21, "Read(21)")
+    n = b.write(14, 1)
+    check(n == 3 && b.bytes[0] == 2 && b.bytes[1] == 14 && b.bytes[2] == 1, "Write(14, 1)")
+    n = b.wait_level(2, 0)
+    check(n == 3 && b.bytes[0] == 3 && b.bytes[1] == 2 && b.bytes[2] == 0, "WaitLevel(2, 0)")
+    n = b.inspect(47)
+    check(n == 2 && b.bytes[0] == 4 && b.bytes[1] == 47, "Inspect(47)")
+    n = b.log(15)
+    check(n == 2 && b.bytes[0] == 5 && b.bytes[1] == 15, "Log(15)")
+    n = b.status()
+    check(n == 1 && b.bytes[0] == 6, "Status")
+    n = b.raw(127, 2)
+    check(n == 3 && b.bytes[0] == 127, "a raw request")
+
+    // Reply builders: lengths and bytes, little-endian.
+    var r = GpioBody.empty()
+    n = r.refuse(GpioStatus.Busy)
+    check(n == 1 && r.bytes[0] == 6, "a refusal is the status alone")
+    n = r.ok()
+    check(n == 1 && r.bytes[0] == 0, "Ok alone")
+    n = r.ok_byte(1)
+    check(n == 2 && r.bytes[0] == 0 && r.bytes[1] == 1, "Ok and a byte")
+    n = r.ok_level(1, 0x0403_0201)
+    check(n == 6 && r.bytes[0] == 0 && r.bytes[1] == 1, "a level answer's head")
+    check(r.bytes[2] == 1 && r.bytes[3] == 2 && r.bytes[4] == 3 && r.bytes[5] == 4,
+           "its fires, little-endian")
+    n = r.ok_status(3, 0x0201, 0x0807_0605)
+    check(n == 8 && r.bytes[0] == 0 && r.bytes[1] == 3, "a status answer's head")
+    check(r.bytes[2] == 1 && r.bytes[3] == 2, "its abandoned, little-endian")
+    check(r.bytes[4] == 5 && r.bytes[5] == 6 && r.bytes[6] == 7 && r.bytes[7] == 8,
+           "its fires, little-endian")
+    n = r.ok_inspect(0x0403_0201, 0x0807_0605, 0x0C0B_0A09, 1)
+    check(n == 14 && r.bytes[0] == 0, "an inspect answer")
+    check(r.bytes[1] == 1 && r.bytes[4] == 4 && r.bytes[5] == 5 && r.bytes[8] == 8
+           && r.bytes[9] == 9 && r.bytes[12] == 12 && r.bytes[13] == 1,
+           "its three words and its bit")
+    n = r.ok_log(28, 0x0201, 15)
+    check(n == 5 && r.bytes[0] == 0 && r.bytes[1] == 28 && r.bytes[2] == 1
+           && r.bytes[3] == 2 && r.bytes[4] == 15, "a log answer's head")
+    n = r.put_log_entry(0, 0x6000_4028, 0x0020_0000)
+    check(n == 13, "the first entry ends at 13")
+    check(r.bytes[5] == 0x28 && r.bytes[6] == 0x40 && r.bytes[7] == 0 && r.bytes[8] == 0x60,
+           "its address, little-endian")
+    check(r.bytes[9] == 0 && r.bytes[10] == 0 && r.bytes[11] == 0x20 && r.bytes[12] == 0,
+           "its word")
+    n = r.put_log_entry(1, 0x600045a8, 0x100)
+    check(n == 21, "an entry is eight bytes")
+    check(r.bytes[13] == 0xa8 && r.bytes[17] == 0 && r.bytes[18] == 1, "the second entry")
+    n = r.put_log_entry(LOG_PER_REPLY - 1, 1, 2)
+    check(n == 5 + 8 * LOG_PER_REPLY as UInt && n <= BODY_BYTES as UInt, "the last entry fits")
+    check(LOG_ENTRIES == 64 && LOG_PER_REPLY == 15, "the log's sizes")
+
+    // The decoders' guards. A message of no bytes names no op and carries no
+    // payload, whatever its buffer holds; a payload byte out of range is 0.
+    let empty = message(0, 1)
+    check(empty.op().is_none(), "no bytes, no op")
+    check(empty.payload_len() == 0, "no bytes, no payload")
+    check(empty.status().is_none(), "no bytes, no status")
+    let nine = message(2, 9)
+    check(nine.op().is_none(), "9 is no op")
+    check(nine.status().is_none(), "9 is no status")
+    var one = message(2, 0)
+    one.bytes[0] = 1
+    one.bytes[1] = 21
+    check(is_op(&one, GpioOp.Read), "op 1 is Read")
+    check(one.payload_len() == 1, "one payload byte")
+    check(one.payload_byte(0) == 21, "the pin")
+    check(one.payload_byte(1) == 0, "past the payload")
+    check(one.payload_byte(-1) == 0, "before the payload")
+    check(empty.payload_byte(0) == 0, "an empty message's byte")
+    var reply = message(3, 0xFF)
+    reply.bytes[0] = 0
+    reply.bytes[1] = 7
+    reply.bytes[2] = 8
+    check(is_status(&reply, GpioStatus.Ok), "status 0 is Ok")
+    check(reply.byte(1) == 7 && reply.byte(2) == 8, "reply bytes")
+    check(reply.byte(3) == 0, "a reply byte past its end")
+    check(reply.byte(-1) == 0, "a reply byte before its start")
+    check(reply.u16(1) == 0x0807, "a half-word")
+    check(reply.u32(0) == 0x0008_0700, "a word, cut short by the reply's end")
+    var full = message(6, 0)
+    full.bytes[2] = 1
+    full.bytes[3] = 2
+    full.bytes[4] = 3
+    full.bytes[5] = 4
+    check(full.u32(2) == 0x0403_0201, "a whole word")
+}

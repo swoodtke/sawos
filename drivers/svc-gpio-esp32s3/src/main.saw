@@ -1,0 +1,568 @@
+// The ESP32-S3's GPIO as a service.
+//
+// The process checks the pins its configuration names, maps GPIO and the IO
+// MUX, configures each pin (`esp32s3io.start_gpio`), and then serves
+// `gpioproto` over a pipe. Its loop is a completion-queue server, as the UART
+// drivers' are: the outlet is given to the Waiter, so every request arrives
+// through `wait` itself with the obligation to answer it, and the process
+// holds no endpoint handle. A delivery is one of four things:
+//
+//   Message      a request. `WaitLevel` is answered at once when the pin
+//                already reads the level, and otherwise held; every other op
+//                is answered from the request.
+//   Interrupt    a pin's edge. `esp32s3io.service_interrupt` reads which pins
+//                fired, clears them, reads the levels and acknowledges, in the
+//                order that loses no edge, and each held wait whose pin now
+//                reads its level is answered.
+//   Abandoned    a client dropped its claim on a wait this driver is holding.
+//                The obligation is discarded and the loop goes on.
+//   Readable     the terminal level: every inlet is gone, so no request can
+//                arrive again and the loop ends.
+//
+// A request may carry handles. They are released when the message is dropped,
+// and the driver's handle row (`process.toml`) leaves room for the obligation
+// and for all of them while every wait is held, so no client can end it.
+//
+// Every register word the driver writes goes through one method that writes
+// the register and appends the word to a log (`Gpio.write`), so the log is
+// the writes themselves; a client reads it with `Log`.
+
+import sos.{System, Process, Interrupt, IoMemory, PipeOutlet, Waiter, WaitResult, BootSet,
+            PipeRequest, PipeMsg, AttachMode, SosStatus, PIPE_BODY_BYTES}
+import gpioproto.{GpioOp, GpioStatus, GpioBody, Frame, BODY_BYTES, LOG_ENTRIES,
+                  LOG_PER_REPLY}
+import esp32s3io.{GpioPin, PinMode, PinSet, PinWait, Register, RegisterPort,
+                  GpioPort, MAX_HELD, check_gpio_config,
+                  start_gpio, is_output, pad_register, pin_register,
+                  out_sel_register, out_set, out_clear, pin_bit, service_interrupt,
+                  count_up, count_up_16, level_register, Pads, pads_pcpu_int,
+                  pads_clear_status, pads_levels, fires_after, take_answered}
+import gpioconfig
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status this driver can never legitimately produce, so meeting it means an
+/// assertion in this file failed rather than a call did.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The tags its declaration gives its records (`process.toml`).
+static TAG_GPIO: UInt = 2
+static TAG_IOMUX: UInt = 3
+static TAG_LINE: UInt = 4
+static TAG_SERVE: UInt = 5
+
+/// The Waiter's keys. The held band is a base plus the slot, so an abandoned
+/// delivery says which held obligation it is about without a second table.
+static KEY_OUTLET: UInt = 11
+static KEY_IRQ: UInt = 12
+static KEY_HELD: UInt = 100
+
+// =============================================================================
+// The device
+// =============================================================================
+
+/// A 4 KiB device window as the words it is. A register is reached by its
+/// offset in its block (`esp32s3io.Register`), so the view is the block's
+/// words and not a field per register.
+struct Words {
+    word: [UInt32; 1024],
+}
+
+static_assert(sizeof<Words>() == 0x1000, "a window is 4 KiB of words")
+
+/// A mapped window. A safe type: only the methods reaching through `regs` carry
+/// the `unsafe` effect.
+struct Window {
+    regs: UnsafeMemory<Words, Device>,
+}
+
+extension Window {
+    init(at: UInt) unsafe -> Window {
+        Window(regs: UnsafeMemory<Words, Device>(at))
+    }
+
+    func get(&self, offset: UInt32) unsafe -> UInt32 {
+        self.regs.word[(offset / 4) as Int].read()
+    }
+
+    func put(&self, offset: UInt32, word: UInt32) unsafe {
+        self.regs.word[(offset / 4) as Int].write(word)
+    }
+}
+
+/// One word the driver wrote.
+struct LogEntry {
+    address: UInt32,
+    word: UInt32,
+}
+
+/// The first `LOG_ENTRIES` words written, and a count of the rest.
+struct WriteLog {
+    entries: [LogEntry; LOG_ENTRIES],
+    kept: Int,
+    dropped: UInt16,
+}
+
+extension WriteLog {
+    static func empty() -> WriteLog {
+        WriteLog(entries: [LogEntry(address: 0, word: 0); LOG_ENTRIES], kept: 0, dropped: 0)
+    }
+
+    func record(&var self, address: UInt32, word: UInt32) {
+        if self.kept < LOG_ENTRIES {
+            self.entries[self.kept] = LogEntry(address: address, word: word)
+            self.kept = self.kept + 1
+        } else {
+            self.dropped = count_up_16(self.dropped)
+        }
+    }
+}
+
+/// GPIO and the IO MUX, the GPIO Interrupt, and the log of what was written.
+struct Gpio {
+    gpio: Window,
+    iomux: Window,
+    irq: Interrupt,
+    log: WriteLog,
+    /// What the interrupt's acknowledgement answered, when it failed: the
+    /// service reports only that it did.
+    ack_failed: SosStatus?,
+}
+
+extension Gpio: NoCopy {}
+
+extension Gpio {
+    /// The word of `reg`, read from the device now.
+    func read(&self, reg: Register) -> UInt32 {
+        match reg.block {
+            case Gpio -> self.gpio.get(reg.offset),
+            case IoMux -> self.iomux.get(reg.offset),
+            case Ledc -> 0,
+        }
+    }
+}
+
+extension Gpio: RegisterPort {
+    func write(&var self, reg: Register, word: UInt32) {
+        self.log.record(reg.address(), word)
+        match reg.block {
+            case Gpio -> self.gpio.put(reg.offset, word),
+            case IoMux -> self.iomux.put(reg.offset, word),
+            case Ledc -> {},
+        }
+    }
+}
+
+extension Gpio: Pads {
+    func read_word(&self, reg: Register) -> UInt32 {
+        self.read(reg)
+    }
+
+    func write_word(&var self, reg: Register, word: UInt32) {
+        self.write(reg, word)
+    }
+
+    func acknowledge(&var self) -> Bool {
+        try self.irq.ack() catch {
+            self.ack_failed = error
+            return false
+        }
+        true
+    }
+}
+
+extension Gpio: GpioPort {
+    func pcpu_int(&var self) -> PinSet {
+        pads_pcpu_int(&self)
+    }
+
+    func clear_status(&var self, fired: PinSet) {
+        pads_clear_status(&var self, fired)
+    }
+
+    func levels(&var self) -> PinSet {
+        pads_levels(&self)
+    }
+
+    func ack(&var self) -> Bool {
+        self.acknowledge()
+    }
+}
+
+// =============================================================================
+// The service
+// =============================================================================
+
+/// A pin of the configuration: its mode, or `None` for a pin it does not name.
+func mode_of<const N: Int>(pins: &[GpioPin; N], pin: UInt8) -> PinMode? {
+    var i = 0
+    while i < N {
+        if pins[i].pin == pin {
+            return pins[i].mode
+        }
+        i = i + 1
+    }
+    None
+}
+
+/// Whether `pin` is no GPIO of the part: above 48, or 22 to 25.
+func is_bad_pin(pin: UInt8) -> Bool {
+    pin > 48 || (pin >= 22 && pin <= 25)
+}
+
+/// Why a request is refused, in the protocol's order, or `Ok` for one to
+/// serve. `Busy` is not here: it depends on the held set.
+func check(frame: &Frame) -> GpioStatus {
+    guard let op = frame.op() else { return GpioStatus.BadOp }
+    if frame.payload_len() != op.payload_bytes() {
+        return GpioStatus.BadOp
+    }
+    let pin = frame.payload_byte(0)
+    let level = frame.payload_byte(1)
+    var names_pin = false
+    match op {
+        case Read -> { names_pin = true },
+        case Write -> { names_pin = true },
+        case WaitLevel -> { names_pin = true },
+        case Inspect -> { names_pin = true },
+        case Log -> {},
+        case Status -> {},
+    }
+    if (op == GpioOp.Write || op == GpioOp.WaitLevel) && level > 1 {
+        return GpioStatus.BadArg
+    }
+    if not names_pin {
+        return GpioStatus.Ok
+    }
+    if is_bad_pin(pin) {
+        return GpioStatus.BadPin
+    }
+    let pins = gpioconfig.pins()
+    guard let mode = mode_of(&pins, pin) else { return GpioStatus.NotMine }
+    if op == GpioOp.Write && not is_output(mode) {
+        return GpioStatus.BadMode
+    }
+    if op == GpioOp.WaitLevel && mode == PinMode.Output {
+        return GpioStatus.BadMode
+    }
+    GpioStatus.Ok
+}
+
+/// The level of a pin of the configuration, read where its mode has it: at the
+/// pad for a pin whose input is on, and from the output register for a plain
+/// output, whose input is off and so reads 0 at the pad whatever it drives.
+func read_level(dev: &Gpio, pin: UInt8) -> UInt8 {
+    let pins = gpioconfig.pins()
+    let mode = mode_of(&pins, pin) ?? PinMode.InputFloating
+    let word = dev.read(level_register(pin, mode))
+    if (word & pin_bit(pin)) != 0 { 1 } else { 0 }
+}
+
+/// What a serving run answers with.
+struct Report {
+    served: UInt32,
+    abandoned: UInt16,
+    fires: UInt32,
+}
+
+/// The server's state: the waits it holds, with the obligation to answer each,
+/// and what it counts.
+struct Server {
+    requests: [PipeRequest?; MAX_HELD],
+    waits: [PinWait?; MAX_HELD],
+    body: GpioBody,
+    served: UInt32,
+    abandoned: UInt16,
+    fires: UInt32,
+}
+
+extension Server: NoCopy {}
+
+extension Server {
+    static func empty() -> Server {
+        Server(requests: [None, None, None, None],
+               waits: [None, None, None, None],
+               body: GpioBody.empty(), served: 0, abandoned: 0, fires: 0)
+    }
+
+    /// A slot nothing is held in, or `-1`.
+    func free_slot(&self) -> Int {
+        var i = 0
+        while i < MAX_HELD {
+            if self.requests[i].is_none() { return i }
+            i = i + 1
+        }
+        -1
+    }
+
+    /// How many waits are held.
+    func held(&self) -> UInt8 {
+        var n: UInt8 = 0
+        var i = 0
+        while i < MAX_HELD {
+            if self.requests[i].is_some() { n = n + 1 }
+            i = i + 1
+        }
+        n
+    }
+
+    /// Answers `request` with `n` bytes of the body. A client that dropped its
+    /// claim between the request and this reply is not a failure: the
+    /// obligation is discharged either way, and a driver one client could end
+    /// would be no driver.
+    func answer(&var self, request: PipeRequest, n: UInt) {
+        var r = move request
+        let _ = (move r).reply(body: &self.body.bytes, len: n)
+    }
+
+    /// Serves one message: refuses it, answers it, or holds it.
+    func serve(&var self, dev: &var Gpio, waiter: &Waiter, msg: PipeMsg,
+               request: PipeRequest) -> Result<Void, SosStatus> {
+        // The bytes are copied out and the message dropped, so whatever handles
+        // it carried are released before anything else is done.
+        let frame = Frame(len: msg.len, bytes: msg.bytes)
+        let _ = move msg
+        var obligation = move request
+        self.served = count_up(self.served)
+        let status = check(&frame)
+        if status != GpioStatus.Ok {
+            let n = self.body.refuse(status)
+            self.answer(move obligation, n)
+            return
+        }
+        guard let op = frame.op() else { return BUG }
+        let pin = frame.payload_byte(0)
+        let level = frame.payload_byte(1)
+        match op {
+            case Read -> {
+                let n = self.body.ok_byte(read_level(&dev, pin))
+                self.answer(move obligation, n)
+            },
+            case Write -> {
+                let reg = if level == 1 { out_set(pin) } else { out_clear(pin) }
+                dev.write(reg, pin_bit(pin))
+                let n = self.body.ok()
+                self.answer(move obligation, n)
+            },
+            case WaitLevel -> {
+                try self.wait_level(&var dev, &waiter, move obligation, pin, level)
+            },
+            case Inspect -> {
+                let iomux = dev.read(pad_register(pin))
+                let pin_word = dev.read(pin_register(pin))
+                let out_sel = dev.read(out_sel_register(pin))
+                let n = self.body.ok_inspect(iomux, pin_word, out_sel,
+                                             dev.levels().level(pin))
+                self.answer(move obligation, n)
+            },
+            case Log -> {
+                let from = pin as Int
+                var n = self.body.ok_log(dev.log.kept as UInt8, dev.log.dropped, 0)
+                var count = 0
+                while count < LOG_PER_REPLY && from + count < dev.log.kept {
+                    let e = dev.log.entries[from + count]
+                    n = self.body.put_log_entry(count, e.address, e.word)
+                    count = count + 1
+                }
+                self.body.bytes[4] = count as UInt8
+                self.answer(move obligation, n)
+            },
+            case Status -> {
+                let n = self.body.ok_status(self.held(), self.abandoned, self.fires)
+                self.answer(move obligation, n)
+            },
+        }
+        return
+    }
+
+    /// `WaitLevel`: answers when the pin already reads `level`, otherwise holds
+    /// the obligation, watching it for abandonment, and answers `Busy` when
+    /// the held set is full, which the client learns instead of an obligation
+    /// silently dropped.
+    func wait_level(&var self, dev: &var Gpio, waiter: &Waiter, request: PipeRequest,
+                    pin: UInt8, level: UInt8) -> Result<Void, SosStatus> {
+        var obligation = move request
+        let now = dev.levels().level(pin)
+        if now == level {
+            let n = self.body.ok_level(now, self.fires)
+            self.answer(move obligation, n)
+            return
+        }
+        let slot = self.free_slot()
+        if slot < 0 {
+            let n = self.body.refuse(GpioStatus.Busy)
+            self.answer(move obligation, n)
+            return
+        }
+        try waiter.add(request: &obligation, key: KEY_HELD + (slot as UInt),
+                       mode: AttachMode.OneShot)
+        self.requests[slot] = move obligation
+        self.waits[slot] = PinWait(pin: pin, level: level)
+        return
+    }
+
+    /// An interrupt: the service, then the held waits whose pins now read their
+    /// levels.
+    func interrupt(&var self, dev: &var Gpio) -> Result<Void, SosStatus> {
+        let serviced = service_interrupt(&var dev, &self.waits)
+        if not serviced.acknowledged {
+            if let why = dev.ack_failed {
+                return why
+            }
+            return BUG
+        }
+        self.fires = fires_after(&serviced, self.fires)
+        var i = 0
+        while i < MAX_HELD {
+            if let w = take_answered(&serviced, &var self.waits, i) {
+                if let held = self.requests[i].take() {
+                    let n = self.body.ok_level(serviced.levels.level(w.pin), self.fires)
+                    self.answer(move held, n)
+                }
+            }
+            i = i + 1
+        }
+        return
+    }
+
+    /// A client dropped its claim on the wait in `slot`: the obligation is
+    /// discarded.
+    func abandon(&var self, slot: Int) {
+        if slot < MAX_HELD {
+            let _ = self.requests[slot].take()
+            self.waits[slot] = None
+            self.abandoned = count_up_16(self.abandoned)
+        }
+    }
+}
+
+/// What a delivery is, decided by borrowing the record.
+static KIND_STOP: Int = 0
+static KIND_MESSAGE: Int = 1
+static KIND_IRQ: Int = 2
+static KIND_ABANDONED: Int = 3
+
+func kind_of(r: &WaitResult) -> Int {
+    match r.what {
+        case Message(_, _) -> KIND_MESSAGE,
+        case Interrupt(_) -> KIND_IRQ,
+        case Abandoned -> KIND_ABANDONED,
+        case _ -> KIND_STOP,
+    }
+}
+
+/// The loop: one `wait`, then one arm per delivery, until the terminal level.
+func serve(waiter: &Waiter, dev: &var Gpio) -> Result<Report, SosStatus> {
+    var server = Server.empty()
+    var wake = try waiter.wait()
+    var serving = true
+    while serving {
+        let kind = kind_of(&wake)
+        let key = wake.key
+        if kind == KIND_STOP {
+            serving = false
+        } else if kind == KIND_IRQ {
+            let _ = move wake
+            try server.interrupt(&var dev)
+            wake = try waiter.wait()
+        } else if kind == KIND_ABANDONED {
+            let _ = move wake
+            if key >= KEY_HELD {
+                server.abandon((key - KEY_HELD) as Int)
+            }
+            wake = try waiter.wait()
+        } else {
+            let (_, what) = (move wake).open()
+            match what {
+                case Message(m, r) -> {
+                    try server.serve(&var dev, &waiter, move m, move r)
+                },
+                case _ -> { return BUG },
+            }
+            wake = try waiter.wait()
+        }
+    }
+    return Report(served: server.served, abandoned: server.abandoned,
+                  fires: server.fires)
+}
+
+/// The device window record `tag`, or `None` when the set has no such record.
+func take_window(set: &var BootSet, tag: UInt) -> IoMemory? {
+    guard var record = set.take(tag) else { return None }
+    record.take_iomemory()
+}
+
+/// The interrupt record `tag`.
+func take_line(set: &var BootSet, tag: UInt) -> Interrupt? {
+    guard var record = set.take(tag) else { return None }
+    record.take_interrupt()
+}
+
+/// The server-end record `tag`.
+func take_serve(set: &var BootSet, tag: UInt) -> PipeOutlet? {
+    guard var record = set.take(tag) else { return None }
+    record.take_outlet()
+}
+
+/// Maps both windows, configures every pin, wires the Waiter and serves until
+/// every client is gone.
+func run(proc: &Process) -> Result<Report, SosStatus> {
+    var set = try BootSet(process: &proc)
+    guard let gpio_window = take_window(&var set, TAG_GPIO) else { return BUG }
+    guard let iomux_window = take_window(&var set, TAG_IOMUX) else { return BUG }
+    guard let irq = take_line(&var set, TAG_LINE) else { return BUG }
+    guard let outlet = take_serve(&var set, TAG_SERVE) else { return BUG }
+
+    let gpio_mapping = try proc.map(iomemory: &gpio_window)
+    let iomux_mapping = try proc.map(iomemory: &iomux_window)
+    let gpio_base = try gpio_mapping.base()
+    let iomux_base = try iomux_mapping.base()
+
+    var dev = Gpio(gpio: Window(at: gpio_base), iomux: Window(at: iomux_base),
+                   irq: move irq, log: WriteLog.empty(), ack_failed: None)
+    let pins = gpioconfig.pins()
+    start_gpio(&var dev, &pins)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(&dev.irq, KEY_IRQ)
+    // The consuming, persistent attach: the attachment owns the server end from
+    // here on, and this process holds no outlet handle.
+    try waiter.give(outlet: move outlet, key: KEY_OUTLET,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let done = try serve(&waiter, &var dev)
+    let _ = move gpio_mapping
+    let _ = move iomux_mapping
+    return done
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS gpiosvc drv: no process handle: {}", error)
+        return
+    }
+    // The configuration is checked before anything is mapped, so a bad one
+    // costs the pad nothing.
+    let pins = gpioconfig.pins()
+    try check_gpio_config(&pins) catch {
+        print("SOS gpiosvc drv: config refused: {}", error.describe())
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let done = try run(&proc) catch {
+        print("SOS gpiosvc drv: failed: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    print("SOS gpiosvc drv: served={} abandoned={} fires={}",
+          done.served, done.abandoned, done.fires)
+    let _ = proc.exit(EXIT_OK)
+}

@@ -53,7 +53,10 @@ drivers/           # userspace device drivers and the protocol packages their
                    # Saw.toml says what a stock root gives it
                    # (tools/sosimage/src/declaration.saw). esp32s3io/ is the
                    # ESP32-S3's GPIO, IO MUX and LEDC as its drivers use
-                   # them, with hosted tests a full run `blade test`s
+                   # them, with hosted tests a full run `blade test`s;
+                   # gpioproto/ is the GPIO driver's wire and
+                   # svc-gpio-esp32s3/ the driver, whose pins are its build
+                   # input `gpioconfig`
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 root/              # the stock root: it launches an image's processes as
@@ -122,9 +125,10 @@ runs its own tests (`blade test` there: the description readers' refusals, the
 region table's and slab block's bytes, an image's limits and each refusal of
 them, the in-place check, the slab-region check, and every board, process
 and image description in the tree read clean) and the hosted packages'
-(`HOSTED_TESTS`: `drivers/esp32s3io/`), which need no emulator and print
-nothing when they pass. Per profile it writes a profile description
-(JSON) and calls `sosimage native`, then `sosimage board` on the profile's
+(`HOSTED_TESTS`: `drivers/esp32s3io/` and `drivers/gpioproto/`), which need
+no emulator and print nothing when they pass. Per profile it writes a
+profile description (JSON) and calls `sosimage native`, then `sosimage board`
+on the profile's
 `hal/<profile>/board.toml`, then `sosimage package` once for each package
 and role (root, or child i) the cases give it, which writes the process's
 script (its region, and on the S3 its flash slot, from `_process_placement`)

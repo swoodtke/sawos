@@ -1,0 +1,126 @@
+//! The GPIO driver's interrupt path on the part, with nothing wired.
+//!
+//! Pin 14 is an output with its input on and an edge interrupt, so its level
+//! change raises GPIO's interrupt line. Ten times the client posts a wait for
+//! the level the pin is not at, confirms the driver holds it, writes that level
+//! and waits for the answer beside a deadline. An answer can only have come
+//! from the interrupt service, since the wait was held before the write. Then
+//! it reads back the words the driver wrote to pins 14 and 21.
+//!
+//! This emulator's `IN` reads 0 and it raises no GPIO interrupt, so the case
+//! is built for a board (`--emit-flash`) and never run here; its console text
+//! is what a run on the part is held to.
+
+import sos.{SosStatus}
+import gpioproto.{GpioStatus}
+import gpiokit.{Remote, Sleeper, Waited, begin, finish, sleeper, EXIT_OK, EXIT_FAILED}
+
+static TAG_GPIO: UInt = 2
+
+/// The pin that is its own loopback, and the pin the switch case reads.
+static LOOP_PIN: UInt8 = 14
+static SWITCH_PIN: UInt8 = 21
+/// A plain output, wired to nothing.
+static OUTPUT_PIN: UInt8 = 2
+
+static TOGGLES: Int = 10
+
+/// An interrupt that does not come within this is a failure of the part or of
+/// the driver, not a measurement: nothing asserts how soon it came.
+static DEADLINE_NS: UInt64 = 2_000_000_000
+static PAUSE_NS: UInt64 = 1_000_000_000
+
+func toggles(r: &var Remote, s: &Sleeper) -> Result<Void, SosStatus> {
+    var level: UInt8 = 0
+    var i = 0
+    while i < TOGGLES {
+        let next: UInt8 = if level == 0 { 1 } else { 0 }
+        let n = r.body.wait_level(LOOP_PIN, next)
+        let claim = try r.post(n)
+        let held = try r.settle("status with the wait held", 1)
+        let w = r.body.write(LOOP_PIN, next)
+        let ok = try r.expect("write 14", w, GpioStatus.Ok)
+        let _ = move ok
+        let got = try s.wait_claim(move claim, DEADLINE_NS)
+        match got {
+            case Answered(a) -> {
+                if a.level != next {
+                    return r.mismatch("14 -> {next}", "level {a.level}", "level {next}")
+                }
+                // Each edge is its own service a second apart, and no other pin
+                // has an edge, so the driver has counted one fire per toggle.
+                if a.fires != ((i + 1) as UInt32) {
+                    return r.mismatch("14 -> {next}", "fires {a.fires}", "fires {i + 1}")
+                }
+                print("SOS gpioboard: 14 -> {} answered by interrupt held={} fires={}",
+                      next, held.held, a.fires)
+            },
+            case TimedOut -> {
+                print("SOS gpioboard: no interrupt in 2 s")
+                return r.mismatch("14 -> {next}", "no interrupt", "an interrupt")
+            },
+        }
+        level = next
+        try s.sleep(PAUSE_NS)
+        i = i + 1
+    }
+    return
+}
+
+/// A plain output reads back the level it is driven to: its input is off, so
+/// the pad reads 0 whatever the output register holds, and the driver reads
+/// the output register for it.
+func output_reads_back(r: &var Remote) -> Result<Void, SosStatus> {
+    try r.write("write 2 1", OUTPUT_PIN, 1)
+    let high = try r.read("read 2 after 1", OUTPUT_PIN)
+    try r.write("write 2 0", OUTPUT_PIN, 0)
+    let low = try r.read("read 2 after 0", OUTPUT_PIN)
+    if high != 1 || low != 0 {
+        return r.mismatch("read 2", "{high} then {low}", "1 then 0")
+    }
+    print("SOS gpioboard: output 2 reads 1 after 1 and 0 after 0")
+    return
+}
+
+/// Reads back one pad's words and holds them to what the start wrote.
+func inspect(r: &var Remote, pin: UInt8, iomux: UInt32, pin_word: UInt32,
+             out_sel: UInt32) -> Result<Void, SosStatus> {
+    let n = r.body.inspect(pin)
+    let reply = try r.expect("inspect", n, GpioStatus.Ok)
+    let got_iomux = reply.u32(1)
+    let got_pin = reply.u32(5)
+    let got_out_sel = reply.u32(9)
+    if got_iomux != iomux || got_pin != pin_word || got_out_sel != out_sel {
+        return r.mismatch("inspect {pin}",
+                          "iomux {got_iomux} pin {got_pin} out_sel {got_out_sel}",
+                          "iomux {iomux} pin {pin_word} out_sel {out_sel}")
+    }
+    print("SOS gpioboard: inspect {} iomux={} pin={} out_sel={} ok",
+          pin, got_iomux, got_pin, got_out_sel)
+    return
+}
+
+func script(r: &var Remote) -> Result<Void, SosStatus> {
+    let s = try sleeper(&r)
+    try toggles(&var r, &s)
+    // 14: the IO MUX word 0x1a00 (function 1, 20 mA, input on), the PIN word
+    // 0x2180 (any edge, to the CPU) and the output select 0x500 (the GPIO
+    // signal, enabled by ENABLE). 21: 0x1b00 (the same with the pull-up), the
+    // same PIN word and the reset select 0x100.
+    try inspect(&var r, LOOP_PIN, 6656, 8576, 1280)
+    try inspect(&var r, SWITCH_PIN, 6912, 8576, 256)
+    try output_reads_back(&var r)
+    return
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    guard var r = begin(boot_handle, "gpioboard", TAG_GPIO) else { return }
+    try script(&var r) catch {
+        print("SOS gpioboard: stopped: {}", error)
+        finish(&r, EXIT_FAILED)
+        return
+    }
+    print("SOS gpioboard: done")
+    finish(&r, EXIT_OK)
+}

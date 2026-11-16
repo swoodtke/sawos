@@ -1,0 +1,337 @@
+//! The GPIO driver's protocol.
+//!
+//! A request is one message: byte 0 the op, then the payload. A reply's byte
+//! 0 is a status, then its payload. Every op is a call. Integers are
+//! little-endian.
+//!
+//! ```text
+//! op         payload        reply payload
+//! Read       pin            level
+//! Write      pin, level     -
+//! WaitLevel  pin, level     level, fires (u32)
+//! Inspect    pin            IO MUX word, PIN word, OUT_SEL word (u32 each),
+//!                           IN bit (u8), each read from the device now
+//! Log        from (u8)      total (u8), dropped (u16), n (u8), then n
+//!                           entries of {address u32, word u32}, n <= 15
+//! Status     -              held (u8), abandoned (u16), fires (u32)
+//! ```
+//!
+//! A reply that is not `Ok` carries the status byte alone.
+//!
+//! # Statuses
+//!
+//! They are checked in this order, and the first that applies is answered:
+//! `BadOp` (an unknown op, or a payload of the wrong length), `BadArg` (a
+//! level other than 0 or 1), `BadPin` (not a GPIO of the part), `NotMine` (a
+//! GPIO the driver's configuration does not name), `BadMode` (a `Write` to an
+//! input, a `WaitLevel` on a plain output), `Busy` (the held set is full).
+//!
+//! # Read
+//!
+//! `Read` answers the pin's level: at the pad for a pin whose input is on (an
+//! input, or a loopback output), and for a plain output the level it is driven
+//! to, since the part reads 0 at the pad of a pin whose input is off. A `Write`
+//! then a `Read` of a plain output answers what was written.
+//!
+//! # Waiting
+//!
+//! `WaitLevel` answers when the pin reads `level`: at once when it already
+//! does, otherwise when an interrupt finds it so. A client that wants a
+//! deadline posts the request and waits on its claim beside a Timer; dropping
+//! the claim is the cancellation, which the driver sees as an abandonment.
+//!
+//! # Log
+//!
+//! The driver records every register word it writes, in order, with its
+//! address: the first `LOG_ENTRIES` writes. `total` counts the entries kept
+//! and `dropped` the writes after them, which are counted and not kept.
+//! `Log(from)` answers entries `from`, `from + 1`, ... up to `LOG_PER_REPLY`
+//! of them; `from` at or past `total` answers none. Under an emulator that
+//! drops device writes, it is the only view of them.
+//!
+//! # Fires
+//!
+//! `fires` counts the deliveries in which a pin's status bit was set, since
+//! start. Several edges between two services count once. It is diagnostic.
+
+/// The bytes of a message body. The kernel's `PIPE_BODY_BYTES` is the same
+/// number, which each package that sends or receives asserts.
+public static BODY_BYTES: Int = 128
+
+/// The op byte. Raw-backed because it crosses a wire: each value is stated.
+public enum GpioOp: UInt8 {
+    case Read = 1,
+    case Write = 2,
+    case WaitLevel = 3,
+    case Inspect = 4,
+    case Log = 5,
+    case Status = 6,
+}
+
+extension GpioOp {
+    /// What a transcript should call this op.
+    public func describe(&self) -> String {
+        match self {
+            case Read -> "read",
+            case Write -> "write",
+            case WaitLevel -> "wait_level",
+            case Inspect -> "inspect",
+            case Log -> "log",
+            case Status -> "status",
+        }
+    }
+
+    /// How many payload bytes a request of this op carries.
+    public func payload_bytes(&self) -> UInt {
+        match self {
+            case Read -> 1,
+            case Write -> 2,
+            case WaitLevel -> 2,
+            case Inspect -> 1,
+            case Log -> 1,
+            case Status -> 0,
+        }
+    }
+}
+
+/// A reply's status byte. `Ok` is 0.
+public enum GpioStatus: UInt8 {
+    case Ok = 0,
+    case BadOp = 1,
+    case BadArg = 2,
+    case BadPin = 3,
+    case NotMine = 4,
+    case BadMode = 5,
+    case Busy = 6,
+}
+
+extension GpioStatus {
+    /// What a transcript should call this status.
+    public func describe(&self) -> String {
+        match self {
+            case Ok -> "Ok",
+            case BadOp -> "BadOp",
+            case BadArg -> "BadArg",
+            case BadPin -> "BadPin",
+            case NotMine -> "NotMine",
+            case BadMode -> "BadMode",
+            case Busy -> "Busy",
+        }
+    }
+}
+
+/// How many entries a log keeps, and how many one `Log` reply carries.
+public static LOG_ENTRIES: Int = 64
+public static LOG_PER_REPLY: Int = 15
+
+static OP_BYTE: Int = 0
+static PAYLOAD_BYTE: Int = 1
+
+/// One log entry's size on the wire: address and word.
+static LOG_ENTRY_BYTES: Int = 8
+
+// A `Log` reply: the status, total, dropped, n and the entries.
+static_assert(5 + LOG_PER_REPLY * LOG_ENTRY_BYTES <= BODY_BYTES,
+              "a full log reply fits one message")
+
+/// A message body, for a request or a reply.
+public struct GpioBody {
+    public bytes: [UInt8; BODY_BYTES],
+}
+
+extension GpioBody {
+    /// A zeroed body.
+    public static func empty() -> GpioBody {
+        GpioBody(bytes: [0; BODY_BYTES])
+    }
+
+    // The request builders answer the message's `len`.
+
+    /// `Read(pin)`.
+    public func read(&var self, pin: UInt8) -> UInt {
+        self.bytes[OP_BYTE] = GpioOp.Read as UInt8
+        self.bytes[PAYLOAD_BYTE] = pin
+        2
+    }
+
+    /// `Write(pin, level)`.
+    public func write(&var self, pin: UInt8, level: UInt8) -> UInt {
+        self.bytes[OP_BYTE] = GpioOp.Write as UInt8
+        self.bytes[PAYLOAD_BYTE] = pin
+        self.bytes[PAYLOAD_BYTE + 1] = level
+        3
+    }
+
+    /// `WaitLevel(pin, level)`.
+    public func wait_level(&var self, pin: UInt8, level: UInt8) -> UInt {
+        self.bytes[OP_BYTE] = GpioOp.WaitLevel as UInt8
+        self.bytes[PAYLOAD_BYTE] = pin
+        self.bytes[PAYLOAD_BYTE + 1] = level
+        3
+    }
+
+    /// `Inspect(pin)`.
+    public func inspect(&var self, pin: UInt8) -> UInt {
+        self.bytes[OP_BYTE] = GpioOp.Inspect as UInt8
+        self.bytes[PAYLOAD_BYTE] = pin
+        2
+    }
+
+    /// `Log(from)`.
+    public func log(&var self, from: UInt8) -> UInt {
+        self.bytes[OP_BYTE] = GpioOp.Log as UInt8
+        self.bytes[PAYLOAD_BYTE] = from
+        2
+    }
+
+    /// `Status`.
+    public func status(&var self) -> UInt {
+        self.bytes[OP_BYTE] = GpioOp.Status as UInt8
+        1
+    }
+
+    /// A request with an op byte of any value and `payload` bytes after it,
+    /// for the refusals a client tests.
+    public func raw(&var self, op: UInt8, payload: UInt) -> UInt {
+        self.bytes[OP_BYTE] = op
+        payload + 1
+    }
+
+    // The reply builders answer the reply's `len`.
+
+    /// A reply of the status alone.
+    public func refuse(&var self, status: GpioStatus) -> UInt {
+        self.bytes[0] = status as UInt8
+        1
+    }
+
+    /// An `Ok` and nothing else.
+    public func ok(&var self) -> UInt {
+        self.refuse(GpioStatus.Ok)
+    }
+
+    /// An `Ok` and one byte.
+    public func ok_byte(&var self, b: UInt8) -> UInt {
+        self.bytes[0] = GpioStatus.Ok as UInt8
+        self.bytes[1] = b
+        2
+    }
+
+    /// Writes `word` at byte `at`, little-endian.
+    public func put_u32(&var self, at: Int, word: UInt32) {
+        self.bytes[at] = (word & 0xFF) as UInt8
+        self.bytes[at + 1] = ((word >> 8) & 0xFF) as UInt8
+        self.bytes[at + 2] = ((word >> 16) & 0xFF) as UInt8
+        self.bytes[at + 3] = ((word >> 24) & 0xFF) as UInt8
+    }
+
+    /// Writes `half` at byte `at`, little-endian.
+    public func put_u16(&var self, at: Int, half: UInt16) {
+        self.bytes[at] = (half & 0xFF) as UInt8
+        self.bytes[at + 1] = ((half >> 8) & 0xFF) as UInt8
+    }
+
+    /// A `WaitLevel` answer: the level and the fires so far.
+    public func ok_level(&var self, level: UInt8, fires: UInt32) -> UInt {
+        self.bytes[0] = GpioStatus.Ok as UInt8
+        self.bytes[1] = level
+        self.put_u32(2, fires)
+        6
+    }
+
+    /// An `Inspect` answer.
+    public func ok_inspect(&var self, iomux: UInt32, pin: UInt32, out_sel: UInt32,
+                           level: UInt8) -> UInt {
+        self.bytes[0] = GpioStatus.Ok as UInt8
+        self.put_u32(1, iomux)
+        self.put_u32(5, pin)
+        self.put_u32(9, out_sel)
+        self.bytes[13] = level
+        14
+    }
+
+    /// A `Status` answer.
+    public func ok_status(&var self, held: UInt8, abandoned: UInt16, fires: UInt32) -> UInt {
+        self.bytes[0] = GpioStatus.Ok as UInt8
+        self.bytes[1] = held
+        self.put_u16(2, abandoned)
+        self.put_u32(4, fires)
+        8
+    }
+
+    /// The head of a `Log` answer: total, dropped and the count `n` of entries
+    /// that follow. Answers the length with none.
+    public func ok_log(&var self, total: UInt8, dropped: UInt16, n: UInt8) -> UInt {
+        self.bytes[0] = GpioStatus.Ok as UInt8
+        self.bytes[1] = total
+        self.put_u16(2, dropped)
+        self.bytes[4] = n
+        5
+    }
+
+    /// Entry `i` of a `Log` answer. Answers the length through the entry.
+    public func put_log_entry(&var self, i: Int, address: UInt32, word: UInt32) -> UInt {
+        let at = 5 + i * LOG_ENTRY_BYTES
+        self.put_u32(at, address)
+        self.put_u32(at + 4, word)
+        (at + LOG_ENTRY_BYTES) as UInt
+    }
+}
+
+/// A received message's length and bytes: all the decoders read, so they are
+/// plain data and the wire is tested without a kernel.
+public struct Frame {
+    public len: UInt,
+    public bytes: [UInt8; BODY_BYTES],
+}
+
+extension Frame {
+    /// The op a received request names, or `None` for a byte that names no op.
+    /// The Optional is a real domain value: a request arrives from a process
+    /// the driver does not trust, so "this byte is not one of my ops" is data
+    /// at a protocol boundary, never a trap. A message of no bytes names no op
+    /// either, whatever its buffer holds.
+    public func op(&self) -> GpioOp? {
+        if self.len == 0 { return None }
+        GpioOp.from(raw: self.bytes[OP_BYTE])
+    }
+
+    /// How many payload bytes a received request carries.
+    public func payload_len(&self) -> UInt {
+        if self.len == 0 { return 0 }
+        self.len - 1
+    }
+
+    /// Payload byte `i` of a received request. Out of range answers zero
+    /// rather than panicking: the sender chose the length and the receiver is
+    /// a server.
+    public func payload_byte(&self, i: Int) -> UInt8 {
+        if i < 0 || (i as UInt) >= self.payload_len() { return 0 }
+        self.bytes[PAYLOAD_BYTE + i]
+    }
+
+    /// The status a received reply carries, or `None` for a status byte no
+    /// status has or a reply with no bytes.
+    public func status(&self) -> GpioStatus? {
+        if self.len == 0 { return None }
+        GpioStatus.from(raw: self.bytes[0])
+    }
+
+    /// Byte `at` of a received reply; zero past its end.
+    public func byte(&self, at: Int) -> UInt8 {
+        if at < 0 || (at as UInt) >= self.len { return 0 }
+        self.bytes[at]
+    }
+
+    /// The little-endian half-word at byte `at` of a received reply.
+    public func u16(&self, at: Int) -> UInt16 {
+        (self.byte(at) as UInt16) | ((self.byte(at + 1) as UInt16) << 8)
+    }
+
+    /// The little-endian word at byte `at` of a received reply.
+    public func u32(&self, at: Int) -> UInt32 {
+        let low = self.u16(at) as UInt32
+        let high = self.u16(at + 2) as UInt32
+        low | (high << 16)
+    }
+}

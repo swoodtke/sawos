@@ -3,13 +3,15 @@
 // waits it answers; and, through a port where an edge lands just after the
 // clear, that the levels it answers by are read after the clear.
 
-import esp32s3io.{GpioPort, PinSet, PinWait, MAX_HELD, service_interrupt}
+import esp32s3io.{GpioPort, PinSet, PinWait, MAX_HELD, service_interrupt, fires_after,
+                  take_answered}
 
 // Reports `fired` and `levels`, and records each call.
 struct Recording {
     fired: PinSet
     levels: PinSet
     calls: Vector<String>
+    accepts: Bool
 }
 
 extension Recording: NoCopy {}
@@ -29,8 +31,9 @@ extension Recording: GpioPort {
         self.levels
     }
 
-    func ack(&var self) {
+    func ack(&var self) -> Bool {
         try! self.calls.push("ack")
+        self.accepts
     }
 }
 
@@ -57,7 +60,7 @@ extension EdgeAfterClear: GpioPort {
         self.pad
     }
 
-    func ack(&var self) {}
+    func ack(&var self) -> Bool { true }
 }
 
 func main() {
@@ -74,7 +77,7 @@ func main() {
     // Pins 21 (bank 0) and 47 (bank 1, bit 15) have fired; 21 reads 0 and
     // 47 reads 1. Held: 21 for 0, nothing, 47 for 0, 47 for 1.
     var port = Recording(fired: PinSet(low: 1 << 21, high: 1 << 15),
-                         levels: PinSet(low: 0, high: 1 << 15), calls: Vector<String>())
+                         levels: PinSet(low: 0, high: 1 << 15), calls: Vector<String>(), accepts: true)
     let held: [PinWait?; MAX_HELD] = [PinWait(pin: 21, level: 0), None,
                                       PinWait(pin: 47, level: 0), PinWait(pin: 47, level: 1)]
     let s = service_interrupt(&var port, &held)
@@ -90,10 +93,31 @@ func main() {
     assert(not s.answered[2], "47 does not read 0")
     assert(s.answered[3], "47 reads 1")
     assert(s.levels == PinSet(low: 0, high: 1 << 15), "the levels read")
+    assert(s.acknowledged, "the ack was accepted")
+
+    // The fire is counted once per service that found a pin fired, and a wait
+    // answered by a service leaves the held set; one not answered stays.
+    assert(fires_after(&s, 4) == 5, "a fire counts")
+    assert(fires_after(&s, 0xFFFF_FFFF) == 0xFFFF_FFFF, "and stops at the greatest count")
+    var kept = held
+    let taken = take_answered(&s, &var kept, 0)
+    assert(taken.is_some(), "21's wait is taken")
+    assert(taken!.pin == 21 && taken!.level == 0, "and it is 21's")
+    assert(kept[0].is_none(), "its record is cleared")
+    assert(take_answered(&s, &var kept, 2).is_none(), "47 for 0 is not answered")
+    assert(kept[2].is_some(), "and its record stays")
+    assert(take_answered(&s, &var kept, 1).is_none(), "an empty slot answers nothing")
+
+    // A refused acknowledgement is reported, with the rest of the service done.
+    var refused = Recording(fired: PinSet(low: 1 << 21, high: 0), levels: PinSet.empty(),
+                            calls: Vector<String>(), accepts: false)
+    let r = service_interrupt(&var refused, &held)
+    assert(not r.acknowledged, "a refused ack is reported")
+    assert(r.fired, "the service was done")
 
     // Nothing fired: no fire is counted, and a held wait whose pin reads its
     // level is still answered.
-    var quiet = Recording(fired: PinSet.empty(), levels: PinSet.empty(), calls: Vector<String>())
+    var quiet = Recording(fired: PinSet.empty(), levels: PinSet.empty(), calls: Vector<String>(), accepts: true)
     let one: [PinWait?; MAX_HELD] = [None, None, None, PinWait(pin: 2, level: 0)]
     let q = service_interrupt(&var quiet, &one)
     assert(not q.fired, "no pin fired")
@@ -101,10 +125,10 @@ func main() {
 
     // A fire in one bank alone is a fire, in either bank.
     var low_bank = Recording(fired: PinSet(low: 1 << 21, high: 0), levels: PinSet.empty(),
-                             calls: Vector<String>())
+                             calls: Vector<String>(), accepts: true)
     assert(service_interrupt(&var low_bank, &one).fired, "a fire in bank 0 alone")
     var high_bank = Recording(fired: PinSet(low: 0, high: 1 << 15), levels: PinSet.empty(),
-                              calls: Vector<String>())
+                              calls: Vector<String>(), accepts: true)
     assert(service_interrupt(&var high_bank, &one).fired, "a fire in bank 1 alone")
 
     // An edge just after the clear: the levels the waits are answered by are

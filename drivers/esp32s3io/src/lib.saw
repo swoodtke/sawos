@@ -64,6 +64,11 @@ static ENABLE1_W1TS: UInt32 = 0x030
 static ENABLE1_W1TC: UInt32 = 0x034
 static STATUS_W1TC: UInt32 = 0x04C
 static STATUS1_W1TC: UInt32 = 0x058
+/// Output levels, pins 0 to 31: what each pad is driven to when its output
+/// is enabled.
+public static OUT: UInt32 = 0x004
+/// The same for 32 to 53.
+public static OUT1: UInt32 = 0x010
 /// Pad input levels, pins 0 to 31 (read-only).
 public static IN: UInt32 = 0x03C
 /// Pad input levels, pins 32 to 53 (read-only).
@@ -98,6 +103,17 @@ public func enable_set(pin: UInt8) -> Register { banked(pin, ENABLE_W1TS, ENABLE
 public func enable_clear(pin: UInt8) -> Register { banked(pin, ENABLE_W1TC, ENABLE1_W1TC) }
 /// The register that clears `pin`'s interrupt status.
 public func status_clear(pin: UInt8) -> Register { banked(pin, STATUS_W1TC, STATUS1_W1TC) }
+
+/// The register whose `pin` bit is the level of a pin in `mode`: the pad's
+/// input for a pin whose input is on, and the output register for a plain
+/// output, whose input is off and so reads 0 whatever it drives.
+public func level_register(pin: UInt8, mode: PinMode) -> Register {
+    if mode == PinMode.Output {
+        Register(block: Block.Gpio, offset: if pin < 32 { OUT } else { OUT1 })
+    } else {
+        Register(block: Block.Gpio, offset: if pin < 32 { IN } else { IN1 })
+    }
+}
 
 /// `PINn`: pin `pin`'s interrupt configuration.
 public func pin_register(pin: UInt8) -> Register {
@@ -371,6 +387,17 @@ public func check_gpio_config<const N: Int>(pins: &[GpioPin; N]) -> Result<Void,
     }
 }
 
+/// `count` plus one, held at the greatest value rather than wrapping: a count
+/// a client's traffic can drive must not end the driver that keeps it.
+public func count_up(count: UInt32) -> UInt32 {
+    if count == 0xFFFF_FFFF { count } else { count + 1 }
+}
+
+/// `count_up` for a 16-bit count.
+public func count_up_16(count: UInt16) -> UInt16 {
+    if count == 0xFFFF { count } else { count + 1 }
+}
+
 /// The interrupt status, the levels or the enables of every pin: bank 0's
 /// word and bank 1's.
 public struct PinSet {
@@ -407,8 +434,43 @@ public trait GpioPort {
     func clear_status(&var self, fired: PinSet)
     /// `IN` and `IN1`: every pad's level.
     func levels(&var self) -> PinSet
-    /// Acknowledges the interrupt, which rearms its line.
-    func ack(&var self)
+    /// Acknowledges the interrupt, which rearms its line; false when the
+    /// acknowledgement was refused.
+    func ack(&var self) -> Bool
+}
+
+/// The GPIO block as a driver reaches it: whole words by register, and the
+/// line's acknowledgement.
+public trait Pads {
+    /// The word of `reg`, read from the device now.
+    func read_word(&self, reg: Register) -> UInt32
+    /// Writes `word` to `reg`.
+    func write_word(&var self, reg: Register, word: UInt32)
+    /// Acknowledges the line; false when it was refused.
+    func acknowledge(&var self) -> Bool
+}
+
+/// `PCPU_INT` and `PCPU_INT1` through `pads`.
+public func pads_pcpu_int<D: Pads>(pads: &D) -> PinSet {
+    PinSet(low: pads.read_word(Register(block: Block.Gpio, offset: PCPU_INT)),
+           high: pads.read_word(Register(block: Block.Gpio, offset: PCPU_INT1)))
+}
+
+/// Writes exactly `fired`'s bits to `STATUS_W1TC` and `STATUS1_W1TC` through
+/// `pads`, and no word that has no bit to clear.
+public func pads_clear_status<D: Pads>(pads: &var D, fired: PinSet) {
+    if fired.low != 0 {
+        pads.write_word(status_clear(0), fired.low)
+    }
+    if fired.high != 0 {
+        pads.write_word(status_clear(32), fired.high)
+    }
+}
+
+/// `IN` and `IN1` through `pads`.
+public func pads_levels<D: Pads>(pads: &D) -> PinSet {
+    PinSet(low: pads.read_word(Register(block: Block.Gpio, offset: IN)),
+           high: pads.read_word(Register(block: Block.Gpio, offset: IN1)))
 }
 
 /// A level a client waits for on a pin.
@@ -428,6 +490,8 @@ public struct Serviced {
     answered: [Bool; MAX_HELD]
     /// The levels read.
     levels: PinSet
+    /// Whether the acknowledgement was accepted.
+    acknowledged: Bool
 }
 
 /// Services the GPIO interrupt through `port`, for the waits `held`, in an
@@ -443,7 +507,7 @@ public func service_interrupt<P: GpioPort>(port: &var P, held: &[PinWait?; MAX_H
     let fired = port.pcpu_int()
     port.clear_status(fired)
     let levels = port.levels()
-    port.ack()
+    let acknowledged = port.ack()
     var answered = [false; MAX_HELD]
     var i = 0
     while i < MAX_HELD {
@@ -452,7 +516,21 @@ public func service_interrupt<P: GpioPort>(port: &var P, held: &[PinWait?; MAX_H
         }
         i = i + 1
     }
-    Serviced(fired: not fired.is_empty(), answered: answered, levels: levels)
+    Serviced(fired: not fired.is_empty(), answered: answered, levels: levels,
+             acknowledged: acknowledged)
+}
+
+/// `fires` after a service: one more when any pin fired.
+public func fires_after(serviced: &Serviced, fires: UInt32) -> UInt32 {
+    if serviced.fired { count_up(fires) } else { fires }
+}
+
+/// The held wait in `slot` when the service found its pin at its level, taken
+/// out of `held` so its record is cleared; `None` for a wait still to come or
+/// no wait.
+public func take_answered(serviced: &Serviced, held: &var [PinWait?; MAX_HELD],
+                          slot: Int) -> PinWait? {
+    if serviced.answered[slot] { held[slot].take() } else { None }
 }
 
 /// The least frame, in microseconds: the divider's least, 1.0, gives

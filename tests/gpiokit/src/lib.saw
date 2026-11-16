@@ -1,0 +1,243 @@
+//! What the GPIO cases' client children do.
+//!
+//! A client starts from its stock root's boot set, takes the client end of the
+//! driver's connection, and makes `gpioproto` calls through `Remote`. A call
+//! that the driver answers with other than the status the script wants is
+//! printed, as `SOS NAME: STEP: got X, wanted Y`, and ends the script: the
+//! console's missing lines are what turns a case red.
+//!
+//! `Sleeper` is a Timer on a Waiter of its own, for a pause and for a wait on
+//! a posted request beside a deadline. Nothing here asserts how long a pause
+//! took.
+
+import sos.{System, Process, BootSet, PipeInlet, PipeReply, PipeHandles, Waiter, Timer,
+            ClockType, WaitPayload, ReplyDelivery, SosStatus, PIPE_BODY_BYTES}
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
+import gpioproto.{BODY_BYTES, Frame, GpioBody, GpioStatus}
+
+public static EXIT_OK: UInt = 0
+public static EXIT_FAILED: UInt = 1
+
+/// A status no honest path of a script produces: a wrong answer from the
+/// driver, which the script has printed.
+public static MISMATCH: SosStatus = SosStatus.BadImage
+
+/// The Waiter's keys for `Sleeper`.
+static KEY_TIMER: UInt = 1
+static KEY_CLAIM: UInt = 2
+
+/// The driver's `Status` answer.
+public struct Snapshot {
+    held: UInt8
+    abandoned: UInt16
+    fires: UInt32
+}
+
+/// The driver's `WaitLevel` answer: the level read and its fires so far.
+public struct Answer {
+    level: UInt8
+    fires: UInt32
+}
+
+/// What a posted request came to when it was waited on beside a deadline.
+public enum Waited {
+    /// The driver answered.
+    case Answered(answer: Answer),
+    /// The deadline came first. The claim is dropped.
+    case TimedOut,
+}
+
+/// The driver's connection, and the process that holds it.
+public struct Remote {
+    name: String
+    proc: Process
+    inlet: PipeInlet
+    body: GpioBody
+    system: System
+}
+
+extension Remote: NoCopy {}
+
+/// Starts a client: its Process handle, its boot set and the inlet it holds
+/// under `tag`. A failure is printed, and answers `None`.
+public func begin(boot_handle: UInt, name: String, tag: UInt) -> Remote? {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS gpiokit: no process handle")
+        let _ = system.shutdown(EXIT_FAILED)
+        return None
+    }
+    var set = try BootSet(process: &proc) catch {
+        print("SOS {}: drain: {}", name, error)
+        let _ = proc.exit(EXIT_FAILED)
+        return None
+    }
+    guard var record = set.take(tag) else {
+        print("SOS {}: no record {}", name, tag)
+        let _ = proc.exit(EXIT_FAILED)
+        return None
+    }
+    guard let inlet = record.take_inlet() else {
+        print("SOS {}: record {} is no inlet", name, tag)
+        let _ = proc.exit(EXIT_FAILED)
+        return None
+    }
+    Remote(name: name, proc: move proc, inlet: move inlet, body: GpioBody.empty(),
+           system: move system)
+}
+
+/// Ends the client with `code`.
+public func finish(remote: &Remote, code: UInt) {
+    let _ = remote.proc.exit(code)
+}
+
+extension Remote {
+    /// Prints a mismatch and answers the status that ends the script.
+    public func mismatch(&self, step: String, got: String, wanted: String) -> SosStatus {
+        print("SOS {}: {}: got {}, wanted {}", self.name, step, got, wanted)
+        MISMATCH
+    }
+
+    /// Sends the request in the body and answers the reply.
+    public func call(&var self, len: UInt) -> Result<Frame, SosStatus> {
+        let msg = try self.inlet.send(body: &self.body.bytes, len: len)
+        return Frame(len: msg.len, bytes: msg.bytes)
+    }
+
+    /// Sends the request and requires the answer's status to be `want`.
+    public func expect(&var self, step: String, len: UInt,
+                       want: GpioStatus) -> Result<Frame, SosStatus> {
+        let reply = try self.call(len)
+        guard let got = reply.status() else {
+            return self.mismatch(step, "no status", want.describe())
+        }
+        if got != want {
+            return self.mismatch(step, got.describe(), want.describe())
+        }
+        return move reply
+    }
+
+    /// Sends the request carrying `handles` and requires the answer's status to
+    /// be `want`.
+    public func expect_with(&var self, step: String, len: UInt, want: GpioStatus,
+                            handles: &var PipeHandles) -> Result<Frame, SosStatus> {
+        let msg = try self.inlet.send_with(body: &self.body.bytes, len: len,
+                                           handles: &var handles)
+        let reply = Frame(len: msg.len, bytes: msg.bytes)
+        guard let got = reply.status() else {
+            return self.mismatch(step, "no status", want.describe())
+        }
+        if got != want {
+            return self.mismatch(step, got.describe(), want.describe())
+        }
+        return move reply
+    }
+
+    /// Posts the request in the body and answers its claim.
+    public func post(&var self, len: UInt) -> Result<PipeReply, SosStatus> {
+        self.inlet.post(body: &self.body.bytes, len: len)
+    }
+
+    /// The driver's `Status`.
+    public func snapshot(&var self, step: String) -> Result<Snapshot, SosStatus> {
+        let n = self.body.status()
+        let reply = try self.expect(step, n, GpioStatus.Ok)
+        return Snapshot(held: reply.byte(1), abandoned: reply.u16(2),
+                        fires: reply.u32(4))
+    }
+
+    /// Calls `Status` until `held` is `held`, yielding between calls: the
+    /// driver's own progress is what ends the loop, never the clock.
+    public func settle(&var self, step: String, held: UInt8) -> Result<Snapshot, SosStatus> {
+        let me = try self.proc.thread_self()
+        while {
+            let now = try self.snapshot(step)
+            if now.held == held {
+                return now
+            }
+            let _ = me.yield_now()
+        }
+    }
+
+    /// The level `pin` reads.
+    public func read(&var self, step: String, pin: UInt8) -> Result<UInt8, SosStatus> {
+        let n = self.body.read(pin)
+        let reply = try self.expect(step, n, GpioStatus.Ok)
+        return reply.byte(1)
+    }
+
+    /// Writes `level` to `pin`.
+    public func write(&var self, step: String, pin: UInt8, level: UInt8) -> Result<Void, SosStatus> {
+        let n = self.body.write(pin, level)
+        let reply = try self.expect(step, n, GpioStatus.Ok)
+        let _ = move reply
+        return
+    }
+
+    /// Waits, parked, until `pin` reads `level`; answers the level read and the
+    /// driver's fires so far.
+    public func wait_level(&var self, step: String, pin: UInt8,
+                           level: UInt8) -> Result<Answer, SosStatus> {
+        let n = self.body.wait_level(pin, level)
+        let reply = try self.expect(step, n, GpioStatus.Ok)
+        return Answer(level: reply.byte(1), fires: reply.u32(2))
+    }
+}
+
+/// A Timer on a Waiter of its own.
+public struct Sleeper {
+    waiter: Waiter
+    timer: Timer
+}
+
+extension Sleeper: NoCopy {}
+
+/// Makes a Sleeper from `remote`'s System and Process.
+public func sleeper(remote: &Remote) -> Result<Sleeper, SosStatus> {
+    let clock = try remote.system.clock_get(type: ClockType.Monotonic)
+    let waiter = try remote.proc.waiter_create()
+    let timer = try clock.timer_create()
+    try waiter.add(&timer, KEY_TIMER)
+    return Sleeper(waiter: move waiter, timer: move timer)
+}
+
+extension Sleeper {
+    /// Pauses for `ns` nanoseconds.
+    public func sleep(&self, ns: UInt64) -> Result<Void, SosStatus> {
+        try self.timer.arm(after_ns: ns)
+        let woke = try self.waiter.wait()
+        let _ = move woke
+        return
+    }
+
+    /// Waits for `claim`'s answer or `ns` nanoseconds, whichever is first. On a
+    /// deadline the claim is dropped, which is the driver's cancellation. An
+    /// answer is the `WaitLevel` reply: its level and fires.
+    public func wait_claim(&self, claim: PipeReply, ns: UInt64) -> Result<Waited, SosStatus> {
+        var held = move claim
+        try self.waiter.add(&held, KEY_CLAIM)
+        try self.timer.arm(after_ns: ns)
+        let woke = try self.waiter.wait()
+        if woke.key == KEY_TIMER {
+            let _ = move woke
+            try self.waiter.remove(KEY_CLAIM)
+            let _ = move held
+            return Waited.TimedOut
+        }
+        try self.timer.disarm()
+        let (_, what) = (move woke).open()
+        match what {
+            case Reply(outcome) -> {
+                if outcome.len() < 6 || outcome.byte(0) != (GpioStatus.Ok as UInt8) {
+                    return MISMATCH
+                }
+                let low = (outcome.byte(2) as UInt32) | ((outcome.byte(3) as UInt32) << 8)
+                let high = (outcome.byte(4) as UInt32) | ((outcome.byte(5) as UInt32) << 8)
+                let fires = low | (high << 16)
+                return Waited.Answered(answer: Answer(level: outcome.byte(1), fires: fires))
+            },
+            case _ -> { return MISMATCH },
+        }
+    }
+}

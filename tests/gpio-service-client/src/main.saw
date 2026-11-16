@@ -1,0 +1,355 @@
+//! The GPIO driver's service case, from its client.
+//!
+//! This emulator models none of GPIO's behavior: `IN` reads 0 and no GPIO
+//! interrupt can be raised. The case holds what it can show anyway, through
+//! the driver's log of the words it wrote, its refusals, and the waits it
+//! holds:
+//!
+//! - the start's writes, each word and its order (`Log`);
+//! - `Read` and a `WaitLevel` the pin already satisfies, answered at once;
+//! - every refusal of every op that names a pin, the log unmoved;
+//! - the two writes a `Write` makes;
+//! - a `WaitLevel` no edge can answer, posted beside a Timer: the Timer comes
+//!   first by construction, and the dropped claim is an abandonment the driver
+//!   discards;
+//! - four held waits, the fifth answered `Busy`, and all four abandoned;
+//! - a wait on the loopback pin, which a pin that is also an output allows.
+//!
+//! The order of the driver's side of each exchange is forced, not raced: the
+//! client's calls ride one connection in order, so a `Status` answer proves the
+//! requests posted before it were served.
+
+import sos.{PipeHandles, SosStatus}
+import gpioproto.{GpioBody, GpioStatus, LOG_PER_REPLY}
+import gpiokit.{Remote, Sleeper, Waited, begin, finish, sleeper, EXIT_OK, EXIT_FAILED}
+
+static TAG_GPIO: UInt = 2
+
+/// A deadline no case depends on: the claim cannot be answered here, so only a
+/// stalled host could move the Timer later, which keeps the order.
+static DEADLINE_NS: UInt64 = 1_000_000
+
+/// One word the driver wrote: the address and the word.
+struct Written {
+    address: UInt32
+    word: UInt32
+}
+
+/// The start's writes for the smoke configuration (`tests/images/gpio/smoke.saw`):
+/// pin 21 pulled up, 14 pulled down, 1 floating, 2 an output driven high, 47 an
+/// output with its input on and an edge interrupt, driven low. Written out from
+/// the registers' addresses and fields, not computed by the driver's own
+/// functions.
+static START: [Written; 28] = [
+    Written(address: 0x60004028, word: 0x00200000),
+    Written(address: 0x600045a8, word: 0x00000100),
+    Written(address: 0x60009058, word: 0x00001b00),
+    Written(address: 0x6000404c, word: 0x00200000),
+    Written(address: 0x600040c8, word: 0x00002180),
+    Written(address: 0x60004028, word: 0x00004000),
+    Written(address: 0x6000458c, word: 0x00000100),
+    Written(address: 0x6000903c, word: 0x00001a80),
+    Written(address: 0x6000404c, word: 0x00004000),
+    Written(address: 0x600040ac, word: 0x00002180),
+    Written(address: 0x60004028, word: 0x00000002),
+    Written(address: 0x60004558, word: 0x00000100),
+    Written(address: 0x60009008, word: 0x00001a00),
+    Written(address: 0x6000404c, word: 0x00000002),
+    Written(address: 0x60004078, word: 0x00002180),
+    Written(address: 0x60004028, word: 0x00000004),
+    Written(address: 0x60004008, word: 0x00000004),
+    Written(address: 0x6000455c, word: 0x00000500),
+    Written(address: 0x6000900c, word: 0x00001800),
+    Written(address: 0x60004024, word: 0x00000004),
+    Written(address: 0x6000407c, word: 0x00000000),
+    Written(address: 0x60004034, word: 0x00008000),
+    Written(address: 0x60004018, word: 0x00008000),
+    Written(address: 0x60004610, word: 0x00000500),
+    Written(address: 0x600090c0, word: 0x00001a00),
+    Written(address: 0x60004030, word: 0x00008000),
+    Written(address: 0x60004058, word: 0x00008000),
+    Written(address: 0x60004130, word: 0x00002180),
+]
+
+/// The `Log` answer from `from`: its head, which holds `total` entries and
+/// none dropped, and its `count` entries, compared with `want` from `at`.
+func check_log(r: &var Remote, step: String, from: Int, want: &[Written; 28],
+               at: Int, count: Int, total: UInt8) -> Result<Void, SosStatus> {
+    let n = r.body.log(from as UInt8)
+    let reply = try r.expect(step, n, GpioStatus.Ok)
+    let head_ok = reply.byte(1) == total && reply.u16(2) == 0 && reply.byte(4) == (count as UInt8)
+    if not head_ok {
+        return r.mismatch(step, "a different head", "total {total} dropped 0 n {count}")
+    }
+    var i = 0
+    while i < count {
+        let address = reply.u32(5 + 8 * i)
+        let word = reply.u32(9 + 8 * i)
+        if address != want[at + i].address || word != want[at + i].word {
+            return r.mismatch(step, "entry {from + i} address {address} word {word}",
+                              "address {want[at + i].address} word {want[at + i].word}")
+        }
+        i = i + 1
+    }
+    print("SOS gpioclient: {}: {} entries ok", step, count)
+    return
+}
+
+/// The log's head: how many entries it kept and dropped.
+func log_total(r: &var Remote, step: String) -> Result<UInt8, SosStatus> {
+    let n = r.body.log(255)
+    let reply = try r.expect(step, n, GpioStatus.Ok)
+    if reply.byte(4) != 0 {
+        return r.mismatch(step, "entries past the end", "none")
+    }
+    return reply.byte(1)
+}
+
+/// A request the driver refuses with `want`, and a message of its own.
+func refuse(r: &var Remote, step: String, len: UInt, want: GpioStatus) -> Result<Void, SosStatus> {
+    let reply = try r.expect(step, len, want)
+    let _ = move reply
+    print("SOS gpioclient: {}: {}", step, want.describe())
+    return
+}
+
+func start_writes(r: &var Remote) -> Result<Void, SosStatus> {
+    try check_log(&var r, "log 0", 0, &START, 0, LOG_PER_REPLY, 28)
+    try check_log(&var r, "log 15", 15, &START, 15, 13, 28)
+    return
+}
+
+func at_once(r: &var Remote) -> Result<Void, SosStatus> {
+    let level = try r.read("read 21", 21)
+    if level != 0 {
+        return r.mismatch("read 21", "{level}", "0")
+    }
+    print("SOS gpioclient: read 21 = {}", level)
+    let seen = try r.wait_level("wait_level 21 0", 21, 0)
+    if seen.level != 0 {
+        return r.mismatch("wait_level 21 0", "level {seen.level}", "0")
+    }
+    print("SOS gpioclient: wait_level 21 0 answered at once")
+    return
+}
+
+func refusals(r: &var Remote) -> Result<Void, SosStatus> {
+    let before = try log_total(&var r, "log before refusals")
+    // A pin the part has no GPIO for (22 to 25, above 48), then a GPIO the
+    // configuration does not name (19), on every op that names a pin.
+    var n = r.body.read(22)
+    try refuse(&var r, "read 22", n, GpioStatus.BadPin)
+    n = r.body.read(19)
+    try refuse(&var r, "read 19", n, GpioStatus.NotMine)
+    n = r.body.read(25)
+    try refuse(&var r, "read 25", n, GpioStatus.BadPin)
+    n = r.body.read(26)
+    try refuse(&var r, "read 26", n, GpioStatus.NotMine)
+    n = r.body.read(48)
+    try refuse(&var r, "read 48", n, GpioStatus.NotMine)
+    n = r.body.read(255)
+    try refuse(&var r, "read 255", n, GpioStatus.BadPin)
+    n = r.body.read(49)
+    try refuse(&var r, "read 49", n, GpioStatus.BadPin)
+    n = r.body.write(22, 0)
+    try refuse(&var r, "write 22", n, GpioStatus.BadPin)
+    n = r.body.write(19, 0)
+    try refuse(&var r, "write 19", n, GpioStatus.NotMine)
+    n = r.body.wait_level(22, 1)
+    try refuse(&var r, "wait_level 22", n, GpioStatus.BadPin)
+    n = r.body.wait_level(19, 1)
+    try refuse(&var r, "wait_level 19", n, GpioStatus.NotMine)
+    n = r.body.inspect(22)
+    try refuse(&var r, "inspect 22", n, GpioStatus.BadPin)
+    n = r.body.inspect(19)
+    try refuse(&var r, "inspect 19", n, GpioStatus.NotMine)
+    // A pin of the configuration the op cannot use.
+    n = r.body.write(21, 1)
+    try refuse(&var r, "write 21", n, GpioStatus.BadMode)
+    n = r.body.wait_level(2, 1)
+    try refuse(&var r, "wait_level 2", n, GpioStatus.BadMode)
+    // A level that is neither 0 nor 1, checked before the pin.
+    n = r.body.write(2, 2)
+    try refuse(&var r, "write 2 level 2", n, GpioStatus.BadArg)
+    n = r.body.wait_level(21, 2)
+    try refuse(&var r, "wait_level 21 level 2", n, GpioStatus.BadArg)
+    n = r.body.write(22, 2)
+    try refuse(&var r, "write 22 level 2", n, GpioStatus.BadArg)
+    // An op that is none, and payloads of the wrong length.
+    n = r.body.raw(0x7F, 1)
+    try refuse(&var r, "op 0x7f", n, GpioStatus.BadOp)
+    n = r.body.raw(1, 0)
+    try refuse(&var r, "read, no pin", n, GpioStatus.BadOp)
+    n = r.body.raw(1, 2)
+    try refuse(&var r, "read, two bytes", n, GpioStatus.BadOp)
+    n = r.body.raw(6, 1)
+    try refuse(&var r, "status, a byte", n, GpioStatus.BadOp)
+    let after = try log_total(&var r, "log after refusals")
+    if before != after {
+        return r.mismatch("log after refusals", "total {after}", "total {before}")
+    }
+    print("SOS gpioclient: refusals wrote nothing")
+    return
+}
+
+func writes(r: &var Remote) -> Result<Void, SosStatus> {
+    try r.write("write 2 0", 2, 0)
+    try r.write("write 47 1", 47, 1)
+    let mine = try log_total(&var r, "log after writes")
+    if mine != 30 {
+        return r.mismatch("log after writes", "total {mine}", "total 30")
+    }
+    let n = r.body.log(28)
+    let reply = try r.expect("log 28", n, GpioStatus.Ok)
+    let a0 = reply.u32(5)
+    let w0 = reply.u32(9)
+    let a1 = reply.u32(13)
+    let w1 = reply.u32(17)
+    let first_ok = a0 == 0x6000400c && w0 == 4
+    let second_ok = a1 == 0x60004014 && w1 == 0x8000
+    if reply.byte(4) != 2 || not first_ok || not second_ok {
+        return r.mismatch("log 28", "{a0} <- {w0}, {a1} <- {w1}",
+                          "1610629132 <- 4, 1610629140 <- 32768")
+    }
+    print("SOS gpioclient: log 28: OUT_W1TC <- 0x00000004, OUT1_W1TS <- 0x00008000")
+    // This emulator holds no OUT write, so what a plain output reads back is
+    // the part's to show (stage G1); here the read is answered.
+    let driven = try r.read("read 2", 2)
+    print("SOS gpioclient: read 2 answered, level {}", driven)
+    return
+}
+
+/// A `WaitLevel` the pin cannot satisfy, posted beside a Timer, then dropped.
+func deadline(r: &var Remote, s: &Sleeper) -> Result<Void, SosStatus> {
+    let n = r.body.wait_level(21, 1)
+    let claim = try r.post(n)
+    // The driver has held the wait when this answers: one connection, in order.
+    let held = try r.settle("status after post", 1)
+    print("SOS gpioclient: wait_level 21 1 held={}", held.held)
+    let got = try s.wait_claim(move claim, DEADLINE_NS)
+    match got {
+        case TimedOut -> print("SOS gpioclient: the deadline came first"),
+        case Answered(_) -> { return r.mismatch("wait_level 21 1", "an answer", "none") },
+    }
+    let gone = try r.settle("status after drop", 0)
+    print("SOS gpioclient: dropped, held={} abandoned={}", gone.held, gone.abandoned)
+    return
+}
+
+/// A request that carries `PIPE_MSG_HANDLES` handles, sent while the driver
+/// holds every wait it will: the delivery needs room for the obligation and
+/// for all four, and the driver stays up and answers.
+func carrying(r: &var Remote) -> Result<Void, SosStatus> {
+    var handles = PipeHandles.none()
+    var at = 0
+    while at < handles.slots() {
+        handles.put(at, event: try r.proc.event_create())
+        at = at + 1
+    }
+    let n = r.body.status()
+    let reply = try r.expect_with("status carrying four handles", n, GpioStatus.Ok, &var handles)
+    let held = reply.byte(1)
+    if held != 4 {
+        return r.mismatch("status carrying four handles", "held {held}", "held 4")
+    }
+    let up = try r.snapshot("status after the handles")
+    print("SOS gpioclient: four handles carried with four held, driver up held={}", up.held)
+    return
+}
+
+/// Four waits held, a fifth refused `Busy`, all four dropped.
+func busy(r: &var Remote) -> Result<Void, SosStatus> {
+    let n = r.body.wait_level(21, 1)
+    let first = try r.post(n)
+    let second = try r.post(n)
+    let third = try r.post(n)
+    let fourth = try r.post(n)
+    let full = try r.settle("status with four held", 4)
+    print("SOS gpioclient: four held, held={}", full.held)
+    let fifth = r.body.wait_level(21, 1)
+    try refuse(&var r, "fifth wait_level 21 1", fifth, GpioStatus.Busy)
+    let still = try r.snapshot("status after busy")
+    if still.held != 4 {
+        return r.mismatch("status after busy", "held {still.held}", "held 4")
+    }
+    // A wait the pin already satisfies is answered with the held set full.
+    let seen = try r.wait_level("wait_level 21 0 with four held", 21, 0)
+    if seen.level != 0 {
+        return r.mismatch("wait_level 21 0 with four held", "level {seen.level}", "0")
+    }
+    print("SOS gpioclient: wait_level 21 0 answered at once with four held")
+    try carrying(&var r)
+    let _ = move first
+    let _ = move second
+    let _ = move third
+    let _ = move fourth
+    let gone = try r.settle("status after four drops", 0)
+    print("SOS gpioclient: dropped four, held={} abandoned={}", gone.held, gone.abandoned)
+    return
+}
+
+/// A wait on the loopback pin, which is also an output, is accepted.
+func loopback(r: &var Remote) -> Result<Void, SosStatus> {
+    let n = r.body.wait_level(47, 1)
+    let claim = try r.post(n)
+    let held = try r.settle("status with the loopback held", 1)
+    print("SOS gpioclient: wait_level 47 1 held={}", held.held)
+    let _ = move claim
+    let gone = try r.settle("status after the loopback drop", 0)
+    print("SOS gpioclient: dropped, held={} abandoned={}", gone.held, gone.abandoned)
+    return
+}
+
+/// The log keeps `LOG_ENTRIES` words and counts the rest.
+func overflow(r: &var Remote) -> Result<Void, SosStatus> {
+    var i = 0
+    while i < 40 {
+        try r.write("write 2", 2, (i % 2) as UInt8)
+        i = i + 1
+    }
+    let n = r.body.log(0)
+    let reply = try r.expect("log head", n, GpioStatus.Ok)
+    let total = reply.byte(1)
+    let dropped = reply.u16(2)
+    if total != 64 || dropped != 6 {
+        return r.mismatch("log head", "total {total} dropped {dropped}", "total 64 dropped 6")
+    }
+    print("SOS gpioclient: log kept {} and dropped {}", total, dropped)
+    return
+}
+
+func inspect(r: &var Remote) -> Result<Void, SosStatus> {
+    let n = r.body.inspect(21)
+    let reply = try r.expect("inspect 21", n, GpioStatus.Ok)
+    // What the device answers is the device's: the emulator reads zeros.
+    print("SOS gpioclient: inspect 21 iomux={} pin={} out_sel={} in={}",
+          reply.u32(1), reply.u32(5), reply.u32(9),
+          reply.byte(13))
+    return
+}
+
+func script(r: &var Remote) -> Result<Void, SosStatus> {
+    let s = try sleeper(&r)
+    try start_writes(&var r)
+    try at_once(&var r)
+    try refusals(&var r)
+    try writes(&var r)
+    try deadline(&var r, &s)
+    try busy(&var r)
+    try loopback(&var r)
+    try overflow(&var r)
+    try inspect(&var r)
+    return
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    guard var r = begin(boot_handle, "gpioclient", TAG_GPIO) else { return }
+    try script(&var r) catch {
+        print("SOS gpioclient: stopped: {}", error)
+        finish(&r, EXIT_FAILED)
+        return
+    }
+    print("SOS gpioclient: done")
+    finish(&r, EXIT_OK)
+}

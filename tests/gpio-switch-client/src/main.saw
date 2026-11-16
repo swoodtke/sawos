@@ -1,0 +1,65 @@
+//! The switch on pin 21, through the GPIO driver, on the part.
+//!
+//! The switch is wired from GPIO 21 to ground and the pad is pulled up, so the
+//! pin reads 1 with the switch open and 0 closed. The client reads the pin,
+//! then ten times waits, parked in the driver, for the opposite level; after
+//! each answer it pauses for a settle time and reads the pin again, and counts
+//! the change only if the pin still reads what it waited for, which is how a
+//! bouncing contact is told from a flip. `on` is the switch closed.
+//!
+//! This emulator's `IN` reads 0 and it raises no GPIO interrupt, so the case
+//! is built for a board (`--emit-flash`) and never run here.
+
+import sos.{SosStatus}
+import gpiokit.{Remote, Sleeper, begin, finish, sleeper, EXIT_OK, EXIT_FAILED}
+
+static TAG_GPIO: UInt = 2
+
+static SWITCH_PIN: UInt8 = 21
+
+/// How many flips the owner makes.
+static FLIPS: Int = 10
+
+/// How long a level must hold to count: the application's policy, not the
+/// driver's.
+static SETTLE_NS: UInt64 = 50_000_000
+
+func word(level: UInt8) -> String {
+    if level == 0 { "on" } else { "off" }
+}
+
+func flips(r: &var Remote, s: &Sleeper) -> Result<Void, SosStatus> {
+    var level = try r.read("read 21", SWITCH_PIN)
+    print("SOS gpioswitch: at boot the switch is {}", word(level))
+    var counted = 0
+    while counted < FLIPS {
+        let want: UInt8 = if level == 0 { 1 } else { 0 }
+        let answer = try r.wait_level("wait_level 21", SWITCH_PIN, want)
+        try s.sleep(SETTLE_NS)
+        let now = try r.read("read 21 after settling", SWITCH_PIN)
+        if now == want {
+            level = want
+            counted = counted + 1
+            print("SOS gpioswitch: switch {} fires={}", word(level), answer.fires)
+        }
+    }
+    return
+}
+
+func script(r: &var Remote) -> Result<Void, SosStatus> {
+    let s = try sleeper(&r)
+    try flips(&var r, &s)
+    return
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    guard var r = begin(boot_handle, "gpioswitch", TAG_GPIO) else { return }
+    try script(&var r) catch {
+        print("SOS gpioswitch: stopped: {}", error)
+        finish(&r, EXIT_FAILED)
+        return
+    }
+    print("SOS gpioswitch: done")
+    finish(&r, EXIT_OK)
+}
