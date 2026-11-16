@@ -36,7 +36,8 @@ hal/riscv32-esp32c3/ # the ESP32-C3 board, same shape — reached only by
                    # `make sos-smoke-esp32c3`, which gates after sos-test
 hal/xtensa-esp32s3/  # Xtensa (call0) and the ESP32-S3 board in one
                    # directory, as arm64's: kernel/ (boot.S with the vectors
-                   # and trap entry, sink.c, lib.saw on the Flat tier,
+                   # and trap entry, sink.c, mspi.c the PSRAM's command
+                   # layer in IRAM, lib.saw on the Flat tier,
                    # esp32s3.ld, which INCLUDEs each image's generated
                    # flash slots) + user/ (the syscall stub, user.ld)
                    # + keys/ (an image's build keys, one module

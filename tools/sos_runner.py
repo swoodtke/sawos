@@ -75,6 +75,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -1210,6 +1211,11 @@ ESP32S3_ARCH = {
     # grant budget's sixteen rows less an image's four.
     "board_areas": [(1, 4), (3, 20), (7, 24), (11, 5), (12, 20)],
     "board_mappings": 12,
+    # The emulator's arguments for the part's in-package PSRAM, the N8R8's
+    # 8 MiB octal AP chip: `-m` sizes it, and without the property the
+    # machine's model is a quad chip (ABI.md §16e). A case that boots the
+    # PSRAM's harnesses passes these unless it names its own `qemu_args`.
+    "psram_qemu_args": ["-m", "8M", "-global", "ssi_psram.is_octal=true"],
 }
 
 # How big a child's destination region is.
@@ -1477,9 +1483,10 @@ def needs_region_table(case):
 
 def _builder_only(case):
     """Refuse, on the runner's own image path, a case only the image builder
-    can build: one that states `limits` or carries a hand-made `slab_block`.
-    This path writes region tables that end with their rows."""
-    for key in ("limits", "slab_block"):
+    can build: one that states `limits` or carries a hand-made `slab_block`,
+    which this path's region tables cannot hold, or a PSRAM harness's `psram`
+    description, which this path does not write."""
+    for key in ("limits", "slab_block", "psram"):
         if case.get(key):
             raise ToolError(f"case {case['name']!r} has `{key}`, which only "
                             "the image builder builds (unset "
@@ -12377,12 +12384,14 @@ def _image_description(case, arch, kernel_obj, output, flash=None,
 
 
 def _link_image(builder, profile, case, arch, output, flash=None,
-                link_args=()):
+                link_args=(), payload=None):
     """Write a case's image description into its staging directory and have
     the builder link it; return what the builder printed.
 
     A `slab_block` case's payload is its hand-made table, written into the
     staging directory from the kernel's own slab sizes (`_slab_block_asm`).
+    Any other payload the caller writes is `payload`, the assembly's text,
+    written there as `payload.S`.
     """
     kernel_obj = _kernel_object(arch, case["src"])
     board_limits = None
@@ -12390,6 +12399,12 @@ def _link_image(builder, profile, case, arch, output, flash=None,
         board_limits = _board_defaults(builder, arch, kernel_obj)
     description = _image_description(case, arch, kernel_obj, output, flash,
                                      link_args, board_limits)
+    if payload is not None:
+        os.makedirs(description["staging"], exist_ok=True)
+        path = os.path.join(description["staging"], "payload.S")
+        with open(path, "w") as f:
+            f.write(payload)
+        description["asm"] = path
     if case.get("slab_block"):
         os.makedirs(description["staging"], exist_ok=True)
         payload = os.path.join(description["staging"], "slab_block.S")
@@ -13243,6 +13258,212 @@ def check_read_only_probe(path):
                         f"may call is exit_pass, and it calls {calls}")
 
 
+# The S3 kernel's two SRAM ranges, `esp32s3.ld`'s MEMORY: IRAM, where the
+# vectors and the PSRAM's command layer run, and DRAM, the kernel's `.data`
+# and `.bss`. Nothing in either is fetched through the flash cache.
+S3_IRAM = (0x40378000, 0x40378000 + 16 * 1024)
+S3_DRAM = (0x3FC8C000, 0x3FC8C000 + 144 * 1024)
+
+# The sections the PSRAM's command layer may have: its code and literal pool
+# in IRAM, its data in DRAM (`esp32s3.ld` places each by name).
+IRAM_CHECK_SECTIONS = (".text.iram", ".literal.iram", ".data", ".bss")
+
+
+def _elf32_sections(data):
+    """An ELF32's sections: (name, type, flags, offset, size, link, entsize)."""
+    shoff, = struct.unpack_from("<I", data, 32)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 46)
+    raw = [struct.unpack_from("<10I", data, shoff + shentsize * i)
+           for i in range(shnum)]
+    names = raw[shstrndx][4]
+
+    def name(off):
+        return data[names + off:data.index(b"\0", names + off)].decode()
+    return [(name(s[0]), s[1], s[2], s[4], s[5], s[6], s[9]) for s in raw]
+
+
+def _elf32_symbols(data, sections):
+    """An ELF32's symbols: (name, value, type, section index)."""
+    out = []
+    for _name, kind, _flags, offset, size, link, entsize in sections:
+        if kind != 2:                           # SHT_SYMTAB
+            continue
+        strtab = sections[link][3]
+        for at in range(offset, offset + size, entsize):
+            st_name, value, _size, info, _other, shndx = struct.unpack_from(
+                "<IIIBBH", data, at)
+            name = data[strtab + st_name:data.index(b"\0", strtab + st_name)]
+            out.append((name.decode(), value, info & 15, shndx))
+    return out
+
+
+def check_iram(obj, elf=None):
+    """Refuse the PSRAM's command layer, `obj` (`mspi.c`'s object), if any of
+    it can be fetched through the flash cache while SPI1 holds the gate
+    (ABI.md §16d). Every finding is named, one per line, when the object
+      * has an allocated section of non-zero size outside
+        `IRAM_CHECK_SECTIONS` (a `.rodata` table, a switch's jump table, a
+        string, a function that lost its section);
+      * references a symbol it does not define (a compiler helper, `memset`,
+        any kernel function);
+      * or, in the linked image `elf`, defines a symbol that lies outside
+        `S3_IRAM` and `S3_DRAM`.
+    An image that does not link the layer has none of its symbols, and so
+    no third kind of finding."""
+    with open(obj, "rb") as f:
+        data = f.read()
+    sections = _elf32_sections(data)
+    symbols = _elf32_symbols(data, sections)
+    findings = []
+    for name, _kind, flags, _offset, size, _link, _entsize in sections:
+        if flags & 2 and size and not name.startswith(IRAM_CHECK_SECTIONS):
+            findings.append(f"{os.path.basename(obj)}: section {name} "
+                            f"({size} bytes) is not IRAM code or DRAM data")
+    for name, _value, _kind, shndx in symbols:
+        if name and shndx == 0:
+            findings.append(f"{os.path.basename(obj)}: references {name}, "
+                            "which it does not define")
+    if elf is not None:
+        defined = {name for name, _value, kind, shndx in symbols
+                   if name and shndx != 0 and kind in (1, 2)}
+        with open(elf, "rb") as f:
+            linked = f.read()
+        for name, value, kind, _shndx in _elf32_symbols(
+                linked, _elf32_sections(linked)):
+            if name in defined and kind in (1, 2) and not (
+                    S3_IRAM[0] <= value < S3_IRAM[1]
+                    or S3_DRAM[0] <= value < S3_DRAM[1]):
+                findings.append(f"{os.path.basename(elf)}: {name} is at "
+                                f"{value:#010x}, outside IRAM and DRAM")
+    if findings:
+        raise ToolError("the PSRAM command layer can be fetched from flash:\n"
+                        + "\n".join(findings))
+
+
+# The fault record `mspi.c` defines in its fault build. Only the fault
+# harness's emulator image may hold it: a board image, or any other kernel,
+# is refused.
+PSRAM_FAULT_SYMBOL = "sos_psram_fault"
+PSRAM_FAULT_HARNESS = os.path.join(TESTS_DIR, "xtensa", "psram_fault.saw")
+
+
+def check_psram_fault(name, symbols, src, board):
+    """Refuse an image that defines `mspi.c`'s fault record unless it is the
+    fault harness's emulator image."""
+    if PSRAM_FAULT_SYMBOL not in symbols:
+        return
+    if board:
+        raise ToolError(f"{name}: a board image defines {PSRAM_FAULT_SYMBOL}, "
+                        "the PSRAM bring-up's fault record, which only a "
+                        "harness image for the emulator may hold")
+    if os.path.abspath(src) != PSRAM_FAULT_HARNESS:
+        raise ToolError(f"{name}: {os.path.relpath(src, REPO_ROOT)} is not the "
+                        f"PSRAM fault harness and defines "
+                        f"{PSRAM_FAULT_SYMBOL}, the bring-up's fault record")
+
+
+# What the S3 part's in-package PSRAM is (ABI.md §16a): the eFuse's codes
+# (PSRAM_CAP 1, 8 MiB; PSRAM_VENDOR 1, AP at 3.3 V), the chip's MR1 vendor
+# (0x0D, AP Memory) and MR2 density (3, 8 MiB), and the divider word for the
+# commands and the cache fills: divide by 4, `0x00030103` as IDF's
+# `mspi_timing_ll_set_psram_clock(_, 4)` encodes it. Under every clock key
+# the memory-SPI core clock is at most 80 MHz (ABI.md §16b), so the bus runs
+# at 20 MHz or less.
+PSRAM_DESCRIPTION = {"efuse_cap": 1, "efuse_vendor": 1, "vendor": 0x0D,
+                     "density": 3, "divider": 0x00030103}
+
+# The clock words S0.3 compares, SYSCLK_CONF & 0x80FFF, CPU_PER_CONF & 7 and
+# CORE_CLK_SEL & 3, as each clock key leaves them on the part (ABI.md §14h,
+# §16b). A board image's description is its key's.
+PSRAM_PART_CLOCK = {
+    "rom": (0x00080001, 0x4, 0x0),
+    "xtal40": (0x00080000, 0x4, 0x0),
+    "pll80": (0x00080400, 0x4, 0x0),
+}
+
+# The emulator's, under every key: it answers SYSCLK_CONF with the PLL
+# selected whatever is stored, CPU_PER_CONF with 0 and SPI0 with 0 (ABI.md
+# §14e). The smoke's description is this.
+PSRAM_EMULATOR_CLOCK = (0x00080401, 0x0, 0x0)
+
+# `mspi.c`'s `last_step` values.
+PSRAM_THROUGH_S8 = 0x80
+PSRAM_THROUGH_S9 = 0x90
+
+# The fault harness's words, after the description, in `psram_fault.saw`'s
+# `CaseHarness` order.
+PSRAM_HARNESS_WORDS = ("step", "command", "addr", "value", "count",
+                       "expect_at", "record_at", "last_step", "time_bytes")
+
+# The record's size, `mspi.c`'s `struct sos_psram_record`.
+PSRAM_RECORD_BYTES = 76
+
+
+def _psram_case_asm(case, clock, board):
+    """A PSRAM harness's case block, as assembly: the description at the
+    block's start, the fault harness's words, then room for the record, all
+    in `.data` (DRAM); and `sos_psram_case`, which answers the block's
+    address. The description is `PSRAM_DESCRIPTION` with the clock words of
+    the image's target, the part's at `clock` for a board image and the
+    emulator's otherwise, and the case's `psram["expect"]` over both."""
+    spec = case["psram"]
+    if board:
+        if clock not in PSRAM_PART_CLOCK:
+            raise ToolError(f"{case['name']}: no PSRAM description for the "
+                            f"clock key {clock!r}; the part's clock words are "
+                            f"known for {', '.join(PSRAM_PART_CLOCK)}")
+        words = PSRAM_PART_CLOCK[clock]
+    else:
+        words = PSRAM_EMULATOR_CLOCK
+    expect = dict(PSRAM_DESCRIPTION, sysclk=words[0], cpu_per=words[1],
+                  core_clk_sel=words[2])
+    expect.update(spec.get("expect", {}))
+    order = ("efuse_cap", "efuse_vendor", "vendor", "density", "divider",
+             "sysclk", "cpu_per", "core_clk_sel")
+    harness = dict(spec.get("fault", {}), last_step=PSRAM_THROUGH_S8)
+    for key in ("expect_at", "record_at", "last_step", "time_bytes"):
+        if key in spec:
+            harness[key] = spec[key]
+    lines = ["/* Written by tools/sos_runner.py: a PSRAM harness's case block "
+             "(ABI.md §16e). */",
+             '    .section .data.sos_psram_case_block, "aw"',
+             "    .balign 4",
+             "sos_psram_case_block:"]
+    lines += [f"    .word {expect[k]:#x}" for k in order]
+    lines += [f"    .word {harness.get(k, 0):#x}" for k in PSRAM_HARNESS_WORDS]
+    lines += [f"    .space {PSRAM_RECORD_BYTES}",
+              '    .section .text.sos_psram_case, "ax"',
+              "    .literal .Lsos_psram_case_lit, sos_psram_case_block",
+              "    .align 4",
+              "    .global sos_psram_case",
+              "    .type sos_psram_case, @function",
+              "sos_psram_case:",
+              "    l32r a2, .Lsos_psram_case_lit",
+              "    ret", ""]
+    return "\n".join(lines)
+
+
+# The eFuse words the emulator's model reads from a file (ABI.md §16e): six
+# words of block 0, then block 1, whose word 4 is EFUSE_RD_MAC_SPI_SYS_4,
+# with PSRAM_CAP [4:3] and PSRAM_VENDOR [8:7].
+EFUSE_FILE_BYTES = 1024
+EFUSE_SYS_4_OFFSET = 40
+EFUSE_SYS_4 = {
+    "8M": (1 << 3) | (1 << 7),          # 8 MiB, AP at 3.3 V: the part's
+    "16M": (3 << 3) | (1 << 7),         # 16 MiB, AP at 3.3 V
+    "AP_1V8": (1 << 3) | (2 << 7),      # 8 MiB, AP at 1.8 V
+}
+
+
+def _efuse_file(path, which):
+    """Write a fresh eFuse file for one run, so nothing one run's emulator
+    does to it reaches another's."""
+    image = bytearray(EFUSE_FILE_BYTES)
+    struct.pack_into("<I", image, EFUSE_SYS_4_OFFSET, EFUSE_SYS_4[which])
+    with open(path, "wb") as f:
+        f.write(image)
+
+
 def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     """The ESP32-S3 board smoke: Xtensa, call0, the `Flat` tier. Returns the
     process exit status. `wanted` is the `--case` names (underscored), or
@@ -13283,14 +13504,24 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     transcript is asserted in order as well. A run that never reaches the
     door is killed at the deadline and fails.
 
-    Each image is built at its build keys, two modules the HAL imports and
-    the runner maps to a directory under `hal/xtensa-esp32s3/keys/`: the CPU
+    Each image is built at its build keys: two modules the HAL imports and
+    the runner maps to a directory under `hal/xtensa-esp32s3/keys/`, the CPU
     clock (`"clock"`, `rom` unless a case says otherwise; ABI.md §14) and the
-    console's stall count (`"console_stall"`, off unless a case asks). A key
-    changes the kernel's compile, so each combination the cases use is its
-    own profile, with its own build directory; `rom` with the count off is
-    `.build/esp32s3/sos`, and its images are the bytes they are without the
-    keys. A case marked `"board_only"` (with its reason) is built only by
+    console's stall count (`"console_stall"`, off unless a case asks); and
+    the PSRAM command layer's fault build (`"psram_fault"`, `mspi.c` with
+    `-DSOS_PSRAM_FAULT`; ABI.md §16e). A key changes the kernel's compile, so
+    each combination the cases use is its own profile, with its own build
+    directory; `rom` with the rest off is `.build/esp32s3/sos`, and its
+    images are the bytes they are without the keys.
+
+    A PSRAM harness's case (`"psram"`) gets its description written beside
+    its image (`_psram_case_asm`) and boots with the part's PSRAM, an eFuse
+    file and the flash model's trace (`boot_args`); every image is held to
+    `check_iram` and `check_psram_fault` once linked. A case with
+    `"iram_mutant"` boots nothing: it runs `check_iram` on the command layer
+    with one slip added (`iram_mutant`).
+
+    A case marked `"board_only"` (with its reason) is built only by
     `--emit-flash`: the smoke prints the reason and runs nothing for it. A
     case marked `"read_only_probe"` has its source held to
     `check_read_only_probe` before it is built.
@@ -13301,7 +13532,6 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     import glob
     import hashlib
     import select
-    import struct
 
     arch = ESP32S3_ARCH
     dirs = arch_dirs(arch)
@@ -13360,22 +13590,31 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     clock_keys = ("rom", "xtal40", "pll80")
 
     def variant(case):
-        """A case's build keys: its clock and whether the console counts its
-        stalls."""
-        return (case.get("clock", "rom"), bool(case.get("console_stall")))
+        """A case's build keys: its clock, whether the console counts its
+        stalls, and whether the PSRAM's command layer is its fault build
+        (`psram_fault`, `mspi.c` compiled with `-DSOS_PSRAM_FAULT`)."""
+        return (case.get("clock", "rom"), bool(case.get("console_stall")),
+                bool(case.get("psram_fault")))
 
     def variant_arch(key):
         """The arch entry an image at these keys builds under: this board's,
         with a build directory of the keys' own unless they are the
         defaults."""
-        clock, stall = key
-        if key == ("rom", False):
+        clock, stall, fault = key
+        if key == ("rom", False, False):
             return arch
-        tag = f"{arch['build_tag']}-{clock}" + ("-stall" if stall else "")
+        tag = (f"{arch['build_tag']}-{clock}" + ("-stall" if stall else "")
+               + ("-fault" if fault else ""))
         return dict(arch, build_tag=tag)
 
+    def mspi_object(key):
+        """The PSRAM command layer's object for an image at these keys."""
+        if python_path:
+            return os.path.join(s3_build, "mspi.o")
+        return os.path.join(arch_dirs(variant_arch(key))["build"], "mspi.o")
+
     def module_paths(key):
-        clock, stall = key
+        clock, stall, _fault = key
         return [CORE_MODULE, f"hal={os.path.join(s3_hal, 'kernel')}",
                 tc().module_path_arg("imgformat"), SOSRT_MODULE,
                 SOSABI_MODULE,
@@ -13550,8 +13789,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             f.write(image)
         return flash, used, end
 
-    def boot(flash):
-        """Boot the image; collect the console until the emulator exits.
+    def boot(flash, extra=()):
+        """Boot the image, with `extra` after the board's own arguments;
+        collect the console until the emulator exits.
 
         Returns the transcript and the exit status, or None for a run killed
         at the deadline. Stderr is discarded: QEMU writes `Adding SPI flash
@@ -13559,7 +13799,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         """
         proc = subprocess.Popen(
             [qemu, "-machine", "esp32s3", "-nographic", "-semihosting",
-             "-drive", f"file={flash},if=mtd,format=raw"],
+             "-drive", f"file={flash},if=mtd,format=raw", *extra],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL)
         out = b""
@@ -14058,6 +14298,412 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            halt_pass],
             "expect_clean_exit": True,
         },
+    ]
+
+    # The PSRAM's command layer (ABI.md §16): the bring-up's identity and its
+    # mode write on the emulator's octal 8 MiB chip, then every stop it
+    # makes, each with what it leaves on SPI1, and the flash's own trace:
+    # the flash model decodes the ROM's one command at boot (0xab) and
+    # nothing the bring-up sends. The description is the case's, with the
+    # emulator's clock words (`_psram_case_asm`). `psram_identity` and
+    # `psram_mode` are board stages P1 and P2 too (`--emit-flash`, which
+    # gives them the part's clock words at the image's clock key).
+    # S1's stores from words that read 0: pad 26 at function 0 with drive 3;
+    # pads 27 and 28 at function 0 with the pull-up and input on, drive 3;
+    # pads 33 to 37 at function 4, pull-up, input, drive 3; the input
+    # selects of signals 2, 3 and 7 to 11 cleared.
+    s1_stores = {0x6000_906C: 0x0C00, 0x6000_9070: 0x0F00,
+                 0x6000_9074: 0x0F00,
+                 # Pads 29 to 32, the flash's, as the ROM's boot left them:
+                 # S1 stores none of them.
+                 0x6000_9078: 0, 0x6000_907C: 0, 0x6000_9080: 0x0200,
+                 0x6000_9084: 0x0200,
+                 **{0x6000_9004 + 4 * pad: 0x4F00 for pad in range(33, 38)},
+                 **{0x6000_4154 + 4 * sig: 0 for sig in (2, 3, 7, 8, 9, 10,
+                                                         11)}}
+    # S2's and S4's, from SPI0's words that read 0: SPI_MEM_SPI_SMEM_AC(0)
+    # with CS_SETUP, CS_HOLD, CS_SETUP_TIME 3, CS_HOLD_TIME 3 and
+    # CS_HOLD_DELAY 2; SPI_MEM_SRAM_CLK(0) at the divider, divide by 4.
+    s2_s4_stores = {0x6000_30DC: 0x0400_018F, 0x6000_3050: 0x0003_0103}
+    # Stores to SPI1 that S10 undoes, so each is a store the run made, not
+    # its last: S5's SPI_MEM_DDR(1), from the 0 the emulator's SPI1 holds,
+    # VAR_DUMMY and DDR_EN; and S7's for a register read, SPI_MEM_CTRL(1)
+    # with the octal bits (FASTRD_MODE, FCMD_OCT, FADDR_OCT, FDIN_OCT,
+    # FDOUT_OCT) over the ROM's `0x00208000`, and SPI_MEM_USER1(1) with a
+    # 32-bit address and the register read's 8 dummy cycles.
+    spi1_stores = {0x6000_20E0: 0x0000_0003, 0x6000_2008: 0x0020_A270,
+                   0x6000_201C: 0x7C00_0007}
+    # What S1 must not store to: the flash's pads 29 to 32, pad 38 beyond
+    # DQS, and the input selects of signals 4 to 6 and 12, beside the ones
+    # it clears.
+    s1_untouched = [*(0x6000_9004 + 4 * pad for pad in (29, 30, 31, 32, 38)),
+                    *(0x6000_4154 + 4 * sig for sig in (4, 5, 6, 12))]
+    spi1_as_before = ("SOS psram: SPI1 MISC=0x00000000 clock=0x00030103 "
+                      "after the call, as before it")
+    flash_once = ["0xab"]
+    spi1_cmd = 0x6000_2000
+    spi1_misc = 0x6000_2034
+    spi1_w0 = 0x6000_2058
+    every_time = 0xFFFF_FFFF
+
+    def psram_stop(name, src, stop, lines, **keys):
+        """A case that stops the bring-up at `stop`: its lines, then the
+        halt with the stop's code. `psram`, `qemu_args`, `efuse` and
+        `psram_fault` are the case's keys, as `boot_args` and `variant` read
+        them."""
+        case = {
+            "name": name,
+            "src": os.path.join(s3_tests, src),
+            "psram": keys.pop("psram", {}),
+            "flash_commands": flash_once,
+            "expect_out": [rom, *lines,
+                           f"SOS-S3: halt fail code={stop:#010x}"],
+            "expect_clean_exit": False,
+            "expect_status": stop,
+        }
+        case.update(keys)
+        return case
+
+    def fault_stop(name, stop, lines, **psram):
+        """A stop the fault harness reaches by lying to one read (or, with no
+        `fault`, by the addresses it passes)."""
+        return psram_stop(name, "psram_fault.saw", stop, lines,
+                          psram=psram, psram_fault=True)
+
+    kernel_cases += [
+        {
+            # P1: S0 to S8 and S10. The eFuse words are the part's, the clock
+            # words the emulator's, SPI1's clock is the ROM's divide by 4,
+            # and the mode registers are the emulator's AP chip at power-on.
+            # SPI0 is not modelled and reads 0. The cycle count is host time.
+            "name": "psram_identity",
+            "src": os.path.join(s3_tests, "psram_identity.saw"),
+            "psram": {},
+            "flash_commands": flash_once,
+            "expect_out": [
+                rom,
+                "SOS psram: efuse PSRAM_CAP=0x00000001 "
+                "PSRAM_VENDOR=0x00000001",
+                "SOS psram: sysclk=0x000a8401 cpu_per=0x00000000 "
+                "core_clk_sel=0x00000000 spi0 clock=0x00000000 "
+                "sram_clk=0x00000000 spi1 clock=0x00030103",
+                "SOS psram: SPI1 MISC=0x00000001 before the first command",
+                "SOS psram: MR0=0x00000009 MR1=0x0000000d MR2=0x00000093 "
+                "MR3=0x00000020 MR4=0x00000020 MR8=0x00000005",
+                "SOS psram: MR0/MR1 read took ",
+                "SOS psram: pads 26=0x",
+                spi1_as_before,
+                halt_pass],
+            # S1's, S2's and S4's stores, which the emulator takes and reads
+            # back as 0, each from a read of 0; S5's and S7's to SPI1, which
+            # S10 puts back; and the addresses S1 must leave alone.
+            "device_writes": {**s1_stores, **s2_s4_stores},
+            "device_stores": spi1_stores,
+            "device_untouched": s1_untouched,
+            "expect_clean_exit": True,
+        },
+        # S1 on the part's own words (ABI.md §15c), one read lied to each
+        # time: pads 27 and 28 from the GPIO function, pull-up, input and
+        # drive 2 (`0x1b00`; pad 28's with the pull-down on too, `0x1b80`) to
+        # function 0 with the pull-down off and drive 3 (`0x0f00`),
+        # and the input selects of signals 2 and 3 with bit 7 cleared.
+        *[{
+            "name": name,
+            "src": os.path.join(s3_tests, "psram_fault.saw"),
+            "psram": {"fault": {"step": 0x10, "addr": addr, "value": found,
+                                "count": 1}},
+            "psram_fault": True,
+            "flash_commands": flash_once,
+            "expect_out": [
+                rom,
+                "SOS psram: fault hits=0x00000001 starts=0x00000004 "
+                "w0_reads=0x00000004",
+                spi1_as_before,
+                halt_pass],
+            "device_writes": {addr: stored},
+            "expect_clean_exit": True,
+        } for name, addr, found, stored in (
+            ("psram_pad27_word", 0x6000_9070, 0x1B00, 0x0F00),
+            ("psram_pad28_word", 0x6000_9074, 0x1B80, 0x0F00),
+            ("psram_insel2_word", 0x6000_415C, 0xBC, 0x3C),
+            ("psram_insel3_word", 0x6000_4160, 0xBC, 0x3C))],
+        {
+            # P2: S9's write takes, then the array reads are timed. The ticks
+            # and the clock they give are host time here.
+            "name": "psram_mode",
+            "src": os.path.join(s3_tests, "psram_mode.saw"),
+            "psram": {},
+            "flash_commands": flash_once,
+            "expect_out": [
+                rom,
+                "SOS psram: MR0=0x00000009 before, 0x28 written, "
+                "MR0=0x00000028 after",
+                "SOS psram: 1000 reads of 2 bytes took ",
+                " ticks, of 10 bytes ",
+                "SOS psram: core clock ",
+                " by 4 clocks x 4 per read",
+                spi1_as_before,
+                halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # The bring-up through S8, counted: four commands start, the four
+            # mode-register reads, and none after them, so nothing is
+            # written to the chip.
+            "name": "psram_identity_commands",
+            "src": os.path.join(s3_tests, "psram_fault.saw"),
+            "psram": {},
+            "psram_fault": True,
+            "flash_commands": flash_once,
+            "expect_out": [
+                rom,
+                "SOS psram: fault hits=0x00000000 starts=0x00000004 "
+                "w0_reads=0x00000004",
+                spi1_as_before,
+                halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # P1 at divide by 2: the commands run at a clock word other than
+            # the one SPI1 holds, and S10 puts the ROM's back.
+            "name": "psram_identity_divider_2",
+            "src": os.path.join(s3_tests, "psram_identity.saw"),
+            "psram": {"expect": {"divider": 0x00010001}},
+            "flash_commands": flash_once,
+            "expect_out": [
+                rom,
+                "SOS psram: sysclk=0x000a8401 cpu_per=0x00000000 "
+                "core_clk_sel=0x00000000 spi0 clock=0x00000000 "
+                "sram_clk=0x00000000 spi1 clock=0x00010001",
+                spi1_as_before,
+                halt_pass],
+            "expect_clean_exit": True,
+        },
+        # 0x50: the description, then the record, then the timing call's
+        # description at a flash address. Nothing on SPI1 changes.
+        fault_stop("psram_stop_expect_in_flash", 0x50, [
+            "SOS-S3: psram stop: bring-up record at 0x3fc",
+            " or expectation at 0x3c200000 is not in DRAM",
+            "SOS psram: fault hits=0x00000000 starts=0x00000000",
+            spi1_as_before], expect_at=0x3C20_0000),
+        fault_stop("psram_stop_record_in_flash", 0x50, [
+            "SOS-S3: psram stop: bring-up record at 0x3c200000 or "
+            "expectation at 0x3fc",
+            "SOS psram: fault hits=0x00000000 starts=0x00000000",
+            spi1_as_before], record_at=0x3C20_0000),
+        fault_stop("psram_stop_time_reads_in_flash", 0x50, [
+            " or expectation at 0x3c200000 is not in DRAM",
+            "SOS psram: fault hits=0x00000000 starts=0x00000000",
+            spi1_as_before], expect_at=0x3C20_0000, time_bytes=2),
+        # And a description that starts in DRAM and runs past its end
+        # (0x3FD0_0000): the check holds the whole of it, not its first byte.
+        fault_stop("psram_stop_expect_past_dram", 0x50, [
+            " or expectation at 0x3fcffff0 is not in DRAM",
+            "SOS psram: fault hits=0x00000000 starts=0x00000000",
+            spi1_as_before], expect_at=0x3FCF_FFF0),
+        # 0x61: the measurement asked for 64-byte reads, which it never
+        # sends; nothing on SPI1 changes.
+        fault_stop("psram_stop_read_length", 0x61, [
+            "SOS-S3: psram stop: a timing read of 0x00000040 bytes; the "
+            "measurement reads 2 or 10",
+            "SOS psram: fault hits=0x00000000 starts=0x00000000",
+            spi1_as_before], time_bytes=64),
+        # 0x51: no eFuse file (every word 0), a 16 MiB part, an AP part at
+        # 1.8 V. Before anything is written.
+        psram_stop("psram_stop_efuse_none", "psram_identity.saw", 0x51, [
+            "SOS-S3: psram stop: efuse word 0x60007054 = 0x00000000 says "
+            "PSRAM_CAP=0x0 PSRAM_VENDOR=0x0, the board says 0x1 (8 MiB) and "
+            "0x1 (AP 3.3 V)",
+            spi1_as_before], efuse=None),
+        psram_stop("psram_stop_efuse_16m", "psram_identity.saw", 0x51, [
+            "SOS-S3: psram stop: efuse word 0x60007054 = 0x00000098 says "
+            "PSRAM_CAP=0x3 PSRAM_VENDOR=0x1, the board says 0x1 (8 MiB) and "
+            "0x1 (AP 3.3 V)",
+            spi1_as_before], efuse="16M"),
+        psram_stop("psram_stop_efuse_1v8", "psram_identity.saw", 0x51, [
+            "SOS-S3: psram stop: efuse word 0x60007054 = 0x00000108 says "
+            "PSRAM_CAP=0x1 PSRAM_VENDOR=0x2, the board says 0x1 (8 MiB) and "
+            "0x1 (AP 3.3 V)",
+            spi1_as_before], efuse="AP_1V8"),
+        # 0x52: pad 26's hold bit, read at S0.2.
+        fault_stop("psram_stop_pad_held", 0x52, [
+            "SOS-S3: psram stop: pads held, RTC_CNTL_DIG_PAD_HOLD = "
+            "0x00000020, the board needs pads 26-28 and 33-37 free",
+            "SOS psram: fault hits=0x00000001 starts=0x00000000",
+            spi1_as_before],
+            fault={"step": 0x02, "addr": 0x6000_80DC, "value": 0x20,
+                   "count": 1}),
+        # And the other pads S1 writes: the flash's HD and WP, 27 and 28,
+        # and the data pads at either end, 33 and 37.
+        *[fault_stop(f"psram_stop_pad{pad}_held", 0x52, [
+            "SOS-S3: psram stop: pads held, RTC_CNTL_DIG_PAD_HOLD = "
+            f"{1 << (pad - 21):#010x}, the board needs pads 26-28 and 33-37 "
+            "free",
+            "SOS psram: fault hits=0x00000001 starts=0x00000000",
+            spi1_as_before],
+            fault={"step": 0x02, "addr": 0x6000_80DC,
+                   "value": 1 << (pad - 21), "count": 1})
+          for pad in (27, 28, 33, 37)],
+        # 0x53: a description for another clock, one word at a time: the
+        # pre-divider at 0, the PLL at 480 MHz, the core clock select at 1.
+        psram_stop("psram_stop_clock_pre_div", "psram_identity.saw", 0x53, [
+            "SOS-S3: psram stop: clock SYSCLK_CONF=0x000a8401 "
+            "CPU_PER_CONF=0x00000000 CORE_CLK_SEL=0x0, the board's PSRAM "
+            "divider is for SYSCLK_CONF&0x80fff=0x00080400 CPU_PER_CONF&7=0x0 "
+            "CORE_CLK_SEL=0x0",
+            spi1_as_before], psram={"expect": {"sysclk": 0x00080400}}),
+        psram_stop("psram_stop_clock_cpu_per", "psram_identity.saw", 0x53, [
+            "SOS-S3: psram stop: clock SYSCLK_CONF=0x000a8401 "
+            "CPU_PER_CONF=0x00000000 CORE_CLK_SEL=0x0, the board's PSRAM "
+            "divider is for SYSCLK_CONF&0x80fff=0x00080401 CPU_PER_CONF&7=0x4 "
+            "CORE_CLK_SEL=0x0",
+            spi1_as_before], psram={"expect": {"cpu_per": 0x4}}),
+        psram_stop("psram_stop_clock_core", "psram_identity.saw", 0x53, [
+            "SOS-S3: psram stop: clock SYSCLK_CONF=0x000a8401 "
+            "CPU_PER_CONF=0x00000000 CORE_CLK_SEL=0x0, the board's PSRAM "
+            "divider is for SYSCLK_CONF&0x80fff=0x00080401 CPU_PER_CONF&7=0x0 "
+            "CORE_CLK_SEL=0x1",
+            spi1_as_before], psram={"expect": {"core_clk_sel": 0x1}}),
+        # 0x54: SPI1 busy at S0.4, every read of the bound.
+        fault_stop("psram_stop_busy_before", 0x54, [
+            "SOS-S3: psram stop: SPI1 busy before any command, SPI_MEM_CMD = "
+            "0x00040000 after 100000 polls",
+            "SOS psram: fault hits=0x000186a0 starts=0x00000000",
+            spi1_as_before],
+            fault={"step": 0x04, "addr": spi1_cmd, "value": 0x40000,
+                   "count": every_time}),
+        # 0x55: ECC on at S3, and still on after the clear.
+        fault_stop("psram_stop_ecc", 0x55, [
+            "SOS-S3: psram stop: SYSCON_SRAM_ACE0_ATTR = 0x000001ff still has "
+            "ECC on after clearing it",
+            "SOS psram: fault hits=0x00000002 starts=0x00000000",
+            spi1_as_before],
+            fault={"step": 0x30, "addr": 0x6002_6058, "value": 0x1FF,
+                   "count": every_time}),
+        # 0x56: the gate does not read back at S6. Nothing is sent, SPI1 is
+        # restored.
+        fault_stop("psram_stop_gate", 0x56, [
+            "SOS-S3: psram stop: SPI1 MISC = 0x00000000 after selecting CS1 "
+            "alone; nothing was sent",
+            "SOS psram: fault hits=0x00000002 starts=0x00000000",
+            spi1_as_before],
+            fault={"step": 0x60, "addr": spi1_misc, "value": 0,
+                   "count": every_time}),
+        # 0x57: SPI1 busy before the second command; the first ran.
+        fault_stop("psram_stop_busy_command", 0x57, [
+            "SOS-S3: psram stop: SPI1 busy before command 0x4040 (MR2/MR3 "
+            "read), SPI_MEM_CMD = 0x00040000 after 100000 polls",
+            "SOS psram: fault hits=0x000186a0 starts=0x00000001",
+            spi1_as_before],
+            fault={"step": 0x71, "command": 2, "addr": spi1_cmd,
+                   "value": 0x40000, "count": every_time}),
+        # 0x58: the gate gone before the first command starts: it is not
+        # sent, and no answer is read.
+        fault_stop("psram_stop_gate_lost", 0x58, [
+            "SOS-S3: psram stop: SPI1 MISC = 0x00000000 before command 0x4040 "
+            "(MR0/MR1 read); not sent",
+            "SOS psram: fault hits=0x00000001 starts=0x00000000 "
+            "w0_reads=0x00000000",
+            spi1_as_before],
+            fault={"step": 0x78, "command": 1, "addr": spi1_misc, "value": 0,
+                   "count": 1}),
+        # 0x59: the first command never finishes. The call's own line comes
+        # first, then the stop's; SPI1 is not restored, and its MISC still
+        # holds the gate, chip select 0 disabled.
+        fault_stop("psram_stop_not_finished", 0x59, [
+            "SOS-S3: psram: SPI1 command 0x4040 did not finish",
+            "SOS-S3: psram stop: SPI1 command 0x4040 (MR0/MR1 read) did not "
+            "finish, SPI_MEM_CMD = 0x00040000 after 100000 polls; CS0 left "
+            "disabled",
+            "SOS psram: fault hits=0x000186a0 starts=0x00000001",
+            "SOS psram: SPI1 MISC=0x00000001 clock=0x00030103 after the "
+            "call, differing:",
+            " misc=0x00000000->0x00000001\n"],
+            fault={"step": 0x79, "command": 1, "addr": spi1_cmd,
+                   "value": 0x40000, "count": every_time}),
+        # 0x5A: the machine's quad chip, and no chip at all: MR1 reads 0.
+        psram_stop("psram_stop_vendor_quad", "psram_identity.saw", 0x5A, [
+            "SOS-S3: psram stop: MR1 vendor = 0x00, the board says 0x0d "
+            "(AP Memory)",
+            spi1_as_before], qemu_args=["-m", "8M"]),
+        psram_stop("psram_stop_vendor_none", "psram_identity.saw", 0x5A, [
+            "SOS-S3: psram stop: MR1 vendor = 0x00, the board says 0x0d "
+            "(AP Memory)",
+            spi1_as_before], qemu_args=[]),
+        # 0x5B: MR2's answer with the good-die bit clear.
+        fault_stop("psram_stop_die", 0x5B, [
+            "SOS-S3: psram stop: MR2 = 0x13 has the good-die bit clear, the "
+            "board says a good die",
+            "SOS psram: fault hits=0x00000001 starts=0x00000002",
+            spi1_as_before],
+            fault={"step": 0x7A, "command": 2, "addr": spi1_w0,
+                   "value": 0x2013, "count": 1}),
+        # 0x5C: a 4 MiB and a 16 MiB chip behind the 8 MiB part's eFuse.
+        psram_stop("psram_stop_density_4m", "psram_identity.saw", 0x5C, [
+            "SOS-S3: psram stop: MR2 density = 0x1 (4 MiB), the board says "
+            "0x3 (8 MiB)",
+            spi1_as_before],
+            qemu_args=["-m", "4M", "-global", "ssi_psram.is_octal=true"]),
+        psram_stop("psram_stop_density_16m", "psram_identity.saw", 0x5C, [
+            "SOS-S3: psram stop: MR2 density = 0x5 (16 MiB), the board says "
+            "0x3 (8 MiB)",
+            spi1_as_before],
+            qemu_args=["-m", "16M", "-global", "ssi_psram.is_octal=true"]),
+        # 0x5D: the read-back after the MR0 write, the sixth command, answers
+        # the old MR0.
+        fault_stop("psram_stop_mr0", 0x5D, [
+            "SOS-S3: psram stop: MR0 = 0x09 after writing 0x28",
+            "SOS psram: fault hits=0x00000001 starts=0x00000006",
+            spi1_as_before],
+            fault={"step": 0x7A, "command": 6, "addr": spi1_w0,
+                   "value": 0x0D09, "count": 1},
+            last_step=0x90),
+        {
+            # The fault record in a kernel that is not the fault harness.
+            "name": "psram_fault_outside_harness",
+            "src": os.path.join(s3_tests, "psram_identity.saw"),
+            "psram": {},
+            "psram_fault": True,
+            "expect_build_error": "is not the PSRAM fault harness and "
+                                  "defines sos_psram_fault",
+            "expect_out": [],
+            "expect_clean_exit": False,
+        },
+        {
+            # And in the fault harness's board image.
+            "name": "psram_fault_board_image",
+            "src": os.path.join(s3_tests, "psram_fault.saw"),
+            "psram": {},
+            "psram_fault": True,
+            "board_image": True,
+            "expect_build_error": "a board image defines sos_psram_fault",
+            "expect_out": [],
+            "expect_clean_exit": False,
+        },
+    ]
+    # `check_iram` on the command layer as built, then with each slip it
+    # must refuse, by the finding it must name (`iram_mutant`).
+    kernel_cases += [
+        {"name": "iram_check_clean", "iram_mutant": "NONE",
+         "expect_out": [], "expect_clean_exit": True},
+        {"name": "iram_mutant_table", "iram_mutant": "TABLE",
+         "expect_finding": "section .rodata",
+         "expect_out": [], "expect_clean_exit": True},
+        {"name": "iram_mutant_switch", "iram_mutant": "SWITCH",
+         "expect_finding": "section .rodata",
+         "expect_out": [], "expect_clean_exit": True},
+        {"name": "iram_mutant_helper", "iram_mutant": "HELPER",
+         "expect_finding": "references __udivdi3",
+         "expect_out": [], "expect_clean_exit": True},
+        {"name": "iram_mutant_memset", "iram_mutant": "MEMSET",
+         "expect_finding": "references memset",
+         "expect_out": [], "expect_clean_exit": True},
+        {"name": "iram_mutant_noiram", "iram_mutant": "NOIRAM",
+         "expect_finding": "section .text.sos_psram_mutant",
+         "expect_out": [], "expect_clean_exit": True},
+        {"name": "iram_mutant_script", "iram_mutant": "SCRIPT",
+         "expect_finding": "sos_psram_bringup is at 0x42",
+         "expect_out": [], "expect_clean_exit": True},
     ]
 
     # The process cases: the gate's, by name, each chosen for one thing the
@@ -14634,10 +15280,12 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         return 1
 
     # The native half is one compile for every case at one set of keys.
-    # `boot.S` holds the vectors and the trap entry; `support.c` is the shared
-    # C floor, whose word atomics nothing references here (the compiler
-    # inlines `s32c1i`). Each set of keys the cases use is a profile of its
-    # own, since the keys are module paths of the kernel's compile.
+    # `boot.S` holds the vectors and the trap entry; `mspi.c` is the PSRAM's
+    # command layer, which the link drops from every image that does not
+    # call it; `support.c` is the shared C floor, whose word atomics nothing
+    # references here (the compiler inlines `s32c1i`). Each set of keys the
+    # cases use is a profile of its own, since the keys are module paths of
+    # the kernel's compile or, for the fault build, its C flags.
     keys_used = []
     for case in built:
         if variant(case) not in keys_used:
@@ -14649,17 +15297,22 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                        os.path.join(s3_build, "boot.o")),
                       (os.path.join(s3_hal, "kernel", "sink.c"),
                        os.path.join(s3_build, "sink.o")),
+                      (os.path.join(s3_hal, "kernel", "mspi.c"),
+                       os.path.join(s3_build, "mspi.o")),
                       (os.path.join(RT_COMMON_C_DIR, "support.c"),
                        os.path.join(s3_build, "support.o"))]
             shared = [cc(native[0][0], native[0][1]),
                       cc(native[1][0], native[1][1], extra=("-O2",)),
-                      cc(native[2][0], native[2][1], extra=("-O2",))]
+                      cc(native[2][0], native[2][1], extra=("-O2",)),
+                      cc(native[3][0], native[3][1], extra=("-O2",))]
         for key in keys_used:
             key_build = arch_dirs(variant_arch(key))["build"]
             native = [(os.path.join(s3_hal, "kernel", "boot.S"),
                        os.path.join(key_build, "boot.o")),
                       (os.path.join(s3_hal, "kernel", "sink.c"),
                        os.path.join(key_build, "sink.o")),
+                      (os.path.join(s3_hal, "kernel", "mspi.c"),
+                       os.path.join(key_build, "mspi.o")),
                       (os.path.join(RT_COMMON_C_DIR, "support.c"),
                        os.path.join(key_build, "support.o"))]
             profiles[key] = os.path.join(key_build, "sosimage.profile.json")
@@ -14667,6 +15320,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                 arch, clang, lld, native,
                 os.path.join(s3_hal, "kernel", "esp32s3.ld"),
                 module_paths(key),
+                kernel_c_args=["-DSOS_PSRAM_FAULT"] if key[2] else [],
                 flash={"bytes": flash_bytes, "instruction_window": flash_ibus,
                        "data_window": flash_dbus,
                        "window_bytes": flash_window,
@@ -14731,7 +15385,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # tree's descriptions are held to below.
     main_src = os.path.join(KERNEL_DIR, "main.saw")
     for key in ([] if python_path else keys_used):
-        entries = [c for c in built if variant(c) == key]
+        entries = [c for c in built if variant(c) == key and "src" in c]
         if key == keys_used[0]:
             entries.append({"src": main_src})
         failures = _build_kernels(builder, profiles[key], variant_arch(key),
@@ -14761,6 +15415,21 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         with no `simcall` in its stops."""
         made, elf = link_flash(case, board, check)
         _check_drom(elf, case["name"], arch)
+        # The PSRAM's command layer is linked into every image and kept only
+        # where it is called; where it is, none of it may be in flash, and
+        # its fault record only in the fault harness's emulator image. A
+        # refused image is deleted, so nothing refused can be written to a
+        # board from the build directory.
+        try:
+            check_iram(mspi_object(variant(case)), elf)
+            with open(elf, "rb") as f:
+                check_psram_fault(case["name"], elf_symbols(f.read()),
+                                  case.get("src", ""), board)
+        except ToolError:
+            for path in (made[0], elf):
+                if os.path.exists(path):
+                    os.remove(path)
+            raise
         return made
 
     def link_flash(case, board, check):
@@ -14790,10 +15459,14 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         if failure is not None:
             raise failure
         flash = os.path.join(s3_build, f"{name}.{tag}.bin")
+        payload = None
+        if "psram" in case:
+            payload = _psram_case_asm(case, key[0], board)
         printed = _link_image(
             builder, profiles[key], case, variant_arch(key), elf,
             flash={"output": flash, "check": check},
-            link_args=["--defsym=_sos_semihosting=0"] if board else [])
+            link_args=["--defsym=_sos_semihosting=0"] if board else [],
+            payload=payload)
         found = re.search(r"^flash used=(\d+) end=(\d+)$", printed, re.M)
         if not found:
             raise ToolError(f"{name}: the image builder did not say how much "
@@ -14842,6 +15515,117 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
               f"write-flash 0x0 {emit_out}")
         return 0
 
+    def boot_args(case):
+        """The emulator's extra arguments for one run, and the file its flash
+        model's trace goes to (None for a case that boots no PSRAM harness).
+        A PSRAM harness's run gets the part's PSRAM (`psram_qemu_args`)
+        unless the case names its own `qemu_args`, a fresh eFuse file
+        holding the case's `efuse` words (the part's, `8M`, unless it says
+        otherwise; None gives the model no file, and every word reads 0),
+        and the trace of every command the flash model decodes; and, for a
+        case with `device_writes`, of every store to a device register."""
+        if "psram" not in case:
+            return [], None
+        args = list(case.get("qemu_args", arch["psram_qemu_args"]))
+        which = case.get("efuse", "8M")
+        if which is not None:
+            efuse = os.path.join(s3_build, f"{case['name']}.efuse.bin")
+            _efuse_file(efuse, which)
+            args += ["-drive", f"file={efuse},if=none,format=raw,id=efuse",
+                     "-global",
+                     "driver=nvram.esp32s3.efuse,property=drive,value=efuse"]
+        trace = os.path.join(s3_build, f"{case['name']}.trace.txt")
+        if os.path.exists(trace):
+            os.remove(trace)
+        args += ["-trace", "m25p80_command_decoded", "-D", trace]
+        if (case.get("device_writes") or case.get("device_stores")
+                or case.get("device_untouched")):
+            args += ["-trace", "memory_region_ops_write"]
+        return args, trace
+
+    def flash_commands(trace):
+        """The commands the flash model decoded in one run, in order."""
+        if not os.path.exists(trace):
+            raise ToolError(f"the emulator wrote no trace at {trace}")
+        with open(trace) as f:
+            return re.findall(
+                r"m25p80_command_decoded .*new command:(0x[0-9a-f]+)",
+                f.read())
+
+    # The kernel's first store, `_start`'s RTC watchdog key to
+    # RTC_CNTL_WDTWPROTECT (ABI.md §2e): every store the trace shows before
+    # it is the ROM's.
+    kernel_first_store = (0x6000_80B0, 0x50D8_3AA1)
+
+    def device_writes(trace):
+        """Every value the run stored to each device address, in order, from
+        `memory_region_ops_write`'s lines, which give the address whole; and
+        the set of addresses stored to from the kernel's first store on."""
+        stores = {}
+        kernel = None
+        with open(trace) as f:
+            for found in re.finditer(
+                    r"memory_region_ops_write .*addr (0x[0-9a-f]+) value "
+                    r"(0x[0-9a-f]+) size", f.read()):
+                addr = int(found.group(1), 16)
+                value = int(found.group(2), 16)
+                if kernel is None and (addr, value) == kernel_first_store:
+                    kernel = set()
+                if kernel is not None:
+                    kernel.add(addr)
+                stores.setdefault(addr, []).append(value)
+        if kernel is None:
+            raise ToolError(f"{trace}: no store of the kernel's: the "
+                            "watchdog key `_start` writes first is missing")
+        return stores, kernel
+
+    def iram_mutant(case):
+        """Run `check_iram` on the PSRAM command layer with one slip added
+        (`tests/xtensa/iram_mutants.c`, `MUT_<name>`), or with its link
+        script's IRAM line removed (`SCRIPT`), and answer (ok, reason): the
+        check must refuse it with the case's finding, or, for `NONE`, pass.
+        The object is linked alone, rooted at the two entries and the
+        mutant, with the board's script, as a kernel would link it."""
+        which = case["iram_mutant"]
+        name = case["name"]
+        obj = os.path.join(s3_build, f"{name}.o")
+        elf = os.path.join(s3_build, f"{name}.elf")
+        script = os.path.join(s3_hal, "kernel", "esp32s3.ld")
+        define = "MUT_NONE" if which in ("NONE", "SCRIPT") else f"MUT_{which}"
+        if which == "SCRIPT":
+            line = "        *(.literal.iram .text.iram)\n"
+            with open(script) as f:
+                text = f.read()
+            if text.count(line) != 1:
+                return False, f"esp32s3.ld has no one line {line.strip()!r}"
+            script = os.path.join(s3_build, f"{name}.ld")
+            with open(script, "w") as f:
+                f.write(text.replace(line, ""))
+        try:
+            cc(os.path.join(s3_tests, "iram_mutants.c"), obj,
+               extra=("-O2", f"-D{define}"))
+        except ToolError as e:
+            return False, f"the mutant did not build: {e}"
+        try:
+            check_iram(obj)
+            roots = ["-u", "sos_psram_bringup", "-u", "sos_psram_time_reads"]
+            if define not in ("MUT_NONE",):
+                roots += ["-u", "sos_psram_mutant"]
+            slots = _write_image_slots(
+                arch, 0, os.path.join(s3_build, f"{name}.slots"))
+            _run([lld, "-T", script, "--gc-sections", "-L", slots, *roots,
+                  "--entry=sos_psram_bringup", "-o", elf, obj])
+            check_iram(obj, elf)
+        except ToolError as e:
+            want = case.get("expect_finding")
+            if want is not None and want in str(e):
+                return True, ""
+            return False, f"refused, but not with {want!r}: {e}"
+        if case.get("expect_finding") is None:
+            return True, ""
+        return False, (f"check_iram passed it; it must find "
+                       f"{case['expect_finding']!r}")
+
     failed = 0
     for i, case in enumerate(cases, 1):
         name = case["name"]
@@ -14849,19 +15633,38 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             print(f"[{i}/{len(cases)}] - {name}  (board only, built by "
                   f"--emit-flash: {case['board_only']})")
             continue
+        if case.get("iram_mutant"):
+            ok, reason = iram_mutant(case)
+            if ok:
+                print(f"[{i}/{len(cases)}] {CHECK} {name}")
+            else:
+                print(f"[{i}/{len(cases)}] {CROSS} {name}")
+                print(f"    {reason}")
+                failed += 1
+            continue
         try:
             flash, size, _end = build_flash(
-                case, check=not case.get("loader_fixture"))
+                case, board=bool(case.get("board_image")),
+                check=not case.get("loader_fixture"))
             if case.get("expect_build_error"):
                 print(f"[{i}/{len(cases)}] {CROSS} {name}")
                 print(f"    the build succeeded; it must refuse: "
                       f"{case['expect_build_error']}")
                 failed += 1
                 continue
-            out, status = boot(flash)
+            extra, trace = boot_args(case)
+            out, status = boot(flash, extra)
         except ToolError as e:
             if case.get("expect_build_error") and \
                     case["expect_build_error"] in str(e):
+                left = [p for p in glob.glob(
+                            os.path.join(s3_build, f"{name}.*.bin"))
+                        if case.get("board_image")]
+                if left:
+                    print(f"[{i}/{len(cases)}] {CROSS} {name}")
+                    print(f"    refused, and its image is still at {left}")
+                    failed += 1
+                    continue
                 print(f"[{i}/{len(cases)}] {CHECK} {name}  (the build "
                       "refused it)")
                 continue
@@ -14875,6 +15678,53 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                                 f"{timeout_s}s"
         else:
             ok, reason = _check(case, arch, status, out, False)
+        # The flash's own view of the run: every command it decoded, which
+        # for a PSRAM harness must be the ROM's one at boot and nothing the
+        # bring-up sent (`flash_commands`).
+        if ok and case.get("flash_commands") is not None:
+            try:
+                heard = flash_commands(trace)
+            except ToolError as e:
+                ok, reason = False, str(e)
+            else:
+                if heard != case["flash_commands"]:
+                    ok, reason = False, (f"the flash decoded {heard}, not "
+                                         f"{case['flash_commands']}")
+        # The words the run left in registers the emulator does not read
+        # back (the IO MUX): the last store to each address must be the
+        # case's (`device_writes`).
+        # `device_stores` names a value that must be among the stores to an
+        # address, for a word a later step puts back; `device_untouched`, an
+        # address the kernel must not store to at all.
+        if ok and (case.get("device_writes") or case.get("device_stores")
+                   or case.get("device_untouched")):
+            try:
+                stored, by_kernel = device_writes(trace)
+            except ToolError as e:
+                stored, by_kernel = {}, set()
+                ok, reason = False, str(e)
+            wrong = {f"{a:#010x}": (f"{stored[a][-1]:#010x}" if a in stored
+                                    else "no store")
+                     for a, v in case.get("device_writes", {}).items()
+                     if stored.get(a, [None])[-1] != v}
+            if ok and wrong:
+                ok, reason = False, (f"the last stores were {wrong}, not "
+                                     + str({f"{a:#010x}": f"{v:#010x}"
+                                            for a, v in
+                                            case["device_writes"].items()}))
+            missing = {f"{a:#010x}": [f"{x:#010x}" for x in stored.get(a, [])]
+                       for a, v in case.get("device_stores", {}).items()
+                       if v not in stored.get(a, [])}
+            if ok and missing:
+                ok, reason = False, (f"the stores were {missing}, without "
+                                     + str({f"{a:#010x}": f"{v:#010x}"
+                                            for a, v in
+                                            case["device_stores"].items()}))
+            touched = [f"{a:#010x}" for a in case.get("device_untouched", ())
+                       if a in by_kernel]
+            if ok and touched:
+                ok, reason = False, (f"the kernel stored to {touched}, which "
+                                     "it must not touch")
         if ok:
             print(f"[{i}/{len(cases)}] {CHECK} {name}  "
                   f"({size} bytes of flash)")

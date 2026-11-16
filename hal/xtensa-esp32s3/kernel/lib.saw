@@ -1373,3 +1373,370 @@ public func windowed_call_refused(fn_addr: UInt) unsafe -> Never {
     exit_fail(WINDOWED_CALL_REFUSED_STATUS)
     while { }
 }
+
+// =============================================================================
+// The PSRAM's bring-up, Saw half
+// =============================================================================
+//
+// `mspi.c` makes every step and every check of the bring-up from IRAM, in one
+// call, and fills in a record; this half passes it the description and prints
+// the line a stop's record says (../ABI.md §16). Nothing here touches the
+// memory-SPI controller but `psram_spi1_words`, which only reads it, and
+// SYSTIMER, which `psram_time_reads` starts and reads around its call. Down
+// here, below the last overflow check, for the build keys' reason above.
+
+extern "C" {
+    func sos_psram_bringup(expect: UInt, record: UInt, last_step: UInt) -> UInt
+    func sos_psram_time_reads(expect: UInt, record: UInt, bytes: UInt,
+                              count: UInt) -> UInt
+}
+
+/// The description the part must match, as `mspi.c`'s
+/// `struct sos_psram_expect` lays it out.
+public struct PsramExpect {
+    efuse_cap: UInt32,
+    efuse_vendor: UInt32,
+    vendor: UInt32,
+    density: UInt32,
+    divider: UInt32,
+    sysclk: UInt32,
+    cpu_per: UInt32,
+    core_clk_sel: UInt32,
+}
+
+static_assert(sizeof<PsramExpect>() == 32, "PsramExpect is mspi.c's layout")
+
+/// What the bring-up found, as `mspi.c`'s `struct sos_psram_record` lays it
+/// out.
+public struct PsramRecord {
+    stop: UInt32,
+    read: UInt32,
+    expect: UInt32,
+    command: UInt32,
+    address: UInt32,
+    efuse: UInt32,
+    pad_hold: UInt32,
+    sysclk: UInt32,
+    cpu_per: UInt32,
+    core_clk_sel: UInt32,
+    saved: UInt32,
+    spi1_clock: UInt32,
+    misc_gate: UInt32,
+    mr01: UInt32,
+    mr23: UInt32,
+    mr4: UInt32,
+    mr8: UInt32,
+    mr01_after: UInt32,
+    mr_cycles: UInt32,
+}
+
+static_assert(sizeof<PsramRecord>() == 76, "PsramRecord is mspi.c's layout")
+
+/// `last_step` for a bring-up that ends after S8, the identity, and for one
+/// that ends after S9, the mode register's write (`mspi.c`'s STEP_S8,
+/// STEP_S9).
+public static PSRAM_THROUGH_S8: UInt = 0x80
+public static PSRAM_THROUGH_S9: UInt = 0x90
+
+/// The stops' codes (../ABI.md §16c).
+static PSRAM_STOP_NOT_DRAM: UInt = 0x50
+static PSRAM_STOP_EFUSE: UInt = 0x51
+static PSRAM_STOP_PAD_HELD: UInt = 0x52
+static PSRAM_STOP_CLOCK: UInt = 0x53
+static PSRAM_STOP_BUSY_BEFORE: UInt = 0x54
+static PSRAM_STOP_ECC: UInt = 0x55
+static PSRAM_STOP_GATE: UInt = 0x56
+static PSRAM_STOP_BUSY_COMMAND: UInt = 0x57
+static PSRAM_STOP_GATE_LOST: UInt = 0x58
+static PSRAM_STOP_NOT_FINISHED: UInt = 0x59
+static PSRAM_STOP_VENDOR: UInt = 0x5A
+static PSRAM_STOP_DIE: UInt = 0x5B
+static PSRAM_STOP_DENSITY: UInt = 0x5C
+static PSRAM_STOP_MR0: UInt = 0x5D
+static PSRAM_STOP_READ_LENGTH: UInt = 0x61
+
+/// Run the bring-up's steps S0 to `last_step`, then S10, on the description at
+/// `expect`, filling in the record at `record`; both must be DRAM. Answers 0,
+/// or the stop code, whose line `psram_stop_line` prints.
+public func psram_bringup(expect: UInt, record: UInt,
+                          last_step: UInt) unsafe -> UInt {
+    sos_psram_bringup(expect, record, last_step)
+}
+
+/// Send `count` reads of `bytes` bytes (2 or 10, `mspi.c`'s SHORT_READ and
+/// LONG_READ; any other length is stop 0x61) of the RAM chip's array under
+/// the gate, at the description's divider, and answer the stop code (0 when
+/// none). `ticks` is SYSTIMER's count across the call, at 16 MHz.
+public func psram_time_reads(expect: UInt, record: UInt, bytes: UInt,
+                             count: UInt, ticks: &var UInt64) unsafe -> UInt {
+    let timer = Systimer()
+    timer.start()
+    let before = timer.now()
+    let stop = sos_psram_time_reads(expect, record, bytes, count)
+    ticks = timer.now() - before
+    stop
+}
+
+/// `digits` hex digits of `v`, after `0x`.
+func psram_hex(v: UInt, digits: Int) unsafe {
+    console_str("0x")
+    var shift: Int = (digits - 1) * 4
+    while shift >= 0 {
+        let d = (v >> shift) & 0xF
+        let c = if d < 10 { d + 48 } else { d + 87 }
+        console_byte(c as UInt8)
+        shift -= 4
+    }
+}
+
+/// The eFuse's PSRAM_CAP code by name (efuse/esp32s3/esp_efuse_table.csv).
+func psram_cap_name(code: UInt) -> String {
+    if code == 0 { return "none" }
+    if code == 1 { return "8 MiB" }
+    if code == 2 { return "2 MiB" }
+    "16 MiB"
+}
+
+/// The eFuse's PSRAM_VENDOR code by name (the same table).
+func psram_vendor_name(code: UInt) -> String {
+    if code == 0 { return "none" }
+    if code == 1 { return "AP 3.3 V" }
+    if code == 2 { return "AP 1.8 V" }
+    "unnamed"
+}
+
+/// MR2's density field by size (IDF esp_psram/esp32s3/
+/// esp_psram_impl_octal.c, `s_print_psram_info`'s table).
+func psram_density_name(code: UInt) -> String {
+    if code == 1 { return "4 MiB" }
+    if code == 3 { return "8 MiB" }
+    if code == 5 { return "16 MiB" }
+    if code == 7 { return "32 MiB" }
+    if code == 6 { return "64 MiB" }
+    "no size"
+}
+
+/// What a command of the call is, by its command word and address.
+func psram_command_name(command: UInt, address: UInt) -> String {
+    if command == 0xC0C0 { return "MR0 write" }
+    if command == 0x0000 { return "array read" }
+    if address == 0 { return "MR0/MR1 read" }
+    if address == 2 { return "MR2/MR3 read" }
+    if address == 4 { return "MR4 read" }
+    "MR8 read"
+}
+
+/// The tail of a wait's line: every wait in the call reads SPI_MEM_CMD(1) at
+/// most `mspi.c`'s POLL_BOUND times.
+func psram_polls() unsafe {
+    console_str(" after 100000 polls")
+}
+
+func psram_command(command: UInt, address: UInt) unsafe {
+    psram_hex(command, 4)
+    console_str(" (")
+    console_str(psram_command_name(command, address))
+    console_str(")")
+}
+
+/// Print the line for the stop `stop` that `psram_bringup` or
+/// `psram_time_reads` answered, from the description at `expect` and the
+/// record at `record`. For 0x50 neither is read: the line names the two
+/// addresses.
+public func psram_stop_line(expect: UInt, record: UInt, stop: UInt) unsafe {
+    console_str("SOS-S3: psram stop: ")
+    if stop == PSRAM_STOP_NOT_DRAM {
+        console_str("bring-up record at 0x")
+        console_hex(record)
+        console_str(" or expectation at 0x")
+        console_hex(expect)
+        console_str(" is not in DRAM\n")
+        return
+    }
+    let e = UnsafeMemory<PsramExpect, Normal>(expect)
+    let r = UnsafeMemory<PsramRecord, Normal>(record)
+    let read = r.read.read() as UInt
+    let command = r.command.read() as UInt
+    let address = r.address.read() as UInt
+    if stop == PSRAM_STOP_EFUSE {
+        let want_cap = e.efuse_cap.read() as UInt
+        let want_vendor = e.efuse_vendor.read() as UInt
+        console_str("efuse word 0x60007054 = 0x")
+        console_hex(read)
+        console_str(" says PSRAM_CAP=")
+        psram_hex((read >> 3) & 3, 1)
+        console_str(" PSRAM_VENDOR=")
+        psram_hex((read >> 7) & 3, 1)
+        console_str(", the board says ")
+        psram_hex(want_cap, 1)
+        console_str(" (")
+        console_str(psram_cap_name(want_cap))
+        console_str(") and ")
+        psram_hex(want_vendor, 1)
+        console_str(" (")
+        console_str(psram_vendor_name(want_vendor))
+        console_str(")\n")
+    } else if stop == PSRAM_STOP_PAD_HELD {
+        console_str("pads held, RTC_CNTL_DIG_PAD_HOLD = 0x")
+        console_hex(read)
+        console_str(", the board needs pads 26-28 and 33-37 free\n")
+    } else if stop == PSRAM_STOP_CLOCK {
+        console_str("clock SYSCLK_CONF=0x")
+        console_hex(r.sysclk.read() as UInt)
+        console_str(" CPU_PER_CONF=0x")
+        console_hex(r.cpu_per.read() as UInt)
+        console_str(" CORE_CLK_SEL=")
+        psram_hex(r.core_clk_sel.read() as UInt, 1)
+        console_str(", the board's PSRAM divider is for SYSCLK_CONF&0x80fff=0x")
+        console_hex(e.sysclk.read() as UInt)
+        console_str(" CPU_PER_CONF&7=")
+        psram_hex(e.cpu_per.read() as UInt, 1)
+        console_str(" CORE_CLK_SEL=")
+        psram_hex(e.core_clk_sel.read() as UInt, 1)
+        console_str("\n")
+    } else if stop == PSRAM_STOP_BUSY_BEFORE {
+        console_str("SPI1 busy before any command, SPI_MEM_CMD = 0x")
+        console_hex(read)
+        psram_polls()
+        console_str("\n")
+    } else if stop == PSRAM_STOP_ECC {
+        console_str("SYSCON_SRAM_ACE0_ATTR = 0x")
+        console_hex(read)
+        console_str(" still has ECC on after clearing it\n")
+    } else if stop == PSRAM_STOP_GATE {
+        console_str("SPI1 MISC = 0x")
+        console_hex(read)
+        console_str(" after selecting CS1 alone; nothing was sent\n")
+    } else if stop == PSRAM_STOP_BUSY_COMMAND {
+        console_str("SPI1 busy before command ")
+        psram_command(command, address)
+        console_str(", SPI_MEM_CMD = 0x")
+        console_hex(read)
+        psram_polls()
+        console_str("\n")
+    } else if stop == PSRAM_STOP_GATE_LOST {
+        console_str("SPI1 MISC = 0x")
+        console_hex(read)
+        console_str(" before command ")
+        psram_command(command, address)
+        console_str("; not sent\n")
+    } else if stop == PSRAM_STOP_NOT_FINISHED {
+        console_str("SPI1 command ")
+        psram_command(command, address)
+        console_str(" did not finish, SPI_MEM_CMD = 0x")
+        console_hex(read)
+        psram_polls()
+        console_str("; CS0 left disabled\n")
+    } else if stop == PSRAM_STOP_VENDOR {
+        let want = e.vendor.read() as UInt
+        console_str("MR1 vendor = ")
+        psram_hex(read, 2)
+        console_str(", the board says ")
+        psram_hex(want, 2)
+        if want == 0x0D { console_str(" (AP Memory)") }
+        console_str("\n")
+    } else if stop == PSRAM_STOP_DIE {
+        console_str("MR2 = ")
+        psram_hex(read, 2)
+        console_str(" has the good-die bit clear, the board says a good die\n")
+    } else if stop == PSRAM_STOP_DENSITY {
+        let want = e.density.read() as UInt
+        console_str("MR2 density = ")
+        psram_hex(read, 1)
+        console_str(" (")
+        console_str(psram_density_name(read))
+        console_str("), the board says ")
+        psram_hex(want, 1)
+        console_str(" (")
+        console_str(psram_density_name(want))
+        console_str(")\n")
+    } else if stop == PSRAM_STOP_MR0 {
+        console_str("MR0 = ")
+        psram_hex(read, 2)
+        console_str(" after writing 0x28\n")
+    } else if stop == PSRAM_STOP_READ_LENGTH {
+        console_str("a timing read of 0x")
+        console_hex(read)
+        console_str(" bytes; the measurement reads 2 or 10\n")
+    } else {
+        console_str("code 0x")
+        console_hex(stop)
+        console_str(", which this kernel does not name\n")
+    }
+}
+
+/// SPI1's base (IDF reg_base.h, DR_REG_SPI1_BASE), for the words below.
+static PSRAM_SPI1_BASE: UInt = 0x6000_2000
+
+/// How many words the bring-up saves at S5 and puts back at S10.
+public static PSRAM_SPI1_WORDS: Int = 11
+
+/// The offset from SPI1's base of the `i`th word the bring-up saves, in
+/// `mspi.c`'s order (IDF spi_mem_reg.h, SPI_MEM_<NAME>_REG(1)).
+func psram_spi1_offset(i: Int) -> UInt {
+    if i == 0 { return 0x14 }       // CLOCK
+    if i == 1 { return 0x08 }       // CTRL
+    if i == 2 { return 0x18 }       // USER
+    if i == 3 { return 0x1C }       // USER1
+    if i == 4 { return 0x20 }       // USER2
+    if i == 5 { return 0x04 }       // ADDR
+    if i == 6 { return 0x24 }       // MOSI_DLEN
+    if i == 7 { return 0x28 }       // MISO_DLEN
+    if i == 8 { return 0x3C }       // CACHE_FCTRL
+    if i == 9 { return 0xE0 }       // DDR
+    0x34                            // MISC
+}
+
+func psram_spi1_name(i: Int) -> String {
+    if i == 0 { return "clock" }
+    if i == 1 { return "ctrl" }
+    if i == 2 { return "user" }
+    if i == 3 { return "user1" }
+    if i == 4 { return "user2" }
+    if i == 5 { return "addr" }
+    if i == 6 { return "mosi_dlen" }
+    if i == 7 { return "miso_dlen" }
+    if i == 8 { return "fctrl" }
+    if i == 9 { return "ddr" }
+    "misc"
+}
+
+/// Read the words the bring-up saves into `words`, for a harness to compare
+/// across the call. Each register is read; nothing is written.
+public func psram_spi1_words(words: &var [UInt32; 11]) unsafe {
+    var i = 0
+    while i < PSRAM_SPI1_WORDS {
+        words[i] = UnsafeMemory<UInt32, Device>(
+            PSRAM_SPI1_BASE + psram_spi1_offset(i)).read()
+        i += 1
+    }
+}
+
+/// Print, for a harness, SPI1's MISC and clock as they read now, and whether
+/// every word the bring-up saves reads as it did in `before`, naming each one
+/// that does not.
+public func psram_spi1_line(before: &[UInt32; 11]) unsafe {
+    var after: [UInt32; 11] = [0; 11]
+    psram_spi1_words(&var after)
+    console_str("SOS psram: SPI1 MISC=0x")
+    console_hex(after[10] as UInt)
+    console_str(" clock=0x")
+    console_hex(after[0] as UInt)
+    var same = true
+    var i = 0
+    while i < PSRAM_SPI1_WORDS {
+        if after[i] != before[i] {
+            if same { console_str(" after the call, differing:") }
+            same = false
+            console_str(" ")
+            console_str(psram_spi1_name(i))
+            console_str("=0x")
+            console_hex(before[i] as UInt)
+            console_str("->0x")
+            console_hex(after[i] as UInt)
+        }
+        i += 1
+    }
+    if same { console_str(" after the call, as before it") }
+    console_str("\n")
+}

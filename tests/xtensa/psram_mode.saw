@@ -1,0 +1,124 @@
+// The PSRAM's mode register written, then the measurement of the memory-SPI
+// clock: the bring-up's steps S0 to S9 and S10, then `psram_time_reads`
+// twice (../../hal/xtensa-esp32s3/ABI.md §16, board stage P2). The
+// description is the case's (`sos_psram_case`), as in `psram_identity.saw`.
+//
+//   SOS psram: MR0=... before, 0x28 written, MR0=... after
+//   SOS psram: 1000 reads of 2 bytes took N ticks, of 10 bytes M ticks
+//   SOS psram: core clock F MHz by 4 clocks x D per read
+//   SOS psram: SPI1 MISC=... clock=... after the call, as before it
+//   SOS-S3: halt pass
+//
+// The reads take 2 and 10 bytes of the RAM chip's array: in octal DTR the
+// 8 bytes more are 4 SPI clocks, so the difference over READS reads is
+// 4 x D x READS core clocks, D the divider, and SYSTIMER counts it at 16 MHz;
+// what each read costs besides cancels. A 10-byte read holds the chip select
+// low about as long as a mode-register command; a 64-byte one would hold it
+// twice as long and more (ABI.md §16b). Every number on the second and
+// third lines is the part's, or host time on the emulator, and is printed,
+// not asserted.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_psram_case() -> UInt
+}
+
+/// The record's place in the case's block, as in `psram_identity.saw`.
+static RECORD_OFFSET: UInt = 68
+
+static READS: UInt = 1000
+static SHORT_READ: UInt = 2
+static LONG_READ: UInt = 10
+/// The SPI clocks the long read's extra bytes take: two bytes a clock.
+static EXTRA_CLOCKS: UInt64 = 4
+/// SYSTIMER's ticks per microsecond: it counts the crystal's 40 MHz over
+/// 2.5 (ABI.md §6a).
+static TICKS_PER_US: UInt64 = 16
+
+func word(name: String, v: UInt32) unsafe {
+    console().write_str(name)
+    console().write_hex(v as UInt)
+}
+
+func decimal(v: UInt64) unsafe {
+    var digits: [UInt8; 20] = [0; 20]
+    var n = 0
+    var rest = v
+    while true {
+        digits[n] = UInt8.from(truncating: rest % 10) + 48
+        n += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    while n > 0 {
+        n -= 1
+        hal.console_byte(digits[n])
+    }
+}
+
+/// The divider a clock word encodes (IDF mspi_timing_tuning_ll.h,
+/// `mspi_timing_ll_set_psram_clock`): 1 when SCLK_EQU_SYSCLK (bit 31) is
+/// set, else SCLKCNT_N [23:16] plus one.
+func divider_of(w: UInt32) -> UInt64 {
+    if (w >> 31) != 0 { return 1 }
+    (((w >> 16) & 0xFF) as UInt64) + 1
+}
+
+func stopped(expect: UInt, record: UInt, stop: UInt,
+             before: &[UInt32; 11]) unsafe {
+    hal.psram_stop_line(expect, record, stop)
+    hal.psram_spi1_line(&before)
+    hal.exit_fail(stop)
+}
+
+@export("kmain")
+func kmain() unsafe {
+    let expect = sos_psram_case()
+    let record = expect + RECORD_OFFSET
+    var before: [UInt32; 11] = [0; 11]
+    hal.psram_spi1_words(&var before)
+    let stop = hal.psram_bringup(expect, record, hal.PSRAM_THROUGH_S9)
+    if stop != 0 {
+        stopped(expect, record, stop, &before)
+    }
+    let r = UnsafeMemory<hal.PsramRecord, Normal>(record)
+    word("SOS psram: MR0=", r.mr01.read() & 0xFF)
+    console().write_str(" before, 0x28 written, ")
+    word("MR0=", r.mr01_after.read() & 0xFF)
+    console().write_str(" after\n")
+
+    var short_ticks: UInt64 = 0
+    var long_ticks: UInt64 = 0
+    let short_stop = hal.psram_time_reads(expect, record, SHORT_READ, READS,
+                                          &var short_ticks)
+    if short_stop != 0 {
+        stopped(expect, record, short_stop, &before)
+    }
+    let long_stop = hal.psram_time_reads(expect, record, LONG_READ, READS,
+                                         &var long_ticks)
+    if long_stop != 0 {
+        stopped(expect, record, long_stop, &before)
+    }
+    console().write_str("SOS psram: 1000 reads of 2 bytes took ")
+    decimal(short_ticks)
+    console().write_str(" ticks, of 10 bytes ")
+    decimal(long_ticks)
+    console().write_str(" ticks\n")
+    let divider = divider_of(UnsafeMemory<hal.PsramExpect, Normal>(expect)
+                             .divider.read())
+    console().write_str("SOS psram: core clock ")
+    if long_ticks > short_ticks {
+        decimal(EXTRA_CLOCKS * divider * (READS as UInt64) * TICKS_PER_US
+                / (long_ticks - short_ticks))
+        console().write_str(" MHz")
+    } else {
+        console().write_str("not measured: the long reads took no longer")
+    }
+    console().write_str(" by 4 clocks x ")
+    decimal(divider)
+    console().write_str(" per read\n")
+    hal.psram_spi1_line(&before)
+    hal.exit_pass()
+}

@@ -1,0 +1,120 @@
+// The PSRAM's identity, read and checked, nothing written to the RAM chip:
+// the bring-up's steps S0 to S8, then S10 (../../hal/xtensa-esp32s3/ABI.md
+// §16, board stage P1). The description it passes is the case's, which the
+// runner writes beside the image (`sos_psram_case`): the emulator's clock
+// words for the smoke, the part's at the image's clock key for a board image.
+//
+//   SOS psram: efuse PSRAM_CAP=... PSRAM_VENDOR=...
+//   SOS psram: sysclk=... cpu_per=... core_clk_sel=... spi0 clock=...
+//              sram_clk=... spi1 clock=...
+//   SOS psram: SPI1 MISC=... before the first command
+//   SOS psram: MR0=... MR1=... MR2=... MR3=... MR4=... MR8=...
+//   SOS psram: MR0/MR1 read took ... CCOUNT cycles
+//   SOS psram: pads 26=... 27=... 28=... 33=... ... 37=... insel 2=... 3=...
+//              7=... ... 11=...
+//   SOS psram: SPI1 MISC=... clock=... after the call, as before it
+//   SOS-S3: halt pass
+//
+// A stop prints its line, then the SPI1 line, and halts with its code.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_psram_case() -> UInt
+}
+
+/// Where the case's block holds the record, after the description (32
+/// bytes) and the fault harness's nine words (36): the runner's
+/// `_psram_case_asm` lays it out.
+static RECORD_OFFSET: UInt = 68
+
+/// SPI0's clock and PSRAM clock words (IDF spi_mem_reg.h,
+/// SPI_MEM_CLOCK_REG(0), SPI_MEM_SRAM_CLK_REG(0)), printed after the call.
+static SPI0_CLOCK: UInt = 0x6000_3014
+static SPI0_SRAM_CLK: UInt = 0x6000_3050
+
+/// The pads S1 writes and the input signals it routes past the GPIO matrix,
+/// read back after the call: IO_MUX_GPIOn_REG is IO_MUX + 4 + 4n, and
+/// GPIO_FUNCn_IN_SEL_CFG_REG is GPIO + 0x154 + 4n (IDF io_mux_reg.h,
+/// gpio_reg.h).
+static IO_MUX_GPIO0: UInt = 0x6000_9004
+static GPIO_FUNC0_IN_SEL: UInt = 0x6000_4154
+static PAD_COUNT: Int = 8
+static PADS: [UInt; 8] = [26, 27, 28, 33, 34, 35, 36, 37]
+static SIGNAL_COUNT: Int = 7
+static SIGNALS: [UInt; 7] = [2, 3, 7, 8, 9, 10, 11]
+
+/// A number below 100 in decimal.
+func number(n: UInt) unsafe {
+    if n >= 10 {
+        hal.console_byte(((n / 10) + 48) as UInt8)
+    }
+    hal.console_byte(((n % 10) + 48) as UInt8)
+}
+
+func word(name: String, v: UInt32) unsafe {
+    console().write_str(name)
+    console().write_hex(v as UInt)
+}
+
+@export("kmain")
+func kmain() unsafe {
+    let expect = sos_psram_case()
+    let record = expect + RECORD_OFFSET
+    var before: [UInt32; 11] = [0; 11]
+    hal.psram_spi1_words(&var before)
+    let stop = hal.psram_bringup(expect, record, hal.PSRAM_THROUGH_S8)
+    if stop != 0 {
+        hal.psram_stop_line(expect, record, stop)
+        hal.psram_spi1_line(&before)
+        hal.exit_fail(stop)
+    }
+    let r = UnsafeMemory<hal.PsramRecord, Normal>(record)
+    let efuse = r.efuse.read()
+    word("SOS psram: efuse PSRAM_CAP=", (efuse >> 3) & 3)
+    word(" PSRAM_VENDOR=", (efuse >> 7) & 3)
+    console().write_str("\n")
+    word("SOS psram: sysclk=", r.sysclk.read())
+    word(" cpu_per=", r.cpu_per.read())
+    word(" core_clk_sel=", r.core_clk_sel.read())
+    word(" spi0 clock=", UnsafeMemory<UInt32, Device>(SPI0_CLOCK).read())
+    word(" sram_clk=", UnsafeMemory<UInt32, Device>(SPI0_SRAM_CLK).read())
+    word(" spi1 clock=", r.spi1_clock.read())
+    console().write_str("\n")
+    word("SOS psram: SPI1 MISC=", r.misc_gate.read())
+    console().write_str(" before the first command\n")
+    let mr01 = r.mr01.read()
+    let mr23 = r.mr23.read()
+    word("SOS psram: MR0=", mr01 & 0xFF)
+    word(" MR1=", mr01 >> 8)
+    word(" MR2=", mr23 & 0xFF)
+    word(" MR3=", mr23 >> 8)
+    word(" MR4=", r.mr4.read())
+    word(" MR8=", r.mr8.read())
+    console().write_str("\n")
+    word("SOS psram: MR0/MR1 read took ", r.mr_cycles.read())
+    console().write_str(" CCOUNT cycles\n")
+    console().write_str("SOS psram: pads")
+    var i = 0
+    while i < PAD_COUNT {
+        let pad = PADS[i]
+        console().write_str(" ")
+        number(pad)
+        word("=", UnsafeMemory<UInt32, Device>(IO_MUX_GPIO0 + 4 * pad).read())
+        i += 1
+    }
+    console().write_str(" insel")
+    i = 0
+    while i < SIGNAL_COUNT {
+        let signal = SIGNALS[i]
+        console().write_str(" ")
+        number(signal)
+        word("=", UnsafeMemory<UInt32, Device>(GPIO_FUNC0_IN_SEL + 4 * signal)
+                  .read())
+        i += 1
+    }
+    console().write_str("\n")
+    hal.psram_spi1_line(&before)
+    hal.exit_pass()
+}

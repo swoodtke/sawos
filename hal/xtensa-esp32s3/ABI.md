@@ -1757,6 +1757,16 @@ a board" is the order to find out in.
   `boot`, `timer_tick` and `bus_probe` stay on their halt line, and a kernel
   fault stays on its fault line.
 - **GPIO and LEDC** are absent here (§9): the first LED is a real-board test.
+- **The PSRAM's bus.** The emulator models the octal chip's mode registers
+  and array, the eFuse word from a file and the flash's chip select (§16e),
+  but not SPI0, the IO MUX, the GPIO matrix, line modes, dummy cycles or
+  any clock: a command finishes inside the store that starts it, and SPI1's
+  MISC reads 0 at boot where a part reads `0x00000002` (§15c). The system
+  and CPU clock words read the PLL at 320 MHz under every key (§14e).
+  *Prepared for:* the bring-up's description carries the emulator's clock
+  words in the smoke and the part's in a board image (§16a); every wait is
+  bounded and every stop is reached by the fault build (§16e). *Unprobed on
+  silicon:* the whole bring-up (§16f).
 
 ---
 
@@ -2726,31 +2736,550 @@ prints every word it does not assert.
 
 ### 15c. On the part
 
-A cell is empty until a board run fills it. The filled cells are a run on
-an ESP32-S3 rev v0.2 whose ROM is `esp32s3-20210327`; the pad words are
-decoded in §9c. The clock words are in §14h and are not repeated here; a
-run's `sysclk`, `cpu_per`, `core_clk_sel` and `spi1 clock` should agree with
-them.
+From a board run of the probe, ESP32-S3 rev v0.2, ROM `esp32s3-20210327`,
+after a power-on reset; esptool read the same part as "Embedded PSRAM 8MB
+(AP_3v3)". The clock words agree with §14h. Each field is read with the
+positions ESP-IDF v5.4.1's headers give: `efuse_reg.h`, `system_reg.h`,
+`spi_mem_reg.h`, `extmem_reg.h`, `io_mux_reg.h` (MCU_SEL [14:12], FUN_DRV
+[11:10], FUN_IE [9], FUN_PU [8], FUN_PD [7]) and `gpio_reg.h`.
 
 | word | part |
 |---|---|
-| `sys3`, `sys4` | |
-| `PSRAM_CAP`, `PSRAM_VENDOR` | |
-| `strap`, `sdio_conf` | |
-| `sysclk`, `cpu_per`, `core_clk_sel` | |
-| `perip_clk_en0`, `perip_rst_en0` | `0xf9c1e06f`, `0x00000000` |
-| `spi0 clock`, `sram_clk`, `ctrl`, `user`, `user1`, `user2`, `misc` | |
-| `spi0 fctrl`, `sctrl`, `sram_cmd`, `drd`, `dwr` | |
-| `spi0 ddr`, `smem_ddr`, `smem_ac`, `date` | |
-| `spi1 clock`, `ctrl`, `user`, `user1`, `user2` | |
-| `spi1 misc`, `fctrl`, `ddr`, `cmd` | |
-| `dcache_ctrl`, `dcache_ctrl1`, `dcache_autoload`, `icache_ctrl` | |
-| `mmu` 0, 32, 127, 128, 255, 256, 383, 511 | |
-| `iomux pin_ctrl`, pads 14, 21 | `0x0000a7ff`, `0x00000a00`, `0x00000800` |
-| `iomux` pads 26 to 32 (CS1, then the flash's) | |
-| `iomux` pads 33 to 37 (the PSRAM's D4 to D7, DQS) | |
+| `sys3`, `sys4` | `0x03080000`, `0x64d0a6c8` |
+| `PSRAM_CAP`, `PSRAM_VENDOR` | 1 (8 MiB), 1 (AP at 3.3 V) |
+| `strap`, `sdio_conf` | `0x00000008`, `0x0ab0be0a` |
+| `sysclk`, `cpu_per`, `core_clk_sel` | `0x000a8001`, `0x0000000c`, 0: the crystal over 2, as §14h |
+| `perip_clk_en0`, `perip_rst_en0` | `0xf9c1e06f`, 0 |
+| `spi0 clock`, `sram_clk`, `ctrl`, `user`, `user1`, `user2`, `misc` | `0x00030103` and `0x00030103`, both divide by 4; `ctrl` `0x00200000`, no fast-read and no multi-line bit: the flash in slow read on one line; `user` `0x000000c0`, USR_DUMMY [29] clear, so no dummy is sent whatever `user1` holds; `user1` `0x5c000007` (a 24-bit address, a dummy field of 8 cycles); `user2` `0x70000003` (an 8-bit command, 0x03 READ); `misc` 0 |
+| `spi0 fctrl`, `sctrl`, `sram_cmd`, `drd`, `dwr` | `0x00000005` (CACHE_REQ_EN, CACHE_FLASH_USR_CMD), `0x0055c070`, CACHE_SCTRL's reset default: CACHE_SRAM_USR_RCMD and CACHE_SRAM_USR_WCMD set, a 24-bit address (SRAM_ADDR_BITLEN 23), a read dummy of 2 cycles (USR_RD_SRAM_DUMMY [4] set, SRAM_RDUMMY_CYCLELEN 1, which holds the cycles less one), no write dummy (USR_WR_SRAM_DUMMY [3] clear, though SRAM_WDUMMY_CYCLELEN holds 1), SRAM_OCT clear, 0, 0, 0: the PSRAM's commands not set |
+| `spi0 ddr`, `smem_ddr`, `smem_ac`, `date` | 0, `0x00003020`; `smem_ac` `0x0000b107`, CS_SETUP and CS_HOLD set, CS_SETUP_TIME 1, CS_HOLD_TIME 2, CS_HOLD_DELAY 0, the ROM's `SPI_init` words (§16c's S2 changes them); `date` `0x02101040`, SPICLK_PAD_DRV_CTL_EN [4] clear, so the clock pad's drive is pad 30's own `FUN_DRV` |
+| `spi1 clock`, `ctrl`, `user`, `user1`, `user2` | `0x00030103`, `0x00208000`, `0x80000000`, `0x5c000007`, `0x70000000` |
+| `spi1 misc`, `fctrl`, `ddr`, `cmd` | `0x00000002` (CS1_DIS: chip select 1 off, 0 on), 0, 0, 0: idle |
+| `dcache_ctrl`, `dcache_ctrl1`, `dcache_autoload`, `icache_ctrl` | `0x00000001`: the data cache on, 32 KiB, 16-byte lines; 0, its bus open; `0x00000008`, no autoload; `0x00000001`: the instruction cache on, 16 KiB, 16-byte lines |
+| `mmu` 0, 32, 127, 128, 255, 256, 383, 511 | each entry its own index: flash pages 0 to 511, valid |
+| `iomux pin_ctrl`, pads 14, 21 | `0x0000a7ff`; `0x00000a00`, `0x00000800` |
+| `iomux` pads 26 to 32 (CS1, then the flash's) | 26, 27, 28 `0x00001b00`: function 1 (GPIO), pull-up, input, drive 2; 29 to 32 `0x00000b00`: function 0 (SPICS0, SPICLK, SPIQ, SPID), pull-up, input, drive 2 |
+| `iomux` pads 33 to 37 (the PSRAM's D4 to D7, DQS) | `0x00000a00` each: function 0 (`FUNC_GPIO3n_GPIO3n_0`), no pull, input, drive 2. Not the PSRAM's function 4: S1 sets it |
 | `iomux` pads 41, 42, 47 | `0x00000a00`, `0x00000a00`, `0x00001a00` |
-| `insel` 7 to 11 | |
-| `pad_hold`, `ace0` | |
-| `rtc_pad21`, `rtc_pad21_mux_sel` | `0x50000000`, `0x00000000` |
-| `rom_dummy_ptr`, `rom_dummy_spi0`, `rom_dummy_spi1` | |
+| `insel` 7 to 11 | `0x0000003c` each: SIG_IN_SEL [7] clear, the signal straight from the IO MUX |
+| `pad_hold`, `ace0` | 0, no pad held; `0x000000ff`, ECC [8] off |
+| `rtc_pad21`, `rtc_pad21_mux_sel` | `0x50000000`, 0 |
+| `rom_dummy_ptr`, `rom_dummy_spi0`, `rom_dummy_spi1` | `0x3fcef6a4`, 0, 0: the ROM adds no dummy cycle to either controller's commands |
+
+What the bring-up (§16) takes from it: the eFuse is the 8 MiB AP part at
+3.3 V; no pad is held and ECC is off, so S0.2 and S3 pass and S3 writes
+nothing; SPI1 is idle with chip select 1 off, which S10 puts back; the pads
+the PSRAM needs are not yet at its functions (26, 27 and 28 are GPIOs, 33
+to 37 are at function 0) and S1 is what sets them; 27 and 28 are the
+flash's HD and WP, which the ROM's boot leaves GPIOs because the flash reads
+on one line, and the octal bus's D3 and D2, so S1 gives them function 0 as
+ESP-IDF's pin setup does; the pads the flash reads on (29 to 32) are the
+ROM's and S1 does not touch them; and the ROM's extra dummy is 0.
+
+Two departures from ESP-IDF's drive, both on the flash's pads. IDF's
+`esp_mspi_pin_init` follows the ROM's pin setup with
+`mspi_timing_set_pin_drive_strength`, which is
+`mspi_timing_ll_set_all_pin_drive(0, 3)` (hal/esp32s3/include/hal/
+mspi_timing_tuning_ll.h): drive 3 on pads 27, 28, 31, 32 and 33 to 37, and
+on the clock pad through SPI_MEM_DATE_REG(0). S1 gives drive 3 to 27 and
+28, now the PSRAM bus's, and to 33 to 37, but leaves 31 and 32 at the
+ROM's 2, since the running flash reads on them; and it leaves the clock
+pad as it is, pad 30's own 2 (SPICLK_PAD_DRV_CTL_EN clear), where IDF sets
+3 for both chips.
+
+---
+
+## 16. The PSRAM's command layer
+
+The part's 8 MiB octal PSRAM sits on the memory-SPI controller the flash
+uses, on its own chip select (CS1, pad 26) and data pads (the flash's four
+plus 33 to 37). Bringing it up means setting those pads, the controller's
+PSRAM timing and clocks, and the chip's mode register 0, with commands sent
+on SPI1; a command sent with the flash's chip select enabled goes to the
+flash. This section is the command layer: the bring-up's checks and its
+commands, steps S0 to S10, and the measurement that settles the memory-SPI
+core clock. Not built here: SPI0's PSRAM phases, the cache's map of the
+PSRAM, the read-back test and the board that brings the PSRAM up at boot
+(S11 onward). No image of the tree calls it but its harnesses.
+
+- `kernel/mspi.c` makes every step and every check, in one call from IRAM
+  (`sos_psram_bringup`), and returns at the first check that fails with a
+  record of what it read; `sos_psram_time_reads` is the measurement.
+- `kernel/lib.saw`'s PSRAM section passes the description, starts and reads
+  SYSTIMER around the measurement, and prints the line a stop's record says
+  (`psram_stop_line`).
+- `tests/xtensa/psram_identity.saw` (S0 to S8, S10), `psram_mode.saw` (S0 to
+  S10, then the measurement) and `psram_fault.saw` (the fault build, §16e)
+  are the harness kernels; the first two are board stages P1 and P2 (§16f).
+
+### 16a. The part, and the description
+
+The part (§15c): the eFuse's PSRAM_CAP 1 (8 MiB) and PSRAM_VENDOR 1 (AP at
+3.3 V), as esptool reports it. The chip the bring-up must then find: MR1's
+vendor 0x0D (AP Memory, IDF `OCT_PSRAM_VENDOR_ID`), MR2's good-die bit set
+and its density 3 (8 MiB). The bring-up compares each with a description
+and stops at the first that differs; it never infers a size.
+
+The description is eight words (`mspi.c`'s `struct sos_psram_expect`,
+`lib.saw`'s `PsramExpect`): the two eFuse codes, the vendor, the density,
+the divider word, and the three clock words the divider was chosen for,
+masked as S0.3 compares them. Here it is the harness's, written by the
+runner beside each image (`_psram_case_asm`, `PSRAM_DESCRIPTION`,
+`PSRAM_PART_CLOCK`, `PSRAM_EMULATOR_CLOCK` in `tools/sos_runner.py`): the
+part's codes, the divider word `0x00030103`, and the clock words of the
+image's target. A board image (`--emit-flash`) carries the part's words at
+the image's clock key; a smoke image carries the emulator's, which no key
+moves (§14e). The two are different machines as far as S0.3 is concerned,
+and the rule that the part matches its description exactly holds for each.
+
+### 16b. The memory-SPI core clock under each clock key, and the divider
+
+Commands on SPI1 run at SPI_MEM_CLOCK_REG(1), and cache fills from the PSRAM
+at SPI0's SPI_MEM_SRAM_CLK_REG; each is the memory-SPI core clock over its
+divider ("f_SPI_CLK = f_MSPI_CORE_CLK / (SPI_MEM_CLKCNT_N + 1)", IDF
+`spi_mem_reg.h`). The core clock is set by SPI_MEM_CORE_CLK_SEL and the PLL
+when the CPU runs on the PLL: at 480 MHz, 0 gives 80 MHz (the same header,
+`SPI_MEM_CORE_CLK_SEL`). On the crystal the sources do not say; three
+readings stay open, H1 the crystal (40 MHz), H2 a PLL-derived 80 MHz, H3 the
+system clock after the pre-divider. ESP-IDF v5.4.1's
+`mspi_timing_tuning_ll.h` for this part defines
+`MSPI_TIMING_LL_FLASH_CPU_CLK_SRC_BINDED` as 1, a bare define with no
+comment and nothing at that tag using it. Its name suggests that the
+memory-SPI clock's source is bound to the CPU's, which would make H2 the
+unlikely reading; no source states it. Board stage P2 measures it.
+
+What each clock key leaves (§14d, §14h), what S0.3 compares, and the bus at
+the divider every key uses, divide by 4:
+
+```
+key       SYSCLK_CONF  CPU_PER_CONF  CORE_CLK_SEL  core clock          bus at
+          & 0x80FFF    & 7                                             divide 4
+rom       0x00080001   0x4           0             H1 40, H2 80, H3 20  10, 20,
+                                                   MHz                  5 MHz
+xtal40    0x00080000   0x4           0             H1 40, H2 80, H3 40  10, 20,
+                                                                        10 MHz
+pll80     0x00080400   0x4           0             80 MHz: the PLL at   20 MHz
+                                                   480, CORE_CLK_SEL 0
+emulator  0x00080401   0x0           0             no clock modelled    -
+```
+
+`rom`'s and `xtal40`'s words are the part's as §14h prints them; `pll80`'s
+are its line's after the switch (`sysclk` `0x000a8400`, CLK_DIV_EN reading
+1 on the PLL too; `cpu_per` `0x0000000c`). `mspi_core` read 0 and
+`mspi_clock` `0x00030103` under every key on the part. The emulator's words
+read as the PLL at 320 MHz with CPUPERIOD_SEL 0 under every key, since it
+drops every store to both registers.
+
+So divide by 4 serves every key the smoke and the board use: the bus runs at
+5 to 20 MHz, never above the 20 MHz ESP-IDF first talks to the chip at
+(`mspi_timing_enter_low_speed_mode`'s `set_psram_clock(20, ...)`) and never
+above the 40 MHz past which it tunes octal PSRAM
+(`MSPI_TIMING_PSRAM_NEEDS_TUNING`, `mspi_timing_tuning_configs.h`). It is
+also the ROM's flash divider and SRAM_CLK's reset value, so S4's and S5's
+writes leave the words the part already holds. No key is refused; a clock
+key the runner has no part's words for is refused by name when a board
+image is built for it (`_psram_case_asm`). The divider for cache fills at
+20 MHz is a later choice, made once P2 has measured the core clock under
+the key the board uses: 4 under `pll80`, and under `rom` 2, 4 or 1 for H1,
+H2 or H3.
+
+A clock change after the bring-up would move every number above with it;
+no image of this tree makes one (§14d's keys run first, in `clock_init`),
+and S0.3 stops on any difference between the clock in force and the one the
+description names.
+
+**The bound.** Every wait reads SPI_MEM_CMD(1) at most `POLL_BOUND`,
+100,000, times. A mode-register command is under 100 SPI clocks (command 1,
+address 2, latency up to 20, data up to 2), under 20 us at 5 MHz. A read is
+a peripheral load and a branch, several core cycles, so the bound is over a
+millisecond at any CPU clock the part runs (240 MHz at most): fifty times
+the slowest command, and it ends a stuck controller's wait well inside a
+second at the slowest loop rate seen on the part.
+
+**The measurement's reads** are 2 and 10 bytes of the array and no other
+length (`sos_psram_time_reads` stops with 0x61 on any other), not 64: at
+5 MHz a 64-byte read holds the chip select low for 45 to 55 clocks, about
+10 us, longer than any mode-register command and than the cache fill the
+divider is chosen to avoid at that speed; a 10-byte read is about the
+length of a mode-register command. The 8 bytes more are 4 SPI clocks in
+octal DTR, so over 1,000 reads the difference is 4 x 4 x 1,000 core clocks,
+3,200 to 12,800 SYSTIMER ticks at 80 down to 20 MHz, and the core clock in
+MHz is 4 x 4 x 1,000 x 16 over the difference in ticks. The chip's own
+chip-select-low limit is in AP Memory's datasheet, which was not read.
+
+### 16c. The steps, their writes and their stops
+
+Register addresses are ESP-IDF v5.4.1's (`reg_base.h` bases plus each
+header's offsets); `mspi.c` names the header and field at each. "ROM" is the
+mask ROM's disassembly (§2a). Nothing below writes an eFuse, an RTC
+register, the flash, SPI0's flash-side registers, SPI_MEM_CORE_CLK_SEL or
+the pads the flash reads on (29 to 32). Pads 27 and 28, the flash's HD and
+WP, are the octal bus's D3 and D2, and S1 takes them over.
+
+```
+step  writes, in order                                  source
+entry the description and the record are DRAM            soc.h SOC_DRAM_LOW,
+      (0x3FC8_8000 to 0x3FD0_0000), by address alone     SOC_DRAM_HIGH
+S0.1  read EFUSE_RD_MAC_SPI_SYS_4 (0x6000_7054):         efuse_reg.h; the codes
+      PSRAM_CAP [4:3], PSRAM_VENDOR [8:7]                esp_efuse_table.csv
+S0.2  read RTC_CNTL_DIG_PAD_HOLD (0x6000_80DC):          ROM gpio_pad_unhold
+      bits 5 to 7 and 12 to 16 (pads 26 to 28, 33 to     (0x4005_0220-023E)
+      37, the pads S1 writes)
+S0.3  read SYSCLK_CONF (0x600C_0060), CPU_PER_CONF       system_reg.h,
+      (0x600C_0010), CORE_CLK_SEL (0x6000_30EC)          spi_mem_reg.h
+S0.4  read SPI_MEM_CMD(1) until 0, bounded
+S1    IO_MUX_GPIO26 (0x6000_906C): MCU_SEL 0 (SPICS1),   IDF s_init_psram_pins
+        FUN_DRV 3
+      IO_MUX_GPIO27, 28 (0x6000_9070, 0x6000_9074):      IDF esp_mspi_pin_init
+        MCU_SEL 0 (SPIHD, SPIWP), FUN_PD 0, FUN_PU 1,    (spi_flash/flash_ops.c)
+        FUN_IE 1, FUN_DRV 3                              -> ROM esp_rom_
+                                                         opiflash_pin_config,
+                                                         its default branch;
+                                                         gpio_pad_pullup,
+                                                         _input_enable; IDF
+                                                         mspi_timing_ll_set_
+                                                         all_pin_drive
+      IO_MUX_GPIO33..37 (0x6000_9088 + 4n): MCU_SEL 4,   ROM esp_rom_opiflash_
+        FUN_PD 0, FUN_PU 1, FUN_IE 1, FUN_DRV 3          pin_config (tables at
+                                                         0x3FF1_90A8),
+                                                         gpio_pad_pullup,
+                                                         _input_enable; IDF
+                                                         mspi_timing_ll_set_
+                                                         all_pin_drive
+      GPIO_FUNCn_IN_SEL_CFG, n 2, 3 and 7..11            ROM gpio_bypass_
+        (0x6000_4154 + 4n): SIG_IN_SEL [7] cleared       matrix_in; the
+                                                         signals of the ROM's
+                                                         table for pads 27,
+                                                         28 and 33 to 37
+S2    SPI_MEM_SPI_SMEM_AC(0) (0x6000_30DC): CS_SETUP,    IDF s_set_psram_cs_
+        CS_HOLD 1; CS_SETUP_TIME 3; CS_HOLD_TIME 3;      timing (OCT_PSRAM_*)
+        CS_HOLD_DELAY 2
+S3    SYSCON_SRAM_ACE0_ATTR (0x6002_6058) bit 8          IDF s_configure_psram_
+        cleared, only if it reads set                    ecc (ECC off)
+S4    SPI_MEM_SRAM_CLK(0) (0x6000_3050) = the divider    IDF mspi_timing_ll_
+                                                         set_psram_clock
+S5    save SPI1's CLOCK, CTRL, USER, USER1, USER2,       ROM esp_rom_opiflash_
+        ADDR, MOSI_DLEN, MISO_DLEN, CACHE_FCTRL, DDR,    backup_reg (it saves
+        MISC                                             five of them)
+      SPI_MEM_CLOCK(1) (0x6000_2014) = the divider       IDF mspi_timing_ll_
+                                                         set_flash_clock(1, _)
+      SPI_MEM_DDR(1) (0x6000_20E0): DDR_CMD_DIS [4],     ROM set_op_mode mode 7
+        WDAT_SWP [3], RDAT_SWP [2] cleared; VAR_DUMMY    (0x4004_DD48-DD69),
+        [1], DDR_EN [0] set                              set_dtr_swap_mode;
+                                                         IDF esp_psram_impl_
+                                                         enable (VAR_DUMMY)
+S6    SPI_MEM_MISC(1) (0x6000_2034) [1:0] = 0b01:        ROM esp_rom_spi_cmd_
+        CS0_DIS 1, CS1_DIS 0; read back                  start (0x4004_E0E2-
+                                                         E148)
+S7    per command: wait; CTRL(1) = (CTRL & 0xFE6F9C0F)   ROM reset_rw_mode's
+        | 0x2270 (FASTRD_MODE, FCMD_OCT, FADDR_OCT,      mask, mode 7's 0x2270
+        FDIN_OCT, FDOUT_OCT)                             (0x4004_DD3D)
+      USER(1) = (USER & 0x00FF0FFF) | COMMAND, ADDR,     ROM esp_rom_spi_cmd_
+        and DUMMY, MISO or MOSI as the command needs     config
+      USER1(1) = (31 << 26) | (dummy - 1);               the same; IDF
+        USER2(1) = (15 << 28) | command                  s_init_psram_mode_reg
+      ADDR(1) = address; CACHE_FCTRL(1) |= bit 1         the same (32-bit
+                                                         address)
+      MOSI_DLEN(1), W0(1) for a write; MISO_DLEN(1)
+        for a read
+      MISC(1) read again; then CMD(1) = SPI_MEM_USR      ROM esp_rom_spi_cmd_
+        (bit 18) alone; wait; W0(1) read                 start
+S8    MR0/MR1 read (0x4040, address 0, dummy 8, 16 bits) IDF s_get_psram_mode_
+      MR2/MR3 read (address 2), MR4 and MR8 reads        reg, OPI_PSRAM_REG_
+        (addresses 4, 8; 8 bits)                         READ, OCT_PSRAM_RD_
+                                                         REG_DUMMY_BITLEN
+S9    MR0 write (0xC0C0, address 0, 16 bits:             IDF s_init_psram_mode_
+        MR1 << 8 | (MR0 & 0xC0) | 0x28); MR0/MR1 read    reg, esp_psram_impl_
+        again                                            enable (lt 1, latency
+                                                         2, drive 0)
+S10   every word S5 saved written back, MISC last
+time  S5, S6; per read a command 0x0000 (address 0,     IDF OPI_PSRAM_SYNC_
+reads   dummy 18, 2 or 10 bytes in); S10                 READ, OCT_PSRAM_RD_
+                                                         DUMMY_BITLEN
+```
+
+S5's write to DDR(1) is the whole of the mode-7 entry of the ROM's
+`esp_rom_spi_set_op_mode`, which ESP-IDF calls for every PSRAM command:
+besides the CTRL bits S7 sets, it clears DDR_CMD_DIS and sets DDR_EN, so
+the command, address and data phases run on both clock edges. With
+VAR_DUMMY set, the word from the reset value is `0x00000003`.
+
+The only command word ever written to SPI_MEM_CMD(1) is SPI_MEM_USR. The
+bits beside it start the controller's built-in flash commands (21 deep
+power-down, 22 chip erase, 23 block erase, 24 sector erase, 25 page
+program, 26 write status, 30 write enable); none is written, and each
+destructive one also needs the flash's write-enable latch, which nothing
+sets.
+
+**The stops**, in the order the call makes them. Saw prints the line from
+the record, then the caller halts with the code as its status. "S10" says
+SPI1 is put back before the call returns.
+
+```
+0x50 entry  SOS-S3: psram stop: bring-up record at 0x........ or expectation
+            at 0x........ is not in DRAM
+0x51 S0.1   ... efuse word 0x60007054 = 0x........ says PSRAM_CAP=0x.
+            PSRAM_VENDOR=0x., the board says 0x. (N MiB) and 0x. (AP n V)
+0x52 S0.2   ... pads held, RTC_CNTL_DIG_PAD_HOLD = 0x........, the board
+            needs pads 26-28 and 33-37 free
+0x53 S0.3   ... clock SYSCLK_CONF=0x........ CPU_PER_CONF=0x........
+            CORE_CLK_SEL=0x., the board's PSRAM divider is for
+            SYSCLK_CONF&0x80fff=0x........ CPU_PER_CONF&7=0x. CORE_CLK_SEL=0x.
+0x54 S0.4   ... SPI1 busy before any command, SPI_MEM_CMD = 0x........ after
+            100000 polls
+0x55 S3     ... SYSCON_SRAM_ACE0_ATTR = 0x........ still has ECC on after
+            clearing it
+0x56 S6     ... SPI1 MISC = 0x........ after selecting CS1 alone; nothing
+            was sent                                                  (S10)
+0x57 S7.1   ... SPI1 busy before command 0x.... (name), SPI_MEM_CMD =
+            0x........ after 100000 polls                             (S10)
+0x58 S7.8   ... SPI1 MISC = 0x........ before command 0x.... (name); not
+            sent                                                      (S10)
+0x59 S7.9   SOS-S3: psram: SPI1 command 0x.... did not finish   (from IRAM)
+            ... SPI1 command 0x.... (name) did not finish, SPI_MEM_CMD =
+            0x........ after 100000 polls; CS0 left disabled       (no S10)
+0x5A S8.1   ... MR1 vendor = 0x.., the board says 0x0d (AP Memory)    (S10)
+0x5B S8.2   ... MR2 = 0x.. has the good-die bit clear, the board says a
+            good die                                                  (S10)
+0x5C S8.2   ... MR2 density = 0x. (N MiB), the board says 0x. (N MiB) (S10)
+0x5D S9.3   ... MR0 = 0x.. after writing 0x28                         (S10)
+0x61 time   ... a timing read of 0x........ bytes; the measurement reads 2
+            or 10                                    (before S5, nothing sent)
+```
+
+A command's name is `MR0/MR1 read`, `MR2/MR3 read`, `MR4 read`, `MR8 read`,
+`MR0 write` or `array read`. After 0x59 the call leaves MISC(1) holding the
+gate, chip select 0 disabled, so a transfer still under way cannot be
+turned towards the flash by a restore; its own line comes first, written to
+UART0 from IRAM, in case a controller stuck mid-command also stalls SPI0's
+fetches of the Saw that prints the full one. 0x57 restores SPI1 although
+SPI_MEM_CMD(1) reads busy, because no command of this call is under way
+then: the wait after the previous one read it finished, so the busy word is
+not a transfer of ours to CS1, while at 0x59 the command the call started
+may still be on the bus with CS1 selected. Before S5 nothing on SPI1 has
+changed, so the stops before it need no S10. 0x61 is the measurement's own:
+it asked for a length it never sends.
+
+### 16d. Nothing in flash: `check_iram`
+
+From S6 to S10 no instruction and no data may be fetched through the flash
+cache: SPI1 holds the gate or a command is under way. So `mspi.c`'s
+functions are all in `.text.iram`, whose literal pools the compiler puts in
+`.literal.iram`, and `esp32s3.ld`'s `.iram` holds both, copied to IRAM by
+`_start` with the vectors; it has no `const` data, no string, no jump
+table, no call out of the file, and its one line of text is a `.data`
+array named into its section, so the compiler cannot promote it to
+`.rodata`. Each of its sections is dropped by the link when nothing calls
+the layer, so every other image is the bytes it was without it.
+
+`check_iram` (`tools/sos_runner.py`) holds that on every S3 image the smoke
+links and every board image: it refuses, naming each finding, an `mspi.o`
+with an allocated section of non-zero size other than `.text.iram*`,
+`.literal.iram*`, `.data*` or `.bss*`; one that references a symbol it does
+not define; and a linked image in which a symbol `mspi.o` defines lies
+outside IRAM (0x4037_8000 to 0x4037_BFFF) and the kernel's DRAM
+(0x3FC8_C000 to 0x3FCA_FFFF). The smoke's `iram_mutant_*` cases build
+`mspi.c` with one slip added (`tests/xtensa/iram_mutants.c`) and require
+the check to refuse each with its finding: a constant table and a dense
+switch (`.rodata`), a 64-bit division (`__udivdi3`), a zeroed array
+(`memset`), a function without its section (`.text.sos_psram_mutant`), and
+the link script with its `.literal.iram .text.iram` line removed
+(`sos_psram_bringup` linked in flash). `iram_check_clean` requires it to
+pass the layer as it is, through the same path.
+
+### 16e. The emulator and the smoke
+
+The emulator's PSRAM is a model on SPI1's bus at CS1 (`hw/misc/ssi_psram.c`
+in espressif/qemu): `-m` sizes it (no `-m`, no chip), and it is a quad chip
+unless `-global ssi_psram.is_octal=true` is given; then its mode registers
+read as an AP chip's at power-on (MR0 0x09, MR1 0x0d, MR2 0x93, MR3 0x20,
+MR4 0x20, MR8 0x05), MR0 takes a write, and the density field follows `-m`
+(4 MiB 1, 8 MiB 3, 16 MiB 5). The arch entry's `psram_qemu_args` are the
+part's, `-m 8M -global ssi_psram.is_octal=true`. Found on these runs:
+
+- SPI1 runs a user command inside the store to SPI_MEM_CMD and reads
+  SPI_MEM_CMD 0 at once, so no wait can run out here; the fault build is
+  what reaches the waits' stops.
+- SPI1's MISC reads 0 at boot (the part reads `0x00000002`) and keeps what
+  is stored, as do the other words S5 saves: a stop without S10 shows them
+  changed (`psram_stop_not_finished`).
+- SPI0, the IO MUX and the GPIO matrix are not modelled and read 0 (§15b),
+  so what S1, S2 and S4 write cannot be read back here. The emulator's
+  `memory_region_ops_write` trace shows every store all the same, by its
+  whole address (the IO MUX lands in `esp32s3.iomem`, the input selects in
+  `esp32.gpio`, SPI0's words in `esp32s3.iomem`, SPI1's in
+  `ssi.esp32s3.spi`), and a case's `device_writes` holds the last store to
+  each address it names, its `device_stores` a store among them for a word
+  a later step puts back, and its `device_untouched` an address the kernel
+  stores nothing to: no store from `_start`'s first, the RTC watchdog's key
+  (§2e), on. The ROM's boot stores to pads 27 to 32 before the kernel runs,
+  leaving 29 and 30 at 0 and 31 and 32 at `0x200`; the last store to 27
+  and 28 is S1's.
+- The eFuse word is read from a file given with `-drive file=F,if=none,
+  format=raw,id=efuse -global driver=nvram.esp32s3.efuse,property=drive,
+  value=efuse`: six words of block 0, then block 1, so
+  EFUSE_RD_MAC_SPI_SYS_4 is bytes 40 to 43 (`0x88` for the part). With no
+  file it reads 0. The runner writes a fresh file for every run.
+- The flash model's trace (`-trace m25p80_command_decoded -D FILE`) shows
+  every command the flash decodes. On every PSRAM run it is the ROM's one
+  at boot, `0xab`; with the gate removed (MISC [1:0] written 0b00) each MR
+  read reaches the flash too, as `0x40`.
+- The timing reads finish on host time: the measurement prints a number
+  that means nothing here.
+
+**The fault build.** Every register read in `mspi.c` goes through `rd`;
+built with `-DSOS_PSRAM_FAULT`, `rd` consults the DRAM record
+`sos_psram_fault`, filled in by the harness before the call: the read at
+that step (`mspi.c`'s STEP_* values), in that command (1 for the call's
+first), of that address, returns the record's value that many times. Writes
+always reach the register. The record also counts the reads it answered,
+the commands started and the answers read. The case key `psram_fault`
+builds an image's profile with the define; the runner refuses any image
+that defines `sos_psram_fault` unless it is `psram_fault.saw`'s, and any
+board image that defines it (`check_psram_fault`; the cases
+`psram_fault_outside_harness` and `psram_fault_board_image`). An image
+the checks refuse is deleted from the build directory, and the board
+image's case requires that it is gone.
+
+**The cases.** Each PSRAM case boots with the case's description, its
+emulator arguments and eFuse file, and asserts its lines, its halt and the
+flash's trace (`flash_commands`, `["0xab"]`). "As before" is the SPI1 line
+`SPI1 MISC=0x00000000 clock=0x00030103 after the call, as before it`, every
+word S5 saves reading as it did before the call: untouched for a stop
+before S5, put back for one after. `psram_identity` also holds every word
+S1 stores, from the 0 each pad and input select reads here: pad 26
+`0x0c00`, pads 27 and 28 `0x0f00`, pads 33 to 37 `0x4f00`, the input
+selects 0; that pads 29 to 32 keep the ROM's words and that the kernel
+stores nothing to them, to pad 38, or to the input selects of signals 4 to
+6 and 12; and the four `_word` cases feed S1 the part's own words for pads
+27 and 28 (`0x1b00`, and for 28 `0x1b80`, its pull-down on too) and for
+signals 2 and 3's input selects (`0xbc`, bit 7 set), and hold what it
+stores (`0x0f00`, `0x3c`). `psram_identity` holds S2's and S4's stores to
+SPI0 too, from the 0 its words read here: SPI_MEM_SPI_SMEM_AC(0)
+`0x0400018f` (CS_SETUP, CS_HOLD, CS_SETUP_TIME 3, CS_HOLD_TIME 3,
+CS_HOLD_DELAY 2) and SPI_MEM_SRAM_CLK(0) `0x00030103`; and S5's store of
+`0x3` to SPI_MEM_DDR(1) (VAR_DUMMY and DDR_EN, the swaps and DDR_CMD_DIS
+clear), which S10 then puts back to 0; and two of S7's for a register
+read, SPI_MEM_CTRL(1) `0x0020a270` (the octal bits over the ROM's
+`0x00208000`) and SPI_MEM_USER1(1) `0x7c000007` (a 32-bit address, 8 dummy
+cycles).
+
+```
+case                              how                                   stop
+psram_identity                    P1; the identity lines; as before      -
+psram_mode                        P2; MR0 0x09 -> 0x28; as before        -
+psram_identity_commands           fault build, no fault: 4 commands,     -
+                                  4 answers read
+psram_pad27_word                  S1 on `0x1b00`: `0x0f00` stored        -
+psram_pad28_word                  S1 on `0x1b80`: `0x0f00` stored        -
+psram_insel2_word                 S1 on `0xbc`: `0x3c` stored            -
+psram_insel3_word                 S1 on `0xbc`: `0x3c` stored            -
+psram_identity_divider_2          P1 at divide by 2, `0x00010001`: SPI1  -
+                                  ran at it and its clock is put back
+psram_stop_expect_in_flash        description at 0x3c200000              0x50
+psram_stop_record_in_flash        record at 0x3c200000                   0x50
+psram_stop_time_reads_in_flash    the measurement, description in flash  0x50
+psram_stop_expect_past_dram       description at 0x3fcffff0, its end     0x50
+                                  past DRAM's
+psram_stop_read_length            the measurement asked for 64 bytes     0x61
+psram_stop_efuse_none             no eFuse file                          0x51
+psram_stop_efuse_16m              PSRAM_CAP 3                            0x51
+psram_stop_efuse_1v8              PSRAM_VENDOR 2                         0x51
+psram_stop_pad_held               S0.2's read: pad 26 held               0x52
+psram_stop_pad33_held             S0.2's read: pad 33 held               0x52
+psram_stop_pad37_held             S0.2's read: pad 37 held               0x52
+psram_stop_pad27_held             S0.2's read: pad 27 held               0x52
+psram_stop_pad28_held             S0.2's read: pad 28 held               0x52
+psram_stop_clock_pre_div          described SYSCLK_CONF with PRE_DIV 0   0x53
+psram_stop_clock_cpu_per          described CPU_PER_CONF 4               0x53
+psram_stop_clock_core             described CORE_CLK_SEL 1               0x53
+psram_stop_busy_before            S0.4's reads: busy, every one          0x54
+psram_stop_ecc                    S3's reads: ECC on, both               0x55
+psram_stop_gate                   S6's reads of MISC: 0b00               0x56
+psram_stop_busy_command           S7.1's reads in command 2: busy;       0x57
+                                  command 1 ran
+psram_stop_gate_lost              S7.8's read in command 1: 0b00; no     0x58
+                                  command started, no answer read
+psram_stop_not_finished           S7.9's reads in command 1: busy; the   0x59
+                                  call's line first, MISC left 0b01
+psram_stop_vendor_quad            `-m 8M`, the quad model: MR1 0         0x5A
+psram_stop_vendor_none            no `-m`: no chip                       0x5A
+psram_stop_die                    MR2's answer with bit 7 clear          0x5B
+psram_stop_density_4m             `-m 4M`, octal                         0x5C
+psram_stop_density_16m            `-m 16M`, octal                        0x5C
+psram_stop_mr0                    the sixth command's answer: MR0 0x09   0x5D
+```
+
+Every stop but 0x59 is followed by SPI1 as before. No case reaches 0x52,
+0x54 to 0x59 or 0x5B as a real event: the hardware conditions behind them
+(a held pad, ECC stuck on, a hung controller, the gate not taking) are read
+in the sources, not tested; their code paths are what the fault build
+tests.
+
+**What the emulator cannot show**, and only a part can: the words S1, S2,
+S4 and S5 store taking effect, which the cases hold only as stores (the
+pads' functions, pulls and drives, read back by P1's pads line; SPI0's
+chip-select timing and PSRAM clock; octal DTR on SPI1); the dummy cycles
+and SPI1's clock on the wire (S7); the chip's answers at power-on and after
+an earlier MR0 write; and the measured core clock.
+
+### 16f. The board stages
+
+Both images write the PSRAM's pads, SPI0's PSRAM timing and clock, SPI1
+(put back), and, for P2, the chip's MR0; nothing non-volatile. A power
+cycle undoes every one; a chip reset all but MR0, which the next bring-up
+reads at the same dummy either way. They are built with `python3
+tools/sos_runner.py --board esp32s3 --emit-flash psram_identity|psram_mode
+--clock KEY --out PATH`, the description carrying the part's clock words at
+KEY (§16b).
+
+**P1, `psram_identity`.** Expected, the cycle count printed for the record:
+
+```
+SOS psram: efuse PSRAM_CAP=0x00000001 PSRAM_VENDOR=0x00000001
+SOS psram: sysclk=<as §14h for KEY> cpu_per=0x0000000c
+           core_clk_sel=0x00000000 spi0 clock=0x00030103
+           sram_clk=0x00030103 spi1 clock=0x00030103
+SOS psram: SPI1 MISC=0x00000001 before the first command
+SOS psram: MR0=<v> MR1=0x0000000d MR2=<bit 7 set, [2:0] 3> MR3=<v>
+           MR4=<v> MR8=<v>
+SOS psram: MR0/MR1 read took <v> CCOUNT cycles
+SOS psram: pads 26=0x00000f00 27=0x00000f00 28=0x00000f00 33=0x00004f00
+           34=0x00004f00 35=0x00004f00 36=0x00004f00 37=0x00004f00 insel
+           2=0x0000003c 3=0x0000003c 7=0x0000003c 8=0x0000003c
+           9=0x0000003c 10=0x0000003c 11=0x0000003c
+SOS psram: SPI1 MISC=0x00000002 clock=0x00030103 after the call, as before it
+SOS-S3: halt pass
+```
+
+The pads line is S1's words read back on the part, from §15c's: pad 26
+from the GPIO function to SPICS1 with drive 3; 27 and 28 from the GPIO
+function to SPIHD and SPIWP with drive 3, their pull-up and input kept;
+33 to 37 to function 4 with the pull-up and drive 3; and every input
+select with bit 7 clear. Signals 2 and 3's selects were not read by the probe, so `3c`
+there is the expectation from signals 7 to 11's.
+
+(each wrapped line is one line). MR0 is the chip's power-on value after a
+power cycle and 0x28 after an earlier P2; both are expected.
+
+**P2, `psram_mode`.**
+
+```
+SOS psram: MR0=<v> before, 0x28 written, MR0=0x00000028 after
+SOS psram: 1000 reads of 2 bytes took <v> ticks, of 10 bytes <v> ticks
+SOS psram: core clock <v> MHz by 4 clocks x 4 per read
+SOS psram: SPI1 MISC=0x00000002 clock=0x00030103 after the call, as before it
+SOS-S3: halt pass
+```
+
+The core clock it prints names the reading of §16b under KEY: at `rom`, 40,
+80 or 20 MHz is H1, H2 or H3; at `xtal40`, 40 is H1 or H3 and 80 is H2; at
+`pll80` it should be 80. A value far from all of them ends the series until
+it is understood.
+
+| image | part |
+|---|---|
+| P1 at `rom` | |
+| P1 after P2 | |
+| P2 at `rom` | |
+| P2 at `pll80` | |

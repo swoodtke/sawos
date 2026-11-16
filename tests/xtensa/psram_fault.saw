@@ -1,0 +1,103 @@
+// The PSRAM bring-up's stops, each reached through the real call
+// (../../hal/xtensa-esp32s3/ABI.md §16e). Built only with `mspi.c`'s fault
+// record (`-DSOS_PSRAM_FAULT`, the case key `psram_fault`): the case's block
+// (`sos_psram_case`, written by the runner beside the image) says which one
+// read of the call lies, and how; this copies that into the record, runs the
+// call, and prints what happened.
+//
+//   (the call's own line, for a command that did not finish)
+//   SOS-S3: psram stop: ...                     the stop's line
+//   SOS psram: fault hits=... starts=... w0_reads=...
+//   SOS psram: SPI1 MISC=... clock=... after the call, ...
+//   SOS-S3: halt fail code=...
+//
+// `hits` is how many reads the record answered, `starts` how many commands
+// the call started, `w0_reads` how many answers it read. The block may also
+// name an address to pass for the description or the record in place of the
+// block's own, the step the call ends after, and that the call is
+// `psram_time_reads` (one read of that many bytes) rather than the bring-up.
+// A board image of this harness is refused: the runner allows the fault
+// record in this harness's emulator image only.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_psram_case() -> UInt
+    func sos_psram_fault_record() -> UInt
+}
+
+/// The case's block, as the runner's `_psram_case_asm` lays it out: the
+/// description, then this, then the record.
+struct CaseHarness {
+    step: UInt32,
+    command: UInt32,
+    addr: UInt32,
+    value: UInt32,
+    count: UInt32,
+    expect_at: UInt32,          // 0: the block's own description
+    record_at: UInt32,          // 0: the block's own record
+    last_step: UInt32,
+    time_bytes: UInt32,         // 0: the bring-up; else `psram_time_reads`
+}
+
+static HARNESS_OFFSET: UInt = 32
+static RECORD_OFFSET: UInt = 68
+
+/// `mspi.c`'s `struct sos_psram_fault`.
+struct FaultRecord {
+    step: UInt32,
+    command: UInt32,
+    addr: UInt32,
+    value: UInt32,
+    count: UInt32,
+    hits: UInt32,
+    starts: UInt32,
+    w0_reads: UInt32,
+}
+
+func word(name: String, v: UInt32) unsafe {
+    console().write_str(name)
+    console().write_hex(v as UInt)
+}
+
+@export("kmain")
+func kmain() unsafe {
+    let block = sos_psram_case()
+    let h = UnsafeMemory<CaseHarness, Normal>(block + HARNESS_OFFSET)
+    let f = UnsafeMemory<FaultRecord, Normal>(sos_psram_fault_record())
+    f.step.write(h.step.read())
+    f.command.write(h.command.read())
+    f.addr.write(h.addr.read())
+    f.value.write(h.value.read())
+    f.count.write(h.count.read())
+    f.hits.write(0)
+    f.starts.write(0)
+    f.w0_reads.write(0)
+    let expect = if h.expect_at.read() != 0 { h.expect_at.read() as UInt }
+                 else { block }
+    let record = if h.record_at.read() != 0 { h.record_at.read() as UInt }
+                 else { block + RECORD_OFFSET }
+
+    var before: [UInt32; 11] = [0; 11]
+    hal.psram_spi1_words(&var before)
+    var ticks: UInt64 = 0
+    let bytes = h.time_bytes.read() as UInt
+    let stop = if bytes != 0 {
+        hal.psram_time_reads(expect, record, bytes, 1, &var ticks)
+    } else {
+        hal.psram_bringup(expect, record, h.last_step.read() as UInt)
+    }
+    if stop != 0 {
+        hal.psram_stop_line(expect, record, stop)
+    }
+    word("SOS psram: fault hits=", f.hits.read())
+    word(" starts=", f.starts.read())
+    word(" w0_reads=", f.w0_reads.read())
+    console().write_str("\n")
+    hal.psram_spi1_line(&before)
+    if stop != 0 {
+        hal.exit_fail(stop)
+    }
+    hal.exit_pass()
+}

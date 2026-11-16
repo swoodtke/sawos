@@ -17,9 +17,13 @@ kernel/boot.S       the direct-boot entry, the reset path out of the ROM's
 kernel/sink.c       the special-register leaves (INTENABLE, INTERRUPT,
                     INTCLEAR, CCOUNT), `simcall` SYS_exit, the linker-symbol
                     accessors, and `kernel_fault`
+kernel/mspi.c       the octal PSRAM's command layer: the bring-up's checks,
+                    its pads and mode-register commands on SPI1 with the
+                    flash's chip select held off, all in IRAM (ABI.md §16)
 kernel/lib.saw      the `hal` module: the trap frame and its accessors, the
                     cause decoding, the Flat protection seam, UART0,
-                    SYSTIMER, the interrupt matrix, the memory map
+                    SYSTIMER, the interrupt matrix, the memory map, and the
+                    PSRAM bring-up's stop lines
 kernel/esp32s3.ld   the flash layout across the two bus windows, with an image
                     slot for root and the image's slots for the other
                     processes (generated per image), IRAM for the vectors,
@@ -36,7 +40,8 @@ keys/               an image's build keys, each a module the runner maps to
                     `clock-common` is `s3clockkit`, what the clock keys
                     that write share
 ABI.md              every board fact, with the probe that produced it; §13 is
-                    the process layout, §14 the system clock
+                    the process layout, §14 the system clock, §15 the board
+                    probe, §16 the PSRAM's command layer
 ```
 
 **Read `ABI.md` before changing anything here.** It is the record of what
