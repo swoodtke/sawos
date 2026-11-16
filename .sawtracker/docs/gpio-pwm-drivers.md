@@ -1,83 +1,76 @@
-# SO-77: GPIO and PWM drivers for the ESP32-S3 (design, revision 2)
+# SO-77: GPIO and PWM drivers for the ESP32-S3 (design, revision 3)
 
-For the owner, before anything is built. Written against main at `81895b0e`,
-with SO-125.p1 (per-board limits, under review) read from its patch and
-SO-95's design at revision 6 (approved) for the formats and the box's image.
-Section 2 gives a source for every register number; where a number has no
-source, it says so.
+For the owner, before anything is built. Written against main at `cf3518c6`,
+with SO-125 (per-board limits) merged, and SO-95's design at revision 6
+(approved) for the formats and the box's image. Section 2 gives a source for
+every register number; where a number has no source, it says so.
 
 ---
 
-## 0. What changed from revision 1
+## 0. What changed from revision 2
 
-1. **The PWM driver routes its own pads.** It holds LEDC whole and two
-   8-byte register ranges, the output selects and the IO MUX words of its
-   two pads, carved by root (SO-95 rule 8.5, ruled Nov 14). Root's part
-   shrinks to three setup writes before any child starts: LEDC's clock
-   gate, its reset, and the two pads' output enable. Root maps no LEDC word
-   and applies no pin table (§3.3).
-2. **Pins and limits are build-time inputs, not a `Setup` message.** SO-95
-   rule 4.6 ruled that a driver's pins are a build-time module. The GPIO
-   driver compiles `gpioconfig`, the PWM driver `pwmconfig`; each driver
-   checks its configuration when it starts and stops, naming the fault, on
-   a bad one. The `Setup` ops, `BadState`, the setup-once rule and the
-   "attach a channel to a pin" request are gone (§4.2, §5.2).
-3. **Code lives in `drivers/`** (ruled, SO-77 c8): the drivers, their
-   protocols and a package of the part's numbers. Test roots, test
-   configurations and cases stay in `tests/` (§7).
-4. **The formats.** The S3's `board.toml` gains the four devices (§3.1).
-   Each driver has a `process.toml` (§3.5), whose `[quota]` the smoke
-   cases run under, so a declaration one row short fails a case.
-5. **Stage 0's reads are done.** The read-only probe ran on the part on
-   Nov 15 (`s3_mem_probe`, SO-109 c9). Its pad words change one conclusion:
-   pads 41 and 42 reset with no pull, so a servo line floats until the
-   driver routes it (§2.3, §9). Revision 1's U0 is dropped. Its write half
-   is replaced by a loopback pin whose own edges raise the GPIO interrupt
-   (stage G1) and by a frame measured from the pad's input (stage P1), so
-   no instrument is needed for either (§8.5).
-6. **The CPU clock is known now:** 20 MHz as the ROM leaves it, 40 or
-   80 MHz under the `xtal40` and `pll80` keys (`ABI.md` §14). LEDC on the
-   crystal gives the same 20 ms frame under every key; APB would move it
-   fourfold between `rom` and `pll80` (§2.6, §6).
-7. **Windowed processes** exist on the S3. Nothing here needs them; the
-   drivers are call0 Saw processes, like every Saw process on the S3 today,
-   and the design assumes call0 only in keeping to 32-bit division (§5.3).
-8. **Revision 1's U5 (room for the box) is replaced** by a count of the box
-   against the S3's `[limits.default]` (§10). Every limit fits. What the
-   box still lacks is not a limit: three more flash slots and child
-   regions (SO-95's U4), and the stock root with its setup writes, parts and
-   inputs (SO-95's U6), or SO-78's hand-written equivalents.
-9. **Testing is laid out against the review rule** (§8.4). The pure parts
-   (register words, the pulse arithmetic, configuration checks, the
-   interrupt service's order, the PWM start's order) live in a package with
-   hosted `blade test`s. Each driver keeps a log of the words it wrote,
-   which the emulator smoke asserts. Every check and stop has a case that
-   goes red when it is removed, listed per unit.
-10. **Corrections.** The IO MUX pull bits are `FUN_PU` and `FUN_PD` in
-    ESP-IDF's header (the SVD spells them `FUN_WPU`, `FUN_WPD`); the sleep
-    fields are `SLP_*`. `FILTER_EN`'s width is in the header after all
-    (§2.3). A servo pad's word now carries `FUN_IE` (`0x1A00`, was
-    `0x1800`) so its level can be read back. The frame is bounded so the
-    pulse arithmetic stays in 32 bits (§5.3).
-11. **Open questions.** The two ruled since revision 1 are dropped (where
-    the drivers live; who routes the pads). The pins, the ramp and
-    per-client pin authority stay; two are new: pins a board holds, and the
-    servo pins stated three times in the box's image (§11).
+1. **Each servo pad is routed function first** (t1). The PWM driver writes
+   a pad's output select back to `0x100`, then the pad's IO MUX word, then
+   the output select naming its channel: ESP-IDF's own order. Root gains a
+   fourth setup write, `OUT1_W1TC = 0x600`, before the output enable, so
+   at function 1 the pad drives a written 0. The pad goes from its reset
+   state to a written low to the idle channel's low, each step a level a
+   source gives (§3.3, §5.5). A plain GPIO output gets the same order: its
+   enable is cleared first and set last (§4.4).
+2. **The launcher sets each child's declared quota rows** (t3). An image's
+   quota defaults are raise-only (`tools/sosimage/src/limits.saw`
+   `plan_limits`), so revision 2's runner key, which put a declaration in
+   the image's defaults, is refused at the link. The test roots now call
+   `ProcessOp.QuotaSet` for each declared row before any give, which is
+   SO-95's launch convention. The rows reach the root as a module the
+   runner generates from the driver's `process.toml`, so the numbers are
+   stated once (§3.5, §12).
+3. **The setup writes are tested against the part's word** (t4). One
+   routine in `esp32s3io` makes a setup write; a hosted test runs it
+   against a fake register reading `0xf9c1e06f` and expects `0xf9c1e86f`
+   for the set and the right words for the clear and the write. A plain
+   store would turn off the flash, the console and SYSTIMER on the part
+   (§8.2).
+4. **Three checks gain red cases** (t5). Every op that names a channel or a
+   pin is asked with a bad one, `Stop(8)` and `Inspect(8)` included; a
+   channel is looked up in one place before any address is formed, because
+   channel 8's `CONF0` slot is `TIMER0_CONF`. `GpioPort` carries the ack,
+   so the hosted test asserts all four steps of the interrupt service. The
+   bad-configuration cases run under a Mapping row of 0, so a driver that
+   maps before it checks prints a different line (§5.4, §4.6, §8.3).
+5. **The pulse bounds are checked in counts** (t6): `pulse_counts(min_us)`
+   above 0 and `pulse_counts(max_us)` below 16384. Revision 2's bound in
+   microseconds let a 100% duty through, which ESP-IDF says the hardware
+   cannot make at full resolution (§5.2).
+6. **Stage P1 looks at both pads and counts frames right.** It samples pads
+   41 and 42 before any `Set`, sets both channels, and times 51 rising
+   edges, 50 frames, per pad (§8.5).
+7. **A driver stops on any error from its wait.** A declaration one row
+   short then shows as the driver's stop line, which is how each quota row
+   goes red (§4.1, §8.4).
+8. **Smaller.** SO-125 has merged, so §3.6 and §10 drop the 16-entry
+   caveat. ESP-IDF v5.4.1's paths are given beside v5.1's (§2). §2.7 moves
+   `TIMERt_CONF`'s reset `RST` to the header and adds `PARA_UP`'s latch as
+   SVD-only. The board file gains `OUT_W1TC` and `OUT1_W1TC`. Open
+   question 5 now counts four statements of the servo pins.
 
-**Thread t1** (who selects LEDC's clock, and when a pad is routed): settled
-by construction. One process, the PWM driver, selects the crystal,
-configures the timer, leaves each channel idle and only then routes its
-pads, output select first and the pad's function last. Root writes only the
-clock gate, the reset and the output enable, before the driver exists. No
-pad is ever driven by an unconfigured channel, and stage P1 prints the
-pad's level between the driver's start and the first `Set` (§3.3, §5.6).
+**Thread t1:** taken as the reviewer proposes, with one more write: the
+driver resets each pad's output select to `0x100` before the pad's IO MUX
+word, so the order holds whatever an earlier run left there.
 
-**Thread t2** (§2 against the headers; root's handle table): the numbers
-stand as the reviewer confirmed them. The pull bits now carry the header's
-names, and §2.7 lists every number that rests on one source alone. Root's
-table is counted for each test root and for the box, with the order in
-which root releases what it no longer needs (§3.6); the peaks are 13 and
-12 of 32 in the cases and 17 of 32 in the box.
+**Thread t3:** agreed; the test roots set the declared rows with
+`QuotaSet`, read from a module generated from `process.toml`, and §8.4
+names the red case for every declared row, `handles = 10` included.
+
+**Thread t4:** agreed; a hosted test runs the setup-write routine against
+the part's `0xf9c1e06f`. The same test belongs to the stock root's setup
+writes in SO-95's U6.
+
+**Thread t5:** agreed on all three: bad channels and pins on every op,
+the ack inside `GpioPort`, and the bad-configuration cases under a Mapping
+row of 0.
+
+**Thread t6:** agreed; the check is on the counts.
 
 ---
 
@@ -138,7 +131,10 @@ Sources, all public:
 The Technical Reference Manual was downloaded, but no tool on this machine
 extracts its text or renders its pages, so no number below comes from it.
 The copies of the headers are in this design's scratch folder (`idf51/`,
-`svd/`).
+`svd/`). At v5.4.1, the tag `ABI.md` cites, the register headers are under
+`components/soc/esp32s3/register/soc/`, the interrupt sources are in
+`interrupts.h`, and `ledc.c` is `components/esp_driver_ledc/src/ledc.c`;
+the reviewer re-read every number here at both tags (t2).
 
 ### 2.1 Blocks
 
@@ -299,7 +295,7 @@ off           register         fields
 0x10 + 0x14c  CHc_DUTY_R       18:0 the duty in force (read-only)
 0xA0 + 8t     TIMERt_CONF      3:0 DUTY_RES, 21:4 CLK_DIV (10.8 fixed
                                point), 22 PAUSE, 23 RST, 24 TICK_SEL,
-                               25 PARA_UP (write-only); reset 0x0080_0000
+                               25 PARA_UP (write-only); RST resets to 1
                                [SVD]
 0xA4 + 8t     TIMERt_VALUE     13:0 the counter (read-only)
 0xC0..0xCC    INT_RAW/ST/ENA/CLR  (not used)
@@ -375,24 +371,26 @@ console. Root writes them, as a set and a clear of bit 11 (§3.3).
 ### 2.7 Numbers that rest on one source
 
 The reviewer re-read every base, offset, field position, signal number and
-interrupt source of §2.1 to §2.5 against ESP-IDF v5.1 and recomputed every
-word (t2). What rests on one source alone:
+interrupt source of §2.1 to §2.5 against ESP-IDF v5.1 and v5.4.1 and
+recomputed every word (t2). What rests on one source alone:
 
 - **The SVD alone:** the drive strengths; which `INT_ENA` bit is the NMI;
-  the reset value of `TIMERt_CONF` (`0x0080_0000`, `RST` set); the meaning
-  of `OEN_SEL`, `IDLE_LV`, `CLK_EN` and `TICK_SEL`. The SVD's
-  `PERIP_CLK_EN0` reset value is now confirmed on the part; its IO MUX
-  reset value is contradicted by the part for every pad read.
-- **ESP-IDF's HAL alone:** the `INT_TYPE` values (`gpio_types.h`), and the
-  LEDC sequences, read as prose from `ledc.c`.
-- **The reviewer's reading, no header:** that the GPIO matrix drives a pad
-  only while the pad's IO MUX function is the GPIO one (c4). This design
-  does not depend on it: §3.3's order is low or undriven at every step
-  either way.
+  the meaning of `OEN_SEL`, `IDLE_LV`, `CLK_EN` and `TICK_SEL`; and which
+  fields `PARA_UP` latches, on which "the channel is idle until `Set`"
+  rests. The SVD's `PERIP_CLK_EN0` reset value is confirmed on the part;
+  its IO MUX reset value is contradicted by the part for every pad read.
+- **ESP-IDF's HAL alone:** the `INT_TYPE` values (`gpio_types.h`), the LEDC
+  sequences read as prose from `ledc.c`, and that a plain output's enable
+  is `ENABLE[n]` with its output select at `0x100` (`gpio_ll.h`'s
+  `gpio_ll_output_enable` and `gpio_ll_output_disable`).
+- **Header defaults not read on the part:** `GPIO_OUT1` and `GPIO_ENABLE`
+  reset to 0. Nothing here depends on either: root and the drivers write
+  the bits they rely on (§3.3, §4.4).
 - **No source:** whether LEDC drives the peripheral output enable that
-  `OEN_SEL` 0 would select (sidestepped: `OEN_SEL` 1); which clock
-  `FILTER_EN` counts; whether RTC pad 21's `RDE` loads the pad while the
-  digital IO MUX has it (§2.3).
+  `OEN_SEL` 0 would select (sidestepped: `OEN_SEL` 1); what a pad in
+  function 0 (`MTDI`, `MTMS`) drives (left as the part leaves it, never
+  enabled through the matrix); which clock `FILTER_EN` counts; whether RTC
+  pad 21's `RDE` loads the pad while the digital IO MUX has it (§2.3).
 
 ---
 
@@ -411,6 +409,8 @@ base = 0x6000_4000
 len = 0x1000
 line = 16                   # ETS_GPIO_INTR_SOURCE
 registers.ENABLE_W1TS = { offset = 0x024 }
+registers.OUT_W1TC = { offset = 0x00C }
+registers.OUT1_W1TC = { offset = 0x018 }
 registers.ENABLE1_W1TS = { offset = 0x030 }
 arrays.out_sel = { offset = 0x554, stride = 4, count = 54 }
 
@@ -463,9 +463,9 @@ nothing. So the design isolates by **role**:
 - **the PWM driver** holds LEDC and two parts: `GPIO.out_sel[41..=42]`
   (0x6000_45F8, 8 bytes) and `IO_MUX.pad[41..=42]` (0x6000_90A8, 8 bytes).
   It can route its own two pads and no other, the switch's included;
-- **root** writes LEDC's clock gate, its reset and the two pads' output
-  enable once, before any child starts, and gives the rows away or releases
-  them.
+- **root** writes LEDC's clock gate, its reset, and the two pads' output
+  level and output enable once, before any child starts, and gives the rows
+  away or releases them.
 
 **A pad pair is one part when it is `(n, n + 1)` with n odd.** Both arrays
 start 4 bytes past an 8-byte boundary (`0x554 = 0x550 + 4`, `0x004`), so
@@ -477,47 +477,66 @@ is odd. 41/42 and 1/2 qualify; 47/14 does not (Open question 1).
 The PWM path, in the order it happens, in the box and in every PWM case:
 
 ```
-who     what                                         pad 41's state after
-reset                                                function 0 (MTDI), IE,
-                                                     no pull: undriven,
-                                                     floating [PART]
-root    PERIP_CLK_EN0 |= 0x800   LEDC's clock on     unchanged
-root    PERIP_RST_EN0 &= ~0x800  LEDC out of reset   unchanged
-root    ENABLE1_W1TS = 0x600     pads 41, 42 enabled unchanged or low (a)
+who     what                                  pad 41 after
+reset                                         function 0 (MTDI), IE, no
+                                              pull, OUT_SEL 0x100: the
+                                              part's reset state,
+                                              undriven by anything here
+root    PERIP_CLK_EN0 |= 0x800  LEDC clocked  unchanged
+root    PERIP_RST_EN0 &= ~0x800 out of reset  unchanged
+root    OUT1_W1TC = 0x600       OUT1 bits     unchanged
+                                9, 10 = 0
+root    ENABLE1_W1TS = 0x600    enables set   unchanged: OEN_SEL is 0, so
+                                              the enable is function 0's
+                                              own (a)
 root    creates the PWM driver, gives it LEDC, the two parts, a masked
         System and the outlet, starts it
-driver  CONF = 3                 XTAL_CLK            unchanged or low (a)
-driver  TIMER0_CONF ...          14 bits, 20 ms,     unchanged or low (a)
-                                 counter running
-driver  per channel: HPOINT 0;   channel idle:       unchanged or low (a)
-        CONF0 = PARA_UP          outputs IDLE_LV 0
-driver  per pad: FUNC_OUT_SEL =  matrix: pad <-      unchanged or low (b)
-        73 + ch | OEN_SEL        the idle channel
-driver  per pad: IO MUX = 0x1A00 function 1 (GPIO)   driven low: the idle
-                                                     channel's IDLE_LV
-client  Set(ch, pulse_us)                            frames at the width
+driver  CONF = 3                XTAL_CLK      unchanged
+driver  TIMER0_CONF, three      14 bits,      unchanged
+        words                   20 ms, runs
+driver  per channel: HPOINT 0,  idle: output  unchanged
+        CONF0 = PARA_UP         IDLE_LV 0
+driver  FUNC41_OUT_SEL = 0x100  plain GPIO    unchanged on a first start
+        signal, OEN_SEL 0
+driver  IO MUX 41 = 0x1A00      function 1    driven low: OUT1 bit 9,
+                                (GPIO)        written 0, enabled by
+                                              ENABLE1 (b)
+driver  FUNC41_OUT_SEL = 0x449  signal 73,    driven low: the idle
+                                OEN_SEL 1     channel's IDLE_LV (c)
+        (then the same three for pad 42)
+client  Set(ch, pulse_us)                     frames at the width
 ```
 
-(a) With the pad's function still 0, ENABLE reaches it only if the matrix
-drives pads in other functions, which the reviewer's reading denies (§2.7).
-If it does, the matrix's signal at that moment is `FUNC41_OUT_SEL`'s reset
-256, the plain `OUT1` bit, and nothing here sets `OUT1` bit 9: low. (b) The
-same, with the idle channel as the signal: low.
+(a) [SVD] `OEN_SEL`: "0: use peripheral output enable signal"; at function
+0 the peripheral is the pad's IO MUX function, `MTDI`, the JTAG port's
+data input. (b) At function 1 with the output select at `0x100` the pad is
+ESP-IDF's plain GPIO output: data from `OUT1`, enable from `ENABLE1`
+([IDF-HAL] `gpio_ll_output_disable` writes `0x100`, `gpio_ll_output_enable`
+sets the `ENABLE` bit). (c) [SVD] `IDLE_LV`, `OEN_SEL`.
 
-- **Root never touches LEDC.** Its three words are SO-95 rule 8.5's setup
-  writes: the stock root's `[[setup]]` in the box's image, and the same
-  three writes, made the same way, in the PWM test root.
-- **The driver writes every LEDC word,** the source select first, so no
-  channel is configured before its clock exists, and routes each pad only
-  after every channel is idle and clocked. The pad's function is the last
-  word, so the pad changes from its reset function straight to a driven
-  low.
+- **Every driven level is a written one.** The pad is undriven until its
+  function becomes GPIO, then drives `OUT1`'s written 0, then the idle
+  channel's 0. No step depends on what function 0 drives.
+- **The order is ESP-IDF's:** `ledc_set_pin` ([IDF-HAL] ledc.c, v5.1; at
+  v5.4.1 `_ledc_set_pin` in `esp_driver_ledc/src/ledc.c`) selects
+  `PIN_FUNC_GPIO`, sets the direction, then connects the signal. ESP-IDF's
+  `gpio_ll_iomux_out` writes `OEN_SEL` for a pad routed through the IO MUX
+  ([IDF-HAL] gpio_ll.h), so the output-enable select is live for a pad in
+  another function, which is why the channel's select comes last.
+- **The first output-select write** (`0x100`) is a no-op on a first start,
+  and makes the order true on any later one, whatever the select held.
+- **Root never touches LEDC.** Its four words are SO-95 rule 8.5's setup
+  writes: the stock root's `[[setup]]` in the box's image, and the same four
+  writes, made by the same routine, in the PWM test root. Each set or clear
+  is a read-modify-write of a word that gates every peripheral; a plain
+  store would turn off the flash, the console and SYSTIMER (t4, §8.2).
 - **Root's writes come first by construction:** the stock root makes every
   setup write before it starts anyone (rule 8.5), and the driver's first
   LEDC write needs the module's clock.
 - **A restarted driver** runs the same start: the timer is reset (one
-  frame boundary disturbed) and each channel goes idle, so a servo is limp
-  until its next `Set`. No restart is built in this version.
+  frame boundary disturbed), each channel goes idle and each pad passes
+  through a written low, so a servo is limp until its next `Set`. No
+  restart is built in this version.
 
 ### 3.4 The interrupt line
 
@@ -597,6 +616,14 @@ held waits (MAX_HELD)           4     -
                                13    10
 ```
 
+**The launcher sets these rows** with `ProcessOp.QuotaSet` after the
+create and before any give (SO-95's launch convention; spec §2.7). An
+image's quota defaults cannot carry them: they are raise-only, and the
+builder refuses a default below the compiled one (`plan_limits` in
+`tools/sosimage/src/limits.saw`), which waiters 1 and handles 10 are. A
+row set by the launcher may go either way: GPIO's handles 13 is above the
+compiled 12, the waiters rows below the compiled 2.
+
 Neither driver declares a default for its input: the image (or the case)
 must name the configuration, so nothing runs with pins nobody chose
 (rule 4.6 refuses an input with no value).
@@ -604,10 +631,13 @@ must name the configuration, so nothing runs with pins nobody chose
 SO-95's §4 gives the GPIO driver 11 handles; the count above, with four
 held waits, is 13.
 
-### 3.6 Root's handle table (t2)
+### 3.6 Root's handle table
 
-Root's table holds 32 on the S3 (SO-125). Counted step by step, root
-releasing each thing as soon as nothing later needs it:
+Root's table holds 32 on the S3 (`hal.MAX_HANDLES`, SO-125). The builder
+refuses an image whose root holds more than that at boot (`plan_limits`:
+System, Process, Thread and one per row). Counted step by step, root
+releasing each thing as soon as nothing later needs it; `QuotaSet` mints
+nothing:
 
 **`gpio_service`'s root** (rows: the driver's blob and destination, GPIO,
 IO_MUX):
@@ -616,6 +646,7 @@ IO_MUX):
 entry: System, Process, Thread, 4 rows                  7
 process_self                                            8
 create the driver (+1), release blob and destination    9, 7
+set the declared quota rows                             7
 bind line 16                                            8
 System sibling made, given; GPIO, IO_MUX, line given    9, 8, 7, 6, 5
 pipe_create (+2), outlet given (-1)                     7, 6
@@ -630,8 +661,10 @@ SYSTEM):
 entry: System, Process, Thread, 6 rows                  9
 process_self                                            10
 create the driver (+1), release blob and destination    11, 9
+set the declared quota rows                             9
 each setup write: carve (+1), map (+1), unmap and
-  release both (-2); SYSTEM's row released after two    11, 9 (x3); 8
+  release both (-2); SYSTEM's row released after its
+  two                                                   11, 9 (x4); 8
 System sibling made, given; LEDC given                  9, 8, 7
 each part: carve (+1), give (-1)                        8, 7 (x2)
 IO_MUX released; GPIO kept (stage P1 maps it)           6
@@ -640,10 +673,9 @@ Waiter, Timer, GPIO mapping (P1 only)                   10
 posted claims, at most 2                                12
 ```
 
-Peaks 13 and 12, each well inside 32. The box's stock root peaks at 17 of
-32 (SO-95 §5.3, which counts the same reach). With SO-125 unmerged the
-table is 16, and both test roots fit it only in this release order; U2 and
-U3 assume SO-125 has merged.
+Peaks 13 and 12 of 32. The box's stock root peaks at 17 of 32 (SO-95 §5.3,
+which counts the same reach; a fourth setup write adds nothing to the
+peak, since each is released before the next).
 
 ---
 
@@ -652,12 +684,22 @@ U3 assume SO-125 has merged.
 ### 4.1 The process
 
 `drivers/svc-gpio-esp32s3/`, a child for `xtensa-esp-unknown-elf` linked
-with `hal/xtensa-esp32s3/user/child.ld`. It takes its boot records by the
-tags of §3.5, derives its Process handle, maps both windows and finds each
-base with `Mapping.base()` (SO-95 rule 4.5). It checks its configuration,
-configures every pin in it, attaches the Interrupt and the outlet to one
-Waiter, and serves: one `wait`, one arm per delivery kind, as
-`svc-uart-ns16550` does.
+with `hal/xtensa-esp32s3/user/child.ld`. In order, it:
+
+1. takes its boot records by the tags of §3.5 and derives its Process
+   handle;
+2. checks its configuration (§4.2), and stops on a bad one **before it maps
+   anything**;
+3. maps both windows and finds each base with `Mapping.base()` (SO-95
+   rule 4.5);
+4. configures every pin (§4.4);
+5. attaches the Interrupt and the outlet to one Waiter, and serves: one
+   `wait`, one arm per delivery kind, as `svc-uart-ns16550` does.
+
+**A wait that answers an error is a stop.** The driver prints the status
+and exits non-zero. A wait answers `QuotaExceeded` when the delivery's mint
+does not fit the driver's handle row (spec §2.2), so a declaration one row
+short shows as that line, not as a driver that quietly serves less.
 
 ### 4.2 Configuration: `gpioconfig`
 
@@ -733,22 +775,24 @@ For each pin, in configuration order, whole words, never a read-modify-
 write (the emulator reads 0, and the log must be the truth):
 
 ```
-input (any pull)             output                   output, loopback
-ENABLE(1)_W1TC  bit          OUT(1)_W1TS/W1TC  bit    OUT(1)_W1TS/W1TC  bit
-FUNCn_OUT_SEL   0x100        FUNCn_OUT_SEL  0x500     FUNCn_OUT_SEL  0x500
-IO MUX          (§2.3)       ENABLE(1)_W1TS  bit      ENABLE(1)_W1TS  bit
-STATUS(1)_W1TC  bit          IO MUX         0x1800    IO MUX         0x1A00
-PINn            0x2180       PINn           0         STATUS(1)_W1TC  bit
-                                                      PINn           0x2180
+input (any pull)          output                    output, loopback
+ENABLE(1)_W1TC  bit       ENABLE(1)_W1TC  bit       ENABLE(1)_W1TC  bit
+FUNCn_OUT_SEL   0x100     OUT(1)_W1TS/W1TC  bit     OUT(1)_W1TS/W1TC  bit
+IO MUX          (§2.3)    IO MUX          0x1800    IO MUX          0x1A00
+STATUS(1)_W1TC  bit       FUNCn_OUT_SEL   0x500     FUNCn_OUT_SEL   0x500
+PINn            0x2180    ENABLE(1)_W1TS  bit       ENABLE(1)_W1TS  bit
+                          PINn            0         STATUS(1)_W1TC  bit
+                                                    PINn            0x2180
 ```
 
 - `PINn` = `INT_TYPE 3 << 7 | INT_ENA bit 13` = `0x2180`: any edge, to the
   CPU. `0x500` = `SIG_GPIO_OUT | OEN_SEL`.
+- **An output's enable is cleared first and set last,** after its level,
+  its function and its output select: the pad is undriven until it drives
+  the written level, whatever function it reset to (§3.3's reasoning).
 - **An input's interrupt is enabled last,** after its input enable and
   pull are set and its status cleared, so setting `FUN_IE` (pad 21's is off
   at reset) cannot leave a stale edge pending.
-- **An output's level is written before its enable,** so the pad never
-  drives a stale level, and its function last.
 
 For pin 21 (`InputPullUp`) the log reads:
 
@@ -763,10 +807,11 @@ For pin 21 (`InputPullUp`) the log reads:
 and for pin 47 (`OutputLoopback`, low):
 
 ```
+0x60004034 <- 0x00008000    ENABLE1_W1TC, bit 15
 0x60004018 <- 0x00008000    OUT1_W1TC, bit 15
+0x600090c0 <- 0x00001a00    IO MUX pad 47
 0x60004610 <- 0x00000500    FUNC47_OUT_SEL_CFG
 0x60004030 <- 0x00008000    ENABLE1_W1TS, bit 15
-0x600090c0 <- 0x00001a00    IO MUX pad 47
 0x60004058 <- 0x00008000    STATUS1_W1TC, bit 15
 0x60004130 <- 0x00002180    PIN47
 ```
@@ -818,15 +863,16 @@ On a delivery the driver:
 means an edge after the clear sets the status again and fires again after
 the ack, so the levels read in (3) are never stale without a new fire
 pending. Reading first would let an edge between (3) and (2) be cleared
-unseen. Everything that touches the device happens before the ack, as
-spec §9 requires.
+unseen. Everything that touches the device happens before the ack (4), as
+spec §9 requires, and the answers (5) are replies, which come after.
 
-Steps 1 to 3 and the choice in step 5 are written once, generic over a
-`GpioPort` trait in `esp32s3io` (`service_interrupt<P: GpioPort>`), which
-the driver implements with its register blocks and the hosted tests with a
-recording fake (§8.2). The emulator can raise no GPIO interrupt, so the
-hosted test is the case that holds the order; stages G1 and G2 run it on
-the part.
+Steps 1 to 4 and the choice in step 5 are written once, generic over a
+`GpioPort` trait in `esp32s3io` (`service_interrupt<P: GpioPort>`), whose
+methods are `pcpu_int`, `clear_status`, `levels` and `ack`. The driver
+implements it with its register blocks and its Interrupt; the hosted tests
+with a recording fake that asserts all four calls in order (§8.2). The
+emulator can raise no GPIO interrupt, so the hosted test is the case that
+holds the order; stages G1 and G2 run it on the part.
 
 ### 4.7 When the driver dies
 
@@ -847,10 +893,12 @@ the part.
 
 ### 5.1 The process
 
-`drivers/svc-pwm-esp32s3/`. It takes its records by the tags of §3.5,
-checks its configuration, maps its three windows (LEDC, `outsel`, `pads`),
-runs the start of §5.5, gives the outlet to a Waiter and serves. It needs
-no interrupt and no Timer. LEDC's clock is on before it starts (§3.3).
+`drivers/svc-pwm-esp32s3/`. In order, it takes its records by the tags of
+§3.5, checks its configuration (stopping on a bad one before it maps
+anything), maps its three windows (LEDC, `outsel`, `pads`), runs the start
+of §5.5, gives the outlet to a Waiter and serves. A wait that answers an
+error is a stop, as for the GPIO driver (§4.1). It needs no interrupt and
+no Timer. LEDC's clock is on before it starts (§3.3).
 
 ### 5.2 Configuration: `pwmconfig`
 
@@ -874,7 +922,15 @@ exit:
 
 - `FRAME_US` from 416 to 200 000, and a multiple of 8 (§5.3);
 - each channel 0..7, none twice;
-- `0 < min_us <= max_us < FRAME_US` for each servo;
+- for each servo, `min_us <= max_us < FRAME_US` (the last keeps the pulse
+  arithmetic inside 32 bits, §5.3), then, in counts,
+  `pulse_counts(min_us) > 0` and `pulse_counts(max_us) < 16384` (t6). A
+  pulse that rounds to 0 counts is no pulse. One that rounds to 16384 is a
+  100% duty, which ESP-IDF refuses because it "is not reachable when the
+  binded timer selects the maximum duty resolution" and "will mess up the
+  duty calculation in hardware" ([IDF-HAL] ledc.c's duty check). At
+  20 000 µs the range this allows is 1 to 19 999 µs; at 200 000 µs it is 7
+  to 199 993;
 - each pin a GPIO the part can drive and not one the chip holds (§4.2's
   list);
 - **the pins are one naturally aligned window in both blocks:** consecutive
@@ -882,15 +938,19 @@ exit:
   `pad` offsets aligned to the window's length. For two servos that is a
   pair `(n, n + 1)` with n odd (§3.2).
 
-**The pins are stated in three places in the box's image:** `pwmconfig`,
+`Set` refuses anything outside `[min_us, max_us]`, so every commanded duty
+is inside `(0, 16384)` counts too.
+
+**The pins are stated in four places in the box's image:** `pwmconfig`,
 the two parts the image binds (`GPIO.out_sel[41..=42]`,
-`IO_MUX.pad[41..=42]`), and the `ENABLE1_W1TS` setup write. The driver
-cannot see a part's length, and the builder cannot read a Saw module, so
-nothing checks the three against each other in the box. The test roots
-import `pwmconfig` and compute their carves and enable bits from it, so in
-the cases there is one statement. In the box, a wrong part writes another
-pad's registers and a missing enable bit leaves the pad low; stage P1's
-sampled pad shows the second. Open question 5 asks whether that is enough.
+`IO_MUX.pad[41..=42]`), and the `OUT1_W1TC` and `ENABLE1_W1TS` setup
+writes. The driver cannot see a part's length, and the builder cannot read
+a Saw module, so nothing checks them against each other in the box. The
+test roots import `pwmconfig` and compute their carves and both setup
+words from it, so in the cases there is one statement. In the box, a wrong
+part writes another pad's registers and a missing enable bit leaves the
+pad undriven; stage P1's sampled pads show the second. Open question 5 asks
+whether that is enough.
 
 The driver writes pin p's registers at `outsel.base() + 4 (p - lowest)`
 and `pads.base() + 4 (p - lowest)`.
@@ -946,6 +1006,13 @@ Log    4    from (u8)                 as gpioproto's Log
 `BadChannel` (not in the configuration, or above 7), `OutOfRange` (outside
 the channel's `[min_us, max_us]`).
 
+- **A channel is looked up in one place,** `servo_of(channel)`, which
+  answers the configured servo or `BadChannel`, and every op that names a
+  channel goes through it before any register address is formed. Channel
+  c's `CONF0` is at LEDC + `0x14 c`, so an unchecked channel 8 is
+  `0x600190a0`, `TIMER0_CONF`: a `Stop(8)` would write `0x10` over the
+  timer both servos run on (t5). `pwm_service` asks `Set`, `Stop` and
+  `Inspect` each with channel 2 and channel 8.
 - **The request is a pulse width, not an angle.** A pulse width is what the
   hardware makes and is the same for every servo; an angle depends on the
   servo (centre, travel and direction differ between units of one model),
@@ -971,17 +1038,21 @@ configuration, two servos on 41 and 42):
                             PARA_UP
 0x60019018 <- 0x00000000    CH1_HPOINT
 0x60019014 <- 0x00000010    CH1_CONF0
-0x600045f8 <- 0x00000449    FUNC41_OUT_SEL_CFG: signal 73 | OEN_SEL
+0x600045f8 <- 0x00000100    FUNC41_OUT_SEL_CFG: the plain GPIO signal
 0x600090a8 <- 0x00001a00    IO MUX pad 41: function 1, IE, 20 mA
-0x600045fc <- 0x0000044a    FUNC42_OUT_SEL_CFG: signal 74 | OEN_SEL
+0x600045f8 <- 0x00000449    FUNC41_OUT_SEL_CFG: signal 73 | OEN_SEL
+0x600045fc <- 0x00000100    FUNC42_OUT_SEL_CFG
 0x600090ac <- 0x00001a00    IO MUX pad 42
+0x600045fc <- 0x0000044a    FUNC42_OUT_SEL_CFG: signal 74 | OEN_SEL
 ```
 
-- `TIMER0_CONF`'s reset value has `RST` set ([SVD]), so the first word
-  keeps it set while the fields are loaded, as `ledc_timer_set` then
-  `ledc_timer_rst` leave it.
+- `TIMER0_CONF`'s `RST` resets to 1 ([IDF] ledc_reg.h, `LEDC_LSTIMER0_RST
+  ... default: 1'b1`), so the first word keeps it set while the fields are
+  loaded, as `ledc_timer_set` then `ledc_timer_rst` leave it.
 - Every channel is configured and **off: its output is `IDLE_LV`, low**
   ([SVD] `IDLE_LV`).
+- Each pad's three words are §3.3's order: the output select to the plain
+  signal, the function, then the channel.
 - The pad's IO MUX word carries `FUN_IE` so a board stage can read the
   pad's level through `IN1` (§8.5). An input enable on a driven pad is
   ESP-IDF's `GPIO_MODE_INPUT_OUTPUT`.
@@ -1001,12 +1072,14 @@ recording fake, and the smoke holds the real driver's log (§8).
 
 ### 5.6 The servo line, from reset to exit
 
-- **From reset until the driver routes the pad:** function 0 (JTAG) with
-  no pull ([PART]), so the line is undriven and floats; the servo sees no
-  valid frame. A 10 kΩ pull-down from each signal to ground holds it low
-  (§9).
-- **From the routing until the first `Set`:** low, the idle channel's
-  `IDLE_LV`, with its clock selected and its timer running (§3.3).
+- **From reset until the driver gives the pad its function:** function 0
+  (JTAG) with no pull ([PART]), undriven by anything here, so the line
+  floats; the servo sees no valid frame. A 10 kΩ pull-down from each signal
+  to ground holds it low (§9).
+- **From the function until the channel's select:** low, `OUT1`'s written
+  0 (§3.3).
+- **From the channel's select until the first `Set`:** low, the idle
+  channel's `IDLE_LV`, with its clock selected and its timer running.
 - **From the first `Set`:** frames at the commanded width.
 
 So the controller's first act is to command each servo to rest, one at a
@@ -1059,9 +1132,10 @@ drivers/esp32s3io/          the part's numbers and pure functions, shared
                             bases and offsets, pad and signal numbers, the
                             word functions (pad_word, pin_cfg, out_sel,
                             divider, pulse_counts), the config types and
-                            their checks, the GpioPort and LedcPort traits
-                            with service_interrupt and start_pwm; hosted
-                            tests in tests/
+                            their checks, the setup write over a WordPort,
+                            the GpioPort and LedcPort traits with
+                            service_interrupt and start_pwm; hosted tests
+                            in tests/
 drivers/gpioproto/          the GPIO wire: ops, statuses, body builders
 drivers/pwmproto/           the PWM wire
 drivers/svc-gpio-esp32s3/   the GPIO driver, its process.toml
@@ -1075,7 +1149,11 @@ tests/s3-pwm-config/        pwmconfig files, one per case
 
 `esp32s3io` imports nothing but the standard library, so `blade test` runs
 its tests on the host. The protocols are separate packages because SO-78's
-QEMU case runs stand-in drivers that speak them (SO-78 c2).
+QEMU case runs stand-in drivers that speak them (SO-78 c2). The setup write
+(`apply_setup`: `set` ORs into the word read, `clear` ANDs out, `write`
+stores) has nothing of the S3 in it; it sits in `esp32s3io` because the PWM
+test root is its first user, and SO-95's stock root needs the same routine
+or the same test (§12).
 
 ### 7.2 Register blocks as typed views
 
@@ -1148,36 +1226,58 @@ Run by the runner in a full `make sos-test`, as the builder's own tests are
   allowed frame and pulse with no overflow.
 - **Configuration checks,** one test per refusal of §4.2 and §5.2, each
   asserting the refusal's name, and one accepted configuration of each.
-- **The interrupt service's order:** a recording `GpioPort` that reports
-  pin 21 fired, then answers the levels read; the test asserts the calls
-  were `pcpu_int`, `clear_status` with exactly the fired bits, `levels`,
-  in that order, and which held waits are chosen. A second fake sets a new
-  status bit when `clear_status` runs, as an edge just after the clear
-  would; the test asserts the levels were read after the clear.
+  The count bounds (t6) have four: at 200 000 µs, `max_us` 199 994 is
+  refused (16384 counts) and 199 993 accepted; `min_us` 6 is refused (0
+  counts) and 7 accepted.
+- **The setup write (t4):** against a fake register reading `0xf9c1e06f`,
+  `set 0x800` stores `0xf9c1e86f`; against one reading `0x00000800`,
+  `clear 0x800` stores `0x00000000`, and against `0xffffffff` it stores
+  `0xfffff7ff`; `write 0x600` stores `0x00000600` whatever the register
+  reads. Each test asserts the one store and that the register was read
+  first for a set or a clear and not read for a write.
+- **The interrupt service's order (t5):** a recording `GpioPort` that
+  reports pin 21 fired, then answers the levels read; the test asserts the
+  calls were `pcpu_int`, `clear_status` with exactly the fired bits,
+  `levels`, `ack`, in that order, and which held waits are chosen. A second
+  fake sets a new status bit when `clear_status` runs, as an edge just
+  after the clear would; the test asserts the levels were read after the
+  clear.
 - **The PWM start's order:** a recording `LedcPort`; the test asserts
-  `CONF` first, the timer's three words, each channel idle, then each
-  pad's output select before its IO MUX word, the IO MUX words last.
+  `CONF` first, the timer's three words, each channel idle, then for each
+  pad the output select to `0x100`, the IO MUX word, the output select to
+  the channel, and no pad word before every channel is idle.
+- **A plain output's order:** the GPIO start for an `Output` pin, through
+  the same recording port, clears the enable first and sets it last.
 
 ### 8.3 The smoke cases
 
 S3 cases of the board's own, in `_esp32s3_smoke`'s process cases as
 `irq_line_cycle` is, so `make sos-smoke-esp32s3` runs them. Each is root
 plus one child, the layout the S3 has today. Each case's header says the
-device is absent under this emulator and what the case proves anyway. Each
-child runs under the quota its `process.toml` declares (U1's runner key),
-so a declaration that is short fails the case.
+device is absent under this emulator and what the case proves anyway.
+
+**The child runs under its declaration.** A test image keeps the compiled
+quota defaults, and an image may only raise them (`plan_limits`), so the
+test root sets the child's declared rows itself, with `QuotaSet` after the
+create and before any give, as SO-95's launch convention has a launcher do.
+The rows reach the root as `childquota`, a module the runner generates from
+the child's `process.toml` (U1). Raising and lowering are both legal
+there: root's own rows are unlimited, and a `Handle` row of 13 is within
+`MAX_HANDLES`.
 
 **`gpio_service`.** Rows: GPIO, IO_MUX. Config `tests/s3-gpio-config/
 smoke.saw`: 21 `InputPullUp`, 14 `InputPullDown`, 1 `InputFloating`, 2
-`Output` high, 47 `OutputLoopback` low. Root binds 16, creates the driver,
-gives it its records and is its client.
+`Output` high, 47 `OutputLoopback` low. Root sets the declared rows, binds
+16, creates the driver, gives it its records and is its client.
 
-- `Log(0)` and `Log(15)`: the 26 start writes of §4.4, asserted in order.
+- `Log(0)`, `Log(15)`: the 28 start writes of §4.4, asserted in order.
 - `Read(21)` answers 0; `WaitLevel(21, 0)` answers at once with 0.
-- Refusals: `Read(22)` and `Read(49)` `BadPin`; `Read(19)` `NotMine`;
-  `Write(21, 1)` `BadMode`; `WaitLevel(2, 1)` `BadMode`; `Write(2, 2)`
-  `BadArg`; op 0x7F `BadOp`; a `Read` with no pin byte `BadOp`.
-- `Write(2, 0)` and `Write(47, 1)` answer `Ok`; `Log(26)` shows
+- Refusals, on every op that names a pin: `Read`, `Write`, `WaitLevel` and
+  `Inspect` each with 22 (`BadPin`) and 19 (`NotMine`); `Read(49)`
+  `BadPin`; `Write(21, 1)` `BadMode`; `WaitLevel(2, 1)` `BadMode`;
+  `Write(2, 2)` `BadArg`; op 0x7F `BadOp`; a `Read` with no pin byte
+  `BadOp`. The log's total does not move.
+- `Write(2, 0)` and `Write(47, 1)` answer `Ok`; `Log(28)` shows
   `0x6000400c <- 0x00000004` and `0x60004014 <- 0x00008000`.
 - `WaitLevel(21, 1)` posted beside a Timer: the Timer's record comes first,
   since no edge can arrive here (the order holds by construction). Root
@@ -1192,20 +1292,22 @@ gives it its records and is its client.
   line (`served=` asserted; `fires=` printed only) and exits 0, and root's
   death wait prints the status.
 
-**`gpio_bad_config`.** The same root with `bad.saw`, which names pin 30:
-the driver prints `config refused: pin 30 is held by the chip (the SPI
-flash bus)` and exits non-zero before mapping anything; root prints the
-death status.
+**`gpio_bad_config`.** The same root with `bad.saw`, which names pin 30,
+and the driver's Mapping row set to 0 instead of its declared 2: the driver
+prints `config refused: pin 30 is held by the chip (the SPI flash bus)` and
+exits non-zero; root prints the death status. A driver that mapped before
+it checked would print its map's `QuotaExceeded` instead.
 
 **`pwm_service`.** Rows: GPIO, IO_MUX, LEDC, SYSTEM. Config `tests/s3-pwm-
 config/smoke.saw`: 20 000 µs; channel 0 on 41, 500..2500; channel 1 on 42,
-1000..2000. Root imports the same `pwmconfig`.
+1000..2000. Root imports the same `pwmconfig` and sets the declared rows.
 
 - Root's setup writes, each printed as written: `PERIP_CLK_EN0
-  0x00000800` (the emulator reads 0; on the part it is `0xf9c1e86f`),
-  `PERIP_RST_EN0 0x00000000`, `ENABLE1_W1TS 0x00000600`; the parts it
-  carves, GPIO + 0x5F8 and IO_MUX + 0xA8, 8 bytes each.
-- `Log(0)`: the 12 start writes of §5.5, asserted in order.
+  0x00000800` (the emulator reads 0; on the part it is `0xf9c1e86f`, which
+  §8.2's test holds), `PERIP_RST_EN0 0x00000000`, `OUT1_W1TC 0x00000600`,
+  `ENABLE1_W1TS 0x00000600`; the parts it carves, GPIO + 0x5F8 and
+  IO_MUX + 0xA8, 8 bytes each.
+- `Log(0)`: the 14 start writes of §5.5, asserted in order.
 - `Set(0, 1500)` answers counts 1229; the log gains `DUTY` `0x00004cd0`,
   `CONF1` `0xc0100400`, `CONF0` `0x00000014`.
 - `Set(1, 1000)` answers 819; the log gains channel 1's three words
@@ -1213,16 +1315,17 @@ config/smoke.saw`: 20 000 µs; channel 0 on 41, 500..2500; channel 1 on 42,
   `0x60019014 <- 0x00000014`).
 - `Set(0, 2600)`, `Set(0, 400)` and `Set(1, 2500)` answer `OutOfRange`,
   and the log's total does not move.
-- `Set(2, 1500)` and `Set(8, 1500)` answer `BadChannel`; op 0x7F and a
-  `Set` with no pulse answer `BadOp`.
+- `Set`, `Stop` and `Inspect` each with channel 2 and channel 8 answer
+  `BadChannel`; op 0x7F and a `Set` with no pulse answer `BadOp`. The log's
+  total does not move.
 - `Stop(0)` answers `Ok`; the log gains `CONF1` `0x40100400` and `CONF0`
   `0x00000010`.
 - `Inspect(0)` answers `Ok`, its words printed only.
 - Root releases its inlet; the driver exits 0.
 
-**`pwm_bad_config`.** The same root with a frame of 1 000 000 µs: the
-driver prints `config refused: frame 1000000 us is outside 416..200000` and
-exits non-zero before mapping anything.
+**`pwm_bad_config`.** The same root with a frame of 1 000 000 µs and the
+driver's Mapping row set to 0: the driver prints `config refused: frame
+1000000 us is outside 416..200000` and exits non-zero.
 
 No case asserts a time or a count that accrues with time.
 
@@ -1232,27 +1335,37 @@ No case asserts a time or a count that accrues with time.
 |---|---|---|
 | each pad, pin and out-select word | `esp32s3io` | hosted word tests |
 | `MCU_SEL` 1 in every pad word (c4) | `esp32s3io`, driver | hosted; `gpio_service` and `pwm_service` logs |
-| each GPIO start write and its order | driver | `gpio_service` log |
+| each GPIO start write and its order | driver | `gpio_service` log; hosted (a plain output's order) |
 | `INT_TYPE` 3 and `INT_ENA` | `esp32s3io` | hosted; `gpio_service` log |
 | each GPIO config refusal | `esp32s3io` | hosted, one test each |
-| the driver calls the config check | GPIO driver | `gpio_bad_config` |
-| `BadOp`, `BadArg`, `BadPin`, `NotMine`, `BadMode` | GPIO driver | `gpio_service` refusals |
+| the check before any map | GPIO driver | `gpio_bad_config` under a Mapping row of 0 |
+| `BadOp`, `BadArg`, `BadPin`, `NotMine`, `BadMode`, on every op | GPIO driver | `gpio_service` refusals |
 | the `Busy` bound | GPIO driver | `gpio_service` (the fifth wait) |
 | answer at once when the level holds | GPIO driver | `gpio_service` (`WaitLevel(21, 0)`) |
 | abandonment discards the obligation | GPIO driver | `gpio_service` (`abandoned=`) |
-| the interrupt service's order | `esp32s3io` | hosted, two fakes; G1 and G2 on the part |
-| the declared quota (handles 13, mappings 2) | `process.toml` | `gpio_service`: one short and the fifth wait or a map fails |
+| the interrupt service's order, the ack fourth | `esp32s3io` | hosted, two fakes; G1 and G2 on the part |
+| declared `mappings = 2` | `process.toml`, test root | `gpio_service`: at 1 the second map fails at start |
+| declared `handles = 13` | `process.toml`, test root | `gpio_service`: at 12 the fifth wait's delivery answers `QuotaExceeded` and the driver stops |
+| declared `waiters = 1` | `process.toml`, test root | `gpio_service`: at 0 the driver's Waiter is refused at start |
+| root sets the declared rows | test roots | both services: at the compiled defaults (handles 12, mappings 2) the GPIO driver stops at the fifth wait and the PWM driver at its third map |
 | the divider and its range | `esp32s3io` | hosted; `pwm_service` (`0x00830d4e`) |
 | the pulse rounding | `esp32s3io` | hosted; `pwm_service` (1229, not 1228) |
-| each PWM config refusal | `esp32s3io` | hosted, one test each |
-| the driver calls the config check | PWM driver | `pwm_bad_config` |
-| the start's order: clock, timer, idle channels, routing | `esp32s3io`, driver | hosted; `pwm_service` log |
+| each PWM config refusal, the count bounds included | `esp32s3io` | hosted, one test each |
+| the check before any map | PWM driver | `pwm_bad_config` under a Mapping row of 0 |
+| the start's order: clock, timer, idle channels, then each pad plain, function, channel | `esp32s3io`, driver | hosted; `pwm_service` log |
 | the range check, writing nothing | PWM driver | `pwm_service` (`OutOfRange`, log total) |
-| `BadChannel`, `BadOp` | PWM driver | `pwm_service` |
+| `BadChannel` on `Set`, `Stop` and `Inspect` | PWM driver | `pwm_service` (channels 2 and 8, log total) |
+| `BadOp` | PWM driver | `pwm_service` |
 | `Stop`'s words | PWM driver | `pwm_service` log |
+| declared `mappings = 3` | `process.toml`, test root | `pwm_service`: at 2 the third map fails at start |
+| declared `handles = 10` | `process.toml`, test root | `pwm_service`: at 9 the first request's delivery answers `QuotaExceeded` and the driver stops |
+| declared `waiters = 1` | `process.toml`, test root | `pwm_service`: at 0 the Waiter is refused at start |
+| a set or clear reads the word first | `esp32s3io` | hosted, against `0xf9c1e06f` (t4) |
 | root's setup words and parts | test root | `pwm_service` (printed words) |
-| the declared quota (mappings 3, handles 10) | `process.toml` | `pwm_service`: one short and the third map fails |
-| silicon: every read-back, source 16, the frame, the pad low until `Set` | the part | G1, G2, P1, P2 (§8.5) |
+| silicon: every read-back, source 16, the frame, the pads low until `Set` | the part | G1, G2, P1, P2 (§8.5) |
+
+A declared row is a number, not code; "removed" there means set one lower,
+which is the mutant the patch note runs for each row.
 
 ### 8.5 Board stages
 
@@ -1290,19 +1403,22 @@ driver with the box's pins; root keeps GPIO's row and maps it. Run twice,
 `--clock rom` and `--clock pll80`.
 
 - Root's setup words: `PERIP_CLK_EN0 0xf9c1e86f`, `PERIP_RST_EN0
-  0x00000000`, `ENABLE1_W1TS 0x00000600`.
-- After the driver's first answer, root samples `IN1` bit 9 (pad 41, whose
-  input is enabled) a million times. Expected: `pad 41 before Set: 0 high
-  of 1000000` (t1's "low until commanded", on silicon).
-- `Set(0, 1500)`; after a 100 ms Timer, root counts 50 rising edges of
-  bit 9, reading the Monotonic clock at the first and the last, and the
-  high samples among all samples in between. It prints `frame_us=` (the
-  interval over 50) and `pulse_us=` (the high fraction times the frame).
-  Expected: about 20000 and 1500 under both keys. APB as the source would
-  read 40000 under `rom` and 10000 under `pll80`.
-- `Inspect(0)`: `DUTY_R` `0x00004cd0`, the pad's OUT_SEL `0x00000449` and
-  IO MUX `0x00001a00` (reset `0x00000a00`: the reviewer's c4 check on a
-  JTAG pad), `TIMER0_VALUE` printed twice, some ticks apart, and moving.
+  0x00000000`, `OUT1_W1TC 0x00000600`, `ENABLE1_W1TS 0x00000600`.
+- After the driver's first answer, root samples `IN1` bits 9 and 10 (pads
+  41 and 42, whose inputs are enabled) a million times. Expected: `pad 41
+  before Set: 0 high of 1000000` and the same for pad 42 (t1's "low until
+  commanded", on silicon, for both pads).
+- `Set(0, 1500)` and `Set(1, 1000)`; after a 100 ms Timer, root measures
+  each pad in turn: it counts 51 rising edges, reading the Monotonic clock
+  at the first and the 51st, which bound 50 frames, and the high samples
+  among all samples in between. It prints `frame_us=` (the interval over
+  50) and `pulse_us=` (the high fraction times the frame). Expected: about
+  20000 for both pads under both keys, and about 1500 on 41 and 1000 on 42.
+  APB as the source would read 40000 under `rom` and 10000 under `pll80`.
+- `Inspect(0)` and `Inspect(1)`: `DUTY_R` `0x00004cd0` and `0x00003330`,
+  the pads' OUT_SEL `0x00000449` and `0x0000044a` and IO MUX `0x00001a00`
+  (reset `0x00000a00`: the reviewer's c4 check on both JTAG pads),
+  `TIMER0_VALUE` printed twice, some ticks apart, and moving.
 
 **P2, `pwm_servo_board`: the servos.** As P1 at the box's key, with a servo
 on 41, powered as §9 says, and optionally a second on 42. Root commands
@@ -1353,7 +1469,9 @@ The box (SO-78; SO-95 §5.3's image): root, the GPIO driver, the PWM
 driver, the controller and a heartbeat. A hand-written image gets its
 board's `[limits.default]`: on the S3, processes 8 and waiters 8, quotas
 handles 28 and mappings 12, every other kind at its floor, the derived
-totals following (SO-95 §6.4; SO-125).
+totals following, number by number where the image states none (SO-95
+§6.4; SO-125, merged). The stock root then sets each child's declared rows
+with `QuotaSet` (§3.5).
 
 ```
 resource                 the box needs                     S3 default   fits
@@ -1428,31 +1546,32 @@ flash slots              4 children                        1 today      no
    ["gpioheld"]`, each board's file naming its list), added with SO-102's
    `-r8` board, when 33..37 first matter. Until then the chip's list
    compiled into `esp32s3io` is enough for the box.
-5. **(new) The servo pins are stated three times in the box's image**
-   (`pwmconfig`, the two parts, the enable write), with nothing checking
-   them against each other (§5.2). Recommended: **accept it for the box.**
-   The driver's check catches a pair that is not one window, stage P1's
-   pad sample catches a missing enable, and the image's comment names the
-   three. A builder check would need the pins in TOML rather than a Saw
-   module, a format change worth making when a second product drives
-   servos.
+5. **(new) The servo pins are stated four times in the box's image**
+   (`pwmconfig`, the two parts, the output-level and enable writes), with
+   nothing checking them against each other (§5.2). Recommended: **accept
+   it for the box.** The driver's check catches a pair that is not one
+   window, stage P1's pad samples catch a missing enable, and the image's
+   comment names the four. A builder check would need the pins in TOML
+   rather than a Saw module, a format change worth making when a second
+   product drives servos.
 
 ---
 
 ## 12. Units of work
 
 No spec or ABI change to the kernel comes first, because none is needed.
-SO-125 (per-board limits) merges before U2 and U3 (§3.6). The read-only
-stage 0 is done (SO-109) and has no unit here. At most two agents run at
-once; SO-95 places the GPIO driver beside its U4 and the PWM driver beside
-its U6.
+SO-125 has merged. The read-only stage 0 is done (SO-109) and has no unit
+here. At most two agents run at once; SO-95 places the GPIO driver beside
+its U4 and the PWM driver beside its U6.
 
 **U1. Groundwork (Sonnet; small to medium).**
 
 - `hal/xtensa-esp32s3/board.toml`: the four devices of §3.1.
 - `sosimage devices BOARD`: prints each device's base, length and line;
   `sosimage declared PROCESS_TOML`: prints a declaration's `[quota]` and
-  `[build] inputs`. Both reuse the readers that exist.
+  `[build] inputs`, and with `--saw` prints the quota as a Saw module
+  (`public static QUOTA_HANDLES: Int = 13`, one line per kind, -1 for a
+  kind not declared). Both reuse the readers that exist.
 - The runner:
   - a case's `"devices": ["GPIO", ...]` emits one device row per name,
     after the pool row, in the case's order, from `sosimage devices`; an
@@ -1462,8 +1581,11 @@ its U6.
     `--module-path NAME=DIR` (§7.3), one build per distinct set of inputs
     in its own `--out-dir`; a child that lists an input the case does not
     give is refused naming it;
-  - a case's `"quota_from_declaration": True` (one child only) puts the
-    child's declared `[quota]` in the image's `limits.quotas`;
+  - a case's `"declared_quota": PACKAGE` gives the case's root the module
+    `childquota`, generated from that package's `process.toml`, with an
+    optional `"quota_override": {KIND: N}` over it (the bad-configuration
+    cases' Mapping row of 0). Nothing goes in the image's limits, whose
+    quota defaults are raise-only (t3);
   - `blade test` in `drivers/esp32s3io/` in a full run.
 - `drivers/esp32s3io/` with its hosted tests (§8.2).
 - `hal/xtensa-esp32s3/ABI.md`: §9 gains the facts of §2 with their
@@ -1473,27 +1595,38 @@ its U6.
   becomes "then each device row the case names".
 - `CLAUDE.md`'s repo map: `drivers/` gains the S3 packages.
 - Tests: the builder's tests for both new subcommands (a board's devices
-  printed; a declaration's quota and inputs printed; an unknown device
-  refused); the hosted tests; every existing case unchanged.
+  printed; a declaration's quota and inputs printed, and as a module; an
+  unknown device refused); the hosted tests; every existing case
+  unchanged.
 - No board needed.
 
 **U2. The GPIO driver (Sonnet; medium; after U1).** `gpioproto`, the
-driver and its `process.toml`, `tests/s3-gpio-service/`, the configs, the
-`gpio_service` and `gpio_bad_config` smoke cases, and the G1 and G2 board
-cases. Its red cases are §8.4's GPIO rows; the patch note lists the mutants
-run. Needs from the board: G1 (nothing wired), then G2 (the switch on 21).
+driver and its `process.toml`, `tests/s3-gpio-service/` (setting the
+declared rows from `childquota`), the configs, the `gpio_service` and
+`gpio_bad_config` smoke cases, and the G1 and G2 board cases. Its red cases
+are §8.4's GPIO rows; the patch note lists the mutants run, one per row.
+Needs from the board: G1 (nothing wired), then G2 (the switch on 21).
 
 **U3. The PWM driver (Sonnet; medium; after U1, beside U2).** `pwmproto`,
-the driver and its `process.toml`, `tests/s3-pwm-service/` with its setup
-writes and parts, the configs, the `pwm_service` and `pwm_bad_config`
-smoke cases, and the P1 and P2 board cases. Its red cases are §8.4's PWM
-rows. Needs from the board: P1 twice (nothing wired), then P2 (one servo,
-the capacitor, a supply good for an amp).
+the driver and its `process.toml`, `tests/s3-pwm-service/` with its four
+setup writes (through `apply_setup`), its parts and the declared rows, the
+configs, the `pwm_service` and `pwm_bad_config` smoke cases, and the P1 and
+P2 board cases. Its red cases are §8.4's PWM rows. Needs from the board: P1
+twice (nothing wired), then P2 (one servo, the capacitor, a supply good for
+an amp).
 
 **U4. Board stages (the lead and the reviewer).** G1, G2, P1 at `rom` and
 `pll80`, P2, in that order, each on the lead's request to the reviewer,
 each capture pasted into the issue and each finding recorded in `ABI.md`
 beside the emulator's answer. Nothing is flashed otherwise.
+
+**For SO-95's U6 (the stock root), from this design:** the box's
+`[[setup]]` has four entries (`SYSTEM.PERIP_CLK_EN0` set `0x800`,
+`SYSTEM.PERIP_RST_EN0` clear `0x800`, `GPIO.OUT1_W1TC` write `0x600`,
+`GPIO.ENABLE1_W1TS` write `0x600`), where SO-95 §5.3 lists three; the stock
+root's set and clear need t4's test against `0xf9c1e06f`, or this design's
+`apply_setup`; and the stock root sets each child's declared rows with
+`QuotaSet`, since an image's defaults cannot lower a row.
 
 **After SO-77:** both drivers in one image, and the box, are SO-78's, once
 SO-95's U4 and U6 (or SO-78's own layout and root) exist (§10).
