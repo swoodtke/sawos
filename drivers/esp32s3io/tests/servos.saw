@@ -1,0 +1,190 @@
+// The PWM driver's commands, through a port that records each write: a
+// channel looked up before any address is formed, a pulse refused at each end
+// of its range and accepted at each end, nothing written for a refusal; the
+// registers `Inspect` reads; where the driver's windows hold each register;
+// and the counts a driver keeps, held at their greatest value.
+
+import esp32s3io.{
+    Block, Placed, PwmRefusal, PwmWindow, Register, RegisterPort, Servo,
+    count_up, count_up_16, inspected, lowest_pin, out_sel_register, pad_register,
+    place_pwm, servo_of, set_servo, stop_servo,
+}
+
+struct Recorder {
+    writes: Vector<String>
+}
+
+extension Recorder: NoCopy {}
+
+extension Recorder: RegisterPort {
+    func write(&var self, reg: Register, word: UInt32) {
+        try! self.writes.push("{reg.address()} {word}")
+    }
+}
+
+extension Recorder {
+    static func fresh() -> Recorder {
+        Recorder(writes: Vector<String>())
+    }
+}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// The smoke's servos: channel 0 on 41 from 500 to 2500, channel 1 on 42
+/// from 1000 to 2000.
+func smoke() -> [Servo; 2] {
+    [Servo(channel: 0, pin: 41, min_us: 500, max_us: 2500),
+     Servo(channel: 1, pin: 42, min_us: 1000, max_us: 2000)]
+}
+
+/// What `set_servo` answered, as a line.
+func set_line(r: &var Recorder, channel: UInt8, pulse_us: UInt32) -> String {
+    let servos = smoke()
+    match set_servo(&var r, 20000, &servos, channel, pulse_us) {
+        case Ok(counts) -> "counts {counts}",
+        case Err(why) -> if why == PwmRefusal.BadChannel { "BadChannel" } else { "OutOfRange" },
+    }
+}
+
+/// What `stop_servo` answered, as a line.
+func stop_line(r: &var Recorder, channel: UInt8) -> String {
+    let servos = smoke()
+    match stop_servo(&var r, &servos, channel) {
+        case Ok(_) -> "stopped",
+        case Err(why) -> if why == PwmRefusal.BadChannel { "BadChannel" } else { "OutOfRange" },
+    }
+}
+
+/// Whether `channel` is refused as `BadChannel`.
+func no_servo(servos: &[Servo; 2], channel: UInt8) -> Bool {
+    match servo_of(&servos, channel) {
+        case Ok(_) -> false,
+        case Err(why) -> why == PwmRefusal.BadChannel,
+    }
+}
+
+func expect(what: String, got: String, want: String) {
+    if not got.equals(want) {
+        print("{what}: got {got}, wanted {want}")
+    }
+    assert(got.equals(want), what)
+}
+
+func main() {
+    let servos = smoke()
+
+    // The lookup: each configured channel answers its own servo, and every
+    // other channel, in range or not, is refused.
+    let zero = try! servo_of(&servos, 0)
+    check(zero.pin == 41 && zero.min_us == 500 && zero.max_us == 2500, "channel 0 is 41's")
+    let one = try! servo_of(&servos, 1)
+    check(one.pin == 42 && one.min_us == 1000 && one.max_us == 2000, "channel 1 is 42's")
+    var c: UInt8 = 2
+    while c < 255 {
+        check(no_servo(&servos, c), "channel {c} is not configured")
+        c = c + 1
+    }
+    check(no_servo(&servos, 255), "channel 255 is not configured")
+
+    // A command on a channel the configuration does not name writes nothing:
+    // channel 8's CONF0 would be TIMER0_CONF.
+    var r = Recorder.fresh()
+    expect("Set(2, 1500)", set_line(&var r, 2, 1500), "BadChannel")
+    expect("Set(7, 1500)", set_line(&var r, 7, 1500), "BadChannel")
+    expect("Set(8, 1500)", set_line(&var r, 8, 1500), "BadChannel")
+    expect("Stop(2)", stop_line(&var r, 2), "BadChannel")
+    expect("Stop(8)", stop_line(&var r, 8), "BadChannel")
+    expect("Stop(255)", stop_line(&var r, 255), "BadChannel")
+    check(r.writes.len() == 0, "a refused channel writes nothing")
+
+    // Each end of each servo's range: refused one past it, accepted at it.
+    // Neither 0 nor the greatest pulse is accepted, and the greatest computes
+    // no counts, whose product would not fit 32 bits.
+    expect("Set(0, 499)", set_line(&var r, 0, 499), "OutOfRange")
+    expect("Set(0, 2501)", set_line(&var r, 0, 2501), "OutOfRange")
+    expect("Set(0, 0)", set_line(&var r, 0, 0), "OutOfRange")
+    expect("Set(0, 0xFFFFFFFF)", set_line(&var r, 0, 0xFFFF_FFFF), "OutOfRange")
+    expect("Set(1, 999)", set_line(&var r, 1, 999), "OutOfRange")
+    expect("Set(1, 2001)", set_line(&var r, 1, 2001), "OutOfRange")
+    expect("Set(1, 500)", set_line(&var r, 1, 500), "OutOfRange")
+    check(r.writes.len() == 0, "a refused pulse writes nothing")
+    expect("Set(0, 500)", set_line(&var r, 0, 500), "counts 410")
+    expect("Set(0, 2500)", set_line(&var r, 0, 2500), "counts 2048")
+    expect("Set(1, 1000)", set_line(&var r, 1, 1000), "counts 819")
+    expect("Set(1, 2000)", set_line(&var r, 1, 2000), "counts 1638")
+    check(r.writes.len() == 12, "each accepted Set writes three words")
+
+    // The words: a Set is the channel's duty, CONF1 and CONF0; a Stop its
+    // CONF1 and CONF0; a Set after the Stop starts the pulses again.
+    r = Recorder.fresh()
+    expect("Set(0, 1500)", set_line(&var r, 0, 1500), "counts 1229")
+    expect("Stop(0)", stop_line(&var r, 0), "stopped")
+    expect("Set(0, 1500) again", set_line(&var r, 0, 1500), "counts 1229")
+    expect("Stop(1)", stop_line(&var r, 1), "stopped")
+    expect("Set(1, 1000)", set_line(&var r, 1, 1000), "counts 819")
+    let words = r.writes.join(", ")
+    // 0x60019008 <- 0x4cd0, 0x6001900c <- 0xc0100400, 0x60019000 <- 0x14;
+    // 0x6001900c <- 0x40100400, 0x60019000 <- 0x10; then channel 1's at
+    // 0x60019014 (CONF0), 0x6001901c (DUTY) and 0x60019020 (CONF1).
+    let want: Vector<String> = [
+        "1610715144 19664", "1610715148 3222275072", "1610715136 20",
+        "1610715148 1074791424", "1610715136 16",
+        "1610715144 19664", "1610715148 3222275072", "1610715136 20",
+        "1610715168 1074791424", "1610715156 16",
+        "1610715164 13104", "1610715168 3222275072", "1610715156 20"]
+    expect("Set, Stop, Set on both channels", words, want.join(", "))
+
+    // The registers Inspect reads: channel 1's DUTY_R (0x60019024),
+    // TIMER0_VALUE (0x600190a4), channel 1's CONF0 (0x60019014), pad 42's
+    // output select (0x600045fc) and IO MUX word (0x600090ac).
+    let seen = inspected(&one)
+    check(seen.duty_r.address() == 0x6001_9024, "channel 1's DUTY_R")
+    check(seen.timer.address() == 0x6001_90a4, "TIMER0_VALUE")
+    check(seen.conf0.address() == 0x6001_9014, "channel 1's CONF0")
+    check(seen.out_sel.address() == 0x6000_45fc, "pad 42's output select")
+    check(seen.pad.address() == 0x6000_90ac, "pad 42's IO MUX word")
+    let first = inspected(&zero)
+    check(first.duty_r.address() == 0x6001_9010 && first.conf0.address() == 0x6001_9000,
+          "channel 0's")
+
+    // Where the driver's windows hold each register: LEDC whole, and each
+    // part from pad 41's register for two pads; the pads on either side are
+    // in neither part.
+    check(lowest_pin(&servos) == 41, "the parts begin at 41")
+    let swapped: [Servo; 2] = [Servo(channel: 0, pin: 42, min_us: 500, max_us: 2500),
+                               Servo(channel: 1, pin: 41, min_us: 500, max_us: 2500)]
+    check(lowest_pin(&swapped) == 41, "whatever the servos' order")
+    let no_servos: [Servo; 0] = []
+    check(lowest_pin(&no_servos) == 255, "no servo: 255")
+    check(place_pwm(Register(block: Block.Ledc, offset: 0xA0), 41, 2)
+          == Placed(window: PwmWindow.Ledc, offset: 0xA0), "LEDC at its own offset")
+    check(place_pwm(out_sel_register(41), 41, 2) == Placed(window: PwmWindow.OutSel, offset: 0),
+          "41's output select first")
+    check(place_pwm(out_sel_register(42), 41, 2) == Placed(window: PwmWindow.OutSel, offset: 4),
+          "42's after it")
+    check(place_pwm(out_sel_register(40), 41, 2).is_none(), "40's is not the driver's")
+    check(place_pwm(out_sel_register(43), 41, 2).is_none(), "43's is not the driver's")
+    check(place_pwm(pad_register(41), 41, 2) == Placed(window: PwmWindow.Pads, offset: 0),
+          "pad 41 first")
+    check(place_pwm(pad_register(42), 41, 2) == Placed(window: PwmWindow.Pads, offset: 4),
+          "pad 42 after it")
+    check(place_pwm(pad_register(40), 41, 2).is_none(), "pad 40 is not the driver's")
+    check(place_pwm(pad_register(43), 41, 2).is_none(), "pad 43 is not the driver's")
+    check(place_pwm(Register(block: Block.Gpio, offset: 0x18), 41, 2).is_none(),
+          "nor is any other GPIO register")
+    check(place_pwm(out_sel_register(42), 41, 1).is_none(), "one servo, one word")
+
+    // The counts a driver keeps hold at their greatest value.
+    check(count_up(0) == 1, "a count goes up")
+    check(count_up(0xFFFF_FFFE) == 0xFFFF_FFFF, "to its greatest")
+    check(count_up(0xFFFF_FFFF) == 0xFFFF_FFFF, "and stays there")
+    check(count_up_16(0) == 1, "a 16-bit count goes up")
+    check(count_up_16(0xFFFE) == 0xFFFF, "to its greatest")
+    check(count_up_16(0xFFFF) == 0xFFFF, "and stays there")
+}

@@ -1,0 +1,74 @@
+//! Stage P2 on a board, from the PWM driver's client: a servo on each of pads
+//! 41 and 42 (the one on 42 may be left off), moved one at a time, as the
+//! box's controller will.
+//!
+//! Each servo in turn: five swings between 1000 and 2000 us, two seconds
+//! apart, then centred at 1500; stopped, limp for five seconds, so its arm
+//! turns by hand; then commanded again, holding centre and moving to 1000 and
+//! back; stopped at the end. Each command prints what the servo should be
+//! doing, for whoever watches it.
+
+import sos.{SosStatus}
+import pwmkit.{Remote, Sleeper, begin, finish, sleeper, EXIT_OK, EXIT_FAILED}
+
+static TAG_PWM: UInt = 2
+
+/// The pause between two commands.
+static STEP_NS: UInt64 = 2_000_000_000
+/// How long a stopped servo is left limp.
+static LIMP_NS: UInt64 = 5_000_000_000
+
+/// `Set(channel, pulse_us)`, and what the servo on `pin` should do.
+func command(r: &var Remote, s: &Sleeper, channel: UInt8, pin: UInt8, pulse_us: UInt32,
+             what: String) -> Result<Void, SosStatus> {
+    let counts = try r.set("set {channel} {pulse_us}", channel, pulse_us)
+    print("SOS pwmservo: set {} {} (counts {}): the servo on {} {}", channel, pulse_us,
+          counts, pin, what)
+    try s.sleep(STEP_NS)
+    return
+}
+
+/// One servo's run.
+func exercise(r: &var Remote, s: &Sleeper, channel: UInt8, pin: UInt8) -> Result<Void, SosStatus> {
+    var swing = 0
+    while swing < 5 {
+        try command(&var r, &s, channel, pin, 1000, "turns to one end")
+        try command(&var r, &s, channel, pin, 2000, "turns to the other")
+        swing = swing + 1
+    }
+    try command(&var r, &s, channel, pin, 1500, "centres")
+    try r.stop("stop {channel}", channel)
+    print("SOS pwmservo: stop {}: the servo on {} is limp; turn its arm by hand", channel, pin)
+    try s.sleep(LIMP_NS)
+    try command(&var r, &s, channel, pin, 1500, "holds centre again")
+    try command(&var r, &s, channel, pin, 1000, "turns to one end")
+    try command(&var r, &s, channel, pin, 1500, "centres")
+    try r.stop("stop {channel}", channel)
+    print("SOS pwmservo: stop {}: the servo on {} is limp", channel, pin)
+    return
+}
+
+func script(r: &var Remote, s: &Sleeper) -> Result<Void, SosStatus> {
+    print("SOS pwmservo: both servos are limp until their first command")
+    try s.sleep(LIMP_NS)
+    try exercise(&var r, &s, 0, 41)
+    try exercise(&var r, &s, 1, 42)
+    return
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    guard var r = begin(boot_handle, "pwmservo", TAG_PWM) else { return }
+    let s = try sleeper(&r) catch {
+        print("SOS pwmservo: no timer: {}", error)
+        finish(&r, EXIT_FAILED)
+        return
+    }
+    try script(&var r, &s) catch {
+        print("SOS pwmservo: stopped: {}", error)
+        finish(&r, EXIT_FAILED)
+        return
+    }
+    print("SOS pwmservo: done")
+    finish(&r, EXIT_OK)
+}

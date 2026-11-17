@@ -3181,9 +3181,11 @@ part's, `-m 8M -global ssi_psram.is_octal=true`. Found on these runs:
   each address it names, its `device_stores` a store among them for a word
   a later step puts back, and its `device_untouched` an address the kernel
   stores nothing to: no store from `_start`'s first, the RTC watchdog's key
-  (§2e), on. The ROM's boot stores to pads 27 to 32 before the kernel runs,
-  leaving 29 and 30 at 0 and 31 and 32 at `0x200`; the last store to 27
-  and 28 is S1's.
+  (§2e), on. A `kernel_writes` row is a `device_writes` row whose address
+  must also be stored to from that first store on, so a word the ROM left
+  at the expected value does not pass for the image's. The ROM's boot
+  stores to pads 27 to 32 before the kernel runs, leaving 29 and 30 at 0
+  and 31 and 32 at `0x200`; the last store to 27 and 28 is S1's.
 - The eFuse word is read from a file given with `-drive file=F,if=none,
   format=raw,id=efuse -global driver=nvram.esp32s3.efuse,property=drive,
   value=efuse`: six words of block 0, then block 1, so

@@ -1,0 +1,312 @@
+//! Stage P1 on a board, from the PWM driver's client: the servo signal on
+//! pads 41 and 42 with nothing wired, read back through GPIO.
+//!
+//! The client holds GPIO whole, so it reads each pad's level in `IN1` (both
+//! pads have their input enabled), and their output levels and enables in
+//! `OUT1` and `ENABLE1`. It shows:
+//!
+//! - both pads' output enabled, which root's `ENABLE1_W1TS` setup word does,
+//!   and their output level 0. `OUT1` resets to 0, so the level would read 0
+//!   whatever `OUT1_W1TC` word root wrote; the emulator's store trace holds
+//!   that word (`pwm_service`);
+//! - both pads low from the driver's start until the first `Set`;
+//! - each pad's frame and pulse, timed by the Monotonic clock over fifty
+//!   frames, the pulse from the share of the samples that read high;
+//! - what `Inspect` reads back: the duty in force, the pad's output select and
+//!   IO MUX word, timer 0 counting;
+//! - `Stop` on each channel holding its pad low while the other pulses on, and
+//!   a later `Set` starting its pulses again.
+//!
+//! Every check prints its numbers and `ok`, or `WRONG` with what it wanted,
+//! and the script goes on, so one capture shows every check.
+
+import sos.{ClockType, Clock, SosStatus}
+import pwmkit.{Remote, Sleeper, Words, begin, finish, sleeper, EXIT_OK, EXIT_FAILED}
+
+static TAG_PWM: UInt = 2
+static TAG_GPIO: UInt = 3
+
+// GPIO's registers: bank 1's output levels, output enables and input levels.
+static OUT1: UInt = 0x010
+static ENABLE1: UInt = 0x02C
+static IN1: UInt = 0x040
+// Pads 41 and 42 are bank 1's bits 9 and 10.
+static PAD41_BIT: UInt32 = 9
+static PAD42_BIT: UInt32 = 10
+
+/// How many samples a check of a still pad takes.
+static STILL_SAMPLES: UInt32 = 1_000_000
+/// The most samples a measurement takes before it gives up on a pad that
+/// never rises: several seconds at any clock key.
+static MAX_SAMPLES: UInt32 = 50_000_000
+/// The frames a measurement times: from the first rising edge to the 51st.
+static FRAMES: UInt32 = 50
+/// A pause that crosses several frame boundaries, so a command is in force.
+static SETTLE_NS: UInt64 = 100_000_000
+
+// What a measurement accepts: the frame within 1% of 20 ms, the pulse within
+// 60 us of the command. A divider computed for the crystal and run from APB
+// would read 40000 or 10000.
+static FRAME_US: UInt32 = 20000
+static FRAME_SLACK_US: UInt32 = 200
+static PULSE_SLACK_US: UInt32 = 60
+
+/// A device register's word, as a mapped window shows it.
+struct Word {
+    v: UInt32,
+}
+
+/// The register at `address`, read now.
+func read_word(address: UInt) unsafe -> UInt32 {
+    let register = UnsafeMemory<Word, Device>(address)
+    register.v.read()
+}
+
+/// What the stage holds: the driver's connection, GPIO's base, the clock,
+/// and how many checks went wrong.
+struct Board {
+    r: Remote
+    gpio: UInt
+    clock: Clock
+    wrong: Int
+}
+
+extension Board: NoCopy {}
+
+/// One pad's frame and pulse, as measured, and the rising edges seen: fewer
+/// than `FRAMES` is a pad that stopped rising, and no measurement.
+struct Measured {
+    edges: UInt32
+    frame_us: UInt32
+    pulse_us: UInt32
+}
+
+extension Board {
+    /// Bank 1's input levels.
+    func in1(&self) -> UInt32 {
+        read_word(self.gpio + IN1)
+    }
+
+    /// Prints a check's line, `LABEL ok: DETAILS` or `LABEL WRONG: DETAILS,
+    /// wanted WANTED`, and counts a wrong one.
+    func verdict(&var self, label: String, details: String, ok: Bool, wanted: String) {
+        if ok {
+            print("SOS pwmboard: {} ok: {}", label, details)
+        } else {
+            print("SOS pwmboard: {} WRONG: {}, wanted {}", label, details, wanted)
+            self.wrong = self.wrong + 1
+        }
+    }
+
+    /// How many of `STILL_SAMPLES` samples read pad `bit` high.
+    func highs(&self, bit: UInt32) -> UInt32 {
+        var high: UInt32 = 0
+        var n: UInt32 = 0
+        while n < STILL_SAMPLES {
+            high = high + ((self.in1() >> bit) & 1)
+            n = n + 1
+        }
+        high
+    }
+
+    /// Checks that pad `pin` (bank 1's `bit`) reads low throughout.
+    func still(&var self, what: String, pin: UInt8, bit: UInt32) {
+        let high = self.highs(bit)
+        self.verdict("pad {pin} {what}", "{high} high of {STILL_SAMPLES}", high == 0, "0 high")
+    }
+
+    /// Times `FRAMES` frames of pad `bit`, from one rising edge to the one
+    /// `FRAMES` later, and the share of the samples between that read high.
+    /// Every sample costs the same, high or low, so the share is the pulse's
+    /// share of the frame. A pad that does not rise within `MAX_SAMPLES` is
+    /// measured as fewer edges than `FRAMES`.
+    func measure(&self, bit: UInt32) -> Result<Measured, SosStatus> {
+        // To a low level, then to the rising edge.
+        var n: UInt32 = 0
+        while ((self.in1() >> bit) & 1) == 1 && n < MAX_SAMPLES {
+            n = n + 1
+        }
+        while ((self.in1() >> bit) & 1) == 0 && n < MAX_SAMPLES {
+            n = n + 1
+        }
+        if n >= MAX_SAMPLES {
+            return Measured(edges: 0, frame_us: 0, pulse_us: 0)
+        }
+        let start = try self.clock.now()
+        var edges: UInt32 = 0
+        var high: UInt32 = 0
+        var total: UInt32 = 0
+        var last: UInt32 = 1
+        while edges < FRAMES && total < MAX_SAMPLES {
+            let level = (self.in1() >> bit) & 1
+            edges = edges + (level & (last ^ 1))
+            high = high + level
+            total = total + 1
+            last = level
+        }
+        let end = try self.clock.now()
+        if edges < FRAMES {
+            return Measured(edges: edges, frame_us: 0, pulse_us: 0)
+        }
+        // Fifty frames of any sane length are well inside 32 bits of
+        // nanoseconds, and 64-bit division is a call no call0 library has.
+        let span = end - start
+        if span > 0xFFFF_FFFF {
+            return Measured(edges: edges, frame_us: 0xFFFF_FFFF, pulse_us: 0)
+        }
+        let frame_us = (span as UInt32) / FRAMES / 1000
+        // The pulse is high * frame / total, scaled down until the product
+        // fits 32 bits.
+        while frame_us > 0 && high > 0xFFFF_FFFF / frame_us {
+            high = high >> 1
+            total = total >> 1
+        }
+        let pulse_us = if total == 0 { 0 } else { high * frame_us / total }
+        return Measured(edges: edges, frame_us: frame_us, pulse_us: pulse_us)
+    }
+
+    /// Checks pad `pin`'s frame and its pulse against `pulse_us`.
+    func pulses(&var self, pin: UInt8, bit: UInt32, pulse_us: UInt32) -> Result<Void, SosStatus> {
+        let m = try self.measure(bit)
+        if m.edges < FRAMES {
+            self.verdict("pad {pin} at {pulse_us} us", "{m.edges} rising edges", false,
+                         "{FRAMES + 1}")
+            return
+        }
+        let frame_low = m.frame_us + FRAME_SLACK_US >= FRAME_US
+        let frame_high = m.frame_us <= FRAME_US + FRAME_SLACK_US
+        let pulse_low = m.pulse_us + PULSE_SLACK_US >= pulse_us
+        let pulse_high = m.pulse_us <= pulse_us + PULSE_SLACK_US
+        let frame_ok = frame_low && frame_high
+        let pulse_ok = pulse_low && pulse_high
+        self.verdict("pad {pin} at {pulse_us} us", "frame_us={m.frame_us} pulse_us={m.pulse_us}",
+                     frame_ok && pulse_ok,
+                     "frame_us {FRAME_US} and pulse_us {pulse_us}, each within its slack")
+        return
+    }
+
+    /// `Set(channel, pulse_us)`, its counts checked.
+    func set(&var self, channel: UInt8, pulse_us: UInt32, counts: UInt32) -> Result<Void, SosStatus> {
+        let got = try self.r.set("set {channel} {pulse_us}", channel, pulse_us)
+        self.verdict("set {channel} {pulse_us}", "counts {got}", got == counts, "counts {counts}")
+        return
+    }
+
+    /// `Inspect(channel)` while its pulses are `counts` wide, on a pad with
+    /// output select `out_sel`: the duty in force, the select, the IO MUX word
+    /// (`0x1a00`, function 1 with its input on), and `SIG_OUT_EN` set.
+    func inspect_set(&var self, channel: UInt8, counts: UInt32,
+                     out_sel: UInt32) -> Result<Words, SosStatus> {
+        let w = try self.r.inspect("inspect {channel}", channel)
+        let words_ok = w.duty_r == counts << 4 && w.out_sel == out_sel && w.iomux == 0x1a00
+        let ok = words_ok && (w.conf0 & 4) != 0
+        self.verdict("inspect {channel}",
+                     "duty_r={w.duty_r} out_sel={w.out_sel} iomux={w.iomux} conf0={w.conf0}", ok,
+                     "duty_r {counts << 4}, out_sel {out_sel}, iomux 6656, conf0 bit 2 set")
+        return w
+    }
+
+    /// `Inspect(channel)` once it is stopped: `SIG_OUT_EN` clear.
+    func inspect_stopped(&var self, channel: UInt8) -> Result<Void, SosStatus> {
+        let w = try self.r.inspect("inspect {channel}", channel)
+        self.verdict("inspect {channel} stopped", "conf0={w.conf0} duty_r={w.duty_r}",
+                     (w.conf0 & 4) == 0, "conf0 bit 2 clear")
+        return
+    }
+}
+
+func script(b: &var Board, s: &Sleeper) -> Result<Void, SosStatus> {
+    // Both pads' output enabled (root's `ENABLE1_W1TS`) and driven to 0.
+    let out1 = read_word(b.gpio + OUT1)
+    let enable1 = read_word(b.gpio + ENABLE1)
+    let pads = (1u32 << PAD41_BIT) | (1u32 << PAD42_BIT)
+    b.verdict("setup", "OUT1={out1} ENABLE1={enable1}",
+              (out1 & pads) == 0 && (enable1 & pads) == pads,
+              "OUT1 bits 9 and 10 clear and ENABLE1's set")
+    // The driver has started once it answers.
+    let head = try b.r.log_head("log")
+    b.verdict("the driver started", "log {head.total}", head.total >= 14, "14 start writes")
+    b.still("before any Set", 41, PAD41_BIT)
+    b.still("before any Set", 42, PAD42_BIT)
+
+    try b.set(0, 1500, 1229)
+    try b.set(1, 1000, 819)
+    try s.sleep(SETTLE_NS)
+    try b.pulses(41, PAD41_BIT, 1500)
+    try b.pulses(42, PAD42_BIT, 1000)
+    let first = try b.inspect_set(0, 1229, 0x449)
+    let _ = try b.inspect_set(1, 819, 0x44a)
+    let again = try b.r.inspect("inspect 0", 0)
+    b.verdict("timer 0 counts", "{first.timer} then {again.timer}", first.timer != again.timer,
+              "two readings that differ")
+
+    // Each channel stopped while the other pulses on, then started again.
+    try b.r.stop("stop 0", 0)
+    try s.sleep(SETTLE_NS)
+    b.still("after stop 0", 41, PAD41_BIT)
+    try b.pulses(42, PAD42_BIT, 1000)
+    try b.inspect_stopped(0)
+    try b.set(0, 2000, 1638)
+    try s.sleep(SETTLE_NS)
+    try b.pulses(41, PAD41_BIT, 2000)
+    try b.r.stop("stop 1", 1)
+    try s.sleep(SETTLE_NS)
+    b.still("after stop 1", 42, PAD42_BIT)
+    try b.pulses(41, PAD41_BIT, 2000)
+    try b.inspect_stopped(1)
+    try b.set(1, 1500, 1229)
+    try s.sleep(SETTLE_NS)
+    try b.pulses(42, PAD42_BIT, 1500)
+
+    // Both stopped, as the box leaves them at rest.
+    try b.r.stop("stop 0", 0)
+    try b.r.stop("stop 1", 1)
+    try s.sleep(SETTLE_NS)
+    b.still("at rest", 41, PAD41_BIT)
+    b.still("at rest", 42, PAD42_BIT)
+    return
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    guard var r = begin(boot_handle, "pwmboard", TAG_PWM) else { return }
+    guard let window = r.take_window(TAG_GPIO) else {
+        print("SOS pwmboard: no GPIO record {}", TAG_GPIO)
+        finish(&r, EXIT_FAILED)
+        return
+    }
+    let mapping = try r.proc.map(iomemory: &window) catch {
+        print("SOS pwmboard: GPIO not mapped: {}", error)
+        finish(&r, EXIT_FAILED)
+        return
+    }
+    let gpio = try mapping.base() catch {
+        print("SOS pwmboard: GPIO's base: {}", error)
+        finish(&r, EXIT_FAILED)
+        return
+    }
+    let clock = try r.system.clock_get(type: ClockType.Monotonic) catch {
+        print("SOS pwmboard: no clock: {}", error)
+        finish(&r, EXIT_FAILED)
+        return
+    }
+    let s = try sleeper(&r) catch {
+        print("SOS pwmboard: no timer: {}", error)
+        finish(&r, EXIT_FAILED)
+        return
+    }
+    var b = Board(r: move r, gpio: gpio, clock: move clock, wrong: 0)
+    try script(&var b, &s) catch {
+        print("SOS pwmboard: stopped: {}", error)
+        finish(&b.r, EXIT_FAILED)
+        return
+    }
+    let _ = move mapping
+    if b.wrong == 0 {
+        print("SOS pwmboard: done, every check ok")
+        finish(&b.r, EXIT_OK)
+    } else {
+        print("SOS pwmboard: done, {} checks WRONG", b.wrong)
+        finish(&b.r, EXIT_FAILED)
+    }
+}

@@ -1,0 +1,47 @@
+# Stage P2: a servo on each of pads 41 and 42 (the one on 42 may be left off),
+# moved and stopped one at a time by a client that prints what each should do
+# (`tests/pwm-servo-client`), over the servos of `tests/images/pwm/board.saw`.
+# The S3 smoke's `pwm_servo_board` case builds it for a board with
+# `--emit-flash`.
+#
+# The servo pins, 41 and 42, are stated four times: in the configuration, in
+# the driver's two parts, and in the two pad words of the setup writes (bits 9
+# and 10 of GPIO's second bank). Nothing checks one against another.
+format = 1
+
+[image]
+name = "pwm_servo_board"
+board = "esp32s3"
+tick = false
+
+[root]
+package = "stock"
+
+# LEDC's clock on and its reset off, each a read-modify-write of a word that
+# gates every peripheral; then pads 41 and 42 driven low once they are GPIO.
+[[setup]]
+register = "SYSTEM.PERIP_CLK_EN0"
+set = 0x800
+
+[[setup]]
+register = "SYSTEM.PERIP_RST_EN0"
+clear = 0x800
+
+[[setup]]
+register = "GPIO.OUT1_W1TC"
+write = 0x600
+
+[[setup]]
+register = "GPIO.ENABLE1_W1TS"
+write = 0x600
+
+[[process]]
+name = "driver"
+package = "sawos:drivers/svc-pwm-esp32s3"
+device = { ledc = "LEDC", outsel = "GPIO.out_sel[41..=42]", pads = "IO_MUX.pad[41..=42]" }
+inputs = { pwmconfig = "tests/images/pwm/board.saw" }
+
+[[process]]
+name = "client"
+package = "sawos:tests/pwm-servo-client"
+clients = { pwm = "driver.pwm" }

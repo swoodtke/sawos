@@ -1,0 +1,385 @@
+//! The PWM driver's service case, from its client.
+//!
+//! This emulator holds none of LEDC's, GPIO's or the IO MUX's words: a write
+//! is dropped and a read answers 0. The case holds what it can show anyway,
+//! through the driver's log of the words it wrote and its answers:
+//!
+//! - the start's writes, each word and its order (`Log`);
+//! - `Set` on each channel, its counts and its three words;
+//! - every refusal of every op, at each end of each bound, the log unmoved;
+//! - each servo's range accepted at both ends;
+//! - `Stop` then `Set` on each channel: the pulses cut, then started again;
+//! - a request carrying `PIPE_MSG_HANDLES` handles, answered with the driver
+//!   up;
+//! - the log's bounds: a reply's fifteen entries, its end, and the writes it
+//!   counts and does not keep.
+//!
+//! What the device reads back (`Inspect`) is the part's to show, on a board;
+//! here each `Inspect` is held to its answer and its words are printed.
+
+import sos.{PipeHandles, SosStatus}
+import pwmproto.{PwmStatus, LOG_PER_REPLY}
+import pwmkit.{Remote, begin, entry, finish, EXIT_OK, EXIT_FAILED}
+
+static TAG_PWM: UInt = 2
+
+/// One word the driver wrote: the address and the word.
+struct Written {
+    address: UInt32
+    word: UInt32
+}
+
+/// The start's writes for the smoke configuration
+/// (`tests/images/pwm/smoke.saw`): LEDC's clock, timer 0 (14 bits, a divider
+/// of 12500/256 for 20 ms, RST held, latched, released), channels 0 and 1
+/// idle, then pads 41 and 42, each to the plain GPIO signal, function 1 with
+/// its input on, then its channel's signal (73 + channel) with `OEN_SEL`.
+/// Written out from the registers' addresses and fields, not computed by the
+/// driver's own functions.
+static START: [Written; 14] = [
+    Written(address: 0x600190d0, word: 0x00000003),
+    Written(address: 0x600190a0, word: 0x00830d4e),
+    Written(address: 0x600190a0, word: 0x02830d4e),
+    Written(address: 0x600190a0, word: 0x00030d4e),
+    Written(address: 0x60019004, word: 0x00000000),
+    Written(address: 0x60019000, word: 0x00000010),
+    Written(address: 0x60019018, word: 0x00000000),
+    Written(address: 0x60019014, word: 0x00000010),
+    Written(address: 0x600045f8, word: 0x00000100),
+    Written(address: 0x600090a8, word: 0x00001a00),
+    Written(address: 0x600045f8, word: 0x00000449),
+    Written(address: 0x600045fc, word: 0x00000100),
+    Written(address: 0x600090ac, word: 0x00001a00),
+    Written(address: 0x600045fc, word: 0x0000044a),
+]
+
+// Each channel's `DUTY`, `CONF1` and `CONF0`, and the words a `Set` and a
+// `Stop` write to them.
+static CH0_DUTY: UInt32 = 0x60019008
+static CH0_CONF1: UInt32 = 0x6001900c
+static CH0_CONF0: UInt32 = 0x60019000
+static CH1_DUTY: UInt32 = 0x6001901c
+static CH1_CONF1: UInt32 = 0x60019020
+static CH1_CONF0: UInt32 = 0x60019014
+static CONF1_SET: UInt32 = 0xc0100400
+static CONF1_STOP: UInt32 = 0x40100400
+static CONF0_SET: UInt32 = 0x00000014
+static CONF0_STOP: UInt32 = 0x00000010
+
+/// The log's entries from `from`, compared with `want`: its head holds
+/// `total` entries kept, none dropped, and `want.len()` entries in this reply.
+func check_entries(r: &var Remote, step: String, from: UInt8, total: UInt8,
+                   want: &Vector<Written>) -> Result<Void, SosStatus> {
+    let reply = try r.log(step, from)
+    let count = want.len()
+    if reply.byte(1) != total || reply.u16(2) != 0 || reply.byte(4) != (count as UInt8) {
+        return r.mismatch(step, "total {reply.byte(1)} dropped {reply.u16(2)} n {reply.byte(4)}",
+                          "total {total} dropped 0 n {count}")
+    }
+    var i = 0
+    while i < count {
+        let (address, word) = entry(&reply, i)
+        let w = want.get(i)!
+        if address != w.address || word != w.word {
+            return r.mismatch(step, "entry {from as Int + i} address {address} word {word}",
+                              "address {w.address} word {w.word}")
+        }
+        i = i + 1
+    }
+    return
+}
+
+/// The log's total, and that it has dropped nothing.
+func log_total(r: &var Remote, step: String) -> Result<UInt8, SosStatus> {
+    let head = try r.log_head(step)
+    if head.dropped != 0 {
+        return r.mismatch(step, "dropped {head.dropped}", "dropped 0")
+    }
+    return head.total
+}
+
+/// A request the driver refuses with `want`, printed.
+func refuse(r: &var Remote, step: String, len: UInt, want: PwmStatus) -> Result<Void, SosStatus> {
+    let reply = try r.expect(step, len, want)
+    if reply.len != 1 {
+        return r.mismatch(step, "a refusal of {reply.len} bytes", "1")
+    }
+    print("SOS pwmclient: {}: {}", step, want.describe())
+    return
+}
+
+/// `Set(channel, pulse_us)` answered with `counts`.
+func set_counts(r: &var Remote, channel: UInt8, pulse_us: UInt32,
+                counts: UInt32) -> Result<Void, SosStatus> {
+    let step = "set {channel} {pulse_us}"
+    let got = try r.set(step, channel, pulse_us)
+    if got != counts {
+        return r.mismatch(step, "counts {got}", "counts {counts}")
+    }
+    return
+}
+
+func start_writes(r: &var Remote) -> Result<Void, SosStatus> {
+    var want = Vector<Written>()
+    var i = 0
+    while i < 14 {
+        try! want.push(START[i])
+        i = i + 1
+    }
+    try check_entries(&var r, "log 0", 0, 14, &want)
+    print("SOS pwmclient: log 0: the 14 start writes")
+    // The log's end: the last entry, then none.
+    var last = Vector<Written>()
+    try! last.push(START[13])
+    try check_entries(&var r, "log 13", 13, 14, &last)
+    let none = Vector<Written>()
+    try check_entries(&var r, "log 14", 14, 14, &none)
+    try check_entries(&var r, "log 255", 255, 14, &none)
+    print("SOS pwmclient: log 13: one entry; log 14 and 255: none")
+    return
+}
+
+/// The three words a `Set` of `counts` writes on a channel.
+func set_words(duty: UInt32, conf1: UInt32, conf0: UInt32, counts: UInt32) -> Vector<Written> {
+    var v = Vector<Written>()
+    try! v.push(Written(address: duty, word: counts << 4))
+    try! v.push(Written(address: conf1, word: CONF1_SET))
+    try! v.push(Written(address: conf0, word: CONF0_SET))
+    move v
+}
+
+/// The two words a `Stop` writes on a channel.
+func stop_words(conf1: UInt32, conf0: UInt32) -> Vector<Written> {
+    var v = Vector<Written>()
+    try! v.push(Written(address: conf1, word: CONF1_STOP))
+    try! v.push(Written(address: conf0, word: CONF0_STOP))
+    move v
+}
+
+func first_sets(r: &var Remote) -> Result<Void, SosStatus> {
+    try set_counts(&var r, 0, 1500, 1229)
+    let zero = set_words(CH0_DUTY, CH0_CONF1, CH0_CONF0, 1229)
+    try check_entries(&var r, "log 14", 14, 17, &zero)
+    print("SOS pwmclient: set 0 1500: counts 1229, DUTY 0x00004cd0 CONF1 0xc0100400 CONF0 0x14")
+    try set_counts(&var r, 1, 1000, 819)
+    let one = set_words(CH1_DUTY, CH1_CONF1, CH1_CONF0, 819)
+    try check_entries(&var r, "log 17", 17, 20, &one)
+    print("SOS pwmclient: set 1 1000: counts 819, DUTY 0x00003330 CONF1 0xc0100400 CONF0 0x14")
+    return
+}
+
+func refusals(r: &var Remote) -> Result<Void, SosStatus> {
+    let before = try log_total(&var r, "log before refusals")
+    // A pulse one past each end of each channel's range, and further out.
+    var n = r.body.set(0, 499)
+    try refuse(&var r, "set 0 499", n, PwmStatus.OutOfRange)
+    n = r.body.set(0, 2501)
+    try refuse(&var r, "set 0 2501", n, PwmStatus.OutOfRange)
+    n = r.body.set(0, 400)
+    try refuse(&var r, "set 0 400", n, PwmStatus.OutOfRange)
+    n = r.body.set(0, 2600)
+    try refuse(&var r, "set 0 2600", n, PwmStatus.OutOfRange)
+    n = r.body.set(0, 0)
+    try refuse(&var r, "set 0 0", n, PwmStatus.OutOfRange)
+    n = r.body.set(0, 0xFFFF_FFFF)
+    try refuse(&var r, "set 0 4294967295", n, PwmStatus.OutOfRange)
+    // 66036 is 0x000101f4: a pulse read without its high half would be 500.
+    n = r.body.set(0, 66036)
+    try refuse(&var r, "set 0 66036", n, PwmStatus.OutOfRange)
+    n = r.body.set(1, 999)
+    try refuse(&var r, "set 1 999", n, PwmStatus.OutOfRange)
+    n = r.body.set(1, 2001)
+    try refuse(&var r, "set 1 2001", n, PwmStatus.OutOfRange)
+    n = r.body.set(1, 2500)
+    try refuse(&var r, "set 1 2500", n, PwmStatus.OutOfRange)
+    // A channel the configuration does not name, on every op that names one:
+    // the next after the configured ones, the last LEDC has, the first past
+    // it (whose `CONF0` would be `TIMER0_CONF`), and the last a byte holds.
+    // The channel is checked before the pulse.
+    n = r.body.set(2, 1500)
+    try refuse(&var r, "set 2", n, PwmStatus.BadChannel)
+    n = r.body.set(7, 1500)
+    try refuse(&var r, "set 7", n, PwmStatus.BadChannel)
+    n = r.body.set(8, 1500)
+    try refuse(&var r, "set 8", n, PwmStatus.BadChannel)
+    n = r.body.set(255, 1500)
+    try refuse(&var r, "set 255", n, PwmStatus.BadChannel)
+    n = r.body.set(8, 0)
+    try refuse(&var r, "set 8 0", n, PwmStatus.BadChannel)
+    n = r.body.stop(2)
+    try refuse(&var r, "stop 2", n, PwmStatus.BadChannel)
+    n = r.body.stop(7)
+    try refuse(&var r, "stop 7", n, PwmStatus.BadChannel)
+    n = r.body.stop(8)
+    try refuse(&var r, "stop 8", n, PwmStatus.BadChannel)
+    n = r.body.stop(255)
+    try refuse(&var r, "stop 255", n, PwmStatus.BadChannel)
+    n = r.body.inspect(2)
+    try refuse(&var r, "inspect 2", n, PwmStatus.BadChannel)
+    n = r.body.inspect(7)
+    try refuse(&var r, "inspect 7", n, PwmStatus.BadChannel)
+    n = r.body.inspect(8)
+    try refuse(&var r, "inspect 8", n, PwmStatus.BadChannel)
+    n = r.body.inspect(255)
+    try refuse(&var r, "inspect 255", n, PwmStatus.BadChannel)
+    // An op that is none: below the first, past the last, and far past.
+    n = r.body.raw(0, 1)
+    try refuse(&var r, "op 0", n, PwmStatus.BadOp)
+    n = r.body.raw(5, 1)
+    try refuse(&var r, "op 5", n, PwmStatus.BadOp)
+    n = r.body.raw(0x7F, 1)
+    try refuse(&var r, "op 0x7f", n, PwmStatus.BadOp)
+    // A payload one short and one long, for every op; the length is checked
+    // before the channel.
+    n = r.body.set(0, 1500)
+    try refuse(&var r, "set, a byte short", n - 1, PwmStatus.BadOp)
+    n = r.body.set(0, 1500)
+    try refuse(&var r, "set, a byte long", n + 1, PwmStatus.BadOp)
+    n = r.body.set(8, 1500)
+    try refuse(&var r, "set 8, a byte short", n - 1, PwmStatus.BadOp)
+    n = r.body.raw(1, 1)
+    try refuse(&var r, "set, no pulse", n, PwmStatus.BadOp)
+    n = r.body.raw(2, 0)
+    try refuse(&var r, "stop, no channel", n, PwmStatus.BadOp)
+    n = r.body.raw(2, 2)
+    try refuse(&var r, "stop, two bytes", n, PwmStatus.BadOp)
+    n = r.body.raw(3, 0)
+    try refuse(&var r, "inspect, no channel", n, PwmStatus.BadOp)
+    n = r.body.raw(3, 2)
+    try refuse(&var r, "inspect, two bytes", n, PwmStatus.BadOp)
+    n = r.body.raw(4, 0)
+    try refuse(&var r, "log, no start", n, PwmStatus.BadOp)
+    n = r.body.raw(4, 2)
+    try refuse(&var r, "log, two bytes", n, PwmStatus.BadOp)
+    let after = try log_total(&var r, "log after refusals")
+    if before != after {
+        return r.mismatch("log after refusals", "total {after}", "total {before}")
+    }
+    print("SOS pwmclient: refusals wrote nothing")
+    return
+}
+
+/// Each channel's range is accepted at both ends.
+func bounds(r: &var Remote) -> Result<Void, SosStatus> {
+    try set_counts(&var r, 0, 500, 410)
+    try set_counts(&var r, 0, 2500, 2048)
+    try set_counts(&var r, 1, 1000, 819)
+    try set_counts(&var r, 1, 2000, 1638)
+    let total = try log_total(&var r, "log after the bounds")
+    if total != 32 {
+        return r.mismatch("log after the bounds", "total {total}", "total 32")
+    }
+    print("SOS pwmclient: each range's ends: counts 410, 2048, 819, 1638")
+    return
+}
+
+/// What `Inspect(channel)` answered, printed: the emulator holds no device
+/// word, so the words are the part's to show.
+func show(r: &var Remote, step: String, channel: UInt8) -> Result<Void, SosStatus> {
+    let w = try r.inspect(step, channel)
+    print("SOS pwmclient: {}: answered, duty_r={} timer={} conf0={} out_sel={} iomux={}",
+          step, w.duty_r, w.timer, w.conf0, w.out_sel, w.iomux)
+    return
+}
+
+/// `Stop` then `Set` on each channel: a stopped servo is limp until a later
+/// `Set` starts its pulses again.
+func stop_then_set(r: &var Remote) -> Result<Void, SosStatus> {
+    try r.stop("stop 0", 0)
+    let stop0 = stop_words(CH0_CONF1, CH0_CONF0)
+    try check_entries(&var r, "log 32", 32, 34, &stop0)
+    print("SOS pwmclient: stop 0: CONF1 <- 0x40100400, CONF0 <- 0x00000010")
+    try show(&var r, "inspect 0 stopped", 0)
+    try set_counts(&var r, 0, 1500, 1229)
+    let set0 = set_words(CH0_DUTY, CH0_CONF1, CH0_CONF0, 1229)
+    try check_entries(&var r, "log 34", 34, 37, &set0)
+    print("SOS pwmclient: set 0 1500 after the stop: counts 1229, its three words")
+    try show(&var r, "inspect 0 set", 0)
+    try r.stop("stop 1", 1)
+    let stop1 = stop_words(CH1_CONF1, CH1_CONF0)
+    try check_entries(&var r, "log 37", 37, 39, &stop1)
+    print("SOS pwmclient: stop 1: CONF1 <- 0x40100400, CONF0 <- 0x00000010")
+    try show(&var r, "inspect 1 stopped", 1)
+    try set_counts(&var r, 1, 1500, 1229)
+    let set1 = set_words(CH1_DUTY, CH1_CONF1, CH1_CONF0, 1229)
+    try check_entries(&var r, "log 39", 39, 42, &set1)
+    print("SOS pwmclient: set 1 1500 after the stop: counts 1229, its three words")
+    try show(&var r, "inspect 1 set", 1)
+    return
+}
+
+/// A request carrying `PIPE_MSG_HANDLES` handles: the delivery needs room for
+/// the obligation and for all four, and the driver answers and stays up.
+func carrying(r: &var Remote) -> Result<Void, SosStatus> {
+    var handles = PipeHandles.none()
+    var at = 0
+    while at < handles.slots() {
+        handles.put(at, event: try r.proc.event_create())
+        at = at + 1
+    }
+    let n = r.body.inspect(0)
+    let reply = try r.expect_with("inspect 0 carrying four handles", n, PwmStatus.Ok,
+                                  &var handles)
+    let _ = move reply
+    let total = try log_total(&var r, "log after the handles")
+    print("SOS pwmclient: inspect 0 carrying four handles: answered, driver up, log {}", total)
+    return
+}
+
+/// A reply carries at most `LOG_PER_REPLY` entries; the log keeps 64 words and
+/// counts the rest.
+func overflow(r: &var Remote) -> Result<Void, SosStatus> {
+    let head = try r.log_head("log 0 of 42")
+    if head.total != 42 || head.n != (LOG_PER_REPLY as UInt8) {
+        return r.mismatch("log 0 of 42", "total {head.total} n {head.n}",
+                          "total 42 n {LOG_PER_REPLY}")
+    }
+    let page = try r.log("log 0 of 42", 0)
+    let (address, word) = entry(&page, LOG_PER_REPLY - 1)
+    if address != CH0_DUTY || word != (1229 << 4) {
+        return r.mismatch("log 0 of 42", "entry 14 address {address} word {word}",
+                          "address {CH0_DUTY} word {1229 << 4}")
+    }
+    print("SOS pwmclient: log 0: 15 entries of 42, the last the first set's DUTY")
+    // Eight more sets write 24 words: 64 kept, 2 dropped.
+    var i: UInt32 = 0
+    while i < 8 {
+        let _ = try r.set("set 1, filling the log", 1, 1000 + 100 * i)
+        i = i + 1
+    }
+    let full = try r.log_head("log when full")
+    if full.total != 64 || full.dropped != 2 {
+        return r.mismatch("log when full", "total {full.total} dropped {full.dropped}",
+                          "total 64 dropped 2")
+    }
+    let end = try r.log("log 63", 63)
+    let from_end = try r.log("log 64", 64)
+    if end.byte(4) != 1 || from_end.byte(4) != 0 {
+        return r.mismatch("log 63 and 64", "n {end.byte(4)} and {from_end.byte(4)}", "n 1 and 0")
+    }
+    print("SOS pwmclient: log kept 64 and dropped 2; log 63: one entry, log 64: none")
+    return
+}
+
+func script(r: &var Remote) -> Result<Void, SosStatus> {
+    try start_writes(&var r)
+    try first_sets(&var r)
+    try refusals(&var r)
+    try bounds(&var r)
+    try stop_then_set(&var r)
+    try carrying(&var r)
+    try overflow(&var r)
+    return
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    guard var r = begin(boot_handle, "pwmclient", TAG_PWM) else { return }
+    try script(&var r) catch {
+        print("SOS pwmclient: stopped: {}", error)
+        finish(&r, EXIT_FAILED)
+        return
+    }
+    print("SOS pwmclient: done")
+    finish(&r, EXIT_OK)
+}

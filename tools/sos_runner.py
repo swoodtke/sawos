@@ -12215,7 +12215,8 @@ SOSIMAGE_DIR = os.path.join(REPO_ROOT, "tools", "sosimage")
 # Packages whose own tests run on the host in a full run, beside the
 # builder's: `blade test` in each.
 HOSTED_TESTS = [os.path.join(DRIVERS_DIR, "esp32s3io"),
-                os.path.join(DRIVERS_DIR, "gpioproto")]
+                os.path.join(DRIVERS_DIR, "gpioproto"),
+                os.path.join(DRIVERS_DIR, "pwmproto")]
 
 # The link the builder's manifest reaches the sawlang checkout's packages
 # through: `imgformat = { path = "../../.sawlang/libs/imgformat" }`.
@@ -13685,6 +13686,73 @@ def _boot_esp32s3(qemu, flash, timeout_s, extra=()):
         proc.stdout.close()
     return out.decode("utf-8", "replace"), status
 
+
+
+# The ESP32-S3's PWM driver, a child of a stock root (`drivers/`).
+PWM_DRIVER_PKG = os.path.join(DRIVERS_DIR, "svc-pwm-esp32s3")
+
+# What `pwm_service`'s client prints, in order (`tests/pwm-service-client`).
+# The words the device answers to `Inspect` are the part's and are printed for
+# a reader, so those lines are held to their start.
+_PWM_SERVICE_LINES = [
+    "SOS pwmclient: log 0: the 14 start writes",
+    "SOS pwmclient: log 13: one entry; log 14 and 255: none",
+    "SOS pwmclient: set 0 1500: counts 1229, DUTY 0x00004cd0 CONF1 0xc0100400 "
+    "CONF0 0x14",
+    "SOS pwmclient: set 1 1000: counts 819, DUTY 0x00003330 CONF1 0xc0100400 "
+    "CONF0 0x14",
+    *[f"SOS pwmclient: {step}: OutOfRange"
+      for step in ("set 0 499", "set 0 2501", "set 0 400", "set 0 2600",
+                   "set 0 0", "set 0 4294967295", "set 0 66036", "set 1 999",
+                   "set 1 2001",
+                   "set 1 2500")],
+    *[f"SOS pwmclient: set {channel}: BadChannel"
+      for channel in (2, 7, 8, 255)],
+    "SOS pwmclient: set 8 0: BadChannel",
+    *[f"SOS pwmclient: {op} {channel}: BadChannel"
+      for op in ("stop", "inspect") for channel in (2, 7, 8, 255)],
+    *[f"SOS pwmclient: {step}: BadOp"
+      for step in ("op 0", "op 5", "op 0x7f", "set, a byte short",
+                   "set, a byte long", "set 8, a byte short",
+                   "set, no pulse", "stop, no channel", "stop, two bytes",
+                   "inspect, no channel", "inspect, two bytes",
+                   "log, no start", "log, two bytes")],
+    "SOS pwmclient: refusals wrote nothing",
+    "SOS pwmclient: each range's ends: counts 410, 2048, 819, 1638",
+    "SOS pwmclient: stop 0: CONF1 <- 0x40100400, CONF0 <- 0x00000010",
+    "SOS pwmclient: inspect 0 stopped: answered, duty_r=",
+    "SOS pwmclient: set 0 1500 after the stop: counts 1229, its three words",
+    "SOS pwmclient: inspect 0 set: answered, duty_r=",
+    "SOS pwmclient: stop 1: CONF1 <- 0x40100400, CONF0 <- 0x00000010",
+    "SOS pwmclient: inspect 1 stopped: answered, duty_r=",
+    "SOS pwmclient: set 1 1500 after the stop: counts 1229, its three words",
+    "SOS pwmclient: inspect 1 set: answered, duty_r=",
+    "SOS pwmclient: inspect 0 carrying four handles: answered, driver up, "
+    "log 42",
+    "SOS pwmclient: log 0: 15 entries of 42, the last the first set's DUTY",
+    "SOS pwmclient: log kept 64 and dropped 2; log 63: one entry, log 64: "
+    "none",
+    "SOS pwmclient: done",
+]
+
+
+# The stock root's plan for the PWM driver alone, over rows LEDC, GPIO and the
+# IO MUX (2, 3 and 4, after its blob and destination): LEDC whole, and its
+# pads' output selects and IO MUX words carved from the other two, under the
+# quota rows `quota` names.
+def _pwm_driver_plan(quota):
+    return {
+        "connections": 1,
+        "children": [{"name": "driver", "image": 0, "destination": 1,
+                      "start": 1, "quota": quota,
+                      "records": [
+                          {"tag": 1, "source": "system"},
+                          {"tag": 2, "source": "row", "from": 2},
+                          {"tag": 3, "source": "carve", "from": 3,
+                           "offset": 0x5F8, "len": 8},
+                          {"tag": 4, "source": "carve", "from": 4,
+                           "offset": 0xA8, "len": 8},
+                          {"tag": 5, "source": "outlet", "from": 0}]}]}
 
 
 def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
@@ -15540,6 +15608,191 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                                 "stockconfig is "
                                 "tests/stock-timg/config/none.saw, which is "
                                 "not a file in the tree"),
+        {
+            # The PWM driver under the stock root (`pwm_service_s3.toml`):
+            # root's four setup writes, the driver with LEDC and its two
+            # parts, and a client that makes every request of the protocol.
+            # This emulator reads every word of LEDC, GPIO and the IO MUX as
+            # 0, so the client reads what the driver wrote through its log,
+            # and every refusal; the emulator's store trace holds where the
+            # words went (`kernel_writes`): root's four setup words, as it
+            # writes them over words that read 0, and the driver's start,
+            # each the last store to its address and one the kernel's side
+            # made, so a word the ROM left is not taken for root's. What the
+            # part reads back is stage P1's.
+            "name": "pwm_service",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "pwm_service_s3.toml"},
+            "kernel_writes": {
+                0x600C_0018: 0x800,     # PERIP_CLK_EN0: LEDC's clock
+                0x600C_0020: 0x0,       # PERIP_RST_EN0: LEDC out of reset
+                0x6000_4018: 0x600,     # OUT1_W1TC: pads 41 and 42
+                0x6000_4030: 0x600,     # ENABLE1_W1TS: pads 41 and 42
+                0x6001_90D0: 0x3,       # LEDC CONF: XTAL_CLK
+                0x6001_90A0: 0x30D4E,   # TIMER0_CONF: 14 bits, 20 ms, run
+                0x6000_45F8: 0x449,     # FUNC41_OUT_SEL_CFG: channel 0
+                0x6000_45FC: 0x44A,     # FUNC42_OUT_SEL_CFG: channel 1
+                0x6000_90A8: 0x1A00,    # IO MUX pad 41
+                0x6000_90AC: 0x1A00},   # IO MUX pad 42
+            "expect_out": ["{banner}",
+                           *_PWM_SERVICE_LINES,
+                           "root: client ended status=65536",
+                           "SOS pwmsvc drv: served=78",
+                           "root: driver ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The PWM driver stops on a frame past the longest its arithmetic
+            # allows, before it maps anything: its Mapping row is 0, so a
+            # driver that mapped first would end on that refusal instead.
+            "name": "pwm_bad_config",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": STOCK_ROOT_PKG,
+            "root_plan": _pwm_driver_plan({"handles": 14, "mappings": 0,
+                                           "waiters": 1}),
+            "children": [PWM_DRIVER_PKG],
+            "devices": ["LEDC", "GPIO", "IO_MUX"],
+            "inputs": {"pwmconfig": "tests/images/pwm/bad.saw"},
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={five}",
+                           # The refusal is the driver's last word: the next
+                           # line is the kernel's account of its exit, so a
+                           # driver that went on would print more between.
+                           "SOS pwmsvc drv: config refused: frame 1000000 us "
+                           "is outside 416..200000\n"
+                           "SOS: process exit: code=0x00000001",
+                           "root: driver ended status=65537"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The same refusal under every row the driver declares: a driver
+            # that went on after it would map, start and serve, and end clean
+            # (status 65536) when root's end of its connection goes.
+            "name": "pwm_refused_config",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": STOCK_ROOT_PKG,
+            "root_plan": _pwm_driver_plan({"handles": 14, "mappings": 3,
+                                           "waiters": 1}),
+            "children": [PWM_DRIVER_PKG],
+            "devices": ["LEDC", "GPIO", "IO_MUX"],
+            "inputs": {"pwmconfig": "tests/images/pwm/bad.saw"},
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={five}",
+                           "SOS pwmsvc drv: config refused: frame 1000000 us "
+                           "is outside 416..200000\n"
+                           "SOS: process exit: code=0x00000001",
+                           "root: driver ended status=65537"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A good configuration under a Mapping row of 0: the driver passes
+            # its check, its first map is refused, and it stops there, its
+            # failure its last word and its exit code `EXIT_FAILED`.
+            "name": "pwm_run_failed",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "root_pkg": STOCK_ROOT_PKG,
+            "root_plan": _pwm_driver_plan({"handles": 14, "mappings": 0,
+                                           "waiters": 1}),
+            "children": [PWM_DRIVER_PKG],
+            "devices": ["LEDC", "GPIO", "IO_MUX"],
+            "inputs": {"pwmconfig": "tests/images/pwm/smoke.saw"},
+            "expect_out": ["{banner}",
+                           "SOS: boot regions={five}",
+                           "SOS pwmsvc drv: failed: this process is at its "
+                           "quota\nSOS: process exit: code=0x00000001",
+                           "root: driver ended status=65537"],
+            "expect_clean_exit": True,
+        },
+        {
+            # Stage P1, for a board (`--emit-flash`, at `--clock rom` and at
+            # `--clock pll80`): the servo signal with nothing wired. The client
+            # reads the pads' output enables (`ENABLE1`, root's
+            # `ENABLE1_W1TS`) and levels through GPIO: both pads low until
+            # the first `Set`, each pad's frame and pulse
+            # timed over fifty frames, what `Inspect` reads back, and `Stop`
+            # on each channel holding its pad low until a later `Set`.
+            "name": "pwm_signal_board",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "pwm_signal_s3.toml"},
+            "board_only": "this emulator holds no word of LEDC, GPIO or the "
+                          "IO MUX and its `IN1` reads 0",
+            "expect_out": ["{banner}",
+                           "SOS pwmboard: setup ok: OUT1=",
+                           "SOS pwmboard: the driver started ok: log 14",
+                           *[f"SOS pwmboard: pad {pin} before any Set ok: 0 "
+                             "high of 1000000" for pin in (41, 42)],
+                           "SOS pwmboard: set 0 1500 ok: counts 1229",
+                           "SOS pwmboard: set 1 1000 ok: counts 819",
+                           "SOS pwmboard: pad 41 at 1500 us ok: frame_us=",
+                           "SOS pwmboard: pad 42 at 1000 us ok: frame_us=",
+                           # 0x4cd0 and 0x3330, 0x449 and 0x44a, 0x1a00.
+                           "SOS pwmboard: inspect 0 ok: duty_r=19664 "
+                           "out_sel=1097 iomux=6656 conf0=",
+                           "SOS pwmboard: inspect 1 ok: duty_r=13104 "
+                           "out_sel=1098 iomux=6656 conf0=",
+                           "SOS pwmboard: timer 0 counts ok: ",
+                           "SOS pwmboard: pad 41 after stop 0 ok: 0 high of "
+                           "1000000",
+                           "SOS pwmboard: pad 42 at 1000 us ok: frame_us=",
+                           "SOS pwmboard: inspect 0 stopped ok: conf0=",
+                           "SOS pwmboard: set 0 2000 ok: counts 1638",
+                           "SOS pwmboard: pad 41 at 2000 us ok: frame_us=",
+                           "SOS pwmboard: pad 42 after stop 1 ok: 0 high of "
+                           "1000000",
+                           "SOS pwmboard: pad 41 at 2000 us ok: frame_us=",
+                           "SOS pwmboard: inspect 1 stopped ok: conf0=",
+                           "SOS pwmboard: set 1 1500 ok: counts 1229",
+                           "SOS pwmboard: pad 42 at 1500 us ok: frame_us=",
+                           *[f"SOS pwmboard: pad {pin} at rest ok: 0 high of "
+                             "1000000" for pin in (41, 42)],
+                           "SOS pwmboard: done, every check ok",
+                           "root: client ended status=65536",
+                           "SOS pwmsvc drv: served=14",
+                           "root: driver ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # Stage P2, for a board: a servo on pad 41, and one on 42 if it
+            # is wired, each on a 5 V supply with its bulk capacitor and a
+            # pull-down on its signal. Each moves in turn, is stopped (limp, its
+            # arm turned by hand), then moves again; what each should do is
+            # printed beside each command.
+            "name": "pwm_servo_board",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "pwm_servo_s3.toml"},
+            "board_only": "it needs servos wired, which this emulator cannot "
+                          "show",
+            "expect_out": ["{banner}",
+                           "SOS pwmservo: both servos are limp until their "
+                           "first command",
+                           *[line for channel, pin in ((0, 41), (1, 42))
+                             for line in [
+                                 *[f"SOS pwmservo: set {channel} {pulse} "
+                                   f"(counts {counts}): the servo on {pin} "
+                                   f"{what}"
+                                   for pulse, counts, what in (
+                                       (1000, 819, "turns to one end"),
+                                       (2000, 1638, "turns to the other"))
+                                   ] * 5,
+                                 f"SOS pwmservo: set {channel} 1500 (counts "
+                                 f"1229): the servo on {pin} centres",
+                                 f"SOS pwmservo: stop {channel}: the servo on "
+                                 f"{pin} is limp; turn its arm by hand",
+                                 f"SOS pwmservo: set {channel} 1500 (counts "
+                                 f"1229): the servo on {pin} holds centre "
+                                 "again",
+                                 f"SOS pwmservo: set {channel} 1000 (counts "
+                                 f"819): the servo on {pin} turns to one end",
+                                 f"SOS pwmservo: set {channel} 1500 (counts "
+                                 f"1229): the servo on {pin} centres",
+                                 f"SOS pwmservo: stop {channel}: the servo on "
+                                 f"{pin} is limp"]],
+                           "SOS pwmservo: done",
+                           "root: client ended status=65536",
+                           "SOS pwmsvc drv: served=32",
+                           "root: driver ended status=65536"],
+            "expect_clean_exit": True,
+        },
     ]
     for case in process_cases:
         if case.get("tier", arch["tier"]) != arch["tier"]:
@@ -15823,17 +16076,31 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
               f"write-flash 0x0 {emit_out}")
         return 0
 
+    def watches_devices(case):
+        """Whether a case holds the run's stores to device registers
+        (`device_writes`, `kernel_writes`, `device_stores`,
+        `device_untouched`)."""
+        return bool(case.get("device_writes") or case.get("kernel_writes")
+                    or case.get("device_stores")
+                    or case.get("device_untouched"))
+
     def boot_args(case):
-        """The emulator's extra arguments for one run, and the file its flash
-        model's trace goes to (None for a case that boots no PSRAM harness).
-        A PSRAM harness's run gets the part's PSRAM (`psram_qemu_args`)
-        unless the case names its own `qemu_args`, a fresh eFuse file
-        holding the case's `efuse` words (the part's, `8M`, unless it says
-        otherwise; None gives the model no file, and every word reads 0),
-        and the trace of every command the flash model decodes; and, for a
-        case with `device_writes`, of every store to a device register."""
+        """The emulator's extra arguments for one run, and the file its trace
+        goes to (None for a case that keeps no trace). A PSRAM harness's run
+        gets the part's PSRAM (`psram_qemu_args`) unless the case names its
+        own `qemu_args`, a fresh eFuse file holding the case's `efuse` words
+        (the part's, `8M`, unless it says otherwise; None gives the model no
+        file, and every word reads 0), and the trace of every command the
+        flash model decodes. Any case that watches devices
+        (`watches_devices`) gets the trace of every store to a device
+        register."""
         if "psram" not in case:
-            return [], None
+            if not watches_devices(case):
+                return [], None
+            trace = os.path.join(s3_build, f"{case['name']}.trace.txt")
+            if os.path.exists(trace):
+                os.remove(trace)
+            return ["-trace", "memory_region_ops_write", "-D", trace], trace
         args = list(case.get("qemu_args", arch["psram_qemu_args"]))
         which = case.get("efuse", "8M")
         if which is not None:
@@ -15846,8 +16113,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         if os.path.exists(trace):
             os.remove(trace)
         args += ["-trace", "m25p80_command_decoded", "-D", trace]
-        if (case.get("device_writes") or case.get("device_stores")
-                or case.get("device_untouched")):
+        if watches_devices(case):
             args += ["-trace", "memory_region_ops_write"]
         return args, trace
 
@@ -16000,26 +16266,35 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                                          f"{case['flash_commands']}")
         # The words the run left in registers the emulator does not read
         # back (the IO MUX): the last store to each address must be the
-        # case's (`device_writes`).
+        # case's (`device_writes`), and for `kernel_writes` one the kernel's
+        # side made as well.
         # `device_stores` names a value that must be among the stores to an
         # address, for a word a later step puts back; `device_untouched`, an
         # address the kernel must not store to at all.
-        if ok and (case.get("device_writes") or case.get("device_stores")
-                   or case.get("device_untouched")):
+        if ok and watches_devices(case):
             try:
                 stored, by_kernel = device_writes(trace)
             except ToolError as e:
                 stored, by_kernel = {}, set()
                 ok, reason = False, str(e)
+            last = {**case.get("device_writes", {}),
+                    **case.get("kernel_writes", {})}
             wrong = {f"{a:#010x}": (f"{stored[a][-1]:#010x}" if a in stored
                                     else "no store")
-                     for a, v in case.get("device_writes", {}).items()
+                     for a, v in last.items()
                      if stored.get(a, [None])[-1] != v}
             if ok and wrong:
                 ok, reason = False, (f"the last stores were {wrong}, not "
                                      + str({f"{a:#010x}": f"{v:#010x}"
-                                            for a, v in
-                                            case["device_writes"].items()}))
+                                            for a, v in last.items()}))
+            # `kernel_writes` rows must also be stored to from the kernel's
+            # first store on: a word the ROM left at the expected value
+            # would otherwise pass for one the image wrote.
+            unwritten = [f"{a:#010x}" for a in case.get("kernel_writes", {})
+                         if a not in by_kernel]
+            if ok and unwritten:
+                ok, reason = False, (f"the kernel's side never stored to "
+                                     f"{unwritten}")
             missing = {f"{a:#010x}": [f"{x:#010x}" for x in stored.get(a, [])]
                        for a, v in case.get("device_stores", {}).items()
                        if v not in stored.get(a, [])}

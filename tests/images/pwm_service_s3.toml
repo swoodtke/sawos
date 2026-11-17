@@ -1,0 +1,47 @@
+# The PWM driver under the stock root, with a client that makes every request
+# of `pwmproto` (`tests/pwm-service-client`) over the servos of
+# `tests/images/pwm/smoke.saw`. The S3 smoke's `pwm_service` case builds it
+# with `sosimage build`.
+#
+# The servo pins, 41 and 42, are stated four times: in the configuration, in
+# the driver's two parts, and in the two pad words of the setup writes (bits 9
+# and 10 of GPIO's second bank). Nothing checks one against another; the
+# `pwm_service` case holds each word this image writes, where it lands.
+format = 1
+
+[image]
+name = "pwm_service"
+board = "esp32s3"
+tick = false
+
+[root]
+package = "stock"
+
+# LEDC's clock on and its reset off, each a read-modify-write of a word that
+# gates every peripheral; then pads 41 and 42 driven low once they are GPIO.
+[[setup]]
+register = "SYSTEM.PERIP_CLK_EN0"
+set = 0x800
+
+[[setup]]
+register = "SYSTEM.PERIP_RST_EN0"
+clear = 0x800
+
+[[setup]]
+register = "GPIO.OUT1_W1TC"
+write = 0x600
+
+[[setup]]
+register = "GPIO.ENABLE1_W1TS"
+write = 0x600
+
+[[process]]
+name = "driver"
+package = "sawos:drivers/svc-pwm-esp32s3"
+device = { ledc = "LEDC", outsel = "GPIO.out_sel[41..=42]", pads = "IO_MUX.pad[41..=42]" }
+inputs = { pwmconfig = "tests/images/pwm/smoke.saw" }
+
+[[process]]
+name = "client"
+package = "sawos:tests/pwm-service-client"
+clients = { pwm = "driver.pwm" }

@@ -56,7 +56,9 @@ drivers/           # userspace device drivers and the protocol packages their
                    # them, with hosted tests a full run `blade test`s;
                    # gpioproto/ is the GPIO driver's wire and
                    # svc-gpio-esp32s3/ the driver, whose pins are its build
-                   # input `gpioconfig`
+                   # input `gpioconfig`; pwmproto/ is the PWM driver's wire
+                   # and svc-pwm-esp32s3/ the driver, whose servos are its
+                   # build input `pwmconfig`
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 root/              # the stock root: it launches an image's processes as
@@ -125,14 +127,14 @@ runs its own tests (`blade test` there: the description readers' refusals, the
 region table's and slab block's bytes, an image's limits and each refusal of
 them, the in-place check, the slab-region check, and every board, process
 and image description in the tree read clean) and the hosted packages'
-(`HOSTED_TESTS`: `drivers/esp32s3io/` and `drivers/gpioproto/`), which need
-no emulator and print nothing when they pass. Per profile it writes a
-profile description (JSON) and calls `sosimage native`, then `sosimage board`
-on the profile's
-`hal/<profile>/board.toml`, then `sosimage package` once for each package
-and role (root, or child i) the cases give it, which writes the process's
-script (its region, and on the S3 its flash slot, from `_process_placement`)
-and has Blade link the package through it into
+(`HOSTED_TESTS`: `drivers/esp32s3io/`, `drivers/gpioproto/` and
+`drivers/pwmproto/`), which need no emulator and print nothing when they
+pass. Per profile it writes a profile description (JSON) and calls `sosimage
+native`, then `sosimage board` on the profile's `hal/<profile>/board.toml`,
+then `sosimage package` once for
+each package and role (root, or child i) the cases give it, which writes the
+process's script (its region, and on the S3 its flash slot, from
+`_process_placement`) and has Blade link the package through it into
 `<package>/.build/<triple>/<role>.sosimg`, then `sosimage kernel` once for
 each kernel entry the cases use and for the shipping kernel, then
 `sosimage defaults`, then `sosimage check-tree`, which reads every

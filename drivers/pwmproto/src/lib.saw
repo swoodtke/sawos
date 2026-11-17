@@ -1,0 +1,290 @@
+//! The PWM driver's protocol.
+//!
+//! A request is one message: byte 0 the op, then the payload. A reply's byte
+//! 0 is a status, then its payload. Every op is a call. Integers are
+//! little-endian.
+//!
+//! ```text
+//! op         payload                   reply payload
+//! Set     1  channel, pulse_us (u32)   counts (u32)
+//! Stop    2  channel                   -
+//! Inspect 3  channel                   DUTY_R, TIMER0_VALUE, CONF0, the pad's
+//!                                      OUT_SEL and IO MUX words (u32 each),
+//!                                      each read from the device now
+//! Log     4  from (u8)                 total (u8), dropped (u16), n (u8), then
+//!                                      n entries of {address u32, word u32},
+//!                                      n <= 15
+//! ```
+//!
+//! A reply that is not `Ok` carries the status byte alone.
+//!
+//! # Statuses
+//!
+//! They are checked in this order, and the first that applies is answered:
+//! `BadOp` (an unknown op, or a payload of the wrong length), `BadChannel` (a
+//! channel the driver's configuration does not name, which every channel above
+//! 7 is), `OutOfRange` (a pulse outside the channel's configured range). A
+//! refused request writes nothing.
+//!
+//! # Set and Stop
+//!
+//! `Set(channel, pulse_us)` makes the channel's pulse `pulse_us` wide in every
+//! frame from the next frame boundary, and answers the timer counts the pulse
+//! came to. `Stop(channel)` ends the channel's pulses at the next frame
+//! boundary and holds its line low, so a servo on it goes limp: it stays
+//! powered and draws little. A later `Set` starts its pulses again. A pulse
+//! width is what the hardware makes: the angle a width gives is the servo's,
+//! and the client's to know.
+//!
+//! # Inspect
+//!
+//! `Inspect` reads the device: the channel's duty in force, timer 0's counter,
+//! the channel's `CONF0`, and its pad's output select and IO MUX word. Under
+//! an emulator that holds no device word it answers zeros.
+//!
+//! # Log
+//!
+//! The driver records every register word it writes, in order, with its
+//! address: the first `LOG_ENTRIES` writes. `total` counts the entries kept
+//! and `dropped` the writes after them, which are counted and not kept.
+//! `Log(from)` answers entries `from`, `from + 1`, ... up to `LOG_PER_REPLY`
+//! of them; `from` at or past `total` answers none. Under an emulator that
+//! reads every device word as 0, it is a client's only view of them.
+
+/// The bytes of a message body. The kernel's `PIPE_BODY_BYTES` is the same
+/// number, which each package that sends or receives asserts.
+public static BODY_BYTES: Int = 128
+
+/// The op byte. Raw-backed because it crosses a wire: each value is stated.
+public enum PwmOp: UInt8 {
+    case Set = 1,
+    case Stop = 2,
+    case Inspect = 3,
+    case Log = 4,
+}
+
+extension PwmOp {
+    /// How many payload bytes a request of this op carries.
+    public func payload_bytes(&self) -> UInt {
+        match self {
+            case Set -> 5,
+            case Stop -> 1,
+            case Inspect -> 1,
+            case Log -> 1,
+        }
+    }
+}
+
+/// A reply's status byte. `Ok` is 0.
+public enum PwmStatus: UInt8 {
+    case Ok = 0,
+    case BadOp = 1,
+    case BadChannel = 2,
+    case OutOfRange = 3,
+}
+
+extension PwmStatus {
+    /// What a transcript should call this status.
+    public func describe(&self) -> String {
+        match self {
+            case Ok -> "Ok",
+            case BadOp -> "BadOp",
+            case BadChannel -> "BadChannel",
+            case OutOfRange -> "OutOfRange",
+        }
+    }
+}
+
+/// How many entries a log keeps, and how many one `Log` reply carries.
+public static LOG_ENTRIES: Int = 64
+public static LOG_PER_REPLY: Int = 15
+
+static OP_BYTE: Int = 0
+static PAYLOAD_BYTE: Int = 1
+
+/// One log entry's size on the wire: address and word.
+static LOG_ENTRY_BYTES: Int = 8
+
+// A `Log` reply: the status, total, dropped, n and the entries.
+static_assert(5 + LOG_PER_REPLY * LOG_ENTRY_BYTES <= BODY_BYTES,
+              "a full log reply fits one message")
+
+/// A message body, for a request or a reply.
+public struct PwmBody {
+    public bytes: [UInt8; BODY_BYTES],
+}
+
+extension PwmBody {
+    /// A zeroed body.
+    public static func empty() -> PwmBody {
+        PwmBody(bytes: [0; BODY_BYTES])
+    }
+
+    /// Writes `word` at byte `at`, little-endian.
+    public func put_u32(&var self, at: Int, word: UInt32) {
+        self.bytes[at] = (word & 0xFF) as UInt8
+        self.bytes[at + 1] = ((word >> 8) & 0xFF) as UInt8
+        self.bytes[at + 2] = ((word >> 16) & 0xFF) as UInt8
+        self.bytes[at + 3] = ((word >> 24) & 0xFF) as UInt8
+    }
+
+    /// Writes `half` at byte `at`, little-endian.
+    public func put_u16(&var self, at: Int, half: UInt16) {
+        self.bytes[at] = (half & 0xFF) as UInt8
+        self.bytes[at + 1] = ((half >> 8) & 0xFF) as UInt8
+    }
+
+    // The request builders answer the message's `len`.
+
+    /// `Set(channel, pulse_us)`.
+    public func set(&var self, channel: UInt8, pulse_us: UInt32) -> UInt {
+        self.bytes[OP_BYTE] = PwmOp.Set as UInt8
+        self.bytes[PAYLOAD_BYTE] = channel
+        self.put_u32(PAYLOAD_BYTE + 1, pulse_us)
+        6
+    }
+
+    /// `Stop(channel)`.
+    public func stop(&var self, channel: UInt8) -> UInt {
+        self.bytes[OP_BYTE] = PwmOp.Stop as UInt8
+        self.bytes[PAYLOAD_BYTE] = channel
+        2
+    }
+
+    /// `Inspect(channel)`.
+    public func inspect(&var self, channel: UInt8) -> UInt {
+        self.bytes[OP_BYTE] = PwmOp.Inspect as UInt8
+        self.bytes[PAYLOAD_BYTE] = channel
+        2
+    }
+
+    /// `Log(from)`.
+    public func log(&var self, from: UInt8) -> UInt {
+        self.bytes[OP_BYTE] = PwmOp.Log as UInt8
+        self.bytes[PAYLOAD_BYTE] = from
+        2
+    }
+
+    /// A request with an op byte of any value and `payload` bytes after it,
+    /// for the refusals a client tests.
+    public func raw(&var self, op: UInt8, payload: UInt) -> UInt {
+        self.bytes[OP_BYTE] = op
+        payload + 1
+    }
+
+    // The reply builders answer the reply's `len`.
+
+    /// A reply of the status alone.
+    public func refuse(&var self, status: PwmStatus) -> UInt {
+        self.bytes[0] = status as UInt8
+        1
+    }
+
+    /// An `Ok` and nothing else.
+    public func ok(&var self) -> UInt {
+        self.refuse(PwmStatus.Ok)
+    }
+
+    /// A `Set` answer: the counts the pulse came to.
+    public func ok_counts(&var self, counts: UInt32) -> UInt {
+        self.bytes[0] = PwmStatus.Ok as UInt8
+        self.put_u32(1, counts)
+        5
+    }
+
+    /// An `Inspect` answer.
+    public func ok_inspect(&var self, duty_r: UInt32, timer: UInt32, conf0: UInt32,
+                           out_sel: UInt32, iomux: UInt32) -> UInt {
+        self.bytes[0] = PwmStatus.Ok as UInt8
+        self.put_u32(1, duty_r)
+        self.put_u32(5, timer)
+        self.put_u32(9, conf0)
+        self.put_u32(13, out_sel)
+        self.put_u32(17, iomux)
+        21
+    }
+
+    /// The head of a `Log` answer: total, dropped and the count `n` of entries
+    /// that follow. Answers the length with none.
+    public func ok_log(&var self, total: UInt8, dropped: UInt16, n: UInt8) -> UInt {
+        self.bytes[0] = PwmStatus.Ok as UInt8
+        self.bytes[1] = total
+        self.put_u16(2, dropped)
+        self.bytes[4] = n
+        5
+    }
+
+    /// Entry `i` of a `Log` answer. Answers the length through the entry.
+    public func put_log_entry(&var self, i: Int, address: UInt32, word: UInt32) -> UInt {
+        let at = 5 + i * LOG_ENTRY_BYTES
+        self.put_u32(at, address)
+        self.put_u32(at + 4, word)
+        (at + LOG_ENTRY_BYTES) as UInt
+    }
+}
+
+/// A received message's length and bytes: all the decoders read, so they are
+/// plain data and the wire is tested without a kernel.
+public struct Frame {
+    public len: UInt,
+    public bytes: [UInt8; BODY_BYTES],
+}
+
+extension Frame {
+    /// The op a received request names, or `None` for a byte that names no op.
+    /// The Optional is a real domain value: a request arrives from a process
+    /// the driver does not trust, so "this byte is not one of my ops" is data
+    /// at a protocol boundary, never a trap. A message of no bytes names no op
+    /// either, whatever its buffer holds.
+    public func op(&self) -> PwmOp? {
+        if self.len == 0 { return None }
+        PwmOp.from(raw: self.bytes[OP_BYTE])
+    }
+
+    /// How many payload bytes a received request carries.
+    public func payload_len(&self) -> UInt {
+        if self.len == 0 { return 0 }
+        self.len - 1
+    }
+
+    /// Payload byte `i` of a received request. Out of range answers zero
+    /// rather than panicking: the sender chose the length and the receiver is
+    /// a server.
+    public func payload_byte(&self, i: Int) -> UInt8 {
+        if i < 0 || (i as UInt) >= self.payload_len() { return 0 }
+        self.bytes[PAYLOAD_BYTE + i]
+    }
+
+    /// The little-endian word at payload byte `i` of a received request; zero
+    /// bytes past the payload's end.
+    public func payload_u32(&self, i: Int) -> UInt32 {
+        let low = (self.payload_byte(i) as UInt32) | ((self.payload_byte(i + 1) as UInt32) << 8)
+        let high = (self.payload_byte(i + 2) as UInt32) | ((self.payload_byte(i + 3) as UInt32) << 8)
+        low | (high << 16)
+    }
+
+    /// The status a received reply carries, or `None` for a status byte no
+    /// status has or a reply with no bytes.
+    public func status(&self) -> PwmStatus? {
+        if self.len == 0 { return None }
+        PwmStatus.from(raw: self.bytes[0])
+    }
+
+    /// Byte `at` of a received reply; zero past its end.
+    public func byte(&self, at: Int) -> UInt8 {
+        if at < 0 || (at as UInt) >= self.len { return 0 }
+        self.bytes[at]
+    }
+
+    /// The little-endian half-word at byte `at` of a received reply.
+    public func u16(&self, at: Int) -> UInt16 {
+        (self.byte(at) as UInt16) | ((self.byte(at + 1) as UInt16) << 8)
+    }
+
+    /// The little-endian word at byte `at` of a received reply.
+    public func u32(&self, at: Int) -> UInt32 {
+        let low = self.u16(at) as UInt32
+        let high = self.u16(at + 2) as UInt32
+        low | (high << 16)
+    }
+}

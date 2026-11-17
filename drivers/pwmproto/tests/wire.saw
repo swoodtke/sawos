@@ -1,0 +1,146 @@
+// The PWM wire, as bytes: each op and status value, each builder's bytes and
+// lengths, and the decoders' guards. A shared enum would change client and
+// driver together and no case would notice, so the numbers are written here.
+
+import pwmproto.{BODY_BYTES, Frame, PwmBody, PwmOp, PwmStatus, LOG_ENTRIES, LOG_PER_REPLY}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func is_op(frame: &Frame, want: PwmOp) -> Bool {
+    if let op = frame.op() { op == want } else { false }
+}
+
+func is_status(frame: &Frame, want: PwmStatus) -> Bool {
+    if let status = frame.status() { status == want } else { false }
+}
+
+func message(len: UInt, fill: UInt8) -> Frame {
+    Frame(len: len, bytes: [fill; BODY_BYTES])
+}
+
+func main() {
+    // Op and status numbers, and the bytes on either side of them.
+    check(PwmOp.Set as UInt8 == 1, "Set is 1")
+    check(PwmOp.Stop as UInt8 == 2, "Stop is 2")
+    check(PwmOp.Inspect as UInt8 == 3, "Inspect is 3")
+    check(PwmOp.Log as UInt8 == 4, "Log is 4")
+    check(PwmOp.from(raw: 0).is_none(), "no op 0")
+    check(PwmOp.from(raw: 5).is_none(), "no op 5")
+    check(PwmStatus.Ok as UInt8 == 0, "Ok is 0")
+    check(PwmStatus.BadOp as UInt8 == 1, "BadOp is 1")
+    check(PwmStatus.BadChannel as UInt8 == 2, "BadChannel is 2")
+    check(PwmStatus.OutOfRange as UInt8 == 3, "OutOfRange is 3")
+    check(PwmStatus.from(raw: 4).is_none(), "no status 4")
+
+    // How many payload bytes each op carries.
+    check(PwmOp.Set.payload_bytes() == 5, "Set: a channel and a pulse")
+    check(PwmOp.Stop.payload_bytes() == 1, "Stop: a channel")
+    check(PwmOp.Inspect.payload_bytes() == 1, "Inspect: a channel")
+    check(PwmOp.Log.payload_bytes() == 1, "Log: a start")
+
+    // Request builders.
+    var b = PwmBody.empty()
+    var n = b.set(1, 0x0403_0201)
+    check(n == 6 && b.bytes[0] == 1 && b.bytes[1] == 1, "Set(1, ...)'s head")
+    check(b.bytes[2] == 1 && b.bytes[3] == 2 && b.bytes[4] == 3 && b.bytes[5] == 4,
+          "its pulse, little-endian")
+    n = b.stop(7)
+    check(n == 2 && b.bytes[0] == 2 && b.bytes[1] == 7, "Stop(7)")
+    n = b.inspect(8)
+    check(n == 2 && b.bytes[0] == 3 && b.bytes[1] == 8, "Inspect(8)")
+    n = b.log(15)
+    check(n == 2 && b.bytes[0] == 4 && b.bytes[1] == 15, "Log(15)")
+    n = b.raw(127, 2)
+    check(n == 3 && b.bytes[0] == 127, "a raw request")
+
+    // Reply builders: lengths and bytes, little-endian.
+    var r = PwmBody.empty()
+    n = r.refuse(PwmStatus.OutOfRange)
+    check(n == 1 && r.bytes[0] == 3, "a refusal is the status alone")
+    n = r.ok()
+    check(n == 1 && r.bytes[0] == 0, "Ok alone")
+    n = r.ok_counts(0x0403_0201)
+    check(n == 5 && r.bytes[0] == 0, "a Set answer's head")
+    check(r.bytes[1] == 1 && r.bytes[2] == 2 && r.bytes[3] == 3 && r.bytes[4] == 4,
+          "its counts, little-endian")
+    n = r.ok_inspect(0x0403_0201, 0x0807_0605, 0x0C0B_0A09, 0x100F_0E0D, 0x1413_1211)
+    check(n == 21 && r.bytes[0] == 0, "an inspect answer")
+    var at = 1
+    var all = true
+    while at < 21 {
+        all = all && r.bytes[at] == at as UInt8
+        at = at + 1
+    }
+    check(all, "its five words, in order, little-endian")
+    n = r.ok_log(28, 0xA5C3, 15)
+    check(n == 5 && r.bytes[0] == 0 && r.bytes[1] == 28 && r.bytes[2] == 0xC3
+          && r.bytes[3] == 0xA5 && r.bytes[4] == 15, "a log answer's head")
+    n = r.put_log_entry(0, 0x6001_90d0, 0x0000_0003)
+    check(n == 13, "the first entry ends at 13")
+    check(r.bytes[5] == 0xd0 && r.bytes[6] == 0x90 && r.bytes[7] == 0x01 && r.bytes[8] == 0x60,
+          "its address, little-endian")
+    check(r.bytes[9] == 3 && r.bytes[10] == 0 && r.bytes[11] == 0 && r.bytes[12] == 0,
+          "its word")
+    n = r.put_log_entry(1, 0x600045f8, 0x449)
+    check(n == 21, "an entry is eight bytes")
+    check(r.bytes[13] == 0xf8 && r.bytes[17] == 0x49 && r.bytes[18] == 4, "the second entry")
+    n = r.put_log_entry(LOG_PER_REPLY - 1, 1, 2)
+    check(n == 5 + 8 * LOG_PER_REPLY as UInt && n <= BODY_BYTES as UInt, "the last entry fits")
+    check(LOG_ENTRIES == 64 && LOG_PER_REPLY == 15, "the log's sizes")
+
+    // The decoders' guards. A message of no bytes names no op and carries no
+    // payload, whatever its buffer holds; a payload byte out of range is 0.
+    let empty = message(0, 1)
+    check(empty.op().is_none(), "no bytes, no op")
+    check(empty.payload_len() == 0, "no bytes, no payload")
+    check(empty.status().is_none(), "no bytes, no status")
+    check(empty.payload_byte(0) == 0, "an empty message's byte")
+    let nine = message(2, 9)
+    check(nine.op().is_none(), "9 is no op")
+    check(nine.status().is_none(), "9 is no status")
+    var set = message(6, 0)
+    set.bytes[0] = 1
+    set.bytes[1] = 1
+    set.bytes[2] = 0xdc
+    set.bytes[3] = 0x05
+    check(is_op(&set, PwmOp.Set), "op 1 is Set")
+    check(set.payload_len() == 5, "five payload bytes")
+    check(set.payload_byte(0) == 1, "the channel")
+    check(set.payload_u32(1) == 1500, "the pulse")
+    check(set.payload_byte(5) == 0, "past the payload")
+    check(set.payload_byte(-1) == 0, "before the payload")
+    // Each of the pulse's four bytes in its place.
+    var wide = message(6, 0)
+    wide.bytes[0] = 1
+    wide.bytes[2] = 1
+    wide.bytes[3] = 2
+    wide.bytes[4] = 3
+    wide.bytes[5] = 4
+    check(wide.payload_u32(1) == 0x0403_0201, "a pulse's four bytes, little-endian")
+    // A Set cut short: the pulse's missing bytes read 0, not the buffer's.
+    var short = message(4, 0xFF)
+    short.bytes[0] = 1
+    check(short.payload_u32(1) == 0x0000_FFFF, "a pulse cut short by the message's end")
+    var reply = message(3, 0xFF)
+    reply.bytes[0] = 0
+    reply.bytes[1] = 7
+    reply.bytes[2] = 8
+    check(is_status(&reply, PwmStatus.Ok), "status 0 is Ok")
+    check(reply.byte(1) == 7 && reply.byte(2) == 8, "reply bytes")
+    check(reply.byte(3) == 0, "a reply byte past its end")
+    check(reply.byte(-1) == 0, "a reply byte before its start")
+    check(reply.u16(1) == 0x0807, "a half-word")
+    check(reply.u32(0) == 0x0008_0700, "a word, cut short by the reply's end")
+    var full = message(6, 0)
+    full.bytes[2] = 1
+    full.bytes[3] = 2
+    full.bytes[4] = 3
+    full.bytes[5] = 4
+    check(full.u32(2) == 0x0403_0201, "a whole word")
+}

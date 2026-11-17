@@ -1,0 +1,350 @@
+// The ESP32-S3's LEDC as a servo service.
+//
+// The process checks the frame and the servos its configuration names, maps
+// LEDC and the two parts that hold its pads' output selects and IO MUX words,
+// and starts the PWM (`esp32s3io.start_pwm`): timer 0 counting the crystal,
+// every channel idle with its line low, then each pad routed to its channel.
+// Then it serves `pwmproto` over a pipe. Its loop is a completion-queue
+// server, as the UART drivers' are: the outlet is given to the Waiter, so every
+// request arrives through `wait` itself with the obligation to answer it, and
+// the process holds no endpoint handle. A delivery is one of two things:
+//
+//   Message      a request, answered from the request. A command looks its
+//                channel up before it forms any register's address
+//                (`esp32s3io.servo_of`), and a refused one writes nothing.
+//   Readable     the terminal level: every inlet is gone, so no request can
+//                arrive again and the loop ends.
+//
+// A request may carry handles. They are released when the message is dropped,
+// and the driver's handle row (`process.toml`) leaves room for the obligation
+// and for all of them, so no client can end it.
+//
+// Every register word the driver writes goes through one method that forms
+// the address in its mapped windows, appends that address and the word to a
+// log and writes the word there (`Pwm`'s `write`), so the log is the writes
+// themselves; a client reads it with `Log`.
+//
+// When the driver ends, nothing touches LEDC: each channel goes on at its last
+// duty, so a client that wants its servos limp stops them first.
+
+import sos.{System, Process, IoMemory, PipeOutlet, Waiter, WaitResult, BootSet,
+            PipeRequest, PipeMsg, AttachMode, SosStatus, PIPE_BODY_BYTES}
+import pwmproto.{PwmStatus, PwmBody, Frame, BODY_BYTES, LOG_ENTRIES, LOG_PER_REPLY}
+import esp32s3io.{Servo, Register, RegisterPort, PwmRefusal, check_pwm_config, start_pwm,
+                  servo_of, set_servo, stop_servo, inspected, lowest_pin, place_pwm,
+                  count_up, count_up_16}
+import pwmconfig
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status this driver can never legitimately produce, so meeting it means an
+/// assertion in this file failed rather than a call did.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The tags its declaration gives its records (`process.toml`).
+static TAG_LEDC: UInt = 2
+static TAG_OUTSEL: UInt = 3
+static TAG_PADS: UInt = 4
+static TAG_SERVE: UInt = 5
+
+/// The Waiter's key for the outlet.
+static KEY_OUTLET: UInt = 11
+
+// =============================================================================
+// The device
+// =============================================================================
+
+/// A device register's word, as a mapped window shows it.
+struct Word {
+    v: UInt32,
+}
+
+/// The register at `address` in a mapped window, read now.
+func read_word(address: UInt) unsafe -> UInt32 {
+    let register = UnsafeMemory<Word, Device>(address)
+    register.v.read()
+}
+
+/// Writes `word` to the register at `address` in a mapped window.
+func write_word(address: UInt, word: UInt32) unsafe {
+    let register = UnsafeMemory<Word, Device>(address)
+    register.v.write(word)
+}
+
+/// One word the driver wrote, and the address it wrote it to.
+struct LogEntry {
+    address: UInt32,
+    word: UInt32,
+}
+
+/// The first `LOG_ENTRIES` words written, and a count of the rest.
+struct WriteLog {
+    entries: [LogEntry; LOG_ENTRIES],
+    kept: Int,
+    dropped: UInt16,
+}
+
+extension WriteLog {
+    static func empty() -> WriteLog {
+        WriteLog(entries: [LogEntry(address: 0, word: 0); LOG_ENTRIES], kept: 0, dropped: 0)
+    }
+
+    func record(&var self, address: UInt32, word: UInt32) {
+        if self.kept < LOG_ENTRIES {
+            self.entries[self.kept] = LogEntry(address: address, word: word)
+            self.kept = self.kept + 1
+        } else {
+            self.dropped = count_up_16(self.dropped)
+        }
+    }
+}
+
+/// How many servos `servos` holds.
+func servo_count<const N: Int>(servos: &[Servo; N]) -> Int {
+    N
+}
+
+/// LEDC and the driver's two parts, each by its mapped base, and the log of
+/// what was written.
+struct Pwm {
+    ledc: UInt,
+    outsel: UInt,
+    pads: UInt,
+    log: WriteLog,
+}
+
+extension Pwm: NoCopy {}
+
+extension Pwm {
+    /// The address `reg` is mapped at. A register none of the driver's windows
+    /// holds is a fault of this file, never of a request: every register it
+    /// names is its servos' own.
+    func address(&self, reg: Register) -> UInt {
+        guard let at = place_pwm(reg, lowest_pin(&pwmconfig.SERVOS),
+                                 servo_count(&pwmconfig.SERVOS)) else {
+            panic("SOS pwmsvc drv: register {} is in none of its windows", reg.address())
+        }
+        let base = match at.window {
+            case Ledc -> self.ledc,
+            case OutSel -> self.outsel,
+            case Pads -> self.pads,
+        }
+        base + (at.offset as UInt)
+    }
+
+    /// The word of `reg`, read from the device now.
+    func read(&self, reg: Register) -> UInt32 {
+        read_word(self.address(reg))
+    }
+}
+
+extension Pwm: RegisterPort {
+    func write(&var self, reg: Register, word: UInt32) {
+        let at = self.address(reg)
+        self.log.record(at as UInt32, word)
+        write_word(at, word)
+    }
+}
+
+// =============================================================================
+// The service
+// =============================================================================
+
+/// The status a refused command answers.
+func refusal(why: PwmRefusal) -> PwmStatus {
+    match why {
+        case BadChannel -> PwmStatus.BadChannel,
+        case OutOfRange -> PwmStatus.OutOfRange,
+    }
+}
+
+/// The server's state: the reply body and how many requests it has served.
+struct Server {
+    body: PwmBody,
+    served: UInt32,
+}
+
+extension Server {
+    static func empty() -> Server {
+        Server(body: PwmBody.empty(), served: 0)
+    }
+
+    /// Answers `request` with `n` bytes of the body. A client that dropped its
+    /// claim between the request and this reply is not a failure: the
+    /// obligation is discharged either way, and a driver one client could end
+    /// would be no driver.
+    func answer(&var self, request: PipeRequest, n: UInt) {
+        var r = move request
+        let _ = (move r).reply(body: &self.body.bytes, len: n)
+    }
+
+    /// Serves one message: refuses it or answers it.
+    func serve(&var self, dev: &var Pwm, msg: PipeMsg, request: PipeRequest) {
+        // The bytes are copied out and the message dropped, so whatever handles
+        // it carried are released before anything else is done.
+        let frame = Frame(len: msg.len, bytes: msg.bytes)
+        let _ = move msg
+        var obligation = move request
+        self.served = count_up(self.served)
+        // An op that is none, or a payload of another length than the op's.
+        guard let op = frame.op() else {
+            let n = self.body.refuse(PwmStatus.BadOp)
+            self.answer(move obligation, n)
+            return
+        }
+        if frame.payload_len() != op.payload_bytes() {
+            let n = self.body.refuse(PwmStatus.BadOp)
+            self.answer(move obligation, n)
+            return
+        }
+        // Every op's first payload byte is its channel, or `Log`'s start.
+        let first = frame.payload_byte(0)
+        let n = match op {
+            case Set -> {
+                match set_servo(&var dev, pwmconfig.FRAME_US, &pwmconfig.SERVOS, first,
+                                frame.payload_u32(1)) {
+                    case Ok(counts) -> self.body.ok_counts(counts),
+                    case Err(why) -> self.body.refuse(refusal(why)),
+                }
+            },
+            case Stop -> {
+                match stop_servo(&var dev, &pwmconfig.SERVOS, first) {
+                    case Ok(_) -> self.body.ok(),
+                    case Err(why) -> self.body.refuse(refusal(why)),
+                }
+            },
+            case Inspect -> self.inspect(&dev, first),
+            case Log -> self.log(&dev, first as Int),
+        }
+        self.answer(move obligation, n)
+    }
+
+    /// `Inspect(channel)`: its words, read from the device now.
+    func inspect(&var self, dev: &Pwm, channel: UInt8) -> UInt {
+        let servo = try servo_of(&pwmconfig.SERVOS, channel) catch {
+            return self.body.refuse(refusal(error))
+        }
+        let regs = inspected(&servo)
+        self.body.ok_inspect(dev.read(regs.duty_r), dev.read(regs.timer),
+                             dev.read(regs.conf0), dev.read(regs.out_sel),
+                             dev.read(regs.pad))
+    }
+
+    /// `Log(from)`: the entries from `from`, at most `LOG_PER_REPLY` of them.
+    func log(&var self, dev: &Pwm, from: Int) -> UInt {
+        var n = self.body.ok_log(dev.log.kept as UInt8, dev.log.dropped, 0)
+        var count = 0
+        while count < LOG_PER_REPLY && from + count < dev.log.kept {
+            let e = dev.log.entries[from + count]
+            n = self.body.put_log_entry(count, e.address, e.word)
+            count = count + 1
+        }
+        self.body.bytes[4] = count as UInt8
+        n
+    }
+}
+
+/// Whether a delivery is a request.
+func is_message(r: &WaitResult) -> Bool {
+    match r.what {
+        case Message(_, _) -> true,
+        case _ -> false,
+    }
+}
+
+/// Whether a delivery is the outlet's terminal level.
+func is_terminal(r: &WaitResult) -> Bool {
+    match r.what {
+        case Readable(_) -> true,
+        case _ -> false,
+    }
+}
+
+/// The loop: one `wait`, then the request it delivered, until the terminal
+/// level; answers how many requests it served.
+func serve(waiter: &Waiter, dev: &var Pwm) -> Result<UInt32, SosStatus> {
+    var server = Server.empty()
+    var wake = try waiter.wait()
+    while not is_terminal(&wake) {
+        if not is_message(&wake) {
+            return BUG
+        }
+        let (_, what) = (move wake).open()
+        match what {
+            case Message(m, r) -> { server.serve(&var dev, move m, move r) },
+            case _ -> { return BUG },
+        }
+        wake = try waiter.wait()
+    }
+    return server.served
+}
+
+/// The device window record `tag`, or `None` when the set has no such record.
+func take_window(set: &var BootSet, tag: UInt) -> IoMemory? {
+    guard var record = set.take(tag) else { return None }
+    record.take_iomemory()
+}
+
+/// The server-end record `tag`.
+func take_serve(set: &var BootSet, tag: UInt) -> PipeOutlet? {
+    guard var record = set.take(tag) else { return None }
+    record.take_outlet()
+}
+
+/// Maps the three windows, starts the PWM, wires the Waiter and serves until
+/// every client is gone.
+func run(proc: &Process) -> Result<UInt32, SosStatus> {
+    var set = try BootSet(process: &proc)
+    guard let ledc_window = take_window(&var set, TAG_LEDC) else { return BUG }
+    guard let outsel_window = take_window(&var set, TAG_OUTSEL) else { return BUG }
+    guard let pads_window = take_window(&var set, TAG_PADS) else { return BUG }
+    guard let outlet = take_serve(&var set, TAG_SERVE) else { return BUG }
+
+    let ledc_mapping = try proc.map(iomemory: &ledc_window)
+    let outsel_mapping = try proc.map(iomemory: &outsel_window)
+    let pads_mapping = try proc.map(iomemory: &pads_window)
+    var dev = Pwm(ledc: try ledc_mapping.base(), outsel: try outsel_mapping.base(),
+                  pads: try pads_mapping.base(), log: WriteLog.empty())
+    start_pwm(&var dev, pwmconfig.FRAME_US, &pwmconfig.SERVOS)
+
+    let waiter = try proc.waiter_create()
+    // The consuming, persistent attach: the attachment owns the server end from
+    // here on, and this process holds no outlet handle.
+    try waiter.give(outlet: move outlet, key: KEY_OUTLET,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let served = try serve(&waiter, &var dev)
+    let _ = move ledc_mapping
+    let _ = move outsel_mapping
+    let _ = move pads_mapping
+    return served
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS pwmsvc drv: no process handle: {}", error)
+        return
+    }
+    // The configuration is checked before anything is mapped, so a bad one
+    // writes nothing.
+    try check_pwm_config(pwmconfig.FRAME_US, &pwmconfig.SERVOS) catch {
+        print("SOS pwmsvc drv: config refused: {}", error.describe())
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let served = try run(&proc) catch {
+        print("SOS pwmsvc drv: failed: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    print("SOS pwmsvc drv: served={}", served)
+    let _ = proc.exit(EXIT_OK)
+}

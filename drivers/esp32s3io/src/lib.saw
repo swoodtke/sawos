@@ -724,3 +724,152 @@ public func stop_pwm<P: RegisterPort>(port: &var P, channel: UInt8) {
     port.write(channel_register(channel, CH_CONF1), CONF1_FIXED)
     port.write(channel_register(channel, CH_CONF0), CONF0_PARA_UP)
 }
+
+// The PWM driver's commands look their channel up and check their pulse before
+// they write anything (`set_servo`, `stop_servo`), and `place_pwm` says which
+// of that driver's windows holds a register.
+
+/// Why a PWM driver refuses a command.
+public enum PwmRefusal {
+    /// A channel the configuration does not name.
+    case BadChannel,
+    /// A pulse outside the channel's configured range.
+    case OutOfRange
+}
+
+@synthesize
+extension PwmRefusal: Equatable {}
+
+/// The servo `servos` puts on `channel`, or `BadChannel`. Every command that
+/// names a channel looks it up here before it forms a register's address: an
+/// unchecked channel 8's `CONF0` would be `TIMER0_CONF`, the timer every
+/// channel runs on.
+public func servo_of<const N: Int>(servos: &[Servo; N], channel: UInt8) -> Result<Servo, PwmRefusal> {
+    var i = 0
+    while i < N {
+        if servos[i].channel == channel {
+            return servos[i]
+        }
+        i = i + 1
+    }
+    return PwmRefusal.BadChannel
+}
+
+/// Sets the servo on `channel` to pulses `pulse_us` wide through `port`, from
+/// the next frame boundary (`set_pwm`), and answers the counts the pulse came
+/// to. A channel `servos` does not name is `BadChannel` and a pulse outside
+/// the servo's `min_us` to `max_us` is `OutOfRange`, and either writes
+/// nothing: a command is refused, never clamped. The range is checked before
+/// the counts are computed, so their arithmetic stays inside 32 bits.
+public func set_servo<P: RegisterPort, const N: Int>(port: &var P, frame_us: UInt32,
+                                                     servos: &[Servo; N], channel: UInt8,
+                                                     pulse_us: UInt32) -> Result<UInt32, PwmRefusal> {
+    let servo = try servo_of(&servos, channel)
+    if pulse_us < servo.min_us || pulse_us > servo.max_us {
+        return PwmRefusal.OutOfRange
+    }
+    let counts = pulse_counts(pulse_us, frame_us)
+    set_pwm(&var port, servo.channel, counts)
+    return counts
+}
+
+/// Stops the servo on `channel` through `port` (`stop_pwm`): its line low from
+/// the next frame boundary, so the servo goes limp, until a later
+/// `set_servo`. A channel `servos` does not name is `BadChannel`, and writes
+/// nothing.
+public func stop_servo<P: RegisterPort, const N: Int>(port: &var P, servos: &[Servo; N],
+                                                      channel: UInt8) -> Result<Void, PwmRefusal> {
+    let servo = try servo_of(&servos, channel)
+    stop_pwm(&var port, servo.channel)
+    return
+}
+
+/// The registers a PWM driver's `Inspect` reads for one servo.
+public struct Inspected {
+    /// Its channel's duty in force.
+    duty_r: Register
+    /// Timer 0's counter.
+    timer: Register
+    /// Its channel's `CONF0`.
+    conf0: Register
+    /// Its pad's output select.
+    out_sel: Register
+    /// Its pad's IO MUX word.
+    pad: Register
+}
+
+/// The registers `Inspect` reads for `servo`.
+public func inspected(servo: &Servo) -> Inspected {
+    Inspected(duty_r: channel_register(servo.channel, CH_DUTY_R),
+              timer: Register(block: Block.Ledc, offset: TIMER0_VALUE),
+              conf0: channel_register(servo.channel, CH_CONF0),
+              out_sel: out_sel_register(servo.pin),
+              pad: pad_register(servo.pin))
+}
+
+/// The lowest of the servos' pins, which begins both of a PWM driver's
+/// parts; 255 for no servo.
+public func lowest_pin<const N: Int>(servos: &[Servo; N]) -> UInt8 {
+    var lowest: UInt8 = 255
+    var i = 0
+    while i < N {
+        if servos[i].pin < lowest {
+            lowest = servos[i].pin
+        }
+        i = i + 1
+    }
+    lowest
+}
+
+/// Which of a PWM driver's windows holds a register.
+public enum PwmWindow {
+    /// LEDC, whole.
+    case Ledc,
+    /// The part of GPIO holding its pads' output selects.
+    case OutSel,
+    /// The part of the IO MUX holding its pads' words.
+    case Pads
+}
+
+@synthesize
+extension PwmWindow: Equatable {}
+
+/// A register as a PWM driver reaches it: its window, and its offset there.
+public struct Placed {
+    window: PwmWindow
+    offset: UInt32
+}
+
+@synthesize
+extension Placed: Equatable {}
+
+/// The offset of `offset` in a part of `count` words beginning at `first`, or
+/// `None` when the part does not hold it.
+func in_part(offset: UInt32, first: UInt32, count: Int) -> UInt32? {
+    if offset < first || offset - first >= 4 * (count as UInt32) {
+        return None
+    }
+    offset - first
+}
+
+/// Where a PWM driver whose servos' pins are the `count` from `lowest` reaches
+/// `reg`: in LEDC at its own offset, and a pad's output select and IO MUX word
+/// in the part that begins at pad `lowest`'s register. `None` for a register
+/// none of its windows holds, which a driver has no address for.
+public func place_pwm(reg: Register, lowest: UInt8, count: Int) -> Placed? {
+    match reg.block {
+        case Ledc -> Placed(window: PwmWindow.Ledc, offset: reg.offset),
+        case Gpio -> {
+            guard let at = in_part(reg.offset, out_sel_register(lowest).offset, count) else {
+                return None
+            }
+            Placed(window: PwmWindow.OutSel, offset: at)
+        },
+        case IoMux -> {
+            guard let at = in_part(reg.offset, pad_register(lowest).offset, count) else {
+                return None
+            }
+            Placed(window: PwmWindow.Pads, offset: at)
+        }
+    }
+}
