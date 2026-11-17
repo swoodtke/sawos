@@ -1261,14 +1261,11 @@ nothing before it. Unit 5 waits on SO-137's merge and units 2 and 4.
 
 ## Open questions
 
-1. **Every runtime end is `Faulted (Panic)`, wherever its text goes.** A
-   panic, an exhausted arena, a bad free, a failed start-up and the image
-   entry re-entered all end through the op, whether the process has a
-   console, `Debug`, or neither. *Recommend yes.* Tying the reason to where
-   the text could go would make one bug read differently in two images.
-2. **The op's object.** Handle-free (`PANIC_OP` with `NO_HANDLE`), or an
-   ungated System op, as the owner's words put it? *Recommend handle-free*
-   (§4.1): it reaches a process with no System or with a boot word of
-   another kind, reads no parked word, and puts no unremovable op on an
-   object whose every op is gated. The System op differs only in the rows of
-   §4.4 that a process without a System reaches.
+None. The owner ruled on the last two:
+
+- **Every runtime end is `Faulted (Panic)`, wherever its text goes:** a
+  panic, an exhausted arena, a bad free, a failed start-up and the image
+  entry re-entered all end through the op, whether the process has a
+  console, `Debug`, or neither.
+- **The op is handle-free** (`PANIC_OP` with `NO_HANDLE`, §4.1): it is the
+  way a process can die once it has lost all its handles.
