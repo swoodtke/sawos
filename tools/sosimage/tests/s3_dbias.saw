@@ -1,0 +1,159 @@
+// The ESP32-S3's LDO settings from the eFuse (`hal/xtensa-esp32s3/dbias/`),
+// held to ESP-IDF v5.4.1's arithmetic in esp_hw_support/port/esp32s3/
+// rtc_init.c. Each expected value is that C code's answer for the fields
+// given, worked with C's types: `uint32_t` sums, `int` slopes, a `uint32_t`
+// comparison.
+
+import s3dbias.{Calibration, Dbias, DbiasError, DbiasSource, EfuseWords,
+                check_dbias, dig1v3_dbias, pvt_scheme, rtc_dbias, stored_dbias}
+
+func fields(major: UInt32, minor: UInt32, k_rtc: UInt32, k_dig: UInt32,
+            v_rtc: UInt32, v_dig: UInt32, hvt: UInt32) -> Calibration {
+    Calibration(blk_version_major: major, blk_version_minor: minor,
+                k_rtc_ldo: k_rtc, k_dig_ldo: k_dig, v_rtc_dbias20: v_rtc,
+                v_dig_dbias20: v_dig, dig_dbias_hvt: hvt)
+}
+
+/// A calibrated block (version 1.2) with these fields.
+func calibrated(k_rtc: UInt32, k_dig: UInt32, v_rtc: UInt32, v_dig: UInt32,
+                hvt: UInt32) -> Calibration {
+    fields(1, 2, k_rtc, k_dig, v_rtc, v_dig, hvt)
+}
+
+func dbias(dig_240m: UInt32, rtc_240m: UInt32, dig_non_240m: UInt32,
+           rtc_non_240m: UInt32, source: DbiasSource) -> Dbias {
+    Dbias(dig_240m: dig_240m, rtc_240m: rtc_240m, dig_non_240m: dig_non_240m,
+          rtc_non_240m: rtc_non_240m, source: source)
+}
+
+func refused(d: Dbias, which: DbiasError) -> Bool {
+    match check_dbias(d) {
+        case Ok(_) -> false,
+        case Err(e) -> e == which
+    }
+}
+
+func accepted(d: Dbias) -> Bool {
+    match check_dbias(d) {
+        case Ok(_) -> true,
+        case Err(_) -> false
+    }
+}
+
+func main() {
+    // The fields out of the words, each at its shift with every bit around
+    // it set: BLK_VERSION_MINOR [26:24] of SYS_3, BLK_VERSION_MAJOR [1:0] of
+    // PART1_DATA4, K_RTC_LDO [19:13] and K_DIG_LDO [26:20] of SYS_4,
+    // V_RTC_DBIAS20's low five bits at SYS_4 [31:27] and its high three at
+    // SYS_5 [2:0], V_DIG_DBIAS20 [10:3] and DIG_DBIAS_HVT [15:11] of SYS_5.
+    let words = EfuseWords(
+        sys3: (2 << 24) | 0xF8FF_FFFF,
+        sys4: (0x13 << 27) | (0x45 << 20) | (0x4C << 13) | 0x1FFF,
+        sys5: 0xFFFF_0000 | (24 << 11) | (0x8A << 3) | 0x4,
+        part1_data4: 0xFFFF_FFFC | 1)
+    let cal = Calibration(words: words)
+    assert(cal.blk_version_minor == 2, "minor")
+    assert(cal.blk_version_major == 1, "major")
+    assert(cal.k_rtc_ldo == 0x4C, "k_rtc")
+    assert(cal.k_dig_ldo == 0x45, "k_dig")
+    assert(cal.v_rtc_dbias20 == 0x93, "v_rtc, from both words")
+    assert(cal.v_dig_dbias20 == 0x8A, "v_dig")
+    assert(cal.dig_dbias_hvt == 24, "hvt")
+    // The fields' widths: every bit of the minor and the major, and
+    // V_RTC_DBIAS20's high part ending where V_DIG_DBIAS20 begins.
+    let more = Calibration(words: EfuseWords(
+        sys3: (5 << 24) | 0xF8FF_FFFF, sys4: 0, sys5: 0x8,
+        part1_data4: 0xFFFF_FFFC | 2))
+    assert(more.blk_version_minor == 5, "minor, all three bits")
+    assert(more.blk_version_major == 2, "major, both bits")
+    assert(more.v_rtc_dbias20 == 0, "v_rtc stops at SYS_5 bit 2")
+    assert(more.v_dig_dbias20 == 1, "v_dig starts at SYS_5 bit 3")
+    // The words a console line prints for each source.
+    assert(DbiasSource.Default.name() == "default", "the default name")
+    assert(DbiasSource.NotBurnt.name() == "unburnt", "the unburnt name")
+    assert(DbiasSource.Efuse.name() == "efuse", "the efuse name")
+    // Negative slopes and voltages (the sign bit set), HVT + 2 the smaller.
+    assert(stored_dbias(cal) == dbias(27, 31, 26, 30, DbiasSource.Efuse),
+           "a calibrated block with signed fields")
+
+    // The block version's test, as rtc_set_stored_dbias writes it.
+    assert(not pvt_scheme(fields(0, 0, 0, 0, 0, 0, 0)), "0.0")
+    assert(pvt_scheme(fields(0, 1, 0, 0, 0, 0, 0)), "0.1")
+    assert(not pvt_scheme(fields(0, 2, 0, 0, 0, 0, 0)), "0.2")
+    assert(not pvt_scheme(fields(1, 0, 0, 0, 0, 0, 0)), "1.0")
+    assert(pvt_scheme(fields(1, 1, 0, 0, 0, 0, 0)), "1.1")
+    assert(pvt_scheme(fields(1, 2, 0, 0, 0, 0, 0)), "1.2")
+    assert(pvt_scheme(fields(2, 0, 0, 0, 0, 0, 0)), "2.0")
+    assert(pvt_scheme(fields(3, 7, 0, 0, 0, 0, 0)), "3.7")
+
+    // An uncalibrated block: ESP-IDF's defaults, whatever the fields hold.
+    let zero = EfuseWords(sys3: 0, sys4: 0, sys5: 0, part1_data4: 0)
+    assert(stored_dbias(Calibration(words: zero)) ==
+           dbias(28, 28, 27, 27, DbiasSource.Default), "an empty eFuse")
+    assert(stored_dbias(fields(1, 0, 0x3F, 0x3F, 0x7F, 0x7F, 24)) ==
+           dbias(28, 28, 27, 27, DbiasSource.Default),
+           "fields under a block version without the scheme")
+    // The scheme's version with no HVT burnt: the defaults too.
+    assert(stored_dbias(calibrated(0x3F, 0x3F, 0x7F, 0x7F, 0)) ==
+           dbias(28, 28, 27, 27, DbiasSource.NotBurnt), "HVT 0")
+
+    // A calibrated block at the mid slopes and voltages: no dbias reaches
+    // 1.3 V, so the search answers 31 and HVT plus 2 and 3 win; the RTC LDO
+    // sits within 25 mV below the digital one.
+    assert(dig1v3_dbias(calibrated(0, 0, 0, 0, 25)) == 31,
+           "the 1.3 V search finding none")
+    assert(stored_dbias(calibrated(0, 0, 0, 0, 25)) ==
+           dbias(28, 31, 27, 30, DbiasSource.Efuse), "HVT + 2 the smaller")
+    // The highest digital voltage at dbias 20 with the steepest slope: the
+    // search's answer is the smaller.
+    assert(dig1v3_dbias(calibrated(0, 0x3F, 0, 0x7F, 31)) == 19,
+           "the 1.3 V search at its earliest with the steepest slope")
+    assert(stored_dbias(calibrated(0, 0x3F, 0, 0x7F, 31)) ==
+           dbias(19, 31, 19, 31, DbiasSource.Efuse), "the 1.3 V answer the smaller")
+    // The least slope reaches 1.3 V earliest of all: from the highest
+    // voltage at dbias 20 it falls slowest going down.
+    assert(dig1v3_dbias(calibrated(0, 0x7F, 0, 0x7F, 31)) == 18,
+           "the 1.3 V search's earliest answer")
+    // HVT 1: ESP-IDF's least values.
+    assert(stored_dbias(calibrated(0, 0, 0, 0, 1)) ==
+           dbias(4, 15, 3, 15, DbiasSource.Efuse), "HVT 1")
+
+    // Each search's bound met exactly, and missed by 0.1 mV, so a slope, a
+    // voltage at dbias 20, a bound or a comparison one off moves the answer.
+    assert(dig1v3_dbias(calibrated(0, 0x00, 0, 0x0D, 31)) == 29,
+           "1.3 V met exactly at 29")
+    assert(dig1v3_dbias(calibrated(0, 0x02, 0, 0x2C, 31)) == 27,
+           "1.3 V missed by 0.1 mV at 26")
+    assert(rtc_dbias(calibrated(0x00, 0, 0x46, 0, 0), 20) == 15,
+           "the RTC bound met exactly at 15")
+    assert(rtc_dbias(calibrated(0x00, 0, 0x7C, 0, 0), 27) == 18,
+           "the RTC bound missed by 0.1 mV at 17")
+
+    // The RTC search's two ends: met at its first value, and never met.
+    assert(rtc_dbias(calibrated(0x3F, 0, 0x7F, 0xFF, 0), 3) == 15,
+           "the RTC search met at 15")
+    assert(rtc_dbias(calibrated(0x7F, 0, 0xFF, 0x7F, 0), 31) == 31,
+           "the RTC search never met")
+
+    // The range check: each of the four at both ends of its range and one
+    // past each.
+    assert(accepted(dbias(28, 28, 27, 27, DbiasSource.Default)), "defaults")
+    assert(accepted(dbias(4, 15, 3, 15, DbiasSource.Efuse)), "the least")
+    assert(accepted(dbias(31, 31, 31, 31, DbiasSource.Efuse)), "the greatest")
+    assert(refused(dbias(3, 28, 27, 27, DbiasSource.Efuse), DbiasError.Dig240m),
+           "dig 240m below")
+    assert(refused(dbias(32, 28, 27, 27, DbiasSource.Efuse), DbiasError.Dig240m),
+           "dig 240m above")
+    assert(refused(dbias(28, 14, 27, 27, DbiasSource.Efuse), DbiasError.Rtc240m),
+           "rtc 240m below")
+    assert(refused(dbias(28, 32, 27, 27, DbiasSource.Efuse), DbiasError.Rtc240m),
+           "rtc 240m above")
+    assert(refused(dbias(28, 28, 2, 27, DbiasSource.Efuse),
+                   DbiasError.DigNon240m), "dig non-240m below")
+    assert(refused(dbias(28, 28, 32, 27, DbiasSource.Efuse),
+                   DbiasError.DigNon240m), "dig non-240m above")
+    assert(refused(dbias(28, 28, 27, 14, DbiasSource.Efuse),
+                   DbiasError.RtcNon240m), "rtc non-240m below")
+    assert(refused(dbias(28, 28, 27, 32, DbiasSource.Efuse),
+                   DbiasError.RtcNon240m), "rtc non-240m above")
+}

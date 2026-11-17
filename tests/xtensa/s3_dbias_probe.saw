@@ -1,0 +1,94 @@
+// Board probe: the eFuse's voltage calibration, read and decoded, and the LDO
+// settings ESP-IDF v5.4.1 would choose from it (`s3dbias`,
+// hal/xtensa-esp32s3/dbias/), for a look at a part before any image writes
+// a voltage.
+//
+// The image reads four eFuse read registers and writes nothing beyond what
+// every image of this tree writes: `_start`'s registers, the kernel's own RAM
+// and the console's FIFO. It writes no LDO, analog-bus or eFuse register,
+// calls no ROM function, and does not change the clock. The eFuse read
+// registers hold what the eFuse controller loaded at reset; reading them
+// programs nothing.
+//
+// Every load goes through `load`, whose view is a `ReadOnly` field, so a
+// store through it is a compile error. The runner (`check_read_only_probe`
+// in tools/sos_runner.py) refuses this file if it takes a direct route to a
+// store, and holds `s3dbias` to having no unsafe code, no `extern` and no
+// imports; what holds the property for an image is a trace of its device
+// writes under the emulator before it is flashed.
+//
+// The lines:
+//   efuse    the four words, as read
+//   fields   the calibration's fields out of them, and whether the block
+//            version carries the PVT scheme
+//   dbias    where the settings come from (`default`, `unburnt` or `efuse`),
+//            the 1.3 V search's answer, ESP-IDF's four settings, and whether
+//            each is in the range ESP-IDF's arithmetic gives it
+
+import kcore.{console}
+import hal
+import s3dbias.{Calibration, EfuseWords, EFUSE_BASE, EFUSE_SYS_3, EFUSE_SYS_4,
+                EFUSE_SYS_5, EFUSE_PART1_DATA4, check_dbias, dig1v3_dbias,
+                pvt_scheme, stored_dbias}
+
+/// One register as a read-only word. `ReadOnly` gates `read()` and withholds
+/// `write(v)`, so nothing in this file can store through it.
+struct Reg {
+    v: ReadOnly<UInt32>,
+}
+
+/// The only access to a peripheral address in this image.
+func load(addr: UInt) unsafe -> UInt32 {
+    UnsafeMemory<Reg, Device>(addr).v.read()
+}
+
+func text(s: String) {
+    console().write_str(s)
+}
+
+func show(name: String, v: UInt32) {
+    text(" ")
+    text(name)
+    text("=")
+    console().write_hex(v as UInt)
+}
+
+@export("kmain")
+func kmain() unsafe {
+    let words = EfuseWords(sys3: load(EFUSE_BASE + EFUSE_SYS_3),
+                           sys4: load(EFUSE_BASE + EFUSE_SYS_4),
+                           sys5: load(EFUSE_BASE + EFUSE_SYS_5),
+                           part1_data4: load(EFUSE_BASE + EFUSE_PART1_DATA4))
+    text("SOS dbiasprobe: efuse")
+    show("sys3", words.sys3)
+    show("sys4", words.sys4)
+    show("sys5", words.sys5)
+    show("part1_data4", words.part1_data4)
+    text("\n")
+
+    let cal = Calibration(words: words)
+    text("SOS dbiasprobe: fields")
+    show("blk_version_major", cal.blk_version_major)
+    show("blk_version_minor", cal.blk_version_minor)
+    show("k_rtc_ldo", cal.k_rtc_ldo)
+    show("k_dig_ldo", cal.k_dig_ldo)
+    show("v_rtc_dbias20", cal.v_rtc_dbias20)
+    show("v_dig_dbias20", cal.v_dig_dbias20)
+    show("dig_dbias_hvt", cal.dig_dbias_hvt)
+    text(if pvt_scheme(cal) { " pvt=yes\n" } else { " pvt=no\n" })
+
+    let d = stored_dbias(cal)
+    text("SOS dbiasprobe: dbias source=")
+    text(d.source.name())
+    show("dig1v3", dig1v3_dbias(cal))
+    show("dig_240m", d.dig_240m)
+    show("rtc_240m", d.rtc_240m)
+    show("dig_non_240m", d.dig_non_240m)
+    show("rtc_non_240m", d.rtc_non_240m)
+    let in_range = match check_dbias(d) {
+        case Ok(_) -> true,
+        case Err(_) -> false
+    }
+    text(if in_range { " check=ok\n" } else { " check=refused\n" })
+    hal.exit_pass()
+}

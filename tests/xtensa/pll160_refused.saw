@@ -1,0 +1,32 @@
+// The `pll160` key handed LDO settings outside the range ESP-IDF's
+// arithmetic gives them: a digital setting of 32, past the 5-bit field. No
+// eFuse can produce one (`s3dbias`), so the settings are handed in rather
+// than read. The key must refuse before it writes anything, print why, and
+// let the boot go on:
+//
+//   SOS-S3: clock pll160 not taken: the LDO settings are outside ESP-IDF's
+//   range; nothing is written ldo=efuse dig=0x00000020 rtc=0x0000001b
+//
+// (one line). The emulator drops the analog bus's stores, so what shows
+// that nothing ran past the check is SYSTIMER's CONF, which the key's
+// `pll_bring_up` sets first (CLK_EN, UNIT0_WORK_EN) and the emulator keeps:
+// it must read as reset left it. Built at the `pll160` clock key.
+
+import kcore.{console}
+import hal
+import s3clock.{clock_init_at}
+import s3dbias.{Dbias, DbiasSource}
+
+/// SYSTIMER_CONF_REG (soc/esp32s3/register/soc/systimer_reg.h).
+static SYSTIMER_CONF: UInt = 0x6002_3000
+
+@export("kmain")
+func kmain() unsafe {
+    clock_init_at(Dbias(dig_240m: 28, rtc_240m: 28, dig_non_240m: 32,
+                        rtc_non_240m: 27, source: DbiasSource.Efuse))
+    let uart = console()
+    uart.write_str("SOS pll160: the boot goes on systimer_conf=")
+    uart.write_hex(UnsafeMemory<UInt32, Device>(SYSTIMER_CONF).read() as UInt)
+    uart.write_str("\n")
+    hal.exit_pass()
+}

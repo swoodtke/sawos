@@ -1,15 +1,21 @@
 //! What the clock keys that write share: the clock words' addresses, the
 //! console held still across a switch, the CPU's speed measured against
-//! SYSTIMER, and a console writer of their own.
+//! SYSTIMER, a console writer of their own, and the PLL keys' bring-up and
+//! switch.
 //!
 //! The `s3clockkit` module. The runner maps it for every image, but only a
-//! clock key that writes imports it (`../clock-xtal40/`, `../clock-pll80/`),
-//! so an image at the `rom` key compiles nothing from it. Like the keys, it
-//! reaches every register through views of its own and names nothing in
-//! `../../kernel/lib.saw`. `../../ABI.md` §14 is the source of every number.
+//! clock key that writes imports it (`../clock-xtal40/`, `../clock-pll80/`,
+//! `../clock-pll160/`), so an image at the `rom` key compiles nothing from
+//! it. Like the keys, it reaches every register through views of its own and
+//! names nothing in `../../kernel/lib.saw`. `../../ABI.md` §14 is the source
+//! of every number.
 
 extern "C" {
     func sos_ccount_read() -> UInt
+    func sos_clock_store(addr: UInt, value: UInt)
+    func sos_pll_bringup() -> UInt
+    func sos_windowed_call(fn_addr: UInt, a: UInt, b: UInt, c: UInt, d: UInt,
+                           e: UInt, f: UInt) -> UInt
 }
 
 /// SYSTEM_SYSCLK_CONF_REG: SOC_CLK_SEL [11:10] (0 the crystal, 1 the PLL, 2
@@ -79,6 +85,14 @@ static WORD_BITS: Int = 32
 /// counts at 16 MHz.
 static MEASURE_TICKS: UInt64 = 80000
 static TICKS_PER_US: UInt64 = 16
+
+/// Wait at least `ticks` of SYSTIMER, which `systimer_start` has started.
+///
+/// No preemption point: it runs at boot, before anything else.
+public func systimer_wait(ticks: UInt64) unsafe {
+    let start = systimer_now()
+    while systimer_now() - start < ticks { }
+}
 
 /// One 32-bit device register.
 public func device_word(addr: UInt) unsafe -> UnsafeMemory<UInt32, Device> {
@@ -210,4 +224,184 @@ public func write_centi(v: UInt) unsafe {
     let frac = v % 100
     write_byte(UInt8.from(truncating: frac / 10) + 48)
     write_byte(UInt8.from(truncating: frac % 10) + 48)
+}
+
+// -- The PLL keys ------------------------------------------------------------
+
+/// `sos_pll_bringup`'s answer when the BBPLL reported its calibration done.
+static PLL_CAL_DONE: UInt = 0
+
+/// RTC_CNTL_OPTIONS0, whose BB_I2C_FORCE_PD [6], BBPLL_I2C_FORCE_PD [8] and
+/// BBPLL_FORCE_PD [10] the bring-up clears. Read for the line.
+static RTC_CNTL_OPTIONS0: UInt = 0x6000_8000
+
+/// I2C_MST_ANA_CONF0: the analog master's BBPLL calibration controls
+/// (STOP_FORCE_HIGH [2], STOP_FORCE_LOW [3]) and CAL_DONE [24]. Read for the
+/// line.
+static I2C_MST_ANA_CONF0: UInt = 0x6000_E040
+
+/// The mask ROM's analog-bus functions (esp32s3.rom.ld), windowed, reached
+/// through `sos_windowed_call`: `rom_i2c_readReg(block, host, reg)` and
+/// `rom_i2c_writeReg_Mask(block, host, reg, msb, lsb, data)`, which ESP-IDF's
+/// REGI2C_READ and REGI2C_WRITE_MASK are on this chip.
+static ROM_I2C_READ: UInt = 0x4000_5D48
+static ROM_I2C_WRITE_MASK: UInt = 0x4000_5D6C
+
+/// The BBPLL's block on the analog bus, its host, and its register 8:
+/// OR_CAL_CAP [3:0], OR_CAL_UDF [4], OR_CAL_OVF [5], OR_CAL_END [6] and
+/// OR_LOCK [7] (soc/esp32s3/include/soc/regi2c_bbpll.h). Read for the line
+/// once the bring-up has run.
+static I2C_BBPLL: UInt = 0x66
+static I2C_BBPLL_HOSTID: UInt = 1
+static I2C_BBPLL_OR_CAL: UInt = 8
+
+/// One register of an analog-bus block, through the ROM.
+public func analog_read(block: UInt, host: UInt, reg: UInt) unsafe -> UInt {
+    sos_windowed_call(ROM_I2C_READ, block, host, reg, 0, 0, 0)
+}
+
+/// Bits `msb` to `lsb` of an analog-bus register set to `data`, through the
+/// ROM, which reads the register and writes it back with the field replaced.
+public func analog_write_mask(block: UInt, host: UInt, reg: UInt, msb: UInt,
+                              lsb: UInt, data: UInt) unsafe {
+    let _ = sos_windowed_call(ROM_I2C_WRITE_MASK, block, host, reg, msb, lsb,
+                              data)
+}
+
+/// What a PLL key found before it moved anything, and what the bring-up
+/// left: the words its line prints.
+public struct PllStart {
+    sysclk_before: UInt32,
+    cpu_per_before: UInt32,
+    options0_before: UInt32,
+    uart_clk: UInt32,
+    centi_before: UInt,
+    /// Whether the bring-up ran: the CPU was on the crystal. A CPU found on
+    /// the PLL keeps it, and the PLL is not brought up again under it.
+    brought_up: Bool,
+    /// The BBPLL's register 8 after the bring-up.
+    bbpll: UInt,
+}
+
+/// Why a PLL key leaves the CPU where the ROM left it.
+public enum PllNotTaken {
+    /// The BBPLL did not report its calibration done within the bring-up's
+    /// bound.
+    case CalibrationNotDone
+}
+
+/// The first half of a PLL key, `name` its line's name: the words read, the
+/// speed measured, the console drained and held on the crystal, and, from
+/// the crystal, the BBPLL powered and set to 480 MHz (`sos_pll_bringup`,
+/// `../../kernel/boot.S`; ESP-IDF's `rtc_clk_bbpll_enable` and
+/// `rtc_clk_bbpll_configure`). From RC_FAST, or a select no source names, it
+/// prints why and stops in a quiet loop before any clock word is written
+/// (SYSTIMER is already counting). When the calibration is not reported
+/// done it prints the `not taken` line and answers so: nothing switches to
+/// the PLL.
+public func pll_bring_up(name: String) unsafe -> Result<PllStart, PllNotTaken> {
+    let sysclk = device_word(SYSCLK_CONF)
+    let options0 = device_word(RTC_CNTL_OPTIONS0)
+    let sysclk_before = sysclk.read()
+    let cpu_per_before = device_word(CPU_PER_CONF).read()
+    let options0_before = options0.read()
+    let uart_clk = device_word(UART0_CLK_CONF).read()
+    systimer_start()
+    let centi_before = cpu_centi_mhz()
+
+    let source = (sysclk_before >> SOC_CLK_SEL_SHIFT) & SOC_CLK_SEL_MASK
+    if source != SOC_CLK_SEL_XTAL && source != SOC_CLK_SEL_PLL {
+        write_str("SOS-S3: clock ")
+        write_str(name)
+        write_str(" refused: sysclk=0x")
+        write_hex(sysclk_before)
+        write_str(": the switch is taken from the crystal or the PLL\n")
+        while { }
+    }
+
+    console_drain()
+    console_on_crystal(uart_clk)
+    let brought_up = source == SOC_CLK_SEL_XTAL
+    var bbpll: UInt = 0
+    if brought_up {
+        if sos_pll_bringup() != PLL_CAL_DONE {
+            write_str("SOS-S3: clock ")
+            write_str(name)
+            write_str(" not taken: the BBPLL did not ")
+            write_str("report its calibration done; the CPU stays on the ")
+            write_str("crystal sysclk=0x")
+            write_hex(sysclk.read())
+            write_str(" options0=0x")
+            write_hex(options0_before)
+            write_str("->0x")
+            write_hex(options0.read())
+            write_str(" ana_conf0=0x")
+            write_hex(device_word(I2C_MST_ANA_CONF0).read())
+            write_str(" mhz=")
+            write_centi(centi_before)
+            write_byte(10)
+            return PllNotTaken.CalibrationNotDone
+        }
+        bbpll = analog_read(I2C_BBPLL, I2C_BBPLL_HOSTID, I2C_BBPLL_OR_CAL)
+    }
+    PllStart(sysclk_before: sysclk_before, cpu_per_before: cpu_per_before,
+             options0_before: options0_before, uart_clk: uart_clk,
+             centi_before: centi_before, brought_up: brought_up, bbpll: bbpll)
+}
+
+/// The second half of a PLL key: the CPU moved onto the PLL at the division
+/// `period` (CPUPERIOD_SEL: 0 for 80 MHz, 1 for 160), then the speed
+/// measured and the key's line printed up to its end, which the caller
+/// writes. The three stores are `rtc_clk_cpu_freq_to_pll_mhz`'s
+/// (esp_hw_support/port/esp32s3/rtc_clk.c): CPUPERIOD_SEL, PRE_DIV_CNT 0,
+/// SOC_CLK_SEL 1, in that order, each a store of its own from IRAM.
+/// CPU_PER_CONF is read again because the bring-up set its PLL_FREQ_SEL.
+public func pll_switch(name: String, start: PllStart, period: UInt32) unsafe {
+    let sysclk = device_word(SYSCLK_CONF)
+    let cpu_per = device_word(CPU_PER_CONF)
+    let periodic = (cpu_per.read() & ~CPUPERIOD_SEL_MASK) | period
+    sos_clock_store(CPU_PER_CONF, periodic as UInt)
+    let divided = start.sysclk_before & ~PRE_DIV_CNT_MASK
+    sos_clock_store(SYSCLK_CONF, divided as UInt)
+    let on_pll = ((divided & ~(SOC_CLK_SEL_MASK << SOC_CLK_SEL_SHIFT))
+                  | (SOC_CLK_SEL_PLL << SOC_CLK_SEL_SHIFT))
+    sos_clock_store(SYSCLK_CONF, on_pll as UInt)
+    let sysclk_after = sysclk.read()
+    let cpu_per_after = cpu_per.read()
+    let centi_after = cpu_centi_mhz()
+
+    write_str("SOS-S3: clock ")
+    write_str(name)
+    write_str(" sysclk=0x")
+    write_hex(start.sysclk_before)
+    write_str("->0x")
+    write_hex(sysclk_after)
+    write_str(" cpu_per=0x")
+    write_hex(start.cpu_per_before)
+    write_str("->0x")
+    write_hex(cpu_per_after)
+    write_str(" options0=0x")
+    write_hex(start.options0_before)
+    write_str("->0x")
+    write_hex(device_word(RTC_CNTL_OPTIONS0).read())
+    if start.brought_up {
+        write_str(" bbpll=0x")
+        write_hex(start.bbpll as UInt32)
+    } else {
+        write_str(" bbpll=kept")
+    }
+    write_str(" ana_conf0=0x")
+    write_hex(device_word(I2C_MST_ANA_CONF0).read())
+    write_str(" mhz=")
+    write_centi(start.centi_before)
+    write_str("->")
+    write_centi(centi_after)
+    write_str(" uart_clk=0x")
+    write_hex(start.uart_clk)
+    write_str(" mspi_core=0x")
+    write_hex(device_word(SPI0_CORE_CLK_SEL).read())
+    write_str(" mspi_clock=0x")
+    write_hex(device_word(SPI0_CLOCK).read())
+    write_str(" rtc_date=0x")
+    write_hex(device_word(RTC_CNTL_DATE).read())
 }

@@ -13233,9 +13233,10 @@ def _process_image(pkg, role, arch):
     return os.path.join(pkg, ".build", arch["triple"], f"{role}.sosimg")
 
 
-# The only imports a read-only probe may hold: the console it prints on, and
-# the HAL by its module name, so that every call into the HAL is spelled
-# `hal.NAME` and the check below sees it.
+# The imports every read-only probe holds, and the only ones but a pure
+# module's (`check_pure_module`): the console it prints on, and the HAL by its
+# module name, so that every call into the HAL is spelled `hal.NAME` and the
+# check below sees it.
 READ_ONLY_PROBE_IMPORTS = ["import kcore.{console}", "import hal"]
 
 # A read-only probe's one accessor, as it must be written: a register is a
@@ -13252,13 +13253,35 @@ READ_ONLY_PROBE_ACCESSOR = (
 )
 
 
-def check_read_only_probe(path):
+def check_pure_module(name, directory):
+    """Refuse a module a read-only probe imports unless every source file in
+    `directory` is plain computation: no `unsafe`, no unsafe type, no
+    `extern`, no `asm`, no `@export` and no import, so it reaches no address
+    and no code but its own. Comments are not read."""
+    files = sorted(f for f in os.listdir(directory) if f.endswith(".saw"))
+    if not files:
+        raise ToolError(f"{name} ({directory}) holds no source")
+    for file in files:
+        with open(os.path.join(directory, file)) as f:
+            code = "\n".join(line.split("//", 1)[0]
+                             for line in f.read().splitlines())
+        for word in (r"\bunsafe\b", r"\bUnsafe\w*", r"\bextern\b",
+                     r"\basm\b", r"@export\b", r"\bimport\b"):
+            found = re.search(word, code)
+            if found:
+                raise ToolError(f"{name}'s {file} is imported by a read-only "
+                                f"probe and names `{found.group(0)}`")
+
+
+def check_read_only_probe(path, pure_modules):
     """Refuse a read-only probe's source if it takes one of the direct routes
     to a store to a peripheral: a store through its view, a second view, an
     unsafe type named outside the accessor, a call into the HAL other than the
     one that halts, a call through `kcore.`, an import beyond
-    `READ_ONLY_PROBE_IMPORTS`, `extern` or `asm`. The accessor is held to its
-    text (`READ_ONLY_PROBE_ACCESSOR`). Comments are not read.
+    `READ_ONLY_PROBE_IMPORTS` and the modules `pure_modules` names (name to
+    directory, each held to `check_pure_module`), `extern` or `asm`. The
+    accessor is held to its text (`READ_ONLY_PROBE_ACCESSOR`). Comments are
+    not read.
 
     This guards against an honest mistake; it does not show that the file
     can store nothing, since a raw pointer from a safe name (an allocator's,
@@ -13271,10 +13294,20 @@ def check_read_only_probe(path):
     name = os.path.basename(path)
     imports = [line.strip() for line in code
                if re.match(r"\s*(public\s+)?import\b", line)]
-    if imports != READ_ONLY_PROBE_IMPORTS:
+    # A pure module's import may select names, over as many lines as it
+    # takes; its first line is the one read here.
+    imported = [m.group(1) for m in
+                (re.fullmatch(r"import (\w+)(\.\{.*)?", line)
+                 for line in imports[len(READ_ONLY_PROBE_IMPORTS):])
+                if m]
+    if (imports[:len(READ_ONLY_PROBE_IMPORTS)] != READ_ONLY_PROBE_IMPORTS or
+            len(imported) != len(imports) - len(READ_ONLY_PROBE_IMPORTS) or
+            any(module not in pure_modules for module in imported)):
         raise ToolError(f"{name} is a read-only probe; its imports must be "
-                        f"exactly {READ_ONLY_PROBE_IMPORTS}, and they are "
-                        f"{imports}")
+                        f"exactly {READ_ONLY_PROBE_IMPORTS}, then any of "
+                        f"{sorted(pure_modules)}, and they are {imports}")
+    for module in imported:
+        check_pure_module(module, pure_modules[module])
     code = "\n".join(line.rstrip() for line in code)
     rest = code
     for part in READ_ONLY_PROBE_ACCESSOR:
@@ -13434,6 +13467,7 @@ PSRAM_PART_CLOCK = {
     "rom": (0x00080001, 0x4, 0x0),
     "xtal40": (0x00080000, 0x4, 0x0),
     "pll80": (0x00080400, 0x4, 0x0),
+    "pll160": (0x00080400, 0x5, 0x0),
 }
 
 # The emulator's, under every key: it answers SYSCLK_CONF with the PLL
@@ -13498,10 +13532,12 @@ def _psram_case_asm(case, clock, board):
     return "\n".join(lines)
 
 
-# The eFuse words the emulator's model reads from a file (ABI.md §16e): six
-# words of block 0, then block 1, whose word 4 is EFUSE_RD_MAC_SPI_SYS_4,
-# with PSRAM_CAP [4:3] and PSRAM_VENDOR [8:7].
+# The eFuse words the emulator's model reads from a file (ABI.md §16e): its
+# read registers in order from EFUSE_RD_WR_DIS_REG (0x6000_702C), six words
+# of block 0, then block 1, whose word 4 is EFUSE_RD_MAC_SPI_SYS_4, with
+# PSRAM_CAP [4:3] and PSRAM_VENDOR [8:7].
 EFUSE_FILE_BYTES = 1024
+EFUSE_RD_BASE = 0x6000702C
 EFUSE_SYS_4_OFFSET = 40
 EFUSE_SYS_4 = {
     "8M": (1 << 3) | (1 << 7),          # 8 MiB, AP at 3.3 V: the part's
@@ -13512,9 +13548,17 @@ EFUSE_SYS_4 = {
 
 def _efuse_file(path, which):
     """Write a fresh eFuse file for one run, so nothing one run's emulator
-    does to it reaches another's."""
+    does to it reaches another's. `which` names a SYS_4 word
+    (`EFUSE_SYS_4`), or maps read registers' addresses to their words."""
     image = bytearray(EFUSE_FILE_BYTES)
-    struct.pack_into("<I", image, EFUSE_SYS_4_OFFSET, EFUSE_SYS_4[which])
+    if isinstance(which, str):
+        which = {EFUSE_RD_BASE + EFUSE_SYS_4_OFFSET: EFUSE_SYS_4[which]}
+    for addr, word in which.items():
+        at = addr - EFUSE_RD_BASE
+        if not 0 <= at <= EFUSE_FILE_BYTES - 4 or at % 4:
+            raise ToolError(f"eFuse address {addr:#x} is not a read "
+                            "register's")
+        struct.pack_into("<I", image, at, word)
     with open(path, "wb") as f:
         f.write(image)
 
@@ -13589,6 +13633,7 @@ def _esp32s3_module_paths(key):
             SOSABI_MODULE,
             f"s3clock={os.path.join(keys_dir, 'clock-' + clock)}",
             f"s3clockkit={os.path.join(keys_dir, 'clock-common')}",
+            f"s3dbias={os.path.join(s3_hal, 'dbias', 'src')}",
             "s3stall=" + os.path.join(
                 keys_dir, "stall-on" if stall else "stall-off")]
 
@@ -13851,7 +13896,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # keys that write share `s3clockkit` (`keys/clock-common`), mapped for
     # every image and compiled only into one whose key imports it
     # (`_esp32s3_module_paths`).
-    clock_keys = ("rom", "xtal40", "pll80")
+    clock_keys = ("rom", "xtal40", "pll80", "pll160")
+    # The LDO settings from the eFuse, for every image: plain Saw that only
+    # an image whose source imports it compiles.
+    s3_dbias_dir = os.path.join(s3_hal, "dbias", "src")
 
     def variant(case):
         """A case's build keys: its clock, whether the console counts its
@@ -14045,6 +14093,72 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             f.write(image)
         return flash, used, end
 
+    def traced_accesses(path):
+        """The device accesses a traced run made, in order, each as (kind,
+        address, value), kind "w" for a store and "r" for a load: what QEMU's
+        `memory_region_ops_write` and `memory_region_ops_read` events
+        report, which is every access to a modelled or unmodelled device
+        region and none to RAM. A run traces loads only when its case asks
+        (`expect_counter_span`)."""
+        found = re.compile(r"memory_region_ops_(write|read) .*addr "
+                           r"(0x[0-9a-f]+) value (0x[0-9a-f]+)")
+        accesses = []
+        with open(path) as f:
+            for line in f:
+                m = found.search(line)
+                if m:
+                    accesses.append(("w" if m.group(1) == "write" else "r",
+                                     int(m.group(2), 16), int(m.group(3), 16)))
+        return accesses
+
+    def traced_stores(path):
+        """The device stores a traced run made, in order, each as (address,
+        value)."""
+        return [(a, v) for kind, a, v in traced_accesses(path) if kind == "w"]
+
+    def check_counter_span(case, accesses):
+        """Hold a traced run to its case's `expect_counter_span`: between
+        the store `after` and the first store `before` that follows it, the
+        loads of the counter register `counter` must span at least
+        `at_least` of its counts, the last value read less the first,
+        modulo 2^32. A wait on a free-running counter makes such loads, and
+        a stalled host can only lengthen the span. Returns (ok, reason)."""
+        span = case["expect_counter_span"]
+        after = ("w", *span["after"])
+        before = ("w", *span["before"])
+        start = next((i for i, x in enumerate(accesses) if x == after), None)
+        if start is None:
+            return False, (f"no store of {span['after'][1]:#010x} to "
+                           f"{span['after'][0]:#010x}")
+        end = next((i for i in range(start, len(accesses))
+                    if accesses[i] == before), None)
+        if end is None:
+            return False, (f"no store of {span['before'][1]:#010x} to "
+                           f"{span['before'][0]:#010x} after it")
+        read = [v for kind, a, v in accesses[start:end]
+                if kind == "r" and a == span["counter"]]
+        spanned = (read[-1] - read[0]) % (1 << 32) if read else 0
+        if spanned < span["at_least"]:
+            return False, (f"the loads of {span['counter']:#010x} between "
+                           f"the two stores span {spanned} counts, under "
+                           f"{span['at_least']}")
+        return True, ""
+
+    def check_stores(case, stores):
+        """Hold a traced run to its case's `expect_stores`, (address, value)
+        pairs that must appear in this order among the run's stores, others
+        between them. Returns (ok, reason)."""
+        want = case.get("expect_stores", [])
+        at = 0
+        for store in stores:
+            if at < len(want) and store == want[at]:
+                at += 1
+        if at < len(want):
+            addr, value = want[at]
+            return False, (f"no store of {value:#010x} to {addr:#010x} "
+                           f"followed the {at} expected before it")
+        return True, ""
+
     def boot(flash, extra=()):
         return _boot_esp32s3(qemu, flash, timeout_s, extra)
 
@@ -14072,6 +14186,59 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         "bbpll=kept ana_conf0=0x00000000 mhz=",
         " uart_clk=0x15122500 mspi_core=0x00000000 mspi_clock=0x00000000 "
         "rtc_date=0x00000000\n"]
+    # The `pll160` clock line as the emulator prints it: `pll80`'s, then the
+    # LDO settings and the two LDO registers before and after their writes.
+    # The emulator's eFuse reads 0 unless a case gives it a file, so the
+    # settings are ESP-IDF's defaults (`ldo=default`); its analog bus has no
+    # block, so the ROM's register read answers 0 before and after
+    # (ABI.md §14e).
+    def clock_pll160_lines(ldo):
+        return [
+            "SOS-S3: clock pll160 sysclk=0x000a8401->0x000a8401 "
+            "cpu_per=0x00000000->0x00000000 options0=0x00000000->0x00000000 "
+            "bbpll=kept ana_conf0=0x00000000 mhz=",
+            " uart_clk=0x15122500 mspi_core=0x00000000 "
+            f"mspi_clock=0x00000000 rtc_date=0x00000000 {ldo} "
+            "ext_dig_dreg=0x00000000->0x00000000 "
+            "ext_rtc_dreg=0x00000000->0x00000000\n"]
+    # The stores the PLL keys make on the emulator's path, held in order by
+    # a device trace (`expect_stores`), since the emulator drops each of
+    # them and reads back nothing they wrote. An LDO write is the ROM's
+    # command word to the analog master (0x6000_E000) as the ROM writes it:
+    # the block, 0x6D, in [7:0], the register in [15:8], the data in
+    # [23:16], and bits 24 (a write) and 26 set. Both follow SYSTIMER's CONF
+    # (CLK_EN and UNIT0_WORK_EN over its reset 0x4600_0000), the bring-up's
+    # first store, so the writes are held to their place after it. Between
+    # the two writes and the switch, the 40 us wait makes at least two
+    # SYSTIMER snapshots, and its loads of UNIT0's low word span at least
+    # 640 of SYSTIMER's 16 MHz counts (`pll160_wait`). The switch stores
+    # CPU_PER_CONF with the key's CPUPERIOD_SEL over the 0 the emulator
+    # reads, then SYSCLK_CONF twice: the PLL's word with the pre-divider at
+    # 0.
+    def ldo_store(reg, value):
+        return (0x6000E000, 0x0500006D | (value << 16) | (reg << 8))
+    systimer_snapshot = (0x60023004, 1 << 30)
+    def pll_switch_stores(period):
+        return [(0x600C0010, period), (0x600C0060, 0x000A8400),
+                (0x600C0060, 0x000A8400)]
+    def pll160_stores(rtc, dig):
+        return [(0x60023000, 0xC6000000), ldo_store(4, rtc),
+                ldo_store(6, dig), systimer_snapshot, systimer_snapshot,
+                *pll_switch_stores(1)]
+    def pll160_wait(dig):
+        return {"after": ldo_store(6, dig), "before": (0x600C0010, 1),
+                "counter": 0x60023044, "at_least": 40 * 16}
+    # A calibrated eFuse for the emulator, by read register: block version
+    # 1.2 (BLK_VERSION_MINOR at EFUSE_RD_MAC_SPI_SYS_3 [26:24],
+    # BLK_VERSION_MAJOR at EFUSE_RD_SYS_PART1_DATA4 [1:0]); K_RTC_LDO 0x4C,
+    # K_DIG_LDO 0x45 and V_RTC_DBIAS20's low bits 0x13 in SYS_4; its high
+    # bits 4, V_DIG_DBIAS20 0x8A and DIG_DBIAS_HVT 24 in SYS_5.
+    s3_calibrated_efuse = {
+        0x60007050: 2 << 24,
+        0x60007054: (0x13 << 27) | (0x45 << 20) | (0x4C << 13),
+        0x60007058: (24 << 11) | (0x8A << 3) | 0x4,
+        0x6000706C: 1,
+    }
     # The kernel-only cases, in the gate's case shape so `_check` judges them
     # too. The exit status is the kernel's own semihosting exit, so a failing
     # stop is non-zero and carries its code.
@@ -14103,17 +14270,79 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         },
         {
             # The same boot at the `pll80` clock key, on the emulator's path:
-            # the CPU found on the PLL keeps it, the three stores are made,
-            # the line is printed before the banner and the console works
-            # after it. `pll_bringup` runs the bring-up itself.
+            # the CPU found on the PLL keeps it, the three stores are made
+            # (the device trace holds them), the line is printed before the
+            # banner and the console works after it. `pll_bringup` runs the
+            # bring-up itself.
             "name": "boot_pll80",
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "clock": "pll80",
+            "expect_stores": pll_switch_stores(0),
             "expect_out": [rom, *clock_pll80_lines, banner,
                            "SOS: bad root image: no root image appended",
                            "SOS-S3: halt fail code=0x00000004"],
             "expect_clean_exit": False,
             "expect_status": 4,
+        },
+        {
+            # The same boot at the `pll160` clock key, on the emulator's path
+            # as `boot_pll80`, with the eFuse uncalibrated: the LDO settings
+            # are ESP-IDF's defaults, written RTC first, then the wait, then
+            # the three stores with CPUPERIOD_SEL 1 (the device trace holds
+            # each).
+            "name": "boot_pll160",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "clock": "pll160",
+            "expect_stores": pll160_stores(27, 27),
+            "expect_counter_span": pll160_wait(27),
+            "expect_out": [rom,
+                           *clock_pll160_lines(
+                               "ldo=default dig=0x0000001b rtc=0x0000001b"),
+                           banner,
+                           "SOS: bad root image: no root image appended",
+                           "SOS-S3: halt fail code=0x00000004"],
+            "expect_clean_exit": False,
+            "expect_status": 4,
+        },
+        {
+            # And on the calibrated eFuse (`s3_dbias_probe_calibrated`): the
+            # settings the key writes are the ones computed from it.
+            "name": "boot_pll160_calibrated",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "clock": "pll160",
+            "efuse": s3_calibrated_efuse,
+            "expect_stores": pll160_stores(30, 26),
+            "expect_counter_span": pll160_wait(26),
+            "expect_out": [rom,
+                           *clock_pll160_lines(
+                               "ldo=efuse dig=0x0000001a rtc=0x0000001e"),
+                           banner,
+                           "SOS: bad root image: no root image appended",
+                           "SOS-S3: halt fail code=0x00000004"],
+            "expect_clean_exit": False,
+            "expect_status": 4,
+        },
+        {
+            # The `pll160` key handed LDO settings outside the range
+            # ESP-IDF's arithmetic gives them, which no eFuse produces: it
+            # refuses before it writes anything, says so, and the boot goes
+            # on. SYSTIMER's CONF still reads its reset value, which the
+            # key's first step past the check would have changed.
+            "name": "pll160_refused",
+            "src": os.path.join(s3_tests, "pll160_refused.saw"),
+            "clock": "pll160",
+            # The analog master, ANA_CONFIG, ANA_CONFIG2, both clock words
+            # and SYSTIMER's CONF: none is stored.
+            "device_untouched": [0x6000E000, 0x6000E044, 0x6000E048,
+                                 0x600C0010, 0x600C0060, 0x60023000],
+            "expect_out": [rom,
+                           "SOS-S3: clock pll160 not taken: the LDO settings "
+                           "are outside ESP-IDF's range; nothing is written "
+                           "ldo=efuse dig=0x00000020 rtc=0x0000001b",
+                           "SOS pll160: the boot goes on "
+                           "systimer_conf=0x46000000",
+                           halt_pass],
+            "expect_clean_exit": True,
         },
         {
             # A load the kernel cannot make arrives at the kernel vector
@@ -14283,6 +14512,57 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                 "SOS memprobe: insel 7=0x00000000 8=0x00000000 "
                 "9=0x00000000 10=0x00000000 11=0x00000000",
                 "SOS memprobe: misc pad_hold=0x",
+                halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # The read-only eFuse calibration probe: the four eFuse words
+            # that hold the LDO calibration, their fields, and the settings
+            # ESP-IDF would choose from them (`s3dbias`, ABI.md §14b), with
+            # nothing written beyond what every image writes. The emulator's
+            # eFuse reads 0 (the smoke gives it no file), a block version
+            # below the PVT scheme's, so the settings are ESP-IDF's defaults.
+            "name": "s3_dbias_probe",
+            "src": os.path.join(s3_tests, "s3_dbias_probe.saw"),
+            "read_only_probe": True,
+            "pure_modules": {"s3dbias": s3_dbias_dir},
+            "expect_out": [
+                rom,
+                "SOS dbiasprobe: efuse sys3=0x00000000 sys4=0x00000000 "
+                "sys5=0x00000000 part1_data4=0x00000000",
+                "SOS dbiasprobe: fields blk_version_major=0x00000000 "
+                "blk_version_minor=0x00000000 k_rtc_ldo=0x00000000 "
+                "k_dig_ldo=0x00000000 v_rtc_dbias20=0x00000000 "
+                "v_dig_dbias20=0x00000000 dig_dbias_hvt=0x00000000 pvt=no",
+                "SOS dbiasprobe: dbias source=default dig1v3=0x0000001f "
+                "dig_240m=0x0000001c rtc_240m=0x0000001c "
+                "dig_non_240m=0x0000001b rtc_non_240m=0x0000001b check=ok",
+                halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # The same probe on a calibrated eFuse, given to the emulator as
+            # a file (`efuse`): block version 1.2, negative slopes and
+            # voltages (each field's sign bit set) and DIG_DBIAS_HVT 24, each
+            # at its own bits with the words around it clear. The settings
+            # are the ones the image builder's tests hold to ESP-IDF's
+            # arithmetic for these fields (`tests/s3_dbias.saw`).
+            "name": "s3_dbias_probe_calibrated",
+            "src": os.path.join(s3_tests, "s3_dbias_probe.saw"),
+            "read_only_probe": True,
+            "pure_modules": {"s3dbias": s3_dbias_dir},
+            "efuse": s3_calibrated_efuse,
+            "expect_out": [
+                rom,
+                "SOS dbiasprobe: efuse sys3=0x02000000 sys4=0x9c598000 "
+                "sys5=0x0000c454 part1_data4=0x00000001",
+                "SOS dbiasprobe: fields blk_version_major=0x00000001 "
+                "blk_version_minor=0x00000002 k_rtc_ldo=0x0000004c "
+                "k_dig_ldo=0x00000045 v_rtc_dbias20=0x00000093 "
+                "v_dig_dbias20=0x0000008a dig_dbias_hvt=0x00000018 pvt=yes",
+                "SOS dbiasprobe: dbias source=efuse dig1v3=0x0000001f "
+                "dig_240m=0x0000001b rtc_240m=0x0000001f "
+                "dig_non_240m=0x0000001a rtc_non_240m=0x0000001e check=ok",
                 halt_pass],
             "expect_clean_exit": True,
         },
@@ -15517,6 +15797,12 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         dict(by_name["kill_churn"], name="kill_churn_pll80", clock="pll80",
              expect_out=[*clock_pll80_lines,
                          *by_name["kill_churn"]["expect_out"]]),
+        # And at the `pll160` clock key, on the emulator's path
+        # (`boot_pll160`).
+        dict(by_name["kill_churn"], name="kill_churn_pll160", clock="pll160",
+             expect_out=[*clock_pll160_lines(
+                             "ldo=default dig=0x0000001b rtc=0x0000001b"),
+                         *by_name["kill_churn"]["expect_out"]]),
         {
             # `kill_churn` timed: root stamps the clock around each phase of
             # a round and prints the six totals and the whole once, in
@@ -16000,7 +16286,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         if name in refused:
             raise refused[name]
         if case.get("read_only_probe"):
-            check_read_only_probe(case["src"])
+            check_read_only_probe(case["src"], case.get("pure_modules", {}))
         if case.get("image_file"):
             elf, printed = _build_image_file(
                 packager, profiles[variant(case)], variant_arch(variant(case)),
@@ -16085,36 +16371,42 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                     or case.get("device_untouched"))
 
     def boot_args(case):
-        """The emulator's extra arguments for one run, and the file its trace
-        goes to (None for a case that keeps no trace). A PSRAM harness's run
-        gets the part's PSRAM (`psram_qemu_args`) unless the case names its
-        own `qemu_args`, a fresh eFuse file holding the case's `efuse` words
-        (the part's, `8M`, unless it says otherwise; None gives the model no
-        file, and every word reads 0), and the trace of every command the
-        flash model decodes. Any case that watches devices
-        (`watches_devices`) gets the trace of every store to a device
-        register."""
-        if "psram" not in case:
-            if not watches_devices(case):
-                return [], None
-            trace = os.path.join(s3_build, f"{case['name']}.trace.txt")
-            if os.path.exists(trace):
-                os.remove(trace)
-            return ["-trace", "memory_region_ops_write", "-D", trace], trace
-        args = list(case.get("qemu_args", arch["psram_qemu_args"]))
-        which = case.get("efuse", "8M")
+        """The emulator's extra arguments for one run, and the file its
+        trace goes to (None for a run that traces nothing). A PSRAM
+        harness's run gets the part's PSRAM (`psram_qemu_args`) unless the
+        case names its own `qemu_args`, and the trace of every command the
+        flash model decodes. A run gets a fresh eFuse file holding the
+        case's `efuse` words (`_efuse_file`; a PSRAM harness the part's,
+        `8M`, unless it says otherwise; None, and any other case that names
+        none, gives the model no file, and every word reads 0); and, for a
+        case that watches devices (`watches_devices`) or names
+        `expect_stores` or `expect_counter_span`, the trace of every store
+        to a device register, and for the last, of every load."""
+        psram = "psram" in case
+        args = list(case.get("qemu_args", arch["psram_qemu_args"])) \
+            if psram else []
+        which = case.get("efuse", "8M" if psram else None)
         if which is not None:
             efuse = os.path.join(s3_build, f"{case['name']}.efuse.bin")
             _efuse_file(efuse, which)
             args += ["-drive", f"file={efuse},if=none,format=raw,id=efuse",
                      "-global",
                      "driver=nvram.esp32s3.efuse,property=drive,value=efuse"]
+        stores = (watches_devices(case) or case.get("expect_stores")
+                  or case.get("expect_counter_span"))
+        loads = case.get("expect_counter_span")
+        if not psram and not stores:
+            return args, None
         trace = os.path.join(s3_build, f"{case['name']}.trace.txt")
         if os.path.exists(trace):
             os.remove(trace)
-        args += ["-trace", "m25p80_command_decoded", "-D", trace]
-        if watches_devices(case):
+        if psram:
+            args += ["-trace", "m25p80_command_decoded"]
+        if stores:
             args += ["-trace", "memory_region_ops_write"]
+        if loads:
+            args += ["-trace", "memory_region_ops_read"]
+        args += ["-D", trace]
         return args, trace
 
     def flash_commands(trace):
@@ -16308,6 +16600,14 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             if ok and touched:
                 ok, reason = False, (f"the kernel stored to {touched}, which "
                                      "it must not touch")
+        # Stores the run must make in order (`expect_stores`), for writes
+        # the emulator drops and never reads back.
+        if ok and case.get("expect_stores"):
+            ok, reason = check_stores(case, traced_stores(trace))
+        # A wait the run must make (`expect_counter_span`), read off the
+        # counter's loads.
+        if ok and case.get("expect_counter_span"):
+            ok, reason = check_counter_span(case, traced_accesses(trace))
         if ok:
             print(f"[{i}/{len(cases)}] {CHECK} {name}  "
                   f"({size} bytes of flash)")
@@ -17058,7 +17358,7 @@ def main():
     parser.add_argument("--clock", metavar="KEY",
                         help="with --emit-flash: the CPU clock key the image "
                              "is built with, in place of the case's own "
-                             "(`rom`, the default, `xtal40` or `pll80`; "
+                             "(`rom`, the default, `xtal40`, `pll80` or `pll160`; "
                              "hal/xtensa-esp32s3/ABI.md §14)")
     args = parser.parse_args()
 

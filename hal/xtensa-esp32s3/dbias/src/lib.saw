@@ -1,0 +1,298 @@
+//! The digital and RTC LDO settings ESP-IDF chooses for the ESP32-S3 from the
+//! eFuse's voltage calibration: the four `g_*_dbias_pvt_*` values of ESP-IDF
+//! v5.4.1's `rtc_init.c` (components/esp_hw_support/port/esp32s3/), computed
+//! as its `rtc_set_stored_dbias`, `get_dig1v3_dbias_by_efuse` and
+//! `get_rtc_dbias_by_efuse` compute them, from the eFuse fields as
+//! `efuse_ll.h` reads them (components/hal/esp32s3/include/hal/). A dbias is
+//! the 5-bit setting of an LDO's voltage, written to EXT_DIG_DREG or
+//! EXT_RTC_DREG on the analog bus (soc/esp32s3/include/soc/regi2c_dig_reg.h);
+//! `rtc.h` maps a few of them to voltages: 23 is 1.10 V, 28 is 1.20 V.
+//!
+//! The `s3dbias` module. It reads no register: the caller reads the four
+//! eFuse words, each a read register the eFuse controller loads at reset, and
+//! hands them in. It is plain Saw with nothing unsafe, so the clock keys and
+//! a read-only probe compile it for the part, and the image builder's tests
+//! compile it for the host, where they hold it to ESP-IDF's arithmetic.
+//!
+//! ESP-IDF mixes `uint32_t` and `int` in the sums below, and a C sum of the
+//! two is unsigned. For every value the eFuse fields can hold, and every
+//! dbias from 0 to 31, each sum and each difference is positive (the least
+//! is the digital voltage at dbias 0 under the steepest slope and the lowest
+//! offset, 10841 - 2540 - 274 * 20 = 2821, less 250), so nothing wraps and
+//! signed arithmetic gives ESP-IDF's values.
+
+/// The eFuse read registers that hold the calibration (soc/esp32s3/register/
+/// soc/efuse_reg.h): EFUSE_RD_MAC_SPI_SYS_3_REG, _4_REG and _5_REG, BLOCK1's
+/// words 3 to 5, and EFUSE_RD_SYS_PART1_DATA4_REG, BLOCK2's word 4.
+public struct EfuseWords {
+    sys3: UInt32,
+    sys4: UInt32,
+    sys5: UInt32,
+    part1_data4: UInt32,
+}
+
+/// The eFuse registers' offsets from DR_REG_EFUSE_BASE, 0x6000_7000
+/// (soc/esp32s3/register/soc/reg_base.h).
+public static EFUSE_BASE: UInt = 0x6000_7000
+public static EFUSE_SYS_3: UInt = 0x50
+public static EFUSE_SYS_4: UInt = 0x54
+public static EFUSE_SYS_5: UInt = 0x58
+public static EFUSE_PART1_DATA4: UInt = 0x6C
+
+// Each field's shift and width mask, `EFUSE_<FIELD>_S` and `_V` in
+// efuse_reg.h. V_RTC_DBIAS20 is split: its low five bits are SYS_4's top five
+// and its high three SYS_5's low three (`efuse_ll_get_v_rtc_dbias20`).
+static BLK_VERSION_MINOR_S: UInt32 = 24     // in SYS_3
+static BLK_VERSION_MINOR_V: UInt32 = 0x7
+static BLK_VERSION_MAJOR_S: UInt32 = 0      // in PART1_DATA4
+static BLK_VERSION_MAJOR_V: UInt32 = 0x3
+static K_RTC_LDO_S: UInt32 = 13             // in SYS_4
+static K_RTC_LDO_V: UInt32 = 0x7F
+static K_DIG_LDO_S: UInt32 = 20             // in SYS_4
+static K_DIG_LDO_V: UInt32 = 0x7F
+static V_RTC_DBIAS20_S: UInt32 = 27         // in SYS_4
+static V_RTC_DBIAS20_V: UInt32 = 0x1F
+static V_RTC_DBIAS20_1_S: UInt32 = 0        // in SYS_5
+static V_RTC_DBIAS20_1_V: UInt32 = 0x7
+static V_RTC_DBIAS20_LOW_BITS: UInt32 = 5
+static V_DIG_DBIAS20_S: UInt32 = 3          // in SYS_5
+static V_DIG_DBIAS20_V: UInt32 = 0xFF
+static DIG_DBIAS_HVT_S: UInt32 = 11         // in SYS_5
+static DIG_DBIAS_HVT_V: UInt32 = 0x1F
+
+/// The calibration's fields, each as the eFuse holds it: the block version,
+/// and for the PVT scheme the slope of each LDO's voltage against its dbias
+/// (K_*_LDO), each LDO's voltage at dbias 20 (V_*_DBIAS20), and the digital
+/// dbias found sufficient for 240 MHz at the high-voltage-threshold corner
+/// (DIG_DBIAS_HVT). The slopes and voltages are sign and magnitude, the sign
+/// in the field's top bit.
+public struct Calibration {
+    blk_version_major: UInt32,
+    blk_version_minor: UInt32,
+    k_rtc_ldo: UInt32,
+    k_dig_ldo: UInt32,
+    v_rtc_dbias20: UInt32,
+    v_dig_dbias20: UInt32,
+    dig_dbias_hvt: UInt32,
+}
+
+extension Calibration {
+    /// The fields out of the four words.
+    public init(words: EfuseWords) -> Calibration {
+        let rtc_low = (words.sys4 >> V_RTC_DBIAS20_S) & V_RTC_DBIAS20_V
+        let rtc_high = (words.sys5 >> V_RTC_DBIAS20_1_S) & V_RTC_DBIAS20_1_V
+        Calibration(
+            blk_version_major: (words.part1_data4 >> BLK_VERSION_MAJOR_S) &
+                               BLK_VERSION_MAJOR_V,
+            blk_version_minor: (words.sys3 >> BLK_VERSION_MINOR_S) &
+                               BLK_VERSION_MINOR_V,
+            k_rtc_ldo: (words.sys4 >> K_RTC_LDO_S) & K_RTC_LDO_V,
+            k_dig_ldo: (words.sys4 >> K_DIG_LDO_S) & K_DIG_LDO_V,
+            v_rtc_dbias20: (rtc_high << V_RTC_DBIAS20_LOW_BITS) + rtc_low,
+            v_dig_dbias20: (words.sys5 >> V_DIG_DBIAS20_S) & V_DIG_DBIAS20_V,
+            dig_dbias_hvt: (words.sys5 >> DIG_DBIAS_HVT_S) & DIG_DBIAS_HVT_V)
+    }
+}
+
+/// Where a `Dbias` came from.
+public enum DbiasSource {
+    /// The block version is below the PVT scheme's, so ESP-IDF keeps its
+    /// defaults ("core voltage not decided in efuse, use default value").
+    case Default,
+    /// The scheme's block version, with DIG_DBIAS_HVT 0: ESP-IDF keeps its
+    /// defaults ("not burn core voltage in efuse").
+    case NotBurnt,
+    /// Computed from the calibration.
+    case Efuse
+}
+
+@synthesize
+extension DbiasSource: Equatable {}
+
+extension DbiasSource {
+    /// The word a console line prints for it.
+    public func name(&self) -> String {
+        match self {
+            case Default -> "default",
+            case NotBurnt -> "unburnt",
+            case Efuse -> "efuse"
+        }
+    }
+}
+
+/// ESP-IDF's four LDO settings: `g_dig_dbias_pvt_240m`,
+/// `g_rtc_dbias_pvt_240m`, `g_dig_dbias_pvt_non_240m` and
+/// `g_rtc_dbias_pvt_non_240m`. `rtc_init` writes the two `non_240m` values;
+/// `rtc_clk_cpu_freq_to_pll_mhz` (rtc_clk.c) writes the `240m` pair going up
+/// to 240 MHz and the `non_240m` pair coming down from it.
+public struct Dbias {
+    dig_240m: UInt32,
+    rtc_240m: UInt32,
+    dig_non_240m: UInt32,
+    rtc_non_240m: UInt32,
+    source: DbiasSource,
+}
+
+@synthesize
+extension Dbias: Equatable {}
+
+/// ESP-IDF's defaults, the four variables' initial values in rtc_init.c.
+public static DEFAULT_DIG_240M: UInt32 = 28
+public static DEFAULT_RTC_240M: UInt32 = 28
+public static DEFAULT_DIG_NON_240M: UInt32 = 27
+public static DEFAULT_RTC_NON_240M: UInt32 = 27
+
+// rtc.h (components/esp_hw_support/port/esp32s3/include/soc/): the mid
+// slope and the mid voltage at dbias 20 of each LDO, in units of 0.1 mV,
+// which the calibration's fields correct.
+static K_RTC_MID_MUL10000: Int32 = 198
+static K_DIG_MID_MUL10000: Int32 = 211
+static V_RTC_MID_MUL10000: Int32 = 10181
+static V_DIG_MID_MUL10000: Int32 = 10841
+
+/// The searches' range: each tries the dbias values from 15 up to 30 and
+/// answers 31 when none meets its bound.
+static SEARCH_FIRST: Int32 = 15
+static SEARCH_END: Int32 = 31
+
+/// `get_dig1v3_dbias_by_efuse`'s bound: 1.3 V, in units of 0.1 mV.
+static DIG_1V3_MUL10000: Int32 = 13000
+
+/// How far below the digital LDO the RTC LDO may sit, in units of 0.1 mV
+/// (`get_rtc_dbias_by_efuse`).
+static RTC_BELOW_DIG_MUL10000: Int32 = 250
+
+/// The least and the greatest value each of ESP-IDF's four can take. A
+/// default is 27 or 28. From the eFuse, a digital value is the smaller of the
+/// 1.3 V search's answer (15 to 31) and DIG_DBIAS_HVT plus 2 or 3, where the
+/// field is 1 to 31 (0 keeps the defaults), so 3 to 31 below 240 MHz and 4 to
+/// 31 at it; an RTC value is its search's answer, 15 to 31.
+public static DIG_NON_240M_LEAST: UInt32 = 3
+public static DIG_240M_LEAST: UInt32 = 4
+public static RTC_LEAST: UInt32 = 15
+public static DBIAS_GREATEST: UInt32 = 31
+static_assert(DIG_NON_240M_LEAST == 1 + 2, "the least HVT plus 2")
+static_assert(DIG_240M_LEAST == 1 + 3, "the least HVT plus 3")
+static_assert(RTC_LEAST == (SEARCH_FIRST as UInt32), "the search's first value")
+static_assert(DBIAS_GREATEST == (SEARCH_END as UInt32),
+              "the search's value past its end")
+static_assert(DBIAS_GREATEST == DIG_DBIAS_HVT_V, "a 5-bit field's greatest")
+
+/// A slope or voltage field read as ESP-IDF reads it: the bit `sign` set
+/// negates the bits below it.
+func sign_magnitude(field: UInt32, sign: UInt32) -> Int32 {
+    let magnitude = (field & (sign - 1)) as Int32
+    if (field & sign) != 0 { -magnitude } else { magnitude }
+}
+
+/// A K_*_LDO field's sign bit, of its seven.
+static K_SIGN: UInt32 = 1 << 6
+/// A V_*_DBIAS20 field's sign bit, of its eight.
+static V_SIGN: UInt32 = 1 << 7
+
+/// The digital LDO's slope against its dbias, in units of 0.1 mV a step.
+func dig_slope(cal: Calibration) -> Int32 {
+    K_DIG_MID_MUL10000 + sign_magnitude(cal.k_dig_ldo, K_SIGN)
+}
+
+/// The digital LDO's voltage at dbias 20, in units of 0.1 mV. ESP-IDF scales
+/// the field by 10000 / 500, so a step is 2 mV.
+func dig_at_20(cal: Calibration) -> Int32 {
+    V_DIG_MID_MUL10000 + sign_magnitude(cal.v_dig_dbias20, V_SIGN) * 10000 / 500
+}
+
+/// Whether the block version carries the PVT scheme, ESP-IDF's test in
+/// `rtc_set_stored_dbias`, word for word.
+public func pvt_scheme(cal: Calibration) -> Bool {
+    let major = cal.blk_version_major
+    let minor = cal.blk_version_minor
+    (major <= 1 && minor == 1) || major > 1 || (major == 1 && minor >= 2)
+}
+
+/// `get_dig1v3_dbias_by_efuse`: the least dbias from 15 whose digital
+/// voltage reaches 1.3 V, or 31.
+public func dig1v3_dbias(cal: Calibration) -> UInt32 {
+    let slope = dig_slope(cal)
+    let at_20 = dig_at_20(cal)
+    var dbias = SEARCH_FIRST
+    while dbias < SEARCH_END {
+        if at_20 + slope * (dbias - 20) >= DIG_1V3_MUL10000 {
+            break
+        }
+        dbias += 1
+    }
+    dbias as UInt32
+}
+
+/// `get_rtc_dbias_by_efuse`: the least RTC dbias from 15 whose voltage is
+/// within 25 mV below the digital LDO's at `dig_dbias`, or 31.
+public func rtc_dbias(cal: Calibration, dig_dbias: UInt32) -> UInt32 {
+    let rtc_slope = K_RTC_MID_MUL10000 + sign_magnitude(cal.k_rtc_ldo, K_SIGN)
+    let rtc_at_20 = (V_RTC_MID_MUL10000 +
+                     sign_magnitude(cal.v_rtc_dbias20, V_SIGN) * 10000 / 500)
+    let dig = dig_at_20(cal) + dig_slope(cal) * ((dig_dbias as Int32) - 20)
+    var dbias = SEARCH_FIRST
+    while dbias < SEARCH_END {
+        let rtc = rtc_at_20 + rtc_slope * (dbias - 20)
+        if rtc >= dig - RTC_BELOW_DIG_MUL10000 {
+            break
+        }
+        dbias += 1
+    }
+    dbias as UInt32
+}
+
+func least(a: UInt32, b: UInt32) -> UInt32 {
+    if a < b { a } else { b }
+}
+
+/// `rtc_set_stored_dbias`: ESP-IDF's four values for this calibration.
+public func stored_dbias(cal: Calibration) -> Dbias {
+    if not pvt_scheme(cal) || cal.dig_dbias_hvt == 0 {
+        return Dbias(dig_240m: DEFAULT_DIG_240M, rtc_240m: DEFAULT_RTC_240M,
+                     dig_non_240m: DEFAULT_DIG_NON_240M,
+                     rtc_non_240m: DEFAULT_RTC_NON_240M,
+                     source: if pvt_scheme(cal) { DbiasSource.NotBurnt }
+                             else { DbiasSource.Default })
+    }
+    let dig1v3 = dig1v3_dbias(cal)
+    let dig_240m = least(dig1v3, cal.dig_dbias_hvt + 3)
+    let dig_non_240m = least(dig1v3, cal.dig_dbias_hvt + 2)
+    Dbias(dig_240m: dig_240m, rtc_240m: rtc_dbias(cal, dig_240m),
+          dig_non_240m: dig_non_240m,
+          rtc_non_240m: rtc_dbias(cal, dig_non_240m),
+          source: DbiasSource.Efuse)
+}
+
+/// Which of the four is outside the range ESP-IDF's arithmetic gives it.
+public enum DbiasError {
+    case Dig240m,
+    case Rtc240m,
+    case DigNon240m,
+    case RtcNon240m
+}
+
+@synthesize
+extension DbiasError: Equatable {}
+
+func within(v: UInt32, least: UInt32) -> Bool {
+    v >= least && v <= DBIAS_GREATEST
+}
+
+/// Hold each of the four to the range ESP-IDF's own arithmetic gives it
+/// (`DIG_NON_240M_LEAST` and the rest). A value outside it comes from no
+/// calibration and no default, so it is written nowhere.
+public func check_dbias(d: Dbias) -> Result<Void, DbiasError> {
+    if not within(d.dig_240m, DIG_240M_LEAST) {
+        return DbiasError.Dig240m
+    }
+    if not within(d.rtc_240m, RTC_LEAST) {
+        return DbiasError.Rtc240m
+    }
+    if not within(d.dig_non_240m, DIG_NON_240M_LEAST) {
+        return DbiasError.DigNon240m
+    }
+    if not within(d.rtc_non_240m, RTC_LEAST) {
+        return DbiasError.RtcNon240m
+    }
+}

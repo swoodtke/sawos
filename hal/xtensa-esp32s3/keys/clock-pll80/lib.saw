@@ -32,9 +32,10 @@
 //!     divide by 4 gives the flash 20 MHz, ESP-IDF's own low-speed setting;
 //!     ABI.md §14d says why it is not raised.
 //!
-//! No voltage is changed: ESP-IDF raises the digital LDO only for 240 MHz,
-//! and lowers the number of LDO slaves for 80 MHz, which this leaves as the
-//! ROM does, all six on.
+//! No voltage is changed: ESP-IDF's bootloader reaches 80 MHz without an LDO
+//! write (an application's `rtc_init` sets the LDOs from the eFuse, as
+//! `pll160` does before 160 MHz), and lowers the number of LDO slaves for 80
+//! MHz, which this leaves as the ROM does, all six on.
 //!
 //! Every word written is volatile: a power cycle puts it back, and an EN-pin
 //! reset (esptool's, or the board's button) has been seen to put the clock
@@ -45,141 +46,21 @@
 //! When the BBPLL does not report its calibration done, the CPU is left on
 //! the crystal as the ROM left it, a line says so, and the boot goes on.
 //!
-//! It reaches every register through its own views and `s3clockkit`'s
-//! (`../clock-common/`) rather than the HAL's drivers: the HAL names nothing
-//! here, so an image built at the `rom` key is the bytes it would be without
-//! the keys.
+//! The bring-up and the switch are `s3clockkit`'s (`../clock-common/`),
+//! which `pll160` shares. It reaches every register through the kit's views
+//! rather than the HAL's drivers: the HAL names nothing here, so an image
+//! built at the `rom` key is the bytes it would be without the keys.
 
-import s3clockkit.{SYSCLK_CONF, SOC_CLK_SEL_SHIFT, SOC_CLK_SEL_MASK,
-                   SOC_CLK_SEL_XTAL, SOC_CLK_SEL_PLL, PRE_DIV_CNT_MASK,
-                   CPU_PER_CONF, CPUPERIOD_SEL_MASK, UART0_CLK_CONF,
-                   SPI0_CORE_CLK_SEL, SPI0_CLOCK, RTC_CNTL_DATE, device_word,
-                   systimer_start, console_on_crystal, console_drain,
-                   cpu_centi_mhz, write_byte, write_str, write_hex,
-                   write_centi}
+import s3clockkit.{pll_bring_up, pll_switch, write_byte}
 
-extern "C" {
-    func sos_clock_store(addr: UInt, value: UInt)
-    func sos_pll_bringup() -> UInt
-    func sos_windowed_call(fn_addr: UInt, a: UInt, b: UInt, c: UInt, d: UInt,
-                           e: UInt, f: UInt) -> UInt
-}
-
-/// `sos_pll_bringup`'s answer when the BBPLL reported its calibration done.
-static PLL_CAL_DONE: UInt = 0
-
-/// RTC_CNTL_OPTIONS0, whose BB_I2C_FORCE_PD [6], BBPLL_I2C_FORCE_PD [8] and
-/// BBPLL_FORCE_PD [10] the bring-up clears. Read for the line.
-static RTC_CNTL_OPTIONS0: UInt = 0x6000_8000
-
-/// I2C_MST_ANA_CONF0: the analog master's BBPLL calibration controls
-/// (STOP_FORCE_HIGH [2], STOP_FORCE_LOW [3]) and CAL_DONE [24]. Read for the
-/// line.
-static I2C_MST_ANA_CONF0: UInt = 0x6000_E040
-
-/// The mask ROM's `rom_i2c_readReg(block, host, reg)` (esp32s3.rom.ld), and
-/// the BBPLL's register 8 on the analog bus: OR_CAL_CAP [3:0], OR_CAL_UDF
-/// [4], OR_CAL_OVF [5], OR_CAL_END [6] and OR_LOCK [7]
-/// (soc/esp32s3/include/soc/regi2c_bbpll.h). Read for the line once the
-/// bring-up has run.
-static ROM_I2C_READ: UInt = 0x4000_5D48
-static I2C_BBPLL: UInt = 0x66
-static I2C_BBPLL_HOSTID: UInt = 1
-static I2C_BBPLL_OR_CAL: UInt = 8
+/// CPUPERIOD_SEL for 80 MHz: the PLL at 480 MHz divided by 6.
+static CPUPERIOD_80M: UInt32 = 0
 
 /// Set the CPU clock this image is built for: the PLL at 80 MHz. From
 /// RC_FAST, or a select no source names, it prints why and stops in a quiet
 /// loop before any clock word is written (SYSTIMER is already counting).
 public func clock_init() unsafe {
-    let sysclk = device_word(SYSCLK_CONF)
-    let cpu_per = device_word(CPU_PER_CONF)
-    let options0 = device_word(RTC_CNTL_OPTIONS0)
-    let sysclk_before = sysclk.read()
-    let cpu_per_before = cpu_per.read()
-    let options0_before = options0.read()
-    let uart_clk = device_word(UART0_CLK_CONF).read()
-    systimer_start()
-    let centi_before = cpu_centi_mhz()
-
-    let source = (sysclk_before >> SOC_CLK_SEL_SHIFT) & SOC_CLK_SEL_MASK
-    if source != SOC_CLK_SEL_XTAL && source != SOC_CLK_SEL_PLL {
-        write_str("SOS-S3: clock pll80 refused: sysclk=0x")
-        write_hex(sysclk_before)
-        write_str(": the switch is taken from the crystal or the PLL\n")
-        while { }
-    }
-
-    console_drain()
-    console_on_crystal(uart_clk)
-    let brought_up = source == SOC_CLK_SEL_XTAL
-    var bbpll: UInt = 0
-    if brought_up {
-        if sos_pll_bringup() != PLL_CAL_DONE {
-            write_str("SOS-S3: clock pll80 not taken: the BBPLL did not ")
-            write_str("report its calibration done; the CPU stays on the ")
-            write_str("crystal sysclk=0x")
-            write_hex(sysclk.read())
-            write_str(" options0=0x")
-            write_hex(options0_before)
-            write_str("->0x")
-            write_hex(options0.read())
-            write_str(" ana_conf0=0x")
-            write_hex(device_word(I2C_MST_ANA_CONF0).read())
-            write_str(" mhz=")
-            write_centi(centi_before)
-            write_byte(10)
-            return
-        }
-        bbpll = sos_windowed_call(ROM_I2C_READ, I2C_BBPLL, I2C_BBPLL_HOSTID,
-                                  I2C_BBPLL_OR_CAL, 0, 0, 0)
-    }
-
-    // `rtc_clk_cpu_freq_to_pll_mhz(80)` (esp_hw_support/port/esp32s3/
-    // rtc_clk.c): CPUPERIOD_SEL 0, PRE_DIV_CNT 0, SOC_CLK_SEL 1, in that
-    // order, each a store of its own. CPU_PER_CONF is read again because the
-    // bring-up set its PLL_FREQ_SEL.
-    let period = cpu_per.read() & ~CPUPERIOD_SEL_MASK
-    sos_clock_store(CPU_PER_CONF, period as UInt)
-    let divided = sysclk_before & ~PRE_DIV_CNT_MASK
-    sos_clock_store(SYSCLK_CONF, divided as UInt)
-    let on_pll = ((divided & ~(SOC_CLK_SEL_MASK << SOC_CLK_SEL_SHIFT))
-                  | (SOC_CLK_SEL_PLL << SOC_CLK_SEL_SHIFT))
-    sos_clock_store(SYSCLK_CONF, on_pll as UInt)
-    let sysclk_after = sysclk.read()
-    let cpu_per_after = cpu_per.read()
-    let centi_after = cpu_centi_mhz()
-
-    write_str("SOS-S3: clock pll80 sysclk=0x")
-    write_hex(sysclk_before)
-    write_str("->0x")
-    write_hex(sysclk_after)
-    write_str(" cpu_per=0x")
-    write_hex(cpu_per_before)
-    write_str("->0x")
-    write_hex(cpu_per_after)
-    write_str(" options0=0x")
-    write_hex(options0_before)
-    write_str("->0x")
-    write_hex(options0.read())
-    if brought_up {
-        write_str(" bbpll=0x")
-        write_hex(bbpll as UInt32)
-    } else {
-        write_str(" bbpll=kept")
-    }
-    write_str(" ana_conf0=0x")
-    write_hex(device_word(I2C_MST_ANA_CONF0).read())
-    write_str(" mhz=")
-    write_centi(centi_before)
-    write_str("->")
-    write_centi(centi_after)
-    write_str(" uart_clk=0x")
-    write_hex(uart_clk)
-    write_str(" mspi_core=0x")
-    write_hex(device_word(SPI0_CORE_CLK_SEL).read())
-    write_str(" mspi_clock=0x")
-    write_hex(device_word(SPI0_CLOCK).read())
-    write_str(" rtc_date=0x")
-    write_hex(device_word(RTC_CNTL_DATE).read())
+    let start = try pll_bring_up("pll80") catch { return }
+    pll_switch("pll80", start, CPUPERIOD_80M)
     write_byte(10)
 }

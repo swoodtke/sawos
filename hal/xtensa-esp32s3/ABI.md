@@ -1076,21 +1076,21 @@ frame), and the caller's stack pointer is read from the caller's own base
 save area: overflow spills the oldest frame first, so the caller is always
 spilled before its callee.
 
-**The handlers.** The six window vectors (§5a) are those sequences: 4, 9 or
-13 word accesses through the thread's own registers and one `rfwo` or
-`rfwu`, with PS.EXCM = 1 (so no interrupt is taken inside one) and no kernel
-entry. Four are the mask ROM's instruction for instruction (0x4000_0000 on);
+**The handlers.** The six window vectors (§5a) are those sequences: 4, 9 or 13
+word accesses through the thread's own registers and one `rfwo` or `rfwu`,
+with PS.EXCM = 1 (so no interrupt is taken inside one) and no kernel entry.
+Four are the mask ROM's instruction for instruction (0x4000_0000 on);
 Underflow8 and Underflow12 differ in order: the ROM's load `a0` first, these
 load `a1` first, before the load that goes through it. A fill from below an
 address that answers no load therefore faults on the `a1` word, the stack
-pointer less 12, and `windowed_fill_fault8` and `12` expect that address
-(tval 0x1000_0004, where the ROM's order gives 0x1000_0000). The Alloca exception is
-handled from the user vector, also without entering the kernel: the
-faulting window's WINDOWBASE and `a0` are kept, the window is rotated one
-pane back into the spilled caller's dead registers, PS.OWB is set to the
-faulting window, the window is rotated to the caller's base by the call size
-in the faulting window's `a0` (0 read as call4), and the underflow handler
-for that size fills the caller and returns to the `movsp`.
+pointer less 12, and `windowed_fill_fault8` and `12` expect that address (tval
+0x1000_0004, where the ROM's order gives 0x1000_0000). The Alloca exception is
+handled from the user vector, also without entering the kernel: the faulting
+window's WINDOWBASE and `a0` are kept, the window is rotated one pane back
+into the spilled caller's dead registers, PS.OWB is set to the faulting
+window, the window is rotated to the caller's base by the call size in the
+faulting window's `a0` (0 read as call4), and the underflow handler for that
+size fills the caller and returns to the `movsp`.
 
 **The start state.** Every thread starts in one state both conventions run
 from (`lib.saw`'s `frame_init`), and no image declares its convention:
@@ -2117,10 +2117,19 @@ the crystal, and the PLL path (`rtc_clk_bbpll_enable`,
 240 MHz, which `rtc_clk_cpu_freq_mhz_to_config` maps to the PLL at 480 MHz
 divided by 6, 3 and 2. The bootloader calls `rtc_clk_init` only when the
 reset was not a CPU software reset or APB reads below 80 MHz (the condition
-around the call in bootloader_clock_init.c). Every step, in order, and what
-each key takes of it: the B and R rows belong to both keys that write, the X
-rows are the crystal path, `xtal40`'s, and the S, P and Q rows the PLL path,
-`pll80`'s.
+around the call in bootloader_clock_init.c). An application's `rtc_init`
+sets the two LDOs from the eFuse at startup (`esp_rtc_init`, esp_system/port/
+soc/esp32s3/clk.c), before `esp_clk_init` moves the CPU past the
+bootloader's 80 MHz. Every step, in order, and what each key takes of it: the
+B and R rows belong to every key that writes, the X rows are the crystal
+path, `xtal40`'s, the S, P and Q rows the PLL path, `pll80`'s and
+`pll160`'s, and the L rows `pll160`'s alone. The L rows are `rtc_init`'s
+steps on the LDO block (I2C_DIG_REG) and the settings it computes for it,
+not the whole function: the rest of it sets RTC_CNTL's own power and timer
+words (RTC_CNTL_PVTMON_PU and the wake-up timers first; under
+`pwrctl_init`, RTC_CNTL_REGULATOR_FORCE_PU, RTC_CNTL_DBOOST_FORCE_PU,
+RTC_CNTL_FORCE_PU and RTC_CNTL_I2C_RESET_POR_FORCE_PD, among more), which
+the CPU-frequency path does not make and no key takes.
 
 ```
 step                     register, field = value              taken
@@ -2184,6 +2193,25 @@ X7 RTC_CNTL_DATE_REG.SLAVE_PD [18:13] = DEFAULT_LDO_SLAVE     no: see below
    it (s_bbpll_digi_consumers_ref_count), calls
    rtc_clk_bbpll_disable: RTC_CNTL_OPTIONS0
    BB_I2C_FORCE_PD, BBPLL_FORCE_PD, BBPLL_I2C_FORCE_PD set
+-- rtc_init (rtc_init.c), in an application ------------------------------------
+L1 I2C_DIG_REG (block 0x6D, host 1; soc/esp32s3/include/soc/   no: below
+   regi2c_dig_reg.h) reg 13: XPD_RTC_REG [2] = 0,
+   XPD_DIG_REG [3] = 0
+L2 reg 5 EXT_RTC_DREG_SLEEP [4:0] = RTC_CNTL_DBIAS_1V10, 23    no: below
+   (esp_hw_support/port/esp32s3/include/soc/rtc.h), then
+   reg 4 EXT_RTC_DREG [4:0] = 23: "Reset RTC bias to default
+   value (needed if waking up from deep sleep)"
+L3 on a power-on reset only (`cali_ocode`, set by             no: below
+   esp_rtc_init): the bandgap's OCode, from the eFuse
+   (set_ocode_by_efuse) or measured (calibrate_ocode)
+L4 rtc_set_stored_dbias: the four g_*_dbias_pvt_* values      yes: computed
+   from the eFuse's calibration, or the defaults 28, 28,       the same way
+   27, 27 (below)                                              (`s3dbias`)
+L5 reg 4 EXT_RTC_DREG [4:0] = g_rtc_dbias_pvt_non_240m        pll160: yes,
+                                                              after P7
+L6 reg 6 EXT_DIG_DREG [4:0] = g_dig_dbias_pvt_non_240m        pll160: yes;
+                                                              then 40 us
+                                                              (Q1's wait)
 -- rtc_clk_cpu_freq_set_config, the PLL path (rtc_clk.c) ----------------------
 S1 P1 to P7 only when the old source, clk_ll_cpu_get_src,     yes: the same
    is not the PLL; then the Q rows                            test, on the
@@ -2224,9 +2252,10 @@ Q1 240 only, going up: I2C_DIG_REG (block 0x6D) reg 4         no: 240 only
    the values come from eFuse calibration (rtc_init.c,
    rtc_set_stored_dbias; 28 by default)
 Q2 going up: RTC_CNTL_DATE_REG.SLAVE_PD = 0x7 >> (f / 80),    no: see below
-   3 at 80
-Q3 CPU_PER_CONF.CPUPERIOD_SEL = 0, 1, 2 for 80, 160, 240      yes: 0, a store
-   (clk_ll_cpu_set_freq_mhz_from_pll)                         from IRAM
+   3 at 80, 1 at 160
+Q3 CPU_PER_CONF.CPUPERIOD_SEL = 0, 1, 2 for 80, 160, 240      yes: 0 at pll80,
+   (clk_ll_cpu_set_freq_mhz_from_pll)                         1 at pll160, a
+                                                              store from IRAM
 Q4 SYSCLK_CONF.PRE_DIV_CNT = 0 (clk_ll_cpu_set_divider(1))    yes, a store
                                                               from IRAM
 Q5 SYSCLK_CONF.SOC_CLK_SEL = 1 (clk_ll_cpu_set_src)           yes, a store
@@ -2280,6 +2309,51 @@ in flash. Once P7 is made the PLL is calibrated, and the key continues from
 flash; Q3 to Q5, which move the CPU's clock, are each a store by
 `sos_clock_store` from IRAM.
 
+**The LDO settings (L4 to L6).** `rtc_set_stored_dbias` reads the block
+version (BLK_VERSION_MAJOR, EFUSE_RD_SYS_PART1_DATA4 [1:0]; BLK_VERSION_MINOR,
+EFUSE_RD_MAC_SPI_SYS_3 [26:24]) and, at versions 0.1, 1.1 and every one from
+1.2 on (its test, word for word: `(major <= 1 && minor == 1) || major > 1 ||
+(major == 1 && minor >= 2)`),
+the calibration: K_RTC_LDO and K_DIG_LDO, each LDO's slope against its dbias
+(SYS_4 [19:13] and [26:20]); V_RTC_DBIAS20 and V_DIG_DBIAS20, each LDO's
+voltage at dbias 20 (SYS_4 [31:27] with SYS_5 [2:0] above it, and SYS_5
+[10:3]); and DIG_DBIAS_HVT, the digital dbias found sufficient for 240 MHz
+(SYS_5 [15:11]) (soc/esp32s3/register/soc/efuse_reg.h,
+hal/esp32s3/include/hal/efuse_ll.h). With an HVT of 0, or any other version,
+the values stay the defaults: 28 for both LDOs at 240 MHz and 27 below
+it. Otherwise the digital value below 240 MHz is the smaller of HVT + 2 and
+the least dbias from 15 whose digital voltage reaches 1.3 V (31 when none
+does), and the RTC value the least dbias from 15 whose RTC voltage is within
+25 mV below the digital one (31 when none is): `get_dig1v3_dbias_by_efuse`
+and `get_rtc_dbias_by_efuse`, with the mid slopes and voltages of rtc.h
+(`K_RTC_MID_MUL10000` 198, `K_DIG_MID_MUL10000` 211, `V_RTC_MID_MUL10000`
+10181, `V_DIG_MID_MUL10000` 10841). `hal/xtensa-esp32s3/dbias/` (`s3dbias`)
+computes the same; the image builder's tests hold it to that arithmetic,
+case by case (`tools/sosimage/tests/s3_dbias.saw`).
+
+`pll160` holds each value to the range ESP-IDF's own arithmetic gives it
+before it writes anything: the digital one below 240 MHz 3 to 31 (HVT 1 to 31,
+plus 2, and never past the search's 31), the RTC one 15 to 31 (the searches'
+first value and their answer when nothing is found). A value outside it comes
+from no calibration and no default; the key prints its `not taken` line (§14d)
+and writes nothing. Inside it, the key writes what ESP-IDF would write on the
+part, and nothing else checks the voltage: a part's settings are read on it
+first (§15d).
+
+The two writes are made after P7, where an application makes them after its
+bootloader has brought the PLL up, and in `rtc_init`'s order, RTC first. Each
+is a `rom_i2c_writeReg_Mask` of bits [4:0], so each reads its register first,
+which stores ANA_CONFIG = 0xFFFF_BFFF: every block's bus held off but bit 14,
+the one the ROM's read mask (`rom_get_i2c_read_mask`) names for this block;
+the emulator runs the ROM's code and its trace shows the word. That word stays
+after the switch, where `pll80`'s bring-up leaves 0xFFFD_FFFF; the BBPLL,
+calibrated by then, is not reached again. The key then waits 40 us of SYSTIMER
+before it moves the CPU's clock: `rtc_clk_cpu_freq_to_pll_mhz` waits that long
+after it moves an LDO (Q1), and in an application `rtc_init` runs long before
+the switch. The writes are made from flash, through `sos_windowed_call` in
+IRAM, with the CPU on the clock it had; they move the digital core's voltage
+and no clock.
+
 **P5 is bounded.** ESP-IDF waits for CAL_DONE without a bound. The bring-up
 waits at most 4,000,000 CCOUNT cycles, which with the CPU on the crystal at
 40 MHz or less is at least 100 ms; no source states how long the
@@ -2292,16 +2366,25 @@ own stores to ANA_CONFIG, ANA_CONFIG2 and the analog master.
 **What is left out, and why that is safe:**
 
 - X7's and Q2's SLAVE_PD. RTC_CNTL_DATE_REG's field resets to 0, all six LDO
-  slaves on (rtc_cntl_reg.h, "LDO SLAVE ... default: 6'd0", and the
-  register's default 0x2101271 has 0 in [18:13]); the ROM names the register
-  nowhere, so it runs the chip with all six on, and the part reads 0x02101271
-  (§14h). ESP-IDF writes 0x7 on the crystal to power three down and 0x3 at
-  80 MHz to power two down ("CPU frequency <= 40M : just open 3 LDO slaves;
-  CPU frequency = 80M : open 4 LDO slaves", `rtc_clk_cpu_freq_to_pll_mhz`).
+  slaves on (rtc_cntl_reg.h, "LDO SLAVE ... default: 6'd0", and the register's
+  default 0x2101271 has 0 in [18:13]); the ROM names the register nowhere, so
+  it runs the chip with all six on, and the part reads 0x02101271 (§14h).
+  ESP-IDF writes 0x7 on the crystal to power three down, 0x3 at 80 MHz to
+  power two down and 0x1 at 160 to power one down ("CPU frequency <= 40M :
+  just open 3 LDO slaves; CPU frequency = 80M : open 4 LDO slaves; CPU
+  frequency = 160M : open 5 LDO slaves", `rtc_clk_cpu_freq_to_pll_mhz`).
   Slaves damp the LDO's voltage change at a switch, and ESP-IDF opens more of
-  them the faster the CPU runs, so all six at 80 MHz is the side that cannot
-  droop. It is also an RTC register, which this kernel writes only for the
-  watchdogs (§2e) and P1. Each line prints the word.
+  them the faster the CPU runs, so all six at 80 or 160 MHz is the side that
+  cannot droop. It is also an RTC register, which this kernel writes only for
+  the watchdogs (§2e) and P1. Each line prints the word.
+- L1, L2 and L3, `rtc_init`'s setup of the LDO block at every start, which
+  the CPU-frequency path (`rtc_clk_cpu_freq_set_config`) does not make:
+  L1's two XPD bits, which `rtc_init` clears whatever the speed; L2's sleep
+  setting, which applies only in deep sleep ("needed if waking up from deep
+  sleep"), and its 1.10 V for EXT_RTC_DREG, which L5 replaces in the same
+  function; and L3's OCode, the bandgap's offset, calibrated on a power-on
+  reset only. None of them is a step of the ramp, and leaving them leaves the
+  block as the key finds it.
 - R5's RTC_XTAL_FREQ_REG is a store word that survives every reset but a
   power cycle, read back by ESP-IDF and ROM functions this kernel never
   calls; and X1, X5, Q6, R7 keep software values in step.
@@ -2314,37 +2397,44 @@ own stores to ANA_CONFIG, ANA_CONFIG2 and the analog master.
   (`ANA_CONFIG_S` 8, `ANA_CONFIG_M` 0x3FF, regi2c_defs.h); the ROM's read
   stores above hold off every other bit's too, the SAR ADC's (bit 18,
   `I2C_SAR_M`) among them. The kernel uses none of those blocks.
-- Q7. The key is written for a CPU the ROM left on the crystal. On the kept
-  path, a CPU already on the PLL, it stores CPUPERIOD_SEL 0 whatever it read,
-  so a CPU found at 160 or 240 MHz would go down to 80 without Q7's voltage
-  steps. The ROM leaves the crystal, so nothing reaches that.
+- Q7. The keys are written for a CPU the ROM left on the crystal. On the
+  kept path, a CPU already on the PLL, each stores its own CPUPERIOD_SEL
+  whatever it read. A CPU found at 240 MHz would go down to 80 under
+  `pll80` without Q7's voltage steps; under `pll160` it would get the two
+  `non_240m` writes, but before the clock goes down, where Q7 makes them
+  after it (`rtc_clk_cpu_freq_to_pll_mhz`, rtc_clk.c). The ROM leaves the
+  crystal, so nothing reaches either.
 
-### 14c. What is not built: 160 and 240 MHz
+### 14c. 160 MHz, and what is not built: 240
 
-`pll80` is the PLL's first speed. 160 and 240 MHz are the same sequence with
-CPUPERIOD_SEL 1 or 2 at Q3, and more:
+`pll80` is the PLL's first speed and `pll160` its second: the same sequence
+with CPUPERIOD_SEL 1 at Q3, after `rtc_init`'s two LDO writes (L4 to L6),
+which an application makes before it reaches 160 MHz and ESP-IDF v5.4.1's
+bootloader never makes for its 80 MHz. (Earlier versions did: at v5.1
+`rtc_clk_cpu_freq_to_pll_mhz` wrote both LDOs, RTC first, and waited 40 us
+before every switch below 240 MHz, the bootloader's to 80 included.) 240
+MHz is not built. It is the same again with
+CPUPERIOD_SEL 2, and more:
 
-- **The voltage.** 240 MHz raises the digital LDO through I2C_DIG_REG
-  (block 0x6D) to values ESP-IDF reads from eFuse calibration (Q1), and puts
-  them back when leaving it. 160 MHz is reached in an application only after
-  `rtc_init` has set the LDO to `g_dig_dbias_pvt_non_240m` (rtc_init.c),
-  which the bootloader's 80 MHz never does; the ROM's own setting is unread.
-  Both want the owner's word: the eFuse reads are reads only, but the LDO
-  write is a voltage change.
+- **The voltage.** 240 MHz raises both LDOs through I2C_DIG_REG to
+  `g_rtc_dbias_pvt_240m` and `g_dig_dbias_pvt_240m` and waits 40 us (Q1),
+  and puts the `non_240m` values back when leaving it (X6, Q7). `s3dbias`
+  computes both pairs; only `pll160`'s is written.
 - **The slaves.** Q2 opens five slaves at 160 and six at 240; all six are on
-  as the ROM leaves them, so nothing changes here.
-- **The flash** does not move: the memory-SPI core clock follows
-  CORE_CLK_SEL and the PLL, not CPUPERIOD_SEL (`spi_mem_reg.h`), so it stays
-  80 MHz and the flash 20 MHz at every PLL speed.
+  as the ROM leaves them, so nothing changes at either.
+
+At every PLL speed **the flash** does not move: the memory-SPI core clock
+follows CORE_CLK_SEL and the PLL, not CPUPERIOD_SEL (`spi_mem_reg.h`), so it
+stays 80 MHz and the flash 20 MHz.
 
 ### 14d. What each key sets
 
-The key is chosen per image at build time (`s3clock`, `keys/clock-*/`);
-`rom` is the default everywhere. The case key `"clock"` sets it, and
-`--emit-flash CASE --clock KEY` overrides it for a board image. The keys
-that write share `s3clockkit` (`keys/clock-common/`): the console's drain,
-the measurement and the line's writer. Each starts SYSTIMER and takes one
-snapshot it throws away before it measures (§14h).
+The key is chosen per image at build time (`s3clock`, `keys/clock-*/`); `rom`
+is the default everywhere. The case key `"clock"` sets it, and `--emit-flash
+CASE --clock KEY` overrides it for a board image. The keys that write share
+`s3clockkit` (`keys/clock-common/`): the console's drain, the measurement, the
+line's writer, and the PLL keys' bring-up and switch. Each starts SYSTIMER and
+takes one snapshot it throws away before it measures (§14h).
 
 ```
 key     registers written, in order                    from
@@ -2386,6 +2476,20 @@ pll80   SYSTIMER and UART0 as xtal40                   as xtal40
         RC_FAST or 3 stops before the bring-up and any clock word, as
           xtal40 does (SYSTIMER's rows and the first measurement have
           been made)
+pll160  nothing, if the LDO settings computed from     L4, held to ESP-IDF's
+        the eFuse are outside ESP-IDF's range; it      range first
+        reads the four eFuse words first
+        SYSTIMER, UART0 and the bring-up as pll80      as pll80
+        on a timeout nothing below is written
+        BBPLL register 8 read through the ROM          for the line
+        I2C_DIG_REG regs 4 and 6 read through the ROM  for the line
+        I2C_DIG_REG reg 4 [4:0] = the RTC setting,     L5, through
+          then reg 6 [4:0] = the digital one           rom_i2c_writeReg_Mask
+        SYSTIMER read for 40 us                        Q1's wait
+        I2C_DIG_REG regs 4 and 6 read again            for the line
+        CPU_PER_CONF = read & ~0x3 | 0x1               Q3, from IRAM
+          (CPUPERIOD_SEL 1)
+        SYSCLK_CONF as pll80                           Q4, Q5, from IRAM
 ```
 
 Each of the ROM's analog-bus calls also makes the ROM's own writes (§14b):
@@ -2414,6 +2518,7 @@ rom              20         = CPU      crystal, 115,212 bd  H1 10, H2 20,
 xtal40           40         40         crystal, 115,212 bd  H1 10, H2 20,
                                                             H3 10 MHz
 pll80            80         80         crystal, 115,212 bd  20 MHz
+pll160          160         80         crystal, 115,212 bd  20 MHz
 ```
 
 The console stays at the ROM's 115200 for every key because its clock is
@@ -2456,34 +2561,44 @@ waits on moves with a key.
 
 **Every register a key writes is volatile.** SYSCLK_CONF, CPU_PER_CONF,
 UART0's and SYSTIMER's registers are reset by a chip reset (power, or the EN
-pin, which the board's reset button and esptool pull) and by a system reset.
-A CPU-only reset (a TIMG watchdog's) leaves the clock as it was, as
-ESP-IDF's bootloader notes ("in case of TG WDT reset, CPU may still be
-running at >80 MHZ"); the watchdogs are off, so nothing here makes one.
-`pll80` also writes the analog master's words, the BBPLL's analog registers
-and one RTC register, RTC_CNTL_OPTIONS0, whose three BBPLL power-down bits
-it clears. Each of those bits resets to 0, so on a part that reads them 0
-the store writes the word back unchanged. A power cycle restores all of them.
-An EN-pin reset restores the clock words: on the part each reset through the
-serial port's RTS line printed `rst:0x1 (POWERON)`, and a run that found
-`sysclk=0x000a8001` followed one that had left 0x000a8400 (§14h). Whether it
-restores OPTIONS0, ANA_CONFIG and the analog words has not been observed
-(OPTIONS0's three bits read 0 before every run) and is the reference manual's
-to say, not ESP-IDF's sources'; an image that does not write them leaves them
-as it finds them. The PLL powered and set to 480 MHz is the state ESP-IDF runs
-every application in. Nothing written is non-volatile, no LDO or voltage word
-is written, and no eFuse is read or written.
+pin, which the board's reset button and esptool pull) and by a system reset. A
+CPU-only reset (a TIMG watchdog's) leaves the clock as it was, as ESP-IDF's
+bootloader notes ("in case of TG WDT reset, CPU may still be running at >80
+MHZ"); the watchdogs are off, so nothing here makes one. `pll80` and `pll160`
+also write the analog master's words, the BBPLL's analog registers and one RTC
+register, RTC_CNTL_OPTIONS0, whose three BBPLL power-down bits they clear.
+Each of those bits resets to 0, so on a part that reads them 0 the store
+writes the word back unchanged. `pll160` writes two analog registers more, the
+LDO settings EXT_RTC_DREG and EXT_DIG_DREG, and reads the eFuse. A power cycle
+restores all of them. An EN-pin reset restores the clock words: on the part
+each reset through the serial port's RTS line printed `rst:0x1 (POWERON)`, and
+a run that found `sysclk=0x000a8001` followed one that had left 0x000a8400
+(§14h). It restores the two LDO fields: `kill_churn_profile` at `pll160` was
+written after `kill_churn` at `pll160` had raised them, with a reset through
+RTS between and no power cycle, and its line read the ROM's 0x18 in both
+before its writes (§14h). Whether it restores OPTIONS0, ANA_CONFIG and the
+BBPLL's words has not been observed, and the runs so far cannot show it:
+OPTIONS0's three bits read 0 before every run, which is both their reset value
+and the value the bring-up leaves, so a reset that kept them would read the
+same. It is the reference manual's to say, not ESP-IDF's sources'; an image
+that does not write them leaves them as it finds them. The PLL powered and set
+to 480 MHz, and the LDOs at the eFuse's settings, are the state ESP-IDF runs
+every application below 240 MHz in. Nothing written is non-volatile, and the
+eFuse is read and never written or burnt.
 
-**A wrong value on a part.** A PRE_DIV_CNT too large slows the CPU, and
-under H3 the flash with it, down to 40 MHz / 1024; a SOC_CLK_SEL of 3 names
-no source. A PLL set to the wrong frequency, or switched to before it has
-locked, clocks the CPU, APB and the flash wrongly. Any of these looks like a
-hang: no line after the ROM's banner, or one that crawls; the console's
-clock is the crystal, so whatever does print is readable. `pll80` switches
-only after the PLL has reported its calibration done, and prints its `not
-taken` line instead when it has not. A wrong UART word garbles the console
-and stops nothing. The part stays that way until reset: the board's reset
-button or `esptool`'s EN-pin reset is a chip reset that restores every
+**A wrong value on a part.** A PRE_DIV_CNT too large slows the CPU, and under
+H3 the flash with it, down to 40 MHz / 1024; a SOC_CLK_SEL of 3 names no
+source. A PLL set to the wrong frequency, or switched to before it has locked,
+clocks the CPU, APB and the flash wrongly. Any of these looks like a hang: no
+line after the ROM's banner, or one that crawls; the console's clock is the
+crystal, so whatever does print is readable. `pll80` switches only after the
+PLL has reported its calibration done, and prints its `not taken` line instead
+when it has not. An LDO setting too low for the clock makes the digital core
+fail at 160 MHz, which looks the same, or like faults no case explains;
+`pll160` writes the settings ESP-IDF writes on the part, read there first
+(§15d), and a power cycle puts the ROM's back. A wrong UART word garbles the
+console and stops nothing. The part stays that way until reset: the board's
+reset button or `esptool`'s EN-pin reset is a chip reset that restores every
 clock word, and the ROM's download mode (strapping GPIO0 low at that reset)
 runs before any image code, so `write-flash` puts a good image back.
 
@@ -2503,6 +2618,22 @@ ana_conf0=... mhz=...
 ```
 
 (one line) and the boot goes on at the clock the ROM left.
+
+`pll160`'s line is `pll80`'s, named `pll160`, with five words added at its
+end: `ldo=` (where the settings came from: `default`, the eFuse with no PVT
+scheme; `unburnt`, the scheme's block version with no HVT; `efuse`, computed
+from the calibration), `dig=` and `rtc=` (the settings written), and
+`ext_dig_dreg=` and `ext_rtc_dreg=` (each LDO register's bits [4:0], read
+through `rom_i2c_readReg` before its write and after the 40 us wait). Its
+`not taken` line for the BBPLL is `pll80`'s; for LDO settings out of range
+it prints, before anything is written,
+
+```
+SOS-S3: clock pll160 not taken: the LDO settings are outside ESP-IDF's
+range; nothing is written ldo=... dig=... rtc=...
+```
+
+(one line), and the boot goes on at the clock the ROM left.
 
 ### 14e. The emulator
 
@@ -2531,14 +2662,42 @@ RTC_CNTL_OPTIONS0    reads 0 at boot, and keeps what is stored
                      store. There is no analog block, so CAL_DONE is never
                      set
 the ROM's analog-    run, being the ROM's own code: each finds the master's
-  bus functions      busy bit clear and returns; `rom_i2c_readReg` answers 0
+  bus functions      busy bit clear and returns; `rom_i2c_readReg` answers 0,
+                     so `pll160`'s LDO registers read 0 before and after
+the eFuse            reads 0, unless the case gives the emulator a file of
+                     the read registers (a case's `efuse`), whose words it
+                     answers from EFUSE_RD_WR_DIS (0x6000_702C) on
 SYSTIMER             modelled (§6a)
 CCOUNT               40 MHz of host time whatever is stored: `mhz=` reads
                      about 40.00 on both sides
 ```
 
 Each key's line, up to the two speeds and after them, is asserted; the
-speeds are host time and are not. `pll_bringup` runs the bring-up itself, a
+speeds are host time and are not. `boot_pll160` runs `pll160` on the
+uncalibrated eFuse (`ldo=default`, 27 and 27) and `boot_pll160_calibrated`
+on a calibrated one, block version 1.2 with negative slopes and voltages and
+HVT 24 (`ldo=efuse`, 26 and 30: the image builder's tests hold those to
+ESP-IDF's arithmetic). `pll160_refused` hands the key settings no eFuse can
+give (a digital 32): it prints its `not taken` line, SYSTIMER's CONF still
+reads its reset value 0x4600_0000, which the key's first step past the check
+changes, and the boot goes on.
+
+The emulator drops those stores and reads back nothing they wrote, so these
+cases hold them by a trace of the run's device accesses (QEMU's
+`memory_region_ops_write` and `memory_region_ops_read`; a case's
+`expect_stores`, `expect_counter_span` and `device_untouched`):
+`boot_pll80`'s three clock stores, CPUPERIOD_SEL 0 and SYSCLK_CONF twice;
+`boot_pll160`'s and `boot_pll160_calibrated`'s SYSTIMER CONF store, the
+key's first past the check, then the two LDO writes, as the ROM's command
+words to the analog master with the settings in them, RTC first, then at
+least two SYSTIMER snapshots of the wait, then the clock stores with
+CPUPERIOD_SEL 1; the wait's loads of SYSTIMER's UNIT0 between the digital
+write and CPU_PER_CONF's store, which must span at least 640 counts, 40 us
+at 16 MHz (a stalled host only lengthens it); and no store by
+`pll160_refused` to the analog master, ANA_CONFIG, ANA_CONFIG2, either
+clock word or SYSTIMER's CONF.
+
+`pll_bringup` runs the bring-up itself, a
 harness kernel that calls `sos_pll_bringup`: its seven ROM calls go through
 the stub and return, the calibration is never reported done, the bring-up
 answers its timeout (1) after the bound, and RTC_CNTL_OPTIONS0's three
@@ -2546,13 +2705,23 @@ power-down bits, set first, come back clear with the bits beside them kept
 (`options0=0x1c000000`). The timeout's outcome does not depend on the
 host's speed: CAL_DONE never comes, and the bound only says when to stop.
 
-**What the emulator cannot judge**, and only a part can: the analog words
-(P4: values, order, and that the ROM's functions deliver them), R3, P2, P3,
-P6 and P7, which land in registers the emulator drops; the calibration and
-the PLL's lock (P5's done path and `bbpll=`); the three clock stores Q3 to
-Q5 and the speed they give; the bring-up's path through `pll80` (the
-emulator's source is the PLL); that the bring-up and the stub need IRAM; the
-flash at 20 MHz; and the snapshot thrown away before a measurement.
+**What the emulator cannot judge**, and only a part can: the analog words (P4:
+values, order, and that the ROM's functions deliver them; that L5's and L6's
+reach the LDOs, and their field's width: the ROM's masked write clears the
+field it is given in what it read and ORs the data in whole, so a field of
+[3:0] would send the same command where the register's bit 4 is clear or the
+setting's is set, as in the emulator (the register reads 0) and on this part
+(settings 0x1c and 0x1d); a setting below 16 over the ROM's 0x18 would go out
+16 high), R3, P2, P3, P6 and P7, which land in
+registers the emulator drops; the voltage the LDO settings give and the CPU's
+running at 160 MHz on it; the calibration and the PLL's lock (P5's done path
+and `bbpll=`); the speed the three clock stores give; the wait's own length,
+since one load of SYSTIMER takes a few hundred of its counts under the
+emulator, so the span holds that 40 us passed between the writes and the
+switch but a wait asked for a single count can span them too; the bring-up's
+path through `pll80` and `pll160` (the emulator's source is the PLL); that the
+bring-up and the stub need IRAM; the flash at 20 MHz; and the snapshot thrown
+away before a measurement.
 
 ### 14f. The profile: where a round of `kill_churn` goes
 
@@ -2589,12 +2758,13 @@ the largest phase, a little over a third of a round (§14h).
 
 ### 14g. The images
 
-The smoke's clock cases are `boot_xtal40` and `boot_pll80` (the kernel alone
-at the key: the line, the banner, the refusal of an empty image),
-`kill_churn_xtal40` and `kill_churn_pll80` (`kill_churn` at the key), and
-`pll_bringup` (the bring-up, §14e). `kill_churn_profile` is board-only: the
-smoke prints its reason and builds nothing for it. A board image of each is
-`--emit-flash CASE --clock KEY --out PATH`.
+The smoke's clock cases are `boot_xtal40`, `boot_pll80`, `boot_pll160` and
+`boot_pll160_calibrated` (the kernel alone at the key: the line, the banner,
+the refusal of an empty image), `kill_churn_xtal40`, `kill_churn_pll80` and
+`kill_churn_pll160` (`kill_churn` at the key), `pll_bringup` (the bring-up)
+and `pll160_refused` (the LDO settings' stop) (§14e). `kill_churn_profile` is
+board-only: the smoke prints its reason and builds nothing for it. A board
+image of each is `--emit-flash CASE --clock KEY --out PATH`.
 
 An image at the `rom` key is the bytes it is without the keys: it compiles
 no key's code, and the link drops the IRAM code only a key calls
@@ -2691,6 +2861,49 @@ creating a child 0.49, settling and killing about 0.56, releasing 0.62,
 giving 0.74 and starting 0.84. The flash's clock stays 20 MHz under every
 PLL speed (§14c); how much of each phase waits on it has not been measured.
 
+**At 160 MHz**, from the `pll160` images and a `pll80` `kill_churn` built
+from the same tree as the control, written and reset as above. The part's
+eFuse gives the settings §15d shows, and the line reads the ROM's 0x18 in
+both LDO fields before the writes:
+
+```
+pll160 line   both images
+sysclk        0x000a8001 -> 0x000a8400   as pll80
+cpu_per       0x0000000c -> 0x0000000d   CPUPERIOD_SEL 1, 160 MHz
+options0, bbpll, ana_conf0, uart_clk, mspi_core, mspi_clock, rtc_date
+                                         pll80's words, as above
+ldo           efuse, dig 0x1d, rtc 0x1c
+ext_dig_dreg  0x18 -> 0x1d
+ext_rtc_dreg  0x18 -> 0x1c
+
+image                         mhz before   mhz after   reset to `200 rounds`
+kill_churn, pll160            19.84        160.01       6.319 s
+kill_churn_profile, pll160    19.76        160.01       -
+kill_churn, pll80             19.92         80.01       7.528 s
+```
+
+A trace of each image under the emulator, given this part's four eFuse
+words, shows the analog master taking the two writes, the read of its
+register each masked write makes first, and the four reads the line makes,
+six reads in all, each command to block 0x6D, and nothing else; one store to
+CPU_PER_CONF, with CPUPERIOD_SEL 1; and no store to the eFuse controller,
+RTC_CNTL_OPTIONS0 or RTC_CNTL_DATE.
+
+```
+          create    give     start   settle   kill     release  all
+pll160     1772175   756490  199579  1994585  1638724   265876   6627431
+
+          stalled   bytes written after the tick was armed
+pll160     361342   31312
+```
+
+Against `pll80`'s row above, twice the CPU's clock takes 0.84 of the time,
+to `200 rounds` and in the profile alike: creating a child 0.72, giving
+0.69, starting 0.62, releasing 0.85, while settling (0.98) and killing
+(0.97) hardly move. The two `pll80` rows were taken from different trees and
+days, which move this case by a few percent on their own (7.88 s, then 7.53 s
+to `200 rounds`). The flash stays at 20 MHz.
+
 ---
 
 ## 15. The board probe
@@ -2707,14 +2920,14 @@ registers, the kernel's RAM, the console's FIFO). It does not call
 its snapshot bit), sends no command on the memory-SPI bus, routes no
 interrupt, writes no pad, clock, cache or MMU register, and leaves the clock
 at the `rom` key's. What holds that for an image is a trace of the built
-image's device writes under the emulator, made before it is flashed: it
-must write no device address an ordinary boot does not. Every load goes
-through one accessor whose view is a `ReadOnly` field, so a store through it
-is a compile error; and the runner refuses the source if it takes a direct
-route to a store (a second view, an unsafe type named outside the accessor,
-a HAL call but the one that halts, an import beyond the console and the HAL,
-`extern`, `asm`), which catches a mistake but cannot prove the property: a
-raw pointer from a safe name and an index reach any address
+image's device writes under the emulator, made before it is flashed: it must
+write no device address an ordinary boot does not. Every load goes through one
+accessor whose view is a `ReadOnly` field, so a store through it is a compile
+error; and the runner refuses the source if it takes a direct route to a store
+(a second view, an unsafe type named outside the accessor, a HAL call but the
+one that halts, an import beyond the console, the HAL and a module of plain
+computation (§15d), `extern`, `asm`), which catches a mistake but cannot prove
+the property: a raw pointer from a safe name and an index reach any address
 (`check_read_only_probe`).
 
 `python3 tools/sos_runner.py --board esp32s3 --emit-flash s3_mem_probe --out
@@ -2811,10 +3024,13 @@ after a power-on reset; esptool read the same part as "Embedded PSRAM 8MB
 positions ESP-IDF v5.4.1's headers give: `efuse_reg.h`, `system_reg.h`,
 `spi_mem_reg.h`, `extmem_reg.h`, `io_mux_reg.h` (MCU_SEL [14:12], FUN_DRV
 [11:10], FUN_IE [9], FUN_PU [8], FUN_PD [7]) and `gpio_reg.h`.
+The eFuse words `sys5` and `part1_data4` are from the calibration probe's
+run (§15d), on the same part.
 
 | word | part |
 |---|---|
 | `sys3`, `sys4` | `0x03080000`, `0x64d0a6c8` |
+| `sys5`, `part1_data4` (§15d) | `0x7400dc90`, `0x33c979b1` |
 | `PSRAM_CAP`, `PSRAM_VENDOR` | 1 (8 MiB), 1 (AP at 3.3 V) |
 | `strap`, `sdio_conf` | `0x00000008`, `0x0ab0be0a` |
 | `sysclk`, `cpu_per`, `core_clk_sel` | `0x000a8001`, `0x0000000c`, 0: the crystal over 2, as §14h |
@@ -2855,6 +3071,49 @@ on the clock pad through SPI_MEM_DATE_REG(0). S1 gives drive 3 to 27 and
 ROM's 2, since the running flash reads on them; and it leaves the clock
 pad as it is, pad 30's own 2 (SPICLK_PAD_DRV_CTL_EN clear), where IDF sets
 3 for both chips.
+
+### 15d. The eFuse calibration probe
+
+`tests/xtensa/s3_dbias_probe.saw`, the smoke's `s3_dbias_probe`, reads the
+four eFuse read registers that hold the LDO calibration and prints them,
+their fields, and the settings ESP-IDF would choose from them (§14b, L4).
+It is the look at a part before any image writes a voltage. It is held to
+everything `s3_mem_probe` is held to, and its one import beyond the console
+and the HAL, `s3dbias`, is held to having no unsafe code, no `extern` and no
+import of its own (`check_pure_module`). Its trace under the emulator writes
+what `s3_mem_probe`'s does, store for store, but the console's bytes.
+
+```
+SOS dbiasprobe: efuse sys3= sys4= sys5= part1_data4=
+SOS dbiasprobe: fields blk_version_major= blk_version_minor= k_rtc_ldo=
+                k_dig_ldo= v_rtc_dbias20= v_dig_dbias20= dig_dbias_hvt=
+                pvt=yes|no
+SOS dbiasprobe: dbias source= dig1v3= dig_240m= rtc_240m= dig_non_240m=
+                rtc_non_240m= check=ok|refused
+```
+
+`source` is `default`, `unburnt` or `efuse` (§14d), `dig1v3` the 1.3 V
+search's answer, and `check` whether each setting is in the range ESP-IDF's
+arithmetic gives it.
+
+On the emulator the eFuse reads 0: block version 0.0, no PVT scheme, so the
+settings are the defaults, 28, 28, 27 and 27. `s3_dbias_probe_calibrated`
+gives it the calibrated file `boot_pll160_calibrated` boots on (§14e); the
+smoke asserts both transcripts whole.
+
+On the part (ESP32-S3 rev v0.2, ROM `esp32s3-20210327`):
+
+```
+sys3 0x03080000  sys4 0x64d0a6c8  sys5 0x7400dc90  part1_data4 0x33c979b1
+blk_version 1.3, so the PVT scheme
+k_rtc_ldo 0x05 (+5)   k_dig_ldo 0x4d (-13)
+v_rtc_dbias20 0x0c (+12)   v_dig_dbias20 0x92 (-18)   dig_dbias_hvt 27
+source efuse   dig1v3 31 (no dbias up to 30 reaches 1.3 V)
+dig_240m 30   rtc_240m 29   dig_non_240m 29   rtc_non_240m 28   check ok
+```
+
+So `pll160` writes 29 (0x1d) to EXT_DIG_DREG and 28 (0x1c) to EXT_RTC_DREG
+on this part: HVT + 2, and the RTC setting that search gives for it.
 
 ---
 
@@ -2929,12 +3188,14 @@ xtal40    0x00080000   0x4           0             H1 40, H2 80, H3 40  10, 20,
                                                                         10 MHz
 pll80     0x00080400   0x4           0             80 MHz: the PLL at   20 MHz
                                                    480, CORE_CLK_SEL 0
+pll160    0x00080400   0x5           0             80 MHz, as pll80     20 MHz
 emulator  0x00080401   0x0           0             no clock modelled    -
 ```
 
 `rom`'s and `xtal40`'s words are the part's as §14h prints them; `pll80`'s
-are its line's after the switch (`sysclk` `0x000a8400`, CLK_DIV_EN reading
-1 on the PLL too; `cpu_per` `0x0000000c`). `mspi_core` read 0 and
+and `pll160`'s are their lines' after the switch (`sysclk` `0x000a8400`,
+CLK_DIV_EN reading 1 on the PLL too; `cpu_per` `0x0000000c` and
+`0x0000000d`). `mspi_core` read 0 and
 `mspi_clock` `0x00030103` under every key on the part. The emulator's words
 read as the PLL at 320 MHz with CPUPERIOD_SEL 0 under every key, since it
 drops every store to both registers.

@@ -35,10 +35,14 @@ user/user.ld        every process: code and read-only data in place in its
                     its region from DRAM 0x3FCB_0000)
 keys/               an image's build keys, each a module the runner maps to
                     one of these directories: `s3clock` (`clock-rom`, the
-                    default, `clock-xtal40` and `clock-pll80`) and `s3stall`
-                    (`stall-off`, the default, and `stall-on`); ABI.md §14.
-                    `clock-common` is `s3clockkit`, what the clock keys
-                    that write share
+                    default, `clock-xtal40`, `clock-pll80` and
+                    `clock-pll160`) and `s3stall` (`stall-off`, the default,
+                    and `stall-on`); ABI.md §14. `clock-common` is
+                    `s3clockkit`, what the clock keys that write share
+dbias/              `s3dbias`, the LDO settings ESP-IDF chooses from the
+                    eFuse's calibration: a package of plain Saw that the
+                    `pll160` key and a read-only probe compile for the part
+                    and the image builder's tests for the host; ABI.md §14b
 ABI.md              every board fact, with the probe that produced it; §13 is
                     the process layout, §14 the system clock, §15 the board
                     probe, §16 the PSRAM's command layer
