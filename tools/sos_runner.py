@@ -15628,6 +15628,23 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "name": "gpio_service",
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "image_file": {arch["name"]: "gpio_service_s3.toml"},
+            # The words the driver's start stored, each at its address in the
+            # GPIO block (0x6000_4000) or the IO MUX (0x6000_9000), from the
+            # emulator's own trace of the stores: the last store to each
+            # address of the smoke configuration's pins (pin 21 pulled up, 14
+            # pulled down, 1 floating, 2 an output driven high, 47 a loopback
+            # output driven low), and one the kernel's side made. The
+            # emulator does not read these back; the driver's log shows the
+            # words it meant, and this shows where they went.
+            "kernel_writes": {
+                0x6000_4008: 0x4, 0x6000_4018: 0x8000, 0x6000_4024: 0x4,
+                0x6000_4028: 0x4, 0x6000_4030: 0x8000, 0x6000_4034: 0x8000,
+                0x6000_404C: 0x2, 0x6000_4058: 0x8000, 0x6000_4078: 0x2180,
+                0x6000_407C: 0, 0x6000_40AC: 0x2180, 0x6000_40C8: 0x2180,
+                0x6000_4130: 0x2180, 0x6000_4558: 0x100, 0x6000_455C: 0x500,
+                0x6000_458C: 0x100, 0x6000_45A8: 0x100, 0x6000_4610: 0x500,
+                0x6000_9008: 0x1A00, 0x6000_900C: 0x1800, 0x6000_903C: 0x1A80,
+                0x6000_9058: 0x1B00, 0x6000_90C0: 0x1A00},
             "expect_out": ["{banner}",
                            *_GPIO_SERVICE_LINES,
                            "root: client ended status=65536",
