@@ -3613,7 +3613,7 @@ can ask about (`SystemOp.TierGet`, §2.8):
 | arm64 `virt` | 1 | yes — Profile B | per-process table sets, higher-half kernel, `map` places. A process's RAM rows lie in a page-granular window of the first 4 MiB of RAM, and a child is linked at `hal.USER_IMAGE_BASE`, 2 MiB into it, so a destination longer than 2 MiB is one this profile cannot grant, and `ProcessCreate` answers it `BadImage` (§2.7) |
 | riscv32 `virt` | 2 | yes — Profile A | PMP regions replayed through the one seam; each resident image linked for its own region, the living identity-tier demonstration |
 | riscv32 `virt`, flat build profile | 3 | yes — a third run | a module swap over the same board: `prot_*` no-ops, PMP opened with one TOR entry, `prot_isolated()` false. No new toolchain, and the tier-3 story's test target |
-| ESP32-C3 | 2, at the floor | no — a gating board smoke (`make sos-smoke-esp32c3`) | 16 PMP entries exactly, 400 KB SRAM; XIP is the entry price |
+| ESP32-C3 | 2, at the floor | no — a board smoke (`make sos-smoke-esp32c3`), not gating | 16 PMP entries exactly, 400 KB SRAM; XIP is the entry price |
 | ESP32-P4 | 2 | no — no QEMU machine yet | 32 PMP + 16 PMA, 768 KB; the first real tier-2 part |
 | ESP32-S3 (Xtensa LX7, call0) | 3, `Flat` | no — a board smoke (`make sos-smoke-esp32s3`) | the core has no privilege (PS.UM picks a vector, not a permission), so the `prot_*` seam installs nothing and `prot_isolated()` is false; the off-core WORLD0/1 controller is unused. Processes are Blade-built images at fixed link addresses, one per resident image as on riscv32, and run the gate's own programs from flash: code in place in the flash instruction window, read-only data in place in the data window, and only writable memory copied, to DRAM, where the kernel also grants the stack (§5.6). A `map` with execute succeeds and its row is recorded, but a region is at DRAM addresses, where the part fetches no instruction (§11). An interrupt line holds one of the board's nine device CPU interrupts (`DEVICE_CPU_INT_COUNT`) while it is unmasked and may lose it to another line once masked, so the limit is at most nine lines unmasked at once, never a count of lines ever bound; the Interrupt slab (`MAX_INTERRUPTS`) stays below it, so a bind meets the slab's `NoResource` first. `hal/xtensa-esp32s3/` |
 
@@ -4510,9 +4510,9 @@ loader parses and reports while no process stores either.
   user process, `sosrt`'s bump arena cursor among them, are plain
   read-modify-write libcalls, so under the tick (§7) two threads of one
   process that share one can each be preempted inside it, and two that
-  allocate at once can be handed overlapping blocks (§5c). The emulator the
-  gate runs never delivers the timer interrupt to user mode on that board, so
-  the gate cannot show it.
+  allocate at once can be handed overlapping blocks (§5c). That board's
+  emulator never delivers the timer interrupt to user mode, so no run under
+  it can show it.
 - On the ESP32-S3 every executable segment is used in place in flash
   (§5.6), so a program cannot be loaded into RAM and run there. A
   `map` with execute succeeds there and its row is recorded, as on every

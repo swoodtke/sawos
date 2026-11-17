@@ -17361,11 +17361,11 @@ def main():
                              "serial harness)")
     parser.add_argument("--board", metavar="NAME", default="virt",
                         help="board profile (default: virt, the GATE's). "
-                             "`esp32c3` is the gating smoke target, run "
+                             "`esp32s3` is the gating smoke target, run "
                              "after the suite: it needs the Espressif "
-                             "toolchain on the gate's machine. `esp32s3` "
-                             "is the Xtensa board's smoke, on the same "
-                             "terms")
+                             "toolchain on the gate's machine. `esp32c3` "
+                             "is the C3 board's smoke, which does not "
+                             "gate")
     parser.add_argument("--emit-flash", metavar="CASE",
                         help="with --board esp32s3: build CASE's image for a "
                              "real board (no semihosting exit), write it to "
@@ -17409,9 +17409,9 @@ def main():
             sys.exit(2)
 
         # ------------------------------------------------------------------
-        # The ESP32-C3 smoke. Gating: the server runs it after `make
-        # sos-test` (it is not part of that target) against the Espressif QEMU
-        # on the machine that runs the gate.
+        # The ESP32-C3 smoke. Not gating: the C3 has no atomic instructions,
+        # which the runtime's locks need, so the server does not run it. It
+        # runs against the Espressif QEMU.
         #
         # It shares no table, no build directory and no run path with the gate
         # above. The board is different in every way that matters (direct boot
@@ -17720,7 +17720,7 @@ def main():
             },
         ]
 
-        print(f"{BOLD}SOS ESP32-C3 board smoke{RESET} (GATING)")
+        print(f"{BOLD}SOS ESP32-C3 board smoke{RESET} (not gating)")
         print(f"  qemu   {qemu}")
         print(f"  clang  {clang}")
         print(f"  target {C3_TRIPLE} --target-features {C3_FEATURES} "

@@ -1,9 +1,9 @@
 # hal/riscv32-esp32c3 — the ESP32-C3 board HAL
 
-SOS boots here. `make sos-smoke-esp32c3` is gating: the server runs it after
-`make sos-test`, and it needs the Espressif toolchain under `~/.espressif`
-(QEMU with the `esp32c3` machine, and esp-clang for the no-A multilib row) on
-the machine that runs the gate.
+SOS boots here. `make sos-smoke-esp32c3` is not gating: the part has no
+atomic instructions, which the runtime's locks need. It needs the Espressif
+toolchain under `~/.espressif` (QEMU with the `esp32c3` machine, and
+esp-clang for the no-A multilib row).
 
 This directory is the board half only. Everything architectural — the trap
 entry, the trap frame, the cause decoding, the syscall accessors, PMP, the

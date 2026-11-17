@@ -33,7 +33,7 @@ hal/riscv32-flat/  # the flat build profile of that board: a facade, not a
                    # a second time as `rv32virt`) and overrides the protection
                    # seam. The gate runs this profile
 hal/riscv32-esp32c3/ # the ESP32-C3 board, same shape — reached only by
-                   # `make sos-smoke-esp32c3`, which gates after sos-test
+                   # `make sos-smoke-esp32c3`, which is not gating
 hal/xtensa-esp32s3/  # Xtensa (call0) and the ESP32-S3 board in one
                    # directory, as arm64's: kernel/ (boot.S with the vectors
                    # and trap entry, sink.c, mspi.c the PSRAM's command
@@ -238,7 +238,7 @@ A `SAWLANG_ROOT` run skips the pin's version check, so it builds with whatever
 compiler that checkout holds, which may not be the one the server's `fetch` run
 uses.
 The sawtracker server runs the full suite. `.sawtracker/tests.json` runs
-`make sos-test sos-smoke-esp32c3 sos-smoke-esp32s3` on every SO patch, and a
+`make sos-test sos-smoke-esp32s3` on every SO patch, and a
 merge needs a green run. The server rebases a patch onto current main before
 its run.
 `sawtracker patch log PATCH` prints the run's transcript; the header's
@@ -255,13 +255,14 @@ rights, quotas and lifetimes are checked identically on the syscall path, but
 it disclaims protecting memory, the kernel's included, from a process. The
 isolated profiles enforce both the syscall-path checks and memory protection.
 
-`make sos-smoke-esp32c3` is the ESP32-C3 board smoke. It is gating: the server
-runs it after `sos-test`, and it needs the Espressif toolchain (QEMU with the
-esp32c3 machine, esp-clang) on the machine that runs the gate. It is not part
-of `sos-test` itself.
+`make sos-smoke-esp32c3` is the ESP32-C3 board smoke. It is not gating: the
+C3 has no atomic instructions, which the runtime's locks need, and there is no
+C3 board, so the smoke is kept for the day the C3 gets real support; how its
+processes would get atomics then is not chosen. It needs the Espressif
+toolchain (QEMU with the esp32c3 machine, esp-clang).
 
-`make sos-smoke-esp32s3` is the ESP32-S3 board smoke, on the same terms: it is
-gating, the server runs it after the C3 smoke, it needs the Espressif toolchain
+`make sos-smoke-esp32s3` is the ESP32-S3 board smoke. It is gating: the server
+runs it after `sos-test`, it needs the Espressif toolchain
 on the gate's machine (QEMU with the esp32s3 machine, esp-clang and its
 `ld.lld`), and it is not part of `sos-test`. Its cases are the gate's harness
 kernels on hand-assembled payloads from `tests/xtensa/`, and gate cases with
