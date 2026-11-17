@@ -51,16 +51,23 @@
 //!
 //!     [limits.default]                   optional: an image's `[limits]`
 //!
+//!     [keys.clock]                       a build key, one per keyed module
+//!     module = "s3clock"
+//!     values = ["rom", "xtal40", "pll80"]
+//!
 //!     [lines]
 //!     reserved = [57]                    lines no device may have
 //!
 //! `modules` are the kernel's extra module paths, `NAME=PATH`. A keyed
 //! module, whose directory each image chooses from several, ends its path in
 //! `*` after the part every choice's name starts with: `s3clock=keys/clock-*`.
-//! A path is relative to the HAL directory, but `hal`, which names that
-//! directory from the tree's top. A size, an address, an offset, a stride or
-//! a line is a TOML integer that the triple's word holds, and a range runs no
-//! further than its address space.
+//! Its build key, a table of `[keys]`, names it and lists the values an
+//! image's own `[keys]` may choose, each the directory of the path with the
+//! value in place of the `*`: `keys/clock-xtal40`. A path is relative to the
+//! HAL directory, but `hal`, which names that directory from the tree's top.
+//! A size, an address, an offset, a stride or a line is a TOML integer that
+//! the triple's word holds, and a range runs no further than its address
+//! space.
 //!
 //! Beyond the rules of `sosimage.rules`, a board is refused by name for: a
 //! `tier`, `placement`, `use` or `speed` outside its words; not exactly one
@@ -72,8 +79,10 @@
 //! a type no device has; a board input named by two types; a device's input
 //! that is not one of its type's, or whose value is not a path; a register
 //! and an array of one device under one name; a register or an element
-//! outside its device's window or off a 4-byte boundary; and a device on a
-//! reserved line.
+//! outside its device's window or off a 4-byte boundary; a device on a
+//! reserved line; a build key whose `module` is no keyed module of
+//! `modules`, or another key's; a build key with no values; and a keyed
+//! module no build key names.
 
 import std.path.{Path}
 import toml.{TomlKind, TomlPosition, TomlTable}
@@ -159,6 +168,22 @@ public struct FlashSpec {
     slots: Span
     slot_count: Int
 }
+
+/// A build key: a keyed module of `modules`, and the values an image may
+/// choose its directory by.
+public struct BuildKey {
+    name: String
+    module: String
+    /// The module's path up to its `*`, from the HAL directory: `keys/clock-`
+    /// for `s3clock=keys/clock-*`. A value's directory is this, then the
+    /// value.
+    prefix: String
+    values: Vector<String>
+    at: TomlPosition
+}
+
+@synthesize
+extension BuildKey: ExplicitCopy {}
 
 /// A named count, as a `[limits]` or a `[quota]` table states it.
 public struct NamedCount {
@@ -305,6 +330,8 @@ public struct Board {
     /// `[limits.default]`, and whether the board states one.
     has_limits: Bool
     limits: LimitsSpec
+    /// `[keys]`, in file order.
+    keys: Vector<BuildKey>
     reserved_lines: Vector<Int>
 }
 
@@ -388,7 +415,7 @@ extension Board {
     /// Reads a board description's top-level table.
     public static func read(root: &TomlTable, file: String) -> Result<Board, BuildError> {
         let top_keys: Vector<String> = ["format", "board", "emulator", "ram", "flash",
-                                        "types", "devices", "limits", "lines"]
+                                        "types", "devices", "limits", "keys", "lines"]
         try only_keys(&root, &top_keys, file, "a board description")
         try check_format(&root, file)
 
@@ -485,6 +512,24 @@ extension Board {
             }
         }
 
+        var keys = Vector<BuildKey>()
+        try expect_table(&root, "keys", file)
+        if let ks = root.table("keys") {
+            keys = try read_keys(&ks, &head.modules, file)
+        }
+        if let b = root.table("board") {
+            var m = 0
+            while m < head.modules.len() {
+                let module = head.modules.get(m) ?? ""
+                let name = module.substring(0, module.index_of(61) ?? 0)
+                if module.ends_with("*") && key_of_module(&keys, name) == None {
+                    return refused(file, element_position(&b, "modules", m),
+                                   "`{module}` in `modules` is keyed, and no [keys] table names it: an image chooses a keyed module's directory by its build key")
+                }
+                m = m + 1
+            }
+        }
+
         let dir = Path(s: file).parent()?.as_string() ?? "."
         return Board(file: file, dir: dir, name: head.name, triple: head.triple,
                      tier: head.tier, hal: head.hal, placement: head.placement,
@@ -494,8 +539,35 @@ extension Board {
                      default_pool: ram.pool, flash: flash,
                      type_inputs: move type_inputs, devices: devices.devices.copy(),
                      members: devices.members.copy(), device_inputs: devices.inputs.copy(),
-                     has_limits: has_limits, limits: move limits,
+                     has_limits: has_limits, limits: move limits, keys: move keys,
                      reserved_lines: move reserved_lines)
+    }
+
+    /// The build key named `name`.
+    public func key(&self, name: String) -> BuildKey? {
+        var i = 0
+        while i < self.keys.len() {
+            borrow let k = self.keys[i] {
+                if k.name.equals(name) {
+                    return k.copy()
+                }
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// The build keys' names, for messages.
+    public func key_names(&self) -> String {
+        var names = Vector<String>()
+        var i = 0
+        while i < self.keys.len() {
+            borrow let k = self.keys[i] {
+                try! names.push("`{k.name}`")
+            }
+            i = i + 1
+        }
+        names.join(", ")
     }
 
     /// The device named `name`.
@@ -674,6 +746,73 @@ func where_whole(role: RefUse) -> String {
         case Part -> "a part window takes the device, an element or a range",
         case Setup -> "a [[setup]] writes a register or one element"
     }
+}
+
+/// `[keys]`: each build key's module, a keyed module of `modules` that no
+/// other key names, and its values, at least one.
+func read_keys(ks: &TomlTable, modules: &Vector<String>,
+               file: String) -> Result<Vector<BuildKey>, BuildError> {
+    var out = Vector<BuildKey>()
+    let names = try! ks.keys()
+    var n = 0
+    while n < names.len() {
+        let name = names.get(n) ?? ""
+        n = n + 1
+        let at = where_is(&ks, name)
+        try check_name(name, file, at, "a build key's name")
+        try require_table(&ks, name, file)
+        if let t = ks.table(name) {
+            let what = "[keys.{name}]"
+            let key_keys: Vector<String> = ["module", "values"]
+            try only_keys(&t, &key_keys, file, what)
+            let module = try text(&t, "module", file)
+            guard let prefix = keyed_prefix(&modules, module) else {
+                return refused(file, where_is(&t, "module"),
+                               "`module` in {what} is \"{module}\", which is no keyed module of `modules`: a build key chooses the directory of a module whose path ends in `*`")
+            }
+            if let other = key_of_module(&out, module) {
+                return refused(file, where_is(&t, "module"),
+                               "the keyed module {module} is [keys.{other.name}]'s too, at {other.at}: one build key chooses a module's directory")
+            }
+            let values = try name_list(&t, "values", file, "a build key's value")
+            if values.len() == 0 {
+                return refused(file, where_is(&t, "values"),
+                               "{what} has no `values`: a build key takes at least one")
+            }
+            try! out.push(BuildKey(name: name, module: module, prefix: prefix,
+                                   values: move values, at: at))
+        }
+    }
+    return move out
+}
+
+/// The path of the keyed module `name` in `modules` up to its `*`, or `None`
+/// when `modules` names no keyed module of that name.
+func keyed_prefix(modules: &Vector<String>, name: String) -> String? {
+    var i = 0
+    while i < modules.len() {
+        let module = modules.get(i) ?? ""
+        i = i + 1
+        let eq = module.index_of(61) ?? 0
+        if module.substring(0, eq).equals(name) && module.ends_with("*") {
+            return module.substring(eq + 1, module.len() - 1)
+        }
+    }
+    None
+}
+
+/// The build key in `keys` whose module is `module`.
+public func key_of_module(keys: &Vector<BuildKey>, module: String) -> BuildKey? {
+    var i = 0
+    while i < keys.len() {
+        borrow let k = keys[i] {
+            if k.module.equals(module) {
+                return k.copy()
+            }
+        }
+        i = i + 1
+    }
+    None
 }
 
 /// Whether `name` is a module's name: a letter or `_`, then letters, digits

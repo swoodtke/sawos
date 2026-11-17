@@ -33,12 +33,14 @@ user/user.ld        every process: code and read-only data in place in its
                     flash slot, writable data in its DRAM region, both
                     assigned by the image builder (root's slot at 0x10_0000,
                     its region from DRAM 0x3FCB_0000)
-keys/               an image's build keys, each a module the runner maps to
-                    one of these directories: `s3clock` (`clock-rom`, the
+keys/               an image's build keys, each a module mapped to one of
+                    these directories: `s3clock` (`clock-rom`, the
                     default, `clock-xtal40`, `clock-pll80` and
                     `clock-pll160`) and `s3stall` (`stall-off`, the default,
-                    and `stall-on`); ABI.md §14. `clock-common` is
-                    `s3clockkit`, what the clock keys that write share
+                    and `stall-on`), which board.toml's `[keys]` lists and a
+                    product's image chooses from in its own `[keys]`;
+                    ABI.md §14d. `clock-common` is `s3clockkit`, what the
+                    clock keys that write share
 dbias/              `s3dbias`, the LDO settings ESP-IDF chooses from the
                     eFuse's calibration: a package of plain Saw that the
                     `pll160` key and a read-only probe compile for the part

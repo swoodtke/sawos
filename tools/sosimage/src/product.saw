@@ -5,6 +5,11 @@
 //! The board is the one whose `board.toml`, in a directory under the sawos
 //! tree's `hal/`, has the image's `board` as its name. It is held to the
 //! profile and its HAL (`sosimage.boardcheck`) before the image is read.
+//! The kernel is compiled at the build keys the image's `[keys]` states
+//! (`keyed_profile`), and an image that states any prints them before
+//! anything is built, in the order it states them:
+//!
+//!     keys NAME=VALUE ...
 //!
 //! A package is `sawos:PATH` in the sawos tree, or a path from the product's
 //! root. The builder builds every process's package itself, each instance
@@ -196,6 +201,11 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
     let facts = try hal_facts(&profile, "{out}/hal")
     try check_board(&board, &profile, &facts, sawos)
     let image = try ImageFile.parse(text, path, &board, facts.grain)
+    // Everything below is built at the image's build keys.
+    let profile = try keyed_profile(&profile, &board, &image)
+    if image.keys.len() > 0 {
+        print(key_line(&image))
+    }
 
     // Every refusal that needs no build, before anything is built.
     let count = image.processes.len()
@@ -359,6 +369,49 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
         }
     }
     link(&profile, &spec)
+}
+
+/// `profile` with the module of each build key `image` states mapped to the
+/// directory of the value it states (`sosimage.board.BuildKey`), from the
+/// board's HAL directory as `board` names it; a module whose key the image
+/// does not state keeps the profile's directory.
+public func keyed_profile(profile: &Profile, board: &Board,
+                          image: &ImageFile) -> Result<Profile, BuildError> {
+    var out = profile.copy()
+    var k = 0
+    while k < image.keys.len() {
+        let choice = image.keys.get(k)!
+        k = k + 1
+        guard let key = board.key(choice.key) else {
+            return BuildError(message: "{image.file}: internal: the build key {choice.key} is not the board {board.name}'s")
+        }
+        var mapped = false
+        var p = 0
+        while p < out.module_paths.len() {
+            if (out.module_paths.get(p) ?? "").starts_with("{key.module}=") {
+                out.module_paths[p] = "{key.module}={board.dir}/{key.prefix}{choice.value}"
+                mapped = true
+            }
+            p = p + 1
+        }
+        if not mapped {
+            return BuildError(message: "{image.file}: internal: the profile maps no module {key.module}")
+        }
+    }
+    return move out
+}
+
+/// The line `sosimage build` prints for an image that states build keys:
+/// `keys NAME=VALUE ...`, in the order `[keys]` states them.
+public func key_line(image: &ImageFile) -> String {
+    var parts = Vector<String>()
+    var k = 0
+    while k < image.keys.len() {
+        let choice = image.keys.get(k)!
+        try! parts.push("{choice.key}={choice.value}")
+        k = k + 1
+    }
+    "keys {parts.join(" ")}"
 }
 
 /// The image description `link` reads for the image `image` describes, built

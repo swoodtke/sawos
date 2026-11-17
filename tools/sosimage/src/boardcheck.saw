@@ -8,9 +8,11 @@
 //! (`read_hal_facts`): the values are the HAL's own, whatever expression
 //! states them. `check_board` refuses, naming both values:
 //!
-//! - against the tree: a `hal` that is not the file's own directory;
+//! - against the tree: a `hal` that is not the file's own directory; a build
+//!   key's value whose directory the HAL directory does not have;
 //! - against the profile: another triple; other C flags; a `hal` module or a
-//!   module of `modules` the profile maps elsewhere or not at all; a module
+//!   module of `modules` the profile maps elsewhere or not at all, a keyed
+//!   module to the directory of no value of its build key; a module
 //!   the profile maps that `modules` does not name (all but the kernel's
 //!   own, `KERNEL_MODULES`); a flash whose length, bus windows, window
 //!   length, root's slot or slot range differ from the profile's layout, or a
@@ -30,11 +32,13 @@
 //!
 //! A keyed module, one whose directory is chosen per image from several
 //! (the ESP32-S3's clock and stall keys), is written in `modules` with a
-//! trailing `*`: `s3clock=keys/clock-*` is any directory beside `keys/` whose
-//! name starts with `clock-`.
+//! trailing `*`, and its build key lists the choices: `s3clock=keys/clock-*`
+//! with the values `rom` and `xtal40` is `keys/clock-rom` or
+//! `keys/clock-xtal40`.
 
+import std.directory.{Directory}
 import std.path.{Path}
-import sosimage.board.{Board}
+import sosimage.board.{Board, key_of_module}
 import sosimage.build.{build_kernel, ensure_directory}
 import sosimage.failure.{BuildError}
 import sosimage.hex.{hex}
@@ -130,6 +134,21 @@ public func check_board(board: &Board, profile: &Profile, facts: &HalFacts,
     }
     if not named.as_string().equals(own) {
         return BuildError(message: "{file}: `hal` is \"{board.hal}\", which is {named.as_string()}, and the description is in {own}: `hal` names the board's own HAL directory")
+    }
+    var k = 0
+    while k < board.keys.len() {
+        borrow let key = board.keys[k] {
+            var v = 0
+            while v < key.values.len() {
+                let value = key.values.get(v) ?? ""
+                v = v + 1
+                let dir = "{key.prefix}{value}"
+                if not Directory.exists(Path(s: "{board.dir}/{dir}")) {
+                    return BuildError(message: "{file}: [keys.{key.name}] has the value {value}, whose directory {dir} is not in the HAL directory {own}")
+                }
+            }
+        }
+        k = k + 1
     }
     try check_profile(&board, &profile)
     if board.flash != None {
@@ -341,7 +360,8 @@ func board_names(board: &Board, name: String) -> Bool {
 
 /// Refuses a module the board names that the profile maps elsewhere, or not
 /// at all. A `dir` ending in `*` is a keyed module's: the profile's directory
-/// must be one beside the `*`'s whose name starts with what precedes it.
+/// must be the one of a value of its build key, the `*` replaced by the
+/// value.
 func module_in_profile(board: &Board, profile: &Profile, name: String,
                        dir: String) -> Result<Void, BuildError> {
     var i = 0
@@ -359,8 +379,13 @@ func module_in_profile(board: &Board, profile: &Profile, name: String,
             let parent = try canonical(dir.substring(0, slash), "{board.file}: the keyed module {name}'s directory")
             let prefix = "{parent}/{dir.substring(slash + 1, dir.len() - 1)}"
             let rest = if found.starts_with(prefix) { found.substring(prefix.len(), found.len()) } else { "/" }
-            if rest.is_empty() || rest.contains("/") {
-                return BuildError(message: "{board.file}: the board's keyed module {name} is {prefix}*, and the profile maps it to {found}")
+            // The board's reader gives every keyed module a key.
+            var values = Vector<String>()
+            if let key = key_of_module(&board.keys, name) {
+                values = key.values.copy()
+            }
+            if not holds_name(&values, rest) {
+                return BuildError(message: "{board.file}: the board's keyed module {name} is {prefix}*, and the profile maps it to {found}, the directory of none of its build key's values, \"{values.join("\", \"")}\"")
             }
             return
         }

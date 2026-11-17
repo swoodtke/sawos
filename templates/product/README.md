@@ -32,6 +32,19 @@ nothing, so connecting and writing the part is yours.
 client; `images/hello-esp32s3.toml`, on a board with no UART driver,
 launches `greeter`, which prints through the kernel's console.
 
+An image chooses its board's build keys in `[keys]`: on the ESP32-S3,
+
+```toml
+[keys]
+clock = "xtal40"
+```
+
+builds its kernel to run the CPU at 40 MHz from the crystal. A board's keys
+and their values are listed in its `board.toml` in the sawos tree
+(`.sawos/hal/xtensa-esp32s3/board.toml`); a key an image leaves out keeps
+its default, on the ESP32-S3 the clock the ROM left (`rom`) and the console
+uncounted (`stall = "off"`).
+
 `tools/sawos.py` needs Python 3.11 or later. It links `.sawos` to the sawos
 tree and runs that tree's `tools/product.py`, which says what each command
 does. The tree is the one `SAWOS_ROOT` names, or else the pinned commit,

@@ -292,6 +292,32 @@ func expect_read_refusal(text: String, message: String) {
     assert(got.equals(message), "the reader's refusal")
 }
 
+// `board()` with two build keys, the ESP32-S3's.
+func keyed_board() -> Board {
+    let modules = "modules = [\"s3clock=keys/clock-*\", \"s3stall=keys/stall-*\"]"
+    let keys = "[keys.clock]\nmodule = \"s3clock\"\nvalues = [\"rom\", \"xtal40\", \"pll80\"]\n[keys.stall]\nmodule = \"s3stall\"\nvalues = [\"off\", \"on\"]\n"
+    try! Board.parse("{board_text().replace("modules = []", modules)}{keys}",
+                     "hal/xtensa-esp32s3/board.toml")
+}
+
+// The UART service's image with `keys` as its `[keys]`, from line 7.
+func with_keys(keys: String) -> String {
+    with_line(service_lines(), 5, "tick = false\n[keys]\n{keys}")
+}
+
+func expect_keyed_refusal(text: String, message: String) {
+    let b = keyed_board()
+    let got = match ImageFile.parse(text, "i.toml", &b, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the reader's refusal")
+}
+
 func bind_refusal(text: String, decls: &Vector<Declaration>) -> String {
     let b = board()
     let image = try! ImageFile.parse(text, "i.toml", &b, 4)
@@ -544,7 +570,30 @@ func main() {
     // Unknown keys: at the top, in [[setup]], in [[pool]], and a hand-written
     // root's process's typo, which is no stock root's key either.
     expect_read_refusal(with_line(service_lines(), 1, "format = 1\nimages = 2"),
-                        "i.toml: line 2, column 1: `images` is not a key of an image description, which takes `format`, `image`, `limits`, `root`, `setup`, `process`, `pool`, `rows`")
+                        "i.toml: line 2, column 1: `images` is not a key of an image description, which takes `format`, `image`, `limits`, `keys`, `root`, `setup`, `process`, `pool`, `rows`")
+
+    // Build keys: each one the board's, its value one of the key's; a board
+    // with none takes none.
+    let kb = keyed_board()
+    let keyed = try! ImageFile.parse(with_keys("clock = \"xtal40\"\nstall = \"on\""), "i.toml", &kb, 4)
+    assert(keyed.keys.len() == 2, "two keys stated")
+    let first_key = keyed.keys.get(0)!
+    assert(first_key.key.equals("clock") && first_key.value.equals("xtal40"), "the clock key")
+    let second_key = keyed.keys.get(1)!
+    assert(second_key.key.equals("stall") && second_key.value.equals("on"), "the stall key")
+    let plain = service_lines()
+    let unkeyed = try! ImageFile.parse(join(&plain), "i.toml", &kb, 4)
+    assert(unkeyed.keys.len() == 0, "no keys stated")
+    expect_keyed_refusal(with_keys("speed = \"fast\""),
+                         "i.toml: line 7, column 1: `speed` in [keys] is no build key of the board esp32s3; its keys are `clock`, `stall`")
+    expect_keyed_refusal(with_keys("clock = \"pll240\""),
+                         "i.toml: line 7, column 1: `clock` in [keys] is \"pll240\", which is not one of the board esp32s3's values for it, \"rom\", \"xtal40\", \"pll80\"")
+    expect_keyed_refusal(with_keys("clock = 40"),
+                         "i.toml: line 7, column 9: `clock` in [keys] is an integer, not a string")
+    expect_keyed_refusal(with_line(service_lines(), 1, "format = 1\nkeys = 3"),
+                         "i.toml: line 2, column 8: `keys` in the top-level table is an integer, not a table")
+    expect_read_refusal(with_keys("clock = \"rom\""),
+                        "i.toml: line 7, column 1: `clock` in [keys] is no build key of the board esp32s3; it has none")
     expect_read_refusal(with_line(box_lines(), 10, "set = 0x800\nmask = 0x800"),
                         "i.toml: line 11, column 1: `mask` is not a key of [[setup]], which takes `register`, `set`, `clear`, `write`")
     expect_read_refusal(with_extra(service_lines(), "pools = [\"a\"]\n[[pool]]\nname = \"a\"\nlen = 0x1000\nsize = 4"),

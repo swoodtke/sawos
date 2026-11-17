@@ -13219,12 +13219,30 @@ def _build_image_file(packager, profile, arch, case, env, board=False):
     `sosimage flash`, which links it with the profile's `board_link_args`;
     return the ELF it linked and what the builder printed. A flash board's
     flash image is beside the ELF (`<name>.flash.bin`); the description's
-    image is named for the case."""
+    image is named for the case.
+
+    A build key is stated in one place: a description that states `[keys]`
+    for a case that names a key too (`"clock"` or `"console_stall"`, which
+    `--emit-flash CASE --clock KEY` sets) is refused, naming both, rather than
+    built at one of them (hal/xtensa-esp32s3/ABI.md §14d)."""
+    import tomllib
+
+    description = os.path.join(TESTS_DIR, "images",
+                               case["image_file"][arch["name"]])
+    named = [k for k in ("clock", "console_stall") if k in case]
+    if named:
+        with open(description, "rb") as f:
+            stated = tomllib.load(f).get("keys")
+        if stated:
+            raise ToolError(
+                f"{description} states the build keys "
+                f"{', '.join(sorted(stated))} in [keys], and the case "
+                f"{case['name']} names {', '.join(named)} too: a key is "
+                "stated in the description or by the case, not both")
     out = os.path.join(arch_dirs(arch)["build"], "images", case["name"])
     printed = _run_sosimage(packager, [
         "flash" if board else "build", profile, REPO_ROOT, REPO_ROOT,
-        os.path.join(TESTS_DIR, "images", case["image_file"][arch["name"]]),
-        out], env=env)
+        description, out], env=env)
     return os.path.join(out, f"{case['name']}.elf"), printed
 
 
@@ -13577,6 +13595,28 @@ ESP32S3_MAGIC = 0xAEDB041D
 # off, and the PSRAM command layer's own build, not its fault build.
 ESP32S3_DEFAULT_KEYS = ("rom", False, False)
 
+# The `xtal40` clock line as the emulator prints it, in two parts around
+# its two measured speeds, which follow host time and are not asserted.
+# The emulator answers SYSCLK_CONF with one fixed word whatever is
+# stored (the PLL selected, the pre-divider at 2), reads 0 for
+# CPU_PER_CONF, the memory-SPI words and the RTC word, and has a read-only
+# date word where UART0's clock register is (ABI.md §14).
+ESP32S3_CLOCK_XTAL40_LINES = [
+    "SOS-S3: clock xtal40 sysclk=0x000a8401->0x000a8401 "
+    "cpu_per=0x00000000->0x00000000 mhz=",
+    " uart_clk=0x15122500 mspi_core=0x00000000 mspi_clock=0x00000000 "
+    "rtc_date=0x00000000\n"]
+
+
+def _board_key_values(hal, key):
+    """The values the board in `hal/<hal>/board.toml` gives its build key
+    `key` (`[keys.<key>] values`), in its order."""
+    import tomllib
+
+    with open(os.path.join(HAL_DIR, hal, "board.toml"), "rb") as f:
+        return tuple(tomllib.load(f)["keys"][key]["values"])
+
+
 # How long an S3 image may run under the emulator before it is killed.
 ESP32S3_TIMEOUT_S = 20
 
@@ -13892,11 +13932,11 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         return obj
 
     # The build keys. Each names a module the HAL imports, and each value a
-    # directory under `keys/` holding that module for the value. The clock
-    # keys that write share `s3clockkit` (`keys/clock-common`), mapped for
-    # every image and compiled only into one whose key imports it
-    # (`_esp32s3_module_paths`).
-    clock_keys = ("rom", "xtal40", "pll80", "pll160")
+    # directory under `keys/` holding that module for the value; the board's
+    # `[keys]` lists them. The clock keys that write share `s3clockkit`
+    # (`keys/clock-common`), mapped for every image and compiled only into
+    # one whose key imports it (`_esp32s3_module_paths`).
+    clock_keys = _board_key_values("xtensa-esp32s3", "clock")
     # The LDO settings from the eFuse, for every image: plain Saw that only
     # an image whose source imports it compiles.
     s3_dbias_dir = os.path.join(s3_hal, "dbias", "src")
@@ -14165,17 +14205,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     rom = "ESP-ROM:esp32s3-20210327"
     banner = "SOS M1: kernel up on xtensa (ESP32-S3)"
     halt_pass = "SOS-S3: halt pass"
-    # The `xtal40` clock line as the emulator prints it, in two parts around
-    # its two measured speeds, which follow host time and are not asserted.
-    # The emulator answers SYSCLK_CONF with one fixed word whatever is
-    # stored (the PLL selected, the pre-divider at 2), reads 0 for
-    # CPU_PER_CONF, the memory-SPI words and the RTC word, and has a read-only
-    # date word where UART0's clock register is (ABI.md §14).
-    clock_xtal40_lines = [
-        "SOS-S3: clock xtal40 sysclk=0x000a8401->0x000a8401 "
-        "cpu_per=0x00000000->0x00000000 mhz=",
-        " uart_clk=0x15122500 mspi_core=0x00000000 mspi_clock=0x00000000 "
-        "rtc_date=0x00000000\n"]
+    clock_xtal40_lines = ESP32S3_CLOCK_XTAL40_LINES
     # The `pll80` clock line as the emulator prints it, the same way. The
     # emulator's word has the CPU on the PLL already, so the key keeps it and
     # brings nothing up (`bbpll=kept`); its three clock stores are dropped,
@@ -15788,6 +15818,33 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "expect_clean_exit": False,
         },
         {
+            # A description that states a clock key, for a case that names
+            # one too: the runner refuses the case rather than build it at
+            # either (`_build_image_file`).
+            "name": "keys_stated_twice",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "keys_twice_s3.toml"},
+            "clock": "xtal40",
+            "expect_build_error": "keys_twice_s3.toml states the build keys "
+                                  "clock in [keys], and the case "
+                                  "keys_stated_twice names clock too",
+            "expect_out": [],
+            "expect_clean_exit": False,
+        },
+        {
+            # The same for a case that names the console's stall key.
+            "name": "keys_stated_twice_stall",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "keys_twice_s3.toml"},
+            "console_stall": True,
+            "expect_build_error": "keys_twice_s3.toml states the build keys "
+                                  "clock in [keys], and the case "
+                                  "keys_stated_twice_stall names "
+                                  "console_stall too",
+            "expect_out": [],
+            "expect_clean_exit": False,
+        },
+        {
             # A root image linked for child 0's slot (`root_link`), stitched
             # into root's: the build reads it back and refuses it, naming
             # where the code is linked and where its bytes sit. Every number
@@ -17168,10 +17225,18 @@ def _product_rows_esp32s3(scratch, builder_before):
     """The S3 smoke's product phase's rows, as `_product_rows`' are: the
     template's ESP32-S3 image tested, and written as a board image by
     `flash`, whose three lines are held to the file, the SHA-256 recomputed
-    here, and the image to one linked for a part rather than the emulator."""
+    here, and the image to one linked for a part rather than the emulator;
+    and its build, which states no keys, printing no `keys` line.
+    Then the same image with a `[keys]` of its own (`keyed_image`): tested at
+    the `xtal40` clock key, whose line it boots with, and written as a board
+    image holding that key's code; and a key and a value the board does not
+    list, each refused by the builder."""
     product = os.path.join(scratch, "product")
     tree = {"SAWOS_ROOT": REPO_ROOT}
     image = "hello-esp32s3"
+    keyed = "hello-xtal40"
+    # What only an image at the `xtal40` key carries: its clock line's text.
+    xtal40_code = b"SOS-S3: clock xtal40 sysclk=0x"
 
     def made():
         r = _product_run([sys.executable, PRODUCT_TOOL, "new", product])
@@ -17220,7 +17285,9 @@ def _product_rows_esp32s3(scratch, builder_before):
         if emulated[:len(board)] == board:
             return (f"{board_bin} is the emulator's image: it was not linked "
                     "for a part")
-        # Built at the S3's default build keys, the smoke's own.
+        # Built at the S3's default build keys, the ROM's clock with the
+        # console uncounted, held to a literal so that `ESP32S3_DEFAULT_KEYS`,
+        # which product.py writes the profile at, cannot drift unseen.
         with open(os.path.join(product, "build", ESP32S3_ARCH["name"],
                                "sosimage.profile.json")) as f:
             built = json.load(f)
@@ -17229,13 +17296,92 @@ def _product_rows_esp32s3(scratch, builder_before):
                       for path in built["module_paths"]
                       if path.startswith(("s3clock=", "s3stall=")))
         want = sorted(os.path.relpath(path.split("=", 1)[1], REPO_ROOT)
-                      for path in _esp32s3_module_paths(ESP32S3_DEFAULT_KEYS)
+                      for path in _esp32s3_module_paths(("rom", False, False))
                       if path.startswith(("s3clock=", "s3stall=")))
         if keys != want or built.get("kernel_c_args"):
             return (f"the product's S3 profile is at the keys {keys} with "
                     f"{built.get('kernel_c_args')!r}, not the default's "
                     f"{want} with none")
         return None
+
+    def keys_line(printed):
+        """The `keys ...` line in what a build printed, or None."""
+        return next((line for line in printed.splitlines()
+                     if line == "keys" or line.startswith("keys ")), None)
+
+    def unkeyed_prints_no_keys():
+        # An image that states no keys builds as it did, so its build prints
+        # no `keys` line.
+        r = _sawos_py(product, ["build", image], tree)
+        if r.returncode != 0:
+            return f"build failed ({r.returncode}): {r.stdout}{r.stderr}"
+        line = keys_line(r.stdout)
+        if line is not None:
+            return f"{image} states no keys, and its build printed {line!r}"
+        return None
+
+    def keyed_image(name, keys):
+        """Write the template's image as the image `name`, with `keys` as its
+        `[keys]`; answer its path."""
+        with open(os.path.join(product, "images", f"{image}.toml")) as f:
+            text = f.read()
+        text = text.replace(f'name = "{image}"', f'name = "{name}"')
+        text = text.replace("[root]", f"[keys]\n{keys}\n\n[root]")
+        path = os.path.join(product, "images", f"{name}.toml")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def keyed_tests_pass():
+        keyed_image(keyed, 'clock = "xtal40"')
+        r = _sawos_py(product, ["test", keyed], tree)
+        ok, reason = _check({"expect_out": ["keys clock=xtal40",
+                                            *ESP32S3_CLOCK_XTAL40_LINES,
+                                            *PRODUCT_GREETER,
+                                            f"test {keyed}: passed"],
+                             "expect_clean_exit": True},
+                            ESP32S3_ARCH, r.returncode, r.stdout, False)
+        return None if ok else f"{reason}; stderr {r.stderr!r}"
+
+    def keyed_flashes():
+        keyed_image(keyed, 'clock = "xtal40"')
+        r = _sawos_py(product, ["flash", keyed], tree)
+        if r.returncode != 0:
+            return f"flash failed ({r.returncode}): {r.stdout}{r.stderr}"
+        if "keys clock=xtal40" not in r.stdout.splitlines():
+            return f"it did not print the keys it built at: {r.stdout}"
+        board_bin = os.path.join(product, "build", f"{keyed}.board",
+                                 f"{keyed}.board.bin")
+        if not os.path.isfile(board_bin):
+            return f"flash wrote no board image at {board_bin}: {r.stdout}"
+        want = [f"sha256 {_file_sha256(board_bin)}  {board_bin}",
+                "board esp32s3",
+                "python3 -m esptool --chip esp32s3 --port PORT write-flash "
+                f"0x0 {board_bin}"]
+        lines = r.stdout.splitlines()[-3:]
+        if lines != want:
+            return f"its last three lines are {lines!r}, not {want!r}"
+        with open(board_bin, "rb") as f:
+            if xtal40_code not in f.read():
+                return (f"{board_bin} has no {xtal40_code!r}: it was not "
+                        "built at the `xtal40` key")
+        unkeyed = os.path.join(product, "build", f"{image}.board",
+                               f"{image}.board.bin")
+        with open(unkeyed, "rb") as f:
+            if xtal40_code in f.read():
+                return (f"{unkeyed}, built at the default keys, has "
+                        f"{xtal40_code!r} too")
+        return None
+
+    def key_refused(name, keys, text):
+        def check():
+            path = keyed_image(name, keys)
+            try:
+                return _refused(_sawos_py(product, ["build", name], tree), 1,
+                                text)
+            finally:
+                os.remove(path)
+        return check
 
     def builder_unchanged():
         after = _file_sha256(SOSIMAGE_BINARY)
@@ -17248,6 +17394,17 @@ def _product_rows_esp32s3(scratch, builder_before):
         ("product_new", made),
         ("product_test_passes", tests_pass),
         ("product_flash", flashes),
+        ("product_unkeyed_prints_no_keys", unkeyed_prints_no_keys),
+        ("product_keyed_test_passes", keyed_tests_pass),
+        ("product_keyed_flash", keyed_flashes),
+        ("product_key_unknown", key_refused(
+            "x-speed", 'speed = "fast"',
+            "`speed` in [keys] is no build key of the board esp32s3; its "
+            "keys are `clock`, `stall`")),
+        ("product_key_value_unknown", key_refused(
+            "x-pll240", 'clock = "pll240"',
+            '`clock` in [keys] is "pll240", which is not one of the board '
+            'esp32s3\'s values for it, "rom", "xtal40", "pll80", "pll160"')),
         ("product_builder_unchanged", builder_unchanged),
     ]
 

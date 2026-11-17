@@ -9,6 +9,9 @@
 //!
 //!     [limits]                           optional: a board's [limits.default]
 //!
+//!     [keys]                             optional: the board's build keys
+//!     clock = "xtal40"                   one of the key's values
+//!
 //!     [root]
 //!     package = "stock"                  or a hand-written root's package
 //!
@@ -41,6 +44,13 @@
 //! package is `sawos:` and a path in the sawos tree, or a path from the
 //! product's root.
 //!
+//! `[keys]` chooses the kernel's keyed modules: each key it states is one of
+//! the board's build keys (`sosimage.board`), and its value names the
+//! directory the key's module is compiled from, the module's path with the
+//! value in place of its `*` (`xtal40` is `keys/clock-xtal40`). A key it
+//! does not state keeps the directory the profile maps
+//! (`sosimage.product.keyed_profile`).
+//!
 //! Reading (`ImageFile.read`) holds the image to the rules of
 //! `sosimage.rules` and to its board: a process name given twice, or twice
 //! but for case, or `root` in any case; a pool name given twice; a reference outside its grammar; a `[[setup]]` or
@@ -48,11 +58,12 @@
 //! value goes (the list forms, reserved); a RAM name that is reserved or not
 //! a process range of the board; a package or an input that is not a path
 //! (`check_path`); a pool length the board's word cannot hold; a pool bound
-//! twice or bound to nothing. Binding a stock root's processes to their
-//! declarations (`bind`) is the rest of it, a `device` reference against the
-//! board included: device needs to devices, by type; client records to
-//! serves; memory records to pools; every input to its value; and each
-//! process to a RAM range (`choose_range`).
+//! twice or bound to nothing; a key of `[keys]` that is no build key of the
+//! board, or a value that is not one of the key's. Binding a stock root's
+//! processes to their declarations (`bind`) is the rest of it, a `device`
+//! reference against the board included: device needs to devices, by type;
+//! client records to serves; memory records to pools; every input to its
+//! value; and each process to a RAM range (`choose_range`).
 
 import toml.{TomlKind, TomlPosition, TomlTable}
 import sosimage.board.{Board, LimitsSpec, NamedCount, RefUse, Window, expect_table,
@@ -131,6 +142,13 @@ public struct RowDevice {
     at: TomlPosition
 }
 
+/// A build key's value, as `[keys]` states it.
+public struct KeyChoice {
+    key: String
+    value: String
+    at: TomlPosition
+}
+
 /// An image, as its description states it.
 public struct ImageFile {
     file: String
@@ -139,6 +157,8 @@ public struct ImageFile {
     tick: Bool
     has_limits: Bool
     limits: LimitsSpec
+    /// `[keys]`, in file order.
+    keys: Vector<KeyChoice>
     /// The stock root, or a hand-written one in `root_package`.
     stock: Bool
     root_package: String
@@ -190,8 +210,8 @@ extension ImageFile {
     /// Reads an image description's top-level table.
     public static func read(root: &TomlTable, file: String, board: &Board,
                             grain: UInt64) -> Result<ImageFile, BuildError> {
-        let top_keys: Vector<String> = ["format", "image", "limits", "root", "setup",
-                                        "process", "pool", "rows"]
+        let top_keys: Vector<String> = ["format", "image", "limits", "keys", "root",
+                                        "setup", "process", "pool", "rows"]
         try only_keys(&root, &top_keys, file, "an image description")
         try check_format(&root, file)
 
@@ -220,6 +240,12 @@ extension ImageFile {
         if let l = root.table("limits") {
             limits = try LimitsSpec.read(&l, file, "[limits]")
             has_limits = true
+        }
+
+        var keys = Vector<KeyChoice>()
+        try expect_table(&root, "keys", file)
+        if let k = root.table("keys") {
+            keys = try read_keys(&k, &board, file)
         }
 
         try require_table(&root, "root", file)
@@ -387,7 +413,8 @@ extension ImageFile {
         }
 
         return ImageFile(file: file, name: name, board: board_name, tick: tick,
-                         has_limits: has_limits, limits: move limits, stock: stock,
+                         has_limits: has_limits, limits: move limits, keys: move keys,
+                         stock: stock,
                          root_package: root_package, root_at: root_at,
                          setup: move setup, processes: parts.processes.copy(),
                          devices: parts.devices.copy(), inputs: parts.inputs.copy(),
@@ -424,6 +451,28 @@ struct Parts {
 
 @synthesize
 extension Parts: ExplicitCopy {}
+
+/// `[keys]`: each a build key of `board`, its value a string the key takes.
+func read_keys(k: &TomlTable, board: &Board, file: String) -> Result<Vector<KeyChoice>, BuildError> {
+    var out = Vector<KeyChoice>()
+    let names = try! k.keys()
+    var i = 0
+    while i < names.len() {
+        let name = names.get(i) ?? ""
+        i = i + 1
+        let at = where_is(&k, name)
+        guard let key = board.key(name) else {
+            let known = if board.keys.len() == 0 { "it has none" } else { "its keys are {board.key_names()}" }
+            return refused(file, at, "`{name}` in [keys] is no build key of the board {board.name}; {known}")
+        }
+        let value = try text(&k, name, file)
+        if not holds(&key.values, value) {
+            return refused(file, at, "`{name}` in [keys] is \"{value}\", which is not one of the board {board.name}'s values for it, \"{key.values.join("\", \"")}\"")
+        }
+        try! out.push(KeyChoice(key: name, value: value, at: at))
+    }
+    return move out
+}
 
 /// Whether `pools` has one named `name`.
 func has_pool(pools: &Vector<PoolEntry>, name: String) -> Bool {

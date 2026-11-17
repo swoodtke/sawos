@@ -2431,10 +2431,41 @@ stays 80 MHz and the flash 20 MHz.
 
 The key is chosen per image at build time (`s3clock`, `keys/clock-*/`); `rom`
 is the default everywhere. The case key `"clock"` sets it, and `--emit-flash
-CASE --clock KEY` overrides it for a board image. The keys that write share
-`s3clockkit` (`keys/clock-common/`): the console's drain, the measurement, the
-line's writer, and the PLL keys' bring-up and switch. Each starts SYSTIMER and
-takes one snapshot it throws away before it measures (§14h).
+CASE --clock KEY` overrides it for a board image.
+
+A product's image chooses its keys in its description's `[keys]`, each value
+one of the key's in this board's `board.toml`:
+
+```toml
+[keys]
+clock = "xtal40"
+stall = "on"
+```
+
+The names and values are this board's: `board.toml`'s `[keys.clock]` and
+`[keys.stall]` list each key's module (`s3clock`, `s3stall`) and its values.
+A value names a directory: the module's path in `modules` with the value in
+place of its `*`, so `xtal40` is `keys/clock-xtal40` and `on` is
+`keys/stall-on`. `sosimage build` and `sosimage flash` refuse a key or a
+value the board does not list, by name, and compile the kernel with each
+stated key's module mapped to its value's directory (`keyed_profile` in
+tools/sosimage/src/product.saw); a key the image leaves out keeps the
+profile's directory, which in the profile `tools/product.py` writes is the
+default, `rom` and `off`. So `tools/sawos.py build`, `run`, `test` and
+`flash` all build a product's image at its keys, and the build prints them
+first (`keys clock=xtal40`).
+
+A key is stated in one place. The smoke's cases give theirs in the case
+(`"clock"`, `"console_stall"`) or by `--emit-flash CASE --clock KEY`, and the
+runner refuses a case whose hand-written description states `[keys]` while
+the case, or `--clock`, names a key as well, rather than pick one
+(`_build_image_file`, the smoke's `keys_stated_twice`). A description's
+`[keys]` with a case that names none is built at the description's keys.
+
+The keys that write share `s3clockkit` (`keys/clock-common/`): the console's
+drain, the measurement, the line's writer, and the PLL keys' bring-up and
+switch. Each starts SYSTIMER and takes one snapshot it throws away before it
+measures (§14h).
 
 ```
 key     registers written, in order                    from

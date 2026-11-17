@@ -166,7 +166,10 @@ console window, the device grain, the kernel range beginning at
 ending by `RAM_TOP`, root's region inside the default process range).
 `src/boardcheck.saw` is the list. A keyed module, chosen
 per image (the ESP32-S3's clock and stall keys), is written
-`NAME=DIR/PREFIX*`. The gate runs it on the three gate profiles. The
+`NAME=DIR/PREFIX*`, and the board's `[keys]` lists its values, which a
+hand-written image chooses from in its own `[keys]` (`sosimage build` maps
+the module to the value's directory). The gate runs it on the three gate
+profiles. The
 builder's tests hold the S3 file to profiles shaped as the smoke's and to its
 linker script, with the HAL's numbers given rather than compiled; the C3 file
 is held to no profile or HAL, and only its `[limits.default]` is planned

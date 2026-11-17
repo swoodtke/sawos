@@ -12,7 +12,8 @@ import sosimage.boardcheck.{HalFacts, check_board, facts_symbol, hal_facts, read
 import sosimage.build.{build_kernel, ensure_directory}
 import sosimage.limits.{ImageLimits}
 import sosimage.kernel.{KernelFacts}
-import sosimage.product.{image_limits}
+import sosimage.imagefile.{ImageFile}
+import sosimage.product.{image_limits, key_line, keyed_profile}
 import sosimage.board.{LimitsSpec, NamedCount}
 import sosimage.profile.{Profile}
 import sosimage.tool.{read_text, write_lines}
@@ -130,6 +131,19 @@ func s3_text() -> String {
 
 func s3_with(old: String, new: String) -> Board {
     board_file("../../hal/xtensa-esp32s3", "board.toml", s3_text().replace(old, new))
+}
+
+// A hand-written-root image for the ESP32-S3 with `keys` after `[image]`.
+func s3_image(keys: String, board: &Board) -> ImageFile {
+    let text = "format = 1\n[image]\nname = \"keyed\"\nboard = \"esp32s3\"\ntick = false\n{keys}[root]\npackage = \"root\"\n[[process]]\nname = \"child\"\npackage = \"child\"\n"
+    try! ImageFile.parse(text, "i.toml", &board, 4)
+}
+
+func keyed_refusal(profile: &Profile, board: &Board, image: &ImageFile) -> String {
+    match keyed_profile(&profile, &board, &image) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
 }
 
 func main() {
@@ -265,6 +279,44 @@ func main() {
     expect(&s3, &s3_profile(s3_modules("clock-xtal40"), layout), &s3_facts, "")
     expect_part(&s3, &s3_profile(s3_modules("clock-rom").replace("keys/clock-rom", "kernel"), layout), &s3_facts,
                 "{s3_file}: the board's keyed module s3clock is ", "keys/clock-*, and the profile maps it to ")
+    // A directory the `*` matches that is no value's; a value with no
+    // directory.
+    expect_part(&s3, &s3_profile(s3_modules("clock-common"), layout), &s3_facts,
+                "{s3_file}: the board's keyed module s3clock is ",
+                "keys/clock-common, the directory of none of its build key's values, \"rom\", \"xtal40\", \"pll80\", \"pll160\"")
+    expect_part(&s3_with("values = [\"rom\", \"xtal40\", \"pll80\", \"pll160\"]", "values = [\"rom\", \"xtal40\", \"pll240\"]"),
+                &s3_profile(s3_modules("clock-rom"), layout), &s3_facts,
+                "{s3_file}: [keys.clock] has the value pll240, whose directory keys/clock-pll240 is not in the HAL directory ",
+                "hal/xtensa-esp32s3")
+    // The second key's values are held too.
+    expect_part(&s3_with("values = [\"off\", \"on\"]", "values = [\"off\", \"onn\"]"),
+                &s3_profile(s3_modules("clock-rom"), layout), &s3_facts,
+                "{s3_file}: [keys.stall] has the value onn, whose directory keys/stall-onn is not in the HAL directory ",
+                "hal/xtensa-esp32s3")
+
+    // An image's build keys: each it states maps its module to the value's
+    // directory, and the rest stay the profile's.
+    let rom_profile = s3_profile(s3_modules("clock-rom"), layout)
+    let at_xtal40 = s3_image("[keys]\nclock = \"xtal40\"\n", &s3)
+    let keyed = try! keyed_profile(&rom_profile, &s3, &at_xtal40)
+    let want = s3_profile(s3_modules("clock-xtal40"), layout)
+    assert(keyed.module_paths.join(" ").equals(want.module_paths.join(" ")),
+           "the clock key's module mapped")
+    assert(key_line(&at_xtal40).equals("keys clock=xtal40"), "the keys line")
+    let both = s3_image("[keys]\nstall = \"on\"\nclock = \"pll80\"\n", &s3)
+    assert(key_line(&both).equals("keys stall=on clock=pll80"), "the keys line, in the image's order")
+    let both_keyed = try! keyed_profile(&rom_profile, &s3, &both)
+    let both_want = s3_profile(s3_modules("clock-pll80").replace("keys/stall-off", "keys/stall-on"), layout)
+    assert(both_keyed.module_paths.join(" ").equals(both_want.module_paths.join(" ")),
+           "both keys' modules mapped")
+    let none = s3_image("", &s3)
+    let same = try! keyed_profile(&rom_profile, &s3, &none)
+    assert(same.module_paths.join(" ").equals(rom_profile.module_paths.join(" ")), "no key stated, the profile's")
+    assert(keyed_refusal(&rom_profile, &virt, &at_xtal40).equals("i.toml: internal: the build key clock is not the board riscv32-virt's"),
+           "a key the board does not have")
+    let unmapped = s3_profile(s3_modules("clock-rom").replace("\"s3clock=../../hal/xtensa-esp32s3/keys/clock-rom\", ", ""), layout)
+    assert(keyed_refusal(&unmapped, &s3, &at_xtal40).equals("i.toml: internal: the profile maps no module s3clock"),
+           "a module the profile does not map")
     expect(&s3, &s3_profile(s3_modules("clock-rom"), layout.replace("4194304", "2097152")), &s3_facts,
            "{s3_file}: [flash] is 0x400000 bytes, ibus 0x42000000 and dbus 0x3c000000 for 0x2000000 and 0x2000000; the profile's flash is 0x200000 bytes, windows 0x42000000 and 0x3c000000 for 0x2000000")
     expect(&s3, &s3_profile(s3_modules("clock-rom"), layout.replace("1107296256", "1107300352")), &s3_facts,

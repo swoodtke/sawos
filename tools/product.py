@@ -43,8 +43,11 @@ PRODUCT/build/<profile>/.
 
 An image's board is read from its `[image] board`, and is built for when it
 is one of the gate's profiles (`sos_runner.ARCHES`) or the ESP32-S3
-(`sos_runner.ESP32S3_ARCH`, at its default build keys, with Espressif's
-tools); any other is refused, naming the board.
+(`sos_runner.ESP32S3_ARCH`, with Espressif's tools); any other is refused,
+naming the board. The S3's profile is written at its default build keys
+(`sos_runner.ESP32S3_DEFAULT_KEYS`), and for every command `sosimage build`
+and `flash` compile an image's kernel at each key its `[keys]` states
+instead, refusing a key or a value the board's `board.toml` does not list.
 
 A refusal prints `error: ` and its reason on standard error and exits 1; a
 command line this file does not take exits 2.
@@ -229,8 +232,9 @@ class Session:
             build = os.path.join(self.build, arch["name"])
             if self.s3(arch):
                 os.makedirs(build, exist_ok=True)
-                path = self.runner._esp32s3_profile(clang, lld, self.blade,
-                                                    ("rom", False, False), build)
+                path = self.runner._esp32s3_profile(
+                    clang, lld, self.blade, self.runner.ESP32S3_DEFAULT_KEYS,
+                    build)
             else:
                 path = self.runner._gate_profile(arch, clang, lld, self.blade,
                                                  build=build)

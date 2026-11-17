@@ -80,6 +80,12 @@ func refusal(text: String) -> String {
     }
 }
 
+// The board with a keyed module, `s3clock=keys/clock-*`, and `keys` after
+// the rest, from line 48.
+func keyed(keys: String) -> String {
+    "{with_line(8, "modules = [\"s3clock=keys/clock-*\", \"plain=keys/plain\"]")}{keys}\n"
+}
+
 func expect_refusal(text: String, message: String) {
     let got = refusal(text)
     if not got.equals(message) {
@@ -130,7 +136,7 @@ func main() {
 
     // Keys the format does not define.
     expect_refusal(with_extra("[board2]"),
-                   "b.toml: line 48, column 2: `board2` is not a key of a board description, which takes `format`, `board`, `emulator`, `ram`, `flash`, `types`, `devices`, `limits`, `lines`")
+                   "b.toml: line 48, column 2: `board2` is not a key of a board description, which takes `format`, `board`, `emulator`, `ram`, `flash`, `types`, `devices`, `limits`, `keys`, `lines`")
     expect_refusal(with_line(31, "size = 0x1000"),
                    "b.toml: line 31, column 1: `size` is not a key of [devices.UART0], which takes `type`, `base`, `len`, `line`, `kernel`, `registers`, `arrays`, `inputs`")
     expect_refusal(with_line(17, "top = 0x8020_0000"),
@@ -262,11 +268,53 @@ func main() {
                    "b.toml: line 8, column 12: `x=` in `modules` is not NAME=PATH, a module's name and its directory")
     expect_refusal(with_line(8, "modules = [\"1x=y\"]"),
                    "b.toml: line 8, column 12: `1x=y` in `modules` is not NAME=PATH, a module's name and its directory")
-    expect_refusal(with_line(8, "modules = [\"s3clock=keys/clock-*\"]"), "")
+    expect_refusal(keyed("[keys.clock]\nmodule = \"s3clock\"\nvalues = [\"rom\"]"), "")
     expect_refusal(with_line(8, "modules = [\"s3clock=keys/*-clock\"]"),
                    "b.toml: line 8, column 12: `s3clock=keys/*-clock` in `modules`: a `*` ends a keyed module's path, after the part every key's directory starts with")
     expect_refusal(with_line(8, "modules = [\"s3clock=*\"]"),
                    "b.toml: line 8, column 12: `s3clock=*` in `modules`: a `*` ends a keyed module's path, after the part every key's directory starts with")
+
+    // Build keys: each names a keyed module, which no other key names, and
+    // its values; every keyed module has one.
+    let clock = "[keys.clock]\nmodule = \"s3clock\"\nvalues = [\"rom\", \"xtal40\"]"
+    let kb = try! Board.parse(keyed(clock), "hal/test/board.toml")
+    assert(kb.keys.len() == 1, "one build key")
+    guard let key = kb.key("clock") else {
+        panic("no build key clock")
+    }
+    assert(key.module.equals("s3clock") && key.prefix.equals("keys/clock-"), "the key's module and prefix")
+    assert(key.values.len() == 2 && (key.values.get(1) ?? "").equals("xtal40"), "the key's values")
+    assert(kb.key("stall") == None, "no other key")
+    assert(kb.key_names().equals("`clock`"), "the key names")
+    assert(b.keys.len() == 0, "a board with no keyed module has no keys")
+    expect_refusal(with_line(8, "modules = [\"s3clock=keys/clock-*\", \"plain=keys/plain\"]"),
+                   "b.toml: line 8, column 12: `s3clock=keys/clock-*` in `modules` is keyed, and no [keys] table names it: an image chooses a keyed module's directory by its build key")
+    expect_refusal(keyed(clock.replace("\"s3clock\"", "\"plain\"")),
+                   "b.toml: line 49, column 1: `module` in [keys.clock] is \"plain\", which is no keyed module of `modules`: a build key chooses the directory of a module whose path ends in `*`")
+    expect_refusal(keyed(clock.replace("\"s3clock\"", "\"nosuch\"")),
+                   "b.toml: line 49, column 1: `module` in [keys.clock] is \"nosuch\", which is no keyed module of `modules`: a build key chooses the directory of a module whose path ends in `*`")
+    expect_refusal(keyed("{clock}\n[keys.speed]\nmodule = \"s3clock\"\nvalues = [\"on\"]"),
+                   "b.toml: line 52, column 1: the keyed module s3clock is [keys.clock]'s too, at line 48, column 7: one build key chooses a module's directory")
+    expect_refusal(keyed(clock.replace("[\"rom\", \"xtal40\"]", "[]")),
+                   "b.toml: line 50, column 1: [keys.clock] has no `values`: a build key takes at least one")
+    expect_refusal(keyed("[keys.clock]\nmodule = \"s3clock\""),
+                   "b.toml: line 48, column 7: [keys.clock] has no `values`: a build key takes at least one")
+    expect_refusal(keyed("[keys.clock]\nvalues = [\"rom\"]"),
+                   "b.toml: line 48, column 7: `module` is missing from [keys.clock]")
+    expect_refusal(keyed(clock.replace("[\"rom\", \"xtal40\"]", "[\"rom\", \"rom\"]")),
+                   "b.toml: line 50, column 18: `rom` is in `values` twice")
+    expect_refusal(keyed(clock.replace("[\"rom\", \"xtal40\"]", "[\"rom\", \"1x\"]")),
+                   "b.toml: line 50, column 18: `1x` is not a name: a build key's value is a letter, then letters, digits, `_` and `-`")
+    expect_refusal(keyed(clock.replace("[keys.clock]", "[keys.1clock]")),
+                   "b.toml: line 48, column 7: `1clock` is not a name: a build key's name is a letter, then letters, digits, `_` and `-`")
+    expect_refusal(keyed("{clock}\n[keys.2speed]\nmodule = \"s3clock\"\nvalues = [\"on\"]"),
+                   "b.toml: line 51, column 7: `2speed` is not a name: a build key's name is a letter, then letters, digits, `_` and `-`")
+    expect_refusal(keyed("[keys]\nclock = \"rom\""),
+                   "b.toml: line 49, column 9: `clock` in [keys] is a string, not a table")
+    expect_refusal(keyed("{clock}\ndefault = \"rom\""),
+                   "b.toml: line 51, column 1: `default` is not a key of [keys.clock], which takes `module`, `values`")
+    expect_refusal(with_line(1, "format = 1\nkeys = 3"),
+                   "b.toml: line 2, column 8: `keys` in the top-level table is an integer, not a table")
 
     // A device input's path.
     expect_refusal(with_line(34, "inputs = \{ uartpins = \"/etc/pins.saw\" \}"),
