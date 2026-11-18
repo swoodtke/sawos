@@ -1067,12 +1067,11 @@ Order:
 
 ## Open questions
 
-**Q1. Doubling on riscv32, or TOR?** On this HAL a NAPOT row spends the
-same numbered region as a TOR pair, so doubling saves no slot. It costs a
-pool base aligned to the largest power of two not above `len`, and up to
-half the pool unreachable by the heap. *Recommendation:* TOR, growing at
-the grain. Doubling becomes worth it only if the HAL packs NAPOT rows one
-entry each, a change of its own.
+**Decided by the owner: TOR on riscv32, growing at the grain.** On this
+HAL a NAPOT row spends the same numbered region as a TOR pair, so doubling
+saves no slot, and it would cost a pool base aligned to a large power of two
+and up to half the pool. Doubling becomes worth it only if the HAL packs
+NAPOT rows one entry each, a change of its own.
 
 **Q2. Should a share be mintable?** Without `Mint` on the pool, a share
 reaches one other holder at a time. Granting `Mint` lets the program fan a
