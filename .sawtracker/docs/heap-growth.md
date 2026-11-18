@@ -1,80 +1,116 @@
 # SO-142 phase 2: heaps from pools
 
-Revision 2 of the design for the owner's review. Nothing here is built. It
-settles what a process allocates from: a small built-in heap in `.bss`, a
-default heap from a pool its launcher gives it, and named heaps from pools
-of their own, each placed in a RAM range the image chooses. It covers a
-start-up that allocates nothing, how the runtime maps the pools before
-`main`, how a program chooses a heap, what a refusal is, the declaration and
-image syntax, locks, the builder's checks, boards, the migration and the
-units.
+Revision 3 of the design for the owner's review. Unit 1, the
+allocation-free drain, has merged; nothing else here is built.
+
+What a process allocates from:
+
+- **a small built-in heap** in `.bss`;
+- **a default heap** that grows up from the front of a pool, one contiguous
+  region in one protection slot, as allocation needs it;
+- **named heaps**, each the same over a pool of its own.
+
+Shareable `Memory` objects come from the back of the same pools, growing
+down. The document covers:
+
+- the kernel ops this needs (an allocation from the back, and a `Memory`
+  and its `Mapping` grown in place), with their spec text, in units of their
+  own ahead of the runtime's;
+- the runtime's heaps;
+- the share API;
+- the growth step per board;
+- the declaration and image syntax;
+- locks, the builder's checks and the units.
 
 A bare section sign (§4) is this document's; the spec's sections are written
 "spec §N", and SO-124's design (`.leadwork/SO-124/design-r5-live.md`) is
-cited as "SO-124 §N". The replies to the review's threads on revision 1 are
-in `heap-thread-replies-r2.md` beside this file.
+cited as "SO-124 §N". The replies to the review's threads on revision 2 are
+in `heap-thread-replies-r3.md` beside this file.
 
-Sources: the owner's answers to revision 1's five questions and the rulings
-after them (two heaps for small boards; a small, configurable built-in heap
-for every process; start-up allocates nothing); sawlang's allocator ABI as
-its lead states it (a failure answers null and never panics, aborts or
-blocks; alignment up to 4096; `dealloc` gets the matching size and
-alignment; any thread frees any block; no allocation or suspension inside
-the allocator); SO-124 unit 1 as it stands for review (`PANIC_OP`, and
-`__saw_rt_alloc` answering null); spec §2.5, §2.7, §2.9, §2.10, §5.5, §5.6,
-§5b.1, §5c, §11 and §12; `rt/common/src/{heap,lib}.saw`;
-`kernel/sysapi/src/{rt,floor,bootset,pool,system}.saw`;
-`kernel/abi/src/{status,boot}.saw`; `kernel/core/{dispatch,objects,limits}.saw`;
-`root/src/main.saw`, `root/bootplan`;
-`tools/sosimage/src/{declaration,imagefile,plan,layout,board}.saw`; each
-board's `board.toml`; `hal/xtensa-esp32s3/ABI.md` §8 and §16 and SO-102's
-issue; sawlang's `std/{alloc,vector,box,map,set,string,stringbuilder,panic}.saw`
-and `LANGUAGE_SPEC.md` at the pin (v0.24.3); and one `sawc mono --check`
-probe at the pin (§4.2).
+Sources:
+
+- the owner's rulings:
+  - two heaps for small boards;
+  - a small, configurable built-in heap of 4 KiB by default;
+  - start-up allocates nothing;
+  - a heap's pool owned entirely by the runtime;
+  - "only map in memory as needed via allocation. some should remain to
+    allocate sharable memory objects";
+  - malloc memory from the pool's front and memory objects from its back,
+    the heap's one slot extended as it grows;
+  - heap memory is forever, and a shared object is an ordinary Memory
+    returned when its last mapping and handle go;
+  - a board-aware growth step;
+  - the question of a heap alignment key;
+- sawlang's allocator ABI as its lead states it:
+  - a failure answers null and never panics, aborts or blocks;
+  - alignment up to 4096;
+  - `dealloc` gets the matching size and alignment;
+  - any thread frees any block;
+  - no allocation or suspension inside the allocator;
+- SO-124 unit 1 and SO-142 unit 1 (`be9c9bd9`), both merged;
+- spec §2.5, §2.7, §2.9, §2.10, §3, §5.5, §5.6, §5b.1, §5c, §11 and §12;
+- the kernel and runtime:
+  - `kernel/core/{objects,dispatch,process,pslot,limits}.saw`;
+  - `kernel/abi/src/{ops,rights,status,boot}.saw`;
+  - `hal/riscv32-common/kernel/lib.saw` (PMP),
+    `hal/arm64/kernel/{lib.saw,ABI.md}`;
+  - `rt/common/src/{heap,lib}.saw`;
+  - `kernel/sysapi/src/{rt,floor,bootset,pool,memory,mapping,system}.saw`;
+- the builder and root: `root/`, `tools/sosimage/src/*.saw`, and each
+  board's `board.toml`;
+- the S3: `hal/xtensa-esp32s3/ABI.md` §8 and §16, and SO-102's issue;
+- sawlang at the pin (v0.24.3): `std/{alloc,vector,box,map,set,string}.saw`,
+  `runtime/ABI.md` and `LANGUAGE_SPEC.md`;
+- one `sawc mono --check` probe at the pin (§5.2).
 
 ## 0. The shape in one page
 
-- **Start-up allocates nothing.** The boot set's drain stores its records
-  in fixed storage inside `BootSet`, bounded by the handle table, so every
-  step before `main` (SO-124's start-up, and a `_start` package's own
-  drain) runs with no heap at all. A case holds the rule: a `main` program
-  and a `_start` package with no heap start, reach their programs and exit
-  clean.
-- **Three kinds of heap, one TLSF each.** The *built-in heap* is today's
-  `.bss` arena, sized at link time and the program's alone. The *default
-  heap* is a pool the launcher gives the process. A *named heap* (`data`,
-  say) is another pool. Each pool heap is mapped whole before `main`. Each
-  heap is one region, one `UnsafeHeap` and one `SpinLock`; `heap.saw` does
-  not change.
-- **Saw's global allocator** (`String`, `Vector<T>`, interpolation) serves
-  from the default heap, then from the built-in heap. A free goes to the
-  heap whose range holds the block.
-- **A named heap is an allocator type,** `sos.Heap<SLOT>`, conforming to
-  std's `Allocator`. At the pin `Vector`, `Box`, `Map` and `Set` take an
-  allocator parameter, so `Vector<UInt8, Heap<DATA>>` allocates from the
-  named heap. `String` cannot; that is the sawlang ask (§4.4).
-- **Every heap that cannot serve answers null.** std makes the null an
-  `Err(AllocError)` where it has an error channel and panics where it has
-  none (its `String` layer). A process with no heap, a spent heap and a
-  named heap it was never given all answer the same way. The only panics are
-  a bad free (the owner's ruling) and the start-up's mapping refusals that
-  are not "the pool has no bytes" (§3.4).
-- **The pools arrive as boot records under reserved tags,** given with only
-  `PoolRight.Allocate | PoolRight.Map`. `BootSet(process:)` drains, then
-  maps every heap record it holds: reads the pool's free length, allocates
-  it all, maps it read-write, reads the base and releases every handle. The
-  pool dies at the process's death, by the kernel's rule.
-- **The declaration** keeps `arena` for the built-in heap and adds a
-  `[heap.NAME]` table per pool heap (`default`, and named ones with a
-  `slot`), each with a `len` and an optional `ram = "fast"`. **The image**
-  sets every built-in heap's default size (`[image] arena`) and where heaps
-  come from (`[image] heap-ram`, and a process's `heap-ram = { data =
-  "psram" }`). **The board** states which ranges have working atomics, and
-  the builder refuses a heap anywhere else.
-- **Migration: no existing process changes.** Each keeps its built-in heap;
-  the kernel and root keep only theirs.
-- **Five units:** the allocation-free drain; the heap table; adoption and
-  `Heap<SLOT>`; the builder and the stock root; a data heap in the S3's
+- **A pool has two ends.** A heap takes the pool's front and grows up:
+  - it is one `Memory` that the kernel extends in place with the pool's
+    next bytes (`MemoryOp.Extend`);
+  - it has one `Mapping` whose row the kernel extends to cover them
+    (`MappingOp.Grow`).
+
+  Shares come from the back and grow down (`PoolOp.Allocate`'s new `Back`
+  argument). The two meet in the middle, and whichever side cannot be served
+  answers null or `NoMemory`.
+- **One protection slot per heap, whatever its size.** On riscv32 the row
+  is a TOR pair whose top moves; on arm64 the next pages are mapped at the
+  next virtual addresses, which `map` reserves; on the S3 (Flat) no slot is
+  spent at all. A heap costs one `Memory` row and one `Mapping` row for its
+  life.
+- **The heap only grows, and it is forever.** No trim, no region returned.
+  Its memory goes home when the process ends. A share is an ordinary
+  `Memory` and goes home under spec §2.5's refcount invariant, when its last
+  handle and its last row are gone, wherever they are.
+- **The growth step is the pool's grain:** a request's need, rounded up to
+  the grain the kernel reports for the pool, and at least 1 KiB. That is a
+  page on arm64 and four bytes on riscv32 and the S3. Doubling on riscv32
+  (a NAPOT row) is weighed and not recommended: this HAL charges a NAPOT
+  row the same slot as a TOR pair (Q1).
+- **The runtime holds each heap's pool, its `Memory`, its `Mapping` and a
+  Map-only Process sibling for the process's life.** The heap is one TLSF
+  region, so `heap.saw` gains only `extend` and a class table sized for the
+  pool.
+- **The global allocator** serves from the default heap and then the
+  built-in heap. `Heap<SLOT>`, an std `Allocator`, serves named heaps;
+  `Heap<SLOT>().share(len:)` answers a `Memory` from the back with
+  `Transfer | Map`.
+- **Every refusal to allocate is null,** and each heap records why. The
+  panics are a bad free and adoption's rights checks, before the program
+  runs.
+- **Syntax:**
+  - the declaration's optional `arena` and a `[heap.NAME]` table per heap
+    (`len`, `slot`, `ram`);
+  - the image's `arena` and `heap-ram`;
+  - a board range's `atomics = true`.
+
+  The builder holds one `Memory` and one `Mapping` row per heap.
+- **No existing process changes;** the kernel and root keep their built-in
+  heaps.
+- **Units:** two kernel units first (a pool's two ends; growing a `Memory`
+  and a `Mapping`), then four runtime and builder units, then the S3's
   PSRAM.
 
 ## 1. What a process allocates from
@@ -83,289 +119,425 @@ probe at the pin (§4.2).
 
 | Kind | Memory | Sized by | Serves |
 |---|---|---|---|
-| built-in | `[_arena_start, _arena_end)` in `.bss`, in the process's own region | the link (`ARENA_SIZE`): the declaration's `arena`, else the image's `[image] arena`, else the package's script | the global allocator, after the default heap |
-| default | a pool under `HEAP_TAG`, mapped before `main` | `[heap.default] len` | the global allocator, first |
-| named | a pool under `HEAP_TAG + slot`, mapped before `main` | `[heap.NAME] len` | `Heap<slot>` only |
+| built-in | `[_arena_start, _arena_end)` in `.bss` | `ARENA_SIZE` at link: the declaration's `arena`, else `[image] arena`, else 4 KiB | the global allocator, after the default heap |
+| default | the front of a pool under `HEAP_TAG`, growing up | `[heap.default] len`, the pool | the global allocator, first; `Heap<0>` |
+| named | the front of a pool under `HEAP_TAG + slot` | `[heap.NAME] len` | `Heap<slot>` |
 
-Every heap is one region, so each `UnsafeHeap` is made exactly as the
-arena's is today: its control block at its front, sized for its own region
-on its first call (`ready()`), its blocks never outgrowing its class table.
-There is no region list, no `add_region` after the first and no link-time
-length.
+The 4 KiB default is SO-142.p3's. The runtime needs none of it: start-up,
+a `print` with `{}` arguments and the panic path allocate nothing.
 
-### 1.2 The built-in heap stays separate from the default heap
+### 1.2 Who supplies the memory, and the authority
 
-Two ways to relate them were weighed:
+The launcher gives one pool per declared heap, under the heap's reserved
+tag, with the keep mask `PoolRight.Allocate | Map | Transfer | Extend`.
+`Extend` is the new bit of §2.2, carried for allocations as `Map` is. An
+allocation carries its pool handle's carried bits, capped by the process's
+`Memory` ceiling (spec §2.5; `mint_capped`). So the heap's `Memory` can be
+mapped and extended, a share can be mapped and given, and neither can be
+executed (no `MapExecute`) or minted into siblings (no `Mint`).
 
-- **One heap, two regions.** The built-in heap is the default heap's first
-  region and the pool joins it as a second, so blocks from either free into
-  the same lists. The class table must then be sized for the larger region
-  before the first allocation, `holds` must know both regions, and
-  `heap.saw` gains the multi-region code revision 1 described.
-- **Two heaps, routed by address** (recommended). Each is its own TLSF. The
-  global allocator asks the default heap, then the built-in heap; a free
-  compares the block with the arena's linker bounds and goes to the heap
-  whose range holds it. Each heap sizes its own table, `heap.saw` is
-  unchanged, and a built-in heap of zero bytes is a heap that serves
-  nothing.
+**The pool is owned entirely by the runtime.** Its word sits in a static of
+`sos.rt` with no typed way out. The program reaches it only through the heap
+and `share` (§5). Like every handle guarantee of `sos`, this holds in the
+typed layer: at the C altitude a program that guesses words could name the
+pool, and the kernel cannot tell a process's runtime from its program.
 
-The routing costs one range compare per free. Since start-up allocates
-nothing (§2), the built-in heap holds only the program's blocks.
+### 1.3 The built-in heap stays separate
 
-### 1.3 The kernel and root
+Two TLSFs, routed by address. The global allocator asks the default heap,
+which may grow, and then the built-in heap. A free compares the block with
+the arena's linker bounds and goes to the heap whose range holds it.
 
-- **The kernel** keeps its built-in heap and nothing else. It never
-  allocates at run time; its scripts keep placing the arena as now.
-- **Root** has no launcher, so nobody gives it pools. Its boot records carry
-  region ordinals (spec §12), never a reserved tag, so `BootSet` adopts
-  nothing for it. Root's heap is its built-in heap, as today.
+### 1.4 The kernel and root
 
-### 1.4 Who supplies the memory, and the authority
+The kernel keeps its built-in heap and never allocates at run time. Root has
+no launcher and so no pools; its records carry region ordinals, never a
+heap tag, and its heap is its built-in heap.
 
-The launcher, at launch, as boot records (revision 1's option A, which the
-owner's first answer confirms: "the launcher doesn't need an allocation
-seam"). For each declared heap the process holds a pool it may allocate
-from as read-write memory it can never execute (no `MapExecute`), give on
-(no `Transfer`) or narrow for anyone else (no `Mint`). The kernel's
-contract does not change: `Pool.available`, `allocate`, `map`,
-`Mapping.base` and handle release are spec §2.5 as built.
+### 1.5 Lifetimes
 
-**A heap's pool is the runtime's, used whole.** The owner's second answer
-allows processes to pass pools between them. A heap's pool is not one of
-those: the runtime allocates all of it before `main` and releases its
-handle, so nothing is left to pass. A process that wants a pool to share or
-give declares a `memory` record, which the stock root already gives as a
-pool (`tests/stock-server`), and manages it and its quotas itself. Q1 asks
-the owner to confirm.
+- **A heap is forever.** Its `Memory` and `Mapping` are the runtime's for
+  the process's life; nothing it grows into goes back. At teardown the
+  process's handles go and its domain is cleared (spec §2.10), the row's
+  count on the allocation drops, and its range returns to the pool.
+- **A share is an ordinary `Memory`.** Spec §2.5's refcount invariant
+  says it exactly: "a Mapping holds a reference to the physical pages (not
+  merely to a MemoryObject handle). The pages are freed only when the last
+  reference of either kind — any MemoryObject handle or any Mapping —
+  drops", and "The range returns to its pool at the second zero". `maps`
+  counts installed rows, so a row whose `Mapping` handle was released still
+  holds the bytes. So a share's range returns to the pool's free list when
+  its last handle and its last row are gone, in whichever process they
+  were.
+- **The pool** dies when its handle has gone (at teardown) and every share
+  has come home, which may be after the process has ended (spec §2.5, "What
+  holds a pool").
 
-### 1.5 Lifetime
+### 1.6 What a pool's bytes hold
 
-Spec §2.5, "What holds a pool": its handles and its outstanding bytes; when
-its last handle has gone and its last allocation has come home its slot
-frees, and a pool minted at boot has no pool above it, so its bytes go
-nowhere. The runtime releases the pool's handle once it has allocated from
-it, so the pool is held only by that allocation. The allocation is held by
-its grant row once its `Memory` handle is released (spec §2.5's refcount
-invariant), and the row goes when the process's domain is cleared at
-teardown (spec §2.10). So the pool dies at the process's death, the owner's
-fourth answer, by the kernel's rule with nothing added. No region goes back
-before then.
+`PoolOp.Allocate` writes none of the bytes it cuts (`pool_cut`), and spec
+§2.5 says nothing of an allocation's contents. So the runtime zeroes the
+control block's first word before it makes a heap, because
+`UnsafeHeap.ready()` trusts that word to read zero until the heap is made.
+`extend` writes every word it relies on. A share holds whatever its range
+last held: the board's power-on contents, or a share this process gave and
+got back. The heap never returns bytes, so no heap data reaches a share.
 
-## 2. Start-up allocates nothing
+## 2. The kernel: a pool's two ends, and growing in place
 
-### 2.1 The rule, and the case that holds it
+### 2.1 Allocating from the back
 
-Everything that runs before `main`, and before a `_start` package's own
-code can allocate, is allocation-free: SO-124's start-up (§2.3) and the
-`sos` calls a `_start` package makes to begin (`System(boot_handle:)`,
-`System.process_self`, `BootSet(process:)`). So a built-in heap of zero
-bytes is a real choice, and the heaps hold nothing the runtime put there.
+Today an allocation is the front of the first free range that holds it, and
+otherwise the front of the pool's unspent frontier (`pool_cut`, spec §2.5).
+A returned range coalesces with its free neighbours, and one that ends where
+the frontier begins folds into it (`pool_return`, `pool_fold_frontier`).
 
-**The case** (`start_no_heap`, on riscv32, arm64, riscv32-flat and the S3):
-a `_start` package linked with `ARENA_SIZE = 0` and given no heap record,
-but a System, an Event and a pool, adopts its System, derives its Process,
-drains its set, takes each record by tag, prints what it took (a `print`
-with `{}` arguments renders on the stack, `rt/common/src/lib.saw`), and
-exits clean. A `main` program with the same set does the same; it lands with
-SO-124 unit 2, which owns `sosmain`. A start-up step that allocates gets
-null, and std turns that into an `Err` the step reports or a panic, so the
-case fails at the step, by name.
+**`PoolOp.Allocate` gains a third argument, `from`.** It is today's unused
+third word, so the op's number and its other answers stay:
 
-**Its mutant:** put a `Vector` push back into the drain. The push answers
-`Err(AllocError)`, the drain answers `NoMemory`, and the package's drain
-fails: red.
+- **`0`, `Any`:** today's rule.
+- **`1`, `Front`:** the front of the frontier only. The allocation an
+  extendable `Memory` starts from (§2.2).
+- **`2`, `Back`:** the highest free range whose aligned run holds `len`,
+  cut from its top (last fit); and only when none does, the top of the
+  frontier. Cutting from a range's top shortens the range in place and needs
+  no free-list node.
+- **any other word** is the `BadArg` fault, as an unaccepted granularity is.
 
-### 2.2 The drain: fixed storage in `BootSet`
+`NoMemory` means what it means today: nothing the argument allows can serve
+`len`.
 
-`BootSet(process:)` grows two vectors today
-(`kernel/sysapi/src/bootset.saw`). Three ways to drain without allocating
-were weighed:
+**The frontier folds at both ends.** Bytes are now cut from both ends of
+the frontier, so a returned range may touch it from above as well as from
+below:
 
-- **Fixed storage bounded by the handle table** (recommended). Each boot
-  record is a handle in the process's own table: a give mints the child's
-  entry (spec §12), and the drain hands back its word. So the drain can
-  never answer more records than the table holds, `MAX_HANDLES`, which is 32
-  on every board (`hal/*/kernel/lib.saw`). `BootSet` keeps each record raw,
-  as the kernel's record is (`BOOT_HANDLE_RECORD_WORDS`, three words: tag,
-  kind, handle, `kernel/abi/src/boot.saw`), in an inline array of
-  `BOOT_SET_CAPACITY` records and a count: 384 bytes on a 32-bit profile,
-  768 on arm64. `take(tag)` wraps one record's word into a `BootHandle` (the
-  wrapping `boot_handle_into_frame` already does) and clears the word to
-  `NO_HANDLE`; dropping the set releases every word not taken.
-- **A builder-known bound** (the declaration's record count, carried as a
-  const generic `BootSet<N>`). Tighter, but `N` would ride in every
-  signature that names the set, and a package the runner builds, or a root,
-  has no declaration to take it from.
-- **Take by tag without draining.** The kernel keeps the records until they
-  are consumed (spec §12), so a `ProcessOp.BootHandleTake(tag)` would need
-  no storage at all. It is a kernel op and a spec change for what a fixed
-  array does in userspace.
+- a range that begins where the frontier ends extends it upward, as one
+  that ends where it begins extends it downward;
+- the fold then takes in a listed range touching the new bound;
+- `pool_fold_frontier`'s premise ("only the last node can touch the
+  frontier: bytes are cut from the front") becomes "the nodes just below
+  and just above the frontier".
 
-**The bound.** `BOOT_SET_CAPACITY` is published in `sosabi` as 32, and
-`kcore.limits` holds `hal.MAX_HANDLES <= BOOT_SET_CAPACITY` with a
-`static_assert`, so a board that raises its table raises the capacity with
-it. A drain that answers a record past the capacity is therefore
-unreachable; `BootSet` still refuses it by name, `sos: the boot set holds
-more than 32 records`, a panic, since it would mean a kernel built past the
-assert.
+**How freed shares are reused.** Shares freed out of order leave free
+ranges above the frontier. A `Back` allocation takes the highest one that
+holds it, so the back stays packed toward the pool's end. A freed range that
+touches the frontier folds back into it, where it serves either side again.
 
-**What changes for callers.** `len()` and `take(tag)` keep their meaning.
-`entries()` still answers a `Vector`, for a program that lists its set, and
-allocates as any program call may; an allocation-free `entry(at:)` sits
-beside it. A `BootEntry` gains the record's rights word, read with
-`INFO_OP` as the drain meets the record (one ungated call each), so a
-program can see what it was given, the records the runtime takes
-included. The set is a value of fixed size, moved into `main` once by
-SO-124's `take_boot_set`; the copy is the array's size.
+**Rights.** A `Front` cut is minted with `MemoryRight.Extend` if the pool
+handle carries the bit. An `Any` or `Back` cut never is: the bytes after a
+back allocation belong to the back, and an `Any` cut's need not be free.
+`available` does not change; its totals count the frontier once, whichever
+end is spent.
 
-### 2.3 What SO-124's start-up does before `main`
+`PoolOp` numbers 2 and 3 stay reserved for `Split` and `Revoke`; this adds
+no op.
 
-Each step of SO-124 §1.2, with what it allocates:
+### 2.2 Growing a `Memory` and its `Mapping` in place
 
-| Step | Allocates | How it goes away |
-|---|---|---|
-| 1. Re-entry guard and the thread register | nothing | — |
-| 2. Check and adopt the System handle (`INFO_OP`, `System(boot_handle:)`, its rights) | nothing; a refusal's panic text is formatted into std's fixed `StringBuilder` over the compiler's stack scratch (`std/stringbuilder.saw`: "caller storage, never grown") | — |
-| 3. Derive the Process handle and the main thread's own | nothing | — |
-| 4. Drain the boot set | two `Vector`s (the step's own text: "The drain allocates its two vectors from the arena's heap") | §2.2's fixed storage; the sentence goes |
-| 5. Give the console record to the write seam (`set.take(CONSOLE_TAG)`, `adopt_console`) | nothing: `take` reads the fixed storage, and `adopt_console` parks a word | — |
-| (new) Map the heaps (§3) | nothing: syscalls, `INFO_OP` and words on the stack | — |
-| 6. Publish the boot context (`Boot` in the frame, its parked address, the taken word) | nothing | — |
-| 8. Flush (`console_sync`'s `Sync`) and 9. exit, after `main` | nothing: the send record and the reply's record are on the stack (SO-124 §4.3) | — |
+**`MemoryOp.Extend(len)`** (op 1), on `MemoryRight.Extend` (bit 11, the
+next unassigned bit after `MapExecute`). A pool carries it for its
+allocations at the same bit, as it carries `Map`. `pool_rights()` mints it,
+because a bit not minted at boot never appears later. `memory_rights()`, a
+boot allocation's set, does not: a boot allocation has no pool to extend
+from. The answers, in order:
 
-The heap mapping happens inside `BootSet(process:)`, so SO-124's step 4
-gains it without a step of its own. SO-124 unit 2's tests gain the `main`
-half of `start_no_heap` and its mutant.
+- without `Extend`, the `AccessDenied` fault;
+- a `len` of zero, or one that is no whole number of the allocation's
+  granularity, the `BadArg` fault;
+- `NoMemory` unless the `len` bytes after the allocation are the front of
+  its pool's frontier: either another `Front` allocation or the back side
+  took them, or the pool has fewer free bytes there;
+- then the allocation's `len` grows, the frontier's front moves up, and the
+  pool's outstanding bytes grow by `len`.
 
-### 2.4 A built-in heap of zero
+No object is made and no quota is charged: bytes are the pool's ledger
+(spec §2.9). Rows already granting the allocation keep their own bounds.
 
-With no default heap either, the process has no heap: every global
-allocation answers null. A `Vector` push answers `Err(AllocError)` and the
-program carries on; a `String` built or extended panics in std's `String`
-layer with `String: allocation of N bytes (align A) failed`
-(`std/string.saw`), which ends the process `Faulted (Panic)` with that text.
-A `print` with `{}` arguments renders on the stack and still works. Such a
-process is legitimate (a driver that never allocates), so the builder
-refuses nothing for it.
+**`MappingOp.Grow(len)`** (op 2), on `MappingRight.Grow` (bit 10, after
+`Base`), which `mapping_rights()` mints. The answers, in order:
 
-## 3. Mapping the heaps before `main`
+- without `Grow`, the `AccessDenied` fault;
+- a husk (unmapped) the `BadState` fault, as `Unmap` answers it;
+- a device row, or a `len` that is zero or off the protection grain, the
+  `BadArg` fault;
+- a `Gone` target, `Revoked`;
+- `NoMemory` when the row's new top would pass its allocation's end. The
+  holder of a `Mapping` may not hold the `Memory` and cannot read its
+  bounds, so this is a status;
+- on a translating target, `NoResource` when the next addresses meet
+  another row or leave the grant window, as `map` answers;
+- then the row's top rises by `len` over the allocation's next bytes, and
+  the domain is reloaded if it is the installed one (spec §2.5's
+  live-domain rule).
 
-### 3.1 Where the records are
+The row is still one row, so the `Mapping` quota row does not move, and
+`maps` on the allocation does not change.
 
-The launcher gives each heap's pool under a reserved tag, `HEAP_TAG + slot`,
-slot 0 the default heap and slots 1 to `MAX_HEAPS - 1` the named ones, in
-any order among the other records; the stock root gives them after the
-declared records, beside SO-124's console record. `HEAP_TAG` is the
-reserved range's second tag (`0xFFFF_FF00` up, `CONSOLE_TAG` first,
-SO-124 §3.1). `MAX_HEAPS` is 4, a policy number: a static array of heap
-descriptors and locks in every process, raised when a process needs more.
+**`MemoryOp.Map` gains a third argument, `room`,** today's unused word: the
+address space to keep free above the row on a translating target.
 
-The constants live in `bootplan` beside `CONSOLE_TAG`, and `sos` gains
-`bootplan` as a dependency so the builder, the stock root and the runtime
-read one copy of the reserved range.
+- `free_user_va` treats a row's `[base, top + room)` as claimed, so a later
+  `map` is placed past the room.
+- `Grow` within the room cannot meet a row.
+- The room is recorded in the row (`GrantRow.room`) and shrinks as the row
+  grows.
+- On an identity target `room` is recorded as zero, since a row's addresses
+  are its bytes'.
+- A `room` off the grain is the `BadArg` fault; one that takes the row past
+  the window is `NoResource`.
+- The typed form is `Process.map(memory:access:room:)` with `room`
+  defaulting to zero, so every caller today is unchanged.
 
-### 3.2 When
+### 2.3 Per tier
 
-`BootSet(process:)` drains into its fixed storage (§2.2), then takes every
-record whose tag is a heap tag and maps it, then returns. The set's listing
-still names those records, taken, as it names the console's (SO-124 §3.2).
-So by the time a `_start` package holds its set, or a `main` program runs,
-every heap it was given is mapped, and nothing has allocated yet. Only one
-thread exists then: a `_start` package makes threads through handles it has
-not yet drained, and SO-124's start-up runs on the main thread alone.
+- **riscv32 (PMP).** A RAM row is a TOR pair (`prot_region`): a lower bound
+  and a top of any four-byte multiple. `Grow` moves the top and the domain
+  replays it. One numbered region whatever its size.
+- **arm64 (page tables).** `Grow` maps the next pages of the allocation at
+  the next virtual addresses. Both runs are contiguous, so the row stays one
+  `GrantRow` (base, top and physical base). `room` keeps the addresses
+  free. The 4 MiB window bounds a heap's reach.
+- **The S3 and riscv32-flat (Flat).** The row's top is recorded and
+  `prot_*` installs nothing, so no protection entry is spent at any size.
+  The grant record's row and the `Mapping` row are still counted.
 
-### 3.3 The steps, per heap
+### 2.4 The spec text
 
-With `pool` the record's handle, `slot` its slot, and `proc` the Process
-handle the drain was given:
+**Spec §2.5, `allocate`'s bullet,** after "Its answers, in the order they
+are decided":
 
-1. **Rights.** Read the pool's with `INFO_OP`: without
-   `PoolRight.Allocate`, panic `sos: heap SLOT's pool lacks Allocate`;
-   without `PoolRight.Map`, panic `sos: heap SLOT's pool lacks Map`. Read
-   `proc`'s: without `ProcessRight.Map`, panic `sos: the Process handle
-   lacks Map, so heap SLOT cannot be mapped`. `INFO_OP` is ungated and
-   answers at once.
-2. **Length.** `Pool.available(0)`. Its `largest` is the longest run an
-   `allocate` at the pool's grain could take, a whole number of units by
-   definition (spec §2.5). Zero leaves the heap empty (§3.4).
-3. **Allocate** `largest` at granularity zero. `NoMemory` (another holder
-   took the bytes between the two calls) leaves the heap empty; any other
-   refusal panics `sos: heap SLOT: allocate: DESCRIBE`.
-4. **The allocation's rights.** They are the pool's capped by the process's
-   `Memory` ceiling (`mint_capped`, `kernel/core/objects.saw`): without
-   `MemoryRight.Map`, panic `sos: heap SLOT's memory lacks Map (the Memory
-   ceiling)`.
-5. **Map** into `proc`, read and write. A refusal panics `sos: heap SLOT:
-   map: DESCRIBE`.
-6. **The mapping's rights,** capped by the `Mapping` ceiling: without
-   `MappingRight.Base`, panic `sos: heap SLOT's mapping lacks Base (the
-   Mapping ceiling)`.
-7. **Base.** `Mapping.base()`; a refusal panics `sos: heap SLOT: base:
-   DESCRIBE`.
-8. **Release** the Mapping, the Memory and the pool, in that order.
-9. **Install** `[base, base + largest)` as heap `slot`'s region, under that
-   heap's lock (`sosrt`'s public `adopt_heap(slot, base, len)`, which
-   panics `sos: heap SLOT was mapped twice` on a second call for one slot).
+> `allocate(len, granularity, from)`: `from` says where the bytes come from.
+> `Any` (0) is the rule below. `Front` (1) takes the front of the pool's
+> unspent frontier and nothing else. `Back` (2) takes the top of the
+> highest free range that holds `len`, and only when none does the top of
+> the frontier. Any other word is the `BadArg` fault. A `Front` allocation
+> is minted with `MemoryRight.Extend` when its pool handle carries it, and
+> no other allocation ever is.
 
-`DESCRIBE` is the status's printed form, which is its `describe()`
-(`kernel/abi/src/status.saw`): `QuotaExceeded` prints `this process is at
-its quota`, `NoResource` `no room for what was asked`. The texts are made in
-`sos`, which can name `SosStatus`; `sosrt`, which cannot, makes none. Each
-panic ends the process `Faulted (Panic)` through `PANIC_OP`.
+**Spec §2.5, "Where the bytes come from":** append
 
-Nothing here runs inside a heap's lock but step 9's store. The handles peak
-at two more than the records the process holds (the Memory and the
-Mapping) during steps 3 to 8 of one heap, and the heap's own record is gone
-after step 8.
+> A pool so has two ends: allocations from the front and from the back meet
+> in its frontier, and a returned range that touches the frontier from
+> either side folds into it.
 
-### 3.4 Which failures panic
+**Spec §2.5, the `Memory` section:** "one op, `Map`" becomes "two ops,
+`Map` and `Extend`", and after `map`'s bullets:
 
-The allocator's ABI forbids a panic on an allocation's failure, and every
-allocation's failure here is a null (§4). The mapping is not an allocation:
-it is the start-up taking what its launcher gave. Its failures split:
+> - **`extend(len)` grows an allocation in place.** It spends
+>   `MemoryRight.Extend` (bit 11, carried by a pool for its allocations) and
+>   takes the `len` bytes after the allocation from the front of its pool's
+>   frontier, answering `NoMemory` when they are not there. It makes no
+>   object and charges no quota; rows that grant the allocation keep their
+>   bounds. Only a `Front` allocation carries the right, and a boot
+>   allocation never does.
 
-- **"The pool has no bytes"** (step 2's zero, step 3's `NoMemory`) is the
-  plain no-memory case. The heap is left empty, its allocations answer null,
-  and the process starts. The builder makes every pool exactly its heap's
-  `len`, so only a hand-written launcher meets this.
-- **Every other failure panics,** by name: a missing right (each would
-  otherwise be a kernel fault with no text, as the review's t1 shows), the
-  `allocate`'s `QuotaExceeded` or `NoResource`, any `map` refusal, and a
-  `Base` refusal. Each is a launch or quota configuration the process cannot
-  run under, found before `main`.
+**Spec §2.5, `map`:** "`map(process, access)`" becomes "`map(process,
+access, room)`", with
 
-## 4. Choosing a heap, and what a refusal is
+> `room` is address space kept free above the row on a translating target,
+> for the row to grow into; it is recorded as zero on an identity target.
 
-### 4.1 The global allocator
+**Spec §2.5, the `Mapping` section:** "Two ops" becomes "Three ops", adding
 
-std's `GlobalAllocator` calls `__saw_rt_alloc` and `__saw_rt_dealloc`
-(`std/alloc.saw`), and everything that names no allocator goes there:
-`String`, `StringBuilder`'s growth, interpolation, `Vector<T>`, `Box<T>`,
-`Arc<T>`. `sosrt`'s seams serve it:
+> `Grow` (on `MappingRight.Grow`) raises the row's top over its
+> allocation's next bytes, which the allocation must already hold
+> (`NoMemory` otherwise), and on a translating target into its room or
+> other free addresses (`NoResource` otherwise). The row stays one row: the
+> quota and the allocation's row count do not change.
 
-- **alloc:** the default heap if mapped, else or then the built-in heap,
-  each under its own lock, never both held; null when neither serves.
-- **dealloc:** the built-in heap when the block lies in the arena's bounds,
-  otherwise the default heap; that heap's `holds` check, then today's `bad
-  free at ADDRESS` panic.
+**Spec §3's rights tables** gain the two bits; `pool_rights()` and
+`mapping_rights()` gain them.
 
-### 4.2 Named heaps: `sos.Heap<SLOT>`
+## 3. The runtime's heaps
 
-std's `Allocator` asks for a field-less struct with `init() -> Self`, built
-as `A()` at each call (`std/alloc.saw`), so a heap's identity rides in the
-type:
+### 3.1 Adoption
+
+After the drain, `BootSet(process:)` takes every record under a heap tag
+(`HEAP_TAG + slot`, slot 0 the default heap, 1 to `MAX_HEAPS - 1` named;
+`HEAP_TAG` the reserved range's second tag after `CONSOLE_TAG`, SO-124
+§3.1; `MAX_HEAPS` 4, a policy number; the constants in `bootplan`, on which
+`sos` depends) and adopts it:
+
+1. **The pool's rights,** read with `INFO_OP`: without `Allocate`, `Map`,
+   `Transfer` or `Extend`, panic `sos: heap SLOT's pool lacks RIGHT`.
+2. **The Process sibling,** once per process. Read the drain's Process
+   handle's rights; without `Mint`, panic `sos: the Process handle lacks
+   Mint, so no heap can be adopted`. Then mint a sibling with the keep mask
+   `ProcessRight.Map`. A mint is capped by the Process ceiling (spec §2.7),
+   so a sibling without `Map` panics `sos: the heaps' Process handle lacks
+   Map (the Process ceiling)`, and a refused mint panics `sos: no handle for
+   the heaps: DESCRIBE`.
+3. **The pool's length and grain.** Read with `Pool.available(0)`, while
+   nothing is taken: `total` is the pool's length, which sizes the class
+   table; the lowest bit of `granularities` is its grain, the growth step's
+   unit (§4).
+4. **Install** the descriptor under the heap's lock, with no region yet.
+
+`DESCRIBE` is the status's `describe()`. The texts are made in `sos`, and
+each panic ends the process `Faulted (Panic)`. These are the heaps' only
+panics. Each checks a right the launcher chose, before the program runs,
+which would otherwise be a kernel fault with no text.
+
+A heap maps nothing at adoption: a heap the program never allocates from
+spends no `Memory`, no `Mapping` and no slot, and all of its pool is for
+shares.
+
+### 3.2 The first growth
+
+The heap's first growth allocates `Front`, which on the runtime's own pool
+is always the pool's first bytes, whatever shares have taken from the back:
+
+1. **Allocate** the first size (§4) with `from = Front`.
+2. **Read the Memory's rights;** without `Map` or `Extend` (the `Memory`
+   ceiling), release it and refuse (`Rights`).
+3. **Map** read-write through the Process sibling, with `room` the pool's
+   length less the first size.
+4. **Read the Mapping's rights;** without `Grow` (the `Mapping` ceiling),
+   unmap, release and refuse (`Rights`). Then read `Base`.
+5. **Zero the control block's first word** (§1.6) and make the heap over
+   `[base, base + size)`.
+
+The runtime keeps the Memory and the Mapping for the process's life.
+
+### 3.3 Every later growth
+
+1. `Memory.extend(n)`. `NoMemory` refuses (`Spent`): the back side or the
+   pool's end is at the heap's front.
+2. `Mapping.grow(n)`. A refusal here, which the room makes unreachable on
+   arm64 and which the identity tiers never answer, leaves the `Memory`
+   longer than its row. The heap still serves only from its row, so it is
+   refused (`Rights` or `Spent`, the status saying which) and the bytes stay
+   the heap's, unused.
+3. `heap.extend(base + new_size)`: the old sentinel's header becomes a
+   free block's over the new bytes, merged with a free block before it
+   (`PREV_FREE`), with a new sentinel at the new end. Constant time.
+
+All of it runs inside the heap's lock, as every op it makes answers at once
+or faults the process inside the kernel. None suspends and none allocates.
+The code is check-free Saw over the floor's raw calls, behind a per-side hook
+`sos_rt_grow(slot, need, ...)` that the kernel answers "no".
+
+### 3.4 `heap.saw`
+
+The heap stays one region. It gains:
+
+- **`largest`:** the class table is sized for the pool's length, so no
+  block a growth makes outgrows it;
+- **`extend(new_end)`:** as in §3.3 step 3, the region's `size` rising with
+  it, so `holds` checks against the current end with no other change.
+
+### 3.5 The front never moves down
+
+The heap's front only rises. Once it meets the back's lowest live
+allocation, the heap is spent, and it stays spent while that allocation
+lives. A share freed higher up returns to the free list, where `Back`
+allocations reuse it, but the heap never can: it grows only into the bytes
+directly above its front. When the lowest share itself comes home, its
+range folds into the frontier (§2.1), and the heap can grow again. This is
+a known property of the shape, not a problem to solve. A product that
+shares a lot sizes the pool for the heap's peak and the shares together.
+
+### 3.6 Why a growth was refused
+
+A refusal is a null, so each heap records its reason:
+
+```saw
+let info = Heap<DATA>().info()  // HeapInfo
+```
+
+`HeapInfo` carries:
+
+- the heap's size and its pool's length;
+- the last refusal: a `HeapRefusal` of `Never`, `Spent`,
+  `Quota(QuotaKind)`, `NoResource` or `Rights`.
+
+The cases assert it (§10).
+
+## 4. The growth step, per board
+
+### 4.1 The rule, and where its numbers come from
+
+A growth takes the request's need (its block, plus the region's overhead
+the first time), rounded up to the pool's grain, and at least
+`MIN_GROWTH`. `MIN_GROWTH` is 1 KiB or one grain, whichever is larger.
+The first growth is at least the control block and one block. The grain is
+the pool's own: the lowest bit of `available`'s `granularities`
+(spec §2.5).
+
+- **arm64:** a page (4 KiB), so a growth takes whole pages, at least one.
+- **riscv32:** four bytes, so a growth takes at least 1 KiB.
+- **The S3:** four bytes, at least 1 KiB.
+
+Nothing needs a board fact: the kernel already answers the grain, and
+`rt/common` stays arch-free with no number of its own. `MIN_GROWTH` keeps a
+program that allocates in small steps from making a syscall pair per
+allocation; it costs at most 1 KiB of the pool to the heap that the shares
+could have had.
+
+### 4.2 Doubling on riscv32: weighed, not recommended
+
+The owner asked whether riscv32's heap could keep doubling, so that its slot
+is a NAPOT region. A NAPOT row is a power-of-two size on a base aligned to
+it.
+
+- **What it demands of placement.** The heap's base, the pool's front, must
+  be aligned to the largest size the heap can reach: the largest power of
+  two not above the pool's `len`, since the heap never outgrows its pool.
+  The builder would derive that alignment from `len` and place the pool
+  row on it, refusing by name a range that cannot place it ("the pool of
+  heap `data` of `logger` needs a base aligned to 0x4_0000, which range
+  `sram` cannot place"). No `align` key: `len` is always declared, so the
+  maximum is always known, and a second number would only have to agree
+  with the first.
+- **How the last doubling ends.** A doubling takes as many bytes as the
+  heap already holds. So the heap stops at the largest power of two that
+  fits below the back side's lowest allocation, or the pool's end. The bytes
+  between that and the back side are never the heap's; they stay for
+  shares. A heap may use only a little over half of what its pool could
+  give it.
+- **What it would save:** nothing on this HAL. `prot_device` puts a NAPOT
+  entry in "the pair's high one, where `prot_region` puts a TOR region's
+  permissions, and the pair's low entry stays disabled": a NAPOT row spends
+  the same numbered region, one of `GRANT_ROW_BUDGET`'s 8, as a TOR pair
+  does (`hal/riscv32-common/kernel/lib.saw`). The budget is counted in
+  pairs, so it would not rise.
+- **TOR** takes any size, grows by the grain, wastes nothing and needs no
+  alignment beyond the grain. It costs the same one region on this HAL.
+
+**Recommendation: TOR**, as RAM rows are today (Q1). Doubling becomes worth
+its alignment and its waste only if the HAL packs NAPOT rows one entry each
+and the budget counts entries. That is a HAL change of its own, and with it:
+
+- a board fact `heap-growth = "double"` in `board.toml`, held by `sosimage
+  board` to a HAL constant compiled as its other numbers are;
+- the runtime told through a link symbol in every script that links
+  `support.c` (the user scripts, the four kernel scripts, and the eight
+  test scripts the review's t3 lists);
+- the builder's alignment rule above.
+
+## 5. Choosing a heap, sharing, and refusals
+
+### 5.1 The global allocator
+
+- **alloc:** the default heap if adopted, growing as it needs; then the
+  built-in heap. Each step holds one lock and gives it back before the
+  next. The answer is null when neither serves.
+- **dealloc:** to the built-in heap when the block lies in the arena's
+  bounds, otherwise to the default heap. A bad free panics, after the lock
+  is given back, with `bad free at ADDRESS`.
+
+### 5.2 Named heaps: `sos.Heap<SLOT>`
 
 ```saw
 public struct Heap<const SLOT: Int> {}
+// static_assert(SLOT >= 0 && SLOT < MAX_HEAPS), checked per instance
 
-extension Heap<SLOT>: Allocator {
-    public func alloc(&self, size: Int, align: Int) unsafe -> UnsafePointer<Int8>?
-    public func dealloc(&self, ptr: UnsafePointer<Int8>, size: Int, align: Int) unsafe
+extension Heap<SLOT>: Allocator { ... }
+extension Heap<SLOT> {
+    public func share(&self, len: UInt) -> Result<Memory, SosStatus>
+    public func info(&self) -> HeapInfo
 }
 ```
-
-A program names its heap by the slot its declaration gives it, as it names
-a boot record by its declared tag:
 
 ```saw
 import sos.{Heap}
@@ -376,74 +548,118 @@ var log = Vector<UInt8, Heap<DATA>>()
 try log.push(byte) catch { drop_oldest(&var log) }
 ```
 
-- **What the pin offers.** `Vector<T, A>`, `Box<T, A>`, `Map<K, V, A>` and
-  `Set<T, A>` take an allocator parameter, `GlobalAllocator` by default. A
-  const generic argument may be a named constant (`LANGUAGE_SPEC.md`, "Const
-  generics"). One probe at the pin, `sawc mono --check` on a hosted file
-  that declares `Heap<const SLOT: Int>` as above and instantiates
-  `Vector<UInt8, Heap<DATA>>` and `Box<Int, Heap<DATA>>` with `static DATA:
-  Int = 1`, passed.
-- **A named heap's null** is an `Err(AllocError)` to the program with the
-  container unchanged, so a log that fills its heap drops old entries.
-- **A slot the process was not given** is a heap with no region: it answers
-  null, as an empty heap does. The builder gives every declared slot (§5.2),
-  so the null means a hand-written launcher left one out.
-- `Heap<0>` names the default heap without the built-in fallback.
-- **A block freed through the wrong allocator** reaches the heap its
-  allocator or its address names, whose `holds` refuses it: `bad free at
-  ADDRESS`.
+- **What the pin offers.**
+  - `Vector<T, A>`, `Box<T, A>`, `Map<K, V, A>` and `Set<T, A>` take an
+    allocator parameter.
+  - A const generic argument may be a named constant.
+  - One `sawc mono --check` probe at the pin, declaring `Heap<const SLOT:
+    Int>` and instantiating `Vector<UInt8, Heap<DATA>>` and `Box<Int,
+    Heap<DATA>>`, passed.
+- **A slot outside `0 .. MAX_HEAPS - 1`** fails to build at the
+  `static_assert`, naming the bound.
+- **A slot in range that was not given** is a heap with no pool. It answers
+  null, and its `info()` reads `Spent` with a length of zero.
+- **`Heap<0>`** is the default heap without the built-in fallback.
+- **A block freed through the wrong allocator** is refused by the heap that
+  receives it: `bad free at ADDRESS`.
 
-### 4.3 The allocator ABI's constraints
+### 5.3 Sharing
 
-- **A failure answers null,** and nothing in any heap's seam panics, aborts
-  or blocks on one (§3.4, §4.1, §4.2). A bad free is not a failure to
-  allocate: it panics, by the owner's ruling, after the lock is given back.
-- **Alignment up to 4096** is honoured by every heap, as phase 1's TLSF
-  honours any alignment. A heap too small to hold a block at the alignment
-  asked answers null.
-- **`dealloc`'s size and alignment** are not read: each block's header
-  holds its size, and the heap is chosen by the block's address (§4.1) or
-  by its allocator (§4.2).
-- **Any thread frees any block:** each heap's lock serializes its callers,
-  whichever thread allocated.
-- **Nothing inside the allocator allocates or suspends:** each window holds
-  the heap's check-free calls and nothing else, and no syscall runs in any
-  window (the mapping is before `main`, §3).
+`Heap<SLOT>().share(len:)` allocates `len` bytes from the heap's pool with
+`from = Back`.
 
-### 4.4 What needs sawlang
+- **`len` must be a whole number of the pool's grain.** An off-grain `len`
+  answers `NoResource` without asking the kernel, which would fault it
+  `BadArg`.
+- **Its rights** are `Transfer | Map` at most: the pool's carried bits
+  without `Extend`, which a `Back` cut never carries, capped by the
+  `Memory` ceiling.
+  - The program may map it into itself, give it
+    (`Process.give(memory:tag:keep:)`, narrowing the receiver's copy), or
+    send it in a message.
+  - It may not map it executable or mint siblings of it: one share reaches
+    one other holder at a time. To keep a view and give one, the program
+    maps the share, then gives the handle; its row keeps its view.
+- **It competes with the heap** for the middle of the pool. A share the
+  pool cannot serve answers `NoMemory`; a heap that cannot grow answers
+  null with `Spent`.
+- **It costs the caller** a `Memory` row while it lives (creator-pays,
+  spec §2.9) and a `Handle` row while it holds the handle. A share over the
+  `Memory` row answers `QuotaExceeded`. Those counts are the program's to
+  manage.
+- **It goes home** under spec §2.5's refcount invariant (§1.5), and a later
+  share reuses its range from the free list (§2.1).
+- **Share-only:** a heap the program never allocates from maps nothing, so
+  all of its pool is for shares. No key says so. The default heap cannot be
+  share-only, since the global allocator uses it.
 
-- **`String` and `StringBuilder` take no allocator** (`std/string.saw`'s
-  `String` has no parameter, and `StringBuilder` grows through
-  `GlobalAllocator`, `std/stringbuilder.saw`), so text cannot live in a
-  named heap, and interpolation always uses the global allocator. A log held
-  as `Vector<UInt8, Heap<DATA>>` works today; one held as `String` does not.
-- **`Arc` takes no allocator,** so shared ownership is global-only.
+### 5.4 Which refusals panic
 
-**The ask for the sawlang lead:** an allocator parameter on `String` and
-`StringBuilder` (`String<A: Allocator = GlobalAllocator>`, as `Vector` has
-it), with formatting into a `StringBuilder<A>`, so `"{}"` can render into a
-named heap; and the same parameter on `Arc<T, A>`. Nothing here waits on it.
+| Path | A refusal |
+|---|---|
+| `__saw_rt_alloc`, `Heap<SLOT>.alloc`, a growth inside either | null, its reason in `info()` |
+| `share` | `Err(NoMemory)`, `Err(QuotaExceeded)`, `Err(NoResource)` |
+| a bad free | a panic, `bad free at ADDRESS` (the owner's ruling) |
+| adoption (§3.1) | a panic per missing right or refused mint, before the program runs |
+| `Heap<N>` past the table | a build error |
 
-## 5. Declaring heaps, and limits
+With no heap at all (a zero built-in heap and no default heap), every global
+allocation is null. What the program sees then depends on who allocated:
 
-### 5.1 The syntax
+- an operation with an error channel answers `Err(AllocError)`;
+- an interpolation panics `try! failed: allocation of N bytes (align 1)
+  failed`;
+- `String`'s own operations panic `String: allocation of N bytes (align A)
+  failed`;
+- the other no-channel places panic with their own texts (sawlang's spec,
+  "Where a refusal still panics").
 
-One name per kind: `arena` is the built-in heap everywhere it appears (its
-`.bss` region and its linker symbols already say so), and `heap` is a pool
-heap everywhere. A size is `len`, as every range's and pool's is.
+A `main` that returns `Err` with no heap panics too, since the program entry
+renders the `Err` through the global allocator unless the compile has
+`--no-hidden-alloc` (sawlang's `runtime/ABI.md`, "The program entry"). The
+4 KiB default heap avoids it; SO-124's unit 2 holds the heapless case.
+
+### 5.5 The allocator ABI
+
+- **A failure answers null.** No heap's seam panics, aborts or blocks on
+  one.
+- **Alignment up to 4096** is honoured. A heap answers null when it cannot
+  place a block so aligned, after growing.
+- **`dealloc`'s size and alignment** are not read: the block's header holds
+  its size, and the heap is chosen by allocator or address.
+- **Any thread frees any block,** under each heap's lock.
+- **Nothing in the allocator allocates or suspends.** A window holds
+  check-free calls and, while it grows, syscalls that answer at once.
+
+### 5.6 What needs sawlang
+
+`String`, `StringBuilder` and `Arc` take no allocator parameter. The ask is
+`String<A: Allocator = GlobalAllocator>`, formatting into a
+`StringBuilder<A>`, and `Arc<T, A>`.
+
+## 6. Declaring heaps, and limits
+
+### 6.1 The syntax
+
+The naming rule:
+
+- **`arena`** is the built-in heap.
+- **`heap`** is a pool heap.
+- **`len`** is a pool's size.
+- **`slot`** is the program's number for a named heap.
 
 The declaration (`process.toml`):
 
 ```toml
 format = 1
-arena = 0x800                 # optional: the built-in heap; 0 for none
+arena = 0x2000                # optional: the built-in heap
 
-[heap.default]                # optional: the global allocator's pool
-len = 0x8000
+[heap.default]                # optional: the global allocator's heap
+len = 0x2_0000                # the pool: the heap and its shares together
 ram = "fast"                  # optional: it must be fast memory
 
-[heap.data]                   # optional: a named heap
-slot = 1                      # Heap<1> in the program
+[heap.data]                   # a named heap
+slot = 1
 len = 0x4_0000
 ```
 
@@ -451,11 +667,9 @@ The image:
 
 ```toml
 [image]
-name = "logger"
-board = "esp32s3-r8"
-arena = 0x400                 # optional: every process's built-in heap,
+arena = 0x1000                # optional: every process's built-in heap,
                               # unless its declaration states its own
-heap-ram = "sram"             # optional: where every heap comes from
+heap-ram = "sram"             # optional: where every heap's pool comes from
 
 [[process]]
 name = "logger"
@@ -463,375 +677,405 @@ package = "sawos:drivers/logger"
 heap-ram = { data = "psram" } # optional: one heap's range, by its name
 ```
 
-The board (`board.toml`) states, per RAM range, whether word atomics are
-known to work there:
+A board range states whether word atomics work there (`atomics = true` in
+its `[ram.NAME]`).
 
-```toml
-[ram.sram]
-use = "process"
-speed = "fast"
-atomics = true
-base = 0x3FCB_0000
-len = 0x4_0000
-```
-
-- **A built-in heap's size:** the declaration's `arena`, else the image's
-  `[image] arena`, else what the package's script provides (the user
-  scripts' `PROVIDE(ARENA_SIZE = 64K)`, or a package's own). The builder
-  writes it as `ARENA_SIZE` in the process's script, as it writes a
-  declaration's `arena` now (`process_script`). Zero links no arena.
-- **A heap's range:** the process's `heap-ram` entry for that heap, else the
+- **`arena` becomes optional in a declaration.** Today `Declaration.read`
+  requires it (`size`, not `optional_size`), and every `process.toml` in
+  the tree states one. The built-in heap's size is the declaration's
+  `arena`, else `[image] arena`, else 4 KiB, written as `ARENA_SIZE` in the
+  process's script. If SO-142.p3 makes the key optional, this order stands;
+  otherwise unit 6 makes it so.
+- **A pool's range:** the process's `heap-ram` entry for the heap, else the
   image's `heap-ram`, else the board's `[ram.default] pool`.
+- **No growth keys.** The step is the pool's grain (§4.1), and a heap maps
+  nothing until it is used, so there is no up-front size to declare.
 
-### 5.2 What the builder checks
+### 6.2 What the builder checks
 
-Refused by name, in the declaration reader and against the board:
+In the declaration reader:
 
-- a heap name that is no Saw identifier; a `slot` on `default`; a named heap
-  without a `slot`, or with a slot of 0 or of `MAX_HEAPS` or more; one slot
-  given twice;
-- a `len` the board's word cannot hold, or that is no whole number of the
-  board's protection grain (a pool serves whole grains, spec §2.5);
-- a `len` too small for the heap's control block and one block, computed
-  from the board's word as `ready()` computes it;
-- a `ram` other than `fast` (the existing rule, now also on a heap);
-- a declared `[[boot]]` tag in the reserved range (SO-124 §3.1).
+- a heap name that is no Saw identifier;
+- a `slot` on `default`; a named heap without a `slot`, with a slot of 0
+  or of `MAX_HEAPS` or more, or with a slot given twice;
+- a `ram` other than `fast`;
+- a declared `[[boot]]` tag in the reserved range.
 
-In the image and the plan:
+Where the image is read or planned, with the board's grain. `board.toml`
+carries no grain, so `Declaration.check_against` cannot make these checks:
 
-- a `heap-ram` entry naming no heap of the process's declaration, or a range
-  that is not a process range of the board;
-- a heap whose range is not fast, for a heap that declares `ram = "fast"`;
-- **the atomics fact:** a heap whose range does not state `atomics = true`.
-  The gate boards' process ranges and the S3's SRAM state it (riscv32 and
-  arm64 under QEMU have atomic instructions; `ABI.md` §8 shows `s32c1i` at
-  a DRAM address on the S3, on silicon). A range that says nothing is
-  refused, so the S3's PSRAM takes no heap until a board stage shows
-  `s32c1i` there (§7.3);
-- on arm64, a process whose region and heaps together pass the grant
-  window: a child links 2 MiB into the 4 MiB window (spec §5b.1) and each
-  heap is mapped above the image region, so the region plus every heap's
-  `len` must fit in the 2 MiB above it (the review's t9);
-- the rows the heaps spend, each held where the plan holds the child's rows
-  (`check_child`, `tools/sosimage/src/plan.saw`):
-  - **`Handle`:** the floor `check_child` holds, as SO-124 raises it (the
-    console record and a `main` program's thread handle, SO-124 §3.1), plus
-    one per heap record and two for the Memory and Mapping handles a mapping
-    holds while it runs (§3.3);
-  - **`Memory`:** at least one per heap, since each allocation stays charged
-    for the process's life;
-  - **`Mapping`:** at least the windows plus one per heap (the floor already
-    assumes each window is mapped); the kernel clamps the row to the grant
-    rows the domain has left (spec §2.9);
-- an image whose Memory slab cannot hold the boot rows (the heap pools
-  among them) and one allocation per heap (`check_plan`'s
-  objects-of-a-kind check).
+- a `len` the word cannot hold, or that is no whole number of the grain;
+- a `len` below the heap's first growth: its control block, sized for
+  `len`, and one block;
+- a `heap-ram` entry naming no heap of the declaration, or a range that is
+  not a process range;
+- a pool in a range that is not fast, for a heap that declares
+  `ram = "fast"`;
+- **the atomics fact:** a pool in a range without `atomics = true`. The
+  gate boards' process ranges and the S3's SRAM state it: riscv32 and arm64
+  under QEMU have atomic instructions, and `ABI.md` §8 shows `s32c1i` at a
+  DRAM address on silicon. The S3's PSRAM states it only after a board stage
+  shows `s32c1i` there.
+- **arm64's window:** a child links 2 MiB into the 4 MiB grant window, and
+  every row with its room lies above the image region. So the process's
+  region plus every heap's `len` must fit in the 2 MiB above it.
 
-The plan gives each heap's pool as a new `Source.Heap`: the pool row
-`from`, given with the keep mask `PoolRight.Allocate | PoolRight.Map`
-(`Process.give(pool:tag:keep:)`), after the declared records. The pools are
-rows of the region table like every image pool (spec §12), one per declared
-heap, each placed in its range.
+The rows, held where `check_child` holds a child's, with `H` the number of
+heaps:
 
-### 5.3 What a refusal looks like
+- **`Mapping`:** at least the windows plus `H`. This is a new lower bound;
+  `check_child` holds only the upper one today. A heap holds one row
+  whatever its size, so on riscv32 the 4 regions an image leaves are shared
+  by windows and heaps.
+- **`Memory`:** at least `H`.
+- **`Handle`:** the floor `check_child` holds as SO-124 raises it, plus
+  three per heap (its pool, its `Memory`, its `Mapping`, all kept) and one
+  for the Process sibling.
+- **The image's Memory slab:** besides the boot rows, which `limits.saw`
+  already counts (the heap pools among them), one slot per heap. This is new
+  plumbing: `check_plan`'s objects-of-a-kind walk counts Process, IoMemory,
+  Pipe and Interrupt objects only.
+- **Root's handle table at boot:** each heap's pool is a boot row root
+  holds until it gives it, and root's step count meets it as it meets every
+  pool row.
 
-| Cause | What the program sees |
-|---|---|
-| Any heap spent, a process with no heap, a slot not given, a pool with no bytes | null: `Err(AllocError)` from `Vector`, `Box`, `Map`, `Set`; std's `String` layer panics, `String: allocation of N bytes (align A) failed`, `Faulted (Panic)` |
-| A bad free in any heap | `bad free at ADDRESS`, a panic (today's) |
-| A mapping refusal other than "no bytes" | the start-up's named panic of §3.3, `Faulted (Panic)`, before `main` |
-| More boot records than `BOOT_SET_CAPACITY` (unreachable, §2.2) | `sos: the boot set holds more than 32 records`, a panic |
+Shares are not budgeted: their bytes compete with the heap inside the
+declared `len`, and their rows are the program's.
 
-A `Faulted (Panic)` end reads `ended status=131086` in the stock root's
-report and stops the machine with 64 in root (SO-124 §4.4).
+The plan gives each heap's pool as `Source.Heap`: the pool row `from`,
+after the declared records, with the keep mask `PoolRight.Allocate | Map |
+Transfer | Extend`.
 
-## 6. Locks and threads
+## 7. Locks and threads
 
-- **One `SpinLock` per heap:** the built-in heap's (`ARENA`, as today) and
-  one per slot. The global allocator takes the default heap's lock, and on
-  a null gives it back before it takes the built-in heap's; it never holds
-  two. `Heap<SLOT>` takes its slot's alone.
-- **The panic path stays off every lock.** Each window holds only the
-  heap's check-free calls, as `ARENA`'s does now; a bad free panics after
-  the lock is given back; the start-up's panics are raised while no heap
-  lock is held.
-- **Each heap's descriptor is written once,** before `main`, on the only
-  thread (§3.2), under its lock, and read under it after.
-- **Two threads on one heap** contend as two threads on the arena do now;
-  the hazard `ARENA`'s doc states (a spinner above a preempted holder under
-  fixed priorities) applies to each lock, and no lock is held across a
-  syscall.
-- **Two threads on two heaps** never contend: a data heap filled by a
-  logging thread does not slow the global allocator.
+- **One `SpinLock` per heap:** the built-in heap's (`ARENA`), and one per
+  slot. No path holds two.
+- **The panic path stays off every lock.** Windows hold check-free calls; a
+  bad free panics after the release; adoption's panics are raised with no
+  heap lock held.
+- **The lock is what the table's safety rests on,** not a single thread. A
+  `_start` package can make threads before it drains (`tests/arena-race`
+  never drains) and may drain late. So adoption stores each descriptor under
+  its lock, a growth runs under it, and the routing reads only the arena's
+  fixed bounds. In a SO-124 `main` program adoption also runs on the only
+  thread.
+- **A growth holds its heap's lock across a few syscalls** that answer at
+  once. A spinner meanwhile spins as it does while a holder is preempted,
+  and the hazard `ARENA`'s doc states applies to each lock.
+- **`share` takes no heap lock:** the pool's ops are the kernel's and
+  atomic, and the heap's front and a share's back are cut by the kernel
+  from the one frontier.
+- **Two heaps never contend.**
 
-## 7. Boards
+## 8. Boards
 
-### 7.1 The isolated tiers
+- **riscv32 (`virt`, PMP).** One TOR region per heap, whose top rises with
+  each growth (§2.3). An image leaves 4 regions for windows and heaps.
+- **arm64 (`virt`, MMU).** One row per heap. Its `room` keeps the next
+  addresses free, and growth takes whole pages. The window's bound is the
+  builder's.
+- **riscv32-flat and the S3 (Flat).** One recorded row, no protection
+  entry, and growth at the grain. The process could reach a pool's bytes
+  unmapped, but no op says where they are. No heap case asserts a hardware
+  denial, so the flat profile excludes none.
+- **The S3's PSRAM.** From SO-102:
+  - PSRAM at `0x3D00_0000`, 8 MiB, through the cache MMU, on a board
+    `esp32s3-r8` with a slow process range `[ram.psram]`, once SO-102's
+    units C and D land;
+  - no `atomics = true` there until a board stage shows `s32c1i` on a PSRAM
+    address under the ROM's `ATOMCTL`;
+  - the copy doors read a buffer there with interrupts masked, a serial
+    transfer per cache miss, measured in unit 7.
 
-- **riscv32 (`virt`, PMP).** Each heap's allocation is mapped at its own
-  address, inside its pool's row, apart from every process region, and is
-  one more PMP region in the process's set. The budget is 8 rows and an
-  image spends 4, so a process has 4 for its windows and heaps together.
-- **arm64 (`virt`, MMU).** Each heap is placed by the kernel above the
-  image region in the 4 MiB grant window; a pool serves whole pages, so
-  every heap's `len` is a page multiple (§5.2's grain check), and the
-  window's bound is the builder's (§5.2).
-- **Both** enforce the access: each heap's row is read-write and not
-  executable, and the keep mask means no other row over the same bytes can
-  be.
-
-### 7.2 The Flat tier
-
-riscv32-flat and the S3 run the same code. `map` is "trivially true" there
-and its row is recorded and counted (spec §5b.1). The process could reach a
-pool's bytes without mapping them, but no op tells it where they are
-(spec §2.5): `Mapping.base()` is the only answer. No heap case asserts a
-hardware denial, so the flat profile excludes none of them.
-
-On the S3 every process range today is the internal SRAM (256 KiB,
-`hal/xtensa-esp32s3/board.toml`), shared by every process region and pool,
-so a heap there costs the same bytes a built-in heap would. Two heaps pay
-off with the PSRAM.
-
-### 7.3 The S3's PSRAM
-
-Assumed from SO-102 (its issue and `ABI.md` §16, which builds the command
-layer only): PSRAM at `0x3D00_0000`, 8 MiB, through the cache MMU, on a
-board `esp32s3-r8` whose description names it as a slow process range
-(`[ram.psram]`) once SO-102's units C (the map and read-back) and D (process
-memory in PSRAM) land.
-
-- **Atomics.** `ABI.md` §8 probes `s32c1i` on DRAM and IRAM only, and SO-102
-  lists atomics on PSRAM as unverified. A heap's blocks hold whatever the
-  program puts there, `Atomic` words included, so the range carries no
-  `atomics = true` until a board stage shows `s32c1i` works on a PSRAM
-  address under the ROM's `ATOMCTL`; until then the builder refuses a heap
-  there.
-- **Masked latency.** A buffer in a heap can be handed to a syscall, and the
-  copy doors read it with interrupts masked; in PSRAM each cache miss is a
-  serial transfer. Unit 5 measures it on the part.
-- **The owner's example** (operating memory in SRAM, logs and other
-  generated data in PSRAM) is `[image] heap-ram = "sram"` with the logging
+  The owner's example is `[image] heap-ram = "sram"` with the logging
   process's `heap-ram = { data = "psram" }`.
 
-## 8. Migration
+## 9. Migration and spec text
 
-No existing process changes. Each keeps its built-in heap, sized as now:
-the stock root and every root package by their scripts, the harness's
-children by the user scripts' default or their own scripts, and the
-declared processes (`drivers/`, `tests/stock-*`, the product template) by
-their declarations' `arena`. A process gains pool heaps by declaring them.
+**No existing process changes.**
 
-- **Transcripts** move only where a case is added. Every image that links
-  `sos` moves with the drain's storage, and every image that links `sosrt`
-  with the heap table.
-- **`uart_service_ns16550`'s byte-for-byte check** (`FROM_FILES`) holds
-  while its description declares no heap. A heap added to it later needs the
-  runner's case to give the same pool rows and records, or the two ELFs
-  differ.
+- Each process keeps its built-in heap, at the 4 KiB default once
+  SO-142.p3 has migrated the tree, or at its declared size.
+- `map`'s new argument defaults to zero, and `Allocate`'s third word was
+  zero already, so every caller keeps today's behaviour.
+- Every image that links `sosrt` or the kernel moves. No transcript moves
+  but the new cases' rows.
 
-## 9. The spec text
+**The runtime's spec text,** beside §2.4's kernel text:
 
-The kernel's contract does not change. Three paragraphs describe the
-runtime's use of it; the owner reads them with the design.
+**Spec §5c, the paragraph "Where the floor is":**
 
-**Spec §5c, the paragraph "Where the floor is", after "panics through the
-ordinary panic path, naming the address; one it cannot tell corrupts the
-heap.":**
+> A process may also have heaps over pools its launcher gives it, which the
+> runtime holds for the process's life: a default heap, which serves the
+> global allocator ahead of the arena, and named heaps a program allocates
+> from explicitly. A heap grows up from its pool's front, one allocation and
+> one row extended in place, and never gives memory back; the program takes
+> shareable memory from the pool's back. A heap that cannot grow answers
+> null. The runtime allocates nothing before the program runs.
 
-> A process may also have heaps from pools its launcher gives it: a default
-> heap, which serves the global allocator ahead of the arena, and named
-> heaps a program allocates from explicitly. The runtime maps each whole
-> before the program runs, and allocates nothing itself before then. A
-> heap that cannot serve a request answers null.
-
-**Spec §12, the launch convention, after "It gives windows, lines and
-endpoints as capabilities":**
+**Spec §12, the launch convention:**
 
 > A process that declares heaps gets one pool for each, under the runtime's
-> heap tags, given with `PoolRight.Allocate | PoolRight.Map` and nothing
-> else.
-
-**Spec §11:** a heap's memory is the process's until it ends, and a heap
-in the S3's PSRAM waits on atomics being shown to work there.
+> heap tags, given with `PoolRight.Allocate | Map | Transfer | Extend` and
+> nothing else.
 
 ## 10. Units of work, in order
 
 Each unit is one patch, gated by `make sos-test sos-smoke-esp32s3`; the
 ESP32-C3 builds nothing now. Each lists its mutants, the review standard:
-every check and refusal goes red when removed or inverted.
+every check and refusal goes red when removed or inverted, or is named
+equivalent with the reason.
 
-**Unit 1: the allocation-free drain** (`kernel/sysapi/src/bootset.saw`,
-`kernel/abi`, `kcore.limits`). Needs nothing. `BOOT_SET_CAPACITY` and its
-assert; `BootSet`'s fixed storage, `take`, `entry(at:)`, the release of
-untaken words, the capacity's panic. Transcripts hold; images that drain
-move. Its tests:
+**Unit 1: the allocation-free drain.** Merged (`be9c9bd9`).
 
-- `start_no_heap` (§2.1), the `_start` half, on riscv32, arm64,
-  riscv32-flat and the S3;
-- every case that drains a boot set, unchanged (the stock-root images,
-  `uart_service_ns16550`, the drivers);
-- untaken records released: a child that takes one of three records reads
-  its `Handle` row before and after dropping the set, two fewer after.
+**Unit 2 (kernel): a pool's two ends.** Needs nothing.
 
-Mutants: a `Vector` push in the drain (`start_no_heap` red, §2.1); the
-release of untaken words dropped (the `Handle` row reads the same); `take`
-not clearing its word (a record taken twice: the second take answers a
-handle, where the case wants `None`).
+- The changes:
+  - `Allocate`'s `from`;
+  - the last-fit cut from a range's top and the frontier's top;
+  - the frontier's fold at both ends;
+  - `Extend` withheld from `Any` and `Back` cuts (the bit itself arrives in
+    unit 3);
+  - spec §2.4's `allocate` and "Where the bytes come from" text.
+- Cases (root packages on riscv32, arm64, riscv32-flat and the S3):
+  - **`pool_back`:** a fresh pool. A `Back` allocation and a `Front` one,
+    each mapped and written with its own pattern, sit at the pool's two
+    ends: on the identity tiers `Mapping.base()` reads the pool's last
+    bytes and its first; on arm64 `available` reads the middle.
+  - **`pool_back_reuse`:** three `Back` allocations freed second, first,
+    third. A fourth of the first's length lands in the highest hole, read by
+    its contents' absence of the old pattern on identity, and by
+    `available`'s `largest` everywhere. With all freed, `available` reads
+    the pool whole.
+  - **`pool_meet`:** `Front` and `Back` until the frontier is spent.
+    `Front` answers `NoMemory` while `Any` still serves from a freed hole.
+  - **`pool_from_bad`:** a `from` of 3 is the `BadArg` fault.
+- Mutants:
+  - first fit for `Back` (`pool_back_reuse` lands low);
+  - no fold from above (`pool_back_reuse`'s whole pool reads short);
+  - `Front` falling back to the list (`pool_meet`);
+  - the `from` check dropped (`pool_from_bad`).
 
-**Unit 2: the heap table** (`rt/common/src/lib.saw`). Needs SO-124 unit 1
-(the null seam). The built-in heap as one entry of a table of `MAX_HEAPS`
-slots, one `SpinLock` each; the global seams' order and the free's routing
-by the arena's bounds; `adopt_heap(slot, base, len)`, unused yet. No
-process adopts anything, so every transcript holds. Its tests: the arena
-cases on every profile and the S3 unchanged (`arena_small`, `arena_reuse`,
-`arena_large`, `arena_churn`, `arena_race`, `double_free`, `stray_free`,
-`lock_owner`); a root package with `ARENA_SIZE = 0` whose `Vector` push
-answers `AllocError` and which exits clean. Mutant: the routing inverted
-(every free of an arena block panics `bad free`). The default heap's order
-and the built-in fallback have no heap to act on until unit 3, whose cases
-hold them.
+**Unit 3 (kernel): growing in place.** Needs unit 2.
 
-**Unit 3: adoption and `Heap<SLOT>`.** Needs units 1 and 2 and the reserved
-range (SO-124 unit 4, or this unit defines it in `bootplan` if it lands
-first). `BootSet`'s mapping of every heap record, §3.3's checks and texts,
-`sos`'s dependency on `bootplan`, `sos.Heap<SLOT>`. Its cases are
-hand-written launchers on riscv32, arm64, riscv32-flat and the S3, each
-giving a child pool rows under heap tags with the keep mask:
+- The changes:
+  - `MemoryOp.Extend` and `MemoryRight.Extend` (carried by pools,
+    `pool_rights()`);
+  - `MappingOp.Grow` and `MappingRight.Grow`;
+  - `map`'s `room` and `GrantRow.room` in placement;
+  - per tier, the row's top raised and the domain reloaded;
+  - spec §2.4's `Memory`, `map` and `Mapping` text, and spec §3's rights.
+- Cases (the same four boards):
+  - **`memory_extend`:** a `Front` allocation mapped with `room`, extended
+    and grown three times. The process writes and reads the last byte each
+    time, and its `Mapping` used row stays one.
+  - **`memory_extend_met`:** `Extend` answers `NoMemory` once a `Back`
+    allocation sits at the front's end. When that allocation is freed, it
+    succeeds.
+  - **`mapping_grow_past`:** `Grow` past the allocation answers `NoMemory`.
+  - **`mapping_grow_room`** (arm64): a second `map` lands past the first's
+    room, and a `Grow` past the room meets it with `NoResource`.
+  - **The faults:** `Extend` on a `Back` allocation (no right), `Extend` of
+    zero, `Grow` on a device row and `Grow` on a husk.
+  - **`extend_isolation`** (riscv32 and arm64, isolated only): a read one
+    grain past the grown top faults.
+- Mutants:
+  - `Extend` not checking that the frontier starts at the end
+    (`memory_extend_met`);
+  - `Grow` not checking the allocation's end (`mapping_grow_past`);
+  - the row's top raised without the reload (the last byte faults on the
+    isolated tiers);
+  - `room` ignored in placement (`mapping_grow_room`);
+  - the `Mapping` quota charged on a `Grow` (`memory_extend`'s row count).
 
-- `heap_default`: a child with `ARENA_SIZE = 0` and a default heap takes a
-  block larger than any arena, writes and reads it, frees it, and exits
-  clean; it prints its `Handle`, `Memory` and `Mapping` used rows after the
-  drain: one `Memory` and one `Mapping` more than at its start, and its
-  handles one fewer (the pool's record gone);
-- `heap_named`: a default heap and a data heap at slot 1; the child fills
-  `Vector<UInt8, Heap<1>>` until `push` answers `Err(AllocError)`, prints
-  the length it reached (fixed by the vector's doubling and the heap's
-  length, not by time), drops it, fills it to the same length again, and a
-  `String` built meanwhile comes from the default heap;
-- `heap_spent`: the default heap and a small arena both spent: a `Vector`
-  push answers `AllocError`, then a `String` panics with std's text,
-  `ended status=131086`;
-- `heap_fallback`: a default heap of one block's room and an 8 KiB arena;
-  the child takes the default heap's block, then a second block, which the
-  arena serves, then frees both and exits clean;
-- `heap_empty_pool`: a launcher that took every byte of a pool before
-  giving a sibling as the default heap: the child starts and its first push
-  answers `AllocError`;
-- `heap_missing_slot`: `Vector<UInt8, Heap<2>>` with no slot 2 given: the
-  push answers `AllocError`;
-- `heap_rights`, one child per refusal: a pool given without `Allocate`, one
-  without `Map`, a child whose `Memory` ceiling lacks `Map`, one whose
-  Process handle was derived without `Map`, one whose `Mapping` ceiling
-  lacks `Base`, each ending before its program with its own §3.3 text;
-- `heap_wrong_free`: a block from `Heap<1>` freed through the global
-  allocator: `bad free at`;
-- `heap_race` (riscv32, the short tick): `arena_race`'s two workers with
-  their blocks from a default heap. Its verdict on a lock mutant rests on
-  `arena_race`'s argument (many ticks over thousands of allocations).
+**Unit 4: `sosrt.heap`'s `largest` and `extend`** (hosted). It can run
+beside units 2 and 3.
 
-Mutants: the mapping loop dropped (`heap_default` answers `AllocError` at
-its first block); the built-in fallback dropped (`heap_fallback`'s second
-block answers `AllocError`); the free's routing sending every block to the
-default heap (`heap_fallback`'s free of the arena's block panics); each
-rights check dropped (the kernel's fault, with no text, replaces the named
-panic); a release dropped (`heap_default`'s rows); "no bytes" made a
-panic (`heap_empty_pool` ends); `Heap<SLOT>`'s null made a panic
-(`heap_named` ends); the default heap's lock not taken (`heap_race`, by
-`arena_race`'s argument).
+- Tests:
+  - a table sized for 64 times the first region serves, after extensions,
+    a block of half of it;
+  - `extend` merges with a free last block and appends after a used one;
+  - `holds` takes the new last block, a region ending on the granule
+    included, and refuses past the new end;
+  - 200,000 random steps with an `extend` every thousand.
+- Mutants:
+  - the table sized by the first region;
+  - `extend` not merging with a free last block;
+  - the old sentinel left as a header of size zero;
+  - `size` not raised (`holds` refuses the new block).
 
-**Unit 4: the builder and the stock root.** Needs unit 3. The declaration's
-`[heap.NAME]` tables and `arena` above the image's default; the image's
-`arena` and `heap-ram`; the board's `atomics` key on every range that
-states it; one pool per heap; `Source.Heap` in root; every refusal of §5.2;
-the spec text of §9. Its tests prove:
+**Unit 5: the heap table, adoption, growth and shares.** Needs units 3 and
+4.
 
-- each refusal by name, and the plan's records (their tags and keep mask),
-  the pool rows and the script's `ARENA_SIZE` (builder tests);
-- every description in the tree reading clean (`check-tree`);
-- described images on riscv32, arm64, riscv32-flat and the S3 whose
-  `_start` child, built from a declaration with `arena = 0`, a default heap
-  and a data heap, prints its heap records' rights from the set's listing
-  (`BootEntry`'s rights, read at the drain, §2.2): `Allocate | Map` and
-  nothing else; it runs `heap_named`'s fill and exits clean.
+- The changes:
+  - the table and its locks;
+  - the global seams' order and routing;
+  - `BootSet`'s adoption;
+  - `sos_rt_grow`;
+  - `Heap<SLOT>` with its assert, `info()` and `share`;
+  - `bootplan`'s heap tags.
+- Cases (hand-written launchers on the four boards, giving children pool
+  rows under heap tags with the keep mask):
+  - **`heap_grow`:** arena 0. The child takes growing blocks; `info()`
+    reads its size rising, and its `Mapping` and `Memory` used rows read
+    one each throughout.
+  - **`heap_named`:** arena 0, a default and a data heap. `Vector<UInt8,
+    Heap<1>>` fills until `push` answers `Err(AllocError)`; `info()` reads
+    `Spent`. A `Vector` built meanwhile comes from the default heap, whose
+    `info()` shows it.
+  - **`heap_fallback`:** a default heap whose pool holds one growth and an
+    8 KiB arena. The next block comes from the arena; both are freed and
+    the child exits clean.
+  - **`heap_dirty_pool`:** the launcher maps the pool's front, writes
+    `0xFF` over it, unmaps and gives the pool. The child's heap serves and
+    frees cleanly (the zeroed first word).
+  - **`heap_share`:** a 4 KiB share with rights `Transfer | Map`. The child
+    maps and writes it and gives it to a sibling, which reads it. The
+    child's heap then grows up to the share's front and `info()` reads
+    `Spent`. When the sibling drops the share, the child's next growth
+    succeeds (§3.5).
+  - **`heap_share_reuse`:** two shares, the higher freed. A third of its
+    length reuses its range, and the heap's room is unchanged.
+  - **`heap_share_only`:** a data heap the child never allocates from;
+    `info()` reads size 0 after two shares, and its `Mapping` used row is
+    unchanged.
+  - **`heap_share_grain`:** an off-grain `len` answers `NoResource`.
+  - **`heap_refusals`, one child per reason, read from `info()`:**
+    - a `Mapping` row at the windows only (`Quota(Mapping)`);
+    - a `Memory` row of zero (`Quota(Memory)`);
+    - a full `Handle` row (`Quota(Handle)`);
+    - a `Memory` ceiling restricted before the first growth (`Rights`).
+  - **`heap_rights`, one child per adoption panic:** the pool without
+    each of its four bits, a Process handle without `Mint`, a Process
+    ceiling without `Map`.
+  - **`heap_missing_slot`:** `Heap<2>` with no slot 2 given.
+  - **`heap_slot_bound`:** `Heap<4>`, a build error.
+  - **`heap_wrong_free`:** a block freed through the wrong allocator.
+  - **`heap_zero_spent`:** a heapless child whose push answers
+    `AllocError` and whose interpolation panics with `try! failed:
+    allocation of`.
+  - **`heap_race`** (riscv32, the short tick): `arena_race`'s workers on a
+    default heap, holding a lock mutant by `arena_race`'s argument.
+- Mutants:
+  - adoption dropped;
+  - each rights check dropped (a growth's `Rights` null or the kernel's
+    fault replaces the named text);
+  - `Front` replaced by `Any` (`heap_share`'s growth after the share is
+    freed lands elsewhere and the next `Extend` fails);
+  - the growth's `extend` not merging;
+  - the control word not zeroed (`heap_dirty_pool`);
+  - the fallback or the routing dropped (`heap_fallback`);
+  - `Back` replaced by `Any` in `share` (`heap_share`'s heap meets the
+    share at once);
+  - each refusal folded into another (`heap_refusals`);
+  - the lock not taken (`heap_race`).
+- Equivalent on the gate:
+  - the handling of a `Grow` refusal after an `Extend`, which the room
+    (arm64) and the identity tiers make unreachable;
+  - the order of the two locks in the fallback.
 
-Mutants: the keep mask widened (the printed rights change); each floor term
-dropped (its builder test); the atomics check dropped (its builder test);
-`[image] arena` read above a declaration's `arena` (a builder test).
+**Unit 6: the builder and the stock root.** Needs unit 5.
 
-**Unit 5: a data heap in the S3's PSRAM.** Needs SO-102's units C and D and
-a board stage, run on the part with the owner's word, showing `s32c1i` on a
-PSRAM address. `atomics = true` on `esp32s3-r8`'s PSRAM range, and a smoke
-case on that board under the emulator's PSRAM model in which a process's
-data heap lies in PSRAM and its default heap in SRAM; the masked-latency
-measurement on the part.
+- The changes:
+  - the declaration's `[heap.NAME]` and an optional `arena`;
+  - the image's `arena` and `heap-ram`;
+  - the boards' `atomics`;
+  - one pool per heap;
+  - `Source.Heap` and its keep mask in root;
+  - every check of §6.2, including the new `Mapping` floor and the Memory
+    slab's plumbing;
+  - §9's spec text.
+- Tests:
+  - each refusal by name, the plan's records and keep mask, the pool rows
+    and the script's `ARENA_SIZE` (builder tests);
+  - every description reading clean;
+  - described images on the four boards whose child, declared with
+    `arena = 0`, a default and a data heap, fills, shares and exits clean.
+- Mutants:
+  - the keep mask narrowed or widened (the share's rights, or an adoption
+    panic);
+  - each floor term dropped;
+  - the atomics check dropped;
+  - the image's `arena` read above the declaration's.
 
-Unit 1 can land now. Unit 2 follows SO-124 unit 1; unit 3 follows units 1
-and 2; unit 4 follows unit 3; unit 5 follows unit 4 and SO-102.
+**Unit 7: a data heap in the S3's PSRAM.** Needs unit 6, SO-102's units C
+and D, and a board stage, run on the part with the owner's word, showing
+`s32c1i` on a PSRAM address.
 
-**For SO-124 unit 2** (the lead carries it there): step 4's sentence on the
-drain's vectors goes; the `main` half of `start_no_heap` and its mutant
-join its tests; the start-up's heap mapping needs nothing of its own, being
-inside the drain (§2.3).
+- `atomics = true` on `esp32s3-r8`'s PSRAM range.
+- A smoke case with a data heap in PSRAM and the default heap in SRAM.
+- The masked-latency measurement on the part.
+
+Order:
+
+- units 2 and 4 can land now, beside each other;
+- unit 3 follows unit 2;
+- unit 5 follows units 3 and 4;
+- unit 6 follows unit 5;
+- unit 7 follows unit 6 and SO-102.
 
 ## Decided
 
-1. **Start-up allocates nothing;** the drain keeps raw records in fixed
-   storage bounded by the handle table (§2).
-2. **Three kinds of heap,** each its own single-region TLSF and `SpinLock`;
-   `heap.saw` unchanged (§1.1).
-3. **The built-in heap stays separate** from the default heap; the global
-   allocator asks the default first; a free is routed by the arena's bounds
-   (§1.2).
-4. **The heaps are mapped inside `BootSet(process:)`,** after the drain and
-   before it returns, wherever their records lie (§3.2).
-5. **A heap uses its whole pool,** read with `Pool.available`, and the
-   runtime keeps no handle afterwards (§1.4, §3.3).
-6. **Every refusal to allocate is null;** the start-up's mapping panics only
-   for failures other than "no bytes", each with its own text (§3.4).
-7. **Every right is read before it is spent** (§3.3).
-8. **Names:** `arena` for the built-in heap, `[heap.NAME]` for a pool heap,
-   `len` for a size, `slot` for the program's number, `heap-ram` in the
-   image, `atomics` on a board's range (§5.1).
-9. **`MAX_HEAPS` is 4** and `BOOT_SET_CAPACITY` 32, policy numbers raised
-   on need (§2.2, §3.1).
-10. **The reserved tags in `bootplan`,** and `sos` depends on it (§3.1).
-11. **No link-time heap length:** a heap's length is read from its pool, so
-    no script gains a symbol (§3.3).
-12. **The builder's floors** are added to the floor `check_child` holds
-    after SO-124 (§5.2).
-13. **The kernel and root use their built-in heaps only** (§1.3).
+1. **A pool has two ends:** `Allocate`'s `from` (`Any`, `Front`, `Back`),
+   last fit for `Back`, the frontier folding at both ends; no new `PoolOp`.
+2. **Growing in place:**
+   - `MemoryOp.Extend` (bit 11, carried by pools, never on a boot or
+     non-`Front` allocation);
+   - `MappingOp.Grow` (bit 10);
+   - `map`'s `room`, so a translating target keeps the next addresses free.
+3. **A heap is one region in one slot, and forever;** no trim, no return.
+4. **The growth step is the pool's grain,** at least `MIN_GROWTH`; no board
+   fact on TOR.
+5. **A heap maps nothing until it is used,** and its first growth is a
+   `Front` cut.
+6. **Shares are `Back` cuts with `Transfer | Map`,** ordinary `Memory`
+   under spec §2.5's invariant; `share` takes no heap lock.
+7. **The runtime keeps each heap's pool, `Memory` and `Mapping`, and one
+   Map-only Process sibling.**
+8. **Every refusal to allocate is null,** its reason in `info()`; the panics
+   are a bad free and adoption's checks.
+9. **`Heap<SLOT>` past the table is a build error.**
+10. **Names:** `arena`, `[heap.NAME]`, `len`, `slot`, `ram`, `heap-ram`,
+    `atomics`; no growth keys and no `align` key.
+11. **The builder** holds one `Memory` and one `Mapping` row per heap and
+    makes the grain checks at the image.
+12. **The control block's first word is zeroed** before a heap is made.
 
 ## Where this departs from the lead's reading
 
-- **"No heap declared: every allocation panics by name."** The later
-  rulings keep a built-in heap for every process and make every failure a
-  null, so a process with no heap at all gets null from every allocation,
-  and std's `String` layer is what panics, with std's text (§2.4).
-- **"Pools can be passed between processes."** A heap's pool is used whole
-  by the runtime, so it is not one a process can pass; a pool to pass is a
-  `memory` record, as today (§1.4, Q1).
-- **"The tooling gives one heap pool per declaring process."** With named
-  heaps it gives one pool per declared heap.
-- **The drain's bound** is the handle table (`MAX_HANDLES`), not the
-  declaration's record count or the `Handle` row: it holds for every
-  process, root and the harness's children included, and needs no number
-  from the builder (§2.2).
-- **`sos` depending on `bootplan`** is a new edge between the kernel's
-  userspace API and the launch convention's package, chosen so the
-  reserved range has one copy. The alternative is a copy in `sos` with
-  nothing to hold the two equal, since `bootplan` is dependency-free and
-  the builder is hosted.
+- **"Once the heap's front meets the back's lowest allocation, the heap is
+  spent for good, even if shared objects are freed later."** For good only
+  while that lowest share lives. When it comes home, its range folds into
+  the frontier, which begins at the heap's front, and the heap grows again.
+  A share freed higher up helps only later shares (§3.5).
+- **The doubling the owner asked about** is specified (§4.2) and not
+  recommended: on this HAL a NAPOT row spends the same numbered region as a
+  TOR pair, so doubling would cost alignment and up to half the pool for no
+  saving in slots.
+- **The alignment is derived, as you ruled,** and only for a doubling
+  board: the largest power of two not above `len`. That is enough, since
+  the heap cannot outgrow its pool; aligning to the power of two at or above
+  `len` would also work, and asks more of the range.
+- **"Growing a Memory and its Mapping in place" is two ops, not one.**
+  Taking the pool's bytes spends authority over the allocation, and widening
+  a row spends authority over an address space, as `map` already splits
+  them (spec §2.5). `room` is the third piece: without it, arm64 places the
+  next `map` directly above the heap and its growth meets it.
+- **`Front` is a new `from`,** not today's rule. Today's first fit takes a
+  freed hole before the frontier, and a heap that started in a hole could
+  never extend.
 
 ## Open questions
 
-None. The owner ruled on both:
+**Q1. Doubling on riscv32, or TOR?** On this HAL a NAPOT row spends the
+same numbered region as a TOR pair, so doubling saves no slot. It costs a
+pool base aligned to the largest power of two not above `len`, and up to
+half the pool unreachable by the heap. *Recommendation:* TOR, growing at
+the grain. Doubling becomes worth it only if the HAL packs NAPOT rows one
+entry each, a change of its own.
 
-- **A heap's pool is owned entirely by the runtime.** The runtime uses the
-  whole pool and keeps no handle, so it cannot be passed on; a process that
-  wants memory to share declares a `memory` record and manages it.
-- **The built-in heap defaults to 4 KiB on every board.** The runtime needs
-  none (start-up, `print` and the panic path allocate nothing); a process
-  that needs more raises it in its build config (`arena` in its declaration,
-  or `[image] arena` for an image's processes), and a larger board's
-  processes declare heaps or, later, ask a page-granular memory service.
+**Q2. Should a share be mintable?** Without `Mint` on the pool, a share
+reaches one other holder at a time. Granting `Mint` lets the program fan a
+share out, and also lets a program that guesses the pool's word at the C
+altitude mint pool siblings. *Recommendation:* no `Mint` now; add it when a
+product needs one buffer in two other processes.
