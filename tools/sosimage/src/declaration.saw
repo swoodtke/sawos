@@ -53,7 +53,12 @@
 //! an input, or whose value is not a path; a `ram` other than `fast`; a
 //! `threads` of 0, since a process's first thread is charged to it; and a
 //! declared `handles` below what the process holds when it starts (one per
-//! record, its Process handle, and one Mapping per window).
+//! record, its Process handle, one Mapping per window, and for a program
+//! written with `main` its main thread's own Thread handle).
+//!
+//! A program written with `main` is one whose `Saw.toml`, beside its
+//! `process.toml`, depends on `sosmain`: that package's start-up mints the
+//! main thread's handle before `main` runs (`Declaration.load`).
 //!
 //! Against a board (`check_against`), a process is also refused for an
 //! `arena` or a tag the board's word cannot hold, a type the board has no
@@ -62,9 +67,10 @@
 //! input of a type it needs: the board input's value follows the device.
 
 import std.path.{Path}
-import toml.{TomlKind, TomlPosition, TomlTable}
+import toml.{TomlDoc, TomlKind, TomlPosition, TomlTable}
 import sosimage.board.{Board, NamedCount, expect_table, quota_keys, read_counts}
 import sosimage.failure.{BuildError}
+import sosimage.tool.{read_text}
 import sosimage.rules.{
     check_format, check_input_name, check_name, check_path, count, element_at, fits_board_word, flag, holds,
     name_list, only_keys, parse_description, refused, size, text, toml_refused,
@@ -139,6 +145,8 @@ public struct Declaration {
     arena_at: TomlPosition
     /// `ram = "fast"`.
     fast: Bool
+    /// A program written with `main`, whose start-up holds one handle more.
+    main: Bool
     records: Vector<BootRecord>
     /// The rights its `system` record names; none when it has no `rights`,
     /// and the image's default applies (`system_rights_or`).
@@ -209,17 +217,29 @@ func family(kind: RecordKind) -> Int {
 }
 
 extension Declaration {
+    /// Reads the declaration at `file`, a `process.toml`, and whether its
+    /// package is a program written with `main` from the `Saw.toml` beside
+    /// it.
+    public static func load(file: String) -> Result<Declaration, BuildError> {
+        let dir = Path(s: file).parent()?.as_string() ?? "."
+        let main = try is_main_program(dir)
+        Declaration.parse(try read_text(file), file, main: main)
+    }
+
     /// Reads a declaration from its text; `file` names it, and its directory
-    /// is the package's.
-    public static func parse(text: String, file: String) -> Result<Declaration, BuildError> {
+    /// is the package's. `main` says the package is a program written with
+    /// `main` rather than one exporting its own `_start`.
+    public static func parse(text: String, file: String,
+                             main: Bool = false) -> Result<Declaration, BuildError> {
         let doc = try parse_description(text, file)
         borrow let root = doc.root() {
-            return Declaration.read(&root, file)
+            return Declaration.read(&root, file, main)
         }
     }
 
     /// Reads a declaration's top-level table.
-    public static func read(root: &TomlTable, file: String) -> Result<Declaration, BuildError> {
+    public static func read(root: &TomlTable, file: String,
+                            main: Bool) -> Result<Declaration, BuildError> {
         let top_keys: Vector<String> = ["format", "arena", "ram", "boot", "quota", "build"]
         try only_keys(&root, &top_keys, file, "a process declaration")
         try check_format(&root, file)
@@ -271,7 +291,7 @@ extension Declaration {
                 }
                 r = r + 1
             }
-            try check_handles(&records, &quota, file, where_is(&q, "handles"))
+            try check_handles(&records, main, &quota, file, where_is(&q, "handles"))
         }
 
         var inputs = Vector<String>()
@@ -311,7 +331,7 @@ extension Declaration {
 
         let dir = Path(s: file).parent()?.as_string() ?? "."
         return Declaration(file: file, dir: dir, arena: arena, arena_at: where_is(&root, "arena"), fast: fast,
-                           records: move records, system_rights: move system_rights,
+                           main: main, records: move records, system_rights: move system_rights,
                            quota: move quota,
                            inputs: move inputs, inputs_at: inputs_at,
                            defaults: move defaults)
@@ -327,9 +347,10 @@ extension Declaration {
     }
 
     /// The handles the process holds when it starts: one per record, its
-    /// Process handle, and one Mapping per window.
+    /// Process handle, one Mapping per window, and for a program written with
+    /// `main` its main thread's own Thread handle.
     public func handle_floor(&self) -> Int {
-        handles_at_start(&self.records)
+        handles_at_start(&self.records, self.main)
     }
 
     /// The device needs, each named once, with its type: the first record of
@@ -455,8 +476,24 @@ extension Declaration {
     }
 }
 
-/// The handles a process with `records` holds when it starts.
-func handles_at_start(records: &Vector<BootRecord>) -> Int {
+/// Whether the package in `dir` is a program written with `main`: its
+/// `Saw.toml` depends on `sosmain`.
+public func is_main_program(dir: String) -> Result<Bool, BuildError> {
+    let manifest = "{dir}/Saw.toml"
+    let doc = try TomlDoc.parse(try read_text(manifest)) catch {
+        return BuildError(message: "{manifest}: {error}")
+    }
+    borrow let root = doc.root() {
+        if let deps = root.table("dependencies") {
+            return deps.contains("sosmain")
+        }
+        return false
+    }
+}
+
+/// The handles a process with `records` holds when it starts, `main` saying
+/// it is a program written with `main`.
+func handles_at_start(records: &Vector<BootRecord>, main: Bool) -> Int {
     var windows = 0
     var i = 0
     while i < records.len() {
@@ -465,7 +502,8 @@ func handles_at_start(records: &Vector<BootRecord>) -> Int {
         }
         i = i + 1
     }
-    records.len() + 1 + windows
+    let main_thread = if main { 1 } else { 0 }
+    records.len() + 1 + windows + main_thread
 }
 
 /// One `[[boot]]` record.
@@ -550,8 +588,8 @@ func check_records(records: &Vector<BootRecord>, file: String, at: TomlPosition)
 }
 
 /// Refuses a declared `handles` below what the process holds when it starts.
-func check_handles(records: &Vector<BootRecord>, quota: &Vector<NamedCount>, file: String,
-                   at: TomlPosition) -> Result<Void, BuildError> {
+func check_handles(records: &Vector<BootRecord>, main: Bool, quota: &Vector<NamedCount>,
+                   file: String, at: TomlPosition) -> Result<Void, BuildError> {
     var i = 0
     while i < quota.len() {
         let q = quota.get(i)!
@@ -559,8 +597,11 @@ func check_handles(records: &Vector<BootRecord>, quota: &Vector<NamedCount>, fil
         if not q.name.equals("handles") {
             continue
         }
-        let floor = handles_at_start(&records)
+        let floor = handles_at_start(&records, main)
         if q.value < floor {
+            if main {
+                return refused(file, at, "`handles` in [quota] is {q.value}, below the {floor} the process holds when it starts: one per [[boot]] record, its Process handle, one Mapping per window and its main thread's own Thread handle, which `sosmain`'s start-up holds for a program written with `main`")
+            }
             return refused(file, at, "`handles` in [quota] is {q.value}, below the {floor} the process holds when it starts: one per [[boot]] record, its Process handle and one Mapping per window")
         }
     }

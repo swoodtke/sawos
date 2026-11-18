@@ -1,29 +1,36 @@
-//! The runtime's three hooks, process side.
+//! The runtime's four hooks, process side.
 //!
-//! `sosrt` implements the frozen `__saw_rt_*` seams over three per-side hooks:
-//! where a byte goes, how a run ends with a text, and which thread asks. The
-//! kernel HAL answers "the UART" and "write the text, stop the board". A
-//! process owns no device, so it answers with kernel ops: a byte goes out
-//! through a System op, and the end is the kernel's panic op, which puts the
-//! text on its fault line and ends the process. If `panic()` could reach a
-//! UART from userspace, the user/kernel split would be claimed rather than
-//! real. The third it answers from the thread register (the foot of this
-//! file).
+//! `sosrt` implements the frozen `__saw_rt_*` seams over four per-side hooks:
+//! where a byte goes, how a run ends with a text, which thread asks, and how a
+//! thread waiting for the output lock gives the processor up. The kernel HAL
+//! answers "the UART" and "write the text, stop the board". A process owns no
+//! device, so it answers with kernel ops: a byte goes out through a System op,
+//! and the end is the kernel's panic op, which puts the text on its fault line
+//! and ends the process. If `panic()` could reach a UART from userspace, the
+//! user/kernel split would be claimed rather than real. The last two it
+//! answers from the thread register (the foot of this file).
 //!
 //! They live here, not in `hal/<arch>/user/`, because they name no
 //! architecture: the System op and the panic op are the same ops on every
 //! profile, and the thread register is read through the user HAL's accessors.
 //!
-//! This is the top of the module order because the first two hooks are written
-//! over the floor's ops. The byte goes out through `sos_system_debug_print`,
-//! on the handle `System(boot_handle:)` parks at the floor, which the hook
-//! cannot do for itself; the end goes through `sos_panic`, which needs no
-//! handle.
+//! This is the top of the module order because the hooks are written over the
+//! floor's ops. The byte goes out through `sos_system_debug_print`, on the
+//! handle `System(boot_handle:)` parks at the floor, which the hook cannot do
+//! for itself; the end goes through `sos_panic`, which needs no handle.
 
-import sos.floor.{SYSTEM_HANDLE, sos_system_debug_print, sos_panic}
-import sosabi.{PANIC_TEXT_BYTES}
+import sos.floor.{SYSTEM_HANDLE, PRINT_ANSWER, PRINT_UNASKED, PRINT_DEBUG,
+                  PRINT_SILENT, sos_handle_info, sos_system_debug_print,
+                  sos_panic, sos_thread_yield}
+import sos.thread.{Thread}
+import sosabi.{PANIC_TEXT_BYTES, NO_HANDLE, ThreadHandle, HandleInfo,
+               HandleKind, SystemRight}
 
 /// Write `len` bytes at `ptr` to the debug console: `print`'s writer.
+///
+/// The bytes go out through the kernel's debug print when the parked handle
+/// is a System holding `Debug`, and are dropped otherwise, so a process
+/// without the right prints nothing rather than faulting (`may_print`).
 ///
 /// Check-free by construction, on the same terms as the kernel HAL's writer: no
 /// indexing (raw `UnsafeMemory` reads), no allocation, no `String`, and a
@@ -34,7 +41,7 @@ import sosabi.{PANIC_TEXT_BYTES}
 /// the console is the thing that would have failed.
 @export("sos_rt_write")
 func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
-    if SYSTEM_HANDLE == 0 {
+    if not may_print() {
         return
     }
     var addr = ptr as UInt
@@ -45,6 +52,44 @@ func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
         addr = addr &+ 1
         left = left &- 1
     }
+}
+
+/// Whether the parked handle prints: a System whose rights hold `Debug`.
+///
+/// A handle of `NO_HANDLE` answers no without a call. Otherwise the first
+/// write asks the kernel for the handle's kind and rights (`INFO_OP`, which no
+/// right gates) and keeps the answer until a handle is parked again. Two
+/// threads that ask at once each ask, and keep the same answer.
+///
+/// The kind is asked first because a launcher may start a process on a word of
+/// any kind, and another kind's rights word gives the bit `Debug` sits at a
+/// meaning of its own.
+func may_print() unsafe -> Bool {
+    let handle = SYSTEM_HANDLE
+    if handle == NO_HANDLE {
+        return false
+    }
+    let known = PRINT_ANSWER.load()
+    if known != PRINT_UNASKED {
+        return known == PRINT_DEBUG
+    }
+    let answer = if holds_debug(handle) { PRINT_DEBUG } else { PRINT_SILENT }
+    PRINT_ANSWER.store(answer)
+    answer == PRINT_DEBUG
+}
+
+/// Whether `handle` names a System and its rights hold `Debug`.
+func holds_debug(handle: UInt) unsafe -> Bool {
+    var kind: UInt = 0
+    let _ = sos_handle_info(handle, HandleInfo.Kind as UInt,
+                            (&var kind) as UnsafePointer<UInt>)
+    if kind != (HandleKind.System as UInt) {
+        return false
+    }
+    var rights: UInt = 0
+    let _ = sos_handle_info(handle, HandleInfo.Rights as UInt,
+                            (&var rights) as UnsafePointer<UInt>)
+    (rights & (SystemRight.Debug as UInt)) != 0
 }
 
 /// The words of the buffer a panic's text is copied into: the kernel's bound,
@@ -106,31 +151,99 @@ func rt_abort(ptr: UnsafePointer<Int8>, len: UInt,
 // The calling thread's own word: the thread register, read and written by the
 // user HAL (`hal/<arch>/user/syscall.c`). The kernel keeps it per thread and
 // starts every thread with it zero.
+//
+// Its low bit says what it holds. Zero is nothing yet. An odd word is a
+// number the lock-owner hook below handed out. An even word that is not zero
+// is the address of the thread's block (`ThreadBlock`), which the thread
+// wrote before it took its first lock. A thread's word is written once and
+// never changes after, so a lock never sees its holder's identity change. A
+// program that writes the register itself breaks all of this.
 extern "C" {
     func sos_thread_word() -> UInt
     func sos_set_thread_word(word: UInt)
 }
 
-/// The last thread identity this process handed out; zero names none.
+/// The last thread number this process handed out; zero names none.
 static LAST_OWNER: Atomic<Int> = Atomic(0)
 
 /// Which thread is asking, for `sosrt`'s lock-owner seam: nonzero, and
 /// distinct between any two threads of this process.
 ///
-/// A thread's first call takes the next number and keeps it in its thread
-/// register; every later call reads it back. It allocates nothing and cannot
-/// panic. A program that writes the thread register itself changes the
-/// answer. Two processes number their threads independently, so a lock in
-/// memory two processes share is not told apart by it. The count is a word, so
-/// on a 32-bit profile it wraps after 2^32 first asks in one process and
-/// numbers repeat from there.
+/// A thread's word is its identity when it has one: its block's address, or a
+/// number an earlier call gave it. A thread with none takes the next number,
+/// made odd so that no number equals a block's address, and keeps it in its
+/// thread register. It allocates nothing and cannot panic. Two processes
+/// number their threads independently, so a lock in memory two processes
+/// share is not told apart by it. The count is a word, so on a 32-bit profile
+/// it wraps after 2^31 first asks in one process and numbers repeat from
+/// there.
 @export("sos_rt_lock_owner")
 func rt_lock_owner() unsafe -> Int {
     let word = sos_thread_word()
     if word != 0 {
         return Int.from(truncating: word)
     }
-    let fresh = LAST_OWNER.fetch_add(1) &+ 1
-    sos_set_thread_word(UInt.from(truncating: fresh))
-    fresh
+    let number = LAST_OWNER.fetch_add(1) &+ 1
+    let fresh = (UInt.from(truncating: number) << 1) | 1
+    sos_set_thread_word(fresh)
+    Int.from(truncating: fresh)
+}
+
+/// Give the processor up while the output lock is held by another thread: the
+/// output lock's yield hook.
+///
+/// It yields through the calling thread's own Thread handle, which its block
+/// holds. A thread with no block, or a block holding no handle yet, does
+/// nothing, and its wait spins until a tick moves it. That cannot hang: a
+/// holder parks inside the lock only on a console's ring, and only a thread
+/// with a block writes to one.
+@export("sos_rt_yield")
+func rt_yield() unsafe {
+    let word = sos_thread_word()
+    if word == 0 || (word & 1) != 0 {
+        return
+    }
+    let thread = UnsafeMemory<ThreadBlock, Normal>(word).read().thread
+    if thread == NO_HANDLE {
+        return
+    }
+    let _ = sos_thread_yield(thread)
+}
+
+/// A thread's block: the per-thread place its thread register names, holding
+/// the thread's own Thread handle, through which the output lock's wait
+/// yields.
+///
+/// The block lives for its thread's life wherever the thread put it (the
+/// main thread's, in `sosmain`'s start-up frame), and holds its handle until
+/// the process ends. Its address is word-aligned and nonzero, so it serves as
+/// the thread's lock-owner identity as it is.
+public struct ThreadBlock {
+    private thread: UInt,
+}
+
+extension ThreadBlock {
+    /// A block holding no handle yet.
+    public init() -> ThreadBlock {
+        ThreadBlock(thread: NO_HANDLE)
+    }
+
+    /// Keep `thread`, the calling thread's own handle, for the rest of the
+    /// process's life: the wrapper is given up without a release, and the
+    /// process's end releases the handle.
+    public func keep(&var self, thread: Thread) {
+        var own = move thread
+        self.thread = own.handle
+        own.handle = ThreadHandle(NO_HANDLE)
+    }
+}
+
+/// Make `block` the calling thread's block: write its address into the
+/// thread register.
+///
+/// It is made once per thread, before the thread takes its first lock, so the
+/// thread's lock-owner identity is the block's address from the start; and
+/// `block` stays where it is for the rest of the thread's life.
+public func enter_thread_block(block: UnsafePointer<ThreadBlock>) unsafe {
+    sos_set_thread_word(block as UInt)
 }

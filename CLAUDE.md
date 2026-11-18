@@ -62,6 +62,9 @@ drivers/           # userspace device drivers and the protocol packages their
                    # build input `pwmconfig`
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
+rt/main/           # `sosmain`: the `_start` of a program written with `main`
+                   # and the boot context `main` reads; a package opts in by
+                   # depending on it and importing it
 root/              # the stock root: it launches an image's processes as
                    # the plan the image builder writes for the image
                    # (`imageplan`) says; bootplan/ holds the plan's types.

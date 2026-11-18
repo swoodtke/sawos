@@ -1,0 +1,113 @@
+// A `_start` package printing where nothing may print, from the
+// supervisor's side: `child-start-print` launched on a System without `Debug`
+// and on an Event's word, each launch waited out and its status word printed,
+// then what the Event reads:
+//
+//   SOS printlaunch: <round> ended status=<word>
+//   SOS printlaunch: the Event reads <bits>
+//
+// The print is dropped both times, and on the Event nothing of it may
+// signal: the debug print's op number on an Event is the Event's `Signal`.
+//
+// This image's kernel arms no tick, so root parks in each wait and the
+// child's death is what brings it back.
+
+import sos.{System, Process, Memory, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static KEY_DEATH: UInt = 6
+
+static CHILD_NO_DEBUG: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer
+                                 | SystemRight.ClockGet)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS printlaunch: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS printlaunch: refused: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS printlaunch: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let img = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    try start_print(&system, &proc, &img, &ram)
+    try on_event(&system, &proc, &img, &ram)
+    return
+}
+
+/// `child-start-print` on a System without `Debug`.
+func start_print(system: &System, proc: &Process, img: &Memory,
+                 ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    try give_system(&system, &child, CHILD_NO_DEBUG)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, "no debug")
+}
+
+/// `child-start-print` started on an Event, whose word root reads after the
+/// child's end.
+func on_event(system: &System, proc: &Process, img: &Memory,
+              ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    let event = try proc.event_create()
+    let given = try event.mint()
+    try child.give(event: move given, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, "on an event")
+    print("SOS printlaunch: the Event reads {}", try event.receive())
+    return
+}
+
+/// A System narrowed to `rights`, under `TAG_BOOT`.
+func give_system(system: &System, child: &Process,
+                 rights: UInt32) -> Result<Void, SosStatus> {
+    let boot = try system.mint(rights: rights)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Wait for `child`'s death and print its status word; the handle goes with
+/// it, so the next round's child takes the same region.
+func ended(proc: &Process, child: Process,
+           round: String) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH {
+                return BUG
+            }
+            print("SOS printlaunch: {} ended status={}", round, status)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

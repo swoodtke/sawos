@@ -1,0 +1,43 @@
+// A child written with `main` and no heap (`ARENA_SIZE = 0`): every
+// allocation it makes is refused, so `sosmain`'s start-up, which runs before
+// `main`, must allocate nothing for `main` to be reached at all. `main` then
+// allocates nothing either: it lists the boot set the start-up drained with
+// `entry(at:)`, takes each record by tag, and prints with `{}` arguments,
+// which render on the stack. It returns, and the start-up exits 0.
+
+import sosmain
+
+/// The tags `boot-set-launch` gives its records under.
+static TAG_EVENT: UInt = 2
+static TAG_POOL: UInt = 3
+static TAG_SPARE: UInt = 4
+
+func main() {
+    var set = sosmain.take_boot_set()
+    print("SOS mainnoheap: main reached, {} records", set.len())
+    var i: Int = 0
+    while i < set.len() {
+        let e = set.entry(at: i)
+        print("SOS mainnoheap: record {} kind {}", e.tag, e.kind as UInt)
+        i = i + 1
+    }
+    guard var event_record = set.take(TAG_EVENT) else {
+        panic("SOS mainnoheap: no record under tag {}", TAG_EVENT)
+    }
+    guard var pool_record = set.take(TAG_POOL) else {
+        panic("SOS mainnoheap: no record under tag {}", TAG_POOL)
+    }
+    guard var spare_record = set.take(TAG_SPARE) else {
+        panic("SOS mainnoheap: no record under tag {}", TAG_SPARE)
+    }
+    guard let _ = event_record.take_event() else {
+        panic("SOS mainnoheap: the record under tag {} is no Event", TAG_EVENT)
+    }
+    guard let _ = pool_record.take_pool() else {
+        panic("SOS mainnoheap: the record under tag {} is no pool", TAG_POOL)
+    }
+    guard let _ = spare_record.take_event() else {
+        panic("SOS mainnoheap: the record under tag {} is no Event", TAG_SPARE)
+    }
+    print("SOS mainnoheap: took an Event, a pool and an Event")
+}

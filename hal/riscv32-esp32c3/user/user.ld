@@ -20,6 +20,12 @@
 
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
+/* A program written with `main` gets its `_start` from `sosmain`, and only
+ * when it imports that package. Without the import the link has no entry,
+ * which `ld.lld` only warns about, so the warning is made an error that names
+ * the fix.
+ */
+ASSERT(DEFINED(_start), "no _start: a main program imports sosmain")
 
 /* The arena: the region `sosrt`'s heap serves a freestanding Saw image's
  * allocations from.

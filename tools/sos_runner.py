@@ -895,6 +895,29 @@ BOOT_SET_LAUNCH_PKG = os.path.join(TESTS_DIR, "boot-set-launch")
 CHILD_NO_HEAP_PKG = os.path.join(TESTS_DIR, "child-no-heap")
 CHILD_SET_RELEASE_PKG = os.path.join(TESTS_DIR, "child-set-release")
 
+# Programs written with `main`, whose `_start` is `sosmain`'s. `main-start`
+# launches `child-main` once per role and per refusal of its start-up.
+# `child-main-no-heap` is `child-no-heap`'s twin written with `main`, under
+# `boot-set-launch`. `start-print` launches `child-start-print`, a `_start`
+# package, on a System without `Debug` and on an Event.
+MAIN_START_PKG = os.path.join(TESTS_DIR, "main-start")
+CHILD_MAIN_PKG = os.path.join(TESTS_DIR, "child-main")
+CHILD_MAIN_NO_HEAP_PKG = os.path.join(TESTS_DIR, "child-main-no-heap")
+START_PRINT_PKG = os.path.join(TESTS_DIR, "start-print")
+CHILD_START_PRINT_PKG = os.path.join(TESTS_DIR, "child-start-print")
+# `main-bare` starts a `main` program with no tag: `child-main-bare`, which
+# prints and returns, or one of `child-main-lend-*`, which asks for a lent
+# handle.
+MAIN_BARE_PKG = os.path.join(TESTS_DIR, "main-bare")
+CHILD_MAIN_BARE_PKG = os.path.join(TESTS_DIR, "child-main-bare")
+CHILD_MAIN_LEND_SYSTEM_PKG = os.path.join(TESTS_DIR, "child-main-lend-system")
+CHILD_MAIN_LEND_PROCESS_PKG = os.path.join(TESTS_DIR,
+                                           "child-main-lend-process")
+# A `main` program that never imports `sosmain`, whose link the user script
+# refuses; and a `_start` root whose second thread waits on the output lock.
+MAIN_UNIMPORTED_PKG = os.path.join(TESTS_DIR, "main-unimported")
+LOCK_WAIT_PKG = os.path.join(TESTS_DIR, "lock-wait")
+
 # What the harness types at the guest's serial port for the echo cases, and what
 # it then expects to read back.
 #
@@ -1333,6 +1356,21 @@ def _case_processes(case):
         else:
             out.append((pkg, f"child{i}"))
     return out
+
+
+def _expected_build_failure(cases, pkg, role, error, refused):
+    """Record `error`, the failure of building `pkg` as `role`, as the build
+    error of every case that builds it, when each of them expects a build
+    error (`expect_build_error`), and say whether it did. A failure a case
+    does not expect stops the run as before."""
+    owners = [case for case in cases
+              if (pkg, role) in _case_processes(case)]
+    if not owners or not all(case.get("expect_build_error")
+                             for case in owners):
+        return False
+    for case in owners:
+        refused[case["name"]] = error
+    return True
 
 
 def _case_builds(cases):
@@ -2167,7 +2205,7 @@ TEST_CASES = [
         "name": "task_dump_empty",
         "src": os.path.join(TESTS_DIR, "taskdump_empty.saw"),
         "expect_out": ["saw tasks: none live",
-                       "panic at taskdump_empty.saw:38: "
+                       "panic at taskdump_empty.saw:21: "
                        "SOS task dump: no tasks here"],
         "expect_clean_exit": False,
     },
@@ -8696,10 +8734,10 @@ TEST_CASES = [
     # convention's four less `transfer` (`tests/images/stock_rights.toml`).
     # `narrow` names `debug` and `process-self`, and its handle has those two
     # and no other right: its own set, not the image's. `mute` names the
-    # convention's rights but `debug`: its first print is the kernel's
-    # `AccessDenied` fault, and root reports its end as that fault, `Faulted`
-    # (2) << 16 | `AccessDenied` (3). `plain` names none, and its handle has
-    # the image's default and no other right.
+    # convention's rights but `debug`: its prints are dropped, so nothing lies
+    # between `narrow`'s teardown line and `mute`'s exit line, and it exits 0.
+    # `plain` names none, and its handle has the image's default and no other
+    # right.
     {
         "name": "stock_rights",
         "arches": ["riscv32"],
@@ -8707,13 +8745,14 @@ TEST_CASES = [
         "image_file": {"riscv32": "stock_rights.toml"},
         "expect_out": ["{banner}",
                        _stock_system("narrow", held=("Debug", "ProcessSelf")),
-                       "SOS: process fault: access denied process={two}",
+                       " process={one}\n"
+                       "SOS: process exit: code={zero} process={two}\n",
                        _stock_system("plain",
                                      held=("Debug", "ProcessSelf", "ClockGet")),
                        "root: narrow ended status=65536",
                        "root: plain ended status=65536",
-                       "root: mute ended status=131075"],
-        "expect_tail": "root: mute ended status=131075",
+                       "root: mute ended status=65536"],
+        "expect_tail": "root: mute ended status=65536",
         "expect_clean_exit": True,
     },
 
@@ -11985,6 +12024,269 @@ TEST_CASES = [
                        "SOS bootlaunch: done"],
         "expect_clean_exit": True,
     },
+    {
+        # A program written with `main` (`rt/main`): `sosmain`'s start-up
+        # adopts the boot word, derives the Process handle and the main
+        # thread's own Thread handle, drains the boot set, runs `main` and
+        # exits with its status. `main-start` launches `child-main` once per
+        # role and once per refusal of its start-up, printing each status
+        # word: `Exited` (65536 | code), or `Faulted (Panic)` (131086) with
+        # the runtime's text on the kernel's fault line.
+        #
+        #   seven, error, range  `main` returning 7, an `Err` (written as
+        #     `error: ...`, status 1) and 300 (the entry's panic);
+        #   exit  `sosmain.exit` with a word wider than 16 bits, whose low 16
+        #     the status word carries;
+        #   context  the lent System's and Process's rights, a record taken by
+        #     tag twice, then a second `take_boot_set()`, which panics;
+        #   hold  the child's `Handle` row, read by root with its boot set held
+        #     and after it dropped the set with two records untaken: its
+        #     System, Process and main thread's Thread, the two Events it took
+        #     and a Waiter, and the two spares while the set holds them;
+        #   entry  a thread made at the image entry, which panics there;
+        #   no debug  a `main` program whose System lacks `Debug` prints and
+        #     exits 0: its line is dropped, so nothing lies between the last
+        #     round's line and its exit line;
+        #   memory, no process self, no thread self, no boot handles, no exit
+        #     each refusal of the start-up, by name: a boot word that names a
+        #     Memory, a System without `ProcessSelf`, and a Process ceiling
+        #     without `ThreadSelf`, `BootHandles` or `Exit` (`main` returns 0,
+        #     and the line carries it);
+        #   no control  a Thread ceiling without `Control`, which the main
+        #     thread's handle needs to yield through, refused by name;
+        #   no room for a process, no room for a thread  a `Handle` row with
+        #     room for the System alone, then for it and the Process handle:
+        #     the start-up's mint past it answers `QuotaExceeded`, named;
+        #   no tag  a child started with no tag, whose `take_boot_set()`
+        #     panics: it has no System.
+        #
+        # The drain's own refusal is not reached: `BootHandleNext` answers a
+        # record or `Drained`, and faults on everything else.
+        #
+        # This image arms no tick, so root parks in each wait and the death,
+        # or the child's signal, brings it back.
+        "name": "main_start",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAIN_START_PKG,
+        "children": [CHILD_MAIN_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}",
+            "SOS: process exit: code={seven} process={one}",
+            "SOS mainstart: seven ended status=65543\n",
+            "error: not a loadable process image\n"
+            "SOS: process exit: code={one} process={one}",
+            "SOS mainstart: error ended status=65537\n",
+            *_panic_fault("{one}", "panic at main.saw:",
+                          ": main returned exit status 300, which is outside "
+                          "0...255"),
+            f"SOS mainstart: range ended status={STATUS_PANICKED}\n",
+            "SOS: process exit: code=0x",
+            "00020009 process={one}\n",
+            "SOS mainstart: exit ended status=65545\n",
+            "SOS mainchild: the System's rights 5377, the Process's "
+            "8388355\n",
+            "SOS mainchild: took the Event under tag 43; a second take found "
+            "nothing\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: the boot set was taken already"),
+            f"SOS mainstart: context ended status={STATUS_PANICKED}\n",
+            "SOS mainstart: hold: handles 8 with the set, 6 after it "
+            "dropped\n",
+            "SOS: process exit: code={zero} process={one}",
+            "SOS mainstart: hold ended status=65536\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: a thread entered the image entry; make "
+                          "threads with thread_create(run:)"),
+            f"SOS mainstart: entry ended status={STATUS_PANICKED}\n"
+            "SOS: process exit: code={zero} process={one}",
+            "SOS mainstart: no debug ended status=65536\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: the boot word names a Memory, not a "
+                          "System"),
+            f"SOS mainstart: memory ended status={STATUS_PANICKED}\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: the System handle lacks ProcessSelf"),
+            f"SOS mainstart: no process self ended status={STATUS_PANICKED}"
+            "\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: a main program needs ThreadSelf"),
+            f"SOS mainstart: no thread self ended status={STATUS_PANICKED}"
+            "\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: the Process handle lacks BootHandles"),
+            f"SOS mainstart: no boot handles ended status={STATUS_PANICKED}"
+            "\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: main returned 0 and the Process handle "
+                          "lacks Exit"),
+            f"SOS mainstart: no exit ended status={STATUS_PANICKED}\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: a main program's thread handle needs "
+                          "Control"),
+            f"SOS mainstart: no control ended status={STATUS_PANICKED}\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: no process handle: this process is at its "
+                          "quota"),
+            "SOS mainstart: no room for a process ended "
+            f"status={STATUS_PANICKED}\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: no thread handle: this process is at its "
+                          "quota"),
+            "SOS mainstart: no room for a thread ended "
+            f"status={STATUS_PANICKED}\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: no boot set: the process was started with "
+                          "no System"),
+            f"SOS mainstart: no tag ended status={STATUS_PANICKED}\n",
+            "SOS mainstart: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A program written with `main` started with no tag: the start-up has
+        # no System, no Process and no boot set. `main` prints, which with no
+        # handle parked is dropped without a call to the kernel, so nothing
+        # lies between root's console line and the child's fault line; it
+        # touches nothing else and returns 3, and with no Process handle to
+        # exit through the start-up panics, naming the status.
+        "name": "main_no_system",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAIN_BARE_PKG,
+        "children": [CHILD_MAIN_BARE_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}\n"
+            "SOS: console handover\n"
+            "SOS: process fault: the program panicked process={one} "
+            "text=panic at lib.saw:",
+            ": sos: main returned 3 with no Process handle to exit through\n"
+            "SOS: process teardown handles=",
+            " process={one}\n",
+            f"SOS mainbare: ended status={STATUS_PANICKED}\n",
+            "SOS mainbare: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The boot context's lent System, asked for in a process started with
+        # no tag: the accessor panics, naming the cause.
+        "name": "main_no_system_lend_system",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAIN_BARE_PKG,
+        "children": [CHILD_MAIN_LEND_SYSTEM_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: no System: the process was started with no "
+                          "boot handle"),
+            f"SOS mainbare: ended status={STATUS_PANICKED}\n",
+            "SOS mainbare: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same for the boot context's lent Process.
+        "name": "main_no_system_lend_process",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAIN_BARE_PKG,
+        "children": [CHILD_MAIN_LEND_PROCESS_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: no Process handle: the process was started "
+                          "with no System"),
+            f"SOS mainbare: ended status={STATUS_PANICKED}\n",
+            "SOS mainbare: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A program written with `main` that depends on `sosmain` and never
+        # imports it: its link has no `_start`, which `ld.lld` alone only
+        # warns about, and the user script's assertion refuses it, naming
+        # the fix.
+        "name": "main_not_imported",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAIN_UNIMPORTED_PKG,
+        "expect_build_error": "no _start: a main program imports sosmain",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+    {
+        # The output lock's wait in a `_start` package (`lock-wait`): the
+        # initial thread takes the lock and prints, a worker's `print` then
+        # waits for it, and the initial thread prints again and gives it
+        # back before the worker's line arrives. The worker has no block, and
+        # its lock-owner number is odd, so the yield hook does nothing and
+        # the tick hands the processor back; an even number would be read as
+        # a block's address. The tick moves the processor and the lock makes
+        # the order, so nothing here depends on how many ticks pass.
+        "name": "output_lock_wait",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "tick": True,
+        "root_pkg": LOCK_WAIT_PKG,
+        "strip_kernel_lines": True,
+        "expect_out": ["SOS lockwait: the holder took the output lock\n",
+                       "SOS lockwait: the holder gives the output lock "
+                       "back\n",
+                       "SOS lockwait: the waiter's line\n",
+                       "SOS lockwait: joined the waiter, which exited 7\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The debug path's rights check, in a `_start` package: `start-print`
+        # launches `child-start-print`, which adopts its boot word as a System
+        # and prints. On a System without `Debug` the line is dropped and the
+        # child exits 0, so nothing lies between root's banner lines and the
+        # child's exit line. On an Event's word, whose rights word is no
+        # System's, the line is dropped too, and the child then panics, having
+        # no Process handle to exit through: had its rights been read as a
+        # System's, the print would have signalled the Event, the debug
+        # print's op number being the Event's `Signal`, and root reads it
+        # back as 0.
+        "name": "start_print",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": START_PRINT_PKG,
+        "children": [CHILD_START_PRINT_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}\n"
+            "SOS: console handover\n"
+            "SOS: process exit: code={zero} process={one}",
+            "SOS printlaunch: no debug ended status=65536\n"
+            "SOS: process fault: the program panicked process={one} "
+            "text=panic at main.saw:",
+            ": SOS startprint: printed on a word that is no System\n",
+            f"SOS printlaunch: on an event ended status={STATUS_PANICKED}\n",
+            "SOS printlaunch: the Event reads 0\n",
+            "SOS printlaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # `start_no_heap`'s twin written with `main`: the start-up allocates
+        # nothing. The child links no arena, so any allocation is refused;
+        # `sosmain`'s start-up adopts its System, derives its Process and its
+        # main thread's handle and drains a boot set of three records, and
+        # `main` is reached, lists the set, takes each record by tag and
+        # returns, so the start-up exits 0. Kinds 8 and 13 are
+        # `BootHandleKind.Event` and `Pool`.
+        "name": "main_no_heap",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": BOOT_SET_LAUNCH_PKG,
+        "children": [CHILD_MAIN_NO_HEAP_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS bootlaunch: started",
+                       "SOS mainnoheap: main reached, 3 records",
+                       "SOS mainnoheap: record 2 kind 8",
+                       "SOS mainnoheap: record 3 kind 13",
+                       "SOS mainnoheap: record 4 kind 8",
+                       "SOS mainnoheap: took an Event, a pool and an Event",
+                       "SOS: process exit: code={zero} process={one}",
+                       "SOS bootlaunch: child status=65536",
+                       "SOS bootlaunch: done"],
+        "expect_clean_exit": True,
+    },
 ]
 
 INSTALL_HINTS = {
@@ -13638,7 +13940,7 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
                     image = _build_process(packager, profile, arch, pkg, role,
                                            env, plan, inputs)
                 except ToolError as e:
-                    return built, e
+                    return built, (pkg, role, e)
                 built.append((os.path.relpath(image, REPO_ROOT),
                               os.path.getsize(image)))
             return built, None
@@ -13648,7 +13950,10 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
             for rel, size in built:
                 print(f"  {rel}  ({size} bytes)")
             if err is not None:
-                build_error = err
+                pkg, role, e = err
+                if _expected_build_failure(cases, pkg, role, e, refused):
+                    continue
+                build_error = e
                 break
         if build_error is not None:
             print(f"{CROSS} failed to build a {arch['name']} process image"
@@ -15957,6 +16262,17 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #                      takes every record
     #   boot_set_release   a boot set's drop releases the records not taken,
     #                      and a record past its end is a panic
+    #   main_start         programs written with `main`: their statuses, the
+    #                      boot context, and each refusal of the start-up
+    #   main_no_heap       a `main` program with no arena reaches `main`
+    #   main_no_system     a `main` program started with no tag runs `main`
+    #                      and cannot exit, and its lent handles panic
+    #   main_not_imported  a `main` program that never imports `sosmain` is
+    #                      refused at its link
+    #   output_lock_wait   a `_start` thread waits on the output lock with
+    #                      no block
+    #   start_print        a `_start` package's print with no `Debug`, or on
+    #                      a word that is no System, is dropped
     #
     # Every process in them runs its code from the flash instruction window
     # and reads its read-only data through the data window, in place in its
@@ -15976,7 +16292,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "image_held", "data_init", "pool_ops",
                      "kill_churn", "kill_runnable", "image_limits",
                      "board_limits", "panic_op", "start_no_heap",
-                     "boot_set_release"]
+                     "boot_set_release", "main_start", "main_no_heap",
+                     "main_no_system", "main_no_system_lend_system",
+                     "main_no_system_lend_process", "main_not_imported",
+                     "output_lock_wait", "start_print"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 
@@ -16150,6 +16469,27 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
              "SOS winsawchild: printed from 100 frames down\n",
              "SOS winsawchild: answered 393937586, expected 393937586\n",
              "SOS winsawchild: exiting\n",
+             "SOS: process exit: code={five} process={one}"],
+            65541),
+        # A child written with `main`, built whole for the windowed ABI and
+        # beside the call0 Saw root: `sosmain`'s `_start` and the program are
+        # one compile, so the start-up's call into `main` is windowed. `main`
+        # says it runs windowed, makes a system call from 100 frames down,
+        # prints its chain's answer beside the loop's and returns 5 only when
+        # they agree, and the start-up exits with it.
+        windowed_child(
+            "windowed_saw_main", "xtensa-main-windowed",
+            ["SOS winmain: windowed code\n",
+             "SOS winmain: printed from 100 frames down\n",
+             "SOS winmain: answered 393937586, expected 393937586\n",
+             "SOS: process exit: code={five} process={one}"],
+            65541),
+        # The same program built for call0, the board's default ABI.
+        windowed_child(
+            "call0_saw_main", "xtensa-main-call0",
+            ["SOS winmain: call0 code\n",
+             "SOS winmain: printed from 100 frames down\n",
+             "SOS winmain: answered 393937586, expected 393937586\n",
              "SOS: process exit: code={five} process={one}"],
             65541),
         # A windowed Saw child's fault, 64 frames down: the kernel ends that
@@ -16932,17 +17272,19 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         for process in _case_processes(case):
             if process not in processes:
                 processes.append(process)
-    try:
-        env = _blade_env(clang, lld)
-        for pkg, role in processes:
-            plan, inputs = builds.get(role, (None, None))
+    env = _blade_env(clang, lld)
+    for pkg, role in processes:
+        plan, inputs = builds.get(role, (None, None))
+        try:
             image = _build_process(packager, profiles[keys_used[0]], arch,
                                    pkg, role, env, plan, inputs)
-            print(f"  {os.path.relpath(image, REPO_ROOT)}  "
-                  f"({os.path.getsize(image)} bytes)")
-    except ToolError as e:
-        print(f"{CROSS} failed to build an image\n{e}", file=sys.stderr)
-        return 1
+        except ToolError as e:
+            if _expected_build_failure(process_cases, pkg, role, e, refused):
+                continue
+            print(f"{CROSS} failed to build an image\n{e}", file=sys.stderr)
+            return 1
+        print(f"  {os.path.relpath(image, REPO_ROOT)}  "
+              f"({os.path.getsize(image)} bytes)")
     # The image descriptions read a case's images by arch name, as on the
     # gate.
     for case in process_cases:

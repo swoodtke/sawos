@@ -3713,7 +3713,7 @@ and every process — is the arena accessors and the word atomics. Each user HAL
 its syscall instruction and its thread register's two accessors, and nothing
 else. The arena's heap, taken under std's `SpinLock`, and the frozen
 `__saw_rt_*` seams are Saw in `rt/common/src/`, one copy serving the
-kernel and every process; the process side's three hooks and its parked boot
+kernel and every process; the process side's four hooks and its parked boot
 handle are Saw in `kernel/sysapi/`, beside the System object whose authority
 they spend. A free the heap can tell is bad (a block freed twice while its
 header still says free, a pointer outside the arena, before its first block,
@@ -3723,9 +3723,16 @@ the arena cannot serve answers a null pointer, as sawlang's allocator ABI has
 it: the allocator never ends the run itself, and std turns the null into an
 `AllocError` at the operation that asked. The
 third hook answers `SpinLock`'s question of which thread is asking: a process
-numbers its threads on first ask and keeps each number in the thread's thread
-register, which the kernel carries per thread on every profile, and the
-kernel, one context, answers one constant. A thread context
+keeps the answer in the thread's thread register, which the kernel carries
+per thread on every profile, and the kernel, one context, answers one
+constant. A thread that has a block (the main thread of a program written
+with `main`) answers with the block's address, which its start-up writes
+there first; any other is numbered on first ask, with an odd number, so no
+number is a block's address. The fourth is the output lock's wait: a process
+yields through the calling thread's own Thread handle, which its block
+holds, and the kernel does nothing, never finding the lock held by another.
+`print`'s lines and a task dump are written whole under that lock, which is
+recursive and which a panic takes and keeps. A thread context
 is built in Saw (`frame_init`, and a `resume_frame` that branches into the trap
 entry's own restore path), so no register-clearing prologue is needed in
 assembly.
@@ -4909,8 +4916,11 @@ reserved.
   launcher keeps the child's Process handle, so it supervises (`get_status`,
   the death wait and `kill`, §8) while the child manages itself. What the
   mask withholds is enforced at run time by the ordinary rights check — a
-  child that asks to `shutdown`, or prints without `Debug`, is
-  `AccessDenied` and dies, and the machine keeps running.
+  child that asks to `shutdown`, or makes the debug print without `Debug`, is
+  `AccessDenied` and dies, and the machine keeps running. A `print` is not
+  that op unguarded: the runtime asks its System handle's kind and rights
+  (`INFO_OP`) before its first write, and a process whose handle is no System
+  holding `Debug` prints nothing.
 - **What a launcher furnishes reaches hardware.** `give(iomemory:)` hands a
   child a device's window, over the `Transfer` bit `iomemory_rights()` mints,
   and `give(interrupt:)` hands it the device's line, a bound Interrupt (§2.8),

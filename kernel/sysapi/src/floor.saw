@@ -1343,20 +1343,33 @@ public(package) func ceiling_word(
 /// The boot handle, parked for the runtime hooks in `sos.rt`.
 ///
 /// The runtime seams take no handle (the ABI has no room for one), so the one
-/// root is given at boot is remembered here by `System.init` before anything
-/// can print. It is root's own authority kept in root's own address space, not
-/// ambient authority: a process that was never given the handle has nothing to
-/// remember and its prints are simply dropped. Its panics are not: the panic
-/// hook takes no handle (`sos_panic`).
+/// a process is given at boot is remembered here by `System.init` before
+/// anything can print. It is the process's own authority kept in its own
+/// address space, not ambient authority: a process that was never given the
+/// handle has nothing to remember and its prints are simply dropped, and so
+/// are the prints of one whose handle is no System holding `Debug`
+/// (`sos.rt`). Its panics are not: the panic hook takes no handle
+/// (`sos_panic`).
 ///
 /// `unsafe static var` rather than an `Atomic`: it is plain compound process
 /// state written once at boot, and spec §7's uniprocessor argument covers it as
 /// it covers the arena.
 public(package) unsafe static var SYSTEM_HANDLE: UInt = 0
 
+/// Whether `print` may write through the parked handle: `PRINT_UNASKED` until
+/// the first write asks the kernel, then `PRINT_DEBUG` or `PRINT_SILENT`
+/// (`sos.rt`). Parking a handle clears it, so the answer is always about the
+/// handle parked now.
+public(package) static PRINT_ANSWER: Atomic<Int> = Atomic(0)
+
+public(package) static PRINT_UNASKED: Int = 0
+public(package) static PRINT_DEBUG: Int = 1
+public(package) static PRINT_SILENT: Int = 2
+
 /// Park the boot handle. A small named `unsafe` helper is how contact with an
 /// unsafe-typed value is confined, and it keeps the public
 /// `System(boot_handle:)` an ordinary safe signature.
 public(package) func park_system_handle(handle: UInt) unsafe {
     SYSTEM_HANDLE = handle
+    PRINT_ANSWER.store(PRINT_UNASKED)
 }

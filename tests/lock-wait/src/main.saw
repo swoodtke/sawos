@@ -1,0 +1,100 @@
+// The output lock's wait in a `_start` package, whose threads have no block:
+//
+//   SOS lockwait: the holder took the output lock
+//   SOS lockwait: the holder gives the output lock back
+//   SOS lockwait: the waiter's line
+//   SOS lockwait: joined the waiter, which exited 7
+//
+// The initial thread takes the output lock with `__saw_rt_output_lock`,
+// prints, and starts a worker made at the image entry. It yields until the
+// worker says it is about to print, and once more: the worker's `print`
+// then finds the lock held and waits. A `_start` thread's lock-owner number
+// is odd, so the yield hook finds no block and the worker spins until the
+// tick hands the processor back. The initial thread prints again, gives the
+// lock back and joins the worker, whose line comes only now.
+//
+// An even number would be read as a block's address, and its first word as a
+// Thread handle to yield through.
+
+import sos.{System, SosStatus}
+
+extern "C" {
+    func __saw_rt_output_lock()
+    func __saw_rt_output_unlock()
+}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+static EXIT_WAITER: UInt = 7
+
+/// The boot handle, parked by the initial thread for the worker; zero until
+/// then, which is how an entry tells the initial thread from the worker.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// Set by the worker just before it prints.
+static ABOUT_TO_PRINT: Atomic<Int> = Atomic(0)
+
+/// The worker's stack, in this process's own zero-init data.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+/// Every profile wants a 16-byte-aligned stack pointer.
+static STACK_ALIGN: UInt = 16
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    if parked() != 0 {
+        waiter()
+        return
+    }
+    park(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    try holder(&system) catch {
+        print("SOS lockwait: refused: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func holder(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    let me = try proc.thread_self()
+    let worker = try proc.thread_create(stack_top: stack_top(), arg: 0)
+    __saw_rt_output_lock()
+    print("SOS lockwait: the holder took the output lock")
+    try worker.start()
+    while ABOUT_TO_PRINT.load() == 0 {
+        try me.yield_now()
+    }
+    try me.yield_now()
+    print("SOS lockwait: the holder gives the output lock back")
+    __saw_rt_output_unlock()
+    let code = try worker.join()
+    print("SOS lockwait: joined the waiter, which exited {}", code)
+    return
+}
+
+/// The worker: print, which waits for the lock, then exit.
+func waiter() unsafe {
+    let system = System(boot_handle: parked())
+    ABOUT_TO_PRINT.store(1)
+    print("SOS lockwait: the waiter's line")
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let _ = (move me).exit(EXIT_WAITER)
+}
+
+func parked() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+func park(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+/// The highest 16-aligned address inside the worker's stack.
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    let top = base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+    top - (top % STACK_ALIGN)
+}

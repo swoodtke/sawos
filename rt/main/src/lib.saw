@@ -1,0 +1,315 @@
+//! `sosmain`: the start-up of a program written with `main`, and the boot
+//! context `main` reads.
+//!
+//! A program opts in by depending on this package and importing it:
+//!
+//! ```saw
+//! import sosmain
+//!
+//! func main() -> Result<Void, SosStatus> {
+//!     var set = sosmain.take_boot_set()
+//!     ...
+//!     let t = try sosmain.context().process().thread_self()
+//!     print("started")
+//!     return
+//! }
+//! ```
+//!
+//! It exports `_start`, the image entry, which adopts the boot word as the
+//! process's System, derives its Process handle and the main thread's own
+//! Thread handle, drains the boot set, runs `main` through the compiler's
+//! `__saw_main` and ends the process with `main`'s status. A package that
+//! exports its own `_start` never imports this one: two exports of one symbol
+//! are refused at compile time.
+//!
+//! The start-up allocates nothing, so a program with no heap starts.
+//!
+//! Every way the start-up cannot go on is a panic naming the cause, which
+//! ends the process as `Faulted` with the reason `Panic` and the text on the
+//! kernel's fault line. A missing right would otherwise be the kernel's fault
+//! inside the call that needs it, with the kernel's words and none of the
+//! runtime's, so the start-up reads each handle's rights (`INFO_OP`, which no
+//! right gates) before it spends them.
+//!
+//! `main` borrows the System and the Process, which the runtime keeps for the
+//! process's life, and takes the boot set: see `context()` and
+//! `take_boot_set()`.
+
+import sos.{System, Process, BootSet, SosStatus, HandleInfo, HandleKind,
+            SystemRight, ProcessRight, ThreadRight, sos_handle_info}
+import sos.rt.{ThreadBlock, enter_thread_block}
+
+// The program's entry, which the compiler defines in a program whose module
+// declares `main` (sawlang's runtime/ABI.md, "The program entry"): it runs
+// `main` and answers its exit status, 0 to 255. An `Err` has been written as
+// `error: ...` and answers 1; a status outside the range is a panic, and does
+// not return.
+extern "C" {
+    func __saw_main() -> Int32
+}
+
+/// The handle word a process started with no tag is given: no handle.
+static NO_WORD: UInt = 0
+
+/// Set by the start-up's first act. A second thread made at the image entry
+/// finds it set.
+static STARTED: Atomic<Int> = Atomic(0)
+
+/// The address of the start-up's `Boot` value once it is published, and zero
+/// before.
+unsafe static var BOOT_AT: UInt = 0
+
+/// What the start-up keeps for `main`: the process's System and Process,
+/// absent when it was started with no tag, the Process handle's rights, and
+/// the boot set until `main` takes it.
+///
+/// It lives in `_start`'s frame, which outlives `main` because `main` runs
+/// inside `_start`'s call, and is reached through its parked address
+/// (`BOOT_AT`). A static cannot hold it: a static's type must be trivially
+/// destructible, and each wrapper has a `deinit`.
+struct Boot {
+    system: System?
+    process: Process?
+    process_rights: UInt32
+    set: BootSet?
+    /// 0 until the boot set is taken, then 1: the take is one
+    /// compare-and-swap, so of two threads that race only one moves it out.
+    taken: Atomic<Int>
+}
+
+extension Boot: NoCopy {}
+
+/// The image entry of a program written with `main`. Its first argument is
+/// the boot word: the handle under the tag the launcher started it with, or no
+/// handle.
+///
+/// The start-up's frame holds the main thread's block and the boot context
+/// for the rest of the process's life, and it never returns: it ends the
+/// process through the Process exit op with `main`'s status, or panics.
+@export("_start")
+func _start(boot: UInt) unsafe -> Never {
+    // A thread made at the image entry runs this again, where it would adopt
+    // its argument as a second System and run `main` twice.
+    if not STARTED.compare_exchange(0, 1) {
+        panic("sos: a thread entered the image entry; make threads with thread_create(run:)")
+    }
+    // The block goes into the thread register before anything takes a lock,
+    // so every lock the main thread takes records the block as its owner.
+    var block = ThreadBlock()
+    enter_thread_block((&var block) as UnsafePointer<ThreadBlock>)
+
+    var start = if boot == NO_WORD {
+        Boot(system: None, process: None, process_rights: 0, set: None,
+             taken: Atomic(0))
+    } else {
+        adopt(boot, &var block)
+    }
+    BOOT_AT = ((&var start) as UnsafePointer<Boot>) as UInt
+
+    let status = __saw_main()
+    flush()
+    end(UInt.from(truncating: status), "main returned")
+}
+
+/// Adopt `boot` as the process's System, derive its Process and the main
+/// thread's own Thread handle, keeping the last in `block`, and drain the boot
+/// set. Each refusal panics, naming it.
+func adopt(boot: UInt, block: &var ThreadBlock) unsafe -> Boot {
+    let kind = kind_of(boot)
+    if kind != (HandleKind.System as UInt) {
+        panic("sos: the boot word names {}, not a System", kind_name(kind))
+    }
+    let system = System(boot_handle: boot)
+    let system_rights = try system.rights() catch {
+        panic("sos: the System handle's rights cannot be read: {}", error)
+    }
+    if (system_rights & (SystemRight.ProcessSelf as UInt32)) == 0 {
+        panic("sos: the System handle lacks ProcessSelf")
+    }
+    let process = try system.process_self() catch {
+        panic("sos: no process handle: {}", error)
+    }
+    let rights = try process.rights() catch {
+        panic("sos: the Process handle's rights cannot be read: {}", error)
+    }
+    // The output lock's wait yields through the main thread's own handle; a
+    // main thread with none could wait for good behind a holder parked on a
+    // console's ring.
+    if (rights & (ProcessRight.ThreadSelf as UInt32)) == 0 {
+        panic("sos: a main program needs ThreadSelf")
+    }
+    let thread = try process.thread_self() catch {
+        panic("sos: no thread handle: {}", error)
+    }
+    // The yield is `ThreadOp.Yield` through that handle, which a Thread
+    // ceiling without `Control` leaves the handle unable to make.
+    let thread_rights = try thread.rights() catch {
+        panic("sos: the Thread handle's rights cannot be read: {}", error)
+    }
+    if (thread_rights & (ThreadRight.Control as UInt32)) == 0 {
+        panic("sos: a main program's thread handle needs Control")
+    }
+    block.keep(move thread)
+    if (rights & (ProcessRight.BootHandles as UInt32)) == 0 {
+        panic("sos: the Process handle lacks BootHandles")
+    }
+    let set = try BootSet(process: &process) catch {
+        panic("sos: the boot set's drain answered {}", error)
+    }
+    Boot(system: move system, process: move process, process_rights: rights,
+         set: move set, taken: Atomic(0))
+}
+
+/// The kind of the handle `word` names (`HandleInfo.Kind`), as its number.
+func kind_of(word: UInt) unsafe -> UInt {
+    var kind: UInt = 0
+    let _ = sos_handle_info(word, HandleInfo.Kind as UInt,
+                            (&var kind) as UnsafePointer<UInt>)
+    kind
+}
+
+/// A handle kind's name, with its article, for a refusal's text.
+func kind_name(kind: UInt) -> String {
+    guard let known = HandleKind.from(raw: kind) else {
+        return "an unknown kind"
+    }
+    match known {
+        case System -> "a System",
+        case Process -> "a Process",
+        case Thread -> "a Thread",
+        case Event -> "an Event",
+        case Waiter -> "a Waiter",
+        case Interrupt -> "an Interrupt",
+        case Clock -> "a Clock",
+        case Timer -> "a Timer",
+        case Memory -> "a Memory",
+        case IoMemory -> "an IoMemory",
+        case Mapping -> "a Mapping",
+        case PipeInlet -> "a PipeInlet",
+        case PipeOutlet -> "a PipeOutlet",
+        case PipeReply -> "a PipeReply",
+        case PipeRequest -> "a PipeRequest",
+        case Pool -> "a Pool"
+    }
+}
+
+/// End the process with `status` through the Process exit op, or panic naming
+/// why it cannot: a process started with no tag has no Process handle, and
+/// one whose Process ceiling took `Exit` away cannot exit. `how` says where
+/// the status came from, for the panic's text.
+func end(status: UInt, how: String) unsafe -> Never {
+    let boot = boot_at() as UnsafePointer<Boot>
+    if boot[0].process == None {
+        panic("sos: {} {} with no Process handle to exit through", how, status)
+    }
+    if (boot[0].process_rights & (ProcessRight.Exit as UInt32)) == 0 {
+        panic("sos: {} {} and the Process handle lacks Exit", how, status)
+    }
+    try context().process().exit(status) catch {
+        panic("sos: {} {} and the exit was refused: {}", how, status, error)
+    }
+    while { }
+}
+
+/// The start-up's `Boot` value's address.
+func boot_at() unsafe -> UInt {
+    let at = BOOT_AT
+    if at == 0 {
+        panic("sos: the boot context is read before the start-up made it")
+    }
+    at
+}
+
+/// A view of the boot context, one word: the start-up's `Boot` value's
+/// address. Copy it freely; what it lends lives for the process's life.
+public struct Context {
+    private at: UInt
+}
+
+/// The boot context: what the start-up made for `main`.
+///
+/// ```saw
+/// borrow let proc = sosmain.context().process() {
+///     let waiter = try proc.waiter_create()
+/// }
+/// let t = try sosmain.context().process().thread_self()
+/// ```
+public func context() -> Context {
+    Context(at: boot_at())
+}
+
+extension Context {
+    // The two lends below are declared before the safe accessors that forward
+    // them: sawc refuses a forwarding lend of an accessor declared after it
+    // in the extension.
+    func boot_system(&self) unsafe borrows -> &System {
+        let boot = self.at as UnsafePointer<Boot>
+        if boot[0].system == None {
+            panic("sos: no System: the process was started with no boot handle")
+        }
+        lend boot[0].system!
+    }
+
+    func boot_process(&self) unsafe borrows -> &Process {
+        let boot = self.at as UnsafePointer<Boot>
+        if boot[0].process == None {
+            panic("sos: no Process handle: the process was started with no System")
+        }
+        lend boot[0].process!
+    }
+
+    /// The process's System handle, lent: `main` may use it, and mint
+    /// siblings of it, but cannot drop it or give it away, because `print`
+    /// writes through its word. A process started with no tag has none, and
+    /// asking panics.
+    public func system(&self) borrows -> &System {
+        lend self.boot_system()
+    }
+
+    /// The process's own Process handle, lent: exit, `thread_self`, waiters,
+    /// gives and maps all work through it. `system().process_self()` mints a
+    /// second one that `main` owns. A process started with no tag has none,
+    /// and asking panics.
+    public func process(&self) borrows -> &Process {
+        lend self.boot_process()
+    }
+}
+
+/// The boot set, drained by the start-up, handed over once. `main` owns it:
+/// it takes records by tag, and dropping it releases the records nobody took.
+/// A set `main` never takes is released when the process ends.
+///
+/// A second call panics, on any thread, and so does a call in a process
+/// started with no tag, which has no boot set.
+public func take_boot_set() -> BootSet {
+    take_set(boot_at())
+}
+
+func take_set(at: UInt) unsafe -> BootSet {
+    let boot = at as UnsafePointer<Boot>
+    if boot[0].system == None {
+        panic("sos: no boot set: the process was started with no System")
+    }
+    if not boot[0].taken.compare_exchange(0, 1) {
+        panic("sos: the boot set was taken already")
+    }
+    guard let set = boot[0].set.take() else {
+        panic("sos: the boot set is missing")
+    }
+    move set
+}
+
+/// Make every line printed so far reach the console before what follows.
+///
+/// `print` writes through the kernel's debug print, which has written each
+/// byte by the time it returns, so there is nothing to wait for.
+public func flush() {
+}
+
+/// End the process with `code`, after `flush()`, through the Process exit op:
+/// a supervisor reads the low 16 bits under `Exited`. A Process handle whose
+/// ceiling took `Exit` away panics, naming the code.
+public func exit(code: UInt) -> Never {
+    flush()
+    end(code, "sosmain.exit was given")
+}

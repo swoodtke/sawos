@@ -119,6 +119,22 @@ public func package_dir(package: String, sawos: String, product: String) -> Stri
     "{product}/{package}"
 }
 
+/// The declarations of a stock-root image's processes, in its order: each
+/// package's `process.toml`, read with the `Saw.toml` beside it
+/// (`Declaration.load`), each package from the product's root `product`.
+public func image_declarations(image: &ImageFile, sawos: String,
+                               product: String) -> Result<Vector<Declaration>, BuildError> {
+    var decls = Vector<Declaration>()
+    var i = 0
+    while i < image.processes.len() {
+        let process = image.processes.get(i)!
+        i = i + 1
+        let file = "{package_dir(process.package, sawos, product)}/process.toml"
+        try! decls.push(try Declaration.load(file))
+    }
+    return move decls
+}
+
 /// The `SlabKind` a `[limits]` key totals.
 func slab_of(key: String) -> Int {
     if key.equals("processes") { return PROCESSES }
@@ -233,14 +249,7 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
     var plan_rows = Vector<RowSpec>()
     var root_dir = ""
     if image.stock {
-        var decls = Vector<Declaration>()
-        var i = 0
-        while i < count {
-            let process = image.processes.get(i)!
-            i = i + 1
-            let file = "{package_dir(process.package, sawos, product)}/process.toml"
-            try! decls.push(try Declaration.parse(try read_text(file), file))
-        }
+        let decls = try image_declarations(&image, sawos, product)
         let bound = try bind(&image, &board, &decls, facts.grain)
         var n = 0
         while n < bound.notes.len() {
@@ -259,7 +268,7 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
         let slabs = plan_slabs(&limits, &kernel_facts)
         try check_plan(&plan, &kernel_facts, &defaults, &slabs, path)
 
-        i = 0
+        var i = 0
         while i < count {
             let process = image.processes.get(i)!
             borrow let d = decls[i] {

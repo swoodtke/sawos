@@ -20,8 +20,8 @@ import sosimage.imagefile.{Bindings, Bound, InputValue}
 import sosimage.plan.{ImagePlan, PlanRecord, PlanSlabs, Source, check_plan, plan_image,
                       plan_module, root_windows, window_rows}
 import sosimage.limits.{ImageLimits}
-import sosimage.product.{described_spec, input_path, plan_slabs, process_extras,
-                         quota_defaults, slab_total, stock_region_rows}
+import sosimage.product.{described_spec, image_declarations, input_path, plan_slabs,
+                         process_extras, quota_defaults, slab_total, stock_region_rows}
 import sosimage.regions.{RegionKind}
 import sosimage.tool.{write_lines}
 
@@ -296,7 +296,44 @@ func one_child(records: String, connections: Int) -> String {
     "\{\"connections\": {connections}, \"children\": [\{\"name\": \"c\", \"image\": 0, \"destination\": 1, \"start\": 1, \"records\": [{records}]\}]\}"
 }
 
+/// A stock image of one process, `heartbeat`, whose package in the product
+/// at `dir` is a program written with `main`: its declaration, read with its
+/// manifest, counts the main thread's handle, and a plan whose children
+/// start with the handles a `_start` package would hold is refused.
+func main_program_plan() {
+    let dir = "../../.build/sosimage-tests/main-plan"
+    try! ensure_directory("{dir}/heartbeat")
+    try! write_lines("{dir}/heartbeat/process.toml", &heartbeat_lines())
+    let manifest: Vector<String> = ["[package]", "name = \"heartbeat\"", "version = \"0.1.0\"",
+        "[dependencies]", "sosmain = \{ path = \"../../rt/main\" \}"]
+    try! write_lines("{dir}/heartbeat/Saw.toml", &manifest)
+    let lines: Vector<String> = ["format = 1",
+        "[image]", "name = \"m\"", "board = \"esp32s3\"", "tick = true",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"heartbeat\"", "package = \"heartbeat\""]
+    let b = board()
+    let image = try! ImageFile.parse(join(&lines), "m.toml", &b, 4)
+    let decls = try! image_declarations(&image, "../..", dir)
+    let bound = try! bind(&image, &b, &decls, 4)
+    let plan = try! plan_image(&image, &b, &decls, &bound, 4)
+    let f = facts(32)
+    let d = defaults(2)
+    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100)
+    let got = match check_plan(&plan, &f, &d, &slabs, "m.toml") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    let want = "m.toml: the process heartbeat's `Handle` row is 2, short of the 3 handles it holds when it starts"
+    if not got.equals(want) {
+        print("expected: {want}")
+        print("got:      {got}")
+    }
+    assert(got.equals(want), "a main program's plan counts its main thread's handle")
+}
+
 func main() {
+    main_program_plan()
+
     // The box: rows, records, connections, setup writes, quota rows.
     let decls = box_decls()
     let box = match planned(join(&box_lines()), &decls, 4) {

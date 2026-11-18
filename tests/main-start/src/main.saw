@@ -1,0 +1,288 @@
+// `sosmain`'s start-up, from the supervisor's side: `child-main` launched in
+// one region once per role and once per way its start-up refuses, each
+// launch waited out and its status word printed:
+//
+//   SOS mainstart: <round> ended status=<word>
+//
+// `Exited` (1) << 16 with `main`'s status, or `Faulted` (2) << 16 | 14
+// (`FaultReason.Panic`) for every end the runtime raises, with its text on the
+// kernel's fault line. The `hold` round also prints the child's `Handle` row
+// as it reads it with the child's boot set held and dropped.
+//
+// This image's kernel arms no tick, so root parks in each wait and the
+// child's death, or its signal, is what brings it back: the kernel's lines
+// come before root's by construction.
+
+import sos.{System, Process, Memory, SosStatus, SystemRight, ProcessRight,
+            ThreadRight, QuotaKind, ALL_RIGHTS}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_READY: UInt = 41
+static TAG_GO: UInt = 42
+static TAG_EXTRA: UInt = 43
+static TAG_SPARE_A: UInt = 44
+static TAG_SPARE_B: UInt = 45
+
+static KEY_DEATH: UInt = 6
+static KEY_READY: UInt = 8
+
+/// The roles `child-main` knows.
+static ROLE_SEVEN: UInt = 1
+static ROLE_ERROR: UInt = 2
+static ROLE_RANGE: UInt = 3
+static ROLE_CONTEXT: UInt = 4
+static ROLE_HOLD: UInt = 5
+static ROLE_ENTRY: UInt = 6
+static ROLE_PRINT: UInt = 7
+static ROLE_ZERO: UInt = 8
+static ROLE_EXIT: UInt = 9
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer | SystemRight.ClockGet)
+static CHILD_NO_DEBUG: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer
+                                 | SystemRight.ClockGet)
+static CHILD_NO_PROCESS: UInt32 = (SystemRight.Debug | SystemRight.Transfer
+                                   | SystemRight.ClockGet)
+
+/// A Process ceiling with one right taken away.
+static NO_THREAD_SELF: UInt32 = (ALL_RIGHTS
+                                 & ~(ProcessRight.ThreadSelf as UInt32))
+static NO_BOOT_HANDLES: UInt32 = (ALL_RIGHTS
+                                  & ~(ProcessRight.BootHandles as UInt32))
+static NO_EXIT: UInt32 = ALL_RIGHTS & ~(ProcessRight.Exit as UInt32)
+
+/// A Thread ceiling without `Control`.
+static NO_CONTROL: UInt32 = ALL_RIGHTS & ~(ThreadRight.Control as UInt32)
+
+/// `Handle` rows with room for the System given and nothing more, and for
+/// the System and the Process handle the start-up derives.
+static ROOM_FOR_SYSTEM: UInt16 = 1
+static ROOM_FOR_PROCESS: UInt16 = 2
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS mainstart: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS mainstart: refused: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS mainstart: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var main_img_rec = try proc.boot_handle_next()
+    var main_ram_rec = try proc.boot_handle_next()
+    guard let main_img = main_img_rec.take_memory() else { return BUG }
+    guard let main_ram = main_ram_rec.take_memory() else { return BUG }
+
+    try with_role(&system, &proc, &main_img, &main_ram, "seven", ROLE_SEVEN,
+                  CHILD_SYSTEM, ALL_RIGHTS)
+    try with_role(&system, &proc, &main_img, &main_ram, "error", ROLE_ERROR,
+                  CHILD_SYSTEM, ALL_RIGHTS)
+    try with_role(&system, &proc, &main_img, &main_ram, "range", ROLE_RANGE,
+                  CHILD_SYSTEM, ALL_RIGHTS)
+    try with_role(&system, &proc, &main_img, &main_ram, "exit", ROLE_EXIT,
+                  CHILD_SYSTEM, ALL_RIGHTS)
+    try with_role(&system, &proc, &main_img, &main_ram, "context",
+                  ROLE_CONTEXT, CHILD_SYSTEM, ALL_RIGHTS)
+    try hold(&system, &proc, &main_img, &main_ram)
+    try with_role(&system, &proc, &main_img, &main_ram, "entry", ROLE_ENTRY,
+                  CHILD_SYSTEM, ALL_RIGHTS)
+    try with_role(&system, &proc, &main_img, &main_ram, "no debug",
+                  ROLE_PRINT, CHILD_NO_DEBUG, ALL_RIGHTS)
+    try on_memory(&system, &proc, &main_img, &main_ram)
+    try with_role(&system, &proc, &main_img, &main_ram, "no process self",
+                  ROLE_ZERO, CHILD_NO_PROCESS, ALL_RIGHTS)
+    try with_role(&system, &proc, &main_img, &main_ram, "no thread self",
+                  ROLE_ZERO, CHILD_SYSTEM, NO_THREAD_SELF)
+    try with_role(&system, &proc, &main_img, &main_ram, "no boot handles",
+                  ROLE_ZERO, CHILD_SYSTEM, NO_BOOT_HANDLES)
+    try with_role(&system, &proc, &main_img, &main_ram, "no exit", ROLE_ZERO,
+                  CHILD_SYSTEM, NO_EXIT)
+    try no_control(&system, &proc, &main_img, &main_ram)
+    try short_row(&system, &proc, &main_img, &main_ram, "no room for a process",
+                  ROOM_FOR_SYSTEM)
+    try short_row(&system, &proc, &main_img, &main_ram, "no room for a thread",
+                  ROOM_FOR_PROCESS)
+    try bare(&system, &proc, &main_img, &main_ram)
+    return
+}
+
+/// A `child-main` given its role, and a System narrowed to `rights` under
+/// `TAG_BOOT`, whose Process ceiling is narrowed to `ceiling`, started on the
+/// System. The `context` round also gets an Event under `TAG_EXTRA`.
+func with_role(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+               round: String, role: UInt, rights: UInt32,
+               ceiling: UInt32) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    if ceiling != ALL_RIGHTS {
+        try child.restrict_rights(process: ceiling)
+    }
+    try give_role(&proc, &child, role)
+    if role == ROLE_CONTEXT {
+        try give_event(&proc, &child, TAG_EXTRA)
+    }
+    try give_system(&system, &child, rights)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, round)
+}
+
+/// `HOLD`: the child signals `READY` with its boot set held, and again once
+/// it has dropped the set with two records untaken; at each signal root reads
+/// its `Handle` row and lets it go on with `GO`.
+///
+/// The child holds its System and Process, its main thread's own Thread
+/// handle, the two Events it took and a Waiter, and the two spares while the
+/// set holds them. The role's Event is gone by then, released once read.
+func hold(system: &System, proc: &Process, img: &Memory,
+          ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    try give_role(&proc, &child, ROLE_HOLD)
+    let ready = try proc.event_create()
+    let go = try proc.event_create()
+    let ready_given = try ready.mint()
+    try child.give(event: move ready_given, tag: TAG_READY) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let go_given = try go.mint()
+    try child.give(event: move go_given, tag: TAG_GO) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try give_event(&proc, &child, TAG_SPARE_A)
+    try give_event(&proc, &child, TAG_SPARE_B)
+    try give_system(&system, &child, CHILD_SYSTEM)
+    let waiter = try proc.waiter_create()
+    try waiter.add(event: &ready, key: KEY_READY)
+    try child.start(boot_tag: TAG_BOOT)
+
+    let _ = try waiter.wait()
+    let held = try child.quota_get(QuotaKind.Handle)
+    try go.signal(bits: 1)
+    let _ = try waiter.wait()
+    let dropped = try child.quota_get(QuotaKind.Handle)
+    try go.signal(bits: 1)
+    print("SOS mainstart: hold: handles {} with the set, {} after it dropped",
+          held.used, dropped.used)
+    try ended(&proc, move child, "hold")
+}
+
+/// A `child-main` whose Thread ceiling lacks `Control`, so the main thread's
+/// own handle cannot yield.
+func no_control(system: &System, proc: &Process, img: &Memory,
+                ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    try child.restrict_rights(thread: NO_CONTROL)
+    try give_role(&proc, &child, ROLE_ZERO)
+    try give_system(&system, &child, CHILD_SYSTEM)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, "no control")
+}
+
+/// A `child-main` given only its System, whose `Handle` row is `limit`: the
+/// start-up's next mint past it is refused.
+func short_row(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+               round: String, limit: UInt16) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    try give_system(&system, &child, CHILD_SYSTEM)
+    try child.quota_set(QuotaKind.Handle, limit: limit)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, round)
+}
+
+/// A `child-main` started on a Memory record: a sibling of its own image's
+/// region.
+func on_memory(system: &System, proc: &Process, img: &Memory,
+               ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    let region = try img.mint()
+    try child.give(memory: move region, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, "memory")
+}
+
+/// A `child-main` started with no tag: its boot word is no handle.
+func bare(system: &System, proc: &Process, img: &Memory,
+          ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    try child.start()
+    try ended(&proc, move child, "no tag")
+}
+
+/// The child's role, as the bits of an Event under `TAG_ROLE`.
+func give_role(proc: &Process, child: &Process,
+               role: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: role)
+    try child.give(event: move ev, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// An Event nothing signals, under `tag`.
+func give_event(proc: &Process, child: &Process,
+                tag: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// A System narrowed to `rights`, under `TAG_BOOT`.
+func give_system(system: &System, child: &Process,
+                 rights: UInt32) -> Result<Void, SosStatus> {
+    let boot = try system.mint(rights: rights)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Wait for `child`'s death and print its status word; the handle goes with
+/// it, so the next round's child takes the same region.
+func ended(proc: &Process, child: Process,
+           round: String) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH {
+                return BUG
+            }
+            print("SOS mainstart: {} ended status={}", round, status)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

@@ -50,6 +50,12 @@
  */
 
 ENTRY(_start)
+/* A program written with `main` gets its `_start` from `sosmain`, and only
+ * when it imports that package. Without the import the link has no entry,
+ * which `ld.lld` only warns about, so the warning is made an error that names
+ * the fix.
+ */
+ASSERT(DEFINED(_start), "no _start: a main program imports sosmain")
 
 /* `sosrt`'s heap arena (hal/riscv32/user/user.ld describes the
  * knob). `.bss`-resident, so it costs nothing in the image but counts fully

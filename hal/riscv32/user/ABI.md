@@ -3,7 +3,8 @@
 The entire architecture-dependent surface of an SOS process is one C file
 defining `sos_syscall1` and `sos_syscall3`, and the thread register's two
 accessors, `sos_thread_word` and `sos_set_thread_word` (`tp`, which the runtime
-owns: it keeps a thread's lock-owner number there). `root/src/` builds for
+owns: it keeps a thread's lock-owner identity there, a number or the address
+of the thread's block). `root/src/` builds for
 arm64 with only its `[sos.<triple>]` manifest sections differing (the linker
 script and the `native` line).
 
@@ -80,8 +81,8 @@ keeps the syscall instruction's operand list the same shape, which is the only
 part of a process that has to know it is riscv32 — a per-answer register
 convention would make this file grow with the object model.
 
-The runtime's three hooks (`sos_rt_write`, `sos_rt_abort`,
-`sos_rt_lock_owner`) and the parked boot
+The runtime's four hooks (`sos_rt_write`, `sos_rt_abort`,
+`sos_rt_lock_owner`, `sos_rt_yield`) and the parked boot
 handle are part of a process's contract but are not this directory's. See
 `kernel/sysapi/src/lib.saw`, and `rt/common/src/lib.saw` for what calls them.
 

@@ -88,6 +88,8 @@ func fixture_with(dir: String, decl: Vector<String>, spi: Vector<String>) {
     try! write_lines("{dir}/hal/c/board.toml", &c)
     try! write_lines("{dir}/drivers/d/process.toml", &decl)
     try! write_lines("{dir}/drivers/e/process.toml", &spi)
+    try! write_lines("{dir}/drivers/d/Saw.toml", &manifest("d"))
+    try! write_lines("{dir}/drivers/e/Saw.toml", &manifest("e"))
     let images: Vector<String> = ["i.toml", "o.toml", "u.toml"]
     var i = 0
     while i < images.len() {
@@ -116,6 +118,11 @@ func driver(kind_type: String, inputs: String) -> Vector<String> {
      "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
      "[[boot]]", "name = \"uart\"", "kind = \"window\"", "type = \"{kind_type}\"", "tag = 2",
      "[build]", "inputs = [{inputs}]"]
+}
+
+/// The manifest of a fixture package named `name`, which depends on nothing.
+func manifest(name: String) -> Vector<String> {
+    ["[package]", "name = \"{name}\"", "version = \"0.1.0\""]
 }
 
 // A kernel whose handle table holds 32, whose budget leaves 12 grant rows,
@@ -272,6 +279,20 @@ func main() {
     fixture(dir, driver("uart", ""))
     expect(tree_refusal(dir), "{dir}/drivers/d/process.toml: line 13, column 1: `pins` is a board input of the type `uart` on the board b, and [build] inputs does not list it")
 
+    // A package whose manifest has no `[dependencies]` is no program written
+    // with `main`, so a `handles` row at a `_start` package's floor holds.
+    fixture(dir, with_quota(driver("uart", "\"pins\""), "handles = 4"))
+    expect(tree_refusal(dir), "")
+
+    // A package whose manifest depends on `sosmain` is a program written
+    // with `main`, whose start-up holds its main thread's own handle: a
+    // `handles` row at a `_start` package's floor is refused for it.
+    fixture(dir, with_quota(driver("uart", "\"pins\""), "handles = 4"))
+    let main_manifest: Vector<String> = ["[package]", "name = \"d\"", "version = \"0.1.0\"",
+        "[dependencies]", "sosmain = \{ path = \"../../rt/main\" \}"]
+    try! write_lines("{dir}/drivers/d/Saw.toml", &main_manifest)
+    expect(tree_refusal(dir), "{dir}/drivers/d/process.toml: line 15, column 1: `handles` in [quota] is 4, below the 5 the process holds when it starts: one per [[boot]] record, its Process handle, one Mapping per window and its main thread's own Thread handle, which `sosmain`'s start-up holds for a program written with `main`")
+
     // A tree's products: a package directly under a product's root is held
     // as the tree's are; an image in its `images/` is read with its paths from
     // that root, and refused like the tree's when its board is not the tree's.
@@ -284,6 +305,7 @@ func main() {
     try! ensure_directory("{pdir}/tests/product/images")
     let p = driver("uart", "\"pins\"")
     try! write_lines("{pdir}/templates/product/p/process.toml", &p)
+    try! write_lines("{pdir}/templates/product/p/Saw.toml", &manifest("p"))
     let with_product = match read_tree(pdir) {
         case Ok(t) -> move t,
         case Err(e) -> panic("{e.message}")

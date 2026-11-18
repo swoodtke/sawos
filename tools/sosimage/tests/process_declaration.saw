@@ -187,6 +187,17 @@ func main() {
     // A declared handle row below what the process starts holding.
     expect_refusal(with_line(24, "handles = 5"),
                    "p.toml: line 24, column 1: `handles` in [quota] is 5, below the 6 the process holds when it starts: one per [[boot]] record, its Process handle and one Mapping per window")
+    // A program written with `main` holds its main thread's own handle too,
+    // so the row that sufficed for a `_start` package is refused for one.
+    let as_main = match Declaration.parse(text_of(&lines), "p.toml", main: true) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(as_main.equals("p.toml: line 24, column 1: `handles` in [quota] is 6, below the 7 the process holds when it starts: one per [[boot]] record, its Process handle, one Mapping per window and its main thread's own Thread handle, which `sosmain`'s start-up holds for a program written with `main`"),
+           "a main program's floor counts its main thread's handle")
+    let main_floor = try! Declaration.parse(with_line(24, "handles = 7"), "p.toml", main: true)
+    assert(main_floor.handle_floor() == 7, "a main program's floor")
+    assert(d.handle_floor() == 6, "a `_start` package's floor")
     expect_refusal(with_line(25, "rows = 1"),
                    "p.toml: line 25, column 1: `rows` is not a key of [quota], which takes `threads`, `events`, `waiters`, `timers`, `memories`, `iomemories`, `mappings`, `pipes`, `handles`")
 

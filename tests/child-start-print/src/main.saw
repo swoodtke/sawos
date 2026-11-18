@@ -1,0 +1,33 @@
+// Test child with its own `_start`, for `start_print`: it adopts its boot word
+// as a System, whatever the word names, and prints a line, which goes nowhere
+// unless the word is a System holding `Debug`.
+//
+// Started on a System, it then exits 0. Started on a word of another kind it
+// panics with the text below, since it holds no Process handle to exit
+// through; its launcher then reads the word's Event, which nothing of the
+// print may have signalled.
+
+import sos.{System, HandleInfo, HandleKind, sos_handle_info}
+
+static EXIT_OK: UInt = 0
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    print("SOS startprint: a line with no Debug to print it")
+    if kind_of(boot_handle) != (HandleKind.System as UInt) {
+        panic("SOS startprint: printed on a word that is no System")
+    }
+    let proc = try system.process_self() catch {
+        panic("SOS startprint: no process handle: {}", error)
+    }
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// The kind of the handle `word` names, as its number.
+func kind_of(word: UInt) unsafe -> UInt {
+    var kind: UInt = 0
+    let _ = sos_handle_info(word, HandleInfo.Kind as UInt,
+                            (&var kind) as UnsafePointer<UInt>)
+    kind
+}

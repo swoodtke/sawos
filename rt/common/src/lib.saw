@@ -10,13 +10,14 @@
 //!     only the device: two register touches per HAL, and the mechanism that
 //!     stops the machine.
 //!   - The runtime proper (second below): the frozen `__saw_rt_*` seams that
-//!     compiled Saw code and std reach (write, write-line, last raw code,
-//!     panic, lock owner, alloc and dealloc, in sawlang's `runtime/ABI.md`)
-//!     plus the arena heap behind the last two. The compiler and std make the
-//!     calls; this module answers them.
+//!     compiled Saw code and std reach (write, write-line, write-error, the
+//!     output lock, last raw code, panic, lock owner, alloc and dealloc, in
+//!     sawlang's `runtime/ABI.md`) plus the arena heap behind the last two.
+//!     The compiler and std make the calls; this module answers them.
 //!
 //! All of it rests on per-side hooks and nothing else: where a byte goes, how
-//! a run ends with a text, and (with the arena, below) which thread is asking:
+//! a run ends with a text, and (with the arena and the output lock, below)
+//! which thread is asking and how a waiting thread gives the processor up:
 //!
 //!     sos_rt_write(ptr, len)          // supplied per side
 //!     sos_rt_abort(ptr, len, code)    // supplied per side, does not return
@@ -253,17 +254,21 @@ public enum AbortCode: UInt32 {
 }
 
 /// `print`'s output primitive: `len` bytes at `ptr`, to whatever this side
-/// calls a console.
+/// calls a console, under the output lock.
 @export("__saw_rt_write")
 func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Int {
+    rt_output_lock()
     sos_rt_write(ptr, len)
+    rt_output_unlock()
     0
 }
 
 /// `print`'s line primitive: `count` `{ptr, len}` records, each two target
-/// words, written in order and followed by a newline. Always succeeds.
+/// words, written in order and followed by a newline, all under the output
+/// lock. Always succeeds.
 @export("__saw_rt_write_line")
 func rt_write_line(parts: UnsafePointer<Int8>, count: UInt) unsafe -> Int {
+    rt_output_lock()
     let WORD = sizeof<UInt>() as UInt
     var i: UInt = 0
     let words = parts as UInt
@@ -276,7 +281,16 @@ func rt_write_line(parts: UnsafePointer<Int8>, count: UInt) unsafe -> Int {
     }
     let nl = "\n"
     sos_rt_write(nl.c_string()!, 1)
+    rt_output_unlock()
     0
+}
+
+/// The error stream: `len` bytes at `ptr`, unbuffered and with no lock, to
+/// the same console `print` writes. A panic report and `main`'s `error:` line
+/// come here, each under the output lock its caller already holds.
+@export("__saw_rt_write_error")
+func rt_write_error(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
+    sos_rt_write(ptr, len)
 }
 
 /// Has a body because compiled code references it: the compiler emits calls to
@@ -287,13 +301,16 @@ func rt_last_raw_code() -> Int {
     0
 }
 
-/// The panic sink: hand the text to this side's end.
+/// The panic sink: claim the output lock, and hand the text to this side's
+/// end. The lock is never given back, so no other thread's line is written
+/// after the panic began; a line another thread is writing is finished first.
 ///
 /// Check-free by construction, like the hooks under it: it does no arithmetic
 /// at all, so there is nothing here that could raise the panic it is in the
 /// middle of reporting.
 @export("__saw_rt_panic")
 func rt_panic(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
+    rt_output_lock()
     sos_rt_abort(ptr, len, AbortCode.Panic as UInt32)
 }
 
@@ -409,5 +426,88 @@ func rt_dealloc(ptr: UnsafePointer<Int8>, size: UInt, align: UInt) unsafe {
     }
     if not held {
         panic("bad free at {}", block)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The output lock
+// -----------------------------------------------------------------------------
+//
+// One process-wide lock over everything written to the console, as the ABI
+// states it: recursive, taken and given back by two separate calls, and taken
+// by the panic sink, which never gives it back. `print`'s line and a task dump
+// are each written whole under it, so no other thread's output lands inside
+// them.
+//
+// std's `SpinLock` cannot be the lock itself: its window is one block, so it
+// cannot be taken in one call and given back in another; it is not reentrant,
+// and a panic report takes the lock its own thread already holds; and its
+// window always gives the lock back, where the panic sink keeps it. So the
+// `SpinLock` guards the lock's state, an owner and a depth, for a few compares
+// and stores, and the recursion is this module's.
+//
+// A thread that finds the lock held by another gives the `SpinLock` back and
+// yields through the fourth per-side hook before it tries again: the holder
+// may be parked, and only giving the processor up lets it run. The kernel
+// answers the hook with nothing, being one context that never waits; a
+// process yields through the calling thread's own Thread handle
+// (`kernel/sysapi/src/rt.saw`). That relies on the scheduler's one ready
+// list: a waiter in a higher priority band than the holder would never let
+// it run.
+//
+// The ABI's claim priority (a claim is served before plain writes) and its
+// bound on a claim's wait are not kept: the only claimer is the panic sink,
+// and it waits only for a line already being written.
+
+extern "C" {
+    func sos_rt_yield()
+}
+
+/// Who holds the output lock, and how many times over: an owner of zero and a
+/// depth of zero is a free lock.
+struct OutputState {
+    owner: Int
+    depth: UInt
+}
+
+/// The output lock's state, behind std's `SpinLock`. Nothing in its window can
+/// panic, allocate or trap, so the window is never re-entered, and a thread
+/// loses the processor inside it only to a tick.
+static OUTPUT: SpinLock<OutputState>
+
+/// Take the output lock, waiting while another thread holds it. A thread that
+/// holds it already takes it again.
+@export("__saw_rt_output_lock")
+func rt_output_lock() {
+    let me = sos_rt_lock_owner()
+    while not output_take(me) {
+        sos_rt_yield()
+    }
+}
+
+/// Give the output lock back once: the last give of a holder frees it. A give
+/// with the lock free changes nothing.
+@export("__saw_rt_output_unlock")
+func rt_output_unlock() {
+    borrow var state = OUTPUT.lock() {
+        if state.depth != 0 {
+            state.depth = state.depth &- 1
+            if state.depth == 0 {
+                state.owner = 0
+            }
+        }
+    }
+}
+
+/// Take the output lock for `me` if it is free or `me` holds it already.
+func output_take(me: Int) -> Bool {
+    borrow var state = OUTPUT.lock() {
+        if state.depth == 0 || state.owner == me {
+            state.owner = me
+            state.depth = state.depth &+ 1
+            true
+        } else {
+            false
+        }
     }
 }

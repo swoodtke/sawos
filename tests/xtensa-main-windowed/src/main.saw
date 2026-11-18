@@ -1,0 +1,43 @@
+// A child written with `main` on the ESP32-S3, built whole for the windowed
+// ABI: `sosmain`'s `_start`, `main` and the runtime are one compile, so the
+// start-up's call into `main` is an ordinary windowed call.
+//
+//   SOS winmain: windowed code
+//   SOS winmain: printed from 100 frames down
+//   SOS winmain: answered N, expected N
+//
+// `death-notify`'s root launches it and parks on its death. `main` says which
+// convention it runs, descends 100 frames through `winsaw.descend` with a
+// system call at the bottom, prints the chain's answer beside
+// `winsaw.expected`'s, and returns 5 when they agree and 6 when they do not;
+// the start-up exits with it, and the root's wake line carries the code.
+// `xtensa-main-call0` is the same program built for call0.
+
+import sosmain
+import winsaw.{Bottom, descend, expected, windowed}
+
+static DEPTH: UInt32 = 100
+static SEED: UInt32 = 0x0C0F_FEE5
+
+static EXIT_OK: Int = 5
+static EXIT_WRONG: Int = 6
+
+struct Report {}
+
+extension Report: Bottom {
+    func reached(&self) {
+        print("SOS winmain: printed from {} frames down", DEPTH)
+    }
+}
+
+func main() -> Int {
+    if windowed() {
+        print("SOS winmain: windowed code")
+    } else {
+        print("SOS winmain: call0 code")
+    }
+    let answer = descend(DEPTH, SEED, &Report())
+    let want = expected(DEPTH, SEED)
+    print("SOS winmain: answered {}, expected {}", answer, want)
+    if answer == want { EXIT_OK } else { EXIT_WRONG }
+}

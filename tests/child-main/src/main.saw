@@ -1,0 +1,171 @@
+// Test child written with `main`, for `main_start`: `sosmain`'s start-up runs
+// it, and the role its launcher gives it says what `main` does. Its launcher
+// gives the role as the bits of an Event under `TAG_ROLE`, starts it on a
+// System, and prints the status word it ends with.
+//
+//   SEVEN    returns 7
+//   ERROR    returns an `Err`, which the entry writes as `error: ...` and
+//            answers 1 for
+//   RANGE    returns 300, outside 0...255, which the entry panics on
+//   CONTEXT  reads both lent handles' rights, takes a record by tag twice,
+//            then asks for the boot set a second time, which panics
+//   HOLD     holds its boot set while its launcher reads its `Handle` row,
+//            then drops it while two records are untaken, and is read again
+//   ENTRY    makes a thread at the image entry, which re-enters the
+//            start-up and panics
+//   PRINT    prints a line and returns 0
+//   ZERO     returns 0
+//   EXIT     ends itself with `sosmain.exit`, with a word wider than 16 bits
+//
+// A role that comes back from what should have ended it, or a record that is
+// not there, panics naming it, which the case reads as the wrong line.
+
+import sos.{BootSet, Event, Waiter, SosStatus}
+import sosmain
+
+static TAG_ROLE: UInt = 40
+static TAG_EXTRA: UInt = 43
+static TAG_READY: UInt = 41
+static TAG_GO: UInt = 42
+
+static ROLE_SEVEN: UInt = 1
+static ROLE_ERROR: UInt = 2
+static ROLE_RANGE: UInt = 3
+static ROLE_CONTEXT: UInt = 4
+static ROLE_HOLD: UInt = 5
+static ROLE_ENTRY: UInt = 6
+static ROLE_PRINT: UInt = 7
+static ROLE_ZERO: UInt = 8
+static ROLE_EXIT: UInt = 9
+
+/// `EXIT`'s word: its supervisor reads its low 16 bits, 9.
+static EXIT_WIDE: UInt = 0x2_0009
+
+/// The key the launcher's go-ahead wakes `HOLD` under.
+static KEY_GO: UInt = 7
+
+/// `ERROR`'s error: one `main` returns as is.
+static REFUSAL: SosStatus = SosStatus.BadImage
+
+/// The second thread's stack, in this process's own zero-init data: room for
+/// the start-up's frame, which holds the boot context, and a panic's.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+/// Every profile wants a 16-byte-aligned stack pointer.
+static STACK_ALIGN: UInt = 16
+
+func main() -> Result<Int, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let role = try role_of(&var set)
+    if role == ROLE_SEVEN {
+        return 7
+    }
+    if role == ROLE_ERROR {
+        return REFUSAL
+    }
+    if role == ROLE_RANGE {
+        return 300
+    }
+    if role == ROLE_CONTEXT {
+        try context(&var set)
+        panic("SOS mainchild: a second take of the boot set came back")
+    }
+    if role == ROLE_HOLD {
+        try hold(move set)
+        return 0
+    }
+    if role == ROLE_ENTRY {
+        try entry()
+        panic("SOS mainchild: the thread at the image entry came back")
+    }
+    if role == ROLE_PRINT {
+        print("SOS mainchild: a line with no Debug to print it")
+        return 0
+    }
+    if role == ROLE_ZERO {
+        return 0
+    }
+    if role == ROLE_EXIT {
+        sosmain.exit(code: EXIT_WIDE)
+    }
+    panic("SOS mainchild: no role {}", role)
+}
+
+/// The role the launcher gave, read off the Event under `TAG_ROLE`, which is
+/// released once read.
+func role_of(set: &var BootSet) -> Result<UInt, SosStatus> {
+    guard var record = set.take(TAG_ROLE) else {
+        panic("SOS mainchild: no record under the role's tag")
+    }
+    guard let event = record.take_event() else {
+        panic("SOS mainchild: the role's record is no Event")
+    }
+    event.receive()
+}
+
+/// Both lent handles' rights, a record taken by tag and asked for again, and
+/// a second take of the boot set, which does not return.
+func context(set: &var BootSet) -> Result<Void, SosStatus> {
+    let system_rights = try sosmain.context().system().rights()
+    let process_rights = try sosmain.context().process().rights()
+    print("SOS mainchild: the System's rights {}, the Process's {}",
+          system_rights, process_rights)
+    guard var record = set.take(TAG_EXTRA) else {
+        panic("SOS mainchild: no record under tag {}", TAG_EXTRA)
+    }
+    guard let _ = record.take_event() else {
+        panic("SOS mainchild: the record under tag {} is no Event", TAG_EXTRA)
+    }
+    let again = match set.take(TAG_EXTRA) {
+        case Some(_) -> "a record",
+        case None -> "nothing",
+    }
+    print("SOS mainchild: took the Event under tag {}; a second take found {}",
+          TAG_EXTRA, again)
+    let _ = sosmain.take_boot_set()
+    return
+}
+
+/// Signal the launcher with the boot set held, wait for its go-ahead, drop
+/// the set, and do the same again: the launcher reads this process's
+/// `Handle` row at each signal.
+func hold(set: BootSet) -> Result<Void, SosStatus> {
+    var held = move set
+    guard var ready_record = held.take(TAG_READY) else {
+        panic("SOS mainchild: no record under tag {}", TAG_READY)
+    }
+    guard var go_record = held.take(TAG_GO) else {
+        panic("SOS mainchild: no record under tag {}", TAG_GO)
+    }
+    guard let ready = ready_record.take_event() else {
+        panic("SOS mainchild: the record under tag {} is no Event", TAG_READY)
+    }
+    guard let go = go_record.take_event() else {
+        panic("SOS mainchild: the record under tag {} is no Event", TAG_GO)
+    }
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &go, key: KEY_GO)
+    try ready.signal(bits: 1)
+    let _ = try waiter.wait()
+    let _ = move held
+    try ready.signal(bits: 1)
+    let _ = try waiter.wait()
+    return
+}
+
+/// A thread made at the image entry, started and joined: the process ends in
+/// the join, when the thread re-enters the start-up.
+func entry() -> Result<Void, SosStatus> {
+    let thread = try sosmain.context().process().thread_create(
+        stack_top: stack_top(), arg: 0)
+    try thread.start()
+    let _ = try thread.join()
+    return
+}
+
+/// The highest 16-aligned address inside the second thread's stack.
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    let top = base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+    top - (top % STACK_ALIGN)
+}

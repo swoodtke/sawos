@@ -35,7 +35,7 @@ import sosimage.imagefile.{ImageFile, bind, image_board}
 import sosimage.kernel.{KernelFacts, QUOTA_HANDLE, QUOTA_MAPPING}
 import sosimage.limits.{QUOTA_UNLIMITED}
 import sosimage.plan.{quota_of}
-import sosimage.product.{package_dir}
+import sosimage.product.{image_declarations}
 import sosimage.tool.{read_text}
 
 
@@ -157,7 +157,7 @@ public func read_tree(sawos: String) -> Result<Tree, BuildError> {
             if not File.exists(Path(s: file)) {
                 continue
             }
-            let decl = try Declaration.parse(try read_text(file), file)
+            let decl = try Declaration.load(file)
             let runs = try boards_for(&decl, &boards)
             try! processes.push(TreeProcess(decl: move decl, boards: move runs))
         }
@@ -338,14 +338,7 @@ public func check_images(sawos: String, board: &Board,
         if not image.stock {
             continue
         }
-        var decls = Vector<Declaration>()
-        var k = 0
-        while k < image.processes.len() {
-            let process = image.processes.get(k)!
-            k = k + 1
-            let declared = "{package_dir(process.package, sawos, at.product)}/process.toml"
-            try! decls.push(try Declaration.parse(try read_text(declared), declared))
-        }
+        let decls = try image_declarations(&image, sawos, at.product)
         let _ = try bind(&image, &board, &decls, grain)
     }
     return move read
