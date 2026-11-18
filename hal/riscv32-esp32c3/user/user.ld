@@ -22,7 +22,7 @@ OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
 /* The arena: the region `sosrt`'s heap serves a freestanding Saw image's
- * allocations from, the compiler's own panic path's among them.
+ * allocations from.
  *
  * `ARENA_SIZE` is the knob, defaulting to the `PROVIDE` below. A package that
  * wants another size writes a script of its own that assigns the symbol and
@@ -36,8 +36,12 @@ ENTRY(_start)
  * The arena is `.bss`-resident, so it costs nothing in the image but counts
  * fully against the process's region, which is small on this part: size it
  * with the region in mind.
+ *
+ * The default is small, since only the program's own allocations need it
+ * (hal/riscv32/user/user.ld says which). A process that needs more says so
+ * with `arena` in its `process.toml`, or with a script of its own as above.
  */
-PROVIDE(ARENA_SIZE = 64K);
+PROVIDE(ARENA_SIZE = 4K);
 
 MEMORY {
     REGION (rwxa) : ORIGIN = SOS_REGION_BASE, LENGTH = SOS_REGION_LEN - SOS_STACK_LEN

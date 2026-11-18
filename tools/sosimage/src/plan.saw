@@ -41,6 +41,13 @@
 //! connection), Interrupt objects (one per line) and IoMemory objects (one
 //! per device row, carve given and setup write's carve).
 //!
+//! Root's arena (`root_arena`) is what its heap takes for the plan: each of
+//! the plan's vectors and of root's own bookkeeping is made once at its
+//! length (`root/src/main.saw`), so the sum of their blocks, the heap's
+//! control block and `ROOT_ARENA_MARGIN`, never below `ROOT_ARENA_FLOOR`,
+//! serves every allocation root makes. An element's words are `bootplan`'s,
+//! which root's compile holds to the types' sizes.
+//!
 //! A test image states a plan of its own, unchecked, as JSON
 //! (`ImagePlan.read`), so a case can reach each of the stock root's stops:
 //!
@@ -58,10 +65,15 @@
 //!
 //! A record's `from`, `offset` and `len`, a child's `quota`, `records` and
 //! `shutdown`, and `children`, `connections` and `setup` may be left out
-//! (zero, none, false); an unknown key is refused. A test image's child keeps
+//! (zero, none, false); an unknown key is refused. A test plan may also state
+//! `windows`, the count of windows root is given in place of the one the
+//! builder makes (`window_rows`), so a case can hand root a count that is
+//! short. A test image's child keeps
 //! the launch convention's System rights (`child_rights`).
 
 import toml.{TomlPosition}
+import bootplan.{CHILD_WORDS, QUOTA_WORDS, RECORD_WORDS, RIGHT_WORDS, SETUP_WORDS,
+                 PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS, ROW_WINDOW_WORDS}
 import sosimage.board.{Board, Window, quota_keys}
 import sosimage.declaration.{Declaration, RecordKind, child_rights}
 import sosimage.failure.{BuildError}
@@ -80,6 +92,21 @@ static ROOT_BOOT_HANDLES: Int = 3
 
 /// `QuotaKind.Thread`'s value.
 static QUOTA_THREAD: Int = 0
+
+/// What root's arena keeps past the blocks its plan and bookkeeping take.
+public static ROOT_ARENA_MARGIN: Int = 256
+
+/// The least arena root is linked with, the user scripts' default.
+public static ROOT_ARENA_FLOOR: Int = 0x1000
+
+/// The multiple root's arena is rounded up to: the user scripts align the
+/// arena's start and end to 16 bytes.
+static ARENA_ALIGN: Int = 16
+
+/// The heap's control block (`rt/common/src/heap.saw`): its fixed words, and
+/// the words of each class, a bitmap and four list heads.
+static HEAP_CONTROL_FIXED: Int = 2
+static HEAP_CLASS_WORDS: Int = 5
 
 /// The least window a setup write carves: one register.
 static REGISTER_BYTES: UInt64 = 4
@@ -200,6 +227,9 @@ public struct ImagePlan {
     connections: Int
     /// The rows after the blobs and destinations, in order.
     rows: Vector<PlanRow>
+    /// The count of windows a test plan states for root, unchecked; root is
+    /// otherwise given `window_rows`.
+    windows: Int?
 }
 
 @synthesize
@@ -424,7 +454,7 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
                                   value: entry.value))
     }
     return ImagePlan(children: move children, setup: move setup,
-                     connections: connections.len(), rows: move rows)
+                     connections: connections.len(), rows: move rows, windows: None)
 }
 
 /// The device bound to the need `need` of `process`.
@@ -797,9 +827,13 @@ extension ImagePlan {
         if fields.has("connections") {
             connections = try fields.integer("connections")
         }
+        var windows: Int? = None
+        if fields.has("windows") {
+            windows = try fields.integer("windows")
+        }
         try fields.finish()
         return ImagePlan(children: move children, setup: move setup, connections: connections,
-                         rows: Vector<PlanRow>())
+                         rows: Vector<PlanRow>(), windows: windows)
     }
 }
 
@@ -862,8 +896,131 @@ func literal(text: String) -> String {
     "{quote}{escaped}{quote}"
 }
 
+/// The count of windows root is given for `plan`: the one a test plan
+/// states, or `window_rows`.
+public func root_windows(plan: &ImagePlan) -> Int {
+    plan.windows ?? window_rows(&plan)
+}
+
+/// How many device rows root holds as windows, at most: each row a sibling
+/// or carve record or a setup write names, which root takes as a window the
+/// first time it is named.
+public func window_rows(plan: &ImagePlan) -> Int {
+    var rows = Vector<UInt64>()
+    var s = 0
+    while s < plan.setup.len() {
+        note_row(&var rows, (plan.setup.get(s)!).row as UInt64)
+        s = s + 1
+    }
+    var c = 0
+    while c < plan.children.len() {
+        borrow let child = plan.children[c] {
+            var r = 0
+            while r < child.records.len() {
+                let record = child.records.get(r)!
+                if record.source == Source.Sibling || record.source == Source.Carve {
+                    note_row(&var rows, record.from)
+                }
+                r = r + 1
+            }
+        }
+        c = c + 1
+    }
+    rows.len()
+}
+
+/// `row` added to `rows` unless it is there.
+func note_row(rows: &var Vector<UInt64>, row: UInt64) {
+    var k = 0
+    while k < rows.len() {
+        if (rows.get(k) ?? 0) == row {
+            return
+        }
+        k = k + 1
+    }
+    try! rows.push(row)
+}
+
+/// The bytes the heap's block for a vector of `count` elements of `words`
+/// words each takes, on a word of `word` bytes (`rt/common/src/heap.saw`): the
+/// request and a one-word header, rounded up to two words and four at least.
+/// An empty vector allocates nothing.
+public func heap_block(count: Int, words: Int, word: Int) -> Int {
+    if count <= 0 {
+        return 0
+    }
+    let grain = 2 * word
+    let need = (count * words * word + word + grain - 1) / grain * grain
+    if need < 4 * word {
+        return 4 * word
+    }
+    need
+}
+
+/// The blocks root's heap serves for `plan` on a word of `word` bytes: the
+/// plan's vectors (`plan_module`) and root's bookkeeping (`root/`).
+public func root_blocks(plan: &ImagePlan, word: Int) -> Int {
+    var bytes = heap_block(plan.children.len(), CHILD_WORDS, word) +
+                heap_block(plan.setup.len(), SETUP_WORDS, word)
+    var c = 0
+    while c < plan.children.len() {
+        borrow let child = plan.children[c] {
+            bytes = bytes + heap_block(child.quota.len(), QUOTA_WORDS, word) +
+                    heap_block(child.records.len(), RECORD_WORDS, word) +
+                    heap_block(child.rights.len(), RIGHT_WORDS, word)
+        }
+        c = c + 1
+    }
+    let windows = root_windows(&plan)
+    bytes + heap_block(plan.children.len(), PROCESS_WORDS, word) +
+        heap_block(plan.connections, ENDS_WORDS, word) +
+        heap_block(windows, ROW_TAG_WORDS, word) +
+        heap_block(windows, ROW_WINDOW_WORDS, word)
+}
+
+/// The bytes ahead of a heap's first block in a region of `size` bytes whose
+/// start is aligned to two words (`rt/common/src/heap.saw`): the control
+/// block, sized for a block as large as the region, and the first block's
+/// header, rounded up to two words.
+public func heap_front(size: Int, word: Int) -> Int {
+    var top = 0
+    while (size >> (top + 1)) != 0 {
+        top = top + 1
+    }
+    var smallest = 0
+    while ((4 * word) >> (smallest + 1)) != 0 {
+        smallest = smallest + 1
+    }
+    let classes = top - smallest + 1
+    let grain = 2 * word
+    let words = HEAP_CONTROL_FIXED + classes * HEAP_CLASS_WORDS
+    (words * word + word + grain - 1) / grain * grain
+}
+
+/// The arena the stock root is linked with for `plan` on a word of `word`
+/// bytes: its heap's front, the blocks it serves and `ROOT_ARENA_MARGIN`,
+/// rounded up to `ARENA_ALIGN` and no less than `ROOT_ARENA_FLOOR`.
+public func root_arena(plan: &ImagePlan, word: Int) -> UInt64 {
+    let blocks = root_blocks(&plan, word)
+    var size = ROOT_ARENA_FLOOR
+    var need = arena_need(size, blocks, word)
+    // The front grows with the region, so a larger size is measured again.
+    while need > size {
+        size = need
+        need = arena_need(size, blocks, word)
+    }
+    size as UInt64
+}
+
+/// What a region of `size` bytes must be to serve `blocks` bytes of blocks
+/// and keep `ROOT_ARENA_MARGIN`, rounded up to `ARENA_ALIGN`.
+func arena_need(size: Int, blocks: Int, word: Int) -> Int {
+    let total = heap_front(size, word) + blocks + ROOT_ARENA_MARGIN
+    (total + ARENA_ALIGN - 1) / ARENA_ALIGN * ARENA_ALIGN
+}
+
 /// The module `imageplan` for `plan`, as the lines of its `lib.saw`; `name`
-/// names the image.
+/// names the image. Each vector is made at its length, so none grows.
 public func plan_module(plan: &ImagePlan, name: String) -> Vector<String> {
     var out = Vector<String>()
     try! out.push("//! Generated by sosimage: the stock root's plan for the image {name}.")
@@ -871,13 +1028,13 @@ public func plan_module(plan: &ImagePlan, name: String) -> Vector<String> {
     try! out.push("import bootplan.\{Plan, Child, Record, Source, Setup, SetupOp, Quota, QuotaName, RightName\}")
     try! out.push("")
     try! out.push("public func plan() -> Plan \{")
-    try! out.push("    var children = Vector<Child>()")
+    try! out.push("    var children = try! Vector<Child>(capacity: {plan.children.len()})")
     var c = 0
     while c < plan.children.len() {
         try! out.push("    try! children.push(child_{c}())")
         c = c + 1
     }
-    try! out.push("    var setup = Vector<Setup>()")
+    try! out.push("    var setup = try! Vector<Setup>(capacity: {plan.setup.len()})")
     var s = 0
     while s < plan.setup.len() {
         let w = plan.setup.get(s)!
@@ -885,7 +1042,8 @@ public func plan_module(plan: &ImagePlan, name: String) -> Vector<String> {
         try! out.push("    try! setup.push(Setup(register: {literal(w.register)}, row: {w.row}, offset: {hex(w.offset)}, len: {hex(w.len)}, at: {hex(w.at)}, op: SetupOp.{op}, value: {hex(w.value)}))")
         s = s + 1
     }
-    try! out.push("    Plan(children: move children, setup: move setup, connections: {plan.connections})")
+    try! out.push("    Plan(children: move children, setup: move setup, connections: {plan.connections},")
+    try! out.push("         windows: {root_windows(&plan)})")
     try! out.push("\}")
     c = 0
     while c < plan.children.len() {
@@ -902,21 +1060,21 @@ func child_function(child: &PlanChild, index: Int) -> Vector<String> {
     var out = Vector<String>()
     try! out.push("")
     try! out.push("func child_{index}() -> Child \{")
-    try! out.push("    var quota = Vector<Quota>()")
+    try! out.push("    var quota = try! Vector<Quota>(capacity: {child.quota.len()})")
     var q = 0
     while q < child.quota.len() {
         let row = child.quota.get(q)!
         try! out.push("    try! quota.push(Quota(kind: QuotaName.{quota_name(row.kind)}, limit: {row.limit}))")
         q = q + 1
     }
-    try! out.push("    var records = Vector<Record>()")
+    try! out.push("    var records = try! Vector<Record>(capacity: {child.records.len()})")
     var r = 0
     while r < child.records.len() {
         let record = child.records.get(r)!
         try! out.push("    try! records.push(Record(tag: {record.tag}, source: Source.{source_word(record.source)}, from: {hex(record.from)}, offset: {hex(record.offset)}, len: {hex(record.len)}))")
         r = r + 1
     }
-    try! out.push("    var rights = Vector<RightName>()")
+    try! out.push("    var rights = try! Vector<RightName>(capacity: {child.rights.len()})")
     var k = 0
     while k < child.rights.len() {
         try! out.push("    try! rights.push(RightName.{right_word(child.rights.get(k) ?? "")})")

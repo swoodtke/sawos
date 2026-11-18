@@ -1,0 +1,200 @@
+// The stock root's arena: the heap `sosrt` runs, over a region of the size
+// the builder computes for a plan, serves every vector root makes for it, at
+// the length root makes it, and the size has no slack past its margin.
+//
+// The heap runs here on the host's word, eight bytes; the heap's arithmetic
+// is the word's alone (`rt/common/src/heap.saw`), so a four-byte word is the
+// same sum in smaller units, and the gate's `stock_root_heap` case boots a
+// large plan on riscv32 and arm64 at the size the builder gives it.
+
+import std.json.{JsonValue}
+import bootplan.{CHILD_WORDS, QUOTA_WORDS, RECORD_WORDS, RIGHT_WORDS, SETUP_WORDS,
+                 PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS, ROW_WINDOW_WORDS}
+import sosrt.heap.{UnsafeHeap}
+import sosimage.fields.{Fields}
+import sosimage.kernel.{KernelFacts}
+import sosimage.package.{stock_root_extras}
+import sosimage.plan.{ImagePlan, PlanSlabs, ROOT_ARENA_FLOOR, ROOT_ARENA_MARGIN, check_plan,
+                      root_arena, window_rows}
+
+/// The host's word.
+static WORD: Int = 8
+
+/// More than the largest arena this test asks for.
+static REGION_WORDS: Int = 16_384
+
+@align(64)
+unsafe static var REGION: [UInt64; REGION_WORDS] = [0; REGION_WORDS]
+
+/// Root's handle table, and a child's.
+static TABLE: Int = 32
+
+func read_plan(text: String) -> ImagePlan {
+    let doc = try! JsonValue.parse(text)
+    var fields = try! Fields(move doc, "the plan")
+    match ImagePlan.read(&var fields) {
+        case Ok(plan) -> move plan,
+        case Err(e) -> panic("the plan did not read: {e.message}")
+    }
+}
+
+/// A plan of `children` children, each given `records` records (its System
+/// record, the server ends of the connections dealt to it in turn, carves and
+/// siblings of row 4 in turn, and last an inlet of a connection made
+/// already), over `connections` connections, with `setup` writes. Each child
+/// has every quota row and the four rights.
+func plan_text(children: Int, records: Int, connections: Int, setup: Int) -> String {
+    var out = "\{\"connections\": {connections}, \"children\": ["
+    var c = 0
+    while c < children {
+        if c > 0 {
+            out = "{out}, "
+        }
+        out = "{out}\{\"name\": \"c{c}\", \"image\": {2 * c}, \"destination\": {2 * c + 1}, \"start\": 1, \"quota\": \{\"threads\": 1, \"events\": 1, \"waiters\": 1, \"timers\": 1, \"memories\": 1, \"iomemories\": 1, \"mappings\": 1, \"handles\": {TABLE}, \"pipes\": 1\}, \"records\": [\{\"tag\": 1, \"source\": \"system\"\}"
+        var r = 1
+        while r < records {
+            let tag = r + 1
+            let served = c + children * (r - 1)
+            let record = if served < connections {
+                "\{\"tag\": {tag}, \"source\": \"outlet\", \"from\": {served}\}"
+            } else if r == records - 1 && connections > 0 {
+                "\{\"tag\": {tag}, \"source\": \"inlet\", \"from\": {c % connections}\}"
+            } else if served % 2 == 0 {
+                "\{\"tag\": {tag}, \"source\": \"carve\", \"from\": 4, \"offset\": 0, \"len\": 4\}"
+            } else {
+                "\{\"tag\": {tag}, \"source\": \"sibling\", \"from\": 4\}"
+            }
+            out = "{out}, {record}"
+            r = r + 1
+        }
+        out = "{out}]\}"
+        c = c + 1
+    }
+    out = "{out}], \"setup\": ["
+    var s = 0
+    while s < setup {
+        if s > 0 {
+            out = "{out}, "
+        }
+        out = "{out}\{\"register\": \"R{s}\", \"row\": 4, \"offset\": 0, \"len\": 4, \"at\": 0, \"op\": \"set\", \"value\": 1\}"
+        s = s + 1
+    }
+    "{out}]\}"
+}
+
+/// Whether a heap over the first `bytes` of the zeroed region serves every
+/// vector root makes for `plan`, at the length root makes it.
+func serves(plan: &ImagePlan, bytes: Int) unsafe -> Bool {
+    var i = 0
+    while i < REGION_WORDS {
+        REGION[i] = 0
+        i = i + 1
+    }
+    let heap = UnsafeHeap(base: ((&var REGION) as UnsafePointer<UInt64>) as UInt,
+                          size: bytes as UInt)
+    // The plan's own vectors, as `imageplan.plan()` makes them.
+    var ok = take(&heap, plan.children.len(), CHILD_WORDS)
+    var c = 0
+    while c < plan.children.len() {
+        borrow let child = plan.children[c] {
+            ok = ok && take(&heap, child.quota.len(), QUOTA_WORDS) &&
+                 take(&heap, child.records.len(), RECORD_WORDS) &&
+                 take(&heap, child.rights.len(), RIGHT_WORDS)
+        }
+        c = c + 1
+    }
+    ok = ok && take(&heap, plan.setup.len(), SETUP_WORDS)
+    // Root's bookkeeping: the rows it holds as windows, its children and
+    // the connections' ends.
+    let windows = window_rows(&plan)
+    ok && take(&heap, windows, ROW_TAG_WORDS) && take(&heap, windows, ROW_WINDOW_WORDS) &&
+        take(&heap, plan.children.len(), PROCESS_WORDS) &&
+        take(&heap, plan.connections, ENDS_WORDS)
+}
+
+/// Whether `heap` serves a vector of `count` elements of `words` words; an
+/// empty one asks for nothing.
+func take(heap: &UnsafeHeap, count: Int, words: Int) unsafe -> Bool {
+    if count == 0 {
+        return true
+    }
+    heap.alloc((count * words * WORD) as UInt, WORD as UInt) != 0
+}
+
+/// A kernel whose tables hold `TABLE` handles and whose children start with
+/// 4 of each other row.
+func facts() -> KernelFacts {
+    var zeros = Vector<Int>()
+    var k = 0
+    while k < 13 {
+        try! zeros.push(0)
+        k = k + 1
+    }
+    KernelFacts(word: WORD, capacity: 255, extents: 4, records_per_body: 4, handles: TABLE,
+                image_rows: 4, budget: 16, domains: 16, stride: 0, inflight: 2,
+                floors: zeros.copy(), defaults: defaults(), units: zeros.copy(),
+                aligns: move zeros)
+}
+
+func defaults() -> Vector<Int> {
+    var out = Vector<Int>()
+    var k = 0
+    while k < 9 {
+        try! out.push(4)
+        k = k + 1
+    }
+    move out
+}
+
+func main() unsafe {
+    // The most root's table lets a checked plan hold: at derive root holds
+    // its three boot handles, its Process handle and two rows a child, and a
+    // create takes one more, so 13 children; once each is created it holds a
+    // Process handle a child and an inlet a connection, so 14 connections
+    // leave the Waiter its last slot. A child's own table bounds its records.
+    let most = read_plan(plan_text(13, TABLE - 2, 14, 16))
+    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 1000)
+    let kernel = facts()
+    let rows = defaults()
+    try check_plan(&most, &kernel, &rows, &slabs, "most") catch {
+        panic("the largest plan is refused: {error.message}")
+    }
+    let size = root_arena(&most, WORD) as Int
+    assert(serves(&most, size), "the largest plan is served")
+    // The sum is exact: without the margin the plan is still served, and 64
+    // bytes short of that it is not, which is more than the five words a
+    // class of the control block gives back when the region shrinks past a
+    // power of two.
+    assert(serves(&most, size - ROOT_ARENA_MARGIN), "the plan without the margin")
+    assert(not serves(&most, size - ROOT_ARENA_MARGIN - 64), "a region shorter than the sum")
+
+    // Smaller plans are served at their own sizes, which are never below the
+    // floor.
+    var children = 0
+    while children <= 13 {
+        var connections = 0
+        while connections <= 14 && connections <= children + 1 {
+            let plan = read_plan(plan_text(children, 3 + children, connections, children))
+            let at = root_arena(&plan, WORD) as Int
+            assert(at >= ROOT_ARENA_FLOOR, "the floor")
+            assert(at % 16 == 0, "a multiple of 16")
+            assert(serves(&plan, at), "a plan of {children} children and {connections} connections")
+            connections = connections + 1
+        }
+        children = children + 1
+    }
+    // Both of the builder's paths to a stock root link it with the plan's
+    // arena and its module.
+    let word4 = try! stock_root_extras(&most, 4, ".build/root-arena", "root", "most")
+    assert((word4.arena ?? 0) == root_arena(&most, 4), "the extras' arena, word 4")
+    assert(root_arena(&most, 4) > ROOT_ARENA_FLOOR as UInt64, "past the floor, word 4")
+    let word8 = try! stock_root_extras(&most, 8, ".build/root-arena", "root", "most")
+    assert((word8.arena ?? 0) == root_arena(&most, 8), "the extras' arena, word 8")
+    assert(word8.modules.len() == 1 && (word8.modules.get(0)!).name.equals("imageplan"),
+           "the extras' module")
+
+    // A plan of nothing is the floor.
+    assert(root_arena(&read_plan("\{\}"), WORD) as Int == ROOT_ARENA_FLOOR, "an empty plan")
+    // A four-byte word takes no more than an eight-byte one.
+    assert(root_arena(&most, 4) <= root_arena(&most, 8), "the word")
+}

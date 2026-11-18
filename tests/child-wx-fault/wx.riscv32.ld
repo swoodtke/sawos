@@ -9,7 +9,7 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
-PROVIDE(ARENA_SIZE = 64K);
+PROVIDE(ARENA_SIZE = 4K);
 
 PHDRS {
     all PT_LOAD FLAGS(7);

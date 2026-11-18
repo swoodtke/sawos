@@ -2014,6 +2014,34 @@ _GPIO_SERVICE_LINES = [
 _STOCK_START = {"name": "first", "image": 0, "destination": 1, "start": 1,
                 "records": [{"tag": 1, "source": "system"}]}
 
+# `stock_root_heap`'s plan: `_HEAP_CHILDREN` children (`tests/child-bye`)
+# of `_HEAP_RECORDS` records each, over `_HEAP_CONNECTIONS` connections. Each
+# child is given its System record, the server ends of its share of the
+# connections and an inlet of each, and siblings of the console's row (after
+# the children's blobs and destinations) for the rest; its `Handle` row holds
+# them all.
+_HEAP_CHILDREN = 6
+_HEAP_CONNECTIONS = 18
+_HEAP_RECORDS = 30
+
+
+def _heap_plan():
+    share = _HEAP_CONNECTIONS // _HEAP_CHILDREN
+    console = 2 * _HEAP_CHILDREN
+    children = []
+    for c in range(_HEAP_CHILDREN):
+        served = [c + _HEAP_CHILDREN * k for k in range(share)]
+        sources = ([("system", 0)] + [("outlet", i) for i in served]
+                   + [("inlet", i) for i in served])
+        sources += [("sibling", console)] * (_HEAP_RECORDS - len(sources))
+        records = [{"tag": tag, "source": source, "from": row}
+                   for tag, (source, row) in enumerate(sources, start=1)]
+        children.append({"name": f"c{c}", "image": c,
+                         "destination": _HEAP_CHILDREN + c, "start": 1,
+                         "quota": {"handles": 32}, "records": records})
+    return {"connections": _HEAP_CONNECTIONS, "children": children}
+
+
 # Root's table holds `MAX_HANDLES` (32): its System, Process and Thread and a
 # handle per row at entry, and its own Process handle once it derives it. A
 # stop case brings the table to its edge with rows of no bytes
@@ -8778,6 +8806,36 @@ TEST_CASES = [
         "expect_out": [],
         "expect_clean_exit": False,
     },
+    # A large plan (`_heap_plan`): root's heap holds it and root's own
+    # bookkeeping for it in the arena the builder sizes from it
+    # (`sosimage.plan.root_arena`), which is past the user scripts' default
+    # on both words. Every child is given its records, starts, says so and
+    # exits; root reports each end, in the order its Waiter answers them, and
+    # stops the machine with 0.
+    _stock_stop("stock_root_heap", _heap_plan(),
+                ["SOS bye: exiting"] * _HEAP_CHILDREN
+                + [f"root: c{i} ended status=65541"
+                   for i in (0, *range(_HEAP_CHILDREN - 1, 0, -1))],
+                0, arches=["riscv32", "arm64"],
+                children=[CHILD_BYE_PKG] * _HEAP_CHILDREN, device=True,
+                limits={"slabs": {"processes": 1 + _HEAP_CHILDREN,
+                                  "pipes": _HEAP_CONNECTIONS}}),
+    # The same shape from a hand-written description (`sosimage build`): six
+    # children (`tests/stock-many`) of 28 records each over 18 connections, so
+    # the builder's other path to a stock root links it with the arena it
+    # computes, past the user scripts' default on both words.
+    {
+        "name": "stock_many",
+        "arches": ["riscv32", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_many.toml",
+                       "arm64": "stock_many_arm64.toml"},
+        "expect_out": ["{banner}",
+                       *["SOS many: exiting"] * 6,
+                       *[f"root: m{i} ended status=65541"
+                         for i in (0, 5, 4, 3, 2, 1)]],
+        "expect_clean_exit": True,
+    },
     # Root lets go of the rows it still holds before it waits: the console's
     # row, which only a carve of it was given from, is the IoMemory object
     # the carver's last carve takes. Its plan raises its IoMemory row past
@@ -8895,6 +8953,18 @@ TEST_CASES = [
                                             {"tag": 4, "source": "sibling",
                                              "from": 2}])]},
                 _root_panic("root: the plan uses row 2 after giving it whole"),
+                EXIT_PANIC, children=[CHILD_BYE_PKG], device=True),
+    # A plan whose count of windows is short of the rows root takes as
+    # windows (a test plan's stated `windows`): root refuses the window by
+    # name rather than grow a vector past the arena the builder sized.
+    _stock_stop("stock_skew_windows",
+                {"windows": 0,
+                 "children": [dict(_STOCK_START,
+                                   records=[{"tag": 1, "source": "system"},
+                                            {"tag": 2, "source": "sibling",
+                                             "from": 2}])]},
+                _root_panic("root: the plan makes room for 0 windows, and root "
+                            "takes one more"),
                 EXIT_PANIC, children=[CHILD_BYE_PKG], device=True),
     {
         # The stock root on a plan of the case's own (`root_plan`), over rows
@@ -10220,12 +10290,13 @@ TEST_CASES = [
         # The case is the mechanism's only proof, and it is a pair of brackets.
         # There is no op that reports an arena size and there should not be, so
         # the program makes two requests whose answers together pin the size to
-        # a range only the override can produce: a small request is served (so
-        # the region is real, which rules out a build where the linker reserved
-        # nothing) and a large one is not (so the region is smaller than that
-        # request, which is impossible at the default). An image that missed the
-        # override serves both and reaches the program's UNREACHABLE line, which
-        # fails the case rather than passing by omission.
+        # a range only the override can produce: a request the default arena
+        # cannot hold is served (so the region is the override's, which also
+        # rules out a build where the linker reserved nothing) and a larger one
+        # is not (so the region is smaller than that request). An image whose
+        # arena came out larger serves both and reaches the program's
+        # UNREACHABLE line, which fails the case rather than passing by
+        # omission.
         #
         # The second bracket is a refusal the program is handed:
         # `__saw_rt_alloc` answers null when the arena holds no such block,
@@ -10239,7 +10310,7 @@ TEST_CASES = [
         "root_pkg": ARENA_SMALL_PKG,
         "expect_out": ["{banner}",
                        # Bracket one: reserved, written and read back.
-                       "SOS arenasmall: 2 KiB ok",
+                       "SOS arenasmall: 4 KiB ok",
                        # Bracket two: std's words for the null.
                        "SOS arenasmall: 16 KiB refused as a STATUS: "
                        "allocation of 16384 bytes (align 4) failed\n"],

@@ -35,13 +35,23 @@
 //! boot set does not hold, or holds as another kind, or uses a row after
 //! giving it whole, is a skew between the plan and the region table the
 //! builder wrote beside it, and root panics naming it.
+//!
+//! Root's heap holds the plan and its own bookkeeping (its children, the
+//! connections' ends and the device rows it holds as windows), each vector
+//! made once at the length the plan gives it. Nothing else allocates, a
+//! stop's message included, and the builder links root with an arena of
+//! exactly that sum and a margin (`sosimage.plan.root_arena`). So a count
+//! the plan has short is a panic naming it, and a bookkeeping vector that
+//! would grow is a panic too (`Exact`), never arena the builder did not size.
 
 import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet,
             WaitResult, BootSet, BootHandle, SosStatus, SystemRight,
             PipeInletRight, QuotaKind}
 import bootplan.{Plan, Child, Record, Source, Setup, SetupOp, QuotaName, RightName,
-                 setup_word, reads_first}
+                 setup_word, reads_first, PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS,
+                 ROW_WINDOW_WORDS}
 import imageplan
+import std.alloc.{GlobalAllocator}
 
 /// The machine's status when every child has ended.
 static EXIT_OK: UInt = 0
@@ -57,10 +67,58 @@ static REASON_EXITED: UInt = 1
 static REASON_SHIFT: UInt = 16
 static CODE_MASK: UInt = 0xFFFF
 
-/// A step that failed: which, for whom, and the status it answered.
+// The bookkeeping's elements, held to the words the builder sizes the arena
+// with (`bootplan`).
+static_assert(sizeof<Process>() <= PROCESS_WORDS * sizeof<UInt>(),
+              "a Process fits PROCESS_WORDS")
+static_assert(sizeof<Ends>() <= ENDS_WORDS * sizeof<UInt>(), "an Ends fits ENDS_WORDS")
+static_assert(sizeof<UInt>() <= ROW_TAG_WORDS * sizeof<UInt>(), "a tag fits ROW_TAG_WORDS")
+static_assert(sizeof<IoMemory?>() <= ROW_WINDOW_WORDS * sizeof<UInt>(),
+              "a window fits ROW_WINDOW_WORDS")
+
+/// Whether `exact` is making a vector, the only time `Exact` serves.
+unsafe static var MAKING: Bool = false
+
+/// The allocator of root's bookkeeping: it serves the one block `exact` makes
+/// each vector with, and refuses by name any later request, which only a
+/// vector growing past the length the plan gave it would make.
+struct Exact {}
+
+extension Exact: Allocator {
+    func alloc(&self, size: Int, align: Int) unsafe -> UnsafePointer<Int8>? {
+        if not MAKING {
+            panic("root: a vector of root's would grow past the length its plan gave it")
+        }
+        GlobalAllocator().alloc(size, align)
+    }
+
+    func dealloc(&self, ptr: UnsafePointer<Int8>, size: Int, align: Int) unsafe {
+        GlobalAllocator().dealloc(ptr, size, align)
+    }
+}
+
+/// A vector with room for `count` elements, which never grows.
+func exact<T>(count: Int) unsafe -> Vector<T, Exact> {
+    MAKING = true
+    let made = try! Vector<T, Exact>(capacity: count)
+    MAKING = false
+    move made
+}
+
+/// Panics, naming `what`, when a vector the plan gives room for `room`
+/// elements holds them all already: the plan's count is short.
+func room_for(held: Int, room: Int, what: String) {
+    if held >= room {
+        panic("root: the plan makes room for {} {}, and root takes one more", room, what)
+    }
+}
+
+/// A step that failed: which, for whom, the record when it was a give, and
+/// the status it answered.
 struct Stop {
     step: String
     who: String
+    record: UInt?
     status: SosStatus
 }
 
@@ -69,7 +127,11 @@ func _start(boot_handle: UInt) {
     let system = System(boot_handle: boot_handle)
     let plan = imageplan.plan()
     let code = try run(&system, &plan) catch {
-        print("root: {} {}: {}", error.step, error.who, error.status)
+        if let tag = error.record {
+            print("root: {} {} record {}: {}", error.step, error.who, tag, error.status)
+        } else {
+            print("root: {} {}: {}", error.step, error.who, error.status)
+        }
         let _ = system.shutdown(EXIT_STOPPED)
         return
     }
@@ -77,7 +139,7 @@ func _start(boot_handle: UInt) {
 }
 
 func stop(step: String, who: String, status: SosStatus) -> Stop {
-    Stop(step: step, who: who, status: status)
+    Stop(step: step, who: who, record: None, status: status)
 }
 
 /// Every step; answers the machine's status.
@@ -85,15 +147,17 @@ func run(system: &System, plan: &Plan) -> Result<UInt, Stop> {
     let (proc, set) = try derive(&system) catch {
         return stop("derive", "root", error)
     }
-    var rows = Rows(set: move set, tags: Vector<UInt>(), windows: Vector<IoMemory?>())
+    var rows = Rows(set: move set, room: plan.windows, tags: exact<UInt>(plan.windows),
+                    windows: exact<IoMemory?>(plan.windows))
 
-    var children = Vector<Process>()
+    var children = exact<Process>(plan.children.len())
     var i = 0
     while i < plan.children.len() {
         borrow let c = plan.children[i] {
             let child = try create(&system, &var rows, &c) catch {
                 return stop("create", c.name, error)
             }
+            room_for(children.len(), plan.children.len(), "children")
             try! children.push(move child)
         }
         i = i + 1
@@ -109,9 +173,10 @@ func run(system: &System, plan: &Plan) -> Result<UInt, Stop> {
         i = i + 1
     }
 
-    var ends = Vector<Ends>()
+    var ends = exact<Ends>(plan.connections)
     i = 0
     while i < plan.connections {
+        room_for(ends.len(), plan.connections, "connections")
         try! ends.push(Ends(inlet: None, outlet: None))
         i = i + 1
     }
@@ -127,7 +192,8 @@ func run(system: &System, plan: &Plan) -> Result<UInt, Stop> {
                 while r < c.records.len() {
                     borrow let record = c.records[r] {
                         try give(&system, &proc, &child, &var rows, &var ends, &record, keep) catch {
-                            return stop("give", "{c.name} record {record.tag}", error)
+                            return Stop(step: "give", who: c.name, record: record.tag,
+                                        status: error)
                         }
                     }
                     r = r + 1
@@ -162,11 +228,13 @@ func derive(system: &System) -> Result<(Process, BootSet), SosStatus> {
 }
 
 /// Root's rows: the boot set, and the device rows taken out of it, each kept
-/// while a later record or write still carves or mints from it.
+/// while a later record or write still carves or mints from it, of which the
+/// plan makes room for `room`.
 struct Rows {
     set: BootSet
-    tags: Vector<UInt>
-    windows: Vector<IoMemory?>
+    room: Int
+    tags: Vector<UInt, Exact>
+    windows: Vector<IoMemory?, Exact>
 }
 
 extension Rows: NoCopy {}
@@ -214,6 +282,7 @@ extension Rows {
         guard let w = record.take_iomemory() else {
             panic("root: the plan names row {} as a device's, and it is not one", tag)
         }
+        room_for(self.tags.len(), self.room, "windows")
         try! self.tags.push(tag)
         try! self.windows.push(move w)
         self.tags.len() - 1
@@ -322,7 +391,7 @@ struct Ends {
 extension Ends: NoCopy {}
 
 /// Connection `index`'s ends, made if they are not yet.
-func connection(proc: &Process, ends: &var Vector<Ends>, index: Int) -> Result<Void, SosStatus> {
+func connection(proc: &Process, ends: &var Vector<Ends, Exact>, index: Int) -> Result<Void, SosStatus> {
     borrow var e = ends[index] {
         if e.inlet.is_none() && e.outlet.is_none() {
             let (inlet, outlet) = try proc.pipe_create()
@@ -336,7 +405,7 @@ func connection(proc: &Process, ends: &var Vector<Ends>, index: Int) -> Result<V
 /// One record, made as its source says and given under its tag; a System
 /// record keeps the rights in `keep`.
 func give(system: &System, proc: &Process, child: &Process, rows: &var Rows,
-          ends: &var Vector<Ends>, r: &Record, keep: UInt32) -> Result<Void, SosStatus> {
+          ends: &var Vector<Ends, Exact>, r: &Record, keep: UInt32) -> Result<Void, SosStatus> {
     match r.source {
         case System -> {
             // The give checks `Transfer` on the sibling, and its own keep mask
@@ -410,8 +479,8 @@ func give_row(child: &Process, record: &var BootHandle, tag: UInt) -> Result<Voi
 
 /// Wait for the children's ends, reporting each; answers the machine's
 /// status.
-func supervise(proc: &Process, plan: &Plan, children: &Vector<Process>, rows: Rows,
-             ends: Vector<Ends>) -> Result<UInt, SosStatus> {
+func supervise(proc: &Process, plan: &Plan, children: &Vector<Process, Exact>, rows: Rows,
+             ends: Vector<Ends, Exact>) -> Result<UInt, SosStatus> {
     let waiter = try proc.waiter_create()
     var i = 0
     while i < children.len() {

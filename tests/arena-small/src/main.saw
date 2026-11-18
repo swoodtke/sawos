@@ -9,18 +9,21 @@
 // two requests whose outcomes together pin the size to a range only the
 // override can produce:
 //
-//   SOS arenasmall: 2 KiB ok          <- the region is real (a 0 KiB arena, or
-//                                        one the linker forgot, fails here)
+//   SOS arenasmall: 4 KiB ok          <- the region is the override's: the
+//                                        shared default arena, a 0 KiB one or
+//                                        one the linker forgot fails here
 //   SOS arenasmall: 16 KiB refused as a STATUS: allocation of 16384 bytes
 //                                     (align 4) failed
 //                                     <- the arena answered null, and std made
 //                                        it the constructor's `AllocError`
 //
-// The second request proves the override. 16 KiB is past this package's 8 KiB
-// and far inside the shared default arena, so an image that did not take the
-// override serves the request and prints the UNREACHABLE line at the bottom,
-// which fails the case loudly. The first request rules out the other way to
-// be wrong: a region that ended up empty or unreserved fails at 2 KiB.
+// The two requests bracket the override from both sides. 4 KiB is more than
+// the shared default arena (4 KiB, with the heap's control block and a
+// block's header in it) can serve, so an image that did not take the override,
+// or whose region ended up empty or unreserved, fails at the first. 16 KiB is
+// past this package's 8 KiB, so an image whose arena came out larger serves
+// the second and prints the UNREACHABLE line at the bottom, which fails the
+// case loudly.
 //
 // The refusal is a status: `__saw_rt_alloc` answers null when the arena holds
 // no such block (`rt/common/src/lib.saw`), and `Vector(capacity:)` hands the
@@ -31,11 +34,11 @@
 
 import sos.{System}
 
-/// 512 words = 2 KiB. Comfortably inside the 8 KiB the script asks for, with
-/// room for whatever the allocator rounds or aligns.
-static WITHIN_WORDS: Int = 512
+/// 1024 words = 4 KiB. Inside the 8 KiB the script asks for, with room for
+/// whatever the allocator rounds or aligns, and past the shared default.
+static WITHIN_WORDS: Int = 1024
 
-/// 4096 words = 16 KiB. Past the 8 KiB override, far inside the default.
+/// 4096 words = 16 KiB. Past the 8 KiB override.
 static BEYOND_WORDS: Int = 4096
 
 /// Written into the first request and read back.
@@ -50,7 +53,7 @@ func _start(boot_handle: UInt) {
 
     // Request one: the override must still be able to serve it.
     var within = try Vector<UInt32>(capacity: WITHIN_WORDS) catch {
-        print("SOS arenasmall: 2 KiB refused: {}\n", error)
+        print("SOS arenasmall: 4 KiB refused: {}\n", error)
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
@@ -66,7 +69,7 @@ func _start(boot_handle: UInt) {
         let _ = system.shutdown(EXIT_FAILED)
         return
     }
-    let _ = system.debug_print("SOS arenasmall: 2 KiB ok\n")
+    let _ = system.debug_print("SOS arenasmall: 4 KiB ok\n")
 
     // Request two: refused, as a status.
     let beyond = try Vector<UInt32>(capacity: BEYOND_WORDS) catch {
@@ -75,8 +78,8 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    // Unreachable on a correct build: a run that gets here linked the shared
-    // default arena, so it exits non-zero.
+    // Unreachable on a correct build: a run that gets here linked an arena
+    // larger than the override, so it exits non-zero.
     print("SOS arenasmall: UNREACHABLE, got {} words\n", beyond.len())
     let _ = system.shutdown(EXIT_FAILED)
 }

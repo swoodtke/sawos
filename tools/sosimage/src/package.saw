@@ -30,8 +30,9 @@
 //! `slot` is an in-place board's, and absent on any other. `plan` is a stock
 //! root's: the builder writes it as the module `imageplan`
 //! (`sosimage.plan.plan_module`) into `OUT/NAME.imageplan/` and builds the
-//! package with it, unchecked, so a case can hand the stock root a plan the
-//! builder would refuse. `inputs` are the process's build inputs: each file is
+//! package with it and the arena the plan needs (`sosimage.plan.root_arena`),
+//! unchecked, so a case can hand the stock root a plan the builder would
+//! refuse. `inputs` are the process's build inputs: each file is
 //! the module of its name (`write_input`). `plan` and `inputs` may be left
 //! out; every other key is required, and an unknown key is refused.
 
@@ -44,7 +45,7 @@ import sosimage.build.{ensure_directory}
 import sosimage.failure.{BuildError}
 import sosimage.fields.{Fields}
 import sosimage.layout.{Placement, process_script}
-import sosimage.plan.{ImagePlan, plan_module}
+import sosimage.plan.{ImagePlan, plan_module, root_arena}
 import sosimage.profile.{Profile}
 import sosimage.tool.{read_file, read_text, run_tool, write_file, write_lines}
 
@@ -78,8 +79,8 @@ public struct ModulePath {
 }
 
 /// What a process's build takes beyond its placement: the arena its
-/// declaration states, when it states one, and the modules the image gives
-/// it (its inputs, or a stock root's plan).
+/// declaration states, or a stock root's plan needs, and the modules the
+/// image gives it (its inputs, or a stock root's plan).
 public struct Extras {
     arena: UInt64?
     modules: Vector<ModulePath>
@@ -207,6 +208,20 @@ public func write_plan(plan: &ImagePlan, out: String, name: String,
     let lines = plan_module(&plan, image)
     try write_lines("{dir}/lib.saw", &lines)
     return ModulePath(name: "imageplan", dir: try absolute(dir, "the plan's directory"))
+}
+
+/// What the stock root's build takes for `plan`, built as the process `name`
+/// of the image `image` on a word of `word` bytes: the module `imageplan`,
+/// written into `OUT/NAME.imageplan/` (`write_plan`), and the arena the plan
+/// needs (`sosimage.plan.root_arena`). Both of the builder's paths to a stock
+/// root take it: a test image's (`sosimage package`) and a described one's
+/// (`sosimage.product`).
+public func stock_root_extras(plan: &ImagePlan, word: Int, out: String, name: String,
+                              image: String) -> Result<Extras, BuildError> {
+    var extras = Extras.none()
+    extras.arena = root_arena(&plan, word)
+    try! extras.modules.push(try write_plan(&plan, out, name, image))
+    return move extras
 }
 
 /// Writes the file `from` as the module `input` of the process `name`, into

@@ -53,8 +53,11 @@ ENTRY(_start)
 
 /* `sosrt`'s heap arena (hal/riscv32/user/user.ld describes the
  * knob). `.bss`-resident, so it costs nothing in the image but counts fully
- * against the region. */
-PROVIDE(ARENA_SIZE = 48K);
+ * against the region. The default is small, since only the program's own
+ * allocations need it: a process that needs more says so with `arena` in its
+ * `process.toml`, or with a script of its own that assigns `ARENA_SIZE` and
+ * INCLUDEs this one. */
+PROVIDE(ARENA_SIZE = 4K);
 
 /* Flash offset 0 in each bus window. */
 FLASH_IBUS = 0x42000000;

@@ -12,10 +12,10 @@
  * `-T <the manifest's linker-script string>`, and `ld.lld` resolves an INCLUDE
  * relative to that same directory.
  *
- * 8 KiB is load-bearing for `tests/arena-small/src/main.saw`: small enough
- * that a 16 KiB request cannot be served (proving the override reached the
- * image), large enough that the 2 KiB request before it can (proving the
- * region is real rather than merely absent).
+ * 8 KiB is load-bearing for `tests/arena-small/src/main.saw`: large enough
+ * that a 4 KiB request, which the shared default cannot serve, can be (proving
+ * the override reached the image), small enough that the 16 KiB request after
+ * it cannot.
  */
 ARENA_SIZE = 8K;
 

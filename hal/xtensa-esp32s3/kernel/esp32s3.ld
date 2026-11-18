@@ -84,8 +84,10 @@
 ENTRY(_entry)
 
 /* `sosrt`'s heap arena (hal/riscv32/kernel/virt.ld describes it in
- * full). The kernel allocates nothing on its steady path; the arena backs the
- * compiler's panic path only. The boot stack is the other boards' size. */
+ * full). Nothing in the kernel reaches the allocator at run time
+ * (hal/riscv32-esp32c3/kernel/esp32c3.ld says why); the link still needs the
+ * arena, whose bounds the allocator seams `sosrt` exports read. The boot
+ * stack is the other boards' size. */
 PROVIDE(ARENA_SIZE = 16K);
 KERNEL_STACK_SIZE = 64K;
 

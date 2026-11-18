@@ -77,10 +77,12 @@ ENTRY(_start)
  * ---------------------------------------------------------------------------
  * `ARENA_SIZE` is the size of `sosrt`'s heap arena (virt.ld
  * describes it in full). It is 16K here, smaller than virt's, so the kernel's
- * .data + .bss fit the 168K `SRAM` region; that is safe because the kernel
- * allocates nothing on its steady path and the arena backs only the compiler's
- * panic path. `KERNEL_STACK_SIZE` is the boot stack, left at the virt board's
- * 64K.
+ * .data + .bss fit the 168K `SRAM` region; that is safe because nothing in the
+ * kernel reaches the allocator at run time: every kernel source builds under
+ * `--no-hidden-alloc`, and its prints and a failed check's message render
+ * into stack buffers. The link still needs the arena, whose bounds the
+ * allocator seams `sosrt` exports read. `KERNEL_STACK_SIZE` is the boot stack,
+ * left at the virt board's 64K.
  *
  * `PROT_DOMAIN_SLOTS` also costs this board `.bss`: it sizes the kernel's stats
  * region. It is not a board knob, though. It is `rv32core`'s, shared with the

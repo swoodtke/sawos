@@ -47,7 +47,7 @@ OUTPUT_ARCH(aarch64)
 ENTRY(_start)
 
 /* The arena: the region `sosrt`'s heap serves a freestanding Saw image's
- * allocations from, the compiler's own panic path's among them.
+ * allocations from.
  *
  * `ARENA_SIZE` is the knob, defaulting to the `PROVIDE` below. A package that
  * wants another size writes a script of its own that assigns the symbol and
@@ -59,8 +59,15 @@ ENTRY(_start)
  *
  * It is `.bss`-resident, so it costs the image nothing and the process's
  * region everything.
+ *
+ * The default is small. Start-up, `print` and `panic` with `{}` arguments
+ * and the checks the compiler inserts allocate nothing, so the arena serves
+ * only what the program itself allocates: an interpolated string, a `String`,
+ * a growing `Vector`. A process that needs more says so with `arena` in its
+ * `process.toml` (`tools/sosimage/src/declaration.saw`), or with a script of
+ * its own as above.
  */
-PROVIDE(ARENA_SIZE = 64K);
+PROVIDE(ARENA_SIZE = 4K);
 
 MEMORY {
     IMAGE (rwxa) : ORIGIN = 0x40200000, LENGTH = SOS_REGION_LEN - SOS_STACK_LEN

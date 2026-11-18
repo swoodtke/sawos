@@ -18,7 +18,7 @@ import sosimage.build.{ensure_directory}
 import sosimage.image.{RowSpec}
 import sosimage.imagefile.{Bindings, Bound, InputValue}
 import sosimage.plan.{ImagePlan, PlanRecord, PlanSlabs, Source, check_plan, plan_image,
-                      plan_module}
+                      plan_module, root_windows, window_rows}
 import sosimage.limits.{ImageLimits}
 import sosimage.product.{described_spec, input_path, plan_slabs, process_extras,
                          quota_defaults, slab_total, stock_region_rows}
@@ -371,9 +371,9 @@ func main() {
                "heartbeat: its own over the image's default")
     }
     let box_module = plan_module(&box, "useless-box").join("\n")
-    assert(box_module.contains("func child_3() -> Child \{\n    var quota = Vector<Quota>()\n    var records = Vector<Record>()\n    try! records.push(Record(tag: 1, source: Source.System, from: 0x0, offset: 0x0, len: 0x0))\n    var rights = Vector<RightName>()\n    try! rights.push(RightName.ClockGet)\n    try! rights.push(RightName.Debug)\n    Child(name: \"heartbeat\", image: 3, destination: 7,\n          quota: move quota, records: move records, rights: move rights,\n          start: 1, shutdown: false)\n\}"),
+    assert(box_module.contains("func child_3() -> Child \{\n    var quota = try! Vector<Quota>(capacity: 0)\n    var records = try! Vector<Record>(capacity: 1)\n    try! records.push(Record(tag: 1, source: Source.System, from: 0x0, offset: 0x0, len: 0x0))\n    var rights = try! Vector<RightName>(capacity: 2)\n    try! rights.push(RightName.ClockGet)\n    try! rights.push(RightName.Debug)\n    Child(name: \"heartbeat\", image: 3, destination: 7,\n          quota: move quota, records: move records, rights: move rights,\n          start: 1, shutdown: false)\n\}"),
            "heartbeat's child function: its two rights")
-    assert(box_module.contains("    var rights = Vector<RightName>()\n    try! rights.push(RightName.Debug)\n    try! rights.push(RightName.ProcessSelf)\n    try! rights.push(RightName.ClockGet)\n    try! rights.push(RightName.Transfer)\n    Child(name: \"gpio\""),
+    assert(box_module.contains("    var rights = try! Vector<RightName>(capacity: 4)\n    try! rights.push(RightName.Debug)\n    try! rights.push(RightName.ProcessSelf)\n    try! rights.push(RightName.ClockGet)\n    try! rights.push(RightName.Transfer)\n    Child(name: \"gpio\""),
            "gpio's child function: the four")
     // The setup writes, in file order, each a register's word of its row.
     assert(box.setup.len() == 4, "four setup writes")
@@ -542,7 +542,30 @@ func main() {
     let text = module.join("\n")
     assert(text.contains("import bootplan.\{Plan, Child, Record, Source, Setup, SetupOp, Quota, QuotaName, RightName\}"), "its import")
     assert(text.contains("    try! setup.push(Setup(register: \"D.R\", row: 4, offset: 0x10, len: 0x4, at: 0x0, op: SetupOp.Clear, value: 0x2))"), "a setup write")
-    assert(text.contains("    Plan(children: move children, setup: move setup, connections: 1)"), "the plan")
+    assert(text.contains("    var children = try! Vector<Child>(capacity: 1)"), "the children")
+    assert(text.contains("    var setup = try! Vector<Setup>(capacity: 1)"), "the setup writes")
+    // A carve and a setup write of one row: root holds it as one window.
+    assert(text.contains("    Plan(children: move children, setup: move setup, connections: 1,\n         windows: 1)"), "the plan")
+
+    // The rows root holds as windows: one a sibling names, one a setup write
+    // names, one both name, counted once, and two rows two windows. A row
+    // given whole is no window.
+    let sibling = "\{\"tag\": 2, \"source\": \"sibling\", \"from\": 5\}"
+    let write = "\{\"register\": \"R\", \"row\": 5, \"offset\": 0, \"len\": 4, \"at\": 0, \"op\": \"set\", \"value\": 1\}"
+    let other = "\{\"register\": \"S\", \"row\": 6, \"offset\": 0, \"len\": 4, \"at\": 0, \"op\": \"set\", \"value\": 1\}"
+    let child = "\{\"name\": \"c\", \"image\": 0, \"destination\": 1, \"start\": 1, \"records\": [{sibling}]\}"
+    assert(window_rows(&read_ok(one_child(sibling, 0))) == 1, "a sibling's row")
+    assert(window_rows(&read_ok("\{\"setup\": [{write}]\}")) == 1, "a setup write's row")
+    assert(window_rows(&read_ok("\{\"children\": [{child}], \"setup\": [{write}]\}")) == 1,
+           "a row a sibling and a setup write name")
+    assert(window_rows(&read_ok("\{\"children\": [{child}], \"setup\": [{other}]\}")) == 2,
+           "two rows")
+    assert(window_rows(&read_ok(one_child("\{\"tag\": 2, \"source\": \"row\", \"from\": 5\}", 0))) == 0,
+           "a row given whole")
+    // A test plan may state root's count, which the module then carries.
+    let short = read_ok("\{\"windows\": 0, \"children\": [{child}]\}")
+    assert(window_rows(&short) == 1 && root_windows(&short) == 0, "a stated count")
+    assert(plan_module(&short, "s").join("\n").contains("         windows: 0)"), "its module")
     assert(text.contains("    try! quota.push(Quota(kind: QuotaName.Handle, limit: 6))"), "a quota row")
     assert(text.contains("    try! records.push(Record(tag: 6, source: Source.Carve, from: 0x4, offset: 0xc, len: 0x8))"), "a record")
     assert(text.contains("    Child(name: \"a\", image: 2, destination: 3,"), "a child")
@@ -798,6 +821,14 @@ func more() {
     }
     let quoted_text = plan_module(&quoted, "q").join("\n")
     assert(quoted_text.contains("Child(name: \"q\\\"r\\\\s\", image: 0"), "a quote and a backslash")
+}
+
+/// The test plan `text`, which reads.
+func read_ok(text: String) -> ImagePlan {
+    match read_plan(text) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the plan did not read: {m}")
+    }
 }
 
 func read_refusal(text: String) -> String {

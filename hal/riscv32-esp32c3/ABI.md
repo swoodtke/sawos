@@ -502,12 +502,16 @@ flash size the smoke harness provides; the runner's `C3_FLASH_BYTES` checks the
 same limit before booting.
 
 In a freestanding process image the `.bss` is dominated by one number: the
-arena, `ARENA_SIZE` in the linker script. A process package may choose its own
-size (`tests/arena-small/`); a package that says nothing gets the default in
-`user.ld`. The kernel's arena is `PROVIDE(ARENA_SIZE = 16K)` in
-`esp32c3.ld`: the kernel allocates nothing on its steady path (every kernel
-source builds under `--no-hidden-alloc`; the arena backs only the compiler's
-panic path), so the arena is the first lever to pull when the kernel's `.data` +
+arena, `ARENA_SIZE` in the linker script. A process states its size with
+`arena` in its declaration, or its package chooses one with a script of its
+own (`tests/arena-small/`); a package that says nothing gets `user.ld`'s
+default of 4 KiB, since start-up, `print` and the panic path allocate nothing
+and the arena serves only the program's own allocations. The kernel's arena is
+`PROVIDE(ARENA_SIZE = 16K)` in `esp32c3.ld`. Nothing in the kernel reaches the
+allocator at run time: every kernel source builds under `--no-hidden-alloc`,
+and its prints and a failed check's message render into stack buffers. The
+link still needs the arena, whose bounds the allocator seams `sosrt` exports
+read, so the arena is the first lever to pull when the kernel's `.data` +
 `.bss` outgrow their region. The kernel's `.bss` also holds the kernel stack
 (`KERNEL_STACK_SIZE`, a second lever) and the per-process stats region, which
 has `STATS_ROWS` = `PROT_DOMAIN_SLOTS` rows. `PROT_DOMAIN_SLOTS` is
