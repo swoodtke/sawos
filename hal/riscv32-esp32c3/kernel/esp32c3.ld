@@ -75,7 +75,7 @@ ENTRY(_start)
 /* ---------------------------------------------------------------------------
  * The two `.bss` knobs
  * ---------------------------------------------------------------------------
- * `ARENA_SIZE` is the size of `sosrt`'s bump-allocator arena (virt.ld
+ * `ARENA_SIZE` is the size of `sosrt`'s heap arena (virt.ld
  * describes it in full). It is 16K here, smaller than virt's, so the kernel's
  * .data + .bss fit the 168K `SRAM` region; that is safe because the kernel
  * allocates nothing on its steady path and the arena backs only the compiler's

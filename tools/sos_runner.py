@@ -174,7 +174,7 @@ EXIT_DEADLOCK = 7
 EXIT_KILLED_ROOT = 8
 
 # `AbortCode.NoMemory` in rt/common/src/lib.saw: what the runtime stops the
-# machine with when the bump arena cannot serve a request. Deliberately
+# machine with when the arena cannot serve a request. Deliberately
 # different from the kernel's exit codes, so a transcript can tell "the program
 # panicked" from "the arena ran dry" by the status alone. Kept in step with that
 # enum.
@@ -211,8 +211,12 @@ FAULT_ROOT_PKG = os.path.join(TESTS_DIR, "faulting-root")
 # module and never through an op number.
 THREAD_BASICS_PKG = os.path.join(TESTS_DIR, "thread-basics")
 THREAD_PREEMPT_PKG = os.path.join(TESTS_DIR, "thread-preempt")
-# Two preempted threads of one process allocating from the bump arena.
+# Two preempted threads of one process allocating from the arena, and two
+# that allocate and free.
 ARENA_RACE_PKG = os.path.join(TESTS_DIR, "arena-race")
+ARENA_CHURN_PKG = os.path.join(TESTS_DIR, "arena-churn")
+# Three threads of one process asking the runtime which thread they are.
+LOCK_OWNER_PKG = os.path.join(TESTS_DIR, "lock-owner")
 # User FP/SIMD state, arm64 only: two threads' patterns across yields, and a
 # second process's first use after the first has filled the registers.
 FP_THREADS_PKG = os.path.join(TESTS_DIR, "fp-threads")
@@ -828,8 +832,15 @@ STATS_REGION_RO_PKG = os.path.join(TESTS_DIR, "stats-region-ro")
 
 # The package that chooses its own arena. Its `linker-script` is not one of the
 # shared `hal/*/user/` scripts: it names a two-line file of its own that sets
-# `ARENA_SIZE` and then INCLUDEs the shared one.
+# `ARENA_SIZE` and then INCLUDEs the shared one. `arena-reuse` does the same.
 ARENA_SMALL_PKG = os.path.join(TESTS_DIR, "arena-small")
+ARENA_REUSE_PKG = os.path.join(TESTS_DIR, "arena-reuse")
+# Blocks past 64 KiB in a 176 KiB arena.
+ARENA_LARGE_PKG = os.path.join(TESTS_DIR, "arena-large")
+# Two bad frees the heap refuses: a block freed twice, and a pointer into a
+# live block.
+DOUBLE_FREE_PKG = os.path.join(TESTS_DIR, "double-free")
+STRAY_FREE_PKG = os.path.join(TESTS_DIR, "stray-free")
 
 # A freestanding C child. `c-child` is a `main.c`, a `crt0.c` and a hand-rolled
 # `syscall.c`, with no `sos` dependency, no `sosrt` and no arena; `c-hello` is a
@@ -2534,26 +2545,23 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
-        # The bump arena's cursor under preemption. Two workers of one process
+        # The arena's allocations under preemption. Two workers of one process
         # take thousands of blocks each from `sosrt`'s arena under the
         # short-tick preemption kernel (`tests/threads_fast_tick.saw`), and the
         # initial thread then checks that no two blocks share a granule and
-        # that every block still holds its worker's marker. A cursor update
-        # that a switch can overwrite hands the same block to both workers and
-        # fails the first check with a line naming the offset.
+        # that every block still holds its worker's marker. A heap entered by
+        # both workers at once hands the same block to both and fails the
+        # first check with a line naming the offset.
         #
         # The kernel's own tick narration lands in the same stream, so the
         # match runs on the projection `thread_preempt` uses; neither expected
         # line begins `SOS: `.
         #
         # It runs on the isolated riscv32 profile only, because that is the
-        # only profile where it can fail. Against a cursor updated by a plain
-        # read and store, a boot there reports an overlap and a boot on arm64
-        # or riscv32-flat does not: those two run the workload so fast that
-        # too few ticks land in it for one to fall inside a window of a few
-        # instructions, and a shorter period does not add enough. A case that
-        # cannot fail there would pass whatever the allocator did, so it is
-        # not run there.
+        # profile where it can fail: arm64 and riscv32-flat run the workload so
+        # fast that too few ticks land inside the allocator, and a shorter
+        # period does not add enough. A case that cannot fail there would pass
+        # whatever the allocator did, so it is not run there.
         "name": "arena_race",
         "src": os.path.join(TESTS_DIR, "threads_fast_tick.saw"),
         "root_pkg": ARENA_RACE_PKG,
@@ -2562,6 +2570,47 @@ TEST_CASES = [
         "expect_out": ["SOS M2: preemptive kernel up on",
                        "SOS arenarace: two allocators, no yields",
                        "SOS arenarace: blocks disjoint, markers intact"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Allocation and free under preemption. Two workers of one process
+        # each hold a few blocks of varying size and alignment, and in each of
+        # thousands of rounds check and free the oldest and take a new one,
+        # under the short-tick kernel. A block that lost its worker's byte
+        # before its free (two workers handed overlapping blocks, or a free
+        # list written into a live block) ends the worker with a line naming
+        # it. Once both are joined the initial thread asks for three quarters
+        # of the arena in one block, which a free lost to a switch makes
+        # impossible: the request then stops the machine with the arena's
+        # status.
+        #
+        # The kernel's tick narration and the profile are as `arena_race`'s.
+        "name": "arena_churn",
+        "src": os.path.join(TESTS_DIR, "threads_fast_tick.saw"),
+        "root_pkg": ARENA_CHURN_PKG,
+        "arches": ["riscv32"],
+        "strip_kernel_lines": True,
+        "expect_out": ["SOS M2: preemptive kernel up on",
+                       "SOS arenachurn: two threads, no yields",
+                       "SOS arenachurn: blocks intact, the arena merged back"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The runtime's lock-owner seam, which std's `SpinLock` records as a
+        # lock's owner: three threads of one process each ask which thread
+        # they are, the workers again after a yield has run the other, and
+        # the initial thread again after both are joined. Each answer must be
+        # nonzero, each thread's two must agree, and the three threads' must
+        # differ. A process keeps the answer in the thread register, so a
+        # kernel that did not carry that register per thread hands a worker
+        # the other's answer after the yield. No tick, so the switches are
+        # the yields. It runs on every profile and on the ESP32-S3.
+        "name": "lock_owner",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LOCK_OWNER_PKG,
+        "expect_out": ["{banner}",
+                       "SOS lockowner: three threads, three owners, kept "
+                       "across switches"],
         "expect_clean_exit": True,
     },
     {
@@ -9779,7 +9828,7 @@ TEST_CASES = [
     },
 
     {
-        # A package that chose its own arena. `sosrt`'s bump arena is a linker
+        # A package that chose its own arena. `sosrt`'s arena is a linker
         # region, `PROVIDE`d at a default size by every shared user script, and
         # this package's manifest names a two-line script of its own that
         # assigns `ARENA_SIZE = 8K` and then INCLUDEs exactly the `user.ld`
@@ -9802,9 +9851,8 @@ TEST_CASES = [
         # allocate through), so it writes one line and aborts, and the exact
         # status tells "the arena ran dry" from "the program panicked".
         #
-        # It runs on every profile. A link address and a bump cursor are
-        # the same on a flat platform as on an isolated one, so nothing here is
-        # tiered.
+        # It runs on every profile. A link address and a heap are the same on
+        # a flat platform as on an isolated one, so nothing here is tiered.
         "name": "arena_small",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": ARENA_SMALL_PKG,
@@ -9818,6 +9866,80 @@ TEST_CASES = [
                        "sos: out of arena memory"],
         "expect_clean_exit": False,
         "expect_status": EXIT_ARENA_EXHAUSTED,
+    },
+    {
+        # The arena serves again what a program frees. The package's scripts
+        # give it an 8 KiB arena, as `arena_small`'s do. The program builds
+        # and drops a 1 KiB `Vector` two thousand times; takes three
+        # quarter-arena blocks, the first at the arena's front and the third
+        # against the free rest at its end, frees them first, third, second
+        # and asks for three quarters, which only a block merged on both sides
+        # holds; and takes a block at each power-of-two alignment to 1024,
+        # checks each address and that the blocks kept what was written, frees
+        # them and asks for the three quarters again. Each request that must be
+        # served is simply made: a refusal stops the machine with the arena's
+        # status, and the case wants a clean exit.
+        #
+        # It runs on every profile, for the reason `arena_small` gives.
+        "name": "arena_reuse",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": ARENA_REUSE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS arenareuse: 2000 KiB through 8 KiB",
+                       "SOS arenareuse: freed neighbours merged",
+                       "SOS arenareuse: aligned to 1024, gaps merged"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Blocks past 64 KiB, filed apart. In a 176 KiB arena the program
+        # takes a 66 KiB block and a small one after it, frees the 66 KiB
+        # block, and asks for 95 KiB, which only the free rest of the arena
+        # holds. On a 32-bit word these are the first sizes whose class index
+        # needs bit 16, so a heap that cannot see that bit files both blocks
+        # in one range and hands out the 66 KiB block; the program names it
+        # and fails. It runs on every profile; on arm64 the sizes are far
+        # from the word's top, and the case is the same claim.
+        "name": "arena_large",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": ARENA_LARGE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS arenalarge: 95 KiB served past a free 66 KiB "
+                       "block"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A free the heap can tell is bad panics. The program frees a null
+        # pointer, which is no block and is ignored, then frees one block
+        # twice: its header still marks it free, so `__saw_rt_dealloc` panics
+        # through the ordinary panic path, naming the address, and root's
+        # panic stops the machine with the panic's status. A runtime that took
+        # the second free reaches the program's UNREACHABLE line. It runs on
+        # every profile, for the reason `arena_small` gives.
+        "name": "double_free",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DOUBLE_FREE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS doublefree: a null free is no free",
+                       "SOS doublefree: freeing a block twice",
+                       # The panic's location is `sosrt`'s, and its words
+                       # end with the address, which differs by profile.
+                       "panic at lib.saw:", "bad free at "],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PANIC,
+    },
+    {
+        # A free of a pointer the heap never handed out panics as
+        # `double_free` does: the program frees a pointer into a live block,
+        # past a word it wrote zero where a header would be, and no block is
+        # zero bytes long.
+        "name": "stray_free",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": STRAY_FREE_PKG,
+        "expect_out": ["{banner}",
+                       "SOS strayfree: freeing a pointer inside a live block",
+                       "panic at lib.saw:", "bad free at "],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PANIC,
     },
     {
         # A freestanding C child, end to end. This case spawns a C image:
@@ -12216,7 +12338,8 @@ SOSIMAGE_DIR = os.path.join(REPO_ROOT, "tools", "sosimage")
 # builder's: `blade test` in each.
 HOSTED_TESTS = [os.path.join(DRIVERS_DIR, "esp32s3io"),
                 os.path.join(DRIVERS_DIR, "gpioproto"),
-                os.path.join(DRIVERS_DIR, "pwmproto")]
+                os.path.join(DRIVERS_DIR, "pwmproto"),
+                os.path.dirname(SOSRT_DIR)]
 
 # The link the builder's manifest reaches the sawlang checkout's packages
 # through: `imgformat = { path = "../../.sawlang/libs/imgformat" }`.
@@ -15285,6 +15408,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #                      `ROOT_LOAD_BASE`, entered, and its boot set drained
     #   thread_basics      threads of one process, switched as frames
     #   thread_preempt     the same under a tick harness kernel: preemption
+    #   lock_owner         each thread its own lock owner, kept in THREADPTR
     #   timer_oneshot      a Timer fire through a Waiter, with the kernel idle
     #                      on `irq_poll` in between
     #   tier_word          the platform says `Flat`
@@ -15330,6 +15454,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # A case asserting a hardware denial does not belong on a Flat board; the
     # check below refuses one named here by mistake, with the gate's reason.
     process_names = ["root_server_boot", "thread_basics", "thread_preempt",
+                     "lock_owner",
                      "timer_oneshot", "tier_word", "process_lifecycle",
                      "death_fault", "pipe_pingpong", "map_into_child",
                      "iomemory_carve", "interrupt_give", "tick_spinner",
@@ -17568,7 +17693,9 @@ def main():
         # ------------------------------------------------------------------
         # The ESP32-C3 smoke. Not gating: the C3 has no atomic instructions,
         # which the runtime's locks need, so the server does not run it. It
-        # runs against the Espressif QEMU.
+        # runs against the Espressif QEMU, and stops at its first kernel
+        # compile: `sosrt` takes std's `SpinLock`, which sawlang refuses on a
+        # target without the A extension.
         #
         # It shares no table, no build directory and no run path with the gate
         # above. The board is different in every way that matters (direct boot
@@ -17898,22 +18025,38 @@ def main():
                   c3_cc(os.path.join(RT_COMMON_C_DIR, "support.c"),
                         os.path.join(C3_BUILD, "support.o"), extra=("-O2",))]
         kobj = os.path.join(C3_BUILD, "kernel.o")
-        _run(tc().sawc() + [os.path.join(KERNEL_DIR, "main.saw"), "-o", kobj,
-                            "-Oz",
-                            "--freestanding", "--no-hidden-alloc",
-                            "--runtime-provider",
-                            "--target", C3_TRIPLE,
-                            "--target-features", C3_FEATURES,
-                            "--module-path", CORE_MODULE,
-                            "--module-path",
-                            f"hal={os.path.join(C3_HAL, 'kernel')}",
-                            # This board's `hal` re-exports the shared riscv32
-                            # core, so `rv32core` rides beside it exactly as it
-                            # does on the virt path.
-                            "--module-path", RV32_CORE_MODULE,
-                            "--module-path", tc().module_path_arg("imgformat"),
-                            "--module-path", SOSRT_MODULE,
-                            "--module-path", SOSABI_MODULE])
+        # The smoke's first compile of `sosrt`, and where sawlang refuses its
+        # `SpinLock` on a part without the A extension: the refusal is named
+        # and the smoke stops, rather than a traceback.
+        try:
+            _run(tc().sawc() + [os.path.join(KERNEL_DIR, "main.saw"),
+                                "-o", kobj,
+                                "-Oz",
+                                "--freestanding", "--no-hidden-alloc",
+                                "--runtime-provider",
+                                "--target", C3_TRIPLE,
+                                "--target-features", C3_FEATURES,
+                                "--module-path", CORE_MODULE,
+                                "--module-path",
+                                f"hal={os.path.join(C3_HAL, 'kernel')}",
+                                # This board's `hal` re-exports the shared
+                                # riscv32 core, so `rv32core` rides beside it
+                                # exactly as it does on the virt path.
+                                "--module-path", RV32_CORE_MODULE,
+                                "--module-path",
+                                tc().module_path_arg("imgformat"),
+                                "--module-path", SOSRT_MODULE,
+                                "--module-path", SOSABI_MODULE])
+        except ToolError as e:
+            if "atomics.target" not in str(e):
+                raise
+            said = [line for line in str(e).splitlines()
+                    if line.startswith("ERROR")]
+            print(f"{RED}the ESP32-C3 builds no image while the runtime's "
+                  f"lock needs atomic instructions; sawlang:{RESET}",
+                  file=sys.stderr)
+            print("\n".join(said) if said else str(e), file=sys.stderr)
+            sys.exit(2)
 
         # The builder builds every process's package and reads the kernel's
         # slab sizes for a hand-made block. Its profile is this board's, as

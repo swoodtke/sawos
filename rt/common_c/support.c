@@ -77,7 +77,7 @@ _Bool __atomic_compare_exchange_4(volatile void *ptr, void *expected,
 
 // ---- the arena's extent ---------------------------------------------------
 //
-// `sosrt`'s bump arena is a linker region, so a package can choose its size
+// `sosrt`'s arena is a linker region, so a package can choose its size
 // without conditional compilation, which this toolchain does not have. Each
 // linker script reserves `[_arena_start, _arena_end)` inside `.bss` under a
 // `PROVIDE`d `ARENA_SIZE`; the two functions below read that extent back.

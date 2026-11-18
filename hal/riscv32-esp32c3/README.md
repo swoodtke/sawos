@@ -1,7 +1,9 @@
 # hal/riscv32-esp32c3 — the ESP32-C3 board HAL
 
-SOS boots here. `make sos-smoke-esp32c3` is not gating: the part has no
-atomic instructions, which the runtime's locks need. It needs the Espressif
+`make sos-smoke-esp32c3` is not gating: the part has no atomic instructions,
+which the runtime's locks need. Nothing builds for it: the runtime takes
+std's `SpinLock`, which sawlang refuses on a target without atomics, so the
+smoke stops at its first kernel compile. It needs the Espressif
 toolchain under `~/.espressif` (QEMU with the `esp32c3` machine, and
 esp-clang for the no-A multilib row).
 

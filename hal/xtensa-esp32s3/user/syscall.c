@@ -1,10 +1,12 @@
-// SOS Xtensa user-side HAL: the syscall instruction, ESP32-S3 board.
+// SOS Xtensa user-side HAL: the syscall instruction and the thread register,
+// ESP32-S3 board.
 //
 // This is the entire architecture-dependent surface of an SOS process. A
 // `syscall` is not expressible in Saw, and neither is naming the registers the
 // ABI puts arguments in, so this file exists and nothing else in a process
 // needs to know it is Xtensa. It is C because of the `syscall` instruction
-// plus the register pinning the ABI requires; neither has a Saw spelling.
+// plus the register pinning the ABI requires, and the thread register's
+// accessors at the foot; none has a Saw spelling.
 //
 // The runtime's hooks name no architecture (a byte reaches the console through
 // a System op, the same op on every profile), so they live in the arch-free
@@ -55,4 +57,18 @@ u32 sos_syscall3(u32 handle, u32 op, u32 arg0, u32 arg1, u32 arg2,
                      : "memory");
     *value_out = a3;
     return a2;
+}
+
+// The thread register, `THREADPTR`. The kernel saves and restores it in a
+// thread's frame and starts a new thread with it zero, so it is the thread's
+// own word; nothing the compilers emit here uses it. The runtime keeps the
+// thread's lock-owner identity in it (`kernel/sysapi/src/rt.saw`).
+u32 sos_thread_word(void) {
+    u32 word;
+    __asm__ volatile("rur %0, threadptr" : "=a"(word));
+    return word;
+}
+
+void sos_set_thread_word(u32 word) {
+    __asm__ volatile("wur %0, threadptr" : : "a"(word));
 }

@@ -1,24 +1,23 @@
-// The bump arena under preemption (spec §5c, §7).
+// The arena's allocations under preemption (spec §5c, §7).
 //
 // Two workers of one process each take BLOCKS blocks from `sosrt`'s arena,
 // through the `__saw_rt_alloc` seam itself (declared `extern "C"` below, the
 // same symbol the compiler's allocation path calls). Neither yields: a burn
 // between two allocations keeps each worker running across many ticks, so the
 // preemption harness kernel with a short tick (`tests/threads_fast_tick.saw`)
-// takes the processor away at arbitrary points, including between the
-// cursor's read and its update. Each worker records every block's offset in a
-// table of its own.
+// takes the processor away at arbitrary points, inside the heap's lock
+// included. Each worker records every block's offset in a table of its own.
 //
-// The runner runs this case on the isolated riscv32 profile only: the window
-// is a few instructions, and on arm64 and riscv32-flat a boot's ticks did not
-// land in it against the unsafe allocator (see the case's comment in
-// `tools/sos_runner.py`), so a pass there would prove nothing.
+// The runner runs this case on the isolated riscv32 profile only: on arm64
+// and riscv32-flat a boot's ticks land too rarely inside the allocator (see the
+// case's comment in `tools/sos_runner.py`), so a pass there would prove
+// nothing.
 //
 // After both are joined the initial thread checks two things:
 //
 //   * disjointness: every 4-byte granule of the arena is claimed by at most
-//     one block, whichever worker took it. A cursor update lost to a switch
-//     hands the same granule out twice.
+//     one block, whichever worker took it. A free-list update lost to a
+//     switch hands the same granule out twice.
 //   * markers: after its allocation pass each worker writes its own marker
 //     byte across all of its blocks, and the initial thread reads every byte
 //     back, but only once disjointness has held. Disjoint in-arena blocks
@@ -38,8 +37,9 @@
 // or the first byte that lost its marker.
 //
 // The allocation pass is separated from the marker pass on purpose: the
-// window under test is a few instructions of `rt_alloc`, and the more of a
-// worker's time is spent inside it the likelier a tick lands there.
+// window under test is `rt_alloc`, and the more of a worker's time is spent
+// inside it the likelier a tick lands there. `tests/arena-churn/` races frees
+// as well.
 
 import sos.{System, Process}
 
@@ -66,21 +66,22 @@ static STACK_ALIGN: UInt = 16
 static ROLE_A: UInt = 1
 static ROLE_B: UInt = 2
 
-/// A block is one granule: the smallest the allocator hands out here, so the
-/// arena holds as many blocks as it can. Both workers' blocks together
-/// (`2 * BLOCKS * GRANULE` bytes) must fit the `ARENA_SIZE` the package's
-/// linker scripts set, with room left for the allocator's alignment padding.
+/// A block asks for one granule, the smallest request, and costs the smallest
+/// block the heap makes: four words. Both workers' blocks together
+/// (`2 * BLOCKS` of them) must fit the `ARENA_SIZE` the riscv32 linker script
+/// sets, after the heap's control block, on the one profile the case runs on;
+/// arm64's four-word blocks are twice the size and would not fit its script's.
 /// The root image's region bounds the arena, the tables and the stacks
 /// together.
 static GRANULE: UInt = 4
-static BLOCKS: Int = 11_000
+static BLOCKS: Int = 3000
 
 /// Iterations between two allocations, so a worker spans many ticks.
 static SPIN: Int = 60
 
 /// The granule index of every block, worker A's then worker B's. A worker
 /// writes only its own half.
-static TABLE_LEN: Int = 22_000
+static TABLE_LEN: Int = 6000
 unsafe static var BLOCK_GRANULES: [UInt16; TABLE_LEN] = [0; TABLE_LEN]
 
 /// Which worker claimed each granule of the arena (0 = nobody).

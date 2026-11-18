@@ -35,8 +35,8 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
-/* The arena: `sosrt`'s bump-allocator region, which every freestanding Saw
- * image needs because the compiler's own panic path can allocate.
+/* The arena: the region `sosrt`'s heap serves a freestanding Saw image's
+ * allocations from, the compiler's own panic path's among them.
  *
  * `ARENA_SIZE` is the knob, defaulting to the `PROVIDE` below. A package that
  * wants another size writes a script of its own that assigns the symbol and

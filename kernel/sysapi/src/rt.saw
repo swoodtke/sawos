@@ -1,17 +1,19 @@
-//! The runtime's two hooks, process side.
+//! The runtime's three hooks, process side.
 //!
-//! `sosrt` implements the frozen `__saw_rt_*` seams over exactly two per-side
-//! hooks: where a byte goes, and how the machine stops. The kernel HAL answers
-//! "the UART" and "the board's stop". A process owns no device, so it answers
-//! "a System op" to both. If `panic()` could reach a UART from userspace, the
-//! user/kernel split would be claimed rather than real.
+//! `sosrt` implements the frozen `__saw_rt_*` seams over three per-side hooks:
+//! where a byte goes, how the machine stops, and which thread asks. The kernel
+//! HAL answers "the UART" and "the board's stop". A process owns no device, so
+//! it answers "a System op" to both. If `panic()` could reach a UART from
+//! userspace, the user/kernel split would be claimed rather than real. The
+//! third it answers from the thread register (the foot of this file).
 //!
 //! They live here, not in `hal/<arch>/user/`, because they name no architecture
 //! (a byte reaches the console through a System op, the same op on every
-//! profile) and belong to whoever owns the System object.
+//! profile; the thread register is read through the user HAL's accessors) and
+//! belong to whoever owns the System object.
 //!
-//! This is the top of the module order because both hooks are written over a
-//! System op: the byte goes out through `sos_system_debug_print` and the
+//! This is the top of the module order because the first two hooks are written
+//! over a System op: the byte goes out through `sos_system_debug_print` and the
 //! machine stops through `sos_system_shutdown`. The handle they use is parked
 //! at the floor by `System(boot_handle:)`, which neither hook can do for
 //! itself.
@@ -57,4 +59,36 @@ func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
 func rt_abort(code: UInt32) unsafe -> Never {
     let _ = sos_system_shutdown(SYSTEM_HANDLE, code as UInt)
     while { }
+}
+
+// The calling thread's own word: the thread register, read and written by the
+// user HAL (`hal/<arch>/user/syscall.c`). The kernel keeps it per thread and
+// starts every thread with it zero.
+extern "C" {
+    func sos_thread_word() -> UInt
+    func sos_set_thread_word(word: UInt)
+}
+
+/// The last thread identity this process handed out; zero names none.
+static LAST_OWNER: Atomic<Int> = Atomic(0)
+
+/// Which thread is asking, for `sosrt`'s lock-owner seam: nonzero, and
+/// distinct between any two threads of this process.
+///
+/// A thread's first call takes the next number and keeps it in its thread
+/// register; every later call reads it back. It allocates nothing and cannot
+/// panic. A program that writes the thread register itself changes the
+/// answer. Two processes number their threads independently, so a lock in
+/// memory two processes share is not told apart by it. The count is a word, so
+/// on a 32-bit profile it wraps after 2^32 first asks in one process and
+/// numbers repeat from there.
+@export("sos_rt_lock_owner")
+func rt_lock_owner() unsafe -> Int {
+    let word = sos_thread_word()
+    if word != 0 {
+        return Int.from(truncating: word)
+    }
+    let fresh = LAST_OWNER.fetch_add(1) &+ 1
+    sos_set_thread_word(UInt.from(truncating: fresh))
+    fresh
 }

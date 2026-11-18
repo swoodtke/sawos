@@ -3683,10 +3683,9 @@ and there are only two reasons in the whole system:
    compare-and-swap is no instruction (the ESP32-C3, riscv32 without the A
    extension) the language leaves the `__atomic_*_4` routines to the
    environment; elsewhere the compiler inlines atomic instructions and nothing
-   references them. The bump arena's cursor advances by a compare-and-swap, so
-   it is safe under preemption on a target with atomic instructions. On a part
-   without them the routine is a plain read-modify-write, and word atomics in
-   a user process there are safe only while nothing preempts.
+   references them. The arena's heap is taken under std's `SpinLock`, which
+   sawlang refuses on a target without atomic instructions, and every kernel
+   and process links `sosrt`, so no image for such a part builds.
 
 The first half of reason 2 is a language gap: it closes the day Saw can name a
 linker symbol.
@@ -3697,13 +3696,22 @@ written in Saw, on every profile.
 
 **Where the floor is.** `rt/common_c/support.c` — one copy, shared by the kernel
 and every process — is the arena accessors and the word atomics. Each user HAL is
-its syscall instruction and nothing else. The bump arena and the frozen
-`__saw_rt_*` seams are Saw in `rt/common/src/lib.saw`, one copy serving the
-kernel and every process; the process side's two hooks and its parked boot
+its syscall instruction and its thread register's two accessors, and nothing
+else. The arena's heap, taken under std's `SpinLock`, and the frozen
+`__saw_rt_*` seams are Saw in `rt/common/src/`, one copy serving the
+kernel and every process; the process side's three hooks and its parked boot
 handle are Saw in `kernel/sysapi/`, beside the System object whose authority
-they spend. A thread context is built in Saw (`frame_init`, and a
-`resume_frame` that branches into the trap entry's own restore path), so no
-register-clearing prologue is needed in assembly.
+they spend. A free the heap can tell is bad (a block freed twice while its
+header still says free, a pointer outside the arena, before its first block,
+off the granule or behind no plausible header) panics through the ordinary
+panic path, naming the address; one it cannot tell corrupts the heap. The
+third hook answers `SpinLock`'s question of which thread is asking: a process
+numbers its threads on first ask and keeps each number in the thread's thread
+register, which the kernel carries per thread on every profile, and the
+kernel, one context, answers one constant. A thread context
+is built in Saw (`frame_init`, and a `resume_frame` that branches into the trap
+entry's own restore path), so no register-clearing prologue is needed in
+assembly.
 
 **The panic path is check-free by construction.** The console writer the runtime
 seams call is Saw, and it is check-free by construction rather than by
@@ -3762,26 +3770,28 @@ the tick and timers arm their own.
   `resume_after_death`, after a teardown. Every thread belongs to a Process: a
   kernel that could enter user mode without a Process would have syscalls no
   handle table answers.
-- **User FP/SIMD state travels with the thread, on Profile B.** Profile A has
-  no FPU, so there is none to carry, and the ESP32-S3 profile leaves its FPU
-  disabled (`CPENABLE` = 0), so an FP instruction there is a fault for a
-  process that leaves `CPENABLE` alone. That tier is `Flat` and cannot stop a
-  process setting it; one that does runs FP instructions with nothing to
-  carry its FP state across a switch, which the tier disclaims. The trap
-  frame holds general registers only, and the kernel executes no FP/SIMD
-  instruction, so a trap that resumes the same thread (an interrupt included)
-  saves nothing. Each thread's
+- **User FP/SIMD state travels with the thread, on Profile B.** Profile A has no
+  FPU, so there is none to carry, and the ESP32-S3 profile leaves its FPU
+  disabled (`CPENABLE` = 0), so an FP instruction there is a fault for a process
+  that leaves `CPENABLE` alone. That tier is `Flat` and cannot stop a process
+  setting it; one that does runs FP instructions with nothing to carry its FP
+  state across a switch, which the tier disclaims. The trap frame holds general
+  registers only, and the kernel executes no FP/SIMD instruction, so a trap that
+  resumes the same thread (an interrupt included) saves nothing. Each thread's
   V0-V31, `FPCR` and `FPSR` live in an area after its frame, in its own slot,
-  and a new thread's area is zero. EL0 access to FP/SIMD is off for a thread
-  that has not used it: the first instruction traps (§5b), the thread's own
-  state is loaded and access is enabled, and the thread resumes at that
-  instruction. A switch saves the outgoing thread's state if it has used FP/SIMD
-  (before the processor idles and before the slot of an exited thread is
+  and a new thread's area is zero. The area also holds the thread's `TPIDR_EL0`,
+  which the kernel never uses: every switch saves the outgoing thread's and
+  loads the incoming one's, FP/SIMD or not, so each thread's thread register is
+  its own and none reads a value another thread wrote. EL0 access to FP/SIMD is
+  off for a thread that has not used it: the first instruction traps (§5b), the
+  thread's own state is loaded and access is enabled, and the thread resumes at
+  that instruction. A switch saves the outgoing thread's state if it has used
+  FP/SIMD (before the processor idles and before the slot of an exited thread is
   released, so a teardown during the idle wait never meets a pending save) and
-  loads the incoming
-  thread's, enabling or disabling EL0 access to match; a thread that never uses
-  FP/SIMD pays nothing. The first-use trap is not a syscall, interrupt or fault
-  and no `Stats` column counts it.
+  loads the incoming thread's, enabling or disabling EL0 access to match; a
+  thread that never uses FP/SIMD pays only the thread register's word, which
+  every switch saves and loads. The first-use trap is not a
+  syscall, interrupt or fault and no `Stats` column counts it.
 - **Protection is installed at the switch.** A process's rows are data in its
   body. On a replay tier (`hal.prot_replay_at_switch()` true: Profile A, which
   has a small fixed budget of numbered regions) the scheduler replays them when
@@ -4506,13 +4516,11 @@ loader parses and reports while no process stores either.
   rather than carrying on. A process stuck while others can still run is not a
   deadlock and is not touched; it holds what it holds until something ends it,
   which for a supervisor is `kill` (§8).
-- On a part without atomic instructions (the ESP32-C3), word atomics in a
-  user process, `sosrt`'s bump arena cursor among them, are plain
-  read-modify-write libcalls, so under the tick (§7) two threads of one
-  process that share one can each be preempted inside it, and two that
-  allocate at once can be handed overlapping blocks (§5c). That board's
+- On a part without atomic instructions (the ESP32-C3) no image builds:
+  `sosrt` takes the arena under std's `SpinLock`, which sawlang refuses on such
+  a target, and every kernel and process links `sosrt` (§5c). That board's
   emulator never delivers the timer interrupt to user mode, so no run under
-  it can show it.
+  it can show the race the lock guards.
 - On the ESP32-S3 every executable segment is used in place in flash
   (§5.6), so a program cannot be loaded into RAM and run there. A
   `map` with execute succeeds there and its row is recorded, as on every

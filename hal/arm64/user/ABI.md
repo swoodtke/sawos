@@ -1,7 +1,10 @@
 # arm64 user HAL — the seam
 
 The entire architecture-dependent surface of an SOS process on Profile B is
-`syscall.c`, which defines two symbols, `sos_syscall1` and `sos_syscall3`.
+`syscall.c`, which defines `sos_syscall1` and `sos_syscall3`, and the thread
+register's two accessors, `sos_thread_word` and `sos_set_thread_word`
+(`TPIDR_EL0`, which the runtime owns: it keeps a thread's lock-owner number
+there).
 `root/src/` builds for both profiles with only its `[sos.<triple>]` manifest
 sections differing (the linker script and the `native` line).
 
@@ -53,7 +56,8 @@ value register takes a buffer argument and the kernel copies its answer out
 (`Waiter.Wait` is the first, spec §2.2), so the `svc` operand list keeps its
 shape. Same contract as the riscv32 twin, which states the reasoning.
 
-The runtime's two hooks (`sos_rt_write`, `sos_rt_abort`) and the parked boot
+The runtime's three hooks (`sos_rt_write`, `sos_rt_abort`,
+`sos_rt_lock_owner`) and the parked boot
 handle are part of a process's contract but are not this directory's. See
 `kernel/sysapi/src/lib.saw`.
 

@@ -128,8 +128,9 @@ runs its own tests (`blade test` there: the description readers' refusals, the
 region table's and slab block's bytes, an image's limits and each refusal of
 them, the in-place check, the slab-region check, and every board, process
 and image description in the tree read clean) and the hosted packages'
-(`HOSTED_TESTS`: `drivers/esp32s3io/`, `drivers/gpioproto/` and
-`drivers/pwmproto/`), which need no emulator and print nothing when they
+(`HOSTED_TESTS`: `drivers/esp32s3io/`, `drivers/gpioproto/`,
+`drivers/pwmproto/` and `rt/common/`, the runtime's heap), which need no
+emulator and print nothing when they
 pass. Per profile it writes a profile description (JSON) and calls `sosimage
 native`, then `sosimage board` on the profile's `hal/<profile>/board.toml`,
 then `sosimage package` once for
@@ -144,7 +145,7 @@ description in the tree, the products `templates/product/` and
 every board it runs on and to this board's kernel, each image to a board of
 the tree, and each image for this board to the board (`src/tree.saw`; a
 refusal fails
-the profile, and the C3 and S3 smokes run it for their boards); per case it
+the profile, and the S3 smoke runs it for its board); per case it
 writes an image
 description into the case's staging directory and calls `sosimage link`,
 which refuses an image whose slab areas lie outside the board's slab region
@@ -204,9 +205,9 @@ hand-written image that states none does (`board_limits`, and
 `uart_service_ns16550`, whose description states none). Per profile the
 runner plans the board's `[limits.default]` against the shipping kernel
 (`sosimage defaults`) whether or not a case asks, and a refused default fails
-the profile, as a refused C3 default fails the C3 smoke, which plans it
-against its own kernel. The builder's tests plan every board's against
-numbers given there.
+the profile. The C3 smoke would plan its board's against its own kernel,
+but stops before it has one (below). The builder's tests plan every board's
+against numbers given there.
 `SOS_IMAGE_BUILDER=python` builds every image through the runner's own code
 instead, so the two can be compared, except those kinds of case, which
 that path refuses by name.
@@ -261,8 +262,10 @@ isolated profiles enforce both the syscall-path checks and memory protection.
 `make sos-smoke-esp32c3` is the ESP32-C3 board smoke. It is not gating: the
 C3 has no atomic instructions, which the runtime's locks need, and there is no
 C3 board, so the smoke is kept for the day the C3 gets real support; how its
-processes would get atomics then is not chosen. It needs the Espressif
-toolchain (QEMU with the esp32c3 machine, esp-clang).
+processes would get atomics then is not chosen. Nothing builds for it now:
+the runtime takes std's `SpinLock`, which sawlang refuses on a target without
+atomics, so the smoke stops at its first kernel compile. It needs the
+Espressif toolchain (QEMU with the esp32c3 machine, esp-clang).
 
 `make sos-smoke-esp32s3` is the ESP32-S3 board smoke. It is gating: the server
 runs it after `sos-test`, it needs the Espressif toolchain

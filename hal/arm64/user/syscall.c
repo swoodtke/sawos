@@ -1,10 +1,11 @@
-// SOS arm64 user-side HAL: the syscall instruction.
+// SOS arm64 user-side HAL: the syscall instruction and the thread register.
 //
 // This is the entire architecture-dependent surface of an SOS process. An `svc`
 // is not expressible in Saw, and neither is naming the registers the ABI puts
 // arguments in, so this file exists and nothing else in a process needs to
 // know it is arm64. It is C because of the `svc` instruction plus the register
-// pinning the ABI requires; neither has a Saw spelling.
+// pinning the ABI requires, and the thread register's accessors at the foot;
+// none has a Saw spelling.
 //
 // The runtime's hooks name no architecture (a byte reaches the console through
 // a System op, the same op on every profile), so they live in the arch-free
@@ -58,4 +59,18 @@ u64 sos_syscall3(u64 handle, u64 op, u64 arg0, u64 arg1, u64 arg2, u64 *value_ou
                      : "memory");
     *value_out = x1;
     return x0;
+}
+
+// The thread register, `TPIDR_EL0`. The kernel saves it at a switch and
+// loads the incoming thread's, zero for a new thread, so it is the thread's
+// own word; nothing the compilers emit here uses it. The runtime keeps the
+// thread's lock-owner identity in it (`kernel/sysapi/src/rt.saw`).
+u64 sos_thread_word(void) {
+    u64 word;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(word));
+    return word;
+}
+
+void sos_set_thread_word(u64 word) {
+    __asm__ volatile("msr tpidr_el0, %0" : : "r"(word));
 }

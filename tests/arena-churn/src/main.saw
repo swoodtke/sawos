@@ -1,0 +1,232 @@
+// Allocation and free from two preempted threads (spec §5c, §7).
+//
+// Two workers of one process each run ROUNDS rounds against `sosrt`'s arena,
+// through the `__saw_rt_alloc` and `__saw_rt_dealloc` seams themselves. Each
+// keeps LIVE blocks at once: a round checks and frees the oldest block, takes
+// a new one of a size and alignment that vary round to round, and fills it
+// with a byte naming the worker and the slot. Neither yields, and the
+// preemption harness kernel with a short tick (`tests/threads_fast_tick.saw`)
+// takes the processor away at arbitrary points, inside the heap's lock
+// included.
+//
+// Two things fail the case:
+//
+//   * a block that lost its byte before its free, which is what two threads
+//     handed overlapping blocks see, or one whose block a free list wrote
+//     into:
+//
+//       SOS arenachurn: block lost at round R: worker W slot S
+//
+//   * an arena that does not merge back. Once both workers are joined the
+//     initial thread asks for three quarters of the arena in one block, which
+//     only an arena whose every freed block went back on a list and merged
+//     can give. A free lost to a switch leaves a hole and the request stops
+//     the machine with the arena's status.
+//
+// Like `arena-race`, it runs on the isolated riscv32 profile only, where the
+// short tick lands inside the heap's few hundred instructions often enough.
+
+import sos.{System, Process}
+
+extern "C" {
+    func __saw_rt_alloc(size: Int, align: Int) -> UnsafePointer<Int8>?
+    func __saw_rt_dealloc(ptr: UnsafePointer<Int8>, size: Int, align: Int)
+    func sos_arena_size() -> UInt
+}
+
+/// The boot handle, parked for the workers; see `thread-preempt`.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+unsafe static var BURN_SINK: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static ROLE_A: UInt = 1
+static ROLE_B: UInt = 2
+
+static ROUNDS: Int = 4000
+
+/// Blocks each worker holds at once.
+static LIVE: Int = 8
+
+/// Iterations between two rounds.
+static SPIN: Int = 20
+
+/// Each worker's live blocks, worker A's then worker B's.
+static SLOTS: Int = 16
+unsafe static var BLOCKS: [UInt; SLOTS] = [0; SLOTS]
+unsafe static var SIZES: [Int; SLOTS] = [0; SLOTS]
+unsafe static var ALIGNS: [Int; SLOTS] = [0; SLOTS]
+
+static EXIT_A: UInt = 33
+static EXIT_B: UInt = 44
+static EXIT_LOST: UInt = 55
+static NO_VALUE: UInt = 0
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+/// Burn time without touching the kernel or the arena; see `thread-preempt`.
+func burn(iterations: Int) unsafe {
+    var x = BURN_SINK
+    var i = 0
+    while i < iterations {
+        x = (x &* 1_664_525) &+ 1_013_904_223
+        i = i + 1
+    }
+    BURN_SINK = x
+}
+
+/// The byte a worker writes across a slot's block.
+func tag_of(role: UInt, slot: Int) -> UInt8 {
+    UInt8.from(truncating: (role << 4) | (slot as UInt))
+}
+
+func filled(block: UInt, len: Int, tag: UInt8) unsafe -> Bool {
+    var byte = 0
+    while byte < len {
+        if UnsafeMemory<UInt8, Normal>(block + (byte as UInt)).read() != tag {
+            return false
+        }
+        byte = byte + 1
+    }
+    true
+}
+
+func fill(block: UInt, len: Int, tag: UInt8) unsafe {
+    var byte = 0
+    while byte < len {
+        UnsafeMemory<UInt8, Normal>(block + (byte as UInt)).write(tag)
+        byte = byte + 1
+    }
+}
+
+/// Check and free the block in `slot`, if it holds one. False when the block
+/// lost its byte.
+func release(role: UInt, slot: Int) unsafe -> Bool {
+    let block = BLOCKS[slot]
+    if block == 0 {
+        return true
+    }
+    let tag = tag_of(role, slot)
+    if not filled(block, SIZES[slot], tag) {
+        return false
+    }
+    __saw_rt_dealloc(block as UnsafePointer<Int8>, SIZES[slot], ALIGNS[slot])
+    BLOCKS[slot] = 0
+    true
+}
+
+func worker(role: UInt) unsafe {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let first = if role == ROLE_A { 0 } else { LIVE }
+    var seed = role
+    var round = 0
+    var code = if role == ROLE_A { EXIT_A } else { EXIT_B }
+    while round < ROUNDS {
+        let slot = first + round % LIVE
+        if not release(role, slot) {
+            print("SOS arenachurn: block lost at round {}: worker {} slot {}\n",
+                  round, role, slot)
+            code = EXIT_LOST
+            break
+        }
+        seed = (seed &* 1_103_515_245) &+ 12_345
+        let size = 1 + Int.from(truncating: (seed >> 8) % 160)
+        let align = 1 << Int.from(truncating: (seed >> 20) % 6)
+        let block = __saw_rt_alloc(size, align)! as UInt
+        fill(block, size, tag_of(role, slot))
+        BLOCKS[slot] = block
+        SIZES[slot] = size
+        ALIGNS[slot] = align
+        burn(SPIN)
+        round = round + 1
+    }
+    var slot = first
+    while slot < first + LIVE {
+        if not release(role, slot) {
+            print("SOS arenachurn: block lost at the end: worker {} slot {}\n",
+                  role, slot)
+            code = EXIT_LOST
+        }
+        slot = slot + 1
+    }
+    let _ = (move me).exit(code)
+}
+
+func initial(boot_handle: UInt) unsafe {
+    park_boot_handle(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS arenachurn: no process handle\n")
+        let _ = system.shutdown(1)
+        return
+    }
+
+    let top_a = stack_a_top()
+    let top_b = stack_b_top()
+    let a = try proc.thread_create(stack_top: top_a, arg: ROLE_A) catch {
+        print("SOS arenachurn: create failed: {}\n", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let b = try proc.thread_create(stack_top: top_b, arg: ROLE_B) catch {
+        print("SOS arenachurn: create failed: {}\n", error)
+        let _ = system.shutdown(1)
+        return
+    }
+
+    let _ = system.debug_print("SOS arenachurn: two threads, no yields\n")
+    let _ = a.start()
+    let _ = b.start()
+
+    let ra: UInt = try a.join() catch { NO_VALUE }
+    let rb: UInt = try b.join() catch { NO_VALUE }
+    if ra != EXIT_A || rb != EXIT_B {
+        print("SOS arenachurn: workers ended a={} b={}\n", ra, rb)
+        let _ = system.shutdown(1)
+        return
+    }
+
+    let whole = (sos_arena_size() / 4 * 3) as Int
+    let block = __saw_rt_alloc(whole, 1)!
+    __saw_rt_dealloc(block, whole, 1)
+    let ok = "SOS arenachurn: blocks intact, the arena merged back\n"
+    let _ = system.debug_print(ok)
+    let _ = proc.exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) unsafe {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

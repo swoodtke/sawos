@@ -1,6 +1,6 @@
 /* The C child's linker script, riscv32.
  *
- * `ARENA_SIZE` is `sosrt`'s bump-allocator region, and every user script
+ * `ARENA_SIZE` is `sosrt`'s heap region, and every user script
  * `PROVIDE`s a default of it because every freestanding Saw image needs one
  * (the compiler's own panic path can allocate). This image has no Saw in it:
  * it links no `sosrt`, references neither `_arena_start` nor `_arena_end`, and

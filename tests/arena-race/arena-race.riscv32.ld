@@ -6,7 +6,7 @@
  * `ld.lld` runs with the package directory as its working directory.
  *
  * The size is load-bearing for `src/main.saw`: it must hold every block both
- * workers allocate with room to spare, since nothing is reclaimed.
+ * workers allocate with room to spare, since neither frees one.
  */
 ARENA_SIZE = 96K;
 

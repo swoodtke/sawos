@@ -1,0 +1,46 @@
+// Blocks past 64 KiB are filed by their real size (spec §5c).
+//
+// The heap files a free block by the power of two its size falls in, then by
+// a quarter of that range. On a 32-bit word the sizes past 64 KiB are the
+// first whose class index needs bit 16, so this case asks the heap to tell
+// two of them apart in a 176 KiB arena:
+//
+//   * a 66 KiB block is taken and a small block after it, so the rest of the
+//     arena (about 110 KiB) is one free block of its own;
+//   * the 66 KiB block is freed, and 95 KiB is asked for.
+//
+// Only the rest holds 95 KiB. A heap that filed both blocks in one range, or
+// the 66 KiB one in a list it searches for 95 KiB, hands out the 66 KiB block
+// for the request, which this case names. A pass reads
+//
+//   SOS arenalarge: 95 KiB served past a free 66 KiB block
+
+import sos.{System}
+
+// Declared as `std.alloc` declares them, since a program's declarations of one
+// symbol must agree; `sosrt` defines them.
+extern "C" {
+    func __saw_rt_alloc(size: Int, align: Int) -> UnsafePointer<Int8>?
+    func __saw_rt_dealloc(ptr: UnsafePointer<Int8>, size: Int, align: Int)
+}
+
+static SMALL_BYTES: Int = 66 * 1024
+static LARGE_BYTES: Int = 95 * 1024
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let small = __saw_rt_alloc(SMALL_BYTES, 8)!
+    let wall = __saw_rt_alloc(1, 1)! as UInt
+    __saw_rt_dealloc(small, SMALL_BYTES, 8)
+    let large = __saw_rt_alloc(LARGE_BYTES, 8)! as UInt
+    if large == small as UInt || large < wall {
+        print("SOS arenalarge: 95 KiB from the 66 KiB block at {}\n", large)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print(
+        "SOS arenalarge: 95 KiB served past a free 66 KiB block\n")
+    let _ = system.shutdown(0)
+}

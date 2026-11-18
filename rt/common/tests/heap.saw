@@ -1,0 +1,665 @@
+// The heap behind `__saw_rt_alloc`, on the host: what it serves, what it
+// refuses, and that every freed byte comes back.
+//
+// Most checks rest on one measure, `largest`: the largest request the heap
+// serves now, found by bisection. A refusal changes nothing, and a block taken
+// from a free one and freed straight back merges into it again, so measuring
+// leaves the heap as it was. A heap whose every block has been freed must
+// measure what it did fresh and serve it from the region's first block, which
+// only a merge on each side of every free can give.
+
+import sosrt.heap.{UnsafeHeap}
+
+/// 176 KiB, the largest arena a package in the tree declares.
+static REGION_WORDS: Int = 22_528
+
+@align(64)
+unsafe static var REGION: [UInt64; REGION_WORDS] = [0; REGION_WORDS]
+
+// The heap's geometry on a 64-bit host: a header word, a two-word granule and
+// a four-word smallest block.
+static WORD: UInt = 8
+static GRAIN: UInt = 16
+static MIN_BLOCK: UInt = 32
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func region_base() unsafe -> UInt {
+    ((&var REGION) as UnsafePointer<UInt64>) as UInt
+}
+
+/// A heap over the first `bytes` of a zeroed region.
+func fresh(bytes: UInt) unsafe -> UnsafeHeap {
+    var i = 0
+    while i < REGION_WORDS {
+        REGION[i] = 0
+        i = i + 1
+    }
+    UnsafeHeap(base: region_base(), size: bytes)
+}
+
+/// The largest request `heap` serves now; the heap is left as it was.
+func largest(heap: &UnsafeHeap) unsafe -> UInt {
+    var low: UInt = 0
+    var high = heap.size
+    while low < high {
+        let mid = high - (high - low) / 2
+        let block = heap.alloc(mid, 1)
+        if block != 0 {
+            heap.free(block)
+            low = mid
+        } else {
+            high = mid - 1
+        }
+    }
+    low
+}
+
+/// The block every fully merged heap over `heap`'s region serves its largest
+/// request from.
+func first_block(heap: &UnsafeHeap) unsafe -> UInt {
+    let all = largest(&heap)
+    let block = heap.alloc(all, 1)
+    heap.free(block)
+    block
+}
+
+func fill(block: UInt, len: UInt, tag: UInt8) unsafe {
+    var i: UInt = 0
+    while i < len {
+        UnsafeMemory<UInt8, Normal>(block + i).write(tag)
+        i = i + 1
+    }
+}
+
+func intact(block: UInt, len: UInt, tag: UInt8) unsafe -> Bool {
+    var i: UInt = 0
+    while i < len {
+        if UnsafeMemory<UInt8, Normal>(block + i).read() != tag {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+static CANARY: UInt8 = 0xC5
+
+/// How much of the region a fence covers: past the largest tiny region.
+static FENCE_BYTES: UInt = 1024
+
+/// Fill the region with `CANARY` but for `[base + skip, + bytes)`, which is
+/// zeroed, and give a heap that span.
+func fenced(skip: UInt, bytes: UInt) unsafe -> UnsafeHeap {
+    let base = region_base()
+    let all = FENCE_BYTES
+    var at: UInt = 0
+    while at < all {
+        let inside = at >= skip && at < skip + bytes
+        let byte: UInt8 = if inside { 0 } else { CANARY }
+        UnsafeMemory<UInt8, Normal>(base + at).write(byte)
+        at = at + 1
+    }
+    UnsafeHeap(base: base + skip, size: bytes)
+}
+
+/// Whether every byte outside `[base + skip, + bytes)` is still `CANARY`.
+func fence_holds(skip: UInt, bytes: UInt) unsafe -> Bool {
+    let base = region_base()
+    let all = FENCE_BYTES
+    var at: UInt = 0
+    while at < all {
+        if (at < skip || at >= skip + bytes) &&
+           UnsafeMemory<UInt8, Normal>(base + at).read() != CANARY {
+            return false
+        }
+        at = at + 1
+    }
+    true
+}
+
+/// A region too small for the control block, or for a block after it, serves
+/// nothing, and no region is written outside, at any size or misalignment.
+func tiny_regions() unsafe {
+    var skip: UInt = 0
+    while skip < WORD {
+        var bytes: UInt = 0
+        while bytes <= 512 {
+            let heap = fenced(skip, bytes)
+            let block = heap.alloc(1, 1)
+            if block != 0 {
+                check(block >= heap.base && block + 1 <= heap.base + bytes,
+                      "a block inside a tiny region")
+                heap.free(block)
+            }
+            check(fence_holds(skip, bytes), "nothing written outside a region")
+            let stride: UInt = if bytes < 64 { 1 } else { 8 }
+            bytes = bytes + stride
+        }
+        skip = skip + 1
+    }
+    // The smallest region that serves: a control block of two words and five
+    // per class, three classes for a region under 256 bytes (17 words), then
+    // a header, rounded to the granule (144), and the smallest block (176).
+    check(fresh(175).alloc(1, 1) == 0, "a 175-byte region does not serve")
+    check(fresh(176).alloc(1, 1) != 0, "a 176-byte region serves")
+}
+
+/// A region whose first word is zero is all a heap needs: the rest may hold
+/// anything, the control block's words and the region's last word included.
+func over_garbage() unsafe {
+    let all = largest(&fresh(4096))
+    let heap = fenced(0, 4096)
+    var at: UInt = WORD
+    while at < 4096 {
+        UnsafeMemory<UInt8, Normal>(heap.base + at).write(CANARY)
+        at = at + 1
+    }
+    check(largest(&heap) == all, "a heap made over garbage serves it all")
+    let block = heap.alloc(all, 1)
+    heap.free(block)
+    check(largest(&heap) == all, "and takes it back")
+}
+
+/// Allocation and free in a loop far past the region's size.
+func churn() unsafe {
+    let heap = fresh(4096)
+    let all = largest(&heap)
+    check(all > 3072, "most of the region is servable")
+    var i: UInt = 0
+    while i < 100_000 {
+        let size = 1 + (i * 37) % 300
+        let block = heap.alloc(size, 8)
+        check(block != 0, "a churned request is served")
+        fill(block, size, 0x5A)
+        heap.free(block)
+        i = i + 1
+    }
+    check(largest(&heap) == all, "churn gives every byte back")
+}
+
+/// Five blocks filling the region, freed in each of the 120 orders: every
+/// order merges back into the region's first block.
+func every_free_order() unsafe {
+    let heap = fresh(4096)
+    let all = largest(&heap)
+    let home = first_block(&heap)
+    let piece = all / 6
+    var order: UInt = 0
+    while order < 120 {
+        var blocks: [UInt; 5] = [0; 5]
+        var i = 0
+        while i < 4 {
+            blocks[i] = heap.alloc(piece, 1)
+            check(blocks[i] != 0, "a piece is served")
+            i = i + 1
+        }
+        let rest = largest(&heap)
+        blocks[4] = heap.alloc(rest, 1)
+        check(blocks[4] != 0, "the rest is served")
+        check(heap.alloc(1, 1) == 0, "the region is full")
+        // The order's permutation, from its factorial digits.
+        var pool: [UInt; 5] = [0, 1, 2, 3, 4]
+        var left = 5
+        var code = order
+        while left > 0 {
+            let pick = Int.from(truncating: code % (left as UInt))
+            code = code / (left as UInt)
+            heap.free(blocks[Int.from(truncating: pool[pick])])
+            var j = pick
+            while j + 1 < left {
+                pool[j] = pool[j + 1]
+                j = j + 1
+            }
+            left = left - 1
+        }
+        check(largest(&heap) == all, "every order merges back")
+        check(first_block(&heap) == home, "from the first block")
+        order = order + 1
+    }
+}
+
+/// A list whose head is too small but which holds a block that fits: the
+/// refusal path walks it.
+func walk_the_list() unsafe {
+    let heap = fresh(4096)
+    // Two blocks of one list, 9 and 8 granules, kept apart by allocated
+    // blocks, and the rest of the region taken.
+    let nine = heap.alloc(9 * GRAIN - WORD, 1)
+    let wall_a = heap.alloc(1, 1)
+    let eight = heap.alloc(8 * GRAIN - WORD, 1)
+    let wall_b = heap.alloc(1, 1)
+    let rest = heap.alloc(largest(&heap), 1)
+    check(nine != 0 && wall_a != 0 && eight != 0 && wall_b != 0 && rest != 0,
+          "the layout is served")
+    heap.free(nine)
+    heap.free(eight)
+    // The list's head is now the 8-granule block.
+    check(heap.alloc(9 * GRAIN - WORD, 1) == nine, "the walk finds the fit")
+    check(heap.alloc(8 * GRAIN - WORD, 1) == eight, "the head still serves")
+    check(heap.alloc(1, 1) == 0, "and nothing else is free")
+}
+
+/// The split rule at its boundary: a remainder of one block is split off, and
+/// a smaller one stays with the allocation.
+func split_boundary() unsafe {
+    let heap = fresh(4096)
+    let all = largest(&heap)
+    let whole = heap.alloc(all, 1)
+    check(heap.alloc(1, 1) == 0, "a whole-region block leaves nothing")
+    heap.free(whole)
+
+    let most = heap.alloc(all - MIN_BLOCK, 1)
+    check(most != 0, "a block one block short of the region")
+    let last = heap.alloc(MIN_BLOCK - WORD, 1)
+    check(last == most + all + WORD - MIN_BLOCK, "the remainder is split off")
+    heap.free(last)
+    heap.free(most)
+
+    let near = heap.alloc(all - GRAIN, 1)
+    check(near != 0, "a block a granule short of the region")
+    check(heap.alloc(1, 1) == 0, "a granule's remainder is not a block")
+    heap.free(near)
+    check(largest(&heap) == all, "the boundary blocks merge back")
+}
+
+/// Every alignment asked of it, powers of two or not, and the gaps in front
+/// of the blocks merge back.
+func alignment() unsafe {
+    let heap = fresh(16384)
+    let all = largest(&heap)
+    let aligns: [UInt; 17] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 3,
+                              12, 24, 48, 96]
+    var blocks: [UInt; 17] = [0; 17]
+    var i = 0
+    while i < 17 {
+        let block = heap.alloc(40, aligns[i])
+        check(block != 0, "an aligned request is served")
+        if aligns[i] != 0 {
+            check(block % aligns[i] == 0, "the block is aligned")
+        }
+        check(block % GRAIN == 0, "on the granule too")
+        fill(block, 40, UInt8.from(truncating: i + 1))
+        blocks[i] = block
+        i = i + 1
+    }
+    i = 0
+    while i < 17 {
+        check(intact(blocks[i], 40, UInt8.from(truncating: i + 1)),
+              "aligned blocks are disjoint")
+        i = i + 1
+    }
+    i = 0
+    while i < 17 {
+        heap.free(blocks[i])
+        i = i + 1
+    }
+    check(largest(&heap) == all, "the gaps merge back")
+}
+
+/// A list that keeps a block keeps its bits: a request below its class finds
+/// it through the bitmaps.
+func bits_kept() unsafe {
+    let heap = fresh(4096)
+    let first = heap.alloc(8 * GRAIN - WORD, 1)
+    let wall_a = heap.alloc(1, 1)
+    let second = heap.alloc(8 * GRAIN - WORD, 1)
+    let wall_b = heap.alloc(1, 1)
+    let rest = heap.alloc(largest(&heap), 1)
+    check(first != 0 && wall_a != 0 && second != 0 && wall_b != 0 && rest != 0,
+          "the layout is served")
+    heap.free(first)
+    heap.free(second)
+    check(heap.alloc(8 * GRAIN - WORD, 1) != 0, "one of the pair serves")
+    check(heap.alloc(1, 1) != 0, "the other is still found")
+}
+
+/// An alignment no block can serve is refused without reading past the
+/// control block, though the list heads beyond the bitmaps and the blocks
+/// beyond the heads hold non-zero words.
+func unservable_alignment() unsafe {
+    let heap = fresh(4096)
+    let small = heap.alloc(3 * GRAIN - WORD, 1)
+    let wall = heap.alloc(1, 1)
+    let rest = heap.alloc(largest(&heap), 1)
+    check(small != 0 && wall != 0 && rest != 0, "the layout is served")
+    fill(rest, 256, 0xFF)
+    heap.free(small)
+    check(heap.alloc(10, 2047) == 0, "an odd alignment half the region")
+    check(heap.alloc(10, 4095) == 0, "an odd alignment near the region")
+    check(heap.alloc(1, 1) == small, "the small block is still free")
+}
+
+/// Refusals: past the region, past the word, an alignment past the region.
+/// None of them changes the heap.
+func refusals() unsafe {
+    let heap = fresh(4096)
+    let all = largest(&heap)
+    check(heap.alloc(all + 1, 1) == 0, "one byte more than fits")
+    check(heap.alloc(4096, 1) == 0, "the region's own size")
+    check(heap.alloc(~(0 as UInt), 1) == 0, "the whole word")
+    check(heap.alloc(~(0 as UInt) - 4, 1) == 0, "a size that wraps a header")
+    check(heap.alloc(1, 1 << 63) == 0, "the top bit as an alignment")
+    check(heap.alloc(1, 8192) == 0, "an alignment past the region")
+    check(heap.alloc(1, (1 << 63) + 1) == 0, "an alignment that wraps")
+    check(heap.alloc(1, ~(0 as UInt)) == 0, "the whole word as an alignment")
+    heap.free(0)
+    check(largest(&heap) == all, "a refusal changes nothing")
+}
+
+/// Random requests and frees, every live block checked against every other
+/// and against what was written into it.
+func random_churn() unsafe {
+    let heap = fresh(16384)
+    let all = largest(&heap)
+    let base = region_base()
+    var blocks: [UInt; 64] = [0; 64]
+    var sizes: [UInt; 64] = [0; 64]
+    let aligns: [UInt; 8] = [1, 2, 4, 8, 16, 32, 64, 24]
+    var seed: UInt = 12_345
+    var served = 0
+    var step = 0
+    while step < 200_000 {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        let slot = Int.from(truncating: (seed >> 33) % 64)
+        let tag = UInt8.from(truncating: slot + 1)
+        if blocks[slot] != 0 {
+            check(intact(blocks[slot], sizes[slot], tag), "a live block kept")
+            heap.free(blocks[slot])
+            blocks[slot] = 0
+        } else {
+            let size = 1 + (seed >> 20) % 700
+            let align = aligns[Int.from(truncating: (seed >> 50) % 8)]
+            let block = heap.alloc(size, align)
+            if block != 0 {
+                check(block % align == 0, "a random block is aligned")
+                check(block >= base && block + size <= base + 16384,
+                      "a random block is inside the region")
+                var other = 0
+                while other < 64 {
+                    if blocks[other] != 0 {
+                        check(block + size <= blocks[other] ||
+                              blocks[other] + sizes[other] <= block,
+                              "random blocks are disjoint")
+                    }
+                    other = other + 1
+                }
+                fill(block, size, tag)
+                blocks[slot] = block
+                sizes[slot] = size
+                served = served + 1
+            }
+        }
+        step = step + 1
+    }
+    check(served > 50_000, "most random requests are served")
+    var i = 0
+    while i < 64 {
+        if blocks[i] != 0 {
+            heap.free(blocks[i])
+        }
+        i = i + 1
+    }
+    check(largest(&heap) == all, "random churn gives every byte back")
+}
+
+/// A heap over the first `bytes` of a region that is all `CANARY` but its
+/// first word.
+func garbage(bytes: UInt) unsafe -> UnsafeHeap {
+    let base = region_base()
+    var at: UInt = 0
+    while at < (REGION_WORDS as UInt) * WORD {
+        UnsafeMemory<UInt8, Normal>(base + at).write(CANARY)
+        at = at + 1
+    }
+    UnsafeMemory<UInt, Normal>(base).write(0)
+    UnsafeHeap(base: base, size: bytes)
+}
+
+/// The largest request `heap` serves now at `align`; the heap is left as it
+/// was.
+func largest_at(heap: &UnsafeHeap, align: UInt) unsafe -> UInt {
+    var low: UInt = 0
+    var high = heap.size
+    while low < high {
+        let mid = high - (high - low) / 2
+        let block = heap.alloc(mid, align)
+        if block != 0 {
+            heap.free(block)
+            low = mid
+        } else {
+            high = mid - 1
+        }
+    }
+    low
+}
+
+/// The arena sizes the tree's scripts and declarations set (4, 8, 16, 48, 64,
+/// 72, 96 and 176 KiB, four of them powers of two), and one that is no multiple
+/// of a page: each fresh arena's one block is in the class table's top class,
+/// whose last list or next class a request near the arena's size reaches.
+/// Each serves its whole block, over garbage as over zeros, takes a small
+/// block back on the first list, and refuses a request a class past the
+/// table without reading past it.
+func real_arenas() unsafe {
+    let sizes: [UInt; 9] = [4096, 8192, 16_384, 49_152, 65_536, 73_728, 98_304,
+                            180_224, 6000]
+    var i = 0
+    while i < 9 {
+        let bytes = sizes[i]
+        let clean = fresh(bytes)
+        let all = largest(&clean)
+        let whole = clean.alloc(all, 1)
+        check(whole != 0 && whole + all <= clean.base + bytes,
+              "an arena serves its one block")
+        clean.free(whole)
+        let small = clean.alloc(1, 1)
+        let wall = clean.alloc(1, 1)
+        clean.free(small)
+        check(clean.alloc(bytes, bytes) == 0, "a class past the table")
+        check(wall != 0 && clean.alloc(1, 1) == small,
+              "a small block comes back on the first list")
+
+        let junk = garbage(bytes)
+        check(largest(&junk) == all, "an arena over garbage serves the same")
+        let block = junk.alloc(1, 1)
+        let fence = junk.alloc(1, 1)
+        check(block > junk.base && block < junk.base + bytes,
+              "a first block over garbage is inside the arena")
+        junk.free(block)
+        check(junk.alloc(bytes, bytes) == 0,
+              "a class past the table over garbage")
+        check(fence != 0 && junk.alloc(1, 1) == block,
+              "and the first list still serves")
+        junk.free(block)
+        junk.free(fence)
+        check(largest(&junk) == all, "and the arena is whole")
+        i = i + 1
+    }
+}
+
+/// A freed block is served again to the request that fits it exactly,
+/// though a larger free block exists.
+func exact_fit() unsafe {
+    let heap = fresh(4096)
+    let a = heap.alloc(120, 1)
+    let wall = heap.alloc(1, 1)
+    heap.free(a)
+    check(wall != 0 && heap.alloc(120, 1) == a, "an exact fit is served")
+}
+
+/// A small request is served from the smallest class that holds a fit, and
+/// within a class from the lowest list, not from the large rest.
+func good_fit() unsafe {
+    let heap = fresh(4096)
+    let a = heap.alloc(120, 1)
+    let wall = heap.alloc(1, 1)
+    heap.free(a)
+    check(wall != 0 && heap.alloc(40, 1) == a, "the smallest class serves")
+
+    let lists = fresh(4096)
+    let small = lists.alloc(120, 1)
+    let w1 = lists.alloc(1, 1)
+    let big = lists.alloc(184, 1)
+    let w2 = lists.alloc(1, 1)
+    let rest = lists.alloc(largest(&lists), 1)
+    lists.free(big)
+    lists.free(small)
+    check(w1 != 0 && w2 != 0 && rest != 0 && lists.alloc(40, 1) == small,
+          "the lowest list serves")
+}
+
+/// Emptying one list of a class keeps the class visible while another of its
+/// lists holds a block.
+func class_bit_kept() unsafe {
+    let heap = fresh(4096)
+    let a = heap.alloc(120, 1)
+    let w1 = heap.alloc(1, 1)
+    let b = heap.alloc(184, 1)
+    let w2 = heap.alloc(1, 1)
+    let rest = heap.alloc(largest(&heap), 1)
+    heap.free(a)
+    heap.free(b)
+    let again = heap.alloc(120, 1)
+    check(w1 != 0 && w2 != 0 && rest != 0 && again == a, "one list emptied")
+    check(heap.alloc(40, 1) == b, "and its class still serves")
+}
+
+/// The region's last list: an 8000-byte region's one block (7648 bytes) is
+/// served whole, over zeros and over garbage.
+func last_list() unsafe {
+    let zero = fresh(8000)
+    check(largest(&zero) == 7640, "the last list serves its block")
+    let junk = garbage(8000)
+    let b = junk.alloc(1, 1)
+    check(b > junk.base && b < junk.base + 8000, "a block inside the region")
+    junk.free(b)
+    check(largest(&junk) == 7640, "the last list over garbage")
+}
+
+/// Alignment costs: none for one the granule gives, a block already aligned is
+/// served in place, and an aligned request needs its step and a granule.
+func alignment_costs() unsafe {
+    let heap = fresh(4096)
+    let all = largest(&heap)
+    check(largest_at(&heap, 2) == all && largest_at(&heap, 4) == all &&
+          largest_at(&heap, 8) == all && largest_at(&heap, 16) == all,
+          "the granule's alignments cost nothing")
+    let home = heap.alloc(40, 1)
+    heap.free(home)
+    let align = home & (0 &- home)
+    check(align > GRAIN && heap.alloc(40, align) == home,
+          "an aligned block is served in place")
+    let wide = fresh(65_536)
+    let room = largest(&wide)
+    check(largest_at(&wide, 4096) == room - 4096 - GRAIN,
+          "an aligned request costs its step and a granule")
+}
+
+/// A region's tail short of a granule holds no block.
+func granule_tail() unsafe {
+    let all = largest(&fresh(4096))
+    check(largest(&fresh(4104)) == all, "a tail short of a granule")
+}
+
+/// What `holds` refuses, and that every block `alloc` hands out it holds.
+func bad_frees() unsafe {
+    let heap = fresh(4096)
+    check(not heap.holds(region_base() + 64), "no block before the first")
+    let a = heap.alloc(400, 1)
+    let b = heap.alloc(400, 1)
+    let wall = heap.alloc(1, 1)
+    check(heap.holds(a) && heap.holds(b) && heap.holds(wall),
+          "a live block is held")
+    check(not heap.holds(heap.base), "the control block is no block")
+    UnsafeMemory<UInt, Normal>(heap.base + 4096 + 56).write(MIN_BLOCK)
+    check(not heap.holds(heap.base + 4096 + 64), "past the region is no block")
+    UnsafeMemory<UInt, Normal>(a).write(MIN_BLOCK)
+    check(not heap.holds(a + WORD), "off the granule is no block")
+    UnsafeMemory<UInt, Normal>(a + 56).write(0)
+    check(not heap.holds(a + 64), "a zero word is no header")
+    UnsafeMemory<UInt, Normal>(a + 56).write(MIN_BLOCK - GRAIN)
+    check(not heap.holds(a + 64), "a block less than a block")
+    UnsafeMemory<UInt, Normal>(a + 56).write(4096)
+    check(not heap.holds(a + 64), "a block past the region")
+    UnsafeMemory<UInt, Normal>(a + 56).write(MIN_BLOCK)
+    check(heap.holds(a + 64), "a plausible header is not told apart")
+    heap.free(b)
+    check(not heap.holds(b), "a freed block is no live block")
+    heap.free(a)
+    check(not heap.holds(a), "a block merged forward is no live block")
+    check(not heap.holds(b), "nor the one it merged with")
+    let d = heap.alloc(40, 1)
+    let e = heap.alloc(40, 1)
+    heap.free(d)
+    heap.free(e)
+    check(not heap.holds(e), "a block merged backward is no live block")
+    check(not UnsafeHeap(base: region_base(), size: 0).holds(region_base()),
+          "an empty heap holds nothing")
+    let inner = UnsafeHeap(base: region_base() + 64, size: 4096)
+    UnsafeMemory<UInt, Normal>(inner.base - WORD).write(MIN_BLOCK)
+    check(not inner.holds(inner.base), "a heap's own base is no block")
+}
+
+/// No address before a heap's first block is a block, however its preceding
+/// word reads: inside the control block that word is a bitmap or a list head,
+/// often a plausible header.
+func control_block_frees() unsafe {
+    let sizes: [UInt; 5] = [4096, 8192, 49_152, 73_728, 98_304]
+    var i = 0
+    while i < 5 {
+        let heap = fresh(sizes[i])
+        let first = heap.alloc(1, 1)
+        heap.free(first)
+        var at = heap.base + GRAIN
+        while at < first {
+            check(not heap.holds(at), "no block inside the control block")
+            at = at + GRAIN
+        }
+        check(heap.holds(heap.alloc(1, 1)), "the first block is held")
+        i = i + 1
+    }
+}
+
+/// A heap's last block, the one before the sentinel, is held when the region
+/// ends on the granule, where its size reaches the region's end exactly.
+func last_block_held() unsafe {
+    let heap = fresh(4096)
+    let all = largest(&heap)
+    let a = heap.alloc(64, 1)
+    let rest = heap.alloc(largest(&heap), 1)
+    check(rest != 0 && heap.holds(rest), "the last block is held")
+    heap.free(rest)
+    heap.free(a)
+    check(largest(&heap) == all, "and frees back whole")
+}
+
+func main() {
+    tiny_regions()
+    over_garbage()
+    churn()
+    every_free_order()
+    walk_the_list()
+    split_boundary()
+    alignment()
+    bits_kept()
+    unservable_alignment()
+    refusals()
+    real_arenas()
+    exact_fit()
+    good_fit()
+    class_bit_kept()
+    last_list()
+    alignment_costs()
+    granule_tail()
+    bad_frees()
+    control_block_frees()
+    last_block_held()
+    random_churn()
+}

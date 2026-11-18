@@ -1,0 +1,38 @@
+// A free of a pointer `alloc` did not hand out panics (spec §5c).
+//
+// The program takes one block and frees a pointer 64 bytes into it, past a
+// word it wrote zero. That word is where a block's header would be, and no
+// block is zero bytes long, so `__saw_rt_dealloc` refuses the free: it panics
+// through the ordinary panic path, naming the address.
+//
+//   SOS strayfree: freeing a pointer inside a live block
+//   panic at lib.saw:N: bad free at ADDRESS
+//
+// A runtime that took the free would hand part of the live block out again
+// and run on to the UNREACHABLE line.
+
+import sos.{System}
+
+// Declared as `std.alloc` declares them, since a program's declarations of one
+// symbol must agree; `sosrt` defines them.
+extern "C" {
+    func __saw_rt_alloc(size: Int, align: Int) -> UnsafePointer<Int8>?
+    func __saw_rt_dealloc(ptr: UnsafePointer<Int8>, size: Int, align: Int)
+}
+
+static BLOCK_BYTES: Int = 400
+static INSIDE: UInt = 64
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let block = __saw_rt_alloc(BLOCK_BYTES, 8)! as UInt
+    let word = sizeof<UInt>() as UInt
+    UnsafeMemory<UInt, Normal>(block + INSIDE - word).write(0)
+    let _ = system.debug_print(
+        "SOS strayfree: freeing a pointer inside a live block\n")
+    __saw_rt_dealloc((block + INSIDE) as UnsafePointer<Int8>, 8, 8)
+    let _ = system.debug_print("SOS strayfree: UNREACHABLE\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

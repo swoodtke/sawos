@@ -65,7 +65,7 @@ ENTRY(_start)
  * Both regions are linker regions, so each is one number in the file that
  * fixes this side of the map.
  *
- * ARENA_SIZE: `sosrt`'s bump-allocator region, the storage behind
+ * ARENA_SIZE: `sosrt`'s heap region, the storage behind
  *   `__saw_rt_alloc`. `PROVIDE`d rather than assigned because the user scripts
  *   let a package override it (see `hal/riscv32/user/user.ld`); nothing
  *   overrides the kernel's.

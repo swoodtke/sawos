@@ -133,9 +133,9 @@ static TRAP_FRAME_BYTES: Int = 272
 ///
 /// V0-V31 at 16 bytes each (offset 0), then `FPCR` (offset 512), `FPSR` (520),
 /// the active word (528: nonzero once the thread has used floating point or
-/// SIMD) and a pad word, which keeps the size a multiple of 16. `sos_fp_save`
-/// and `sos_fp_load` in `boot.S` read and write the first three fields by these
-/// offsets.
+/// SIMD) and the thread's `TPIDR_EL0` while it is off the processor (536,
+/// `THREAD_REGISTER_OFFSET`). `sos_fp_save` and `sos_fp_load` in `boot.S` read
+/// and write the first three fields by these offsets.
 ///
 /// It lives beside the trap frame rather than inside it. A frame is saved and
 /// restored on every trap, and only a thread that has used floating point
@@ -144,6 +144,7 @@ static TRAP_FRAME_BYTES: Int = 272
 /// indexed by thread.
 static FP_AREA_BYTES: Int = 544
 static FP_ACTIVE_OFFSET: UInt = 528
+static THREAD_REGISTER_OFFSET: UInt = 536
 
 /// Bytes in one saved context, floating-point area included.
 ///
@@ -344,12 +345,12 @@ public func exit_fail(code: UInt) {
 }
 
 // =============================================================================
-// The runtime's two hooks
+// The runtime's hooks
 // =============================================================================
 //
-// `sosrt` (rt/common/src/lib.saw) implements the `__saw_rt_*` seams over
-// exactly two per-side hooks: where a byte goes, and how the machine stops. The
-// kernel HAL answers "the UART" and "the platform's exit".
+// `sosrt` (rt/common/src/lib.saw) implements the `__saw_rt_*` seams over three
+// per-side hooks: where a byte goes, how the machine stops, which thread asks.
+// This HAL answers the first two; `kcore.sched` answers the third.
 
 /// Stop the machine with a non-zero status, for the common runtime.
 ///
@@ -652,6 +653,7 @@ static WORD_BYTES: UInt = 8
 /// handing a frame back to the trap entry; the assembly behind it is a single
 /// branch into that entry's own restore path rather than a second copy of it.
 public func resume_frame(frame_addr: UInt) -> Never {
+    thread_register_in(frame_addr)
     sos_resume_frame(frame_addr)
     while { }
 }
@@ -680,15 +682,24 @@ public func resume_frame(frame_addr: UInt) -> Never {
 //   - At a switch `fp_switch_out` saves the outgoing thread's registers if it
 //     is active, and `fp_switch_in` loads the incoming thread's if it is,
 //     leaving EL0 access on, or turns EL0 access off if it is not. A thread
-//     that never uses floating point pays one compare per switch.
+//     that never uses floating point pays one compare per switch, beside the
+//     thread register's word every switch moves (below).
 //
 // `EL0_FP_ON` mirrors the register so a switch between two threads of the same
 // kind writes nothing.
+//
+// The thread register, `TPIDR_EL0`, travels the same way for every thread: the
+// kernel never uses it, so a trap leaves it alone, and a switch saves the
+// outgoing thread's into its area and loads the incoming thread's, which is
+// zero for a new thread. So it is each thread's own, as the user HAL's
+// accessors expect, and no thread reads what another wrote.
 
 extern "C" {
     func sos_fp_save(area: UInt)
     func sos_fp_load(area: UInt)
     func sos_fp_enable(on: UInt)
+    func sos_thread_register_read() -> UInt
+    func sos_thread_register_write(value: UInt)
 }
 
 /// Whether `CPACR_EL1` currently lets EL0 execute floating point and SIMD.
@@ -736,21 +747,34 @@ public func fp_trap(frame_addr: UInt, cause: UInt) unsafe -> Bool {
     true
 }
 
-/// Save the outgoing thread's floating-point state if it has any.
+/// Install the thread register of the thread whose frame is `frame_addr`.
+/// Called wherever a thread starts running: at a switch, and at the first
+/// entry to user mode.
+func thread_register_in(frame_addr: UInt) unsafe {
+    let at = fp_area(frame_addr) + THREAD_REGISTER_OFFSET
+    sos_thread_register_write(UnsafeMemory<UInt, Normal>(at).read())
+}
+
+/// Save the outgoing thread's thread register, and its floating-point state if
+/// it has any.
 ///
 /// Called by the scheduler while the thread's slot is still live: before the
 /// idle wait, whose deliveries can end the thread's process, and before a
 /// deferred free can release the slot.
 public func fp_switch_out(frame_addr: UInt) unsafe {
     let area = fp_area(frame_addr)
+    UnsafeMemory<UInt, Normal>(area + THREAD_REGISTER_OFFSET).write(
+        sos_thread_register_read())
     if fp_active(area) {
         sos_fp_save(area)
     }
 }
 
-/// Install the incoming thread's floating-point state: load it and leave EL0
-/// access on if the thread is active, turn EL0 access off if it is not.
+/// Install the incoming thread's thread register, and its floating-point state:
+/// load it and leave EL0 access on if the thread is active, turn EL0 access off
+/// if it is not.
 public func fp_switch_in(frame_addr: UInt) unsafe {
+    thread_register_in(frame_addr)
     let area = fp_area(frame_addr)
     if fp_active(area) {
         sos_fp_load(area)

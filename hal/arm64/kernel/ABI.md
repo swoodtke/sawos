@@ -103,6 +103,7 @@ THR.
 | `sos_region_table_start()` / `sos_region_table_end()` | sink.c | Bounds of the `.regions` section — the boot region table. The table's blob rows carry bases the linker resolved when it placed the generated stub, so no per-child symbol has to be nameable here. | Same reason. |
 | `sos_kernel_slabs_start()` / `sos_kernel_slabs_end()` | sink.c | `_sos_slabs_start` and `_sos_slabs_end`, **masked to physical**: the kernel's slab region, where an image's slab areas must lie, compared with an area's base after `hal.virt_to_phys`. | Same reason. |
 | `sos_wait_for_irq()` | sink.c | Park the core until an interrupt is pending, behind `wait_for_irq`. | `wfi` is an instruction. |
+| `sos_thread_register_read()` / `sos_thread_register_write(v)` | sink.c | The user thread register, `TPIDR_EL0`, which a switch saves into the outgoing thread's area and loads from the incoming thread's ("Thread contexts"). | `mrs`/`msr` name a system register at assembly time. |
 | `virt.ld` | — | Links the image at `0x4000_0000 + LINMAP_OFFSET` and loads it at 0x4000_0000 (one VMA cursor, a per-section `AT(ADDR(.x) - LINMAP_OFFSET)`), bounds the appended payload on page boundaries, and exports `LINMAP_PHYS_MASK` as an absolute symbol for `boot.S`. Asserts `_bss_end` below `ROOT_LOAD_BASE` — which is also the top of the one RAM block the linear map leaves executable. | Not a program. |
 
 `sos_rt_write` (check-free by construction so the panic path cannot re-enter
@@ -199,17 +200,25 @@ entered once has no storage a second thread could have.
     zeros.
   - Each thread's save area follows its trap frame in the same slot: V0-V31
     (offset 0, 16 bytes each), `FPCR` (512), `FPSR` (520), an active word (528)
-    and a pad word; `FP_AREA_BYTES` in `lib.saw` is the size and `FRAME_BYTES`
-    covers frame and area together. It stays out of the 272-byte trap frame
-    because a frame is saved on every trap and an area only at a switch, for
-    threads that use it. `frame_init` zeroes both, so a new thread is inactive.
+    and the thread's `TPIDR_EL0` (536); `FP_AREA_BYTES` in `lib.saw` is the
+    size and `FRAME_BYTES` covers frame and area together. It stays out of
+    the 272-byte trap frame because a frame is saved on every trap and an area
+    only at a switch, for threads that use it. `frame_init` zeroes both, so a
+    new thread is inactive.
   - At a switch `kcore.sched.pick_next` calls `fp_switch_out` (save the
     outgoing thread if it is active) and `run_thread` calls `fp_switch_in`
     (load the incoming thread and leave EL0 access on if it is active, else
     turn EL0 access off). The save runs before the idle wait and before an
-    exited thread's deferred free, so a freed slot is never written, and a thread that never uses FP/SIMD
-    costs one compare per switch. Exit and invalidation need nothing: the area
-    dies with the slot.
+    exited thread's deferred free, so a freed slot is never written, and a
+    thread that never uses FP/SIMD costs one compare per switch beside the
+    thread register's word, which every switch saves and loads. Exit and
+    invalidation need nothing: the area dies with the slot.
+  - The thread register, `TPIDR_EL0`, is every thread's own, FP/SIMD or not:
+    the kernel never uses it, `fp_switch_out` stores the outgoing thread's
+    into its area at 536 and `fp_switch_in` loads the incoming thread's, as
+    `resume_frame` does at the first entry to user mode. A new thread's is
+    zero, and no thread reads a value another thread, or another process,
+    wrote. The runtime keeps a thread's lock-owner identity there.
 - **Semihosting, not PSCI, for shutdown.** PSCI `SYSTEM_OFF` over the HVC
   conduit works on `-M virt` but always exits the emulator with status 0, and
   this harness asserts on exit status — one case encodes its entire verdict in

@@ -27,6 +27,12 @@
 // outgoing thread's registers and loaded the incoming one's. With no save, B's
 // fill overwrites A's pattern and A counts every register.
 //
+// Each worker also asks the runtime which thread it is (`__saw_rt_lock_owner`)
+// before its fill and again after its last check. The answer lives in the
+// thread register, which a switch keeps in the same save area as the FP
+// state, so a second answer that differs from the first, after switches that
+// saved and loaded that state, counts as one more bad register.
+//
 // Every thread enters at `_start`, as in `thread-basics`: the initial thread is
 // the one that has not yet parked the boot handle.
 
@@ -35,6 +41,7 @@ import sos.{System, Process, Thread, SosStatus}
 extern "C" {
     func fp_fill(seed: UInt)
     func fp_check(seed: UInt) -> UInt
+    func __saw_rt_lock_owner() -> Int
 }
 
 /// The boot handle, parked by the initial thread for the workers; also the
@@ -81,7 +88,8 @@ func parked_boot_handle() unsafe -> UInt {
 }
 
 /// A worker: fill, then yield and check `TURNS` times. Its exit value is the
-/// number of mismatching registers it saw, summed over the checks.
+/// number of mismatching registers it saw, summed over the checks, and one more
+/// if its owner answer changed.
 func worker(role: UInt) unsafe {
     let system = System(boot_handle: parked_boot_handle())
     let proc = try system.process_self() catch { return }
@@ -90,6 +98,7 @@ func worker(role: UInt) unsafe {
     let tag = if role == ROLE_A { "A" } else { "B" }
 
     print("SOS fp: {} begin", tag)
+    let owner = __saw_rt_lock_owner()
     fp_fill(seed)
     print("SOS fp: {} filled", tag)
 
@@ -99,6 +108,9 @@ func worker(role: UInt) unsafe {
         let _ = me.yield_now()
         bad = bad + fp_check(seed)
         turn = turn + 1
+    }
+    if __saw_rt_lock_owner() != owner {
+        bad = bad + 1
     }
     print("SOS fp: {} bad={}", tag, bad)
     let _ = (move me).exit(bad)
@@ -117,6 +129,9 @@ func initial(boot_handle: UInt) unsafe {
     }
 
     let _ = system.debug_print("SOS fp: initial begin\n")
+    // Asked first, so the workers' numbers are not the small values their
+    // `FPSR` patterns hold, which a misplaced save could pass off as theirs.
+    let _ = __saw_rt_lock_owner()
     let a = try proc.thread_create(stack_top: stack_a_top(), arg: ROLE_A) catch {
         print("SOS fp: create failed: {}", error)
         let _ = system.shutdown(1)

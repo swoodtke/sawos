@@ -252,3 +252,21 @@ void sos_timer_set_compare(u64 v) { __asm__ volatile("msr cntp_cval_el0, %0" :: 
 // A spurious wake costs one poll.
 
 void sos_wait_for_irq(void) { __asm__ volatile("wfi"); }
+
+// ---- the user thread register ---------------------------------------------
+//
+// C because: `mrs`/`msr` name a system register at assembly time (reason 1).
+//
+// `TPIDR_EL0` is EL0's to use and the kernel never reads it for itself: a
+// switch moves it between the processor and the threads' save areas
+// (`fp_switch_out` and `fp_switch_in` in lib.saw), so each thread has its own.
+
+u64 sos_thread_register_read(void) {
+    u64 v;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(v));
+    return v;
+}
+
+void sos_thread_register_write(u64 v) {
+    __asm__ volatile("msr tpidr_el0, %0" :: "r"(v));
+}

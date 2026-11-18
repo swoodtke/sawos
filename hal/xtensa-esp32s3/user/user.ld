@@ -51,7 +51,7 @@
 
 ENTRY(_start)
 
-/* `sosrt`'s bump-allocator arena (hal/riscv32/user/user.ld describes the
+/* `sosrt`'s heap arena (hal/riscv32/user/user.ld describes the
  * knob). `.bss`-resident, so it costs nothing in the image but counts fully
  * against the region. */
 PROVIDE(ARENA_SIZE = 48K);

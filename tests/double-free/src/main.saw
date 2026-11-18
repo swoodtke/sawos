@@ -1,0 +1,39 @@
+// A block freed twice panics (spec §5c).
+//
+// The program frees a null pointer, which is no block and is ignored, then
+// takes one block, frees it, and frees it again. The heap's header for the
+// block still marks it free, so `__saw_rt_dealloc` refuses the second free:
+// it panics through the ordinary panic path, naming the address, and a root
+// that panics stops the machine with the panic's status.
+//
+//   SOS doublefree: a null free is no free
+//   SOS doublefree: freeing a block twice
+//   panic at lib.saw:N: bad free at ADDRESS
+//
+// A runtime that took the second free would put the block on its list twice
+// and run on to the UNREACHABLE line.
+
+import sos.{System}
+
+// Declared as `std.alloc` declares them, since a program's declarations of one
+// symbol must agree; `sosrt` defines them.
+extern "C" {
+    func __saw_rt_alloc(size: Int, align: Int) -> UnsafePointer<Int8>?
+    func __saw_rt_dealloc(ptr: UnsafePointer<Int8>, size: Int, align: Int)
+}
+
+static BLOCK_BYTES: Int = 40
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    __saw_rt_dealloc(0 as UnsafePointer<Int8>, BLOCK_BYTES, 8)
+    let _ = system.debug_print("SOS doublefree: a null free is no free\n")
+    let block = __saw_rt_alloc(BLOCK_BYTES, 8)!
+    __saw_rt_dealloc(block, BLOCK_BYTES, 8)
+    let _ = system.debug_print("SOS doublefree: freeing a block twice\n")
+    __saw_rt_dealloc(block, BLOCK_BYTES, 8)
+    let _ = system.debug_print("SOS doublefree: UNREACHABLE\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

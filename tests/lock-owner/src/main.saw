@@ -1,0 +1,154 @@
+// Which thread is asking: the runtime's lock-owner seam (spec §5c, §8).
+//
+// std's `SpinLock` records the answer of `__saw_rt_lock_owner` as a lock's
+// owner, so two threads that can hold a lock at once must get two answers,
+// and one thread must get the same answer each time it asks. A process's
+// answer lives in the thread's thread register, which the kernel keeps per
+// thread, so the case asks across switches:
+//
+//   * the initial thread asks, then starts two workers;
+//   * each worker asks, yields so that the other runs and asks too, and asks
+//     again;
+//   * the initial thread, once both are joined, asks again and compares.
+//
+// The kernel booting this image arms no timer, so the switches are the
+// yields. A register the kernel did not carry per thread would hand a worker
+// the other's answer after the yield, and a seam that answered every thread
+// alike would give three equal answers. A pass reads
+//
+//   SOS lockowner: three threads, three owners, kept across switches
+//
+// and a failure prints the six answers.
+
+import sos.{System, Process}
+
+// Declared as `std.spinlock` declares it, since a program's declarations of
+// one symbol must agree; `sosrt` defines it.
+extern "C" {
+    func __saw_rt_lock_owner() -> Int
+}
+
+/// The boot handle, parked for the workers; see `thread-basics`.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static ROLE_A: UInt = 1
+static ROLE_B: UInt = 2
+static EXIT_A: UInt = 11
+static EXIT_B: UInt = 22
+static NO_VALUE: UInt = 0
+
+/// The answers: the initial thread's before and after, then each worker's
+/// before and after its yield.
+static ANSWERS: Int = 6
+unsafe static var OWNER: [Int; ANSWERS] = [0; ANSWERS]
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+func record(slot: Int, owner: Int) unsafe {
+    OWNER[slot] = owner
+}
+
+func worker(role: UInt) unsafe {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let first = if role == ROLE_A { 2 } else { 4 }
+    record(first, __saw_rt_lock_owner())
+    let _ = me.yield_now()
+    record(first + 1, __saw_rt_lock_owner())
+    let _ = (move me).exit(if role == ROLE_A { EXIT_A } else { EXIT_B })
+}
+
+/// Whether the six answers are three owners, each nonzero and kept.
+func answers_hold() unsafe -> Bool {
+    var slot = 0
+    while slot < ANSWERS {
+        if OWNER[slot] == 0 {
+            return false
+        }
+        slot = slot + 1
+    }
+    let kept = OWNER[0] == OWNER[1] && OWNER[2] == OWNER[3] &&
+               OWNER[4] == OWNER[5]
+    let apart = OWNER[0] != OWNER[2] && OWNER[0] != OWNER[4] &&
+                OWNER[2] != OWNER[4]
+    kept && apart
+}
+
+func initial(boot_handle: UInt) unsafe {
+    park_boot_handle(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS lockowner: no process handle\n")
+        let _ = system.shutdown(1)
+        return
+    }
+    record(0, __saw_rt_lock_owner())
+
+    let a = try proc.thread_create(stack_top: stack_a_top(), arg: ROLE_A) catch {
+        print("SOS lockowner: create failed: {}\n", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let b = try proc.thread_create(stack_top: stack_b_top(), arg: ROLE_B) catch {
+        print("SOS lockowner: create failed: {}\n", error)
+        let _ = system.shutdown(1)
+        return
+    }
+    let _ = a.start()
+    let _ = b.start()
+    let ra: UInt = try a.join() catch { NO_VALUE }
+    let rb: UInt = try b.join() catch { NO_VALUE }
+    record(1, __saw_rt_lock_owner())
+    if ra != EXIT_A || rb != EXIT_B {
+        print("SOS lockowner: workers ended a={} b={}\n", ra, rb)
+        let _ = system.shutdown(1)
+        return
+    }
+
+    if not answers_hold() {
+        print("SOS lockowner: answers {} {} {} {} {} {}\n", OWNER[0], OWNER[1],
+              OWNER[2], OWNER[3], OWNER[4], OWNER[5])
+        let _ = system.shutdown(1)
+        return
+    }
+    let _ = system.debug_print(
+        "SOS lockowner: three threads, three owners, kept across switches\n")
+    let _ = proc.exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) unsafe {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

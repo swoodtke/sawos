@@ -83,7 +83,7 @@
 
 ENTRY(_entry)
 
-/* `sosrt`'s bump-allocator arena (hal/riscv32/kernel/virt.ld describes it in
+/* `sosrt`'s heap arena (hal/riscv32/kernel/virt.ld describes it in
  * full). The kernel allocates nothing on its steady path; the arena backs the
  * compiler's panic path only. The boot stack is the other boards' size. */
 PROVIDE(ARENA_SIZE = 16K);

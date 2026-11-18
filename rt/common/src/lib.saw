@@ -11,12 +11,12 @@
 //!     stops the machine.
 //!   - The runtime proper (second below): the frozen `__saw_rt_*` seams that
 //!     compiled Saw code and std reach (write, write-line, last raw code,
-//!     panic, alloc and dealloc, spelled out in sawlang's `runtime/ABI.md`)
-//!     plus the bump arena behind the last two. The compiler and std make the
+//!     panic, lock owner, alloc and dealloc, in sawlang's `runtime/ABI.md`)
+//!     plus the arena heap behind the last two. The compiler and std make the
 //!     calls; this module answers them.
 //!
-//! All of it rests on two per-side hooks and nothing else, where a byte goes
-//! and how the machine stops:
+//! All of it rests on per-side hooks and nothing else: where a byte goes, how
+//! the machine stops, and (with the arena, below) which thread is asking:
 //!
 //!     sos_rt_write(ptr, len)      // supplied per side
 //!     sos_rt_abort(code)          // supplied per side, does not return
@@ -27,8 +27,8 @@
 //! `panic()` in userspace cannot reach a UART.
 //!
 //! Nothing here suspends and nothing names a target. No code here calls an
-//! allocator either: the arena below is the one, and it hands out a fixed
-//! region it was given at link time.
+//! allocator either: the heap below is the one, over a fixed region it was
+//! given at link time.
 
 /// Hex digits in a machine word on this target: eight on a 32-bit profile,
 /// sixteen on a 64-bit one (spec §5b).
@@ -232,7 +232,7 @@ extern "C" {
     func sos_rt_abort(code: UInt32) -> Never
 }
 
-// Where the arena is, and how big (see the bump-arena section below). Not a
+// Where the arena is, and how big (see the arena section below). Not a
 // per-side hook like the two above: there is exactly one answer, in the one C
 // file both sides link (`rt/common_c/support.c`), because the numbers come from
 // the linker and Saw cannot name a linker symbol.
@@ -299,16 +299,16 @@ func rt_panic(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
 }
 
 // -----------------------------------------------------------------------------
-// The bump arena
+// The arena
 // -----------------------------------------------------------------------------
 //
 // SOS allocates nothing on the steady path: the kernel's diagnostics and
 // root's banner are string literals walked byte by byte, and every kernel
-// source builds under `--no-hidden-alloc`. The arena exists because the
-// compiler's panic path can allocate, and an unbacked seam would turn a
-// diagnosable panic into a wild jump.
-//
-// No reclamation: `__saw_rt_dealloc` is a no-op.
+// source builds under `--no-hidden-alloc`, so a kernel never calls the seams
+// below, though its link keeps them: std's `StringBuilder` and `String` drop
+// glue reach them. A process allocates wherever its program does (an
+// interpolated string, a `String` or a growing `Vector`; a `print` with `{}`
+// arguments renders on the stack), and a block it frees is served again.
 //
 // The region is the linker's, not this module's. `sosrt` is shared, so a
 // `static` here would be one compile-time size for every image in the system.
@@ -319,73 +319,101 @@ func rt_panic(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
 // script says otherwise, as `tests/arena-small/` does), and the two accessors
 // above read it back. The region is `.bss`-resident, so it costs the image no
 // bytes and the process's region all of them.
+//
+// The heap over it is `sosrt.heap`'s: a free takes constant time, and so does
+// a request but for the one list it walks before refusing; a freed block
+// merges with both neighbours; and the heap's control block sits at the front
+// of the region. A block is the request plus a one-word header, rounded up to
+// a multiple of two words and four words at least.
 
-/// The cursor over the region, as a byte offset from `sos_arena_base()`.
-/// `rt_alloc` advances it with a compare-and-swap loop: it reads the cursor,
-/// computes the aligned offset and the next cursor from that read, and installs
-/// the next cursor only if the cursor still holds the value it read. A thread
-/// that loses the exchange reads again and recomputes, so two threads, however
-/// they are interleaved or preempted, never receive overlapping blocks.
+import sosrt.heap.{UnsafeHeap}
+import std.spinlock.{SpinLock}
+
+// Which thread is asking: the third per-side hook, beside the two above, and
+// what std's `SpinLock` records as a lock's owner. The kernel answers one
+// constant, being one context (`kcore.sched`); a process answers from its
+// thread register (`kernel/sysapi/src/rt.saw`).
+extern "C" {
+    func sos_rt_lock_owner() -> Int
+}
+
+/// The arena's heap, behind std's `SpinLock`: one thread at a time is inside
+/// it.
 ///
-/// The exchange is inline atomic instructions on a target that has them (the
-/// riscv32 `virt` board, arm64). On a part without them (the ESP32-C3) it is
-/// the `__atomic_compare_exchange_4` routine in `rt/common_c/support.c`, a
-/// plain read-modify-write, so there the arena is safe only while nothing
-/// preempts a thread between that routine's read and its write.
+/// The lock guards the heap's descriptor, zero until the first allocation
+/// fills it from the linker's bounds, and holding it is what entitles a thread
+/// to the region the descriptor names: the control block and every block in
+/// it. A thread that finds it held spins until the holder runs again and gives
+/// it back. The loop is std's and spins without yielding. Under one
+/// round-robin level, as the scheduler runs today, the holder runs once the
+/// spinner's slice ends. Under the fixed-priority levels the spec gives, a
+/// spinner above a preempted holder spins for good, and a yield that returns
+/// the spinner to its own level does not change that.
 ///
-/// It is the only arena state in this module. The extent is a link-time
-/// constant and only the offset moves. `Atomic` holds an `Int`; an offset is
-/// bounded by the arena's size, far below the point where the two differ.
-static ARENA_NEXT: Atomic<Int> = Atomic(0)
+/// Nothing in the window can panic or allocate: the heap is check-free and the
+/// window calls nothing else, so the panic path never meets the lock held by
+/// its own thread.
+static ARENA: SpinLock<UnsafeHeap>
+
+func arena() unsafe -> UnsafeHeap {
+    UnsafeHeap(base: sos_arena_base(), size: sos_arena_size())
+}
+
+/// `SpinLock`'s owner seam: the calling thread's identity, from this side's
+/// hook. Nonzero, and it neither allocates nor panics, as a lock's panic path
+/// needs.
+@export("__saw_rt_lock_owner")
+func rt_lock_owner() -> Int {
+    sos_rt_lock_owner()
+}
 
 /// Hand out `size` bytes aligned to `align`, or stop the machine.
 ///
-/// Alignment is applied to the absolute address, not to the offset. Rounding
-/// the offset only satisfies the caller if the region itself is at least as
-/// aligned as anything asked of it. Rounding the address the caller receives is
-/// correct wherever the region is placed; the linker scripts' `. = ALIGN(16)`
-/// is a courtesy, not a precondition.
-///
-/// The bound is checked as a subtraction so a hostile `size` cannot wrap past
-/// it. The padding step uses `&-` because a checked one would put a panic
-/// branch inside the allocator for a subtraction that cannot go negative (`rem`
-/// is a remainder of `step`, so `rem < step` always). The compiler cannot see
-/// that, and the allocator is not a place to spend a trap.
-///
-/// The block is the winner's: the cursor is advanced past it by the
-/// compare-and-swap before the pointer is returned, and a thread whose
-/// exchange fails recomputes from the cursor it now sees. A refusal needs no
-/// exchange, since the machine stops.
+/// A refusal is not returned. `__saw_rt_alloc` is the allocator every
+/// reporting path would allocate through, so it writes one line and aborts
+/// with its own status, which tells "the arena ran dry" from a panic. The lock
+/// is given back first.
 @export("__saw_rt_alloc")
 func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
-    var step = align
-    if step < 1 {
-        step = 1
-    }
-    let base = sos_arena_base()
-    let capacity = sos_arena_size()
-    var offset: UInt = 0
-    var won = false
-    while not won {
-        let seen = ARENA_NEXT.load()
-        offset = UInt.from(truncating: seen)
-        let rem = (base &+ offset) % step
-        if rem != 0 {
-            offset = offset &+ (step &- rem)
+    let block = borrow var heap = ARENA.lock() {
+        if heap.size == 0 {
+            heap = arena()
         }
-        if size > capacity || offset > capacity - size {
-            let msg = "sos: out of arena memory\n"
-            sos_rt_write(msg.c_string()!, UInt.from(truncating: msg.len()))
-            sos_rt_abort(AbortCode.NoMemory as UInt32)
-        }
-        let next = Int.from(truncating: offset &+ size)
-        won = ARENA_NEXT.compare_exchange(seen, next)
+        heap.alloc(size, align)
     }
-    (base &+ offset) as UnsafePointer<Int8>
+    if block == 0 {
+        let msg = "sos: out of arena memory\n"
+        sos_rt_write(msg.c_string()!, UInt.from(truncating: msg.len()))
+        sos_rt_abort(AbortCode.NoMemory as UInt32)
+    }
+    block as UnsafePointer<Int8>
 }
 
-/// Free a block. A bump arena reclaims nothing, so this is deliberately
-/// empty.
+/// Free a block `rt_alloc` returned, or panic. A null `ptr` is no block. The
+/// block's header holds its size, so `size` and `align` are not read.
+///
+/// A free the heap can tell is bad (`UnsafeHeap.holds` says which: a block
+/// freed twice while its header still marks it free, a pointer outside the
+/// arena, before its first block or off the granule, one whose preceding word
+/// is no plausible header) panics, naming the address, through the ordinary
+/// panic path, the lock given back first; it ends the process as any panic
+/// does. One it cannot tell (a second free after the block was served again,
+/// a pointer into a live block past a word that reads as a header, a pointer
+/// into a freed block past a stale size) corrupts the heap.
 @export("__saw_rt_dealloc")
 func rt_dealloc(ptr: UnsafePointer<Int8>, size: UInt, align: UInt) unsafe {
+    let block = ptr as UInt
+    if block == 0 {
+        return
+    }
+    let held = borrow var heap = ARENA.lock() {
+        let live = heap.holds(block)
+        if live {
+            heap.free(block)
+        }
+        live
+    }
+    if not held {
+        panic("bad free at {}", block)
+    }
 }

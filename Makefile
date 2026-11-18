@@ -14,7 +14,9 @@ sos-test:
 # Not gating: the ESP32-C3 board smoke — bringup + memory config only. Its
 # cases are `c3_cases` in tools/sos_runner.py. The C3 has no atomic
 # instructions, which the runtime's locks need, so the gate does not run it;
-# it is kept for the day the C3 gets real support.
+# it is kept for the day the C3 gets real support. Nothing builds for it now:
+# the runtime takes std's `SpinLock`, which sawlang refuses without atomics,
+# so it stops at its first kernel compile.
 #
 # It needs the Espressif toolchain under ~/.espressif (QEMU with the esp32c3
 # machine, and esp-clang for the no-A multilib row); the target says so and

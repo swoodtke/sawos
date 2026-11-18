@@ -1,11 +1,12 @@
-// SOS riscv32 user-side HAL: the syscall instruction, shared by every riscv32
-// board.
+// SOS riscv32 user-side HAL: the syscall instruction and the thread register,
+// shared by every riscv32 board.
 //
 // This is the entire architecture-dependent surface of an SOS process. An
 // `ecall` is not expressible in Saw, and neither is naming the registers the
 // ABI puts arguments in, so this file exists and nothing else in a process
 // needs to know it is riscv32. It is C because of the `ecall` instruction plus
-// the register pinning the ABI requires; neither has a Saw spelling.
+// the register pinning the ABI requires, and the thread register's accessors at
+// the foot; none has a Saw spelling.
 //
 // It names the ISA's syscall instruction and the ABI's registers and nothing
 // about a board, so every root and child manifest, whichever board it targets,
@@ -54,4 +55,18 @@ u32 sos_syscall3(u32 handle, u32 op, u32 arg0, u32 arg1, u32 arg2, u32 *value_ou
                      : "memory");
     *value_out = a1;
     return a0;
+}
+
+// The thread register, `tp`. The kernel saves and restores it with a thread's
+// other registers and starts a new thread with it zero, so it is the thread's
+// own word; nothing the compilers emit here uses it. The runtime keeps the
+// thread's lock-owner identity in it (`kernel/sysapi/src/rt.saw`).
+u32 sos_thread_word(void) {
+    u32 word;
+    __asm__ volatile("mv %0, tp" : "=r"(word));
+    return word;
+}
+
+void sos_set_thread_word(u32 word) {
+    __asm__ volatile("mv tp, %0" : : "r"(word));
 }

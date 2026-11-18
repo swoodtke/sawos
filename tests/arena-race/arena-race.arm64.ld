@@ -1,5 +1,7 @@
 /* Arena override, arm64. Same shape as the riscv32 sibling, which carries the
- * explanation; a package names one `linker-script` per target triple.
+ * explanation; a package names one `linker-script` per target triple. The case
+ * runs on riscv32 only, and this size would not hold its blocks here, where a
+ * block is twice as large.
  */
 ARENA_SIZE = 96K;
 

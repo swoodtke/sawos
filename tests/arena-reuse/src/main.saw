@@ -1,0 +1,153 @@
+// The arena serves again what a program frees.
+//
+// The package's scripts give it an 8 KiB arena. The program then:
+//
+//   * builds and drops a 1 KiB `Vector` two thousand times, so it allocates
+//     2000 KiB through the 8 KiB arena and runs to its end only if every
+//     drop gave its block back;
+//   * takes three quarter-arena blocks through the seam itself, the first at
+//     the arena's front and the third against the free rest at its end, frees
+//     them first, third, second, and asks for three quarters: only a block
+//     merged with the free blocks on both sides of it holds that much, and the
+//     answer is the first block's address;
+//   * asks for a block at every power-of-two alignment to 1024, checks each
+//     address and that the blocks are disjoint, frees them, and asks for the
+//     three quarters again, which needs the gaps in front of the aligned
+//     blocks merged back too.
+//
+// A refusal stops the machine with the arena's own status, which fails the
+// case, so each request that must be served is simply made.
+
+import sos.{System}
+
+// Declared as `std.alloc` declares them, since a program's declarations of one
+// symbol must agree; `sosrt` defines them.
+extern "C" {
+    func __saw_rt_alloc(size: Int, align: Int) -> UnsafePointer<Int8>?
+    func __saw_rt_dealloc(ptr: UnsafePointer<Int8>, size: Int, align: Int)
+    func sos_arena_size() -> UInt
+}
+
+static ROUNDS: Int = 2000
+
+/// 256 words = 1 KiB per round.
+static ROUND_WORDS: Int = 256
+
+static ALIGNS: Int = 11
+static ALIGNED_BYTES: Int = 24
+
+static EXIT_FAILED: UInt = 1
+
+/// Two thousand 1 KiB vectors, each dropped before the next is built.
+func churn(system: &System) -> Bool {
+    var round = 0
+    while round < ROUNDS {
+        var words = try Vector<UInt32>(capacity: ROUND_WORDS) catch {
+            print("SOS arenareuse: round {} refused: {}\n", round, error)
+            return false
+        }
+        try words.push(UInt32.from(truncating: round)) catch {
+            print("SOS arenareuse: round {} push refused: {}\n", round, error)
+            return false
+        }
+        if words[0] != UInt32.from(truncating: round) {
+            let _ = system.debug_print("SOS arenareuse: a word was lost\n")
+            return false
+        }
+        round = round + 1
+    }
+    true
+}
+
+/// Three quarters of the arena from one block, which only full merging gives.
+/// Returns its address.
+func three_quarters() unsafe -> UInt {
+    let quarter = (sos_arena_size() / 4) as Int
+    let block = __saw_rt_alloc(3 * quarter, 1)!
+    __saw_rt_dealloc(block, 3 * quarter, 1)
+    block as UInt
+}
+
+func neighbours(system: &System) unsafe -> Bool {
+    let quarter = (sos_arena_size() / 4) as Int
+    let first = __saw_rt_alloc(quarter, 1)!
+    let second = __saw_rt_alloc(quarter, 1)!
+    let third = __saw_rt_alloc(quarter, 1)!
+    __saw_rt_dealloc(first, quarter, 1)
+    __saw_rt_dealloc(third, quarter, 1)
+    __saw_rt_dealloc(second, quarter, 1)
+    if three_quarters() != first as UInt {
+        let _ = system.debug_print("SOS arenareuse: merged block not first\n")
+        return false
+    }
+    true
+}
+
+func aligned(system: &System) unsafe -> Bool {
+    let home = three_quarters()
+    let aligns: [Int; ALIGNS] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    var blocks: [UInt; ALIGNS] = [0; ALIGNS]
+    var i = 0
+    while i < ALIGNS {
+        let block = __saw_rt_alloc(ALIGNED_BYTES, aligns[i])! as UInt
+        if block % (aligns[i] as UInt) != 0 {
+            print("SOS arenareuse: align {} gave {}\n", aligns[i], block)
+            return false
+        }
+        var byte = 0
+        while byte < ALIGNED_BYTES {
+            UnsafeMemory<UInt8, Normal>(block + (byte as UInt)).write(
+                UInt8.from(truncating: i + 1))
+            byte = byte + 1
+        }
+        blocks[i] = block
+        i = i + 1
+    }
+    i = 0
+    while i < ALIGNS {
+        var byte = 0
+        while byte < ALIGNED_BYTES {
+            let at = blocks[i] + (byte as UInt)
+            let seen = UnsafeMemory<UInt8, Normal>(at).read()
+            if seen != UInt8.from(truncating: i + 1) {
+                print("SOS arenareuse: align {} block overwritten\n", aligns[i])
+                return false
+            }
+            byte = byte + 1
+        }
+        __saw_rt_dealloc(blocks[i] as UnsafePointer<Int8>, ALIGNED_BYTES,
+                         aligns[i])
+        i = i + 1
+    }
+    if three_quarters() != home {
+        let _ = system.debug_print("SOS arenareuse: gaps did not merge\n")
+        return false
+    }
+    true
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS arenareuse: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if not churn(&system) {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS arenareuse: 2000 KiB through 8 KiB\n")
+    if not neighbours(&system) {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS arenareuse: freed neighbours merged\n")
+    if not aligned(&system) {
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS arenareuse: aligned to 1024, gaps merged\n")
+    let _ = proc.exit(0)
+}

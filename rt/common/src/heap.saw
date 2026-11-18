@@ -1,0 +1,421 @@
+//! A two-level segregated-fit heap (TLSF) over one region of memory.
+//!
+//! Free blocks sit on one list per size range, two bitmaps say which lists are
+//! non-empty, and a boundary tag on each block lets a freed block merge with
+//! both neighbours without a search. A free takes constant time, and so does a
+//! request, but for one case: when no list is certain to hold a block large
+//! enough, `find` walks the list the request's own size falls in before the
+//! heap refuses.
+//!
+//! It names no linker symbol, no lock and no way to stop the machine, so it
+//! compiles hosted for its own tests (`rt/common/tests/`). `sosrt` gives it the
+//! arena, serializes its callers and turns a refusal into the stop.
+//!
+//! Layout. With `W` the word size and `GRAIN` two words, every block is a
+//! multiple of `GRAIN` and starts with a one-word header (its size, with the
+//! two flags below in the low bits). A block is named by its payload address,
+//! one word past the header and `GRAIN`-aligned, which is what an allocation
+//! returns. A free block keeps its list links in the first two payload words
+//! and its size again in its last word (the footer), which is where the block
+//! after it finds it. A region ends in a sentinel: a header of size zero that
+//! is never free, so no merge runs past the end; the region's first block
+//! never has `PREV_FREE`, so none runs past the start.
+//!
+//! The region begins with the control block, made on the first call:
+//!
+//!     word 0                  the class count (zero until made)
+//!     word 1                  the first-level bitmap
+//!     words 2 ..              one second-level bitmap per class
+//!     then                    the list heads, `SL_COUNT` per class
+//!
+//! A later region can join as the first does, as one more free block between
+//! its own boundaries (`add_region`), provided none of its blocks outgrows the
+//! largest class the control block was sized for.
+//!
+//! Arithmetic that cannot wrap uses `&+`/`&-` and every shift count is masked:
+//! a check here would put a trap inside the allocator, which a panic's own
+//! formatting can reach.
+
+/// The heap over `[base, base + size)`. The region is the caller's to give:
+/// its first word reads zero until the first call, nothing else writes it, and
+/// one caller at a time is inside a method.
+public unsafe struct UnsafeHeap {
+    base: UInt,
+    size: UInt
+}
+
+/// The low bits of a header. A block's size is a multiple of `GRAIN`, so
+/// these two never collide with it.
+static FREE: UInt = 1
+static PREV_FREE: UInt = 2
+static FLAGS: UInt = 3
+
+/// Second-level lists per class: each power-of-two range is cut into four.
+static SL_LOG2: UInt = 2
+static SL_COUNT: UInt = 1 << SL_LOG2
+
+static ALL_ONES: UInt = ~(0 as UInt)
+
+/// Control-block words before the per-class ones.
+static CONTROL_FIXED: UInt = 2
+
+func word() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func word_bits() -> UInt {
+    word() &* 8
+}
+
+/// The payload alignment and size granule.
+func grain() -> UInt {
+    word() &* 2
+}
+
+/// The smallest block: a header, two links and a footer.
+func min_block() -> UInt {
+    word() &* 4
+}
+
+func shl(value: UInt, count: UInt) -> UInt {
+    value << (count & (word_bits() &- 1))
+}
+
+func shr(value: UInt, count: UInt) -> UInt {
+    value >> (count & (word_bits() &- 1))
+}
+
+/// The index of the highest set bit of a non-zero `value`.
+func highest_bit(value: UInt) -> UInt {
+    var rest = value
+    var index: UInt = 0
+    var step = word_bits() >> 1
+    while step != 0 {
+        if shr(rest, step) != 0 {
+            rest = shr(rest, step)
+            index = index &+ step
+        }
+        step = step >> 1
+    }
+    index
+}
+
+/// The index of the lowest set bit of a non-zero `value`.
+func lowest_bit(value: UInt) -> UInt {
+    highest_bit(value & (0 &- value))
+}
+
+/// A block size's class and list, `(class << SL_LOG2) | list`. Class 0 is
+/// the smallest block's power of two, and each class doubles the one before.
+func class_of(size: UInt) -> UInt {
+    let top = highest_bit(size)
+    let list = shr(size, top &- SL_LOG2) & (SL_COUNT &- 1)
+    shl(top &- highest_bit(min_block()), SL_LOG2) | list
+}
+
+/// The first list whose every block holds `size`: `size` rounded up to the
+/// next list boundary first.
+func search_class_of(size: UInt) -> UInt {
+    let round = shl(1, highest_bit(size) &- SL_LOG2) &- 1
+    class_of(size &+ round)
+}
+
+func read(at: UInt) unsafe -> UInt {
+    UnsafeMemory<UInt, Normal>(at).read()
+}
+
+func write(at: UInt, value: UInt) unsafe {
+    UnsafeMemory<UInt, Normal>(at).write(value)
+}
+
+func header(block: UInt) unsafe -> UInt {
+    read(block &- word())
+}
+
+func set_header(block: UInt, value: UInt) unsafe {
+    write(block &- word(), value)
+}
+
+func size_of(block: UInt) unsafe -> UInt {
+    header(block) & ~FLAGS
+}
+
+func round_up(value: UInt, to: UInt) -> UInt {
+    (value &+ to &- 1) & ~(to &- 1)
+}
+
+extension UnsafeHeap {
+    /// The control block's first word.
+    func control(&self) unsafe -> UInt {
+        round_up(self.base, word())
+    }
+
+    func classes(&self) unsafe -> UInt {
+        read(self.control())
+    }
+
+    func fl_map_at(&self) unsafe -> UInt {
+        self.control() &+ word()
+    }
+
+    func sl_map_at(&self, fl: UInt) unsafe -> UInt {
+        self.control() &+ (CONTROL_FIXED &+ fl) &* word()
+    }
+
+    /// The list head for class-and-list `index`.
+    func head_at(&self, index: UInt) unsafe -> UInt {
+        let heads = CONTROL_FIXED &+ self.classes()
+        self.control() &+ (heads &+ index) &* word()
+    }
+
+    /// The address of the region's first block, which follows the control
+    /// block and a header, on the granule.
+    func first(&self) unsafe -> UInt {
+        let words = CONTROL_FIXED &+ self.classes() &* (SL_COUNT &+ 1)
+        round_up(self.control() &+ words &* word() &+ word(), grain())
+    }
+
+    /// Whether the control block exists, making it on the first call. False
+    /// when the region cannot hold one, in which case nothing was written.
+    func ready(&self) unsafe -> Bool {
+        if self.size < min_block() {
+            return false
+        }
+        let start = self.control()
+        let end = self.base &+ self.size
+        if read(start) != 0 {
+            return true
+        }
+        // Size the class table for a block as large as the whole region,
+        // which no block reaches, so every block has a class.
+        let classes = shr(class_of(self.size), SL_LOG2) &+ 1
+        let words = CONTROL_FIXED &+ classes &* (SL_COUNT &+ 1)
+        if end &- start < words &* word() {
+            return false
+        }
+        var at = start &+ word()
+        while at < start &+ words &* word() {
+            write(at, 0)
+            at = at &+ word()
+        }
+        write(start, classes)
+        self.add_region(start &+ words &* word(), end)
+        true
+    }
+
+    /// Give `[start, end)` to the heap as one free block. A region too small
+    /// for a block and its sentinel adds nothing.
+    func add_region(&self, start: UInt, end: UInt) unsafe {
+        let first = round_up(start &+ word(), grain())
+        let limit = end & ~(grain() &- 1)
+        if first > limit || limit &- first < min_block() {
+            return
+        }
+        set_header(limit, 0)
+        self.insert(first, limit &- first)
+    }
+
+    /// Put `block` of `size` bytes on its list and mark it free, and mark the
+    /// block after it. A free block's predecessor is never free (the two
+    /// would have merged), so its own header carries no `PREV_FREE`.
+    func insert(&self, block: UInt, size: UInt) unsafe {
+        let index = class_of(size)
+        let fl = shr(index, SL_LOG2)
+        let slot = self.head_at(index)
+        let head = read(slot)
+        write(block, head)
+        write(block &+ word(), 0)
+        if head != 0 {
+            write(head &+ word(), block)
+        }
+        write(slot, block)
+        let fl_map = self.fl_map_at()
+        write(fl_map, read(fl_map) | shl(1, fl))
+        let sl_map = self.sl_map_at(fl)
+        write(sl_map, read(sl_map) | shl(1, index & (SL_COUNT &- 1)))
+        set_header(block, size | FREE)
+        write(block &+ size &- grain(), size)
+        let next = block &+ size
+        set_header(next, header(next) | PREV_FREE)
+    }
+
+    /// Take `block` of `size` bytes off its list. Its flags are the caller's.
+    func remove(&self, block: UInt, size: UInt) unsafe {
+        let index = class_of(size)
+        let next = read(block)
+        let prev = read(block &+ word())
+        if next != 0 {
+            write(next &+ word(), prev)
+        }
+        if prev != 0 {
+            write(prev, next)
+            return
+        }
+        write(self.head_at(index), next)
+        if next != 0 {
+            return
+        }
+        let fl = shr(index, SL_LOG2)
+        let sl_map = self.sl_map_at(fl)
+        let left = read(sl_map) & ~shl(1, index & (SL_COUNT &- 1))
+        write(sl_map, left)
+        if left == 0 {
+            let fl_map = self.fl_map_at()
+            write(fl_map, read(fl_map) & ~shl(1, fl))
+        }
+    }
+
+    /// A free block of at least `size` bytes, or 0.
+    ///
+    /// The bitmaps answer for a list whose every block is large enough. When
+    /// none is non-empty, the list `size` itself falls in can still hold a
+    /// block that fits: a request near the size of a nearly empty region's one
+    /// block (68 KiB of a 72 KiB arena) is served only from there. So that list
+    /// is walked before the heap refuses.
+    func find(&self, size: UInt) unsafe -> UInt {
+        let classes = self.classes()
+        let search = search_class_of(size)
+        var fl = shr(search, SL_LOG2)
+        if fl < classes {
+            var sl_map = read(self.sl_map_at(fl)) &
+                         shl(ALL_ONES, search & (SL_COUNT &- 1))
+            if sl_map == 0 {
+                let fl_map = read(self.fl_map_at()) & shl(ALL_ONES, fl &+ 1)
+                if fl_map != 0 {
+                    fl = lowest_bit(fl_map)
+                    sl_map = read(self.sl_map_at(fl))
+                }
+            }
+            if sl_map != 0 {
+                return read(self.head_at(shl(fl, SL_LOG2) | lowest_bit(sl_map)))
+            }
+        }
+        let index = class_of(size)
+        if shr(index, SL_LOG2) >= classes {
+            return 0
+        }
+        var block = read(self.head_at(index))
+        while block != 0 {
+            if size_of(block) >= size {
+                return block
+            }
+            block = read(block)
+        }
+        0
+    }
+
+    /// A block of at least `size` bytes aligned to `align`, or 0 when the heap
+    /// cannot serve it. An `align` of 0 means 1.
+    public func alloc(&self, size: UInt, align: UInt) unsafe -> UInt {
+        if not self.ready() || size > self.size {
+            return 0
+        }
+        var need = round_up(size &+ word(), grain())
+        if need < min_block() {
+            need = min_block()
+        }
+        // An alignment the granule already gives costs nothing. Any other is
+        // served from a block with room for the gap in front, where `step` is
+        // the smallest multiple of both it and the granule.
+        var step = grain()
+        var room: UInt = 0
+        if align > grain() || (align != 0 && grain() % align != 0) {
+            if align > self.size {
+                return 0
+            }
+            // A zero `step` is not a multiple to stop at: the bound lets the
+            // compiler drop the division check below.
+            step = align
+            while step < grain() || (step & (grain() &- 1)) != 0 {
+                step = step &+ step
+            }
+            room = step &+ grain()
+        }
+        var block = self.find(need &+ room)
+        if block == 0 {
+            return 0
+        }
+        var total = size_of(block)
+        self.remove(block, total)
+        if room != 0 {
+            // A gap smaller than a block cannot stand on its own, so the
+            // block moves one more step instead.
+            let rem = block % step
+            var gap = if rem == 0 { 0 } else { step &- rem }
+            if gap != 0 && gap < min_block() {
+                gap = gap &+ step
+            }
+            if gap != 0 {
+                // The gap's insert marks the word that becomes the block's
+                // header with `PREV_FREE`, and the header is written whole
+                // below.
+                self.insert(block, gap)
+                block = block &+ gap
+                total = total &- gap
+            }
+        }
+        if total &- need >= min_block() {
+            self.insert(block &+ need, total &- need)
+            total = need
+        } else {
+            let next = block &+ total
+            set_header(next, header(next) & ~PREV_FREE)
+        }
+        set_header(block, total | (header(block) & PREV_FREE))
+        block
+    }
+
+    /// Whether `block` can be a live block of a heap that has served: `free`
+    /// trusts its argument, and this is the check to make before it.
+    ///
+    /// It answers false for a block outside the region, before its first
+    /// block (the control block included) or off the granule; for one whose
+    /// header marks it free; and for one whose header's size is less than a
+    /// block or runs past the region. So it catches a block freed twice while
+    /// its header still says free (a block that merged into the free block
+    /// before it keeps a header that says so), and a stray pointer whose
+    /// preceding word is not a plausible header. It misses a second free after
+    /// the block was served again, a pointer into a live block whose preceding
+    /// word happens to read as a header that fits, and a pointer into a freed
+    /// block whose preceding word is a stale size. `sosrt`'s dealloc seam
+    /// panics on a block this refuses.
+    public func holds(&self, block: UInt) unsafe -> Bool {
+        let end = self.base &+ self.size
+        // The first test keeps the control block's first word, which `first`
+        // reads, inside the region.
+        if block <= self.control() || block >= end ||
+           (block & (grain() &- 1)) != 0 || block < self.first() {
+            return false
+        }
+        let word = header(block)
+        let size = word & ~FLAGS
+        (word & FREE) == 0 && size >= min_block() && size <= end &- block
+    }
+
+    /// Return `block`, from `alloc` on this heap, merging it with each free
+    /// neighbour. A zero `block` is no block. Anything else that is not a live
+    /// block of this heap corrupts it; `holds` is the check.
+    public func free(&self, block: UInt) unsafe {
+        if block == 0 {
+            return
+        }
+        var start = block
+        var total = size_of(block)
+        let next = block &+ total
+        if (header(next) & FREE) != 0 {
+            let more = size_of(next)
+            self.remove(next, more)
+            total = total &+ more
+        }
+        if (header(block) & PREV_FREE) != 0 {
+            let before = read(block &- grain())
+            start = block &- before
+            self.remove(start, before)
+            total = total &+ before
+            // The block's header is now inside the merged block. Marked
+            // free, it tells `holds` of a second free.
+            set_header(block, FREE)
+        }
+        self.insert(start, total)
+    }
+}
