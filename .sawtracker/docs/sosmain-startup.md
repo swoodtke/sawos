@@ -561,6 +561,12 @@ a holder parks inside the lock only on the console's ring, and only a
 through `DebugPrint`, never parks, and is preempted only by a tick, which
 also ends the waiter's spin.
 
+All of this relies on the one ready list the scheduler keeps at the pin. The
+fixed-priority bands spec §7 specifies bring a hazard: a waiter in a higher
+band than the holder is always ready, so neither a tick nor `ThreadOp.Yield`
+hands the processor to the holder, and the waiter spins for good. The lock
+needs a priority-aware wait before bands land.
+
 When SL-1159 lands, `sosrt` answers its `__saw_rt_thread_yield` seam with
 the same hook, and std's spins yield too.
 
