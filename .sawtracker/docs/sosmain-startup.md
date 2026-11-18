@@ -104,23 +104,36 @@ inside the call that needs it, with the kernel's own words and no message
 from the runtime, so the start-up reads each handle's rights with `INFO_OP`
 (ungated) before it spends them, and panics by name instead.
 
-1. **Re-entry guard.** If the `STARTED` word is set, this is a second thread
-   made at `ENTRY_IMAGE` (§5.4). The start-up panics with `sos: a thread
-   entered the image entry; make threads with thread_create(run:)`.
-   Otherwise it sets the word.
+1. **Re-entry guard, and the thread register.** If the `STARTED` word is
+   set, this is a second thread made at `ENTRY_IMAGE` (§5.4). The start-up
+   panics with `sos: a thread entered the image entry; make threads with
+   thread_create(run:)`. Otherwise it sets the word, and writes the address
+   of the main thread's block, in its own frame, into the thread register
+   (§5.3). Nothing has taken a lock yet, so every lock the main thread takes
+   records that address as its owner.
 2. **Check and adopt the System handle.** If the word is `NO_HANDLE`, skip to
    step 6: the process has no System, no Process and no boot set. Otherwise
    the start-up asks `INFO_OP` for the word's kind; anything but a System
    panics with `sos: the boot word names a KIND, not a System`. It then
    adopts the word with `System(boot_handle:)`, which parks it for the write
    seam as today, and reads its rights with `INFO_OP`.
-3. **Derive the Process handle.** A System without `ProcessSelf` panics with
-   `sos: the System handle lacks ProcessSelf`. Otherwise
-   `system.process_self()`; a refusal, which can only be the `Handle` quota
-   or a full table, panics with `sos: no process handle: STATUS`.
-4. **Drain the boot set.** The start-up reads the derived handle's rights; a
-   ceiling that took `BootHandles` away panics with `sos: the Process handle
-   lacks BootHandles`. Otherwise `BootSet(process:)` drains every record. A
+3. **Derive the Process handle and the main thread's own.** A System
+   without `ProcessSelf` panics with `sos: the System handle lacks
+   ProcessSelf`. Otherwise `system.process_self()`; a refusal, which can
+   only be the `Handle` quota or a full table, panics with `sos: no process
+   handle: STATUS`. The start-up then reads the derived handle's rights with
+   `INFO_OP`, which steps 4 and 9 use too. Rights without `ThreadSelf` panic
+   with `sos: a main program needs ThreadSelf`: asking without the right
+   would be the kernel's `AccessDenied` fault, and a main thread with no
+   handle to yield through could wait forever behind the output lock (§3.5),
+   a hang where a named refusal belongs. Otherwise the start-up mints the
+   main thread's own Thread handle (`proc.thread_self()`) and keeps it in
+   the main thread's block, where the output lock's yield finds it; a
+   refusal panics with `sos: no thread handle: STATUS`, since the builder's
+   floor counts the handle (§3.1).
+4. **Drain the boot set.** A Process ceiling that took `BootHandles` away
+   panics with `sos: the Process handle lacks BootHandles`. Otherwise
+   `BootSet(process:)` drains every record. A
    drain that ends other than in `Drained` panics with its status. The drain
    allocates its two vectors from the arena's heap.
 5. **Give the console record to the write seam.** `set.take(CONSOLE_TAG)`. If
@@ -167,8 +180,13 @@ func main() -> Result<Void, SosStatus> {
 ```
 
 A lent place is named by a block that opens its own window (`borrow let`),
-or used for one statement (`sosmain.context().process().exit(3)`); a `let`
-cannot hold it.
+or used within one statement (`let t = try
+sosmain.context().process().thread_self()` binds the minted handle, not the
+lent place; it passes sawc's borrow check at the pin); a `let` cannot hold
+the place itself. A
+program ends itself early with `sosmain.exit(3)`, which sends the console's
+`Sync` first; `Process.exit` answers a `Result` that a bare statement may not
+drop, and skips the `Sync`.
 
 Its `Saw.toml` adds `sosmain = { path = ".../rt/main" }` beside `sos`, and
 keeps `runtime = true` because the image's compile is still where the seams
@@ -240,7 +258,13 @@ runtime keeps the wrappers for the whole life of the process.
   drop it when it chooses, as the stock root does (§8). `main` takes records
   from it by tag. A record nobody takes is released when the set is dropped,
   or when the process ends if `main` never took the set. A second
-  `take_boot_set()` panics.
+  `take_boot_set()` panics, on any thread: the `Boot` value carries an
+  `Atomic` taken word beside the set, and the take is one compare-and-swap
+  of it from 0 to 1. The thread whose exchange wins moves the set out; every
+  other caller, at once or later, finds the word set and panics with `sos:
+  the boot set was taken already`, so two threads that race can never both
+  hold it. Unit 2 holds a second call on one thread, and unit 3 two threads
+  racing (§10).
 
 A child started with no System has no Process and no boot set either.
 `system()`, `process()` and `take_boot_set()` then panic with a message that
@@ -323,6 +347,15 @@ console = "console.uart"       # PROCESS.RECORD: a serve record of uartproto
   when it goes into a console image. Root's per-step check already counts
   the inlet it mints per child (the `Inlet` step). `print` needs no further
   row: the writer never holds a claim (§3.3).
+- **A `main` program holds one handle more again,** its main thread's own
+  Thread handle (§1.2 step 3), in every image, console or not. A child
+  starts with its records, its Process handle and one handle per window
+  (`handles_at_start`, `tools/sosimage/src/declaration.saw`), so the builder
+  adds one to that floor for a package whose `Saw.toml`, beside its
+  `process.toml`, depends on `sosmain`; that dependency is what makes a
+  package a `main` program, and `_start` packages keep their floor. A stock
+  root that is a `main` program counts the handle in its own steps the same
+  way.
 - The console driver is the image's choice. SO-137's `svc-console` serves the
   kernel console on every board, through its own `Debug`; on a gate board an
   image may name `svc-uart-ns16550` or `svc-uart-pl011` instead. A client
@@ -415,8 +448,11 @@ a `DebugPrint` trap. The new path works like this:
   much: 160 bytes on a 32-bit profile and 176 on a 64-bit one, not a body's
   128. The `Sync` uses the same record.
 - **Ordering.** A connection's ring is FIFO, and it is shared by every client
-  of the console, so lines from one process arrive in order, and lines from
-  different processes interleave at line boundaries.
+  of the console, so lines from one process arrive in order. The output
+  lock is per process, so lines from different processes interleave at
+  message boundaries: a line of up to `LINE_CHUNK` bytes is one message and
+  arrives whole, and a longer one can have another process's message land
+  between its chunks.
 - **`Sync` at the end.** The start-up's step 8, `sosmain.exit` and the panic
   hook (§4) each call `console_sync()` before the process ends. The reason is
   the transcript, not delivery: a posted message outlives its sender (spec
@@ -496,11 +532,37 @@ It is a recursive lock whose state, an owner and a depth, is kept in a
 `static SpinLock<OutputState>`. `lock` takes the `SpinLock` for a few
 compares and stores: if the depth is zero or the owner is the caller
 (`__saw_rt_lock_owner`), it records the caller and adds one to the depth;
-otherwise it gives the `SpinLock` back and tries again, yielding between
-tries through `__saw_rt_thread_yield` once std's spin-then-yield lands
-(SL-1159) and spinning until then. `unlock` takes one from the depth and
-clears the owner at zero. Nothing in the `SpinLock`'s window can panic or
-allocate, so the window is never re-entered.
+otherwise it gives the `SpinLock` back, yields, and tries again. `unlock`
+takes one from the depth and clears the owner at zero. Nothing in the
+`SpinLock`'s window can panic, allocate or trap, so the window is never
+re-entered, and a thread never loses the processor inside it except to a
+tick.
+
+**The yield is `sosrt`'s own, not std's.** std's spin-then-yield (SL-1159)
+is not at the pin, and std's `SpinLock` there is a bare compare-and-swap
+loop. It does not need to yield here: its window holds no system call, so on
+an image with no tick it is never found held, and with a tick a waiter spins
+at most until the holder's next turn. The wait that needs a yield is for the
+outer lock, whose holder can be parked in a `Call` for room on the ring.
+That loop is `sosrt`'s, and it yields through a fourth per-side hook,
+`sos_rt_yield()`:
+
+- the kernel answers it with nothing, being one context that never waits;
+- a process answers `ThreadOp.Yield` through the calling thread's own Thread
+  handle, read from the block the thread register names (§5.3).
+
+Every thread of a `main` program has that handle: the start-up mints the
+main thread's, refusing a Process handle without `ThreadSelf` by name (§1.2
+step 3), and every `thread_create(run:)` thread carries its own (§5.2). A
+thread with no block (a `_start` package's, whose register is zero or a
+lazy number) finds no handle, and the hook does nothing. That cannot hang:
+a holder parks inside the lock only on the console's ring, and only a
+`main` program adopts a console, so a `_start` package's holder writes
+through `DebugPrint`, never parks, and is preempted only by a tick, which
+also ends the waiter's spin.
+
+When SL-1159 lands, `sosrt` answers its `__saw_rt_thread_yield` seam with
+the same hook, and std's spins yield too.
 
 `SpinLock<T>` cannot be the output lock itself, for three reasons: its window
 is one block, so it cannot be taken in `__saw_rt_output_lock` and given back
@@ -517,10 +579,6 @@ before plain writes) and its one-second bound on a claim's wait are not
 kept. The only claimer is the panic path, which writes nothing through the
 stream: it waits only for a line already being written, and a holder parked
 on a wedged driver hangs it, as §3.6 says.
-
-The yield needs the calling thread's own Thread handle, because
-`ThreadOp.Yield` is an op on a handle naming the caller; §5.3 says where it
-lives.
 
 ### 3.6 A driver that stops serving
 
@@ -629,13 +687,20 @@ extern "C" {
     func sos_rt_abort(ptr: UnsafePointer<Int8>, len: UInt,
                       code: UInt32) -> Never
     func sos_rt_lock_owner() -> Int
+    func sos_rt_yield()
 }
 ```
 
+`sos_rt_lock_owner` is the allocator's hook (SO-142, as its revision under
+review stands) and `sos_rt_yield` the output lock's (§3.5).
+
 `rt_panic` claims the output lock, as the ABI's panic sink does, and calls
-`sos_rt_abort(ptr, len, AbortCode.Panic)`. The allocator's two refusals call
-it with their own line and code: `sos: out of arena memory` and `sos: bad
-free`. None of them writes through `sos_rt_write` any more.
+`sos_rt_abort(ptr, len, AbortCode.Panic)`. The allocator's exhaustion calls
+it with its own line and code, `sos: out of arena memory` and
+`AbortCode.NoMemory`. A free the heap can tell is bad is an ordinary
+`panic("bad free at {}")` in the allocator under review, so it reaches the
+hook through `rt_panic`. None of them writes through `sos_rt_write` any
+more.
 
 - **The kernel's answer** (each board's `hal/*/kernel/lib.saw`) writes the
   text to the UART and stops the machine through `exit_fail(code)`, which
@@ -654,10 +719,18 @@ free`. None of them writes through `sos_rt_write` any more.
   `code` is not read: the kernel's line and reason say it all. The copy uses
   `UnsafeMemory` and wrapping arithmetic, check-free on the standard
   `rt/common`'s header sets: read the `-Oz` disassembly of the hook on each
-  architecture. A panicking thread needs the compiler's 512 bytes of message
-  scratch, this 256-byte buffer and, with a console, the `Sync`'s message
-  record (§3.3) on its stack; a thread that has less takes a hardware fault
-  on its stack instead.
+  architecture. A panicking thread needs, beyond its frames, the
+  compiler's 512 bytes of message scratch and this 256-byte buffer, and with
+  a console the `Sync`'s send record (24 bytes on a 32-bit profile, 48 on a
+  64-bit one), its one-byte body and its reply's message record (160 or
+  176, §3.3) on its stack. What a thread that has less meets depends on the
+  tier and the stack. On an isolated tier, a run below the main thread's
+  stack grant faults only where nothing is granted below it; the loader
+  holds the copied segments below the grant, not a gap from it. On the
+  `Flat` tier (riscv32-flat, the ESP32-S3) user mode may write the whole
+  address space, so nothing faults. And a `thread_create(run:)` stack carved
+  from the process's own data has nothing below it to fault on, on any tier.
+  Everywhere else the overrun writes over what lies below the stack.
 
 `DebugPrint` has no part in the panic path any more, in any process. It
 stays `print`'s fallback when a process has no console.
@@ -686,10 +759,13 @@ kernel's line unless it says otherwise.
 | Root, any of the above | the line, then the teardown | the machine stops with 64 |
 
 **Root.** A root that panics stops the machine after its teardown, with the
-kernel's new `ExitCode.Panic`, whose number is `sosrt`'s `AbortCode.Panic`,
-64, read from there so the two cannot drift: a panic stops the machine with
-64 whichever side raised it. Arena exhaustion and a bad free in root stop it
-with 64 too, where they stopped it with 65 and 66; the line says which. The
+kernel's new `ExitCode.Panic = 64`. A raw case cannot name another enum's
+case (`static.not-constant` at the pin), so the number is a literal, and a
+`static_assert` beside it holds `ExitCode.Panic as UInt` equal to `sosrt`'s
+`AbortCode.Panic as UInt32 as UInt`, which makes that enum public: a panic
+stops the machine with 64 whichever side raised it. Arena exhaustion in root
+stops it with 64 too, where it stopped it with 65; a bad free already
+panics; the line says which. The
 teardown line is the one a root's `Exit` prints, which is why root's normal
 end keeps `shutdown` (§7); at a panic the line is wanted.
 
@@ -793,14 +869,15 @@ Spec §9a needs nothing: its reclaim list already names a panic.
 - `kernel/core`: the interception at the head of `dispatch`; the line and the
   chunked copy beside it, since the copy doors live above the scheduler; the
   end through `end_process(p, Faulted, Panic, ExitCode.Panic)`;
-  `ExitCode.Panic` in `diag.saw`, which makes `sosrt`'s `AbortCode` public.
+  `ExitCode.Panic = 64` in `diag.saw`, held to `sosrt`'s `AbortCode.Panic` by
+  a `static_assert`, which makes that enum public.
 - `kernel/sysapi`: `sos_panic` in the floor, the C altitude's export, and
   `sos.rt`'s new abort hook. No typed wrapper: a Saw program panics with
   `panic`.
-- `rt/common`: the hook's shape, `rt_panic`, and the allocator's two
-  refusals. Each HAL's kernel abort hook takes the text.
-- `tools/sos_runner.py`: `EXIT_ARENA_EXHAUSTED` and `EXIT_BAD_FREE` retire;
-  `EXIT_PANIC` is the kernel's `ExitCode.Panic`.
+- `rt/common`: the hook's shape, `rt_panic`, and the allocator's exhaustion.
+  Each HAL's kernel abort hook takes the text.
+- `tools/sos_runner.py`: `EXIT_ARENA_EXHAUSTED` retires; `EXIT_PANIC` is the
+  kernel's `ExitCode.Panic`.
 
 ### 4.7 The transcripts that move
 
@@ -822,8 +899,10 @@ The runtime's other root ends move, and their status with them:
 
 - `arena_small`: `sos: out of arena memory` becomes the fault line's text and
   the status 65 becomes 64 (`expect_status` changes);
-- the allocator's `double_free` and `stray_free`, once it merges: `sos: bad
-  free` likewise, and 66 becomes 64.
+- the allocator's `double_free` and `stray_free`, as its revision under
+  review stands: the `panic at lib.saw: … bad free at …` it asserts becomes
+  the fault line's text, followed by root's teardown line; the status stays
+  64 and the assertions hold.
 
 No case asserts a child's panic: every child `panic` in the tree is
 defensive and never reached on a passing run. A child's panic, which today
@@ -889,9 +968,12 @@ rule: which process a handle names is its holder's to know, the reason
    mint's status. The Thread and Handle rows then read back as before the
    call. A refusal by the kernel's create itself leaves nothing to unwind.
 4. **The trampoline**, `sos.thread`'s `thread_entry(record: UInt) sync ->
-   Never`, is created at `FuncPointer(thread_entry).address()`. It reads the
-   record into locals, calls `run(arg)`, then calls `sos_thread_exit(self,
-   result)` and `while { }`. Its address comes from Saw, not a C leaf.
+   Never`, is created at `FuncPointer(thread_entry).address()`. Its first act
+   writes the record's address into the thread register (§5.3), before it
+   can take a lock. It then reads the record into locals, calls `run(arg)`,
+   then calls `sos_thread_exit(self, result)` and `while { }`. Its address
+   comes from Saw, not a C leaf. The record stays where it is, at the top of
+   the thread's stack, for the thread's life: it is the thread's block.
 5. **A panic on any thread** ends the whole process through `PANIC_OP`
    (spec §8's fault rule: there is no per-thread recovery).
 6. **The ordering of ends.** The process ends when `main` returns, through the
@@ -905,21 +987,40 @@ rule: which process a handle names is its holder's to know, the reason
 
 ### 5.3 The thread register, and where SO-141 hooks in
 
-- **The thread register.** The allocator (SO-142) makes the architecture's
-  thread register each thread's own on every profile, arm64's `TPIDR_EL0`
-  included, which was the kernel change SO-141 expected to make, and keeps a
-  lazily numbered lock owner there. SO-141's executor word and the yield's
-  own handle (§3.5) need a per-thread place too. So the register holds the
-  address of a per-thread block: the start record (§5.2) for a
+- **What the allocator provides.** As SO-142's revision under review
+  stands, the kernel keeps the architecture's thread register per thread on
+  every profile (riscv32's `tp` and the S3's `THREADPTR` in the trap frame
+  already; arm64's `TPIDR_EL0` saved and loaded at each switch) and starts
+  every thread with it zero, and `sos.rt`'s lock-owner hook reads it: a
+  nonzero register is the thread's identity, and at a zero one the hook
+  takes the next number from a process-wide counter and writes it there.
+  If SO-142 merges without the per-thread register, unit 2 takes that
+  kernel change, and the hook with it.
+- **What this design adds: a per-thread block.** SO-141's executor word and
+  the yield's own handle (§3.5) need a per-thread place, so the register
+  can also hold the address of a block: the start record (§5.2) for a
   `thread_create(run:)` thread, and a block in `_start`'s frame for the main
-  thread. The block holds the thread's own Thread handle and SO-141's word.
-  The address is word-aligned, nonzero and the thread's alone, so it is the
-  lock-owner identity as it stands. A thread with no block, a raw
-  `ENTRY_IMAGE` thread, keeps the allocator's lazy number, which sets the
-  low bit so it never equals an address. The main thread's own handle is
-  minted at start-up (`thread_self`, one handle row); without
-  `ProcessRight.ThreadSelf` its spins do not yield. SO-141's brief takes
-  this layout.
+  thread of a `main` program. A block holds the thread's own Thread handle
+  and SO-141's word. Its address is word-aligned, nonzero and the thread's
+  alone, so it serves as the lock-owner identity unchanged.
+- **Who writes the register, and when.** Each thread's register is written
+  once, before the thread takes its first lock, and never again, so a lock
+  never sees its holder's identity change:
+  1. the kernel, zero at the thread's start;
+  2. `_start`'s step 1, the main block's address, for a `main` program's
+     main thread, before the boot set's drain takes the heap's lock;
+  3. the trampoline's first act, the start record's address, for a
+     `thread_create(run:)` thread;
+  4. the lock-owner hook, at the first lock of a thread whose register is
+     still zero: a `_start` package's main thread, or a thread made at a raw
+     entry. Unit 3 makes the number it writes odd (`n << 1 | 1`), so a
+     number never equals a block's address by construction.
+
+  So the low bit tells a reader what it holds: zero is nothing yet, an odd
+  word a number only, an even nonzero word a block. The yield (§3.5) and
+  SO-141's drive read a block only from an even word. A program that writes
+  the register itself breaks all of this, as it breaks the allocator's
+  hook today. SO-141's brief takes this layout.
 - **The close.** The trampoline calls `__saw_background_close()` between
   `run(arg)` and the thread exit. That is SO-141's line to add, once a sawlang
   carrying SL-1150 is pinned. `_start` needs no close, because `__saw_main`
@@ -1105,10 +1206,13 @@ instead of `Panic`; root's status; the runtime's alignment copy dropped.
 
 **Unit 2: `sosmain`'s start-up and the boot context, with no console.** It
 needs unit 1 and the allocator's lock-owner seam. The new `rt/main` package:
-`_start` with its kind and rights checks, the `Boot` value, `Context` and its
-accessors, `take_boot_set`, `exit`, `flush` (a no-op until unit 5), and the
-re-entry guard. `sosrt` exports `__saw_rt_write_error` and the output lock
-(§3.5). The task-dump kernel entries (`tests/taskdump.saw`,
+`_start` with its kind and rights checks, the main thread's block and its
+own Thread handle, the `Boot` value, `Context` and its accessors,
+`take_boot_set` with its taken word, `exit`, `flush` (a no-op until unit 5),
+and the re-entry guard. `sosrt` exports `__saw_rt_write_error` and the
+output lock (§3.5), whose waits yield through the new `sos_rt_yield` hook.
+The builder adds one handle to the floor of a package that depends on
+`sosmain` (§3.1). The task-dump kernel entries (`tests/taskdump.saw`,
 `tests/taskdump_empty.saw`) export both seams themselves today, and drop
 their copies, which would now be duplicates. `sos.rt` gets the debug path's
 rights check (§3.4). Each `user.ld` gets `ASSERT(DEFINED(_start))`. Its tests
@@ -1118,28 +1222,34 @@ prove:
   (a panic, `Faulted (Panic)` with its text) each reach the status word
   exactly, as root's `ended` line prints it;
 - the accessors' rights and records, taking by tag, a second
-  `take_boot_set()` panicking, and untaken records released at the end (the
-  Handle row read by a supervisor);
+  `take_boot_set()` on the same thread panicking, and untaken records
+  released at the end (the Handle row read by a supervisor);
+- the main thread's own handle: with `ThreadSelf` in the Process handle's
+  rights it is minted (the Handle row reads one more); without it the
+  start-up panics with `sos: a main program needs ThreadSelf`, `Faulted
+  (Panic)`; and a `handles` row at the old floor is refused by the builder
+  for a `main` package;
 - a thread made at `ENTRY_IMAGE` ending the process with its message;
 - each start-up refusal by name, `Faulted (Panic)`: a boot word that is a
   Memory, a System without `ProcessSelf`, a Process ceiling without
   `BootHandles`, and one without `Exit` (the status on the line);
 - a child printing with no `Debug`, both a `main` program and a `_start`
   package (dropped, not faulted);
-- on a no-tick image, a thread holding the output lock across a yield keeps
-  another thread's line out of its own: the order is made by the lock, not
-  by the clock;
 - a windowed and a call0 `main` on the S3;
 - the full suite's transcripts unchanged.
 
 Mutants: each start-up check dropped (the kernel's fault replaces the named
 panic); the seam's kind check dropped (a non-System word's rights read as a
-System's); the lock's owner test dropped (re-entry deadlocks the report).
+System's); the lock's owner test dropped (re-entry deadlocks the report);
+the thread-self right's check dropped (a process without it ends by the
+kernel's `AccessDenied` fault instead of the named panic).
 
-**Unit 3: a thread's real entry.** It needs unit 1. `thread_create(run:arg:
-stack_top:)`, the self flag on `Process`, the trampoline, the start record,
-the self handle minted at create with its unwind, and the stale doc
-corrected. Its tests prove:
+**Unit 3: a thread's real entry.** It needs units 1 and 2: its threads take
+unit 2's output lock and yield through unit 2's hook. `thread_create(run:arg:
+stack_top:)`, the self flag on `Process`, the trampoline and its register
+write, the start record as the thread's block, the self handle minted at
+create with its unwind, the lock-owner hook's odd numbers (§5.3), and the
+stale doc corrected. Its tests prove:
 
 - threads with different entries and arguments join with their results;
 - a thread's panic ends the process `Faulted (Panic)`;
@@ -1147,10 +1257,25 @@ corrected. Its tests prove:
   `Handle` row with room for the created handle and not its sibling), each
   return the status and leak nothing (the Thread and Handle rows read back);
 - through a child's handle, `thread_create(run:)` panics with its rule;
+- on an image with no tick, the main thread takes the output lock with
+  `__saw_rt_output_lock`, writes half a line, and yields through a Thread
+  handle onto itself that it minted (`thread_self`, `yield_now`); a
+  `thread_create(run:)` thread then
+  prints a line, finds the lock held, and yields through `sos_rt_yield`,
+  which uses the handle in its start record; the main thread finishes its
+  line, gives the lock back and joins the thread. The two lines arrive
+  whole, the main
+  thread's first: the order is made by the lock and the FIFO ready list,
+  with no tick and no clock, and every yield is `ThreadOp.Yield`, at the pin;
+- two threads that both call `take_boot_set()`: the process ends `Faulted
+  (Panic)` with `sos: the boot set was taken already`, and no thread prints
+  a set it took second;
 - the same on the S3, windowed.
 
 Mutants: the unwind dropped (the rows do not read back); the self flag's
-check dropped.
+check dropped; the yield hook made a no-op (the no-tick case hangs and the
+harness's timeout reports it); the taken word's exchange replaced by a load
+and a store.
 
 **Unit 4: the builder's console.** `[image] console`, the reserved range in
 `bootplan` and its refusal in declarations, the inlet record appended per
@@ -1200,10 +1325,12 @@ unit 2 and SO-137 merged, since `svc-console` exists only then.
 Transcript-neutral; image hashes listed.
 
 **Unit 9: the S3 drivers move.** It needs unit 2. The same terms, on the S3
-smoke.
+smoke. Each driver's `handles` row, counted to its peak use, gains one for
+its main thread's own handle.
 
-**Unit 10: the stock root moves.** It needs unit 2. Transcript-neutral across
-every stock-root case.
+**Unit 10: the stock root moves.** It needs unit 2. The builder's count of
+root's own steps gains the main thread's handle (§3.1). Transcript-neutral
+across every stock-root case.
 
 **Unit 11: the product template moves**, with its images naming the console.
 It needs units 4 and 5: its images name the console, and its `print` goes
@@ -1213,8 +1340,9 @@ over it.
 executor set, which a suspending `main` needs); test conversions as they are
 touched.
 
-Units 2 and 3 can run in parallel once unit 1 lands, and unit 4 needs
-nothing before it. Unit 5 waits on SO-137's merge and units 2 and 4.
+Unit 2 follows unit 1, and unit 3 follows unit 2; unit 4 needs nothing
+before it and can run beside any of them. Unit 5 waits on SO-137's merge and
+units 2 and 4.
 
 ## Decided
 
@@ -1250,14 +1378,27 @@ nothing before it. Unit 5 waits on SO-137's merge and units 2 and 4.
     dropped, the text the line's last field (§4.2).
 16. **Root's machine status for a runtime end:** 64, the kernel's
     `ExitCode.Panic`, for every one of them (§4.4).
-17. **The thread register:** the address of a per-thread block holding the
-    thread's own handle and SO-141's word; the allocator's lazy numbers set
-    the low bit (§5.3).
+17. **The thread register:** written once per thread before its first lock:
+    by `_start` (the main block's address), by the trampoline (its start
+    record's address), or by the allocator's lock-owner hook (a number, made
+    odd); an even nonzero word names a block holding the thread's own handle
+    and SO-141's word (§5.3).
 18. **The debug path's rights check:** in `sos.rt`, asked once at the first
     console-less write, for every process (§3.4).
 19. **`thread_create(run:)`:** self-only, by a flag the caller's own Process
     wrappers carry, and a refused self-handle mint unwound by running the
     thread to an immediate exit (§5).
+20. **The output lock's yield:** `sosrt`'s own retry loop, through a per-side
+    `sos_rt_yield` hook that yields with the calling thread's own handle,
+    independent of std's spin-then-yield; its case runs in unit 3, where a
+    second thread exists (§3.5, §10).
+21. **The main thread's own handle:** minted by the start-up after it reads
+    the Process handle's rights; rights without `ThreadSelf` are refused by
+    name (`sos: a main program needs ThreadSelf`, `Faulted (Panic)`). The
+    builder counts the handle in the floor of a package that depends on
+    `sosmain` (§1.2, §3.1).
+22. **`take_boot_set`:** one compare-and-swap of a taken word; the loser
+    panics (§2.1).
 
 ## Open questions
 
