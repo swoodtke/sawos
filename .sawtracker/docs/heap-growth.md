@@ -1,7 +1,8 @@
 # SO-142 phase 2: heaps from pools
 
-Revision 3 of the design for the owner's review. Unit 1, the
-allocation-free drain, has merged; nothing else here is built.
+Revision 4 of the design for the owner's review. Unit 1, the
+allocation-free drain, and the 4 KiB built-in default (SO-142.p3,
+`5a2aa38b`) have merged; nothing else here is built.
 
 What a process allocates from:
 
@@ -24,8 +25,8 @@ down. The document covers:
 
 A bare section sign (§4) is this document's; the spec's sections are written
 "spec §N", and SO-124's design (`.leadwork/SO-124/design-r5-live.md`) is
-cited as "SO-124 §N". The replies to the review's threads on revision 2 are
-in `heap-thread-replies-r3.md` beside this file.
+cited as "SO-124 §N". The replies to the review's threads on revision 3 are
+in `heap-thread-replies-r4.md` beside this file.
 
 Sources:
 
@@ -42,6 +43,8 @@ Sources:
     returned when its last mapping and handle go;
   - a board-aware growth step;
   - the question of a heap alignment key;
+  - TOR on riscv32, growing at the grain;
+  - a share carries `Mint` and `Transfer`, the pool granted `Mint`;
 - sawlang's allocator ABI as its lead states it:
   - a failure answers null and never panics, aborts or blocks;
   - alignment up to 4096;
@@ -86,17 +89,21 @@ Sources:
   handle and its last row are gone, wherever they are.
 - **The growth step is the pool's grain:** a request's need, rounded up to
   the grain the kernel reports for the pool, and at least 1 KiB. That is a
-  page on arm64 and four bytes on riscv32 and the S3. Doubling on riscv32
-  (a NAPOT row) is weighed and not recommended: this HAL charges a NAPOT
-  row the same slot as a TOR pair (Q1).
+  page on arm64 and four bytes on riscv32 and the S3. riscv32's row is a
+  TOR pair growing at the grain (the owner's ruling); doubling a NAPOT row
+  would save no slot on this HAL.
 - **The runtime holds each heap's pool, its `Memory`, its `Mapping` and a
   Map-only Process sibling for the process's life.** The heap is one TLSF
-  region, so `heap.saw` gains only `extend` and a class table sized for the
-  pool.
+  region, so `heap.saw` gains only `extend`, and a class table whose last
+  list takes every block larger than the table.
+- **The heap's `Memory` never leaves its process:** a `Front` cut is minted
+  with `Map | Extend` and without `Transfer` or `Mint`. A share is a `Back`
+  cut with `Transfer | Mint | Map`, so it can be fanned out to any number of
+  processes.
 - **The global allocator** serves from the default heap and then the
   built-in heap. `Heap<SLOT>`, an std `Allocator`, serves named heaps;
   `Heap<SLOT>().share(len:)` answers a `Memory` from the back with
-  `Transfer | Map`.
+  `Transfer | Mint | Map`.
 - **Every refusal to allocate is null,** and each heap records why. The
   panics are a bad free and adoption's rights checks, before the program
   runs.
@@ -119,28 +126,39 @@ Sources:
 
 | Kind | Memory | Sized by | Serves |
 |---|---|---|---|
-| built-in | `[_arena_start, _arena_end)` in `.bss` | `ARENA_SIZE` at link: the declaration's `arena`, else `[image] arena`, else 4 KiB | the global allocator, after the default heap |
+| built-in | `[_arena_start, _arena_end)` in `.bss` | `ARENA_SIZE` at link: the declaration's `arena`, else `[image] arena`, else 4 KiB (the stock root's computed from its plan) | the global allocator, after the default heap |
 | default | the front of a pool under `HEAP_TAG`, growing up | `[heap.default] len`, the pool | the global allocator, first; `Heap<0>` |
 | named | the front of a pool under `HEAP_TAG + slot` | `[heap.NAME] len` | `Heap<slot>` |
 
-The 4 KiB default is SO-142.p3's. The runtime needs none of it: start-up,
-a `print` with `{}` arguments and the panic path allocate nothing.
+The 4 KiB default is SO-142.p3's, merged (`5a2aa38b`), with the stock
+root's arena computed from its plan. The runtime needs none of it:
+start-up, a `print` with `{}` arguments and the panic path allocate
+nothing.
 
 ### 1.2 Who supplies the memory, and the authority
 
 The launcher gives one pool per declared heap, under the heap's reserved
-tag, with the keep mask `PoolRight.Allocate | Map | Transfer | Extend`.
-`Extend` is the new bit of §2.2, carried for allocations as `Map` is. An
-allocation carries its pool handle's carried bits, capped by the process's
-`Memory` ceiling (spec §2.5; `mint_capped`). So the heap's `Memory` can be
-mapped and extended, a share can be mapped and given, and neither can be
-executed (no `MapExecute`) or minted into siblings (no `Mint`).
+tag, with the keep mask `PoolRight.Allocate | Map | Transfer | Mint |
+Extend`. `Extend` is the new bit of §2.2, carried for allocations as `Map`
+is. An allocation carries its pool handle's carried bits, capped by the
+process's `Memory` ceiling (spec §2.5; `mint_capped`), and then by what its
+cut allows (§2.1):
 
-**The pool is owned entirely by the runtime.** Its word sits in a static of
-`sos.rt` with no typed way out. The program reaches it only through the heap
-and `share` (§5). Like every handle guarantee of `sos`, this holds in the
-typed layer: at the C altitude a program that guesses words could name the
-pool, and the kernel cannot tell a process's runtime from its program.
+- **the heap's `Memory`,** a `Front` cut, carries `Map | Extend` and never
+  `Transfer` or `Mint`, so an extendable allocation never leaves its
+  process;
+- **a share,** a `Back` cut, carries `Transfer | Mint | Map` and never
+  `Extend`, so the program may fan it out to any number of processes (the
+  owner's ruling);
+- **neither** can be mapped executable: the pool carries no `MapExecute`.
+
+**"The pool is the runtime's" is the runtime's convention, not a kernel
+boundary** (the owner's ruling). The pool's word sits in a static of
+`sos.rt`, and the typed layer offers no way out: the program reaches the
+pool only through the heap and `share` (§5). Every handle in a process's
+table is the whole process's. Code that finds the pool's word at the C
+altitude can allocate from it or mint siblings of it, which is authority the
+process already holds, not a new one.
 
 ### 1.3 The built-in heap stays separate
 
@@ -223,11 +241,43 @@ ranges above the frontier. A `Back` allocation takes the highest one that
 holds it, so the back stays packed toward the pool's end. A freed range that
 touches the frontier folds back into it, where it serves either side again.
 
-**Rights.** A `Front` cut is minted with `MemoryRight.Extend` if the pool
-handle carries the bit. An `Any` or `Back` cut never is: the bytes after a
-back allocation belong to the back, and an `Any` cut's need not be free.
-`available` does not change; its totals count the frontier once, whichever
-end is spent.
+**Rights.** Today `Allocate` mints with `obj.rights & memory_rights()`
+(`kernel/core/dispatch.saw`), the bits a `Memory` has. That mask becomes the
+cut's own:
+
+- **a `Front` cut:** the pool handle's carried bits intersected with
+  `Map | MapExecute | Extend`. It carries `Extend` when the pool handle
+  does, and never `Transfer` or `Mint`, so an extendable allocation cannot
+  be given, sent or minted out of its process. Nothing needs a heap's
+  `Memory` to move, and without this, whoever received it could spend the
+  heap's frontier and grow a row of its own over the bytes;
+- **an `Any` or `Back` cut:** the carried bits intersected with
+  `memory_rights()`, which does not hold `Extend`, as today. The bytes after
+  a back allocation belong to the back, and an `Any` cut's need not be free.
+
+The declarations that follow:
+
+- `PoolRight.Extend` (bit 11), held equal to `MemoryRight.Extend` by an
+  assert like `PoolRight.Map`'s;
+- the assert `rights.saw` asks of every new `MemoryRight` case;
+- `pool_rights()`, which is `memory_rights() | Allocate` today, gains
+  `Extend` explicitly, so a boot pool carries it and a boot allocation does
+  not;
+- spec §2.5's list of "the bits a `Memory` has", which gains `Extend`
+  (§2.4).
+
+**The frontier's top is on the grain.** `grain_aligned`
+(`kernel/core/process.saw`) puts a boot pool's base on the grain and leaves
+its length as the row gave it. A `Back` cut from the frontier's top would
+then start off the grain. So the kernel also rounds a boot pool's length
+down to the grain when it mints the pool. The bytes past the last whole
+grain were never handed out (spec §2.5 says so) and now are not counted
+either. With that, every range a `Back` cut makes or returns is on the
+grain, and cutting from a range's top needs no node.
+
+`available` does not change: its totals count the frontier once, whichever
+end is spent, and they count free bytes only, so a pool with bytes out reads
+short (§3.1).
 
 `PoolOp` numbers 2 and 3 stay reserved for `Split` and `Revoke`; this adds
 no op.
@@ -288,6 +338,14 @@ address space to keep free above the row on a translating target.
 - The typed form is `Process.map(memory:access:room:)` with `room`
   defaulting to zero, so every caller today is unchanged.
 
+**The dispatch's plumbing.** A Memory op is called as `memory_op(op, &obj,
+arg0, arg1)` and drops the third word, and a Mapping op as `mapping_op(op,
+&obj)` with no argument (`kernel/core/dispatch.saw`). So unit 3 passes
+`room` through to `Map`, and `Grow`'s `len` to the Mapping ops. Each floor
+stub loads every register its op reads: `Grow`'s goes through
+`sos_syscall3`, not the `sos_syscall1` that `Unmap` uses, which leaves the
+other argument registers stale.
+
 ### 2.3 Per tier
 
 - **riscv32 (PMP).** A RAM row is a TOR pair (`prot_region`): a lower bound
@@ -311,14 +369,21 @@ are decided":
 > unspent frontier and nothing else. `Back` (2) takes the top of the
 > highest free range that holds `len`, and only when none does the top of
 > the frontier. Any other word is the `BadArg` fault. A `Front` allocation
-> is minted with `MemoryRight.Extend` when its pool handle carries it, and
-> no other allocation ever is.
+> is minted with its pool handle's `Map`, `MapExecute` and `Extend` bits and
+> never `Transfer` or `Mint`, so it stays in the process that allocated it;
+> every other allocation is minted with the bits a `Memory` has, never
+> `Extend`.
 
 **Spec §2.5, "Where the bytes come from":** append
 
 > A pool so has two ends: allocations from the front and from the back meet
 > in its frontier, and a returned range that touches the frontier from
-> either side folds into it.
+> either side folds into it. A boot pool's length is rounded down to the
+> grain when it is minted, so the frontier's top is on the grain.
+
+**Spec §2.5, "An allocation's rights come from the pool handle":** the
+bits a `Memory` has become `Transfer`, `Mint`, `Map`, `MapExecute` and
+`Extend`, with the `Front` rule above; `pool_rights()` names `Extend`.
 
 **Spec §2.5, the `Memory` section:** "one op, `Map`" becomes "two ops,
 `Map` and `Extend`", and after `map`'s bullets:
@@ -359,7 +424,8 @@ After the drain, `BootSet(process:)` takes every record under a heap tag
 `sos` depends) and adopts it:
 
 1. **The pool's rights,** read with `INFO_OP`: without `Allocate`, `Map`,
-   `Transfer` or `Extend`, panic `sos: heap SLOT's pool lacks RIGHT`.
+   `Transfer`, `Mint` or `Extend`, panic `sos: heap SLOT's pool lacks
+   RIGHT`.
 2. **The Process sibling,** once per process. Read the drain's Process
    handle's rights; without `Mint`, panic `sos: the Process handle lacks
    Mint, so no heap can be adopted`. Then mint a sibling with the keep mask
@@ -367,10 +433,18 @@ After the drain, `BootSet(process:)` takes every record under a heap tag
    so a sibling without `Map` panics `sos: the heaps' Process handle lacks
    Map (the Process ceiling)`, and a refused mint panics `sos: no handle for
    the heaps: DESCRIBE`.
-3. **The pool's length and grain.** Read with `Pool.available(0)`, while
-   nothing is taken: `total` is the pool's length, which sizes the class
-   table; the lowest bit of `granularities` is its grain, the growth step's
-   unit (§4).
+3. **The pool's free bytes and grain.** Read with `Pool.available(0)`:
+   `total` is the bytes free in the pool now, which sizes the class table
+   and the first growth's `room`; the lowest bit of `granularities` is the
+   grain, the growth step's unit (§4). `total` is not the pool's length:
+   the kernel keeps no length for a pool, and `available` counts nothing
+   out on loan (`pool_available`). A launcher may give a pool while it
+   still holds an allocation from it (`process_give` never reads
+   `out_bytes`). The stock root gives every heap pool fresh, so there
+   `total` is the declared `len`. When a held allocation comes home later,
+   its bytes fold into the frontier and the heap can grow past what
+   adoption saw. §3.4 keeps that safe, and on arm64 the growth may then
+   meet the room's end (§3.3).
 4. **Install** the descriptor under the heap's lock, with no region yet.
 
 `DESCRIBE` is the status's `describe()`. The texts are made in `sos`, and
@@ -389,11 +463,20 @@ is always the pool's first bytes, whatever shares have taken from the back:
 
 1. **Allocate** the first size (§4) with `from = Front`.
 2. **Read the Memory's rights;** without `Map` or `Extend` (the `Memory`
-   ceiling), release it and refuse (`Rights`).
-3. **Map** read-write through the Process sibling, with `room` the pool's
-   length less the first size.
-4. **Read the Mapping's rights;** without `Grow` (the `Mapping` ceiling),
-   unmap, release and refuse (`Rights`). Then read `Base`.
+   ceiling), release it and refuse (`Rights`). The bytes go home.
+3. **Map** read-write through the Process sibling, with `room` adoption's
+   `total` less the first size. A refusal releases the Memory and refuses
+   with the status's reason (`Quota(Mapping)`, `NoResource`).
+4. **Read the Mapping's rights,** `Grow` and `Base` together, before
+   spending either: the `Mapping` ceiling caps the new handle
+   (`install_row` mints it with `mint_capped`), and `Base` or `Grow`
+   without its bit is the `AccessDenied` fault, inside the lock. Without
+   either, release both handles and refuse (`Rights`), and the heap is
+   spent for good. The runtime does not unmap: `Unmap` would need a third
+   bit the ceiling may also lack. Releasing leaves the row installed with
+   no handle (spec §2.5's "dropped without unmap = permanent,
+   safe-but-leaked"), holding its `Mapping` row and its bytes until
+   teardown. Then call `Base` for the row's address.
 5. **Zero the control block's first word** (§1.6) and make the heap over
    `[base, base + size)`.
 
@@ -403,11 +486,17 @@ The runtime keeps the Memory and the Mapping for the process's life.
 
 1. `Memory.extend(n)`. `NoMemory` refuses (`Spent`): the back side or the
    pool's end is at the heap's front.
-2. `Mapping.grow(n)`. A refusal here, which the room makes unreachable on
-   arm64 and which the identity tiers never answer, leaves the `Memory`
-   longer than its row. The heap still serves only from its row, so it is
-   refused (`Rights` or `Spent`, the status saying which) and the bytes stay
-   the heap's, unused.
+2. `Mapping.grow(n)`. `Grow` answers `NoMemory`, `NoResource` or
+   `Revoked` (§2.2); its right was read at the first growth. A refusal here
+   leaves the `Memory` `n` bytes longer than its row, so it refuses with
+   `Spent` (for `NoMemory` and `Revoked`) or `NoResource`, and **the heap
+   is spent for good**. A later growth tried again would move the `Memory`
+   and the row by the same `n` and leave the row a step behind. The heap
+   takes its end from what `Grow` granted, never from the `Memory`'s
+   length, and the `n` bytes stay the heap's, unused. On the identity tiers
+   `Grow` cannot meet another row. On arm64 the room reaches as far as
+   adoption's `total`, so this is reachable only for a heap grown past it
+   (§3.1 step 3).
 3. `heap.extend(base + new_size)`: the old sentinel's header becomes a
    free block's over the new bytes, merged with a free block before it
    (`PREV_FREE`), with a new sentinel at the new end. Constant time.
@@ -421,8 +510,14 @@ The code is check-free Saw over the floor's raw calls, behind a per-side hook
 
 The heap stays one region. It gains:
 
-- **`largest`:** the class table is sized for the pool's length, so no
-  block a growth makes outgrows it;
+- **`largest`:** the class table is sized for adoption's `total`;
+- **a bounded class:** `class_of` sends every block larger than the
+  table's top class to the table's last list, the last second-level list of
+  the last class, and `find` walks that list as it walks a request's own
+  list today. A heap that grows past adoption's `total` (§3.1 step 3) then
+  keeps working, where today's unbounded `insert` would write a list head
+  past the control block, into the first block
+  (`rt/common/src/heap.saw`: only `find` checks `fl < classes`);
 - **`extend(new_end)`:** as in §3.3 step 3, the region's `size` rising with
   it, so `holds` checks against the current end with no other change.
 
@@ -474,7 +569,7 @@ program that allocates in small steps from making a syscall pair per
 allocation; it costs at most 1 KiB of the pool to the heap that the shares
 could have had.
 
-### 4.2 Doubling on riscv32: weighed, not recommended
+### 4.2 Doubling on riscv32: weighed, and not taken
 
 The owner asked whether riscv32's heap could keep doubling, so that its slot
 is a NAPOT region. A NAPOT row is a power-of-two size on a base aligned to
@@ -504,7 +599,7 @@ it.
 - **TOR** takes any size, grows by the grain, wastes nothing and needs no
   alignment beyond the grain. It costs the same one region on this HAL.
 
-**Recommendation: TOR**, as RAM rows are today (Q1). Doubling becomes worth
+**The owner ruled TOR**, as RAM rows are today. Doubling becomes worth
 its alignment and its waste only if the HAL packs NAPOT rows one entry each
 and the budget counts entries. That is a HAL change of its own, and with it:
 
@@ -571,15 +666,16 @@ try log.push(byte) catch { drop_oldest(&var log) }
 - **`len` must be a whole number of the pool's grain.** An off-grain `len`
   answers `NoResource` without asking the kernel, which would fault it
   `BadArg`.
-- **Its rights** are `Transfer | Map` at most: the pool's carried bits
-  without `Extend`, which a `Back` cut never carries, capped by the
+- **Its rights** are `Transfer | Mint | Map` at most: the pool's carried
+  bits without `Extend`, which a `Back` cut never carries, capped by the
   `Memory` ceiling.
-  - The program may map it into itself, give it
-    (`Process.give(memory:tag:keep:)`, narrowing the receiver's copy), or
-    send it in a message.
-  - It may not map it executable or mint siblings of it: one share reaches
-    one other holder at a time. To keep a view and give one, the program
-    maps the share, then gives the handle; its row keeps its view.
+  - The program may map it into itself, mint siblings of it (narrowed with
+    `Memory.mint(rights:)`, say to a read-only view's `Transfer | Map`),
+    give each (`Process.give(memory:tag:keep:)`) or send each in a message,
+    so one share can reach any number of processes (the owner's ruling).
+  - It may not map it executable: the pool carries no `MapExecute`.
+  - It lives until its last handle and last row are gone, wherever they
+    are (§1.5).
 - **It competes with the heap** for the middle of the pool. A share the
   pool cannot serve answers `NoMemory`; a heap that cannot grow answers
   null with `Spent`.
@@ -617,7 +713,24 @@ allocation is null. What the program sees then depends on who allocated:
 A `main` that returns `Err` with no heap panics too, since the program entry
 renders the `Err` through the global allocator unless the compile has
 `--no-hidden-alloc` (sawlang's `runtime/ABI.md`, "The program entry"). The
-4 KiB default heap avoids it; SO-124's unit 2 holds the heapless case.
+4 KiB default heap avoids it. This design holds the heapless case itself:
+unit 5's `heap_main_err`, once SO-124's unit 2 has made `sosmain`.
+
+**On arm64 a heap's first `map` can meet the window's end.** `free_user_va`
+places every non-device row first fit above the image region, in the order
+rows are made, and a heap's row and its room arrive at its first growth.
+Rows made before it push it higher:
+
+- the stats region's row (`StatsRegionMap`);
+- RAM another process gave this one and it mapped;
+- one of the program's own shares mapped into itself.
+
+The builder's window bound (§6.2) is then necessary but not sufficient, and
+the first growth answers null with `NoResource`. That is a refusal the
+program can meet at a time the builder cannot see, and the case that
+produces `NoResource` (unit 5's `heap_window`). Mapping the heap at
+adoption would place it first, at the price of a row for a heap that may
+never be used. The owner's "map in memory as needed" keeps it lazy.
 
 ### 5.5 The allocator ABI
 
@@ -718,7 +831,9 @@ carries no grain, so `Declaration.check_against` cannot make these checks:
   shows `s32c1i` there.
 - **arm64's window:** a child links 2 MiB into the 4 MiB grant window, and
   every row with its room lies above the image region. So the process's
-  region plus every heap's `len` must fit in the 2 MiB above it.
+  region plus every heap's `len` must fit in the 2 MiB above it. The bound
+  is necessary and not sufficient: rows the program makes before a heap's
+  first growth push the heap higher (§5.4).
 
 The rows, held where `check_child` holds a child's, with `H` the number of
 heaps:
@@ -744,7 +859,7 @@ declared `len`, and their rows are the program's.
 
 The plan gives each heap's pool as `Source.Heap`: the pool row `from`,
 after the declared records, with the keep mask `PoolRight.Allocate | Map |
-Transfer | Extend`.
+Transfer | Mint | Extend`.
 
 ## 7. Locks and threads
 
@@ -762,6 +877,14 @@ Transfer | Extend`.
 - **A growth holds its heap's lock across a few syscalls** that answer at
   once. A spinner meanwhile spins as it does while a holder is preempted,
   and the hazard `ARENA`'s doc states applies to each lock.
+- **Its scope is held by reading.** The kernel is uniprocessor, and a
+  thread leaves the processor only at a tick, a yield, a block or an exit.
+  None of the growth's ops blocks or asks for a reschedule. So a mutant
+  that gives the lock back across the growth's syscalls goes red only if a
+  tick lands in that window while another thread is about to allocate the
+  same heap. Nothing puts one there, and a heap grows only when its blocks
+  outrun it. Unit 5 names the mutant equivalent on the gate for that
+  reason.
 - **`share` takes no heap lock:** the pool's ops are the kernel's and
   atomic, and the heap's front and a share's back are cut by the kernel
   from the one frontier.
@@ -816,8 +939,8 @@ Transfer | Extend`.
 **Spec §12, the launch convention:**
 
 > A process that declares heaps gets one pool for each, under the runtime's
-> heap tags, given with `PoolRight.Allocate | Map | Transfer | Extend` and
-> nothing else.
+> heap tags, given with `PoolRight.Allocate | Map | Transfer | Mint |
+> Extend` and nothing else.
 
 ## 10. Units of work, in order
 
@@ -834,72 +957,119 @@ equivalent with the reason.
   - `Allocate`'s `from`;
   - the last-fit cut from a range's top and the frontier's top;
   - the frontier's fold at both ends;
-  - `Extend` withheld from `Any` and `Back` cuts (the bit itself arrives in
-    unit 3);
-  - spec §2.4's `allocate` and "Where the bytes come from" text.
-- Cases (root packages on riscv32, arm64, riscv32-flat and the S3):
+  - a boot pool's length rounded down to the grain at mint;
+  - the cut's own mint mask (§2.1), `PoolRight.Extend` and
+    `MemoryRight.Extend` with their asserts, and `pool_rights()` (the op
+    that spends `Extend` arrives in unit 3);
+  - spec §2.4's `allocate`, rights and "Where the bytes come from" text.
+- Cases (root packages on riscv32, arm64, riscv32-flat and the S3; each
+  reads rights with `INFO_OP` and bytes with `available`):
   - **`pool_back`:** a fresh pool. A `Back` allocation and a `Front` one,
     each mapped and written with its own pattern, sit at the pool's two
     ends: on the identity tiers `Mapping.base()` reads the pool's last
-    bytes and its first; on arm64 `available` reads the middle.
+    bytes and its first. `available` with both ends cut reads the middle,
+    on every tier.
   - **`pool_back_reuse`:** three `Back` allocations freed second, first,
     third. A fourth of the first's length lands in the highest hole, read by
-    its contents' absence of the old pattern on identity, and by
-    `available`'s `largest` everywhere. With all freed, `available` reads
-    the pool whole.
+    `available`'s `largest` everywhere and by its base on identity. With
+    all freed, `available` reads the pool whole.
   - **`pool_meet`:** `Front` and `Back` until the frontier is spent.
-    `Front` answers `NoMemory` while `Any` still serves from a freed hole.
+    `Front` answers `NoMemory` while `Any` still serves from a freed hole,
+    and `Back` answers `NoMemory` once no hole holds it.
+  - **`pool_cut_rights`:** a `Front` cut through a pool handle with
+    `Extend` reads `Map | Extend` and no `Transfer` or `Mint`; through a
+    sibling minted without `Extend`, `Map` alone; an `Any` cut and a `Back`
+    cut never read `Extend`.
+  - **`pool_odd_len`:** a boot pool row whose length is a grain and two
+    bytes reads `available` short by the two bytes, and a `Back` cut of one
+    grain lands on the grain.
   - **`pool_from_bad`:** a `from` of 3 is the `BadArg` fault.
 - Mutants:
   - first fit for `Back` (`pool_back_reuse` lands low);
   - no fold from above (`pool_back_reuse`'s whole pool reads short);
   - `Front` falling back to the list (`pool_meet`);
+  - `Back` not refusing (a fatal stop in `pool_cut`);
+  - each mint mask widened or narrowed (`pool_cut_rights`);
+  - the length not rounded (`pool_odd_len`);
   - the `from` check dropped (`pool_from_bad`).
 
 **Unit 3 (kernel): growing in place.** Needs unit 2.
 
 - The changes:
-  - `MemoryOp.Extend` and `MemoryRight.Extend` (carried by pools,
-    `pool_rights()`);
-  - `MappingOp.Grow` and `MappingRight.Grow`;
-  - `map`'s `room` and `GrantRow.room` in placement;
+  - `MemoryOp.Extend`;
+  - `MappingOp.Grow` and `MappingRight.Grow`, and `mapping_rights()`;
+  - `map`'s `room`, `GrantRow.room` in placement;
+  - the dispatch passing `room` and `len` through, and `Grow`'s floor stub
+    on `sos_syscall3`;
   - per tier, the row's top raised and the domain reloaded;
   - spec §2.4's `Memory`, `map` and `Mapping` text, and spec §3's rights.
 - Cases (the same four boards):
   - **`memory_extend`:** a `Front` allocation mapped with `room`, extended
     and grown three times. The process writes and reads the last byte each
-    time, and its `Mapping` used row stays one.
+    time; its `Mapping` and `Memory` used rows stay one. Between an
+    `Extend` and its `Grow`, the bytes past the old top fault on the
+    isolated tiers (the row keeps its bounds). Then it unmaps and releases,
+    and `available` reads the pool whole: `Extend` raised the outstanding
+    bytes (else `pool_return` stops the machine at its underflow check),
+    `Grow` left `maps` alone (else the range never comes home), and the
+    return took the grown length.
   - **`memory_extend_met`:** `Extend` answers `NoMemory` once a `Back`
-    allocation sits at the front's end. When that allocation is freed, it
-    succeeds.
+    allocation sits at the front's end; and when the frontier is shorter
+    than `len`. When the `Back` allocation is freed, it succeeds.
+  - **`memory_extend_two`:** two `Front` cuts; the first's `Extend`
+    answers `NoMemory`, the second's bytes being in the way.
   - **`mapping_grow_past`:** `Grow` past the allocation answers `NoMemory`.
+  - **`mapping_grow_gone`:** a launcher maps a child's `Front` allocation
+    into the child, the child dies, and the launcher's `Grow` answers
+    `Revoked`.
   - **`mapping_grow_room`** (arm64): a second `map` lands past the first's
-    room, and a `Grow` past the room meets it with `NoResource`.
-  - **The faults:** `Extend` on a `Back` allocation (no right), `Extend` of
-    zero, `Grow` on a device row and `Grow` on a husk.
+    room; a `Grow` into the room succeeds and the room shrinks (a second
+    `map` made then still lands past it), and a `Grow` past the room meets
+    the second row with `NoResource`.
+  - **`map_room_window`** (arm64): a `room` that takes the row past the
+    window answers `NoResource`.
+  - **`map_room_identity`** (riscv32 and the S3): a `map` with a large
+    `room` succeeds, and a second `map` of the pool's next bytes is placed
+    at their own address, so the room was recorded as zero.
+  - **The faults, one child each:**
+    - `Extend` on a `Back` allocation (`AccessDenied`);
+    - `Extend` of zero, and off the grain (`BadArg`);
+    - `Grow` through a `Mapping` minted without `Grow` (`AccessDenied`);
+    - `Grow` of zero, and off the grain (`BadArg`);
+    - `Grow` on a device row (`BadArg`) and on a husk (`BadState`);
+    - a `room` off the grain (`BadArg`).
   - **`extend_isolation`** (riscv32 and arm64, isolated only): a read one
     grain past the grown top faults.
 - Mutants:
   - `Extend` not checking that the frontier starts at the end
-    (`memory_extend_met`);
+    (`memory_extend_met`, `memory_extend_two`);
+  - `Extend` not raising the outstanding bytes (`memory_extend`'s return
+    stops the machine);
+  - `Grow` raising `maps` (`memory_extend`'s pool reads short);
   - `Grow` not checking the allocation's end (`mapping_grow_past`);
   - the row's top raised without the reload (the last byte faults on the
     isolated tiers);
-  - `room` ignored in placement (`mapping_grow_room`);
+  - `room` ignored in placement, or not shrinking (`mapping_grow_room`);
+  - each fault's check dropped (its child);
   - the `Mapping` quota charged on a `Grow` (`memory_extend`'s row count).
 
-**Unit 4: `sosrt.heap`'s `largest` and `extend`** (hosted). It can run
-beside units 2 and 3.
+**Unit 4: `sosrt.heap`'s `largest`, bounded class and `extend`**
+(hosted). It can run beside units 2 and 3.
 
 - Tests:
   - a table sized for 64 times the first region serves, after extensions,
     a block of half of it;
+  - a table sized for 4 KiB, extended to 64 KiB, serves a 40 KiB block
+    from the last list and frees it back; the control block's words read
+    unchanged around it;
   - `extend` merges with a free last block and appends after a used one;
   - `holds` takes the new last block, a region ending on the granule
     included, and refuses past the new end;
-  - 200,000 random steps with an `extend` every thousand.
+  - 200,000 random steps with an `extend` every thousand, past the table's
+    top.
 - Mutants:
   - the table sized by the first region;
+  - the class not bounded (the control block's words change);
   - `extend` not merging with a free last block;
   - the old sentinel left as a header of size zero;
   - `size` not raised (`holds` refuses the new block).
@@ -915,7 +1085,8 @@ beside units 2 and 3.
   - `Heap<SLOT>` with its assert, `info()` and `share`;
   - `bootplan`'s heap tags.
 - Cases (hand-written launchers on the four boards, giving children pool
-  rows under heap tags with the keep mask):
+  rows under heap tags with the keep mask; a launcher that dirties or holds
+  part of a pool releases its own `Memory` before it gives the pool):
   - **`heap_grow`:** arena 0. The child takes growing blocks; `info()`
     reads its size rising, and its `Mapping` and `Memory` used rows read
     one each throughout.
@@ -927,12 +1098,18 @@ beside units 2 and 3.
     8 KiB arena. The next block comes from the arena; both are freed and
     the child exits clean.
   - **`heap_dirty_pool`:** the launcher maps the pool's front, writes
-    `0xFF` over it, unmaps and gives the pool. The child's heap serves and
-    frees cleanly (the zeroed first word).
-  - **`heap_share`:** a 4 KiB share with rights `Transfer | Map`. The child
-    maps and writes it and gives it to a sibling, which reads it. The
-    child's heap then grows up to the share's front and `info()` reads
-    `Spent`. When the sibling drops the share, the child's next growth
+    `0xFF` over it, unmaps it and releases its `Memory` (so the bytes come
+    home and the child's `Front` cut lands on them), then gives the pool.
+    The child's heap serves and frees cleanly (the zeroed first word).
+  - **`heap_held_pool`:** a 64 KiB pool, given while the launcher holds a
+    `Back` cut of 48 KiB of it, which it then frees. The child's table is
+    sized for 16 KiB, so it covers blocks under 32 KiB; its heap grows past
+    that and serves a 40 KiB block from the last list (§3.4).
+  - **`heap_share`:** a 4 KiB share with rights `Transfer | Mint | Map`.
+    The child mints a read-only sibling (`Transfer | Map`), gives the
+    share to one sibling child and the narrowed one to another; both read
+    it. The child's heap then grows up to the share's front and `info()`
+    reads `Spent`. When both siblings drop it, the child's next growth
     succeeds (§3.5).
   - **`heap_share_reuse`:** two shares, the higher freed. A third of its
     length reuses its range, and the heap's room is unchanged.
@@ -940,38 +1117,64 @@ beside units 2 and 3.
     `info()` reads size 0 after two shares, and its `Mapping` used row is
     unchanged.
   - **`heap_share_grain`:** an off-grain `len` answers `NoResource`.
-  - **`heap_refusals`, one child per reason, read from `info()`:**
+  - **`heap_refusals`, one child per reason or bit, each read from
+    `info()`:**
     - a `Mapping` row at the windows only (`Quota(Mapping)`);
     - a `Memory` row of zero (`Quota(Memory)`);
     - a full `Handle` row (`Quota(Handle)`);
-    - a `Memory` ceiling restricted before the first growth (`Rights`).
+    - a `Memory` ceiling without `Map` (`Rights`; with the check dropped,
+      the map faults);
+    - a `Memory` ceiling without `Extend` (`Rights` at the first growth;
+      with the check dropped, the second growth's `extend` faults, so the
+      child grows twice);
+    - a `Mapping` ceiling without `Grow` (`Rights`; with the check
+      dropped, the second growth's `grow` faults);
+    - a `Mapping` ceiling without `Base` (`Rights`; with the check
+      dropped, the `Base` read faults);
+    - a `Mapping` ceiling without `Unmap` as well as `Grow` (`Rights`, and
+      the child runs on: no unmap was asked).
+  - **`heap_window`** (arm64): the child maps a large share into itself,
+    and its default heap's first growth meets the window (`NoResource`).
   - **`heap_rights`, one child per adoption panic:** the pool without
-    each of its four bits, a Process handle without `Mint`, a Process
+    each of its five bits, a Process handle without `Mint`, a Process
     ceiling without `Map`.
   - **`heap_missing_slot`:** `Heap<2>` with no slot 2 given.
-  - **`heap_slot_bound`:** `Heap<4>`, a build error.
+  - **`heap_slot_bound`:** `Heap<4>`, a build error
+    (`expect_build_error`).
   - **`heap_wrong_free`:** a block freed through the wrong allocator.
   - **`heap_zero_spent`:** a heapless child whose push answers
     `AllocError` and whose interpolation panics with `try! failed:
     allocation of`.
+  - **`heap_main_err`,** once SO-124 unit 2 has made `sosmain`: a heapless
+    `main` that returns `Err` ends `Faulted (Panic)` with `try! failed:
+    allocation of` (§5.4).
   - **`heap_race`** (riscv32, the short tick): `arena_race`'s workers on a
-    default heap, holding a lock mutant by `arena_race`'s argument.
+    default heap, holding the lock-not-taken mutant by `arena_race`'s
+    argument (many ticks over thousands of allocations).
 - Mutants:
   - adoption dropped;
-  - each rights check dropped (a growth's `Rights` null or the kernel's
-    fault replaces the named text);
-  - `Front` replaced by `Any` (`heap_share`'s growth after the share is
-    freed lands elsewhere and the next `Extend` fails);
+  - each adoption check dropped (the kernel's fault replaces the text);
+  - each first-growth rights check dropped (its `heap_refusals` child
+    faults instead of answering null);
+  - an unmap on the rights refusal (the `Unmap` child faults);
+  - `Front` replaced by `Any` (red at `heap_grow`: an `Any` cut carries no
+    `Extend`, so the first growth refuses with `Rights`);
+  - the bounded class removed (`heap_held_pool` corrupts the control block);
   - the growth's `extend` not merging;
   - the control word not zeroed (`heap_dirty_pool`);
   - the fallback or the routing dropped (`heap_fallback`);
   - `Back` replaced by `Any` in `share` (`heap_share`'s heap meets the
     share at once);
-  - each refusal folded into another (`heap_refusals`);
+  - each refusal folded into another (`heap_refusals`, `heap_window` for
+    `NoResource`);
   - the lock not taken (`heap_race`).
 - Equivalent on the gate:
-  - the handling of a `Grow` refusal after an `Extend`, which the room
-    (arm64) and the identity tiers make unreachable;
+  - the lock given back across a growth's syscalls: red only if a tick
+    lands in that window while another thread allocates the same heap
+    (§7);
+  - the handling of a `Grow` refusal after an `Extend`: the identity tiers
+    never answer one, and on arm64 it needs a heap grown past the room
+    with a row above it, which `heap_held_pool` does not place;
   - the order of the two locks in the fallback.
 
 **Unit 6: the builder and the stock root.** Needs unit 5.
@@ -1014,6 +1217,20 @@ Order:
 - unit 6 follows unit 5;
 - unit 7 follows unit 6 and SO-102.
 
+## 11. Split and revoke (SO-146)
+
+SO-146 brings a pool's `Split` and `Revoke` (`PoolOp` 2 and 3, reserved in
+spec §2.5). A revoke takes back what was allocated from a pool, and a
+heap is a `Front` allocation of its pool, so revoking a process's heap pool
+would take its heap with it, out from under a running program. Once revoke
+exists, shares should come from a split instead. The runtime, or the
+launcher, splits a share pool off the heap's pool, and `share` cuts from
+that sub-pool. A revoke of the sub-pool then reclaims every share without
+touching the heap. The cost is the flexibility of §3.5: a split fixes the
+share budget when it is made, where today the heap and the shares compete
+for the middle of one frontier. Nothing in this design waits on SO-146, and
+`share`'s signature does not change when its pool does.
+
 ## Decided
 
 1. **A pool has two ends:** `Allocate`'s `from` (`Any`, `Front`, `Back`),
@@ -1022,24 +1239,38 @@ Order:
    - `MemoryOp.Extend` (bit 11, carried by pools, never on a boot or
      non-`Front` allocation);
    - `MappingOp.Grow` (bit 10);
-   - `map`'s `room`, so a translating target keeps the next addresses free.
-3. **A heap is one region in one slot, and forever;** no trim, no return.
-4. **The growth step is the pool's grain,** at least `MIN_GROWTH`; no board
-   fact on TOR.
-5. **A heap maps nothing until it is used,** and its first growth is a
+   - `map`'s `room`, so a translating target keeps the next addresses free;
+   - the dispatch passing both through, and `Grow`'s stub on
+     `sos_syscall3`.
+3. **A `Front` cut carries `Map | MapExecute | Extend` of its pool's bits
+   and never `Transfer` or `Mint`;** a boot pool's length is rounded down to
+   the grain.
+4. **A heap is one region in one slot, and forever;** no trim, no return.
+5. **The growth step is the pool's grain,** at least `MIN_GROWTH`; TOR on
+   riscv32 (the owner's ruling).
+6. **A heap maps nothing until it is used,** and its first growth is a
    `Front` cut.
-6. **Shares are `Back` cuts with `Transfer | Map`,** ordinary `Memory`
-   under spec §2.5's invariant; `share` takes no heap lock.
-7. **The runtime keeps each heap's pool, `Memory` and `Mapping`, and one
+7. **Shares are `Back` cuts with `Transfer | Mint | Map`** (the owner's
+   ruling), ordinary `Memory` under spec §2.5's invariant; `share` takes no
+   heap lock.
+8. **The runtime keeps each heap's pool, `Memory` and `Mapping`, and one
    Map-only Process sibling.**
-8. **Every refusal to allocate is null,** its reason in `info()`; the panics
-   are a bad free and adoption's checks.
-9. **`Heap<SLOT>` past the table is a build error.**
-10. **Names:** `arena`, `[heap.NAME]`, `len`, `slot`, `ram`, `heap-ram`,
+9. **Every right is read before it is spent:** the pool's and the Process
+   handle's at adoption, the `Memory`'s `Map` and `Extend` and the
+   `Mapping`'s `Grow` and `Base` at the first growth. A refusal there
+   releases and never unmaps.
+10. **A refused `Grow`, or a first growth refused for rights, spends the
+    heap for good;** the heap's end is what `Grow` granted.
+11. **The class table is sized for adoption's free bytes, and its last list
+    takes every larger block.**
+12. **Every refusal to allocate is null,** its reason in `info()`; the
+    panics are a bad free and adoption's checks.
+13. **`Heap<SLOT>` past the table is a build error.**
+14. **Names:** `arena`, `[heap.NAME]`, `len`, `slot`, `ram`, `heap-ram`,
     `atomics`; no growth keys and no `align` key.
-11. **The builder** holds one `Memory` and one `Mapping` row per heap and
+15. **The builder** holds one `Memory` and one `Mapping` row per heap and
     makes the grain checks at the image.
-12. **The control block's first word is zeroed** before a heap is made.
+16. **The control block's first word is zeroed** before a heap is made.
 
 ## Where this departs from the lead's reading
 
@@ -1048,14 +1279,6 @@ Order:
   while that lowest share lives. When it comes home, its range folds into
   the frontier, which begins at the heap's front, and the heap grows again.
   A share freed higher up helps only later shares (§3.5).
-- **The doubling the owner asked about** is specified (§4.2) and not
-  recommended: on this HAL a NAPOT row spends the same numbered region as a
-  TOR pair, so doubling would cost alignment and up to half the pool for no
-  saving in slots.
-- **The alignment is derived, as you ruled,** and only for a doubling
-  board: the largest power of two not above `len`. That is enough, since
-  the heap cannot outgrow its pool; aligning to the power of two at or above
-  `len` would also work, and asks more of the range.
 - **"Growing a Memory and its Mapping in place" is two ops, not one.**
   Taking the pool's bytes spends authority over the allocation, and widening
   a row spends authority over an address space, as `map` already splits
@@ -1065,18 +1288,16 @@ Order:
   freed hole before the frontier, and a heap that started in a hole could
   never extend.
 
+- **A `Front` cut without `Transfer` or `Mint`** is a kernel rule this
+  revision adds, from the review's t25: a heap's `Memory` has no reason to
+  move, and one that did would carry `Extend` to another process.
+
 ## Open questions
 
-**Decided by the owner: TOR on riscv32, growing at the grain.** On this
-HAL a NAPOT row spends the same numbered region as a TOR pair, so doubling
-saves no slot, and it would cost a pool base aligned to a large power of two
-and up to half the pool. Doubling becomes worth it only if the HAL packs
-NAPOT rows one entry each, a change of its own.
+None. The owner has ruled on both of revision 3's:
 
-**Decided by the owner: a share carries `Mint` and `Transfer`.** A program
-may fan a share out to any number of processes; the share lives until its
-last handle and last mapping are gone (spec §2.5). The pool is granted with
-`Mint` so its allocations carry it. That also lets code that finds the
-pool's word mint pool siblings, which is no new authority: every handle in a
-process's table is the whole process's, and "the pool is the runtime's" is
-the runtime's convention, not a kernel boundary.
+- **TOR on riscv32, growing at the grain** (§4.2). On this HAL a NAPOT row
+  spends the same numbered region as a TOR pair, so doubling saves no slot.
+- **A share carries `Mint` and `Transfer`** (§5.3), with the pool granted
+  `Mint`. "The pool is the runtime's" is the runtime's convention, not a
+  kernel boundary (§1.2).
