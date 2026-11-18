@@ -1073,8 +1073,10 @@ saves no slot, and it would cost a pool base aligned to a large power of two
 and up to half the pool. Doubling becomes worth it only if the HAL packs
 NAPOT rows one entry each, a change of its own.
 
-**Q2. Should a share be mintable?** Without `Mint` on the pool, a share
-reaches one other holder at a time. Granting `Mint` lets the program fan a
-share out, and also lets a program that guesses the pool's word at the C
-altitude mint pool siblings. *Recommendation:* no `Mint` now; add it when a
-product needs one buffer in two other processes.
+**Decided by the owner: a share carries `Mint` and `Transfer`.** A program
+may fan a share out to any number of processes; the share lives until its
+last handle and last mapping are gone (spec §2.5). The pool is granted with
+`Mint` so its allocations carry it. That also lets code that finds the
+pool's word mint pool siblings, which is no new authority: every handle in a
+process's table is the whole process's, and "the pool is the runtime's" is
+the runtime's convention, not a kernel boundary.
