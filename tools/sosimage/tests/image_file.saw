@@ -570,7 +570,7 @@ func main() {
     // Unknown keys: at the top, in [[setup]], in [[pool]], and a hand-written
     // root's process's typo, which is no stock root's key either.
     expect_read_refusal(with_line(service_lines(), 1, "format = 1\nimages = 2"),
-                        "i.toml: line 2, column 1: `images` is not a key of an image description, which takes `format`, `image`, `limits`, `keys`, `root`, `setup`, `process`, `pool`, `rows`")
+                        "i.toml: line 2, column 1: `images` is not a key of an image description, which takes `format`, `image`, `limits`, `keys`, `root`, `system`, `setup`, `process`, `pool`, `rows`")
 
     // Build keys: each one the board's, its value one of the key's; a board
     // with none takes none.
@@ -641,4 +641,29 @@ func main() {
     assert(small.equals("i.toml: line 24, column 12: `GPIO.out_sel[41]` is 4 bytes at 0x600045f8, and a part is a naturally aligned power of two of at least 8 bytes, this board's grain"), "a part under the grain: {small}")
     let fine = try! ImageFile.parse(one, "i.toml", &b, 4)
     let _ = try! bind(&fine, &b, &decls, 4)
+
+    // `[system]`: the default System rights of a process whose declaration
+    // names none. With no table, the launch convention's four; a stated list,
+    // exactly it; an empty one, none.
+    assert(image.system_rights.join(" | ").equals("debug | process-self | clock-get | transfer"),
+           "no [system]: the four")
+    let stated = try! ImageFile.parse(with_line(box_lines(), 7, "package = \"stock\"\n[system]\nrights = [\"process-self\", \"debug\"]"),
+                                      "i.toml", &b, 4)
+    assert(stated.system_rights.join(" | ").equals("process-self | debug"), "a stated default")
+    let none = try! ImageFile.parse(with_line(box_lines(), 7, "package = \"stock\"\n[system]\nrights = []"),
+                                    "i.toml", &b, 4)
+    assert(none.system_rights.len() == 0, "an empty default")
+    let bare = try! ImageFile.parse(with_line(box_lines(), 7, "package = \"stock\"\n[system]"),
+                                    "i.toml", &b, 4)
+    assert(bare.system_rights.len() == 4, "[system] with no `rights`: the four")
+    // The ceiling holds an image's default as it holds a declaration's.
+    expect_read_refusal(with_line(box_lines(), 7, "package = \"stock\"\n[system]\nrights = [\"debug\", \"shutdown\"]"),
+                        "i.toml: line 9, column 20: `rights` in [system] names `shutdown`, which an image may not name: a process's System record keeps at most `debug`, `process-self`, `clock-get` and `transfer`, and any other System right is its launcher's to give")
+    expect_read_refusal(with_line(box_lines(), 7, "package = \"stock\"\n[system]\nrights = [\"debug\", \"debug\"]"),
+                        "i.toml: line 9, column 20: `debug` is in `rights` twice")
+    expect_read_refusal(with_line(box_lines(), 7, "package = \"stock\"\n[system]\nkeep = [\"debug\"]"),
+                        "i.toml: line 9, column 1: `keep` is not a key of [system], which takes `rights`")
+    // A hand-written root gives its own System handles.
+    expect_read_refusal(with_line(service_lines(), 7, "package = \"sawos:tests/uart-service\"\n[system]\nrights = [\"debug\"]"),
+                        "i.toml: line 8, column 2: [system] is the stock root's: a hand-written root gives its own System handles")
 }

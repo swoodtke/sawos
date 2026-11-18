@@ -2368,9 +2368,9 @@ names its clients through the sender handle (§2.1), which asks no System right.
 - **The right.** `root_system_rights()` carries `SystemRight.ProcessObserve`:
   root is the machine's first observer, and a right not minted at boot could
   never appear later (§3). A launcher gives it or withholds it in the keep mask
-  it builds a child's System sibling with; §12's convention mask
-  (`Debug | ProcessSelf | ClockGet | Transfer`) withholds it, so a process
-  holds it only if a holder of the right gave it on.
+  it builds a child's System sibling with; §12's convention, whose mask is
+  at most `Debug | ProcessSelf | ClockGet | Transfer`, withholds it, so a
+  process holds it only if a holder of the right gave it on.
 
 ### 2.9 Quotas
 
@@ -4771,7 +4771,8 @@ reserved.
   (`root/`), the builder also writes the module `imageplan`, in the types of
   `bootplan`: for each child, the tags of its image and destination rows, its
   quota rows, the records to give it (each with its tag, its source, and for a
-  carve the offset and length), the tag it is started with and its exit policy;
+  carve the offset and length), the System rights its System record keeps, by
+  name, the tag it is started with and its exit policy;
   the connections; and the setup writes. The stock root holds no device code,
   address or line of its own: it creates every child, makes the setup writes (a
   carve of the register's grain from its device's row, mapped, written, unmapped
@@ -4893,21 +4894,23 @@ reserved.
     than a reserved tag value, because zero is a legitimate tag (root's region
     ordinals start there).
 - **A child bootstraps exactly as root does.** A launcher mints a masked
-  sibling of its own System handle (§3's `MINT_OP`) — a keep mask naming
-  `Debug | ProcessSelf | ClockGet | Transfer` and nothing else — gives the
-  sibling under a tag, and starts the child naming that tag. The child then
-  does what root does at boot: adopt the System handle in its first argument
-  register, derive its own Process object from it, drain its boot set from
-  there. So the kernel has one way in for every process, which is the same
-  claim loader-above-boot makes about images, and the differences between root
-  and a child are entirely in rights: the masked System handle it is given,
-  and the rights ceilings it inherits and its launcher may narrow before or
-  after `start` (§2.7). The launcher keeps the child's
-  Process handle, so it supervises (`get_status`, the death wait and `kill`,
-  §8) while the child manages itself. What the mask
-  withholds is enforced at run time by the ordinary rights check — a child
-  that asks to `shutdown` is `AccessDenied` and dies, and the machine keeps
-  running.
+  sibling of its own System handle (§3's `MINT_OP`), gives it under a tag with
+  a keep mask naming the rights the child's declaration names, or its image's
+  default, at most `Debug | ProcessSelf | ClockGet | Transfer` (the launch
+  convention, below), and starts the child naming that tag. The sibling keeps
+  `Transfer` until the give, which checks it; the give's mask decides whether
+  the child does. The child then does what root does at boot: adopt the
+  System handle in its first argument register, derive its own Process
+  object from it, drain its boot set from there. So the kernel has one way in
+  for every process, which is the same claim loader-above-boot makes about
+  images, and the differences between root and a child are entirely in
+  rights: the masked System handle it is given, and the rights ceilings it
+  inherits and its launcher may narrow before or after `start` (§2.7). The
+  launcher keeps the child's Process handle, so it supervises (`get_status`,
+  the death wait and `kill`, §8) while the child manages itself. What the
+  mask withholds is enforced at run time by the ordinary rights check — a
+  child that asks to `shutdown`, or prints without `Debug`, is
+  `AccessDenied` and dies, and the machine keeps running.
 - **What a launcher furnishes reaches hardware.** `give(iomemory:)` hands a
   child a device's window, over the `Transfer` bit `iomemory_rights()` mints,
   and `give(interrupt:)` hands it the device's line, a bound Interrupt (§2.8),
@@ -4926,10 +4929,17 @@ reserved.
   It sets the declared quota rows before any give (§2.7, `QuotaSet`). It
   gives windows, lines and endpoints as capabilities: a client gets an inlet
   minted with `Post | Transfer`, a server the outlet. It starts the child
-  with its System record's tag, a sibling masked with `Debug | ProcessSelf |
-  ClockGet | Transfer`, and keeps the child's Process handle. A child that
-  knows its records by tag drains them all at once (`sos.BootSet`) and takes
-  each by its tag.
+  with its System record's tag, a sibling masked with the System rights the
+  record names (`rights`, by `SystemRight`'s names: `debug`, `process-self`,
+  `clock-get`, `transfer`), and keeps the child's Process handle. A record
+  that names none keeps the image's default, the `rights` of its image
+  description's `[system]`, and all four when the image states none; an
+  empty list, in either place, keeps none. Those four are the ceiling: every
+  right a declaration or an image may name, so an image narrows the default
+  and never widens it, and the image builder refuses any other right by
+  name. `Shutdown`, process creation and the rest are the launcher's own to
+  give, never a declaration's or an image's. A child that knows its records
+  by tag drains them all at once (`sos.BootSet`) and takes each by its tag.
 - **v1 protocol conventions** (userspace convention, not kernel surface): a
   launched process receives one bootstrap pipe handle at launch; its first
   messages request its initial handle set from the launcher (name-service

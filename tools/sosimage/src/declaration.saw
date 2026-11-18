@@ -6,6 +6,12 @@
 //!     ram = "fast"                       optional: it needs fast memory
 //!
 //!     [[boot]]                           in the order the launcher gives them
+//!     name = "system"
+//!     kind = "system"
+//!     tag = 1
+//!     rights = ["debug", "clock-get"]    optional
+//!
+//!     [[boot]]
 //!     name = "uart"
 //!     kind = "window"                    system, window, line, serve, client
 //!     type = "esp32s3-uart"              or memory
@@ -19,15 +25,25 @@
 //!     inputs = ["uartpins", "uartconfig"]
 //!     defaults = { uartconfig = "config/default.saw" }
 //!
-//! By kind, a record also has: `system`, nothing (exactly one, whose tag is
-//! the start tag); `window`, `type` and an optional `part = true` (a register
-//! range of the device will do, and the image names it); `line`, `type`;
-//! `serve` and `client`, `protocol`, the protocol package's name; `memory`,
-//! nothing (the image binds it to a pool). A path is relative to the
-//! package's directory.
+//! By kind, a record also has: `system`, an optional `rights` (exactly one
+//! record, whose tag is the start tag); `window`, `type` and an optional
+//! `part = true` (a register range of the device will do, and the image names
+//! it); `line`, `type`; `serve` and `client`, `protocol`, the protocol
+//! package's name; `memory`, nothing (the image binds it to a pool). A path is
+//! relative to the package's directory.
+//!
+//! A `system` record's `rights` names the `SystemRight`s its System handle
+//! keeps, each by its name in kebab case, and the process gets exactly those:
+//! an empty list gives it none. A record with no `rights` gets the image's
+//! default (`sosimage.imagefile`'s `[system]`), which is the launch
+//! convention's four (spec §12) when the image states none: `debug`,
+//! `process-self`, `clock-get` and `transfer`. Those four are also every
+//! right a declaration or an image may name, since any other System right is
+//! the launcher's to give.
 //!
 //! Beyond the rules of `sosimage.rules`, a declaration is refused by name
-//! for: a `count` on a record (the list form, reserved); a tag given twice;
+//! for: a `count` on a record (the list form, reserved); a right in `rights`
+//! that is not one of the four, or one named twice; a tag given twice;
 //! not exactly one `system` record; a name given twice within its family
 //! (device needs; endpoints, a serve and a client sharing one set of names;
 //! memory), where a window and a line of one type under one name are one
@@ -124,6 +140,9 @@ public struct Declaration {
     /// `ram = "fast"`.
     fast: Bool
     records: Vector<BootRecord>
+    /// The rights its `system` record names; none when it has no `rights`,
+    /// and the image's default applies (`system_rights_or`).
+    system_rights: Vector<String>?
     quota: Vector<NamedCount>
     inputs: Vector<String>
     inputs_at: TomlPosition
@@ -148,6 +167,33 @@ public func input_lines(d: &Declaration) -> Vector<String> {
 /// Whether a record is a device need: a window or a line.
 public func is_need(kind: RecordKind) -> Bool {
     kind == RecordKind.Window || kind == RecordKind.Line
+}
+
+/// The System rights a declaration or an image may name, as they name them,
+/// in the launch convention's order: every right the stock root gives a
+/// process, and what one keeps when neither its declaration nor its image
+/// names any.
+public func child_rights() -> Vector<String> {
+    ["debug", "process-self", "clock-get", "transfer"]
+}
+
+/// The list `rights` in `t`, each one of `child_rights()`; `place` says
+/// where the key is for a refusal (empty, or ` in [TABLE]`) and `owner` what
+/// states it.
+public func read_rights(t: &TomlTable, file: String, place: String,
+                        owner: String) -> Result<Vector<String>, BuildError> {
+    let allowed = child_rights()
+    let rights = try name_list(&t, "rights", file, "a System right's name")
+    var i = 0
+    while i < rights.len() {
+        let name = rights.get(i) ?? ""
+        if not holds(&allowed, name) {
+            return refused(file, element_at(&t, "rights", i),
+                           "`rights`{place} names `{name}`, which {owner} may not name: a process's System record keeps at most `debug`, `process-self`, `clock-get` and `transfer`, and any other System right is its launcher's to give")
+        }
+        i = i + 1
+    }
+    return move rights
 }
 
 /// The family a record's name is unique in.
@@ -192,11 +238,16 @@ extension Declaration {
             return toml_refused(file, error)
         }
         var records = Vector<BootRecord>()
+        var system_rights: Vector<String>? = None
         if let boot = root.array("boot") {
             var i = 0
             while i < boot.len() {
                 if let r = boot.table(i) {
-                    try! records.push(try read_record(&r, file))
+                    let record = try read_record(&r, file)
+                    if record.kind == RecordKind.System && r.contains("rights") {
+                        system_rights = try read_rights(&r, file, "", "a process's declaration")
+                    }
+                    try! records.push(record)
                 } else {
                     return refused(file, boot.position(i) ?? boot.defined_at(),
                                    "`boot` is an array of tables: write each record as [[boot]]")
@@ -260,9 +311,19 @@ extension Declaration {
 
         let dir = Path(s: file).parent()?.as_string() ?? "."
         return Declaration(file: file, dir: dir, arena: arena, arena_at: where_is(&root, "arena"), fast: fast,
-                           records: move records, quota: move quota,
+                           records: move records, system_rights: move system_rights,
+                           quota: move quota,
                            inputs: move inputs, inputs_at: inputs_at,
                            defaults: move defaults)
+    }
+
+    /// The rights its System record keeps: those it names, or the image's
+    /// default, `image_default`, when it names none.
+    public func system_rights_or(&self, image_default: &Vector<String>) -> Vector<String> {
+        match self.system_rights {
+            case Some(own) -> own.copy(),
+            case None -> image_default.copy()
+        }
     }
 
     /// The handles the process holds when it starts: one per record, its
@@ -424,6 +485,7 @@ func read_record(r: &TomlTable, file: String) -> Result<BootRecord, BuildError> 
         case Line -> ["name", "kind", "tag", "type"],
         case Serve -> ["name", "kind", "tag", "protocol"],
         case Client -> ["name", "kind", "tag", "protocol"],
+        case System -> ["name", "kind", "tag", "rights"],
         case _ -> ["name", "kind", "tag"]
     }
     try only_keys(&r, &known, file, what)

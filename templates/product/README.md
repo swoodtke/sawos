@@ -45,6 +45,19 @@ and their values are listed in its `board.toml` in the sawos tree
 its default, on the ESP32-S3 the clock the ROM left (`rom`) and the console
 uncounted (`stall = "off"`).
 
+A process's System handle keeps the rights its `process.toml` names in its
+`system` record's `rights`. One that names none keeps its image's default,
+which an image whose root is the stock root may state in `[system]`:
+
+```toml
+[system]
+rights = ["process-self", "clock-get", "transfer"]
+```
+
+With no `[system]`, the default is all four rights a process may hold
+(`debug`, `process-self`, `clock-get`, `transfer`); a process without
+`debug` cannot print.
+
 `tools/sawos.py` needs Python 3.11 or later. It links `.sawos` to the sawos
 tree and runs that tree's `tools/product.py`, which says what each command
 does. The tree is the one `SAWOS_ROOT` names, or else the pinned commit,

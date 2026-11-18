@@ -15,6 +15,9 @@
 //!     [root]
 //!     package = "stock"                  or a hand-written root's package
 //!
+//!     [system]                           optional, the stock root's
+//!     rights = ["debug", "process-self"] its processes' default System rights
+//!
 //!     [[setup]]                          the stock root's, in file order
 //!     register = "SYSTEM.PERIP_CLK_EN0"  a register or one array element
 //!     set = 0x800                        or `clear`, or `write`: 32 bits
@@ -44,6 +47,12 @@
 //! package is `sawos:` and a path in the sawos tree, or a path from the
 //! product's root.
 //!
+//! `[system]` states the System rights a stock root's process keeps when its
+//! declaration's `system` record names no `rights` (`sosimage.declaration`),
+//! by the same names and held to the same ceiling, `child_rights()`: an image
+//! narrows the launch convention's four and never widens them. An empty list
+//! gives such a process none; with no `[system]` it keeps the four.
+//!
 //! `[keys]` chooses the kernel's keyed modules: each key it states is one of
 //! the board's build keys (`sosimage.board`), and its value names the
 //! directory the key's module is compiled from, the module's path with the
@@ -54,7 +63,9 @@
 //! Reading (`ImageFile.read`) holds the image to the rules of
 //! `sosimage.rules` and to its board: a process name given twice, or twice
 //! but for case, or `root` in any case; a pool name given twice; a reference outside its grammar; a `[[setup]]` or
-//! `[rows]` reference naming what the board does not have; a list where one
+//! `[rows]` reference naming what the board does not have; `[system]` for a
+//! hand-written root, and a right in it outside the ceiling or named twice;
+//! a list where one
 //! value goes (the list forms, reserved); a RAM name that is reserved or not
 //! a process range of the board; a package or an input that is not a path
 //! (`check_path`); a pool length the board's word cannot hold; a pool bound
@@ -68,7 +79,8 @@
 import toml.{TomlKind, TomlPosition, TomlTable}
 import sosimage.board.{Board, LimitsSpec, NamedCount, RefUse, Window, expect_table,
                        quota_keys, read_counts, require_table}
-import sosimage.declaration.{BootRecord, Declaration, RecordKind, kind_word}
+import sosimage.declaration.{BootRecord, Declaration, RecordKind, child_rights, kind_word,
+                             read_rights}
 import sosimage.failure.{BuildError}
 import sosimage.hex.{hex}
 import sosimage.layout.{choose_range}
@@ -163,6 +175,9 @@ public struct ImageFile {
     stock: Bool
     root_package: String
     root_at: TomlPosition
+    /// The System rights a stock root's process keeps when its declaration
+    /// names none: `[system]`'s `rights`, else `child_rights()`.
+    system_rights: Vector<String>
     setup: Vector<SetupEntry>
     processes: Vector<ProcessEntry>
     devices: Vector<NeedRef>
@@ -211,7 +226,7 @@ extension ImageFile {
     public static func read(root: &TomlTable, file: String, board: &Board,
                             grain: UInt64) -> Result<ImageFile, BuildError> {
         let top_keys: Vector<String> = ["format", "image", "limits", "keys", "root",
-                                        "setup", "process", "pool", "rows"]
+                                        "system", "setup", "process", "pool", "rows"]
         try only_keys(&root, &top_keys, file, "an image description")
         try check_format(&root, file)
 
@@ -260,6 +275,20 @@ extension ImageFile {
         }
         let stock = root_package.equals("stock")
         let root_at = where_is(&root, "root")
+
+        var system_rights = child_rights()
+        try expect_table(&root, "system", file)
+        if let t = root.table("system") {
+            if not stock {
+                return refused(file, t.defined_at(),
+                               "[system] is the stock root's: a hand-written root gives its own System handles")
+            }
+            let system_keys: Vector<String> = ["rights"]
+            try only_keys(&t, &system_keys, file, "[system]")
+            if t.contains("rights") {
+                system_rights = try read_rights(&t, file, " in [system]", "an image")
+            }
+        }
 
         var setup = Vector<SetupEntry>()
         if root.contains("setup") {
@@ -416,6 +445,7 @@ extension ImageFile {
                          has_limits: has_limits, limits: move limits, keys: move keys,
                          stock: stock,
                          root_package: root_package, root_at: root_at,
+                         system_rights: move system_rights,
                          setup: move setup, processes: parts.processes.copy(),
                          devices: parts.devices.copy(), inputs: parts.inputs.copy(),
                          clients: parts.clients.copy(),

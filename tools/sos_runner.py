@@ -1862,14 +1862,23 @@ def _stock_stop(name, plan, says, status=EXIT_ROOT_STOPPED, **keys):
     return case
 
 
-def _stock_system(name):
+# Every right of `SystemRight`, in the order `tests/stockkit` prints them.
+_SYSTEM_RIGHTS = ("Transfer", "Mint", "Debug", "Shutdown", "ClockGet",
+                  "ProcessCreate", "ProcessSelf", "SlabDonate", "TierGet",
+                  "StatsRegionMap", "InterruptBind", "ProcessObserve")
+
+# The launch convention's mask: what a child whose declaration names no
+# rights keeps.
+_CHILD_SYSTEM = ("Transfer", "Debug", "ClockGet", "ProcessSelf")
+
+
+def _stock_system(name, held=_CHILD_SYSTEM):
     """What a child of a stock root prints of the System handle it was
-    started with: every right of `SystemRight`, held by the launch
-    convention's mask or withheld (`tests/stockkit`)."""
-    return (f"SOS {name}: its System: Transfer yes, Mint no, Debug yes, "
-            "Shutdown no, ClockGet yes, ProcessCreate no, ProcessSelf yes, "
-            "SlabDonate no, TierGet no, StatsRegionMap no, InterruptBind no, "
-            "ProcessObserve no")
+    started with: every right of `SystemRight`, held (`held`, by default the
+    launch convention's mask) or withheld (`tests/stockkit`)."""
+    rights = ", ".join(f"{right} {'yes' if right in held else 'no'}"
+                       for right in _SYSTEM_RIGHTS)
+    return f"SOS {name}: its System: {rights}"
 
 
 # What a stock root's client prints of the inlet it was given: every right of
@@ -8645,6 +8654,32 @@ TEST_CASES = [
                               "past MAX_HANDLES (32)",
         "expect_out": [],
         "expect_clean_exit": False,
+    },
+
+    # Three processes whose System rights come from their declarations or,
+    # for one that names none, from the image's `[system]` default, the launch
+    # convention's four less `transfer` (`tests/images/stock_rights.toml`).
+    # `narrow` names `debug` and `process-self`, and its handle has those two
+    # and no other right: its own set, not the image's. `mute` names the
+    # convention's rights but `debug`: its first print is the kernel's
+    # `AccessDenied` fault, and root reports its end as that fault, `Faulted`
+    # (2) << 16 | `AccessDenied` (3). `plain` names none, and its handle has
+    # the image's default and no other right.
+    {
+        "name": "stock_rights",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_rights.toml"},
+        "expect_out": ["{banner}",
+                       _stock_system("narrow", held=("Debug", "ProcessSelf")),
+                       "SOS: process fault: access denied process={two}",
+                       _stock_system("plain",
+                                     held=("Debug", "ProcessSelf", "ClockGet")),
+                       "root: narrow ended status=65536",
+                       "root: plain ended status=65536",
+                       "root: mute ended status=131075"],
+        "expect_tail": "root: mute ended status=131075",
+        "expect_clean_exit": True,
     },
 
     # Two processes taking the RTC whole (`tests/images/stock_takers.toml`):

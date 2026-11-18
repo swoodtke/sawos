@@ -14,7 +14,8 @@
 //!              for a `set` or a `clear`), unmap it and release both;
 //!   quota      set each child's declared quota rows;
 //!   give       give each child its records under their tags, in its declared
-//!              order: a System sibling, a row or a sibling of one, a carve of
+//!              order: a System sibling keeping the rights the plan names
+//!              for the child, a row or a sibling of one, a carve of
 //!              one, an interrupt line it binds, a connection's server end or
 //!              an inlet minted from it;
 //!   start      start every child with its System record's tag;
@@ -38,7 +39,7 @@
 import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet,
             WaitResult, BootSet, BootHandle, SosStatus, SystemRight,
             PipeInletRight, QuotaKind}
-import bootplan.{Plan, Child, Record, Source, Setup, SetupOp, QuotaName,
+import bootplan.{Plan, Child, Record, Source, Setup, SetupOp, QuotaName, RightName,
                  setup_word, reads_first}
 import imageplan
 
@@ -47,12 +48,6 @@ static EXIT_OK: UInt = 0
 /// The machine's status when a step fails, or a `shutdown` child ends other
 /// than by exiting.
 static EXIT_STOPPED: UInt = 1
-
-/// A child's System handle: print, learn its own Process object, read the
-/// clock, and the bit `give` checks on the thing given. A System right added
-/// later is withheld by silence.
-static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
-                               | SystemRight.ClockGet | SystemRight.Transfer)
 
 /// A client's inlet: it may post and hand the end on.
 static CLIENT_INLET: UInt32 = (PipeInletRight.Post | PipeInletRight.Transfer)
@@ -127,10 +122,11 @@ func run(system: &System, plan: &Plan) -> Result<UInt, Stop> {
                 try set_quota(&child, &c) catch {
                     return stop("quota", c.name, error)
                 }
+                let keep = system_mask(&c)
                 var r = 0
                 while r < c.records.len() {
                     borrow let record = c.records[r] {
-                        try give(&system, &proc, &child, &var rows, &var ends, &record) catch {
+                        try give(&system, &proc, &child, &var rows, &var ends, &record, keep) catch {
                             return stop("give", "{c.name} record {record.tag}", error)
                         }
                     }
@@ -293,6 +289,28 @@ func set_quota(child: &Process, c: &Child) -> Result<Void, SosStatus> {
     return
 }
 
+/// `sos`'s bit for a plan's System right.
+func system_right(name: RightName) -> UInt32 {
+    match name {
+        case Debug -> SystemRight.Debug as UInt32,
+        case ProcessSelf -> SystemRight.ProcessSelf as UInt32,
+        case ClockGet -> SystemRight.ClockGet as UInt32,
+        case Transfer -> SystemRight.Transfer as UInt32
+    }
+}
+
+/// The keep mask of a child's System sibling: the rights its plan names and
+/// none other, so a System right the plan cannot name is withheld.
+func system_mask(c: &Child) -> UInt32 {
+    var keep: UInt32 = 0
+    var k = 0
+    while k < c.rights.len() {
+        keep = keep | system_right(c.rights.get(k)!)
+        k = k + 1
+    }
+    keep
+}
+
 /// A connection's two ends, while root holds them: made at the first record
 /// that needs one, the server end given to the server, and an inlet minted
 /// from root's for each client.
@@ -315,13 +333,16 @@ func connection(proc: &Process, ends: &var Vector<Ends>, index: Int) -> Result<V
     return
 }
 
-/// One record, made as its source says and given under its tag.
+/// One record, made as its source says and given under its tag; a System
+/// record keeps the rights in `keep`.
 func give(system: &System, proc: &Process, child: &Process, rows: &var Rows,
-          ends: &var Vector<Ends>, r: &Record) -> Result<Void, SosStatus> {
+          ends: &var Vector<Ends>, r: &Record, keep: UInt32) -> Result<Void, SosStatus> {
     match r.source {
         case System -> {
-            let sibling = try system.mint(rights: CHILD_SYSTEM)
-            try child.give(system: move sibling, tag: r.tag) catch { return error.0 }
+            // The give checks `Transfer` on the sibling, and its own keep mask
+            // is what the child receives.
+            let sibling = try system.mint(rights: keep | (SystemRight.Transfer as UInt32))
+            try child.give(system: move sibling, tag: r.tag, keep: keep) catch { return error.0 }
         },
         case Row -> {
             let k = rows.find(r.from)

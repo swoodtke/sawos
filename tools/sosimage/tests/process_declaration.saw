@@ -218,4 +218,31 @@ func main() {
                   "p.toml: line 2, column 1: `arena` is 0x100000000, past what the 32-bit word of the board b holds (0xffffffff)")
     check_refusal(listed.replace("tag = 4", "tag = 0x1_0000_0000"),
                   "p.toml: line 22, column 1: the tag of `gpio` is 0x100000000, past what the 32-bit word of the board b holds (0xffffffff)")
+
+    // The System record's rights: the image's default when it names none,
+    // exactly those it names otherwise, and none for an empty list.
+    let image_default: Vector<String> = ["clock-get"]
+    assert(d.system_rights.is_none(), "no `rights`: none named")
+    assert(d.system_rights_or(&image_default).join(" | ").equals("clock-get"),
+           "no `rights`: the image's default")
+    let named = try! Declaration.parse(with_line(7, "tag = 1\nrights = [\"process-self\", \"debug\"]"),
+                                       "p.toml")
+    assert(named.system_rights_or(&image_default).join(" | ").equals("process-self | debug"),
+           "the rights it names, over the image's default")
+    let each = try! Declaration.parse(with_line(7, "tag = 1\nrights = [\"debug\", \"process-self\", \"clock-get\", \"transfer\"]"),
+                                      "p.toml")
+    assert(each.system_rights_or(&image_default).len() == 4, "each of the four")
+    let empty = try! Declaration.parse(with_line(7, "tag = 1\nrights = []"), "p.toml")
+    assert(empty.system_rights_or(&image_default).len() == 0, "an empty list: none")
+    // A right the launcher keeps, by name, wherever it stands in the list.
+    expect_refusal(with_line(7, "tag = 1\nrights = [\"debug\", \"shutdown\"]"),
+                   "p.toml: line 8, column 20: `rights` names `shutdown`, which a process's declaration may not name: a process's System record keeps at most `debug`, `process-self`, `clock-get` and `transfer`, and any other System right is its launcher's to give")
+    expect_refusal(with_line(7, "tag = 1\nrights = [\"process-create\"]"),
+                   "p.toml: line 8, column 11: `rights` names `process-create`, which a process's declaration may not name: a process's System record keeps at most `debug`, `process-self`, `clock-get` and `transfer`, and any other System right is its launcher's to give")
+    expect_refusal(with_line(7, "tag = 1\nrights = [\"Debug\"]"),
+                   "p.toml: line 8, column 11: `rights` names `Debug`, which a process's declaration may not name: a process's System record keeps at most `debug`, `process-self`, `clock-get` and `transfer`, and any other System right is its launcher's to give")
+    expect_refusal(with_line(7, "tag = 1\nrights = [\"debug\", \"debug\"]"),
+                   "p.toml: line 8, column 20: `debug` is in `rights` twice")
+    expect_refusal(with_line(12, "tag = 2\nrights = [\"debug\"]"),
+                   "p.toml: line 13, column 1: `rights` is not a key of a [[boot]] record of kind window, which takes `name`, `kind`, `tag`, `type`, `part`")
 }
