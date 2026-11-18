@@ -1,0 +1,274 @@
+//! A `uartproto` client that prints through its connection: it writes, syncs,
+//! reads and ends, whichever driver serves it.
+//!
+//! Every line it prints goes through the driver as a `Write`, so the console
+//! shows the client's text exactly when the driver wrote it. Where the console
+//! driver and a UART driver behave the same, the client prints the same line;
+//! the one place they differ is a `Read`, and the line it prints there says
+//! which. The script holds each request's answer:
+//!
+//! - a `Mark`, a `Write` sent as a call and each `Sync`, answered `Ok`;
+//! - a burst of `BURST` writes with no call among them, more than the
+//!   connection's ring holds, which its transport carries by waiting for the
+//!   driver;
+//! - `Write`s of no payload and of a full one, and a line split over two;
+//! - a `Read`, posted, then a `Sync`. A connection is served in order, so once
+//!   the `Sync` is answered the driver has served the `Read`. A claim answered
+//!   by then was answered at once: `Unsupported` from a device with no input,
+//!   or `Ok` and a byte from a driver with input already buffered, which this
+//!   script has none to expect, so it stops there. A claim still pending is
+//!   held by a driver whose device has input and none to give: against it
+//!   three more reads are held, a fifth is answered `Busy`, and the four are
+//!   dropped. No timer orders any of it;
+//! - each request the protocol refuses, answered `BadOp`;
+//! - a `Sync` carrying `PIPE_MSG_HANDLES` handles, answered `Ok`;
+//! - a write with the client's handle table at its quota, so the post that
+//!   would tell it has no room for its claim and its transport calls instead.
+//!
+//! The protocol's requests go through `Uart`; what only a pipe does (a post
+//! whose claim is kept, a request carrying handles) goes through its
+//! transport's inlet. A different answer is printed through the client's own
+//! System handle, and the client exits with `EXIT_FAILED`.
+
+import sos.{System, Process, BootSet, PipeHandles, SosStatus}
+import uartproto.{Frame, MAX_PAYLOAD, PAYLOAD_BYTE, Uart, UartBody, UartError,
+                  UartOp, empty_reply, read_reply}
+import uartpipe.{PipeTransport, uart}
+
+/// The client end of the driver's connection, as `process.toml` declares it.
+static TAG_UART: UInt = 2
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no honest path of the script produces: an answer the script did
+/// not want, which it has printed.
+static MISMATCH: SosStatus = SosStatus.BadImage
+
+/// How many reads a UART driver holds at once: its `MAX_HELD`.
+static HELD: Int = 4
+
+static_assert(HELD == 4, "`read` holds its reads written out at this count")
+
+/// The connection, and the process that holds it.
+struct Client {
+    proc: Process
+    u: Uart<PipeTransport>
+    /// A body for the requests the client builds by hand.
+    body: UartBody
+}
+
+extension Client: NoCopy {}
+
+/// `r` is `Ok`; otherwise what it is, printed.
+func ok<V>(step: String, r: Result<V, UartError>) -> Result<V, SosStatus> {
+    let v = try r catch {
+        print("SOS uartclient: {}: {}", step, error)
+        return MISMATCH
+    }
+    return move v
+}
+
+/// `e` is the error `want`; otherwise what it is, printed.
+func is_want(step: String, e: UartError, want: UartError) -> Result<Void, SosStatus> {
+    if e != want {
+        print("SOS uartclient: {}: {}, wanted {}", step, e, want)
+        return MISMATCH
+    }
+    return
+}
+
+// `refused` and `read_refused` are two functions, not one generic: esp-clang
+// 20.1.1 crashes building that for the ESP32-S3.
+
+/// `r` is the error `want`; an answer, or another error, is printed.
+func refused(step: String, r: Result<Void, UartError>,
+             want: UartError) -> Result<Void, SosStatus> {
+    try r catch { return is_want(step, error, want) }
+    print("SOS uartclient: {}: answered, wanted {}", step, want)
+    return MISMATCH
+}
+
+/// `r`, a read's answer, is the error `want`; a byte, or another error, is
+/// printed.
+func read_refused(step: String, r: Result<UInt8, UartError>,
+                  want: UartError) -> Result<Void, SosStatus> {
+    let b = try r catch { return is_want(step, error, want) }
+    print("SOS uartclient: {}: answered {}, wanted {}", step, b, want)
+    return MISMATCH
+}
+
+extension Client {
+    /// Writes `line` through the driver, as a tell.
+    func say(&var self, line: String) -> Result<Void, SosStatus> {
+        ok("write", self.u.write(line))
+    }
+
+    /// Tells the driver `n` bytes of the hand-built body.
+    func tell(&var self, n: UInt) -> Result<Void, SosStatus> {
+        ok("tell", self.u.transport.tell(&self.body.bytes, n))
+    }
+}
+
+/// How many writes the burst makes: well past the ring's `PIPE_INFLIGHT`.
+static BURST: Int = 40
+
+/// One line in `BURST` writes, with no call among them: its opening, a byte
+/// at a time, and its end.
+func burst(c: &var Client) -> Result<Void, SosStatus> {
+    try c.say("SOS uartclient: a burst of 40 writes: ")
+    var i = 2
+    while i < BURST {
+        try ok("burst", c.u.write_byte(0x2B))
+        i = i + 1
+    }
+    try c.say("\n")
+    return
+}
+
+/// Writes of no payload and of a full one, and a line split over two.
+func writes(c: &var Client) -> Result<Void, SosStatus> {
+    try c.say("SOS uartclient: a line written through uartproto\n")
+    try c.say("")
+    // A full payload: the prefix, dots, and the newline as its last byte.
+    let head = c.body.text(UartOp.Write, "SOS uartclient: a full write ")
+    var at = PAYLOAD_BYTE + (head as Int) - 1
+    while at < MAX_PAYLOAD {
+        c.body.bytes[at] = 0x2E
+        at = at + 1
+    }
+    c.body.bytes[MAX_PAYLOAD] = 0x0A
+    try c.tell((MAX_PAYLOAD + 1) as UInt)
+    try c.say("SOS uartclient: one line in ")
+    try c.say("two writes\n")
+    try ok("write as a call", c.u.write_now("SOS uartclient: a write sent as a call\n"))
+    try ok("sync", c.u.sync())
+    try c.say("SOS uartclient: sync answered Ok\n")
+    return
+}
+
+/// A `Read`, answered at once or held, told apart by a `Sync`. Against a
+/// driver that holds it, three more are held and a fifth is answered `Busy`.
+func read(c: &var Client) -> Result<Void, SosStatus> {
+    let n = c.body.bare(UartOp.Read)
+    let claim = try c.u.transport.inlet.post(body: &c.body.bytes, len: n)
+    try ok("sync after read", c.u.sync())
+    let answered = try claim.ready() catch {
+        print("SOS uartclient: read: {}", error)
+        return MISMATCH
+    }
+    if not answered {
+        let second = try c.u.transport.inlet.post(body: &c.body.bytes, len: n)
+        let third = try c.u.transport.inlet.post(body: &c.body.bytes, len: n)
+        let fourth = try c.u.transport.inlet.post(body: &c.body.bytes, len: n)
+        try read_refused("a read past four held", c.u.read(), UartError.Busy)
+        let _ = move claim
+        let _ = move second
+        let _ = move third
+        let _ = move fourth
+        try c.say("SOS uartclient: read: held, no input yet; ")
+        try c.say("a fifth answered Busy; claims dropped\n")
+        return
+    }
+    let answer = try (move claim).resolve()
+    let reply = Frame(len: answer.len, bytes: answer.bytes)
+    let _ = move answer
+    try read_refused("read", read_reply(&reply), UartError.Unsupported)
+    try c.say("SOS uartclient: read: Unsupported, the device has no input\n")
+    return
+}
+
+/// Each request the protocol refuses: no bytes, an op that is none, and a
+/// payload where none goes.
+func refusals(c: &var Client) -> Result<Void, SosStatus> {
+    try refused("no bytes", c.u.nothing(), UartError.BadOp)
+    try c.say("SOS uartclient: a request of no bytes: BadOp\n")
+    try refused("op 0", c.u.raw(0, 0), UartError.BadOp)
+    try c.say("SOS uartclient: op 0: BadOp\n")
+    try refused("op 5", c.u.raw(5, 0), UartError.BadOp)
+    try c.say("SOS uartclient: op 5: BadOp\n")
+    try refused("op 255", c.u.raw(255, 0), UartError.BadOp)
+    try c.say("SOS uartclient: op 255: BadOp\n")
+    try refused("read carrying a byte", c.u.raw(UartOp.Read as UInt8, 1), UartError.BadOp)
+    try c.say("SOS uartclient: a read carrying a byte: BadOp\n")
+    try refused("sync carrying a byte", c.u.raw(UartOp.Sync as UInt8, 1), UartError.BadOp)
+    try c.say("SOS uartclient: a sync carrying a byte: BadOp\n")
+    try refused("mark carrying a full payload",
+                c.u.raw(UartOp.Mark as UInt8, MAX_PAYLOAD as UInt), UartError.BadOp)
+    try c.say("SOS uartclient: a mark carrying a full payload: BadOp\n")
+    return
+}
+
+/// A `Sync` carrying as many handles as a message can.
+func carrying(c: &var Client) -> Result<Void, SosStatus> {
+    var handles = PipeHandles.none()
+    var at = 0
+    while at < handles.slots() {
+        handles.put(at, event: try c.proc.event_create())
+        at = at + 1
+    }
+    let s = c.body.bare(UartOp.Sync)
+    let reply = try c.u.transport.inlet.send_with(body: &c.body.bytes, len: s,
+                                                  handles: &var handles)
+    let frame = Frame(len: reply.len, bytes: reply.bytes)
+    let _ = move reply
+    try ok("sync carrying handles", empty_reply(&frame))
+    try c.say("SOS uartclient: a sync carrying 4 handles answered Ok\n")
+    return
+}
+
+/// A write with no handle to spare: four Events fill the table to its quota,
+/// so the post that would tell the write cannot mint its claim.
+func table_full(c: &var Client) -> Result<Void, SosStatus> {
+    var held = PipeHandles.none()
+    var at = 0
+    while at < held.slots() {
+        held.put(at, event: try c.proc.event_create())
+        at = at + 1
+    }
+    try c.say("SOS uartclient: a write with no handle to spare for its claim\n")
+    let _ = move held
+    return
+}
+
+func script(c: &var Client) -> Result<Void, SosStatus> {
+    try ok("mark", c.u.mark())
+    try burst(&var c)
+    try writes(&var c)
+    try read(&var c)
+    try refusals(&var c)
+    try carrying(&var c)
+    try table_full(&var c)
+    try c.say("SOS uartclient: done\n")
+    // The last `Sync` settles every write before this process ends.
+    try ok("last sync", c.u.sync())
+    return
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch { return }
+    var set = try BootSet(process: &proc) catch {
+        print("SOS uartclient: drain: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard var record = set.take(TAG_UART) else {
+        print("SOS uartclient: no record {}", TAG_UART)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let inlet = record.take_inlet() else {
+        print("SOS uartclient: record {} is no inlet", TAG_UART)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    var c = Client(proc: move proc, u: uart(move inlet), body: UartBody.empty())
+    try script(&var c) catch {
+        print("SOS uartclient: stopped: {}", error)
+        let _ = c.proc.exit(EXIT_FAILED)
+        return
+    }
+    let _ = c.proc.exit(EXIT_OK)
+}

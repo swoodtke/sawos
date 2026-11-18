@@ -13,9 +13,11 @@
 //
 // A delivery is one of four things, each an arm of one dispatch:
 //
-//   Message      a request. `Read` is answered from the input buffer, or held;
-//                `Write` goes out the transmitter; `Sync` and `Mark` are
-//                answered empty.
+//   Message      a request. `Read` is answered from the input buffer, or held,
+//                or answered `Busy` while `MAX_HELD` are held; `Write` goes
+//                out the transmitter and is answered `Ok`; `Sync` and `Mark`
+//                are answered `Ok`; a request `uartproto` refuses is answered
+//                `BadOp`.
 //   Interrupt    the device has bytes. Drain, ack, then answer as many held
 //                reads as there are bytes for.
 //   Abandoned    a client dropped its claim on a read this driver is holding.
@@ -37,7 +39,9 @@
 import sos.{System, Process, Interrupt, Waiter, WaitResult, WaitPayload,
             PipeOutlet, PipeRequest, PipeMsg, AttachMode, ReplyWaitError,
             SosStatus, PIPE_BODY_BYTES}
-import uartproto.{UartOp, UartBody, op_of, payload_len, payload_byte}
+import uartproto.{UartOp, UartStatus, UartBody, Frame, BODY_BYTES}
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
 
 // =============================================================================
 // The board
@@ -149,11 +153,14 @@ struct InBuf {
     head: Int,
     count: Int,
     dropped: Int,
+    /// Bytes a reply that found nobody home put back at the front.
+    returned: Int,
 }
 
 extension InBuf {
     static func empty() -> InBuf {
-        InBuf(bytes: [0; INPUT_BYTES], head: 0, count: 0, dropped: 0)
+        InBuf(bytes: [0; INPUT_BYTES], head: 0, count: 0, dropped: 0,
+              returned: 0)
     }
 
     func has(&self) -> Bool { self.count > 0 }
@@ -181,6 +188,7 @@ extension InBuf {
         self.bytes[at] = b
         self.head = at
         self.count = self.count + 1
+        self.returned = self.returned + 1
     }
 
     /// The oldest byte, or zero when there is none. The caller asks `has()`
@@ -285,6 +293,7 @@ struct Report {
     messages: Int,
     abandoned: Int,
     dropped: Int,
+    returned: Int,
     window_answered: Int,
     window_discarded: Int,
     window_traps: UInt64,
@@ -328,6 +337,7 @@ func _start(boot_handle: UInt) {
     // `stats()` closed.
     print("SOS uartsvc drv: served={} abandoned={} dropped={}\n",
           done.messages, done.abandoned, done.dropped)
+    print("SOS uartsvc drv: bytes put back={}\n", done.returned)
     print("SOS uartsvc drv: after the mark answered={} discarded={} traps={}\n",
           done.window_answered, done.window_discarded, done.window_traps)
     // A wrapped binary expression is two statements in Saw, so the arithmetic
@@ -340,12 +350,11 @@ func _start(boot_handle: UInt) {
         // answers: `reply_wait` discharges the obligation and parks for the
         // next in one op.
         //
-        // A tell costs two. `Write` is post-then-drop at the client, so nothing
-        // is owed back and there is nothing to reply to; the obligation the
-        // delivery minted has to be released, and a release is a syscall. There
-        // is no cheaper spelling: `reply_wait` on an abandoned claim answers
-        // `Err(Reply(...))` without parking, so it would cost the discharge and
-        // then the `wait` anyway.
+        // A tell costs two. `Write` is post-then-drop at the client, so the
+        // `Ok` it is answered does not land: `reply_wait` on an abandoned
+        // claim answers `Err(Reply(...))` without parking, and the loop then
+        // waits afresh. The obligation is discharged either way, and there is
+        // no cheaper spelling: releasing it unanswered is a syscall too.
         //
         // The `+ 1` is the closing `stats()` read, charged at trap entry before
         // it answers.
@@ -397,6 +406,83 @@ func run(proc: &Process) -> Result<Report, SosStatus> {
     return move done
 }
 
+/// The measured window: open from the first `Mark` to the loop's end, and what
+/// the server did inside it.
+struct Window {
+    marked: Bool,
+    syscalls: UInt64,
+    answered: Int,
+    discarded: Int,
+}
+
+extension Window {
+    static func closed() -> Window {
+        Window(marked: false, syscalls: 0, answered: 0, discarded: 0)
+    }
+
+    /// Opens the window at `syscalls`, the trap count the first `Mark` read.
+    func open(&var self, syscalls: UInt64) {
+        self.marked = true
+        self.syscalls = syscalls
+    }
+
+    func answered_one(&var self) {
+        if self.marked { self.answered += 1 }
+    }
+
+    func discarded_one(&var self) {
+        if self.marked { self.discarded += 1 }
+    }
+}
+
+/// Answers `request` with `n` bytes of `body` and waits for the next delivery,
+/// in one trap when the reply lands.
+///
+/// A reply that does not land (the client dropped its claim, as a client
+/// that tells a `Write` rather than calling it has) has discharged the
+/// obligation all the same, and the loop waits afresh: one client cannot end
+/// the driver.
+func answer(request: PipeRequest, body: &UartBody, n: UInt, waiter: &Waiter,
+            window: &var Window) -> Result<WaitResult, SosStatus> {
+    var r = move request
+    let next = try (move r).reply_wait(body: &body.bytes, len: n,
+                                       waiter: &waiter) catch {
+        match error {
+            case Reply(_) -> {
+                window.discarded_one()
+                return waiter.wait()
+            },
+            case Wait(s) -> { return s },
+        }
+    }
+    window.answered_one()
+    return move next
+}
+
+/// Answers a `Read` from the buffer with `b`, as `answer` answers. A reply
+/// that does not land puts `b` back at the front of the buffer, so the next
+/// reader gets it, as `answer_held` does: a byte goes to a reader or is
+/// counted dropped, never lost.
+func answer_read(request: PipeRequest, b: UInt8, input: &var InBuf,
+                 body: &var UartBody, waiter: &Waiter,
+                 window: &var Window) -> Result<WaitResult, SosStatus> {
+    let n = body.ok_byte(b)
+    var r = move request
+    let next = try (move r).reply_wait(body: &body.bytes, len: n,
+                                       waiter: &waiter) catch {
+        match error {
+            case Reply(_) -> {
+                input.unpush(b)
+                window.discarded_one()
+                return waiter.wait()
+            },
+            case Wait(s) -> { return s },
+        }
+    }
+    window.answered_one()
+    return move next
+}
+
 /// The measured loop. One `wait` opens it, then one op per delivery.
 func serve(waiter: &Waiter, proc: &Process, uart: &Uart,
            irq: &Interrupt) -> Result<Report, SosStatus> {
@@ -407,11 +493,7 @@ func serve(waiter: &Waiter, proc: &Process, uart: &Uart,
     var messages: Int = 0
     var abandoned: Int = 0
     var order: UInt = 0
-
-    var marked = false
-    var mark_syscalls: UInt64 = 0
-    var window_answered: Int = 0
-    var window_discarded: Int = 0
+    var window = Window.closed()
 
     var wake = try waiter.wait()
     var serving = true
@@ -453,116 +535,75 @@ func serve(waiter: &Waiter, proc: &Process, uart: &Uart,
             let (_, what) = (move wake).open()
             match what {
                 case Message(m, r) -> {
-                    var msg = move m
+                    // The bytes are copied out and the message dropped, so
+                    // whatever handles it carried are released first.
+                    let frame = Frame(len: m.len, bytes: m.bytes)
+                    let _ = move m
                     var obligation = move r
-                    var op = UartOp.Sync
-                    var known = false
-                    if let named = op_of(&msg) {
-                        op = named
-                        known = true
+                    guard let op = frame.request() else {
+                        // A request the protocol refuses is answered `BadOp`
+                        // and the loop goes on: a server a client can end by
+                        // sending nonsense is not a server.
+                        let n = body.refuse(UartStatus.BadOp)
+                        wake = try answer(move obligation, &body, n, &waiter,
+                                          &var window)
+                        continue
                     }
-                    if not known {
-                        // A byte that names no op. The obligation is dropped,
-                        // which tells the client its call will never be
-                        // answered, and the loop goes on: a server a client can
-                        // end by sending nonsense is not a server.
-                        let _ = move msg
-                        let _ = move obligation
-                        if marked { window_discarded += 1 }
-                        wake = try waiter.wait()
-                    } else {
-                        match op {
-                            case Read -> {
-                                if input.has() {
-                                    let b = input.pop()
-                                    let n = body.answer(b)
-                                    let _ = move msg
-                                    if marked { window_answered += 1 }
-                                    wake = try (move obligation).reply_wait(
-                                               body: &body.bytes, len: n,
-                                               waiter: &waiter) catch {
-                                        match error {
-                                            case Reply(_) -> { return BUG },
-                                            case Wait(s) -> { return s },
-                                        }
-                                    }
+                    match op {
+                        case Read -> {
+                            if input.has() {
+                                let b = input.pop()
+                                wake = try answer_read(move obligation, b,
+                                                       &var input, &var body,
+                                                       &waiter, &var window)
+                            } else {
+                                // Hold it. The client is parked in its own
+                                // `Call`; this driver owns the obligation until
+                                // a byte exists or the client gives up, and the
+                                // one-shot attach makes the second of those a
+                                // delivery rather than a discovery.
+                                let slot = held.free_slot()
+                                if slot < 0 {
+                                    // More outstanding reads than this driver
+                                    // will hold: answered `Busy`, and the
+                                    // client may ask again.
+                                    let n = body.refuse(UartStatus.Busy)
+                                    wake = try answer(move obligation, &body, n,
+                                                      &waiter, &var window)
                                 } else {
-                                    let _ = move msg
-                                    // Hold it. The client is parked in its own
-                                    // `Call`; this driver owns the obligation
-                                    // until a byte exists or the client gives
-                                    // up, and the one-shot attach makes the
-                                    // second of those a delivery rather than a
-                                    // discovery.
-                                    let slot = held.free_slot()
-                                    if slot < 0 {
-                                        // More outstanding reads than this
-                                        // driver will hold. Dropping the
-                                        // obligation is the honest answer: the
-                                        // client's `Call` returns `PeerClosed`
-                                        // and it may ask again.
-                                        let _ = move obligation
-                                        if marked { window_discarded += 1 }
-                                    } else {
-                                        try waiter.add(request: &obligation,
-                                                       key: KEY_HELD + (slot as UInt),
-                                                       mode: AttachMode.OneShot)
-                                        held.put(at: slot,
-                                                 request: move obligation,
-                                                 order: order)
-                                        order = order + 1
-                                    }
+                                    try waiter.add(request: &obligation,
+                                                   key: KEY_HELD + (slot as UInt),
+                                                   mode: AttachMode.OneShot)
+                                    held.put(at: slot, request: move obligation,
+                                             order: order)
+                                    order = order + 1
                                     wake = try waiter.wait()
                                 }
-                            },
-                            case Write -> {
-                                write_out(&uart, &msg)
-                                let _ = move msg
-                                // A tell owes nothing back: the client posted
-                                // and dropped its claim, so this obligation is
-                                // discharged by being dropped and there is
-                                // nobody to tell.
-                                let _ = move obligation
-                                if marked { window_discarded += 1 }
-                                wake = try waiter.wait()
-                            },
-                            case Sync -> {
-                                let _ = move msg
-                                let n = body.nothing()
-                                if marked { window_answered += 1 }
-                                wake = try (move obligation).reply_wait(
-                                           body: &body.bytes, len: n,
-                                           waiter: &waiter) catch {
-                                    match error {
-                                        case Reply(_) -> { return BUG },
-                                        case Wait(s) -> { return s },
-                                    }
-                                }
-                            },
-                            case Mark -> {
-                                let _ = move msg
-                                if not marked {
-                                    let now = try proc.stats()
-                                    mark_syscalls = now.syscalls
-                                    marked = true
-                                    window_answered = 0
-                                    window_discarded = 0
-                                }
-                                // The mark is the window's first answered
-                                // message: the `reply_wait` below discharges it
-                                // and parks for the next.
-                                window_answered += 1
-                                let n = body.nothing()
-                                wake = try (move obligation).reply_wait(
-                                           body: &body.bytes, len: n,
-                                           waiter: &waiter) catch {
-                                    match error {
-                                        case Reply(_) -> { return BUG },
-                                        case Wait(s) -> { return s },
-                                    }
-                                }
-                            },
-                        }
+                            }
+                        },
+                        case Write -> {
+                            write_out(&uart, &frame)
+                            let n = body.ok()
+                            wake = try answer(move obligation, &body, n,
+                                              &waiter, &var window)
+                        },
+                        case Sync -> {
+                            let n = body.ok()
+                            wake = try answer(move obligation, &body, n,
+                                              &waiter, &var window)
+                        },
+                        case Mark -> {
+                            // The mark is the window's first answered
+                            // message: `answer` discharges it and parks for
+                            // the next.
+                            if not window.marked {
+                                let now = try proc.stats()
+                                window.open(now.syscalls)
+                            }
+                            let n = body.ok()
+                            wake = try answer(move obligation, &body, n,
+                                              &waiter, &var window)
+                        },
                     }
                 },
                 // Unreachable: `kind_of` established the tag one branch up and
@@ -574,12 +615,13 @@ func serve(waiter: &Waiter, proc: &Process, uart: &Uart,
 
     let after = try proc.stats()
     var traps: UInt64 = 0
-    if marked && after.syscalls >= mark_syscalls {
-        traps = after.syscalls - mark_syscalls
+    if window.marked && after.syscalls >= window.syscalls {
+        traps = after.syscalls - window.syscalls
     }
     return Report(messages: messages, abandoned: abandoned,
-                  dropped: input.dropped, window_answered: window_answered,
-                  window_discarded: window_discarded, window_traps: traps)
+                  dropped: input.dropped, returned: input.returned,
+                  window_answered: window.answered,
+                  window_discarded: window.discarded, window_traps: traps)
 }
 
 /// Empty the receiver into the buffer. This is the only device read in the
@@ -591,11 +633,11 @@ func drain_device(uart: &Uart, into: &var InBuf) {
 }
 
 /// Put a `Write` request's payload out the transmitter.
-func write_out(uart: &Uart, msg: &PipeMsg) {
+func write_out(uart: &Uart, frame: &Frame) {
     var i: Int = 0
-    let n = payload_len(&msg) as Int
+    let n = frame.payload_len() as Int
     while i < n {
-        uart.put_byte(payload_byte(&msg, i))
+        uart.put_byte(frame.payload_byte(i))
         i = i + 1
     }
 }
@@ -625,7 +667,7 @@ func answer_held(held: &var Pending, input: &var InBuf,
             } else {
                 guard let request = held.take(slot) else { return BUG }
                 let b = input.pop()
-                let n = body.answer(b)
+                let n = body.ok_byte(b)
                 match (move request).reply(body: &body.bytes, len: n) {
                     case Ok(_) -> {},
                     case Err(_) -> { input.unpush(b) },

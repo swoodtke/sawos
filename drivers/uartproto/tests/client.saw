@@ -1,0 +1,167 @@
+// The typed client over a fake transport: each op's request bytes, each
+// reply decoded to its value or its error, and the transport's failures
+// passed through.
+
+import uartproto.{BODY_BYTES, Frame, MAX_PAYLOAD, Uart, UartError, UartTransport,
+                  empty_reply, read_reply}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// A transport that keeps the last request it was sent and answers a call
+/// with `reply`, or fails with `fails` when it is set.
+struct Fake {
+    sent: [UInt8; BODY_BYTES],
+    sent_len: UInt,
+    calls: Int,
+    tells: Int,
+    reply: Frame,
+    fails: UartError?,
+}
+
+extension Fake: UartTransport {
+    func call(&var self, body: &[UInt8; BODY_BYTES], len: UInt) -> Result<Frame, UartError> {
+        self.sent = body
+        self.sent_len = len
+        self.calls = self.calls + 1
+        if let e = self.fails { return e }
+        return self.reply
+    }
+
+    func tell(&var self, body: &[UInt8; BODY_BYTES], len: UInt) -> Result<Void, UartError> {
+        self.sent = body
+        self.sent_len = len
+        self.tells = self.tells + 1
+        if let e = self.fails { return e }
+        return
+    }
+}
+
+/// A reply of `len` bytes: `status`, then `b`.
+func reply(len: UInt, status: UInt8, b: UInt8) -> Frame {
+    var f = Frame(len: len, bytes: [0; BODY_BYTES])
+    f.bytes[0] = status
+    f.bytes[1] = b
+    f
+}
+
+func client(answer: Frame) -> Uart<Fake> {
+    Uart.over(Fake(sent: [0; BODY_BYTES], sent_len: 0, calls: 0, tells: 0,
+                   reply: answer, fails: None))
+}
+
+func is_err<V>(r: Result<V, UartError>, want: UartError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func reads(answer: Frame, want: UartError) -> Bool {
+    var u = client(answer)
+    is_err(u.read(), want)
+}
+
+func syncs(answer: Frame, want: UartError) -> Bool {
+    var u = client(answer)
+    is_err(u.sync(), want)
+}
+
+func main() {
+    // A read: its request, its byte, and every refusal.
+    var u = client(reply(2, 0, 0x5A))
+    let b = try! u.read()
+    check(b == 0x5A, "a read answers its byte")
+    check(u.transport.sent_len == 1 && u.transport.sent[0] == 1 && u.transport.calls == 1,
+          "a read is the op alone, called")
+    check(reads(reply(1, 1, 0), UartError.BadOp), "a read refused BadOp")
+    check(reads(reply(1, 2, 0), UartError.Unsupported), "a read refused Unsupported")
+    check(reads(reply(1, 3, 0), UartError.Busy), "a read refused Busy")
+    // Malformed: no bytes, a status that is none, Ok without its byte or with
+    // one too many, a refusal with a byte.
+    check(reads(reply(0, 0, 0), UartError.Malformed), "a read answered nothing")
+    check(reads(reply(1, 4, 0), UartError.Malformed), "a read answered status 4")
+    check(reads(reply(1, 0, 0), UartError.Malformed), "a read answered Ok alone")
+    check(reads(reply(3, 0, 0), UartError.Malformed), "a read answered Ok and two")
+    check(reads(reply(2, 2, 0), UartError.Malformed), "a refusal with a byte")
+    check(reads(reply(2, 9, 0x5A), UartError.Malformed), "a byte after a status that is none")
+
+    // Sync, Mark and a Write sent as a call: Ok alone, or a refusal.
+    var s = client(reply(1, 0, 0))
+    try! s.sync()
+    check(s.transport.sent_len == 1 && s.transport.sent[0] == 3, "a sync is op 3")
+    try! s.mark()
+    check(s.transport.sent_len == 1 && s.transport.sent[0] == 4, "a mark is op 4")
+    try! s.write_now("hi")
+    check(s.transport.sent_len == 3 && s.transport.sent[0] == 2 && s.transport.sent[1] == 0x68
+          && s.transport.sent[2] == 0x69 && s.transport.tells == 0,
+          "a write sent as a call is called")
+    check(syncs(reply(1, 1, 0), UartError.BadOp), "a sync refused BadOp")
+    check(syncs(reply(1, 2, 0), UartError.Unsupported), "a sync refused Unsupported")
+    check(syncs(reply(1, 3, 0), UartError.Busy), "a sync refused Busy")
+    check(syncs(reply(2, 0, 0), UartError.Malformed), "a sync answered Ok and a byte")
+    check(syncs(reply(0, 0, 0), UartError.Malformed), "a sync answered nothing")
+    check(syncs(reply(1, 9, 0), UartError.Malformed), "a sync answered status 9")
+    var refusing = client(reply(1, 1, 0))
+    check(is_err(refusing.write_now("x"), UartError.BadOp), "a write sent as a call refused")
+    var unsupported = client(reply(1, 2, 0))
+    check(is_err(unsupported.mark(), UartError.Unsupported), "a mark refused")
+
+    // Writes told: no call, the op and the payload.
+    var w = client(reply(1, 0, 0))
+    try! w.write("ok\n")
+    check(w.transport.tells == 1 && w.transport.calls == 0, "a write is told")
+    check(w.transport.sent_len == 4 && w.transport.sent[0] == 2 && w.transport.sent[3] == 0x0A,
+          "a write's bytes")
+    try! w.write_byte(0x23)
+    check(w.transport.sent_len == 2 && w.transport.sent[0] == 2 && w.transport.sent[1] == 0x23,
+          "a write of one byte")
+    check(w.transport.tells == 2 && w.transport.calls == 0, "a write of one byte is told")
+    var long = ""
+    var i = 0
+    while i < MAX_PAYLOAD + 3 {
+        long = "{long}x"
+        i = i + 1
+    }
+    try! w.write(long)
+    check(w.transport.sent_len == BODY_BYTES as UInt, "a write past the payload is cut")
+
+    // Requests a client sends to be refused.
+    var r = client(reply(1, 1, 0))
+    check(is_err(r.raw(255, 2), UartError.BadOp), "a raw request refused")
+    check(r.transport.sent_len == 3 && r.transport.sent[0] == 255, "a raw request's bytes")
+    check(is_err(r.raw(4, MAX_PAYLOAD as UInt), UartError.BadOp), "a raw request at its bound")
+    check(r.transport.sent_len == BODY_BYTES as UInt, "a raw request fills the body at its bound")
+    check(is_err(r.nothing(), UartError.BadOp), "a request of no bytes refused")
+    check(r.transport.sent_len == 0, "a request of no bytes sends none")
+
+    // The transport's failures pass through every op unchanged.
+    var gone = client(reply(1, 0, 0))
+    gone.transport.fails = UartError.Gone
+    check(is_err(gone.read(), UartError.Gone), "a read to a gone driver")
+    check(is_err(gone.write("x"), UartError.Gone), "a write to a gone driver")
+    check(is_err(gone.sync(), UartError.Gone), "a sync to a gone driver")
+    check(is_err(gone.write_byte(0x23), UartError.Gone), "a byte to a gone driver")
+    var failed = client(reply(1, 0, 0))
+    failed.transport.fails = UartError.Transport(7)
+    check(is_err(failed.mark(), UartError.Transport(7)), "a transport's own code")
+    check(is_err(failed.write_now("x"), UartError.Transport(7)),
+          "a write sent as a call over a failed transport")
+
+    // The decoders on their own, and the errors' names.
+    check(try! read_reply(&reply(2, 0, 7)) == 7, "read_reply")
+    check(is_err(empty_reply(&reply(1, 2, 0)), UartError.Unsupported), "empty_reply")
+    check(UartError.BadOp.describe().equals("BadOp"), "BadOp's name")
+    check(UartError.Unsupported.describe().equals("Unsupported"), "Unsupported's name")
+    check(UartError.Busy.describe().equals("Busy"), "Busy's name")
+    check(UartError.Malformed.describe().equals("a malformed reply"), "Malformed's name")
+    check(UartError.Gone.describe().equals("the driver is gone"), "Gone's name")
+    check("{UartError.Transport(7)}".equals("the transport failed: code 7"),
+          "a transport failure prints its code")
+    check("{UartError.Busy}".equals("Busy"), "an error prints its name")
+}

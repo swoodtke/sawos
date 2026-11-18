@@ -31,7 +31,8 @@
 import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet, PipeReply,
             PipeMsg, Clock, ClockType, Timer, Waiter, WaitResult, WaitPayload,
             SystemRight, SosStatus, PIPE_BODY_BYTES}
-import uartproto.{UartOp, UartBody}
+import uartproto.{UartOp, UartBody, Uart, UartError}
+import uartpipe.{PipeTransport, uart}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -177,10 +178,14 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     // with the ordinary driver: the two lines come out of a transmitter root
     // does not own, and the `Sync` that follows is answered, which it could not
     // be if one dead read had wedged the server.
-    try own_round(&inlet, &var req)
+    var u = uart(move inlet)
+    try own_round(&var u) catch {
+        print("SOS uartcancel: root's round: {}\n", error)
+        return BUG
+    }
 
     try waiter.add(process: &driver, key: KEY_DRIVER)
-    let _ = move inlet
+    let _ = move u
     let gone = try waiter.wait()
     if gone.key != KEY_DRIVER { return BUG }
     let status = status_of(&gone)
@@ -197,26 +202,11 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 
 /// `Mark`, two `Write` tells and a `Sync`: the same round `uart-service` runs,
 /// with the same measured window on the driver's side.
-func own_round(inlet: &PipeInlet, req: &var UartBody) -> Result<Void, SosStatus> {
-    let mark = req.bare(UartOp.Mark)
-    let ack = try inlet.send(body: &req.bytes, len: mark)
-    if ack.len != 0 { return BUG }
-    let _ = move ack
-
-    let a = req.text(UartOp.Write,
-                     "SOS uartcancel: root wrote this line through the driver\n")
-    let first = try inlet.post(body: &req.bytes, len: a)
-    let _ = move first
-
-    let b = req.text(UartOp.Write,
-                     "SOS uartcancel: one dead read did not wedge it\n")
-    let second = try inlet.post(body: &req.bytes, len: b)
-    let _ = move second
-
-    let sync = req.bare(UartOp.Sync)
-    let settled = try inlet.send(body: &req.bytes, len: sync)
-    if settled.len != 0 { return BUG }
-    let _ = move settled
+func own_round(u: &var Uart<PipeTransport>) -> Result<Void, UartError> {
+    try u.mark()
+    try u.write("SOS uartcancel: root wrote this line through the driver\n")
+    try u.write("SOS uartcancel: one dead read did not wedge it\n")
+    try u.sync()
     return
 }
 

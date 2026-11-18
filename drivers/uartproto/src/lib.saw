@@ -1,41 +1,68 @@
-//! The /dev/uart0 protocol.
+//! The UART drivers' protocol.
 //!
-//! A UART driver that serves its device over a pipe needs a wire: one op byte,
-//! then payload. Nothing here is kernel surface. A device protocol belongs to
-//! the device's driver and its clients; the kernel supplies the connection, the
-//! message and the one-shot reply pair, equally to every protocol.
-//!
-//! This is a package, not a comment, because three programs compile against
-//! these numbers (the driver, the client child, and each root launcher acting
-//! as a client) and they must agree. A copy per program can drift, and drift
-//! shows up as a wrong byte rather than a compile error. It lives in
-//! `drivers/`, not in `sosrt`, which is arch-free and role-free code every
-//! image links.
-//!
-//! # The wire
+//! A request is one message: byte 0 the op, then the payload. A reply's byte 0
+//! is a status, then its payload.
 //!
 //! ```text
-//! byte 0      the op                    (UartOp, a raw-backed enum)
-//! bytes 1..   the payload               (`len - 1` of them)
+//! op        payload               reply payload
+//! Read   1  -                     the next input byte
+//! Write  2  0 to MAX_PAYLOAD      -
+//!           bytes to write
+//! Sync   3  -                     -
+//! Mark   4  -                     -
 //! ```
 //!
-//! The four ops, each with its own kernel-level shape:
+//! A reply that is not `Ok` carries the status byte alone.
 //!
-//!   - `Read`  - a call. The reply carries the next input byte, and the
-//!               reply's own `len` says how many. If no input is pending the
-//!               driver holds the obligation and answers when its IRQ delivers
-//!               one; a fused `send` parks meanwhile, so a blocking read is
-//!               composed entirely out of shipped parts.
+//! Nothing here is kernel surface. A device protocol belongs to the device's
+//! driver and its clients; the kernel supplies the connection, the message and
+//! the one-shot reply pair, equally to every protocol. The package has no
+//! dependency, so `blade test` holds the wire's bytes on the host. A body is
+//! `BODY_BYTES`, the kernel's `PIPE_BODY_BYTES`: a send's array type refuses
+//! a skew between the two.
+//!
+//! # The client
+//!
+//! `Uart<T>` makes each request and decodes its reply into a `Result`: a
+//! `Read` answers the byte, every other op `Void`, and a refusal, a reply no
+//! request can produce, or the transport's own failure is a `UartError`. It
+//! reaches the driver through a `UartTransport`, so a client is written once
+//! and runs over whatever carries the bytes: the pipe transport in a process
+//! (`drivers/uartpipe`), a fake one in this package's tests.
+//!
+//! # Statuses
+//!
+//! They are checked in this order, and the first that applies is answered:
+//! `BadOp` (a message of no bytes, an op byte that names no op, or a payload
+//! on an op that takes none), then `Unsupported` (an op this driver's device
+//! cannot do), then `Busy` (a `Read` the driver would hold, when it holds as
+//! many as it will). Every driver serves `Write`, `Sync` and `Mark`; a driver
+//! whose device has no input answers every `Read` `Unsupported`, at once.
+//!
+//! # The ops
+//!
+//!   - `Read`  - a call. A driver whose device has input answers `Ok` and the
+//!               next input byte. With none pending it holds the obligation
+//!               and answers when its device delivers one; a fused `send`
+//!               parks meanwhile, so a blocking read is composed entirely out
+//!               of shipped parts. A read past the most it holds is answered
+//!               `Busy` at once, and the client may ask again.
 //!   - `Write` - a tell: post, drop the claim, never look back. The driver
-//!               writes the payload out its window.
-//!   - `Sync`  - a call with an empty reply. A connection's ring is FIFO, so an
-//!               answered `Sync` proves every message posted before it has been
-//!               served; that is how a client that only tells learns when its
-//!               writes reached the device.
-//!   - `Mark`  - a call with an empty reply, and pure instrumentation: it tells
-//!               the driver to take a trap reading, so the serve loop's cost
-//!               can be measured over a window the case controls. It carries no
+//!               writes the payload out, then answers `Ok`, which goes nowhere
+//!               for a claim that was dropped. A client that calls instead
+//!               learns that its bytes are out. Every payload length, none
+//!               included, is a write, so a `Write` is never refused.
+//!   - `Sync`  - a call answered `Ok`. A connection's ring is FIFO, so an
+//!               answered `Sync` proves every message posted before it has
+//!               been served; that is how a client that only tells learns when
+//!               its writes reached the device.
+//!   - `Mark`  - a call answered `Ok`, and pure instrumentation: it tells the
+//!               driver to take a trap reading, so the serve loop's cost can be
+//!               measured over a window the case controls. It carries no
 //!               authority and reads no device.
+//!
+//! A refusal is a reply, so a malformed request that was posted and its claim
+//! dropped is refused to nobody: the client that wants to know calls.
 //!
 //! # Cancellation is not an op
 //!
@@ -45,12 +72,11 @@
 //! wire would make the driver correlate two messages and would race the reply
 //! it is trying to cancel; the reference count does not.
 
-import sos.{PipeMsg, PIPE_BODY_BYTES}
-import sosrt.{ascii_byte}
+/// The bytes of a message body: the kernel's `PIPE_BODY_BYTES`.
+public static BODY_BYTES: Int = 128
 
-/// The op byte. Raw-backed because it crosses a wire: the values are ABI
-/// between the driver and its clients, so each is stated explicitly and a
-/// reorder cannot renumber them.
+/// The op byte. Raw-backed because it crosses a wire: each value is stated,
+/// so a reorder cannot renumber them.
 public enum UartOp: UInt8 {
     case Read = 1,
     case Write = 2,
@@ -68,6 +94,34 @@ extension UartOp {
             case Mark -> "mark",
         }
     }
+
+    /// Whether a request of this op carries a payload: only a `Write` does.
+    public func takes_payload(&self) -> Bool {
+        match self {
+            case Write -> true,
+            case _ -> false,
+        }
+    }
+}
+
+/// A reply's status byte. `Ok` is 0.
+public enum UartStatus: UInt8 {
+    case Ok = 0,
+    case BadOp = 1,
+    case Unsupported = 2,
+    case Busy = 3,
+}
+
+extension UartStatus {
+    /// What a transcript should call this status.
+    public func describe(&self) -> String {
+        match self {
+            case Ok -> "Ok",
+            case BadOp -> "BadOp",
+            case Unsupported -> "Unsupported",
+            case Busy -> "Busy",
+        }
+    }
 }
 
 /// Where the op byte sits, and where the payload starts.
@@ -75,55 +129,45 @@ public static OP_BYTE: Int = 0
 public static PAYLOAD_BYTE: Int = 1
 
 /// The most payload one message can carry: the body minus the op byte.
-public static MAX_PAYLOAD: Int = PIPE_BODY_BYTES - 1
+public static MAX_PAYLOAD: Int = BODY_BYTES - 1
 
 static_assert(MAX_PAYLOAD > 0, "a message must have room for an op and a byte")
 
-/// The request buffer. The body every send takes is a
-/// `&[UInt8; PIPE_BODY_BYTES]`; a builder fills the array through a `&var`
-/// struct field, and `&buf.bytes` is what goes to the wire.
+/// What a non-ASCII scalar becomes in `UartBody.text`: the kernel console's
+/// substitute, so a line written through a driver reads the same as one
+/// written through a System op.
+public static ASCII_SUBSTITUTE: UInt8 = 0x3F
+
+/// A message body, for a request or a reply. The body every send takes is a
+/// `&[UInt8; PIPE_BODY_BYTES]`; `&body.bytes` is what goes to the wire.
 public struct UartBody {
-    public bytes: [UInt8; PIPE_BODY_BYTES],
+    public bytes: [UInt8; BODY_BYTES],
 }
 
 extension UartBody {
     /// A zeroed body.
     public static func empty() -> UartBody {
-        UartBody(bytes: [0; PIPE_BODY_BYTES])
+        UartBody(bytes: [0; BODY_BYTES])
     }
 
-    /// An op and nothing else. Answers the message's `len`.
+    // The request builders answer the message's `len`.
+
+    /// An op and nothing else.
     public func bare(&var self, op: UartOp) -> UInt {
         self.bytes[OP_BYTE] = op as UInt8
         1
     }
 
-    /// An op and one payload byte. Answers the message's `len`.
+    /// An op and one payload byte.
     public func one(&var self, op: UartOp, b: UInt8) -> UInt {
         self.bytes[OP_BYTE] = op as UInt8
         self.bytes[PAYLOAD_BYTE] = b
         2
     }
 
-    /// A reply carrying one byte. Answers the reply's `len`.
+    /// An op and a line of ASCII.
     ///
-    /// A reply has no op byte: it answers exactly one request, so the
-    /// request's op says how to read it, and the reply's own `len` is the
-    /// length prefix §2.1 gives every message.
-    public func answer(&var self, b: UInt8) -> UInt {
-        self.bytes[0] = b
-        1
-    }
-
-    /// A reply carrying nothing. Answers `0`, which §2.1 allows and which
-    /// reads no buffer: the acknowledgement `Sync` and `Mark` want.
-    public func nothing(&self) -> UInt { 0 }
-
-    /// An op and a line of ASCII. Answers the message's `len`.
-    ///
-    /// A scalar that is not ASCII becomes `?` (`ascii_byte`'s rule, shared with
-    /// the kernel console), so a line written through a driver's window reads
-    /// the same as one written through a System op. Text longer than
+    /// A scalar that is not ASCII becomes `ASCII_SUBSTITUTE`. Text longer than
     /// `MAX_PAYLOAD` is cut, not wrapped: a silently split message would be two
     /// requests where the caller wrote one.
     public func text(&var self, op: UartOp, s: String) -> UInt {
@@ -131,38 +175,290 @@ extension UartBody {
         var n: Int = 0
         for scalar in s.scalars() {
             if n < MAX_PAYLOAD {
-                self.bytes[PAYLOAD_BYTE + n] = ascii_byte(scalar)
+                self.bytes[PAYLOAD_BYTE + n] = ascii_or_substitute(scalar)
                 n = n + 1
             }
         }
         (n + 1) as UInt
     }
+
+    /// A request with an op byte of any value and `payload` bytes after it,
+    /// for the refusals a client tests. `payload` is at most `MAX_PAYLOAD`: a
+    /// longer message is past the kernel's body, and the kernel ends a process
+    /// that sends one.
+    public func raw(&var self, op: UInt8, payload: UInt) -> UInt {
+        self.bytes[OP_BYTE] = op
+        payload + 1
+    }
+
+    // The reply builders answer the reply's `len`.
+
+    /// A reply of the status alone.
+    public func refuse(&var self, status: UartStatus) -> UInt {
+        self.bytes[0] = status as UInt8
+        1
+    }
+
+    /// An `Ok` and nothing else: what `Write`, `Sync` and `Mark` answer.
+    public func ok(&var self) -> UInt {
+        self.refuse(UartStatus.Ok)
+    }
+
+    /// An `Ok` and one byte: a `Read`'s answer.
+    public func ok_byte(&var self, b: UInt8) -> UInt {
+        self.bytes[0] = UartStatus.Ok as UInt8
+        self.bytes[1] = b
+        2
+    }
 }
 
-/// The op a received message names, or `None` for a byte that names no op.
-///
-/// The Optional is a real domain value: a request arrives from a process the
-/// driver does not trust, so "this byte is not one of my ops" is data at a
-/// protocol boundary, never a trap. This is a decode, not an operation that can
-/// fail, so there is no error channel.
-///
-/// A message with no bytes (`len == 0`, which §2.1 allows) names no op either,
-/// and the same `None` says so.
-public func op_of(msg: &PipeMsg) -> UartOp? {
-    if msg.len == 0 { return None }
-    UartOp.from(raw: msg.bytes[OP_BYTE])
+/// A scalar as a byte of a line: itself when it is ASCII, the substitute
+/// otherwise.
+public func ascii_or_substitute(scalar: Scalar) -> UInt8 {
+    let v = scalar.value()
+    if v < 0 || v > 0x7F {
+        ASCII_SUBSTITUTE
+    } else {
+        v as UInt8
+    }
 }
 
-/// How many payload bytes a received message carries.
-public func payload_len(msg: &PipeMsg) -> UInt {
-    if msg.len == 0 { return 0 }
-    msg.len - 1
+/// A received message's length and bytes: all the decoders read, so they are
+/// plain data and the wire is tested without a kernel.
+public struct Frame {
+    public len: UInt,
+    public bytes: [UInt8; BODY_BYTES],
 }
 
-/// Payload byte `i` of a received message. Out of range answers zero rather
-/// than panicking: the sender chose the length and the receiver is a server,
-/// which a client's arithmetic must not be able to end.
-public func payload_byte(msg: &PipeMsg, i: Int) -> UInt8 {
-    if i < 0 || (i as UInt) >= payload_len(&msg) { return 0 }
-    msg.bytes[PAYLOAD_BYTE + i]
+extension Frame {
+    /// The op a received request names, or `None` for a byte that names no op.
+    /// The Optional is a real domain value: a request arrives from a process
+    /// the driver does not trust, so "this byte is not one of my ops" is data
+    /// at a protocol boundary, never a trap. A message of no bytes names no op
+    /// either, whatever its buffer holds.
+    public func op(&self) -> UartOp? {
+        if self.len == 0 { return None }
+        UartOp.from(raw: self.bytes[OP_BYTE])
+    }
+
+    /// The op of a request the protocol accepts, or `None` for one a driver
+    /// answers `BadOp`: one that names no op, or carries a payload on an op
+    /// that takes none.
+    public func request(&self) -> UartOp? {
+        guard let op = self.op() else { return None }
+        if self.payload_len() != 0 && not op.takes_payload() {
+            return None
+        }
+        op
+    }
+
+    /// How many payload bytes a received request carries.
+    public func payload_len(&self) -> UInt {
+        if self.len == 0 { return 0 }
+        self.len - 1
+    }
+
+    /// Payload byte `i` of a received request. Out of range answers zero
+    /// rather than panicking: the sender chose the length and the receiver is
+    /// a server, which a client's arithmetic must not be able to end.
+    public func payload_byte(&self, i: Int) -> UInt8 {
+        if i < 0 || (i as UInt) >= self.payload_len() { return 0 }
+        self.bytes[PAYLOAD_BYTE + i]
+    }
+
+    /// The status a received reply carries, or `None` for a status byte no
+    /// status has or a reply with no bytes.
+    public func status(&self) -> UartStatus? {
+        if self.len == 0 { return None }
+        UartStatus.from(raw: self.bytes[0])
+    }
+
+    /// Byte `at` of a received reply; zero past its end.
+    public func byte(&self, at: Int) -> UInt8 {
+        if at < 0 || (at as UInt) >= self.len { return 0 }
+        self.bytes[at]
+    }
+}
+
+// =============================================================================
+// Replies, decoded
+// =============================================================================
+
+/// Why a request did not do what it asked.
+public enum UartError {
+    /// The driver refused the request: the protocol's `BadOp`.
+    case BadOp,
+    /// The driver's device cannot do the op: the protocol's `Unsupported`.
+    case Unsupported,
+    /// The driver holds as many reads as it will: the protocol's `Busy`. The
+    /// read may be asked again.
+    case Busy,
+    /// A reply no request of this op can produce: a status byte that is none,
+    /// or a length the status does not have.
+    case Malformed,
+    /// The driver is gone: its end of the connection is closed, or it
+    /// dropped the request unanswered.
+    case Gone,
+    /// The transport failed for a reason of its own, which `code` names in
+    /// the transport's terms.
+    case Transport(code: UInt32),
+}
+
+@synthesize
+extension UartError: Equatable {}
+
+extension UartError {
+    /// What a transcript should call this error.
+    public func describe(&self) -> String {
+        match self {
+            case BadOp -> "BadOp",
+            case Unsupported -> "Unsupported",
+            case Busy -> "Busy",
+            case Malformed -> "a malformed reply",
+            case Gone -> "the driver is gone",
+            case Transport(_) -> "the transport failed",
+        }
+    }
+}
+
+extension UartError: Printable {
+    /// The description, and a transport failure's code after it. Written out
+    /// of `append` calls, which allocate nothing a freestanding process lacks.
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+        match self {
+            case Transport(code) -> {
+                try! into.append(": code ")
+                try! into.append(value: code as UInt)
+            },
+            case _ -> {},
+        }
+    }
+}
+
+extension UartError: Error {}
+
+/// The error a refusal's status names, or `None` for `Ok`, which refuses
+/// nothing.
+func refusal(status: UartStatus) -> UartError? {
+    match status {
+        case Ok -> None,
+        case BadOp -> UartError.BadOp,
+        case Unsupported -> UartError.Unsupported,
+        case Busy -> UartError.Busy,
+    }
+}
+
+/// A `Read`'s reply: `Ok` and one byte, or a refusal alone.
+public func read_reply(reply: &Frame) -> Result<UInt8, UartError> {
+    guard let status = reply.status() else { return UartError.Malformed }
+    if let refused = refusal(status) {
+        if reply.len != 1 { return UartError.Malformed }
+        return refused
+    }
+    if reply.len != 2 { return UartError.Malformed }
+    return reply.byte(1)
+}
+
+/// The reply to a `Write`, `Sync` or `Mark`: the status alone, `Ok` or a
+/// refusal.
+public func empty_reply(reply: &Frame) -> Result<Void, UartError> {
+    guard let status = reply.status() else { return UartError.Malformed }
+    if reply.len != 1 { return UartError.Malformed }
+    if let refused = refusal(status) { return refused }
+    return
+}
+
+// =============================================================================
+// The client
+// =============================================================================
+
+/// What carries a client's requests to the driver and its replies back.
+public trait UartTransport {
+    /// Sends the first `len` bytes of `body` and answers the reply. A driver
+    /// that is gone is `UartError.Gone`; any other failure of the transport's
+    /// own is `UartError.Transport`.
+    func call(&var self, body: &[UInt8; BODY_BYTES], len: UInt) -> Result<Frame, UartError>
+
+    /// Sends the first `len` bytes of `body` and owes nothing back: the reply,
+    /// if the driver makes one, goes nowhere.
+    ///
+    /// A transport carries only so many tells the driver has not yet taken
+    /// (the pipe's ring holds `PIPE_INFLIGHT`), and a pipe's post needs a
+    /// handle for its claim. Past either limit, a tell waits for the driver,
+    /// as a call does, rather than failing: a burst of any length is
+    /// back-pressure, never an error.
+    func tell(&var self, body: &[UInt8; BODY_BYTES], len: UInt) -> Result<Void, UartError>
+}
+
+/// A `uartproto` client over the transport `T`.
+public struct Uart<T: UartTransport> {
+    /// The transport, reachable for what the protocol's ops do not cover.
+    public transport: T,
+    body: UartBody,
+}
+
+extension Uart<T: UartTransport> {
+    /// A client over `transport`.
+    public static func over(transport: T) -> Uart<T> {
+        Uart(transport: move transport, body: UartBody.empty())
+    }
+
+    /// The next input byte. A driver whose device has input parks the call
+    /// until a byte exists.
+    public func read(&var self) -> Result<UInt8, UartError> {
+        let n = self.body.bare(UartOp.Read)
+        let reply = try self.transport.call(&self.body.bytes, n)
+        read_reply(&reply)
+    }
+
+    /// Writes `text` as one `Write`, a tell: it is out when a later `sync`
+    /// answers. Text past `MAX_PAYLOAD` is cut, as `UartBody.text` cuts it.
+    public func write(&var self, text: String) -> Result<Void, UartError> {
+        let n = self.body.text(UartOp.Write, text)
+        self.transport.tell(&self.body.bytes, n)
+    }
+
+    /// Writes one byte as a `Write`, a tell.
+    public func write_byte(&var self, b: UInt8) -> Result<Void, UartError> {
+        let n = self.body.one(UartOp.Write, b)
+        self.transport.tell(&self.body.bytes, n)
+    }
+
+    /// Writes `text` as one `Write` sent as a call: it is out when this
+    /// answers.
+    public func write_now(&var self, text: String) -> Result<Void, UartError> {
+        let n = self.body.text(UartOp.Write, text)
+        let reply = try self.transport.call(&self.body.bytes, n)
+        empty_reply(&reply)
+    }
+
+    /// Answers once every request sent before it has been served.
+    public func sync(&var self) -> Result<Void, UartError> {
+        let n = self.body.bare(UartOp.Sync)
+        let reply = try self.transport.call(&self.body.bytes, n)
+        empty_reply(&reply)
+    }
+
+    /// Asks the driver to take its trap reading.
+    public func mark(&var self) -> Result<Void, UartError> {
+        let n = self.body.bare(UartOp.Mark)
+        let reply = try self.transport.call(&self.body.bytes, n)
+        empty_reply(&reply)
+    }
+
+    /// A call of the op byte `op` and `payload` bytes after it, whatever they
+    /// name, decoded as an empty reply: for the refusals a client tests.
+    /// `payload` is at most `MAX_PAYLOAD`, as `UartBody.raw` says.
+    public func raw(&var self, op: UInt8, payload: UInt) -> Result<Void, UartError> {
+        let n = self.body.raw(op, payload)
+        let reply = try self.transport.call(&self.body.bytes, n)
+        empty_reply(&reply)
+    }
+
+    /// A call of no bytes at all, decoded as an empty reply.
+    public func nothing(&var self) -> Result<Void, UartError> {
+        let reply = try self.transport.call(&self.body.bytes, 0)
+        empty_reply(&reply)
+    }
 }

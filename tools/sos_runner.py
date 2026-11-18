@@ -206,6 +206,12 @@ STOCK_GOLDFISH_PKG = os.path.join(TESTS_DIR, "stock-goldfish")
 STOCK_TIMG_PKG = os.path.join(TESTS_DIR, "stock-timg")
 # The ESP32-S3's GPIO driver, a child of a stock root (`drivers/`).
 GPIO_DRIVER_PKG = os.path.join(REPO_ROOT, "drivers", "svc-gpio-esp32s3")
+# The console driver, a child of a stock root (`drivers/`), and a root that
+# starts it without `Debug`.
+CONSOLE_DRIVER_PKG = os.path.join(DRIVERS_DIR, "svc-console")
+CONSOLE_NO_DEBUG_PKG = os.path.join(TESTS_DIR, "console-no-debug")
+# A root that writes through the console driver with its handle table full.
+CONSOLE_FULL_ROOT_PKG = os.path.join(TESTS_DIR, "console-full-root")
 FAULT_ROOT_PKG = os.path.join(TESTS_DIR, "faulting-root")
 # Thread and Process objects. Test processes reach the kernel through the `sos`
 # module and never through an op number.
@@ -695,10 +701,11 @@ CHILD_WAITABLE_PKG = os.path.join(TESTS_DIR, "child-waitable")
 
 # Driver-as-service.
 #
-# `uartproto` is a library package rather than an image: the protocol is one
-# declaration the driver, the client and both launchers compile against. It has
-# no constant here because nothing builds it directly; Blade pulls it in as a
-# path dependency.
+# `uartproto` is a library package rather than an image: the protocol and its
+# typed client are one declaration the drivers, the clients and both launchers
+# compile against. Blade pulls it in as a path dependency, and its own tests
+# run on the host (`HOSTED_TESTS`). `uartpipe` is the client's transport over
+# a pipe, the one piece of a client that names the kernel.
 #
 # The driver is per chip and the client and launchers are arch-free: a driver
 # names its device, a launcher moves a capability, and a capability has no
@@ -1859,6 +1866,40 @@ _STOCK_TIMG_REFUSED = {
     "expect_out": [],
     "expect_clean_exit": False}
 
+
+# What `tests/uart-text-client` writes through its driver, in order, before
+# its read, and after it: the same text whichever driver serves it.
+_UART_CLIENT_LINES = [
+    "SOS uartclient: a burst of 40 writes: " + "+" * 38,
+    "SOS uartclient: a line written through uartproto",
+    "SOS uartclient: a full write " + "." * 97,
+    "SOS uartclient: one line in two writes",
+    "SOS uartclient: a write sent as a call",
+    "SOS uartclient: sync answered Ok",
+]
+_UART_CLIENT_AFTER_READ = [
+    "SOS uartclient: a request of no bytes: BadOp",
+    "SOS uartclient: op 0: BadOp",
+    "SOS uartclient: op 5: BadOp",
+    "SOS uartclient: op 255: BadOp",
+    "SOS uartclient: a read carrying a byte: BadOp",
+    "SOS uartclient: a sync carrying a byte: BadOp",
+    "SOS uartclient: a mark carrying a full payload: BadOp",
+    "SOS uartclient: a sync carrying 4 handles answered Ok",
+    "SOS uartclient: a write with no handle to spare for its claim",
+    "SOS uartclient: done",
+]
+# The client's read, against the console driver, which has no input, and
+# against a UART driver, which holds it.
+_UART_CLIENT_CONSOLE = [
+    *_UART_CLIENT_LINES,
+    "SOS uartclient: read: Unsupported, the device has no input",
+    *_UART_CLIENT_AFTER_READ]
+_UART_CLIENT_UART = [
+    *_UART_CLIENT_LINES,
+    "SOS uartclient: read: held, no input yet; a fifth answered Busy; "
+    "claims dropped",
+    *_UART_CLIENT_AFTER_READ]
 
 # What `gpio_service`'s client prints, in order
 # (`tests/gpio-service-client`). The words the device answers to `Inspect`
@@ -8893,6 +8934,178 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # The console driver under the stock root
+        # (`tests/images/console_service*.toml`), with a client that writes,
+        # syncs, reads and ends through it, printing every line as a `Write`
+        # (`tests/uart-text-client`). Its first line is forty writes with no
+        # call among them, past the `PIPE_INFLIGHT` a connection's ring holds:
+        # the pipe transport sends a write that finds the ring full as a call,
+        # so the burst waits for the driver and arrives whole. The kernel
+        # console has no input for a process, so the read is answered
+        # `Unsupported` at once. The driver's
+        # own line counts what it served: every request, the refusals, the
+        # read, and the bytes it printed.
+        "name": "console_service",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "console_service.toml",
+                       "riscv32-flat": "console_service_flat.toml",
+                       "arm64": "console_service_arm64.toml"},
+        "expect_out": ["{banner}",
+                       *_UART_CLIENT_CONSOLE,
+                       "root: client ended status=65536",
+                       # Every request; the seven `BadOp`s; the read; and
+                       # the bytes of every `Write`. The traps run from the
+                       # mark: one per byte printed, one per answer that
+                       # landed (seventeen: two of the burst's writes found
+                       # the ring full and one write found no handle for its
+                       # claim, and went as calls), two per tell whose `Ok`
+                       # did not (fifty-four), one per handle the carrying
+                       # `Sync` brought, released, and the closing `stats()`
+                       # read.
+                       "SOS console drv: served=71 refused=7 unsupported=1 "
+                       "printed=837",
+                       "SOS console drv: after the mark traps=967",
+                       "root: console ended status=65536"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same client against the board's UART driver, given the console
+        # UART (`tests/images/console_service_*.toml`): the image names the
+        # driver instead, and the client's text is the same but for its read,
+        # which the driver holds, there being no input. The client has it hold
+        # four, the most it will, has a fifth answered `Busy`, and drops the
+        # four. The driver's own lines say so (`abandoned=4`).
+        "name": "console_service_uart",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "console_service_ns16550.toml",
+                       "riscv32-flat": "console_service_ns16550_flat.toml",
+                       "arm64": "console_service_pl011_arm64.toml"},
+        "expect_out": ["{banner}",
+                       *_UART_CLIENT_UART,
+                       "root: client ended status=65536",
+                       # The four reads it held, dropped. Seventeen calls
+                       # answered (the fifth read's `Busy`, the two writes of
+                       # the burst that found the ring full and the write
+                       # that found no handle for its claim among them) and
+                       # fifty-five tells whose `Ok` did not land; the
+                       # rest of the window's traps are each held read's
+                       # attach, the wait after it, the wait after its
+                       # abandonment and its release, the four handles the
+                       # carrying `Sync` brought, released, and the closing
+                       # `stats()` read.
+                       "SOS uartsvc drv: served=76 abandoned=4 dropped=0",
+                       "SOS uartsvc drv: after the mark answered=17 "
+                       "discarded=55 traps=148",
+                       "root: console ended status=65536"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A UART driver answers a `Read` from bytes it holds, and the reader
+        # has dropped its claim (`tests/images/uart_dropped_read*.toml`): the
+        # byte goes back to the front of the buffer, so the next reader gets
+        # it. The harness hands the four bytes over before the guest boots,
+        # so they are waiting when the driver first looks (`ECHO_INPUT`), every
+        # read is answered from the buffer, and the client orders the rest by
+        # a `Sync`, not by a clock. A driver that lost the byte would leave the
+        # client's last read waiting for a fifth; one that never served a read
+        # from its buffer, or never had one dropped, would count differently.
+        "name": "uart_dropped_read",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "uart_dropped_read.toml",
+                       "riscv32-flat": "uart_dropped_read_flat.toml",
+                       "arm64": "uart_dropped_read_arm64.toml"},
+        "stdin": ECHO_INPUT,
+        "stdin_at_once": True,
+        "expect_out": ["{banner}",
+                       f"SOS uartdrop: after a dropped read, {ECHO_INPUT}",
+                       "root: client ended status=65536",
+                       # Every read answered from the buffer: the mark, the
+                       # four reads and the two syncs answered, the dropped
+                       # read's reply and the six writes discarded, and no
+                       # read held, so none abandoned. The dropped read's byte
+                       # is the one put back.
+                       "SOS uartsvc drv: served=14 abandoned=0 dropped=0",
+                       "SOS uartsvc drv: bytes put back=1",
+                       "SOS uartsvc drv: after the mark answered=7 "
+                       "discarded=7 traps=22",
+                       "root: console ended status=65536"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The console driver stops when it is given no server end: its line,
+        # then the kernel's account of its exit, so a driver that went on
+        # would print more between.
+        "name": "console_no_server_end",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": STOCK_ROOT_PKG,
+        "root_plan": {
+            "children": [{"name": "console", "image": 0, "destination": 1,
+                          "start": 1,
+                          "quota": {"handles": 8, "waiters": 1},
+                          "records": [{"tag": 1, "source": "system"}]}]},
+        "children": [CONSOLE_DRIVER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS console drv: no server end under tag 2\n"
+                       "SOS: process exit: code={one}",
+                       "root: console ended status=65537"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A write from a client whose handle table is full
+        # (`tests/console-full-root`): the post that would tell it cannot mint
+        # its claim, so the pipe transport sends it as a call, which mints
+        # none, and the line reaches the console.
+        "name": "console_table_full",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CONSOLE_FULL_ROOT_PKG,
+        "children": [CONSOLE_DRIVER_PKG],
+        "expect_out": ["{banner}",
+                       "SOS fullroot: the table filled: no room for what was "
+                       "asked",
+                       "SOS fullroot: a write with the table full",
+                       # The write and the sync, both answered.
+                       "SOS console drv: served=2 refused=0 unsupported=0 "
+                       "printed=42",
+                       "SOS fullroot: console ended status=65536"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The console driver started without `Debug` (`tests/console-no-debug`)
+        # exits with its own code before it serves anyone. Root fills the ring
+        # first, so its next write is sent as a call and parks; the driver's
+        # end fails that call, and the write reports the driver gone. The
+        # write root posted before it ran answers `PeerClosed`, a sync after it
+        # through the typed client finds the driver gone, and nothing reaches
+        # the console.
+        "name": "console_no_debug",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CONSOLE_NO_DEBUG_PKG,
+        "children": [CONSOLE_DRIVER_PKG],
+        "expect_out": ["{banner}",
+                       # Nothing between root's line and the kernel's account
+                       # of the exit: the driver said nothing.
+                       "SOS nodebug: started the console driver without "
+                       "Debug\nSOS: process exit: code={two}",
+                       # The ring's sixteen slots less the kept claim's; the
+                       # next write parked as a call and failed with the
+                       # driver's end.
+                       "SOS nodebug: the write past the ring, after 15: the "
+                       "driver is gone",
+                       "SOS nodebug: console ended status=65538",
+                       "SOS nodebug: the write posted before it ended: the "
+                       "other end of this connection is gone",
+                       "SOS nodebug: a sync after it ended: the driver is "
+                       "gone",
+                       # A closed peer is reported from the post alone, not
+                       # retried as a call.
+                       "SOS nodebug: a write after it ended: the driver is "
+                       "gone, in 1 trap"],
+        "expect_clean_exit": True,
+    },
+    {
         # Delegation across three processes. `pipe_delegate_msg` proved the
         # mechanism with two pipes and one child; what three processes add is
         # that the middle is a genuinely different principal from both ends,
@@ -12339,6 +12552,8 @@ SOSIMAGE_DIR = os.path.join(REPO_ROOT, "tools", "sosimage")
 HOSTED_TESTS = [os.path.join(DRIVERS_DIR, "esp32s3io"),
                 os.path.join(DRIVERS_DIR, "gpioproto"),
                 os.path.join(DRIVERS_DIR, "pwmproto"),
+                os.path.join(DRIVERS_DIR, "uartproto"),
+                os.path.join(DRIVERS_DIR, "consolecore"),
                 os.path.dirname(SOSRT_DIR)]
 
 # The link the builder's manifest reaches the sawlang checkout's packages
@@ -12818,7 +13033,7 @@ def _slab_block_asm(case, arch, facts):
     return "\n".join(lines + [""] + storage + [""])
 
 
-def _run_qemu(qemu, arch, elf, feed=None):
+def _run_qemu(qemu, arch, elf, feed=None, at_once=False):
     """Run the ELF under QEMU with a hard timeout.
 
     Returns (exit_status, stdout, timed_out). A timeout is a hang: the
@@ -12831,7 +13046,9 @@ def _run_qemu(qemu, arch, elf, feed=None):
 
     The bytes go one at a time behind `SERIAL_TYPE_DELAY_S`, for the reason
     stated there: withholding them is what makes the driver park and the
-    kernel idle, and a burst handed over at once would test neither.
+    kernel idle, and a burst handed over at once would test neither. With
+    `at_once` they are handed over before the guest boots, for a case that
+    needs every byte waiting in the driver's buffer.
 
     The pipe is made here rather than by `Popen(stdin=PIPE)`, because
     `communicate()` closes the stdin it owns as soon as it is called, which
@@ -12875,7 +13092,8 @@ def _run_qemu(qemu, arch, elf, feed=None):
         # have reused.
         try:
             for ch in feed:
-                time.sleep(SERIAL_TYPE_DELAY_S)
+                if not at_once:
+                    time.sleep(SERIAL_TYPE_DELAY_S)
                 os.write(write_fd, ch.encode())
         except OSError:
             pass                    # the guest stopped first; nothing to say
@@ -13230,7 +13448,8 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
         if refusal is not None:
             return (False, f"{CROSS} {name}  (the build succeeded; it must "
                            f"refuse: {refusal})", [])
-        status, out, timed_out = _run_qemu(qemu, arch, elf, case.get("stdin"))
+        status, out, timed_out = _run_qemu(qemu, arch, elf, case.get("stdin"),
+                                           case.get("stdin_at_once", False))
         ok, reason = _check(case, arch, status, out, timed_out)
         if ok:
             return True, f"{CHECK} {name}", []
@@ -15805,6 +16024,22 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "root: client ended status=65536",
                            "SOS gpiosvc drv: served=92 abandoned=6 fires=",
                            "root: driver ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The gate's `console_service` on this board
+            # (`console_service_s3.toml`), which has no UART driver: the
+            # console driver writes through the kernel's console, UART0.
+            "name": "console_service",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "console_service_s3.toml"},
+            "expect_out": ["{banner}",
+                           *_UART_CLIENT_CONSOLE,
+                           "root: client ended status=65536",
+                           "SOS console drv: served=71 refused=7 "
+                           "unsupported=1 printed=837",
+                           "SOS console drv: after the mark traps=967",
+                           "root: console ended status=65536"],
             "expect_clean_exit": True,
         },
         {

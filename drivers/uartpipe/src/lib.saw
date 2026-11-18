@@ -1,0 +1,87 @@
+//! `uartproto` over a pipe.
+//!
+//! `PipeTransport` holds a client's inlet of the driver's connection: a call
+//! is the fused `send` (one trap, parked until the answer), and a tell is a
+//! post whose claim is dropped at once (two traps: the post and the claim's
+//! release). The pipe's own failures become `UartError`s: a closed peer is
+//! `Gone`, anything else `Transport` with the status's value.
+//!
+//! A post can be refused for three transient reasons, none of which stops a
+//! call: the ring is full (`WouldBlock`: a told message keeps its slot until
+//! the driver takes it, the ring holds `PIPE_INFLIGHT`, and the driver runs
+//! only once the client blocks), or the client's handle table has no room
+//! for the claim a post mints (`QuotaExceeded` at its quota, `NoResource` when
+//! the table is full), where a call mints none. A tell refused for any of the
+//! three is sent as a call instead, which parks until the driver answers: a
+//! burst of writes, or a write from a client with no handle to spare, waits
+//! for the driver rather than failing. The call's own failure is the tell's.
+
+import sos.{PipeInlet, SosStatus, PIPE_BODY_BYTES}
+import uartproto.{BODY_BYTES, Frame, Uart, UartError, UartTransport}
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
+
+/// A client's inlet of a UART driver's connection, as a `UartTransport`.
+public struct PipeTransport {
+    /// The inlet, for what a pipe does that the protocol's ops do not: a post
+    /// whose claim is kept, or a request carrying handles.
+    public inlet: PipeInlet,
+}
+
+extension PipeTransport: NoCopy {}
+
+/// A `Uart` client over `inlet`.
+public func uart(inlet: PipeInlet) -> Uart<PipeTransport> {
+    Uart.over(PipeTransport(inlet: move inlet))
+}
+
+/// A pipe's failure as a client's error: a closed peer is the driver gone.
+public func uart_error(status: SosStatus) -> UartError {
+    if status == SosStatus.PeerClosed {
+        UartError.Gone
+    } else {
+        UartError.Transport(status as UInt32)
+    }
+}
+
+/// Whether a post's refusal is one a call does not meet: a full ring, or no
+/// room for the claim a post mints.
+func transient(status: SosStatus) -> Bool {
+    (status == SosStatus.WouldBlock || status == SosStatus.QuotaExceeded
+     || status == SosStatus.NoResource)
+}
+
+extension PipeTransport {
+    /// A tell a post was refused for, sent as a call: it parks until the
+    /// driver answers, and the answer goes nowhere, as a tell's does.
+    func told_as_call(&var self, body: &[UInt8; BODY_BYTES],
+                      len: UInt) -> Result<Void, UartError> {
+        let reply = try self.inlet.send(body: &body, len: len) catch {
+            return uart_error(error)
+        }
+        let _ = move reply
+        return
+    }
+}
+
+extension PipeTransport: UartTransport {
+    func call(&var self, body: &[UInt8; BODY_BYTES], len: UInt) -> Result<Frame, UartError> {
+        let reply = try self.inlet.send(body: &body, len: len) catch {
+            return uart_error(error)
+        }
+        let frame = Frame(len: reply.len, bytes: reply.bytes)
+        let _ = move reply
+        return frame
+    }
+
+    func tell(&var self, body: &[UInt8; BODY_BYTES], len: UInt) -> Result<Void, UartError> {
+        let claim = try self.inlet.post(body: &body, len: len) catch {
+            if transient(error) {
+                return self.told_as_call(&body, len)
+            }
+            return uart_error(error)
+        }
+        let _ = move claim
+        return
+    }
+}

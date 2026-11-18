@@ -61,7 +61,8 @@
 import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet, PipeReply,
             PipeMsg, Waiter, WaitResult, WaitPayload, SystemRight,
             PipeInletRight, SosStatus, PIPE_BODY_BYTES}
-import uartproto.{UartOp, UartBody}
+import uartproto.{UartOp, UartBody, Uart, UartError, Frame, read_reply}
+import uartpipe.{PipeTransport, uart}
 
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
@@ -252,17 +253,22 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     // nothing here polls. What resumes it is a device interrupt taken by the
     // process root gave the device to.
     let answer = try (move claim).resolve()
-    if answer.len != 1 { return BUG }
-    let got = answer.bytes[0]
+    let read = Frame(len: answer.len, bytes: answer.bytes)
     let _ = move answer
+    let got = try read_reply(&read) catch {
+        print("SOS uartsvc: root's read: {}\n", error)
+        return BUG
+    }
 
     // Root echoes its byte back the way the client echoes its own (a `Write`
     // tell), so the phrase the harness typed comes out of the console whole,
     // the first byte having travelled through root's claim and the rest through
-    // the client's.
-    let m = req.one(UartOp.Write, got)
-    let echo_claim = try inlet.post(body: &req.bytes, len: m)
-    let _ = move echo_claim
+    // the client's. From here root is the protocol's client, through `Uart`.
+    var u = uart(move inlet)
+    try u.write_byte(got) catch {
+        print("SOS uartsvc: root's echo: {}\n", error)
+        return BUG
+    }
 
     // =====================================================================
     // Phase B: the client finishes the phrase, and root is parked on its
@@ -282,7 +288,10 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     // =====================================================================
     // Phase C: root's own round, and the driver's measured window.
     // =====================================================================
-    try own_round(&inlet, &var req)
+    try own_round(&var u) catch {
+        print("SOS uartsvc: root's round: {}\n", error)
+        return BUG
+    }
 
     if client_status != CLIENT_STATUS {
         print("SOS uartsvc: client status={} wanted {}\n", client_status,
@@ -327,7 +336,7 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     // reaching zero turns the driver's readable level terminal. There is no
     // `close` op: the reference count already knows.
     try waiter.add(process: &driver, key: KEY_DRIVER)
-    let _ = move inlet
+    let _ = move u
     let gone = try waiter.wait()
     if gone.key != KEY_DRIVER { return BUG }
     let driver_status = status_of(&gone)
@@ -351,26 +360,11 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
 /// FIFO, so an answered `Sync` proves both writes were served, which is how a
 /// client that only tells learns when its bytes reached the device. Nothing
 /// here is timing.
-func own_round(inlet: &PipeInlet, req: &var UartBody) -> Result<Void, SosStatus> {
-    let mark = req.bare(UartOp.Mark)
-    let ack = try inlet.send(body: &req.bytes, len: mark)
-    if ack.len != 0 { return BUG }
-    let _ = move ack
-
-    let a = req.text(UartOp.Write,
-                     "SOS uartsvc: root wrote this line through the driver\n")
-    let first = try inlet.post(body: &req.bytes, len: a)
-    let _ = move first
-
-    let b = req.text(UartOp.Write,
-                     "SOS uartsvc: and root does not hold the device\n")
-    let second = try inlet.post(body: &req.bytes, len: b)
-    let _ = move second
-
-    let sync = req.bare(UartOp.Sync)
-    let settled = try inlet.send(body: &req.bytes, len: sync)
-    if settled.len != 0 { return BUG }
-    let _ = move settled
+func own_round(u: &var Uart<PipeTransport>) -> Result<Void, UartError> {
+    try u.mark()
+    try u.write("SOS uartsvc: root wrote this line through the driver\n")
+    try u.write("SOS uartsvc: and root does not hold the device\n")
+    try u.sync()
     return
 }
 

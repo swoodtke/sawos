@@ -1,0 +1,101 @@
+//! A root that writes through the console driver with its handle table full.
+//!
+//! Root's handle row has no quota, so its table fills before any row runs
+//! out: it mints siblings of its inlet until the kernel refuses one with
+//! `NoResource`. A write then needs a handle for its post's claim and has
+//! none, so the pipe transport sends it as a call (`uartpipe`), which mints
+//! no claim: the line reaches the console all the same. Root then lets the
+//! siblings go, syncs, hangs up and waits for the driver's end.
+//!
+//!   SOS fullroot: the table filled: (NoResource's description)
+//!   SOS fullroot: a write with the table full
+//!   SOS console drv: ...
+//!   SOS fullroot: console ended status=65536
+
+import sos.{System, PipeInlet, WaitResult, SosStatus, SystemRight}
+import uartproto.{Uart}
+import uartpipe.{PipeTransport, uart}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The driver's tags (`drivers/svc-console/process.toml`).
+static TAG_SYSTEM: UInt = 1
+static TAG_SERVE: UInt = 2
+
+static KEY_DRIVER: UInt = 1
+
+/// What the stock root gives a child.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS fullroot: failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var image_rec = try proc.boot_handle_next()
+    var dest_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return SosStatus.BadImage }
+    guard let dest = dest_rec.take_memory() else { return SosStatus.BadImage }
+    let driver = try system.process_create(image: &image, memory: &dest)
+    let _ = move image
+    let _ = move dest
+
+    let (inlet, outlet) = try proc.pipe_create()
+    let sibling = try system.mint(rights: CHILD_SYSTEM)
+    try driver.give(system: move sibling, tag: TAG_SYSTEM) catch { return error.0 }
+    try driver.give(outlet: move outlet, tag: TAG_SERVE) catch { return error.0 }
+    try driver.start(boot_tag: TAG_SYSTEM)
+
+    var u = uart(move inlet)
+    try write_with_the_table_full(&var u)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &driver, key: KEY_DRIVER)
+    let _ = move u
+    let ended = try waiter.wait()
+    print("SOS fullroot: console ended status={}", status_of(&ended))
+    let _ = move ended
+    return
+}
+
+/// Fills the table with siblings of the inlet, writes, then lets them go.
+func write_with_the_table_full(u: &var Uart<PipeTransport>) -> Result<Void, SosStatus> {
+    var siblings = Vector<PipeInlet>()
+    var full = false
+    while not full {
+        let s = try u.transport.inlet.mint() catch {
+            print("SOS fullroot: the table filled: {}", error)
+            full = true
+            continue
+        }
+        try! siblings.push(move s)
+    }
+    try u.write("SOS fullroot: a write with the table full\n") catch {
+        print("SOS fullroot: the write: {}", error)
+        return SosStatus.BadImage
+    }
+    let _ = move siblings
+    try u.sync() catch {
+        print("SOS fullroot: the sync: {}", error)
+        return SosStatus.BadImage
+    }
+    return
+}
+
+/// The §8 status word out of a wait record: root attaches only its driver.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("root attached only a Process"),
+    }
+}

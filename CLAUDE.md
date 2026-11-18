@@ -129,10 +129,11 @@ region table's and slab block's bytes, an image's limits and each refusal of
 them, the in-place check, the slab-region check, and every board, process
 and image description in the tree read clean) and the hosted packages'
 (`HOSTED_TESTS`: `drivers/esp32s3io/`, `drivers/gpioproto/`,
-`drivers/pwmproto/` and `rt/common/`, the runtime's heap), which need no
-emulator and print nothing when they
-pass. Per profile it writes a profile description (JSON) and calls `sosimage
-native`, then `sosimage board` on the profile's `hal/<profile>/board.toml`,
+`drivers/pwmproto/`, `drivers/uartproto/`, `drivers/consolecore/` and
+`rt/common/`, the runtime's heap), which need no emulator and print nothing
+when they pass. Per profile it writes a profile description (JSON) and calls
+`sosimage native`, then `sosimage board` on the profile's
+`hal/<profile>/board.toml`,
 then `sosimage package` once for
 each package and role (root, or child i) the cases give it, which writes the
 process's script (its region, and on the S3 its flash slot, from

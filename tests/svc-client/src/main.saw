@@ -28,8 +28,9 @@
 // on which process wrote which byte, so a line from here would be one more
 // thing to order. The verdict travels in the §8 exit code.
 
-import sos.{System, Process, PipeInlet, PipeMsg, SosStatus, PIPE_BODY_BYTES}
-import uartproto.{UartOp, UartBody}
+import sos.{System, Process}
+import uartproto.{Uart}
+import uartpipe.{PipeTransport, uart}
 
 /// How many bytes this client echoes. The harness feeds one more than this:
 /// root takes the first byte through its own retained inlet and this process
@@ -39,7 +40,8 @@ static ROUNDS: Int = 3
 
 /// Every round read a byte and wrote it back.
 static EXIT_ECHOED: UInt = 61
-/// A call was refused, or answered a length no read can produce.
+/// A request failed: a refusal, a reply no request produces, or the driver
+/// gone.
 static EXIT_MISMATCH: UInt = 62
 /// The boot set held no inlet where its launcher's config says one is.
 static EXIT_NO_INLET: UInt = 63
@@ -64,45 +66,33 @@ func _start(boot_handle: UInt) {
         return
     }
 
-    let verdict = echo(&inlet)
+    // The client lives until `exit`, which does not return: dropping it
+    // would release the inlet, one more trap than the ledger its launcher
+    // checks.
+    var u = uart(move inlet)
+    let verdict = echo(&var u)
     let _ = proc.exit(verdict)
 }
 
 /// The loop, in its own frame. This body must contain no print, and keeping it
 /// apart from the entry makes that visible at a glance.
-func echo(inlet: &PipeInlet) -> UInt {
-    var req = UartBody.empty()
-
+func echo(u: &var Uart<PipeTransport>) -> UInt {
     var round: Int = 0
     while round < ROUNDS {
-        // The blocking read, composed out of shipped parts. `send` is the fused
-        // `Call`: it stages the request and parks this thread on a claim the
+        // The blocking read, composed out of shipped parts: the fused `Call`
+        // (one trap) stages the request and parks this thread on a claim the
         // kernel keeps internally, so no handle is minted and no table row is
         // spent however long the wait is. The driver holds this obligation
         // until a device interrupt makes an answer possible; the kernel, which
-        // routes all of it, has never heard of a UART.
-        let n = req.bare(UartOp.Read)
-        let answer = try inlet.send(body: &req.bytes, len: n) catch {
-            return EXIT_MISMATCH
-        }
-        // A read answers exactly one byte: the reply's own `len` is the length
-        // prefix, so a wrong length is a protocol violation rather than a short
-        // read to loop over.
-        if answer.len != 1 {
-            return EXIT_MISMATCH
-        }
-        let b = answer.bytes[0]
-        let _ = move answer
+        // routes all of it, has never heard of a UART. A reply that is not
+        // `Ok` and one byte is an error, not a short read to loop over.
+        let b = try u.read() catch { return EXIT_MISMATCH }
 
         // The tell: post and drop the claim (§2.1's payload-carrying one-way).
         // Nothing comes back and nothing is waited for; the proof it arrived is
         // the byte appearing on the console, written by a process that is not
         // this one.
-        let m = req.one(UartOp.Write, b)
-        let claim = try inlet.post(body: &req.bytes, len: m) catch {
-            return EXIT_MISMATCH
-        }
-        let _ = move claim
+        try u.write_byte(b) catch { return EXIT_MISMATCH }
 
         round = round + 1
     }
@@ -116,14 +106,7 @@ func echo(inlet: &PipeInlet) -> UInt {
     //
     // `Sync` is the barrier: a connection's ring is FIFO, so an answered `Sync`
     // proves every message posted before it has been served.
-    let s = req.bare(UartOp.Sync)
-    let settled = try inlet.send(body: &req.bytes, len: s) catch {
-        return EXIT_MISMATCH
-    }
-    if settled.len != 0 {
-        return EXIT_MISMATCH
-    }
-    let _ = move settled
+    try u.sync() catch { return EXIT_MISMATCH }
 
     EXIT_ECHOED
 }

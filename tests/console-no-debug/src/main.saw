@@ -1,0 +1,146 @@
+//! A root that gives the console driver a System handle without `Debug`.
+//!
+//! The driver checks for the right before anything else and, without it,
+//! exits with its `EXIT_NO_DEBUG` before it serves anyone. Root runs until it
+//! blocks, so everything it sends before then is in the connection's ring
+//! when the driver ends: a `Write` whose claim it keeps, then writes through
+//! the typed client until one fails. Those fill the ring, the first that
+//! finds it full is sent as a call (`uartpipe`), and root parks in that call
+//! until the driver ends, which fails it: the call's failure is the write's.
+//! The kept claim then answers `PeerClosed`, a `Sync` finds the driver gone,
+//! and nothing reaches the console. A last write finds the driver gone in its
+//! post alone: a closed peer is no refusal the transport retries as a call.
+//!
+//!   SOS nodebug: started the console driver without Debug
+//!   SOS nodebug: the write past the ring, after N: the driver is gone
+//!   SOS nodebug: console ended status=65538
+//!   SOS nodebug: the write posted before it ended: the other end of this
+//!                connection is gone
+//!   SOS nodebug: a sync after it ended: the driver is gone
+//!   SOS nodebug: a write after it ended: the driver is gone, in 1 trap
+//!
+//! `N` is the ring's `PIPE_INFLIGHT` less the kept claim's slot. Root parks on
+//! the driver's end, so the order is forced, not raced.
+
+import sos.{System, Process, WaitResult, SosStatus, SystemRight, PIPE_BODY_BYTES}
+import uartproto.{BODY_BYTES, Uart, UartBody, UartOp}
+import uartpipe.{PipeTransport, uart}
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The driver's tags (`drivers/svc-console/process.toml`).
+static TAG_SYSTEM: UInt = 1
+static TAG_SERVE: UInt = 2
+
+static KEY_DRIVER: UInt = 1
+
+/// Every right the stock root gives a child but `Debug`.
+static NO_DEBUG: UInt32 = (SystemRight.ProcessSelf | SystemRight.ClockGet
+                           | SystemRight.Transfer)
+
+/// More writes than any ring holds: one of them must fail.
+static WRITES: Int = 64
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS nodebug: failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var image_rec = try proc.boot_handle_next()
+    var dest_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return SosStatus.BadImage }
+    guard let dest = dest_rec.take_memory() else { return SosStatus.BadImage }
+    let driver = try system.process_create(image: &image, memory: &dest)
+
+    let (inlet, outlet) = try proc.pipe_create()
+    let masked = try system.mint(rights: NO_DEBUG)
+    try driver.give(system: move masked, tag: TAG_SYSTEM) catch { return error.0 }
+    try driver.give(outlet: move outlet, tag: TAG_SERVE) catch { return error.0 }
+    try driver.start(boot_tag: TAG_SYSTEM)
+    print("SOS nodebug: started the console driver without Debug")
+
+    var body = UartBody.empty()
+    let n = body.text(UartOp.Write, "SOS nodebug: this line must not appear\n")
+    let claim = try inlet.post(body: &body.bytes, len: n)
+
+    var u = uart(move inlet)
+    try past_the_ring(&var u)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &driver, key: KEY_DRIVER)
+    let ended = try waiter.wait()
+    print("SOS nodebug: console ended status={}", status_of(&ended))
+    let _ = move ended
+
+    let answered = try (move claim).resolve() catch {
+        print("SOS nodebug: the write posted before it ended: {}", error)
+        try sync_after(&var u)
+        return write_after(&proc, &var u)
+    }
+    let _ = move answered
+    print("SOS nodebug: the write posted before it ended was answered")
+    return SosStatus.BadImage
+}
+
+/// Writes until one fails: the first past the ring parks as a call, and the
+/// driver's end fails that call.
+func past_the_ring(u: &var Uart<PipeTransport>) -> Result<Void, SosStatus> {
+    var written = 0
+    while written < WRITES {
+        try u.write("SOS nodebug: nor this one\n") catch {
+            print("SOS nodebug: the write past the ring, after {}: {}", written,
+                  error)
+            return
+        }
+        written = written + 1
+    }
+    print("SOS nodebug: {} writes and none failed", WRITES)
+    return SosStatus.BadImage
+}
+
+/// A `Sync` after the driver ended, through the typed client: the driver is
+/// gone.
+func sync_after(u: &var Uart<PipeTransport>) -> Result<Void, SosStatus> {
+    try u.sync() catch {
+        print("SOS nodebug: a sync after it ended: {}", error)
+        return
+    }
+    print("SOS nodebug: a sync after it ended was answered")
+    return SosStatus.BadImage
+}
+
+/// A write after the driver ended, and the traps it took: the post, and no
+/// call after it.
+func write_after(proc: &Process, u: &var Uart<PipeTransport>) -> Result<Void, SosStatus> {
+    let before = try proc.stats()
+    let failed = u.write("SOS nodebug: nor this\n")
+    let after = try proc.stats()
+    // Each `stats()` is charged before it answers, so the difference holds the
+    // second's trap as well as the write's.
+    let traps = after.syscalls - before.syscalls - 1
+    try failed catch {
+        print("SOS nodebug: a write after it ended: {}, in {} trap", error, traps)
+        return
+    }
+    print("SOS nodebug: a write after it ended was answered")
+    return SosStatus.BadImage
+}
+
+/// The §8 status word out of a wait record: root attaches only its driver.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("root attached only a Process"),
+    }
+}

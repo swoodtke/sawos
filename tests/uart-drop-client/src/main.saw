@@ -1,0 +1,75 @@
+//! A client that drops the claim of a read its UART driver can answer at
+//! once, then reads on.
+//!
+//! The harness hands the driver its input at once, so the driver has bytes
+//! buffered by the time this client's first read is answered. The client
+//! then tells a `Read` (posts it and drops the claim) and calls a `Sync`: the
+//! connection is served in order, so when the `Sync` answers, the driver has
+//! answered that read from its buffer, and the reply went nowhere. The byte
+//! it was answered with must go back to the buffer, so the reads after it
+//! get every byte that was typed: the client writes them back as one line.
+
+import sos.{System, BootSet, SosStatus}
+import uartproto.{Uart, UartBody, UartError, UartOp}
+import uartpipe.{PipeTransport, uart}
+
+/// The client end of the driver's connection, as `process.toml` declares it.
+static TAG_UART: UInt = 2
+
+/// How many bytes the harness types.
+static TYPED: Int = 4
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+func echo(u: &var Uart<PipeTransport>) -> Result<Void, UartError> {
+    var got: [UInt8; TYPED] = [0; TYPED]
+    try u.mark()
+    got[0] = try u.read()
+    var body = UartBody.empty()
+    let n = body.bare(UartOp.Read)
+    try u.transport.tell(&body.bytes, n)
+    try u.sync()
+    var i = 1
+    while i < TYPED {
+        got[i] = try u.read()
+        i = i + 1
+    }
+    try u.write("SOS uartdrop: after a dropped read, ")
+    i = 0
+    while i < TYPED {
+        try u.write_byte(got[i])
+        i = i + 1
+    }
+    try u.write("\n")
+    try u.sync()
+    return
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch { return }
+    var set = try BootSet(process: &proc) catch {
+        print("SOS uartdrop: drain: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard var record = set.take(TAG_UART) else {
+        print("SOS uartdrop: no record {}", TAG_UART)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let inlet = record.take_inlet() else {
+        print("SOS uartdrop: record {} is no inlet", TAG_UART)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    var u = uart(move inlet)
+    try echo(&var u) catch {
+        print("SOS uartdrop: stopped: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let _ = proc.exit(EXIT_OK)
+}

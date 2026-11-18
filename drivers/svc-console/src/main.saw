@@ -1,0 +1,211 @@
+// The kernel's console as a `uartproto` service.
+//
+// The process serves `uartproto` over a pipe and writes what it is sent
+// through its System handle's `debug_print`, the kernel console. A process
+// prints through a UART connection on every board this way; on a board with a
+// UART driver an image names that driver instead, and its clients do not
+// change. Nothing here names a client: whoever holds an inlet of the
+// connection is served.
+//
+// Its loop is a completion-queue server, as the UART drivers' are: the outlet
+// is given to the Waiter, so every request arrives through `wait` itself with
+// the obligation to answer it, and the process holds no endpoint handle. Every
+// request is answered at once, with the status `consolecore.console_status`
+// gives it: a `Write`'s payload goes to the console and is answered `Ok`, as
+// are `Sync` and `Mark`; a `Read` is answered `Unsupported`, since the kernel
+// console has no input for a process; anything the protocol refuses is
+// answered `BadOp`. The driver holds no obligation, so no read parks.
+//
+// The cost: each `Write` is a pipe round trip, then one trap per byte, each
+// the kernel's synchronous console write. On the ESP32-S3 that write stalls
+// with interrupts masked while UART0's transmit FIFO is full. The driver suits
+// a product that prints little. A client's writes wait in the connection's
+// ring, `PIPE_INFLIGHT` of them, until this driver runs; past that the
+// client's transport waits for the driver (`uartpipe`), so a burst slows the
+// writer and loses nothing.
+//
+// It needs `SystemRight.Debug` and checks for it before anything else. Without
+// it the driver can say nothing, so it exits with `EXIT_NO_DEBUG` before it
+// serves anyone, and its clients' calls answer `PeerClosed`.
+
+import sos.{System, Process, Waiter, WaitResult, BootSet, PipeOutlet,
+            PipeRequest, AttachMode, SosStatus, SystemRight, PIPE_BODY_BYTES}
+import uartproto.{BODY_BYTES, Frame, UartBody, UartOp}
+import consolecore.{Tally, console_status, writes}
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+/// Its System handle has no `Debug`, so the console is not this process's to
+/// write.
+static EXIT_NO_DEBUG: UInt = 2
+
+/// A status this driver can never legitimately produce, so meeting it means an
+/// assertion in this file failed rather than a call did.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The tag its declaration gives its server end (`process.toml`).
+static TAG_SERVE: UInt = 2
+
+/// The Waiter's key for the server end.
+static KEY_OUTLET: UInt = 11
+
+/// What a serving run answers with.
+struct Report {
+    tally: Tally,
+    /// The traps from the first `Mark` to the loop's end, the closing
+    /// `stats()` read included; 0 with no mark.
+    traps: UInt64,
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    // A failure here cannot report through `exit`, because `exit` is the op on
+    // the handle that just failed to arrive.
+    let proc = try system.process_self() catch { return }
+    let rights = try system.rights() catch {
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    if (rights & (SystemRight.Debug as UInt32)) == 0 {
+        let _ = proc.exit(EXIT_NO_DEBUG)
+        return
+    }
+    var set = try BootSet(process: &proc) catch {
+        print("SOS console drv: no boot records: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let outlet = take_serve(&var set, TAG_SERVE) else {
+        print("SOS console drv: no server end under tag {}", TAG_SERVE)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let done = try run(&system, &proc, move outlet) catch {
+        print("SOS console drv: failed: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    print("SOS console drv: served={} refused={} unsupported={} printed={}",
+          done.tally.served, done.tally.refused, done.tally.unsupported,
+          done.tally.printed)
+    print("SOS console drv: after the mark traps={}", done.traps)
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// The server-end record `tag`, or `None` when the set has no such record.
+func take_serve(set: &var BootSet, tag: UInt) -> PipeOutlet? {
+    guard var record = set.take(tag) else { return None }
+    record.take_outlet()
+}
+
+/// Wires the Waiter and serves until every client is gone.
+func run(system: &System, proc: &Process, outlet: PipeOutlet) -> Result<Report, SosStatus> {
+    let waiter = try proc.waiter_create()
+    // The consuming, persistent attach: the attachment owns the server end from
+    // here on, and this process holds no outlet handle.
+    try waiter.give(outlet: move outlet, key: KEY_OUTLET,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    serve(&system, &proc, &waiter)
+}
+
+/// Whether a delivery is a request; anything else on the one attachment is the
+/// terminal level, every inlet gone.
+func is_message(r: &WaitResult) -> Bool {
+    match r.what {
+        case Message(_, _) -> true,
+        case _ -> false,
+    }
+}
+
+/// Whether `frame` is a `Mark` the protocol accepts.
+func is_mark(frame: &Frame) -> Bool {
+    if let op = frame.request() { op == UartOp.Mark } else { false }
+}
+
+/// The loop: one `wait`, then one answer per request, until the terminal
+/// level.
+func serve(system: &System, proc: &Process, waiter: &Waiter) -> Result<Report, SosStatus> {
+    var tally = Tally.zero()
+    var body = UartBody.empty()
+    var marked = false
+    var mark_syscalls: UInt64 = 0
+
+    var wake = try waiter.wait()
+    var serving = true
+    while serving {
+        if not is_message(&wake) {
+            serving = false
+        } else {
+            let (_, what) = (move wake).open()
+            match what {
+                case Message(m, r) -> {
+                    // The bytes are copied out and the message dropped, so
+                    // whatever handles it carried are released first.
+                    let frame = Frame(len: m.len, bytes: m.bytes)
+                    let _ = move m
+                    let status = console_status(&frame)
+                    var printed: UInt32 = 0
+                    if writes(&frame) {
+                        try print_payload(&system, &frame)
+                        printed = frame.payload_len() as UInt32
+                    }
+                    if is_mark(&frame) && not marked {
+                        let now = try proc.stats()
+                        mark_syscalls = now.syscalls
+                        marked = true
+                    }
+                    tally.count(status, printed)
+                    let n = body.refuse(status)
+                    wake = try answer(move r, &body, n, &waiter)
+                },
+                // Unreachable: `is_message` established the tag one line up.
+                case _ -> { return BUG },
+            }
+        }
+    }
+
+    let after = try proc.stats()
+    var traps: UInt64 = 0
+    if marked && after.syscalls >= mark_syscalls {
+        traps = after.syscalls - mark_syscalls
+    }
+    return Report(tally: tally, traps: traps)
+}
+
+/// Writes a `Write` request's payload to the kernel console, a byte a trap.
+func print_payload(system: &System, frame: &Frame) -> Result<Void, SosStatus> {
+    var i: Int = 0
+    let n = frame.payload_len() as Int
+    while i < n {
+        try system.debug_print_byte(frame.payload_byte(i))
+        i = i + 1
+    }
+    return
+}
+
+/// Answers `request` with `n` bytes of `body` and waits for the next delivery,
+/// in one trap when the reply lands.
+///
+/// A reply that does not land (the client dropped its claim, as a client
+/// that tells a `Write` rather than calling it has) has discharged the
+/// obligation all the same, and the loop waits afresh: one client cannot end
+/// the driver.
+func answer(request: PipeRequest, body: &UartBody, n: UInt,
+            waiter: &Waiter) -> Result<WaitResult, SosStatus> {
+    var r = move request
+    let next = try (move r).reply_wait(body: &body.bytes, len: n,
+                                       waiter: &waiter) catch {
+        match error {
+            case Reply(_) -> { return waiter.wait() },
+            case Wait(s) -> { return s },
+        }
+    }
+    return move next
+}

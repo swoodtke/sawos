@@ -1,0 +1,137 @@
+// The UART wire, as bytes: each op and status value, each builder's bytes and
+// lengths, and the decoders' guards. A shared enum would change client and
+// driver together and no case would notice, so the numbers are written here.
+
+import uartproto.{ASCII_SUBSTITUTE, BODY_BYTES, Frame, MAX_PAYLOAD, OP_BYTE,
+                  PAYLOAD_BYTE, UartBody, UartOp, UartStatus}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func is_op(op: UartOp?, want: UartOp) -> Bool {
+    if let o = op { o == want } else { false }
+}
+
+func is_status(frame: &Frame, want: UartStatus) -> Bool {
+    if let status = frame.status() { status == want } else { false }
+}
+
+/// A message of `len` bytes: op byte `op`, the rest `fill`.
+func message(len: UInt, op: UInt8, fill: UInt8) -> Frame {
+    var f = Frame(len: len, bytes: [fill; BODY_BYTES])
+    f.bytes[0] = op
+    f
+}
+
+func main() {
+    // Op and status numbers, and the body's layout.
+    check(UartOp.Read as UInt8 == 1, "Read is 1")
+    check(UartOp.Write as UInt8 == 2, "Write is 2")
+    check(UartOp.Sync as UInt8 == 3, "Sync is 3")
+    check(UartOp.Mark as UInt8 == 4, "Mark is 4")
+    check(UartOp.from(raw: 0).is_none(), "no op 0")
+    check(UartOp.from(raw: 5).is_none(), "no op 5")
+    check(UartOp.from(raw: 255).is_none(), "no op 255")
+    check(UartStatus.Ok as UInt8 == 0, "Ok is 0")
+    check(UartStatus.BadOp as UInt8 == 1, "BadOp is 1")
+    check(UartStatus.Unsupported as UInt8 == 2, "Unsupported is 2")
+    check(UartStatus.Busy as UInt8 == 3, "Busy is 3")
+    check(UartStatus.from(raw: 4).is_none(), "no status 4")
+    check(UartStatus.Ok.describe().equals("Ok") && UartStatus.BadOp.describe().equals("BadOp")
+          && UartStatus.Unsupported.describe().equals("Unsupported")
+          && UartStatus.Busy.describe().equals("Busy"), "each status's name")
+    check(UartOp.Read.describe().equals("read") && UartOp.Write.describe().equals("write")
+          && UartOp.Sync.describe().equals("sync") && UartOp.Mark.describe().equals("mark"),
+          "each op's name")
+    check(BODY_BYTES == 128, "a body is 128 bytes")
+    check(OP_BYTE == 0 && PAYLOAD_BYTE == 1, "the op, then the payload")
+    check(MAX_PAYLOAD == 127, "a payload is the body less the op")
+    check(UartOp.Write.takes_payload(), "Write takes a payload")
+    check(not UartOp.Read.takes_payload(), "Read takes none")
+    check(not UartOp.Sync.takes_payload(), "Sync takes none")
+    check(not UartOp.Mark.takes_payload(), "Mark takes none")
+
+    // Request builders.
+    var b = UartBody.empty()
+    var n = b.bare(UartOp.Sync)
+    check(n == 1 && b.bytes[0] == 3, "Sync")
+    n = b.one(UartOp.Write, 0x5A)
+    check(n == 2 && b.bytes[0] == 2 && b.bytes[1] == 0x5A, "Write one byte")
+    n = b.text(UartOp.Write, "ok\n")
+    check(n == 4 && b.bytes[0] == 2 && b.bytes[1] == 0x6F && b.bytes[2] == 0x6B
+          && b.bytes[3] == 0x0A, "Write a line")
+    n = b.text(UartOp.Write, "")
+    check(n == 1 && b.bytes[0] == 2, "Write nothing")
+    n = b.text(UartOp.Write, "a\u{E9}~\u{7F}")
+    check(n == 5 && b.bytes[1] == 0x61 && b.bytes[2] == ASCII_SUBSTITUTE
+          && b.bytes[3] == 0x7E && b.bytes[4] == 0x7F,
+          "a non-ASCII scalar is the substitute, the last ASCII one itself")
+    check(ASCII_SUBSTITUTE == 0x3F, "the substitute is ?")
+    var long = ""
+    var i = 0
+    while i < MAX_PAYLOAD + 1 {
+        long = "{long}x"
+        i = i + 1
+    }
+    n = b.text(UartOp.Write, long)
+    check(n == BODY_BYTES as UInt && b.bytes[MAX_PAYLOAD] == 0x78,
+          "a line past the payload is cut at MAX_PAYLOAD")
+    n = b.raw(255, 2)
+    check(n == 3 && b.bytes[0] == 255, "a raw request")
+
+    // Reply builders.
+    var r = UartBody.empty()
+    n = r.ok()
+    check(n == 1 && r.bytes[0] == 0, "Ok alone")
+    n = r.refuse(UartStatus.Unsupported)
+    check(n == 1 && r.bytes[0] == 2, "a refusal is the status alone")
+    n = r.refuse(UartStatus.BadOp)
+    check(n == 1 && r.bytes[0] == 1, "BadOp alone")
+    n = r.ok_byte(0x5A)
+    check(n == 2 && r.bytes[0] == 0 && r.bytes[1] == 0x5A, "Ok and a byte")
+
+    // A request the protocol accepts, at the ends of each length.
+    check(is_op(message(1, 1, 0).request(), UartOp.Read), "Read, no payload")
+    check(is_op(message(1, 3, 0).request(), UartOp.Sync), "Sync, no payload")
+    check(is_op(message(1, 4, 0).request(), UartOp.Mark), "Mark, no payload")
+    check(is_op(message(1, 2, 0).request(), UartOp.Write), "Write, no payload")
+    check(is_op(message(BODY_BYTES as UInt, 2, 0).request(), UartOp.Write),
+          "Write, a full payload")
+    // And each it refuses: no bytes, no op, a payload where none goes.
+    check(message(0, 1, 0).op().is_none(), "no bytes, no op")
+    check(message(0, 1, 0).request().is_none(), "no bytes, refused")
+    check(message(1, 0, 0).request().is_none(), "op 0 refused")
+    check(message(1, 5, 0).request().is_none(), "op 5 refused")
+    check(message(1, 255, 0).request().is_none(), "op 255 refused")
+    check(message(2, 1, 0).request().is_none(), "Read with a byte refused")
+    check(message(2, 3, 0).request().is_none(), "Sync with a byte refused")
+    check(message(2, 4, 0).request().is_none(), "Mark with a byte refused")
+    check(message(BODY_BYTES as UInt, 3, 0).request().is_none(),
+          "Sync with a full payload refused")
+
+    // Payload decoding: lengths, and a byte out of range is 0.
+    let w = message(3, 2, 9)
+    check(w.payload_len() == 2, "two payload bytes")
+    check(w.payload_byte(0) == 9 && w.payload_byte(1) == 9, "the payload")
+    check(w.payload_byte(2) == 0, "past the payload")
+    check(w.payload_byte(-1) == 0, "before the payload")
+    let empty = message(0, 2, 9)
+    check(empty.payload_len() == 0, "no bytes, no payload")
+    check(empty.payload_byte(0) == 0, "an empty message's byte")
+
+    // Replies.
+    let ok = message(2, 0, 0x5A)
+    check(is_status(&ok, UartStatus.Ok), "status 0 is Ok")
+    check(ok.byte(1) == 0x5A, "the byte after the status")
+    check(ok.byte(2) == 0 && ok.byte(-1) == 0, "a reply byte out of range")
+    let unsupported = message(1, 2, 0)
+    check(is_status(&unsupported, UartStatus.Unsupported), "status 2")
+    check(is_status(&message(1, 3, 0), UartStatus.Busy), "status 3")
+    check(message(1, 4, 0).status().is_none(), "4 is no status")
+    check(message(0, 0, 0).status().is_none(), "no bytes, no status")
+}
