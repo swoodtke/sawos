@@ -981,8 +981,14 @@ equivalent with the reason.
     sibling minted without `Extend`, `Map` alone; an `Any` cut and a `Back`
     cut never read `Extend`.
   - **`pool_odd_len`:** a boot pool row whose length is a grain and two
-    bytes reads `available` short by the two bytes, and a `Back` cut of one
-    grain lands on the grain.
+    bytes, and a `Back` cut of one grain from it. The case asserts the cut's
+    base, read with `Mapping.base()`, is the grain below the frontier's
+    rounded top, on riscv32, riscv32-flat and the S3; arm64 does not read it,
+    since its mapping's base is a virtual address. `available` reading short
+    by the two bytes is asserted too, but holds without the rounding
+    (`pool_available` already counts the frontier through `aligned_run`), so
+    the pin is the cut's base: it goes red only if `Back` takes its start as
+    the frontier's top less `len`.
   - **`pool_from_bad`:** a `from` of 3 is the `BadArg` fault.
 - Mutants:
   - first fit for `Back` (`pool_back_reuse` lands low);
