@@ -1274,8 +1274,11 @@ stale doc corrected. Its tests prove:
 
 Mutants: the unwind dropped (the rows do not read back); the self flag's
 check dropped; the yield hook made a no-op (the no-tick case hangs and the
-harness's timeout reports it); the taken word's exchange replaced by a load
-and a store.
+harness's timeout reports it). The taken word's exchange replaced by a load and
+a store is equivalent on the gate, and the exchange is held by reading: the
+kernel is uniprocessor, nothing in the take blocks or yields between the load
+and the store, and a tick landing there would be a host-time dependence, so
+both shapes give the loser's panic.
 
 **Unit 4: the builder's console.** `[image] console`, the reserved range in
 `bootplan` and its refusal in declarations, the inlet record appended per
