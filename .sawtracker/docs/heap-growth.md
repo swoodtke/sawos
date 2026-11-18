@@ -825,14 +825,13 @@ inside the drain (§2.3).
 
 ## Open questions
 
-**Q1. Is a heap's pool the runtime's alone?** The runtime uses the whole
-pool and keeps no handle, so it cannot be passed on; a process that wants a
-pool to share declares a `memory` record and manages it.
-*Recommendation:* yes.
+None. The owner ruled on both:
 
-**Q2. What is the default built-in heap's size?** Today's scripts give
-64 KiB (`PROVIDE(ARENA_SIZE = 64K)`), and an image may now set its own
-(`[image] arena`). Shrinking the scripts' default would move every image
-and could leave a test or driver short. *Recommendation:* keep 64 KiB as
-the scripts' default; a product sets a small `[image] arena` and declares
-heaps.
+- **A heap's pool is owned entirely by the runtime.** The runtime uses the
+  whole pool and keeps no handle, so it cannot be passed on; a process that
+  wants memory to share declares a `memory` record and manages it.
+- **The built-in heap defaults to 4 KiB on every board.** The runtime needs
+  none (start-up, `print` and the panic path allocate nothing); a process
+  that needs more raises it in its build config (`arena` in its declaration,
+  or `[image] arena` for an image's processes), and a larger board's
+  processes declare heaps or, later, ask a page-granular memory service.
