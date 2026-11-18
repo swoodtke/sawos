@@ -166,9 +166,9 @@ The **Where** column names the file: `boot.S` is this board's, `trap.S` and
 | `virt.ld` | this board | Places the image at this board's RAM base, first section first, and bounds the appended payload on page boundaries at both ends. The rounding is a speed property under emulation rather than a protection one: a PMP region covering part of a page defeats the emulator's per-page translation cache, and the cost under emulation is large enough to matter. | Not a program. |
 
 `sos_rt_write` (check-free by construction so the panic path cannot re-enter
-it), `sos_rt_abort` (it is `exit_fail` under the seam's name), and the PMP
-arithmetic (`prot_reset` / `prot_region` / `prot_commit` over the two register
-writers above) are Saw in `lib.saw`.
+it), `sos_rt_abort` (the text through `sos_rt_write`, then `exit_fail`), and
+the PMP arithmetic (`prot_reset` / `prot_region` / `prot_commit` over the two
+register writers above) are Saw in `lib.saw`.
 
 ## Required of the kernel
 

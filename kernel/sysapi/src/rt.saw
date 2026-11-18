@@ -1,38 +1,37 @@
 //! The runtime's three hooks, process side.
 //!
 //! `sosrt` implements the frozen `__saw_rt_*` seams over three per-side hooks:
-//! where a byte goes, how the machine stops, and which thread asks. The kernel
-//! HAL answers "the UART" and "the board's stop". A process owns no device, so
-//! it answers "a System op" to both. If `panic()` could reach a UART from
-//! userspace, the user/kernel split would be claimed rather than real. The
-//! third it answers from the thread register (the foot of this file).
+//! where a byte goes, how a run ends with a text, and which thread asks. The
+//! kernel HAL answers "the UART" and "write the text, stop the board". A
+//! process owns no device, so it answers with kernel ops: a byte goes out
+//! through a System op, and the end is the kernel's panic op, which puts the
+//! text on its fault line and ends the process. If `panic()` could reach a
+//! UART from userspace, the user/kernel split would be claimed rather than
+//! real. The third it answers from the thread register (the foot of this
+//! file).
 //!
-//! They live here, not in `hal/<arch>/user/`, because they name no architecture
-//! (a byte reaches the console through a System op, the same op on every
-//! profile; the thread register is read through the user HAL's accessors) and
-//! belong to whoever owns the System object.
+//! They live here, not in `hal/<arch>/user/`, because they name no
+//! architecture: the System op and the panic op are the same ops on every
+//! profile, and the thread register is read through the user HAL's accessors.
 //!
 //! This is the top of the module order because the first two hooks are written
-//! over a System op: the byte goes out through `sos_system_debug_print` and the
-//! machine stops through `sos_system_shutdown`. The handle they use is parked
-//! at the floor by `System(boot_handle:)`, which neither hook can do for
-//! itself.
+//! over the floor's ops. The byte goes out through `sos_system_debug_print`,
+//! on the handle `System(boot_handle:)` parks at the floor, which the hook
+//! cannot do for itself; the end goes through `sos_panic`, which needs no
+//! handle.
 
-import sos.floor.{SYSTEM_HANDLE, sos_system_debug_print, sos_system_shutdown}
+import sos.floor.{SYSTEM_HANDLE, sos_system_debug_print, sos_panic}
+import sosabi.{PANIC_TEXT_BYTES}
 
-/// Write `len` bytes at `ptr` to the debug console. This is the panic path's
-/// writer.
+/// Write `len` bytes at `ptr` to the debug console: `print`'s writer.
 ///
-/// Check-free by construction, on the same terms as the kernel HAL's writer: it
-/// runs while a panic is being reported, so a bounds or overflow check that
-/// tripped here would re-enter `__saw_rt_panic` and hang or garble the one
-/// diagnostic that matters. So: no indexing (raw `UnsafeMemory` reads), no
-/// allocation, no `String`, and a cursor that advances with wrapping arithmetic
-/// (`&+` / `&-`) so even a nonsensical length cannot raise an overflow trap.
+/// Check-free by construction, on the same terms as the kernel HAL's writer: no
+/// indexing (raw `UnsafeMemory` reads), no allocation, no `String`, and a
+/// cursor that advances with wrapping arithmetic (`&+` / `&-`), so even a
+/// nonsensical length cannot raise an overflow trap inside `print`.
 ///
-/// A per-byte status is dropped on purpose. There is nowhere to report it (the
-/// console is the thing that would have failed), and a second channel for "the
-/// console is broken" is how a panic path stops being one.
+/// A per-byte status is dropped on purpose: there is nowhere to report it, and
+/// the console is the thing that would have failed.
 @export("sos_rt_write")
 func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
     if SYSTEM_HANDLE == 0 {
@@ -48,17 +47,60 @@ func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
     }
 }
 
-/// Stop the machine with `code`, for the common runtime.
+/// The words of the buffer a panic's text is copied into: the kernel's bound,
+/// which is a whole number of words on every profile.
+static PANIC_COPY_WORDS: Int = PANIC_TEXT_BYTES / sizeof<UInt>()
+
+static_assert(PANIC_TEXT_BYTES % sizeof<UInt>() == 0,
+              "the panic text's bound is a whole number of words")
+
+/// What a cut copy ends with, and how many of it: `...`.
+static CUT_MARK: UInt8 = 0x2Eu8
+static CUT_MARK_BYTES: UInt = 3
+
+/// End this process as a panic, for the common runtime: `len` bytes at `ptr`
+/// become the text of the kernel's fault line.
 ///
-/// `-> Never` is what `sosrt` declares this hook to be, and it holds twice
-/// over: `shutdown` does not return when it succeeds, and when it is refused
-/// (no handle was ever parked, or the right was stripped) there is nothing left
-/// to try, so the loop keeps a failed abort from running off the end of the
-/// granted region.
+/// The text is copied first into a word-aligned buffer on this stack, because
+/// the kernel reads it through the copy-in door, which takes only a
+/// word-aligned buffer, and the text's own source need not be one: the
+/// compiler's message scratch, or a literal in read-only data.
+/// At most `PANIC_TEXT_BYTES` are copied. A longer text is cut there and its
+/// last bytes become `...`, so the line shows the cut, where the kernel's own
+/// cut would end it silently.
+///
+/// `code` is not read: the reason in the status word and the kernel's line say
+/// it all, and the text says which end it was. No handle is read either, so a
+/// process started with none, or on a word that is not a System, ends the same
+/// way.
+///
+/// Check-free by construction, on `rt_write`'s terms: raw `UnsafeMemory` reads
+/// and writes, and wrapping arithmetic.
 @export("sos_rt_abort")
-func rt_abort(code: UInt32) unsafe -> Never {
-    let _ = sos_system_shutdown(SYSTEM_HANDLE, code as UInt)
-    while { }
+func rt_abort(ptr: UnsafePointer<Int8>, len: UInt,
+              code: UInt32) unsafe -> Never {
+    var buf: [UInt; PANIC_COPY_WORDS] = [0; PANIC_COPY_WORDS]
+    let dst = ((&var buf) as UnsafePointer<UInt>) as UInt
+    let bound = UInt.from(truncating: PANIC_TEXT_BYTES)
+    var n = len
+    if n > bound {
+        n = bound
+    }
+    let src = ptr as UInt
+    var i: UInt = 0
+    while i != n {
+        let byte = UnsafeMemory<UInt8, Normal>(src &+ i).read()
+        UnsafeMemory<UInt8, Normal>(dst &+ i).write(byte)
+        i = i &+ 1
+    }
+    if len > bound {
+        var at = n &- CUT_MARK_BYTES
+        while at != n {
+            UnsafeMemory<UInt8, Normal>(dst &+ at).write(CUT_MARK)
+            at = at &+ 1
+        }
+    }
+    sos_panic(dst as UnsafePointer<Int8>, n)
 }
 
 // The calling thread's own word: the thread register, read and written by the

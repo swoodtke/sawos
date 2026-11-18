@@ -173,16 +173,15 @@ EXIT_DEADLOCK = 7
 # when root is killed through `ProcessOp.Kill`. Kept in step with that enum.
 EXIT_KILLED_ROOT = 8
 
-# `AbortCode.NoMemory` in rt/common/src/lib.saw: what the runtime stops the
-# machine with when the arena cannot serve a request. Deliberately
-# different from the kernel's exit codes, so a transcript can tell "the program
-# panicked" from "the arena ran dry" by the status alone. Kept in step with that
-# enum.
-EXIT_ARENA_EXHAUSTED = 65
-
-# `AbortCode.Panic` in rt/common/src/lib.saw: what the runtime stops the
-# machine with when a process panics. Kept in step with that enum.
+# `ExitCode.Panic` in kernel/core/diag.saw: what the machine exits with when
+# root ends through the panic op (a panic, a refused free), and, as
+# `AbortCode.Panic` in rt/common/src/lib.saw, which the kernel holds equal to
+# it, when the kernel panics. Kept in step with that enum.
 EXIT_PANIC = 64
+
+# The status word (spec §8) of a process that ended through the panic op:
+# `Faulted` (2) << 16 | `FaultReason.Panic` (14), as a supervisor reads it.
+STATUS_PANICKED = (2 << 16) | 14
 
 # What the stock root (`root/`) stops the machine with when a step of its
 # launch fails. Kept in step with its `EXIT_STOPPED`.
@@ -763,6 +762,27 @@ KILL_CHURN_PKG = os.path.join(TESTS_DIR, "kill-churn")
 KILL_CHURN_PROFILE_PKG = os.path.join(TESTS_DIR, "kill-churn-profile")
 KILL_RUNNABLE_PKG = os.path.join(TESTS_DIR, "kill-runnable")
 KILL_LATE_DOOR_PKG = os.path.join(TESTS_DIR, "kill-late-door")
+# The kernel's panic op (spec §8): `child-panic-op` ends through it in the way
+# its role names, and `panic-op` launches it once per way and prints each
+# status word.
+CHILD_PANIC_OP_PKG = os.path.join(TESTS_DIR, "child-panic-op")
+PANIC_OP_PKG = os.path.join(TESTS_DIR, "panic-op")
+
+# The part `child-panic-op`'s `CUT` repeats past the bound, and the 300 bytes
+# its `LONG` hands the kernel, as far as the kernel's 256-byte cut: its opening,
+# then the alphabet, the byte at offset `i` being `'a' + i % 26`, but for the
+# line break at the last byte the kernel reads, which is no trailing break of
+# the text and reads as `?`.
+_PANICOP_PART = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWX"
+_PANICOP_LONG = "SOS panicop: " + "".join(chr(0x61 + i % 26)
+                                          for i in range(13, 255)) + "?"
+
+
+def _panic_round(round_name, *pieces):
+    """One `panic_op` round ending through the panic op: the child's fault
+    and teardown lines (`_panic_fault`), and root's line with the word."""
+    return [*_panic_fault("{one}", *pieces),
+            f"SOS panicop: {round_name} ended status={STATUS_PANICKED}\n"]
 
 # Executable memory is not a buffer, and a thread's entry must be executable
 # (spec §2.2, §2.7). Both cases launch `child-exec-fault`, once per role.
@@ -1797,20 +1817,44 @@ def _slab_stop(name, spec, reason, arches=None):
     return case
 
 
+def _panic_fault(process, *pieces, open_end=False):
+    """What a process ending through the panic op (spec §8) prints, as
+    expectations: the kernel's fault line, whose text holds `pieces` in order,
+    and the teardown line after it, both naming `process` as `expectations`
+    spells a word. The text ends with the last piece, a line break straight
+    after it, unless `open_end` says the text runs on past it."""
+    lines = list(pieces) or [""]
+    lines[0] = ("SOS: process fault: the program panicked "
+                f"process={process} text=" + lines[0])
+    if open_end:
+        lines.append("\nSOS: process teardown handles=")
+    else:
+        lines[-1] += "\nSOS: process teardown handles="
+    return lines + [f" process={process}\n"]
+
+
+def _root_panic(message):
+    """The lines a stock root's `panic(message)` prints: its fault line, whose
+    text is the compiler's `panic at FILE:LINE: ` and the message, then its
+    teardown line."""
+    return _panic_fault("{zero}", "panic at main.saw:", ": " + message)
+
+
 def _stock_stop(name, plan, says, status=EXIT_ROOT_STOPPED, **keys):
     """A case that hands the stock root `plan`, a plan of the case's own
     (`root_plan`), unchecked, so it may be one the image builder would
     refuse, and whose console says `says`: the line root prints at a stop,
-    or a panic's message (`status` then `EXIT_PANIC`), or what a child
-    prints on a machine that ends clean (`status` 0). Its rows are the test
-    image's (`_region_row_specs`), so `keys` say what they are. The root is
-    arch-free, so one profile runs it."""
+    or the lines of a panic (`_root_panic`, `status` then `EXIT_PANIC`), or
+    what a child prints on a machine that ends clean (`status` 0). Its rows
+    are the test image's (`_region_row_specs`), so `keys` say what they are.
+    The root is arch-free, so one profile runs it."""
     case = {"name": name,
             "arches": ["riscv32"],
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "root_pkg": STOCK_ROOT_PKG,
             "root_plan": plan,
-            "expect_out": ["{banner}", says],
+            "expect_out": ["{banner}",
+                           *([says] if isinstance(says, str) else says)],
             "expect_clean_exit": status == 0}
     if status != 0:
         case["expect_status"] = status
@@ -2622,8 +2666,8 @@ TEST_CASES = [
         # list written into a live block) ends the worker with a line naming
         # it. Once both are joined the initial thread asks for three quarters
         # of the arena in one block, which a free lost to a switch makes
-        # impossible: the request then stops the machine with the arena's
-        # status.
+        # impossible: the request then answers null, and the program's
+        # unwrap panics.
         #
         # The kernel's tick narration and the profile are as `arena_race`'s.
         "name": "arena_churn",
@@ -5943,6 +5987,85 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # The panic op (spec §8), from both sides. Root launches
+        # `child-panic-op` in one region once per round, waits out its death
+        # and prints its status word: `Faulted (Panic)`, 131086, every time
+        # the child ends through the op, whatever it held. The kernel's fault
+        # line carries the text and the teardown line follows it at once.
+        #
+        # - A Saw `panic`: with a System that has `Debug`, with no word at all
+        #   (started with no tag), on a Memory's word, and with a System
+        #   without `Debug`. The text is the compiler's message, its trailing
+        #   line break dropped.
+        # - A request no arena holds, where std has an error channel: the
+        #   arena answers null, std hands the child an `AllocError`, and the
+        #   child panics with it.
+        # - Allocations std makes with no error channel, past the arena: an
+        #   interpolation doubling a `String`, whose text is std's from
+        #   whichever of its allocations is refused (the String's block, or
+        #   the builder's growth under `Printable`'s `try!`, by profile), and
+        #   `String.replace` doubling one, whose text is the String layer's
+        #   `String: allocation of N bytes (align A) failed`.
+        # - A Saw `panic` past `PANIC_TEXT_BYTES`: the runtime's copy cuts it
+        #   and ends it in `...`. The child's line number has three digits,
+        #   so the cut lands 37 bytes into the message's fourth part.
+        # - Texts of the child's own through `sos_panic`: one with line
+        #   breaks, an escape byte, `~` and the bytes above it (DEL, then `é`
+        #   in UTF-8), ending in a line break, which reads as one line with a
+        #   `?` for each and the last break dropped; 300 bytes, cut by the
+        #   kernel at 256, whose 256th, a line break, is not the text's last
+        #   and reads as `?`; a length of zero at an address that is neither
+        #   aligned nor the child's; and the door's two refusals, each read
+        #   as `text unreadable:` and still a panic.
+        # - The op with a handle word: on the child's live System handle,
+        #   the `BadOp` fault (131074), and on a word it released, the
+        #   `BadHandle` fault (131073).
+        #
+        # This image arms no tick, so root parks in each wait and the death
+        # brings it back: the kernel's lines precede root's by construction.
+        "name": "panic_op",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PANIC_OP_PKG,
+        "children": [CHILD_PANIC_OP_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}",
+            *_panic_round("panic", "panic at main.saw:",
+                          ": SOS panicop: the child gives up"),
+            *_panic_round("no tag", "panic at main.saw:",
+                          ": SOS panicop: started with no boot word"),
+            *_panic_round("memory", "panic at main.saw:",
+                          ": SOS panicop: started on a word that is not a "
+                          "System"),
+            *_panic_round("no debug", "panic at main.saw:",
+                          ": SOS panicop: the child gives up"),
+            *_panic_round("arena", "panic at main.saw:",
+                          ": SOS panicop: the arena refused as a status: "
+                          "allocation of 16777216 bytes (align 4) failed"),
+            *_panic_round("string", "panic at string.saw:", "allocation of ",
+                          " failed"),
+            *_panic_round("grown", "panic at string.saw:",
+                          ": String: allocation of ", " failed"),
+            *_panic_round("cut", "panic at main.saw:",
+                          ": SOS panicop: " + _PANICOP_PART * 3,
+                          _PANICOP_PART[:37] + "..."),
+            *_panic_round("lines", "SOS panicop: ~ one?two?[0m three??? four"),
+            *_panic_round("long", _PANICOP_LONG),
+            *_panic_round("empty", ""),
+            *_panic_round("outside", "text unreadable: buffer is outside the "
+                          "process's memory"),
+            *_panic_round("misaligned", "text unreadable: buffer is not "
+                          "word-aligned"),
+            "SOS: process fault: bad op process={one}\n"
+            "SOS: process teardown handles=", " process={one}\n",
+            "SOS panicop: live ended status=131074\n",
+            "SOS: process fault: bad handle process={one}\n"
+            "SOS: process teardown handles=", " process={one}\n",
+            "SOS panicop: stale ended status=131073\n",
+            "SOS panicop: done"],
+        "expect_clean_exit": True,
+    },
+    {
         # Nothing un-dies: the terminal level, and the reference count observed
         # through the supervision flow.
         #
@@ -8690,21 +8813,24 @@ TEST_CASES = [
                 children=[CHILD_BYE_PKG], spare_rows=1),
 
     # A plan that names a row the region table does not hold as it says is a
-    # skew between the two, and root panics naming it.
+    # skew between the two, and root panics naming it: its fault line carries
+    # the message, its teardown line follows, and the machine stops with the
+    # panic's status.
     _stock_stop("stock_skew_no_row",
                 {"children": [dict(_STOCK_START, image=9)]},
-                "root: the plan names row 9, which root's boot set does not "
-                "hold",
+                _root_panic("root: the plan names row 9, which root's boot set "
+                            "does not hold"),
                 EXIT_PANIC, children=[CHILD_BYE_PKG]),
     _stock_stop("stock_skew_not_allocation",
                 {"children": [dict(_STOCK_START, image=2)]},
-                "root: the plan names row 2 as an allocation, and it is not "
-                "one",
+                _root_panic("root: the plan names row 2 as an allocation, and "
+                            "it is not one"),
                 EXIT_PANIC, children=[CHILD_BYE_PKG], device=True),
     _stock_stop("stock_skew_not_device",
                 {"setup": [{"register": "R.W", "row": 0, "offset": 0,
                             "len": 4, "at": 0, "op": "set", "value": 0}]},
-                "root: the plan names row 0 as a device's, and it is not one",
+                _root_panic("root: the plan names row 0 as a device's, and it "
+                            "is not one"),
                 EXIT_PANIC, spare_rows=1),
     _stock_stop("stock_skew_outlet_twice",
                 {"connections": 1,
@@ -8714,7 +8840,8 @@ TEST_CASES = [
                                              "from": 0},
                                             {"tag": 3, "source": "outlet",
                                              "from": 0}])]},
-                "root: the plan gives connection 0's server end twice",
+                _root_panic("root: the plan gives connection 0's server end "
+                            "twice"),
                 EXIT_PANIC, children=[CHILD_BYE_PKG]),
     _stock_stop("stock_skew_used_after_given",
                 {"children": [dict(_STOCK_START,
@@ -8725,7 +8852,7 @@ TEST_CASES = [
                                              "from": 2},
                                             {"tag": 4, "source": "sibling",
                                              "from": 2}])]},
-                "root: the plan uses row 2 after giving it whole",
+                _root_panic("root: the plan uses row 2 after giving it whole"),
                 EXIT_PANIC, children=[CHILD_BYE_PKG], device=True),
     {
         # The stock root on a plan of the case's own (`root_plan`), over rows
@@ -10058,11 +10185,10 @@ TEST_CASES = [
         # override serves both and reaches the program's UNREACHABLE line, which
         # fails the case rather than passing by omission.
         #
-        # The second bracket ends the machine, which is why this case asserts a
-        # status rather than a clean shutdown. `__saw_rt_alloc` has nowhere to
-        # report a refusal to (it is the allocator every reporting path would
-        # allocate through), so it writes one line and aborts, and the exact
-        # status tells "the arena ran dry" from "the program panicked".
+        # The second bracket is a refusal the program is handed:
+        # `__saw_rt_alloc` answers null when the arena holds no such block,
+        # and std makes it `Vector(capacity:)`'s `AllocError`, so the program
+        # prints it and shuts down clean.
         #
         # It runs on every profile. A link address and a heap are the same on
         # a flat platform as on an isolated one, so nothing here is tiered.
@@ -10072,13 +10198,10 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        # Bracket one: reserved, written and read back.
                        "SOS arenasmall: 2 KiB ok",
-                       # Printed before the ask, because the ask does not
-                       # return.
-                       "SOS arenasmall: asking 16 KiB",
-                       # `sosrt`'s own words, from `rt/common/src/lib.saw`.
-                       "sos: out of arena memory"],
-        "expect_clean_exit": False,
-        "expect_status": EXIT_ARENA_EXHAUSTED,
+                       # Bracket two: std's words for the null.
+                       "SOS arenasmall: 16 KiB refused as a STATUS: "
+                       "allocation of 16384 bytes (align 4) failed\n"],
+        "expect_clean_exit": True,
     },
     {
         # The arena serves again what a program frees. The package's scripts
@@ -10090,8 +10213,8 @@ TEST_CASES = [
         # holds; and takes a block at each power-of-two alignment to 1024,
         # checks each address and that the blocks kept what was written, frees
         # them and asks for the three quarters again. Each request that must be
-        # served is simply made: a refusal stops the machine with the arena's
-        # status, and the case wants a clean exit.
+        # served is simply unwrapped: a refusal answers null, the unwrap
+        # panics, and the case wants a clean exit.
         #
         # It runs on every profile, for the reason `arena_small` gives.
         "name": "arena_reuse",
@@ -10124,8 +10247,9 @@ TEST_CASES = [
         # A free the heap can tell is bad panics. The program frees a null
         # pointer, which is no block and is ignored, then frees one block
         # twice: its header still marks it free, so `__saw_rt_dealloc` panics
-        # through the ordinary panic path, naming the address, and root's
-        # panic stops the machine with the panic's status. A runtime that took
+        # through the ordinary panic path, naming the address, on root's
+        # fault line, and root's panic stops the machine with the panic's
+        # status. A runtime that took
         # the second free reaches the program's UNREACHABLE line. It runs on
         # every profile, for the reason `arena_small` gives.
         "name": "double_free",
@@ -10136,7 +10260,8 @@ TEST_CASES = [
                        "SOS doublefree: freeing a block twice",
                        # The panic's location is `sosrt`'s, and its words
                        # end with the address, which differs by profile.
-                       "panic at lib.saw:", "bad free at "],
+                       *_panic_fault("{zero}", "panic at lib.saw:",
+                                     ": bad free at ", open_end=True)],
         "expect_clean_exit": False,
         "expect_status": EXIT_PANIC,
     },
@@ -10150,7 +10275,8 @@ TEST_CASES = [
         "root_pkg": STRAY_FREE_PKG,
         "expect_out": ["{banner}",
                        "SOS strayfree: freeing a pointer inside a live block",
-                       "panic at lib.saw:", "bad free at "],
+                       *_panic_fault("{zero}", "panic at lib.saw:",
+                                     ": bad free at ", open_end=True)],
         "expect_clean_exit": False,
         "expect_status": EXIT_PANIC,
     },
@@ -15680,7 +15806,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "copy_from_code_refused", "thread_entry_not_exec",
                      "image_held", "data_init", "pool_ops",
                      "kill_churn", "kill_runnable", "image_limits",
-                     "board_limits"]
+                     "board_limits", "panic_op"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 

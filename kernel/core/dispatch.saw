@@ -129,6 +129,8 @@ import sosabi.{
     RELEASE_OP,
     MINT_OP,
     INFO_OP,
+    PANIC_OP,
+    PANIC_TEXT_BYTES,
     HandleInfo,
     HandleKind,
     ENTRY_IMAGE,
@@ -235,7 +237,7 @@ import kcore.objects.{
     quota_word,
     unbind_handle,
 }
-import kcore.diag.{console, fatal_kernel}
+import kcore.diag.{ExitCode, console, fatal_kernel}
 import kcore.stats.{stats_bump, stats_clear, stats_name, stats_read,
                     stats_region_phys, stats_region_len}
 import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment,
@@ -2880,6 +2882,96 @@ func handle_info(p: Int, entry: HandleEntry,
 }
 
 // =============================================================================
+// The panic op (spec §8)
+// =============================================================================
+
+/// The words of the kernel stack buffer a panic's text is copied through, a
+/// chunk at a time.
+static PANIC_CHUNK_WORDS: Int = 8
+
+/// What of a panic's text reaches the line: printable ASCII as it is, and
+/// every other byte as `?`.
+static PANIC_PRINTABLE_FIRST: UInt8 = 0x20u8
+static PANIC_PRINTABLE_LAST: UInt8 = 0x7Eu8
+static PANIC_SUBSTITUTE: UInt8 = 0x3Fu8
+static LINE_FEED: UInt8 = 0x0Au8
+
+/// `PANIC_OP` with `NO_HANDLE`: end the caller as a panic, with `len` bytes at
+/// `src` as its text (spec §8). Never returns.
+///
+/// The text is untrusted bytes bound for a kernel line. At most
+/// `PANIC_TEXT_BYTES` of it are read, through the copy-in door, and the whole
+/// of what will be read is checked before a byte of the line is written, so a
+/// refusal cannot leave part of a text behind it. A length of zero reads
+/// nothing and asks nothing of the address. A refused buffer still ends the
+/// caller as a panic, since that is the op's one outcome; the line carries
+/// `text unreadable:` and the door's reason in place of the text.
+///
+/// The line is the fault line with the text last, so nothing the text holds
+/// can move a field before it. The end is `end_process`'s, as at every fault,
+/// and root's stops the machine with `ExitCode.Panic`.
+func panic_process(p: Int, src: UInt, len: UInt) unsafe -> Never {
+    let bound = PANIC_TEXT_BYTES as UInt
+    let bytes = if len > bound { bound } else { len }
+    var refused: FaultReason? = None
+    if bytes != 0 {
+        refused = copy_in_check(p, src, bytes)
+    }
+    let reason = FaultReason.Panic
+    let uart = console()
+    uart.write_str("SOS: process fault: ")
+    uart.write_str(reason.describe())
+    uart.write_str(" process=")
+    uart.write_hex(p as UInt)
+    uart.write_str(" text=")
+    if let why = refused {
+        uart.write_str("text unreadable: ")
+        uart.write_str(why.describe())
+    } else {
+        write_panic_text(p, src, bytes, bytes == len)
+    }
+    uart.write_str("\n")
+    end_process(p, ProcessStatusKind.Faulted, (reason as UInt8) as UInt,
+                ExitCode.Panic as UInt)
+}
+
+/// Write the `bytes` of process `p`'s text at `src`, which the door has
+/// passed, to the console, so that it can neither start a line of its own nor
+/// reach the terminal as a control sequence: printable ASCII as it is, and
+/// every other byte as `?`, line breaks and every byte of a multi-byte
+/// character included. The one exception is a line break that is the text's
+/// last byte, which is dropped: the compiler's messages end with one. `whole`
+/// says the last byte read is the text's last, which a cut text's is not.
+func write_panic_text(p: Int, src: UInt, bytes: UInt, whole: Bool) unsafe {
+    var chunk: [UInt; PANIC_CHUNK_WORDS] = [0; PANIC_CHUNK_WORDS]
+    let buf = ((&var chunk) as UnsafePointer<UInt>) as UInt
+    let size = (PANIC_CHUNK_WORDS * sizeof<UInt>()) as UInt
+    var done: UInt = 0
+    while done < bytes {
+        let left = bytes - done
+        let n = if left < size { left } else { size }
+        // Every chunk lies inside the range checked whole a moment ago, with
+        // no user code run since, so a refusal here is the kernel's own fault.
+        if let why = copy_in(p, buf, src + done, n) {
+            fatal_kernel("a panic text refused after its check",
+                         (why as UInt8) as UInt)
+        }
+        var i: UInt = 0
+        while i < n {
+            let b = UnsafeMemory<UInt8, Normal>(buf + i).read()
+            let last = whole && done + i + 1 == bytes
+            if b >= PANIC_PRINTABLE_FIRST && b <= PANIC_PRINTABLE_LAST {
+                hal.console_byte(b)
+            } else if not (last && b == LINE_FEED) {
+                hal.console_byte(PANIC_SUBSTITUTE)
+            }
+            i = i + 1
+        }
+        done = done + n
+    }
+}
+
+// =============================================================================
 // Memory, IoMemory and Mapping (spec §2.5)
 // =============================================================================
 //
@@ -4757,9 +4849,17 @@ func detach_watcher(watched: WaitableKind, target: Int) unsafe {
 /// once per kind. This is the one point in the kernel that knows a handle's
 /// entry and not yet its kind, which is the altitude a kind-independent op
 /// belongs at.
+///
+/// The panic op is intercepted before the lookup, and only with `NO_HANDLE`
+/// in the handle register: it names no object, so a process that holds no
+/// handle can still make it. With any other word it goes the way of every op,
+/// and no kind's table reaches its number.
 func dispatch(handle: UInt, op: UInt,
               arg0: UInt, arg1: UInt, arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
+    if handle == NO_HANDLE && op == PANIC_OP {
+        panic_process(p, arg0, arg1)
+    }
     let entry = lookup_handle(p, handle)
     if op == RELEASE_OP {
         return release_handle(p, handle, entry)

@@ -1,5 +1,5 @@
-//! The op numbers (spec §2, §5.7): the three universal ops and every
-//! per-object op table.
+//! The op numbers (spec §2, §5.7): the three universal ops, the panic op, and
+//! every per-object op table.
 //!
 //! This is the half of the module the vDSO discipline is about: userspace never
 //! writes one of these, which is what leaves the kernel free to renumber
@@ -146,6 +146,31 @@ public static MINT_OP: UInt = 0xFFFE
 /// stale one whose generation has moved, a released one) is the ordinary
 /// `FaultReason.BadHandle`.
 public static INFO_OP: UInt = 0xFFFD
+
+/// PANIC: end the calling process as a panic, with a text for the kernel's
+/// fault line (spec §8).
+///
+/// It is not a universal op: it names no object. It is made with `NO_HANDLE`
+/// in the handle register, and the dispatch intercepts that pair before the
+/// handle-table lookup, so a process that holds no handle at all, or was
+/// started on a word that is not a System, can still end itself as a panic.
+/// It takes the text's address and length, ends the caller `Faulted` with
+/// `FaultReason.Panic`, and does not return. No right gates it: it reaches
+/// nothing but its caller, which a process can already end by naming a handle
+/// it does not hold.
+///
+/// Made with any other word in the handle register it is looked up as every
+/// op is: a word that names nothing is `BadHandle`, and a handle naming an
+/// object is `BadOp`, since no kind's table reaches the number. `0xFFFC` is
+/// the next number down from `INFO_OP`, so it is the lowest number of the
+/// band, and every per-object table stays below it, which the `static_assert`s
+/// below hold.
+public static PANIC_OP: UInt = 0xFFFC
+
+/// The most of a panic's text the kernel reads, in bytes. A longer text is cut
+/// there. The kernel writes its console with interrupts masked, so the bound
+/// is what caps the latency one panic adds.
+public static PANIC_TEXT_BYTES: Int = 256
 
 // =============================================================================
 // The System object's op table (spec §2)
@@ -989,56 +1014,58 @@ public enum ReplyWaitLeg: UInt {
     case Reply = 1,
 }
 
-// Every op table is dense from zero, and stays below the universal ops. That is
-// what makes a universal op number safe: it can never collide with a per-kind
-// op, because no kind is allowed to reach it. The bound tested is `MINT_OP`,
-// the lowest of the three, so one assert per table covers all, and adding
-// another universal op below it tightens every one of these at once. There is
+// Every op table is dense from zero, and stays below the universal ops and the
+// panic op. That is what makes those numbers safe: none can collide with a
+// per-kind op, because no kind is allowed to reach it. The bound tested is
+// `PANIC_OP`, the lowest of the band, so one assert per table covers all, and
+// adding another number below it tightens every one of these at once. There is
 // one assert per table, on its highest case, in the spirit of the rights
 // asserts above: the repetition is the check, and a table growing toward the
-// top of the space fails to build rather than failing as a universal op that
+// top of the space fails to build rather than failing as a band op that
 // quietly ran somebody's op.
 //
 // When an op is added to a table, re-point that table's assert at the new
 // highest case. A bound tested against a case that is no longer the highest
-// passes while the table walks past `INFO_OP`.
-static_assert((SystemOp.ProcessByPid as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((ProcessOp.QuotaGet as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((ThreadOp.Yield as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((EventOp.Receive as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((WaiterOp.Wait as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((InterruptOp.Ack as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((ClockOp.TimerCreate as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((TimerOp.Disarm as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((MemoryOp.Map as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((PoolOp.Available as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((IoMemoryOp.Map as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
+// passes while the table walks past `PANIC_OP`.
+static_assert((SystemOp.ProcessByPid as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((ProcessOp.QuotaGet as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((ThreadOp.Yield as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((EventOp.Receive as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((WaiterOp.Wait as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((InterruptOp.Ack as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((ClockOp.TimerCreate as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((TimerOp.Disarm as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((MemoryOp.Map as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((PoolOp.Available as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((IoMemoryOp.Map as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
 // Re-point this assert at the highest case when an op is added (see the note on
 // the System table's assert above).
-static_assert((MappingOp.Base as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((PipeInletOp.Call as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((PipeOutletOp.Take as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((PipeReplyOp.Ready as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
-static_assert((PipeRequestOp.ReplyWait as UInt) < INFO_OP,
-              "an op table must stay below the universal ops")
+static_assert((MappingOp.Base as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((PipeInletOp.Call as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((PipeOutletOp.Take as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((PipeReplyOp.Ready as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
+static_assert((PipeRequestOp.ReplyWait as UInt) < PANIC_OP,
+              "an op table must stay below the panic and universal ops")
 
-// ...and the universal numbers are distinct and ordered, which is the fact the
+// ...and the band's numbers are distinct and ordered, which is the fact the
 // asserts above lean on when they test the lowest one.
+static_assert(PANIC_OP < INFO_OP,
+              "the panic op sits below the universal ops")
 static_assert(INFO_OP < MINT_OP,
               "the universal ops descend from the top of the number space")
 static_assert(MINT_OP < RELEASE_OP,

@@ -16,15 +16,15 @@
 //!     calls; this module answers them.
 //!
 //! All of it rests on per-side hooks and nothing else: where a byte goes, how
-//! the machine stops, and (with the arena, below) which thread is asking:
+//! a run ends with a text, and (with the arena, below) which thread is asking:
 //!
-//!     sos_rt_write(ptr, len)      // supplied per side
-//!     sos_rt_abort(code)          // supplied per side, does not return
+//!     sos_rt_write(ptr, len)          // supplied per side
+//!     sos_rt_abort(ptr, len, code)    // supplied per side, does not return
 //!
-//! The kernel HAL answers "the UART" and "the board's stop" (each board's
-//! `hal/*/kernel/lib.saw`); a process answers "a System op" to both
-//! (`kernel/sysapi/`). That second answer keeps the kernel/user split real: a
-//! `panic()` in userspace cannot reach a UART.
+//! The kernel HAL answers "the UART" and "write the text there, stop the
+//! board" (each board's `hal/*/kernel/lib.saw`); a process answers a System op
+//! and the kernel's panic op (`kernel/sysapi/`), which puts the text on the
+//! kernel's fault line. So a `panic()` in userspace cannot reach a UART.
 //!
 //! Nothing here suspends and nothing names a target. No code here calls an
 //! allocator either: the heap below is the one, over a fixed region it was
@@ -223,13 +223,14 @@ public func abort_status(code: UInt) -> UInt {
 //     was detached when no thread exists, and would leak the control block of
 //     every one.
 
-// Where a byte goes, and how the machine stops. Everything below is written
-// against these two and nothing else. See the module header for who answers.
-// (A plain comment, not `///`: an `extern` block is a container, and a doc
-// block attaches to a declaration.)
+// Where a byte goes, and how a run ends with a text. Everything below is
+// written against these two and nothing else. See the module header for who
+// answers. (A plain comment, not `///`: an `extern` block is a container, and
+// a doc block attaches to a declaration.)
 extern "C" {
     func sos_rt_write(ptr: UnsafePointer<Int8>, len: UInt)
-    func sos_rt_abort(code: UInt32) -> Never
+    func sos_rt_abort(ptr: UnsafePointer<Int8>, len: UInt,
+                      code: UInt32) -> Never
 }
 
 // Where the arena is, and how big (see the arena section below). Not a
@@ -241,15 +242,14 @@ extern "C" {
     func sos_arena_size() -> UInt
 }
 
-// Abort codes the runtime raises on its own behalf. A side's own exit codes
-// live with that side; these two are ours, and they stay distinct so a
-// transcript can tell "the program panicked" from "the arena ran dry".
+// Abort codes the runtime raises on its own behalf: the panic's. The kernel's
+// hook stops the machine with it, and a process's hook reads none. `Panic` is
+// also the kernel's `ExitCode.Panic`, held equal there.
 //
 // A backed enum, on the same terms as the kernel's `ExitCode`; the backing is
 // the width `sos_rt_abort` takes, so the projection at the call is one `as`.
-enum AbortCode: UInt32 {
+public enum AbortCode: UInt32 {
     case Panic = 64,
-    case NoMemory = 65
 }
 
 /// `print`'s output primitive: `len` bytes at `ptr`, to whatever this side
@@ -287,15 +287,14 @@ func rt_last_raw_code() -> Int {
     0
 }
 
-/// The panic sink: report, then stop.
+/// The panic sink: hand the text to this side's end.
 ///
-/// Check-free by construction, like the writers under it: it does no arithmetic
+/// Check-free by construction, like the hooks under it: it does no arithmetic
 /// at all, so there is nothing here that could raise the panic it is in the
 /// middle of reporting.
 @export("__saw_rt_panic")
 func rt_panic(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
-    sos_rt_write(ptr, len)
-    sos_rt_abort(AbortCode.Panic as UInt32)
+    sos_rt_abort(ptr, len, AbortCode.Panic as UInt32)
 }
 
 // -----------------------------------------------------------------------------
@@ -367,12 +366,12 @@ func rt_lock_owner() -> Int {
     sos_rt_lock_owner()
 }
 
-/// Hand out `size` bytes aligned to `align`, or stop the machine.
+/// Hand out `size` bytes aligned to `align`, or a null pointer when the arena
+/// holds no such block.
 ///
-/// A refusal is not returned. `__saw_rt_alloc` is the allocator every
-/// reporting path would allocate through, so it writes one line and aborts
-/// with its own status, which tells "the arena ran dry" from a panic. The lock
-/// is given back first.
+/// A refusal is the caller's to handle, as sawlang's allocator ABI has it: the
+/// seam never panics or aborts on one, and std turns the null pointer into
+/// an `AllocError`, each allocating operation all-or-nothing on it.
 @export("__saw_rt_alloc")
 func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
     let block = borrow var heap = ARENA.lock() {
@@ -380,11 +379,6 @@ func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
             heap = arena()
         }
         heap.alloc(size, align)
-    }
-    if block == 0 {
-        let msg = "sos: out of arena memory\n"
-        sos_rt_write(msg.c_string()!, UInt.from(truncating: msg.len()))
-        sos_rt_abort(AbortCode.NoMemory as UInt32)
     }
     block as UnsafePointer<Int8>
 }

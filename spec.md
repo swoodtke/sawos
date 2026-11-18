@@ -2133,6 +2133,9 @@ a whole.
 
 - **`exit` is not here**: process exit is `ProcessOp.Exit`, which ends the
   calling process, and faults a caller whose handle names another (§2.7).
+- **Nor is a panic**: a process ends itself as a panic with `PANIC_OP`,
+  which names no object (§8), so a process holding no System handle can
+  still report one.
 - **`process_self` is §3's derivation rule made real.** The boot register
   stays one handle wide, and a process obtains its Process object through the
   System handle rather than being handed it. Strip `SystemRight.ProcessSelf`
@@ -2838,6 +2841,11 @@ have no field.
     selector is for the C floor (`sos_handle_info`): a typed wrapper knows its
     own kind, so the typed API carries no kind number.
 
+- **`PANIC_OP` sits below `INFO_OP`, at `0xFFFC`.** It is not a universal op:
+  it names no object and is intercepted before the lookup, with `NO_HANDLE`
+  in the handle register (§8). It takes its number from the band so that no
+  per-kind table can grow into it, and every table stays below it.
+
   **The typed tier spells every mask.** Every kind's rights enum is public in
   the `sos` module, because a keep mask is assembled from its bits at a mint, a
   give or before a send. Every wrapper whose kind's default set carries `Mint`
@@ -3315,7 +3323,9 @@ resource condition answers with a status; broken code faults.
 table → rights check → op. The System object (§2.8) is minted to root at boot,
 and `debug_print` / `shutdown(status)` are among its ops (§2.8 lists them),
 rights-gated (`SystemRight.Debug`/`.Shutdown`) — a process without the System
-handle cannot even print. Process exit is a Process op. Ops map 1:1 onto the
+handle cannot even print. Process exit is a Process op. A panic names no
+object: `PANIC_OP` with `NO_HANDLE` in the handle register is intercepted
+before the table lookup and ends the caller (§8). Ops map 1:1 onto the
 `sos` module's typed wrappers (`system.debug_print(...)`,
 `-> Result<T, SosStatus>`). Op tables and rights sets are named for the §2
 object, spelled out (`SystemOp`, `ProcessOp`, `ThreadOp` beside `SystemRight`,
@@ -3327,7 +3337,10 @@ authority anywhere in the ABI (§3): an op is reached through a handle of the
 right kind and spends a bit named for that op. Binding an interrupt line is
 `SystemRight.InterruptBind` on a System handle, not a root IRQ-table object or
 a per-line capability: a right is the cheaper answer whenever an "object" would
-have been a table with no state and one verb (§2.8).
+have been a table with no state and one verb (§2.8). The one op that names no
+object, `PANIC_OP` (§8), is not a facility: it ends its caller, which a process
+can already do by naming a handle it does not hold, and it reaches nothing
+else.
 
 **The boot set is one handle wide at the entry register.** A process enters user
 mode with exactly one word in its first argument register — root's System
@@ -3383,14 +3396,15 @@ register.
 
 **Growing an op costs no register and no ABI.** Because the numbers are not ABI,
 a new op takes the next value in its own table and displaces nothing, and each
-table's `< INFO_OP` assert sits on its highest case — one assert per table, on
-its top — which keeps a growing table from ever reaching a universal op number.
-An op's argument list may grow the same way, up to the three argument registers:
-the raw form is fixed-arity, so a grown argument rides a register the raw form
-already passes, and the convention does not move. An op that needs more than
-three argument words passes an argument record in memory through the copy-in
-funnel (the pipe send records below are the example). An op answers one value
-word (`a1`/`x1`); an answer wider than that goes through the copy-out funnel.
+table's `< PANIC_OP` assert sits on its highest case — one assert per table, on
+its top — which keeps a growing table from ever reaching a universal op number
+or the panic op's, the lowest of the band. An op's argument list may grow the
+same way, up to the three argument registers: the raw form is fixed-arity, so a
+grown argument rides a register the raw form already passes, and the
+convention does not move. An op that needs more than three argument words
+passes an argument record in memory through the copy-in funnel (the pipe send
+records below are the example). An op answers one value word (`a1`/`x1`); an
+answer wider than that goes through the copy-out funnel.
 And a contract may change where a number may not: an op can keep its number,
 right and record while its semantics change, because nothing a Saw program links
 against is a number (a C image is the exception stated above) — the vDSO
@@ -3704,7 +3718,10 @@ handle are Saw in `kernel/sysapi/`, beside the System object whose authority
 they spend. A free the heap can tell is bad (a block freed twice while its
 header still says free, a pointer outside the arena, before its first block,
 off the granule or behind no plausible header) panics through the ordinary
-panic path, naming the address; one it cannot tell corrupts the heap. The
+panic path, naming the address; one it cannot tell corrupts the heap. A request
+the arena cannot serve answers a null pointer, as sawlang's allocator ABI has
+it: the allocator never ends the run itself, and std turns the null into an
+`AllocError` at the operation that asked. The
 third hook answers `SpinLock`'s question of which thread is asking: a process
 numbers its threads on first ask and keeps each number in the thread's thread
 register, which the kernel carries per thread on every profile, and the
@@ -3720,14 +3737,13 @@ That is what makes a panic raised inside the panic reporter unreachable instead
 of merely unlikely: the whole call cone contains no bounds check, no overflow
 trap and no call back into `__saw_rt_panic`. A harness case pins it on both
 machines by taking a compiler-raised bounds check and asserting the message
-arrives in three independent pieces. In the kernel and in root, the panic seam
-writes its message to the console and then fails the run; it never hangs. A
-child's panic ends in a `shutdown` request through its System handle: the launch
-mask of §12 withholds `Shutdown`, so the child dies by `AccessDenied`, and a
-child started with no tag received `NO_HANDLE` in its first argument register,
-so its runtime has no System handle parked (even if the launcher gave it one),
-prints nothing and dies by `BadHandle`. Sawlang's runtime ABI (`runtime/ABI.md`)
-freezes `__saw_rt_panic` as `noreturn`; the Saw seam produces `Never` with a
+arrives in three independent pieces. In the kernel, the panic seam writes its
+message to the console and then fails the run; it never hangs. A process's
+panic ends in `PANIC_OP` (§8): the runtime hands the kernel the message, the
+kernel writes it on its fault line and ends the process `Faulted (Panic)`, root
+included, whatever handles the process holds. Nothing of a panic goes through
+`DebugPrint`. Sawlang's runtime ABI (`runtime/ABI.md`) freezes
+`__saw_rt_panic` as `noreturn`; the Saw seam produces `Never` with a
 conditionless `while { }` that has no `break`.
 
 **Who declares the runtime.** `@export`ing a frozen `__saw_rt_*` name needs
@@ -3939,6 +3955,47 @@ handle carrying `ProcessRight.Kill` ("Kill", below), as well as by its own
 exit or fault or, never started, by the loss of its last name. `Exit` through
 another process's handle stays the `NotSelf` fault (§2.7): ending another
 process is the kill's, on a right of its own.
+
+**A process can end itself as a panic.** `PANIC_OP`, made with `NO_HANDLE`
+in the handle register, ends the calling process as `Faulted` with the
+reason `Panic`, and the kernel writes the text the caller hands it on its
+fault line. It is how a runtime ends a process that cannot go on (a panic,
+a refused free, a failed start-up), so a supervisor
+reads one word for every such end, and what a panic does is the kernel's.
+
+- **It names no object and needs no right.** The dispatch intercepts it
+  before the table lookup (§5.7), so every process can reach it, one
+  started with no tag and one that holds no handle included. It grants
+  nothing: a process can already end itself by naming a handle it does not
+  hold, and this op ends it the same way with a reason a supervisor can
+  tell apart. It is no print channel: it is made once, its line is bounded,
+  and the caller does not survive it.
+- **Its arguments** are the text's address and its length. The kernel reads
+  at most `PANIC_TEXT_BYTES` and cuts a longer text there. The text is read
+  through the copy-in door on that door's terms (§2.2): the whole buffer is
+  checked before any of the line is written, and a zero length reads
+  nothing at any address. A buffer the door refuses ends the caller the
+  same way, and the line carries `text unreadable:` and the door's reason in
+  place of the text.
+- **The line** is the fault line with the text last:
+  `SOS: process fault: the program panicked process=N text=TEXT`. The text
+  is untrusted: one trailing line break is dropped, and every other byte
+  outside printable ASCII (0x20 to 0x7E) is written as `?`, so the text can
+  neither start a line nor move a field before it. The teardown line
+  follows, as at every death.
+- **What a supervisor reads** is `Faulted` with `FaultReason.Panic` (14) in
+  the code, through `get_status` and the wait record alike. The text is not
+  in the word.
+- **Root.** A root that panics stops the machine after its teardown with
+  the kernel's `Panic` exit status, the one a panic in the kernel stops it
+  with, so a panic reads the same whichever side raised it.
+- **Its answers, in order.** `PANIC_OP` with any word but `NO_HANDLE` in the
+  handle register is looked up as every op is: a word that names nothing is
+  the `BadHandle` fault, and a handle naming an object is the `BadOp` fault,
+  since no kind's table reaches the number. The op itself has no refusal.
+- **Cost.** A fault's: one teardown inside the caller's trap, and a line no
+  longer than `PANIC_TEXT_BYTES` beyond the fault line's own fields, written
+  with interrupts masked (§9a's reclaim).
 
 **What is built.** The fault rule, whole. `get_status` as
 `ProcessOp.GetStatus`, gated on `ProcessRight.Wait`, answering the one

@@ -1,0 +1,158 @@
+// The kernel's panic op, from the supervisor's side: one child image,
+// `child-panic-op`, launched in the same region once per way a process can
+// end as a panic, each launch waited out and its status word printed.
+//
+//   SOS: process fault: the program panicked process=... text=...
+//   SOS: process teardown ... process=...
+//   SOS panicop: <round> ended status=131086
+//
+// 131086 is `Faulted` (2) << 16 | 14, `FaultReason.Panic`: the word is the
+// same whatever the child held (a System with `Debug`, one without, no word at
+// all, a Memory's) and whatever the kernel made of its text. The two rounds
+// that make the op on a handle word read `BadOp` (131074) and `BadHandle`
+// (131073) instead.
+//
+// This image's kernel arms no tick, so root parks in each wait and the
+// child's death is what brings it back: the kernel's two lines come before
+// root's by construction.
+
+import sos.{System, Process, Memory, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static KEY_DEATH: UInt = 6
+
+/// The roles `child-panic-op` knows.
+static ROLE_PANIC: UInt = 1
+static ROLE_ARENA: UInt = 2
+static ROLE_CUT: UInt = 3
+static ROLE_LINES: UInt = 4
+static ROLE_LONG: UInt = 5
+static ROLE_EMPTY: UInt = 6
+static ROLE_OUTSIDE: UInt = 7
+static ROLE_MISALIGNED: UInt = 8
+static ROLE_LIVE: UInt = 9
+static ROLE_STALE: UInt = 10
+static ROLE_STRING: UInt = 11
+static ROLE_GROWN: UInt = 12
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer | SystemRight.ClockGet)
+static CHILD_NO_DEBUG: UInt32 = (SystemRight.ProcessSelf | SystemRight.Transfer
+                                 | SystemRight.ClockGet)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS panicop: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS panicop: refused: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS panicop: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let img = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    try with_role(&system, &proc, &img, &ram, "panic", ROLE_PANIC, CHILD_SYSTEM)
+    try bare(&system, &proc, &img, &ram)
+    try on_memory(&system, &proc, &img, &ram)
+    try with_role(&system, &proc, &img, &ram, "no debug", ROLE_PANIC,
+                  CHILD_NO_DEBUG)
+    try with_role(&system, &proc, &img, &ram, "arena", ROLE_ARENA, CHILD_SYSTEM)
+    try with_role(&system, &proc, &img, &ram, "string", ROLE_STRING,
+                  CHILD_SYSTEM)
+    try with_role(&system, &proc, &img, &ram, "grown", ROLE_GROWN, CHILD_SYSTEM)
+    try with_role(&system, &proc, &img, &ram, "cut", ROLE_CUT, CHILD_SYSTEM)
+    try with_role(&system, &proc, &img, &ram, "lines", ROLE_LINES, CHILD_SYSTEM)
+    try with_role(&system, &proc, &img, &ram, "long", ROLE_LONG, CHILD_SYSTEM)
+    try with_role(&system, &proc, &img, &ram, "empty", ROLE_EMPTY, CHILD_SYSTEM)
+    try with_role(&system, &proc, &img, &ram, "outside", ROLE_OUTSIDE,
+                  CHILD_SYSTEM)
+    try with_role(&system, &proc, &img, &ram, "misaligned", ROLE_MISALIGNED,
+                  CHILD_SYSTEM)
+    try with_role(&system, &proc, &img, &ram, "live", ROLE_LIVE, CHILD_SYSTEM)
+    try with_role(&system, &proc, &img, &ram, "stale", ROLE_STALE, CHILD_SYSTEM)
+    return
+}
+
+/// A child given a System narrowed to `rights` and its role, started on the
+/// System.
+func with_role(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+               round: String, role: UInt,
+               rights: UInt32) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    let ev = try proc.event_create()
+    try ev.signal(bits: role)
+    try child.give(event: move ev, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try system.mint(rights: rights)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, round)
+}
+
+/// A child started with no tag: its boot word is no handle.
+func bare(system: &System, proc: &Process, img: &Memory,
+          ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    try child.start()
+    try ended(&proc, move child, "no tag")
+}
+
+/// A child started on a Memory record: a sibling of its own image's region.
+func on_memory(system: &System, proc: &Process, img: &Memory,
+               ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    let region = try img.mint()
+    try child.give(memory: move region, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, "memory")
+}
+
+/// Wait for `child`'s death and print its status word; the handle goes with
+/// it, so the next round's child takes the same region.
+func ended(proc: &Process, child: Process,
+           round: String) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH {
+                return BUG
+            }
+            print("SOS panicop: {} ended status={}", round, status)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

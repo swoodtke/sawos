@@ -18,7 +18,8 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
                InterruptOp, ClockOp, TimerOp, MemoryOp, PoolOp, IoMemoryOp,
                MappingOp,
                PipeInletOp, PipeOutletOp, PipeReplyOp, PipeRequestOp,
-               RELEASE_OP, MINT_OP, INFO_OP, HandleInfo, HandleKind}
+               RELEASE_OP, MINT_OP, INFO_OP, PANIC_OP, NO_HANDLE, HandleInfo,
+               HandleKind}
 
 // The per-arch HAL's whole surface: the one instruction in the system that
 // crosses the trap boundary. Fixed arity on purpose: a varargs call across a
@@ -1236,6 +1237,27 @@ public func sos_handle_info(handle: UInt, selector: UInt,
     sos_syscall3(handle, INFO_OP, selector, 0, 0, value_out)
 }
 
+/// End this process as a panic, with `len` bytes at `text` for the kernel's
+/// fault line (spec §8). Does not return.
+///
+/// It names no object and needs no right, so a process that holds no handle
+/// at all can make it: `PANIC_OP` goes with `NO_HANDLE` in the handle
+/// register. The kernel reads at most `PANIC_TEXT_BYTES` of the text through
+/// the copy-in door, so the buffer is word-aligned memory the process may
+/// read, none of it executable. A buffer the door refuses still ends the
+/// process as a panic, and the line names the refusal in place of the text. A
+/// length of zero reads nothing, at any address.
+///
+/// A supervisor reads `Faulted` with the reason `Panic` in the status word.
+/// Typed Saw callers write `panic`, which the runtime brings here.
+@export("sos_panic")
+public func sos_panic(text: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
+    var unused: UInt = 0
+    let _ = sos_syscall3(NO_HANDLE, PANIC_OP, text as UInt, len, 0,
+                         (&var unused) as UnsafePointer<UInt>)
+    while { }
+}
+
 /// The rights word of the handle `handle`, for the typed wrappers' `rights()`.
 ///
 /// `unsafe` for `call_value`'s out-parameter; the wrappers call it with the one
@@ -1315,8 +1337,8 @@ public(package) func ceiling_word(
 //
 // It sits at the floor because two files need it and neither is below the
 // other: `sos.system` writes it, out of `System(boot_handle:)`, and `sos.rt`
-// reads it, out of the panic path's writer. A helper two seams share lives
-// below both.
+// reads it, out of `print`'s writer. A helper two seams share lives below
+// both.
 
 /// The boot handle, parked for the runtime hooks in `sos.rt`.
 ///
@@ -1324,7 +1346,8 @@ public(package) func ceiling_word(
 /// root is given at boot is remembered here by `System.init` before anything
 /// can print. It is root's own authority kept in root's own address space, not
 /// ambient authority: a process that was never given the handle has nothing to
-/// remember and its panics are simply silent.
+/// remember and its prints are simply dropped. Its panics are not: the panic
+/// hook takes no handle (`sos_panic`).
 ///
 /// `unsafe static var` rather than an `Atomic`: it is plain compound process
 /// state written once at boot, and spec §7's uniprocessor argument covers it as

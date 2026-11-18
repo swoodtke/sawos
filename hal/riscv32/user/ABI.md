@@ -28,9 +28,9 @@ keep it.
 
 The other symbols a process needs — `sos_rt_write` and `sos_rt_abort`, and the
 System handle's parking — name no architecture: a byte reaches the console
-through a System op, which is the same op on both profiles, so per-arch C copies
-would be two copies of one thing. They are Saw, once, in `kernel/sysapi/`,
-beside the System object whose authority they use.
+through a System op and a panic ends the process through the kernel's panic op,
+each the same op on both profiles, so per-arch C copies would be two copies of
+one thing. They are Saw, once, in `kernel/sysapi/`.
 
 ## Which altitude is supported for whom
 

@@ -1,0 +1,202 @@
+// Test child: ends through the kernel's panic op in the way its role names,
+// for `panic_op`.
+//
+// It looks at its boot word before it adopts it. With no word (started with
+// no tag) or a word that is not a System (started on a Memory record) it
+// panics at once: nothing it holds could print or stop anything, and the
+// panic op needs neither. Otherwise its first boot record is an Event whose
+// word is its role:
+//
+//   PANIC       a Saw `panic`
+//   ARENA       a request no arena holds, made where std has an error
+//               channel, which the child panics on
+//   STRING      an interpolation doubling a `String` until the arena holds
+//               no block for it, which std's String layer panics on
+//   GROWN       `String.replace` doubling a `String` the same way
+//   CUT         a Saw `panic` whose message passes `PANIC_TEXT_BYTES`
+//   LINES       `sos_panic` on a text with line breaks, an escape byte and
+//               bytes above 0x7E, ending in a line break
+//   LONG        `sos_panic` on 300 bytes, printable but for a line break at
+//               the last byte the kernel reads, where the text goes on
+//   EMPTY       `sos_panic` with a length of zero, at an address that is
+//               neither aligned nor the process's
+//   OUTSIDE     `sos_panic` on a buffer in no row of the process
+//   MISALIGNED  `sos_panic` on a buffer one byte off a word
+//   LIVE        the panic op made on its live System handle
+//   STALE       the panic op made on a word it has released
+//
+// A role that comes back from what should have ended it panics naming that,
+// which the launcher's case reads as the wrong line.
+
+import sos.{System, HandleInfo, HandleKind, ALL_RIGHTS, PANIC_TEXT_BYTES,
+            sos_handle_info, sos_handle_release, sos_system_process_self,
+            sos_panic}
+import sosabi.{PANIC_OP}
+
+// The raw form, for the two roles that make the panic op with a handle word,
+// which no typed call or floor function does.
+extern "C" {
+    func sos_syscall1(handle: UInt, op: UInt, arg0: UInt) -> UInt
+}
+
+static ROLE_PANIC: UInt = 1
+static ROLE_ARENA: UInt = 2
+static ROLE_CUT: UInt = 3
+static ROLE_LINES: UInt = 4
+static ROLE_LONG: UInt = 5
+static ROLE_EMPTY: UInt = 6
+static ROLE_OUTSIDE: UInt = 7
+static ROLE_MISALIGNED: UInt = 8
+static ROLE_LIVE: UInt = 9
+static ROLE_STALE: UInt = 10
+static ROLE_STRING: UInt = 11
+static ROLE_GROWN: UInt = 12
+
+/// The boot word of a process started with no tag.
+static NO_WORD: UInt = 0
+
+/// More `UInt32`s than any arena holds.
+static ARENA_PAST: Int = 0x40_0000
+
+/// The text buffer's words: room for `LONG_BYTES` on every profile.
+static TEXT_WORDS: Int = 80
+
+/// `LONG`'s length, past the kernel's bound.
+static LONG_BYTES: UInt = 300
+
+/// `LONG`'s opening; the rest is the alphabet over and over, the byte at
+/// offset `i` being `'a' + i % 26`, which the case computes the same way.
+static ASCII_LOWER_A: UInt = 0x61
+static ALPHABET: UInt = 26
+
+/// An address no process is granted, and a length to read there.
+static UNGRANTED: UInt = 0x10
+static SOME_BYTES: UInt = 8
+
+static LINE_FEED: UInt8 = 0x0Au8
+static ESCAPE: UInt8 = 0x1Bu8
+static DELETE: UInt8 = 0x7Fu8
+/// `é` in UTF-8.
+static E_ACUTE_0: UInt8 = 0xC3u8
+static E_ACUTE_1: UInt8 = 0xA9u8
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    if boot_handle == NO_WORD {
+        panic("SOS panicop: started with no boot word")
+    }
+    if not names_system(boot_handle) {
+        panic("SOS panicop: started on a word that is not a System")
+    }
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        panic("SOS panicop: no process handle: {}", error)
+    }
+    var rec = try proc.boot_handle_next() catch {
+        panic("SOS panicop: no role: {}", error)
+    }
+    guard let told = rec.take_event() else {
+        panic("SOS panicop: the role record is not an Event")
+    }
+    let role = try told.receive() catch {
+        panic("SOS panicop: the role did not arrive: {}", error)
+    }
+    act(boot_handle, role)
+}
+
+/// Whether `word` names a System, asked of the handle and not of the object.
+func names_system(word: UInt) unsafe -> Bool {
+    var kind: UInt = 0
+    let _ = sos_handle_info(word, HandleInfo.Kind as UInt,
+                            (&var kind) as UnsafePointer<UInt>)
+    kind == (HandleKind.System as UInt)
+}
+
+func act(word: UInt, role: UInt) unsafe {
+    if role == ROLE_PANIC {
+        panic("SOS panicop: the child gives up")
+    } else if role == ROLE_ARENA {
+        let past = try Vector<UInt32>(capacity: ARENA_PAST) catch {
+            panic("SOS panicop: the arena refused as a status: {}", error)
+        }
+        panic("SOS panicop: the arena served {} words", past.len())
+    } else if role == ROLE_STRING {
+        var grown = "SOS panicop: "
+        while {
+            grown = "{grown}{grown}"
+        }
+    } else if role == ROLE_GROWN {
+        var grown = "x"
+        while {
+            grown = grown.replace("x", "xx")
+        }
+    } else if role == ROLE_CUT {
+        let part = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWX"
+        panic("SOS panicop: {}{}{}{}{}", part, part, part, part, part)
+    } else if role == ROLE_MISALIGNED {
+        var buf: [UInt; TEXT_WORDS] = [0; TEXT_WORDS]
+        let base = ((&var buf) as UnsafePointer<UInt>) as UInt
+        let end = put(base, 1, "SOS panicop: one byte off")
+        sos_panic((base + 1) as UnsafePointer<Int8>, end - 1)
+    } else if role == ROLE_LIVE {
+        let _ = sos_syscall1(word, PANIC_OP, 0)
+        panic("SOS panicop: the panic op on a live handle answered")
+    } else if role == ROLE_STALE {
+        var gone: UInt = 0
+        let _ = sos_system_process_self(word, ALL_RIGHTS as UInt,
+                                        (&var gone) as UnsafePointer<UInt>)
+        let _ = sos_handle_release(gone)
+        let _ = sos_syscall1(gone, PANIC_OP, 0)
+        panic("SOS panicop: the panic op on a released word answered")
+    } else {
+        raw(role)
+    }
+    panic("SOS panicop: role {} is not one this child knows", role)
+}
+
+/// The roles that hand the kernel a text of their own through `sos_panic`.
+func raw(role: UInt) unsafe {
+    var buf: [UInt; TEXT_WORDS] = [0; TEXT_WORDS]
+    let base = ((&var buf) as UnsafePointer<UInt>) as UInt
+    if role == ROLE_LINES {
+        var at = put(base, 0, "SOS panicop: ~ one")
+        at = put_byte(base, at, LINE_FEED)
+        at = put(base, at, "two")
+        at = put_byte(base, at, ESCAPE)
+        at = put(base, at, "[0m three")
+        at = put_byte(base, at, DELETE)
+        at = put_byte(base, at, E_ACUTE_0)
+        at = put_byte(base, at, E_ACUTE_1)
+        at = put(base, at, " four")
+        at = put_byte(base, at, LINE_FEED)
+        sos_panic(base as UnsafePointer<Int8>, at)
+    } else if role == ROLE_LONG {
+        var at = put(base, 0, "SOS panicop: ")
+        while at < LONG_BYTES {
+            at = put_byte(base, at, (ASCII_LOWER_A + at % ALPHABET) as UInt8)
+        }
+        let _ = put_byte(base, (PANIC_TEXT_BYTES - 1) as UInt, LINE_FEED)
+        sos_panic(base as UnsafePointer<Int8>, at)
+    } else if role == ROLE_EMPTY {
+        sos_panic(1 as UnsafePointer<Int8>, 0)
+    } else if role == ROLE_OUTSIDE {
+        sos_panic(UNGRANTED as UnsafePointer<Int8>, SOME_BYTES)
+    }
+}
+
+/// Write `s` at offset `at` of the buffer at `base`; answers the offset after
+/// it.
+func put(base: UInt, at: UInt, s: String) unsafe -> UInt {
+    var i = 0
+    var to = at
+    while i < s.len() {
+        to = put_byte(base, to, s.byte_at(i))
+        i = i + 1
+    }
+    to
+}
+
+func put_byte(base: UInt, at: UInt, b: UInt8) unsafe -> UInt {
+    UnsafeMemory<UInt8, Normal>(base + at).write(b)
+    at + 1
+}
