@@ -1,0 +1,87 @@
+// A `_start` child with no heap (`ARENA_SIZE = 0`): every allocation it makes
+// is refused, and the runtime ends the process with `sos: out of arena
+// memory`. So each step below allocates nothing: adopting its System,
+// deriving its Process, draining its boot set, listing it with `entry(at:)`,
+// taking each record by tag, and printing with `{}` arguments, which render
+// on the stack.
+//
+// It asks for one record twice: the second take answers `None`, because a
+// take clears the record's word. It exits 0 once every step has answered as
+// its launcher's config says.
+
+import sos.{System, Process, BootSet, BootHandleKind}
+
+/// The tags `boot-set-launch` gives its records under.
+static TAG_EVENT: UInt = 2
+static TAG_POOL: UInt = 3
+static TAG_SPARE: UInt = 4
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS noheap: no process handle\n")
+        return
+    }
+    var set = try BootSet(process: &proc) catch {
+        print("SOS noheap: drain answered {}\n", error as UInt)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    print("SOS noheap: drained {} records\n", set.len())
+    var i: Int = 0
+    while i < set.len() {
+        let e = set.entry(at: i)
+        print("SOS noheap: record {} kind {}\n", e.tag, e.kind as UInt)
+        i = i + 1
+    }
+
+    guard let event_record = set.take(TAG_EVENT) else {
+        let _ = system.debug_print("SOS noheap: no Event record\n")
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let pool_record = set.take(TAG_POOL) else {
+        let _ = system.debug_print("SOS noheap: no pool record\n")
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let spare_record = set.take(TAG_SPARE) else {
+        let _ = system.debug_print("SOS noheap: no second Event record\n")
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    var event_rec = move event_record
+    var pool_rec = move pool_record
+    var spare_rec = move spare_record
+    guard let event = event_rec.take_event() else {
+        let _ = system.debug_print("SOS noheap: record 2 is no Event\n")
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let pool = pool_rec.take_pool() else {
+        let _ = system.debug_print("SOS noheap: record 3 is no pool\n")
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let spare = spare_rec.take_event() else {
+        let _ = system.debug_print("SOS noheap: record 4 is no Event\n")
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS noheap: took an Event, a pool and an Event\n")
+
+    // The record is gone from the set once taken.
+    let again = match set.take(TAG_EVENT) {
+        case Some(_) -> 1,
+        case None -> 0,
+    }
+    print("SOS noheap: a second take of tag 2 answered {} handles\n", again)
+    if again != 0 {
+        let _ = proc.exit(EXIT_FAILED)
+    }
+    let _ = proc.exit(EXIT_OK)
+}

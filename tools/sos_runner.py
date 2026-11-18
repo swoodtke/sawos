@@ -888,6 +888,13 @@ CHILD_DISOWN_PKG = os.path.join(TESTS_DIR, "child-disown")
 CHARGE_REAP_PKG = os.path.join(TESTS_DIR, "charge-reap")
 CHILD_KEEPER_PKG = os.path.join(TESTS_DIR, "child-keeper")
 
+# A launcher giving a child three records beside its System handle, and the
+# two children that drain them with `BootSet`: one with no heap at all, one
+# that takes a single record and lets the set release the rest.
+BOOT_SET_LAUNCH_PKG = os.path.join(TESTS_DIR, "boot-set-launch")
+CHILD_NO_HEAP_PKG = os.path.join(TESTS_DIR, "child-no-heap")
+CHILD_SET_RELEASE_PKG = os.path.join(TESTS_DIR, "child-set-release")
+
 # What the harness types at the guest's serial port for the echo cases, and what
 # it then expects to read back.
 #
@@ -11855,6 +11862,58 @@ TEST_CASES = [
                        "SOS replyorder: done"],
         "expect_clean_exit": True,
     },
+    {
+        # Start-up allocates nothing. The child links no arena, so any
+        # allocation ends it with `sos: out of arena memory`; it adopts its
+        # System, derives its Process, drains a boot set of three records,
+        # lists them, takes each by tag and exits 0. Kinds 8 and 13 are
+        # `BootHandleKind.Event` and `Pool`. A second take of a taken tag
+        # answers no handle.
+        "name": "start_no_heap",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": BOOT_SET_LAUNCH_PKG,
+        "children": [CHILD_NO_HEAP_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS bootlaunch: started",
+                       "SOS noheap: drained 3 records",
+                       "SOS noheap: record 2 kind 8",
+                       "SOS noheap: record 3 kind 13",
+                       "SOS noheap: record 4 kind 8",
+                       "SOS noheap: took an Event, a pool and an Event",
+                       "SOS noheap: a second take of tag 2 answered 0 "
+                       "handles",
+                       "SOS: process exit: code={zero} process={one}",
+                       "SOS bootlaunch: child status=65536",
+                       "SOS bootlaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A boot set releases what was not taken. The child takes one record
+        # of three and reads its `Handle` row with the set alive (its System,
+        # its Process and the three records) and after the set drops (the
+        # System, the Process and the Event it took). Then it drains again,
+        # into a set that holds nothing, and asks for the record at its
+        # length, which panics with `entry(at:)`'s text: `Faulted (Panic)`.
+        "name": "boot_set_release",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": BOOT_SET_LAUNCH_PKG,
+        "children": [CHILD_SET_RELEASE_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS bootlaunch: started",
+                       "SOS setrelease: handles 5 with the set, 3 after it "
+                       "dropped",
+                       "SOS setrelease: a second drain holds 0 records",
+                       *_panic_fault("{one}", "panic at bootset.saw:",
+                                     ": BootSet.entry: index out of range: "
+                                     "0 (len 0)"),
+                       f"SOS bootlaunch: child status={STATUS_PANICKED}\n",
+                       "SOS bootlaunch: done"],
+        "expect_clean_exit": True,
+    },
 ]
 
 INSTALL_HINTS = {
@@ -15823,6 +15882,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #                      its kernel and linked in: a child's quotas start
     #                      at them and its maps fill the board's grant budget,
     #                      and root's table is `MAX_HANDLES` deep
+    #   start_no_heap      a child with no arena drains its boot set and
+    #                      takes every record
+    #   boot_set_release   a boot set's drop releases the records not taken,
+    #                      and a record past its end is a panic
     #
     # Every process in them runs its code from the flash instruction window
     # and reads its read-only data through the data window, in place in its
@@ -15841,7 +15904,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "copy_from_code_refused", "thread_entry_not_exec",
                      "image_held", "data_init", "pool_ops",
                      "kill_churn", "kill_runnable", "image_limits",
-                     "board_limits", "panic_op"]
+                     "board_limits", "panic_op", "start_no_heap",
+                     "boot_set_release"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 

@@ -1,0 +1,81 @@
+// A `_start` child that takes one record of the three its launcher gave and
+// lets its `BootSet` drop with the other two in it. It reads its `Handle`
+// quota row while the set lives and again after the drop: the drop releases
+// the two records it did not take, so it holds two handles fewer, and the
+// Event it took is still its own.
+//
+// It ends by asking an empty set for the record at its length, which panics:
+// the case holds `Faulted (Panic)` and the panic's text.
+
+import sos.{System, Process, BootSet, Event, QuotaKind}
+
+/// The tag `boot-set-launch` gives its first Event under.
+static TAG_EVENT: UInt = 2
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The handles this process holds, from its `Handle` quota row; `None` when
+/// the row cannot be read, which is printed.
+func handles_held(proc: &Process) -> UInt16? {
+    let row = try proc.quota_get(QuotaKind.Handle) catch {
+        print("SOS setrelease: quota row: {}\n", error)
+        return None
+    }
+    row.used
+}
+
+/// Drain the boot set, read the `Handle` row with it alive into `held`, and
+/// take the Event. The set drops on the way out, with two records in it.
+func take_event(proc: &Process, held: &var UInt16) -> Event? {
+    var set = try BootSet(process: &proc) catch {
+        print("SOS setrelease: drain: {}\n", error)
+        return None
+    }
+    guard let with_set = handles_held(&proc) else { return None }
+    held = with_set
+    guard let record = set.take(TAG_EVENT) else {
+        print("SOS setrelease: no record under tag {}\n", TAG_EVENT)
+        return None
+    }
+    var rec = move record
+    rec.take_event()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS setrelease: no process handle\n")
+        return
+    }
+    var with_set: UInt16 = 0
+    guard let event = take_event(&proc, &var with_set) else {
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard let after = handles_held(&proc) else {
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    print("SOS setrelease: handles {} with the set, {} after it dropped\n",
+          with_set, after)
+    try event.signal(1) catch {
+        print("SOS setrelease: the Event it took: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+
+    // A second drain holds nothing, since the set stays drained, and asking
+    // for the record at its length panics: the slot past the end is storage,
+    // not a record.
+    let empty = try BootSet(process: &proc) catch {
+        print("SOS setrelease: second drain: {}\n", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    print("SOS setrelease: a second drain holds {} records\n", empty.len())
+    let past = empty.entry(at: empty.len())
+    print("SOS setrelease: the record past the end read tag {}\n", past.tag)
+    let _ = proc.exit(EXIT_OK)
+}

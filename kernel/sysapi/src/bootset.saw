@@ -5,9 +5,23 @@
 //! the declaration names. A child that knows its records by tag has no use
 //! for that order: it drains everything here and takes each record by its
 //! tag, so a record it does not ask for is released with the set.
+//!
+//! The drain allocates nothing, so a process with no heap can drain its set.
+//! Every record names a handle in the process's own table, so a drain meets
+//! at most `MAX_HANDLES` records, and the kernel holds that number under
+//! `BOOT_SET_CAPACITY` (`kcore.limits`). The set keeps each record as the
+//! kernel wrote it, its three words, in an inline array that many records
+//! long, and makes the record's wrapper only when it is taken.
 
-import sosabi.{SosStatus, BootHandleKind}
-import sos.system.{Process, BootHandle}
+import sosabi.{SosStatus, BootHandleKind, BOOT_SET_CAPACITY,
+               BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
+               BOOT_HANDLE_KIND_WORD, BOOT_HANDLE_HANDLE_WORD,
+               boot_handle_record_bytes, NO_HANDLE}
+import sos.system.{Process, BootHandle, decode_boot_handle}
+import sos.floor.{checked, sos_handle_release, sos_process_boot_handle_next}
+
+/// The words the set's records fill when the set is full.
+static BOOT_SET_WORDS: Int = BOOT_SET_CAPACITY * BOOT_HANDLE_RECORD_WORDS
 
 /// One record of a drained set, as the drain met it: its tag and its kind.
 public struct BootEntry {
@@ -19,13 +33,27 @@ public struct BootEntry {
 /// them: a child's in the order its launcher gave them, root's in row order.
 ///
 /// `NoCopy`: it owns every record not yet taken, and dropping it releases
-/// them.
+/// them. A taken record's handle word reads `NO_HANDLE`.
 public struct BootSet {
-    entries: Vector<BootEntry>
-    records: Vector<BootHandle?>
+    records: [UInt; BOOT_SET_WORDS]
+    count: Int
 }
 
-extension BootSet: NoCopy {}
+extension BootSet: NoCopy {
+    /// Release every handle word not taken: the release each record's
+    /// wrapper would make on its drop.
+    func deinit(&var self) {
+        var i: Int = 0
+        while i < self.count {
+            let word = self.records[i * BOOT_HANDLE_RECORD_WORDS
+                                    + BOOT_HANDLE_HANDLE_WORD]
+            if word != NO_HANDLE {
+                let _ = sos_handle_release(word)
+            }
+            i = i + 1
+        }
+    }
+}
 
 extension BootSet {
     /// Drain `process`'s boot set to its end. Requires
@@ -33,34 +61,61 @@ extension BootSet {
     /// (`boot_handle_next`'s terms). A drain that ends other than by
     /// `SosStatus.Drained` answers that status, and the records drained
     /// before it are released.
+    ///
+    /// More records than `BOOT_SET_CAPACITY` panic, naming the capacity: the
+    /// kernel's table cannot hold them, so only a kernel built past its own
+    /// assert could answer one.
     public init(process: &Process) -> Result<BootSet, SosStatus> {
-        var entries = Vector<BootEntry>()
-        var records = Vector<BootHandle?>()
+        var set = BootSet(records: [0; BOOT_SET_WORDS], count: 0)
         while {
-            let record = try process.boot_handle_next() catch {
+            let record = try next_record(&process) catch {
                 if error == SosStatus.Drained {
                     break
                 }
                 return error
             }
-            try entries.push(BootEntry(tag: record.tag, kind: record.kind)) catch {
-                return SosStatus.NoMemory
+            if set.count == BOOT_SET_CAPACITY {
+                panic("sos: the boot set holds more than {} records",
+                      BOOT_SET_CAPACITY)
             }
-            try records.push(move record) catch {
-                return SosStatus.NoMemory
-            }
+            let kind = kind_of(record.1)
+            let at = set.count * BOOT_HANDLE_RECORD_WORDS
+            set.records[at + BOOT_HANDLE_TAG_WORD] = record.0
+            set.records[at + BOOT_HANDLE_KIND_WORD] = kind as UInt
+            set.records[at + BOOT_HANDLE_HANDLE_WORD] = record.2
+            set.count = set.count + 1
         }
-        return BootSet(entries: move entries, records: move records)
+        return move set
     }
 
     /// How many records the drain met, taken or not.
     public func len(&self) -> Int {
-        self.entries.len()
+        self.count
     }
 
-    /// The tag and kind of every record, in drain order, taken or not.
+    /// The tag and kind of record `at`, in drain order, taken or not. It
+    /// allocates nothing. An `at` outside `0 ..< len()` panics: the length is
+    /// published, so the caller could have checked.
+    public func entry(&self, at: Int) -> BootEntry {
+        if at < 0 || at >= self.count {
+            panic("BootSet.entry: index out of range: {} (len {})", at,
+                  self.count)
+        }
+        let base = at * BOOT_HANDLE_RECORD_WORDS
+        BootEntry(tag: self.records[base + BOOT_HANDLE_TAG_WORD],
+                  kind: kind_of(self.records[base + BOOT_HANDLE_KIND_WORD]))
+    }
+
+    /// The tag and kind of every record, in drain order, taken or not. The
+    /// vector is allocated, and a failure to allocate it panics.
     public func entries(&self) -> Vector<BootEntry> {
-        self.entries.copy()
+        var all = Vector<BootEntry>()
+        var i: Int = 0
+        while i < self.count {
+            try! all.push(self.entry(at: i))
+            i = i + 1
+        }
+        return move all
     }
 
     /// Take the record given under `tag`, leaving the set without it. `None`
@@ -68,13 +123,43 @@ extension BootSet {
     /// giver's word, and asking for one it did not give is a question with an
     /// answer.
     public func take(&var self, tag: UInt) -> BootHandle? {
-        var i = 0
-        while i < self.entries.len() {
-            if (self.entries.get(i)!).tag == tag {
-                return self.records[i].take()
+        var i: Int = 0
+        while i < self.count {
+            let at = i * BOOT_HANDLE_RECORD_WORDS
+            if self.records[at + BOOT_HANDLE_TAG_WORD] == tag {
+                let word = self.records[at + BOOT_HANDLE_HANDLE_WORD]
+                if word == NO_HANDLE {
+                    return None
+                }
+                self.records[at + BOOT_HANDLE_HANDLE_WORD] = NO_HANDLE
+                let kind = self.records[at + BOOT_HANDLE_KIND_WORD]
+                return decode_boot_handle(tag, kind, word)
             }
             i = i + 1
         }
         None
     }
+}
+
+/// A record's kind word, decoded. An unknown word panics, on
+/// `decode_boot_handle`'s terms: the kernel wrote it out of the declaration
+/// this reads, so a word that does not decode is a skew between the two.
+func kind_of(word: UInt) -> BootHandleKind {
+    guard let kind = BootHandleKind.from(raw: word) else {
+        panic("sos: kernel wrote boot handle kind {}, which this build cannot name",
+              word)
+    }
+    kind
+}
+
+/// The next record of `process`'s boot set, as its tag, kind and handle
+/// words: the `unsafe` half of the drain, confined to one helper so the
+/// buffer's address never leaves it.
+func next_record(process: &Process) unsafe -> Result<(UInt, UInt, UInt), SosStatus> {
+    var buf: [UInt; BOOT_HANDLE_RECORD_WORDS] = [0; BOOT_HANDLE_RECORD_WORDS]
+    try checked(sos_process_boot_handle_next(process.handle,
+                                             (&var buf) as UnsafePointer<UInt>,
+                                             boot_handle_record_bytes() as UInt))
+    return (buf[BOOT_HANDLE_TAG_WORD], buf[BOOT_HANDLE_KIND_WORD],
+            buf[BOOT_HANDLE_HANDLE_WORD])
 }
