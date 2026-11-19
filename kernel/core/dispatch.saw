@@ -316,6 +316,7 @@ import kcore.process.{
     meets_row,
     record_grant,
     remove_grant,
+    grow_grant,
 }
 import kcore.loader.{
     ImageTable,
@@ -607,7 +608,7 @@ func stats_region_map(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     // frames, and where the kernel lives in a linear map the two differ.
     // `kcore.stats` owns that conversion.
     let base = stats_region_phys()
-    install_row(p, p, base, base + stats_region_len(),
+    install_row(p, p, base, base + stats_region_len(), 0,
                 grant_perms(MapAccess.Read as UInt32), false, NO_MEMORY)
 }
 
@@ -3143,8 +3144,16 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
 /// device window (an IoMemory is pinned and its range is never returned,
 /// §5.9). `record_grant` counts the row against the region, and that count is
 /// half of the release condition in §2.5.
-func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
-                 device: Bool, region: Int) unsafe -> SyscallResult {
+///
+/// `room` is address space to keep free above the row for it to grow into
+/// (`MappingOp.Grow`), a whole number of grains. Where the target translates
+/// the row is placed with its room clear of every other row's claim, the
+/// window must hold both, and the row records it (`GrantRow.room`). Where a
+/// row's address is its memory's own it is recorded as zero, since there is
+/// nothing to keep; a device row's caller passes zero.
+func install_row(p: Int, t: Int, base: UInt, top: UInt, room: UInt,
+                 perms: UInt8, device: Bool,
+                 region: Int) unsafe -> SyscallResult {
     match PROCESS_RECORDS[t].state {
         case Gone -> { return op_status(SosStatus.Revoked) },
         case _ -> {},
@@ -3177,8 +3186,12 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     // Placement precedes `alloc_mapping` and `mint_handle` so that a refusal
     // leaks neither.
     let span = top - base
-    let va_base = hal.map_place(free_user_va(t, span), base, device)
-    if span > UInt.max - va_base {
+    let kept: UInt = if hal.map_translates() && not device { room } else { 0 }
+    if kept > UInt.max - span {
+        return op_status(SosStatus.NoResource)
+    }
+    let va_base = hal.map_place(free_user_va(t, span + kept), base, device)
+    if span + kept > UInt.max - va_base {
         return op_status(SosStatus.NoResource)
     }
     let va_top = va_base + span
@@ -3186,7 +3199,7 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     // chose no address, so what it met is a domain window with no room left. A
     // device row is not asked; its window is the board's, and
     // `device_window_ok` answered for it at the op that named the bounds.
-    if not device && not hal.map_target_ok(va_base, va_top) {
+    if not device && not hal.map_target_ok(va_base, va_top + kept) {
         return op_status(SosStatus.NoResource)
     }
     // A mapping meets no row the target already holds, of any kind. Where
@@ -3208,6 +3221,7 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
     // that disagrees with its own record.
     let row = PROCESSES[target_body].grant_count
     record_grant(t, va_base, va_top, base, perms, device, region)
+    PROCESSES[target_body].grants[row].room = kept
     MAPPINGS[slot] = MappingSlot(state: SlotState.Live, process: p, target: t,
                                  row: row, refs: 1)
     quota_charge(t, QuotaKind.Mapping)
@@ -3216,19 +3230,20 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, perms: UInt8,
 }
 
 /// The Memory object's ops (spec §2.5).
-func memory_op(raw_op: UInt, obj: &MemoryObject, arg0: UInt,
-               arg1: UInt) unsafe -> SyscallResult {
+func memory_op(raw_op: UInt, obj: &MemoryObject, arg0: UInt, arg1: UInt,
+               arg2: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     guard let op = MemoryOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
-    return memory_op_decoded(op, &obj, arg0, arg1, p)
+    return memory_op_decoded(op, &obj, arg0, arg1, arg2, p)
 }
 
 func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
-                       p: Int) unsafe -> SyscallResult {
+                       arg2: UInt, p: Int) unsafe -> SyscallResult {
     match op {
         // Map: install this region in a domain and answer with the Mapping.
-        // `arg0` is the target Process handle and `arg1` the `MapAccess` bits;
-        // the two rights it spends are checked on two objects, here and in
+        // `arg0` is the target Process handle, `arg1` the `MapAccess` bits and
+        // `arg2` the room to keep free above the row (`install_row`); the two
+        // rights it spends are checked on two objects, here and in
         // `map_target`.
         //
         // The range is the region's own, since a caller supplies no addresses,
@@ -3262,6 +3277,12 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             if (base % hal.PROT_GRAIN) != 0 || (len % hal.PROT_GRAIN) != 0 {
                 fault_process(p, FaultReason.BadArg)
             }
+            // The room is whole grains, so the row's top stays on the grain
+            // wherever a `Grow` takes it within the room.
+            let room = arg2
+            if (room % hal.PROT_GRAIN) != 0 {
+                fault_process(p, FaultReason.BadArg)
+            }
             let top = base + len
             // Ask the HAL's window predicate rather than relying on its loader
             // path: one target's grant window cannot express every address, and
@@ -3276,7 +3297,51 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             if not hal.map_source_ok(base, top) {
                 fault_process(p, FaultReason.BadArg)
             }
-            install_row(p, t, base, top, grant_perms(access), false, obj.slot)
+            install_row(p, t, base, top, room, grant_perms(access), false,
+                        obj.slot)
+        },
+        // Extend: grow this allocation in place by `arg0` bytes, the front of
+        // its pool's unspent frontier. The answers, in spec §2.5's order: no
+        // `Extend` right (`AccessDenied`); a `len` of zero or off the
+        // allocation's granularity (`BadArg`); the bytes after the allocation
+        // not the frontier's front, or the frontier shorter than `len`
+        // (`NoMemory`), a status because the pool may be shared and another
+        // holder's cut changes it between any read of it and this call.
+        //
+        // The bytes move from the pool's frontier to the allocation and onto
+        // the pool's loan ledger (`out_bytes`), as a `Front` cut of `len`
+        // would put them, so the whole grown range goes home together at the
+        // release. No object is made and no quota is charged: bytes are the
+        // pool's ledger (spec §2.9). Rows that grant the allocation keep their
+        // bounds; a row grows by its own `MappingOp.Grow`.
+        case Extend -> {
+            if not obj.allows(MemoryRight.Extend) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            let len = arg0
+            if len == 0 || (len % MEMORIES[obj.slot].granularity) != 0 {
+                fault_process(p, FaultReason.BadArg)
+            }
+            // Only a `Front` cut is minted with `Extend`, and no derivation
+            // adds it, so an allocation that carries it names a live pool: a
+            // pool does not free while anything allocated from it is out.
+            let pool = MEMORIES[obj.slot].pool
+            if pool == NO_MEMORY {
+                fatal_kernel("an allocation that may extend names no pool",
+                             obj.slot as UInt)
+                // `fatal_kernel` stops the machine but is not declared
+                // `-> Never`, so the scope has to exit itself.
+                return op_status(SosStatus.NoMemory)
+            }
+            let end = MEMORIES[obj.slot].base + MEMORIES[obj.slot].len
+            if MEMORIES[pool].base != end || MEMORIES[pool].len < len {
+                return op_status(SosStatus.NoMemory)
+            }
+            MEMORIES[pool].base = MEMORIES[pool].base + len
+            MEMORIES[pool].len = MEMORIES[pool].len - len
+            MEMORIES[pool].out_bytes = MEMORIES[pool].out_bytes + len
+            MEMORIES[obj.slot].len = MEMORIES[obj.slot].len + len
+            op_ok()
         },
     }
 }
@@ -3529,7 +3594,7 @@ func iomemory_op_decoded(op: IoMemoryOp, obj: &IoMemoryObject, arg0: UInt,
             // and nothing about caching. `NO_MEMORY`: MMIO is pinned, so a
             // device row counts against no region and returns no bytes when it
             // goes (§5.9).
-            install_row(p, t, base, base + len,
+            install_row(p, t, base, base + len, 0,
                         (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), true,
                         NO_MEMORY)
         },
@@ -3537,13 +3602,14 @@ func iomemory_op_decoded(op: IoMemoryOp, obj: &IoMemoryObject, arg0: UInt,
 }
 
 /// The Mapping object's ops (spec §2.5).
-func mapping_op(raw_op: UInt, obj: &MappingObject) unsafe -> SyscallResult {
+func mapping_op(raw_op: UInt, obj: &MappingObject,
+               arg0: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     guard let op = MappingOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
-    return mapping_op_decoded(op, &obj, p)
+    return mapping_op_decoded(op, &obj, arg0, p)
 }
 
-func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
+func mapping_op_decoded(op: MappingOp, obj: &MappingObject, arg0: UInt,
                         p: Int) unsafe -> SyscallResult {
     match op {
         // Unmap: only a mapping unmaps (§2.5).
@@ -3634,6 +3700,75 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject,
             // own instructions will issue.
             let t = MAPPINGS[obj.slot].target
             op_value(PROCESSES[body_of(t)].grants[row].base)
+        },
+        // Grow: raise the row's top by `arg0` bytes, over its allocation's
+        // next bytes. The answers, in spec §2.5's order:
+        //
+        //   - no `Grow` right (`AccessDenied`);
+        //   - a husk its holder unmapped (`BadState`, as for `Unmap`);
+        //   - a `len` of zero or off the grain (`BadArg`);
+        //   - a husk whose target died (`Revoked`): the row went with the
+        //     domain, so nothing is left to ask about it;
+        //   - a row that grants no allocation, a device window or the stats
+        //     region (`BadArg`): there are no next bytes to grow over;
+        //   - a new top past the allocation's end (`NoMemory`), a status
+        //     because the holder of a Mapping need not hold the Memory and
+        //     cannot read its bounds;
+        //   - next addresses that meet another row or leave the grant window
+        //     (`NoResource`), as `map` answers. Where a row's address is its
+        //     memory's own they are the allocation's own bytes, which no other
+        //     row can grant, so this answers only where the target
+        //     translates, and not within the row's room, which placement kept
+        //     clear.
+        //
+        // Then the row grows (`grow_grant`), and the live-domain rule
+        // replays the record where the target's domain is the installed one.
+        // It is still one row, so no quota moves, and the allocation's row
+        // count (`maps`) does not change.
+        case Grow -> {
+            if not obj.allows(MappingRight.Grow) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            match MAPPINGS[obj.slot].state {
+                case Live -> {},
+                case Free -> fault_process(p, FaultReason.BadState),
+            }
+            let row = MAPPINGS[obj.slot].row
+            if row == NO_ROW {
+                fault_process(p, FaultReason.BadState)
+            }
+            let len = arg0
+            if len == 0 || (len % hal.PROT_GRAIN) != 0 {
+                fault_process(p, FaultReason.BadArg)
+            }
+            if row == ROW_TARGET_DIED {
+                return op_status(SosStatus.Revoked)
+            }
+            let t = MAPPINGS[obj.slot].target
+            let b = body_of(t)
+            let grant = PROCESSES[b].grants[row]
+            if grant.region == NO_MEMORY {
+                fault_process(p, FaultReason.BadArg)
+            }
+            // A row grants bytes of its allocation and no others, so its
+            // physical top lies within the allocation's range.
+            let pa_top = grant.pa + (grant.top - grant.base)
+            let end = (MEMORIES[grant.region].base
+                       + MEMORIES[grant.region].len)
+            if len > end - pa_top {
+                return op_status(SosStatus.NoMemory)
+            }
+            if len > UInt.max - grant.top {
+                return op_status(SosStatus.NoResource)
+            }
+            let top = grant.top + len
+            if (not hal.map_target_ok(grant.base, top)
+                || meets_row(t, grant.top, top)) {
+                return op_status(SosStatus.NoResource)
+            }
+            grow_grant(t, row, len)
+            domain_changed(t)
+            op_ok()
         },
     }
 }
@@ -4927,12 +5062,13 @@ func dispatch(handle: UInt, op: UInt,
                                   rights: entry.rights, slot: entry.target)
             timer_op(op, &obj, arg0, arg1)
         },
-        // A Memory has one op, install (spec §2.5); an unknown number aimed
-        // at one is `BadOp` inside `memory_op` rather than at this line.
+        // A Memory has two ops, install and grow in place (spec §2.5); an
+        // unknown number aimed at one is `BadOp` inside `memory_op` rather
+        // than at this line.
         case Memory -> {
             let obj = MemoryObject(handle: MemoryHandle(handle),
                                    rights: entry.rights, slot: entry.target)
-            memory_op(op, &obj, arg0, arg1)
+            memory_op(op, &obj, arg0, arg1, arg2)
         },
         // A Pool's two ops are `Allocate` and `Available` (spec §2.5); its
         // slot is a Memory slot, and the kind is what keeps every `MemoryOp`
@@ -4950,7 +5086,7 @@ func dispatch(handle: UInt, op: UInt,
         case Mapping -> {
             let obj = MappingObject(handle: MappingHandle(handle),
                                     rights: entry.rights, slot: entry.target)
-            mapping_op(op, &obj)
+            mapping_op(op, &obj, arg0)
         },
         // Two arms onto one slab. `entry.target` is the connection for both,
         // and the kind decides which op table answers and which rights enum the

@@ -1,0 +1,130 @@
+// An allocation and its row, grown in place (spec §2.5): `Memory.extend`
+// takes the pool's next bytes, and `Mapping.grow` raises the row over them.
+//
+//   SOS memextend: fresh total=<pool> largest=<pool>
+//   SOS memextend: mapped: rows mapping +1 memory +1
+//   SOS memextend: growth 1: last=yes first=yes same base=yes
+//   SOS memextend: growth 1: rows mapping +1 memory +1
+//   ... (growths 2 and 3 the same)
+//   SOS memextend: grown: total fell by 16384 largest fell by 16384
+//   SOS memextend: all home: total=<pool> largest=<pool>
+//   SOS memextend: done
+//
+// A page from the front of a fresh pool is mapped read-write with three pages
+// of room, which keeps the next addresses free where a mapping has an address
+// of its own. Three times the allocation is extended by a page and its row
+// grown by the same page, and the new last byte is written and read back:
+// reachable, through the one row, at once, in the running process. The row's
+// address does not move, and this process's `Mapping` and `Memory` rows read
+// one more than before the allocation throughout, so a growth installs no row
+// and makes no object.
+//
+// With four pages out, `available` reads four pages fewer, so the extensions
+// took their bytes from the pool. Then the row is unmapped and the allocation
+// released, and the pool reads whole: the grown range came home, all of it,
+// which needs the extensions on the pool's loan ledger (a return of more than
+// was lent stops the machine) and the row count untouched by the growths (a
+// row counted twice would hold the bytes forever).
+
+import sos.{System, Process, Pool, AllocateFrom, MapAccess, QuotaKind,
+            SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+static GROWTHS: UInt = 3
+
+/// The byte the allocation's first byte is written with, and the first of
+/// the bytes each growth's last byte is written with.
+static FIRST_MARK: UInt8 = 0x5D
+static LAST_MARK: UInt8 = 0xA0
+
+func poke(at: UInt, mark: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(at).write(mark)
+}
+
+func peek(at: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(at).read()
+}
+
+func yes_no(b: Bool) -> String {
+    if b { "yes" } else { "no" }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS memextend: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS memextend: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS memextend: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// This process's `Mapping` and `Memory` rows, what each holds.
+func rows(proc: &Process) -> Result<(UInt16, UInt16), SosStatus> {
+    let mapping = try proc.quota_get(kind: QuotaKind.Mapping)
+    let memory = try proc.quota_get(kind: QuotaKind.Memory)
+    return (mapping.used, memory.used)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    let fresh = try pool.available()
+    print("SOS memextend: fresh total={} largest={}\n", fresh.total,
+          fresh.largest)
+
+    let (mappings, memories) = try rows(&proc)
+    let mem = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let view = try proc.map(memory: &mem, access: RW, room: GROWTHS * PAGE)
+    let base = try view.base()
+    poke(base, FIRST_MARK)
+    let (mapped_rows, memory_rows) = try rows(&proc)
+    print("SOS memextend: mapped: rows mapping +{} memory +{}\n",
+          mapped_rows - mappings, memory_rows - memories)
+
+    var len = PAGE
+    var step: UInt = 1
+    while step <= GROWTHS {
+        try mem.extend(len: PAGE)
+        try view.grow(len: PAGE)
+        len = len + PAGE
+        let mark = LAST_MARK + (step as UInt8)
+        poke(base + len - 1, mark)
+        let last = peek(base + len - 1) == mark
+        let first = peek(base) == FIRST_MARK
+        let at = try view.base()
+        let (now_mappings, now_memories) = try rows(&proc)
+        print("SOS memextend: growth {}: last={} first={} same base={}\n",
+              step, yes_no(last), yes_no(first), yes_no(at == base))
+        print("SOS memextend: growth {}: rows mapping +{} memory +{}\n", step,
+              now_mappings - mappings, now_memories - memories)
+        step = step + 1
+    }
+    let grown = try pool.available()
+    print("SOS memextend: grown: total fell by {} largest fell by {}\n",
+          fresh.total - grown.total, fresh.largest - grown.largest)
+
+    try view.unmap()
+    let _ = move view
+    let _ = move mem
+    let home = try pool.available()
+    print("SOS memextend: all home: total={} largest={}\n", home.total,
+          home.largest)
+    return
+}

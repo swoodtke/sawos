@@ -788,10 +788,34 @@ public func sos_pool_available(handle: UInt, granularity: UInt,
 ///
 /// The caller supplies no addresses. No op reads a Memory's bounds;
 /// `MappingOp.Base` reads where a mapping landed.
+///
+/// `room` is address space the kernel keeps free above the row, where the
+/// target translates, for the row to grow into (`sos_mapping_grow`); zero
+/// keeps none. Where a row's address is its memory's own it is recorded as
+/// zero. A `room` off the protection grain terminates the caller, and one that
+/// takes the row past the target's window is `SosStatus.NoResource`.
 @export("sos_memory_map")
 public func sos_memory_map(handle: UInt, process: UInt, access: UInt,
+                           room: UInt,
                            value_out: UnsafePointer<UInt>) unsafe -> UInt {
-    sos_syscall3(handle, MemoryOp.Map as UInt, process, access, 0, value_out)
+    sos_syscall3(handle, MemoryOp.Map as UInt, process, access, room,
+                 value_out)
+}
+
+/// Extend: grow this allocation in place by `len` bytes, over the bytes after
+/// it in its pool. Requires `MemoryRight.Extend`, which only an allocation
+/// from the front of its pool's frontier carries.
+///
+/// A `len` of zero or off the allocation's granularity terminates the caller.
+/// The bytes after the allocation must be the front of its pool's unspent
+/// frontier and hold `len`: otherwise, another allocation or the pool's back
+/// in the way or the pool's end too near, the answer is `SosStatus.NoMemory`.
+/// Rows that grant the allocation keep their bounds (`sos_mapping_grow`).
+@export("sos_memory_extend")
+public func sos_memory_extend(handle: UInt, len: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, MemoryOp.Extend as UInt, len, 0, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
 }
 
 /// Carve: a sub-window of this device window, leaving the parent whole.
@@ -841,6 +865,23 @@ public func sos_iomemory_map(handle: UInt, process: UInt,
 @export("sos_mapping_unmap")
 public func sos_mapping_unmap(handle: UInt) -> UInt {
     sos_syscall1(handle, MappingOp.Unmap as UInt, 0)
+}
+
+/// Grow: raise this mapping's top by `len` bytes, over its allocation's next
+/// bytes. Requires `MappingRight.Grow`.
+///
+/// A mapping already unmapped terminates the caller (`BadState`), as do a
+/// `len` of zero or off the protection grain and a mapping of a device window
+/// or the stats region (`BadArg`). One whose target process has died is
+/// `SosStatus.Revoked`. Bytes the allocation does not hold yet
+/// (`sos_memory_extend` first) are `SosStatus.NoMemory`; next addresses that
+/// meet another row or leave the target's window, where the target
+/// translates, are `SosStatus.NoResource`.
+@export("sos_mapping_grow")
+public func sos_mapping_grow(handle: UInt, len: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, MappingOp.Grow as UInt, len, 0, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
 }
 
 // There is no `sos_mapping_base` for `MappingOp.Base`: `Mapping.base()` reaches

@@ -1,0 +1,92 @@
+// An extension takes the front of its pool's frontier and nothing else (spec
+// §2.5).
+//
+//   SOS extendmet: the back at the front's end: this pool has no free range
+//                  that long
+//   SOS extendmet: the back home: total=<pool less a page>
+//   SOS extendmet: more than the frontier: this pool has no free range that
+//                  long
+//   SOS extendmet: a page: ok
+//   SOS extendmet: a free range after it: this pool has no free range that
+//                  long
+//   SOS extendmet: all home: total=<pool> largest=<pool>
+//   SOS extendmet: done
+//
+// A page from the front of a fresh pool, and the rest of the pool from its
+// back, so the back's allocation begins where the front's ends and the
+// frontier is spent: the front's extension is `NoMemory`. The back's
+// allocation released folds into the frontier from above, which then begins
+// at the front's end again. An extension longer than the frontier is
+// `NoMemory`, and one page is served. Then two more pages from the front, the
+// first of them released: the bytes after the grown allocation are a free
+// range below the frontier, not its front, and the extension is `NoMemory`.
+// Released, the grown allocation comes home whole and the pool reads whole.
+
+import sos.{System, Process, Pool, AllocateFrom, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS extendmet: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS extendmet: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS extendmet: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// What an extension answered, as a status: `Ok` when it was served.
+func answer(result: Result<Void, SosStatus>) -> SosStatus {
+    match result {
+        case Ok(_) -> SosStatus.Ok,
+        case Err(why) -> why,
+    }
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    let fresh = try pool.available()
+
+    let front = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let back = try pool.allocate(len: fresh.total - PAGE,
+                                 from: AllocateFrom.Back)
+    print("SOS extendmet: the back at the front's end: {}\n",
+          answer(front.extend(len: PAGE)))
+
+    let _ = move back
+    let home = try pool.available()
+    print("SOS extendmet: the back home: total={}\n", home.total)
+    print("SOS extendmet: more than the frontier: {}\n",
+          answer(front.extend(len: fresh.total)))
+    print("SOS extendmet: a page: {}\n", answer(front.extend(len: PAGE)))
+
+    let freed = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let after = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let _ = move freed
+    print("SOS extendmet: a free range after it: {}\n",
+          answer(front.extend(len: PAGE)))
+
+    let _ = move after
+    let _ = move front
+    let whole = try pool.available()
+    print("SOS extendmet: all home: total={} largest={}\n", whole.total,
+          whole.largest)
+    return
+}

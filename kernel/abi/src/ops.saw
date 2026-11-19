@@ -660,9 +660,9 @@ public enum TimerOp: UInt {
 
 /// A method id on a Memory object: an allocation.
 ///
-/// One op, install. It does not read the region, and there is no op that hands
-/// back a Memory's bounds, so a region stays a capability rather than a
-/// description (spec §2.5).
+/// Two ops, install and grow in place. Neither reads the region, and there is
+/// no op that hands back a Memory's bounds, so a region stays a capability
+/// rather than a description (spec §2.5).
 ///
 /// There is no op that cuts an allocation. An allocation is made whole by a
 /// pool's `Allocate` or at boot, and goes back whole: when no handle names it
@@ -681,8 +681,22 @@ public enum TimerOp: UInt {
 /// `MemoryRight.MapExecute` on this region. It is conditional because it is a
 /// bit about what is being asked for rather than about the op: a caller mapping
 /// RW spends exactly what it always did.
+///
+/// `Map`'s third argument is a `room`: address space the kernel keeps free
+/// above the row, on a target that translates, for the row to grow into
+/// (`MappingOp.Grow`). It is a whole number of the protection grain, and zero
+/// keeps none. On a target where a row's address is its memory's own it is
+/// recorded as zero, since there is nothing to keep.
+///
+/// `Extend` grows the allocation in place by its one argument, a length, over
+/// the bytes after it: they must be the front of its pool's unspent frontier
+/// (`SosStatus.NoMemory` otherwise). It spends `MemoryRight.Extend`, which only
+/// a cut from the frontier's front carries (`AllocateFrom.Front`). It makes no
+/// object and charges no quota, and the rows that already grant the allocation
+/// keep their bounds: a row grows by its own `MappingOp.Grow`.
 public enum MemoryOp: UInt {
     case Map = 0,
+    case Extend = 1,
 }
 
 // =============================================================================
@@ -779,12 +793,13 @@ public enum IoMemoryOp: UInt {
 
 /// A method id on a Mapping object.
 ///
-/// Two ops. `Unmap` is the thing a Mapping is for (§2.5 gives it exactly one
-/// job: it is the thing that can unmap), and `Base` reads where the row landed.
-/// Everything else about it, such as what access it carries, was decided when
-/// it was installed and cannot be edited afterwards. A mapping whose access
-/// should change is a mapping that is unmapped and made again, which is one
-/// fewer op and no ambiguity about what a half-changed row means.
+/// Three ops. `Unmap` is the thing a Mapping is for (§2.5 gives it exactly one
+/// job: it is the thing that can unmap), `Base` reads where the row landed, and
+/// `Grow` raises its top. Everything else about it, such as what access it
+/// carries, was decided when it was installed and cannot be edited afterwards.
+/// A mapping whose access should change is a mapping that is unmapped and made
+/// again, which is one fewer op and no ambiguity about what a half-changed row
+/// means.
 ///
 /// Unmap of an already-unmapped Mapping is `BadState`, caller-checkable since
 /// the caller is the one that unmapped it. The same tag covers a mapping whose
@@ -811,6 +826,17 @@ public enum MappingOp: UInt {
     /// translate it is also the physical one, which is that tier's answer to
     /// the same question rather than a different question.
     case Base = 1,
+    /// Raise the row's top by the op's one argument, a length, over its
+    /// allocation's next bytes.
+    ///
+    /// The allocation must already hold them (`MemoryOp.Extend`), or the
+    /// answer is `SosStatus.NoMemory`: the holder of a Mapping need not hold
+    /// the Memory, so it cannot read the allocation's bounds. On a target that
+    /// translates the row grows into the next addresses, its `room` first, and
+    /// addresses that meet another row or leave the grant window are
+    /// `SosStatus.NoResource`. The row stays one row: no quota moves and the
+    /// allocation's row count does not change. It spends `MappingRight.Grow`.
+    case Grow = 2,
 }
 
 // =============================================================================
@@ -1064,7 +1090,7 @@ static_assert((ClockOp.TimerCreate as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
 static_assert((TimerOp.Disarm as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
-static_assert((MemoryOp.Map as UInt) < PANIC_OP,
+static_assert((MemoryOp.Extend as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
 static_assert((PoolOp.Available as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
@@ -1072,7 +1098,7 @@ static_assert((IoMemoryOp.Map as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
 // Re-point this assert at the highest case when an op is added (see the note on
 // the System table's assert above).
-static_assert((MappingOp.Base as UInt) < PANIC_OP,
+static_assert((MappingOp.Grow as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
 static_assert((PipeInletOp.Call as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")

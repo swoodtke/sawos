@@ -1,0 +1,59 @@
+// Where a mapping's address is its memory's own, a row's room is recorded as
+// zero (spec §2.5): a row's next addresses are its allocation's next bytes,
+// so there is nothing to keep free.
+//
+//   SOS roomidentity: a GiB of room: ok
+//   SOS roomidentity: the next page, at its own address: yes
+//   SOS roomidentity: done
+//
+// A page from the front of a fresh pool maps with a GiB of room, more than
+// any of these boards' RAM, and is not refused: the room is not asked of the
+// window. The pool's next page, from its front too, maps at its own address,
+// the page right after the first, inside the room a translating target would
+// have kept free.
+
+import sos.{System, Process, Pool, AllocateFrom, MapAccess, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static PAGE: UInt = 0x1000
+static GIB: UInt = 0x4000_0000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS roomidentity: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS roomidentity: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS roomidentity: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let first = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let first_view = try proc.map(memory: &first, access: RW, room: GIB)
+    print("SOS roomidentity: a GiB of room: ok\n")
+    let next = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let next_view = try proc.map(memory: &next, access: RW)
+    let first_at = try first_view.base()
+    let next_at = try next_view.base()
+    let own = if next_at == first_at + PAGE { "yes" } else { "no" }
+    print("SOS roomidentity: the next page, at its own address: {}\n", own)
+    return
+}

@@ -1,0 +1,86 @@
+// A row grows over its allocation's bytes and no others (spec §2.5).
+//
+//   SOS growpast: a page past the allocation: this pool has no free range
+//                 that long
+//   SOS growpast: extended by a page, grown by two: this pool has no free
+//                 range that long
+//   SOS growpast: grown by one: ok, its last byte holds its mark: yes
+//   SOS growpast: all home: total=<pool> largest=<pool>
+//   SOS growpast: done
+//
+// A page from the front of a fresh pool, mapped read-write. Its row grown by a
+// page before the allocation holds one is `NoMemory`; with the allocation
+// extended by a page, a growth of two pages still is, and a growth of the one
+// page is served and its last byte is reachable. Unmapped and released, the
+// pool reads whole.
+
+import sos.{System, Process, Pool, AllocateFrom, MapAccess, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+static MARK: UInt8 = 0x6E
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS growpast: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS growpast: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS growpast: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// What a growth answered, as a status: `Ok` when it was served.
+func answer(result: Result<Void, SosStatus>) -> SosStatus {
+    match result {
+        case Ok(_) -> SosStatus.Ok,
+        case Err(why) -> why,
+    }
+}
+
+/// Write `MARK` at `at` and say whether it reads back.
+func holds_mark(at: UInt) unsafe -> String {
+    UnsafeMemory<UInt8, Normal>(at).write(MARK)
+    if UnsafeMemory<UInt8, Normal>(at).read() == MARK { "yes" } else { "no" }
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let mem = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let view = try proc.map(memory: &mem, access: RW)
+    print("SOS growpast: a page past the allocation: {}\n",
+          answer(view.grow(len: PAGE)))
+    try mem.extend(len: PAGE)
+    print("SOS growpast: extended by a page, grown by two: {}\n",
+          answer(view.grow(len: 2 * PAGE)))
+    let grown = answer(view.grow(len: PAGE))
+    let base = try view.base()
+    print("SOS growpast: grown by one: {}, its last byte holds its mark: {}\n",
+          grown, holds_mark(base + 2 * PAGE - 1))
+
+    try view.unmap()
+    let _ = move view
+    let _ = move mem
+    let home = try pool.available()
+    print("SOS growpast: all home: total={} largest={}\n", home.total,
+          home.largest)
+    return
+}

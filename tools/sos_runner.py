@@ -378,6 +378,19 @@ POOL_MEET_PKG = os.path.join(TESTS_DIR, "pool-meet")
 POOL_CUT_RIGHTS_PKG = os.path.join(TESTS_DIR, "pool-cut-rights")
 POOL_ODD_LEN_PKG = os.path.join(TESTS_DIR, "pool-odd-len")
 POOL_FROM_BAD_PKG = os.path.join(TESTS_DIR, "pool-from-bad")
+# Growing in place: an allocation extended over its pool's next bytes and its
+# row grown over them, the room `map` keeps above a row, and what each refuses.
+MEMORY_EXTEND_PKG = os.path.join(TESTS_DIR, "memory-extend")
+MEMORY_EXTEND_MET_PKG = os.path.join(TESTS_DIR, "memory-extend-met")
+MEMORY_EXTEND_TWO_PKG = os.path.join(TESTS_DIR, "memory-extend-two")
+MAPPING_GROW_PAST_PKG = os.path.join(TESTS_DIR, "mapping-grow-past")
+MAPPING_GROW_GONE_PKG = os.path.join(TESTS_DIR, "mapping-grow-gone")
+MAPPING_GROW_ROOM_PKG = os.path.join(TESTS_DIR, "mapping-grow-room")
+MAP_ROOM_WINDOW_PKG = os.path.join(TESTS_DIR, "map-room-window")
+MAP_ROOM_IDENTITY_PKG = os.path.join(TESTS_DIR, "map-room-identity")
+GROW_FAULTS_PKG = os.path.join(TESTS_DIR, "grow-faults")
+CHILD_GROW_LEG_PKG = os.path.join(TESTS_DIR, "child-grow-leg")
+EXTEND_ISOLATION_PKG = os.path.join(TESTS_DIR, "extend-isolation")
 MAP_BASICS_PKG = os.path.join(TESTS_DIR, "map-basics")
 MAP_UNMAP_PKG = os.path.join(TESTS_DIR, "map-unmap")
 MAP_INTO_CHILD_PKG = os.path.join(TESTS_DIR, "map-into-child")
@@ -1723,6 +1736,8 @@ def expectations(arch):
                                - arch.get("prot_grain", 0)),
         "pool_less_two_grains": str(arch.get("pool_len", 0)
                                     - 2 * arch.get("prot_grain", 0)),
+        # A fresh pool with a page out of it, in `Pool.available`'s decimal.
+        "pool_less_page": str(arch.get("pool_len", 0) - 0x1000),
         # A child's Mapping default under the board's defaults (`board_limits`):
         # in decimal as the child prints it, as the kernel's exit line prints
         # it, and in the §8 status word of a child that exited with it.
@@ -5257,6 +5272,258 @@ TEST_CASES = [
                        "process={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # An allocation and its row grown in place (spec §2.5). A page from
+        # the front of a fresh pool, mapped with three pages of room, is
+        # extended and its row grown by a page three times; each time the
+        # new last byte is written and read back, the first byte keeps its
+        # own, the row's address does not move, and root's `Mapping` and
+        # `Memory` rows read one more than before the allocation. Four pages
+        # are then out of the pool. Unmapped and released, the grown range
+        # comes home whole: the extensions were on the pool's loan ledger
+        # and no growth counted the row twice.
+        "name": "memory_extend",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_EXTEND_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS memextend: fresh total={pool_bytes} "
+                       "largest={pool_bytes}",
+                       "SOS memextend: mapped: rows mapping +1 memory +1",
+                       "SOS memextend: growth 1: last=yes first=yes "
+                       "same base=yes",
+                       "SOS memextend: growth 1: rows mapping +1 memory +1",
+                       "SOS memextend: growth 2: last=yes first=yes "
+                       "same base=yes",
+                       "SOS memextend: growth 2: rows mapping +1 memory +1",
+                       "SOS memextend: growth 3: last=yes first=yes "
+                       "same base=yes",
+                       "SOS memextend: growth 3: rows mapping +1 memory +1",
+                       "SOS memextend: grown: total fell by 16384 "
+                       "largest fell by 16384",
+                       "SOS memextend: all home: total={pool_bytes} "
+                       "largest={pool_bytes}",
+                       "SOS memextend: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # An extension takes the front of its pool's frontier and nothing
+        # else (spec §2.5). With the rest of a fresh pool cut from its back
+        # after a page from its front, the front page's extension is
+        # `NoMemory`; with the back's allocation home, one longer than the
+        # frontier still is, and a page is served. With a page freed after
+        # it below the frontier, its extension is `NoMemory` again: the bytes
+        # after it are a free range, not the frontier's front. Released, the
+        # pool reads whole.
+        "name": "memory_extend_met",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_EXTEND_MET_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS extendmet: the back at the front's end: this "
+                       "pool has no free range that long",
+                       "SOS extendmet: the back home: total={pool_less_page}",
+                       "SOS extendmet: more than the frontier: this pool has "
+                       "no free range that long",
+                       "SOS extendmet: a page: ok",
+                       "SOS extendmet: a free range after it: this pool has "
+                       "no free range that long",
+                       "SOS extendmet: all home: total={pool_bytes} "
+                       "largest={pool_bytes}",
+                       "SOS extendmet: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Two pages from the front of a fresh pool (spec §2.5): the first's
+        # extension would take the second's bytes and is `NoMemory`, though
+        # the frontier holds a page; the second's is served.
+        "name": "memory_extend_two",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_EXTEND_TWO_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS extendtwo: the first: this pool has no free range "
+                       "that long",
+                       "SOS extendtwo: the second: ok",
+                       "SOS extendtwo: all home: total={pool_bytes} "
+                       "largest={pool_bytes}",
+                       "SOS extendtwo: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A row grows over its allocation's bytes and no others (spec §2.5).
+        # A mapped page's row grown before its allocation holds more is
+        # `NoMemory`; extended by a page, a growth of two is still
+        # `NoMemory`, and one of a page is served and reaches the new last
+        # byte.
+        "name": "mapping_grow_past",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAPPING_GROW_PAST_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS growpast: a page past the allocation: this pool "
+                       "has no free range that long",
+                       "SOS growpast: extended by a page, grown by two: this "
+                       "pool has no free range that long",
+                       "SOS growpast: grown by one: ok, its last byte holds "
+                       "its mark: yes",
+                       "SOS growpast: all home: total={pool_bytes} "
+                       "largest={pool_bytes}",
+                       "SOS growpast: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A Mapping whose target died cannot grow (spec §2.5, §2.10). Root
+        # maps a page from its pool's front into a child and extends it; the
+        # child (`child-grow-leg`, its exiting role) ends with 7, and root's
+        # growth of the Mapping is `Revoked`. A growth off the grain through
+        # it is still the `BadArg` fault, which ends root: the length is
+        # judged before the target's death.
+        "name": "mapping_grow_gone",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAPPING_GROW_GONE_PKG,
+        "children": [CHILD_GROW_LEG_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS growgone: mapped a page into the child and "
+                       "extended it",
+                       "SOS growgone: the child ended: status=65543",
+                       "SOS growgone: grow: what this call was waiting for "
+                       "is gone",
+                       "SOS growgone: grow off the grain",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A row's room where a mapping has an address of its own (spec
+        # §2.5). A row mapped with two pages of room puts the next `map` three
+        # pages up. Grown into the room by a page, the row leaves one page of
+        # it, so with the second row unmapped a third `map` lands three pages
+        # up again (four, had the room not shrunk). Grown into the last of
+        # the room, one page more meets the third row: `NoResource`. A row
+        # asking for a page of room is not placed in a one-page hole: the
+        # third row unmapped below a fourth, a fifth lands past the fourth.
+        "name": "mapping_grow_room",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAPPING_GROW_ROOM_PKG,
+        "pool": True,
+        "arches": ["arm64"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS growroom: the second row, pages past the first: 3",
+                       "SOS growroom: grown into the room: ok",
+                       "SOS growroom: a row made then, pages past the "
+                       "first: 3",
+                       "SOS growroom: grown past the room: no room for what "
+                       "was asked",
+                       "SOS growroom: a row with a page of room, pages past "
+                       "the first: 5",
+                       "SOS growroom: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A room must fit the grant window with its row (spec §2.5). A
+        # mapped page with a MiB of room fits; with the window's whole length
+        # of room it is `NoResource`, and no row was installed.
+        "name": "map_room_window",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_ROOM_WINDOW_PKG,
+        "pool": True,
+        "arches": ["arm64"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS roomwindow: a MiB of room: ok",
+                       "SOS roomwindow: the window's length of room: no room "
+                       "for what was asked, rows +0",
+                       "SOS roomwindow: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Where a mapping's address is its memory's own, a room is recorded
+        # as zero (spec §2.5): a page mapped with a GiB of room is not
+        # refused, and the pool's next page maps at its own address, inside
+        # the room a translating target would have kept.
+        "name": "map_room_identity",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAP_ROOM_IDENTITY_PKG,
+        "pool": True,
+        "arches": ["riscv32", "riscv32-flat"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS roomidentity: a GiB of room: ok",
+                       "SOS roomidentity: the next page, at its own "
+                       "address: yes",
+                       "SOS roomidentity: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # What growing in place refuses as a fault (spec §2.5). Root launches
+        # `child-grow-leg` once per role and prints the §8 word it ends with:
+        # `Faulted` (2) in the high half and the reason in the low. Extending
+        # an allocation from the back, and growing through a Mapping minted
+        # without `Grow`, are `AccessDenied`; a length of zero or off the
+        # grain for either op, a growth of a device window's row, and a room
+        # off the grain at `map` are `BadArg`; growing an unmapped Mapping is
+        # `BadState`. A length off the grain is `BadArg` even where the pool
+        # could not serve the extension (a second cut after the first) or
+        # the growth would pass the allocation's end (no extension first):
+        # the argument is judged before either status. A child whose call
+        # returned would end `Exited` with 8, one refused a status with 97.
+        "name": "grow_faults",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": GROW_FAULTS_PKG,
+        "children": [CHILD_GROW_LEG_PKG],
+        "pool": True,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS growfaults: extend a page from the back: "
+                       "status=131075",
+                       "SOS growfaults: extend by zero: status=131081",
+                       "SOS growfaults: extend off the grain: status=131081",
+                       "SOS growfaults: extend off the grain, the frontier "
+                       "elsewhere: status=131081",
+                       "SOS growfaults: grow through a mapping without Grow: "
+                       "status=131075",
+                       "SOS growfaults: grow by zero: status=131081",
+                       "SOS growfaults: grow off the grain: status=131081",
+                       "SOS growfaults: grow off the grain, past the "
+                       "allocation: status=131081",
+                       "SOS growfaults: grow a device row: status=131081",
+                       "SOS growfaults: grow an unmapped mapping: "
+                       "status=131077",
+                       "SOS growfaults: map with room off the grain: "
+                       "status=131081",
+                       "SOS growfaults: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A grown row grants exactly what it grew over (spec §2.5). A page
+        # extended and its row grown by a page reaches its new last byte;
+        # extended once more and not grown, the first byte past the row is
+        # the allocation's own and still the hardware's fault.
+        "name": "extend_isolation",
+        "tier": TIER_ISOLATED,
+        "tier_reason": "the bytes past a row being unreachable is a property "
+                       "the Flat tier disclaims — the read would succeed",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": EXTEND_ISOLATION_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS extendiso: grown, its last byte holds its mark: "
+                       "yes",
+                       "SOS extendiso: extended again, reading past the row",
+                       "SOS: fault "],
+        "expect_clean_exit": False,
     },
     {
         # Installation. Root maps a page into itself and writes it, the inverse
@@ -16601,6 +16868,14 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #   pool_odd_len       a pool row trimmed to whole grains, read at the
     #                      back's cut
     #   pool_from_bad      a `from` word past the last, a fault
+    #   memory_extend      an allocation and its row grown in place
+    #   memory_extend_met  an extension refused at the back's allocation
+    #                      and past the frontier
+    #   memory_extend_two  an extension refused at the next front cut
+    #   mapping_grow_past  a growth refused past its allocation
+    #   mapping_grow_gone  a growth refused once its target died
+    #   map_room_identity  a room recorded as zero
+    #   grow_faults        each fault growing in place raises
     #
     # Every process in them runs its code from the flash instruction window
     # and reads its read-only data through the data window, in place in its
@@ -16626,7 +16901,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "output_lock_wait", "start_print", "thread_run",
                      "thread_take", "pool_back", "pool_back_reuse",
                      "pool_meet", "pool_cut_rights", "pool_odd_len",
-                     "pool_from_bad"]
+                     "pool_from_bad", "memory_extend",
+                     "memory_extend_met", "memory_extend_two",
+                     "mapping_grow_past", "mapping_grow_gone",
+                     "map_room_identity", "grow_faults"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 

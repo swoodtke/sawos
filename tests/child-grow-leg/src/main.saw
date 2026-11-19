@@ -1,0 +1,161 @@
+// Test child: does one thing to grow memory in place, chosen by the role its
+// launcher signalled, for `grow_faults` and `mapping_grow_gone` (spec §2.5).
+//
+// The launcher gives it a System sibling as its boot tag, an Event carrying
+// the role, a pool sibling, and for the device role the device window. Every
+// role but `ROLE_EXIT` sets up from the pool and then makes one call the
+// kernel answers with a fault, which ends this process there; the launcher
+// reads the reason in the §8 status word. A call that returns instead ends it
+// with `EXIT_SURVIVED`, and a refused set-up step with `EXIT_SETUP`.
+// `ROLE_EXIT` ends it at once with `EXIT_DONE`.
+
+import sos.{System, Process, Pool, Memory, Mapping, IoMemory, AllocateFrom,
+            MapAccess, MappingRight, SosStatus}
+
+static TAG_ROLE: UInt = 32
+static TAG_POOL: UInt = 33
+static TAG_DEVICE: UInt = 34
+
+/// The roles, as `grow-faults` and `mapping-grow-gone` number them.
+static ROLE_EXIT: UInt = 1
+static ROLE_EXTEND_BACK: UInt = 2
+static ROLE_EXTEND_ZERO: UInt = 3
+static ROLE_EXTEND_OFF_GRAIN: UInt = 4
+static ROLE_GROW_UNGRANTED: UInt = 5
+static ROLE_GROW_ZERO: UInt = 6
+static ROLE_GROW_OFF_GRAIN: UInt = 7
+static ROLE_GROW_DEVICE: UInt = 8
+static ROLE_GROW_HUSK: UInt = 9
+static ROLE_ROOM_OFF_GRAIN: UInt = 10
+static ROLE_EXTEND_BLOCKED_OFF_GRAIN: UInt = 11
+static ROLE_GROW_WHOLE_OFF_GRAIN: UInt = 12
+
+/// How this process ends when `ROLE_EXIT` has run.
+static EXIT_DONE: UInt = 7
+/// The call that should have faulted returned.
+static EXIT_SURVIVED: UInt = 8
+/// Something a role needs was refused with a status.
+static EXIT_SETUP: UInt = 97
+/// The boot set held no role, or a role this program does not know.
+static EXIT_NO_ROLE: UInt = 98
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+/// Two bytes: off a four-byte grain and off a page.
+static OFF_GRAIN: UInt = 2
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// Every Mapping right but `Grow`.
+static NO_GROW: UInt32 = (MappingRight.Mint | MappingRight.Unmap
+                          | MappingRight.Base)
+
+/// What the launcher gave, by tag.
+struct Given {
+    role: UInt,
+    pool: Pool?,
+    device: IoMemory?,
+}
+
+extension Given: NoCopy {}
+
+func drain(proc: &Process) -> Given {
+    var given = Given(role: 0, pool: None, device: None)
+    var going = true
+    while going {
+        var rec = try proc.boot_handle_next() catch {
+            going = false
+            continue
+        }
+        if rec.tag == TAG_ROLE {
+            if let ev = rec.take_event() {
+                given.role = try ev.receive() catch { 0 }
+            }
+        } else if rec.tag == TAG_POOL {
+            given.pool = rec.take_pool()
+        } else if rec.tag == TAG_DEVICE {
+            given.device = rec.take_iomemory()
+        }
+    }
+    move given
+}
+
+/// A page from the front of `pool`, mapped read-write into `proc`.
+func mapped_page(proc: &Process, pool: &Pool,
+                 room: UInt) -> Result<(Memory, Mapping), SosStatus> {
+    let mem = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let view = try proc.map(memory: &mem, access: RW, room: room)
+    return (move mem, move view)
+}
+
+/// Run `role` and answer the code this process ends with, when it is not
+/// ended by the call the role is about.
+func run(proc: &Process, given: &var Given) -> Result<UInt, SosStatus> {
+    let role = given.role
+    if role == ROLE_EXIT {
+        return EXIT_DONE
+    }
+    if role == ROLE_GROW_DEVICE {
+        guard let window = given.device.take() else { return EXIT_SETUP }
+        let view = try proc.map(iomemory: &window)
+        try view.grow(len: PAGE)
+        return EXIT_SURVIVED
+    }
+    guard let pool = given.pool.take() else { return EXIT_SETUP }
+    if role == ROLE_EXTEND_BACK {
+        let mem = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+        try mem.extend(len: PAGE)
+        return EXIT_SURVIVED
+    }
+    if role == ROLE_EXTEND_ZERO || role == ROLE_EXTEND_OFF_GRAIN {
+        let mem = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+        let len = if role == ROLE_EXTEND_ZERO { 0 } else { OFF_GRAIN }
+        try mem.extend(len: len)
+        return EXIT_SURVIVED
+    }
+    if role == ROLE_EXTEND_BLOCKED_OFF_GRAIN {
+        // The second cut lies after the first, so the pool could not serve
+        // the first's extension: the length is judged before the pool is.
+        let mem = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+        let _next = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+        try mem.extend(len: OFF_GRAIN)
+        return EXIT_SURVIVED
+    }
+    if role == ROLE_ROOM_OFF_GRAIN {
+        let _ = try mapped_page(&proc, &pool, OFF_GRAIN)
+        return EXIT_SURVIVED
+    }
+    if role == ROLE_GROW_WHOLE_OFF_GRAIN {
+        // The row covers its whole allocation, so a growth of any length
+        // would pass its end: the length is judged before the allocation is.
+        let (_mem, view) = try mapped_page(&proc, &pool, 0)
+        try view.grow(len: OFF_GRAIN)
+        return EXIT_SURVIVED
+    }
+    let (mem, view) = try mapped_page(&proc, &pool, 0)
+    try mem.extend(len: PAGE)
+    if role == ROLE_GROW_UNGRANTED {
+        let narrow = try view.mint(rights: NO_GROW)
+        try narrow.grow(len: PAGE)
+        return EXIT_SURVIVED
+    }
+    if role == ROLE_GROW_ZERO || role == ROLE_GROW_OFF_GRAIN {
+        let len = if role == ROLE_GROW_ZERO { 0 } else { OFF_GRAIN }
+        try view.grow(len: len)
+        return EXIT_SURVIVED
+    }
+    if role == ROLE_GROW_HUSK {
+        try view.unmap()
+        try view.grow(len: PAGE)
+        return EXIT_SURVIVED
+    }
+    return EXIT_NO_ROLE
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch { return }
+    var given = drain(&proc)
+    let code = try run(&proc, &var given) catch { EXIT_SETUP }
+    let _ = proc.exit(code)
+}

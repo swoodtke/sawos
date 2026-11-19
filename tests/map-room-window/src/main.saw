@@ -1,0 +1,66 @@
+// A row's room must fit the grant window with it, where a mapping has an
+// address of its own (spec §2.5).
+//
+//   SOS roomwindow: a MiB of room: ok
+//   SOS roomwindow: the window's length of room: no room for what was asked,
+//                   rows +0
+//   SOS roomwindow: done
+//
+// A page from the front of a fresh pool maps with a MiB of room above it,
+// which the window holds. Unmapped, it maps again with as much room as the
+// whole grant window is long, which no placement above the image region can
+// hold: `NoResource`, and no row was installed.
+
+import sos.{System, Process, Pool, AllocateFrom, MapAccess, QuotaKind,
+            SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static PAGE: UInt = 0x1000
+static MIB: UInt = 0x10_0000
+/// The grant window's length on this board (`GRANT_PAGES` pages, in
+/// `hal/arm64/kernel/lib.saw`).
+static WINDOW: UInt = 0x40_0000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS roomwindow: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS roomwindow: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS roomwindow: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let mem = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let view = try proc.map(memory: &mem, access: RW, room: MIB)
+    print("SOS roomwindow: a MiB of room: ok\n")
+    try view.unmap()
+
+    let before = try proc.quota_get(kind: QuotaKind.Mapping)
+    let _ = try proc.map(memory: &mem, access: RW, room: WINDOW) catch {
+        let after = try proc.quota_get(kind: QuotaKind.Mapping)
+        print("SOS roomwindow: the window's length of room: {}, rows +{}\n",
+              error, after.used - before.used)
+        return
+    }
+    print("SOS roomwindow: the window's length of room: ok\n")
+    return
+}

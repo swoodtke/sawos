@@ -1537,10 +1537,18 @@ extension Process {
     /// `Err(SosStatus.Revoked)` (a body is gone, and the mapper did not cause
     /// that). A supervisor's handle onto a dead child outlives it on purpose
     /// (reading how it died is what the handle is for).
-    public func map(&self, memory: &Memory,
-                    access: UInt32) -> Result<Mapping, SosStatus> {
+    ///
+    /// `room` is address space to keep free above the row for it to grow into
+    /// (`Mapping.grow(len:)`), where a mapping has an address of its own: no
+    /// later `map` into this process is placed in it. Zero, the default, keeps
+    /// none. Where a mapping's address is its memory's own it is recorded as
+    /// zero, since the row's next addresses are its allocation's next bytes.
+    /// A `room` off the protection grain terminates the caller, and one that
+    /// takes the row past this process's window is `Err(SosStatus.NoResource)`.
+    public func map(&self, memory: &Memory, access: UInt32,
+                    room: UInt = 0) -> Result<Mapping, SosStatus> {
         let raw = try call_value(memory.handle, MemoryOp.Map as UInt,
-                                 self.handle, access as UInt, 0)
+                                 self.handle, access as UInt, room)
         return Mapping(handle: MappingHandle(raw))
     }
 

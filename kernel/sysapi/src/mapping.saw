@@ -14,7 +14,7 @@
 import sosabi.{SosStatus, MappingHandle, MappingOp, NO_HANDLE, MINT_OP}
 
 import sos.floor.{call_value, checked, sos_handle_release, sos_mapping_unmap,
-                  ALL_RIGHTS, handle_rights}
+                  sos_mapping_grow, ALL_RIGHTS, handle_rights}
 
 /// A handle to a Mapping, one protection row, installed.
 ///
@@ -103,6 +103,31 @@ extension Mapping {
     /// refusals as `unmap`.
     public func base(&self) -> Result<UInt, SosStatus> {
         call_value(self.handle, MappingOp.Base as UInt, 0, 0, 0)
+    }
+
+    /// Raise this row's top by `len` bytes, over its allocation's next bytes.
+    /// Requires `MappingRight.Grow`.
+    ///
+    /// The allocation must already hold the bytes (`Memory.extend(len:)`):
+    /// a row never grants a byte outside its allocation, so growing past it is
+    /// `Err(SosStatus.NoMemory)`. Where a mapping has an address of its own,
+    /// the row grows into the next addresses: the room its `map` kept free
+    /// (`Process.map(memory:access:room:)`), then any free addresses past it.
+    /// Addresses another row holds, or past the target's window, are
+    /// `Err(SosStatus.NoResource)`. Where a mapping's address is its memory's
+    /// own, the next addresses are the allocation's next bytes, which nothing
+    /// else can hold.
+    ///
+    /// The new bytes are reachable as soon as it answers, in the running
+    /// process too. The row is still one row: the target's `Mapping` quota and
+    /// the address `base()` answers do not change.
+    ///
+    /// Growing an unmapped Mapping, a `len` of zero or off the protection
+    /// grain, and a mapping of a device window or of the stats region
+    /// terminate the caller. A Mapping whose target has died answers
+    /// `Err(SosStatus.Revoked)`.
+    public func grow(&self, len: UInt) -> Result<Void, SosStatus> {
+        checked(sos_mapping_grow(self.handle, len))
     }
 
     /// Mint a sibling of this Mapping handle, narrowed by a keep mask: the

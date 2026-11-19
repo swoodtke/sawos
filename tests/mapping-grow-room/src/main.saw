@@ -1,0 +1,102 @@
+// A row's room, where a mapping has an address of its own (spec §2.5): `map`
+// keeps it free above the row, a growth spends it, and past it a growth meets
+// whatever row is there.
+//
+//   SOS growroom: the second row, pages past the first: 3
+//   SOS growroom: grown into the room: ok
+//   SOS growroom: a row made then, pages past the first: 3
+//   SOS growroom: grown past the room: no room for what was asked
+//   SOS growroom: a row with a page of room, pages past the first: 5
+//   SOS growroom: done
+//
+// Five pages: one from the pool's front, mapped with two pages of room, and
+// four from its back. The second row lands past the first row and its room,
+// three pages above the first's base. The front page extended by a page, its
+// row grows into the room; the second row unmapped, a third `map` lands
+// where the room now ends, still three pages up: the first row claims its
+// two pages and the page of room left. The front page extended by another
+// page, its row grows into the last of the room; one page more meets the third
+// row, `NoResource`.
+//
+// A new row's own room is kept too. A fourth row lands right above the third,
+// four pages up; with the third unmapped, the page it held is a hole between
+// the first row and the fourth, and a fifth row asking for a page of room
+// needs two free pages: it lands past the fourth, five pages up, and not in
+// the hole.
+
+import sos.{System, Process, Pool, AllocateFrom, MapAccess, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS growroom: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS growroom: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS growroom: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// What a growth answered, as a status: `Ok` when it was served.
+func answer(result: Result<Void, SosStatus>) -> SosStatus {
+    match result {
+        case Ok(_) -> SosStatus.Ok,
+        case Err(why) -> why,
+    }
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let front = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let second = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+    let third = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+    let fourth = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+    let fifth = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+
+    let first_view = try proc.map(memory: &front, access: RW, room: 2 * PAGE)
+    let second_view = try proc.map(memory: &second, access: RW)
+    let at = try first_view.base()
+    let second_at = try second_view.base()
+    print("SOS growroom: the second row, pages past the first: {}\n",
+          (second_at - at) / PAGE)
+
+    try front.extend(len: PAGE)
+    print("SOS growroom: grown into the room: {}\n",
+          answer(first_view.grow(len: PAGE)))
+    try second_view.unmap()
+    let third_view = try proc.map(memory: &third, access: RW)
+    let third_at = try third_view.base()
+    print("SOS growroom: a row made then, pages past the first: {}\n",
+          (third_at - at) / PAGE)
+
+    try front.extend(len: 2 * PAGE)
+    try first_view.grow(len: PAGE)
+    print("SOS growroom: grown past the room: {}\n",
+          answer(first_view.grow(len: PAGE)))
+
+    let _fourth_view = try proc.map(memory: &fourth, access: RW)
+    try third_view.unmap()
+    let fifth_view = try proc.map(memory: &fifth, access: RW, room: PAGE)
+    let fifth_at = try fifth_view.base()
+    print("SOS growroom: a row with a page of room, pages past the first: {}\n",
+          (fifth_at - at) / PAGE)
+    return
+}

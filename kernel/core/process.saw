@@ -394,7 +394,7 @@ public(package) func record_grant(p: Int, base: UInt, top: UInt, pa: UInt,
                     PROCESSES[b].grant_count as UInt)
     }
     let n = PROCESSES[b].grant_count
-    PROCESSES[b].grants[n] = GrantRow(base: base, top: top, pa: pa,
+    PROCESSES[b].grants[n] = GrantRow(base: base, top: top, pa: pa, room: 0,
                                       perms: perms, device: device,
                                       region: region)
     PROCESSES[b].grant_count = n + 1
@@ -423,7 +423,9 @@ public(package) func record_grant(p: Int, base: UInt, top: UInt, pa: UInt,
 /// the linker and recorded by the loader; segments used in place lie wherever
 /// their image is, and like every row they are stepped over. Device rows are
 /// skipped: they live in a window of their own and never contend with RAM for
-/// an address.
+/// an address. A row claims its room as well as its own range
+/// (`GrantRow.room`), so the room stays free for the row to grow into, and a
+/// caller that wants room above the new row asks for `len` plus that room.
 ///
 /// Addresses are recycled, so an address freed by `unmap` may be handed to a
 /// later mapping of different bytes, and a program that keeps a pointer past
@@ -455,8 +457,9 @@ public(package) func free_user_va(p: Int, len: UInt) unsafe -> UInt {
         var i: Int = 0
         while i < PROCESSES[b].grant_count {
             let row = PROCESSES[b].grants[i]
-            if not row.device && va < row.top && row.base < va + len {
-                va = align_up(row.top, hal.PROT_GRAIN)
+            let claimed = row.top + row.room
+            if not row.device && va < claimed && row.base < va + len {
+                va = align_up(claimed, hal.PROT_GRAIN)
                 bumped = true
             }
             i = i + 1
@@ -726,6 +729,33 @@ public(package) func remove_grant(p: Int, row: Int) unsafe {
     }
     PROCESSES[b].grant_count = PROCESSES[b].grant_count - 1
     unref_region_row(gone.region)
+}
+
+/// Raise row `row` of process `p`'s grant record by `len` bytes, over the
+/// bytes after it in its own range: its top rises by `len` and its room
+/// shrinks by as much, down to zero.
+///
+/// The third of the funnels a grant record changes shape through, beside
+/// `record_grant` and `remove_grant`, so the record and the hardware move
+/// together here too: `hal.prot_update` grants the new range with the row's
+/// own permissions, which installs it where the target keeps a standing image
+/// and is a no-op where the record is replayed at the next load. The caller
+/// has checked the new range against the row's allocation and the target's
+/// other rows, and reloads the domain if it is the installed one.
+///
+/// The row's region keeps its count: the row is still one row.
+public(package) func grow_grant(p: Int, row: Int, len: UInt) unsafe {
+    let b = body_of(p)
+    let old = PROCESSES[b].grants[row]
+    let top = old.top + len
+    PROCESSES[b].grants[row].top = top
+    PROCESSES[b].grants[row].room = if old.room > len {
+        old.room - len
+    } else {
+        0
+    }
+    hal.prot_update(b as UInt, old.top, top, old.pa + (old.top - old.base),
+                    old.perms, old.device)
 }
 
 /// Where row `row` ends physically: its `pa` plus its length, saturating.

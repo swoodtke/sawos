@@ -581,10 +581,10 @@ static_assert((TimerRight.Wait as UInt32) >= (1 << 8),
 /// derive one from another.
 ///
 /// `Extend` is the authority to grow an allocation in place over the bytes
-/// after it in its pool. Only an allocation cut from the front of its pool's
-/// frontier carries it (`AllocateFrom.Front`), and that one carries neither
-/// `Transfer` nor `Mint`, so the authority stays in the process that
-/// allocated. A boot allocation came from no pool and never carries it.
+/// after it in its pool (`MemoryOp.Extend`). Only an allocation cut from the
+/// front of its pool's frontier carries it (`AllocateFrom.Front`), and that one
+/// carries neither `Transfer` nor `Mint`, so the authority stays in the process
+/// that allocated. A boot allocation came from no pool and never carries it.
 ///
 /// There is deliberately no `Read`/`Write` pair. Access is a property of the
 /// mapping (`map(access:)`), which is what lets one region be mapped read-only
@@ -736,7 +736,8 @@ static_assert((IoMemoryRight.Map as UInt32) >= (1 << 8),
 ///
 /// `Unmap` is the authority to take the row out, and §2.5's "only the Mapping
 /// handle can unmap" is what makes holding one meaningful at all. `Base` is the
-/// authority to ask where the row is.
+/// authority to ask where the row is, and `Grow` to raise its top over the
+/// allocation's next bytes.
 ///
 /// `Transfer` is declared and never minted. The bit exists because the
 /// universal low byte is pinned in every kind's enum by the asserts below, but
@@ -760,6 +761,13 @@ public enum MappingRight: UInt32 {
     /// away, and folding them into one bit would make every mask coarser than
     /// the fail-closed rule wants.
     case Base = 1 << 9,
+    /// May this handle raise the row's top (`MappingOp.Grow`)?
+    ///
+    /// Separate from `Unmap` and `Base` because widening a row is authority
+    /// over the target's address space, which neither of those is: a holder
+    /// that may locate or revoke a row need not be one that may make it
+    /// cover more.
+    case Grow = 1 << 10,
 }
 
 static_assert((MappingRight.Transfer as UInt32) == (1 << 0),
@@ -770,6 +778,8 @@ static_assert((MappingRight.Unmap as UInt32) >= (1 << 8),
               "kind-specific right Unmap must start at bit 8 or above")
 static_assert((MappingRight.Base as UInt32) >= (1 << 8),
               "kind-specific right Base must start at bit 8 or above")
+static_assert((MappingRight.Grow as UInt32) >= (1 << 8),
+              "kind-specific right Grow must start at bit 8 or above")
 
 /// A right on a PipeInlet, the client end of a connection (spec §2.1).
 ///
@@ -1252,7 +1262,7 @@ public func iomemory_rights() -> UInt32 {
 /// hands out an un-unmappable reference to one.
 public func mapping_rights() -> UInt32 {
     ((MappingRight.Unmap as UInt32) | (MappingRight.Mint as UInt32)
-     | (MappingRight.Base as UInt32))
+     | (MappingRight.Base as UInt32) | (MappingRight.Grow as UInt32))
 }
 
 /// What the kernel mints for a thread's own handle: root's initial thread at

@@ -36,9 +36,9 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global and external-memory-only, not per-process). Paging targets: page-table root. There is no AddressSpace object: the domain is the process (see below). |
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. Ops `Start`/`Join`/`Exit`/`Yield`; `Exit` releases the handle it is invoked through; rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame is the context, so a switch is the trap handler returning a different frame (§7). Lifecycle: §8. |
 | `Pool` | RAM not yet allocated: what a `MemoryObject` is allocated from. Two ops (`Allocate`, and `Available`, which reads how much it can allocate); rights `PoolRight.Allocate` and the bits it hands down to what it allocates, `.Map`/`.MapExecute`/`.Extend`. It has two ends: an allocation is cut from its front or its back. Minted at boot from the region table. A pool is never mapped and holds no row. Splitting a pool into a smaller one and a revoke are reserved, not built. §2.5. |
-| `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. One op (`Map`); rights `MemoryRight.Map`/`.MapExecute`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5. |
+| `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. Two ops (`Map`, and `Extend`, which grows it in place); rights `MemoryRight.Map`/`.MapExecute`/`.Extend`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5. |
 | `IoMemoryObject` | Physical memory-mapped device registers; the kind is `IoMemory`. A distinct kind rather than a flag on `MemoryObject`, so a driver cannot obtain a cacheable view of a register block by construction. Ops `Carve`/`Map`; rights `IoMemoryRight.Carve`/`.Map`. §2.5. |
-| `Mapping` | One installed protection row, with its own handle. Ops `Unmap`/`Base`; rights `MappingRight.Unmap`/`.Base`. Not givable. §2.5. |
+| `Mapping` | One installed protection row, with its own handle. Ops `Unmap`/`Base`/`Grow`; rights `MappingRight.Unmap`/`.Base`/`.Grow`. Not givable. §2.5. |
 | `Pipe` | Synchronous message IPC with request/reply built in. Four kinds: `PipeInlet` and `PipeOutlet` (the client and server ends of a connection) and `PipeReply` and `PipeRequest` (the client's claim on one reply and the server's obligation to send it). §2.1. |
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable. Ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). The word is consumed by whoever takes it, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read and clear, so a value is reported exactly once. §2.2, §2.4. |
 | `Clock` | A granted time source — time is a capability, not an ambient facility. §2.6. |
@@ -715,13 +715,14 @@ a reply delivery carries, which is why there is one type and not two — and
   a status (room in its table, for one), so a process whose buffer is gone ends
   with `BadBuffer` whether or not that answer was owed. A wake that carries only
   a status (the peer closed) writes no buffer and asks about none: the process
-  is answered and runs on. A row's access is fixed when it is installed (a
-  `Mapping`'s only ops are `Unmap` and `Base`, §2.5), so a change of access is
-  an unmap and a map, and a future op that changes a row in place (its
-  permissions, say) must be, to every door, an unmap followed by a map: the
-  grant record and the hardware change together with no preemption point
-  between, nothing caches a row's permission or translation across a switch
-  point, and the next door to look, late doors included, judges the new row.
+  is answered and runs on. A row's access is fixed when it is installed (no
+  op of a `Mapping`'s changes it, §2.5), so a change of access is an unmap and
+  a map. An op that changes a row in place (`Grow`, which raises its top, and
+  any future one, its permissions, say) must be, to every door, an unmap
+  followed by a map: the grant record and the hardware change together with no
+  preemption point between, nothing caches a row's permission or translation
+  across a switch point, and the next door to look, late doors included,
+  judges the new row.
 - **`write_result` is the only function that writes an answer into a frame** —
   its callers are `ktrap` for an op that answered at once and the wake paths
   that answer a parked thread — which is what makes "exactly one write per
@@ -1228,11 +1229,12 @@ no more than the pool holds, and what it releases it can allocate again.
   (`HandleKind.Pool`, 15), it is read and narrowed as every kind's is, and a
   sub-pool's mint will be capped by it (below).
 
-**`Memory`: one op, `Map`; rights `MemoryRight.Map` and `.MapExecute`**
-beside the universal `Transfer` and `Mint`. A `Memory` is an allocation: it is
-mapped, used as a process's image or destination (§8, §12), given, sent in a
-message, minted and donated, and it is never cut. It comes from a pool's
-`allocate`, or from a row of the region table typed as an allocation (§12).
+**`Memory`: two ops, `Map` and `Extend`; rights `MemoryRight.Map`,
+`.MapExecute` and `.Extend`** beside the universal `Transfer` and `Mint`. A
+`Memory` is an allocation: it is mapped, used as a process's image or
+destination (§8, §12), given, sent in a message, minted and donated, and it is
+never cut. It comes from a pool's `allocate`, or from a row of the region
+table typed as an allocation (§12).
 
 - **It records its pool and goes back whole.** An allocation's range returns
   to the pool it was allocated from, all of it at once, when no handle and no
@@ -1247,7 +1249,7 @@ message, minted and donated, and it is never cut. It comes from a pool's
   `memory_rights()`, the set a boot allocation is minted with, is the first
   four bits, without `Extend`: a boot allocation came from no pool. An
   allocation from a pool carries what its pool handle handed down (above).
-- **`map(process, access)` installs a protection row and answers with a
+- **`map(process, access, room)` installs a protection row and answers with a
   `Mapping`.** It spends `MemoryRight.Map` on the allocation and
   `ProcessRight.Map` on the target, because possession of bytes must not
   imply authority over an address space. `aspace` is a process: §5b says the
@@ -1267,13 +1269,22 @@ message, minted and donated, and it is never cut. It comes from a pool's
   for nothing, for write without read or for write with execute is `BadArg`;
   execute asked through a handle without `MapExecute` is `AccessDenied`; and
   an allocation that is empty, runs off the end of the address space, has its
-  base or its length off the grain, or lies in memory the board cannot hand a
-  process (flash, §5.6) is `BadArg`. Then the statuses: a `Gone` target
-  answers `Revoked` (§2.10), a target at its `Mapping` quota
-  `QuotaExceeded` (§2.9), and a target whose address space has no room for
-  the range, or one of whose rows the range meets (below), `NoResource`, as
-  a full Mapping slab does; the caller's handle budget and table answer last,
-  as at every mint.
+  base or its length off the grain, a `room` off the grain, or an allocation
+  that lies in memory the board cannot hand a process (flash, §5.6) is
+  `BadArg`. Then the statuses: a `Gone` target answers `Revoked` (§2.10), a
+  target at its `Mapping` quota `QuotaExceeded` (§2.9), and a target whose
+  address space has no room for the range and its `room`, or one of whose rows
+  the range meets (below), `NoResource`, as a full Mapping slab does; the
+  caller's handle budget and table answer last, as at every mint.
+- **`room` is address space kept free above the row on a translating target,
+  for the row to grow into; it is recorded as zero on an identity target.**
+  The row records it, and placement treats a row's range and its room as
+  claimed, so no later `map` into the target is placed in it, and a `Grow`
+  within it cannot meet another row (`Mapping`, below). A `Grow` spends it as
+  the row's top rises. On an identity target a row's next addresses are its
+  allocation's next bytes, so there is nothing to keep, and a room of any
+  length is no refusal there. The typed `Process.map(memory:access:room:)`
+  takes it as a defaulted parameter, zero.
 - **Access is a property of the mapping.** An allocation carries no R/W/X
   triple, and mapping one allocation read-only in one place and read-write in
   another is expressible and allowed, wherever the overlap rule below allows
@@ -1362,6 +1373,19 @@ message, minted and donated, and it is never cut. It comes from a pool's
 - **It is per handle, not per allocation.** A second handle that still
   carries the bit can map the same bytes executable. An allocation-level
   immutable flag would be a second mechanism doing overlapping work.
+- **`extend(len)` grows an allocation in place.** It spends
+  `MemoryRight.Extend` (bit 11, carried by a pool for its allocations) and
+  takes the `len` bytes after the allocation from the front of its pool's
+  frontier, answering `NoMemory` when they are not there. It makes no
+  object and charges no quota; rows that grant the allocation keep their
+  bounds. Only a `Front` allocation carries the right, and a boot
+  allocation never does. Its answers, in order: a handle without `Extend` is
+  the `AccessDenied` fault; a `len` of zero or off the allocation's
+  granularity is `BadArg`; bytes after the allocation that are not the front
+  of the frontier (another `Front` allocation, or the back side, took them)
+  or a frontier shorter than `len` is `NoMemory`. Then the allocation's
+  length grows, the frontier's front moves up, and the pool's outstanding
+  bytes grow by `len`, so the whole grown range goes home together.
 
 **`IoMemory`: ops `Carve` and `Map`, rights `IoMemoryRight.Carve` and `.Map`**
 beside the universal pair.
@@ -1392,7 +1416,7 @@ halves — a user VA range and the physical base it translates to — so
 asserted equal on the tiers that do not translate (§5.5): one mechanism with
 one degree of freedom unspent on the MPU tier, not two mechanisms.
 
-- **Two ops.** `Unmap` (on `MappingRight.Unmap`) and `Base` (on
+- **Three ops.** `Unmap` (on `MappingRight.Unmap`) and `Base` (on
   `MappingRight.Base`) — the address the kernel chose, asked for rather than
   assumed, which is the portable spelling every program should use
   (`tests/map-placed`). `Base` is a separate bit from `Unmap` because locating
@@ -1401,6 +1425,26 @@ one degree of freedom unspent on the MPU tier, not two mechanisms.
   child needs the address to use the memory) or one it can revoke and not
   locate. The answer is a user address on every tier, and on a tier that does
   not translate it is also the physical one.
+  `Grow` (on `MappingRight.Grow`, bit 10) raises the row's top over its
+  allocation's next bytes, which the allocation must already hold
+  (`NoMemory` otherwise), and on a translating target into its room or other
+  free addresses (`NoResource` otherwise). The row stays one row: the quota
+  and the allocation's row count do not change. Its answers, in order: a
+  handle without `Grow` is the `AccessDenied` fault; a Mapping its holder
+  unmapped is `BadState`, as for `Unmap`; a `len` of zero or off the grain is
+  `BadArg`; a Mapping whose target died is `Revoked`; a row that grants no
+  allocation, a device window or the stats region, is `BadArg`; a new top
+  past the allocation's end is `NoMemory`, a status because the holder of a
+  Mapping need not hold the `Memory` and cannot read its bounds; and next
+  addresses that meet another row or leave the grant window are
+  `NoResource`, as `map` answers (only where the target translates: on an
+  identity target they are the allocation's own bytes). Then the top rises by
+  `len`, the room shrinks by as much, and the domain is reloaded when it is
+  the installed one. Per tier: on the PMP boards the row's TOR pair's top
+  moves, one numbered region whatever its size; on arm64 the allocation's
+  next pages are mapped at the next virtual addresses, so the row stays one
+  affine row; on a Flat board the record's top moves and no protection entry
+  is spent. `mapping_rights()` mints `Unmap`, `Mint`, `Base` and `Grow`.
 - **A mapping's address is the kernel's answer and is treated as data.** `map`
   takes no VA hint on any tier; `Mapping.base()` asks. On tier 1 `map` chooses
   the address, so two processes sharing one allocation hold two different
@@ -1433,8 +1477,8 @@ one degree of freedom unspent on the MPU tier, not two mechanisms.
 - **It is bound to its target.** A Mapping charges the target process's quota,
   not the caller's (§2.9), and the target is its owner in §2.10's sense: when
   the target dies its row goes with the whole domain and the Mapping is
-  invalid, so `Unmap` and `Base` answer `Revoked`. A Mapping its holder
-  unmapped is not that state: it is the `BadState` above.
+  invalid, so `Unmap`, `Base` and `Grow` answer `Revoked`. A Mapping its
+  holder unmapped is not that state: it is the `BadState` above.
 - **It is not givable** — `mapping_rights()` withholds `Transfer` — because a
   Mapping names a row in one specific domain.
 

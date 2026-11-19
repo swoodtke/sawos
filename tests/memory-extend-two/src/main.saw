@@ -1,0 +1,66 @@
+// An extension needs the bytes after its allocation to be the frontier's
+// front (spec §2.5).
+//
+//   SOS extendtwo: the first: this pool has no free range that long
+//   SOS extendtwo: the second: ok
+//   SOS extendtwo: all home: total=<pool> largest=<pool>
+//   SOS extendtwo: done
+//
+// Two pages from the front of a fresh pool lie one after the other, and the
+// frontier begins where the second ends. The first's extension would take the
+// second's bytes, so it is `NoMemory` although the frontier holds a page; the
+// second's is served. Released, both come home and the pool reads whole.
+
+import sos.{System, Process, Pool, AllocateFrom, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS extendtwo: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS extendtwo: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS extendtwo: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// What an extension answered, as a status: `Ok` when it was served.
+func answer(result: Result<Void, SosStatus>) -> SosStatus {
+    match result {
+        case Ok(_) -> SosStatus.Ok,
+        case Err(why) -> why,
+    }
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let first = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let second = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    print("SOS extendtwo: the first: {}\n", answer(first.extend(len: PAGE)))
+    print("SOS extendtwo: the second: {}\n", answer(second.extend(len: PAGE)))
+
+    let _ = move first
+    let _ = move second
+    let home = try pool.available()
+    print("SOS extendtwo: all home: total={} largest={}\n", home.total,
+          home.largest)
+    return
+}
