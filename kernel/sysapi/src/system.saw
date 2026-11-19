@@ -41,10 +41,10 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, PipeRequestOp, MemoryOp,
                stats_region_map_record_bytes}
 
 // The `sosabi.` qualifier, for the one encoding this module names without
-// binding bare: `sosabi.ENTRY_IMAGE`, the sentinel a process passes when it has
-// no way to compute an entry address (see `thread_create` below). A selective
-// import binds its list and no qualifier, so the reach is written rather than
-// inherited. It is an ordinary import, so it re-exports nothing.
+// binding bare: `sosabi.ENTRY_IMAGE`, the sentinel a process passes for its
+// image's own entry (see `thread_create` below). A selective import binds its
+// list and no qualifier, so the reach is written rather than inherited. It is
+// an ordinary import, so it re-exports nothing.
 import sosabi
 
 // The scalar-to-console-byte rule, shared with the kernel's own console so the
@@ -71,6 +71,7 @@ import sos.pipe.{PipeInlet, PipeOutlet, PipeReply, PipeRequest}
 // which, wherever `Process` names one; the facade re-exports the bare spelling
 // a process writes.
 import sos.thread
+import sos.rt.{create_thread}
 import sos.event.{Event}
 import sos.interrupt.{Interrupt}
 import sos.clock.{Clock}
@@ -250,7 +251,7 @@ extension System {
                              keep: UInt32 = ALL_RIGHTS) -> Result<Process, SosStatus> {
         let raw = try call_value(self.handle, SystemOp.ProcessSelf as UInt,
                                  keep as UInt, 0, 0)
-        return Process(handle: ProcessHandle(raw))
+        return Process(handle: ProcessHandle(raw), names_caller: true)
     }
 
     /// Phase one of the two-phase lifecycle: load `image` into `memory` and
@@ -290,7 +291,7 @@ extension System {
                                memory: &Memory) -> Result<Process, SosStatus> {
         let raw = try call_value(self.handle, SystemOp.ProcessCreate as UInt,
                                  image.handle, memory.handle, 0)
-        return Process(handle: ProcessHandle(raw))
+        return Process(handle: ProcessHandle(raw), names_caller: false)
     }
 
     /// `process_create`, with the new process's rights ceilings held to
@@ -311,7 +312,7 @@ extension System {
         let raw = try call_value(self.handle, SystemOp.ProcessCreate as UInt,
                                  image.handle, memory.handle,
                                  ceiling_source.handle)
-        return Process(handle: ProcessHandle(raw))
+        return Process(handle: ProcessHandle(raw), names_caller: false)
     }
 
     /// Give the kernel `memory` to back the slab `kind` names, for good.
@@ -527,7 +528,7 @@ extension System {
         after: UInt64
     ) -> Result<(Process, UInt64), SosStatus> {
         let step = try process_next_into_frame(self.handle, after)
-        let proc = Process(handle: ProcessHandle(step.0))
+        let proc = Process(handle: ProcessHandle(step.0), names_caller: false)
         return (move proc, step.1)
     }
 
@@ -545,7 +546,7 @@ extension System {
         pid: UInt64
     ) -> Result<Process, SosStatus> {
         let raw = try process_by_pid_into_frame(self.handle, pid)
-        return Process(handle: ProcessHandle(raw))
+        return Process(handle: ProcessHandle(raw), names_caller: false)
     }
 
     /// Map the machine's trap counters read-only into this process: the shared
@@ -759,7 +760,7 @@ extension PipeRequest {
     public func sender(&self) -> Result<Process, SosStatus> {
         let raw = try call_value(self.handle, PipeRequestOp.Sender as UInt,
                                  0, 0, 0)
-        return Process(handle: ProcessHandle(raw))
+        return Process(handle: ProcessHandle(raw), names_caller: false)
     }
 }
 
@@ -798,9 +799,15 @@ extension PipeRequest {
 /// caller, and through the handle of a process that has ended every factory
 /// answers `SosStatus.Revoked`. `thread_self` and `boot_handle_next` are
 /// self-only: through a handle naming another process they terminate the
-/// caller.
+/// caller. `thread_create(run:arg:stack_top:)` is self-only too, and asks the
+/// wrapper rather than the kernel (`names_caller`).
 public struct Process {
     handle: ProcessHandle,
+    /// Whether this wrapper is known to name the calling process: set by
+    /// `System.process_self()` and carried by `mint`, and clear on a wrapper
+    /// that arrived any other way (a create, a walk, a request's sender, a
+    /// boot record), even one that happens to name the caller.
+    private names_caller: Bool,
 }
 
 extension Process: NoCopy {
@@ -855,16 +862,56 @@ extension Process {
     /// the kernel took out of the image header), with `arg` in its first
     /// argument register, so the entry can tell which thread it is running as.
     ///
-    /// This overload exists because Saw cannot name the address of a function:
-    /// `extern` declares functions, an extern function is not usable as a
-    /// value, and `@export` on a static emits a definition. A process written
-    /// entirely in Saw therefore cannot compute an entry address, and this is
-    /// the one entry it can ask for by name. A process with a C leaf that can
-    /// produce an address uses the overload above.
+    /// It serves a package that exports its own `_start` and tells its threads
+    /// apart there. A program written with `main` cannot use it: its image
+    /// entry is the start-up, which a second thread would run again, so the
+    /// start-up panics, naming the overload below.
     public func thread_create(&self, stack_top: UInt,
                               arg: UInt) -> Result<thread.Thread, SosStatus> {
         self.thread_create(entry: sosabi.ENTRY_IMAGE, stack_top: stack_top,
                            arg: arg)
+    }
+
+    /// Make a thread of the calling process that runs `run(arg)` on the stack
+    /// below `stack_top` and exits with what `run` returns, which a `join`
+    /// reads. Not started: `start()` it. Requires `ProcessRight.ThreadCreate`.
+    ///
+    /// ```saw
+    /// func worker(n: UInt) sync -> UInt { n * 2 }
+    ///
+    /// let t = try proc.thread_create(run: worker, arg: 21, stack_top: top)
+    /// try t.start()
+    /// let doubled = try t.join()
+    /// ```
+    ///
+    /// Only through the caller's own Process handle, one that
+    /// `System.process_self()` made or a `mint` of one: through any other
+    /// wrapper it panics, even one that names the caller, because which
+    /// process a handle names is its holder's to know, and the thread's
+    /// start, its own handle and its stack are all the caller's.
+    ///
+    /// The thread's start record, four words, is written just below
+    /// `stack_top`, and the stack the thread runs on starts below it at a
+    /// 16-byte boundary. The rest holds every frame the thread makes; a
+    /// `print` renders each argument on the stack and a panic builds its text
+    /// there, so a thread that prints or can panic wants 4 KiB at least.
+    ///
+    /// The thread holds its own `Control`-only handle, minted here and
+    /// released by its exit; the handle this returns is the caller's, with
+    /// the rights the Thread ceiling leaves, which must hold `Start`, `Mint`
+    /// and `Control` or this panics. Refusals are the kernel's, as the
+    /// `entry:` overload's are: a stack top it refuses terminates the caller,
+    /// and quota and table refusals come back as the status with nothing
+    /// left charged. A refused mint of the thread's own handle is unwound by
+    /// starting the thread, which exits at once without calling `run`: its
+    /// Thread and Handle rows come back once it has run.
+    public func thread_create(&self, run: FuncPointer<(UInt) sync -> UInt>,
+                              arg: UInt,
+                              stack_top: UInt) -> Result<thread.Thread, SosStatus> {
+        if not self.names_caller {
+            panic("sos: thread_create(run:) works only through the caller's own Process handle, from System.process_self()")
+        }
+        create_thread(self.handle, run.address(), arg, stack_top)
     }
 
     /// The calling thread's own Thread object. Requires
@@ -1564,7 +1611,8 @@ extension Process {
     public func mint(&self,
                      rights: UInt32 = ALL_RIGHTS) -> Result<Process, SosStatus> {
         let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
-        return Process(handle: ProcessHandle(raw))
+        return Process(handle: ProcessHandle(raw),
+                       names_caller: self.names_caller)
     }
 
     // -------------------------------------------------------------------------
@@ -2050,9 +2098,12 @@ extension Waiter {
     ) -> Result<Void, (SosStatus, Process)> {
         var owned = move process
         let word: UInt = owned.handle
+        let names_caller = owned.names_caller
         owned.handle = ProcessHandle(NO_HANDLE)
         try self.attach_consuming(word, key, mode) catch {
-            let back: (SosStatus, Process) = (error, Process(handle: ProcessHandle(word)))
+            let given = Process(handle: ProcessHandle(word),
+                                names_caller: names_caller)
+            let back: (SosStatus, Process) = (error, move given)
             return move back
         }
         return
@@ -2301,7 +2352,8 @@ public(package) func decode_boot_handle(tag: UInt, kind: UInt, handle: UInt) -> 
         case Memory -> { record.memory = Memory(handle: MemoryHandle(handle)) },
         case Pool -> { record.pool = Pool(handle: PoolHandle(handle)) },
         case Process -> {
-            record.process = Process(handle: ProcessHandle(handle))
+            record.process = Process(handle: ProcessHandle(handle),
+                                     names_caller: false)
         },
         case System -> { record.system = System(handle: SystemHandle(handle)) },
         case IoMemory -> {

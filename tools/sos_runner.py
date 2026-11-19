@@ -917,6 +917,12 @@ CHILD_MAIN_LEND_PROCESS_PKG = os.path.join(TESTS_DIR,
 # refuses; and a `_start` root whose second thread waits on the output lock.
 MAIN_UNIMPORTED_PKG = os.path.join(TESTS_DIR, "main-unimported")
 LOCK_WAIT_PKG = os.path.join(TESTS_DIR, "lock-wait")
+# Threads made with `thread_create(run:arg:stack_top:)`: `thread-run`
+# launches `child-thread-run` once per role, and `child-thread-take`, under
+# `death-notify`, has two threads take the boot set.
+THREAD_RUN_PKG = os.path.join(TESTS_DIR, "thread-run")
+CHILD_THREAD_RUN_PKG = os.path.join(TESTS_DIR, "child-thread-run")
+CHILD_THREAD_TAKE_PKG = os.path.join(TESTS_DIR, "child-thread-take")
 
 # What the harness types at the guest's serial port for the echo cases, and what
 # it then expects to read back.
@@ -1876,6 +1882,12 @@ def _panic_fault(process, *pieces, open_end=False):
     else:
         lines[-1] += "\nSOS: process teardown handles="
     return lines + [f" process={process}\n"]
+
+
+def _after(line, lines):
+    """`lines` with `line` straight before the first of them, as one
+    expectation, so nothing may come between the two."""
+    return [line + lines[0], *lines[1:]]
 
 
 def _root_panic(message):
@@ -12233,6 +12245,132 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # Threads made with `thread_create(run:arg:stack_top:)` in a program
+        # written with `main`: `thread-run` launches `child-thread-run` once
+        # per role, printing each status word.
+        #
+        #   join  two threads at two entries, with two arguments, one made
+        #     through a mint of the lent Process handle on a stack top off
+        #     the 16-byte grain, joined with their results;
+        #   lock  the main thread takes the output lock, writes half a line
+        #     and yields onto itself; a made thread's `print` waits, yielding
+        #     through the handle in its start record. Then a made thread
+        #     holds the lock with half a line and the main thread's `print`
+        #     waits, yielding through the handle in the block the start-up
+        #     wrote. Each holder's line is whole, and first;
+        #   claim  the main thread panics while a made thread holds the lock
+        #     with half a line: the panic sink's claim waits for the line,
+        #     which is whole before the kernel's fault line;
+        #   panic  a made thread's panic ends the process;
+        #   no room for a thread, no room for its own handle  a Thread row
+        #     with room for the main thread alone, and a `Handle` row with
+        #     room for the created thread's handle and not its own: each
+        #     create answers `QuotaExceeded`, and the rows read back after
+        #     the refused thread, if one was made, has run;
+        #   no mint, no start  a Thread ceiling without `Mint`, which the
+        #     thread's own handle is minted with, and one without `Start`:
+        #     each refused by name before it is spent;
+        #   own pid, root pid  a create through a Process handle the System
+        #     answered by pid, onto the child itself and onto root: neither
+        #     came from `process_self()`, so each panics with the rule;
+        #   no control  the child narrows its own Thread ceiling to leave out
+        #     `Control` after its start-up, and its create is refused by
+        #     name;
+        #   given back  the child gives a mint of its own Process handle to a
+        #     Waiter whose owner has ended (a process root made and dropped
+        #     unstarted); the give answers `Revoked` and hands the wrapper
+        #     back, which still names the caller, and a thread made through
+        #     it joins.
+        #
+        # This image arms no tick, so every order in the child is made by the
+        # output lock and the one FIFO ready list, and a wait that did not
+        # yield would spin for good; root parks in each wait, and the death
+        # brings it back.
+        "name": "thread_run",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": THREAD_RUN_PKG,
+        "children": [CHILD_THREAD_RUN_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}",
+            "SOS threadrun: joined doubled(21)=42 and squared(12)=144\n"
+            "SOS: process exit: code={zero} process={one}",
+            "SOS threadrun: join ended status=65536\n",
+            "SOS threadrun: the main thread holds the lock, and its line is "
+            "whole\n"
+            "SOS threadrun: a thread's line waited for it\n"
+            "SOS threadrun: a thread holds the lock, and its line is whole\n"
+            "SOS threadrun: the main thread's line waited for it\n"
+            "SOS: process exit: code={zero} process={one}",
+            "SOS threadrun: lock ended status=65536\n",
+            *_after("SOS threadrun: a thread holds the lock, and its line is "
+                    "whole\n",
+                    _panic_fault("{one}", "panic at lib.saw:",
+                                 ": SOS threadrun: the main thread panicked "
+                                 "while a thread held the output lock")),
+            f"SOS threadrun: claim ended status={STATUS_PANICKED}\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": SOS threadrun: thread 7 panicked"),
+            f"SOS threadrun: panic ended status={STATUS_PANICKED}\n",
+            "SOS threadrun: refused: this process is at its quota; threads 1 "
+            "and handles 4 before, 1 and 4 after\n"
+            "SOS: process exit: code={zero} process={one}",
+            "SOS threadrun: no room for a thread ended status=65536\n",
+            "SOS threadrun: refused: this process is at its quota; threads 1 "
+            "and handles 4 before, 1 and 4 after\n"
+            "SOS: process exit: code={zero} process={one}",
+            "SOS threadrun: no room for its own handle ended status=65536\n",
+            *_panic_fault("{one}", "panic at rt.saw:",
+                          ": sos: thread_create(run:) needs Start, Mint and "
+                          "Control on the new thread's handle"),
+            f"SOS threadrun: no mint ended status={STATUS_PANICKED}\n",
+            *_panic_fault("{one}", "panic at rt.saw:",
+                          ": sos: thread_create(run:) needs Start, Mint and "
+                          "Control on the new thread's handle"),
+            f"SOS threadrun: no start ended status={STATUS_PANICKED}\n",
+            *_panic_fault("{one}", "panic at system.saw:",
+                          ": sos: thread_create(run:) works only through the "
+                          "caller's own Process handle, from "
+                          "System.process_self()"),
+            f"SOS threadrun: own pid ended status={STATUS_PANICKED}\n",
+            *_panic_fault("{one}", "panic at system.saw:",
+                          ": sos: thread_create(run:) works only through the "
+                          "caller's own Process handle, from "
+                          "System.process_self()"),
+            f"SOS threadrun: root pid ended status={STATUS_PANICKED}\n",
+            *_panic_fault("{one}", "panic at rt.saw:",
+                          ": sos: thread_create(run:) needs Start, Mint and "
+                          "Control on the new thread's handle"),
+            f"SOS threadrun: no control ended status={STATUS_PANICKED}\n",
+            "SOS threadrun: a refused give answered what this call was "
+            "waiting for is gone; through the handle it handed back, a "
+            "thread joined with 8\n"
+            "SOS: process exit: code={zero} process={one}",
+            "SOS threadrun: given back ended status=65536\n",
+            "SOS threadrun: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Two threads that both take the boot set (`child-thread-take`,
+        # beside `death-notify`'s root): the first takes it and prints, and
+        # the second's take panics before it prints, ending the process.
+        # With no tick, the first runs to its exit before the second runs.
+        "name": "thread_take",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": DEATH_NOTIFY_PKG,
+        "children": [CHILD_THREAD_TAKE_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS: boot regions={two}",
+            "SOS deathnotify: started",
+            *_after("SOS threadtake: thread 1 took the boot set\n",
+                    _panic_fault("{one}", "panic at lib.saw:",
+                                 ": sos: the boot set was taken already")),
+            f"SOS deathnotify: woke key=44 status={STATUS_PANICKED}\n",
+            "SOS deathnotify: done"],
+        "expect_clean_exit": True,
+    },
+    {
         # The debug path's rights check, in a `_start` package: `start-print`
         # launches `child-start-print`, which adopts its boot word as a System
         # and prints. On a System without `Debug` the line is dropped and the
@@ -16271,6 +16409,11 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #                      refused at its link
     #   output_lock_wait   a `_start` thread waits on the output lock with
     #                      no block
+    #   thread_run         threads made with `thread_create(run:)`: joins,
+    #                      the output lock's waits and claim, a panic, and
+    #                      each refusal
+    #   thread_take        two threads take the boot set, and the second
+    #                      panics
     #   start_print        a `_start` package's print with no `Debug`, or on
     #                      a word that is no System, is dropped
     #
@@ -16295,7 +16438,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "boot_set_release", "main_start", "main_no_heap",
                      "main_no_system", "main_no_system_lend_system",
                      "main_no_system_lend_process", "main_not_imported",
-                     "output_lock_wait", "start_print"]
+                     "output_lock_wait", "start_print", "thread_run",
+                     "thread_take"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 
@@ -16492,6 +16636,27 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
              "SOS winmain: answered 393937586, expected 393937586\n",
              "SOS: process exit: code={five} process={one}"],
             65541),
+        # Threads made with `thread_create(run:)` in a child written with
+        # `main` and built whole for the windowed ABI: the trampoline and the
+        # threads' entries open with `entry`. Two threads joined with their
+        # results, the output lock held by the main thread and then by a made
+        # thread with the other waiting, and the main thread's panic while a
+        # made thread holds it, as `thread_run` runs them on call0.
+        windowed_child(
+            "windowed_thread_run", "xtensa-thread-windowed",
+            ["SOS threadwin: windowed code\n"
+             "SOS threadrun: joined doubled(21)=42 and squared(12)=144\n"
+             "SOS threadrun: the main thread holds the lock, and its line is "
+             "whole\n"
+             "SOS threadrun: a thread's line waited for it\n"
+             "SOS threadrun: a thread holds the lock, and its line is whole\n"
+             "SOS threadrun: the main thread's line waited for it\n",
+             *_after("SOS threadrun: a thread holds the lock, and its line is "
+                     "whole\n",
+                     _panic_fault("{one}", "panic at lib.saw:",
+                                  ": SOS threadrun: the main thread panicked "
+                                  "while a thread held the output lock"))],
+            STATUS_PANICKED),
         # A windowed Saw child's fault, 64 frames down: the kernel ends that
         # process, the teardown names it, and the call0 root wakes and goes
         # on.

@@ -1,0 +1,264 @@
+//! Threads made with `Process.thread_create(run:arg:stack_top:)` in a program
+//! written with `main`, each piece a function the program calls: its threads
+//! join with their results, take the output lock and wait on it, panic, and
+//! are refused.
+//!
+//! Every order here is made by the output lock and the scheduler's one FIFO
+//! ready list, on an image with no tick: a thread runs until it parks, yields
+//! or exits, and a yield hands the processor to every thread that was ready
+//! before it. A wait on the output lock gives the processor up through the
+//! `sos_rt_yield` hook, with the waiter's own Thread handle from its block:
+//! the main thread's, which the start-up wrote, or a made thread's, in its
+//! start record. Were the hook to do nothing, the waiter would spin with no
+//! tick to move it, and the case would hang to the harness's timeout.
+
+import sos.{SosStatus, QuotaKind, ThreadRight, Waiter, ALL_RIGHTS}
+import sosmain
+
+extern "C" {
+    func __saw_rt_output_lock()
+    func __saw_rt_output_unlock()
+    func __saw_rt_write(ptr: UnsafePointer<Int8>, len: Int) -> Int
+}
+
+/// Two threads' stacks, in this process's own zero-init data. A thread that
+/// prints or panics wants 4 KiB at least, and a word is 4 or 8 bytes.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top_a() unsafe -> UInt {
+    let base = ((&var STACK_A) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func top_b() unsafe -> UInt {
+    let base = ((&var STACK_B) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+/// Write `text` to the console as it is, with no line break, under the output
+/// lock the caller holds.
+func write(text: String) unsafe {
+    let _ = __saw_rt_write(text.c_string()!, text.len())
+}
+
+func doubled(n: UInt) sync -> UInt {
+    n * 2
+}
+
+func squared(n: UInt) sync -> UInt {
+    n * n
+}
+
+/// Two threads at two entries, with two arguments, joined with their results:
+/// one made through the lent Process handle, one through a mint of it, which
+/// carries the mark that it names the caller. The second's stack top is a
+/// word below its stack's end, off the 16-byte grain, which the create rounds
+/// its stack down to.
+///
+///   SOS threadrun: joined doubled(21)=42 and squared(12)=144
+public func join_two() -> Result<Void, SosStatus> {
+    let first = try sosmain.context().process().thread_create(
+        run: doubled, arg: 21, stack_top: top_a())
+    let minted = try sosmain.context().process().mint()
+    let off_grain = top_b() - (sizeof<UInt>() as UInt)
+    let second = try minted.thread_create(run: squared, arg: 12,
+                                          stack_top: off_grain)
+    try first.start()
+    try second.start()
+    let a = try first.join()
+    let b = try second.join()
+    print("SOS threadrun: joined doubled(21)={} and squared(12)={}", a, b)
+    return
+}
+
+/// The main thread holds the output lock while a made thread prints:
+///
+///   SOS threadrun: the main thread holds the lock, and its line is whole
+///   SOS threadrun: a thread's line waited for it
+///
+/// The main thread takes the lock, writes half its line and yields through a
+/// handle onto itself; the thread's `print` finds the lock held and yields
+/// through the handle in its start record, so the main thread finishes its
+/// line and gives the lock back before the thread's line is written. Its stack
+/// top is three bytes off, so only the rounding keeps its record a block.
+public func main_holds() -> Result<Void, SosStatus> {
+    let me = try sosmain.context().process().thread_self()
+    let waiter = try sosmain.context().process().thread_create(
+        run: waiting_line, arg: 0, stack_top: top_a() - 3)
+    __saw_rt_output_lock()
+    write("SOS threadrun: the main thread holds the lock, ")
+    try waiter.start()
+    try me.yield_now()
+    write("and its line is whole\n")
+    __saw_rt_output_unlock()
+    let _ = try waiter.join()
+    return
+}
+
+func waiting_line(arg: UInt) sync -> UInt {
+    print("SOS threadrun: a thread's line waited for it")
+    0
+}
+
+/// A made thread holds the output lock while the main thread prints:
+///
+///   SOS threadrun: a thread holds the lock, and its line is whole
+///   SOS threadrun: the main thread's line waited for it
+///
+/// The thread takes the lock, writes half its line and yields through a
+/// handle onto itself; the main thread's `print` finds the lock held and
+/// yields through the handle in its block, which the start-up wrote, so the
+/// thread finishes its line and gives the lock back first.
+public func thread_holds() -> Result<Void, SosStatus> {
+    let me = try sosmain.context().process().thread_self()
+    let holder = try sosmain.context().process().thread_create(
+        run: holding_line, arg: 0, stack_top: top_b())
+    try holder.start()
+    try me.yield_now()
+    print("SOS threadrun: the main thread's line waited for it")
+    let _ = try holder.join()
+    return
+}
+
+func holding_line(arg: UInt) sync -> UInt {
+    hold_and_yield()
+    0
+}
+
+/// Take the output lock, write half a line, yield through a handle onto this
+/// thread, then finish the line and give the lock back.
+func hold_and_yield() unsafe sync {
+    __saw_rt_output_lock()
+    write("SOS threadrun: a thread holds the lock, ")
+    let me = try sosmain.context().process().thread_self() catch {
+        panic("SOS threadrun: no handle onto the holder: {}", error)
+    }
+    try me.yield_now() catch {
+        panic("SOS threadrun: the holder's yield was refused: {}", error)
+    }
+    write("and its line is whole\n")
+    __saw_rt_output_unlock()
+}
+
+/// The main thread panics while a made thread holds the output lock with half
+/// a line written: the panic sink claims the lock, which waits for the line,
+/// so the line is whole before the kernel's fault line.
+///
+///   SOS threadrun: a thread holds the lock, and its line is whole
+///   SOS: process fault: the program panicked ... SOS threadrun: the main
+///   thread panicked while a thread held the output lock
+public func panic_while_held() -> Result<Void, SosStatus> {
+    let me = try sosmain.context().process().thread_self()
+    let holder = try sosmain.context().process().thread_create(
+        run: holding_line, arg: 0, stack_top: top_b())
+    try holder.start()
+    try me.yield_now()
+    panic("SOS threadrun: the main thread panicked while a thread held the output lock")
+}
+
+/// A made thread panics, which ends the process as `Faulted (Panic)` with
+/// its text, while the main thread waits to join it.
+public func thread_panics() -> Result<Void, SosStatus> {
+    let thread = try sosmain.context().process().thread_create(
+        run: panicking, arg: 7, stack_top: top_a())
+    try thread.start()
+    let _ = try thread.join()
+    panic("SOS threadrun: the join of a panicking thread came back")
+}
+
+func panicking(n: UInt) sync -> UInt {
+    panic("SOS threadrun: thread {} panicked", n)
+}
+
+/// A `thread_create(run:)` its process's rows refuse: the status, and the
+/// process's Thread and Handle rows before the call and after the refused
+/// thread, if one was made, has run.
+///
+///   SOS threadrun: refused: STATUS; threads T and handles H before, T and H
+///   after
+///
+/// The main thread yields before it reads the rows again: a thread made and
+/// then refused its own handle is started to exit at once, without calling
+/// its entry, which would panic, and it is freed once it has run.
+public func refused() -> Result<Void, SosStatus> {
+    let me = try sosmain.context().process().thread_self()
+    let threads = try sosmain.context().process().quota_get(QuotaKind.Thread)
+    let handles = try sosmain.context().process().quota_get(QuotaKind.Handle)
+    let status = match sosmain.context().process().thread_create(
+        run: refused_ran, arg: 1, stack_top: top_a()) {
+        case Ok(_) -> panic("SOS threadrun: the refused create came back"),
+        case Err(e) -> e,
+    }
+    try me.yield_now()
+    let threads_after = try sosmain.context().process().quota_get(
+        QuotaKind.Thread)
+    let handles_after = try sosmain.context().process().quota_get(
+        QuotaKind.Handle)
+    print("SOS threadrun: refused: {}; threads {} and handles {} before, {} and {} after",
+          status, threads.used, handles.used, threads_after.used,
+          handles_after.used)
+    return
+}
+
+func refused_ran(n: UInt) sync -> UInt {
+    panic("SOS threadrun: a refused thread ran its entry")
+}
+
+/// A `thread_create(run:)` through the lent Process handle that does not
+/// return: in a process whose Thread ceiling leaves the new handle without a
+/// right it needs, it panics, naming them.
+public func create_once() -> Result<Void, SosStatus> {
+    let _ = try sosmain.context().process().thread_create(
+        run: doubled, arg: 1, stack_top: top_a())
+    panic("SOS threadrun: the create came back")
+}
+
+/// `create_once` after this process narrows its own Thread ceiling to leave
+/// out `Control`. The start-up's own thread handle was minted before, with
+/// `Control`; the new thread's handle is minted after, without it.
+public func no_control() -> Result<Void, SosStatus> {
+    try sosmain.context().process().restrict_rights(
+        thread: ALL_RIGHTS & ~(ThreadRight.Control as UInt32))
+    try create_once()
+}
+
+/// A Process handle minted from the lent one, given to `waiter`, whose owner
+/// has ended: the give answers `Revoked` and hands the wrapper back, and the
+/// wrapper still names the caller, so a thread made through it runs.
+///
+///   SOS threadrun: a refused give answered STATUS; through the handle it
+///   handed back, a thread joined with 8
+public func through_given_back(waiter: Waiter) -> Result<Void, SosStatus> {
+    let own = try sosmain.context().process().mint()
+    try waiter.give(process: move own, key: GIVE_KEY) catch {
+        let (why, back) = move error
+        let thread = try back.thread_create(run: doubled, arg: 4,
+                                            stack_top: top_a())
+        try thread.start()
+        let n = try thread.join()
+        print("SOS threadrun: a refused give answered {}; through the handle it handed back, a thread joined with {}",
+              why, n)
+        return
+    }
+    panic("SOS threadrun: a dead process's Waiter took the give")
+}
+
+/// The key `through_given_back` attaches under.
+static GIVE_KEY: UInt = 9
+
+/// `thread_create(run:)` through a Process handle the System's walk answered
+/// for `pid`: a wrapper that did not come from `process_self()`, which panics
+/// whatever process it names.
+public func create_through_walk(pid: UInt64) -> Result<Void, SosStatus> {
+    let other = try sosmain.context().system().process_by_pid(pid)
+    let _ = try other.thread_create(run: doubled, arg: 1, stack_top: top_a())
+    panic("SOS threadrun: the create through the walk's handle came back")
+}
+
+/// This process's pid, as its stats read it.
+public func own_pid() -> Result<UInt64, SosStatus> {
+    let stats = try sosmain.context().process().stats()
+    return stats.pid
+}

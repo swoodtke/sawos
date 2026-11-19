@@ -1,0 +1,50 @@
+// Two threads that both take the boot set:
+//
+//   SOS threadtake: thread 1 took the boot set
+//   SOS: process fault: the program panicked ... sos: the boot set was taken
+//   already
+//
+// `main` never takes the set. It makes two threads at one entry with the
+// arguments 1 and 2, starts both and joins the first. With no tick, the
+// first runs until it exits: it takes the set and prints. The second runs
+// next, ahead of the main thread its exit woke, and its take panics before
+// it prints, which ends the process.
+//
+// `death-notify`'s root launches it and prints the status word it ends with.
+
+import sos.{SosStatus}
+import sosmain
+
+/// Two threads' stacks, in this process's own zero-init data. A thread that
+/// prints or panics wants 4 KiB at least, and a word is 4 or 8 bytes.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top_a() unsafe -> UInt {
+    let base = ((&var STACK_A) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func top_b() unsafe -> UInt {
+    let base = ((&var STACK_B) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func main() -> Result<Void, SosStatus> {
+    let first = try sosmain.context().process().thread_create(
+        run: take, arg: 1, stack_top: top_a())
+    let second = try sosmain.context().process().thread_create(
+        run: take, arg: 2, stack_top: top_b())
+    try first.start()
+    try second.start()
+    let _ = try first.join()
+    let _ = try second.join()
+    panic("SOS threadtake: both threads took the boot set")
+}
+
+func take(n: UInt) sync -> UInt {
+    let _ = sosmain.take_boot_set()
+    print("SOS threadtake: thread {} took the boot set", n)
+    0
+}

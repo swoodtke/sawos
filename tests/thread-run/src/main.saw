@@ -1,0 +1,207 @@
+// `thread_create(run:arg:stack_top:)` from the supervisor's side:
+// `child-thread-run` launched in one region once per role, each launch
+// waited out and its status word printed:
+//
+//   SOS threadrun: <round> ended status=<word>
+//
+// `Exited` (1) << 16 with `main`'s status, or `Faulted` (2) << 16 | 14
+// (`FaultReason.Panic`) for a panic, with its text on the kernel's fault
+// line. The child's own lines come before, and say what each round shows.
+//
+// This image's kernel arms no tick, so the child's threads run in the order
+// the output lock and the one FIFO ready list make, root parks in each wait,
+// and the child's death is what brings it back: the kernel's lines come
+// before root's by construction.
+
+import sos.{System, Process, Memory, SosStatus, SystemRight, ThreadRight,
+            QuotaKind, ALL_RIGHTS}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_EXTRA: UInt = 43
+
+static KEY_DEATH: UInt = 6
+
+/// The roles `child-thread-run` knows.
+static ROLE_JOIN: UInt = 1
+static ROLE_LOCK: UInt = 2
+static ROLE_CLAIM: UInt = 3
+static ROLE_PANIC: UInt = 4
+static ROLE_REFUSED: UInt = 5
+static ROLE_NO_RIGHT: UInt = 6
+static ROLE_OWN_PID: UInt = 7
+static ROLE_ROOT_PID: UInt = 8
+static ROLE_NO_CONTROL: UInt = 9
+static ROLE_GIVEN_BACK: UInt = 10
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer
+                               | SystemRight.ProcessObserve)
+
+/// A Thread ceiling with one right taken away.
+static NO_MINT: UInt32 = ALL_RIGHTS & ~(ThreadRight.Mint as UInt32)
+static NO_START: UInt32 = ALL_RIGHTS & ~(ThreadRight.Start as UInt32)
+
+/// A Thread row with room for the main thread alone.
+static ROOM_FOR_MAIN: UInt16 = 1
+/// A `Handle` row with room for the child's System, Process, main thread's
+/// handle, the handle onto itself the `REFUSED` role mints and the created
+/// thread's handle, and not for the thread's own.
+static ROOM_FOR_CREATED: UInt16 = 5
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS threadrun: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS threadrun: refused: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS threadrun: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let img = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+
+    try with_role(&system, &proc, &img, &ram, "join", ROLE_JOIN)
+    try with_role(&system, &proc, &img, &ram, "lock", ROLE_LOCK)
+    try with_role(&system, &proc, &img, &ram, "claim", ROLE_CLAIM)
+    try with_role(&system, &proc, &img, &ram, "panic", ROLE_PANIC)
+    try short_row(&system, &proc, &img, &ram, "no room for a thread",
+                  QuotaKind.Thread, ROOM_FOR_MAIN)
+    try short_row(&system, &proc, &img, &ram, "no room for its own handle",
+                  QuotaKind.Handle, ROOM_FOR_CREATED)
+    try no_right(&system, &proc, &img, &ram, "no mint", NO_MINT)
+    try no_right(&system, &proc, &img, &ram, "no start", NO_START)
+    try with_role(&system, &proc, &img, &ram, "own pid", ROLE_OWN_PID)
+    try root_pid(&system, &proc, &img, &ram)
+    try with_role(&system, &proc, &img, &ram, "no control", ROLE_NO_CONTROL)
+    try given_back(&system, &proc, &img, &ram)
+    return
+}
+
+/// A `child-thread-run` given its role and a System under `TAG_BOOT`, started
+/// on the System.
+func with_role(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+               round: String, role: UInt) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    try give_bits(&proc, &child, TAG_ROLE, role)
+    try give_system(&system, &child)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, round)
+}
+
+/// `REFUSED`, with the child's `kind` row at `limit`.
+func short_row(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+               round: String, kind: QuotaKind,
+               limit: UInt16) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    try give_bits(&proc, &child, TAG_ROLE, ROLE_REFUSED)
+    try give_system(&system, &child)
+    try child.quota_set(kind, limit: limit)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, round)
+}
+
+/// `NO RIGHT`, with the child's Thread ceiling narrowed to `ceiling`.
+func no_right(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+              round: String, ceiling: UInt32) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    try child.restrict_rights(thread: ceiling)
+    try give_bits(&proc, &child, TAG_ROLE, ROLE_NO_RIGHT)
+    try give_system(&system, &child)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, round)
+}
+
+/// `ROOT PID`, given this process's pid under `TAG_EXTRA`.
+func root_pid(system: &System, proc: &Process, img: &Memory,
+              ram: &Memory) -> Result<Void, SosStatus> {
+    let stats = try proc.stats()
+    let pid = stats.pid
+    let child = try system.process_create(image: &img, memory: &ram)
+    try give_bits(&proc, &child, TAG_ROLE, ROLE_ROOT_PID)
+    try give_bits(&proc, &child, TAG_EXTRA, pid as UInt)
+    try give_system(&system, &child)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, "root pid")
+}
+
+/// `GIVEN BACK`, given under `TAG_EXTRA` a Waiter whose owner has ended: a
+/// process made in the same regions and dropped before it was started, which
+/// ends it.
+func given_back(system: &System, proc: &Process, img: &Memory,
+                ram: &Memory) -> Result<Void, SosStatus> {
+    let owner = try system.process_create(image: &img, memory: &ram)
+    let waiter = try owner.waiter_create()
+    let _ = move owner
+    let child = try system.process_create(image: &img, memory: &ram)
+    try give_bits(&proc, &child, TAG_ROLE, ROLE_GIVEN_BACK)
+    try child.give(waiter: move waiter, tag: TAG_EXTRA) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try give_system(&system, &child)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(&proc, move child, "given back")
+}
+
+/// An Event signalled with `bits`, under `tag`.
+func give_bits(proc: &Process, child: &Process, tag: UInt,
+               bits: UInt) -> Result<Void, SosStatus> {
+    let ev = try proc.event_create()
+    try ev.signal(bits: bits)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// A System narrowed to `CHILD_SYSTEM`, under `TAG_BOOT`.
+func give_system(system: &System, child: &Process) -> Result<Void, SosStatus> {
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Wait for `child`'s death and print its status word; the handle goes with
+/// it, so the next round's child takes the same region.
+func ended(proc: &Process, child: Process,
+           round: String) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH {
+                return BUG
+            }
+            print("SOS threadrun: {} ended status={}", round, status)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

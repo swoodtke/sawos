@@ -1,0 +1,37 @@
+// Threads made with `thread_create(run:arg:stack_top:)` on the ESP32-S3,
+// built whole for the windowed ABI: the trampoline, the threads' entries,
+// `sosmain`'s start-up and the runtime are one compile, so each opens with
+// `entry`.
+//
+//   SOS threadwin: windowed code
+//   SOS threadrun: joined doubled(21)=42 and squared(12)=144
+//   SOS threadrun: the main thread holds the lock, and its line is whole
+//   SOS threadrun: a thread's line waited for it
+//   SOS threadrun: a thread holds the lock, and its line is whole
+//   SOS threadrun: the main thread's line waited for it
+//   SOS threadrun: a thread holds the lock, and its line is whole
+//   SOS: process fault: the program panicked ...
+//
+// `death-notify`'s root launches it and parks on its death. `main` says
+// which convention it runs, then runs `threadrun`'s pieces in turn: two
+// threads joined with their results, the output lock held by the main thread
+// and then by a made thread, each with the other waiting, and last the main
+// thread's panic while a made thread holds the lock, which ends the process.
+
+import sos.{SosStatus}
+import sosmain
+import threadrun
+import winsaw.{windowed}
+
+func main() -> Result<Void, SosStatus> {
+    if windowed() {
+        print("SOS threadwin: windowed code")
+    } else {
+        print("SOS threadwin: call0 code")
+    }
+    try threadrun.join_two()
+    try threadrun.main_holds()
+    try threadrun.thread_holds()
+    try threadrun.panic_while_held()
+    return
+}

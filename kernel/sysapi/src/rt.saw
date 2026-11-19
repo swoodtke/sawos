@@ -8,16 +8,19 @@
 //! and the end is the kernel's panic op, which puts the text on its fault line
 //! and ends the process. If `panic()` could reach a UART from userspace, the
 //! user/kernel split would be claimed rather than real. The last two it
-//! answers from the thread register (the foot of this file).
+//! answers from the thread register, whose layout this file also keeps: the
+//! blocks, and the start record of a thread `thread_create(run:)` makes.
 //!
 //! They live here, not in `hal/<arch>/user/`, because they name no
 //! architecture: the System op and the panic op are the same ops on every
 //! profile, and the thread register is read through the user HAL's accessors.
 //!
-//! This is the top of the module order because the hooks are written over the
-//! floor's ops. The byte goes out through `sos_system_debug_print`, on the
-//! handle `System(boot_handle:)` parks at the floor, which the hook cannot do
-//! for itself; the end goes through `sos_panic`, which needs no handle.
+//! This sits above the floor because the hooks are written over the floor's
+//! ops, and below `sos.system`, whose `thread_create(run:)` makes its threads
+//! at the entry this file keeps. The byte goes out through
+//! `sos_system_debug_print`, on the handle `System(boot_handle:)` parks at the
+//! floor, which the hook cannot do for itself; the end goes through
+//! `sos_panic`, which needs no handle.
 
 import sos.floor.{SYSTEM_HANDLE, PRINT_ANSWER, PRINT_UNASKED, PRINT_DEBUG,
                   PRINT_SILENT, sos_handle_info, sos_system_debug_print,
@@ -214,10 +217,11 @@ func rt_yield() unsafe {
 /// the thread's own Thread handle, through which the output lock's wait
 /// yields.
 ///
-/// The block lives for its thread's life wherever the thread put it (the
-/// main thread's, in `sosmain`'s start-up frame), and holds its handle until
-/// the process ends. Its address is word-aligned and nonzero, so it serves as
-/// the thread's lock-owner identity as it is.
+/// The block lives for its thread's life wherever the thread put it: the main
+/// thread's in `sosmain`'s start-up frame, and a `thread_create(run:)`
+/// thread's at the head of its start record, at the top of its stack. Its
+/// address is word-aligned and nonzero, so it serves as the thread's
+/// lock-owner identity as it is.
 public struct ThreadBlock {
     private thread: UInt,
 }
@@ -246,4 +250,109 @@ extension ThreadBlock {
 /// `block` stays where it is for the rest of the thread's life.
 public func enter_thread_block(block: UnsafePointer<ThreadBlock>) unsafe {
     sos_set_thread_word(block as UInt)
+}
+
+// -----------------------------------------------------------------------------
+// A thread's real entry
+// -----------------------------------------------------------------------------
+//
+// `Process.thread_create(run:arg:stack_top:)` makes every thread at one
+// entry, the trampoline below, and hands it the address of a start record
+// written just below the stack top: the entry to run, its argument, the
+// thread's own handle and an abandon flag. The trampoline's first act makes
+// the record the thread's block, so the record stays where it is for the
+// thread's life and its head is the `ThreadBlock` the output lock's yield
+// reads.
+
+import sosabi.{SosStatus, ProcessOp, ThreadRight}
+import sos.floor.{call_value, checked, handle_rights, sos_handle_mint,
+                  sos_thread_start, sos_thread_exit}
+
+/// A thread's start record. The block comes first: the thread register
+/// names the record, and a reader of a block reads it there.
+struct StartRecord {
+    block: ThreadBlock,
+    /// The address of the `run` the thread calls.
+    entry: UInt,
+    arg: UInt,
+    /// Nonzero for a thread made only to be unwound: it exits at once,
+    /// without calling `run`.
+    abandon: UInt,
+}
+
+/// The grain the stack given to the kernel is rounded down to: every profile
+/// wants a 16-byte-aligned stack pointer.
+static STACK_GRAIN: UInt = 16
+
+/// The rights the created thread's handle must hold: `Start` to start it,
+/// `Mint` for the thread's own handle, and `Control`, through which the
+/// thread yields and exits.
+static ENTRY_RIGHTS: UInt32 = ((ThreadRight.Start as UInt32)
+                               | (ThreadRight.Mint as UInt32)
+                               | (ThreadRight.Control as UInt32))
+
+/// Make a thread of the process `process` names, which is the caller's own,
+/// that runs `entry(arg)` on the stack below `stack_top`:
+/// `Process.thread_create(run:arg:stack_top:)`'s body.
+///
+/// The start record is written once the kernel has made the thread, so a
+/// stack top the kernel refuses is refused before anything is written below
+/// it. The thread's own handle is a `Control`-only sibling of the created
+/// one. A refused mint is unwound by starting the thread on an abandoned
+/// record holding the created handle's word: the thread exits through that
+/// word at once, which releases it, and an exited thread with no handle left
+/// is freed, so its Thread and Handle rows come back once it has run.
+public(package) func create_thread(process: UInt, entry: UInt, arg: UInt,
+                                   stack_top: UInt) unsafe -> Result<Thread, SosStatus> {
+    let below = stack_top &- (sizeof<StartRecord>() as UInt)
+    let at = below & ~(STACK_GRAIN &- 1)
+    let trampoline: FuncPointer<(UInt) sync -> Never> = thread_entry
+    let created = try call_value(process, ProcessOp.ThreadCreate as UInt,
+                                 trampoline.address(), at, at)
+    let rights = try handle_rights(created) catch {
+        panic("sos: the new thread's rights cannot be read: {}", error)
+    }
+    if (rights & ENTRY_RIGHTS) != ENTRY_RIGHTS {
+        panic("sos: thread_create(run:) needs Start, Mint and Control on the new thread's handle")
+    }
+    let record = UnsafeMemory<StartRecord, Normal>(at)
+    var own: UInt = 0
+    let minted = sos_handle_mint(created, ThreadRight.Control as UInt,
+                                 (&var own) as UnsafePointer<UInt>)
+    try checked(minted) catch {
+        record.write(StartRecord(block: ThreadBlock(thread: created),
+                                 entry: entry, arg: arg, abandon: 1))
+        try checked(sos_thread_start(created)) catch {
+            panic("sos: the unwound thread's start was refused: {}", error)
+        }
+        return error
+    }
+    record.write(StartRecord(block: ThreadBlock(thread: own), entry: entry,
+                             arg: arg, abandon: 0))
+    return Thread(handle: ThreadHandle(created))
+}
+
+/// The entry of every thread `create_thread` makes: `at` is its start
+/// record's address.
+func thread_entry(at: UInt) sync -> Never {
+    run_thread(at)
+}
+
+/// Make the start record the calling thread's block before anything can take
+/// a lock, call the entry it names with its argument, and exit with what the
+/// entry returns, through the thread's own handle, which the exit releases.
+/// An abandoned record exits at once with 0.
+func run_thread(at: UInt) unsafe sync -> Never {
+    sos_set_thread_word(at)
+    let record = UnsafeMemory<StartRecord, Normal>(at).read()
+    var code: UInt = 0
+    if record.abandon == 0 {
+        let run = FuncPointer<(UInt) sync -> UInt>.from_raw(
+            record.entry as UnsafePointer<UInt8>)
+        code = run(record.arg)
+    }
+    try checked(sos_thread_exit(record.block.thread, code)) catch {
+        panic("sos: the thread's exit was refused: {}", error)
+    }
+    while { }
 }

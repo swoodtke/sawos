@@ -1,0 +1,102 @@
+// Test child written with `main`, for `thread_run`: the role its launcher
+// gives it, as the bits of an Event under `TAG_ROLE`, says which of
+// `threadrun`'s pieces `main` runs.
+//
+//   JOIN     two threads at two entries, joined with their results
+//   LOCK     the main thread holds the output lock while a thread prints,
+//            then a thread holds it while the main thread prints
+//   CLAIM    the main thread panics while a thread holds the output lock
+//   PANIC    a thread panics
+//   REFUSED  a create its rows refuse, and the rows before and after
+//   NO RIGHT a create whose new handle lacks a right it needs, which
+//            panics
+//   OWN PID  a create through a walk's handle onto this process, which
+//            panics
+//   ROOT PID a create through a walk's handle onto the pid the Event under
+//            `TAG_EXTRA` carries, which panics
+//   NO CONTROL  a create after this process narrows its own Thread ceiling
+//            to leave out `Control`, which panics
+//   GIVEN BACK  a give of a mint of its own Process handle to the Waiter
+//            under `TAG_EXTRA`, whose owner has ended, then a create through
+//            the wrapper the refusal hands back
+//
+// A role that comes back from what should have ended it, or a record that is
+// not there, panics naming it, which the case reads as the wrong line.
+
+import sos.{BootSet, SosStatus}
+import sosmain
+import threadrun
+
+static TAG_ROLE: UInt = 40
+static TAG_EXTRA: UInt = 43
+
+static ROLE_JOIN: UInt = 1
+static ROLE_LOCK: UInt = 2
+static ROLE_CLAIM: UInt = 3
+static ROLE_PANIC: UInt = 4
+static ROLE_REFUSED: UInt = 5
+static ROLE_NO_RIGHT: UInt = 6
+static ROLE_OWN_PID: UInt = 7
+static ROLE_ROOT_PID: UInt = 8
+static ROLE_NO_CONTROL: UInt = 9
+static ROLE_GIVEN_BACK: UInt = 10
+
+func main() -> Result<Int, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let role = try bits_under(&var set, TAG_ROLE)
+    if role == ROLE_JOIN {
+        try threadrun.join_two()
+        return 0
+    }
+    if role == ROLE_LOCK {
+        try threadrun.main_holds()
+        try threadrun.thread_holds()
+        return 0
+    }
+    if role == ROLE_CLAIM {
+        try threadrun.panic_while_held()
+    }
+    if role == ROLE_PANIC {
+        try threadrun.thread_panics()
+    }
+    if role == ROLE_REFUSED {
+        try threadrun.refused()
+        return 0
+    }
+    if role == ROLE_NO_RIGHT {
+        try threadrun.create_once()
+    }
+    if role == ROLE_OWN_PID {
+        try threadrun.create_through_walk(try threadrun.own_pid())
+    }
+    if role == ROLE_ROOT_PID {
+        let pid = try bits_under(&var set, TAG_EXTRA)
+        try threadrun.create_through_walk(pid as UInt64)
+    }
+    if role == ROLE_NO_CONTROL {
+        try threadrun.no_control()
+    }
+    if role == ROLE_GIVEN_BACK {
+        guard var record = set.take(TAG_EXTRA) else {
+            panic("SOS threadchild: no record under tag {}", TAG_EXTRA)
+        }
+        guard let waiter = record.take_waiter() else {
+            panic("SOS threadchild: the record under tag {} is no Waiter",
+                  TAG_EXTRA)
+        }
+        try threadrun.through_given_back(move waiter)
+        return 0
+    }
+    panic("SOS threadchild: role {} came back", role)
+}
+
+/// The bits of the Event under `tag`, which is released once read.
+func bits_under(set: &var BootSet, tag: UInt) -> Result<UInt, SosStatus> {
+    guard var record = set.take(tag) else {
+        panic("SOS threadchild: no record under tag {}", tag)
+    }
+    guard let event = record.take_event() else {
+        panic("SOS threadchild: the record under tag {} is no Event", tag)
+    }
+    event.receive()
+}
