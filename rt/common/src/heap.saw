@@ -7,6 +7,13 @@
 //! enough, `find` walks the list the request's own size falls in before the
 //! heap refuses.
 //!
+//! The class table is sized for the heap's `largest`, which the caller gives.
+//! A block larger than the table's top class has no list of its own and goes
+//! on the table's last list, the last second-level list of the last class, so
+//! a region extended past `largest` keeps working: such a block is found by
+//! the walk, and the bitmaps' answer for the last list stays true, its every
+//! block being at least the list's lower bound.
+//!
 //! It names no linker symbol, no lock and no way to stop the machine, so it
 //! compiles hosted for its own tests (`rt/common/tests/`). `sosrt` gives it the
 //! arena, serializes its callers and turns a refusal into a null pointer.
@@ -19,7 +26,10 @@
 //! and its size again in its last word (the footer), which is where the block
 //! after it finds it. A region ends in a sentinel: a header of size zero that
 //! is never free, so no merge runs past the end; the region's first block
-//! never has `PREV_FREE`, so none runs past the start.
+//! never has `PREV_FREE`, so none runs past the start. The sentinel sits at
+//! the region's end rounded down to the granule: its header is the word below
+//! that address. `extend` turns it into the header of the block over the new
+//! bytes and writes a new one at the new end.
 //!
 //! The region begins with the control block, made on the first call:
 //!
@@ -28,20 +38,18 @@
 //!     words 2 ..              one second-level bitmap per class
 //!     then                    the list heads, `SL_COUNT` per class
 //!
-//! A later region can join as the first does, as one more free block between
-//! its own boundaries (`add_region`), provided none of its blocks outgrows the
-//! largest class the control block was sized for.
-//!
 //! Arithmetic that cannot wrap uses `&+`/`&-` and every shift count is masked:
 //! a check here would put a trap inside the allocator, which a panic's own
 //! formatting can reach.
 
-/// The heap over `[base, base + size)`. The region is the caller's to give:
-/// its first word reads zero until the first call, nothing else writes it, and
-/// one caller at a time is inside a method.
+/// The heap over `[base, base + size)`, its class table sized for blocks of up
+/// to `largest` bytes. The region is the caller's to give: its first word reads
+/// zero until the first call, nothing else writes it, and one caller at a time
+/// is inside a method.
 public unsafe struct UnsafeHeap {
     base: UInt,
-    size: UInt
+    size: UInt,
+    largest: UInt
 }
 
 /// The low bits of a header. A block's size is a multiple of `GRAIN`, so
@@ -162,17 +170,30 @@ extension UnsafeHeap {
         self.control() &+ (CONTROL_FIXED &+ fl) &* word()
     }
 
+    /// The class-and-list a block of `size` bytes is kept on: its own, or the
+    /// table's last list for a block past the table's top class.
+    func list_of(&self, size: UInt) unsafe -> UInt {
+        let index = class_of(size)
+        let last = shl(self.classes(), SL_LOG2) &- 1
+        if index > last { last } else { index }
+    }
+
     /// The list head for class-and-list `index`.
     func head_at(&self, index: UInt) unsafe -> UInt {
         let heads = CONTROL_FIXED &+ self.classes()
         self.control() &+ (heads &+ index) &* word()
     }
 
+    /// The first address past the control block.
+    func control_end(&self) unsafe -> UInt {
+        let words = CONTROL_FIXED &+ self.classes() &* (SL_COUNT &+ 1)
+        self.control() &+ words &* word()
+    }
+
     /// The address of the region's first block, which follows the control
     /// block and a header, on the granule.
     func first(&self) unsafe -> UInt {
-        let words = CONTROL_FIXED &+ self.classes() &* (SL_COUNT &+ 1)
-        round_up(self.control() &+ words &* word() &+ word(), grain())
+        round_up(self.control_end() &+ word(), grain())
     }
 
     /// Whether the control block exists, making it on the first call. False
@@ -186,9 +207,12 @@ extension UnsafeHeap {
         if read(start) != 0 {
             return true
         }
-        // Size the class table for a block as large as the whole region,
-        // which no block reaches, so every block has a class.
-        let classes = shr(class_of(self.size), SL_LOG2) &+ 1
+        let largest = if self.largest < min_block() {
+            min_block()
+        } else {
+            self.largest
+        }
+        let classes = shr(class_of(largest), SL_LOG2) &+ 1
         let words = CONTROL_FIXED &+ classes &* (SL_COUNT &+ 1)
         if end &- start < words &* word() {
             return false
@@ -199,12 +223,12 @@ extension UnsafeHeap {
             at = at &+ word()
         }
         write(start, classes)
-        self.add_region(start &+ words &* word(), end)
+        self.add_region(self.control_end(), end)
         true
     }
 
     /// Give `[start, end)` to the heap as one free block. A region too small
-    /// for a block and its sentinel adds nothing.
+    /// for a block and its sentinel adds nothing, and writes nothing.
     func add_region(&self, start: UInt, end: UInt) unsafe {
         let first = round_up(start &+ word(), grain())
         let limit = end & ~(grain() &- 1)
@@ -215,11 +239,55 @@ extension UnsafeHeap {
         self.insert(first, limit &- first)
     }
 
+    /// Grow the region by the `by` bytes that follow it, which are the
+    /// caller's to give as the region's were. Constant time.
+    ///
+    /// The old sentinel's header becomes the header of a free block over the
+    /// new bytes, merged with the last block when that is free, and a new
+    /// sentinel goes at the new end. New bytes of one granule, too few for a
+    /// block, after a used last block become a used block nothing holds, so
+    /// the sentinel still sits at the end. A heap not made yet only takes the
+    /// new `size`; one made over a region too small for a block gives the
+    /// whole span past its control block to `add_region` again.
+    public func extend(&var self, by: UInt) unsafe {
+        let old_end = self.base &+ self.size
+        let end = old_end &+ by
+        let made = self.size >= min_block() && self.classes() != 0
+        self.size = self.size &+ by
+        if not made {
+            return
+        }
+        let old_limit = old_end & ~(grain() &- 1)
+        let first = self.first()
+        if first > old_limit || old_limit &- first < min_block() {
+            // No block was ever added, so there is no sentinel either.
+            self.add_region(self.control_end(), end)
+            return
+        }
+        let limit = end & ~(grain() &- 1)
+        let space = limit &- old_limit
+        if space == 0 {
+            return
+        }
+        let sentinel = header(old_limit)
+        set_header(limit, 0)
+        if (sentinel & PREV_FREE) != 0 {
+            let last = read(old_limit &- grain())
+            let start = old_limit &- last
+            self.remove(start, last)
+            self.insert(start, last &+ space)
+        } else if space < min_block() {
+            set_header(old_limit, space)
+        } else {
+            self.insert(old_limit, space)
+        }
+    }
+
     /// Put `block` of `size` bytes on its list and mark it free, and mark the
     /// block after it. A free block's predecessor is never free (the two
     /// would have merged), so its own header carries no `PREV_FREE`.
     func insert(&self, block: UInt, size: UInt) unsafe {
-        let index = class_of(size)
+        let index = self.list_of(size)
         let fl = shr(index, SL_LOG2)
         let slot = self.head_at(index)
         let head = read(slot)
@@ -241,7 +309,7 @@ extension UnsafeHeap {
 
     /// Take `block` of `size` bytes off its list. Its flags are the caller's.
     func remove(&self, block: UInt, size: UInt) unsafe {
-        let index = class_of(size)
+        let index = self.list_of(size)
         let next = read(block)
         let prev = read(block &+ word())
         if next != 0 {
@@ -268,10 +336,11 @@ extension UnsafeHeap {
     /// A free block of at least `size` bytes, or 0.
     ///
     /// The bitmaps answer for a list whose every block is large enough. When
-    /// none is non-empty, the list `size` itself falls in can still hold a
+    /// none is non-empty, the list `size` itself is kept on can still hold a
     /// block that fits: a request near the size of a nearly empty region's one
-    /// block (68 KiB of a 72 KiB arena) is served only from there. So that list
-    /// is walked before the heap refuses.
+    /// block (68 KiB of a 72 KiB arena) is served only from there, and a
+    /// request past the table's top class only from the last list. So that
+    /// list is walked before the heap refuses.
     func find(&self, size: UInt) unsafe -> UInt {
         let classes = self.classes()
         let search = search_class_of(size)
@@ -290,11 +359,7 @@ extension UnsafeHeap {
                 return read(self.head_at(shl(fl, SL_LOG2) | lowest_bit(sl_map)))
             }
         }
-        let index = class_of(size)
-        if shr(index, SL_LOG2) >= classes {
-            return 0
-        }
-        var block = read(self.head_at(index))
+        var block = read(self.head_at(self.list_of(size)))
         while block != 0 {
             if size_of(block) >= size {
                 return block

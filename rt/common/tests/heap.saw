@@ -34,14 +34,21 @@ func region_base() unsafe -> UInt {
     ((&var REGION) as UnsafePointer<UInt64>) as UInt
 }
 
-/// A heap over the first `bytes` of a zeroed region.
+/// A heap over the first `bytes` of a zeroed region, its table sized for the
+/// region.
 func fresh(bytes: UInt) unsafe -> UnsafeHeap {
+    sized(bytes, bytes)
+}
+
+/// A heap over the first `bytes` of a zeroed region, its table sized for
+/// `largest`.
+func sized(bytes: UInt, largest: UInt) unsafe -> UnsafeHeap {
     var i = 0
     while i < REGION_WORDS {
         REGION[i] = 0
         i = i + 1
     }
-    UnsafeHeap(base: region_base(), size: bytes)
+    UnsafeHeap(base: region_base(), size: bytes, largest: largest)
 }
 
 /// The largest request `heap` serves now; the heap is left as it was.
@@ -106,7 +113,7 @@ func fenced(skip: UInt, bytes: UInt) unsafe -> UnsafeHeap {
         UnsafeMemory<UInt8, Normal>(base + at).write(byte)
         at = at + 1
     }
-    UnsafeHeap(base: base + skip, size: bytes)
+    UnsafeHeap(base: base + skip, size: bytes, largest: bytes)
 }
 
 /// Whether every byte outside `[base + skip, + bytes)` is still `CANARY`.
@@ -419,7 +426,7 @@ func garbage(bytes: UInt) unsafe -> UnsafeHeap {
         at = at + 1
     }
     UnsafeMemory<UInt, Normal>(base).write(0)
-    UnsafeHeap(base: base, size: bytes)
+    UnsafeHeap(base: base, size: bytes, largest: bytes)
 }
 
 /// The largest request `heap` serves now at `align`; the heap is left as it
@@ -600,9 +607,9 @@ func bad_frees() unsafe {
     heap.free(d)
     heap.free(e)
     check(not heap.holds(e), "a block merged backward is no live block")
-    check(not UnsafeHeap(base: region_base(), size: 0).holds(region_base()),
-          "an empty heap holds nothing")
-    let inner = UnsafeHeap(base: region_base() + 64, size: 4096)
+    let empty = UnsafeHeap(base: region_base(), size: 0, largest: 0)
+    check(not empty.holds(region_base()), "an empty heap holds nothing")
+    let inner = UnsafeHeap(base: region_base() + 64, size: 4096, largest: 4096)
     UnsafeMemory<UInt, Normal>(inner.base - WORD).write(MIN_BLOCK)
     check(not inner.holds(inner.base), "a heap's own base is no block")
 }
@@ -640,6 +647,247 @@ func last_block_held() unsafe {
     check(largest(&heap) == all, "and frees back whole")
 }
 
+/// Word `index` of `heap`'s control block.
+func control_word(heap: &UnsafeHeap, index: UInt) unsafe -> UInt {
+    UnsafeMemory<UInt, Normal>(heap.base + index * WORD).read()
+}
+
+/// The control block's first word: the number of classes in its table.
+func class_count(heap: &UnsafeHeap) unsafe -> UInt {
+    control_word(&heap, 0)
+}
+
+/// A table sized for 64 times the first region: the control block has that
+/// many classes (32 bytes, the smallest block, up to 128 KiB: 13), and once
+/// extensions have grown the region, it serves a block of half of it and
+/// takes it back.
+func wide_table() unsafe {
+    let first: UInt = 2048
+    let expect = largest(&sized(40 * first, 64 * first))
+    var heap = sized(first, 64 * first)
+    heap.free(heap.alloc(1, 1))
+    check(class_count(&heap) == 13, "the table is sized for its largest")
+    var n = 1
+    while n < 40 {
+        heap.extend(by: first)
+        n = n + 1
+    }
+    check(largest(&heap) == expect, "the extensions make one block")
+    let half = heap.alloc(32 * first, 1)
+    check(half != 0 && half + 32 * first <= heap.base + heap.size,
+          "half of the table's largest is served")
+    fill(half, 32 * first, 0x6B)
+    heap.free(half)
+    check(largest(&heap) == expect, "and taken back")
+}
+
+/// A table sized for 4 KiB, its region extended to 64 KiB: a 40 KiB block is
+/// past the table's top class, so it comes from the last list, and its alloc
+/// and free write nothing past the table. The control block's words read
+/// the same after the free as before the alloc, and a block just past the
+/// table, where a list head past the table would land, keeps its bytes. A
+/// table sized for less than a block has one class.
+func past_the_table() unsafe {
+    var heap = sized(4096, 4096)
+    let front = heap.alloc(256, 1)
+    check(front != 0, "the first block is served")
+    fill(front, 256, 0xA5)
+    var n = 1
+    while n < 16 {
+        heap.extend(by: 4096)
+        n = n + 1
+    }
+    let words = 2 + class_count(&heap) * 5
+    check(words <= 64, "the control block fits the copy")
+    var before: [UInt; 64] = [0; 64]
+    var i: UInt = 0
+    while i < words {
+        before[Int.from(truncating: i)] = control_word(&heap, i)
+        i = i + 1
+    }
+    let block = heap.alloc(40 * 1024, 1)
+    check(block != 0 && block + 40 * 1024 <= heap.base + heap.size,
+          "a block past the table's top is served")
+    fill(block, 40 * 1024, 0x3C)
+    check(intact(front, 256, 0xA5), "the block past the table kept")
+    heap.free(block)
+    i = 0
+    while i < words {
+        check(control_word(&heap, i) == before[Int.from(truncating: i)],
+              "the control block reads unchanged")
+        i = i + 1
+    }
+    check(intact(front, 256, 0xA5), "and still kept after the free")
+    check(heap.alloc(40 * 1024, 1) == block, "the block is served again")
+
+    // One class is seven words; with a header, on the granule, 64 bytes.
+    let none = sized(4096, 0)
+    check(largest(&none) == 4096 - 64 - WORD && class_count(&none) == 1,
+          "a table sized for nothing has one class, and its last list serves")
+}
+
+/// `extend` merges the new bytes with a free last block, and appends them
+/// after a used one as a block whose header was the old sentinel's, so the
+/// used block merges into it when freed. Both write every word they rely
+/// on, so they work over garbage. A granule is too few for a block, and an
+/// extension after one is a block of its own. A heap not made yet, or made
+/// over a region too small for a block, takes the new bytes as a fresh heap
+/// over the whole region would.
+func extend_joins() unsafe {
+    var junk = garbage(4096)
+    let whole_junk = largest(&junk)
+    let used = junk.alloc(whole_junk, 1)
+    junk.extend(by: 4096)
+    let more = junk.alloc(4096 - WORD, 1)
+    check(used != 0 && more == junk.base + 4096, "an extension over garbage")
+    junk.free(more)
+    junk.free(used)
+    junk.extend(by: 4096)
+    check(largest(&junk) == whole_junk + 8192, "merges over garbage")
+
+    let all = largest(&sized(4096, 65_536))
+    let grown = largest(&sized(8192, 65_536))
+    check(grown == all + 4096, "a heap of 8 KiB serves 4 KiB more")
+
+    var merging = sized(4096, 65_536)
+    merging.free(merging.alloc(1, 1))
+    merging.extend(by: 4096)
+    check(largest(&merging) == grown, "a free last block merges")
+
+    var appending = sized(4096, 65_536)
+    let whole = appending.alloc(all, 1)
+    check(whole != 0, "the whole region is served")
+    appending.extend(by: 4096)
+    let new = appending.alloc(4096 - WORD, 1)
+    check(new == appending.base + 4096,
+          "a used last block has the new block after it")
+    check(appending.alloc(1, 1) == 0, "and nothing else is free")
+    appending.free(new)
+    appending.free(whole)
+    check(largest(&appending) == grown, "the used block merges into it")
+
+    var sliver = sized(4096, 65_536)
+    let full = sliver.alloc(all, 1)
+    sliver.extend(by: WORD)
+    sliver.extend(by: WORD)
+    check(sliver.alloc(1, 1) == 0, "a granule is no block")
+    sliver.extend(by: 4096)
+    check(largest(&sliver) == 4096 - WORD, "the next extension is a block")
+    sliver.free(full)
+    check(sliver.alloc(4096 - WORD, 1) == sliver.base + 4096 + GRAIN,
+          "past the granule")
+    check(sliver.alloc(all, 1) == full, "which the freed block stops at")
+
+    var unmade = sized(4096, 65_536)
+    unmade.extend(by: 4096)
+    check(largest(&unmade) == grown, "a heap not made yet")
+    var nothing = UnsafeHeap(base: 0, size: 0, largest: 0)
+    nothing.extend(by: 0)
+    check(nothing.size == 0, "a heap over no region reads none")
+
+    let small = largest(&sized(4271, 175))
+    var empty = sized(175, 175)
+    check(empty.alloc(1, 1) == 0 && class_count(&empty) != 0,
+          "a heap made with no block")
+    empty.extend(by: 4096)
+    check(largest(&empty) == small, "gains its first block")
+}
+
+/// `holds` takes the last block after an extension, one whose end is the
+/// region's end on the granule and one in a region ending off it, and
+/// refuses what lies past the new end.
+func holds_extended() unsafe {
+    var heap = sized(4096, 65_536)
+    let used = heap.alloc(largest(&heap), 1)
+    heap.extend(by: 4096)
+    let last = heap.alloc(4096 - WORD, 1)
+    check(used != 0 && last + 4096 == heap.base + heap.size,
+          "the new last block ends on the region's end")
+    check(heap.holds(last), "and is held")
+    heap.extend(by: 4100)
+    let end = heap.base + heap.size
+    let tail = heap.alloc(4096 - WORD, 1)
+    check(tail != 0 && tail + 4096 == end - 4, "a region off the granule")
+    check(heap.holds(tail), "holds its last block")
+    check(not heap.holds(end - 4), "the sentinel is no block")
+    UnsafeMemory<UInt, Normal>(end - 4 + GRAIN - WORD).write(MIN_BLOCK)
+    check(not heap.holds(end - 4 + GRAIN), "past the new end is no block")
+    UnsafeMemory<UInt, Normal>(tail + 64 - WORD).write(4096)
+    check(not heap.holds(tail + 64), "a block past the new end")
+    UnsafeMemory<UInt, Normal>(tail + 64 - WORD).write(MIN_BLOCK)
+    check(heap.holds(tail + 64), "a plausible header inside it is not")
+}
+
+/// Random requests and frees as `random_churn`'s, over a table sized for
+/// 4 KiB whose region is extended every thousand steps, with requests large
+/// enough for blocks past the table's top class.
+func random_extended() unsafe {
+    var heap = sized(4096, 4096)
+    let base = region_base()
+    var blocks: [UInt; 64] = [0; 64]
+    var sizes: [UInt; 64] = [0; 64]
+    let aligns: [UInt; 8] = [1, 2, 4, 8, 16, 32, 64, 24]
+    var seed: UInt = 54_321
+    var served = 0
+    var past = 0
+    var step = 0
+    while step < 200_000 {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        if step % 1000 == 999 {
+            heap.extend(by: 768 + ((seed >> 40) % 8) * WORD)
+        }
+        let slot = Int.from(truncating: (seed >> 33) % 64)
+        let tag = UInt8.from(truncating: slot + 1)
+        if blocks[slot] != 0 {
+            check(intact(blocks[slot], sizes[slot], tag), "a live block kept")
+            heap.free(blocks[slot])
+            blocks[slot] = 0
+        } else {
+            let size = if (seed >> 12) % 16 == 0 {
+                1 + (seed >> 20) % 12_000
+            } else {
+                1 + (seed >> 20) % 700
+            }
+            let align = aligns[Int.from(truncating: (seed >> 50) % 8)]
+            let block = heap.alloc(size, align)
+            if block != 0 {
+                check(block % align == 0, "a random block is aligned")
+                check(block >= base && block + size <= base + heap.size,
+                      "a random block is inside the region")
+                var other = 0
+                while other < 64 {
+                    if blocks[other] != 0 {
+                        check(block + size <= blocks[other] ||
+                              blocks[other] + sizes[other] <= block,
+                              "random blocks are disjoint")
+                    }
+                    other = other + 1
+                }
+                fill(block, size, tag)
+                blocks[slot] = block
+                sizes[slot] = size
+                served = served + 1
+                if size > 8192 {
+                    past = past + 1
+                }
+            }
+        }
+        step = step + 1
+    }
+    check(served > 50_000, "most random requests are served")
+    check(past > 100, "blocks past the table's top are served")
+    var i = 0
+    while i < 64 {
+        if blocks[i] != 0 {
+            heap.free(blocks[i])
+        }
+        i = i + 1
+    }
+    let all = largest(&heap)
+    check(all == largest(&sized(heap.size, 4096)),
+          "the extended region gives every byte back")
+}
+
 func main() {
     tiny_regions()
     over_garbage()
@@ -662,4 +910,9 @@ func main() {
     control_block_frees()
     last_block_held()
     random_churn()
+    wide_table()
+    past_the_table()
+    extend_joins()
+    holds_extended()
+    random_extended()
 }
