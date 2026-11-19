@@ -6,7 +6,9 @@
 //!
 //! The steps, in order (the launch convention, spec §12):
 //!
-//!   derive     derive its Process handle and drain its rows into a BootSet;
+//!   derive     `sosmain`'s start-up adopts its System, derives its Process
+//!              handle and its main thread's own Thread handle and drains its
+//!              rows into a BootSet, which root takes;
 //!   create     create every child from its image blob and destination, and
 //!              release both rows;
 //!   setup      make each `[[setup]]` write: carve the register's window from
@@ -23,9 +25,16 @@
 //!              and connection end root still holds, and wait for the
 //!              children's ends.
 //!
-//! A step that fails prints `root: STEP WHO: STATUS` (WHO is the child, with
-//! the record's tag for a give; the register for a setup write; or `root`)
-//! and stops the machine with status 1. A child's end is reported as
+//! Root is written with `main`: it reaches its System and Process through
+//! `sosmain.context()`, and has no console record, so its lines go through the
+//! debug print. It stops the machine itself rather than returning from
+//! `main`, which would exit through its Process and add the kernel's teardown
+//! line to every transcript.
+//!
+//! A refusal at `derive` is the start-up's panic, which names it. A later step
+//! that fails prints `root: STEP WHO: STATUS` (WHO is the child, with the
+//! record's tag for a give; the register for a setup write; or `root`) and
+//! stops the machine with status 1. A child's end is reported as
 //! `root: NAME ended status=WORD`, the §8 status word. Root stops the machine
 //! when a child whose image entry says `on-exit = "shutdown"` ends, with its
 //! exit code if it exited and 1 if it did not, and with 0 when every child has
@@ -38,11 +47,12 @@
 //!
 //! Root's heap holds the plan and its own bookkeeping (its children, the
 //! connections' ends and the device rows it holds as windows), each vector
-//! made once at the length the plan gives it. Nothing else allocates, a
-//! stop's message included, and the builder links root with an arena of
-//! exactly that sum and a margin (`sosimage.plan.root_arena`). So a count
-//! the plan has short is a panic naming it, and a bookkeeping vector that
-//! would grow is a panic too (`Exact`), never arena the builder did not size.
+//! made once at the length the plan gives it. Nothing else allocates, the
+//! start-up's drain and a stop's message included, and the builder links root
+//! with an arena of exactly that sum and a margin (`sosimage.plan.root_arena`).
+//! So a count the plan has short is a panic naming it, and a bookkeeping
+//! vector that would grow is a panic too (`Exact`), never arena the builder
+//! did not size.
 
 import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet,
             WaitResult, BootSet, BootHandle, SosStatus, SystemRight,
@@ -51,6 +61,7 @@ import bootplan.{Plan, Child, Record, Source, Setup, SetupOp, QuotaName, RightNa
                  setup_word, reads_first, PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS,
                  ROW_WINDOW_WORDS}
 import imageplan
+import sosmain
 import std.alloc.{GlobalAllocator}
 
 /// The machine's status when every child has ended.
@@ -122,32 +133,33 @@ struct Stop {
     status: SosStatus
 }
 
-@export("_start")
-func _start(boot_handle: UInt) {
-    let system = System(boot_handle: boot_handle)
+func main() -> Result<Void, SosStatus> {
     let plan = imageplan.plan()
-    let code = try run(&system, &plan) catch {
-        if let tag = error.record {
-            print("root: {} {} record {}: {}", error.step, error.who, tag, error.status)
-        } else {
-            print("root: {} {}: {}", error.step, error.who, error.status)
+    borrow let system = sosmain.context().system() {
+        borrow let proc = sosmain.context().process() {
+            let code = try run(&system, &proc, &plan) catch {
+                if let tag = error.record {
+                    print("root: {} {} record {}: {}", error.step, error.who, tag,
+                          error.status)
+                } else {
+                    print("root: {} {}: {}", error.step, error.who, error.status)
+                }
+                EXIT_STOPPED
+            }
+            try system.shutdown(code)
         }
-        let _ = system.shutdown(EXIT_STOPPED)
-        return
     }
-    let _ = system.shutdown(code)
+    return
 }
 
 func stop(step: String, who: String, status: SosStatus) -> Stop {
     Stop(step: step, who: who, record: None, status: status)
 }
 
-/// Every step; answers the machine's status.
-func run(system: &System, plan: &Plan) -> Result<UInt, Stop> {
-    let (proc, set) = try derive(&system) catch {
-        return stop("derive", "root", error)
-    }
-    var rows = Rows(set: move set, room: plan.windows, tags: exact<UInt>(plan.windows),
+/// Every step after `derive`; answers the machine's status.
+func run(system: &System, proc: &Process, plan: &Plan) -> Result<UInt, Stop> {
+    var rows = Rows(set: sosmain.take_boot_set(), room: plan.windows,
+                    tags: exact<UInt>(plan.windows),
                     windows: exact<IoMemory?>(plan.windows))
 
     var children = exact<Process>(plan.children.len())
@@ -218,13 +230,6 @@ func run(system: &System, plan: &Plan) -> Result<UInt, Stop> {
         return stop("supervise", "root", error)
     }
     return code
-}
-
-/// Root's Process handle, and its rows drained.
-func derive(system: &System) -> Result<(Process, BootSet), SosStatus> {
-    let proc = try system.process_self()
-    let set = try BootSet(process: &proc)
-    return (move proc, move set)
 }
 
 /// Root's rows: the boot set, and the device rows taken out of it, each kept

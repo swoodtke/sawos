@@ -9677,11 +9677,13 @@ TEST_CASES = [
     # with its message: `root: STEP WHO: STATUS`. A plan of the case's own
     # reaches what the builder's plan never would.
     #
-    # Its table full at entry (three handles and 29 rows), root cannot derive
-    # its Process handle.
+    # Its table full at entry (three handles and 29 rows), root's start-up
+    # cannot derive its Process handle, and panics naming the refusal.
     _stock_stop("stock_stop_derive", {"children": []},
-                "root: derive root: no room for what was asked",
-                spare_rows=29, limits=_SPARE_ROW_LIMITS),
+                _panic_fault("{zero}", "panic at lib.saw:",
+                             ": sos: no process handle: no room for what was "
+                             "asked"),
+                EXIT_PANIC, spare_rows=29, limits=_SPARE_ROW_LIMITS),
     # The image row is the other child's destination, which holds no image.
     _stock_stop("stock_stop_create",
                 {"children": [dict(_STOCK_START, image=3, destination=2)]},
@@ -9692,14 +9694,15 @@ TEST_CASES = [
                 {"children": [dict(_STOCK_START, quota={"mappings": 200})]},
                 "root: quota first: no room for what was asked",
                 children=[CHILD_BYE_PKG]),
-    # The console's row and 27 of no bytes: root's table is full once it has
-    # derived its Process handle, and the write's carve finds no room.
+    # The console's row and 26 of no bytes: root's table is full once its
+    # start-up has derived its Process handle and its main thread's own
+    # Thread handle, and the write's carve finds no room.
     _stock_stop("stock_stop_setup",
                 {"setup": [{"register": "UART0.SCRATCH", "row": 0,
                             "offset": 4, "len": 4, "at": 0, "op": "set",
                             "value": 0}]},
                 "root: setup UART0.SCRATCH: no room for what was asked",
-                device=True, spare_rows=27, limits=_SPARE_ROW_LIMITS),
+                device=True, spare_rows=26, limits=_SPARE_ROW_LIMITS),
     # A `Handle` row of one, and two records to give.
     _stock_stop("stock_stop_give",
                 {"children": [dict(_STOCK_START, quota={"handles": 1},
@@ -9712,11 +9715,11 @@ TEST_CASES = [
                 {"children": [dict(_STOCK_START, quota={"threads": 0})]},
                 "root: start first: this process is at its quota",
                 children=[CHILD_BYE_PKG]),
-    # 28 rows of no bytes, which root still holds when it makes its Waiter:
+    # 27 rows of no bytes, which root still holds when it makes its Waiter:
     # its table is full.
     _stock_stop("stock_stop_supervise", {"children": []},
                 "root: supervise root: no room for what was asked",
-                spare_rows=28, limits=_SPARE_ROW_LIMITS),
+                spare_rows=27, limits=_SPARE_ROW_LIMITS),
 
     # A child whose end stops the machine: with its exit code when it exits
     # (`tests/child-bye`, 5), and with 1 when it does not. Started with the

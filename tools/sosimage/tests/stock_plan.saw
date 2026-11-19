@@ -502,11 +502,11 @@ func main() {
         assert((g.quota.get(1)!).kind == 2 && (g.quota.get(1)!).limit == 3, "waiters raised")
     }
 
-    // The box against a 32-entry table: root peaks at 18 (13 rows), at its
-    // first create, and a table of 17 refuses it there.
+    // The box against a 32-entry table: root peaks at 19 (13 rows), at its
+    // first create, and a table of 18 refuses it there.
     assert(fits(&box, 32, 28).is_empty(), "the box fits 32")
-    assert(fits(&box, 18, 28).is_empty(), "the box fits 18")
-    assert(fits(&box, 17, 28).equals("box.toml: the stock root would hold 18 handles at `create gpio`, past MAX_HANDLES (17)"), "18 at the first create")
+    assert(fits(&box, 19, 28).is_empty(), "the box fits 19")
+    assert(fits(&box, 18, 28).equals("box.toml: the stock root would hold 19 handles at `create gpio`, past MAX_HANDLES (18)"), "19 at the first create")
     // A child whose `Handle` row is short of what it holds when it starts:
     // the controller holds 5 (its four records and its Process handle).
     assert(fits(&box, 32, 4).equals("box.toml: the process controller's `Handle` row is 4, short of the 5 handles it holds when it starts"), "a short row")
@@ -526,35 +526,36 @@ func main() {
     // A test image's child is held to no floor.
     expect_checked(quota_plan.replace("QUOTA", "\{\"handles\": 0\}"), 32, "")
 
-    // Root's table at each step. No children: 4 after derive, 5 with the
-    // Waiter.
-    expect_checked("\{\"children\": []\}", 3,
-                   "p.json: the stock root would hold 4 handles at `derive`, past MAX_HANDLES (3)")
+    // Root's table at each step. No children: 5 after derive (its three boot
+    // handles, and the Process handle and main thread's own Thread handle its
+    // start-up derives), 6 with the Waiter.
     expect_checked("\{\"children\": []\}", 4,
-                   "p.json: the stock root would hold 5 handles at `supervise`, past MAX_HANDLES (4)")
-    expect_checked("\{\"children\": []\}", 5, "")
-    // A child: two rows, 6 after derive, 7 as it is created, then 5.
-    expect_checked(one_child("", 0), 6,
-                   "p.json: the stock root would hold 7 handles at `create c`, past MAX_HANDLES (6)")
-    // Two: 8, 9 at the first create, then 7; 8 at the second, then 6.
-    expect_checked("\{\"children\": [\{\"name\": \"a\", \"image\": 0, \"destination\": 2, \"start\": 1\}, \{\"name\": \"b\", \"image\": 1, \"destination\": 3, \"start\": 1\}]\}", 9, "")
-    // A setup write's carve and mapping: 6.
-    expect_checked("\{\"setup\": [\{\"register\": \"R\", \"row\": 0, \"offset\": 0, \"len\": 4, \"at\": 0, \"op\": \"write\", \"value\": 1\}]\}", 5,
-                   "p.json: the stock root would hold 6 handles at `setup R`, past MAX_HANDLES (5)")
-    // A server end made (7) and given (6): with a second (8, then 7) root
-    // fits 8, and the Waiter is its eighth.
+                   "p.json: the stock root would hold 5 handles at `derive`, past MAX_HANDLES (4)")
+    expect_checked("\{\"children\": []\}", 5,
+                   "p.json: the stock root would hold 6 handles at `supervise`, past MAX_HANDLES (5)")
+    expect_checked("\{\"children\": []\}", 6, "")
+    // A child: two rows, 7 after derive, 8 as it is created, then 6.
+    expect_checked(one_child("", 0), 7,
+                   "p.json: the stock root would hold 8 handles at `create c`, past MAX_HANDLES (7)")
+    // Two: 9, 10 at the first create, then 8; 9 at the second, then 7.
+    expect_checked("\{\"children\": [\{\"name\": \"a\", \"image\": 0, \"destination\": 2, \"start\": 1\}, \{\"name\": \"b\", \"image\": 1, \"destination\": 3, \"start\": 1\}]\}", 10, "")
+    // A setup write's carve and mapping: 7.
+    expect_checked("\{\"setup\": [\{\"register\": \"R\", \"row\": 0, \"offset\": 0, \"len\": 4, \"at\": 0, \"op\": \"write\", \"value\": 1\}]\}", 6,
+                   "p.json: the stock root would hold 7 handles at `setup R`, past MAX_HANDLES (6)")
+    // A server end made (8) and given (7): with a second (9, then 8) root
+    // fits 9, and the Waiter is its ninth.
     let outlets = "\{\"tag\": 2, \"source\": \"outlet\", \"from\": 0\}, \{\"tag\": 3, \"source\": \"outlet\", \"from\": 1\}"
-    expect_checked(one_child(outlets, 2), 8, "")
-    // A row given away (4) leaves room for both connections in 7.
-    expect_checked(one_child("\{\"tag\": 4, \"source\": \"row\", \"from\": 0\}, {outlets}", 2), 7, "")
-    // An inlet: the connection made (7) and an inlet minted from it (8).
-    expect_checked(one_child("\{\"tag\": 2, \"source\": \"inlet\", \"from\": 0\}", 1), 7,
-                   "p.json: the stock root would hold 8 handles at `give c record 2`, past MAX_HANDLES (7)")
+    expect_checked(one_child(outlets, 2), 9, "")
+    // A row given away (5) leaves room for both connections in 8.
+    expect_checked(one_child("\{\"tag\": 4, \"source\": \"row\", \"from\": 0\}, {outlets}", 2), 8, "")
+    // An inlet: the connection made (8) and an inlet minted from it (9).
+    expect_checked(one_child("\{\"tag\": 2, \"source\": \"inlet\", \"from\": 0\}", 1), 8,
+                   "p.json: the stock root would hold 9 handles at `give c record 2`, past MAX_HANDLES (8)")
     // A connection is made once, whoever takes its ends.
-    expect_checked(one_child("\{\"tag\": 2, \"source\": \"outlet\", \"from\": 0\}, \{\"tag\": 3, \"source\": \"inlet\", \"from\": 0\}, \{\"tag\": 4, \"source\": \"inlet\", \"from\": 0\}", 1), 7, "")
-    // The second connection made: 8.
-    expect_checked(one_child(outlets, 2), 7,
-                   "p.json: the stock root would hold 8 handles at `give c record 3`, past MAX_HANDLES (7)")
+    expect_checked(one_child("\{\"tag\": 2, \"source\": \"outlet\", \"from\": 0\}, \{\"tag\": 3, \"source\": \"inlet\", \"from\": 0\}, \{\"tag\": 4, \"source\": \"inlet\", \"from\": 0\}", 1), 8, "")
+    // The second connection made: 9.
+    expect_checked(one_child(outlets, 2), 8,
+                   "p.json: the stock root would hold 9 handles at `give c record 3`, past MAX_HANDLES (8)")
 
     // A test image's plan, read: every key, and each refusal.
     let full = match read_plan("\{\"connections\": 1, \"children\": [\{\"name\": \"a\", \"image\": 2, \"destination\": 3, \"start\": 5, \"shutdown\": true, \"quota\": \{\"waiters\": 1, \"handles\": 6\}, \"records\": [\{\"tag\": 5, \"source\": \"system\"\}, \{\"tag\": 6, \"source\": \"carve\", \"from\": 4, \"offset\": 12, \"len\": 8\}]\}], \"setup\": [\{\"register\": \"D.R\", \"row\": 4, \"offset\": 16, \"len\": 4, \"at\": 0, \"op\": \"clear\", \"value\": 2\}]\}") {

@@ -95,6 +95,10 @@ import sosimage.rules.{refused}
 /// Process and Thread.
 static ROOT_BOOT_HANDLES: Int = 3
 
+/// The handles `sosmain`'s start-up derives for root before `main` runs: its
+/// Process handle and its main thread's own Thread handle.
+static ROOT_START_HANDLES: Int = 2
+
 
 /// `QuotaKind.Thread`'s value.
 static QUOTA_THREAD: Int = 0
@@ -692,8 +696,9 @@ func has_console(child: &PlanChild) -> Bool {
 }
 
 /// Refuses a step of `plan` at which root would hold more than `table`
-/// handles, as `root/` takes them: its boot handles and one per row, its own
-/// Process handle, each child created and its two rows released, each setup
+/// handles, as `root/` takes them: its boot handles and one per row, the
+/// Process handle and the main thread's own Thread handle its start-up
+/// derives, each child created and its two rows released, each setup
 /// write's carve and mapping, each record made and given, and its Waiter,
 /// made before it releases what is left of the rows and connections. Refuses
 /// one at which the objects of a kind would number more than `slabs` holds:
@@ -712,7 +717,8 @@ func root_steps(plan: &ImagePlan, table: Int, slabs: &PlanSlabs,
         }
         d = d + 1
     }
-    var steps = Steps(held: ROOT_BOOT_HANDLES + 2 * count + plan.rows.len() + 1,
+    var steps = Steps(held: ROOT_BOOT_HANDLES + 2 * count + plan.rows.len() +
+                            ROOT_START_HANDLES,
                       made: Vector<Bool>(), iomemories: devices, pipes: 0, interrupts: 0,
                       slabs: slabs)
     try within(steps.held, table, what, "derive")
