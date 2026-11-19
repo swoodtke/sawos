@@ -1,0 +1,142 @@
+// A UART driver given two of its three records ends with its own line naming
+// the one it lacks, and status 1.
+//
+// Root launches the board's `svc-uart-*` driver three times in one region,
+// each time without a different record: the window under 22, the server end
+// under 23, the interrupt line under 24. Each launch is waited out and its
+// status word printed:
+//
+//   SOS uartmissing: <round> ended status=<word>
+//
+// `Exited` (1) << 16 | 1 for each: the driver's own stop, not a panic or a
+// fault. This image's kernel arms no tick, so root parks in each wait and the
+// driver's death brings it back: the driver's line and the kernel's exit line
+// come before root's by construction.
+
+import sos.{System, Process, Memory, IoMemory, WaitResult, SystemRight,
+            SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Revoked
+
+/// The tags the driver's declaration names (`process.toml`).
+static TAG_BOOT: UInt = 21
+static TAG_WINDOW: UInt = 22
+static TAG_OUTLET: UInt = 23
+static TAG_LINE: UInt = 24
+
+static KEY_DEATH: UInt = 6
+
+// The console UART's interrupt line on the board this image runs on, answered
+// by the target's own C file (`tests/irq-lines`).
+extern "C" {
+    func driver_irq_line() -> UInt
+}
+
+/// What the driver may ask its System for.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS uartmissing: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS uartmissing: failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS uartmissing: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// The boot set, in the build's row order: the driver's image, its region,
+/// then the console's register page, an `IoMemory`. Each round gives the
+/// driver a sibling of the window, so root keeps the page throughout.
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var img_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var window_rec = try proc.boot_handle_next()
+    guard let img = img_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let window = window_rec.take_iomemory() else { return BUG }
+
+    try round(&system, &proc, &img, &ram, &window, "no window", false, true,
+              true)
+    try round(&system, &proc, &img, &ram, &window, "no server end", true,
+              false, true)
+    try round(&system, &proc, &img, &ram, &window, "no line", true, true,
+              false)
+    return
+}
+
+/// One launch of the driver with its System and the records the flags name,
+/// waited out. A line is bound per round and goes with the driver.
+func round(system: &System, proc: &Process, img: &Memory, ram: &Memory,
+           window: &IoMemory, name: String, give_window: Bool,
+           give_outlet: Bool, give_line: Bool) -> Result<Void, SosStatus> {
+    let driver = try system.process_create(image: &img, memory: &ram)
+    if give_window {
+        let sibling = try window.mint()
+        try driver.give(iomemory: move sibling, tag: TAG_WINDOW) catch {
+            let (why, back) = move error
+            let _ = move back
+            return why
+        }
+    }
+    if give_outlet {
+        let pair = try proc.pipe_create()
+        let (inlet, outlet) = move pair
+        let _ = move inlet
+        try driver.give(outlet: move outlet, tag: TAG_OUTLET) catch {
+            let (why, back) = move error
+            let _ = move back
+            return why
+        }
+    }
+    if give_line {
+        let line = try system.interrupt_bind(line: driver_irq_line())
+        try driver.give(interrupt: move line, tag: TAG_LINE) catch {
+            let (why, back) = move error
+            let _ = move back
+            return why
+        }
+    }
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try driver.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try driver.start(boot_tag: TAG_BOOT)
+    ended(&proc, move driver, name)
+}
+
+/// Wait for `driver`'s death and print its status word; the handle goes with
+/// it, so the next round's driver takes the same region.
+func ended(proc: &Process, driver: Process,
+           name: String) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &driver, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    if wake.key != KEY_DEATH {
+        return BUG
+    }
+    print("SOS uartmissing: {} ended status={}", name, status_of(&wake))
+    return
+}
+
+/// The §8 status word out of a wait record.
+func status_of(r: &WaitResult) -> UInt {
+    match r.what {
+        case Process(status) -> status,
+        case _ -> panic("this record was supposed to be the driver's"),
+    }
+}

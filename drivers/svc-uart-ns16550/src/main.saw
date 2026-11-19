@@ -33,14 +33,20 @@
 // it for abandonment (§2.1's opt-in early notice) with a one-shot attach; the
 // IRQ eventually makes an answer possible.
 //
+// It is written with `main`: `sosmain`'s start-up adopts its System, derives
+// its Process and drains its boot set, from which `main` takes the window, the
+// server end and the line by tag. When it serves an image's console it has no
+// console record, so its own lines go through the debug print.
+//
 // Nothing is printed until the loop is over. Every printed byte is one `ecall`
 // through the debug seam, and this file reports an exact trap count, so a line
 // inside the measured window would make the number depend on its own prose.
 
-import sos.{System, Process, Interrupt, Waiter, WaitResult, WaitPayload,
+import sos.{BootSet, IoMemory, Interrupt, Waiter, WaitResult, WaitPayload,
             PipeOutlet, PipeRequest, PipeMsg, AttachMode, ReplyWaitError,
             SosStatus, PIPE_BODY_BYTES}
 import uartproto.{UartOp, UartStatus, UartBody, Frame, BODY_BYTES}
+import sosmain
 
 static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
 
@@ -249,6 +255,11 @@ extension Pending {
 // The serve loop
 // =============================================================================
 
+/// The tags its declaration gives its records (`process.toml`).
+static TAG_WINDOW: UInt = 22
+static TAG_OUTLET: UInt = 23
+static TAG_LINE: UInt = 24
+
 /// The keys. Distinct words, and the pending band is a base plus the slot, so
 /// an abandoned delivery says which held obligation it is about without a
 /// second table.
@@ -260,14 +271,14 @@ static KEY_HELD: UInt = 100
 /// error channel means an assertion in this file failed rather than a call did.
 static BUG: SosStatus = SosStatus.BadImage
 
-static EXIT_OK: UInt = 0
-static EXIT_FAILED: UInt = 1
+static EXIT_OK: Int = 0
+static EXIT_FAILED: Int = 1
 
 /// What one serving run answers with.
 ///
 /// The measured window splits by what the server did, not by what the client
 /// sent: an answered message costs one trap, a discarded one two (see
-/// `_start`).
+/// `main`).
 struct Report {
     messages: Int,
     abandoned: Int,
@@ -294,22 +305,31 @@ func kind_of(r: &WaitResult) -> Int {
     }
 }
 
-@export("_start")
-func _start(boot_handle: UInt) {
-    let system = System(boot_handle: boot_handle)
-
-    // §12's symmetry: a child bootstraps exactly as root does. A failure here
-    // cannot report through `exit`, because `exit` is the op on the handle that
-    // just failed to arrive.
-    let proc = try system.process_self() catch {
-        print("SOS uartsvc drv: no process handle: {}\n", error)
-        return
+func main() -> Int {
+    var set = sosmain.take_boot_set()
+    // A record is a record: whether the kernel or a launcher queued it is not
+    // something the receiver can tell or needs to.
+    guard let window = take_window(&var set) else {
+        print("SOS uartsvc drv: no IoMemory under tag {}\n", TAG_WINDOW)
+        return EXIT_FAILED
+    }
+    // The server end arrives the same way the window does, a capability under
+    // a launcher's tag, and this driver can no more name its clients than it
+    // could name its device's previous owner.
+    guard let outlet = take_outlet(&var set) else {
+        print("SOS uartsvc drv: no PipeOutlet under tag {}\n", TAG_OUTLET)
+        return EXIT_FAILED
+    }
+    // The line arrives the same way, an Interrupt its launcher bound and gave
+    // under a tag. The object is waitable, and this handle is its one name.
+    guard let irq = take_line(&var set) else {
+        print("SOS uartsvc drv: no Interrupt under tag {}\n", TAG_LINE)
+        return EXIT_FAILED
     }
 
-    let done = try run(&proc) catch {
+    let done = try run(move window, move outlet, move irq) catch {
         print("SOS uartsvc drv: failed: {}\n", error)
-        let _ = proc.exit(EXIT_FAILED)
-        return
+        return EXIT_FAILED
     }
 
     // Every line below is outside the measured window, which the closing
@@ -340,30 +360,34 @@ func _start(boot_handle: UInt) {
         // it answers.
         print("SOS uartsvc drv: one trap per answered message, two per discarded\n")
     }
-    let _ = proc.exit(EXIT_OK)
+    EXIT_OK
 }
 
-/// Obtain the device, wire the Waiter, and serve until every client is gone.
+/// The device's window, under `TAG_WINDOW`.
+func take_window(set: &var BootSet) -> IoMemory? {
+    guard var record = set.take(TAG_WINDOW) else { return None }
+    record.take_iomemory()
+}
+
+/// The connection's server end, under `TAG_OUTLET`.
+func take_outlet(set: &var BootSet) -> PipeOutlet? {
+    guard var record = set.take(TAG_OUTLET) else { return None }
+    record.take_outlet()
+}
+
+/// The device's interrupt line, under `TAG_LINE`.
+func take_line(set: &var BootSet) -> Interrupt? {
+    guard var record = set.take(TAG_LINE) else { return None }
+    record.take_interrupt()
+}
+
+/// Map the device, wire the Waiter, and serve until every client is gone.
 ///
-/// One phase per function, to stay under `hal.ROOT_STACK_LEN`.
-func run(proc: &Process) -> Result<Report, SosStatus> {
-    // Obtain the window. A record is a record: whether the kernel or a launcher
-    // queued it is not something the receiver can tell or needs to.
-    var window_rec = try proc.boot_handle_next()
-    guard let window = window_rec.take_iomemory() else { return BUG }
-    let _mapping = try proc.map(iomemory: &window)
-
-    // The server end arrives the same way the window does, a capability under a
-    // launcher's tag, and this driver can no more name its clients than it
-    // could name its device's previous owner.
-    var outlet_rec = try proc.boot_handle_next()
-    guard let outlet = outlet_rec.take_outlet() else { return BUG }
-
-    // The line arrives the same way, an Interrupt its launcher bound and gave
-    // under a tag. The object is waitable, and this handle is its one name.
-    var irq_rec = try proc.boot_handle_next()
-    guard let irq = irq_rec.take_interrupt() else { return BUG }
-    let waiter = try proc.waiter_create()
+/// One phase per function, to keep each frame small.
+func run(window: IoMemory, outlet: PipeOutlet,
+         irq: Interrupt) -> Result<Report, SosStatus> {
+    let _mapping = try sosmain.context().process().map(iomemory: &window)
+    let waiter = try sosmain.context().process().waiter_create()
     try waiter.add(&irq, KEY_IRQ)
 
     // The consuming, persistent attach. `give` rather than `add`: the wrapper
@@ -381,7 +405,7 @@ func run(proc: &Process) -> Result<Report, SosStatus> {
     let uart = Uart(at: UART_BASE)
     uart.listen()
 
-    let done = try serve(&waiter, &proc, &uart, &irq)
+    let done = try serve(&waiter, &uart, &irq)
     let _ = move window
     return move done
 }
@@ -464,7 +488,7 @@ func answer_read(request: PipeRequest, b: UInt8, input: &var InBuf,
 }
 
 /// The measured loop. One `wait` opens it, then one op per delivery.
-func serve(waiter: &Waiter, proc: &Process, uart: &Uart,
+func serve(waiter: &Waiter, uart: &Uart,
            irq: &Interrupt) -> Result<Report, SosStatus> {
     var held = Pending.empty()
     var input = InBuf.empty()
@@ -576,7 +600,7 @@ func serve(waiter: &Waiter, proc: &Process, uart: &Uart,
                             // message: `answer` discharges it and parks for
                             // the next.
                             if not window.marked {
-                                let now = try proc.stats()
+                                let now = try sosmain.context().process().stats()
                                 window.open(now.syscalls)
                             }
                             let n = body.ok()
@@ -592,7 +616,7 @@ func serve(waiter: &Waiter, proc: &Process, uart: &Uart,
         }
     }
 
-    let after = try proc.stats()
+    let after = try sosmain.context().process().stats()
     var traps: UInt64 = 0
     if window.marked && after.syscalls >= window.syscalls {
         traps = after.syscalls - window.syscalls

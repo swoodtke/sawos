@@ -760,6 +760,7 @@ CHILD_WAITABLE_PKG = os.path.join(TESTS_DIR, "child-waitable")
 # datasheet.
 UART_SERVICE_PKG = os.path.join(TESTS_DIR, "uart-service")
 UART_CANCEL_PKG = os.path.join(TESTS_DIR, "uart-cancel")
+UART_MISSING_PKG = os.path.join(TESTS_DIR, "uart-missing")
 SVC_UART_NS16550_PKG = os.path.join(DRIVERS_DIR, "svc-uart-ns16550")
 SVC_UART_PL011_PKG = os.path.join(DRIVERS_DIR, "svc-uart-pl011")
 SVC_CLIENT_PKG = os.path.join(TESTS_DIR, "svc-client")
@@ -10046,6 +10047,35 @@ TEST_CASES = [
                        "SOS uartcancel: done"],
         "expect_clean_exit": True,
     },
+    *[{
+        # The UART driver given two of its three records
+        # (`tests/uart-missing`), launched once without each: it ends with its
+        # own line naming the record it lacks, then the kernel's exit line,
+        # status 1, before root's account of the round. A driver that went on
+        # without the record would panic or fault instead.
+        "name": f"uart_missing_record_{chip}",
+        "arches": arches,
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": UART_MISSING_PKG,
+        "children": [driver],
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS: console handover",
+                       "SOS uartsvc drv: no IoMemory under tag 22\n\n"
+                       "SOS: process exit: code={one} process={one}\n",
+                       "SOS uartmissing: no window ended status=65537\n",
+                       "SOS uartsvc drv: no PipeOutlet under tag 23\n\n"
+                       "SOS: process exit: code={one} process={one}\n",
+                       "SOS uartmissing: no server end ended status=65537\n",
+                       "SOS uartsvc drv: no Interrupt under tag 24\n\n"
+                       "SOS: process exit: code={one} process={one}\n",
+                       "SOS uartmissing: no line ended status=65537\n",
+                       "SOS uartmissing: done"],
+        "expect_clean_exit": True,
+    } for chip, arches, driver in (
+        ("ns16550", ["riscv32", "riscv32-flat"], SVC_UART_NS16550_PKG),
+        ("pl011", ["arm64"], SVC_UART_PL011_PKG))],
     {
         # The console driver under the stock root
         # (`tests/images/console_service*.toml`), with a client that writes,
