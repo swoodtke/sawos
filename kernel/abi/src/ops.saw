@@ -691,15 +691,15 @@ public enum MemoryOp: UInt {
 
 /// A method id on a Pool object.
 ///
-/// Two ops, and both spend `PoolRight.Allocate`. `Allocate` takes a length and
-/// a granularity and mints a new `Memory` over that many bytes of the pool,
-/// first fit from the pool's free list and only then from the front of its
-/// unspent frontier. A length no free range can serve in one run is the
-/// `SosStatus.NoMemory` status, because a holder of a pool shared with others
-/// cannot know its free state when it calls. `Available` takes a granularity
-/// and a record's address and capacity, and copies out the record
-/// `POOL_AVAILABLE_RECORD_WORDS` describes: what is free, the longest
-/// allocation that could be served, and the granularities the pool accepts.
+/// Two ops, and both spend `PoolRight.Allocate`. `Allocate` takes a length, a
+/// granularity and an `AllocateFrom` word, and mints a new `Memory` over that
+/// many bytes of the pool, from where the word says. A length the word's rule
+/// cannot serve in one run is the `SosStatus.NoMemory` status, because a
+/// holder of a pool shared with others cannot know its free state when it
+/// calls. `Available` takes a granularity and a record's address and capacity,
+/// and copies out the record `POOL_AVAILABLE_RECORD_WORDS` describes: what is
+/// free, the longest allocation that could be served, and the granularities
+/// the pool accepts.
 ///
 /// A granularity of zero names the pool's finest accepted one. Any other word
 /// must be a single bit the accepted set holds, and a word that is not is the
@@ -710,6 +710,27 @@ public enum MemoryOp: UInt {
 public enum PoolOp: UInt {
     case Allocate = 0,
     case Available = 1,
+}
+
+/// Where `PoolOp.Allocate` takes its bytes: the op's third argument word.
+///
+/// A pool has two ends. Its unspent frontier is cut from the front and from
+/// the back, and a returned range that touches the frontier from either side
+/// folds back into it.
+///
+/// - `Any`: the front of the lowest free range that holds the length (first
+///   fit), and only when none does, the front of the frontier.
+/// - `Front`: the front of the frontier and nothing else. The allocation is
+///   minted with `front_allocation_rights()`.
+/// - `Back`: the top of the highest free range that holds the length (last
+///   fit), and only when none does, the top of the frontier.
+///
+/// Any other word is the `BadArg` fault, as a granularity the pool does not
+/// accept is.
+public enum AllocateFrom: UInt {
+    case Any = 0,
+    case Front = 1,
+    case Back = 2,
 }
 
 // =============================================================================

@@ -1,0 +1,92 @@
+// The front and the back of a pool meet in its frontier (spec §2.5). The
+// front takes nothing but the frontier's front, and the back takes a free
+// range or the frontier's top, so once they have met only a freed range can
+// serve, and only to an allocation that may take one.
+//
+//   SOS poolmeet: met: total=0
+//   SOS poolmeet: a hole at the front: total=4096 largest=4096
+//   SOS poolmeet: a page from the front: <NoMemory>
+//   SOS poolmeet: a page from anywhere: ok
+//   SOS poolmeet: a page from the back: <NoMemory>
+//   SOS poolmeet: all home: total=<pool> largest=<pool>
+//   SOS poolmeet: done
+//
+// The back takes a page and the front a page, then the front two more and the
+// back what is left, so the frontier is spent with nothing free. Releasing
+// the front's first page leaves one hole, below the front's second cut and so
+// away from the frontier. A page from the front is refused although the hole
+// holds one, a page from anywhere is served from the hole, and then a page
+// from the back is refused: no free range holds it and the frontier is empty.
+// Everything released, the pool reads whole.
+
+import sos.{System, Process, Memory, Pool, AllocateFrom, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+/// What a page from `from` answers, as a status: `Ok` when one was served,
+/// which is released again at once.
+func answer(pool: &Pool, from: AllocateFrom) -> SosStatus {
+    match pool.allocate(len: PAGE, from: from) {
+        case Ok(_) -> SosStatus.Ok,
+        case Err(why) -> why,
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poolmeet: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS poolmeet: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poolmeet: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let back = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+    let first = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let second = try pool.allocate(len: 2 * PAGE, from: AllocateFrom.Front)
+    let rest = try pool.available()
+    let last = try pool.allocate(len: rest.largest, from: AllocateFrom.Back)
+    let met = try pool.available()
+    print("SOS poolmeet: met: total={}\n", met.total)
+
+    let _ = move first
+    let hole = try pool.available()
+    print("SOS poolmeet: a hole at the front: total={} largest={}\n",
+          hole.total, hole.largest)
+
+    print("SOS poolmeet: a page from the front: {}\n",
+          answer(&pool, AllocateFrom.Front))
+    let any = try pool.allocate(len: PAGE)
+    print("SOS poolmeet: a page from anywhere: ok\n")
+    print("SOS poolmeet: a page from the back: {}\n",
+          answer(&pool, AllocateFrom.Back))
+
+    let _ = move any
+    let _ = move back
+    let _ = move second
+    let _ = move last
+    let home = try pool.available()
+    print("SOS poolmeet: all home: total={} largest={}\n", home.total,
+          home.largest)
+    return
+}

@@ -35,6 +35,7 @@ import sosabi.{
     MemoryRight,
     PoolHandle,
     PoolRight,
+    AllocateFrom,
     IoMemoryHandle,
     IoMemoryRight,
     MappingHandle,
@@ -1034,9 +1035,13 @@ public(package) func alloc_memory() unsafe -> Int {
 // range goes back to that pool. A returned range coalesces with its free
 // neighbours, and one that touches the pool's unspent frontier folds back into
 // the cursor, so a fully-freed pool returns to its boot state. The frontier is
-// a free neighbour like any other, and folding into it needs no node. An
-// `Allocate` takes the first fit off the free list and falls back to the
-// cursor.
+// a free neighbour like any other, and folding into it needs no node.
+//
+// The frontier has two ends. An `Any` allocation takes the first fit off the
+// free list and falls back to the frontier's front; a `Front` one takes the
+// frontier's front only; a `Back` one takes the top of the last fit on the list
+// and falls back to the frontier's top. So free ranges lie below the frontier
+// and above it, and a returned range can touch it from either side.
 //
 // The cursor is the empty-free-list fast path and what a fresh pool is. An
 // allocate-and-drop loop allocates and frees the same range forever and never
@@ -1046,11 +1051,12 @@ public(package) func alloc_memory() unsafe -> Int {
 // its own range for its life and is never cut: a pool's handed-out ranges are
 // on loan, and a returned loan is the pool's again.
 //
-// Every range on a pool's list and its frontier begin on the protection grain:
-// a pool's base is put on the grain when it is minted, and every length it
-// hands out, and every length that comes back, is a multiple of the grain. So
-// at the grain the first range that holds a length holds it from its own front,
-// and the first fit below serves exactly the aligned run `available` reports.
+// Every range on a pool's list and its frontier begin and end on the
+// protection grain: a pool is trimmed to whole grains when it is minted, and
+// every length it hands out, and every length that comes back, is a multiple
+// of the grain. So at the grain a range that holds a length holds it from its
+// own front and from its own top, both cuts serve exactly the aligned run
+// `available` reports, and neither leaves a piece that needs a node.
 //
 // IoMemory is untouched (§5.9's carve-out): a carve leaves the parent whole,
 // MMIO is pinned, and nothing is ever placed in or returned from those bytes.
@@ -1143,16 +1149,23 @@ public(package) func pool_available(pool: Int, g: UInt) unsafe -> (UInt, UInt) {
     (total, largest)
 }
 
-/// Can pool `pool` serve an allocation of `len` bytes, from its frontier or
-/// from one range on its free list?
+/// Can pool `pool` serve an allocation of `len` bytes from where `from` says:
+/// from its frontier, or, unless `from` is `Front`, from one range on its free
+/// list?
 ///
 /// This is `Allocate`'s `NoMemory`. The question is whether the pool can hand
 /// out `len` bytes in one range, which is what an allocation is, not whether
 /// it holds that many in total. Two non-adjacent halves of the ask answer no:
 /// that is fragmentation rather than exhaustion.
-public(package) func pool_can_serve(pool: Int, len: UInt) unsafe -> Bool {
+public(package) func pool_can_serve(pool: Int, len: UInt,
+                                    from: AllocateFrom) unsafe -> Bool {
     if MEMORIES[pool].len >= len {
         return true
+    }
+    match from {
+        case Front -> { return false },
+        case Any -> {},
+        case Back -> {},
     }
     var cur = MEMORIES[pool].free_head
     while cur != 0 {
@@ -1165,17 +1178,32 @@ public(package) func pool_can_serve(pool: Int, len: UInt) unsafe -> Bool {
     false
 }
 
-/// Cut `len` bytes out of pool `pool` for a new allocation, put them on its
-/// loan ledger, and answer where they are.
+/// Cut `len` bytes out of pool `pool` for a new allocation, from where `from`
+/// says, put them on its loan ledger, and answer where they are.
 ///
-/// First fit first, cursor second. Taking the list first keeps the frontier
-/// unspent as long as possible, so a recycled pool stays whole at its top edge
-/// instead of fragmenting outward.
+/// `Any` is first fit first, the frontier's front second. Taking the list first
+/// keeps the frontier unspent as long as possible, so a recycled pool stays
+/// whole at its top edge instead of fragmenting outward. `Front` is the
+/// frontier's front alone. `Back` is the top of the last fit first, the
+/// frontier's top second, which keeps the back packed toward the pool's end.
 ///
 /// The caller has asked `pool_can_serve` and been told yes. A wall reached with
 /// the check passed is the kernel's bug, so it stops the machine rather than
 /// inventing a status.
-public(package) func pool_cut(pool: Int, len: UInt) unsafe -> UInt {
+public(package) func pool_cut(pool: Int, len: UInt,
+                              from: AllocateFrom) unsafe -> UInt {
+    let base = match from {
+        case Any -> pool_cut_first_fit(pool, len),
+        case Front -> pool_cut_frontier(pool, len, false),
+        case Back -> pool_cut_last_fit(pool, len),
+    }
+    MEMORIES[pool].out_bytes = MEMORIES[pool].out_bytes + len
+    base
+}
+
+/// The front of the first range on pool `pool`'s list that holds `len`, else
+/// the front of its frontier.
+func pool_cut_first_fit(pool: Int, len: UInt) unsafe -> UInt {
     var prev: Int = NO_FREE_RANGE
     var cur = MEMORIES[pool].free_head
     while cur != 0 {
@@ -1186,30 +1214,73 @@ public(package) func pool_cut(pool: Int, len: UInt) unsafe -> UInt {
             FREE_RANGES[n].base = base + len
             FREE_RANGES[n].len = FREE_RANGES[n].len - len
             if FREE_RANGES[n].len == 0 {
-                if prev == NO_FREE_RANGE {
-                    MEMORIES[pool].free_head = FREE_RANGES[n].next
-                } else {
-                    FREE_RANGES[prev].next = FREE_RANGES[n].next
-                }
-                free_free_range(n)
+                pool_unlink_range(pool, prev, n)
             }
-            MEMORIES[pool].out_bytes = MEMORIES[pool].out_bytes + len
             return base
         }
         prev = n
         cur = FREE_RANGES[n].next
     }
+    pool_cut_frontier(pool, len, false)
+}
+
+/// The top of the last range on pool `pool`'s list that holds `len`, else the
+/// top of its frontier.
+///
+/// The list is sorted by base, so the last range that holds `len` is the
+/// highest. Cutting from a range's top only shortens it, so it needs no node.
+func pool_cut_last_fit(pool: Int, len: UInt) unsafe -> UInt {
+    var prev: Int = NO_FREE_RANGE
+    var fit: Int = NO_FREE_RANGE
+    var fit_prev: Int = NO_FREE_RANGE
+    var cur = MEMORIES[pool].free_head
+    while cur != 0 {
+        let n = cur - 1
+        if FREE_RANGES[n].len >= len {
+            fit = n
+            fit_prev = prev
+        }
+        prev = n
+        cur = FREE_RANGES[n].next
+    }
+    if fit == NO_FREE_RANGE {
+        return pool_cut_frontier(pool, len, true)
+    }
+    FREE_RANGES[fit].len = FREE_RANGES[fit].len - len
+    let base = FREE_RANGES[fit].base + FREE_RANGES[fit].len
+    if FREE_RANGES[fit].len == 0 {
+        pool_unlink_range(pool, fit_prev, fit)
+    }
+    base
+}
+
+/// `len` bytes off pool `pool`'s unspent frontier: off its top when `top`,
+/// otherwise off its front.
+func pool_cut_frontier(pool: Int, len: UInt, top: Bool) unsafe -> UInt {
     if MEMORIES[pool].len < len {
         fatal_kernel("an allocation cut bytes its pool does not have", len)
         // `fatal_kernel` stops the machine but is not declared `-> Never`, so
         // the scope has to exit itself.
         return 0
     }
+    MEMORIES[pool].len = MEMORIES[pool].len - len
+    if top {
+        return MEMORIES[pool].base + MEMORIES[pool].len
+    }
     let base = MEMORIES[pool].base
     MEMORIES[pool].base = base + len
-    MEMORIES[pool].len = MEMORIES[pool].len - len
-    MEMORIES[pool].out_bytes = MEMORIES[pool].out_bytes + len
     base
+}
+
+/// Take node `n` off pool `pool`'s list, where `prev` is the node before it
+/// (`NO_FREE_RANGE` when `n` is the head), and give it back to the slab.
+func pool_unlink_range(pool: Int, prev: Int, n: Int) unsafe {
+    if prev == NO_FREE_RANGE {
+        MEMORIES[pool].free_head = FREE_RANGES[n].next
+    } else {
+        FREE_RANGES[prev].next = FREE_RANGES[n].next
+    }
+    free_free_range(n)
 }
 
 /// Put `[base, base + len)` back on pool `pool`'s free list, coalescing.
@@ -1279,33 +1350,37 @@ func pool_insert_range(pool: Int, base: UInt, len: UInt) unsafe {
     }
 }
 
-/// Fold the free range that touches pool `pool`'s unspent frontier back into
+/// Fold the free ranges that touch pool `pool`'s unspent frontier back into
 /// the cursor, so a fully-freed pool is whole again.
 ///
-/// Only the last node can touch the frontier: bytes are cut from the front, so
-/// every range ever handed out lies below it, and the list is sorted. One pass
-/// suffices, because the coalescing invariant leaves no two free ranges
-/// adjacent, so the node below the one just absorbed cannot also be touching.
+/// Bytes are cut from both ends of the frontier, so a listed range can touch it
+/// from below or from above: the node just below it and the node just above.
+/// One pass takes in both. The list is sorted, so the node below comes first,
+/// and absorbing it lowers the frontier's base and leaves its top where the
+/// node above is looked for. The coalescing invariant leaves no two free
+/// ranges adjacent, so the node beyond one just absorbed cannot also be
+/// touching.
 func pool_fold_frontier(pool: Int) unsafe {
     var prev: Int = NO_FREE_RANGE
     var cur = MEMORIES[pool].free_head
     while cur != 0 {
         let n = cur - 1
-        if FREE_RANGES[n].next == 0 {
-            if FREE_RANGES[n].base + FREE_RANGES[n].len == MEMORIES[pool].base {
-                MEMORIES[pool].base = FREE_RANGES[n].base
-                MEMORIES[pool].len = MEMORIES[pool].len + FREE_RANGES[n].len
-                if prev == NO_FREE_RANGE {
-                    MEMORIES[pool].free_head = 0
-                } else {
-                    FREE_RANGES[prev].next = 0
-                }
-                free_free_range(n)
-            }
+        let next = FREE_RANGES[n].next
+        let top = MEMORIES[pool].base + MEMORIES[pool].len
+        if FREE_RANGES[n].base > top {
             return
         }
-        prev = n
-        cur = FREE_RANGES[n].next
+        if FREE_RANGES[n].base + FREE_RANGES[n].len == MEMORIES[pool].base {
+            MEMORIES[pool].base = FREE_RANGES[n].base
+            MEMORIES[pool].len = MEMORIES[pool].len + FREE_RANGES[n].len
+            pool_unlink_range(pool, prev, n)
+        } else if FREE_RANGES[n].base == top {
+            MEMORIES[pool].len = MEMORIES[pool].len + FREE_RANGES[n].len
+            pool_unlink_range(pool, prev, n)
+        } else {
+            prev = n
+        }
+        cur = next
     }
 }
 
@@ -1313,13 +1388,14 @@ func pool_fold_frontier(pool: Int) unsafe {
 /// ledger.
 ///
 /// A range that ends where the unspent frontier begins lowers the frontier to
-/// its own base and needs no node: the frontier is free memory, a neighbour
-/// the range joins as it would join a free range. It is asked before the list
-/// is, so such a range comes home with the node slab full, and the fold that
-/// follows then takes in the listed range just below it, if that one now
-/// touches the frontier. Any other range goes on the list, and there the fold
-/// finds nothing to do: that range does not touch the frontier, and between
-/// two calls here no listed range does.
+/// its own base, and one that begins where the frontier ends raises its top
+/// to the range's end. Neither needs a node: the frontier is free memory, a
+/// neighbour the range joins as it would join a free range. They are asked
+/// before the list is, so such a range comes home with the node slab full,
+/// and the fold that follows then takes in the listed range beyond it, if that
+/// one now touches the frontier. Any other range goes on the list, and there
+/// the fold finds nothing to do: that range does not touch the frontier, and
+/// between two calls here no listed range does.
 func pool_return(pool: Int, base: UInt, len: UInt) unsafe {
     // A pool that is not there is a kernel bug, not a case to handle: a pool's
     // own release refuses while any of its bytes are out (see
@@ -1340,6 +1416,8 @@ func pool_return(pool: Int, base: UInt, len: UInt) unsafe {
     MEMORIES[pool].out_bytes = MEMORIES[pool].out_bytes - len
     if base + len == MEMORIES[pool].base {
         MEMORIES[pool].base = base
+        MEMORIES[pool].len = MEMORIES[pool].len + len
+    } else if base == MEMORIES[pool].base + MEMORIES[pool].len {
         MEMORIES[pool].len = MEMORIES[pool].len + len
     } else {
         pool_insert_range(pool, base, len)

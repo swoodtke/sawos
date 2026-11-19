@@ -1,0 +1,111 @@
+// An allocation from the back reuses the highest free range that holds it,
+// cut from its top, and every returned range folds back into the frontier,
+// from below or from above (spec §2.5).
+//
+//   SOS poolreuse: back four, front the rest: total=0
+//   SOS poolreuse: two holes: total=12288 largest=8192
+//   SOS poolreuse: a page from the back: total=8192 largest=8192
+//   SOS poolreuse: in the highest hole: yes   (`not read` on arm64)
+//   SOS poolreuse: all home: total=<pool> largest=<pool>
+//   SOS poolreuse: done
+//
+// In pages counted down from the pool's top, the back takes A (one page), B
+// (one), C (two) and D (one), and the front then takes the rest of the
+// frontier (F), so nothing is free. Releasing A and C leaves two holes on the
+// free list, the higher one page long and the lower two, with B between them.
+// A page from the back is the last fit: the highest hole that holds it, which
+// is A's, and the two-page hole stays whole, so `largest` stays two pages.
+// The first fit would cut the lower hole and leave two holes of a page each.
+// Where a mapping's address is its memory's own, the riscv32 profiles and the
+// ESP32-S3, the new page reads A's address as well; arm64, the one board with
+// a 64-bit word, translates, and the address is not read.
+//
+// Then everything goes home, in an order that folds into the frontier at both
+// of its ends. The frontier is empty, between F and D. D returns first and
+// joins it from above, which takes in C's hole above D in the same fold; F
+// returns below it; B and the new page join from above. The pool reads whole:
+// one run of every byte it has, which a frontier that folded only from below
+// would not be.
+
+import sos.{System, Process, Memory, Pool, AllocateFrom, MapAccess, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// Where `memory` lands when mapped into `proc`, which is where it lies on an
+/// identity tier. The row goes again before this answers.
+func address(proc: &Process, memory: &Memory) -> Result<UInt, SosStatus> {
+    let view = try proc.map(memory: &memory, access: RW)
+    let at = try view.base()
+    try view.unmap()
+    return at
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poolreuse: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS poolreuse: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poolreuse: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let a = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+    let b = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+    let c = try pool.allocate(len: 2 * PAGE, from: AllocateFrom.Back)
+    let d = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+    let rest = try pool.available()
+    let f = try pool.allocate(len: rest.largest, from: AllocateFrom.Front)
+    let none = try pool.available()
+    print("SOS poolreuse: back four, front the rest: total={}\n", none.total)
+
+    let a_at = try address(&proc, &a)
+    let _ = move a
+    let _ = move c
+    let holes = try pool.available()
+    print("SOS poolreuse: two holes: total={} largest={}\n", holes.total,
+          holes.largest)
+
+    let e = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+    let after = try pool.available()
+    print("SOS poolreuse: a page from the back: total={} largest={}\n",
+          after.total, after.largest)
+    let e_at = try address(&proc, &e)
+    let highest = if sizeof<UInt>() == 8 {
+        "not read"
+    } else if e_at == a_at {
+        "yes"
+    } else {
+        "no"
+    }
+    print("SOS poolreuse: in the highest hole: {}\n", highest)
+
+    let _ = move d
+    let _ = move f
+    let _ = move b
+    let _ = move e
+    let home = try pool.available()
+    print("SOS poolreuse: all home: total={} largest={}\n", home.total,
+          home.largest)
+    return
+}

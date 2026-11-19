@@ -369,6 +369,15 @@ POOL_LIFETIME_PKG = os.path.join(TESTS_DIR, "pool-lifetime")
 POOL_BOOT_PKG = os.path.join(TESTS_DIR, "pool-boot")
 POOL_SKEW_PKG = os.path.join(TESTS_DIR, "pool-skew")
 POOL_FREED_PKG = os.path.join(TESTS_DIR, "pool-freed")
+# A pool's two ends: cuts from its back and its front, where they land, how
+# the back reuses what comes home, where the two meet, the rights each cut is
+# minted with, a row trimmed to whole grains, and a `from` word past the last.
+POOL_BACK_PKG = os.path.join(TESTS_DIR, "pool-back")
+POOL_BACK_REUSE_PKG = os.path.join(TESTS_DIR, "pool-back-reuse")
+POOL_MEET_PKG = os.path.join(TESTS_DIR, "pool-meet")
+POOL_CUT_RIGHTS_PKG = os.path.join(TESTS_DIR, "pool-cut-rights")
+POOL_ODD_LEN_PKG = os.path.join(TESTS_DIR, "pool-odd-len")
+POOL_FROM_BAD_PKG = os.path.join(TESTS_DIR, "pool-from-bad")
 MAP_BASICS_PKG = os.path.join(TESTS_DIR, "map-basics")
 MAP_UNMAP_PKG = os.path.join(TESTS_DIR, "map-unmap")
 MAP_INTO_CHILD_PKG = os.path.join(TESTS_DIR, "map-into-child")
@@ -1692,6 +1701,11 @@ def expectations(arch):
                        else "the read-execute map refused, taken"),
         "late_rx_rw": ("BadBuffer" if arch.get("map_places")
                        else "the read-write map refused, BadBuffer"),
+        # Whether a pool case read an allocation's place from its mapping's
+        # address: where a mapping's address is its memory's own the case
+        # reads it and answers `yes`, and where a mapping has an address of
+        # its own it does not read it.
+        "place_read": "not read" if arch.get("map_places") else "yes",
         # The address a refused root image's second meeting segment is named
         # by: `payload_segments_meet.S` links it two grains above the entry.
         "segments_meet_at": f"0x{meet_at:0{width}x}",
@@ -4595,9 +4609,10 @@ TEST_CASES = [
     {
         # Ceilings cap the handles minted from a held object. Root narrows its
         # Memory (no `MapExecute`), Mapping (no `Base`) and Process (no `Start`)
-        # ceilings; the pool it already held reads 67075 (`pool_rights()`,
-        # the Memory default set 1539 and `PoolRight.Allocate`), what it
-        # allocates reads 515, the Mapping that installs that 258 (the
+        # ceilings; the pool it already held reads 69123 (`pool_rights()`,
+        # the Memory default set 1539, `PoolRight.Extend` and
+        # `PoolRight.Allocate`), what it allocates reads 515, the Mapping
+        # that installs that 258 (the
         # Mapping default set is 770), and the process it creates 8371971,
         # the Process default set without `Start`.
         "name": "rights_ceiling_derived",
@@ -4607,7 +4622,7 @@ TEST_CASES = [
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
-                       "SOS ceilderived: pool rights=67075",
+                       "SOS ceilderived: pool rights=69123",
                        "SOS ceilderived: allocation rights=515",
                        "SOS ceilderived: mapping rights=258",
                        "SOS ceilderived: created process rights=8371971",
@@ -4732,8 +4747,8 @@ TEST_CASES = [
         # its whole length twice and the grain's one bit as its set; the set's
         # lowest bit as the granularity answers what zero does. Four pages
         # allocated take four pages off both numbers, and an allocation's
-        # rights are the pool's word (67075) less `Allocate` (1539) under
-        # root's unrestricted ceiling. More than the pool holds
+        # rights are the pool's word (69123) less `Extend` and `Allocate`
+        # (1539) under root's unrestricted ceiling. More than the pool holds
         # is `NoMemory` and changes nothing the next report sees. With the
         # frontier spent and the first and third page home, two pages are free
         # in two ranges: one unit past `largest` and the two pages in one piece
@@ -4752,7 +4767,7 @@ TEST_CASES = [
                        "same=1",
                        "SOS poolops: four allocations: total fell by 16384 "
                        "largest fell by 16384",
-                       "SOS poolops: rights pool=67075 allocation=1539",
+                       "SOS poolops: rights pool=69123 allocation=1539",
                        "SOS poolops: more than the pool holds: this pool has "
                        "no free range that long unchanged=1",
                        "SOS poolops: fragmented total=8192 largest=4096",
@@ -4858,7 +4873,7 @@ TEST_CASES = [
         # refused for a different reason (`BadState`: a running process takes
         # no give). Then the roles that run to their end: `INFO_OP` names a
         # pool 15 and an allocation 8; a child's narrowed `Memory` ceiling caps
-        # what it allocates (515) under a pool word of 67075; a child takes
+        # what it allocates (515) under a pool word of 69123; a child takes
         # all the pool holds and is refused one unit more; a child at its
         # `Memory` quota is answered `QuotaExceeded` before the pool is asked;
         # and a child at its handle budget with the Memory slab full (root
@@ -4910,7 +4925,7 @@ TEST_CASES = [
                        "status=131077",
                        "SOS poolleg: kinds pool=15 given=8 own=8",
                        "SOS poolfaults: kinds: status=65543",
-                       "SOS poolleg: capped rights pool=67075 allocation=515",
+                       "SOS poolleg: capped rights pool=69123 allocation=515",
                        "SOS poolfaults: a capped allocation: status=65543",
                        "SOS poolleg: all it holds: ok; one unit more: this "
                        "pool has no free range that long",
@@ -5102,6 +5117,146 @@ TEST_CASES = [
                        "SOS poolskew: the rest in one piece: ok",
                        "SOS poolskew: done"],
         "expect_clean_exit": True,
+    },
+    {
+        # A pool has two ends (spec §2.5). A page from the back and a page
+        # from the front of a fresh pool leave the middle as one run, two
+        # pages shorter. Mapped and written, each holds its own byte; where a
+        # mapping's address is its memory's own, the front page is at the
+        # pool's base and the back page one page below its top
+        # (`{place_read}`). Released, both fold back into the frontier, from
+        # below and from above, and the pool reads whole.
+        "name": "pool_back",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_BACK_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS poolback: fresh total={pool_bytes} "
+                       "largest={pool_bytes}",
+                       "SOS poolback: both ends cut: total fell by 8192 "
+                       "largest fell by 8192",
+                       "SOS poolback: each page holds its own pattern: yes",
+                       "SOS poolback: front at the pool's base, back at its "
+                       "top: {place_read}",
+                       "SOS poolback: all home: total={pool_bytes} "
+                       "largest={pool_bytes}",
+                       "SOS poolback: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A cut from the back is the last fit (spec §2.5). With the frontier
+        # spent, two holes lie above it, the higher one page long and the
+        # lower two; a page from the back takes the higher one, so the
+        # two-page hole stays whole (`largest` 8192, where the first fit
+        # would leave 4096), and where a mapping's address is its memory's
+        # own it reads the higher hole's address (`{place_read}`). Then
+        # everything returns, joining the frontier from above as well as
+        # from below, and the pool reads whole in one run.
+        "name": "pool_back_reuse",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_BACK_REUSE_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS poolreuse: back four, front the rest: total=0",
+                       "SOS poolreuse: two holes: total=12288 largest=8192",
+                       "SOS poolreuse: a page from the back: total=8192 "
+                       "largest=8192",
+                       "SOS poolreuse: in the highest hole: {place_read}",
+                       "SOS poolreuse: all home: total={pool_bytes} "
+                       "largest={pool_bytes}",
+                       "SOS poolreuse: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The front and the back meet in the frontier (spec §2.5). With the
+        # frontier spent and one hole freed below it, a page from the front
+        # is `NoMemory` although the hole holds one, a page from anywhere is
+        # served from the hole, and a page from the back is then `NoMemory`:
+        # no range holds it. Everything released, the pool reads whole.
+        "name": "pool_meet",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_MEET_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS poolmeet: met: total=0",
+                       "SOS poolmeet: a hole at the front: total=4096 "
+                       "largest=4096",
+                       "SOS poolmeet: a page from the front: this pool has no "
+                       "free range that long",
+                       "SOS poolmeet: a page from anywhere: ok",
+                       "SOS poolmeet: a page from the back: this pool has no "
+                       "free range that long",
+                       "SOS poolmeet: all home: total={pool_bytes} "
+                       "largest={pool_bytes}",
+                       "SOS poolmeet: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Each cut's own mint mask (spec §2.5), under root's unrestricted
+        # `Memory` ceiling. A cut from the front carries the pool handle's
+        # `Map` (512), `MapExecute` (1024) and `Extend` (2048) and never
+        # `Transfer` or `Mint`: 3584 through the whole pool, 2560 through a
+        # sibling without `MapExecute`, 512 through one without `Extend` or
+        # `MapExecute`. A cut from anywhere or from the back never carries
+        # `Extend`: 1539 through the whole pool, 515 through the narrowest
+        # sibling.
+        "name": "pool_cut_rights",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_CUT_RIGHTS_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS cutrights: whole pool: front=3584 any=1539 "
+                       "back=1539",
+                       "SOS cutrights: no MapExecute: front=2560",
+                       "SOS cutrights: no Extend: front=512 any=515 back=515",
+                       "SOS cutrights: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A boot pool is trimmed to whole grains (spec §2.5). The pool row is
+        # a page and two bytes long from a base on the grain (`pool_bytes`),
+        # so the pool is one page, and a page from its back is the pool's
+        # first bytes: it maps, and where a mapping's address is its
+        # memory's own it reads the pool's base (`{place_read}`). Untrimmed,
+        # the cut would begin two bytes past the base, off the grain, and its
+        # `map` would fault on every profile.
+        "name": "pool_odd_len",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_ODD_LEN_PKG,
+        "pool": True,
+        "pool_bytes": 0x1002,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS poolodd: total=4096 largest=4096",
+                       "SOS poolodd: a page from the back, mapped: taken",
+                       "SOS poolodd: at the pool's base: {place_read}",
+                       "SOS poolodd: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # `Allocate`'s `from` word (spec §2.5): word 2, `Back`, is served.
+        # `Any` cuts then spend the pool until a page is `NoMemory`, and word
+        # 3, past the last `AllocateFrom`, asked of the spent pool, is the
+        # `BadArg` fault, which ends root: the word is judged before the
+        # pool's room.
+        "name": "pool_from_bad",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_FROM_BAD_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS poolfrom: from 2: taken",
+                       "SOS poolfrom: spent from anywhere: this pool has no "
+                       "free range that long",
+                       "SOS poolfrom: from 3",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
     {
         # Installation. Root maps a page into itself and writes it, the inverse
@@ -16416,6 +16571,14 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #                      panics
     #   start_print        a `_start` package's print with no `Debug`, or on
     #                      a word that is no System, is dropped
+    #   pool_back          a pool's two ends, read at their addresses
+    #   pool_back_reuse    the back's last fit, and the frontier folding at
+    #                      both of its ends
+    #   pool_meet          the front and the back meeting in the frontier
+    #   pool_cut_rights    each cut's own mint mask
+    #   pool_odd_len       a pool row trimmed to whole grains, read at the
+    #                      back's cut
+    #   pool_from_bad      a `from` word past the last, a fault
     #
     # Every process in them runs its code from the flash instruction window
     # and reads its read-only data through the data window, in place in its
@@ -16439,7 +16602,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "main_no_system", "main_no_system_lend_system",
                      "main_no_system_lend_process", "main_not_imported",
                      "output_lock_wait", "start_print", "thread_run",
-                     "thread_take"]
+                     "thread_take", "pool_back", "pool_back_reuse",
+                     "pool_meet", "pool_cut_rights", "pool_odd_len",
+                     "pool_from_bad"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 

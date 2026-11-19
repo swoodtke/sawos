@@ -1,0 +1,134 @@
+// A pool has two ends (spec §2.5): an allocation from the back takes the top
+// of the pool's unspent frontier, one from the front takes its front, and
+// what is left between them is one run.
+//
+//   SOS poolback: fresh total=<pool> largest=<pool>
+//   SOS poolback: both ends cut: total fell by 8192 largest fell by 8192
+//   SOS poolback: each page holds its own pattern: yes
+//   SOS poolback: front at the pool's base, back at its top: yes
+//                 (`not read` on arm64)
+//   SOS poolback: all home: total=<pool> largest=<pool>
+//   SOS poolback: done
+//
+// The two pages are cut from a fresh pool, back first, and `available` then
+// reads the middle: two pages fewer in all and in its longest run, so neither
+// cut left a piece behind. Each page is mapped and written with its own byte,
+// and each still reads its own byte when both are written, so the two are
+// different bytes. Where a mapping's address is its memory's own, the riscv32
+// profiles and the ESP32-S3, `Mapping.base()` says where each lies: the front
+// page at the pool's base and the back page one page below its top. arm64,
+// the one board with a 64-bit word, translates, so the address it answers is
+// the kernel's choice and is not read. Unmapped and released, both pages come
+// home and fold back into the frontier from below and from above, and the pool
+// reads whole.
+
+import sos.{System, Process, Pool, AllocateFrom, MapAccess, SosStatus}
+
+extern "C" {
+    func sos_test_pool_base() -> UInt
+}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The bytes the back page and the front page are written with.
+static BACK_MARK: UInt8 = 0xB7
+static FRONT_MARK: UInt8 = 0xF3
+
+/// Write `mark` over the `len` bytes at `at`. `unsafe` because it names a
+/// pointer type.
+func fill(at: UInt, len: UInt, mark: UInt8) unsafe {
+    var i: UInt = 0
+    while i < len {
+        UnsafeMemory<UInt8, Normal>(at + i).write(mark)
+        i = i + 1
+    }
+}
+
+/// Whether every one of the `len` bytes at `at` reads `mark`.
+func holds(at: UInt, len: UInt, mark: UInt8) unsafe -> Bool {
+    var i: UInt = 0
+    while i < len {
+        if UnsafeMemory<UInt8, Normal>(at + i).read() != mark {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+func yes_no(b: Bool) -> String {
+    if b { "yes" } else { "no" }
+}
+
+/// Whether the front page lies at the pool's base and the back page at its
+/// last page, where a mapping's address is its memory's own.
+func ends(front_at: UInt, back_at: UInt, pool_len: UInt) unsafe -> String {
+    if sizeof<UInt>() == 8 {
+        return "not read"
+    }
+    let base = sos_test_pool_base()
+    yes_no(front_at == base && back_at == base + pool_len - PAGE)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poolback: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS poolback: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poolback: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    let fresh = try pool.available()
+    print("SOS poolback: fresh total={} largest={}\n", fresh.total,
+          fresh.largest)
+
+    let back = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+    let front = try pool.allocate(len: PAGE, from: AllocateFrom.Front)
+    let both = try pool.available()
+    print("SOS poolback: both ends cut: total fell by {} largest fell by {}\n",
+          fresh.total - both.total, fresh.largest - both.largest)
+
+    let back_view = try proc.map(memory: &back, access: RW)
+    let front_view = try proc.map(memory: &front, access: RW)
+    let back_at = try back_view.base()
+    let front_at = try front_view.base()
+    fill(back_at, PAGE, BACK_MARK)
+    fill(front_at, PAGE, FRONT_MARK)
+    let own = (holds(back_at, PAGE, BACK_MARK)
+               && holds(front_at, PAGE, FRONT_MARK))
+    print("SOS poolback: each page holds its own pattern: {}\n", yes_no(own))
+    print("SOS poolback: front at the pool's base, back at its top: {}\n",
+          ends(front_at, back_at, fresh.total))
+
+    try back_view.unmap()
+    try front_view.unmap()
+    let _ = move back_view
+    let _ = move front_view
+    let _ = move back
+    let _ = move front
+    let home = try pool.available()
+    print("SOS poolback: all home: total={} largest={}\n", home.total,
+          home.largest)
+    return
+}

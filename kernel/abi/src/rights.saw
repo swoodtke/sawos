@@ -580,6 +580,12 @@ static_assert((TimerRight.Wait as UInt32) >= (1 << 8),
 /// is not assigned: an allocation is never cut, so there is no authority to
 /// derive one from another.
 ///
+/// `Extend` is the authority to grow an allocation in place over the bytes
+/// after it in its pool. Only an allocation cut from the front of its pool's
+/// frontier carries it (`AllocateFrom.Front`), and that one carries neither
+/// `Transfer` nor `Mint`, so the authority stays in the process that
+/// allocated. A boot allocation came from no pool and never carries it.
+///
 /// There is deliberately no `Read`/`Write` pair. Access is a property of the
 /// mapping (`map(access:)`), which is what lets one region be mapped read-only
 /// in one place and read-write in another. Rights on the region could not
@@ -617,6 +623,7 @@ public enum MemoryRight: UInt32 {
     case Mint = 1 << 1,
     case Map = 1 << 9,
     case MapExecute = 1 << 10,
+    case Extend = 1 << 11,
 }
 
 static_assert((MemoryRight.Transfer as UInt32) == (1 << 0),
@@ -627,6 +634,8 @@ static_assert((MemoryRight.Map as UInt32) >= (1 << 8),
               "kind-specific right Map must start at bit 8 or above")
 static_assert((MemoryRight.MapExecute as UInt32) >= (1 << 8),
               "kind-specific right MapExecute must start at bit 8 or above")
+static_assert((MemoryRight.Extend as UInt32) >= (1 << 8),
+              "kind-specific right Extend must start at bit 8 or above")
 
 /// A right on a Pool object (spec §2.5).
 ///
@@ -635,22 +644,24 @@ static_assert((MemoryRight.MapExecute as UInt32) >= (1 << 8),
 /// 18 are reserved for a pool's `split` and a revoke, and no handle carries
 /// them. Every bit below 16 is a `MemoryRight` bit at `MemoryRight`'s own
 /// number, carried on behalf of what the pool allocates: an allocation is
-/// minted with the pool handle's word intersected with the bits a `Memory`
-/// has (`memory_rights()`), so narrowing a pool handle narrows everything
-/// allocated through it. Starting the pool's own bits at 16 is what keeps the
-/// two families from ever colliding.
+/// minted with the pool handle's word intersected with the mask of the cut it
+/// is (`memory_rights()`, or `front_allocation_rights()` for a cut from the
+/// frontier's front), so narrowing a pool handle narrows everything allocated
+/// through it. Starting the pool's own bits at 16 is what keeps the two
+/// families from ever colliding.
 ///
 /// `Transfer` and `Mint` are the universal pair here as everywhere, and are
-/// handed down too. `Map` and `MapExecute` are spent on nothing at the pool:
-/// they are named here so a launcher can write a pool's keep mask in this
-/// enum, as in `pool.mint(rights: PoolRight.Allocate | PoolRight.Map)`, which
-/// gives a child memory it can allocate, map, read and write and never execute
-/// from.
+/// handed down too. `Map`, `MapExecute` and `Extend` are spent on nothing at
+/// the pool: they are named here so a launcher can write a pool's keep mask in
+/// this enum, as in `pool.mint(rights: PoolRight.Allocate | PoolRight.Map)`,
+/// which gives a child memory it can allocate, map, read and write and never
+/// execute from. `Extend` reaches only a `Front` allocation.
 public enum PoolRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
     case Map = 1 << 9,
     case MapExecute = 1 << 10,
+    case Extend = 1 << 11,
     case Allocate = 1 << 16,
 }
 
@@ -663,6 +674,8 @@ static_assert((PoolRight.Map as UInt32) == (MemoryRight.Map as UInt32),
 static_assert((PoolRight.MapExecute as UInt32)
               == (MemoryRight.MapExecute as UInt32),
               "a pool carries MapExecute at MemoryRight's number")
+static_assert((PoolRight.Extend as UInt32) == (MemoryRight.Extend as UInt32),
+              "a pool carries Extend at MemoryRight's number")
 static_assert((PoolRight.Allocate as UInt32) >= (1 << 16),
               "a pool's own rights must start at bit 16")
 
@@ -678,6 +691,8 @@ static_assert((MemoryRight.Map as UInt32) < (PoolRight.Allocate as UInt32),
               "a Memory right must lie below a pool's own rights")
 static_assert((MemoryRight.MapExecute as UInt32)
               < (PoolRight.Allocate as UInt32),
+              "a Memory right must lie below a pool's own rights")
+static_assert((MemoryRight.Extend as UInt32) < (PoolRight.Allocate as UInt32),
               "a Memory right must lie below a pool's own rights")
 
 /// A right on an IoMemory object (spec §2.5).
@@ -1154,14 +1169,17 @@ public func process_observe_rights() -> UInt32 {
     ((ProcessRight.Wait as UInt32) | (ProcessRight.Stats as UInt32))
 }
 
-/// What the kernel mints for a boot allocation (spec §2.5), and every bit a
-/// `Memory` can carry.
+/// What the kernel mints for a boot allocation (spec §2.5): every bit a
+/// `Memory` can carry but `Extend`, which a boot allocation has no pool to
+/// spend against.
 ///
 /// An allocation `Pool.Allocate` makes is not minted from this set alone: it
 /// carries the pool handle's rights intersected with this set, because it is
 /// a derivation and §3 makes derivation monotonic. A caller that wants a
 /// narrower allocation mints an attenuated sibling of the pool (`MINT_OP`),
-/// and everything allocated through that sibling inherits the narrowing.
+/// and everything allocated through that sibling inherits the narrowing. A
+/// cut from the front of the pool's frontier takes
+/// `front_allocation_rights()` in place of this set.
 ///
 /// The kind-specific bits are named for what they gate (`Map`, `MapExecute`)
 /// rather than a generic authority.
@@ -1185,13 +1203,28 @@ public func memory_rights() -> UInt32 {
 /// every bit a `Memory` can carry, which the pool hands down to what it
 /// allocates.
 ///
-/// It is written as `memory_rights()` plus the pool's own bit, so the set a
-/// pool hands down and the set an allocation can hold are one declaration and
-/// cannot drift. Every defined bit is minted, for `memory_rights`' reason:
-/// attenuation is monotonic, so a bit not minted at boot could never appear
-/// later, and the narrowing is a launcher's keep mask on a pool sibling.
+/// It is written as `memory_rights()` plus `Extend` and the pool's own bit, so
+/// the set a pool hands down and the set an allocation can hold are one
+/// declaration and cannot drift. Every defined bit is minted, for
+/// `memory_rights`' reason: attenuation is monotonic, so a bit not minted at
+/// boot could never appear later, and the narrowing is a launcher's keep mask
+/// on a pool sibling. `Extend` is named on its own because `memory_rights()`
+/// does not hold it.
 public func pool_rights() -> UInt32 {
-    memory_rights() | (PoolRight.Allocate as UInt32)
+    (memory_rights() | (PoolRight.Extend as UInt32)
+     | (PoolRight.Allocate as UInt32))
+}
+
+/// The mask a cut from the front of a pool's frontier (`AllocateFrom.Front`)
+/// is minted under, intersected with the pool handle's word (spec §2.5).
+///
+/// It holds `Extend`, which no other allocation carries, and it holds neither
+/// `Transfer` nor `Mint`: an allocation that can grow over its pool's next
+/// bytes cannot be given, sent or minted out of the process that allocated it,
+/// so no other process can spend that pool's frontier through it.
+public func front_allocation_rights() -> UInt32 {
+    ((MemoryRight.Map as UInt32) | (MemoryRight.MapExecute as UInt32)
+     | (MemoryRight.Extend as UInt32))
 }
 
 /// What the kernel mints for a boot device-pool root (spec §2.5).

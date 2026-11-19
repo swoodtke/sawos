@@ -8,7 +8,8 @@
 //! allocate (`available`), and what it gets back from `allocate` is another
 //! capability.
 
-import sosabi.{SosStatus, PoolHandle, PoolOp, MemoryHandle, MINT_OP, NO_HANDLE,
+import sosabi.{SosStatus, PoolHandle, PoolOp, AllocateFrom, MemoryHandle,
+               MINT_OP, NO_HANDLE,
                POOL_AVAILABLE_RECORD_WORDS, POOL_AVAILABLE_TOTAL_WORD,
                POOL_AVAILABLE_LARGEST_WORD, POOL_AVAILABLE_GRANULARITIES_WORD,
                pool_available_record_bytes}
@@ -75,10 +76,19 @@ extension Pool {
     /// Allocate `len` bytes out of this pool, as a new `Memory`. Requires
     /// `PoolRight.Allocate`.
     ///
-    /// The bytes are the front of the lowest-addressed free range that holds
-    /// `len`, and only when none does, the front of the pool's unspent
-    /// frontier. They leave the pool until the allocation comes home: its
-    /// last handle and its last grant row gone, it returns to this pool whole.
+    /// `from` says where the bytes come from. A pool has two ends: its unspent
+    /// frontier is cut from the front and from the back, and what comes home
+    /// touching it from either side folds back into it.
+    ///
+    /// - `AllocateFrom.Any`, the default: the front of the lowest-addressed
+    ///   free range that holds `len`, and only when none does, the front of
+    ///   the frontier.
+    /// - `Front`: the front of the frontier and nothing else.
+    /// - `Back`: the top of the highest free range that holds `len`, and only
+    ///   when none does, the top of the frontier.
+    ///
+    /// The bytes leave the pool until the allocation comes home: its last
+    /// handle and its last grant row gone, it returns to this pool whole.
     ///
     /// `granularity` is the unit the allocation is made of: its base and its
     /// length are multiples of it. Zero names the pool's finest accepted
@@ -88,20 +98,25 @@ extension Pool {
     /// the set first.
     ///
     /// The allocation carries this handle's rights intersected with the bits
-    /// a `Memory` has, capped by the caller's `Memory` ceiling: a pool sibling
-    /// minted without `MapExecute` allocates memory that cannot be mapped
-    /// executable either.
+    /// a `Memory` has but `MemoryRight.Extend`, capped by the caller's
+    /// `Memory` ceiling: a pool sibling minted without `MapExecute` allocates
+    /// memory that cannot be mapped executable either. A `Front` allocation
+    /// carries this handle's `Map`, `MapExecute` and `Extend` instead, and
+    /// never `Transfer` or `Mint`, so it stays in this process.
     ///
     /// A caller at its Memory or handle quota gets `SosStatus.QuotaExceeded`.
-    /// A pool with no free range that long is `SosStatus.NoMemory`, whether it
-    /// holds too few free bytes or holds them only in shorter ranges: a pool
-    /// may be shared, so its free state is not something the caller can know
-    /// when it calls. A full Memory slab or handle table is
-    /// `SosStatus.NoResource`. A refusal changes nothing in the pool.
-    public func allocate(&self, len: UInt,
-                         granularity: UInt = 0) -> Result<Memory, SosStatus> {
+    /// A pool with no range `from` allows that long is `SosStatus.NoMemory`,
+    /// whether it holds too few free bytes or holds them only in shorter
+    /// ranges or at the other end: a pool may be shared, so its free state is
+    /// not something the caller can know when it calls. A full Memory slab or
+    /// handle table is `SosStatus.NoResource`. A refusal changes nothing in
+    /// the pool.
+    public func allocate(
+        &self, len: UInt, granularity: UInt = 0,
+        from: AllocateFrom = AllocateFrom.Any
+    ) -> Result<Memory, SosStatus> {
         let raw = try call_value(self.handle, PoolOp.Allocate as UInt, len,
-                                 granularity, 0)
+                                 granularity, from as UInt)
         return Memory(handle: MemoryHandle(raw))
     }
 

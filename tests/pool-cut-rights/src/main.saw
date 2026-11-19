@@ -1,0 +1,82 @@
+// Each kind of cut is minted with a mask of its own, intersected with the pool
+// handle's word (spec §2.5). Rights words are decimal.
+//
+//   SOS cutrights: whole pool: front=3584 any=1539 back=1539
+//   SOS cutrights: no MapExecute: front=2560
+//   SOS cutrights: no Extend: front=512 any=515 back=515
+//   SOS cutrights: done
+//
+// A cut from the front carries the pool handle's `Map` (512), `MapExecute`
+// (1024) and `Extend` (2048) and never `Transfer` or `Mint`, so through root's
+// whole pool it reads 3584, through a sibling minted without `MapExecute`
+// 2560, and through one minted without `Extend` or `MapExecute` `Map` alone.
+// A cut from anywhere or from the back carries the bits a `Memory` has but
+// `Extend`: `Transfer`, `Mint`, `Map` and `MapExecute` (1539) through the
+// whole pool, and `Transfer`, `Mint` and `Map` (515) through the narrowest
+// sibling. Root's `Memory` ceiling is unrestricted, so it caps nothing here.
+// Each allocation is released before the next is cut.
+
+import sos.{System, Process, Pool, PoolRight, AllocateFrom, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+/// A sibling's keep mask without `MapExecute`.
+static NO_EXECUTE: UInt32 = (PoolRight.Transfer | PoolRight.Mint
+                             | PoolRight.Allocate | PoolRight.Map
+                             | PoolRight.Extend)
+
+/// A sibling's keep mask without `Extend` or `MapExecute`.
+static NO_EXTEND: UInt32 = (PoolRight.Transfer | PoolRight.Mint
+                            | PoolRight.Allocate | PoolRight.Map)
+
+/// The rights of a page cut from `from` through `pool`, released at once.
+func cut_rights(pool: &Pool, from: AllocateFrom) -> Result<UInt32, SosStatus> {
+    let page = try pool.allocate(len: PAGE, from: from)
+    return try page.rights()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS cutrights: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS cutrights: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS cutrights: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    print("SOS cutrights: whole pool: front={} any={} back={}\n",
+          try cut_rights(&pool, AllocateFrom.Front),
+          try cut_rights(&pool, AllocateFrom.Any),
+          try cut_rights(&pool, AllocateFrom.Back))
+
+    let no_execute = try pool.mint(rights: NO_EXECUTE)
+    print("SOS cutrights: no MapExecute: front={}\n",
+          try cut_rights(&no_execute, AllocateFrom.Front))
+
+    let no_extend = try pool.mint(rights: NO_EXTEND)
+    print("SOS cutrights: no Extend: front={} any={} back={}\n",
+          try cut_rights(&no_extend, AllocateFrom.Front),
+          try cut_rights(&no_extend, AllocateFrom.Any),
+          try cut_rights(&no_extend, AllocateFrom.Back))
+    return
+}

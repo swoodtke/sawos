@@ -35,7 +35,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 |---|---|
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global and external-memory-only, not per-process). Paging targets: page-table root. There is no AddressSpace object: the domain is the process (see below). |
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. Ops `Start`/`Join`/`Exit`/`Yield`; `Exit` releases the handle it is invoked through; rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame is the context, so a switch is the trap handler returning a different frame (§7). Lifecycle: §8. |
-| `Pool` | RAM not yet allocated: what a `MemoryObject` is allocated from. Two ops (`Allocate`, and `Available`, which reads how much it can allocate); rights `PoolRight.Allocate` and the bits it hands down to what it allocates, `.Map`/`.MapExecute`. Minted at boot from the region table. A pool is never mapped and holds no row. Splitting a pool into a smaller one and a revoke are reserved, not built. §2.5. |
+| `Pool` | RAM not yet allocated: what a `MemoryObject` is allocated from. Two ops (`Allocate`, and `Available`, which reads how much it can allocate); rights `PoolRight.Allocate` and the bits it hands down to what it allocates, `.Map`/`.MapExecute`/`.Extend`. It has two ends: an allocation is cut from its front or its back. Minted at boot from the region table. A pool is never mapped and holds no row. Splitting a pool into a smaller one and a revoke are reserved, not built. §2.5. |
 | `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. One op (`Map`); rights `MemoryRight.Map`/`.MapExecute`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5. |
 | `IoMemoryObject` | Physical memory-mapped device registers; the kind is `IoMemory`. A distinct kind rather than a flag on `MemoryObject`, so a driver cannot obtain a cacheable view of a register block by construction. Ops `Carve`/`Map`; rights `IoMemoryRight.Carve`/`.Map`. §2.5. |
 | `Mapping` | One installed protection row, with its own handle. Ops `Unmap`/`Base`; rights `MappingRight.Unmap`/`.Base`. Not givable. §2.5. |
@@ -1031,40 +1031,55 @@ handle's kind says so (`INFO_OP`'s `Kind`, §3; a typed wrapper is one or the
 other).
 
 **`Pool`: two ops, `Allocate` and `Available`; rights `PoolRight.Allocate` and
-two bits it hands down, `.Map` and `.MapExecute`**, beside the universal
-`Transfer` and `Mint`. A pool cannot be mapped, passed to `process_create` as an
-image or a destination, or attached to a Waiter, and no grant row is ever
-counted on one. Root receives the build's pools at boot
+three bits it hands down, `.Map`, `.MapExecute` and `.Extend`**, beside the
+universal `Transfer` and `Mint`. A pool cannot be mapped, passed to
+`process_create` as an image or a destination, or attached to a Waiter, and no
+grant row is ever counted on one. Root receives the build's pools at boot
 (§12), and a pool, or a narrowed sibling of one, can be given to another process
 like any handle; what that process then holds is a byte budget: it can allocate
 no more than the pool holds, and what it releases it can allocate again.
 
-- **`allocate(len, granularity) -> Memory`.** `PoolOp.Allocate` (op 0) takes the
-  length in its first argument and the granularity in its second, and answers a
-  new `Memory` handle in the caller's table. The granularity is the unit the
-  allocation is made of: its base and its length are multiples of it, it is
-  recorded on the allocation for its life (a field of the Memory slot), and
-  anything that later divides the allocation is held to it (§2.5's direction).
+- **`allocate(len, granularity, from) -> Memory`.** `PoolOp.Allocate` (op 0)
+  takes the length in its first argument, the granularity in its second and
+  `from` in its third, and answers a new `Memory` handle in the caller's table.
+  The granularity is the unit the allocation is made of: its base and its
+  length are multiples of it, it is recorded on the allocation for its life (a
+  field of the Memory slot), and anything that later divides the allocation is
+  held to it (§2.5's direction).
   The granularities a pool accepts are the set its `available` answers (below).
   Today that set is one value, the profile's protection grain (`hal.PROT_GRAIN`:
   a page on Profile B, four bytes on Profile A, §5.6). Zero spells the pool's
   finest accepted granularity, the set's lowest bit, which is the grain, so zero
   and the grain's own value are the only legal words. The typed
-  `Pool.allocate(len:granularity:)` takes it as a defaulted trailing parameter,
-  zero, as `mint` takes its keep mask. Its answers, in the order they are
-  decided, after §5.7's dispatch order has answered a word that names nothing:
+  `Pool.allocate(len:granularity:from:)` takes it as a defaulted parameter,
+  zero, as `mint` takes its keep mask, and `from` as a defaulted trailing one,
+  `AllocateFrom.Any`.
+
+  `allocate(len, granularity, from)`: `from` says where the bytes come from.
+  `Any` (0) is the rule below. `Front` (1) takes the front of the pool's
+  unspent frontier and nothing else. `Back` (2) takes the top of the highest
+  free range that holds `len`, and only when none does the top of the
+  frontier. Any other word is the `BadArg` fault. A `Front` allocation is
+  minted with its pool handle's `Map`, `MapExecute` and `Extend` bits and
+  never `Transfer` or `Mint`, so it stays in the process that allocated it;
+  every other allocation is minted with the bits a `Memory` has, never
+  `Extend`.
+
+  Its answers, in the order they are decided, after §5.7's dispatch order has
+  answered a word that names nothing:
   - a handle without `PoolRight.Allocate` is the `AccessDenied` fault;
   - a granularity that is neither zero nor in the pool's accepted set, a
-    `len` of zero, and a `len` that is not a multiple of the granularity
-    asked are each the `BadArg` fault: `available` with a granularity of
-    zero is legal through any handle that may allocate and answers the set,
-    so the caller could have read which granularities it may name and the
-    unit its `len` must be a multiple of;
+    `from` that names none of the three, a `len` of zero, and a `len` that is
+    not a multiple of the granularity asked are each the `BadArg` fault:
+    `available` with a granularity of zero is legal through any handle that
+    may allocate and answers the set, so the caller could have read which
+    granularities it may name and the unit its `len` must be a multiple of;
   - a caller at its `Memory` quota answers `QuotaExceeded` (§2.9's policy
     first);
-  - a `len` the pool cannot serve in one aligned run (below) answers
-    `NoMemory`: the pool holds fewer free bytes, or holds them only in ranges
-    none of which has an aligned run that long;
+  - a `len` the pool cannot serve in one aligned run from where `from`
+    allows (below) answers `NoMemory`: the pool holds fewer free bytes, or
+    holds them only in ranges none of which has an aligned run that long, or,
+    for `Front`, only in ranges other than its frontier;
   - a full Memory slab answers `NoResource`, as does a cut that would need a
     free-list node (below) when the node slab has none;
   - a caller at its handle budget answers `QuotaExceeded`, and one within it
@@ -1138,13 +1153,16 @@ no more than the pool holds, and what it releases it can allocate again.
     bounded by the free-list node slab's capacity (`SlabKind.FreeRanges`), the
     same walk `allocate` makes; it takes no preemption point, as the bounded
     slab scans take none (§9).
-- **Where the bytes come from.** An allocation is the front of the aligned
-  run of the lowest-addressed range on the pool's free list whose aligned run
-  holds `len` (first fit), and, only when no free range's does, the front of
-  the aligned run of the pool's unspent frontier. Taking the list first keeps
-  the frontier whole for as long as possible. The bytes leave the pool: none
-  of them is handed out again until the allocation has come home. The caller
-  passes no address and learns none. The bytes past a pool's last whole
+- **Where the bytes come from.** An `Any` allocation is the front of the
+  aligned run of the lowest-addressed range on the pool's free list whose
+  aligned run holds `len` (first fit), and, only when no free range's does,
+  the front of the aligned run of the pool's unspent frontier. Taking the list
+  first keeps the frontier whole for as long as possible. A `Front` allocation
+  is the front of the frontier, and a `Back` allocation the top of the highest
+  range on the list that holds `len` (last fit), else the top of the
+  frontier; cutting a range's top only shortens it. The bytes leave the pool:
+  none of them is handed out again until the allocation has come home. The
+  caller passes no address and learns none. The bytes past a pool's last whole
   grain, and before its first grain boundary when its base is off the grain,
   are never handed out; the build puts pool rows on the grain (§12).
   A cut from an aligned run that does not begin where its range begins
@@ -1155,17 +1173,27 @@ no more than the pool holds, and what it releases it can allocate again.
   accepted: a pool on the grain hands out only grain multiples, so every
   free range and the frontier begin on the grain and a cut takes their
   front.
+
+  A pool so has two ends: allocations from the front and from the back meet
+  in its frontier, and a returned range that touches the frontier from
+  either side folds into it. A boot pool's length is rounded down to the
+  grain when it is minted, so the frontier's top is on the grain.
 - **What it makes.** A new `Memory` over exactly `len` bytes, which records the
   pool it came from and its granularity. It is charged to the caller's
   `QuotaKind.Memory` row (§2.9), whoever's pool it is, and the bytes are charged
   to nobody: they are the pool's outstanding bytes until they come home.
 - **An allocation's rights come from the pool handle it was allocated
-  through.** It is minted with that handle's rights word intersected with
-  the bits a `Memory` has (`Transfer`, `Mint`, `Map` and `MapExecute`), then
-  capped by the caller's `Memory` ceiling (§2.7). A pool handle carries those
-  four bits on behalf of what it allocates, at the bit numbers `MemoryRight`
-  gives them, and its own `Allocate` is not among them. So narrowing a pool
-  handle narrows everything allocated through it: a launcher that gives a
+  through.** The bits a `Memory` has are `Transfer`, `Mint`, `Map`,
+  `MapExecute` and `Extend`. An allocation is minted with that handle's rights
+  word intersected with all of them but `Extend` (`memory_rights()`), or, for
+  a `Front` allocation, with `Map`, `MapExecute` and `Extend` alone
+  (`front_allocation_rights()`), then capped by the caller's `Memory` ceiling
+  (§2.7). So `Extend` reaches only a `Front` allocation, which can never be
+  given, sent or minted out of the process that allocated it. A pool handle
+  carries those five bits on behalf of what it allocates, at the bit numbers
+  `MemoryRight` gives them, and its own `Allocate` is not among them. So
+  narrowing a pool handle narrows everything allocated through it: a launcher
+  that gives a
   child a pool sibling minted without `MapExecute` has given it memory it can
   allocate, map, read and write and never execute from, and one minted
   without `Transfer` has given it allocations it cannot give on. An
@@ -1174,13 +1202,15 @@ no more than the pool holds, and what it releases it can allocate again.
 - **The rights, bit by bit.** `PoolRight.Transfer` (bit 0) and `.Mint` (bit 1)
   are the universal pair (§3), and they are handed down as well. Bits 8 to 15
   are `MemoryRight`'s bits, carried for allocations and spent on nothing here:
-  `.Map` (bit 9) and `.MapExecute` (bit 10). A pool's own rights start at bit
-  16, so no bit of `MemoryRight`'s can ever be one of them: `.Allocate` (bit 16)
-  gates `allocate` and `available`, and bits 17 and 18 are reserved for `Split`
-  and `Revoke` (below). `pool_rights()`, the set a boot pool is minted with, is
-  `Transfer | Mint | Allocate | Map | MapExecute`: every defined bit, because
-  attenuation is monotonic and a bit not minted at boot could never appear
-  later.
+  `.Map` (bit 9), `.MapExecute` (bit 10) and `.Extend` (bit 11). A pool's own
+  rights start at bit 16, so no bit of `MemoryRight`'s can ever be one of them:
+  `.Allocate` (bit 16) gates `allocate` and `available`, and bits 17 and 18 are
+  reserved for `Split` and `Revoke` (below). `pool_rights()`, the set a boot
+  pool is minted with, is
+  `Transfer | Mint | Allocate | Map | MapExecute | Extend`: every defined bit,
+  because attenuation is monotonic and a bit not minted at boot could never
+  appear later. It names `Extend` on its own, since `memory_rights()` does not
+  hold it.
 - **What holds a pool.** Its handles (and references in staged messages, §2)
   and its outstanding bytes, and nothing else. Its outstanding bytes are the
   lengths of its live allocations plus the length of every allocation from it
@@ -1211,10 +1241,12 @@ message, minted and donated, and it is never cut. It comes from a pool's
   bytes go nowhere; its granularity is the profile's grain.
 - **The rights, bit by bit.** `MemoryRight.Transfer` (bit 0) and `.Mint`
   (bit 1) are the universal pair; `.Map` (bit 9) gates `map`, and
-  `.MapExecute` (bit 10) gates an executable `map` (below). Bit 8 is not
-  assigned. `memory_rights()`, the set a boot allocation is minted with, is
-  all four bits; an allocation from a pool carries what its pool handle
-  handed down (above).
+  `.MapExecute` (bit 10) gates an executable `map` (below). `.Extend` (bit 11)
+  is the authority to grow the allocation in place over its pool's next bytes,
+  and only a `Front` allocation carries it (above). Bit 8 is not assigned.
+  `memory_rights()`, the set a boot allocation is minted with, is the first
+  four bits, without `Extend`: a boot allocation came from no pool. An
+  allocation from a pool carries what its pool handle handed down (above).
 - **`map(process, access)` installs a protection row and answers with a
   `Mapping`.** It spends `MemoryRight.Map` on the allocation and
   `ProcessRight.Map` on the target, because possession of bytes must not

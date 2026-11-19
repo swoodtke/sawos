@@ -1,0 +1,76 @@
+// A boot pool is trimmed to whole grains when it is minted (spec §2.5), so the
+// top of its frontier is on the grain and a cut from its back begins on the
+// grain.
+//
+//   SOS poolodd: total=4096 largest=4096
+//   SOS poolodd: a page from the back, mapped: taken
+//   SOS poolodd: at the pool's base: yes   (`not read` on arm64)
+//   SOS poolodd: done
+//
+// The runner writes the pool row a page and two bytes long, from a base on
+// the grain (`pool_bytes`). `available` reads one page, which it would also
+// read of an untrimmed pool, since it counts only aligned runs. The pin is the
+// cut: a page from the back is the top page of the trimmed frontier, which is
+// the pool's base. Untrimmed, the frontier's top would be two bytes past the
+// page and the cut would begin two bytes past the base, off the grain, and its
+// `map` would fault. Where a mapping's address is its memory's own, the
+// riscv32 profiles and the ESP32-S3, `Mapping.base()` reads the base as well;
+// arm64, the one board with a 64-bit word, translates, and the address is not
+// read.
+
+import sos.{System, Process, Pool, AllocateFrom, MapAccess, SosStatus}
+
+extern "C" {
+    func sos_test_pool_base() -> UInt
+}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// Whether `at` is the pool's base, where a mapping's address is its memory's
+/// own.
+func at_base(at: UInt) unsafe -> String {
+    if sizeof<UInt>() == 8 {
+        return "not read"
+    }
+    if at == sos_test_pool_base() { "yes" } else { "no" }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poolodd: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS poolodd: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poolodd: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    let fresh = try pool.available()
+    print("SOS poolodd: total={} largest={}\n", fresh.total, fresh.largest)
+
+    let page = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+    let view = try proc.map(memory: &page, access: RW)
+    print("SOS poolodd: a page from the back, mapped: taken\n")
+    let at = try view.base()
+    print("SOS poolodd: at the pool's base: {}\n", at_base(at))
+    return
+}

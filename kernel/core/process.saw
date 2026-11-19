@@ -1252,10 +1252,10 @@ func mint_boot_regions(p: Int) unsafe {
                 if slot == NO_MEMORY {
                     fatal_image("out of Memory slots for the boot regions", i)
                 }
-                // A pool starts at its first grain boundary and hands out
-                // whole grains, so every range it ever serves or takes back is
-                // on the grain. The bytes before that boundary are never
-                // handed out; a row too short to reach one is an empty pool.
+                // A pool is trimmed to whole grains, so every range it ever
+                // serves or takes back, at its front or its back, begins and
+                // ends on the grain. The bytes outside them are never handed
+                // out; a row too short to hold a whole grain is an empty pool.
                 let (pool_base, pool_len) = grain_aligned(row_base,
                                                           row.len as UInt)
                 // A pool names itself (`pool: slot`): it is the one slot every
@@ -1303,17 +1303,18 @@ func mint_boot_regions(p: Int) unsafe {
     uart.write_str("\n")
 }
 
-/// `[base, base + len)` trimmed to start on the protection grain: the first
-/// grain boundary at or above `base`, and what is left of the range from
-/// there. A range that never reaches a boundary, or whose boundary lies past
-/// the end of the address space, is empty and keeps its base.
+/// `[base, base + len)` trimmed to whole protection grains: from the first
+/// grain boundary at or above `base`, the whole grains of what is left of the
+/// range from there. A range that never reaches a boundary, or whose boundary
+/// lies past the end of the address space, is empty and keeps its base.
 func grain_aligned(base: UInt, len: UInt) -> (UInt, UInt) {
     let rem = base % hal.PROT_GRAIN
     let pad: UInt = if rem == 0 { 0 } else { hal.PROT_GRAIN - rem }
     if pad >= len || pad > UInt.max - base {
         return (base, 0)
     }
-    (base + pad, len - pad)
+    let rest = len - pad
+    (base + pad, rest - rest % hal.PROT_GRAIN)
 }
 
 /// Can this build's machine word hold `v`?

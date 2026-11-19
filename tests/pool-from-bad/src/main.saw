@@ -1,0 +1,112 @@
+// `Allocate`'s third argument word is an `AllocateFrom`, and a word that names
+// none is the `BadArg` fault (spec §2.5), as a granularity the pool does not
+// accept is. It is decided with the caller's other mistakes, before the pool
+// is asked whether it can serve.
+//
+//   SOS poolfrom: from 2: taken
+//   SOS poolfrom: spent from anywhere: this pool has no free range that long
+//   SOS poolfrom: from 3
+//   SOS: process fault: argument outside its domain process=0
+//
+// The case is written at the C floor, on raw words: the typed `Pool.allocate`
+// takes an `AllocateFrom`, which has no value for a word past `Back`. A page
+// from word 2, `Back`, is served. Then `Any` cuts spend the pool, each half
+// the length of the last one refused, until a page is refused `NoMemory`. A
+// page from word 3 is then asked of a pool that can serve nothing, so the
+// fault, and not `NoMemory`, says the word is judged before the pool's room.
+// It is root's last call, and the fault ends root and the machine with it.
+
+import sos.{System, SosStatus, sos_pool_allocate, sos_process_boot_handle_next}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static STATUS_OK: UInt = 0
+
+/// Root's boot-minted Process word (spec §12).
+static BOOT_PROCESS_WORD: UInt = 2
+
+/// A boot-handle record: tag, kind, handle word.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+/// The first length the spending asks for: more than any board's pool.
+static FIRST_ASK: UInt = 0x100_0000
+
+/// The `from` words: `Any`, the last one `AllocateFrom` names, and the first
+/// past it.
+static FROM_ANY: UInt = 0
+static FROM_BACK: UInt = 2
+static FROM_PAST: UInt = 3
+
+/// The next boot-set record's handle word, drained through `process`, or 0.
+func next_word(process: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(process,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return 0
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+/// `Pool.Allocate` of `len` bytes from the `from` word given: the raw status.
+/// What it serves is kept for the process's life.
+func allocate(pool: UInt, len: UInt, from: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    sos_pool_allocate(pool, len, 0, from, (&var out) as UnsafePointer<UInt>)
+}
+
+/// A raw status word in the typed vocabulary's words.
+func describe(raw: UInt) -> SosStatus {
+    if raw > (UInt8.max as UInt) {
+        return SosStatus.Unknown
+    }
+    SosStatus.from(raw: raw as UInt8) ?? SosStatus.Unknown
+}
+
+/// Spend `pool` with `Any` cuts, halving the length after each refusal, until
+/// a page is refused. Answers that page's status, or the first status that is
+/// neither `Ok` nor `NoMemory`.
+func spend(pool: UInt) unsafe -> UInt {
+    let no_memory = (SosStatus.NoMemory as UInt8) as UInt
+    var len = FIRST_ASK
+    while {
+        let status = allocate(pool, len, FROM_ANY)
+        if status == STATUS_OK {
+            continue
+        }
+        if status != no_memory || len == PAGE {
+            return status
+        }
+        len = len / 2
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let pool = next_word(BOOT_PROCESS_WORD)
+    if pool == 0 {
+        let _ = system.debug_print("SOS poolfrom: no pool\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if allocate(pool, PAGE, FROM_BACK) != STATUS_OK {
+        let _ = system.debug_print("SOS poolfrom: from 2: refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poolfrom: from 2: taken\n")
+    print("SOS poolfrom: spent from anywhere: {}\n", describe(spend(pool)))
+    let _ = system.debug_print("SOS poolfrom: from 3\n")
+    print("SOS poolfrom: from 3 answered: {}\n",
+          describe(allocate(pool, PAGE, FROM_PAST)))
+    let _ = system.shutdown(EXIT_OK)
+}
