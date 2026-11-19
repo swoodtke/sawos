@@ -2128,6 +2128,29 @@ _CONSOLE_LINES = [
 ]
 
 
+def _console_panic_lines(count):
+    """`tests/console-panic`'s numbered lines, `count` of them."""
+    return [f"SOS consolepanic: line {i} of {count}"
+            for i in range(1, count + 1)]
+
+
+def _console_served(lines, messages):
+    """`svc-console`'s count once its client is gone, the client having sent
+    `messages` messages whose payloads are `lines`, each with its line
+    break."""
+    printed = sum(len(line) + 1 for line in lines)
+    return (f"SOS console drv: served={messages} refused=0 unsupported=0 "
+            f"printed={printed}")
+
+
+# What `tests/console-panic`'s `locked` role writes holding the output lock: a
+# line through `print`, then a piece through the runtime's unbuffered write.
+_CONSOLE_LOCKED_LINES = [
+    "SOS consolepanic: a line printed holding the output lock",
+    "SOS consolepanic: a piece written holding the output lock",
+]
+
+
 def _console_print_cases(files):
     """The cases of `print` over a console, each on described images:
     `files(name)` is a case's `image_file` for the images named `name`."""
@@ -2265,6 +2288,123 @@ def _console_print_cases(files):
                 "SOS: process exit: code={zero} process={two}",
                 "root: console ended status=65536\n"
                 "root: client ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A program written with `main` prints three lines and panics
+            # (`tests/console-panic`). With no tick the lines wait in the
+            # ring until the client parks, and the panic op ends it without
+            # parking, so the panic hook's `Sync` is what puts them before
+            # the kernel's fault line. The driver serves the three lines and
+            # the `Sync`.
+            "name": "console_panic",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_panic"),
+            "expect_out": [
+                "{banner}",
+                *_after("SOS: console handover\n"
+                        + "".join(f"{line}\n"
+                                  for line in _console_panic_lines(3)),
+                        _panic_fault("{two}", "panic at main.saw:",
+                                     ": SOS consolepanic: a panic after 3 "
+                                     "lines")),
+                f"root: client ended status={STATUS_PANICKED}",
+                _console_served(_console_panic_lines(3), 4),
+                "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A program written with `main` prints a line and returns an
+            # `Err` (`tests/console-error`): the entry writes the
+            # `error:` line through the runtime's error stream, which goes to
+            # the console as the line does, and the start-up's `Sync` puts
+            # both before the kernel's exit line. The status is 1. The driver
+            # serves the line, the `error:` line's three writes (its prefix,
+            # the rendered error and the line break) and the `Sync`.
+            "name": "console_error",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_error"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console handover\n"
+                "SOS consoleerror: a line, then an Err from main\n"
+                "error: not a loadable process image\n"
+                "SOS: process exit: code={one} process={two}",
+                "root: client ended status=65537",
+                _console_served(["SOS consoleerror: a line, then an Err from "
+                                 "main",
+                                 "error: not a loadable process image"], 5),
+                "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A program written with `main` posts as many lines as the
+            # connection's ring holds (`PIPE_INFLIGHT`) and panics
+            # (`tests/console-panic`, `full`). With no tick the driver has not
+            # run, so the panic hook's `Sync` finds the ring full: it parks
+            # for room, then for the answer, and every line comes before the
+            # kernel's fault line.
+            "name": "console_panic_full",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_panic_full"),
+            "expect_out": [
+                "{banner}",
+                *_after("SOS: console handover\n"
+                        + "".join(f"{line}\n"
+                                  for line in _console_panic_lines(16)),
+                        _panic_fault("{two}", "panic at main.saw:",
+                                     ": SOS consolepanic: a panic with the "
+                                     "ring full")),
+                f"root: client ended status={STATUS_PANICKED}",
+                _console_served(_console_panic_lines(16), 17),
+                "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A program written with `main` takes the output lock as a
+            # `print` does, prints a line and writes a piece under it, and
+            # panics holding it (`tests/console-panic`, `locked`): the panic
+            # sink claims the lock its own thread holds, and the hook's
+            # `Sync` takes it again, so neither waits, and both lines come
+            # before the kernel's fault line. The driver serves the two and
+            # the `Sync`.
+            "name": "console_panic_locked",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_panic_locked"),
+            "expect_out": [
+                "{banner}",
+                *_after("SOS: console handover\n"
+                        + "".join(f"{line}\n"
+                                  for line in _CONSOLE_LOCKED_LINES),
+                        _panic_fault("{two}", "panic at main.saw:",
+                                     ": SOS consolepanic: a panic holding "
+                                     "the output lock")),
+                f"root: client ended status={STATUS_PANICKED}",
+                _console_served(_CONSOLE_LOCKED_LINES, 3),
+                "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A console driver that is gone before its client prints
+            # (`tests/images/console_panic_gone*.toml`, as `console_gone`'s):
+            # the client's three lines are each answered `PeerClosed` and
+            # dropped, and its panic's `Sync` meets the gone driver and
+            # answers at once, so the panic goes on: nothing lies between the
+            # driver's teardown and the client's fault line.
+            "name": "console_panic_gone",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_panic_gone"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console handover\n"
+                "SOS: process exit: code={two} process={one}\n"
+                "SOS: process teardown handles=",
+                *_after(" process={one}\n",
+                        _panic_fault("{two}", "panic at main.saw:",
+                                     ": SOS consolepanic: a panic after 3 "
+                                     "lines")),
+                "root: console ended status=65538\n"
+                f"root: client ended status={STATUS_PANICKED}"],
             "expect_clean_exit": True,
         },
     ]

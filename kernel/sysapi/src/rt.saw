@@ -21,8 +21,8 @@
 //! ops, and below `sos.system`, whose `thread_create(run:)` makes its threads
 //! at the entry this file keeps. With no console the byte goes out through
 //! `sos_system_debug_print`, on the handle `System(boot_handle:)` parks at the
-//! floor, which the hook cannot do for itself; the end goes through
-//! `sos_panic`, which needs no handle.
+//! floor, which the hook cannot do for itself; the end syncs the console, then
+//! goes through `sos_panic`, which needs no handle.
 
 import sos.floor.{SYSTEM_HANDLE, PRINT_ANSWER, PRINT_UNASKED, PRINT_DEBUG,
                   PRINT_SILENT, sos_handle_info, sos_system_debug_print,
@@ -117,7 +117,14 @@ static CUT_MARK_BYTES: UInt = 3
 /// End this process as a panic, for the common runtime: `len` bytes at `ptr`
 /// become the text of the kernel's fault line.
 ///
-/// The text is copied first into a word-aligned buffer on this stack, because
+/// It first waits for the console to write every line posted to it
+/// (`console_sync`), so they come before the kernel's line. The sync takes the
+/// output lock, which the panic sink already holds on this thread, so it takes
+/// it again and never waits. A driver that is gone answers at once, and the
+/// panic goes on; one that has stopped serving without its connection going
+/// parks the process until its supervisor kills it.
+///
+/// The text is then copied into a word-aligned buffer on this stack, because
 /// the kernel reads it through the copy-in door, which takes only a
 /// word-aligned buffer, and the text's own source need not be one: the
 /// compiler's message scratch, or a literal in read-only data.
@@ -126,15 +133,18 @@ static CUT_MARK_BYTES: UInt = 3
 /// cut would end it silently.
 ///
 /// `code` is not read: the reason in the status word and the kernel's line say
-/// it all, and the text says which end it was. No handle is read either, so a
-/// process started with none, or on a word that is not a System, ends the same
-/// way.
+/// it all, and the text says which end it was. No handle is read but the
+/// adopted console's, so a process started with none, or on a word that is not
+/// a System, ends the same way.
 ///
 /// Check-free by construction, on `rt_write`'s terms: raw `UnsafeMemory` reads
 /// and writes, and wrapping arithmetic.
 @export("sos_rt_abort")
 func rt_abort(ptr: UnsafePointer<Int8>, len: UInt,
               code: UInt32) unsafe -> Never {
+    // A driver that is gone has nothing left to write, so its answer is not
+    // read.
+    let _ = console_sync()
     var buf: [UInt; PANIC_COPY_WORDS] = [0; PANIC_COPY_WORDS]
     let dst = ((&var buf) as UnsafePointer<UInt>) as UInt
     let bound = UInt.from(truncating: PANIC_TEXT_BYTES)

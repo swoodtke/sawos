@@ -3822,12 +3822,13 @@ trap and no call back into `__saw_rt_panic`. A harness case pins it on both
 machines by taking a compiler-raised bounds check and asserting the message
 arrives in three independent pieces. In the kernel, the panic seam writes its
 message to the console and then fails the run; it never hangs. A process's
-panic ends in `PANIC_OP` (§8): the runtime hands the kernel the message, the
-kernel writes it on its fault line and ends the process `Faulted (Panic)`, root
-included, whatever handles the process holds. Nothing of a panic goes through
-`DebugPrint`. Sawlang's runtime ABI (`runtime/ABI.md`) freezes
-`__saw_rt_panic` as `noreturn`; the Saw seam produces `Never` with a
-conditionless `while { }` that has no `break`.
+panic ends in `PANIC_OP` (§8): the runtime waits for its console's `Sync`, when
+it has one (§12), then hands the kernel the message, the kernel writes it on its
+fault line and ends the process `Faulted (Panic)`, root included, whatever
+handles the process holds. Nothing of a panic goes through `DebugPrint`.
+Sawlang's runtime ABI (`runtime/ABI.md`) freezes `__saw_rt_panic` as
+`noreturn`; the Saw seam produces `Never` with a conditionless `while { }` that
+has no `break`.
 
 **Who declares the runtime.** `@export`ing a frozen `__saw_rt_*` name needs
 the compile to say it implements the runtime ABI, so `tools/sos_runner.py`
@@ -5046,9 +5047,10 @@ reserved.
   it for its life: each `print` line goes to the driver as `uartproto`
   `Write` messages of at most `MAX_PAYLOAD` bytes, posted, or called when a
   post finds no room in the ring or the caller's table, and the runtime
-  sends a `Sync` before the process exits. A process with no console record
-  prints through the debug print when its System holds `Debug`, and its
-  lines are dropped otherwise.
+  waits for a `Sync` before the process exits or panics, so every line it
+  printed comes before the kernel's exit or fault line. A process with no
+  console record prints through the debug print when its System holds
+  `Debug`, and its lines are dropped otherwise.
 - **v1 protocol conventions** (userspace convention, not kernel surface): a
   launched process receives one bootstrap pipe handle at launch; its first
   messages request its initial handle set from the launcher (name-service

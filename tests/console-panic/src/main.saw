@@ -1,0 +1,66 @@
+// A process written with `main`, with no heap, in an image that names a
+// console with no tick, which panics with its lines posted and not yet
+// written: the driver runs only once this process parks, so every line waits
+// in the ring until the panic hook's `Sync` parks it, and the panic op ends
+// the process without parking. Nothing it does allocates, its panic included,
+// so an allocation would end it with another text. The image chooses what it
+// does (`panicrole`):
+//
+//   print   three lines, then a panic: the `Sync` puts every line before the
+//           kernel's fault line;
+//   full    as many lines as the connection's ring holds, then a panic: the
+//           hook's `Sync` finds the ring full and parks for room, then for
+//           the answer;
+//   locked  the output lock taken, as a `print` takes it, a line printed and
+//           a piece written under it, then a panic with the lock still held:
+//           the panic claims the lock its own thread holds, and the hook's
+//           `Sync` takes it once more.
+
+import panicrole.{role}
+import sosmain
+
+extern "C" {
+    func __saw_rt_write(ptr: UnsafePointer<Int8>, len: Int) -> Int
+    func __saw_rt_output_lock()
+}
+
+/// How many lines `print` posts before its panic.
+static LINES: UInt = 3
+
+/// The served ring's depth (`PIPE_INFLIGHT`), which `full` fills.
+static RING: UInt = 16
+
+func main() {
+    let what = role()
+    if what == "print" {
+        lines(LINES)
+        panic("SOS consolepanic: a panic after {} lines", LINES)
+    }
+    if what == "full" {
+        lines(RING)
+        panic("SOS consolepanic: a panic with the ring full")
+    }
+    if what == "locked" {
+        locked()
+    }
+    panic("SOS consolepanic: no role {}", what)
+}
+
+/// Print `count` numbered lines, each a message posted to the ring.
+func lines(count: UInt) {
+    var i: UInt = 1
+    while i <= count {
+        print("SOS consolepanic: line {} of {}", i, count)
+        i = i + 1
+    }
+}
+
+/// Take the output lock and keep it: print a line and write a piece under
+/// it, as the executor's panic report does, then panic holding it.
+func locked() unsafe -> Never {
+    __saw_rt_output_lock()
+    print("SOS consolepanic: a line printed holding the output lock")
+    let piece = "SOS consolepanic: a piece written holding the output lock\n"
+    let _ = __saw_rt_write(piece.c_string()!, piece.len())
+    panic("SOS consolepanic: a panic holding the output lock")
+}
