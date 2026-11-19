@@ -89,7 +89,8 @@ import sos.waiter.{AttachMode, Waiter, mode_flag}
 /// built from a raw word or from another kind's handle, so handle-kind
 /// confusion is not expressible here. It costs nothing: the alias flows to
 /// `UInt` implicitly at the stub, so the calls below pass `self.handle` with no
-/// cast.
+/// cast. The field is private: only this module reads it, and no other module
+/// can construct a `System` except through `System(boot_handle:)`.
 ///
 /// `NoCopy`, and dropping it releases the handle. A `System` is a capability
 /// instance, not a description of one, so it cannot be duplicated and its scope
@@ -101,7 +102,7 @@ import sos.waiter.{AttachMode, Waiter, mode_flag}
 /// with everything else. The deinit covers the cases that do fall out of a
 /// scope.
 public struct System {
-    handle: SystemHandle,
+    private handle: SystemHandle,
 }
 
 extension System: NoCopy {
@@ -773,10 +774,13 @@ extension PipeRequest {
 /// declared at the bottom of this file).
 ///
 /// There is no way to build one from a word and no way to get a word back out.
-/// The field is private, the only constructors are this module's own op
-/// wrappers, and the derivation chain starts at `System(boot_handle:)`, so a
-/// `Process` in hand is one the kernel handed over, not an integer somebody
-/// guessed. See the two-layer rule in the `sos` module docstring (`lib.saw`).
+/// The field is `public(package)`, because `bootset` reads it (the boot set's
+/// drain and the heaps' `Map` sibling), so nothing outside the `sos` package
+/// can read it or construct a `Process`; the only constructors are this
+/// module's own op wrappers, and the derivation chain starts at
+/// `System(boot_handle:)`, so a `Process` in hand is one the kernel handed
+/// over, not an integer somebody guessed. See the two-layer rule in the `sos`
+/// module docstring (`lib.saw`).
 ///
 /// `NoCopy`, and dropping it releases the handle. `System.process_self()` mints
 /// a fresh instance on every call, so two calls give two independently owned
@@ -802,11 +806,15 @@ extension PipeRequest {
 /// caller. `thread_create(run:arg:stack_top:)` is self-only too, and asks the
 /// wrapper rather than the kernel (`names_caller`).
 public struct Process {
-    handle: ProcessHandle,
-    /// Whether this wrapper is known to name the calling process: set by
-    /// `System.process_self()` and carried by `mint`, and clear on a wrapper
-    /// that arrived any other way (a create, a walk, a request's sender, a
-    /// boot record), even one that happens to name the caller.
+    public(package) handle: ProcessHandle,
+    // A `private` field's notes are `//` comments, not `///`: the compiler
+    // drops the `private` of a field that follows a doc comment, which would
+    // make it public (`handle_fields_sealed` catches that).
+    //
+    // Whether this wrapper is known to name the calling process: set by
+    // `System.process_self()` and carried by `mint`, and clear on a wrapper
+    // that arrived any other way (a create, a walk, a request's sender, a
+    // boot record), even one that happens to name the caller.
     private names_caller: Bool,
 }
 
@@ -2156,57 +2164,61 @@ public struct BootHandle {
     /// reach for. A caller that asserts this is asserting the giver gave what
     /// its config says it gave.
     public kind: BootHandleKind,
-    /// The region itself, until somebody takes it. Private on purpose: the only
-    /// way out is `take_memory`, which is what makes the one-owner rule hold.
-    memory: Memory?,
-    /// The pool, on the same terms; `take_pool` is its one door. A pool row of
-    /// the build's region table mints a `Pool`, and a launcher may give one.
-    pool: Pool?,
-    /// The Process handle, on the same terms; `take_process` is its one door.
-    process: Process?,
-    /// The System handle, on the same terms; `take_system` is its one door. A
-    /// record has one object, so at most one of these slots is ever occupied
-    /// and `kind` says which. They are separate fields rather than an enum
-    /// payload because asking the wrong one must be harmless: an enum would
-    /// have to be taken out of the record to be matched, and a mismatch would
-    /// then drop a capability the caller still wanted.
-    system: System?,
-    /// The device window, on the same terms; `take_iomemory` is its one door. A
-    /// device row of the build's region table mints an `IoMemory`, and a
-    /// driver's first act is to drain it.
-    iomemory: IoMemory?,
-    /// The client end of a connection, on the same terms; `take_inlet` is its
-    /// one door. A launcher creates a pair and gives one end across, and the
-    /// child drains it as it drains a region.
-    inlet: PipeInlet?,
-    /// The server end, on the same terms; `take_outlet` is its one door. Which
-    /// end a child receives is entirely its launcher's config, so both
-    /// spellings exist and a record carries at most one of them.
-    outlet: PipeOutlet?,
-    /// A claim on one reply, on the same terms; `take_reply` is its one door.
-    /// §2.1 makes both one-shots transferable, so any holder may hand one
-    /// across, and a child collects it as it collects a region.
-    reply: PipeReply?,
-    /// An obligation to reply, on the same terms; `take_request` is its one
-    /// door. §2.1 calls it the delegation primitive: a child that receives one
-    /// answers a question it was never asked, and its bytes go straight to
-    /// whoever asked it.
-    request: PipeRequest?,
-    /// A notification, on the same terms; `take_event` is its one door. A
-    /// launcher hands a child an Event, often narrowed to the producer or the
-    /// consumer end, and the child drains it as it drains a region.
-    event: Event?,
-    /// A Thread, on the same terms; `take_thread` is its one door. A launcher
-    /// hands a child the thread it is to join.
-    thread: thread.Thread?,
-    /// A Waiter, on the same terms; `take_waiter` is its one door.
-    waiter: Waiter?,
-    /// A Timer, on the same terms; `take_timer` is its one door.
-    timer: Timer?,
-    /// An Interrupt, on the same terms; `take_interrupt` is its one door. A
-    /// launcher binds a line and hands the driver that services it the one
-    /// handle.
-    interrupt: Interrupt?,
+    // A `private` field's notes are `//` comments, not `///`: the compiler
+    // drops the `private` of a field that follows a doc comment, which would
+    // make it public (`handle_fields_sealed` catches that).
+    //
+    // The region itself, until somebody takes it. Private on purpose: the only
+    // way out is `take_memory`, which is what makes the one-owner rule hold.
+    private memory: Memory?,
+    // The pool, on the same terms; `take_pool` is its one door. A pool row of
+    // the build's region table mints a `Pool`, and a launcher may give one.
+    private pool: Pool?,
+    // The Process handle, on the same terms; `take_process` is its one door.
+    private process: Process?,
+    // The System handle, on the same terms; `take_system` is its one door. A
+    // record has one object, so at most one of these slots is ever occupied
+    // and `kind` says which. They are separate fields rather than an enum
+    // payload because asking the wrong one must be harmless: an enum would
+    // have to be taken out of the record to be matched, and a mismatch would
+    // then drop a capability the caller still wanted.
+    private system: System?,
+    // The device window, on the same terms; `take_iomemory` is its one door. A
+    // device row of the build's region table mints an `IoMemory`, and a
+    // driver's first act is to drain it.
+    private iomemory: IoMemory?,
+    // The client end of a connection, on the same terms; `take_inlet` is its
+    // one door. A launcher creates a pair and gives one end across, and the
+    // child drains it as it drains a region.
+    private inlet: PipeInlet?,
+    // The server end, on the same terms; `take_outlet` is its one door. Which
+    // end a child receives is entirely its launcher's config, so both
+    // spellings exist and a record carries at most one of them.
+    private outlet: PipeOutlet?,
+    // A claim on one reply, on the same terms; `take_reply` is its one door.
+    // §2.1 makes both one-shots transferable, so any holder may hand one
+    // across, and a child collects it as it collects a region.
+    private reply: PipeReply?,
+    // An obligation to reply, on the same terms; `take_request` is its one
+    // door. §2.1 calls it the delegation primitive: a child that receives one
+    // answers a question it was never asked, and its bytes go straight to
+    // whoever asked it.
+    private request: PipeRequest?,
+    // A notification, on the same terms; `take_event` is its one door. A
+    // launcher hands a child an Event, often narrowed to the producer or the
+    // consumer end, and the child drains it as it drains a region.
+    private event: Event?,
+    // A Thread, on the same terms; `take_thread` is its one door. A launcher
+    // hands a child the thread it is to join.
+    private thread: thread.Thread?,
+    // A Waiter, on the same terms; `take_waiter` is its one door.
+    private waiter: Waiter?,
+    // A Timer, on the same terms; `take_timer` is its one door.
+    private timer: Timer?,
+    // An Interrupt, on the same terms; `take_interrupt` is its one door. A
+    // launcher binds a line and hands the driver that services it the one
+    // handle.
+    private interrupt: Interrupt?,
 }
 
 extension BootHandle: NoCopy {}

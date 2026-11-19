@@ -1,0 +1,44 @@
+// A program written with `main` that reaches past the `sos` wrappers: the
+// handle word of the System and of the Process `sosmain` lends it, the
+// Process's self-only flag, its boot set's records and count, and every
+// wrapper slot of a boot record. None of these fields is reachable outside
+// the `sos` package, so the compile refuses each read and the program is
+// never linked (`handle_fields_sealed`).
+
+import sos.{BootHandle}
+import sosmain
+
+// How many of the record's slots are empty, one read per slot.
+func empty_slots(record: &BootHandle) -> Int {
+    var empty = 0
+    if record.memory.is_none() { empty = empty + 1 }
+    if record.pool.is_none() { empty = empty + 1 }
+    if record.process.is_none() { empty = empty + 1 }
+    if record.system.is_none() { empty = empty + 1 }
+    if record.iomemory.is_none() { empty = empty + 1 }
+    if record.inlet.is_none() { empty = empty + 1 }
+    if record.outlet.is_none() { empty = empty + 1 }
+    if record.reply.is_none() { empty = empty + 1 }
+    if record.request.is_none() { empty = empty + 1 }
+    if record.event.is_none() { empty = empty + 1 }
+    if record.thread.is_none() { empty = empty + 1 }
+    if record.waiter.is_none() { empty = empty + 1 }
+    if record.timer.is_none() { empty = empty + 1 }
+    if record.interrupt.is_none() { empty = empty + 1 }
+    empty
+}
+
+func main() {
+    let context = sosmain.context()
+    let system_word: UInt = context.system().handle
+    let process_word: UInt = context.process().handle
+    let names_caller: Bool = context.process().names_caller
+    var set = sosmain.take_boot_set()
+    let first_word: UInt = set.records[0]
+    let count: Int = set.count
+    if let record = set.take(tag: 0) {
+        print("SOS sealed: empty={}", empty_slots(&record))
+    }
+    print("SOS sealed: system={} process={} self={} first={} count={}",
+          system_word, process_word, names_caller, first_word, count)
+}

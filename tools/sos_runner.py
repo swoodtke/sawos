@@ -967,6 +967,9 @@ CHILD_MAIN_LEND_PROCESS_PKG = os.path.join(TESTS_DIR,
 # refuses; and a `_start` root whose second thread waits on the output lock.
 MAIN_UNIMPORTED_PKG = os.path.join(TESTS_DIR, "main-unimported")
 LOCK_WAIT_PKG = os.path.join(TESTS_DIR, "lock-wait")
+# A `main` program reading fields `sos` keeps to itself (handle words, a boot
+# set's records, a boot record's slots), which the compile refuses.
+HANDLE_SEALED_PKG = os.path.join(TESTS_DIR, "handle-sealed")
 # Threads made with `thread_create(run:arg:stack_top:)`: `thread-run`
 # launches `child-thread-run` once per role, and `child-thread-take`, under
 # `death-notify`, has two threads take the boot set.
@@ -13126,6 +13129,29 @@ TEST_CASES = [
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MAIN_UNIMPORTED_PKG,
         "expect_build_error": "no _start: a main program imports sosmain",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+    {
+        # A program reading past the wrappers: the handle words of its System
+        # and its Process, the Process's self-only flag, a boot set's records
+        # and count, and every slot of a boot record. None is reachable
+        # outside the `sos` package, so the compile refuses every read, and
+        # each refusal is asserted.
+        "name": "handle_fields_sealed",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_SEALED_PKG,
+        "expect_build_error": [
+            f"`sos.{owner}` has no member `{field}` this module can see"
+            for owner, fields in [
+                ("system.System", ["handle"]),
+                ("system.Process", ["handle", "names_caller"]),
+                ("bootset.BootSet", ["records", "count"]),
+                ("system.BootHandle",
+                 ["memory", "pool", "process", "system", "iomemory", "inlet",
+                  "outlet", "reply", "request", "event", "thread", "waiter",
+                  "timer", "interrupt"])]
+            for field in fields],
         "expect_out": [],
         "expect_clean_exit": False,
     },
