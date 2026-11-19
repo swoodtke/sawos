@@ -4827,7 +4827,8 @@ reserved.
   the declaration's or, for a kind the declaration leaves out, below the one the
   image's children start with (an image raises a row and never lowers one), a
   `threads` row of 0 (a child's first thread is charged to it), and a child
-  whose `Handle` row is short of what it holds when it starts. A step that fails
+  whose `Handle` row is short of what it holds when it starts, the console's
+  inlet below included. A step that fails
   prints the step, the child and the status and stops the machine; a child whose
   image says `on-exit = "shutdown"` stops the machine when it ends, and the
   machine stops when every child has ended.
@@ -4967,9 +4968,10 @@ reserved.
   it everything allocated through the narrowed handle.
 - **The launch convention** (userspace convention, not kernel surface). A
   launcher that follows it gives a child exactly the records its declaration
-  lists (`process.toml`), under their tags, in declared order, before start.
-  It sets the declared quota rows before any give (§2.7, `QuotaSet`). It
-  gives windows, lines and endpoints as capabilities: a client gets an inlet
+  lists (`process.toml`), under their tags, in declared order, before start,
+  and in an image that names a console the console record after them
+  (below). It sets the declared quota rows before any give (§2.7,
+  `QuotaSet`). It gives windows, lines and endpoints as capabilities: a client gets an inlet
   minted with `Post | Transfer`, a server the outlet. It starts the child
   with its System record's tag, a sibling masked with the System rights the
   record names (`rights`, by `SystemRight`'s names: `debug`, `process-self`,
@@ -4982,6 +4984,20 @@ reserved.
   name. `Shutdown`, process creation and the rest are the launcher's own to
   give, never a declaration's or an image's. A child that knows its records
   by tag drains them all at once (`sos.BootSet`) and takes each by its tag.
+- **The console record** (userspace convention, not kernel surface). The
+  tags from `0xFFFF_FF00` to `0xFFFF_FFFF` are the runtime's: a launcher
+  gives a record under one for the runtime to take, and the image builder
+  refuses a declaration that names one. The first is `CONSOLE_TAG`
+  (`bootplan`). An image whose root is the stock root may name its console,
+  `[image] console = "PROCESS.RECORD"`, a serve record of `uartproto`; the
+  builder refuses a reference to no process or record, a record that is not
+  a serve, another protocol, and the key in an image with a hand-written
+  root. Every other process of the image is then given one record more,
+  after its declared ones: an inlet of that connection under `CONSOLE_TAG`,
+  minted as a client's is, so the stock root gives it as any other inlet.
+  A process holds it from its start, so the builder raises by one the
+  handles it holds when it starts, and a `Handle` row at its declaration's
+  own floor is refused in such an image.
 - **v1 protocol conventions** (userspace convention, not kernel surface): a
   launched process receives one bootstrap pipe handle at launch; its first
   messages request its initial handle set from the launcher (name-service

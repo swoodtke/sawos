@@ -19,9 +19,13 @@
 //! other; a `part` window is a carve of its device's row; a `line` is the
 //! bound device's interrupt line, which root binds; a `serve` is the server
 //! end of a connection of its own, and a `client` an inlet of the connection
-//! of the serve it is bound to; a `memory` record is its pool's row. Its quota
-//! rows are its declaration's `[quota]`, each replaced by the image's
-//! `quota` for it, which may raise a row and not lower it.
+//! of the serve it is bound to; a `memory` record is its pool's row. In an
+//! image that names a console (`[image] console`), every process but the one
+//! serving it is given one record more, after its declared ones: an inlet of
+//! the console's connection under `bootplan.CONSOLE_TAG`, which raises the
+//! handles it holds when it starts by one. Its quota rows are its
+//! declaration's `[quota]`, each replaced by the image's `quota` for it,
+//! which may raise a row and not lower it.
 //!
 //! A `[[setup]]` write carves from its device's row the window of the board's
 //! grain (four bytes at least) that holds its register, and writes the
@@ -35,9 +39,10 @@
 //! image leaves, a row at the ledger's unlimited mark, a row the image alone
 //! gives below the row the image's children start with (an image raises a
 //! row and never lowers one), a child whose `Handle` row is short of what it
-//! holds when it starts, and a step at which root would hold more handles
-//! than its table has or make more objects of a kind than the image's slab
-//! of it holds: Process objects (root and each child), Pipe objects (one per
+//! holds when it starts (the console's inlet included, so a row at the
+//! declaration's own floor is short in an image that names a console), and a
+//! step at which root would hold more handles than its table has or make
+//! more objects of a kind than the image's slab of it holds: Process objects (root and each child), Pipe objects (one per
 //! connection), Interrupt objects (one per line) and IoMemory objects (one
 //! per device row, carve given and setup write's carve).
 //!
@@ -73,7 +78,7 @@
 
 import toml.{TomlPosition}
 import bootplan.{CHILD_WORDS, QUOTA_WORDS, RECORD_WORDS, RIGHT_WORDS, SETUP_WORDS,
-                 PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS, ROW_WINDOW_WORDS}
+                 PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS, ROW_WINDOW_WORDS, CONSOLE_TAG}
 import sosimage.board.{Board, Window, quota_keys}
 import sosimage.declaration.{Declaration, RecordKind, child_rights}
 import sosimage.failure.{BuildError}
@@ -190,8 +195,9 @@ public struct PlanChild {
     rights: Vector<String>
     start: Int
     shutdown: Bool
-    /// The handles it holds when it starts (`Declaration.handle_floor`); 0
-    /// for a test image's child, which nothing holds to it.
+    /// The handles it holds when it starts (`Declaration.handle_floor`, and
+    /// one for the console's inlet when it is given one); 0 for a test
+    /// image's child, which nothing holds to it.
     floor: Int
 }
 
@@ -363,6 +369,15 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
         p = p + 1
     }
 
+    // The console's connection and the process serving it, which `bind`
+    // holds to be a serve of this image.
+    var console: Int? = None
+    var console_server = ""
+    if let target = image.console {
+        console = index_of(&connections, target)
+        console_server = target.substring(0, target.index_of(46)!)
+    }
+
     var children = Vector<PlanChild>()
     var lines = Vector<String>()
     var line_holders = Vector<String>()
@@ -428,13 +443,21 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
                 }
                 try! records.push(made)
             }
+            var floor = d.handle_floor()
+            if let index = console {
+                if not process.name.equals(console_server) {
+                    try! records.push(PlanRecord(tag: CONSOLE_TAG as Int, source: Source.Inlet,
+                                                 from: index as UInt64, offset: 0, len: 0))
+                    floor = floor + 1
+                }
+            }
             let quota = try quota_rows(&image, &d, process.name, process.at)
             try! children.push(PlanChild(name: process.name, image: p, destination: count + p,
                                          quota: move quota, records: move records,
                                          rights: d.system_rights_or(&image.system_rights),
                                          start: start,
                                          shutdown: process.on_exit.equals("shutdown"),
-                                         floor: d.handle_floor()))
+                                         floor: floor))
         }
         p = p + 1
     }
@@ -646,9 +669,25 @@ func check_child(child: &PlanChild, facts: &KernelFacts, defaults: &Vector<Int>,
         }
     }
     if handles < child.floor {
+        if has_console(&child) {
+            return BuildError(message: "{what}: the process {child.name}'s `Handle` row is {handles}, short of the {child.floor} handles it holds when it starts, the console's inlet under CONSOLE_TAG among them")
+        }
         return BuildError(message: "{what}: the process {child.name}'s `Handle` row is {handles}, short of the {child.floor} handles it holds when it starts")
     }
     return
+}
+
+/// Whether `child` is given the console's inlet.
+func has_console(child: &PlanChild) -> Bool {
+    var r = 0
+    while r < child.records.len() {
+        let record = child.records.get(r)!
+        if record.tag == CONSOLE_TAG as Int && record.source == Source.Inlet {
+            return true
+        }
+        r = r + 1
+    }
+    false
 }
 
 /// Refuses a step of `plan` at which root would hold more than `table`

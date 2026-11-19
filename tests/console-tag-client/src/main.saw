@@ -1,0 +1,69 @@
+//! A process of an image that names a console (`[image] console`), written
+//! with its own `_start`: it drains its boot set, finds the record the image
+//! builder appends to its declared ones, an inlet of the console's connection
+//! under `bootplan.CONSOLE_TAG`, and writes a line through it to the driver
+//! serving the console.
+//!
+//! Its declaration lists only its System record, which it is started with, so
+//! the drain meets exactly one record, and the client says so before it
+//! writes. A different set is printed through its System handle, and the
+//! client exits with `EXIT_FAILED`.
+
+import sos.{System, Process, BootSet}
+import bootplan.{CONSOLE_TAG}
+import uartpipe.{uart}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// Print `what` and end the process.
+func fail(proc: &Process, what: String) {
+    print("SOS consoletag: {}", what)
+    let _ = proc.exit(EXIT_FAILED)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch { return }
+    var set = try BootSet(process: &proc) catch {
+        print("SOS consoletag: drain: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    if set.len() != 1 {
+        print("SOS consoletag: the drain met {} records, not the console's alone",
+              set.len())
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let entry = set.entry(at: 0)
+    if entry.tag != CONSOLE_TAG {
+        print("SOS consoletag: the one record is under {}, not CONSOLE_TAG",
+              entry.tag)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    guard var record = set.take(CONSOLE_TAG) else {
+        fail(&proc, "no record under CONSOLE_TAG to take")
+        return
+    }
+    guard let inlet = record.take_inlet() else {
+        fail(&proc, "the record under CONSOLE_TAG is no inlet")
+        return
+    }
+    print("SOS consoletag: one record, an inlet under CONSOLE_TAG")
+    var u = uart(move inlet)
+    try u.write("SOS consoletag: a line through the console's inlet\n") catch {
+        print("SOS consoletag: write: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    // The `Sync` settles the write before this process ends.
+    try u.sync() catch {
+        print("SOS consoletag: sync: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let _ = proc.exit(EXIT_OK)
+}

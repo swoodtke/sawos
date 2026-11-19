@@ -42,8 +42,10 @@
 //! the launcher's to give.
 //!
 //! Beyond the rules of `sosimage.rules`, a declaration is refused by name
-//! for: a `count` on a record (the list form, reserved); a right in `rights`
-//! that is not one of the four, or one named twice; a tag given twice;
+//! for: a `count` on a record (the list form, reserved); a tag in the range
+//! the runtime reserves (`bootplan.RESERVED_TAG_FIRST` up, whose first is
+//! `CONSOLE_TAG`); a right in `rights` that is not one of the four, or one
+//! named twice; a tag given twice;
 //! not exactly one `system` record; a name given twice within its family
 //! (device needs; endpoints, a serve and a client sharing one set of names;
 //! memory), where a window and a line of one type under one name are one
@@ -60,6 +62,10 @@
 //! `process.toml`, depends on `sosmain`: that package's start-up mints the
 //! main thread's handle before `main` runs (`Declaration.load`).
 //!
+//! A declaration does not know its image, so its floor leaves out the record
+//! an image that names a console gives the process; the plan adds it
+//! (`sosimage.plan`).
+//!
 //! Against a board (`check_against`), a process is also refused for an
 //! `arena` or a tag the board's word cannot hold, a type the board has no
 //! device of, a board input of a type it needs (other than through a `part`
@@ -69,7 +75,9 @@
 import std.path.{Path}
 import toml.{TomlDoc, TomlKind, TomlPosition, TomlTable}
 import sosimage.board.{Board, NamedCount, expect_table, quota_keys, read_counts}
+import bootplan.{RESERVED_TAG_FIRST, RESERVED_TAG_LAST, is_reserved_tag}
 import sosimage.failure.{BuildError}
+import sosimage.hex.{hex}
 import sosimage.tool.{read_text}
 import sosimage.rules.{
     check_format, check_input_name, check_name, check_path, count, element_at, fits_board_word, flag, holds,
@@ -530,6 +538,10 @@ func read_record(r: &TomlTable, file: String) -> Result<BootRecord, BuildError> 
     let name = try text(&r, "name", file)
     try check_name(name, file, where_is(&r, "name"), "a record's name")
     let tag = try count(&r, "tag", file, "[[boot]]")
+    if is_reserved_tag(tag as UInt) {
+        return refused(file, where_is(&r, "tag"),
+                       "the tag {hex(tag as UInt64)} of `{name}` is one the runtime reserves, {hex(RESERVED_TAG_FIRST as UInt64)} to {hex(RESERVED_TAG_LAST as UInt64)}, for records it is given itself (the console's, under CONSOLE_TAG): a declaration's tags lie below the range")
+    }
     var type_name = ""
     if is_need(kind) {
         type_name = try text(&r, "type", file)

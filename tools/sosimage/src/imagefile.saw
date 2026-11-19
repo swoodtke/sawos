@@ -6,6 +6,7 @@
 //!     name = "logger"
 //!     board = "esp32s3"                  a board description's `name`
 //!     tick = true
+//!     console = "console.uart"           optional: PROCESS.RECORD
 //!
 //!     [limits]                           optional: a board's [limits.default]
 //!
@@ -53,6 +54,11 @@
 //! narrows the launch convention's four and never widens them. An empty list
 //! gives such a process none; with no `[system]` it keeps the four.
 //!
+//! `console` names the image's console, a stock root's: a serve record of
+//! `uartproto` (`console_protocol()`), in the grammar `clients` uses. Every
+//! process but the one serving it is given an inlet of that connection under
+//! `bootplan.CONSOLE_TAG`, after its declared records (`sosimage.plan`).
+//!
 //! `[keys]` chooses the kernel's keyed modules: each key it states is one of
 //! the board's build keys (`sosimage.board`), and its value names the
 //! directory the key's module is compiled from, the module's path with the
@@ -62,19 +68,20 @@
 //!
 //! Reading (`ImageFile.read`) holds the image to the rules of
 //! `sosimage.rules` and to its board: a process name given twice, or twice
-//! but for case, or `root` in any case; a pool name given twice; a reference outside its grammar; a `[[setup]]` or
-//! `[rows]` reference naming what the board does not have; `[system]` for a
-//! hand-written root, and a right in it outside the ceiling or named twice;
-//! a list where one
-//! value goes (the list forms, reserved); a RAM name that is reserved or not
-//! a process range of the board; a package or an input that is not a path
-//! (`check_path`); a pool length the board's word cannot hold; a pool bound
-//! twice or bound to nothing; a key of `[keys]` that is no build key of the
-//! board, or a value that is not one of the key's. Binding a stock root's
-//! processes to their declarations (`bind`) is the rest of it, a `device`
-//! reference against the board included: device needs to devices, by type;
-//! client records to serves; memory records to pools; every input to its
-//! value; and each process to a RAM range (`choose_range`).
+//! but for case, or `root` in any case; a pool name given twice; a reference
+//! outside its grammar; a `[[setup]]` or `[rows]` reference naming what the
+//! board does not have; `[system]` or `console` for a hand-written root, and
+//! a right in `[system]` outside the ceiling or named twice; a list where
+//! one value goes (the list forms, reserved); a RAM name that is reserved or
+//! not a process range of the board; a package or an input that is not a
+//! path (`check_path`); a pool length the board's word cannot hold; a pool
+//! bound twice or bound to nothing; a key of `[keys]` that is no build key
+//! of the board, or a value that is not one of the key's. Binding a stock
+//! root's processes to their declarations (`bind`) is the rest of it, a
+//! `device` reference against the board included: device needs to devices,
+//! by type; client records to serves; memory records to pools; every input
+//! to its value; each process to a RAM range (`choose_range`); and `console`
+//! to a serve of `uartproto`.
 
 import toml.{TomlKind, TomlPosition, TomlTable}
 import sosimage.board.{Board, LimitsSpec, NamedCount, RefUse, Window, expect_table,
@@ -167,6 +174,9 @@ public struct ImageFile {
     name: String
     board: String
     tick: Bool
+    /// The console, as PROCESS.RECORD; none when the image names none.
+    console: String?
+    console_at: TomlPosition
     has_limits: Bool
     limits: LimitsSpec
     /// `[keys]`, in file order.
@@ -234,8 +244,10 @@ extension ImageFile {
         var name = ""
         var board_name = ""
         var tick = false
+        var console: String? = None
+        var console_at = root.defined_at()
         if let i = root.table("image") {
-            let image_keys: Vector<String> = ["name", "board", "tick"]
+            let image_keys: Vector<String> = ["name", "board", "tick", "console"]
             try only_keys(&i, &image_keys, file, "[image]")
             name = try text(&i, "name", file)
             try check_name(name, file, where_is(&i, "name"), "an image's name")
@@ -246,6 +258,10 @@ extension ImageFile {
             }
             tick = try i.boolean("tick") catch {
                 return toml_refused(file, error)
+            }
+            if i.contains("console") {
+                console = try text(&i, "console", file)
+                console_at = where_is(&i, "console")
             }
         }
 
@@ -275,6 +291,10 @@ extension ImageFile {
         }
         let stock = root_package.equals("stock")
         let root_at = where_is(&root, "root")
+        if console != None && not stock {
+            return refused(file, console_at,
+                           "`console` in [image] is the stock root's: a hand-written root gives its own records, and its description says what it gives")
+        }
 
         var system_rights = child_rights()
         try expect_table(&root, "system", file)
@@ -442,6 +462,7 @@ extension ImageFile {
         }
 
         return ImageFile(file: file, name: name, board: board_name, tick: tick,
+                         console: console, console_at: console_at,
                          has_limits: has_limits, limits: move limits, keys: move keys,
                          stock: stock,
                          root_package: root_package, root_at: root_at,
@@ -749,7 +770,10 @@ extension Bindings: ExplicitCopy {}
 /// the image places in a slow range, or one it names no range for on a board
 /// with no fast process range (`choose_range`, which places a fast process
 /// that names none in a fast range); an input with no value, or an image
-/// input that is none of the process's.
+/// input that is none of the process's; and a `console` that is not
+/// PROCESS.RECORD, or names no process of the image, no record of that
+/// process, a record that is not a serve, or a serve of a protocol other than
+/// `console_protocol()`.
 public func bind(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
                  grain: UInt64) -> Result<Bindings, BuildError> {
     let file = image.file
@@ -765,6 +789,9 @@ public func bind(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
             try! ranges.push(try bind_process(&image, &board, &d, &decls, &process, grain,
                                               &var windows, &var values, &var notes))
         }
+    }
+    if let target = image.console {
+        try console_serve(&image, &decls, target)
     }
 
     // Every device bound to more than one process, printed.
@@ -1006,6 +1033,54 @@ func serve_of(image: &ImageFile, decls: &Vector<Declaration>, client: &BootRecor
         return
     }
     return refused(file, entry.at, "`{target}` names no process of this image: there is no `{server}`")
+}
+
+/// The protocol an image's console speaks: the runtime writes a process's
+/// lines to it as this protocol's `Write`s.
+public func console_protocol() -> String {
+    "uartproto"
+}
+
+/// Refuses an image's `console`, `target`, that is not PROCESS.RECORD, or
+/// that names no process of the image, no record of that process, a record
+/// that is not a serve, or a serve of a protocol other than
+/// `console_protocol()`.
+func console_serve(image: &ImageFile, decls: &Vector<Declaration>,
+                   target: String) -> Result<Void, BuildError> {
+    let file = image.file
+    let at = image.console_at
+    let protocol = console_protocol()
+    guard let dot = target.index_of(46) else {
+        return refused(file, at, "`console` in [image] is `{target}`, not PROCESS.RECORD, a process and its serve record")
+    }
+    let server = target.substring(0, dot)
+    let name = target.substring(dot + 1, target.len())
+    var i = 0
+    while i < image.processes.len() {
+        let p = image.processes.get(i)!
+        i = i + 1
+        if not p.name.equals(server) {
+            continue
+        }
+        borrow let d = decls[i - 1] {
+            if let serve = d.record(RecordKind.Serve, name) {
+                if not serve.protocol.equals(protocol) {
+                    return refused(file, at, "`console` in [image] is `{target}`, which serves `{serve.protocol}`: the console is a serve record of `{protocol}`")
+                }
+                return
+            }
+            var r = 0
+            while r < d.records.len() {
+                let other = d.records.get(r)!
+                r = r + 1
+                if other.name.equals(name) {
+                    return refused(file, at, "`console` in [image] is `{target}`, a {kind_word(other.kind)} record of the process {server}: the console is a serve record of `{protocol}`")
+                }
+            }
+            return refused(file, at, "`console` in [image] is `{target}`, and the process {server} has no record `{name}`")
+        }
+    }
+    return refused(file, at, "`console` in [image] is `{target}`, which names no process of this image: there is no `{server}`")
 }
 
 extension ImageFile {

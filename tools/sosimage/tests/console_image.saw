@@ -1,0 +1,378 @@
+// An image that names its console (`[image] console`): the key read, each
+// refusal of it, the record the plan appends to every process but the
+// console's server, the floor it raises, the checks that floor is held to,
+// and root's arena with the record counted.
+
+import bootplan.{CONSOLE_TAG, RECORD_WORDS}
+import sosimage.board.{Board}
+import sosimage.declaration.{Declaration}
+import sosimage.imagefile.{ImageFile, bind}
+import sosimage.kernel.{KernelFacts}
+import sosimage.plan.{ImagePlan, PlanSlabs, Source, check_plan, heap_block, plan_image,
+                      plan_module, root_arena, root_blocks}
+
+func join(lines: &Vector<String>) -> String {
+    "{lines.join("\n")}\n"
+}
+
+// An ESP32-S3 board with a UART beside the kernel's console.
+func board() -> Board {
+    let lines: Vector<String> = [
+        "format = 1",
+        "[board]",
+        "name = \"esp32s3\"",
+        "triple = \"xtensa-esp-unknown-elf\"",
+        "tier = \"flat\"",
+        "hal = \"hal/xtensa-esp32s3\"",
+        "placement = \"copied\"",
+        "modules = []",
+        "cflags = []",
+        "[emulator]",
+        "program = \"qemu-system-xtensa\"",
+        "args = []",
+        "[ram.kernel]",
+        "use = \"kernel\"",
+        "speed = \"fast\"",
+        "base = 0x3FC8_C000",
+        "len = 0x2_4000",
+        "[ram.sram]",
+        "use = \"process\"",
+        "speed = \"fast\"",
+        "base = 0x3FCB_0000",
+        "len = 0x4_0000",
+        "[ram.default]",
+        "process = \"sram\"",
+        "pool = \"sram\"",
+        "[devices.UART0]",
+        "type = \"esp32s3-uart\"",
+        "base = 0x6000_0000",
+        "len = 0x1000",
+        "line = 27",
+        "kernel = true",
+        "[devices.UART1]",
+        "type = \"esp32s3-uart\"",
+        "base = 0x6001_0000",
+        "len = 0x1000",
+        "line = 28"]
+    try! Board.parse(join(&lines), "hal/xtensa-esp32s3/board.toml")
+}
+
+func decl(lines: Vector<String>, file: String) -> Declaration {
+    try! Declaration.parse(join(&lines), file)
+}
+
+// The console's driver: a UART window, its line and a `uartproto` serve. Its
+// `handles` row is its floor, six, which the console does not raise: it
+// serves the console and is given no record of it.
+func driver() -> Declaration {
+    decl(["format = 1", "arena = 0x1000",
+          "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+          "[[boot]]", "name = \"port\"", "kind = \"window\"", "type = \"esp32s3-uart\"", "tag = 2",
+          "[[boot]]", "name = \"port\"", "kind = \"line\"", "type = \"esp32s3-uart\"", "tag = 3",
+          "[[boot]]", "name = \"uart\"", "kind = \"serve\"", "protocol = \"uartproto\"", "tag = 4",
+          "[quota]", "handles = 6"],
+         "driver/process.toml")
+}
+
+// A client of the console driver's own: it holds two inlets of one
+// connection in a console image.
+func hello() -> Declaration {
+    decl(["format = 1", "arena = 0x1000",
+          "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+          "[[boot]]", "name = \"uart\"", "kind = \"client\"", "protocol = \"uartproto\"", "tag = 2"],
+         "hello/process.toml")
+}
+
+// A server of another protocol.
+func logger() -> Declaration {
+    decl(["format = 1", "arena = 0x1000",
+          "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+          "[[boot]]", "name = \"log\"", "kind = \"serve\"", "protocol = \"logproto\"", "tag = 2"],
+         "logger/process.toml")
+}
+
+// A process whose `handles` row is its declaration's floor: its System and
+// Process handles.
+func beat() -> Declaration {
+    decl(["format = 1", "arena = 0x1000",
+          "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+          "[quota]", "handles = 2"],
+         "beat/process.toml")
+}
+
+func decls() -> Vector<Declaration> {
+    var out = Vector<Declaration>()
+    try! out.push(driver())
+    try! out.push(hello())
+    try! out.push(logger())
+    try! out.push(beat())
+    move out
+}
+
+// An image of the four, its console the driver's serve.
+func image_lines() -> Vector<String> {
+    ["format = 1",                                       // 1
+     "[image]",                                          // 2
+     "name = \"boxed\"",                                 // 3
+     "board = \"esp32s3\"",                              // 4
+     "tick = true",                                      // 5
+     "console = \"console.uart\"",                       // 6
+     "[root]",                                           // 7
+     "package = \"stock\"",                              // 8
+     "[[process]]",                                      // 9
+     "name = \"console\"",                               // 10
+     "package = \"driver\"",                             // 11
+     "device = \{ port = \"UART1\" \}",                  // 12
+     "[[process]]",                                      // 13
+     "name = \"hello\"",                                 // 14
+     "package = \"hello\"",                              // 15
+     "clients = \{ uart = \"console.uart\" \}",          // 16
+     "[[process]]",                                      // 17
+     "name = \"logger\"",                                // 18
+     "package = \"logger\"",                             // 19
+     "[[process]]",                                      // 20
+     "name = \"beat\"",                                  // 21
+     "package = \"beat\""]                               // 22
+}
+
+// The image's text with line `n` replaced by `with`.
+func with_line(n: Int, with: String) -> String {
+    var lines = image_lines()
+    lines[n - 1] = with
+    join(&lines)
+}
+
+func read_refusal(text: String) -> String {
+    let b = board()
+    match ImageFile.parse(text, "i.toml", &b, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func bind_refusal(text: String) -> String {
+    let b = board()
+    let image = try! ImageFile.parse(text, "i.toml", &b, 4)
+    let d = decls()
+    match bind(&image, &b, &d, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect(got: String, want: String, what: String) {
+    if not got.equals(want) {
+        print("expected: {want}")
+        print("got:      {got}")
+    }
+    assert(got.equals(want), what)
+}
+
+// The plan of an image's text whose processes are `d`.
+func planned_with(text: String, d: &Vector<Declaration>) -> ImagePlan {
+    let b = board()
+    let image = try! ImageFile.parse(text, "i.toml", &b, 4)
+    let bound = try! bind(&image, &b, &d, 4)
+    try! plan_image(&image, &b, &d, &bound, 4)
+}
+
+// The plan of an image's text whose processes are `decls()`.
+func planned(text: String) -> ImagePlan {
+    let d = decls()
+    planned_with(text, &d)
+}
+
+// A kernel whose tables hold `table` handles.
+func facts(table: Int) -> KernelFacts {
+    var zeros = Vector<Int>()
+    var k = 0
+    while k < 13 {
+        try! zeros.push(0)
+        k = k + 1
+    }
+    var defaults = Vector<Int>()
+    k = 0
+    while k < 9 {
+        try! defaults.push(4)
+        k = k + 1
+    }
+    KernelFacts(word: 4, capacity: 255, extents: 4, records_per_body: 4, handles: table,
+                image_rows: 4, budget: 16, domains: 16, stride: 0, inflight: 2,
+                floors: zeros.copy(), defaults: move defaults, units: zeros.copy(),
+                aligns: move zeros)
+}
+
+// What `check_plan` says of `plan` against tables of `table` handles, with
+// children starting at `handles`; "" when it holds.
+func checked(plan: &ImagePlan, table: Int, handles: Int) -> String {
+    let f = facts(table)
+    var d = Vector<Int>()
+    var k = 0
+    while k < 9 {
+        try! d.push(if k == 7 { handles } else { 4 })
+        k = k + 1
+    }
+    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100)
+    match check_plan(&plan, &f, &d, &slabs, "i.toml") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+// Child `child`'s record `index` is `tag`, from `source` and `from`.
+func record_is(plan: &ImagePlan, child: Int, index: Int, tag: Int, source: Source,
+               from: UInt64) {
+    borrow let c = plan.children[child] {
+        let r = c.records.get(index)!
+        let ok = r.tag == tag && r.source == source && r.from == from && r.offset == 0 &&
+                 r.len == 0
+        if not ok {
+            print("child {child} record {index}: tag {r.tag} from {r.from}")
+        }
+        assert(ok, "a record")
+    }
+}
+
+func records_and_floor(plan: &ImagePlan, child: Int, records: Int, floor: Int) {
+    borrow let c = plan.children[child] {
+        if c.records.len() != records || c.floor != floor {
+            print("child {child}: {c.records.len()} records, floor {c.floor}")
+        }
+        assert(c.records.len() == records && c.floor == floor, "records and floor")
+    }
+}
+
+func main() {
+    let console = CONSOLE_TAG as Int
+    assert(console == 0xFFFF_FF00, "CONSOLE_TAG is the reserved range's first")
+
+    // The key, read; and absent.
+    let b = board()
+    let named = try! ImageFile.parse(join(&image_lines()), "i.toml", &b, 4)
+    assert((named.console ?? "").equals("console.uart"), "the console, read")
+    let plain_text = with_line(6, "")
+    let plain_image = try! ImageFile.parse(plain_text, "i.toml", &b, 4)
+    assert(plain_image.console == None, "no console")
+
+    // Refused: a hand-written root's image naming one.
+    let service: Vector<String> = ["format = 1",
+        "[image]", "name = \"s\"", "board = \"esp32s3\"", "tick = false",
+        "console = \"driver.uart\"",
+        "[root]", "package = \"sawos:tests/uart-service\"",
+        "[[process]]", "name = \"driver\"", "package = \"driver\""]
+    expect(read_refusal(join(&service)),
+           "i.toml: line 6, column 1: `console` in [image] is the stock root's: a hand-written root gives its own records, and its description says what it gives",
+           "a hand-written root")
+    expect(read_refusal(with_line(6, "console = 3")),
+           "i.toml: line 6, column 11: `console` in [image] is an integer, not a string",
+           "not a string")
+
+    // Refused at binding: a reference outside PROCESS.RECORD, to no process,
+    // to no record, to a record that is not a serve, and to a serve of
+    // another protocol.
+    expect(bind_refusal(with_line(6, "console = \"console\"")),
+           "i.toml: line 6, column 1: `console` in [image] is `console`, not PROCESS.RECORD, a process and its serve record",
+           "no record named")
+    expect(bind_refusal(with_line(6, "console = \"modem.uart\"")),
+           "i.toml: line 6, column 1: `console` in [image] is `modem.uart`, which names no process of this image: there is no `modem`",
+           "no such process")
+    expect(bind_refusal(with_line(6, "console = \"console.tty\"")),
+           "i.toml: line 6, column 1: `console` in [image] is `console.tty`, and the process console has no record `tty`",
+           "no such record")
+    expect(bind_refusal(with_line(6, "console = \"console.port\"")),
+           "i.toml: line 6, column 1: `console` in [image] is `console.port`, a window record of the process console: the console is a serve record of `uartproto`",
+           "a window")
+    expect(bind_refusal(with_line(6, "console = \"hello.uart\"")),
+           "i.toml: line 6, column 1: `console` in [image] is `hello.uart`, a client record of the process hello: the console is a serve record of `uartproto`",
+           "a client")
+    expect(bind_refusal(with_line(6, "console = \"logger.log\"")),
+           "i.toml: line 6, column 1: `console` in [image] is `logger.log`, which serves `logproto`: the console is a serve record of `uartproto`",
+           "another protocol")
+    expect(bind_refusal(join(&image_lines())), "", "the console binds")
+
+    // The plan: connection 0 is the console's, 1 the logger's. Every process
+    // but the console's server is given an inlet of connection 0 under
+    // CONSOLE_TAG after its declared records, and holds one handle more when
+    // it starts.
+    let plan = planned(join(&image_lines()))
+    let without = planned(plain_text)
+    assert(plan.connections == 2 && without.connections == 2, "two connections")
+    records_and_floor(&plan, 0, 4, 6)
+    records_and_floor(&without, 0, 4, 6)
+    record_is(&plan, 0, 3, 4, Source.Outlet, 0)
+    // hello holds two inlets of the one connection: its own, then the
+    // console's.
+    records_and_floor(&plan, 1, 3, 4)
+    records_and_floor(&without, 1, 2, 3)
+    record_is(&plan, 1, 1, 2, Source.Inlet, 0)
+    record_is(&plan, 1, 2, console, Source.Inlet, 0)
+    records_and_floor(&plan, 2, 3, 4)
+    records_and_floor(&without, 2, 2, 3)
+    record_is(&plan, 2, 1, 2, Source.Outlet, 1)
+    record_is(&plan, 2, 2, console, Source.Inlet, 0)
+    records_and_floor(&plan, 3, 2, 3)
+    records_and_floor(&without, 3, 1, 2)
+    record_is(&plan, 3, 1, console, Source.Inlet, 0)
+    // The module root is built with carries it as any other record.
+    let module = plan_module(&plan, "boxed").join("\n")
+    assert(module.contains("    var records = try! Vector<Record>(capacity: 2)\n    try! records.push(Record(tag: 1, source: Source.System, from: 0x0, offset: 0x0, len: 0x0))\n    try! records.push(Record(tag: 4294967040, source: Source.Inlet, from: 0x0, offset: 0x0, len: 0x0))"),
+           "beat's records in the module")
+
+    // Held to the raised floor: beat's declared row, at its declaration's
+    // floor, is short in a console image and enough without one.
+    expect(checked(&plan, 32, 16),
+           "i.toml: the process beat's `Handle` row is 2, short of the 3 handles it holds when it starts, the console's inlet under CONSOLE_TAG among them",
+           "a row at the old floor")
+    expect(checked(&without, 32, 16), "", "the same row with no console")
+    // The image may raise it to the new floor.
+    let raised = planned(with_line(22, "package = \"beat\"\nquota = \{ handles = 3 \}"))
+    expect(checked(&raised, 32, 16), "", "beat raised to its floor")
+    // A row the children start with is held the same way: hello holds four.
+    expect(checked(&raised, 32, 3),
+           "i.toml: the process hello's `Handle` row is 3, short of the 4 handles it holds when it starts, the console's inlet under CONSOLE_TAG among them",
+           "the default row")
+    expect(checked(&raised, 32, 4), "", "the default row at the floor")
+
+    // The console's record cannot take a process past its handle table, so
+    // never past the boot set's capacity, which the table's is at most. With
+    // a table of 2, beat's row of 2 is short of its 3, and the row it would
+    // need is past the table.
+    let small: Vector<String> = ["format = 1",
+        "[image]", "name = \"small\"", "board = \"esp32s3\"", "tick = true",
+        "console = \"console.uart\"",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"beat\"", "package = \"beat\"",
+        "[[process]]", "name = \"console\"", "package = \"driver\"",
+        "device = \{ port = \"UART1\" \}"]
+    var beat_first = Vector<Declaration>()
+    try! beat_first.push(beat())
+    try! beat_first.push(driver())
+    let at_two = planned_with(join(&small), &beat_first)
+    expect(checked(&at_two, 2, 2),
+           "i.toml: the process beat's `Handle` row is 2, short of the 3 handles it holds when it starts, the console's inlet under CONSOLE_TAG among them",
+           "beat at a table of 2")
+    let small_raised = join(&small).replace("package = \"beat\"\n",
+                                            "package = \"beat\"\nquota = \{ handles = 3 \}\n")
+    let past = planned_with(small_raised, &beat_first)
+    expect(checked(&past, 2, 2),
+           "i.toml: the process beat's `handles` row is 3, past MAX_HANDLES (2)",
+           "beat's row past a table of 2")
+
+    // Root's arena counts the record: its heap serves each child's records
+    // in one block, a record's `RECORD_WORDS` longer for each process given
+    // the console's.
+    var grown = 0
+    var c = 0
+    while c < plan.children.len() {
+        borrow let with_console = plan.children[c] {
+            borrow let plain = without.children[c] {
+                grown = grown + heap_block(with_console.records.len(), RECORD_WORDS, 4) -
+                        heap_block(plain.records.len(), RECORD_WORDS, 4)
+            }
+        }
+        c = c + 1
+    }
+    assert(grown > 0, "a block grew")
+    assert(root_blocks(&plan, 4) == root_blocks(&without, 4) + grown, "root's blocks")
+    assert(root_arena(&plan, 4) >= root_arena(&without, 4), "root's arena")
+}

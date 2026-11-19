@@ -9445,6 +9445,28 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # An image that names its console, the board's UART driver's serve
+        # (`tests/images/console_tag_*.toml`): the builder gives the client,
+        # which declares only its System record, an inlet of that connection
+        # under `CONSOLE_TAG` after it. The client drains one record, takes
+        # the inlet from under the tag, and writes a line through it; the
+        # driver serves the write and the `Sync` after it, and ends once the
+        # client's inlet, its last client's, is gone.
+        "name": "console_tag",
+        "arches": ["riscv32", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "console_tag_ns16550.toml",
+                       "arm64": "console_tag_pl011_arm64.toml"},
+        "expect_out": ["{banner}",
+                       "SOS consoletag: one record, an inlet under CONSOLE_TAG",
+                       "SOS consoletag: a line through the console's inlet",
+                       "root: client ended status=65536",
+                       "SOS uartsvc drv: served=2 abandoned=0 dropped=0",
+                       "root: console ended status=65536"],
+        "expect_tail": "root: console ended status=65536",
+        "expect_clean_exit": True,
+    },
+    {
         # A UART driver answers a `Read` from bytes it holds, and the reader
         # has dropped its claim (`tests/images/uart_dropped_read*.toml`): the
         # byte goes back to the front of the buffer, so the next reader gets
