@@ -211,6 +211,8 @@ CONSOLE_DRIVER_PKG = os.path.join(DRIVERS_DIR, "svc-console")
 CONSOLE_NO_DEBUG_PKG = os.path.join(TESTS_DIR, "console-no-debug")
 # A root that writes through the console driver with its handle table full.
 CONSOLE_FULL_ROOT_PKG = os.path.join(TESTS_DIR, "console-full-root")
+# A root that adopts the console driver's inlet as its own console.
+CONSOLE_ADOPT_ROOT_PKG = os.path.join(TESTS_DIR, "console-adopt-root")
 FAULT_ROOT_PKG = os.path.join(TESTS_DIR, "faulting-root")
 # Thread and Process objects. Test processes reach the kernel through the `sos`
 # module and never through an op number.
@@ -2088,6 +2090,190 @@ _GPIO_SERVICE_LINES = [
     "SOS gpioclient: inspect 21 iomux=",
     "SOS gpioclient: done",
 ]
+
+
+def _console_line(n):
+    """`tests/console-lines`' line of `n` bytes, its line break not counted."""
+    head = f"SOS consolelines: {n} bytes "
+    return head + "x" * (n - len(head))
+
+
+# What `tests/console-lines` prints, in order, each line whole: that its boot
+# set lists the console's record, taken by the start-up; lines of 0, 1,
+# 126, 127 and 128 bytes (with its line break, a line of 127 bytes is past
+# `LINE_CHUNK`, one piece), and 200 bytes written with no line break, then
+# ended; a posted line and, after the flush, a line through the kernel's debug
+# print; the burst; the lines printed with the `Handle` row full; and each
+# thread's lines of two pieces, the first thread's first.
+_CONSOLE_LINES = [
+    "SOS consolelines: the set lists the console's record, taken",
+    "SOS consolelines: lines of 0, 1, 126, 127 and 128 bytes",
+    "",
+    "1",
+    _console_line(126),
+    _console_line(127),
+    _console_line(128),
+    _console_line(200),
+    "SOS consolelines: a line posted before the flush",
+    "SOS consolelines: after the flush, through the debug print",
+    *[f"SOS consolelines: burst line {i} of 40" for i in range(1, 41)],
+    "SOS consolelines: the Handle row is full after 6 siblings: this process "
+    "is at its quota",
+    "SOS consolelines: a second line with the row full",
+    "SOS consolelines: 6 siblings let go",
+    *[f"SOS consolelines: thread {t} line {i}: " + "x" * 200
+      for t in (1, 2) for i in range(1, 11)],
+    "SOS consolelines: joined threads 1 and 2",
+    "SOS consolelines: done",
+]
+
+
+def _console_print_cases(files):
+    """The cases of `print` over a console, each on described images:
+    `files(name)` is a case's `image_file` for the images named `name`."""
+    return [
+        {
+            # A program written with `main` and no heap in an image that names
+            # its console, the console driver's serve, and arms no tick
+            # (`tests/images/console_print*.toml`, `tests/console-lines`):
+            # the start-up takes the console's inlet and allocates nothing,
+            # and every line goes to the driver, a message per piece of
+            # `LINE_CHUNK` bytes. The client's lines are matched as one
+            # stretch from the kernel's handover to its exit line, so each
+            # arrives whole, in order, with nothing between, and before the
+            # exit line, which the start-up's `Sync` orders.
+            #
+            # The burst prints past the connection's ring, and with no tick
+            # the driver runs only once the client parks, so the post past
+            # the ring's last slot finds it full and goes as a call. The
+            # lines with the `Handle` row full each go as a call, which mints
+            # no claim. The first thread fills the ring inside a line and
+            # parks in a call holding the output lock, so the second waits
+            # for the lock, yielding, and its lines come after.
+            #
+            # Root and the driver print through the kernel's debug print.
+            # The driver counts the messages: the record's line, the
+            # lengths' eight pieces, the
+            # unbuffered write's two and the line break after it, the
+            # posted line and the flush's `Sync` (a flush straight after it,
+            # with nothing posted since, sends none), the burst's forty, the
+            # row's three lines, the `Sync` of the flush before the threads,
+            # the threads' forty pieces, the last two lines and the
+            # start-up's `Sync`.
+            "name": "console_print",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_print"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console handover\n" + "\n".join(_CONSOLE_LINES)
+                + "\nSOS: process exit: code={zero} process={two}",
+                "root: lines ended status=65536",
+                "SOS console drv: served=101 refused=0 unsupported=0 "
+                "printed=7224",
+                "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A client in an image that names its console prints a line and
+            # ends with `sosmain.exit(5)` (`tests/console-exit`). With no
+            # tick the line waits in the ring until the client parks, so the
+            # exit's `Sync` is what puts it before the kernel's exit line.
+            "name": "console_exit",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_exit"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console handover\n"
+                "SOS consoleexit: a line, then sosmain.exit(5)\n"
+                "SOS: process exit: code={five} process={two}",
+                "root: exit ended status=65541",
+                # The line and the `Sync`.
+                "SOS console drv: served=2 refused=0 unsupported=0 "
+                "printed=46",
+                "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A program written with `main` in an image that names no
+            # console, whose System holds no `Debug`
+            # (`tests/console-silent`): its lines, one past a piece and one
+            # from a thread among them, are dropped, so nothing lies between
+            # the kernel's handover and its exit line, and it ends clean.
+            "name": "console_silent",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_silent"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console handover\n"
+                "SOS: process exit: code={zero} process={one}",
+                "root: silent ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A console driver that is gone before its client prints
+            # (`tests/images/console_gone*.toml`): the image's `[system]`
+            # leaves out `Debug`, so `svc-console` ends at once with its own
+            # code, before it serves anyone, and with no tick it has ended
+            # before the client (`tests/console-gone`) runs. Each of the
+            # client's lines is posted to a connection with no server end,
+            # answered `PeerClosed` and dropped, with no fault: nothing lies
+            # between the driver's teardown and the client's reports, which
+            # it writes through the kernel's debug print. A dropped line is
+            # kept as unsynced, so each flush meets the gone driver and
+            # answers `Err(PeerClosed)`, and `main` returns 0.
+            "name": "console_gone",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_gone"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console handover\n"
+                "SOS: process exit: code={two} process={one}\n"
+                "SOS: process teardown handles=",
+                " process={one}\n"
+                "SOS consolegone: the first flush: PeerClosed\n"
+                "SOS consolegone: the second flush: PeerClosed\n"
+                "SOS: process exit: code={zero} process={two}",
+                "root: console ended status=65538\n"
+                "root: client ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A console driver that ends while its client prints
+            # (`tests/images/console_quit*.toml`): `tests/console-quit`
+            # serves two requests and ends at the third, unanswered. The
+            # client's first line and its flush's `Sync` are the two, so the
+            # line arrives and the flush answers `Ok`. Its next line, printed
+            # with its `Handle` row full, is refused for the claim's row and
+            # goes as a call, the third request, which the driver leaves as
+            # it ends: the call answers `PeerClosed`, the line is dropped
+            # with no fault, and the next flush answers `Err(PeerClosed)`.
+            # The driver counts requests, not time, and with no tick each
+            # side runs until it parks, so the order is fixed.
+            "name": "console_quit",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_quit"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console handover\n"
+                "SOS consolegone: a line before the first flush\n"
+                "SOS consolegone: the first flush: Ok\n"
+                "SOS consolequit: ending at request 3, unanswered\n"
+                "SOS: process exit: code={zero} process={one}\n"
+                "SOS: process teardown handles=",
+                " process={one}\n"
+                "SOS consolegone: the second flush: PeerClosed\n"
+                "SOS: process exit: code={zero} process={two}",
+                "root: console ended status=65536\n"
+                "root: client ended status=65536"],
+            "expect_clean_exit": True,
+        },
+    ]
+
+
+_CONSOLE_PRINT_CASES = _console_print_cases(
+    lambda name: {"riscv32": f"{name}.toml",
+                  "riscv32-flat": f"{name}_flat.toml",
+                  "arm64": f"{name}_arm64.toml"})
 
 # What a stock root's plan gives a child it only starts: its System record.
 _STOCK_START = {"name": "first", "image": 0, "destination": 1, "start": 1,
@@ -9733,6 +9919,7 @@ TEST_CASES = [
         "expect_tail": "root: console ended status=65536",
         "expect_clean_exit": True,
     },
+    *_CONSOLE_PRINT_CASES,
     {
         # A UART driver answers a `Read` from bytes it holds, and the reader
         # has dropped its claim (`tests/images/uart_dropped_read*.toml`): the
@@ -9838,6 +10025,36 @@ TEST_CASES = [
                        "SOS nodebug: a write after it ended: the driver is "
                        "gone, in 1 trap"],
         "expect_clean_exit": True,
+    },
+    {
+        # The console's adoption, from a root that makes its own
+        # (`tests/console-adopt-root`). First a program written with `main`
+        # started with an Event under `CONSOLE_TAG`: its start-up refuses the
+        # record by name. Then root adopts an inlet of the console driver's
+        # connection with `sos.rt.adopt_console` and prints through it, then
+        # fills its table, whose row has no quota, until the kernel answers
+        # `NoResource`, and prints with the table full: each line goes as a
+        # call, which mints no claim. Root flushes, then adopts a second
+        # inlet, which panics, and root's panic stops the machine.
+        "name": "console_adopt",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": CONSOLE_ADOPT_ROOT_PKG,
+        "children": [CHILD_MAIN_BARE_PKG, CONSOLE_DRIVER_PKG],
+        "expect_out": ["{banner}",
+                       *_panic_fault("{one}", "panic at lib.saw:",
+                                     ": sos: the console record is not an "
+                                     "inlet"),
+                       "SOS adoptroot: bad record ended "
+                       f"status={STATUS_PANICKED}\n"
+                       "SOS adoptroot: a line through the adopted console\n"
+                       "SOS adoptroot: the table filled: no room for what "
+                       "was asked\n"
+                       "SOS adoptroot: a line with the table full\n",
+                       *_panic_fault("{zero}", "panic at rt.saw:",
+                                     ": sos: a console is adopted already")],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PANIC,
     },
     {
         # Delegation across three processes. `pipe_delegate_msg` proved the
@@ -17308,6 +17525,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "root: console ended status=65536"],
             "expect_clean_exit": True,
         },
+        # The gate's console cases on this board (`*_s3.toml`).
+        *_console_print_cases(lambda name: {arch["name"]: f"{name}_s3.toml"}),
         {
             # The GPIO driver stops on a configuration that names a pin the
             # chip holds, before it maps anything: its Mapping row is 0, so a

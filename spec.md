@@ -5041,7 +5041,14 @@ reserved.
   minted as a client's is, so the stock root gives it as any other inlet.
   A process holds it from its start, so the builder raises by one the
   handles it holds when it starts, and a `Handle` row at its declaration's
-  own floor is refused in such an image.
+  own floor is refused in such an image. A program written with `main`
+  (`sosmain`) gives the record to its runtime before `main` runs, and holds
+  it for its life: each `print` line goes to the driver as `uartproto`
+  `Write` messages of at most `MAX_PAYLOAD` bytes, posted, or called when a
+  post finds no room in the ring or the caller's table, and the runtime
+  sends a `Sync` before the process exits. A process with no console record
+  prints through the debug print when its System holds `Debug`, and its
+  lines are dropped otherwise.
 - **v1 protocol conventions** (userspace convention, not kernel surface): a
   launched process receives one bootstrap pipe handle at launch; its first
   messages request its initial handle set from the launcher (name-service

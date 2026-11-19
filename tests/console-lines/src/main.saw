@@ -1,0 +1,181 @@
+// A process written with `main`, with no heap, in an image that names a
+// console with no tick: the start-up gives the console's inlet to `print`,
+// and every line goes to the console's driver as one message per piece of
+// `LINE_CHUNK` bytes. Nothing it does allocates, so a start-up or a `print`
+// that did would end it at the first allocation.
+//
+// The image arms no tick, so this process runs until it parks, and the
+// driver runs only then: every order below is made by the ring, the output
+// lock and the one FIFO ready list, never by a clock.
+//
+//   record   the boot set lists the console's record, which the start-up
+//            took before `main` could;
+//   lengths  lines of 0, 1, 126, 127 and 128 bytes: the last two are past
+//            one piece once their line break is counted; then 200 bytes
+//            through the runtime's unbuffered write, with no line break,
+//            which goes as two messages, and the line ended by a `print`;
+//   flush    a line posted, `sosmain.flush()`, then a line through the
+//            kernel's debug print, which the flush puts after the posted one;
+//   burst    more lines than the connection's ring holds: the post that
+//            finds the ring full goes as a call, which parks until the driver
+//            has served the ring, and every line arrives in order;
+//   row      lines printed with its `Handle` row full, each a call, which
+//            mints no claim;
+//   threads  two threads printing lines longer than a piece: the first parks
+//            in a call inside a line, holding the output lock, and the second
+//            waits for the lock, so every line arrives whole, the first
+//            thread's before the second's.
+//
+// `main` returns, and the start-up's `Sync` puts every line before the
+// kernel's exit line.
+
+import sos.{SosStatus}
+import bootplan.{CONSOLE_TAG}
+import sosmain
+
+extern "C" {
+    func __saw_rt_write(ptr: UnsafePointer<Int8>, len: Int) -> Int
+}
+
+/// How many lines the burst prints: past the ring's `PIPE_INFLIGHT` twice.
+static BURST: UInt = 40
+
+/// How many lines each thread prints, each two pieces: past the ring.
+static THREAD_LINES: UInt = 10
+
+/// The threads' stacks, in this process's own zero-init data. A thread that
+/// prints wants 4 KiB at least, and a word is 4 or 8 bytes.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func main() -> Result<Void, SosStatus> {
+    console_record()
+    lengths()
+    try flushed()
+    burst()
+    try row_full()
+    try threads()
+    print("SOS consolelines: done")
+    return
+}
+
+/// The boot set lists the console's record, its only one, and the start-up
+/// has taken it, so `main` finds nothing to take.
+func console_record() {
+    var set = sosmain.take_boot_set()
+    if set.len() != 1 || set.entry(at: 0).tag != CONSOLE_TAG {
+        panic("SOS consolelines: the set does not list the console's record alone")
+    }
+    guard let record = set.take(CONSOLE_TAG) else {
+        print("SOS consolelines: the set lists the console's record, taken")
+        return
+    }
+    let _ = move record
+    panic("SOS consolelines: the console's record was there to take")
+}
+
+/// Lines of 0, 1, 126, 127 and 128 bytes, each with its line break, and one
+/// of 200 written without one, then ended.
+func lengths() {
+    print("SOS consolelines: lines of 0, 1, 126, 127 and 128 bytes")
+    print("")
+    print("1")
+    print("SOS consolelines: 126 bytes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    print("SOS consolelines: 127 bytes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    print("SOS consolelines: 128 bytes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    write("SOS consolelines: 200 bytes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    print("")
+}
+
+/// Write `text` as it is, with no line break, through the runtime's
+/// unbuffered write, which sends it as messages of at most `LINE_CHUNK`
+/// bytes.
+func write(text: String) unsafe {
+    let _ = __saw_rt_write(text.c_string()!, text.len())
+}
+
+/// A posted line, a flush, and a line through the kernel's debug print,
+/// which reaches the console at once: without the flush it would come first.
+/// A second flush, with nothing posted since the first, sends nothing.
+func flushed() -> Result<Void, SosStatus> {
+    print("SOS consolelines: a line posted before the flush")
+    try sosmain.flush()
+    try sosmain.flush()
+    try sosmain.context().system().debug_print("SOS consolelines: after the flush, through the debug print\n")
+    return
+}
+
+/// More lines than the ring holds, with no tick: the post past the ring's
+/// last slot finds it full.
+func burst() {
+    var i: UInt = 1
+    while i <= BURST {
+        print("SOS consolelines: burst line {} of {}", i, BURST)
+        i = i + 1
+    }
+}
+
+/// Fill the `Handle` row with siblings of the Process handle, then print.
+func row_full() -> Result<Void, SosStatus> {
+    let held = try fill_row(0)
+    print("SOS consolelines: {} siblings let go", held)
+    return
+}
+
+/// Mint a sibling of the Process handle, held in this frame, and go on, until
+/// the row refuses one; then print two lines with the row full, each of which
+/// a post would need a row for. Answers how many siblings were held.
+func fill_row(held: UInt) -> Result<UInt, SosStatus> {
+    let sibling = try sosmain.context().process().mint() catch {
+        if error != SosStatus.QuotaExceeded {
+            return error
+        }
+        print("SOS consolelines: the Handle row is full after {} siblings: {}",
+              held, error)
+        print("SOS consolelines: a second line with the row full")
+        return held
+    }
+    let n = try fill_row(held + 1)
+    let _ = move sibling
+    return n
+}
+
+/// Two threads print their lines; joined, they answer their numbers.
+///
+/// The flush first empties the ring, so the first thread fills it from
+/// empty and parks inside a line.
+func threads() -> Result<Void, SosStatus> {
+    try sosmain.flush()
+    let a = try sosmain.context().process().thread_create(
+        run: long_lines, arg: 1, stack_top: top_a())
+    let b = try sosmain.context().process().thread_create(
+        run: long_lines, arg: 2, stack_top: top_b())
+    try a.start()
+    try b.start()
+    let first = try a.join()
+    let second = try b.join()
+    print("SOS consolelines: joined threads {} and {}", first, second)
+    return
+}
+
+/// `THREAD_LINES` lines of two pieces each, numbered by thread `n`.
+func long_lines(n: UInt) sync -> UInt {
+    var i: UInt = 1
+    while i <= THREAD_LINES {
+        print("SOS consolelines: thread {} line {}: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+              n, i)
+        i = i + 1
+    }
+    n
+}
+
+func top_a() unsafe -> UInt {
+    let base = ((&var STACK_A) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func top_b() unsafe -> UInt {
+    let base = ((&var STACK_B) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}

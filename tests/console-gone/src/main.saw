@@ -1,0 +1,57 @@
+// A program written with `main`, with no heap, in an image that names a
+// console whose driver is gone before it prints, or goes while it prints. It
+// reports through the kernel's debug print, which needs no console.
+//
+//   1. A line, then a flush. With the driver gone the post answers
+//      `PeerClosed`, the line is dropped, and the flush answers
+//      `Err(PeerClosed)`. With a driver that serves two requests and ends at
+//      the third, the driver writes the line and answers the `Sync`, and the
+//      flush answers `Ok`.
+//   2. A line with the `Handle` row full, then a flush. A gone driver
+//      refuses the post again. A live one's post is refused for the claim's
+//      row and goes as a call, the driver's third request, which it leaves
+//      unanswered as it ends: the call answers `PeerClosed` and the line is
+//      dropped. Either way the flush answers `Err(PeerClosed)`.
+//
+// No print faults, and `main` returns 0.
+
+import sos.{SosStatus}
+import sosmain
+
+func main() -> Result<Void, SosStatus> {
+    print("SOS consolegone: a line before the first flush")
+    try report("SOS consolegone: the first flush: ", sosmain.flush())
+    let _ = try fill_row(0)
+    try report("SOS consolegone: the second flush: ", sosmain.flush())
+    return
+}
+
+/// Write `what`, then how `answered` answered, through the kernel's debug
+/// print.
+func report(what: String, answered: Result<Void, SosStatus>) -> Result<Void, SosStatus> {
+    try sosmain.context().system().debug_print(what)
+    let word = match answered {
+        case Ok(_) -> "Ok\n",
+        case Err(e) -> {
+            if e == SosStatus.PeerClosed { "PeerClosed\n" } else { "another error\n" }
+        },
+    }
+    try sosmain.context().system().debug_print(word)
+    return
+}
+
+/// Mint a sibling of the Process handle, held in this frame, and go on, until
+/// the row refuses one; then print a line with the row full. Answers how many
+/// siblings were held.
+func fill_row(held: UInt) -> Result<UInt, SosStatus> {
+    let sibling = try sosmain.context().process().mint() catch {
+        if error != SosStatus.QuotaExceeded {
+            return error
+        }
+        print("SOS consolegone: a line with the row full")
+        return held
+    }
+    let n = try fill_row(held + 1)
+    let _ = move sibling
+    return n
+}

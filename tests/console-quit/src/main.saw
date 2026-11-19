@@ -1,0 +1,90 @@
+// A `uartproto` driver that ends while its client prints: it serves its first
+// two requests, writing a `Write`'s payload through its System handle's
+// `debug_print` and answering each `Ok`, and ends at the third, which it
+// leaves unanswered. A client parked in a call on that request is answered
+// `PeerClosed`, and the connection goes with the driver.
+//
+// It counts requests, not time, so where it ends is fixed by what the client
+// sends.
+
+import sos.{System, Process, BootSet, AttachMode, SosStatus}
+import uartproto.{Frame, UartBody, UartOp}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The tag its declaration gives its server end (`process.toml`).
+static TAG_SERVE: UInt = 2
+
+/// The Waiter's key for the server end.
+static KEY_OUTLET: UInt = 11
+
+/// The request it ends at, unanswered.
+static QUIT_AT: UInt = 3
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch { return }
+    try serve(&system, &proc) catch {
+        print("SOS consolequit: failed: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let _ = proc.exit(EXIT_OK)
+}
+
+/// Serves until the request numbered `QUIT_AT`, which it drops.
+func serve(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var set = try BootSet(process: &proc)
+    guard var record = set.take(TAG_SERVE) else { return SosStatus.BadImage }
+    guard let outlet = record.take_outlet() else { return SosStatus.BadImage }
+    let waiter = try proc.waiter_create()
+    try waiter.give(outlet: move outlet, key: KEY_OUTLET,
+                    mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    var body = UartBody.empty()
+    var served: UInt = 0
+    while {
+        let wake = try waiter.wait()
+        let (_, what) = (move wake).open()
+        match what {
+            case Message(m, r) -> {
+                served = served + 1
+                let frame = Frame(len: m.len, bytes: m.bytes)
+                let _ = move m
+                if served == QUIT_AT {
+                    print("SOS consolequit: ending at request {}, unanswered",
+                          served)
+                    let _ = move r
+                    return
+                }
+                if is_write(&frame) {
+                    var i: Int = 0
+                    while i < (frame.payload_len() as Int) {
+                        try system.debug_print_byte(frame.payload_byte(i))
+                        i = i + 1
+                    }
+                }
+                // A reply to a claim the client dropped, as it does after a
+                // post, answers `PeerClosed` and has discharged the
+                // obligation all the same.
+                let n = body.ok()
+                try (move r).reply(body: &body.bytes, len: n) catch {
+                    if error != SosStatus.PeerClosed {
+                        return error
+                    }
+                }
+            },
+            case _ -> { return SosStatus.BadImage },
+        }
+    }
+}
+
+/// Whether `frame` is a `Write`.
+func is_write(frame: &Frame) -> Bool {
+    if let op = frame.request() { op == UartOp.Write } else { false }
+}

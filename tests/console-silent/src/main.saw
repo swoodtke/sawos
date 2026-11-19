@@ -1,0 +1,30 @@
+// A process written with `main` with no console record and a System without
+// `Debug`: every line it prints is dropped, a short one, one longer than a
+// piece, and one from a thread, and it ends clean, with `main`'s status.
+
+import sos.{SosStatus}
+import sosmain
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func main() -> Result<Void, SosStatus> {
+    print("SOS consolesilent: a line with nowhere to go")
+    print("SOS consolesilent: a line longer than a piece: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    let t = try sosmain.context().process().thread_create(
+        run: thread_line, arg: 1, stack_top: top())
+    try t.start()
+    let _ = try t.join()
+    try sosmain.flush()
+    return
+}
+
+func thread_line(n: UInt) sync -> UInt {
+    print("SOS consolesilent: thread {}'s line", n)
+    n
+}
+
+func top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}

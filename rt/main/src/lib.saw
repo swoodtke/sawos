@@ -17,10 +17,20 @@
 //!
 //! It exports `_start`, the image entry, which adopts the boot word as the
 //! process's System, derives its Process handle and the main thread's own
-//! Thread handle, drains the boot set, runs `main` through the compiler's
-//! `__saw_main` and ends the process with `main`'s status. A package that
-//! exports its own `_start` never imports this one: two exports of one symbol
-//! are refused at compile time.
+//! Thread handle, drains the boot set, gives the console to `print`, runs
+//! `main` through the compiler's `__saw_main` and ends the process with
+//! `main`'s status. A package that exports its own `_start` never imports this
+//! one: two exports of one symbol are refused at compile time.
+//!
+//! The console is the record the image builder gives a process under
+//! `bootplan.CONSOLE_TAG` when its image names one: a client inlet of a
+//! `uartproto` driver. The start-up takes it before `main` can, and from then
+//! on `print` sends each line to that driver (`sos.rt.adopt_console`). The
+//! boot set still lists the record, taken. Before the process ends, normally
+//! or through `exit`, the start-up sends a `Sync`, so every line is out before
+//! the kernel's exit line. A process with no console record prints through
+//! the kernel's debug print when its System holds `Debug`, and prints nothing
+//! otherwise.
 //!
 //! The start-up allocates nothing, so a program with no heap starts.
 //!
@@ -36,8 +46,16 @@
 //! `take_boot_set()`.
 
 import sos.{System, Process, BootSet, SosStatus, HandleInfo, HandleKind,
-            SystemRight, ProcessRight, ThreadRight, sos_handle_info}
-import sos.rt.{ThreadBlock, enter_thread_block}
+            SystemRight, ProcessRight, ThreadRight, PIPE_BODY_BYTES,
+            sos_handle_info}
+import sos.rt.{ThreadBlock, enter_thread_block, adopt_console, console_sync}
+import sosrt.{LINE_CHUNK}
+import bootplan.{CONSOLE_TAG}
+import uartproto.{BODY_BYTES, MAX_PAYLOAD, UartOp}
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
+static_assert(LINE_CHUNK == MAX_PAYLOAD,
+              "a line's piece is one console message's payload")
 
 // The program's entry, which the compiler defines in a program whose module
 // declares `main` (sawlang's runtime/ABI.md, "The program entry"): it runs
@@ -107,7 +125,8 @@ func _start(boot: UInt) unsafe -> Never {
     BOOT_AT = ((&var start) as UnsafePointer<Boot>) as UInt
 
     let status = __saw_main()
-    flush()
+    // A console driver that is gone leaves nothing to flush to.
+    let _ = flush()
     end(UInt.from(truncating: status), "main returned")
 }
 
@@ -153,11 +172,26 @@ func adopt(boot: UInt, block: &var ThreadBlock) unsafe -> Boot {
     if (rights & (ProcessRight.BootHandles as UInt32)) == 0 {
         panic("sos: the Process handle lacks BootHandles")
     }
-    let set = try BootSet(process: &process) catch {
+    var set = try BootSet(process: &process) catch {
         panic("sos: the boot set's drain answered {}", error)
     }
+    take_console(&var set)
     Boot(system: move system, process: move process, process_rights: rights,
          set: move set, taken: Atomic(0))
+}
+
+/// Give the console record, when the set holds one, to `print`'s writer,
+/// which holds it for the process's life. The builder makes it an inlet of a
+/// `uartproto` connection, so any other kind is a skew between the builder
+/// and this runtime.
+func take_console(set: &var BootSet) unsafe {
+    guard var record = set.take(CONSOLE_TAG) else {
+        return
+    }
+    guard let inlet = record.take_inlet() else {
+        panic("sos: the console record is not an inlet")
+    }
+    adopt_console(move inlet, UartOp.Write as UInt8, UartOp.Sync as UInt8)
 }
 
 /// The kind of the handle `word` names (`HandleInfo.Kind`), as its number.
@@ -301,15 +335,25 @@ func take_set(at: UInt) unsafe -> BootSet {
 
 /// Make every line printed so far reach the console before what follows.
 ///
-/// `print` writes through the kernel's debug print, which has written each
-/// byte by the time it returns, so there is nothing to wait for.
-public func flush() {
+/// With a console it sends the driver a `Sync` when a line was posted or
+/// dropped since the last one, and parks until the driver answers, which it
+/// does once it has written every earlier line. A driver that has stopped
+/// serving without its connection going never answers.
+/// `Err(SosStatus.PeerClosed)` is a driver that is gone: a line it dropped,
+/// or one posted that it never served, did not reach the console, and every
+/// flush after answers the same.
+///
+/// With none, `print` writes through the kernel's debug print, which has
+/// written each byte by the time it returns, so there is nothing to wait for.
+public func flush() -> Result<Void, SosStatus> {
+    console_sync()
 }
 
 /// End the process with `code`, after `flush()`, through the Process exit op:
 /// a supervisor reads the low 16 bits under `Exited`. A Process handle whose
 /// ceiling took `Exit` away panics, naming the code.
 public func exit(code: UInt) -> Never {
-    flush()
+    // A console driver that is gone leaves nothing to flush to.
+    let _ = flush()
     end(code, "sosmain.exit was given")
 }

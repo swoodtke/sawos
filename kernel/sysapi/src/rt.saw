@@ -4,10 +4,12 @@
 //! where a byte goes, how a run ends with a text, which thread asks, and how a
 //! thread waiting for the output lock gives the processor up. The kernel HAL
 //! answers "the UART" and "write the text, stop the board". A process owns no
-//! device, so it answers with kernel ops: a byte goes out through a System op,
-//! and the end is the kernel's panic op, which puts the text on its fault line
-//! and ends the process. If `panic()` could reach a UART from userspace, the
-//! user/kernel split would be claimed rather than real. The last two it
+//! device, so it answers with kernel ops: a byte goes to the console's driver
+//! over a pipe, or out through a System op in a process with no console (the
+//! console's section, at the end), and the end is the kernel's panic op,
+//! which puts the text on its fault line and ends the process. If `panic()`
+//! could reach a UART from userspace, the user/kernel split would be claimed
+//! rather than real. The last two it
 //! answers from the thread register, whose layout this file also keeps: the
 //! blocks, and the start record of a thread `thread_create(run:)` makes.
 //!
@@ -17,7 +19,7 @@
 //!
 //! This sits above the floor because the hooks are written over the floor's
 //! ops, and below `sos.system`, whose `thread_create(run:)` makes its threads
-//! at the entry this file keeps. The byte goes out through
+//! at the entry this file keeps. With no console the byte goes out through
 //! `sos_system_debug_print`, on the handle `System(boot_handle:)` parks at the
 //! floor, which the hook cannot do for itself; the end goes through
 //! `sos_panic`, which needs no handle.
@@ -29,11 +31,13 @@ import sos.thread.{Thread}
 import sosabi.{PANIC_TEXT_BYTES, NO_HANDLE, ThreadHandle, HandleInfo,
                HandleKind, SystemRight}
 
-/// Write `len` bytes at `ptr` to the debug console: `print`'s writer.
+/// Write `len` bytes at `ptr` to the console: `print`'s writer.
 ///
-/// The bytes go out through the kernel's debug print when the parked handle
-/// is a System holding `Debug`, and are dropped otherwise, so a process
-/// without the right prints nothing rather than faulting (`may_print`).
+/// Once a console is adopted the bytes go to its driver (`console_write`).
+/// Until then, and in a process with none, they go out through the kernel's
+/// debug print when the parked handle is a System holding `Debug`, and are
+/// dropped otherwise, so a process without the right prints nothing rather
+/// than faulting (`may_print`).
 ///
 /// Check-free by construction, on the same terms as the kernel HAL's writer: no
 /// indexing (raw `UnsafeMemory` reads), no allocation, no `String`, and a
@@ -44,6 +48,10 @@ import sosabi.{PANIC_TEXT_BYTES, NO_HANDLE, ThreadHandle, HandleInfo,
 /// the console is the thing that would have failed.
 @export("sos_rt_write")
 func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe {
+    if CONSOLE != NO_HANDLE {
+        console_write(ptr as UInt, len)
+        return
+    }
     if not may_print() {
         return
     }
@@ -355,4 +363,195 @@ func run_thread(at: UInt) unsafe sync -> Never {
         panic("sos: the thread's exit was refused: {}", error)
     }
     while { }
+}
+
+// -----------------------------------------------------------------------------
+// The console
+// -----------------------------------------------------------------------------
+//
+// A process's console is a client inlet of a `uartproto` driver's
+// connection, which the runtime adopts once and holds until the process ends
+// (`adopt_console`). Every write is a `Write` message, the write op byte
+// followed by the bytes, built on the writer's stack. The runtime speaks the
+// wire at this floor rather than through a typed client, because the writer
+// runs inside a panic report, where nothing may allocate or trip a check. The
+// op bytes come from the caller, so this package names no driver protocol.
+//
+// A write is posted, a tell, and the claim the post mints is released at
+// once, so a piece costs two traps and never waits for the driver. A post
+// refused for room (a full ring, or no row in the caller's table for the
+// claim) is sent as a call instead, which mints no claim and parks until the
+// driver answers: a client that fills the ring waits for the driver, which is
+// when the driver runs, and a client with no handle to spare prints all the
+// same. A driver that is gone takes nothing, and the bytes are dropped; the
+// loss is kept, so the next `console_sync` meets the gone driver and says so.
+//
+// The output lock guards the unsynced flag: every write comes here under it,
+// and `console_sync` takes it.
+
+import sos.pipe.{PipeInlet}
+import sos.floor.{sos_pipe_inlet_post, sos_pipe_inlet_call, sos_handle_release}
+import sosabi.{PIPE_BODY_BYTES, PIPE_MSG_HANDLES, PipeSendRecord,
+               PipeMsgRecord, PipeMsgMeta, PipeInletHandle,
+               pipe_send_record_bytes}
+import sosrt.{LINE_CHUNK, rt_output_lock, rt_output_unlock}
+
+static_assert(LINE_CHUNK == PIPE_BODY_BYTES - 1,
+              "a line's piece is a pipe body less the op byte")
+
+/// The console's inlet once it is adopted, and `NO_HANDLE` before that and in
+/// a process with none.
+unsafe static var CONSOLE: UInt = 0
+
+/// The protocol's op bytes for a write and a sync, given at the adoption.
+unsafe static var CONSOLE_WRITE_OP: UInt8 = 0
+unsafe static var CONSOLE_SYNC_OP: UInt8 = 0
+
+/// Whether a write was posted, or dropped, since the last answered `Sync`.
+unsafe static var CONSOLE_UNSYNCED: Bool = false
+
+/// A message body's length in doublewords: a `[UInt64; N]` local is
+/// eight-aligned on every profile, which the copy-in door's word alignment
+/// needs.
+static CONSOLE_BODY_DWORDS: Int = 16
+
+static_assert(CONSOLE_BODY_DWORDS * 8 == PIPE_BODY_BYTES,
+              "the body buffer covers exactly one pipe body")
+
+/// Adopt `inlet` as this process's console: from here on `print` writes to
+/// the driver at its far end, with `write_op` and `sync_op` the protocol's
+/// op bytes for a write and a sync.
+///
+/// The runtime holds the handle until the process ends and nothing releases
+/// it, so the driver serves this process for its whole life. A process has
+/// one console: a second adoption panics.
+///
+/// It allocates nothing.
+public func adopt_console(inlet: PipeInlet, write_op: UInt8,
+                          sync_op: UInt8) unsafe {
+    if CONSOLE != NO_HANDLE {
+        panic("sos: a console is adopted already")
+    }
+    var own = move inlet
+    CONSOLE_WRITE_OP = write_op
+    CONSOLE_SYNC_OP = sync_op
+    CONSOLE = own.handle
+    own.handle = PipeInletHandle(NO_HANDLE)
+}
+
+/// Make every write posted so far reach the console before what follows: a
+/// `Sync`, sent when a write was posted or dropped since the last one was
+/// answered. It answers at once otherwise, and in a process with no console.
+/// A connection's ring is first in, first out, so the answer means the driver
+/// has served every earlier message.
+///
+/// The `Sync` is a call, which parks until the driver answers: a driver that
+/// has stopped serving without its connection going parks it for good.
+/// `Err(SosStatus.PeerClosed)` is a driver that is gone: a write it dropped,
+/// or one posted that it never served, did not reach the console. Every call
+/// after that answers the same, since what was lost stays lost.
+public func console_sync() unsafe -> Result<Void, SosStatus> {
+    rt_output_lock()
+    let synced = sync_posted()
+    rt_output_unlock()
+    synced
+}
+
+func sync_posted() unsafe -> Result<Void, SosStatus> {
+    if CONSOLE == NO_HANDLE || not CONSOLE_UNSYNCED {
+        return
+    }
+    var body: [UInt64; CONSOLE_BODY_DWORDS] = [0; CONSOLE_BODY_DWORDS]
+    let at = ((&var body) as UnsafePointer<UInt64>) as UInt
+    let len = console_body(at, CONSOLE_SYNC_OP, 0, 0)
+    try checked(console_call(at, len))
+    CONSOLE_UNSYNCED = false
+    return
+}
+
+/// Write `len` bytes at `at` to the console, as consecutive `Write` messages
+/// of at most `LINE_CHUNK` bytes each.
+///
+/// Check-free by construction, on `rt_write`'s terms.
+func console_write(at: UInt, len: UInt) unsafe {
+    let most = UInt.from(truncating: LINE_CHUNK)
+    var addr = at
+    var left = len
+    while left != 0 {
+        let n = if left < most { left } else { most }
+        console_send(addr, n)
+        addr = addr &+ n
+        left = left &- n
+    }
+}
+
+/// Send one `Write` of the `n` bytes at `src`: a post whose claim is released
+/// at once, or a call when the post is refused for room. A write neither
+/// takes, the driver being gone, is marked unsynced, so the next sync reports
+/// it.
+func console_send(src: UInt, n: UInt) unsafe {
+    var body: [UInt64; CONSOLE_BODY_DWORDS] = [0; CONSOLE_BODY_DWORDS]
+    let at = ((&var body) as UnsafePointer<UInt64>) as UInt
+    let len = console_body(at, CONSOLE_WRITE_OP, src, n)
+    var args = PipeSendRecord(body: at, len: len,
+                              handles: [NO_HANDLE; PIPE_MSG_HANDLES])
+    var claim: UInt = 0
+    let raw = sos_pipe_inlet_post(CONSOLE,
+                                  (&var args) as UnsafePointer<UInt>,
+                                  UInt.from(truncating: pipe_send_record_bytes()),
+                                  (&var claim) as UnsafePointer<UInt>)
+    if raw == (SosStatus.Ok as UInt) {
+        let _ = sos_handle_release(claim)
+        CONSOLE_UNSYNCED = true
+        return
+    }
+    if refused_for_room(raw) {
+        let answer = console_call(at, len)
+        if answer == (SosStatus.Ok as UInt) {
+            return
+        }
+    }
+    CONSOLE_UNSYNCED = true
+}
+
+/// Whether a post's status is a refusal a call does not meet: a full ring
+/// (`WouldBlock`), or no room for the claim a post mints (`QuotaExceeded` at
+/// the caller's quota, `NoResource` with its table full).
+func refused_for_room(raw: UInt) -> Bool {
+    (raw == (SosStatus.WouldBlock as UInt)
+     || raw == (SosStatus.QuotaExceeded as UInt)
+     || raw == (SosStatus.NoResource as UInt))
+}
+
+/// Write a message into the body buffer at `at`: the op byte `op`, then the
+/// `n` bytes at `src`. Answers the message's length.
+func console_body(at: UInt, op: UInt8, src: UInt, n: UInt) unsafe -> UInt {
+    UnsafeMemory<UInt8, Normal>(at).write(op)
+    var i: UInt = 0
+    while i != n {
+        let byte = UnsafeMemory<UInt8, Normal>(src &+ i).read()
+        UnsafeMemory<UInt8, Normal>(at &+ 1 &+ i).write(byte)
+        i = i &+ 1
+    }
+    n &+ 1
+}
+
+/// Send the `len`-byte message at `at` to the console as a call, and answer
+/// the call's status word. The reply's bytes are not read.
+///
+/// The reply buffer is a whole delivered-message record, because the kernel
+/// checks it against `pipe_msg_record_bytes()` and writes that much.
+func console_call(at: UInt, len: UInt) unsafe -> UInt {
+    var args = PipeSendRecord(body: at, len: len,
+                              handles: [NO_HANDLE; PIPE_MSG_HANDLES])
+    var reply = PipeMsgRecord(meta: PipeMsgMeta(len: 0,
+                                                kinds: [0; PIPE_MSG_HANDLES]),
+                              handles: [NO_HANDLE; PIPE_MSG_HANDLES],
+                              sender: 0,
+                              bytes: [0; PIPE_BODY_BYTES])
+    var value: UInt = 0
+    sos_pipe_inlet_call(CONSOLE, (&var args) as UnsafePointer<UInt>,
+                        UInt.from(truncating: pipe_send_record_bytes()),
+                        (&var reply) as UnsafePointer<UInt>,
+                        (&var value) as UnsafePointer<UInt>)
 }

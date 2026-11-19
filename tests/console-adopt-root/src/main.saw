@@ -1,0 +1,129 @@
+//! A root that adopts a console of its own with `sos.rt.adopt_console`, the
+//! call `sosmain`'s start-up makes, and the start-up's refusal of a console
+//! record that is no inlet.
+//!
+//!   1. It starts `child-main-bare`, a program written with `main`, with a
+//!      System and an Event under `CONSOLE_TAG`: the start-up refuses the
+//!      record by name before `main` runs, and the child ends `Faulted
+//!      (Panic)`.
+//!   2. It starts the console driver, keeps a sibling of the connection's
+//!      inlet, and adopts the inlet: its `print` goes to the driver from
+//!      here on.
+//!   3. Root's handle row has no quota, so its table fills before any row
+//!      runs out: it mints siblings of its System until the kernel refuses
+//!      one with `NoResource`, and prints with the table full. A post would
+//!      need a row for its claim, so each line goes as a call, which mints
+//!      none, and reaches the console all the same.
+//!   4. It lets the siblings go, flushes with `console_sync`, and adopts the
+//!      sibling it kept: a process has one console, so the second adoption
+//!      panics, and root's panic stops the machine.
+//!
+//!   SOS adoptroot: bad record ended status=...
+//!   SOS adoptroot: a line through the adopted console
+//!   SOS adoptroot: the table filled: (NoResource's description)
+//!   SOS adoptroot: a line with the table full
+//!   SOS: process fault: the program panicked ... sos: a console is adopted
+//!   already
+
+import sos.{System, Process, Memory, SosStatus, SystemRight}
+import sos.rt.{adopt_console, console_sync}
+import bootplan.{CONSOLE_TAG}
+import uartproto.{UartOp}
+
+static EXIT_FAILED: UInt = 1
+
+/// A status no step of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The tag each child is started with, its System's, and the console
+/// driver's server end's (`drivers/svc-console/process.toml`).
+static TAG_SYSTEM: UInt = 1
+static TAG_SERVE: UInt = 2
+
+static KEY_CHILD: UInt = 1
+
+/// What the stock root gives a child.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.ClockGet | SystemRight.Transfer)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS adoptroot: failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS adoptroot: the second adoption came back")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var bare_img_rec = try proc.boot_handle_next()
+    var driver_img_rec = try proc.boot_handle_next()
+    var bare_ram_rec = try proc.boot_handle_next()
+    var driver_ram_rec = try proc.boot_handle_next()
+    guard let bare_img = bare_img_rec.take_memory() else { return BUG }
+    guard let driver_img = driver_img_rec.take_memory() else { return BUG }
+    guard let bare_ram = bare_ram_rec.take_memory() else { return BUG }
+    guard let driver_ram = driver_ram_rec.take_memory() else { return BUG }
+
+    try bad_record(&system, &proc, &bare_img, &bare_ram)
+
+    let driver = try system.process_create(image: &driver_img,
+                                           memory: &driver_ram)
+    let (inlet, outlet) = try proc.pipe_create()
+    let sibling = try system.mint(rights: CHILD_SYSTEM)
+    try driver.give(system: move sibling, tag: TAG_SYSTEM) catch { return error.0 }
+    try driver.give(outlet: move outlet, tag: TAG_SERVE) catch { return error.0 }
+    try driver.start(boot_tag: TAG_SYSTEM)
+
+    let spare = try inlet.mint()
+    adopt_console(move inlet, UartOp.Write as UInt8, UartOp.Sync as UInt8)
+    print("SOS adoptroot: a line through the adopted console")
+    try print_with_the_table_full(&system)
+    try console_sync()
+    adopt_console(move spare, UartOp.Write as UInt8, UartOp.Sync as UInt8)
+    return
+}
+
+/// Start `child-main-bare` with a System and an Event under `CONSOLE_TAG`,
+/// and print its status word once it has ended.
+func bad_record(system: &System, proc: &Process, img: &Memory,
+                ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try system.process_create(image: &img, memory: &ram)
+    let sibling = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move sibling, tag: TAG_SYSTEM) catch { return error.0 }
+    let event = try proc.event_create()
+    try child.give(event: move event, tag: CONSOLE_TAG) catch { return error.0 }
+    try child.start(boot_tag: TAG_SYSTEM)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_CHILD)
+    let wake = try waiter.wait()
+    let (_, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            print("SOS adoptroot: bad record ended status={}", status)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+/// Fill the table with siblings of the System, print, then let them go.
+func print_with_the_table_full(system: &System) -> Result<Void, SosStatus> {
+    var siblings = Vector<System>()
+    var full = false
+    while not full {
+        let s = try system.mint() catch {
+            print("SOS adoptroot: the table filled: {}", error)
+            full = true
+            continue
+        }
+        try! siblings.push(move s)
+    }
+    print("SOS adoptroot: a line with the table full")
+    let _ = move siblings
+    return
+}

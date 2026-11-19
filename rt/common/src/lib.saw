@@ -266,21 +266,36 @@ func rt_write(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Int {
 /// `print`'s line primitive: `count` `{ptr, len}` records, each two target
 /// words, written in order and followed by a newline, all under the output
 /// lock. Always succeeds.
+///
+/// The line is gathered on this stack and handed to `sos_rt_write` in pieces
+/// of `LINE_CHUNK` bytes, the last one shorter: a line that fits, its newline
+/// included, is one piece, and a process sends a piece as one console
+/// message. The buffer is the calling thread's, so two threads that print
+/// share none.
+///
+/// Check-free by construction, on `console_write`'s terms.
 @export("__saw_rt_write_line")
 func rt_write_line(parts: UnsafePointer<Int8>, count: UInt) unsafe -> Int {
     rt_output_lock()
+    var line: [UInt8; LINE_CHUNK] = [0; LINE_CHUNK]
+    let buf = ((&var line) as UnsafePointer<UInt8>) as UInt
     let WORD = sizeof<UInt>() as UInt
+    var fill: UInt = 0
     var i: UInt = 0
     let words = parts as UInt
     while i < count {
         let rec = words &+ (i &* 2 &* WORD)
         let p = UnsafeMemory<UInt, Normal>(rec).read()
         let n = UnsafeMemory<UInt, Normal>(rec &+ WORD).read()
-        sos_rt_write(p as UnsafePointer<Int8>, n)
+        var k: UInt = 0
+        while k != n {
+            fill = line_put(buf, fill, UnsafeMemory<UInt8, Normal>(p &+ k).read())
+            k = k &+ 1
+        }
         i = i &+ 1
     }
-    let nl = "\n"
-    sos_rt_write(nl.c_string()!, 1)
+    fill = line_put(buf, fill, NEWLINE)
+    sos_rt_write(buf as UnsafePointer<Int8>, fill)
     rt_output_unlock()
     0
 }
@@ -479,7 +494,7 @@ static OUTPUT: SpinLock<OutputState>
 /// Take the output lock, waiting while another thread holds it. A thread that
 /// holds it already takes it again.
 @export("__saw_rt_output_lock")
-func rt_output_lock() {
+public func rt_output_lock() {
     let me = sos_rt_lock_owner()
     while not output_take(me) {
         sos_rt_yield()
@@ -489,7 +504,7 @@ func rt_output_lock() {
 /// Give the output lock back once: the last give of a holder frees it. A give
 /// with the lock free changes nothing.
 @export("__saw_rt_output_unlock")
-func rt_output_unlock() {
+public func rt_output_unlock() {
     borrow var state = OUTPUT.lock() {
         if state.depth != 0 {
             state.depth = state.depth &- 1
@@ -511,4 +526,30 @@ func output_take(me: Int) -> Bool {
             false
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// The line
+// -----------------------------------------------------------------------------
+
+/// The most bytes of a line `rt_write_line` hands this side's writer at once.
+///
+/// A process's writer sends each piece as one console message whose first
+/// byte is the op, so this is a pipe body less that byte: `sos.rt` holds it
+/// to the kernel's body, and `sosmain` to the console protocol's payload.
+public static LINE_CHUNK: Int = 127
+
+static NEWLINE: UInt8 = 0x0Au8
+
+/// Put `byte` at `fill` in the line buffer at `buf`, handing the buffer to
+/// this side's writer first when it holds a whole piece, and answer the new
+/// fill.
+func line_put(buf: UInt, fill: UInt, byte: UInt8) unsafe -> UInt {
+    var at = fill
+    if at == UInt.from(truncating: LINE_CHUNK) {
+        sos_rt_write(buf as UnsafePointer<Int8>, at)
+        at = 0
+    }
+    UnsafeMemory<UInt8, Normal>(buf &+ at).write(byte)
+    at &+ 1
 }
