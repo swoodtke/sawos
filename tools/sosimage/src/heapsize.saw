@@ -1,0 +1,56 @@
+//! The runtime's heap (`rt/common/src/heap.saw`) as the builder sizes it, on
+//! the target's word rather than the host's: its control block, and the first
+//! growth a heap over a pool makes (`rt/common/src/lib.saw`'s `grow`).
+//!
+//! A heap's control block holds `HEAP_CONTROL_FIXED` words and, for each class
+//! of block size up to the largest block it is sized for, `HEAP_CLASS_WORDS`
+//! more: a bitmap and four list heads. The smallest block is four words, and a
+//! block's size is a multiple of two.
+
+/// The control block's fixed words.
+public static HEAP_CONTROL_FIXED: Int = 2
+/// The control block's words per class.
+public static HEAP_CLASS_WORDS: Int = 5
+
+/// The fewest bytes a pool heap's growth takes, unless its pool's grain is
+/// larger (`MIN_GROWTH`).
+public static MIN_GROWTH: UInt64 = 1024
+
+/// The words past the control block a first growth also spends: the first
+/// block's header and the granule's slack, and the sentinel.
+static FRONT_EXTRA_WORDS: Int = 4
+
+/// How many classes a heap whose table is sized for blocks up to `size` bytes
+/// has, on a word of `word` bytes: one per power of two from the smallest
+/// block's to `size`'s.
+public func heap_classes(size: UInt64, word: Int) -> Int {
+    let smallest = (4 * word) as UInt64
+    let top = if size < smallest { smallest } else { size }
+    highest_bit(top) - highest_bit(smallest) + 1
+}
+
+/// The index of the highest set bit of a non-zero `value`.
+func highest_bit(value: UInt64) -> Int {
+    var index = 0
+    while index < 63 && (value >> ((index + 1) as UInt64)) != 0 {
+        index = index + 1
+    }
+    index
+}
+
+/// The bytes the first growth of a heap over a pool of `len` bytes takes, on
+/// a word of `word` bytes and a pool grain of `grain` bytes, to serve its
+/// smallest block: its control block, sized for `len`, the first block's
+/// header and the sentinel (`front_bytes`), and the block (`block_bytes`),
+/// rounded up to the grain and at least `MIN_GROWTH` or one grain. A pool
+/// shorter than this can never serve a block.
+public func first_growth(len: UInt64, word: Int, grain: UInt64) -> UInt64 {
+    let w = word as UInt64
+    let words = HEAP_CONTROL_FIXED + heap_classes(len, word) * HEAP_CLASS_WORDS +
+                FRONT_EXTRA_WORDS
+    let block = 4 * w
+    let need = (words as UInt64) * w + block
+    let by = (need + grain - 1) / grain * grain
+    let least = if grain > MIN_GROWTH { grain } else { MIN_GROWTH }
+    if by < least { least } else { by }
+}

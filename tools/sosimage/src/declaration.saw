@@ -2,7 +2,7 @@
 //! package the stock root launches.
 //!
 //!     format = 1
-//!     arena = 0x1000                     a size
+//!     arena = 0x1000                     optional: the built-in heap's size
 //!     ram = "fast"                       optional: it needs fast memory
 //!
 //!     [[boot]]                           in the order the launcher gives them
@@ -24,6 +24,14 @@
 //!     [build]                            optional
 //!     inputs = ["uartpins", "uartconfig"]
 //!     defaults = { uartconfig = "config/default.saw" }
+//!
+//!     [heap.default]                     optional: the global allocator's
+//!     len = 0x2_0000                     the pool: the heap and its shares
+//!     ram = "fast"                       optional: the pool in fast memory
+//!
+//!     [heap.data]                        a named heap, `sos.Heap<1>`
+//!     slot = 1
+//!     len = 0x4_0000
 //!
 //! By kind, a record also has: `system`, an optional `rights` (exactly one
 //! record, whose tag is the start tag); `window`, `type` and an optional
@@ -59,7 +67,23 @@
 //! `threads` of 0, since a process's first thread is charged to it; and a
 //! declared `handles` below what the process holds when it starts (one per
 //! record, its Process handle, one Mapping per window, and for a program
-//! written with `main` its main thread's own Thread handle).
+//! written with `main` its main thread's own Thread handle) and once its heaps
+//! have grown (`heap_handles`).
+//!
+//! `arena` sizes the process's built-in heap, which is linked into its image;
+//! with none, the image's `[image] arena` sizes it, and with neither it is
+//! 4 KiB (`sosimage.product.process_arena`). Each `[heap.NAME]` is a heap over
+//! a pool the launcher gives the process under the heap's slot's tag
+//! (`bootplan.HEAP_TAG` and up), for the runtime to grow the heap into from
+//! the pool's front and to take shares from its back: `default` is slot 0,
+//! which the global allocator asks before the built-in heap, and a named heap
+//! states the slot its program names it by (`sos.Heap<SLOT>`). Heaps are kept
+//! in slot order. A heap is refused by name for a name that is no Saw
+//! identifier, a `slot` on `default`, a named heap without one or with one of
+//! 0 or of `bootplan.MAX_HEAPS` or more, a slot two heaps take, and a `ram`
+//! other than `fast`. Its `len` is held to the board's word by
+//! `check_against`, and to the board's grain and RAM where the image binds it
+//! (`sosimage.imagefile.bind`).
 //!
 //! A program written with `main` is one whose `Saw.toml`, beside its
 //! `process.toml`, depends on `sosmain`: that package's start-up mints the
@@ -70,23 +94,32 @@
 //! (`sosimage.plan`).
 //!
 //! Against a board (`check_against`), a process is also refused for an
-//! `arena` or a tag the board's word cannot hold, a type the board has no
-//! device of, a board input of a type it needs (other than through a `part`
-//! window alone) that its `inputs` does not list, and a default for any board
-//! input of a type it needs: the board input's value follows the device.
+//! `arena`, a heap's `len` or a tag the board's word cannot hold, a type the
+//! board has no device of, a board input of a type it needs (other than
+//! through a `part` window alone) that its `inputs` does not list, and a
+//! default for any board input of a type it needs: the board input's value
+//! follows the device.
 
 import std.path.{Path}
 import toml.{TomlDoc, TomlKind, TomlPosition, TomlTable}
-import sosimage.board.{Board, NamedCount, expect_table, quota_keys, read_counts}
-import bootplan.{RESERVED_TAG_FIRST, RESERVED_TAG_LAST, is_reserved_tag}
+import sosimage.board.{Board, NamedCount, expect_table, quota_keys, read_counts,
+                       require_table}
+import bootplan.{MAX_HEAPS, RESERVED_TAG_FIRST, RESERVED_TAG_LAST, is_reserved_tag}
 import sosimage.failure.{BuildError}
 import sosimage.hex.{hex}
 import sosimage.tool.{read_text}
 import sosimage.rules.{
     check_format, check_input_name, check_name, check_path, count, element_at, fits_board_word, flag, holds,
-    name_list, only_keys, parse_description, refused, size, text, toml_refused,
-    where_is,
+    is_name, name_list, only_keys, optional_size, parse_description, refused, size, text,
+    toml_refused, where_is,
 }
+
+/// The handles each heap holds once it has grown: its pool, its `Memory` and
+/// its `Mapping`, which the runtime keeps for the process's life.
+public static HEAP_HANDLES: Int = 3
+
+/// The default heap's slot: the global allocator's.
+public static DEFAULT_HEAP_SLOT: Int = 0
 
 /// What a boot record is.
 public enum RecordKind {
@@ -139,6 +172,19 @@ public struct BootRecord {
     at: TomlPosition
 }
 
+/// One `[heap.NAME]`: a heap over a pool the launcher gives.
+public struct HeapDecl {
+    name: String
+    /// `DEFAULT_HEAP_SLOT` for `default`, a named heap's `slot` otherwise.
+    slot: Int
+    /// The pool's bytes: the heap and its shares together.
+    len: UInt64
+    len_at: TomlPosition
+    /// `ram = "fast"`: the pool must lie in a fast range.
+    fast: Bool
+    at: TomlPosition
+}
+
 /// An input's default, and the file it names.
 public struct InputDefault {
     input: String
@@ -152,7 +198,9 @@ public struct Declaration {
     file: String
     /// The package's directory: the file's.
     dir: String
-    arena: UInt64
+    /// The built-in heap's size; none when the declaration states none, and
+    /// the image's or the default applies.
+    arena: UInt64?
     arena_at: TomlPosition
     /// `ram = "fast"`.
     fast: Bool
@@ -166,6 +214,8 @@ public struct Declaration {
     inputs: Vector<String>
     inputs_at: TomlPosition
     defaults: Vector<InputDefault>
+    /// `[heap]`, in slot order.
+    heaps: Vector<HeapDecl>
 }
 
 @synthesize
@@ -259,10 +309,11 @@ extension Declaration {
     /// Reads a declaration's top-level table.
     public static func read(root: &TomlTable, file: String,
                             main: Bool) -> Result<Declaration, BuildError> {
-        let top_keys: Vector<String> = ["format", "arena", "ram", "boot", "quota", "build"]
+        let top_keys: Vector<String> = ["format", "arena", "ram", "boot", "quota", "build",
+                                        "heap"]
         try only_keys(&root, &top_keys, file, "a process declaration")
         try check_format(&root, file)
-        let arena = try size(&root, "arena", 8, file, "the declaration")
+        let arena = try optional_size(&root, "arena", 8, file, "the declaration")
         var fast = false
         if root.contains("ram") {
             let ram = try text(&root, "ram", file)
@@ -271,6 +322,12 @@ extension Declaration {
                                "`ram` is \"{ram}\": a declaration's `ram` is \"fast\", for a program that needs fast memory, or absent")
             }
             fast = true
+        }
+
+        var heaps = Vector<HeapDecl>()
+        try expect_table(&root, "heap", file)
+        if let h = root.table("heap") {
+            heaps = try read_heaps(&h, file)
         }
 
         try root.require("boot", TomlKind.Array) catch {
@@ -310,7 +367,7 @@ extension Declaration {
                 }
                 r = r + 1
             }
-            try check_handles(&records, main, &quota, file, where_is(&q, "handles"))
+            try check_handles(&records, main, heaps.len(), &quota, file, where_is(&q, "handles"))
         }
 
         var inputs = Vector<String>()
@@ -353,7 +410,7 @@ extension Declaration {
                            main: main, records: move records, system_rights: move system_rights,
                            quota: move quota,
                            inputs: move inputs, inputs_at: inputs_at,
-                           defaults: move defaults)
+                           defaults: move defaults, heaps: move heaps)
     }
 
     /// The rights its System record keeps: those it names, or the image's
@@ -365,11 +422,18 @@ extension Declaration {
         }
     }
 
-    /// The handles the process holds when it starts: one per record, its
-    /// Process handle, one Mapping per window, and for a program written with
-    /// `main` its main thread's own Thread handle.
+    /// The handles the process holds when it starts, and once its heaps have
+    /// grown: one per record, its Process handle, one Mapping per window, for
+    /// a program written with `main` its main thread's own Thread handle, and
+    /// its heaps' (`heap_handles`).
     public func handle_floor(&self) -> Int {
-        handles_at_start(&self.records, self.main)
+        handles_at_start(&self.records, self.main) + heap_handles(self.heaps.len())
+    }
+
+    /// The window records: each a Mapping row the process spends when it maps
+    /// its window.
+    public func window_count(&self) -> Int {
+        windows_of(&self.records)
     }
 
     /// The device needs, each named once, with its type: the first record of
@@ -458,8 +522,17 @@ extension Declaration {
     /// needed type that `inputs` does not list (a need met by a part window
     /// alone owes none), and a default for any board input of a needed type.
     public func check_against(&self, board: &Board) -> Result<Void, BuildError> {
-        try fits_board_word(self.arena, board.name, board.word, self.file, self.arena_at,
-                            "`arena`")
+        if let arena = self.arena {
+            try fits_board_word(arena, board.name, board.word, self.file, self.arena_at,
+                                "`arena`")
+        }
+        var h = 0
+        while h < self.heaps.len() {
+            let heap = self.heaps.get(h)!
+            try fits_board_word(heap.len, board.name, board.word, self.file, heap.len_at,
+                                "`len` in [heap.{heap.name}]")
+            h = h + 1
+        }
         var t = 0
         while t < self.records.len() {
             let r = self.records.get(t)!
@@ -513,6 +586,12 @@ public func is_main_program(dir: String) -> Result<Bool, BuildError> {
 /// The handles a process with `records` holds when it starts, `main` saying
 /// it is a program written with `main`.
 func handles_at_start(records: &Vector<BootRecord>, main: Bool) -> Int {
+    let main_thread = if main { 1 } else { 0 }
+    records.len() + 1 + windows_of(&records) + main_thread
+}
+
+/// The window records among `records`.
+func windows_of(records: &Vector<BootRecord>) -> Int {
     var windows = 0
     var i = 0
     while i < records.len() {
@@ -521,8 +600,88 @@ func handles_at_start(records: &Vector<BootRecord>, main: Bool) -> Int {
         }
         i = i + 1
     }
-    let main_thread = if main { 1 } else { 0 }
-    records.len() + 1 + windows + main_thread
+    windows
+}
+
+/// The handles `heaps` heaps hold once each has grown: `HEAP_HANDLES` each,
+/// and one for the Process handle they map through, which the runtime mints
+/// at the first adoption.
+public func heap_handles(heaps: Int) -> Int {
+    if heaps == 0 {
+        return 0
+    }
+    HEAP_HANDLES * heaps + 1
+}
+
+/// `[heap]`: a table per heap, kept in slot order.
+func read_heaps(h: &TomlTable, file: String) -> Result<Vector<HeapDecl>, BuildError> {
+    var out = Vector<HeapDecl>()
+    let names = try! h.keys()
+    var i = 0
+    while i < names.len() {
+        let name = names.get(i) ?? ""
+        i = i + 1
+        let at = where_is(&h, name)
+        if not is_name(name) || name.contains("-") {
+            return refused(file, at, "`{name}` is not a heap's name: a heap is named as a Saw identifier is, a letter, then letters, digits and `_`")
+        }
+        try require_table(&h, name, file)
+        if let t = h.table(name) {
+            let heap = try read_heap(&t, name, file, at)
+            var j = 0
+            while j < out.len() {
+                let other = out.get(j)!
+                if other.slot == heap.slot {
+                    return refused(file, where_is(&t, "slot"), "[heap.{name}] takes slot {heap.slot}, which [heap.{other.name}] takes at {other.at}: a slot is one heap's")
+                }
+                j = j + 1
+            }
+            try! out.push(heap)
+            var k = out.len() - 1
+            while k > 0 && (out.get(k - 1)!).slot > (out.get(k)!).slot {
+                out.swap(k - 1, k)
+                k = k - 1
+            }
+        }
+    }
+    return move out
+}
+
+/// One `[heap.NAME]`, at `at`.
+func read_heap(t: &TomlTable, name: String, file: String,
+               at: TomlPosition) -> Result<HeapDecl, BuildError> {
+    let what = "[heap.{name}]"
+    let heap_keys: Vector<String> = ["len", "slot", "ram"]
+    try only_keys(&t, &heap_keys, file, what)
+    let len = try size(&t, "len", 8, file, what)
+    var slot = DEFAULT_HEAP_SLOT
+    if name.equals("default") {
+        if t.contains("slot") {
+            return refused(file, where_is(&t, "slot"),
+                           "[heap.default] has a `slot`: the default heap is slot {DEFAULT_HEAP_SLOT}, the global allocator's, and only a named heap states one")
+        }
+    } else {
+        if not t.contains("slot") {
+            return refused(file, at,
+                           "[heap.{name}] has no `slot`: a named heap states the slot its program names it by, 1 to {MAX_HEAPS - 1}")
+        }
+        slot = try count(&t, "slot", file, what)
+        if slot == DEFAULT_HEAP_SLOT || slot >= MAX_HEAPS {
+            return refused(file, where_is(&t, "slot"),
+                           "`slot` in [heap.{name}] is {slot}: a named heap's slot is 1 to {MAX_HEAPS - 1}, below MAX_HEAPS ({MAX_HEAPS}), and slot {DEFAULT_HEAP_SLOT} is [heap.default]'s")
+        }
+    }
+    var fast = false
+    if t.contains("ram") {
+        let ram = try text(&t, "ram", file)
+        if not ram.equals("fast") {
+            return refused(file, where_is(&t, "ram"),
+                           "`ram` in [heap.{name}] is \"{ram}\": a heap's `ram` is \"fast\", for a pool that must lie in fast memory, or absent")
+        }
+        fast = true
+    }
+    return HeapDecl(name: name, slot: slot, len: len, len_at: where_is(&t, "len"), fast: fast,
+                    at: at)
 }
 
 /// One `[[boot]]` record.
@@ -610,9 +769,11 @@ func check_records(records: &Vector<BootRecord>, file: String, at: TomlPosition)
     return
 }
 
-/// Refuses a declared `handles` below what the process holds when it starts.
-func check_handles(records: &Vector<BootRecord>, main: Bool, quota: &Vector<NamedCount>,
-                   file: String, at: TomlPosition) -> Result<Void, BuildError> {
+/// Refuses a declared `handles` below what the process holds when it starts
+/// and once its `heaps` heaps have grown.
+func check_handles(records: &Vector<BootRecord>, main: Bool, heaps: Int,
+                   quota: &Vector<NamedCount>, file: String,
+                   at: TomlPosition) -> Result<Void, BuildError> {
     var i = 0
     while i < quota.len() {
         let q = quota.get(i)!
@@ -620,7 +781,10 @@ func check_handles(records: &Vector<BootRecord>, main: Bool, quota: &Vector<Name
         if not q.name.equals("handles") {
             continue
         }
-        let floor = handles_at_start(&records, main)
+        let floor = handles_at_start(&records, main) + heap_handles(heaps)
+        if q.value < floor && heaps > 0 {
+            return refused(file, at, "`handles` in [quota] is {q.value}, below the {floor} the process holds once its heaps have grown: one per [[boot]] record, its Process handle, one Mapping per window, its main thread's own Thread handle if it is written with `main`, and {HEAP_HANDLES} for each of its {heaps} heaps (its pool, its Memory and its Mapping) with the one Process handle they map through")
+        }
         if q.value < floor {
             if main {
                 return refused(file, at, "`handles` in [quota] is {q.value}, below the {floor} the process holds when it starts: one per [[boot]] record, its Process handle, one Mapping per window and its main thread's own Thread handle, which `sosmain`'s start-up holds for a program written with `main`")

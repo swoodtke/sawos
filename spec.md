@@ -3797,7 +3797,14 @@ off the granule or behind no plausible header) panics through the ordinary
 panic path, naming the address; one it cannot tell corrupts the heap. A request
 the arena cannot serve answers a null pointer, as sawlang's allocator ABI has
 it: the allocator never ends the run itself, and std turns the null into an
-`AllocError` at the operation that asked. The
+`AllocError` at the operation that asked. A process may also have heaps over
+pools its launcher gives it, which the runtime holds for the process's life: a
+default heap, which serves the global allocator ahead of the arena, and named
+heaps a program allocates from explicitly. A heap grows up from its pool's
+front, one allocation and one row extended in place, and never gives memory
+back; the program takes shareable memory from the pool's back. A heap that
+cannot grow answers null. The runtime allocates nothing before the program
+runs. The
 third hook answers `SpinLock`'s question of which thread is asking: a process
 keeps the answer in the thread's thread register, which the kernel carries
 per thread on every profile, and the kernel, one context, answers one
@@ -5033,6 +5040,9 @@ reserved.
   name. `Shutdown`, process creation and the rest are the launcher's own to
   give, never a declaration's or an image's. A child that knows its records
   by tag drains them all at once (`sos.BootSet`) and takes each by its tag.
+  A process that declares heaps gets one pool for each, under the runtime's
+  heap tags, given with `PoolRight.Allocate | Map | Transfer | Mint |
+  Extend` and nothing else.
 - **The console record** (userspace convention, not kernel surface). The
   tags from `0xFFFF_FF00` to `0xFFFF_FFFF` are the runtime's: a launcher
   gives a record under one for the runtime to take, and the image builder

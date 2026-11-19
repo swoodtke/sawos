@@ -9550,6 +9550,56 @@ TEST_CASES = [
         "expect_tail": "root: server ended status=65536",
         "expect_clean_exit": True,
     },
+    {
+        # A stock-root process with heaps (`tests/images/stock_heap*.toml`,
+        # `tests/stock-heap`): its declaration states no built-in heap, a
+        # default heap and a data heap, and root gives it a pool for each
+        # under the heap tags with the launch convention's mask. The child
+        # fills a vector over its data heap until a push is refused, inside
+        # the pool, while a vector over the global allocator grows on the
+        # default heap. A page it shares from the default heap's pool
+        # carries the pool's `Transfer`, `Mint` and `Map` and nothing more,
+        # and it maps the page, writes it and reads it back. Its end stops
+        # the machine with its exit code.
+        "name": "stock_heap",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_heap.toml",
+                       "riscv32-flat": "stock_heap_flat.toml",
+                       "arm64": "stock_heap_arm64.toml"},
+        "expect_out": ["{banner}",
+                       # Four rows: the image blob, the destination
+                       # and the two heaps' pools.
+                       "SOS: boot regions={four}",
+                       "SOS stockheap: the data heap's vector was "
+                       "refused inside its pool: yes, reads Spent",
+                       "SOS stockheap: the default heap holds the other "
+                       "vector: yes, reads Never",
+                       "SOS stockheap: a share of a page: Transfer, Mint "
+                       "and Map: yes",
+                       "SOS stockheap: the share reads back its mark: yes",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: heap ended status=65536"],
+        "expect_tail": "root: heap ended status=65536",
+        "expect_clean_exit": True,
+    },
+    {
+        # A child whose heaps' pools come to 2 MiB on arm64
+        # (`tests/images/stock_heap_wide_arm64.toml`,
+        # `tests/stock-heap-wide`): every process links at one address and
+        # its rows lie above its image inside the grant window, so its region
+        # and pools pass the 2 MiB above the link address, and the builder
+        # refuses the image once it has measured the region
+        # (`sosimage.product.check_windows`).
+        "name": "stock_heap_window",
+        "arches": ["arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"arm64": "stock_heap_wide_arm64.toml"},
+        "expect_build_error": "and its heaps' pools, 0x200000 bytes, pass the "
+                              "0x200000 bytes its rows have above its link "
+                              "address on a board that translates",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
 
     # A stock-root image whose plan the kernel's numbers refuse: the builder
     # holds each child's quota rows to their bounds before it builds any
@@ -18222,6 +18272,28 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "root: client ended status=65536",
                            "SOS server: no client is left",
                            "root: server ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The gate's `stock_heap` on this board
+            # (`tests/images/stock_heap_s3.toml`), each heap's pool in SRAM,
+            # whose word atomics `s32c1i` serves.
+            "name": "stock_heap",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "stock_heap_s3.toml"},
+            "expect_out": ["{banner}",
+                           # Four rows: the image blob, the destination
+                           # and the two heaps' pools.
+                           "SOS: boot regions={four}",
+                           "SOS stockheap: the data heap's vector was "
+                           "refused inside its pool: yes, reads Spent",
+                           "SOS stockheap: the default heap holds the other "
+                           "vector: yes, reads Never",
+                           "SOS stockheap: a share of a page: Transfer, Mint "
+                           "and Map: yes",
+                           "SOS stockheap: the share reads back its mark: yes",
+                           "SOS: process exit: code={zero} process={one}",
+                           "root: heap ended status=65536"],
             "expect_clean_exit": True,
         },
         {

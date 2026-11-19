@@ -19,7 +19,8 @@
 //!              order: a System sibling keeping the rights the plan names
 //!              for the child, a row or a sibling of one, a carve of
 //!              one, an interrupt line it binds, a connection's server end or
-//!              an inlet minted from it;
+//!              an inlet minted from it; then each of its heaps' pools,
+//!              keeping `HEAP_POOL_KEEP`;
 //!   start      start every child with its System record's tag;
 //!   supervise  make a Waiter and attach every child to it, release every row
 //!              and connection end root still holds, and wait for the
@@ -56,7 +57,7 @@
 
 import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet,
             WaitResult, BootSet, BootHandle, SosStatus, SystemRight,
-            PipeInletRight, QuotaKind}
+            PipeInletRight, PoolRight, QuotaKind}
 import bootplan.{Plan, Child, Record, Source, Setup, SetupOp, QuotaName, RightName,
                  setup_word, reads_first, PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS,
                  ROW_WINDOW_WORDS}
@@ -72,6 +73,13 @@ static EXIT_STOPPED: UInt = 1
 
 /// A client's inlet: it may post and hand the end on.
 static CLIENT_INLET: UInt32 = (PipeInletRight.Post | PipeInletRight.Transfer)
+
+/// A heap's pool, as the launch convention gives it (spec §12): the runtime
+/// allocates and maps its heap from it, extends the heap in place, and cuts
+/// shares a program may mint and give; nothing it allocates may be mapped
+/// executable.
+static HEAP_POOL_KEEP: UInt32 = (PoolRight.Allocate | PoolRight.Map | PoolRight.Transfer
+                                 | PoolRight.Mint | PoolRight.Extend)
 
 /// The §8 status word's reason for a process that exited, in its high half.
 static REASON_EXITED: UInt = 1
@@ -459,6 +467,15 @@ func give(system: &System, proc: &Process, child: &Process, rows: &var Rows,
             borrow let e = ends[index] {
                 let minted = try e.inlet!.mint(rights: CLIENT_INLET)
                 try child.give(inlet: move minted, tag: r.tag) catch { return error.0 }
+            }
+        },
+        case Heap -> {
+            var record = rows.take(r.from)
+            guard let pool = record.take_pool() else {
+                panic("root: the plan gives row {} as a heap's pool, and it is not a pool", r.from)
+            }
+            try child.give(pool: move pool, tag: r.tag, keep: HEAP_POOL_KEEP) catch {
+                return error.0
             }
         }
     }

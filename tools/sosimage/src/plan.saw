@@ -8,7 +8,9 @@
 //! blob per process, one destination per process, then a row per device, in
 //! the order the image first uses each (every window need of each process, in
 //! image order and declaration order, then each `[[setup]]` write's device),
-//! then a row per pool, in `[[pool]]` order. A row is tagged with its ordinal.
+//! then a row per pool, in `[[pool]]` order, then a row per heap's pool, in
+//! image order and each declaration's slot order (`Bindings.heaps`). A row is
+//! tagged with its ordinal.
 //!
 //! Each process's records, in its declaration's order, each under its tag:
 //! its `system` record is a sibling of root's System that keeps the rights
@@ -24,7 +26,10 @@
 //! image that names a console (`[image] console`), every process but the one
 //! serving it is given one record more, after its declared ones: an inlet of
 //! the console's connection under `bootplan.CONSOLE_TAG`, which raises the
-//! handles it holds when it starts by one. Its quota rows are its
+//! handles it holds when it starts by one. Each heap it declares is given
+//! last, its pool's row under `bootplan.HEAP_TAG` plus the heap's slot
+//! (`Source.Heap`), which root gives with the launch convention's mask for a
+//! heap's pool (spec §12). Its quota rows are its
 //! declaration's `[quota]`, each replaced by the image's `quota` for it,
 //! which may raise a row and not lower it.
 //!
@@ -40,12 +45,18 @@
 //! image leaves, a row at the ledger's unlimited mark, a row the image alone
 //! gives below the row the image's children start with (an image raises a
 //! row and never lowers one), a child whose `Handle` row is short of what it
-//! holds when it starts (the console's inlet included, so a row at the
-//! declaration's own floor is short in an image that names a console), and a
-//! step at which root would hold more handles than its table has or make
-//! more objects of a kind than the image's slab of it holds: Process objects (root and each child), Pipe objects (one per
-//! connection), Interrupt objects (one per line) and IoMemory objects (one
-//! per device row, carve given and setup write's carve).
+//! holds when it starts and once its heaps have grown (the console's inlet
+//! included, so a row at the declaration's own floor is short in an image
+//! that names a console), a child whose `Mapping` row is short of a row for
+//! each window and each heap, or whose `Memory` row is short of one for each
+//! heap; a step at which root would hold more handles than its table has or
+//! make more objects of a kind than the image's slab of it holds: Process
+//! objects (root and each child), Pipe objects (one per connection),
+//! Interrupt objects (one per line) and IoMemory objects (one per device row,
+//! carve given and setup write's carve); and more Memory objects than the
+//! image's slab holds, one per row of the region table that is not a device's
+//! and one for each heap's `Memory`. A heap's shares are its program's to
+//! budget, and are not counted.
 //!
 //! Root's arena (`root_arena`) is what its heap takes for the plan: each of
 //! the plan's vectors and of root's own bookkeeping is made once at its
@@ -79,14 +90,16 @@
 
 import toml.{TomlPosition}
 import bootplan.{CHILD_WORDS, QUOTA_WORDS, RECORD_WORDS, RIGHT_WORDS, SETUP_WORDS,
-                 PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS, ROW_WINDOW_WORDS, CONSOLE_TAG}
+                 PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS, ROW_WINDOW_WORDS, CONSOLE_TAG,
+                 HEAP_TAG}
 import sosimage.board.{Board, Window, quota_keys}
 import sosimage.declaration.{Declaration, RecordKind, child_rights}
 import sosimage.failure.{BuildError}
 import sosimage.fields.{Fields}
+import sosimage.heapsize.{HEAP_CLASS_WORDS, HEAP_CONTROL_FIXED, heap_classes}
 import sosimage.hex.{hex}
 import sosimage.imagefile.{Bindings, ImageFile, SetupOp}
-import sosimage.kernel.{KernelFacts, QUOTA_HANDLE, QUOTA_KINDS, QUOTA_MAPPING}
+import sosimage.kernel.{KernelFacts, QUOTA_HANDLE, QUOTA_KINDS, QUOTA_MAPPING, QUOTA_MEMORY}
 import sosimage.limits.{QUOTA_UNLIMITED}
 import sosimage.regions.{RegionKind}
 import sosimage.rules.{refused}
@@ -113,11 +126,6 @@ public static ROOT_ARENA_FLOOR: Int = 0x1000
 /// arena's start and end to 16 bytes.
 static ARENA_ALIGN: Int = 16
 
-/// The heap's control block (`rt/common/src/heap.saw`): its fixed words, and
-/// the words of each class, a bitmap and four list heads.
-static HEAP_CONTROL_FIXED: Int = 2
-static HEAP_CLASS_WORDS: Int = 5
-
 /// The least window a setup write carves: one register.
 static REGISTER_BYTES: UInt64 = 4
 
@@ -129,7 +137,8 @@ public enum Source {
     case Carve,
     case Line,
     case Outlet,
-    case Inlet
+    case Inlet,
+    case Heap
 }
 
 @synthesize
@@ -144,7 +153,8 @@ public func source_word(source: Source) -> String {
         case Carve -> "Carve",
         case Line -> "Line",
         case Outlet -> "Outlet",
-        case Inlet -> "Inlet"
+        case Inlet -> "Inlet",
+        case Heap -> "Heap"
     }
 }
 
@@ -167,6 +177,7 @@ func source_named(word: String) -> Source? {
     if word.equals("line") { return Source.Line }
     if word.equals("outlet") { return Source.Outlet }
     if word.equals("inlet") { return Source.Inlet }
+    if word.equals("heap") { return Source.Heap }
     None
 }
 
@@ -200,10 +211,14 @@ public struct PlanChild {
     rights: Vector<String>
     start: Int
     shutdown: Bool
-    /// The handles it holds when it starts (`Declaration.handle_floor`, and
-    /// one for the console's inlet when it is given one); 0 for a test
-    /// image's child, which nothing holds to it.
+    /// The handles it holds when it starts and once its heaps have grown
+    /// (`Declaration.handle_floor`, and one for the console's inlet when it is
+    /// given one); 0 for a test image's child, which nothing holds to it.
     floor: Int
+    /// Its window records and its heaps, each a `Mapping` row it spends, and
+    /// each heap a `Memory` row; 0 for a test image's child.
+    windows: Int
+    heaps: Int
 }
 
 @synthesize
@@ -227,8 +242,12 @@ public struct PlanRow {
     /// A device row's window; a pool's is placed with the processes.
     base: UInt64
     len: UInt64
-    /// The pool a pool row is; "" for a device row.
+    /// The pool a pool row is; "" for a device row and a heap's pool.
     pool: String
+    /// The heap whose pool a row is, PROCESS.HEAP; "" for any other row.
+    heap: String
+    /// The range a heap's pool lies in; "" for any other row.
+    ram: String
 }
 
 /// An image's plan.
@@ -246,15 +265,17 @@ public struct ImagePlan {
 @synthesize
 extension ImagePlan: ExplicitCopy {}
 
-/// The objects of the four kinds the stock root makes for a plan that an
-/// image's slabs hold: Process (root and each child), Pipe (one per
-/// connection), Interrupt (one per line) and IoMemory (one per device row,
-/// carve given and setup write's carve).
+/// The objects of the kinds the stock root makes for a plan that an image's
+/// slabs hold: Process (root and each child), Pipe (one per connection),
+/// Interrupt (one per line) and IoMemory (one per device row, carve given and
+/// setup write's carve); and the Memory objects of the region table's rows
+/// and its children's heaps.
 public struct PlanSlabs {
     processes: Int
     pipes: Int
     interrupts: Int
     iomemories: Int
+    memories: Int
 }
 
 /// The `QuotaKind` value a quota key names.
@@ -305,7 +326,7 @@ func row_tag(rows: &Vector<PlanRow>, first: Int, device: String, pool: String) -
     var i = 0
     while i < rows.len() {
         let r = rows.get(i)!
-        if (not device.is_empty() && r.pool.is_empty() && r.what.equals(device)) ||
+        if (not device.is_empty() && r.kind == RegionKind.Device && r.what.equals(device)) ||
            (not pool.is_empty() && r.pool.equals(pool)) {
             return first + i
         }
@@ -352,8 +373,17 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
     while q < image.pools.len() {
         let pool = image.pools.get(q)!
         try! rows.push(PlanRow(what: "the pool {pool.name}", kind: RegionKind.Pool, base: 0,
-                               len: pool.len, pool: pool.name))
+                               len: pool.len, pool: pool.name, heap: "", ram: pool.ram))
         q = q + 1
+    }
+    let heap_first = first + rows.len()
+    var h = 0
+    while h < bound.heaps.len() {
+        let b = bound.heaps.get(h)!
+        try! rows.push(PlanRow(what: "the heap {b.heap.name} of {b.process}", kind: RegionKind.Pool,
+                               base: 0, len: b.heap.len, pool: "",
+                               heap: "{b.process}.{b.heap.name}", ram: b.range))
+        h = h + 1
     }
 
     // A connection per serve record, in image order and declaration order.
@@ -456,13 +486,25 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
                     floor = floor + 1
                 }
             }
+            var k = 0
+            while k < bound.heaps.len() {
+                let b = bound.heaps.get(k)!
+                if b.process.equals(process.name) {
+                    try! records.push(PlanRecord(tag: (HEAP_TAG as Int) + b.heap.slot,
+                                                 source: Source.Heap,
+                                                 from: (heap_first + k) as UInt64, offset: 0,
+                                                 len: 0))
+                }
+                k = k + 1
+            }
             let quota = try quota_rows(&image, &d, process.name, process.at)
             try! children.push(PlanChild(name: process.name, image: p, destination: count + p,
                                          quota: move quota, records: move records,
                                          rights: d.system_rights_or(&image.system_rights),
                                          start: start,
                                          shutdown: process.on_exit.equals("shutdown"),
-                                         floor: floor))
+                                         floor: floor, windows: d.window_count(),
+                                         heaps: d.heaps.len()))
         }
         p = p + 1
     }
@@ -510,7 +552,7 @@ func add_device_row(rows: &var Vector<PlanRow>, board: &Board, device: String, f
     }
     let d = board.device(device)!
     try! rows.push(PlanRow(what: device, kind: RegionKind.Device, base: d.base, len: d.len,
-                           pool: ""))
+                           pool: "", heap: "", ram: ""))
 }
 
 /// The index of `name` in `names`.
@@ -631,19 +673,36 @@ func quota_rows(image: &ImageFile, d: &Declaration, process: String,
 /// whose children start with the quota rows `defaults` (by `QuotaKind`
 /// value) and whose slabs hold `slabs`: each quota row against its bound,
 /// and a row the image alone gives against the row it would lower; each
-/// child's `Handle` row against what it holds when it starts; and root at
-/// every step of the plan, its handle table and the objects it has made of
-/// each kind `slabs` counts.
+/// child's `Handle` row against what it holds when it starts and once its
+/// heaps have grown, its `Mapping` row against its windows and heaps and its
+/// `Memory` row against its heaps; root at every step of the plan, its
+/// handle table and the objects it has made of each kind `slabs` counts; and
+/// the Memory objects of the region table's rows and the heaps against the
+/// image's slab.
 public func check_plan(plan: &ImagePlan, facts: &KernelFacts, defaults: &Vector<Int>,
                        slabs: &PlanSlabs, what: String) -> Result<Void, BuildError> {
     var c = 0
+    var heaps = 0
     while c < plan.children.len() {
         borrow let child = plan.children[c] {
             try check_child(&child, &facts, &defaults, what)
+            heaps = heaps + child.heaps
         }
         c = c + 1
     }
-    return root_steps(&plan, facts.handles, &slabs, what)
+    try root_steps(&plan, facts.handles, &slabs, what)
+    var rows = 2 * plan.children.len()
+    var r = 0
+    while r < plan.rows.len() {
+        if (plan.rows.get(r)!).kind != RegionKind.Device {
+            rows = rows + 1
+        }
+        r = r + 1
+    }
+    if rows + heaps > slabs.memories {
+        return BuildError(message: "{what}: the region table mints {rows} Memory objects at boot and the processes' {heaps} heaps make one each, {rows + heaps} in all, past the image's {slabs.memories}")
+    }
+    return
 }
 
 /// `check_plan` for one child.
@@ -651,6 +710,8 @@ func check_child(child: &PlanChild, facts: &KernelFacts, defaults: &Vector<Int>,
                  what: String) -> Result<Void, BuildError> {
     let mapping_bound = facts.budget - facts.image_rows
     var handles = defaults.get(QUOTA_HANDLE) ?? 0
+    var mappings = defaults.get(QUOTA_MAPPING) ?? 0
+    var memories = defaults.get(QUOTA_MEMORY) ?? 0
     var q = 0
     while q < child.quota.len() {
         let row = child.quota.get(q)!
@@ -672,6 +733,21 @@ func check_child(child: &PlanChild, facts: &KernelFacts, defaults: &Vector<Int>,
         if row.kind == QUOTA_MAPPING && row.limit > mapping_bound {
             return BuildError(message: "{what}: the process {child.name}'s `mappings` row is {row.limit}, past the {mapping_bound} grant rows an image leaves of this board's {facts.budget}")
         }
+        if row.kind == QUOTA_MAPPING {
+            mappings = row.limit
+        }
+        if row.kind == QUOTA_MEMORY {
+            memories = row.limit
+        }
+    }
+    if mappings < child.windows + child.heaps {
+        return BuildError(message: "{what}: the process {child.name}'s `Mapping` row is {mappings}, short of the {child.windows + child.heaps} rows it maps, one for each window ({child.windows}) and each heap ({child.heaps})")
+    }
+    if memories < child.heaps {
+        return BuildError(message: "{what}: the process {child.name}'s `Memory` row is {memories}, short of the {child.heaps} its heaps hold, one each")
+    }
+    if handles < child.floor && child.heaps > 0 {
+        return BuildError(message: "{what}: the process {child.name}'s `Handle` row is {handles}, short of the {child.floor} handles it holds once its {child.heaps} heaps have grown")
     }
     if handles < child.floor {
         if has_console(&child) {
@@ -781,6 +857,7 @@ func give_step(steps: &var Steps, record: &PlanRecord, table: Int, what: String,
                step: String) -> Result<Void, BuildError> {
     match record.source {
         case Row -> { steps.held = steps.held - 1 },
+        case Heap -> { steps.held = steps.held - 1 },
         case Outlet -> {
             try connect(&var steps, record.from as Int, table, what, step)
             steps.held = steps.held - 1
@@ -907,7 +984,7 @@ func read_child(f: &var Fields) -> Result<PlanChild, BuildError> {
         borrow var g = given[r] {
             let word = try g.text("source")
             guard let source = source_named(word) else {
-                return BuildError(message: "a plan's record has the source `{word}`, not one of `system`, `row`, `sibling`, `carve`, `line`, `outlet`, `inlet`")
+                return BuildError(message: "a plan's record has the source `{word}`, not one of `system`, `row`, `sibling`, `carve`, `line`, `outlet`, `inlet`, `heap`")
             }
             var from: UInt64 = 0
             var offset: UInt64 = 0
@@ -929,7 +1006,7 @@ func read_child(f: &var Fields) -> Result<PlanChild, BuildError> {
                           destination: try f.integer("destination"), quota: move quota,
                           records: move records, rights: child_rights(),
                           start: try f.integer("start"),
-                          shutdown: shutdown, floor: 0)
+                          shutdown: shutdown, floor: 0, windows: 0, heaps: 0)
     try f.finish()
     return move child
 }
@@ -1029,15 +1106,7 @@ public func root_blocks(plan: &ImagePlan, word: Int) -> Int {
 /// block, sized for a block as large as the region, and the first block's
 /// header, rounded up to two words.
 public func heap_front(size: Int, word: Int) -> Int {
-    var top = 0
-    while (size >> (top + 1)) != 0 {
-        top = top + 1
-    }
-    var smallest = 0
-    while ((4 * word) >> (smallest + 1)) != 0 {
-        smallest = smallest + 1
-    }
-    let classes = top - smallest + 1
+    let classes = heap_classes(size as UInt64, word)
     let grain = 2 * word
     let words = HEAP_CONTROL_FIXED + classes * HEAP_CLASS_WORDS
     (words * word + word + grain - 1) / grain * grain

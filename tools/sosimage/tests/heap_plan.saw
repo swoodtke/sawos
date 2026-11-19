@@ -1,0 +1,649 @@
+// Heaps over pools, as the builder reads, binds, plans and checks them: a
+// declaration's `[heap.NAME]` tables and its optional `arena`, an image's
+// `arena` and `heap-ram`, a RAM range's `atomics`, the pool rows and the
+// `Source.Heap` records a plan gives, the rows a heap holds a process to,
+// each refusal by its message, the built-in heap's size in a process's
+// script, and a heap's first growth against the runtime's own arithmetic.
+
+import sosrt.heap.{block_bytes, front_bytes}
+import bootplan.{HEAP_TAG}
+import sosimage.board.{Board, Span}
+import sosimage.declaration.{Declaration}
+import sosimage.heapsize.{first_growth}
+import sosimage.imagefile.{ImageFile, bind}
+import sosimage.kernel.{KernelFacts}
+import sosimage.layout.{Placement, check_window, process_script}
+import sosimage.plan.{ImagePlan, PlanSlabs, Source, check_plan, plan_image, plan_module}
+import sosimage.boardcheck.{HalFacts}
+import sosimage.product.{DEFAULT_ARENA, check_windows, process_arena}
+import sosimage.regions.{RegionKind}
+
+func join(lines: &Vector<String>) -> String {
+    "{lines.join("\n")}\n"
+}
+
+// An ESP32-S3 board with a slow range without atomics, as a PSRAM range is
+// until word atomics are shown to work there, and a second fast range with
+// them.
+func board() -> Board {
+    try! Board.parse(board_text(), "hal/xtensa-esp32s3/board.toml")
+}
+
+func board_text() -> String {
+    let lines: Vector<String> = [
+        "format = 1",
+        "[board]",
+        "name = \"esp32s3\"",
+        "triple = \"xtensa-esp-unknown-elf\"",
+        "tier = \"flat\"",
+        "hal = \"hal/xtensa-esp32s3\"",
+        "placement = \"copied\"",
+        "modules = []",
+        "cflags = []",
+        "[emulator]",
+        "program = \"qemu-system-xtensa\"",
+        "args = []",
+        "[ram.kernel]",
+        "use = \"kernel\"",
+        "speed = \"fast\"",
+        "base = 0x3FC8_C000",
+        "len = 0x2_4000",
+        "[ram.sram]",
+        "use = \"process\"",
+        "speed = \"fast\"",
+        "base = 0x3FCB_0000",
+        "len = 0x4_0000",
+        "atomics = true",
+        "[ram.iram]",
+        "use = \"process\"",
+        "speed = \"fast\"",
+        "base = 0x3FCF_0000",
+        "len = 0x1_0000",
+        "atomics = true",
+        "[ram.psram]",
+        "use = \"process\"",
+        "speed = \"slow\"",
+        "base = 0x3D00_0000",
+        "len = 0x80_0000",
+        "[ram.default]",
+        "process = \"sram\"",
+        "pool = \"sram\"",
+        "[devices.UART0]",
+        "type = \"esp32s3-uart\"",
+        "base = 0x6000_0000",
+        "len = 0x1000",
+        "line = 27",
+        "kernel = true",
+        "[devices.GPIO]",
+        "type = \"esp32s3-gpio\"",
+        "base = 0x6000_4000",
+        "len = 0x1000",
+        "line = 16"]
+    join(&lines)
+}
+
+func decl(lines: &Vector<String>, file: String) -> Declaration {
+    try! Declaration.parse(join(&lines), file)
+}
+
+// A logger: no arena, a pool for its memory record, and a default and a data
+// heap, the data heap written first.
+func logger_lines() -> Vector<String> {
+    ["format = 1", "arena = 0",
+     "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+     "[[boot]]", "name = \"scratch\"", "kind = \"memory\"", "tag = 2",
+     "[heap.data]", "slot = 1", "len = 0x4000",
+     "[heap.default]", "len = 0x8000"]
+}
+
+// A process that maps GPIO and has a default heap.
+func watcher_lines() -> Vector<String> {
+    ["format = 1",
+     "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+     "[[boot]]", "name = \"gpio\"", "kind = \"window\"", "type = \"esp32s3-gpio\"", "tag = 2",
+     "[heap.default]", "len = 0x2000"]
+}
+
+func image_lines() -> Vector<String> {
+    ["format = 1",
+     "[image]", "name = \"heaps\"", "board = \"esp32s3\"", "tick = false",
+     "[root]", "package = \"stock\"",
+     "[[process]]", "name = \"logger\"", "package = \"logger\"",
+     "pools = \{ scratch = \"spare\" \}",
+     "[[pool]]", "name = \"spare\"", "len = 0x1000"]
+}
+
+func loggers() -> Vector<Declaration> {
+    var out = Vector<Declaration>()
+    try! out.push(decl(&logger_lines(), "logger/process.toml"))
+    move out
+}
+
+func expect_text(got: String, want: String, what: String) {
+    if not got.equals(want) {
+        print("{what}")
+        print("expected: {want}")
+        print("got:      {got}")
+    }
+    assert(got.equals(want), what)
+}
+
+func decl_refusal(lines: Vector<String>, message: String) {
+    let got = match Declaration.parse(join(&lines), "p.toml") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect_text(got, message, "a declaration's refusal")
+}
+
+func image_refusal(lines: Vector<String>, message: String) {
+    let b = board()
+    let got = match ImageFile.parse(join(&lines), "i.toml", &b, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect_text(got, message, "an image's refusal")
+}
+
+func bind_refusal(lines: Vector<String>, decls: &Vector<Declaration>, message: String) {
+    let b = board()
+    let image = try! ImageFile.parse(join(&lines), "i.toml", &b, 4)
+    let got = match bind(&image, &b, &decls, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect_text(got, message, "a binding's refusal")
+}
+
+// The plan of `lines` with `decls`, at a grain of 4.
+func planned(lines: Vector<String>, decls: &Vector<Declaration>) -> ImagePlan {
+    let b = board()
+    let image = try! ImageFile.parse(join(&lines), "i.toml", &b, 4)
+    let bound = try! bind(&image, &b, &decls, 4)
+    try! plan_image(&image, &b, &decls, &bound, 4)
+}
+
+// The pools' ranges binding `lines` with `decls` placed, in order.
+func heap_ranges(lines: Vector<String>, decls: &Vector<Declaration>) -> String {
+    let b = board()
+    let image = try! ImageFile.parse(join(&lines), "i.toml", &b, 4)
+    let bound = try! bind(&image, &b, &decls, 4)
+    var out = Vector<String>()
+    var h = 0
+    while h < bound.heaps.len() {
+        let one = bound.heaps.get(h)!
+        try! out.push("{one.process}.{one.heap.name}:{one.range}")
+        h = h + 1
+    }
+    out.join(" ")
+}
+
+// A kernel whose root table holds 32 handles and whose budget leaves 12
+// grant rows.
+func facts() -> KernelFacts {
+    var zeros = Vector<Int>()
+    var k = 0
+    while k < 13 {
+        try! zeros.push(0)
+        k = k + 1
+    }
+    var defaults = Vector<Int>()
+    k = 0
+    while k < 9 {
+        try! defaults.push(4)
+        k = k + 1
+    }
+    KernelFacts(word: 4, capacity: 255, extents: 4, records_per_body: 4, handles: 32,
+                image_rows: 4, budget: 16, domains: 16, stride: 0, inflight: 2,
+                floors: zeros.copy(), defaults: move defaults, units: zeros.copy(),
+                aligns: move zeros)
+}
+
+// The rows children start with: `handles` handles, `mappings` mappings and 4
+// of every other kind.
+func defaults(handles: Int, mappings: Int) -> Vector<Int> {
+    var out = Vector<Int>()
+    var k = 0
+    while k < 9 {
+        try! out.push(if k == 7 { handles } else if k == 6 { mappings } else { 4 })
+        k = k + 1
+    }
+    move out
+}
+
+func slabs(memories: Int) -> PlanSlabs {
+    PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100,
+              memories: memories)
+}
+
+// What `check_plan` says of `plan`; "" when it holds.
+func checked(plan: &ImagePlan, handles: Int, mappings: Int, memories: Int) -> String {
+    let f = facts()
+    let d = defaults(handles, mappings)
+    let s = slabs(memories)
+    match check_plan(&plan, &f, &d, &s, "i.toml") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func main() {
+    declarations()
+    images()
+    plans()
+    rows()
+    arenas()
+    growth()
+    windows()
+}
+
+// An arm64 board, which translates: every process links at root's region's
+// base, and its rows lie above its image inside the grant window.
+func translated_board() -> Board {
+    let lines: Vector<String> = [
+        "format = 1",
+        "[board]",
+        "name = \"arm64-virt\"",
+        "triple = \"aarch64-unknown-none-elf\"",
+        "tier = \"isolated\"",
+        "hal = \"hal/arm64\"",
+        "placement = \"translated\"",
+        "modules = []",
+        "cflags = []",
+        "[emulator]",
+        "program = \"qemu-system-aarch64\"",
+        "args = []",
+        "[ram.kernel]",
+        "use = \"kernel\"",
+        "speed = \"fast\"",
+        "base = 0x4000_0000",
+        "len = 0x20_0000",
+        "[ram.ram]",
+        "use = \"process\"",
+        "speed = \"fast\"",
+        "base = 0x4020_0000",
+        "len = 0x7E0_0000",
+        "atomics = true",
+        "[ram.default]",
+        "process = \"ram\"",
+        "pool = \"ram\"",
+        "[devices.UART0]",
+        "type = \"pl011\"",
+        "base = 0x900_0000",
+        "len = 0x1000",
+        "line = 33",
+        "kernel = true"]
+    try! Board.parse(join(&lines), "hal/arm64/board.toml")
+}
+
+// arm64's HAL: RAM to 0x4800_0000, and a grant window that ends at
+// 0x4040_0000, 2 MiB above root's region's base.
+func arm64_facts() -> HalFacts {
+    HalFacts(root_base: 0x4020_0000, root_top: 0x4024_0000, grain: 0x1000,
+             console_base: 0x900_0000, console_len: 0x1000, kernel_base: 0x4000_0000,
+             ram_top: 0x4800_0000, stack_len: 0x4000, user_ram_top: 0x4040_0000)
+}
+
+// What `check_windows` says of one process with a region of `region` bytes
+// and heaps' pools of `heaps` bytes on `board`; "" when it holds.
+func windowed(board: &Board, region: UInt64, heaps: UInt64) -> String {
+    let lines: Vector<String> = ["format = 1",
+        "[image]", "name = \"w\"", "board = \"{board.name}\"", "tick = false",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"logger\"", "package = \"logger\""]
+    let image = try! ImageFile.parse(join(&lines), "w.toml", &board, 4)
+    var regions = Vector<Span>()
+    try! regions.push(Span(base: 0x4024_0000, len: region))
+    var bytes = Vector<UInt64>()
+    try! bytes.push(heaps)
+    let facts = arm64_facts()
+    match check_windows(&board, &facts, &image, &regions, &bytes, "w.toml") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func windows() {
+    // On a board that translates, the space is the grant window's above the
+    // link address, `USER_RAM_TOP` less root's base, not RAM's: a region and
+    // heaps' pools that fit below `RAM_TOP` and not below the window's end are
+    // refused.
+    let arm64 = translated_board()
+    assert(windowed(&arm64, 0x8000, 0x1F_8000).is_empty(), "the window's space exactly")
+    expect_text(windowed(&arm64, 0x8000, 0x20_0000), "w.toml: line 9, column 1: the process logger's region, 0x8000 bytes, and its heaps' pools, 0x200000 bytes, pass the 0x200000 bytes its rows have above its link address on a board that translates: each heap's row and the room it grows into lie above the region", "past the grant window, inside RAM")
+    // A board that runs a process where it links holds no such bound.
+    let s3 = board()
+    assert(windowed(&s3, 0x8000, 0x20_0000).is_empty(), "an identity board")
+}
+
+func declarations() {
+    // The heaps, in slot order whatever the file's, and no arena.
+    let logger = decl(&logger_lines(), "logger/process.toml")
+    assert(logger.arena == 0, "no built-in heap")
+    assert(logger.heaps.len() == 2, "two heaps")
+    let first = logger.heaps.get(0)!
+    let second = logger.heaps.get(1)!
+    assert(first.name.equals("default") && first.slot == 0 && first.len == 0x8000,
+           "the default heap first")
+    assert(second.name.equals("data") && second.slot == 1 && second.len == 0x4000,
+           "the data heap, slot 1")
+    assert(not first.fast && not second.fast, "neither asks for fast memory")
+    // Two records and its Process handle, and three handles a heap with one
+    // Process handle they map through.
+    assert(logger.handle_floor() == 10, "the floor, its heaps' included")
+    assert(logger.window_count() == 0, "no window")
+    let watcher = decl(&watcher_lines(), "watcher/process.toml")
+    assert(watcher.handle_floor() == 8, "a window's Mapping, and one heap's four")
+    assert(watcher.window_count() == 1, "one window")
+    var fast = logger_lines()
+    try! fast.push("ram = \"fast\"")
+    assert((decl(&fast, "f.toml").heaps.get(0)!).fast, "a fast heap")
+
+    // A declared `handles` row at the floor reads, and one below it is refused.
+    var at_floor = logger_lines()
+    try! at_floor.push("[quota]")
+    try! at_floor.push("handles = 10")
+    let _ = decl(&at_floor, "p.toml")
+    var below = logger_lines()
+    try! below.push("[quota]")
+    try! below.push("handles = 9")
+    decl_refusal(move below, "p.toml: line 17, column 1: `handles` in [quota] is 9, below the 10 the process holds once its heaps have grown: one per [[boot]] record, its Process handle, one Mapping per window, its main thread's own Thread handle if it is written with `main`, and 3 for each of its 2 heaps (its pool, its Memory and its Mapping) with the one Process handle they map through")
+
+    // Each refusal of a heap.
+    let base: Vector<String> = ["format = 1",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1"]
+    var dash = base.copy()
+    try! dash.append(&["[heap.my-data]", "slot = 1", "len = 0x4000"])
+    decl_refusal(move dash, "p.toml: line 6, column 7: `my-data` is not a heap's name: a heap is named as a Saw identifier is, a letter, then letters, digits and `_`")
+    var slotted = base.copy()
+    try! slotted.append(&["[heap.default]", "slot = 0", "len = 0x4000"])
+    decl_refusal(move slotted, "p.toml: line 7, column 1: [heap.default] has a `slot`: the default heap is slot 0, the global allocator's, and only a named heap states one")
+    var unslotted = base.copy()
+    try! unslotted.append(&["[heap.data]", "len = 0x4000"])
+    decl_refusal(move unslotted, "p.toml: line 6, column 7: [heap.data] has no `slot`: a named heap states the slot its program names it by, 1 to 3")
+    var zero = base.copy()
+    try! zero.append(&["[heap.data]", "slot = 0", "len = 0x4000"])
+    decl_refusal(move zero, "p.toml: line 7, column 1: `slot` in [heap.data] is 0: a named heap's slot is 1 to 3, below MAX_HEAPS (4), and slot 0 is [heap.default]'s")
+    var past = base.copy()
+    try! past.append(&["[heap.data]", "slot = 4", "len = 0x4000"])
+    decl_refusal(move past, "p.toml: line 7, column 1: `slot` in [heap.data] is 4: a named heap's slot is 1 to 3, below MAX_HEAPS (4), and slot 0 is [heap.default]'s")
+    var last = base.copy()
+    try! last.append(&["[heap.data]", "slot = 3", "len = 0x4000"])
+    assert((decl(&last, "p.toml").heaps.get(0)!).slot == 3, "the last slot")
+    var twice = base.copy()
+    try! twice.append(&["[heap.data]", "slot = 2", "len = 0x4000",
+                        "[heap.log]", "slot = 2", "len = 0x4000"])
+    decl_refusal(move twice, "p.toml: line 10, column 1: [heap.log] takes slot 2, which [heap.data] takes at line 6, column 7: a slot is one heap's")
+    var slow = base.copy()
+    try! slow.append(&["[heap.default]", "len = 0x4000", "ram = \"slow\""])
+    decl_refusal(move slow, "p.toml: line 8, column 1: `ram` in [heap.default] is \"slow\": a heap's `ram` is \"fast\", for a pool that must lie in fast memory, or absent")
+    var unknown = base.copy()
+    try! unknown.append(&["[heap.default]", "len = 0x4000", "grow = 0x1000"])
+    decl_refusal(move unknown, "p.toml: line 8, column 1: `grow` is not a key of [heap.default], which takes `len`, `slot`, `ram`")
+    var lenless = base.copy()
+    try! lenless.append(&["[heap.default]", "ram = \"fast\""])
+    let missing = match Declaration.parse(join(&lenless), "p.toml") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(missing.contains("len"), "a heap without `len`: {missing}")
+
+    // A heap's `len` is held to the board's word.
+    let b = board()
+    var wide = base.copy()
+    try! wide.append(&["[heap.default]", "len = 0x1_0000_0000"])
+    let too_wide = decl(&wide, "p.toml")
+    let word = match too_wide.check_against(&b) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect_text(word, "p.toml: line 7, column 1: `len` in [heap.default] is 0x100000000, past what the 32-bit word of the board esp32s3 holds (0xffffffff)", "a len past the word")
+}
+
+func images() {
+    // A board range's `atomics`.
+    let b = board()
+    assert((b.range("sram")!).atomics, "sram states atomics")
+    assert(not (b.range("psram")!).atomics, "psram states none")
+
+    // The image's `arena` and `heap-ram`.
+    var stated = image_lines()
+    stated[4] = "tick = false\narena = 0x3000\nheap-ram = \"iram\""
+    let image = try! ImageFile.parse(join(&stated), "i.toml", &b, 4)
+    assert(image.arena == 0x3000, "the image's arena")
+    assert(image.heap_ram.equals("iram"), "the image's heap-ram")
+    let plain = try! ImageFile.parse(join(&image_lines()), "i.toml", &b, 4)
+    assert(plain.arena == None && plain.heap_ram.is_empty(), "neither stated")
+
+    var kernel_range = image_lines()
+    kernel_range[4] = "tick = false\nheap-ram = \"kernel\""
+    image_refusal(move kernel_range, "i.toml: line 6, column 1: `heap-ram` in [image] is \"kernel\", the kernel's range: a process or a pool takes a range with use = \"process\"")
+    var nowhere = image_lines()
+    nowhere[10] = "pools = \{ scratch = \"spare\" \}\nheap-ram = \{ data = \"nowhere\" \}"
+    image_refusal(move nowhere, "i.toml: line 12, column 14: `data` in the `heap-ram` of the process logger is \"nowhere\", which names no RAM range of the board esp32s3")
+    let hand: Vector<String> = ["format = 1",
+        "[image]", "name = \"hand\"", "board = \"esp32s3\"", "tick = false", "arena = 0x1000",
+        "[root]", "package = \"myroot\"",
+        "[[process]]", "name = \"one\"", "package = \"one\""]
+    image_refusal(hand.copy(), "i.toml: line 6, column 1: `arena` and `heap-ram` in [image] are the stock root's: a hand-written root's processes are linked as their packages say, and its description gives their records")
+    var hand_ram = hand.copy()
+    hand_ram[5] = "heap-ram = \"sram\""
+    image_refusal(move hand_ram, "i.toml: line 6, column 1: `arena` and `heap-ram` in [image] are the stock root's: a hand-written root's processes are linked as their packages say, and its description gives their records")
+
+    // Where each heap's pool lies: the process's `heap-ram` for the heap, else
+    // the image's, else the board's default.
+    let decls = loggers()
+    expect_text(heap_ranges(image_lines(), &decls), "logger.default:sram logger.data:sram",
+                "the board's default")
+    var image_wide = image_lines()
+    image_wide[4] = "tick = false\nheap-ram = \"iram\""
+    expect_text(heap_ranges(image_wide.copy(), &decls), "logger.default:iram logger.data:iram",
+                "the image's")
+    var per_heap = image_wide.copy()
+    per_heap[10] = "pools = \{ scratch = \"spare\" \}\nheap-ram = \{ data = \"sram\" \}"
+    expect_text(heap_ranges(move per_heap, &decls), "logger.default:iram logger.data:sram",
+                "the process's, over the image's")
+
+    // Binding's refusals.
+    var no_heap = image_lines()
+    no_heap[10] = "pools = \{ scratch = \"spare\" \}\nheap-ram = \{ log = \"sram\" \}"
+    bind_refusal(move no_heap, &decls, "i.toml: line 12, column 14: `log` in the `heap-ram` of the process logger is no heap of logger, whose heaps are `default`, `data`")
+    // A pool in a range without atomics: an ESP32-S3's PSRAM until word
+    // atomics are shown to work there.
+    var in_psram = image_lines()
+    in_psram[10] = "pools = \{ scratch = \"spare\" \}\nheap-ram = \{ data = \"psram\" \}"
+    bind_refusal(move in_psram, &decls, "i.toml: line 9, column 1: the heap `data` of the process logger has its pool placed in psram, which does not state `atomics = true` on the board esp32s3: what a program allocates may hold atomic words, so a heap's pool lies where word atomics work")
+    // A fast heap in a slow range.
+    var fast_lines = logger_lines()
+    try! fast_lines.push("ram = \"fast\"")
+    var fast = Vector<Declaration>()
+    try! fast.push(decl(&fast_lines, "logger/process.toml"))
+    var fast_in_psram = image_lines()
+    fast_in_psram[4] = "tick = false\nheap-ram = \"psram\""
+    bind_refusal(move fast_in_psram, &fast, "i.toml: line 10, column 1: the heap `default` of the process logger declares ram = \"fast\", and its pool is placed in psram, a slow range")
+    // A `len` off the grain, and one below the first growth.
+    var odd_lines = logger_lines()
+    odd_lines[12] = "len = 0x4002"
+    var odd = Vector<Declaration>()
+    try! odd.push(decl(&odd_lines, "logger/process.toml"))
+    bind_refusal(image_lines(), &odd, "logger/process.toml: line 13, column 1: the heap `data` of the process logger's pool is 0x4002 bytes, which is no whole number of the board esp32s3's grain (0x4 bytes): a heap grows by whole grains")
+    var small_lines = logger_lines()
+    small_lines[12] = "len = 0x3FC"
+    var small = Vector<Declaration>()
+    try! small.push(decl(&small_lines, "logger/process.toml"))
+    bind_refusal(image_lines(), &small, "logger/process.toml: line 13, column 1: the heap `data` of the process logger's pool is 0x3fc bytes, below the 0x400 its first growth takes on the board esp32s3: its control block, sized for the pool, and one block, at least a KiB or a grain")
+    var least_lines = logger_lines()
+    least_lines[12] = "len = 0x400"
+    var least = Vector<Declaration>()
+    try! least.push(decl(&least_lines, "logger/process.toml"))
+    let _ = planned(image_lines(), &least)
+}
+
+func plans() {
+    let decls = loggers()
+    let plan = planned(image_lines(), &decls)
+    // One blob and one destination; then the image's pool, then each heap's,
+    // in slot order.
+    assert(plan.rows.len() == 3, "a pool and two heaps' pools")
+    let pool = plan.rows.get(0)!
+    assert(pool.kind == RegionKind.Pool && pool.pool.equals("spare") && pool.heap.is_empty(),
+           "the image's pool first")
+    let default_row = plan.rows.get(1)!
+    assert(default_row.kind == RegionKind.Pool && default_row.heap.equals("logger.default") &&
+           default_row.len == 0x8000 && default_row.ram.equals("sram") &&
+           default_row.pool.is_empty(), "the default heap's pool")
+    let data_row = plan.rows.get(2)!
+    assert(data_row.heap.equals("logger.data") && data_row.len == 0x4000, "the data heap's pool")
+    borrow let logger = plan.children[0] {
+        assert(logger.records.len() == 4, "two declared records and two heaps")
+        assert(logger.floor == 10 && logger.windows == 0 && logger.heaps == 2, "its rows' needs")
+        let system = logger.records.get(0)!
+        assert(system.source == Source.System, "its System first")
+        let scratch = logger.records.get(1)!
+        assert(scratch.source == Source.Row && scratch.from == 2, "its pool's row")
+        let heap0 = logger.records.get(2)!
+        assert(heap0.tag == (HEAP_TAG as Int) && heap0.source == Source.Heap && heap0.from == 3,
+               "the default heap's pool, under HEAP_TAG")
+        let heap1 = logger.records.get(3)!
+        assert(heap1.tag == (HEAP_TAG as Int) + 1 && heap1.source == Source.Heap &&
+               heap1.from == 4, "the data heap's pool, under HEAP_TAG + 1")
+    }
+    let module = plan_module(&plan, "heaps").join("\n")
+    assert(module.contains("    try! records.push(Record(tag: 4294967041, source: Source.Heap, from: 0x3, offset: 0x0, len: 0x0))\n    try! records.push(Record(tag: 4294967042, source: Source.Heap, from: 0x4, offset: 0x0, len: 0x0))"),
+           "the module's heap records")
+
+    // Two processes: the device rows first, then the image's pools, then
+    // every heap's pool, in image order.
+    var two = loggers()
+    try! two.push(decl(&watcher_lines(), "watcher/process.toml"))
+    var both = image_lines()
+    both[10] = "pools = \{ scratch = \"spare\" \}\n[[process]]\nname = \"watcher\"\npackage = \"watcher\""
+    let pair = planned(move both, &two)
+    assert(pair.rows.len() == 5, "GPIO, the pool and three heaps' pools")
+    assert((pair.rows.get(0)!).kind == RegionKind.Device, "the device row first")
+    assert((pair.rows.get(4)!).heap.equals("watcher.default"), "the watcher's heap's pool last")
+    borrow let w = pair.children[1] {
+        let heap = w.records.get(2)!
+        assert(heap.source == Source.Heap && heap.from == 8, "the watcher's heap's pool's row")
+        assert(w.windows == 1 && w.heaps == 1, "a window and a heap")
+    }
+}
+
+func rows() {
+    let decls = loggers()
+    let plan = planned(image_lines(), &decls)
+    assert(checked(&plan, 10, 2, 100).is_empty(), "the logger's rows hold")
+    // `Handle`: its records, its Process handle, three per heap and the
+    // heaps' Process handle.
+    expect_text(checked(&plan, 9, 2, 100), "i.toml: the process logger's `Handle` row is 9, short of the 10 handles it holds once its 2 heaps have grown", "a Handle row short")
+    // `Mapping`: a row per heap.
+    expect_text(checked(&plan, 10, 1, 100), "i.toml: the process logger's `Mapping` row is 1, short of the 2 rows it maps, one for each window (0) and each heap (2)", "a Mapping row short")
+    // ...and a row per window: a watcher's Mapping row of one is short.
+    var watchers = Vector<Declaration>()
+    var watcher_quota = watcher_lines()
+    try! watcher_quota.push("[quota]")
+    try! watcher_quota.push("mappings = 1")
+    try! watchers.push(decl(&watcher_quota, "watcher/process.toml"))
+    let alone: Vector<String> = ["format = 1",
+        "[image]", "name = \"w\"", "board = \"esp32s3\"", "tick = false",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"watcher\"", "package = \"watcher\""]
+    let watched = planned(alone.copy(), &watchers)
+    expect_text(checked(&watched, 16, 4, 100), "i.toml: the process watcher's `Mapping` row is 1, short of the 2 rows it maps, one for each window (1) and each heap (1)", "a window's row")
+    var watcher_two = watcher_lines()
+    try! watcher_two.push("[quota]")
+    try! watcher_two.push("mappings = 2")
+    var roomy = Vector<Declaration>()
+    try! roomy.push(decl(&watcher_two, "watcher/process.toml"))
+    let room = planned(alone.copy(), &roomy)
+    assert(checked(&room, 16, 4, 100).is_empty(), "a row per window and heap")
+    // `Memory`: a row per heap.
+    var memory_one = logger_lines()
+    try! memory_one.push("[quota]")
+    try! memory_one.push("memories = 1")
+    var short_memory = Vector<Declaration>()
+    try! short_memory.push(decl(&memory_one, "logger/process.toml"))
+    let memory_plan = planned(image_lines(), &short_memory)
+    expect_text(checked(&memory_plan, 10, 2, 100), "i.toml: the process logger's `Memory` row is 1, short of the 2 its heaps hold, one each", "a Memory row short")
+    // The image's Memory slab: the blob, the destination, the pool and two
+    // heaps' pools at boot, and a Memory for each heap.
+    assert(checked(&plan, 10, 2, 7).is_empty(), "seven Memory objects")
+    expect_text(checked(&plan, 10, 2, 6), "i.toml: the region table mints 5 Memory objects at boot and the processes' 2 heaps make one each, 7 in all, past the image's 6", "the Memory slab")
+
+    // On a board that translates, the region and the heaps' pools within the
+    // space above the link address.
+    let b = board()
+    let image = try! ImageFile.parse(join(&image_lines()), "i.toml", &b, 4)
+    let fits = match check_window("logger", 0x8000, 0x1F_8000, 0x20_0000, "i.toml", image.root_at) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(fits.is_empty(), "exactly the space")
+    let over = match check_window("logger", 0x8000, 0x1F_9000, 0x20_0000, "i.toml", image.root_at) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect_text(over, "i.toml: line 6, column 2: the process logger's region, 0x8000 bytes, and its heaps' pools, 0x1f9000 bytes, pass the 0x200000 bytes its rows have above its link address on a board that translates: each heap's row and the room it grows into lie above the region", "past the window")
+    let heapless = match check_window("logger", 0x30_0000, 0, 0x20_0000, "i.toml", image.root_at) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(heapless.is_empty(), "no heap, no bound")
+}
+
+func arenas() {
+    // The built-in heap: the declaration's, else the image's, else the
+    // default.
+    let b = board()
+    var with_arena = image_lines()
+    with_arena[4] = "tick = false\narena = 0x3000"
+    let image = try! ImageFile.parse(join(&with_arena), "i.toml", &b, 4)
+    let plain = try! ImageFile.parse(join(&image_lines()), "i.toml", &b, 4)
+    var own_lines = logger_lines()
+    own_lines[1] = "arena = 0x2000"
+    let own = decl(&own_lines, "logger/process.toml")
+    assert(process_arena(&own, &image) == 0x2000, "the declaration's over the image's")
+    assert(process_arena(&own, &plain) == 0x2000, "the declaration's")
+    var none_lines = logger_lines()
+    none_lines[1] = "# no arena"
+    let none = decl(&none_lines, "logger/process.toml")
+    assert(process_arena(&none, &image) == 0x3000, "the image's")
+    assert(process_arena(&none, &plain) == DEFAULT_ARENA && DEFAULT_ARENA == 0x1000,
+           "the default, 4 KiB")
+    let zero = decl(&logger_lines(), "logger/process.toml")
+    assert(process_arena(&zero, &image) == 0, "a declared arena of 0")
+    // The process's script states it.
+    let p = Placement(region: Span(base: 0x3FCC_0000, len: 0x8000), stack: 0x4000, slot: None)
+    let script = try! process_script("logger", &p, process_arena(&none, &image), "/u.ld")
+    assert(script.join("\n").contains("ARENA_SIZE = 0x3000;\nINCLUDE \"/u.ld\""), "the script's arena")
+}
+
+func growth() {
+    // A 32-bit word at a grain of 4: a KiB, the least growth.
+    assert(first_growth(0x4000, 4, 4) == 0x400, "word 4")
+    // A 64-bit word at a page's grain: a page.
+    assert(first_growth(0x8000, 8, 0x1000) == 0x1000, "word 8, a page")
+    // Past a KiB: a control block sized for a pool of 4 GiB, on 64 bits.
+    assert(first_growth(0x1_0000_0000, 8, 16) == 0x4B0, "a large pool's control block")
+    // On the host's word the runtime's own arithmetic says the same.
+    let lens: [UInt; 5] = [0x400, 0x1000, 0x8000, 0x10_0000, 0x1234_0000]
+    let grains: [UInt; 3] = [8, 16, 0x1000]
+    var i = 0
+    while i < 5 {
+        var g = 0
+        while g < 3 {
+            let len = lens[i]
+            let grain = grains[g]
+            let need = front_bytes(len) + block_bytes(1, 1)
+            var by = (need + grain - 1) / grain * grain
+            let least: UInt = if grain > 1024 { grain } else { 1024 }
+            if by < least {
+                by = least
+            }
+            assert(first_growth(len as UInt64, 8, grain as UInt64) == by as UInt64,
+                   "the runtime's first growth for {len} at a grain of {grain}")
+            g = g + 1
+        }
+        i = i + 1
+    }
+}

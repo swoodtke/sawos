@@ -7,6 +7,9 @@
 //!     board = "esp32s3"                  a board description's `name`
 //!     tick = true
 //!     console = "console.uart"           optional: PROCESS.RECORD
+//!     arena = 0x1000                     optional: every process's built-in
+//!                                        heap, but one its declaration sizes
+//!     heap-ram = "sram"                  optional: every heap's pool's range
 //!
 //!     [limits]                           optional: a board's [limits.default]
 //!
@@ -32,6 +35,7 @@
 //!     quota = { handles = 10 }
 //!     clients = { log = "logger.log" }   client record to PROCESS.RECORD
 //!     pools = { buffer = "frames" }      memory record to pool
+//!     heap-ram = { data = "psram" }      heap to its pool's range
 //!     on-exit = "report"                 or "shutdown"
 //!
 //!     [[pool]]
@@ -62,6 +66,13 @@
 //! process but the one serving it is given an inlet of that connection under
 //! `bootplan.CONSOLE_TAG`, after its declared records (`sosimage.plan`).
 //!
+//! `arena` and `heap-ram` are the stock root's. `arena` sizes the built-in
+//! heap of each process whose declaration states no `arena` of its own
+//! (`sosimage.product.process_arena`). A heap's pool (`[heap.NAME]` in a
+//! declaration) lies in the process's `heap-ram` range for the heap, else the
+//! image's `heap-ram`, else the board's `[ram.default] pool`; binding holds
+//! it to the board (`bind_heaps`).
+//!
 //! `[keys]` chooses the kernel's keyed modules: each key it states is one of
 //! the board's build keys (`sosimage.board`), and its value names the
 //! directory the key's module is compiled from, the module's path with the
@@ -83,21 +94,22 @@
 //! root's processes to their declarations (`bind`) is the rest of it, a
 //! `device` reference against the board included: device needs to devices,
 //! by type; client records to serves; memory records to pools; every input
-//! to its value; each process to a RAM range (`choose_range`); and `console`
-//! to a serve of `uartproto`.
+//! to its value; each process to a RAM range (`choose_range`); each heap to
+//! its pool's range (`bind_heaps`); and `console` to a serve of `uartproto`.
 
 import toml.{TomlKind, TomlPosition, TomlTable}
 import sosimage.board.{Board, LimitsSpec, NamedCount, RefUse, Window, expect_table,
                        quota_keys, read_counts, require_table}
-import sosimage.declaration.{BootRecord, Declaration, RecordKind, child_rights,
+import sosimage.declaration.{BootRecord, Declaration, HeapDecl, RecordKind, child_rights,
                              console_rights, kind_word, read_rights}
 import sosimage.failure.{BuildError}
+import sosimage.heapsize.{first_growth}
 import sosimage.hex.{hex}
 import sosimage.layout.{choose_range}
 import sosimage.rules.{
     check_format, check_name, check_path, check_process_name, check_ram_name,
-    element_at, holds, only_keys, parse_description, parse_ref, refused, size,
-    strings, text, toml_refused, where_is,
+    element_at, holds, only_keys, optional_size, parse_description, parse_ref, refused,
+    size, strings, text, toml_refused, where_is,
 }
 
 /// A stock-root process's device need, as the image binds it.
@@ -180,6 +192,12 @@ public struct ImageFile {
     /// The console, as PROCESS.RECORD; none when the image names none.
     console: String?
     console_at: TomlPosition
+    /// `[image] arena`: the built-in heap of a process whose declaration
+    /// states none.
+    arena: UInt64?
+    /// `[image] heap-ram`: the range every heap's pool lies in that its
+    /// process's `heap-ram` does not place; the board's default when empty.
+    heap_ram: String
     has_limits: Bool
     limits: LimitsSpec
     /// `[keys]`, in file order.
@@ -199,6 +217,8 @@ public struct ImageFile {
     clients: Vector<Entry>
     pool_bindings: Vector<Entry>
     quotas: Vector<Entry>
+    /// Each process's `heap-ram`: a heap's name to its pool's range.
+    heap_rams: Vector<Entry>
     pools: Vector<PoolEntry>
     row_devices: Vector<RowDevice>
     row_pools: Vector<String>
@@ -250,8 +270,12 @@ extension ImageFile {
         var tick = false
         var console: String? = None
         var console_at = root.defined_at()
+        var arena: UInt64? = None
+        var heap_ram = ""
+        var stock_keys = Vector<TomlPosition>()
         if let i = root.table("image") {
-            let image_keys: Vector<String> = ["name", "board", "tick", "console"]
+            let image_keys: Vector<String> = ["name", "board", "tick", "console", "arena",
+                                              "heap-ram"]
             try only_keys(&i, &image_keys, file, "[image]")
             name = try text(&i, "name", file)
             try check_name(name, file, where_is(&i, "name"), "an image's name")
@@ -266,6 +290,16 @@ extension ImageFile {
             if i.contains("console") {
                 console = try text(&i, "console", file)
                 console_at = where_is(&i, "console")
+            }
+            arena = try optional_size(&i, "arena", board.word, file, "[image]")
+            if i.contains("arena") {
+                try! stock_keys.push(where_is(&i, "arena"))
+            }
+            if i.contains("heap-ram") {
+                heap_ram = try text(&i, "heap-ram", file)
+                try check_ram(&board, "`heap-ram` in [image]", heap_ram, file,
+                              where_is(&i, "heap-ram"))
+                try! stock_keys.push(where_is(&i, "heap-ram"))
             }
         }
 
@@ -298,6 +332,10 @@ extension ImageFile {
         if console != None && not stock {
             return refused(file, console_at,
                            "`console` in [image] is the stock root's: a hand-written root gives its own records, and its description says what it gives")
+        }
+        if stock_keys.len() > 0 && not stock {
+            return refused(file, stock_keys.get(0)!,
+                           "`arena` and `heap-ram` in [image] are the stock root's: a hand-written root's processes are linked as their packages say, and its description gives their records")
         }
 
         var system_rights = if console != None { console_rights() } else { child_rights() }
@@ -339,7 +377,8 @@ extension ImageFile {
 
         var parts = Parts(processes: Vector<ProcessEntry>(), devices: Vector<NeedRef>(),
                           inputs: Vector<Entry>(), clients: Vector<Entry>(),
-                          pool_bindings: Vector<Entry>(), quotas: Vector<Entry>())
+                          pool_bindings: Vector<Entry>(), quotas: Vector<Entry>(),
+                          heap_rams: Vector<Entry>())
         try root.require("process", TomlKind.Array) catch {
             return toml_refused(file, error)
         }
@@ -466,8 +505,9 @@ extension ImageFile {
         }
 
         return ImageFile(file: file, name: name, board: board_name, tick: tick,
-                         console: console, console_at: console_at,
-                         has_limits: has_limits, limits: move limits, keys: move keys,
+                         console: console, console_at: console_at, arena: arena,
+                         heap_ram: heap_ram, has_limits: has_limits, limits: move limits,
+                         keys: move keys,
                          stock: stock,
                          root_package: root_package, root_at: root_at,
                          system_rights: move system_rights,
@@ -475,7 +515,8 @@ extension ImageFile {
                          devices: parts.devices.copy(), inputs: parts.inputs.copy(),
                          clients: parts.clients.copy(),
                          pool_bindings: parts.pool_bindings.copy(),
-                         quotas: parts.quotas.copy(), pools: move pools,
+                         quotas: parts.quotas.copy(), heap_rams: parts.heap_rams.copy(),
+                         pools: move pools,
                          row_devices: move row_devices, row_pools: move row_pools)
     }
 
@@ -502,6 +543,7 @@ struct Parts {
     clients: Vector<Entry>
     pool_bindings: Vector<Entry>
     quotas: Vector<Entry>
+    heap_rams: Vector<Entry>
 }
 
 @synthesize
@@ -541,14 +583,16 @@ func has_pool(pools: &Vector<PoolEntry>, name: String) -> Bool {
     false
 }
 
-/// Refuses a `ram` naming no process range of `board`.
-func check_ram(board: &Board, ram: String, file: String, at: TomlPosition) -> Result<Void, BuildError> {
+/// Refuses a range `ram`, which `what` names, that is no process range of
+/// `board`.
+func check_ram(board: &Board, what: String, ram: String, file: String,
+               at: TomlPosition) -> Result<Void, BuildError> {
     try check_ram_name(ram, file, at)
     guard let r = board.range(ram) else {
-        return refused(file, at, "`ram` is \"{ram}\", which names no RAM range of the board {board.name}")
+        return refused(file, at, "{what} is \"{ram}\", which names no RAM range of the board {board.name}")
     }
     if r.kernel {
-        return refused(file, at, "`ram` is \"{ram}\", the kernel's range: a process or a pool takes a range with use = \"process\"")
+        return refused(file, at, "{what} is \"{ram}\", the kernel's range: a process or a pool takes a range with use = \"process\"")
     }
     return
 }
@@ -557,7 +601,7 @@ func check_ram(board: &Board, ram: String, file: String, at: TomlPosition) -> Re
 func read_process(p: &TomlTable, stock: Bool, board: &Board, parts: &var Parts,
                   file: String) -> Result<Void, BuildError> {
     let known: Vector<String> = ["name", "package", "device", "inputs", "ram", "quota", "clients",
-                                 "pools", "on-exit"]
+                                 "pools", "heap-ram", "on-exit"]
     try only_keys(&p, &known, file, "[[process]]")
     let keys = try! p.keys()
     var k = 0
@@ -590,7 +634,7 @@ func read_process(p: &TomlTable, stock: Bool, board: &Board, parts: &var Parts,
     var ram = ""
     if p.contains("ram") {
         ram = try text(&p, "ram", file)
-        try check_ram(&board, ram, file, where_is(&p, "ram"))
+        try check_ram(&board, "`ram`", ram, file, where_is(&p, "ram"))
     }
     var on_exit = "report"
     if p.contains("on-exit") {
@@ -621,6 +665,16 @@ func read_process(p: &TomlTable, stock: Bool, board: &Board, parts: &var Parts,
     }
     try read_entries(&p, "clients", name, &var parts.clients, file)
     try read_entries(&p, "pools", name, &var parts.pool_bindings, file)
+    try read_entries(&p, "heap-ram", name, &var parts.heap_rams, file)
+    var h = 0
+    while h < parts.heap_rams.len() {
+        let given = parts.heap_rams.get(h)!
+        h = h + 1
+        if given.process.equals(name) {
+            try check_ram(&board, "`{given.key}` in the `heap-ram` of the process {name}",
+                          given.value, file, given.at)
+        }
+    }
     try expect_table(&p, "quota", file)
     if let q = p.table("quota") {
         let qk = quota_keys()
@@ -666,6 +720,7 @@ func key_noun(key: String) -> String {
     if key.equals("device") { return "device need" }
     if key.equals("inputs") { return "input" }
     if key.equals("clients") { return "client record" }
+    if key.equals("heap-ram") { return "heap" }
     "memory record"
 }
 
@@ -680,7 +735,7 @@ func read_pool(p: &TomlTable, board: &Board, file: String) -> Result<PoolEntry, 
     var ram = ""
     if p.contains("ram") {
         ram = try text(&p, "ram", file)
-        try check_ram(&board, ram, file, where_is(&p, "ram"))
+        try check_ram(&board, "`ram`", ram, file, where_is(&p, "ram"))
     }
     return PoolEntry(name: name, len: len, ram: ram, at: at)
 }
@@ -750,14 +805,24 @@ public struct InputValue {
     source: InputSource
 }
 
+/// A heap, bound: its process, its declaration, and the range its pool lies
+/// in.
+public struct BoundHeap {
+    process: String
+    heap: HeapDecl
+    range: String
+}
+
 /// What binding a stock root's processes made: each device need's window,
 /// each input's value, the RAM range each process is placed in (in the
-/// image's order), and the lines the builder prints (each input's source,
-/// each part it grants, each device bound more than once).
+/// image's order), each heap's pool's range (in the image's order and each
+/// declaration's slot order), and the lines the builder prints (each input's
+/// source, each part it grants, each device bound more than once).
 public struct Bindings {
     windows: Vector<Bound>
     inputs: Vector<InputValue>
     ranges: Vector<String>
+    heaps: Vector<BoundHeap>
     notes: Vector<String>
 }
 
@@ -773,7 +838,8 @@ extension Bindings: ExplicitCopy {}
 /// such record; a client bound to no serve of its protocol; a fast process
 /// the image places in a slow range, or one it names no range for on a board
 /// with no fast process range (`choose_range`, which places a fast process
-/// that names none in a fast range); an input with no value, or an image
+/// that names none in a fast range); a heap the board cannot serve
+/// (`bind_heaps`); an input with no value, or an image
 /// input that is none of the process's; and a `console` that is not
 /// PROCESS.RECORD, or names no process of the image, no record of that
 /// process, a record that is not a serve, or a serve of a protocol other than
@@ -784,6 +850,7 @@ public func bind(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
     var windows = Vector<Bound>()
     var values = Vector<InputValue>()
     var ranges = Vector<String>()
+    var heaps = Vector<BoundHeap>()
     var notes = Vector<String>()
     var p = 0
     while p < image.processes.len() {
@@ -792,6 +859,7 @@ public func bind(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
         borrow let d = decls[p - 1] {
             try! ranges.push(try bind_process(&image, &board, &d, &decls, &process, grain,
                                               &var windows, &var values, &var notes))
+            try bind_heaps(&image, &board, &d, &process, grain, &var heaps)
         }
     }
     if let target = image.console {
@@ -828,7 +896,84 @@ public func bind(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
         }
     }
     return Bindings(windows: move windows, inputs: move values, ranges: move ranges,
-                    notes: move notes)
+                    heaps: move heaps, notes: move notes)
+}
+
+/// `bind` for the heaps of `process`, whose declaration is `d`, appended to
+/// `heaps`. Refused by name: a `heap-ram` entry naming no heap of the
+/// declaration; a `len` that is no whole number of the board's grain `grain`,
+/// or below the heap's first growth (`first_growth`), since such a pool can
+/// never serve a block; a pool in a slow range for a heap that declares
+/// `ram = "fast"`; and a pool in a range without `atomics = true`, since what
+/// a program allocates may hold atomic words.
+func bind_heaps(image: &ImageFile, board: &Board, d: &Declaration, process: &ProcessEntry,
+                grain: UInt64, heaps: &var Vector<BoundHeap>) -> Result<Void, BuildError> {
+    let file = image.file
+    var e = 0
+    while e < image.heap_rams.len() {
+        let given = image.heap_rams.get(e)!
+        e = e + 1
+        if given.process.equals(process.name) && not has_heap(&d, given.key) {
+            return refused(file, given.at, "`{given.key}` in the `heap-ram` of the process {process.name} is no heap of {process.package}, whose heaps are {heaps_listed(&d)}")
+        }
+    }
+    var h = 0
+    while h < d.heaps.len() {
+        let heap = d.heaps.get(h)!
+        h = h + 1
+        let what = "the heap `{heap.name}` of the process {process.name}"
+        var range = board.default_pool
+        if not image.heap_ram.is_empty() {
+            range = image.heap_ram
+        }
+        if let named = image.entry(&image.heap_rams, process.name, heap.name) {
+            range = named.value
+        }
+        if heap.len % grain != 0 {
+            return refused(d.file, heap.len_at, "{what}'s pool is {hex(heap.len)} bytes, which is no whole number of the board {board.name}'s grain ({hex(grain)} bytes): a heap grows by whole grains")
+        }
+        let least = first_growth(heap.len, board.word, grain)
+        if heap.len < least {
+            return refused(d.file, heap.len_at, "{what}'s pool is {hex(heap.len)} bytes, below the {hex(least)} its first growth takes on the board {board.name}: its control block, sized for the pool, and one block, at least a KiB or a grain")
+        }
+        guard let r = board.range(range) else {
+            return BuildError(message: "{file}: internal: the range {range} vanished")
+        }
+        if heap.fast && not r.fast {
+            return refused(file, process.at, "{what} declares ram = \"fast\", and its pool is placed in {range}, a slow range")
+        }
+        if not r.atomics {
+            return refused(file, process.at, "{what} has its pool placed in {range}, which does not state `atomics = true` on the board {board.name}: what a program allocates may hold atomic words, so a heap's pool lies where word atomics work")
+        }
+        try! heaps.push(BoundHeap(process: process.name, heap: heap, range: range))
+    }
+    return
+}
+
+/// Whether `d` declares a heap named `name`.
+func has_heap(d: &Declaration, name: String) -> Bool {
+    var h = 0
+    while h < d.heaps.len() {
+        if (d.heaps.get(h)!).name.equals(name) {
+            return true
+        }
+        h = h + 1
+    }
+    false
+}
+
+/// `d`'s heaps' names, for a refusal.
+func heaps_listed(d: &Declaration) -> String {
+    if d.heaps.len() == 0 {
+        return "none"
+    }
+    var names = Vector<String>()
+    var h = 0
+    while h < d.heaps.len() {
+        try! names.push((d.heaps.get(h)!).name)
+        h = h + 1
+    }
+    "`{names.join("`, `")}`"
 }
 
 /// `bind` for one process and its declaration `d`; returns the range the

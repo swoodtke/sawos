@@ -22,6 +22,7 @@
 //!     speed = "fast"                     or "slow"
 //!     base = 0x8000_0000
 //!     len = 0x20_0000
+//!     atomics = true                     optional: word atomics work here
 //!
 //!     [ram.default]                      the ranges a process and a pool
 //!     process = "ram"                    take when an image names none
@@ -57,6 +58,12 @@
 //!
 //!     [lines]
 //!     reserved = [57]                    lines no device may have
+//!
+//! A RAM range's `atomics` states that the processor's word atomics work on
+//! its bytes. A heap's pool takes only such a range, since what a program
+//! allocates may hold atomic words, a lock's or a shared count's
+//! (`sosimage.imagefile.bind`); a range that states nothing is taken to have
+//! none.
 //!
 //! `modules` are the kernel's extra module paths, `NAME=PATH`. A keyed
 //! module, whose directory each image chooses from several, ends its path in
@@ -103,6 +110,9 @@ public struct RamRange {
     kernel: Bool
     /// `speed = "fast"`; slow otherwise.
     fast: Bool
+    /// `atomics = true`: the processor's word atomics work on its bytes, so a
+    /// heap's pool may lie in it.
+    atomics: Bool
     base: UInt64
     len: UInt64
     at: TomlPosition
@@ -1128,7 +1138,7 @@ func read_ram(r: &TomlTable, word: Int, file: String) -> Result<RamSet, BuildErr
 func read_range(t: &TomlTable, range: String, word: Int, file: String,
                 at: TomlPosition) -> Result<RamRange, BuildError> {
     let what = "[ram.{range}]"
-    let range_keys: Vector<String> = ["use", "speed", "base", "len"]
+    let range_keys: Vector<String> = ["use", "speed", "base", "len", "atomics"]
     try only_keys(&t, &range_keys, file, what)
     let use_word = try text(&t, "use", file)
     let uses: Vector<String> = ["kernel", "process"]
@@ -1139,12 +1149,13 @@ func read_range(t: &TomlTable, range: String, word: Int, file: String,
     let base = try size(&t, "base", word, file, what)
     let len = try size(&t, "len", word, file, what)
     try fits_space(base, len, word, file, where_is(&t, "len"), what)
+    let atomics = try flag(&t, "atomics", false, file)
     if use_word.equals("kernel") && speed.equals("slow") {
         return refused(file, where_is(&t, "speed"),
                        "{what} is the kernel's and slow: kernel memory is internal SRAM, never behind a cache")
     }
     return RamRange(name: range, kernel: use_word.equals("kernel"), fast: speed.equals("fast"),
-                    base: base, len: len, at: at)
+                    atomics: atomics, base: base, len: len, at: at)
 }
 
 /// `[types]`: each type's board inputs, no input named by two types.

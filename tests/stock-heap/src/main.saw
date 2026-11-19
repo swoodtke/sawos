@@ -1,0 +1,92 @@
+// A child of the gate's described heap images (`tests/images/stock_heap*.toml`),
+// written with `main`. Its declaration states no built-in heap and two heaps
+// over pools the stock root gives it, a default heap and a data heap in slot
+// 1, so every block it is served is a heap's.
+//
+// It fills a vector over the data heap until a push is refused, building a
+// vector over the global allocator, the default heap, meanwhile. Then it
+// shares a page from the default heap's pool, reads its rights, which are the
+// pool's as root gave it less `Extend`, maps it, writes it and reads it back,
+// and returns, so the start-up exits 0.
+
+import sos.{Heap, HeapRefusal, MapAccess, MemoryRight, SosStatus}
+import sosmain
+
+/// The data heap's slot, as `process.toml` declares it.
+static DATA: Int = 1
+
+/// A share's rights: a heap's pool's as the launch convention gives it, less
+/// `Extend`, which a share never carries.
+static SHARE_RIGHTS: UInt32 = (MemoryRight.Transfer | MemoryRight.Mint
+                               | MemoryRight.Map)
+
+/// A share's length: a page, a whole number of every board's grain.
+static PAGE: UInt = 0x1000
+
+/// The byte the share is written with.
+static MARK: UInt8 = 0x5Au8
+
+func main() -> Result<Void, SosStatus> {
+    var data = Vector<UInt8, Heap<DATA>>()
+    var other = Vector<UInt8>()
+    var pushed: UInt = 0
+    while {
+        try data.push(7u8) catch {
+            break
+        }
+        pushed = pushed + 1
+        if pushed % 1024 == 0 {
+            try other.push(1u8) catch {
+                panic("SOS stockheap: the default heap refused a byte")
+            }
+        }
+    }
+    let data_info = Heap<DATA>().info()
+    let default_info = Heap<0>().info()
+    print("SOS stockheap: the data heap's vector was refused inside its pool: {}, reads {}",
+          yes(pushed > 0 && data_info.size <= data_info.pool),
+          refusal_name(&data_info.refusal))
+    print("SOS stockheap: the default heap holds the other vector: {}, reads {}",
+          yes(default_info.size > 0 && other.len() > 0),
+          refusal_name(&default_info.refusal))
+    let shared = try Heap<0>().share(len: PAGE)
+    let rights = try shared.rights()
+    print("SOS stockheap: a share of a page: Transfer, Mint and Map: {}",
+          yes(rights == SHARE_RIGHTS))
+    borrow let proc = sosmain.context().process() {
+        let row = try proc.map(memory: &shared,
+                               access: MapAccess.Read | MapAccess.Write)
+        let base = try row.base()
+        poke(base, MARK)
+        print("SOS stockheap: the share reads back its mark: {}",
+              yes(peek(base) == MARK))
+        try row.unmap()
+    }
+    return
+}
+
+/// Write `byte` at `at`, mapped into this process.
+func poke(at: UInt, byte: UInt8) unsafe {
+    UnsafeMemory<UInt8, Normal>(at).write(byte)
+}
+
+/// The byte at `at`, mapped into this process.
+func peek(at: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(at).read()
+}
+
+/// A refusal's name, as this process prints it.
+func refusal_name(refusal: &HeapRefusal) -> String {
+    match refusal {
+        case Never -> "Never",
+        case Spent -> "Spent",
+        case Quota(_) -> "Quota",
+        case NoResource -> "NoResource",
+        case Rights -> "Rights",
+    }
+}
+
+/// `yes` or `no`.
+func yes(b: Bool) -> String {
+    if b { "yes" } else { "no" }
+}

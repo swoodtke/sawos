@@ -21,16 +21,21 @@
 //! `process.toml` that declares `ram = "fast"` is placed in a fast range, or
 //! refused by name on a board with none (`declares_fast`, `choose_range`); a
 //! hand-written root's process names no range, and no other part of its
-//! declaration is read. Every address is printed, a line per process and per
-//! pool:
+//! declaration is read. Every address is printed, a line per process, per
+//! pool and per heap's pool:
 //!
 //!     process NAME region=BASE+LEN slot=BASE+LEN
 //!     pool NAME region=BASE+LEN
+//!     heap PROCESS.HEAP region=BASE+LEN
 //!
 //! `slot` only on an in-place board. An image with more processes besides
 //! root than the board has slots is refused before anything is built, and a
 //! region or a pool that runs past its range once the processes are measured,
-//! naming it and the range, before the kernel is compiled.
+//! naming it and the range, before the kernel is compiled. A heap's pool is
+//! placed after the image's pools, in its range (`sosimage.imagefile.bind`).
+//! On a board that translates, a process's region and its heaps' pools are
+//! held to the space its rows have above its link address
+//! (`sosimage.layout.check_window`).
 //!
 //! A hand-written root's region table's rows are, in order: one image blob per
 //! process, one destination per process (its region), then `[rows] devices`,
@@ -43,13 +48,14 @@
 //! it (`sosimage.imagefile.bind`), which places each process in a range, and
 //! prints what binding found. Its plan (`sosimage.plan`) is checked against
 //! the kernel, which is compiled first for its numbers, before any package is
-//! built. Each process is linked with its declaration's `arena` and its
-//! inputs: each input's file, from the image's root, the board's HAL
+//! built. Each process is linked with its built-in heap (`process_arena`) and
+//! its inputs: each input's file, from the image's root, the board's HAL
 //! directory or the package's directory by where its value came from, is
 //! the module of its name (`OUT/NAME.inputs/INPUT/lib.saw`). The stock root
 //! (`root/`) is linked with the plan written as its module `imageplan`
 //! (`OUT/root.imageplan/`). The region table's rows are the plan's: an image
-//! blob and a destination per process, then its device rows, then its pools'.
+//! blob and a destination per process, then its device rows, then its pools',
+//! then its heaps' pools.
 //!
 //! On a board that runs an image in place and whose protection grain is
 //! coarser than 16 bytes, each child's blob is placed on and padded to the
@@ -62,8 +68,8 @@ import sosimage.board.{Board, LimitsSpec, NamedCount, Span}
 import sosimage.boardcheck.{HalFacts, check_board, hal_facts}
 import sosimage.build.{Linked, build_kernel, ensure_directory, link}
 import sosimage.flash.{load_segments}
-import sosimage.layout.{Ask, Placement, child_slots, choose_range, first_placement, place,
-                        ram_span, region_align}
+import sosimage.layout.{Ask, Placement, check_window, child_slots, choose_range,
+                        first_placement, place, ram_span, region_align}
 import sosimage.package.{Extras, ModulePath, build_process, stock_root_extras, write_input}
 import sosimage.plan.{ImagePlan, PlanSlabs, check_plan, plan_image, quota_of}
 import sosimage.declaration.{Declaration}
@@ -79,6 +85,11 @@ import sosimage.limits.{ImageLimits, plan_limits}
 import sosimage.profile.{Profile}
 import sosimage.regions.{BOOT_FLAG_NO_TICK, RegionKind}
 import sosimage.tool.{read_file, read_text}
+
+/// The built-in heap a process is linked with when neither its declaration
+/// nor its image sizes it: the user scripts' own default, which the builder
+/// writes rather than leaves to the script.
+public static DEFAULT_ARENA: UInt64 = 0x1000
 
 /// The board under `<sawos>/hal/` whose description names `name`.
 public func find_board(sawos: String, name: String) -> Result<Board, BuildError> {
@@ -248,6 +259,8 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
     var root_extras = Extras.none()
     var plan_rows = Vector<RowSpec>()
     var root_dir = ""
+    var heap_asks = Vector<Ask>()
+    var heap_bytes = Vector<UInt64>()
     if image.stock {
         let decls = try image_declarations(&image, sawos, product)
         let bound = try bind(&image, &board, &decls, facts.grain)
@@ -272,9 +285,22 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
         while i < count {
             let process = image.processes.get(i)!
             borrow let d = decls[i] {
-                try! extras.push(try process_extras(&d, &bound, &board, process.name, sawos,
+                try! extras.push(try process_extras(&d, &bound, &board, process.name,
+                                                    process_arena(&d, &image), sawos,
                                                     product, out))
             }
+            var bytes: UInt64 = 0
+            var h = 0
+            while h < bound.heaps.len() {
+                let b = bound.heaps.get(h)!
+                h = h + 1
+                if b.process.equals(process.name) {
+                    bytes = bytes + b.heap.len
+                    try! heap_asks.push(Ask(name: "{b.process}.{b.heap.name}", range: b.range,
+                                            bytes: b.heap.len, pool: true, at: process.at))
+                }
+            }
+            try! heap_bytes.push(bytes)
             i = i + 1
         }
         root_extras = try stock_root_extras(&plan, profile.word_bytes, out, "root", image.name)
@@ -323,7 +349,9 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
         try! asks.push(Ask(name: pool.name, range: range_name, bytes: pool.len, pool: true,
                            at: pool.at))
     }
+    try! asks.append(&heap_asks)
     let regions = try place(&board, root_region, align, stack, &asks, path)
+    try check_windows(&board, &facts, &image, &regions, &heap_bytes, path)
 
     // Each process linked again where its region is, unless that is where it
     // was first linked; a translated board links every image at one base.
@@ -354,6 +382,12 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
         print("pool {(image.pools.get(p)!).name} region={hex(region.base)}+{hex(region.len)}")
         p = p + 1
     }
+    var h = 0
+    while h < heap_asks.len() {
+        let region = regions.get(count + image.pools.len() + h)!
+        print("heap {(heap_asks.get(h)!).name} region={hex(region.base)}+{hex(region.len)}")
+        h = h + 1
+    }
 
     var rows = Vector<RowSpec>()
     if image.stock {
@@ -378,6 +412,28 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
         }
     }
     link(&profile, &spec)
+}
+
+/// Refuses, on a board that translates, a process of `image` whose region in
+/// `regions` and heaps' pools of `heap_bytes` bytes (both by process, in image
+/// order) pass the space its rows have above its link address: from root's
+/// region's base, where every process links, to `USER_RAM_TOP`, the end of
+/// the window its rows lie in (`sosimage.layout.check_window`). On any other
+/// board a row lies at its own bytes' address, which `place` holds.
+public func check_windows(board: &Board, facts: &HalFacts, image: &ImageFile,
+                          regions: &Vector<Span>, heap_bytes: &Vector<UInt64>,
+                          file: String) -> Result<Void, BuildError> {
+    if not board.placement.equals("translated") {
+        return
+    }
+    var i = 0
+    while i < heap_bytes.len() {
+        let process = image.processes.get(i)!
+        try check_window(process.name, (regions.get(i)!).len, heap_bytes.get(i) ?? 0,
+                         facts.user_ram_top - facts.root_base, file, process.at)
+        i = i + 1
+    }
+    return
 }
 
 /// `profile` with the module of each build key `image` states mapped to the
@@ -464,7 +520,8 @@ public func plan_slabs(limits: &ImageLimits, facts: &KernelFacts) -> PlanSlabs {
     PlanSlabs(processes: slab_total(&limits, &facts, PROCESSES),
               pipes: slab_total(&limits, &facts, PIPES),
               interrupts: slab_total(&limits, &facts, INTERRUPTS),
-              iomemories: slab_total(&limits, &facts, IOMEMORIES))
+              iomemories: slab_total(&limits, &facts, IOMEMORIES),
+              memories: slab_total(&limits, &facts, MEMORIES))
 }
 
 /// How many objects an image's slab of `kind` (a `SlabKind` value) holds:
@@ -487,13 +544,23 @@ public func blob_align(grain: UInt64, placement: String) -> Int {
     BLOB_ALIGN
 }
 
-/// What a stock-root process's build takes beyond its placement: its
-/// declaration's `arena`, and each of its inputs as a module, the file its
-/// value names copied to `OUT/NAME.inputs/INPUT/lib.saw`. An image's value is
-/// a path from `product`, a device's from the board's HAL directory in
-/// `sawos`, and a driver's default from its package's directory.
+/// The built-in heap a stock-root process whose declaration is `d` is linked
+/// with in `image`: its declaration's `arena`, else the image's, else
+/// `DEFAULT_ARENA`.
+public func process_arena(d: &Declaration, image: &ImageFile) -> UInt64 {
+    if let own = d.arena {
+        return own
+    }
+    image.arena ?? DEFAULT_ARENA
+}
+
+/// What a stock-root process's build takes beyond its placement: its built-in
+/// heap of `arena` bytes (`process_arena`), and each of its inputs as a
+/// module, the file its value names copied to `OUT/NAME.inputs/INPUT/lib.saw`.
+/// An image's value is a path from `product`, a device's from the board's HAL
+/// directory in `sawos`, and a driver's default from its package's directory.
 public func process_extras(d: &Declaration, bound: &Bindings, board: &Board, process: String,
-                           sawos: String, product: String,
+                           arena: UInt64, sawos: String, product: String,
                            out: String) -> Result<Extras, BuildError> {
     var modules = Vector<ModulePath>()
     var i = 0
@@ -506,7 +573,7 @@ public func process_extras(d: &Declaration, bound: &Bindings, board: &Board, pro
         let from = input_path(value.source, value.path, d.dir, board.hal, sawos, product)
         try! modules.push(try write_input(out, process, value.input, from))
     }
-    return Extras(arena: d.arena, modules: move modules)
+    return Extras(arena: arena, modules: move modules)
 }
 
 /// Where an input's value `path` is, by where it came from: an image's from
@@ -529,7 +596,11 @@ func stock_rows(plan: &ImagePlan) -> Vector<RowSpec> {
     var r = 0
     while r < plan.rows.len() {
         let row = plan.rows.get(r)!
-        let what = if row.kind == RegionKind.Pool { row.pool } else { "{row.what}'s window" }
+        let what = if row.kind != RegionKind.Pool { "{row.what}'s window" } else if row.heap.is_empty() {
+            row.pool
+        } else {
+            row.heap
+        }
         try! rows.push(RowSpec(what: what, kind: row.kind, blob: None, base: row.base,
                                len: row.len))
         r = r + 1
@@ -539,18 +610,21 @@ func stock_rows(plan: &ImagePlan) -> Vector<RowSpec> {
 
 /// A stock-root image's region table: an image blob and a destination per
 /// process, each process's region in `regions`, then the plan's `rows`
-/// (`stock_rows`), a pool's row its region, which follows the processes' in
-/// `regions`.
+/// (`stock_rows`), each pool row its region: the pools' regions follow the
+/// processes' in `regions`, in the order of the pool rows, the image's pools'
+/// and then the heaps'.
 public func stock_region_rows(image: &ImageFile, rows: &Vector<RowSpec>,
                               regions: &Vector<Span>) -> Vector<RowSpec> {
     var out = blob_and_destination_rows(&image, &regions)
+    var pools = 0
     var r = 0
     while r < rows.len() {
         var row = rows.get(r)!
         if row.kind == RegionKind.Pool {
-            let region = regions.get(image.processes.len() + pool_index(&image, row.what))!
+            let region = regions.get(image.processes.len() + pools)!
             row.base = region.base
             row.len = region.len
+            pools = pools + 1
         }
         try! out.push(row)
         r = r + 1

@@ -16,7 +16,7 @@ import std.file.{File}
 import std.path.{Path}
 import sosimage.build.{ensure_directory}
 import sosimage.image.{RowSpec}
-import sosimage.imagefile.{Bindings, Bound, InputValue}
+import sosimage.imagefile.{Bindings, Bound, BoundHeap, InputValue}
 import sosimage.plan.{ImagePlan, PlanRecord, PlanSlabs, Source, check_plan, plan_image,
                       plan_module, root_windows, window_rows}
 import sosimage.limits.{ImageLimits}
@@ -238,7 +238,7 @@ func defaults(handles: Int) -> Vector<Int> {
 // holds.
 func fits_io(plan: &ImagePlan, table: Int, handles: Int, iomemories: Int) -> String {
     fits_slabs(&plan, table, handles,
-               PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: iomemories))
+               PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: iomemories, memories: 100))
 }
 
 // What `check_plan` says of `plan` against a table of `table`, with
@@ -275,7 +275,7 @@ func checked(json: String, table: Int, handles: Int) -> String {
     }
     let f = facts(table)
     let d = defaults(handles)
-    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100)
+    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100, memories: 100)
     match check_plan(&plan, &f, &d, &slabs, "p.json") {
         case Ok(_) -> "",
         case Err(e) -> e.message
@@ -318,7 +318,7 @@ func main_program_plan() {
     let plan = try! plan_image(&image, &b, &decls, &bound, 4)
     let f = facts(32)
     let d = defaults(2)
-    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100)
+    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100, memories: 100)
     let got = match check_plan(&plan, &f, &d, &slabs, "m.toml") {
         case Ok(_) -> "",
         case Err(e) -> e.message
@@ -572,7 +572,7 @@ func main() {
     let w = full.setup.get(0)!
     assert(w.register.equals("D.R") && w.row == 4 && w.offset == 16 && w.op == SetupOp.Clear, "a write")
     assert(read_refusal("\{\"setup\": [\{\"register\": \"R\", \"row\": 0, \"offset\": 0, \"len\": 4, \"at\": 0, \"op\": \"or\", \"value\": 1\}]\}").equals("a plan's setup write has the op `or`, not one of `set`, `clear`, `write`"), "an op")
-    assert(read_refusal(one_child("\{\"tag\": 1, \"source\": \"window\"\}", 0)).equals("a plan's record has the source `window`, not one of `system`, `row`, `sibling`, `carve`, `line`, `outlet`, `inlet`"), "a source")
+    assert(read_refusal(one_child("\{\"tag\": 1, \"source\": \"window\"\}", 0)).equals("a plan's record has the source `window`, not one of `system`, `row`, `sibling`, `carve`, `line`, `outlet`, `inlet`, `heap`"), "a source")
     assert(read_refusal("\{\"childs\": []\}").contains("childs"), "an unknown key")
 
     // The module the builder writes.
@@ -760,14 +760,14 @@ func more() {
     assert(fits_io(&box, 32, 28, 6).is_empty(), "six hold the box")
     assert(fits_io(&box, 32, 28, 5).equals("box.toml: the stock root would make the IoMemory objects 6 at `give pwm record 4`, past the image's 5"), "the second carve")
     // Process objects: root's and one per child, the box's four.
-    let roomy = PlanSlabs(processes: 5, pipes: 2, interrupts: 1, iomemories: 6)
+    let roomy = PlanSlabs(processes: 5, pipes: 2, interrupts: 1, iomemories: 6, memories: 100)
     assert(fits_slabs(&box, 32, 28, roomy).is_empty(), "each slab at the box's own count")
-    assert(fits_slabs(&box, 32, 28, PlanSlabs(processes: 4, pipes: 2, interrupts: 1, iomemories: 6)).equals("box.toml: the stock root would make the Process objects 5 at `create heartbeat`, past the image's 4"), "a child too many")
+    assert(fits_slabs(&box, 32, 28, PlanSlabs(processes: 4, pipes: 2, interrupts: 1, iomemories: 6, memories: 100)).equals("box.toml: the stock root would make the Process objects 5 at `create heartbeat`, past the image's 4"), "a child too many")
     // Pipe objects: one per connection, the second made at pwm's serve.
-    assert(fits_slabs(&box, 32, 28, PlanSlabs(processes: 5, pipes: 1, interrupts: 1, iomemories: 6)).equals("box.toml: the stock root would make the Pipe objects 2 at `give pwm record 5`, past the image's 1"), "a connection too many")
+    assert(fits_slabs(&box, 32, 28, PlanSlabs(processes: 5, pipes: 1, interrupts: 1, iomemories: 6, memories: 100)).equals("box.toml: the stock root would make the Pipe objects 2 at `give pwm record 5`, past the image's 1"), "a connection too many")
     // Interrupt objects: one per line, gpio's. No board's lines reach the
     // slab's floor, so this has no case.
-    assert(fits_slabs(&box, 32, 28, PlanSlabs(processes: 5, pipes: 2, interrupts: 0, iomemories: 6)).equals("box.toml: the stock root would make the Interrupt objects 1 at `give gpio record 4`, past the image's 0"), "a line too many")
+    assert(fits_slabs(&box, 32, 28, PlanSlabs(processes: 5, pipes: 2, interrupts: 0, iomemories: 6, memories: 100)).equals("box.toml: the stock root would make the Interrupt objects 1 at `give gpio record 4`, past the image's 0"), "a line too many")
     assert(fits_io(&box, 32, 28, 4).equals("box.toml: the stock root would make the IoMemory objects 5 at `setup SYSTEM.PERIP_CLK_EN0`, past the image's 4"), "a setup write's carve")
 
     // The rows of a stock image: a blob and a destination per process at the
@@ -816,8 +816,10 @@ func more() {
     try! inputs.push(InputValue(process: "p", input: "cfg", path: "x.saw",
                                 source: InputSource.Driver))
     let bound = Bindings(windows: Vector<Bound>(), inputs: move inputs,
-                         ranges: Vector<String>(), notes: Vector<String>())
-    let extras = try! process_extras(&d, &bound, &b, "p", "/sawos", "/product", ".build/extras/out")
+                         ranges: Vector<String>(), heaps: Vector<BoundHeap>(),
+                         notes: Vector<String>())
+    let extras = try! process_extras(&d, &bound, &b, "p", 0x1000, "/sawos", "/product",
+                                    ".build/extras/out")
     let module = extras.modules.get(0)!
     assert(module.name.equals("cfg"), "the input's module")
     assert(module.dir.starts_with("/") && module.dir.ends_with(".build/extras/out/p.inputs/cfg"),
