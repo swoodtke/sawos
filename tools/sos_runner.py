@@ -19318,11 +19318,11 @@ SOSIMAGE_BINARY = os.path.join(SOSIMAGE_DIR, ".build", "host", "sosimage")
 PRODUCT_TIMEOUT_S = 1800
 
 # What `test hello-riscv32` prints, in order: the kernel's banner, the
-# greeting the driver wrote for `hello`, `hello`'s count, root's line for its
-# end, and the verdict.
+# greeting the driver wrote for `hello`'s own client, `hello`'s line printed
+# over the console, which is the same driver, and root's line for its end.
 PRODUCT_HELLO = ["{banner}",
                  "hello from a product",
-                 "hello: the driver wrote 21 bytes",
+                 "hello: the driver has written the greeting",
                  "root: hello ended status=65536"]
 
 
@@ -19786,7 +19786,8 @@ def _product_rows(scratch, builder_before):
 
 
 # What `test hello-esp32s3` prints, in order: the kernel's banner, the
-# greeter's line, and root's line for its end.
+# greeter's line, which the console driver writes, and root's line for its
+# end.
 PRODUCT_GREETER = ["{banner}",
                    "greeter: hello from a product",
                    "root: greeter ended status=65536"]

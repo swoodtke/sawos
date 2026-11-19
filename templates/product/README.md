@@ -30,7 +30,9 @@ nothing, so connecting and writing the part is yours.
 
 `images/hello-riscv32.toml` launches sawos's UART driver and `hello`, its
 client; `images/hello-esp32s3.toml`, on a board with no UART driver,
-launches `greeter`, which prints through the kernel's console.
+launches sawos's console driver, which writes to the kernel's console, and
+`greeter`. Each image names its driver's serve as its console, so both
+processes `print` through it.
 
 An image chooses its board's build keys in `[keys]`: on the ESP32-S3,
 
@@ -45,6 +47,68 @@ and their values are listed in its `board.toml` in the sawos tree
 its default, on the ESP32-S3 the clock the ROM left (`rom`) and the console
 uncounted (`stall = "off"`).
 
+`tools/sawos.py` needs Python 3.11 or later. It links `.sawos` to the sawos
+tree and runs that tree's `tools/product.py`, which says what each command
+does. The tree is the one `SAWOS_ROOT` names, or else the pinned commit,
+fetched once into `~/.cache/sawos/<sha>/` (`SAWOS_CACHE` moves it). The
+sawlang toolchain is the one the sawos tree pins; `SAWLANG_ROOT` overrides
+it, as it does in sawos itself.
+
+## Writing a process
+
+A process is written with an ordinary `main`, as `hello/src/main.saw` and
+`greeter/src/main.saw` are:
+
+```saw
+import sos.{SosStatus}
+import sosmain
+
+/// A record's tag, as `process.toml` declares it.
+static TAG_UART: UInt = 2
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    var record = set.take(TAG_UART)!
+    borrow let proc = sosmain.context().process() {
+        let waiter = try proc.waiter_create()
+        ...
+    }
+    print("served {} requests", n)
+    return
+}
+```
+
+Its `Saw.toml` depends on `sosmain`
+(`sosmain = { path = "../.sawos/rt/main" }`) beside `sos`, and its source
+imports it: that package's start-up runs `main`. `main` returns nothing, an
+`Int` from 0 to 255, or a `Result` of either, and the process ends with
+that status; an `Err` is written as `error: ...` and ends it with 1, which
+needs a heap, since writing the error allocates (a process with no heap that
+returns an `Err` panics instead). A panic ends it as `Faulted`, with its text
+on the kernel's line.
+
+`sosmain.take_boot_set()` hands `main` the records its `process.toml`
+declares, once, to take by tag. `sosmain.context()` lends the process's
+System and Process handles, which the runtime keeps for the process's life:
+`main` uses them, and mints siblings of them, but cannot drop them or give
+them away. `sosmain.exit(code)` ends the process early.
+
+`print` writes a line to the image's console. An image names one in
+`[image]`, as a serve record of a `uartproto` driver, in the grammar
+`clients` uses:
+
+```toml
+[image]
+console = "uart.uart"           # PROCESS.RECORD
+```
+
+The builder then gives every other process a client record of that connection,
+which the runtime takes before `main` runs, so `main` cannot take it. A process
+that also wants to speak to that driver itself, to read from it, say, declares
+a client of its own and takes it from its boot set, as `hello` does. In an
+image with no console, `print` writes through the kernel's debug print when the
+process's System handle holds `debug`, and writes nothing when it does not.
+
 A process's System handle keeps the rights its `process.toml` names in its
 `system` record's `rights`. One that names none keeps its image's default,
 which an image whose root is the stock root may state in `[system]`:
@@ -56,18 +120,10 @@ rights = ["process-self", "clock-get", "transfer"]
 
 With no `[system]`, the default is all four rights a process may hold
 (`debug`, `process-self`, `clock-get`, `transfer`), or in an image that
-names a console (`[image] console = "PROCESS.RECORD"`) the three without
-`debug`. There a process written with `main` prints through the console's
-driver; elsewhere a process without `debug` prints nothing. A process that
-writes through the kernel's debug print itself, as a console's driver does,
-names `debug` in its own `rights`.
-
-`tools/sawos.py` needs Python 3.11 or later. It links `.sawos` to the sawos
-tree and runs that tree's `tools/product.py`, which says what each command
-does. The tree is the one `SAWOS_ROOT` names, or else the pinned commit,
-fetched once into `~/.cache/sawos/<sha>/` (`SAWOS_CACHE` moves it). The
-sawlang toolchain is the one the sawos tree pins; `SAWLANG_ROOT` overrides
-it, as it does in sawos itself.
+names a console the three without `debug`, since its processes print through
+the console. `hello` and `greeter` name no rights, and have no `debug` in
+their images. A process that writes through the kernel's debug print itself,
+as a console's driver does, names `debug` in its own `rights`.
 
 ## Naming sawos
 
