@@ -26,8 +26,12 @@
 // Every register word the driver writes goes through one method that writes
 // the register and appends the word to a log (`Gpio.write`), so the log is
 // the writes themselves; a client reads it with `Log`.
+//
+// It is written with `main`: `sosmain`'s start-up adopts its System, derives
+// its Process and drains its boot set, from which `run` takes the records by
+// tag. It has no console record, so its own lines go through the debug print.
 
-import sos.{System, Process, Interrupt, IoMemory, PipeOutlet, Waiter, WaitResult, BootSet,
+import sos.{Interrupt, IoMemory, PipeOutlet, Waiter, WaitResult, BootSet,
             PipeRequest, PipeMsg, AttachMode, SosStatus, PIPE_BODY_BYTES}
 import gpioproto.{GpioOp, GpioStatus, GpioBody, Frame, BODY_BYTES, LOG_ENTRIES,
                   LOG_PER_REPLY}
@@ -38,11 +42,12 @@ import esp32s3io.{GpioPin, PinMode, PinSet, PinWait, Register, RegisterPort,
                   count_up, count_up_16, level_register, Pads, pads_pcpu_int,
                   pads_clear_status, pads_levels, fires_after, take_answered}
 import gpioconfig
+import sosmain
 
 static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
 
-static EXIT_OK: UInt = 0
-static EXIT_FAILED: UInt = 1
+static EXIT_OK: Int = 0
+static EXIT_FAILED: Int = 1
 
 /// A status this driver can never legitimately produce, so meeting it means an
 /// assertion in this file failed rather than a call did.
@@ -509,15 +514,15 @@ func take_serve(set: &var BootSet, tag: UInt) -> PipeOutlet? {
 
 /// Maps both windows, configures every pin, wires the Waiter and serves until
 /// every client is gone.
-func run(proc: &Process) -> Result<Report, SosStatus> {
-    var set = try BootSet(process: &proc)
+func run() -> Result<Report, SosStatus> {
+    var set = sosmain.take_boot_set()
     guard let gpio_window = take_window(&var set, TAG_GPIO) else { return BUG }
     guard let iomux_window = take_window(&var set, TAG_IOMUX) else { return BUG }
     guard let irq = take_line(&var set, TAG_LINE) else { return BUG }
     guard let outlet = take_serve(&var set, TAG_SERVE) else { return BUG }
 
-    let gpio_mapping = try proc.map(iomemory: &gpio_window)
-    let iomux_mapping = try proc.map(iomemory: &iomux_window)
+    let gpio_mapping = try sosmain.context().process().map(iomemory: &gpio_window)
+    let iomux_mapping = try sosmain.context().process().map(iomemory: &iomux_window)
     let gpio_base = try gpio_mapping.base()
     let iomux_base = try iomux_mapping.base()
 
@@ -526,7 +531,7 @@ func run(proc: &Process) -> Result<Report, SosStatus> {
     let pins = gpioconfig.pins()
     start_gpio(&var dev, &pins)
 
-    let waiter = try proc.waiter_create()
+    let waiter = try sosmain.context().process().waiter_create()
     try waiter.add(&dev.irq, KEY_IRQ)
     // The consuming, persistent attach: the attachment owns the server end from
     // here on, and this process holds no outlet handle.
@@ -542,27 +547,19 @@ func run(proc: &Process) -> Result<Report, SosStatus> {
     return done
 }
 
-@export("_start")
-func _start(boot_handle: UInt) {
-    let system = System(boot_handle: boot_handle)
-    let proc = try system.process_self() catch {
-        print("SOS gpiosvc drv: no process handle: {}", error)
-        return
-    }
+func main() -> Int {
     // The configuration is checked before anything is mapped, so a bad one
     // costs the pad nothing.
     let pins = gpioconfig.pins()
     try check_gpio_config(&pins) catch {
         print("SOS gpiosvc drv: config refused: {}", error.describe())
-        let _ = proc.exit(EXIT_FAILED)
-        return
+        return EXIT_FAILED
     }
-    let done = try run(&proc) catch {
+    let done = try run() catch {
         print("SOS gpiosvc drv: failed: {}", error)
-        let _ = proc.exit(EXIT_FAILED)
-        return
+        return EXIT_FAILED
     }
     print("SOS gpiosvc drv: served={} abandoned={} fires={}",
           done.served, done.abandoned, done.fires)
-    let _ = proc.exit(EXIT_OK)
+    EXIT_OK
 }

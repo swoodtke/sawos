@@ -26,19 +26,24 @@
 //
 // When the driver ends, nothing touches LEDC: each channel goes on at its last
 // duty, so a client that wants its servos limp stops them first.
+//
+// It is written with `main`: `sosmain`'s start-up adopts its System, derives
+// its Process and drains its boot set, from which `run` takes the records by
+// tag. It has no console record, so its own lines go through the debug print.
 
-import sos.{System, Process, IoMemory, PipeOutlet, Waiter, WaitResult, BootSet,
-            PipeRequest, PipeMsg, AttachMode, SosStatus, PIPE_BODY_BYTES}
+import sos.{IoMemory, PipeOutlet, Waiter, WaitResult, BootSet, PipeRequest,
+            PipeMsg, AttachMode, SosStatus, PIPE_BODY_BYTES}
 import pwmproto.{PwmStatus, PwmBody, Frame, BODY_BYTES, LOG_ENTRIES, LOG_PER_REPLY}
 import esp32s3io.{Servo, Register, RegisterPort, PwmRefusal, check_pwm_config, start_pwm,
                   servo_of, set_servo, stop_servo, inspected, lowest_pin, place_pwm,
                   count_up, count_up_16}
 import pwmconfig
+import sosmain
 
 static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
 
-static EXIT_OK: UInt = 0
-static EXIT_FAILED: UInt = 1
+static EXIT_OK: Int = 0
+static EXIT_FAILED: Int = 1
 
 /// A status this driver can never legitimately produce, so meeting it means an
 /// assertion in this file failed rather than a call did.
@@ -296,21 +301,21 @@ func take_serve(set: &var BootSet, tag: UInt) -> PipeOutlet? {
 
 /// Maps the three windows, starts the PWM, wires the Waiter and serves until
 /// every client is gone.
-func run(proc: &Process) -> Result<UInt32, SosStatus> {
-    var set = try BootSet(process: &proc)
+func run() -> Result<UInt32, SosStatus> {
+    var set = sosmain.take_boot_set()
     guard let ledc_window = take_window(&var set, TAG_LEDC) else { return BUG }
     guard let outsel_window = take_window(&var set, TAG_OUTSEL) else { return BUG }
     guard let pads_window = take_window(&var set, TAG_PADS) else { return BUG }
     guard let outlet = take_serve(&var set, TAG_SERVE) else { return BUG }
 
-    let ledc_mapping = try proc.map(iomemory: &ledc_window)
-    let outsel_mapping = try proc.map(iomemory: &outsel_window)
-    let pads_mapping = try proc.map(iomemory: &pads_window)
+    let ledc_mapping = try sosmain.context().process().map(iomemory: &ledc_window)
+    let outsel_mapping = try sosmain.context().process().map(iomemory: &outsel_window)
+    let pads_mapping = try sosmain.context().process().map(iomemory: &pads_window)
     var dev = Pwm(ledc: try ledc_mapping.base(), outsel: try outsel_mapping.base(),
                   pads: try pads_mapping.base(), log: WriteLog.empty())
     start_pwm(&var dev, pwmconfig.FRAME_US, &pwmconfig.SERVOS)
 
-    let waiter = try proc.waiter_create()
+    let waiter = try sosmain.context().process().waiter_create()
     // The consuming, persistent attach: the attachment owns the server end from
     // here on, and this process holds no outlet handle.
     try waiter.give(outlet: move outlet, key: KEY_OUTLET,
@@ -326,25 +331,17 @@ func run(proc: &Process) -> Result<UInt32, SosStatus> {
     return served
 }
 
-@export("_start")
-func _start(boot_handle: UInt) {
-    let system = System(boot_handle: boot_handle)
-    let proc = try system.process_self() catch {
-        print("SOS pwmsvc drv: no process handle: {}", error)
-        return
-    }
+func main() -> Int {
     // The configuration is checked before anything is mapped, so a bad one
     // writes nothing.
     try check_pwm_config(pwmconfig.FRAME_US, &pwmconfig.SERVOS) catch {
         print("SOS pwmsvc drv: config refused: {}", error.describe())
-        let _ = proc.exit(EXIT_FAILED)
-        return
+        return EXIT_FAILED
     }
-    let served = try run(&proc) catch {
+    let served = try run() catch {
         print("SOS pwmsvc drv: failed: {}", error)
-        let _ = proc.exit(EXIT_FAILED)
-        return
+        return EXIT_FAILED
     }
     print("SOS pwmsvc drv: served={}", served)
-    let _ = proc.exit(EXIT_OK)
+    EXIT_OK
 }
