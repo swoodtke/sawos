@@ -65,6 +65,10 @@ extension BootSet {
     /// More records than `BOOT_SET_CAPACITY` panic, naming the capacity: the
     /// kernel's table cannot hold them, so only a kernel built past its own
     /// assert could answer one.
+    ///
+    /// A pool given under a heap tag leaves the set: it becomes the pool of
+    /// its slot's heap (`Heap`), and a right adoption needs that is missing
+    /// panics, naming it (see `adopt_heaps`).
     public init(process: &Process) -> Result<BootSet, SosStatus> {
         var set = BootSet(records: [0; BOOT_SET_WORDS], count: 0)
         while {
@@ -85,6 +89,7 @@ extension BootSet {
             set.records[at + BOOT_HANDLE_HANDLE_WORD] = record.2
             set.count = set.count + 1
         }
+        adopt_heaps(&process, &var set)
         return move set
     }
 
@@ -162,4 +167,130 @@ func next_record(process: &Process) unsafe -> Result<(UInt, UInt, UInt), SosStat
                                              boot_handle_record_bytes() as UInt))
     return (buf[BOOT_HANDLE_TAG_WORD], buf[BOOT_HANDLE_KIND_WORD],
             buf[BOOT_HANDLE_HANDLE_WORD])
+}
+
+// -----------------------------------------------------------------------------
+// Adopting the heaps
+// -----------------------------------------------------------------------------
+//
+// A launcher gives a process one pool per heap, under the heap's slot's tag
+// (`bootplan`'s `HEAP_TAG`). The drain adopts each one as its slot's heap
+// before the set is handed over, so the program's first allocation can grow
+// the heap. Adoption allocates nothing and maps nothing: a heap the program
+// never allocates from spends no `Memory`, no `Mapping` and no slot.
+//
+// Each right a heap will spend is read before the program runs, and a missing
+// one panics, naming it: otherwise it would be the kernel's fault inside an
+// allocation, with no text. These are a heap's only panics, and none is
+// raised with a heap's lock held.
+
+import bootplan.{HEAP_TAG, MAX_HEAPS}
+import sosrt.{HEAP_SLOTS, adopt_heap}
+import sosabi.{PoolRight, ProcessRight, PoolHandle}
+import sos.floor.{handle_rights, sos_handle_mint}
+import sos.pool.{available_into_frame}
+
+static_assert(MAX_HEAPS == HEAP_SLOTS,
+              "bootplan's heap slots must be the runtime's table")
+
+/// The rights a heap's pool must carry: `Allocate` and `Map` for the heap,
+/// `Extend` for its growth, `Mint` to tell its quota refusals apart, and
+/// `Transfer` and `Mint`, which a share carries.
+static HEAP_POOL_RIGHTS: [PoolRight; 5] = [PoolRight.Allocate, PoolRight.Map,
+                                           PoolRight.Transfer, PoolRight.Mint,
+                                           PoolRight.Extend]
+
+/// The Process sibling every heap maps through, minted once per process, or
+/// `NO_HANDLE` before the first heap is adopted.
+unsafe static var HEAP_PROCESS: UInt = 0
+
+/// Adopt every pool in `set` under a heap tag as its slot's heap, taking it
+/// out of the set.
+///
+/// For each: the pool's rights are read, and one of `Allocate`, `Map`,
+/// `Transfer`, `Mint` or `Extend` missing panics; the first adoption mints a
+/// `Map`-only sibling of `process`, which needs `Mint` on `process` and
+/// panics without it, or when the mint is refused, or when the sibling lacks
+/// `Map` (the Process ceiling); then the pool's free bytes and its grain are
+/// read, and the heap is installed with no memory.
+func adopt_heaps(process: &Process, set: &var BootSet) unsafe {
+    var i: Int = 0
+    while i < set.count {
+        let at = i * BOOT_HANDLE_RECORD_WORDS
+        let tag = set.records[at + BOOT_HANDLE_TAG_WORD]
+        let word = set.records[at + BOOT_HANDLE_HANDLE_WORD]
+        if (tag >= HEAP_TAG && tag - HEAP_TAG < (MAX_HEAPS as UInt)
+            && word != NO_HANDLE) {
+            let slot = (tag - HEAP_TAG) as Int
+            let kind = set.records[at + BOOT_HANDLE_KIND_WORD]
+            if kind != (BootHandleKind.Pool as UInt) {
+                panic("sos: heap {}'s record is not a pool", slot)
+            }
+            adopt(slot, word, &process)
+            set.records[at + BOOT_HANDLE_HANDLE_WORD] = NO_HANDLE
+        }
+        i = i + 1
+    }
+}
+
+/// Adopt the pool `word` as heap `slot`'s.
+func adopt(slot: Int, word: UInt, process: &Process) unsafe {
+    let rights = try handle_rights(word) catch {
+        panic("sos: heap {}'s pool's rights cannot be read: {}", slot, error)
+    }
+    var r: Int = 0
+    while r < 5 {
+        let right = HEAP_POOL_RIGHTS[r]
+        if (rights & (right as UInt32)) == 0 {
+            panic("sos: heap {}'s pool lacks {}", slot, pool_right_name(right))
+        }
+        r = r + 1
+    }
+    let sibling = heap_process(&process)
+    let free = try available_into_frame(PoolHandle(word), 0) catch {
+        panic("sos: heap {}'s pool cannot be read: {}", slot, error)
+    }
+    let grains = free.granularities
+    adopt_heap(slot, word, sibling, free.total, grains & (0 &- grains))
+}
+
+/// The `Map`-only sibling of `process` every heap maps its row through,
+/// minted on the first call.
+func heap_process(process: &Process) unsafe -> UInt {
+    if HEAP_PROCESS != NO_HANDLE {
+        return HEAP_PROCESS
+    }
+    let rights = try process.rights() catch {
+        panic("sos: the Process handle's rights cannot be read: {}", error)
+    }
+    if (rights & (ProcessRight.Mint as UInt32)) == 0 {
+        panic("sos: the Process handle lacks Mint, so no heap can be adopted")
+    }
+    var sibling: UInt = NO_HANDLE
+    let minted = sos_handle_mint(process.handle, ProcessRight.Map as UInt,
+                                 (&var sibling) as UnsafePointer<UInt>)
+    try checked(minted) catch {
+        panic("sos: no handle for the heaps: {}", error)
+    }
+    let kept = try handle_rights(sibling) catch {
+        panic("sos: the heaps' Process handle's rights cannot be read: {}",
+              error)
+    }
+    if (kept & (ProcessRight.Map as UInt32)) == 0 {
+        panic("sos: the heaps' Process handle lacks Map (the Process ceiling)")
+    }
+    HEAP_PROCESS = sibling
+    sibling
+}
+
+/// A pool right's name, for adoption's panic.
+func pool_right_name(right: PoolRight) -> String {
+    match right {
+        case Allocate -> "Allocate",
+        case Map -> "Map",
+        case Transfer -> "Transfer",
+        case Mint -> "Mint",
+        case Extend -> "Extend",
+        case MapExecute -> "MapExecute",
+    }
 }

@@ -1,0 +1,249 @@
+// A default heap's allocations under preemption: `arena-race` with the
+// arena replaced by a heap over a pool, which grows as the workers take
+// blocks.
+//
+// The child has no arena, so every block the global allocator serves is the
+// default heap's. Two workers each take BLOCKS blocks through the
+// `__saw_rt_alloc` seam, a burn between two allocations keeping each running
+// across many ticks of the short-tick kernel (`tests/threads_fast_tick.saw`),
+// which takes the processor away at arbitrary points, inside the heap's lock
+// and its growth's kernel ops included. Each worker records every block's
+// address.
+//
+// After both are joined the initial thread checks, as `arena-race` does,
+// that no two blocks share a granule (counted from the lowest block's) and
+// that every block still holds its worker's marker. A pass reads
+//
+//   SOS heaprace: blocks disjoint, markers intact
+//
+// and a failure names the first granule claimed twice, or the first byte
+// that lost its marker.
+
+import sos.{System, Process, BootSet}
+
+extern "C" {
+    func __saw_rt_alloc(size: Int, align: Int) -> UnsafePointer<Int8>?
+}
+
+/// The boot handle, parked for the workers; see `thread-preempt`.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+unsafe static var BURN_SINK: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static ROLE_A: UInt = 1
+static ROLE_B: UInt = 2
+
+/// A block asks for four bytes and costs the heap's smallest block, four
+/// words. The granule a block starts on is two words.
+static ASK: UInt = 4
+static GRANULE: UInt = 8
+static BLOCKS: Int = 3000
+
+/// Iterations between two allocations, so a worker spans many ticks.
+static SPIN: Int = 60
+
+/// Every block's address, worker A's then worker B's. A worker writes only
+/// its own half.
+static TABLE_LEN: Int = 6000
+unsafe static var BLOCK_AT: [UInt; TABLE_LEN] = [0; TABLE_LEN]
+
+/// Which worker claimed each granule from the lowest block's (0 = nobody):
+/// enough for the pool the case gives.
+static MAP_LEN: Int = 32_768
+unsafe static var OWNER: [UInt8; MAP_LEN] = [0; MAP_LEN]
+
+static MARKER_A: UInt8 = 0xA1
+static MARKER_B: UInt8 = 0xB2
+
+static EXIT_A: UInt = 33
+static EXIT_B: UInt = 44
+static NO_VALUE: UInt = 0
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func stack_a_top() unsafe -> UInt {
+    stack_top(((&var STACK_A) as UnsafePointer<UInt64>) as UInt)
+}
+
+func stack_b_top() unsafe -> UInt {
+    stack_top(((&var STACK_B) as UnsafePointer<UInt64>) as UInt)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+/// Burn time without touching the kernel or the heap; see `thread-preempt`
+/// for why the body is a linear-congruential step.
+func burn(iterations: Int) unsafe {
+    var x = BURN_SINK
+    var i = 0
+    while i < iterations {
+        x = (x &* 1_664_525) &+ 1_013_904_223
+        i = i + 1
+    }
+    BURN_SINK = x
+}
+
+func table_base(role: UInt) -> Int {
+    if role == ROLE_A { 0 } else { BLOCKS }
+}
+
+func marker_of(role: UInt) -> UInt8 {
+    if role == ROLE_A { MARKER_A } else { MARKER_B }
+}
+
+func worker(role: UInt) unsafe {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    let first = table_base(role)
+
+    var i = 0
+    while i < BLOCKS {
+        guard let block = __saw_rt_alloc(ASK as Int, ASK as Int) else {
+            print("SOS heaprace: worker {} block {} refused\n", role, i)
+            let _ = (move me).exit(NO_VALUE)
+            return
+        }
+        BLOCK_AT[first + i] = block as UInt
+        burn(SPIN)
+        i = i + 1
+    }
+
+    let marker = marker_of(role)
+    i = 0
+    while i < BLOCKS {
+        let at = BLOCK_AT[first + i]
+        var byte: UInt = 0
+        while byte < ASK {
+            UnsafeMemory<UInt8, Normal>(at + byte).write(marker)
+            byte = byte + 1
+        }
+        i = i + 1
+    }
+    let _ = (move me).exit(if role == ROLE_A { EXIT_A } else { EXIT_B })
+}
+
+/// The lowest block's address.
+func lowest() unsafe -> UInt {
+    var low = BLOCK_AT[0]
+    var i = 1
+    while i < TABLE_LEN {
+        if BLOCK_AT[i] < low {
+            low = BLOCK_AT[i]
+        }
+        i = i + 1
+    }
+    low
+}
+
+/// Claim each of `role`'s blocks in the owner map. True when every block lay
+/// on a granule nobody had claimed. Otherwise prints the first block that
+/// did not, with the granule's earlier owner, and returns false.
+func check_disjoint(role: UInt, low: UInt) unsafe -> Bool {
+    let first = table_base(role)
+    var i = 0
+    while i < BLOCKS {
+        let off = BLOCK_AT[first + i] - low
+        let g = Int.from(truncating: off / GRANULE)
+        if g >= MAP_LEN {
+            print("SOS heaprace: block past the map: worker {} block {}\n",
+                  role, i)
+            return false
+        }
+        if OWNER[g] != 0 {
+            print("SOS heaprace: OVERLAP at {}: worker {} block {} meets {}\n",
+                  off, role, i, OWNER[g])
+            return false
+        }
+        OWNER[g] = UInt8.from(truncating: role)
+        i = i + 1
+    }
+    true
+}
+
+func check_markers(role: UInt) unsafe -> Bool {
+    let first = table_base(role)
+    let marker = marker_of(role)
+    var i = 0
+    while i < BLOCKS {
+        let at = BLOCK_AT[first + i]
+        var byte: UInt = 0
+        while byte < ASK {
+            if UnsafeMemory<UInt8, Normal>(at + byte).read() != marker {
+                print("SOS heaprace: marker lost: worker {} block {}\n",
+                      role, i)
+                return false
+            }
+            byte = byte + 1
+        }
+        i = i + 1
+    }
+    true
+}
+
+func initial(boot_handle: UInt) unsafe {
+    park_boot_handle(boot_handle)
+
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        panic("SOS heaprace: no process handle: {}", error)
+    }
+    // The drain adopts the default heap's pool.
+    let set = try BootSet(process: &proc) catch {
+        panic("SOS heaprace: the drain answered {}", error)
+    }
+    let _ = move set
+
+    let top_a = stack_a_top()
+    let top_b = stack_b_top()
+    let a = try proc.thread_create(stack_top: top_a, arg: ROLE_A) catch {
+        panic("SOS heaprace: create failed: {}", error)
+    }
+    let b = try proc.thread_create(stack_top: top_b, arg: ROLE_B) catch {
+        panic("SOS heaprace: create failed: {}", error)
+    }
+
+    print("SOS heaprace: two allocators on one default heap, no yields")
+    let _ = a.start()
+    let _ = b.start()
+
+    let ra: UInt = try a.join() catch { NO_VALUE }
+    let rb: UInt = try b.join() catch { NO_VALUE }
+    if ra != EXIT_A || rb != EXIT_B {
+        panic("SOS heaprace: workers ended a={} b={}", ra, rb)
+    }
+
+    let low = lowest()
+    let disjoint = check_disjoint(ROLE_A, low) && check_disjoint(ROLE_B, low)
+    if disjoint && check_markers(ROLE_A) && check_markers(ROLE_B) {
+        print("SOS heaprace: blocks disjoint, markers intact")
+        let _ = proc.exit(0)
+        return
+    }
+    let _ = proc.exit(1)
+}
+
+@export("_start")
+func _start(arg: UInt) unsafe {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

@@ -1,0 +1,1113 @@
+//! `heapkit`: the heap cases' launcher and child, as a library.
+//!
+//! Each heap case's root is a package of its own whose `_start` calls
+//! `launch` with its case, and each heap child's `_start` calls `child`. The
+//! launcher takes the child's image and destination rows (0 and 1) and the
+//! case's pool rows (2 on), creates the child once per round, gives it a
+//! System under `TAG_BOOT`, its role as the bits of an Event under
+//! `TAG_ROLE`, and its pools under heap tags, starts it, waits for its end
+//! and prints the §8 status word it ended with:
+//!
+//!   SOS heaplaunch: <round> ended status=<word>
+//!
+//! `Exited` (1) << 16 with the child's code, or `Faulted` (2) << 16 | 14
+//! (`FaultReason.Panic`) for a panic, with its text on the kernel's fault
+//! line. The child drains its boot set with `BootSet`, which adopts the
+//! pools as its heaps, and does what its role says; it allocates nothing but
+//! through the heaps under test, and prints with `{}` arguments, which
+//! allocate nothing.
+//!
+//! This image's kernel arms no tick, so the launcher parks in each wait and
+//! the child's death, or its signal, is what brings it back.
+
+import sos.{System, Process, BootSet, Memory, Pool, Event, Waiter, Mapping,
+            Heap, HeapInfo, HeapRefusal, SosStatus, SystemRight,
+            ProcessRight, PoolRight, MemoryRight, MappingRight, MapAccess,
+            QuotaKind, AllocateFrom, ALL_RIGHTS, PipeInlet, PipeOutlet,
+            PipeHandles, PipeHandle, PipeMsg, PIPE_BODY_BYTES}
+import bootplan.{HEAP_TAG}
+
+static ROW_IMAGE: UInt = 0
+static ROW_DEST: UInt = 1
+static ROW_POOL: UInt = 2
+
+static TAG_BOOT: UInt = 1
+static TAG_ROLE: UInt = 2
+static TAG_READY: UInt = 3
+static TAG_GO: UInt = 4
+static TAG_INLET: UInt = 5
+
+static KEY_DEATH: UInt = 6
+static KEY_READY: UInt = 8
+static KEY_GO: UInt = 9
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// What a child may ask its System for: print, learn its own Process, and
+/// `Transfer`, the bit a give checks.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The launch convention's keep mask for a heap's pool.
+public static HEAP_KEEP: UInt32 = (PoolRight.Allocate | PoolRight.Map
+                                   | PoolRight.Transfer | PoolRight.Mint
+                                   | PoolRight.Extend)
+
+/// A share's rights at most, and its read-only sibling's.
+static SHARE_RIGHTS: UInt32 = (MemoryRight.Transfer | MemoryRight.Mint
+                               | MemoryRight.Map)
+static VIEW_RIGHTS: UInt32 = MemoryRight.Transfer | MemoryRight.Map
+
+/// The byte a shared range is written with.
+static SHARE_MARK: UInt8 = 0x5Au8
+static REUSE_MARK: UInt8 = 0xA1u8
+
+/// The roles the child knows.
+static ROLE_GROW: UInt = 1
+static ROLE_NAMED: UInt = 2
+static ROLE_FALLBACK: UInt = 3
+static ROLE_SERVE: UInt = 4
+static ROLE_HELD: UInt = 5
+static ROLE_SHARE: UInt = 6
+static ROLE_SHARE_REUSE: UInt = 7
+static ROLE_SHARE_ONLY: UInt = 8
+static ROLE_SHARE_GRAIN: UInt = 9
+static ROLE_REFUSE: UInt = 10
+static ROLE_FILL_HANDLES: UInt = 11
+static ROLE_WINDOW: UInt = 12
+static ROLE_MISSING_SLOT: UInt = 13
+static ROLE_WRONG_FREE: UInt = 14
+static ROLE_ZERO: UInt = 15
+static ROLE_HEAPLESS: UInt = 16
+static ROLE_SIZING: UInt = 17
+
+/// The heap cases, one per root package.
+public enum Case {
+    case Grow,
+    case Named,
+    case Fallback,
+    case DirtyPool,
+    case HeldPool,
+    case Share,
+    case ShareReuse,
+    case ShareOnly,
+    case ShareGrain,
+    case Refusals,
+    case Window,
+    case Rights,
+    case MissingSlot,
+    case WrongFree,
+    case ZeroSpent,
+    case MainErr,
+    case Race,
+    case Sizing,
+}
+
+// =============================================================================
+// The launcher
+// =============================================================================
+
+/// What the launcher holds: its System and Process, the child's image and
+/// destination, and its boot set, which holds the pool rows until a round
+/// takes them.
+struct Kit {
+    system: System,
+    proc: Process,
+    image: Memory,
+    dest: Memory,
+    set: BootSet,
+}
+
+extension Kit: NoCopy {}
+
+/// Run `which`'s rounds as the image's root, then stop the machine: with 0
+/// when every round ran, and with 1 when a step was refused, after printing
+/// it.
+public func launch(boot: UInt, which: Case) {
+    let system = System(boot_handle: boot)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS heaplaunch: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var set = try BootSet(process: &proc) catch {
+        print("SOS heaplaunch: drain: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let image = take_memory(&var set, ROW_IMAGE)
+    let dest = take_memory(&var set, ROW_DEST)
+    var kit = Kit(system: move system, proc: move proc, image: move image,
+                  dest: move dest, set: move set)
+    try run_case(&var kit, which) catch {
+        print("SOS heaplaunch: refused: {}", error)
+        let _ = kit.system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = kit.system.debug_print("SOS heaplaunch: done\n")
+    let _ = kit.system.shutdown(EXIT_OK)
+}
+
+func run_case(kit: &var Kit, which: Case) -> Result<Void, SosStatus> {
+    match which {
+        case Grow -> try one_heap(&var kit, "grow", ROLE_GROW),
+        case Named -> try named(&var kit),
+        case Fallback -> try one_heap(&var kit, "fallback", ROLE_FALLBACK),
+        case DirtyPool -> try dirty_pool(&var kit),
+        case HeldPool -> try held_pool(&var kit),
+        case Share -> try share(&var kit),
+        case ShareReuse -> try one_heap(&var kit, "share reuse",
+                                        ROLE_SHARE_REUSE),
+        case ShareOnly -> try share_only(&var kit),
+        case ShareGrain -> try one_heap(&var kit, "share grain",
+                                        ROLE_SHARE_GRAIN),
+        case Refusals -> try refusals(&var kit),
+        case Window -> try one_heap(&var kit, "window", ROLE_WINDOW),
+        case Rights -> try rights(&var kit),
+        case MissingSlot -> try one_heap(&var kit, "missing slot",
+                                         ROLE_MISSING_SLOT),
+        case WrongFree -> try wrong_free(&var kit),
+        case ZeroSpent -> try bare(&var kit, "zero spent", ROLE_HEAPLESS),
+        case MainErr -> try bare(&var kit, "main err", ROLE_ZERO),
+        case Race -> try one_heap(&var kit, "race", ROLE_ZERO),
+        case Sizing -> try one_heap(&var kit, "sizing", ROLE_SIZING),
+    }
+    return
+}
+
+/// The boot row `row`'s allocation, or a panic naming it.
+func take_memory(set: &var BootSet, row: UInt) -> Memory {
+    guard var record = set.take(row) else {
+        panic("SOS heaplaunch: no row {}", row)
+    }
+    guard let memory = record.take_memory() else {
+        panic("SOS heaplaunch: row {} is no allocation", row)
+    }
+    move memory
+}
+
+/// Pool row `index` of the case's, counted from the first after the child's
+/// rows.
+func pool_row(kit: &var Kit, index: UInt) -> Pool {
+    guard var record = kit.set.take(ROW_POOL + index) else {
+        panic("SOS heaplaunch: no pool row {}", index)
+    }
+    guard let pool = record.take_pool() else {
+        panic("SOS heaplaunch: pool row {} is no pool", index)
+    }
+    move pool
+}
+
+/// The child, created and given its System and its role.
+func create(kit: &var Kit, role: UInt) -> Result<Process, SosStatus> {
+    let child = try kit.system.process_create(image: &kit.image,
+                                              memory: &kit.dest)
+    let role_event = try kit.proc.event_create()
+    try role_event.signal(bits: role)
+    try child.give(event: move role_event, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let for_child = try kit.system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return move child
+}
+
+/// Give `pool` to `child` as heap `slot`'s, under `keep`.
+func give_heap(child: &Process, pool: Pool, slot: UInt,
+               keep: UInt32) -> Result<Void, SosStatus> {
+    try child.give(pool: move pool, tag: HEAP_TAG + slot, keep: keep) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Start `child` on its System, wait for its end and print its status word.
+func finish(kit: &var Kit, child: Process,
+            round: String) -> Result<Void, SosStatus> {
+    try child.start(boot_tag: TAG_BOOT)
+    let status = try ended(&var kit, move child)
+    print("SOS heaplaunch: {} ended status={}", round, status)
+    return
+}
+
+/// Wait for `child`'s end, and answer its status word.
+func ended(kit: &var Kit, child: Process) -> Result<UInt, SosStatus> {
+    let waiter = try kit.proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let _ = try waiter.wait()
+    child.get_status()
+}
+
+/// A round with one heap: the first pool row as the default heap's.
+func one_heap(kit: &var Kit, round: String,
+              role: UInt) -> Result<Void, SosStatus> {
+    let child = try create(&var kit, role)
+    let pool = pool_row(&var kit, 0)
+    try give_heap(&child, move pool, 0, HEAP_KEEP)
+    try finish(&var kit, move child, round)
+}
+
+/// A round with no heap but the child's arena.
+func bare(kit: &var Kit, round: String, role: UInt) -> Result<Void, SosStatus> {
+    let child = try create(&var kit, role)
+    try finish(&var kit, move child, round)
+}
+
+/// A default heap and a data heap, slot 1.
+func named(kit: &var Kit) -> Result<Void, SosStatus> {
+    let child = try create(&var kit, ROLE_NAMED)
+    try give_heap(&child, pool_row(&var kit, 0), 0, HEAP_KEEP)
+    try give_heap(&child, pool_row(&var kit, 1), 1, HEAP_KEEP)
+    try finish(&var kit, move child, "named")
+}
+
+/// A data heap only, never allocated from.
+func share_only(kit: &var Kit) -> Result<Void, SosStatus> {
+    let child = try create(&var kit, ROLE_SHARE_ONLY)
+    try give_heap(&child, pool_row(&var kit, 0), 1, HEAP_KEEP)
+    try finish(&var kit, move child, "share only")
+}
+
+/// A default heap and a data heap; a block of the data heap's is freed
+/// through the default heap.
+func wrong_free(kit: &var Kit) -> Result<Void, SosStatus> {
+    let child = try create(&var kit, ROLE_WRONG_FREE)
+    try give_heap(&child, pool_row(&var kit, 0), 0, HEAP_KEEP)
+    try give_heap(&child, pool_row(&var kit, 1), 1, HEAP_KEEP)
+    try finish(&var kit, move child, "wrong free")
+}
+
+/// The pool's front, mapped, written with `0xFF` and unmapped, and its
+/// allocation released, so the child's first growth lands on those bytes.
+func dirty_pool(kit: &var Kit) -> Result<Void, SosStatus> {
+    let pool = pool_row(&var kit, 0)
+    let dirty_len: UInt = 0x2000
+    let front = try pool.allocate(len: dirty_len, from: AllocateFrom.Front)
+    let row = try kit.proc.map(memory: &front,
+                               access: MapAccess.Read | MapAccess.Write)
+    let base = try row.base()
+    fill(base, dirty_len, 0xFFu8)
+    try row.unmap()
+    let _ = move row
+    let _ = move front
+    let child = try create(&var kit, ROLE_SERVE)
+    try give_heap(&child, move pool, 0, HEAP_KEEP)
+    try finish(&var kit, move child, "dirty pool")
+}
+
+/// Write `len` bytes of `byte` at `base`, mapped into this process.
+func fill(base: UInt, len: UInt, byte: UInt8) unsafe {
+    var at: UInt = 0
+    while at < len {
+        UnsafeMemory<UInt8, Normal>(base + at).write(byte)
+        at = at + 1
+    }
+}
+
+/// The byte at `at`, mapped into this process.
+func peek(at: UInt) unsafe -> UInt8 {
+    UnsafeMemory<UInt8, Normal>(at).read()
+}
+
+/// A 64 KiB pool given while the launcher holds a 48 KiB cut from its back,
+/// which comes home once the child has adopted the pool.
+func held_pool(kit: &var Kit) -> Result<Void, SosStatus> {
+    let pool = pool_row(&var kit, 0)
+    let held = try pool.allocate(len: 0xC000, from: AllocateFrom.Back)
+    let child = try create(&var kit, ROLE_HELD)
+    let (ready, go) = try give_signals(&var kit, &child)
+    try give_heap(&child, move pool, 0, HEAP_KEEP)
+    let waiter = try kit.proc.waiter_create()
+    try waiter.add(event: &ready, key: KEY_READY)
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = try waiter.wait()
+    let _ = move held
+    try go.signal(bits: 1)
+    let status = try ended(&var kit, move child)
+    print("SOS heaplaunch: held pool ended status={}", status)
+    return
+}
+
+/// Two Events given to `child`: one it signals when it is ready (`TAG_READY`)
+/// and one the launcher signals to let it go on (`TAG_GO`). The launcher keeps
+/// a sibling of each.
+func give_signals(kit: &var Kit,
+                  child: &Process) -> Result<(Event, Event), SosStatus> {
+    let ready = try kit.proc.event_create()
+    let go = try kit.proc.event_create()
+    let ready_given = try ready.mint()
+    try child.give(event: move ready_given, tag: TAG_READY) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let go_given = try go.mint()
+    try child.give(event: move go_given, tag: TAG_GO) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return (move ready, move go)
+}
+
+/// The child shares a page from its heap's pool and sends it, and a
+/// read-only sibling, to the launcher; fills its heap until it meets the
+/// share and signals. The launcher maps each handle, reads the child's mark
+/// through it, drops both and lets the child go on.
+func share(kit: &var Kit) -> Result<Void, SosStatus> {
+    let child = try create(&var kit, ROLE_SHARE)
+    let (ready, go) = try give_signals(&var kit, &child)
+    let (inlet, outlet) = try kit.proc.pipe_create()
+    try child.give(inlet: move inlet, tag: TAG_INLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try give_heap(&child, pool_row(&var kit, 0), 0, HEAP_KEEP)
+    let waiter = try kit.proc.waiter_create()
+    try waiter.add(event: &ready, key: KEY_READY)
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = try waiter.wait()
+    let got = try outlet.take()
+    let (msg, request) = move got
+    let _ = move request
+    var message = move msg
+    try read_share(&var kit, &var message, 0, "the share")
+    try read_share(&var kit, &var message, 1, "its read-only sibling")
+    let _ = move message
+    try go.signal(bits: 1)
+    let status = try ended(&var kit, move child)
+    print("SOS heaplaunch: share ended status={}", status)
+    return
+}
+
+/// Map the Memory in `msg`'s slot `slot`, read the mark at its first and last
+/// bytes and print it with the handle's rights; the handle and its row are
+/// gone when this returns.
+func read_share(kit: &var Kit, msg: &var PipeMsg, slot: Int,
+                what: String) -> Result<Void, SosStatus> {
+    guard let carried = msg.handles[slot].take() else {
+        panic("SOS heaplaunch: no handle in slot {}", slot)
+    }
+    match carried {
+        case Memory(m) -> {
+            let rights = try m.rights()
+            let row = try kit.proc.map(memory: &m, access: MapAccess.Read)
+            let base = try row.base()
+            let first = peek(base)
+            let last = peek(base + 0xFFF)
+            try row.unmap()
+            print("SOS heaplaunch: {}: rights {}, marked {} {}", what, rights,
+                  first, last)
+        },
+        case _ -> { panic("SOS heaplaunch: slot {} holds no Memory", slot) },
+    }
+    return
+}
+
+/// How a round narrows its child before it starts.
+enum Narrow {
+    case Nothing,
+    /// The `Mapping` row at what the child holds before its heap's row.
+    case MappingRow,
+    /// The `Memory` row at zero.
+    case MemoryRow,
+    /// The `Handle` row at `limit`.
+    case HandleRow(limit: UInt16),
+    /// The `Memory` ceiling without `drop`.
+    case MemoryCeiling(drop: UInt32),
+    /// The `Mapping` ceiling without `drop`.
+    case MappingCeiling(drop: UInt32),
+    /// The `Process` ceiling without `drop`.
+    case ProcessCeiling(drop: UInt32),
+}
+
+/// One child per reason a growth is refused, and per right the first growth
+/// reads, each read from `info()`.
+func refusals(kit: &var Kit) -> Result<Void, SosStatus> {
+    let pool = pool_row(&var kit, 0)
+    try round(&var kit, &pool, ROLE_REFUSE, Narrow.MappingRow,
+              "mapping row full")
+    try round(&var kit, &pool, ROLE_REFUSE, Narrow.MemoryRow,
+              "memory row zero")
+    try round(&var kit, &pool, ROLE_FILL_HANDLES, Narrow.Nothing,
+              "handle row full")
+    try round(&var kit, &pool, ROLE_REFUSE,
+              Narrow.MemoryCeiling(MemoryRight.Map as UInt32),
+              "memory ceiling without Map")
+    try round(&var kit, &pool, ROLE_REFUSE,
+              Narrow.MemoryCeiling(MemoryRight.Extend as UInt32),
+              "memory ceiling without Extend")
+    try round(&var kit, &pool, ROLE_REFUSE,
+              Narrow.MappingCeiling(MappingRight.Grow as UInt32),
+              "mapping ceiling without Grow")
+    try round(&var kit, &pool, ROLE_REFUSE,
+              Narrow.MappingCeiling(MappingRight.Base as UInt32),
+              "mapping ceiling without Base")
+    try round(&var kit, &pool, ROLE_REFUSE,
+              Narrow.MappingCeiling((MappingRight.Grow as UInt32)
+                                    | (MappingRight.Unmap as UInt32)),
+              "mapping ceiling without Grow and Unmap")
+    return
+}
+
+/// A child in `role`, narrowed as `narrow` says and given a sibling of
+/// `pool` as its default heap's, started and waited out.
+func round(kit: &var Kit, pool: &Pool, role: UInt, narrow: Narrow,
+           name: String) -> Result<Void, SosStatus> {
+    let child = try create(&var kit, role)
+    match narrow {
+        case Nothing -> {},
+        case MappingRow -> {
+            let held = try child.quota_get(QuotaKind.Mapping)
+            try child.quota_set(QuotaKind.Mapping, limit: held.used)
+        },
+        case MemoryRow -> { try child.quota_set(QuotaKind.Memory, limit: 0) },
+        case HandleRow(limit) -> {
+            try child.quota_set(QuotaKind.Handle, limit: limit)
+        },
+        case MemoryCeiling(drop) -> {
+            try child.restrict_rights(memory: ALL_RIGHTS & ~drop)
+        },
+        case MappingCeiling(drop) -> {
+            try child.restrict_rights(mapping: ALL_RIGHTS & ~drop)
+        },
+        case ProcessCeiling(drop) -> {
+            try child.restrict_rights(process: ALL_RIGHTS & ~drop)
+        },
+    }
+    let sibling = try pool.mint()
+    try give_heap(&child, move sibling, 0, HEAP_KEEP)
+    try finish(&var kit, move child, name)
+}
+
+/// One child per panic adoption raises: the pool without each right it
+/// needs, the Process handle without `Mint`, a Process ceiling without `Map`
+/// and a `Handle` row with no room for the heaps' Process handle.
+func rights(kit: &var Kit) -> Result<Void, SosStatus> {
+    let pool = pool_row(&var kit, 0)
+    try pool_without(&var kit, &pool, PoolRight.Allocate as UInt32,
+                     "no Allocate")
+    try pool_without(&var kit, &pool, PoolRight.Map as UInt32, "no Map")
+    try pool_without(&var kit, &pool, PoolRight.Transfer as UInt32,
+                     "no Transfer")
+    try pool_without(&var kit, &pool, PoolRight.Mint as UInt32, "no Mint")
+    try pool_without(&var kit, &pool, PoolRight.Extend as UInt32,
+                     "no Extend")
+    try round(&var kit, &pool, ROLE_ZERO,
+              Narrow.ProcessCeiling(ProcessRight.Mint as UInt32),
+              "process handle without Mint")
+    try round(&var kit, &pool, ROLE_ZERO,
+              Narrow.ProcessCeiling(ProcessRight.Map as UInt32),
+              "process ceiling without Map")
+    // The System, the Process handle, the role's Event and the pool.
+    try round(&var kit, &pool, ROLE_ZERO, Narrow.HandleRow(4),
+              "no handle for the heaps")
+    try not_a_pool(&var kit, &pool)
+    return
+}
+
+/// A child given an allocation, not a pool, under heap 1's tag.
+func not_a_pool(kit: &var Kit, pool: &Pool) -> Result<Void, SosStatus> {
+    let child = try create(&var kit, ROLE_ZERO)
+    let page = try pool.allocate(len: 0x1000)
+    try child.give(memory: move page, tag: HEAP_TAG + 1) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try finish(&var kit, move child, "a record that is not a pool")
+}
+
+/// A child given a sibling of `pool` whose keep mask lacks `right`.
+func pool_without(kit: &var Kit, pool: &Pool, right: UInt32,
+                  name: String) -> Result<Void, SosStatus> {
+    let child = try create(&var kit, ROLE_ZERO)
+    let sibling = try pool.mint()
+    try give_heap(&child, move sibling, 0, HEAP_KEEP & ~right)
+    try finish(&var kit, move child, name)
+}
+
+// =============================================================================
+// The child
+// =============================================================================
+
+/// A heap child's whole run: drain the boot set, which adopts the heaps, do
+/// what the role says, and exit with 0. A refused step panics, naming it.
+public func child(boot: UInt) {
+    let system = System(boot_handle: boot)
+    let proc = try system.process_self() catch {
+        panic("SOS heapchild: no process handle: {}", error)
+    }
+    var set = try BootSet(process: &proc) catch {
+        panic("SOS heapchild: the drain answered {}", error)
+    }
+    let role = role_of(&var set)
+    try play(&proc, &var set, role) catch {
+        panic("SOS heapchild: refused: {}", error)
+    }
+    try proc.exit(EXIT_OK) catch {
+        panic("SOS heapchild: the exit was refused: {}", error)
+    }
+}
+
+/// The role the launcher gave, off the Event under `TAG_ROLE`.
+func role_of(set: &var BootSet) -> UInt {
+    guard var record = set.take(TAG_ROLE) else {
+        panic("SOS heapchild: no role")
+    }
+    guard let event = record.take_event() else {
+        panic("SOS heapchild: the role's record is no Event")
+    }
+    try event.receive() catch {
+        panic("SOS heapchild: the role cannot be read: {}", error)
+    }
+}
+
+func play(proc: &Process, set: &var BootSet,
+          role: UInt) -> Result<Void, SosStatus> {
+    if role == ROLE_GROW {
+        return grow_blocks(&proc)
+    }
+    if role == ROLE_NAMED {
+        return fill_named()
+    }
+    if role == ROLE_FALLBACK {
+        return fall_back()
+    }
+    if role == ROLE_SERVE {
+        return serve_and_free()
+    }
+    if role == ROLE_HELD {
+        return past_the_table(&proc, &var set)
+    }
+    if role == ROLE_SHARE {
+        return share_and_meet(&proc, &var set)
+    }
+    if role == ROLE_SHARE_REUSE {
+        return share_reuse(&proc)
+    }
+    if role == ROLE_SHARE_ONLY {
+        return share_only_heap(&proc)
+    }
+    if role == ROLE_SHARE_GRAIN {
+        return share_grain()
+    }
+    if role == ROLE_REFUSE {
+        return grow_twice(&proc)
+    }
+    if role == ROLE_FILL_HANDLES {
+        return fill_handles_and_grow(&proc)
+    }
+    if role == ROLE_WINDOW {
+        return meet_window(&proc)
+    }
+    if role == ROLE_MISSING_SLOT {
+        return missing_slot()
+    }
+    if role == ROLE_WRONG_FREE {
+        return free_through_wrong()
+    }
+    if role == ROLE_HEAPLESS {
+        return heapless()
+    }
+    if role == ROLE_SIZING {
+        return sizing()
+    }
+    if role == ROLE_ZERO {
+        return
+    }
+    panic("SOS heapchild: no role {}", role)
+}
+
+/// `heap_zero_spent`: with no heap at all, a push answers `AllocError` and
+/// an interpolation, which has no error channel, panics.
+func heapless() -> Result<Void, SosStatus> {
+    var bytes = Vector<UInt8>()
+    try bytes.push(1u8) catch {
+        print("SOS heapchild: a push with no heap: {}", error)
+    }
+    let n = bytes.len()
+    let text = "{n} bytes"
+    print("SOS heapchild: an interpolation with no heap came back: {}",
+          text.len())
+    return
+}
+
+/// A block of `size` bytes from the global allocator, or 0.
+func global_block(size: Int) unsafe -> UInt {
+    guard let p = GlobalAllocator().alloc(size, 8) else {
+        return 0
+    }
+    p as UInt
+}
+
+/// Give a global allocator's block back.
+func global_free(block: UInt, size: Int) unsafe {
+    GlobalAllocator().dealloc(block as UnsafePointer<Int8>, size, 8)
+}
+
+/// A refusal's name, as the cases print it.
+func refusal_name(refusal: &HeapRefusal) -> String {
+    match refusal {
+        case Never -> "Never",
+        case Spent -> "Spent",
+        case Quota(kind) -> quota_name(kind),
+        case NoResource -> "NoResource",
+        case Rights -> "Rights",
+    }
+}
+
+func quota_name(kind: QuotaKind) -> String {
+    match kind {
+        case Memory -> "Quota(Memory)",
+        case Mapping -> "Quota(Mapping)",
+        case Handle -> "Quota(Handle)",
+        case _ -> "Quota(another kind)",
+    }
+}
+
+/// `yes` or `no`.
+func yes(b: Bool) -> String {
+    if b { "yes" } else { "no" }
+}
+
+/// This process's `Memory` and `Mapping` rows' use.
+func rows(proc: &Process) -> Result<(UInt16, UInt16), SosStatus> {
+    let memory = try proc.quota_get(QuotaKind.Memory)
+    let mapping = try proc.quota_get(QuotaKind.Mapping)
+    return (memory.used, mapping.used)
+}
+
+/// `heap_grow`: blocks each larger than the heap's free bytes, all kept; the
+/// heap grows for each, and holds one `Memory` and one `Mapping` row
+/// throughout. All freed, the heap is one free block again: three quarters
+/// of it are served with no growth.
+func grow_blocks(proc: &Process) -> Result<Void, SosStatus> {
+    let (memory0, mapping0) = try rows(&proc)
+    print("SOS heapchild: before any block: size {}", Heap<0>().info().size)
+    var blocks: [UInt; 4] = [0; 4]
+    var sizes: [Int; 4] = [0; 4]
+    var size: Int = 64
+    var step: Int = 0
+    while step < 4 {
+        let before = Heap<0>().info().size
+        let block = global_block(size)
+        let after = Heap<0>().info().size
+        let (memory, mapping) = try rows(&proc)
+        print("SOS heapchild: a block of {}: served {}, the heap grew {}, rows memory +{} mapping +{}",
+              size, yes(block != 0), yes(after > before), memory - memory0,
+              mapping - mapping0)
+        blocks[step] = block
+        sizes[step] = size
+        if step == 0 {
+            print("SOS heapchild: the first growth took a KiB at least: {}",
+                  yes(after >= 1024))
+        }
+        size = if step == 0 { 4096 } else { size * 2 }
+        step = step + 1
+    }
+    step = 0
+    while step < 4 {
+        global_free(blocks[step], sizes[step])
+        step = step + 1
+    }
+    let before = Heap<0>().info().size
+    let whole = global_block((before * 3 / 4) as Int)
+    let after = Heap<0>().info().size
+    print("SOS heapchild: all four freed, three quarters of the heap: served {}, the heap grew {}",
+          yes(whole != 0), yes(after > before))
+    return
+}
+
+/// `heap_named`: a data heap's vector filled until a push is refused, with
+/// a default heap's vector built meanwhile.
+func fill_named() -> Result<Void, SosStatus> {
+    var data = Vector<UInt8, Heap<1>>()
+    var other = Vector<UInt8>()
+    var pushed: UInt = 0
+    while {
+        try data.push(7u8) catch {
+            break
+        }
+        pushed = pushed + 1
+        if pushed % 1024 == 0 {
+            try other.push(1u8) catch {
+                panic("SOS heapchild: the default heap refused a byte")
+            }
+        }
+    }
+    let data_info = Heap<1>().info()
+    let default_info = Heap<0>().info()
+    print("SOS heapchild: the data heap's vector was refused after {} of its pool's bytes: {}",
+          "a quarter", yes(pushed * 4 >= data_info.pool))
+    print("SOS heapchild: the data heap reads {}, inside its pool: {}",
+          refusal_name(&data_info.refusal),
+          yes(data_info.size <= data_info.pool))
+    print("SOS heapchild: the default heap holds the other vector: {}, reads {}",
+          yes(default_info.size > 0 && other.len() > 0),
+          refusal_name(&default_info.refusal))
+    return
+}
+
+/// `heap_fallback`: a block the default heap serves, then one past what its
+/// pool holds, which the arena serves; both freed.
+func fall_back() -> Result<Void, SosStatus> {
+    let first = global_block(64)
+    let grown = Heap<0>().info()
+    let second = global_block(6000)
+    let after = Heap<0>().info()
+    print("SOS heapchild: the first block from the default heap: {}",
+          yes(first != 0 && grown.size > 0))
+    print("SOS heapchild: the second from the arena: {}, the default heap reads {}",
+          yes(second != 0 && after.size == grown.size),
+          refusal_name(&after.refusal))
+    global_free(first, 64)
+    global_free(second, 6000)
+    print("SOS heapchild: both freed")
+    return
+}
+
+/// `heap_dirty_pool`: blocks served, written, freed and served again.
+func serve_and_free() -> Result<Void, SosStatus> {
+    var round = 0
+    while round < 2 {
+        let a = global_block(100)
+        let b = global_block(3000)
+        if a == 0 || b == 0 {
+            print("SOS heapchild: a block was refused: {}",
+                  refusal_name(&Heap<0>().info().refusal))
+            return
+        }
+        fill(a, 100, 1u8)
+        fill(b, 3000, 2u8)
+        global_free(a, 100)
+        global_free(b, 3000)
+        round = round + 1
+    }
+    print("SOS heapchild: served and freed twice over a dirty pool")
+    // Everything is free now. A block larger than the heap grows it, and the
+    // growth's bytes join the free block before them; freed, the two are one
+    // free block, which serves all but a KiB of the heap with no growth.
+    let first = Heap<0>().info().size
+    let past = (first + 2048) as Int
+    let over = global_block(past)
+    global_free(over, past)
+    let grown = Heap<0>().info().size
+    let most = global_block((grown - 1024) as Int)
+    let after = Heap<0>().info().size
+    print("SOS heapchild: a growth joined the free block before it: {}",
+          yes(over != 0 && most != 0 && after == grown))
+    return
+}
+
+/// The two Events `give_signals` gave.
+func signals(set: &var BootSet) -> (Event, Event) {
+    guard var ready_record = set.take(TAG_READY) else {
+        panic("SOS heapchild: no ready Event")
+    }
+    guard var go_record = set.take(TAG_GO) else {
+        panic("SOS heapchild: no go Event")
+    }
+    guard let ready = ready_record.take_event() else {
+        panic("SOS heapchild: the ready record is no Event")
+    }
+    guard let go = go_record.take_event() else {
+        panic("SOS heapchild: the go record is no Event")
+    }
+    (move ready, move go)
+}
+
+/// Signal `ready` and wait for `go`.
+func handshake(proc: &Process, ready: &Event,
+               go: &Event) -> Result<Void, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(event: &go, key: KEY_GO)
+    try ready.signal(bits: 1)
+    let _ = try waiter.wait()
+    return
+}
+
+/// `heap_held_pool`: adopted while the launcher held most of the pool, so
+/// the class table is sized for what was free; once the held bytes are home
+/// the heap grows past the table and serves a block from its last list.
+func past_the_table(proc: &Process,
+                    set: &var BootSet) -> Result<Void, SosStatus> {
+    let (ready, go) = signals(&var set)
+    try handshake(&proc, &ready, &go)
+    let small = global_block(64)
+    let big_len: Int = 40 * 1024
+    let big = global_block(big_len)
+    let info = Heap<0>().info()
+    print("SOS heapchild: adopted {} free bytes; a block of 40 KiB served: {}, the heap past twice that: {}",
+          info.pool, yes(small != 0 && big != 0),
+          yes(info.size > 2 * info.pool))
+    if big == 0 {
+        return
+    }
+    fill(big, big_len as UInt, 3u8)
+    global_free(big, big_len)
+    // Two small blocks, then the large one again after them, freed onto the
+    // table's last list; then the first small block, alone between used
+    // blocks, freed onto the smallest blocks' list, whose head the control
+    // block keeps beside the last list's.
+    let a = global_block(8)
+    let b = global_block(8)
+    let again = global_block(big_len)
+    print("SOS heapchild: freed and served again after two small blocks: {}",
+          yes(a != 0 && b != 0 && again != 0))
+    global_free(again, big_len)
+    global_free(a, 8)
+    let c = global_block(8)
+    print("SOS heapchild: a small block freed and served beside it: {}",
+          yes(c == a))
+    return
+}
+
+/// `heap_share`: a page shared from the default heap's pool, marked, sent
+/// with a read-only sibling to the launcher; the heap filled until it meets
+/// the share; once the launcher has dropped both, the heap grows again.
+func share_and_meet(proc: &Process,
+                    set: &var BootSet) -> Result<Void, SosStatus> {
+    let (ready, go) = signals(&var set)
+    guard var inlet_record = set.take(TAG_INLET) else {
+        panic("SOS heapchild: no inlet")
+    }
+    guard let inlet = inlet_record.take_inlet() else {
+        panic("SOS heapchild: the inlet record is no inlet")
+    }
+    let page: UInt = 0x1000
+    let shared = try Heap<0>().share(len: page)
+    let rights = try shared.rights()
+    print("SOS heapchild: a share of a page: rights {}, Transfer, Mint and Map: {}",
+          rights, yes(rights == SHARE_RIGHTS))
+    let row = try proc.map(memory: &shared,
+                           access: MapAccess.Read | MapAccess.Write)
+    let base = try row.base()
+    fill(base, page, SHARE_MARK)
+    try row.unmap()
+    let _ = move row
+    let view = try shared.mint(rights: VIEW_RIGHTS)
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    var carrying = PipeHandles.none()
+    carrying.put(0, memory: move shared)
+    carrying.put(1, memory: move view)
+    let claim = try inlet.post_with(body: &body, len: 1, handles: &var carrying)
+    let _ = move claim
+    var blocks: UInt = 0
+    while global_block(512) != 0 {
+        blocks = blocks + 1
+    }
+    print("SOS heapchild: the heap met the share: {}",
+          refusal_name(&Heap<0>().info().refusal))
+    try handshake(&proc, &ready, &go)
+    let again = global_block(512)
+    print("SOS heapchild: with the share home, the heap grew again: {}",
+          yes(again != 0))
+    return
+}
+
+/// `heap_share_reuse`: two shares, the higher freed; a third of its length
+/// takes its range, so the heap can still grow to the second's front.
+func share_reuse(proc: &Process) -> Result<Void, SosStatus> {
+    let len: UInt = 0x2000
+    let first = global_block(64)
+    if first == 0 {
+        panic("SOS heapchild: the first block was refused")
+    }
+    let higher = try Heap<0>().share(len: len)
+    let lower = try Heap<0>().share(len: len)
+    try mark(&proc, &higher, REUSE_MARK)
+    let _ = move higher
+    let third = try Heap<0>().share(len: len)
+    let reused = try marked(&proc, &third)
+    print("SOS heapchild: the third share took the freed one's range: {}",
+          yes(reused == REUSE_MARK))
+    while global_block(1024) != 0 {
+    }
+    let info = Heap<0>().info()
+    print("SOS heapchild: the heap met the shares: {}, its room unchanged: {}",
+          refusal_name(&info.refusal),
+          yes(info.size + 3 * len > info.pool))
+    let _ = move lower
+    let _ = move third
+    return
+}
+
+/// Write `byte` over `memory`'s first byte, mapped and unmapped.
+func mark(proc: &Process, memory: &Memory,
+          byte: UInt8) -> Result<Void, SosStatus> {
+    let row = try proc.map(memory: &memory,
+                           access: MapAccess.Read | MapAccess.Write)
+    let base = try row.base()
+    fill(base, 1, byte)
+    try row.unmap()
+    return
+}
+
+/// `memory`'s first byte, mapped and unmapped.
+func marked(proc: &Process, memory: &Memory) -> Result<UInt8, SosStatus> {
+    let row = try proc.map(memory: &memory, access: MapAccess.Read)
+    let base = try row.base()
+    let byte = peek(base)
+    try row.unmap()
+    return byte
+}
+
+/// `heap_share_only`: two shares from a data heap never allocated from.
+func share_only_heap(proc: &Process) -> Result<Void, SosStatus> {
+    let before = try proc.quota_get(QuotaKind.Mapping)
+    let one = try Heap<1>().share(len: 0x1000)
+    let two = try Heap<1>().share(len: 0x1000)
+    let after = try proc.quota_get(QuotaKind.Mapping)
+    let info = Heap<1>().info()
+    print("SOS heapchild: two shares from a heap never allocated from: size {}, mapping rows +{}",
+          info.size, after.used - before.used)
+    let _ = move one
+    let _ = move two
+    return
+}
+
+/// `heap_share_grain`: a share off the pool's grain.
+func share_grain() -> Result<Void, SosStatus> {
+    try Heap<0>().share(len: 0x1002) catch {
+        print("SOS heapchild: a share off the grain: {}", error)
+        return share_nothing()
+    }
+    print("SOS heapchild: a share off the grain was served")
+    return
+}
+
+/// `heap_share_grain`'s second share: of no bytes.
+func share_nothing() -> Result<Void, SosStatus> {
+    try Heap<0>().share(len: 0) catch {
+        print("SOS heapchild: a share of no bytes: {}", error)
+        return
+    }
+    print("SOS heapchild: a share of no bytes was served")
+    return
+}
+
+/// `heap_refusals`: a block, then one larger, each printed with what
+/// `info()` read after it, and the `Mapping` rows the two growths left. A
+/// first growth refused for its `Mapping`'s rights leaves its row installed,
+/// and spends the heap, so the second makes none.
+func grow_twice(proc: &Process) -> Result<Void, SosStatus> {
+    let before = try proc.quota_get(QuotaKind.Mapping)
+    let first = global_block(64)
+    print("SOS heapchild: a block: {}, the heap reads {}", yes(first != 0),
+          refusal_name(&Heap<0>().info().refusal))
+    let second = global_block(0x2000)
+    let after = try proc.quota_get(QuotaKind.Mapping)
+    print("SOS heapchild: a larger block: {}, the heap reads {}, mapping rows +{}",
+          yes(second != 0), refusal_name(&Heap<0>().info().refusal),
+          after.used - before.used)
+    return
+}
+
+/// `heap_refusals`' full `Handle` row: siblings of an Event until the row
+/// refuses one, then the blocks.
+func fill_handles_and_grow(proc: &Process) -> Result<Void, SosStatus> {
+    let event = try proc.event_create()
+    hold_siblings(&proc, &event)
+}
+
+/// Mint siblings of `event` until one is refused, each held in its own
+/// frame while the next is asked for; then say whether the refusal was the
+/// quota's, and ask for the blocks while every sibling is held.
+func hold_siblings(proc: &Process, event: &Event) -> Result<Void, SosStatus> {
+    let sibling = try event.mint() catch {
+        print("SOS heapchild: filled the handle row: {}",
+              yes(error == SosStatus.QuotaExceeded))
+        return grow_twice(&proc)
+    }
+    try hold_siblings(&proc, &event)
+    let _ = move sibling
+    return
+}
+
+/// `heap_window`: a share mapped into this process with the most room the
+/// window allows, so the heap's first growth finds no addresses.
+func meet_window(proc: &Process) -> Result<Void, SosStatus> {
+    let page: UInt = 0x1000
+    let shared = try Heap<0>().share(len: page)
+    var low: UInt = 0
+    var high: UInt = 0x400
+    while low + 1 < high {
+        let mid = (low + high) / 2
+        let tried = proc.map(memory: &shared, access: MapAccess.Read,
+                             room: mid * page)
+        match tried {
+            case Ok(row) -> {
+                try row.unmap()
+                low = mid
+            },
+            case Err(_) -> { high = mid },
+        }
+    }
+    let row = try proc.map(memory: &shared, access: MapAccess.Read,
+                           room: low * page)
+    let block = global_block(64)
+    print("SOS heapchild: with the window filled, a block: {}, the heap reads {}",
+          yes(block != 0), refusal_name(&Heap<0>().info().refusal))
+    try row.unmap()
+    return
+}
+
+/// `heap_missing_slot`: a slot in range that was not given.
+func missing_slot() unsafe -> Result<Void, SosStatus> {
+    let block = Heap<2>().alloc(64, 8)
+    let info = Heap<2>().info()
+    print("SOS heapchild: slot 2, never given: a block {}, size {}, pool {}, reads {}",
+          yes(block != None), info.size, info.pool, refusal_name(&info.refusal))
+    try Heap<2>().share(len: 0x1000) catch {
+        print("SOS heapchild: slot 2, never given: a share: {}", error)
+        return
+    }
+    print("SOS heapchild: slot 2, never given: a share was served")
+    return
+}
+
+/// `heap_sizing`: a growth holds what it is asked for. A fresh heap's first
+/// block is a little short of two pages, so only a growth that counts the
+/// heap's front holds it; a block aligned to a page is served from a growth
+/// that counts the gap in front of it; and a request no region could hold is
+/// refused with no growth.
+func sizing() unsafe -> Result<Void, SosStatus> {
+    let first_len: Int = 0x2000 - 16
+    let first = global_block(first_len)
+    print("SOS heapchild: a first block a little short of two pages: {}",
+          yes(first != 0))
+    let before = Heap<0>().info().size
+    let aligned = Heap<0>().alloc(64, 0x1000)
+    let grown = Heap<0>().info().size
+    let at = if let p = aligned { p as UInt } else { 0 }
+    print("SOS heapchild: a block aligned to a page, the heap grown for it: {}, aligned {}",
+          yes(at != 0 && grown > before), yes((at & 0xFFF) == 0))
+    let whole = Heap<0>().alloc(-1, 8)
+    let after = Heap<0>().info()
+    print("SOS heapchild: a block of the whole address space: {}, the heap grew {}, reads {}",
+          yes(whole != None), yes(after.size > grown),
+          refusal_name(&after.refusal))
+    return
+}
+
+/// `heap_wrong_free`: a data heap's block freed through the default heap.
+func free_through_wrong() unsafe -> Result<Void, SosStatus> {
+    let ours = global_block(64)
+    guard let theirs = Heap<1>().alloc(64, 8) else {
+        panic("SOS heapchild: the data heap refused a block")
+    }
+    print("SOS heapchild: a block from each heap: {}", yes(ours != 0))
+    Heap<0>().dealloc(theirs, 64, 8)
+    panic("SOS heapchild: the wrong free came back")
+}

@@ -1,0 +1,175 @@
+//! Heap: a process's heaps over the pools its launcher gave it, as std
+//! allocators, and the shareable memory from the back of the same pools.
+//!
+//! A launcher gives a process one pool per heap under the heap's slot's tag,
+//! and the drain adopts each (`BootSet`, `adopt_heaps`). Slot 0 is the
+//! default heap, which the global allocator asks before the arena; the other
+//! slots are named heaps a program asks for by number:
+//!
+//! ```saw
+//! import sos.{Heap}
+//!
+//! static DATA: Int = 1           // [heap.data] slot = 1
+//!
+//! var log = Vector<UInt8, Heap<DATA>>()
+//! try log.push(byte) catch { drop_oldest(&var log) }
+//! ```
+//!
+//! A heap grows up from its pool's front, one allocation and one row extended
+//! in place, and never gives memory back. `share` takes memory from the
+//! pool's back, which the heap and the shares compete for: a heap that cannot
+//! grow answers null, and `info()` says why.
+//!
+//! The table and the growth are `sosrt`'s (`rt/common/src/lib.saw`), the
+//! growth's kernel ops `sos.rt`'s.
+
+import sosabi.{SosStatus, PoolOp, AllocateFrom, MemoryHandle, QuotaKind,
+               NO_HANDLE}
+import bootplan.{MAX_HEAPS}
+import sosrt.{GrowRefusal, heap_alloc, heap_free, heap_state, heap_pool}
+import sos.floor.{call_value}
+import sos.memory.{Memory}
+
+/// The heap in slot `SLOT`, an std `Allocator`: `Heap<0>` is the default
+/// heap without the arena behind it, and `Heap<n>` the named heap whose
+/// declaration says `slot = n`.
+///
+/// A slot past the table is a build error. A slot in range that was not
+/// given is a heap with no pool: it serves nothing, and its `info()` reads
+/// `Spent` with a pool of zero bytes.
+public struct Heap<const SLOT: Int> {}
+
+/// Why a heap last refused to grow.
+public enum HeapRefusal {
+    /// It has never refused.
+    case Never,
+    /// Its pool has no bytes after its front: the shares or the pool's end are
+    /// there. A share coming home that was the lowest one lets it grow again.
+    /// A heap with no pool reads this too.
+    case Spent,
+    /// A quota row refused the `Memory` or the `Mapping` the first growth
+    /// makes, or a handle for either.
+    case Quota(kind: QuotaKind),
+    /// The kernel had no room for an object, or for the row's addresses.
+    case NoResource,
+    /// A ceiling took away a right the heap spends: `Map` or `Extend` on its
+    /// `Memory`, or `Grow` or `Base` on its `Mapping`.
+    case Rights,
+}
+
+@synthesize
+extension HeapRefusal: Equatable {}
+
+/// What `Heap.info()` answers: the heap's size, its pool's free bytes when it
+/// was adopted, and why it last refused to grow.
+public struct HeapInfo {
+    /// The bytes the heap's region holds: zero until its first growth.
+    size: UInt,
+    /// The pool's free bytes at adoption, zero for a heap with no pool.
+    pool: UInt,
+    refusal: HeapRefusal,
+}
+
+extension Heap<SLOT>: Allocator {
+    /// `size` bytes aligned to `align` from this heap, growing it as it
+    /// needs, or `None`. A refusal never panics; `info()` says why it came.
+    public func alloc(&self, size: Int,
+                      align: Int) unsafe -> UnsafePointer<Int8>? {
+        static_assert(SLOT >= 0 && SLOT < MAX_HEAPS,
+                      "Heap's slot must be below MAX_HEAPS")
+        let block = heap_alloc(SLOT, UInt.from(truncating: size),
+                               UInt.from(truncating: align))
+        if block == 0 {
+            return None
+        }
+        block as UnsafePointer<Int8>
+    }
+
+    /// Free a block this heap served. A block it does not hold as a live
+    /// block, one another heap served included, panics, naming the address,
+    /// after the heap's lock is given back.
+    public func dealloc(&self, ptr: UnsafePointer<Int8>, size: Int,
+                        align: Int) unsafe {
+        static_assert(SLOT >= 0 && SLOT < MAX_HEAPS,
+                      "Heap's slot must be below MAX_HEAPS")
+        let block = ptr as UInt
+        if not heap_free(SLOT, block) {
+            panic("bad free at {}", block)
+        }
+    }
+}
+
+extension Heap<SLOT> {
+    /// This heap's size, its pool's free bytes at adoption, and why it last
+    /// refused to grow.
+    public func info(&self) -> HeapInfo {
+        static_assert(SLOT >= 0 && SLOT < MAX_HEAPS,
+                      "Heap's slot must be below MAX_HEAPS")
+        read_info(SLOT)
+    }
+
+    /// `len` bytes from the back of this heap's pool, as a `Memory` the
+    /// program may map, mint siblings of and give or send to any number of
+    /// processes.
+    ///
+    /// It carries the pool's `Transfer`, `Mint` and `Map` at most, capped by
+    /// this process's `Memory` ceiling, and never `Extend` or `MapExecute`. It
+    /// is an ordinary `Memory`: its bytes return to the pool when its last
+    /// handle and its last row are gone, in whichever processes they are, and
+    /// a later share reuses them. Its bytes hold whatever they last held.
+    ///
+    /// The share and the heap compete for the middle of the pool: a share the
+    /// pool cannot serve is `Err(NoMemory)`, as is one from a heap with no
+    /// pool, and a heap that meets a share stops growing until that share
+    /// comes home. `len` must be a whole number of the pool's grain, else
+    /// `Err(NoResource)`. A share costs a `Memory` row while it lives and a
+    /// `Handle` row while this process holds it: past either,
+    /// `Err(QuotaExceeded)`.
+    ///
+    /// It takes no heap lock: the kernel cuts the share from the pool, whose
+    /// front the heap's growth cuts from the same frontier.
+    public func share(&self, len: UInt) -> Result<Memory, SosStatus> {
+        static_assert(SLOT >= 0 && SLOT < MAX_HEAPS,
+                      "Heap's slot must be below MAX_HEAPS")
+        share_from(SLOT, len)
+    }
+}
+
+/// `info()`'s body.
+func read_info(slot: Int) unsafe -> HeapInfo {
+    let state = heap_state(slot)
+    if not state.adopted {
+        return HeapInfo(size: 0, pool: 0, refusal: HeapRefusal.Spent)
+    }
+    let refusal = match state.refusal {
+        case Never -> HeapRefusal.Never,
+        case Spent -> HeapRefusal.Spent,
+        case Quota -> HeapRefusal.Quota(quota_kind(state.quota)),
+        case NoResource -> HeapRefusal.NoResource,
+        case Rights -> HeapRefusal.Rights,
+    }
+    HeapInfo(size: state.size, pool: state.total, refusal: refusal)
+}
+
+/// A quota kind's number, as the growth recorded it.
+func quota_kind(raw: UInt) -> QuotaKind {
+    guard let kind = QuotaKind.from(raw: raw) else {
+        panic("sos: a heap recorded quota kind {}, which this build lacks",
+              raw)
+    }
+    kind
+}
+
+/// `share`'s body.
+func share_from(slot: Int, len: UInt) unsafe -> Result<Memory, SosStatus> {
+    let (pool, grain) = heap_pool(slot)
+    if pool == NO_HANDLE {
+        return SosStatus.NoMemory
+    }
+    if len == 0 || (len & (grain &- 1)) != 0 {
+        return SosStatus.NoResource
+    }
+    let raw = try call_value(pool, PoolOp.Allocate as UInt, len, 0,
+                             AllocateFrom.Back as UInt)
+    return Memory(handle: MemoryHandle(raw))
+}

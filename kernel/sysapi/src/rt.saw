@@ -1,17 +1,18 @@
-//! The runtime's four hooks, process side.
+//! The runtime's five hooks, process side.
 //!
-//! `sosrt` implements the frozen `__saw_rt_*` seams over four per-side hooks:
-//! where a byte goes, how a run ends with a text, which thread asks, and how a
-//! thread waiting for the output lock gives the processor up. The kernel HAL
-//! answers "the UART" and "write the text, stop the board". A process owns no
-//! device, so it answers with kernel ops: a byte goes to the console's driver
-//! over a pipe, or out through a System op in a process with no console (the
-//! console's section, at the end), and the end is the kernel's panic op,
-//! which puts the text on its fault line and ends the process. If `panic()`
+//! `sosrt` implements the frozen `__saw_rt_*` seams over five per-side hooks:
+//! where a byte goes, how a run ends with a text, which thread asks, how a
+//! thread waiting for the output lock gives the processor up, and how a pool
+//! heap grows. The kernel HAL answers "the UART", "write the text, stop the
+//! board" and "no growth". A process owns no device, so it answers with kernel
+//! ops: a byte goes to the console's driver over a pipe, or out through a
+//! System op in a process with no console (the console's section), the end is
+//! the kernel's panic op, which puts the text on its fault line and ends the
+//! process, and a growth is its pool's ops (the last section). If `panic()`
 //! could reach a UART from userspace, the user/kernel split would be claimed
-//! rather than real. The last two it
-//! answers from the thread register, whose layout this file also keeps: the
-//! blocks, and the start record of a thread `thread_create(run:)` makes.
+//! rather than real. Which thread asks, and the yield, it answers from the
+//! thread register, whose layout this file also keeps: the blocks, and the
+//! start record of a thread `thread_create(run:)` makes.
 //!
 //! They live here, not in `hal/<arch>/user/`, because they name no
 //! architecture: the System op and the panic op are the same ops on every
@@ -564,4 +565,147 @@ func console_call(at: UInt, len: UInt) unsafe -> UInt {
                         UInt.from(truncating: pipe_send_record_bytes()),
                         (&var reply) as UnsafePointer<UInt>,
                         (&var value) as UnsafePointer<UInt>)
+}
+
+// -----------------------------------------------------------------------------
+// A pool heap's growth
+// -----------------------------------------------------------------------------
+//
+// `sosrt`'s fifth hook. It runs inside the heap's lock, so it is check-free on
+// `rt_write`'s terms: raw floor calls, wrapping arithmetic, no allocation and
+// no panic. Every op it makes answers at once, or ends the process inside the
+// kernel, which the rights read before each spend rule out.
+
+import sosrt.{PoolHeap, GrowRefusal}
+import sosabi.{MemoryRight, MappingRight, MappingOp, MapAccess,
+               AllocateFrom, QuotaKind}
+import sos.floor.{sos_pool_allocate, sos_memory_map, sos_memory_extend,
+                  sos_mapping_grow, sos_handle_release}
+
+static STATUS_OK: UInt = 0
+
+/// The rights the heap's `Memory` and `Mapping` must hold, read at the first
+/// growth: the later growths spend them.
+static MEMORY_SPENT: UInt = ((MemoryRight.Map as UInt)
+                             | (MemoryRight.Extend as UInt))
+static MAPPING_SPENT: UInt = ((MappingRight.Grow as UInt)
+                              | (MappingRight.Base as UInt))
+
+static HEAP_ACCESS: UInt = (MapAccess.Read as UInt) | (MapAccess.Write as UInt)
+
+/// Grow the heap at `at`, a `PoolHeap`, by `by` bytes, a whole number of its
+/// pool's grain: nonzero when its region may grow by them.
+///
+/// The first growth cuts the front of the pool, `by` bytes, and maps them
+/// through the heap's Process sibling with the rest of the pool's free bytes
+/// at adoption as the row's room; it keeps the `Memory` and the `Mapping`
+/// for the process's life and records where the row landed. Every later
+/// growth extends the `Memory` and then grows the `Mapping` over the new
+/// bytes.
+///
+/// A refusal is recorded in the heap and answered with zero:
+///
+///   - `Spent`: the pool has no bytes at the heap's front, the cut's or an
+///     extension's `NoMemory`, or a `Grow`'s `NoMemory` or `Revoked`;
+///   - `Quota`: a quota row refused the `Memory`, the `Mapping` or a handle,
+///     its kind told apart by minting one handle more;
+///   - `NoResource`: the kernel had no room for an object, or the row's next
+///     addresses meet another row or leave the window;
+///   - `Rights`: the `Memory` lacks `Map` or `Extend`, or the `Mapping` lacks
+///     `Grow` or `Base`, which the ceilings may take away.
+///
+/// A first growth refused for want of a right releases what it made, and
+/// never unmaps: `Unmap` is a third right the ceiling may also lack, and a
+/// row released unmapped stays installed until the process ends. A
+/// `Mapping` without its rights, or a refused `Grow`, which leaves the
+/// `Memory` longer than its row, spends the heap for good.
+@export("sos_rt_grow")
+func rt_grow(at: UInt, by: UInt) unsafe -> UInt {
+    let heap = at as UnsafePointer<PoolHeap>
+    if heap[0].memory == NO_HANDLE {
+        return first_growth(heap, by)
+    }
+    let extended = sos_memory_extend(heap[0].memory, by)
+    if extended != STATUS_OK {
+        refuse(heap, extended, QuotaKind.Memory)
+        return 0
+    }
+    let grown = sos_mapping_grow(heap[0].mapping, by)
+    if grown != STATUS_OK {
+        heap[0].spent = true
+        refuse(heap, grown, QuotaKind.Mapping)
+        return 0
+    }
+    1
+}
+
+/// The first growth: see `rt_grow`.
+func first_growth(heap: UnsafePointer<PoolHeap>, by: UInt) unsafe -> UInt {
+    var memory: UInt = NO_HANDLE
+    let cut = sos_pool_allocate(heap[0].pool, by, 0, AllocateFrom.Front as UInt,
+                                (&var memory) as UnsafePointer<UInt>)
+    if cut != STATUS_OK {
+        refuse(heap, cut, QuotaKind.Memory)
+        return 0
+    }
+    if (rights_word(memory) & MEMORY_SPENT) != MEMORY_SPENT {
+        let _ = sos_handle_release(memory)
+        heap[0].refusal = GrowRefusal.Rights
+        return 0
+    }
+    let total = heap[0].total
+    let room = if total > by { total &- by } else { 0 }
+    var mapping: UInt = NO_HANDLE
+    let mapped = sos_memory_map(memory, heap[0].process, HEAP_ACCESS, room,
+                                (&var mapping) as UnsafePointer<UInt>)
+    if mapped != STATUS_OK {
+        let _ = sos_handle_release(memory)
+        refuse(heap, mapped, QuotaKind.Mapping)
+        return 0
+    }
+    if (rights_word(mapping) & MAPPING_SPENT) != MAPPING_SPENT {
+        let _ = sos_handle_release(mapping)
+        let _ = sos_handle_release(memory)
+        heap[0].spent = true
+        heap[0].refusal = GrowRefusal.Rights
+        return 0
+    }
+    let base = try call_value(mapping, MappingOp.Base as UInt, 0, 0, 0) catch {
+        0
+    }
+    heap[0].memory = memory
+    heap[0].mapping = mapping
+    heap[0].base = base
+    1
+}
+
+/// Record why a growth op answered `status`. `kind` is the quota an object
+/// the op makes is charged to; a `QuotaExceeded` is that row's or the
+/// `Handle` row's, and minting one more handle of the pool tells which.
+func refuse(heap: UnsafePointer<PoolHeap>, status: UInt,
+            kind: QuotaKind) unsafe {
+    if status == (SosStatus.QuotaExceeded as UInt) {
+        heap[0].refusal = GrowRefusal.Quota
+        heap[0].quota = kind as UInt
+        var probe: UInt = NO_HANDLE
+        let minted = sos_handle_mint(heap[0].pool, 0,
+                                     (&var probe) as UnsafePointer<UInt>)
+        if minted == (SosStatus.QuotaExceeded as UInt) {
+            heap[0].quota = QuotaKind.Handle as UInt
+        } else if minted == STATUS_OK {
+            let _ = sos_handle_release(probe)
+        }
+    } else if status == (SosStatus.NoResource as UInt) {
+        heap[0].refusal = GrowRefusal.NoResource
+    } else {
+        heap[0].refusal = GrowRefusal.Spent
+    }
+}
+
+/// The rights word of `handle`, a handle this hook made.
+func rights_word(handle: UInt) unsafe -> UInt {
+    var rights: UInt = 0
+    let _ = sos_handle_info(handle, HandleInfo.Rights as UInt,
+                            (&var rights) as UnsafePointer<UInt>)
+    rights
 }

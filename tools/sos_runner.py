@@ -393,6 +393,31 @@ MAP_ROOM_IDENTITY_PKG = os.path.join(TESTS_DIR, "map-room-identity")
 GROW_FAULTS_PKG = os.path.join(TESTS_DIR, "grow-faults")
 CHILD_GROW_LEG_PKG = os.path.join(TESTS_DIR, "child-grow-leg")
 EXTEND_ISOLATION_PKG = os.path.join(TESTS_DIR, "extend-isolation")
+# The heaps over pools (`sos.Heap`): a launcher per case, each calling
+# `heapkit` with its case, and the children `heapkit` drives by role.
+HEAP_GROW_PKG = os.path.join(TESTS_DIR, "heap-grow")
+HEAP_NAMED_PKG = os.path.join(TESTS_DIR, "heap-named")
+HEAP_FALLBACK_PKG = os.path.join(TESTS_DIR, "heap-fallback")
+HEAP_DIRTY_POOL_PKG = os.path.join(TESTS_DIR, "heap-dirty-pool")
+HEAP_HELD_POOL_PKG = os.path.join(TESTS_DIR, "heap-held-pool")
+HEAP_SHARE_PKG = os.path.join(TESTS_DIR, "heap-share")
+HEAP_SHARE_REUSE_PKG = os.path.join(TESTS_DIR, "heap-share-reuse")
+HEAP_SHARE_ONLY_PKG = os.path.join(TESTS_DIR, "heap-share-only")
+HEAP_SHARE_GRAIN_PKG = os.path.join(TESTS_DIR, "heap-share-grain")
+HEAP_REFUSALS_PKG = os.path.join(TESTS_DIR, "heap-refusals")
+HEAP_WINDOW_PKG = os.path.join(TESTS_DIR, "heap-window")
+HEAP_RIGHTS_PKG = os.path.join(TESTS_DIR, "heap-rights")
+HEAP_MISSING_SLOT_PKG = os.path.join(TESTS_DIR, "heap-missing-slot")
+HEAP_WRONG_FREE_PKG = os.path.join(TESTS_DIR, "heap-wrong-free")
+HEAP_ZERO_SPENT_PKG = os.path.join(TESTS_DIR, "heap-zero-spent")
+HEAP_BARE_PKG = os.path.join(TESTS_DIR, "heap-bare")
+HEAP_RACE_PKG = os.path.join(TESTS_DIR, "heap-race")
+HEAP_SIZING_PKG = os.path.join(TESTS_DIR, "heap-sizing")
+CHILD_HEAP_PKG = os.path.join(TESTS_DIR, "child-heap")
+CHILD_HEAP_ARENA_PKG = os.path.join(TESTS_DIR, "child-heap-arena")
+CHILD_HEAP_BOUND_PKG = os.path.join(TESTS_DIR, "child-heap-bound")
+CHILD_HEAP_MAIN_PKG = os.path.join(TESTS_DIR, "child-heap-main")
+CHILD_HEAP_RACE_PKG = os.path.join(TESTS_DIR, "child-heap-race")
 MAP_BASICS_PKG = os.path.join(TESTS_DIR, "map-basics")
 MAP_UNMAP_PKG = os.path.join(TESTS_DIR, "map-unmap")
 MAP_INTO_CHILD_PKG = os.path.join(TESTS_DIR, "map-into-child")
@@ -1592,7 +1617,8 @@ def needs_region_table(case):
     if case.get("slab_block"):
         return False
     return bool(case.get("children") or case.get("child_asm")
-                or case.get("pool") or case.get("device")
+                or case.get("pool") or case.get("heap_pools")
+                or case.get("device")
                 or case.get("limits") or not case.get("tick"))
 
 
@@ -1626,6 +1652,12 @@ def _child_count(case):
 REGION_KIND_RAM = 0
 REGION_KIND_DEVICE = 1
 REGION_KIND_POOL = 2
+
+# A `heap_pools` length naming one growth of a heap: the runtime's fewest
+# bytes a growth takes (`sosrt`'s `MIN_GROWTH`), or the board's grain when
+# that is larger.
+MIN_GROWTH = "one growth"
+HEAP_MIN_GROWTH = 1024
 
 # The top of the pool window an `off_grain_destinations` case gives to its two
 # allocations off the grain, half each.
@@ -1913,6 +1945,23 @@ def _panic_fault(process, *pieces, open_end=False):
     else:
         lines[-1] += "\nSOS: process teardown handles="
     return lines + [f" process={process}\n"]
+
+
+def _heap_refused(round, reason, rows=0):
+    """What a `heap_refusals` round prints: the child's two blocks, each
+    refused and `info()` reading `reason`, the `Mapping` rows the two
+    growths left, and the launcher's line for its clean exit."""
+    return [f"SOS heapchild: a block: no, the heap reads {reason}",
+            f"SOS heapchild: a larger block: no, the heap reads {reason}, "
+            f"mapping rows +{rows}",
+            f"SOS heaplaunch: {round} ended status=65536"]
+
+
+def _heap_adoption(round, message):
+    """What a `heap_rights` round prints: the child's adoption panics with
+    `message`, and the launcher reads `Faulted (Panic)`."""
+    return [*_panic_fault("{one}", "panic at bootset.saw:", ": " + message),
+            f"SOS heaplaunch: {round} ended status={STATUS_PANICKED}\n"]
 
 
 def _after(line, lines):
@@ -13252,6 +13301,457 @@ TEST_CASES = [
                        "SOS bootlaunch: done"],
         "expect_clean_exit": True,
     },
+
+    # =========================================================================
+    # The heaps over pools (`sos.Heap`)
+    # =========================================================================
+    #
+    # Each case's launcher is `heapkit.launch` with the case's rounds: it
+    # creates its one child from the image and destination rows once per
+    # round, gives it a System, its role and the case's `heap_pools` rows
+    # under heap tags with the launch convention's keep mask (each named
+    # below), starts it, waits for its end and prints its status word. The
+    # child (`heapkit.child`) drains its boot set, which adopts the pools as
+    # its heaps, and does what its role says. `child-heap` has no arena, so
+    # every block it is served is a heap's.
+    {
+        # A heap grows as its blocks need (spec §5c). Four blocks, each
+        # larger than the heap's free bytes, all kept: each is served and
+        # the heap grows for each, the first growth by a KiB at least, the
+        # fewest bytes a growth takes, and it holds one `Memory` and one
+        # `Mapping` row throughout. All four freed, the growths' blocks are
+        # one free block: three quarters of the heap are served with no
+        # growth.
+        "name": "heap_grow",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_GROW_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0xC000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS heapchild: before any block: size 0",
+                       "SOS heapchild: a block of 64: served yes, the heap "
+                       "grew yes, rows memory +1 mapping +1",
+                       "SOS heapchild: the first growth took a KiB at least: "
+                       "yes",
+                       "SOS heapchild: a block of 4096: served yes, the heap "
+                       "grew yes, rows memory +1 mapping +1",
+                       "SOS heapchild: a block of 8192: served yes, the heap "
+                       "grew yes, rows memory +1 mapping +1",
+                       "SOS heapchild: a block of 16384: served yes, the heap "
+                       "grew yes, rows memory +1 mapping +1",
+                       "SOS heapchild: all four freed, three quarters of the "
+                       "heap: served yes, the heap grew no",
+                       "SOS heaplaunch: grow ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A named heap is an std allocator (`Heap<1>`): a vector over the
+        # data heap (slot 1) fills until a push is refused, past a quarter of
+        # its pool, and the heap reads `Spent` inside its pool; a vector
+        # built meanwhile through the global allocator comes from the default
+        # heap, which grew for it.
+        "name": "heap_named",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_NAMED_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x4000, 0x8000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS heapchild: the data heap's vector was refused "
+                       "after a quarter of its pool's bytes: yes",
+                       "SOS heapchild: the data heap reads Spent, inside its "
+                       "pool: yes",
+                       "SOS heapchild: the default heap holds the other "
+                       "vector: yes, reads Never",
+                       "SOS heaplaunch: named ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The global allocator asks the default heap and then the arena
+        # (`child-heap-arena`, 8 KiB). The default heap's pool holds one
+        # growth: its first block is the heap's, and a block past what is
+        # left is the arena's, the heap reading `Spent`; both are freed, each
+        # to the heap its address is in, and the child exits clean.
+        "name": "heap_fallback",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_FALLBACK_PKG,
+        "children": [CHILD_HEAP_ARENA_PKG],
+        "heap_pools": [MIN_GROWTH],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS heapchild: the first block from the default "
+                       "heap: yes",
+                       "SOS heapchild: the second from the arena: yes, the "
+                       "default heap reads Spent",
+                       "SOS heapchild: both freed",
+                       "SOS heaplaunch: fallback ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A pool's bytes hold what they last held. The launcher maps its
+        # pool's first two pages, writes 0xFF over them, unmaps them and
+        # releases the allocation, so the child's first growth lands on
+        # them; the heap zeroes its control block's first word before it
+        # makes the heap, and serves and frees cleanly. With everything
+        # free, a block larger than the heap grows it, and the growth's bytes
+        # join the free block before them: freed, the two serve all but a
+        # KiB of the heap with no growth.
+        "name": "heap_dirty_pool",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_DIRTY_POOL_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x8000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS heapchild: served and freed twice over a dirty "
+                       "pool",
+                       "SOS heapchild: a growth joined the free block before "
+                       "it: yes",
+                       "SOS heaplaunch: dirty pool ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A heap grows past what its adoption saw. The launcher gives a
+        # 64 KiB pool while it holds a 48 KiB cut from its back, so the
+        # child adopts 16 KiB and its class table is sized for that; once
+        # the child has adopted it, the launcher's cut comes home. A 40 KiB
+        # block is then served from the table's last list, the heap more
+        # than twice what it adopted, freed, and served again after two
+        # small blocks; freed onto the last list again, it stays there while
+        # the first small block is freed onto the smallest blocks' list,
+        # whose head sits beside the last list's in the control block, and
+        # is served again from it.
+        "name": "heap_held_pool",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_HELD_POOL_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x10000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS heapchild: adopted 16384 free bytes; a block of "
+                       "40 KiB served: yes, the heap past twice that: yes",
+                       "SOS heapchild: freed and served again after two "
+                       "small blocks: yes",
+                       "SOS heapchild: a small block freed and served beside "
+                       "it: yes",
+                       "SOS heaplaunch: held pool ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A share (`Heap.share(len:)`) is the back of the heap's pool. The
+        # child shares a page, which carries `Transfer`, `Mint` and `Map`
+        # (515), marks it, and sends it with a read-only sibling
+        # (`Transfer | Map`, 513) to the launcher, which maps each and reads
+        # the mark (90) at both ends. The child's heap meanwhile grows until
+        # it meets the share and reads `Spent`; once the launcher has
+        # dropped both handles, the share's range is home and the heap grows
+        # again.
+        "name": "heap_share",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_SHARE_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x8000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS heapchild: a share of a page: rights 515, "
+                       "Transfer, Mint and Map: yes",
+                       "SOS heapchild: the heap met the share: Spent",
+                       "SOS heaplaunch: the share: rights 515, marked 90 90",
+                       "SOS heaplaunch: its read-only sibling: rights 513, "
+                       "marked 90 90",
+                       "SOS heapchild: with the share home, the heap grew "
+                       "again: yes",
+                       "SOS heaplaunch: share ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A freed share's range is reused from the back. Two shares, the
+        # higher marked and freed; a third of its length reads the mark, so
+        # it took the freed range and not the frontier, and the heap still
+        # grows to within a growth of the second share's front.
+        "name": "heap_share_reuse",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_SHARE_REUSE_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x10000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS heapchild: the third share took the freed one's "
+                       "range: yes",
+                       "SOS heapchild: the heap met the shares: Spent, its "
+                       "room unchanged: yes",
+                       "SOS heaplaunch: share reuse ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A heap never allocated from maps nothing: two shares from a data
+        # heap leave its size at 0 and the child's `Mapping` row where it
+        # was.
+        "name": "heap_share_only",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_SHARE_ONLY_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x4000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS heapchild: two shares from a heap never allocated "
+                       "from: size 0, mapping rows +0",
+                       "SOS heaplaunch: share only ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A share's length off the pool's grain, or of no bytes, is
+        # `NoResource`, answered without asking the kernel, which would fault
+        # it.
+        "name": "heap_share_grain",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_SHARE_GRAIN_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x4000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS heapchild: a share off the grain: no room for "
+                       "what was asked",
+                       "SOS heapchild: a share of no bytes: no room for what "
+                       "was asked",
+                       "SOS heaplaunch: share grain ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Every refusal to grow is a null, its reason in `info()`. One child
+        # per reason or right, each asking for a block and then a larger one
+        # (a second growth): its `Mapping` row at what it holds before the
+        # heap's, its `Memory` row at zero, its `Handle` row filled by the
+        # child itself, its `Memory` ceiling without `Map` and without
+        # `Extend`, and its `Mapping` ceiling without `Grow`, without `Base`
+        # and without `Grow` and `Unmap`. Each child runs on and exits clean.
+        # A first growth refused for its `Mapping`'s rights releases the
+        # handles and does not unmap, so its row stays installed until the
+        # child ends, and the heap is spent: the second block makes no
+        # second row.
+        "name": "heap_refusals",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_REFUSALS_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x8000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       *_heap_refused("mapping row full", "Quota(Mapping)"),
+                       *_heap_refused("memory row zero", "Quota(Memory)"),
+                       "SOS heapchild: filled the handle row: yes",
+                       *_heap_refused("handle row full", "Quota(Handle)"),
+                       *_heap_refused("memory ceiling without Map", "Rights"),
+                       *_heap_refused("memory ceiling without Extend",
+                                      "Rights"),
+                       *_heap_refused("mapping ceiling without Grow",
+                                      "Rights", rows=1),
+                       *_heap_refused("mapping ceiling without Base",
+                                      "Rights", rows=1),
+                       *_heap_refused("mapping ceiling without Grow and "
+                                      "Unmap", "Rights", rows=1),
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A heap's first growth can meet the end of the grant window, where
+        # a mapping has an address of its own. The child maps a share into
+        # itself with the most room the window allows, and its default
+        # heap's first growth is refused `NoResource`.
+        "name": "heap_window",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_WINDOW_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x4000],
+        "arches": ["arm64"],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS heapchild: with the window filled, a block: no, "
+                       "the heap reads NoResource",
+                       "SOS heaplaunch: window ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Adoption reads every right a heap will spend before the program
+        # runs, and panics naming the one missing. One child per panic: its
+        # pool given without each of `Allocate`, `Map`, `Transfer`, `Mint`
+        # and `Extend`; its Process ceiling without `Mint`, so the Process
+        # handle it derives has none; its Process ceiling without `Map`, so
+        # the heaps' sibling has none; its `Handle` row at the four
+        # handles it holds, so the sibling's mint is refused; and an
+        # allocation, not a pool, under heap 1's tag.
+        "name": "heap_rights",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_RIGHTS_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x4000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       *_heap_adoption("no Allocate",
+                                       "sos: heap 0's pool lacks Allocate"),
+                       *_heap_adoption("no Map",
+                                       "sos: heap 0's pool lacks Map"),
+                       *_heap_adoption("no Transfer",
+                                       "sos: heap 0's pool lacks Transfer"),
+                       *_heap_adoption("no Mint",
+                                       "sos: heap 0's pool lacks Mint"),
+                       *_heap_adoption("no Extend",
+                                       "sos: heap 0's pool lacks Extend"),
+                       *_heap_adoption("process handle without Mint",
+                                       "sos: the Process handle lacks Mint, "
+                                       "so no heap can be adopted"),
+                       *_heap_adoption("process ceiling without Map",
+                                       "sos: the heaps' Process handle lacks "
+                                       "Map (the Process ceiling)"),
+                       *_heap_adoption("no handle for the heaps",
+                                       "sos: no handle for the heaps: this "
+                                       "process is at its quota"),
+                       *_heap_adoption("a record that is not a pool",
+                                       "sos: heap 1's record is not a pool"),
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A slot in range that was never given is a heap with no pool: it
+        # serves nothing and reads `Spent` with a pool of zero bytes, and a
+        # share from it is `NoMemory`, answered without a call.
+        "name": "heap_missing_slot",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_MISSING_SLOT_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x4000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS heapchild: slot 2, never given: a block no, size "
+                       "0, pool 0, reads Spent",
+                       "SOS heapchild: slot 2, never given: a share: this "
+                       "pool has no free range that long",
+                       "SOS heaplaunch: missing slot ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A slot past the table (`Heap<4>`) is a build error: `Heap`'s
+        # assert names the bound.
+        "name": "heap_slot_bound",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_BARE_PKG,
+        "children": [CHILD_HEAP_BOUND_PKG],
+        "expect_build_error": "Heap's slot must be below MAX_HEAPS",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+    {
+        # A block freed through the wrong heap is refused by the heap that
+        # receives it: the data heap's block freed through `Heap<0>` panics
+        # `bad free at` its address.
+        "name": "heap_wrong_free",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_WRONG_FREE_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x4000, 0x4000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={four}",
+                       "SOS heapchild: a block from each heap: yes",
+                       *_panic_fault("{one}", "panic at heap.saw:",
+                                     ": bad free at ", open_end=True),
+                       f"SOS heaplaunch: wrong free ended "
+                       f"status={STATUS_PANICKED}\n",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # With no heap at all (no arena and no pool), every global
+        # allocation is null: a push answers `AllocError`, and an
+        # interpolation, which has no error channel, panics.
+        "name": "heap_zero_spent",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_ZERO_SPENT_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       "SOS heapchild: a push with no heap: allocation of ",
+                       *_panic_fault("{one}", "panic at ",
+                                     ": try! failed: allocation of ",
+                                     open_end=True),
+                       f"SOS heaplaunch: zero spent ended "
+                       f"status={STATUS_PANICKED}\n",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A heapless `main` that returns `Err`: the program entry renders it
+        # through the global allocator, which refuses, so it panics.
+        "name": "heap_main_err",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_BARE_PKG,
+        "children": [CHILD_HEAP_MAIN_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       *_panic_fault("{one}", "panic at ",
+                                     ": try! failed: allocation of ",
+                                     open_end=True),
+                       f"SOS heaplaunch: main err ended "
+                       f"status={STATUS_PANICKED}\n",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A default heap's lock under preemption: `arena_race`'s two workers,
+        # in a child whose only heap is a default heap over a pool, which
+        # grows as they take thousands of blocks under the short-tick kernel.
+        # A heap entered by both at once hands one granule to both. The
+        # kernel's tick narration and the profile are `arena_race`'s.
+        "name": "heap_race",
+        "src": os.path.join(TESTS_DIR, "threads_fast_tick.saw"),
+        "root_pkg": HEAP_RACE_PKG,
+        "children": [CHILD_HEAP_RACE_PKG],
+        "heap_pools": [0x20000],
+        "arches": ["riscv32"],
+        "strip_kernel_lines": True,
+        "expect_out": ["SOS M2: preemptive kernel up on",
+                       "SOS heaprace: two allocators on one default heap, no "
+                       "yields",
+                       "SOS heaprace: blocks disjoint, markers intact",
+                       "SOS heaplaunch: race ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A growth holds what it is asked for. A fresh heap's first block, a
+        # little short of two pages, is served only by a growth that counts
+        # the heap's front (its control block and the first header) as well
+        # as the block; a block aligned to a page, which the heap grows for,
+        # only by one that counts the gap in front of an aligned block. A
+        # request of the whole address space is refused with no growth, the
+        # heap reading `Spent`: the growth's sum would wrap.
+        "name": "heap_sizing",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_SIZING_PKG,
+        "children": [CHILD_HEAP_PKG],
+        "heap_pools": [0x8000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS heapchild: a first block a little short of two "
+                       "pages: yes",
+                       "SOS heapchild: a block aligned to a page, the heap "
+                       "grown for it: yes, aligned yes",
+                       "SOS heapchild: a block of the whole address space: "
+                       "no, the heap grew no, reads Spent",
+                       "SOS heaplaunch: sizing ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
 ]
 
 INSTALL_HINTS = {
@@ -13658,11 +14158,15 @@ def _region_row_specs(case, arch):
     # children the second one's destination is the pool's window, and the
     # table would publish two rows naming the same bytes under two kinds.
     # Widening the layout is a decision for this file to make out loud.
-    if len(children) > 1 and case.get("pool"):
+    if len(children) > 1 and (case.get("pool") or case.get("heap_pools")):
         raise ToolError(
             f"case {case['name']!r}: a case with two children cannot also ask "
             f"for a pool — the second child's destination region and the pool "
             f"share a base (`_process_placement`)")
+    if case.get("pool") and case.get("heap_pools"):
+        raise ToolError(f"case {case['name']!r}: `heap_pools` cuts the pool "
+                        "window into rows of its own, so it cannot also ask "
+                        "for the whole window as `pool`")
     pool_blobs = case.get("pool_blobs", ())
     for i in pool_blobs:
         if i not in children:
@@ -13732,6 +14236,19 @@ def _region_row_specs(case, arch):
                          "kind": "ram",
                          "base": base + OFF_GRAIN_SPAN // 2 + 1,
                          "len": OFF_GRAIN_SPAN // 2 - 0x1000})
+    # `heap_pools`: a pool row per length, cut in order from the pool
+    # window's base, for a launcher to give a child as its heaps' pools.
+    # `MIN_GROWTH` names one growth of a heap at the board's grain.
+    base = arch["pool_base"]
+    for i, length in enumerate(case.get("heap_pools", ())):
+        if length == MIN_GROWTH:
+            length = max(HEAP_MIN_GROWTH, arch["prot_grain"])
+        if base + length > arch["pool_base"] + arch["pool_len"]:
+            raise ToolError(f"case {case['name']!r}: its heap pools pass the "
+                            f"end of the {arch['name']} pool window")
+        rows.append({"what": f"heap pool {i}", "kind": "pool", "base": base,
+                     "len": length})
+        base += length
     if case.get("device"):
         rows.append({"what": "the DEVICE window — the console UART's register "
                              "page",
@@ -17259,6 +17776,11 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #   mapping_grow_gone  a growth refused once its target died
     #   map_room_identity  a room recorded as zero
     #   grow_faults        each fault growing in place raises
+    #   heap_grow ... heap_main_err   the heaps over pools: growth, named
+    #                      heaps, the arena behind the default heap, a dirty
+    #                      or held pool, shares, every refusal and adoption
+    #                      panic, a slot never given or past the table, a
+    #                      wrong free, and no heap at all
     #
     # Every process in them runs its code from the flash instruction window
     # and reads its read-only data through the data window, in place in its
@@ -17287,7 +17809,13 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "pool_from_bad", "memory_extend",
                      "memory_extend_met", "memory_extend_two",
                      "mapping_grow_past", "mapping_grow_gone",
-                     "map_room_identity", "grow_faults"]
+                     "map_room_identity", "grow_faults", "heap_grow",
+                     "heap_named", "heap_fallback", "heap_dirty_pool",
+                     "heap_held_pool", "heap_share", "heap_share_reuse",
+                     "heap_share_only", "heap_share_grain", "heap_refusals",
+                     "heap_rights", "heap_missing_slot", "heap_slot_bound",
+                     "heap_wrong_free", "heap_zero_spent", "heap_main_err",
+                     "heap_sizing"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 

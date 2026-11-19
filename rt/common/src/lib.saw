@@ -12,8 +12,8 @@
 //!   - The runtime proper (second below): the frozen `__saw_rt_*` seams that
 //!     compiled Saw code and std reach (write, write-line, write-error, the
 //!     output lock, last raw code, panic, lock owner, alloc and dealloc, in
-//!     sawlang's `runtime/ABI.md`) plus the arena heap behind the last two.
-//!     The compiler and std make the calls; this module answers them.
+//!     sawlang's `runtime/ABI.md`) plus the heaps behind the last two: the
+//!     arena, and the pool heaps (last below). Compiled code makes the calls.
 //!
 //! All of it rests on per-side hooks and nothing else: where a byte goes, how
 //! a run ends with a text, and (with the arena and the output lock, below)
@@ -28,8 +28,8 @@
 //! kernel's fault line. So a `panic()` in userspace cannot reach a UART.
 //!
 //! Nothing here suspends and nothing names a target. No code here calls an
-//! allocator either: the heap below is the one, over a fixed region it was
-//! given at link time.
+//! allocator either: the heaps below are the ones, over the region the link
+//! gave and the pools a growth hook (below) maps.
 
 /// Hex digits in a machine word on this target: eight on a 32-bit profile,
 /// sixteen on a 64-bit one (spec §5b).
@@ -357,7 +357,7 @@ func rt_panic(ptr: UnsafePointer<Int8>, len: UInt) unsafe -> Never {
 // of the region. A block is the request plus a one-word header, rounded up to
 // a multiple of two words and four words at least.
 
-import sosrt.heap.{UnsafeHeap}
+import sosrt.heap.{UnsafeHeap, front_bytes, block_bytes}
 import std.spinlock.{SpinLock}
 
 // Which thread is asking: the third per-side hook, beside the two above, and
@@ -399,29 +399,36 @@ func rt_lock_owner() -> Int {
     sos_rt_lock_owner()
 }
 
-/// Hand out `size` bytes aligned to `align`, or a null pointer when the arena
-/// holds no such block.
+/// Hand out `size` bytes aligned to `align`: from the default heap, growing
+/// it as it needs, and then from the arena; or a null pointer when neither
+/// holds such a block. Each heap's lock is given back before the next is
+/// taken.
 ///
 /// A refusal is the caller's to handle, as sawlang's allocator ABI has it: the
 /// seam never panics or aborts on one, and std turns the null pointer into
 /// an `AllocError`, each allocating operation all-or-nothing on it.
 @export("__saw_rt_alloc")
 func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
-    let block = borrow var heap = ARENA.lock() {
-        if heap.size == 0 {
-            heap = arena()
+    var block = heap_alloc(DEFAULT_HEAP, size, align)
+    if block == 0 {
+        block = borrow var heap = ARENA.lock() {
+            if heap.size == 0 {
+                heap = arena()
+            }
+            heap.alloc(size, align)
         }
-        heap.alloc(size, align)
     }
     block as UnsafePointer<Int8>
 }
 
 /// Free a block `rt_alloc` returned, or panic. A null `ptr` is no block. The
-/// block's header holds its size, so `size` and `align` are not read.
+/// block's header holds its size, so `size` and `align` are not read. A block
+/// inside the arena's linker bounds goes to the arena, and any other to the
+/// default heap.
 ///
 /// A free the heap can tell is bad (`UnsafeHeap.holds` says which: a block
 /// freed twice while its header still marks it free, a pointer outside the
-/// arena, before its first block or off the granule, one whose preceding word
+/// heap, before its first block or off the granule, one whose preceding word
 /// is no plausible header) panics, naming the address, through the ordinary
 /// panic path, the lock given back first; it ends the process as any panic
 /// does. One it cannot tell (a second free after the block was served again,
@@ -433,12 +440,16 @@ func rt_dealloc(ptr: UnsafePointer<Int8>, size: UInt, align: UInt) unsafe {
     if block == 0 {
         return
     }
-    let held = borrow var heap = ARENA.lock() {
-        let live = heap.holds(block)
-        if live {
-            heap.free(block)
+    let held = if in_arena(block) {
+        borrow var heap = ARENA.lock() {
+            let live = heap.holds(block)
+            if live {
+                heap.free(block)
+            }
+            live
         }
-        live
+    } else {
+        heap_free(DEFAULT_HEAP, block)
     }
     if not held {
         panic("bad free at {}", block)
@@ -552,4 +563,224 @@ func line_put(buf: UInt, fill: UInt, byte: UInt8) unsafe -> UInt {
     }
     UnsafeMemory<UInt8, Normal>(buf &+ at).write(byte)
     at &+ 1
+}
+
+// -----------------------------------------------------------------------------
+// The pool heaps
+// -----------------------------------------------------------------------------
+//
+// Beside the arena a process may have heaps over pools its launcher gives it:
+// the default heap, slot `DEFAULT_HEAP`, which the global allocator asks
+// before the arena, and named heaps a program asks by slot. A heap is adopted
+// with no memory (`adopt_heap`, from the drain of the boot set); its first
+// growth cuts the front of its pool and maps it, and every later growth
+// extends that one allocation and its one row in place, so a heap is one
+// region whatever its size. It only grows, and keeps its memory for the
+// process's life.
+//
+// The kernel ops a growth makes are the fifth per-side hook:
+//
+//     sos_rt_grow(heap, by)    // supplied per side
+//
+// `heap` is the address of the slot's `PoolHeap`, which the hook reads for its
+// handles and writes with what it made or why it refused, and `by` the bytes
+// to grow by. It answers nonzero when the heap's region may grow by them. A
+// process answers with its pool's, its `Memory`'s and its `Mapping`'s ops
+// (`kernel/sysapi/src/rt.saw`); the kernel, which adopts no heap, answers no.
+//
+// Each slot has a lock of its own, so two heaps never contend, and no path
+// holds two locks. A growth runs inside its heap's lock: every op it makes
+// answers at once or ends the process inside the kernel, none suspends, and
+// none allocates, so nothing in the window can panic, allocate or re-enter
+// the lock. The lock is what the table's safety rests on, not a single
+// thread: a program may make threads before it drains its boot set.
+
+extern "C" {
+    func sos_rt_grow(heap: UInt, by: UInt) -> UInt
+}
+
+/// How many pool heaps a process can have: slot 0 is the default heap and
+/// the rest are named. `bootplan`'s `MAX_HEAPS` is held equal to it in `sos`.
+public static HEAP_SLOTS: Int = 4
+
+/// The default heap's slot.
+public static DEFAULT_HEAP: Int = 0
+
+/// The fewest bytes a growth takes, unless the pool's grain is larger: a
+/// program that allocates in small steps then makes no pair of kernel ops per
+/// allocation.
+static MIN_GROWTH: UInt = 1024
+
+/// Why a pool heap last refused to grow: what `Heap.info()` reports.
+public enum GrowRefusal: UInt {
+    /// No growth has been refused.
+    case Never = 0,
+    /// The pool has no bytes after the heap's front: the back side or the
+    /// pool's end is there, or the heap has no pool.
+    case Spent = 1,
+    /// A quota row refused an object the growth makes; `PoolHeap.quota` names
+    /// the kind.
+    case Quota = 2,
+    /// The kernel had no room for an object or for the row's addresses.
+    case NoResource = 3,
+    /// A handle the growth made lacks a right the heap spends.
+    case Rights = 4,
+}
+
+/// A pool heap: its region, the handles it grows through, and why it last
+/// refused. Zero is a slot with no pool.
+///
+/// `heap.size` is zero until the first growth and then the bytes the row
+/// grants. `memory` and `mapping` are `NO_HANDLE` (zero) until the first
+/// growth makes them; `base` is where the row landed.
+public struct PoolHeap {
+    heap: UnsafeHeap,
+    /// The pool's handle, adopted.
+    pool: UInt,
+    /// A sibling of the process's own handle, through which the row is
+    /// mapped.
+    process: UInt,
+    memory: UInt,
+    mapping: UInt,
+    base: UInt,
+    /// The pool's free bytes at adoption, which size the class table.
+    total: UInt,
+    /// The pool's grain, the unit a growth is made of.
+    grain: UInt,
+    adopted: Bool,
+    /// Set by a refusal that leaves the heap unable to grow again.
+    spent: Bool,
+    refusal: GrowRefusal,
+    /// The `QuotaKind` number a `Quota` refusal names.
+    quota: UInt,
+}
+
+/// One lock per slot.
+static HEAPS: [SpinLock<PoolHeap>; HEAP_SLOTS]
+
+/// Whether each slot has a pool, set once its heap is installed and never
+/// cleared: the global allocator asks a process with no default heap's arena
+/// without taking a lock it would find empty.
+static ADOPTED: [Atomic<Int>; HEAP_SLOTS]
+
+/// What `Heap.info()` reads of a slot.
+public struct HeapState {
+    size: UInt,
+    total: UInt,
+    adopted: Bool,
+    refusal: GrowRefusal,
+    quota: UInt,
+}
+
+/// Whether `block` lies inside the arena's linker bounds.
+func in_arena(block: UInt) unsafe -> Bool {
+    let base = sos_arena_base()
+    block >= base && block &- base < sos_arena_size()
+}
+
+/// Make `slot` the heap over `pool`, mapped through `process`: adoption's
+/// last step. `total` is the pool's free bytes and `grain` its grain. It maps
+/// nothing: the first allocation the heap cannot serve grows it.
+public func adopt_heap(slot: Int, pool: UInt, process: UInt, total: UInt,
+                       grain: UInt) {
+    borrow var h = HEAPS[slot].lock() {
+        h.pool = pool
+        h.process = process
+        h.total = total
+        h.grain = grain
+        h.adopted = true
+    }
+    ADOPTED[slot].store(1)
+}
+
+/// `size` bytes aligned to `align` from `slot`'s heap, growing it when it
+/// cannot serve them, or 0. A slot with no pool answers 0 at once, without
+/// its lock.
+public func heap_alloc(slot: Int, size: UInt, align: UInt) unsafe -> UInt {
+    if ADOPTED[slot].load() == 0 {
+        return 0
+    }
+    borrow var h = HEAPS[slot].lock() {
+        if h.adopted { serve(&var h, size, align) } else { 0 }
+    }
+}
+
+/// Free `block` to `slot`'s heap when the heap holds it as a live block, and
+/// answer whether it did.
+public func heap_free(slot: Int, block: UInt) unsafe -> Bool {
+    borrow var h = HEAPS[slot].lock() {
+        let live = h.heap.size != 0 && h.heap.holds(block)
+        if live {
+            h.heap.free(block)
+        }
+        live
+    }
+}
+
+/// `slot`'s size, adoption total and last refusal.
+public func heap_state(slot: Int) unsafe -> HeapState {
+    borrow var h = HEAPS[slot].lock() {
+        HeapState(size: h.heap.size, total: h.total, adopted: h.adopted,
+                  refusal: h.refusal, quota: h.quota)
+    }
+}
+
+/// `slot`'s pool handle and grain, for a share. The pool's word is written
+/// once, at adoption, and the share's allocation is made with the lock given
+/// back. A slot with no pool answers `NO_HANDLE`, zero.
+public func heap_pool(slot: Int) unsafe -> (UInt, UInt) {
+    borrow var h = HEAPS[slot].lock() {
+        (h.pool, h.grain)
+    }
+}
+
+/// Serve from `h`, growing it once when it cannot.
+func serve(h: &var PoolHeap, size: UInt, align: UInt) unsafe -> UInt {
+    if h.heap.size != 0 {
+        let block = h.heap.alloc(size, align)
+        if block != 0 {
+            return block
+        }
+    }
+    if not grow(&var h, size, align) {
+        return 0
+    }
+    h.heap.alloc(size, align)
+}
+
+/// Grow `h` by enough to serve `size` bytes aligned to `align`: the block,
+/// and the heap's front the first time, rounded up to the pool's grain, and
+/// at least `MIN_GROWTH` or one grain. The new bytes are a free block after
+/// the last one, merged with it when it is free.
+func grow(h: &var PoolHeap, size: UInt, align: UInt) unsafe -> Bool {
+    if h.spent {
+        return false
+    }
+    let block = block_bytes(size, align)
+    if block == 0 {
+        h.refusal = GrowRefusal.Spent
+        return false
+    }
+    let first = h.heap.size == 0
+    var by = block
+    if first {
+        by = by &+ front_bytes(h.total)
+    }
+    by = (by &+ h.grain &- 1) & ~(h.grain &- 1)
+    let least = if h.grain > MIN_GROWTH { h.grain } else { MIN_GROWTH }
+    if by < least {
+        by = least
+    }
+    if sos_rt_grow(((&var h) as UnsafePointer<PoolHeap>) as UInt, by) == 0 {
+        return false
+    }
+    if first {
+        // The heap trusts its control block's first word to read zero until
+        // it makes the block, and a pool's bytes hold whatever they last held.
+        UnsafeMemory<UInt, Normal>(h.base).write(0)
+        h.heap = UnsafeHeap(base: h.base, size: by, largest: h.total)
+    } else {
+        h.heap.extend(by: by)
+    }
+    true
 }

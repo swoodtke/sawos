@@ -484,3 +484,37 @@ extension UnsafeHeap {
         self.insert(start, total)
     }
 }
+
+/// The bytes a heap whose table is sized for `largest` spends before its first
+/// block's payload and after its last block: the control block, the first
+/// block's header and the granule's slack, and the sentinel. A first growth
+/// that adds a block's bytes to these holds the block.
+public func front_bytes(largest: UInt) -> UInt {
+    let top = if largest < min_block() { min_block() } else { largest }
+    let classes = shr(class_of(top), SL_LOG2) &+ 1
+    let words = CONTROL_FIXED &+ classes &* (SL_COUNT &+ 1)
+    (words &+ 4) &* word()
+}
+
+/// The bytes a free block must hold for `alloc` to serve `size` bytes aligned
+/// to `align` from it: the block itself, and the room for an alignment's gap.
+/// Zero for a request no region of this word could hold, past a quarter of
+/// the address space, so the sums made with it cannot wrap.
+public func block_bytes(size: UInt, align: UInt) -> UInt {
+    let limit = shl(1, word_bits() &- 2)
+    if size >= limit || align >= limit {
+        return 0
+    }
+    var need = round_up(size &+ word(), grain())
+    if need < min_block() {
+        need = min_block()
+    }
+    if align > grain() || (align != 0 && grain() % align != 0) {
+        var step = align
+        while step < grain() || (step & (grain() &- 1)) != 0 {
+            step = step &+ step
+        }
+        need = need &+ step &+ grain()
+    }
+    need
+}
