@@ -52,7 +52,10 @@
 //! declaration's `system` record names no `rights` (`sosimage.declaration`),
 //! by the same names and held to the same ceiling, `child_rights()`: an image
 //! narrows the launch convention's four and never widens them. An empty list
-//! gives such a process none; with no `[system]` it keeps the four.
+//! gives such a process none. With no `rights` in `[system]` it keeps the
+//! four, or in an image that names a console the three without `debug`
+//! (`console_rights()`), since a program written with `main` prints through
+//! the console there.
 //!
 //! `console` names the image's console, a stock root's: a serve record of
 //! `uartproto` (`console_protocol()`), in the grammar `clients` uses. Every
@@ -86,8 +89,8 @@
 import toml.{TomlKind, TomlPosition, TomlTable}
 import sosimage.board.{Board, LimitsSpec, NamedCount, RefUse, Window, expect_table,
                        quota_keys, read_counts, require_table}
-import sosimage.declaration.{BootRecord, Declaration, RecordKind, child_rights, kind_word,
-                             read_rights}
+import sosimage.declaration.{BootRecord, Declaration, RecordKind, child_rights,
+                             console_rights, kind_word, read_rights}
 import sosimage.failure.{BuildError}
 import sosimage.hex.{hex}
 import sosimage.layout.{choose_range}
@@ -186,7 +189,8 @@ public struct ImageFile {
     root_package: String
     root_at: TomlPosition
     /// The System rights a stock root's process keeps when its declaration
-    /// names none: `[system]`'s `rights`, else `child_rights()`.
+    /// names none: `[system]`'s `rights`, else `console_rights()` in an image
+    /// that names a console and `child_rights()` in one that does not.
     system_rights: Vector<String>
     setup: Vector<SetupEntry>
     processes: Vector<ProcessEntry>
@@ -296,7 +300,7 @@ extension ImageFile {
                            "`console` in [image] is the stock root's: a hand-written root gives its own records, and its description says what it gives")
         }
 
-        var system_rights = child_rights()
+        var system_rights = if console != None { console_rights() } else { child_rights() }
         try expect_table(&root, "system", file)
         if let t = root.table("system") {
             if not stock {

@@ -55,8 +55,12 @@ rights = ["process-self", "clock-get", "transfer"]
 ```
 
 With no `[system]`, the default is all four rights a process may hold
-(`debug`, `process-self`, `clock-get`, `transfer`); a process without
-`debug` cannot print.
+(`debug`, `process-self`, `clock-get`, `transfer`), or in an image that
+names a console (`[image] console = "PROCESS.RECORD"`) the three without
+`debug`. There a process written with `main` prints through the console's
+driver; elsewhere a process without `debug` prints nothing. A process that
+writes through the kernel's debug print itself, as a console's driver does,
+names `debug` in its own `rights`.
 
 `tools/sawos.py` needs Python 3.11 or later. It links `.sawos` to the sawos
 tree and runs that tree's `tools/product.py`, which says what each command

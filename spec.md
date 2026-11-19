@@ -5022,10 +5022,14 @@ reserved.
   record names (`rights`, by `SystemRight`'s names: `debug`, `process-self`,
   `clock-get`, `transfer`), and keeps the child's Process handle. A record
   that names none keeps the image's default, the `rights` of its image
-  description's `[system]`, and all four when the image states none; an
-  empty list, in either place, keeps none. Those four are the ceiling: every
-  right a declaration or an image may name, so an image narrows the default
-  and never widens it, and the image builder refuses any other right by
+  description's `[system]`. When the image states none, that is all four,
+  or in an image that names a console (below) `process-self`, `clock-get`
+  and `transfer`: there a program written with `main` prints through the
+  console, so `debug` is for a process that writes through the debug print,
+  the console's driver among them, and its record names it. An empty list,
+  in either place, keeps none. Those four are the ceiling: every right a
+  declaration or an image may name, so an image narrows the default and
+  never widens it, and the image builder refuses any other right by
   name. `Shutdown`, process creation and the rest are the launcher's own to
   give, never a declaration's or an image's. A child that knows its records
   by tag drains them all at once (`sos.BootSet`) and takes each by its tag.

@@ -2217,6 +2217,29 @@ def _console_print_cases(files):
             "expect_clean_exit": True,
         },
         {
+            # A client in an image that names its console, whose declaration
+            # names no System rights (`tests/console-default`): it keeps the
+            # image's default, which there is the launch convention's four
+            # less `Debug`, and prints each right of its System by name. The
+            # line, longer than a piece, still reaches the console's driver,
+            # before the kernel's exit line, as the start-up's `Sync` orders.
+            "name": "console_default",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": files("console_default"),
+            "expect_out": [
+                "{banner}",
+                "SOS: console handover\n"
+                + _stock_system("consoledefault",
+                                held=("Transfer", "ClockGet", "ProcessSelf"))
+                + "\nSOS: process exit: code={zero} process={two}",
+                "root: default ended status=65536",
+                # The line's two pieces and the `Sync`.
+                "SOS console drv: served=3 refused=0 unsupported=0 "
+                "printed=209",
+                "root: console ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
             # A program written with `main` in an image that names no
             # console, whose System holds no `Debug`
             # (`tests/console-silent`): its lines, one past a piece and one
@@ -2234,10 +2257,10 @@ def _console_print_cases(files):
         },
         {
             # A console driver that is gone before its client prints
-            # (`tests/images/console_gone*.toml`): the image's `[system]`
-            # leaves out `Debug`, so `svc-console` ends at once with its own
-            # code, before it serves anyone, and with no tick it has ended
-            # before the client (`tests/console-gone`) runs. Each of the
+            # (`tests/images/console_gone*.toml`): the console's driver
+            # (`tests/console-gone-driver`) ends at once with its own code,
+            # before it serves anyone, and with no tick it has ended before
+            # the client (`tests/console-gone`) runs. Each of the
             # client's lines is posted to a connection with no server end,
             # answered `PeerClosed` and dropped, with no fault: nothing lies
             # between the driver's teardown and the client's reports, which

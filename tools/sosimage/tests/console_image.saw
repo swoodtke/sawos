@@ -1,7 +1,8 @@
 // An image that names its console (`[image] console`): the key read, each
 // refusal of it, the record the plan appends to every process but the
 // console's server, the floor it raises, the checks that floor is held to,
-// and root's arena with the record counted.
+// the System rights a record naming none keeps, and root's arena with the
+// record counted.
 
 import bootplan.{CONSOLE_TAG, RECORD_WORDS}
 import sosimage.board.{Board}
@@ -96,6 +97,15 @@ func logger() -> Declaration {
 func beat() -> Declaration {
     decl(["format = 1", "arena = 0x1000",
           "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+          "[quota]", "handles = 2"],
+         "beat/process.toml")
+}
+
+// `beat` with a System record that names its own rights.
+func beat_named() -> Declaration {
+    decl(["format = 1", "arena = 0x1000",
+          "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+          "rights = [\"clock-get\"]",
           "[quota]", "handles = 2"],
          "beat/process.toml")
 }
@@ -233,6 +243,20 @@ func record_is(plan: &ImagePlan, child: Int, index: Int, tag: Int, source: Sourc
     }
 }
 
+// Child `child`'s System rights, by name.
+func rights_of(plan: &ImagePlan, child: Int) -> String {
+    var out = ""
+    borrow let c = plan.children[child] {
+        out = c.rights.join(" | ")
+    }
+    move out
+}
+
+// `text` with `[system]` stating `rights` after the stock root's line.
+func with_system(text: String, rights: String) -> String {
+    text.replace("package = \"stock\"\n", "package = \"stock\"\n[system]\n{rights}")
+}
+
 func records_and_floor(plan: &ImagePlan, child: Int, records: Int, floor: Int) {
     borrow let c = plan.children[child] {
         if c.records.len() != records || c.floor != floor {
@@ -318,6 +342,35 @@ func main() {
     assert(module.contains("    var records = try! Vector<Record>(capacity: 2)\n    try! records.push(Record(tag: 1, source: Source.System, from: 0x0, offset: 0x0, len: 0x0))\n    try! records.push(Record(tag: 4294967040, source: Source.Inlet, from: 0x0, offset: 0x0, len: 0x0))"),
            "beat's records in the module")
 
+    // The System rights a record naming none keeps: in an image that names a
+    // console the launch convention's four less `debug`, the console's
+    // server included, and in one that names none the four.
+    let three = "process-self | clock-get | transfer"
+    let four = "debug | process-self | clock-get | transfer"
+    expect(named.system_rights.join(" | "), three, "a console image's default")
+    expect(plain_image.system_rights.join(" | "), four, "no console: the four")
+    expect(rights_of(&plan, 0), three, "the console's server, naming none")
+    expect(rights_of(&plan, 3), three, "beat in a console image")
+    expect(rights_of(&without, 3), four, "beat with no console")
+    // `[system]` with no `rights` states none, so the console's default holds.
+    let bare = planned(with_system(join(&image_lines()), ""))
+    expect(rights_of(&bare, 3), three, "a bare [system] in a console image")
+    // `[system]`'s `rights` is the default, with a console or without.
+    let stated_text = with_system(join(&image_lines()), "rights = [\"debug\", \"clock-get\"]\n")
+    let stated = planned(stated_text)
+    expect(rights_of(&stated, 3), "debug | clock-get", "[system] over the console's default")
+    let stated_plain = planned(with_system(plain_text, "rights = [\"debug\", \"clock-get\"]\n"))
+    expect(rights_of(&stated_plain, 3), "debug | clock-get", "[system] with no console")
+    // A record's own `rights` is what it keeps, over either default.
+    var own = decls()
+    own[3] = beat_named()
+    let own_console = planned_with(join(&image_lines()), &own)
+    expect(rights_of(&own_console, 3), "clock-get", "beat's own over the console's default")
+    let own_stated = planned_with(stated_text, &own)
+    expect(rights_of(&own_stated, 3), "clock-get", "beat's own over [system]")
+    let own_plain = planned_with(plain_text, &own)
+    expect(rights_of(&own_plain, 3), "clock-get", "beat's own with no console")
+
     // Held to the raised floor: beat's declared row, at its declaration's
     // floor, is short in a console image and enough without one.
     expect(checked(&plan, 32, 16),
@@ -360,12 +413,15 @@ func main() {
 
     // Root's arena counts the record: its heap serves each child's records
     // in one block, a record's `RECORD_WORDS` longer for each process given
-    // the console's.
+    // the console's. The image it is held to names no console and states the
+    // console's default rights, so the records are all that differ.
+    let same_rights = planned(with_system(plain_text,
+                                          "rights = [\"process-self\", \"clock-get\", \"transfer\"]\n"))
     var grown = 0
     var c = 0
     while c < plan.children.len() {
         borrow let with_console = plan.children[c] {
-            borrow let plain = without.children[c] {
+            borrow let plain = same_rights.children[c] {
                 grown = grown + heap_block(with_console.records.len(), RECORD_WORDS, 4) -
                         heap_block(plain.records.len(), RECORD_WORDS, 4)
             }
@@ -373,6 +429,6 @@ func main() {
         c = c + 1
     }
     assert(grown > 0, "a block grew")
-    assert(root_blocks(&plan, 4) == root_blocks(&without, 4) + grown, "root's blocks")
-    assert(root_arena(&plan, 4) >= root_arena(&without, 4), "root's arena")
+    assert(root_blocks(&plan, 4) == root_blocks(&same_rights, 4) + grown, "root's blocks")
+    assert(root_arena(&plan, 4) >= root_arena(&same_rights, 4), "root's arena")
 }
