@@ -1,0 +1,43 @@
+// The read-back test's stop, 0x60 (../../hal/xtensa-esp32s3/ABI.md §17), on
+// the `esp32s3-r8` board, through the shipping bring-up's own two halves:
+// the whole call (S0 to S12, `psram_map_up`) on the board's description at
+// the image's clock key; then two MMU entries pointed at other pages, one
+// in each half of the PSRAM, so the test's words in each are written over
+// that page's: entry 320 (0x3D40_0000) at page 0 (0x3D00_0000), and entry
+// 383 (0x3D7F_0000), the last, at page 126 (0x3D7E_0000); then the test and
+// its line (S14, `psram_test_up`). Pages 0 and 126 read back the aliasing
+// pages' words, and the test names the first and counts both:
+//
+//   SOS-S3: psram stop: read-back at 0x3d000000 read ..., wrote ...
+//   (... of ... words wrong)
+//   SOS-S3: halt fail code=0x00000060
+//
+// A test that passed would print the PSRAM's success line and
+// `SOS psram: read-back passed`, and halt with a pass.
+
+import kcore.{console}
+import hal
+
+/// MMU entries 320 and 383 (IDF soc.h DR_REG_MMU_TABLE, four bytes an
+/// entry), and the PSRAM's pages 0 and 126 as an entry names them
+/// (SOC_MMU_ACCESS_SPIRAM, bit 15).
+static ENTRY_320: UInt = 0x600C_5000 + 4 * 320
+static ENTRY_383: UInt = 0x600C_5000 + 4 * 383
+static PSRAM_PAGE_0: UInt32 = 0x8000
+static PSRAM_PAGE_126: UInt32 = 0x8000 + 126
+
+@export("kmain")
+func kmain() unsafe {
+    hal.clock_init()
+    var stop = hal.psram_map_up(hal.PSRAM_DESCRIBED_BYTES, hal.psram_clock())
+    if stop == 0 {
+        UnsafeMemory<UInt32, Device>(ENTRY_320).write(PSRAM_PAGE_0)
+        UnsafeMemory<UInt32, Device>(ENTRY_383).write(PSRAM_PAGE_126)
+        stop = hal.psram_test_up(hal.PSRAM_DESCRIBED_BYTES)
+    }
+    if stop != 0 {
+        hal.exit_fail(stop)
+    }
+    console().write_str("SOS psram: read-back passed\n")
+    hal.exit_pass()
+}

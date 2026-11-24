@@ -277,6 +277,8 @@ public enum ConfigError {
     case NotAGpio(pin: UInt8),
     /// One of 26 to 32, the SPI bus the code runs from.
     case FlashPin(pin: UInt8),
+    /// One of 33 to 37, the octal PSRAM's D4 to D7 and DQS.
+    case PsramPin(pin: UInt8),
     /// 43 or 44, UART0's pads: the kernel's console.
     case ConsolePin(pin: UInt8),
     /// 19 or 20, the USB-Serial-JTAG's D- and D+.
@@ -323,6 +325,7 @@ extension ConfigError {
         match self {
             case NotAGpio(pin) -> "pin {pin} is not a GPIO of the part",
             case FlashPin(pin) -> "pin {pin} is held by the chip (the SPI flash bus)",
+            case PsramPin(pin) -> "pin {pin} is held by the chip (the octal PSRAM's bus)",
             case ConsolePin(pin) -> "pin {pin} is held by the chip (the console)",
             case UsbPin(pin) -> "pin {pin} is held by the chip (the USB-Serial-JTAG)",
             case PinTwice(pin) -> "pin {pin} is named twice",
@@ -344,15 +347,25 @@ extension ConfigError {
 }
 
 /// Refuses `pin` unless it is a GPIO of the part that no S3 image holds for
-/// the chip: the SPI flash bus (26 to 32), the console's pads (43, 44) and
-/// the USB-Serial-JTAG's (19, 20), whose pad enable a driver here does not
-/// write. Every GPIO of the part can drive.
+/// the chip: the SPI flash bus (26 to 32), the octal PSRAM's own pads (33 to
+/// 37), the console's pads (43, 44) and the USB-Serial-JTAG's (19, 20),
+/// whose pad enable a driver here does not write. Every GPIO of the part can
+/// drive.
+///
+/// 33 to 37 are refused on every board. A part with octal PSRAM in its
+/// package, as the N8R8 every board here runs on, wires them to the RAM chip
+/// whether or not a board brings it up, and the `esp32s3-r8` board's
+/// `memory_init` takes them for it (hal/xtensa-esp32s3/ABI.md §16c, S1); a
+/// driver that set one would re-mux a PSRAM data pad under the cache.
 public func check_pin(pin: UInt8) -> Result<Void, ConfigError> {
     if pin > 48 || (pin >= 22 && pin <= 25) {
         return ConfigError.NotAGpio(pin: pin)
     }
     if pin >= 26 && pin <= 32 {
         return ConfigError.FlashPin(pin: pin)
+    }
+    if pin >= 33 && pin <= 37 {
+        return ConfigError.PsramPin(pin: pin)
     }
     if pin == 43 || pin == 44 {
         return ConfigError.ConsolePin(pin: pin)

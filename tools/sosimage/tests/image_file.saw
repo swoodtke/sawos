@@ -46,6 +46,7 @@ func board_text() -> String {
         "speed = \"fast\"",
         "base = 0x3FCB_0000",
         "len = 0x4_0000",
+        "atomics = true",
         "[ram.psram]",
         "use = \"process\"",
         "speed = \"slow\"",
@@ -501,13 +502,20 @@ func main() {
     expect_bind_refusal(with_line(logger_lines(), 11, "ram = \"psram\"\ndevice = \{ uart = \"UART1\" \}"), &ldecls,
                         "i.toml: line 9, column 1: the process gps declares ram = \"fast\" and is placed in psram, a slow range")
 
+    // A process placed in a range without word atomics: its region holds
+    // the runtime's own atomic words. An ESP32-S3's PSRAM states none until a
+    // part has shown them there.
+    expect_bind_refusal(with_line(logger_lines(), 20, "package = \"logger\"\nram = \"psram\""), &ldecls,
+                        "i.toml: line 19, column 1: the process logger is placed in psram, which does not state `atomics = true` on the board esp32s3: a process's region holds the runtime's atomic words, so it lies where word atomics work")
+
     // Placement: the range an image names, else the board's default, and a
     // fast range for a process that declares `ram = "fast"` on a board whose
     // default is slow; with no fast process range it is refused.
     let on_default = try! ImageFile.parse(join(&logger_lines()), "i.toml", &b, 4)
     let placed_default = try! bind(&on_default, &b, &ldecls, 4)
     assert(placed_default.ranges.join(" ").equals("sram sram sram"), "the default, fast")
-    let slow_default = board_with("process = \"sram\"", "process = \"psram\"")
+    let slow_default = board_with("len = 0x80_0000\n[ram.default]\nprocess = \"sram\"",
+                                  "len = 0x80_0000\natomics = true\n[ram.default]\nprocess = \"psram\"")
     let on_slow = try! ImageFile.parse(join(&logger_lines()), "i.toml", &slow_default, 4)
     let placed_fast = try! bind(&on_slow, &slow_default, &ldecls, 4)
     assert(placed_fast.ranges.join(" ").equals("sram sram psram"),

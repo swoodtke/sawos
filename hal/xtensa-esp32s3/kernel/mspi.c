@@ -21,14 +21,16 @@
 //
 // Every register address and value is cited where it is defined, from
 // ESP-IDF v5.4.1 ("IDF", components/ of that tag) or from the mask ROM's
-// disassembly (`esp32s3_rev0_rom.elf`, "ROM"). The step names (S0.1 to S10)
-// and the stop codes (0x50 to 0x5D, 0x61 and 0x62) are ../ABI.md §16's.
+// disassembly (`esp32s3_rev0_rom.elf`, "ROM"). The step names (S0.1 to S12)
+// and the stop codes (0x50 to 0x5F, 0x61 and 0x62) are ../ABI.md §16's and
+// §17's.
 //
 // Nothing here writes non-volatile state: the eFuse is only read
 // (EFUSE_RD_*), no RTC register is written, no command is ever sent with chip
 // select 0 enabled, and the commands sent to the RAM chip read its mode
 // registers and its array and write its mode register 0, which it loses at
-// power-off.
+// power-off. The cache's map of the PSRAM (S12) is MMU entries from 256 up,
+// which a chip reset gives back to the flash.
 //
 // Built call0 with no FPU like the rest of the kernel (`-windowed`, `-fp`).
 //
@@ -87,12 +89,14 @@ struct sos_psram_record {
     u32 mr01_after;         // S9.3
     u32 mr_cycles;          // CCOUNT across S8.1's command
     u32 cycles;             // `sos_psram_time_reads`' answer
+    u32 mapped;             // S12: the MMU entries written and read back
 };
 
 // The steps, as `last_step` names them and as the fault record names a read:
-// 0xMN is step SM.N (N in hex: S7.10 is 0x7A), 0xM0 step SM. The reads S7.2
-// to S7.6 make to change a word are STEP_S7's; STEP_S7_PROBE is the
-// measurement's one read of SPI_MEM_CMD(1) between S7.9's start and its wait.
+// 0xMN is step SM.N (M and N in hex: S7.10 is 0x7A, S12.2 is 0xC2), 0xM0
+// step SM. The reads S7.2 to S7.6 make to change a word are STEP_S7's;
+// STEP_S7_PROBE is the measurement's one read of SPI_MEM_CMD(1) between
+// S7.9's start and its wait.
 #define STEP_S0_1   0x01u
 #define STEP_S0_2   0x02u
 #define STEP_S0_3   0x03u
@@ -110,6 +114,10 @@ struct sos_psram_record {
 #define STEP_S7_PROBE 0x7Bu
 #define STEP_S8     0x80u
 #define STEP_S9     0x90u
+#define STEP_S11    0xB0u
+#define STEP_S12    0xC0u
+#define STEP_S12_2  0xC2u
+#define STEP_S12_3  0xC3u
 
 // The stops, in the order the steps make them (../ABI.md §16c).
 #define STOP_NOT_DRAM       0x50u
@@ -126,6 +134,8 @@ struct sos_psram_record {
 #define STOP_DIE            0x5Bu
 #define STOP_DENSITY        0x5Cu
 #define STOP_MR0            0x5Du
+#define STOP_MMU            0x5Eu
+#define STOP_BUS_OFF        0x5Fu
 #define STOP_MEASUREMENT    0x61u
 #define STOP_STILL_BUSY     0x62u
 
@@ -222,10 +232,15 @@ struct sos_psram_record {
 #define SPI_MISO_DLEN       0x28u
 #define SPI_MISC            0x34u
 #define SPI_CACHE_FCTRL     0x3Cu
+#define SPI_CACHE_SCTRL     0x40u
+#define SPI_SRAM_CMD        0x44u
+#define SPI_SRAM_DRD_CMD    0x48u
+#define SPI_SRAM_DWR_CMD    0x4Cu
 #define SPI_SRAM_CLK        0x50u
 #define SPI_W0              0x58u
 #define SPI_SMEM_AC         0xDCu
 #define SPI_DDR             0xE0u
+#define SPI_SMEM_DDR        0xE4u
 
 // SPI_MEM_CMD: SPI_MEM_USR (bit 18) starts a user command and reads back 0
 // when it has finished. The bits beside it are the controller's built-in
@@ -287,8 +302,10 @@ struct sos_psram_record {
 #define CMD_REG_READ        0x4040u
 #define CMD_REG_WRITE       0xC0C0u
 #define CMD_SYNC_READ       0x0000u
+#define CMD_SYNC_WRITE      0x8080u
 #define REG_DUMMY           8u
 #define ARRAY_DUMMY         18u
+#define ARRAY_WRITE_DUMMY   8u
 #define MR1_VENDOR_MASK     0x1Fu
 #define MR2_GOOD_DIE        0x80u
 #define MR2_DENSITY_MASK    0x07u
@@ -298,6 +315,66 @@ struct sos_psram_record {
 #define MR0_KEEP            0xC0u
 #define MR0_MODE            0x28u
 #define MR0_MODE_MASK       0x3Fu
+
+// S11, SPI0's PSRAM side, which the cache's fills and write-backs to chip
+// select 1 use (IDF `s_config_psram_spi_phases`; spi_mem_reg.h). Every word
+// is read, its fields changed, and written back:
+//   SPI_MEM_CACHE_SCTRL(0): CACHE_USR_SCMD_4BYTE [0], USR_WR_SRAM_DUMMY [3],
+//     USR_RD_SRAM_DUMMY [4], CACHE_SRAM_USR_RCMD [5], CACHE_SRAM_USR_WCMD
+//     [20] and SRAM_OCT [21] set; SRAM_RDUMMY_CYCLELEN [11:6] the array
+//     read's dummy less one (OCT_PSRAM_RD_DUMMY_BITLEN, 2 x (10 - 1)),
+//     SRAM_ADDR_BITLEN [19:14] 31 (OCT_PSRAM_ADDR_BITLEN 32, less one) and
+//     SRAM_WDUMMY_CYCLELEN [27:22] the array write's dummy less one
+//     (OCT_PSRAM_WR_DUMMY_BITLEN, 2 x (5 - 1));
+//   SPI_MEM_SRAM_DRD_CMD(0) and SPI_MEM_SRAM_DWR_CMD(0): the command's bit
+//     length less one [31:28], 15, and the command [15:0],
+//     OPI_PSRAM_SYNC_READ and OPI_PSRAM_SYNC_WRITE;
+//   SPI_MEM_SPI_SMEM_DDR(0): SMEM_DDR_EN [0] and SMEM_VAR_DUMMY [1] set,
+//     SMEM_DDR_RDAT_SWP [2] and SMEM_DDR_WDAT_SWP [3] clear;
+//   SPI_MEM_SRAM_CMD(0): SDIN_OCT [18], SDOUT_OCT [19], SADDR_OCT [20],
+//     SCMD_OCT [21] and SDUMMY_OUT [22] set.
+// None of SPI0's flash-side words is written.
+#define SCTRL_SET           ((1u << 0) | (1u << 3) | (1u << 4) | (1u << 5) \
+                             | (1u << 20) | (1u << 21))
+#define SCTRL_FIELDS        ((0x3Fu << 6) | (0x3Fu << 14) | (0x3Fu << 22))
+#define SCTRL_LENGTHS       (((ARRAY_DUMMY - 1u) << 6) | (31u << 14) \
+                             | ((ARRAY_WRITE_DUMMY - 1u) << 22))
+#define SRAM_CMD_FIELDS     ((0xFu << 28) | 0xFFFFu)
+#define SRAM_CMD_16         (15u << 28)
+#define SMEM_DDR_SET        ((1u << 1) | (1u << 0))
+#define SMEM_DDR_CLEAR      ((1u << 3) | (1u << 2))
+#define SRAM_CMD_OCTAL      ((1u << 18) | (1u << 19) | (1u << 20) \
+                             | (1u << 21) | (1u << 22))
+
+// S12, the cache's map (IDF soc.h DR_REG_MMU_TABLE; ext_mem_defs.h;
+// hal/esp32s3/include/hal/mmu_ll.h `mmu_ll_write_entry`): one table of 512
+// words serves both buses, entry n naming the 64 KiB page at data-bus
+// 0x3C00_0000 + n x 64 KiB and instruction-bus 0x4200_0000 + n x 64 KiB. An
+// entry is a page number, with SOC_MMU_ACCESS_SPIRAM (bit 15) for a page of
+// the PSRAM and SOC_MMU_INVALID (bit 14) clear for a valid one. The entries
+// below 256 are the flash's, which the kernel runs from; the PSRAM's pages
+// go in from entry 256, data-bus 0x3D00_0000, one for each 64 KiB of the
+// described density: `MMU_PAGES_PER_DENSITY << (density >> 1)`, 64 entries
+// for MR2's code 1 (4 MiB), 128 for 3 (8 MiB) and 256 for 5 (16 MiB), the
+// last filling the table. No entry past the table is written: a description
+// larger than what is left there maps to the table's end, and the read-back
+// test over the described size then faults at the first address the map
+// does not reach.
+#define MMU_TABLE           0x600C5000u
+#define MMU_ENTRIES         512u
+#define MMU_PSRAM_FIRST     256u
+#define MMU_ACCESS_SPIRAM   (1u << 15)
+#define MMU_PAGES_PER_DENSITY 64u
+
+// EXTMEM_DCACHE_CTRL1_REG: a bit set shuts one core's data bus to the cache,
+// and nothing the cache maps is reachable from that core. Which bit is core
+// 0's, the core the kernel runs on, the sources disagree: extmem_reg.h names
+// bit 0 DCACHE_SHUT_CORE0_BUS and bit 1 DCACHE_SHUT_CORE1_BUS, and
+// hal/esp32s3/include/hal/cache_ll.h's `cache_ll_l1_enable_bus` clears bit
+// 1 for cache id 0 and bit 0 for cache id 1. So both bits are held clear.
+// Read only.
+#define DCACHE_CTRL1        0x600C4004u
+#define DCACHE_SHUT_BUS     3u
 
 // Every wait reads SPI_MEM_CMD(1) at most this many times (../ABI.md §16b
 // says why the number).
@@ -746,6 +823,53 @@ static IRAM u32 identify_and_set(struct sos_psram_expect *e,
     return 0;
 }
 
+// S11: SPI0's PSRAM side, read-modify-write. No PSRAM page is mapped yet, so
+// no access reaches chip select 1 while these change.
+static IRAM void configure_spi0(void) {
+    u32 sctrl = rd(STEP_S11, SPI0 + SPI_CACHE_SCTRL);
+    wr(SPI0 + SPI_CACHE_SCTRL,
+       (sctrl & ~SCTRL_FIELDS) | SCTRL_SET | SCTRL_LENGTHS);
+    u32 drd = rd(STEP_S11, SPI0 + SPI_SRAM_DRD_CMD);
+    wr(SPI0 + SPI_SRAM_DRD_CMD,
+       (drd & ~SRAM_CMD_FIELDS) | SRAM_CMD_16 | CMD_SYNC_READ);
+    u32 dwr = rd(STEP_S11, SPI0 + SPI_SRAM_DWR_CMD);
+    wr(SPI0 + SPI_SRAM_DWR_CMD,
+       (dwr & ~SRAM_CMD_FIELDS) | SRAM_CMD_16 | CMD_SYNC_WRITE);
+    u32 ddr = rd(STEP_S11, SPI0 + SPI_SMEM_DDR);
+    wr(SPI0 + SPI_SMEM_DDR, (ddr & ~SMEM_DDR_CLEAR) | SMEM_DDR_SET);
+    u32 cmd = rd(STEP_S11, SPI0 + SPI_SRAM_CMD);
+    wr(SPI0 + SPI_SRAM_CMD, cmd | SRAM_CMD_OCTAL);
+}
+
+// S12: the PSRAM's pages written into the MMU from entry 256, then each read
+// back (stop 0x5E at the first that differs, its number in the record's
+// `address`), then both data-bus shut bits checked clear (stop 0x5F). No
+// cache operation: nothing has read these addresses since reset, so no line
+// of them can be in the data cache. Answers 0 or the stop code.
+static IRAM u32 map_psram(struct sos_psram_expect *e,
+                          struct sos_psram_record *r) {
+    u32 pages = MMU_PAGES_PER_DENSITY << (e->density >> 1);
+    if (pages > MMU_ENTRIES - MMU_PSRAM_FIRST) {
+        pages = MMU_ENTRIES - MMU_PSRAM_FIRST;
+    }
+    for (u32 n = 0; n < pages; n++) {
+        wr(MMU_TABLE + 4u * (MMU_PSRAM_FIRST + n), MMU_ACCESS_SPIRAM | n);
+    }
+    for (u32 n = 0; n < pages; n++) {
+        u32 back = rd(STEP_S12_2, MMU_TABLE + 4u * (MMU_PSRAM_FIRST + n));
+        if (back != (MMU_ACCESS_SPIRAM | n)) {
+            r->address = MMU_PSRAM_FIRST + n;
+            return stop(r, STOP_MMU, back, MMU_ACCESS_SPIRAM | n);
+        }
+    }
+    r->mapped = pages;
+    u32 ctrl1 = rd(STEP_S12_3, DCACHE_CTRL1);
+    if (ctrl1 & DCACHE_SHUT_BUS) {
+        return stop(r, STOP_BUS_OFF, ctrl1, 0);
+    }
+    return 0;
+}
+
 // One probe of the measurement: the command started, CCOUNT left to advance
 // by `spin`, SPI_MEM_CMD(1) read once, then the command waited for as S7.9
 // waits. `*done` says whether that one read found it finished. Answers 0 or
@@ -870,16 +994,19 @@ static IRAM u32 entry_ok(u32 expect_addr, u32 record_addr) {
     r->address = 0;
     r->saved = 0;
     r->cycles = 0;
+    r->mapped = 0;
     command_number = 0;
     return 1;
 }
 
 // ---- the entries ------------------------------------------------------------
 
-// The bring-up, S0 to S10: S8's identity is checked before S9 writes the
-// chip, and `last_step` ends it after S8 (STEP_S8) or S9 (STEP_S9 or more,
-// S9 being this file's last command step). Answers 0 or the stop code; for
-// 0x50 nothing is written to the record, which is then not known to be RAM.
+// The bring-up, S0 to S12: S8's identity is checked before S9 writes the
+// chip, and `last_step` ends it after S8 (STEP_S8), S9 (STEP_S9), S11
+// (STEP_S11) or S12 (STEP_S12 or more). S10 puts SPI1 back once the last
+// command has run, so S11 and S12 run with SPI1 as the ROM left it. Answers
+// 0 or the stop code; for 0x50 nothing is written to the record, which is
+// then not known to be RAM.
 IRAM u32 sos_psram_bringup(u32 expect_addr, u32 record_addr, u32 last_step) {
     if (!entry_ok(expect_addr, record_addr)) {
         return STOP_NOT_DRAM;
@@ -899,7 +1026,15 @@ IRAM u32 sos_psram_bringup(u32 expect_addr, u32 record_addr, u32 last_step) {
     struct gated g;
     g.what = GATED_IDENTITY;
     g.last_step = last_step;
-    return under_gate(e, r, e->divider, &g);
+    code = under_gate(e, r, e->divider, &g);
+    if (code || last_step < STEP_S11) {
+        return code;
+    }
+    configure_spi0();
+    if (last_step < STEP_S12) {
+        return 0;
+    }
+    return map_psram(e, r);
 }
 
 // The measurement that settles the memory-SPI core clock (../ABI.md §16b):

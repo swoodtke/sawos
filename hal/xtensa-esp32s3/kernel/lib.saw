@@ -216,13 +216,16 @@ public func map_place(cursor: UInt, pa: UInt, device: Bool) -> UInt {
 /// zero.
 public func map_translates() -> Bool { false }
 
-/// Flash offset 0 in each bus window, and how much flash the mask ROM maps at
-/// both before it enters the kernel (../ABI.md §2a). Instructions are fetched
-/// through the first and data is read through the second; the two are one
-/// flash.
+/// Flash offset 0 in each bus window, and how much of each window is flash:
+/// the first 16 MiB, MMU entries 0 to 255. Instructions are fetched through
+/// the first and data is read through the second; the two are one flash. The
+/// mask ROM maps all 512 entries to the flash before it enters the kernel
+/// (../ABI.md §2a), and the PSRAM's map takes entries from 256 up (§17), so
+/// no address above the first 16 MiB of either window is taken for flash
+/// here, mapped to the PSRAM or not.
 public static FLASH_IBUS: UInt = 0x4200_0000
 public static FLASH_DBUS: UInt = 0x3C00_0000
-public static FLASH_WINDOW_LEN: UInt = 0x0200_0000
+public static FLASH_WINDOW_LEN: UInt = 0x0100_0000
 
 /// Does `[addr, addr + len)` lie in the window that starts at `base`?
 func in_flash_window(addr: UInt, len: UInt, base: UInt) -> Bool {
@@ -254,9 +257,18 @@ public func same_bytes(link: UInt, at: UInt, len: UInt) -> Bool {
 /// segment in place in the data window, or copied into process RAM; a
 /// writable one copied into process RAM. Every width works at the DRAM
 /// addresses process RAM has, and a byte load in the instruction window does
-/// not, so nothing but code is linked there (../ABI.md §3c).
+/// not, so nothing but code is linked there (../ABI.md §3c). Process RAM is
+/// the SRAM range, and the PSRAM once a board has brought it up
+/// (`segment_bus_ok_with`).
 public func segment_bus_ok(addr: UInt, len: UInt, flags: UInt8,
                            in_place: Bool) -> Bool {
+    segment_bus_ok_with(addr, len, flags, in_place, psram_bytes())
+}
+
+/// `segment_bus_ok` on a board whose PSRAM holds `psram` bytes from
+/// `PSRAM_BASE`, 0 for none: a board facade asks it with its own count.
+public func segment_bus_ok_with(addr: UInt, len: UInt, flags: UInt8,
+                                in_place: Bool, psram: UInt) -> Bool {
     let writes = (flags & (SegFlag.Write as UInt8)) != 0
     if (flags & (SegFlag.Execute as UInt8)) != 0 {
         return in_place && not writes && in_flash_window(addr, len, FLASH_IBUS)
@@ -264,7 +276,14 @@ public func segment_bus_ok(addr: UInt, len: UInt, flags: UInt8,
     if in_place {
         return not writes && in_flash_window(addr, len, FLASH_DBUS)
     }
-    addr >= RAM_BASE && addr <= RAM_TOP && len <= RAM_TOP - addr
+    (in_range(addr, len, RAM_BASE, RAM_TOP)
+     || (psram != 0 && in_range(addr, len, PSRAM_BASE, PSRAM_BASE + psram)))
+}
+
+/// Does `[addr, addr + len)` lie in `[base, top)`? A range of no bytes at
+/// `top` does.
+func in_range(addr: UInt, len: UInt, base: UInt, top: UInt) -> Bool {
+    addr >= base && addr <= top && len <= top - addr
 }
 
 // =============================================================================
@@ -325,7 +344,7 @@ public func iram_name(dram: UInt) -> UInt {
 /// nothing is installed, but the range is still checked: a map of a device
 /// window through the RAM door, or of the kernel's own memory, is refused.
 public func map_target_ok(base: UInt, top: UInt) -> Bool {
-    base < top && base >= RAM_BASE && top <= RAM_TOP
+    process_ram(base, top, psram_bytes())
 }
 
 /// May `[base, top)` be handed to a user domain as physical backing? The same
@@ -334,7 +353,37 @@ public func map_target_ok(base: UInt, top: UInt) -> Bool {
 /// `Memory` over it is an image source and never a destination, a mapping or
 /// a slab donation (spec §5.6, §2.8).
 public func map_source_ok(base: UInt, top: UInt) -> Bool {
-    base < top && base >= RAM_BASE && top <= RAM_TOP
+    process_ram(base, top, psram_bytes())
+}
+
+/// Is `[base, top)` process RAM on a board whose PSRAM holds `psram` bytes
+/// from `PSRAM_BASE`, 0 for none: inside the SRAM range, or inside the
+/// PSRAM's? A range reaching into both is not, since the two are not
+/// adjacent and the bytes between them are flash. A board facade asks it
+/// with its own count.
+public func process_ram(base: UInt, top: UInt, psram: UInt) -> Bool {
+    if base >= top {
+        return false
+    }
+    if base >= RAM_BASE && top <= RAM_TOP {
+        return true
+    }
+    psram != 0 && base >= PSRAM_BASE && top <= PSRAM_BASE + psram
+}
+
+/// Where the PSRAM is mapped once a board has brought it up: the data-bus
+/// address of MMU entry 256 (../ABI.md §17), where the data window's 16 MiB
+/// of flash end.
+public static PSRAM_BASE: UInt = 0x3D00_0000
+
+static_assert(PSRAM_BASE == FLASH_DBUS + FLASH_WINDOW_LEN,
+              "the PSRAM's map begins where the flash's ends")
+
+/// How many bytes of PSRAM this board has brought up: none. A board facade
+/// that brings its PSRAM up answers with its own count, which
+/// `map_target_ok`, `map_source_ok` and `segment_bus_ok` read.
+public func psram_bytes() -> UInt {
+    0
 }
 
 /// Root's region, which the image builder links root for: its writable
@@ -1419,9 +1468,11 @@ public func windowed_call_refused(fn_addr: UInt) unsafe -> Never {
 // `mspi.c` makes every step and every check of the bring-up from IRAM, in one
 // call, and fills in a record; this half passes it the description and prints
 // the line a stop's record says (../ABI.md §16). Nothing here touches the
-// memory-SPI controller but `psram_spi1_words`, which only reads it, and
-// SYSTIMER, which `psram_cpu_passes` starts and reads. Down here, below the
-// last overflow check, for the build keys' reason above.
+// memory-SPI controller but `psram_spi1_words`, which only reads it;
+// SYSTIMER, which `psram_cpu_passes` and `psram_ticks` start and read; and,
+// at the end of the file, the PSRAM itself, which only the read-back test
+// writes (§17). Down here, below the last overflow check, for the build
+// keys' reason above.
 
 extern "C" {
     func sos_psram_bringup(expect: UInt, record: UInt, last_step: UInt) -> UInt
@@ -1468,15 +1519,17 @@ public struct PsramRecord {
     mr01_after: UInt32,
     mr_cycles: UInt32,
     cycles: UInt32,
+    mapped: UInt32,
 }
 
-static_assert(sizeof<PsramRecord>() == 80, "PsramRecord is mspi.c's layout")
+static_assert(sizeof<PsramRecord>() == 84, "PsramRecord is mspi.c's layout")
 
-/// `last_step` for a bring-up that ends after S8, the identity, and for one
-/// that ends after S9, the mode register's write (`mspi.c`'s STEP_S8,
-/// STEP_S9).
+/// `last_step` for a bring-up that ends after S8, the identity; after S9, the
+/// mode register's write; and after S12, the map: the whole call (`mspi.c`'s
+/// STEP_S8, STEP_S9, STEP_S12).
 public static PSRAM_THROUGH_S8: UInt = 0x80
 public static PSRAM_THROUGH_S9: UInt = 0x90
+public static PSRAM_THROUGH_S12: UInt = 0xC0
 
 /// The stops' codes (../ABI.md §16c).
 static PSRAM_STOP_NOT_DRAM: UInt = 0x50
@@ -1493,6 +1546,9 @@ static PSRAM_STOP_VENDOR: UInt = 0x5A
 static PSRAM_STOP_DIE: UInt = 0x5B
 static PSRAM_STOP_DENSITY: UInt = 0x5C
 static PSRAM_STOP_MR0: UInt = 0x5D
+static PSRAM_STOP_MMU: UInt = 0x5E
+static PSRAM_STOP_BUS_OFF: UInt = 0x5F
+public static PSRAM_STOP_READ_BACK: UInt = 0x60
 static PSRAM_STOP_MEASUREMENT: UInt = 0x61
 static PSRAM_STOP_STILL_BUSY: UInt = 0x62
 
@@ -1749,6 +1805,18 @@ public func psram_stop_line(expect: UInt, record: UInt, stop: UInt) unsafe {
         console_str("MR0 = ")
         psram_hex(read, 2)
         console_str(" after writing 0x28\n")
+    } else if stop == PSRAM_STOP_MMU {
+        console_str("MMU entry ")
+        psram_hex(address, 3)
+        console_str(" reads 0x")
+        console_hex(read)
+        console_str(", wrote 0x")
+        console_hex(r.expect.read() as UInt)
+        console_str("\n")
+    } else if stop == PSRAM_STOP_BUS_OFF {
+        console_str("data bus off, EXTMEM_DCACHE_CTRL1 = 0x")
+        console_hex(read)
+        console_str("\n")
     } else if stop == PSRAM_STOP_MEASUREMENT {
         console_str("a timing measurement 0x")
         console_hex(read)
@@ -1846,3 +1914,240 @@ public func psram_spi1_line(before: &[UInt32; 11]) unsafe {
 /// One past the highest user address a RAM row may take. A row's address is
 /// its bytes' on this board, so it is RAM's end.
 public static USER_RAM_TOP: UInt = RAM_TOP
+
+// =============================================================================
+// The PSRAM brought up whole: the map, the read-back test, the line
+// =============================================================================
+//
+// What a board facade with PSRAM runs from its `memory_init` (../ABI.md §17):
+// the description of its part at the image's clock, the whole call (S0 to
+// S12), the read-back test (S14) over every byte it describes, and the line
+// that says how it went. The facade publishes the PSRAM (S15) only when this
+// answers 0. This board describes none, so its `memory_init` writes nothing.
+
+/// Bring up the RAM this board describes beyond what the boot left usable:
+/// none. `kmain` calls it after `clock_init` and the banner, before anything
+/// is loaded; the `esp32s3-r8` board's facade brings its PSRAM up here.
+public func memory_init() unsafe {
+}
+
+extern "C" {
+    func sos_board_image() -> UInt
+}
+
+/// Is this image linked for the part rather than the emulator? A board image
+/// is linked with `_sos_semihosting` at 0 (`sink.c`, ../ABI.md §10), the one
+/// link-time fact that tells the two machines apart: a PSRAM description
+/// names the part's clock words in a board image and the emulator's in any
+/// other (`PsramClock`).
+public func board_image() -> Bool {
+    sos_board_image() != 0
+}
+
+/// The clock a PSRAM description is for: the three words S0.3 compares, each
+/// masked as it compares them (`mspi.c`'s SYSCLK_MASK, CPU_PER_MASK and
+/// CORE_CLK_SEL_MASK), and the divider word for the bus at that clock, as
+/// IDF's `mspi_timing_ll_set_psram_clock` encodes it (../ABI.md §16b).
+public struct PsramClock {
+    sysclk: UInt32,
+    cpu_per: UInt32,
+    core_clk_sel: UInt32,
+    divider: UInt32,
+}
+
+/// The emulator's clock words, the same whatever an image's clock key
+/// stores: SYSCLK_CONF reads the PLL selected at a pre-divider of 1, and
+/// CPU_PER_CONF and the memory-SPI core clock select read 0 (../ABI.md §14e,
+/// §16b). Masked as S0.3 compares them.
+public static PSRAM_EMULATOR_SYSCLK: UInt32 = 0x0008_0401
+public static PSRAM_EMULATOR_CPU_PER: UInt32 = 0
+public static PSRAM_EMULATOR_CORE_CLK_SEL: UInt32 = 0
+
+/// The divider word that divides the memory-SPI core clock by `div` in
+/// SPI_MEM_SRAM_CLK(0) and SPI_MEM_CLOCK(1) (IDF
+/// `mspi_timing_ll_set_psram_clock`, hal/esp32s3/include/hal/
+/// mspi_timing_tuning_ll.h): SCLK_EQU_SYSCLK [31] alone for 1; otherwise
+/// SCLKCNT_N [23:16] and SCLKCNT_L [7:0] `div - 1`, and SCLKCNT_H [15:8]
+/// `div / 2 - 1`.
+public func psram_divider_word(div: UInt) -> UInt32 {
+    if div <= 1 {
+        return 0x8000_0000
+    }
+    (((div - 1) << 16) | ((div / 2 - 1) << 8) | (div - 1)) as UInt32
+}
+
+/// The sizes of the part's octal AP PSRAM that the eFuse and the chip both
+/// name: 8 MiB (PSRAM_CAP 1, MR2's density 3) and 16 MiB (PSRAM_CAP 3,
+/// density 5). efuse/esp32s3/esp_efuse_table.csv; IDF esp_psram/esp32s3/
+/// esp_psram_impl_octal.c, `s_print_psram_info`.
+public static PSRAM_8_MIB: UInt = 0x80_0000
+public static PSRAM_16_MIB: UInt = 0x100_0000
+
+/// The description of `bytes` (8 or 16 MiB) of AP Memory's octal PSRAM at
+/// 3.3 V (PSRAM_VENDOR 1, MR1's vendor 0x0D) at `clock`. One fact, the size,
+/// sets both the eFuse's size code and the chip's density.
+public func psram_expect(bytes: UInt, clock: PsramClock) -> PsramExpect {
+    assert(bytes == PSRAM_8_MIB || bytes == PSRAM_16_MIB,
+           "a PSRAM description is 8 or 16 MiB")
+    let sixteen = bytes == PSRAM_16_MIB
+    PsramExpect(efuse_cap: if sixteen { 3 } else { 1 }, efuse_vendor: 1,
+                vendor: 0x0D, density: if sixteen { 5 } else { 3 },
+                divider: clock.divider, sysclk: clock.sysclk,
+                cpu_per: clock.cpu_per, core_clk_sel: clock.core_clk_sel)
+}
+
+/// The description and the record of a board's bring-up: kernel statics, so
+/// DRAM, as `mspi.c`'s entry check requires.
+unsafe static var PSRAM_EXPECT: PsramExpect
+unsafe static var PSRAM_RECORD: PsramRecord
+
+/// Write the description of `bytes` at `clock` into the bring-up's own, and
+/// answer its address for `psram_bringup`.
+public func psram_description(bytes: UInt, clock: PsramClock) unsafe -> UInt {
+    PSRAM_EXPECT = psram_expect(bytes, clock)
+    ((&var PSRAM_EXPECT) as UnsafePointer<PsramExpect>) as UInt
+}
+
+/// The address of the bring-up's own record, for `psram_bringup`.
+public func psram_record() unsafe -> UInt {
+    ((&var PSRAM_RECORD) as UnsafePointer<PsramRecord>) as UInt
+}
+
+/// The read-back test's pattern (IDF esp_psram.c, `s_test_psram`): the word
+/// at word index p from `PSRAM_BASE` is written with p ^ this.
+static PSRAM_TEST_PATTERN: UInt = 0xAAAA_AAAA
+/// The test writes and reads every eighth word, one in each 32 bytes.
+static PSRAM_TEST_STEP: UInt = 8
+
+/// What the read-back test found: how many of the words it wrote read back
+/// otherwise, and the first such word's address, what it read and what was
+/// written there.
+public struct PsramReadBack {
+    wrong: UInt,
+    at: UInt,
+    read: UInt32,
+    wrote: UInt32,
+}
+
+/// S14, the read-back test (IDF `s_test_psram`): every eighth word of the
+/// `bytes` bytes at `PSRAM_BASE` written with its word index ^ 0xAAAAAAAA,
+/// then each read back. The span is many times the data cache, so every word
+/// written has been evicted to the chip before the read pass reaches it, and
+/// every read is a fill from the chip; a chip smaller than its description
+/// aliases, and a word written later reads back where an earlier one was.
+/// Each access is a volatile load or store, so each one is made.
+public func psram_read_back(bytes: UInt) unsafe -> PsramReadBack {
+    let words = bytes / 4
+    var p: UInt = 0
+    while p < words {
+        let at = UnsafeMemory<UInt32, Device>(PSRAM_BASE + 4 * p)
+        at.write((p ^ PSRAM_TEST_PATTERN) as UInt32)
+        p += PSRAM_TEST_STEP
+    }
+    var found = PsramReadBack(wrong: 0, at: 0, read: 0, wrote: 0)
+    p = 0
+    while p < words {
+        let want = (p ^ PSRAM_TEST_PATTERN) as UInt32
+        let got = UnsafeMemory<UInt32, Device>(PSRAM_BASE + 4 * p).read()
+        if got != want {
+            if found.wrong == 0 {
+                found = PsramReadBack(wrong: 0, at: PSRAM_BASE + 4 * p,
+                                      read: got, wrote: want)
+            }
+            found.wrong += 1
+        }
+        p += PSRAM_TEST_STEP
+    }
+    found
+}
+
+/// `v` in decimal.
+func psram_decimal(v: UInt) unsafe {
+    if v >= 10 {
+        psram_decimal(v / 10)
+    }
+    console_byte(((v % 10) + 48) as UInt8)
+}
+
+/// Print the read-back test's stop line, 0x60, for what it `found` over
+/// `bytes`.
+public func psram_read_back_line(found: &PsramReadBack, bytes: UInt) unsafe {
+    console_str("SOS-S3: psram stop: read-back at 0x")
+    console_hex(found.at)
+    console_str(" read 0x")
+    console_hex(found.read as UInt)
+    console_str(", wrote 0x")
+    console_hex(found.wrote as UInt)
+    console_str(" (0x")
+    console_hex(found.wrong)
+    console_str(" of 0x")
+    console_hex(bytes / 4 / PSRAM_TEST_STEP)
+    console_str(" words wrong)\n")
+}
+
+/// Print the line that says `bytes` of PSRAM are up, with the mode registers
+/// as the bring-up whose record is at `record` read them last.
+public func psram_up_line(record: UInt, bytes: UInt) unsafe {
+    let r = UnsafeMemory<PsramRecord, Normal>(record)
+    let mr01 = r.mr01_after.read() as UInt
+    let mr23 = r.mr23.read() as UInt
+    console_str("SOS-S3: psram ")
+    psram_decimal(bytes >> 20)
+    console_str(" MiB at 0x")
+    console_hex(PSRAM_BASE)
+    console_str(", MR0=")
+    psram_hex(mr01 & 0xFF, 2)
+    console_str(" MR1=")
+    psram_hex(mr01 >> 8, 2)
+    console_str(" MR2=")
+    psram_hex(mr23 & 0xFF, 2)
+    console_str(" MR3=")
+    psram_hex(mr23 >> 8, 2)
+    console_str(", read-back ok\n")
+}
+
+/// Bring up `bytes` of the part's PSRAM described at `clock`: the whole call
+/// (`psram_map_up`), then the read-back test over all of it
+/// (`psram_test_up`). Answers 0 once the line that says so is printed, or
+/// the stop's code once its line is.
+public func psram_up(bytes: UInt, clock: PsramClock) unsafe -> UInt {
+    let stop = psram_map_up(bytes, clock)
+    if stop != 0 {
+        return stop
+    }
+    psram_test_up(bytes)
+}
+
+/// The whole call, S0 to S12, on the bring-up's own description of `bytes`
+/// at `clock` and its own record. Answers 0, or the stop's code once its
+/// line is printed.
+public func psram_map_up(bytes: UInt, clock: PsramClock) unsafe -> UInt {
+    let expect = psram_description(bytes, clock)
+    let record = psram_record()
+    let stop = psram_bringup(expect, record, PSRAM_THROUGH_S12)
+    if stop != 0 {
+        psram_stop_line(expect, record, stop)
+    }
+    stop
+}
+
+/// The read-back test over the `bytes` the bring-up's own call mapped (S14).
+/// Answers 0 once the line that says the PSRAM is up is printed, or 0x60
+/// once the test's stop line is.
+public func psram_test_up(bytes: UInt) unsafe -> UInt {
+    let found = psram_read_back(bytes)
+    if found.wrong != 0 {
+        psram_read_back_line(&found, bytes)
+        return PSRAM_STOP_READ_BACK
+    }
+    psram_up_line(psram_record(), bytes)
+    0
+}
+
+/// SYSTIMER's count, in ticks of 1/16 us, the counter started first if
+/// nothing has started it: for a harness to time a step of the bring-up.
+public func psram_ticks() unsafe -> UInt64 {
+    let timer = Systimer()
+    timer.start()
+    timer.now()
+}

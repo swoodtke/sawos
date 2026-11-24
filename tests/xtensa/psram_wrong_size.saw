@@ -1,0 +1,35 @@
+// The `esp32s3-r8` board's bring-up with a description that says 16 MiB
+// (../../hal/xtensa-esp32s3/ABI.md §17, board stage P7): the facade's own
+// path, `psram_bring_up`, at the image's clock key, with the one fact
+// changed. The size sets both codes the part is held to, the eFuse's
+// PSRAM_CAP (3) and MR2's density (5), and the eFuse is read first, so on
+// the 8 MiB part it stops there, before any command:
+//
+//   SOS-S3: psram stop: efuse word 0x60007054 = ... says PSRAM_CAP=0x1
+//   PSRAM_VENDOR=0x1, the board says 0x3 (16 MiB) and 0x1 (AP 3.3 V)
+//   SOS psram: published 0x00000000 bytes
+//   SOS-S3: halt fail code=0x00000051
+//
+// On a part that has 16 MiB, the whole of it is mapped (256 MMU entries),
+// tested and published:
+//
+//   SOS-S3: psram 16 MiB at 0x3d000000, MR0=... MR1=... MR2=... MR3=...,
+//   read-back ok
+//   SOS psram: published ... bytes
+//   SOS-S3: halt pass
+
+import kcore.{console}
+import hal
+
+@export("kmain")
+func kmain() unsafe {
+    hal.clock_init()
+    let stop = hal.psram_bring_up(hal.PSRAM_16_MIB)
+    console().write_str("SOS psram: published ")
+    console().write_hex(hal.psram_bytes())
+    console().write_str(" bytes\n")
+    if stop != 0 {
+        hal.exit_fail(stop)
+    }
+    hal.exit_pass()
+}

@@ -3665,7 +3665,14 @@ profile of §5b.1 — three gate runs — and any run failing is red.
 - **The HAL is the whole of the difference**, and it is small: boot +
   vectors, the privilege transition, the protection primitive, a console byte
   sink, a way to stop the machine, the trap-frame accessors, the interrupt and
-  timer seams (§9, §2.6), and the board's memory map. Everything else —
+  timer seams (§9, §2.6), the board's memory map, and two seams `kmain` calls
+  before anything else: `clock_init`, which sets the CPU clock the image is
+  built for, and then, after the banner, `memory_init`, which brings up any
+  RAM the board describes beyond what the boot left usable and proves it, or
+  stops the machine with a line saying why. Any clock switch is
+  `clock_init`'s and runs before `memory_init`, and nothing after
+  `memory_init` changes the clock that RAM was brought up for; a board with
+  no such RAM answers `memory_init` with nothing. Everything else —
   dispatch, rights, the loader's order of checks, the console's formatting — is
   shared, and `kernel/core/` is shared by every kernel image, which keeps them
   all on the same trap path.
@@ -3726,7 +3733,7 @@ can ask about (`SystemOp.TierGet`, §2.8):
 | riscv32 `virt`, flat build profile | 3 | yes — a third run | a module swap over the same board: `prot_*` no-ops, PMP opened with one TOR entry, `prot_isolated()` false. No new toolchain, and the tier-3 story's test target |
 | ESP32-C3 | 2, at the floor | no — a board smoke (`make sos-smoke-esp32c3`), not gating | 16 PMP entries exactly, 400 KB SRAM; XIP is the entry price |
 | ESP32-P4 | 2 | no — no QEMU machine yet | 32 PMP + 16 PMA, 768 KB; the first real tier-2 part |
-| ESP32-S3 (Xtensa LX7, call0) | 3, `Flat` | no — a board smoke (`make sos-smoke-esp32s3`) | the core has no privilege (PS.UM picks a vector, not a permission), so the `prot_*` seam installs nothing and `prot_isolated()` is false; the off-core WORLD0/1 controller is unused. Processes are Blade-built images at fixed link addresses, one per resident image as on riscv32, and run the gate's own programs from flash: code in place in the flash instruction window, read-only data in place in the data window, and only writable memory copied, to DRAM, where the kernel also grants the stack (§5.6). A `map` with execute succeeds and its row is recorded, but a region is at DRAM addresses, where the part fetches no instruction (§11). An interrupt line holds one of the board's nine device CPU interrupts (`DEVICE_CPU_INT_COUNT`) while it is unmasked and may lose it to another line once masked, so the limit is at most nine lines unmasked at once, never a count of lines ever bound; the Interrupt slab (`MAX_INTERRUPTS`) stays below it, so a bind meets the slab's `NoResource` first. `hal/xtensa-esp32s3/` |
+| ESP32-S3 (Xtensa LX7, call0) | 3, `Flat` | no — a board smoke (`make sos-smoke-esp32s3`) | the core has no privilege (PS.UM picks a vector, not a permission), so the `prot_*` seam installs nothing and `prot_isolated()` is false; the off-core WORLD0/1 controller is unused. Processes are Blade-built images at fixed link addresses, one per resident image as on riscv32, and run the gate's own programs from flash: code in place in the flash instruction window, read-only data in place in the data window, and only writable memory copied, to DRAM, where the kernel also grants the stack (§5.6). A `map` with execute succeeds and its row is recorded, but a region is at DRAM addresses, where the part fetches no instruction (§11). An interrupt line holds one of the board's nine device CPU interrupts (`DEVICE_CPU_INT_COUNT`) while it is unmasked and may lose it to another line once masked, so the limit is at most nine lines unmasked at once, never a count of lines ever bound; the Interrupt slab (`MAX_INTERRUPTS`) stays below it, so a bind meets the slab's `NoResource` first. `hal/xtensa-esp32s3/`. The `esp32s3-r8` board is the same part with 8 MiB of octal PSRAM in its package, a facade over this HAL (`hal/xtensa-esp32s3-r8/`): its `memory_init` brings the PSRAM up at every boot, after the image's clock key's `clock_init`, at a bus divider chosen for that key's clock, maps it at 0x3D00_0000 and tests every byte before publishing it as process RAM beside the SRAM range, or stops the boot; nothing after it writes SYSTEM_SYSCLK_CONF, SYSTEM_CPU_PER_CONF or SPI_MEM_CORE_CLK_SEL. The flash windows the HAL takes are each bus's first 16 MiB, below the PSRAM's map |
 
 **Two words and not three.** `Isolated` and `Flat`; MMU-vs-MPU is not
 advertised, because slot pricing and the `map` answer are already the visible

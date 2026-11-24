@@ -1,0 +1,212 @@
+// The PSRAM brought up whole, then every access width at PSRAM addresses,
+// on the `esp32s3-r8` board (../../hal/xtensa-esp32s3/ABI.md §17, board
+// stage P4). `hal.memory_init` is the shipping kernel's: S0 to S12, the
+// read-back test over all 8 MiB (S14), and the PSRAM published (S15), or a
+// stop. Then the probe, in `tests/bus_probe.saw`'s style through its leaves
+// in `bus_probe.S`: each step prints its name and address, makes its access
+// and prints `ok <value>` or `refused cause=<EXCCAUSE> vaddr=<EXCVADDR>`, and
+// the probe goes on past a refusal.
+//
+//   SOS-S3: psram 8 MiB at 0x3d000000, MR0=... MR1=... MR2=... MR3=...,
+//   read-back ok
+//   SOS psram: up and tested in ... us, published ... bytes
+//   SOS probe: word load, PSRAM at 0x3d000000   ... and 0x3d7fffe0, the
+//   read-back test's first and last words
+//   SOS probe: word store and load, PSRAM at 0x3d000000   ... and its top
+//   SOS probe: halfword store and load, PSRAM at 0x3d000002
+//   SOS probe: byte store and load, PSRAM at 0x3d000003
+//   SOS probe: unaligned word load, PSRAM at 0x3d000001
+//   SOS probe: ATOMCTL ...
+//   SOS probe: word store, then s32c1i swapping it, PSRAM at 0x3d000010
+//   SOS probe: word load after s32c1i, PSRAM at 0x3d000010
+//   SOS probe: word stored at 0x3d000100 and evicted, word load at 0x43000100
+//   SOS-S3: halt pass
+//
+// `s32c1i` on cached external memory is not probed anywhere else: a refusal
+// says processes in PSRAM cannot use word atomics there. The last step loads
+// through the instruction bus's name of the same page, which the one MMU
+// table serves for both buses: the word is stored through the data cache,
+// 128 KiB of other PSRAM lines are stored to so the data cache writes it
+// back, and the instruction cache's fill then reads it from the chip. The
+// time is SYSTIMER's, host time on the emulator.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func probe_install()
+    func probe_remove()
+    func probe_load8(addr: UInt) -> UInt
+    func probe_load16(addr: UInt) -> UInt
+    func probe_load32(addr: UInt) -> UInt
+    func probe_store8(addr: UInt, v: UInt) -> UInt
+    func probe_store16(addr: UInt, v: UInt) -> UInt
+    func probe_store32(addr: UInt, v: UInt) -> UInt
+    func probe_s32c1i(addr: UInt, expected: UInt, v: UInt) -> UInt
+    func probe_value() -> UInt
+    func probe_cause() -> UInt
+    func probe_vaddr() -> UInt
+    func probe_ps() -> UInt
+    func probe_atomctl() -> UInt
+}
+
+static ACCESS_OK: UInt = 0
+static RESUME_FAILED: UInt = 2
+
+/// What the stores write, as `tests/bus_probe.saw`'s do.
+static WORD_MARK: UInt = 0x5A5A_A5A5
+static HALF_MARK: UInt = 0xC33C
+static BYTE_MARK: UInt = 0x96
+static ALIAS_MARK: UInt = 0xC3D2_E1F0
+static CAS_OLD: UInt = 5
+static CAS_NEW: UInt = 7
+
+/// Where each step works, from `hal.PSRAM_BASE`.
+static HALF_OFFSET: UInt = 2
+static BYTE_OFFSET: UInt = 3
+static UNALIGNED_OFFSET: UInt = 1
+static ATOMIC_OFFSET: UInt = 0x10
+static ALIAS_OFFSET: UInt = 0x100
+
+/// The instruction bus's name of a data-bus address in the MMU's window:
+/// entry n is data-bus 0x3C00_0000 + n x 64 KiB and instruction-bus
+/// 0x4200_0000 + n x 64 KiB (IDF ext_mem_defs.h).
+static IBUS_FROM_DBUS: UInt = 0x4200_0000 - 0x3C00_0000
+
+/// The lines stored to between the alias's store and its load, as
+/// `psram_word.saw`'s eviction: 128 KiB from the PSRAM's second 64 KiB.
+static EVICT_FROM: UInt = 0x1_0000
+static EVICT_BYTES: UInt = 0x2_0000
+static LINE: UInt = 16
+
+/// The read-back test writes one word in each 32 bytes.
+static TEST_STEP: UInt = 32
+
+/// SYSTIMER counts 16 ticks a microsecond.
+static TICKS_PER_US: UInt64 = 16
+
+func say(line: String) {
+    console().write_str("SOS probe: ")
+    console().write_str(line)
+    console().write_str("\n")
+}
+
+func step(name: String, addr: UInt) {
+    console().write_str("SOS probe: ")
+    console().write_str(name)
+    console().write_str(" at ")
+    console().write_hex(addr)
+    console().write_str("\n")
+}
+
+/// `v` in decimal.
+func decimal(v: UInt64) unsafe {
+    if v >= 10 {
+        decimal(v / 10)
+    }
+    hal.console_byte(((v % 10) + 48) as UInt8)
+}
+
+/// Report a refusal, if `status` is one, and say whether it was. A resume at
+/// another PS than the kernel's stops the probe.
+func refused(status: UInt, kernel_ps: UInt) unsafe -> Bool {
+    if status == ACCESS_OK {
+        return false
+    }
+    console().write_str("SOS probe: refused cause=")
+    console().write_hex(probe_cause())
+    console().write_str(" vaddr=")
+    console().write_hex(probe_vaddr())
+    console().write_str("\n")
+    if probe_ps() != kernel_ps {
+        console().write_str("SOS probe: resumed at another PS\n")
+        hal.exit_fail(RESUME_FAILED)
+    }
+    true
+}
+
+/// Report what an allowed access gave.
+func report(status: UInt, kernel_ps: UInt) unsafe {
+    if refused(status, kernel_ps) {
+        return
+    }
+    console().write_str("SOS probe: ok ")
+    console().write_hex(probe_value())
+    console().write_str("\n")
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.clock_init()
+    let start = hal.psram_ticks()
+    hal.memory_init()
+    let took = (hal.psram_ticks() - start) / TICKS_PER_US
+    console().write_str("SOS psram: up and tested in ")
+    decimal(took)
+    console().write_str(" us, published ")
+    decimal(hal.psram_bytes() as UInt64)
+    console().write_str(" bytes\n")
+
+    let ps = probe_ps()
+    probe_install()
+    let base = hal.PSRAM_BASE
+    let top = base + hal.psram_bytes() - 4
+
+    // What the read-back test left at the PSRAM's two ends: its first word
+    // and its last, one 32 bytes below the top.
+    step("word load, PSRAM", base)
+    report(probe_load32(base), ps)
+    step("word load, PSRAM", top + 4 - TEST_STEP)
+    report(probe_load32(top + 4 - TEST_STEP), ps)
+
+    step("word store and load, PSRAM", base)
+    if not refused(probe_store32(base, WORD_MARK), ps) {
+        report(probe_load32(base), ps)
+    }
+    step("word store and load, PSRAM", top)
+    if not refused(probe_store32(top, WORD_MARK), ps) {
+        report(probe_load32(top), ps)
+    }
+    step("halfword store and load, PSRAM", base + HALF_OFFSET)
+    if not refused(probe_store16(base + HALF_OFFSET, HALF_MARK), ps) {
+        report(probe_load16(base + HALF_OFFSET), ps)
+    }
+    step("byte store and load, PSRAM", base + BYTE_OFFSET)
+    if not refused(probe_store8(base + BYTE_OFFSET, BYTE_MARK), ps) {
+        report(probe_load8(base + BYTE_OFFSET), ps)
+    }
+    step("word load after the narrow stores, PSRAM", base)
+    report(probe_load32(base), ps)
+    step("unaligned word load, PSRAM", base + UNALIGNED_OFFSET)
+    report(probe_load32(base + UNALIGNED_OFFSET), ps)
+
+    console().write_str("SOS probe: ATOMCTL ")
+    console().write_hex(probe_atomctl())
+    console().write_str("\n")
+    let cas = base + ATOMIC_OFFSET
+    step("word store, then s32c1i swapping it, PSRAM", cas)
+    if not refused(probe_store32(cas, CAS_OLD), ps) {
+        report(probe_s32c1i(cas, CAS_OLD, CAS_NEW), ps)
+        step("word load after s32c1i, PSRAM", cas)
+        report(probe_load32(cas), ps)
+    }
+
+    let alias = base + ALIAS_OFFSET
+    console().write_str("SOS probe: word stored at ")
+    console().write_hex(alias)
+    console().write_str(" and evicted, word load at ")
+    console().write_hex(alias + IBUS_FROM_DBUS)
+    console().write_str("\n")
+    if not refused(probe_store32(alias, ALIAS_MARK), ps) {
+        var offset: UInt = 0
+        while offset < EVICT_BYTES {
+            let line = UnsafeMemory<UInt32, Device>(base + EVICT_FROM + offset)
+            line.write(offset as UInt32)
+            offset += LINE
+        }
+        report(probe_load32(alias + IBUS_FROM_DBUS), ps)
+    }
+    probe_remove()
+    say("done")
+    hal.exit_pass()
+}

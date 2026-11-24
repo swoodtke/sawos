@@ -140,6 +140,15 @@ void sos_sim_exit(u32 status) {
     __asm__ volatile("simcall" : "+a"(a2) : "a"(a3) : "memory");
 }
 
+// Whether this image is a board image, linked for the part: 1 when
+// `_sos_semihosting` is 0, as a board image is linked, and 0 for an image
+// linked for the emulator. The same linker constant read the same way, for
+// what differs between the two machines beyond the stop (`lib.saw`'s
+// `board_image`).
+u32 sos_board_image(void) {
+    return (u32)(unsigned long)_sos_semihosting == 0;
+}
+
 // ---- a trap the kernel took -----------------------------------------------
 //
 // C because: it reads the cause registers' values as `boot.S` captured them

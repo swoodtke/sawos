@@ -1,0 +1,107 @@
+// What the HAL takes for process RAM and for flash, asked before and after
+// `memory_init` (../../hal/xtensa-esp32s3/ABI.md §17): on the `esp32s3-r8`
+// board the PSRAM is process RAM only once it is brought up, and on the
+// `esp32s3` board never. Each RAM line names a range and answers
+// `map_target_ok`, `map_source_ok` and `segment_bus_ok` for a writable
+// segment copied there; each code line answers `segment_bus_ok` for code in
+// place there, and `same_bytes` for an instruction-bus address and the
+// data-bus address of the same page.
+//
+//   SOS ranges: before ... bytes of PSRAM
+//   SOS ranges: <name> 0x........-0x........ target=yes|no source=yes|no
+//               copy=yes|no
+//   SOS ranges: after ... bytes of PSRAM
+//   ... the same lines again, then the code lines:
+//   SOS ranges: code 0x........+0x........ in place=yes|no
+//   SOS ranges: same bytes 0x........ 0x........ = yes|no
+//   SOS-S3: halt pass
+//
+// The ranges: the SRAM's first page; the PSRAM's first page and its last;
+// a range from the PSRAM's last page past its end, one from below its start
+// into it, and one from it into the SRAM; and a page of the flash's data
+// window. The code: flash's last page in the instruction window, a range
+// from it past the window's 16 MiB, and the PSRAM's page as the
+// instruction bus names it.
+
+import kcore.{console}
+import hal
+import imgformat.{SegFlag}
+
+func yes(answer: Bool) -> String {
+    if answer { "yes" } else { "no" }
+}
+
+func ram(name: String, base: UInt, top: UInt) unsafe {
+    let copy = (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8)
+    console().write_str("SOS ranges: ")
+    console().write_str(name)
+    console().write_str(" ")
+    console().write_hex(base)
+    console().write_str("-")
+    console().write_hex(top)
+    console().write_str(" target=")
+    console().write_str(yes(hal.map_target_ok(base, top)))
+    console().write_str(" source=")
+    console().write_str(yes(hal.map_source_ok(base, top)))
+    console().write_str(" copy=")
+    console().write_str(yes(hal.segment_bus_ok(base, top - base, copy,
+                                                false)))
+    console().write_str("\n")
+}
+
+func rams() unsafe {
+    let psram = hal.PSRAM_BASE
+    let end = psram + 0x80_0000
+    ram("sram", hal.RAM_BASE, hal.RAM_BASE + 0x1000)
+    ram("psram", psram, psram + 0x1000)
+    ram("psram top", end - 0x1000, end)
+    ram("past psram", end - 0x1000, end + 0x1000)
+    ram("below psram", psram - 0x1000, psram + 0x1000)
+    ram("psram to sram", end - 0x1000, hal.RAM_BASE + 0x1000)
+    ram("flash", 0x3C10_0000, 0x3C10_1000)
+}
+
+func code(base: UInt, len: UInt) unsafe {
+    let exec = (SegFlag.Read as UInt8) | (SegFlag.Execute as UInt8)
+    console().write_str("SOS ranges: code ")
+    console().write_hex(base)
+    console().write_str("+")
+    console().write_hex(len)
+    console().write_str(" in place=")
+    console().write_str(yes(hal.segment_bus_ok(base, len, exec, true)))
+    console().write_str("\n")
+}
+
+func same(link: UInt, at: UInt) unsafe {
+    console().write_str("SOS ranges: same bytes ")
+    console().write_hex(link)
+    console().write_str(" ")
+    console().write_hex(at)
+    console().write_str(" = ")
+    console().write_str(yes(hal.same_bytes(link, at, 4)))
+    console().write_str("\n")
+}
+
+func psram(when: String) unsafe {
+    console().write_str("SOS ranges: ")
+    console().write_str(when)
+    console().write_str(" ")
+    console().write_hex(hal.psram_bytes())
+    console().write_str(" bytes of PSRAM\n")
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.clock_init()
+    psram("before")
+    rams()
+    hal.memory_init()
+    psram("after")
+    rams()
+    code(0x42FF_F000, 0x1000)
+    code(0x42FF_F000, 0x2000)
+    code(0x4300_0000, 0x1000)
+    same(0x4300_0100, 0x3D00_0100)
+    same(0x4210_0000, 0x3C10_0000)
+    hal.exit_pass()
+}

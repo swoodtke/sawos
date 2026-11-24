@@ -45,6 +45,10 @@ hal/xtensa-esp32s3/  # Xtensa (call0) and the ESP32-S3 board in one
                    # count) + dbias/ (`s3dbias`, the LDO settings from the
                    # eFuse) + ABI.md, the board facts. Reached by
                    # `make sos-smoke-esp32s3`
+hal/xtensa-esp32s3-r8/ # the same part with its 8 MiB PSRAM: a facade over
+                   # the S3 HAL whose `memory_init` brings the PSRAM up,
+                   # tests it and publishes it, or stops the machine; its
+                   # board.toml adds the PSRAM range. The S3 smoke runs both
 hal/*/board.toml   # each board's description, one complete file per HAL
                    # directory (the flat profile's too): the TOML an image is
                    # built against; tools/sosimage/src/board.saw states it

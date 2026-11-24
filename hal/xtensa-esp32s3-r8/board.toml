@@ -1,0 +1,159 @@
+# The ESP32-S3 with 8 MiB of octal PSRAM in its package (an N8R8 module),
+# Xtensa (call0), flat tier, under Espressif's QEMU: what an image is built
+# against. The S3 board's machine, HAL and keys, with the PSRAM described
+# (kernel/lib.saw, ../xtensa-esp32s3/ABI.md §17).
+# tools/sosimage/src/board.saw states the format; `sosimage board` holds this
+# file to a profile and to this HAL's numbers.
+format = 1
+
+[board]
+name = "esp32s3-r8"
+triple = "xtensa-esp-unknown-elf"
+tier = "flat"
+hal = "hal/xtensa-esp32s3-r8"
+placement = "in-place"
+modules = ["s3hal=../xtensa-esp32s3/kernel",
+           "s3clock=../xtensa-esp32s3/keys/clock-*",          # keyed per image
+           "s3stall=../xtensa-esp32s3/keys/stall-*",          # keyed per image
+           "s3clockkit=../xtensa-esp32s3/keys/clock-common",
+           "s3dbias=../xtensa-esp32s3/dbias/src"]
+cflags = ["-mcpu=esp32s3",
+          "-Xclang", "-target-feature", "-Xclang", "-windowed",
+          "-Xclang", "-target-feature", "-Xclang", "-fp",
+          "-fintegrated-as", "-ffreestanding", "-fno-builtin",
+          "-ffunction-sections", "-fdata-sections"]
+
+# The emulator's PSRAM is a model on SPI1's bus at chip select 1: `-m` sizes
+# it, and the property makes it an octal AP chip (ABI.md §16e). A run also
+# needs an eFuse file naming the part's PSRAM, which the runner writes for
+# each run.
+[emulator]
+program = "qemu-system-xtensa"
+args = ["-machine", "esp32s3", "-nographic", "-semihosting",
+        "-m", "8M", "-global", "ssi_psram.is_octal=true"]
+
+# The kernel's .data and .bss in DRAM (kernel/esp32s3.ld), then the
+# processes' DRAM, `RAM_BASE` to `RAM_TOP`.
+[ram.kernel]
+use = "kernel"
+speed = "fast"
+base = 0x3FC8_C000
+len = 0x2_4000              # 144 KiB
+
+[ram.sram]
+use = "process"
+speed = "fast"
+base = 0x3FCB_0000
+len = 0x4_0000              # 256 KiB
+atomics = true              # word atomics: `s32c1i` on DRAM (ABI.md §8)
+
+# The PSRAM, as the cache maps it once `memory_init` has brought it up
+# (`PSRAM_BASE`): every byte reached through the data cache, a miss a burst
+# on the memory-SPI bus. No `atomics` until a part has shown `s32c1i` there
+# (board stage P4, ABI.md §17).
+[ram.psram]
+use = "process"
+speed = "slow"
+base = 0x3D00_0000
+len = 0x80_0000             # 8 MiB
+
+# Root's region is in the SRAM (`ROOT_LOAD_BASE`), so the default process
+# range is; so is the pool, which a heap needs word atomics in.
+[ram.default]
+process = "sram"
+pool = "sram"
+
+# The image's flash, as the S3 board's: 4 MiB, mapped for instructions and
+# for data over the first 16 MiB of each window (`FLASH_IBUS`, `FLASH_DBUS`,
+# `FLASH_WINDOW_LEN`), the PSRAM's map taking the next 8 MiB. Root's image
+# takes `root-slot`; the other processes' images take `slots`, child i in
+# slot i.
+[flash]
+chip = "esp32s3"
+base = 0x0
+len = 0x40_0000             # 4 MiB
+ibus = { base = 0x4200_0000, len = 0x100_0000 }
+dbus = { base = 0x3C00_0000, len = 0x100_0000 }
+root-slot = { base = 0x10_0000, len = 0x8_0000 }
+slots = { base = 0x18_0000, len = 0x8_0000, count = 4 }
+
+# The console: UART0, on interrupt-matrix source 27.
+[devices.UART0]
+type = "esp32s3-uart"
+base = 0x6000_0000
+len = 0x1000
+line = 27
+kernel = true
+
+# Timer group 1, which the kernel does not use. Its timer 0's alarm word
+# holds what is written to it, and acts only once the timer's alarm is
+# enabled; `word` is its first sixteen registers.
+[devices.TIMG1]
+type = "esp32s3-timg"
+base = 0x6002_0000
+len = 0x1000
+registers.T0ALARMLO = { offset = 0x10 }
+arrays.word = { offset = 0x0, stride = 4, count = 16 }
+
+# GPIO: pad levels, output enables, interrupts and the output matrix
+# (ABI.md §9). Its line is ETS_GPIO_INTR_SOURCE. `word` is its first sixteen
+# registers, from `BT_SELECT` (0x00) to `IN` (0x3C), so one naturally aligned
+# part holds both banks' levels and enables.
+[devices.GPIO]
+type = "esp32s3-gpio"
+base = 0x6000_4000
+len = 0x1000
+line = 16
+registers.OUT_W1TC = { offset = 0x00C }
+registers.OUT1_W1TC = { offset = 0x018 }
+registers.ENABLE_W1TS = { offset = 0x024 }
+registers.ENABLE1_W1TS = { offset = 0x030 }
+arrays.word = { offset = 0x0, stride = 4, count = 16 }
+arrays.out_sel = { offset = 0x554, stride = 4, count = 54 }
+
+# The IO MUX: each pad's function, pulls, input enable and drive, pad n's
+# word at `pad[n]`. The PSRAM's pads, 26 to 28 and 33 to 37, are the
+# kernel's once `memory_init` has set them: the drivers' pin check
+# (`drivers/esp32s3io`'s `check_pin`) refuses each to a configuration, the
+# flash bus's 26 to 32 and the PSRAM's 33 to 37, on every board.
+[devices.IO_MUX]
+type = "esp32s3-io-mux"
+base = 0x6000_9000
+len = 0x1000
+arrays.pad = { offset = 0x004, stride = 4, count = 49 }
+
+# LEDC, the PWM block. Its line is ETS_LEDC_INTR_SOURCE.
+[devices.LEDC]
+type = "esp32s3-ledc"
+base = 0x6001_9000
+len = 0x1000
+line = 35
+
+# SYSTEM: every peripheral's clock gate and reset, and the CPU's clock.
+[devices.SYSTEM]
+type = "esp32s3-system"
+base = 0x600C_0000
+len = 0x1000
+registers.PERIP_CLK_EN0 = { offset = 0x018 }
+registers.PERIP_RST_EN0 = { offset = 0x020 }
+
+# SYSTIMER target 0's source, the kernel's tick.
+[lines]
+reserved = [57]
+
+# What an image that states no limits of its own boots with: the S3 board's.
+[limits.default]
+processes = 8
+waiters = 8
+quota = { handles = 28, mappings = 12 }
+
+# The build keys an image's `[keys]` chooses (ABI.md §14d), the S3 board's:
+# the CPU's clock, which also sets the PSRAM's divider, and whether the
+# console counts its stalls.
+[keys.clock]
+module = "s3clock"
+values = ["rom", "xtal40", "pll80", "pll160", "pll240"]
+
+[keys.stall]
+module = "s3stall"
+values = ["off", "on"]

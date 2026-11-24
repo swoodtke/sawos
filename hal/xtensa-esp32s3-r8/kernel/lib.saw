@@ -1,0 +1,159 @@
+//! The `esp32s3-r8` board: the ESP32-S3 with 8 MiB of octal PSRAM in its
+//! package, an N8R8 module's part, over the S3's own HAL.
+//!
+//! A facade, not a fork: everything but the PSRAM is the S3 HAL's, re-exported
+//! from it as the module `s3hal` (the same directory the `esp32s3` board maps
+//! as `hal`), and this file answers the five names that differ, all of them
+//! the PSRAM's:
+//!
+//!   * `memory_init` brings the PSRAM up at boot or stops the machine: the
+//!     description below, the whole call from IRAM (S0 to S12: identity, mode
+//!     register, SPI0's PSRAM side, the cache's map), the read-back test over
+//!     all 8 MiB (S14), and only then the PSRAM published (S15)
+//!     (../../xtensa-esp32s3/ABI.md §16, §17);
+//!   * `psram_bytes` answers 0 until S15 and the described size after;
+//!   * `map_target_ok`, `map_source_ok` and `segment_bus_ok` take the PSRAM
+//!     as process RAM beside the SRAM range once it is published, and refuse
+//!     a range that reaches into both.
+//!
+//! The description is HAL data, since the kernel needs it at boot: the size
+//! (one fact, which sets both the eFuse's size code and the chip's density),
+//! the clock it is brought up at, which is the image's clock key's (`s3clock`
+//! states what each key leaves on the part), and the bus divider for that
+//! clock. A board image carries the part's clock words and an image for the
+//! emulator the emulator's (`s3hal.board_image`): the two machines answer
+//! S0.3 differently, and the part must match its description exactly.
+//!
+//! Any clock change is `clock_init`'s, which `kmain` calls first; nothing
+//! after `memory_init` writes SYSTEM_SYSCLK_CONF, SYSTEM_CPU_PER_CONF or
+//! SPI_MEM_CORE_CLK_SEL, since the bus would move with them (the runner's
+//! `check_clock_registers` holds the S3 HAL's sources to it).
+
+public import s3hal.{
+    arch_name, arch_tag, board_image, cause_tag, clock_init, console_byte,
+    DEVICE_GRANT_BASE, DEVICE_GRANT_LEN, device_window_ok, dram_name,
+    exit_fail, exit_pass, FLASH_DBUS, FLASH_IBUS, FLASH_WINDOW_LEN,
+    fp_switch_in,
+    fp_switch_out, fp_trap, FRAME_BYTES, frame_init, GRANT_ROW_BUDGET,
+    idle_wakes, image_link_base, intc_init, IRAM_DRAM_OFFSET, iram_name,
+    irq_claim, irq_complete, irq_line_valid, irq_mask, IRQ_NONE, irq_poll,
+    irq_raise_selftest_line, IRQ_TIMER, irq_unmask, is_interrupt, is_syscall,
+    KERNEL_RAM_BASE, kernel_slabs_end, kernel_slabs_start, map_place,
+    map_translates, MAX_GRANT_ROWS, MAX_HANDLES, MAX_ROOT_SEGMENTS,
+    payload_end, payload_start, phys_to_virt, process_ram, PROT_DOMAIN_SLOTS,
+    PROT_GRAIN, prot_clear, prot_commit, prot_device, prot_isolated,
+    prot_region, prot_replay_at_switch, prot_reset, prot_switch, prot_update,
+    PSRAM_16_MIB, PSRAM_8_MIB, PSRAM_BASE, psram_bringup, PsramClock,
+    psram_cpu_passes, PsramCpuPass, psram_description, psram_divider_word,
+    psram_map_up, psram_test_up,
+    PSRAM_EMULATOR_CORE_CLK_SEL, PSRAM_EMULATOR_CPU_PER,
+    PSRAM_EMULATOR_SYSCLK, PsramExpect, psram_expect, psram_read_back,
+    psram_read_back_line, PsramReadBack, psram_record, PsramRecord,
+    PSRAM_SPI1_WORDS, psram_spi1_line, psram_spi1_words, psram_stop_line,
+    PSRAM_STOP_READ_BACK, PSRAM_THROUGH_S12, PSRAM_THROUGH_S8,
+    PSRAM_THROUGH_S9, psram_ticks, PSRAM_TIME_ARRAY_LONG,
+    PSRAM_TIME_ARRAY_SHORT, PSRAM_TIME_MR_FAST, PSRAM_TIME_MR_SLOW,
+    psram_time_reads, psram_up, psram_up_line, RAM_BASE, RAM_TOP,
+    region_table_end, region_table_start, resume_frame, ROOT_LOAD_BASE,
+    ROOT_REGION_TOP, ROOT_STACK_LEN, same_bytes, segment_bus_ok_with,
+    SHARED_IRAM_BASE, SHARED_IRAM_TOP, syscall_arg0, syscall_arg1,
+    syscall_arg2, syscall_handle, syscall_op, syscall_return, timer_now_ns,
+    timer_pending, timer_set_deadline_ns, trap_pc, UNMAPPED_PROBE,
+    USER_RAM_TOP, virt_to_phys, wait_for_irq,
+}
+
+// What the image's clock key leaves on the part, and the memory-SPI core
+// clock it makes: the key's own facts (`../../xtensa-esp32s3/keys/`).
+import s3clock.{MSPI_CORE_MHZ, PART_CORE_CLK_SEL, PART_CPU_PER, PART_SYSCLK}
+
+/// The PSRAM this board describes: 8 MiB, the N8R8's, which its eFuse names
+/// with PSRAM_CAP 1 and its chip with MR2's density 3.
+public static PSRAM_DESCRIBED_BYTES: UInt = 0x80_0000
+
+/// The bus the PSRAM runs at: 20 MHz, the speed ESP-IDF first talks to the
+/// chip at (`mspi_timing_enter_low_speed_mode`), below the 40 MHz past which
+/// it tunes octal PSRAM, and a cache line's burst well inside the chip's
+/// 8 us chip-select-low limit (../../xtensa-esp32s3/ABI.md §16b, §17b). The
+/// divider is the key's core clock over it, and never less than
+/// `PSRAM_DIVIDER_LEAST`: 2 at `xtal40` and 4 on the PLL, and 2 at `rom`,
+/// whose core clock is the bus's 20 MHz itself.
+static PSRAM_BUS_MHZ: UInt = 20
+
+/// The least divider: a bus at the memory-SPI core clock itself, divide by
+/// 1, is never used. On the part the mode-register reads came back shifted
+/// at it (board stage P3 at `rom` read MR2 0x09 and stopped at S8.2), and
+/// nothing here tunes the controller's input timing, as ESP-IDF does before
+/// it raises a bus that far. So `rom` runs the PSRAM at 10 MHz, divide by 2,
+/// which `xtal40` runs cleanly on the part at its 40 MHz core.
+static PSRAM_DIVIDER_LEAST: UInt = 2
+
+/// How many bytes of PSRAM are up: 0 until `psram_bring_up` has proven them
+/// (S15). Its one writer runs at boot, in the kernel, on one core.
+unsafe static var PSRAM_LEN: UInt = 0
+
+/// How many bytes of PSRAM this board has brought up and published: 0 before
+/// `memory_init`, the described size after.
+public func psram_bytes() unsafe -> UInt {
+    PSRAM_LEN
+}
+
+/// The clock the PSRAM's description names for this image: the image's clock
+/// key's words on the part in a board image, the emulator's otherwise, and
+/// the divider that runs the bus at `PSRAM_BUS_MHZ` from the key's core
+/// clock, or at half the core clock where that is slower.
+public func psram_clock() -> PsramClock {
+    let div = MSPI_CORE_MHZ / PSRAM_BUS_MHZ
+    let divider = psram_divider_word(
+        if div < PSRAM_DIVIDER_LEAST { PSRAM_DIVIDER_LEAST } else { div })
+    if board_image() {
+        return PsramClock(sysclk: PART_SYSCLK, cpu_per: PART_CPU_PER,
+                          core_clk_sel: PART_CORE_CLK_SEL, divider: divider)
+    }
+    PsramClock(sysclk: PSRAM_EMULATOR_SYSCLK, cpu_per: PSRAM_EMULATOR_CPU_PER,
+               core_clk_sel: PSRAM_EMULATOR_CORE_CLK_SEL, divider: divider)
+}
+
+/// Bring up `bytes` of PSRAM as described at this image's clock (S0 to S14)
+/// and publish them (S15) when every step and the read-back test passed.
+/// Answers 0, or the stop's code once its line is printed; nothing is
+/// published then.
+public func psram_bring_up(bytes: UInt) unsafe -> UInt {
+    let stop = psram_up(bytes, psram_clock())
+    if stop == 0 {
+        PSRAM_LEN = bytes
+    }
+    stop
+}
+
+/// Bring up the PSRAM this board describes, or stop the machine with the
+/// line that says why: a board described as having PSRAM never boots on
+/// without it.
+public func memory_init() unsafe {
+    let stop = psram_bring_up(PSRAM_DESCRIBED_BYTES)
+    if stop != 0 {
+        exit_fail(stop)
+        while { }
+    }
+}
+
+/// May `[base, top)` be installed as a RAM row in a user domain? Inside the
+/// SRAM range, or inside the PSRAM once it is published
+/// (`s3hal.process_ram`).
+public func map_target_ok(base: UInt, top: UInt) -> Bool {
+    process_ram(base, top, psram_bytes())
+}
+
+/// May `[base, top)` be handed to a user domain as physical backing? The same
+/// ranges as `map_target_ok`.
+public func map_source_ok(base: UInt, top: UInt) -> Bool {
+    process_ram(base, top, psram_bytes())
+}
+
+/// Can this board's buses serve a segment of `len` bytes linked at `addr`?
+/// The S3's rule, with the PSRAM as process RAM once it is published
+/// (`s3hal.segment_bus_ok_with`): a segment copied into RAM may be copied
+/// into the PSRAM, and code is still used only in place in flash.
+public func segment_bus_ok(addr: UInt, len: UInt, flags: UInt8,
+                           in_place: Bool) -> Bool {
+    segment_bus_ok_with(addr, len, flags, in_place, psram_bytes())
+}

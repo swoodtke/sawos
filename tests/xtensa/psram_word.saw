@@ -1,0 +1,96 @@
+// One word through the cache's map of the PSRAM, evicted and read back: the
+// bring-up's whole call, S0 to S12, on the `esp32s3-r8` board's own
+// description at the image's clock key (../../hal/xtensa-esp32s3/ABI.md §17,
+// board stage P3), then one word stored at the PSRAM's first address, 128 KiB
+// of other PSRAM lines stored to so the data cache writes it back, and the
+// word loaded again, a fill from the chip.
+//
+//   SOS psram: described sysclk=... cpu_per=... core_clk_sel=... divider=...
+//   SOS psram: mapped 0x3d000000-0x3d7fffff, entries 0x100-0x17f read back
+//   SOS psram: word at 0x3d000000 0x5aa5c33c after eviction, misses=...
+//   SOS-S3: halt pass
+//
+// The first line is the description the call compared the part with: the
+// image's clock key's words on the part in a board image, the emulator's in
+// any other, and the divider for a 20 MHz bus at the key. `misses` is the
+// data cache's count of PSRAM misses over the store, the eviction and the
+// load (EXTMEM_DBUS_ACS_SPIRAM_MISS_CNT, cleared first), which the emulator
+// does not model. A stop prints its line and halts with its code. No
+// read-back test runs: this is the first image in which a cache fill reaches
+// the chip.
+
+import kcore.{console}
+import hal
+
+/// What is stored and read back.
+static WORD: UInt32 = 0x5AA5_C33C
+
+/// The PSRAM lines stored to between the store and the load: 128 KiB from
+/// the PSRAM's second 64 KiB, every 16 bytes, which is the part's data cache
+/// line (../../hal/xtensa-esp32s3/ABI.md §15c). It is four times the largest
+/// data cache the part can be set to, so each of the cache's sets sees more
+/// lines than it has ways.
+static EVICT_FROM: UInt = 0x1_0000
+static EVICT_BYTES: UInt = 0x2_0000
+static LINE: UInt = 16
+
+/// EXTMEM_CACHE_ACS_CNT_CLR_REG, DCACHE_ACS_CNT_CLR [0], and
+/// EXTMEM_DBUS_ACS_SPIRAM_MISS_CNT_REG (IDF extmem_reg.h).
+static ACS_CNT_CLR: UInt = 0x600C_40C4
+static DCACHE_ACS_CNT_CLR: UInt32 = 1
+static SPIRAM_MISS_CNT: UInt = 0x600C_40D4
+
+/// The MMU's first PSRAM entry (S12): 256, at data-bus 0x3D00_0000.
+static FIRST_ENTRY: UInt = 0x100
+static PAGE: UInt = 0x1_0000
+
+func word(name: String, v: UInt) unsafe {
+    console().write_str(name)
+    console().write_hex(v)
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.clock_init()
+    let clock = hal.psram_clock()
+    let expect = hal.psram_description(hal.PSRAM_DESCRIBED_BYTES, clock)
+    let record = hal.psram_record()
+    word("SOS psram: described sysclk=", clock.sysclk as UInt)
+    word(" cpu_per=", clock.cpu_per as UInt)
+    word(" core_clk_sel=", clock.core_clk_sel as UInt)
+    word(" divider=", clock.divider as UInt)
+    console().write_str("\n")
+    let stop = hal.psram_bringup(expect, record, hal.PSRAM_THROUGH_S12)
+    if stop != 0 {
+        hal.psram_stop_line(expect, record, stop)
+        hal.exit_fail(stop)
+    }
+    let r = UnsafeMemory<hal.PsramRecord, Normal>(record)
+    let entries = r.mapped.read() as UInt
+    word("SOS psram: mapped ", hal.PSRAM_BASE)
+    word("-", hal.PSRAM_BASE + entries * PAGE - 1)
+    word(", entries ", FIRST_ENTRY)
+    word("-", FIRST_ENTRY + entries - 1)
+    console().write_str(" read back\n")
+
+    UnsafeMemory<UInt32, Device>(ACS_CNT_CLR).write(DCACHE_ACS_CNT_CLR)
+    let at = UnsafeMemory<UInt32, Device>(hal.PSRAM_BASE)
+    at.write(WORD)
+    var offset: UInt = 0
+    while offset < EVICT_BYTES {
+        let line = UnsafeMemory<UInt32, Device>(
+            hal.PSRAM_BASE + EVICT_FROM + offset)
+        line.write(offset as UInt32)
+        offset += LINE
+    }
+    let back = at.read()
+    let misses = UnsafeMemory<UInt32, Device>(SPIRAM_MISS_CNT).read()
+    word("SOS psram: word at ", hal.PSRAM_BASE)
+    word(" ", back as UInt)
+    word(" after eviction, misses=", misses as UInt)
+    console().write_str("\n")
+    if back != WORD {
+        hal.exit_fail(1)
+    }
+    hal.exit_pass()
+}

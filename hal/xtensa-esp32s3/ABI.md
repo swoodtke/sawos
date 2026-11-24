@@ -1833,9 +1833,44 @@ a board" is the order to find out in.
   MISC reads 0 at boot where a part reads `0x00000002` (§15c). The system
   and CPU clock words read the PLL at 320 MHz under every key (§14e).
   *Prepared for:* the bring-up's description carries the emulator's clock
-  words in the smoke and the part's in a board image (§16a); every wait is
-  bounded and every stop is reached by the fault build (§16e). *Unprobed on
-  silicon:* the whole bring-up (§16f).
+  words in an image for the emulator and the part's in a board image
+  (§16a, §17b); every wait is bounded and every stop is reached by the
+  fault build (§16e). *On silicon (rev v0.2, ROM `esp32s3-20210327`):* S0
+  to S10 and the measurement, stages P1 and P2 (§16f). *Unprobed on
+  silicon:* SPI0's PSRAM side, the map and the read-back test, stages P3 on
+  (§17f).
+- **The PSRAM's cache.** Here the cache's model translates every access to
+  an MMU entry with the PSRAM bit straight into the chip's memory, whatever
+  SPI0 holds: there is no cache in between, nothing is evicted or written
+  back, a rewritten entry takes effect at the next access, and EXTMEM's
+  access and miss counters read 0 (§17d). On a part every PSRAM access goes
+  through the data cache, a miss is a burst on the memory-SPI bus at the
+  divider S4 set, a dirty line is written back when evicted, and the
+  instruction cache fills from the chip through the same table.
+  *Prepared for:* the read-back test spans many times the largest data
+  cache, so on a part its reads are fills from the chip (S14); stage P3
+  evicts the one word it reads back, and P4 evicts the word it loads through
+  the instruction bus (§17f). *On silicon (rev v0.2, ROM
+  `esp32s3-20210327`):* stages P3, P4, P5 and P7 at `pll80` printed §17f's
+  text: the word read back after its eviction, the instruction-bus alias
+  read from the chip, and the read-back test passed over 8 MiB.
+  *Unprobed on silicon:* the other clock keys.
+- **`s32c1i` on the PSRAM.** Here it swaps a PSRAM word as it does a DRAM
+  word (`psram_probe`). On a part the PSRAM is external memory behind the
+  cache. ESP-IDF never uses `s32c1i` there: v5.4.1's
+  `esp_cpu_compare_and_set` (esp_hw_support/cpu.c) takes an interrupts-off
+  lock in internal RAM for an external-RAM address, "the native CAS
+  instruction cannot be used". That rule dates from the ESP32, whose
+  PSRAM "hardware ... does not support this operation" (the FreeRTOS port's
+  `uxPortCompareSetExtram`, ESP-IDF v3.0), and was carried into the
+  architecture-wide code every Xtensa target with PSRAM takes; the ESP32-S3
+  errata name no fault of atomics or of `s32c1i`. *Prepared for:* the
+  `esp32s3-r8` board's PSRAM range states no word atomics, so the image
+  builder places neither a process nor a heap's pool there (§17e). *On
+  silicon (rev v0.2, ROM `esp32s3-20210327`):* P4's `s32c1i` at
+  0x3d000010, under ATOMCTL 0x15, answered the old word 5 and left 7, on
+  the one core the kernel runs. *Unprobed on silicon:* `s32c1i` racing a
+  line's eviction or fill, and any second core.
 
 ---
 
@@ -3336,9 +3371,9 @@ PSRAM timing and clocks, and the chip's mode register 0, with commands sent
 on SPI1; a command sent with the flash's chip select enabled goes to the
 flash. This section is the command layer: the bring-up's checks and its
 commands, steps S0 to S10, and the measurement that settles the memory-SPI
-core clock. Not built here: SPI0's PSRAM phases, the cache's map of the
-PSRAM, the read-back test and the board that brings the PSRAM up at boot
-(S11 onward). No image of the tree calls it but its harnesses.
+core clock. SPI0's PSRAM side, the cache's map, the read-back test and the
+`esp32s3-r8` board that brings the PSRAM up at every boot (S11 to S15) are
+§17's.
 
 - `kernel/mspi.c` makes every step and every check, in one call from IRAM
   (`sos_psram_bringup`), and returns at the first check that fails with a
@@ -3427,7 +3462,8 @@ writes leave the words the part already holds. No key is refused; a clock
 key the runner has no part's words for is refused by name when a board
 image is built for it (`_psram_case_asm`). The divider for cache fills at
 20 MHz follows from the reading P2 measured: 4 under `pll80` and
-`pll160`, 2 under `xtal40`, and 1 (SCLK_EQU_SYSCLK) under `rom`.
+`pll160` and 2 under `xtal40`. Under `rom` it would be 1 (SCLK_EQU_SYSCLK),
+which the part read shifted, so `rom` takes 2, a 10 MHz bus (§17b).
 
 A clock change after the bring-up would move every number above with it;
 no image of this tree makes one (§14d's keys run first, in `clock_init`),
@@ -3963,3 +3999,341 @@ P2 uses.
 | P1 after P2 and a reset | MR0 0x09; the rest as P1 at `rom` |
 | P2 at `rom` | MR0 0x09 -> 0x28; A 72.0, B 86.0, C 51.0, D 107.0; K 19999 (first pass 19290), F 22.9, X 56.0; H3, the core at 20 MHz |
 | P2 at `pll80` | MR0 0x09 -> 0x28; A 72.0, B 86.0, C 51.0, D 107.0; K 80000 (first pass 79555), F 91.4, X 14.0; H3, the core at 80 MHz |
+
+---
+
+## 17. The PSRAM mapped, tested and published: the `esp32s3-r8` board
+
+The part's 8 MiB of octal PSRAM becomes process RAM in four more steps after
+§16's: SPI0's PSRAM side (S11) and the cache's map (S12), both in the same
+call from IRAM; the read-back test (S14) and the PSRAM published (S15), in
+Saw. A board described as having PSRAM runs them at every boot, from
+`memory_init`, and either publishes the PSRAM or stops the machine; it
+never boots on without it. The `esp32s3` board describes none and never
+runs them.
+
+- `kernel/mspi.c` makes S11 and S12 when `last_step` reaches them
+  (`STEP_S11`, `STEP_S12`), after S10 has put SPI1 back.
+- `kernel/lib.saw`'s last section is the Saw half of the whole bring-up:
+  the description (`psram_expect`, `psram_description`), the read-back test
+  (`psram_read_back`), its stop line and the success line, and `psram_up`:
+  the call through S12 (`psram_map_up`), then the test and its line
+  (`psram_test_up`). Its `memory_init` writes nothing, and its
+  `psram_bytes` answers 0.
+- `../xtensa-esp32s3-r8/` is the `esp32s3-r8` board: a facade that
+  re-exports this HAL as the module `s3hal` and answers `memory_init`,
+  `psram_bytes`, `map_target_ok`, `map_source_ok` and `segment_bus_ok`
+  (its README). Its `board.toml` is this board's with the PSRAM's range.
+
+### 17a. The order at boot, and the clock
+
+`kmain` calls `clock_init`, prints the banner, then calls `memory_init`
+before the interrupt controller and the loader. Any clock change is
+`clock_init`'s, the image's clock key's (§14d), and nothing after
+`memory_init` writes SYSTEM_SYSCLK_CONF, SYSTEM_CPU_PER_CONF or
+SPI_MEM_CORE_CLK_SEL: the PSRAM's bus is the memory-SPI core clock over the
+divider S4 wrote, and a clock change would move it under every process in
+PSRAM. The runner's `check_clock_registers` holds the sources of this HAL
+and of the facade to it: a file that names one of the three registers in
+code, by address or by name, is a clock key's module, `boot.S` (whose BBPLL
+bring-up only the PLL keys call), or `mspi.c`, which names each by its
+`#define` and reads it with `rd` alone (S0.3); and `kernel/main.saw` calls
+`hal.clock_init()` before `hal.memory_init()`. Its cases are the
+`clock_registers_*` rows of §17d.
+
+### 17b. The description
+
+The description is the facade's, since the kernel needs it at boot, and has
+three parts:
+
+- **The size**, 8 MiB. One fact sets both codes the part is held to: the
+  eFuse's PSRAM_CAP (1 for 8 MiB, 3 for 16) and MR2's density (3 for
+  8 MiB, 5 for 16). AP Memory's vendor (0x0D) and the eFuse's PSRAM_VENDOR
+  1 (AP at 3.3 V) are fixed (`psram_expect`).
+- **The clock**, the image's clock key's: each key's module states the
+  words it leaves on the part (`PART_SYSCLK`, `PART_CPU_PER`,
+  `PART_CORE_CLK_SEL`, from §14h) and the memory-SPI core clock they make
+  (`MSPI_CORE_MHZ`, §16b). A board image carries the part's words, and an
+  image for the emulator the emulator's (§16b's table), chosen by the
+  linker constant that tells the two apart, `_sos_semihosting` (§10): 0 in
+  a board image (`board_image`). The two machines answer S0.3 differently,
+  and the part must match its description exactly.
+- **The divider**, for a 20 MHz bus: the key's core clock over 20, and
+  never less than 2, as IDF's `mspi_timing_ll_set_psram_clock` encodes it
+  (`psram_divider_word`, `PSRAM_DIVIDER_LEAST`). 20 MHz is the speed
+  ESP-IDF first talks to the chip at, half the 40 MHz past which it tunes
+  octal PSRAM. Divide by 1, a bus at the memory-SPI core clock itself, is
+  never used: at `rom`, whose core clock is 20 MHz, stage P3 at divide by 1
+  read MR2 back as 0x09, the mode registers shifted, and stopped at S8.2
+  (0x5B), and nothing here tunes the controller's input timing, as ESP-IDF
+  does before it raises a bus that far. So `rom` runs the bus at 10 MHz,
+  divide by 2, as `xtal40` runs cleanly on the part at a 40 MHz core.
+- **The chip select at 10 MHz.** A cache fill holds chip select low for the
+  command (1 clock), the address (2), the read latency (10 to 20, the
+  second figure when a refresh doubles it) and the data at two bytes a
+  clock: 21 to 31 clocks for the part's 16-byte line, 29 to 39 for a
+  32-byte line and 45 to 55 for 64 bytes. At 10 MHz that is 2.1 to 3.1 us,
+  2.9 to 3.9 us and 4.5 to 5.5 us, inside AP Memory's tCEM of 8 us at
+  standard temperature (§16b) at every line size the data cache takes; at
+  20 MHz, half as long. A write-back is its own transaction, as short.
+
+```
+key       part's SYSCLK_CONF  CPU_PER_CONF  core clock  divider  word
+          & 0x80FFF           & 7
+rom       0x00080001          0x4           20 MHz      2        0x00010001
+xtal40    0x00080000          0x4           40 MHz      2        0x00010001
+pll80     0x00080400          0x4           80 MHz      4        0x00030103
+pll160    0x00080400          0x5           80 MHz      4        0x00030103
+pll240    0x00080400          0x6           80 MHz      4        0x00030103
+emulator  0x00080401          0x0           -           the key's
+```
+
+`pll240`'s are its board run's words, `sysclk` 0x000a8400 and `cpu_per`
+0x0000000e. The runner's `PSRAM_PART_CLOCK` holds the same words for the
+command layer's harnesses (§16a), whose description keeps divide by 4, the
+divider stages P1 and P2 ran at.
+
+### 17c. The steps
+
+```
+step  writes, in order                                  source
+S11   SPI_MEM_CACHE_SCTRL(0) (0x6000_3040), RMW:        IDF s_config_psram_
+        CACHE_USR_SCMD_4BYTE [0], USR_WR_SRAM_DUMMY      spi_phases;
+        [3], USR_RD_SRAM_DUMMY [4], CACHE_SRAM_USR_RCMD  OCT_PSRAM_RD_DUMMY_
+        [5], CACHE_SRAM_USR_WCMD [20], SRAM_OCT [21]     BITLEN, _WR_DUMMY_,
+        set; SRAM_RDUMMY_CYCLELEN [11:6] 17,             _ADDR_BITLEN
+        SRAM_ADDR_BITLEN [19:14] 31,
+        SRAM_WDUMMY_CYCLELEN [27:22] 7
+      SPI_MEM_SRAM_DRD_CMD(0) (0x6000_3048), RMW:        OPI_PSRAM_SYNC_READ
+        [31:28] 15, [15:0] 0x0000
+      SPI_MEM_SRAM_DWR_CMD(0) (0x6000_304C), RMW:        OPI_PSRAM_SYNC_WRITE
+        [31:28] 15, [15:0] 0x8080
+      SPI_MEM_SPI_SMEM_DDR(0) (0x6000_30E4), RMW:
+        DDR_EN [0], VAR_DUMMY [1] set; RDAT_SWP [2],
+        WDAT_SWP [3] clear
+      SPI_MEM_SRAM_CMD(0) (0x6000_3044), RMW: SDIN_OCT,
+        SDOUT_OCT, SADDR_OCT, SCMD_OCT, SDUMMY_OUT
+        [22:18] set
+S12   MMU entries 256 + n (0x600C_5400 + 4n) =           IDF mmu_ll_write_
+        0x8000 | n, for one entry per 64 KiB of the      entry, s_psram_
+        described density (128 for 8 MiB); each read     mapping; ext_mem_
+        back; EXTMEM_DCACHE_CTRL1 (0x600C_4004) read:    defs.h; extmem_reg.h
+        bits 0 and 1 must be clear                       and cache_ll_l1_
+                                                         enable_bus, which
+                                                         disagree
+S14   (Saw) every eighth word of the described size at   IDF esp_psram.c,
+        0x3D00_0000 written with its word index ^        s_test_psram
+        0xAAAAAAAA, then each read back
+S15   (Saw) `psram_bytes` answers the described size
+```
+
+On the part SPI0's PSRAM side reads `sctrl` `0x0055c070`, `smem_ddr`
+`0x00003020` and the rest 0 (§15c), so S11 leaves `sctrl` `0x01f7c479`,
+`smem_ddr` `0x00003023`, `drd` `0xf0000000`, `dwr` `0xf0008080` and
+`sram_cmd` `0x007c0000`. None of SPI0's flash-side words is written, and no
+PSRAM page is mapped while these change, so no access reaches chip select 1
+then.
+
+The map leaves entries 0 to 255 the ROM's flash pages, which the kernel and
+every process's code and read-only data are read through; the replaced
+entries named flash pages past the 4 MiB flash, which nothing reads. One
+table serves both buses, so the PSRAM's pages are also instruction-bus
+0x4300_0000 up. That is why `FLASH_WINDOW_LEN` is 16 MiB on both boards:
+`in_flash_window` never takes an address of the PSRAM's under either bus's
+name, so `same_bytes` never pairs 0x4300_0000 with 0x3D00_0000 and no code
+is used in place there. The boards' `[flash]` windows and the runner's
+`ESP32S3_FLASH_WINDOW` are the same 16 MiB, and the build's in-place check
+reads them.
+
+No cache operation is made: nothing has read the PSRAM's addresses since
+reset, so no line of them is in the data cache, and ESP-IDF maps the PSRAM
+the same way. The read-back test spans 8 MiB, many times the largest data
+cache (64 KiB), so every word it writes has been written back to the chip
+before the read pass reaches it, and every read is a fill from the chip; a
+chip smaller than its description aliases, and a later word reads back where
+an earlier one was.
+
+**The stops**, after §16c's, in the order the boot makes them. Each prints
+its line; `memory_init` then halts with the code as its status.
+
+```
+0x5E S12.2  SOS-S3: psram stop: MMU entry 0x... reads 0x........, wrote
+            0x........                                (SPI1 already put back)
+0x5F S12.3  SOS-S3: psram stop: data bus off, EXTMEM_DCACHE_CTRL1 =
+            0x........
+0x60 S14    SOS-S3: psram stop: read-back at 0x3d...... read 0x........,
+            wrote 0x........ (0x........ of 0x........ words wrong)
+```
+
+On success, one line, then the boot goes on:
+
+```
+SOS-S3: psram 8 MiB at 0x3d000000, MR0=0x.. MR1=0x.. MR2=0x.. MR3=0x..,
+read-back ok
+```
+
+MR0 and MR1 are S9's read-back, MR2 and MR3 S8's.
+
+### 17d. The emulator and the smoke
+
+The cache's model (`hw/misc/esp32s3_cache.c`) translates an access through
+an entry with the PSRAM bit into the octal chip's memory directly, at once
+and every time: no line is held, nothing is evicted, a rewritten entry
+takes effect at the next access, and EXTMEM's access and miss counters read
+0. SPI0 is not modelled, so S11's words read back 0 and are held as the
+stores the trace shows. The `esp32s3-r8` board's runs get the part's PSRAM
+and eFuse as §16e's harnesses do, and the flash model's trace, which shows
+the ROM's one command (`0xab`) and nothing more on every run.
+
+```
+case                        board    what
+psram_map                   esp32s3  the fault build through S12, no fault:
+                                     six commands, S11's words, the map's
+                                     first and last entries stored, and
+                                     entries 255 and 384 not
+psram_spi0_only             esp32s3  through S11: S11's words, no MMU entry
+psram_stop_mmu, _top        esp32s3  entry 300's read-back lied to, and
+                                     the last entry's, 383: 0x5E
+psram_stop_bus_off, _1      esp32s3  DCACHE_CTRL1 read with bit 0 set, and
+                                     with bit 1: 0x5F
+psram_clock_<key>           r8       the description at rom, xtal40, pll80,
+                                     pll240: the emulator's words and the
+                                     key's divider
+psram_clock_board_<key>     r8       a board image's at rom, pll80, pll240:
+                                     the part's words; booted, it halts in
+                                     its quiet loop (`quiet_halt`)
+psram_word, _pll80          r8       P3: the call through S12 at the key's
+                                     divider, which SRAM_CLK(0) and
+                                     CLOCK(1) are stored with; one word
+                                     through the map
+psram_probe                 r8       P4: `memory_init`; the test's first
+                                     and last words, 0xaaaaaaaa and
+                                     0xaab55552; every width, `s32c1i` and
+                                     the instruction-bus alias
+psram_speed                 r8       P5: the measurements' lines
+psram_wrong_size            r8       P7: a 16 MiB description on the 8 MiB
+                                     eFuse: 0x51, nothing sent
+psram_up_16m                r8       the same description on `-m 16M` and a
+                                     16 MiB eFuse: 256 entries, the test over
+                                     16 MiB, 16 MiB published
+psram_stop_read_back        r8       `psram_map_up`, entries 320 and 383
+                                     rewritten to pages 0 and 126, one in
+                                     each half, `psram_test_up`: 0x60, 4096
+                                     of 262144 words wrong
+psram_ranges, _s3           both     the process-RAM and flash rules before
+                                     and after `memory_init` (§17e)
+psram_boot                  r8       `root_server_boot` on this board: the
+                                     success line, then root
+psram_boot_no_efuse         r8       the shipping kernel stopped at
+                                     `memory_init` (0x51) before root
+<gate case>_r8              r8       every process case of the S3's again,
+                                     the success line first (§17e)
+clock_registers_clean       -        `check_clock_registers` passes the tree
+clock_registers_<slip>      -        it refuses a store in `mspi.c`, in this
+                                     HAL and in the facade, and `memory_init`
+                                     before `clock_init`, and passes a store
+                                     a clock key makes
+```
+
+What the emulator cannot show: S11's words taking effect, any fill or
+write-back, the cost of a miss, `s32c1i` on cached external memory (it
+allows it, as it does at DRAM), and the instruction cache filling from the
+chip; stages P3 to P5 are the part's.
+
+### 17e. The PSRAM as process RAM
+
+Once published, the PSRAM is process RAM beside the SRAM range:
+`map_target_ok` and `map_source_ok` take a range inside either, and
+`segment_bus_ok` a writable or read-only segment copied into either; a range
+that reaches into both is refused, since the bytes between them are flash
+and the rest of the address space. Code is still used only in place in the
+flash instruction window. Before `memory_init` has published it, and on the
+`esp32s3` board always, the PSRAM is none of these (`process_ram`,
+`psram_ranges`).
+
+The board's `[ram.psram]` range is `slow` and states no word atomics, so
+the image builder places neither a process nor a heap's pool in it: a
+process's region holds the runtime's own atomic words, its locks, its heap
+table and its start-up flag, and a heap's pool may hold a program's. P4
+shows `s32c1i` swapping a cached PSRAM word on the part, and whether the
+range states them is the owner's call. The PSRAM's pads, 33 to 37, are
+refused to every driver's configuration on every board, as the flash bus's
+are (`drivers/esp32s3io`'s `check_pin`): on a part with octal PSRAM in its
+package they are wired to the RAM chip. Root's region is in SRAM
+(`ROOT_LOAD_BASE`), so the default process range is, and so is the default
+pool. In the smoke the Blade-built processes
+are placed in SRAM as on the `esp32s3` board, and the two boards share their
+images; a hand-assembled child's destination (`asm_child_region_base`
+0x3D00_0000) and the pool (`pool_base` 0x3D04_0000) are PSRAM, so
+`image_held_r8` runs a child whose stack the kernel grants in PSRAM, and the
+pool and heap cases cut PSRAM. Two are left out, `pool_back` and
+`pool_odd_len`, whose package carries the `esp32s3` board's pool base
+(`tests/poolbase_xtensa.c`) and checks the pool's place against it, since
+both boards share their images; so is every case built from a hand-written
+image, which names its board, and every case whose build is refused. The
+smoke prints the list. A case that boots
+a harness kernel of its own runs with the PSRAM not brought up.
+
+### 17f. The board stages
+
+Each is built with `python3 tools/sos_runner.py --board esp32s3 --emit-flash
+CASE --clock KEY --out PATH`; the description is the part's at KEY. Every
+image writes what §16f's do, then SPI0's PSRAM side and MMU entries 256 to
+383, all volatile: a reset through EN puts them back, and the PSRAM loses
+everything at power-off. Nothing writes an eFuse or the flash, and the
+flash's chip select is never selected after the ROM's own reads. `<v>` is a
+value the part prints and the record keeps.
+
+**P3, `psram_word`.** The first image in which a cache fill reaches the chip.
+
+```
+SOS psram: described sysclk=<the key's> cpu_per=<the key's>
+           core_clk_sel=0x00000000 divider=<the key's>
+SOS psram: mapped 0x3d000000-0x3d7fffff, entries 0x00000100-0x0000017f read
+           back
+SOS psram: word at 0x3d000000 0x5aa5c33c after eviction, misses=<v>
+SOS-S3: halt pass
+```
+
+`misses` is at least 1 on a part, where the word is filled from the chip.
+
+**P4, `psram_probe`.**
+
+```
+SOS-S3: psram 8 MiB at 0x3d000000, MR0=0x28 MR1=0x0d MR2=<v> MR3=<v>,
+read-back ok
+SOS psram: up and tested in <v> us, published 8388608 bytes
+SOS probe: word load, PSRAM at 0x3d000000
+SOS probe: ok 0xaaaaaaaa
+SOS probe: word load, PSRAM at 0x3d7fffe0
+SOS probe: ok 0xaab55552
+SOS probe: word store and load, PSRAM at 0x3d000000
+SOS probe: ok 0x5a5aa5a5
+... (each step, and `ok <value>` or `refused cause=... vaddr=...`)
+SOS probe: word store, then s32c1i swapping it, PSRAM at 0x3d000010
+SOS probe: ok 0x00000005 | refused cause=<v> vaddr=0x3d000010
+SOS probe: word stored at 0x3d000100 and evicted, word load at 0x43000100
+SOS probe: ok 0xc3d2e1f0
+SOS probe: done
+SOS-S3: halt pass
+```
+
+(each wrapped line is one line). The emulator's values are `psram_probe`'s.
+A refused `s32c1i` means a process in PSRAM cannot use word atomics there,
+and the board's PSRAM range keeps stating none.
+
+**P5, `psram_speed`.** P4's bring-up, then the measurements its header
+lists, each `<v> ticks, <v> accesses, <v> misses`; the record keeps every
+number.
+
+**P7, `psram_wrong_size`.**
+
+```
+SOS-S3: psram stop: efuse word 0x60007054 = <v> says PSRAM_CAP=0x1
+PSRAM_VENDOR=0x1, the board says 0x3 (16 MiB) and 0x1 (AP 3.3 V)
+SOS psram: published 0x00000000 bytes
+SOS-S3: halt fail code=0x00000051
+```
+
+Then the `esp32s3` board's `root_server_boot` runs as README's stage 5: a
+stop leaves nothing behind.

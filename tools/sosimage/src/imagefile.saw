@@ -838,7 +838,8 @@ extension Bindings: ExplicitCopy {}
 /// such record; a client bound to no serve of its protocol; a fast process
 /// the image places in a slow range, or one it names no range for on a board
 /// with no fast process range (`choose_range`, which places a fast process
-/// that names none in a fast range); a heap the board cannot serve
+/// that names none in a fast range); a process placed in a range without
+/// `atomics = true`; a heap the board cannot serve
 /// (`bind_heaps`); an input with no value, or an image
 /// input that is none of the process's; and a `console` that is not
 /// PROCESS.RECORD, or names no process of the image, no record of that
@@ -987,11 +988,17 @@ func bind_process(image: &ImageFile, board: &Board, d: &Declaration,
 
     // The process's placement: the range the image names, else one its speed
     // allows (`choose_range`); a fast process the image places in a slow
-    // range is refused.
+    // range is refused, and so is one placed in a range without
+    // `atomics = true`: its region holds the runtime's own atomic words (the
+    // arena's and the output's locks, the heap table and its adoption, the
+    // start-up flag), as a heap's pool may.
     let ram = try choose_range(&board, process.ram, d.fast, process.name, file, process.at)
     if let r = board.range(ram) {
         if d.fast && not r.fast {
             return refused(file, process.at, "the process {process.name} declares ram = \"fast\" and is placed in {ram}, a slow range")
+        }
+        if not r.atomics {
+            return refused(file, process.at, "the process {process.name} is placed in {ram}, which does not state `atomics = true` on the board {board.name}: a process's region holds the runtime's atomic words, so it lies where word atomics work")
         }
     }
 

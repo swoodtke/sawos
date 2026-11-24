@@ -1,0 +1,147 @@
+// What a PSRAM access costs, measured on the `esp32s3-r8` board
+// (../../hal/xtensa-esp32s3/ABI.md §17, board stage P5): the PSRAM brought up
+// as the shipping kernel does (`hal.memory_init`), then five measurements,
+// each SYSTIMER's ticks (16 a microsecond) and the data cache's counts of
+// its accesses and of its PSRAM misses (EXTMEM_DBUS_ACS_CNT,
+// EXTMEM_DBUS_ACS_SPIRAM_MISS_CNT, cleared before each):
+//
+//   1. a read walk, one word in each 32 bytes, over 1 MiB of PSRAM, then
+//      over 64 KiB of process SRAM;
+//   2. the same walk over the PSRAM writing, which adds the write-back of
+//      the dirty lines it evicts;
+//   3. 16 KiB of PSRAM read 16 times, which the data cache holds: the cost
+//      of a hit;
+//   4. 4 KiB copied from SRAM into PSRAM 16 times by words, as a kernel copy
+//      into a process's PSRAM is made, interrupts masked.
+//
+// The bring-up's own time, the read-back test's included, is the first line
+// after the PSRAM's. Every number is printed for the record and none is
+// held: on the emulator they follow host time and the counters read 0.
+//
+//   SOS psram: up and tested in ... us
+//   SOS psram: read walk PSRAM 1 MiB: ... ticks, ... accesses, ... misses
+//   SOS psram: read walk SRAM 64 KiB: ... ticks, ... accesses, ... misses
+//   SOS psram: write walk PSRAM 1 MiB: ... ticks, ... accesses, ... misses
+//   SOS psram: hits PSRAM 16 KiB x 16: ... ticks, ... accesses, ... misses
+//   SOS psram: copy SRAM to PSRAM 4 KiB x 16: ... ticks, ... accesses, ...
+//   misses
+//   SOS-S3: halt pass
+
+import kcore.{console}
+import hal
+
+/// EXTMEM_CACHE_ACS_CNT_CLR_REG, DCACHE_ACS_CNT_CLR [0];
+/// EXTMEM_DBUS_ACS_SPIRAM_MISS_CNT_REG; EXTMEM_DBUS_ACS_CNT_REG (IDF
+/// extmem_reg.h).
+static ACS_CNT_CLR: UInt = 0x600C_40C4
+static DCACHE_ACS_CNT_CLR: UInt32 = 1
+static SPIRAM_MISS_CNT: UInt = 0x600C_40D4
+static DBUS_ACS_CNT: UInt = 0x600C_40D8
+
+static TICKS_PER_US: UInt64 = 16
+static STRIDE: UInt = 32
+static WALK_PSRAM: UInt = 0x10_0000
+static WALK_SRAM: UInt = 0x1_0000
+static HIT_BYTES: UInt = 0x4000
+static COPY_BYTES: UInt = 0x1000
+static ROUNDS: UInt = 16
+
+/// Where the copy's source sits: the process SRAM, which no process holds in
+/// a harness kernel.
+static SRAM_FROM: UInt = 0x3FCB_0000
+
+/// `v` in decimal.
+func decimal(v: UInt64) unsafe {
+    if v >= 10 {
+        decimal(v / 10)
+    }
+    hal.console_byte(((v % 10) + 48) as UInt8)
+}
+
+/// A measurement's start: the counters cleared, SYSTIMER read.
+func begin() unsafe -> UInt64 {
+    UnsafeMemory<UInt32, Device>(ACS_CNT_CLR).write(DCACHE_ACS_CNT_CLR)
+    hal.psram_ticks()
+}
+
+/// A measurement's line, from its start.
+func end(name: String, start: UInt64) unsafe {
+    let ticks = hal.psram_ticks() - start
+    let accesses = UnsafeMemory<UInt32, Device>(DBUS_ACS_CNT).read()
+    let misses = UnsafeMemory<UInt32, Device>(SPIRAM_MISS_CNT).read()
+    console().write_str("SOS psram: ")
+    console().write_str(name)
+    console().write_str(": ")
+    decimal(ticks)
+    console().write_str(" ticks, ")
+    decimal(accesses as UInt64)
+    console().write_str(" accesses, ")
+    decimal(misses as UInt64)
+    console().write_str(" misses\n")
+}
+
+/// Load one word in each `STRIDE` bytes of `[base, base + len)`; answer
+/// their sum, so no load is left out.
+func read_walk(base: UInt, len: UInt) unsafe -> UInt32 {
+    var sum: UInt32 = 0
+    var at: UInt = 0
+    while at < len {
+        sum = sum &+ UnsafeMemory<UInt32, Device>(base + at).read()
+        at += STRIDE
+    }
+    sum
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.clock_init()
+    let up = hal.psram_ticks()
+    hal.memory_init()
+    console().write_str("SOS psram: up and tested in ")
+    decimal((hal.psram_ticks() - up) / TICKS_PER_US)
+    console().write_str(" us\n")
+    let base = hal.PSRAM_BASE
+    var sum: UInt32 = 0
+
+    var t = begin()
+    sum = sum &+ read_walk(base, WALK_PSRAM)
+    end("read walk PSRAM 1 MiB", t)
+    t = begin()
+    sum = sum &+ read_walk(SRAM_FROM, WALK_SRAM)
+    end("read walk SRAM 64 KiB", t)
+
+    t = begin()
+    var at: UInt = 0
+    while at < WALK_PSRAM {
+        UnsafeMemory<UInt32, Device>(base + at).write(at as UInt32)
+        at += STRIDE
+    }
+    end("write walk PSRAM 1 MiB", t)
+
+    sum = sum &+ read_walk(base, HIT_BYTES)
+    t = begin()
+    var round: UInt = 0
+    while round < ROUNDS {
+        sum = sum &+ read_walk(base, HIT_BYTES)
+        round += 1
+    }
+    end("hits PSRAM 16 KiB x 16", t)
+
+    t = begin()
+    round = 0
+    while round < ROUNDS {
+        var word: UInt = 0
+        while word < COPY_BYTES {
+            UnsafeMemory<UInt32, Device>(base + word).write(
+                UnsafeMemory<UInt32, Device>(SRAM_FROM + word).read())
+            word += 4
+        }
+        round += 1
+    }
+    end("copy SRAM to PSRAM 4 KiB x 16", t)
+
+    console().write_str("SOS psram: sum ")
+    console().write_hex(sum as UInt)
+    console().write_str("\n")
+    hal.exit_pass()
+}
