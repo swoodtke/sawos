@@ -16799,8 +16799,11 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
 
     def check_number(want, out):
         """Hold the decimal that follows `want["after"]` in the console to
-        `want["at_least"]` .. `want["at_most"]`. Returns (ok, reason)."""
-        m = re.search(re.escape(want["after"]) + r"(\d+)", out)
+        `want["at_least"]` .. `want["at_most"]`. `want["past"]`, a regular
+        expression, is matched between `after` and the decimal, to reach a
+        later number on the line. Returns (ok, reason)."""
+        m = re.search(re.escape(want["after"]) + want.get("past", "")
+                      + r"(\d+)", out)
         if not m:
             return False, f"no decimal after {want['after']!r}"
         v = int(m.group(1))
@@ -16940,6 +16943,27 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "name": "boot_xtal40",
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "clock": "xtal40",
+            "expect_out": [rom, *clock_xtal40_lines, banner,
+                           "SOS: bad root image: no root image appended",
+                           "SOS-S3: halt fail code=0x00000004"],
+            "expect_clean_exit": False,
+            "expect_status": 4,
+        },
+        {
+            # The `xtal40` key's two measured speeds on the instruction-counted
+            # clock, where CCOUNT (40 MHz) and SYSTIMER (16 MHz) count the
+            # same virtual time, so each figure is the models' ratio and the
+            # same on every run of one image. Both whole-MHz figures land
+            # near 40; a unit, a window or an end out of place moves them by
+            # a factor.
+            "name": "clock_mhz_icount",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "clock": "xtal40",
+            "icount": True,
+            "expect_number": [
+                {"after": "mhz=", "at_least": 36, "at_most": 44},
+                {"after": "mhz=", "past": r"\d+\.\d+->", "at_least": 36,
+                 "at_most": 44}],
             "expect_out": [rom, *clock_xtal40_lines, banner,
                            "SOS: bad root image: no root image appended",
                            "SOS-S3: halt fail code=0x00000004"],
@@ -17824,8 +17848,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "src": os.path.join(s3_tests, "psram_mode.saw"),
             "psram": {},
             "icount": True,
-            "expect_number": {"after": "SOS psram: CPU ", "at_least": 36000,
-                              "at_most": 44000},
+            "expect_number": [{"after": "SOS psram: CPU ",
+                               "at_least": 36000, "at_most": 44000}],
             "flash_commands": flash_once,
             "expect_out": [
                 rom,
@@ -19718,10 +19742,12 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         # counter's loads.
         if ok and case.get("expect_counter_span"):
             ok, reason = check_counter_span(case, traced_accesses(trace))
-        # A decimal the console prints (`expect_number`): the first after
-        # `after`, between `at_least` and `at_most`.
-        if ok and case.get("expect_number"):
-            ok, reason = check_number(case["expect_number"], out)
+        # Decimals the console prints (`expect_number`, a list): the first
+        # after `after`, between `at_least` and `at_most`.
+        for want in case.get("expect_number", ()) if ok else ():
+            ok, reason = check_number(want, out)
+            if not ok:
+                break
         if ok:
             print(f"[{i}/{len(cases)}] {CHECK} {name}  "
                   f"({size} bytes of flash)")

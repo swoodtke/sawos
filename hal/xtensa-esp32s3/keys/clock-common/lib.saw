@@ -194,22 +194,41 @@ func systimer_now() unsafe -> UInt64 {
     ((hi as UInt64) << WORD_BITS) | (lo as UInt64)
 }
 
-/// The CPU's speed in hundredths of a MHz: CCOUNT's advance over at least
-/// `MEASURE_TICKS` of SYSTIMER, which `systimer_start` has started. The
-/// division goes through microseconds so every step stays in one word however
-/// long a slow host stretches the interval.
+/// One end of a pass's interval: SYSTIMER's count, then CCOUNT. Both ends
+/// run these same instructions, so the time from the snapshot to the CCOUNT
+/// read is the same at each and drops out of the difference.
+///
+/// No preemption point: the snapshot polls a hardware latch.
+func cpu_sample() unsafe -> (UInt64, UInt) {
+    let ticks = systimer_now()
+    (ticks, sos_ccount_read())
+}
+
+/// One pass: CCOUNT's advance, and SYSTIMER's over the same interval, at
+/// least `MEASURE_TICKS`, as hundredths of a MHz. The division goes through
+/// microseconds so every step stays in one word however long a slow host
+/// stretches the interval.
+func cpu_pass() unsafe -> UInt {
+    let start = cpu_sample()
+    var end = cpu_sample()
+    while end.0 - start.0 < MEASURE_TICKS {
+        end = cpu_sample()
+    }
+    let cycles = (end.1 &- start.1) as UInt
+    let us = UInt.from(truncating: (end.0 - start.0) / TICKS_PER_US)
+    (cycles / us) * 100 + (cycles % us) * 100 / us
+}
+
+/// The CPU's speed in hundredths of a MHz, SYSTIMER having been started by
+/// `systimer_start`: two passes back to back, the second the measurement. The
+/// first fills the caches with the code it runs from flash, whose first fetch
+/// at a slow clock costs a thousand cycles or more and, landing between one
+/// end's snapshot and its CCOUNT read, would count against that end alone.
 ///
 /// No preemption point: it runs at boot, before anything else.
 public func cpu_centi_mhz() unsafe -> UInt {
-    let start = systimer_now()
-    let cycles_start = sos_ccount_read()
-    var at = start
-    while at - start < MEASURE_TICKS {
-        at = systimer_now()
-    }
-    let cycles = sos_ccount_read() &- cycles_start
-    let us = UInt.from(truncating: (at - start) / TICKS_PER_US)
-    (cycles / us) * 100 + (cycles % us) * 100 / us
+    let _ = cpu_pass()
+    cpu_pass()
 }
 
 /// Write one console byte: wait for room, then store it, as the HAL's console

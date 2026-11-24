@@ -2872,8 +2872,11 @@ done path and `bbpll=`); the speed the three clock stores give; the wait's
 threshold within its last 31 counts, and its length on the part, which
 counts the part's own SYSTIMER; the bring-up's
 path through the PLL keys (the emulator's source is the PLL); that the
-bring-up and the stub need IRAM; the flash at 20 MHz; and the snapshot thrown
-away before a measurement.
+bring-up and the stub need IRAM; the flash at 20 MHz; the snapshot thrown
+away before a measurement; and the measurement's warm-up pass, and its
+two-sided shape as a whole: on the counted clock there is no cold fetch, so
+the one-sided measurement it replaced reads the same there, and only the
+part tells them apart (§14h).
 
 ### 14f. The profile: where a round of `kill_churn` goes
 
@@ -2950,12 +2953,19 @@ kill_churn_profile, xtal40   19.54        40.01
 So the ROM leaves the CPU on the crystal divided by two, and one store
 makes it the crystal. The figure before the store reads about 2.5% under
 the 20 MHz the registers say, and the one after reads true. The images
-above took their first SYSTIMER snapshot inside the first measurement, just
-after enabling its clock; if that first handshake is the slow one, the
-measurement counts its time in SYSTIMER's interval and not in CCOUNT's. The
-keys take one snapshot first and throw it away (`systimer_start`), so an
-`xtal40` image built that way reads its figure before the store without the
-first handshake (the table below).
+above were read by a one-sided measurement: the two ends of the interval
+ran differently (a snapshot then CCOUNT at the start, a polling loop then
+CCOUNT at the end) in one cold pass. Flash fetches and the first slow
+SYSTIMER handshake landed at the start and were counted late, which reads
+low. The keys now measure as the PSRAM's P2 does (`cpu_centi_mhz`,
+`psram_cpu_passes`): both ends through the same sampler, a warm-up pass that
+fills the caches, and the second pass used, over at least 5 ms of SYSTIMER.
+The rows above were read before that and are not remeasured. On the part,
+`kill_churn` at `pll80` built with the two-sided measurement reads
+`mhz=20.00->80.00` on four boots running, and 5.78 s from the reset to `200
+rounds`, where the one-sided images of the same hour read 19.60 to 19.81
+before. The case `clock_mhz_icount` holds the figure's arithmetic on the
+emulator's instruction-counted clock.
 
 `kill_churn`, from the reset to `200 rounds, every create succeeded`:
 26.05 s at `rom`, 13.44 s at `xtal40`.
