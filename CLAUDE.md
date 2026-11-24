@@ -359,8 +359,9 @@ verified-dead.
 ## Workflow
 - The lead writes a brief for each unit as a sawtracker issue.
 - Implementers are subagents: Sonnet by default, Opus for units whose judgment
-  warrants it (spec and API contracts). At most 2 run at once, whatever the
-  model (user ruling). An implementer never spawns subagents or forks, and
+  warrants it (spec and API contracts). By default at most 2 run at once,
+  whatever the model, unless the owner sets another number for a stretch of
+  work (user ruling). An implementer never spawns subagents or forks, and
   never disables the sandbox.
 - An implementer who finds a brief wrong or incomplete stops and returns a
   `CLARIFICATION REQUEST:` to the lead rather than guessing.
