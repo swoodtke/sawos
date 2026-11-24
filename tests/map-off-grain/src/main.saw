@@ -1,19 +1,24 @@
-// A mapping covers exactly its allocation (spec §2.5): `map` refuses an
-// allocation whose base is off the protection grain with the `BadArg` fault,
-// rather than grant the bytes before it in its first grain.
+// `map` answers a status, never a fault, for an allocation the board cannot
+// grant (spec §2.5): a server that maps a client's Memory cannot check it
+// first, and a mapping covers exactly its allocation, so none is rounded.
 //
-// The build gives root two boot allocations off the grain beside its pool
-// (`off_grain_destinations`): one whose length is off the grain, which
-// `tests/dest-grain` maps, and one whose base is a byte past the grain and
-// whose length is whole grains, which this case maps. An allocation out of
-// the pool, on the grain, is mapped first:
+// The build gives root, beside its pool, a boot allocation whose length is
+// off the grain (`off_grain_destinations`), one whose base is a byte past the
+// grain with whole grains of length, one whose length runs off the end of the
+// address space (`wrapping_region`) and one of no bytes (`empty_region`). An
+// allocation out of the pool, on the grain, maps first; each of the others is
+// `NoResource` and root carries on:
 //
 //   SOS mapgrain: an allocation on the grain, mapped: taken
-//   SOS mapgrain: the allocation whose base is off the grain, mapped
-//   SOS: process fault: argument outside its domain process=0
+//   SOS mapgrain: a length off the grain: <status>
+//   SOS mapgrain: a base off the grain: <status>
+//   SOS mapgrain: a length past the end of the address space: <status>
+//   SOS mapgrain: a length of zero: <status>
+//   SOS mapgrain: done
 //
-// The second map is root's last call: the fault ends root, and the machine
-// with it.
+// A 64-bit row's length is a signed integer in the description, so the
+// build has no row that runs off the end of the address space there, and the
+// third line says so instead.
 
 import sos.{System, Process, Memory, Pool, MapAccess, SosStatus}
 
@@ -47,14 +52,14 @@ func _start(boot_handle: UInt) {
 }
 
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
-    // The pool, then the two allocations off the grain: the table's order.
+    // The pool, the two allocations off the grain, the one that wraps and the
+    // empty one: the table's order, each read where it is mapped.
     var pool_rec = try proc.boot_handle_next()
     var short_rec = try proc.boot_handle_next()
     var skewed_rec = try proc.boot_handle_next()
     guard let pool = pool_rec.take_pool() else { return BUG }
     guard let short = short_rec.take_memory() else { return BUG }
     guard let skewed = skewed_rec.take_memory() else { return BUG }
-    let _ = move short
 
     let piece = try pool.allocate(len: PAGE)
     let view = try proc.map(memory: &piece, access: RW)
@@ -62,11 +67,46 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
         "SOS mapgrain: an allocation on the grain, mapped: taken\n")
     let _ = move view
 
-    let _ = system.debug_print(
-        "SOS mapgrain: the allocation whose base is off the grain, mapped\n")
-    let mapped = try proc.map(memory: &skewed, access: RW)
-    let _ = system.debug_print(
-        "SOS mapgrain: a map whose base is off the grain: taken\n")
-    let _ = move mapped
+    try refused(&proc, &short, "a length off the grain")
+    try refused(&proc, &skewed, "a base off the grain")
+
+    // A 64-bit table has no row that runs off the end of the address space:
+    // a length is a signed integer in the description.
+    if sizeof<UInt>() == 8 {
+        print("SOS mapgrain: no row runs off a 64-bit address space\n")
+    } else {
+        var wide_rec = try proc.boot_handle_next()
+        guard let wide = wide_rec.take_memory() else { return BUG }
+        try refused(&proc, &wide, "a length past the end of the address space")
+    }
+
+    var empty_rec = try proc.boot_handle_next()
+    guard let empty = empty_rec.take_memory() else { return BUG }
+    try refused(&proc, &empty, "a length of zero")
+    return
+}
+
+/// A `map` of `memory` that answers `NoResource`, which is printed. A mapping,
+/// or any other status, fails the case.
+func refused(proc: &Process, memory: &Memory,
+             what: String) -> Result<Void, SosStatus> {
+    match proc.map(memory: &memory, access: RW) {
+        case Ok(_) -> {
+            print("SOS mapgrain: {}: mapped\n", what)
+            return BUG
+        },
+        case Err(status) -> {
+            match status {
+                case NoResource -> {
+                    print("SOS mapgrain: {}: {}\n", what, status)
+                },
+                case _ -> {
+                    print("SOS mapgrain: {}: the wrong status: {}\n", what,
+                          status)
+                    return BUG
+                },
+            }
+        },
+    }
     return
 }

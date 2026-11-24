@@ -1762,6 +1762,15 @@ def expectations(arch):
         # (`destination_past_window`): `BadImage` where a child's rows must
         # fit a window shorter than that above its link base, and loaded where
         # any RAM can be granted.
+        # `map_refused_regions`: a row's length is a signed 64-bit integer in
+        # the description, so a 64-bit word has no row whose length runs off
+        # the end of the address space, and its table has one row fewer.
+        "map_regions": f"0x{4 if arch['name'] == 'arm64' else 5:0{width}x}",
+        "map_wrap_line": ("SOS mapgrain: no row runs off a 64-bit "
+                          "address space"
+                          if arch["name"] == "arm64" else
+                          "SOS mapgrain: a length past the end of the "
+                          "address space: no room for what was asked"),
         "wide_destination": ("BadImage"
                              if arch.get("image_window_len") is not None
                              and arch["image_window_len"]
@@ -12561,10 +12570,7 @@ TEST_CASES = [
         # thread is made on its stack's top word; with a one-byte executable
         # segment just below the stack it loads too, and a thread is made on
         # the stack's lowest grain, which no row the process may execute
-        # grants. Last, root maps the allocation whose length is off the
-        # grain into itself: a row covers exactly its allocation, so `map`
-        # refuses it with the `BadArg` fault (spec §2.5), which ends root,
-        # rather than round the row's top up past the allocation's end.
+        # grants.
         "name": "destination_off_grain",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": DEST_GRAIN_PKG,
@@ -12582,34 +12588,37 @@ TEST_CASES = [
                        "the stack: loaded",
                        "SOS destgrain: a thread on the stack's bottom grain: "
                        "made",
-                       "SOS destgrain: the allocation whose length is off "
-                       "the grain, mapped",
-                       "SOS: process fault: argument outside its domain "
-                       "process={zero}"],
-        "expect_clean_exit": False,
-        "expect_status": EXIT_PROCESS_FAULT,
+                       "SOS destgrain: done"],
+        "expect_clean_exit": True,
     },
     {
-        # A mapping covers exactly its allocation (spec §2.5). The build
-        # gives root the same two allocations off the grain as
-        # `destination_off_grain`; root maps an allocation out of its pool,
-        # which is taken, and then the allocation whose base is a byte past
-        # the grain, which is the `BadArg` fault and ends root.
-        "name": "map_base_off_grain",
+        # `map` answers a status, not a fault, for an allocation the board
+        # cannot grant (spec §2.5). The build gives root the same two
+        # allocations off the grain as `destination_off_grain`, one whose
+        # length runs off the end of the address space (`wrapping_region`)
+        # and one of no bytes (`empty_region`); root maps an allocation out of
+        # its pool, which is taken, and then each of the four, which answer
+        # `NoResource` and leave root running.
+        "name": "map_refused_regions",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MAP_OFF_GRAIN_PKG,
         "pool": True,
         "off_grain_destinations": True,
+        "wrapping_region": True,
+        "empty_region": True,
         "expect_out": ["{banner}",
-                       "SOS: boot regions={three}",
+                       "SOS: boot regions={map_regions}",
                        "SOS mapgrain: an allocation on the grain, mapped: "
                        "taken",
-                       "SOS mapgrain: the allocation whose base is off the "
-                       "grain, mapped",
-                       "SOS: process fault: argument outside its domain "
-                       "process={zero}"],
-        "expect_clean_exit": False,
-        "expect_status": EXIT_PROCESS_FAULT,
+                       "SOS mapgrain: a length off the grain: no room for "
+                       "what was asked",
+                       "SOS mapgrain: a base off the grain: no room for "
+                       "what was asked",
+                       "{map_wrap_line}",
+                       "SOS mapgrain: a length of zero: no room for what "
+                       "was asked",
+                       "SOS mapgrain: done"],
+        "expect_clean_exit": True,
     },
     {
         # A destination is memory the profile can grant at the addresses the
@@ -14564,6 +14573,22 @@ def _region_row_specs(case, arch):
                          "kind": "ram",
                          "base": base + OFF_GRAIN_SPAN // 2 + 1,
                          "len": OFF_GRAIN_SPAN // 2 - 0x1000})
+    if case.get("wrapping_region"):
+        # A row on the grain whose length runs past the end of the address
+        # space: the longest whole-grain length the word holds, from a base
+        # that is ordinary RAM.
+        # A 64-bit word has none: a length is a signed integer in the
+        # description.
+        if arch["name"] != "arm64":
+            rows.append({"what": "an allocation whose length runs off the "
+                                 "end of the address space",
+                         "kind": "ram", "base": arch["pool_base"],
+                         "len": (1 << 32) - 0x1000})
+    if case.get("empty_region"):
+        # A row of no bytes whose base is ordinary RAM, so only its length
+        # says it is empty.
+        rows.append({"what": "an allocation of no bytes",
+                     "kind": "ram", "base": arch["pool_base"], "len": 0})
     # `heap_pools`: a pool row per length, cut in order from the pool
     # window's base, for a launcher to give a child as its heaps' pools.
     # `MIN_GROWTH` names one growth of a heap at the board's grain.
@@ -19187,8 +19212,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             # (spec §5.6, §2.8). The blob's row is a pool. The image allocated
             # off its front is valid and copies nothing, so only the
             # destination rule refuses the rest of the blob, allocated as a
-            # second allocation, as its destination; then donating the image
-            # ends root with `BadArg`.
+            # second allocation, as its destination; mapping it is
+            # `NoResource`, a status, and then donating the image ends root
+            # with `BadArg`.
             "name": "flash_region",
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "root_pkg": FLASH_REGION_PKG,
@@ -19198,6 +19224,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "SOS: boot regions={two}",
                            "SOS flashregion: a destination in flash is "
                            "refused: not a loadable process image",
+                           "SOS flashregion: a map of it is refused: no room "
+                           "for what was asked",
                            "SOS: process fault: argument outside its domain "
                            "process={zero}"],
             "expect_clean_exit": False,

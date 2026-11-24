@@ -1274,14 +1274,19 @@ table typed as an allocation (§12).
   `AccessDenied`; an access word with a bit outside `MapAccess`, one asking
   for nothing, for write without read or for write with execute is `BadArg`;
   execute asked through a handle without `MapExecute` is `AccessDenied`; and
-  an allocation that is empty, runs off the end of the address space, has its
-  base or its length off the grain, a `room` off the grain, or an allocation
-  that lies in memory the board cannot hand a process (flash, §5.6) is
-  `BadArg`. Then the statuses: a `Gone` target answers `Revoked` (§2.10), a
-  target at its `Mapping` quota `QuotaExceeded` (§2.9), and a target whose
-  address space has no room for the range and its `room`, or one of whose rows
-  the range meets (below), `NoResource`, as a full Mapping slab does; the
-  caller's handle budget and table answer last, as at every mint.
+  a `room` off the grain is `BadArg`, the caller's own word. Then the
+  statuses, the first of them about the region, which a caller may have been
+  handed and could not check (a server maps its client's Memory, and a client
+  must not be able to end it with one): an allocation that is empty, runs off
+  the end of the address space, has its base or its length off the grain, or
+  lies in memory the board cannot hand a process (flash, §5.6) is
+  `NoResource` with nothing installed or charged (a destination of those
+  shapes is `BadImage` to `ProcessCreate`, §2.7). Then a `Gone` target
+  answers `Revoked` (§2.10), a target at its `Mapping` quota `QuotaExceeded`
+  (§2.9), and a target whose address space has no room for the range and its
+  `room`, or one of whose rows the range meets (below), `NoResource`, as a
+  full Mapping slab does; the caller's handle budget and table answer last,
+  as at every mint.
 - **`room` is address space kept free above the row on a translating target,
   for the row to grow into; it is recorded as zero on an identity target.**
   The row records it, and placement treats a row's range and its room as
@@ -3405,7 +3410,8 @@ uniform because it has to be: an unbound handle names no kind, so there is no op
 table to ask which rule applies. The caller is the process that faults, through
 whichever process's handle the op was made (§2.7). What is left in `SosStatus`
 is what a caller could not have known — `NoResource` (no room for what
-was asked: a full slab or table, or a range a row already holds),
+was asked: a full slab or table, a range a row already holds, or a region a
+`map` cannot grant),
 `QuotaExceeded` (§2.9), `NoMemory` (11: a pool that cannot serve the length
 asked of it in one range, answered by `Pool.allocate` alone, §2.5),
 `BadImage` (§8), `Drained` (§12, and the end of a
@@ -4876,10 +4882,10 @@ reserved.
   The pool row is a pool. A case that allocates from a blob or a destination
   types that row as a pool instead. On the ESP32-S3 the blob rows lie in flash:
   an allocation there is an image source and nothing else (a `map` of it is
-  `BadArg`, a destination `BadImage`, a donation `BadArg`, §2.5, §5.6, §2.8), a
-  pool there allocates only such allocations, and the segments a child uses in
-  place count on the image allocation they lie in (§2.5), so a launcher may
-  release its image handle while the child runs out of flash.
+  `NoResource`, a destination `BadImage`, a donation `BadArg`, §2.5, §5.6,
+  §2.8), a pool there allocates only such allocations, and the segments a
+  child uses in place count on the image allocation they lie in (§2.5), so a
+  launcher may release its image handle while the child runs out of flash.
 - **The table of an image built from its description.** The image builder
   (`tools/sosimage`) writes, in this order, which root's config reads as tags:
   one image blob per child, one destination per child, then the image's rows,

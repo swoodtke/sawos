@@ -3269,33 +3269,38 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
                 && not obj.allows(MemoryRight.MapExecute)) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            let base = MEMORIES[obj.slot].base
-            let len = MEMORIES[obj.slot].len
-            if len == 0 || region_wraps(base, len) {
-                fault_process(p, FaultReason.BadArg)
-            }
-            if (base % hal.PROT_GRAIN) != 0 || (len % hal.PROT_GRAIN) != 0 {
-                fault_process(p, FaultReason.BadArg)
-            }
-            // The room is whole grains, so the row's top stays on the grain
-            // wherever a `Grow` takes it within the room.
+            // The room is the caller's own argument, whole grains, so the
+            // row's top stays on the grain wherever a `Grow` takes it within
+            // the room.
             let room = arg2
             if (room % hal.PROT_GRAIN) != 0 {
                 fault_process(p, FaultReason.BadArg)
             }
-            let top = base + len
-            // Ask the HAL's window predicate rather than relying on its loader
-            // path: one target's grant window cannot express every address, and
-            // its loader path stops the machine, which is right for a memory
-            // map the build got wrong and wrong for a range a process chose. So
-            // a map asks first and faults with `BadArg`.
+            // What follows is about the region, which a caller may have been
+            // handed rather than made (a server maps its client's Memory), so
+            // each shape the board cannot grant is the `NoResource` status and
+            // the caller carries on: an empty region, one that runs off the
+            // end of the address space, one with its base or length off the
+            // protection grain, and one in memory the board cannot hand a user
+            // domain (`hal.map_source_ok`, which the HAL's window predicate
+            // answers rather than its loader path, since that path stops the
+            // machine). Nothing is installed or charged.
             //
             // This checks the physical half only: the range is the region's own
             // frames, so the question is whether the board can hand them to a
             // user domain at all. The virtual half is answered in
             // `install_row`.
+            let base = MEMORIES[obj.slot].base
+            let len = MEMORIES[obj.slot].len
+            if len == 0 || region_wraps(base, len) {
+                return op_status(SosStatus.NoResource)
+            }
+            if (base % hal.PROT_GRAIN) != 0 || (len % hal.PROT_GRAIN) != 0 {
+                return op_status(SosStatus.NoResource)
+            }
+            let top = base + len
             if not hal.map_source_ok(base, top) {
-                fault_process(p, FaultReason.BadArg)
+                return op_status(SosStatus.NoResource)
             }
             install_row(p, t, base, top, room, grant_perms(access), false,
                         obj.slot)

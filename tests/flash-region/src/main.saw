@@ -10,12 +10,16 @@
 //                    process image
 //
 // With the image valid and nothing to copy, nothing but the destination rule
-// stands between that call and a child whose stack is flash. Then root
-// donates the image to a slab, which the kernel would zero, and the
+// stands between that call and a child whose stack is flash. Mapping it into
+// root is a status as well, `NoResource`, and root carries on:
+//
+//   SOS flashregion: a map of it is refused: no room for what was asked
+//
+// Then root donates the image to a slab, which the kernel would zero, and the
 // kernel ends root with `BadArg`: the transcript's last word is the kernel's
 // fault line.
 
-import sos.{System, Process, Pool, SlabKind, SosStatus}
+import sos.{System, Process, Pool, SlabKind, SosStatus, MapAccess}
 
 static EXIT_FAILED: UInt = 1
 
@@ -61,6 +65,26 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
         },
         case Err(e) -> {
             print("SOS flashregion: a destination in flash is refused: {}\n", e)
+        },
+    }
+
+    // A map is no way round the rule: the region is memory the board cannot
+    // give a process, and a caller that was handed one could not have known.
+    match proc.map(memory: &rest, access: MapAccess.Read) {
+        case Ok(_) -> {
+            let _ = system.debug_print(
+                "SOS flashregion: a map of it was taken\n")
+            return BUG
+        },
+        case Err(e) -> {
+            match e {
+                case NoResource -> print(
+                    "SOS flashregion: a map of it is refused: {}\n", e),
+                case _ -> {
+                    print("SOS flashregion: a map of it: {}\n", e)
+                    return BUG
+                },
+            }
         },
     }
 

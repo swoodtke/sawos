@@ -1520,12 +1520,16 @@ extension Process {
     /// read-only in one place and read-write in another: two rows, two
     /// Mappings.
     ///
-    /// Write without read, no access at all, a bit outside the three, an
-    /// allocation whose base or length is off the protection grain (only a
-    /// boot allocation can be), and a range this machine cannot grant all
-    /// terminate the caller. The target's mapping quota is capped at the
-    /// protection rows its domain has left (on one profile a fixed number of
-    /// hardware regions), so a domain with no row left is
+    /// Write without read, no access at all, a bit outside the three and a
+    /// `room` off the protection grain terminate the caller. A region the
+    /// caller was handed, and could not check, is `SosStatus.NoResource`
+    /// instead and installs nothing: an allocation of zero length, one that
+    /// runs off the end of the address space, one whose base or length is off
+    /// the protection grain (only a boot allocation can be), and one this
+    /// machine cannot grant a process (the ESP32-S3's flash).
+    ///
+    /// The target's mapping quota is capped at the protection rows its
+    /// domain has left (on one profile a fixed number of hardware regions), so a domain with no row left is
     /// `SosStatus.QuotaExceeded`; so is a caller at its handle quota. No
     /// address space left for the range in the target's domain, a
     /// range that meets a row the target already holds (spec §2.5: where a
@@ -1551,8 +1555,8 @@ extension Process {
     /// later `map` into this process is placed in it. Zero, the default, keeps
     /// none. Where a mapping's address is its memory's own it is recorded as
     /// zero, since the row's next addresses are its allocation's next bytes.
-    /// A `room` off the protection grain terminates the caller, and one that
-    /// takes the row past this process's window is `Err(SosStatus.NoResource)`.
+    /// One that takes the row past this process's window is
+    /// `Err(SosStatus.NoResource)`.
     public func map(&self, memory: &Memory, access: UInt32,
                     room: UInt = 0) -> Result<Mapping, SosStatus> {
         let raw = try call_value(memory.handle, MemoryOp.Map as UInt,
