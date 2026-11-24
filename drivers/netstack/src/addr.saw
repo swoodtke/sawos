@@ -1,0 +1,123 @@
+//! Addresses: an Ethernet MAC address, an IPv4 address, and an IPv4 address
+//! with a port.
+
+import netstack.bytes.{be32, put32}
+
+/// The bytes of a MAC address.
+public static MAC_BYTES: Int = 6
+
+/// The bytes of an IPv4 address.
+public static IPV4_BYTES: Int = 4
+
+/// An Ethernet MAC address, its octets in wire order.
+public struct MacAddr {
+    public octets: [UInt8; MAC_BYTES],
+}
+
+@synthesize
+extension MacAddr: Equatable {}
+
+extension MacAddr {
+    /// The broadcast address, all ones.
+    public static func broadcast() -> MacAddr {
+        MacAddr(octets: [0xFF; MAC_BYTES])
+    }
+
+    /// All zeros: the target hardware address of an ARP request, which asks
+    /// for it.
+    public static func zero() -> MacAddr {
+        MacAddr(octets: [0; MAC_BYTES])
+    }
+
+    /// The address in the six bytes at `at`.
+    public init(bytes: &[UInt8], at: Int) -> MacAddr {
+        var octets: [UInt8; MAC_BYTES] = [0; MAC_BYTES]
+        var i = 0
+        while i < MAC_BYTES {
+            octets[i] = bytes[at + i]
+            i = i + 1
+        }
+        MacAddr(octets: octets)
+    }
+
+    /// Writes the address into the six bytes at `at`.
+    public func write(&self, bytes: &var [UInt8], at: Int) {
+        var i = 0
+        while i < MAC_BYTES {
+            bytes[at + i] = self.octets[i]
+            i = i + 1
+        }
+    }
+
+    /// Whether this is the broadcast address.
+    public func is_broadcast(&self) -> Bool {
+        self == MacAddr.broadcast()
+    }
+
+    /// Whether this is a group address, broadcast included: the I/G bit, the
+    /// least significant bit of the first octet, is set.
+    public func is_multicast(&self) -> Bool {
+        (self.octets[0] & 0x01) != 0
+    }
+}
+
+/// An IPv4 address, held as the number its four octets spell in network
+/// order: 10.0.0.1 is `0x0A00_0001`.
+public struct Ipv4Addr {
+    public value: UInt32,
+}
+
+@synthesize
+extension Ipv4Addr: Equatable {}
+
+extension Ipv4Addr {
+    /// The address `a.b.c.d`.
+    public init(a: UInt8, b: UInt8, c: UInt8, d: UInt8) -> Ipv4Addr {
+        Ipv4Addr(value: ((a as UInt32) << 24) | ((b as UInt32) << 16) |
+                        ((c as UInt32) << 8) | (d as UInt32))
+    }
+
+    /// The address in the four bytes at `at`.
+    public init(bytes: &[UInt8], at: Int) -> Ipv4Addr {
+        Ipv4Addr(value: be32(&bytes, at))
+    }
+
+    /// 0.0.0.0, the unspecified address: "this host" as a source, and no
+    /// address at all as a destination.
+    public static func unspecified() -> Ipv4Addr {
+        Ipv4Addr(value: 0)
+    }
+
+    /// 255.255.255.255, the limited broadcast address.
+    public static func broadcast() -> Ipv4Addr {
+        Ipv4Addr(value: 0xFFFF_FFFF)
+    }
+
+    /// Writes the address into the four bytes at `at`.
+    public func write(&self, bytes: &var [UInt8], at: Int) {
+        put32(&var bytes, at, self.value)
+    }
+
+    public func is_unspecified(&self) -> Bool {
+        self.value == 0
+    }
+
+    /// Whether this is the limited broadcast address.
+    public func is_broadcast(&self) -> Bool {
+        self.value == 0xFFFF_FFFF
+    }
+
+    /// Whether this is a class D (multicast) address, 224.0.0.0/4.
+    public func is_multicast(&self) -> Bool {
+        (self.value >> 28) == 0xE
+    }
+}
+
+/// An IPv4 address and a port: one end of a datagram.
+public struct SocketAddr {
+    public addr: Ipv4Addr,
+    public port: UInt16,
+}
+
+@synthesize
+extension SocketAddr: Equatable {}

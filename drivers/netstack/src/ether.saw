@@ -1,0 +1,82 @@
+//! Ethernet II framing.
+//!
+//! ```text
+//! offset  bytes  field
+//! 0       6      destination address
+//! 6       6      source address
+//! 12      2      EtherType
+//! 14             payload, 46 to 1500 bytes
+//! ```
+//!
+//! A frame here is what a device hands over and takes: no preamble and no
+//! frame check sequence, so the shortest is `MIN_FRAME_BYTES` and the longest
+//! `MAX_FRAME_BYTES`. A frame built shorter than the minimum is padded with
+//! zeros; a received frame's padding is whatever lies past its IPv4 total
+//! length, and the layers above ignore it.
+
+import netstack.addr.{MacAddr}
+import netstack.bytes.{be16, put16}
+import netstack.counters.{Drop}
+
+/// The header's bytes.
+public static HEADER_BYTES: Int = 14
+
+/// The most payload a frame carries: the link's MTU.
+public static MTU: Int = 1500
+
+/// The shortest frame, padding included.
+public static MIN_FRAME_BYTES: Int = 60
+
+/// The longest frame.
+public static MAX_FRAME_BYTES: Int = HEADER_BYTES + MTU
+
+/// The EtherTypes the stack speaks.
+public enum EtherType: UInt16 {
+    case Ipv4 = 0x0800,
+    case Arp = 0x0806,
+}
+
+/// A frame's header.
+public struct Header {
+    public dst: MacAddr,
+    public src: MacAddr,
+    /// The EtherType as received, which need not be one the stack speaks.
+    public ether_type: UInt16,
+}
+
+extension Header {
+    /// The header at the front of `frame`, or `EtherRunt` when the frame is
+    /// shorter than one.
+    public init(frame: &[UInt8]) -> Result<Header, Drop> {
+        if frame.len() < HEADER_BYTES {
+            return Drop.EtherRunt
+        }
+        return Header(dst: MacAddr(bytes: &frame, at: 0),
+                      src: MacAddr(bytes: &frame, at: 6),
+                      ether_type: be16(&frame, 12))
+    }
+
+    /// Writes the header at the front of `frame`.
+    public func write(&self, frame: &var [UInt8]) {
+        self.dst.write(&var frame, 0)
+        self.src.write(&var frame, 6)
+        put16(&var frame, 12, self.ether_type)
+    }
+}
+
+/// Whether a frame to `dst` is one this station takes: our own address or
+/// broadcast. Multicast is off.
+public func admit(dst: MacAddr, ours: MacAddr) -> Result<Void, Drop> {
+    if dst.is_broadcast() || dst == ours {
+        return
+    }
+    if dst.is_multicast() {
+        return Drop.EtherMulticast
+    }
+    return Drop.EtherNotOurs
+}
+
+/// The length a frame of `len` bytes goes out at: at least the minimum.
+public func padded(len: Int) -> Int {
+    if len < MIN_FRAME_BYTES { MIN_FRAME_BYTES } else { len }
+}

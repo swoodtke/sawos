@@ -1,0 +1,1235 @@
+// One stack, driven frame by frame through a sink that records what it is
+// given: each refusal of each layer by its reason and its counter, with
+// nothing sent and nothing delivered; what the stack answers, byte for byte
+// against golden frames; resolution, the pending queue and its time limits;
+// the rate limit on unreachables; back-pressure from the device and from the
+// sockets; and every refusal of a send.
+//
+// A is the stack under test, 02:00:00:00:00:0a at 10.0.0.1; B is
+// 02:00:00:00:00:0b at 10.0.0.2, on 10.0.0.0/24 with the gateway at
+// 10.0.0.254.
+
+import netstack.{
+    Count, DROP_KINDS, Delivery, Drop, Ipv4Addr, MAX_ECHO_DATA, MAX_UDP_DATA,
+    MacAddr, Opened, SendError, Sink, SinkError, SocketAddr, Stack,
+}
+import netstack.arp
+import netstack.bytes.{checksum, put16, put_bytes, sum16}
+import netstack.ether
+import netstack.icmp
+import netstack.ipv4
+import netstack.udp
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func same(a: &[UInt8], b: &[UInt8]) -> Bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+func mac_a() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0A]) }
+func mac_b() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0B]) }
+func mac_c() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0C]) }
+func ip_a() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 1) }
+func ip_b() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 2) }
+func ip_c() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 3) }
+func gateway() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 254) }
+func mask24() -> Ipv4Addr { Ipv4Addr(a: 255, b: 255, c: 255, d: 0) }
+func far() -> Ipv4Addr { Ipv4Addr(a: 192, b: 0, c: 2, d: 7) }
+func subnet_broadcast() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 255) }
+
+func config_a() -> ipv4.Config {
+    try! ipv4.Config(addr: ip_a(), netmask: mask24(),
+                     gateway: gateway())
+}
+
+// -----------------------------------------------------------------------------
+// Frames, and the sink that records them
+// -----------------------------------------------------------------------------
+
+static FRAME_BYTES: Int = 1514
+
+/// A frame or a payload: its bytes and how many of them count.
+struct Frame {
+    len: Int,
+    bytes: [UInt8; FRAME_BYTES],
+}
+
+extension Frame {
+    init(copying: &[UInt8]) -> Frame {
+        var f = Frame(len: copying.len(), bytes: [0; FRAME_BYTES])
+        put_bytes(&var f.bytes, 0, &copying)
+        f
+    }
+}
+
+/// What the sink was handed up.
+struct Got {
+    delivery: Delivery,
+    data: Frame,
+}
+
+struct Recorder {
+    frames: Vector<Frame>,
+    got: Vector<Got>,
+    /// The device refuses every frame.
+    tx_full: Bool,
+    /// The sockets refuse every delivery.
+    deliver_full: Bool,
+}
+
+extension Recorder: NoCopy {}
+
+extension Recorder {
+    static func fresh() -> Recorder {
+        Recorder(frames: Vector<Frame>(), got: Vector<Got>(), tx_full: false,
+                 deliver_full: false)
+    }
+
+    func clear(&var self) {
+        self.frames.clear()
+        self.got.clear()
+    }
+
+    /// Whether the stack sent exactly the frames `count` and handed up none.
+    func sent_only(&self, count: Int) -> Bool {
+        self.frames.len() == count && self.got.len() == 0
+    }
+
+    /// Whether frame `i` is `expected`.
+    func sent(&self, i: Int, expected: &Frame) -> Bool {
+        if i >= self.frames.len() {
+            return false
+        }
+        let f = self.frames[i]
+        same(&f.bytes[..f.len], &expected.bytes[..expected.len])
+    }
+}
+
+extension Recorder: Sink {
+    func transmit(&var self, frame: &[UInt8]) -> Result<Void, SinkError> {
+        if self.tx_full {
+            return SinkError.Full
+        }
+        try! self.frames.push(Frame(copying: &frame))
+        return
+    }
+
+    func deliver(&var self, delivery: Delivery,
+                 data: &[UInt8]) -> Result<Void, SinkError> {
+        if self.deliver_full {
+            return SinkError.Full
+        }
+        try! self.got.push(Got(delivery: delivery, data: Frame(copying: &data)))
+        return
+    }
+}
+
+/// A frame to `dst` from `src` of `ether_type` carrying `payload`, padded as a
+/// device pads it.
+func ether_frame(dst: MacAddr, src: MacAddr, ether_type: UInt16,
+                 payload: &[UInt8]) -> Frame {
+    var f = Frame(len: ether.padded(ether.HEADER_BYTES + payload.len()),
+                  bytes: [0; FRAME_BYTES])
+    let h = ether.Header(dst: dst, src: src, ether_type: ether_type)
+    h.write(&var f.bytes)
+    put_bytes(&var f.bytes, ether.HEADER_BYTES, &payload)
+    f
+}
+
+/// Works frame `f`'s IPv4 header checksum again, its header `header_bytes`.
+func fix_ip(f: &var Frame, header_bytes: Int) {
+    put16(&var f.bytes, 24, 0)
+    let sum = checksum(sum16(0, &f.bytes[14..14 + header_bytes]))
+    put16(&var f.bytes, 24, sum)
+}
+
+/// A frame from B's hardware address to `dst_mac` with a datagram from `src`
+/// to `dst` of `protocol` carrying `payload`.
+func ip_frame(dst_mac: MacAddr, src: Ipv4Addr, dst: Ipv4Addr, protocol: UInt8,
+              payload: &[UInt8]) -> Frame {
+    var p = Frame(len: ipv4.HEADER_BYTES + payload.len(), bytes: [0; FRAME_BYTES])
+    put_bytes(&var p.bytes, ipv4.HEADER_BYTES, &payload)
+    ipv4.write_header(&var p.bytes, src, dst, ipv4.Protocol.Udp, 9, 64, payload.len())
+    p.bytes[9] = protocol
+    var f = ether_frame(dst_mac, mac_b(), 0x0800, &p.bytes[..p.len])
+    fix_ip(&var f, ipv4.HEADER_BYTES)
+    f
+}
+
+/// A UDP datagram's bytes, from `src` to `dst` carrying `data`.
+func udp_bytes(src: SocketAddr, dst: SocketAddr, data: &[UInt8]) -> Frame {
+    var u = Frame(len: 8 + data.len(), bytes: [0; FRAME_BYTES])
+    put_bytes(&var u.bytes, 8, &data)
+    let _ = udp.write_header(&var u.bytes, src.addr, dst.addr, src.port,
+                                      dst.port, data.len())
+    u
+}
+
+/// B's datagram from port 5000 to `dst`, sent to hardware address `dst_mac`.
+func udp_frame(dst_mac: MacAddr, dst: SocketAddr, data: &[UInt8]) -> Frame {
+    udp_from(SocketAddr(addr: ip_b(), port: 5000), dst_mac, dst, &data)
+}
+
+/// A datagram from `src` to `dst`, sent from B's hardware address to
+/// `dst_mac`.
+func udp_from(src: SocketAddr, dst_mac: MacAddr, dst: SocketAddr,
+              data: &[UInt8]) -> Frame {
+    let u = udp_bytes(src, dst, &data)
+    ip_frame(dst_mac, src.addr, dst.addr, 17, &u.bytes[..u.len])
+}
+
+/// `ip_frame` with a header of 24 bytes: four of options, three no-ops and
+/// the end of the list.
+func ip_frame_options(dst_mac: MacAddr, src: Ipv4Addr, dst: Ipv4Addr,
+                      protocol: UInt8, payload: &[UInt8]) -> Frame {
+    var p = Frame(len: 24 + payload.len(), bytes: [0; FRAME_BYTES])
+    put_bytes(&var p.bytes, 24, &payload)
+    ipv4.write_header(&var p.bytes, src, dst, ipv4.Protocol.Udp, 9, 64,
+                      payload.len() + 4)
+    p.bytes[0] = 0x46
+    p.bytes[9] = protocol
+    p.bytes[20] = 1
+    p.bytes[21] = 1
+    p.bytes[22] = 1
+    var f = ether_frame(dst_mac, mac_b(), 0x0800, &p.bytes[..p.len])
+    fix_ip(&var f, 24)
+    f
+}
+
+/// An echo message's bytes.
+func echo_bytes(kind: icmp.IcmpType, ident: UInt16, sequence: UInt16,
+                data: &[UInt8]) -> Frame {
+    var e = Frame(len: 0, bytes: [0; FRAME_BYTES])
+    e.len = icmp.write_echo(&var e.bytes, kind, ident, sequence, &data)
+    e
+}
+
+/// B's echo request to `dst` sent to `dst_mac`, identifier 0x1234, sequence
+/// 1, data "abcd": the frame around wire.saw's golden request.
+func echo_frame(dst_mac: MacAddr, dst: Ipv4Addr) -> Frame {
+    echo_from(ip_b(), dst_mac, dst)
+}
+
+/// `echo_frame`, from `src`.
+func echo_from(src: Ipv4Addr, dst_mac: MacAddr, dst: Ipv4Addr) -> Frame {
+    let data: [UInt8; 4] = [0x61, 0x62, 0x63, 0x64]
+    let e = echo_bytes(icmp.IcmpType.EchoRequest, 0x1234, 1, &data)
+    var f = ip_frame(dst_mac, src, dst, 1, &e.bytes[..e.len])
+    f.bytes[18] = 0
+    f.bytes[19] = 7
+    fix_ip(&var f, ipv4.HEADER_BYTES)
+    f
+}
+
+/// B asking who has `target`.
+func arp_frame(op: arp.ArpOp, eth_dst: MacAddr, sender_mac: MacAddr,
+               sender_ip: Ipv4Addr, target_mac: MacAddr, target_ip: Ipv4Addr) -> Frame {
+    var p: [UInt8; 28] = [0; 28]
+    let packet = arp.Packet(op: op, sender_mac: sender_mac, sender_ip: sender_ip,
+                            target_mac: target_mac, target_ip: target_ip)
+    packet.write(&var p)
+    ether_frame(eth_dst, sender_mac, 0x0806, &p)
+}
+
+/// What A sends for a request for `ip`: broadcast, A as the sender.
+func request_from_a(ip: Ipv4Addr) -> Frame {
+    arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_a(), ip_a(),
+              MacAddr.zero(), ip)
+}
+
+/// B's reply to A: 10.0.0.2 is at B.
+func reply_from_b() -> Frame {
+    arp_frame(arp.ArpOp.Reply, mac_a(), mac_b(), ip_b(), mac_a(), ip_a())
+}
+
+/// Whether `result` is the refusal `expected`.
+func fails(result: Result<Void, SendError>, expected: SendError) -> Bool {
+    match result { case Err(e) -> e == expected, case Ok(_) -> false }
+}
+
+/// Every drop the stack counted, whatever its reason.
+func all_drops(s: &Stack) -> UInt64 {
+    var total: UInt64 = 0
+    var raw = 0
+    while raw < DROP_KINDS {
+        total = total + (s.drops(Drop.from(raw: raw as UInt8)!) as UInt64)
+        raw = raw + 1
+    }
+    total
+}
+
+/// Whether the stack's only drops are `n` of `reason`. When they are not, the
+/// drops it did count are printed.
+func dropped(s: &Stack, reason: Drop, n: UInt32) -> Bool {
+    if s.drops(reason) == n && all_drops(&s) == (n as UInt64) {
+        return true
+    }
+    var raw = 0
+    while raw < DROP_KINDS {
+        let r = Drop.from(raw: raw as UInt8)!
+        if s.drops(r) != 0 {
+            print("  dropped: {r} x{s.drops(r)}")
+        }
+        raw = raw + 1
+    }
+    false
+}
+
+func no_drops(s: &Stack) -> Bool {
+    dropped(&s, Drop.EtherRunt, 0)
+}
+
+/// A, configured at time 0, its announcement cleared.
+func stack_a(r: &var Recorder) -> Stack {
+    var s = Stack(mac: mac_a())
+    s.configure(config_a(), &var r)
+    r.clear()
+    s
+}
+
+/// A, with B resolved at time 0.
+func stack_a_knowing_b(r: &var Recorder) -> Stack {
+    var s = stack_a(&var r)
+    let reply = reply_from_b()
+    s.receive(&reply.bytes[..reply.len], 0, &var r)
+    r.clear()
+    s
+}
+
+/// Feeds `f` to `s` at `now`.
+func feed(s: &var Stack, f: &Frame, now: UInt64, r: &var Recorder) {
+    s.receive(&f.bytes[..f.len], now, &var r)
+}
+
+/// Whether feeding `f` to a fresh A is refused, `reason` its one drop, with
+/// nothing sent or delivered.
+func refused(f: &Frame, reason: Drop) -> Bool {
+    var r = Recorder.fresh()
+    var s = stack_a_knowing_b(&var r)
+    let _ = s.udp_open(7)
+    feed(&var s, &f, 0, &var r)
+    dropped(&s, reason, 1) && r.sent_only(0) && s.count(Count.FramesReceived) == 2
+}
+
+// -----------------------------------------------------------------------------
+// Configuration and ARP
+// -----------------------------------------------------------------------------
+
+func announcements() {
+    var r = Recorder.fresh()
+    var s = Stack(mac: mac_a())
+    check(s.config() == None, "a new stack has no address")
+    s.configure(config_a(), &var r)
+    let gratuitous = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_a(), ip_a(),
+                               MacAddr.zero(), ip_a())
+    check(r.sent_only(1) && r.sent(0, &gratuitous), "an address is announced")
+    check(s.count(Count.ArpRequestsSent) == 1 && s.count(Count.FramesSent) == 1,
+          "and counted")
+    check(s.config() == config_a(), "and held")
+
+    r.clear()
+    let moved_gateway = try! ipv4.Config(addr: ip_a(),
+                                         netmask: mask24(),
+                                         gateway: Ipv4Addr(a: 10, b: 0, c: 0, d: 253))
+    s.configure(moved_gateway, &var r)
+    check(r.sent_only(0), "the same address is not announced again")
+
+    let other = try! ipv4.Config(addr: ip_c(),
+                                 netmask: mask24(),
+                                 gateway: gateway())
+    s.configure(other, &var r)
+    let moved = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_a(), ip_c(),
+                          MacAddr.zero(), ip_c())
+    check(r.sent_only(1) && r.sent(0, &moved), "a new address is")
+    check(no_drops(&s), "nothing dropped")
+}
+
+func arp_answers() {
+    // wire.saw's golden request, answered with its golden reply.
+    var r = Recorder.fresh()
+    var s = stack_a(&var r)
+    let request = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_b(), ip_b(),
+                            MacAddr.zero(), ip_a())
+    feed(&var s, &request, 0, &var r)
+    let reply = arp_frame(arp.ArpOp.Reply, mac_b(), mac_a(), ip_a(), mac_b(), ip_b())
+    check(r.sent_only(1) && r.sent(0, &reply), "a request for us is answered")
+    check(s.count(Count.ArpRepliesSent) == 1, "the reply is counted")
+    check(s.resolved(ip_b(), 0) == mac_b(), "and the asker learned (RFC 826)")
+    check(no_drops(&s), "nothing dropped")
+
+    // A request for someone else teaches nothing new and is not answered.
+    r.clear()
+    let for_c = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_c(), ip_c(),
+                          MacAddr.zero(), ip_b())
+    feed(&var s, &for_c, 0, &var r)
+    check(r.sent_only(0) && s.resolved(ip_c(), 0) == None,
+          "a request for another is ignored, its sender not learned")
+    // ... but updates a sender already known.
+    let b_moved = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_c(), ip_b(),
+                            MacAddr.zero(), ip_c())
+    feed(&var s, &b_moved, 10, &var r)
+    check(r.sent_only(0) && s.resolved(ip_b(), 10) == mac_c(),
+          "a known sender's address is merged")
+    check(s.resolved(ip_b(), 10 + arp.ENTRY_LIFETIME_MS - 1) == mac_c(),
+          "and its age restarted")
+
+    // A reply to us teaches its sender and is not answered.
+    var r2 = Recorder.fresh()
+    var s2 = stack_a(&var r2)
+    let reply_b = reply_from_b()
+    feed(&var s2, &reply_b, 0, &var r2)
+    check(r2.sent_only(0) && s2.resolved(ip_b(), 0) == mac_b(), "a reply is learned")
+    // A reply for someone else is not.
+    let reply_c = arp_frame(arp.ArpOp.Reply, MacAddr.broadcast(), mac_c(), ip_c(),
+                            mac_b(), ip_b())
+    feed(&var s2, &reply_c, 0, &var r2)
+    check(r2.sent_only(0) && s2.resolved(ip_c(), 0) == None,
+          "a reply to another is not")
+    check(no_drops(&s2), "nothing dropped")
+
+    // A probe (RFC 5227) is answered and not learned.
+    var r3 = Recorder.fresh()
+    var s3 = stack_a(&var r3)
+    let probe = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_b(),
+                          Ipv4Addr.unspecified(), MacAddr.zero(), ip_a())
+    feed(&var s3, &probe, 0, &var r3)
+    let defend = arp_frame(arp.ArpOp.Reply, mac_b(), mac_a(), ip_a(), mac_b(),
+                           Ipv4Addr.unspecified())
+    check(r3.sent_only(1) && r3.sent(0, &defend), "a probe for our address is answered")
+    check(s3.resolved(Ipv4Addr.unspecified(), 0) == None, "and 0.0.0.0 is not learned")
+    let probe_other = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_b(),
+                                Ipv4Addr.unspecified(), MacAddr.zero(), ip_c())
+    r3.clear()
+    feed(&var s3, &probe_other, 0, &var r3)
+    check(r3.sent_only(0), "a probe for another is not")
+
+    // An unconfigured stack answers nothing and learns nothing.
+    var r4 = Recorder.fresh()
+    var s4 = Stack(mac: mac_a())
+    feed(&var s4, &request, 0, &var r4)
+    let anonymous = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_b(),
+                              Ipv4Addr.unspecified(), MacAddr.zero(),
+                              Ipv4Addr.unspecified())
+    feed(&var s4, &anonymous, 0, &var r4)
+    check(r4.sent_only(0) && s4.resolved(ip_b(), 0) == None && no_drops(&s4),
+          "with no address, nothing is ours, not even 0.0.0.0")
+}
+
+func arp_refusals() {
+    let group = MacAddr(octets: [0x01, 0x00, 0x5E, 0x00, 0x00, 0x02])
+    let bad_sender = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), group, ip_b(),
+                               MacAddr.zero(), ip_a())
+    check(refused(&bad_sender, Drop.ArpBadSender), "a group sender")
+    let broadcast_sender = arp_frame(arp.ArpOp.Reply, mac_a(), MacAddr.broadcast(),
+                                     ip_c(), mac_a(), ip_a())
+    var r = Recorder.fresh()
+    var s = stack_a(&var r)
+    feed(&var s, &broadcast_sender, 0, &var r)
+    check(dropped(&s, Drop.ArpBadSender, 1) && s.resolved(ip_c(), 0) == None,
+          "a broadcast sender is not learned")
+
+    let conflict = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_b(), ip_a(),
+                             MacAddr.zero(), ip_a())
+    check(refused(&conflict, Drop.ArpConflict), "our address claimed")
+
+    let request = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_b(), ip_b(),
+                            MacAddr.zero(), ip_a())
+    var short = ether_frame(MacAddr.broadcast(), mac_b(), 0x0806,
+                            &request.bytes[14..41])
+    short.len = 41
+    check(refused(&short, Drop.ArpTruncated), "a truncated packet")
+    var htype = request
+    htype.bytes[15] = 6
+    check(refused(&htype, Drop.ArpUnsupported), "another hardware type")
+    var op = request
+    op.bytes[21] = 9
+    check(refused(&op, Drop.ArpBadOp), "operation 9")
+}
+
+// -----------------------------------------------------------------------------
+// Ethernet
+// -----------------------------------------------------------------------------
+
+func ethernet_refusals() {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    let dst = SocketAddr(addr: ip_a(), port: 7)
+    let good = udp_frame(mac_a(), dst, &data)
+
+    var runt = good
+    runt.len = 13
+    check(refused(&runt, Drop.EtherRunt), "13 bytes")
+    var r = Recorder.fresh()
+    var s = stack_a_knowing_b(&var r)
+    var big: [UInt8; 1515] = [0; 1515]
+    put_bytes(&var big, 0, &good.bytes[..good.len])
+    s.receive(&big, 0, &var r)
+    check(dropped(&s, Drop.EtherOversize, 1) && r.sent_only(0), "1515 bytes")
+
+    var group = good
+    group.bytes[0] = 0x01
+    check(refused(&group, Drop.EtherMulticast), "a multicast group")
+    var other = good
+    other.bytes[5] = 0x0C
+    check(refused(&other, Drop.EtherNotOurs), "another station")
+    var ipv6 = good
+    ipv6.bytes[12] = 0x86
+    ipv6.bytes[13] = 0xDD
+    check(refused(&ipv6, Drop.EtherType), "IPv6")
+    var length = good
+    length.bytes[12] = 0x00
+    length.bytes[13] = 0x2E
+    check(refused(&length, Drop.EtherType), "an 802.3 length")
+}
+
+// -----------------------------------------------------------------------------
+// IPv4
+// -----------------------------------------------------------------------------
+
+func ipv4_refusals() {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    let good = udp_frame(mac_a(), SocketAddr(addr: ip_a(), port: 7), &data)
+
+    var short = good
+    short.len = 14 + 19
+    check(refused(&short, Drop.IpTruncated), "19 bytes")
+    var version = good
+    version.bytes[14] = 0x65
+    fix_ip(&var version, 20)
+    check(refused(&version, Drop.IpVersion), "version 6")
+    var ihl = good
+    ihl.bytes[14] = 0x44
+    fix_ip(&var ihl, 16)
+    check(refused(&ihl, Drop.IpHeaderLength), "a 16-byte header")
+    var total = good
+    total.bytes[17] = 61
+    fix_ip(&var total, 20)
+    check(refused(&total, Drop.IpTotalLength), "a total past the frame")
+    var long_header = good
+    long_header.bytes[14] = 0x49
+    long_header.bytes[16] = 0
+    long_header.bytes[17] = 32
+    fix_ip(&var long_header, 36)
+    check(refused(&long_header, Drop.IpTotalLength),
+          "a total under a header of options")
+    var sum = good
+    sum.bytes[24] = sum.bytes[24] ^ 0x80
+    check(refused(&sum, Drop.IpChecksum), "a bad checksum")
+    var fragment = good
+    fragment.bytes[20] = 0x20
+    fix_ip(&var fragment, 20)
+    check(refused(&fragment, Drop.IpFragment), "a first fragment")
+    var later = good
+    later.bytes[21] = 0x10
+    fix_ip(&var later, 20)
+    check(refused(&later, Drop.IpFragment), "a later fragment")
+
+    let to_c = udp_frame(mac_a(), SocketAddr(addr: ip_c(), port: 7), &data)
+    check(refused(&to_c, Drop.IpNotOurs), "another host's datagram")
+    let to_far = udp_frame(mac_a(), SocketAddr(addr: far(), port: 7), &data)
+    check(refused(&to_far, Drop.IpNotOurs), "a datagram to route: hosts do not")
+    var r = Recorder.fresh()
+    var unconfigured = Stack(mac: mac_a())
+    feed(&var unconfigured, &good, 0, &var r)
+    check(dropped(&unconfigured, Drop.IpNotOurs, 1) && r.sent_only(0),
+          "nothing is ours with no address")
+
+    var from_broadcast = good
+    Ipv4Addr.broadcast().write(&var from_broadcast.bytes, 26)
+    fix_ip(&var from_broadcast, 20)
+    check(refused(&from_broadcast, Drop.IpBadSource), "from the limited broadcast")
+    var from_subnet = good
+    subnet_broadcast().write(&var from_subnet.bytes, 26)
+    fix_ip(&var from_subnet, 20)
+    check(refused(&from_subnet, Drop.IpBadSource), "from the subnet's broadcast")
+    var from_group = good
+    Ipv4Addr(a: 224, b: 0, c: 0, d: 9).write(&var from_group.bytes, 26)
+    fix_ip(&var from_group, 20)
+    check(refused(&from_group, Drop.IpBadSource), "from a multicast group")
+
+    let ourselves = echo_from(ip_a(), mac_a(), ip_a())
+    check(refused(&ourselves, Drop.IpBadSource), "an echo from our own address")
+    let from_us = udp_from(SocketAddr(addr: ip_a(), port: 5000), mac_a(),
+                           SocketAddr(addr: ip_a(), port: 9), &data)
+    check(refused(&from_us, Drop.IpBadSource), "a datagram from our own address")
+
+    let tcp = ip_frame(mac_a(), ip_b(), ip_a(), 6, &data)
+    check(refused(&tcp, Drop.IpProtocol), "TCP")
+    let zero = ip_frame(mac_a(), ip_b(), ip_a(), 0, &data)
+    check(refused(&zero, Drop.IpProtocol), "protocol 0")
+}
+
+// -----------------------------------------------------------------------------
+// ICMP
+// -----------------------------------------------------------------------------
+
+/// What A sends B for `echo_frame`: wire.saw's golden reply, identification
+/// 0, in a frame from A to B.
+func golden_echo_reply() -> Frame {
+    let data: [UInt8; 4] = [0x61, 0x62, 0x63, 0x64]
+    let e = echo_bytes(icmp.IcmpType.EchoReply, 0x1234, 1, &data)
+    var p = Frame(len: 20 + e.len, bytes: [0; FRAME_BYTES])
+    let header: [UInt8; 20] = [
+        0x45, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x40, 0x01,
+        0x66, 0xDB, 0x0A, 0x00, 0x00, 0x01, 0x0A, 0x00, 0x00, 0x02,
+    ]
+    put_bytes(&var p.bytes, 0, &header)
+    put_bytes(&var p.bytes, 20, &e.bytes[..e.len])
+    ether_frame(mac_b(), mac_a(), 0x0800, &p.bytes[..p.len])
+}
+
+func echo() {
+    var r = Recorder.fresh()
+    var s = stack_a_knowing_b(&var r)
+    let request = echo_frame(mac_a(), ip_a())
+    feed(&var s, &request, 1, &var r)
+    let reply = golden_echo_reply()
+    check(r.sent_only(1) && r.sent(0, &reply), "an echo request is answered")
+    check(s.count(Count.EchoRepliesSent) == 1 && no_drops(&s), "and counted")
+
+    // To an unknown asker: the reply waits on its address.
+    var r2 = Recorder.fresh()
+    var s2 = stack_a(&var r2)
+    feed(&var s2, &request, 5, &var r2)
+    let ask = request_from_a(ip_b())
+    check(r2.sent_only(1) && r2.sent(0, &ask) && s2.pending_frames() == 1,
+          "a reply to an unknown host waits, its address asked for")
+    check(s2.count(Count.EchoRepliesSent) == 1, "a queued reply counts as sent")
+    let b_answers = reply_from_b()
+    r2.clear()
+    feed(&var s2, &b_answers, 6, &var r2)
+    check(r2.sent_only(1) && r2.sent(0, &reply) && s2.pending_frames() == 0,
+          "and goes out once the address is learned")
+
+    // To a broadcast, at the IP or the link layer.
+    let to_all = echo_frame(mac_a(), subnet_broadcast())
+    check(refused(&to_all, Drop.IcmpBroadcastEcho), "an echo to the subnet")
+    let to_everyone = echo_frame(MacAddr.broadcast(), Ipv4Addr.broadcast())
+    check(refused(&to_everyone, Drop.IcmpBroadcastEcho), "an echo to everyone")
+    let link_broadcast = echo_frame(MacAddr.broadcast(), ip_a())
+    check(refused(&link_broadcast, Drop.IcmpBroadcastEcho), "an echo sent link-wide")
+    var anonymous = request
+    Ipv4Addr.unspecified().write(&var anonymous.bytes, 26)
+    fix_ip(&var anonymous, 20)
+    check(refused(&anonymous, Drop.IcmpNoSource), "an echo from no address")
+
+    // An echo reply is handed up.
+    var r3 = Recorder.fresh()
+    var s3 = stack_a_knowing_b(&var r3)
+    let data: [UInt8; 3] = [1, 2, 3]
+    let e = echo_bytes(icmp.IcmpType.EchoReply, 77, 5, &data)
+    let reply_in = ip_frame(mac_a(), ip_b(), ip_a(), 1, &e.bytes[..e.len])
+    feed(&var s3, &reply_in, 0, &var r3)
+    check(r3.frames.len() == 0 && r3.got.len() == 1, "an echo reply goes up")
+    let got = r3.got[0]
+    let expected = Delivery.EchoReply(from: ip_b(), ident: 77, sequence: 5)
+    check(got.delivery == expected && got.data.len == 3 &&
+          got.data.bytes[2] == 3, "with its sender, identifier, sequence and data")
+    check(s3.count(Count.EchoRepliesReceived) == 1 && no_drops(&s3), "counted")
+    r3.deliver_full = true
+    feed(&var s3, &reply_in, 0, &var r3)
+    check(dropped(&s3, Drop.DeliverFull, 1) && s3.count(Count.EchoRepliesReceived) == 1,
+          "a reply nobody has room for is dropped")
+}
+
+func icmp_refusals() {
+    let data: [UInt8; 4] = [0x61, 0x62, 0x63, 0x64]
+    let e = echo_bytes(icmp.IcmpType.EchoRequest, 0x1234, 1, &data)
+    let short = ip_frame(mac_a(), ip_b(), ip_a(), 1, &e.bytes[..7])
+    check(refused(&short, Drop.IcmpTruncated), "7 bytes")
+    var bad = e
+    bad.bytes[9] = 0x00
+    let corrupt = ip_frame(mac_a(), ip_b(), ip_a(), 1, &bad.bytes[..bad.len])
+    check(refused(&corrupt, Drop.IcmpChecksum), "a bad checksum")
+    var timestamp = e
+    timestamp.bytes[0] = 13
+    put16(&var timestamp.bytes, 2, 0)
+    let sum = checksum(sum16(0, &timestamp.bytes[..timestamp.len]))
+    put16(&var timestamp.bytes, 2, sum)
+    let ts = ip_frame(mac_a(), ip_b(), ip_a(), 1, &timestamp.bytes[..timestamp.len])
+    check(refused(&ts, Drop.IcmpUnhandled), "a timestamp request")
+    var quote: [UInt8; 28] = [0; 28]
+    quote[0] = 0x45
+    var u = Frame(len: 0, bytes: [0; FRAME_BYTES])
+    u.len = icmp.write_unreachable(&var u.bytes, 3, &quote)
+    let unreachable = ip_frame(mac_a(), ip_b(), ip_a(), 1, &u.bytes[..u.len])
+    check(refused(&unreachable, Drop.IcmpUnhandled), "an unreachable")
+}
+
+// -----------------------------------------------------------------------------
+// UDP
+// -----------------------------------------------------------------------------
+
+/// A's port unreachable for B's "hi" to port 7: wire.saw's golden message in
+/// a datagram of identification 0.
+func golden_unreachable() -> Frame {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    let in_frame = udp_frame(mac_a(), SocketAddr(addr: ip_a(), port: 7), &data)
+    var u = Frame(len: 0, bytes: [0; FRAME_BYTES])
+    u.len = icmp.write_unreachable(&var u.bytes, 3, &in_frame.bytes[14..42])
+    var p = Frame(len: 20 + u.len, bytes: [0; FRAME_BYTES])
+    let header: [UInt8; 20] = [
+        0x45, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x00, 0x40, 0x01,
+        0x66, 0xC3, 0x0A, 0x00, 0x00, 0x01, 0x0A, 0x00, 0x00, 0x02,
+    ]
+    put_bytes(&var p.bytes, 0, &header)
+    put_bytes(&var p.bytes, 20, &u.bytes[..u.len])
+    ether_frame(mac_b(), mac_a(), 0x0800, &p.bytes[..p.len])
+}
+
+func udp_receive() {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    var r = Recorder.fresh()
+    var s = stack_a_knowing_b(&var r)
+    let opened = try! s.udp_open(7)
+    check(opened == Opened(id: 0, port: 7), "a socket on port 7")
+    let to_7 = udp_frame(mac_a(), SocketAddr(addr: ip_a(), port: 7), &data)
+    feed(&var s, &to_7, 0, &var r)
+    check(r.frames.len() == 0 && r.got.len() == 1, "a datagram goes up")
+    let got = r.got[0]
+    let from_b = SocketAddr(addr: ip_b(), port: 5000)
+    check(got.delivery == Delivery.Datagram(id: 0, from: from_b) &&
+          same(&got.data.bytes[..got.data.len], &data),
+          "to its socket, with its sender and data")
+    check(s.count(Count.DatagramsDelivered) == 1 && no_drops(&s), "counted")
+
+    // Sent to the subnet's broadcast, or the link's.
+    r.clear()
+    let subnet_7 = SocketAddr(addr: subnet_broadcast(), port: 7)
+    let to_all = udp_frame(mac_a(), subnet_7, &data)
+    feed(&var s, &to_all, 0, &var r)
+    let everyone = udp_frame(MacAddr.broadcast(),
+                             SocketAddr(addr: Ipv4Addr.broadcast(), port: 7), &data)
+    feed(&var s, &everyone, 0, &var r)
+    check(r.got.len() == 2 && s.count(Count.DatagramsDelivered) == 3 && no_drops(&s),
+          "broadcasts go up too")
+
+    // The largest frame there is.
+    r.clear()
+    var most: [UInt8; 1472] = [0x5A; 1472]
+    most[1471] = 0xA5
+    let biggest = udp_frame(mac_a(), SocketAddr(addr: ip_a(), port: 7), &most)
+    check(biggest.len == ether.MAX_FRAME_BYTES, "a frame of the MTU")
+    feed(&var s, &biggest, 0, &var r)
+    let whole = r.got[0]
+    check(r.got.len() == 1 && whole.data.len == 1472 && whole.data.bytes[1471] == 0xA5,
+          "is taken whole")
+
+    // Padding past the datagram is not data.
+    r.clear()
+    let one: [UInt8; 1] = [0x31]
+    let tiny = udp_frame(mac_a(), SocketAddr(addr: ip_a(), port: 7), &one)
+    check(tiny.len == 60, "a short frame is padded")
+    feed(&var s, &tiny, 0, &var r)
+    let small = r.got[0]
+    check(small.data.len == 1 && small.data.bytes[0] == 0x31, "and its padding dropped")
+
+    // Bytes inside the IP datagram past the UDP length are not data.
+    r.clear()
+    let src = SocketAddr(addr: ip_b(), port: 5000)
+    var u = udp_bytes(src, SocketAddr(addr: ip_a(), port: 7), &data)
+    u.len = u.len + 3
+    let extra = ip_frame(mac_a(), ip_b(), ip_a(), 17, &u.bytes[..u.len])
+    feed(&var s, &extra, 0, &var r)
+    let trimmed = r.got[0]
+    check(r.got.len() == 1 && same(&trimmed.data.bytes[..trimmed.data.len], &data),
+          "the UDP length bounds the data")
+
+    // A socket with no room.
+    r.clear()
+    r.deliver_full = true
+    feed(&var s, &to_7, 0, &var r)
+    check(dropped(&s, Drop.DeliverFull, 1) && r.got.len() == 0 &&
+          s.count(Count.DatagramsDelivered) == 6, "a full socket drops")
+
+    // A closed socket's port is closed.
+    r.deliver_full = false
+    check(match s.udp_close(0) { case Ok(_) -> true, case Err(_) -> false }, "a close")
+    check(match s.udp_close(0) { case Err(_) -> true, case Ok(_) -> false },
+          "a second close")
+    r.clear()
+    feed(&var s, &to_7, 10_000, &var r)
+    check(s.drops(Drop.UdpNoPort) == 1 && r.got.len() == 0, "a closed port")
+}
+
+func unreachables() {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    let to_7 = udp_frame(mac_a(), SocketAddr(addr: ip_a(), port: 7), &data)
+    var r = Recorder.fresh()
+    var s = stack_a_knowing_b(&var r)
+    feed(&var s, &to_7, 1000, &var r)
+    let expected = golden_unreachable()
+    check(r.sent_only(1) && r.sent(0, &expected), "a closed port is unreachable")
+    check(dropped(&s, Drop.UdpNoPort, 1) && s.count(Count.UnreachablesSent) == 1,
+          "the datagram dropped, the unreachable counted")
+
+    r.clear()
+    feed(&var s, &to_7, 1000 + icmp.UNREACHABLE_INTERVAL_MS - 1, &var r)
+    check(r.sent_only(0) && s.drops(Drop.IcmpRateLimited) == 1 &&
+          s.drops(Drop.UdpNoPort) == 2, "the next waits out the rate limit")
+    feed(&var s, &to_7, 1000 + icmp.UNREACHABLE_INTERVAL_MS, &var r)
+    check(r.sent_only(1) && s.count(Count.UnreachablesSent) == 2, "and then goes")
+
+    // None for a broadcast, a link broadcast, or a source of no address; and
+    // none of those spends the rate limit.
+    var r2 = Recorder.fresh()
+    var s2 = stack_a_knowing_b(&var r2)
+    let subnet_7 = SocketAddr(addr: subnet_broadcast(), port: 7)
+    let to_all = udp_frame(mac_a(), subnet_7, &data)
+    feed(&var s2, &to_all, 0, &var r2)
+    check(r2.sent_only(0) && dropped(&s2, Drop.UdpNoPort, 1), "not to a broadcast")
+    let link = udp_frame(MacAddr.broadcast(), SocketAddr(addr: ip_a(), port: 7), &data)
+    feed(&var s2, &link, 0, &var r2)
+    check(r2.sent_only(0) && dropped(&s2, Drop.UdpNoPort, 2), "not to a link broadcast")
+    var anonymous = to_7
+    Ipv4Addr.unspecified().write(&var anonymous.bytes, 26)
+    fix_ip(&var anonymous, 20)
+    put16(&var anonymous.bytes, 40, 0)
+    feed(&var s2, &anonymous, 0, &var r2)
+    check(r2.sent_only(0) && dropped(&s2, Drop.UdpNoPort, 3), "not to no address")
+    feed(&var s2, &to_7, 0, &var r2)
+    check(r2.sent_only(1), "and the limit is still unspent")
+}
+
+func udp_refusals() {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    let src = SocketAddr(addr: ip_b(), port: 5000)
+    let dst = SocketAddr(addr: ip_a(), port: 7)
+    let u = udp_bytes(src, dst, &data)
+    let short = ip_frame(mac_a(), ip_b(), ip_a(), 17, &u.bytes[..7])
+    check(refused(&short, Drop.UdpTruncated), "7 bytes")
+    var long = u
+    put16(&var long.bytes, 4, 11)
+    let long_frame = ip_frame(mac_a(), ip_b(), ip_a(), 17, &long.bytes[..10])
+    check(refused(&long_frame, Drop.UdpLength), "a length past the payload")
+    var bad = u
+    bad.bytes[9] = 0x6A
+    let corrupt = ip_frame(mac_a(), ip_b(), ip_a(), 17, &bad.bytes[..10])
+    check(refused(&corrupt, Drop.UdpChecksum), "a bad checksum")
+}
+
+// -----------------------------------------------------------------------------
+// Sending
+// -----------------------------------------------------------------------------
+
+func sends() {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    let to_b = SocketAddr(addr: ip_b(), port: 5000)
+
+    var r = Recorder.fresh()
+    var unconfigured = Stack(mac: mac_a())
+    let early = try! unconfigured.udp_open(7)
+    check(fails(unconfigured.udp_send(early.id, to_b, &data, 0, &var r),
+                SendError.NotConfigured), "no address")
+    check(fails(unconfigured.ping(ip_b(), 1, 1, &data, 0, &var r),
+                SendError.NotConfigured), "no address to ping from")
+
+    // wire.saw's golden datagram, A's first.
+    var s = stack_a_knowing_b(&var r)
+    let socket = try! s.udp_open(7)
+    check(match s.udp_send(socket.id, to_b, &data, 0, &var r) {
+              case Ok(_) -> true, case Err(_) -> false }, "a datagram is sent")
+    let udp_to_b: [UInt8; 30] = [
+        0x45, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11, 0x66, 0xCD,
+        0x0A, 0x00, 0x00, 0x01, 0x0A, 0x00, 0x00, 0x02,
+        0x00, 0x07, 0x13, 0x88, 0x00, 0x0A, 0x6F, 0xDF, 0x68, 0x69,
+    ]
+    let golden = ether_frame(mac_b(), mac_a(), 0x0800, &udp_to_b)
+    check(r.sent_only(1) && r.sent(0, &golden), "byte for byte")
+    check(s.count(Count.DatagramsSent) == 1, "and counted")
+
+    // The next datagram takes the next identification.
+    r.clear()
+    let _ = s.udp_send(socket.id, to_b, &data, 0, &var r)
+    let second = r.frames[0]
+    check(second.bytes[18] == 0 && second.bytes[19] == 1, "identifications count up")
+
+    check(fails(s.udp_send(socket.id + 1, to_b, &data, 0, &var r), SendError.NoSocket),
+          "a socket not open")
+    var most: [UInt8; 1473] = [0; 1473]
+    check(fails(s.udp_send(socket.id, to_b, &most, 0, &var r), SendError.TooLong),
+          "one byte past a datagram")
+    r.clear()
+    check(match s.udp_send(socket.id, to_b, &most[..MAX_UDP_DATA], 0, &var r) {
+              case Ok(_) -> true, case Err(_) -> false }, "a datagram of the MTU")
+    let full = r.frames[0]
+    check(full.len == ether.MAX_FRAME_BYTES, "fills the largest frame")
+    check(fails(s.udp_send(socket.id, SocketAddr(addr: ip_b(), port: 0), &data,
+                           0, &var r), SendError.BadAddress), "port 0")
+    let nowhere = SocketAddr(addr: Ipv4Addr.unspecified(), port: 9)
+    check(fails(s.udp_send(socket.id, nowhere, &data,
+                     0, &var r), SendError.BadAddress), "no address")
+    let group = SocketAddr(addr: Ipv4Addr(a: 224, b: 0, c: 0, d: 1), port: 9)
+    check(fails(s.udp_send(socket.id, group, &data, 0, &var r),
+                SendError.BadAddress), "a multicast group")
+    check(fails(s.udp_send(socket.id, SocketAddr(addr: ip_a(), port: 9), &data, 0,
+                           &var r), SendError.BadAddress), "our own address")
+
+    // Broadcasts go to every station, with nothing to resolve.
+    r.clear()
+    let everyone = SocketAddr(addr: Ipv4Addr.broadcast(), port: 9)
+    let _ = s.udp_send(socket.id, everyone, &data, 0, &var r)
+    let subnet = SocketAddr(addr: subnet_broadcast(), port: 9)
+    let _ = s.udp_send(socket.id, subnet, &data, 0, &var r)
+    let b1 = r.frames[0]
+    let b2 = r.frames[1]
+    check(r.sent_only(2) && MacAddr(bytes: &b1.bytes, at: 0) == MacAddr.broadcast() &&
+          MacAddr(bytes: &b2.bytes, at: 0) == MacAddr.broadcast(),
+          "broadcasts go to the broadcast address")
+    check(b1.bytes[12] == 0x08 && b1.bytes[13] == 0x00 &&
+          Ipv4Addr(bytes: &b1.bytes, at: 30) == Ipv4Addr.broadcast() &&
+          b2.bytes[12] == 0x08 && b2.bytes[13] == 0x00 &&
+          Ipv4Addr(bytes: &b2.bytes, at: 30) == subnet_broadcast(),
+          "as the datagrams themselves, with nothing to resolve")
+    check(no_drops(&s), "nothing dropped")
+
+    // Off the subnet, through the gateway; with none, nowhere.
+    r.clear()
+    let _ = s.udp_send(socket.id, SocketAddr(addr: far(), port: 9), &data, 0, &var r)
+    let ask_gateway = request_from_a(gateway())
+    check(r.sent_only(1) && r.sent(0, &ask_gateway) && s.pending_frames() == 1,
+          "a far host's datagram waits on the gateway")
+    var r2 = Recorder.fresh()
+    var alone = Stack(mac: mac_a())
+    let no_gateway = try! ipv4.Config(addr: ip_a(),
+                                      netmask: mask24(),
+                                      gateway: Ipv4Addr.unspecified())
+    alone.configure(no_gateway, &var r2)
+    let lone = try! alone.udp_open(7)
+    let far_9 = SocketAddr(addr: far(), port: 9)
+    check(fails(alone.udp_send(lone.id, far_9, &data, 0, &var r2),
+                SendError.NoRoute), "no gateway, no route")
+    r2.clear()
+    check(match alone.udp_send(lone.id, SocketAddr(addr: Ipv4Addr.broadcast(), port: 9),
+                               &data, 0, &var r2) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "a broadcast needs no route")
+    check(r2.sent_only(1), "and goes out")
+
+    // With the gateway resolved, a far host's datagram goes to the gateway's
+    // hardware address, addressed to the far host.
+    var r5 = Recorder.fresh()
+    var s5 = stack_a(&var r5)
+    let sock5 = try! s5.udp_open(7)
+    let gateway_reply = arp_frame(arp.ArpOp.Reply, mac_a(), mac_c(), gateway(), mac_a(),
+                                  ip_a())
+    feed(&var s5, &gateway_reply, 0, &var r5)
+    let _ = s5.udp_send(sock5.id, SocketAddr(addr: far(), port: 9), &data, 0, &var r5)
+    let routed = r5.frames[0]
+    check(r5.sent_only(1) && MacAddr(bytes: &routed.bytes, at: 0) == mac_c() &&
+          Ipv4Addr(bytes: &routed.bytes, at: 30) == far(),
+          "through the gateway")
+
+    // The device has no room.
+    var r3 = Recorder.fresh()
+    var s3 = stack_a_knowing_b(&var r3)
+    let sock3 = try! s3.udp_open(7)
+    r3.tx_full = true
+    check(fails(s3.udp_send(sock3.id, to_b, &data, 0, &var r3), SendError.LinkFull),
+          "a full device")
+    check(dropped(&s3, Drop.TxFull, 1) && s3.count(Count.DatagramsSent) == 0 &&
+          s3.count(Count.FramesSent) == 1, "is a counted drop, the frame unsent")
+
+    // Identifications wrap after the last.
+    r3.clear()
+    var k = 0
+    while k < 0x1_0000 {
+        let _ = s3.udp_send(sock3.id, to_b, &data, 0, &var r3)
+        k = k + 1
+    }
+    r3.tx_full = false
+    let _ = s3.udp_send(sock3.id, to_b, &data, 0, &var r3)
+    let wrapped = r3.frames[0]
+    check(r3.sent_only(1) && wrapped.bytes[18] == 0 && wrapped.bytes[19] == 1,
+          "the identification wraps to 0 after 65535")
+
+    // Pings.
+    var r4 = Recorder.fresh()
+    var s4 = stack_a_knowing_b(&var r4)
+    let payload: [UInt8; 4] = [0x61, 0x62, 0x63, 0x64]
+    check(match s4.ping(ip_b(), 0x1234, 1, &payload, 0, &var r4) {
+              case Ok(_) -> true, case Err(_) -> false }, "a ping")
+    let ping = r4.frames[0]
+    let request = echo_bytes(icmp.IcmpType.EchoRequest, 0x1234, 1, &payload)
+    check(r4.sent_only(1) && ping.len == 60 && ping.bytes[23] == 1 &&
+          same(&ping.bytes[34..42 + 4], &request.bytes[..request.len]),
+          "is an echo request")
+    check(s4.count(Count.EchoRequestsSent) == 1, "counted")
+    var big: [UInt8; 1473] = [0; 1473]
+    check(fails(s4.ping(ip_b(), 1, 1, &big[..MAX_ECHO_DATA + 1], 0, &var r4),
+                SendError.TooLong), "a ping too long")
+    check(match s4.ping(ip_b(), 1, 1, &big[..MAX_ECHO_DATA], 0, &var r4) {
+              case Ok(_) -> true, case Err(_) -> false }, "the longest ping")
+    check(fails(s4.ping(Ipv4Addr.unspecified(), 1, 1, &payload, 0, &var r4),
+                SendError.BadAddress), "a ping to no address")
+    check(fails(s4.ping(Ipv4Addr(a: 239, b: 1, c: 1, d: 1), 1, 1, &payload, 0,
+                        &var r4), SendError.BadAddress), "a ping to a group")
+    check(fails(s4.ping(ip_a(), 1, 1, &payload, 0, &var r4), SendError.BadAddress),
+          "a ping to ourselves")
+}
+
+// -----------------------------------------------------------------------------
+// Resolution over time
+// -----------------------------------------------------------------------------
+
+func resolution() {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    let to_b = SocketAddr(addr: ip_b(), port: 5000)
+    var r = Recorder.fresh()
+    var s = stack_a(&var r)
+    let socket = try! s.udp_open(7)
+    let ask = request_from_a(ip_b())
+
+    check(match s.udp_send(socket.id, to_b, &data, 100, &var r) {
+              case Ok(_) -> true, case Err(_) -> false }, "a send waits")
+    check(r.sent_only(1) && r.sent(0, &ask) && s.pending_frames() == 1,
+          "and asks for the address")
+    let more: [UInt8; 1] = [0x21]
+    let _ = s.udp_send(socket.id, to_b, &more, 100 + arp.REQUEST_INTERVAL_MS - 1,
+                       &var r)
+    check(r.sent_only(1) && s.pending_frames() == 2,
+          "a second waits without asking again within the interval")
+    check(s.count(Count.DatagramsSent) == 2, "both count as sent")
+
+    s.poll(100 + arp.REQUEST_INTERVAL_MS - 1, &var r)
+    check(r.sent_only(1), "no request is due before the interval")
+    s.poll(100 + arp.REQUEST_INTERVAL_MS, &var r)
+    check(r.sent_only(2) && r.sent(1, &ask), "a poll asks again after it")
+    let _ = s.udp_send(socket.id, to_b, &more, 100 + 2 * arp.REQUEST_INTERVAL_MS,
+                       &var r)
+    check(r.sent_only(3) && r.sent(2, &ask) && s.pending_frames() == 3,
+          "a send asks again after it too")
+
+    r.clear()
+    let reply = reply_from_b()
+    feed(&var s, &reply, 2500, &var r)
+    check(r.sent_only(3) && s.pending_frames() == 0, "the answer releases them")
+    let first = r.frames[0]
+    let third = r.frames[2]
+    check(MacAddr(bytes: &first.bytes, at: 0) == mac_b() && first.bytes[42] == 0x68 &&
+          third.bytes[42] == 0x21, "to B's address, in the order sent")
+    check(no_drops(&s), "nothing dropped")
+
+    // Learned entries age out, and are asked for again.
+    r.clear()
+    let _ = s.udp_send(socket.id, to_b, &data, 2500 + arp.ENTRY_LIFETIME_MS - 1, &var r)
+    let live = r.frames[0]
+    check(r.sent_only(1) && MacAddr(bytes: &live.bytes, at: 0) == mac_b(),
+          "a live entry is used")
+    r.clear()
+    let _ = s.udp_send(socket.id, to_b, &data, 2500 + arp.ENTRY_LIFETIME_MS, &var r)
+    check(r.sent_only(1) && r.sent(0, &ask) && s.pending_frames() == 1,
+          "an expired one is asked for again")
+}
+
+func unanswered() {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    let to_c = SocketAddr(addr: ip_c(), port: 5000)
+    var r = Recorder.fresh()
+    var s = stack_a(&var r)
+    let socket = try! s.udp_open(7)
+    var n = 0
+    while n < arp.PENDING_FRAMES {
+        check(match s.udp_send(socket.id, to_c, &data, n as UInt64, &var r) {
+                  case Ok(_) -> true, case Err(_) -> false }, "a send queues")
+        n = n + 1
+    }
+    check(s.pending_frames() == arp.PENDING_FRAMES, "the queue fills")
+    check(fails(s.udp_send(socket.id, to_c, &data, 10, &var r), SendError.QueueFull),
+          "and refuses the next")
+    check(dropped(&s, Drop.ArpQueueFull, 1), "counted")
+    check(s.count(Count.DatagramsSent) == arp.PENDING_FRAMES as UInt32,
+          "the refused one is not sent")
+
+    s.poll(arp.PENDING_TIMEOUT_MS - 1, &var r)
+    check(s.pending_frames() == arp.PENDING_FRAMES, "nothing expires early")
+    s.poll(arp.PENDING_TIMEOUT_MS, &var r)
+    check(s.pending_frames() == arp.PENDING_FRAMES - 1, "the oldest expires first")
+    s.poll(arp.PENDING_TIMEOUT_MS + 100, &var r)
+    check(s.pending_frames() == 0, "then the rest")
+    check(s.drops(Drop.ArpUnresolved) == arp.PENDING_FRAMES as UInt32,
+          "each counted unresolved")
+    r.clear()
+    s.poll(arp.PENDING_TIMEOUT_MS + 10_000, &var r)
+    check(r.sent_only(0), "and nothing is asked for once none wait")
+}
+
+/// A, on 10.0.0.0/24 with no gateway, with B resolved at time 0.
+func stack_alone(r: &var Recorder) -> Stack {
+    var s = Stack(mac: mac_a())
+    let alone = try! ipv4.Config(addr: ip_a(), netmask: mask24(),
+                                 gateway: Ipv4Addr.unspecified())
+    s.configure(alone, &var r)
+    let reply = reply_from_b()
+    s.receive(&reply.bytes[..reply.len], 0, &var r)
+    r.clear()
+    s
+}
+
+func refused_replies() {
+    // With no gateway, a reply to a host off the subnet has no route, and is
+    // counted so.
+    let data: [UInt8; 2] = [0x68, 0x69]
+    var r = Recorder.fresh()
+    var s = stack_alone(&var r)
+    let ping_far = echo_from(far(), mac_a(), ip_a())
+    feed(&var s, &ping_far, 0, &var r)
+    check(r.sent_only(0) && dropped(&s, Drop.IpNoRoute, 1) &&
+          s.count(Count.EchoRepliesSent) == 0,
+          "an echo reply with no route is a counted drop")
+    let far_udp = udp_from(SocketAddr(addr: far(), port: 5000), mac_a(),
+                           SocketAddr(addr: ip_a(), port: 9), &data)
+    feed(&var s, &far_udp, 100, &var r)
+    check(r.sent_only(0) && s.drops(Drop.UdpNoPort) == 1 &&
+          s.drops(Drop.IpNoRoute) == 2 && all_drops(&s) == 3 &&
+          s.count(Count.UnreachablesSent) == 0,
+          "so is an unreachable with no route")
+    let near = udp_frame(mac_a(), SocketAddr(addr: ip_a(), port: 9), &data)
+    feed(&var s, &near, 600, &var r)
+    check(r.sent_only(1) && s.count(Count.UnreachablesSent) == 1 &&
+          s.drops(Drop.IcmpRateLimited) == 0,
+          "and it spends none of the rate limit")
+
+    // A device with no room for a reply: the reply is a counted drop, not a
+    // reply sent, and spends nothing.
+    var r2 = Recorder.fresh()
+    var s2 = stack_a_knowing_b(&var r2)
+    r2.tx_full = true
+    let ping = echo_frame(mac_a(), ip_a())
+    feed(&var s2, &ping, 0, &var r2)
+    check(dropped(&s2, Drop.TxFull, 1) && s2.count(Count.EchoRepliesSent) == 0,
+          "an echo reply the device refuses is not sent")
+    let request = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_b(),
+                            ip_b(), MacAddr.zero(), ip_a())
+    feed(&var s2, &request, 0, &var r2)
+    check(dropped(&s2, Drop.TxFull, 2) && s2.count(Count.ArpRepliesSent) == 0,
+          "nor an ARP reply")
+    feed(&var s2, &near, 1000, &var r2)
+    check(s2.drops(Drop.TxFull) == 3 && s2.count(Count.UnreachablesSent) == 0,
+          "nor an unreachable")
+    r2.tx_full = false
+    feed(&var s2, &near, 1000, &var r2)
+    check(r2.sent_only(1) && s2.count(Count.UnreachablesSent) == 1,
+          "which spent none of the rate limit")
+}
+
+func options() {
+    // A header of options moves where every payload starts.
+    let data: [UInt8; 2] = [0x68, 0x69]
+    var r = Recorder.fresh()
+    var s = stack_a_knowing_b(&var r)
+    let _ = s.udp_open(7)
+    let words: [UInt8; 4] = [0x61, 0x62, 0x63, 0x64]
+    let e = echo_bytes(icmp.IcmpType.EchoRequest, 0x1234, 1, &words)
+    let ping = ip_frame_options(mac_a(), ip_b(), ip_a(), 1, &e.bytes[..e.len])
+    feed(&var s, &ping, 0, &var r)
+    let reply = golden_echo_reply()
+    check(r.sent_only(1) && r.sent(0, &reply), "an echo with options is answered")
+
+    r.clear()
+    let src = SocketAddr(addr: ip_b(), port: 5000)
+    let u = udp_bytes(src, SocketAddr(addr: ip_a(), port: 7), &data)
+    let to_7 = ip_frame_options(mac_a(), ip_b(), ip_a(), 17, &u.bytes[..u.len])
+    feed(&var s, &to_7, 0, &var r)
+    let got = r.got[0]
+    check(r.frames.len() == 0 && r.got.len() == 1 &&
+          same(&got.data.bytes[..got.data.len], &data),
+          "a datagram with options goes up whole")
+
+    r.clear()
+    let closed = udp_bytes(src, SocketAddr(addr: ip_a(), port: 9), &data)
+    let to_9 = ip_frame_options(mac_a(), ip_b(), ip_a(), 17,
+                                &closed.bytes[..closed.len])
+    feed(&var s, &to_9, 0, &var r)
+    let answer = r.frames[0]
+    check(r.sent_only(1) && answer.len == 14 + 20 + 8 + 32 &&
+          same(&answer.bytes[42..74], &to_9.bytes[14..46]),
+          "an unreachable quotes the header with its options and 8 bytes")
+}
+
+func reply_bound() {
+    // Replies to hosts nobody answers for wait, but not in every slot.
+    var r = Recorder.fresh()
+    var s = stack_a(&var r)
+    var n = 0
+    while n < arp.REPLY_FRAMES {
+        let ping = echo_from(Ipv4Addr(a: 10, b: 0, c: 0, d: (20 + n) as UInt8),
+                             mac_a(), ip_a())
+        feed(&var s, &ping, 0, &var r)
+        n = n + 1
+    }
+    check(s.pending_frames() == arp.REPLY_FRAMES && no_drops(&s),
+          "replies wait up to their bound")
+    let one_more = echo_from(Ipv4Addr(a: 10, b: 0, c: 0, d: 40), mac_a(), ip_a())
+    feed(&var s, &one_more, 0, &var r)
+    check(dropped(&s, Drop.ArpQueueFull, 1) &&
+          s.pending_frames() == arp.REPLY_FRAMES, "and no further")
+    let data: [UInt8; 2] = [0x68, 0x69]
+    let closed = udp_from(SocketAddr(addr: Ipv4Addr(a: 10, b: 0, c: 0, d: 41),
+                                     port: 5000), mac_a(),
+                          SocketAddr(addr: ip_a(), port: 9), &data)
+    feed(&var s, &closed, 0, &var r)
+    check(s.drops(Drop.ArpQueueFull) == 2 && s.count(Count.UnreachablesSent) == 0,
+          "an unreachable is a reply too")
+    let socket = try! s.udp_open(7)
+    check(match s.udp_send(socket.id, SocketAddr(addr: ip_c(), port: 9), &data, 0,
+                           &var r) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "a datagram of our own still finds a slot")
+    check(s.pending_frames() == arp.PENDING_FRAMES, "the last one")
+}
+
+func readdressed() {
+    let data: [UInt8; 2] = [0x68, 0x69]
+    var r = Recorder.fresh()
+    var s = stack_a(&var r)
+    let socket = try! s.udp_open(7)
+    let to_c = SocketAddr(addr: ip_c(), port: 9)
+    let _ = s.udp_send(socket.id, to_c, &data, 0, &var r)
+    let _ = s.udp_send(socket.id, to_c, &data, 0, &var r)
+    s.configure(config_a(), &var r)
+    check(s.pending_frames() == 2 && no_drops(&s),
+          "the same address keeps what waits")
+    let moved = try! ipv4.Config(addr: Ipv4Addr(a: 10, b: 0, c: 0, d: 9),
+                                 netmask: mask24(), gateway: gateway())
+    r.clear()
+    s.configure(moved, &var r)
+    check(s.pending_frames() == 0 && dropped(&s, Drop.ArpReaddressed, 2),
+          "a new address drops what was built with the old one")
+    check(r.sent_only(1), "and is announced")
+}
+
+func main() {
+    announcements()
+    arp_answers()
+    arp_refusals()
+    ethernet_refusals()
+    ipv4_refusals()
+    echo()
+    icmp_refusals()
+    udp_receive()
+    unreachables()
+    udp_refusals()
+    sends()
+    resolution()
+    unanswered()
+    refused_replies()
+    options()
+    reply_bound()
+    readdressed()
+}

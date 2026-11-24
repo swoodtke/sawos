@@ -1,0 +1,240 @@
+// Two stacks wired back to back: every frame one sends, the other receives,
+// until neither has anything left to say. Neither knows the other at the
+// start, so the first ping resolves both ways over ARP before the echo
+// crosses; then a UDP echo, a datagram to a closed port answered unreachable,
+// and a second ping after the translations have aged out.
+//
+// A is 02:00:00:00:00:0a at 10.0.0.1, B is 02:00:00:00:00:0b at 10.0.0.2, on
+// 10.0.0.0/24.
+
+import netstack.{Config, Count, DROP_KINDS, Delivery, Drop, Ipv4Addr, MacAddr, Sink,
+                 SinkError, SocketAddr, Stack}
+import netstack.arp
+import netstack.bytes.{put_bytes}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func same(a: &[UInt8], b: &[UInt8]) -> Bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+func mac_a() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0A]) }
+func mac_b() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0B]) }
+func ip_a() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 1) }
+func ip_b() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 2) }
+
+func config(addr: Ipv4Addr) -> Config {
+    try! Config(addr: addr, netmask: Ipv4Addr(a: 255, b: 255, c: 255, d: 0),
+                gateway: Ipv4Addr.unspecified())
+}
+
+static FRAME_BYTES: Int = 1514
+
+struct Frame {
+    len: Int,
+    bytes: [UInt8; FRAME_BYTES],
+}
+
+extension Frame {
+    init(copying: &[UInt8]) -> Frame {
+        var f = Frame(len: copying.len(), bytes: [0; FRAME_BYTES])
+        put_bytes(&var f.bytes, 0, &copying)
+        f
+    }
+}
+
+struct Got {
+    delivery: Delivery,
+    data: Frame,
+}
+
+/// One station's side of the wire: the frames it sent, not yet carried, and
+/// what it handed up.
+struct Port {
+    frames: Vector<Frame>,
+    got: Vector<Got>,
+}
+
+extension Port: NoCopy {}
+
+extension Port {
+    static func fresh() -> Port {
+        Port(frames: Vector<Frame>(), got: Vector<Got>())
+    }
+}
+
+extension Port: Sink {
+    func transmit(&var self, frame: &[UInt8]) -> Result<Void, SinkError> {
+        try! self.frames.push(Frame(copying: &frame))
+        return
+    }
+
+    func deliver(&var self, delivery: Delivery,
+                 data: &[UInt8]) -> Result<Void, SinkError> {
+        try! self.got.push(Got(delivery: delivery, data: Frame(copying: &data)))
+        return
+    }
+}
+
+/// The most turns a conversation may take before the wire calls it a loop.
+static MAX_TURNS: Int = 16
+
+/// Carries frames both ways at `now` until neither side sends; answers the
+/// frames carried.
+func pump(a: &var Stack, pa: &var Port, b: &var Stack, pb: &var Port,
+          now: UInt64) -> Int {
+    var carried = 0
+    var turns = 0
+    while pa.frames.len() + pb.frames.len() != 0 {
+        turns = turns + 1
+        check(turns <= MAX_TURNS, "the conversation ends")
+        let to_b = pa.frames.len()
+        var i = 0
+        while i < to_b {
+            let f = pa.frames[i]
+            b.receive(&f.bytes[..f.len], now, &var pb)
+            i = i + 1
+        }
+        pa.frames.clear()
+        let to_a = pb.frames.len()
+        i = 0
+        while i < to_a {
+            let f = pb.frames[i]
+            a.receive(&f.bytes[..f.len], now, &var pa)
+            i = i + 1
+        }
+        pb.frames.clear()
+        carried = carried + to_b + to_a
+    }
+    carried
+}
+
+/// Every drop the stack counted, whatever its reason.
+func all_drops(s: &Stack) -> UInt64 {
+    var total: UInt64 = 0
+    var raw = 0
+    while raw < DROP_KINDS {
+        total = total + (s.drops(Drop.from(raw: raw as UInt8)!) as UInt64)
+        raw = raw + 1
+    }
+    total
+}
+
+/// Whether the stack's only drops are `n` of `reason`. When they are not, the
+/// drops it did count are printed.
+func dropped(s: &Stack, reason: Drop, n: UInt32) -> Bool {
+    if s.drops(reason) == n && all_drops(&s) == (n as UInt64) {
+        return true
+    }
+    var raw = 0
+    while raw < DROP_KINDS {
+        let r = Drop.from(raw: raw as UInt8)!
+        if s.drops(r) != 0 {
+            print("  dropped: {r} x{s.drops(r)}")
+        }
+        raw = raw + 1
+    }
+    false
+}
+
+func main() {
+    var a = Stack(mac: mac_a())
+    var b = Stack(mac: mac_b())
+    var pa = Port.fresh()
+    var pb = Port.fresh()
+
+    // Each announces itself; an announcement teaches a station that does not
+    // hold the address already nothing (RFC 826 merges only).
+    a.configure(config(ip_a()), &var pa)
+    b.configure(config(ip_b()), &var pb)
+    check(pump(&var a, &var pa, &var b, &var pb, 0) == 2, "two announcements")
+    check(a.resolved(ip_b(), 0) == None && b.resolved(ip_a(), 0) == None,
+          "and neither knows the other")
+
+    // A pings B: A asks for B, B learns A from the request and answers, A
+    // sends the request it held, B replies, and A hands the reply up.
+    let payload: [UInt8; 5] = [0x70, 0x69, 0x6E, 0x67, 0x21]
+    try! a.ping(ip_b(), 0x0BAD, 1, &payload, 10, &var pa)
+    check(a.pending_frames() == 1, "the ping waits on B's address")
+    check(pump(&var a, &var pa, &var b, &var pb, 10) == 4,
+          "request, reply, echo request, echo reply")
+    check(a.resolved(ip_b(), 10) == mac_b() && b.resolved(ip_a(), 10) == mac_a(),
+          "each resolved the other")
+    check(pa.got.len() == 1 && pb.got.len() == 0, "the reply reached A")
+    let pong = pa.got[0]
+    let expected = Delivery.EchoReply(from: ip_b(), ident: 0x0BAD, sequence: 1)
+    check(pong.delivery == expected &&
+          same(&pong.data.bytes[..pong.data.len], &payload),
+          "from B, matching the request, its data intact")
+    check(b.count(Count.EchoRepliesSent) == 1 &&
+          a.count(Count.EchoRepliesReceived) == 1,
+          "counted on both sides")
+    check(dropped(&a, Drop.UdpNoPort, 0) && dropped(&b, Drop.UdpNoPort, 0),
+          "nothing dropped")
+    pa.got.clear()
+
+    // A UDP echo: A's ephemeral socket to B's port 7, and B's server sends
+    // back what it got to whoever sent it.
+    let server = try! b.udp_open(7)
+    let client = try! a.udp_open(0)
+    let hello: [UInt8; 5] = [0x68, 0x65, 0x6C, 0x6C, 0x6F]
+    try! a.udp_send(client.id, SocketAddr(addr: ip_b(), port: 7), &hello, 20, &var pa)
+    check(pump(&var a, &var pa, &var b, &var pb, 20) == 1, "one datagram, no ARP")
+    check(pb.got.len() == 1, "B's server got it")
+    let request = pb.got[0]
+    let from_a = SocketAddr(addr: ip_a(), port: client.port)
+    check(request.delivery == Delivery.Datagram(id: server.id, from: from_a),
+          "from A's socket")
+    try! b.udp_send(server.id, from_a, &request.data.bytes[..request.data.len], 21,
+                    &var pb)
+    pb.got.clear()
+    check(pump(&var a, &var pa, &var b, &var pb, 21) == 1, "one datagram back")
+    check(pa.got.len() == 1, "A's client got the echo")
+    let echoed = pa.got[0]
+    let from_b = SocketAddr(addr: ip_b(), port: 7)
+    check(echoed.delivery == Delivery.Datagram(id: client.id, from: from_b) &&
+          same(&echoed.data.bytes[..echoed.data.len], &hello),
+          "from B's port 7, the same bytes")
+    pa.got.clear()
+
+    // A datagram to a port B has no socket on is answered unreachable, which
+    // A counts and does not act on.
+    try! a.udp_send(client.id, SocketAddr(addr: ip_b(), port: 9), &hello, 30, &var pa)
+    check(pump(&var a, &var pa, &var b, &var pb, 30) == 2, "a datagram and its answer")
+    check(b.drops(Drop.UdpNoPort) == 1 && b.count(Count.UnreachablesSent) == 1,
+          "B refused it and said so")
+    check(a.drops(Drop.IcmpUnhandled) == 1 && pa.got.len() == 0,
+          "A heard and counted it")
+
+    // Once the translations age out, the next ping resolves again.
+    let later = 30 + arp.ENTRY_LIFETIME_MS
+    check(a.resolved(ip_b(), later) == None, "A's translation aged out")
+    try! a.ping(ip_b(), 0x0BAD, 2, &payload, later, &var pa)
+    check(pump(&var a, &var pa, &var b, &var pb, later) == 4, "resolved again")
+    check(pa.got.len() == 1, "and answered")
+    let second = pa.got[0]
+    check(second.delivery == Delivery.EchoReply(from: ip_b(), ident: 0x0BAD,
+                                                sequence: 2),
+          "the second reply")
+
+    check(dropped(&b, Drop.UdpNoPort, 1),
+          "B dropped only the datagram to the closed port")
+    check(dropped(&a, Drop.IcmpUnhandled, 1), "A dropped only the unreachable")
+    check(a.pending_frames() == 0 && b.pending_frames() == 0, "nothing waits")
+}

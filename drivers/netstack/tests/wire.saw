@@ -1,0 +1,794 @@
+// The wire formats and the small state machines, one layer at a time: each
+// protocol's golden bytes, written out from its RFC's layout with checksums
+// worked by hand, parsed to their fields and built back byte for byte; every
+// refusal by its reason; the checksum against RFC 1071's own example; and the
+// ARP table, the pending queue, the port table and the rate limit at their
+// edges.
+//
+// The stations: A is 02:00:00:00:00:0a at 10.0.0.1, B is 02:00:00:00:00:0b at
+// 10.0.0.2, on 10.0.0.0/24 with the gateway at 10.0.0.254.
+
+import netstack.addr.{Ipv4Addr, MacAddr}
+import netstack.arp
+import netstack.bytes.{checksum, count_up, elapsed, put16, sum16, verifies}
+import netstack.counters.{COUNT_KINDS, Count, Counters, DROP_KINDS, Drop}
+import netstack.ether
+import netstack.icmp
+import netstack.ipv4
+import netstack.udp
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func same(a: &[UInt8], b: &[UInt8]) -> Bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+func mac_a() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0A]) }
+func mac_b() -> MacAddr { MacAddr(octets: [0x02, 0, 0, 0, 0, 0x0B]) }
+func ip_a() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 1) }
+func ip_b() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 2) }
+func mask24() -> Ipv4Addr { Ipv4Addr(a: 255, b: 255, c: 255, d: 0) }
+func gateway() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 254) }
+
+// -----------------------------------------------------------------------------
+// Golden bytes
+// -----------------------------------------------------------------------------
+
+/// B asks who has 10.0.0.1: broadcast, padded to the minimum frame.
+static ARP_REQUEST: [UInt8; 60] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02, 0x00, 0x00, 0x00, 0x00, 0x0B,
+    0x08, 0x06,
+    0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x0B, 0x0A, 0x00, 0x00, 0x02,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]
+
+/// A's answer: 10.0.0.1 is at 02:00:00:00:00:0a, sent to B alone.
+static ARP_REPLY: [UInt8; 60] = [
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x0B, 0x02, 0x00, 0x00, 0x00, 0x00, 0x0A,
+    0x08, 0x06,
+    0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x02,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x0A, 0x00, 0x00, 0x01,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x0B, 0x0A, 0x00, 0x00, 0x02,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]
+
+/// B's echo request to A, identification 7, identifier 0x1234, sequence 1,
+/// data "abcd". IP checksum 0x66D4, ICMP checksum 0x2104.
+static ECHO_REQUEST: [UInt8; 32] = [
+    0x45, 0x00, 0x00, 0x20, 0x00, 0x07, 0x00, 0x00, 0x40, 0x01, 0x66, 0xD4,
+    0x0A, 0x00, 0x00, 0x02, 0x0A, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x21, 0x04, 0x12, 0x34, 0x00, 0x01, 0x61, 0x62, 0x63, 0x64,
+]
+
+/// A's echo reply, identification 0. IP checksum 0x66DB, ICMP 0x2904.
+static ECHO_REPLY: [UInt8; 32] = [
+    0x45, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x66, 0xDB,
+    0x0A, 0x00, 0x00, 0x01, 0x0A, 0x00, 0x00, 0x02,
+    0x00, 0x00, 0x29, 0x04, 0x12, 0x34, 0x00, 0x01, 0x61, 0x62, 0x63, 0x64,
+]
+
+/// B's datagram from port 5000 to A's port 7, identification 9, data "hi". IP
+/// checksum 0x66C4, UDP checksum (pseudo-header included) 0x6FDF.
+static UDP_TO_A: [UInt8; 30] = [
+    0x45, 0x00, 0x00, 0x1E, 0x00, 0x09, 0x00, 0x00, 0x40, 0x11, 0x66, 0xC4,
+    0x0A, 0x00, 0x00, 0x02, 0x0A, 0x00, 0x00, 0x01,
+    0x13, 0x88, 0x00, 0x07, 0x00, 0x0A, 0x6F, 0xDF, 0x68, 0x69,
+]
+
+/// A's datagram back from port 7 to port 5000, identification 0. IP checksum
+/// 0x66CD; the UDP checksum is the same sum, so the same 0x6FDF.
+static UDP_TO_B: [UInt8; 30] = [
+    0x45, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11, 0x66, 0xCD,
+    0x0A, 0x00, 0x00, 0x01, 0x0A, 0x00, 0x00, 0x02,
+    0x00, 0x07, 0x13, 0x88, 0x00, 0x0A, 0x6F, 0xDF, 0x68, 0x69,
+]
+
+/// A's port unreachable for `UDP_TO_A`: type 3, code 3, checksum 0x7984,
+/// unused, then the datagram's IP header and its UDP header.
+static UNREACHABLE: [UInt8; 36] = [
+    0x03, 0x03, 0x79, 0x84, 0x00, 0x00, 0x00, 0x00,
+    0x45, 0x00, 0x00, 0x1E, 0x00, 0x09, 0x00, 0x00, 0x40, 0x11, 0x66, 0xC4,
+    0x0A, 0x00, 0x00, 0x02, 0x0A, 0x00, 0x00, 0x01,
+    0x13, 0x88, 0x00, 0x07, 0x00, 0x0A, 0x6F, 0xDF,
+]
+
+// -----------------------------------------------------------------------------
+// The checksum
+// -----------------------------------------------------------------------------
+
+func checksums() {
+    // RFC 1071 §3's example: these eight bytes sum to 0xDDF2.
+    let example: [UInt8; 8] = [0x00, 0x01, 0xF2, 0x03, 0xF4, 0xF5, 0xF6, 0xF7]
+    check(checksum(sum16(0, &example)) == 0x220D, "RFC 1071's example")
+    check(checksum(sum16(0, &example[4..])) == ~0xEBED, "a carry folds back in")
+    let odd: [UInt8; 3] = [0x12, 0x34, 0x56]
+    check(checksum(sum16(0, &odd)) == ~0x6834, "an odd byte pads on its right")
+    check(checksum(sum16(sum16(0, &example[..4]), &example[4..])) == 0x220D,
+          "a sum chains")
+    check(verifies(sum16(0, &ECHO_REQUEST[..20])), "a golden header verifies")
+    check(not verifies(sum16(0, &ECHO_REQUEST[..19])), "a cut one does not")
+    let ones: [UInt8; 4] = [0xFF, 0xFF, 0xFF, 0xFF]
+    check(checksum(sum16(0, &ones)) == 0, "all ones sums to negative zero")
+}
+
+// -----------------------------------------------------------------------------
+// Ethernet
+// -----------------------------------------------------------------------------
+
+func ethernet() {
+    let h = try! ether.Header(frame: &ARP_REQUEST)
+    check(h.dst == MacAddr.broadcast() && h.src == mac_b() && h.ether_type == 0x0806,
+          "the request's header parses")
+    var built: [UInt8; 14] = [0; 14]
+    h.write(&var built)
+    check(same(&built, &ARP_REQUEST[..14]), "and builds back")
+
+    let runt = ether.Header(frame: &ARP_REQUEST[..13])
+    check(match runt { case Err(e) -> e == Drop.EtherRunt, case Ok(_) -> false },
+          "13 bytes are a runt")
+    check(match ether.Header(frame: &ARP_REQUEST[..14]) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "14 bytes are a header")
+
+    check(match ether.admit(mac_a(), mac_a()) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "our address is taken")
+    check(match ether.admit(MacAddr.broadcast(), mac_a()) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "broadcast is taken")
+    let group = MacAddr(octets: [0x01, 0x00, 0x5E, 0x00, 0x00, 0x01])
+    check(match ether.admit(group, mac_a()) {
+              case Err(e) -> e == Drop.EtherMulticast, case Ok(_) -> false },
+          "a multicast group is not")
+    check(match ether.admit(mac_b(), mac_a()) {
+              case Err(e) -> e == Drop.EtherNotOurs, case Ok(_) -> false },
+          "another station's address is not")
+
+    check(ether.padded(42) == 60 && ether.padded(59) == 60, "short frames pad")
+    check(ether.padded(60) == 60 && ether.padded(61) == 61, "others do not")
+    check(MacAddr.broadcast().is_multicast() && not mac_a().is_multicast(),
+          "the I/G bit")
+    check(MacAddr.broadcast().is_broadcast() && not group.is_broadcast(),
+          "broadcast is all ones")
+}
+
+// -----------------------------------------------------------------------------
+// ARP
+// -----------------------------------------------------------------------------
+
+/// `ARP_REQUEST`'s packet with byte `at` set to `value`.
+func arp_with(at: Int, value: UInt8) -> [UInt8; 28] {
+    var p: [UInt8; 28] = [0; 28]
+    var i = 0
+    while i < 28 {
+        p[i] = ARP_REQUEST[14 + i]
+        i = i + 1
+    }
+    p[at] = value
+    p
+}
+
+func arp_refused(bytes: &[UInt8], reason: Drop) -> Bool {
+    match arp.Packet(bytes: &bytes) { case Err(e) -> e == reason, case Ok(_) -> false }
+}
+
+func arp_packets() {
+    let p = try! arp.Packet(bytes: &ARP_REQUEST[14..])
+    check(p.op == arp.ArpOp.Request && p.sender_mac == mac_b() &&
+          p.sender_ip == ip_b() &&
+          p.target_mac == MacAddr.zero() && p.target_ip == ip_a(),
+          "the request parses, its padding ignored")
+
+    let reply = arp.Packet(op: arp.ArpOp.Reply, sender_mac: mac_a(), sender_ip: ip_a(),
+                           target_mac: mac_b(), target_ip: ip_b())
+    var built: [UInt8; 28] = [0; 28]
+    reply.write(&var built)
+    check(same(&built, &ARP_REPLY[14..42]), "the reply builds")
+    let back = try! arp.Packet(bytes: &ARP_REPLY[14..42])
+    check(back.op == arp.ArpOp.Reply && back.sender_ip == ip_a(), "and parses back")
+
+    check(arp_refused(&ARP_REQUEST[14..41], Drop.ArpTruncated), "27 bytes")
+    check(match arp.Packet(bytes: &ARP_REQUEST[14..42]) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "28 bytes are a packet")
+    check(arp_refused(&arp_with(1, 0x06), Drop.ArpUnsupported), "hardware type 6")
+    check(arp_refused(&arp_with(0, 0x01), Drop.ArpUnsupported), "hardware type 257")
+    check(arp_refused(&arp_with(2, 0x86), Drop.ArpUnsupported), "protocol 0x8600")
+    check(arp_refused(&arp_with(3, 0x06), Drop.ArpUnsupported), "protocol 0x0806")
+    check(arp_refused(&arp_with(4, 8), Drop.ArpUnsupported),
+          "8-byte hardware addresses")
+    check(arp_refused(&arp_with(5, 16), Drop.ArpUnsupported),
+          "16-byte protocol addresses")
+    check(arp_refused(&arp_with(7, 0), Drop.ArpBadOp), "operation 0")
+    check(arp_refused(&arp_with(7, 3), Drop.ArpBadOp), "operation 3")
+    check(arp_refused(&arp_with(6, 1), Drop.ArpBadOp), "operation 257")
+}
+
+func arp_cache() {
+    var c = arp.Cache.empty()
+    check(c.lookup(ip_b(), 0) == None, "an empty table resolves nothing")
+    c.insert(ip_b(), mac_b(), 1000)
+    check(c.lookup(ip_b(), 1000) == mac_b(), "an entry resolves")
+    check(c.lookup(ip_b(), 1000 + arp.ENTRY_LIFETIME_MS - 1) == mac_b(),
+          "until its lifetime ends")
+    check(c.lookup(ip_b(), 1000 + arp.ENTRY_LIFETIME_MS) == None, "and not after")
+    check(c.lookup(ip_b(), 0) == mac_b(), "a clock run backwards ages nothing")
+    check(c.lookup(ip_a(), 1000) == None, "another address does not resolve")
+
+    // A merge restarts the age and takes the new address.
+    check(c.merge(ip_b(), mac_a(), 2000), "a merge finds the entry")
+    check(c.lookup(ip_b(), 2000 + arp.ENTRY_LIFETIME_MS - 1) == mac_a(),
+          "and restarts its age with the new address")
+    check(not c.merge(ip_a(), mac_a(), 2000), "a merge adds nothing")
+    check(c.lookup(ip_a(), 2000) == None, "so the address stays unknown")
+    check(not c.merge(ip_b(), mac_b(), 2000 + arp.ENTRY_LIFETIME_MS),
+          "an expired entry is not merged")
+    check(c.lookup(ip_b(), 2000) == None, "and is gone")
+
+    // Two entries made at one time both stay: a free slot is taken first.
+    var twins = arp.Cache.empty()
+    twins.insert(ip_a(), mac_a(), 0)
+    twins.insert(ip_b(), mac_b(), 0)
+    check(twins.lookup(ip_a(), 0) == mac_a() && twins.lookup(ip_b(), 0) == mac_b(),
+          "a free slot before the oldest entry")
+
+    // Full: the entry confirmed longest ago makes room.
+    var full = arp.Cache.empty()
+    var i = 0
+    while i < arp.CACHE_ENTRIES {
+        let at = (100 - i) as UInt64
+        full.insert(Ipv4Addr(a: 10, b: 0, c: 1, d: i as UInt8), mac_b(), at)
+        i = i + 1
+    }
+    check(full.live(100) == arp.CACHE_ENTRIES, "the table fills")
+    check(full.live(100 + arp.ENTRY_LIFETIME_MS) == 0, "and every entry ages out")
+    let last = Ipv4Addr(a: 10, b: 0, c: 1, d: (arp.CACHE_ENTRIES - 1) as UInt8)
+    full.insert(ip_a(), mac_a(), 200)
+    check(full.lookup(last, 200) == None, "the oldest entry is evicted")
+    check(full.lookup(Ipv4Addr(a: 10, b: 0, c: 1, d: 0), 200) == mac_b() &&
+          full.lookup(ip_a(), 200) == mac_a(),
+          "and the rest stay, the new one added")
+    check(full.live(200) == arp.CACHE_ENTRIES, "still full")
+
+    // Re-inserting an address replaces its entry rather than adding another.
+    full.insert(ip_a(), mac_b(), 201)
+    check(full.lookup(ip_a(), 201) == mac_b() && full.live(201) == arp.CACHE_ENTRIES &&
+          full.lookup(Ipv4Addr(a: 10, b: 0, c: 1, d: 6), 201) == mac_b(),
+          "one entry per address")
+}
+
+func pending_queue() {
+    var q = arp.Pending.empty()
+    let frame_1: [UInt8; 3] = [1, 1, 1]
+    let frame_2: [UInt8; 2] = [2, 2]
+    let frame_3: [UInt8; 1] = [3]
+    try! q.push(ip_b(), &frame_1, 10, 10)
+    try! q.push(gateway(), &frame_2, 20, 20)
+    try! q.push(ip_b(), &frame_3, 30, 10)
+    check(q.len() == 3, "three wait")
+    check(q.requested_at(ip_b()) == 10, "a hop's request time")
+    check(q.requested_at(ip_a()) == None, "no request for a hop nothing waits on")
+    check(q.first_for(ip_b()) == 0, "the oldest for a hop first")
+    check(q.first_for(ip_a()) == None, "none for another")
+
+    var out: [UInt8; 8] = [0; 8]
+    check(q.copy_out(0, &var out) == 3 && out[0] == 1 && out[2] == 1,
+          "a frame copies out")
+    q.remove(0)
+    check(q.first_for(ip_b()) == 1, "removal keeps the order")
+    check(q.copy_out(1, &var out) == 1 && out[0] == 3, "the third is now second")
+    check(q.copy_out(0, &var out) == 2 && out[0] == 2, "the second is now first")
+
+    try! q.push(ip_a(), &frame_3, 40, 40)
+    try! q.push(ip_a(), &frame_3, 41, 40)
+    check(q.len() == arp.PENDING_FRAMES, "the queue fills")
+    check(match q.push(ip_a(), &frame_3, 42, 40) {
+              case Err(e) -> e == Drop.ArpQueueFull, case Ok(_) -> false },
+          "and refuses one more")
+    check(q.len() == arp.PENDING_FRAMES, "the refused frame is not queued")
+
+    // Requests come due per hop, in queue order: the gateway's frame is the
+    // oldest, B's was asked about earlier.
+    let interval = arp.REQUEST_INTERVAL_MS
+    check(q.request_due(10 + interval - 1) == None, "no request due yet")
+    check(q.request_due(10 + interval) == ip_b(), "B's is due first")
+    check(q.request_due(20 + interval) == gateway(), "then the oldest frame's")
+    q.requested(gateway(), 20 + interval)
+    check(q.request_due(20 + interval) == ip_b(), "a request is due until it is sent")
+    q.requested(ip_b(), 20 + interval)
+    check(q.request_due(20 + interval) == None, "and then not")
+    q.requested(ip_a(), 7)
+    check(q.requested_at(ip_a()) == 7, "a request is recorded")
+    q.remove(2)
+    check(q.requested_at(ip_a()) == 7, "for every frame of its hop")
+
+    // Frames expire by when they were queued.
+    check(q.first_expired(20 + arp.PENDING_TIMEOUT_MS - 1) == None, "none expired yet")
+    check(q.first_expired(20 + arp.PENDING_TIMEOUT_MS) == 0, "the oldest expires first")
+    check(q.first_expired(30 + arp.PENDING_TIMEOUT_MS) == 0, "in queue order")
+    check(q.first_expired(0) == None, "a clock run backwards expires nothing")
+}
+
+// -----------------------------------------------------------------------------
+// IPv4
+// -----------------------------------------------------------------------------
+
+/// `ECHO_REQUEST` with byte `at` set to `value` and its header checksum
+/// worked again.
+func ip_with(at: Int, value: UInt8) -> [UInt8; 32] {
+    var p = ECHO_REQUEST
+    p[at] = value
+    put16(&var p, 10, 0)
+    let sum = checksum(sum16(0, &p[..20]))
+    put16(&var p, 10, sum)
+    p
+}
+
+func ip_refused(packet: &[UInt8], reason: Drop) -> Bool {
+    match ipv4.Header(packet: &packet) {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+func ip_parses(packet: &[UInt8]) -> Bool {
+    match ipv4.Header(packet: &packet) { case Ok(_) -> true, case Err(_) -> false }
+}
+
+func ipv4_headers() {
+    let h = try! ipv4.Header(packet: &ECHO_REQUEST)
+    check(h.header_bytes() == 20 && h.total() == 32 && h.ident == 7 && h.ttl == 64 &&
+          h.protocol == 1 && h.src == ip_b() && h.dst == ip_a(),
+          "the request's header parses")
+
+    var built: [UInt8; 20] = [0; 20]
+    ipv4.write_header(&var built, ip_a(), ip_b(), ipv4.Protocol.Icmp, 0, 64, 12)
+    check(same(&built, &ECHO_REPLY[..20]), "the reply's header builds")
+
+    check(ip_refused(&ECHO_REQUEST[..19], Drop.IpTruncated), "19 bytes")
+    check(ip_parses(&ECHO_REQUEST[..32]), "a whole datagram parses")
+    check(ip_refused(&ip_with(0, 0x65), Drop.IpVersion), "version 6")
+    check(ip_refused(&ip_with(0, 0x35), Drop.IpVersion), "version 3")
+    check(ip_refused(&ip_with(0, 0x44), Drop.IpHeaderLength), "a 16-byte header")
+    check(ip_refused(&ip_with(0, 0x48)[..30], Drop.IpHeaderLength),
+          "a 32-byte header in 30 bytes")
+    check(ip_refused(&ip_with(3, 19), Drop.IpTotalLength), "a total under the header")
+    check(ip_refused(&ECHO_REQUEST[..31], Drop.IpTotalLength), "a total past the frame")
+    check(ip_parses(&ip_with(3, 20)), "a total of the header alone")
+    check(ip_refused(&ip_with(2, 0x01), Drop.IpTotalLength), "a total of 288")
+
+    // A total under a long header, though over the shortest one: a 36-byte
+    // header in 46 bytes, a total of 32.
+    var long_header: [UInt8; 46] = [0; 46]
+    var k = 0
+    while k < 32 {
+        long_header[k] = ECHO_REQUEST[k]
+        k = k + 1
+    }
+    long_header[0] = 0x49
+    put16(&var long_header, 10, 0)
+    let long_sum = checksum(sum16(0, &long_header[..36]))
+    put16(&var long_header, 10, long_sum)
+    check(ip_refused(&long_header, Drop.IpTotalLength),
+          "a total under a header of options")
+
+    var bad = ECHO_REQUEST
+    bad[11] = bad[11] ^ 0x01
+    check(ip_refused(&bad, Drop.IpChecksum), "a checksum off by one bit")
+    var bad_source = ECHO_REQUEST
+    bad_source[15] = 3
+    check(ip_refused(&bad_source, Drop.IpChecksum),
+          "a field changed under its checksum")
+
+    check(ip_refused(&ip_with(6, 0x20), Drop.IpFragment), "More Fragments")
+    check(ip_refused(&ip_with(7, 0x01), Drop.IpFragment), "offset 8")
+    check(ip_refused(&ip_with(6, 0x10), Drop.IpFragment), "the offset's high bit")
+    check(ip_parses(&ip_with(6, 0x40)), "Don't Fragment is a whole datagram")
+
+    // A header with one word of options: the payload starts after it.
+    var opts: [UInt8; 36] = [0; 36]
+    var i = 0
+    while i < 20 {
+        opts[i] = ECHO_REQUEST[i]
+        i = i + 1
+    }
+    opts[0] = 0x46
+    put16(&var opts, 2, 36)
+    opts[20] = 0x01
+    opts[21] = 0x01
+    opts[22] = 0x01
+    opts[23] = 0x00
+    put16(&var opts, 10, 0)
+    let sum = checksum(sum16(0, &opts[..24]))
+    put16(&var opts, 10, sum)
+    let with_options = try! ipv4.Header(packet: &opts)
+    check(with_options.header_bytes() == 24 && with_options.total() == 36,
+          "options are skipped")
+
+    // Padding after the datagram is not part of it.
+    var padded: [UInt8; 46] = [0; 46]
+    i = 0
+    while i < 32 {
+        padded[i] = ECHO_REQUEST[i]
+        i = i + 1
+    }
+    let trimmed = try! ipv4.Header(packet: &padded)
+    check(trimmed.total() == 32, "padding is not payload")
+}
+
+/// The netmask of `bits` ones.
+func slash(bits: Int) -> Ipv4Addr {
+    if bits == 0 {
+        return Ipv4Addr.unspecified()
+    }
+    let host = (1u32 << (32 - bits)) - 1
+    Ipv4Addr(value: ~host)
+}
+
+func config_refused(addr: Ipv4Addr, netmask: Ipv4Addr, gateway: Ipv4Addr,
+                    reason: ipv4.ConfigError) -> Bool {
+    match ipv4.Config(addr: addr, netmask: netmask, gateway: gateway) {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+func config_takes(addr: Ipv4Addr, netmask: Ipv4Addr) -> Bool {
+    match ipv4.Config(addr: addr, netmask: netmask,
+                      gateway: Ipv4Addr.unspecified()) {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+}
+
+func configs() {
+    let cfg = try! ipv4.Config(addr: ip_a(), netmask: mask24(), gateway: gateway())
+    check(cfg.addr() == ip_a(), "a configuration")
+    check(match ipv4.Config(addr: ip_a(), netmask: Ipv4Addr(a: 255, b: 0, c: 255, d: 0),
+                            gateway: gateway()) {
+              case Err(e) -> e == ipv4.ConfigError.Netmask, case Ok(_) -> false },
+          "a mask with a hole")
+    check(match ipv4.Config(addr: ip_a(), netmask: Ipv4Addr(a: 0, b: 0, c: 0, d: 255),
+                            gateway: Ipv4Addr.unspecified()) {
+              case Err(e) -> e == ipv4.ConfigError.Netmask, case Ok(_) -> false },
+          "a mask from the bottom")
+    check(match ipv4.Config(addr: ip_a(), netmask: Ipv4Addr.unspecified(),
+                            gateway: Ipv4Addr.unspecified()) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "a mask of no ones")
+    check(match ipv4.Config(addr: ip_a(), netmask: Ipv4Addr.broadcast(),
+                            gateway: Ipv4Addr.unspecified()) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "a mask of all ones")
+    check(match ipv4.Config(addr: Ipv4Addr.unspecified(), netmask: mask24(),
+                            gateway: Ipv4Addr.unspecified()) {
+              case Err(e) -> e == ipv4.ConfigError.Address, case Ok(_) -> false },
+          "no address")
+    check(match ipv4.Config(addr: Ipv4Addr.broadcast(), netmask: mask24(),
+                            gateway: Ipv4Addr.unspecified()) {
+              case Err(e) -> e == ipv4.ConfigError.Address, case Ok(_) -> false },
+          "the broadcast address")
+    check(match ipv4.Config(addr: Ipv4Addr(a: 224, b: 0, c: 0, d: 1), netmask: mask24(),
+                            gateway: Ipv4Addr.unspecified()) {
+              case Err(e) -> e == ipv4.ConfigError.Address, case Ok(_) -> false },
+          "a multicast address")
+    check(match ipv4.Config(addr: ip_a(), netmask: mask24(),
+                            gateway: Ipv4Addr(a: 10, b: 0, c: 1, d: 1)) {
+              case Err(e) -> e == ipv4.ConfigError.Gateway, case Ok(_) -> false },
+          "a gateway off the subnet")
+    check(match ipv4.Config(addr: ip_a(), netmask: mask24(), gateway: ip_a()) {
+              case Err(e) -> e == ipv4.ConfigError.Gateway, case Ok(_) -> false },
+          "a gateway that is ourselves")
+    check(match ipv4.Config(addr: ip_a(), netmask: mask24(),
+                            gateway: Ipv4Addr.unspecified()) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "no gateway")
+
+    // An address and a gateway must each be a host's.
+    check(config_refused(Ipv4Addr(a: 10, b: 0, c: 0, d: 255), mask24(),
+                         Ipv4Addr.unspecified(), ipv4.ConfigError.Address),
+          "the subnet's broadcast")
+    check(config_refused(Ipv4Addr(a: 10, b: 0, c: 0, d: 0), mask24(),
+                         Ipv4Addr.unspecified(), ipv4.ConfigError.Address),
+          "the subnet's network address")
+    check(config_refused(Ipv4Addr(a: 10, b: 0, c: 0, d: 0), slash(30),
+                         Ipv4Addr.unspecified(), ipv4.ConfigError.Address),
+          "a /30's network address")
+    check(config_refused(Ipv4Addr(a: 10, b: 0, c: 0, d: 3), slash(30),
+                         Ipv4Addr.unspecified(), ipv4.ConfigError.Address),
+          "a /30's broadcast")
+    check(config_takes(Ipv4Addr(a: 10, b: 0, c: 0, d: 1), slash(31)),
+          "a /31's odd address")
+    check(config_refused(Ipv4Addr.unspecified(), slash(32),
+                         Ipv4Addr.unspecified(), ipv4.ConfigError.Address),
+          "0.0.0.0 as a /32")
+    check(config_refused(Ipv4Addr(a: 127, b: 0, c: 0, d: 1), mask24(),
+                         Ipv4Addr.unspecified(), ipv4.ConfigError.Address),
+          "loopback")
+    check(config_takes(Ipv4Addr(a: 126, b: 255, c: 255, d: 254), mask24()) &&
+          config_takes(Ipv4Addr(a: 128, b: 0, c: 0, d: 1), mask24()),
+          "either side of loopback")
+    check(config_refused(Ipv4Addr(a: 240, b: 0, c: 0, d: 1), mask24(),
+                         Ipv4Addr.unspecified(), ipv4.ConfigError.Address),
+          "class E")
+    check(config_refused(Ipv4Addr(a: 224, b: 0, c: 0, d: 0), slash(32),
+                         Ipv4Addr.unspecified(), ipv4.ConfigError.Address),
+          "the first of class D")
+    check(config_takes(Ipv4Addr(a: 223, b: 255, c: 255, d: 255), slash(32)),
+          "the last below class D")
+    check(config_refused(ip_a(), mask24(), Ipv4Addr(a: 10, b: 0, c: 0, d: 255),
+                         ipv4.ConfigError.Gateway),
+          "a gateway at the subnet's broadcast")
+    check(config_refused(ip_a(), mask24(), Ipv4Addr(a: 10, b: 0, c: 0, d: 0),
+                         ipv4.ConfigError.Gateway),
+          "a gateway at the subnet's network address")
+    check(config_refused(Ipv4Addr(a: 126, b: 0, c: 0, d: 1), slash(7),
+                         Ipv4Addr(a: 127, b: 0, c: 0, d: 1),
+                         ipv4.ConfigError.Gateway),
+          "a loopback gateway, on the subnet")
+    let high = Ipv4Addr(a: 223, b: 0, c: 0, d: 1)
+    check(config_refused(high, slash(2), Ipv4Addr(a: 240, b: 0, c: 0, d: 1),
+                         ipv4.ConfigError.Gateway),
+          "a class E gateway, on the subnet")
+    check(config_refused(high, slash(2), Ipv4Addr(a: 224, b: 0, c: 0, d: 1),
+                         ipv4.ConfigError.Gateway),
+          "a multicast gateway, on the subnet")
+
+    check(cfg.on_link(ip_b()) && not cfg.on_link(Ipv4Addr(a: 10, b: 0, c: 1, d: 2)),
+          "the subnet")
+    check(cfg.is_broadcast(Ipv4Addr.broadcast()), "the limited broadcast")
+    check(cfg.is_broadcast(Ipv4Addr(a: 10, b: 0, c: 0, d: 255)), "the directed one")
+    let other_subnet = Ipv4Addr(a: 10, b: 0, c: 1, d: 255)
+    check(not cfg.is_broadcast(ip_b()) && not cfg.is_broadcast(other_subnet),
+          "a host, and another subnet's broadcast")
+    let slash30 = try! ipv4.Config(addr: ip_a(),
+                                   netmask: Ipv4Addr(a: 255, b: 255, c: 255, d: 252),
+                                   gateway: Ipv4Addr.unspecified())
+    check(slash30.is_broadcast(Ipv4Addr(a: 10, b: 0, c: 0, d: 3)),
+          "a /30 has a broadcast")
+    let slash31 = try! ipv4.Config(addr: Ipv4Addr(a: 10, b: 0, c: 0, d: 0),
+                                   netmask: Ipv4Addr(a: 255, b: 255, c: 255, d: 254),
+                                   gateway: Ipv4Addr.unspecified())
+    check(not slash31.is_broadcast(ip_a()), "a /31 has none")
+    let slash32 = try! ipv4.Config(addr: ip_a(), netmask: Ipv4Addr.broadcast(),
+                                   gateway: Ipv4Addr.unspecified())
+    check(not slash32.is_broadcast(ip_a()), "nor a /32, whose host is the address")
+
+    let far = Ipv4Addr(a: 192, b: 0, c: 2, d: 7)
+    check(cfg.next_hop(ip_b()) == ip_b(), "on the subnet, the host itself")
+    check(cfg.next_hop(far) == gateway(), "off it, the gateway")
+    let alone = try! ipv4.Config(addr: ip_a(), netmask: mask24(),
+                                 gateway: Ipv4Addr.unspecified())
+    check(alone.next_hop(far) == None, "off it with no gateway, nothing")
+    check(alone.next_hop(ip_b()) == ip_b(), "on it with no gateway, the host")
+
+    check(Ipv4Addr(a: 224, b: 0, c: 0, d: 0).is_multicast() &&
+          Ipv4Addr(a: 239, b: 255, c: 255, d: 255).is_multicast() &&
+          not Ipv4Addr(a: 223, b: 255, c: 255, d: 255).is_multicast() &&
+          not Ipv4Addr(a: 240, b: 0, c: 0, d: 0).is_multicast(),
+          "class D is 224/4")
+}
+
+// -----------------------------------------------------------------------------
+// ICMP
+// -----------------------------------------------------------------------------
+
+func icmp_refused(message: &[UInt8], reason: Drop) -> Bool {
+    match icmp.Header(message: &message) {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+func icmp_messages() {
+    let h = try! icmp.Header(message: &ECHO_REQUEST[20..])
+    check(h.kind == 8 && h.code == 0 && h.ident == 0x1234 && h.sequence == 1,
+          "the request parses")
+
+    var built: [UInt8; 12] = [0; 12]
+    let n = icmp.write_echo(&var built, icmp.IcmpType.EchoReply, 0x1234, 1,
+                            &ECHO_REQUEST[28..])
+    check(n == 12 && same(&built, &ECHO_REPLY[20..]), "the reply builds")
+
+    var unreachable: [UInt8; 36] = [0; 36]
+    let m = icmp.write_unreachable(&var unreachable, icmp.CODE_PORT_UNREACHABLE,
+                                   &UDP_TO_A[..28])
+    check(m == 36 && same(&unreachable, &UNREACHABLE), "the unreachable builds")
+    let u = try! icmp.Header(message: &UNREACHABLE)
+    check(u.kind == 3 && u.code == 3, "and parses back")
+
+    check(icmp_refused(&ECHO_REQUEST[20..27], Drop.IcmpTruncated), "7 bytes")
+    let header_only = icmp.write_echo(&var built, icmp.IcmpType.EchoRequest, 1, 2,
+                                      &ECHO_REQUEST[..0])
+    check(header_only == 8 && match icmp.Header(message: &built[..8]) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "8 bytes, no data, is a message")
+    var bad = ECHO_REQUEST
+    bad[31] = 0x65
+    check(icmp_refused(&bad[20..], Drop.IcmpChecksum),
+          "data changed under the checksum")
+    check(icmp_refused(&ECHO_REQUEST[20..31], Drop.IcmpChecksum),
+          "a message cut short does not verify")
+
+    let interval = icmp.UNREACHABLE_INTERVAL_MS
+    var limit = icmp.RateLimit.fresh()
+    check(limit.ready(5000), "the first may go")
+    check(limit.ready(5000), "and asking spends nothing")
+    limit.spend(5000)
+    check(not limit.ready(5000 + interval - 1), "the next waits")
+    check(limit.ready(5000 + interval), "for the interval")
+    limit.spend(5000 + interval)
+    check(not limit.ready(0), "a clock run backwards sends nothing")
+    check(limit.ready(5000 + 2 * interval), "and the clock resumes")
+    check(icmp.RateLimit.fresh().ready(0), "the first may go at time zero too")
+}
+
+// -----------------------------------------------------------------------------
+// UDP
+// -----------------------------------------------------------------------------
+
+func udp_refused(datagram: &[UInt8], reason: Drop) -> Bool {
+    match udp.Header(datagram: &datagram, src: ip_b(), dst: ip_a()) {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+func udp_datagrams() {
+    let h = try! udp.Header(datagram: &UDP_TO_A[20..], src: ip_b(), dst: ip_a())
+    check(h.src_port == 5000 && h.dst_port == 7 && h.length() == 10,
+          "the datagram parses")
+
+    var built: [UInt8; 10] = [0; 10]
+    built[8] = 0x68
+    built[9] = 0x69
+    let n = udp.write_header(&var built, ip_a(), ip_b(), 7, 5000, 2)
+    check(n == 10 && same(&built, &UDP_TO_B[20..]), "the reply builds")
+
+    check(udp_refused(&UDP_TO_A[20..27], Drop.UdpTruncated), "7 bytes")
+    var empty: [UInt8; 8] = [0; 8]
+    let written = udp.write_header(&var empty, ip_b(), ip_a(), 5000, 7, 0)
+    let bare = try! udp.Header(datagram: &empty, src: ip_b(), dst: ip_a())
+    check(written == 8 && bare.length() == 8, "8 bytes, no data, is a datagram")
+    var short_length = UDP_TO_A
+    put16(&var short_length, 24, 7)
+    check(udp_refused(&short_length[20..], Drop.UdpLength), "a length of 7")
+    var long_length = UDP_TO_A
+    put16(&var long_length, 24, 11)
+    check(udp_refused(&long_length[20..], Drop.UdpLength), "a length past the payload")
+    check(udp_refused(&UDP_TO_A[20..29], Drop.UdpLength), "a payload cut short")
+
+    var bad = UDP_TO_A
+    bad[29] = 0x6A
+    check(udp_refused(&bad[20..], Drop.UdpChecksum), "data changed under the checksum")
+    check(match udp.Header(datagram: &UDP_TO_A[20..], src: ip_b(),
+                           dst: Ipv4Addr(a: 10, b: 0, c: 0, d: 3)) {
+              case Err(e) -> e == Drop.UdpChecksum, case Ok(_) -> false },
+          "the pseudo-header is covered")
+    var unchecked = bad
+    put16(&var unchecked, 26, 0)
+    check(match udp.Header(datagram: &unchecked[20..], src: ip_b(), dst: ip_a()) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "a zero checksum is not checked")
+
+    // Bytes past the UDP length are not the datagram's.
+    var longer: [UInt8; 14] = [0; 14]
+    var i = 0
+    while i < 10 {
+        longer[i] = UDP_TO_A[20 + i]
+        i = i + 1
+    }
+    longer[12] = 0xAB
+    let trailing = try! udp.Header(datagram: &longer, src: ip_b(), dst: ip_a())
+    check(trailing.length() == 10, "the length bounds the datagram")
+
+    // A checksum that computes to zero is sent as all ones, and verifies.
+    var zero_sum: [UInt8; 10] = [0; 10]
+    zero_sum[8] = 0xD8
+    zero_sum[9] = 0x48
+    let z = udp.write_header(&var zero_sum, ip_a(), ip_b(), 7, 5000, 2)
+    check(z == 10 && zero_sum[6] == 0xFF && zero_sum[7] == 0xFF,
+          "zero goes as all ones")
+    check(match udp.Header(datagram: &zero_sum, src: ip_a(), dst: ip_b()) {
+              case Ok(_) -> true, case Err(_) -> false },
+          "and verifies")
+}
+
+func port_table() {
+    var t = udp.PortTable.empty()
+    check(try! t.bind(7) == 0, "the first socket is id 0")
+    check(match t.bind(7) {
+              case Err(e) -> e == udp.BindError.InUse(7), case Ok(_) -> false },
+          "a port in use")
+    check(try! t.bind(0) == 1 && t.port_of(1) == udp.EPHEMERAL_FIRST,
+          "port 0 takes the first ephemeral port")
+    check(try! t.bind(0) == 2 && t.port_of(2) == udp.EPHEMERAL_FIRST + 1,
+          "and the next takes the next")
+    try! t.bind(udp.EPHEMERAL_FIRST + 2)
+    check(try! t.bind(0) == 4 && t.port_of(4) == udp.EPHEMERAL_FIRST + 3,
+          "an ephemeral port in use is skipped")
+    check(t.lookup(7) == 0 && t.lookup(8) == None, "lookup")
+    check(t.release(1) && t.port_of(1) == None && t.lookup(udp.EPHEMERAL_FIRST) == None,
+          "a release frees the id and the port")
+    check(not t.release(1), "a socket released twice")
+    check(not t.release(udp.SOCKETS as UInt8), "an id past the table")
+    check(t.port_of(udp.SOCKETS as UInt8) == None, "no port past the table")
+    check(try! t.bind(9) == 1, "a freed id is reused")
+
+    var n = 5
+    while n < udp.SOCKETS {
+        try! t.bind((100 + n) as UInt16)
+        n = n + 1
+    }
+    check(match t.bind(200) {
+              case Err(e) -> e == udp.BindError.Full, case Ok(_) -> false },
+          "a full table")
+    check(match t.bind(7) {
+              case Err(e) -> e == udp.BindError.InUse(7), case Ok(_) -> false },
+          "a port in use, full or not")
+
+    // The ephemeral range wraps from its last port to its first.
+    var w = udp.PortTable.empty()
+    var port: UInt16 = 0
+    while port != udp.EPHEMERAL_LAST {
+        let id = try! w.bind(0)
+        port = w.port_of(id)!
+        let _ = w.release(id)
+    }
+    let after = try! w.bind(0)
+    check(w.port_of(after) == udp.EPHEMERAL_FIRST, "after the last, the first")
+}
+
+// -----------------------------------------------------------------------------
+// Counts and time
+// -----------------------------------------------------------------------------
+
+func counts() {
+    check(Drop.from(raw: (DROP_KINDS - 1) as UInt8) != None &&
+          Drop.from(raw: DROP_KINDS as UInt8) == None, "DROP_KINDS counts the reasons")
+    check(Count.from(raw: (COUNT_KINDS - 1) as UInt8) != None &&
+          Count.from(raw: COUNT_KINDS as UInt8) == None,
+          "COUNT_KINDS counts the counts")
+    var c = Counters.zero()
+    c.add_drop(Drop.UdpNoPort)
+    c.add_drop(Drop.UdpNoPort)
+    c.add(Count.FramesSent)
+    check(c.drops(Drop.UdpNoPort) == 2 && c.drops(Drop.UdpChecksum) == 0 &&
+          c.count(Count.FramesSent) == 1,
+          "each count by its name")
+    check(count_up(0xFFFF_FFFE) == 0xFFFF_FFFF && count_up(0xFFFF_FFFF) == 0xFFFF_FFFF,
+          "a count holds at its top")
+    check(elapsed(10, 3) == 7 && elapsed(3, 10) == 0, "time runs forward only")
+}
+
+func main() {
+    checksums()
+    ethernet()
+    arp_packets()
+    arp_cache()
+    pending_queue()
+    ipv4_headers()
+    configs()
+    icmp_messages()
+    udp_datagrams()
+    port_table()
+    counts()
+}

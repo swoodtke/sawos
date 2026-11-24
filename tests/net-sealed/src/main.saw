@@ -3,19 +3,96 @@
 // (a layout's sizes, a window's address and length, an endpoint's memory,
 // indexes and latched fault, a frame's length and bytes, an SSID's, a key's
 // and a name's) and builds a window, a layout, an endpoint and a frame field
-// by field. None of these is reachable outside its package, so the compile
-// refuses each and the program is never linked (`net_fields_sealed`).
+// by field. It reads and writes every field the TCP/IP stack's state rests on
+// (its ARP table and pending queue, its port table, its rate limit, its
+// counts, its configuration, a parsed header's lengths, the stack's own
+// state) and builds each of those it can name field by field. None of these
+// is reachable outside its package, so the compile refuses each and the
+// program is never linked (`net_fields_sealed`).
 
 import pktring.{Endpoint, Layout, Ring, SharedWindow}
 import netdevproto
 import hciproto
 import wlanproto
 import sockproto
+import netstack.{Config, Counters, Ipv4Addr, MacAddr, Stack}
+import netstack.arp
+import netstack.icmp
+import netstack.ipv4
+import netstack.udp
 import sosmain
 
 // A window over `mem`, made the one way a window is made.
 func window(mem: &var [UInt32; 64]) unsafe -> SharedWindow {
     SharedWindow(at: (&var mem) as UnsafePointer<UInt32>, bytes: 256)
+}
+
+// Each field of the stack's state, read from one value and written to
+// another.
+func cache(x: &var arp.Cache, y: &arp.Cache) {
+    x.entries = y.entries
+}
+
+func pending(x: &var arp.Pending, y: &arp.Pending) {
+    x.slots = y.slots
+    x.count = y.count
+}
+
+func counters(x: &var Counters, y: &Counters) {
+    x.dropped = y.dropped
+    x.counts = y.counts
+}
+
+func rate_limit(x: &var icmp.RateLimit, y: &icmp.RateLimit) {
+    x.last = y.last
+}
+
+func ports(x: &var udp.PortTable, y: &udp.PortTable) {
+    x.bound = y.bound
+    x.ports = y.ports
+    x.next_ephemeral = y.next_ephemeral
+}
+
+func headers(x: &var ipv4.Header, y: &ipv4.Header, u: &var udp.Header,
+             v: &udp.Header) {
+    x.ihl_bytes = y.ihl_bytes
+    x.total_length = y.total_length
+    u.datagram_length = v.datagram_length
+}
+
+func config(x: &var Config, y: &Config) {
+    x.address = y.address
+    x.mask = y.mask
+    x.router = y.router
+}
+
+func stack(x: &var Stack, y: &Stack) {
+    x.link_addr = y.link_addr
+    x.settings = y.settings
+    x.cache = y.cache
+    x.pending = y.pending
+    x.ports = y.ports
+    x.unreachable = y.unreachable
+    x.ident = y.ident
+    x.tally = y.tally
+}
+
+// The stack's state built field by field, every check skipped.
+func forged() {
+    let u = udp.Header(src_port: 1, dst_port: 2, datagram_length: 9999)
+    let h = ipv4.Header(ihl_bytes: 60, total_length: 9999, ident: 0, ttl: 64,
+                        protocol: 17, src: Ipv4Addr(value: 1),
+                        dst: Ipv4Addr(value: 2))
+    let r = icmp.RateLimit(last: None)
+    let c = Counters(dropped: [0; 35], counts: [0; 10])
+    let t = udp.PortTable(bound: [false; 16], ports: [0; 16], next_ephemeral: 0)
+    let g = Config(address: Ipv4Addr(value: 0), mask: Ipv4Addr(value: 1),
+                   router: Ipv4Addr(value: 2))
+    let s = Stack(link_addr: MacAddr.zero(), settings: None,
+                  cache: arp.Cache.empty(), pending: arp.Pending.empty(),
+                  ports: udp.PortTable.empty(),
+                  unreachable: icmp.RateLimit.fresh(), ident: 0,
+                  tally: Counters.zero())
 }
 
 func layout() -> Layout {

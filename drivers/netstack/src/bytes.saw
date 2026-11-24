@@ -1,0 +1,96 @@
+//! Big-endian fields over byte slices, the Internet checksum, and time.
+//!
+//! Every multi-byte field on the wire is in network order, most significant
+//! byte first. A reader indexes the slice it is given, so a field past the
+//! slice's end panics: every parser checks a length against what was received
+//! before it reads a field under it.
+
+/// The 16-bit field at `at`.
+public func be16(bytes: &[UInt8], at: Int) -> UInt16 {
+    ((bytes[at] as UInt16) << 8) | (bytes[at + 1] as UInt16)
+}
+
+/// The 32-bit field at `at`.
+public func be32(bytes: &[UInt8], at: Int) -> UInt32 {
+    ((bytes[at] as UInt32) << 24) | ((bytes[at + 1] as UInt32) << 16) |
+        ((bytes[at + 2] as UInt32) << 8) | (bytes[at + 3] as UInt32)
+}
+
+/// Writes `value` as the 16-bit field at `at`.
+public func put16(bytes: &var [UInt8], at: Int, value: UInt16) {
+    bytes[at] = (value >> 8) as UInt8
+    bytes[at + 1] = (value & 0xFF) as UInt8
+}
+
+/// Writes `value` as the 32-bit field at `at`.
+public func put32(bytes: &var [UInt8], at: Int, value: UInt32) {
+    bytes[at] = (value >> 24) as UInt8
+    bytes[at + 1] = ((value >> 16) & 0xFF) as UInt8
+    bytes[at + 2] = ((value >> 8) & 0xFF) as UInt8
+    bytes[at + 3] = (value & 0xFF) as UInt8
+}
+
+/// Copies `from` into `to`, starting at `at`.
+public func put_bytes(to: &var [UInt8], at: Int, from: &[UInt8]) {
+    var i = 0
+    while i < from.len() {
+        to[at + i] = from[i]
+        i = i + 1
+    }
+}
+
+/// `sum` plus the ones'-complement sum of `bytes` taken as 16-bit words, an
+/// odd last byte padded with a zero on its right (RFC 1071 §4.1). The sum is
+/// kept folded to 17 bits, so a caller may chain any number of calls; every
+/// call but the last must cover an even number of bytes.
+public func sum16(sum: UInt32, bytes: &[UInt8]) -> UInt32 {
+    var acc = sum
+    var i = 0
+    let n = bytes.len()
+    while i + 1 < n {
+        acc = fold_once(acc + (be16(&bytes, i) as UInt32))
+        i = i + 2
+    }
+    if i < n {
+        acc = fold_once(acc + ((bytes[i] as UInt32) << 8))
+    }
+    acc
+}
+
+/// `sum` plus one 16-bit word.
+public func sum_word(sum: UInt32, word: UInt16) -> UInt32 {
+    fold_once(sum + (word as UInt32))
+}
+
+func fold_once(sum: UInt32) -> UInt32 {
+    (sum & 0xFFFF) + (sum >> 16)
+}
+
+/// The checksum field that makes `sum` verify: the ones' complement of the
+/// folded sum.
+public func checksum(sum: UInt32) -> UInt16 {
+    var s = sum
+    while s > 0xFFFF {
+        s = fold_once(s)
+    }
+    ~(s as UInt16)
+}
+
+/// Whether a sum taken over a whole message, its checksum field included,
+/// verifies: it folds to all ones (RFC 1071 §1, (3)).
+public func verifies(sum: UInt32) -> Bool {
+    checksum(sum) == 0
+}
+
+/// Milliseconds from `since` to `now` on the caller's clock, or zero if the
+/// clock ran backwards: a time the caller passes is input, and a subtraction
+/// that could trap on it would end the stack.
+public func elapsed(now: UInt64, since: UInt64) -> UInt64 {
+    if now >= since { now - since } else { 0 }
+}
+
+/// `count + 1`, held at the type's top: a count the network can drive must
+/// not be able to end the stack.
+public func count_up(count: UInt32) -> UInt32 {
+    if count == 0xFFFF_FFFF { count } else { count + 1 }
+}

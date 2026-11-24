@@ -1,0 +1,257 @@
+//! IPv4 (RFC 791): the header, and the one interface's configuration.
+//!
+//! ```text
+//! offset  bytes  field
+//! 0       1      version (high nibble), header length in words (low)
+//! 1       1      type of service
+//! 2       2      total length, header included
+//! 4       2      identification
+//! 6       2      flags (high 3 bits: reserved, DF, MF), fragment offset
+//! 8       1      time to live
+//! 9       1      protocol
+//! 10      2      header checksum
+//! 12      4      source address
+//! 16      4      destination address
+//! 20             options, to the header length
+//! ```
+//!
+//! There is no reassembly: a received fragment, one with More Fragments set
+//! or a nonzero offset, is dropped and counted. A datagram is sent whole,
+//! with no options, and one too long for the link is refused before it is
+//! built. Received options are skipped (RFC 1122 §3.2.1.8 has a host ignore
+//! the options it does not implement).
+
+import netstack.addr.{Ipv4Addr}
+import netstack.bytes.{be16, checksum, put16, sum16, verifies}
+import netstack.counters.{Drop}
+
+/// The header's bytes without options: the least a header has.
+public static HEADER_BYTES: Int = 20
+
+/// The time to live a datagram is sent with (RFC 1122 §3.2.1.7, from the
+/// assigned numbers).
+public static DEFAULT_TTL: UInt8 = 64
+
+/// The flags-and-offset field's More Fragments bit.
+public static FLAG_MF: UInt16 = 0x2000
+
+/// The flags-and-offset field's fragment offset, in 8-byte units.
+public static OFFSET_MASK: UInt16 = 0x1FFF
+
+/// The protocols the stack carries.
+public enum Protocol: UInt8 {
+    case Icmp = 1,
+    case Udp = 17,
+}
+
+/// A received header's fields. Only parsing makes one, so its lengths are
+/// ones the packet was checked to hold.
+public struct Header {
+    // The header's bytes, options included: where the payload starts.
+    private ihl_bytes: Int,
+    // The datagram's bytes, header included: where the payload ends.
+    private total_length: Int,
+    public ident: UInt16,
+    public ttl: UInt8,
+    /// The protocol as received, which need not be one the stack carries.
+    public protocol: UInt8,
+    public src: Ipv4Addr,
+    public dst: Ipv4Addr,
+}
+
+extension Header {
+    /// The header's bytes, options included: where the payload starts.
+    public func header_bytes(&self) -> Int {
+        self.ihl_bytes
+    }
+
+    /// The datagram's bytes, header included: where the payload ends.
+    public func total(&self) -> Int {
+        self.total_length
+    }
+
+    /// The header at the front of `packet`, the bytes after the Ethernet
+    /// header, or why it is refused. Every length the header states is held
+    /// to what was received.
+    public init(packet: &[UInt8]) -> Result<Header, Drop> {
+        let received = packet.len()
+        if received < HEADER_BYTES {
+            return Drop.IpTruncated
+        }
+        if (packet[0] >> 4) != 4 {
+            return Drop.IpVersion
+        }
+        let header_bytes = ((packet[0] & 0x0F) as Int) * 4
+        if header_bytes < HEADER_BYTES || header_bytes > received {
+            return Drop.IpHeaderLength
+        }
+        let total = be16(&packet, 2) as Int
+        if total < header_bytes || total > received {
+            return Drop.IpTotalLength
+        }
+        if not verifies(sum16(0, &packet[..header_bytes])) {
+            return Drop.IpChecksum
+        }
+        let fragment = be16(&packet, 6)
+        if (fragment & FLAG_MF) != 0 || (fragment & OFFSET_MASK) != 0 {
+            return Drop.IpFragment
+        }
+        return Header(ihl_bytes: header_bytes, total_length: total,
+                      ident: be16(&packet, 4), ttl: packet[8],
+                      protocol: packet[9],
+                      src: Ipv4Addr(bytes: &packet, at: 12),
+                      dst: Ipv4Addr(bytes: &packet, at: 16))
+    }
+}
+
+/// Writes a header with no options at the front of `packet`, for a datagram
+/// of `payload_bytes` after it, its checksum computed.
+public func write_header(packet: &var [UInt8], src: Ipv4Addr, dst: Ipv4Addr,
+                         protocol: Protocol, ident: UInt16, ttl: UInt8,
+                         payload_bytes: Int) {
+    packet[0] = 0x45
+    packet[1] = 0
+    put16(&var packet, 2, (HEADER_BYTES + payload_bytes) as UInt16)
+    put16(&var packet, 4, ident)
+    put16(&var packet, 6, 0)
+    packet[8] = ttl
+    packet[9] = protocol as UInt8
+    put16(&var packet, 10, 0)
+    src.write(&var packet, 12)
+    dst.write(&var packet, 16)
+    let sum = checksum(sum16(0, &packet[..HEADER_BYTES]))
+    put16(&var packet, 10, sum)
+}
+
+// =============================================================================
+// The interface
+// =============================================================================
+
+/// Why a configuration is refused.
+public enum ConfigError {
+    /// A netmask whose ones are not contiguous from the top.
+    case Netmask,
+    /// An address that cannot be a host's (`host_address`).
+    case Address,
+    /// A gateway that is off the interface's subnet, is the interface's own
+    /// address, or cannot be a host's.
+    case Gateway,
+}
+
+@synthesize
+extension ConfigError: Equatable {}
+
+extension ConfigError {
+    /// What a transcript should call this error.
+    public func describe(&self) -> String {
+        match self {
+            case Netmask -> "a netmask that is not contiguous",
+            case Address -> "an address that is not a host's",
+            case Gateway -> "a gateway that is not another host on the subnet",
+        }
+    }
+}
+
+extension ConfigError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+    }
+}
+
+extension ConfigError: Error {}
+
+/// Whether `a` can be a host's address on a subnet of `netmask`. It cannot be
+/// 0.0.0.0, on the loopback network 127/8, or 224.0.0.0 and above (class D,
+/// class E and the limited broadcast), nor the subnet's network or broadcast
+/// address, all host bits zero or all ones, which a subnet of four addresses
+/// or more has. A /31 has neither, and both its addresses are hosts' (RFC
+/// 3021); a /32's one address is the host's.
+public func host_address(a: Ipv4Addr, netmask: Ipv4Addr) -> Bool {
+    if a.is_unspecified() || (a.value >> 24) == 127 || a.value >= 0xE000_0000 {
+        return false
+    }
+    let host = ~netmask.value
+    let bits = a.value & host
+    not (host >= 3 && (bits == 0 || bits == host))
+}
+
+/// The interface's address, netmask and gateway. A gateway of 0.0.0.0 is no
+/// gateway: only the subnet is reachable. Only the checked `init` makes one.
+public struct Config {
+    private address: Ipv4Addr,
+    private mask: Ipv4Addr,
+    private router: Ipv4Addr,
+}
+
+@synthesize
+extension Config: Equatable {}
+
+extension Config {
+    /// The configuration, or why it cannot be one.
+    public init(addr: Ipv4Addr, netmask: Ipv4Addr,
+                gateway: Ipv4Addr) -> Result<Config, ConfigError> {
+        // Contiguous ones from the top: the complement plus one is a power of
+        // two. A mask of no ones is contiguous too, and its complement plus
+        // one does not fit.
+        let host = ~netmask.value
+        if host != 0xFFFF_FFFF && (host & (host + 1)) != 0 {
+            return ConfigError.Netmask
+        }
+        if not host_address(addr, netmask) {
+            return ConfigError.Address
+        }
+        if not gateway.is_unspecified() {
+            let mask = netmask.value
+            if gateway == addr || not host_address(gateway, netmask) ||
+               (gateway.value & mask) != (addr.value & mask) {
+                return ConfigError.Gateway
+            }
+        }
+        return Config(address: addr, mask: netmask, router: gateway)
+    }
+
+    /// The interface's address.
+    public func addr(&self) -> Ipv4Addr {
+        self.address
+    }
+
+    /// The subnet's mask.
+    public func netmask(&self) -> Ipv4Addr {
+        self.mask
+    }
+
+    /// The gateway, or 0.0.0.0 for none.
+    public func gateway(&self) -> Ipv4Addr {
+        self.router
+    }
+
+    /// Whether `dst` is on the interface's subnet.
+    public func on_link(&self, dst: Ipv4Addr) -> Bool {
+        let mask = self.mask.value
+        (dst.value & mask) == (self.address.value & mask)
+    }
+
+    /// Whether `dst` is a broadcast on this interface: the limited broadcast,
+    /// or the subnet's directed broadcast. A subnet of fewer than four
+    /// addresses has no broadcast address (RFC 3021 for the /31).
+    public func is_broadcast(&self, dst: Ipv4Addr) -> Bool {
+        if dst.is_broadcast() {
+            return true
+        }
+        let host = ~self.mask.value
+        host >= 3 && dst.value == (self.address.value | host)
+    }
+
+    /// Where a datagram to `dst` goes next: `dst` itself on the subnet, the
+    /// gateway off it, or `None` when it is off the subnet and there is no
+    /// gateway.
+    public func next_hop(&self, dst: Ipv4Addr) -> Ipv4Addr? {
+        if self.on_link(dst) {
+            return dst
+        }
+        if self.router.is_unspecified() {
+            return None
+        }
+        self.router
+    }
+}

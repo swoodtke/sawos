@@ -1,0 +1,361 @@
+//! ARP for IPv4 over Ethernet (RFC 826): the packet, the translation table,
+//! and the frames waiting on a resolution.
+//!
+//! ```text
+//! offset  bytes  field
+//! 0       2      hardware type, 1 for Ethernet
+//! 2       2      protocol type, 0x0800 for IPv4
+//! 4       1      hardware address length, 6
+//! 5       1      protocol address length, 4
+//! 6       2      operation, 1 request, 2 reply
+//! 8       6      sender hardware address
+//! 14      4      sender protocol address
+//! 18      6      target hardware address
+//! 24      4      target protocol address
+//! ```
+//!
+//! The table holds resolved entries only, each with the time it was last
+//! confirmed; an entry older than `ENTRY_LIFETIME_MS` is not used and its slot
+//! is reused first. A datagram whose next hop is not in the table waits in the
+//! pending queue as a built frame; when the next hop is learned its address is
+//! written into each of its frames, which go out in the order they were
+//! queued, and when it does not answer within `PENDING_TIMEOUT_MS` they are
+//! dropped. Time is the caller's: every operation that ages takes `now`.
+
+import netstack.addr.{IPV4_BYTES, Ipv4Addr, MAC_BYTES, MacAddr}
+import netstack.bytes.{be16, elapsed, put16}
+import netstack.counters.{Drop}
+import netstack.ether.{MAX_FRAME_BYTES}
+
+/// An Ethernet/IPv4 ARP packet's bytes.
+public static PACKET_BYTES: Int = 28
+
+/// The hardware type of Ethernet.
+public static HTYPE_ETHERNET: UInt16 = 1
+
+/// The protocol type of IPv4: its EtherType.
+public static PTYPE_IPV4: UInt16 = 0x0800
+
+/// The operation field.
+public enum ArpOp: UInt16 {
+    case Request = 1,
+    case Reply = 2,
+}
+
+@synthesize
+extension ArpOp: Equatable {}
+
+/// An ARP packet's addresses and operation.
+public struct Packet {
+    public op: ArpOp,
+    public sender_mac: MacAddr,
+    public sender_ip: Ipv4Addr,
+    public target_mac: MacAddr,
+    public target_ip: Ipv4Addr,
+}
+
+extension Packet {
+    /// The packet at the front of `bytes`, or why it is refused. Bytes past
+    /// the packet are the frame's padding.
+    public init(bytes: &[UInt8]) -> Result<Packet, Drop> {
+        if bytes.len() < PACKET_BYTES {
+            return Drop.ArpTruncated
+        }
+        // RFC 826, "Packet Reception": a station that does not have the
+        // hardware type or does not speak the protocol discards the packet.
+        if be16(&bytes, 0) != HTYPE_ETHERNET || be16(&bytes, 2) != PTYPE_IPV4 ||
+           (bytes[4] as Int) != MAC_BYTES || (bytes[5] as Int) != IPV4_BYTES {
+            return Drop.ArpUnsupported
+        }
+        guard let op = ArpOp.from(raw: be16(&bytes, 6)) else {
+            return Drop.ArpBadOp
+        }
+        return Packet(op: op,
+                      sender_mac: MacAddr(bytes: &bytes, at: 8),
+                      sender_ip: Ipv4Addr(bytes: &bytes, at: 14),
+                      target_mac: MacAddr(bytes: &bytes, at: 18),
+                      target_ip: Ipv4Addr(bytes: &bytes, at: 24))
+    }
+
+    /// Writes the packet into the front of `bytes`.
+    public func write(&self, bytes: &var [UInt8]) {
+        put16(&var bytes, 0, HTYPE_ETHERNET)
+        put16(&var bytes, 2, PTYPE_IPV4)
+        bytes[4] = MAC_BYTES as UInt8
+        bytes[5] = IPV4_BYTES as UInt8
+        put16(&var bytes, 6, self.op as UInt16)
+        self.sender_mac.write(&var bytes, 8)
+        self.sender_ip.write(&var bytes, 14)
+        self.target_mac.write(&var bytes, 18)
+        self.target_ip.write(&var bytes, 24)
+    }
+}
+
+// =============================================================================
+// The translation table
+// =============================================================================
+
+/// How many translations the table holds.
+public static CACHE_ENTRIES: Int = 8
+
+/// How long a translation is used after it was last confirmed. RFC 1122
+/// §2.3.2.1 asks for a timeout on cache entries, on the order of a minute.
+public static ENTRY_LIFETIME_MS: UInt64 = 60_000
+
+struct Entry {
+    used: Bool,
+    ip: Ipv4Addr,
+    mac: MacAddr,
+    updated_at: UInt64,
+}
+
+/// The translation table: IPv4 address to MAC address, a fixed number of
+/// entries.
+public struct Cache {
+    private entries: [Entry; CACHE_ENTRIES],
+}
+
+extension Cache {
+    /// No translations.
+    public static func empty() -> Cache {
+        let free = Entry(used: false, ip: Ipv4Addr.unspecified(),
+                         mac: MacAddr.zero(), updated_at: 0)
+        Cache(entries: [free; CACHE_ENTRIES])
+    }
+
+    /// The MAC address `ip` resolves to at `now`, or `None` when the table has
+    /// no live translation for it.
+    public func lookup(&self, ip: Ipv4Addr, now: UInt64) -> MacAddr? {
+        guard let i = self.find(ip) else { return None }
+        if self.stale(i, now) {
+            return None
+        }
+        self.entries[i].mac
+    }
+
+    /// RFC 826's merge: when `ip` is in the table, its address becomes `mac`
+    /// and its age restarts. Answers whether it was there. An expired entry
+    /// is not in the table: its slot is freed and nothing is merged.
+    public func merge(&var self, ip: Ipv4Addr, mac: MacAddr,
+                      now: UInt64) -> Bool {
+        guard let i = self.find(ip) else { return false }
+        if self.stale(i, now) {
+            self.entries[i].used = false
+            return false
+        }
+        self.entries[i].mac = mac
+        self.entries[i].updated_at = now
+        true
+    }
+
+    /// Adds the translation `ip` to `mac`, into a free slot, else the slot
+    /// of the entry confirmed longest ago, which is an expired one if any is.
+    public func insert(&var self, ip: Ipv4Addr, mac: MacAddr, now: UInt64) {
+        if self.merge(ip, mac, now) {
+            return
+        }
+        var victim = 0
+        var i = 0
+        while i < CACHE_ENTRIES {
+            if not self.entries[i].used {
+                victim = i
+                break
+            }
+            if self.entries[i].updated_at < self.entries[victim].updated_at {
+                victim = i
+            }
+            i = i + 1
+        }
+        self.entries[victim] = Entry(used: true, ip: ip, mac: mac,
+                                     updated_at: now)
+    }
+
+    /// How many live translations the table holds at `now`.
+    public func live(&self, now: UInt64) -> Int {
+        var n = 0
+        var i = 0
+        while i < CACHE_ENTRIES {
+            if self.entries[i].used && not self.stale(i, now) {
+                n = n + 1
+            }
+            i = i + 1
+        }
+        n
+    }
+
+    func find(&self, ip: Ipv4Addr) -> Int? {
+        var i = 0
+        while i < CACHE_ENTRIES {
+            if self.entries[i].used && self.entries[i].ip == ip {
+                return i
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    func stale(&self, i: Int, now: UInt64) -> Bool {
+        elapsed(now, self.entries[i].updated_at) >= ENTRY_LIFETIME_MS
+    }
+}
+
+// =============================================================================
+// The pending queue
+// =============================================================================
+
+/// How many frames may wait on resolutions, all next hops together. A frame
+/// that finds the queue full is dropped.
+public static PENDING_FRAMES: Int = 4
+
+/// The most of the pending queue that replies (echo replies and port
+/// unreachables) may hold. A reply goes wherever a received frame's source
+/// says, so without a bound a stream of frames from addresses nobody answers
+/// for would fill the queue; the slot left over is always free for a
+/// datagram this station sends itself.
+public static REPLY_FRAMES: Int = PENDING_FRAMES - 1
+
+static_assert(REPLY_FRAMES > 0 && REPLY_FRAMES < PENDING_FRAMES,
+              "replies and local sends each have a slot of their own")
+
+/// The least time between two requests for one address: RFC 1122 §2.3.2.1
+/// allows no more than one a second.
+public static REQUEST_INTERVAL_MS: UInt64 = 1000
+
+/// How long a frame waits on its next hop before it is dropped: three
+/// requests' worth.
+public static PENDING_TIMEOUT_MS: UInt64 = 3 * REQUEST_INTERVAL_MS
+
+struct Waiting {
+    next_hop: Ipv4Addr,
+    queued_at: UInt64,
+    requested_at: UInt64,
+    len: Int,
+    frame: [UInt8; MAX_FRAME_BYTES],
+}
+
+/// The frames waiting on resolutions, oldest first.
+public struct Pending {
+    private slots: [Waiting; PENDING_FRAMES],
+    // How many of the slots, from the first, hold a frame.
+    private count: Int,
+}
+
+extension Pending {
+    /// No frames.
+    public static func empty() -> Pending {
+        Pending(slots: [Waiting(next_hop: Ipv4Addr.unspecified(), queued_at: 0,
+                                requested_at: 0, len: 0,
+                                frame: [0; MAX_FRAME_BYTES]); PENDING_FRAMES],
+                count: 0)
+    }
+
+    /// How many frames wait.
+    public func len(&self) -> Int {
+        self.count
+    }
+
+    /// Queues `frame` to wait on `next_hop`, or `ArpQueueFull`. A request
+    /// sent for the hop at `requested_at` is carried with it, so a new frame
+    /// for a hop already asked about does not ask again early.
+    public func push(&var self, next_hop: Ipv4Addr, frame: &[UInt8],
+                     now: UInt64, requested_at: UInt64) -> Result<Void, Drop> {
+        if self.count == PENDING_FRAMES {
+            return Drop.ArpQueueFull
+        }
+        let i = self.count
+        self.slots[i].next_hop = next_hop
+        self.slots[i].queued_at = now
+        self.slots[i].requested_at = requested_at
+        self.slots[i].len = frame.len()
+        var j = 0
+        while j < frame.len() {
+            self.slots[i].frame[j] = frame[j]
+            j = j + 1
+        }
+        self.count = i + 1
+        return
+    }
+
+    /// When a request last went out for `next_hop`, or `None` when no frame
+    /// waits on it.
+    public func requested_at(&self, next_hop: Ipv4Addr) -> UInt64? {
+        var i = 0
+        while i < self.count {
+            if self.slots[i].next_hop == next_hop {
+                return self.slots[i].requested_at
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// Records a request for `next_hop` sent at `now`.
+    public func requested(&var self, next_hop: Ipv4Addr, now: UInt64) {
+        var i = 0
+        while i < self.count {
+            if self.slots[i].next_hop == next_hop {
+                self.slots[i].requested_at = now
+            }
+            i = i + 1
+        }
+    }
+
+    /// A next hop whose last request was `REQUEST_INTERVAL_MS` or more before
+    /// `now`, or `None` when no request is due.
+    public func request_due(&self, now: UInt64) -> Ipv4Addr? {
+        var i = 0
+        while i < self.count {
+            if elapsed(now, self.slots[i].requested_at) >= REQUEST_INTERVAL_MS {
+                return self.slots[i].next_hop
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// The oldest frame waiting on `next_hop`, or `None`.
+    public func first_for(&self, next_hop: Ipv4Addr) -> Int? {
+        var i = 0
+        while i < self.count {
+            if self.slots[i].next_hop == next_hop {
+                return i
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// The oldest frame that has waited `PENDING_TIMEOUT_MS` or more at
+    /// `now`, or `None`.
+    public func first_expired(&self, now: UInt64) -> Int? {
+        var i = 0
+        while i < self.count {
+            if elapsed(now, self.slots[i].queued_at) >= PENDING_TIMEOUT_MS {
+                return i
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// Copies frame `i` into the front of `out` and answers its length.
+    public func copy_out(&self, i: Int, out: &var [UInt8]) -> Int {
+        let n = self.slots[i].len
+        var j = 0
+        while j < n {
+            out[j] = self.slots[i].frame[j]
+            j = j + 1
+        }
+        n
+    }
+
+    /// Removes frame `i`, keeping the rest in order.
+    public func remove(&var self, i: Int) {
+        var j = i
+        while j + 1 < self.count {
+            self.slots[j] = self.slots[j + 1]
+            j = j + 1
+        }
+        self.count = self.count - 1
+    }
+}

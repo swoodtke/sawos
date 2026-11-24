@@ -1,0 +1,214 @@
+//! What the stack counts: every refusal by its reason, and the traffic it
+//! carried.
+//!
+//! A malformed or unwanted frame is a counted drop and nothing else: the
+//! parsers answer the reason as their error, and the stack counts it. Each
+//! count holds at its top rather than wrapping.
+
+import netstack.bytes.{count_up}
+
+/// Why a frame, a datagram or a reply was dropped. Raw-backed so each reason
+/// has a stable index into the counts.
+public enum Drop: UInt8 {
+    /// A frame shorter than an Ethernet header.
+    case EtherRunt = 0,
+    /// A frame longer than `MAX_FRAME_BYTES`.
+    case EtherOversize = 1,
+    /// A unicast frame for another station.
+    case EtherNotOurs = 2,
+    /// A multicast frame: the filter passes only our address and broadcast.
+    case EtherMulticast = 3,
+    /// An EtherType the stack does not speak, an 802.3 length included.
+    case EtherType = 4,
+
+    /// An ARP packet shorter than an Ethernet/IPv4 one.
+    case ArpTruncated = 5,
+    /// A hardware or protocol type, or an address length, other than
+    /// Ethernet's and IPv4's.
+    case ArpUnsupported = 6,
+    /// An operation neither request nor reply.
+    case ArpBadOp = 7,
+    /// A sender hardware address that is a group address.
+    case ArpBadSender = 8,
+    /// Another station claims our address.
+    case ArpConflict = 9,
+    /// A datagram awaiting resolution, refused because the queue was full,
+    /// or because replies hold all of it they may (`arp.REPLY_FRAMES`).
+    case ArpQueueFull = 10,
+    /// A datagram awaiting resolution, given up when its next hop never
+    /// answered.
+    case ArpUnresolved = 11,
+    /// A datagram awaiting resolution, dropped when the interface's address
+    /// changed: it was built with the old address as its source.
+    case ArpReaddressed = 12,
+
+    /// A packet shorter than the minimal IPv4 header.
+    case IpTruncated = 13,
+    /// A version other than 4.
+    case IpVersion = 14,
+    /// A header length under the minimum or past the packet.
+    case IpHeaderLength = 15,
+    /// A total length under the header or past the frame.
+    case IpTotalLength = 16,
+    /// A header checksum that does not verify.
+    case IpChecksum = 17,
+    /// A fragment. There is no reassembly: a datagram with More Fragments set
+    /// or a nonzero offset is dropped.
+    case IpFragment = 18,
+    /// A destination that is neither our address nor a broadcast, or any
+    /// datagram while the interface has no address.
+    case IpNotOurs = 19,
+    /// A source that is a broadcast or multicast address, or our own.
+    case IpBadSource = 20,
+    /// A protocol other than ICMP and UDP.
+    case IpProtocol = 21,
+    /// A datagram, sent or a reply, to a destination off the subnet when
+    /// there is no gateway.
+    case IpNoRoute = 22,
+
+    /// An ICMP message shorter than its header.
+    case IcmpTruncated = 23,
+    /// An ICMP checksum that does not verify.
+    case IcmpChecksum = 24,
+    /// An ICMP type the stack does not act on.
+    case IcmpUnhandled = 25,
+    /// An echo request to a broadcast address (RFC 1122 §3.2.2.6).
+    case IcmpBroadcastEcho = 26,
+    /// An echo request from 0.0.0.0, which no reply can reach.
+    case IcmpNoSource = 27,
+    /// A port unreachable the rate limit held back.
+    case IcmpRateLimited = 28,
+
+    /// A UDP datagram shorter than its header.
+    case UdpTruncated = 29,
+    /// A UDP length under the header or past the IP payload.
+    case UdpLength = 30,
+    /// A UDP checksum that does not verify.
+    case UdpChecksum = 31,
+    /// A datagram to a port no socket is bound to.
+    case UdpNoPort = 32,
+
+    /// A frame the device had no room for.
+    case TxFull = 33,
+    /// A datagram or echo reply its receiver had no room for.
+    case DeliverFull = 34,
+}
+
+/// How many reasons there are: one past the last's value.
+public static DROP_KINDS: Int = 35
+
+extension Drop {
+    /// What a transcript should call this reason.
+    public func describe(&self) -> String {
+        match self {
+            case EtherRunt -> "ether runt",
+            case EtherOversize -> "ether oversize",
+            case EtherNotOurs -> "ether not ours",
+            case EtherMulticast -> "ether multicast",
+            case EtherType -> "ether type",
+            case ArpTruncated -> "arp truncated",
+            case ArpUnsupported -> "arp unsupported",
+            case ArpBadOp -> "arp bad op",
+            case ArpBadSender -> "arp bad sender",
+            case ArpConflict -> "arp conflict",
+            case ArpQueueFull -> "arp queue full",
+            case ArpUnresolved -> "arp unresolved",
+            case ArpReaddressed -> "arp readdressed",
+            case IpTruncated -> "ip truncated",
+            case IpVersion -> "ip version",
+            case IpHeaderLength -> "ip header length",
+            case IpTotalLength -> "ip total length",
+            case IpChecksum -> "ip checksum",
+            case IpFragment -> "ip fragment",
+            case IpNotOurs -> "ip not ours",
+            case IpBadSource -> "ip bad source",
+            case IpProtocol -> "ip protocol",
+            case IpNoRoute -> "ip no route",
+            case IcmpTruncated -> "icmp truncated",
+            case IcmpChecksum -> "icmp checksum",
+            case IcmpUnhandled -> "icmp unhandled",
+            case IcmpBroadcastEcho -> "icmp broadcast echo",
+            case IcmpNoSource -> "icmp no source",
+            case IcmpRateLimited -> "icmp rate limited",
+            case UdpTruncated -> "udp truncated",
+            case UdpLength -> "udp length",
+            case UdpChecksum -> "udp checksum",
+            case UdpNoPort -> "udp no port",
+            case TxFull -> "tx full",
+            case DeliverFull -> "deliver full",
+        }
+    }
+}
+
+@synthesize
+extension Drop: Equatable {}
+
+extension Drop: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+    }
+}
+
+extension Drop: Error {}
+
+/// The traffic the stack carried.
+public enum Count: UInt8 {
+    /// Frames handed to the stack, every one.
+    case FramesReceived = 0,
+    /// Frames the device took.
+    case FramesSent = 1,
+    /// ARP requests sent, announcements included.
+    case ArpRequestsSent = 2,
+    /// ARP replies sent.
+    case ArpRepliesSent = 3,
+    /// Echo requests sent.
+    case EchoRequestsSent = 4,
+    /// Echo replies sent.
+    case EchoRepliesSent = 5,
+    /// Echo replies handed up.
+    case EchoRepliesReceived = 6,
+    /// Port unreachables sent.
+    case UnreachablesSent = 7,
+    /// UDP datagrams sent.
+    case DatagramsSent = 8,
+    /// UDP datagrams handed up to a socket.
+    case DatagramsDelivered = 9,
+}
+
+/// How many counts there are: one past the last's value.
+public static COUNT_KINDS: Int = 10
+
+/// Every drop by reason and every count, each held at its top.
+public struct Counters {
+    private dropped: [UInt32; DROP_KINDS],
+    private counts: [UInt32; COUNT_KINDS],
+}
+
+extension Counters {
+    /// Nothing counted.
+    public static func zero() -> Counters {
+        Counters(dropped: [0; DROP_KINDS], counts: [0; COUNT_KINDS])
+    }
+
+    /// Counts one drop for `reason`.
+    public func add_drop(&var self, reason: Drop) {
+        let i = (reason as UInt8) as Int
+        self.dropped[i] = count_up(self.dropped[i])
+    }
+
+    /// Counts one `count`.
+    public func add(&var self, count: Count) {
+        let i = (count as UInt8) as Int
+        self.counts[i] = count_up(self.counts[i])
+    }
+
+    /// The drops counted for `reason`.
+    public func drops(&self, reason: Drop) -> UInt32 {
+        self.dropped[(reason as UInt8) as Int]
+    }
+
+    /// The value of `count`.
+    public func count(&self, count: Count) -> UInt32 {
+        self.counts[(count as UInt8) as Int]
+    }
+}

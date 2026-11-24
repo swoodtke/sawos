@@ -1,0 +1,214 @@
+//! UDP (RFC 768): the header with its pseudo-header checksum, and the table
+//! binding ports to sockets.
+//!
+//! ```text
+//! offset  bytes  field
+//! 0       2      source port
+//! 2       2      destination port
+//! 4       2      length, header included
+//! 6       2      checksum
+//! 8              data
+//! ```
+//!
+//! The checksum covers a pseudo-header (source and destination address, a
+//! zero byte, the protocol and the UDP length), the header and the data. A
+//! received checksum of zero means the sender computed none, and the datagram
+//! is taken unchecked; a sent one is always computed, and a computed zero is
+//! sent as all ones (RFC 768).
+
+import netstack.addr.{Ipv4Addr}
+import netstack.bytes.{be16, checksum, put16, sum16, sum_word, verifies}
+import netstack.counters.{Drop}
+import netstack.ipv4.{Protocol}
+
+/// The header's bytes.
+public static HEADER_BYTES: Int = 8
+
+/// The first and last ports handed out for a socket opened on port 0: the
+/// dynamic range.
+public static EPHEMERAL_FIRST: UInt16 = 49152
+public static EPHEMERAL_LAST: UInt16 = 65535
+
+/// How many sockets may be bound at once. A socket's id is below it.
+public static SOCKETS: Int = 16
+
+/// A received header's fields. Only parsing makes one, so its length is one
+/// the datagram was checked to hold.
+public struct Header {
+    public src_port: UInt16,
+    public dst_port: UInt16,
+    // The datagram's bytes, header included: where the data ends.
+    private datagram_length: Int,
+}
+
+/// The pseudo-header's part of the checksum (RFC 768).
+public func pseudo_sum(src: Ipv4Addr, dst: Ipv4Addr, length: Int) -> UInt32 {
+    var sum: UInt32 = 0
+    sum = sum_word(sum, (src.value >> 16) as UInt16)
+    sum = sum_word(sum, (src.value & 0xFFFF) as UInt16)
+    sum = sum_word(sum, (dst.value >> 16) as UInt16)
+    sum = sum_word(sum, (dst.value & 0xFFFF) as UInt16)
+    sum = sum_word(sum, (Protocol.Udp as UInt8) as UInt16)
+    sum_word(sum, length as UInt16)
+}
+
+extension Header {
+    /// The datagram's bytes, header included: where the data ends.
+    public func length(&self) -> Int {
+        self.datagram_length
+    }
+
+    /// The header of `datagram`, the IP payload of a datagram from `src` to
+    /// `dst`, or why it is refused. Bytes past the UDP length are ignored.
+    public init(datagram: &[UInt8], src: Ipv4Addr,
+                dst: Ipv4Addr) -> Result<Header, Drop> {
+        let received = datagram.len()
+        if received < HEADER_BYTES {
+            return Drop.UdpTruncated
+        }
+        let length = be16(&datagram, 4) as Int
+        if length < HEADER_BYTES || length > received {
+            return Drop.UdpLength
+        }
+        let pseudo = pseudo_sum(src, dst, length)
+        if be16(&datagram, 6) != 0 &&
+           not verifies(sum16(pseudo, &datagram[..length])) {
+            return Drop.UdpChecksum
+        }
+        return Header(src_port: be16(&datagram, 0),
+                      dst_port: be16(&datagram, 2),
+                      datagram_length: length)
+    }
+}
+
+/// Writes the header at the front of `datagram`, whose data of `data_bytes`
+/// is already in place after it, with the checksum for a datagram from
+/// `src` to `dst`. Answers the datagram's length.
+public func write_header(datagram: &var [UInt8], src: Ipv4Addr, dst: Ipv4Addr,
+                         src_port: UInt16, dst_port: UInt16,
+                         data_bytes: Int) -> Int {
+    let length = HEADER_BYTES + data_bytes
+    put16(&var datagram, 0, src_port)
+    put16(&var datagram, 2, dst_port)
+    put16(&var datagram, 4, length as UInt16)
+    put16(&var datagram, 6, 0)
+    let sum = checksum(sum16(pseudo_sum(src, dst, length), &datagram[..length]))
+    put16(&var datagram, 6, if sum == 0 { 0xFFFF } else { sum })
+    length
+}
+
+/// The ephemeral port after `port`, wrapping from the last to the first.
+func after(port: UInt16) -> UInt16 {
+    if port == EPHEMERAL_LAST { EPHEMERAL_FIRST } else { port + 1 }
+}
+
+// =============================================================================
+// The port table
+// =============================================================================
+
+/// Why a port cannot be bound.
+public enum BindError {
+    /// A socket is bound to the port already.
+    case InUse(port: UInt16),
+    /// Every socket is in use.
+    case Full,
+}
+
+@synthesize
+extension BindError: Equatable {}
+
+extension BindError {
+    /// What a transcript should call this error.
+    public func describe(&self) -> String {
+        match self {
+            case InUse(_) -> "the port is in use",
+            case Full -> "every socket is in use",
+        }
+    }
+}
+
+extension BindError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+    }
+}
+
+extension BindError: Error {}
+
+/// The sockets, each bound to one port; a socket's id is its slot.
+public struct PortTable {
+    private bound: [Bool; SOCKETS],
+    private ports: [UInt16; SOCKETS],
+    // Where the search for an ephemeral port starts.
+    private next_ephemeral: UInt16,
+}
+
+extension PortTable {
+    /// No sockets.
+    public static func empty() -> PortTable {
+        PortTable(bound: [false; SOCKETS], ports: [0; SOCKETS],
+                  next_ephemeral: EPHEMERAL_FIRST)
+    }
+
+    /// Binds a socket to `port`, or to an ephemeral port for 0, and answers
+    /// its id. No socket is ever bound to port 0, so it is never in use.
+    public func bind(&var self, port: UInt16) -> Result<UInt8, BindError> {
+        if self.lookup(port) != None {
+            return BindError.InUse(port)
+        }
+        var id = 0
+        while id < SOCKETS && self.bound[id] {
+            id = id + 1
+        }
+        if id == SOCKETS {
+            return BindError.Full
+        }
+        let chosen = if port == 0 { self.ephemeral() } else { port }
+        self.bound[id] = true
+        self.ports[id] = chosen
+        return id as UInt8
+    }
+
+    /// Unbinds socket `id`; answers whether it was bound.
+    public func release(&var self, id: UInt8) -> Bool {
+        let i = id as Int
+        if i >= SOCKETS || not self.bound[i] {
+            return false
+        }
+        self.bound[i] = false
+        true
+    }
+
+    /// The socket bound to `port`, or `None`.
+    public func lookup(&self, port: UInt16) -> UInt8? {
+        var i = 0
+        while i < SOCKETS {
+            if self.bound[i] && self.ports[i] == port {
+                return i as UInt8
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    /// The port socket `id` is bound to, or `None` when it is not bound.
+    public func port_of(&self, id: UInt8) -> UInt16? {
+        let i = id as Int
+        if i >= SOCKETS || not self.bound[i] {
+            return None
+        }
+        self.ports[i]
+    }
+
+    /// The next free port of the dynamic range, from where the last search
+    /// stopped. A free one is found within `SOCKETS + 1` tries: at most
+    /// `SOCKETS` are bound.
+    func ephemeral(&var self) -> UInt16 {
+        var candidate = self.next_ephemeral
+        while self.lookup(candidate) != None {
+            candidate = after(candidate)
+        }
+        self.next_ephemeral = after(candidate)
+        candidate
+    }
+}

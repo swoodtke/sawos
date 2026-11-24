@@ -970,9 +970,9 @@ LOCK_WAIT_PKG = os.path.join(TESTS_DIR, "lock-wait")
 # A `main` program reading fields `sos` keeps to itself (handle words, a boot
 # set's records, a boot record's slots), which the compile refuses.
 HANDLE_SEALED_PKG = os.path.join(TESTS_DIR, "handle-sealed")
-# A `main` program writing fields the networking packages keep to themselves
+# A `main` program reaching fields the networking packages keep to themselves
 # (a ring's layout, window and endpoint state, the decoders' frames and
-# lengths), which the compile refuses.
+# lengths, the TCP/IP stack's state), which the compile refuses.
 NET_SEALED_PKG = os.path.join(TESTS_DIR, "net-sealed")
 # Threads made with `thread_create(run:arg:stack_top:)`: `thread-run`
 # launches `child-thread-run` once per role, and `child-thread-take`, under
@@ -13215,8 +13215,9 @@ TEST_CASES = [
         # length, an endpoint's memory, indexes and latched fault) and those a
         # decoder's bounds rest on (a frame's, an SSID's, a key's and a name's
         # length and bytes), and building a layout, a window, an endpoint and
-        # a frame field by field. The compile refuses each, and each refusal
-        # is asserted.
+        # a frame field by field; and reading and writing every field the
+        # TCP/IP stack's state rests on, and building that state field by
+        # field. The compile refuses each, and each refusal is asserted.
         "name": "net_fields_sealed",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": NET_SEALED_PKG,
@@ -13235,13 +13236,35 @@ TEST_CASES = [
                 ("sockproto.Frame", ["count", "body"]),
                 ("wlanproto.Ssid", ["count", "data"]),
                 ("wlanproto.Key", ["count", "data"]),
-                ("sockproto.Name", ["count", "data"])]
+                ("sockproto.Name", ["count", "data"]),
+                ("netstack.arp.Cache", ["entries"]),
+                ("netstack.arp.Pending", ["slots", "count"]),
+                ("netstack.counters.Counters", ["dropped", "counts"]),
+                ("netstack.icmp.RateLimit", ["last"]),
+                ("netstack.udp.PortTable",
+                 ["bound", "ports", "next_ephemeral"]),
+                ("netstack.ipv4.Header", ["ihl_bytes", "total_length"]),
+                ("netstack.udp.Header", ["datagram_length"]),
+                ("netstack.ipv4.Config", ["address", "mask", "router"]),
+                ("netstack.Stack",
+                 ["link_addr", "settings", "cache", "pending", "ports",
+                  "unreachable", "ident", "tally"])]
             for field in fields] + [
             "no parameter is labeled `slot_size` in Layout.init",
             "no parameter is labeled `base` in SharedWindow.init",
             "`Endpoint` has no `init` this module can call, and its fields "
             "are not all visible here",
-            "no parameter is labeled `count` in Frame.init"],
+            "no parameter is labeled `count` in Frame.init",
+            "no parameter is labeled `src_port` in Header.init(datagram:",
+            "no parameter is labeled `ihl_bytes` in Header.init(packet:",
+            "`RateLimit` has no `init` this module can call, and its fields "
+            "are not all visible here",
+            "`Counters` has no `init` this module can call, and its fields "
+            "are not all visible here",
+            "`PortTable` has no `init` this module can call, and its fields "
+            "are not all visible here",
+            "no parameter is labeled `address` in Config.init(addr:",
+            "no parameter is labeled `link_addr` in Stack.init(mac:"],
         "expect_out": [],
         "expect_clean_exit": False,
     },
@@ -14780,6 +14803,7 @@ HOSTED_TESTS = [os.path.join(DRIVERS_DIR, "esp32s3io"),
                 os.path.join(DRIVERS_DIR, "hciproto"),
                 os.path.join(DRIVERS_DIR, "wlanproto"),
                 os.path.join(DRIVERS_DIR, "sockproto"),
+                os.path.join(DRIVERS_DIR, "netstack"),
                 os.path.dirname(SOSRT_DIR)]
 
 # The link the builder's manifest reaches the sawlang checkout's packages

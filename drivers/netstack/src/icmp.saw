@@ -1,0 +1,125 @@
+//! ICMP (RFC 792): echo, and the port unreachable a closed UDP port answers.
+//!
+//! ```text
+//! offset  bytes  field
+//! 0       1      type
+//! 1       1      code
+//! 2       2      checksum, over the whole message
+//! 4       2      echo: identifier      unreachable: unused, zero
+//! 6       2      echo: sequence number
+//! 8              echo: data            unreachable: the datagram's IP header
+//!                                      and its first 8 data bytes
+//! ```
+
+import netstack.bytes.{
+    be16, checksum, elapsed, put16, put_bytes, sum16, verifies,
+}
+import netstack.counters.{Drop}
+
+/// The header's bytes: type, code, checksum and the four that depend on the
+/// type.
+public static HEADER_BYTES: Int = 8
+
+/// The types the stack acts on.
+public enum IcmpType: UInt8 {
+    case EchoReply = 0,
+    case Unreachable = 3,
+    case EchoRequest = 8,
+}
+
+/// Destination unreachable's code for a port with no listener.
+public static CODE_PORT_UNREACHABLE: UInt8 = 3
+
+/// The data bytes of the offending datagram an unreachable quotes, after its
+/// IP header (RFC 792; RFC 1122 §3.2.2 asks for at least these).
+public static QUOTED_DATA_BYTES: Int = 8
+
+/// The least time between two port unreachables (RFC 1122 §3.2.8 has a host
+/// limit the rate it sends ICMP errors at).
+public static UNREACHABLE_INTERVAL_MS: UInt64 = 1000
+
+/// A received message's header.
+public struct Header {
+    /// The type as received, which need not be one the stack acts on.
+    public kind: UInt8,
+    public code: UInt8,
+    /// An echo's identifier: the first half of the type's four bytes.
+    public ident: UInt16,
+    /// An echo's sequence number: the second half.
+    public sequence: UInt16,
+}
+
+extension Header {
+    /// The header of `message`, the whole ICMP message, or why it is refused.
+    public init(message: &[UInt8]) -> Result<Header, Drop> {
+        if message.len() < HEADER_BYTES {
+            return Drop.IcmpTruncated
+        }
+        if not verifies(sum16(0, &message)) {
+            return Drop.IcmpChecksum
+        }
+        return Header(kind: message[0], code: message[1],
+                      ident: be16(&message, 4), sequence: be16(&message, 6))
+    }
+}
+
+/// Writes an echo request or reply carrying `data` at the front of
+/// `message`, and answers its length.
+public func write_echo(message: &var [UInt8], kind: IcmpType, ident: UInt16,
+                       sequence: UInt16, data: &[UInt8]) -> Int {
+    message[0] = kind as UInt8
+    message[1] = 0
+    put16(&var message, 2, 0)
+    put16(&var message, 4, ident)
+    put16(&var message, 6, sequence)
+    put_bytes(&var message, HEADER_BYTES, &data)
+    let len = HEADER_BYTES + data.len()
+    let sum = checksum(sum16(0, &message[..len]))
+    put16(&var message, 2, sum)
+    len
+}
+
+/// Writes a destination unreachable of `code` quoting `quote`, the offending
+/// datagram's header and first data bytes, and answers its length.
+public func write_unreachable(message: &var [UInt8], code: UInt8,
+                              quote: &[UInt8]) -> Int {
+    message[0] = IcmpType.Unreachable as UInt8
+    message[1] = code
+    put16(&var message, 2, 0)
+    put16(&var message, 4, 0)
+    put16(&var message, 6, 0)
+    put_bytes(&var message, HEADER_BYTES, &quote)
+    let len = HEADER_BYTES + quote.len()
+    let sum = checksum(sum16(0, &message[..len]))
+    put16(&var message, 2, sum)
+    len
+}
+
+/// The rate limit on port unreachables: one per `UNREACHABLE_INTERVAL_MS`.
+public struct RateLimit {
+    // When the last one went out, or `None` before the first.
+    private last: UInt64?,
+}
+
+extension RateLimit {
+    /// None sent yet.
+    public static func fresh() -> RateLimit {
+        RateLimit(last: None)
+    }
+
+    /// Whether one may go out at `now`. Asking spends nothing: `spend` does,
+    /// once one has gone.
+    public func ready(&self, now: UInt64) -> Bool {
+        if let last = self.last {
+            if elapsed(now, last) < UNREACHABLE_INTERVAL_MS {
+                return false
+            }
+        }
+        true
+    }
+
+    /// Records that one went out at `now`.
+    public func spend(&var self, now: UInt64) {
+        self.last = now
+    }
+}

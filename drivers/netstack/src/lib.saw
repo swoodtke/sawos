@@ -1,0 +1,707 @@
+//! The TCP/IP stack's first layer: Ethernet II, ARP, IPv4, ICMP and UDP for
+//! one interface.
+//!
+//! A `Stack` is a value with no clock, no device and no sockets of its own.
+//! Whoever drives it hands it frames and the time, and gives it a `Sink` that
+//! takes the frames it sends and the datagrams it delivers:
+//!
+//!   - downward, `receive` takes a frame the device received, and the stack
+//!     calls `Sink.transmit` with each frame it sends;
+//!   - upward, `udp_send` sends a datagram from socket id N to an address and
+//!     port, and the stack calls `Sink.deliver` with each datagram for socket
+//!     id N and each echo reply;
+//!   - `poll` ages what waits on time: it retries ARP requests and drops the
+//!     frames whose next hop never answered.
+//!
+//! Everything that crosses is plain data: frames and payloads as bytes,
+//! sockets as small ids, addresses as numbers. A device driver and a socket
+//! server each adapt their own protocol to this.
+//!
+//! # Time
+//!
+//! `now` is a count of milliseconds on a monotonic clock the caller keeps,
+//! passed to every operation that ages something: ARP entries
+//! (`arp.ENTRY_LIFETIME_MS`), ARP requests (`arp.REQUEST_INTERVAL_MS`),
+//! frames waiting on a resolution (`arp.PENDING_TIMEOUT_MS`) and port
+//! unreachables (`icmp.UNREACHABLE_INTERVAL_MS`). A time earlier than one
+//! the stack has seen counts as no time passing.
+//!
+//! # A received frame is input
+//!
+//! A frame may sit in memory its sender can still write. So `receive` reads
+//! it once, copying it whole into private memory, and every parser works on
+//! the copy: every length a header states is checked against what was
+//! received before anything under it is read, and a frame that fails a check
+//! is a counted drop (`Drop`), never a fault of the stack. The copy is what
+//! lets a checksum and the payload it covers be the same bytes.
+//!
+//! # Drops
+//!
+//! Every refusal is counted by its reason (`Stack.drops`). Among them: a frame
+//! for another station or a multicast group (the filter passes our address
+//! and broadcast), an EtherType other than IPv4 and ARP, a malformed header
+//! of any layer, a bad checksum, an IPv4 fragment (there is no reassembly),
+//! a protocol other than ICMP and UDP, an ICMP type other than echo, a
+//! datagram to a closed port, a datagram with no route, and a frame the
+//! device or a socket had no room for: back-pressure is a drop, and the stack
+//! never waits. A reply the stack cannot send is counted the same way, by
+//! why it could not.
+//!
+//! # What the layer answers
+//!
+//! An echo request to our address is answered with an echo reply, unless it
+//! came from 0.0.0.0. A UDP datagram to a closed port is answered with a port
+//! unreachable, at most one each `icmp.UNREACHABLE_INTERVAL_MS` that goes out,
+//! and never for a datagram sent to a broadcast or from no address (RFC 1122
+//! §3.2.2). A datagram whose source is a broadcast, a multicast group or our
+//! own address is dropped before anything could answer it. An ARP request for
+//! our address is answered, and a new address is announced with a gratuitous
+//! ARP request.
+//!
+//! A reply goes to whatever source a received frame names, so replies waiting
+//! on a resolution may hold only `arp.REPLY_FRAMES` of the pending queue, and
+//! a datagram this station sends always finds a slot that no reply can take.
+
+public import netstack.addr.{Ipv4Addr, MacAddr, SocketAddr}
+public import netstack.counters.{COUNT_KINDS, Count, Counters, DROP_KINDS, Drop}
+public import netstack.ipv4.{Config, ConfigError}
+public import netstack.udp.{BindError}
+
+import netstack.arp
+import netstack.ether
+import netstack.icmp
+import netstack.ipv4
+import netstack.udp
+import netstack.bytes.{elapsed, put_bytes}
+
+/// The most data one UDP datagram carries: the MTU less the IPv4 and UDP
+/// headers. Larger is refused, since nothing is fragmented.
+public static MAX_UDP_DATA: Int = (
+    ether.MTU - ipv4.HEADER_BYTES - udp.HEADER_BYTES)
+
+/// The most data one echo request carries.
+public static MAX_ECHO_DATA: Int = (
+    ether.MTU - ipv4.HEADER_BYTES - icmp.HEADER_BYTES)
+
+/// Where an IPv4 datagram's payload starts in a frame the stack builds.
+static PAYLOAD_AT: Int = ether.HEADER_BYTES + ipv4.HEADER_BYTES
+
+// =============================================================================
+// The interface to the driver and the sockets
+// =============================================================================
+
+/// A refusal from the sink: it has no room. The stack counts the drop and
+/// goes on.
+public enum SinkError {
+    case Full,
+}
+
+/// What the stack hands up, besides the data that comes with it.
+public enum Delivery {
+    /// A UDP datagram for socket `id`, from `from`.
+    case Datagram(id: UInt8, from: SocketAddr),
+    /// An echo reply from `from`, to a request this stack sent.
+    case EchoReply(from: Ipv4Addr, ident: UInt16, sequence: UInt16),
+}
+
+@synthesize
+extension Delivery: Equatable {}
+
+/// Where the stack's output goes: the device, for frames, and the sockets,
+/// for what it delivers. Each call is one frame or one datagram; the bytes
+/// are lent for the call and the sink copies what it keeps.
+public trait Sink {
+    /// Takes `frame` to transmit, or answers `Full`.
+    func transmit(&var self, frame: &[UInt8]) -> Result<Void, SinkError>
+
+    /// Takes `data` to hand up as `delivery`, or answers `Full`.
+    func deliver(&var self, delivery: Delivery,
+                 data: &[UInt8]) -> Result<Void, SinkError>
+}
+
+/// Why a datagram or an echo request is not sent.
+public enum SendError {
+    /// The interface has no address yet.
+    case NotConfigured,
+    /// No socket has the id.
+    case NoSocket,
+    /// More data than one datagram carries.
+    case TooLong,
+    /// A destination this interface cannot send to: no address, a multicast
+    /// address, its own address, or port 0.
+    case BadAddress,
+    /// A destination off the subnet, and no gateway.
+    case NoRoute,
+    /// The next hop is unresolved and the pending queue is full.
+    case QueueFull,
+    /// The device had no room for the frame.
+    case LinkFull,
+}
+
+@synthesize
+extension SendError: Equatable {}
+
+extension SendError {
+    /// What a transcript should call this error.
+    public func describe(&self) -> String {
+        match self {
+            case NotConfigured -> "no address",
+            case NoSocket -> "no such socket",
+            case TooLong -> "too long",
+            case BadAddress -> "a destination it cannot send to",
+            case NoRoute -> "no route",
+            case QueueFull -> "the pending queue is full",
+            case LinkFull -> "the link is full",
+        }
+    }
+}
+
+extension SendError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+    }
+}
+
+extension SendError: Error {}
+
+extension Config {
+    /// Whether this interface can send to `dst`: not 0.0.0.0, not a multicast
+    /// group (there is no multicast), and not its own address (there is no
+    /// loopback). A broadcast is a destination.
+    func sends_to(&self, dst: Ipv4Addr) -> Bool {
+        not dst.is_unspecified() && not dst.is_multicast() && dst != self.addr()
+    }
+}
+
+/// Why a socket cannot be closed: no socket has the id.
+public enum CloseError {
+    case NotOpen,
+}
+
+@synthesize
+extension CloseError: Equatable {}
+
+/// A socket just opened: its id and the port it is bound to.
+public struct Opened {
+    public id: UInt8,
+    public port: UInt16,
+}
+
+@synthesize
+extension Opened: Equatable {}
+
+// =============================================================================
+// The stack
+// =============================================================================
+
+/// One interface's stack.
+public struct Stack {
+    private link_addr: MacAddr,
+    private settings: Config?,
+    private cache: arp.Cache,
+    private pending: arp.Pending,
+    private ports: udp.PortTable,
+    private unreachable: icmp.RateLimit,
+    // The identification of the next datagram sent.
+    private ident: UInt16,
+    private tally: Counters,
+}
+
+extension Stack {
+    /// A stack for the interface whose hardware address is `mac`, with no IPv4
+    /// address yet.
+    public init(mac: MacAddr) -> Stack {
+        Stack(link_addr: mac, settings: None, cache: arp.Cache.empty(),
+              pending: arp.Pending.empty(), ports: udp.PortTable.empty(),
+              unreachable: icmp.RateLimit.fresh(), ident: 0,
+              tally: Counters.zero())
+    }
+
+    /// The interface's hardware address.
+    public func mac(&self) -> MacAddr {
+        self.link_addr
+    }
+
+    /// The interface's configuration, or `None` before it has one.
+    public func config(&self) -> Config? {
+        self.settings
+    }
+
+    /// The drops counted for `reason`.
+    public func drops(&self, reason: Drop) -> UInt32 {
+        self.tally.drops(reason)
+    }
+
+    /// The value of `count`.
+    public func count(&self, count: Count) -> UInt32 {
+        self.tally.count(count)
+    }
+
+    /// Every count.
+    public func counters(&self) -> Counters {
+        self.tally
+    }
+
+    /// The hardware address `ip` resolves to at `now`, or `None` when the ARP
+    /// table has no live translation for it.
+    public func resolved(&self, ip: Ipv4Addr, now: UInt64) -> MacAddr? {
+        self.cache.lookup(ip, now)
+    }
+
+    /// How many frames wait on a resolution.
+    public func pending_frames(&self) -> Int {
+        self.pending.len()
+    }
+
+    /// Gives the interface `config`. A changed address is announced with a
+    /// gratuitous ARP request: sender and target are both the new address, so
+    /// every station that holds a translation for it updates it. The frames
+    /// waiting on a resolution then are dropped (`Drop.ArpReaddressed`): they
+    /// carry the old address as their source.
+    public func configure<S: Sink>(&var self, config: Config, sink: &var S) {
+        let changed = if let old = self.settings {
+            old.addr() != config.addr()
+        } else {
+            true
+        }
+        self.settings = config
+        if changed {
+            while self.pending.len() != 0 {
+                self.pending.remove(0)
+                self.tally.add_drop(Drop.ArpReaddressed)
+            }
+            self.send_arp(arp.ArpOp.Request, MacAddr.broadcast(),
+                          MacAddr.zero(), config.addr(), &var sink)
+        }
+    }
+
+    /// Takes a frame the device received at `now`. Whatever it calls for
+    /// (an ARP reply, an echo reply, a port unreachable, a datagram handed up,
+    /// frames that waited on the sender's address) goes to `sink` before this
+    /// returns.
+    public func receive<S: Sink>(&var self, frame: &[UInt8], now: UInt64,
+                                 sink: &var S) {
+        self.tally.add(Count.FramesReceived)
+        let n = frame.len()
+        if n > ether.MAX_FRAME_BYTES {
+            self.tally.add_drop(Drop.EtherOversize)
+            return
+        }
+        var copy: [UInt8; ether.MAX_FRAME_BYTES] = [0; ether.MAX_FRAME_BYTES]
+        put_bytes(&var copy, 0, &frame)
+        self.receive_copy(&copy[..n], now, &var sink)
+    }
+
+    /// Ages what waits on time at `now`: drops the frames whose next hop has
+    /// not answered within `arp.PENDING_TIMEOUT_MS`, and asks again for each
+    /// next hop not asked about for `arp.REQUEST_INTERVAL_MS`.
+    public func poll<S: Sink>(&var self, now: UInt64, sink: &var S) {
+        while let i = self.pending.first_expired(now) {
+            self.pending.remove(i)
+            self.tally.add_drop(Drop.ArpUnresolved)
+        }
+        while let hop = self.pending.request_due(now) {
+            self.pending.requested(hop, now)
+            self.request(hop, &var sink)
+        }
+    }
+
+    /// Opens a UDP socket bound to `port`, or to an ephemeral port for 0.
+    public func udp_open(&var self, port: UInt16) -> Result<Opened, BindError> {
+        let id = try self.ports.bind(port)
+        return Opened(id: id, port: self.ports.port_of(id)!)
+    }
+
+    /// Closes UDP socket `id`, freeing its port.
+    public func udp_close(&var self, id: UInt8) -> Result<Void, CloseError> {
+        if not self.ports.release(id) {
+            return CloseError.NotOpen
+        }
+        return
+    }
+
+    /// Sends `data` as one UDP datagram from socket `id` to `to`. A datagram
+    /// whose next hop is unresolved waits for it, and counts as sent.
+    public func udp_send<S: Sink>(&var self, id: UInt8, to: SocketAddr,
+                                  data: &[UInt8], now: UInt64,
+                                  sink: &var S) -> Result<Void, SendError> {
+        guard let cfg = self.settings else { return SendError.NotConfigured }
+        guard let port = self.ports.port_of(id) else {
+            return SendError.NoSocket
+        }
+        if data.len() > MAX_UDP_DATA {
+            return SendError.TooLong
+        }
+        if to.port == 0 || not cfg.sends_to(to.addr) {
+            return SendError.BadAddress
+        }
+        var frame: [UInt8; ether.MAX_FRAME_BYTES] = [0; ether.MAX_FRAME_BYTES]
+        put_bytes(&var frame, PAYLOAD_AT + udp.HEADER_BYTES, &data)
+        let n = udp.write_header(&var frame[PAYLOAD_AT..], cfg.addr(), to.addr,
+                                 port, to.port, data.len())
+        try self.send_ipv4(&var frame, to.addr, ipv4.Protocol.Udp, n, false,
+                           now, &var sink)
+        self.tally.add(Count.DatagramsSent)
+        return
+    }
+
+    /// Sends an echo request carrying `data` to `to`. Its reply is handed up
+    /// as `Delivery.EchoReply`.
+    public func ping<S: Sink>(&var self, to: Ipv4Addr, ident: UInt16,
+                              sequence: UInt16, data: &[UInt8], now: UInt64,
+                              sink: &var S) -> Result<Void, SendError> {
+        guard let cfg = self.settings else { return SendError.NotConfigured }
+        if data.len() > MAX_ECHO_DATA {
+            return SendError.TooLong
+        }
+        if not cfg.sends_to(to) {
+            return SendError.BadAddress
+        }
+        try self.send_echo(icmp.IcmpType.EchoRequest, to, ident, sequence,
+                           &data, false, now, &var sink)
+        self.tally.add(Count.EchoRequestsSent)
+        return
+    }
+
+    // -------------------------------------------------------------------------
+    // Receiving
+    // -------------------------------------------------------------------------
+
+    func receive_copy<S: Sink>(&var self, frame: &[UInt8], now: UInt64,
+                               sink: &var S) {
+        let header = try ether.Header(frame: &frame) catch {
+            self.tally.add_drop(error)
+            return
+        }
+        try ether.admit(header.dst, self.link_addr) catch {
+            self.tally.add_drop(error)
+            return
+        }
+        guard let kind = ether.EtherType.from(raw: header.ether_type) else {
+            self.tally.add_drop(Drop.EtherType)
+            return
+        }
+        match kind {
+            case Arp -> self.receive_arp(&frame[ether.HEADER_BYTES..], now,
+                                         &var sink),
+            case Ipv4 -> self.receive_ipv4(&frame[ether.HEADER_BYTES..],
+                                           header.dst.is_broadcast(), now,
+                                           &var sink),
+        }
+    }
+
+    /// RFC 826, "Packet Reception", for a station whose one protocol address
+    /// is the interface's.
+    func receive_arp<S: Sink>(&var self, packet: &[UInt8], now: UInt64,
+                              sink: &var S) {
+        let p = try arp.Packet(bytes: &packet) catch {
+            self.tally.add_drop(error)
+            return
+        }
+        if p.sender_mac.is_multicast() {
+            self.tally.add_drop(Drop.ArpBadSender)
+            return
+        }
+        let ours = self.address()
+        if not ours.is_unspecified() && p.sender_ip == ours {
+            self.tally.add_drop(Drop.ArpConflict)
+            return
+        }
+        // A sender of 0.0.0.0 is probing for an address it does not hold yet
+        // (RFC 5227): it is answered, and never entered in the table.
+        // A request or reply for us adds its sender; any other only updates a
+        // sender already known.
+        let for_us = not ours.is_unspecified() && p.target_ip == ours
+        let learned = if p.sender_ip.is_unspecified() {
+            false
+        } else if for_us {
+            self.cache.insert(p.sender_ip, p.sender_mac, now)
+            true
+        } else {
+            self.cache.merge(p.sender_ip, p.sender_mac, now)
+        }
+        if learned {
+            self.flush(p.sender_ip, p.sender_mac, &var sink)
+        }
+        if for_us && p.op == arp.ArpOp.Request {
+            self.send_arp(arp.ArpOp.Reply, p.sender_mac, p.sender_mac,
+                          p.sender_ip, &var sink)
+        }
+    }
+
+    func receive_ipv4<S: Sink>(&var self, packet: &[UInt8],
+                               link_broadcast: Bool, now: UInt64,
+                               sink: &var S) {
+        let header = try ipv4.Header(packet: &packet) catch {
+            self.tally.add_drop(error)
+            return
+        }
+        guard let cfg = self.settings else {
+            self.tally.add_drop(Drop.IpNotOurs)
+            return
+        }
+        let broadcast = cfg.is_broadcast(header.dst)
+        if header.dst != cfg.addr() && not broadcast {
+            self.tally.add_drop(Drop.IpNotOurs)
+            return
+        }
+        // RFC 1122 §3.2.1.3: a broadcast or multicast source is discarded. So
+        // is our own address: there is no loopback, so a datagram that names
+        // it came off the link from a station claiming to be us, and nothing
+        // is answered to it.
+        if cfg.is_broadcast(header.src) || header.src.is_multicast() ||
+           header.src == cfg.addr() {
+            self.tally.add_drop(Drop.IpBadSource)
+            return
+        }
+        guard let protocol = ipv4.Protocol.from(raw: header.protocol) else {
+            self.tally.add_drop(Drop.IpProtocol)
+            return
+        }
+        // RFC 1122 §3.2.2 and §3.2.2.6: what a broadcast asked for, at either
+        // layer, is not answered.
+        let any_broadcast = broadcast || link_broadcast
+        match protocol {
+            case Icmp -> self.receive_icmp(&packet[..header.total()], header,
+                                           any_broadcast, now, &var sink),
+            case Udp -> self.receive_udp(&packet[..header.total()], header,
+                                         any_broadcast, now, &var sink),
+        }
+    }
+
+    func receive_icmp<S: Sink>(&var self, datagram: &[UInt8], ip: ipv4.Header,
+                               broadcast: Bool, now: UInt64, sink: &var S) {
+        let message = ip.header_bytes()
+        let header = try icmp.Header(message: &datagram[message..]) catch {
+            self.tally.add_drop(error)
+            return
+        }
+        guard let kind = icmp.IcmpType.from(raw: header.kind) else {
+            self.tally.add_drop(Drop.IcmpUnhandled)
+            return
+        }
+        let data_at = ip.header_bytes() + icmp.HEADER_BYTES
+        match kind {
+            case EchoRequest -> {
+                if broadcast {
+                    self.tally.add_drop(Drop.IcmpBroadcastEcho)
+                    return
+                }
+                if ip.src.is_unspecified() {
+                    self.tally.add_drop(Drop.IcmpNoSource)
+                    return
+                }
+                // A reply that cannot go was counted by its reason.
+                try self.send_echo(icmp.IcmpType.EchoReply, ip.src,
+                                   header.ident, header.sequence,
+                                   &datagram[data_at..], true, now,
+                                   &var sink) catch { return }
+                self.tally.add(Count.EchoRepliesSent)
+            },
+            case EchoReply -> {
+                let delivery = Delivery.EchoReply(from: ip.src,
+                                                  ident: header.ident,
+                                                  sequence: header.sequence)
+                try sink.deliver(delivery, &datagram[data_at..]) catch {
+                    self.tally.add_drop(Drop.DeliverFull)
+                    return
+                }
+                self.tally.add(Count.EchoRepliesReceived)
+            },
+            case Unreachable -> self.tally.add_drop(Drop.IcmpUnhandled),
+        }
+    }
+
+    func receive_udp<S: Sink>(&var self, datagram: &[UInt8], ip: ipv4.Header,
+                              broadcast: Bool, now: UInt64, sink: &var S) {
+        let header = try udp.Header(datagram: &datagram[ip.header_bytes()..],
+                                    src: ip.src, dst: ip.dst) catch {
+            self.tally.add_drop(error)
+            return
+        }
+        guard let id = self.ports.lookup(header.dst_port) else {
+            self.tally.add_drop(Drop.UdpNoPort)
+            // RFC 1122 §3.2.2: no ICMP error answers a datagram sent to a
+            // broadcast, or one whose source names no single host.
+            if not broadcast && not ip.src.is_unspecified() {
+                let quoted = ip.header_bytes() + icmp.QUOTED_DATA_BYTES
+                self.port_unreachable(&datagram[..quoted], ip.src, now,
+                                      &var sink)
+            }
+            return
+        }
+        let from = SocketAddr(addr: ip.src, port: header.src_port)
+        let delivery = Delivery.Datagram(id: id, from: from)
+        let first = ip.header_bytes() + udp.HEADER_BYTES
+        let end = ip.header_bytes() + header.length()
+        try sink.deliver(delivery, &datagram[first..end]) catch {
+            self.tally.add_drop(Drop.DeliverFull)
+            return
+        }
+        self.tally.add(Count.DatagramsDelivered)
+    }
+
+    // -------------------------------------------------------------------------
+    // Sending
+    // -------------------------------------------------------------------------
+
+    /// Answers a datagram to a closed port with a port unreachable quoting
+    /// `quote`, its IP header and first data bytes, unless the rate limit
+    /// holds it back. Only one that goes out, or waits on a resolution,
+    /// spends the limit; one that cannot was counted by its reason.
+    func port_unreachable<S: Sink>(&var self, quote: &[UInt8], to: Ipv4Addr,
+                                   now: UInt64, sink: &var S) {
+        if not self.unreachable.ready(now) {
+            self.tally.add_drop(Drop.IcmpRateLimited)
+            return
+        }
+        var frame: [UInt8; ether.MAX_FRAME_BYTES] = [0; ether.MAX_FRAME_BYTES]
+        let n = icmp.write_unreachable(&var frame[PAYLOAD_AT..],
+                                       icmp.CODE_PORT_UNREACHABLE, &quote)
+        try self.send_ipv4(&var frame, to, ipv4.Protocol.Icmp, n, true, now,
+                           &var sink) catch { return }
+        self.unreachable.spend(now)
+        self.tally.add(Count.UnreachablesSent)
+    }
+
+    func send_echo<S: Sink>(&var self, kind: icmp.IcmpType, to: Ipv4Addr,
+                            ident: UInt16, sequence: UInt16, data: &[UInt8],
+                            reply: Bool, now: UInt64,
+                            sink: &var S) -> Result<Void, SendError> {
+        var frame: [UInt8; ether.MAX_FRAME_BYTES] = [0; ether.MAX_FRAME_BYTES]
+        let n = icmp.write_echo(&var frame[PAYLOAD_AT..], kind, ident, sequence,
+                                &data)
+        self.send_ipv4(&var frame, to, ipv4.Protocol.Icmp, n, reply, now,
+                       &var sink)
+    }
+
+    /// Sends the datagram whose IPv4 payload of `payload_bytes` is in place in
+    /// `frame`: writes the IPv4 and Ethernet headers, and transmits it to its
+    /// next hop's address, or queues it while that address is resolved. A
+    /// `reply` answers a received frame. Whatever stops the datagram is
+    /// counted here, by its reason, as well as answered.
+    func send_ipv4<S: Sink>(&var self, frame: &var [UInt8], dst: Ipv4Addr,
+                            protocol: ipv4.Protocol, payload_bytes: Int,
+                            reply: Bool, now: UInt64,
+                            sink: &var S) -> Result<Void, SendError> {
+        guard let cfg = self.settings else { return SendError.NotConfigured }
+        let broadcast = cfg.is_broadcast(dst)
+        // A broadcast goes to every station and has no next hop to resolve.
+        var hop = dst
+        if not broadcast {
+            guard let next = cfg.next_hop(dst) else {
+                self.tally.add_drop(Drop.IpNoRoute)
+                return SendError.NoRoute
+            }
+            hop = next
+        }
+        let ident = self.next_ident()
+        ipv4.write_header(&var frame[ether.HEADER_BYTES..], cfg.addr(), dst,
+                          protocol, ident, ipv4.DEFAULT_TTL, payload_bytes)
+        let header = ether.Header(dst: MacAddr.broadcast(), src: self.link_addr,
+                                  ether_type: ether.EtherType.Ipv4 as UInt16)
+        header.write(&var frame)
+        let len = ether.padded(PAYLOAD_AT + payload_bytes)
+        if broadcast {
+            return self.transmit(&frame[..len], &var sink)
+        }
+        if let mac = self.cache.lookup(hop, now) {
+            mac.write(&var frame, 0)
+            return self.transmit(&frame[..len], &var sink)
+        }
+        self.queue(hop, &frame[..len], reply, now, &var sink)
+    }
+
+    /// Queues `frame` until `hop` is resolved, asking for it unless a request
+    /// went out less than `arp.REQUEST_INTERVAL_MS` ago. A `reply` may not
+    /// take the queue past `arp.REPLY_FRAMES`.
+    func queue<S: Sink>(&var self, hop: Ipv4Addr, frame: &[UInt8], reply: Bool,
+                        now: UInt64, sink: &var S) -> Result<Void, SendError> {
+        if reply && self.pending.len() >= arp.REPLY_FRAMES {
+            self.tally.add_drop(Drop.ArpQueueFull)
+            return SendError.QueueFull
+        }
+        let asked = self.pending.requested_at(hop)
+        let due = if let at = asked {
+            elapsed(now, at) >= arp.REQUEST_INTERVAL_MS
+        } else {
+            true
+        }
+        let requested_at = if due { now } else { asked ?? now }
+        try self.pending.push(hop, &frame, now, requested_at) catch {
+            self.tally.add_drop(error)
+            return SendError.QueueFull
+        }
+        if due {
+            self.pending.requested(hop, now)
+            self.request(hop, &var sink)
+        }
+        return
+    }
+
+    /// Transmits the frames waiting on `hop`, now that it is `mac`, oldest
+    /// first.
+    func flush<S: Sink>(&var self, hop: Ipv4Addr, mac: MacAddr, sink: &var S) {
+        var frame: [UInt8; ether.MAX_FRAME_BYTES] = [0; ether.MAX_FRAME_BYTES]
+        while let i = self.pending.first_for(hop) {
+            let n = self.pending.copy_out(i, &var frame)
+            self.pending.remove(i)
+            mac.write(&var frame, 0)
+            let _ = self.transmit(&frame[..n], &var sink)
+        }
+    }
+
+    /// Broadcasts a request for `ip`'s hardware address.
+    func request<S: Sink>(&var self, ip: Ipv4Addr, sink: &var S) {
+        self.send_arp(arp.ArpOp.Request, MacAddr.broadcast(), MacAddr.zero(),
+                      ip, &var sink)
+    }
+
+    /// Sends an ARP packet of `op` from this station to `eth_dst`, naming
+    /// `target_mac` and `target_ip` as its target.
+    func send_arp<S: Sink>(&var self, op: arp.ArpOp, eth_dst: MacAddr,
+                           target_mac: MacAddr, target_ip: Ipv4Addr,
+                           sink: &var S) {
+        let ours = self.address()
+        var frame: [UInt8; ether.MIN_FRAME_BYTES] = [0; ether.MIN_FRAME_BYTES]
+        let header = ether.Header(dst: eth_dst, src: self.link_addr,
+                                  ether_type: ether.EtherType.Arp as UInt16)
+        header.write(&var frame)
+        let packet = arp.Packet(op: op, sender_mac: self.link_addr,
+                                sender_ip: ours, target_mac: target_mac,
+                                target_ip: target_ip)
+        packet.write(&var frame[ether.HEADER_BYTES..])
+        try self.transmit(&frame, &var sink) catch { return }
+        self.tally.add(if op == arp.ArpOp.Request {
+            Count.ArpRequestsSent
+        } else {
+            Count.ArpRepliesSent
+        })
+    }
+
+    /// Hands `frame` to the device, counting it sent or dropped.
+    func transmit<S: Sink>(&var self, frame: &[UInt8],
+                           sink: &var S) -> Result<Void, SendError> {
+        try sink.transmit(&frame) catch {
+            self.tally.add_drop(Drop.TxFull)
+            return SendError.LinkFull
+        }
+        self.tally.add(Count.FramesSent)
+        return
+    }
+
+    /// The interface's address, or 0.0.0.0 before it has one.
+    func address(&self) -> Ipv4Addr {
+        if let cfg = self.settings {
+            cfg.addr()
+        } else {
+            Ipv4Addr.unspecified()
+        }
+    }
+
+    func next_ident(&var self) -> UInt16 {
+        let ident = self.ident
+        self.ident = if ident == 0xFFFF { 0 } else { ident + 1 }
+        ident
+    }
+}

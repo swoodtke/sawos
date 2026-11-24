@@ -64,7 +64,9 @@ drivers/           # userspace device drivers and the protocol packages their
                    # accessors; netdevproto/ (frames), hciproto/ (H4
                    # packets) and sockproto/ (sockets) are the protocols
                    # that carry their bulk data in one, wlanproto/ the radio's
-                   # join control
+                   # join control; netstack/ is the TCP/IP stack's first
+                   # layer (Ethernet, ARP, IPv4, ICMP, UDP) over byte
+                   # buffers, with no device and no clock of its own
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 rt/main/           # `sosmain`: the `_start` of a program written with `main`
@@ -139,8 +141,8 @@ and image description in the tree read clean) and the hosted packages'
 (`HOSTED_TESTS`: `drivers/esp32s3io/`, `drivers/gpioproto/`,
 `drivers/pwmproto/`, `drivers/uartproto/`, `drivers/consolecore/`,
 `drivers/pktring/`, `drivers/netdevproto/`, `drivers/hciproto/`,
-`drivers/wlanproto/`, `drivers/sockproto/` and `rt/common/`, the
-runtime's heap), which need no emulator and print nothing
+`drivers/wlanproto/`, `drivers/sockproto/`, `drivers/netstack/` and
+`rt/common/`, the runtime's heap), which need no emulator and print nothing
 when they pass. Per profile it writes a profile description (JSON) and calls
 `sosimage native`, then `sosimage board` on the profile's
 `hal/<profile>/board.toml`,
