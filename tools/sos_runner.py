@@ -71,6 +71,7 @@ path), `_run_qemu`'s own stdin, and `main`'s eager `tc()`.
 import argparse
 import ast
 import concurrent.futures
+import glob
 import json
 import os
 import re
@@ -9579,12 +9580,16 @@ TEST_CASES = [
         # and the machine stops when every child has ended. The server serves
         # until its last client's end is gone, which it is only once root has
         # let go of its own inlet. With no tick, a process runs until it blocks,
-        # so the interleaving is the scheduler's order and nothing else.
+        # so the interleaving is the scheduler's order and nothing else. Root
+        # is written with `main` on the root stack, under which its start-up
+        # stays for its life, so the row holds that start-up to the boot set's
+        # bound and prints its frame (`startup_frame`).
         "name": "stock_root",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "image_file": {"riscv32": "stock_root.toml",
                        "riscv32-flat": "stock_root_flat.toml",
                        "arm64": "stock_root_arm64.toml"},
+        "startup_frame": True,
         "expect_out": ["{banner}",
                        lambda arch: (
                            # Eight rows: three image blobs, three
@@ -13199,10 +13204,16 @@ TEST_CASES = [
         #
         # This image arms no tick, so root parks in each wait and the death,
         # or the child's signal, brings it back.
+        #
+        # The child's start-up is held to the boot set's bound from its image
+        # before it boots (`startup_frame`, `_check_startup_frame`): `entry`
+        # runs `_start`'s frame on a thread stack of `STACK_WORDS`, and the
+        # frame is printed under the row.
         "name": "main_start",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": MAIN_START_PKG,
         "children": [CHILD_MAIN_PKG],
+        "startup_frame": True,
         "expect_out": [
             "{banner}",
             "SOS: boot regions={two}",
@@ -14926,11 +14937,10 @@ def _fp_instructions(disassembly):
             yield symbol, line.strip()
 
 
-def _check_kernel_fp_free(elf, clang):
-    """Fail the build if the kernel's text executes FP/SIMD outside the two
-    user-state routines. The kernel is free of them so that a trap never
-    disturbs a thread's vector registers; see `hal/arm64/kernel/boot.S`.
-    """
+def _disassemble(elf, clang, what):
+    """`elf`'s disassembly, by the llvm-objdump that goes with `clang`;
+    `what` names the check that needs it, for the refusal when there is
+    none."""
     # Where `_find_clang` looks for an LLVM, in the same order: beside the
     # clang in use, on PATH, then the Homebrew prefixes (Apple's clang ships
     # without one).
@@ -14943,19 +14953,185 @@ def _check_kernel_fp_free(elf, clang):
         if objdump:
             break
     if not objdump:
-        raise ToolError("the arm64 kernel's FP-free check needs llvm-objdump "
-                        "(next to clang, on PATH, or in the Homebrew llvm)")
+        raise ToolError(f"{what} needs llvm-objdump (next to clang, on PATH, "
+                        "or in the Homebrew llvm)")
     result = subprocess.run([objdump, "-d", "--no-show-raw-insn", elf],
                             capture_output=True, text=True)
     if result.returncode != 0:
         raise ToolError(f"llvm-objdump failed on {elf}: {result.stderr}")
-    bad = [(sym, line) for sym, line in _fp_instructions(result.stdout)
+    return result.stdout
+
+
+def _check_kernel_fp_free(elf, clang):
+    """Fail the build if the kernel's text executes FP/SIMD outside the two
+    user-state routines. The kernel is free of them so that a trap never
+    disturbs a thread's vector registers; see `hal/arm64/kernel/boot.S`.
+    """
+    disassembly = _disassemble(elf, clang, "the arm64 kernel's FP-free check")
+    bad = [(sym, line) for sym, line in _fp_instructions(disassembly)
            if sym not in FP_ALLOWED_SYMBOLS]
     if bad:
         shown = "\n".join(f"  in {sym}: {line}" for sym, line in bad[:8])
         raise ToolError(f"{os.path.basename(elf)}: the kernel executes "
                         f"FP/SIMD instructions outside "
                         f"{', '.join(FP_ALLOWED_SYMBOLS)}:\n{shown}")
+
+
+# The start-up of a program written with `main` (`rt/main`), from its image:
+# `_start`'s frame stays on the main thread's stack for the process's whole
+# life, under everything `main` does, so it must hold no copy of the boot
+# set, whose records are a few words per record of `BOOT_SET_CAPACITY`. The
+# start-up drains the set into a static in place (`BootSet.drain_into`) and
+# adopts the boot word in a call of its own (`sos_main_adopt`), so `_start`
+# keeps a thread block and a few words; a copy of the set in it makes it at
+# least one set long.
+BOOT_SET_CAPACITY_SOURCE = os.path.join(KERNEL_DIR, "abi", "src", "boot.saw")
+
+# The symbol prefix of `sosmain`'s functions, which a program written with
+# `main` links and no other program does.
+SOSMAIN_SYMBOLS = "saw sosmain."
+
+# A function's first line, whose name may hold `<` and `>` of its own, and an
+# instruction.
+_FRAME_SYMBOL = re.compile(r"^[0-9a-f]+ <(.+)>:$")
+_FRAME_INSN = re.compile(r"^\s*[0-9a-f]+:\s+(\S+)\s*(.*)$")
+
+
+def _number(text):
+    """An immediate as objdump prints one: decimal or hex, `#` and sign."""
+    text = text.strip().lstrip("#")
+    sign = -1 if text.startswith("-") else 1
+    text = text.lstrip("-")
+    return sign * int(text, 16 if text.startswith("0x") else 10)
+
+
+def _function_frames(disassembly, sp):
+    """Each function's stack frame in bytes, from its disassembly: the
+    deepest `sp`, the stack pointer's name, goes below its value at entry,
+    following the function's instructions in address order. `sp` moves by
+    an immediate (`addi`, `addmi`, `add`/`sub`, an arm64 pre- or
+    post-indexed pair), by a register a constant was loaded into (`li`,
+    `lui`, `movi`, then `sub`), or by a move into `sp` of a register that
+    holds `sp` plus a constant (Xtensa's `add.n a8, a1, a8; mov.n a1, a8`)."""
+    frames = {}
+    name = None
+    for line in disassembly.splitlines():
+        m = _FRAME_SYMBOL.match(line)
+        if m:
+            name = m.group(1)
+            frames[name] = 0
+            depth = 0
+            consts, off_sp = {}, {}
+            continue
+        m = _FRAME_INSN.match(line) if name is not None else None
+        if not m or _DISASM_DATA.match(line):
+            continue
+        op, args = m.group(1), m.group(2)
+        ops = [a.strip() for a in
+               re.sub(r"<[^>]*>|//.*", "", args).split(",")]
+        dest = ops[0]
+        moved = None
+        try:
+            if op in ("li", "movi", "movi.n", "mov", "mov.n", "mv") \
+                    and len(ops) == 2:
+                consts.pop(dest, None)
+                if dest == sp and ops[1] in off_sp:
+                    moved = off_sp[ops[1]]
+                off_sp.pop(dest, None)
+                if dest != sp:
+                    consts[dest] = _number(ops[1])
+            elif op == "lui" and len(ops) == 2:
+                consts[dest] = _number(ops[1]) << 12
+            elif op in ("addi", "addi.n", "addmi") and len(ops) == 3:
+                if dest == ops[1] == sp:
+                    moved = _number(ops[2])
+                elif ops[1] == sp:
+                    off_sp[dest] = _number(ops[2])
+                elif dest == ops[1] and dest in consts:
+                    consts[dest] += _number(ops[2])
+            elif op in ("add", "add.n", "sub") and len(ops) >= 3 \
+                    and ops[1] == sp:
+                sign = -1 if op == "sub" else 1
+                amount = None
+                if ops[2].startswith("#"):
+                    shift = (_number(ops[3].split()[-1])
+                             if len(ops) == 4 and "lsl" in ops[3] else 0)
+                    amount = sign * (_number(ops[2]) << shift)
+                elif ops[2] in consts:
+                    amount = sign * consts[ops[2]]
+                if amount is not None and dest == sp:
+                    moved = amount
+                elif amount is not None:
+                    off_sp[dest] = amount
+            elif op in ("stp", "str") and args.rstrip().endswith("]!") \
+                    and f"[{sp}, #-" in args:
+                moved = _number(
+                    re.search(r"\[\w+, (#-[0-9a-fx]+)\]!", args).group(1))
+            elif op in ("ldp", "ldr") and re.search(
+                    rf"\[{sp}\], #[0-9a-fx]+$", args.strip()):
+                moved = _number(args.strip().rsplit("#", 1)[1])
+        except ValueError:
+            pass
+        if moved is not None:
+            depth = max(depth - moved, 0)
+            frames[name] = max(frames[name], depth)
+    return frames
+
+
+def _boot_set_bytes(arch):
+    """One `BootSet`'s bytes on `arch`: three words a record, at
+    `BOOT_SET_CAPACITY` records, and its count."""
+    with open(BOOT_SET_CAPACITY_SOURCE) as f:
+        found = re.search(r"^public static BOOT_SET_CAPACITY: Int = (\d+)$",
+                          f.read(), re.M)
+    if not found:
+        raise ToolError(f"{BOOT_SET_CAPACITY_SOURCE} states no "
+                        "BOOT_SET_CAPACITY")
+    word = 4 if arch["hex_width"] == 8 else 8
+    return (3 * int(found.group(1)) + 1) * word
+
+
+def _check_startup_frame(elf, arch, clang):
+    """Hold the start-up of the program `elf` to the boot set's bound:
+    `_start`'s frame is shorter than one boot set. Returns the line the
+    report prints, the frame and the bound; or None for a program that is not
+    written with `main`, which links none of `sosmain`'s functions."""
+    frames = _function_frames(
+        _disassemble(elf, clang, "the start-up's frame check"),
+        "a1" if "xtensa" in arch["triple"] else "sp")
+    if "_start" not in frames or not any(
+            f.startswith(SOSMAIN_SYMBOLS) for f in frames):
+        return None
+    program = os.path.basename(elf)
+    frame, bound = frames["_start"], _boot_set_bytes(arch)
+    if frame >= bound:
+        raise ToolError(f"{program}: _start's frame is {frame} bytes, at "
+                        f"least one boot set's {bound}, which stays under "
+                        "`main` for the process's life: a copy of the set, "
+                        "or the start-up's own work, in `_start`")
+    return f"{program}: _start's frame {frame} bytes, one boot set {bound}"
+
+
+def _startup_frame_lines(case, arch, build_dir, clang):
+    """`_check_startup_frame` on every process of a case that says
+    `startup_frame`, built from its packages or from its `image_file` into
+    `build_dir`: the lines the report prints under the case's row, one for
+    each program written with `main`. A case none of whose processes is one
+    is refused, since the check would hold nothing."""
+    if case.get("image_file"):
+        elfs = sorted(glob.glob(os.path.join(build_dir, "images",
+                                             case["name"], "*", "*.elf")))
+    else:
+        elfs = []
+        for pkg, role in _case_processes(case):
+            elfs += sorted(glob.glob(os.path.join(
+                pkg, ".build", arch["triple"], role, "*.elf")))
+    lines = [line for line in (_check_startup_frame(elf, arch, clang)
+                               for elf in elfs) if line is not None]
+    if not lines:
+        raise ToolError(f"{case['name']} asks for the start-up's frames, and "
+                        "none of its processes is written with `main`")
+    return lines
 
 
 # =============================================================================
@@ -15873,6 +16049,10 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
                 _link_image(builder, profile, case, arch, elf)
                 if arch.get("kernel_fp_free"):
                     _check_kernel_fp_free(elf, clang)
+            frames = []
+            if case.get("startup_frame"):
+                frames = [f"    {line}" for line in _startup_frame_lines(
+                    case, arch, dirs["build"], clang)]
         except ToolError as e:
             # A case that asserts the build's refusal passes on it, and only
             # on it: its text must be in what the build said.
@@ -15889,8 +16069,8 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
                                            case.get("stdin_at_once", False))
         ok, reason = _check(case, arch, status, out, timed_out)
         if ok:
-            return True, f"{CHECK} {name}", []
-        return False, f"{CROSS} {name}  ({reason})", []
+            return True, f"{CHECK} {name}", frames
+        return False, f"{CROSS} {name}  ({reason})", frames
 
     # The excluded cases, by name, with the reason. Printed here rather than
     # folded into the numbered rows because these cases did not run and did not
@@ -19284,9 +19464,12 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             # alarm word (61450, as on the gate's boards), a connection, a
             # pool, a declared `Waiter` row, and the timer group given whole
             # to its one taker. The machine stops when every child has ended.
+            # Root's start-up is held to the boot set's bound, as on the gate
+            # (`startup_frame`).
             "name": "stock_root",
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "image_file": {arch["name"]: "stock_root_s3.toml"},
+            "startup_frame": True,
             "expect_out": ["{banner}",
                            # Eight rows: three image blobs, three
                            # destinations, the timer group, the pool.
@@ -20410,6 +20593,11 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             flash, size, _end = build_flash(
                 case, board=bool(case.get("board_image")),
                 check=not case.get("loader_fixture"))
+            frames = []
+            if case.get("startup_frame"):
+                frames = _startup_frame_lines(
+                    case, arch, arch_dirs(variant_arch(variant(case)))["build"],
+                    clang)
             if case.get("expect_build_error"):
                 print(f"[{i}/{len(cases)}] {CROSS} {name}")
                 print(f"    the build succeeded; it must refuse: "
@@ -20523,6 +20711,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         if ok:
             print(f"[{i}/{len(cases)}] {CHECK} {name}  "
                   f"({size} bytes of flash)")
+            for line in frames:
+                print(f"    {line}")
             continue
         failed += 1
         # `_check`'s reason quotes the whole console; the console is printed

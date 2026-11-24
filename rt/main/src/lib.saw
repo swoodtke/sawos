@@ -32,7 +32,11 @@
 //! the kernel's debug print when its System holds `Debug`, and prints nothing
 //! otherwise.
 //!
-//! The start-up allocates nothing, so a program with no heap starts.
+//! The start-up allocates nothing, so a program with no heap starts. Its
+//! frame stays on the main thread's stack under `main` for the process's
+//! life, so it keeps the boot set out of it: the drain builds the set in a
+//! static (`SET_STORE`), and `take_boot_set()` moves it from there to `main`,
+//! the one copy of its records any frame holds.
 //!
 //! Every way the start-up cannot go on is a panic naming the cause, which
 //! ends the process as `Faulted` with the reason `Panic` and the text on the
@@ -47,7 +51,7 @@
 
 import sos.{System, Process, BootSet, SosStatus, HandleInfo, HandleKind,
             SystemRight, ProcessRight, ThreadRight, PIPE_BODY_BYTES,
-            sos_handle_info}
+            BOOT_SET_STORAGE_WORDS, sos_handle_info}
 import sos.rt.{ThreadBlock, enter_thread_block, adopt_console, console_sync}
 import sosrt.{LINE_CHUNK}
 import bootplan.{CONSOLE_TAG}
@@ -77,9 +81,20 @@ static STARTED: Atomic<Int> = Atomic(0)
 /// before.
 unsafe static var BOOT_AT: UInt = 0
 
+/// The boot set's storage. The start-up drains the set into it in place
+/// (`BootSet.drain_into`), and `take_boot_set` moves it out to `main`. It is
+/// words rather than a `BootSet`, because a static's type must be trivially
+/// destructible and a set has a `deinit`.
+///
+/// It holds a set from the drain until `main` takes it, in a process started
+/// with a System (`Boot.system`); a set `main` never takes is released when
+/// the process ends.
+unsafe static var SET_STORE: [UInt; BOOT_SET_STORAGE_WORDS] = (
+    [0; BOOT_SET_STORAGE_WORDS])
+
 /// What the start-up keeps for `main`: the process's System and Process,
 /// absent when it was started with no tag, the Process handle's rights, and
-/// the boot set until `main` takes it.
+/// whether `main` has taken the boot set, which lives in `SET_STORE`.
 ///
 /// It lives in `_start`'s frame, which outlives `main` because `main` runs
 /// inside `_start`'s call, and is reached through its parked address
@@ -89,7 +104,6 @@ struct Boot {
     system: System?
     process: Process?
     process_rights: UInt32
-    set: BootSet?
     /// 0 until the boot set is taken, then 1: the take is one
     /// compare-and-swap, so of two threads that race only one moves it out.
     taken: Atomic<Int>
@@ -101,9 +115,10 @@ extension Boot: NoCopy {}
 /// the boot word: the handle under the tag the launcher started it with, or no
 /// handle.
 ///
-/// The start-up's frame holds the main thread's block and the boot context
-/// for the rest of the process's life, and it never returns: it ends the
-/// process through the Process exit op with `main`'s status, or panics.
+/// The start-up's frame holds the main thread's block and the boot context,
+/// but not the boot set, for the rest of the process's life, and it never
+/// returns: it ends the process through the Process exit op with `main`'s
+/// status, or panics.
 @export("_start")
 func _start(boot: UInt) unsafe -> Never {
     // A thread made at the image entry runs this again, where it would adopt
@@ -116,11 +131,11 @@ func _start(boot: UInt) unsafe -> Never {
     var block = ThreadBlock()
     enter_thread_block((&var block) as UnsafePointer<ThreadBlock>)
 
-    var start = if boot == NO_WORD {
-        Boot(system: None, process: None, process_rights: 0, set: None,
-             taken: Atomic(0))
-    } else {
-        adopt(boot, &var block)
+    var start = Boot(system: None, process: None, process_rights: 0,
+                     taken: Atomic(0))
+    if boot != NO_WORD {
+        adopt(boot, (&var block) as UnsafePointer<ThreadBlock>,
+              (&var start) as UnsafePointer<Boot>)
     }
     BOOT_AT = ((&var start) as UnsafePointer<Boot>) as UInt
 
@@ -131,9 +146,18 @@ func _start(boot: UInt) unsafe -> Never {
 }
 
 /// Adopt `boot` as the process's System, derive its Process and the main
-/// thread's own Thread handle, keeping the last in `block`, and drain the boot
-/// set. Each refusal panics, naming it.
-func adopt(boot: UInt, block: &var ThreadBlock) unsafe -> Boot {
+/// thread's own Thread handle, keeping the last in `block`, drain the boot
+/// set, and write what `main` reads over the empty `Boot` at `start`. Each
+/// refusal panics, naming it.
+///
+/// It is exported so that the compiler keeps it a call of its own rather than
+/// inlining it into `_start`, its one caller: its frame, with the text
+/// buffers of its panics, is then gone once it returns, where in `_start`'s it
+/// would stay under `main` for the process's life. The runner holds
+/// `_start`'s frame to that from the image (`startup_frame`).
+@export("sos_main_adopt")
+func adopt(boot: UInt, block: UnsafePointer<ThreadBlock>,
+           start: UnsafePointer<Boot>) unsafe {
     let kind = kind_of(boot)
     if kind != (HandleKind.System as UInt) {
         panic("sos: the boot word names {}, not a System", kind_name(kind))
@@ -168,16 +192,25 @@ func adopt(boot: UInt, block: &var ThreadBlock) unsafe -> Boot {
     if (thread_rights & (ThreadRight.Control as UInt32)) == 0 {
         panic("sos: a main program's thread handle needs Control")
     }
-    block.keep(move thread)
+    block[0].keep(move thread)
     if (rights & (ProcessRight.BootHandles as UInt32)) == 0 {
         panic("sos: the Process handle lacks BootHandles")
     }
-    var set = try BootSet(process: &process) catch {
+    let set = set_at()
+    try BootSet.drain_into(at: set, process: &process) catch {
         panic("sos: the boot set's drain answered {}", error)
     }
-    take_console(&var set)
-    Boot(system: move system, process: move process, process_rights: rights,
-         set: move set, taken: Atomic(0))
+    take_console(&var set[0])
+    // `start` holds an empty `Boot`, which owns nothing, so the write
+    // replaces it without a drop.
+    start[0] = Boot(system: move system, process: move process,
+                    process_rights: rights, taken: Atomic(0))
+}
+
+/// The boot set's storage, `SET_STORE`, as the set it holds.
+func set_at() unsafe -> UnsafePointer<BootSet> {
+    let words = (&var SET_STORE[0]) as UnsafePointer<UInt>
+    (words as UInt) as UnsafePointer<BootSet>
 }
 
 /// Give the console record, when the set holds one, to `print`'s writer,
@@ -327,10 +360,8 @@ func take_set(at: UInt) unsafe -> BootSet {
     if not boot[0].taken.compare_exchange(0, 1) {
         panic("sos: the boot set was taken already")
     }
-    guard let set = boot[0].set.take() else {
-        panic("sos: the boot set is missing")
-    }
-    move set
+    let set = set_at()
+    move set[0]
 }
 
 /// Make every line printed so far reach the console before what follows.

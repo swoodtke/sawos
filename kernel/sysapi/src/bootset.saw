@@ -12,6 +12,11 @@
 //! `BOOT_SET_CAPACITY` (`kcore.limits`). The set keeps each record as the
 //! kernel wrote it, its three words, in an inline array that many records
 //! long, and makes the record's wrapper only when it is taken.
+//!
+//! That array is the set's size, a few words per record of the capacity, so
+//! each copy of a set is that much stack. `drain_into` builds a set in
+//! storage the caller names instead of returning it: `sosmain`'s start-up
+//! drains into a static that way, so no frame of the start-up holds one.
 
 import sosabi.{SosStatus, BootHandleKind, BOOT_SET_CAPACITY,
                BOOT_HANDLE_RECORD_WORDS, BOOT_HANDLE_TAG_WORD,
@@ -22,6 +27,10 @@ import sos.floor.{checked, sos_handle_release, sos_process_boot_handle_next}
 
 /// The words the set's records fill when the set is full.
 static BOOT_SET_WORDS: Int = BOOT_SET_CAPACITY * BOOT_HANDLE_RECORD_WORDS
+
+/// The words a `BootSet` fills, its records' and its count's: storage of
+/// this many words, word-aligned, holds a set (`BootSet.drain_into`).
+public static BOOT_SET_STORAGE_WORDS: Int = BOOT_SET_WORDS + 1
 
 /// One record of a drained set, as the drain met it: its tag and its kind.
 public struct BootEntry {
@@ -42,6 +51,11 @@ public struct BootSet {
     private records: [UInt; BOOT_SET_WORDS]
     private count: Int
 }
+
+static_assert(sizeof<BootSet>() == BOOT_SET_STORAGE_WORDS * sizeof<UInt>(),
+              "a boot set is its records' words and its count's")
+static_assert(alignof<BootSet>() == alignof<UInt>(),
+              "a boot set aligns on a word")
 
 extension BootSet: NoCopy {
     /// Release every handle word not taken: the release each record's
@@ -75,6 +89,33 @@ extension BootSet {
     /// panics, naming it (see `adopt_heaps`).
     public init(process: &Process) -> Result<BootSet, SosStatus> {
         var set = BootSet(records: [0; BOOT_SET_WORDS], count: 0)
+        try set.fill(&process)
+        return move set
+    }
+
+    /// Drain `process`'s boot set into the storage at `at`, on
+    /// `init(process:)`'s terms, building the set there: it is never moved
+    /// out of a temporary, so no frame holds a copy of its records.
+    ///
+    /// `at` must be writable, sized and aligned for a `BootSet`, and hold no
+    /// live set, since nothing there is released. Whatever the drain
+    /// answers, a set is left at `at`, which the caller owns from then on
+    /// (`move at[0]` hands it over, and dropping it releases its records):
+    /// the drained one, or when the drain ends other than by
+    /// `SosStatus.Drained`, the records drained before it.
+    public static func drain_into(
+        at: UnsafePointer<BootSet>, process: &Process
+    ) unsafe -> Result<Void, SosStatus> {
+        // Records past the count are never read, so a count of zero makes
+        // whatever bytes are there an empty set.
+        at[0].count = 0
+        at[0].fill(&process)
+    }
+
+    /// Drain `process`'s boot set onto the end of this one, then adopt its
+    /// heaps. A drain that ends other than by `SosStatus.Drained` answers
+    /// that status, with the records drained before it in the set.
+    func fill(&var self, process: &Process) -> Result<Void, SosStatus> {
         while {
             let record = try next_record(&process) catch {
                 if error == SosStatus.Drained {
@@ -82,19 +123,19 @@ extension BootSet {
                 }
                 return error
             }
-            if set.count == BOOT_SET_CAPACITY {
+            if self.count == BOOT_SET_CAPACITY {
                 panic("sos: the boot set holds more than {} records",
                       BOOT_SET_CAPACITY)
             }
             let kind = kind_of(record.1)
-            let at = set.count * BOOT_HANDLE_RECORD_WORDS
-            set.records[at + BOOT_HANDLE_TAG_WORD] = record.0
-            set.records[at + BOOT_HANDLE_KIND_WORD] = kind as UInt
-            set.records[at + BOOT_HANDLE_HANDLE_WORD] = record.2
-            set.count = set.count + 1
+            let at = self.count * BOOT_HANDLE_RECORD_WORDS
+            self.records[at + BOOT_HANDLE_TAG_WORD] = record.0
+            self.records[at + BOOT_HANDLE_KIND_WORD] = kind as UInt
+            self.records[at + BOOT_HANDLE_HANDLE_WORD] = record.2
+            self.count = self.count + 1
         }
-        adopt_heaps(&process, &var set)
-        return move set
+        adopt_heaps(&process, &var self)
+        return
     }
 
     /// How many records the drain met, taken or not.

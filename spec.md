@@ -5082,6 +5082,11 @@ reserved.
   name. `Shutdown`, process creation and the rest are the launcher's own to
   give, never a declaration's or an image's. A child that knows its records
   by tag drains them all at once (`sos.BootSet`) and takes each by its tag.
+  A set holds up to `BOOT_SET_CAPACITY` records (`sosabi`) inline, a few
+  words each, so each copy of one is that much stack: a program written
+  with `main` has its start-up drain the set in place into storage of the
+  runtime's, not into the start-up's frame, which stays under `main` for
+  the process's life, and `main` takes it with `sosmain.take_boot_set()`.
   A process that declares heaps gets one pool for each, under the runtime's
   heap tags, given with `PoolRight.Allocate | Map | Transfer | Mint |
   Extend` and nothing else.
