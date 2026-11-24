@@ -1,0 +1,566 @@
+// A shared ring is input. One end over a memory that counts its reads and can
+// change a word just after it is read, with the test writing the peer's
+// words: an index past the count, an index out of order, a length past the
+// slot, each fatal, latched and counted; every shared field read once, so a
+// field changed between two reads is seen at its first value; and, through a
+// real window, a field changed between the accessor's read and the use.
+
+import pktring.{Endpoint, FaultCounts, Layout, Ring, RingError, Shared,
+                SharedWindow, SlotRange}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+static FAKE_WORDS: Int = 64
+static STORES: Int = 64
+
+/// A ring's words, the reads of each, and a twist: once armed, the word at
+/// `twist_at` becomes `twist_to` just after its next read, a peer writing
+/// between two reads of one field.
+struct Store {
+    words: [UInt32; FAKE_WORDS],
+    reads: [UInt32; FAKE_WORDS],
+    twist_at: UInt,
+    twist_to: UInt32,
+    armed: Bool,
+}
+
+static FRESH: Store = Store(words: [0; FAKE_WORDS], reads: [0; FAKE_WORDS], twist_at: 0,
+                            twist_to: 0, armed: false)
+
+// The stores, one per end a test makes, so an end's memory outlives the
+// moves of the end that holds it and the test can write the peer's words.
+unsafe static var POOL: [Store; STORES] = [FRESH; STORES]
+unsafe static var USED: Int = 0
+
+/// A ring's memory in the pool, read and written as the `Endpoint` does.
+struct Fake {
+    at: Int,
+}
+
+extension Fake: Shared {
+    func load(&var self, offset: UInt) unsafe -> UInt32 {
+        let i = (offset / 4) as Int
+        POOL[self.at].reads[i] = POOL[self.at].reads[i] + 1
+        let value = POOL[self.at].words[i]
+        if POOL[self.at].armed && offset == POOL[self.at].twist_at {
+            POOL[self.at].words[i] = POOL[self.at].twist_to
+            POOL[self.at].armed = false
+        }
+        value
+    }
+
+    func store(&var self, offset: UInt, word: UInt32) unsafe {
+        POOL[self.at].words[(offset / 4) as Int] = word
+    }
+}
+
+/// An end and the index of its store.
+struct Rig {
+    e: Endpoint<Fake>,
+    at: Int,
+}
+
+/// A fresh store, its words `fill`.
+func fresh(fill: UInt32) unsafe -> Int {
+    let at = USED
+    USED = USED + 1
+    POOL[at].words = [fill; FAKE_WORDS]
+    at
+}
+
+/// 16-byte slots, four each way: 192 bytes.
+func layout() -> Layout {
+    try! Layout(slot_bytes: 16, to_server: 4, to_client: 4)
+}
+
+func server_over(fill: UInt32) unsafe -> Rig {
+    let at = fresh(fill)
+    Rig(e: Endpoint.server(Fake(at: at), layout()), at: at)
+}
+
+func client_over(fill: UInt32) unsafe -> Rig {
+    let at = fresh(fill)
+    Rig(e: Endpoint.client(Fake(at: at), layout()), at: at)
+}
+
+func server() unsafe -> Rig {
+    server_over(0)
+}
+
+func client() unsafe -> Rig {
+    client_over(0)
+}
+
+func word(offset: UInt) -> Int {
+    (offset / 4) as Int
+}
+
+/// The peer writes `value` at `offset`.
+func poke(r: &var Rig, offset: UInt, value: UInt32) unsafe {
+    POOL[r.at].words[word(offset)] = value
+}
+
+/// The word at `offset` as the memory holds it.
+func peek(r: &Rig, offset: UInt) unsafe -> UInt32 {
+    POOL[r.at].words[word(offset)]
+}
+
+func reads(r: &Rig, offset: UInt) unsafe -> UInt32 {
+    POOL[r.at].reads[word(offset)]
+}
+
+/// Arms the store's twist: the word at `offset` becomes `to` just after its
+/// next read.
+func twist(r: &var Rig, offset: UInt, to: UInt32) unsafe {
+    POOL[r.at].twist_at = offset
+    POOL[r.at].twist_to = to
+    POOL[r.at].armed = true
+}
+
+/// Every read of every word so far.
+func all_reads(r: &Rig) unsafe -> UInt32 {
+    var total: UInt32 = 0
+    var i = 0
+    while i < FAKE_WORDS {
+        total = total + POOL[r.at].reads[i]
+        i = i + 1
+    }
+    total
+}
+
+func is_err<V>(r: Result<V, RingError>, want: RingError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func range_is(r: Result<SlotRange, RingError>, first: UInt16, count: UInt16) -> Bool {
+    match r {
+        case Ok(got) -> got == SlotRange(first: first, count: count),
+        case Err(_) -> false,
+    }
+}
+
+func faulted(r: &Rig, want: RingError) -> Bool {
+    if let f = r.e.fault() { f == want } else { false }
+}
+
+/// Every operation of a faulted end answers `want` and reads nothing.
+func latched(e: &var Rig, want: RingError) unsafe -> Bool {
+    let before = all_reads(&e)
+    var got: [UInt8; 16] = [0; 16]
+    let p: [UInt8; 16] = [0; 16]
+    let ok = is_err(e.e.poll(), want) && is_err(e.e.receive(&var got), want) &&
+             is_err(e.e.release(), want) && is_err(e.e.send(&p, 4), want) &&
+             is_err(e.e.publish(), want) && is_err(e.e.room(), want)
+    ok && all_reads(&e) == before && faulted(&e, want)
+}
+
+/// The client publishes `n` packets of 4 bytes into ToServer: the peer's
+/// part, written by hand into the server's memory.
+func peer_fills(e: &var Rig, n: UInt32) unsafe {
+    let l = layout()
+    var i: UInt32 = 0
+    while i < n {
+        poke(&var e, l.length_offset(Ring.ToServer, i), 4)
+        poke(&var e, l.slot_offset(Ring.ToServer, i), 0x0403_0201 + i)
+        i = i + 1
+    }
+    poke(&var e, l.head_offset(Ring.ToServer), n)
+}
+
+/// A client whose ToServer ring is full: four sends, published.
+func full_client() unsafe -> Rig {
+    var c = client()
+    let p: [UInt8; 16] = [7; 16]
+    var i = 0
+    while i < 4 {
+        let _ = try! c.e.send(&p, 4)
+        i = i + 1
+    }
+    let _ = try! c.e.publish()
+    c
+}
+
+func index_past_count() unsafe {
+    let l = layout()
+    let head = l.head_offset(Ring.ToServer)
+    // Indexes run 0..7 for four slots: 8 is past the count.
+    var s = server()
+    poke(&var s, head, 8)
+    check(is_err(s.e.poll(), RingError.IndexPastCount(8)), "a head past the count")
+    check(latched(&var s, RingError.IndexPastCount(8)), "the fault latches")
+    var huge = server()
+    poke(&var huge, head, 0xFFFF_FFFF)
+    check(is_err(huge.e.poll(), RingError.IndexPastCount(0xFFFF_FFFF)), "the largest head")
+    // The last index in range is no fault: four filled is a full ring.
+    var full = server()
+    peer_fills(&var full, 4)
+    check(range_is(full.e.poll(), 0, 4), "a head of four slots filled")
+    check(full.e.fault().is_none(), "a full ring is no fault")
+
+    // The tail a full producer reads.
+    let tail = l.tail_offset(Ring.ToServer)
+    var c = full_client()
+    poke(&var c, tail, 8)
+    let p: [UInt8; 16] = [0; 16]
+    check(is_err(c.e.send(&p, 4), RingError.IndexPastCount(8)), "a tail past the count")
+    check(latched(&var c, RingError.IndexPastCount(8)), "a tail's fault latches")
+    var r = full_client()
+    poke(&var r, tail, 9)
+    check(is_err(r.e.room(), RingError.IndexPastCount(9)), "room reads the tail too")
+}
+
+func index_out_of_order() unsafe {
+    let l = layout()
+    let head = l.head_offset(Ring.ToServer)
+    // A head five past a tail of zero claims more slots than the ring has.
+    var past = server()
+    poke(&var past, head, 5)
+    check(is_err(past.e.poll(), RingError.IndexOutOfOrder(5)), "a head past the free slots")
+    check(latched(&var past, RingError.IndexOutOfOrder(5)), "out of order latches")
+    // A head that goes back takes slots back.
+    var back = server()
+    peer_fills(&var back, 3)
+    check(range_is(back.e.poll(), 0, 3), "three filled")
+    poke(&var back, head, 1)
+    check(is_err(back.e.poll(), RingError.IndexOutOfOrder(1)), "a head going back")
+    // A head that stays is no fault.
+    var same = server()
+    peer_fills(&var same, 2)
+    check(range_is(same.e.poll(), 0, 2), "two filled")
+    check(range_is(same.e.poll(), 0, 2), "and still two")
+    // After the server took and released two, a head of 2 is empty, a head
+    // of 6 is full, and a head of 7 is past it.
+    var got: [UInt8; 16] = [0; 16]
+    let _ = try! same.e.receive(&var got)
+    let _ = try! same.e.receive(&var got)
+    let _ = try! same.e.release()
+    check(is_err(same.e.poll(), RingError.Empty), "a head at the tail is empty")
+    poke(&var same, head, 6)
+    check(range_is(same.e.poll(), 2, 4), "a head four past the tail, wrapping")
+    var over = server()
+    peer_fills(&var over, 2)
+    let _ = try! over.e.poll()
+    let _ = try! over.e.receive(&var got)
+    let _ = try! over.e.receive(&var got)
+    let _ = try! over.e.release()
+    poke(&var over, head, 7)
+    check(is_err(over.e.poll(), RingError.IndexOutOfOrder(7)), "a head five past the tail")
+
+    // A tail past the head frees slots that were never filled.
+    let tail = l.tail_offset(Ring.ToServer)
+    var ahead = full_client()
+    poke(&var ahead, tail, 5)
+    check(is_err(ahead.e.room(), RingError.IndexOutOfOrder(5)), "a tail past the head")
+    check(latched(&var ahead, RingError.IndexOutOfOrder(5)), "a tail's order latches")
+    // A tail that goes back takes freed slots back.
+    var tback = full_client()
+    poke(&var tback, tail, 2)
+    let room = try! tback.e.room()
+    check(room == 2, "two freed")
+    poke(&var tback, tail, 1)
+    check(is_err(tback.e.room(), RingError.IndexOutOfOrder(1)), "a tail going back")
+    // A tail at the head frees every slot.
+    var all = full_client()
+    poke(&var all, tail, 4)
+    let free = try! all.e.room()
+    check(free == 4, "a tail at the head frees all")
+}
+
+func length_past_slot() unsafe {
+    let l = layout()
+    // The slot is 16 bytes: 16 is a length, 17 is past it.
+    var s = server()
+    peer_fills(&var s, 2)
+    poke(&var s, l.length_offset(Ring.ToServer, 0), 16)
+    poke(&var s, l.length_offset(Ring.ToServer, 1), 17)
+    let _ = try! s.e.poll()
+    var got: [UInt8; 16] = [0; 16]
+    let len = try! s.e.receive(&var got)
+    check(len == 16, "a length of the whole slot")
+    check(is_err(s.e.receive(&var got), RingError.LengthPastSlot(17)), "a length past the slot")
+    check(latched(&var s, RingError.LengthPastSlot(17)), "a length's fault latches")
+    var huge = server()
+    peer_fills(&var huge, 1)
+    poke(&var huge, l.length_offset(Ring.ToServer, 0), 0xFFFF_FFFF)
+    let _ = try! huge.e.poll()
+    check(is_err(huge.e.receive(&var got), RingError.LengthPastSlot(0xFFFF_FFFF)),
+          "the largest length")
+}
+
+func counted() {
+    var counts = FaultCounts.zero()
+    counts.record(&RingError.IndexPastCount(8))
+    counts.record(&RingError.IndexOutOfOrder(5))
+    counts.record(&RingError.IndexOutOfOrder(1))
+    counts.record(&RingError.LengthPastSlot(17))
+    counts.record(&RingError.Empty)
+    counts.record(&RingError.Full)
+    counts.record(&RingError.TooLong(9))
+    check(counts.index_past_count == 1 && counts.index_out_of_order == 2 &&
+          counts.length_past_slot == 1, "each fatal error counted by kind")
+    check(counts.total() == 4, "this side's conditions count nothing")
+    check(RingError.IndexPastCount(8).is_fatal() && RingError.IndexOutOfOrder(1).is_fatal() &&
+          RingError.LengthPastSlot(17).is_fatal(), "a peer's bad value is fatal")
+    check("{RingError.IndexPastCount(8)}".equals("an index past the slot count: 8"),
+          "an index past the count prints its value")
+    check("{RingError.IndexOutOfOrder(5)}".equals("an index out of order: 5"),
+          "an index out of order prints its value")
+    check("{RingError.LengthPastSlot(17)}".equals("a length past the slot: 17"),
+          "a length past the slot prints its value")
+}
+
+func read_once() unsafe {
+    let l = layout()
+    // The head: read once by the poll, which answers its first value though
+    // the peer then writes one past the count. Receiving reads it no more.
+    let head = l.head_offset(Ring.ToServer)
+    var s = server()
+    peer_fills(&var s, 2)
+    twist(&var s, head, 13)
+    check(range_is(s.e.poll(), 0, 2), "the head's first value")
+    check(reads(&s, head) == 1, "the head read once")
+    check(s.e.fault().is_none(), "the head's later value is not seen")
+    var got: [UInt8; 16] = [0; 16]
+    let _ = try! s.e.receive(&var got)
+    let _ = try! s.e.receive(&var got)
+    check(is_err(s.e.receive(&var got), RingError.Empty), "the polled slots, and no more")
+    check(reads(&s, head) == 1, "receiving reads no head")
+    check(is_err(s.e.poll(), RingError.IndexPastCount(13)), "the next poll sees the change")
+
+    // A slot's length: read once, and the copy is the first length's.
+    var r = server()
+    peer_fills(&var r, 1)
+    let len_at = l.length_offset(Ring.ToServer, 0)
+    let slot = l.slot_offset(Ring.ToServer, 0)
+    poke(&var r, len_at, 6)
+    poke(&var r, slot + 4, 0x0807_0605)
+    poke(&var r, slot + 8, 0xDEAD_BEEF)
+    twist(&var r, len_at, 0xFFFF)
+    let _ = try! r.e.poll()
+    var into: [UInt8; 16] = [0xAA; 16]
+    let n = try! r.e.receive(&var into)
+    check(n == 6, "the length's first value")
+    check(into[0] == 1 && into[1] == 2 && into[2] == 3 && into[3] == 4 &&
+          into[4] == 5 && into[5] == 6, "the bytes the first length covers")
+    check(into[6] == 0xAA && into[7] == 0xAA && into[8] == 0xAA,
+          "nothing past the first length")
+    check(reads(&r, len_at) == 1, "the length read once")
+    check(reads(&r, slot) == 1 && reads(&r, slot + 4) == 1, "each payload word read once")
+    check(reads(&r, slot + 8) == 0, "no word past the length read")
+    check(r.e.fault().is_none(), "the length's later value is not seen")
+
+    // A slot's bytes: read once, so a byte the peer changes after the read
+    // is not in the copy.
+    var b = server()
+    peer_fills(&var b, 1)
+    twist(&var b, slot, 0xFFFF_FFFF)
+    let _ = try! b.e.poll()
+    let m = try! b.e.receive(&var into)
+    check(m == 4 && into[0] == 1 && into[3] == 4, "the bytes' first value")
+    check(reads(&b, slot) == 1, "the payload word read once")
+
+    // The tail a full producer reads: once per look, the first value used.
+    let tail = l.tail_offset(Ring.ToServer)
+    var c = full_client()
+    poke(&var c, tail, 1)
+    twist(&var c, tail, 12)
+    let p: [UInt8; 16] = [0; 16]
+    let sent = try! c.e.send(&p, 4)
+    check(sent == 0, "the tail's first value frees slot 0")
+    check(reads(&c, tail) == 1, "the tail read once")
+    check(is_err(c.e.send(&p, 4), RingError.IndexPastCount(12)),
+          "the next look sees the change")
+
+    // A producer with room reads no tail; a consumer with polled slots
+    // reads no head.
+    var quiet = client()
+    let _ = try! quiet.e.send(&p, 4)
+    let _ = try! quiet.e.send(&p, 4)
+    check(reads(&quiet, tail) == 0, "a send with room reads no tail")
+}
+
+func window(mem: &var [UInt32; FAKE_WORDS], l: &Layout) unsafe -> SharedWindow {
+    SharedWindow(at: (&var mem) as UnsafePointer<UInt32>, bytes: l.bytes())
+}
+
+func between_read_and_use() unsafe {
+    // Through a real window: the peer's head and a slot change after the
+    // accessor read them, and the use sees the first values.
+    var mem: [UInt32; FAKE_WORDS] = [0; FAKE_WORDS]
+    let l = layout()
+    var s = Endpoint.server(window(&var mem, &l), l)
+    let head = word(l.head_offset(Ring.ToServer))
+    let len0 = word(l.length_offset(Ring.ToServer, 0))
+    let slot0 = word(l.slot_offset(Ring.ToServer, 0))
+    mem[len0] = 4
+    mem[slot0] = 0x6463_6261
+    mem[word(l.length_offset(Ring.ToServer, 1))] = 4
+    mem[head] = 2
+    check(range_is(s.poll(), 0, 2), "two to take")
+    mem[head] = 9
+    var got: [UInt8; 16] = [0; 16]
+    let n = try! s.receive(&var got)
+    mem[len0] = 4000
+    mem[slot0] = 0
+    check(n == 4 && got[0] == 0x61 && got[3] == 0x64, "the copy is the first value")
+    let _ = try! s.receive(&var got)
+    check(is_err(s.receive(&var got), RingError.Empty), "the head's first value bounds it")
+    check(s.fault().is_none(), "nothing changed is seen")
+    check(range_is(s.release(), 0, 2), "the slots taken")
+    check(mem[word(l.tail_offset(Ring.ToServer))] == 2, "the tail stored")
+    check(is_err(s.poll(), RingError.IndexPastCount(9)), "a fresh poll sees the change")
+}
+
+func published_and_released() unsafe {
+    let l = layout()
+    let p: [UInt8; 16] = [0; 16]
+    var got: [UInt8; 16] = [0; 16]
+    // A tail is bounded by the head this end published, not by what it sent:
+    // two sent and none published, a tail of 2 frees slots the peer never
+    // saw.
+    let tail = l.tail_offset(Ring.ToServer)
+    var c = client()
+    let _ = try! c.e.send(&p, 4)
+    let _ = try! c.e.send(&p, 4)
+    poke(&var c, tail, 2)
+    check(is_err(c.e.room(), RingError.IndexOutOfOrder(2)), "a tail past the published head")
+    check(latched(&var c, RingError.IndexOutOfOrder(2)), "and it latches")
+    // Published, the same tail frees them.
+    var ok = client()
+    let _ = try! ok.e.send(&p, 4)
+    let _ = try! ok.e.send(&p, 4)
+    let _ = try! ok.e.publish()
+    poke(&var ok, tail, 2)
+    let room = try! ok.e.room()
+    check(room == 4, "a tail at the published head frees all")
+
+    // A head is bounded by the tail this end released, not by what it took:
+    // four taken and none released, a head of 0 claims four slots more.
+    let head = l.head_offset(Ring.ToServer)
+    var s = server()
+    peer_fills(&var s, 4)
+    let _ = try! s.e.poll()
+    var i = 0
+    while i < 4 {
+        let _ = try! s.e.receive(&var got)
+        i = i + 1
+    }
+    poke(&var s, head, 0)
+    check(is_err(s.e.poll(), RingError.IndexOutOfOrder(0)), "a head past the released tail")
+    check(latched(&var s, RingError.IndexOutOfOrder(0)), "and it latches too")
+    // Released, the same head fills the ring again.
+    var again = server()
+    peer_fills(&var again, 4)
+    let _ = try! again.e.poll()
+    i = 0
+    while i < 4 {
+        let _ = try! again.e.receive(&var got)
+        i = i + 1
+    }
+    let _ = try! again.e.release()
+    poke(&var again, head, 0)
+    check(range_is(again.e.poll(), 0, 4), "a head the slots past the released tail")
+
+    // A poll between a receive and its release names what is left to take.
+    var mid = server()
+    peer_fills(&var mid, 3)
+    check(range_is(mid.e.poll(), 0, 3), "three to take")
+    let _ = try! mid.e.receive(&var got)
+    check(range_is(mid.e.poll(), 1, 2), "two left after one taken")
+    check(range_is(mid.e.release(), 0, 1), "and the one released")
+}
+
+func errors_read_once() unsafe {
+    // An error names the value the check read, and the check read it once.
+    let l = layout()
+    let head = l.head_offset(Ring.ToServer)
+    var past = server()
+    poke(&var past, head, 13)
+    twist(&var past, head, 99)
+    check(is_err(past.e.poll(), RingError.IndexPastCount(13)), "a head past the count, once")
+    check(reads(&past, head) == 1, "read once on the way to its error")
+    var order = server()
+    poke(&var order, head, 5)
+    twist(&var order, head, 6)
+    check(is_err(order.e.poll(), RingError.IndexOutOfOrder(5)), "a head out of order, once")
+    check(reads(&order, head) == 1, "read once on the way to its error too")
+
+    let tail = l.tail_offset(Ring.ToServer)
+    var tpast = full_client()
+    poke(&var tpast, tail, 9)
+    twist(&var tpast, tail, 10)
+    check(is_err(tpast.e.room(), RingError.IndexPastCount(9)), "a tail past the count, once")
+    check(reads(&tpast, tail) == 1, "the tail read once on the way to its error")
+    var torder = full_client()
+    poke(&var torder, tail, 5)
+    twist(&var torder, tail, 6)
+    check(is_err(torder.e.room(), RingError.IndexOutOfOrder(5)), "a tail out of order, once")
+    check(reads(&torder, tail) == 1, "and once again")
+
+    // The tail room reads: once, and the answer is the first value's.
+    var room = full_client()
+    poke(&var room, tail, 1)
+    twist(&var room, tail, 12)
+    let free = try! room.e.room()
+    check(free == 1, "room answers the tail's first value")
+    check(reads(&room, tail) == 1, "room reads the tail once")
+
+    let len_at = l.length_offset(Ring.ToServer, 0)
+    var len = server()
+    peer_fills(&var len, 1)
+    poke(&var len, len_at, 40)
+    twist(&var len, len_at, 41)
+    let _ = try! len.e.poll()
+    var got: [UInt8; 16] = [0; 16]
+    check(is_err(len.e.receive(&var got), RingError.LengthPastSlot(40)),
+          "a length past the slot, once")
+    check(reads(&len, len_at) == 1, "the length read once on the way to its error")
+}
+
+func window_bounds() unsafe {
+    // A window holds a word wholly inside it at a word's offset.
+    var mem: [UInt32; FAKE_WORDS] = [0; FAKE_WORDS]
+    let w = SharedWindow(at: (&var mem) as UnsafePointer<UInt32>, bytes: 16)
+    check(w.holds(0) && w.holds(12), "the first and last words")
+    check(not w.holds(16), "the word at the end")
+    check(not w.holds(14), "a word past the end, misaligned")
+    check(not w.holds(2), "a misaligned word inside")
+    check(not w.holds(0xFFFF_FFFF_FFFF_FFFC), "an offset that would wrap")
+    let odd = SharedWindow(at: (&var mem) as UnsafePointer<UInt32>, bytes: 14)
+    check(odd.holds(8) && not odd.holds(12), "a word cut by the end")
+}
+
+func fresh_ends() unsafe {
+    // Memory a client allocates holds whatever it held: the client stores
+    // every index word, the server only its own two.
+    let c = client_over(0xA5A5_A5A5)
+    check(peek(&c, 0) == 0 && peek(&c, 4) == 0 && peek(&c, 8) == 0 && peek(&c, 12) == 0,
+          "the client stores every index word")
+    let s = server_over(0xA5A5_A5A5)
+    check(peek(&s, 4) == 0 && peek(&s, 8) == 0, "the server stores its own index words")
+    check(peek(&s, 0) == 0xA5A5_A5A5 && peek(&s, 12) == 0xA5A5_A5A5,
+          "and leaves the client's")
+    check(all_reads(&s) == 0, "and reads nothing")
+}
+
+func main() {
+    fresh_ends()
+    published_and_released()
+    errors_read_once()
+    window_bounds()
+    index_past_count()
+    index_out_of_order()
+    length_past_slot()
+    counted()
+    read_once()
+    between_read_and_use()
+}

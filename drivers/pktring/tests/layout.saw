@@ -1,0 +1,103 @@
+// The layout as numbers: each offset of a frame ring and an HCI ring written
+// out, the refusals of a shape the ring cannot have, and the index arithmetic
+// at its ends. Both sides compute these, so they are written here rather than
+// derived.
+
+import pktring.{HEADER_BYTES, Layout, LayoutError, MAX_SLOT_BYTES, MAX_SLOTS,
+                Ring, SLOT_ALIGN, SlotRange, WORD_BYTES, advance_index, filled,
+                index_modulus, next_index, slot_of}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func refused(r: Result<Layout, LayoutError>, want: LayoutError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func main() {
+    check(MAX_SLOTS == 256, "a ring holds at most 256 slots")
+    check(MAX_SLOT_BYTES == 65536, "a slot is at most 64 KiB")
+    check(WORD_BYTES == 4 && HEADER_BYTES == 16 && SLOT_ALIGN == 64,
+          "words, the header and the slot alignment")
+
+    // A frame ring: 2048-byte slots, 8 to the server and 16 to the client.
+    let f = try! Layout(slot_bytes: 2048, to_server: 8, to_client: 16)
+    check(f.head_offset(Ring.ToServer) == 0 && f.tail_offset(Ring.ToServer) == 4,
+          "the ToServer index words")
+    check(f.head_offset(Ring.ToClient) == 8 && f.tail_offset(Ring.ToClient) == 12,
+          "the ToClient index words")
+    check(f.length_offset(Ring.ToServer, 0) == 16, "the first ToServer length")
+    check(f.length_offset(Ring.ToServer, 7) == 44, "the last ToServer length")
+    check(f.length_offset(Ring.ToClient, 0) == 48, "the first ToClient length")
+    check(f.length_offset(Ring.ToClient, 15) == 108, "the last ToClient length")
+    // The lengths end at 112, so the slots start at 128.
+    check(f.slots_offset() == 128, "the slots start at the next 64")
+    check(f.slot_offset(Ring.ToServer, 0) == 128, "the first ToServer slot")
+    check(f.slot_offset(Ring.ToServer, 7) == 128 + 7 * 2048, "the last ToServer slot")
+    check(f.slot_offset(Ring.ToClient, 0) == 128 + 8 * 2048, "the first ToClient slot")
+    check(f.slot_offset(Ring.ToClient, 15) == 128 + 23 * 2048, "the last ToClient slot")
+    check(f.bytes() == 128 + 24 * 2048, "the whole frame ring")
+    check(f.slots(Ring.ToServer) == 8 && f.slots(Ring.ToClient) == 16, "each ring's slots")
+    check(f.slot_bytes() == 2048, "the slot size")
+
+    // An HCI ring whose lengths end on the alignment: 512-byte slots, 4 and 8.
+    // The lengths end at 16 + 48 = 64.
+    let h = try! Layout(slot_bytes: 512, to_server: 4, to_client: 8)
+    check(h.slots_offset() == 64, "lengths ending on 64 start the slots there")
+    check(h.slot_offset(Ring.ToClient, 0) == 64 + 4 * 512, "the first HCI ToClient slot")
+    check(h.bytes() == 64 + 12 * 512, "the whole HCI ring")
+
+    // One slot each, and the largest of everything.
+    let one = try! Layout(slot_bytes: 4, to_server: 1, to_client: 1)
+    check(one.slots_offset() == 64 && one.bytes() == 72, "the smallest ring")
+    let most = try! Layout(slot_bytes: MAX_SLOT_BYTES, to_server: MAX_SLOTS,
+                           to_client: MAX_SLOTS)
+    check(most.slots_offset() == 2112, "the most length words")
+    check(most.bytes() == 2112 + 512 * 65536, "the largest ring")
+
+    // A shape the ring cannot have, each refused by name.
+    check(refused(Layout(slot_bytes: 0, to_server: 1, to_client: 1),
+                  LayoutError.SlotBytes(0)), "a slot of no bytes")
+    check(refused(Layout(slot_bytes: 6, to_server: 1, to_client: 1),
+                  LayoutError.SlotBytes(6)), "a slot of part of a word")
+    check(refused(Layout(slot_bytes: MAX_SLOT_BYTES + 4, to_server: 1, to_client: 1),
+                  LayoutError.SlotBytes(MAX_SLOT_BYTES + 4)), "a slot past the largest")
+    check(refused(Layout(slot_bytes: 4, to_server: 0, to_client: 1),
+                  LayoutError.SlotCount(0)), "no ToServer slots")
+    check(refused(Layout(slot_bytes: 4, to_server: 1, to_client: 0),
+                  LayoutError.SlotCount(0)), "no ToClient slots")
+    check(refused(Layout(slot_bytes: 4, to_server: MAX_SLOTS + 1, to_client: 1),
+                  LayoutError.SlotCount(MAX_SLOTS + 1)), "too many ToServer slots")
+    check(refused(Layout(slot_bytes: 4, to_server: 1, to_client: MAX_SLOTS + 1),
+                  LayoutError.SlotCount(MAX_SLOTS + 1)), "too many ToClient slots")
+    check("{LayoutError.SlotCount(300)}".equals("a slot count the ring cannot have: 300"),
+          "a layout error prints its value")
+    check("{LayoutError.SlotBytes(6)}".equals("a slot size the ring cannot have: 6"),
+          "a slot size error prints its value")
+
+    // Index arithmetic at its ends: a ring of 3 counts 0..5.
+    check(index_modulus(3) == 6, "indexes count to twice the slots")
+    check(next_index(3, 0) == 1 && next_index(3, 4) == 5 && next_index(3, 5) == 0,
+          "the next index wraps at the modulus")
+    check(advance_index(3, 4, 2) == 0 && advance_index(3, 1, 3) == 4 &&
+          advance_index(3, 5, 6) == 5, "advancing wraps at the modulus")
+    check(slot_of(3, 0) == 0 && slot_of(3, 2) == 2 && slot_of(3, 3) == 0 &&
+          slot_of(3, 5) == 2, "an index names its slot")
+    check(filled(3, 0, 0) == 0 && filled(3, 3, 0) == 3 && filled(3, 1, 4) == 3 &&
+          filled(3, 5, 0) == 5 && filled(3, 0, 5) == 1, "filled counts from tail to head")
+
+    // A range a message carries fits a ring of 4 slots or does not.
+    check(SlotRange(first: 0, count: 1).fits(4), "one slot")
+    check(SlotRange(first: 3, count: 4).fits(4), "every slot, wrapping")
+    check(not SlotRange(first: 4, count: 1).fits(4), "a first slot past the ring")
+    check(not SlotRange(first: 0, count: 0).fits(4), "no slots")
+    check(not SlotRange(first: 0, count: 5).fits(4), "more slots than the ring")
+}

@@ -1,0 +1,604 @@
+//! The network device protocol: what a network stack, the client, and a
+//! network device driver, the server, say to each other.
+//!
+//! Frames cross in a `pktring` the client lays out with `SLOT_BYTES` slots
+//! and gives the server at `Attach`. The stack fills the `ToServer` ring with
+//! frames to send and the driver fills the `ToClient` ring with frames it
+//! received. Messages carry doorbells and slot numbers.
+//!
+//! A request is one message: byte 0 the op, then the payload. A reply's byte 0
+//! is a status, then its payload. Integers are little-endian.
+//!
+//! ```text
+//! op           payload                    reply payload
+//! Attach    1  to_server u16,             mac [6], mtu u16,
+//!              to_client u16;             to_server u16, to_client u16
+//!              handle slot 0: the ring
+//! Tx        2  first u16, count u16       -
+//! RxReturn  3  first u16, count u16       -
+//! WaitEvent 4  -                          kind u8, then the event's fields
+//! Stats     5  -                          rx_frames, rx_dropped, tx_frames,
+//!                                         tx_errors, ring_faults (u32 each)
+//! ```
+//!
+//! ```text
+//! event        fields
+//! RxReady   1  first u16, count u16      frames received in those ToClient
+//!                                        slots
+//! TxDone    2  first u16, count u16      ToServer slots sent, free again
+//! LinkUp    3  -
+//! LinkDown  4  -
+//! ```
+//!
+//! A reply that is not `Ok` carries the status byte alone.
+//!
+//! # The ops
+//!
+//!   - `Attach`    - a call, the connection's first request. The client
+//!                   allocates a Memory of at least the ring's
+//!                   `Layout.bytes()` (`layout`), stores its index words
+//!                   (`Endpoint.client`), and sends it in handle slot 0 with
+//!                   its two slot counts. The driver maps it and answers the
+//!                   device's MAC address, its MTU, and the slot counts it
+//!                   laid the ring out with, which are the request's.
+//!   - `Tx`        - a tell, the doorbell for frames the client published in
+//!                   the `ToServer` ring.
+//!   - `RxReturn`  - a tell, the doorbell for `ToClient` slots the client
+//!                   released.
+//!   - `WaitEvent` - a call the driver holds until it has an event, and
+//!                   answers with the next one. A driver holds one at a time.
+//!                   Frames that arrive while none is held are kept in the
+//!                   ring, and the next `WaitEvent` names all of them, so a
+//!                   slow client never blocks the driver.
+//!   - `Stats`     - a call answered with the driver's counts since it
+//!                   started.
+//!
+//! A doorbell's range is checked on the wire (`SlotRange.fits`) and need not
+//! be acted on: the ring's index words say the same or more.
+//!
+//! # Statuses
+//!
+//! They are checked in this order, and the first that applies is answered:
+//! `BadOp` (a message of no bytes, an op byte that names no op, or a payload
+//! of the wrong length), `BadArg` (a slot count of none or past `MAX_SLOTS`,
+//! a range that does not fit the ring, an `Attach` with no Memory), then
+//! `NotAttached` (any op before `Attach`), `Attached` (a second `Attach`),
+//! `Busy` (a `WaitEvent` while one is held).
+//!
+//! # Failure
+//!
+//! The ring is input (`pktring`): a value of the client's that fails a check
+//! ends the connection, and the driver counts it in `ring_faults`. A client's
+//! death is the connection's peer-closed: the driver drops its mapping and
+//! its slots. A driver's death answers every claim `PeerClosed`.
+
+import pktring.{Layout, LayoutError, MAX_SLOTS, SlotRange}
+
+/// The bytes of a message body: the kernel's `PIPE_BODY_BYTES`.
+public static BODY_BYTES: Int = 128
+
+/// The bytes of each slot of the ring, in both directions: a frame.
+public static SLOT_BYTES: UInt32 = 2048
+
+/// An Ethernet header's bytes, which a frame carries beside its MTU.
+public static ETHERNET_HEADER_BYTES: UInt32 = 14
+
+/// A MAC address's bytes.
+public static MAC_BYTES: Int = 6
+
+/// The layout of a ring of `to_server` and `to_client` frame slots.
+public func layout(to_server: UInt16, to_client: UInt16) -> Result<Layout, LayoutError> {
+    Layout(slot_bytes: SLOT_BYTES, to_server: to_server as UInt32,
+           to_client: to_client as UInt32)
+}
+
+/// The op byte. Raw-backed because it crosses a wire: each value is stated.
+public enum NetdevOp: UInt8 {
+    case Attach = 1,
+    case Tx = 2,
+    case RxReturn = 3,
+    case WaitEvent = 4,
+    case Stats = 5,
+}
+
+extension NetdevOp {
+    /// What a transcript should call this op.
+    public func describe(&self) -> String {
+        match self {
+            case Attach -> "attach",
+            case Tx -> "tx",
+            case RxReturn -> "rx_return",
+            case WaitEvent -> "wait_event",
+            case Stats -> "stats",
+        }
+    }
+
+    /// How many payload bytes a request of this op carries.
+    public func payload_bytes(&self) -> UInt {
+        match self {
+            case Attach -> 4,
+            case Tx -> 4,
+            case RxReturn -> 4,
+            case WaitEvent -> 0,
+            case Stats -> 0,
+        }
+    }
+}
+
+/// A reply's status byte. `Ok` is 0.
+public enum NetdevStatus: UInt8 {
+    case Ok = 0,
+    case BadOp = 1,
+    case BadArg = 2,
+    case NotAttached = 3,
+    case Attached = 4,
+    case Busy = 5,
+}
+
+@synthesize
+extension NetdevStatus: Equatable {}
+
+extension NetdevStatus {
+    /// What a transcript should call this status.
+    public func describe(&self) -> String {
+        match self {
+            case Ok -> "Ok",
+            case BadOp -> "BadOp",
+            case BadArg -> "BadArg",
+            case NotAttached -> "NotAttached",
+            case Attached -> "Attached",
+            case Busy -> "Busy",
+        }
+    }
+}
+
+/// An event's kind byte.
+public enum EventKind: UInt8 {
+    case RxReady = 1,
+    case TxDone = 2,
+    case LinkUp = 3,
+    case LinkDown = 4,
+}
+
+/// What a `WaitEvent` is answered with.
+public enum NetdevEvent {
+    /// Frames received in these `ToClient` slots.
+    case RxReady(range: SlotRange),
+    /// These `ToServer` slots were sent and are free again.
+    case TxDone(range: SlotRange),
+    case LinkUp,
+    case LinkDown,
+}
+
+@synthesize
+extension NetdevEvent: Equatable {}
+
+/// A request, decoded.
+public enum NetdevRequest {
+    case Attach(to_server: UInt16, to_client: UInt16),
+    case Tx(range: SlotRange),
+    case RxReturn(range: SlotRange),
+    case WaitEvent,
+    case Stats,
+}
+
+@synthesize
+extension NetdevRequest: Equatable {}
+
+/// An `Attach`'s answer.
+public struct AttachInfo {
+    public mac: [UInt8; MAC_BYTES],
+    public mtu: UInt16,
+    public to_server: UInt16,
+    public to_client: UInt16,
+}
+
+@synthesize
+extension AttachInfo: Equatable {}
+
+/// A `Stats` answer: the driver's counts since it started.
+public struct NetdevStats {
+    public rx_frames: UInt32,
+    /// Frames the device received with no free `ToClient` slot.
+    public rx_dropped: UInt32,
+    public tx_frames: UInt32,
+    public tx_errors: UInt32,
+    /// Connections ended for a value that failed a ring check.
+    public ring_faults: UInt32,
+}
+
+@synthesize
+extension NetdevStats: Equatable {}
+
+/// Why a message is malformed: each shape a decoder refuses, by name.
+public enum WireError {
+    /// A message of no bytes.
+    case NoBytes,
+    /// An op byte that names no op.
+    case UnknownOp(op: UInt8),
+    /// A status byte that names no status.
+    case UnknownStatus(status: UInt8),
+    /// An event kind byte that names no event.
+    case UnknownEvent(kind: UInt8),
+    /// A length the message's op, status or event does not have.
+    case Length(len: UInt),
+    /// A slot count of none or past `MAX_SLOTS`.
+    case SlotCount(count: UInt16),
+    /// A slot range no ring can hold (`SlotRange.fits` at `MAX_SLOTS`).
+    case Range(first: UInt16, count: UInt16),
+    /// An MTU whose frame would not fit a slot.
+    case Mtu(mtu: UInt16),
+}
+
+@synthesize
+extension WireError: Equatable {}
+
+extension WireError {
+    /// The status a driver answers a request refused for this.
+    public func status(&self) -> NetdevStatus {
+        match self {
+            case SlotCount(_) -> NetdevStatus.BadArg,
+            case Range(_, _) -> NetdevStatus.BadArg,
+            case _ -> NetdevStatus.BadOp,
+        }
+    }
+
+    /// What a transcript should call this.
+    public func describe(&self) -> String {
+        match self {
+            case NoBytes -> "a message of no bytes",
+            case UnknownOp(_) -> "an op that is none",
+            case UnknownStatus(_) -> "a status that is none",
+            case UnknownEvent(_) -> "an event that is none",
+            case Length(_) -> "a length its kind does not have",
+            case SlotCount(_) -> "a slot count past the ring's",
+            case Range(_, _) -> "a slot range past the ring's",
+            case Mtu(_) -> "an MTU past the slot",
+        }
+    }
+}
+
+/// Why a reply did not answer what its request asked.
+public enum NetdevError {
+    /// The driver refused the request with this status.
+    case Refused(status: NetdevStatus),
+    /// The reply is no reply its request can have.
+    case Malformed(why: WireError),
+}
+
+@synthesize
+extension NetdevError: Equatable {}
+
+extension NetdevError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        match self {
+            case Refused(status) -> {
+                try! into.append("refused: ")
+                try! into.append(status.describe())
+            },
+            case Malformed(why) -> {
+                try! into.append("malformed: ")
+                try! into.append(why.describe())
+            },
+        }
+    }
+}
+
+extension NetdevError: Error {}
+
+static OP_BYTE: Int = 0
+static PAYLOAD_BYTE: Int = 1
+
+/// A `WaitEvent` answer's bytes: the status, the kind and a range.
+static EVENT_REPLY_BYTES: UInt = 6
+/// An `Attach` answer's bytes.
+static ATTACH_REPLY_BYTES: UInt = 13
+/// A `Stats` answer's bytes.
+static STATS_REPLY_BYTES: UInt = 21
+
+static_assert(STATS_REPLY_BYTES <= BODY_BYTES as UInt, "a Stats answer fits one message")
+
+/// A message body, for a request or a reply. The builders answer the
+/// message's `len`.
+public struct NetdevBody {
+    public bytes: [UInt8; BODY_BYTES],
+}
+
+extension NetdevBody {
+    /// A zeroed body.
+    public static func empty() -> NetdevBody {
+        NetdevBody(bytes: [0; BODY_BYTES])
+    }
+
+    /// Writes `half` at byte `at`, little-endian.
+    public func put_u16(&var self, at: Int, half: UInt16) {
+        self.bytes[at] = (half & 0xFF) as UInt8
+        self.bytes[at + 1] = (half >> 8) as UInt8
+    }
+
+    /// Writes `word` at byte `at`, little-endian.
+    public func put_u32(&var self, at: Int, word: UInt32) {
+        self.put_u16(at, (word & 0xFFFF) as UInt16)
+        self.put_u16(at + 2, (word >> 16) as UInt16)
+    }
+
+    /// `Attach(to_server, to_client)`; the ring goes in handle slot 0.
+    public func attach(&var self, to_server: UInt16, to_client: UInt16) -> UInt {
+        self.bytes[OP_BYTE] = NetdevOp.Attach as UInt8
+        self.put_u16(1, to_server)
+        self.put_u16(3, to_client)
+        5
+    }
+
+    /// An op and a slot range: `Tx` and `RxReturn`.
+    func ranged(&var self, op: NetdevOp, range: SlotRange) -> UInt {
+        self.bytes[OP_BYTE] = op as UInt8
+        self.put_u16(1, range.first)
+        self.put_u16(3, range.count)
+        5
+    }
+
+    /// `Tx(first, count)`.
+    public func tx(&var self, range: SlotRange) -> UInt {
+        self.ranged(NetdevOp.Tx, range)
+    }
+
+    /// `RxReturn(first, count)`.
+    public func rx_return(&var self, range: SlotRange) -> UInt {
+        self.ranged(NetdevOp.RxReturn, range)
+    }
+
+    /// `WaitEvent`.
+    public func wait_event(&var self) -> UInt {
+        self.bytes[OP_BYTE] = NetdevOp.WaitEvent as UInt8
+        1
+    }
+
+    /// `Stats`.
+    public func stats(&var self) -> UInt {
+        self.bytes[OP_BYTE] = NetdevOp.Stats as UInt8
+        1
+    }
+
+    /// A request with an op byte of any value and `payload` bytes after it,
+    /// for the refusals a client tests. `payload` is at most `BODY_BYTES - 1`.
+    public func raw(&var self, op: UInt8, payload: UInt) -> UInt {
+        self.bytes[OP_BYTE] = op
+        payload + 1
+    }
+
+    /// A reply of the status alone.
+    public func refuse(&var self, status: NetdevStatus) -> UInt {
+        self.bytes[0] = status as UInt8
+        1
+    }
+
+    /// An `Ok` and nothing else: what `Tx` and `RxReturn` answer.
+    public func ok(&var self) -> UInt {
+        self.refuse(NetdevStatus.Ok)
+    }
+
+    /// An `Attach` answer.
+    public func ok_attach(&var self, info: &AttachInfo) -> UInt {
+        self.bytes[0] = NetdevStatus.Ok as UInt8
+        var i = 0
+        while i < MAC_BYTES {
+            self.bytes[1 + i] = info.mac[i]
+            i = i + 1
+        }
+        self.put_u16(7, info.mtu)
+        self.put_u16(9, info.to_server)
+        self.put_u16(11, info.to_client)
+        ATTACH_REPLY_BYTES
+    }
+
+    /// A `WaitEvent` answer.
+    public func ok_event(&var self, event: &NetdevEvent) -> UInt {
+        self.bytes[0] = NetdevStatus.Ok as UInt8
+        match event {
+            case RxReady(range) -> {
+                self.bytes[1] = EventKind.RxReady as UInt8
+                self.put_u16(2, range.first)
+                self.put_u16(4, range.count)
+                EVENT_REPLY_BYTES
+            },
+            case TxDone(range) -> {
+                self.bytes[1] = EventKind.TxDone as UInt8
+                self.put_u16(2, range.first)
+                self.put_u16(4, range.count)
+                EVENT_REPLY_BYTES
+            },
+            case LinkUp -> {
+                self.bytes[1] = EventKind.LinkUp as UInt8
+                2
+            },
+            case LinkDown -> {
+                self.bytes[1] = EventKind.LinkDown as UInt8
+                2
+            },
+        }
+    }
+
+    /// A `Stats` answer.
+    public func ok_stats(&var self, stats: &NetdevStats) -> UInt {
+        self.bytes[0] = NetdevStatus.Ok as UInt8
+        self.put_u32(1, stats.rx_frames)
+        self.put_u32(5, stats.rx_dropped)
+        self.put_u32(9, stats.tx_frames)
+        self.put_u32(13, stats.tx_errors)
+        self.put_u32(17, stats.ring_faults)
+        STATS_REPLY_BYTES
+    }
+}
+
+/// A received message's length and bytes: all the decoders read, so the wire
+/// is tested without a kernel.
+///
+/// Only `init` makes one, so its length is at most `BODY_BYTES`, which the
+/// decoders rely on.
+public struct Frame {
+    // How many of the bytes are the message's.
+    private count: UInt,
+    private body: [UInt8; BODY_BYTES],
+}
+
+extension Frame {
+    /// The message of the first `len` bytes of `body`, or `Length` for a
+    /// length past the body.
+    public init(len: UInt, body: [UInt8; BODY_BYTES]) -> Result<Frame, WireError> {
+        if len > BODY_BYTES as UInt { return WireError.Length(len) }
+        return Frame(count: len, body: body)
+    }
+
+    /// How many bytes the message has.
+    public func len(&self) -> UInt {
+        self.count
+    }
+
+    /// The body the message's bytes are the first of.
+    public func bytes(&self) -> [UInt8; BODY_BYTES] {
+        self.body
+    }
+
+    /// Byte `at`; zero past the message's end.
+    public func byte(&self, at: Int) -> UInt8 {
+        if at < 0 || (at as UInt) >= self.count { return 0 }
+        self.body[at]
+    }
+
+    /// The little-endian half-word at byte `at`.
+    public func u16(&self, at: Int) -> UInt16 {
+        (self.byte(at) as UInt16) | ((self.byte(at + 1) as UInt16) << 8)
+    }
+
+    /// The little-endian word at byte `at`.
+    public func u32(&self, at: Int) -> UInt32 {
+        (self.u16(at) as UInt32) | ((self.u16(at + 2) as UInt32) << 16)
+    }
+
+    /// The slot range at byte `at`, refused unless some ring can hold it.
+    func range(&self, at: Int) -> Result<SlotRange, WireError> {
+        let range = SlotRange(first: self.u16(at), count: self.u16(at + 2))
+        if not range.fits(MAX_SLOTS) {
+            return WireError.Range(range.first, range.count)
+        }
+        return range
+    }
+
+    /// The request this message is, or why it is none. A driver answers a
+    /// refusal with its `WireError.status()`.
+    public func request(&self) -> Result<NetdevRequest, WireError> {
+        if self.count == 0 { return WireError.NoBytes }
+        let raw = self.body[OP_BYTE]
+        guard let op = NetdevOp.from(raw: raw) else { return WireError.UnknownOp(raw) }
+        if self.count != op.payload_bytes() + 1 { return WireError.Length(self.count) }
+        match op {
+            case Attach -> {
+                let to_server = self.u16(1)
+                let to_client = self.u16(3)
+                try check_count(to_server)
+                try check_count(to_client)
+                NetdevRequest.Attach(to_server, to_client)
+            },
+            case Tx -> NetdevRequest.Tx(try self.range(1)),
+            case RxReturn -> NetdevRequest.RxReturn(try self.range(1)),
+            case WaitEvent -> NetdevRequest.WaitEvent,
+            case Stats -> NetdevRequest.Stats,
+        }
+    }
+
+    /// The status a reply carries, or why it carries none.
+    func status(&self) -> Result<NetdevStatus, WireError> {
+        if self.count == 0 { return WireError.NoBytes }
+        let raw = self.body[0]
+        guard let status = NetdevStatus.from(raw: raw) else {
+            return WireError.UnknownStatus(raw)
+        }
+        return status
+    }
+
+    /// The reply's status when it is `Ok` with `len` bytes; the refusal it
+    /// carries, or why it is malformed, otherwise.
+    func ok(&self, len: UInt) -> Result<Void, NetdevError> {
+        let status = try self.status() catch { return NetdevError.Malformed(error) }
+        if status != NetdevStatus.Ok {
+            if self.count != 1 { return NetdevError.Malformed(WireError.Length(self.count)) }
+            return NetdevError.Refused(status)
+        }
+        if self.count != len { return NetdevError.Malformed(WireError.Length(self.count)) }
+        return
+    }
+}
+
+/// A slot count an `Attach` may carry: one to `MAX_SLOTS`.
+func check_count(count: UInt16) -> Result<Void, WireError> {
+    if count == 0 || (count as UInt32) > MAX_SLOTS { return WireError.SlotCount(count) }
+    return
+}
+
+/// The reply to a `Tx` or an `RxReturn` sent as a call: `Ok` alone, or a
+/// refusal.
+public func empty_reply(reply: &Frame) -> Result<Void, NetdevError> {
+    reply.ok(1)
+}
+
+/// An `Attach`'s reply. Slot counts no ring can have, and an MTU whose frame
+/// would not fit a slot, are malformed.
+public func attach_reply(reply: &Frame) -> Result<AttachInfo, NetdevError> {
+    try reply.ok(ATTACH_REPLY_BYTES)
+    var mac: [UInt8; MAC_BYTES] = [0; MAC_BYTES]
+    var i = 0
+    while i < MAC_BYTES {
+        mac[i] = reply.byte(1 + i)
+        i = i + 1
+    }
+    let mtu = reply.u16(7)
+    if (mtu as UInt32) + ETHERNET_HEADER_BYTES > SLOT_BYTES {
+        return NetdevError.Malformed(WireError.Mtu(mtu))
+    }
+    let to_server = reply.u16(9)
+    let to_client = reply.u16(11)
+    try check_count(to_server) catch { return NetdevError.Malformed(error) }
+    try check_count(to_client) catch { return NetdevError.Malformed(error) }
+    return AttachInfo(mac: mac, mtu: mtu, to_server: to_server, to_client: to_client)
+}
+
+/// A `WaitEvent`'s reply.
+public func event_reply(reply: &Frame) -> Result<NetdevEvent, NetdevError> {
+    let status = try reply.status() catch { return NetdevError.Malformed(error) }
+    if status != NetdevStatus.Ok || reply.count < 2 {
+        try reply.ok(2)
+    }
+    let raw = reply.body[1]
+    guard let kind = EventKind.from(raw: raw) else {
+        return NetdevError.Malformed(WireError.UnknownEvent(raw))
+    }
+    match kind {
+        case RxReady -> {
+            try reply.ok(EVENT_REPLY_BYTES)
+            let range = try reply.range(2) catch { return NetdevError.Malformed(error) }
+            NetdevEvent.RxReady(range)
+        },
+        case TxDone -> {
+            try reply.ok(EVENT_REPLY_BYTES)
+            let range = try reply.range(2) catch { return NetdevError.Malformed(error) }
+            NetdevEvent.TxDone(range)
+        },
+        case LinkUp -> {
+            try reply.ok(2)
+            NetdevEvent.LinkUp
+        },
+        case LinkDown -> {
+            try reply.ok(2)
+            NetdevEvent.LinkDown
+        },
+    }
+}
+
+/// A `Stats`'s reply.
+public func stats_reply(reply: &Frame) -> Result<NetdevStats, NetdevError> {
+    try reply.ok(STATS_REPLY_BYTES)
+    return NetdevStats(rx_frames: reply.u32(1), rx_dropped: reply.u32(5),
+                       tx_frames: reply.u32(9), tx_errors: reply.u32(13),
+                       ring_faults: reply.u32(17))
+}

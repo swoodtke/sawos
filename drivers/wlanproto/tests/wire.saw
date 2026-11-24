@@ -1,0 +1,404 @@
+// The wireless LAN wire: each op, status, auth, state, reason and event value
+// written out; each builder's bytes; every request, reply and event built,
+// decoded and compared with what was built; and each malformed message
+// refused by name, with the status a driver answers it.
+
+import wlanproto.{BODY_BYTES, BSSID_BYTES, DisconnectReason, EventKind, Frame, KEY_BYTES,
+                  Key, Network, PASSPHRASE_MAX, PASSPHRASE_MIN, SSID_BYTES, Ssid,
+                  StationStatus, WireError, WlanAuth, WlanBody, WlanError, WlanEvent,
+                  WlanOp, WlanRequest, WlanState, WlanStatus, check_key, empty_reply,
+                  event_reply, status_reply}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func frame(body: &WlanBody, len: UInt) -> Frame {
+    try! Frame(len: len, body: body.bytes)
+}
+
+func message(len: UInt, first: UInt8, fill: UInt8) -> Frame {
+    var b: [UInt8; BODY_BYTES] = [fill; BODY_BYTES]
+    b[0] = first
+    try! Frame(len: len, body: b)
+}
+
+/// `f` with byte `at` set to `b`.
+func with(f: &Frame, at: Int, b: UInt8) -> Frame {
+    var body = f.bytes()
+    body[at] = b
+    try! Frame(len: f.len(), body: body)
+}
+
+/// `f` with its length set to `len`.
+func cut(f: &Frame, len: UInt) -> Frame {
+    try! Frame(len: len, body: f.bytes())
+}
+
+func ssid(text: String) -> Ssid {
+    try! Ssid(text: text)
+}
+
+func key(text: String) -> Key {
+    try! Key(text: text)
+}
+
+func request_is(f: &Frame, want: WlanRequest) -> Bool {
+    match f.request() {
+        case Ok(got) -> got == want,
+        case Err(_) -> false,
+    }
+}
+
+func refused(f: &Frame, want: WireError) -> Bool {
+    match f.request() {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func is_err<V>(r: Result<V, WlanError>, want: WlanError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func malformed(why: WireError) -> WlanError {
+    WlanError.Malformed(why)
+}
+
+func repeat(c: String, n: Int) -> String {
+    var s = ""
+    var i = 0
+    while i < n {
+        s = "{s}{c}"
+        i = i + 1
+    }
+    s
+}
+
+/// A `Connect` of `ssid`, `auth` and `key`, as a message.
+func connect(ssid: &Ssid, auth: WlanAuth, key: &Key) -> Frame {
+    var b = WlanBody.empty()
+    let n = b.connect(&ssid, auth, &key)
+    frame(&b, n)
+}
+
+func numbers() {
+    check(WlanOp.Scan as UInt8 == 1 && WlanOp.Connect as UInt8 == 2 &&
+          WlanOp.Disconnect as UInt8 == 3 && WlanOp.Status as UInt8 == 4 &&
+          WlanOp.WaitEvent as UInt8 == 5, "the op numbers")
+    check(WlanStatus.Ok as UInt8 == 0 && WlanStatus.BadOp as UInt8 == 1 &&
+          WlanStatus.BadArg as UInt8 == 2 && WlanStatus.Unsupported as UInt8 == 3 &&
+          WlanStatus.Busy as UInt8 == 4, "the status numbers")
+    check(WlanAuth.Open as UInt8 == 0 && WlanAuth.Wep as UInt8 == 1 &&
+          WlanAuth.Wpa2Psk as UInt8 == 2 && WlanAuth.Wpa3Sae as UInt8 == 3 &&
+          WlanAuth.Enterprise as UInt8 == 4, "the auth numbers")
+    check(WlanState.Idle as UInt8 == 0 && WlanState.Scanning as UInt8 == 1 &&
+          WlanState.Joining as UInt8 == 2 && WlanState.Joined as UInt8 == 3,
+          "the state numbers")
+    check(DisconnectReason.Requested as UInt8 == 1 && DisconnectReason.NotFound as UInt8 == 2 &&
+          DisconnectReason.AuthFailed as UInt8 == 3 && DisconnectReason.Lost as UInt8 == 4,
+          "the reason numbers")
+    check(EventKind.ScanResult as UInt8 == 1 && EventKind.ScanDone as UInt8 == 2 &&
+          EventKind.Connected as UInt8 == 3 && EventKind.Disconnected as UInt8 == 4,
+          "the event numbers")
+    check(BODY_BYTES == 128 && SSID_BYTES == 32 && KEY_BYTES == 64 && BSSID_BYTES == 6 &&
+          PASSPHRASE_MIN == 8 && PASSPHRASE_MAX == 63, "the sizes")
+    check(WlanAuth.Open.joinable() && WlanAuth.Wpa2Psk.joinable() &&
+          not WlanAuth.Wep.joinable() && not WlanAuth.Wpa3Sae.joinable() &&
+          not WlanAuth.Enterprise.joinable(), "the station joins Open and WPA2")
+    check(WlanOp.Scan.describe().equals("scan") && WlanOp.Connect.describe().equals("connect") &&
+          WlanOp.Disconnect.describe().equals("disconnect") &&
+          WlanOp.Status.describe().equals("status") &&
+          WlanOp.WaitEvent.describe().equals("wait_event"), "each op's name")
+    check(WlanStatus.Unsupported.describe().equals("Unsupported") &&
+          WlanStatus.Busy.describe().equals("Busy") && WlanStatus.Ok.describe().equals("Ok") &&
+          WlanStatus.BadOp.describe().equals("BadOp") &&
+          WlanStatus.BadArg.describe().equals("BadArg"), "each status's name")
+
+    // A Connect's bytes.
+    var b = WlanBody.empty()
+    let n = b.connect(&ssid("ab"), WlanAuth.Wpa2Psk, &key("password"))
+    check(n == 14 && b.bytes[0] == 2 && b.bytes[1] == 2 && b.bytes[2] == 0x61 &&
+          b.bytes[3] == 0x62 && b.bytes[4] == 2 && b.bytes[5] == 8 && b.bytes[6] == 0x70 &&
+          b.bytes[13] == 0x64, "a Connect")
+    b.wipe()
+    var zero = true
+    var i = 0
+    while i < BODY_BYTES {
+        if b.bytes[i] != 0 { zero = false }
+        i = i + 1
+    }
+    check(zero, "a wiped body holds no key")
+    check(b.bare(WlanOp.Status) == 1 && b.bytes[0] == 4, "Status")
+    check(b.raw(9, 2) == 3 && b.bytes[0] == 9, "a raw request")
+    check(b.refuse(WlanStatus.Busy) == 1 && b.bytes[0] == 4, "a refusal")
+
+    // A Status answer's bytes: the RSSI is a signed byte.
+    let st = StationStatus(state: WlanState.Joined, bssid: [1, 2, 3, 4, 5, 6], channel: 11,
+                           rssi: -40, ssid: ssid("net"))
+    let m = b.ok_status(&st)
+    check(m == 14 && b.bytes[0] == 0 && b.bytes[1] == 3 && b.bytes[2] == 1 &&
+          b.bytes[7] == 6 && b.bytes[8] == 11 && b.bytes[9] == 0xD8 && b.bytes[10] == 3 &&
+          b.bytes[11] == 0x6E, "a Status answer")
+}
+
+func requests() {
+    var b = WlanBody.empty()
+    var n = b.bare(WlanOp.Scan)
+    check(request_is(&frame(&b, n), WlanRequest.Scan), "Scan round trip")
+    n = b.bare(WlanOp.Disconnect)
+    check(request_is(&frame(&b, n), WlanRequest.Disconnect), "Disconnect round trip")
+    n = b.bare(WlanOp.Status)
+    check(request_is(&frame(&b, n), WlanRequest.Status), "Status round trip")
+    n = b.bare(WlanOp.WaitEvent)
+    check(request_is(&frame(&b, n), WlanRequest.WaitEvent), "WaitEvent round trip")
+
+    let home = ssid("home")
+    let pass = key("correct horse")
+    check(request_is(&connect(&home, WlanAuth.Wpa2Psk, &pass),
+                     WlanRequest.Connect(home, WlanAuth.Wpa2Psk, pass)), "a WPA2 Connect")
+    check(request_is(&connect(&home, WlanAuth.Open, &Key.none()),
+                     WlanRequest.Connect(home, WlanAuth.Open, Key.none())), "an Open Connect")
+    let longest = ssid(repeat("s", 32))
+    let psk = key(repeat("aF09", 16))
+    check(request_is(&connect(&longest, WlanAuth.Wpa2Psk, &psk),
+                     WlanRequest.Connect(longest, WlanAuth.Wpa2Psk, psk)),
+          "the longest SSID and a hex key")
+    let shortest = key("12345678")
+    let printable = key(" ~{repeat("x", 61)}")
+    check(request_is(&connect(&home, WlanAuth.Wpa2Psk, &shortest),
+                     WlanRequest.Connect(home, WlanAuth.Wpa2Psk, shortest)),
+          "the shortest passphrase")
+    check(request_is(&connect(&home, WlanAuth.Wpa2Psk, &printable),
+                     WlanRequest.Connect(home, WlanAuth.Wpa2Psk, printable)),
+          "the longest passphrase, its ends printable")
+    // An auth the station does not join still decodes: the driver answers
+    // it Unsupported.
+    check(request_is(&connect(&home, WlanAuth.Wpa3Sae, &pass),
+                     WlanRequest.Connect(home, WlanAuth.Wpa3Sae, pass)), "a WPA3 Connect")
+
+    // Each malformed request, by name.
+    check(refused(&message(0, 1, 0), WireError.NoBytes), "no bytes")
+    check(refused(&message(1, 0, 0), WireError.UnknownOp(0)), "op 0")
+    check(refused(&message(1, 6, 0), WireError.UnknownOp(6)), "op 6")
+    check(refused(&message(2, 1, 0), WireError.Length(2)), "Scan with a byte")
+    check(refused(&message(2, 3, 0), WireError.Length(2)), "Disconnect with a byte")
+    check(refused(&message(2, 4, 0), WireError.Length(2)), "Status with a byte")
+    check(refused(&message(2, 5, 0), WireError.Length(2)), "WaitEvent with a byte")
+    check(refused(&message(1, 2, 0), WireError.Length(1)), "Connect of nothing")
+    check(refused(&message(2, 2, 0), WireError.SsidLength(0)), "an SSID of no bytes")
+    check(refused(&message(40, 2, 33), WireError.SsidLength(33)), "an SSID past 32")
+    var f = connect(&home, WlanAuth.Open, &Key.none())
+    check(refused(&cut(&f, f.len() - 1), WireError.Length(7)),
+          "a Connect cut before its key length")
+    f = connect(&home, WlanAuth.Wpa2Psk, &pass)
+    check(refused(&cut(&f, f.len() - 1), WireError.Length(f.len() - 1)),
+          "a Connect cut inside its key")
+    check(refused(&cut(&f, f.len() + 1), WireError.Length(f.len() + 1)),
+          "a Connect past its key")
+    // A key length past KEY_BYTES with the bytes to match.
+    var long = message(100, 2, 0x61)
+    long = with(&long, 1, 1)
+    long = with(&long, 3, 2)
+    long = with(&long, 4, 95)
+    check(refused(&long, WireError.KeyLength(95)), "a key past 64")
+    var auth = connect(&home, WlanAuth.Open, &Key.none())
+    auth = with(&auth, 6, 5)
+    check(refused(&auth, WireError.UnknownAuth(5)), "auth 5")
+    check(refused(&connect(&home, WlanAuth.Open, &pass), WireError.KeyLength(13)),
+          "an Open network with a key")
+    check(refused(&connect(&home, WlanAuth.Wpa2Psk, &Key.none()), WireError.KeyLength(0)),
+          "WPA2 with no key")
+    check(refused(&connect(&home, WlanAuth.Wpa2Psk, &key("1234567")),
+                  WireError.KeyLength(7)), "a passphrase of 7")
+    check(refused(&connect(&home, WlanAuth.Wpa2Psk, &key(repeat("x", 64))),
+                  WireError.KeyByte(0x78)), "64 bytes that are not hex")
+    check(refused(&connect(&home, WlanAuth.Wpa2Psk, &key("passw\u{1F}rd")),
+                  WireError.KeyByte(0x1F)), "a passphrase with a control byte")
+    check(refused(&connect(&home, WlanAuth.Wpa2Psk, &key("passw\u{7F}rd")),
+                  WireError.KeyByte(0x7F)), "a passphrase with DEL")
+
+    // A hex key's characters, at each edge of each run.
+    let edges = ["/", ":", "@", "G", "`", "g"]
+    var i = 0
+    while i < 6 {
+        let k = key("{repeat("0", 63)}{edges[i]}")
+        check(match check_key(WlanAuth.Wpa2Psk, &k) {
+                  case Ok(_) -> false,
+                  case Err(e) -> e == WireError.KeyByte(k.bytes()[63]),
+              }, "a byte beside a hex run")
+        i = i + 1
+    }
+    let ends = ["0", "9", "A", "F", "a", "f"]
+    i = 0
+    while i < 6 {
+        let k = key("{repeat("0", 63)}{ends[i]}")
+        check(match check_key(WlanAuth.Wpa2Psk, &k) { case Ok(_) -> true, case Err(_) -> false },
+              "a hex run's ends")
+        i = i + 1
+    }
+    // An auth the station does not join takes any key.
+    check(match check_key(WlanAuth.Wep, &key("\u{1}")) {
+              case Ok(_) -> true, case Err(_) -> false }, "WEP's key is not checked")
+    check(match check_key(WlanAuth.Wpa3Sae, &Key.none()) {
+              case Ok(_) -> true, case Err(_) -> false }, "nor WPA3's, none included")
+
+    check(WireError.NoBytes.status() == WlanStatus.BadOp &&
+          WireError.UnknownOp(9).status() == WlanStatus.BadOp &&
+          WireError.Length(3).status() == WlanStatus.BadOp, "a shape is BadOp")
+    check(WireError.SsidLength(0).status() == WlanStatus.BadArg &&
+          WireError.UnknownAuth(9).status() == WlanStatus.BadArg &&
+          WireError.KeyLength(1).status() == WlanStatus.BadArg &&
+          WireError.KeyByte(1).status() == WlanStatus.BadArg, "a value is BadArg")
+}
+
+func replies() {
+    var r = WlanBody.empty()
+    var n = r.ok()
+    check(match empty_reply(&frame(&r, n)) { case Ok(_) -> true, case Err(_) -> false },
+          "Ok alone")
+    check(is_err(empty_reply(&frame(&r, 2)), malformed(WireError.Length(2))), "Ok and a byte")
+    n = r.refuse(WlanStatus.Unsupported)
+    check(is_err(empty_reply(&frame(&r, n)), WlanError.Refused(WlanStatus.Unsupported)),
+          "a Connect refused")
+    check(is_err(empty_reply(&message(2, 4, 0)), malformed(WireError.Length(2))),
+          "a refusal with a byte")
+    check(is_err(empty_reply(&message(1, 5, 0)), malformed(WireError.UnknownStatus(5))),
+          "status 5")
+    check(is_err(empty_reply(&message(0, 0, 0)), malformed(WireError.NoBytes)), "no bytes")
+
+    // Status.
+    let idle = StationStatus(state: WlanState.Idle, bssid: [0; 6], channel: 0, rssi: 0,
+                             ssid: Ssid.none())
+    let joined = StationStatus(state: WlanState.Joined, bssid: [1, 2, 3, 4, 5, 6], channel: 13,
+                               rssi: -128, ssid: ssid(repeat("n", 32)))
+    n = r.ok_status(&idle)
+    check(match status_reply(&frame(&r, n)) { case Ok(got) -> got == idle, case Err(_) -> false },
+          "an idle Status round trip")
+    n = r.ok_status(&joined)
+    check(match status_reply(&frame(&r, n)) { case Ok(got) -> got == joined,
+                                              case Err(_) -> false },
+          "a joined Status round trip")
+    check(is_err(status_reply(&frame(&r, n - 1)), malformed(WireError.Length(n - 1))),
+          "a Status cut inside its SSID")
+    check(is_err(status_reply(&frame(&r, 10)), malformed(WireError.Length(10))),
+          "a Status cut before its SSID")
+    var bad = frame(&r, n)
+    bad = with(&bad, 1, 4)
+    check(is_err(status_reply(&bad), malformed(WireError.UnknownState(4))), "state 4")
+    var long = message(44, 0, 0x6E)
+    long = with(&long, 1, 3)
+    long = with(&long, 10, 33)
+    check(is_err(status_reply(&long), malformed(WireError.SsidLength(33))),
+          "a Status SSID past 32")
+    n = r.refuse(WlanStatus.BadOp)
+    check(is_err(status_reply(&frame(&r, n)), WlanError.Refused(WlanStatus.BadOp)),
+          "a Status refused")
+    check(is_err(status_reply(&message(1, 0, 3)), malformed(WireError.Length(1))),
+          "Ok and no status")
+
+    // Events.
+    let events = [WlanEvent.ScanResult(Network(bssid: [9, 8, 7, 6, 5, 4], channel: 1,
+                                               rssi: 127, auth: WlanAuth.Enterprise,
+                                               ssid: ssid("cafe"))),
+                  WlanEvent.ScanResult(Network(bssid: [0; 6], channel: 6, rssi: -90,
+                                               auth: WlanAuth.Open, ssid: Ssid.none())),
+                  WlanEvent.ScanDone(0x0102),
+                  WlanEvent.Connected([1, 1, 2, 3, 5, 8], 11),
+                  WlanEvent.Disconnected(DisconnectReason.Requested),
+                  WlanEvent.Disconnected(DisconnectReason.NotFound),
+                  WlanEvent.Disconnected(DisconnectReason.AuthFailed),
+                  WlanEvent.Disconnected(DisconnectReason.Lost)]
+    var i = 0
+    while i < 8 {
+        let e = events[i]
+        n = r.ok_event(&e)
+        check(match event_reply(&frame(&r, n)) { case Ok(got) -> got == e, case Err(_) -> false },
+              "an event round trip")
+        i = i + 1
+    }
+    n = r.ok_event(&events[0])
+    check(n == 16 && r.bytes[1] == 1 && r.bytes[2] == 9 && r.bytes[8] == 1 &&
+          r.bytes[9] == 127 && r.bytes[10] == 4 && r.bytes[11] == 4 && r.bytes[12] == 0x63,
+          "a ScanResult's bytes")
+    check(is_err(event_reply(&frame(&r, n + 1)), malformed(WireError.Length(n + 1))),
+          "a ScanResult past its SSID")
+    check(is_err(event_reply(&frame(&r, 11)), malformed(WireError.Length(11))),
+          "a ScanResult cut before its SSID")
+    var auth = frame(&r, n)
+    auth = with(&auth, 10, 7)
+    check(is_err(event_reply(&auth), malformed(WireError.UnknownAuth(7))), "a result's auth 7")
+    var past = message(50, 0, 0)
+    past = with(&past, 1, 1)
+    past = with(&past, 11, 40)
+    check(is_err(event_reply(&past), malformed(WireError.SsidLength(40))),
+          "a result's SSID past 32")
+    n = r.ok_event(&events[2])
+    check(n == 4 && r.bytes[1] == 2 && r.bytes[2] == 2 && r.bytes[3] == 1, "ScanDone's bytes")
+    check(is_err(event_reply(&frame(&r, 3)), malformed(WireError.Length(3))), "ScanDone short")
+    check(is_err(event_reply(&frame(&r, 5)), malformed(WireError.Length(5))), "ScanDone long")
+    n = r.ok_event(&events[3])
+    check(n == 9 && r.bytes[1] == 3 && r.bytes[7] == 8 && r.bytes[8] == 11, "Connected's bytes")
+    check(is_err(event_reply(&frame(&r, 10)), malformed(WireError.Length(10))), "Connected long")
+    check(is_err(event_reply(&frame(&r, 8)), malformed(WireError.Length(8))), "Connected short")
+    n = r.ok_event(&events[7])
+    check(n == 3 && r.bytes[1] == 4 && r.bytes[2] == 4, "Disconnected's bytes")
+    check(is_err(event_reply(&frame(&r, 4)), malformed(WireError.Length(4))),
+          "Disconnected long")
+    check(is_err(event_reply(&frame(&r, 2)), malformed(WireError.Length(2))),
+          "Disconnected short")
+    var reason = frame(&r, n)
+    reason = with(&reason, 2, 0)
+    check(is_err(event_reply(&reason), malformed(WireError.UnknownReason(0))), "reason 0")
+    reason = with(&reason, 2, 5)
+    check(is_err(event_reply(&reason), malformed(WireError.UnknownReason(5))), "reason 5")
+    check(is_err(event_reply(&message(2, 0, 0)), malformed(WireError.UnknownEvent(0))),
+          "event 0")
+    check(is_err(event_reply(&message(2, 0, 5)), malformed(WireError.UnknownEvent(5))),
+          "event 5")
+    check(is_err(event_reply(&message(1, 0, 0)), malformed(WireError.Length(1))),
+          "Ok with no event")
+    n = r.refuse(WlanStatus.Busy)
+    check(is_err(event_reply(&frame(&r, n)), WlanError.Refused(WlanStatus.Busy)),
+          "a WaitEvent refused")
+    check("{WlanError.Refused(WlanStatus.Busy)}".equals("refused: Busy"),
+          "a refusal prints its status")
+    check("{malformed(WireError.KeyByte(1))}".equals(
+              "malformed: a key byte its form does not take"),
+          "a malformed reply prints why")
+}
+
+func constructors() {
+    // A frame is at most a body; an SSID and a key at most their bytes.
+    let body: [UInt8; BODY_BYTES] = [7; BODY_BYTES]
+    check(match Frame(len: 128, body: body) { case Ok(f) -> f.len() == 128,
+                                              case Err(_) -> false }, "a whole body")
+    check(match Frame(len: 129, body: body) { case Ok(_) -> false,
+                                              case Err(e) -> e == WireError.Length(129) },
+          "a frame past the body")
+    let s32 = ssid(repeat("s", 32))
+    check(s32.len() == 32 && s32.bytes()[31] == 0x73, "an SSID of 32")
+    check(match Ssid(text: repeat("s", 33)) { case Ok(_) -> false,
+                                              case Err(e) -> e == WireError.SsidLength(33) },
+          "an SSID past 32")
+    let k64 = key(repeat("k", 64))
+    check(k64.len() == 64 && k64.bytes()[63] == 0x6B, "a key of 64")
+    check(match Key(text: repeat("k", 65)) { case Ok(_) -> false,
+                                             case Err(e) -> e == WireError.KeyLength(65) },
+          "a key past 64")
+    check(Ssid.none().len() == 0 && Key.none().len() == 0, "none of each")
+}
+
+func main() {
+    constructors()
+    numbers()
+    requests()
+    replies()
+}

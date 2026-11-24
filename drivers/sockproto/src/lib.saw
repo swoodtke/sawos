@@ -1,0 +1,866 @@
+//! The sockets protocol: what an application, the client, and the network
+//! stack, the server, say to each other.
+//!
+//! An application holds one connection to the stack, and its sockets are
+//! named inside it by a small id. Bulk data crosses in a `pktring` the client
+//! lays out with `SLOT_BYTES` slots and gives the stack at `Attach`: data to
+//! send in the `ToServer` ring, data received in the `ToClient` ring.
+//! Messages carry the socket and the slots.
+//!
+//! A request is one message: byte 0 the op, then the payload. A reply's byte 0
+//! is a status, then its payload. Integers are little-endian; an address is
+//! IPv4's four bytes in network order.
+//!
+//! ```text
+//! op              payload                         reply payload
+//! Attach       1  to_server u16, to_client u16;   to_server u16, to_client u16
+//!                 handle slot 0: the ring
+//! UdpOpen      2  port u16                        id u8, port u16
+//! TcpConnect   3  addr [4], port u16              id u8, port u16
+//! TcpListen    4  port u16                        id u8
+//! Accept       5  id u8                           id u8, addr [4], port u16
+//! Send         6  id u8, first u16, count u16     -
+//! Recv         7  id u8                           first u16, count u16
+//! Close        8  id u8                           -
+//! Resolve      9  name_len u8, name               addr [4]
+//! IfStatus    10  -                               up u8, addr [4],
+//!                                                 netmask [4],
+//!                                                 gateway [4], dns [4],
+//!                                                 mtu u16, mac [6]
+//! ```
+//!
+//! A reply that is not `Ok` carries the status byte alone.
+//!
+//! # The ops
+//!
+//!   - `Attach`     - a call, the connection's first request: the client's
+//!                    ring, laid out as in `netdevproto`, answered with its
+//!                    slot counts.
+//!   - `UdpOpen`    - a call: a UDP socket bound to `port`, or to a port the
+//!                    stack chooses for zero. The answer is its id and port.
+//!   - `TcpConnect` - a call the stack holds until the connection is made or
+//!                    fails: the id and the local port, or `Refused`,
+//!                    `Unreachable` or `TimedOut`.
+//!   - `TcpListen`  - a call: a listening socket on `port`.
+//!   - `Accept`     - a call the stack holds until the listener `id` has a
+//!                    connection: the new socket's id and its peer.
+//!   - `Send`       - a tell or a call: the `count` slots of the `ToServer`
+//!                    ring from `first` hold the socket's data, in order. A
+//!                    UDP socket's slots each hold one datagram, which opens
+//!                    with its destination (`put_datagram_header`).
+//!   - `Recv`       - a call the stack holds until the socket has data: the
+//!                    `ToClient` slots that hold it, a UDP socket's each one
+//!                    datagram opening with its source (`datagram`). A TCP
+//!                    socket whose peer closed its side is answered `Ended`.
+//!   - `Close`      - a call or a tell: the socket is gone, and its id may
+//!                    name the next one opened.
+//!   - `Resolve`    - a call: the address `name` resolves to, or `NotFound`.
+//!   - `IfStatus`   - a call: whether the interface is up, and its
+//!                    addresses, MTU and MAC address.
+//!
+//! The ring is FIFO, so the client sends its data in the order of its `Send`s
+//! and takes it in the order the answers to its `Recv`s name it; the slot
+//! numbers let it check the two agree.
+//!
+//! # Statuses
+//!
+//! They are checked in this order, and the first that applies is answered:
+//! `BadOp` (a message of no bytes, an op byte that names no op, or a length
+//! its op does not have), `BadArg` (a slot count, range, socket id, port,
+//! address or name the protocol refuses), `NotAttached` (any op before
+//! `Attach`), `Attached` (a second `Attach`), `NoSocket` (an id that names no
+//! open socket), `WrongKind` (an op the socket's kind does not do), `Busy` (a
+//! held call on a socket that holds one), then the op's own: `InUse` (a port
+//! bound already), `NoRoom` (every id open), `Down` (no interface), and the
+//! outcomes above.
+//!
+//! # Failure
+//!
+//! The ring is input (`pktring`), and so is a datagram's header in it. An
+//! application's death is the connection's peer-closed, which closes every
+//! socket it held.
+
+import pktring.{Layout, LayoutError, MAX_SLOTS, SlotRange}
+
+/// The bytes of a message body: the kernel's `PIPE_BODY_BYTES`.
+public static BODY_BYTES: Int = 128
+
+/// The bytes of each slot of the ring, in both directions.
+public static SLOT_BYTES: UInt32 = 2048
+
+/// The most sockets one connection holds open: an id is below it.
+public static MAX_SOCKETS: UInt8 = 16
+
+/// An address's bytes.
+public static ADDR_BYTES: Int = 4
+
+/// A MAC address's bytes.
+public static MAC_BYTES: Int = 6
+
+/// The most bytes of a name to resolve: the body less the op and the length.
+public static MAX_NAME_BYTES: Int = BODY_BYTES - 2
+
+/// A datagram's header in its slot: the address, then the port.
+public static DATAGRAM_HEADER_BYTES: UInt = 6
+
+/// The layout of a ring of `to_server` and `to_client` slots.
+public func layout(to_server: UInt16, to_client: UInt16) -> Result<Layout, LayoutError> {
+    Layout(slot_bytes: SLOT_BYTES, to_server: to_server as UInt32,
+           to_client: to_client as UInt32)
+}
+
+/// The op byte. Raw-backed because it crosses a wire: each value is stated.
+public enum SockOp: UInt8 {
+    case Attach = 1,
+    case UdpOpen = 2,
+    case TcpConnect = 3,
+    case TcpListen = 4,
+    case Accept = 5,
+    case Send = 6,
+    case Recv = 7,
+    case Close = 8,
+    case Resolve = 9,
+    case IfStatus = 10,
+}
+
+extension SockOp {
+    /// What a transcript should call this op.
+    public func describe(&self) -> String {
+        match self {
+            case Attach -> "attach",
+            case UdpOpen -> "udp_open",
+            case TcpConnect -> "tcp_connect",
+            case TcpListen -> "tcp_listen",
+            case Accept -> "accept",
+            case Send -> "send",
+            case Recv -> "recv",
+            case Close -> "close",
+            case Resolve -> "resolve",
+            case IfStatus -> "if_status",
+        }
+    }
+
+    /// How many payload bytes a request of this op carries; a `Resolve`'s
+    /// depends on its name.
+    public func payload_bytes(&self) -> UInt {
+        match self {
+            case Attach -> 4,
+            case UdpOpen -> 2,
+            case TcpConnect -> 6,
+            case TcpListen -> 2,
+            case Accept -> 1,
+            case Send -> 5,
+            case Recv -> 1,
+            case Close -> 1,
+            case Resolve -> 1,
+            case IfStatus -> 0,
+        }
+    }
+}
+
+/// A reply's status byte. `Ok` is 0.
+public enum SockStatus: UInt8 {
+    case Ok = 0,
+    case BadOp = 1,
+    case BadArg = 2,
+    case NotAttached = 3,
+    case Attached = 4,
+    case NoSocket = 5,
+    case WrongKind = 6,
+    case InUse = 7,
+    case NoRoom = 8,
+    case Refused = 9,
+    case Unreachable = 10,
+    case TimedOut = 11,
+    case Ended = 12,
+    case NotFound = 13,
+    case Busy = 14,
+    case Down = 15,
+}
+
+@synthesize
+extension SockStatus: Equatable {}
+
+extension SockStatus {
+    /// What a transcript should call this status.
+    public func describe(&self) -> String {
+        match self {
+            case Ok -> "Ok",
+            case BadOp -> "BadOp",
+            case BadArg -> "BadArg",
+            case NotAttached -> "NotAttached",
+            case Attached -> "Attached",
+            case NoSocket -> "NoSocket",
+            case WrongKind -> "WrongKind",
+            case InUse -> "InUse",
+            case NoRoom -> "NoRoom",
+            case Refused -> "Refused",
+            case Unreachable -> "Unreachable",
+            case TimedOut -> "TimedOut",
+            case Ended -> "Ended",
+            case NotFound -> "NotFound",
+            case Busy -> "Busy",
+            case Down -> "Down",
+        }
+    }
+}
+
+/// A name to resolve: its length and bytes, the bytes past the length zero.
+///
+/// Only its constructor and the decoder make one, so its length is one to
+/// `MAX_NAME_BYTES`, which the builder relies on.
+public struct Name {
+    // How many of the bytes are the name's.
+    private count: UInt8,
+    private data: [UInt8; MAX_NAME_BYTES],
+}
+
+@synthesize
+extension Name: Equatable {}
+
+extension Name {
+    /// The name of `text`'s bytes, or `NameLength` for text of no bytes or
+    /// past `MAX_NAME_BYTES`.
+    public init(text: String) -> Result<Name, WireError> {
+        let n = text.len()
+        if n == 0 || n > MAX_NAME_BYTES { return WireError.NameLength(n as UInt) }
+        var name = Name(count: n as UInt8, data: [0; MAX_NAME_BYTES])
+        var i = 0
+        while i < n {
+            name.data[i] = text.byte_at(i)
+            i = i + 1
+        }
+        return name
+    }
+
+    /// How many bytes the name has.
+    public func len(&self) -> UInt8 {
+        self.count
+    }
+
+    /// The name's bytes, zero past its length.
+    public func bytes(&self) -> [UInt8; MAX_NAME_BYTES] {
+        self.data
+    }
+}
+
+/// A request, decoded.
+public enum SockRequest {
+    case Attach(to_server: UInt16, to_client: UInt16),
+    case UdpOpen(port: UInt16),
+    case TcpConnect(addr: [UInt8; ADDR_BYTES], port: UInt16),
+    case TcpListen(port: UInt16),
+    case Accept(id: UInt8),
+    case Send(id: UInt8, range: SlotRange),
+    case Recv(id: UInt8),
+    case Close(id: UInt8),
+    case Resolve(name: Name),
+    case IfStatus,
+}
+
+@synthesize
+extension SockRequest: Equatable {}
+
+/// The slot counts an `Attach` answers.
+public struct RingCounts {
+    public to_server: UInt16,
+    public to_client: UInt16,
+}
+
+@synthesize
+extension RingCounts: Equatable {}
+
+/// A socket opened: what `UdpOpen` and `TcpConnect` answer.
+public struct Opened {
+    public id: UInt8,
+    /// The local port.
+    public port: UInt16,
+}
+
+@synthesize
+extension Opened: Equatable {}
+
+/// A connection accepted: the new socket and its peer.
+public struct Accepted {
+    public id: UInt8,
+    public addr: [UInt8; ADDR_BYTES],
+    public port: UInt16,
+}
+
+@synthesize
+extension Accepted: Equatable {}
+
+/// An `IfStatus` answer.
+public struct InterfaceStatus {
+    public up: Bool,
+    public addr: [UInt8; ADDR_BYTES],
+    public netmask: [UInt8; ADDR_BYTES],
+    public gateway: [UInt8; ADDR_BYTES],
+    public dns: [UInt8; ADDR_BYTES],
+    public mtu: UInt16,
+    public mac: [UInt8; MAC_BYTES],
+}
+
+@synthesize
+extension InterfaceStatus: Equatable {}
+
+/// Why a message is malformed: each shape a decoder refuses, by name.
+public enum WireError {
+    /// A message of no bytes.
+    case NoBytes,
+    /// An op byte that names no op.
+    case UnknownOp(op: UInt8),
+    /// A status byte that names no status.
+    case UnknownStatus(status: UInt8),
+    /// A length the message's op or status does not have.
+    case Length(len: UInt),
+    /// A slot count of none or past `MAX_SLOTS`.
+    case SlotCount(count: UInt16),
+    /// A slot range no ring can hold (`SlotRange.fits` at `MAX_SLOTS`).
+    case Range(first: UInt16, count: UInt16),
+    /// A socket id at or past `MAX_SOCKETS`.
+    case SocketId(id: UInt8),
+    /// A port of zero where a port must be named.
+    case Port(port: UInt16),
+    /// An address of zero where an address must be named.
+    case Addr,
+    /// A name of no bytes, or past `MAX_NAME_BYTES`.
+    case NameLength(len: UInt),
+    /// A flag byte other than 0 or 1.
+    case Flag(byte: UInt8),
+    /// A datagram slot shorter than its header.
+    case Datagram(len: UInt),
+}
+
+@synthesize
+extension WireError: Equatable {}
+
+extension WireError {
+    /// The status a stack answers a request refused for this.
+    public func status(&self) -> SockStatus {
+        match self {
+            case NoBytes -> SockStatus.BadOp,
+            case UnknownOp(_) -> SockStatus.BadOp,
+            case Length(_) -> SockStatus.BadOp,
+            case _ -> SockStatus.BadArg,
+        }
+    }
+
+    /// What a transcript should call this.
+    public func describe(&self) -> String {
+        match self {
+            case NoBytes -> "a message of no bytes",
+            case UnknownOp(_) -> "an op that is none",
+            case UnknownStatus(_) -> "a status that is none",
+            case Length(_) -> "a length its kind does not have",
+            case SlotCount(_) -> "a slot count past the ring's",
+            case Range(_, _) -> "a slot range past the ring's",
+            case SocketId(_) -> "a socket id past the most",
+            case Port(_) -> "no port",
+            case Addr -> "no address",
+            case NameLength(_) -> "a name of a length it cannot have",
+            case Flag(_) -> "a flag that is neither 0 nor 1",
+            case Datagram(_) -> "a datagram shorter than its header",
+        }
+    }
+}
+
+/// Why a reply did not answer what its request asked.
+public enum SockError {
+    /// The stack refused the request, or answered its outcome, with this
+    /// status.
+    case Refused(status: SockStatus),
+    /// The reply is no reply its request can have.
+    case Malformed(why: WireError),
+}
+
+@synthesize
+extension SockError: Equatable {}
+
+extension SockError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        match self {
+            case Refused(status) -> {
+                try! into.append("refused: ")
+                try! into.append(status.describe())
+            },
+            case Malformed(why) -> {
+                try! into.append("malformed: ")
+                try! into.append(why.describe())
+            },
+        }
+    }
+}
+
+extension SockError: Error {}
+
+static OP_BYTE: Int = 0
+
+/// A message body, for a request or a reply. The builders answer the
+/// message's `len`.
+public struct SockBody {
+    public bytes: [UInt8; BODY_BYTES],
+}
+
+extension SockBody {
+    /// A zeroed body.
+    public static func empty() -> SockBody {
+        SockBody(bytes: [0; BODY_BYTES])
+    }
+
+    /// Writes `half` at byte `at`, little-endian.
+    public func put_u16(&var self, at: Int, half: UInt16) {
+        self.bytes[at] = (half & 0xFF) as UInt8
+        self.bytes[at + 1] = (half >> 8) as UInt8
+    }
+
+    /// Writes `addr` at byte `at`.
+    public func put_addr(&var self, at: Int, addr: &[UInt8; ADDR_BYTES]) {
+        var i = 0
+        while i < ADDR_BYTES {
+            self.bytes[at + i] = addr[i]
+            i = i + 1
+        }
+    }
+
+    /// An op and a port: `UdpOpen` and `TcpListen`.
+    func ported(&var self, op: SockOp, port: UInt16) -> UInt {
+        self.bytes[OP_BYTE] = op as UInt8
+        self.put_u16(1, port)
+        3
+    }
+
+    /// An op and a socket id: `Accept`, `Recv` and `Close`.
+    func socket(&var self, op: SockOp, id: UInt8) -> UInt {
+        self.bytes[OP_BYTE] = op as UInt8
+        self.bytes[1] = id
+        2
+    }
+
+    /// `Attach(to_server, to_client)`; the ring goes in handle slot 0.
+    public func attach(&var self, to_server: UInt16, to_client: UInt16) -> UInt {
+        self.bytes[OP_BYTE] = SockOp.Attach as UInt8
+        self.put_u16(1, to_server)
+        self.put_u16(3, to_client)
+        5
+    }
+
+    /// `UdpOpen(port)`; zero asks the stack to choose.
+    public func udp_open(&var self, port: UInt16) -> UInt {
+        self.ported(SockOp.UdpOpen, port)
+    }
+
+    /// `TcpConnect(addr, port)`.
+    public func tcp_connect(&var self, addr: &[UInt8; ADDR_BYTES], port: UInt16) -> UInt {
+        self.bytes[OP_BYTE] = SockOp.TcpConnect as UInt8
+        self.put_addr(1, &addr)
+        self.put_u16(5, port)
+        7
+    }
+
+    /// `TcpListen(port)`.
+    public func tcp_listen(&var self, port: UInt16) -> UInt {
+        self.ported(SockOp.TcpListen, port)
+    }
+
+    /// `Accept(id)`.
+    public func accept(&var self, id: UInt8) -> UInt {
+        self.socket(SockOp.Accept, id)
+    }
+
+    /// `Send(id, first, count)`.
+    public func send(&var self, id: UInt8, range: SlotRange) -> UInt {
+        self.bytes[OP_BYTE] = SockOp.Send as UInt8
+        self.bytes[1] = id
+        self.put_u16(2, range.first)
+        self.put_u16(4, range.count)
+        6
+    }
+
+    /// `Recv(id)`.
+    public func recv(&var self, id: UInt8) -> UInt {
+        self.socket(SockOp.Recv, id)
+    }
+
+    /// `Close(id)`.
+    public func close(&var self, id: UInt8) -> UInt {
+        self.socket(SockOp.Close, id)
+    }
+
+    /// `Resolve(name)`.
+    public func resolve(&var self, name: &Name) -> UInt {
+        self.bytes[OP_BYTE] = SockOp.Resolve as UInt8
+        self.bytes[1] = name.count
+        var i = 0
+        while i < name.count as Int {
+            self.bytes[2 + i] = name.data[i]
+            i = i + 1
+        }
+        (2 + name.count as Int) as UInt
+    }
+
+    /// `IfStatus`.
+    public func if_status(&var self) -> UInt {
+        self.bytes[OP_BYTE] = SockOp.IfStatus as UInt8
+        1
+    }
+
+    /// A request with an op byte of any value and `payload` bytes after it,
+    /// for the refusals a client tests.
+    public func raw(&var self, op: UInt8, payload: UInt) -> UInt {
+        self.bytes[OP_BYTE] = op
+        payload + 1
+    }
+
+    /// A reply of the status alone.
+    public func refuse(&var self, status: SockStatus) -> UInt {
+        self.bytes[0] = status as UInt8
+        1
+    }
+
+    /// An `Ok` and nothing else: what `Send` and `Close` answer.
+    public func ok(&var self) -> UInt {
+        self.refuse(SockStatus.Ok)
+    }
+
+    /// An `Attach` answer.
+    public func ok_attach(&var self, counts: &RingCounts) -> UInt {
+        self.bytes[0] = SockStatus.Ok as UInt8
+        self.put_u16(1, counts.to_server)
+        self.put_u16(3, counts.to_client)
+        5
+    }
+
+    /// A `UdpOpen` or `TcpConnect` answer.
+    public func ok_opened(&var self, opened: &Opened) -> UInt {
+        self.bytes[0] = SockStatus.Ok as UInt8
+        self.bytes[1] = opened.id
+        self.put_u16(2, opened.port)
+        4
+    }
+
+    /// A `TcpListen` answer.
+    public func ok_listening(&var self, id: UInt8) -> UInt {
+        self.bytes[0] = SockStatus.Ok as UInt8
+        self.bytes[1] = id
+        2
+    }
+
+    /// An `Accept` answer.
+    public func ok_accepted(&var self, accepted: &Accepted) -> UInt {
+        self.bytes[0] = SockStatus.Ok as UInt8
+        self.bytes[1] = accepted.id
+        self.put_addr(2, &accepted.addr)
+        self.put_u16(6, accepted.port)
+        8
+    }
+
+    /// A `Recv` answer: the slots that hold the data.
+    public func ok_received(&var self, range: SlotRange) -> UInt {
+        self.bytes[0] = SockStatus.Ok as UInt8
+        self.put_u16(1, range.first)
+        self.put_u16(3, range.count)
+        5
+    }
+
+    /// A `Resolve` answer.
+    public func ok_resolved(&var self, addr: &[UInt8; ADDR_BYTES]) -> UInt {
+        self.bytes[0] = SockStatus.Ok as UInt8
+        self.put_addr(1, &addr)
+        5
+    }
+
+    /// An `IfStatus` answer.
+    public func ok_if_status(&var self, status: &InterfaceStatus) -> UInt {
+        self.bytes[0] = SockStatus.Ok as UInt8
+        self.bytes[1] = if status.up { 1 } else { 0 }
+        self.put_addr(2, &status.addr)
+        self.put_addr(6, &status.netmask)
+        self.put_addr(10, &status.gateway)
+        self.put_addr(14, &status.dns)
+        self.put_u16(18, status.mtu)
+        var i = 0
+        while i < MAC_BYTES {
+            self.bytes[20 + i] = status.mac[i]
+            i = i + 1
+        }
+        26
+    }
+}
+
+/// A received message's length and bytes: all the decoders read, so the wire
+/// is tested without a kernel.
+///
+/// Only `init` makes one, so its length is at most `BODY_BYTES`, which the
+/// decoders rely on.
+public struct Frame {
+    // How many of the bytes are the message's.
+    private count: UInt,
+    private body: [UInt8; BODY_BYTES],
+}
+
+extension Frame {
+    /// The message of the first `len` bytes of `body`, or `Length` for a
+    /// length past the body.
+    public init(len: UInt, body: [UInt8; BODY_BYTES]) -> Result<Frame, WireError> {
+        if len > BODY_BYTES as UInt { return WireError.Length(len) }
+        return Frame(count: len, body: body)
+    }
+
+    /// How many bytes the message has.
+    public func len(&self) -> UInt {
+        self.count
+    }
+
+    /// The body the message's bytes are the first of.
+    public func bytes(&self) -> [UInt8; BODY_BYTES] {
+        self.body
+    }
+
+    /// Byte `at`; zero past the message's end.
+    public func byte(&self, at: Int) -> UInt8 {
+        if at < 0 || (at as UInt) >= self.count { return 0 }
+        self.body[at]
+    }
+
+    /// The little-endian half-word at byte `at`.
+    public func u16(&self, at: Int) -> UInt16 {
+        (self.byte(at) as UInt16) | ((self.byte(at + 1) as UInt16) << 8)
+    }
+
+    /// The address at byte `at`.
+    public func addr(&self, at: Int) -> [UInt8; ADDR_BYTES] {
+        var a: [UInt8; ADDR_BYTES] = [0; ADDR_BYTES]
+        var i = 0
+        while i < ADDR_BYTES {
+            a[i] = self.byte(at + i)
+            i = i + 1
+        }
+        a
+    }
+
+    /// The socket id at byte `at`, refused past the most.
+    func id(&self, at: Int) -> Result<UInt8, WireError> {
+        let id = self.byte(at)
+        if id >= MAX_SOCKETS { return WireError.SocketId(id) }
+        return id
+    }
+
+    /// The slot range at byte `at`, refused unless some ring can hold it.
+    func range(&self, at: Int) -> Result<SlotRange, WireError> {
+        let range = SlotRange(first: self.u16(at), count: self.u16(at + 2))
+        if not range.fits(MAX_SLOTS) {
+            return WireError.Range(range.first, range.count)
+        }
+        return range
+    }
+
+    /// The request this message is, or why it is none. A stack answers a
+    /// refusal with its `WireError.status()`.
+    public func request(&self) -> Result<SockRequest, WireError> {
+        if self.count == 0 { return WireError.NoBytes }
+        let raw = self.body[OP_BYTE]
+        guard let op = SockOp.from(raw: raw) else { return WireError.UnknownOp(raw) }
+        // A name's length past the end reads as zero, so a `Resolve` too short
+        // to state one matches no length.
+        let want = match op {
+            case Resolve -> 2 + self.byte(1) as UInt,
+            case _ -> op.payload_bytes() + 1,
+        }
+        if self.count != want { return WireError.Length(self.count) }
+        match op {
+            case Attach -> {
+                let to_server = self.u16(1)
+                let to_client = self.u16(3)
+                try check_count(to_server)
+                try check_count(to_client)
+                SockRequest.Attach(to_server, to_client)
+            },
+            case UdpOpen -> SockRequest.UdpOpen(self.u16(1)),
+            case TcpConnect -> {
+                let addr = self.addr(1)
+                if is_zero(&addr) { return WireError.Addr }
+                let port = self.u16(5)
+                if port == 0 { return WireError.Port(port) }
+                SockRequest.TcpConnect(addr, port)
+            },
+            case TcpListen -> {
+                let port = self.u16(1)
+                if port == 0 { return WireError.Port(port) }
+                SockRequest.TcpListen(port)
+            },
+            case Accept -> SockRequest.Accept(try self.id(1)),
+            case Send -> {
+                let id = try self.id(1)
+                SockRequest.Send(id, try self.range(2))
+            },
+            case Recv -> SockRequest.Recv(try self.id(1)),
+            case Close -> SockRequest.Close(try self.id(1)),
+            case Resolve -> {
+                // The length check above holds a name to the body.
+                let n = self.body[1]
+                if n == 0 { return WireError.NameLength(n as UInt) }
+                var name = Name(count: n, data: [0; MAX_NAME_BYTES])
+                var i = 0
+                while i < n as Int {
+                    name.data[i] = self.body[2 + i]
+                    i = i + 1
+                }
+                SockRequest.Resolve(name)
+            },
+            case IfStatus -> SockRequest.IfStatus,
+        }
+    }
+
+    /// The status a reply carries, or why it carries none.
+    func status(&self) -> Result<SockStatus, WireError> {
+        if self.count == 0 { return WireError.NoBytes }
+        let raw = self.body[0]
+        guard let status = SockStatus.from(raw: raw) else {
+            return WireError.UnknownStatus(raw)
+        }
+        return status
+    }
+
+    /// Nothing when the reply is `Ok` and `len` bytes; the refusal it
+    /// carries, or why it is malformed, otherwise.
+    func ok(&self, len: UInt) -> Result<Void, SockError> {
+        let status = try self.status() catch { return SockError.Malformed(error) }
+        if status != SockStatus.Ok {
+            if self.count != 1 { return SockError.Malformed(WireError.Length(self.count)) }
+            return SockError.Refused(status)
+        }
+        if self.count != len { return SockError.Malformed(WireError.Length(self.count)) }
+        return
+    }
+}
+
+func is_zero(addr: &[UInt8; ADDR_BYTES]) -> Bool {
+    addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && addr[3] == 0
+}
+
+/// A slot count an `Attach` may carry: one to `MAX_SLOTS`.
+func check_count(count: UInt16) -> Result<Void, WireError> {
+    if count == 0 || (count as UInt32) > MAX_SLOTS { return WireError.SlotCount(count) }
+    return
+}
+
+/// The reply to a `Send` or a `Close` sent as a call: `Ok` alone, or a
+/// refusal.
+public func empty_reply(reply: &Frame) -> Result<Void, SockError> {
+    reply.ok(1)
+}
+
+/// An `Attach`'s reply.
+public func attach_reply(reply: &Frame) -> Result<RingCounts, SockError> {
+    try reply.ok(5)
+    let to_server = reply.u16(1)
+    let to_client = reply.u16(3)
+    try check_count(to_server) catch { return SockError.Malformed(error) }
+    try check_count(to_client) catch { return SockError.Malformed(error) }
+    return RingCounts(to_server: to_server, to_client: to_client)
+}
+
+/// A `UdpOpen`'s or `TcpConnect`'s reply. A port of zero is malformed: the
+/// stack names the one it bound.
+public func opened_reply(reply: &Frame) -> Result<Opened, SockError> {
+    try reply.ok(4)
+    let id = try reply.id(1) catch { return SockError.Malformed(error) }
+    let port = reply.u16(2)
+    if port == 0 { return SockError.Malformed(WireError.Port(port)) }
+    return Opened(id: id, port: port)
+}
+
+/// A `TcpListen`'s reply: the listener's id.
+public func listening_reply(reply: &Frame) -> Result<UInt8, SockError> {
+    try reply.ok(2)
+    let id = try reply.id(1) catch { return SockError.Malformed(error) }
+    return id
+}
+
+/// An `Accept`'s reply.
+public func accepted_reply(reply: &Frame) -> Result<Accepted, SockError> {
+    try reply.ok(8)
+    let id = try reply.id(1) catch { return SockError.Malformed(error) }
+    return Accepted(id: id, addr: reply.addr(2), port: reply.u16(6))
+}
+
+/// A `Recv`'s reply: the slots that hold the data.
+public func received_reply(reply: &Frame) -> Result<SlotRange, SockError> {
+    try reply.ok(5)
+    let range = try reply.range(1) catch { return SockError.Malformed(error) }
+    return range
+}
+
+/// A `Resolve`'s reply.
+public func resolved_reply(reply: &Frame) -> Result<[UInt8; ADDR_BYTES], SockError> {
+    try reply.ok(5)
+    return reply.addr(1)
+}
+
+/// An `IfStatus`'s reply.
+public func if_status_reply(reply: &Frame) -> Result<InterfaceStatus, SockError> {
+    try reply.ok(26)
+    let up = reply.body[1]
+    if up > 1 { return SockError.Malformed(WireError.Flag(up)) }
+    var mac: [UInt8; MAC_BYTES] = [0; MAC_BYTES]
+    var i = 0
+    while i < MAC_BYTES {
+        mac[i] = reply.body[20 + i]
+        i = i + 1
+    }
+    return InterfaceStatus(up: up == 1, addr: reply.addr(2), netmask: reply.addr(6),
+                           gateway: reply.addr(10), dns: reply.addr(14),
+                           mtu: reply.u16(18), mac: mac)
+}
+
+// =============================================================================
+// Datagrams in the slots
+// =============================================================================
+
+/// A UDP datagram's header, checked: the peer's address and port, and where
+/// the payload lies in the slot.
+public struct Datagram {
+    public addr: [UInt8; ADDR_BYTES],
+    public port: UInt16,
+    public payload_at: UInt,
+    public payload_len: UInt,
+}
+
+@synthesize
+extension Datagram: Equatable {}
+
+/// The datagram in the first `len` bytes of `packet`, or why it is none.
+///
+/// `packet` is the private copy `Endpoint.receive` made, so the header is
+/// read from memory the peer cannot write; `len` is the length it answered,
+/// and one past `packet` is `Length`.
+public func datagram<const N: Int>(packet: &[UInt8; N], len: UInt) -> Result<Datagram, WireError> {
+    if len > N as UInt { return WireError.Length(len) }
+    if len < DATAGRAM_HEADER_BYTES { return WireError.Datagram(len) }
+    var addr: [UInt8; ADDR_BYTES] = [0; ADDR_BYTES]
+    var i = 0
+    while i < ADDR_BYTES {
+        addr[i] = packet[i]
+        i = i + 1
+    }
+    let port = (packet[4] as UInt16) | ((packet[5] as UInt16) << 8)
+    return Datagram(addr: addr, port: port, payload_at: DATAGRAM_HEADER_BYTES,
+                    payload_len: len - DATAGRAM_HEADER_BYTES)
+}
+
+/// Writes a datagram's header, its peer's `addr` and `port`, at the start of
+/// `into`, and answers where the payload goes. `into` holds the header,
+/// which the compile checks.
+public func put_datagram_header<const N: Int>(into: &var [UInt8; N], addr: &[UInt8; ADDR_BYTES],
+                                              port: UInt16) -> UInt {
+    static_assert(N >= 6, "the buffer holds a datagram's header")
+    var i = 0
+    while i < ADDR_BYTES {
+        into[i] = addr[i]
+        i = i + 1
+    }
+    into[4] = (port & 0xFF) as UInt8
+    into[5] = (port >> 8) as UInt8
+    DATAGRAM_HEADER_BYTES
+}

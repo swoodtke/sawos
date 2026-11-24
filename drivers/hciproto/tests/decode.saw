@@ -1,0 +1,231 @@
+// Every request, reply and event built, decoded and compared with what was
+// built; and each malformed message refused by name, with the status a
+// driver answers it.
+
+import hciproto.{AttachInfo, BODY_BYTES, Frame, HciBody, HciError, HciEvent,
+                 HciRequest, HciStats, HciStatus, WireError, attach_reply,
+                 empty_reply, event_reply, stats_reply}
+import pktring.{MAX_SLOTS, SlotRange}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// The message `body` holds, `len` bytes of it.
+func frame(body: &HciBody, len: UInt) -> Frame {
+    try! Frame(len: len, body: body.bytes)
+}
+
+/// A message of `len` bytes: byte 0 `first`, the rest `fill`.
+func message(len: UInt, first: UInt8, fill: UInt8) -> Frame {
+    var b: [UInt8; BODY_BYTES] = [fill; BODY_BYTES]
+    b[0] = first
+    try! Frame(len: len, body: b)
+}
+
+/// `f` with byte `at` set to `b`.
+func with(f: &Frame, at: Int, b: UInt8) -> Frame {
+    var body = f.bytes()
+    body[at] = b
+    try! Frame(len: f.len(), body: body)
+}
+
+func request_is(f: &Frame, want: HciRequest) -> Bool {
+    match f.request() {
+        case Ok(got) -> got == want,
+        case Err(_) -> false,
+    }
+}
+
+func refused(f: &Frame, want: WireError) -> Bool {
+    match f.request() {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func is_err<V>(r: Result<V, HciError>, want: HciError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func malformed(why: WireError) -> HciError {
+    HciError.Malformed(why)
+}
+
+func requests() {
+    var b = HciBody.empty()
+    var n = b.attach(8, 16)
+    check(request_is(&frame(&b, n), HciRequest.Attach(8, 16)), "Attach round trip")
+    n = b.attach(1, MAX_SLOTS as UInt16)
+    check(request_is(&frame(&b, n), HciRequest.Attach(1, 256)), "Attach at the ends")
+    let r = SlotRange(first: 255, count: 256)
+    n = b.tx(r)
+    check(request_is(&frame(&b, n), HciRequest.Tx(r)), "Tx round trip")
+    n = b.rx_return(SlotRange(first: 0, count: 1))
+    check(request_is(&frame(&b, n), HciRequest.RxReturn(SlotRange(first: 0, count: 1))),
+          "RxReturn round trip")
+    n = b.wait_event()
+    check(request_is(&frame(&b, n), HciRequest.WaitEvent), "WaitEvent round trip")
+    n = b.stats()
+    check(request_is(&frame(&b, n), HciRequest.Stats), "Stats round trip")
+
+    // Each malformed request, by name, and the status it is answered.
+    check(refused(&message(0, 1, 0), WireError.NoBytes), "no bytes")
+    check(refused(&message(1, 0, 0), WireError.UnknownOp(0)), "op 0")
+    check(refused(&message(1, 6, 0), WireError.UnknownOp(6)), "op 6")
+    check(refused(&message(4, 1, 1), WireError.Length(4)), "Attach one byte short")
+    check(refused(&message(6, 1, 1), WireError.Length(6)), "Attach one byte long")
+    check(refused(&message(4, 2, 1), WireError.Length(4)), "Tx short")
+    check(refused(&message(6, 3, 1), WireError.Length(6)), "RxReturn long")
+    check(refused(&message(2, 4, 0), WireError.Length(2)), "WaitEvent with a byte")
+    check(refused(&message(2, 5, 0), WireError.Length(2)), "Stats with a byte")
+    n = b.attach(0, 4)
+    check(refused(&frame(&b, n), WireError.SlotCount(0)), "no ToServer slots")
+    n = b.attach(4, 0)
+    check(refused(&frame(&b, n), WireError.SlotCount(0)), "no ToClient slots")
+    n = b.attach(257, 4)
+    check(refused(&frame(&b, n), WireError.SlotCount(257)), "too many ToServer slots")
+    n = b.attach(4, 257)
+    check(refused(&frame(&b, n), WireError.SlotCount(257)), "too many ToClient slots")
+    n = b.tx(SlotRange(first: 256, count: 1))
+    check(refused(&frame(&b, n), WireError.Range(256, 1)), "a first slot past any ring")
+    n = b.tx(SlotRange(first: 0, count: 0))
+    check(refused(&frame(&b, n), WireError.Range(0, 0)), "a range of no slots")
+    n = b.rx_return(SlotRange(first: 0, count: 257))
+    check(refused(&frame(&b, n), WireError.Range(0, 257)), "a range past any ring")
+
+    check(WireError.NoBytes.status() == HciStatus.BadOp &&
+          WireError.UnknownOp(9).status() == HciStatus.BadOp &&
+          WireError.Length(3).status() == HciStatus.BadOp, "a shape is BadOp")
+    check(WireError.SlotCount(0).status() == HciStatus.BadArg &&
+          WireError.Range(0, 0).status() == HciStatus.BadArg, "a value is BadArg")
+}
+
+func replies() {
+    var r = HciBody.empty()
+    let info = AttachInfo(address: [2, 0, 0, 0, 0, 1], acl_max: 251, to_server: 8, to_client: 16)
+    var n = r.ok_attach(&info)
+    check(match attach_reply(&frame(&r, n)) { case Ok(got) -> got == info, case Err(_) -> false },
+          "an Attach answer round trip")
+    let biggest = AttachInfo(address: [0xFF; 6], acl_max: 507, to_server: 256, to_client: 1)
+    n = r.ok_attach(&biggest)
+    check(match attach_reply(&frame(&r, n)) { case Ok(got) -> got == biggest,
+                                              case Err(_) -> false },
+          "the largest ACL size a slot holds")
+    let big = AttachInfo(address: [0; 6], acl_max: 508, to_server: 8, to_client: 8)
+    n = r.ok_attach(&big)
+    check(is_err(attach_reply(&frame(&r, n)), malformed(WireError.AclMax(508))),
+          "an ACL size past the slot")
+    let none = AttachInfo(address: [0; 6], acl_max: 251, to_server: 0, to_client: 8)
+    n = r.ok_attach(&none)
+    check(is_err(attach_reply(&frame(&r, n)), malformed(WireError.SlotCount(0))),
+          "an Attach answer of no slots")
+    let many = AttachInfo(address: [0; 6], acl_max: 251, to_server: 8, to_client: 300)
+    n = r.ok_attach(&many)
+    check(is_err(attach_reply(&frame(&r, n)), malformed(WireError.SlotCount(300))),
+          "an Attach answer of too many slots")
+    n = r.ok_attach(&info)
+    check(is_err(attach_reply(&frame(&r, n - 1)), malformed(WireError.Length(12))),
+          "an Attach answer cut short")
+    check(is_err(attach_reply(&frame(&r, n + 1)), malformed(WireError.Length(14))),
+          "an Attach answer too long")
+    n = r.refuse(HciStatus.Attached)
+    check(is_err(attach_reply(&frame(&r, n)), HciError.Refused(HciStatus.Attached)),
+          "an Attach refused")
+    check(is_err(attach_reply(&message(2, 2, 0)), malformed(WireError.Length(2))),
+          "a refusal with a byte")
+    check(is_err(attach_reply(&message(1, 6, 0)), malformed(WireError.UnknownStatus(6))),
+          "status 6")
+    check(is_err(attach_reply(&message(0, 0, 0)), malformed(WireError.NoBytes)),
+          "a reply of no bytes")
+
+    // Events.
+    let events = [HciEvent.RxReady(SlotRange(first: 3, count: 4)),
+                  HciEvent.TxDone(SlotRange(first: 255, count: 256)),
+                  HciEvent.Up, HciEvent.Down]
+    var i = 0
+    while i < 4 {
+        let e = events[i]
+        n = r.ok_event(&e)
+        check(match event_reply(&frame(&r, n)) { case Ok(got) -> got == e, case Err(_) -> false },
+              "an event round trip")
+        i = i + 1
+    }
+    n = r.ok_event(&HciEvent.RxReady(SlotRange(first: 3, count: 4)))
+    check(is_err(event_reply(&frame(&r, n - 1)), malformed(WireError.Length(5))),
+          "RxReady cut short")
+    n = r.ok_event(&HciEvent.TxDone(SlotRange(first: 1, count: 2)))
+    check(is_err(event_reply(&frame(&r, n + 1)), malformed(WireError.Length(7))),
+          "TxDone too long")
+    n = r.ok_event(&HciEvent.TxDone(SlotRange(first: 0, count: 0)))
+    check(is_err(event_reply(&frame(&r, n)), malformed(WireError.Range(0, 0))),
+          "TxDone of no slots")
+    n = r.ok_event(&HciEvent.RxReady(SlotRange(first: 256, count: 1)))
+    check(is_err(event_reply(&frame(&r, n)), malformed(WireError.Range(256, 1))),
+          "RxReady past any ring")
+    n = r.ok_event(&HciEvent.Up)
+    check(is_err(event_reply(&frame(&r, n + 1)), malformed(WireError.Length(3))),
+          "Up with a byte")
+    n = r.ok_event(&HciEvent.Down)
+    check(is_err(event_reply(&frame(&r, n + 1)), malformed(WireError.Length(3))),
+          "Down with a byte")
+    check(is_err(event_reply(&message(2, 0, 5)), malformed(WireError.UnknownEvent(5))),
+          "event 5")
+    check(is_err(event_reply(&message(2, 0, 0)), malformed(WireError.UnknownEvent(0))),
+          "event 0")
+    check(is_err(event_reply(&message(1, 0, 0)), malformed(WireError.Length(1))),
+          "Ok with no event")
+    n = r.refuse(HciStatus.Busy)
+    check(is_err(event_reply(&frame(&r, n)), HciError.Refused(HciStatus.Busy)),
+          "a WaitEvent refused")
+    check(is_err(event_reply(&message(2, 5, 1)), malformed(WireError.Length(2))),
+          "an event refusal with a byte")
+
+    // Stats.
+    let stats = HciStats(rx_packets: 1, rx_dropped: 0xFFFF_FFFF, tx_packets: 3,
+                            tx_errors: 4, ring_faults: 5)
+    n = r.ok_stats(&stats)
+    check(match stats_reply(&frame(&r, n)) { case Ok(got) -> got == stats, case Err(_) -> false },
+          "a Stats answer round trip")
+    check(is_err(stats_reply(&frame(&r, n - 1)), malformed(WireError.Length(20))),
+          "a Stats answer cut short")
+    n = r.refuse(HciStatus.NotAttached)
+    check(is_err(stats_reply(&frame(&r, n)), HciError.Refused(HciStatus.NotAttached)),
+          "Stats before Attach")
+
+    // The answer to a doorbell sent as a call.
+    n = r.ok()
+    check(match empty_reply(&frame(&r, n)) { case Ok(_) -> true, case Err(_) -> false },
+          "Ok alone")
+    check(is_err(empty_reply(&frame(&r, 2)), malformed(WireError.Length(2))), "Ok and a byte")
+    n = r.refuse(HciStatus.BadArg)
+    check(is_err(empty_reply(&frame(&r, n)), HciError.Refused(HciStatus.BadArg)),
+          "a Tx refused")
+    check("{HciError.Refused(HciStatus.BadArg)}".equals("refused: BadArg"),
+          "a refusal prints its status")
+    check("{malformed(WireError.AclMax(9000))}".equals("malformed: an ACL size past the slot"),
+          "a malformed reply prints why")
+}
+
+func frames() {
+    // A frame is at most a body.
+    let body: [UInt8; BODY_BYTES] = [7; BODY_BYTES]
+    check(match Frame(len: 128, body: body) { case Ok(f) -> f.len() == 128 && f.bytes()[127] == 7,
+                                              case Err(_) -> false }, "a whole body")
+    check(match Frame(len: 129, body: body) { case Ok(_) -> false,
+                                              case Err(e) -> e == WireError.Length(129) },
+          "a frame past the body")
+}
+
+func main() {
+    frames()
+    requests()
+    replies()
+}

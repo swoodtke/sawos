@@ -1,0 +1,74 @@
+// A program written with `main` that reaches past the networking packages'
+// seals: it writes every field a ring's safety or a decoder's bounds rest on
+// (a layout's sizes, a window's address and length, an endpoint's memory,
+// indexes and latched fault, a frame's length and bytes, an SSID's, a key's
+// and a name's) and builds a window, a layout, an endpoint and a frame field
+// by field. None of these is reachable outside its package, so the compile
+// refuses each and the program is never linked (`net_fields_sealed`).
+
+import pktring.{Endpoint, Layout, Ring, SharedWindow}
+import netdevproto
+import hciproto
+import wlanproto
+import sockproto
+import sosmain
+
+// A window over `mem`, made the one way a window is made.
+func window(mem: &var [UInt32; 64]) unsafe -> SharedWindow {
+    SharedWindow(at: (&var mem) as UnsafePointer<UInt32>, bytes: 256)
+}
+
+func layout() -> Layout {
+    try! Layout(slot_bytes: 4, to_server: 1, to_client: 1)
+}
+
+func main() {
+    var mem: [UInt32; 64] = [0; 64]
+    var l = layout()
+    l.slot_size = 0
+    l.to_server = 0
+    l.to_client = 0
+    let forged = Layout(slot_size: 4, to_server: 300, to_client: 0)
+    var w = window(&var mem)
+    w.base = 0x10
+    w.bytes = 0x1000_0000
+    let wild = SharedWindow(base: 0x10, bytes: 0x1000_0000)
+    var e = Endpoint.server(window(&var mem), layout())
+    e.memory = window(&var mem)
+    e.shape = forged
+    e.fills = Ring.ToServer
+    e.out_head = 0
+    e.out_published = 0
+    e.out_tail = 0
+    e.drains = Ring.ToClient
+    e.in_tail = 0
+    e.in_released = 0
+    e.in_head = 0
+    e.failed = None
+    let made = Endpoint(memory: wild, shape: forged, fills: Ring.ToServer, out_head: 0,
+                        out_published: 0, out_tail: 0, drains: Ring.ToClient,
+                        in_tail: 0, in_released: 0, in_head: 0, failed: None)
+    var nf = try! netdevproto.Frame(len: 1, body: [0; 128])
+    nf.count = 200
+    nf.body = [0; 128]
+    let long = netdevproto.Frame(count: 200, body: [0; 128])
+    var hf = try! hciproto.Frame(len: 1, body: [0; 128])
+    hf.count = 200
+    hf.body = [0; 128]
+    var wf = try! wlanproto.Frame(len: 1, body: [0; 128])
+    wf.count = 200
+    wf.body = [0; 128]
+    var sf = try! sockproto.Frame(len: 1, body: [0; 128])
+    sf.count = 200
+    sf.body = [0; 128]
+    var ssid = wlanproto.Ssid.none()
+    ssid.count = 200
+    ssid.data = [0; 32]
+    var key = wlanproto.Key.none()
+    key.count = 200
+    key.data = [0; 64]
+    var name = try! sockproto.Name(text: "n")
+    name.count = 200
+    name.data = [0; 126]
+    print("SOS netsealed: {} {}", made.layout().slot_bytes(), long.len())
+}

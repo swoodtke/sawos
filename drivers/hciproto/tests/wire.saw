@@ -1,0 +1,96 @@
+// The HCI transport wire, as bytes: each op, status and event value, each
+// builder's bytes and lengths. A shared enum would change client and driver
+// together and no case would notice, so the numbers are written here.
+
+import hciproto.{BODY_BYTES, ACL_HEADER_BYTES, EventKind, ADDRESS_BYTES, HciBody,
+                 HciEvent, HciOp, HciStats, HciStatus, AttachInfo,
+                 SLOT_BYTES, layout}
+import pktring.{LayoutError, Ring, SlotRange}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// Whether the first bytes of `b` are `want`.
+func starts(b: &HciBody, want: [UInt8; 13], n: Int) -> Bool {
+    var i = 0
+    while i < n {
+        if b.bytes[i] != want[i] { return false }
+        i = i + 1
+    }
+    true
+}
+
+func main() {
+    check(HciOp.Attach as UInt8 == 1 && HciOp.Tx as UInt8 == 2 &&
+          HciOp.RxReturn as UInt8 == 3 && HciOp.WaitEvent as UInt8 == 4 &&
+          HciOp.Stats as UInt8 == 5, "the op numbers")
+    check(HciOp.from(raw: 0).is_none() && HciOp.from(raw: 6).is_none(),
+          "no op 0 or 6")
+    check(HciStatus.Ok as UInt8 == 0 && HciStatus.BadOp as UInt8 == 1 &&
+          HciStatus.BadArg as UInt8 == 2 && HciStatus.NotAttached as UInt8 == 3 &&
+          HciStatus.Attached as UInt8 == 4 && HciStatus.Busy as UInt8 == 5,
+          "the status numbers")
+    check(EventKind.RxReady as UInt8 == 1 && EventKind.TxDone as UInt8 == 2 &&
+          EventKind.Up as UInt8 == 3 && EventKind.Down as UInt8 == 4,
+          "the event numbers")
+    check(HciOp.Attach.payload_bytes() == 4 && HciOp.Tx.payload_bytes() == 4 &&
+          HciOp.RxReturn.payload_bytes() == 4 && HciOp.WaitEvent.payload_bytes() == 0 &&
+          HciOp.Stats.payload_bytes() == 0, "each op's payload")
+    check(HciOp.Attach.describe().equals("attach") && HciOp.Tx.describe().equals("tx") &&
+          HciOp.RxReturn.describe().equals("rx_return") &&
+          HciOp.WaitEvent.describe().equals("wait_event") &&
+          HciOp.Stats.describe().equals("stats"), "each op's name")
+    check(HciStatus.Ok.describe().equals("Ok") && HciStatus.BadOp.describe().equals("BadOp") &&
+          HciStatus.BadArg.describe().equals("BadArg") &&
+          HciStatus.NotAttached.describe().equals("NotAttached") &&
+          HciStatus.Attached.describe().equals("Attached") &&
+          HciStatus.Busy.describe().equals("Busy"), "each status's name")
+    check(BODY_BYTES == 128 && SLOT_BYTES == 512 && ADDRESS_BYTES == 6 &&
+          ACL_HEADER_BYTES == 5, "the sizes")
+
+    // The ring's layout is the HCI slot's.
+    let l = try! layout(8, 16)
+    check(l.slot_bytes() == 512 && l.slots(Ring.ToServer) == 8 && l.slots(Ring.ToClient) == 16,
+          "an HCI ring")
+    check(match layout(0, 1) { case Ok(_) -> false, case Err(e) -> e == LayoutError.SlotCount(0) },
+          "an HCI ring of no slots")
+
+    // Requests.
+    var b = HciBody.empty()
+    check(b.attach(0x0102, 0x0304) == 5 &&
+          starts(&b, [1, 0x02, 0x01, 0x04, 0x03, 0, 0, 0, 0, 0, 0, 0, 0], 5), "Attach")
+    check(b.tx(SlotRange(first: 0x0A0B, count: 0x0C0D)) == 5 &&
+          starts(&b, [2, 0x0B, 0x0A, 0x0D, 0x0C, 0, 0, 0, 0, 0, 0, 0, 0], 5), "Tx")
+    check(b.rx_return(SlotRange(first: 7, count: 1)) == 5 &&
+          starts(&b, [3, 7, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0], 5), "RxReturn")
+    check(b.wait_event() == 1 && b.bytes[0] == 4, "WaitEvent")
+    check(b.stats() == 1 && b.bytes[0] == 5, "Stats")
+    check(b.raw(0xEE, 3) == 4 && b.bytes[0] == 0xEE, "a raw request")
+
+    // Replies.
+    var r = HciBody.empty()
+    check(r.ok() == 1 && r.bytes[0] == 0, "Ok alone")
+    check(r.refuse(HciStatus.Busy) == 1 && r.bytes[0] == 5, "a refusal is its status")
+    let info = AttachInfo(address: [0x02, 0x11, 0x22, 0x33, 0x44, 0x55], acl_max: 1500,
+                          to_server: 8, to_client: 0x0102)
+    check(r.ok_attach(&info) == 13 &&
+          starts(&r, [0, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0xDC, 0x05, 8, 0, 0x02, 0x01], 13),
+          "an Attach answer")
+    check(r.ok_event(&HciEvent.RxReady(SlotRange(first: 3, count: 0x0102))) == 6 &&
+          starts(&r, [0, 1, 3, 0, 0x02, 0x01, 0, 0, 0, 0, 0, 0, 0], 6), "RxReady")
+    check(r.ok_event(&HciEvent.TxDone(SlotRange(first: 1, count: 2))) == 6 &&
+          starts(&r, [0, 2, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0], 6), "TxDone")
+    check(r.ok_event(&HciEvent.Up) == 2 && r.bytes[0] == 0 && r.bytes[1] == 3, "Up")
+    check(r.ok_event(&HciEvent.Down) == 2 && r.bytes[0] == 0 && r.bytes[1] == 4,
+          "Down")
+    let stats = HciStats(rx_packets: 0x0403_0201, rx_dropped: 5, tx_packets: 6,
+                            tx_errors: 7, ring_faults: 0x0C0B_0A09)
+    check(r.ok_stats(&stats) == 21 && r.bytes[0] == 0 && r.bytes[1] == 1 && r.bytes[4] == 4 &&
+          r.bytes[5] == 5 && r.bytes[9] == 6 && r.bytes[13] == 7 && r.bytes[17] == 9 &&
+          r.bytes[20] == 0x0C, "a Stats answer")
+}

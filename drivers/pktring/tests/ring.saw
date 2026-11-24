@@ -1,0 +1,260 @@
+// A client and a server on one ring, both through `SharedWindow` over the same
+// words: every slot count the layout allows filled until full, drained until
+// empty and wrapped, in both rings; packets of every length to a slot's end
+// crossing byte for byte; and each refusal of this side's own conditions.
+
+import pktring.{Endpoint, Layout, MAX_SLOTS, Ring, RingError, SharedWindow,
+                SlotRange}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// Enough words for the largest ring of 4-byte slots, or a small ring of
+/// 2048-byte ones.
+static WORDS: Int = 4096
+
+func window(mem: &var [UInt32; WORDS], layout: &Layout) unsafe -> SharedWindow {
+    SharedWindow(at: (&var mem) as UnsafePointer<UInt32>, bytes: layout.bytes())
+}
+
+func is_err<V>(r: Result<V, RingError>, want: RingError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func range_is(r: Result<SlotRange, RingError>, first: UInt16, count: UInt16) -> Bool {
+    match r {
+        case Ok(got) -> got == SlotRange(first: first, count: count),
+        case Err(_) -> false,
+    }
+}
+
+/// One packet of `len` bytes, byte `i` of it `seed + i`.
+func packet(seed: UInt8, len: Int) -> [UInt8; 2048] {
+    var p: [UInt8; 2048] = [0; 2048]
+    var i = 0
+    while i < len {
+        p[i] = UInt8.from(truncating: (seed as Int) + i)
+        i = i + 1
+    }
+    p
+}
+
+/// Whether the first `len` bytes of `got` are `packet(seed, len)`'s.
+func is_packet(got: &[UInt8; 2048], seed: UInt8, len: Int) -> Bool {
+    var i = 0
+    while i < len {
+        if got[i] != UInt8.from(truncating: (seed as Int) + i) { return false }
+        i = i + 1
+    }
+    true
+}
+
+/// Fills `from`'s outbound ring until full, drains it at `to` until empty, and
+/// does so three times over, so every index wraps. Answers whether every
+/// step answered as the ring's arithmetic says.
+func cycle(from: &var Endpoint<SharedWindow>, to: &var Endpoint<SharedWindow>,
+           n: UInt32) -> Bool {
+    var round = 0
+    var seed: UInt8 = 0
+    while round < 3 {
+        // Fill: n packets, then Full.
+        var k: UInt32 = 0
+        while k < n {
+            let p = packet(seed, 4)
+            let slot = try from.send(&p, 4) catch { return false }
+            if slot != k { return false }
+            seed = seed &+ 1
+            k = k + 1
+        }
+        let more = packet(0, 4)
+        if not is_err(from.send(&more, 4), RingError.Full) { return false }
+        let room = try from.room() catch { return false }
+        if room != 0 { return false }
+        // Nothing reaches the peer before the publish.
+        if not is_err(to.poll(), RingError.Empty) { return false }
+        if not range_is(from.publish(), 0, n as UInt16) { return false }
+        if not is_err(from.publish(), RingError.Empty) { return false }
+        if not range_is(to.poll(), 0, n as UInt16) { return false }
+        // Drain: n packets, then Empty without a poll and with one.
+        var got: [UInt8; 2048] = [0; 2048]
+        var check_seed = seed &- UInt8.from(truncating: n)
+        k = 0
+        while k < n {
+            let len = try to.receive(&var got) catch { return false }
+            if len != 4 || not is_packet(&got, check_seed, 4) { return false }
+            check_seed = check_seed &+ 1
+            k = k + 1
+        }
+        if not is_err(to.receive(&var got), RingError.Empty) { return false }
+        if not is_err(to.poll(), RingError.Empty) { return false }
+        // The slots stay the consumer's until it releases them.
+        let before = try from.room() catch { return false }
+        if before != 0 { return false }
+        if not range_is(to.release(), 0, n as UInt16) { return false }
+        if not is_err(to.release(), RingError.Empty) { return false }
+        let after = try from.room() catch { return false }
+        if after != n { return false }
+        round = round + 1
+    }
+    true
+}
+
+/// The same, a slot at a time: send, publish, poll, receive, release, so the
+/// indexes walk every value through two full wraps. Answers whether each
+/// range named the slot the index arithmetic says.
+func step(from: &var Endpoint<SharedWindow>, to: &var Endpoint<SharedWindow>,
+          n: UInt32) -> Bool {
+    var i: UInt32 = 0
+    var got: [UInt8; 2048] = [0; 2048]
+    while i < 4 * n {
+        let slot = i % n
+        let p = packet(UInt8.from(truncating: i), 3)
+        let sent = try from.send(&p, 3) catch { return false }
+        if sent != slot { return false }
+        if not range_is(from.publish(), slot as UInt16, 1) { return false }
+        if not range_is(to.poll(), slot as UInt16, 1) { return false }
+        let len = try to.receive(&var got) catch { return false }
+        if len != 3 || not is_packet(&got, UInt8.from(truncating: i), 3) { return false }
+        if not range_is(to.release(), slot as UInt16, 1) { return false }
+        i = i + 1
+    }
+    true
+}
+
+func every_count() unsafe {
+    var mem: [UInt32; WORDS] = [0; WORDS]
+    var n: UInt32 = 1
+    while n <= MAX_SLOTS {
+        // The two rings differ in size, so a skew between them shows.
+        let other = if n == MAX_SLOTS { 1 } else { n + 1 }
+        let layout = try! Layout(slot_bytes: 4, to_server: n, to_client: other)
+        var client = Endpoint.client(window(&var mem, &layout), layout)
+        var server = Endpoint.server(window(&var mem, &layout), layout)
+        check(client.out_ring() == Ring.ToServer && client.in_ring() == Ring.ToClient,
+              "the client fills ToServer and drains ToClient")
+        check(server.out_ring() == Ring.ToClient && server.in_ring() == Ring.ToServer,
+              "the server fills ToClient and drains ToServer")
+        let room = try! client.room()
+        check(room == n, "a fresh ring is all free")
+        if not cycle(&var client, &var server, n) {
+            print("count {}", n as UInt)
+            check(false, "ToServer fills, drains and wraps")
+        }
+        if not cycle(&var server, &var client, other) {
+            print("count {}", other as UInt)
+            check(false, "ToClient fills, drains and wraps")
+        }
+        if not step(&var client, &var server, n) {
+            print("count {}", n as UInt)
+            check(false, "ToServer a slot at a time")
+        }
+        if not step(&var server, &var client, other) {
+            print("count {}", other as UInt)
+            check(false, "ToClient a slot at a time")
+        }
+        check(client.fault().is_none() && server.fault().is_none(), "no fault")
+        n = n + 1
+    }
+}
+
+func lengths() unsafe {
+    // Every length from none to the whole slot crosses byte for byte, and a
+    // byte past the length is the receiver's own.
+    var mem: [UInt32; WORDS] = [0; WORDS]
+    let layout = try! Layout(slot_bytes: 2048, to_server: 2, to_client: 3)
+    var client = Endpoint.client(window(&var mem, &layout), layout)
+    var server = Endpoint.server(window(&var mem, &layout), layout)
+    var got: [UInt8; 2048] = [0; 2048]
+    var len = 0
+    while len <= 2048 {
+        let p = packet(UInt8.from(truncating: len), len)
+        let _ = try! client.send(&p, len as UInt)
+        let _ = try! client.publish()
+        let _ = try! server.poll()
+        got[len % 2048] = 0xEE
+        let n = try! server.receive(&var got)
+        if n != len as UInt || not is_packet(&got, UInt8.from(truncating: len), len) {
+            print("length {}", len)
+            check(false, "a packet crosses byte for byte")
+        }
+        if len < 2048 && got[len] != 0xEE {
+            print("length {}", len)
+            check(false, "nothing past the length is written")
+        }
+        let _ = try! server.release()
+        len = len + 1
+    }
+
+    // A send writes nothing of the caller's past the length into the ring.
+    var leak: [UInt8; 2048] = [0xFF; 2048]
+    leak[0] = 0x01
+    let slot = try! client.send(&leak, 1)
+    let at = (layout.slot_offset(Ring.ToServer, slot) / 4) as Int
+    check(mem[at] == 0x0000_0001, "nothing past the length reaches the slot")
+    let _ = try! client.publish()
+    let _ = try! server.poll()
+    let _ = try! server.receive(&var got)
+    let _ = try! server.release()
+
+    // A packet past the slot is TooLong and leaves the ring as it was.
+    let big: [UInt8; 2052] = [1; 2052]
+    check(is_err(client.send(&big, 2052), RingError.TooLong(2052)), "a packet past the slot")
+    check(is_err(client.publish(), RingError.Empty), "a refused packet fills nothing")
+    check(client.fault().is_none(), "TooLong is not fatal")
+    check(not RingError.TooLong(1).is_fatal() && not RingError.Full.is_fatal() &&
+          not RingError.Empty.is_fatal(), "this side's conditions are not fatal")
+    check("{RingError.TooLong(2052)}".equals("a packet longer than a slot: 2052"),
+          "TooLong prints its length")
+    check("{RingError.Full}".equals("the ring is full") &&
+          "{RingError.Empty}".equals("the ring is empty"), "Full and Empty print their names")
+}
+
+func batches() unsafe {
+    // Several sends behind one publish, released in two parts, wrapping.
+    var mem: [UInt32; WORDS] = [0; WORDS]
+    let layout = try! Layout(slot_bytes: 64, to_server: 5, to_client: 5)
+    var client = Endpoint.client(window(&var mem, &layout), layout)
+    var server = Endpoint.server(window(&var mem, &layout), layout)
+    var got: [UInt8; 2048] = [0; 2048]
+    var i = 0
+    while i < 3 {
+        let p = packet(0, 9)
+        let _ = try! client.send(&p, 9)
+        i = i + 1
+    }
+    check(range_is(client.publish(), 0, 3), "three sends, one doorbell")
+    check(range_is(server.poll(), 0, 3), "three to take")
+    let _ = try! server.receive(&var got)
+    check(range_is(server.release(), 0, 1), "release what was taken")
+    let _ = try! server.receive(&var got)
+    let _ = try! server.receive(&var got)
+    check(range_is(server.release(), 1, 2), "release the rest")
+    i = 0
+    while i < 4 {
+        let p = packet(0, 9)
+        let _ = try! client.send(&p, 9)
+        i = i + 1
+    }
+    check(range_is(client.publish(), 3, 4), "a doorbell wrapping past the last slot")
+    check(range_is(server.poll(), 3, 4), "a poll wrapping past the last slot")
+    // A second poll before any receive sees the same, and a later publish adds.
+    let p = packet(0, 9)
+    let _ = try! client.send(&p, 9)
+    check(range_is(server.poll(), 3, 4), "a poll sees only what was published")
+    check(range_is(client.publish(), 2, 1), "the next doorbell")
+    check(range_is(server.poll(), 3, 5), "and the poll after it sees all of it")
+}
+
+func main() {
+    every_count()
+    lengths()
+    batches()
+}

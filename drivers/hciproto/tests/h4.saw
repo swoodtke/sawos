@@ -1,0 +1,153 @@
+// H4 packets in the slots: each type's header written and parsed back, the
+// bytes of each header, and each slot that is no H4 packet refused by name.
+// A packet crosses the ring too, so the parser reads the receiver's copy.
+
+import hciproto.{H4_HEADER_MAX, H4Error, H4Packet, H4Type, SLOT_BYTES, h4_packet,
+                 layout, put_h4_header}
+import pktring.{Endpoint, Ring, SharedWindow}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func parses(p: &[UInt8; 512], len: UInt, ring: Ring, want: H4Packet) -> Bool {
+    match h4_packet(&p, len, ring) {
+        case Ok(got) -> got == want,
+        case Err(_) -> false,
+    }
+}
+
+func refused(p: &[UInt8; 512], len: UInt, ring: Ring, want: H4Error) -> Bool {
+    match h4_packet(&p, len, ring) {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+/// Writes a header of `kind`, `field` and `payload` and parses it back from
+/// `ring`.
+func round_trip(kind: H4Type, field: UInt16, payload: UInt, ring: Ring) -> Bool {
+    var p: [UInt8; 512] = [0; 512]
+    let len = try! put_h4_header(&var p, kind, field, payload)
+    let at = 1 + kind.header_bytes()
+    len == at + payload &&
+        parses(&p, len, ring, H4Packet(kind: kind, field: field, payload_at: at,
+                                       payload_len: payload))
+}
+
+static WORDS: Int = 1024
+
+func window(mem: &var [UInt32; WORDS], bytes: UInt) unsafe -> SharedWindow {
+    SharedWindow(at: (&var mem) as UnsafePointer<UInt32>, bytes: bytes)
+}
+
+func across_the_ring() unsafe {
+    // A command crosses to the server and parses from the server's copy.
+    var mem: [UInt32; WORDS] = [0; WORDS]
+    let l = try! layout(1, 1)
+    var host = Endpoint.client(window(&var mem, l.bytes()), l)
+    var driver = Endpoint.server(window(&var mem, l.bytes()), l)
+    var cmd: [UInt8; 512] = [0; 512]
+    let len = try! put_h4_header(&var cmd, H4Type.Command, 0x0C03, 0)
+    let _ = try! host.send(&cmd, len)
+    let _ = try! host.publish()
+    let _ = try! driver.poll()
+    var got: [UInt8; 512] = [0; 512]
+    let n = try! driver.receive(&var got)
+    check(parses(&got, n, Ring.ToServer, H4Packet(kind: H4Type.Command, field: 0x0C03,
+                                                 payload_at: 4, payload_len: 0)),
+          "a Reset command crosses the ring")
+}
+
+func main() {
+    check(H4Type.Command as UInt8 == 1 && H4Type.Acl as UInt8 == 2 &&
+          H4Type.Sco as UInt8 == 3 && H4Type.Event as UInt8 == 4 &&
+          H4Type.Iso as UInt8 == 5, "the H4 type numbers")
+    check(H4Type.from(raw: 0).is_none() && H4Type.from(raw: 6).is_none(), "no type 0 or 6")
+    check(SLOT_BYTES == 512, "an HCI slot")
+
+    // Each header's bytes.
+    var p: [UInt8; 512] = [0; 512]
+    check(try! put_h4_header(&var p, H4Type.Command, 0x0C03, 2) == 6 && p[0] == 1 &&
+          p[1] == 0x03 && p[2] == 0x0C && p[3] == 2, "a command header")
+    check(try! put_h4_header(&var p, H4Type.Acl, 0x2001, 0x0102) == 0x0107 && p[0] == 2 &&
+          p[1] == 0x01 && p[2] == 0x20 && p[3] == 0x02 && p[4] == 0x01, "an ACL header")
+    check(try! put_h4_header(&var p, H4Type.Sco, 0x0003, 9) == 13 && p[0] == 3 && p[1] == 3 &&
+          p[2] == 0 && p[3] == 9, "an SCO header")
+    check(try! put_h4_header(&var p, H4Type.Event, 0x0E, 4) == 7 && p[0] == 4 && p[1] == 0x0E &&
+          p[2] == 4, "an event header")
+    check(try! put_h4_header(&var p, H4Type.Iso, 0x0005, 0x3FFF) == 5 + 0x3FFF && p[0] == 5 &&
+          p[3] == 0xFF && p[4] == 0x3F, "an ISO header")
+
+    // Round trips, each type in each ring it crosses, at the ends of a slot.
+    check(round_trip(H4Type.Command, 0x0C03, 0, Ring.ToServer), "a command")
+    check(round_trip(H4Type.Command, 0xFFFF, 255, Ring.ToServer), "the longest command")
+    check(round_trip(H4Type.Event, 0x3E, 255, Ring.ToClient), "an event")
+    check(round_trip(H4Type.Event, 0x0E, 0, Ring.ToClient), "an empty event")
+    check(round_trip(H4Type.Acl, 0x2001, 507, Ring.ToServer), "ACL out, a slot's worth")
+    check(round_trip(H4Type.Acl, 0x2001, 0, Ring.ToClient), "ACL in")
+    check(round_trip(H4Type.Sco, 3, 48, Ring.ToServer), "SCO out")
+    check(round_trip(H4Type.Sco, 3, 48, Ring.ToClient), "SCO in")
+    check(round_trip(H4Type.Iso, 5, 100, Ring.ToServer), "ISO out")
+    check(round_trip(H4Type.Iso, 5, 100, Ring.ToClient), "ISO in")
+
+    // Each refusal, by name.
+    check(refused(&p, 0, Ring.ToClient, H4Error.NoBytes), "no bytes")
+    p[0] = 0
+    check(refused(&p, 1, Ring.ToClient, H4Error.UnknownType(0)), "type 0")
+    p[0] = 6
+    check(refused(&p, 4, Ring.ToClient, H4Error.UnknownType(6)), "type 6")
+    let _ = try! put_h4_header(&var p, H4Type.Command, 1, 0)
+    check(refused(&p, 4, Ring.ToClient, H4Error.Direction(H4Type.Command)),
+          "a command from the controller")
+    let _ = try! put_h4_header(&var p, H4Type.Event, 1, 0)
+    check(refused(&p, 3, Ring.ToServer, H4Error.Direction(H4Type.Event)),
+          "an event to the controller")
+    let _ = try! put_h4_header(&var p, H4Type.Acl, 1, 0)
+    check(refused(&p, 4, Ring.ToClient, H4Error.Short(4)), "ACL short of its header")
+    check(refused(&p, 1, Ring.ToClient, H4Error.Short(1)), "a type byte alone")
+    let _ = try! put_h4_header(&var p, H4Type.Event, 0x0E, 4)
+    check(refused(&p, 2, Ring.ToClient, H4Error.Short(2)), "an event short of its header")
+    check(refused(&p, 6, Ring.ToClient, H4Error.Length(7, 6)), "an event short of its payload")
+    check(refused(&p, 8, Ring.ToClient, H4Error.Length(7, 8)), "an event past its payload")
+    let _ = try! put_h4_header(&var p, H4Type.Acl, 1, 600)
+    check(refused(&p, 512, Ring.ToClient, H4Error.Length(605, 512)),
+          "ACL stating more than the slot")
+    // An ISO length's top two bits are flags, not length.
+    let _ = try! put_h4_header(&var p, H4Type.Iso, 1, 3)
+    p[4] = p[4] | 0xC0
+    check(parses(&p, 8, Ring.ToClient, H4Packet(kind: H4Type.Iso, field: 1, payload_at: 5,
+                                                payload_len: 3)), "ISO's flag bits")
+    check(H4Error.Length(7, 6).describe().equals("a header whose length is not the packet's"),
+          "an error's name")
+
+    // A payload past each type's length field writes no header.
+    check(H4_HEADER_MAX == 5, "the longest header")
+    var q: [UInt8; 8] = [0xEE; 8]
+    check(writes_none(&var q, H4Type.Command, 256), "a command past 255")
+    check(writes_none(&var q, H4Type.Event, 256), "an event past 255")
+    check(writes_none(&var q, H4Type.Sco, 256), "SCO past 255")
+    check(writes_none(&var q, H4Type.Acl, 0x1_0000), "ACL past 65535")
+    check(writes_none(&var q, H4Type.Iso, 0x4000), "ISO past its 14 bits")
+    check(try! put_h4_header(&var q, H4Type.Acl, 1, 0xFFFF) == 5 + 0xFFFF &&
+          q[3] == 0xFF && q[4] == 0xFF, "ACL at 65535")
+    check(try! put_h4_header(&var q, H4Type.Sco, 1, 255) == 4 + 255 && q[3] == 0xFF,
+          "SCO at 255")
+
+    across_the_ring()
+}
+
+/// Whether a header for `payload` bytes of `kind` is refused as `Payload` and
+/// leaves `into` as it was.
+func writes_none(into: &var [UInt8; 8], kind: H4Type, payload: UInt) -> Bool {
+    let before = into[0]
+    let refused = match put_h4_header(&var into, kind, 1, payload) {
+        case Ok(_) -> false,
+        case Err(e) -> e == H4Error.Payload(payload),
+    }
+    refused && into[0] == before
+}

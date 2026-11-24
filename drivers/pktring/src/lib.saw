@@ -1,0 +1,754 @@
+//! The packet ring: the shared memory a packet protocol's packets cross in.
+//!
+//! A frame or an HCI packet cannot ride a message, whose body is the kernel's
+//! `PIPE_BODY_BYTES`. So the client of a packet protocol allocates one Memory
+//! per connection, lays a ring out in it and gives it to the server at the
+//! protocol's `Attach`, and both map it. Packets cross in the ring's slots;
+//! messages carry doorbells and slot numbers.
+//!
+//! # Layout
+//!
+//! Two rings share the memory: `ToServer`, which the client fills and the
+//! server drains, and `ToClient`, the reverse. A `Layout` is the slot size and
+//! each ring's slot count, and every offset follows from those three numbers,
+//! so both sides compute the same layout and nothing in the memory describes
+//! itself.
+//!
+//! ```text
+//! offset                          what
+//! 0                               ToServer head (the client writes it)
+//! 4                               ToServer tail (the server writes it)
+//! 8                               ToClient head (the server writes it)
+//! 12                              ToClient tail (the client writes it)
+//! 16                              ToServer length words, one per slot
+//! 16 + 4 * to_server              ToClient length words, one per slot
+//! base: the end of those, rounded up to SLOT_ALIGN
+//! base                            ToServer slots, slot_bytes each
+//! base + to_server * slot_bytes   ToClient slots, slot_bytes each
+//! ```
+//!
+//! A word is in the machine's order, little-endian on every target, and a
+//! slot's bytes are its words' bytes in memory order.
+//!
+//! # Indexes
+//!
+//! A ring of `n` slots counts its head and tail modulo `2n`. An index names
+//! slot `index mod n`, and `head - tail` modulo `2n` is how many slots are
+//! filled: 0 when the ring is empty, `n` when it is full. Counting to `2n`
+//! tells full from empty without giving up a slot.
+//!
+//! The producer writes a slot's bytes and its length word, then advances the
+//! head; the consumer reads the head, then each slot's length word and bytes,
+//! then advances the tail. Each side keeps its own index in private memory
+//! and only ever stores it: the shared copy is for the peer. The kernel is
+//! uniprocessor and every shared access is volatile, so the peer sees the
+//! stores in program order.
+//!
+//! # A shared ring is input
+//!
+//! Whatever the peer wrote, it may write again at any moment, and a peer may
+//! be buggy or hostile. So the receiving side reads each field it acts on
+//! once, into private memory, checks it there and uses only the copy:
+//!
+//!   1. an index word is read once and checked against the slot count;
+//!   2. a slot's length word is read once and checked against the slot size;
+//!   3. a slot's bytes are copied out with the checked length and never read
+//!      again, so a parser acts on the copy;
+//!   4. a value that fails a check ends the connection with a counted error,
+//!      never a fault of the receiver.
+//!
+//! An `Endpoint` is the only reader of the memory: every shared field it acts
+//! on passes through one load into a local, a check, and from there the
+//! private state, so a protocol written on it cannot read a field twice by
+//! accident. A failed check latches (`Endpoint.fault`): every later operation
+//! answers the same error without touching the memory, and the server ends
+//! the connection and counts the error (`FaultCounts`). Its state is private
+//! to this package, so no caller can move an index or clear a fault.
+//!
+//! A server cannot ask the kernel how long a Memory it was given is, so it
+//! maps the ring trusting the client to have allocated `Layout.bytes()`.
+//!
+//! # Doorbells
+//!
+//! A message that says slots were filled or freed is a doorbell. The index
+//! words are the ring's state; a doorbell wakes the peer and names the slots
+//! it rings for (`SlotRange`), which the receiver checks on the wire
+//! (`SlotRange.fits`) and need not act on: the indexes it reads say the same
+//! or more.
+
+// =============================================================================
+// Sizes
+// =============================================================================
+
+/// The most slots one ring holds. A slot number and a count of slots each fit
+/// a 16-bit wire field.
+public static MAX_SLOTS: UInt32 = 256
+
+/// The largest slot. Slots are whole words.
+public static MAX_SLOT_BYTES: UInt32 = 65536
+
+/// The bytes of a word, an index or a length.
+public static WORD_BYTES: UInt32 = 4
+
+/// The four index words, before the length words.
+public static HEADER_BYTES: UInt32 = 16
+
+/// Where the slot array starts: the first multiple of this past the length
+/// words. A slot size that is a multiple of it keeps every slot aligned to it.
+public static SLOT_ALIGN: UInt32 = 64
+
+static_assert(MAX_SLOTS <= 65536, "a slot number and a count fit 16 bits")
+
+// =============================================================================
+// The layout
+// =============================================================================
+
+/// One of a connection's two rings.
+public enum Ring {
+    /// Filled by the client, drained by the server.
+    case ToServer,
+    /// Filled by the server, drained by the client.
+    case ToClient,
+}
+
+@synthesize
+extension Ring: Equatable {}
+
+/// Why a layout cannot be laid out.
+public enum LayoutError {
+    /// A slot size of zero, past `MAX_SLOT_BYTES`, or not whole words.
+    case SlotBytes(bytes: UInt32),
+    /// A ring of no slots, or of more than `MAX_SLOTS`.
+    case SlotCount(count: UInt32),
+}
+
+@synthesize
+extension LayoutError: Equatable {}
+
+extension LayoutError {
+    /// What a transcript should call this error.
+    public func describe(&self) -> String {
+        match self {
+            case SlotBytes(_) -> "a slot size the ring cannot have",
+            case SlotCount(_) -> "a slot count the ring cannot have",
+        }
+    }
+}
+
+extension LayoutError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+        let n = match self {
+            case SlotBytes(bytes) -> bytes,
+            case SlotCount(count) -> count,
+        }
+        try! into.append(": ")
+        try! into.append(value: n as UInt)
+    }
+}
+
+extension LayoutError: Error {}
+
+/// A ring's shape: the slot size and each ring's slot count. Both sides
+/// compute every offset from it.
+///
+/// Only `init` makes one, so every layout's sizes are in range, which an
+/// `Endpoint`'s arithmetic relies on.
+public struct Layout {
+    // The bytes of each slot, in both rings.
+    private slot_size: UInt32,
+    // The `ToServer` ring's slots.
+    private to_server: UInt32,
+    // The `ToClient` ring's slots.
+    private to_client: UInt32,
+}
+
+@synthesize
+extension Layout: Equatable {}
+
+extension Layout {
+    /// The layout of `slot_bytes` slots, `to_server` and `to_client` of them,
+    /// or why there is none.
+    public init(slot_bytes: UInt32, to_server: UInt32,
+                to_client: UInt32) -> Result<Layout, LayoutError> {
+        if slot_bytes == 0 || slot_bytes > MAX_SLOT_BYTES ||
+           slot_bytes % WORD_BYTES != 0 {
+            return LayoutError.SlotBytes(slot_bytes)
+        }
+        if to_server == 0 || to_server > MAX_SLOTS {
+            return LayoutError.SlotCount(to_server)
+        }
+        if to_client == 0 || to_client > MAX_SLOTS {
+            return LayoutError.SlotCount(to_client)
+        }
+        return Layout(slot_size: slot_bytes, to_server: to_server,
+                      to_client: to_client)
+    }
+
+    /// The bytes of each slot, in both rings.
+    public func slot_bytes(&self) -> UInt32 {
+        self.slot_size
+    }
+
+    /// How many slots `ring` has.
+    public func slots(&self, ring: Ring) -> UInt32 {
+        match ring {
+            case ToServer -> self.to_server,
+            case ToClient -> self.to_client,
+        }
+    }
+
+    /// The offset of `ring`'s head word.
+    public func head_offset(&self, ring: Ring) -> UInt {
+        match ring {
+            case ToServer -> 0,
+            case ToClient -> 8,
+        }
+    }
+
+    /// The offset of `ring`'s tail word.
+    public func tail_offset(&self, ring: Ring) -> UInt {
+        self.head_offset(ring) + WORD_BYTES as UInt
+    }
+
+    /// The offset of the length word of `ring`'s slot `slot`. A slot past the
+    /// ring's count is a caller's bug, and panics.
+    public func length_offset(&self, ring: Ring, slot: UInt32) -> UInt {
+        self.check_slot(ring, slot)
+        let first = match ring {
+            case ToServer -> 0,
+            case ToClient -> self.to_server,
+        }
+        (HEADER_BYTES + (first + slot) * WORD_BYTES) as UInt
+    }
+
+    /// Where the slot array starts.
+    public func slots_offset(&self) -> UInt {
+        let lengths = HEADER_BYTES + (self.to_server + self.to_client) * WORD_BYTES
+        let rem = lengths % SLOT_ALIGN
+        if rem == 0 { lengths as UInt } else { (lengths + SLOT_ALIGN - rem) as UInt }
+    }
+
+    /// The offset of `ring`'s slot `slot`. A slot past the ring's count is a
+    /// caller's bug, and panics.
+    public func slot_offset(&self, ring: Ring, slot: UInt32) -> UInt {
+        self.check_slot(ring, slot)
+        let first = match ring {
+            case ToServer -> 0,
+            case ToClient -> self.to_server,
+        }
+        self.slots_offset() + ((first + slot) as UInt) * (self.slot_size as UInt)
+    }
+
+    /// The bytes the whole ring takes: the Memory the client allocates is at
+    /// least this long.
+    public func bytes(&self) -> UInt {
+        self.slots_offset() +
+            ((self.to_server + self.to_client) as UInt) * (self.slot_size as UInt)
+    }
+
+    func check_slot(&self, ring: Ring, slot: UInt32) {
+        let n = self.slots(ring)
+        if slot >= n {
+            panic("Layout: slot out of range: {} (len {})", slot as UInt, n as UInt)
+        }
+    }
+}
+
+// =============================================================================
+// Index arithmetic
+// =============================================================================
+
+/// What an index of a ring of `slots` slots counts modulo: twice the slots.
+public func index_modulus(slots: UInt32) -> UInt32 {
+    slots * 2
+}
+
+/// The index after `index`, in a ring of `slots` slots.
+public func next_index(slots: UInt32, index: UInt32) -> UInt32 {
+    let after = index + 1
+    if after == index_modulus(slots) { 0 } else { after }
+}
+
+/// The index `count` past `index`, in a ring of `slots` slots. `count` is at
+/// most the modulus.
+public func advance_index(slots: UInt32, index: UInt32, count: UInt32) -> UInt32 {
+    let m = index_modulus(slots)
+    let sum = index + count
+    if sum >= m { sum - m } else { sum }
+}
+
+/// How many slots lie from `tail` up to `head`, in a ring of `slots` slots:
+/// the filled slots when the head is the producer's and the tail the
+/// consumer's.
+public func filled(slots: UInt32, head: UInt32, tail: UInt32) -> UInt32 {
+    if head >= tail { head - tail } else { head + index_modulus(slots) - tail }
+}
+
+/// The slot an index names.
+public func slot_of(slots: UInt32, index: UInt32) -> UInt32 {
+    if index >= slots { index - slots } else { index }
+}
+
+/// A run of slots a message names: `count` slots from `first`, wrapping past
+/// the ring's last slot to its first.
+public struct SlotRange {
+    public first: UInt16,
+    public count: UInt16,
+}
+
+@synthesize
+extension SlotRange: Equatable {}
+
+extension SlotRange {
+    /// Whether the range is one a ring of `slots` slots can hold: its first
+    /// slot is one of the ring's, and it is at least one slot and at most all
+    /// of them. A range a message carries is checked with this before
+    /// anything acts on it.
+    public func fits(&self, slots: UInt32) -> Bool {
+        (self.first as UInt32) < slots && self.count != 0 &&
+            (self.count as UInt32) <= slots
+    }
+}
+
+// =============================================================================
+// Shared memory
+// =============================================================================
+
+/// The ring's memory, word by word: what an `Endpoint` reads and writes
+/// through. An offset is a byte offset, a multiple of `WORD_BYTES`, and the
+/// word is inside the ring's `Layout.bytes()`; the `Endpoint` computes every
+/// offset it passes from its layout.
+public trait Shared {
+    /// The word at `offset`.
+    func load(&var self, offset: UInt) -> UInt32
+
+    /// Writes `word` at `offset`.
+    func store(&var self, offset: UInt, word: UInt32)
+}
+
+/// A ring mapped into this process: `bytes` bytes from an address.
+///
+/// Every access is one volatile load or store, so the compiler neither drops
+/// nor repeats one: a field read once in the source is read once.
+///
+/// Only the `unsafe` init makes one, so every window is one its maker vouched
+/// for, and an access outside it panics rather than reaching past it.
+public struct SharedWindow {
+    // The first byte's address.
+    private base: UInt,
+    // How many bytes the window holds.
+    private bytes: UInt,
+}
+
+extension SharedWindow {
+    /// The window of `bytes` bytes at `at`: a mapping's base, word-aligned,
+    /// with at least `bytes` bytes mapped readable and writable.
+    public init(at: UnsafePointer<UInt32>, bytes: UInt) unsafe -> SharedWindow {
+        SharedWindow(base: at as UInt, bytes: bytes)
+    }
+
+    /// Whether the word at `offset` is in the window: the offset is a
+    /// multiple of `WORD_BYTES` and the whole word lies inside.
+    public func holds(&self, offset: UInt) -> Bool {
+        offset % (WORD_BYTES as UInt) == 0 && offset <= self.bytes &&
+            self.bytes - offset >= WORD_BYTES as UInt
+    }
+
+    func word(&self, offset: UInt) unsafe -> UnsafeMemory<UInt32, Device> {
+        if not self.holds(offset) {
+            panic("SharedWindow: offset out of range: {} (len {})", offset, self.bytes)
+        }
+        UnsafeMemory<UInt32, Device>(self.base + offset)
+    }
+}
+
+extension SharedWindow: Shared {
+    func load(&var self, offset: UInt) unsafe -> UInt32 {
+        self.word(offset).read()
+    }
+
+    func store(&var self, offset: UInt, word: UInt32) unsafe {
+        self.word(offset).write(word)
+    }
+}
+
+// =============================================================================
+// Errors
+// =============================================================================
+
+/// Why a ring operation did not do what it asked.
+///
+/// `Empty`, `Full` and `TooLong` are this side's conditions, and it may try
+/// again. The rest are a peer's values that failed a check: they are fatal,
+/// end the connection, and are counted.
+public enum RingError {
+    /// Nothing to take or to publish.
+    case Empty,
+    /// No free slot.
+    case Full,
+    /// A packet longer than a slot.
+    case TooLong(len: UInt),
+    /// The peer's index word is past the ring's index range.
+    case IndexPastCount(index: UInt32),
+    /// The peer's index word is in range but where its index cannot be. A
+    /// tail lies from the tail last read up to the head this end published:
+    /// the peer frees only published slots, and never takes one back. A head
+    /// lies from the head last read up to the ring's slots past the tail
+    /// this end released: the peer fills only slots it was given, and never
+    /// takes one back.
+    case IndexOutOfOrder(index: UInt32),
+    /// A slot's length word is past the slot size.
+    case LengthPastSlot(length: UInt32),
+}
+
+@synthesize
+extension RingError: Equatable {}
+
+extension RingError {
+    /// Whether the error is a peer's value that failed a check, which ends the
+    /// connection.
+    public func is_fatal(&self) -> Bool {
+        match self {
+            case Empty -> false,
+            case Full -> false,
+            case TooLong(_) -> false,
+            case _ -> true,
+        }
+    }
+
+    /// What a transcript should call this error.
+    public func describe(&self) -> String {
+        match self {
+            case Empty -> "the ring is empty",
+            case Full -> "the ring is full",
+            case TooLong(_) -> "a packet longer than a slot",
+            case IndexPastCount(_) -> "an index past the slot count",
+            case IndexOutOfOrder(_) -> "an index out of order",
+            case LengthPastSlot(_) -> "a length past the slot",
+        }
+    }
+}
+
+extension RingError: Printable {
+    /// The description, and the value that failed after it.
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+        match self {
+            case TooLong(len) -> {
+                try! into.append(": ")
+                try! into.append(value: len)
+            },
+            case IndexPastCount(index) -> {
+                try! into.append(": ")
+                try! into.append(value: index as UInt)
+            },
+            case IndexOutOfOrder(index) -> {
+                try! into.append(": ")
+                try! into.append(value: index as UInt)
+            },
+            case LengthPastSlot(length) -> {
+                try! into.append(": ")
+                try! into.append(value: length as UInt)
+            },
+            case _ -> {},
+        }
+    }
+}
+
+extension RingError: Error {}
+
+/// A server's counts of the connections it ended, by the check that failed.
+public struct FaultCounts {
+    public index_past_count: UInt32,
+    public index_out_of_order: UInt32,
+    public length_past_slot: UInt32,
+}
+
+extension FaultCounts {
+    /// No faults.
+    public static func zero() -> FaultCounts {
+        FaultCounts(index_past_count: 0, index_out_of_order: 0, length_past_slot: 0)
+    }
+
+    /// Counts `error` when it is fatal; this side's own conditions count
+    /// nothing.
+    public func record(&var self, error: &RingError) {
+        match error {
+            case IndexPastCount(_) -> self.index_past_count = self.index_past_count + 1,
+            case IndexOutOfOrder(_) -> self.index_out_of_order = self.index_out_of_order + 1,
+            case LengthPastSlot(_) -> self.length_past_slot = self.length_past_slot + 1,
+            case _ -> {},
+        }
+    }
+
+    /// Every fault counted.
+    public func total(&self) -> UInt32 {
+        self.index_past_count + self.index_out_of_order + self.length_past_slot
+    }
+}
+
+// =============================================================================
+// An end of the ring
+// =============================================================================
+
+/// Which end of a connection an `Endpoint` is.
+enum Side {
+    case Client,
+    case Server,
+}
+
+/// One side's end of a ring: it fills one of the two rings and drains the
+/// other, and it is the side's only access to the memory.
+///
+/// It keeps its own indexes in private memory and only stores them. Of the
+/// peer's indexes it keeps the last value it read and checked, and it reads
+/// one again only when that value leaves it nothing to do.
+public struct Endpoint<M: Shared> {
+    // The ring's memory, reached only through the checked operations.
+    private memory: M,
+    private shape: Layout,
+    // The ring this side fills. Its head is ours: `out_head` is past the
+    // slots sent, `out_published` past those published. `out_tail` is the
+    // peer's tail as last read and checked.
+    private fills: Ring,
+    private out_head: UInt32,
+    private out_published: UInt32,
+    private out_tail: UInt32,
+    // The ring this side drains. Its tail is ours: `in_tail` is past the
+    // slots received, `in_released` past those released. `in_head` is the
+    // peer's head as last read and checked.
+    private drains: Ring,
+    private in_tail: UInt32,
+    private in_released: UInt32,
+    private in_head: UInt32,
+    // The first fatal error, which every later operation answers.
+    private failed: RingError?,
+}
+
+extension Endpoint<M: Shared> {
+    /// The client's end of a ring it has just laid out in `memory`: every
+    /// index word is stored zero, so the ring starts empty. The client does
+    /// this before it gives the memory to the server.
+    public static func client(memory: M, layout: Layout) -> Endpoint<M> {
+        var e = Endpoint.fresh(move memory, layout, Side.Client)
+        e.memory.store(layout.head_offset(Ring.ToServer), 0)
+        e.memory.store(layout.tail_offset(Ring.ToServer), 0)
+        e.memory.store(layout.head_offset(Ring.ToClient), 0)
+        e.memory.store(layout.tail_offset(Ring.ToClient), 0)
+        e
+    }
+
+    /// The server's end of a ring a client gave it. It stores its own two
+    /// index words zero and trusts nothing the memory holds.
+    public static func server(memory: M, layout: Layout) -> Endpoint<M> {
+        var e = Endpoint.fresh(move memory, layout, Side.Server)
+        e.memory.store(layout.head_offset(Ring.ToClient), 0)
+        e.memory.store(layout.tail_offset(Ring.ToServer), 0)
+        e
+    }
+
+    static func fresh(memory: M, layout: Layout, side: Side) -> Endpoint<M> {
+        let out_ring = match side {
+            case Client -> Ring.ToServer,
+            case Server -> Ring.ToClient,
+        }
+        let in_ring = match side {
+            case Client -> Ring.ToClient,
+            case Server -> Ring.ToServer,
+        }
+        Endpoint(memory: move memory, shape: layout,
+                 fills: out_ring, out_head: 0, out_published: 0, out_tail: 0,
+                 drains: in_ring, in_tail: 0, in_released: 0, in_head: 0,
+                 failed: None)
+    }
+
+    /// The first fatal error this end met, which ended its connection, or
+    /// `None` while it has met none.
+    public func fault(&self) -> RingError? {
+        self.failed
+    }
+
+    /// The ring's shape.
+    public func layout(&self) -> Layout {
+        self.shape
+    }
+
+    /// The ring this end fills.
+    public func out_ring(&self) -> Ring {
+        self.fills
+    }
+
+    /// The ring this end drains.
+    public func in_ring(&self) -> Ring {
+        self.drains
+    }
+
+    /// Latches `error` and answers it.
+    func fail(&var self, error: RingError) -> RingError {
+        self.failed = error
+        error
+    }
+
+    // -------------------------------------------------------------------------
+    // Filling
+    // -------------------------------------------------------------------------
+
+    /// Reads the peer's tail of the ring this end fills, once, and checks it:
+    /// it is an index, and it lies from the tail last read up to the head
+    /// this end published (`RingError.IndexOutOfOrder`).
+    func read_out_tail(&var self) -> Result<Void, RingError> {
+        let n = self.shape.slots(self.fills)
+        let tail = self.memory.load(self.shape.tail_offset(self.fills))
+        if tail >= index_modulus(n) {
+            return self.fail(RingError.IndexPastCount(tail))
+        }
+        let was = filled(n, self.out_published, self.out_tail)
+        let now = filled(n, self.out_published, tail)
+        if now > was {
+            return self.fail(RingError.IndexOutOfOrder(tail))
+        }
+        self.out_tail = tail
+        return
+    }
+
+    /// How many slots of the ring this end fills are free, reading the peer's
+    /// tail afresh.
+    public func room(&var self) -> Result<UInt32, RingError> {
+        if let f = self.failed { return f }
+        try self.read_out_tail()
+        let n = self.shape.slots(self.fills)
+        return n - filled(n, self.out_head, self.out_tail)
+    }
+
+    /// Writes the first `len` bytes of `packet` into the next free slot and
+    /// answers the slot. The peer sees it at the next `publish`.
+    ///
+    /// The peer's tail is read again only when the slots it last freed are
+    /// all filled. `len` past the slot size is `TooLong`, and no free slot is
+    /// `Full`; both leave the ring as it was. `len` past `packet` is a
+    /// caller's bug, and panics.
+    public func send<const N: Int>(&var self, packet: &[UInt8; N],
+                                   len: UInt) -> Result<UInt32, RingError> {
+        if let f = self.failed { return f }
+        if len > N as UInt {
+            panic("Endpoint.send: length out of range: {} (len {})", len, N)
+        }
+        if len > self.shape.slot_size as UInt { return RingError.TooLong(len) }
+        let n = self.shape.slots(self.fills)
+        if filled(n, self.out_head, self.out_tail) == n {
+            try self.read_out_tail()
+            if filled(n, self.out_head, self.out_tail) == n { return RingError.Full }
+        }
+        let slot = slot_of(n, self.out_head)
+        let at = self.shape.slot_offset(self.fills, slot)
+        let count = Int.from(truncating: len)
+        var i = 0
+        while i < count {
+            var word: UInt32 = 0
+            var b = 0
+            while b < 4 && i + b < count {
+                word = word | ((packet[i + b] as UInt32) << (8 * b))
+                b = b + 1
+            }
+            self.memory.store(at + (i as UInt), word)
+            i = i + 4
+        }
+        self.memory.store(self.shape.length_offset(self.fills, slot), len as UInt32)
+        self.out_head = next_index(n, self.out_head)
+        return slot
+    }
+
+    /// Stores this end's head, so the peer sees every slot `send` filled since
+    /// the last `publish`, and answers those slots for the doorbell. None is
+    /// `Empty`.
+    public func publish(&var self) -> Result<SlotRange, RingError> {
+        if let f = self.failed { return f }
+        let n = self.shape.slots(self.fills)
+        let count = filled(n, self.out_head, self.out_published)
+        if count == 0 { return RingError.Empty }
+        let first = slot_of(n, self.out_published)
+        self.memory.store(self.shape.head_offset(self.fills), self.out_head)
+        self.out_published = self.out_head
+        return SlotRange(first: first as UInt16, count: count as UInt16)
+    }
+
+    // -------------------------------------------------------------------------
+    // Draining
+    // -------------------------------------------------------------------------
+
+    /// Reads the peer's head of the ring this end drains, once, and answers
+    /// the filled slots this end has not yet taken. None is `Empty`.
+    ///
+    /// The head is checked: it is an index, and it lies from the head last
+    /// read up to the ring's slots past the tail this end released
+    /// (`RingError.IndexOutOfOrder`).
+    public func poll(&var self) -> Result<SlotRange, RingError> {
+        if let f = self.failed { return f }
+        let n = self.shape.slots(self.drains)
+        let head = self.memory.load(self.shape.head_offset(self.drains))
+        if head >= index_modulus(n) {
+            return self.fail(RingError.IndexPastCount(head))
+        }
+        let was = filled(n, self.in_head, self.in_released)
+        let now = filled(n, head, self.in_released)
+        if now < was || now > n {
+            return self.fail(RingError.IndexOutOfOrder(head))
+        }
+        self.in_head = head
+        let count = filled(n, head, self.in_tail)
+        if count == 0 { return RingError.Empty }
+        return SlotRange(first: slot_of(n, self.in_tail) as UInt16, count: count as UInt16)
+    }
+
+    /// Copies the next filled slot into `into` and answers its length. The
+    /// slots are the ones the last `poll` found: with none left, it is
+    /// `Empty`, and it reads nothing.
+    ///
+    /// The length word is read once and checked against the slot size, and
+    /// the bytes are copied with that length; nothing in the slot is read
+    /// again. `into` shorter than a slot is a caller's bug, and panics.
+    public func receive<const N: Int>(&var self,
+                                      into: &var [UInt8; N]) -> Result<UInt, RingError> {
+        if let f = self.failed { return f }
+        if (N as UInt) < (self.shape.slot_size as UInt) {
+            panic("Endpoint.receive: buffer shorter than a slot: {} (slot {})", N,
+                  self.shape.slot_size as UInt)
+        }
+        let n = self.shape.slots(self.drains)
+        if self.in_tail == self.in_head { return RingError.Empty }
+        let slot = slot_of(n, self.in_tail)
+        let length = self.memory.load(self.shape.length_offset(self.drains, slot))
+        if length > self.shape.slot_size {
+            return self.fail(RingError.LengthPastSlot(length))
+        }
+        let at = self.shape.slot_offset(self.drains, slot)
+        let count = length as Int
+        var i = 0
+        while i < count {
+            let word = self.memory.load(at + (i as UInt))
+            var b = 0
+            while b < 4 && i + b < count {
+                into[i + b] = ((word >> (8 * b)) & 0xFF) as UInt8
+                b = b + 1
+            }
+            i = i + 4
+        }
+        self.in_tail = next_index(n, self.in_tail)
+        return length as UInt
+    }
+
+    /// Stores this end's tail, so the peer may fill again every slot
+    /// `receive` took since the last `release`, and answers those slots for
+    /// the doorbell. None is `Empty`.
+    public func release(&var self) -> Result<SlotRange, RingError> {
+        if let f = self.failed { return f }
+        let n = self.shape.slots(self.drains)
+        let count = filled(n, self.in_tail, self.in_released)
+        if count == 0 { return RingError.Empty }
+        let first = slot_of(n, self.in_released)
+        self.memory.store(self.shape.tail_offset(self.drains), self.in_tail)
+        self.in_released = self.in_tail
+        return SlotRange(first: first as UInt16, count: count as UInt16)
+    }
+}

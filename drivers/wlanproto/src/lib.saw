@@ -1,0 +1,782 @@
+//! The wireless LAN control protocol: what a network manager, the client, and
+//! the radio's driver, the server, say to each other about which network the
+//! station joins. Frames do not cross here: the driver serves them to the
+//! network stack through `netdevproto`.
+//!
+//! A request is one message: byte 0 the op, then the payload. A reply's byte 0
+//! is a status, then its payload. Integers are little-endian, and an RSSI is
+//! a signed byte in dBm.
+//!
+//! ```text
+//! op             payload                      reply payload
+//! Scan        1  -                            -
+//! Connect     2  ssid_len u8, ssid,           -
+//!                auth u8, key_len u8, key
+//! Disconnect  3  -                            -
+//! Status      4  -                            state u8, bssid [6], channel u8,
+//!                                             rssi i8, ssid_len u8, ssid
+//! WaitEvent   5  -                            kind u8, then the event's fields
+//! ```
+//!
+//! ```text
+//! event            fields
+//! ScanResult    1  bssid [6], channel u8, rssi i8, auth u8, ssid_len u8, ssid
+//! ScanDone      2  found u16
+//! Connected     3  bssid [6], channel u8
+//! Disconnected  4  reason u8
+//! ```
+//!
+//! An SSID is at most `SSID_BYTES` bytes; a `Connect`'s is at least one. A
+//! reply that is not `Ok` carries the status byte alone.
+//!
+//! # The ops
+//!
+//!   - `Scan`       - a call, answered `Ok` when the scan starts. Each network
+//!                    found is a `ScanResult` event, and `ScanDone` ends the
+//!                    scan with how many there were.
+//!   - `Connect`    - a call, answered `Ok` when the station starts to join
+//!                    the network. `Connected` or `Disconnected` says how it
+//!                    went. The station joins `Open` and `Wpa2Psk` networks
+//!                    (`WlanAuth.joinable`); another auth is `Unsupported`.
+//!   - `Disconnect` - a call answered `Ok`; a station that was joined, or
+//!                    joining, then reports `Disconnected` with the reason
+//!                    `Requested`.
+//!   - `Status`     - a call answered with the station's state and the
+//!                    network it is joined to, or joining. A station in
+//!                    neither names no network: a zero BSSID, channel and
+//!                    RSSI, and no SSID.
+//!   - `WaitEvent`  - a call the driver holds until it has an event, and
+//!                    answers with the next one. A driver holds one at a
+//!                    time and queues the events in between.
+//!
+//! # The key crosses once
+//!
+//! A `Connect` is the only message that carries a key: no reply, event or
+//! status names one, so it crosses the connection once per join. For
+//! `Wpa2Psk` the key is a passphrase of 8 to 63 printable ASCII bytes or a
+//! pre-shared key of 64 hex digits; for `Open` there is none.
+//!
+//! A client wipes the body it sent the key in (`WlanBody.wipe`). That wipe
+//! reaches the body alone. The key is also in the client's `Key`, in the
+//! kernel's copy of the message in the pipe that carried it, and in the
+//! driver's `Frame` and the `WlanRequest` it decodes; each of those is its
+//! holder's to drop or overwrite, and nothing here wipes them.
+//!
+//! # Statuses
+//!
+//! They are checked in this order, and the first that applies is answered:
+//! `BadOp` (a message of no bytes, an op byte that names no op, or a length
+//! its op does not have), `BadArg` (an SSID or key of a length or bytes the
+//! protocol refuses, an auth that names none), `Unsupported` (an auth the
+//! station does not join), `Busy` (a `Scan` or `Connect` while one is under
+//! way, a `WaitEvent` while one is held). The one exception is a `Connect`,
+//! whose fields are checked in the order they lie: an SSID length the
+//! protocol refuses is `BadArg` before the message's length, which that SSID
+//! length decides, is checked.
+
+/// The bytes of a message body: the kernel's `PIPE_BODY_BYTES`.
+public static BODY_BYTES: Int = 128
+
+/// The most bytes of an SSID.
+public static SSID_BYTES: Int = 32
+
+/// The most bytes of a key: a pre-shared key's hex digits.
+public static KEY_BYTES: Int = 64
+
+/// A passphrase's fewest and most bytes.
+public static PASSPHRASE_MIN: Int = 8
+public static PASSPHRASE_MAX: Int = 63
+
+/// A BSSID's bytes.
+public static BSSID_BYTES: Int = 6
+
+static_assert(PASSPHRASE_MAX + 1 == KEY_BYTES, "a key past a passphrase is hex")
+
+// The longest message is a `Connect` with an SSID and a key of the most bytes.
+static_assert(4 + SSID_BYTES + KEY_BYTES <= BODY_BYTES, "a Connect fits one message")
+
+/// The op byte. Raw-backed because it crosses a wire: each value is stated.
+public enum WlanOp: UInt8 {
+    case Scan = 1,
+    case Connect = 2,
+    case Disconnect = 3,
+    case Status = 4,
+    case WaitEvent = 5,
+}
+
+extension WlanOp {
+    /// What a transcript should call this op.
+    public func describe(&self) -> String {
+        match self {
+            case Scan -> "scan",
+            case Connect -> "connect",
+            case Disconnect -> "disconnect",
+            case Status -> "status",
+            case WaitEvent -> "wait_event",
+        }
+    }
+}
+
+/// A reply's status byte. `Ok` is 0.
+public enum WlanStatus: UInt8 {
+    case Ok = 0,
+    case BadOp = 1,
+    case BadArg = 2,
+    case Unsupported = 3,
+    case Busy = 4,
+}
+
+@synthesize
+extension WlanStatus: Equatable {}
+
+extension WlanStatus {
+    /// What a transcript should call this status.
+    public func describe(&self) -> String {
+        match self {
+            case Ok -> "Ok",
+            case BadOp -> "BadOp",
+            case BadArg -> "BadArg",
+            case Unsupported -> "Unsupported",
+            case Busy -> "Busy",
+        }
+    }
+}
+
+/// How a network authenticates a station.
+public enum WlanAuth: UInt8 {
+    case Open = 0,
+    case Wep = 1,
+    case Wpa2Psk = 2,
+    case Wpa3Sae = 3,
+    case Enterprise = 4,
+}
+
+@synthesize
+extension WlanAuth: Equatable {}
+
+extension WlanAuth {
+    /// Whether the station joins a network that authenticates this way.
+    public func joinable(&self) -> Bool {
+        match self {
+            case Open -> true,
+            case Wpa2Psk -> true,
+            case _ -> false,
+        }
+    }
+}
+
+/// What the station is doing.
+public enum WlanState: UInt8 {
+    case Idle = 0,
+    case Scanning = 1,
+    case Joining = 2,
+    case Joined = 3,
+}
+
+@synthesize
+extension WlanState: Equatable {}
+
+/// Why the station is not joined.
+public enum DisconnectReason: UInt8 {
+    /// The client asked, with `Disconnect`.
+    case Requested = 1,
+    /// No network of that SSID answered.
+    case NotFound = 2,
+    /// The network refused the key.
+    case AuthFailed = 3,
+    /// The network stopped answering.
+    case Lost = 4,
+}
+
+@synthesize
+extension DisconnectReason: Equatable {}
+
+/// An event's kind byte.
+public enum EventKind: UInt8 {
+    case ScanResult = 1,
+    case ScanDone = 2,
+    case Connected = 3,
+    case Disconnected = 4,
+}
+
+/// An SSID: its length and bytes, the bytes past the length zero.
+///
+/// Only its constructors and the decoders make one, so its length is at most
+/// `SSID_BYTES`, which the builders rely on.
+public struct Ssid {
+    // How many of the bytes are the SSID's.
+    private count: UInt8,
+    private data: [UInt8; SSID_BYTES],
+}
+
+@synthesize
+extension Ssid: Equatable {}
+
+extension Ssid {
+    /// The SSID of no bytes.
+    public static func none() -> Ssid {
+        Ssid(count: 0, data: [0; SSID_BYTES])
+    }
+
+    /// The SSID of `text`'s bytes, or `SsidLength` for text past
+    /// `SSID_BYTES` bytes.
+    public init(text: String) -> Result<Ssid, WireError> {
+        let n = text.len()
+        if n > SSID_BYTES { return WireError.SsidLength(n as UInt) }
+        var s = Ssid.none()
+        var i = 0
+        while i < n {
+            s.data[i] = text.byte_at(i)
+            i = i + 1
+        }
+        s.count = n as UInt8
+        return s
+    }
+
+    /// How many bytes the SSID has.
+    public func len(&self) -> UInt8 {
+        self.count
+    }
+
+    /// The SSID's bytes, zero past its length.
+    public func bytes(&self) -> [UInt8; SSID_BYTES] {
+        self.data
+    }
+}
+
+/// A key: its length and bytes, the bytes past the length zero.
+///
+/// Only its constructors and the decoder make one, so its length is at most
+/// `KEY_BYTES`, which the builder relies on.
+public struct Key {
+    // How many of the bytes are the key's.
+    private count: UInt8,
+    private data: [UInt8; KEY_BYTES],
+}
+
+@synthesize
+extension Key: Equatable {}
+
+extension Key {
+    /// The key of no bytes, an `Open` network's.
+    public static func none() -> Key {
+        Key(count: 0, data: [0; KEY_BYTES])
+    }
+
+    /// The key of `text`'s bytes, or `KeyLength` for text past `KEY_BYTES`
+    /// bytes. Whether its auth takes it is `check_key`'s to say.
+    public init(text: String) -> Result<Key, WireError> {
+        let n = text.len()
+        if n > KEY_BYTES { return WireError.KeyLength(n as UInt) }
+        var k = Key.none()
+        var i = 0
+        while i < n {
+            k.data[i] = text.byte_at(i)
+            i = i + 1
+        }
+        k.count = n as UInt8
+        return k
+    }
+
+    /// How many bytes the key has.
+    public func len(&self) -> UInt8 {
+        self.count
+    }
+
+    /// The key's bytes, zero past its length.
+    public func bytes(&self) -> [UInt8; KEY_BYTES] {
+        self.data
+    }
+}
+
+/// A network a scan found.
+public struct Network {
+    public bssid: [UInt8; BSSID_BYTES],
+    public channel: UInt8,
+    public rssi: Int8,
+    public auth: WlanAuth,
+    public ssid: Ssid,
+}
+
+@synthesize
+extension Network: Equatable {}
+
+/// A `Status` answer.
+public struct StationStatus {
+    public state: WlanState,
+    public bssid: [UInt8; BSSID_BYTES],
+    public channel: UInt8,
+    public rssi: Int8,
+    public ssid: Ssid,
+}
+
+@synthesize
+extension StationStatus: Equatable {}
+
+/// What a `WaitEvent` is answered with.
+public enum WlanEvent {
+    case ScanResult(network: Network),
+    case ScanDone(found: UInt16),
+    case Connected(bssid: [UInt8; BSSID_BYTES], channel: UInt8),
+    case Disconnected(reason: DisconnectReason),
+}
+
+@synthesize
+extension WlanEvent: Equatable {}
+
+/// A request, decoded.
+public enum WlanRequest {
+    case Scan,
+    case Connect(ssid: Ssid, auth: WlanAuth, key: Key),
+    case Disconnect,
+    case Status,
+    case WaitEvent,
+}
+
+@synthesize
+extension WlanRequest: Equatable {}
+
+/// Why a message is malformed: each shape a decoder refuses, by name.
+public enum WireError {
+    /// A message of no bytes.
+    case NoBytes,
+    /// An op byte that names no op.
+    case UnknownOp(op: UInt8),
+    /// A status byte that names no status.
+    case UnknownStatus(status: UInt8),
+    /// An event kind byte that names no event.
+    case UnknownEvent(kind: UInt8),
+    /// A length the message's op, status or event does not have.
+    case Length(len: UInt),
+    /// An SSID past `SSID_BYTES`, or a `Connect`'s of no bytes.
+    case SsidLength(len: UInt),
+    /// An auth byte that names no auth.
+    case UnknownAuth(auth: UInt8),
+    /// A key of a length its auth does not take.
+    case KeyLength(len: UInt),
+    /// A key byte its form does not take: a passphrase's that is not
+    /// printable ASCII, a pre-shared key's that is not a hex digit.
+    case KeyByte(byte: UInt8),
+    /// A state byte that names no state.
+    case UnknownState(state: UInt8),
+    /// A reason byte that names no reason.
+    case UnknownReason(reason: UInt8),
+}
+
+@synthesize
+extension WireError: Equatable {}
+
+extension WireError {
+    /// The status a driver answers a request refused for this.
+    public func status(&self) -> WlanStatus {
+        match self {
+            case NoBytes -> WlanStatus.BadOp,
+            case UnknownOp(_) -> WlanStatus.BadOp,
+            case Length(_) -> WlanStatus.BadOp,
+            case _ -> WlanStatus.BadArg,
+        }
+    }
+
+    /// What a transcript should call this.
+    public func describe(&self) -> String {
+        match self {
+            case NoBytes -> "a message of no bytes",
+            case UnknownOp(_) -> "an op that is none",
+            case UnknownStatus(_) -> "a status that is none",
+            case UnknownEvent(_) -> "an event that is none",
+            case Length(_) -> "a length its kind does not have",
+            case SsidLength(_) -> "an SSID of a length it cannot have",
+            case UnknownAuth(_) -> "an auth that is none",
+            case KeyLength(_) -> "a key of a length its auth does not take",
+            case KeyByte(_) -> "a key byte its form does not take",
+            case UnknownState(_) -> "a state that is none",
+            case UnknownReason(_) -> "a reason that is none",
+        }
+    }
+}
+
+/// Why a reply did not answer what its request asked.
+public enum WlanError {
+    /// The driver refused the request with this status.
+    case Refused(status: WlanStatus),
+    /// The reply is no reply its request can have.
+    case Malformed(why: WireError),
+}
+
+@synthesize
+extension WlanError: Equatable {}
+
+extension WlanError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        match self {
+            case Refused(status) -> {
+                try! into.append("refused: ")
+                try! into.append(status.describe())
+            },
+            case Malformed(why) -> {
+                try! into.append("malformed: ")
+                try! into.append(why.describe())
+            },
+        }
+    }
+}
+
+extension WlanError: Error {}
+
+/// Whether `key` is one `auth` takes: none for `Open`; for `Wpa2Psk` a
+/// passphrase of printable ASCII or a pre-shared key of hex digits. An auth
+/// the station does not join takes any key the message can carry, since the
+/// driver answers it `Unsupported` whatever the key.
+public func check_key(auth: WlanAuth, key: &Key) -> Result<Void, WireError> {
+    let n = key.count as Int
+    match auth {
+        case Open -> {
+            if n != 0 { return WireError.KeyLength(key.count as UInt) }
+        },
+        case Wpa2Psk -> {
+            if n == KEY_BYTES {
+                var i = 0
+                while i < n {
+                    if not is_hex(key.data[i]) { return WireError.KeyByte(key.data[i]) }
+                    i = i + 1
+                }
+            } else {
+                // A key holds at most `KEY_BYTES`, the hex form's length, so
+                // a passphrase is at most `PASSPHRASE_MAX`.
+                if n < PASSPHRASE_MIN { return WireError.KeyLength(key.count as UInt) }
+                var i = 0
+                while i < n {
+                    let b = key.data[i]
+                    if b < 0x20 || b > 0x7E { return WireError.KeyByte(b) }
+                    i = i + 1
+                }
+            }
+        },
+        case _ -> {},
+    }
+    return
+}
+
+func is_hex(b: UInt8) -> Bool {
+    (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x46) || (b >= 0x61 && b <= 0x66)
+}
+
+static OP_BYTE: Int = 0
+
+/// A message body, for a request or a reply. The builders answer the
+/// message's `len`.
+public struct WlanBody {
+    public bytes: [UInt8; BODY_BYTES],
+}
+
+extension WlanBody {
+    /// A zeroed body.
+    public static func empty() -> WlanBody {
+        WlanBody(bytes: [0; BODY_BYTES])
+    }
+
+    /// Zeroes the body, so a key it carried is gone from it. The stores are
+    /// volatile, so the compiler keeps them though the body is dropped right
+    /// after. Other copies of the key are the module doc's list.
+    public func wipe(&var self) unsafe {
+        let at = ((&var self.bytes) as UnsafePointer<UInt8>) as UInt
+        var i = 0
+        while i < BODY_BYTES {
+            UnsafeMemory<UInt8, Device>(at + (i as UInt)).write(0)
+            i = i + 1
+        }
+    }
+
+    /// An op and nothing else: `Scan`, `Disconnect`, `Status`, `WaitEvent`.
+    public func bare(&var self, op: WlanOp) -> UInt {
+        self.bytes[OP_BYTE] = op as UInt8
+        1
+    }
+
+    /// Writes `ssid`'s length and bytes at `at`, and answers the offset after.
+    func put_ssid(&var self, at: Int, ssid: &Ssid) -> Int {
+        self.bytes[at] = ssid.count
+        var i = 0
+        while i < ssid.count as Int {
+            self.bytes[at + 1 + i] = ssid.data[i]
+            i = i + 1
+        }
+        at + 1 + ssid.count as Int
+    }
+
+    /// `Connect(ssid, auth, key)`.
+    public func connect(&var self, ssid: &Ssid, auth: WlanAuth, key: &Key) -> UInt {
+        self.bytes[OP_BYTE] = WlanOp.Connect as UInt8
+        let at = self.put_ssid(1, &ssid)
+        self.bytes[at] = auth as UInt8
+        self.bytes[at + 1] = key.count
+        var i = 0
+        while i < key.count as Int {
+            self.bytes[at + 2 + i] = key.data[i]
+            i = i + 1
+        }
+        (at + 2 + key.count as Int) as UInt
+    }
+
+    /// A request with an op byte of any value and `payload` bytes after it,
+    /// for the refusals a client tests.
+    public func raw(&var self, op: UInt8, payload: UInt) -> UInt {
+        self.bytes[OP_BYTE] = op
+        payload + 1
+    }
+
+    /// A reply of the status alone.
+    public func refuse(&var self, status: WlanStatus) -> UInt {
+        self.bytes[0] = status as UInt8
+        1
+    }
+
+    /// An `Ok` and nothing else.
+    public func ok(&var self) -> UInt {
+        self.refuse(WlanStatus.Ok)
+    }
+
+    func put_bssid(&var self, at: Int, bssid: &[UInt8; BSSID_BYTES]) {
+        var i = 0
+        while i < BSSID_BYTES {
+            self.bytes[at + i] = bssid[i]
+            i = i + 1
+        }
+    }
+
+    /// A `Status` answer.
+    public func ok_status(&var self, status: &StationStatus) -> UInt {
+        self.bytes[0] = WlanStatus.Ok as UInt8
+        self.bytes[1] = status.state as UInt8
+        self.put_bssid(2, &status.bssid)
+        self.bytes[8] = status.channel
+        self.bytes[9] = UInt8.from(truncating: status.rssi)
+        self.put_ssid(10, &status.ssid) as UInt
+    }
+
+    /// A `WaitEvent` answer.
+    public func ok_event(&var self, event: &WlanEvent) -> UInt {
+        self.bytes[0] = WlanStatus.Ok as UInt8
+        match event {
+            case ScanResult(network) -> {
+                self.bytes[1] = EventKind.ScanResult as UInt8
+                self.put_bssid(2, &network.bssid)
+                self.bytes[8] = network.channel
+                self.bytes[9] = UInt8.from(truncating: network.rssi)
+                self.bytes[10] = network.auth as UInt8
+                self.put_ssid(11, &network.ssid) as UInt
+            },
+            case ScanDone(found) -> {
+                self.bytes[1] = EventKind.ScanDone as UInt8
+                self.bytes[2] = (found & 0xFF) as UInt8
+                self.bytes[3] = (found >> 8) as UInt8
+                4
+            },
+            case Connected(bssid, channel) -> {
+                self.bytes[1] = EventKind.Connected as UInt8
+                self.put_bssid(2, &bssid)
+                self.bytes[8] = channel
+                9
+            },
+            case Disconnected(reason) -> {
+                self.bytes[1] = EventKind.Disconnected as UInt8
+                self.bytes[2] = reason as UInt8
+                3
+            },
+        }
+    }
+}
+
+/// A received message's length and bytes: all the decoders read, so the wire
+/// is tested without a kernel.
+///
+/// Only `init` makes one, so its length is at most `BODY_BYTES`, which the
+/// decoders rely on.
+public struct Frame {
+    // How many of the bytes are the message's.
+    private count: UInt,
+    private body: [UInt8; BODY_BYTES],
+}
+
+extension Frame {
+    /// The message of the first `len` bytes of `body`, or `Length` for a
+    /// length past the body.
+    public init(len: UInt, body: [UInt8; BODY_BYTES]) -> Result<Frame, WireError> {
+        if len > BODY_BYTES as UInt { return WireError.Length(len) }
+        return Frame(count: len, body: body)
+    }
+
+    /// How many bytes the message has.
+    public func len(&self) -> UInt {
+        self.count
+    }
+
+    /// The body the message's bytes are the first of.
+    public func bytes(&self) -> [UInt8; BODY_BYTES] {
+        self.body
+    }
+
+    /// Byte `at`; zero past the message's end.
+    public func byte(&self, at: Int) -> UInt8 {
+        if at < 0 || (at as UInt) >= self.count { return 0 }
+        self.body[at]
+    }
+
+    /// The BSSID at byte `at`.
+    func bssid(&self, at: Int) -> [UInt8; BSSID_BYTES] {
+        var b: [UInt8; BSSID_BYTES] = [0; BSSID_BYTES]
+        var i = 0
+        while i < BSSID_BYTES {
+            b[i] = self.byte(at + i)
+            i = i + 1
+        }
+        b
+    }
+
+    /// The SSID whose length byte is at `at`, which must end the message.
+    func ssid(&self, at: Int) -> Result<Ssid, WireError> {
+        let n = self.byte(at)
+        if n as Int > SSID_BYTES { return WireError.SsidLength(n as UInt) }
+        if self.count != (at + 1 + n as Int) as UInt { return WireError.Length(self.count) }
+        var s = Ssid.none()
+        var i = 0
+        while i < n as Int {
+            s.data[i] = self.body[at + 1 + i]
+            i = i + 1
+        }
+        s.count = n
+        return s
+    }
+
+    /// The request this message is, or why it is none. A driver answers a
+    /// refusal with its `WireError.status()`, and a `Connect` of an auth it
+    /// does not join `Unsupported`.
+    public func request(&self) -> Result<WlanRequest, WireError> {
+        if self.count == 0 { return WireError.NoBytes }
+        let raw = self.body[OP_BYTE]
+        guard let op = WlanOp.from(raw: raw) else { return WireError.UnknownOp(raw) }
+        match op {
+            case Connect -> self.connect(),
+            case _ -> {
+                if self.count != 1 { return WireError.Length(self.count) }
+                match op {
+                    case Scan -> WlanRequest.Scan,
+                    case Disconnect -> WlanRequest.Disconnect,
+                    case Status -> WlanRequest.Status,
+                    case _ -> WlanRequest.WaitEvent,
+                }
+            },
+        }
+    }
+
+    /// A `Connect`'s fields: the SSID, then the auth and the key after it.
+    func connect(&self) -> Result<WlanRequest, WireError> {
+        if self.count < 2 { return WireError.Length(self.count) }
+        let ssid_len = self.body[1]
+        if ssid_len == 0 || ssid_len as Int > SSID_BYTES {
+            return WireError.SsidLength(ssid_len as UInt)
+        }
+        // A key length past the end reads as zero, and no length then matches.
+        let at = 2 + ssid_len as Int
+        let key_len = self.byte(at + 1)
+        if self.count != (at + 2 + key_len as Int) as UInt { return WireError.Length(self.count) }
+        if key_len as Int > KEY_BYTES { return WireError.KeyLength(key_len as UInt) }
+        guard let auth = WlanAuth.from(raw: self.body[at]) else {
+            return WireError.UnknownAuth(self.body[at])
+        }
+        var ssid = Ssid.none()
+        var i = 0
+        while i < ssid_len as Int {
+            ssid.data[i] = self.body[2 + i]
+            i = i + 1
+        }
+        ssid.count = ssid_len
+        var key = Key.none()
+        i = 0
+        while i < key_len as Int {
+            key.data[i] = self.body[at + 2 + i]
+            i = i + 1
+        }
+        key.count = key_len
+        try check_key(auth, &key)
+        return WlanRequest.Connect(ssid, auth, key)
+    }
+
+    /// The status a reply carries, or why it carries none.
+    func status(&self) -> Result<WlanStatus, WireError> {
+        if self.count == 0 { return WireError.NoBytes }
+        let raw = self.body[0]
+        guard let status = WlanStatus.from(raw: raw) else {
+            return WireError.UnknownStatus(raw)
+        }
+        return status
+    }
+
+    /// Nothing when the reply is `Ok`; the refusal it carries, or why it is
+    /// malformed, otherwise. Each decoder checks an `Ok` reply's length
+    /// itself, reading a field past the end as zero until it does.
+    func ok(&self) -> Result<Void, WlanError> {
+        let status = try self.status() catch { return WlanError.Malformed(error) }
+        if status != WlanStatus.Ok {
+            if self.count != 1 { return WlanError.Malformed(WireError.Length(self.count)) }
+            return WlanError.Refused(status)
+        }
+        return
+    }
+}
+
+/// The reply to a `Scan`, `Connect` or `Disconnect`: `Ok` alone, or a
+/// refusal.
+public func empty_reply(reply: &Frame) -> Result<Void, WlanError> {
+    try reply.ok()
+    if reply.count != 1 { return WlanError.Malformed(WireError.Length(reply.count)) }
+    return
+}
+
+/// A `Status`'s reply. The SSID ends it, so its length is the reply's.
+public func status_reply(reply: &Frame) -> Result<StationStatus, WlanError> {
+    try reply.ok()
+    guard let state = WlanState.from(raw: reply.byte(1)) else {
+        return WlanError.Malformed(WireError.UnknownState(reply.byte(1)))
+    }
+    let ssid = try reply.ssid(10) catch { return WlanError.Malformed(error) }
+    return StationStatus(state: state, bssid: reply.bssid(2), channel: reply.byte(8),
+                         rssi: Int8.from(truncating: reply.byte(9)), ssid: ssid)
+}
+
+/// A `WaitEvent`'s reply.
+public func event_reply(reply: &Frame) -> Result<WlanEvent, WlanError> {
+    try reply.ok()
+    if reply.count < 2 { return WlanError.Malformed(WireError.Length(reply.count)) }
+    let raw = reply.body[1]
+    guard let kind = EventKind.from(raw: raw) else {
+        return WlanError.Malformed(WireError.UnknownEvent(raw))
+    }
+    match kind {
+        case ScanResult -> {
+            // The SSID ends it, so its length is the reply's.
+            guard let auth = WlanAuth.from(raw: reply.byte(10)) else {
+                return WlanError.Malformed(WireError.UnknownAuth(reply.byte(10)))
+            }
+            let ssid = try reply.ssid(11) catch { return WlanError.Malformed(error) }
+            WlanEvent.ScanResult(Network(bssid: reply.bssid(2), channel: reply.byte(8),
+                                         rssi: Int8.from(truncating: reply.byte(9)),
+                                         auth: auth, ssid: ssid))
+        },
+        case ScanDone -> {
+            if reply.count != 4 { return WlanError.Malformed(WireError.Length(reply.count)) }
+            WlanEvent.ScanDone((reply.body[2] as UInt16) | ((reply.body[3] as UInt16) << 8))
+        },
+        case Connected -> {
+            if reply.count != 9 { return WlanError.Malformed(WireError.Length(reply.count)) }
+            WlanEvent.Connected(reply.bssid(2), reply.body[8])
+        },
+        case Disconnected -> {
+            if reply.count != 3 { return WlanError.Malformed(WireError.Length(reply.count)) }
+            guard let reason = DisconnectReason.from(raw: reply.body[2]) else {
+                return WlanError.Malformed(WireError.UnknownReason(reply.body[2]))
+            }
+            WlanEvent.Disconnected(reason)
+        },
+    }
+}

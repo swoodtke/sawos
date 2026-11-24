@@ -59,7 +59,12 @@ drivers/           # userspace device drivers and the protocol packages their
                    # svc-gpio-esp32s3/ the driver, whose pins are its build
                    # input `gpioconfig`; pwmproto/ is the PWM driver's wire
                    # and svc-pwm-esp32s3/ the driver, whose servos are its
-                   # build input `pwmconfig`
+                   # build input `pwmconfig`. Networking's packages: pktring/
+                   # is the shared-memory packet ring and its read-once
+                   # accessors; netdevproto/ (frames), hciproto/ (H4
+                   # packets) and sockproto/ (sockets) are the protocols
+                   # that carry their bulk data in one, wlanproto/ the radio's
+                   # join control
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 rt/main/           # `sosmain`: the `_start` of a program written with `main`
@@ -132,8 +137,10 @@ region table's and slab block's bytes, an image's limits and each refusal of
 them, the in-place check, the slab-region check, and every board, process
 and image description in the tree read clean) and the hosted packages'
 (`HOSTED_TESTS`: `drivers/esp32s3io/`, `drivers/gpioproto/`,
-`drivers/pwmproto/`, `drivers/uartproto/`, `drivers/consolecore/` and
-`rt/common/`, the runtime's heap), which need no emulator and print nothing
+`drivers/pwmproto/`, `drivers/uartproto/`, `drivers/consolecore/`,
+`drivers/pktring/`, `drivers/netdevproto/`, `drivers/hciproto/`,
+`drivers/wlanproto/`, `drivers/sockproto/` and `rt/common/`, the
+runtime's heap), which need no emulator and print nothing
 when they pass. Per profile it writes a profile description (JSON) and calls
 `sosimage native`, then `sosimage board` on the profile's
 `hal/<profile>/board.toml`,

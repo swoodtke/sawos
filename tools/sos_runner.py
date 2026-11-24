@@ -970,6 +970,10 @@ LOCK_WAIT_PKG = os.path.join(TESTS_DIR, "lock-wait")
 # A `main` program reading fields `sos` keeps to itself (handle words, a boot
 # set's records, a boot record's slots), which the compile refuses.
 HANDLE_SEALED_PKG = os.path.join(TESTS_DIR, "handle-sealed")
+# A `main` program writing fields the networking packages keep to themselves
+# (a ring's layout, window and endpoint state, the decoders' frames and
+# lengths), which the compile refuses.
+NET_SEALED_PKG = os.path.join(TESTS_DIR, "net-sealed")
 # Threads made with `thread_create(run:arg:stack_top:)`: `thread-run`
 # launches `child-thread-run` once per role, and `child-thread-take`, under
 # `death-notify`, has two threads take the boot set.
@@ -13206,6 +13210,42 @@ TEST_CASES = [
         "expect_clean_exit": False,
     },
     {
+        # A program writing past the networking packages' seals: the fields a
+        # ring's safety rests on (a layout's sizes, a window's address and
+        # length, an endpoint's memory, indexes and latched fault) and those a
+        # decoder's bounds rest on (a frame's, an SSID's, a key's and a name's
+        # length and bytes), and building a layout, a window, an endpoint and
+        # a frame field by field. The compile refuses each, and each refusal
+        # is asserted.
+        "name": "net_fields_sealed",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": NET_SEALED_PKG,
+        "expect_build_error": [
+            f"`{owner}` has no member `{field}` this module can see"
+            for owner, fields in [
+                ("pktring.Layout", ["slot_size", "to_server", "to_client"]),
+                ("pktring.SharedWindow", ["base", "bytes"]),
+                ("pktring.Endpoint<pktring.SharedWindow>",
+                 ["memory", "shape", "fills", "out_head", "out_published",
+                  "out_tail", "drains", "in_tail", "in_released", "in_head",
+                  "failed"]),
+                ("netdevproto.Frame", ["count", "body"]),
+                ("hciproto.Frame", ["count", "body"]),
+                ("wlanproto.Frame", ["count", "body"]),
+                ("sockproto.Frame", ["count", "body"]),
+                ("wlanproto.Ssid", ["count", "data"]),
+                ("wlanproto.Key", ["count", "data"]),
+                ("sockproto.Name", ["count", "data"])]
+            for field in fields] + [
+            "no parameter is labeled `slot_size` in Layout.init",
+            "no parameter is labeled `base` in SharedWindow.init",
+            "`Endpoint` has no `init` this module can call, and its fields "
+            "are not all visible here",
+            "no parameter is labeled `count` in Frame.init"],
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+    {
         # The output lock's wait in a `_start` package (`lock-wait`): the
         # initial thread takes the lock and prints, a worker's `print` then
         # waits for it, and the initial thread prints again and gives it
@@ -14735,6 +14775,11 @@ HOSTED_TESTS = [os.path.join(DRIVERS_DIR, "esp32s3io"),
                 os.path.join(DRIVERS_DIR, "pwmproto"),
                 os.path.join(DRIVERS_DIR, "uartproto"),
                 os.path.join(DRIVERS_DIR, "consolecore"),
+                os.path.join(DRIVERS_DIR, "pktring"),
+                os.path.join(DRIVERS_DIR, "netdevproto"),
+                os.path.join(DRIVERS_DIR, "hciproto"),
+                os.path.join(DRIVERS_DIR, "wlanproto"),
+                os.path.join(DRIVERS_DIR, "sockproto"),
                 os.path.dirname(SOSRT_DIR)]
 
 # The link the builder's manifest reaches the sawlang checkout's packages

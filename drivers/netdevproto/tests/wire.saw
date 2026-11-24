@@ -1,0 +1,97 @@
+// The network device wire, as bytes: each op, status and event value, each
+// builder's bytes and lengths. A shared enum would change client and driver
+// together and no case would notice, so the numbers are written here.
+
+import netdevproto.{BODY_BYTES, ETHERNET_HEADER_BYTES, EventKind, MAC_BYTES, NetdevBody,
+                    NetdevEvent, NetdevOp, NetdevStats, NetdevStatus, AttachInfo,
+                    SLOT_BYTES, layout}
+import pktring.{LayoutError, Ring, SlotRange}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// Whether the first bytes of `b` are `want`.
+func starts(b: &NetdevBody, want: [UInt8; 13], n: Int) -> Bool {
+    var i = 0
+    while i < n {
+        if b.bytes[i] != want[i] { return false }
+        i = i + 1
+    }
+    true
+}
+
+func main() {
+    check(NetdevOp.Attach as UInt8 == 1 && NetdevOp.Tx as UInt8 == 2 &&
+          NetdevOp.RxReturn as UInt8 == 3 && NetdevOp.WaitEvent as UInt8 == 4 &&
+          NetdevOp.Stats as UInt8 == 5, "the op numbers")
+    check(NetdevOp.from(raw: 0).is_none() && NetdevOp.from(raw: 6).is_none(),
+          "no op 0 or 6")
+    check(NetdevStatus.Ok as UInt8 == 0 && NetdevStatus.BadOp as UInt8 == 1 &&
+          NetdevStatus.BadArg as UInt8 == 2 && NetdevStatus.NotAttached as UInt8 == 3 &&
+          NetdevStatus.Attached as UInt8 == 4 && NetdevStatus.Busy as UInt8 == 5,
+          "the status numbers")
+    check(EventKind.RxReady as UInt8 == 1 && EventKind.TxDone as UInt8 == 2 &&
+          EventKind.LinkUp as UInt8 == 3 && EventKind.LinkDown as UInt8 == 4,
+          "the event numbers")
+    check(NetdevOp.Attach.payload_bytes() == 4 && NetdevOp.Tx.payload_bytes() == 4 &&
+          NetdevOp.RxReturn.payload_bytes() == 4 && NetdevOp.WaitEvent.payload_bytes() == 0 &&
+          NetdevOp.Stats.payload_bytes() == 0, "each op's payload")
+    check(NetdevOp.Attach.describe().equals("attach") && NetdevOp.Tx.describe().equals("tx") &&
+          NetdevOp.RxReturn.describe().equals("rx_return") &&
+          NetdevOp.WaitEvent.describe().equals("wait_event") &&
+          NetdevOp.Stats.describe().equals("stats"), "each op's name")
+    check(NetdevStatus.Ok.describe().equals("Ok") &&
+          NetdevStatus.BadOp.describe().equals("BadOp") &&
+          NetdevStatus.BadArg.describe().equals("BadArg") &&
+          NetdevStatus.NotAttached.describe().equals("NotAttached") &&
+          NetdevStatus.Attached.describe().equals("Attached") &&
+          NetdevStatus.Busy.describe().equals("Busy"), "each status's name")
+    check(BODY_BYTES == 128 && SLOT_BYTES == 2048 && MAC_BYTES == 6 &&
+          ETHERNET_HEADER_BYTES == 14, "the sizes")
+
+    // The ring's layout is the frame slot's.
+    let l = try! layout(8, 16)
+    check(l.slot_bytes() == 2048 && l.slots(Ring.ToServer) == 8 && l.slots(Ring.ToClient) == 16,
+          "a frame ring")
+    check(match layout(0, 1) { case Ok(_) -> false, case Err(e) -> e == LayoutError.SlotCount(0) },
+          "a frame ring of no slots")
+
+    // Requests.
+    var b = NetdevBody.empty()
+    check(b.attach(0x0102, 0x0304) == 5 &&
+          starts(&b, [1, 0x02, 0x01, 0x04, 0x03, 0, 0, 0, 0, 0, 0, 0, 0], 5), "Attach")
+    check(b.tx(SlotRange(first: 0x0A0B, count: 0x0C0D)) == 5 &&
+          starts(&b, [2, 0x0B, 0x0A, 0x0D, 0x0C, 0, 0, 0, 0, 0, 0, 0, 0], 5), "Tx")
+    check(b.rx_return(SlotRange(first: 7, count: 1)) == 5 &&
+          starts(&b, [3, 7, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0], 5), "RxReturn")
+    check(b.wait_event() == 1 && b.bytes[0] == 4, "WaitEvent")
+    check(b.stats() == 1 && b.bytes[0] == 5, "Stats")
+    check(b.raw(0xEE, 3) == 4 && b.bytes[0] == 0xEE, "a raw request")
+
+    // Replies.
+    var r = NetdevBody.empty()
+    check(r.ok() == 1 && r.bytes[0] == 0, "Ok alone")
+    check(r.refuse(NetdevStatus.Busy) == 1 && r.bytes[0] == 5, "a refusal is its status")
+    let info = AttachInfo(mac: [0x02, 0x11, 0x22, 0x33, 0x44, 0x55], mtu: 1500,
+                          to_server: 8, to_client: 0x0102)
+    check(r.ok_attach(&info) == 13 &&
+          starts(&r, [0, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0xDC, 0x05, 8, 0, 0x02, 0x01], 13),
+          "an Attach answer")
+    check(r.ok_event(&NetdevEvent.RxReady(SlotRange(first: 3, count: 0x0102))) == 6 &&
+          starts(&r, [0, 1, 3, 0, 0x02, 0x01, 0, 0, 0, 0, 0, 0, 0], 6), "RxReady")
+    check(r.ok_event(&NetdevEvent.TxDone(SlotRange(first: 1, count: 2))) == 6 &&
+          starts(&r, [0, 2, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0], 6), "TxDone")
+    check(r.ok_event(&NetdevEvent.LinkUp) == 2 && r.bytes[0] == 0 && r.bytes[1] == 3, "LinkUp")
+    check(r.ok_event(&NetdevEvent.LinkDown) == 2 && r.bytes[0] == 0 && r.bytes[1] == 4,
+          "LinkDown")
+    let stats = NetdevStats(rx_frames: 0x0403_0201, rx_dropped: 5, tx_frames: 6,
+                            tx_errors: 7, ring_faults: 0x0C0B_0A09)
+    check(r.ok_stats(&stats) == 21 && r.bytes[0] == 0 && r.bytes[1] == 1 && r.bytes[4] == 4 &&
+          r.bytes[5] == 5 && r.bytes[9] == 6 && r.bytes[13] == 7 && r.bytes[17] == 9 &&
+          r.bytes[20] == 0x0C, "a Stats answer")
+}

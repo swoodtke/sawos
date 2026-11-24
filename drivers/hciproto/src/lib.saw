@@ -1,0 +1,777 @@
+//! The HCI transport protocol: what a Bluetooth host, the client, and a
+//! Bluetooth controller's driver, the server, say to each other.
+//!
+//! HCI packets cross in a `pktring` the client lays out with `SLOT_BYTES`
+//! slots and gives the server at `Attach`: the host fills the `ToServer` ring
+//! with commands and outbound data, and the driver fills the `ToClient` ring
+//! with events and inbound data. A slot holds one H4 packet: its type byte,
+//! then the HCI packet (`H4Type`, `h4_packet`). Messages carry doorbells and
+//! slot numbers.
+//!
+//! A request is one message: byte 0 the op, then the payload. A reply's byte 0
+//! is a status, then its payload. Integers are little-endian.
+//!
+//! ```text
+//! op           payload                    reply payload
+//! Attach    1  to_server u16,             address [6], acl_max u16,
+//!              to_client u16;             to_server u16, to_client u16
+//!              handle slot 0: the ring
+//! Tx        2  first u16, count u16       -
+//! RxReturn  3  first u16, count u16       -
+//! WaitEvent 4  -                          kind u8, then the event's fields
+//! Stats     5  -                          rx_packets, rx_dropped, tx_packets,
+//!                                         tx_errors, ring_faults (u32 each)
+//! ```
+//!
+//! ```text
+//! event        fields
+//! RxReady   1  first u16, count u16      packets received in those ToClient
+//!                                        slots
+//! TxDone    2  first u16, count u16      ToServer slots sent, free again
+//! Up        3  -                         the controller is ready
+//! Down      4  -                         the controller stopped
+//! ```
+//!
+//! A reply that is not `Ok` carries the status byte alone.
+//!
+//! # The ops
+//!
+//!   - `Attach`    - a call, the connection's first request. The client
+//!                   allocates a Memory of at least the ring's
+//!                   `Layout.bytes()` (`layout`), stores its index words
+//!                   (`Endpoint.client`), and sends it in handle slot 0 with
+//!                   its two slot counts. The driver maps it and answers the
+//!                   controller's public address, the most ACL data one
+//!                   packet carries, and the slot counts it laid the ring out
+//!                   with, which are the request's.
+//!   - `Tx`        - a tell, the doorbell for packets the client published in
+//!                   the `ToServer` ring.
+//!   - `RxReturn`  - a tell, the doorbell for `ToClient` slots the client
+//!                   released.
+//!   - `WaitEvent` - a call the driver holds until it has an event, and
+//!                   answers with the next one. A driver holds one at a time.
+//!                   Packets that arrive while none is held are kept in the
+//!                   ring, and the next `WaitEvent` names all of them, so a
+//!                   slow client never blocks the driver.
+//!   - `Stats`     - a call answered with the driver's counts since it
+//!                   started.
+//!
+//! A doorbell's range is checked on the wire (`SlotRange.fits`) and need not
+//! be acted on: the ring's index words say the same or more.
+//!
+//! # Statuses
+//!
+//! They are checked in this order, and the first that applies is answered:
+//! `BadOp` (a message of no bytes, an op byte that names no op, or a payload
+//! of the wrong length), `BadArg` (a slot count of none or past `MAX_SLOTS`,
+//! a range that does not fit the ring, an `Attach` with no Memory), then
+//! `NotAttached` (any op before `Attach`), `Attached` (a second `Attach`),
+//! `Busy` (a `WaitEvent` while one is held).
+//!
+//! # Failure
+//!
+//! The ring is input (`pktring`), and so is each H4 packet in it: a value of
+//! the peer's that fails a check, a slot's H4 header included (`h4_packet`),
+//! ends the connection, and the driver counts it in `ring_faults`. A client's
+//! death is the connection's peer-closed: the driver drops its mapping and
+//! its slots. A driver's death answers every claim `PeerClosed`.
+
+import pktring.{Layout, LayoutError, MAX_SLOTS, Ring, SlotRange}
+
+/// The bytes of a message body: the kernel's `PIPE_BODY_BYTES`.
+public static BODY_BYTES: Int = 128
+
+/// The bytes of each slot of the ring, in both directions: an H4 packet.
+public static SLOT_BYTES: UInt32 = 512
+
+/// An H4 ACL packet's bytes beside its data: the type byte, the handle and
+/// the data length.
+public static ACL_HEADER_BYTES: UInt32 = 5
+
+/// A Bluetooth device address's bytes.
+public static ADDRESS_BYTES: Int = 6
+
+/// The layout of a ring of `to_server` and `to_client` packet slots.
+public func layout(to_server: UInt16, to_client: UInt16) -> Result<Layout, LayoutError> {
+    Layout(slot_bytes: SLOT_BYTES, to_server: to_server as UInt32,
+           to_client: to_client as UInt32)
+}
+
+/// The op byte. Raw-backed because it crosses a wire: each value is stated.
+public enum HciOp: UInt8 {
+    case Attach = 1,
+    case Tx = 2,
+    case RxReturn = 3,
+    case WaitEvent = 4,
+    case Stats = 5,
+}
+
+extension HciOp {
+    /// What a transcript should call this op.
+    public func describe(&self) -> String {
+        match self {
+            case Attach -> "attach",
+            case Tx -> "tx",
+            case RxReturn -> "rx_return",
+            case WaitEvent -> "wait_event",
+            case Stats -> "stats",
+        }
+    }
+
+    /// How many payload bytes a request of this op carries.
+    public func payload_bytes(&self) -> UInt {
+        match self {
+            case Attach -> 4,
+            case Tx -> 4,
+            case RxReturn -> 4,
+            case WaitEvent -> 0,
+            case Stats -> 0,
+        }
+    }
+}
+
+/// A reply's status byte. `Ok` is 0.
+public enum HciStatus: UInt8 {
+    case Ok = 0,
+    case BadOp = 1,
+    case BadArg = 2,
+    case NotAttached = 3,
+    case Attached = 4,
+    case Busy = 5,
+}
+
+@synthesize
+extension HciStatus: Equatable {}
+
+extension HciStatus {
+    /// What a transcript should call this status.
+    public func describe(&self) -> String {
+        match self {
+            case Ok -> "Ok",
+            case BadOp -> "BadOp",
+            case BadArg -> "BadArg",
+            case NotAttached -> "NotAttached",
+            case Attached -> "Attached",
+            case Busy -> "Busy",
+        }
+    }
+}
+
+/// An event's kind byte.
+public enum EventKind: UInt8 {
+    case RxReady = 1,
+    case TxDone = 2,
+    case Up = 3,
+    case Down = 4,
+}
+
+/// What a `WaitEvent` is answered with.
+public enum HciEvent {
+    /// Packets received in these `ToClient` slots.
+    case RxReady(range: SlotRange),
+    /// These `ToServer` slots were sent and are free again.
+    case TxDone(range: SlotRange),
+    /// The controller is ready.
+    case Up,
+    /// The controller stopped.
+    case Down,
+}
+
+@synthesize
+extension HciEvent: Equatable {}
+
+/// A request, decoded.
+public enum HciRequest {
+    case Attach(to_server: UInt16, to_client: UInt16),
+    case Tx(range: SlotRange),
+    case RxReturn(range: SlotRange),
+    case WaitEvent,
+    case Stats,
+}
+
+@synthesize
+extension HciRequest: Equatable {}
+
+/// An `Attach`'s answer.
+public struct AttachInfo {
+    public address: [UInt8; ADDRESS_BYTES],
+    /// The most ACL data one packet carries.
+    public acl_max: UInt16,
+    public to_server: UInt16,
+    public to_client: UInt16,
+}
+
+@synthesize
+extension AttachInfo: Equatable {}
+
+/// A `Stats` answer: the driver's counts since it started.
+public struct HciStats {
+    public rx_packets: UInt32,
+    /// Packets the controller sent with no free `ToClient` slot.
+    public rx_dropped: UInt32,
+    public tx_packets: UInt32,
+    public tx_errors: UInt32,
+    /// Connections ended for a value that failed a ring check.
+    public ring_faults: UInt32,
+}
+
+@synthesize
+extension HciStats: Equatable {}
+
+/// Why a message is malformed: each shape a decoder refuses, by name.
+public enum WireError {
+    /// A message of no bytes.
+    case NoBytes,
+    /// An op byte that names no op.
+    case UnknownOp(op: UInt8),
+    /// A status byte that names no status.
+    case UnknownStatus(status: UInt8),
+    /// An event kind byte that names no event.
+    case UnknownEvent(kind: UInt8),
+    /// A length the message's op, status or event does not have.
+    case Length(len: UInt),
+    /// A slot count of none or past `MAX_SLOTS`.
+    case SlotCount(count: UInt16),
+    /// A slot range no ring can hold (`SlotRange.fits` at `MAX_SLOTS`).
+    case Range(first: UInt16, count: UInt16),
+    /// An ACL data size whose packet would not fit a slot.
+    case AclMax(acl_max: UInt16),
+}
+
+@synthesize
+extension WireError: Equatable {}
+
+extension WireError {
+    /// The status a driver answers a request refused for this.
+    public func status(&self) -> HciStatus {
+        match self {
+            case SlotCount(_) -> HciStatus.BadArg,
+            case Range(_, _) -> HciStatus.BadArg,
+            case _ -> HciStatus.BadOp,
+        }
+    }
+
+    /// What a transcript should call this.
+    public func describe(&self) -> String {
+        match self {
+            case NoBytes -> "a message of no bytes",
+            case UnknownOp(_) -> "an op that is none",
+            case UnknownStatus(_) -> "a status that is none",
+            case UnknownEvent(_) -> "an event that is none",
+            case Length(_) -> "a length its kind does not have",
+            case SlotCount(_) -> "a slot count past the ring's",
+            case Range(_, _) -> "a slot range past the ring's",
+            case AclMax(_) -> "an ACL size past the slot",
+        }
+    }
+}
+
+/// Why a reply did not answer what its request asked.
+public enum HciError {
+    /// The driver refused the request with this status.
+    case Refused(status: HciStatus),
+    /// The reply is no reply its request can have.
+    case Malformed(why: WireError),
+}
+
+@synthesize
+extension HciError: Equatable {}
+
+extension HciError: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        match self {
+            case Refused(status) -> {
+                try! into.append("refused: ")
+                try! into.append(status.describe())
+            },
+            case Malformed(why) -> {
+                try! into.append("malformed: ")
+                try! into.append(why.describe())
+            },
+        }
+    }
+}
+
+extension HciError: Error {}
+
+static OP_BYTE: Int = 0
+static PAYLOAD_BYTE: Int = 1
+
+/// A `WaitEvent` answer's bytes: the status, the kind and a range.
+static EVENT_REPLY_BYTES: UInt = 6
+/// An `Attach` answer's bytes.
+static ATTACH_REPLY_BYTES: UInt = 13
+/// A `Stats` answer's bytes.
+static STATS_REPLY_BYTES: UInt = 21
+
+static_assert(STATS_REPLY_BYTES <= BODY_BYTES as UInt, "a Stats answer fits one message")
+
+/// A message body, for a request or a reply. The builders answer the
+/// message's `len`.
+public struct HciBody {
+    public bytes: [UInt8; BODY_BYTES],
+}
+
+extension HciBody {
+    /// A zeroed body.
+    public static func empty() -> HciBody {
+        HciBody(bytes: [0; BODY_BYTES])
+    }
+
+    /// Writes `half` at byte `at`, little-endian.
+    public func put_u16(&var self, at: Int, half: UInt16) {
+        self.bytes[at] = (half & 0xFF) as UInt8
+        self.bytes[at + 1] = (half >> 8) as UInt8
+    }
+
+    /// Writes `word` at byte `at`, little-endian.
+    public func put_u32(&var self, at: Int, word: UInt32) {
+        self.put_u16(at, (word & 0xFFFF) as UInt16)
+        self.put_u16(at + 2, (word >> 16) as UInt16)
+    }
+
+    /// `Attach(to_server, to_client)`; the ring goes in handle slot 0.
+    public func attach(&var self, to_server: UInt16, to_client: UInt16) -> UInt {
+        self.bytes[OP_BYTE] = HciOp.Attach as UInt8
+        self.put_u16(1, to_server)
+        self.put_u16(3, to_client)
+        5
+    }
+
+    /// An op and a slot range: `Tx` and `RxReturn`.
+    func ranged(&var self, op: HciOp, range: SlotRange) -> UInt {
+        self.bytes[OP_BYTE] = op as UInt8
+        self.put_u16(1, range.first)
+        self.put_u16(3, range.count)
+        5
+    }
+
+    /// `Tx(first, count)`.
+    public func tx(&var self, range: SlotRange) -> UInt {
+        self.ranged(HciOp.Tx, range)
+    }
+
+    /// `RxReturn(first, count)`.
+    public func rx_return(&var self, range: SlotRange) -> UInt {
+        self.ranged(HciOp.RxReturn, range)
+    }
+
+    /// `WaitEvent`.
+    public func wait_event(&var self) -> UInt {
+        self.bytes[OP_BYTE] = HciOp.WaitEvent as UInt8
+        1
+    }
+
+    /// `Stats`.
+    public func stats(&var self) -> UInt {
+        self.bytes[OP_BYTE] = HciOp.Stats as UInt8
+        1
+    }
+
+    /// A request with an op byte of any value and `payload` bytes after it,
+    /// for the refusals a client tests. `payload` is at most `BODY_BYTES - 1`.
+    public func raw(&var self, op: UInt8, payload: UInt) -> UInt {
+        self.bytes[OP_BYTE] = op
+        payload + 1
+    }
+
+    /// A reply of the status alone.
+    public func refuse(&var self, status: HciStatus) -> UInt {
+        self.bytes[0] = status as UInt8
+        1
+    }
+
+    /// An `Ok` and nothing else: what `Tx` and `RxReturn` answer.
+    public func ok(&var self) -> UInt {
+        self.refuse(HciStatus.Ok)
+    }
+
+    /// An `Attach` answer.
+    public func ok_attach(&var self, info: &AttachInfo) -> UInt {
+        self.bytes[0] = HciStatus.Ok as UInt8
+        var i = 0
+        while i < ADDRESS_BYTES {
+            self.bytes[1 + i] = info.address[i]
+            i = i + 1
+        }
+        self.put_u16(7, info.acl_max)
+        self.put_u16(9, info.to_server)
+        self.put_u16(11, info.to_client)
+        ATTACH_REPLY_BYTES
+    }
+
+    /// A `WaitEvent` answer.
+    public func ok_event(&var self, event: &HciEvent) -> UInt {
+        self.bytes[0] = HciStatus.Ok as UInt8
+        match event {
+            case RxReady(range) -> {
+                self.bytes[1] = EventKind.RxReady as UInt8
+                self.put_u16(2, range.first)
+                self.put_u16(4, range.count)
+                EVENT_REPLY_BYTES
+            },
+            case TxDone(range) -> {
+                self.bytes[1] = EventKind.TxDone as UInt8
+                self.put_u16(2, range.first)
+                self.put_u16(4, range.count)
+                EVENT_REPLY_BYTES
+            },
+            case Up -> {
+                self.bytes[1] = EventKind.Up as UInt8
+                2
+            },
+            case Down -> {
+                self.bytes[1] = EventKind.Down as UInt8
+                2
+            },
+        }
+    }
+
+    /// A `Stats` answer.
+    public func ok_stats(&var self, stats: &HciStats) -> UInt {
+        self.bytes[0] = HciStatus.Ok as UInt8
+        self.put_u32(1, stats.rx_packets)
+        self.put_u32(5, stats.rx_dropped)
+        self.put_u32(9, stats.tx_packets)
+        self.put_u32(13, stats.tx_errors)
+        self.put_u32(17, stats.ring_faults)
+        STATS_REPLY_BYTES
+    }
+}
+
+/// A received message's length and bytes: all the decoders read, so the wire
+/// is tested without a kernel.
+///
+/// Only `init` makes one, so its length is at most `BODY_BYTES`, which the
+/// decoders rely on.
+public struct Frame {
+    // How many of the bytes are the message's.
+    private count: UInt,
+    private body: [UInt8; BODY_BYTES],
+}
+
+extension Frame {
+    /// The message of the first `len` bytes of `body`, or `Length` for a
+    /// length past the body.
+    public init(len: UInt, body: [UInt8; BODY_BYTES]) -> Result<Frame, WireError> {
+        if len > BODY_BYTES as UInt { return WireError.Length(len) }
+        return Frame(count: len, body: body)
+    }
+
+    /// How many bytes the message has.
+    public func len(&self) -> UInt {
+        self.count
+    }
+
+    /// The body the message's bytes are the first of.
+    public func bytes(&self) -> [UInt8; BODY_BYTES] {
+        self.body
+    }
+
+    /// Byte `at`; zero past the message's end.
+    public func byte(&self, at: Int) -> UInt8 {
+        if at < 0 || (at as UInt) >= self.count { return 0 }
+        self.body[at]
+    }
+
+    /// The little-endian half-word at byte `at`.
+    public func u16(&self, at: Int) -> UInt16 {
+        (self.byte(at) as UInt16) | ((self.byte(at + 1) as UInt16) << 8)
+    }
+
+    /// The little-endian word at byte `at`.
+    public func u32(&self, at: Int) -> UInt32 {
+        (self.u16(at) as UInt32) | ((self.u16(at + 2) as UInt32) << 16)
+    }
+
+    /// The slot range at byte `at`, refused unless some ring can hold it.
+    func range(&self, at: Int) -> Result<SlotRange, WireError> {
+        let range = SlotRange(first: self.u16(at), count: self.u16(at + 2))
+        if not range.fits(MAX_SLOTS) {
+            return WireError.Range(range.first, range.count)
+        }
+        return range
+    }
+
+    /// The request this message is, or why it is none. A driver answers a
+    /// refusal with its `WireError.status()`.
+    public func request(&self) -> Result<HciRequest, WireError> {
+        if self.count == 0 { return WireError.NoBytes }
+        let raw = self.body[OP_BYTE]
+        guard let op = HciOp.from(raw: raw) else { return WireError.UnknownOp(raw) }
+        if self.count != op.payload_bytes() + 1 { return WireError.Length(self.count) }
+        match op {
+            case Attach -> {
+                let to_server = self.u16(1)
+                let to_client = self.u16(3)
+                try check_count(to_server)
+                try check_count(to_client)
+                HciRequest.Attach(to_server, to_client)
+            },
+            case Tx -> HciRequest.Tx(try self.range(1)),
+            case RxReturn -> HciRequest.RxReturn(try self.range(1)),
+            case WaitEvent -> HciRequest.WaitEvent,
+            case Stats -> HciRequest.Stats,
+        }
+    }
+
+    /// The status a reply carries, or why it carries none.
+    func status(&self) -> Result<HciStatus, WireError> {
+        if self.count == 0 { return WireError.NoBytes }
+        let raw = self.body[0]
+        guard let status = HciStatus.from(raw: raw) else {
+            return WireError.UnknownStatus(raw)
+        }
+        return status
+    }
+
+    /// The reply's status when it is `Ok` with `len` bytes; the refusal it
+    /// carries, or why it is malformed, otherwise.
+    func ok(&self, len: UInt) -> Result<Void, HciError> {
+        let status = try self.status() catch { return HciError.Malformed(error) }
+        if status != HciStatus.Ok {
+            if self.count != 1 { return HciError.Malformed(WireError.Length(self.count)) }
+            return HciError.Refused(status)
+        }
+        if self.count != len { return HciError.Malformed(WireError.Length(self.count)) }
+        return
+    }
+}
+
+/// A slot count an `Attach` may carry: one to `MAX_SLOTS`.
+func check_count(count: UInt16) -> Result<Void, WireError> {
+    if count == 0 || (count as UInt32) > MAX_SLOTS { return WireError.SlotCount(count) }
+    return
+}
+
+/// The reply to a `Tx` or an `RxReturn` sent as a call: `Ok` alone, or a
+/// refusal.
+public func empty_reply(reply: &Frame) -> Result<Void, HciError> {
+    reply.ok(1)
+}
+
+/// An `Attach`'s reply. Slot counts no ring can have, and an ACL data size
+/// whose packet would not fit a slot, are malformed.
+public func attach_reply(reply: &Frame) -> Result<AttachInfo, HciError> {
+    try reply.ok(ATTACH_REPLY_BYTES)
+    var address: [UInt8; ADDRESS_BYTES] = [0; ADDRESS_BYTES]
+    var i = 0
+    while i < ADDRESS_BYTES {
+        address[i] = reply.byte(1 + i)
+        i = i + 1
+    }
+    let acl_max = reply.u16(7)
+    if (acl_max as UInt32) + ACL_HEADER_BYTES > SLOT_BYTES {
+        return HciError.Malformed(WireError.AclMax(acl_max))
+    }
+    let to_server = reply.u16(9)
+    let to_client = reply.u16(11)
+    try check_count(to_server) catch { return HciError.Malformed(error) }
+    try check_count(to_client) catch { return HciError.Malformed(error) }
+    return AttachInfo(address: address, acl_max: acl_max, to_server: to_server,
+                      to_client: to_client)
+}
+
+/// A `WaitEvent`'s reply.
+public func event_reply(reply: &Frame) -> Result<HciEvent, HciError> {
+    let status = try reply.status() catch { return HciError.Malformed(error) }
+    if status != HciStatus.Ok || reply.count < 2 {
+        try reply.ok(2)
+    }
+    let raw = reply.body[1]
+    guard let kind = EventKind.from(raw: raw) else {
+        return HciError.Malformed(WireError.UnknownEvent(raw))
+    }
+    match kind {
+        case RxReady -> {
+            try reply.ok(EVENT_REPLY_BYTES)
+            let range = try reply.range(2) catch { return HciError.Malformed(error) }
+            HciEvent.RxReady(range)
+        },
+        case TxDone -> {
+            try reply.ok(EVENT_REPLY_BYTES)
+            let range = try reply.range(2) catch { return HciError.Malformed(error) }
+            HciEvent.TxDone(range)
+        },
+        case Up -> {
+            try reply.ok(2)
+            HciEvent.Up
+        },
+        case Down -> {
+            try reply.ok(2)
+            HciEvent.Down
+        },
+    }
+}
+
+/// A `Stats`'s reply.
+public func stats_reply(reply: &Frame) -> Result<HciStats, HciError> {
+    try reply.ok(STATS_REPLY_BYTES)
+    return HciStats(rx_packets: reply.u32(1), rx_dropped: reply.u32(5),
+                       tx_packets: reply.u32(9), tx_errors: reply.u32(13),
+                       ring_faults: reply.u32(17))
+}
+
+// =============================================================================
+// H4 packets in the slots
+// =============================================================================
+
+/// The longest H4 header: the type byte and four bytes of HCI header.
+public static H4_HEADER_MAX: Int = 5
+
+/// An H4 packet's type byte, the slot's first byte.
+public enum H4Type: UInt8 {
+    case Command = 1,
+    case Acl = 2,
+    case Sco = 3,
+    case Event = 4,
+    case Iso = 5,
+}
+
+@synthesize
+extension H4Type: Equatable {}
+
+extension H4Type {
+    /// The bytes of the HCI header after the type byte.
+    public func header_bytes(&self) -> UInt {
+        match self {
+            case Command -> 3,
+            case Acl -> 4,
+            case Sco -> 3,
+            case Event -> 2,
+            case Iso -> 4,
+        }
+    }
+
+    /// Whether a packet of this type crosses in `ring`: commands go only to
+    /// the controller and events only from it.
+    public func crosses(&self, ring: Ring) -> Bool {
+        match self {
+            case Command -> ring == Ring.ToServer,
+            case Event -> ring == Ring.ToClient,
+            case _ -> true,
+        }
+    }
+
+    /// The most payload the header's length field can state.
+    public func payload_max(&self) -> UInt {
+        match self {
+            case Command -> 0xFF,
+            case Acl -> 0xFFFF,
+            case Sco -> 0xFF,
+            case Event -> 0xFF,
+            case Iso -> 0x3FFF,
+        }
+    }
+}
+
+/// An H4 packet's header, checked: its type, its first header field (a
+/// command's opcode, a connection handle with its flags, or an event's code),
+/// and where its payload lies in the packet.
+public struct H4Packet {
+    public kind: H4Type,
+    public field: UInt16,
+    public payload_at: UInt,
+    public payload_len: UInt,
+}
+
+@synthesize
+extension H4Packet: Equatable {}
+
+/// Why a slot's bytes are no H4 packet.
+public enum H4Error {
+    /// A packet of no bytes.
+    case NoBytes,
+    /// A type byte that names no type.
+    case UnknownType(kind: UInt8),
+    /// A type that does not cross in this ring.
+    case Direction(kind: H4Type),
+    /// Fewer bytes than the type's header.
+    case Short(len: UInt),
+    /// A header whose length is not the slot's: `declared` is the type byte,
+    /// the header and the payload the header states.
+    case Length(declared: UInt, len: UInt),
+    /// A payload past what the type's length field can state, which no
+    /// header can be written for.
+    case Payload(len: UInt),
+}
+
+@synthesize
+extension H4Error: Equatable {}
+
+extension H4Error {
+    /// What a transcript should call this.
+    public func describe(&self) -> String {
+        match self {
+            case NoBytes -> "a packet of no bytes",
+            case UnknownType(_) -> "a packet type that is none",
+            case Direction(_) -> "a packet type that does not cross this way",
+            case Short(_) -> "a packet shorter than its header",
+            case Length(_, _) -> "a header whose length is not the packet's",
+            case Payload(_) -> "a payload past its type's length field",
+        }
+    }
+}
+
+/// The H4 packet in the first `len` bytes of `packet`, which crossed in
+/// `ring`, or why it is none.
+///
+/// `packet` is the private copy `Endpoint.receive` made, so the header is
+/// read from memory the peer cannot write; `len` is the length it answered.
+/// The header's stated length must be the packet's. `len` past `packet` is a
+/// caller's bug, and panics.
+public func h4_packet<const N: Int>(packet: &[UInt8; N], len: UInt,
+                                    ring: Ring) -> Result<H4Packet, H4Error> {
+    if len > N as UInt {
+        panic("h4_packet: length out of range: {} (len {})", len, N)
+    }
+    if len == 0 { return H4Error.NoBytes }
+    guard let kind = H4Type.from(raw: packet[0]) else {
+        return H4Error.UnknownType(packet[0])
+    }
+    if not kind.crosses(ring) { return H4Error.Direction(kind) }
+    let at = 1 + kind.header_bytes()
+    if len < at { return H4Error.Short(len) }
+    let field: UInt16 = match kind {
+        case Event -> packet[1] as UInt16,
+        case _ -> (packet[1] as UInt16) | ((packet[2] as UInt16) << 8),
+    }
+    let stated: UInt = match kind {
+        case Command -> packet[3] as UInt,
+        case Acl -> (packet[3] as UInt) | ((packet[4] as UInt) << 8),
+        case Sco -> packet[3] as UInt,
+        case Event -> packet[2] as UInt,
+        case Iso -> ((packet[3] as UInt) | ((packet[4] as UInt) << 8)) & 0x3FFF,
+    }
+    if at + stated != len { return H4Error.Length(at + stated, len) }
+    return H4Packet(kind: kind, field: field, payload_at: at, payload_len: stated)
+}
+
+/// Writes an H4 type byte and HCI header at the start of `into`, and answers
+/// the packet's whole length, the header's and the payload's. The payload is
+/// the caller's, after the header.
+///
+/// A payload past what the type's length field can state is `Payload`, and
+/// writes nothing. `into` holds the longest header, which the compile checks.
+/// An event's `field` is its code, a byte: a larger one is a caller's bug,
+/// and panics.
+public func put_h4_header<const N: Int>(into: &var [UInt8; N], kind: H4Type, field: UInt16,
+                                        payload_len: UInt) -> Result<UInt, H4Error> {
+    static_assert(N >= H4_HEADER_MAX, "the buffer holds the longest H4 header")
+    if payload_len > kind.payload_max() { return H4Error.Payload(payload_len) }
+    let at = 1 + kind.header_bytes()
+    into[0] = kind as UInt8
+    match kind {
+        case Event -> {
+            into[1] = field as UInt8
+            into[2] = payload_len as UInt8
+        },
+        case _ -> {
+            into[1] = (field & 0xFF) as UInt8
+            into[2] = (field >> 8) as UInt8
+            into[3] = (payload_len & 0xFF) as UInt8
+            if kind.header_bytes() == 4 { into[4] = (payload_len >> 8) as UInt8 }
+        },
+    }
+    return at + payload_len
+}
