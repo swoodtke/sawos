@@ -1,0 +1,36 @@
+// A clock key handed a CPU found at 240 MHz: the clock words a part reads
+// with the CPU on the PLL (SOC_CLK_SEL 1, PRE_DIV_CNT 0, CLK_XTAL_FREQ 40,
+// CLK_DIV_EN 1) and CPUPERIOD_SEL 2 under PLL_FREQ_SEL 1, the PLL at 480
+// MHz. The emulator's own words have the CPU at 80 MHz, so the words are
+// handed in rather than read. Built at each key that writes:
+//
+//   * `xtal40`, `pll80` and `pll160` lower no CPU from 240 MHz: each prints
+//     its `not taken` line and writes nothing, not even SYSTIMER's CONF,
+//     which must read as reset left it;
+//
+//       SOS-S3: clock pll80 not taken: the CPU was found at 240 MHz, which
+//       this key does not lower; nothing is written sysclk=0x000a8400
+//       cpu_per=0x0000000e
+//
+//     (one line);
+//   * `pll240` takes its switch, with its two LDO writes and the wait.
+//
+// Then the boot goes on.
+
+import kcore.{console}
+import hal
+import s3clock.{clock_init_found}
+import s3clockkit.{ClockWords}
+
+/// SYSTIMER_CONF_REG (soc/esp32s3/register/soc/systimer_reg.h).
+static SYSTIMER_CONF: UInt = 0x6002_3000
+
+@export("kmain")
+func kmain() unsafe {
+    clock_init_found(ClockWords(sysclk: 0x000A_8400, cpu_per: 0x0000_000E))
+    let uart = console()
+    uart.write_str("SOS clockfound: the boot goes on systimer_conf=")
+    uart.write_hex(UnsafeMemory<UInt32, Device>(SYSTIMER_CONF).read() as UInt)
+    uart.write_str("\n")
+    hal.exit_pass()
+}

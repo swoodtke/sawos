@@ -1,0 +1,70 @@
+//! The clock key `pll240`: the CPU on the BBPLL at 240 MHz, the PLL at 480
+//! MHz divided by 2, with both LDOs raised first to the settings ESP-IDF
+//! runs 240 MHz at.
+//!
+//! One of the `s3clock` modules, mapped by a case's `clock` (the runner) or an
+//! image's `[keys]` (`sosimage`). The HAL re-exports its `clock_init`, which
+//! `kmain` calls first, before anything prints or is timed and before the
+//! loader (`../../kernel/lib.saw`). `../../ABI.md` §14 has the sequence
+//! ESP-IDF v5.4.1 runs, the source of each step, and which of it this takes.
+//!
+//! The sequence is ESP-IDF's `rtc_clk_cpu_freq_set_config` for 240 MHz
+//! (esp_hw_support/port/esp32s3/rtc_clk.c), in order (`s3clockkit`'s
+//! `pll_ldo_switch`):
+//!
+//!   * the LDO settings: ESP-IDF's `g_rtc_dbias_pvt_240m` and
+//!     `g_dig_dbias_pvt_240m`, computed from the eFuse's calibration
+//!     (`s3dbias`, `../../dbias/`) and held to the range ESP-IDF's
+//!     arithmetic gives them. Out of it, a line says so, nothing is written,
+//!     and the boot goes on at the clock the ROM left;
+//!   * the BBPLL powered and set to 480 MHz, as `pll80` does
+//!     (`rtc_clk_bbpll_enable`, `rtc_clk_bbpll_configure`);
+//!   * `rtc_clk_cpu_freq_to_pll_mhz(240)` going up: I2C_DIG_REG (block 0x6D,
+//!     host 1; soc/esp32s3/include/soc/regi2c_dig_reg.h) register 4,
+//!     EXT_RTC_DREG [4:0], to the RTC setting, then register 6, EXT_DIG_DREG
+//!     [4:0], to the digital one, then 40 us for the voltage to settle;
+//!   * its three stores: CPUPERIOD_SEL 2, the pre-divider to 1, the source
+//!     to the PLL.
+//!
+//! `rtc_init`'s two writes of the `non_240m` settings, which an application
+//! makes at startup, are not made: the two writes above replace the same two
+//! fields before the clock moves. On a CPU found on the PLL already the
+//! bring-up is not run again, and the two writes and the wait are made
+//! whatever speed it was found at; at 240 they write the settings ESP-IDF
+//! holds there, where ESP-IDF, not going up, writes nothing.
+//!
+//! What moves with it, beside `pll80`'s list: APB stays 80 MHz on the PLL;
+//! the memory-SPI core clock follows CORE_CLK_SEL and the PLL, not
+//! CPUPERIOD_SEL, so the flash stays 20 MHz. The LDO slaves stay as the ROM
+//! leaves them, all six on, which is what ESP-IDF opens at 240 MHz.
+//!
+//! Every word written is volatile, the LDO settings with the rest: a power
+//! cycle puts each back. The eFuse is only read. No key lowers the clock from
+//! 240 MHz: each below it stops on a CPU found there (`write_not_lowered`).
+//!
+//! It reaches every register through `s3clockkit`'s views and the ROM's
+//! functions rather than the HAL's drivers: the HAL names nothing here, so an
+//! image built at the `rom` key is the bytes it would be without the keys.
+
+import s3clockkit.{CPUPERIOD_240M, ClockWords, clock_words, efuse_dbias,
+                   pll_ldo_switch}
+import s3dbias.{Dbias}
+
+/// Set the CPU clock this image is built for: the PLL at 240 MHz, with the
+/// LDOs raised from the eFuse's settings first.
+public func clock_init() unsafe {
+    clock_init_found(clock_words())
+}
+
+/// `clock_init` on a CPU whose clock words read `found`.
+public func clock_init_found(found: ClockWords) unsafe {
+    clock_init_at(efuse_dbias(), found)
+}
+
+/// `clock_init` with the LDO settings `dbias`, on a CPU whose clock words
+/// read `found`. Settings outside the range ESP-IDF's arithmetic gives them
+/// stop it before anything is written.
+public func clock_init_at(dbias: Dbias, found: ClockWords) unsafe {
+    pll_ldo_switch("pll240", dbias, rtc: dbias.rtc_240m, dig: dbias.dig_240m,
+                   period: CPUPERIOD_240M, found: found)
+}

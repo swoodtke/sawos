@@ -1,14 +1,18 @@
 //! What the clock keys that write share: the clock words' addresses, the
 //! console held still across a switch, the CPU's speed measured against
-//! SYSTIMER, a console writer of their own, and the PLL keys' bring-up and
-//! switch.
+//! SYSTIMER, a console writer of their own, the stop for a CPU found at 240
+//! MHz, and the PLL keys' bring-up, LDO writes and switch.
 //!
 //! The `s3clockkit` module. The profile maps it for every image, but only a
 //! clock key that writes imports it (`../clock-xtal40/`, `../clock-pll80/`,
-//! `../clock-pll160/`), so an image at the `rom` key compiles nothing from
-//! it. Like the keys, it reaches every register through views of its own and
-//! names nothing in `../../kernel/lib.saw`. `../../ABI.md` §14 is the source
-//! of every number.
+//! `../clock-pll160/`, `../clock-pll240/`), so an image at the `rom` key
+//! compiles nothing from it. Like the keys, it reaches every register through
+//! views of its own and names nothing in `../../kernel/lib.saw`.
+//! `../../ABI.md` §14 is the source of every number.
+
+import s3dbias.{Calibration, Dbias, EfuseWords, EFUSE_BASE, EFUSE_SYS_3,
+                EFUSE_SYS_4, EFUSE_SYS_5, EFUSE_PART1_DATA4, check_dbias,
+                stored_dbias}
 
 extern "C" {
     func sos_ccount_read() -> UInt
@@ -31,6 +35,47 @@ public static PRE_DIV_CNT_MASK: UInt32 = 0x3FF
 /// PLL's division for the CPU.
 public static CPU_PER_CONF: UInt = 0x600C_0010
 public static CPUPERIOD_SEL_MASK: UInt32 = 0x3
+
+/// CPUPERIOD_SEL for 240 MHz: the PLL at 480 MHz divided by 2.
+public static CPUPERIOD_240M: UInt32 = 2
+
+/// The CPU's two clock words as a key finds them, before it writes
+/// anything: SYSCLK_CONF and CPU_PER_CONF.
+public struct ClockWords {
+    sysclk: UInt32,
+    cpu_per: UInt32,
+}
+
+/// The clock words as they read now.
+public func clock_words() unsafe -> ClockWords {
+    ClockWords(sysclk: device_word(SYSCLK_CONF).read(),
+               cpu_per: device_word(CPU_PER_CONF).read())
+}
+
+/// Whether `found` has the CPU at 240 MHz: on the PLL, with CPUPERIOD_SEL 2.
+/// On the crystal CPUPERIOD_SEL clocks nothing, whatever it holds.
+public func at_240(found: ClockWords) -> Bool {
+    let source = (found.sysclk >> SOC_CLK_SEL_SHIFT) & SOC_CLK_SEL_MASK
+    source == SOC_CLK_SEL_PLL &&
+        (found.cpu_per & CPUPERIOD_SEL_MASK) == CPUPERIOD_240M
+}
+
+/// The stop of a key that would lower a CPU found at 240 MHz, `name` its
+/// line's name: its `not taken` line, before anything is written. ESP-IDF
+/// lowers both LDOs once the clock has come down from 240
+/// (`rtc_clk_cpu_freq_to_pll_mhz` and `rtc_clk_cpu_freq_to_xtal`, rtc_clk.c),
+/// a step no key below 240 makes, so such a key leaves the CPU, and the
+/// voltage, as it found them.
+public func write_not_lowered(name: String, found: ClockWords) unsafe {
+    write_str("SOS-S3: clock ")
+    write_str(name)
+    write_str(" not taken: the CPU was found at 240 MHz, which this key ")
+    write_str("does not lower; nothing is written sysclk=0x")
+    write_hex(found.sysclk)
+    write_str(" cpu_per=0x")
+    write_hex(found.cpu_per)
+    write_byte(10)
+}
 
 /// UART0: the transmit FIFO, the status word with the FIFO's occupancy in
 /// [25:16], the divisor, FSM_STATUS with ST_UTX_OUT in [7:4] (zero with the
@@ -283,27 +328,38 @@ public struct PllStart {
     bbpll: UInt,
 }
 
-/// Why a PLL key leaves the CPU where the ROM left it.
+/// Why a PLL key leaves the CPU where it found it.
 public enum PllNotTaken {
+    /// The CPU was found at 240 MHz, and the key runs it slower
+    /// (`write_not_lowered`).
+    case FoundAt240,
     /// The BBPLL did not report its calibration done within the bring-up's
     /// bound.
     case CalibrationNotDone
 }
 
-/// The first half of a PLL key, `name` its line's name: the words read, the
-/// speed measured, the console drained and held on the crystal, and, from
-/// the crystal, the BBPLL powered and set to 480 MHz (`sos_pll_bringup`,
-/// `../../kernel/boot.S`; ESP-IDF's `rtc_clk_bbpll_enable` and
-/// `rtc_clk_bbpll_configure`). From RC_FAST, or a select no source names, it
-/// prints why and stops in a quiet loop before any clock word is written
-/// (SYSTIMER is already counting). When the calibration is not reported
-/// done it prints the `not taken` line and answers so: nothing switches to
-/// the PLL.
-public func pll_bring_up(name: String) unsafe -> Result<PllStart, PllNotTaken> {
+/// The first half of a PLL key, `name` its line's name, `period` the
+/// CPUPERIOD_SEL it switches to, and `found` the clock words it read first:
+/// a key below 240 MHz handed a CPU at 240 stops before it writes anything
+/// (`write_not_lowered`). Then the speed measured, the console drained and
+/// held on the crystal, and, from the crystal, the BBPLL powered and set to
+/// 480 MHz (`sos_pll_bringup`, `../../kernel/boot.S`; ESP-IDF's
+/// `rtc_clk_bbpll_enable` and `rtc_clk_bbpll_configure`). From RC_FAST, or a
+/// select no source names, it prints why and stops in a quiet loop before
+/// any clock word is written (SYSTIMER is already counting). When the
+/// calibration is not reported done it prints the `not taken` line and
+/// answers so: nothing switches to the PLL.
+public func pll_bring_up(name: String, period: UInt32,
+                         found: ClockWords) unsafe -> Result<PllStart,
+                                                             PllNotTaken> {
+    if period != CPUPERIOD_240M && at_240(found) {
+        write_not_lowered(name, found)
+        return PllNotTaken.FoundAt240
+    }
     let sysclk = device_word(SYSCLK_CONF)
     let options0 = device_word(RTC_CNTL_OPTIONS0)
-    let sysclk_before = sysclk.read()
-    let cpu_per_before = device_word(CPU_PER_CONF).read()
+    let sysclk_before = found.sysclk
+    let cpu_per_before = found.cpu_per
     let options0_before = options0.read()
     let uart_clk = device_word(UART0_CLK_CONF).read()
     systimer_start()
@@ -350,8 +406,8 @@ public func pll_bring_up(name: String) unsafe -> Result<PllStart, PllNotTaken> {
 }
 
 /// The second half of a PLL key: the CPU moved onto the PLL at the division
-/// `period` (CPUPERIOD_SEL: 0 for 80 MHz, 1 for 160), then the speed
-/// measured and the key's line printed up to its end, which the caller
+/// `period` (CPUPERIOD_SEL: 0 for 80 MHz, 1 for 160, 2 for 240), then the
+/// speed measured and the key's line printed up to its end, which the caller
 /// writes. The three stores are `rtc_clk_cpu_freq_to_pll_mhz`'s
 /// (esp_hw_support/port/esp32s3/rtc_clk.c): CPUPERIOD_SEL, PRE_DIV_CNT 0,
 /// SOC_CLK_SEL 1, in that order, each a store of its own from IRAM.
@@ -404,4 +460,98 @@ public func pll_switch(name: String, start: PllStart, period: UInt32) unsafe {
     write_hex(device_word(SPI0_CLOCK).read())
     write_str(" rtc_date=0x")
     write_hex(device_word(RTC_CNTL_DATE).read())
+}
+
+// -- The PLL keys that set the LDOs ------------------------------------------
+
+/// I2C_DIG_REG on the analog bus, its host, and the two registers written:
+/// EXT_RTC_DREG and EXT_DIG_DREG, each in bits [4:0] of its register
+/// (soc/esp32s3/include/soc/regi2c_dig_reg.h).
+static I2C_DIG_REG: UInt = 0x6D
+static I2C_DIG_REG_HOSTID: UInt = 1
+static EXT_RTC_DREG: UInt = 4
+static EXT_DIG_DREG: UInt = 6
+static DREG_MSB: UInt = 4
+static DREG_LSB: UInt = 0
+static DREG_MASK: UInt = 0x1F
+
+/// `esp_rom_delay_us(40)`, in SYSTIMER's 16 MHz ticks.
+static LDO_SETTLE_TICKS: UInt64 = 40 * 16
+
+/// ESP-IDF's four LDO settings for this part: the eFuse's four calibration
+/// words read, and `rtc_set_stored_dbias`'s arithmetic over them
+/// (`s3dbias`, `../../dbias/`). The eFuse is only read.
+public func efuse_dbias() unsafe -> Dbias {
+    let words = EfuseWords(
+        sys3: device_word(EFUSE_BASE + EFUSE_SYS_3).read(),
+        sys4: device_word(EFUSE_BASE + EFUSE_SYS_4).read(),
+        sys5: device_word(EFUSE_BASE + EFUSE_SYS_5).read(),
+        part1_data4: device_word(EFUSE_BASE + EFUSE_PART1_DATA4).read())
+    stored_dbias(Calibration(words: words))
+}
+
+/// One LDO setting as it reads now.
+func dreg(reg: UInt) unsafe -> UInt {
+    analog_read(I2C_DIG_REG, I2C_DIG_REG_HOSTID, reg) & DREG_MASK
+}
+
+/// A PLL key that sets both LDOs before it moves the CPU's clock, `name` its
+/// line's name: `rtc` and `dig` are the pair of `dbias` it writes, `period`
+/// its CPUPERIOD_SEL and `found` the clock words it read first. In order:
+///
+///   * `dbias` held to the range ESP-IDF's arithmetic gives it
+///     (`check_dbias`). Out of it, a line says so, nothing is written, and
+///     the boot goes on at the clock found;
+///   * `pll_bring_up`, with its two stops;
+///   * EXT_RTC_DREG [4:0] = `rtc`, then EXT_DIG_DREG [4:0] = `dig`, each
+///     through the mask ROM's `rom_i2c_writeReg_Mask`, which ESP-IDF's
+///     REGI2C_WRITE_MASK is: the order of `rtc_init` (rtc_init.c) and of
+///     `rtc_clk_cpu_freq_to_pll_mhz` (rtc_clk.c);
+///   * 40 us of SYSTIMER for the voltage to settle, the wait
+///     `rtc_clk_cpu_freq_to_pll_mhz` makes after it moves an LDO;
+///   * `pll_switch` at `period`, and the line's LDO words.
+public func pll_ldo_switch(name: String, dbias: Dbias, rtc: UInt32,
+                           dig: UInt32, period: UInt32,
+                           found: ClockWords) unsafe {
+    try check_dbias(dbias) catch {
+        write_str("SOS-S3: clock ")
+        write_str(name)
+        write_str(" not taken: the LDO settings are outside ESP-IDF's range; ")
+        write_str("nothing is written ldo=")
+        write_str(dbias.source.name())
+        write_str(" dig=0x")
+        write_hex(dig)
+        write_str(" rtc=0x")
+        write_hex(rtc)
+        write_byte(10)
+        return
+    }
+    let start = try pll_bring_up(name, period, found) catch { return }
+
+    let rtc_before = dreg(EXT_RTC_DREG)
+    let dig_before = dreg(EXT_DIG_DREG)
+    analog_write_mask(I2C_DIG_REG, I2C_DIG_REG_HOSTID, EXT_RTC_DREG, DREG_MSB,
+                      DREG_LSB, rtc as UInt)
+    analog_write_mask(I2C_DIG_REG, I2C_DIG_REG_HOSTID, EXT_DIG_DREG, DREG_MSB,
+                      DREG_LSB, dig as UInt)
+    systimer_wait(LDO_SETTLE_TICKS)
+    let rtc_after = dreg(EXT_RTC_DREG)
+    let dig_after = dreg(EXT_DIG_DREG)
+
+    pll_switch(name, start, period)
+    write_str(" ldo=")
+    write_str(dbias.source.name())
+    write_str(" dig=0x")
+    write_hex(dig)
+    write_str(" rtc=0x")
+    write_hex(rtc)
+    write_str(" ext_dig_dreg=0x")
+    write_hex(dig_before as UInt32)
+    write_str("->0x")
+    write_hex(dig_after as UInt32)
+    write_str(" ext_rtc_dreg=0x")
+    write_hex(rtc_before as UInt32)
+    write_str("->0x")
+    write_hex(rtc_after as UInt32)
+    write_byte(10)
 }

@@ -44,14 +44,18 @@
 //! clears.
 //!
 //! When the BBPLL does not report its calibration done, the CPU is left on
-//! the crystal as the ROM left it, a line says so, and the boot goes on.
+//! the crystal as the ROM left it, a line says so, and the boot goes on. A
+//! CPU found at 240 MHz is left there, before anything is written, with a
+//! line that says so: ESP-IDF lowers both LDOs once the clock has come down
+//! from 240, and this key sets no LDO (`write_not_lowered`).
 //!
 //! The bring-up and the switch are `s3clockkit`'s (`../clock-common/`),
-//! which `pll160` shares. It reaches every register through the kit's views
-//! rather than the HAL's drivers: the HAL names nothing here, so an image
-//! built at the `rom` key is the bytes it would be without the keys.
+//! which `pll160` and `pll240` share. It reaches every register through the
+//! kit's views rather than the HAL's drivers: the HAL names nothing here, so
+//! an image built at the `rom` key is the bytes it would be without the keys.
 
-import s3clockkit.{pll_bring_up, pll_switch, write_byte}
+import s3clockkit.{ClockWords, clock_words, pll_bring_up, pll_switch,
+                   write_byte}
 
 /// CPUPERIOD_SEL for 80 MHz: the PLL at 480 MHz divided by 6.
 static CPUPERIOD_80M: UInt32 = 0
@@ -60,7 +64,14 @@ static CPUPERIOD_80M: UInt32 = 0
 /// RC_FAST, or a select no source names, it prints why and stops in a quiet
 /// loop before any clock word is written (SYSTIMER is already counting).
 public func clock_init() unsafe {
-    let start = try pll_bring_up("pll80") catch { return }
+    clock_init_found(clock_words())
+}
+
+/// `clock_init` on a CPU whose clock words read `found`.
+public func clock_init_found(found: ClockWords) unsafe {
+    let start = try pll_bring_up("pll80", CPUPERIOD_80M, found) catch {
+        return
+    }
     pll_switch("pll80", start, CPUPERIOD_80M)
     write_byte(10)
 }

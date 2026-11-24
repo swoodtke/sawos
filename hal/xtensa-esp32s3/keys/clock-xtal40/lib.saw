@@ -25,7 +25,8 @@
 //!   * the watchdogs clocked from APB are off (`boot.S`'s `_start`).
 //!
 //! Every word written here is volatile: a chip reset (power, or the EN pin
-//! esptool and the board's reset button pull) puts it back.
+//! esptool and the board's reset button pull) puts it back. A CPU found at
+//! 240 MHz is left there with a line that says so, and nothing is written.
 //!
 //! The line it prints is the record a board run needs: the two clock words
 //! before and after, the CPU's speed measured before and after (CCOUNT over a
@@ -41,7 +42,8 @@
 import s3clockkit.{SYSCLK_CONF, SOC_CLK_SEL_SHIFT, SOC_CLK_SEL_MASK,
                    SOC_CLK_SEL_XTAL, SOC_CLK_SEL_PLL, PRE_DIV_CNT_MASK,
                    CPU_PER_CONF, UART0_CLK_CONF, SPI0_CORE_CLK_SEL, SPI0_CLOCK,
-                   RTC_CNTL_DATE, device_word, systimer_start,
+                   RTC_CNTL_DATE, ClockWords, at_240, clock_words,
+                   write_not_lowered, device_word, systimer_start,
                    console_on_crystal, console_drain, cpu_centi_mhz,
                    write_byte, write_str, write_hex, write_centi}
 
@@ -53,10 +55,22 @@ extern "C" {
 /// RC_FAST, or a select no source names, it prints why and stops in a quiet
 /// loop before any clock word is written (SYSTIMER is already counting).
 public func clock_init() unsafe {
+    clock_init_found(clock_words())
+}
+
+/// `clock_init` on a CPU whose clock words read `found`. A CPU found at 240
+/// MHz is left there, before anything is written (`write_not_lowered`):
+/// ESP-IDF's `rtc_clk_cpu_freq_to_xtal` lowers both LDOs once it has left
+/// 240, and this key sets no LDO.
+public func clock_init_found(found: ClockWords) unsafe {
+    if at_240(found) {
+        write_not_lowered("xtal40", found)
+        return
+    }
     let sysclk = device_word(SYSCLK_CONF)
     let cpu_per = device_word(CPU_PER_CONF)
-    let sysclk_before = sysclk.read()
-    let cpu_per_before = cpu_per.read()
+    let sysclk_before = found.sysclk
+    let cpu_per_before = found.cpu_per
     let uart_clk = device_word(UART0_CLK_CONF).read()
     systimer_start()
     let centi_before = cpu_centi_mhz()

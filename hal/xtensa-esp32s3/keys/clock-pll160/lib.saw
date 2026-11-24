@@ -8,20 +8,21 @@
 //! loader (`../../kernel/lib.saw`). `../../ABI.md` §14 has the sequence
 //! ESP-IDF v5.4.1 runs, the source of each step, and which of it this takes.
 //!
-//! In order:
+//! In order (`s3clockkit`'s `pll_ldo_switch`):
 //!
 //!   * the LDO settings: ESP-IDF's `g_rtc_dbias_pvt_non_240m` and
 //!     `g_dig_dbias_pvt_non_240m`, computed from the eFuse's calibration
 //!     (`s3dbias`, `../../dbias/`) and held to the range ESP-IDF's
 //!     arithmetic gives them. Out of it, a line says so, nothing is written,
 //!     and the boot goes on at the clock the ROM left;
-//!   * the BBPLL powered and set to 480 MHz, as `pll80` does (`s3clockkit`'s
-//!     `pll_bring_up`);
+//!   * a CPU found at 240 MHz: a line says so, nothing is written, and the
+//!     boot goes on at 240. ESP-IDF writes these two settings after the
+//!     clock comes down from 240, where this key would write them before;
+//!   * the BBPLL powered and set to 480 MHz, as `pll80` does;
 //!   * the two LDO writes `rtc_init` makes (esp_hw_support/port/esp32s3/
 //!     rtc_init.c), in its order: I2C_DIG_REG (block 0x6D, host 1;
 //!     soc/esp32s3/include/soc/regi2c_dig_reg.h) register 4, EXT_RTC_DREG
-//!     [4:0], then register 6, EXT_DIG_DREG [4:0], each through the mask
-//!     ROM's `rom_i2c_writeReg_Mask`, which ESP-IDF's REGI2C_WRITE_MASK is;
+//!     [4:0], then register 6, EXT_DIG_DREG [4:0];
 //!   * 40 us for the voltage to settle, the wait
 //!     `rtc_clk_cpu_freq_to_pll_mhz` (rtc_clk.c) makes after it moves an
 //!     LDO; in an application `rtc_init` runs long before the switch;
@@ -40,84 +41,28 @@
 //! functions rather than the HAL's drivers: the HAL names nothing here, so an
 //! image built at the `rom` key is the bytes it would be without the keys.
 
-import s3clockkit.{analog_read, analog_write_mask, device_word, pll_bring_up,
-                   pll_switch, systimer_wait, write_byte, write_hex, write_str}
-import s3dbias.{Calibration, Dbias, EfuseWords, EFUSE_BASE, EFUSE_SYS_3,
-                EFUSE_SYS_4, EFUSE_SYS_5, EFUSE_PART1_DATA4, check_dbias,
-                stored_dbias}
+import s3clockkit.{ClockWords, clock_words, efuse_dbias, pll_ldo_switch}
+import s3dbias.{Dbias}
 
 /// CPUPERIOD_SEL for 160 MHz: the PLL at 480 MHz divided by 3.
 static CPUPERIOD_160M: UInt32 = 1
 
-/// I2C_DIG_REG on the analog bus, its host, and the two registers written:
-/// EXT_RTC_DREG and EXT_DIG_DREG, each in bits [4:0] of its register.
-static I2C_DIG_REG: UInt = 0x6D
-static I2C_DIG_REG_HOSTID: UInt = 1
-static EXT_RTC_DREG: UInt = 4
-static EXT_DIG_DREG: UInt = 6
-static DREG_MSB: UInt = 4
-static DREG_LSB: UInt = 0
-static DREG_MASK: UInt = 0x1F
-
-/// `esp_rom_delay_us(40)`, in SYSTIMER's 16 MHz ticks.
-static LDO_SETTLE_TICKS: UInt64 = 40 * 16
-
 /// Set the CPU clock this image is built for: the PLL at 160 MHz, with the
 /// LDOs set from the eFuse first.
 public func clock_init() unsafe {
-    let words = EfuseWords(
-        sys3: device_word(EFUSE_BASE + EFUSE_SYS_3).read(),
-        sys4: device_word(EFUSE_BASE + EFUSE_SYS_4).read(),
-        sys5: device_word(EFUSE_BASE + EFUSE_SYS_5).read(),
-        part1_data4: device_word(EFUSE_BASE + EFUSE_PART1_DATA4).read())
-    clock_init_at(stored_dbias(Calibration(words: words)))
+    clock_init_found(clock_words())
 }
 
-/// One LDO setting as it reads now.
-func dreg(reg: UInt) unsafe -> UInt {
-    analog_read(I2C_DIG_REG, I2C_DIG_REG_HOSTID, reg) & DREG_MASK
+/// `clock_init` on a CPU whose clock words read `found`.
+public func clock_init_found(found: ClockWords) unsafe {
+    clock_init_at(efuse_dbias(), found)
 }
 
-/// `clock_init` with the LDO settings `dbias`. Settings outside the range
-/// ESP-IDF's arithmetic gives them stop it before anything is written.
-public func clock_init_at(dbias: Dbias) unsafe {
-    try check_dbias(dbias) catch {
-        write_str("SOS-S3: clock pll160 not taken: the LDO settings are ")
-        write_str("outside ESP-IDF's range; nothing is written ldo=")
-        write_str(dbias.source.name())
-        write_str(" dig=0x")
-        write_hex(dbias.dig_non_240m)
-        write_str(" rtc=0x")
-        write_hex(dbias.rtc_non_240m)
-        write_byte(10)
-        return
-    }
-    let start = try pll_bring_up("pll160") catch { return }
-
-    let rtc_before = dreg(EXT_RTC_DREG)
-    let dig_before = dreg(EXT_DIG_DREG)
-    analog_write_mask(I2C_DIG_REG, I2C_DIG_REG_HOSTID, EXT_RTC_DREG, DREG_MSB,
-                      DREG_LSB, dbias.rtc_non_240m as UInt)
-    analog_write_mask(I2C_DIG_REG, I2C_DIG_REG_HOSTID, EXT_DIG_DREG, DREG_MSB,
-                      DREG_LSB, dbias.dig_non_240m as UInt)
-    systimer_wait(LDO_SETTLE_TICKS)
-    let rtc_after = dreg(EXT_RTC_DREG)
-    let dig_after = dreg(EXT_DIG_DREG)
-
-    pll_switch("pll160", start, CPUPERIOD_160M)
-    write_str(" ldo=")
-    write_str(dbias.source.name())
-    write_str(" dig=0x")
-    write_hex(dbias.dig_non_240m)
-    write_str(" rtc=0x")
-    write_hex(dbias.rtc_non_240m)
-    write_str(" ext_dig_dreg=0x")
-    write_hex(dig_before as UInt32)
-    write_str("->0x")
-    write_hex(dig_after as UInt32)
-    write_str(" ext_rtc_dreg=0x")
-    write_hex(rtc_before as UInt32)
-    write_str("->0x")
-    write_hex(rtc_after as UInt32)
-    write_byte(10)
+/// `clock_init` with the LDO settings `dbias`, on a CPU whose clock words
+/// read `found`. Settings outside the range ESP-IDF's arithmetic gives them
+/// stop it before anything is written.
+public func clock_init_at(dbias: Dbias, found: ClockWords) unsafe {
+    pll_ldo_switch("pll160", dbias, rtc: dbias.rtc_non_240m,
+                   dig: dbias.dig_non_240m, period: CPUPERIOD_160M,
+                   found: found)
 }

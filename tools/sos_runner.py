@@ -16019,6 +16019,12 @@ PSRAM_PART_CLOCK = {
 # §14e). The smoke's description is this.
 PSRAM_EMULATOR_CLOCK = (0x00080401, 0x0, 0x0)
 
+# The S3 emulator's instruction-counted clock for a run that reads a span off
+# SYSTIMER (`expect_counter_span`): each instruction is 2^5 = 32 ns of
+# virtual time, half a SYSTIMER count. A smaller shift steps finer and makes
+# the boot slower.
+ICOUNT_SHIFT = 5
+
 # `mspi.c`'s `last_step` values.
 PSRAM_THROUGH_S8 = 0x80
 PSRAM_THROUGH_S9 = 0x90
@@ -16687,8 +16693,11 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         the store `after` and the first store `before` that follows it, the
         loads of the counter register `counter` must span at least
         `at_least` of its counts, the last value read less the first,
-        modulo 2^32. A wait on a free-running counter makes such loads, and
-        a stalled host can only lengthen the span. Returns (ok, reason)."""
+        modulo 2^32, and no two loads in a row may be more than
+        `step_at_most` counts apart. A wait on a free-running counter makes
+        such loads. The run is on the emulator's instruction-counted clock
+        (`boot_args`), so neither number moves with the host. Returns (ok,
+        reason)."""
         span = case["expect_counter_span"]
         after = ("w", *span["after"])
         before = ("w", *span["before"])
@@ -16708,6 +16717,15 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             return False, (f"the loads of {span['counter']:#010x} between "
                            f"the two stores span {spanned} counts, under "
                            f"{span['at_least']}")
+        # The span bounds the wait's threshold from above only to within
+        # one pass of its loop: a wait for t counts spans less than t plus
+        # the largest step between two loads. So the steps are held too,
+        # and a wait shorter than `at_least` less `step_at_most` is red.
+        steps = [(b - a) % (1 << 32) for a, b in zip(read, read[1:])]
+        if steps and max(steps) > span["step_at_most"]:
+            return False, (f"the loads of {span['counter']:#010x} between "
+                           f"the two stores step {max(steps)} counts at "
+                           f"most, over {span['step_at_most']}")
         return True, ""
 
     def check_stores(case, stores):
@@ -16742,48 +16760,71 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         "bbpll=kept ana_conf0=0x00000000 mhz=",
         " uart_clk=0x15122500 mspi_core=0x00000000 mspi_clock=0x00000000 "
         "rtc_date=0x00000000\n"]
-    # The `pll160` clock line as the emulator prints it: `pll80`'s, then the
-    # LDO settings and the two LDO registers before and after their writes.
-    # The emulator's eFuse reads 0 unless a case gives it a file, so the
-    # settings are ESP-IDF's defaults (`ldo=default`); its analog bus has no
-    # block, so the ROM's register read answers 0 before and after
+    # The clock line of a key that sets the LDOs (`pll160`, `pll240`) as the
+    # emulator prints it, `sysclk` and `cpu_per` the clock words it found
+    # (the emulator's own, unless a case hands others in): `pll80`'s, then
+    # the LDO settings and the two LDO registers before and after their
+    # writes. The emulator's eFuse reads 0 unless a case gives it a file, so
+    # the settings are ESP-IDF's defaults (`ldo=default`); its analog bus has
+    # no block, so the ROM's register read answers 0 before and after
     # (ABI.md §14e).
-    def clock_pll160_lines(ldo):
+    def clock_ldo_lines(key, ldo, sysclk=0x000A8401, cpu_per=0):
         return [
-            "SOS-S3: clock pll160 sysclk=0x000a8401->0x000a8401 "
-            "cpu_per=0x00000000->0x00000000 options0=0x00000000->0x00000000 "
+            f"SOS-S3: clock {key} sysclk=0x{sysclk:08x}->0x000a8401 "
+            f"cpu_per=0x{cpu_per:08x}->0x00000000 "
+            "options0=0x00000000->0x00000000 "
             "bbpll=kept ana_conf0=0x00000000 mhz=",
             " uart_clk=0x15122500 mspi_core=0x00000000 "
             f"mspi_clock=0x00000000 rtc_date=0x00000000 {ldo} "
             "ext_dig_dreg=0x00000000->0x00000000 "
             "ext_rtc_dreg=0x00000000->0x00000000\n"]
     # The stores the PLL keys make on the emulator's path, held in order by
-    # a device trace (`expect_stores`), since the emulator drops each of
-    # them and reads back nothing they wrote. An LDO write is the ROM's
-    # command word to the analog master (0x6000_E000) as the ROM writes it:
-    # the block, 0x6D, in [7:0], the register in [15:8], the data in
-    # [23:16], and bits 24 (a write) and 26 set. Both follow SYSTIMER's CONF
-    # (CLK_EN and UNIT0_WORK_EN over its reset 0x4600_0000), the bring-up's
-    # first store, so the writes are held to their place after it. Between
-    # the two writes and the switch, the 40 us wait makes at least two
-    # SYSTIMER snapshots, and its loads of UNIT0's low word span at least
-    # 640 of SYSTIMER's 16 MHz counts (`pll160_wait`). The switch stores
-    # CPU_PER_CONF with the key's CPUPERIOD_SEL over the 0 the emulator
-    # reads, then SYSCLK_CONF twice: the PLL's word with the pre-divider at
-    # 0.
+    # a device trace (`expect_stores`) to ESP-IDF v5.4.1's
+    # `rtc_clk_cpu_freq_to_pll_mhz` (esp_hw_support/port/esp32s3/rtc_clk.c),
+    # since the emulator drops each of them and reads back nothing they
+    # wrote. A key that sets the LDOs writes EXT_RTC_DREG, then EXT_DIG_DREG,
+    # then waits 40 us, before CPUPERIOD_SEL: `rtc_init`'s order for
+    # `pll160`'s `non_240m` pair, and that function's going up to 240 MHz
+    # for `pll240`'s `240m` pair. An LDO write is the ROM's command word to
+    # the analog master (0x6000_E000) as the ROM writes it: the block, 0x6D,
+    # in [7:0], the register in [15:8], the data in [23:16], and bits 24 (a
+    # write) and 26 set. Both follow SYSTIMER's CONF (CLK_EN and
+    # UNIT0_WORK_EN over its reset 0x4600_0000), the bring-up's first store,
+    # so the writes are held to their place after it. Between the two writes
+    # and the switch, the 40 us wait makes at least two SYSTIMER snapshots,
+    # and its loads of UNIT0's low word span at least 640 of SYSTIMER's 16
+    # MHz counts, 40 us, stepping at most 32 counts, 2 us, from one load to
+    # the next (`ldo_wait`): on the instruction-counted clock a pass of the
+    # wait's loop steps a few counts, so any wait of 608 counts, 38 us, or
+    # less is red. The switch stores CPU_PER_CONF with the key's
+    # CPUPERIOD_SEL over the 0 the emulator reads, then SYSCLK_CONF twice:
+    # the PLL's word with the pre-divider at 0.
     def ldo_store(reg, value):
         return (0x6000E000, 0x0500006D | (value << 16) | (reg << 8))
     systimer_snapshot = (0x60023004, 1 << 30)
     def pll_switch_stores(period):
         return [(0x600C0010, period), (0x600C0060, 0x000A8400),
                 (0x600C0060, 0x000A8400)]
-    def pll160_stores(rtc, dig):
+    def ldo_stores(rtc, dig, period):
         return [(0x60023000, 0xC6000000), ldo_store(4, rtc),
                 ldo_store(6, dig), systimer_snapshot, systimer_snapshot,
-                *pll_switch_stores(1)]
-    def pll160_wait(dig):
-        return {"after": ldo_store(6, dig), "before": (0x600C0010, 1),
-                "counter": 0x60023044, "at_least": 40 * 16}
+                *pll_switch_stores(period)]
+    def ldo_wait(dig, period):
+        return {"after": ldo_store(6, dig), "before": (0x600C0010, period),
+                "counter": 0x60023044, "at_least": 40 * 16,
+                "step_at_most": 2 * 16}
+    # The clock words a part reads with the CPU at 240 MHz: SYSCLK_CONF on
+    # the PLL, CPU_PER_CONF with PLL_FREQ_SEL 1 and CPUPERIOD_SEL 2
+    # (`clock_found_240.saw` hands them to a key). A key below 240 prints
+    # this and writes nothing: no clock word, no analog-bus word and not
+    # SYSTIMER's CONF.
+    def not_lowered(key):
+        return (f"SOS-S3: clock {key} not taken: the CPU was found at 240 "
+                "MHz, which this key does not lower; nothing is written "
+                "sysclk=0x000a8400 cpu_per=0x0000000e")
+    nothing_clocked = [0x6000E000, 0x6000E044, 0x6000E048, 0x600C0010,
+                       0x600C0060, 0x60023000, 0x60008000]
+    found_240_goes_on = "SOS clockfound: the boot goes on systimer_conf="
     # A calibrated eFuse for the emulator, by read register: block version
     # 1.2 (BLK_VERSION_MINOR at EFUSE_RD_MAC_SPI_SYS_3 [26:24],
     # BLK_VERSION_MAJOR at EFUSE_RD_SYS_PART1_DATA4 [1:0]); K_RTC_LDO 0x4C,
@@ -16849,10 +16890,11 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "name": "boot_pll160",
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "clock": "pll160",
-            "expect_stores": pll160_stores(27, 27),
-            "expect_counter_span": pll160_wait(27),
+            "expect_stores": ldo_stores(27, 27, 1),
+            "expect_counter_span": ldo_wait(27, 1),
             "expect_out": [rom,
-                           *clock_pll160_lines(
+                           *clock_ldo_lines(
+                               "pll160",
                                "ldo=default dig=0x0000001b rtc=0x0000001b"),
                            banner,
                            "SOS: bad root image: no root image appended",
@@ -16867,10 +16909,11 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "src": os.path.join(KERNEL_DIR, "main.saw"),
             "clock": "pll160",
             "efuse": s3_calibrated_efuse,
-            "expect_stores": pll160_stores(30, 26),
-            "expect_counter_span": pll160_wait(26),
+            "expect_stores": ldo_stores(30, 26, 1),
+            "expect_counter_span": ldo_wait(26, 1),
             "expect_out": [rom,
-                           *clock_pll160_lines(
+                           *clock_ldo_lines(
+                               "pll160",
                                "ldo=efuse dig=0x0000001a rtc=0x0000001e"),
                            banner,
                            "SOS: bad root image: no root image appended",
@@ -16898,6 +16941,127 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "SOS pll160: the boot goes on "
                            "systimer_conf=0x46000000",
                            halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # The same boot at the `pll240` clock key, on the emulator's path
+            # as `boot_pll80`, with the eFuse uncalibrated: both LDOs raised
+            # to ESP-IDF's defaults for 240 MHz, RTC first, then the wait,
+            # then the three stores with CPUPERIOD_SEL 2 (the device trace
+            # holds each). The emulator finds the CPU at 80 MHz, so this is
+            # ESP-IDF's path going up.
+            "name": "boot_pll240",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "clock": "pll240",
+            "expect_stores": ldo_stores(28, 28, 2),
+            "expect_counter_span": ldo_wait(28, 2),
+            "expect_out": [rom,
+                           *clock_ldo_lines(
+                               "pll240",
+                               "ldo=default dig=0x0000001c rtc=0x0000001c"),
+                           banner,
+                           "SOS: bad root image: no root image appended",
+                           "SOS-S3: halt fail code=0x00000004"],
+            "expect_clean_exit": False,
+            "expect_status": 4,
+        },
+        {
+            # And on the calibrated eFuse: the `240m` settings computed from
+            # it, which differ in both fields from the `non_240m` pair
+            # `boot_pll160_calibrated` writes.
+            "name": "boot_pll240_calibrated",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "clock": "pll240",
+            "efuse": s3_calibrated_efuse,
+            "expect_stores": ldo_stores(31, 27, 2),
+            "expect_counter_span": ldo_wait(27, 2),
+            "expect_out": [rom,
+                           *clock_ldo_lines(
+                               "pll240",
+                               "ldo=efuse dig=0x0000001b rtc=0x0000001f"),
+                           banner,
+                           "SOS: bad root image: no root image appended",
+                           "SOS-S3: halt fail code=0x00000004"],
+            "expect_clean_exit": False,
+            "expect_status": 4,
+        },
+        {
+            # The `pll240` key handed a digital setting for 240 MHz outside
+            # the range ESP-IDF's arithmetic gives it, as `pll160_refused`.
+            "name": "pll240_refused",
+            "src": os.path.join(s3_tests, "pll240_refused.saw"),
+            "clock": "pll240",
+            "device_untouched": [0x6000E000, 0x6000E044, 0x6000E048,
+                                 0x600C0010, 0x600C0060, 0x60023000],
+            "expect_out": [rom,
+                           "SOS-S3: clock pll240 not taken: the LDO settings "
+                           "are outside ESP-IDF's range; nothing is written "
+                           "ldo=efuse dig=0x00000020 rtc=0x0000001c",
+                           "SOS pll240: the boot goes on "
+                           "systimer_conf=0x46000000",
+                           halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # Each key below 240 MHz handed a CPU found at 240
+            # (`clock_found_240.saw`): it lowers nothing, writes nothing
+            # (not even SYSTIMER's CONF, which still reads its reset value;
+            # nor RTC_CNTL_OPTIONS0), says so, and the boot goes on.
+            "name": "xtal40_found_at_240",
+            "src": os.path.join(s3_tests, "clock_found_240.saw"),
+            "clock": "xtal40",
+            "device_untouched": nothing_clocked,
+            "expect_out": [rom, not_lowered("xtal40"),
+                           f"{found_240_goes_on}0x46000000", halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            "name": "pll80_found_at_240",
+            "src": os.path.join(s3_tests, "clock_found_240.saw"),
+            "clock": "pll80",
+            "device_untouched": nothing_clocked,
+            "expect_out": [rom, not_lowered("pll80"),
+                           f"{found_240_goes_on}0x46000000", halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            "name": "pll160_found_at_240",
+            "src": os.path.join(s3_tests, "clock_found_240.saw"),
+            "clock": "pll160",
+            "device_untouched": nothing_clocked,
+            "expect_out": [rom, not_lowered("pll160"),
+                           f"{found_240_goes_on}0x46000000", halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # And `pll240` handed the same words: it is not lowering, so it
+            # takes its switch, the two LDO writes and the wait first, as
+            # `boot_pll240` does.
+            "name": "pll240_found_at_240",
+            "src": os.path.join(s3_tests, "clock_found_240.saw"),
+            "clock": "pll240",
+            "expect_stores": ldo_stores(28, 28, 2),
+            "expect_counter_span": ldo_wait(28, 2),
+            "expect_out": [rom,
+                           *clock_ldo_lines(
+                               "pll240",
+                               "ldo=default dig=0x0000001c rtc=0x0000001c",
+                               sysclk=0x000A8400, cpu_per=0x0000000E),
+                           f"{found_240_goes_on}0xc6000000", halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # The `xtal40` key handed a CPU on the crystal with CPUPERIOD_SEL
+            # 2 (`clock_found_crystal.saw`): not at 240 MHz, so it takes its
+            # switch and prints its line, with the words handed in as the
+            # ones found.
+            "name": "xtal40_found_crystal",
+            "src": os.path.join(s3_tests, "clock_found_crystal.saw"),
+            "clock": "xtal40",
+            "expect_out": [rom,
+                           "SOS-S3: clock xtal40 sysclk=0x000a8001->0x000a8401 "
+                           "cpu_per=0x0000000e->0x00000000 mhz=",
+                           "SOS clockfound: the boot goes on", halt_pass],
             "expect_clean_exit": True,
         },
         {
@@ -18577,8 +18741,16 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         # And at the `pll160` clock key, on the emulator's path
         # (`boot_pll160`).
         dict(by_name["kill_churn"], name="kill_churn_pll160", clock="pll160",
-             expect_out=[*clock_pll160_lines(
+             expect_out=[*clock_ldo_lines(
+                             "pll160",
                              "ldo=default dig=0x0000001b rtc=0x0000001b"),
+                         *by_name["kill_churn"]["expect_out"]]),
+        # And at the `pll240` clock key, on the emulator's path
+        # (`boot_pll240`).
+        dict(by_name["kill_churn"], name="kill_churn_pll240", clock="pll240",
+             expect_out=[*clock_ldo_lines(
+                             "pll240",
+                             "ldo=default dig=0x0000001c rtc=0x0000001c"),
                          *by_name["kill_churn"]["expect_out"]]),
         {
             # `kill_churn` timed: root stamps the clock around each phase of
@@ -19184,7 +19356,14 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         if stores:
             args += ["-trace", "memory_region_ops_write"]
         if loads:
-            args += ["-trace", "memory_region_ops_read"]
+            # A span is read on the instruction-counted clock: each
+            # instruction advances the emulator's virtual clock, which
+            # SYSTIMER's model counts, by 2^ICOUNT_SHIFT ns, and nothing
+            # syncs it to the host's. One pass of a wait's loop then spans
+            # a few of SYSTIMER's counts, the same on every run, where on
+            # the host's clock one load alone can take hundreds.
+            args += ["-icount", f"shift={ICOUNT_SHIFT},align=off,sleep=off",
+                     "-trace", "memory_region_ops_read"]
         args += ["-D", trace]
         return args, trace
 
@@ -20108,9 +20287,10 @@ def _product_rows_esp32s3(scratch, builder_before):
             "`speed` in [keys] is no build key of the board esp32s3; its "
             "keys are `clock`, `stall`")),
         ("product_key_value_unknown", key_refused(
-            "x-pll240", 'clock = "pll240"',
-            '`clock` in [keys] is "pll240", which is not one of the board '
-            'esp32s3\'s values for it, "rom", "xtal40", "pll80", "pll160"')),
+            "x-pll320", 'clock = "pll320"',
+            '`clock` in [keys] is "pll320", which is not one of the board '
+            'esp32s3\'s values for it, "rom", "xtal40", "pll80", "pll160", '
+            '"pll240"')),
         ("product_builder_unchanged", builder_unchanged),
     ]
 
@@ -20238,7 +20418,8 @@ def main():
     parser.add_argument("--clock", metavar="KEY",
                         help="with --emit-flash: the CPU clock key the image "
                              "is built with, in place of the case's own "
-                             "(`rom`, the default, `xtal40`, `pll80` or `pll160`; "
+                             "(`rom`, the default, `xtal40`, `pll80`, "
+                             "`pll160` or `pll240`; "
                              "hal/xtensa-esp32s3/ABI.md §14)")
     args = parser.parse_args()
 
