@@ -17500,6 +17500,26 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "device_untouched": s1_untouched,
             "expect_clean_exit": True,
         },
+        {
+            # The identity at a clock key that writes: the harness runs the
+            # key before the bring-up, as the kernel's `kmain` does, so a
+            # board image built at a key runs at it. The emulator's clock
+            # words are the same under every key (`PSRAM_EMULATOR_CLOCK`).
+            "name": "psram_identity_pll80",
+            "src": os.path.join(s3_tests, "psram_identity.saw"),
+            "clock": "pll80",
+            "psram": {},
+            "flash_commands": flash_once,
+            "expect_out": [
+                rom, *clock_pll80_lines,
+                "SOS psram: efuse PSRAM_CAP=0x00000001 "
+                "PSRAM_VENDOR=0x00000001",
+                "SOS psram: MR0=0x00000009 MR1=0x0000000d MR2=0x00000093 "
+                "MR3=0x00000020 MR4=0x00000020 MR8=0x00000005",
+                spi1_as_before,
+                halt_pass],
+            "expect_clean_exit": True,
+        },
         # S1 on the part's own words (ABI.md §15c), one read lied to each
         # time: pads 27 and 28 from the GPIO function, pull-up, input and
         # drive 2 (`0x1b00`; pad 28's with the pull-down on too, `0x1b80`) to
@@ -17540,6 +17560,22 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                 " ticks, of 10 bytes ",
                 "SOS psram: core clock ",
                 " by 4 clocks x 4 per read",
+                spi1_as_before,
+                halt_pass],
+            "expect_clean_exit": True,
+        },
+        {
+            # The mode write at a clock key that writes, the key run first
+            # as in `psram_identity_pll80`.
+            "name": "psram_mode_pll80",
+            "src": os.path.join(s3_tests, "psram_mode.saw"),
+            "clock": "pll80",
+            "psram": {},
+            "flash_commands": flash_once,
+            "expect_out": [
+                rom, *clock_pll80_lines,
+                "SOS psram: MR0=0x00000009 before, 0x28 written, "
+                "MR0=0x00000028 after",
                 spi1_as_before,
                 halt_pass],
             "expect_clean_exit": True,
