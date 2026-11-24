@@ -13,6 +13,8 @@
 //   SOS growfaults: grow a device row: status=131081
 //   SOS growfaults: grow an unmapped mapping: status=131077      BadState
 //   SOS growfaults: map with room off the grain: status=131081
+//   SOS growfaults: len through a mapping without Base: status=131075
+//   SOS growfaults: len of an unmapped mapping: status=131077
 //   SOS growfaults: done
 //
 // An allocation from the back never carries `Extend`, and a Mapping minted
@@ -20,7 +22,9 @@
 // answers. A length of zero, or off the grain, is `BadArg` for both ops, as
 // is a room off the grain at `map`. A device window's row grants no
 // allocation and has no next bytes to grow over (`BadArg`), and a Mapping
-// its holder unmapped is `BadState`, as its second `unmap` is. A length off
+// its holder unmapped is `BadState`, as its second `unmap` is. `len` answers
+// `base`'s refusals: a Mapping minted without `Base` is `AccessDenied` and an
+// unmapped one `BadState`. A length off
 // the grain is the fault even where the pool could not serve the extension or
 // the growth would pass the allocation's end: the caller's own argument is
 // judged before the status either would answer. Every role sets up from a
@@ -58,6 +62,8 @@ static ROLE_GROW_HUSK: UInt = 9
 static ROLE_ROOM_OFF_GRAIN: UInt = 10
 static ROLE_EXTEND_BLOCKED_OFF_GRAIN: UInt = 11
 static ROLE_GROW_WHOLE_OFF_GRAIN: UInt = 12
+static ROLE_LEN_UNGRANTED: UInt = 13
+static ROLE_LEN_HUSK: UInt = 14
 
 static CHILD_SYSTEM: UInt32 = (SystemRight.Transfer | SystemRight.ProcessSelf
                                | SystemRight.Debug)
@@ -114,6 +120,10 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
             "grow an unmapped mapping", ROLE_GROW_HUSK)
     try leg(&system, &proc, &image, &dest, &pool, &device,
             "map with room off the grain", ROLE_ROOM_OFF_GRAIN)
+    try leg(&system, &proc, &image, &dest, &pool, &device,
+            "len through a mapping without Base", ROLE_LEN_UNGRANTED)
+    try leg(&system, &proc, &image, &dest, &pool, &device,
+            "len of an unmapped mapping", ROLE_LEN_HUSK)
     return
 }
 

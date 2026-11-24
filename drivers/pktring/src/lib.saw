@@ -50,6 +50,7 @@
 //! be buggy or hostile. So the receiving side reads each field it acts on
 //! once, into private memory, checks it there and uses only the copy:
 //!
+//!   0. the memory is checked to hold the layout before any field is read;
 //!   1. an index word is read once and checked against the slot count;
 //!   2. a slot's length word is read once and checked against the slot size;
 //!   3. a slot's bytes are copied out with the checked length and never read
@@ -65,8 +66,30 @@
 //! the connection and counts the error (`FaultCounts`). Its state is private
 //! to this package, so no caller can move an index or clear a fault.
 //!
-//! A server cannot ask the kernel how long a Memory it was given is, so it
-//! maps the ring trusting the client to have allocated `Layout.bytes()`.
+//! # Attaching a ring
+//!
+//! The client allocates the ring's Memory and gives it at `Attach`. A server
+//! that receives one:
+//!
+//!   1. checks the handle's rights hold `MemoryRight.Map` (`rights()`): a
+//!      Memory given without it would make `map` end the server;
+//!   2. maps it read-write into itself;
+//!   3. makes the window from the Mapping's `base()` and `len()`
+//!      (`SharedWindow.init(at:len:layout:)`), which answers
+//!      `RingError.ShortMemory` for a row shorter than `Layout.bytes()`;
+//!   4. on `ShortMemory`, unmaps, releases the Memory, counts the error
+//!      (`FaultCounts`) and ends the connection, before any byte of the row
+//!      is read.
+//!
+//! The length is the row's, which the kernel records, and not a number the
+//! client claims. A server that releases its Memory handle after the map loses
+//! nothing: the row holds the bytes.
+//!
+//! The check does not cover every Memory a client can give. `map` itself ends
+//! its caller for an allocation of zero length, one off the protection grain,
+//! and one the board cannot give a process (the ESP32-S3's flash rows); a
+//! server cannot see these before it maps, and the kernel does not yet answer
+//! them with a status.
 //!
 //! # Doorbells
 //!
@@ -348,6 +371,22 @@ extension SharedWindow {
         SharedWindow(base: at as UInt, bytes: bytes)
     }
 
+    /// The window over a ring laid out as `layout` in a row the kernel says
+    /// is `len` bytes from `at`: a mapping's `base()` and `len()`. A row
+    /// shorter than `layout.bytes()` is the peer's value, refused before
+    /// anything reads it. The window is the layout's length, not the row's,
+    /// so nothing past the ring is reachable through it.
+    ///
+    /// Still `unsafe`: the caller vouches that `at` and `len` are those of a
+    /// word-aligned, readable and writable row.
+    public init(at: UnsafePointer<UInt32>, len: UInt,
+                layout: &Layout) unsafe -> Result<SharedWindow, RingError> {
+        if len < layout.bytes() {
+            return RingError.ShortMemory(len)
+        }
+        return SharedWindow(base: at as UInt, bytes: layout.bytes())
+    }
+
     /// Whether the word at `offset` is in the window: the offset is a
     /// multiple of `WORD_BYTES` and the whole word lies inside.
     public func holds(&self, offset: UInt) -> Bool {
@@ -400,6 +439,8 @@ public enum RingError {
     case IndexOutOfOrder(index: UInt32),
     /// A slot's length word is past the slot size.
     case LengthPastSlot(length: UInt32),
+    /// The memory given for the ring is shorter than the ring's layout.
+    case ShortMemory(len: UInt),
 }
 
 @synthesize
@@ -426,6 +467,7 @@ extension RingError {
             case IndexPastCount(_) -> "an index past the slot count",
             case IndexOutOfOrder(_) -> "an index out of order",
             case LengthPastSlot(_) -> "a length past the slot",
+            case ShortMemory(_) -> "a memory shorter than the ring",
         }
     }
 }
@@ -451,6 +493,10 @@ extension RingError: Printable {
                 try! into.append(": ")
                 try! into.append(value: length as UInt)
             },
+            case ShortMemory(len) -> {
+                try! into.append(": ")
+                try! into.append(value: len)
+            },
             case _ -> {},
         }
     }
@@ -463,12 +509,14 @@ public struct FaultCounts {
     public index_past_count: UInt32,
     public index_out_of_order: UInt32,
     public length_past_slot: UInt32,
+    public short_memory: UInt32,
 }
 
 extension FaultCounts {
     /// No faults.
     public static func zero() -> FaultCounts {
-        FaultCounts(index_past_count: 0, index_out_of_order: 0, length_past_slot: 0)
+        FaultCounts(index_past_count: 0, index_out_of_order: 0,
+                    length_past_slot: 0, short_memory: 0)
     }
 
     /// Counts `error` when it is fatal; this side's own conditions count
@@ -478,13 +526,15 @@ extension FaultCounts {
             case IndexPastCount(_) -> self.index_past_count = self.index_past_count + 1,
             case IndexOutOfOrder(_) -> self.index_out_of_order = self.index_out_of_order + 1,
             case LengthPastSlot(_) -> self.length_past_slot = self.length_past_slot + 1,
+            case ShortMemory(_) -> self.short_memory = self.short_memory + 1,
             case _ -> {},
         }
     }
 
     /// Every fault counted.
     public func total(&self) -> UInt32 {
-        self.index_past_count + self.index_out_of_order + self.length_past_slot
+        self.index_past_count + self.index_out_of_order + self.length_past_slot +
+            self.short_memory
     }
 }
 

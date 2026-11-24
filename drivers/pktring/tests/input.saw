@@ -1,7 +1,8 @@
 // A shared ring is input. One end over a memory that counts its reads and can
 // change a word just after it is read, with the test writing the peer's
 // words: an index past the count, an index out of order, a length past the
-// slot, each fatal, latched and counted; every shared field read once, so a
+// slot, each fatal, latched and counted; a memory shorter than the ring
+// refused before anything reads it; every shared field read once, so a
 // field changed between two reads is seen at its first value; and, through a
 // real window, a field changed between the accessor's read and the use.
 
@@ -539,6 +540,43 @@ func window_bounds() unsafe {
     check(odd.holds(8) && not odd.holds(12), "a word cut by the end")
 }
 
+/// Two 2048-byte slots each way: 8256 bytes.
+func big_layout() -> Layout {
+    try! Layout(slot_bytes: 2048, to_server: 2, to_client: 2)
+}
+
+/// The window over a row of `len` bytes, or the error that refused it. The
+/// row's words are never read, so a small array stands for it.
+func window_over(len: UInt) unsafe -> Result<SharedWindow, RingError> {
+    var mem: [UInt32; FAKE_WORDS] = [0; FAKE_WORDS]
+    var l = big_layout()
+    SharedWindow(at: (&var mem) as UnsafePointer<UInt32>, len: len, layout: &l)
+}
+
+func short_memory() unsafe {
+    let need = big_layout().bytes()
+    check(need == 8256, "the layout is 8256 bytes")
+    check(is_err(window_over(need - 4), RingError.ShortMemory(need - 4)),
+          "a row one word short is refused with its length")
+    check(is_err(window_over(0), RingError.ShortMemory(0)),
+          "a row of zero is refused")
+    let exact = try! window_over(need)
+    check(exact.holds(need - 4) && not exact.holds(need),
+          "a row of exactly the layout's length: the window holds its last word")
+    let long = try! window_over(12288)
+    check(long.holds(need - 4) && not long.holds(need),
+          "a longer row: the window is still the layout's length")
+
+    var counts = FaultCounts.zero()
+    counts.record(&RingError.ShortMemory(4096))
+    check(counts.short_memory == 1 && counts.total() == 1,
+          "a short memory is counted")
+    check(RingError.ShortMemory(4096).is_fatal(), "a short memory is fatal")
+    check("{RingError.ShortMemory(4096)}".equals(
+              "a memory shorter than the ring: 4096"),
+          "a short memory prints its length")
+}
+
 func fresh_ends() unsafe {
     // Memory a client allocates holds whatever it held: the client stores
     // every index word, the server only its own two.
@@ -557,6 +595,7 @@ func main() {
     published_and_released()
     errors_read_once()
     window_bounds()
+    short_memory()
     index_past_count()
     index_out_of_order()
     length_past_slot()

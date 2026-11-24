@@ -387,11 +387,14 @@ MEMORY_EXTEND_MET_PKG = os.path.join(TESTS_DIR, "memory-extend-met")
 MEMORY_EXTEND_TWO_PKG = os.path.join(TESTS_DIR, "memory-extend-two")
 MAPPING_GROW_PAST_PKG = os.path.join(TESTS_DIR, "mapping-grow-past")
 MAPPING_GROW_GONE_PKG = os.path.join(TESTS_DIR, "mapping-grow-gone")
+MAPPING_LEN_PKG = os.path.join(TESTS_DIR, "mapping-len")
 MAPPING_GROW_ROOM_PKG = os.path.join(TESTS_DIR, "mapping-grow-room")
 MAP_ROOM_WINDOW_PKG = os.path.join(TESTS_DIR, "map-room-window")
 MAP_ROOM_IDENTITY_PKG = os.path.join(TESTS_DIR, "map-room-identity")
 GROW_FAULTS_PKG = os.path.join(TESTS_DIR, "grow-faults")
 CHILD_GROW_LEG_PKG = os.path.join(TESTS_DIR, "child-grow-leg")
+RING_SHORT_PKG = os.path.join(TESTS_DIR, "ring-short")
+CHILD_RING_SERVER_PKG = os.path.join(TESTS_DIR, "child-ring-server")
 EXTEND_ISOLATION_PKG = os.path.join(TESTS_DIR, "extend-isolation")
 # The heaps over pools (`sos.Heap`): a launcher per case, each calling
 # `heapkit` with its case, and the children `heapkit` drives by role.
@@ -5761,6 +5764,21 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # A Mapping answers how long its row is (spec §2.5): the row's own
+        # span, which `extend` does not raise and `grow` does.
+        "name": "mapping_len",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MAPPING_LEN_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS maplen: len: 8192",
+                       "SOS maplen: extended by a page, len: 8192",
+                       "SOS maplen: grown by a page, len: 12288",
+                       "SOS maplen: done"],
+        "expect_clean_exit": True,
+    },
+    {
         # A row grows over its allocation's bytes and no others (spec §2.5).
         # A mapped page's row grown before its allocation holds more is
         # `NoMemory`; extended by a page, a growth of two is still
@@ -5800,6 +5818,8 @@ TEST_CASES = [
                        "SOS growgone: mapped a page into the child and "
                        "extended it",
                        "SOS growgone: the child ended: status=65543",
+                       "SOS growgone: len: what this call was waiting for "
+                       "is gone",
                        "SOS growgone: grow: what this call was waiting for "
                        "is gone",
                        "SOS growgone: grow off the grain",
@@ -5908,7 +5928,35 @@ TEST_CASES = [
                        "status=131077",
                        "SOS growfaults: map with room off the grain: "
                        "status=131081",
+                       "SOS growfaults: len through a mapping without Base: "
+                       "status=131075",
+                       "SOS growfaults: len of an unmapped mapping: "
+                       "status=131077",
                        "SOS growfaults: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A server checks a received Memory's length before it touches a byte
+        # (spec §2.5, `pktring`). Root gives `child-ring-server` a Memory of
+        # one page, shorter than the ring's layout, and one of three. The
+        # child maps each and asks its Mapping the row's length: the short
+        # one is refused and counted, the long one accepted, and a mark the
+        # child stores in its last word reads back through root's own
+        # mapping.
+        "name": "ring_short",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": RING_SHORT_PKG,
+        "children": [CHILD_RING_SERVER_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS ringshort: short ring: refused: a memory "
+                       "shorter than the ring: 4096, counted 1",
+                       "SOS ringshort: ring accepted: the last word holds "
+                       "its mark",
+                       "SOS ringshort: the child ended: status=65536",
+                       "SOS ringshort: root reads the mark: 305419896",
+                       "SOS ringshort: done"],
         "expect_clean_exit": True,
     },
     {
@@ -13251,7 +13299,10 @@ TEST_CASES = [
                   "unreachable", "ident", "tally"])]
             for field in fields] + [
             "no parameter is labeled `slot_size` in Layout.init",
-            "no parameter is labeled `base` in SharedWindow.init",
+            "no candidate takes these arguments; the candidates are "
+            "SharedWindow.init(at: UnsafePointer<UInt32>, bytes: UInt) "
+            "[pktring]; SharedWindow.init(at: UnsafePointer<UInt32>, "
+            "len: UInt, layout: &pktring.Layout) [pktring]",
             "`Endpoint` has no `init` this module can call, and its fields "
             "are not all visible here",
             "no parameter is labeled `count` in Frame.init",
@@ -18248,10 +18299,12 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #   memory_extend_met  an extension refused at the back's allocation
     #                      and past the frontier
     #   memory_extend_two  an extension refused at the next front cut
+    #   mapping_len        a row's length, apart from its allocation's
     #   mapping_grow_past  a growth refused past its allocation
     #   mapping_grow_gone  a growth refused once its target died
     #   map_room_identity  a room recorded as zero
     #   grow_faults        each fault growing in place raises
+    #   ring_short         a ring's Memory checked against its layout
     #   heap_grow ... heap_main_err   the heaps over pools: growth, named
     #                      heaps, the arena behind the default heap, a dirty
     #                      or held pool, shares, every refusal and adoption
@@ -18284,8 +18337,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "pool_meet", "pool_cut_rights", "pool_odd_len",
                      "pool_from_bad", "memory_extend",
                      "memory_extend_met", "memory_extend_two",
-                     "mapping_grow_past", "mapping_grow_gone",
-                     "map_room_identity", "grow_faults", "heap_grow",
+                     "mapping_len", "mapping_grow_past", "mapping_grow_gone",
+                     "map_room_identity", "grow_faults", "ring_short",
+                     "heap_grow",
                      "heap_named", "heap_fallback", "heap_dirty_pool",
                      "heap_held_pool", "heap_share", "heap_share_reuse",
                      "heap_share_only", "heap_share_grain", "heap_refusals",

@@ -2,8 +2,8 @@
 //!
 //! A Mapping is an installed grant row. It records which process's domain
 //! carries the row and which row it is; `base()` reads the address that row was
-//! placed at. On a tier that does not translate, that address is the region's
-//! own.
+//! placed at and `len()` how long it is. On a tier that does not translate,
+//! that address is the region's own.
 //!
 //! Only a Mapping unmaps (§2.5), which is the object's reason to exist. That is
 //! why `Process.map` answers with one instead of a status: without a handle
@@ -103,6 +103,23 @@ extension Mapping {
     /// refusals as `unmap`.
     public func base(&self) -> Result<UInt, SosStatus> {
         call_value(self.handle, MappingOp.Base as UInt, 0, 0, 0)
+    }
+
+    /// How many bytes this mapping grants, from `base()`. Requires
+    /// `MappingRight.Base`, as `base()` does: where a row begins and where it
+    /// ends are one authority.
+    ///
+    /// It answers the row, which is what an access is held to: `grow` raises
+    /// it, and a `Memory.extend` that no `grow` has followed does not. A row
+    /// covers its whole allocation when it is made, so a process given memory
+    /// learns its length here once it has mapped it, and can check it before
+    /// it touches a byte.
+    ///
+    /// The refusals are `base()`'s: an unmapped Mapping ends the caller with
+    /// `BadState`, and one whose target has died answers
+    /// `Err(SosStatus.Revoked)`.
+    public func len(&self) -> Result<UInt, SosStatus> {
+        call_value(self.handle, MappingOp.Len as UInt, 0, 0, 0)
     }
 
     /// Raise this row's top by `len` bytes, over its allocation's next bytes.

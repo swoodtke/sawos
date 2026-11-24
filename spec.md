@@ -38,7 +38,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | `Pool` | RAM not yet allocated: what a `MemoryObject` is allocated from. Two ops (`Allocate`, and `Available`, which reads how much it can allocate); rights `PoolRight.Allocate` and the bits it hands down to what it allocates, `.Map`/`.MapExecute`/`.Extend`. It has two ends: an allocation is cut from its front or its back. Minted at boot from the region table. A pool is never mapped and holds no row. Splitting a pool into a smaller one and a revoke are reserved, not built. §2.5. |
 | `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. Two ops (`Map`, and `Extend`, which grows it in place); rights `MemoryRight.Map`/`.MapExecute`/`.Extend`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5. |
 | `IoMemoryObject` | Physical memory-mapped device registers; the kind is `IoMemory`. A distinct kind rather than a flag on `MemoryObject`, so a driver cannot obtain a cacheable view of a register block by construction. Ops `Carve`/`Map`; rights `IoMemoryRight.Carve`/`.Map`. §2.5. |
-| `Mapping` | One installed protection row, with its own handle. Ops `Unmap`/`Base`/`Grow`; rights `MappingRight.Unmap`/`.Base`/`.Grow`. Not givable. §2.5. |
+| `Mapping` | One installed protection row, with its own handle. Ops `Unmap`/`Base`/`Len`/`Grow`; rights `MappingRight.Unmap`/`.Base`/`.Grow`. Not givable. §2.5. |
 | `Pipe` | Synchronous message IPC with request/reply built in. Four kinds: `PipeInlet` and `PipeOutlet` (the client and server ends of a connection) and `PipeReply` and `PipeRequest` (the client's claim on one reply and the server's obligation to send it). §2.1. |
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable. Ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). The word is consumed by whoever takes it, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read and clear, so a value is reported exactly once. §2.2, §2.4. |
 | `Clock` | A granted time source — time is a capability, not an ambient facility. §2.6. |
@@ -1017,11 +1017,17 @@ and there is no other op on the kind, so "a Device MemoryObject can only
 produce Device mappings" holds by construction. The attribute travels with the
 handle because the attribute is the handle's kind.
 
-**A region is a capability, not a description.** There is no op that reads a
-pool's or an allocation's bounds: a process that holds one can hand it to the
-kernel and cannot learn a number from it. What a process knows about where its
-memory is, it knows from the config that gave it the region — which is what
-root's tag-to-meaning config is, and where a driver's `UART_BASE` comes from.
+**A region is a capability, not a description.** There is no op on a
+pool or an allocation that reads its bounds: a process that holds one hands it
+to the kernel, and what it gets back is another capability. The numbers a
+holder learns are about its own rows, once it has mapped: a `Mapping` answers
+where its row is and how long it is (`Base`, `Len`, below), which a program
+needs to use the memory and a receiver needs to check memory it was given
+before it touches it. Where a row's address is its memory's own, those two are
+the allocation's physical range. What a process knows about where its memory
+is before it maps, it knows from the config that gave it the region — which is
+what root's tag-to-meaning config is, and where a driver's `UART_BASE` comes
+from.
 
 **Pools and allocations are two kinds, with disjoint ops.** A pool is memory
 nobody uses yet, and what it does is hand out allocations and say how much it
@@ -1416,7 +1422,7 @@ halves — a user VA range and the physical base it translates to — so
 asserted equal on the tiers that do not translate (§5.5): one mechanism with
 one degree of freedom unspent on the MPU tier, not two mechanisms.
 
-- **Three ops.** `Unmap` (on `MappingRight.Unmap`) and `Base` (on
+- **Four ops.** `Unmap` (on `MappingRight.Unmap`) and `Base` (on
   `MappingRight.Base`) — the address the kernel chose, asked for rather than
   assumed, which is the portable spelling every program should use
   (`tests/map-placed`). `Base` is a separate bit from `Unmap` because locating
@@ -1425,6 +1431,20 @@ one degree of freedom unspent on the MPU tier, not two mechanisms.
   child needs the address to use the memory) or one it can revoke and not
   locate. The answer is a user address on every tier, and on a tier that does
   not translate it is also the physical one.
+  `Len` (also on `MappingRight.Base`) answers how many bytes the row grants
+  from its base: the row's top less its base, read from the grant record, a
+  whole number of grains on every row. Locating a row is knowing where it
+  begins and where it ends, so it spends the right `Base` spends. It answers
+  the row and not the allocation, because the row is what an access is held
+  to: a `Grow` raises it, and an `extend` no `Grow` has followed does not. A
+  row covers its whole allocation when it is made, so this is how a process
+  given memory checks its length before it touches a byte: a shared ring
+  shorter than its layout is a peer's bad value, refused by the receiver's
+  protocol, never a fault of the receiver. It answers for every row a Mapping
+  names, a device window's and the stats region's included. Its answers are
+  `Base`'s, in `Base`'s order: a handle without `Base` is the `AccessDenied`
+  fault, a Mapping its holder unmapped the `BadState` fault, and one whose
+  target died `Revoked`.
   `Grow` (on `MappingRight.Grow`, bit 10) raises the row's top over its
   allocation's next bytes, which the allocation must already hold
   (`NoMemory` otherwise), and on a translating target into its room or other
@@ -1435,7 +1455,8 @@ one degree of freedom unspent on the MPU tier, not two mechanisms.
   `BadArg`; a Mapping whose target died is `Revoked`; a row that grants no
   allocation, a device window or the stats region, is `BadArg`; a new top
   past the allocation's end is `NoMemory`, a status because the holder of a
-  Mapping need not hold the `Memory` and cannot read its bounds; and next
+  Mapping need not hold the `Memory` and cannot read the allocation's bounds
+  (`Len` answers the row's); and next
   addresses that meet another row or leave the grant window are
   `NoResource`, as `map` answers (only where the target translates: on an
   identity target they are the allocation's own bytes). Then the top rises by
@@ -1477,7 +1498,7 @@ one degree of freedom unspent on the MPU tier, not two mechanisms.
 - **It is bound to its target.** A Mapping charges the target process's quota,
   not the caller's (§2.9), and the target is its owner in §2.10's sense: when
   the target dies its row goes with the whole domain and the Mapping is
-  invalid, so `Unmap`, `Base` and `Grow` answer `Revoked`. A Mapping its
+  invalid, so `Unmap`, `Base`, `Len` and `Grow` answer `Revoked`. A Mapping its
   holder unmapped is not that state: it is the `BadState` above.
 - **It is not givable** — `mapping_rights()` withholds `Transfer` — because a
   Mapping names a row in one specific domain.
@@ -3307,7 +3328,7 @@ Everything else derives from those handles.
   must be memory the board can give a process (`hal.map_source_ok`), so a
   `Memory` over flash is an image source and never a destination:
   `ProcessCreate` answers a flash destination `BadImage`, a status as for
-  its other refused destinations, because a launcher cannot read a region's
+  its other refused destinations, because no op on a region reads its
   bounds (§2.5). A destination's base and length must both be whole
   multiples of the protection grain, so that the stack grant at its top
   begins on the grain and no copied segment's row, rounded up, reaches into
@@ -4842,8 +4863,9 @@ reserved.
   device row the case names, in its order, as the board states it. It puts a
   pool row's base on the protection grain (§2.5). A child's image blob and its
   destination are allocations, because `process_create` takes allocations and a
-  launcher cannot allocate a blob from a pool: it would need the blob's length,
-  which it cannot read (§2.5) and which the build writes as a linker expression.
+  launcher cannot allocate a blob from a pool: it would need the blob's length
+  before it holds the blob (§2.5), which the build writes as a linker
+  expression.
   The pool row is a pool. A case that allocates from a blob or a destination
   types that row as a pool instead. On the ESP32-S3 the blob rows lie in flash:
   an allocation there is an image source and nothing else (a `map` of it is

@@ -1,0 +1,120 @@
+// A server checks the length of a ring's Memory before it touches a byte
+// (spec §2.5, `pktring`).
+//
+//   SOS ringshort: short ring: refused: a memory shorter than the ring: 4096,
+//                  counted 1
+//   SOS ringshort: ring accepted: the last word holds its mark
+//   SOS ringshort: the child ended: status=65536
+//   SOS ringshort: root reads the mark: 305419896
+//   SOS ringshort: done
+//
+// Root is the client: it lays the ring out, allocates a Memory of one page,
+// shorter than the layout, and one of three, which holds it, and gives
+// `child-ring-server` a sibling of each. The child maps each, asks its
+// Mapping how long the row is, refuses the short one before reading it, and
+// stores a mark in the long ring's last word. Root maps its own handle of the
+// long Memory and reads the same mark: the row the child checked is the
+// memory both hold.
+
+import sos.{System, Process, Memory, Pool, AllocateFrom, MapAccess,
+            MemoryRight, SosStatus, SystemRight}
+import pktring.{Layout}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_SHORT: UInt = 40
+static TAG_LONG: UInt = 41
+
+static KEY_DEATH: UInt = 6
+
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// What the child stores in the ring's last word.
+static MARK: UInt32 = 0x1234_5678
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Transfer | SystemRight.ProcessSelf
+                               | SystemRight.Debug)
+
+/// What the child gets of each Memory: it may map it, and nothing else.
+static CHILD_MEMORY: UInt32 = (MemoryRight.Transfer | MemoryRight.Map)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS ringshort: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS ringshort: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS ringshort: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func word_at(at: UInt) unsafe -> UInt32 {
+    UnsafeMemory<UInt32, Normal>(at).read()
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var dest_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let dest = dest_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let l = try! Layout(slot_bytes: 2048, to_server: 2, to_client: 2)
+    let short = try pool.allocate(len: PAGE, from: AllocateFrom.Back)
+    let long = try pool.allocate(len: 3 * PAGE, from: AllocateFrom.Back)
+    if l.bytes() <= PAGE || l.bytes() > 3 * PAGE { return BUG }
+
+    let child = try system.process_create(image: &image, memory: &dest)
+    let short_for_child = try short.mint(rights: CHILD_MEMORY)
+    try child.give(memory: move short_for_child, tag: TAG_SHORT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let long_for_child = try long.mint(rights: CHILD_MEMORY)
+    try child.give(memory: move long_for_child, tag: TAG_LONG) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    try child.start(boot_tag: TAG_BOOT)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            print("SOS ringshort: the child ended: status={}\n", status)
+        },
+        case _ -> { return BUG },
+    }
+
+    let view = try proc.map(memory: &long, access: RW)
+    let base = try view.base()
+    let seen = word_at(base + l.bytes() - 4)
+    print("SOS ringshort: root reads the mark: {}\n", seen)
+    if seen != MARK { return BUG }
+    return
+}

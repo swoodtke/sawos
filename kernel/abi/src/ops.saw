@@ -793,13 +793,13 @@ public enum IoMemoryOp: UInt {
 
 /// A method id on a Mapping object.
 ///
-/// Three ops. `Unmap` is the thing a Mapping is for (§2.5 gives it exactly one
-/// job: it is the thing that can unmap), `Base` reads where the row landed, and
-/// `Grow` raises its top. Everything else about it, such as what access it
-/// carries, was decided when it was installed and cannot be edited afterwards.
-/// A mapping whose access should change is a mapping that is unmapped and made
-/// again, which is one fewer op and no ambiguity about what a half-changed row
-/// means.
+/// Four ops. `Unmap` is the thing a Mapping is for (§2.5 gives it exactly one
+/// job: it is the thing that can unmap), `Base` reads where the row landed,
+/// `Len` how long it is, and `Grow` raises its top. Everything else about it,
+/// such as what access it carries, was decided when it was installed and
+/// cannot be edited afterwards. A mapping whose access should change is a
+/// mapping that is unmapped and made again, which is one fewer op and no
+/// ambiguity about what a half-changed row means.
 ///
 /// Unmap of an already-unmapped Mapping is `BadState`, caller-checkable since
 /// the caller is the one that unmapped it. The same tag covers a mapping whose
@@ -837,6 +837,20 @@ public enum MappingOp: UInt {
     /// `SosStatus.NoResource`. The row stays one row: no quota moves and the
     /// allocation's row count does not change. It spends `MappingRight.Grow`.
     case Grow = 2,
+    /// How many bytes this row grants from its base.
+    ///
+    /// Locating a row is knowing where it begins and where it ends, so it
+    /// spends `MappingRight.Base` and answers `Base`'s refusals in `Base`'s
+    /// order. It answers the row and not the allocation, because the row is
+    /// what an access is held to: `Grow` raises it, and `MemoryOp.Extend` does
+    /// not. A row covers its whole allocation when it is made, so a process
+    /// given memory learns its length here once it has mapped it, and can
+    /// check it before it touches a byte.
+    ///
+    /// The answer is a whole number of the protection grain, in the value
+    /// register. It is the same on every tier, a device window's and the stats
+    /// region's rows included.
+    case Len = 3,
 }
 
 // =============================================================================
@@ -1098,7 +1112,7 @@ static_assert((IoMemoryOp.Map as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
 // Re-point this assert at the highest case when an op is added (see the note on
 // the System table's assert above).
-static_assert((MappingOp.Grow as UInt) < PANIC_OP,
+static_assert((MappingOp.Len as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
 static_assert((PipeInletOp.Call as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")

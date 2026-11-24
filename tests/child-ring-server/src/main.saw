@@ -1,0 +1,108 @@
+// Test child: a ring's server that checks a received Memory's length before it
+// reads a byte of it, for `ring_short`.
+//
+// The launcher gives it two Memories, one shorter than the ring's layout and
+// one longer, and a System sibling. For each it follows pktring's attach
+// recipe: the Memory's rights hold `Map`, it is mapped read-write into this
+// process, and the window is made from the Mapping's `base()` and `len()`. A
+// short row is refused and counted. A row that holds the layout is accepted,
+// and the child stores a mark in the ring's last word and loads it back.
+//
+//   SOS ringshort: short ring: refused: a memory shorter than the ring: 4096,
+//                  counted 1
+//   SOS ringshort: ring accepted: the last word holds its mark
+//
+// Without the check the short row's window would reach past the row: its last
+// word's store faults where the board protects memory, and reads back where it
+// does not.
+
+import sos.{System, Process, Memory, MapAccess, MemoryRight, SosStatus}
+import pktring.{Layout, SharedWindow, FaultCounts}
+
+static TAG_SHORT: UInt = 40
+static TAG_LONG: UInt = 41
+
+static EXIT_DONE: UInt = 0
+/// Something this program needs was refused with a status.
+static EXIT_SETUP: UInt = 97
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The word the child stores in the ring's last word, and the launcher reads.
+static MARK: UInt32 = 0x1234_5678
+
+/// Two 2048-byte slots each way: 8256 bytes.
+func layout() -> Layout {
+    try! Layout(slot_bytes: 2048, to_server: 2, to_client: 2)
+}
+
+/// Attach one ring: map `mem`, make the window from the row's own length, and
+/// either count and report the refusal or prove the last word is reachable.
+func attach(proc: &Process, mem: &Memory, what: String,
+            counts: &var FaultCounts) unsafe -> Result<Void, SosStatus> {
+    let rights = try mem.rights()
+    if (rights & (MemoryRight.Map as UInt32)) == 0 {
+        return SosStatus.Unknown
+    }
+    let view = try proc.map(memory: &mem, access: RW)
+    let base = try view.base()
+    let len = try view.len()
+    var l = layout()
+    let window = try SharedWindow(at: base as UnsafePointer<UInt32>, len: len,
+                                  layout: &l) catch {
+        counts.record(&error)
+        print("SOS ringshort: {}: refused: {}, counted {}\n", what, error,
+              counts.total())
+        try view.unmap()
+        return
+    }
+    let last = l.bytes() - 4
+    if not window.holds(last) {
+        return SosStatus.Unknown
+    }
+    UnsafeMemory<UInt32, Normal>(base + last).write(MARK)
+    if UnsafeMemory<UInt32, Normal>(base + last).read() == MARK {
+        print("SOS ringshort: ring accepted: the last word holds its mark\n")
+    } else {
+        print("SOS ringshort: ring accepted: the last word lost its mark\n")
+    }
+    return
+}
+
+/// Drain the boot set, then attach each ring in turn.
+func serve(proc: &Process) unsafe -> UInt {
+    var short_mem: Memory? = None
+    var long_mem: Memory? = None
+    var going = true
+    while going {
+        var rec = try proc.boot_handle_next() catch {
+            going = false
+            continue
+        }
+        if rec.tag == TAG_SHORT {
+            short_mem = rec.take_memory()
+        } else if rec.tag == TAG_LONG {
+            long_mem = rec.take_memory()
+        }
+    }
+    guard let short = short_mem.take() else { return EXIT_SETUP }
+    guard let long = long_mem.take() else { return EXIT_SETUP }
+    var counts = FaultCounts.zero()
+    try attach(&proc, &short, "short ring", &var counts) catch {
+        print("SOS ringshort: short ring: setup: {}\n", error)
+        return EXIT_SETUP
+    }
+    try attach(&proc, &long, "long ring", &var counts) catch {
+        print("SOS ringshort: long ring: setup: {}\n", error)
+        return EXIT_SETUP
+    }
+    return EXIT_DONE
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch { return }
+    let code = serve(&proc)
+    let _ = proc.exit(code)
+}

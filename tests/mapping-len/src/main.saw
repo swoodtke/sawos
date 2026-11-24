@@ -1,0 +1,62 @@
+// A Mapping answers how long its row is (spec §2.5).
+//
+//   SOS maplen: len: 8192
+//   SOS maplen: extended by a page, len: 8192
+//   SOS maplen: grown by a page, len: 12288
+//   SOS maplen: done
+//
+// Two pages from the front of a fresh pool, mapped read-write with a page of
+// room. The row covers its whole allocation, so its length is the two pages.
+// The allocation extended by a page is longer and the row is not: `len` still
+// answers the row's two pages until the row is grown over the new page. A page
+// is a whole number of grains on every profile, so the lines are the same on
+// each.
+
+import sos.{System, Process, Pool, AllocateFrom, MapAccess, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS maplen: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS maplen: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS maplen: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let mem = try pool.allocate(len: 2 * PAGE, from: AllocateFrom.Front)
+    let view = try proc.map(memory: &mem, access: RW, room: PAGE)
+    let first = try view.len()
+    print("SOS maplen: len: {}\n", first)
+    try mem.extend(len: PAGE)
+    let second = try view.len()
+    print("SOS maplen: extended by a page, len: {}\n", second)
+    try view.grow(len: PAGE)
+    let third = try view.len()
+    print("SOS maplen: grown by a page, len: {}\n", third)
+
+    try view.unmap()
+    return
+}

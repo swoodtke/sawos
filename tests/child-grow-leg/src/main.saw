@@ -1,5 +1,6 @@
-// Test child: does one thing to grow memory in place, chosen by the role its
-// launcher signalled, for `grow_faults` and `mapping_grow_gone` (spec §2.5).
+// Test child: does one thing to grow memory in place or ask a row's length,
+// chosen by the role its launcher signalled, for `grow_faults`,
+// `mapping_grow_gone` and the Mapping's `len` (spec §2.5).
 //
 // The launcher gives it a System sibling as its boot tag, an Event carrying
 // the role, a pool sibling, and for the device role the device window. Every
@@ -29,6 +30,8 @@ static ROLE_GROW_HUSK: UInt = 9
 static ROLE_ROOM_OFF_GRAIN: UInt = 10
 static ROLE_EXTEND_BLOCKED_OFF_GRAIN: UInt = 11
 static ROLE_GROW_WHOLE_OFF_GRAIN: UInt = 12
+static ROLE_LEN_UNGRANTED: UInt = 13
+static ROLE_LEN_HUSK: UInt = 14
 
 /// How this process ends when `ROLE_EXIT` has run.
 static EXIT_DONE: UInt = 7
@@ -48,6 +51,10 @@ static RW: UInt32 = MapAccess.Read | MapAccess.Write
 /// Every Mapping right but `Grow`.
 static NO_GROW: UInt32 = (MappingRight.Mint | MappingRight.Unmap
                           | MappingRight.Base)
+
+/// Every Mapping right but `Base`.
+static NO_BASE: UInt32 = (MappingRight.Mint | MappingRight.Unmap
+                          | MappingRight.Grow)
 
 /// What the launcher gave, by tag.
 struct Given {
@@ -129,6 +136,18 @@ func run(proc: &Process, given: &var Given) -> Result<UInt, SosStatus> {
         // would pass its end: the length is judged before the allocation is.
         let (_mem, view) = try mapped_page(&proc, &pool, 0)
         try view.grow(len: OFF_GRAIN)
+        return EXIT_SURVIVED
+    }
+    if role == ROLE_LEN_UNGRANTED {
+        let (_mem, view) = try mapped_page(&proc, &pool, 0)
+        let narrow = try view.mint(rights: NO_BASE)
+        let _ = try narrow.len()
+        return EXIT_SURVIVED
+    }
+    if role == ROLE_LEN_HUSK {
+        let (_mem, view) = try mapped_page(&proc, &pool, 0)
+        try view.unmap()
+        let _ = try view.len()
         return EXIT_SURVIVED
     }
     let (mem, view) = try mapped_page(&proc, &pool, 0)

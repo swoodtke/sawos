@@ -64,7 +64,8 @@
 //! They are checked in this order, and the first that applies is answered:
 //! `BadOp` (a message of no bytes, an op byte that names no op, or a payload
 //! of the wrong length), `BadArg` (a slot count of none or past `MAX_SLOTS`,
-//! a range that does not fit the ring, an `Attach` with no Memory), then
+//! a range that does not fit the ring, an `Attach` with no Memory, one given
+//! without `MemoryRight.Map`, or one shorter than the ring), then
 //! `NotAttached` (any op before `Attach`), `Attached` (a second `Attach`),
 //! `Busy` (a `WaitEvent` while one is held).
 //!
@@ -72,9 +73,14 @@
 //!
 //! The ring is input (`pktring`), and so is each H4 packet in it: a value of
 //! the peer's that fails a check, a slot's H4 header included (`h4_packet`),
-//! ends the connection, and the driver counts it in `ring_faults`. A client's
-//! death is the connection's peer-closed: the driver drops its mapping and
-//! its slots. A driver's death answers every claim `PeerClosed`.
+//! ends the connection, and the driver counts it in `ring_faults`. The first
+//! such check is on the Memory an `Attach` gives: one without `Map`, or whose
+//! mapping is shorter than the ring, is counted and answered `BadArg`, and
+//! the connection ends. A Memory that is zero-length, off the protection
+//! grain or backed by flash is not checked before the driver maps it, and
+//! `map` ends the driver for it. A client's death is the connection's
+//! peer-closed: the driver drops its mapping and its slots. A driver's death
+//! answers every claim `PeerClosed`.
 
 import pktring.{Layout, LayoutError, MAX_SLOTS, Ring, SlotRange}
 
