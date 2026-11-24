@@ -1420,13 +1420,14 @@ public func windowed_call_refused(fn_addr: UInt) unsafe -> Never {
 // call, and fills in a record; this half passes it the description and prints
 // the line a stop's record says (../ABI.md §16). Nothing here touches the
 // memory-SPI controller but `psram_spi1_words`, which only reads it, and
-// SYSTIMER, which `psram_time_reads` starts and reads around its call. Down
-// here, below the last overflow check, for the build keys' reason above.
+// SYSTIMER, which `psram_cpu_passes` starts and reads. Down here, below the
+// last overflow check, for the build keys' reason above.
 
 extern "C" {
     func sos_psram_bringup(expect: UInt, record: UInt, last_step: UInt) -> UInt
-    func sos_psram_time_reads(expect: UInt, record: UInt, bytes: UInt,
-                              count: UInt) -> UInt
+    func sos_psram_time_reads(expect: UInt, record: UInt, which: UInt,
+                              searches: UInt) -> UInt
+    func sos_ccount_read() -> UInt
 }
 
 /// The description the part must match, as `mspi.c`'s
@@ -1466,9 +1467,10 @@ public struct PsramRecord {
     mr8: UInt32,
     mr01_after: UInt32,
     mr_cycles: UInt32,
+    cycles: UInt32,
 }
 
-static_assert(sizeof<PsramRecord>() == 76, "PsramRecord is mspi.c's layout")
+static_assert(sizeof<PsramRecord>() == 80, "PsramRecord is mspi.c's layout")
 
 /// `last_step` for a bring-up that ends after S8, the identity, and for one
 /// that ends after S9, the mode register's write (`mspi.c`'s STEP_S8,
@@ -1491,7 +1493,8 @@ static PSRAM_STOP_VENDOR: UInt = 0x5A
 static PSRAM_STOP_DIE: UInt = 0x5B
 static PSRAM_STOP_DENSITY: UInt = 0x5C
 static PSRAM_STOP_MR0: UInt = 0x5D
-static PSRAM_STOP_READ_LENGTH: UInt = 0x61
+static PSRAM_STOP_MEASUREMENT: UInt = 0x61
+static PSRAM_STOP_STILL_BUSY: UInt = 0x62
 
 /// Run the bring-up's steps S0 to `last_step`, then S10, on the description at
 /// `expect`, filling in the record at `record`; both must be DRAM. Answers 0,
@@ -1501,18 +1504,72 @@ public func psram_bringup(expect: UInt, record: UInt,
     sos_psram_bringup(expect, record, last_step)
 }
 
-/// Send `count` reads of `bytes` bytes (2 or 10, `mspi.c`'s SHORT_READ and
-/// LONG_READ; any other length is stop 0x61) of the RAM chip's array under
-/// the gate, at the description's divider, and answer the stop code (0 when
-/// none). `ticks` is SYSTIMER's count across the call, at 16 MHz.
-public func psram_time_reads(expect: UInt, record: UInt, bytes: UInt,
-                             count: UInt, ticks: &var UInt64) unsafe -> UInt {
+/// The measurements `psram_time_reads` makes (`mspi.c`'s TIME_*): the array
+/// read of 2 and of 10 bytes at divide by 4, and the MR0/MR1 read at divide
+/// by 4 and by 8.
+public static PSRAM_TIME_ARRAY_SHORT: UInt = 1
+public static PSRAM_TIME_ARRAY_LONG: UInt = 2
+public static PSRAM_TIME_MR_FAST: UInt = 3
+public static PSRAM_TIME_MR_SLOW: UInt = 4
+
+/// Bisect `searches` times how many CCOUNT cycles after its start the
+/// measurement `which`'s command ends, under the gate (../ABI.md §16b), and
+/// answer the stop code (0 when none); the record's `cycles` is the sum.
+public func psram_time_reads(expect: UInt, record: UInt, which: UInt,
+                             searches: UInt) unsafe -> UInt {
+    sos_psram_time_reads(expect, record, which, searches)
+}
+
+/// SYSTIMER's ticks in a millisecond: it counts the crystal at 16 MHz
+/// (../ABI.md §6a).
+static PSRAM_TICKS_PER_MS: UInt64 = 16000
+/// The interval a pass of `psram_cpu_passes` spans, at least: 5 ms.
+static PSRAM_CPU_TICKS: UInt64 = 80000
+
+/// One end of a pass's interval: SYSTIMER's count, then CCOUNT. Both ends
+/// run these same instructions, so the time from the snapshot to the CCOUNT
+/// read is the same at each and drops out of the difference.
+func psram_cpu_sample(timer: &Systimer) unsafe -> (UInt64, UInt) {
+    let ticks = timer.now()
+    (ticks, sos_ccount_read())
+}
+
+/// One pass of the CPU's clock against SYSTIMER: CCOUNT's advance, and
+/// SYSTIMER's over the same interval, at least `PSRAM_CPU_TICKS`.
+public struct PsramCpuPass {
+    cycles: UInt64,
+    ticks: UInt64,
+}
+
+extension PsramCpuPass {
+    /// The CPU's clock in kHz the pass gives.
+    public func khz(&self) -> UInt {
+        UInt.from(truncating: self.cycles * PSRAM_TICKS_PER_MS / self.ticks)
+    }
+}
+
+func psram_cpu_pass(timer: &Systimer) unsafe -> PsramCpuPass {
+    let start = psram_cpu_sample(&timer)
+    var end = psram_cpu_sample(&timer)
+    while end.0 - start.0 < PSRAM_CPU_TICKS {
+        end = psram_cpu_sample(&timer)
+    }
+    PsramCpuPass(cycles: (end.1 &- start.1) as UInt64,
+                 ticks: end.0 - start.0)
+}
+
+/// Two passes of the CPU's clock against SYSTIMER, run back to back; the
+/// second is the measurement. The first takes SYSTIMER's first snapshot,
+/// which can be slower than the rest, and fills the caches with the code it
+/// runs from flash, whose first fetch at a slow clock costs a thousand
+/// cycles or more and, landing between one end's snapshot and its CCOUNT
+/// read, would count against that end alone.
+public func psram_cpu_passes(first: &var PsramCpuPass,
+                             second: &var PsramCpuPass) unsafe {
     let timer = Systimer()
     timer.start()
-    let before = timer.now()
-    let stop = sos_psram_time_reads(expect, record, bytes, count)
-    ticks = timer.now() - before
-    stop
+    first = psram_cpu_pass(&timer)
+    second = psram_cpu_pass(&timer)
 }
 
 /// `digits` hex digits of `v`, after `0x`.
@@ -1692,10 +1749,17 @@ public func psram_stop_line(expect: UInt, record: UInt, stop: UInt) unsafe {
         console_str("MR0 = ")
         psram_hex(read, 2)
         console_str(" after writing 0x28\n")
-    } else if stop == PSRAM_STOP_READ_LENGTH {
-        console_str("a timing read of 0x")
+    } else if stop == PSRAM_STOP_MEASUREMENT {
+        console_str("a timing measurement 0x")
         console_hex(read)
-        console_str(" bytes; the measurement reads 2 or 10\n")
+        console_str("; the measurements are 1 to 4\n")
+    } else if stop == PSRAM_STOP_STILL_BUSY {
+        console_str("SPI1 command ")
+        psram_command(command, address)
+        console_str(" still busy 4096 cycles after it started, ")
+        console_str("SPI_MEM_CMD = 0x")
+        console_hex(read)
+        console_str("\n")
     } else {
         console_str("code 0x")
         console_hex(stop)

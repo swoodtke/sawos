@@ -16032,10 +16032,10 @@ PSRAM_THROUGH_S9 = 0x90
 # The fault harness's words, after the description, in `psram_fault.saw`'s
 # `CaseHarness` order.
 PSRAM_HARNESS_WORDS = ("step", "command", "addr", "value", "count",
-                       "expect_at", "record_at", "last_step", "time_bytes")
+                       "expect_at", "record_at", "last_step", "time_which")
 
 # The record's size, `mspi.c`'s `struct sos_psram_record`.
-PSRAM_RECORD_BYTES = 76
+PSRAM_RECORD_BYTES = 80
 
 
 def _psram_case_asm(case, clock, board):
@@ -16060,7 +16060,7 @@ def _psram_case_asm(case, clock, board):
     order = ("efuse_cap", "efuse_vendor", "vendor", "density", "divider",
              "sysclk", "cpu_per", "core_clk_sel")
     harness = dict(spec.get("fault", {}), last_step=PSRAM_THROUGH_S8)
-    for key in ("expect_at", "record_at", "last_step", "time_bytes"):
+    for key in ("expect_at", "record_at", "last_step", "time_which"):
         if key in spec:
             harness[key] = spec[key]
     lines = ["/* Written by tools/sos_runner.py: a PSRAM harness's case block "
@@ -16726,6 +16726,18 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             return False, (f"the loads of {span['counter']:#010x} between "
                            f"the two stores step {max(steps)} counts at "
                            f"most, over {span['step_at_most']}")
+        return True, ""
+
+    def check_number(want, out):
+        """Hold the decimal that follows `want["after"]` in the console to
+        `want["at_least"]` .. `want["at_most"]`. Returns (ok, reason)."""
+        m = re.search(re.escape(want["after"]) + r"(\d+)", out)
+        if not m:
+            return False, f"no decimal after {want['after']!r}"
+        v = int(m.group(1))
+        if not want["at_least"] <= v <= want["at_most"]:
+            return False, (f"{want['after']!r} is followed by {v}, outside "
+                           f"{want['at_least']} to {want['at_most']}")
         return True, ""
 
     def check_stores(case, stores):
@@ -17603,6 +17615,27 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     spi1_as_before = ("SOS psram: SPI1 MISC=0x00000000 clock=0x00030103 "
                       "after the call, as before it")
     flash_once = ["0xab"]
+    # P2's measurement here: a command ends inside the store that starts it,
+    # so every bisection answers 0 and neither difference is measured. The
+    # CPU's kHz and the counts it divides are host time unless the case runs
+    # on the instruction-counted clock (`psram_mode`).
+    psram_measured = [
+        "SOS psram: CPU ",
+        " kHz by SYSTIMER, ",
+        " cycles in ",
+        " ticks; the first pass ",
+        " ticks",
+        "SOS psram: array read ends 0.0 and 0.0 cycles after its start for "
+        "2 and 10 bytes at divide by 4",
+        "SOS psram: MR0/MR1 read ends 0.0 cycles after its start at divide "
+        "by 4, 0.0 at divide by 8",
+        "SOS psram: core clock not measured: the 10-byte read ended no later",
+        "SOS psram: MR0/MR1 read not measured: it ended no later at divide "
+        "by 8"]
+    # And what it stores to SPI1 that S10 puts back: the MR0/MR1 read's
+    # clock word at divide by 8, and the long array read's length in
+    # MISO_DLEN(1), 80 bits.
+    psram_measured_stores = {0x6000_2014: 0x0007_0307, 0x6000_2028: 80 - 1}
     spi1_cmd = 0x6000_2000
     spi1_misc = 0x6000_2034
     spi1_w0 = 0x6000_2058
@@ -17710,22 +17743,29 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             ("psram_insel2_word", 0x6000_415C, 0xBC, 0x3C),
             ("psram_insel3_word", 0x6000_4160, 0xBC, 0x3C))],
         {
-            # P2: S9's write takes, then the array reads are timed. The ticks
-            # and the clock they give are host time here.
+            # P2: S9's write takes, then the four measurements
+            # (`psram_measured`). On the instruction-counted clock CCOUNT
+            # (40 MHz) and SYSTIMER (16 MHz) count the same virtual time, so
+            # the CPU's kHz is the models' ratio of the two, the same on
+            # every run of one image. It lands within a few percent of 40000
+            # and moves a little with the image's code, so the bounds are
+            # wide; a unit, a window or an end out of place moves it by a
+            # factor.
             "name": "psram_mode",
             "src": os.path.join(s3_tests, "psram_mode.saw"),
             "psram": {},
+            "icount": True,
+            "expect_number": {"after": "SOS psram: CPU ", "at_least": 36000,
+                              "at_most": 44000},
             "flash_commands": flash_once,
             "expect_out": [
                 rom,
                 "SOS psram: MR0=0x00000009 before, 0x28 written, "
                 "MR0=0x00000028 after",
-                "SOS psram: 1000 reads of 2 bytes took ",
-                " ticks, of 10 bytes ",
-                "SOS psram: core clock ",
-                " by 4 clocks x 4 per read",
+                *psram_measured,
                 spi1_as_before,
                 halt_pass],
+            "device_stores": psram_measured_stores,
             "expect_clean_exit": True,
         },
         {
@@ -17740,8 +17780,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                 rom, *clock_pll80_lines,
                 "SOS psram: MR0=0x00000009 before, 0x28 written, "
                 "MR0=0x00000028 after",
+                *psram_measured,
                 spi1_as_before,
                 halt_pass],
+            "device_stores": psram_measured_stores,
             "expect_clean_exit": True,
         },
         {
@@ -17761,6 +17803,31 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                 halt_pass],
             "expect_clean_exit": True,
         },
+        # One bisection of the MR0/MR1 read, counted, with no answer read.
+        # Every probe here finds the command finished, so the bisection
+        # answers 0: the probe at the spin limit, then thirteen halvings of
+        # 0 to 4096. With the second probe's read (spin 2048) lied to as
+        # busy, it answers 2049, after twelve probes of 2049 to 4096.
+        *[{
+            "name": name,
+            "src": os.path.join(s3_tests, "psram_fault.saw"),
+            "psram": {"time_which": 3, **fault},
+            "psram_fault": True,
+            "flash_commands": flash_once,
+            "expect_out": [
+                rom,
+                f"SOS psram: fault hits={hits:#010x} starts={starts:#010x} "
+                "w0_reads=0x00000000",
+                f"SOS psram: timing cycles={cycles:#010x}",
+                spi1_as_before,
+                halt_pass],
+            "expect_clean_exit": True,
+        } for name, fault, hits, starts, cycles in (
+            ("psram_time_commands", {}, 0, 14, 0),
+            ("psram_time_bisect", {"fault": {"step": 0x7B, "command": 2,
+                                             "addr": spi1_cmd,
+                                             "value": 0x40000, "count": 1}},
+             1, 13, 2049))],
         {
             # P1 at divide by 2: the commands run at a clock word other than
             # the one SPI1 holds, and S10 puts the ROM's back.
@@ -17792,20 +17859,30 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         fault_stop("psram_stop_time_reads_in_flash", 0x50, [
             " or expectation at 0x3c200000 is not in DRAM",
             "SOS psram: fault hits=0x00000000 starts=0x00000000",
-            spi1_as_before], expect_at=0x3C20_0000, time_bytes=2),
+            spi1_as_before], expect_at=0x3C20_0000, time_which=1),
         # And a description that starts in DRAM and runs past its end
         # (0x3FD0_0000): the check holds the whole of it, not its first byte.
         fault_stop("psram_stop_expect_past_dram", 0x50, [
             " or expectation at 0x3fcffff0 is not in DRAM",
             "SOS psram: fault hits=0x00000000 starts=0x00000000",
             spi1_as_before], expect_at=0x3FCF_FFF0),
-        # 0x61: the measurement asked for 64-byte reads, which it never
-        # sends; nothing on SPI1 changes.
-        fault_stop("psram_stop_read_length", 0x61, [
-            "SOS-S3: psram stop: a timing read of 0x00000040 bytes; the "
-            "measurement reads 2 or 10",
+        # 0x61: a measurement it does not make; nothing on SPI1 changes.
+        fault_stop("psram_stop_measurement", 0x61, [
+            "SOS-S3: psram stop: a timing measurement 0x00000005; the "
+            "measurements are 1 to 4",
             "SOS psram: fault hits=0x00000000 starts=0x00000000",
-            spi1_as_before], time_bytes=64),
+            spi1_as_before], time_which=5),
+        # 0x62: the MR0/MR1 read at divide by 8 still busy at the first
+        # probe, at the spin limit; it then finishes, and SPI1 is restored.
+        fault_stop("psram_stop_still_busy", 0x62, [
+            "SOS-S3: psram stop: SPI1 command 0x4040 (MR0/MR1 read) still "
+            "busy 4096 cycles after it started, SPI_MEM_CMD = 0x00040000",
+            "SOS psram: fault hits=0x00000001 starts=0x00000001 "
+            "w0_reads=0x00000000",
+            spi1_as_before],
+            fault={"step": 0x7B, "command": 1, "addr": spi1_cmd,
+                   "value": 0x40000, "count": 1},
+            time_which=4),
         # 0x51: no eFuse file (every word 0), a 16 MiB part, an AP part at
         # 1.8 V. Before anything is written.
         psram_stop("psram_stop_efuse_none", "psram_identity.saw", 0x51, [
@@ -19332,10 +19409,16 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         none, gives the model no file, and every word reads 0); and, for a
         case that watches devices (`watches_devices`) or names
         `expect_stores` or `expect_counter_span`, the trace of every store
-        to a device register, and for the last, of every load."""
+        to a device register, and for the last, of every load. A case with
+        `icount` runs on the emulator's instruction-counted clock."""
         psram = "psram" in case
         args = list(case.get("qemu_args", arch["psram_qemu_args"])) \
             if psram else []
+        if case.get("icount"):
+            # Each instruction advances the virtual clock, which CCOUNT and
+            # SYSTIMER's model both count, by 2^ICOUNT_SHIFT ns, and nothing
+            # syncs it to the host's: their ratio is the same on every run.
+            args += ["-icount", f"shift={ICOUNT_SHIFT},align=off,sleep=off"]
         which = case.get("efuse", "8M" if psram else None)
         if which is not None:
             efuse = os.path.join(s3_build, f"{case['name']}.efuse.bin")
@@ -19566,6 +19649,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         # counter's loads.
         if ok and case.get("expect_counter_span"):
             ok, reason = check_counter_span(case, traced_accesses(trace))
+        # A decimal the console prints (`expect_number`): the first after
+        # `after`, between `at_least` and `at_most`.
+        if ok and case.get("expect_number"):
+            ok, reason = check_number(case["expect_number"], out)
         if ok:
             print(f"[{i}/{len(cases)}] {CHECK} {name}  "
                   f"({size} bytes of flash)")

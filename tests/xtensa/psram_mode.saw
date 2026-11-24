@@ -1,23 +1,33 @@
 // The PSRAM's mode register written, then the measurement of the memory-SPI
-// clock: the bring-up's steps S0 to S9 and S10, then `psram_time_reads`
-// twice (../../hal/xtensa-esp32s3/ABI.md §16, board stage P2). The
-// description is the case's (`sos_psram_case`), and it runs the image's
-// clock key first, as in `psram_identity.saw`.
+// clock: the bring-up's steps S0 to S9 and S10, then `psram_time_reads` for
+// each of its four measurements (../../hal/xtensa-esp32s3/ABI.md §16, board
+// stage P2). The description is the case's (`sos_psram_case`), and it runs
+// the image's clock key first, as in `psram_identity.saw`.
 //
 //   SOS psram: MR0=... before, 0x28 written, MR0=... after
-//   SOS psram: 1000 reads of 2 bytes took N ticks, of 10 bytes M ticks
-//   SOS psram: core clock F MHz by 4 clocks x D per read
+//   SOS psram: CPU K kHz by SYSTIMER, Y cycles in T ticks; the first pass
+//              K1 kHz, Y1 cycles in T1 ticks
+//   SOS psram: array read ends A and B cycles after its start for 2 and 10
+//              bytes at divide by 4
+//   SOS psram: MR0/MR1 read ends C cycles after its start at divide by 4, D
+//              at divide by 8
+//   SOS psram: core clock F MHz by 4 SPI clocks x 4 a read
+//   SOS psram: MR0/MR1 read X SPI clocks if the core clock is 80 MHz
 //   SOS psram: SPI1 MISC=... clock=... after the call, as before it
 //   SOS-S3: halt pass
 //
-// The reads take 2 and 10 bytes of the RAM chip's array: in octal DTR the
-// 8 bytes more are 4 SPI clocks, so the difference over READS reads is
-// 4 x D x READS core clocks, D the divider, and SYSTIMER counts it at 16 MHz;
-// what each read costs besides cancels. A 10-byte read holds the chip select
-// low about as long as a mode-register command; a 64-byte one would hold it
-// twice as long and more (ABI.md §16b). Every number on the second and
-// third lines is the part's, or host time on the emulator, and is printed,
-// not asserted.
+// (each wrapped line is one line). K is the second of `psram_cpu_passes`'
+// two passes, Y CCOUNT's advance over T of SYSTIMER's 16 MHz ticks, K1 to
+// T1 the first's, printed beside it to show what a pass starting cold
+// reads. A to D are CCOUNT cycles, averaged over `SEARCHES` bisections. In
+// octal DTR the array read's 8 bytes more are 4 SPI clocks, 16 core clocks
+// at divide by 4, so B - A cycles at K kHz give F; the MR0/MR1 read at
+// divide by 8 takes 4 core clocks more for each of its N SPI clocks, so
+// D - C cycles at K kHz are N x 4 core clocks, and X is N when the core
+// clock is 80 MHz, 2N at 40 and 4N at 20. A difference that is not positive
+// prints `not measured`, saying which. On the emulator a command ends inside
+// the store that starts it, so A to D are 0, and K is the model's ratio of
+// CCOUNT to SYSTIMER.
 
 import kcore.{console}
 import hal
@@ -29,14 +39,15 @@ extern "C" {
 /// The record's place in the case's block, as in `psram_identity.saw`.
 static RECORD_OFFSET: UInt = 68
 
-static READS: UInt = 1000
-static SHORT_READ: UInt = 2
-static LONG_READ: UInt = 10
-/// The SPI clocks the long read's extra bytes take: two bytes a clock.
-static EXTRA_CLOCKS: UInt64 = 4
-/// SYSTIMER's ticks per microsecond: it counts the crystal's 40 MHz over
-/// 2.5 (ABI.md §6a).
-static TICKS_PER_US: UInt64 = 16
+/// How many times each measurement bisects its command's end.
+static SEARCHES: UInt = 16
+/// The core clocks the array read's 8 bytes more take at divide by 4: 4 SPI
+/// clocks, two bytes a clock.
+static LONG_READ_CORE_CLOCKS: UInt64 = 16
+/// The divider step between the MR0/MR1 read's two measurements, 4 to 8.
+static DIVIDER_STEP: UInt64 = 4
+/// The core clock, in MHz, X is reckoned at.
+static REFERENCE_MHZ: UInt64 = 80
 
 func word(name: String, v: UInt32) unsafe {
     console().write_str(name)
@@ -59,12 +70,21 @@ func decimal(v: UInt64) unsafe {
     }
 }
 
-/// The divider a clock word encodes (IDF mspi_timing_tuning_ll.h,
-/// `mspi_timing_ll_set_psram_clock`): 1 when SCLK_EQU_SYSCLK (bit 31) is
-/// set, else SCLKCNT_N [23:16] plus one.
-func divider_of(w: UInt32) -> UInt64 {
-    if (w >> 31) != 0 { return 1 }
-    (((w >> 16) & 0xFF) as UInt64) + 1
+/// `v` tenths as a decimal with one place: 125 is 12.5.
+func tenths(v: UInt64) unsafe {
+    decimal(v / 10)
+    hal.console_byte(46)
+    decimal(v % 10)
+}
+
+/// `num` over `den`, rounded to the nearest whole.
+func rounded(num: UInt64, den: UInt64) -> UInt64 {
+    (num + den / 2) / den
+}
+
+/// A measurement's sum over `SEARCHES` bisections as a mean, in tenths.
+func mean_tenths(sum: UInt64) -> UInt64 {
+    rounded(sum * 10, SEARCHES as UInt64)
 }
 
 func stopped(expect: UInt, record: UInt, stop: UInt,
@@ -72,6 +92,17 @@ func stopped(expect: UInt, record: UInt, stop: UInt,
     hal.psram_stop_line(expect, record, stop)
     hal.psram_spi1_line(&before)
     hal.exit_fail(stop)
+}
+
+/// Run the measurement `which` and answer its sum over `SEARCHES`
+/// bisections, or stop the image with its line.
+func measured(expect: UInt, record: UInt, which: UInt,
+              before: &[UInt32; 11]) unsafe -> UInt64 {
+    let stop = hal.psram_time_reads(expect, record, which, SEARCHES)
+    if stop != 0 {
+        stopped(expect, record, stop, &before)
+    }
+    UnsafeMemory<hal.PsramRecord, Normal>(record).cycles.read() as UInt64
 }
 
 @export("kmain")
@@ -91,36 +122,62 @@ func kmain() unsafe {
     word("MR0=", r.mr01_after.read() & 0xFF)
     console().write_str(" after\n")
 
-    var short_ticks: UInt64 = 0
-    var long_ticks: UInt64 = 0
-    let short_stop = hal.psram_time_reads(expect, record, SHORT_READ, READS,
-                                          &var short_ticks)
-    if short_stop != 0 {
-        stopped(expect, record, short_stop, &before)
-    }
-    let long_stop = hal.psram_time_reads(expect, record, LONG_READ, READS,
-                                         &var long_ticks)
-    if long_stop != 0 {
-        stopped(expect, record, long_stop, &before)
-    }
-    console().write_str("SOS psram: 1000 reads of 2 bytes took ")
-    decimal(short_ticks)
-    console().write_str(" ticks, of 10 bytes ")
-    decimal(long_ticks)
+    var first = hal.PsramCpuPass(cycles: 0, ticks: 0)
+    var second = hal.PsramCpuPass(cycles: 0, ticks: 0)
+    hal.psram_cpu_passes(&var first, &var second)
+    let khz = second.khz() as UInt64
+    console().write_str("SOS psram: CPU ")
+    decimal(khz)
+    console().write_str(" kHz by SYSTIMER, ")
+    decimal(second.cycles)
+    console().write_str(" cycles in ")
+    decimal(second.ticks)
+    console().write_str(" ticks; the first pass ")
+    decimal(first.khz() as UInt64)
+    console().write_str(" kHz, ")
+    decimal(first.cycles)
+    console().write_str(" cycles in ")
+    decimal(first.ticks)
     console().write_str(" ticks\n")
-    let divider = divider_of(UnsafeMemory<hal.PsramExpect, Normal>(expect)
-                             .divider.read())
+
+    let short = measured(expect, record, hal.PSRAM_TIME_ARRAY_SHORT, &before)
+    let long = measured(expect, record, hal.PSRAM_TIME_ARRAY_LONG, &before)
+    let fast = measured(expect, record, hal.PSRAM_TIME_MR_FAST, &before)
+    let slow = measured(expect, record, hal.PSRAM_TIME_MR_SLOW, &before)
+    let searches = SEARCHES as UInt64
+
+    console().write_str("SOS psram: array read ends ")
+    tenths(mean_tenths(short))
+    console().write_str(" and ")
+    tenths(mean_tenths(long))
+    console().write_str(" cycles after its start for 2 and 10 bytes at ")
+    console().write_str("divide by 4\n")
+    console().write_str("SOS psram: MR0/MR1 read ends ")
+    tenths(mean_tenths(fast))
+    console().write_str(" cycles after its start at divide by 4, ")
+    tenths(mean_tenths(slow))
+    console().write_str(" at divide by 8\n")
+
     console().write_str("SOS psram: core clock ")
-    if long_ticks > short_ticks {
-        decimal(EXTRA_CLOCKS * divider * (READS as UInt64) * TICKS_PER_US
-                / (long_ticks - short_ticks))
-        console().write_str(" MHz")
+    if long > short {
+        // LONG_READ_CORE_CLOCKS over (long - short) / SEARCHES cycles at
+        // `khz`, in tenths of a MHz.
+        tenths(rounded(LONG_READ_CORE_CLOCKS * khz * searches,
+                       100 * (long - short)))
+        console().write_str(" MHz by 4 SPI clocks x 4 a read\n")
     } else {
-        console().write_str("not measured: the long reads took no longer")
+        console().write_str("not measured: the 10-byte read ended no later\n")
     }
-    console().write_str(" by 4 clocks x ")
-    decimal(divider)
-    console().write_str(" per read\n")
+    console().write_str("SOS psram: MR0/MR1 read ")
+    if slow > fast {
+        // (slow - fast) / SEARCHES cycles at `khz` are N x DIVIDER_STEP core
+        // clocks; at REFERENCE_MHZ, N in tenths.
+        tenths(rounded((slow - fast) * REFERENCE_MHZ * 10000,
+                       searches * khz * DIVIDER_STEP))
+        console().write_str(" SPI clocks if the core clock is 80 MHz\n")
+    } else {
+        console().write_str("not measured: it ended no later at divide by 8\n")
+    }
     hal.psram_spi1_line(&before)
     hal.exit_pass()
 }

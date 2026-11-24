@@ -8,6 +8,7 @@
 //   (the call's own line, for a command that did not finish)
 //   SOS-S3: psram stop: ...                     the stop's line
 //   SOS psram: fault hits=... starts=... w0_reads=...
+//   SOS psram: timing cycles=...                (a measurement's call only)
 //   SOS psram: SPI1 MISC=... clock=... after the call, ...
 //   SOS-S3: halt fail code=...
 //
@@ -15,7 +16,8 @@
 // the call started, `w0_reads` how many answers it read. The block may also
 // name an address to pass for the description or the record in place of the
 // block's own, the step the call ends after, and that the call is
-// `psram_time_reads` (one read of that many bytes) rather than the bring-up.
+// `psram_time_reads` (one bisection of that measurement) rather than the
+// bring-up; `cycles` is then the record's sum.
 // A board image of this harness is refused: the runner allows the fault
 // record in this harness's emulator image only.
 
@@ -38,7 +40,7 @@ struct CaseHarness {
     expect_at: UInt32,          // 0: the block's own description
     record_at: UInt32,          // 0: the block's own record
     last_step: UInt32,
-    time_bytes: UInt32,         // 0: the bring-up; else `psram_time_reads`
+    time_which: UInt32,         // 0: the bring-up; else `psram_time_reads`
 }
 
 static HARNESS_OFFSET: UInt = 32
@@ -81,10 +83,9 @@ func kmain() unsafe {
 
     var before: [UInt32; 11] = [0; 11]
     hal.psram_spi1_words(&var before)
-    var ticks: UInt64 = 0
-    let bytes = h.time_bytes.read() as UInt
-    let stop = if bytes != 0 {
-        hal.psram_time_reads(expect, record, bytes, 1, &var ticks)
+    let which = h.time_which.read() as UInt
+    let stop = if which != 0 {
+        hal.psram_time_reads(expect, record, which, 1)
     } else {
         hal.psram_bringup(expect, record, h.last_step.read() as UInt)
     }
@@ -95,6 +96,11 @@ func kmain() unsafe {
     word(" starts=", f.starts.read())
     word(" w0_reads=", f.w0_reads.read())
     console().write_str("\n")
+    if which != 0 && stop == 0 {
+        let r = UnsafeMemory<hal.PsramRecord, Normal>(record)
+        word("SOS psram: timing cycles=", r.cycles.read())
+        console().write_str("\n")
+    }
     hal.psram_spi1_line(&before)
     if stop != 0 {
         hal.exit_fail(stop)

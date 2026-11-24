@@ -22,7 +22,7 @@
 // Every register address and value is cited where it is defined, from
 // ESP-IDF v5.4.1 ("IDF", components/ of that tag) or from the mask ROM's
 // disassembly (`esp32s3_rev0_rom.elf`, "ROM"). The step names (S0.1 to S10)
-// and the stop codes (0x50 to 0x5D, and 0x61) are ../ABI.md §16's.
+// and the stop codes (0x50 to 0x5D, 0x61 and 0x62) are ../ABI.md §16's.
 //
 // Nothing here writes non-volatile state: the eFuse is only read
 // (EFUSE_RD_*), no RTC register is written, no command is ever sent with chip
@@ -86,11 +86,13 @@ struct sos_psram_record {
     u32 mr8;
     u32 mr01_after;         // S9.3
     u32 mr_cycles;          // CCOUNT across S8.1's command
+    u32 cycles;             // `sos_psram_time_reads`' answer
 };
 
 // The steps, as `last_step` names them and as the fault record names a read:
 // 0xMN is step SM.N (N in hex: S7.10 is 0x7A), 0xM0 step SM. The reads S7.2
-// to S7.6 make to change a word are STEP_S7's.
+// to S7.6 make to change a word are STEP_S7's; STEP_S7_PROBE is the
+// measurement's one read of SPI_MEM_CMD(1) between S7.9's start and its wait.
 #define STEP_S0_1   0x01u
 #define STEP_S0_2   0x02u
 #define STEP_S0_3   0x03u
@@ -105,6 +107,7 @@ struct sos_psram_record {
 #define STEP_S7_8   0x78u
 #define STEP_S7_9   0x79u
 #define STEP_S7_10  0x7Au
+#define STEP_S7_PROBE 0x7Bu
 #define STEP_S8     0x80u
 #define STEP_S9     0x90u
 
@@ -123,7 +126,8 @@ struct sos_psram_record {
 #define STOP_DIE            0x5Bu
 #define STOP_DENSITY        0x5Cu
 #define STOP_MR0            0x5Du
-#define STOP_READ_LENGTH    0x61u
+#define STOP_MEASUREMENT    0x61u
+#define STOP_STILL_BUSY     0x62u
 
 // ---- registers ------------------------------------------------------------
 //
@@ -285,9 +289,6 @@ struct sos_psram_record {
 #define CMD_SYNC_READ       0x0000u
 #define REG_DUMMY           8u
 #define ARRAY_DUMMY         18u
-// The two lengths the measurement reads, in bytes.
-#define SHORT_READ          2u
-#define LONG_READ           10u
 #define MR1_VENDOR_MASK     0x1Fu
 #define MR2_GOOD_DIE        0x80u
 #define MR2_DENSITY_MASK    0x07u
@@ -301,6 +302,30 @@ struct sos_psram_record {
 // Every wait reads SPI_MEM_CMD(1) at most this many times (../ABI.md §16b
 // says why the number).
 #define POLL_BOUND          100000u
+
+// The measurement (../ABI.md §16b): how long after its start one command
+// ends, in CCOUNT cycles, found by bisection. Each probe starts the command,
+// spins until CCOUNT has advanced by the probe's spin, reads
+// SPI_MEM_CMD(1) once, then waits for the command as S7.9 does; the answer
+// is the least spin whose read finds it finished. A command still busy
+// after SPIN_LIMIT cycles is stop 0x62. The bisection makes at most
+// log2(SPIN_LIMIT) + 1 probes after the first, at the limit.
+#define SPIN_LIMIT          4096u
+
+// The four measurements, by the number the caller passes: the array read of
+// 2 and of 10 bytes at divide by 4, and the MR0/MR1 read at divide by 4 and
+// by 8. The clock words are IDF's encoding
+// (`mspi_timing_ll_set_flash_clock`): CLKCNT_N [23:16] and CLKCNT_L [7:0]
+// the divider less one, CLKCNT_H [15:8] half the divider less one.
+#define TIME_ARRAY_SHORT    1u
+#define TIME_ARRAY_LONG     2u
+#define TIME_MR_FAST        3u
+#define TIME_MR_SLOW        4u
+#define ARRAY_SHORT_BITS    16u
+#define ARRAY_LONG_BITS     80u
+#define MR_BITS             16u
+#define CLOCK_DIV_4         0x00030103u
+#define CLOCK_DIV_8         0x00070307u
 
 // UART0's FIFO and status, as `sink.c`'s `kernel_fault` writes them, with the
 // same bounded wait for room per byte.
@@ -446,14 +471,13 @@ static IRAM u32 wait_idle(struct sos_psram_record *r, u32 step) {
     return 0;
 }
 
-// S5: save SPI1, put the commands' clock and DTR mode on it.
-static IRAM void prepare_spi1(struct sos_psram_expect *e,
-                              struct sos_psram_record *r) {
+// S5: save SPI1, put the commands' clock word and DTR mode on it.
+static IRAM void prepare_spi1(u32 clock, struct sos_psram_record *r) {
     for (u32 i = 0; i < SAVED; i++) {
         saved_spi1[i] = rd(STEP_S5, SPI1 + saved_offsets[i]);
     }
     r->saved = 1;
-    wr(SPI1 + SPI_CLOCK, e->divider);
+    wr(SPI1 + SPI_CLOCK, clock);
     r->spi1_clock = rd(STEP_S5, SPI1 + SPI_CLOCK);
     u32 ddr = rd(STEP_S5, SPI1 + SPI_DDR);
     wr(SPI1 + SPI_DDR, (ddr & ~DDR_CLEAR) | DDR_SET);
@@ -479,12 +503,13 @@ static IRAM u32 take_gate(struct sos_psram_record *r) {
     return 1;
 }
 
-// S7: one SPI1 user command to chip select 1. `dummy` is in cycles, 0 for
-// none; `out_bits` and `in_bits` are the data phases, 0 for none. The answer
-// is W0(1). Answers 0, or the stop code with the record filled in.
-static IRAM u32 command(struct sos_psram_record *r, u32 cmd, u32 addr,
-                       u32 dummy, u32 out_bits, u32 out, u32 in_bits,
-                       u32 *answer) {
+// S7.1 to S7.9's start: one SPI1 user command to chip select 1, set up and
+// started. `dummy` is in cycles, 0 for none; `out_bits` and `in_bits` are
+// the data phases, 0 for none. Answers 0, or the stop code with the record
+// filled in.
+static IRAM u32 command_start(struct sos_psram_record *r, u32 cmd, u32 addr,
+                              u32 dummy, u32 out_bits, u32 out,
+                              u32 in_bits) {
     command_number++;
     r->command = cmd;
     r->address = addr;
@@ -528,10 +553,16 @@ static IRAM u32 command(struct sos_psram_record *r, u32 cmd, u32 addr,
     if ((misc & MISC_CS_MASK) != MISC_GATE) {
         return stop(r, STOP_GATE_LOST, misc, MISC_GATE);
     }
-    // S7.9: a command that does not finish leaves the gate as it is, so a
-    // transfer still under way cannot be turned towards the flash by a
-    // restore, and says so from here first.
     wr(SPI1 + SPI_CMD, SPI_MEM_USR);
+    return 0;
+}
+
+// S7.9's wait and S7.10, for the command `command_start` started: a command
+// that does not finish leaves the gate as it is, so a transfer still under
+// way cannot be turned towards the flash by a restore, and says so from here
+// first. The answer is W0(1), read when `answer` is not 0.
+static IRAM u32 command_finish(struct sos_psram_record *r, u32 cmd,
+                               u32 *answer) {
     if (!wait_idle(r, STEP_S7_9)) {
         short_line_out(cmd);
         return stop(r, STOP_NOT_FINISHED, r->read, 0);
@@ -541,6 +572,17 @@ static IRAM u32 command(struct sos_psram_record *r, u32 cmd, u32 addr,
         *answer = rd(STEP_S7_10, SPI1 + SPI_W0);
     }
     return 0;
+}
+
+// S7: one command, started and waited for. Answers 0 or the stop code.
+static IRAM u32 command(struct sos_psram_record *r, u32 cmd, u32 addr,
+                       u32 dummy, u32 out_bits, u32 out, u32 in_bits,
+                       u32 *answer) {
+    u32 code = command_start(r, cmd, addr, dummy, out_bits, out, in_bits);
+    if (code) {
+        return code;
+    }
+    return command_finish(r, cmd, answer);
 }
 
 // The checks before anything is written: the entry check, then S0.1 to
@@ -704,34 +746,105 @@ static IRAM u32 identify_and_set(struct sos_psram_expect *e,
     return 0;
 }
 
-// The array reads `sos_psram_time_reads` times: `count` reads of `bytes`
-// bytes at address 0, each its own command. Answers 0 or the stop code.
-static IRAM u32 read_array(struct sos_psram_record *r, u32 bytes, u32 count) {
-    for (u32 i = 0; i < count; i++) {
-        u32 code = command(r, CMD_SYNC_READ, 0, ARRAY_DUMMY, 0, 0, bytes * 8,
-                           0);
-        if (code) {
-            return code;
-        }
+// One probe of the measurement: the command started, CCOUNT left to advance
+// by `spin`, SPI_MEM_CMD(1) read once, then the command waited for as S7.9
+// waits. `*done` says whether that one read found it finished. Answers 0 or
+// the stop code.
+static IRAM u32 probe(struct sos_psram_record *r, u32 cmd, u32 dummy,
+                      u32 in_bits, u32 spin, u32 *done) {
+    u32 code = command_start(r, cmd, 0, dummy, 0, 0, in_bits);
+    if (code) {
+        return code;
+    }
+    u32 start = ccount();
+    while (ccount() - start < spin) {
+    }
+    u32 v = rd(STEP_S7_PROBE, SPI1 + SPI_CMD);
+    *done = v == 0;
+    code = command_finish(r, cmd, 0);
+    if (code) {
+        return code;
+    }
+    if (spin == SPIN_LIMIT && !*done) {
+        return stop(r, STOP_STILL_BUSY, v, 0);
     }
     return 0;
 }
 
-// What `under_gate` sends: the bring-up's S8 and S9, or the array reads.
-#define GATED_IDENTITY  0u
-#define GATED_ARRAY     1u
+// The least spin at which one probe finds the command finished, by
+// bisection over [0, SPIN_LIMIT] after a first probe at the limit. Each
+// probe reads finished at every spin past the answer, the command taking
+// the same time every time. Answers 0 or the stop code.
+static IRAM u32 bisect(struct sos_psram_record *r, u32 cmd, u32 dummy,
+                       u32 in_bits, u32 *at) {
+    u32 done = 0;
+    u32 code = probe(r, cmd, dummy, in_bits, SPIN_LIMIT, &done);
+    if (code) {
+        return code;
+    }
+    u32 lo = 0;
+    u32 hi = SPIN_LIMIT;
+    while (lo < hi) {
+        u32 mid = (lo + hi) >> 1;
+        code = probe(r, cmd, dummy, in_bits, mid, &done);
+        if (code) {
+            return code;
+        }
+        if (done) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    *at = lo;
+    return 0;
+}
 
-// S5, S6, the commands and S10. S10 runs on every way out but stop 0x59.
+// `searches` bisections of one measurement's command, their answers summed
+// into `r->cycles`. Answers 0 or the stop code.
+static IRAM u32 measure(struct sos_psram_record *r, u32 cmd, u32 dummy,
+                        u32 in_bits, u32 searches) {
+    r->cycles = 0;
+    for (u32 i = 0; i < searches; i++) {
+        u32 at = 0;
+        u32 code = bisect(r, cmd, dummy, in_bits, &at);
+        if (code) {
+            return code;
+        }
+        r->cycles += at;
+    }
+    return 0;
+}
+
+// What `under_gate` sends: the bring-up's S8 and S9, or a measurement's
+// command.
+#define GATED_IDENTITY  0u
+#define GATED_TIMING    1u
+
+// What `under_gate` needs for either: S8 and S9's last step, or the
+// measurement's command and how many times to bisect it.
+struct gated {
+    u32 what;
+    u32 last_step;
+    u32 cmd;
+    u32 dummy;
+    u32 in_bits;
+    u32 searches;
+};
+
+// S5 at the clock word `clock`, S6, the commands and S10. S10 runs on every
+// way out but stop 0x59.
 static IRAM u32 under_gate(struct sos_psram_expect *e,
-                           struct sos_psram_record *r, u32 what,
-                           u32 last_step, u32 bytes, u32 count) {
-    prepare_spi1(e, r);
+                           struct sos_psram_record *r, u32 clock,
+                           struct gated *g) {
+    prepare_spi1(clock, r);
     if (!take_gate(r)) {
         restore_spi1();
         return r->stop;
     }
-    u32 code = what == GATED_ARRAY ? read_array(r, bytes, count)
-                                   : identify_and_set(e, r, last_step);
+    u32 code = g->what == GATED_TIMING
+               ? measure(r, g->cmd, g->dummy, g->in_bits, g->searches)
+               : identify_and_set(e, r, g->last_step);
     if (code == STOP_NOT_FINISHED) {
         return code;
     }
@@ -756,6 +869,7 @@ static IRAM u32 entry_ok(u32 expect_addr, u32 record_addr) {
     r->command = 0;
     r->address = 0;
     r->saved = 0;
+    r->cycles = 0;
     command_number = 0;
     return 1;
 }
@@ -782,21 +896,22 @@ IRAM u32 sos_psram_bringup(u32 expect_addr, u32 record_addr, u32 last_step) {
     if (code) {
         return code;
     }
-    return under_gate(e, r, GATED_IDENTITY, last_step, 0, 0);
+    struct gated g;
+    g.what = GATED_IDENTITY;
+    g.last_step = last_step;
+    return under_gate(e, r, e->divider, &g);
 }
 
-// The measurement that settles the memory-SPI core clock: `count` reads of
-// `bytes` bytes of the RAM chip's array at address 0, under the gate, at the
-// description's divider, between S5 and S10. The caller times a call of
-// short reads and one of long reads against SYSTIMER; the difference is the
-// extra data's SPI clocks, what each read costs besides cancelling. It reads
-// the array and writes nothing to the chip. `bytes` is SHORT_READ or
-// LONG_READ and nothing else: a longer read holds the chip select low longer
-// than any mode-register command, at the slowest bus clock the divider gives
-// (../ABI.md §16b), so any other length is stop 0x61 before SPI1 is touched.
-// Answers 0 or the stop code (0x50, 0x56 to 0x59, 0x61).
-IRAM u32 sos_psram_time_reads(u32 expect_addr, u32 record_addr, u32 bytes,
-                              u32 count) {
+// The measurement that settles the memory-SPI core clock (../ABI.md §16b):
+// `which` names a command and a divider (TIME_*), sent under the gate,
+// between S5 and S10, at that divider instead of the description's; the
+// record's `cycles` is the sum over `searches` bisections of how many CCOUNT
+// cycles after its start the command ends. The array reads read and the
+// mode-register reads read MR0/MR1; nothing is written to the chip. Any other
+// `which` is stop 0x61 before SPI1 is touched. Answers 0 or the stop code
+// (0x50, 0x56 to 0x59, 0x61, 0x62).
+IRAM u32 sos_psram_time_reads(u32 expect_addr, u32 record_addr, u32 which,
+                              u32 searches) {
     if (!entry_ok(expect_addr, record_addr)) {
         return STOP_NOT_DRAM;
     }
@@ -804,8 +919,25 @@ IRAM u32 sos_psram_time_reads(u32 expect_addr, u32 record_addr, u32 bytes,
         (struct sos_psram_expect *)(unsigned long)expect_addr;
     struct sos_psram_record *r =
         (struct sos_psram_record *)(unsigned long)record_addr;
-    if (bytes != SHORT_READ && bytes != LONG_READ) {
-        return stop(r, STOP_READ_LENGTH, bytes, LONG_READ);
+    struct gated g;
+    g.what = GATED_TIMING;
+    g.last_step = 0;
+    g.searches = searches;
+    u32 clock = CLOCK_DIV_4;
+    if (which == TIME_ARRAY_SHORT || which == TIME_ARRAY_LONG) {
+        g.cmd = CMD_SYNC_READ;
+        g.dummy = ARRAY_DUMMY;
+        g.in_bits = which == TIME_ARRAY_SHORT ? ARRAY_SHORT_BITS
+                                              : ARRAY_LONG_BITS;
+    } else if (which == TIME_MR_FAST || which == TIME_MR_SLOW) {
+        g.cmd = CMD_REG_READ;
+        g.dummy = REG_DUMMY;
+        g.in_bits = MR_BITS;
+        if (which == TIME_MR_SLOW) {
+            clock = CLOCK_DIV_8;
+        }
+    } else {
+        return stop(r, STOP_MEASUREMENT, which, TIME_MR_SLOW);
     }
-    return under_gate(e, r, GATED_ARRAY, 0, bytes, count);
+    return under_gate(e, r, clock, &g);
 }

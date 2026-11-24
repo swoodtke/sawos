@@ -3333,9 +3333,15 @@ PSRAM, the read-back test and the board that brings the PSRAM up at boot
 - `kernel/mspi.c` makes every step and every check, in one call from IRAM
   (`sos_psram_bringup`), and returns at the first check that fails with a
   record of what it read; `sos_psram_time_reads` is the measurement.
-- `kernel/lib.saw`'s PSRAM section passes the description, starts and reads
-  SYSTIMER around the measurement, and prints the line a stop's record says
-  (`psram_stop_line`).
+- `kernel/lib.saw`'s PSRAM section passes the description, measures the
+  CPU's clock against SYSTIMER for the measurement (`psram_cpu_passes`),
+  and prints the line a stop's record says (`psram_stop_line`). The CPU's
+  clock is CCOUNT's advance over at least 5 ms of SYSTIMER, the second of
+  two passes, each end of the interval taken by the same instructions
+  (SYSTIMER's snapshot, then CCOUNT), so the time between the two reads
+  drops out; the first pass takes SYSTIMER's first snapshot, which can be
+  slower than the rest, and fills the caches, since a first fetch from the
+  flash at a 20 MHz CPU costs a thousand cycles or more.
 - `tests/xtensa/psram_identity.saw` (S0 to S8, S10), `psram_mode.saw` (S0 to
   S10, then the measurement) and `psram_fault.saw` (the fault build, §16e)
   are the harness kernels; the first two are board stages P1 and P2 (§16f).
@@ -3374,7 +3380,10 @@ system clock after the pre-divider. ESP-IDF v5.4.1's
 `MSPI_TIMING_LL_FLASH_CPU_CLK_SRC_BINDED` as 1, a bare define with no
 comment and nothing at that tag using it. Its name suggests that the
 memory-SPI clock's source is bound to the CPU's, which would make H2 the
-unlikely reading; no source states it. Board stage P2 measures it.
+unlikely reading; no source states it. Board stage P2 measured it on the
+part (§16f): **H3**. On the crystal the memory-SPI core clock is the CPU's,
+the system clock after the pre-divider: 20 MHz under `rom`, and so 40 MHz
+under `xtal40`. Under `pll80` it is 80 MHz, as `SPI_MEM_CORE_CLK_SEL` says.
 
 What each clock key leaves (§14d, §14h), what S0.3 compares, and the bus at
 the divider every key uses, divide by 4:
@@ -3382,10 +3391,8 @@ the divider every key uses, divide by 4:
 ```
 key       SYSCLK_CONF  CPU_PER_CONF  CORE_CLK_SEL  core clock          bus at
           & 0x80FFF    & 7                                             divide 4
-rom       0x00080001   0x4           0             H1 40, H2 80, H3 20  10, 20,
-                                                   MHz                  5 MHz
-xtal40    0x00080000   0x4           0             H1 40, H2 80, H3 40  10, 20,
-                                                                        10 MHz
+rom       0x00080001   0x4           0             20 MHz, the CPU's    5 MHz
+xtal40    0x00080000   0x4           0             40 MHz, the CPU's    10 MHz
 pll80     0x00080400   0x4           0             80 MHz: the PLL at   20 MHz
                                                    480, CORE_CLK_SEL 0
 pll160    0x00080400   0x5           0             80 MHz, as pll80     20 MHz
@@ -3409,9 +3416,8 @@ also the ROM's flash divider and SRAM_CLK's reset value, so S4's and S5's
 writes leave the words the part already holds. No key is refused; a clock
 key the runner has no part's words for is refused by name when a board
 image is built for it (`_psram_case_asm`). The divider for cache fills at
-20 MHz is a later choice, made once P2 has measured the core clock under
-the key the board uses: 4 under `pll80`, and under `rom` 2, 4 or 1 for H1,
-H2 or H3.
+20 MHz follows from the reading P2 measured: 4 under `pll80` and
+`pll160`, 2 under `xtal40`, and 1 (SCLK_EQU_SYSCLK) under `rom`.
 
 A clock change after the bring-up would move every number above with it;
 no image of this tree makes one (§14d's keys run first, in `clock_init`),
@@ -3426,16 +3432,78 @@ millisecond at any CPU clock the part runs (240 MHz at most): fifty times
 the slowest command, and it ends a stuck controller's wait well inside a
 second at the slowest loop rate seen on the part.
 
-**The measurement's reads** are 2 and 10 bytes of the array and no other
-length (`sos_psram_time_reads` stops with 0x61 on any other), not 64: at
-5 MHz a 64-byte read holds the chip select low for 45 to 55 clocks, about
-10 us, longer than any mode-register command and than the cache fill the
-divider is chosen to avoid at that speed; a 10-byte read is about the
-length of a mode-register command. The 8 bytes more are 4 SPI clocks in
-octal DTR, so over 1,000 reads the difference is 4 x 4 x 1,000 core clocks,
-3,200 to 12,800 SYSTIMER ticks at 80 down to 20 MHz, and the core clock in
-MHz is 4 x 4 x 1,000 x 16 over the difference in ticks. The chip's own
-chip-select-low limit is in AP Memory's datasheet, which was not read.
+**The measurement** (`sos_psram_time_reads`; `psram_mode.saw` runs it
+four times and measures the CPU's clock first, with `psram_cpu_passes`)
+finds how many CCOUNT cycles after its start one command ends, from IRAM
+under the gate, by
+bisection: a probe starts the command, spins until CCOUNT has advanced by
+the probe's spin, reads SPI_MEM_CMD(1) once, then waits for the command as
+S7.9 does; the answer is the least spin whose read finds the command
+finished, between 0 and `SPIN_LIMIT` (4096), a command still busy at the
+limit being stop 0x62. The command and the system run from IRAM on one
+crystal, so a command takes the same cycles every time and the bisection's
+error is the spin loop's step, a few cycles. Nothing else is in the
+interval: no flash fetch (the Saw that calls it runs from flash, and an
+instruction-cache fill from the flash, read on one line, takes hundreds of
+SPI clocks), and no polling loop, whose period, a peripheral load and a
+branch, would otherwise round every command's end up to its next read and
+can hide a difference of a few core clocks altogether. There are four
+measurements, each bisected `SEARCHES` (16) times by `psram_mode.saw`:
+
+```
+which  command                                      divider  differs from
+1      array read, 0x0000, dummy 18, 2 bytes        4        -
+2      the same, 10 bytes                           4        1 by 4 SPI clocks
+3      MR0/MR1 read, 0x4040, dummy 8, 2 bytes (S8)  4        -
+4      the same                                     8        3 by N x 4 core
+                                                             clocks
+```
+
+- **The length.** In octal DTR the 8 bytes more are 4 SPI clocks, 16 core
+  clocks at divide by 4: at a CPU of K kHz the core clock is 16 x K over
+  the difference in cycles. That holds if the length reaches the wire: the
+  read's MISO_DLEN(1) is `bits - 1`, `0x4f` for 10 bytes, as IDF's
+  `spimem_flash_ll_set_miso_bitlen` writes it, which the smoke's trace
+  holds; the wire is the part's to show.
+- **The divider.** The MR0/MR1 read at divide by 8 takes 4 core clocks more
+  for each of its N SPI clocks, chip-select setup and hold included, so the
+  difference is N x 4 core clocks whatever the read costs besides. N is 1
+  (command) + 2 (address) + 4 or 8 (dummy, as the controller counts it in
+  DTR) + 1 (data) + 0 to 8 (setup and hold): 8 to 20. The image prints X,
+  the N the difference gives if the core clock is 80 MHz: N under `pll80`,
+  whose core clock is 80 MHz by `SPI_MEM_CORE_CLK_SEL`; under `rom`, N for
+  H2, 2N for H1 and 4N for H3. So `rom`'s X over `pll80`'s is 1, 2 or 4
+  whatever N is, and the two images settle the reading between them.
+
+Expected, by reading, at a 20 MHz CPU under `rom` and 80 MHz under `pll80`
+(core clock C, SPI clock C/4 for the fast measurements, C/8 for the slow
+one):
+
+```
+                   C       length's difference   divider's difference
+rom, H3            20 MHz  16 cycles             N x 4 cycles    X = 4N
+rom, H1            40 MHz   8 cycles             N x 2 cycles    X = 2N
+rom, H2            80 MHz   4 cycles             N cycles        X = N
+pll80              80 MHz  16 cycles             N x 4 cycles    X = N
+```
+
+**The chip select.** AP Memory's datasheet for this chip (APS6408L-OBMx,
+revision 3.9) limits the time chip select stays low, tCEM, to
+8 us at standard temperature (-40 to 85 C; 3 us extended), so that the
+chip can refresh its array; revisions before 3.6 gave 4 us and 1 us. The
+longest of the measurement's commands, at the slowest reading (H3, a
+20 MHz core):
+
+```
+command                         clocks   SPI clock   chip select low
+MR0/MR1 read at divide by 8     8 to 20  2.5 MHz     3.2 to 8.0 us
+array read, 10 bytes, divide 4  17 to 34 5 MHz      3.4 to 6.8 us
+```
+
+Both stay within 8 us; under H1 or H2 they take half or a quarter of it.
+The limit protects the array's contents, which P2 never relies on: the
+measurement reads the mode registers and an array nothing has written, and
+the data it reads is not looked at.
 
 ### 16c. The steps, their writes and their stops
 
@@ -3523,9 +3591,11 @@ S9    MR0 write (0xC0C0, address 0, 16 bits:             IDF s_init_psram_mode_
         again                                            enable (lt 1, latency
                                                          2, drive 0)
 S10   every word S5 saved written back, MISC last
-time  S5, S6; per read a command 0x0000 (address 0,     IDF OPI_PSRAM_SYNC_
-reads   dummy 18, 2 or 10 bytes in); S10                 READ, OCT_PSRAM_RD_
-                                                         DUMMY_BITLEN
+time  S5 at the measurement's clock word, S6; per     IDF OPI_PSRAM_SYNC_
+reads   probe S7 to the start, CCOUNT spun, CMD(1)       READ, OCT_PSRAM_RD_
+        read once, S7.9's wait: 0x0000 (address 0,       DUMMY_BITLEN; the
+        dummy 18, 2 or 10 bytes in) or 0x4040 (address  MR0/MR1 read as S8
+        0, dummy 8, 16 bits in); S10
 ```
 
 S5's write to DDR(1) is the whole of the mode-7 entry of the ROM's
@@ -3573,8 +3643,10 @@ SPI1 is put back before the call returns.
             good die                                                  (S10)
 0x5C S8.2   ... MR2 density = 0x. (N MiB), the board says 0x. (N MiB) (S10)
 0x5D S9.3   ... MR0 = 0x.. after writing 0x28                         (S10)
-0x61 time   ... a timing read of 0x........ bytes; the measurement reads 2
-            or 10                                    (before S5, nothing sent)
+0x61 time   ... a timing measurement 0x........; the measurements are 1
+            to 4                                     (before S5, nothing sent)
+0x62 time   ... SPI1 command 0x.... (name) still busy 4096 cycles after it
+            started, SPI_MEM_CMD = 0x........                         (S10)
 ```
 
 A command's name is `MR0/MR1 read`, `MR2/MR3 read`, `MR4 read`, `MR8 read`,
@@ -3587,8 +3659,10 @@ SPI_MEM_CMD(1) reads busy, because no command of this call is under way
 then: the wait after the previous one read it finished, so the busy word is
 not a transfer of ours to CS1, while at 0x59 the command the call started
 may still be on the bus with CS1 selected. Before S5 nothing on SPI1 has
-changed, so the stops before it need no S10. 0x61 is the measurement's own:
-it asked for a length it never sends.
+changed, so the stops before it need no S10. 0x61 and 0x62 are the
+measurement's own: it was asked for a measurement it does not make, or a
+probe at the spin limit found the command still busy (it then finished, so
+S10 runs).
 
 ### 16d. Nothing in flash: `check_iram`
 
@@ -3656,8 +3730,18 @@ part's, `-m 8M -global ssi_psram.is_octal=true`. Found on these runs:
   every command the flash decodes. On every PSRAM run it is the ROM's one
   at boot, `0xab`; with the gate removed (MISC [1:0] written 0b00) each MR
   read reaches the flash too, as `0x40`.
-- The timing reads finish on host time: the measurement prints a number
-  that means nothing here.
+- A command ends inside the store that starts it, so every bisection of
+  the measurement answers 0 and `psram_mode` prints both differences as
+  not measured. The CPU's kHz is held: the case runs on the emulator's
+  instruction-counted clock (the case key `icount`, `-icount
+  shift=ICOUNT_SHIFT`), where CCOUNT (40 MHz) and SYSTIMER (16 MHz) count
+  the same virtual time, so it reads the same on every run of one image,
+  within a few percent of 40000, and is held to 36000 to 44000
+  (`expect_number`): a unit, a window or an end out of place moves it by a
+  factor. On the host's clock it is host time (`psram_mode_pll80`). What
+  the measurement stores to SPI1 is held all the same: CLOCK(1) at divide
+  by 8, `0x00070307`, and MISO_DLEN(1) at 80 bits, `0x4f`, for the long
+  array read.
 
 **The fault build.** Every register read in `mspi.c` goes through `rd`;
 built with `-DSOS_PSRAM_FAULT`, `rd` consults the DRAM record
@@ -3699,9 +3783,17 @@ cycles).
 ```
 case                              how                                   stop
 psram_identity                    P1; the identity lines; as before      -
-psram_mode                        P2; MR0 0x09 -> 0x28; as before        -
+psram_identity_pll80              the same at `pll80`, the key run first -
+psram_mode                        P2; MR0 0x09 -> 0x28; the four         -
+                                  measurements at 0, SPI1's divide by 8
+                                  and 80-bit length stored; as before
+psram_mode_pll80                  the same at `pll80`, the key run first -
 psram_identity_commands           fault build, no fault: 4 commands,     -
                                   4 answers read
+psram_time_commands               one bisection of the MR0/MR1 read: 14  -
+                                  probes, no answer read, answer 0
+psram_time_bisect                 the same, the probe at spin 2048 read  -
+                                  busy: 13 probes, answer 2049
 psram_pad27_word                  S1 on `0x1b00`: `0x0f00` stored        -
 psram_pad28_word                  S1 on `0x1b80`: `0x0f00` stored        -
 psram_insel2_word                 S1 on `0xbc`: `0x3c` stored            -
@@ -3713,7 +3805,9 @@ psram_stop_record_in_flash        record at 0x3c200000                   0x50
 psram_stop_time_reads_in_flash    the measurement, description in flash  0x50
 psram_stop_expect_past_dram       description at 0x3fcffff0, its end     0x50
                                   past DRAM's
-psram_stop_read_length            the measurement asked for 64 bytes     0x61
+psram_stop_measurement            the measurement asked for number 5     0x61
+psram_stop_still_busy             the first probe, at the spin limit,    0x62
+                                  read busy
 psram_stop_efuse_none             no eFuse file                          0x51
 psram_stop_efuse_16m              PSRAM_CAP 3                            0x51
 psram_stop_efuse_1v8              PSRAM_VENDOR 2                         0x51
@@ -3759,8 +3853,10 @@ an earlier MR0 write; and the measured core clock.
 
 Both images write the PSRAM's pads, SPI0's PSRAM timing and clock, SPI1
 (put back), and, for P2, the chip's MR0; nothing non-volatile. A power
-cycle undoes every one; a chip reset all but MR0, which the next bring-up
-reads at the same dummy either way. They are built with `python3
+cycle undoes every one, and so does a reset through EN (esptool's, or the
+button: `rst:0x1 (POWERON)`), MR0 included: on the part every P1 after a
+P2 and a reset reads MR0 0x09, its power-on value. They are built with
+`python3
 tools/sos_runner.py --board esp32s3 --emit-flash psram_identity|psram_mode
 --clock KEY --out PATH`, the description carrying the part's clock words at
 KEY (§16b).
@@ -3791,27 +3887,69 @@ function to SPIHD and SPIWP with drive 3, their pull-up and input kept;
 select with bit 7 clear. Signals 2 and 3's selects were not read by the probe, so `3c`
 there is the expectation from signals 7 to 11's.
 
-(each wrapped line is one line). MR0 is the chip's power-on value after a
-power cycle and 0x28 after an earlier P2; both are expected.
+(each wrapped line is one line). MR0 is the chip's power-on value, 0x09.
+The part's MR3 is 0x60 (bit 6, VCC 3 V; bit 5, the fast-refresh flag) and
+its MR4 0x40 (write latency code 010, 5, the power-on default), where the
+emulator reads 0x20 for both.
 
-**P2, `psram_mode`.**
+**P2, `psram_mode`.** The measurement of §16b; every number but MR0's is
+the part's:
 
 ```
-SOS psram: MR0=<v> before, 0x28 written, MR0=0x00000028 after
-SOS psram: 1000 reads of 2 bytes took <v> ticks, of 10 bytes <v> ticks
-SOS psram: core clock <v> MHz by 4 clocks x 4 per read
+SOS psram: MR0=0x00000009 before, 0x28 written, MR0=0x00000028 after
+SOS psram: CPU <K> kHz by SYSTIMER, <Y> cycles in <T> ticks; the first
+           pass <K1> kHz, <Y1> cycles in <T1> ticks
+SOS psram: array read ends <A> and <B> cycles after its start for 2 and 10
+           bytes at divide by 4
+SOS psram: MR0/MR1 read ends <C> cycles after its start at divide by 4,
+           <D> at divide by 8
+SOS psram: core clock <F> MHz by 4 SPI clocks x 4 a read
+SOS psram: MR0/MR1 read <X> SPI clocks if the core clock is 80 MHz
 SOS psram: SPI1 MISC=0x00000002 clock=0x00030103 after the call, as before it
 SOS-S3: halt pass
 ```
 
-The core clock it prints names the reading of §16b under KEY: at `rom`, 40,
-80 or 20 MHz is H1, H2 or H3; at `xtal40`, 40 is H1 or H3 and 80 is H2; at
-`pll80` it should be 80. A value far from all of them ends the series until
-it is understood.
+(each wrapped line is one line). K is CCOUNT's advance Y over T of
+SYSTIMER's ticks, at least 80000 (5 ms), times 16000 over T: the second of
+two passes (§16), the first, K1, printed beside it from Y1 and T1, so the
+run shows what a pass that starts cold reads against one that does not.
+A to D are CCOUNT cycles, the mean of 16 bisections; F is 16 x K over 1000 x (B - A) per bisection, and X is
+(D - C) per bisection x 80 over 4 x K / 1000. A difference that is not
+positive prints `core clock not measured: the 10-byte read ended no later`
+or `MR0/MR1 read not measured: it ended no later at divide by 8` in its
+place. Read together:
+
+- `pll80`'s X is the read's N, 8 to 20 (§16b), and its F 80 when the
+  length reaches the wire.
+- `rom`'s X over `pll80`'s is 1, 2 or 4: H2, H1 or H3. Its F, if
+  measured, names the same reading: 80, 40 or 20 MHz. At a 20 MHz CPU the
+  length's 16 core clocks are 16, 8 or 4 cycles, so F's error is a quarter
+  under H3 and grows under the others; X is the deciding number.
+- At `xtal40`, the same with H1 and H3 both 40 MHz.
+- D - C is the part of the MR0/MR1 read at divide by 4 that is SPI
+  clocks, in CPU cycles; beside P1's count for the whole command (setup,
+  start, wait and answer) it says how much of that is the bus.
+
+A ratio far from 1, 2 or 4, or an X outside 8 to 20 at `pll80`, ends the
+series until it is understood.
+
+**The reading is H3.** On the part every interval is the same number of CPU
+cycles at `rom` and at `pll80` (72 and 86, 51 and 107), so the memory-SPI
+core clock moves with the CPU's: at `rom` it is the CPU's clock after the
+pre-divider, 20 MHz, and at `pll80` it is 80 MHz. The MR0/MR1 read is 14
+SPI clocks (`pll80`'s X), 56 cycles of it at divide by 4 against P1's
+0x12b (299) for the whole command; `rom`'s X is 56.0, four times
+`pll80`'s. The length's 4 SPI clocks read 14 cycles where 16 are expected,
+within the bisection's step, so F comes out 91.4 MHz at `pll80` and 22.9 at
+`rom`: H3's 80 and 20, not H1's or H2's. Each first pass reads lower than
+the second, most at `rom` (19290 kHz against 19999), where a cold fetch
+from the one-line flash costs the most cycles; the second pass is the one
+P2 uses.
 
 | image | part |
 |---|---|
-| P1 at `rom` | |
-| P1 after P2 | |
-| P2 at `rom` | |
-| P2 at `pll80` | |
+| P1 at `rom` | MR0 0x09, MR1 0x0d, MR2 0x93, MR3 0x60, MR4 0x40, MR8 0x05; MR0/MR1 read 0x12b CCOUNT cycles; pads and SPI1 as above |
+| P1 at `pll80` | as at `rom`, with `sysclk=0x000a8400`; MR0/MR1 read 0x12b CCOUNT cycles |
+| P1 after P2 and a reset | MR0 0x09; the rest as P1 at `rom` |
+| P2 at `rom` | MR0 0x09 -> 0x28; A 72.0, B 86.0, C 51.0, D 107.0; K 19999 (first pass 19290), F 22.9, X 56.0; H3, the core at 20 MHz |
+| P2 at `pll80` | MR0 0x09 -> 0x28; A 72.0, B 86.0, C 51.0, D 107.0; K 80000 (first pass 79555), F 91.4, X 14.0; H3, the core at 80 MHz |
