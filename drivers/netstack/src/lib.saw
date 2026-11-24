@@ -58,6 +58,32 @@
 //! our address is answered, and a new address is announced with a gratuitous
 //! ARP request.
 //!
+//! # What ARP learns
+//!
+//! An ARP packet's sender is entered in the table, or updated there, only
+//! on these terms:
+//!
+//!   - the packet is a request whose target is our address, or the reply to a
+//!     request we sent, which is a reply whose sender a frame is waiting on;
+//!     any other packet changes nothing and is a counted drop
+//!     (`Drop.ArpUnsolicited`), so a stream of unsolicited replies can
+//!     neither fill the table, evict the gateway's entry nor re-point it, and
+//!     a gratuitous request does not move an entry;
+//!   - a sender protocol address that is not a unicast host on our subnet
+//!     (`ipv4.host_address`, and on `Config.on_link`) is refused
+//!     (`Drop.ArpSenderIp`), except the 0.0.0.0 of a probe, which is
+//!     answered and never learned;
+//!   - a sender hardware address that is zero, the broadcast address, a
+//!     multicast group (the I/G bit) or our own is refused, each with a
+//!     reason of its own (`Drop.ArpSenderZero` and its siblings).
+//!
+//! A host that changes its hardware address is relearned when its entry ages
+//! out (`arp.ENTRY_LIFETIME_MS`) and we ask again, or when it asks for us.
+//!
+//! This is not authentication. A host on the same link can still claim a
+//! neighbor's address in a request for ours, or answer for it before it
+//! does, and poison the table; nothing at this layer prevents that.
+//!
 //! A reply goes to whatever source a received frame names, so replies waiting
 //! on a resolution may hold only `arp.REPLY_FRAMES` of the pending queue, and
 //! a datagram this station sends always finds a slot that no reply can take.
@@ -391,15 +417,27 @@ extension Stack {
     }
 
     /// RFC 826, "Packet Reception", for a station whose one protocol address
-    /// is the interface's.
+    /// is the interface's, with the learning rule in the module docs.
     func receive_arp<S: Sink>(&var self, packet: &[UInt8], now: UInt64,
                               sink: &var S) {
         let p = try arp.Packet(bytes: &packet) catch {
             self.tally.add_drop(error)
             return
         }
+        if p.sender_mac == MacAddr.zero() {
+            self.tally.add_drop(Drop.ArpSenderZero)
+            return
+        }
+        if p.sender_mac.is_broadcast() {
+            self.tally.add_drop(Drop.ArpSenderBroadcast)
+            return
+        }
         if p.sender_mac.is_multicast() {
-            self.tally.add_drop(Drop.ArpBadSender)
+            self.tally.add_drop(Drop.ArpSenderMulticast)
+            return
+        }
+        if p.sender_mac == self.link_addr {
+            self.tally.add_drop(Drop.ArpSenderOwn)
             return
         }
         let ours = self.address()
@@ -408,22 +446,30 @@ extension Stack {
             return
         }
         // A sender of 0.0.0.0 is probing for an address it does not hold yet
-        // (RFC 5227): it is answered, and never entered in the table.
-        // A request or reply for us adds its sender; any other only updates a
-        // sender already known.
-        let for_us = not ours.is_unspecified() && p.target_ip == ours
-        let learned = if p.sender_ip.is_unspecified() {
-            false
-        } else if for_us {
-            self.cache.insert(p.sender_ip, p.sender_mac, now)
-            true
-        } else {
-            self.cache.merge(p.sender_ip, p.sender_mac, now)
+        // (RFC 5227): it is answered, and never entered in the table. Any
+        // other sender must be a unicast host on our subnet.
+        if let cfg = self.settings {
+            if not p.sender_ip.is_unspecified() &&
+               not (cfg.on_link(p.sender_ip) &&
+                    ipv4.host_address(p.sender_ip, cfg.netmask())) {
+                self.tally.add_drop(Drop.ArpSenderIp)
+                return
+            }
         }
-        if learned {
+        // An entry is created or updated only by a request for our address or
+        // by the reply to a request we sent, which a frame waiting on the
+        // sender shows. Any other packet changes nothing.
+        let for_us = not ours.is_unspecified() && p.target_ip == ours
+        let asked = self.pending.requested_at(p.sender_ip) != None
+        if not (for_us && (p.op == arp.ArpOp.Request || asked)) {
+            self.tally.add_drop(Drop.ArpUnsolicited)
+            return
+        }
+        if not p.sender_ip.is_unspecified() {
+            self.cache.insert(p.sender_ip, p.sender_mac, now)
             self.flush(p.sender_ip, p.sender_mac, &var sink)
         }
-        if for_us && p.op == arp.ArpOp.Request {
+        if p.op == arp.ArpOp.Request {
             self.send_arp(arp.ArpOp.Reply, p.sender_mac, p.sender_mac,
                           p.sender_ip, &var sink)
         }

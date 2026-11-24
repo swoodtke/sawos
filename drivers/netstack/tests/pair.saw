@@ -159,8 +159,8 @@ func main() {
     var pa = Port.fresh()
     var pb = Port.fresh()
 
-    // Each announces itself; an announcement teaches a station that does not
-    // hold the address already nothing (RFC 826 merges only).
+    // Each announces itself; an announcement is a request for no one, so it
+    // teaches the other nothing and is counted as unsolicited.
     a.configure(config(ip_a()), &var pa)
     b.configure(config(ip_b()), &var pb)
     check(pump(&var a, &var pa, &var b, &var pb, 0) == 2, "two announcements")
@@ -185,8 +185,8 @@ func main() {
     check(b.count(Count.EchoRepliesSent) == 1 &&
           a.count(Count.EchoRepliesReceived) == 1,
           "counted on both sides")
-    check(dropped(&a, Drop.UdpNoPort, 0) && dropped(&b, Drop.UdpNoPort, 0),
-          "nothing dropped")
+    check(dropped(&a, Drop.ArpUnsolicited, 1) && dropped(&b, Drop.ArpUnsolicited, 1),
+          "only the other's announcement was dropped, as unsolicited")
     pa.got.clear()
 
     // A UDP echo: A's ephemeral socket to B's port 7, and B's server sends
@@ -233,8 +233,9 @@ func main() {
                                                 sequence: 2),
           "the second reply")
 
-    check(dropped(&b, Drop.UdpNoPort, 1),
-          "B dropped only the datagram to the closed port")
-    check(dropped(&a, Drop.IcmpUnhandled, 1), "A dropped only the unreachable")
+    check(b.drops(Drop.UdpNoPort) == 1 && all_drops(&b) == 2,
+          "B dropped only the datagram to the closed port, and the announcement")
+    check(a.drops(Drop.IcmpUnhandled) == 1 && all_drops(&a) == 2,
+          "A dropped only the unreachable, and the announcement")
     check(a.pending_frames() == 0 && b.pending_frames() == 0, "nothing waits")
 }

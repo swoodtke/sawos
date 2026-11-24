@@ -258,6 +258,12 @@ func reply_from_b() -> Frame {
     arp_frame(arp.ArpOp.Reply, mac_a(), mac_b(), ip_b(), mac_a(), ip_a())
 }
 
+/// B asking for A's address.
+func request_from_b() -> Frame {
+    arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_b(), ip_b(),
+              MacAddr.zero(), ip_a())
+}
+
 /// Whether `result` is the refusal `expected`.
 func fails(result: Result<Void, SendError>, expected: SendError) -> Bool {
     match result { case Err(e) -> e == expected, case Ok(_) -> false }
@@ -303,11 +309,11 @@ func stack_a(r: &var Recorder) -> Stack {
     s
 }
 
-/// A, with B resolved at time 0.
+/// A, with B resolved at time 0: B asked for A.
 func stack_a_knowing_b(r: &var Recorder) -> Stack {
     var s = stack_a(&var r)
-    let reply = reply_from_b()
-    s.receive(&reply.bytes[..reply.len], 0, &var r)
+    let request = request_from_b()
+    s.receive(&request.bytes[..request.len], 0, &var r)
     r.clear()
     s
 }
@@ -373,35 +379,53 @@ func arp_answers() {
     check(s.resolved(ip_b(), 0) == mac_b(), "and the asker learned (RFC 826)")
     check(no_drops(&s), "nothing dropped")
 
-    // A request for someone else teaches nothing new and is not answered.
+    // A request for someone else teaches nothing and is not answered.
     r.clear()
     let for_c = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_c(), ip_c(),
                           MacAddr.zero(), ip_b())
     feed(&var s, &for_c, 0, &var r)
-    check(r.sent_only(0) && s.resolved(ip_c(), 0) == None,
-          "a request for another is ignored, its sender not learned")
-    // ... but updates a sender already known.
+    check(dropped(&s, Drop.ArpUnsolicited, 1) && r.sent_only(0) &&
+          s.resolved(ip_c(), 0) == None,
+          "a request for another is a counted drop, its sender not learned")
+    // Nor does it move a sender already known.
     let b_moved = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_c(), ip_b(),
                             MacAddr.zero(), ip_c())
     feed(&var s, &b_moved, 10, &var r)
-    check(r.sent_only(0) && s.resolved(ip_b(), 10) == mac_c(),
-          "a known sender's address is merged")
+    check(dropped(&s, Drop.ArpUnsolicited, 2) && r.sent_only(0) &&
+          s.resolved(ip_b(), 10) == mac_b(), "a known sender is not moved by it")
+    // A gratuitous request is a request for no one.
+    let gratuitous = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_c(),
+                               ip_b(), MacAddr.zero(), ip_b())
+    feed(&var s, &gratuitous, 10, &var r)
+    check(dropped(&s, Drop.ArpUnsolicited, 3) && r.sent_only(0) &&
+          s.resolved(ip_b(), 10) == mac_b(), "nor does a gratuitous request")
+    // A request for us does, and restarts its age.
+    let b_asks = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_c(), ip_b(),
+                           MacAddr.zero(), ip_a())
+    feed(&var s, &b_asks, 10, &var r)
+    check(r.sent_only(1) && s.resolved(ip_b(), 10) == mac_c(),
+          "a request for us updates a known sender")
     check(s.resolved(ip_b(), 10 + arp.ENTRY_LIFETIME_MS - 1) == mac_c(),
           "and its age restarted")
 
-    // A reply to us teaches its sender and is not answered.
+    // A reply to a request we sent teaches its sender and is not answered.
     var r2 = Recorder.fresh()
     var s2 = stack_a(&var r2)
+    let hello: [UInt8; 1] = [0x68]
+    let _ = s2.ping(ip_b(), 1, 1, &hello, 0, &var r2)
+    r2.clear()
     let reply_b = reply_from_b()
     feed(&var s2, &reply_b, 0, &var r2)
-    check(r2.sent_only(0) && s2.resolved(ip_b(), 0) == mac_b(), "a reply is learned")
+    check(r2.sent_only(1) && s2.resolved(ip_b(), 0) == mac_b(),
+          "a reply to our request is learned, and releases the frame")
     // A reply for someone else is not.
     let reply_c = arp_frame(arp.ArpOp.Reply, MacAddr.broadcast(), mac_c(), ip_c(),
                             mac_b(), ip_b())
+    r2.clear()
     feed(&var s2, &reply_c, 0, &var r2)
     check(r2.sent_only(0) && s2.resolved(ip_c(), 0) == None,
           "a reply to another is not")
-    check(no_drops(&s2), "nothing dropped")
+    check(dropped(&s2, Drop.ArpUnsolicited, 1), "and is a counted drop")
 
     // A probe (RFC 5227) is answered and not learned.
     var r3 = Recorder.fresh()
@@ -427,22 +451,150 @@ func arp_answers() {
                               Ipv4Addr.unspecified(), MacAddr.zero(),
                               Ipv4Addr.unspecified())
     feed(&var s4, &anonymous, 0, &var r4)
-    check(r4.sent_only(0) && s4.resolved(ip_b(), 0) == None && no_drops(&s4),
+    check(r4.sent_only(0) && s4.resolved(ip_b(), 0) == None &&
+          dropped(&s4, Drop.ArpUnsolicited, 2),
           "with no address, nothing is ours, not even 0.0.0.0")
+}
+
+func arp_learning() {
+    // A reply nobody asked for creates nothing.
+    var r = Recorder.fresh()
+    var s = stack_a(&var r)
+    let unsolicited = reply_from_b()
+    feed(&var s, &unsolicited, 0, &var r)
+    check(r.sent_only(0) && s.resolved(ip_b(), 0) == None &&
+          dropped(&s, Drop.ArpUnsolicited, 1),
+          "an unsolicited reply is not learned, and is counted")
+
+    // A reply from a host other than the one asked for is not either.
+    let hello: [UInt8; 1] = [0x68]
+    let _ = s.ping(ip_b(), 1, 1, &hello, 0, &var r)
+    r.clear()
+    let from_c = arp_frame(arp.ArpOp.Reply, mac_a(), mac_c(), ip_c(), mac_a(), ip_a())
+    feed(&var s, &from_c, 0, &var r)
+    check(r.sent_only(0) && s.resolved(ip_c(), 0) == None &&
+          s.pending_frames() == 1 && s.drops(Drop.ArpUnsolicited) == 2,
+          "a reply from another host is not learned")
+    // The one asked for is.
+    feed(&var s, &unsolicited, 1, &var r)
+    check(r.sent_only(1) && s.resolved(ip_b(), 1) == mac_b() &&
+          s.pending_frames() == 0, "the reply that was asked for is")
+
+    // Once the wait ended, a late reply is unsolicited again.
+    var r2 = Recorder.fresh()
+    var s2 = stack_a(&var r2)
+    let _ = s2.ping(ip_b(), 1, 1, &hello, 0, &var r2)
+    s2.poll(arp.PENDING_TIMEOUT_MS, &var r2)
+    check(s2.pending_frames() == 0, "the wait ended")
+    r2.clear()
+    feed(&var s2, &unsolicited, arp.PENDING_TIMEOUT_MS, &var r2)
+    check(r2.sent_only(0) && s2.resolved(ip_b(), arp.PENDING_TIMEOUT_MS) == None,
+          "a late reply is not learned")
+
+    // A reply to our request updates an entry that is already there: B's is
+    // old enough to be asked for again, and answers from a new address.
+    var r6 = Recorder.fresh()
+    var s6 = stack_a_knowing_b(&var r6)
+    let later = arp.ENTRY_LIFETIME_MS
+    let _ = s6.ping(ip_b(), 1, 1, &hello, later, &var r6)
+    r6.clear()
+    let moved_reply = arp_frame(arp.ArpOp.Reply, mac_a(), mac_c(), ip_b(), mac_a(),
+                                ip_a())
+    feed(&var s6, &moved_reply, later, &var r6)
+    check(r6.sent_only(1) && s6.resolved(ip_b(), later) == mac_c() &&
+          no_drops(&s6), "a reply to our request moves a known host")
+
+    // A request for another host does not teach its sender.
+    var r3 = Recorder.fresh()
+    var s3 = stack_a(&var r3)
+    let for_b = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_c(), ip_c(),
+                          MacAddr.zero(), ip_b())
+    feed(&var s3, &for_b, 0, &var r3)
+    check(r3.sent_only(0) && s3.resolved(ip_c(), 0) == None,
+          "a request for another is not learned")
+
+    // A table's worth of unsolicited replies evicts nothing: the gateway,
+    // learned from its own request, stays.
+    var r4 = Recorder.fresh()
+    var s4 = stack_a(&var r4)
+    let gw_mac = MacAddr(octets: [0x02, 0, 0, 0, 0, 0xFE])
+    let gw_ask = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), gw_mac,
+                           gateway(), MacAddr.zero(), ip_a())
+    feed(&var s4, &gw_ask, 0, &var r4)
+    var n = 0
+    while n < arp.CACHE_ENTRIES + 2 {
+        let ip = Ipv4Addr(a: 10, b: 0, c: 0, d: (10 + n) as UInt8)
+        let mac = MacAddr(octets: [0x02, 0, 0, 0, 1, n as UInt8])
+        let junk = arp_frame(arp.ArpOp.Reply, mac_a(), mac, ip, mac_a(), ip_a())
+        feed(&var s4, &junk, 1, &var r4)
+        n = n + 1
+    }
+    check(s4.resolved(gateway(), 1) == gw_mac, "the gateway survives the flood")
+    // A reply naming the gateway's address from another hardware address
+    // does not re-point it.
+    let rogue = MacAddr(octets: [0x02, 0, 0, 0, 2, 0x66])
+    let repoint = arp_frame(arp.ArpOp.Reply, mac_a(), rogue, gateway(), mac_a(),
+                            ip_a())
+    feed(&var s4, &repoint, 2, &var r4)
+    check(s4.resolved(gateway(), 2) == gw_mac && r4.sent_only(1),
+          "an unsolicited reply does not re-point the gateway")
+    check(s4.resolved(Ipv4Addr(a: 10, b: 0, c: 0, d: 10), 1) == None &&
+          s4.resolved(Ipv4Addr(a: 10, b: 0, c: 0, d: 11), 1) == None,
+          "and none of the flood is in the table")
+    check(dropped(&s4, Drop.ArpUnsolicited, arp.CACHE_ENTRIES as UInt32 + 3),
+          "all of it was counted as unsolicited")
 }
 
 func arp_refusals() {
     let group = MacAddr(octets: [0x01, 0x00, 0x5E, 0x00, 0x00, 0x02])
-    let bad_sender = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), group, ip_b(),
+    let from_group = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), group, ip_b(),
                                MacAddr.zero(), ip_a())
-    check(refused(&bad_sender, Drop.ArpBadSender), "a group sender")
-    let broadcast_sender = arp_frame(arp.ArpOp.Reply, mac_a(), MacAddr.broadcast(),
-                                     ip_c(), mac_a(), ip_a())
+    check(refused(&from_group, Drop.ArpSenderMulticast), "a multicast sender")
+    let odd = MacAddr(octets: [0x03, 0, 0, 0, 0, 0x0D])
+    let from_odd = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), odd, ip_c(),
+                             MacAddr.zero(), ip_a())
+    check(refused(&from_odd, Drop.ArpSenderMulticast), "the I/G bit alone")
+    let from_broadcast = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(),
+                                   MacAddr.broadcast(), ip_c(), MacAddr.zero(),
+                                   ip_a())
+    check(refused(&from_broadcast, Drop.ArpSenderBroadcast), "a broadcast sender")
+    let from_zero = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(),
+                              MacAddr.zero(), ip_c(), MacAddr.zero(), ip_a())
+    check(refused(&from_zero, Drop.ArpSenderZero), "a zero sender")
+    let from_us = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_a(), ip_c(),
+                            MacAddr.zero(), ip_a())
+    check(refused(&from_us, Drop.ArpSenderOwn), "our own hardware address")
+
+    // A refused packet does not update a known sender either.
     var r = Recorder.fresh()
-    var s = stack_a(&var r)
-    feed(&var s, &broadcast_sender, 0, &var r)
-    check(dropped(&s, Drop.ArpBadSender, 1) && s.resolved(ip_c(), 0) == None,
-          "a broadcast sender is not learned")
+    var s = stack_a_knowing_b(&var r)
+    let hijack = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_a(), ip_b(),
+                           MacAddr.zero(), ip_a())
+    feed(&var s, &hijack, 1, &var r)
+    check(dropped(&s, Drop.ArpSenderOwn, 1) && r.sent_only(0) &&
+          s.resolved(ip_b(), 1) == mac_b(), "a known sender is not moved to us")
+
+    // A sender off the subnet or not a unicast host is refused, whoever
+    // asks and whatever the packet's kind.
+    let bad_ips = [far(), Ipv4Addr.broadcast(), Ipv4Addr(a: 224, b: 0, c: 0, d: 1),
+                   subnet_broadcast(), Ipv4Addr(a: 10, b: 0, c: 0, d: 0),
+                   Ipv4Addr(a: 127, b: 0, c: 0, d: 1)]
+    var i = 0
+    while i < bad_ips.len() {
+        let ip = bad_ips[i]
+        let ask = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_c(), ip,
+                            MacAddr.zero(), ip_a())
+        check(refused(&ask, Drop.ArpSenderIp), "a request from bad sender {i}")
+        let answer = arp_frame(arp.ArpOp.Reply, mac_a(), mac_c(), ip, mac_a(), ip_a())
+        check(refused(&answer, Drop.ArpSenderIp), "a reply from bad sender {i}")
+        i = i + 1
+    }
+    var r5 = Recorder.fresh()
+    var s5 = stack_a(&var r5)
+    let from_far = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_c(), far(),
+                             MacAddr.zero(), ip_a())
+    feed(&var s5, &from_far, 0, &var r5)
+    check(r5.sent_only(0) && s5.resolved(far(), 0) == None, "an off-subnet sender")
 
     let conflict = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_b(), ip_a(),
                              MacAddr.zero(), ip_a())
@@ -926,9 +1078,10 @@ func sends() {
     var r5 = Recorder.fresh()
     var s5 = stack_a(&var r5)
     let sock5 = try! s5.udp_open(7)
-    let gateway_reply = arp_frame(arp.ArpOp.Reply, mac_a(), mac_c(), gateway(), mac_a(),
-                                  ip_a())
-    feed(&var s5, &gateway_reply, 0, &var r5)
+    let gateway_ask = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_c(),
+                                gateway(), MacAddr.zero(), ip_a())
+    feed(&var s5, &gateway_ask, 0, &var r5)
+    r5.clear()
     let _ = s5.udp_send(sock5.id, SocketAddr(addr: far(), port: 9), &data, 0, &var r5)
     let routed = r5.frames[0]
     check(r5.sent_only(1) && MacAddr(bytes: &routed.bytes, at: 0) == mac_c() &&
@@ -943,7 +1096,7 @@ func sends() {
     check(fails(s3.udp_send(sock3.id, to_b, &data, 0, &var r3), SendError.LinkFull),
           "a full device")
     check(dropped(&s3, Drop.TxFull, 1) && s3.count(Count.DatagramsSent) == 0 &&
-          s3.count(Count.FramesSent) == 1, "is a counted drop, the frame unsent")
+          s3.count(Count.FramesSent) == 2, "is a counted drop, the frame unsent")
 
     // Identifications wrap after the last.
     r3.clear()
@@ -1075,8 +1228,8 @@ func stack_alone(r: &var Recorder) -> Stack {
     let alone = try! ipv4.Config(addr: ip_a(), netmask: mask24(),
                                  gateway: Ipv4Addr.unspecified())
     s.configure(alone, &var r)
-    let reply = reply_from_b()
-    s.receive(&reply.bytes[..reply.len], 0, &var r)
+    let request = request_from_b()
+    s.receive(&request.bytes[..request.len], 0, &var r)
     r.clear()
     s
 }
@@ -1117,8 +1270,8 @@ func refused_replies() {
     let request = arp_frame(arp.ArpOp.Request, MacAddr.broadcast(), mac_b(),
                             ip_b(), MacAddr.zero(), ip_a())
     feed(&var s2, &request, 0, &var r2)
-    check(dropped(&s2, Drop.TxFull, 2) && s2.count(Count.ArpRepliesSent) == 0,
-          "nor an ARP reply")
+    check(dropped(&s2, Drop.TxFull, 2) && s2.count(Count.ArpRepliesSent) == 1,
+          "nor an ARP reply, beyond the one the setup sent")
     feed(&var s2, &near, 1000, &var r2)
     check(s2.drops(Drop.TxFull) == 3 && s2.count(Count.UnreachablesSent) == 0,
           "nor an unreachable")
@@ -1217,6 +1370,7 @@ func readdressed() {
 func main() {
     announcements()
     arp_answers()
+    arp_learning()
     arp_refusals()
     ethernet_refusals()
     ipv4_refusals()
