@@ -1,0 +1,91 @@
+// The caller-misuse panics of an `Endpoint`, each pinned by a child: the test
+// runs itself with a mode argument, the child commits one misuse over a real
+// ring, and the parent checks that the child failed with that panic's message
+// and that a child making no misuse does not. A peer's bad value is never one
+// of these: those are the counted errors of `input`.
+
+import pktring.{Endpoint, Layout, SharedWindow}
+import std.env.{Env}
+import std.process.{Command}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func window(mem: &var [UInt32; 64], l: &Layout) unsafe -> SharedWindow {
+    SharedWindow(at: (&var mem) as UnsafePointer<UInt32>, bytes: l.bytes())
+}
+
+/// The child: one ring of 16-byte slots, and the misuse `mode` names.
+func child(mode: String) unsafe {
+    let l = try! Layout(slot_bytes: 16, to_server: 4, to_client: 4)
+    var mem: [UInt32; 64] = [0; 64]
+    var e = Endpoint.server_laid_out(window(&var mem, &l), l)
+    let p: [UInt8; 16] = [0; 16]
+    var short: [UInt8; 8] = [0; 8]
+    if mode.equals("release_taken") {
+        // Nothing was taken.
+        let _ = e.release_taken(1)
+    } else if mode.equals("fill") {
+        // Nothing was reserved.
+        let _ = e.fill(4)
+    } else if mode.equals("send") {
+        // A reserved slot is not filled.
+        let _ = e.reserve()
+        let _ = e.send(&p, 4)
+    } else if mode.equals("receive") {
+        // The buffer is shorter than a slot.
+        let _ = e.receive(&var short)
+    } else {
+        // Every call within its contract.
+        let _ = e.reserve()
+        let _ = e.fill(4)
+        let _ = e.send(&p, 4)
+        let _ = e.release_taken(0)
+    }
+    print("child done")
+}
+
+/// The output of this program run as a child in `mode`, standard error
+/// merged, and whether it exited with a failure.
+struct Ran {
+    out: String,
+    failed: Bool,
+}
+
+func run(mode: String) unsafe -> Ran {
+    let me = try! Env.executable_path()
+    var cmd = Command(program: me)
+    try! cmd.arg(mode)
+    cmd.merge_stderr()
+    let out = try! cmd.output()
+    Ran(out: out.stdout, failed: out.exit_code != 0)
+}
+
+func panics_with(mode: String, message: String) unsafe -> Bool {
+    let ran = run(mode)
+    ran.failed && ran.out.contains(message)
+}
+
+func main() unsafe {
+    if Env.argument_count() > 1 {
+        let mode = try! Env.argument(1)
+        child(mode!)
+        return
+    }
+    let calm = run("none")
+    check(not calm.failed && calm.out.contains("child done"),
+          "a child within the contract finishes")
+    check(panics_with("release_taken", "Endpoint.release_taken: more than were taken"),
+          "release_taken past what was taken panics")
+    check(panics_with("fill", "Endpoint.fill: no slot is reserved"),
+          "fill with no reserved slot panics")
+    check(panics_with("send", "Endpoint.send: a slot is reserved and not filled"),
+          "send with a slot reserved and not filled panics")
+    check(panics_with("receive", "Endpoint.receive: buffer shorter than a slot"),
+          "receive into a buffer shorter than a slot panics")
+}

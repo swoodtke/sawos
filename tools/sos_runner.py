@@ -14099,9 +14099,9 @@ TEST_CASES = [
                 ("pktring.SharedWindow", ["base", "bytes"]),
                 ("pktring.Endpoint<pktring.SharedWindow>",
                  ["memory", "shape", "fills", "out_head", "out_published",
-                  "out_tail", "drains", "in_tail", "in_released", "in_head",
-                  "failed"]),
-                ("netdevproto.Frame", ["count", "body"]),
+                  "out_tail", "out_reserved", "drains", "in_tail",
+                  "in_released", "in_head", "failed"]),
+                ("netdevproto.Frame", ["count", "body", "handle_count"]),
                 ("hciproto.Frame", ["count", "body"]),
                 ("wlanproto.Frame", ["count", "body"]),
                 ("sockproto.Frame", ["count", "body"]),
@@ -14128,7 +14128,10 @@ TEST_CASES = [
             "len: UInt, layout: &pktring.Layout) [pktring]",
             "`Endpoint` has no `init` this module can call, and its fields "
             "are not all visible here",
-            "no parameter is labeled `count` in Frame.init",
+            "no candidate takes these arguments; the candidates are "
+            "Frame.init(len: UInt, body: [UInt8; 128]) [netdevproto]; "
+            "Frame.init(len: UInt, body: [UInt8; 128], handles: UInt) "
+            "[netdevproto]",
             "no parameter is labeled `src_port` in Header.init(datagram:",
             "no parameter is labeled `ihl_bytes` in Header.init(packet:",
             "`RateLimit` has no `init` this module can call, and its fields "

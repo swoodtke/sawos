@@ -1,6 +1,7 @@
 // Every request, reply and event built, decoded and compared with what was
 // built; and each malformed message refused by name, with the status a
-// driver answers it.
+// driver answers it. A request carries no handle, and an `Attach` answer
+// carries the ring's.
 
 import netdevproto.{AttachInfo, BODY_BYTES, Frame, NetdevBody, NetdevError, NetdevEvent,
                     NetdevRequest, NetdevStats, NetdevStatus, WireError, attach_reply,
@@ -18,6 +19,12 @@ func check(ok: Bool, what: String) {
 /// The message `body` holds, `len` bytes of it.
 func frame(body: &NetdevBody, len: UInt) -> Frame {
     try! Frame(len: len, body: body.bytes)
+}
+
+/// The message `body` holds, `len` bytes of it, that came with `handles`
+/// handles.
+func frame_with(body: &NetdevBody, len: UInt, handles: UInt) -> Frame {
+    try! Frame(len: len, body: body.bytes, handles: handles)
 }
 
 /// A message of `len` bytes: byte 0 `first`, the rest `fill`.
@@ -101,6 +108,21 @@ func requests() {
     n = b.rx_return(SlotRange(first: 0, count: 257))
     check(refused(&frame(&b, n), WireError.Range(0, 257)), "a range past any ring")
 
+    // A request carries no handle, whatever its op.
+    n = b.attach(8, 16)
+    check(refused(&frame_with(&b, n, 1), WireError.Handles(1)), "Attach with the ring")
+    check(refused(&frame_with(&b, n, 2), WireError.Handles(2)), "Attach with two handles")
+    check(request_is(&frame_with(&b, n, 0), NetdevRequest.Attach(8, 16)), "Attach with none")
+    n = b.tx(SlotRange(first: 1, count: 1))
+    check(refused(&frame_with(&b, n, 1), WireError.Handles(1)), "Tx with a handle")
+    n = b.rx_return(SlotRange(first: 1, count: 1))
+    check(refused(&frame_with(&b, n, 1), WireError.Handles(1)), "RxReturn with a handle")
+    n = b.wait_event()
+    check(refused(&frame_with(&b, n, 1), WireError.Handles(1)), "WaitEvent with a handle")
+    n = b.stats()
+    check(refused(&frame_with(&b, n, 1), WireError.Handles(1)), "Stats with a handle")
+    check(WireError.Handles(1).status() == NetdevStatus.BadOp, "a handle is BadOp")
+
     check(WireError.NoBytes.status() == NetdevStatus.BadOp &&
           WireError.UnknownOp(9).status() == NetdevStatus.BadOp &&
           WireError.Length(3).status() == NetdevStatus.BadOp, "a shape is BadOp")
@@ -112,37 +134,50 @@ func replies() {
     var r = NetdevBody.empty()
     let info = AttachInfo(mac: [2, 0, 0, 0, 0, 1], mtu: 1500, to_server: 8, to_client: 16)
     var n = r.ok_attach(&info)
-    check(match attach_reply(&frame(&r, n)) { case Ok(got) -> got == info, case Err(_) -> false },
+    check(match attach_reply(&frame_with(&r, n, 1)) { case Ok(got) -> got == info,
+                                                      case Err(_) -> false },
           "an Attach answer round trip")
     let biggest = AttachInfo(mac: [0xFF; 6], mtu: 2034, to_server: 256, to_client: 1)
     n = r.ok_attach(&biggest)
-    check(match attach_reply(&frame(&r, n)) { case Ok(got) -> got == biggest,
-                                              case Err(_) -> false },
+    check(match attach_reply(&frame_with(&r, n, 1)) { case Ok(got) -> got == biggest,
+                                                      case Err(_) -> false },
           "the largest MTU a slot holds")
     let mtu = AttachInfo(mac: [0; 6], mtu: 2035, to_server: 8, to_client: 8)
     n = r.ok_attach(&mtu)
-    check(is_err(attach_reply(&frame(&r, n)), malformed(WireError.Mtu(2035))),
+    check(is_err(attach_reply(&frame_with(&r, n, 1)), malformed(WireError.Mtu(2035))),
           "an MTU past the slot")
     let none = AttachInfo(mac: [0; 6], mtu: 1500, to_server: 0, to_client: 8)
     n = r.ok_attach(&none)
-    check(is_err(attach_reply(&frame(&r, n)), malformed(WireError.SlotCount(0))),
+    check(is_err(attach_reply(&frame_with(&r, n, 1)), malformed(WireError.SlotCount(0))),
           "an Attach answer of no slots")
     let many = AttachInfo(mac: [0; 6], mtu: 1500, to_server: 8, to_client: 300)
     n = r.ok_attach(&many)
-    check(is_err(attach_reply(&frame(&r, n)), malformed(WireError.SlotCount(300))),
+    check(is_err(attach_reply(&frame_with(&r, n, 1)), malformed(WireError.SlotCount(300))),
           "an Attach answer of too many slots")
     n = r.ok_attach(&info)
-    check(is_err(attach_reply(&frame(&r, n - 1)), malformed(WireError.Length(12))),
+    check(is_err(attach_reply(&frame_with(&r, n - 1, 1)), malformed(WireError.Length(12))),
           "an Attach answer cut short")
-    check(is_err(attach_reply(&frame(&r, n + 1)), malformed(WireError.Length(14))),
+    check(is_err(attach_reply(&frame_with(&r, n + 1, 1)), malformed(WireError.Length(14))),
           "an Attach answer too long")
     n = r.refuse(NetdevStatus.Attached)
     check(is_err(attach_reply(&frame(&r, n)), NetdevError.Refused(NetdevStatus.Attached)),
           "an Attach refused")
     check(is_err(attach_reply(&message(2, 2, 0)), malformed(WireError.Length(2))),
           "a refusal with a byte")
-    check(is_err(attach_reply(&message(1, 6, 0)), malformed(WireError.UnknownStatus(6))),
-          "status 6")
+    check(is_err(attach_reply(&message(1, 7, 0)), malformed(WireError.UnknownStatus(7))),
+          "status 7")
+    n = r.refuse(NetdevStatus.NoMemory)
+    check(is_err(attach_reply(&frame(&r, n)), NetdevError.Refused(NetdevStatus.NoMemory)),
+          "an Attach refused for want of memory")
+    check(is_err(attach_reply(&frame_with(&r, n, 1)), malformed(WireError.Handles(1))),
+          "a refusal that carries the ring")
+    n = r.ok_attach(&info)
+    check(is_err(attach_reply(&frame(&r, n)), malformed(WireError.Handles(0))),
+          "an Attach answer without the ring")
+    check(is_err(attach_reply(&frame_with(&r, n, 2)), malformed(WireError.Handles(2))),
+          "an Attach answer with two handles")
+    check(is_err(attach_reply(&frame_with(&r, n - 1, 0)), malformed(WireError.Length(12))),
+          "a short answer is a length before it is a handle")
     check(is_err(attach_reply(&message(0, 0, 0)), malformed(WireError.NoBytes)),
           "a reply of no bytes")
 
@@ -182,6 +217,12 @@ func replies() {
           "event 0")
     check(is_err(event_reply(&message(1, 0, 0)), malformed(WireError.Length(1))),
           "Ok with no event")
+    n = r.ok_event(&NetdevEvent.RxReady(SlotRange(first: 3, count: 4)))
+    check(is_err(event_reply(&frame_with(&r, n, 1)), malformed(WireError.Handles(1))),
+          "RxReady with a handle")
+    n = r.ok_event(&NetdevEvent.LinkUp)
+    check(is_err(event_reply(&frame_with(&r, n, 1)), malformed(WireError.Handles(1))),
+          "LinkUp with a handle")
     n = r.refuse(NetdevStatus.Busy)
     check(is_err(event_reply(&frame(&r, n)), NetdevError.Refused(NetdevStatus.Busy)),
           "a WaitEvent refused")
@@ -196,6 +237,8 @@ func replies() {
           "a Stats answer round trip")
     check(is_err(stats_reply(&frame(&r, n - 1)), malformed(WireError.Length(20))),
           "a Stats answer cut short")
+    check(is_err(stats_reply(&frame_with(&r, n, 1)), malformed(WireError.Handles(1))),
+          "a Stats answer with a handle")
     n = r.refuse(NetdevStatus.NotAttached)
     check(is_err(stats_reply(&frame(&r, n)), NetdevError.Refused(NetdevStatus.NotAttached)),
           "Stats before Attach")
@@ -205,6 +248,8 @@ func replies() {
     check(match empty_reply(&frame(&r, n)) { case Ok(_) -> true, case Err(_) -> false },
           "Ok alone")
     check(is_err(empty_reply(&frame(&r, 2)), malformed(WireError.Length(2))), "Ok and a byte")
+    check(is_err(empty_reply(&frame_with(&r, n, 1)), malformed(WireError.Handles(1))),
+          "Ok and a handle")
     n = r.refuse(NetdevStatus.BadArg)
     check(is_err(empty_reply(&frame(&r, n)), NetdevError.Refused(NetdevStatus.BadArg)),
           "a Tx refused")
@@ -215,6 +260,16 @@ func replies() {
 }
 
 func frames() {
+    // A frame knows how many handles came with it.
+    check(match Frame(len: 1, body: [0; BODY_BYTES]) { case Ok(f) -> f.handles() == 0,
+                                                        case Err(_) -> false },
+          "a frame with no handles")
+    check(match Frame(len: 1, body: [0; BODY_BYTES], handles: 3) {
+              case Ok(f) -> f.handles() == 3 && f.len() == 1, case Err(_) -> false },
+          "a frame with handles")
+    check(match Frame(len: 129, body: [0; BODY_BYTES], handles: 1) {
+              case Ok(_) -> false, case Err(e) -> e == WireError.Length(129) },
+          "a frame with handles past the body")
     // A frame is at most a body.
     let body: [UInt8; BODY_BYTES] = [7; BODY_BYTES]
     check(match Frame(len: 128, body: body) { case Ok(f) -> f.len() == 128 && f.bytes()[127] == 7,

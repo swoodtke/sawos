@@ -93,6 +93,30 @@
 //! protection grain, and one the board cannot give a process (the ESP32-S3's
 //! flash rows), and the server treats that refusal as it does `ShortMemory`.
 //!
+//! # A ring the server lays out
+//!
+//! A server that allocates the ring itself lays it out before it gives the
+//! memory away (`Endpoint.server_laid_out`, which stores all four index
+//! words), and may fill the ring it fills before the client has the memory.
+//! The client takes the ring it was given with `Endpoint.client_given`, which
+//! stores nothing, and checks the memory as it checks any ring it is given: it
+//! holds `MemoryRight.Map`, its mapping is no shorter than the layout.
+//!
+//! # In place
+//!
+//! `send` and `receive` copy a packet through the end. A peer that moves
+//! packet bytes some other way, as a device does through DMA, names a slot
+//! in place instead: `take` and `reserve` answer a `SlotRef`, the slot's
+//! number and offset in the ring's memory, after the same checks. The drain
+//! side's cursor is shared: `take` and `receive` both advance it, `release`
+//! gives back every slot taken since the last release, and `release_taken`
+//! the oldest few, so slots are released in the order they were completed.
+//! The fill side has a cursor beside `send`'s: `reserve` hands out the next
+//! free slot, `fill` states a reserved slot's length in the order they were
+//! reserved, and `publish` shows every slot filled. A slot is the device's
+//! between `reserve` and `fill`, so `send` while one is reserved and not
+//! filled is a caller's bug.
+//!
 //! # Doorbells
 //!
 //! A message that says slots were filled or freed is a doorbell. The index
@@ -340,6 +364,20 @@ extension SlotRange {
 // Shared memory
 // =============================================================================
 
+/// A slot named in place: where its bytes are in the ring's memory.
+public struct SlotRef {
+    /// The slot's number in its ring.
+    public slot: UInt32,
+    /// The offset of the slot's first byte in the ring's memory.
+    public offset: UInt,
+    /// The bytes the slot holds: the length word as read once and checked by
+    /// `take`, and 0 from `reserve`, whose slot is not yet written.
+    public len: UInt,
+}
+
+@synthesize
+extension SlotRef: Equatable {}
+
 /// The ring's memory, word by word: what an `Endpoint` reads and writes
 /// through. An offset is a byte offset, a multiple of `WORD_BYTES`, and the
 /// word is inside the ring's `Layout.bytes()`; the `Endpoint` computes every
@@ -567,8 +605,11 @@ public struct Endpoint<M: Shared> {
     private out_head: UInt32,
     private out_published: UInt32,
     private out_tail: UInt32,
+    // Past the slots `reserve` handed out. It is `out_head` unless a slot is
+    // reserved and not yet filled.
+    private out_reserved: UInt32,
     // The ring this side drains. Its tail is ours: `in_tail` is past the
-    // slots received, `in_released` past those released. `in_head` is the
+    // slots taken, `in_released` past those released. `in_head` is the
     // peer's head as last read and checked.
     private drains: Ring,
     private in_tail: UInt32,
@@ -600,6 +641,25 @@ extension Endpoint<M: Shared> {
         e
     }
 
+    /// The server's end of a ring it allocated and lays out itself: every
+    /// index word is stored zero, so the ring starts empty. The server does
+    /// this before it gives the memory to the client.
+    public static func server_laid_out(memory: M, layout: Layout) -> Endpoint<M> {
+        var e = Endpoint.fresh(move memory, layout, Side.Server)
+        e.memory.store(layout.head_offset(Ring.ToServer), 0)
+        e.memory.store(layout.tail_offset(Ring.ToServer), 0)
+        e.memory.store(layout.head_offset(Ring.ToClient), 0)
+        e.memory.store(layout.tail_offset(Ring.ToClient), 0)
+        e
+    }
+
+    /// The client's end of a ring the server laid out and gave it. It stores
+    /// nothing, since the server may already have published, and trusts
+    /// nothing the memory holds.
+    public static func client_given(memory: M, layout: Layout) -> Endpoint<M> {
+        Endpoint.fresh(move memory, layout, Side.Client)
+    }
+
     static func fresh(memory: M, layout: Layout, side: Side) -> Endpoint<M> {
         let out_ring = match side {
             case Client -> Ring.ToServer,
@@ -611,6 +671,7 @@ extension Endpoint<M: Shared> {
         }
         Endpoint(memory: move memory, shape: layout,
                  fills: out_ring, out_head: 0, out_published: 0, out_tail: 0,
+                 out_reserved: 0,
                  drains: in_ring, in_tail: 0, in_released: 0, in_head: 0,
                  failed: None)
     }
@@ -665,12 +726,12 @@ extension Endpoint<M: Shared> {
     }
 
     /// How many slots of the ring this end fills are free, reading the peer's
-    /// tail afresh.
+    /// tail afresh. A reserved slot is not free.
     public func room(&var self) -> Result<UInt32, RingError> {
         if let f = self.failed { return f }
         try self.read_out_tail()
         let n = self.shape.slots(self.fills)
-        return n - filled(n, self.out_head, self.out_tail)
+        return n - filled(n, self.out_reserved, self.out_tail)
     }
 
     /// Writes the first `len` bytes of `packet` into the next free slot and
@@ -679,10 +740,14 @@ extension Endpoint<M: Shared> {
     /// The peer's tail is read again only when the slots it last freed are
     /// all filled. `len` past the slot size is `TooLong`, and no free slot is
     /// `Full`; both leave the ring as it was. `len` past `packet` is a
-    /// caller's bug, and panics.
+    /// caller's bug, and panics, as does a slot `reserve` handed out and
+    /// `fill` has not filled.
     public func send<const N: Int>(&var self, packet: &[UInt8; N],
                                    len: UInt) -> Result<UInt32, RingError> {
         if let f = self.failed { return f }
+        if self.out_reserved != self.out_head {
+            panic("Endpoint.send: a slot is reserved and not filled")
+        }
         if len > N as UInt {
             panic("Endpoint.send: length out of range: {} (len {})", len, N)
         }
@@ -706,6 +771,44 @@ extension Endpoint<M: Shared> {
             self.memory.store(at + (i as UInt), word)
             i = i + 4
         }
+        self.memory.store(self.shape.length_offset(self.fills, slot), len as UInt32)
+        self.out_head = next_index(n, self.out_head)
+        self.out_reserved = self.out_head
+        return slot
+    }
+
+    /// The next free slot of the ring this end fills, named in place and not
+    /// written: its length is stated at `fill`, and the peer sees nothing of
+    /// it until `publish`. `SlotRef.len` is 0.
+    ///
+    /// The peer's tail is read again only when the slots it last freed are
+    /// all reserved. No free slot is `Full`, and leaves the ring as it was.
+    public func reserve(&var self) -> Result<SlotRef, RingError> {
+        if let f = self.failed { return f }
+        let n = self.shape.slots(self.fills)
+        if filled(n, self.out_reserved, self.out_tail) == n {
+            try self.read_out_tail()
+            if filled(n, self.out_reserved, self.out_tail) == n { return RingError.Full }
+        }
+        let slot = slot_of(n, self.out_reserved)
+        self.out_reserved = next_index(n, self.out_reserved)
+        return SlotRef(slot: slot, offset: self.shape.slot_offset(self.fills, slot),
+                       len: 0)
+    }
+
+    /// Writes `len` as the length word of the oldest reserved slot not yet
+    /// filled, which marks it filled, and answers the slot; `publish` then
+    /// shows it to the peer. `len` past the slot size is `TooLong` and leaves
+    /// the slot reserved. No reserved slot to fill is a caller's bug, and
+    /// panics.
+    public func fill(&var self, len: UInt) -> Result<UInt32, RingError> {
+        if let f = self.failed { return f }
+        if self.out_head == self.out_reserved {
+            panic("Endpoint.fill: no slot is reserved")
+        }
+        if len > self.shape.slot_size as UInt { return RingError.TooLong(len) }
+        let n = self.shape.slots(self.fills)
+        let slot = slot_of(n, self.out_head)
         self.memory.store(self.shape.length_offset(self.fills, slot), len as UInt32)
         self.out_head = next_index(n, self.out_head)
         return slot
@@ -753,20 +856,16 @@ extension Endpoint<M: Shared> {
         return SlotRange(first: slot_of(n, self.in_tail) as UInt16, count: count as UInt16)
     }
 
-    /// Copies the next filled slot into `into` and answers its length. The
-    /// slots are the ones the last `poll` found: with none left, it is
-    /// `Empty`, and it reads nothing.
+    /// The next filled slot of the ring this end drains, named in place and
+    /// not copied. The slots are the ones the last `poll` found: with none
+    /// left, it is `Empty`, and it reads nothing.
     ///
     /// The length word is read once and checked against the slot size, and
-    /// the bytes are copied with that length; nothing in the slot is read
-    /// again. `into` shorter than a slot is a caller's bug, and panics.
-    public func receive<const N: Int>(&var self,
-                                      into: &var [UInt8; N]) -> Result<UInt, RingError> {
+    /// `SlotRef.len` is that checked value; nothing in the slot is read.
+    /// The slot stays the peer's to refill only once `release` or
+    /// `release_taken` gives it back.
+    public func take(&var self) -> Result<SlotRef, RingError> {
         if let f = self.failed { return f }
-        if (N as UInt) < (self.shape.slot_size as UInt) {
-            panic("Endpoint.receive: buffer shorter than a slot: {} (slot {})", N,
-                  self.shape.slot_size as UInt)
-        }
         let n = self.shape.slots(self.drains)
         if self.in_tail == self.in_head { return RingError.Empty }
         let slot = slot_of(n, self.in_tail)
@@ -774,8 +873,24 @@ extension Endpoint<M: Shared> {
         if length > self.shape.slot_size {
             return self.fail(RingError.LengthPastSlot(length))
         }
-        let at = self.shape.slot_offset(self.drains, slot)
-        let count = length as Int
+        self.in_tail = next_index(n, self.in_tail)
+        return SlotRef(slot: slot, offset: self.shape.slot_offset(self.drains, slot),
+                       len: length as UInt)
+    }
+
+    /// Copies the next filled slot into `into` and answers its length: `take`
+    /// and a copy of the slot's checked length. `into` shorter than a slot is
+    /// a caller's bug, and panics.
+    public func receive<const N: Int>(&var self,
+                                      into: &var [UInt8; N]) -> Result<UInt, RingError> {
+        if let f = self.failed { return f }
+        if (N as UInt) < (self.shape.slot_size as UInt) {
+            panic("Endpoint.receive: buffer shorter than a slot: {} (slot {})", N,
+                  self.shape.slot_size as UInt)
+        }
+        let taken = try self.take()
+        let at = taken.offset
+        let count = taken.len as Int
         var i = 0
         while i < count {
             let word = self.memory.load(at + (i as UInt))
@@ -786,21 +901,35 @@ extension Endpoint<M: Shared> {
             }
             i = i + 4
         }
-        self.in_tail = next_index(n, self.in_tail)
-        return length as UInt
+        return taken.len
     }
 
-    /// Stores this end's tail, so the peer may fill again every slot
-    /// `receive` took since the last `release`, and answers those slots for
-    /// the doorbell. None is `Empty`.
+    /// Stores this end's tail, so the peer may fill again every slot taken
+    /// since the last release, and answers those slots for the doorbell. None
+    /// is `Empty`.
     public func release(&var self) -> Result<SlotRange, RingError> {
         if let f = self.failed { return f }
         let n = self.shape.slots(self.drains)
-        let count = filled(n, self.in_tail, self.in_released)
+        return self.release_taken(filled(n, self.in_tail, self.in_released))
+    }
+
+    /// Stores a tail that gives back the oldest `count` slots taken and not
+    /// yet released, and answers them for the doorbell. A `count` of none is
+    /// `Empty`; more than are taken and unreleased is a caller's bug, and
+    /// panics.
+    public func release_taken(&var self, count: UInt32) -> Result<SlotRange, RingError> {
+        if let f = self.failed { return f }
+        let n = self.shape.slots(self.drains)
+        let taken = filled(n, self.in_tail, self.in_released)
+        if count > taken {
+            panic("Endpoint.release_taken: more than were taken: {} (taken {})",
+                  count as UInt, taken as UInt)
+        }
         if count == 0 { return RingError.Empty }
         let first = slot_of(n, self.in_released)
-        self.memory.store(self.shape.tail_offset(self.drains), self.in_tail)
-        self.in_released = self.in_tail
+        let released = advance_index(n, self.in_released, count)
+        self.memory.store(self.shape.tail_offset(self.drains), released)
+        self.in_released = released
         return SlotRange(first: first as UInt16, count: count as UInt16)
     }
 }
