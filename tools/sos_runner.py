@@ -19472,6 +19472,23 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "SOS masked: copy_in 128 bytes, PSRAM, lines held: min ",
             "SOS masked: copy_out 128 bytes, PSRAM, lines evicted: min ",
             "SOS masked: copy_out 128 bytes, SRAM: min "]),
+        # The SYSTIMER read's costs: every number is host time here, so
+        # only the lines are held.
+        r8("systimer_read", "systimer_read.saw", [
+            "SOS systimer: before conf=",
+            "SOS systimer: cpu ",
+            *[f"SOS systimer: {name} min=" for name in (
+                "now x1 cycles", "now x10 cycles",
+                "UPDATE to VALUE_VALID cycles",
+                "UPDATE to VALUE_VALID polls",
+                "VALUE_LO moved with no UPDATE, 1000 cycles apart",
+                "100 us spin, ticks between snapshots",
+                "100 us spin, spin cycles",
+                "100 us spin, cycles snapshot to snapshot",
+                "1 ms spin, ticks between snapshots",
+                "1 ms spin, spin cycles",
+                "1 ms spin, cycles snapshot to snapshot")],
+            "SOS systimer: after conf="]),
         # P7: a description of 16 MiB on the 8 MiB part's eFuse stops at
         # S0.1, before any command; nothing is published.
         r8_stop("psram_wrong_size", "psram_wrong_size.saw", 0x51, [

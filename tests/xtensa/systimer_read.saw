@@ -1,0 +1,225 @@
+// What a SYSTIMER read costs, in CCOUNT cycles, on the board
+// (../../hal/xtensa-esp32s3/ABI.md §6a, the SYSTIMER read probe): the clock
+// key's `clock_init`, then five measurements. Each is taken over 8 rounds
+// and printed as its least and greatest value.
+//
+//   1. `timer_now_ns`, the kernel's own read, once and ten back to back;
+//   2. the UPDATE write to UNIT0_OP up to VALUE_VALID read set, in cycles,
+//      and the number of reads of UNIT0_OP that took;
+//   3. UNIT0_VALUE_LO read, 1,000 CCOUNT cycles pass, and read again with
+//      no UPDATE between: how far it moved;
+//   4. two snapshots of the count with a CCOUNT spin between them, one of
+//      100 us at the CPU clock `psram_cpu_passes` measures and one of ten
+//      times that: the ticks between the snapshots, the cycles of the spin,
+//      and the cycles from before the first snapshot to after the second.
+//      Nothing polls in a loop but the handshake's own VALUE_VALID wait;
+//   5. SYSTIMER's CONF, UNIT0_OP and TARGET0_CONF words (the block has no
+//      UNIT0_CONF) before `Systimer.start` and after the rounds.
+//
+// The only register written is CONF, as `Systimer.start` writes it, and
+// UNIT0_OP's UPDATE. Every number is printed for the record and none is
+// held: on the emulator they follow host time.
+//
+//   SOS systimer: cpu <k> kHz
+//   SOS systimer: before conf=... unit0_op=... target0_conf=...
+//   SOS systimer: now x1 cycles min=... max=...
+//   ... (one line for each measurement)
+//   SOS systimer: after conf=... unit0_op=... target0_conf=...
+//   SOS-S3: halt pass
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_ccount_read() -> UInt
+}
+
+/// SYSTIMER's registers (soc/esp32s3/register/soc/systimer_reg.h).
+static SYSTIMER_CONF: UInt = 0x6002_3000
+static SYSTIMER_UNIT0_OP: UInt = 0x6002_3004
+static SYSTIMER_TARGET0_CONF: UInt = 0x6002_3034
+static SYSTIMER_UNIT0_VALUE_HI: UInt = 0x6002_3040
+static SYSTIMER_UNIT0_VALUE_LO: UInt = 0x6002_3044
+static CLK_EN: UInt32 = 0x8000_0000
+static UNIT0_WORK_EN: UInt32 = 1 << 30
+static UNIT0_UPDATE: UInt32 = 1 << 30
+static UNIT0_VALUE_VALID: UInt32 = 1 << 29
+
+static ROUNDS: UInt = 8
+static BACK_TO_BACK: UInt = 10
+static APART_CYCLES: UInt = 1000
+/// 100 us is a tenth of a millisecond: a tenth of the CPU's kHz in cycles.
+static CYCLES_PER_KHZ_100US: UInt = 10
+static LONG_FACTOR: UInt = 10
+
+func word(addr: UInt) unsafe -> UnsafeMemory<UInt32, Device> {
+    UnsafeMemory<UInt32, Device>(addr)
+}
+
+/// `v` in decimal.
+func decimal(v: UInt64) unsafe {
+    if v >= 10 {
+        decimal(v / 10)
+    }
+    hal.console_byte(((v % 10) + 48) as UInt8)
+}
+
+/// The least and greatest of the values a measurement saw.
+struct Extent {
+    least: UInt64,
+    greatest: UInt64,
+    seen: UInt,
+}
+
+extension Extent {
+    static func empty() -> Extent {
+        Extent(least: 0, greatest: 0, seen: 0)
+    }
+
+    func add(&var self, v: UInt64) {
+        if self.seen == 0 || v < self.least {
+            self.least = v
+        }
+        if self.seen == 0 || v > self.greatest {
+            self.greatest = v
+        }
+        self.seen += 1
+    }
+
+    /// `name min=<least> max=<greatest>` and a newline.
+    func line(&self, name: String) unsafe {
+        let uart = console()
+        uart.write_str("SOS systimer: ")
+        uart.write_str(name)
+        uart.write_str(" min=")
+        decimal(self.least)
+        uart.write_str(" max=")
+        decimal(self.greatest)
+        uart.write_str("\n")
+    }
+}
+
+/// Spin until CCOUNT has advanced `cycles` from where it is now.
+func spin(cycles: UInt) unsafe {
+    let start = sos_ccount_read()
+    while (sos_ccount_read() &- start) < cycles { }
+}
+
+/// SYSTIMER's CONF, UNIT0_OP and TARGET0_CONF, as one line.
+func registers(when: String) unsafe {
+    let uart = console()
+    uart.write_str("SOS systimer: ")
+    uart.write_str(when)
+    uart.write_str(" conf=")
+    uart.write_hex(word(SYSTIMER_CONF).read() as UInt)
+    uart.write_str(" unit0_op=")
+    uart.write_hex(word(SYSTIMER_UNIT0_OP).read() as UInt)
+    uart.write_str(" target0_conf=")
+    uart.write_hex(word(SYSTIMER_TARGET0_CONF).read() as UInt)
+    uart.write_str("\n")
+}
+
+/// One snapshot, as `Systimer.now` takes it: UPDATE, then VALUE_VALID, then
+/// the high half and the low.
+func snapshot() unsafe -> UInt64 {
+    let op = word(SYSTIMER_UNIT0_OP)
+    op.write(UNIT0_UPDATE)
+    while (op.read() & UNIT0_VALUE_VALID) == 0 { }
+    let hi = word(SYSTIMER_UNIT0_VALUE_HI).read()
+    let lo = word(SYSTIMER_UNIT0_VALUE_LO).read()
+    ((hi as UInt64) << 32) | (lo as UInt64)
+}
+
+/// Two snapshots with `spin_cycles` of spin between them; add the ticks
+/// between them, the spin's cycles and the whole span's to the ranges.
+func wait(spin_cycles: UInt, ticks: &var Extent, spun: &var Extent,
+          whole: &var Extent) unsafe {
+    let c0 = sos_ccount_read()
+    let a = snapshot()
+    let s0 = sos_ccount_read()
+    spin(spin_cycles)
+    let s1 = sos_ccount_read()
+    let b = snapshot()
+    let c1 = sos_ccount_read()
+    ticks.add(b - a)
+    spun.add((s1 &- s0) as UInt64)
+    whole.add((c1 &- c0) as UInt64)
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.clock_init()
+    registers("before")
+    let conf = word(SYSTIMER_CONF)
+    conf.write(conf.read() | CLK_EN | UNIT0_WORK_EN)
+
+    var first = hal.PsramCpuPass(cycles: 0, ticks: 0)
+    var second = hal.PsramCpuPass(cycles: 0, ticks: 0)
+    hal.psram_cpu_passes(&var first, &var second)
+    let khz = second.khz()
+    console().write_str("SOS systimer: cpu ")
+    decimal(khz as UInt64)
+    console().write_str(" kHz\n")
+    let short = khz / CYCLES_PER_KHZ_100US
+
+    var one = Extent.empty()
+    var ten = Extent.empty()
+    var update = Extent.empty()
+    var polls = Extent.empty()
+    var apart = Extent.empty()
+    var ticks_short = Extent.empty()
+    var spun_short = Extent.empty()
+    var whole_short = Extent.empty()
+    var ticks_long = Extent.empty()
+    var spun_long = Extent.empty()
+    var whole_long = Extent.empty()
+
+    var round: UInt = 0
+    while round < ROUNDS {
+        var t0 = sos_ccount_read()
+        let _ = hal.timer_now_ns()
+        one.add((sos_ccount_read() &- t0) as UInt64)
+
+        t0 = sos_ccount_read()
+        var n: UInt = 0
+        while n < BACK_TO_BACK {
+            let _ = hal.timer_now_ns()
+            n += 1
+        }
+        ten.add((sos_ccount_read() &- t0) as UInt64)
+
+        let op = word(SYSTIMER_UNIT0_OP)
+        var seen: UInt = 1
+        t0 = sos_ccount_read()
+        op.write(UNIT0_UPDATE)
+        while (op.read() & UNIT0_VALUE_VALID) == 0 {
+            seen += 1
+        }
+        update.add((sos_ccount_read() &- t0) as UInt64)
+        polls.add(seen as UInt64)
+
+        let lo = word(SYSTIMER_UNIT0_VALUE_LO)
+        let before = lo.read()
+        spin(APART_CYCLES)
+        apart.add((lo.read() &- before) as UInt64)
+
+        wait(short, &var ticks_short, &var spun_short, &var whole_short)
+        wait(short * LONG_FACTOR, &var ticks_long, &var spun_long,
+             &var whole_long)
+        round += 1
+    }
+
+    one.line("now x1 cycles")
+    ten.line("now x10 cycles")
+    update.line("UPDATE to VALUE_VALID cycles")
+    polls.line("UPDATE to VALUE_VALID polls")
+    apart.line("VALUE_LO moved with no UPDATE, 1000 cycles apart")
+    ticks_short.line("100 us spin, ticks between snapshots")
+    spun_short.line("100 us spin, spin cycles")
+    whole_short.line("100 us spin, cycles snapshot to snapshot")
+    ticks_long.line("1 ms spin, ticks between snapshots")
+    spun_long.line("1 ms spin, spin cycles")
+    whole_long.line("1 ms spin, cycles snapshot to snapshot")
+    registers("after")
+    hal.exit_pass()
+}

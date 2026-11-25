@@ -695,6 +695,57 @@ reads `0x46000000` at handover, and the `UNIT0_OP` update/valid handshake,
 `UNIT0_VALUE_LO`, `TARGET0_HI`/`LO`, `TARGET0_CONF`, `COMP0_LOAD` and
 `INT_ENA`/`INT_RAW`/`INT_CLR`/`INT_ST` all work.
 
+What a read of the counter costs is measured by `systimer_read`
+(`tests/xtensa/systimer_read.saw`), a board stage whose image is built at
+`rom`, `pll80` and `pll240`. After `clock_init` it prints CONF, UNIT0_OP and
+TARGET0_CONF (the block has no UNIT0_CONF) before CONF's start-up write and
+after the rounds, then, as least and greatest over 8 rounds, in CCOUNT
+cycles: `timer_now_ns` once and ten back to back; the write of UPDATE to
+UNIT0_OP up to VALUE_VALID, with the number of reads of UNIT0_OP it took;
+UNIT0_VALUE_LO read twice 1,000 cycles apart with no UPDATE between; and two
+snapshots with a CCOUNT spin of 100 us, and of 1 ms, at the CPU clock
+`psram_cpu_passes` measures between them: the ticks between the snapshots,
+the spin's cycles, and the cycles from before the first snapshot to after the
+second. Each snapshot is UPDATE, VALUE_VALID, then the two halves, as
+`Systimer.now` takes it; ESP-IDF's `systimer_hal_get_counter_value` does the
+same and reads the low half again to catch a change between the halves. The
+emulator's lines are host time and none is held.
+
+Every kernel read of the counter runs with interrupts masked (§7f):
+`timer_now_ns`, whose callers are the Monotonic clock read, the Timer
+objects' catch-up, the tick's epoch, deadline programming, the timer
+interrupt's handler and the waits' deadline test; and `Systimer.expired`, by
+way of `timer_pending` and the idle loop's `timer_due`.
+`timer_set_deadline_ns` reads and writes CONF and the comparator and takes no
+snapshot.
+
+Measured on the part (the r8 board), least to greatest over 8 rounds:
+
+```
+                                         rom         pll80       pll240
+CPU clock, kHz                           19,999      80,000      240,001
+VALUE_LO moved, no UPDATE, 1000 cycles   0-0         0-0         0-0
+UPDATE to VALUE_VALID, polls             1-2         1-2         1-3
+UPDATE to VALUE_VALID, cycles            63-2953     64-3078     78-8329
+1 ms spin, ticks between snapshots       16099-16109 16027-16029 16012-16013
+100 us spin, ticks between snapshots     1715-2518   1627-1831   1612-2140
+timer_now_ns once, cycles                123-4802    123-4802    173-16468
+timer_now_ns ten in a row, cycles        1200-1609   1200-1609   1719-5530
+CONF before the start-up write           0x46000000  0xc6000000  0xc6000000
+```
+
+After the rounds CONF is 0xc6000000, UNIT0_OP 0x20000000 and TARGET0_CONF 0
+at every key.
+
+SYSTIMER counts at 16 MHz at every key: the 1 ms spins see about 16,000
+ticks. The value registers hold the last snapshot until the next UPDATE,
+and VALUE_VALID is set within one to three polls of UNIT0_OP. A read that
+finds the code warm costs about 120 cycles at 80 MHz and 170 at 240: ten
+in a row take 1,200 and 1,719. The greatest of the rounds is much larger
+(one read at `pll240` took 16,468 cycles, about 69 us). The harness prints
+only each measurement's least and greatest, so which round holds a greatest
+is not known.
+
 ### 6b. The core timers
 
 `CCOMPARE0..2` exist and drive CPU interrupts 6, 15 and 16. Probed with
@@ -4261,6 +4312,8 @@ psram_probe                 r8       P4: `memory_init`; the test's first
                                      0xaab55552; every width, `s32c1i` and
                                      the instruction-bus alias
 psram_speed                 r8       P5: the measurements' lines
+systimer_read               r8       the cost of a SYSTIMER read: the
+                                     measurements' lines (§6a)
 psram_wrong_size            r8       P7: a 16 MiB description on the 8 MiB
                                      eFuse: 0x51, nothing sent
 psram_up_16m                r8       the same description on `-m 16M` and a
