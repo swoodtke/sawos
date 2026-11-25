@@ -12,7 +12,9 @@
 //! of a capacity reads it so.
 //!
 //! The block also carries the quota defaults the image's children start with,
-//! which replace `kcore.limits`' compiled ones (`set_image_quota_defaults`).
+//! which replace `kcore.limits`' compiled ones (`set_image_quota_defaults`),
+//! and the handle blocks root's table takes, which `start_process` attaches
+//! before root's first handle (`set_image_root_blocks`).
 //!
 //! # The block
 //!
@@ -21,7 +23,7 @@
 //!
 //!   - a 48-byte header: magic `u32` (`SLAB_BLOCK_MAGIC`), the number of areas
 //!     `u32`, one quota default `u32` per `QuotaKind` in its value's order, and
-//!     a reserved `u32`;
+//!     the number of handle blocks root's table takes `u32`;
 //!   - one 24-byte entry per area: the `SlabKind` `u32`, a reserved `u32`, the
 //!     area's base `u64` and its length `u64`.
 //!
@@ -84,6 +86,7 @@ import kcore.objects.{
     PIPES,
     compiled_quota_default,
     set_image_quota_defaults,
+    set_image_root_blocks,
 }
 import kcore.threads.{THREADS}
 import kcore.time.{TIMERS}
@@ -228,7 +231,7 @@ struct SlabBlockHeader {
     magic: UInt32,
     count: UInt32,
     quota: [UInt32; QUOTA_KINDS],
-    reserved: UInt32,
+    root_blocks: UInt32,
 }
 
 /// One area: the kind it raises, and where the build linked its storage. The
@@ -257,8 +260,9 @@ func block_area_at(addr: UInt) unsafe -> SlabArea {
 }
 
 /// Read the image's slab block, if it carries one, and install each area as
-/// one more extent of its slab and each quota default as what a child starts
-/// with. Called once, before root's record, body or rows are taken.
+/// one more extent of its slab, each quota default as what a child starts
+/// with, and root's handle blocks as what root's table takes. Called once,
+/// before root's record, body or rows are taken.
 ///
 /// Every refusal is `fatal_image` naming what it found, in this order: the
 /// block's own shape (cut short, not a block, bytes after it); then each area
@@ -268,8 +272,10 @@ func block_area_at(addr: UInt) unsafe -> SlabArea {
 /// `MAX_SLAB_CAPACITY`, a misaligned base, an area outside the kernel's slab
 /// region, an area meeting an earlier one, a length that is not whole slots);
 /// then the capacities at boot against §2.8's relations; then each quota
-/// default against its bounds. Nothing is installed until every check has
-/// passed, so a refused block changes no slab.
+/// default against its bounds; then root's handle blocks, past
+/// `MAX_TABLE_BLOCKS` and past the `HandleBlocks` capacity at boot. Nothing
+/// is installed until every check has passed, so a refused block changes no
+/// slab.
 ///
 /// No preemption point: at most `SLAB_KINDS` areas, each checked against the
 /// ones before it, and a zeroing loop over the area's bytes, all before any
@@ -380,6 +386,7 @@ public func install_image_slabs() unsafe {
 
     check_relations(&raised)
     let defaults = check_quota_defaults(&header, &raised)
+    let root_blocks = check_root_blocks(&header, &raised)
 
     let uart = console()
     var a: UInt = 0
@@ -404,6 +411,7 @@ public func install_image_slabs() unsafe {
         a = a + 1
     }
     set_image_quota_defaults(&defaults)
+    set_image_root_blocks(root_blocks)
 }
 
 /// The capacity `kind` boots with: what its slab holds now (its floor, since
@@ -517,6 +525,25 @@ func check_quota_defaults(header: &SlabBlockHeader,
         c = c + 1
     }
     out
+}
+
+/// Check the handle blocks the block gives root's table and answer them: at
+/// most the blocks one table may link, and at most what the `HandleBlocks`
+/// slab holds at boot, since root's are the first taken from it.
+func check_root_blocks(header: &SlabBlockHeader,
+                       raised: &[Int; SLAB_KINDS]) unsafe -> Int {
+    // Compared as unsigned before it is narrowed: a 32-bit `Int` cannot hold
+    // every word the header can carry.
+    let value = header.root_blocks as UInt
+    if value > (MAX_TABLE_BLOCKS as UInt) {
+        fatal_image("root's handle blocks are more than MAX_TABLE_BLOCKS", value)
+    }
+    let blocks = value as Int
+    if blocks > boot_capacity(SlabKind.HandleBlocks, &raised) {
+        fatal_image("root's handle blocks are more than the HandleBlocks slab holds",
+                    value)
+    }
+    blocks
 }
 
 // =============================================================================

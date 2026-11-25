@@ -2791,11 +2791,12 @@ have no field.
     grants nothing. This is not to be "fixed" into unbounded bookkeeping.
   - **Where an entry lives.** A table is the `MAX_HANDLES` entries of its
     process's body and, for a process whose `Handle` row was set above that
-    (§2.7), up to `MAX_TABLE_BLOCKS` handle blocks of `HANDLE_BLOCK` entries,
-    in the order they were attached: index `MAX_HANDLES` is the first entry
-    of the first block. A table never shrinks while its process lives. A
-    block also holds the boot-set records of its positions, so a process's
-    boot set is as long as its table. A freed block keeps its entries'
+    (§2.7) or for root when its image gives it blocks (§12), up to
+    `MAX_TABLE_BLOCKS` handle blocks of `HANDLE_BLOCK` entries, in the order
+    they were attached: index `MAX_HANDLES` is the first entry of the first
+    block. A table never shrinks while its process lives. A block also holds
+    the boot-set records of its positions, so a process's boot set is as
+    long as its table. A freed block keeps its entries'
     generations, as a body does.
 - **Rights are a bitmask, scoped per object kind.** Each kind defines its own
   backed rights enum — `SystemRight: UInt32`, whose cases include
@@ -4898,7 +4899,8 @@ reserved.
   with the tick, and only an image that asks is cooperative. A table whose
   rows the Memory and IoMemory slabs cannot hold at boot, all together or of
   one kind, stops the boot, and so does one whose rows root's handle table
-  cannot hold beside its first handles.
+  cannot hold beside its first handles. Root's table is the body's
+  `MAX_HANDLES` entries and the handle blocks its image gives it (below).
 - **The kind column types every row**. `Ram` (0)
   mints an allocation, a `Memory` that came from no pool (§2.5); `Device` (1)
   an `IoMemory`; `Pool` (2) a `Pool`. Root's boot pools are minted with
@@ -4959,13 +4961,14 @@ reserved.
   prints the step, the child and the status and stops the machine; a child whose
   image says `on-exit = "shutdown"` stops the machine when it ends, and the
   machine stops when every child has ended.
-- **After the rows, the image's slab areas.** The table is at version 5. After
+- **After the rows, the image's slab areas.** The table is at version 6. After
   its rows comes nothing, or one whole block: a magic word, the number of
   areas, one quota default for each `QuotaKind` (the rows the image's children
-  start with, §2.9), then one entry per area naming a `SlabKind`, the area's
-  base and its length. The build links each area into the kernel's own memory,
-  sized to the image's limits (§2.8). Anything else after the rows stops the
-  boot, a partial block and bytes after the block included. The kernel reads
+  start with, §2.9), the number of handle blocks root's table takes, then one
+  entry per area naming a `SlabKind`, the area's base and its length. The
+  build links each area into the kernel's own memory, sized to the image's
+  limits (§2.8). Anything else after the rows stops the boot, a partial block
+  and bytes after the block included. The kernel reads
   the block before the first process exists, before root's record, body or
   rows are taken, and each of these stops the boot, naming what it found:
   - a kind that is not a `SlabKind`, or a kind two areas name: a kind is
@@ -4990,7 +4993,9 @@ reserved.
     one that is not a limit (at or above `QUOTA_UNLIMITED`, which a row
     reads as no cap at all, §2.7), one not below its slab's capacity at
     boot, a `Handle` default not below `MAX_HANDLES`, or a `Mapping` default
-    above the grant-row budget less `IMAGE_GRANT_ROWS`.
+    above the grant-row budget less `IMAGE_GRANT_ROWS`;
+  - root's handle blocks more than `MAX_TABLE_BLOCKS`, or more than the
+    `HandleBlocks` slab holds at boot.
 
   Then each area is zeroed again and installed as one more extent of its
   slab, as a donated region is (§2.8). What a process can observe afterwards
@@ -4999,15 +5004,20 @@ reserved.
   bodies, §2.7; root's mapping clamp, §2.9; the row bound above) reads it so,
   and a donation adds to it as to any other extent. The area takes one of
   the kind's `MAX_SLAB_EXTENTS`, so a kind raised by its image accepts one
-  donation fewer. No handle names an area and no process can map, give or
-  donate one: its bytes are the kernel's from the first instruction. The
-  slab region is the one place the build links areas: each area is a section
-  named `.bss.sos_slab<kind>`, and every board's link script gathers those
-  sections, and only those, between the region's two symbols, apart from
-  every other static of the kernel's, the arena and the boot stack. An area
-  the containment check takes therefore lies over no static, and one that
-  lies over a static, or over the arena or the stack, is outside the region
-  and stops the boot. An image that links no area has an empty region.
+  donation fewer. Root's handle blocks are the first taken from the
+  `HandleBlocks` slab: they are attached to root's table before its first
+  handle is minted, so its System, Process and Thread handles keep their
+  words and its rows fill the longer table and boot set (§3). An image with
+  no block gives root none. No handle names an area and no process can map,
+  give or donate one: its bytes are the kernel's from the first instruction.
+  The slab region is the one place the build links areas: each area is a
+  section named `.bss.sos_slab<kind>`, and every board's link script gathers
+  those sections, and only those, between the region's two symbols, apart
+  from every other static of the kernel's, the arena and the boot stack. An
+  area the containment check takes therefore lies over no static, and one
+  that lies over a static, or over the arena or the stack, is outside the
+  region and stops the boot. An image that links no area has an empty
+  region.
 - **A row typed wrong is the build's error, met at root's drain.** The kernel
   mints what the kind column says. A root that finds a pool under a tag its
   config gives to an allocation, or the reverse, learns it from the boot

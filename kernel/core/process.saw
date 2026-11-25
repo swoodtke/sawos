@@ -68,7 +68,9 @@ import kcore.objects.{
     SlotState,
     alloc_iomemory,
     alloc_memory,
+    attach_handle_blocks,
     boot_handle_room,
+    image_root_blocks,
     install_quota_limits,
     mint_handle,
     queue_boot_handle,
@@ -1087,8 +1089,9 @@ static REGION_TABLE_MAGIC: UInt32 = 0x4E47_5253
 /// row's base as this one's kind. The stitcher and kernel are built together.
 /// An image with no table at all reads as zero regions and never reaches this
 /// comparison. The kind column is part of the layout: a table written for
-/// fewer kinds is a different version, and so is what may follow the rows.
-static REGION_TABLE_VERSION: UInt16 = 5
+/// fewer kinds is a different version, and so is what may follow the rows,
+/// each word of the slab block's header included.
+static REGION_TABLE_VERSION: UInt16 = 6
 
 /// Overlay the header on the section's first bytes. One view construction, then
 /// an ordinary safe struct; the unsafety is confined to this line.
@@ -1410,6 +1413,16 @@ public func start_process(entry: UInt, stack_top: UInt, region_top: UInt,
     let p: Int = ROOT_PROCESS
     claim_root()
     let b = body_of(p)
+
+    // Root's handle blocks, which its image gives it (`kcore.areas`), are
+    // attached before the first mint: its first three handles land at words
+    // 1, 2 and 3 whatever the table's length, and its rows fill the longer
+    // table and boot set. The boot held the count to both bounds, so a
+    // refusal is the kernel's.
+    let blocks = image_root_blocks()
+    if not attach_handle_blocks(p, blocks) {
+        fatal_kernel("root's checked handle blocks were refused", blocks as UInt)
+    }
 
     // Field by field rather than a whole-entry literal: the loader has already
     // recorded root's grant rows in the body, and a struct literal would erase

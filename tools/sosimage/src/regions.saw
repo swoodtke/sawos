@@ -1,7 +1,7 @@
 //! The boot region table: its wire format, and the assembly that puts it in
 //! an image.
 //!
-//! Version 5, frozen: an 8-byte header (magic u32, version u16, row count u8,
+//! Version 6, frozen: an 8-byte header (magic u32, version u16, row count u8,
 //! boot flags u8), then one 24-byte row per region (base u64, length u64,
 //! kind u8, seven reserved bytes), all little-endian. The header's size puts
 //! the first row on an 8-byte boundary and the row's padding keeps the next
@@ -11,11 +11,11 @@
 //!
 //! After the rows comes nothing, or the slab block of an image that states
 //! limits: a 48-byte header (magic u32, area count u32, one quota default u32
-//! per quota kind in its value's order, a reserved u32), then one 24-byte
-//! entry per area (its slab kind u32, a reserved u32, base u64, length u64).
-//! An area's base is the symbol its section starts at, which the linker fills
-//! in. Kept in step with `kernel/core/areas.saw`'s `SlabBlockHeader` and
-//! `SlabArea`.
+//! per quota kind in its value's order, the handle blocks root's table takes
+//! u32), then one 24-byte entry per area (its slab kind u32, a reserved u32,
+//! base u64, length u64). An area's base is the symbol its section starts at,
+//! which the linker fills in. Kept in step with `kernel/core/areas.saw`'s
+//! `SlabBlockHeader` and `SlabArea`.
 //!
 //! The table is encoded here as fields, each a number or a linker expression:
 //! a child image's row names the symbols bounding its blob, whose values only
@@ -30,7 +30,7 @@ import sosimage.limits.{SlabPlan}
 
 /// 'S','R','G','N' read little-endian.
 public static REGION_TABLE_MAGIC: UInt64 = 0x4E47_5253
-public static REGION_TABLE_VERSION: UInt64 = 5
+public static REGION_TABLE_VERSION: UInt64 = 6
 
 /// 'S','L','A','B' read little-endian.
 public static SLAB_BLOCK_MAGIC: UInt64 = 0x4241_4C53
@@ -158,8 +158,8 @@ public func encode_table(rows: &Vector<RegionRow>, flags: UInt64,
 }
 
 /// The slab block `plan` describes, as fields in order: the header with every
-/// quota default, then an entry per area naming the symbol `area_symbol`
-/// gives its section's start.
+/// quota default and root's handle blocks, then an entry per area naming the
+/// symbol `area_symbol` gives its section's start.
 public func encode_block(plan: &SlabPlan,
                          word_bytes: Int) -> Result<Vector<TableField>, BuildError> {
     var out = Vector<TableField>()
@@ -172,7 +172,7 @@ public func encode_block(plan: &SlabPlan,
         try! out.push(TableField(bytes: 4, value: d as UInt64, symbol: "", note: note))
         q = q + 1
     }
-    try! out.push(TableField(bytes: 4, value: 0, symbol: "", note: ""))
+    try! out.push(TableField(bytes: 4, value: plan.root_blocks as UInt64, symbol: "", note: "root's handle blocks"))
     var a = 0
     while a < plan.areas.len() {
         guard let area = plan.areas.get(a) else {

@@ -2,13 +2,13 @@
 """Dump SawOS binary artifacts, human-readably.
 
   tools/sosimg_dump.py <file.sosimg>          the image header + segment table
-  tools/sosimg_dump.py --regions <blob>       a raw region table (v5) and the
+  tools/sosimg_dump.py --regions <blob>       a raw region table (v6) and the
                                               slab block after its rows, if any,
                                               e.g. from llvm-objcopy -O binary
                                               --only-section=.regions <elf> <blob>
 
 Formats: sosimg v3 (imgformat, sawlang libs/imgformat) and the sawos region
-table v5 (kernel/core/process.saw + tools/sos_runner.py, kept in step by the
+table v6 (kernel/core/process.saw + tools/sos_runner.py, kept in step by the
 static_asserts beside each), with its slab block (kernel/core/areas.saw). An
 area's base is what the linker wrote, a link address on a higher-half kernel.
 """
@@ -23,7 +23,7 @@ REGION_MAGIC = 0x4E47_5253   # 'S','R','G','N' LE
 SLAB_MAGIC = 0x4241_4C53     # 'S','L','A','B' LE
 SLAB_KINDS = ["events", "waiters", "interrupts", "attachments", "timers",
               "memories", "iomemories", "mappings", "free_ranges", "threads",
-              "pipes", "processes", "process_records"]
+              "pipes", "processes", "process_records", "handle_blocks"]
 QUOTA_KINDS = ["thread", "event", "waiter", "timer", "memory", "iomemory",
                "mapping", "handle", "pipe"]
 
@@ -83,10 +83,12 @@ def dump_block(blob, off):
         return
     magic, count = struct.unpack_from("<II", blob, off)
     quotas = struct.unpack_from("<9I", blob, off + 8)
+    (root_blocks,) = struct.unpack_from("<I", blob, off + 44)
     ok = "ok" if magic == SLAB_MAGIC else f"BAD (want 0x{SLAB_MAGIC:08x})"
     print(f"slab block magic 0x{magic:08x} ({ok})")
     print("quota defaults " + " ".join(
         f"{name}={q}" for name, q in zip(QUOTA_KINDS, quotas)))
+    print(f"root's handle blocks {root_blocks}")
     print(f"areas     {count}")
     off += 48
     for i in range(count):

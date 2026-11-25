@@ -1,0 +1,60 @@
+// A root whose image gives its handle table a block: its boot set holds more
+// rows than the body's `MAX_HANDLES` entries (spec §3, §12).
+//
+// The image's slab block raises the Memory slab and gives root one handle
+// block, and its region table has `ROWS` zero-length `Ram` rows. The kernel
+// mints root's System, Process and Thread handles and then one Memory per
+// row, the last of them into the block, and queues a boot record for each.
+// Root drains them all through `BootHandleNext`, each a Memory under its
+// row's ordinal, in order:
+//
+//   SOS rootblocks: drained 41 Ram rows in order
+//
+// Without the block the boot stops at the row that finds the body's table
+// full, before root runs.
+
+import sos.{System, SosStatus, BootHandleKind}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The rows the image's region table has.
+static ROWS: UInt = 41
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS rootblocks: no process handle: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var drained: UInt = 0
+    var in_order = true
+    while {
+        var record = try proc.boot_handle_next() catch {
+            if error == SosStatus.Drained {
+                break
+            }
+            print("SOS rootblocks: the drain was refused: {}\n", error)
+            let _ = system.shutdown(EXIT_FAILED)
+            return
+        }
+        if record.tag != drained || record.kind != BootHandleKind.Memory {
+            in_order = false
+        }
+        match record.take_memory() {
+            case None -> in_order = false,
+            case _ -> {},
+        }
+        drained = drained + 1
+    }
+    if not in_order || drained != ROWS {
+        print("SOS rootblocks: drained {} records, not {} Ram rows in order\n",
+              drained, ROWS)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS rootblocks: drained {} Ram rows in order\n", drained)
+    let _ = system.shutdown(EXIT_OK)
+}

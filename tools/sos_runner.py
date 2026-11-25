@@ -475,6 +475,9 @@ HANDLE_BLOCKS_CLOSE_ALL_PKG = os.path.join(TESTS_DIR,
 HANDLE_BLOCKS_ROOM_PKG = os.path.join(TESTS_DIR, "handle-blocks-room")
 HANDLE_BLOCKS_BOOT_SET_PKG = os.path.join(TESTS_DIR, "handle-blocks-boot-set")
 HANDLE_BLOCKS_DONATE_PKG = os.path.join(TESTS_DIR, "handle-blocks-donate")
+# A root whose image gives its handle table a block, and which drains more
+# rows than the body's entries hold.
+ROOT_BLOCKS_ROWS_PKG = os.path.join(TESTS_DIR, "root-blocks-rows")
 CHILD_BLOCKS_FILL_PKG = os.path.join(TESTS_DIR, "child-blocks-fill")
 CHILD_BLOCKS_BOUNDARY_PKG = os.path.join(TESTS_DIR, "child-blocks-boundary")
 CHILD_BLOCKS_ROOM_PKG = os.path.join(TESTS_DIR, "child-blocks-room")
@@ -1629,7 +1632,7 @@ def _build_process(packager, profile, arch, pkg, role, env, plan=None,
     _run_sosimage(packager, ["package", profile, path], env=env)
     return os.path.join(out, f"{role}.sosimg")
 
-# The boot region table's wire format (version 5), frozen: an 8-byte header
+# The boot region table's wire format (version 6), frozen: an 8-byte header
 # (magic, version u16, count u8, boot flags u8) then `count` rows of {base: u64,
 # len: u64, kind: u8, reserved x 7}, all little-endian. The header's size puts
 # the first row on an 8-byte boundary and the row's padding keeps the next one
@@ -1640,11 +1643,11 @@ def _build_process(packager, profile, arch, pkg, role, env, plan=None,
 # (`kernel/core/areas.saw`), which only the image builder writes: this path
 # writes tables that end with their rows.
 #
-# The kernel accepts exactly version 5, so this constant and that file change
+# The kernel accepts exactly version 6, so this constant and that file change
 # together. An image with no table at all is unaffected: the kernel's `len == 0`
 # short-circuit runs ahead of the header read.
 REGION_TABLE_MAGIC = 0x4E475253          # 'S','R','G','N' read little-endian
-REGION_TABLE_VERSION = 5
+REGION_TABLE_VERSION = 6
 
 # The header's boot flags byte, mirroring `kernel/core/process.saw`'s
 # `BOOT_FLAG_NO_TICK`. The kernel arms the scheduler tick unless this bit is
@@ -1860,8 +1863,10 @@ def expectations(arch):
         "twelve": f"0x{12:0{width}x}",
         "thirteen": f"0x{13:0{width}x}",
         "seventeen": f"0x{17:0{width}x}",
+        "twenty_five": f"0x{25:0{width}x}",
         "twenty_nine": f"0x{29:0{width}x}",
         "thirty_four": f"0x{34:0{width}x}",
+        "forty_one": f"0x{41:0{width}x}",
         "prio": f"0x{0x01010100:0{width}x}",
         "irq_line": f"0x{arch['selftest_line']:0{width}x}",
         # The byte `child-touch` writes into the page its launcher mapped and
@@ -11533,6 +11538,28 @@ TEST_CASES = [
         "expect_clean_exit": False,
         "expect_status": EXIT_BAD_IMAGE,
     },
+    # Root's table lengthened by its image. The hand-made block raises the
+    # Memory slab by 25 and gives root one handle block, from a HandleBlocks
+    # area of one, so 41 `Ram` rows fit root's 48 entries beside its three
+    # first handles, the last rows' handles and boot records in the block.
+    # Root drains all 41, each a Memory under its row's ordinal. Without the
+    # block's attach the boot stops at row 29, as `image_rows_at_capacity`
+    # does.
+    {
+        "name": "root_blocks_rows",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": ROOT_BLOCKS_ROWS_PKG,
+        "tick": True,
+        "slab_block": {"rows": 41, "root_blocks": 1,
+                       "areas": [{"kind": "memories", "slots": 25},
+                                 {"kind": "handle-blocks", "slots": 1}]},
+        "expect_out": ["{banner}",
+                       "SOS: slab area kind={five} slots={twenty_five}",
+                       "SOS: slab area kind={thirteen} slots={one}",
+                       "SOS: boot regions={forty_one}",
+                       "SOS rootblocks: drained 41 Ram rows in order"],
+        "expect_clean_exit": True,
+    },
 
     # A hand-made block the kernel takes, every number at the edge it may
     # reach (`_EDGE_AREAS`, `_EDGE_QUOTAS`). Its areas are installed and the
@@ -11611,6 +11638,31 @@ TEST_CASES = [
                "bytes follow the slab block"),
     _slab_stop("slab_area_unknown_kind", {"areas": [{"kind_raw": 14}]},
                "a slab area names a kind this build cannot name"),
+    # Root's handle blocks: past the blocks one table may link, though the
+    # slab holds them, and past what the slab holds at boot. Exactly the
+    # longest table is taken, and the boot goes on to the root image.
+    _slab_stop("slab_block_root_blocks_past_longest",
+               {"root_blocks": 7,
+                "areas": [{"kind": "handle-blocks", "slots": 7}]},
+               "root's handle blocks are more than MAX_TABLE_BLOCKS"),
+    _slab_taken("slab_block_root_blocks_longest",
+                {"root_blocks": 6,
+                 "areas": [{"kind": "handle-blocks", "slots": 6}]},
+                [("{thirteen}", "{six}")]),
+    _slab_stop("slab_block_root_blocks_past_capacity", {"root_blocks": 1},
+               "root's handle blocks are more than the HandleBlocks slab "
+               "holds"),
+    # The header's widest words, which a 32-bit kernel's `Int` cannot hold:
+    # each is compared unsigned and meets its named stop.
+    _slab_stop("slab_block_root_blocks_word_max", {"root_blocks": 0xFFFF_FFFF},
+               "root's handle blocks are more than MAX_TABLE_BLOCKS"),
+    _slab_stop("slab_block_quota_word_max",
+               {"quotas": {"thread": 0xFFFF_FFFF}},
+               "a quota default does not fit the ledger"),
+    # A table at the version before this build's, whose header and rows
+    # would read the same: the kernel takes only its own.
+    _slab_stop("region_table_old_version", {"version": 5},
+               "region table version is not this build's"),
     _slab_stop("slab_area_kind_twice",        # and past the address space
                {"areas": [{"kind": "waiters"},
                           {"kind": "waiters", "base": 0x1_0000_0000}]},
@@ -15989,15 +16041,17 @@ SLAB_BLOCK_MAGIC = 0x42414C53
 
 
 def _slab_block_asm(case, arch, facts):
-    """A `slab_block` case's payload: a whole region table at version 5, with
-    a hand-made slab block after its rows and the storage its areas name, as
-    assembly. It writes what the image builder would refuse to, so the
-    kernel's own stops are what the case meets.
+    """A `slab_block` case's payload: a whole region table, with a hand-made
+    slab block after its rows and the storage its areas name, as assembly. It
+    writes what the image builder would refuse to, so the kernel's own stops
+    are what the case meets.
 
     The spec (`case["slab_block"]`) is a dict:
 
+      `version`  the table's version, when it is not `REGION_TABLE_VERSION`
       `rows`     zero-length `Ram` rows in the table, before the block
       `quotas`   quota defaults by name; the others are the compiled ones
+      `root_blocks`  the handle blocks the header gives root's table (0)
       `areas`    a list of areas, each a dict: `kind` (a slab kind's name) or
                  `kind_raw` (any number); `slots`, the slots it holds, or
                  `len`, its length in bytes; `extra`, bytes added to the
@@ -16040,7 +16094,7 @@ def _slab_block_asm(case, arch, facts):
              "    .section .regions, \"a\", @progbits",
              "    .balign 8",
              f"    .4byte {REGION_TABLE_MAGIC:#010x}",
-             f"    .2byte {REGION_TABLE_VERSION}",
+             f"    .2byte {spec.get('version', REGION_TABLE_VERSION)}",
              f"    .byte  {rows}",
              f"    .byte  {boot_flags(case)}"]
     for _ in range(rows):
@@ -16057,7 +16111,7 @@ def _slab_block_asm(case, arch, facts):
         if quotas:
             raise ToolError(f"case {case['name']!r}: `slab_block` names "
                             f"quotas the kernel has not: {sorted(quotas)}")
-        lines.append("    .4byte 0")
+        lines.append(f"    .4byte {value(spec.get('root_blocks', 0))}")
     storage = []
     for i, area in enumerate(areas):
         if "kind" in area:
@@ -20233,7 +20287,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "heap_share_only", "heap_share_grain", "heap_refusals",
                      "heap_rights", "heap_missing_slot", "heap_slot_bound",
                      "heap_wrong_free", "heap_zero_spent", "heap_main_err",
-                     "heap_sizing", "handle_blocks_quota"]
+                     "heap_sizing", "handle_blocks_quota",
+                     "root_blocks_rows"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 

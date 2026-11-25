@@ -17,22 +17,28 @@
 //! leaves the rows an image spends before it runs. A default the image does
 //! not state is the compiled one.
 //!
+//! Root's handle table is `MAX_HANDLES` entries and the handle blocks the
+//! image gives it, which the slab block carries and the kernel attaches before
+//! root's first handle. An image states root's table as `root-handles`,
+//! rounded up to a whole block, at most the longest table; the
+//! `handle-blocks` total is at least root's blocks, which are taken first.
+//!
 //! The region table's rows are held against the image's Memory and IoMemory
 //! capacities, and against root's handle table: the kernel mints root's
 //! System, Process and Thread handles and then one handle for every row
 //! (`kcore.process`'s `start_process` and `mint_boot_regions`, spec §12), so
 //! root holds `ROOT_BOOT_HANDLES` plus the rows before it runs, and more than
-//! `MAX_HANDLES` stops the boot. An image that raises neither slab cannot
-//! reach it: `kcore.limits` asserts the table holds the floors' rows beside
-//! five handles.
+//! its table holds stops the boot. An image that raises neither slab cannot
+//! reach it: `kcore.limits` asserts the body's table holds the floors' rows
+//! beside five handles.
 
 import sosimage.failure.{BuildError}
 import sosimage.fields.{Fields}
 import sosimage.kernel.{
-    ATTACHMENTS, EVENTS, INTERRUPTS, IOMEMORIES, KernelFacts, MAPPINGS,
-    MEMORIES, PIPES, PROCESSES, PROCESS_RECORDS, QUOTA_HANDLE, QUOTA_KINDS,
-    QUOTA_MAPPING, SLAB_KINDS, THREADS, TIMERS, WAITERS, quota_kind_name,
-    slab_kind_name,
+    ATTACHMENTS, EVENTS, HANDLE_BLOCKS, INTERRUPTS, IOMEMORIES, KernelFacts,
+    MAPPINGS, MEMORIES, PIPES, PROCESSES, PROCESS_RECORDS, QUOTA_HANDLE,
+    QUOTA_KINDS, QUOTA_MAPPING, SLAB_KINDS, THREADS, TIMERS, WAITERS,
+    quota_kind_name, slab_kind_name,
 }
 
 /// The handles root holds at boot before its rows' (spec §12): System,
@@ -46,10 +52,12 @@ static MAPPINGS_PER_BODY: Int = 4
 /// bits wide (`kernel/abi/src/ops.saw`'s `QUOTA_UNLIMITED`).
 public static QUOTA_UNLIMITED: Int = 0xFFFF
 
-/// What an image description asks for, by kind value; -1 is not stated.
+/// What an image description asks for, by kind value, and root's handle
+/// table; -1 is not stated.
 public struct ImageLimits {
     raise: Vector<Int>
     quota: Vector<Int>
+    root_handles: Int
 }
 
 @synthesize
@@ -70,12 +78,12 @@ extension ImageLimits {
             try! quota.push(-1)
             q = q + 1
         }
-        ImageLimits(raise: move raise, quota: move quota)
+        ImageLimits(raise: move raise, quota: move quota, root_handles: -1)
     }
 
     /// Reads the description's `limits` object: `slabs`, the slots each named
-    /// kind is raised by, and `quotas`, each named default. Both may be left
-    /// out; an unknown name is refused.
+    /// kind is raised by, `quotas`, each named default, and `root-handles`,
+    /// root's handle table. Each may be left out; an unknown name is refused.
     public static func read(limits: &var Fields) -> Result<ImageLimits, BuildError> {
         let empty = ImageLimits.none()
         var raise = empty.raise.copy()
@@ -112,13 +120,21 @@ extension ImageLimits {
             }
             try quotas.finish()
         }
+        var root_handles = -1
+        if limits.has("root-handles") {
+            root_handles = try limits.integer("root-handles")
+            if root_handles < 0 {
+                return BuildError(message: "the image's `limits`: `root-handles` is negative ({root_handles})")
+            }
+        }
         try limits.finish()
-        return ImageLimits(raise: move raise, quota: move quota)
+        return ImageLimits(raise: move raise, quota: move quota,
+                           root_handles: root_handles)
     }
 
     /// The `limits` object of an image description that `read` reads back as
     /// these limits: each stated kind under `slabs`, each stated default under
-    /// `quotas`, in kind order.
+    /// `quotas`, in kind order, and root's table when it is stated.
     public func json(&self) -> String {
         var slabs = Vector<String>()
         var k = 0
@@ -138,7 +154,12 @@ extension ImageLimits {
             }
             q = q + 1
         }
-        "\{\"slabs\": \{{slabs.join(", ")}\}, \"quotas\": \{{quotas.join(", ")}\}\}"
+        let root = if self.root_handles >= 0 {
+            ", \"root-handles\": {self.root_handles}"
+        } else {
+            ""
+        }
+        "\{\"slabs\": \{{slabs.join(", ")}\}, \"quotas\": \{{quotas.join(", ")}\}{root}\}"
     }
 }
 
@@ -152,11 +173,13 @@ public struct SlabArea {
 }
 
 /// What an image's limits come to: whether it carries a block at all, the
-/// areas, in kind order, and every quota default, by kind value.
+/// areas, in kind order, every quota default, by kind value, and the handle
+/// blocks root's table takes.
 public struct SlabPlan {
     block: Bool
     areas: Vector<SlabArea>
     defaults: Vector<Int>
+    root_blocks: Int
 }
 
 @synthesize
@@ -166,7 +189,7 @@ extension SlabPlan {
     /// The plan of an image that states no limits: no block, no areas.
     public static func none() -> SlabPlan {
         SlabPlan(block: false, areas: Vector<SlabArea>(),
-                 defaults: Vector<Int>())
+                 defaults: Vector<Int>(), root_blocks: 0)
     }
 }
 
@@ -187,6 +210,19 @@ public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, name: String,
         try! total.push(if stated < 0 { floor } else { floor + stated })
         k = k + 1
     }
+
+    let longest = facts.handles + facts.table_blocks * facts.handle_block
+    if limits.root_handles > longest {
+        return BuildError(message: "{name}: the image's root handle table is {limits.root_handles}, past the longest handle table ({longest})")
+    }
+    var root_blocks = 0
+    if limits.root_handles > facts.handles {
+        root_blocks = ((limits.root_handles - facts.handles + facts.handle_block - 1)
+                       / facts.handle_block)
+    }
+    let root_table = facts.handles + root_blocks * facts.handle_block
+    try derive(&var total, &limits, HANDLE_BLOCKS, root_blocks, name,
+               "root's handle table of {limits.root_handles} takes {root_blocks}")
 
     let bodies = total.get(PROCESSES) ?? 0
     try derive(&var total, &limits, PROCESS_RECORDS,
@@ -229,8 +265,13 @@ public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, name: String,
         return BuildError(message: "{name}: the region table mints {device_rows} IoMemory objects at boot, past the image's {iomemories}")
     }
     let boot_handles = ROOT_BOOT_HANDLES + memory_rows + device_rows
-    if boot_handles > facts.handles {
-        return BuildError(message: "{name}: root holds {boot_handles} handles at boot, its System, Process and Thread and one for each of the region table's {memory_rows + device_rows} rows, past MAX_HANDLES ({facts.handles})")
+    if boot_handles > root_table {
+        let bound = if root_blocks == 0 {
+            "MAX_HANDLES ({facts.handles})"
+        } else {
+            "root's handle table ({root_table})"
+        }
+        return BuildError(message: "{name}: root holds {boot_handles} handles at boot, its System, Process and Thread and one for each of the region table's {memory_rows + device_rows} rows, past {bound}")
     }
 
     var defaults = Vector<Int>()
@@ -279,7 +320,8 @@ public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, name: String,
         }
         k = k + 1
     }
-    return SlabPlan(block: true, areas: move areas, defaults: move defaults)
+    return SlabPlan(block: true, areas: move areas, defaults: move defaults,
+                    root_blocks: root_blocks)
 }
 
 /// Settle derived kind `kind`'s total against `derivation`: the derivation

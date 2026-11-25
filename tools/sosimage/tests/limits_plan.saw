@@ -99,6 +99,34 @@ func main() {
     assert(blocks_stated.json().equals("\{\"slabs\": \{\"handle-blocks\": 3\}, \"quotas\": \{\}\}"),
            "handle blocks read back: {blocks_stated.json()}")
 
+    // Root's handle table, rounded up to a whole block: the block's header
+    // carries root's blocks, and the HandleBlocks total is derived to hold
+    // them. A table at the body's length takes none.
+    let root48 = plan("\{\"root-handles\": 48\}")
+    assert(root48.root_blocks == 1, "48 entries: one block")
+    let rb = root48.areas.get(root48.areas.len() - 1)!
+    assert(rb.kind == 13 && rb.slots == 1, "the HandleBlocks area holds root's")
+    let root48_fields = try! encode_block(&root48, 4)
+    assert(root48_fields.get(11)!.bytes == 4 && root48_fields.get(11)!.value == 1,
+           "the header word is root's block count")
+    assert(plan("\{\"root-handles\": 33\}").root_blocks == 1, "33: one block")
+    assert(plan("\{\"root-handles\": 49\}").root_blocks == 2, "49: two blocks")
+    assert(plan("\{\"root-handles\": 128\}").root_blocks == 6,
+           "the longest table: six blocks")
+    let root32 = plan("\{\"root-handles\": 32\}")
+    assert(root32.root_blocks == 0
+           && root32.areas.get(root32.areas.len() - 1)!.kind != 13,
+           "the body's table: no blocks and no HandleBlocks area")
+    let root_unstated = plan("\{\}")
+    assert(root_unstated.root_blocks == 0, "unstated: no blocks")
+    let blocks_above = plan("\{\"slabs\": \{\"handle-blocks\": 3\}, \"root-handles\": 48\}")
+    assert(blocks_above.root_blocks == 1
+           && blocks_above.areas.get(blocks_above.areas.len() - 1)!.slots == 3,
+           "blocks stated above root's are taken as stated")
+    let root_stated = stated("\{\"root-handles\": 48\}")
+    assert(root_stated.json().equals("\{\"slabs\": \{\}, \"quotas\": \{\}, \"root-handles\": 48\}"),
+           "root's table read back: {root_stated.json()}")
+
     // A derived total stated above its derivation is taken as stated.
     let above = plan("\{\"slabs\": \{\"processes\": 1, \"process_records\": 10\}\}")
     let rec = above.areas.get(above.areas.len() - 1)!
@@ -124,7 +152,7 @@ func main() {
         q = q + 1
     }
     assert(fields.get(11)!.bytes == 4 && fields.get(11)!.value == 0,
-           "the reserved word")
+           "root's handle blocks: none stated")
     assert(fields.get(12)!.value == 1, "area 0's kind")
     assert(fields.get(14)!.symbol.equals("_sos_slab1_start"), "area 0's base")
     assert(fields.get(15)!.bytes == 4 && fields.get(15)!.value == 0,
@@ -210,6 +238,18 @@ func main() {
                    "img: the image's event quota default is 8, not below its slab's capacity (8)")
     expect_refusal("\{\"quotas\": \{\"handle\": 32\}\}",
                    "img: the image's handle quota default is 32, not below MAX_HANDLES (32)")
+    expect_refusal("\{\"root-handles\": 129\}",
+                   "img: the image's root handle table is 129, past the longest handle table (128)")
+    expect_refusal("\{\"slabs\": \{\"handle-blocks\": 1\}, \"root-handles\": 49\}",
+                   "img: the image's handle-blocks come to 1, below 2: root's handle table of 49 takes 2")
+    let negative_doc = try! JsonValue.parse("\{\"root-handles\": -1\}")
+    var negative_fields = try! Fields(move negative_doc, "limits")
+    let negative = match ImageLimits.read(&var negative_fields) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(negative.equals("the image's `limits`: `root-handles` is negative (-1)"),
+           "a negative root table: {negative}")
     expect_refusal("\{\"quotas\": \{\"mapping\": 5\}\}",
                    "img: the image's mapping quota default is 5, past the 4 grant rows an image leaves of this board's 8")
 
@@ -249,4 +289,16 @@ func main() {
     }
     assert(past_mixed.equals("img: root holds 33 handles at boot, its System, Process and Thread and one for each of the region table's 30 rows, past MAX_HANDLES (32)"),
            "25 and 5 rows: {past_mixed}")
+
+    // Root's rows against root's table, the blocks its image gives it
+    // included: 45 rows fill a table of 48 and 46 are refused, naming it.
+    let longer = stated("\{\"slabs\": \{\"memories\": 40\}, \"root-handles\": 48\}")
+    let longer_full = try! plan_limits(&facts, &longer, "img", 45, 0)
+    assert(longer_full.root_blocks == 1, "45 rows beside root's three handles")
+    let longer_past = match plan_limits(&facts, &longer, "img", 46, 0) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(longer_past.equals("img: root holds 49 handles at boot, its System, Process and Thread and one for each of the region table's 46 rows, past root's handle table (48)"),
+           "46 rows: {longer_past}")
 }
