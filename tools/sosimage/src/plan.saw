@@ -109,8 +109,9 @@ import sosimage.fields.{Fields}
 import sosimage.heapsize.{HEAP_CLASS_WORDS, HEAP_CONTROL_FIXED, heap_classes}
 import sosimage.hex.{hex}
 import sosimage.imagefile.{Bindings, ImageFile, SetupOp}
-import sosimage.kernel.{KernelFacts, QUOTA_HANDLE, QUOTA_KINDS, QUOTA_MAPPING, QUOTA_MEMORY}
-import sosimage.limits.{PlanNeeds, QUOTA_UNLIMITED}
+import sosimage.kernel.{KernelFacts, MEMORIES, QUOTA_HANDLE, QUOTA_KINDS,
+                        QUOTA_MAPPING, QUOTA_MEMORY, SLAB_KINDS, THREADS}
+import sosimage.limits.{PlanNeeds, QUOTA_UNLIMITED, quota_slab}
 import sosimage.regions.{RegionKind}
 import sosimage.rights.{CEILING_KINDS, ceiling_kind_at, ceiling_kind, right_word}
 import sosimage.rules.{refused}
@@ -290,14 +291,13 @@ extension ImagePlan: ExplicitCopy {}
 /// The objects of the kinds the stock root makes for a plan that an image's
 /// slabs hold: Process (root and each child), Pipe (one per connection),
 /// Interrupt (one per line) and IoMemory (one per device row, carve given and
-/// setup write's carve); and the Memory objects of the region table's rows
-/// and its children's heaps.
+/// setup write's carve). The slabs that hold the rest are derived
+/// (`sosimage.limits.plan_limits`).
 public struct PlanSlabs {
     processes: Int
     pipes: Int
     interrupts: Int
     iomemories: Int
-    memories: Int
 }
 
 /// The `QuotaKind` value a quota key names.
@@ -745,19 +745,22 @@ func quota_rows(image: &ImageFile, d: &Declaration, process: String,
 /// heaps have grown, its `Mapping` row against its windows and heaps and its
 /// `Memory` row against its heaps; root at every step of the plan, its
 /// handle table against the longest one and the objects it has made of each
-/// kind `slabs` counts; and the Memory objects of the region table's rows and
-/// the heaps against the image's slab. Answers what the plan asks of the
-/// handle tables and boot sets (`PlanNeeds`).
+/// kind `slabs` counts. Answers what the plan asks of the handle tables, boot
+/// sets and slabs (`PlanNeeds`).
 public func check_plan(plan: &ImagePlan, facts: &KernelFacts, defaults: &Vector<Int>,
                        slabs: &PlanSlabs, what: String) -> Result<PlanNeeds, BuildError> {
     var needs = PlanNeeds.none()
     needs.stock = true
+    var k = 0
+    while k < SLAB_KINDS {
+        try! needs.summed.push(0)
+        k = k + 1
+    }
     var c = 0
-    var heaps = 0
     while c < plan.children.len() {
         borrow let child = plan.children[c] {
             let row = try check_child(&child, &facts, &defaults, what)
-            heaps = heaps + child.heaps
+            add_rows(&var needs, &child)
             try! needs.names.push(child.name)
             try! needs.rows.push(row)
             try! needs.records.push(child.records.len())
@@ -768,18 +771,35 @@ public func check_plan(plan: &ImagePlan, facts: &KernelFacts, defaults: &Vector<
     let peak = try root_steps(&plan, longest, &slabs, what)
     needs.held = peak.held
     needs.step = peak.step
-    var rows = 2 * plan.children.len()
-    var r = 0
-    while r < plan.rows.len() {
-        if (plan.rows.get(r)!).kind != RegionKind.Device {
-            rows = rows + 1
-        }
-        r = r + 1
-    }
-    if rows + heaps > slabs.memories {
-        return BuildError(message: "{what}: the region table mints {rows} Memory objects at boot and the processes' {heaps} heaps make one each, {rows + heaps} in all, past the image's {slabs.memories}")
-    }
     return move needs
+}
+
+/// Adds what `child`'s rows ask of each slab to `needs.summed`: each quota row
+/// that draws on a slab, a Thread row of its own or one for its main thread,
+/// and at least its heaps' Memory objects, which its `Memory` row covers.
+func add_rows(needs: &var PlanNeeds, child: &PlanChild) {
+    var threads = 1
+    var memories = child.heaps
+    var q = 0
+    while q < child.quota.len() {
+        let row = child.quota.get(q)!
+        q = q + 1
+        let slab = quota_slab(row.kind)
+        if slab < 0 {
+            continue
+        }
+        if slab == THREADS {
+            threads = row.limit
+        } else if slab == MEMORIES {
+            if row.limit > memories {
+                memories = row.limit
+            }
+        } else {
+            needs.summed[slab] = (needs.summed.get(slab) ?? 0) + row.limit
+        }
+    }
+    needs.summed[THREADS] = (needs.summed.get(THREADS) ?? 0) + threads
+    needs.summed[MEMORIES] = (needs.summed.get(MEMORIES) ?? 0) + memories
 }
 
 /// `check_plan` for one child; answers its `Handle` row.

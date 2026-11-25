@@ -11,7 +11,9 @@ import sosimage.board.{Board, Span}
 import sosimage.declaration.{Declaration}
 import sosimage.heapsize.{first_growth}
 import sosimage.imagefile.{ImageFile, bind}
-import sosimage.kernel.{KernelFacts}
+import sosimage.kernel.{EVENTS, IOMEMORIES, KernelFacts, MAPPINGS, MEMORIES,
+                        PIPES, THREADS, TIMERS, WAITERS}
+import sosimage.limits.{PlanNeeds}
 import sosimage.layout.{Placement, check_window, process_script}
 import sosimage.plan.{ImagePlan, PlanSlabs, Source, check_plan, plan_image, plan_module}
 import sosimage.boardcheck.{HalFacts}
@@ -212,20 +214,75 @@ func defaults(handles: Int, mappings: Int) -> Vector<Int> {
     move out
 }
 
-func slabs(memories: Int) -> PlanSlabs {
-    PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100,
-              memories: memories)
+func slabs() -> PlanSlabs {
+    PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100)
 }
 
 // What `check_plan` says of `plan`; "" when it holds.
-func checked(plan: &ImagePlan, handles: Int, mappings: Int, memories: Int) -> String {
+func checked(plan: &ImagePlan, handles: Int, mappings: Int) -> String {
     let f = facts()
     let d = defaults(handles, mappings)
-    let s = slabs(memories)
+    let s = slabs()
     match check_plan(&plan, &f, &d, &s, "i.toml") {
         case Ok(_) -> "",
         case Err(e) -> e.message
     }
+}
+
+// What `needs` adds up of the children's rows in slab `kind`.
+func sum_of(needs: &PlanNeeds, kind: Int) -> Int {
+    needs.summed.get(kind) ?? 0
+}
+
+// What `check_plan` adds up of the children's rows, by slab: a declaration's
+// row, an image entry's over it, the main thread of a child with no Thread row
+// and the heaps of one whose Memory row is no larger. The second child's rows
+// are counted as the first's are.
+func summed() {
+    let f = facts()
+    let d = defaults(32, 4)
+    var logger = logger_lines()
+    let logger_rows: Vector<String> = [
+        "[quota]", "threads = 3", "events = 2", "waiters = 2", "timers = 1",
+        "memories = 3", "iomemories = 1", "mappings = 5", "pipes = 2"]
+    try! logger.append(&logger_rows)
+    var watcher = watcher_lines()
+    let watcher_rows: Vector<String> = [
+        "[quota]", "threads = 5", "events = 3", "waiters = 1", "timers = 4",
+        "memories = 2", "iomemories = 2", "mappings = 6", "pipes = 7"]
+    try! watcher.append(&watcher_rows)
+    var decls = Vector<Declaration>()
+    try! decls.push(decl(&logger, "logger/process.toml"))
+    try! decls.push(decl(&watcher, "watcher/process.toml"))
+    var both = image_lines()
+    let entry: Vector<String> = ["pools = \{ scratch = \"spare\" \}",
+        "[[process]]", "name = \"watcher\"", "package = \"watcher\"",
+        "quota = \{ threads = 7 \}"]
+    both[10] = entry.join("\n")
+    let plan = planned(move both, &decls)
+    let sums = try! check_plan(&plan, &f, &d, &slabs(), "i.toml")
+    assert(sum_of(&sums, THREADS) == 10, "3, then 7 over the declared 5")
+    assert(sum_of(&sums, EVENTS) == 5, "2 and 3 events")
+    assert(sum_of(&sums, WAITERS) == 3, "2 and 1 waiters")
+    assert(sum_of(&sums, TIMERS) == 5, "1 and 4 timers")
+    assert(sum_of(&sums, MEMORIES) == 5, "3 and 2, each over its heaps")
+    assert(sum_of(&sums, IOMEMORIES) == 3, "1 and 2 iomemories")
+    assert(sum_of(&sums, MAPPINGS) == 11, "5 and 6 mappings")
+    assert(sum_of(&sums, PIPES) == 9, "2 and 7 pipes")
+
+    // A child with no rows counts its main thread and its heaps.
+    var bare = Vector<Declaration>()
+    try! bare.push(decl(&watcher_lines(), "watcher/process.toml"))
+    let alone: Vector<String> = ["format = 1",
+        "[image]", "name = \"w\"", "board = \"esp32s3\"", "tick = false",
+        "[root]", "package = \"stock\"",
+        "[[process]]", "name = \"watcher\"", "package = \"watcher\""]
+    let bare_plan = planned(alone.copy(), &bare)
+    let none = try! check_plan(&bare_plan, &f, &d, &slabs(), "i.toml")
+    assert(sum_of(&none, THREADS) == 1, "a main thread")
+    assert(sum_of(&none, MEMORIES) == 1, "a heap")
+    assert(sum_of(&none, EVENTS) == 0 && sum_of(&none, PIPES) == 0,
+           "no row counts nothing")
 }
 
 func main() {
@@ -233,6 +290,7 @@ func main() {
     images()
     plans()
     rows()
+    summed()
     arenas()
     growth()
     windows()
@@ -576,12 +634,12 @@ func plans() {
 func rows() {
     let decls = loggers()
     let plan = planned(image_lines(), &decls)
-    assert(checked(&plan, 10, 2, 100).is_empty(), "the logger's rows hold")
+    assert(checked(&plan, 10, 2).is_empty(), "the logger's rows hold")
     // `Handle`: its records, its Process handle, three per heap and the
     // heaps' Process handle.
-    expect_text(checked(&plan, 9, 2, 100), "i.toml: the process logger's `Handle` row is 9, short of the 10 handles it holds once its 2 heaps have grown", "a Handle row short")
+    expect_text(checked(&plan, 9, 2), "i.toml: the process logger's `Handle` row is 9, short of the 10 handles it holds once its 2 heaps have grown", "a Handle row short")
     // `Mapping`: a row per heap.
-    expect_text(checked(&plan, 10, 1, 100), "i.toml: the process logger's `Mapping` row is 1, short of the 2 rows it maps, one for each window (0) and each heap (2)", "a Mapping row short")
+    expect_text(checked(&plan, 10, 1), "i.toml: the process logger's `Mapping` row is 1, short of the 2 rows it maps, one for each window (0) and each heap (2)", "a Mapping row short")
     // ...and a row per window: a watcher's Mapping row of one is short.
     var watchers = Vector<Declaration>()
     var watcher_quota = watcher_lines()
@@ -593,14 +651,14 @@ func rows() {
         "[root]", "package = \"stock\"",
         "[[process]]", "name = \"watcher\"", "package = \"watcher\""]
     let watched = planned(alone.copy(), &watchers)
-    expect_text(checked(&watched, 16, 4, 100), "i.toml: the process watcher's `Mapping` row is 1, short of the 2 rows it maps, one for each window (1) and each heap (1)", "a window's row")
+    expect_text(checked(&watched, 16, 4), "i.toml: the process watcher's `Mapping` row is 1, short of the 2 rows it maps, one for each window (1) and each heap (1)", "a window's row")
     var watcher_two = watcher_lines()
     try! watcher_two.push("[quota]")
     try! watcher_two.push("mappings = 2")
     var roomy = Vector<Declaration>()
     try! roomy.push(decl(&watcher_two, "watcher/process.toml"))
     let room = planned(alone.copy(), &roomy)
-    assert(checked(&room, 16, 4, 100).is_empty(), "a row per window and heap")
+    assert(checked(&room, 16, 4).is_empty(), "a row per window and heap")
     // `Memory`: a row per heap.
     var memory_one = logger_lines()
     try! memory_one.push("[quota]")
@@ -608,11 +666,14 @@ func rows() {
     var short_memory = Vector<Declaration>()
     try! short_memory.push(decl(&memory_one, "logger/process.toml"))
     let memory_plan = planned(image_lines(), &short_memory)
-    expect_text(checked(&memory_plan, 10, 2, 100), "i.toml: the process logger's `Memory` row is 1, short of the 2 its heaps hold, one each", "a Memory row short")
-    // The image's Memory slab: the blob, the destination, the pool and two
-    // heaps' pools at boot, and a Memory for each heap.
-    assert(checked(&plan, 10, 2, 7).is_empty(), "seven Memory objects")
-    expect_text(checked(&plan, 10, 2, 6), "i.toml: the region table mints 5 Memory objects at boot and the processes' 2 heaps make one each, 7 in all, past the image's 6", "the Memory slab")
+    expect_text(checked(&memory_plan, 10, 2), "i.toml: the process logger's `Memory` row is 1, short of the 2 its heaps hold, one each", "a Memory row short")
+    // The Memory slab is derived (`plan_limits`): a child counts its heaps,
+    // once each, when its row is no larger.
+    let f = facts()
+    let d = defaults(10, 2)
+    let sums = try! check_plan(&plan, &f, &d, &slabs(), "i.toml")
+    assert(sum_of(&sums, MEMORIES) == 2, "the logger's two heaps, once each")
+    assert(sum_of(&sums, THREADS) == 1, "its main thread")
 
     // On a board that translates, the region and the heaps' pools within the
     // space above the link address.

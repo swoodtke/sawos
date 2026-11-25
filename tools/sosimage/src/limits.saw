@@ -9,7 +9,18 @@
 //! bodies, attachments at least events + interrupts + timers + records. An
 //! image may state a derived total above its derivation and never below it.
 //! The Mapping slab is sized at four per process body when the image states
-//! none; that is how the builder sizes a default, and nothing checks it.
+//! none, or the sum below when that is larger; that is how the builder sizes a
+//! default, and nothing checks it.
+//!
+//! For a stock root the Thread, Event, Waiter, Timer, Mapping, Pipe, Memory
+//! and IoMemory slabs are also derived from the plan: each total is at least
+//! root's own objects of the kind plus each child's row of it, a declaration's
+//! or the image's, so the rows the children state always fit the slab they
+//! draw from. Root's own are its main thread, its one Waiter and the Memory
+//! objects of the region table; a child that states no row of a kind counts
+//! nothing of it, except a Thread, which counts its main thread, and a
+//! Memory, which counts at least its heaps. An image may state such a total
+//! above its sum and never below it.
 //!
 //! Each quota default an image states is at least the compiled one, below its
 //! slab's capacity at boot (the `handle` default below the handle table), fits
@@ -172,10 +183,12 @@ extension ImageLimits {
 }
 
 /// What a stock root's plan asks of the machine's handle tables and boot
-/// sets, as `check_plan` finds it: the most handles root holds at any step and
-/// the first step it holds them at, and each child's name, `Handle` row and
-/// the records its boot set is given. An image whose root is not the stock
-/// root has no plan to read, and `PlanNeeds.none()` asks nothing.
+/// sets and slabs, as `check_plan` finds it: the most handles root holds at
+/// any step and the first step it holds them at, each child's name, `Handle`
+/// row and the records its boot set is given, and `summed`, by `SlabKind`
+/// value, what the children's rows add up to in each slab (see
+/// `plan_limits`). An image whose root is not the stock root has no plan to
+/// read, and `PlanNeeds.none()` asks nothing.
 public struct PlanNeeds {
     stock: Bool
     held: Int
@@ -183,6 +196,7 @@ public struct PlanNeeds {
     names: Vector<String>
     rows: Vector<Int>
     records: Vector<Int>
+    summed: Vector<Int>
 }
 
 @synthesize
@@ -192,7 +206,8 @@ extension PlanNeeds {
     /// The needs of an image with no plan to read.
     public static func none() -> PlanNeeds {
         PlanNeeds(stock: false, held: 0, step: "", names: Vector<String>(),
-                  rows: Vector<Int>(), records: Vector<Int>())
+                  rows: Vector<Int>(), records: Vector<Int>(),
+                  summed: Vector<Int>())
     }
 
     /// Whether the plan needs handle blocks beyond the body's `MAX_HANDLES`
@@ -291,12 +306,33 @@ public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, needs: &PlanN
     try derive(&var total, &limits, HANDLE_BLOCKS, root_blocks + child_blocks, name,
                "root's handle table of {root_table} takes {root_blocks} and the processes' Handle rows {child_blocks}")
 
+    // A stock root's slabs hold root's own objects and what each child's rows
+    // ask: each kind's total is their sum, which a stated total may exceed.
+    // Root has its main thread, its one Waiter and the region table's Memory
+    // objects, and a child with no row of a kind counts nothing of it.
+    var threads = 0
+    if needs.stock {
+        threads = 1 + (needs.summed.get(THREADS) ?? 0)
+        try sum_kind(&var total, &limits, &needs, EVENTS, 0, name)
+        try sum_kind(&var total, &limits, &needs, WAITERS, 1, name)
+        try sum_kind(&var total, &limits, &needs, TIMERS, 0, name)
+        try sum_kind(&var total, &limits, &needs, MAPPINGS, 0, name)
+        try sum_kind(&var total, &limits, &needs, PIPES, 0, name)
+        try sum_kind(&var total, &limits, &needs, MEMORIES, memory_rows, name)
+        try sum_kind(&var total, &limits, &needs, IOMEMORIES, 0, name)
+    }
+
     let bodies = total.get(PROCESSES) ?? 0
     try derive(&var total, &limits, PROCESS_RECORDS,
                facts.records_per_body * bodies, name,
                "{facts.records_per_body} records per process body, for {bodies} bodies")
-    try derive(&var total, &limits, THREADS, bodies, name,
-               "a main thread for each of {bodies} process bodies")
+    if threads > bodies {
+        try derive(&var total, &limits, THREADS, threads, name,
+                   "root's main thread and the processes' Thread rows")
+    } else {
+        try derive(&var total, &limits, THREADS, bodies, name,
+                   "a main thread for each of {bodies} process bodies")
+    }
     let waitables = ((total.get(EVENTS) ?? 0) + (total.get(INTERRUPTS) ?? 0)
                      + (total.get(TIMERS) ?? 0) + (total.get(PROCESS_RECORDS) ?? 0))
     try derive(&var total, &limits, ATTACHMENTS, waitables, name,
@@ -420,6 +456,16 @@ func blocks_of(facts: &KernelFacts, count: Int) -> Int {
     (count - facts.handles + facts.handle_block - 1) / facts.handle_block
 }
 
+/// Settle slab `kind`'s total against `own` objects of root's and the sum of
+/// the children's rows `needs` holds for it.
+func sum_kind(total: &var Vector<Int>, limits: &ImageLimits, needs: &PlanNeeds,
+              kind: Int, own: Int, name: String) -> Result<Void, BuildError> {
+    let rows = needs.summed.get(kind) ?? 0
+    try derive(&var total, &limits, kind, own + rows, name,
+               "root's own {own} and the processes' rows {rows}")
+    return
+}
+
 /// Settle derived kind `kind`'s total against `derivation`: the derivation
 /// when the image states none, the stated total when it is at least that, and
 /// a refusal naming `why` when it is below.
@@ -439,7 +485,7 @@ func derive(total: &var Vector<Int>, limits: &ImageLimits, kind: Int,
 }
 
 /// The slab a quota kind draws from, by `SlabKind` value. `handle` has none.
-func quota_slab(q: Int) -> Int {
+public func quota_slab(q: Int) -> Int {
     match q {
         case 0 -> THREADS,
         case 1 -> EVENTS,

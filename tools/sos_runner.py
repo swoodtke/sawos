@@ -10490,6 +10490,27 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
 
+    # Two instances of a process whose declaration gives it a `Thread` row of
+    # 9, the first raised to 10 by the image (`tests/images/
+    # stock_rows_summed.toml`). The image states no `threads` total: the
+    # builder derives it from root's main thread and both rows, 20 in all, past
+    # the board's default total of 16. Each instance makes every thread its
+    # row allows and yields while holding them, so both hold theirs at once.
+    # Without the sum a create answers `NoResource` before a row's limit.
+    {
+        "name": "stock_rows_summed",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_rows_summed.toml"},
+        "expect_out": ["{banner}",
+                       "SOS rows: limit=10 made=9",
+                       "SOS rows: limit=9 made=8",
+                       "root: first ended status=65536",
+                       "root: second ended status=65536"],
+        "expect_tail": "root: second ended status=65536",
+        "expect_clean_exit": True,
+    },
+
     # One record of each shape the stock root gives, each with the rights its
     # declaration names (`tests/images/stock_record_shapes.toml`), and each
     # child prints the rights it holds: `first` a sibling of the RTC's row

@@ -76,7 +76,8 @@ func needs_of(held: Int, step: String, names: &[String], rows: &[Int],
         i = i + 1
     }
     PlanNeeds(stock: true, held: held, step: step, names: move n,
-              rows: ints(&rows), records: ints(&records))
+              rows: ints(&rows), records: ints(&records),
+              summed: Vector<Int>())
 }
 
 // A stock root's plan with no children that holds `held` handles at most.
@@ -269,7 +270,119 @@ func stock_derivations() {
     assert(not PlanNeeds.none().wants_blocks(&facts), "none")
 }
 
+// A stock root's plan whose children's rows add up to `n` slots of slab
+// `kind` and to nothing in any other.
+func summing(kind: Int, n: Int) -> PlanNeeds {
+    var needs = root_needs(5)
+    var k = 0
+    while k < 14 {
+        try! needs.summed.push(if k == kind { n } else { 0 })
+        k = k + 1
+    }
+    move needs
+}
+
+// The slots `plan` links of slab `kind`; 0 for no area.
+func slots_of(plan: &SlabPlan, kind: Int) -> Int {
+    var i = 0
+    while i < plan.areas.len() {
+        if plan.areas.get(i)!.kind == kind {
+            return plan.areas.get(i)!.slots
+        }
+        i = i + 1
+    }
+    0
+}
+
+// The slots of slab `kind` the limits `text` come to against `needs`.
+func slots_in(text: String, needs: &PlanNeeds, kind: Int) -> Int {
+    slots_of(&plan_needing(text, &needs), kind)
+}
+
+// The limits object that raises slab `kind` by `n`.
+func raising(kind: String, n: Int) -> String {
+    "\{\"slabs\": \{\"{kind}\": {n}\}\}"
+}
+
+// The message a total of `got` for slab `kind`, below its sum, is refused
+// with; `why` is what the sum is made of.
+func below(kind: String, got: Int, sum: Int, why: String) -> String {
+    "img: the image's {kind} come to {got}, below {sum}: {why}"
+}
+
+// `below`, for a kind whose sum is root's own `own` and the rows' `rows`.
+func below_own(kind: String, got: Int, own: Int, rows: Int) -> String {
+    below(kind, got, own + rows,
+          "root's own {own} and the processes' rows {rows}")
+}
+
+// What a stock root's plan asks of the slabs: root's own objects and the sum
+// of each child's rows, each kind's total at least that, a stated total never
+// below it. The kernel's floors: 8 events, 4 waiters, 8 timers, 16 memories,
+// 8 iomemories, 8 mappings, 8 threads and 4 pipes, with three process bodies.
+// A kind's `SlabKind` value is its argument to `summing` and `slots_in`.
+func summed_rows() {
+    let facts = kernel()
+    let none = "\{\}"
+    // Each kind's total is the sum, in slots above its floor.
+    assert(slots_in(none, &summing(0, 20), 0) == 12, "events: 20 over 8")
+    assert(slots_in(none, &summing(1, 10), 1) == 7, "waiters: 1 and 10 over 4")
+    assert(slots_in(none, &summing(4, 30), 4) == 22, "timers: 30 over 8")
+    assert(slots_in(none, &summing(6, 20), 6) == 12, "iomemories: 20 over 8")
+    assert(slots_in(none, &summing(10, 9), 10) == 5, "pipes: 9 over 4")
+    assert(slots_in(none, &summing(9, 9), 9) == 2, "threads: 1 and 9 over 8")
+    // Memory: the region table's 2 rows are root's own, each counted once.
+    assert(slots_in(none, &summing(5, 20), 5) == 6, "memories: 2, 20 over 16")
+    // Mapping: the larger of the sum and four per body.
+    assert(slots_in(none, &summing(7, 40), 7) == 32, "mappings: 40 over 8")
+    assert(slots_in(none, &summing(7, 6), 7) == 4, "mappings: four per body")
+    // What the sums raise, the derivations that follow take up: 30 timers,
+    // 8 events, 4 interrupts and 12 records are 54 attachments over 32.
+    assert(slots_in(none, &summing(4, 30), 3) == 22, "attachments follow")
+
+    // A sum at or under the floor raises nothing.
+    assert(slots_in(none, &summing(0, 8), 0) == 0, "events at the floor")
+    assert(slots_in(none, &summing(0, 0), 0) == 0, "no rows, no events")
+
+    // A stated total is taken at the sum and above it, and refused below it,
+    // naming the kind, the sum and the image's total.
+    let at = raising("events", 12)
+    assert(slots_in(at, &summing(0, 20), 0) == 12, "events: 20 stated over 20")
+    let over = raising("events", 30)
+    assert(slots_in(over, &summing(0, 20), 0) == 30, "events: 38 over 20")
+    expect_refusal_of(&facts, raising("events", 11), &summing(0, 20), 2,
+                      below_own("events", 19, 0, 20))
+    expect_refusal_of(&facts, raising("waiters", 6), &summing(1, 10), 2,
+                      below_own("waiters", 10, 1, 10))
+    expect_refusal_of(&facts, raising("timers", 21), &summing(4, 30), 2,
+                      below_own("timers", 29, 0, 30))
+    expect_refusal_of(&facts, raising("iomemories", 11), &summing(6, 20), 2,
+                      below_own("iomemories", 19, 0, 20))
+    expect_refusal_of(&facts, raising("pipes", 4), &summing(10, 9), 2,
+                      below_own("pipes", 8, 0, 9))
+    expect_refusal_of(&facts, raising("mappings", 31), &summing(7, 40), 2,
+                      below_own("mappings", 39, 0, 40))
+    expect_refusal_of(&facts, raising("memories", 5), &summing(5, 20), 2,
+                      below_own("memories", 21, 2, 20))
+    let why = "root's main thread and the processes' Thread rows"
+    expect_refusal_of(&facts, raising("threads", 1), &summing(9, 9), 2,
+                      below("threads", 9, 10, why))
+    // Bodies past the plan's threads: the larger decides.
+    let bodies = "\{\"slabs\": \{\"threads\": 0, \"processes\": 7\}\}"
+    expect_refusal_of(&facts, bodies, &summing(9, 2), 2,
+                      below("threads", 8, 10,
+                            "a main thread for each of 10 process bodies"))
+
+    // A root that is not the stock root has no plan to sum.
+    var hand = summing(0, 20)
+    hand.stock = false
+    assert(slots_in(none, &hand, 0) == 0, "a hand-written root: nothing")
+    assert(refusal_of(&facts, raising("events", 1), &hand, 2).is_empty(),
+           "and refuses nothing")
+}
+
 func main() {
+    summed_rows()
     stock_derivations()
 
     // A process body raised: the derived totals follow it, each area in kind

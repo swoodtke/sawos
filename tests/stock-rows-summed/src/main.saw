@@ -1,0 +1,99 @@
+//! A child of the stock-root image `tests/images/stock_rows_summed.toml`
+//! whose declaration gives it a `Thread` row (`process.toml`). It makes
+//! threads, without starting them, until one is refused, so it holds every
+//! thread its row allows, and yields once so the image's other instance makes
+//! its own while this one still holds its threads. It then prints what it
+//! made:
+//!
+//!     SOS rows: limit=10 made=9
+//!
+//! The image states no Thread total, so the slab holds both instances' rows
+//! only if the builder derives it from them. A create refused before the
+//! row's limit ends the process with a number that could not be a count.
+
+import sos.{System, QuotaKind, ALL_RIGHTS, sos_process_thread_create,
+            sos_process_thread_self, sos_process_quota_get, sos_process_exit,
+            sos_thread_yield, sos_system_process_self}
+
+/// What it ends with when a step went otherwise.
+static EXIT_MISMATCH: UInt = 98
+
+/// `ENTRY_IMAGE`: the image's own entry.
+static ENTRY_IMAGE: UInt = 0
+
+/// More threads than any row of the image allows.
+static MAX_THREADS: Int = 16
+
+static STATUS_OK: UInt = 0
+
+/// A stack no thread runs on: a created thread is never started, and the
+/// kernel only checks that the word below its top is writable data.
+static STACK_WORDS: Int = 512
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+/// The Thread row `proc`, a Process handle, reads: its limit.
+func limit_of(proc: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_process_quota_get(proc, QuotaKind.Thread as UInt,
+                                       (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    out & 0xFFFF
+}
+
+/// Makes threads on `proc` until one is refused, answering how many it made.
+func make_threads(proc: UInt) unsafe -> Int {
+    var made: Int = 0
+    var status: UInt = STATUS_OK
+    while made < MAX_THREADS && status == STATUS_OK {
+        var thread: UInt = 0
+        status = sos_process_thread_create(proc, ENTRY_IMAGE, stack_top(), 0,
+                                           (&var thread) as UnsafePointer<UInt>)
+        if status == STATUS_OK {
+            made = made + 1
+        }
+    }
+    made
+}
+
+/// Makes the threads its row allows, and yields to let the image's other
+/// instance run; answers the row's limit and how many it made.
+func run(proc: UInt) unsafe -> (UInt, Int) {
+    var me: UInt = 0
+    let found = sos_process_thread_self(proc, (&var me) as UnsafePointer<UInt>)
+    if found != STATUS_OK {
+        return (0, 0)
+    }
+    let limit = limit_of(proc)
+    let made = make_threads(proc)
+    let _ = sos_thread_yield(me)
+    (limit, made)
+}
+
+/// A Process handle onto the caller, as a word.
+func own_process(system: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let _ = sos_system_process_self(system, ALL_RIGHTS as UInt,
+                                    (&var out) as UnsafePointer<UInt>)
+    out
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    // The runtime prints through the System handle it is given here.
+    let _system = System(boot_handle: boot_handle)
+    let proc = own_process(boot_handle)
+    let (limit, made) = run(proc)
+    print("SOS rows: limit={} made={}\n", limit, made)
+    let code = if (made as UInt) + 1 == limit { 0 } else { EXIT_MISMATCH }
+    let _ = sos_process_exit(proc, code)
+}

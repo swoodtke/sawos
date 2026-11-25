@@ -5023,6 +5023,17 @@ reserved.
   The handle blocks the image links are root's and each child's, for its
   `Handle` row past `MAX_HANDLES`; an image's `handle-blocks` may state the
   total larger and never smaller, and the slab block carries root's count.
+  The Thread, Event, Waiter, Timer, Mapping, Pipe, Memory and IoMemory slabs
+  are summed the same way: each total is at least root's own objects of the
+  kind plus each child's row of it, whether its declaration or its image
+  entry states the row. Root's own are its main thread, its one Waiter and
+  the Memory objects of the region table's rows. A kind a child states no
+  row for counts nothing of it, except Thread, which counts its main thread,
+  and Memory, which counts at least its heaps, each one once, since its
+  `Memory` row covers them. The Mapping slab is the larger of the sum and
+  four per process body. An image may state such a total above its sum and
+  never below it; the builder refuses one below, naming the kind, the sum and
+  the image's total.
   A hand-written root has no plan to read: the image or its board's
   `[limits.default]` states both keys, and with neither root's table is
   `MAX_HANDLES` and the machine holds no blocks.
