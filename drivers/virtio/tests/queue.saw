@@ -1,0 +1,494 @@
+// Posting, publishing and taking back chains (virtio 1.2 sections 2.7.13 and
+// 2.7.14): the descriptors written, the barriers' places around the available
+// index and the used ring's flags, the notification, the index arithmetic
+// across the 16-bit wrap and at small queue sizes, every check of the used
+// ring, and the order chains are acted on in.
+
+import virtio.{Completion, DeviceFault, Lifecycle, MemoryPlan, NotCompleted, Queue, QueueFull,
+               Queues}
+import virtio.fake.{EVENT_BARRIER, EVENT_LOAD16, EVENT_LOAD32, EVENT_STORE16, EVENT_STORE32, Fake}
+import virtio.transport.{REGISTER_QUEUE_NOTIFY}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// The base of the queue memory is 4 mod 16, so its first 16-aligned byte
+/// is 12 on.
+static SLACK: UInt32 = 12
+
+struct Up {
+    f: Fake,
+    lc: Lifecycle,
+    q: Queues,
+}
+
+extension Up: NoCopy {}
+
+/// A device with queues of up to `entries` entries, brought up, with a pinned
+/// ring.
+func up_with(entries: UInt32) -> Up {
+    var f = Fake.qemu()
+    f.max_entries = [entries, entries]
+    var lc = Lifecycle()
+    let _ = try! lc.begin(&var f)
+    let q = try! lc.setup_queues(&var f)
+    lc.go_live(&var f)
+    try! lc.pin_ring(&var f)
+    f.clear_log()
+    Up(f: f, lc: move lc, q: q)
+}
+
+func up() -> Up {
+    up_with(256)
+}
+
+/// Writes `count` as the `num_buffers` of receive chain `chain`'s header, in
+/// a 64 entry queue's memory.
+func set_count(f: &var Fake, chain: UInt32, count: UInt16) {
+    let plan = MemoryPlan(64, 64, SLACK)
+    f.poke16(plan.rx_headers + 12 * chain + 10, count)
+}
+
+func is_fault(r: Result<UInt16, DeviceFault>, want: DeviceFault) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func is_fault_next(r: Result<Completion, DeviceFault>, want: DeviceFault) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func is_full(r: Result<UInt32, QueueFull>) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(_) -> true,
+    }
+}
+
+func is_not_completed(r: Result<UInt32, NotCompleted>) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(_) -> true,
+    }
+}
+
+func receive_chain() {
+    var u = up()
+    let plan = MemoryPlan(64, 64, SLACK)
+    let frame = u.lc.ring_address(0x100, 2048)
+    u.q.rx.post_rx(&var u.f, 3, frame)
+    let d = plan.rx.desc + 16 * 6
+    // The header descriptor: the chain's own header buffer, written by the
+    // device, then the frame's descriptor.
+    check(u.f.peek32(d) == (u.f.queues_base as UInt32) + plan.rx_headers + 36 &&
+          u.f.peek32(d + 4) == 0, "the header descriptor's address")
+    check(u.f.peek32(d + 8) == 12, "the header descriptor is 12 bytes")
+    check(u.f.peek16(d + 12) == 3, "the header descriptor is NEXT and WRITE")
+    check(u.f.peek16(d + 14) == 7, "and chains to the frame")
+    check(u.f.peek32(d + 16) == u.f.ring_base as UInt32 + 0x100 && u.f.peek32(d + 20) == 0,
+          "the frame descriptor's address is in the ring")
+    check(u.f.peek32(d + 24) == 2048, "the frame descriptor's length")
+    check(u.f.peek16(d + 28) == 2 && u.f.peek16(d + 30) == 0, "the frame is WRITE and ends the chain")
+    check(u.f.peek16(plan.rx.avail + 4) == 6, "the ring entry names the header descriptor")
+    check(u.f.peek16(plan.rx.avail + 2) == 0, "nothing is published before the kick")
+    check(u.q.rx.is_in_flight(3) && u.q.rx.in_flight_count() == 1, "the chain is in flight")
+    check(u.f.stray_addresses == 0, "both ranges are in pinned objects")
+}
+
+func transmit_chain() {
+    var u = up()
+    let plan = MemoryPlan(64, 64, SLACK)
+    let frame = u.lc.ring_address(0x800, 60)
+    u.q.tx.post_tx(&var u.f, 0, frame)
+    check(u.f.peek32(plan.tx.desc) == (u.f.queues_base as UInt32) + plan.tx_header,
+          "every transmit chain's header is the shared one")
+    check(u.f.peek32(plan.tx.desc + 8) == 12 && u.f.peek16(plan.tx.desc + 12) == 1,
+          "the header is 12 bytes, NEXT and device-read")
+    check(u.f.peek16(plan.tx.desc + 14) == 1, "and chains to the frame")
+    check(u.f.peek32(plan.tx.desc + 16 + 8) == 60 && u.f.peek16(plan.tx.desc + 16 + 12) == 0,
+          "the frame is 60 bytes and device-read")
+    u.q.tx.post_tx(&var u.f, 5, u.lc.ring_address(0x900, 60))
+    check(u.f.peek32(plan.tx.desc + 16 * 10) == (u.f.queues_base as UInt32) + plan.tx_header,
+          "chain 5 shares the same header")
+    check(u.f.peek32(plan.tx_header) == 0 && u.f.peek32(plan.tx_header + 4) == 0 &&
+          u.f.peek32(plan.tx_header + 8) == 0, "the shared header is zero")
+    check(u.f.stray_addresses == 0, "every range is in a pinned object")
+}
+
+/// The index of the first barrier at or after `from`.
+func barrier_at(f: &Fake, from: Int) -> Int {
+    f.find_after(from, EVENT_BARRIER, 0)!
+}
+
+func kick_order() {
+    var u = up()
+    let plan = MemoryPlan(64, 64, SLACK)
+    u.q.rx.post_rx(&var u.f, 0, u.lc.ring_address(0, 2048))
+    u.q.rx.post_rx(&var u.f, 1, u.lc.ring_address(2048, 2048))
+    u.f.clear_log()
+    u.q.rx.kick(&var u.f)
+    let first = barrier_at(&u.f, 0)
+    let publish = u.f.find(EVENT_STORE16, (plan.rx.avail + 2) as UInt64)!
+    let second = barrier_at(&u.f, publish)
+    let flags = u.f.find(EVENT_LOAD16, plan.rx.used as UInt64)!
+    let notify = u.f.find_any_write(REGISTER_QUEUE_NOTIFY)!
+    check(first < publish, "a barrier comes before the available index is written")
+    check(publish < second, "a barrier follows the available index")
+    check(second < flags, "the used ring's flags are read after that barrier")
+    check(flags < notify, "the notification follows the flags")
+    check(u.f.peek16(plan.rx.avail + 2) == 2, "two chains are published at once")
+    check(u.f.last_write(REGISTER_QUEUE_NOTIFY)! == 0, "the receive queue's notification names queue 0")
+    check(u.f.count(EVENT_STORE16) == 1 && u.f.count(EVENT_STORE32) == 0,
+          "the kick writes only the available index")
+}
+
+func notification_suppressed() {
+    var u = up()
+    let plan = MemoryPlan(64, 64, SLACK)
+    u.f.poke16(plan.rx.used, 1)
+    u.q.rx.post_rx(&var u.f, 0, u.lc.ring_address(0, 2048))
+    u.f.clear_log()
+    u.q.rx.kick(&var u.f)
+    check(u.f.peek16(plan.rx.avail + 2) == 1, "the chain is published")
+    check(u.f.find(EVENT_LOAD16, plan.rx.used as UInt64) != None, "the flags are read")
+    check(u.f.find_any_write(REGISTER_QUEUE_NOTIFY) == None, "a device that asks for none is not notified")
+}
+
+func transmit_notifies_queue_1() {
+    var u = up()
+    u.q.tx.post_tx(&var u.f, 0, u.lc.ring_address(0, 60))
+    u.f.clear_log()
+    u.q.tx.kick(&var u.f)
+    check(u.f.last_write(REGISTER_QUEUE_NOTIFY)! == 1, "the transmit queue's notification names queue 1")
+}
+
+func nothing_staged() {
+    var u = up()
+    u.q.rx.kick(&var u.f)
+    check(u.f.log_len == 0, "a kick with nothing staged touches nothing")
+    u.q.rx.post_rx(&var u.f, 0, u.lc.ring_address(0, 2048))
+    u.q.rx.kick(&var u.f)
+    u.f.clear_log()
+    u.q.rx.kick(&var u.f)
+    check(u.f.log_len == 0, "nor does a second one")
+}
+
+func completion() {
+    var u = up()
+    u.q.rx.post_rx(&var u.f, 0, u.lc.ring_address(0, 2048))
+    u.q.rx.kick(&var u.f)
+    check(try! u.q.rx.pending(&var u.f) == 0, "nothing used yet")
+    set_count(&var u.f, 0, 1)
+    u.f.complete(0, 0, 74)
+    u.f.clear_log()
+    check(try! u.q.rx.pending(&var u.f) == 1, "one element used")
+    let plan = MemoryPlan(64, 64, SLACK)
+    let idx = u.f.find(EVENT_LOAD16, (plan.rx.used + 2) as UInt64)!
+    check(barrier_at(&u.f, idx) == idx + 1, "a barrier follows the index and precedes the elements")
+    check(u.f.count(EVENT_LOAD16) == 1, "the index is read once")
+    let done = try! u.q.rx.next(&var u.f)
+    check(done == Completion(chain: 0, len: 74), "the element's chain and length")
+    check(u.f.count(EVENT_LOAD32) == 2, "the element's two words are read once each")
+    check(not u.q.rx.is_in_flight(0) && u.q.rx.in_flight_count() == 0, "the chain is not in flight")
+    check(u.q.rx.is_busy(0), "but cannot be posted again until it is taken in order")
+    check(try! u.q.rx.take_in_order() == 0, "the oldest chain posted is the one completed")
+    check(not u.q.rx.is_busy(0), "and then it can")
+    check(try! u.q.rx.pending(&var u.f) == 0, "and nothing more is pending")
+}
+
+func completed_prefix() {
+    // Chains 0, 1 and 2 are posted in that order; the device uses 2, 0, 1.
+    // The driver acts on them in posting order, only over the completed
+    // prefix.
+    var u = up()
+    var c: UInt32 = 0
+    while c < 3 {
+        u.q.tx.post_tx(&var u.f, c, u.lc.ring_address(c * 64, 60))
+        c = c + 1
+    }
+    u.q.tx.kick(&var u.f)
+    u.f.complete(1, 4, 0)
+    u.f.complete(1, 0, 0)
+    u.f.complete(1, 2, 0)
+    check(try! u.q.tx.pending(&var u.f) == 3, "three used")
+    check(is_not_completed(u.q.tx.take_in_order()), "nothing is completed before one is taken")
+    let a = try! u.q.tx.next(&var u.f)
+    check(a.chain == 2, "chains come back in the order the device used them")
+    check(is_not_completed(u.q.tx.take_in_order()),
+          "chain 2 is done but chain 0, posted before it, is not")
+    check(u.q.tx.is_busy(2), "and chain 2 cannot be posted again")
+    let b = try! u.q.tx.next(&var u.f)
+    check(b.chain == 0, "then chain 0")
+    check(try! u.q.tx.take_in_order() == 0, "the prefix is chain 0")
+    check(is_not_completed(u.q.tx.take_in_order()), "chain 1 is still out")
+    check(u.q.tx.is_in_flight(1) && not u.q.tx.is_in_flight(0) && not u.q.tx.is_in_flight(2),
+          "only the chain not yet used is in flight")
+    let last = try! u.q.tx.next(&var u.f)
+    check(last.chain == 1, "and the third")
+    check(try! u.q.tx.take_in_order() == 1, "chain 1")
+    check(try! u.q.tx.take_in_order() == 2, "then chain 2, completed long before")
+    check(is_not_completed(u.q.tx.take_in_order()), "and nothing remains")
+    check(not u.q.tx.is_busy(2), "chain 2 can be posted again")
+}
+
+func full_and_free() {
+    var u = up()
+    var c: UInt32 = 0
+    while c < 32 {
+        check(try! u.q.rx.free_chain() == c, "the lowest free chain")
+        u.q.rx.post_rx(&var u.f, c, u.lc.ring_address(0, 2048))
+        c = c + 1
+    }
+    check(is_full(u.q.rx.free_chain()), "32 chains fill a 64 entry queue")
+    u.q.rx.kick(&var u.f)
+    set_count(&var u.f, 0, 1)
+    u.f.complete(0, 0, 12)
+    let _ = try! u.q.rx.pending(&var u.f)
+    let _ = try! u.q.rx.next(&var u.f)
+    check(is_full(u.q.rx.free_chain()), "a used chain is free only once taken in order")
+    check(try! u.q.rx.take_in_order() == 0, "chain 0")
+    check(try! u.q.rx.free_chain() == 0, "and then it is free again")
+}
+
+func index_wraps() {
+    // One chain at a time through 70000 round trips: the available and used
+    // indexes both pass 65535, and each ring slot is the index mod the size.
+    var u = up()
+    let plan = MemoryPlan(64, 64, SLACK)
+    var round: UInt32 = 0
+    while round < 70_000 {
+        let chain = round % 32
+        u.q.tx.post_tx(&var u.f, chain, u.lc.ring_address(0, 60))
+        u.q.tx.kick(&var u.f)
+        let slot = round % 64
+        if u.f.peek16(plan.tx.avail + 4 + 2 * slot) != (2 * chain) as UInt16 {
+            print("round {}", round)
+            check(false, "the ring entry is in slot index mod size")
+        }
+        if u.f.peek16(plan.tx.avail + 2) != UInt16.from(truncating: round + 1) {
+            print("round {}", round)
+            check(false, "the available index counts modulo 2^16")
+        }
+        u.f.complete(1, 2 * chain, 0)
+        let n = try! u.q.tx.pending(&var u.f)
+        if n != 1 {
+            print("round {}", round)
+            check(false, "one element is pending across the wrap")
+        }
+        let done = try! u.q.tx.next(&var u.f)
+        if done.chain != chain {
+            print("round {}", round)
+            check(false, "the element is the chain posted")
+        }
+        if (try! u.q.tx.take_in_order()) != chain {
+            print("round {}", round)
+            check(false, "the oldest chain posted is the one completed")
+        }
+        u.f.clear_log()
+        round = round + 1
+    }
+}
+
+func small_queue_wraps() {
+    // A 4 entry queue: the ring slot is the index mod 4, not mod the largest
+    // queue. The slot is poisoned before each post, so an entry left by an
+    // earlier lap cannot stand in for the one written.
+    var u = up_with(4)
+    let plan = MemoryPlan(4, 4, SLACK)
+    check(u.q.tx.size() == 4, "a queue of 4 entries")
+    var round: UInt32 = 0
+    while round < 20 {
+        let chain = round % 2
+        u.f.poke16(plan.tx.avail + 4 + 2 * (round % 4), 0xFFFF)
+        u.q.tx.post_tx(&var u.f, chain, u.lc.ring_address(0, 60))
+        u.q.tx.kick(&var u.f)
+        check(u.f.peek16(plan.tx.avail + 4 + 2 * (round % 4)) == (2 * chain) as UInt16,
+              "the entry is in slot index mod 4")
+        u.f.complete(1, 2 * chain, 0)
+        check(try! u.q.tx.pending(&var u.f) == 1, "one pending")
+        let done = try! u.q.tx.next(&var u.f)
+        check(done.chain == chain, "the chain posted")
+        check(try! u.q.tx.take_in_order() == chain, "in order")
+        u.f.clear_log()
+        round = round + 1
+    }
+}
+
+func index_advance() {
+    var u = up()
+    u.q.rx.post_rx(&var u.f, 0, u.lc.ring_address(0, 2048))
+    u.q.rx.kick(&var u.f)
+    u.f.set_used_idx(0, 2)
+    check(is_fault(u.q.rx.pending(&var u.f), DeviceFault.UsedIndexAdvance(2)),
+          "an index that moved past the chains in flight")
+    var none = up()
+    none.f.set_used_idx(0, 1)
+    check(is_fault(none.q.rx.pending(&var none.f), DeviceFault.UsedIndexAdvance(1)),
+          "an index that moved with nothing in flight")
+    var behind = up()
+    behind.q.rx.post_rx(&var behind.f, 0, behind.lc.ring_address(0, 2048))
+    behind.f.set_used_idx(0, 0xFFFF)
+    check(is_fault(behind.q.rx.pending(&var behind.f), DeviceFault.UsedIndexAdvance(0xFFFF)),
+          "an index that went backwards is a huge advance")
+    var exact = up()
+    exact.q.rx.post_rx(&var exact.f, 0, exact.lc.ring_address(0, 2048))
+    exact.q.rx.post_rx(&var exact.f, 1, exact.lc.ring_address(0, 2048))
+    exact.f.set_used_idx(0, 2)
+    check(try! exact.q.rx.pending(&var exact.f) == 2, "as many as are in flight is allowed")
+}
+
+func pending_counts_from_taken() {
+    // `pending` counts from the last element taken, not from the last read.
+    var u = up()
+    u.q.rx.post_rx(&var u.f, 0, u.lc.ring_address(0, 2048))
+    u.q.rx.post_rx(&var u.f, 1, u.lc.ring_address(2048, 2048))
+    u.q.rx.kick(&var u.f)
+    set_count(&var u.f, 0, 1)
+    set_count(&var u.f, 1, 1)
+    u.f.complete(0, 0, 12)
+    check(try! u.q.rx.pending(&var u.f) == 1, "one used")
+    u.f.complete(0, 2, 12)
+    check(try! u.q.rx.pending(&var u.f) == 2, "two used, none taken")
+    let _ = try! u.q.rx.next(&var u.f)
+    check(try! u.q.rx.pending(&var u.f) == 1, "one left after one is taken")
+}
+
+func element_ids() {
+    // An odd id, one past the queue, and a chain not in flight.
+    var odd = up()
+    odd.q.rx.post_rx(&var odd.f, 0, odd.lc.ring_address(0, 2048))
+    odd.f.complete(0, 1, 12)
+    let _ = try! odd.q.rx.pending(&var odd.f)
+    check(is_fault_next(odd.q.rx.next(&var odd.f), DeviceFault.UsedIdInvalid(1)), "an odd id")
+    var past = up()
+    past.q.rx.post_rx(&var past.f, 0, past.lc.ring_address(0, 2048))
+    past.f.complete(0, 64, 12)
+    let _ = try! past.q.rx.pending(&var past.f)
+    check(is_fault_next(past.q.rx.next(&var past.f), DeviceFault.UsedIdInvalid(64)),
+          "an id past the queue's size")
+    var small = up_with(32)
+    small.q.rx.post_rx(&var small.f, 0, small.lc.ring_address(0, 2048))
+    small.f.complete(0, 32, 12)
+    let _ = try! small.q.rx.pending(&var small.f)
+    check(is_fault_next(small.q.rx.next(&var small.f), DeviceFault.UsedIdInvalid(32)),
+          "an id past a 32 entry queue's size, though below the largest queue's")
+    var last_valid = up()
+    last_valid.q.rx.post_rx(&var last_valid.f, 31, last_valid.lc.ring_address(0, 2048))
+    set_count(&var last_valid.f, 31, 1)
+    last_valid.f.complete(0, 62, 12)
+    let _ = try! last_valid.q.rx.pending(&var last_valid.f)
+    check(try! last_valid.q.rx.next(&var last_valid.f) == Completion(chain: 31, len: 12),
+          "the last chain's id, 62, is valid")
+    var idle = up()
+    idle.q.rx.post_rx(&var idle.f, 0, idle.lc.ring_address(0, 2048))
+    idle.f.complete(0, 10, 12)
+    let _ = try! idle.q.rx.pending(&var idle.f)
+    check(is_fault_next(idle.q.rx.next(&var idle.f), DeviceFault.UsedIdNotInFlight(10)),
+          "a chain that was never posted")
+    var twice = up()
+    twice.q.rx.post_rx(&var twice.f, 0, twice.lc.ring_address(0, 2048))
+    twice.q.rx.post_rx(&var twice.f, 1, twice.lc.ring_address(0, 2048))
+    set_count(&var twice.f, 0, 1)
+    twice.f.complete(0, 0, 12)
+    twice.f.complete(0, 0, 12)
+    let _ = try! twice.q.rx.pending(&var twice.f)
+    let _ = try! twice.q.rx.next(&var twice.f)
+    check(is_fault_next(twice.q.rx.next(&var twice.f), DeviceFault.UsedIdNotInFlight(0)),
+          "a chain used twice")
+}
+
+/// A receive chain 2 posted with `posted` bytes whose device reported `len`
+/// bytes and wrote `count` as the header's `num_buffers`, taken back.
+func receive_result(posted: UInt32, len: UInt32, count: UInt16) -> Result<Completion, DeviceFault> {
+    var u = up()
+    u.q.rx.post_rx(&var u.f, 2, u.lc.ring_address(0, posted))
+    u.q.rx.kick(&var u.f)
+    set_count(&var u.f, 2, count)
+    u.f.complete(0, 4, len)
+    let _ = try! u.q.rx.pending(&var u.f)
+    u.q.rx.next(&var u.f)
+}
+
+func is_receive_fault(r: Result<Completion, DeviceFault>, want: DeviceFault) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func is_receive_ok(r: Result<Completion, DeviceFault>) -> Bool {
+    match r {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+}
+
+func receive_checks() {
+    check(is_receive_ok(receive_result(2048, 12, 1)), "a header and no frame is a length")
+    check(is_receive_ok(receive_result(2048, 12 + 2048, 1)), "a whole buffer")
+    check(is_receive_fault(receive_result(2048, 11, 1), DeviceFault.ReceiveLength(11)),
+          "a length shorter than the header")
+    check(is_receive_fault(receive_result(2048, 0, 1), DeviceFault.ReceiveLength(0)), "a length of 0")
+    check(is_receive_fault(receive_result(2048, 12 + 2049, 1), DeviceFault.ReceiveLength(2061)),
+          "a length past the header and the buffer")
+    // The bound is what the chain was posted with, not the largest buffer.
+    check(is_receive_ok(receive_result(100, 112, 1)), "a length at the bytes posted")
+    check(is_receive_fault(receive_result(100, 113, 1), DeviceFault.ReceiveLength(113)),
+          "a length past the bytes posted")
+    check(is_receive_fault(receive_result(100, 12 + 2048, 1), DeviceFault.ReceiveLength(2060)),
+          "a length past the bytes posted, within the largest buffer")
+    check(is_receive_fault(receive_result(2048, 100, 2), DeviceFault.NumBuffers(2)), "num_buffers 2")
+    check(is_receive_fault(receive_result(2048, 100, 0), DeviceFault.NumBuffers(0)), "num_buffers 0")
+    check(is_receive_fault(receive_result(2048, 11, 2), DeviceFault.ReceiveLength(11)),
+          "the length is checked before the header is read")
+    var u = up()
+    u.q.rx.post_rx(&var u.f, 2, u.lc.ring_address(0, 2048))
+    u.q.rx.kick(&var u.f)
+    set_count(&var u.f, 2, 1)
+    u.f.complete(0, 4, 100)
+    let _ = try! u.q.rx.pending(&var u.f)
+    u.f.clear_log()
+    let _ = u.q.rx.next(&var u.f)
+    check(u.f.count(EVENT_LOAD16) == 1, "num_buffers is read once")
+    // A transmit completion's length is the device's own business.
+    var t = up()
+    t.q.tx.post_tx(&var t.f, 0, t.lc.ring_address(0, 60))
+    t.q.tx.kick(&var t.f)
+    t.f.complete(1, 0, 0xFFFF)
+    let _ = try! t.q.tx.pending(&var t.f)
+    check(is_receive_ok(t.q.tx.next(&var t.f)), "a transmit length is not checked")
+}
+
+func chain_past_the_mask() {
+    let u = up()
+    check(not u.q.rx.is_in_flight(32), "chain 32 is not in flight")
+    check(not u.q.rx.is_busy(32), "and is not busy")
+}
+
+func main() {
+    receive_chain()
+    transmit_chain()
+    kick_order()
+    notification_suppressed()
+    transmit_notifies_queue_1()
+    nothing_staged()
+    completion()
+    completed_prefix()
+    full_and_free()
+    index_wraps()
+    small_queue_wraps()
+    index_advance()
+    pending_counts_from_taken()
+    element_ids()
+    receive_checks()
+    chain_past_the_mask()
+}

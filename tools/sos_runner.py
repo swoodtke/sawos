@@ -15942,6 +15942,7 @@ HOSTED_TESTS = [os.path.join(DRIVERS_DIR, "esp32s3io"),
                 os.path.join(DRIVERS_DIR, "wlanproto"),
                 os.path.join(DRIVERS_DIR, "sockproto"),
                 os.path.join(DRIVERS_DIR, "netstack"),
+                os.path.join(DRIVERS_DIR, "virtio"),
                 os.path.dirname(SOSRT_DIR)]
 
 # The link the builder's manifest reaches the sawlang checkout's packages

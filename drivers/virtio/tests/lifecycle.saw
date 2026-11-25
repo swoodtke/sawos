@@ -1,0 +1,325 @@
+// The memory lifecycle's order and the failure classes (virtio 1.2 sections
+// 2.4 and 3.1.1): an object is pinned before any address in it reaches the
+// device, unpinned only after `Status` was written 0 and read back as 0,
+// and left pinned when the reset is not confirmed. Each class of failure
+// makes the writes its table says and answers its exit code.
+
+import virtio.{DmaObject, Lifecycle, Queues, SetupError, Shutdown}
+import virtio.fake.{EVENT_PIN, EVENT_READ32, EVENT_UNMAP, EVENT_UNPIN, EVENT_WRITE32, Fake}
+import virtio.transport.{REGISTER_QUEUE_DESC_HIGH, REGISTER_QUEUE_DESC_LOW,
+                         REGISTER_QUEUE_DEVICE_HIGH, REGISTER_QUEUE_DEVICE_LOW, REGISTER_QUEUE_NUM,
+                         REGISTER_QUEUE_READY, REGISTER_QUEUE_SEL, REGISTER_STATUS, RESET_READS, STATUS_ACKNOWLEDGE, STATUS_DRIVER,
+                         STATUS_DRIVER_OK, STATUS_FAILED, STATUS_FEATURES_OK}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// A device with its queues live and a client's ring pinned.
+func running(f: &var Fake, lc: &var Lifecycle) -> Queues {
+    let _ = try! lc.begin(&var f)
+    let q = try! lc.setup_queues(&var f)
+    lc.go_live(&var f)
+    try! lc.pin_ring(&var f)
+    q
+}
+
+/// The number of reads of `Status` after log index `from`.
+func status_reads_after(f: &Fake, from: Int) -> UInt32 {
+    f.count_after(from, EVENT_READ32, REGISTER_STATUS as UInt64)
+}
+
+/// The index of the last read of `Status`.
+func last_status_read(f: &Fake) -> Int {
+    f.find_last(EVENT_READ32, REGISTER_STATUS as UInt64)!
+}
+
+func client_gone_order() {
+    // The reset completes late: five reads answer the old status first.
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = running(&var f, &var lc)
+    f.reset_reads = 5
+    f.clear_log()
+    let code = lc.give_up(&var f, Shutdown.ClientGone)
+    check(code == 0, "the client gone is exit 0")
+    let zero = f.find_write(REGISTER_STATUS, 0)!
+    check(status_reads_after(&f, zero) == 6, "Status is read until it reads 0: five old, then 0")
+    let confirmed = last_status_read(&f)
+    let unpin_ring = f.find(EVENT_UNPIN, 1)!
+    let unmap_ring = f.find(EVENT_UNMAP, 1)!
+    let unpin_queues = f.find(EVENT_UNPIN, 0)!
+    let unmap_queues = f.find(EVENT_UNMAP, 0)!
+    check(zero < confirmed, "the write of 0 precedes the read that answers 0")
+    check(confirmed < unpin_ring, "no Unpin before the read that answers 0")
+    check(unpin_ring < unmap_ring && unmap_ring < unpin_queues && unpin_queues < unmap_queues,
+          "the ring, then the queues, each unpinned and then unmapped")
+    check(f.early_unpins == 0 && f.early_unmaps == 0, "the device had stopped when the pins dropped")
+    check(not lc.queues_pinned() && not lc.ring_pinned(), "nothing is left pinned")
+    check(f.find_write(REGISTER_STATUS, STATUS_FAILED | 15) == None, "a clean end does not set FAILED")
+}
+
+func early_unpin_is_seen() {
+    // The fake's own check: an Unpin while the device may still use the
+    // memory is counted, so an Unpin between the write and the read shows.
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = running(&var f, &var lc)
+    f.reset_reads = 3
+    f.write32(REGISTER_STATUS, 0)
+    f.unpin(DmaObject.Ring)
+    check(f.early_unpins == 1, "an Unpin before the reset reads as complete is counted")
+}
+
+func unconfirmed_reset() {
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = running(&var f, &var lc)
+    f.reset_never = true
+    f.clear_log()
+    let code = lc.give_up(&var f, Shutdown.ClientGone)
+    check(code == 4, "a reset that is not confirmed is exit 4")
+    check(f.count(EVENT_UNPIN) == 0 && f.count(EVENT_UNMAP) == 0, "nothing is unpinned or unmapped")
+    check(lc.queues_pinned() && lc.ring_pinned(), "both objects stay pinned")
+    let zero = f.find_write(REGISTER_STATUS, 0)!
+    check(status_reads_after(&f, zero) == RESET_READS, "Status is read RESET_READS times, no more")
+    var again = Fake.qemu()
+    var lc2 = Lifecycle()
+    let _ = running(&var again, &var lc2)
+    again.reset_never = true
+    check(lc2.give_up(&var again, Shutdown.DeviceFault) == 4, "a device fault ends in 4 too")
+    check(again.count(EVENT_UNPIN) == 0, "with every pin left")
+}
+
+func reset_bound() {
+    // The read that answers 0 may be the last of RESET_READS, and no later.
+    var late = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = running(&var late, &var lc)
+    late.reset_reads = RESET_READS - 1
+    check(lc.give_up(&var late, Shutdown.ClientGone) == 0, "0 on the 64th read is a confirmed reset")
+    check(late.count(EVENT_UNPIN) == 2, "and both objects are unpinned")
+    var too_late = Fake.qemu()
+    var lc2 = Lifecycle()
+    let _ = running(&var too_late, &var lc2)
+    too_late.reset_reads = RESET_READS
+    check(lc2.give_up(&var too_late, Shutdown.ClientGone) == 4, "0 on the 65th read is not")
+    check(too_late.count(EVENT_UNPIN) == 0, "and nothing is unpinned")
+}
+
+func ring_fault() {
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = running(&var f, &var lc)
+    f.clear_log()
+    check(lc.give_up(&var f, Shutdown.RingFault) == 2, "a ring fault is exit 2")
+    check(f.find_write(REGISTER_STATUS, 0) != None, "the device is reset")
+    check(f.writes_to(REGISTER_STATUS) == 1, "no FAILED is written for a client's fault")
+    check(f.count(EVENT_UNPIN) == 2 && f.count(EVENT_UNMAP) == 2, "both objects are unpinned and unmapped")
+    check(f.find(EVENT_UNPIN, 1)! > last_status_read(&f), "after the confirming read")
+}
+
+func device_fault() {
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = running(&var f, &var lc)
+    f.clear_log()
+    check(lc.give_up(&var f, Shutdown.DeviceFault) == 3, "a device fault is exit 3")
+    let failed = f.find_write(REGISTER_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK |
+                                          STATUS_DRIVER_OK | STATUS_FAILED)!
+    let reset = f.find_write(REGISTER_STATUS, 0)!
+    check(failed < reset, "FAILED is added to the status, then the device is reset")
+    check(f.find(EVENT_UNPIN, 1)! > reset && f.find(EVENT_UNPIN, 0)! > reset, "and only then unpinned")
+    check(f.count(EVENT_UNMAP) == 2, "and unmapped")
+    check(f.early_unpins == 0, "after it stopped")
+}
+
+func refusal_after_the_queues_are_pinned() {
+    // A setup refusal once the queue memory is pinned: FAILED, the reset, the
+    // Unpin of the queues; no ring was pinned, and nothing is unmapped.
+    var f = Fake.qemu()
+    f.queues_len = 1024
+    var lc = Lifecycle()
+    let _ = try! lc.begin(&var f)
+    match lc.setup_queues(&var f) {
+        case Ok(_) -> check(false, "the queues are too short"),
+        case Err(e) -> check(e == SetupError.QueuesTooShort(1024), "too short"),
+    }
+    check(lc.queues_pinned(), "the memory was pinned before the layout was checked")
+    f.clear_log()
+    check(lc.give_up(&var f, Shutdown.Refused) == 1, "a refusal is exit 1")
+    let failed = f.find_write(REGISTER_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK |
+                                          STATUS_FAILED)!
+    let reset = f.find_write(REGISTER_STATUS, 0)!
+    check(failed < reset, "FAILED, then the reset")
+    check(f.count(EVENT_UNPIN) == 1 && f.find(EVENT_UNPIN, 0)! > reset, "the queues are unpinned after it")
+    check(f.count(EVENT_UNMAP) == 0, "and not unmapped")
+    check(f.early_unpins == 0, "nothing was live")
+}
+
+func refusal_before_any_pin() {
+    var f = Fake.qemu()
+    f.offered = 0
+    var lc = Lifecycle()
+    match lc.begin(&var f) {
+        case Ok(_) -> check(false, "VERSION_1 is missing"),
+        case Err(_) -> {},
+    }
+    check(lc.give_up(&var f, Shutdown.Refused) == 1, "a refusal is exit 1")
+    check(f.count(EVENT_PIN) == 0 && f.count(EVENT_UNPIN) == 0 && f.count(EVENT_UNMAP) == 0,
+          "nothing was pinned, so nothing is unpinned")
+}
+
+/// Stores descriptor `slot` of queue 0 directly: the address `addr` and the
+/// length `len`, as the library's own writes do.
+func store_descriptor(f: &var Fake, slot: UInt32, addr: UInt64, len: UInt32) {
+    let at = f.desc_offset(0) + 16 * slot
+    f.store32(at, (addr & 0xFFFF_FFFF) as UInt32)
+    f.store32(at + 4, (addr >> 32) as UInt32)
+    f.store32(at + 8, len)
+}
+
+func fake_sees_stray_ranges() {
+    // Controls: the fake counts a descriptor whose range is not wholly in a
+    // pinned object, so a mistake in the library's own writes would show.
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = running(&var f, &var lc)
+    let rb = f.ring_base
+    let rl = f.ring_len
+    store_descriptor(&var f, 0, rb + 0x100, 2048)
+    check(f.stray_addresses == 0, "a range inside the pinned ring is not counted")
+    store_descriptor(&var f, 1, rb + rl - 60, 60)
+    check(f.stray_addresses == 0, "nor is one that ends where the ring ends")
+    store_descriptor(&var f, 2, rb + rl - 60, 61)
+    check(f.stray_addresses == 1, "a range that starts inside and ends past the ring is counted")
+    store_descriptor(&var f, 3, rb + rl, 1)
+    check(f.stray_addresses == 2, "one that starts at the ring's end is counted")
+    store_descriptor(&var f, 4, rb - 1, 8)
+    check(f.stray_addresses == 3, "one that starts before the ring is counted")
+    store_descriptor(&var f, 5, 0x9000_0000, 8)
+    check(f.stray_addresses == 4, "one in no pinned object is counted")
+    let hold = lc.give_up(&var f, Shutdown.ClientGone)
+    check(hold == 0, "the device is given up")
+    store_descriptor(&var f, 6, rb + 0x100, 8)
+    check(f.stray_addresses == 5, "a range in an object since unpinned is counted")
+}
+
+func queue_ready_addresses() {
+    // The fake checks the three areas when a queue is made ready: whole
+    // ranges, in a pinned object.
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = try! lc.begin(&var f)
+    let _ = try! lc.setup_queues(&var f)
+    check(f.stray_addresses == 0, "the library's own queues are in the pinned memory")
+    // The same registers, written to an address in no pinned object.
+    f.write32(REGISTER_QUEUE_SEL, 0)
+    f.write32(REGISTER_QUEUE_DESC_LOW, 0x9000_0000)
+    f.write32(REGISTER_QUEUE_DESC_HIGH, 0)
+    f.write32(REGISTER_QUEUE_READY, 1)
+    check(f.stray_addresses == 1, "a descriptor table outside the pinned memory is counted")
+    // An area that begins inside and runs past the end.
+    var g = Fake.qemu()
+    var lc2 = Lifecycle()
+    let _ = try! lc2.begin(&var g)
+    let _ = try! lc2.setup_queues(&var g)
+    g.write32(REGISTER_QUEUE_SEL, 1)
+    g.write32(REGISTER_QUEUE_NUM, 64)
+    g.write32(REGISTER_QUEUE_DEVICE_LOW, (g.queues_base + g.queues_len - 8) as UInt32)
+    g.write32(REGISTER_QUEUE_DEVICE_HIGH, 0)
+    g.write32(REGISTER_QUEUE_READY, 1)
+    check(g.stray_addresses == 1, "a used ring that runs past the memory is counted")
+}
+
+func unmap_before_unpin_is_seen() {
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = running(&var f, &var lc)
+    f.unmap(DmaObject.Ring)
+    check(f.early_unmaps == 1, "an unmap while the object is still pinned is counted")
+    f.unpin(DmaObject.Ring)
+    f.unmap(DmaObject.Ring)
+    check(f.early_unmaps == 1, "an unmap after the unpin is not")
+}
+
+func ring_pin() {
+    var g = Fake.qemu()
+    var lc2 = Lifecycle()
+    let q2 = running(&var g, &var lc2)
+    var rx2 = q2.rx
+    rx2.post_rx(&var g, 0, lc2.ring_address(0x100, 2048))
+    rx2.post_rx(&var g, 1, lc2.ring_address(0x900, 2048))
+    check(g.stray_addresses == 0, "ranges from the pinned ring are not stray")
+    var refused = Fake.qemu()
+    var lc3 = Lifecycle()
+    let _ = try! lc3.begin(&var refused)
+    let _ = try! lc3.setup_queues(&var refused)
+    refused.pin_refused = true
+    match lc3.pin_ring(&var refused) {
+        case Ok(_) -> check(false, "the Pin is refused"),
+        case Err(e) -> check(e == SetupError.PinRefused, "a refused ring Pin"),
+    }
+    check(not lc3.ring_pinned(), "and the ring is not pinned")
+}
+
+func status_after_give_up() {
+    // A second give_up after a confirmed reset adds FAILED to 0, not to the
+    // status the first one left.
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = running(&var f, &var lc)
+    let _ = lc.give_up(&var f, Shutdown.DeviceFault)
+    let from = f.log_len
+    let _ = lc.give_up(&var f, Shutdown.DeviceFault)
+    var first: UInt32 = 0xFFFF
+    var i = from
+    while i < f.log_len {
+        if f.kind_at(i) == EVENT_WRITE32 && f.argument_at(i) == (REGISTER_STATUS as UInt64) {
+            first = f.value_at(i) as UInt32
+            i = f.log_len
+        }
+        i = i + 1
+    }
+    check(first == STATUS_FAILED, "FAILED alone after a reset")
+}
+
+func refusal_with_the_ring_pinned() {
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = running(&var f, &var lc)
+    f.clear_log()
+    check(lc.give_up(&var f, Shutdown.Refused) == 1, "a refusal is exit 1")
+    check(f.count(EVENT_UNPIN) == 2 && f.count(EVENT_UNMAP) == 0, "both unpinned, neither unmapped")
+}
+
+func reset_needs_zero() {
+    // A stale status with bit 0 clear is not a completed reset.
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = running(&var f, &var lc)
+    f.status = 0x40
+    f.reset_never = true
+    check(lc.give_up(&var f, Shutdown.ClientGone) == 4, "a status of 0x40 is not 0")
+}
+
+func main() {
+    client_gone_order()
+    early_unpin_is_seen()
+    unconfirmed_reset()
+    reset_bound()
+    ring_fault()
+    device_fault()
+    refusal_after_the_queues_are_pinned()
+    refusal_before_any_pin()
+    fake_sees_stray_ranges()
+    queue_ready_addresses()
+    unmap_before_unpin_is_seen()
+    ring_pin()
+    status_after_give_up()
+    refusal_with_the_ring_pinned()
+    reset_needs_zero()
+}

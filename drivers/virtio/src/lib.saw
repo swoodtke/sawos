@@ -1,0 +1,38 @@
+//! The virtio-mmio transport and split virtqueues of a network driver, as a
+//! library the driver and its hosted tests share.
+//!
+//! The library holds every decision the driver makes about the device and
+//! none of its access to it. `Registers` is the transport's window, and `Dma`
+//! is the memory the device addresses, with the operations that pin, unpin and
+//! unmap it; the process implements them over its mapped registers and the
+//! kernel's memory calls, and `virtio.fake` implements them over a device that
+//! behaves as QEMU does and misbehaves one way at a time.
+//!
+//! # Modules
+//!
+//!   - `transport`: the register map, the probe, the reset, feature
+//!     negotiation, configuration space, interrupt status and the errors a
+//!     device's values are refused with;
+//!   - `queue`: the layout of both queues in one allocation, the descriptor,
+//!     available and used rings, the index arithmetic and the checks of the
+//!     used ring;
+//!   - `lifecycle`: bringing the device up and giving it up, and the order
+//!     the memory is pinned, unpinned and unmapped in;
+//!   - `fake`: the fake device.
+//!
+//! # The device is input
+//!
+//! A value the device writes is read once, into a local, checked, and only
+//! then acted on: the used ring's index and elements, a receive header's
+//! `num_buffers`, the configuration space, `QueueNumMax`, `Status`. A value
+//! that fails its check is an error that names it, and the driver gives the
+//! device up by the class of failure (`Lifecycle.give_up`).
+
+public import virtio.lifecycle.{Lifecycle, Queues, Shutdown}
+public import virtio.queue.{Completion, Dma, DmaObject, MAX_QUEUE, MemoryPlan, NET_HEADER_BYTES,
+                            NotCompleted, PinError, Pinned, Queue, QueueFull, QueueLayout, RECEIVE_QUEUE,
+                            RingSpan, TRANSMIT_QUEUE, queue_size}
+public import virtio.transport.{DeviceFault, EXIT_CLEAN, EXIT_DEVICE_FAULT, EXIT_REFUSED,
+                                EXIT_RESET_UNCONFIRMED, EXIT_RING_FAULT, InterruptEvents,
+                                Negotiated, NetConfig, ProbeError, Registers, SetupError,
+                                probe, read_config, read_link, reset_device, take_interrupt}

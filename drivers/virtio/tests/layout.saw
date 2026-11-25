@@ -1,0 +1,119 @@
+// Queue sizes and the layout of both queues in one allocation (virtio 1.2
+// section 2.7): the largest power of two the device allows, the offsets of
+// each area at the sizes the driver uses, and every area's alignment in
+// memory whatever the allocation's own alignment.
+
+import virtio.{MAX_QUEUE, MemoryPlan, QueueLayout, SetupError, queue_size}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func size_is(max: UInt32, want: UInt32) -> Bool {
+    match queue_size(0, max) {
+        case Ok(s) -> s == want,
+        case Err(_) -> false,
+    }
+}
+
+func too_small(max: UInt32) -> Bool {
+    match queue_size(1, max) {
+        case Ok(_) -> false,
+        case Err(e) -> e == SetupError.QueueTooSmall(1, max),
+    }
+}
+
+func sizes() {
+    check(too_small(0), "QueueNumMax 0 is refused: the queue is unavailable")
+    check(too_small(1), "QueueNumMax 1 is refused: it holds no chain")
+    check(size_is(2, 2), "2 gives 2")
+    check(size_is(3, 2), "3 gives 2, a power of two")
+    check(size_is(32, 32), "32 gives 32")
+    check(size_is(48, 32), "48 gives 32")
+    check(size_is(63, 32), "63 gives 32")
+    check(size_is(64, 64), "64 gives 64")
+    check(size_is(256, MAX_QUEUE), "256 gives 64")
+    check(size_is(0xFFFF_FFFF, MAX_QUEUE), "no larger than MAX_QUEUE however large the device's")
+}
+
+func table_at_64() {
+    let plan = MemoryPlan(64, 64, 0)
+    check(plan.rx.size == 64 && plan.tx.size == 64, "both queues are 64")
+    check(plan.rx.desc == 0, "RX descriptor table at 0")
+    check(plan.rx.avail == 1024, "RX available ring at 1024")
+    check(plan.rx.used == 1160, "RX used ring at 1160")
+    check(plan.tx.desc == 1680, "TX descriptor table at 1680")
+    check(plan.tx.avail == 2704, "TX available ring at 2704")
+    check(plan.tx.used == 2840, "TX used ring at 2840")
+    check(plan.rx_headers == 3360, "RX headers at 3360")
+    check(plan.tx_header == 3744, "the shared TX header at 3744")
+    check(plan.end == 3756, "the plan ends at 3756")
+}
+
+func smaller_queues() {
+    let plan = MemoryPlan(32, 16, 0)
+    check(plan.rx.desc == 0 && plan.rx.avail == 512 && plan.rx.used == 584,
+          "a 32 entry queue packs smaller")
+    check(plan.tx.desc == 848, "the next queue starts 16-aligned after it")
+    check(plan.tx.avail == 848 + 256 && plan.tx.used == 1104 + 38 + 2,
+          "a 16 entry queue's rings")
+    check(plan.rx_headers == plan.tx.used + 6 + 8 * 16 + ((4 - (plan.tx.used + 6 + 128) % 4) % 4),
+          "the headers follow, 4-aligned")
+    check(plan.tx_header == plan.rx_headers + 12 * 16, "one header for each of the 16 RX chains")
+}
+
+/// Whether `value` is a multiple of `align`.
+func aligned(value: UInt64, align: UInt64) -> Bool {
+    value % align == 0
+}
+
+func alignment_in_memory() {
+    // Each area is aligned at the address the device sees, for every
+    // allocation base mod 16 a pool's grain allows and every size pair.
+    var rx: UInt32 = 2
+    while rx <= 64 {
+        var tx: UInt32 = 2
+        while tx <= 64 {
+            var base: UInt64 = 0x4000_0000
+            while base < 0x4000_0010 {
+                let slack = ((16 - base % 16) % 16) as UInt32
+                let plan = MemoryPlan(rx, tx, slack)
+                let ok = aligned(base + (plan.rx.desc as UInt64), 16) &&
+                         aligned(base + (plan.tx.desc as UInt64), 16) &&
+                         aligned(base + (plan.rx.avail as UInt64), 2) &&
+                         aligned(base + (plan.tx.avail as UInt64), 2) &&
+                         aligned(base + (plan.rx.used as UInt64), 4) &&
+                         aligned(base + (plan.tx.used as UInt64), 4) &&
+                         aligned(base + (plan.rx_headers as UInt64), 4) &&
+                         plan.rx.desc == slack
+                if not ok { print("rx {} tx {} base {}", rx, tx, base) }
+                check(ok, "every area is aligned in memory")
+                // The areas do not overlap: each ends before the next begins.
+                let disjoint = plan.rx.desc + 16 * rx <= plan.rx.avail &&
+                               plan.rx.avail + 6 + 2 * rx <= plan.rx.used &&
+                               plan.rx.used + 6 + 8 * rx <= plan.tx.desc &&
+                               plan.tx.desc + 16 * tx <= plan.tx.avail &&
+                               plan.tx.avail + 6 + 2 * tx <= plan.tx.used &&
+                               plan.tx.used + 6 + 8 * tx <= plan.rx_headers &&
+                               plan.rx_headers + 12 * (rx / 2) == plan.tx_header &&
+                               plan.tx_header + 12 == plan.end
+                check(disjoint, "the areas are disjoint and in order")
+                base = base + 4
+            }
+            tx = tx * 2
+        }
+        rx = rx * 2
+    }
+    // The largest plan and the worst slack fit the 4 KiB allocation.
+    check(MemoryPlan(64, 64, 12).end <= 4096, "the largest plan fits one page")
+}
+
+func main() {
+    sizes()
+    table_at_64()
+    smaller_queues()
+    alignment_in_memory()
+}

@@ -1,0 +1,466 @@
+//! Split virtqueues (virtio 1.2 section 2.7) as a network driver uses them:
+//! the layout of both queues in one allocation, the descriptor, available and
+//! used rings, the index arithmetic, the barriers' places, and every check of
+//! a value the device writes into a used ring.
+//!
+//! The queue memory is reached through `Dma`, by byte offset from the start
+//! of the pinned allocation, and the device sees it through addresses that
+//! are the allocation's pinned base plus that offset. A chain is a fixed
+//! pair of descriptors, a header and a frame: chain `c` is descriptors `2c`
+//! and `2c + 1`, so a queue of `n` entries holds `n / 2` chains and a used
+//! element's `id` is an even number below `n`.
+
+import virtio.transport.{DeviceFault, REGISTER_QUEUE_DESC_HIGH, REGISTER_QUEUE_DESC_LOW,
+                         REGISTER_QUEUE_DEVICE_HIGH, REGISTER_QUEUE_DEVICE_LOW, REGISTER_QUEUE_DRIVER_HIGH,
+                         REGISTER_QUEUE_DRIVER_LOW, REGISTER_QUEUE_NOTIFY, REGISTER_QUEUE_NUM,
+                         REGISTER_QUEUE_READY, REGISTER_QUEUE_SEL, Registers, SetupError}
+
+// =============================================================================
+// Sizes
+// =============================================================================
+
+/// The largest queue the driver sets up. A queue's size is the largest power
+/// of two at most this and the device's `QueueNumMax` (2.7: "Queue Size
+/// value is always a power of 2").
+public static MAX_QUEUE: UInt32 = 64
+
+/// The net header with `VERSION_1` and no `MRG_RXBUF` (5.1.6).
+public static NET_HEADER_BYTES: UInt32 = 12
+
+/// The offset of `num_buffers` in the net header (5.1.6).
+public static NUM_BUFFERS_OFFSET: UInt32 = 10
+
+/// A descriptor: `addr` le64, `len` le32, `flags` le16, `next` le16 (2.7.5).
+static DESC_BYTES: UInt32 = 16
+
+/// `VIRTQ_DESC_F_NEXT` and `VIRTQ_DESC_F_WRITE` (2.7.5).
+public static DESC_NEXT: UInt16 = 1
+public static DESC_WRITE: UInt16 = 2
+
+/// `VIRTQ_USED_F_NO_NOTIFY`: the device asks the driver not to notify (2.7.10,
+/// without `EVENT_IDX`).
+static USED_NO_NOTIFY: UInt16 = 1
+
+// =============================================================================
+// The memory the library stores into and the device addresses
+// =============================================================================
+
+/// The two objects of the driver's lifecycle that the device addresses.
+public enum DmaObject {
+    /// The queue memory: both queues and their headers.
+    case Queues,
+    /// A client's ring: the frames' slots.
+    case Ring,
+}
+
+@synthesize
+extension DmaObject: Equatable {}
+
+/// A pinned object's physical base and length: what the kernel's Pin
+/// answers.
+public struct Pinned {
+    public base: UInt64,
+    public len: UInt64,
+}
+
+/// A Pin the kernel refused.
+public enum PinError {
+    case NoResource,
+}
+
+/// The pinned memory and the memory operations the driver's lifecycle
+/// orders. Offsets are bytes from the start of the pinned object.
+///
+/// The memory is not assumed zero: `Lifecycle.setup_queues` stores every
+/// word of the queue plan itself, after the pin and before the device is
+/// given an address, so the process need not clear it.
+public trait Dma {
+    /// Pins `object`, which adds the hardware reference its address may be
+    /// given to the device under, and answers its base and length. The object
+    /// is mapped when this answers, since the library stores into it next.
+    func pin(&var self, object: DmaObject) -> Result<Pinned, PinError>
+
+    /// Drops the hardware reference. The library calls it only after a reset
+    /// the driver has seen complete.
+    func unpin(&var self, object: DmaObject)
+
+    /// Unmaps `object`, after its `unpin`.
+    func unmap(&var self, object: DmaObject)
+
+    /// A full barrier: every store and load before it is ordered before every
+    /// one after it, for the device as well as for the processor (2.7.13).
+    func barrier(&var self)
+
+    func load16(&var self, offset: UInt32) -> UInt16
+    func load32(&var self, offset: UInt32) -> UInt32
+    func store16(&var self, offset: UInt32, value: UInt16)
+    func store32(&var self, offset: UInt32, value: UInt32)
+}
+
+// =============================================================================
+// Layout
+// =============================================================================
+
+/// Where one queue's three areas are, as offsets from the start of the
+/// pinned allocation.
+public struct QueueLayout {
+    /// Entries: a power of two, at least 2.
+    public size: UInt32,
+    /// The descriptor table, 16-aligned, `16 * size` bytes.
+    public desc: UInt32,
+    /// The available ring, 2-aligned, `6 + 2 * size` bytes (2.7.6).
+    public avail: UInt32,
+    /// The used ring, 4-aligned, `6 + 8 * size` bytes (2.7.8).
+    public used: UInt32,
+}
+
+/// Both queues, and the header buffers, in one allocation.
+public struct MemoryPlan {
+    /// The receive queue, queue 0 (5.1.2).
+    public rx: QueueLayout,
+    /// The transmit queue, queue 1.
+    public tx: QueueLayout,
+    /// The first of the receive headers, one per chain.
+    public rx_headers: UInt32,
+    /// The one header every transmit chain shares: it is only read, and zero.
+    public tx_header: UInt32,
+    /// The offset past the last byte the plan uses.
+    public end: UInt32,
+}
+
+func align_up(value: UInt32, to: UInt32) -> UInt32 {
+    (value + to - 1) & ~(to - 1)
+}
+
+extension QueueLayout {
+    /// Places a queue of `size` entries at `at`, answering it and the offset
+    /// past its used ring.
+    static func place(size: UInt32, at: UInt32) -> (QueueLayout, UInt32) {
+        let desc = align_up(at, 16)
+        let avail = align_up(desc + DESC_BYTES * size, 2)
+        let used = align_up(avail + 6 + 2 * size, 4)
+        (QueueLayout(size: size, desc: desc, avail: avail, used: used), used + 6 + 8 * size)
+    }
+}
+
+extension QueueLayout {
+    /// The same queue `by` bytes further on.
+    func shifted(&self, by: UInt32) -> QueueLayout {
+        QueueLayout(size: self.size, desc: self.desc + by, avail: self.avail + by,
+                    used: self.used + by)
+    }
+}
+
+extension MemoryPlan {
+    /// The plan for queues of `rx_size` and `tx_size` entries in an
+    /// allocation whose first `slack` bytes are skipped to reach a 16-aligned
+    /// address. The areas are placed from that address and each offset is
+    /// that much further on, so every area is as aligned in memory as the
+    /// table's alignment says.
+    public init(rx_size: UInt32, tx_size: UInt32, slack: UInt32) -> MemoryPlan {
+        let (rx, after_rx) = QueueLayout.place(rx_size, 0)
+        let (tx, after_tx) = QueueLayout.place(tx_size, after_rx)
+        let rx_headers = align_up(after_tx, 4)
+        let tx_header = rx_headers + NET_HEADER_BYTES * (rx_size / 2)
+        MemoryPlan(rx: rx.shifted(slack), tx: tx.shifted(slack), rx_headers: rx_headers + slack,
+                   tx_header: tx_header + slack, end: tx_header + NET_HEADER_BYTES + slack)
+    }
+}
+
+/// The size of a queue whose device reports `max` as `QueueNumMax`: the
+/// largest power of two at most `max` and `MAX_QUEUE`, or the refusal when
+/// that is below 2 (4.2.3.2: 0 means the queue is unavailable; one entry
+/// holds no chain).
+public func queue_size(queue: UInt32, max: UInt32) -> Result<UInt32, SetupError> {
+    var size = MAX_QUEUE
+    while size >= 2 {
+        if size <= max { return size }
+        size = size / 2
+    }
+    return SetupError.QueueTooSmall(queue, max)
+}
+
+// =============================================================================
+// A queue
+// =============================================================================
+
+/// A range of a pinned ring, as a device address and a length: what
+/// `Lifecycle.ring_address` answers, and the only buffer `post_rx` and
+/// `post_tx` accept. The fields are readable and constructible only inside
+/// the package, so the whole range, and not its start alone, was checked
+/// against the ring's pin when it was made.
+public struct RingSpan {
+    public(package) device_address: UInt64,
+    public(package) byte_count: UInt32,
+}
+
+/// A chain the device has used: its number and the bytes the device wrote
+/// (receive) or read (transmit), as it reported them.
+public struct Completion {
+    public chain: UInt32,
+    public len: UInt32,
+}
+
+@synthesize
+extension Completion: Equatable {}
+
+/// No chain is free.
+public enum QueueFull {
+    case Full,
+}
+
+/// No posted chain at the head of the posting order has been completed.
+public enum NotCompleted {
+    case NotCompleted,
+}
+
+/// The receive queue's index (5.1.2).
+public static RECEIVE_QUEUE: UInt32 = 0
+
+/// The transmit queue's index.
+public static TRANSMIT_QUEUE: UInt32 = 1
+
+/// The most chains a queue holds: `in_flight` and `done` keep a bit for each
+/// in a `UInt32`, and `posted` and `order` an entry.
+static MAX_CHAINS: UInt32 = 32
+
+static_assert(MAX_QUEUE / 2 <= MAX_CHAINS, "a chain needs a bit in the in-flight mask")
+
+/// One split queue: the driver's side of the indexes, which chains are in
+/// flight and how many bytes each was posted with. It stores its own indexes
+/// and reads the device's once each, and checks them.
+///
+/// Chains complete in the order the device uses them, which is not the order
+/// they were posted in. The queue keeps the posting order too, so the driver
+/// can act on completions only over the completed prefix (`take_in_order`).
+public struct Queue {
+    private index: UInt32,
+    private layout: QueueLayout,
+    // The first header: each receive chain's own, or the transmit queue's one.
+    private headers: UInt32,
+    // The pinned allocation's physical base, which an offset is added to for
+    // the address the device sees.
+    private memory: UInt64,
+    // The available ring's `idx` as staged, and as last published.
+    private staged: UInt16,
+    private published: UInt16,
+    // The used ring's `idx` as last read and checked, and past the last
+    // element taken.
+    private seen: UInt16,
+    private taken: UInt16,
+    // A bit per chain in flight.
+    private in_flight: UInt32,
+    // The frame bytes each chain was posted with.
+    private posted: [UInt32; 32],
+    // The chains in the order they were posted, as a ring from `order_head`
+    // holding `order_count`, and a bit per chain whose completion was taken.
+    private order: [UInt8; 32],
+    private order_head: UInt32,
+    private order_count: UInt32,
+    private done: UInt32,
+}
+
+extension Queue {
+    /// The queue `index` laid out as `layout`, its headers from `headers`, in
+    /// the allocation pinned at `memory`. Only the lifecycle makes one, from
+    /// what Pin answered, so every address a queue holds is a pinned one.
+    public(package) init(index: UInt32, layout: QueueLayout, headers: UInt32,
+                         memory: UInt64) -> Queue {
+        Queue(index: index, layout: layout, headers: headers, memory: memory, staged: 0,
+              published: 0, seen: 0, taken: 0, in_flight: 0, posted: [0; 32],
+              order: [0; 32], order_head: 0, order_count: 0, done: 0)
+    }
+
+    /// Entries.
+    public func size(&self) -> UInt32 {
+        self.layout.size
+    }
+
+    /// Chains: half the entries.
+    public func chains(&self) -> UInt32 {
+        self.layout.size / 2
+    }
+
+    /// Chains posted and not yet taken back.
+    public func in_flight_count(&self) -> UInt32 {
+        var n: UInt32 = 0
+        var bits = self.in_flight
+        while bits != 0 {
+            n = n + (bits & 1)
+            bits = bits >> 1
+        }
+        n
+    }
+
+    /// Whether chain `chain` is in flight.
+    public func is_in_flight(&self, chain: UInt32) -> Bool {
+        chain < MAX_CHAINS && ((self.in_flight >> chain) & 1) != 0
+    }
+
+    /// Whether `chain` cannot be posted: it is in flight, or it completed and
+    /// `take_in_order` has not yet answered it.
+    public func is_busy(&self, chain: UInt32) -> Bool {
+        chain < MAX_CHAINS && (((self.in_flight | self.done) >> chain) & 1) != 0
+    }
+
+    /// The lowest chain that can be posted.
+    public func free_chain(&self) -> Result<UInt32, QueueFull> {
+        var c: UInt32 = 0
+        while c < self.chains() {
+            if not self.is_busy(c) { return c }
+            c = c + 1
+        }
+        return QueueFull.Full
+    }
+
+    /// The device address of the byte at `offset` in the pinned allocation.
+    func address(&self, offset: UInt32) -> UInt64 {
+        self.memory + (offset as UInt64)
+    }
+
+    /// Writes the descriptor `slot`.
+    func describe<D: Dma>(&self, dma: &var D, slot: UInt32, addr: UInt64, len: UInt32,
+                          flags: UInt16, next: UInt16) {
+        let at = self.layout.desc + DESC_BYTES * slot
+        dma.store32(at, (addr & 0xFFFF_FFFF) as UInt32)
+        dma.store32(at + 4, (addr >> 32) as UInt32)
+        dma.store32(at + 8, len)
+        dma.store16(at + 12, flags)
+        dma.store16(at + 14, next)
+    }
+
+    /// Puts the head of `chain` in the next available ring slot, and marks the
+    /// chain in flight and last in the posting order. Nothing is shown to the
+    /// device until `kick`.
+    func stage<D: Dma>(&var self, dma: &var D, chain: UInt32, len: UInt32) {
+        let slot = (self.staged as UInt32) % self.layout.size
+        dma.store16(self.layout.avail + 4 + 2 * slot, (2 * chain) as UInt16)
+        self.staged = self.staged &+ 1
+        self.in_flight = self.in_flight | (1u32 << chain)
+        self.posted[chain as Int] = len
+        self.order[((self.order_head + self.order_count) % MAX_CHAINS) as Int] = chain as UInt8
+        self.order_count = self.order_count + 1
+    }
+
+    /// Writes a receive chain: its header buffer, device-written, then the
+    /// frame buffer `frame`, device-written (2.7.5, 5.1.6.3). The length
+    /// posted is what a completion is checked against. A chain already in
+    /// flight is a caller's bug.
+    public func post_rx<D: Dma>(&var self, dma: &var D, chain: UInt32, frame: RingSpan) {
+        if chain >= self.chains() || self.is_busy(chain) {
+            panic("post_rx: chain {} is not free", chain)
+        }
+        let header = self.headers + NET_HEADER_BYTES * chain
+        self.describe(&var dma, 2 * chain, self.address(header), NET_HEADER_BYTES,
+                      DESC_NEXT | DESC_WRITE, (2 * chain + 1) as UInt16)
+        self.describe(&var dma, 2 * chain + 1, frame.device_address, frame.byte_count,
+                      DESC_WRITE, 0)
+        self.stage(&var dma, chain, frame.byte_count)
+    }
+
+    /// Writes a transmit chain: the shared zero header, then the frame
+    /// `frame`, device-read.
+    public func post_tx<D: Dma>(&var self, dma: &var D, chain: UInt32, frame: RingSpan) {
+        if chain >= self.chains() || self.is_busy(chain) {
+            panic("post_tx: chain {} is not free", chain)
+        }
+        self.describe(&var dma, 2 * chain, self.address(self.headers), NET_HEADER_BYTES,
+                      DESC_NEXT, (2 * chain + 1) as UInt16)
+        self.describe(&var dma, 2 * chain + 1, frame.device_address, frame.byte_count, 0, 0)
+        self.stage(&var dma, chain, frame.byte_count)
+    }
+
+    /// Shows the device every chain staged: a barrier after the descriptors
+    /// and ring entries, the available `idx`, a barrier, then the used
+    /// ring's flags, and a notification unless the device asked for none
+    /// (2.7.13, 2.7.13.4.1: the flags are read after the barrier that follows
+    /// the `idx`). Nothing staged writes nothing.
+    public func kick<H: Registers + Dma>(&var self, hardware: &var H) {
+        if self.staged == self.published { return }
+        hardware.barrier()
+        hardware.store16(self.layout.avail + 2, self.staged)
+        self.published = self.staged
+        hardware.barrier()
+        let flags = hardware.load16(self.layout.used)
+        if (flags & USED_NO_NOTIFY) == 0 {
+            hardware.write32(REGISTER_QUEUE_NOTIFY, self.index)
+        }
+    }
+
+    /// Reads the used ring's `idx` once and answers how many elements the
+    /// device added since the last one taken, checked against the chains in
+    /// flight (2.7.8: `idx` is modulo 2^16). The barrier follows the read,
+    /// before any element is (2.7.14).
+    public func pending<D: Dma>(&var self, dma: &var D) -> Result<UInt16, DeviceFault> {
+        let idx = dma.load16(self.layout.used + 2)
+        dma.barrier()
+        let advance = idx &- self.taken
+        if (advance as UInt32) > self.in_flight_count() {
+            return DeviceFault.UsedIndexAdvance(advance)
+        }
+        self.seen = idx
+        return advance
+    }
+
+    /// Takes the next used element: its `id` and `len` read once, `id`
+    /// checked to be the head of a chain in flight (2.7.8: it is the head of
+    /// the chain the device used), and the chain freed. On the receive queue
+    /// `len` must hold the header and no more than the header and the bytes
+    /// the chain was posted with (2.7.8.2), and the header's `num_buffers`,
+    /// read once, must be 1 without `MRG_RXBUF` (5.1.6.4.1). Called with
+    /// nothing pending is a caller's bug.
+    public func next<D: Dma>(&var self, dma: &var D) -> Result<Completion, DeviceFault> {
+        if self.seen == self.taken { panic("next: no used element is pending") }
+        let slot = (self.taken as UInt32) % self.layout.size
+        let at = self.layout.used + 4 + 8 * slot
+        let id = dma.load32(at)
+        let len = dma.load32(at + 4)
+        if id >= self.layout.size || (id & 1) != 0 { return DeviceFault.UsedIdInvalid(id) }
+        let chain = id / 2
+        if not self.is_in_flight(chain) { return DeviceFault.UsedIdNotInFlight(id) }
+        if self.index == RECEIVE_QUEUE {
+            if len < NET_HEADER_BYTES || len > NET_HEADER_BYTES + self.posted[chain as Int] {
+                return DeviceFault.ReceiveLength(len)
+            }
+            let count = dma.load16(self.headers + NET_HEADER_BYTES * chain + NUM_BUFFERS_OFFSET)
+            if count != 1 { return DeviceFault.NumBuffers(count) }
+        }
+        self.in_flight = self.in_flight & ~(1u32 << chain)
+        self.done = self.done | (1u32 << chain)
+        self.taken = self.taken &+ 1
+        return Completion(chain: chain, len: len)
+    }
+
+    /// The oldest chain posted whose completion has been taken, if every
+    /// chain posted before it has been answered already: the driver acts on
+    /// completions in posting order, over the completed prefix, however the
+    /// device ordered them. `NotCompleted` when the oldest posted chain is
+    /// still in flight, or nothing is posted.
+    public func take_in_order(&var self) -> Result<UInt32, NotCompleted> {
+        if self.order_count == 0 { return NotCompleted.NotCompleted }
+        let chain = self.order[self.order_head as Int] as UInt32
+        if ((self.done >> chain) & 1) == 0 { return NotCompleted.NotCompleted }
+        self.done = self.done & ~(1u32 << chain)
+        self.order_head = (self.order_head + 1) % MAX_CHAINS
+        self.order_count = self.order_count - 1
+        return chain
+    }
+
+    /// Writes the registers that give the device this queue (4.2.3.2): select
+    /// it, its size, the three areas' addresses, then `QueueReady`. The
+    /// addresses are in the object the lifecycle has pinned.
+    public(package) func program<R: Registers>(&self, registers: &var R) {
+        registers.write32(REGISTER_QUEUE_SEL, self.index)
+        registers.write32(REGISTER_QUEUE_NUM, self.layout.size)
+        let desc = self.address(self.layout.desc)
+        let avail = self.address(self.layout.avail)
+        let used = self.address(self.layout.used)
+        registers.write32(REGISTER_QUEUE_DESC_LOW, (desc & 0xFFFF_FFFF) as UInt32)
+        registers.write32(REGISTER_QUEUE_DESC_HIGH, (desc >> 32) as UInt32)
+        registers.write32(REGISTER_QUEUE_DRIVER_LOW, (avail & 0xFFFF_FFFF) as UInt32)
+        registers.write32(REGISTER_QUEUE_DRIVER_HIGH, (avail >> 32) as UInt32)
+        registers.write32(REGISTER_QUEUE_DEVICE_LOW, (used & 0xFFFF_FFFF) as UInt32)
+        registers.write32(REGISTER_QUEUE_DEVICE_HIGH, (used >> 32) as UInt32)
+        registers.write32(REGISTER_QUEUE_READY, 1)
+    }
+}

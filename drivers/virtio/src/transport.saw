@@ -1,0 +1,436 @@
+//! The modern virtio-mmio transport (virtio 1.2 section 4.2, version 2) as a
+//! network driver uses it: the register map, the probe, feature negotiation,
+//! the device's configuration space, the interrupt registers and the reset.
+//!
+//! Every register is reached through `Registers`. The control registers are
+//! read and written 32 bits wide and aligned; configuration space is read at
+//! each field's own width (4.2.2.2), which is why the trait has an accessor
+//! for each width and nothing else.
+//!
+//! A value the device writes is input. Each one the driver acts on is read
+//! once, checked here, and answered with a refusal that names it: a
+//! `ProbeError` before the transport is touched, a `SetupError` while the
+//! driver brings the device up, a `DeviceFault` once it is serving.
+
+// =============================================================================
+// Register map (4.2.2, Table 4.1)
+// =============================================================================
+
+/// `MagicValue`: "virt" read as a little-endian word (4.2.2).
+public static MAGIC_VALUE: UInt32 = 0x7472_6976
+
+/// The only transport version this driver speaks: the modern one (4.2.2.2
+/// has a driver ignore a version it does not support).
+public static SUPPORTED_VERSION: UInt32 = 2
+
+/// `DeviceID` of a network card (5.1, "Device ID").
+public static DEVICE_ID_NET: UInt32 = 1
+
+public static REGISTER_MAGIC_VALUE: UInt32 = 0x000
+public static REGISTER_VERSION: UInt32 = 0x004
+public static REGISTER_DEVICE_ID: UInt32 = 0x008
+public static REGISTER_DEVICE_FEATURES: UInt32 = 0x010
+public static REGISTER_DEVICE_FEATURES_SEL: UInt32 = 0x014
+public static REGISTER_DRIVER_FEATURES: UInt32 = 0x020
+public static REGISTER_DRIVER_FEATURES_SEL: UInt32 = 0x024
+public static REGISTER_QUEUE_SEL: UInt32 = 0x030
+public static REGISTER_QUEUE_NUM_MAX: UInt32 = 0x034
+public static REGISTER_QUEUE_NUM: UInt32 = 0x038
+public static REGISTER_QUEUE_READY: UInt32 = 0x044
+public static REGISTER_QUEUE_NOTIFY: UInt32 = 0x050
+public static REGISTER_INTERRUPT_STATUS: UInt32 = 0x060
+public static REGISTER_INTERRUPT_ACK: UInt32 = 0x064
+public static REGISTER_STATUS: UInt32 = 0x070
+public static REGISTER_QUEUE_DESC_LOW: UInt32 = 0x080
+public static REGISTER_QUEUE_DESC_HIGH: UInt32 = 0x084
+public static REGISTER_QUEUE_DRIVER_LOW: UInt32 = 0x090
+public static REGISTER_QUEUE_DRIVER_HIGH: UInt32 = 0x094
+public static REGISTER_QUEUE_DEVICE_LOW: UInt32 = 0x0a0
+public static REGISTER_QUEUE_DEVICE_HIGH: UInt32 = 0x0a4
+public static REGISTER_CONFIG_GENERATION: UInt32 = 0x0fc
+
+/// Where device-specific configuration space starts (4.2.2).
+public static REGISTER_CONFIG: UInt32 = 0x100
+
+// =============================================================================
+// Device status (2.1) and interrupt bits (4.2.2)
+// =============================================================================
+
+public static STATUS_ACKNOWLEDGE: UInt32 = 1
+public static STATUS_DRIVER: UInt32 = 2
+public static STATUS_DRIVER_OK: UInt32 = 4
+public static STATUS_FEATURES_OK: UInt32 = 8
+public static STATUS_DEVICE_NEEDS_RESET: UInt32 = 64
+public static STATUS_FAILED: UInt32 = 128
+
+/// `InterruptStatus` bit 0: a used buffer notification (4.2.2).
+public static INTERRUPT_USED_BUFFER: UInt32 = 1
+
+/// `InterruptStatus` bit 1: a configuration change notification (4.2.2).
+public static INTERRUPT_CONFIG_CHANGE: UInt32 = 2
+
+/// The bits of `InterruptStatus` the transport defines. The driver ignores
+/// the others and never writes one to `InterruptACK` (4.2.2.2).
+public static INTERRUPT_DEFINED: UInt32 = 3
+
+// =============================================================================
+// Features (5.1.3 for the device, 6 for the reserved bits)
+// =============================================================================
+
+/// `VIRTIO_NET_F_MTU`.
+public static F_MTU: UInt64 = 1 << 3
+
+/// `VIRTIO_NET_F_MAC`.
+public static F_MAC: UInt64 = 1 << 5
+
+/// `VIRTIO_NET_F_STATUS`.
+public static F_STATUS: UInt64 = 1 << 16
+
+/// `VIRTIO_F_VERSION_1`.
+public static F_VERSION_1: UInt64 = 1 << 32
+
+/// `VIRTIO_F_ACCESS_PLATFORM`: the device's addresses may be translated,
+/// which this driver cannot honour.
+public static F_ACCESS_PLATFORM: UInt64 = 1 << 33
+
+/// `VIRTIO_F_ORDER_PLATFORM`.
+public static F_ORDER_PLATFORM: UInt64 = 1 << 36
+
+/// The features the driver needs: a device without one is refused. 6.1 has a
+/// driver accept `VERSION_1`, and a device without `MAC` has no address to
+/// give a client (5.1.4.2 would let the driver invent one; this one does
+/// not).
+public static FEATURES_REQUIRED: UInt64 = F_VERSION_1 | F_MAC
+
+/// The features the driver takes when the device offers them. Every other
+/// bit is declined and never written back to `DriverFeatures`.
+public static FEATURES_OPTIONAL: UInt64 = F_STATUS | F_MTU | F_ORDER_PLATFORM
+
+// =============================================================================
+// Configuration space of a network device (5.1.4)
+// =============================================================================
+
+/// `mac`, six bytes.
+public static CONFIG_MAC: UInt32 = 0
+public static MAC_BYTES: UInt32 = 6
+
+/// `status`, 16 bits; bit 0 is `VIRTIO_NET_S_LINK_UP`.
+public static CONFIG_STATUS: UInt32 = 6
+
+/// `mtu`, 16 bits, present with `F_MTU`.
+public static CONFIG_MTU: UInt32 = 10
+
+/// The least `mtu` a device may report (5.1.4.1: "between 68 and 65535").
+public static MTU_MIN: UInt16 = 68
+
+/// The MTU the stack above this driver speaks; the driver reports the lesser
+/// of it and the device's.
+public static MTU_STACK: UInt16 = 1500
+
+// =============================================================================
+// Bounds
+// =============================================================================
+
+/// How many times the driver reads `Status` waiting for a reset to complete
+/// (2.4.2: "SHOULD consider a driver-initiated reset complete when it reads
+/// device status as 0"). The bound counts reads, not time, so a device that
+/// never settles is refused by name instead of hanging the driver.
+public static RESET_READS: UInt32 = 64
+
+/// How many times the driver reads configuration space again because
+/// `ConfigGeneration` changed under the read (2.5.1).
+public static CONFIG_READS: UInt32 = 8
+
+// =============================================================================
+// The window
+// =============================================================================
+
+/// The transport's registers: what the process maps and the tests fake.
+public trait Registers {
+    /// The control register at `offset`, 32 bits wide (4.2.2.2).
+    func read32(&var self, offset: UInt32) -> UInt32
+
+    /// Writes the control register at `offset`, 32 bits wide.
+    func write32(&var self, offset: UInt32, value: UInt32)
+
+    /// The configuration-space byte at `offset` from `REGISTER_CONFIG`, for an
+    /// 8 bit wide field.
+    func config_read8(&var self, offset: UInt32) -> UInt8
+
+    /// The configuration-space half word at `offset` from `REGISTER_CONFIG`,
+    /// for a 16 bit wide field; `offset` is even.
+    func config_read16(&var self, offset: UInt32) -> UInt16
+}
+
+// =============================================================================
+// Errors
+// =============================================================================
+
+/// Why the window is not a network device. The driver writes no register to
+/// find out, and exits 1.
+public enum ProbeError {
+    /// `MagicValue` is not `MAGIC_VALUE`: the window may not be virtio at all,
+    /// so no other register was read (4.2.2.2).
+    case BadMagic(value: UInt32),
+    /// A transport version other than 2, a legacy one (4.2.2.2).
+    case BadVersion(version: UInt32),
+    /// `DeviceID` 0: the transport has no device behind it (4.2.3.1.1).
+    case NoDevice,
+    /// A device that is not a network card.
+    case NotNetwork(id: UInt32),
+}
+
+@synthesize
+extension ProbeError: Equatable {}
+
+/// Why the driver cannot bring the device up. It gives the device up with
+/// `Lifecycle.give_up(Shutdown.Refused)`, which sets `FAILED`, resets, and
+/// answers the exit code: 1, or 4 when the reset is not confirmed.
+public enum SetupError {
+    /// The device is not offering a feature the driver needs.
+    case MissingFeature(feature: UInt64),
+    /// The device offers `ACCESS_PLATFORM`.
+    case AccessPlatform,
+    /// The device cleared `FEATURES_OK` (3.1.1 step 6).
+    case FeaturesRejected,
+    /// A queue's `QueueReady` was not 0 before setup (4.2.3.2).
+    case QueueBusy(queue: UInt32),
+    /// A queue's `QueueNumMax` leaves no room for a chain (4.1, 4.2.3.2).
+    case QueueTooSmall(queue: UInt32, max: UInt32),
+    /// The pinned queue memory is shorter than the queues' layout.
+    case QueuesTooShort(len: UInt64),
+    /// The pinned queue memory is not word-aligned.
+    case QueuesMisaligned(base: UInt64),
+    /// The memory could not be pinned.
+    case PinRefused,
+    /// `mtu` below `MTU_MIN`.
+    case MtuTooSmall(mtu: UInt16),
+    /// `ConfigGeneration` changed on every one of `CONFIG_READS` reads.
+    case ConfigUnstable,
+    /// A reset did not complete (`RESET_READS` reads of `Status`).
+    case ResetTimeout,
+}
+
+@synthesize
+extension SetupError: Equatable {}
+
+/// Why the device cannot be served any longer. The driver sets `FAILED`,
+/// resets, unpins and exits 3.
+public enum DeviceFault {
+    /// A used ring's `idx` moved by more than the chains in flight (2.7.8).
+    case UsedIndexAdvance(advance: UInt16),
+    /// A used element's `id` is not the head of a chain.
+    case UsedIdInvalid(id: UInt32),
+    /// A used element names a chain that is not in flight.
+    case UsedIdNotInFlight(id: UInt32),
+    /// A receive length below the header or past the header and the buffer
+    /// (2.7.8.2).
+    case ReceiveLength(len: UInt32),
+    /// A receive header whose `num_buffers` is not 1 (5.1.6.4.1).
+    case NumBuffers(count: UInt16),
+    /// `DEVICE_NEEDS_RESET` in `Status` (2.1.2).
+    case NeedsReset,
+    /// `ConfigGeneration` changed on every one of `CONFIG_READS` reads.
+    case ConfigUnstable,
+}
+
+@synthesize
+extension DeviceFault: Equatable {}
+
+/// The process exit codes, by the class of failure (they are the driver's
+/// `ended` status words, 0x10000 or'd with the code).
+public static EXIT_CLEAN: UInt32 = 0
+public static EXIT_REFUSED: UInt32 = 1
+public static EXIT_RING_FAULT: UInt32 = 2
+public static EXIT_DEVICE_FAULT: UInt32 = 3
+public static EXIT_RESET_UNCONFIRMED: UInt32 = 4
+
+extension ProbeError {
+    /// The process's exit code: 1, with nothing pinned and no register
+    /// written.
+    public func exit_code(&self) -> UInt32 {
+        EXIT_REFUSED
+    }
+}
+
+// =============================================================================
+// Probe
+// =============================================================================
+
+/// Reads `MagicValue`, `Version` and `DeviceID` in that order, each only if
+/// the one before was valid, and answers whether this is a network device.
+/// It writes no register and reads no other (4.2.3.1.1).
+public func probe<R: Registers>(registers: &var R) -> Result<Void, ProbeError> {
+    let magic = registers.read32(REGISTER_MAGIC_VALUE)
+    if magic != MAGIC_VALUE { return ProbeError.BadMagic(magic) }
+    let version = registers.read32(REGISTER_VERSION)
+    if version != SUPPORTED_VERSION { return ProbeError.BadVersion(version) }
+    let id = registers.read32(REGISTER_DEVICE_ID)
+    if id == 0 { return ProbeError.NoDevice }
+    if id != DEVICE_ID_NET { return ProbeError.NotNetwork(id) }
+    return
+}
+
+// =============================================================================
+// Reset
+// =============================================================================
+
+/// Writes `Status` 0 and reads it until it reads 0, at most `RESET_READS`
+/// times. After a read of 0 the device does not touch the queues until the
+/// driver sets it up again (2.4.1, 2.4.2); until then it may. A device that
+/// does not settle is `ResetTimeout`, and the memory the device may still
+/// address stays pinned.
+public func reset_device<R: Registers>(registers: &var R) -> Result<Void, SetupError> {
+    registers.write32(REGISTER_STATUS, 0)
+    var reads: UInt32 = 0
+    while reads < RESET_READS {
+        reads = reads + 1
+        if registers.read32(REGISTER_STATUS) == 0 { return }
+    }
+    return SetupError.ResetTimeout
+}
+
+// =============================================================================
+// Negotiation (3.1.1)
+// =============================================================================
+
+/// The features the driver and the device settled on.
+public struct Negotiated {
+    /// What the driver wrote to `DriverFeatures`.
+    public features: UInt64,
+}
+
+extension Negotiated {
+    /// Whether the driver accepted `feature`.
+    public func has(&self, feature: UInt64) -> Bool {
+        (self.features & feature) != 0
+    }
+}
+
+/// Reads the 64 feature bits the device offers: word 0, then word 1, each
+/// behind its select (4.2.2).
+public func read_device_features<R: Registers>(registers: &var R) -> UInt64 {
+    registers.write32(REGISTER_DEVICE_FEATURES_SEL, 0)
+    let low = registers.read32(REGISTER_DEVICE_FEATURES)
+    registers.write32(REGISTER_DEVICE_FEATURES_SEL, 1)
+    let high = registers.read32(REGISTER_DEVICE_FEATURES)
+    ((high as UInt64) << 32) | (low as UInt64)
+}
+
+/// Chooses from `offered`: the required bits must all be there and
+/// `ACCESS_PLATFORM` must not be; of the optional bits it takes those the
+/// device offers. It writes nothing.
+public func choose_features(offered: UInt64) -> Result<Negotiated, SetupError> {
+    if (offered & F_ACCESS_PLATFORM) != 0 { return SetupError.AccessPlatform }
+    let missing = FEATURES_REQUIRED & ~offered
+    if missing != 0 {
+        // Name the lowest absent bit, so the refusal is one feature.
+        var bit: UInt64 = 1
+        while (missing & bit) == 0 { bit = bit << 1 }
+        return SetupError.MissingFeature(bit)
+    }
+    return Negotiated(features: FEATURES_REQUIRED | (FEATURES_OPTIONAL & offered))
+}
+
+/// Writes `features` to `DriverFeatures`, word 0 then word 1, each behind its
+/// select.
+public func write_driver_features<R: Registers>(registers: &var R, features: UInt64) {
+    registers.write32(REGISTER_DRIVER_FEATURES_SEL, 0)
+    registers.write32(REGISTER_DRIVER_FEATURES, (features & 0xFFFF_FFFF) as UInt32)
+    registers.write32(REGISTER_DRIVER_FEATURES_SEL, 1)
+    registers.write32(REGISTER_DRIVER_FEATURES, (features >> 32) as UInt32)
+}
+
+// =============================================================================
+// Configuration space (5.1.4, 2.5.1)
+// =============================================================================
+
+/// What the driver reads from the device's configuration space.
+public struct NetConfig {
+    public mac: [UInt8; 6],
+    /// The link state: `LINK_UP`, or up when `STATUS` is not negotiated
+    /// (5.1.4.2).
+    public link_up: Bool,
+    /// The device's `mtu`, or 0 when `MTU` is not negotiated.
+    public mtu: UInt16,
+}
+
+extension NetConfig {
+    /// The MTU the driver reports to its client: the device's, no greater than
+    /// the stack's, or the stack's when the device has none to report.
+    public func reported_mtu(&self) -> UInt16 {
+        if self.mtu == 0 || self.mtu > MTU_STACK { MTU_STACK } else { self.mtu }
+    }
+}
+
+/// Reads `status` for the link, 16 bits wide.
+func read_link_bit<R: Registers>(registers: &var R) -> Bool {
+    (registers.config_read16(CONFIG_STATUS) & 1) != 0
+}
+
+/// Reads the configuration the driver uses, each field once at its own width
+/// and the whole read repeated while `ConfigGeneration` changes across it,
+/// at most `CONFIG_READS` times (2.5.1, 4.2.2). `mtu` below `MTU_MIN` is a
+/// refusal (5.1.4.1).
+public func read_config<R: Registers>(registers: &var R,
+                                      negotiated: &Negotiated) -> Result<NetConfig, SetupError> {
+    var attempt: UInt32 = 0
+    while attempt < CONFIG_READS {
+        attempt = attempt + 1
+        let before = registers.read32(REGISTER_CONFIG_GENERATION)
+        var mac: [UInt8; 6] = [0; 6]
+        var i: UInt32 = 0
+        while i < MAC_BYTES {
+            mac[i as Int] = registers.config_read8(CONFIG_MAC + i)
+            i = i + 1
+        }
+        let link_up = if negotiated.has(F_STATUS) { read_link_bit(&var registers) } else { true }
+        let mtu: UInt16 = if negotiated.has(F_MTU) { registers.config_read16(CONFIG_MTU) } else { 0 }
+        let after = registers.read32(REGISTER_CONFIG_GENERATION)
+        if before == after {
+            if negotiated.has(F_MTU) && mtu < MTU_MIN { return SetupError.MtuTooSmall(mtu) }
+            return NetConfig(mac: mac, link_up: link_up, mtu: mtu)
+        }
+    }
+    return SetupError.ConfigUnstable
+}
+
+/// What a configuration-change interrupt asks: whether `Status` says the
+/// device needs a reset (a fault), and otherwise the link's state, read
+/// again under `ConfigGeneration`. Without `STATUS` the link is always up.
+public func read_link<R: Registers>(registers: &var R,
+                                    negotiated: &Negotiated) -> Result<Bool, DeviceFault> {
+    let status = registers.read32(REGISTER_STATUS)
+    if (status & STATUS_DEVICE_NEEDS_RESET) != 0 { return DeviceFault.NeedsReset }
+    if not negotiated.has(F_STATUS) { return true }
+    var attempt: UInt32 = 0
+    while attempt < CONFIG_READS {
+        attempt = attempt + 1
+        let before = registers.read32(REGISTER_CONFIG_GENERATION)
+        let up = read_link_bit(&var registers)
+        if registers.read32(REGISTER_CONFIG_GENERATION) == before { return up }
+    }
+    return DeviceFault.ConfigUnstable
+}
+
+// =============================================================================
+// Interrupts (4.2.2.2, 4.2.3.4)
+// =============================================================================
+
+/// The events one interrupt delivered.
+public struct InterruptEvents {
+    /// A used buffer notification.
+    public used_buffer: Bool,
+    /// A configuration change.
+    public config_change: Bool,
+}
+
+/// Reads `InterruptStatus`, keeps the two defined bits, and writes them back
+/// to `InterruptACK`: an undefined bit is neither acknowledged nor acted on,
+/// and no write is made when no defined bit is set (4.2.2.2).
+public func take_interrupt<R: Registers>(registers: &var R) -> InterruptEvents {
+    let bits = registers.read32(REGISTER_INTERRUPT_STATUS) & INTERRUPT_DEFINED
+    if bits != 0 { registers.write32(REGISTER_INTERRUPT_ACK, bits) }
+    InterruptEvents(used_buffer: (bits & INTERRUPT_USED_BUFFER) != 0,
+                    config_change: (bits & INTERRUPT_CONFIG_CHANGE) != 0)
+}

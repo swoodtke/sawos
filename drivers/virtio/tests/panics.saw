@@ -1,0 +1,147 @@
+// The caller-misuse panics of the library and of the fake, each pinned by a
+// child: the test runs itself with a mode argument, the child commits one
+// misuse, and the parent checks that the child failed with that panic's
+// message, and that a child making no misuse does not. A device's bad value
+// is never one of these: those are the errors the other tests pin.
+
+import virtio.{Lifecycle, Queues}
+import virtio.fake.{Fake}
+import virtio.transport.{REGISTER_STATUS}
+import std.env.{Env}
+import std.process.{Command}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+struct Up {
+    f: Fake,
+    lc: Lifecycle,
+    q: Queues,
+}
+
+extension Up: NoCopy {}
+
+func up() -> Up {
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = try! lc.begin(&var f)
+    let q = try! lc.setup_queues(&var f)
+    lc.go_live(&var f)
+    try! lc.pin_ring(&var f)
+    Up(f: f, lc: move lc, q: q)
+}
+
+/// The child: a running device, and the misuse `mode` names.
+func child(mode: String) {
+    var u = up()
+    if mode.equals("ring_unpinned") {
+        let lc = Lifecycle()
+        let _ = lc.ring_address(0, 4)
+    } else if mode.equals("ring_empty") {
+        let _ = u.lc.ring_address(0x100, 0)
+    } else if mode.equals("ring_empty_at_end") {
+        let _ = u.lc.ring_address(0x2000, 0)
+    } else if mode.equals("ring_past") {
+        let _ = u.lc.ring_address(0x2000 - 4, 8)
+    } else if mode.equals("ring_offset_past") {
+        let _ = u.lc.ring_address(0x2001, 4)
+    } else if mode.equals("post_rx_busy") {
+        u.q.rx.post_rx(&var u.f, 0, u.lc.ring_address(0, 64))
+        u.q.rx.post_rx(&var u.f, 0, u.lc.ring_address(0, 64))
+    } else if mode.equals("post_rx_past") {
+        u.q.rx.post_rx(&var u.f, 32, u.lc.ring_address(0, 64))
+    } else if mode.equals("post_rx_untaken") {
+        // Completed, but not yet taken in order: still not free.
+        u.q.rx.post_rx(&var u.f, 0, u.lc.ring_address(0, 64))
+        u.f.complete(0, 0, 12)
+        let _ = try! u.q.rx.pending(&var u.f)
+        let _ = u.q.rx.next(&var u.f)
+        u.q.rx.post_rx(&var u.f, 0, u.lc.ring_address(0, 64))
+    } else if mode.equals("post_tx_busy") {
+        u.q.tx.post_tx(&var u.f, 0, u.lc.ring_address(0, 64))
+        u.q.tx.post_tx(&var u.f, 0, u.lc.ring_address(0, 64))
+    } else if mode.equals("post_tx_past") {
+        u.q.tx.post_tx(&var u.f, 32, u.lc.ring_address(0, 64))
+    } else if mode.equals("next_none") {
+        let _ = u.q.rx.next(&var u.f)
+    } else if mode.equals("fake_config16_odd") {
+        let _ = u.f.config_read16(7)
+    } else if mode.equals("fake_config16_past") {
+        let _ = u.f.config_read16(12)
+    } else if mode.equals("fake_config8_past") {
+        let _ = u.f.config_read8(12)
+    } else if mode.equals("fake_control_unaligned") {
+        let _ = u.f.read32(0x71)
+    } else if mode.equals("fake_control_in_config") {
+        let _ = u.f.read32(0x100)
+    } else if mode.equals("fake_write_unknown") {
+        u.f.write32(0x0c8, 1)
+    } else {
+        // Every call at its boundary and within its contract.
+        let _ = u.lc.ring_address(0x2000 - 8, 8)
+        u.q.rx.post_rx(&var u.f, 31, u.lc.ring_address(0, 64))
+        u.q.tx.post_tx(&var u.f, 31, u.lc.ring_address(0, 64))
+        let _ = u.f.config_read16(10)
+        let _ = u.f.config_read8(11)
+        let _ = u.f.read32(REGISTER_STATUS)
+    }
+    print("child done")
+}
+
+struct Ran {
+    out: String,
+    failed: Bool,
+}
+
+func run(mode: String) -> Ran {
+    let me = try! Env.executable_path()
+    var cmd = Command(program: me)
+    try! cmd.arg(mode)
+    cmd.merge_stderr()
+    let out = try! cmd.output()
+    Ran(out: out.stdout, failed: out.exit_code != 0)
+}
+
+func panics_with(mode: String, message: String) -> Bool {
+    let ran = run(mode)
+    ran.failed && ran.out.contains(message)
+}
+
+func main() {
+    if Env.argument_count() > 1 {
+        let mode = try! Env.argument(1)
+        child(mode!)
+        return
+    }
+    let calm = run("none")
+    check(not calm.failed && calm.out.contains("child done"), "a child at the boundaries finishes")
+    check(panics_with("ring_unpinned", "ring_address: the ring is not pinned"), "an unpinned ring")
+    check(panics_with("ring_empty", "ring_address: an empty range"), "an empty range")
+    check(panics_with("ring_empty_at_end", "ring_address: an empty range"),
+          "an empty range at the ring's end")
+    check(panics_with("ring_past", "are past the ring"), "a range past the ring")
+    check(panics_with("ring_offset_past", "are past the ring"), "an offset past the ring")
+    check(panics_with("post_rx_busy", "post_rx: chain 0 is not free"), "post_rx of a chain in flight")
+    check(panics_with("post_rx_past", "post_rx: chain 32 is not free"), "post_rx past the chains")
+    check(panics_with("post_rx_untaken", "post_rx: chain 0 is not free"),
+          "post_rx of a chain completed and not taken in order")
+    check(panics_with("post_tx_busy", "post_tx: chain 0 is not free"), "post_tx of a chain in flight")
+    check(panics_with("post_tx_past", "post_tx: chain 32 is not free"), "post_tx past the chains")
+    check(panics_with("next_none", "next: no used element is pending"), "next with nothing pending")
+    check(panics_with("fake_config16_odd", "config_read16: not a 16 bit field"),
+          "the fake refuses a 16 bit read at an odd offset")
+    check(panics_with("fake_config16_past", "config_read16: not a 16 bit field"),
+          "and one that ends past its fields")
+    check(panics_with("fake_config8_past", "config_read8: past the fields"),
+          "and a byte read past them")
+    check(panics_with("fake_control_unaligned", "read32: not a control register"),
+          "and an unaligned control register read")
+    check(panics_with("fake_control_in_config", "read32: not a control register"),
+          "and a 32 bit read in configuration space")
+    check(panics_with("fake_write_unknown", "write32: no such register"),
+          "and a write to a register the transport does not have")
+}

@@ -1,0 +1,217 @@
+// Queue setup (virtio 1.2 section 4.2.3.2) against the fake: the sizes the
+// driver picks, the registers it writes and in which order, the refusals of
+// a device whose queue is not as expected, and the pin that precedes every
+// address.
+
+import virtio.{Lifecycle, MemoryPlan, Queues, SetupError}
+import virtio.fake.{EVENT_PIN, EVENT_READ32, EVENT_STORE16, EVENT_STORE32, EVENT_WRITE32, Fake}
+import virtio.transport.{REGISTER_QUEUE_DESC_HIGH, REGISTER_QUEUE_DESC_LOW, REGISTER_QUEUE_DEVICE_HIGH,
+                         REGISTER_QUEUE_DEVICE_LOW, REGISTER_QUEUE_DRIVER_HIGH, REGISTER_QUEUE_DRIVER_LOW,
+                         REGISTER_QUEUE_NUM, REGISTER_QUEUE_NUM_MAX, REGISTER_QUEUE_READY, REGISTER_QUEUE_SEL,
+                         REGISTER_STATUS, STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK,
+                         STATUS_FEATURES_OK}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func setup(f: &var Fake) -> Result<Queues, SetupError> {
+    var lc = Lifecycle()
+    let _ = try! lc.begin(&var f)
+    lc.setup_queues(&var f)
+}
+
+func is_refused(r: Result<Queues, SetupError>, want: SetupError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func queue_sizes() {
+    var f = Fake.qemu()
+    let q = try! setup(&var f)
+    check(q.rx.size() == 64 && q.tx.size() == 64, "QueueNumMax 256 gives 64 queues")
+    check(f.queue_num(0) == 64 && f.queue_num(1) == 64, "the device was told 64")
+    var small = Fake.qemu()
+    small.max_entries = [48, 32]
+    let s = try! setup(&var small)
+    check(s.rx.size() == 32 && s.tx.size() == 32, "48 and 32 both give 32")
+    check(s.rx.chains() == 16, "a chain is two descriptors")
+    var mixed = Fake.qemu()
+    mixed.max_entries = [256, 4]
+    let m = try! setup(&var mixed)
+    check(m.rx.size() == 64 && m.tx.size() == 4, "each queue is sized on its own")
+}
+
+func registers() {
+    var f = Fake.qemu()
+    let q = try! setup(&var f)
+    // The allocation's base is 4 mod 16, so its first 16-aligned byte is 12 on.
+    let plan = MemoryPlan(64, 64, 12)
+    check(f.desc_offset(0) == plan.rx.desc && f.avail_offset(0) == plan.rx.avail &&
+          f.used_offset(0) == plan.rx.used, "queue 0's three areas")
+    check(f.desc_offset(1) == plan.tx.desc && f.avail_offset(1) == plan.tx.avail &&
+          f.used_offset(1) == plan.tx.used, "queue 1's three areas")
+    check(f.writes_to(REGISTER_QUEUE_READY) == 2 && f.last_write(REGISTER_QUEUE_READY)! == 1,
+          "each queue is made ready once")
+    check(f.writes_to(REGISTER_QUEUE_NUM) == 2, "each queue is given its size once")
+    check(f.writes_to(REGISTER_QUEUE_DESC_LOW) == 2 && f.writes_to(REGISTER_QUEUE_DESC_HIGH) == 2 &&
+          f.writes_to(REGISTER_QUEUE_DRIVER_LOW) == 2 && f.writes_to(REGISTER_QUEUE_DRIVER_HIGH) == 2 &&
+          f.writes_to(REGISTER_QUEUE_DEVICE_LOW) == 2 && f.writes_to(REGISTER_QUEUE_DEVICE_HIGH) == 2,
+          "each address is two words")
+    check(f.stray_addresses == 0, "every address the device holds is in a pinned object")
+    check(f.ready[0] == 1 && f.ready[1] == 1, "both queues are ready")
+    // The queues are not live until the driver says so.
+    check(f.status == (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK),
+          "DRIVER_OK is not set by setup")
+    check(q.rx.size() == 64, "the queues are returned")
+}
+
+func the_plan_is_zeroed() {
+    // The memory is not assumed zero: every word of the plan is stored, from
+    // the first 16-aligned byte to the plan's end, and nothing past it.
+    let plan = MemoryPlan(64, 64, 12)
+    var f = Fake.qemu()
+    var at: UInt32 = 0
+    while at < 4096 {
+        f.poke32(at, 0xFFFF_FFFF)
+        at = at + 4
+    }
+    let _ = try! setup(&var f)
+    at = 12
+    while at < plan.end {
+        if f.peek32(at) != 0 {
+            print("offset {}", at)
+            check(false, "every word of the plan is zero")
+        }
+        at = at + 4
+    }
+    check(f.peek32(plan.end) == 0xFFFF_FFFF && f.peek32(8) == 0xFFFF_FFFF,
+          "and no word outside it is written")
+}
+
+func queue_registers_come_last() {
+    // Every store into the queue memory precedes the first QueueReady, and
+    // QueueNum precedes it, in each queue's turn.
+    var f = Fake.qemu()
+    let _ = try! setup(&var f)
+    let ready = f.find_write(REGISTER_QUEUE_READY, 1)!
+    check(f.count_after(ready, EVENT_STORE32, 0) == 0 && f.count(EVENT_STORE16) == 0,
+          "nothing is stored into the queue memory after the first queue is ready")
+    let plan = MemoryPlan(64, 64, 12)
+    check(f.find(EVENT_STORE32, plan.rx.used as UInt64)! < ready, "the used ring is cleared first")
+    check(f.find(EVENT_STORE32, (plan.rx.used + 4) as UInt64)! < ready, "all of it")
+    check(f.find_write(REGISTER_QUEUE_NUM, 64)! < ready, "QueueNum is written before QueueReady")
+    let second = f.find_write_after(ready + 1, REGISTER_QUEUE_READY, 1)!
+    check(f.find_write_after(ready + 1, REGISTER_QUEUE_NUM, 64)! < second,
+          "and before the second queue's QueueReady")
+}
+
+func plan_length_boundary() {
+    // Base 4 mod 16, so slack 12: memory of exactly the plan's end is enough.
+    let plan = MemoryPlan(64, 64, 12)
+    var exact = Fake.qemu()
+    exact.queues_len = plan.end as UInt64
+    check(not is_refused(setup(&var exact), SetupError.QueuesTooShort(plan.end as UInt64)),
+          "memory exactly the plan's length is enough")
+    var short = Fake.qemu()
+    short.queues_len = (plan.end - 1) as UInt64
+    check(is_refused(setup(&var short), SetupError.QueuesTooShort((plan.end - 1) as UInt64)),
+          "one byte short is refused")
+    check(short.writes_to(REGISTER_QUEUE_READY) == 0, "and no queue is made ready")
+    // The plan reaches the transmit header: memory that ends before it holds
+    // the queues and not the plan.
+    var cut = Fake.qemu()
+    cut.queues_len = (plan.tx_header + 4) as UInt64
+    check(is_refused(setup(&var cut), SetupError.QueuesTooShort((plan.tx_header + 4) as UInt64)),
+          "memory ending inside the transmit header is refused")
+}
+
+func misaligned_memory() {
+    var f = Fake.qemu()
+    f.queues_base = 0x4000_0002
+    check(is_refused(setup(&var f), SetupError.QueuesMisaligned(0x4000_0002)),
+          "memory that is not word-aligned is refused")
+    check(f.writes_to(REGISTER_QUEUE_READY) == 0, "and no queue is made ready")
+    check(f.find(EVENT_STORE32, 0) == None, "and nothing is stored in it")
+}
+
+func driver_ok() {
+    var f = Fake.qemu()
+    var lc = Lifecycle()
+    let _ = try! lc.begin(&var f)
+    let _ = try! lc.setup_queues(&var f)
+    lc.go_live(&var f)
+    check(f.status == (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK),
+          "DRIVER_OK is added to the status written so far")
+}
+
+func pin_comes_first() {
+    var f = Fake.qemu()
+    let _ = try! setup(&var f)
+    let pin = f.find(EVENT_PIN, 0)!
+    let registers: [UInt32; 7] = [REGISTER_QUEUE_DESC_LOW, REGISTER_QUEUE_DESC_HIGH, REGISTER_QUEUE_DRIVER_LOW,
+                                  REGISTER_QUEUE_DRIVER_HIGH, REGISTER_QUEUE_DEVICE_LOW,
+                                  REGISTER_QUEUE_DEVICE_HIGH, REGISTER_QUEUE_READY]
+    var i = 0
+    while i < 7 {
+        check(f.find_any_write(registers[i])! > pin,
+              "no address register is written, and no queue made ready, before the Pin")
+        i = i + 1
+    }
+    // The reads that decide the sizes come first and write only the select.
+    check(f.find(EVENT_READ32, REGISTER_QUEUE_NUM_MAX as UInt64)! < pin, "the sizes are read before the Pin")
+    check(f.writes_to(REGISTER_QUEUE_SEL) == 4, "each queue is selected to read it and to program it")
+}
+
+func queue_busy() {
+    var f = Fake.qemu()
+    f.ready_after_reset = [1, 0]
+    check(is_refused(setup(&var f), SetupError.QueueBusy(0)), "QueueReady 1 on queue 0 before setup")
+    check((f.find(EVENT_PIN, 0) == None), "nothing is pinned for a refused queue")
+    var g = Fake.qemu()
+    g.ready_after_reset = [0, 1]
+    check(is_refused(setup(&var g), SetupError.QueueBusy(1)), "QueueReady 1 on queue 1 before setup")
+}
+
+func queue_unavailable() {
+    var zero = Fake.qemu()
+    zero.max_entries = [0, 256]
+    check(is_refused(setup(&var zero), SetupError.QueueTooSmall(0, 0)), "QueueNumMax 0")
+    var one = Fake.qemu()
+    one.max_entries = [256, 1]
+    check(is_refused(setup(&var one), SetupError.QueueTooSmall(1, 1)), "QueueNumMax 1")
+    check((one.find(EVENT_PIN, 0) == None) && one.writes_to(REGISTER_QUEUE_READY) == 0,
+          "nothing is pinned or made ready")
+}
+
+func pin_refusals() {
+    var refused = Fake.qemu()
+    refused.pin_refused = true
+    check(is_refused(setup(&var refused), SetupError.PinRefused), "a refused Pin")
+    check(refused.writes_to(REGISTER_QUEUE_READY) == 0 && refused.stray_addresses == 0,
+          "no address reaches the device")
+    var short = Fake.qemu()
+    short.queues_len = 1024
+    check(is_refused(setup(&var short), SetupError.QueuesTooShort(1024)),
+          "queue memory shorter than the layout")
+    check(short.writes_to(REGISTER_QUEUE_READY) == 0, "no queue is made ready")
+}
+
+func main() {
+    queue_sizes()
+    registers()
+    the_plan_is_zeroed()
+    queue_registers_come_last()
+    plan_length_boundary()
+    misaligned_memory()
+    driver_ok()
+    pin_comes_first()
+    queue_busy()
+    queue_unavailable()
+    pin_refusals()
+}

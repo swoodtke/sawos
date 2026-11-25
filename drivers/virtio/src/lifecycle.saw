@@ -1,0 +1,211 @@
+//! The driver's order of work: bringing the device up (virtio 1.2 section
+//! 3.1.1), and giving it up, with the memory the device addresses pinned from
+//! before any address reaches it until after a reset the driver has seen
+//! complete.
+//!
+//! The rule, which every method here keeps:
+//!
+//!   1. an object is pinned before any address in it is written to a register
+//!      or a descriptor;
+//!   2. an object is unpinned only after `Status` was written 0 and then read
+//!      as 0 within `RESET_READS` reads (2.4.2), so the device has stopped
+//!      using the queues;
+//!   3. a reset that is not confirmed unpins nothing: the objects stay pinned
+//!      and the process exits 4, since the device may still write them.
+//!
+//! The failure classes and the writes each makes are `Lifecycle.give_up`.
+
+import virtio.queue.{Dma, DmaObject, MemoryPlan, Pinned, Queue, RingSpan, queue_size}
+import virtio.transport.{EXIT_CLEAN, EXIT_DEVICE_FAULT, EXIT_REFUSED, EXIT_RESET_UNCONFIRMED,
+                         EXIT_RING_FAULT, Negotiated, REGISTER_QUEUE_NUM_MAX, REGISTER_QUEUE_READY,
+                         REGISTER_QUEUE_SEL, REGISTER_STATUS, Registers, SetupError, STATUS_ACKNOWLEDGE,
+                         STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, STATUS_FEATURES_OK,
+                         choose_features, read_device_features, reset_device,
+                         write_driver_features}
+
+/// Why the driver is giving the device up after it was set up.
+public enum Shutdown {
+    /// A refusal while setting up: a feature, `FEATURES_OK`, a queue, `mtu`,
+    /// `ConfigGeneration`, a Pin. Exit 1.
+    case Refused,
+    /// A value the device wrote failed a check, or it needs a reset. Exit 3.
+    case DeviceFault,
+    /// A client's ring failed a check. Exit 2.
+    case RingFault,
+    /// The last client is gone. Exit 0.
+    case ClientGone,
+}
+
+/// Both queues, set up.
+public struct Queues {
+    public rx: Queue,
+    public tx: Queue,
+}
+
+/// The device's status as the driver wrote it, and which objects it has
+/// pinned. It is the only holder of a pin, so it is not copied: a copy taken
+/// before `give_up` would go on answering addresses of memory that was
+/// unpinned.
+public struct Lifecycle {
+    private status: UInt32,
+    private queues_pinned: Bool,
+    private queues: Pinned,
+    private ring_pinned: Bool,
+    private ring: Pinned,
+}
+
+extension Lifecycle: NoCopy {}
+
+extension Lifecycle {
+    /// A driver that has written nothing and pinned nothing.
+    public init() -> Lifecycle {
+        Lifecycle(status: 0, queues_pinned: false, queues: Pinned(base: 0, len: 0),
+                  ring_pinned: false, ring: Pinned(base: 0, len: 0))
+    }
+
+    /// Whether the queue memory is pinned: a driver that leaves a reset
+    /// unconfirmed names what it leaves.
+    public func queues_pinned(&self) -> Bool {
+        self.queues_pinned
+    }
+
+    /// Whether the ring is pinned.
+    public func ring_pinned(&self) -> Bool {
+        self.ring_pinned
+    }
+
+    /// Writes `Status` with `bit` added to what the driver last wrote.
+    func add_status<R: Registers>(&var self, registers: &var R, bit: UInt32) {
+        self.status = self.status | bit
+        registers.write32(REGISTER_STATUS, self.status)
+    }
+
+    /// Initialises the device through the features (3.1.1 steps 1 to 6):
+    /// reset, `ACKNOWLEDGE`, `DRIVER`, the offered features read, the ones
+    /// chosen written back, `FEATURES_OK`, and `Status` read again to see it
+    /// still set. A refusal leaves the caller to `give_up(Refused)`.
+    public func begin<R: Registers>(&var self, registers: &var R) -> Result<Negotiated, SetupError> {
+        try reset_device(&var registers)
+        self.status = 0
+        self.add_status(&var registers, STATUS_ACKNOWLEDGE)
+        self.add_status(&var registers, STATUS_DRIVER)
+        let offered = read_device_features(&var registers)
+        let negotiated = try choose_features(offered)
+        write_driver_features(&var registers, negotiated.features)
+        self.add_status(&var registers, STATUS_FEATURES_OK)
+        if (registers.read32(REGISTER_STATUS) & STATUS_FEATURES_OK) == 0 {
+            return SetupError.FeaturesRejected
+        }
+        return negotiated
+    }
+
+    /// Reads one queue's readiness and size, writing only its select
+    /// (4.2.3.2 steps 1 to 3).
+    func inspect_queue<R: Registers>(&self, registers: &var R, queue: UInt32) -> Result<UInt32, SetupError> {
+        registers.write32(REGISTER_QUEUE_SEL, queue)
+        if registers.read32(REGISTER_QUEUE_READY) != 0 { return SetupError.QueueBusy(queue) }
+        let max = registers.read32(REGISTER_QUEUE_NUM_MAX)
+        return try queue_size(queue, max)
+    }
+
+    /// Sets both queues up: each one's readiness and size are read, the queue
+    /// memory is pinned, and only then is any address written, to the
+    /// registers (4.2.3.2 steps 4 to 8). The queues are not live until
+    /// `go_live`.
+    public func setup_queues<H: Registers + Dma>(&var self, hardware: &var H) -> Result<Queues, SetupError> {
+        let rx_size = try self.inspect_queue(&var hardware, 0)
+        let tx_size = try self.inspect_queue(&var hardware, 1)
+        let pinned = try hardware.pin(DmaObject.Queues) catch { return SetupError.PinRefused }
+        self.queues_pinned = true
+        self.queues = pinned
+        // Words are stored, so the memory is at least word-aligned (a pool's
+        // grain is).
+        if pinned.base % 4 != 0 { return SetupError.QueuesMisaligned(pinned.base) }
+        let slack = ((16 - pinned.base % 16) % 16) as UInt32
+        let plan = MemoryPlan(rx_size, tx_size, slack)
+        if pinned.len < (plan.end as UInt64) { return SetupError.QueuesTooShort(pinned.len) }
+        // The memory is not assumed zero: every word of the plan is stored,
+        // the rings' flags and indexes, the shared transmit header and the
+        // descriptors' and headers' space with them, before the device is
+        // given an address.
+        var at = slack
+        while at < plan.end {
+            hardware.store32(at, 0)
+            at = at + 4
+        }
+        let rx = Queue(0, plan.rx, plan.rx_headers, pinned.base)
+        let tx = Queue(1, plan.tx, plan.tx_header, pinned.base)
+        rx.program(&var hardware)
+        tx.program(&var hardware)
+        return Queues(rx: rx, tx: tx)
+    }
+
+    /// Sets `DRIVER_OK`: the device is live (3.1.1 step 8).
+    public func go_live<R: Registers>(&var self, registers: &var R) {
+        self.add_status(&var registers, STATUS_DRIVER_OK)
+    }
+
+    /// Pins a client's ring, before any slot's address is posted.
+    public func pin_ring<D: Dma>(&var self, dma: &var D) -> Result<Void, SetupError> {
+        let pinned = try dma.pin(DmaObject.Ring) catch { return SetupError.PinRefused }
+        self.ring_pinned = true
+        self.ring = pinned
+        return
+    }
+
+    /// The range of `len` bytes at `offset` in the pinned ring, as the one
+    /// buffer a descriptor may be given. An unpinned ring, an empty range or a
+    /// range that does not lie wholly in the ring is a caller's bug.
+    public func ring_address(&self, offset: UInt32, len: UInt32) -> RingSpan {
+        if not self.ring_pinned { panic("ring_address: the ring is not pinned") }
+        if len == 0 { panic("ring_address: an empty range at {}", offset) }
+        if (offset as UInt64) + (len as UInt64) > self.ring.len {
+            panic("ring_address: {} bytes at {} are past the ring", len, offset)
+        }
+        RingSpan(device_address: self.ring.base + (offset as UInt64), byte_count: len)
+    }
+
+    /// Gives the device up and answers the process's exit code.
+    ///
+    ///   - `Refused`: `FAILED` is added to the status (2.2.1), then the
+    ///     reset; what is pinned is unpinned, and nothing is unmapped. Exit 1.
+    ///   - `DeviceFault`: `FAILED`, the reset, then what is pinned is
+    ///     unpinned and unmapped. Exit 3.
+    ///   - `RingFault`: the reset, then unpin and unmap. Exit 2.
+    ///   - `ClientGone`: the reset, then unpin and unmap. Exit 0.
+    ///
+    /// The reset is `Status` 0 and the bounded wait. When it is not confirmed
+    /// nothing is unpinned and the answer is 4. The ring goes before the
+    /// queues, each unpinned and then unmapped. The `Queues` setup answered
+    /// are dead afterwards: the caller posts nothing to them.
+    public func give_up<H: Registers + Dma>(&var self, hardware: &var H, why: Shutdown) -> UInt32 {
+        let failed = match why {
+            case Refused -> true,
+            case DeviceFault -> true,
+            case _ -> false,
+        }
+        if failed { self.add_status(&var hardware, STATUS_FAILED) }
+        try reset_device(&var hardware) catch { return EXIT_RESET_UNCONFIRMED }
+        self.status = 0
+        let unmap = match why {
+            case Refused -> false,
+            case _ -> true,
+        }
+        if self.ring_pinned {
+            hardware.unpin(DmaObject.Ring)
+            self.ring_pinned = false
+            if unmap { hardware.unmap(DmaObject.Ring) }
+        }
+        if self.queues_pinned {
+            hardware.unpin(DmaObject.Queues)
+            self.queues_pinned = false
+            if unmap { hardware.unmap(DmaObject.Queues) }
+        }
+        return match why {
+            case Refused -> EXIT_REFUSED,
+            case DeviceFault -> EXIT_DEVICE_FAULT,
+            case RingFault -> EXIT_RING_FAULT,
+            case ClientGone -> EXIT_CLEAN,
+        }
+    }
+}

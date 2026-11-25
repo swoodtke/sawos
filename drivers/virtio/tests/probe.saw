@@ -1,0 +1,89 @@
+// The probe: MagicValue, Version and DeviceID are read in that order and each
+// only if the one before was valid; no register is written, and the refusals
+// name what was found.
+
+import virtio.{ProbeError, probe}
+import virtio.fake.{EVENT_READ32, EVENT_WRITE32, Fake}
+import virtio.transport.{REGISTER_DEVICE_ID, REGISTER_MAGIC_VALUE, REGISTER_VERSION}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func is_refused(r: Result<Void, ProbeError>, want: ProbeError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func is_ok(r: Result<Void, ProbeError>) -> Bool {
+    match r {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+}
+
+/// How many registers the probe read, and whether it wrote any.
+func reads(f: &Fake) -> UInt32 {
+    f.count(EVENT_READ32)
+}
+
+func writes(f: &Fake) -> UInt32 {
+    f.count(EVENT_WRITE32)
+}
+
+func accepts_a_network_device() {
+    var f = Fake.qemu()
+    check(is_ok(probe(&var f)), "a network device is accepted")
+    check(reads(&f) == 3, "magic, version and device id are read")
+    check(f.find(EVENT_READ32, REGISTER_MAGIC_VALUE as UInt64)! <
+          f.find(EVENT_READ32, REGISTER_VERSION as UInt64)!, "magic is read before version")
+    check(f.find(EVENT_READ32, REGISTER_VERSION as UInt64)! <
+          f.find(EVENT_READ32, REGISTER_DEVICE_ID as UInt64)!, "version is read before the id")
+    check(writes(&f) == 0, "the probe writes nothing")
+}
+
+func wrong_magic() {
+    var f = Fake.qemu()
+    f.magic = 0x7472_6977
+    check(is_refused(probe(&var f), ProbeError.BadMagic(0x7472_6977)), "a wrong magic is refused")
+    check(reads(&f) == 1, "nothing is read after a wrong magic, not even the version")
+    check(writes(&f) == 0, "nothing is written after a wrong magic")
+}
+
+func wrong_version() {
+    var legacy = Fake.qemu()
+    legacy.version = 1
+    check(is_refused(probe(&var legacy), ProbeError.BadVersion(1)), "a legacy transport is refused")
+    check(reads(&legacy) == 2 && writes(&legacy) == 0,
+          "the device id is not read behind a legacy version and nothing is written")
+    var future = Fake.qemu()
+    future.version = 3
+    check(is_refused(probe(&var future), ProbeError.BadVersion(3)), "version 3 is refused")
+    check(reads(&future) == 2 && writes(&future) == 0, "nothing is written behind version 3")
+}
+
+func wrong_device() {
+    var empty = Fake.qemu()
+    empty.device_id = 0
+    check(is_refused(probe(&var empty), ProbeError.NoDevice), "an empty transport is refused")
+    check(writes(&empty) == 0, "nothing is written to an empty transport")
+    check(reads(&empty) == 3, "and no register is read after the DeviceID (4.2.3.1.1)")
+    var block = Fake.qemu()
+    block.device_id = 4
+    check(is_refused(probe(&var block), ProbeError.NotNetwork(4)), "a device that is not a network card")
+    check(reads(&block) == 3 && writes(&block) == 0, "its id is read and nothing is written")
+    check(ProbeError.NoDevice.exit_code() == 1 && ProbeError.BadMagic(0).exit_code() == 1,
+          "a probe refusal exits 1")
+}
+
+func main() {
+    accepts_a_network_device()
+    wrong_magic()
+    wrong_version()
+    wrong_device()
+}

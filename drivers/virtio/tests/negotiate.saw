@@ -1,0 +1,230 @@
+// Feature negotiation (virtio 1.2 sections 3.1.1 and 6.1): the required,
+// taken-when-offered, refused and declined bits, what is written to the
+// device, and each refusal's class.
+
+import virtio.{Lifecycle, Negotiated, SetupError, Shutdown}
+import virtio.fake.{EVENT_WRITE32, Fake}
+import virtio.transport.{F_ACCESS_PLATFORM, F_MAC, F_MTU, F_ORDER_PLATFORM, F_STATUS,
+                         F_VERSION_1, REGISTER_DEVICE_FEATURES_SEL, REGISTER_DRIVER_FEATURES,
+                         REGISTER_DRIVER_FEATURES_SEL, REGISTER_STATUS,
+                         STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_FAILED, STATUS_FEATURES_OK}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// What the driver chose, or the refusal.
+func begin(f: &var Fake) -> Result<Negotiated, SetupError> {
+    var lc = Lifecycle()
+    lc.begin(&var f)
+}
+
+func chose(f: &var Fake) -> UInt64 {
+    let n = try begin(&var f) catch { return 0 }
+    n.features
+}
+
+func is_ok(r: Result<Negotiated, SetupError>) -> Bool {
+    match r {
+        case Ok(_) -> true,
+        case Err(_) -> false,
+    }
+}
+
+func is_refused(r: Result<Negotiated, SetupError>, want: SetupError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func qemu_defaults() {
+    var f = Fake.qemu()
+    let got = chose(&var f)
+    check(got == 0x1_0001_0020, "QEMU's offer negotiates VERSION_1, STATUS and MAC")
+    check(f.driver_features == got, "the chosen word, both halves, is what the device holds")
+    // The order of the writes: the reset, ACKNOWLEDGE, DRIVER, the features,
+    // FEATURES_OK, each status including the one before it.
+    let reset = f.find_write(REGISTER_STATUS, 0)!
+    let ack = f.find_write(REGISTER_STATUS, STATUS_ACKNOWLEDGE)!
+    let driver = f.find_write(REGISTER_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER)!
+    let sel0 = f.find_write(REGISTER_DRIVER_FEATURES_SEL, 0)!
+    let ok = f.find_write(REGISTER_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK)!
+    check(reset < ack && ack < driver && driver < sel0 && sel0 < ok,
+          "reset, ACKNOWLEDGE, DRIVER, the features, FEATURES_OK")
+    check(f.writes_to(REGISTER_DRIVER_FEATURES) == 2 && f.writes_to(REGISTER_DRIVER_FEATURES_SEL) == 2,
+          "DriverFeatures is written once for each half")
+    check(f.find_write(REGISTER_DRIVER_FEATURES_SEL, 1)! > sel0, "word 0 then word 1")
+}
+
+func required_features() {
+    var no_version = Fake.qemu()
+    no_version.offered = F_STATUS | F_MAC
+    check(is_refused(begin(&var no_version), SetupError.MissingFeature(F_VERSION_1)),
+          "VERSION_1 not offered is refused")
+    check(no_version.writes_to(REGISTER_DRIVER_FEATURES) == 0, "no feature word is written to it")
+    var no_mac = Fake.qemu()
+    no_mac.offered = F_VERSION_1 | F_STATUS
+    check(is_refused(begin(&var no_mac), SetupError.MissingFeature(F_MAC)),
+          "MAC not offered is refused")
+    check(no_mac.writes_to(REGISTER_DRIVER_FEATURES) == 0, "no feature word is written to it either")
+}
+
+func access_platform() {
+    var f = Fake.qemu()
+    f.offered = F_VERSION_1 | F_MAC | F_STATUS | F_ACCESS_PLATFORM
+    check(is_refused(begin(&var f), SetupError.AccessPlatform),
+          "a device offering ACCESS_PLATFORM is refused")
+    check(f.writes_to(REGISTER_DRIVER_FEATURES) == 0, "and is given no features")
+}
+
+func taken_when_offered() {
+    var f = Fake.qemu()
+    f.offered = F_VERSION_1 | F_MAC | F_STATUS | F_MTU | F_ORDER_PLATFORM
+    check(chose(&var f) == (F_VERSION_1 | F_MAC | F_STATUS | F_MTU | F_ORDER_PLATFORM),
+          "STATUS, MTU and ORDER_PLATFORM are taken when offered")
+    var bare = Fake.qemu()
+    bare.offered = F_VERSION_1 | F_MAC
+    check(chose(&var bare) == (F_VERSION_1 | F_MAC), "and left out when not")
+    var only_mtu = Fake.qemu()
+    only_mtu.offered = F_VERSION_1 | F_MAC | F_MTU
+    check(chose(&var only_mtu) == (F_VERSION_1 | F_MAC | F_MTU), "each one on its own")
+    var only_order = Fake.qemu()
+    only_order.offered = F_VERSION_1 | F_MAC | F_ORDER_PLATFORM
+    check(chose(&var only_order) == (F_VERSION_1 | F_MAC | F_ORDER_PLATFORM), "ORDER_PLATFORM alone")
+}
+
+func declined_features() {
+    // Every bit but the ones above, offered: none is written back.
+    var f = Fake.qemu()
+    let others: UInt64 = ~(F_VERSION_1 | F_MAC | F_STATUS | F_MTU | F_ORDER_PLATFORM |
+                           F_ACCESS_PLATFORM)
+    f.offered = F_VERSION_1 | F_MAC | others
+    check(chose(&var f) == (F_VERSION_1 | F_MAC),
+          "a feature outside the accepted set is never written back")
+    check(f.driver_features == (F_VERSION_1 | F_MAC), "the device holds only what was chosen")
+    // MRG_RXBUF, RING_PACKED and INDIRECT_DESC.
+    var mrg = Fake.qemu()
+    mrg.offered = F_VERSION_1 | F_MAC | (1 << 15) | (1 << 34) | (1 << 28)
+    check(chose(&var mrg) == (F_VERSION_1 | F_MAC), "MRG_RXBUF, RING_PACKED and INDIRECT_DESC are declined")
+}
+
+func features_ok_cleared() {
+    var f = Fake.qemu()
+    f.reject_features_ok = true
+    check(is_refused(begin(&var f), SetupError.FeaturesRejected),
+          "a device that clears FEATURES_OK is refused")
+}
+
+/// The values written to `Status` after log index `from`, in order.
+func status_writes_after(f: &Fake, from: Int) -> [UInt32; 4] {
+    var out: [UInt32; 4] = [0xFFFF; 4]
+    var n = 0
+    var i = from
+    while i < f.log_len {
+        if f.kind_at(i) == EVENT_WRITE32 && f.argument_at(i) == (REGISTER_STATUS as UInt64) && n < 4 {
+            out[n] = f.value_at(i) as UInt32
+            n = n + 1
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// A refusal is followed by `FAILED` added to the status the driver wrote,
+/// then a reset, and the driver exits 1: nothing else is written to `Status`.
+func fails_then_resets(f: &var Fake, why: String) {
+    var lc = Lifecycle()
+    let refusal = lc.begin(&var f)
+    check(not is_ok(refusal), why)
+    let before = f.log_len
+    let code = lc.give_up(&var f, Shutdown.Refused)
+    check(code == 1, "a refusal exits 1")
+    let w = status_writes_after(&f, before)
+    check((w[0] & STATUS_FAILED) != 0, "FAILED is the first thing written")
+    check(w[1] == 0 && w[2] == 0xFFFF, "then the reset, and nothing else")
+}
+
+func refusals_fail_then_reset() {
+    var missing = Fake.qemu()
+    missing.offered = F_VERSION_1 | F_STATUS
+    fails_then_resets(&var missing, "a missing feature")
+    var access = Fake.qemu()
+    access.offered = F_VERSION_1 | F_MAC | F_ACCESS_PLATFORM
+    fails_then_resets(&var access, "ACCESS_PLATFORM")
+    var rejected = Fake.qemu()
+    rejected.reject_features_ok = true
+    fails_then_resets(&var rejected, "FEATURES_OK cleared")
+    // The status FAILED is added to is the one the driver wrote.
+    var f = Fake.qemu()
+    f.offered = F_VERSION_1 | F_STATUS
+    var lc = Lifecycle()
+    let _ = lc.begin(&var f)
+    let before = f.log_len
+    let _ = lc.give_up(&var f, Shutdown.Refused)
+    check(status_writes_after(&f, before)[0] == (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FAILED),
+          "ACKNOWLEDGE and DRIVER stay set beside FAILED")
+}
+
+func reset_that_never_completes() {
+    // begin's own reset times out. Giving the device up is one decision, whose
+    // answer is the lifecycle's: still stuck, 4; settled, 1.
+    var stuck = Fake.qemu()
+    stuck.status = 3
+    stuck.reset_never = true
+    var lc = Lifecycle()
+    check(is_refused(lc.begin(&var stuck), SetupError.ResetTimeout), "a first reset that never completes")
+    check(lc.give_up(&var stuck, Shutdown.Refused) == 4, "giving up a device still stuck is exit 4")
+    var settles = Fake.qemu()
+    settles.status = 3
+    settles.reset_never = true
+    var lc2 = Lifecycle()
+    check(is_refused(lc2.begin(&var settles), SetupError.ResetTimeout), "the same first reset")
+    settles.reset_never = false
+    check(lc2.give_up(&var settles, Shutdown.Refused) == 1, "a device that then settles is exit 1")
+}
+
+func lowest_missing_feature() {
+    // Both required bits are absent: the refusal names the lower one, MAC.
+    var f = Fake.qemu()
+    f.offered = F_STATUS
+    check(is_refused(begin(&var f), SetupError.MissingFeature(F_MAC)), "MAC, the lower bit, is named")
+}
+
+func features_are_read_after_driver() {
+    var f = Fake.qemu()
+    let _ = chose(&var f)
+    check(f.find_any_write(REGISTER_DEVICE_FEATURES_SEL)! >
+          f.find_write(REGISTER_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER)!,
+          "the device's features are read after DRIVER is set (3.1.1 step 4)")
+}
+
+func second_begin_starts_from_zero() {
+    // A begin after a refused one resets and writes ACKNOWLEDGE alone.
+    var f = Fake.qemu()
+    f.offered = F_STATUS
+    var lc = Lifecycle()
+    let _ = lc.begin(&var f)
+    f.offered = Fake.qemu().offered
+    let from = f.log_len
+    let _ = try! lc.begin(&var f)
+    let w = status_writes_after(&f, from)
+    check(w[0] == 0 && w[1] == STATUS_ACKNOWLEDGE, "reset, then ACKNOWLEDGE alone")
+}
+
+func main() {
+    qemu_defaults()
+    required_features()
+    access_platform()
+    taken_when_offered()
+    declined_features()
+    features_ok_cleared()
+    refusals_fail_then_reset()
+    reset_that_never_completes()
+    lowest_missing_feature()
+    features_are_read_after_driver()
+    second_begin_starts_from_zero()
+}

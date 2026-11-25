@@ -1,0 +1,237 @@
+// The device's configuration space and interrupt registers (virtio 1.2
+// sections 2.5.1, 4.2.2.2 and 5.1.4): each field read at its own width, the
+// generation re-read, `mtu` and the link checked, and the interrupt bits
+// acknowledged as the transport says.
+
+import virtio.{DeviceFault, Lifecycle, Negotiated, NetConfig, SetupError, read_config,
+               read_link, take_interrupt}
+import virtio.fake.{EVENT_CONFIG16, EVENT_CONFIG8, EVENT_READ32, EVENT_WRITE32, Fake}
+import virtio.transport.{CONFIG_READS, F_MAC, F_MTU, F_STATUS, F_VERSION_1,
+                         REGISTER_CONFIG_GENERATION, REGISTER_INTERRUPT_ACK, STATUS_DEVICE_NEEDS_RESET}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// The negotiation of a device that offers `offered`.
+func negotiated(offered: UInt64) -> Negotiated {
+    var f = Fake.qemu()
+    f.offered = offered
+    var lc = Lifecycle()
+    try! lc.begin(&var f)
+}
+
+static BASE: UInt64 = F_VERSION_1 | F_MAC
+
+func config_of(f: &var Fake, n: &Negotiated) -> Result<NetConfig, SetupError> {
+    read_config(&var f, &n)
+}
+
+func is_config_error(r: Result<NetConfig, SetupError>, want: SetupError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func fields_at_their_width() {
+    let n = negotiated(BASE | F_STATUS | F_MTU)
+    var f = Fake.qemu()
+    f.config[10] = 0xDC
+    f.config[11] = 0x05
+    let c = try! config_of(&var f, &n)
+    check(c.mac[0] == 0x52 && c.mac[1] == 0x54 && c.mac[2] == 0x00 && c.mac[3] == 0x12 &&
+          c.mac[4] == 0x34 && c.mac[5] == 0x56, "the MAC, a byte at a time")
+    check(c.link_up, "LINK_UP")
+    check(c.mtu == 1500, "mtu is the 16 bit little-endian field")
+    check(f.count(EVENT_CONFIG8) == 6, "six byte reads for the MAC")
+    check(f.count(EVENT_CONFIG16) == 2, "a 16 bit read each for status and mtu")
+    check(f.find(EVENT_CONFIG16, 6) != None && f.find(EVENT_CONFIG16, 10) != None,
+          "at their own offsets")
+}
+
+func link_down() {
+    let n = negotiated(BASE | F_STATUS)
+    var f = Fake.qemu()
+    f.config[6] = 0
+    check(not (try! config_of(&var f, &n)).link_up, "a link that is down")
+    f.config[6] = 0xFE
+    check(not (try! config_of(&var f, &n)).link_up, "only bit 0 is LINK_UP")
+    f.config[6] = 0x03
+    check((try! config_of(&var f, &n)).link_up, "bit 0 set is up whatever else is")
+}
+
+func without_status_or_mtu() {
+    let n = negotiated(BASE)
+    var f = Fake.qemu()
+    f.config[6] = 0
+    let c = try! config_of(&var f, &n)
+    check(c.link_up, "without STATUS the link is assumed up")
+    check(c.mtu == 0 && c.reported_mtu() == 1500, "without MTU the stack's is reported")
+    check(f.count(EVENT_CONFIG16) == 0, "neither field is read")
+}
+
+func mtu_checks() {
+    let n = negotiated(BASE | F_MTU)
+    var f = Fake.qemu()
+    f.config[10] = 67
+    check(is_config_error(config_of(&var f, &n), SetupError.MtuTooSmall(67)), "an mtu of 67")
+    f.config[10] = 68
+    check((try! config_of(&var f, &n)).mtu == 68, "68 is the least")
+    check((try! config_of(&var f, &n)).reported_mtu() == 68, "and is what is reported")
+    f.config[10] = 0x28
+    f.config[11] = 0x23
+    check((try! config_of(&var f, &n)).reported_mtu() == 1500, "no more than the stack's 1500 is reported")
+    f.config[10] = 0xDC
+    f.config[11] = 0x05
+    check((try! config_of(&var f, &n)).reported_mtu() == 1500, "1500 is itself")
+    f.config[10] = 0
+    f.config[11] = 0
+    check(is_config_error(config_of(&var f, &n), SetupError.MtuTooSmall(0)), "an mtu of 0 is below 68")
+    // An mtu the driver did not negotiate is not read, so not checked.
+    let plain = negotiated(BASE)
+    var g = Fake.qemu()
+    g.config[10] = 1
+    check((try! config_of(&var g, &plain)).mtu == 0, "an mtu not negotiated is not read")
+}
+
+func generation() {
+    let n = negotiated(BASE | F_STATUS)
+    var once = Fake.qemu()
+    once.generation_bumps = 1
+    let c = try! config_of(&var once, &n)
+    check(c.mac[5] == 0x56, "a read that changed under it is accepted when repeated")
+    check(once.count(EVENT_CONFIG8) == 12, "the whole read was repeated")
+    var last = Fake.qemu()
+    last.generation_bumps = 2 * CONFIG_READS - 2
+    check(not is_config_error(config_of(&var last, &n), SetupError.ConfigUnstable),
+          "settling on the last read is accepted")
+    var always = Fake.qemu()
+    always.generation_bumps = 2 * CONFIG_READS - 1
+    check(is_config_error(config_of(&var always, &n), SetupError.ConfigUnstable),
+          "a generation that changes across every read is refused")
+    check(always.count(EVENT_CONFIG8) == 6 * CONFIG_READS, "after exactly CONFIG_READS reads")
+    var forever = Fake.qemu()
+    forever.generation_bumps = 1000
+    check(is_config_error(config_of(&var forever, &n), SetupError.ConfigUnstable), "never settling")
+    check(forever.count(EVENT_CONFIG8) == 6 * CONFIG_READS, "is bounded")
+}
+
+func torn_mtu() {
+    // The mtu read before the generation changed is below the floor; after it
+    // the device holds a good one. A read that tore is read again, not refused.
+    let n = negotiated(BASE | F_MTU)
+    var f = Fake.qemu()
+    f.config[10] = 10
+    f.config[11] = 0
+    f.config_after_change[10] = 0xDC
+    f.config_after_change[11] = 0x05
+    f.changes_config = true
+    let c = try! config_of(&var f, &n)
+    check(c.mtu == 1500, "the settled read's mtu is the one used")
+    check(f.count(EVENT_CONFIG16) == 2, "after reading the whole configuration twice")
+}
+
+func link_generation_bound() {
+    let n = negotiated(BASE | F_STATUS)
+    var last = Fake.qemu()
+    last.status = 15
+    last.generation_bumps = 2 * CONFIG_READS - 2
+    check(is_link(read_link(&var last, &n), true), "read_link settling on its last read is accepted")
+    var always = Fake.qemu()
+    always.status = 15
+    always.generation_bumps = 2 * CONFIG_READS - 1
+    check(is_link_fault(read_link(&var always, &n), DeviceFault.ConfigUnstable),
+          "read_link refuses after CONFIG_READS")
+}
+
+func is_link(r: Result<Bool, DeviceFault>, want: Bool) -> Bool {
+    match r {
+        case Ok(up) -> up == want,
+        case Err(_) -> false,
+    }
+}
+
+func is_link_fault(r: Result<Bool, DeviceFault>, want: DeviceFault) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func link_events() {
+    let n = negotiated(BASE | F_STATUS)
+    var f = Fake.qemu()
+    f.status = 15
+    check(is_link(read_link(&var f, &n), true), "the link is up")
+    f.config[6] = 0
+    check(is_link(read_link(&var f, &n), false), "the link went down")
+    f.status = 15 | STATUS_DEVICE_NEEDS_RESET
+    check(is_link_fault(read_link(&var f, &n), DeviceFault.NeedsReset),
+          "DEVICE_NEEDS_RESET is a fault")
+    var g = Fake.qemu()
+    g.status = 15
+    g.generation_bumps = 1000
+    check(is_link_fault(read_link(&var g, &n), DeviceFault.ConfigUnstable), "an unstable generation")
+    // Without STATUS the link is up, no configuration is read, and the
+    // device's own status is still looked at.
+    let bare = negotiated(BASE)
+    var h = Fake.qemu()
+    h.status = 15
+    h.config[6] = 0
+    check(is_link(read_link(&var h, &bare), true), "without STATUS the link is up")
+    check(h.count(EVENT_CONFIG16) == 0, "and no field is read")
+    h.status = 15 | STATUS_DEVICE_NEEDS_RESET
+    check(is_link_fault(read_link(&var h, &bare), DeviceFault.NeedsReset),
+          "DEVICE_NEEDS_RESET is a fault without STATUS too")
+}
+
+func interrupts() {
+    var f = Fake.qemu()
+    f.interrupt_status = 1
+    let used = take_interrupt(&var f)
+    check(used.used_buffer && not used.config_change, "bit 0 is a used buffer")
+    check(f.last_write(REGISTER_INTERRUPT_ACK)! == 1, "and is acknowledged")
+    check(f.interrupt_status == 0, "the device's status cleared by the acknowledgement")
+    f.interrupt_status = 2
+    let config = take_interrupt(&var f)
+    check(not config.used_buffer && config.config_change, "bit 1 is a configuration change")
+    check(f.last_write(REGISTER_INTERRUPT_ACK)! == 2, "and is acknowledged")
+    f.interrupt_status = 3
+    let both = take_interrupt(&var f)
+    check(both.used_buffer && both.config_change, "both bits")
+    check(f.last_write(REGISTER_INTERRUPT_ACK)! == 3, "acknowledged together")
+}
+
+func undefined_bits() {
+    var f = Fake.qemu()
+    f.interrupt_status = 4
+    let events = take_interrupt(&var f)
+    check(not events.used_buffer && not events.config_change, "bit 2 is not acted on")
+    check(f.writes_to(REGISTER_INTERRUPT_ACK) == 0, "and is not acknowledged")
+    check(f.interrupt_status == 4, "so it stays set, and the driver does not wait on it")
+    f.interrupt_status = 0xFFFF_FFFF
+    let all = take_interrupt(&var f)
+    check(all.used_buffer && all.config_change, "the defined bits among undefined ones")
+    check(f.last_write(REGISTER_INTERRUPT_ACK)! == 3, "only the defined bits are written")
+    var quiet = Fake.qemu()
+    let none = take_interrupt(&var quiet)
+    check(not none.used_buffer && not none.config_change, "no bits")
+    check(quiet.writes_to(REGISTER_INTERRUPT_ACK) == 0, "and nothing to acknowledge")
+}
+
+func main() {
+    fields_at_their_width()
+    link_down()
+    without_status_or_mtu()
+    mtu_checks()
+    generation()
+    link_events()
+    torn_mtu()
+    link_generation_bound()
+    interrupts()
+    undefined_bits()
+}

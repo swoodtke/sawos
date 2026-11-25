@@ -1,0 +1,608 @@
+//! A fake virtio-mmio network device and the memory it addresses, for hosted
+//! tests: it behaves as QEMU's does (`Fake.qemu`), and a test then breaks one
+//! thing about it.
+//!
+//! It implements `Registers` and `Dma` over one state, so its log orders
+//! every register access, barrier, queue-memory access and memory operation
+//! the library makes. The log is what ordering tests read: `find` and
+//! `find_after` answer where an event first happened.
+//!
+//! The fake refuses what a driver must never do, by panicking: a control
+//! register access that is not 32 bits wide and aligned, a register the
+//! transport does not have, a configuration access past the fields it holds.
+//! It counts what a test asserts is zero: a device address range that is not
+//! wholly in a pinned object (`stray_addresses`), a pin dropped while the
+//! device may still use the memory (`early_unpins`), and an unmap before the
+//! unpin (`early_unmaps`).
+
+import virtio.queue.{Dma, DmaObject, PinError, Pinned}
+import virtio.transport.{MAGIC_VALUE, REGISTER_CONFIG_GENERATION, REGISTER_DEVICE_FEATURES,
+                         REGISTER_DEVICE_FEATURES_SEL, REGISTER_DEVICE_ID, REGISTER_DRIVER_FEATURES,
+                         REGISTER_DRIVER_FEATURES_SEL, REGISTER_INTERRUPT_ACK, REGISTER_INTERRUPT_STATUS,
+                         REGISTER_MAGIC_VALUE, REGISTER_QUEUE_DESC_HIGH, REGISTER_QUEUE_DESC_LOW,
+                         REGISTER_QUEUE_DEVICE_HIGH, REGISTER_QUEUE_DEVICE_LOW, REGISTER_QUEUE_DRIVER_HIGH,
+                         REGISTER_QUEUE_DRIVER_LOW, REGISTER_QUEUE_NOTIFY, REGISTER_QUEUE_NUM,
+                         REGISTER_QUEUE_NUM_MAX, REGISTER_QUEUE_READY, REGISTER_QUEUE_SEL, REGISTER_STATUS,
+                         REGISTER_VERSION, Registers, STATUS_FEATURES_OK, F_MAC, F_STATUS,
+                         F_VERSION_1}
+
+/// Events of the log.
+public static EVENT_READ32: UInt32 = 1
+public static EVENT_WRITE32: UInt32 = 2
+public static EVENT_CONFIG8: UInt32 = 3
+public static EVENT_CONFIG16: UInt32 = 4
+public static EVENT_BARRIER: UInt32 = 5
+public static EVENT_LOAD16: UInt32 = 6
+public static EVENT_LOAD32: UInt32 = 7
+public static EVENT_STORE16: UInt32 = 8
+public static EVENT_STORE32: UInt32 = 9
+public static EVENT_PIN: UInt32 = 10
+public static EVENT_UNPIN: UInt32 = 11
+public static EVENT_UNMAP: UInt32 = 12
+
+/// The log's capacity: a test that overflows it fails loudly.
+static LOG_MAX: Int = 8192
+
+/// The queue memory the fake holds, bytes.
+static MEMORY_BYTES: Int = 4096
+
+/// The configuration bytes the fake holds: `mac`, `status`,
+/// `max_virtqueue_pairs` and `mtu` (5.1.4).
+static CONFIG_BYTES: UInt32 = 12
+
+public struct Fake {
+    // The transport.
+    public magic: UInt32,
+    public version: UInt32,
+    public device_id: UInt32,
+    public offered: UInt64,
+    public status: UInt32,
+    public interrupt_status: UInt32,
+    // The features the driver wrote, and the select it wrote last.
+    public driver_features: UInt64,
+    features_sel: UInt32,
+    driver_sel: UInt32,
+    // Reset: the reads of `Status` that still answer the old value, and
+    // whether the device never completes it.
+    public reset_reads: UInt32,
+    public reset_never: Bool,
+    resetting: Bool,
+    reset_left: UInt32,
+    // The device clears FEATURES_OK on the write that sets it.
+    public reject_features_ok: Bool,
+    // Queues.
+    queue_sel: UInt32,
+    public max_entries: [UInt32; 2],
+    public ready: [UInt32; 2],
+    // What a completed reset leaves in each queue's `QueueReady`.
+    public ready_after_reset: [UInt32; 2],
+    num: [UInt32; 2],
+    desc_addr: [UInt64; 2],
+    driver_addr: [UInt64; 2],
+    device_addr: [UInt64; 2],
+    used_idx: [UInt16; 2],
+    // The device may use the queue memory, from `QueueReady` until a reset
+    // reads as complete.
+    public touching: Bool,
+    // Configuration space and its generation: each read of the generation
+    // answers the current value and, while `generation_bumps` lasts, changes
+    // it.
+    public config: [UInt8; 12],
+    // What configuration space holds once the generation has changed, when
+    // `changes_config` says it does: the first read of `mtu` is followed by
+    // a change, so that read is torn.
+    public config_after_change: [UInt8; 12],
+    public changes_config: Bool,
+    generation: UInt32,
+    public generation_bumps: UInt32,
+    // The memory the device addresses.
+    public queues_base: UInt64,
+    public queues_len: UInt64,
+    public ring_base: UInt64,
+    public ring_len: UInt64,
+    public pin_refused: Bool,
+    queues_pinned: Bool,
+    ring_pinned: Bool,
+    memory: [UInt8; 4096],
+    // What a test asserts is zero.
+    public stray_addresses: UInt32,
+    public early_unpins: UInt32,
+    public early_unmaps: UInt32,
+    // The log.
+    public log_len: Int,
+    kinds: [UInt32; 8192],
+    args: [UInt64; 8192],
+    vals: [UInt64; 8192],
+}
+
+extension Fake {
+    /// A device that behaves as QEMU's does with its defaults: `VERSION_1`,
+    /// `STATUS` and `MAC` offered, 256-entry queues, MAC `52:54:00:12:34:56`
+    /// and the link up, a reset that completes at the first read. The queue
+    /// memory is 4 KiB at a base that is 4-aligned and not 16-aligned.
+    public static func qemu() -> Fake {
+        var config: [UInt8; 12] = [0; 12]
+        config[0] = 0x52
+        config[1] = 0x54
+        config[2] = 0x00
+        config[3] = 0x12
+        config[4] = 0x34
+        config[5] = 0x56
+        config[6] = 1
+        Fake(magic: MAGIC_VALUE, version: 2, device_id: 1,
+             offered: F_VERSION_1 | F_STATUS | F_MAC, status: 0, interrupt_status: 0,
+             driver_features: 0, features_sel: 0, driver_sel: 0, reset_reads: 0,
+             reset_never: false, resetting: false, reset_left: 0,
+             reject_features_ok: false, queue_sel: 0, max_entries: [256, 256], ready: [0, 0],
+             ready_after_reset: [0, 0], num: [0, 0], desc_addr: [0, 0], driver_addr: [0, 0], device_addr: [0, 0],
+             used_idx: [0, 0], touching: false, config: config, config_after_change: config, changes_config: false,
+             generation: 0,
+             generation_bumps: 0, queues_base: 0x4000_0004, queues_len: 4096,
+             ring_base: 0x4001_0000, ring_len: 0x2000, pin_refused: false,
+             queues_pinned: false, ring_pinned: false, memory: [0; 4096],
+             stray_addresses: 0, early_unpins: 0, early_unmaps: 0, log_len: 0,
+             kinds: [0; 8192], args: [0; 8192], vals: [0; 8192])
+    }
+
+    func log(&var self, kind: UInt32, arg: UInt64, val: UInt64) {
+        if self.log_len >= LOG_MAX { panic("the fake's log is full") }
+        self.kinds[self.log_len] = kind
+        self.args[self.log_len] = arg
+        self.vals[self.log_len] = val
+        self.log_len = self.log_len + 1
+    }
+
+    // =========================================================================
+    // Reading the log
+    // =========================================================================
+
+    /// The first event at or after `from` of `kind` with argument `arg`.
+    public func find_after(&self, from: Int, kind: UInt32, arg: UInt64) -> Int? {
+        var i = from
+        while i < self.log_len {
+            if self.kinds[i] == kind && self.args[i] == arg { return i }
+            i = i + 1
+        }
+        return None
+    }
+
+    /// The first event of `kind` with argument `arg`.
+    public func find(&self, kind: UInt32, arg: UInt64) -> Int? {
+        self.find_after(0, kind, arg)
+    }
+
+    /// The first write of `value` to the control register `offset`.
+    public func find_write(&self, offset: UInt32, value: UInt32) -> Int? {
+        var i = 0
+        while i < self.log_len {
+            if self.kinds[i] == EVENT_WRITE32 && self.args[i] == (offset as UInt64) &&
+               self.vals[i] == (value as UInt64) {
+                return i
+            }
+            i = i + 1
+        }
+        return None
+    }
+
+    /// The first write of any value to the control register `offset`.
+    public func find_any_write(&self, offset: UInt32) -> Int? {
+        self.find(EVENT_WRITE32, offset as UInt64)
+    }
+
+    /// The first write of `value` to the control register `offset` after
+    /// `from`.
+    public func find_write_after(&self, from: Int, offset: UInt32, value: UInt32) -> Int? {
+        var i = from
+        while i < self.log_len {
+            if self.kinds[i] == EVENT_WRITE32 && self.args[i] == (offset as UInt64) &&
+               self.vals[i] == (value as UInt64) {
+                return i
+            }
+            i = i + 1
+        }
+        return None
+    }
+
+    /// How many events at or after `from` are of `kind` with argument `arg`.
+    public func count_after(&self, from: Int, kind: UInt32, arg: UInt64) -> UInt32 {
+        var n: UInt32 = 0
+        var i = from
+        while i < self.log_len {
+            if self.kinds[i] == kind && self.args[i] == arg { n = n + 1 }
+            i = i + 1
+        }
+        n
+    }
+
+    /// The last event of `kind` with argument `arg`.
+    public func find_last(&self, kind: UInt32, arg: UInt64) -> Int? {
+        var i = self.log_len
+        while i > 0 {
+            i = i - 1
+            if self.kinds[i] == kind && self.args[i] == arg { return i }
+        }
+        return None
+    }
+
+    /// How many events there are of `kind`.
+    public func count(&self, kind: UInt32) -> UInt32 {
+        var n: UInt32 = 0
+        var i = 0
+        while i < self.log_len {
+            if self.kinds[i] == kind { n = n + 1 }
+            i = i + 1
+        }
+        n
+    }
+
+    /// How many writes there are to the control register `offset`.
+    public func writes_to(&self, offset: UInt32) -> UInt32 {
+        var n: UInt32 = 0
+        var i = 0
+        while i < self.log_len {
+            if self.kinds[i] == EVENT_WRITE32 && self.args[i] == (offset as UInt64) { n = n + 1 }
+            i = i + 1
+        }
+        n
+    }
+
+    /// The value of the last write to the control register `offset`, if any.
+    public func last_write(&self, offset: UInt32) -> UInt32? {
+        var i = self.log_len
+        while i > 0 {
+            i = i - 1
+            if self.kinds[i] == EVENT_WRITE32 && self.args[i] == (offset as UInt64) {
+                return self.vals[i] as UInt32
+            }
+        }
+        return None
+    }
+
+    /// The value of the event `index`.
+    public func value_at(&self, index: Int) -> UInt64 {
+        self.vals[index]
+    }
+
+    /// The argument of the event `index`.
+    public func argument_at(&self, index: Int) -> UInt64 {
+        self.args[index]
+    }
+
+    /// The kind of event `index`.
+    public func kind_at(&self, index: Int) -> UInt32 {
+        self.kinds[index]
+    }
+
+    /// Forgets the log, so a test reads only what follows.
+    public func clear_log(&var self) {
+        self.log_len = 0
+    }
+
+    // =========================================================================
+    // Queue memory, as the device and the test see it
+    // =========================================================================
+
+    public func peek16(&self, offset: UInt32) -> UInt16 {
+        let at = offset as Int
+        (self.memory[at] as UInt16) | ((self.memory[at + 1] as UInt16) << 8)
+    }
+
+    public func peek32(&self, offset: UInt32) -> UInt32 {
+        (self.peek16(offset) as UInt32) | ((self.peek16(offset + 2) as UInt32) << 16)
+    }
+
+    public func poke16(&var self, offset: UInt32, value: UInt16) {
+        let at = offset as Int
+        self.memory[at] = (value & 0xFF) as UInt8
+        self.memory[at + 1] = (value >> 8) as UInt8
+    }
+
+    public func poke32(&var self, offset: UInt32, value: UInt32) {
+        self.poke16(offset, (value & 0xFFFF) as UInt16)
+        self.poke16(offset + 2, (value >> 16) as UInt16)
+    }
+
+    /// Where the driver put queue `queue`'s descriptor table, from the
+    /// registers it wrote.
+    public func desc_offset(&self, queue: UInt32) -> UInt32 {
+        (self.desc_addr[queue as Int] - self.queues_base) as UInt32
+    }
+
+    public func avail_offset(&self, queue: UInt32) -> UInt32 {
+        (self.driver_addr[queue as Int] - self.queues_base) as UInt32
+    }
+
+    public func used_offset(&self, queue: UInt32) -> UInt32 {
+        (self.device_addr[queue as Int] - self.queues_base) as UInt32
+    }
+
+    /// The size the driver gave queue `queue`.
+    public func queue_num(&self, queue: UInt32) -> UInt32 {
+        self.num[queue as Int]
+    }
+
+    /// The device uses the chain whose head is descriptor `id`, writing
+    /// `len`: an element in the used ring and the ring's `idx` advanced.
+    public func complete(&var self, queue: UInt32, id: UInt32, len: UInt32) {
+        let q = queue as Int
+        let slot = (self.used_idx[q] as UInt32) % self.num[q]
+        let at = self.used_offset(queue) + 4 + 8 * slot
+        self.poke32(at, id)
+        self.poke32(at + 4, len)
+        self.used_idx[q] = self.used_idx[q] &+ 1
+        self.poke16(self.used_offset(queue) + 2, self.used_idx[q])
+    }
+
+    /// Sets the used ring's `idx` to `idx`, as a misbehaving device would.
+    public func set_used_idx(&var self, queue: UInt32, idx: UInt16) {
+        self.used_idx[queue as Int] = idx
+        self.poke16(self.used_offset(queue) + 2, idx)
+    }
+
+    // =========================================================================
+    // Addresses
+    // =========================================================================
+
+    /// The configuration byte at `offset`: the current one, or the changed
+    /// one once the generation has moved.
+    func config_byte(&self, offset: UInt32) -> UInt8 {
+        if self.changes_config && self.generation >= 1 {
+            self.config_after_change[offset as Int]
+        } else {
+            self.config[offset as Int]
+        }
+    }
+
+    /// Whether the `len` bytes from `addr` lie wholly in one object that is
+    /// pinned now.
+    func addressable(&self, addr: UInt64, len: UInt64) -> Bool {
+        (self.queues_pinned && addr >= self.queues_base &&
+         addr + len <= self.queues_base + self.queues_len) ||
+        (self.ring_pinned && addr >= self.ring_base &&
+         addr + len <= self.ring_base + self.ring_len)
+    }
+
+    func check_range(&var self, addr: UInt64, len: UInt64) {
+        if not self.addressable(addr, len) { self.stray_addresses = self.stray_addresses + 1 }
+    }
+
+    /// Whether `offset` is the low word, the high word or the length of a
+    /// descriptor in either queue's table, and which: 0, 4 and 8. Anything
+    /// else is another field.
+    func descriptor_word(&self, offset: UInt32) -> UInt32? {
+        var q: UInt32 = 0
+        while q < 2 {
+            if self.num[q as Int] != 0 {
+                let base = self.desc_offset(q)
+                let end = base + 16 * self.num[q as Int]
+                if offset >= base && offset < end {
+                    let word = (offset - base) % 16
+                    if word == 0 || word == 4 || word == 8 { return word }
+                }
+            }
+            q = q + 1
+        }
+        return None
+    }
+}
+
+extension Fake: Registers {
+    func read32(&var self, offset: UInt32) -> UInt32 {
+        if offset >= 0x100 || (offset % 4) != 0 {
+            panic("read32: not a control register: {}", offset)
+        }
+        self.log(EVENT_READ32, offset as UInt64, 0)
+        if offset == REGISTER_MAGIC_VALUE { return self.magic }
+        if offset == REGISTER_VERSION { return self.version }
+        if offset == REGISTER_DEVICE_ID { return self.device_id }
+        if offset == REGISTER_DEVICE_FEATURES {
+            return if self.features_sel == 0 { (self.offered & 0xFFFF_FFFF) as UInt32 }
+                   else { (self.offered >> 32) as UInt32 }
+        }
+        if offset == REGISTER_QUEUE_NUM_MAX { return self.max_entries[self.queue_sel as Int] }
+        if offset == REGISTER_QUEUE_READY { return self.ready[self.queue_sel as Int] }
+        if offset == REGISTER_INTERRUPT_STATUS { return self.interrupt_status }
+        if offset == REGISTER_CONFIG_GENERATION {
+            let now = self.generation
+            if self.generation_bumps > 0 {
+                self.generation = self.generation + 1
+                self.generation_bumps = self.generation_bumps - 1
+            }
+            return now
+        }
+        if offset == REGISTER_STATUS {
+            if self.resetting && not self.reset_never {
+                if self.reset_left == 0 {
+                    self.status = 0
+                    self.resetting = false
+                    self.touching = false
+                    self.ready = self.ready_after_reset
+                } else {
+                    self.reset_left = self.reset_left - 1
+                }
+            }
+            return self.status
+        }
+        panic("read32: no such register: {}", offset)
+    }
+
+    func write32(&var self, offset: UInt32, value: UInt32) {
+        if offset >= 0x100 || (offset % 4) != 0 {
+            panic("write32: not a control register: {}", offset)
+        }
+        self.log(EVENT_WRITE32, offset as UInt64, value as UInt64)
+        if offset == REGISTER_DEVICE_FEATURES_SEL { self.features_sel = value; return }
+        if offset == REGISTER_DRIVER_FEATURES_SEL { self.driver_sel = value; return }
+        if offset == REGISTER_DRIVER_FEATURES {
+            if self.driver_sel == 0 {
+                self.driver_features = (self.driver_features & 0xFFFF_FFFF_0000_0000) |
+                                       (value as UInt64)
+            } else {
+                self.driver_features = (self.driver_features & 0xFFFF_FFFF) |
+                                       ((value as UInt64) << 32)
+            }
+            return
+        }
+        if offset == REGISTER_QUEUE_SEL {
+            if value >= 2 { panic("write32: queue {}", value) }
+            self.queue_sel = value
+            return
+        }
+        let q = self.queue_sel as Int
+        if offset == REGISTER_QUEUE_NUM { self.num[q] = value; return }
+        if offset == REGISTER_QUEUE_DESC_LOW {
+            self.desc_addr[q] = (self.desc_addr[q] & 0xFFFF_FFFF_0000_0000) | (value as UInt64)
+            return
+        }
+        if offset == REGISTER_QUEUE_DESC_HIGH {
+            self.desc_addr[q] = (self.desc_addr[q] & 0xFFFF_FFFF) | ((value as UInt64) << 32)
+            return
+        }
+        if offset == REGISTER_QUEUE_DRIVER_LOW {
+            self.driver_addr[q] = (self.driver_addr[q] & 0xFFFF_FFFF_0000_0000) | (value as UInt64)
+            return
+        }
+        if offset == REGISTER_QUEUE_DRIVER_HIGH {
+            self.driver_addr[q] = (self.driver_addr[q] & 0xFFFF_FFFF) | ((value as UInt64) << 32)
+            return
+        }
+        if offset == REGISTER_QUEUE_DEVICE_LOW {
+            self.device_addr[q] = (self.device_addr[q] & 0xFFFF_FFFF_0000_0000) | (value as UInt64)
+            return
+        }
+        if offset == REGISTER_QUEUE_DEVICE_HIGH {
+            self.device_addr[q] = (self.device_addr[q] & 0xFFFF_FFFF) | ((value as UInt64) << 32)
+            return
+        }
+        if offset == REGISTER_QUEUE_READY {
+            if value == 1 {
+                // A queue's three areas are device addresses the moment the
+                // queue is ready.
+                let n = self.num[q] as UInt64
+                self.check_range(self.desc_addr[q], 16 * n)
+                self.check_range(self.driver_addr[q], 6 + 2 * n)
+                self.check_range(self.device_addr[q], 6 + 8 * n)
+                self.touching = true
+            }
+            self.ready[q] = value
+            return
+        }
+        if offset == REGISTER_QUEUE_NOTIFY { return }
+        if offset == REGISTER_INTERRUPT_ACK {
+            self.interrupt_status = self.interrupt_status & ~value
+            return
+        }
+        if offset == REGISTER_STATUS {
+            if value == 0 {
+                self.resetting = true
+                self.reset_left = self.reset_reads
+            } else if self.reject_features_ok {
+                self.status = value & ~STATUS_FEATURES_OK
+            } else {
+                self.status = value
+            }
+            return
+        }
+        panic("write32: no such register: {}", offset)
+    }
+
+    func config_read8(&var self, offset: UInt32) -> UInt8 {
+        if offset >= CONFIG_BYTES { panic("config_read8: past the fields: {}", offset) }
+        self.log(EVENT_CONFIG8, offset as UInt64, 0)
+        self.config_byte(offset)
+    }
+
+    func config_read16(&var self, offset: UInt32) -> UInt16 {
+        if offset + 2 > CONFIG_BYTES || (offset % 2) != 0 {
+            panic("config_read16: not a 16 bit field: {}", offset)
+        }
+        self.log(EVENT_CONFIG16, offset as UInt64, 0)
+        let value = (self.config_byte(offset) as UInt16) |
+                    ((self.config_byte(offset + 1) as UInt16) << 8)
+        // The device changes its configuration just after `mtu` is read: the
+        // generation moves under the driver's read.
+        if self.changes_config && self.generation == 0 && offset == 10 { self.generation = 1 }
+        value
+    }
+}
+
+extension Fake: Dma {
+    func pin(&var self, object: DmaObject) -> Result<Pinned, PinError> {
+        let which: UInt64 = match object {
+            case Queues -> 0,
+            case Ring -> 1,
+        }
+        self.log(EVENT_PIN, which, 0)
+        if self.pin_refused { return PinError.NoResource }
+        match object {
+            case Queues -> {
+                self.queues_pinned = true
+                return Pinned(base: self.queues_base, len: self.queues_len)
+            },
+            case Ring -> {
+                self.ring_pinned = true
+                return Pinned(base: self.ring_base, len: self.ring_len)
+            },
+        }
+    }
+
+    func unpin(&var self, object: DmaObject) {
+        let which: UInt64 = match object {
+            case Queues -> 0,
+            case Ring -> 1,
+        }
+        self.log(EVENT_UNPIN, which, 0)
+        if self.touching { self.early_unpins = self.early_unpins + 1 }
+        match object {
+            case Queues -> { self.queues_pinned = false },
+            case Ring -> { self.ring_pinned = false },
+        }
+    }
+
+    func unmap(&var self, object: DmaObject) {
+        let which: UInt64 = match object {
+            case Queues -> 0,
+            case Ring -> 1,
+        }
+        self.log(EVENT_UNMAP, which, 0)
+        let pinned = match object {
+            case Queues -> self.queues_pinned,
+            case Ring -> self.ring_pinned,
+        }
+        if pinned { self.early_unmaps = self.early_unmaps + 1 }
+    }
+
+    func barrier(&var self) {
+        self.log(EVENT_BARRIER, 0, 0)
+    }
+
+    func load16(&var self, offset: UInt32) -> UInt16 {
+        self.log(EVENT_LOAD16, offset as UInt64, 0)
+        self.peek16(offset)
+    }
+
+    func load32(&var self, offset: UInt32) -> UInt32 {
+        self.log(EVENT_LOAD32, offset as UInt64, 0)
+        self.peek32(offset)
+    }
+
+    func store16(&var self, offset: UInt32, value: UInt16) {
+        self.log(EVENT_STORE16, offset as UInt64, value as UInt64)
+        self.poke16(offset, value)
+    }
+
+    func store32(&var self, offset: UInt32, value: UInt32) {
+        self.log(EVENT_STORE32, offset as UInt64, value as UInt64)
+        // A descriptor's address is a device address once both words are
+        // written: the high word completes it.
+        match self.descriptor_word(offset) {
+            case Some(8) -> {
+                let low = self.peek32(offset - 8)
+                let high = self.peek32(offset - 4)
+                self.check_range(((high as UInt64) << 32) | (low as UInt64), value as UInt64)
+            },
+            case _ -> {},
+        }
+        self.poke32(offset, value)
+    }
+}
