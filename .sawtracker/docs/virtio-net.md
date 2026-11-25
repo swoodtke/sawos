@@ -1,67 +1,94 @@
 # SO-103 A3: `svc-virtio-net`, the runner's network peer, and `net_ping`
 
-Revision 2. Design for unit A3 of the networking design
+Revision 3. Design for unit A3 of the networking design
 (`.leadwork/networking.md`, revision 2, §10 l.1385-1390). Design only:
 nothing here changes the tree. The facts it rests on were checked against the
-code, the spec, the virtio 1.2 specification (OASIS cs01, read in full from a
-text conversion of the published HTML, `so103a3/spec/v.txt`), QEMU 11.1.3 as
-installed and QEMU's source (master: `hw/virtio/virtio-mmio.c`,
+code on current main (`850c5849`, fetched over HTTPS from
+`github.com/swoodtke/sawos` into `so103a3/main`; the local checkout is at the
+same commit), the spec, the virtio 1.2 specification (OASIS cs01, read in
+full from a text conversion of the published HTML, `so103a3/spec/v.txt`),
+QEMU 11.1.3 as installed and QEMU's source (master: `hw/virtio/virtio-mmio.c`,
 `hw/net/virtio-net.c`, `hw/intc/sifive_plic.c`, `net/stream.c`,
 `net/stream_data.c`). The experiments are in the scratch directory
-(`so103a3/exp1.sh` to `exp4b.py` ran; `exp5.sh` is written and not yet
-run, §11); §11 lists them. The reviewer's threads are
-answered one by one in `a3-replies.md`.
+(`so103a3/exp1.sh` to `exp4b.py` ran; `exp5.sh` is written and not yet run,
+§11). The owner's rulings of Nov 25 are `rulings-nov25.md`; the reviewer's
+threads on revision 1 are answered in `a3-replies.md`.
 
-## Changes in revision 2
+## Changes in revision 3
 
-- **The driver's death (§4.5, new).** States why the bytes a dead driver's
-  device still addresses cannot be handed out again in a stock image (every
-  pool is bound to one process and given whole, and a boot pool or boot
-  allocation with no holder returns its bytes nowhere), what that rests on,
-  and where it stops holding. Critical processes (spec §2.5) are priced as an
-  optional unit, A3-K3, and the choice is the owner's (Q5). The spec's "no
-  case in the suite is a DMA driver" sentence is in §10.
-- **Reset is confirmed before unmap.** Every teardown path is reset, `Status`
-  read as 0 within a bound, then unmap (§5.4); the hosted test uses a fake
-  that completes the reset late (§7.4). Reset citations are §2.4.1 and
-  §2.4.2.
-- **K1 (§3.4).** In a stock image only a child's own declaration can withhold
-  `Physical`; the alternatives are priced (§3.6), with a declaration opt-in
-  (`dma = true`) recommended and the choice left to the owner (Q1). The stats
-  region's row answers the `BadArg` fault; spec l.1473 and l.1506 are added;
-  `mapping_row_asked` takes the right; the consumer sweep is listed.
-- **Failure paths (§4.3, new table).** An identity failure writes no register;
-  a negotiation failure sets `FAILED`, then resets; a device fault in service
-  sets `FAILED`, then resets. One exit-code table. Reporting an empty
-  transport is named as the deviation from a MUST NOT it is (Q10).
-- **Cache coherence (§4.6, new).**
-- **Smaller:** config-space access widths (§4.3, §7.4); the ISR ack masked
-  to bits 0 and 1 (§4.4); the `pktring` accessors' receivers, names and
-  cursor rules (§4.2); unit order and file overlap (§8); a `log` peer script
-  (§6.4); `net_wait_abandoned` forced by a yield (§7.3); virtio citations;
-  `QueueNumMax` rounding and two bounded loops (§4.1, §4.3); the kernel's
-  exit lines in the transcript (§7.2); the exact handle count, 17 (§2.5); the
-  SHOULD-accept feature policy, with `MTU` and `ORDER_PLATFORM` now accepted
-  and `ACCESS_PLATFORM` refused (§1.2), and a `net_mtu` case; the barrier
-  before the `used.flags` read (§4.3); cross-references; doorbell ranges
-  against the attached ring (§4.2); the PLIC's re-fire behaviour (§2.1).
+The owner ruled on the physical address and on contiguous memory
+(`rulings-nov25.md`). This revision follows the rulings:
+
+- **The physical address comes from the Memory, not the Mapping.** Unit K1 is
+  now `MemoryOp.Physical` (op 2) on `MemoryRight.Physical` (bit 12), which a
+  pool carries at the same bit (`PoolRight.Physical`) for what it allocates.
+  It answers the object's base and length through a two-word record. The
+  numbers were re-checked on main (§3.4).
+- **Contiguous.** `PoolOp.Allocate`'s third word gains a flag,
+  `AllocateFlag.Contiguous` (bit 8), beside `AllocateFrom`; an unknown bit is
+  the `BadArg` fault. `Physical` answers only for an object created with the
+  flag or a boot allocation, and the `NoResource` status for any other
+  (§3.4).
+- **Off unless asked for, at both ends.** A process's declaration asks in its
+  `[ceilings]`; the image grants it in a new per-process `ceilings` table,
+  which is the image's ceiling and is intersected with the declaration's. The
+  defaults change so that a process with no `[ceilings]`, and a record with no
+  `rights`, get every right except `physical`. The builder refuses, by name,
+  an ask without a grant, a grant without an ask, and an image list that
+  strips a right one of the process's own records keeps (§3.5).
+- **The `dma = true` opt-in and `MappingOp.Physical` are gone**, and with
+  them A3-K1b. The image `ceilings` table and the default changes are priced
+  as a general builder unit (B1), filed under the limits issue, which the
+  networking track depends on (§3.6). The minimum that keeps "off by default"
+  true at every merge rides with the kernel unit.
+- **The driver allocates each client's ring.** `netdevproto`'s `Attach` is
+  reversed: the request carries slot counts and no handle; the driver
+  allocates the ring from its own pool, contiguous, lays it out, and answers
+  with a handle the client may map, minted without `Physical`. A new status,
+  `NoMemory`, answers a ring the pool cannot hold. The `pktring` section gains
+  the constructors this needs (§4.2, §5.2).
+- **Q5's argument is simpler (§4.5):** every byte the device can address lies
+  in the driver's one pool, which the image binds to the driver alone and the
+  driver's record keeps without `Transfer` or `Mint`, so it cannot be shared
+  by any process's code; a ring a client still maps cannot return to it.
+- **Cases (§7.3):** a pin for each new check: `Physical` refused on a
+  non-contiguous object, the opt-in refused without the image's grant, a grant
+  without the declaration's ask, an image list stripping a kept right, the
+  client's ring handle without `Physical`, a ring too large for the pool. The
+  two driver-side `Attach` refusal cases are gone, since the client no longer
+  gives the driver memory.
+- **Units and order (§8):** K1 (kernel, with the builder's default), B1 (the
+  general builder unit), K2, A3-1 to A3-5, and the optional A3-K3.
+- **Questions (§9):** Q1 is ruled. Q12 and Q13 are new: `physical` as an
+  opt-in on the `pool` kind as well as `memory`, and `NoResource` as the
+  status for a non-contiguous object.
+
+Revision 2's changes (the reviewer's twenty threads) stand: reset confirmed
+before unmap, the failure-class table, cache coherence, config access widths,
+the ISR mask, the `pktring` cursor rules, the peer's scripts, the forced
+abandonment case, the virtio citations, the bounded loops, the exit lines in
+the transcript, the SHOULD-accept feature policy, the barrier before the
+`used.flags` read, doorbell ranges against the ring, and the PLIC's re-fire
+rule.
 
 The short version:
 
 - Modern virtio-mmio (version 2). `VERSION_1` and `MAC` required; `STATUS`,
   `MTU` and `ORDER_PLATFORM` taken when offered; a device offering
   `ACCESS_PLATFORM` refused; nothing else. A 12-byte header in a descriptor
-  of its own; frames zero-copy in the client's `pktring` slots.
+  of its own; frames zero-copy in the ring's slots.
 - The board lists each virtio-mmio transport as a device of type
   `virtio-mmio`; the image names the one the driver takes; the driver checks
   `DeviceID` and refuses anything but a network device.
-- riscv32 and the flat profile need no kernel change. arm64 needs two: a
-  Mapping op that answers a row's physical address (`MappingOp.Physical`), and
-  a second device window in the arm64 HAL.
+- Every byte the device sees is in the driver's own pool: its queues and
+  each client's ring, all allocated contiguous. The driver learns their bus
+  addresses with `MemoryOp.Physical`, which it holds only because its
+  declaration asks for it and its image grants it.
+- arm64 also needs a second device window in its HAL.
 - The peer is a Saw tool (`tools/netpeer`), one process per case on a
   loopback port of its own; QEMU is started paused and resumed only once QMP
   says the stream is connected.
-- Eight units, one of them optional (§8).
+- Nine units, one of them optional (§8).
 
 ---
 
@@ -308,10 +335,13 @@ is never to hide one. It prints `SOS netdrv: no device at this transport`
 and exits 1. That is a deviation from a MUST NOT, and it is the owner's to
 accept (Q10).
 
-### 2.5 What the declaration asks for
+### 2.5 What the declaration asks for, and what the image grants
 
 `drivers/svc-virtio-net/process.toml`, in the UART drivers' shape
-(`drivers/svc-uart-ns16550/process.toml`):
+(`drivers/svc-uart-ns16550/process.toml`). It has a `[ceilings]` table,
+because that is where a process asks for `physical` (§3.5), and a table is
+complete when present (spec l.5136-5138: "a kind it does not list gets no
+rights"), so it lists every right the driver spends:
 
 ```toml
 format = 1
@@ -342,44 +372,79 @@ kind = "serve"
 protocol = "netdevproto"
 tag = 4
 
+# The pool its queues and every client's ring come from. Kept without
+# `transfer` and `mint`, so no code of this process can share it.
 [[boot]]
 name = "queues"
 kind = "memory"
 tag = 5
+rights = ["allocate", "map", "physical"]
+
+[ceilings]
+process = ["boot-handles", "thread-self", "exit", "waiter-create", "map"]
+thread = ["control"]
+waiter = ["attach", "wait"]
+interrupt = ["wait", "ack"]
+memory = ["transfer", "mint", "map", "physical"]
+iomemory = ["map"]
+mapping = ["unmap", "base"]
+pool = ["allocate", "map", "physical"]
+pipe-outlet = ["transfer", "take", "wait"]
+pipe-request = ["reply", "wait"]
 
 [quota]
 mappings = 3                # the window, the queues, the client's ring
-memories = 1                # the queues' allocation
+memories = 2                # the queues' allocation, the client's ring
 waiters = 1
-handles = 17
+handles = 16
 ```
 
-(With Q1's option (ii), the declaration also says `dma = true`, §3.4.)
+The `process` and `thread` rows hold what a program written with `main`
+spends (spec l.5152-5154: `BootHandles`, `ThreadSelf`, `Exit`, and its main
+thread's `Control`), which the builder already refuses a table for
+withholding (`declaration.saw`, `check_runtime`). The rights each kind's enum
+has are on main in `kernel/abi/src/rights.saw` (`ProcessRight` …
+`PipeRequestRight`); the implementer confirms the `pipe-outlet` row against
+what `Waiter.give(outlet:)` spends.
+
+The image's entry grants the opt-in at its end (§3.5):
+
+```toml
+[[process]]
+name = "net"
+package = "sawos:drivers/svc-virtio-net"
+device = { net = "VIRTIO7" }
+pools = { queues = "netq" }
+ceilings = { memory = ["transfer", "mint", "map", "physical"], pool = ["allocate", "map", "physical"] }
+on-exit = "shutdown"
+```
 
 Every record kind exists today (`tools/sosimage/src/declaration.saw` l.1-45:
 `window`, `line`, `serve`, `memory`; a `memory` record is bound to an image
 pool by `pools`, `imagefile.saw` l.37-41), and the stock root gives each
 (`root/bootplan/src/lib.saw` l.103-127; a `memory` record is given its pool's
-row whole, `tools/sosimage/src/plan.saw` l.496-500, `Source.Row`).
+row whole, `tools/sosimage/src/plan.saw` l.496-500, `Source.Row`). The
+image's `ceilings` key is new (B1, §3.6).
 
 **Handles, exactly, as the GPIO driver's comment counts them**
 (`drivers/svc-gpio-esp32s3/process.toml`, `[quota]`): its records (five, the
 outlet leaving at the attach: four), its Process, its main thread's Thread
-handle, the queue Memory, three Mappings and its Waiter make eleven; a
-delivery needs room for the obligation it mints and for every handle the
-request carries before it mints any, so the most it holds is those eleven,
-the one `WaitEvent` it holds, the request being served, and the
-`PIPE_MSG_HANDLES` (4, `kernel/abi/src/ops.saw` l.1550) that request
-carries: seventeen. The client's ring Memory is one of those four while the
-`Attach` is served; the driver releases it once the map has answered, which
-`pktring` allows (lib.saw l.87-89: "A server that releases its Memory handle
-after the map loses nothing: the row holds the bytes"), so it is never held
-beside them. The comment in `process.toml` says this, as the GPIO
-driver's does. A row short of seventeen lets a client's request end the
-driver.
+handle, three Mappings and its Waiter make ten; a delivery needs room for the
+obligation it mints and for every handle the request carries before it mints
+any, so the most it holds is those ten, the one `WaitEvent` it holds, the
+request being served, and the `PIPE_MSG_HANDLES` (4, `kernel/abi/src/ops.saw`
+l.1550) that request carries: sixteen. A request's carried handles are
+released as its bytes are copied out, before the driver acts on it (the
+UART's pattern, `svc-uart-ns16550/src/main.saw` l.544-547), so while an
+`Attach` is served the ring's `Memory` and the client's sibling of it (two)
+stand where the carried handles stood. The driver releases each `Memory`
+handle of its own once it has mapped the object, read `Physical`, and, for a
+ring, minted and sent the client's handle; the rows keep the allocations. A
+row short of sixteen lets a client's request end the driver.
 
 `mappings = 3` fits riscv32's budget, four rows a child (`hal/riscv32/board.toml`
-`[limits.default]` comment); arm64 gives 12.
+`[limits.default]` comment); arm64 gives 12. `memories = 2` counts the two
+allocations the driver makes; a sibling is a handle, not an allocation.
 
 ### 2.6 The rules
 
@@ -387,14 +452,16 @@ driver.
   to one process; on arm64 the instance is the page, and the board's comment
   says the other seven transports in it stay empty.
 - **Consistent names:** a range is `base` and `len` in the board, the pool's
-  `len` in the image, `Mapping.len()` in the API; a slot's length in the new
-  `pktring` accessors is `len` (§4.2); the case key that selects the peer's
-  behaviour is `script`, as is the peer's flag (§6). The one older name kept
-  is `pktring`'s `Layout.slot_bytes()`, an existing API.
+  `len` in the image, `Mapping.len()` and `Physical`'s record in the API; a
+  slot's length in the new `pktring` accessors is `len` (§4.2); the image's
+  `ceilings` table uses the declaration's kind and right names; the case key
+  that selects the peer's behaviour is `script`, as is the peer's flag (§6).
+  The one older name kept is `pktring`'s `Layout.slot_bytes()`, an existing
+  API.
 
 ---
 
-## 3. DMA addressing on each profile
+## 3. DMA addressing, `Physical` and contiguous memory
 
 ### 3.1 What the device needs
 
@@ -404,31 +471,34 @@ clear "the device will always use physical addresses matching addresses used
 by the driver (typically meaning physical addresses used by the CPU)", and
 §6.1: "If VIRTIO_F_ACCESS_PLATFORM is not offered, then a driver MUST pass
 only physical addresses to the device". QEMU's `virt` machines have no IOMMU
-in front of virtio-mmio, so the address is the guest physical address. The
-driver needs two:
+in front of virtio-mmio, so the address is the guest physical address.
 
-1. its own queue memory (a `Memory` from its pool);
-2. the client's ring (the `Memory` the client gives at `Attach`).
+With the ring allocated by the driver (§5.2, the owner's ruling), the device
+sees exactly two kinds of object, both allocations from the driver's own pool
+`netq`:
 
-Both are one allocation each, and an allocation is one physically contiguous
-run of its pool (spec §2.5 l.1163-1171, "the front of the aligned run"), so a
-base address and an offset are enough.
+1. the queue memory (one allocation);
+2. each attached client's ring (one allocation per `Attach`).
 
-### 3.2 Per profile
+The driver allocates each with the `contiguous` flag (§3.4), so each is one
+physical range by promise, and a base address and an offset are enough.
+
+### 3.2 Per profile, before this unit
 
 | Profile | Where a RAM row lands | What `Mapping.base()` answers | Physical address known today? |
 |---|---|---|---|
-| riscv32 (PMP, tier 2) | at its own address (spec l.3259-3266) | the user address, which "on a tier that does not translate ... is also the physical one" (spec l.1430-1440; `kernel/abi/src/ops.saw` l.824-827) | yes: `base()` |
+| riscv32 (PMP, tier 2) | at its own address (spec l.3259-3266) | the user address, which "on a tier that does not translate ... is also the physical one" (spec l.1430-1440; `kernel/abi/src/ops.saw` l.868-871 on main) | yes: `base()` |
 | riscv32-flat (tier 3) | the same | the same | yes: `base()` |
 | arm64 (MMU, tier 1) | at the map cursor, inside the 4 MiB grant window from `RAM_BASE` (`hal/arm64/kernel/lib.saw` l.494-499 `map_place`, l.588 `map_target_ok`, l.2326 `USER_RAM_TOP`), backed by frames anywhere in RAM (l.527-529 `map_source_ok`) | a user address that is not the frame's | **no** |
 
-On arm64 no op answers it. The spec says so on purpose: "There is no op on a
-pool or an allocation that reads its bounds ... a `Mapping` answers where its
-row is and how long it is (`Base`, `Len`) ... Where a row's address is its
-memory's own, those two are the allocation's physical range" (spec
-l.1020-1031). The kernel has the number: every grant row records its
-physical base beside its user range (`kernel/core/pslot.saw` l.116-119,
-`GrantRow.pa`; spec l.3279-3284).
+On arm64 no op answers it, on purpose: "There is no op on a pool or an
+allocation that reads its bounds" (spec l.1020-1031). The kernel has the
+number: an allocation's slot records its physical base and length
+(`kernel/core/objects.saw` l.1116-1122 on main, `MemorySlot.base`, `.len`;
+"Addresses-as-data stay physical everywhere they are stored — Pool and Memory
+capabilities", spec l.3285-3289). The driver uses `Physical` on every
+profile, so it has one spelling; on riscv32 and the flat profile it answers
+what `base()` would.
 
 Device windows are not a problem: "A device window is mapped at its own
 address on every profile" (spec l.1334; `map_place` answers `pa` for a
@@ -444,105 +514,197 @@ and `device_window_ok` refuses anything outside it (l.600-608), which
 `IoMemoryOp.Map` answers as a `BadArg` fault (`kernel/core/dispatch.saw`
 l.3598-3610). The console is at 0x0900_0000; the transports are at
 0x0A00_0000, another block. So on arm64 the driver's `map(iomemory:)` faults
-today, whatever is decided about addresses.
+today. Unit K2 (§3.7) fixes it.
 
-### 3.4 Proposal K1: `MappingOp.Physical`
+### 3.4 Unit K1: `MemoryOp.Physical` and `contiguous` (kernel)
 
-The smallest kernel change that answers the question everywhere with one
-spelling.
+As ruled. The numbers are re-checked on main (`so103a3/main`, `850c5849`):
+`MemoryOp` has `Map = 0`, `Extend = 1` (`kernel/abi/src/ops.saw` l.741-744);
+`MemoryRight` has bits 0, 1, 9, 10, 11 (`rights.saw` l.630-636); `PoolRight`
+carries `Map`, `MapExecute` and `Extend` at `MemoryRight`'s numbers and starts
+its own at bit 16 (l.668-675, l.681-689); `AllocateFrom` is `Any = 0`,
+`Front = 1`, `Back = 2` in `Allocate`'s third word (`ops.saw` l.772-792,
+`dispatch.saw` l.3529-3531).
 
-- **Op:** `MappingOp.Physical = 4`: the physical address of the row's first
-  byte, read from the grant record (`GrantRow.pa`), in the value register.
-- **Right:** `MappingRight.Physical = 1 << 11`, the next free kind bit after
-  `Grow` (`kernel/abi/src/rights.saw` l.750-768). `mapping_rights()`
-  (l.1264-1267) mints it.
-- **Which rows answer.** A row over an allocation answers its frame; a device
-  window's row answers the window's own address. The stats region's row
-  (spec §2.7, l.2154-2165: a row over "the kernel's own counter page", for
-  which "no `Memory` handle is minted") answers the `BadArg` fault, as `Grow`
-  answers it for the same row (spec l.1461): it is kernel storage no device
-  is ever given, and its holder knows which Mapping it is, since
-  `SystemOp.StatsRegionMap` answered it.
-- **Refusals,** in `Base`'s order (`mapping_row_asked`, dispatch.saw
-  l.3637-3650): no `Physical` right is the `AccessDenied` fault, a freed slot
-  or an unmapped husk the `BadState` fault, a husk whose target died
-  `Revoked`, then the stats row's `BadArg`. `mapping_row_asked` checks
-  `MappingRight.Base` itself today; it takes the right to check as a
-  parameter, and `Base` and `Len` pass `Base`.
-- **API:** `sos.Mapping.physical() -> Result<UInt, SosStatus>` beside
-  `base()` and `len()` (`kernel/sysapi/src/mapping.saw` l.104-130).
-- **Names:** `tools/sosimage/src/rights.saw` learns `physical` among the
-  mapping rights, so a declaration's `[ceilings] mapping` can name it.
+**The op.** `MemoryOp.Physical = 2`. It takes the address and capacity of a
+record in the caller's memory and writes two words there, the object's
+physical `base` and its `len` (`MemorySlot.base` and `.len`, which `Extend`
+raises), as `PoolOp.Available` answers its three words through a record
+(spec l.1142-1144: "Three words do not fit the one value register, so the op
+answers through a record as `PipeCreate` does"); `sosabi` publishes
+`MEMORY_PHYSICAL_RECORD_WORDS = 2`. Its answers, in order:
 
-**Who can withhold it, as things are.** A hand-written launcher narrows a
-child's `Mapping` ceiling (spec §2.7). In a stock image it cannot be
-withheld by the image's author: `[ceilings]` is a table in the child's own
-`process.toml` (`declaration.saw` l.20, l.48-58), an image's `[[process]]`
-has no ceilings key (`imagefile.saw` l.29-40), and a child without the table
-"keeps the launcher's ceilings", which for the stock root are all ones. So
-with K1 alone, every process of a stock image can learn where its own rows
-lie. §3.6 prices the ways to make that conditional; Q1 is the choice.
+1. a handle without `MemoryRight.Physical` is the `AccessDenied` fault;
+2. a capacity below the record is the `BadArg` fault, and a destination the
+   copy-out door refuses is its fault (`BadAlign`, `BadBuffer`);
+3. an object that was not created contiguous answers the **`NoResource`**
+   status, with nothing written: a holder that was given the object cannot
+   know how it was made, so this is a status and not a fault (§5.7's rule),
+   and `NoResource` is what `map` already answers for memory the kernel
+   cannot serve as asked (Q13);
+4. otherwise it writes the record and answers `Ok`.
 
-**The recommended condition: a declaration opt-in, `dma = true`** (option
-(ii) in §3.6). A package that hands memory to a bus master says so in its
-`process.toml`; the builder gives every other stock-image child a `Mapping`
-ceiling without `physical` (through the plan's existing per-kind ceilings,
-which the stock root applies with `restrict_rights` before it gives
-anything, `root/src/main.saw` l.18-20), and refuses a `[ceilings] mapping`
-list that names `physical` in a declaration without `dma = true`. The image
-author sees which packages say it, and `sosimage` prints a note per such
-process, as it prints a part window's. The kernel stays as above.
+**The right.** `MemoryRight.Physical = 1 << 12`, the next bit after `Extend`
+(bit 11) and below a pool's own (bit 16). `PoolRight.Physical = 1 << 12`: a
+pool carries it on behalf of what it allocates, as it carries `Map`,
+`MapExecute` and `Extend`, with the static asserts `rights.saw` keeps for
+each (l.681-700: "a case added to `MemoryRight` owes one here"). The kernel's
+default sets:
 
-**Spec text**, to add to §2.5's `Mapping` list after `Len` (l.1441-1452),
-with "Four ops" (l.1430) becoming "Five ops":
+| Set | Today (main) | With K1 |
+|---|---|---|
+| `memory_rights()` (boot allocations; the mask `Any`/`Back` allocations are cut with) | `Transfer \| Mint \| Map \| MapExecute` (l.1218-1222) | adds `Physical` |
+| `pool_rights()` (boot pools) | `memory_rights() \| Extend \| Allocate` (l.1235-1238) | adds `Physical`, through `memory_rights()` |
+| `front_allocation_rights()` (a `Front` cut, the heap's) | `Map \| MapExecute \| Extend` (l.1247-1250) | unchanged: a heap's memory is never given to a device |
 
-> `Physical` (on `MappingRight.Physical`, bit 11) answers the physical
-> address of the row's first byte: where the bus finds the bytes the row
-> grants, which is what a device that masters the bus is given. On a tier
-> that does not translate it is the number `Base` answers; on tier 1 it is
-> the frame the row's first page translates to. A row covers one
-> allocation, which is one physically contiguous run, so the row's bytes are
-> the run from this address for `Len` bytes. A device window's row answers
-> the window's own address; the stats region's row is the `BadArg` fault,
-> as for `Grow`. Its other refusals are `Base`'s, in `Base`'s order, with
-> `Physical`'s right in place of `Base`'s. `mapping_rights()` mints it; a
-> launcher that does not want a child to learn where its memory lies narrows
-> the child's `Mapping` ceiling.
+The kernel must mint the bit at boot or nothing could ever hold it
+(attenuation is monotonic, spec l.1216-1219); "off by default" is the
+launcher's and the builder's job (§3.5), and root's own ceilings stay
+unrestricted (spec l.1939). An allocation gets `Physical` only if the pool
+handle carries it and the caller's `Memory` ceiling allows it: `Allocate`
+mints `obj.rights & memory_rights()` through `mint_capped`
+(`dispatch.saw` l.3545-3551), which caps by the ceiling.
 
-and:
+**The flag.** `Allocate`'s third word becomes `from | flags`: bits 0-7 are
+`AllocateFrom`, and `AllocateFlag.Contiguous = 1 << 8`. A word whose low
+byte names no `AllocateFrom`, or with any other bit set, is the `BadArg`
+fault, as an unknown `from` is today (`dispatch.saw` l.3529-3531). An object
+made with the flag records it (`MemorySlot.contiguous`, a new field;
+`objects.saw` l.1116 on), and so does every boot allocation, which is one
+range by construction. The promise, in the spec: such an object is one
+physical range now and in any future kernel; its `Extend` grows it in place
+or answers `NoMemory`, which is all `Extend` does today (spec l.1387-1398).
+Every allocation is contiguous today, so the flag changes no placement; it
+changes what `Physical` answers, which is why it is not a no-op. The typed
+`Pool.allocate(len:granularity:from:contiguous:)` takes it as a defaulted
+`false`, as it takes `from` (`kernel/sysapi/src/pool.saw` l.114 on).
 
-- l.1020-1031, after "(`Base`, `Len`, below)": "and, for a driver that hands
-  the bytes to a device, where they are on the bus (`Physical`)";
-- l.1473: "`mapping_rights()` mints `Unmap`, `Mint`, `Base`, `Grow` and
-  `Physical`";
-- l.1506: "`Unmap`, `Base`, `Len`, `Grow` and `Physical` answer `Revoked`";
-- the DMA paragraph (l.1558-1574): §10.
+**The API.** `sos.Memory.physical() -> Result<PhysicalRange, SosStatus>`,
+which reads the record into `PhysicalRange { base: UInt, len: UInt }`.
 
-With option (ii), §12's launch convention (spec l.4790 on) gains a sentence:
-the stock root narrows `Physical` out of every child's `Mapping` ceiling but
-those whose declaration says `dma = true`.
+**The builder's minimum, in the same unit.** So that "off by default" holds
+at every merge, K1 also: names `physical` in `tools/sosimage/src/rights.saw`
+for `memory` and `pool` (the builder's tests hold that table to the kernel's
+enums, l.1-10, so the name cannot land before the bit); gives every
+stock-image child without `[ceilings]` a `memory` and a `pool` ceiling of
+every right but `physical` (today such a child gets no ceiling rows at all,
+`plan.saw` l.556-570), and every record with no `rights` a keep word without
+it (`declaration.saw` l.510-525, `keep_word`, today `KEEP_ALL`); and refuses a
+declaration that names `physical` ("the image grants it with `ceilings`,
+which this builder does not read yet"). B1 lifts that refusal.
 
-**What it exposes.** It tells the holder of a row which physical frames back
-memory it can already read and write. On riscv32 and the flat profile `Base`
-tells it that already. On arm64 it reveals the physical layout of the
-holder's own rows and nothing about anyone else's. The number grants
-nothing: using it takes a bus master, and the spec already puts any driver
-of a DMA-capable device inside the TCB (l.1558-1566: "the window it was
-granted is a fence around the driver, never around the device"). The
-authority is the device window; the number is a fact that driver needs to
-use it.
+**The consumer sweep** (brief obligation 2: two default sets widen). The
+runner's expectations print the old words, and each changes by 4096:
+`SOS handleinfo: memory rights=1539` (`tools/sos_runner.py` l.5230),
+`SOS ceilderived: pool rights=69123` (l.5323),
+`SOS poolops: rights pool=69123 allocation=1539` (l.5468), the `poolleg` and
+`cutrights` lines (l.5626, l.5910-5911) and their comments (l.5213, l.5310,
+l.5448, l.5574, l.5902). Tests that name the default sets in comments:
+`tests/map-exec-gated`, `tests/pool-ops`. The implementer greps for 1539 and
+69123 in the runner and every expected line that prints a Memory or Pool
+rights word. The builder's default adds a `memory` and a `pool` ceiling row to
+every stock child's plan, so a stock case that prints a child's `Memory` or
+`Pool` ceiling (`ProcessOp.Ceiling`) changes too, and root's arena, which the
+builder sizes from the plan (`sosimage.plan.root_arena`), grows by those rows.
 
-**Consumer sweep** (brief obligation 2: `map` now answers a wider rights
-word). Each names `MappingRight` cases or reads a Mapping's rights, and the
-implementer checks what each prints or compares: `tests/ceiling-derived`
-(`NO_BASE`), `tests/mint-mapping` (`KEEP`), `tests/child-grow-leg`
-(`NO_GROW`, `NO_BASE`), `tests/heapkit` (`Narrow.MappingCeiling`),
-`tests/stock-ceilings-heap/process.toml` (`mapping = ["grow", "base"]`), and,
-because they call `rights()` near a Mapping, `tests/stock-ceilings`,
-`tests/map-needs-map`, `tests/child-ring-server`, `tests/stockkit` and
-`tests/map-placed`.
+**Cases** (riscv32, riscv32-flat, arm64; each fails when its check is removed
+or inverted):
 
-### 3.5 Proposal K2: a second device window on arm64
+| Case | What it pins |
+|---|---|
+| `memory_physical` | a contiguous allocation answers its base and length; on riscv32 and flat the base equals its Mapping's `base()`; on arm64 two rows of it at two addresses answer one base; a boot allocation answers |
+| `memory_physical_not_contiguous` | an allocation made without the flag answers `NoResource`, and the record is untouched |
+| `memory_physical_denied` | a sibling minted without `Physical` faults `AccessDenied` |
+| `memory_physical_record` | a capacity of one word faults `BadArg` |
+| `pool_allocate_flags` | a third word with bit 9 set, and one whose low byte is 3, fault `BadArg`; `Front \| Contiguous` and `Back \| Contiguous` are accepted |
+| `pool_physical_capped` | a pool sibling minted without `Physical` allocates objects without it; a `Memory` ceiling without it does the same through a pool that carries it |
+| `memory_contiguous_extend` | a contiguous `Front` allocation extends in place, then answers `NoMemory` past the frontier, and still answers `Physical` with the grown length |
+| `stock_physical_default` | a stock-image child with no `[ceilings]` reads its `Memory` ceiling (`ProcessOp.Ceiling`) and its pool record's rights, and neither holds `physical` |
+
+### 3.5 Off unless asked for: the declaration asks, the image grants (B1)
+
+As ruled. The ruling's terms, then what the builder does with them.
+
+- **The declaration asks** in its `[ceilings]`: `memory = [..., "physical"]`.
+- **The image grants** on the process's entry, in a per-kind table
+  `ceilings` with the same kind and right names:
+  `ceilings = { memory = [..., "physical"] }`.
+- **The image's table is the image's ceiling** for each kind it lists. The
+  process's effective ceiling for a kind is the declaration's (or, with no
+  `[ceilings]`, every right but `physical`) intersected with the image's; a
+  kind the image does not list is left as the declaration says.
+- **An opt-in right** (only `physical` today) must appear in both, or the
+  build fails, naming the process, the kind and the right.
+- **Refusals** (each names the process, the kind and the right):
+  - an opt-in the declaration asks for and the image does not grant;
+  - an opt-in the image grants and the declaration does not ask for;
+  - an image list that removes a right one of the process's own records
+    keeps (a `memory` record's keep word against the image's `pool` list, a
+    `window`'s against `iomemory`, a `line`'s against `interrupt`, a
+    `serve`'s against `pipe-outlet`, a `client`'s against `pipe-inlet`), so
+    `map` cannot be stripped by accident;
+  - an image list that removes a right the process's runtime spends (the
+    rule `check_runtime` applies to a declaration today, spec l.5150-5159),
+    applied to the effective ceiling;
+  - an unknown kind or right, a right named twice, and a `system` key, as
+    for a declaration.
+- **The defaults change:** with no `[ceilings]`, a process gets every right
+  except `physical`; a record with no `rights` keeps "every right except
+  `physical`" (`keep_word`'s `KEEP_ALL` case); root's ceilings stay
+  unrestricted.
+
+**Which kinds carry the opt-in.** `physical` is a right of two kinds,
+`memory` and `pool` (§3.4), and the ruling's "naming the process, the kind and
+the right" is per kind, so the rules above apply to each kind separately. A
+driver that allocates its DMA memory itself needs both: its `pool` record
+must keep `physical` for its allocations to carry it, and its `memory`
+ceiling must allow it for `Allocate`'s mint. Q12 asks the owner to confirm
+reading the ruling this way.
+
+**The plan.** The stock root already narrows a child's ceilings kind by kind
+to the plan's words (`root/src/main.saw` l.18-20, l.380-400, `restrict`) and gives each record with its keep word, so B1 changes
+what the builder writes and nothing in root: each child's plan gets a ceiling
+row for every kind whose effective word is not all ones (at least `memory`
+and `pool`, since every child now lacks `physical` unless granted), and each
+record its keep word within the effective ceiling. A child that is granted
+`physical` gets it through its pool record's keep word and its `memory`
+ceiling; the heap pools root gives keep `HEAP_POOL_KEEP`, which has no
+`physical` (`root/src/main.saw` l.84-85), so a heap is never DMA memory.
+
+**The client's ring is not covered by any of this.** A ceiling caps what a
+process obtains from the kernel and not what it is sent (spec l.1893-1902; l.1901: "A ceiling therefore bounds what a process can obtain from the kernel, not what it can be given").
+The ring reaches the client in a reply, so the driver mints the client's
+handle without `Physical` itself (§5.2), and a case pins it (§7.3).
+
+### 3.6 Where the image `ceilings` table and the default changes belong
+
+| | Inside the networking track | **A general builder unit (B1), filed under the limits issue** |
+|---|---|---|
+| What changes | every stock image's children's ceilings and record keep words, the image format, spec §12 | the same |
+| Who it serves | one driver today | every future opt-in right and any image that wants to narrow a package's ceilings, which the image format cannot say today (spec l.5159-5160: "An image cannot widen or narrow a declaration's ceilings") |
+| Review | a format change hidden in a driver unit, reviewed by readers looking at virtio | reviewed as a packaging change, with SO-95's format rules and the per-image limits work it sits beside |
+| Tests | its refusals would be tested through a network image | builder tests in `tools/sosimage/tests`, plus one stock-image case that asks, is granted and calls `Physical`, with no network involved |
+| Dependency | networking waits on itself | networking (A3-4) depends on B1; B1 depends on K1 |
+
+**I'd do the general unit, as you lean.** The image `ceilings` table is a
+packaging feature in the family of per-image limits (an image adjusting what a
+package declares, within what the board allows), it changes the defaults of
+every stock image, and its refusals are about formats, not devices. What stays
+in the networking track is the driver's declaration and image entry (§2.5).
+The one piece that cannot wait for B1 is the default "every right but
+`physical`", because K1 makes the kernel mint the bit at boot, and between a
+K1 merge and a B1 merge every stock child would otherwise get it; so that
+piece rides with K1 (§3.4), and B1 brings the image table, the
+intersection, the opt-in and the refusals.
+
+B1's spec text is §10's §12 rows. Its files: `tools/sosimage/src/imagefile.saw`
+(the `ceilings` key in `[[process]]`, l.604 `known` list, and its reading),
+`declaration.saw` (effective ceilings, the opt-in set, `keep_word`),
+`plan.saw` (`ceiling_rows` and keep words from the effective ceiling,
+l.556-580), `rights.saw` (the opt-in set), the builder's tests, `spec.md`
+§12, and runner cases.
+
+### 3.7 Unit K2: a second device window on arm64
 
 `hal/arm64/kernel/lib.saw` keeps one device level-3 table per 2 MiB block it
 offers, and offers two: the console's block (0x0900_0000) and the
@@ -561,43 +723,18 @@ transports' (0x0A00_0000).
 
 Nothing in spec.md names the one block; spec §5b's arm64 row does not change.
 
-### 3.6 Alternatives, priced
+### 3.8 What the driver does with it
 
-**Addresses:**
-
-| Alternative | Kernel change | Cost | Verdict |
-|---|---|---|---|
-| **K1** `MappingOp.Physical` | one op, one right bit, the shared row check taking a right, a sysapi method, a ceiling name, spec text | none at run time | **recommended** |
-| Identity-mapped RAM rows on arm64 (a `map` flag that places a row at its frame's own address, so `Base` is physical everywhere) | a new `MapAccess` bit and a second placement rule | a RAM row's user address must lie in the 4 MiB grant window at `RAM_BASE` (l.588), and frames come from all 126 MiB, so most allocations could not be placed; the grant window would have to become all of RAM's addresses, a redesign of the arm64 tables | rejected |
-| The launcher tells the driver its pool's physical base (a builder-written build input) and the driver copies frames between the client's ring and its own buffers | none (K2 still needed) | the builder learns to write an input whose value it computes; the driver relies on its first allocation sitting at its pool's front (spec l.1163, which then becomes a contract an address depends on); every frame copied once more in each direction; the arm64 driver differs from the riscv32 one; nothing for a client's memory, ever | rejected |
-
-**Who may learn it** (thread t3; Q1):
-
-| Option | Where the condition lives | Cost | Verdict |
-|---|---|---|---|
-| (i) default on, the disclosure accepted | nowhere: every Mapping carries `Physical`; a hand-written launcher may narrow it, a stock image cannot | none | acceptable; the disclosure is a process's own rows' frames |
-| **(ii) default off in stock images, opt-in by `dma = true` in the declaration** | the builder and the plan: every child without `dma = true` gets a `Mapping` ceiling without `physical`, applied by the stock root's existing `restrict_rights` | builder: a declaration key, a plan ceiling for those children, a refusal (`physical` in a `[ceilings]` list without `dma = true`), builder tests; root: nothing new; one `restrict_rights` op per child at boot | **recommended**: least authority in the images the tree builds, and the package that is a TCB member says so where a reader looks |
-| (iii) a right on the Memory (`MemoryRight.Physical`) that `map` copies into the Mapping | the allocation's handle, so the memory's owner decides | a pool, allocation and give path that must carry the bit; and the client's ring would carry it only if the client chose to give it, so the authority sits with the memory's owner, not with the image that made the driver a DMA driver | rejected |
-| (iv) a right on the target Process handle (`ProcessRight.Physical`) that `map` requires to mint `Physical` | the caller's Process handle, capped by its `Process` ceiling | a kernel condition in `map`, and the stock image would still need the builder to narrow every other child's `Process` ceiling, which is (ii)'s work plus a kernel change | rejected: (ii) without the kernel change does the same |
-
-(ii) needs no kernel change beyond K1 and is a separate small builder unit,
-A3-K1b (§8).
-
-### 3.7 What the driver does with it
-
-At start: map the queue allocation, read `physical()` and `base()`; every
-queue address the driver writes to the device is `physical + offset`, every
-CPU access `base + offset`. At `Attach`: map the client's Memory, read
-`len()` (the ring check, `pktring` doc l.69-94) and `physical()`; a slot's bus
-address is `physical + Layout.slot_offset(ring, slot)` (`pktring` l.257-266).
-The offsets come from the driver's private layout and checked indexes (§4.2),
-never from shared memory. The driver gives the device no address outside
-those two allocations: no header, buffer or ring lives in its image, stack
-or arena. §4.5 depends on that rule.
-
-If the owner declines K1, riscv32 and the flat profile still work with
-`base()`, which the spec defines to be physical there, and arm64's A3 rows
-wait.
+At start: allocate the queue memory from `netq` with `contiguous`, map it,
+read `Physical`; every queue address the driver writes to the device is
+`base + offset` from `Physical`'s record, every CPU access the Mapping's
+`base() + offset`. At `Attach`: allocate the ring from `netq` with
+`contiguous`, map it, read `Physical`; a slot's bus address is
+`base + Layout.slot_offset(ring, slot)` (`pktring` l.257-266). The offsets
+come from the driver's private layout and checked indexes (§4.2), never from
+shared memory. The driver gives the device no address outside its pool's
+allocations: no header, buffer or ring lives in its image, stack or arena.
+§4.5 depends on that rule.
 
 ---
 
@@ -605,8 +742,9 @@ wait.
 
 ### 4.1 The queue memory
 
-One allocation from the driver's pool (`memory` record `queues`, image pool
-`netq`, `len = 0x1000`), mapped read-write into the driver and zeroed by it
+One page-sized allocation (0x1000) from the driver's pool (`memory` record
+`queues`, image pool `netq`, which also holds the client's ring, §7.1), made
+with `contiguous`, mapped read-write into the driver and zeroed by it
 (§4.2.3.2 step 4: "Allocate and zero the queue memory"; spec §2.5 promises no
 zeroing).
 
@@ -645,12 +783,14 @@ Queue setup is §4.2.3.2: select, check `QueueReady` reads 0, read
 `QueueNumMax`, write `QueueNum`, the three address pairs, `QueueReady` 1. RX
 is queue 0, TX queue 1 (§5.1.2).
 
-### 4.2 Zero copy, and rule 5.2
+### 4.2 Zero copy, the ring the driver owns, and rule 5.2
 
 §5.3 of the networking design says "the driver points descriptors at the
 shared slots". That holds with rule 5.2 (networking.md l.912-929), because
 the driver never acts on a slot's bytes: it acts on index words and length
-words only, and the device, not the driver, reads or writes the bytes.
+words only, and the device, not the driver, reads or writes the bytes. With
+the reversed `Attach` (§5.2) the ring is the driver's allocation, but the
+client still writes half its words, so the ring is still input to the driver.
 
 **What the driver reads from the ring, once each, and checks:**
 
@@ -662,30 +802,67 @@ words only, and the device, not the driver, reads or writes the bytes.
 | ToClient tail | at an `RxReturn` doorbell and when the driver looks for free RX slots | below `2n`, and in order (`read_out_tail`, l.652-665) | ring fault |
 | a doorbell's range | on the wire, then against the attached ring | `netdevproto`'s decoder refuses a range no ring can hold (`range()` l.486-491, `SlotRange.fits(MAX_SLOTS)`); the driver then checks it against the attached ring's own count (`SlotRange.fits(n)`, `pktring` l.333-336), which netdevproto's status list promises ("a range that does not fit the ring", l.61-67) | `BadArg` either way; the range is never acted on, since the index words say the same or more |
 
-The descriptor's address is computed from the driver's private layout and
-the checked slot number; its length is the checked private copy. Nothing the
-client writes can move a descriptor outside its own ring, and a client that
-rewrites a slot's bytes while the device reads them changes only its own
-frame, which it could have sent anyway.
+The descriptor's address is computed from `Physical`'s base, the driver's
+private layout and the checked slot number; its length is the checked private
+copy. Nothing the client writes can move a descriptor outside its own ring,
+and a client that rewrites a slot's bytes while the device reads them changes
+only its own frame, which it could have sent anyway.
 
-**What the ring cannot be trusted for, and what holds anyway:**
+**The ring is input to the client too.** The client checks what it is given
+as a server checks a client's ring today (`pktring` doc l.69-94): the handle
+holds `Map` (`rights()`), `map` may answer `NoResource`, and the mapping's
+`len()` must hold the layout (`SharedWindow.init(at:len:layout:)`,
+`RingError.ShortMemory`). A driver is in the TCB, but the client's
+transcript should name a broken one rather than fault.
+
+**What the ring's ownership buys, and what holds anyway:**
 
 - The client can write into a ToClient slot the device is filling. That
   corrupts only frames sent to that client.
-- The client can die with RX buffers posted in its ring. The driver's own
-  row of the ring keeps the bytes out of the client's pool until the driver
-  unmaps (spec §2.5 refcount invariant l.1006-1013 and l.1527-1531: "a range
-  is never handed out again while a domain still grants it"), and the driver
-  unmaps only after the device has confirmed a reset (§5.4). "A device MUST
-  NOT send notifications or interact with the queues after indicating
-  completion of the reset by reinitializing device status to 0, until the
-  driver re-initializes the device" (§2.4.1), and "The driver SHOULD
-  consider a driver-initiated reset complete when it reads device status as
-  0" (§2.4.2). QEMU's soft reset clears each queue's `enabled`
-  (`virtio-mmio.c` ~l.72-82, ~l.370-395).
+- The client can die with RX buffers posted. The ring is the driver's
+  allocation, which the driver's row and handle keep out of the pool whatever
+  the client does; the driver resets the device and waits for `Status` 0
+  before it unmaps and releases (§5.4). "A device MUST NOT send notifications
+  or interact with the queues after indicating completion of the reset by
+  reinitializing device status to 0, until the driver re-initializes the
+  device" (§2.4.1); "The driver SHOULD consider a driver-initiated reset
+  complete when it reads device status as 0" (§2.4.2). QEMU's soft reset
+  clears each queue's `enabled` (`virtio-mmio.c` ~l.72-82, ~l.370-395).
+- The driver can end a connection while the client still maps the ring (a
+  ring fault, §5.4). The allocation then stays out of `netq` until the
+  client's row goes, since a row counts against its allocation (spec §2.5
+  l.1006-1013, l.1527-1531: "a range is never handed out again while a domain
+  still grants it"). So the driver cannot hand a client's still-mapped ring
+  to the device as a new client's, nor to anyone.
+- The client cannot donate the ring to the kernel: `SlabDonate` needs the
+  only reference and no row (spec l.2286-2290), and the driver holds a row.
+- The client's handle carries `Map` and `Transfer` only (§5.2): not
+  `Physical`, so the client never learns where the ring lies, and not `Mint`.
 - The driver can die with buffers posted: §4.5.
 
-**New `pktring` accessors (unit A3-1).** `Endpoint` copies today (`send`
+**`pktring` for a ring the server lays out (unit A3-1).** Today the client
+lays the ring out and stores all four index words (`Endpoint.client`,
+l.585-592), and the server stores only its own two (`Endpoint.server`,
+l.596-601). With the reversed `Attach` the server lays it out, and the
+client must not store a word the server may already have published (the
+driver posts RX buffers before it answers `Attach`, and a frame could be
+published before the client's first instruction). Two constructors, beside
+the existing pair, which the other packet protocols keep:
+
+```saw
+extension Endpoint<M: Shared> {
+    /// The server's end of a ring it allocated and lays out itself: every
+    /// index word is stored zero, so the ring starts empty. The server does
+    /// this before it gives the memory to the client.
+    public static func server_laid_out(memory: M, layout: Layout) -> Endpoint<M>
+
+    /// The client's end of a ring the server laid out and gave it. It stores
+    /// nothing, and trusts nothing the memory holds.
+    public static func client_given(memory: M, layout: Layout) -> Endpoint<M>
+}
+```
+
+**The in-place accessors (unit A3-1).** `Endpoint` copies today (`send`
 l.683-712, `receive` l.763-791). The server side of a zero-copy driver needs
 the same checks without the copy, and with release in completion order:
 
@@ -741,7 +918,9 @@ Hosted tests in `drivers/pktring/tests/input.saw` hold each to rule 5.2 as
 A1's tests hold `receive`: a length word changed between two reads is read
 once; an index past the count; out of order; `release_taken` past what is
 taken panics; `send` with a reservation outstanding panics; `fill` with
-none panics; `take` then `receive` then `release()` releases both.
+none panics; `take` then `receive` then `release()` releases both;
+`client_given` stores no word (a fake `Shared` records stores), and
+`server_laid_out` stores all four.
 
 ### 4.3 The device is checked too, and how the driver gives up
 
@@ -790,7 +969,7 @@ hosted library's `Registers` trait has exactly those accessors (§7.4).
 | refused at setup | a feature (§1.2), `FEATURES_OK`, `QueueReady`, `QueueNumMax`, `mtu`, `ConfigGeneration` | `Status` with `FAILED` (128) added (§2.2.1: "otherwise MUST set the FAILED device status bit and cease initialization"), then a reset (`Status` 0) and the bounded wait, since a queue set up before the failure may already be live | 1 | 1 |
 | a device fault in service | §4.3's used-ring rows, `DEVICE_NEEDS_RESET` | `FAILED`, then a reset and the bounded wait, then unmap | 3 | 3 |
 | a reset that does not complete | the bounded wait | nothing more; it unmaps nothing | 4 | 4 |
-| the connection ended by a client fault | §4.2's ring rows, a refused `Attach` | a reset and the bounded wait, then unmap | 2 | 2 |
+| the connection ended by a client fault | §4.2's ring rows (an `Attach` the pool cannot hold is a status, `NoMemory`, and ends nothing) | a reset and the bounded wait, then unmap | 2 | 2 |
 | the client gone | the terminal level (§5.4) | a reset and the bounded wait, then unmap | 0 | 0 |
 
 The machine status is the driver's exit code because the image says
@@ -851,53 +1030,60 @@ the completed prefix); RX slots are filled and published in ring order
 
 **What happens.** A dead driver's teardown masks its line (spec l.2650: the
 Interrupt's release "unbinds and masks the line"), releases its handles,
-then clears its domain (spec l.1536-1545), so its queue allocation goes back
-to its pool while the device may still hold the queue addresses and, in
-posted RX chains, slot addresses in the client's ring. Root hears of the
-death at the start of the teardown, but "the whole teardown below runs to
-completion first" (`kernel/core/sched.saw` l.655-664), and only then can
-root stop the machine. So `on-exit = "shutdown"` acts after the free, not
-before it, as the reviewer says.
+then clears its domain (spec l.1536-1545). Root hears of the death at the
+start of the teardown, but "the whole teardown below runs to completion
+first" (`kernel/core/sched.saw` l.655-664), and only then can root stop the
+machine. So `on-exit = "shutdown"` acts after the frees, not before them,
+and the device may still hold the queue addresses and, in posted RX chains,
+slot addresses in a client's ring.
 
-**Why that is safe in a stock image.** The device's addresses lie only in
-the queue allocation and the client's ring (§3.7). Neither can be handed out
-again, ever, in an image the stock root launches:
+**Why that is safe in a stock image.** Since the owner's ruling on the ring,
+every byte the device can address is in one pool, `netq`: the queue
+allocation and each client's ring are the driver's allocations from it
+(§3.1, §3.8). The argument is about that one pool:
 
-1. **Each pool has one holder.** The builder refuses a pool bound twice
+1. **One holder, by the image.** The builder refuses a pool bound twice
    ("the pool ... is bound twice: a pool is bound once",
    `tools/sosimage/src/imagefile.saw` l.462 and l.483), and the plan gives a
-   `memory` record its pool's row whole (`Source.Row`, `plan.saw`
-   l.496-500), so root keeps no handle on it. `netq` is the driver's alone;
-   `ring` is the client's alone.
-2. **A boot pool with no holder returns its bytes nowhere.** "When its last
+   `memory` record its pool's row whole (`Source.Row`, `plan.saw` l.496-500),
+   so root keeps no handle on it. `netq` is the driver's alone.
+2. **One holder, by capability.** The driver's `queues` record keeps
+   `allocate`, `map` and `physical` and not `transfer` or `mint` (§2.5), so no
+   code in the driver can give the pool or mint a sibling of it: the rights
+   are not there to spend (spec §3). What the driver gives clients are
+   siblings of single allocations (§5.2), never the pool.
+3. **A boot pool with no holder returns its bytes nowhere.** "When its last
    handle has gone and the last allocation from it has come home, its slot
    frees ... and its bytes go nowhere: a pool minted at boot has no pool
    above it" (spec l.1221-1230). The driver's death releases its `netq`
-   handle and, at the domain clear, its queue allocation's last row; the
-   pool then frees and its bytes are on no list.
-3. **The client's ring** is the client's own memory while the client lives
-   (the device writing into it changes only frames sent to that client),
-   and its pool goes the same way when the client dies.
-4. **Nothing else reuses physical RAM.** Every process's region and
+   handle; each allocation comes home when its last row and handle go, the
+   queue allocation at the driver's domain clear, a ring when its client's
+   row goes too; then the pool frees and its bytes are on no list.
+4. **Until then, a still-mapped ring is its client's view only.** A ring a
+   live client maps stays out of the pool (§4.2), so the device writing into
+   it reaches only that client's frames.
+5. **Nothing else reuses physical RAM.** Every process's region and
    destination is a boot allocation, which "came from no pool, and when it
-   frees its bytes go nowhere" (spec l.1246-1249); kernel memory is its
-   image and `.bss`, and slab donations come only from allocations a holder
-   donates.
+   frees its bytes go nowhere" (spec l.1246-1249); kernel memory is its image
+   and `.bss`; slab donations come only from an allocation with no other
+   reference and no row (spec l.2286-2290).
 
-So between the driver's teardown and root's stop, and after it, no process
-and no kernel object is given those bytes; the device's writes land in
-memory nobody owns. `on-exit = "shutdown"` is then not what makes the death
-safe. It stays because a dead network driver leaves nothing for the image to
-do, and so that a driver death is an end the transcript reports (Q5).
+So no process and no kernel object is ever given a byte the dead driver's
+device still addresses. Revision 2's argument also needed the client's pool;
+this one does not, and step 2 moves the last piece from "the driver's code
+does not share the pool" to "the driver cannot". `on-exit = "shutdown"` is
+then not what makes the death safe. It stays because a dead network driver
+leaves nothing for the image to do, and so that a driver death is an end the
+transcript reports (Q5).
 
 **Where the argument stops holding,** and critical processes (or more) are
-needed: a launcher that keeps a sibling of the driver's pool, or gives it to
-two processes (a hand-written root may); a driver that is restarted into
-the same pool; sub-pools and revoke (spec §2.5 l.1576 on, not built);
-anything that returns a boot pool's bytes to a live pool. The builder's
-one-binding rule is what makes it true in a stock image, so the argument is
-written into `imagefile.saw`'s comment on that refusal and into the spec
-(§10).
+needed: a launcher that keeps a sibling of the driver's pool, gives it to two
+processes or gives it with `Transfer` or `Mint` (a hand-written root may); a
+driver that is restarted into the same pool; sub-pools and revoke (spec §2.5
+l.1576 on, not built); anything that returns a boot pool's bytes to a live
+pool. The builder's one-binding rule and the record's keep word are what make
+it true in a stock image, so the argument is written into `imagefile.saw`'s
+comment on that refusal and into the spec (§10).
 
 **Critical processes, priced (A3-K3, optional).** Spec l.1567-1572 names
 "critical processes — a process root marks at launch whose exit for any
@@ -912,9 +1098,8 @@ yet built. Built for A3 it would be:
   `SOS: critical process ended: process=N` and a status;
 - spec §2.7, §8 and the DMA paragraph's text; sysapi
   `Process.mark_critical()`;
-- builder and root: an image key `critical = true` (or `dma = true` in the
-  declaration implying it), a plan field, root calling the op before
-  `start`;
+- builder and root: an image key `critical = true`, a plan field, root
+  calling the op before `start`;
 - cases on all three profiles: a critical child that exits, faults and is
   killed stops the machine before root's `ended` line, and a non-critical
   sibling does not.
@@ -923,10 +1108,9 @@ About an M unit, touching `kernel/abi`, `kernel/core` (`sched.saw`,
 `dispatch.saw`, `process.saw`), `kernel/sysapi`, `tools/sosimage`
 (`imagefile.saw`, `plan.saw`), `root/`, `spec.md` and the runner. It is not
 needed for A3's images by the argument above; it is needed by the first
-image where that argument fails. Recommended: A3 goes ahead on the
-argument, with critical processes scheduled when restart or sub-pools are
-(Q5). If the owner prefers the general mechanism now, A3-K3 comes before
-A3-4.
+image where that argument fails. Recommended: A3 goes ahead on the argument,
+with critical processes scheduled when restart or sub-pools are (Q5). If the
+owner prefers the general mechanism now, A3-K3 comes before A3-4.
 
 ### 4.6 Cache coherence
 
@@ -960,12 +1144,18 @@ obligation are attached, and every delivery arrives through `wait`.
 
 Map the window (`map(iomemory:)`), check the transport (§2.4), reset and wait
 until `Status` reads 0 (bounded, §4.3), set `ACKNOWLEDGE` and `DRIVER`,
-negotiate (§1.2), `FEATURES_OK` and check it, allocate and zero the queues,
-set them up, read `mac`, `status` and `mtu` (§4.3's widths), set `DRIVER_OK`
-(§3.1.1). The RX queue is empty until a client attaches: its buffers are the
-client's slots. QEMU holds frames that arrive with no buffer posted
-(`virtio_net_has_buffers` returns 0, `virtio-net.c` ~l.2010), and the stream
-backend stops reading its socket, so nothing is lost before `Attach`.
+negotiate (§1.2), `FEATURES_OK` and check it; allocate the queue memory from
+`netq` with `contiguous`, map it, read `Physical`, release the `Memory`
+handle, zero the queues and set them up; read `mac`, `status` and `mtu`
+(§4.3's widths), set `DRIVER_OK` (§3.1.1). The RX queue is empty until a
+client attaches: its buffers are the ring's slots. QEMU holds frames that
+arrive with no buffer posted (`virtio_net_has_buffers` returns 0,
+`virtio-net.c` ~l.2010), and the stream backend stops reading its socket, so
+nothing is lost before `Attach`.
+
+A `Physical` that answers `NoResource` here, for an allocation the driver
+made contiguous, is a kernel bug, and the driver stops with a line (exit 1,
+the setup class of §4.3's table, after `FAILED` and a reset).
 
 Two lines, through the debug print (no console record, as the UART drivers):
 
@@ -979,13 +1169,22 @@ SOS netdrv: mac 52:54:00:12:34:56, link up, mtu 1500, queues 64 and 64
 
 ### 5.2 The ops
 
+`Attach` is reversed, as ruled: the client sends slot counts and no memory,
+and the driver answers with the ring.
+
 | Op | What the driver does |
 |---|---|
-| `Attach(to_server, to_client)` + Memory | checks in `netdevproto`'s order (l.61-67). The Memory's rights hold `Map` (`rights()`), else `BadArg`, counted, connection ended. `map` it read-write; `NoResource` (spec §2.5: empty, off the grain, flash) is counted and ends the connection. `SharedWindow.init(at:len:layout:)` with `len()`; `ShortMemory` likewise. Then `physical()`, then the Memory handle is released (§2.5's count), `Endpoint.server`, post RX buffers into the free ToClient slots (as many as there are RX chains), notify, answer `AttachInfo` (mac, the reported MTU, the request's counts). The next `WaitEvent` is answered at once with the link's state. A second `Attach` is `Attached` |
+| `Attach(to_server, to_client)` | a request carrying a handle is `BadOp` (the decoder's new rule, §5.5). The layout's `bytes()` rounded up to the pool's granularity (`Pool.available`'s set, spec §2.5) is allocated from `netq` with `contiguous`; `NoMemory` (the pool cannot hold it) is answered with the new status `NoMemory`, and the connection stays (the client may ask for fewer slots). The driver maps the allocation read-write, reads `Physical`, lays the ring out (`Endpoint.server_laid_out`, §4.2), mints the client's handle with `Memory.mint(rights: Map \| Transfer)` (no `Physical`, no `Mint`), releases its own `Memory` handle (§2.5's count), posts RX buffers into the free ToClient slots (as many as there are RX chains), notifies, and answers `AttachInfo` (mac, the reported MTU, the request's counts) with the client's handle in reply handle slot 0 (`PipeRequest.reply_with`, `kernel/sysapi/src/pipe.saw` l.1446-1458 on main). The next `WaitEvent` is answered at once with the link's state. A second `Attach` is `Attached` |
 | `Tx(range)` (a tell) | the range checked against the ring (§4.2); `poll` the ToServer ring; for each new slot while a TX chain is free: `take`, check the frame length (§4.2), post or complete with `tx_errors`; notify. Slots past the chains in flight wait in the ring until chains free. Answered `Ok` (and discarded, as the UART's `Write`) |
 | `RxReturn(range)` (a tell) | the range checked; `reserve` every freed ToClient slot while an RX chain is free, post, notify |
 | `WaitEvent` | answered at once if an event is pending; otherwise held, with a one-shot attach so an abandoned claim is a delivery (the UART's held `Read`, l.556-584). A second while one is held is `Busy` |
 | `Stats` | `NetdevStats`: `rx_frames` (frames published to the client), `rx_dropped`, `tx_frames` (TX chains the device used), `tx_errors`, `ring_faults` |
+
+An `Attach` whose reply does not land (the client dropped its claim) has
+still made a ring. The driver treats it as attached; the client's next
+request, or the connection's end, settles it. Since the only process that
+could have attached is the one that dropped the claim, a client that does
+this has broken its own connection, and the driver's state stays consistent.
 
 **Events.** Pending state is a link flag, the ToClient range published since
 the last report, and the ToServer range completed since the last report. One
@@ -997,8 +1196,7 @@ next `RxReady` names all of them (netdevproto l.47-51).
 to put a frame when the client holds every slot, so QEMU keeps it and stops
 reading the stream: back-pressure reaches the peer instead of a drop. The
 counter stays in the protocol for drivers that copy (the radio, §5.3 of the
-networking design). `netdevproto`'s doc for `rx_dropped` gains that
-sentence.
+networking design).
 
 ### 5.3 Link
 
@@ -1027,21 +1225,57 @@ runner starts the guest only once the stream is connected (§6.3). Without
   ```
 
   Reset, then `Status` read as 0, then unmap: the device has stopped using
-  the queues before the row that keeps the ring's bytes out of the client's
-  pool goes (§4.2). A reset that does not complete is exit 4 with the ring
+  the queues before the last row on the ring goes and the allocation returns
+  to `netq` (§4.2). A reset that does not complete is exit 4 with the ring
   still mapped (§4.3). The hosted tests pin the order with a fake that
   completes its reset late (§7.4).
-- **Ring fault or a refused Attach:** netdevproto says the connection ends
-  (l.69-82). The driver has one outlet, so ending the connection is
-  releasing it: every claim then answers `PeerClosed`, which is what a dead
-  server looks like (§5.4 item 4 of the networking design). The driver
-  then resets, waits for `Status` 0 and unmaps as above, prints the fault by
+- **Ring fault:** netdevproto says the connection ends (l.69-82). The driver
+  has one outlet, so ending the connection is releasing it: every claim then
+  answers `PeerClosed`, which is what a dead server looks like (§5.4 item 4
+  of the networking design). The driver then resets, waits for `Status` 0
+  and unmaps as above (the client may still map the ring, which then stays
+  out of `netq` until the client's row goes, §4.2), prints the fault by
   `RingError.describe()` with its value and `ring_faults=1`, and exits 2. In
   an image where the driver says `on-exit = "shutdown"` that ends the image
   (Q6).
 - **A client that drops its `WaitEvent` claim:** the abandoned delivery
   discards the obligation; the next `WaitEvent` is served (the UART's
   `Abandoned`, l.520-532).
+
+### 5.5 `netdevproto`, reversed (unit A3-1)
+
+The package's doc (`drivers/netdevproto/src/lib.saw` l.1-82) and its wire
+change as follows; the hosted tests in `drivers/netdevproto/tests/` follow.
+
+- **The table:** `Attach` | `1` | `to_server u16, to_client u16` | `mac [6],
+  mtu u16, to_server u16, to_client u16; handle slot 0: the ring`. The
+  request carries no handle; the reply carries one.
+- **`Attach`'s doc**, replacing l.37-43: "a call, the connection's first
+  request. The client sends the two slot counts it wants. The driver
+  allocates the ring from its own memory, one physical range, lays it out
+  (`Endpoint.server_laid_out`), and answers the device's MAC address, its
+  MTU, and the slot counts, which are the request's, with the ring's Memory
+  in handle slot 0, carrying `Map` and `Transfer` and nothing else. The
+  client checks the handle as input (`pktring`'s rules for a ring it is
+  given: `Map` held, the mapping no shorter than the layout) and takes its end
+  with `Endpoint.client_given`. The ring is the driver's: it does not return
+  to the driver's memory while the client maps it."
+- **A new status**, `NoMemory = 6`: "the driver cannot hold a ring of these
+  counts; the connection stays, and the client may ask for fewer." It is
+  checked after `Attached`.
+- **The statuses' order** (l.61-67) loses "an `Attach` with no Memory, one
+  given without `MemoryRight.Map`, or one shorter than the ring", and gains
+  `BadOp` for any request that carries a handle.
+- **Failure** (l.69-82): the first check on the client's ring is no longer
+  the Memory an `Attach` gives; a client's values that fail a check (indexes,
+  lengths) still end the connection and count in `ring_faults`. The client's
+  own checks of the ring it is given end its use of the connection.
+- **`attach_reply`** (l.553 on) reads the reply's handle as well, and the
+  typed client API returns it beside `AttachInfo`.
+- **`rx_dropped`'s doc** gains §5.2's sentence.
+
+`sockproto` and `hciproto` keep the client-allocates shape for now; whether
+they follow is their units' question.
 
 ---
 
@@ -1221,39 +1455,38 @@ tick = false
 [root]
 package = "stock"
 
+# The driver's queues (one page) and one client's ring (8 + 8 slots,
+# 32,896 bytes, a page-rounded 0x9000 on arm64).
 [[pool]]
 name = "netq"
-len = 0x1000
-
-[[pool]]
-name = "ring"
-len = 0x9000
+len = 0xA000
 
 [[process]]
 name = "net"
 package = "sawos:drivers/svc-virtio-net"
 device = { net = "VIRTIO7" }
 pools = { queues = "netq" }
+ceilings = { memory = ["transfer", "mint", "map", "physical"], pool = ["allocate", "map", "physical"] }
 on-exit = "shutdown"
 
 [[process]]
 name = "ping"
 package = "sawos:tests/net-ping"
 clients = { netdev = "net.netdev" }
-pools = { ring = "ring" }
 ```
 
 `tests/net-ping` is a test package written with `main`, depending on `sos`,
 `sosmain`, `netdevproto`, `pktring` and `netstack` (`svc-net` is A6). Its
-declaration: `system`, a `client` of `netdevproto`, a `memory` record
-`ring`; quota `mappings = 1`, `memories = 1`. Its ring is 8 slots each way:
-`Layout.bytes()` is 128 + 16 × 2048 = 32,896 bytes, rounded up to the
-pool's granularity (`Pool.available`'s set, spec §2.5), 0x9000 on arm64.
+declaration: `system` and a `client` of `netdevproto`; no `memory` record,
+since the ring now comes from the driver; quota `mappings = 1`. It asks for
+no `physical`, and gets none by the default (§3.5). Its ring is 8 slots each
+way: `Layout.bytes()` is 128 + 16 × 2048 = 32,896 bytes.
 
 What it does:
 
-1. allocate and map the ring, `Endpoint.client`, `Attach` with the Memory in
-   handle slot 0; print the reply;
+1. `Attach(8, 8)`; check the handle in the reply (`Map` held, the mapping no
+   shorter than the layout), map it, `Endpoint.client_given`; print the
+   reply;
 2. `WaitEvent`; expect the link's state; print it;
 3. `Stack.init(mac)`, `configure` 10.0.2.15/24 via 10.0.2.2 (which sends the
    gratuitous ARP);
@@ -1326,7 +1559,8 @@ peer: closed after 5 frames
 
 Every check the driver makes has a case that goes red when the check is
 removed or inverted: a gate case where QEMU or a client can produce the
-value, a hosted test (§7.4) where only a misbehaving device could.
+value, a hosted test (§7.4) where only a misbehaving device could. The
+kernel's and the builder's new checks have their own pins (§3.4, §7.5).
 
 Gate cases (all on riscv32, riscv32-flat and arm64; none asserts a hardware
 denial, so the flat profile excludes none). Exit codes are §4.3's.
@@ -1345,8 +1579,9 @@ denial, so the flat profile excludes none). Exit codes are §4.3's.
 | `net_ring_index_order` | head moved back | in order | `an index out of order` |
 | `net_ring_length_past` | a length word of 4096 | length against slot | `a length past the slot: 4096` |
 | `net_ring_tail_past` | ToClient tail = 2n + 1, rings `RxReturn` | ToClient tail checked | `an index past the slot count` |
-| `net_attach_short` | a Memory shorter than the layout | `ShortMemory` | `BadArg`, `a memory shorter than the ring` |
-| `net_attach_no_map` | a Memory minted without `Map` | rights checked | `BadArg`, `ring_faults=1` |
+| `net_attach_too_large` | `Attach(256, 256)` (about 1 MiB) against `netq`'s 0xA000, then `Attach(8, 8)` | the pool's `NoMemory` answered as the status, the connection kept | `NoMemory`, then an attach that succeeds and a ping answered |
+| `net_attach_handle` | an `Attach` that carries a handle (an inlet sibling of its own) | a request carrying a handle | `BadOp`, then a plain `Attach` that succeeds |
+| `net_ring_no_physical` | client calls `Physical` on the ring handle the driver gave it | the client's handle is minted without `Physical` (§5.2) | the client faults `AccessDenied` (the kernel's fault line names it), and the driver then reports `client gone` |
 | `net_protocol_states` | `Tx` before `Attach`; `Attach` twice; `WaitEvent` while one is held; a `Tx` range valid for `MAX_SLOTS` but past the 8-slot ring (first 8, count 1) | statuses in order; the range against the attached ring (§4.2) | `NotAttached`, `Attached`, `Busy`, `BadArg` |
 | `net_slow_client` | script `burst`: client sends `burst 20`, holds every slot until 8 have arrived, then returns slots one at a time | the driver posts only freed slots, publishes in order | the client receives `frame 1 of 20` to `frame 20 of 20` in order, intact; `rx_dropped=0` |
 | `net_client_dies` | client attaches, sends an echo request, exits with its RX buffers posted | reset confirmed before unmap; the terminal level | `client gone: device reset, ring unmapped`; machine status 0 |
@@ -1370,10 +1605,12 @@ never preempts (CLAUDE.md, "A wake never preempts"). The implementer confirms
 it on the first run; if it does not hold, the client's line is left out of
 the expected text rather than ordered by time.
 
-`Map` answering `NoResource` for a client's Memory (an empty one, one off the
-grain, flash) cannot be produced on these boards by a client: every Memory a
-pool gives is on the grain and in RAM. It stays covered by `pktring`'s hosted
-tests of the attach order and by the spec's own map cases.
+Revision 2's `net_attach_short` and `net_attach_no_map` are gone: the
+client no longer gives the driver memory, so the driver has no such check.
+The client's checks of the ring it is given are `pktring`'s
+(`SharedWindow.init`'s `ShortMemory`, the `Map` right), pinned by
+`pktring`'s hosted tests; a driver that gave a short or unmappable ring is a
+driver bug no case can make QEMU produce.
 
 ### 7.4 Hosted tests (`drivers/virtio`)
 
@@ -1426,83 +1663,108 @@ check is removed or inverted:
 
 `HOSTED_TESTS` gains `drivers/virtio` and `tools/netpeer`.
 
+### 7.5 The builder's pins (B1)
+
+Each is a builder test in `tools/sosimage/tests` (beside `process_ceilings.saw`,
+`ceiling_plan.saw` and `image_file.saw`), and the first four are also gate
+cases built from a description, with `expect_build_error` (the runner's key
+for a case whose build must fail, `tools/sos_runner.py` l.1473-1480, used at
+l.10153, l.10168, l.10324), so a refusal is seen end to end:
+
+| Pin | Image and declaration | Expected refusal |
+|---|---|---|
+| `physical_not_granted` | the declaration's `[ceilings] memory` names `physical`; the image's entry has no `ceilings`, or one without `physical` for `memory` | "the process P asks for `physical` on `memory` in its declaration, and the image does not grant it: add it to the process's `ceilings` in the image" |
+| `physical_not_asked` | the image's `ceilings` grants `physical` on `memory`; the declaration does not ask (no `[ceilings]`, or a `memory` row without it) | "the image grants `physical` on `memory` to the process P, whose declaration does not ask for it" |
+| `ceiling_strips_kept` | the image's `ceilings` lists `pool = ["allocate"]` for a process whose `memory` record keeps `allocate` and `map` | "the image's `pool` ceiling for the process P removes `map`, which its record `queues` keeps" |
+| `ceiling_strips_runtime` | the image's `ceilings` lists `process = ["exit"]` for a program written with `main` | the existing runtime refusal, naming `boot-handles` and `thread-self`, now applied to the effective ceiling |
+| `ceiling_unknown` | an unknown kind, an unknown right, a right twice, a `system` key in the image's `ceilings` | each by name, as for a declaration |
+| `ceiling_intersection` | the declaration lists `memory = ["map", "mint"]`, the image `memory = ["map", "transfer"]` | the plan's `memory` ceiling is `map` alone; a kind the image omits keeps the declaration's word |
+| `physical_default` | no `[ceilings]`, no record `rights` | the plan's `memory` and `pool` ceilings are every right but `physical`, and the `memory` record's keep word lacks it (K1 lands this one; B1 keeps it) |
+
+And one gate case that succeeds, `stock_physical_granted`: a test child whose
+declaration asks for `physical` on `memory` and `pool`, granted by the image,
+allocates contiguous from its pool, reads `Physical` and prints its length,
+and allocates without the flag and prints `NoResource`. It runs with no
+network device.
+
 ---
 
 ## 8. Size and units
 
-More than one M brief: eight units, one optional. Sizes as §10 of the
-networking design uses them (S days, M a week or two).
+Nine units, one optional. Sizes as §10 of the networking design uses them
+(S days, M a week or two).
 
-| Unit | Size | What | Files |
-|---|---|---|---|
-| **A3-K1** | S | `MappingOp.Physical` (§3.4), after the owner's ruling | `spec.md` §2.5; `kernel/abi/src/ops.saw`, `rights.saw`; `kernel/core/dispatch.saw`; `kernel/sysapi/src/mapping.saw`; `tools/sosimage/src/rights.saw`; `tests/mapping-physical/` and siblings (denied, husk, revoked, the stats row's `BadArg`; two rows of one allocation answer one `Physical` and, on arm64, two `Base`s); the consumer sweep's tests (§3.4); `tools/sos_runner.py` cases |
-| **A3-K1b** | S | if Q1 chooses (ii): `dma = true` and the stock-image `Mapping` ceiling (§3.4, §3.6) | `tools/sosimage/src/declaration.saw`, `plan.saw`, its tests; `spec.md` §12; `drivers/svc-virtio-net/process.toml` gains the key in A3-4 |
-| **A3-K2** | S | arm64 second device window (§3.5), with the arm64 `virtio_probe` case | `hal/arm64/kernel/lib.saw`, `hal/arm64/kernel/ABI.md`, `hal/arm64/user/ABI.md`; `hal/arm64/board.toml` rows; `tests/images/virtio_probe_arm64.toml`; `tools/sos_runner.py` (the arm64 row of A3-3's probe case) |
-| **A3-K3** | M | optional, if Q5 chooses it: critical processes (§4.5) | `kernel/abi`, `kernel/core/sched.saw`, `dispatch.saw`, `process.saw`, `kernel/sysapi`, `tools/sosimage/src/imagefile.saw`, `plan.saw`, `root/`, `spec.md`, `tools/sos_runner.py` |
-| **A3-1** | S | `pktring` in-place accessors and cursor rules (§4.2); `netdevproto` doc: `rx_dropped` on a zero-copy driver, the first `WaitEvent` after `Attach`, ending the connection is releasing the outlet | `drivers/pktring/src/lib.saw`, `drivers/pktring/tests/input.saw`, `drivers/netdevproto/src/lib.saw` (doc only) |
-| **A3-2** | M | `drivers/virtio`, hosted: MMIO transport v2, negotiation, split queues with the device checks and the failure classes, fake-device tests (§7.4) | `drivers/virtio/` (new); `tools/sos_runner.py` `HOSTED_TESTS` |
-| **A3-3** | M | the riscv32 and flat board rows (§2.3); `tools/netpeer` (§6.4-6.5) with hosted tests; the runner's net path (§6.3); `tests/virtio-probe`, a child that maps its window and prints `MagicValue`, `Version`, `DeviceID`, `VendorID` and the config MAC, with cases `virtio_probe` and `virtio_probe_empty` on riscv32 and the flat profile | `hal/riscv32/board.toml`, `hal/riscv32-flat/board.toml`; `tools/netpeer/` (new); `tools/sos_runner.py`; `tests/virtio-probe/`; `tests/images/virtio_probe.toml`, `virtio_probe_flat.toml` |
-| **A3-4** | M | `drivers/svc-virtio-net`; `tests/net-ping`; `net_ping`, `net_no_status`, `net_mtu`, `net_legacy`, `net_wrong_device`, `net_no_device`; the spec's DMA sentence (§10) | `drivers/svc-virtio-net/` (new, with `native/fence-riscv32.c`, `native/fence-arm64.c`); `tests/net-ping/`; `tests/images/net_*.toml`; `tools/sosimage/src/imagefile.saw` (the comment on the one-binding refusal, §4.5); `spec.md`; `tools/sos_runner.py` |
-| **A3-5** | S-M | `tests/net-client` and the rest of §7.3's table | `tests/net-client/`; `tests/images/net_*.toml`; `tools/sos_runner.py` |
+| Unit | Size | Track | What | Files |
+|---|---|---|---|---|
+| **K1** | M | kernel (networking depends on it) | `MemoryOp.Physical`, `MemoryRight.Physical` and `PoolRight.Physical`, the default sets, `AllocateFlag.Contiguous` and `MemorySlot.contiguous` (§3.4); the builder's minimum for "off by default" (`physical` named, stock children without `[ceilings]` and records without `rights` kept without it, a declaration naming it refused until B1); the consumer sweep; §3.4's cases | `spec.md` §2.5; `kernel/abi/src/ops.saw`, `rights.saw`; `kernel/core/dispatch.saw`, `objects.saw` (and the boot path that mints boot allocations); `kernel/sysapi/src/memory.saw`, `pool.saw`; `tools/sosimage/src/rights.saw`, `declaration.saw`, `plan.saw` and their tests; `tests/memory-physical*/`, `tests/pool-allocate-flags/`, `tests/stock-physical-default/`; `tools/sos_runner.py` (cases and the swept expectations) |
+| **B1** | M | general builder, under the limits issue | the image's per-process `ceilings` table, the intersection, the opt-in at both ends, the refusals, the plan's keep words from the effective ceiling (§3.5, §3.6); §7.5's pins | `tools/sosimage/src/imagefile.saw`, `declaration.saw`, `plan.saw`, `rights.saw`, their tests; `spec.md` §12; `tests/stock-physical-granted/`; `tests/images/` (the pins' descriptions); `tools/sos_runner.py` |
+| **K2** | S | kernel (networking) | arm64 second device window (§3.7), with the arm64 rows and the arm64 `virtio_probe` case | `hal/arm64/kernel/lib.saw`, `hal/arm64/kernel/ABI.md`, `hal/arm64/user/ABI.md`; `hal/arm64/board.toml`; `tests/images/virtio_probe_arm64.toml`; `tools/sos_runner.py` |
+| **A3-K3** | M | kernel, optional | critical processes, if Q5 chooses (b) (§4.5) | `kernel/abi`, `kernel/core/sched.saw`, `dispatch.saw`, `process.saw`, `kernel/sysapi`, `tools/sosimage/src/imagefile.saw`, `plan.saw`, `root/`, `spec.md`, `tools/sos_runner.py` |
+| **A3-1** | S | networking | `pktring`'s `server_laid_out` and `client_given` and the in-place accessors with their cursor rules (§4.2); `netdevproto` reversed: the `Attach` wire, `NoMemory`, the handle in the reply, `BadOp` for a request carrying a handle, the doc text (§5.5) | `drivers/pktring/src/lib.saw`, `drivers/pktring/tests/`, `drivers/netdevproto/src/lib.saw`, `drivers/netdevproto/tests/` |
+| **A3-2** | M | networking | `drivers/virtio`, hosted: MMIO transport v2, negotiation, split queues with the device checks and the failure classes, fake-device tests (§7.4) | `drivers/virtio/` (new); `tools/sos_runner.py` `HOSTED_TESTS` |
+| **A3-3** | M | networking | the riscv32 and flat board rows (§2.3); `tools/netpeer` (§6.4-6.5) with hosted tests; the runner's net path (§6.3); `tests/virtio-probe` and the cases `virtio_probe` and `virtio_probe_empty` on riscv32 and the flat profile | `hal/riscv32/board.toml`, `hal/riscv32-flat/board.toml`; `tools/netpeer/` (new); `tools/sos_runner.py`; `tests/virtio-probe/`; `tests/images/virtio_probe.toml`, `virtio_probe_flat.toml` |
+| **A3-4** | M | networking | `drivers/svc-virtio-net` (its declaration with `[ceilings]`, §2.5); `tests/net-ping`; `net_ping`, `net_no_status`, `net_mtu`, `net_legacy`, `net_wrong_device`, `net_no_device`; the spec's DMA sentence and the comment on the one-binding refusal (§10, §4.5) | `drivers/svc-virtio-net/` (new, with `native/fence-riscv32.c`, `native/fence-arm64.c`); `tests/net-ping/`; `tests/images/net_*.toml`; `tools/sosimage/src/imagefile.saw` (a comment); `spec.md`; `tools/sos_runner.py` |
+| **A3-5** | S-M | networking | `tests/net-client` and the rest of §7.3's table | `tests/net-client/`; `tests/images/net_*.toml`; `tools/sos_runner.py` |
 
-**Files shared.** `tools/sos_runner.py` is touched by A3-K1, A3-K2, A3-K3,
-A3-2, A3-3, A3-4 and A3-5, so by the file-overlap rule no two of them run at
-once. `spec.md` is touched by A3-K1, A3-K1b, A3-K3 and A3-4; `tools/sosimage`
-by A3-K1, A3-K1b, A3-K3 and A3-4; `hal/arm64/board.toml` only by A3-K2.
-A3-1 touches none of them, and pairs with any unit.
+K1 grows from S to M: it now carries a new op with a record, two rights, a
+flag in an existing word, a slot field, two default sets and the builder's
+default, against S for the Mapping op it replaces. A3-K1b is gone.
+
+**Files shared.** `tools/sos_runner.py` is touched by every unit but A3-1,
+so by the file-overlap rule no two of those run at once. `spec.md` is touched
+by K1, B1, A3-K3 and A3-4; `tools/sosimage` by K1, B1, A3-K3 and A3-4 (a
+comment); `hal/arm64/board.toml` only by K2. A3-1 touches none of them and
+pairs with any unit.
 
 **Order** (at most two at once):
 
-1. A3-3 (riscv32 and flat), with A3-1 beside it. Both need nothing.
-2. A3-2, after A3-3 (the runner).
-3. A3-K2, after A3-3: it adds the arm64 rows and the arm64 probe case to
-   A3-3's package and runner path.
-4. A3-K1 once Q1 is ruled, after A3-K2 (the runner); A3-K1b beside it if
-   Q1 chooses (ii) (it touches `tools/sosimage`, which A3-K1 touches only in
-   `rights.saw`, so the two are briefed as one unit or run one after the
-   other). A3-K3 here too if Q5 chooses it.
-5. A3-4, after A3-1, A3-2, A3-3, A3-K1 and A3-K2 (and A3-K3 if chosen). If
-   A3-K1 is late, A3-4's riscv32 and flat rows can use `base()` (§3.7) and
-   switch to `physical()` when it lands; its arm64 rows wait.
-6. A3-5, after A3-4.
+1. K1, with A3-1 beside it. K1 first because B1 and A3-4 both need its
+   right, and the builder's table cannot name `physical` before the kernel's
+   enum has it (`rights.saw`'s tests hold the table to the enums).
+2. A3-3 (riscv32 and flat).
+3. B1, after K1.
+4. A3-2.
+5. K2, after A3-3: it adds the arm64 rows and the arm64 probe case to A3-3's
+   package and runner path.
+6. A3-K3, here, if Q5 chooses (b).
+7. A3-4, after A3-1, A3-2, A3-3, K1, B1 and K2 (and A3-K3 if chosen).
+8. A3-5, after A3-4.
 
 ---
 
 ## 9. Questions for the owner
 
-1. **K1: add `MappingOp.Physical` on a new `MappingRight.Physical` (§3.4),
-   and who may learn a row's physical address (§3.6)?** Options: (i) every
-   process, a launcher narrowing it where it wants, which a stock image
-   cannot; (ii) in stock images only processes whose declaration says
-   `dma = true`, the builder narrowing every other child's `Mapping` ceiling
-   (A3-K1b, a small builder unit, no further kernel change). Recommended:
-   K1 with (ii). Trade-off: (ii) costs a declaration key, a builder rule and
-   one `restrict_rights` per child at boot, and makes every DMA driver name
-   itself in its package; (i) costs nothing and discloses to every process
-   the frames of its own rows only, which riscv32 and the flat profile
-   disclose already through `Base`.
+Q1 is ruled (`rulings-nov25.md`): `MemoryOp.Physical`, off unless the
+declaration asks and the image grants, the default changes, pools carrying
+the right, the `contiguous` flag, and the driver allocating the ring. The
+others stand, updated for the rulings.
+
 2. **Give arm64 processes a second device window, the 2 MiB block at
-   0x0A00_0000, at 4 KiB a table set (64 KiB of `.bss`) (§3.5)?**
+   0x0A00_0000, at 4 KiB a table set (64 KiB of `.bss`) (§3.7)?**
    Recommended: yes; no arm64 virtio driver can map its transport without it.
 3. **Modern virtio-mmio only: the cases pass
    `-global virtio-mmio.force-legacy=false`, and the driver refuses a version
    1 transport (§1.1)?** Recommended: yes.
-4. **Zero copy: descriptors point at the client's `pktring` slots, through
-   new in-place accessors (§4.2), rather than the driver copying each frame?**
-   Recommended: yes. The driver acts only on index and length words, read
-   once and checked; the device touches the bytes.
-5. **The driver's death (§4.5).** A3 rests on the argument that in a stock
-   image the bytes a dead driver's device still addresses are never handed
-   out again (one holder per pool, given whole; boot pools and boot
-   allocations return their bytes nowhere), so the driver's death needs no
-   halt ahead of the free. Options: (a) accept the argument for stock
-   images, record it in the spec (§10), keep `on-exit = "shutdown"` as the
-   image's policy, and schedule critical processes when driver restart or
-   sub-pools are; (b) build critical processes (A3-K3, M) first and mark the
-   driver critical. Recommended: (a). Trade-off: (a) adds no unit but holds
-   only while the builder's one-binding rule and the boot-pool rule hold, and
-   a hand-written root can break it; (b) is general and puts an M kernel and
-   builder unit in front of A3-4.
+4. **Zero copy: descriptors point at the ring's slots, through the new
+   in-place accessors (§4.2), rather than the driver copying each frame?**
+   Recommended: yes. The ring is now the driver's own allocation, and the
+   driver acts only on index and length words, read once and checked; the
+   device touches the bytes.
+5. **The driver's death (§4.5).** Every byte the device can address is now
+   in the driver's one pool, which the image binds to the driver alone and
+   whose record the driver keeps without `Transfer` or `Mint`; a boot pool
+   with no holder returns its bytes nowhere; a ring a live client maps stays
+   out of the pool. So in a stock image no byte the dead driver's device
+   still addresses is handed to anyone, and the death needs no halt ahead of
+   the frees. Options: (a) accept the argument for stock images, record it in
+   the spec (§10), keep `on-exit = "shutdown"` as the image's policy, and
+   schedule critical processes when driver restart or sub-pools are; (b)
+   build critical processes (A3-K3, M) first and mark the driver critical.
+   Recommended: (a). Trade-off: (a) adds no unit and now rests on three
+   things the tree enforces (the builder's one-binding rule, the record's
+   keep word, the boot-pool rule), but a hand-written root can still give the
+   pool away; (b) is general and puts an M kernel and builder unit in front
+   of A3-4.
 6. **A ring fault releases the driver's one outlet, which ends the
    connection for every client, and the driver then exits 2, ending the
    image (§5.4)?** Recommended: yes for A3, whose one client is the stack: a
@@ -1531,6 +1793,20 @@ A3-1 touches none of them, and pairs with any unit.
     `NOTIF_CONFIG_DATA` and `STANDBY`, and `ACCESS_PLATFORM` refused rather
     than accepted (§1.2)?** Recommended: yes; each reason is in §1.2's
     table, and QEMU offers none of them by default.
+12. **(New) `physical` is an opt-in on both kinds that carry it, `memory`
+    and `pool`, each needing the declaration's ask and the image's grant
+    (§3.5)?** The ruling names `memory`; a pool carries the bit for its
+    allocations, so a driver needs it on its pool record too. Recommended:
+    yes, per kind, so the refusals name the kind exactly. The alternative, a
+    `memory` grant implying the pool record's bit, saves one entry in the
+    image and makes the pool's keep word depend on another kind's table.
+13. **(New) `Physical` on an object not created contiguous answers the
+    `NoResource` status (§3.4)?** Recommended: yes. It is what `map` answers
+    for memory the kernel cannot serve as asked, and the holder of a given
+    object cannot check how it was made. The alternative is a new status
+    (`NotContiguous`); statuses are numbered by the vDSO discipline, so one
+    can be added, at the cost of one more word every caller's match must
+    know.
 
 ---
 
@@ -1538,15 +1814,17 @@ A3-1 touches none of them, and pairs with any unit.
 
 | Where | Change | Unit | Question |
 |---|---|---|---|
-| spec.md §2.5, Mapping (l.1430-1452) | "Five ops"; `Physical` on `MappingRight.Physical` (bit 11), text in §3.4, the stats row included | A3-K1 | Q1 |
-| spec.md §2.5, l.1473 | `mapping_rights()` mints `Physical` too | A3-K1 | Q1 |
-| spec.md §2.5, l.1506 | `Physical` among the ops a dead target's Mapping answers `Revoked` | A3-K1 | Q1 |
-| spec.md §2.5, "A region is a capability" (l.1020-1031) | names `Physical` beside `Base` and `Len` | A3-K1 | Q1 |
-| spec.md §2.5, DMA paragraph (l.1558-1574) | a DMA driver learns bus addresses from its rows (`Mapping.Physical`). The last sentence, "no case in the suite is a DMA driver and no capability in the tree is a lie about one", becomes: "`svc-virtio-net` on the QEMU `virt` boards is the suite's DMA driver, and a TCB member. Its device is given addresses only in its own queue allocation and its client's ring; in an image the stock root launches each pool has one holder and is given whole, and a boot pool or boot allocation whose holders are gone returns its bytes nowhere, so those bytes are never handed out again after the driver dies, and its death needs no critical-process halt. A launcher that shares or keeps a DMA driver's pool, or restarts the driver, needs one." | A3-4 | Q5 |
-| spec.md §12 (l.4790 on) | with Q1 (ii): the stock root narrows `Physical` out of every child's `Mapping` ceiling but those whose declaration says `dma = true` | A3-K1b | Q1 |
-| spec.md §2.7, §8 and the DMA paragraph | with Q5 (b): critical processes | A3-K3 | Q5 |
-| `hal/arm64/kernel/ABI.md`, `hal/arm64/user/ABI.md` | two device blocks, not one | A3-K2 | Q2 |
-| `drivers/netdevproto` docs (not the spec) | `rx_dropped` on a zero-copy driver; the first `WaitEvent`; ending a connection | A3-1 | Q6 |
+| spec.md §2.5, "A region is a capability, not a description" (l.1020-1031) | The first sentence, "There is no op on a pool or an allocation that reads its bounds", becomes: "One op on an allocation reads its bounds, `MemoryOp.Physical`, for a driver that hands the bytes to a device: it needs a right no process holds unless its launcher grants it, and it answers only for an allocation made contiguous. No op on a pool reads its bounds." The rest of the paragraph stands. | K1 | ruled |
+| spec.md §2.5, `Pool` (l.1040-1236) | `allocate(len, granularity, from)`'s third word is `from \| flags`: `AllocateFlag.Contiguous` (bit 8) beside `AllocateFrom`, any other bit the `BadArg` fault; an allocation made with it is one physical range now and in any future kernel. "The rights, bit by bit" (l.1209-1220) adds `.Physical` (bit 12) among the bits carried for allocations, and `pool_rights()` holds it. "An allocation's rights come from the pool handle" (l.1192-1208) names `Physical` among a `Memory`'s bits, held by `memory_rights()` and not by `front_allocation_rights()`. | K1 | ruled |
+| spec.md §2.5, `Memory` (l.1238 on) | "three ops, `Map`, `Extend` and `Physical`"; the rights paragraph (l.1250 on) adds `.Physical` (bit 12), minted by `memory_rights()` at boot because attenuation is monotonic; a new bullet for `Physical`: the record, its answers in order (§3.4), the contiguous rule, and that a boot allocation is contiguous by construction; `extend(len)` (l.1387 on): a contiguous allocation grows in place or answers `NoMemory`, now and in any future kernel | K1 | ruled |
+| spec.md §2.5, DMA paragraph (l.1558-1574) | a DMA driver learns bus addresses from `MemoryOp.Physical` on allocations it made contiguous. The last sentence, "no case in the suite is a DMA driver and no capability in the tree is a lie about one", becomes: "`svc-virtio-net` on the QEMU `virt` boards is the suite's DMA driver, and a TCB member. Every byte its device is given lies in its own pool, which a stock image binds to it alone and gives it without `Transfer` or `Mint`, and a boot pool whose holders are gone returns its bytes nowhere, so those bytes are never handed out again after the driver dies, and its death needs no critical-process halt. A launcher that shares or keeps a DMA driver's pool, or restarts the driver, needs one." | A3-4 | Q5 |
+| spec.md §2.7, rights ceilings (l.1869-1940) | a sentence: a launcher that follows §12's convention leaves `MemoryRight.Physical` and `PoolRight.Physical` out of a child's ceilings and records unless the child's declaration asks and its image grants; root's ceilings stay unrestricted | B1 | ruled |
+| spec.md §12, "The stock root's plan" (l.4925-4950) | "the rights word each of its ceilings is narrowed to" no longer only "when its declaration has `[ceilings]`": every child's plan narrows `memory` and `pool` at least, the words being the declaration's ceilings intersected with the image's | B1 (K1 for the default) | ruled |
+| spec.md §12, "The launch convention" (l.5096-5129) | the launcher narrows each child's ceilings to its declaration's intersected with its image's; a record with no `rights` keeps every right of its source except `physical` | B1 | ruled |
+| spec.md §12, "Ceilings and record rights" (l.5130-5160) | "A declaration with none leaves the child the launcher's ceilings" becomes "every right except an opt-in one (`physical`)"; a record with none, likewise; a new paragraph for the image's per-process `ceilings` table (option B: the image's ceiling for each kind it lists, intersected; a kind it omits left as the declaration says); opt-in rights, which must appear in both; the refusals of §3.5; and the last sentence, "An image cannot widen or narrow a declaration's ceilings", becomes "An image narrows a declaration's ceilings with its `ceilings` table and never widens them, and grants an opt-in right only to a process whose declaration asks for it" | B1 | ruled |
+| `hal/arm64/kernel/ABI.md`, `hal/arm64/user/ABI.md` | two device blocks, not one | K2 | Q2 |
+| `drivers/netdevproto` docs (not the spec) | `Attach` reversed, `NoMemory`, `BadOp` for a request with a handle, `rx_dropped` on a zero-copy driver, the first `WaitEvent` (§5.5) | A3-1 | ruled; Q6 |
+| spec.md §2.7, §8, DMA paragraph | with Q5 (b): critical processes | A3-K3 | Q5 |
 
 ---
 
@@ -1554,19 +1832,25 @@ A3-1 touches none of them, and pairs with any unit.
 
 | Fact | How |
 |---|---|
+| current main | `git clone --depth 1 https://github.com/swoodtke/sawos.git` into `so103a3/main`: `850c5849`, the local checkout's commit |
+| `MemoryOp`, `PoolOp`, `AllocateFrom`, `MemoryRight`, `PoolRight` numbers and default sets on main | `kernel/abi/src/ops.saw` l.741-744, l.768-792; `kernel/abi/src/rights.saw` l.630-700, l.1218-1250 |
+| `Allocate`'s decode and mint, `Extend`, `MemorySlot` | `kernel/core/dispatch.saw` l.3403-3420, l.3523-3560; `kernel/core/objects.saw` l.1116-1175 |
+| a reply carrying handles | `kernel/sysapi/src/pipe.saw` l.1440-1458 (`reply_with`) |
+| ceilings, gives and donations in the spec | spec.md l.1869-1940, l.2282-2300, l.4925-4950, l.5096-5160 |
+| the builder's ceilings, keep words, plan rows, the one-binding rule, `expect_build_error` | `tools/sosimage/src/declaration.saw` l.494-525, l.1019; `plan.saw` l.496-500, l.556-580; `imagefile.saw` l.462, l.483, l.604; `rights.saw` l.1-40; `tools/sos_runner.py` l.1473-1480 |
+| the runner's rights-word expectations the default sets change | `tools/sos_runner.py` l.5213-5911 (`1539`, `69123`) |
 | transports, addresses, lines, `dma-coherent` (every arm64 transport node, no riscv32 one), edge flag on arm64 | `-M virt,dumpdtb=...` with a `virtio-net-device` on both machines, `dtc -I dtb -O dts` (`so103a3/exp1.sh`, `rv.dts`, `a64.dts`) |
 | default bus placement; `force-legacy = true`; region 0x200 | HMP `info qtree` (exp1) |
 | `Version` 1 by default, 2 with `force-legacy=false`; `DeviceID` 1 at the device, 0 elsewhere; `bus=virtio-mmio-bus.0` places at 0x1000_1000 | HMP `xp /4wx` on a paused machine (exp1) |
 | QEMU's offered config (`mac`, `status` = 1, nothing past), `QueueNumMax` 256 | HMP `xp` at 0x10008100 and 0x10008034 with `force-legacy=false` (`so103a3/exp2.sh`) |
-| `host_mtu` offering `MTU` | QEMU's source, `virtio_net_device_realize`: `if (n->net_conf.mtu) n->host_features \|= (1ULL << VIRTIO_NET_F_MTU);` and `DEFINE_PROP_UINT16("host_mtu", VirtIONet, net_conf.mtu, 0)`. `so103a3/exp5.sh` reads the config with `host_mtu=1400`; it has not run, since the suite lock was held by another session throughout revision 2, and the A3-4 implementer runs it before writing `net_mtu`'s expected text |
+| `host_mtu` offering `MTU` | QEMU's source, `virtio_net_device_realize`: `if (n->net_conf.mtu) n->host_features \|= (1ULL << VIRTIO_NET_F_MTU);` and `DEFINE_PROP_UINT16("host_mtu", VirtIONet, net_conf.mtu, 0)`. `so103a3/exp5.sh` reads the config with `host_mtu=1400`; it has not run, since the suite lock was held by another session through revisions 2 and 3, and the A3-4 implementer runs it before writing `net_mtu`'s expected text |
 | `virtio-net-device` properties and defaults (`status`, `mrg_rxbuf`, `host_mtu`, `iommu_platform`, `mq`, `packed`) | `-device virtio-net-device,help` |
 | `-netdev stream` syntax (`inet` and `fd`), the 4-byte length framing, `connecting` at start, the NIC's link bit independent of the stream | `so103a3/exp3.py` with `filter-dump` |
 | paused start, `NETDEV_STREAM_CONNECTED`, `prelaunch` then `cont`; `-object monitor-qmp` | `so103a3/exp4.py`, `exp4b.py` |
 | QEMU source facts (irq level, `force-legacy` default, reset, ACK, no `VERSION_1` enforcement; RX drop of a frame that does not fit, header length, link status notify; stream `link_down` and framing; the PLIC's pending rule) | QEMU master `hw/virtio/virtio-mmio.c`, `hw/net/virtio-net.c`, `hw/intc/sifive_plic.c`, `net/stream.c`, `net/stream_data.c`, read online; line numbers approximate |
 | virtio 1.2 sections and quotes | OASIS virtio-v1.2-cs01 HTML, downloaded and converted to text (`so103a3/spec/v.txt`); every section number and quote here was found in it: §1.4, §2.1, §2.2.1, §2.4.1-2.4.2, §2.7, §2.7.4, §2.7.10.1, §2.7.13, §2.7.13.4.1, §2.7.14, §3.1.1, §4.2.2-4.2.4, §5.1.1-5.1.6, §6, §6.1 |
 | arm64 grant and device windows, table pool, RAM attributes | `hal/arm64/kernel/lib.saw` l.488-608, l.1085-1360, l.2060-2100 |
-| kernel Mapping ops, grant row's `pa`, the teardown's order and exit line | `kernel/core/dispatch.saw` l.3620-3760, `kernel/core/pslot.saw` l.116-119, `kernel/abi/src/ops.saw` l.809-853, `rights.saw` l.750-768, l.1264-1267, `kernel/core/sched.saw` l.641-700 |
-| builder binding of devices, pools, inputs; the one-binding rule; the plan's `Source.Row` | `tools/sosimage/src/imagefile.saw` l.1-80, l.455-490, l.815-1120; `plan.saw` l.455-520; `declaration.saw` l.1-120; `board.saw` l.1-120, l.655-720 |
+| the teardown's order and exit line | `kernel/core/sched.saw` l.641-700 |
 | the netstack's time use | `drivers/netstack/src/lib.saw` l.20-27, l.287-334, l.421-470, l.690-698; `arp.saw` l.99-226 |
 
 Each experiment ran under the sawos suite lock, taken with `mkdir` and given
