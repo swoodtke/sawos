@@ -408,7 +408,7 @@ handle:
 - The resolved address is the only pointer into a process's memory the
   kernel keeps. It is safe because the row cannot go before the body does
   (`remove_grant` is reached only from `unmap`, which removes `map` rows),
-  and the body's free clears `section_at`. Image rows are recorded first, so
+  and `link_process` clears `section_at` when a body is taken. Image rows are recorded first, so
   `remove_grant`'s compaction never moves one; the body records how many
   there are (`ProcessBody.image_rows`, set by `place_image`).
 
