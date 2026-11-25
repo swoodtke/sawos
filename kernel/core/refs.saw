@@ -648,8 +648,10 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             }
             // No quota is credited: an Interrupt is charged to nobody.
             INTERRUPTS[slot] = InterruptSlot(state: InterruptState.Free, line: 0,
-                                             pending: false, attachment: 0,
-                                             refs: 0)
+                                             pending: false, fired_at: 0,
+                                             bound_at: 0, fires: 0,
+                                             worst_ns: 0,
+                                             attachment: 0, refs: 0)
         },
         case Timer -> {
             if TIMERS[slot].attachment != 0 {
@@ -1470,7 +1472,8 @@ func reply_carries_handles(kind: WaitableKind, answer: &WaitAnswer) -> Bool {
 /// written `Ok`, and a waiter that frees a slot and waits again gets the same
 /// message. This has `revoke_blocked`'s shape: a delivered wake with a
 /// distinguishable status and no record.
-public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe -> SosStatus {
+public(package) func deliver_attachment(p: Int, t: Int, dst: UInt,
+                                         a: Int) unsafe -> SosStatus {
     let kind = ATTACHMENTS[a].kind
     let target = ATTACHMENTS[a].target
     let key = ATTACHMENTS[a].key
@@ -1483,6 +1486,7 @@ public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe -> Sos
     }
 
     let answer = waitable_answer(kind, target)
+    mark_interrupt_latency(kind, target, t)
     var rec = WaitPrefix(key: key, tag: answer.tag as UInt,
                          payload: answer.payload,
                          meta: PipeMsgMeta(len: answer.body_len as UInt8,
@@ -1517,6 +1521,31 @@ public(package) func deliver_attachment(p: Int, dst: UInt, a: Int) unsafe -> Sos
         unref_waitable(kind, target)
     }
     SosStatus.Ok
+}
+
+/// An Interrupt's fire is being delivered to thread `t`: owe it a latency
+/// reading, taken when it first returns to user mode
+/// (`sched.stamp_interrupt_latency`). The claim moves from the Interrupt into
+/// the thread, so a delivery of the same fire again (a `Wait` that finds it
+/// still pending) takes a zero and measures nothing, and a new claim before
+/// the thread runs is a fire of its own. Any other kind marks nothing.
+///
+/// `t` is always a thread: a wake passes the woken slot and the ready paths
+/// pass `CURRENT_THREAD`, which is set before any process runs and cleared
+/// only as the machine stops. The guard keeps a missing one from indexing
+/// the slab; no case reaches it.
+func mark_interrupt_latency(kind: WaitableKind, target: Int, t: Int) unsafe {
+    if t == NO_THREAD {
+        return
+    }
+    match kind {
+        case Interrupt -> {
+            THREADS[t].latency_irq = target + 1
+            THREADS[t].latency_from = INTERRUPTS[target].fired_at
+            INTERRUPTS[target].fired_at = 0
+        },
+        case _ -> {},
+    }
 }
 
 /// The delivery is the take: the completion-queue server's op, which takes a
@@ -1644,7 +1673,7 @@ public(package) func wake_one_waiter(w: Int, a: Int) unsafe {
         // status and an untouched buffer (`revoke_blocked`'s shape): the wake
         // is delivered either way, never a strand. The message stays staged
         // and its level raised, so waiting again is handed it.
-        let answered = deliver_attachment(p, dst, a)
+        let answered = deliver_attachment(p, slot, dst, a)
         write_result(frame_slot(slot), op_status(answered))
         THREADS[slot].state = ThreadState.Runnable
         ready_push(slot)

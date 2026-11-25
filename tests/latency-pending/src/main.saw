@@ -1,0 +1,134 @@
+// A fire found pending by a `Wait` is measured, once, and only when a thread
+// has it (spec §9).
+//
+// The line is the console UART's transmitter-empty source
+// (`tests/latency-line`). Here the fire arrives while nobody is parked: root
+// enables the source and spins until the kernel's interrupt count for the
+// process has risen, which says the trap that claimed the fire has finished
+// and the Interrupt is pending. Only then does it wait.
+//
+//   round one   The wait finds the fire pending and the record counts one
+//               fire. A second wait finds the same unacked fire again and
+//               counts nothing: the first one spent the stamp.
+//   round two   A second fire is claimed with no thread waiting. A read
+//               finds nothing counted (the thread's earlier mark is gone), a
+//               wait on an Event delivers a record of another kind and
+//               counts nothing, and the wait on the Interrupt counts the
+//               fire.
+//
+//   SOS latpend: a fire found pending is measured once
+//   SOS latpend: a fire is not measured before a thread has it
+//   SOS latpend: an Event's wait measures no fire
+//   SOS latpend: the late wait measures it
+//
+// No latency value is printed or compared: the interval holds the spin, which
+// depends on the host.
+
+import sos.{System, Process, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+static KEY_LINE: UInt = 71
+static KEY_EVENT: UInt = 72
+
+// The console UART's line and its transmitter-empty source, answered by the
+// target's own C file (`tests/latency-line`).
+extern "C" {
+    func latency_line() -> UInt
+    func latency_source_on()
+    func latency_source_off()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS latpend: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS latpend: failed: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS latpend: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Enable the source and spin until the kernel has taken the interrupt, then
+/// turn the source off. The wait is on the kernel's count of interrupts the
+/// process was interrupted by, which the claiming trap raises before the
+/// process runs again, so what follows finds the Interrupt pending.
+func fire_and_settle(proc: &Process) -> Result<Void, SosStatus> {
+    let before = try proc.stats()
+    latency_source_on()
+    var now = try proc.stats()
+    while now.interrupts == before.interrupts {
+        now = try proc.stats()
+    }
+    latency_source_off()
+    return
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var record = try proc.boot_handle_next()
+    guard let window = record.take_iomemory() else {
+        let _ = system.debug_print("SOS latpend: the boot record is no window\n")
+        return SosStatus.BadImage
+    }
+    let _mapping = try proc.map(iomemory: &window)
+
+    let irq = try system.interrupt_bind(line: latency_line())
+    let waiter = try proc.waiter_create()
+    try waiter.add(&irq, KEY_LINE)
+
+    try fire_and_settle(&proc)
+    let first = try waiter.wait()
+    let _ = move first
+    let second = try waiter.wait()
+    let _ = move second
+    try irq.ack()
+    let one = try irq.latency()
+    if one.fires != 1 || one.worst_ns == 0 {
+        print("SOS latpend: round one: fires={} worst_nonzero={}\n", one.fires,
+              one.worst_ns != 0)
+        return SosStatus.BadImage
+    }
+    let _ = system.debug_print("SOS latpend: a fire found pending is measured once\n")
+
+    try fire_and_settle(&proc)
+    let early = try irq.latency()
+    if early.fires != 0 {
+        print("SOS latpend: round two, before any wait: fires={}\n", early.fires)
+        return SosStatus.BadImage
+    }
+    let _ = system.debug_print("SOS latpend: a fire is not measured before a thread has it\n")
+
+    let event = try proc.event_create()
+    let other = try proc.waiter_create()
+    try other.add(&event, KEY_EVENT)
+    try event.signal(1)
+    let told = try other.wait()
+    let _ = move told
+    let between = try irq.latency()
+    if between.fires != 0 {
+        print("SOS latpend: after an Event's wait: fires={}\n", between.fires)
+        return SosStatus.BadImage
+    }
+    let _ = system.debug_print("SOS latpend: an Event's wait measures no fire\n")
+
+    let late = try waiter.wait()
+    let _ = move late
+    try irq.ack()
+    let two = try irq.latency()
+    if two.fires != 1 || two.worst_ns == 0 {
+        print("SOS latpend: round two: fires={} worst_nonzero={}\n", two.fires,
+              two.worst_ns != 0)
+        return SosStatus.BadImage
+    }
+    let _ = system.debug_print("SOS latpend: the late wait measures it\n")
+    return
+}

@@ -1,0 +1,344 @@
+// A thread's latency mark names an Interrupt slot, and the slot can be freed
+// and bound again before the thread runs (spec §9). The record counts only
+// fires delivered to the Interrupt's own waiters; and only an Interrupt's
+// delivery marks, whatever slot an Event of the same number holds.
+//
+// One process. A parker thread (MODE_PARK) waits once on the Waiter whose word
+// is in WAITER, then exits. Main fires the console UART's transmitter-empty
+// source (`tests/latency-line`) and waits on the kernel's interrupt count, so
+// the fire is claimed and the parker woken (and marked) while main runs on:
+// one level, no tick, so a wake never preempts and the parker runs only when
+// main yields.
+//
+//   control  the parker runs (stamps) before I is released; I2, bound in I's
+//            freed slot and fired with nobody waiting, reads fires=0
+//   stale    I is released and I2 bound in its slot and fired before the
+//            parker runs; then the parker runs. I2's fire was
+//            delivered to no thread, so it reads fires=0; then a wait of
+//            main's own finds it pending and measures it, fires=1
+//   kind1    an Event at slot 1 is delivered while an Interrupt at slot 1 has
+//            a claimed fire (slot 0 is a quiet line): fires=0
+//   kind2    an Event at slot 4, past the Interrupt slab, is delivered
+//
+// Every observed value is printed for a reader.
+
+import sos.{System, Process, Thread, SosStatus, ALL_RIGHTS,
+            sos_system_process_self, sos_system_interrupt_bind,
+            sos_process_waiter_create, sos_waiter_add, sos_waiter_wait,
+            sos_handle_release, sos_interrupt_latency}
+
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+static KEY_LINE: UInt = 61
+static KEY_OWN: UInt = 62
+static KEY_EVENT: UInt = 63
+
+/// A line both machines wire and that never asserts unasked.
+static QUIET_LINE: UInt = 5
+
+static MODE_PARK: UInt = 1
+unsafe static var MODE: UInt = 0
+unsafe static var WAITER: UInt = 0
+unsafe static var WOKE: UInt = 0
+unsafe static var WOKE_STATUS: UInt = 0
+
+static RECORD_WORDS: Int = 64
+unsafe static var WBUF: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+unsafe static var MBUF: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+unsafe static var READ_FIRES: UInt64 = 0
+unsafe static var READ_WORST: UInt64 = 0
+unsafe static var READ_STATUS: UInt = 0
+
+extern "C" {
+    func latency_line() -> UInt
+    func latency_source_on()
+    func latency_source_off()
+}
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+/// The parker's one act, chosen by MODE.
+func park_once() unsafe {
+    if MODE == MODE_PARK {
+        WOKE_STATUS = sos_waiter_wait(WAITER, (&var WBUF) as UnsafePointer<UInt>,
+                                      (RECORD_WORDS as UInt) * word_bytes())
+        WOKE = WOKE + 1
+    }
+}
+
+func worker() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    park_once()
+    let _ = (move me).exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker()
+    }
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS latstale: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc, boot_handle) catch {
+        print("SOS latstale: failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS latstale: done")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func raw_process(boot: UInt) unsafe -> UInt {
+    var proc: UInt = NONE
+    if sos_system_process_self(boot, ALL_RIGHTS as UInt,
+                               (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    proc
+}
+
+func bind_line(boot: UInt, line: UInt) unsafe -> UInt {
+    var h: UInt = NONE
+    if sos_system_interrupt_bind(boot, line, (&var h) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    h
+}
+
+func make_waiter(praw: UInt) unsafe -> UInt {
+    var h: UInt = NONE
+    if sos_process_waiter_create(praw, (&var h) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    h
+}
+
+/// Read and reset `irq`'s record into READ_FIRES and READ_WORST.
+func read_latency(irq: UInt) unsafe {
+    var rec: [UInt64; 2] = [0; 2]
+    READ_STATUS = sos_interrupt_latency(irq, (&var rec) as UnsafePointer<UInt64>)
+    READ_FIRES = rec[0]
+    READ_WORST = rec[1]
+}
+
+/// Enable the source and spin until the kernel has taken the interrupt, then
+/// turn the source off (as `latency_pending` does).
+func fire_and_settle(proc: &Process) -> Result<Void, SosStatus> {
+    let before = try proc.stats()
+    latency_source_on()
+    var now = try proc.stats()
+    while now.interrupts == before.interrupts {
+        now = try proc.stats()
+    }
+    latency_source_off()
+    return
+}
+
+func run(system: &System, proc: &Process, boot: UInt) -> Result<Void, SosStatus> {
+    var record = try proc.boot_handle_next()
+    guard let window = record.take_iomemory() else {
+        print("SOS latstale: the boot record is no window")
+        return SosStatus.BadImage
+    }
+    let _mapping = try proc.map(iomemory: &window)
+    let me = try proc.thread_self()
+    try rounds(&proc, &me, boot)
+    return
+}
+
+func rounds(proc: &Process, me: &Thread, boot: UInt) -> Result<Void, SosStatus> {
+    let praw = raw_process(boot)
+    if praw == NONE {
+        print("SOS latstale: no raw process handle")
+        return SosStatus.BadImage
+    }
+    try stale_round(&proc, &me, boot, praw, true, false)
+    try stale_round(&proc, &me, boot, praw, false, true)
+    try stale_round(&proc, &me, boot, praw, false, false)
+    try kind_rounds(&proc, boot)
+    return
+}
+
+/// `early`: the control, where the parker runs before I is released.
+/// `moved`: a quiet-line Interrupt takes I's freed slot first, so I2 lands in
+/// another slot (the stale round's attribution control).
+func stale_round(proc: &Process, me: &Thread, boot: UInt, praw: UInt,
+                 early: Bool, moved: Bool) unsafe -> Result<Void, SosStatus> {
+    let w = make_waiter(praw)
+    let i = bind_line(boot, latency_line())
+    if w == NONE || i == NONE {
+        print("SOS latstale: setup refused w={} i={}", w, i)
+        return SosStatus.BadImage
+    }
+    if sos_waiter_add(w, i, KEY_LINE, 0) != STATUS_OK {
+        print("SOS latstale: attach refused")
+        return SosStatus.BadImage
+    }
+    WAITER = w
+    MODE = MODE_PARK
+    WOKE = 0
+    let parker = try proc.thread_create(stack_top: stack_top(), arg: 1)
+    try parker.start()
+    // One level, no tick: the yield returns once the parker has parked.
+    try me.yield_now()
+    if WOKE != 0 {
+        print("SOS latstale: the parker did not park")
+        return SosStatus.BadImage
+    }
+    // I fires; the parker is woken and marked, and does not run yet.
+    try fire_and_settle(&proc)
+    if WOKE != 0 {
+        print("SOS latstale: the parker ran before the yield")
+        return SosStatus.BadImage
+    }
+    if early {
+        try me.yield_now()
+        print("SOS latstale: control: parker woke={} status={}", WOKE, WOKE_STATUS)
+        read_latency(i)
+        print("SOS latstale: control: I fires={} worst_nonzero={}", READ_FIRES,
+              READ_WORST != 0)
+        if READ_FIRES == 1 {
+            print("SOS latstale: control: the parker's run measured I's fire")
+        }
+    }
+    let rw = sos_handle_release(w)
+    let ri = sos_handle_release(i)
+    var blocker: UInt = NONE
+    if moved {
+        blocker = bind_line(boot, QUIET_LINE)
+        if blocker == NONE {
+            print("SOS latstale: moved: the blocker's bind was refused")
+            return SosStatus.BadImage
+        }
+    }
+    let i2 = bind_line(boot, latency_line())
+    if rw != STATUS_OK || ri != STATUS_OK || i2 == NONE {
+        print("SOS latstale: release or rebind refused rw={} ri={} i2={}", rw, ri, i2)
+        return SosStatus.BadImage
+    }
+    try fire_and_settle(&proc)
+    if WOKE != 0 && not early {
+        print("SOS latstale: the parker ran before the yield")
+        return SosStatus.BadImage
+    }
+    try me.yield_now()
+    let _ = try parker.join()
+    read_latency(i2)
+    if early {
+        print("SOS latstale: control: I2 fires={} worst_nonzero={} status={}",
+              READ_FIRES, READ_WORST != 0, READ_STATUS)
+        if READ_FIRES == 0 {
+            print("SOS latstale: control: I2 reads no fire")
+        }
+    } else {
+        let first = READ_FIRES
+        print("SOS latstale: moved={}: parker woke={} status={}", moved,
+              WOKE, WOKE_STATUS)
+        print("SOS latstale: moved={}: I2 fires={} worst_nonzero={} status={}",
+              moved, READ_FIRES, READ_WORST != 0, READ_STATUS)
+        // Main's own wait now finds I2's fire pending: it measures the fire.
+        let w2 = make_waiter(praw)
+        if w2 == NONE || sos_waiter_add(w2, i2, KEY_OWN, 0) != STATUS_OK {
+            print("SOS latstale: second waiter refused")
+            return SosStatus.BadImage
+        }
+        let ws = sos_waiter_wait(w2, (&var MBUF) as UnsafePointer<UInt>,
+                                 (RECORD_WORDS as UInt) * word_bytes())
+        read_latency(i2)
+        print("SOS latstale: moved={}: after main's own wait (status={} key={}) I2 fires={} worst_nonzero={}",
+              moved, ws, MBUF[0], READ_FIRES, READ_WORST != 0)
+        if first == 0 && READ_FIRES == 1 {
+            if moved {
+                print("SOS latstale: moved: I2 in another slot reads its own fire only")
+            } else {
+                print("SOS latstale: stale: I2 reads no fire before a thread has it, and main's own wait measures it")
+            }
+        }
+        let _ = sos_handle_release(w2)
+    }
+    let _ = sos_handle_release(i2)
+    if blocker != NONE {
+        let _ = sos_handle_release(blocker)
+    }
+    return
+}
+
+func kind_rounds(proc: &Process, boot: UInt) unsafe -> Result<Void, SosStatus> {
+    // Interrupt slot 0 on a quiet line, slot 1 on the UART's line.
+    let quiet = bind_line(boot, QUIET_LINE)
+    let ib = bind_line(boot, latency_line())
+    if quiet == NONE || ib == NONE {
+        print("SOS latstale: kind: binds refused")
+        return SosStatus.BadImage
+    }
+    try fire_and_settle(&proc)
+    // Events at slots 0 and 1; the one at slot 1 is delivered.
+    let e0 = try proc.event_create()
+    let e1 = try proc.event_create()
+    let wt = try proc.waiter_create()
+    try wt.add(event: &e1, key: KEY_EVENT)
+    try e1.signal(bits: 1)
+    let told = try wt.wait()
+    let _ = move told
+    read_latency(ib)
+    print("SOS latstale: kind1: Interrupt slot 1 fires={} status={}", READ_FIRES,
+          READ_STATUS)
+    if READ_FIRES == 0 {
+        print("SOS latstale: kind1: an Event's wait at a pending Interrupt's slot measures no fire")
+    }
+    // Events at slots 2, 3 and 4: slot 4 is past the four-slot Interrupt slab.
+    let e2 = try proc.event_create()
+    let e3 = try proc.event_create()
+    let e4 = try proc.event_create()
+    let wt2 = try proc.waiter_create()
+    try wt2.add(event: &e4, key: KEY_EVENT)
+    try e4.signal(bits: 1)
+    let told2 = try wt2.wait()
+    let _ = move told2
+    print("SOS latstale: kind2: an Event past the Interrupt slab measures nothing")
+    let _ = move e0
+    let _ = move e2
+    let _ = move e3
+    let _ = sos_handle_release(ib)
+    let _ = sos_handle_release(quiet)
+    return
+}

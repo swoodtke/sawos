@@ -1,0 +1,125 @@
+// A reply-wait whose wait leg finds an Interrupt's fire pending
+// (`pipe_reply_wait`'s ready path) measures it (spec §9).
+//
+// Root fires the UART's line with nobody waiting, so the Interrupt attached to
+// its Waiter is pending. It posts an empty message to itself, takes it, and
+// reply-waits through the request on that Waiter: the reply is written and the
+// wait leg is answered at once with the Interrupt's record. That wait
+// found the fire pending, so the record counts it, fires=1.
+
+import sos.{System, Process, SosStatus, ALL_RIGHTS, PIPE_MSG_HANDLES,
+            sos_system_process_self, sos_system_interrupt_bind,
+            sos_process_waiter_create, sos_waiter_add,
+            sos_process_pipe_create, sos_pipe_inlet_post, sos_pipe_outlet_take,
+            sos_pipe_request_reply_wait, sos_interrupt_latency}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+static KEY_LINE: UInt = 61
+
+static SEND_WORDS: Int = 2 + PIPE_MSG_HANDLES
+static REPLY_WAIT_WORDS: Int = 1 + SEND_WORDS
+static TAKE_WORDS: Int = 64
+
+extern "C" {
+    func latency_line() -> UInt
+    func latency_source_on()
+    func latency_source_off()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS latreply: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc, boot_handle) catch {
+        print("SOS latreply: failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS latreply: done")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func fire_and_settle(proc: &Process) -> Result<Void, SosStatus> {
+    let before = try proc.stats()
+    latency_source_on()
+    var now = try proc.stats()
+    while now.interrupts == before.interrupts {
+        now = try proc.stats()
+    }
+    latency_source_off()
+    return
+}
+
+func run(system: &System, proc: &Process, boot: UInt) -> Result<Void, SosStatus> {
+    var record = try proc.boot_handle_next()
+    guard let window = record.take_iomemory() else {
+        print("SOS latreply: the boot record is no window")
+        return SosStatus.BadImage
+    }
+    let _mapping = try proc.map(iomemory: &window)
+    try reply_round(&proc, boot)
+    return
+}
+
+func reply_round(proc: &Process, boot: UInt) unsafe -> Result<Void, SosStatus> {
+    var praw: UInt = NONE
+    var w: UInt = NONE
+    var i: UInt = NONE
+    let s1 = sos_system_process_self(boot, ALL_RIGHTS as UInt,
+                                     (&var praw) as UnsafePointer<UInt>)
+    let s2 = sos_process_waiter_create(praw, (&var w) as UnsafePointer<UInt>)
+    let s3 = sos_system_interrupt_bind(boot, latency_line(),
+                                       (&var i) as UnsafePointer<UInt>)
+    if (s1 != STATUS_OK || s2 != STATUS_OK || s3 != STATUS_OK
+            || sos_waiter_add(w, i, KEY_LINE, 0) != STATUS_OK) {
+        print("SOS latreply: setup refused")
+        return SosStatus.BadImage
+    }
+    try fire_and_settle(&proc)
+
+    var ends: [UInt; 2] = [NONE; 2]
+    if sos_process_pipe_create(praw, (&var ends) as UnsafePointer<UInt>,
+                               (2 * sizeof<UInt>()) as UInt) != STATUS_OK {
+        print("SOS latreply: no pipe")
+        return SosStatus.BadImage
+    }
+    var msg: [UInt; SEND_WORDS] = [NONE; SEND_WORDS]
+    var claim: UInt = NONE
+    if sos_pipe_inlet_post(ends[0], (&var msg) as UnsafePointer<UInt>,
+                           (SEND_WORDS * sizeof<UInt>()) as UInt,
+                           (&var claim) as UnsafePointer<UInt>) != STATUS_OK {
+        print("SOS latreply: post refused")
+        return SosStatus.BadImage
+    }
+    var take: [UInt; TAKE_WORDS] = [NONE; TAKE_WORDS]
+    if sos_pipe_outlet_take(ends[1], (&var take) as UnsafePointer<UInt>,
+                            (TAKE_WORDS * sizeof<UInt>()) as UInt) != STATUS_OK {
+        print("SOS latreply: take refused")
+        return SosStatus.BadImage
+    }
+    let request = take[0]
+
+    var args: [UInt; REPLY_WAIT_WORDS] = [NONE; REPLY_WAIT_WORDS]
+    args[0] = w
+    var rec: [UInt; TAKE_WORDS] = [NONE; TAKE_WORDS]
+    var leg: UInt = NONE
+    let rs = sos_pipe_request_reply_wait(request, (&var args) as UnsafePointer<UInt>,
+                                         (REPLY_WAIT_WORDS * sizeof<UInt>()) as UInt,
+                                         (&var rec) as UnsafePointer<UInt>,
+                                         (&var leg) as UnsafePointer<UInt>)
+    var lat: [UInt64; 2] = [0; 2]
+    let ls = sos_interrupt_latency(i, (&var lat) as UnsafePointer<UInt64>)
+    print("SOS latreply: reply_wait status={} leg={} key={}; fires={} worst_nonzero={} status={}",
+          rs, leg, rec[0], lat[0], lat[1] != 0, ls)
+    if rs == STATUS_OK && rec[0] == KEY_LINE && lat[0] == 1 {
+        print("SOS latreply: the reply-wait's ready leg measures the pending fire")
+    }
+    return
+}

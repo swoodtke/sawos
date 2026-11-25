@@ -43,7 +43,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable. Ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). The word is consumed by whoever takes it, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read and clear, so a value is reported exactly once. §2.2, §2.4. |
 | `Clock` | A granted time source — time is a capability, not an ambient facility. §2.6. |
 | `Timer` | Deadline object bound to the Clock that created it; directly waitable. The process-sleep primitive. §2.6. |
-| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it and ack through the handle. One op (`Ack`), two rights (`InterruptRight.Wait`/`.Ack`), created by `SystemOp.InterruptBind` on `SystemRight.InterruptBind`, because a line is a machine-wide resource (§2.8). The binding is the object's existence (creation takes the line, there is no rebind), which stops one handle naming two devices over its life. It has one name, its handle, and releasing that handle destroys it (§2.10). A line the board does not have, the timer's line, and a line already bound are all faults. §9. |
+| `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it and ack through the handle. Two ops (`Ack` and `Latency`), two rights (`InterruptRight.Wait`/`.Ack`), created by `SystemOp.InterruptBind` on `SystemRight.InterruptBind`, because a line is a machine-wide resource (§2.8). The binding is the object's existence (creation takes the line, there is no rebind), which stops one handle naming two devices over its life. It has one name, its handle, and releasing that handle destroys it (§2.10). A line the board does not have, the timer's line, and a line already bound are all faults. §9. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style). Ops `Add`/`Remove`/`Wait`; rights `WaiterRight.Attach`/`.Wait`; the wait answer is a copy-out record. §2.2. |
 | `Process` | Two entries: a small record (the state, the status word, the pid, the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit, fault or kill (§8) — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
 | `System` | Kernel singleton: the object behind system-scoped primitives, so that every syscall is an object op (§5.7). §2.8. |
@@ -4506,6 +4506,15 @@ death, its notification and its teardown holds for it.
   through §2.2's copy-out record. There is no fire count, because the
   mask-on-fire rule makes it always one; a dispatcher parked on several lines
   gets which one without a side table, exactly as it gets the key.
+- **Each line keeps its latency.** The kernel stamps each fire's claim and
+  the first return to user mode of the thread the fire is delivered to,
+  whether the fire woke it from a `Wait` or its `Wait` found the fire
+  pending, and keeps the count and the worst interval since the last read.
+  `InterruptOp.Latency` on `InterruptRight.Wait` answers both through a
+  copy-out record (`fires`, `worst_ns`, two doublewords) and resets them. A
+  thread at a lower level than the one running when the line fires waits for
+  it, and the interval says so. A refused record terminates the caller, as
+  for every record.
 - **An ack with no fire outstanding is a fault**, not a tolerated no-op. The
   only way to learn about a fire is to be told about one, so an extra ack is a
   servicer that will ack the next fire without servicing it — a dropped byte

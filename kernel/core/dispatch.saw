@@ -78,6 +78,8 @@ import sosabi.{
     wait_record_bytes,
     CLOCK_NOW_RECORD_DOUBLEWORDS,
     clock_now_record_bytes,
+    INTERRUPT_LATENCY_RECORD_DOUBLEWORDS,
+    interrupt_latency_record_bytes,
     TIMER_ARM_RECORD_DOUBLEWORDS,
     timer_arm_record_bytes,
     BOOT_HANDLE_RECORD_WORDS,
@@ -345,6 +347,7 @@ import kcore.sched.{
     fault_trap,
     pick_next,
     section_held,
+    stamp_interrupt_latency,
 }
 import kcore.mem.{word_bytes}
 
@@ -1622,7 +1625,7 @@ func process_start(caller: Int, child: Int,
                                process: child, exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
-                               call_len: 0, refs: 0)
+                               call_len: 0, latency_irq: 0, latency_from: 0, refs: 0)
     quota_charge(child, QuotaKind.Thread)
     ready_push(slot)
     PROCESS_RECORDS[child].state = ProcessState.Running
@@ -1958,7 +1961,9 @@ func interrupt_bind(p: Int, line: UInt) unsafe -> SyscallResult {
         return op_status(mint_refusal(p))
     }
     INTERRUPTS[slot] = InterruptSlot(state: InterruptState.Live, line: line,
-                                     pending: false, attachment: 0, refs: 1)
+                                     pending: false, fired_at: 0,
+                                     bound_at: hal.timer_now_ns(), fires: 0,
+                                     worst_ns: 0, attachment: 0, refs: 1)
     hal.irq_unmask(line)
     op_value(handle)
 }
@@ -2051,7 +2056,7 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
                                process: owner, exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
-                               call_len: 0, refs: 1)
+                               call_len: 0, latency_irq: 0, latency_from: 0, refs: 1)
     quota_charge(owner, QuotaKind.Thread)
     op_value(handle)
 }
@@ -2212,13 +2217,25 @@ func event_op_decoded(op: EventOp, obj: &EventObject, arg0: UInt,
 }
 
 /// The Interrupt object's ops (spec §2 table, §9).
-func interrupt_op(raw_op: UInt, obj: &InterruptObject) unsafe -> SyscallResult {
+func interrupt_op(raw_op: UInt, obj: &InterruptObject,
+                  arg0: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     guard let op = InterruptOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
-    return interrupt_op_decoded(op, &obj, p)
+    return interrupt_op_decoded(op, &obj, arg0, p)
 }
 
-func interrupt_op_decoded(op: InterruptOp, obj: &InterruptObject,
+/// The record `Interrupt.Latency` answers with, in kernel memory. Declaration
+/// order is the layout, as for `ClockNowRecord`.
+struct InterruptLatencyRecord {
+    fires: UInt64,
+    worst_ns: UInt64,
+}
+
+static_assert(sizeof<InterruptLatencyRecord>()
+              == INTERRUPT_LATENCY_RECORD_DOUBLEWORDS * sizeof<UInt64>(),
+              "the latency record must be exactly the doublewords sosabi publishes")
+
+func interrupt_op_decoded(op: InterruptOp, obj: &InterruptObject, arg0: UInt,
                           p: Int) unsafe -> SyscallResult {
     let target = obj.slot
 
@@ -2244,6 +2261,26 @@ func interrupt_op_decoded(op: InterruptOp, obj: &InterruptObject,
             }
             INTERRUPTS[target].pending = false
             hal.irq_unmask(INTERRUPTS[target].line)
+            op_ok()
+        },
+        // The line's latency since the last read, and the read resets it. The
+        // right is `Wait`: the holder that waits on the line is the one that
+        // can say what its waits cost. `arg0` is the record's address; its
+        // size is published, so no capacity rides along, and the copy door
+        // refuses an address the caller cannot be written to.
+        case Latency -> {
+            if not obj.allows(InterruptRight.Wait) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            var rec = InterruptLatencyRecord(fires: INTERRUPTS[target].fires,
+                                             worst_ns: INTERRUPTS[target].worst_ns)
+            if let why = copy_out(p, arg0,
+                                  ((&var rec) as UnsafePointer<InterruptLatencyRecord>) as UInt,
+                                  interrupt_latency_record_bytes() as UInt) {
+                fault_process(p, why)
+            }
+            INTERRUPTS[target].fires = 0
+            INTERRUPTS[target].worst_ns = 0
             op_ok()
         },
     }
@@ -2861,7 +2898,7 @@ func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
         // status and delivers nothing. The message stays staged and its level
         // stays raised, so a caller that frees a slot and waits again is handed
         // the same message.
-        return op_status(deliver_attachment(p, dst, ready))
+        return op_status(deliver_attachment(p, CURRENT_THREAD, dst, ready))
     }
     if CURRENT_THREAD == NO_THREAD {
         fault_process(p, FaultReason.BadState)
@@ -5088,7 +5125,8 @@ func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
         // delivered nothing. The value register stays zero, which is
         // `ReplyWaitLeg.Wait`: the reply was written, and it is the wait that
         // could not be served.
-        return op_status(deliver_attachment(p, rec_dst, ready))
+        return op_status(deliver_attachment(p, CURRENT_THREAD, rec_dst,
+                                            ready))
     }
     if CURRENT_THREAD == NO_THREAD {
         fault_process(p, FaultReason.BadState)
@@ -5224,7 +5262,7 @@ func dispatch(handle: UInt, op: UInt,
         case Interrupt -> {
             let obj = InterruptObject(handle: InterruptHandle(handle),
                                       rights: entry.rights, slot: entry.target)
-            interrupt_op(op, &obj)
+            interrupt_op(op, &obj, arg0)
         },
         case Clock -> {
             let obj = ClockObject(handle: ClockHandle(handle),
@@ -5392,7 +5430,9 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe -> UInt {
     if hal.is_interrupt(cause) {
         count_trap(TrapKind.Interrupt)
         service_irq(frame_addr, cause)
-        return pick_next(frame_addr)
+        let frame = pick_next(frame_addr)
+        stamp_interrupt_latency()
+        return frame
     }
 
     // A thread's first floating-point instruction traps, and the HAL gives it
@@ -5440,7 +5480,9 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe -> UInt {
     } else if parked_in_section() {
         fault_process(calling_process(), FaultReason.SectionHeld)
     }
-    pick_next(frame_addr)
+    let frame = pick_next(frame_addr)
+    stamp_interrupt_latency()
+    frame
 }
 
 /// Whether the syscall just dispatched parked its caller while the caller's

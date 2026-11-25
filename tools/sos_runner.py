@@ -275,6 +275,14 @@ UART_ECHO_NS16550_PKG = os.path.join(TESTS_DIR, "uart-echo-ns16550")
 UART_ECHO_PL011_PKG = os.path.join(TESTS_DIR, "uart-echo-pl011")
 IRQ_BADLINE_PKG = os.path.join(TESTS_DIR, "irq-badline")
 IRQ_EARLYACK_PKG = os.path.join(TESTS_DIR, "irq-earlyack")
+LATENCY_COUNTS_PKG = os.path.join(TESTS_DIR, "latency-counts")
+LATENCY_PENDING_PKG = os.path.join(TESTS_DIR, "latency-pending")
+LATENCY_DENIED_PKG = os.path.join(TESTS_DIR, "latency-denied")
+LATENCY_STALE_PKG = os.path.join(TESTS_DIR, "latency-stale")
+LATENCY_TEARDOWN_PKG = os.path.join(TESTS_DIR, "latency-teardown")
+LATENCY_PINS_PKG = os.path.join(TESTS_DIR, "latency-pins")
+LATENCY_DEATH_PKG = os.path.join(TESTS_DIR, "latency-death")
+LATENCY_REPLY_PKG = os.path.join(TESTS_DIR, "latency-reply")
 # With no line bound, "nothing runnable" is still a deadlock, and it stops the
 # machine.
 WAIT_DEADLOCK_PKG = os.path.join(TESTS_DIR, "wait-deadlock")
@@ -4002,6 +4010,159 @@ TEST_CASES = [
                        "SOS: process fault: object in the wrong state",
                        "SOS: process teardown handles={five} threads={one} "
                        "events={zero} waiters={zero} interrupts={one}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    # The Interrupt's latency record (spec §9). Each case's line is the
+    # console UART's transmitter-empty source, which asserts when it is
+    # enabled with the transmitter empty and falls when the process disables
+    # it (`tests/latency-line`, one C file per board), so each enable is one
+    # fire. None asserts a latency's value: a stalled host only lengthens an
+    # interval, so "the worst is not zero" is the one bound that holds.
+    {
+        # Four rounds of enable, wait, disable, ack: four fires counted, the
+        # worst above zero, and the read leaves the window empty. It runs on
+        # the ESP32-S3 too.
+        "name": "latency_counts",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LATENCY_COUNTS_PKG,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS latcount: the first read is empty",
+                       "SOS latcount: four fires measured, the worst above "
+                       "zero",
+                       "SOS latcount: the second read is empty",
+                       "SOS latcount: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A fire claimed while nobody waits, then found by a `Wait`: measured
+        # once, and not measured by a second wait on the same unacked fire,
+        # by a read before a thread has it, or by a wait on an Event. Each
+        # step waits on the kernel's count of interrupts taken, never the
+        # clock.
+        "name": "latency_pending",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LATENCY_PENDING_PKG,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS latpend: a fire found pending is measured once",
+                       "SOS latpend: a fire is not measured before a thread "
+                       "has it",
+                       "SOS latpend: an Event's wait measures no fire",
+                       "SOS latpend: the late wait measures it",
+                       "SOS latpend: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A thread's mark names an Interrupt slot, which can be freed and
+        # bound again before the thread runs: the new Interrupt's record holds
+        # only fires delivered to its own waiters. The control runs the parker
+        # before the release, `moved` puts the new Interrupt in another slot,
+        # and `stale` runs the parker after the rebind and the new fire. Then
+        # an Event delivered at an Interrupt's slot number, and one past the
+        # Interrupt slab, measure nothing.
+        "name": "latency_stale",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LATENCY_STALE_PKG,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS latstale: control: the parker's run measured I's "
+                       "fire",
+                       "SOS latstale: control: I2 reads no fire",
+                       "SOS latstale: moved: I2 in another slot reads its "
+                       "own fire only",
+                       "SOS latstale: stale: I2 reads no fire before a thread "
+                       "has it, and main's own wait measures it",
+                       "SOS latstale: kind1: an Event's wait at a pending "
+                       "Interrupt's slot measures no fire",
+                       "SOS latstale: kind2: an Event past the Interrupt slab "
+                       "measures nothing",
+                       "SOS latstale: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same, with the Interrupt freed by the teardown of the child
+        # that held its only handle.
+        "name": "latency_teardown",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LATENCY_TEARDOWN_PKG,
+        "children": [CHILD_IRQ_PKG],
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS lattear: I2 reads no fire before a thread has "
+                       "it, and main's own wait measures it",
+                       "SOS lattear: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Rules the other cases do not reach, in one process whose band map
+        # puts High above Normal: a read before the woken waiter runs, a High
+        # waiter that preempts at the interrupt's return, the worst keeping
+        # the longest interval (a bound in the passing direction alone), a
+        # second claim before the first is stamped, and a record at an address
+        # the process cannot write, which ends it.
+        "name": "latency_pins",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LATENCY_PINS_PKG,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS latpin: A: the interrupted thread reads no fire "
+                       "before the waiter runs",
+                       "SOS latpin: B: the preempting waiter's first read "
+                       "counts its fire",
+                       "SOS latpin: D: the worst is the longest interval",
+                       "SOS latpin: G: a second claim before the first is "
+                       "stamped is measured too",
+                       "SOS latpin: F: reading into a refused record",
+                       "SOS: process fault:"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A waiter woken while the scheduler picks a child to run first
+        # returns to user mode through `resume_after_death`, which stamps it.
+        "name": "latency_death",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LATENCY_DEATH_PKG,
+        "children": [CHILD_BYE_PKG],
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS latdeath: the waiter resumed after a death counts "
+                       "its fire on its first read",
+                       "SOS latdeath: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A reply-wait whose wait leg finds the fire pending measures it.
+        "name": "latency_reply",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LATENCY_REPLY_PKG,
+        "device": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS latreply: the reply-wait's ready leg measures the "
+                       "pending fire",
+                       "SOS latreply: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The latency record needs `InterruptRight.Wait`: a handle minted
+        # under a ceiling of `Ack` alone is refused, after a control read of a
+        # full handle succeeds.
+        "name": "latency_denied",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LATENCY_DENIED_PKG,
+        "expect_out": ["{banner}",
+                       "SOS latdeny: reading the record with Wait",
+                       "SOS latdeny: reading the record without Wait",
+                       "SOS: process fault: access denied"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
     },
@@ -20476,6 +20637,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #                      and cannot exit, and its lent handles panic
     #   main_not_imported  a `main` program that never imports `sosmain` is
     #                      refused at its link
+    #   latency_counts     an Interrupt's latency record counts four fires
+    #                      of UART0's transmit-FIFO-empty source and resets
+    #                      on its read
     #   output_lock_wait   a `_start` thread waits on the output lock with
     #                      no block
     #   thread_run         threads made with `thread_create(run:)`: joins,
@@ -20544,7 +20708,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "heap_rights", "heap_missing_slot", "heap_slot_bound",
                      "heap_wrong_free", "heap_zero_spent", "heap_main_err",
                      "heap_sizing", "handle_blocks_quota",
-                     "root_blocks_rows"]
+                     "root_blocks_rows", "latency_counts"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 

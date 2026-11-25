@@ -1,0 +1,283 @@
+// Rules of the latency record that the other cases do not reach (spec §9).
+// One process; root's band map puts High above Normal.
+//
+//   A  the interrupted thread reads the record after the fire and before the
+//      woken waiter runs: fires=0 (the stamp is the waiter's run)
+//   B  a High waiter, woken by a fire taken while a Normal thread runs,
+//      preempts at the interrupt's return; its first call reads the record:
+//      fires=1 (stamped at its first return to user mode, the interrupt tail)
+//   D  a fire whose waiter is held off for HOLD_NS of guest time, measured on
+//      the Clock, then a fire whose waiter runs at once: worst >= HOLD_NS
+//      (the largest is kept, and the stamp reads the clock). A host stall
+//      only lengthens the hold's interval, so the bound holds in the
+//      passing direction alone.
+//   G  a second claim before the first is stamped: the waiter woken by the
+//      first fire is held off while the second fire is claimed and found
+//      pending by a wait of main's own: fires=2
+//   F  a record at an address the process cannot write: the process ends
+//
+import sos.{System, Process, Thread, Clock, SosStatus, Priority, ALL_RIGHTS,
+            sos_system_process_self, sos_system_interrupt_bind,
+            sos_process_waiter_create, sos_waiter_add, sos_waiter_wait,
+            sos_handle_release, sos_interrupt_latency, sos_interrupt_ack}
+
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+static KEY_LINE: UInt = 61
+
+/// How long D's first waiter is held off, in guest nanoseconds.
+static HOLD_NS: UInt64 = 5_000_000
+
+static MODE_PARK: UInt = 1
+static MODE_PARK_READ: UInt = 2
+unsafe static var MODE: UInt = 0
+unsafe static var WAITER: UInt = 0
+unsafe static var IRQ_WORD: UInt = 0
+unsafe static var WOKE: UInt = 0
+unsafe static var P_FIRES: UInt64 = 0
+
+static RECORD_WORDS: Int = 64
+unsafe static var WBUF: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+unsafe static var READ_FIRES: UInt64 = 0
+unsafe static var READ_WORST: UInt64 = 0
+unsafe static var READ_STATUS: UInt = 0
+
+extern "C" {
+    func latency_line() -> UInt
+    func latency_source_on()
+    func latency_source_off()
+}
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+func park_once() unsafe {
+    let _ = sos_waiter_wait(WAITER, (&var WBUF) as UnsafePointer<UInt>,
+                            (RECORD_WORDS as UInt) * word_bytes())
+    if MODE == MODE_PARK_READ {
+        var rec: [UInt64; 2] = [0; 2]
+        let _ = sos_interrupt_latency(IRQ_WORD, (&var rec) as UnsafePointer<UInt64>)
+        P_FIRES = rec[0]
+    }
+    WOKE = WOKE + 1
+}
+
+func worker() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    park_once()
+    let _ = (move me).exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker()
+    }
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS latpin: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc, boot_handle) catch {
+        print("SOS latpin: failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS latpin: done")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func raw_process(boot: UInt) unsafe -> UInt {
+    var proc: UInt = NONE
+    if sos_system_process_self(boot, ALL_RIGHTS as UInt,
+                               (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    proc
+}
+
+func bind_line(boot: UInt, line: UInt) unsafe -> UInt {
+    var h: UInt = NONE
+    if sos_system_interrupt_bind(boot, line, (&var h) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    h
+}
+
+func make_waiter(praw: UInt) unsafe -> UInt {
+    var h: UInt = NONE
+    if sos_process_waiter_create(praw, (&var h) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    h
+}
+
+func read_latency(irq: UInt) unsafe {
+    var rec: [UInt64; 2] = [0; 2]
+    READ_STATUS = sos_interrupt_latency(irq, (&var rec) as UnsafePointer<UInt64>)
+    READ_FIRES = rec[0]
+    READ_WORST = rec[1]
+}
+
+func fire_and_settle(proc: &Process) -> Result<Void, SosStatus> {
+    let before = try proc.stats()
+    latency_source_on()
+    var now = try proc.stats()
+    while now.interrupts == before.interrupts {
+        now = try proc.stats()
+    }
+    latency_source_off()
+    return
+}
+
+func run(system: &System, proc: &Process, boot: UInt) -> Result<Void, SosStatus> {
+    var record = try proc.boot_handle_next()
+    guard let window = record.take_iomemory() else {
+        print("SOS latpin: the boot record is no window")
+        return SosStatus.BadImage
+    }
+    let _mapping = try proc.map(iomemory: &window)
+    let me = try proc.thread_self()
+    let clock = try system.clock_get()
+    let praw = raw_process(boot)
+    let w = make_waiter(praw)
+    let i = bind_line(boot, latency_line())
+    try pins(&proc, &me, &clock, praw, w, i)
+    return
+}
+
+/// Start a parker in `mode` at `band`; a Normal one is let park by a yield.
+func start_parker(proc: &Process, me: &Thread, mode: UInt,
+                  band: Priority) unsafe -> Result<Thread, SosStatus> {
+    MODE = mode
+    WOKE = 0
+    let parker = try proc.thread_create(stack_top: stack_top(), arg: 1)
+    try parker.start(band: band)
+    try me.yield_now()
+    if WOKE != 0 {
+        print("SOS latpin: the parker did not park")
+        return SosStatus.BadImage
+    }
+    return move parker
+}
+
+func pins(proc: &Process, me: &Thread, clock: &Clock, praw: UInt, w: UInt,
+          i: UInt) unsafe -> Result<Void, SosStatus> {
+    if (praw == NONE || w == NONE || i == NONE
+            || sos_waiter_add(w, i, KEY_LINE, 0) != STATUS_OK) {
+        print("SOS latpin: setup refused")
+        return SosStatus.BadImage
+    }
+    WAITER = w
+    IRQ_WORD = i
+
+    // A
+    let pa = try start_parker(&proc, &me, MODE_PARK, Priority.Normal)
+    try fire_and_settle(&proc)
+    read_latency(i)
+    let before_run = READ_FIRES
+    try me.yield_now()
+    let _ = try pa.join()
+    read_latency(i)
+    print("SOS latpin: A: before the waiter ran fires={}, after fires={}",
+          before_run, READ_FIRES)
+    if before_run == 0 && READ_FIRES == 1 {
+        print("SOS latpin: A: the interrupted thread reads no fire before the waiter runs")
+    }
+    let _ = sos_interrupt_ack(i)
+
+    // B
+    let pb = try start_parker(&proc, &me, MODE_PARK_READ, Priority.High)
+    P_FIRES = 99
+    try fire_and_settle(&proc)
+    let _ = try pb.join()
+    read_latency(i)
+    print("SOS latpin: B: the waiter's first read fires={}, main's read after fires={}",
+          P_FIRES, READ_FIRES)
+    if P_FIRES == 1 {
+        print("SOS latpin: B: the preempting waiter's first read counts its fire")
+    }
+    let _ = sos_interrupt_ack(i)
+
+    // D
+    let pd1 = try start_parker(&proc, &me, MODE_PARK, Priority.Normal)
+    try fire_and_settle(&proc)
+    let t0 = try clock.now()
+    var t = try clock.now()
+    while t - t0 < HOLD_NS {
+        t = try clock.now()
+    }
+    try me.yield_now()
+    let _ = try pd1.join()
+    let _ = sos_interrupt_ack(i)
+    let pd2 = try start_parker(&proc, &me, MODE_PARK, Priority.Normal)
+    try fire_and_settle(&proc)
+    try me.yield_now()
+    let _ = try pd2.join()
+    let _ = sos_interrupt_ack(i)
+    read_latency(i)
+    print("SOS latpin: D: fires={} worst_at_least_hold={}", READ_FIRES,
+          READ_WORST >= HOLD_NS)
+    if READ_FIRES == 2 && READ_WORST >= HOLD_NS {
+        print("SOS latpin: D: the worst is the longest interval")
+    }
+
+    // G
+    let pg = try start_parker(&proc, &me, MODE_PARK, Priority.Normal)
+    try fire_and_settle(&proc)
+    let ga = sos_interrupt_ack(i)
+    try fire_and_settle(&proc)
+    try me.yield_now()
+    let _ = try pg.join()
+    let gw = sos_waiter_wait(w, (&var WBUF) as UnsafePointer<UInt>,
+                             (RECORD_WORDS as UInt) * word_bytes())
+    let gb = sos_interrupt_ack(i)
+    read_latency(i)
+    print("SOS latpin: G: acks {} {} wait {} fires={} worst_nonzero={}", ga, gb,
+          gw, READ_FIRES, READ_WORST != 0)
+    if READ_FIRES == 2 {
+        print("SOS latpin: G: a second claim before the first is stamped is measured too")
+    }
+
+    // F, last: the process does not survive it.
+    print("SOS latpin: F: reading into a refused record")
+    let bad: UInt = 16
+    let fs = sos_interrupt_latency(i, bad as UnsafePointer<UInt64>)
+    print("SOS latpin: F: UNREACHABLE the refused record was answered status={}", fs)
+    return
+}

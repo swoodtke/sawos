@@ -1,0 +1,64 @@
+// Reading an Interrupt's latency record needs `InterruptRight.Wait` (spec §9).
+//
+// Root reads the record of an Interrupt it holds in full, as the control: an
+// empty window, no refusal. It then narrows its ceiling for Interrupts to
+// `Ack` alone, so the next Interrupt the kernel mints into its table carries
+// no `Wait`, binds a second line and reads that one's record, which is a
+// missing right and so a fault.
+//
+//   SOS latdeny: reading the record with Wait
+//   SOS latdeny: reading the record without Wait
+//   SOS: process fault: access denied
+
+import sos.{System, InterruptRight}
+
+static EXIT_FAILED: UInt = 1
+
+/// Two lines both machines wire and neither asserts unasked.
+static FIRST_LINE: UInt = 5
+static SECOND_LINE: UInt = 6
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS latdeny: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let full = try system.interrupt_bind(line: FIRST_LINE) catch {
+        print("SOS latdeny: no interrupt: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS latdeny: reading the record with Wait\n")
+    let record = try full.latency() catch {
+        print("SOS latdeny: the control was refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    if record.fires != 0 {
+        let _ = system.debug_print("SOS latdeny: the control read a fire\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+
+    try proc.restrict_rights(interrupt: InterruptRight.Ack as UInt32) catch {
+        print("SOS latdeny: narrowing refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let narrow = try system.interrupt_bind(line: SECOND_LINE) catch {
+        print("SOS latdeny: the second bind was refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS latdeny: reading the record without Wait\n")
+
+    // Does not return: the kernel terminates this process.
+    let _ = narrow.latency()
+
+    let _ = system.debug_print("SOS latdeny: UNREACHABLE the read went through\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

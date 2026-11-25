@@ -3,11 +3,25 @@
 //!
 //! Two operations wide: attach it to a Waiter and park, then `ack` when the
 //! device has been serviced. The attach is the Waiter's, in `sos.waiter`; the
-//! ack is here, with the object it ends a fire on.
+//! ack is here, with the object it ends a fire on. A third call, `latency`,
+//! reads what the line's fires cost.
 
-import sosabi.{SosStatus, InterruptHandle, NO_HANDLE}
+import sosabi.{SosStatus, InterruptHandle, NO_HANDLE,
+               INTERRUPT_LATENCY_RECORD_DOUBLEWORDS,
+               INTERRUPT_LATENCY_FIRES_SLOT, INTERRUPT_LATENCY_WORST_SLOT}
 
-import sos.floor.{checked, sos_handle_release, sos_interrupt_ack, handle_rights}
+import sos.floor.{checked, sos_handle_release, sos_interrupt_ack,
+                  sos_interrupt_latency, handle_rights}
+
+/// What `Interrupt.latency` reads: the fires the kernel measured since the
+/// last read, and the longest interval among them in nanoseconds.
+///
+/// Plain data, a fact taken, on the automatic `Copy` tier. `UInt64` on every
+/// profile, for `ProcessStats`' reason.
+public struct InterruptLatency {
+    public fires: UInt64,
+    public worst_ns: UInt64,
+}
 
 /// A handle to an Interrupt, an IRQ line bound to a waitable.
 ///
@@ -81,4 +95,29 @@ extension Interrupt {
     public func ack(&self) -> Result<Void, SosStatus> {
         checked(sos_interrupt_ack(self.handle))
     }
+
+    /// Read and reset this line's latency record (spec §9). Requires
+    /// `InterruptRight.Wait`.
+    ///
+    /// Each fire is measured from the kernel's claim of it to the first
+    /// return to user mode of the thread it was delivered to, whether that
+    /// thread was parked on the line or its wait found the fire pending. The
+    /// answer is how many fires were measured since the last read and the
+    /// longest interval, in nanoseconds. A window with no fire reads zero in
+    /// both. The interval includes the wait for a thread at a higher level,
+    /// so it is what the board sees and not the kernel's own path.
+    ///
+    /// The out-buffer is this frame's, as for `Clock.now`.
+    public func latency(&self) -> Result<InterruptLatency, SosStatus> {
+        latency_into_frame(self.handle)
+    }
+}
+
+/// The `unsafe` half of `Interrupt.latency`, confined to one small named
+/// helper. The buffer's address never leaves it.
+func latency_into_frame(handle: InterruptHandle) unsafe -> Result<InterruptLatency, SosStatus> {
+    var buf: [UInt64; INTERRUPT_LATENCY_RECORD_DOUBLEWORDS] = [0; INTERRUPT_LATENCY_RECORD_DOUBLEWORDS]
+    try checked(sos_interrupt_latency(handle, (&var buf) as UnsafePointer<UInt64>))
+    return InterruptLatency(fires: buf[INTERRUPT_LATENCY_FIRES_SLOT],
+                            worst_ns: buf[INTERRUPT_LATENCY_WORST_SLOT])
 }

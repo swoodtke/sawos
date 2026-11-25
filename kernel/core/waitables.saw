@@ -168,6 +168,21 @@ public(package) struct InterruptSlot {
     public(package) line: UInt,
     /// Fired and not yet acked. Non-false = ready, in §2.2's sense.
     public(package) pending: Bool,
+    /// When the kernel claimed the fire that no thread has been given yet, in
+    /// `hal.timer_now_ns()` time; 0 when there is none. Delivering the fire to
+    /// a thread (`mark_interrupt_latency`) moves it into the thread and
+    /// clears it here, so a fire is measured once however many waits find it
+    /// pending, and a later claim finds the field free.
+    public(package) fired_at: UInt64,
+    /// When this Interrupt was bound. A thread's mark names a slot, and the
+    /// slot can be freed and bound again before the thread runs; a claim
+    /// older than the binding belongs to the Interrupt that was there, and
+    /// is not counted (`stamp_interrupt_latency`).
+    public(package) bound_at: UInt64,
+    /// Fires measured since the last `InterruptOp.Latency` read.
+    public(package) fires: UInt64,
+    /// The longest interval measured since that read, in nanoseconds.
+    public(package) worst_ns: UInt64,
     /// The attachment naming this interrupt (slot + 1); 0 = unattached.
     public(package) attachment: Int,
     /// Handle entries naming this interrupt, plus the staged message that
@@ -308,7 +323,9 @@ public(package) unsafe static var WAITERS: Slab<WaiterSlot, MAX_WAITERS> = Slab<
 
 public(package) unsafe static var INTERRUPTS: Slab<InterruptSlot, MAX_INTERRUPTS> = Slab<InterruptSlot, MAX_INTERRUPTS>(
     inline: [InterruptSlot(state: InterruptState.Free, line: 0,
-                           pending: false, attachment: 0,
+                           pending: false, fired_at: 0, bound_at: 0, fires: 0,
+                           worst_ns: 0,
+                           attachment: 0,
                            refs: 0); MAX_INTERRUPTS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],

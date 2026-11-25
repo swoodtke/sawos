@@ -86,6 +86,7 @@ import kcore.waitables.{
     ATTACHMENTS,
     Attachment,
     EVENTS,
+    INTERRUPTS,
     WAITERS,
     WaitableKind,
     WaiterSlot,
@@ -145,6 +146,54 @@ func run_thread(next: Int) unsafe -> UInt {
     let frame = frame_slot(next)
     hal.fp_switch_in(frame)
     frame
+}
+
+/// Take the running thread's owed latency reading, if it has one: the fire
+/// delivered to it (`ThreadSlot.latency_irq`) has now reached user mode.
+///
+/// Called at the two places a thread goes back to user mode, `ktrap`'s tail
+/// (after `pick_next` has chosen who runs) and `resume_after_death`. For a
+/// thread that is owed nothing it is one compare.
+///
+/// The interval runs from the claim the thread took at the mark
+/// (`ThreadSlot.latency_from`) to now and includes everything between: the
+/// rest of the trap, any kernel operation still running, the wait at the
+/// thread's level, and the switch. A zero claim is a delivery of a fire some
+/// thread already has; it is older than every binding, so it measures
+/// nothing.
+///
+/// The mark names a slot, and the slot can be freed and bound again before
+/// the thread runs. A claim older than the slot's binding (`bound_at`) is the
+/// old Interrupt's fire and is dropped, so the new Interrupt's counts hold
+/// only fires delivered to its own waiters.
+///
+/// A thread always exists here: `CURRENT_THREAD` is set before any process
+/// runs and cleared only as the machine stops. The guard keeps a missing one
+/// from indexing the slab; no case reaches it.
+public(package) func stamp_interrupt_latency() unsafe {
+    let t = CURRENT_THREAD
+    if t == NO_THREAD {
+        return
+    }
+    let mark = THREADS[t].latency_irq
+    if mark == 0 {
+        return
+    }
+    let from = THREADS[t].latency_from
+    THREADS[t].latency_irq = 0
+    let i = mark - 1
+    if from < INTERRUPTS[i].bound_at {
+        return
+    }
+    let now = hal.timer_now_ns()
+    var took: UInt64 = 0
+    if now > from {
+        took = now - from
+    }
+    INTERRUPTS[i].fires = INTERRUPTS[i].fires &+ 1
+    if took > INTERRUPTS[i].worst_ns {
+        INTERRUPTS[i].worst_ns = took
+    }
 }
 
 /// Choose the thread to run next and return the frame to resume in.
@@ -292,7 +341,9 @@ func idle_until_runnable() unsafe {
 /// notifies before tearing down), so `ready_pop` finds root and this arm is not
 /// reached. What does reach it is a genuine deadlock.
 func resume_after_death() unsafe -> Never {
-    hal.resume_frame(run_thread(take_next()))
+    let frame = run_thread(take_next())
+    stamp_interrupt_latency()
+    hal.resume_frame(frame)
 }
 
 // =============================================================================
@@ -549,7 +600,7 @@ func invalidate_thread(t: Int, p: Int) unsafe {
     THREADS[t] = ThreadSlot(state: ThreadState.Invalid, level: 0, process: p,
                             exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
                             call_pipe: 0, call_claim: 0, call_src: 0,
-                            call_len: 0, refs: refs)
+                            call_len: 0, latency_irq: 0, latency_from: 0, refs: refs)
 }
 
 /// Invalidate Waiter `w` of dying process `p` (spec §2.10): it stays, for the

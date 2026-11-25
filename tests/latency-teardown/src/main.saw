@@ -1,0 +1,272 @@
+// The stale mark across a process teardown (spec §9): the Interrupt a woken
+// thread was marked by is freed by its holder's teardown, not by a release.
+//
+// Root binds the UART's line (Interrupt I), attaches it one-shot to its own
+// Waiter, and gives I to a child it created and never starts, so the child
+// holds I's only handle. Root's parker thread parks on the Waiter. Root fires
+// the source: the parker is woken and marked, and the one-shot attachment
+// ends at that delivery. Root then releases its only handle to the child,
+// whose teardown destroys and frees I. Root binds I2 on the same line (I's
+// freed slot) and fires it with nobody waiting, and only then lets the parker
+// run. I2's fire reached no thread, so it reads fires=0; then main's
+// own wait finds it pending and measures it, fires=1.
+
+import sos.{System, Process, Thread, SosStatus, ALL_RIGHTS,
+            sos_system_process_self, sos_system_interrupt_bind,
+            sos_system_process_create, sos_process_give,
+            sos_process_boot_handle_next,
+            sos_process_waiter_create, sos_waiter_add, sos_waiter_wait,
+            sos_handle_release, sos_interrupt_latency}
+
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+static KEY_LINE: UInt = 61
+static KEY_OWN: UInt = 62
+static TAG_LINE: UInt = 31
+
+/// `WAITER_ADD_ONESHOT`.
+static ONESHOT: UInt = 1
+
+static MODE_PARK: UInt = 1
+unsafe static var MODE: UInt = 0
+unsafe static var WAITER: UInt = 0
+unsafe static var WOKE: UInt = 0
+unsafe static var WOKE_STATUS: UInt = 0
+
+static RECORD_WORDS: Int = 64
+unsafe static var WBUF: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+unsafe static var MBUF: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+unsafe static var READ_FIRES: UInt64 = 0
+unsafe static var READ_WORST: UInt64 = 0
+unsafe static var READ_STATUS: UInt = 0
+
+extern "C" {
+    func latency_line() -> UInt
+    func latency_source_on()
+    func latency_source_off()
+}
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+func park_once() unsafe {
+    if MODE == MODE_PARK {
+        WOKE_STATUS = sos_waiter_wait(WAITER, (&var WBUF) as UnsafePointer<UInt>,
+                                      (RECORD_WORDS as UInt) * word_bytes())
+        WOKE = WOKE + 1
+    }
+}
+
+func worker() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    park_once()
+    let _ = (move me).exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker()
+    }
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS lattear: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc, boot_handle) catch {
+        print("SOS lattear: failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS lattear: done")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func raw_process(boot: UInt) unsafe -> UInt {
+    var proc: UInt = NONE
+    if sos_system_process_self(boot, ALL_RIGHTS as UInt,
+                               (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    proc
+}
+
+/// The handle word of this process's next boot record.
+func boot_record(praw: UInt) unsafe -> UInt {
+    var rec: [UInt; 3] = [0; 3]
+    if sos_process_boot_handle_next(praw, (&var rec) as UnsafePointer<UInt>,
+                                    3 * word_bytes()) != STATUS_OK {
+        return NONE
+    }
+    rec[2]
+}
+
+func bind_line(boot: UInt, line: UInt) unsafe -> UInt {
+    var h: UInt = NONE
+    if sos_system_interrupt_bind(boot, line, (&var h) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    h
+}
+
+func make_waiter(praw: UInt) unsafe -> UInt {
+    var h: UInt = NONE
+    if sos_process_waiter_create(praw, (&var h) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    h
+}
+
+func create_child(boot: UInt, image: UInt, dest: UInt) unsafe -> UInt {
+    var h: UInt = NONE
+    if sos_system_process_create(boot, image, dest, 0,
+                                 (&var h) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    h
+}
+
+func read_latency(irq: UInt) unsafe {
+    var rec: [UInt64; 2] = [0; 2]
+    READ_STATUS = sos_interrupt_latency(irq, (&var rec) as UnsafePointer<UInt64>)
+    READ_FIRES = rec[0]
+    READ_WORST = rec[1]
+}
+
+func fire_and_settle(proc: &Process) -> Result<Void, SosStatus> {
+    let before = try proc.stats()
+    latency_source_on()
+    var now = try proc.stats()
+    while now.interrupts == before.interrupts {
+        now = try proc.stats()
+    }
+    latency_source_off()
+    return
+}
+
+func run(system: &System, proc: &Process, boot: UInt) -> Result<Void, SosStatus> {
+    let praw = raw_process(boot)
+    if praw == NONE {
+        print("SOS lattear: no raw process handle")
+        return SosStatus.BadImage
+    }
+    // The region table lists the child's image, its destination, then the
+    // device window.
+    let image = boot_record(praw)
+    let dest = boot_record(praw)
+    var record = try proc.boot_handle_next()
+    guard let window = record.take_iomemory() else {
+        print("SOS lattear: the third boot record is no window")
+        return SosStatus.BadImage
+    }
+    let _mapping = try proc.map(iomemory: &window)
+    let me = try proc.thread_self()
+    try teardown_round(&proc, &me, boot, praw, image, dest)
+    return
+}
+
+func teardown_round(proc: &Process, me: &Thread, boot: UInt, praw: UInt,
+                    image: UInt, dest: UInt) unsafe -> Result<Void, SosStatus> {
+    let child = create_child(boot, image, dest)
+    let w = make_waiter(praw)
+    let i = bind_line(boot, latency_line())
+    if child == NONE || w == NONE || i == NONE {
+        print("SOS lattear: setup refused child={} w={} i={}", child, w, i)
+        return SosStatus.BadImage
+    }
+    if sos_waiter_add(w, i, KEY_LINE, ONESHOT) != STATUS_OK {
+        print("SOS lattear: attach refused")
+        return SosStatus.BadImage
+    }
+    let given = sos_process_give(child, i, TAG_LINE, ALL_RIGHTS as UInt)
+    if given != STATUS_OK {
+        print("SOS lattear: give refused status={}", given)
+        return SosStatus.BadImage
+    }
+    WAITER = w
+    MODE = MODE_PARK
+    WOKE = 0
+    let parker = try proc.thread_create(stack_top: stack_top(), arg: 1)
+    try parker.start()
+    try me.yield_now()
+    if WOKE != 0 {
+        print("SOS lattear: the parker did not park")
+        return SosStatus.BadImage
+    }
+    try fire_and_settle(&proc)
+    if WOKE != 0 {
+        print("SOS lattear: the parker ran before the teardown")
+        return SosStatus.BadImage
+    }
+    // The child's only name: its teardown destroys and frees I.
+    let rc = sos_handle_release(child)
+    let i2 = bind_line(boot, latency_line())
+    if rc != STATUS_OK || i2 == NONE {
+        print("SOS lattear: release or rebind refused rc={} i2={}", rc, i2)
+        return SosStatus.BadImage
+    }
+    try fire_and_settle(&proc)
+    if WOKE != 0 {
+        print("SOS lattear: the parker ran before the yield")
+        return SosStatus.BadImage
+    }
+    try me.yield_now()
+    let _ = try parker.join()
+    print("SOS lattear: parker woke={} status={} key={}", WOKE, WOKE_STATUS, WBUF[0])
+    read_latency(i2)
+    let first = READ_FIRES
+    print("SOS lattear: I2 fires={} worst_nonzero={} status={}", READ_FIRES,
+          READ_WORST != 0, READ_STATUS)
+    let w2 = make_waiter(praw)
+    if w2 == NONE || sos_waiter_add(w2, i2, KEY_OWN, 0) != STATUS_OK {
+        print("SOS lattear: second waiter refused")
+        return SosStatus.BadImage
+    }
+    let ws = sos_waiter_wait(w2, (&var MBUF) as UnsafePointer<UInt>,
+                             (RECORD_WORDS as UInt) * word_bytes())
+    read_latency(i2)
+    print("SOS lattear: after main's own wait (status={} key={}) I2 fires={} worst_nonzero={}",
+          ws, MBUF[0], READ_FIRES, READ_WORST != 0)
+    if first == 0 && READ_FIRES == 1 {
+        print("SOS lattear: I2 reads no fire before a thread has it, and main's own wait measures it")
+    }
+    let _ = sos_handle_release(w2)
+    let _ = sos_handle_release(i2)
+    let _ = sos_handle_release(w)
+    return
+}

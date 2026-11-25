@@ -260,6 +260,11 @@ static IDLE_PC: UInt = 0
 /// is woken with the record, and one that has not waited yet finds `pending`
 /// set by its own next `Wait`.
 ///
+/// The fire's claim is stamped (`fired_at`) before anything else can run: the
+/// latency record measures from here to the first return to user mode of the
+/// thread the fire is delivered to (`deliver_attachment` marks it,
+/// `stamp_interrupt_latency` reads the clock again).
+///
 /// A line nothing is bound to is reported and left masked, the only safe
 /// answer: the kernel cannot service a device it has no driver for, and an
 /// unmasked line with nobody to ack it would re-fire forever. This is also the
@@ -274,6 +279,7 @@ func on_external_irq(line: UInt) unsafe {
         uart.write_str("\n")
         return
     }
+    INTERRUPTS[irq].fired_at = hal.timer_now_ns()
     INTERRUPTS[irq].pending = true
     notify_ready(WaitableKind.Interrupt, irq)
 }

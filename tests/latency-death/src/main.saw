@@ -1,0 +1,227 @@
+// A woken waiter whose first return to user mode is `resume_after_death`
+// (spec §9).
+//
+// Root creates a child (child-bye's image) and starts it with no boot tag, so
+// it ends at its first call. Root's parker parks on the line; root starts the
+// child (queued first), fires the line (the parker is woken, marked and
+// queued behind the child) and parks on the child's death. The child runs and
+// dies, and the scheduler resumes the parker through `resume_after_death`.
+// The parker's first call reads the record: the stamp is its first return
+// to user mode, so fires=1.
+
+import sos.{System, Process, Thread, SosStatus, ALL_RIGHTS,
+            sos_system_process_self, sos_system_interrupt_bind,
+            sos_system_process_create, sos_process_start,
+            sos_process_boot_handle_next,
+            sos_process_waiter_create, sos_waiter_add, sos_waiter_wait,
+            sos_handle_release, sos_interrupt_latency}
+
+unsafe static var BOOT_HANDLE: UInt = 0
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+static KEY_LINE: UInt = 61
+static KEY_CHILD: UInt = 64
+
+unsafe static var WAITER: UInt = 0
+unsafe static var IRQ_WORD: UInt = 0
+unsafe static var WOKE: UInt = 0
+unsafe static var P_FIRES: UInt64 = 99
+
+static RECORD_WORDS: Int = 64
+unsafe static var WBUF: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+unsafe static var MBUF: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+extern "C" {
+    func latency_line() -> UInt
+    func latency_source_on()
+    func latency_source_off()
+}
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt64>) as UInt
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+func park_once() unsafe {
+    let _ = sos_waiter_wait(WAITER, (&var WBUF) as UnsafePointer<UInt>,
+                            (RECORD_WORDS as UInt) * word_bytes())
+    var rec: [UInt64; 2] = [0; 2]
+    let _ = sos_interrupt_latency(IRQ_WORD, (&var rec) as UnsafePointer<UInt64>)
+    P_FIRES = rec[0]
+    WOKE = WOKE + 1
+}
+
+func worker() {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    park_once()
+    let _ = (move me).exit(0)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker()
+    }
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS latdeath: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc, boot_handle) catch {
+        print("SOS latdeath: failed: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS latdeath: done")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func raw_process(boot: UInt) unsafe -> UInt {
+    var proc: UInt = NONE
+    if sos_system_process_self(boot, ALL_RIGHTS as UInt,
+                               (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    proc
+}
+
+func boot_record(praw: UInt) unsafe -> UInt {
+    var rec: [UInt; 3] = [0; 3]
+    if sos_process_boot_handle_next(praw, (&var rec) as UnsafePointer<UInt>,
+                                    3 * word_bytes()) != STATUS_OK {
+        return NONE
+    }
+    rec[2]
+}
+
+func bind_line(boot: UInt, line: UInt) unsafe -> UInt {
+    var h: UInt = NONE
+    if sos_system_interrupt_bind(boot, line, (&var h) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    h
+}
+
+func make_waiter(praw: UInt) unsafe -> UInt {
+    var h: UInt = NONE
+    if sos_process_waiter_create(praw, (&var h) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    h
+}
+
+func create_child(boot: UInt, image: UInt, dest: UInt) unsafe -> UInt {
+    var h: UInt = NONE
+    if sos_system_process_create(boot, image, dest, 0,
+                                 (&var h) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    h
+}
+
+func fire_and_settle(proc: &Process) -> Result<Void, SosStatus> {
+    let before = try proc.stats()
+    latency_source_on()
+    var now = try proc.stats()
+    while now.interrupts == before.interrupts {
+        now = try proc.stats()
+    }
+    latency_source_off()
+    return
+}
+
+func run(system: &System, proc: &Process, boot: UInt) -> Result<Void, SosStatus> {
+    let praw = raw_process(boot)
+    if praw == NONE {
+        print("SOS latdeath: no raw process handle")
+        return SosStatus.BadImage
+    }
+    let image = boot_record(praw)
+    let dest = boot_record(praw)
+    var record = try proc.boot_handle_next()
+    guard let window = record.take_iomemory() else {
+        print("SOS latdeath: the third boot record is no window")
+        return SosStatus.BadImage
+    }
+    let _mapping = try proc.map(iomemory: &window)
+    let me = try proc.thread_self()
+    try death_round(&proc, &me, boot, praw, image, dest)
+    return
+}
+
+func death_round(proc: &Process, me: &Thread, boot: UInt, praw: UInt,
+                 image: UInt, dest: UInt) unsafe -> Result<Void, SosStatus> {
+    let child = create_child(boot, image, dest)
+    let w = make_waiter(praw)
+    let wd = make_waiter(praw)
+    let i = bind_line(boot, latency_line())
+    if child == NONE || w == NONE || wd == NONE || i == NONE {
+        print("SOS latdeath: setup refused")
+        return SosStatus.BadImage
+    }
+    if (sos_waiter_add(w, i, KEY_LINE, 0) != STATUS_OK
+            || sos_waiter_add(wd, child, KEY_CHILD, 0) != STATUS_OK) {
+        print("SOS latdeath: attach refused")
+        return SosStatus.BadImage
+    }
+    WAITER = w
+    IRQ_WORD = i
+    let parker = try proc.thread_create(stack_top: stack_top(), arg: 1)
+    try parker.start()
+    try me.yield_now()
+    if WOKE != 0 {
+        print("SOS latdeath: the parker did not park")
+        return SosStatus.BadImage
+    }
+    // Queued first: the child.
+    if sos_process_start(child, 0, 0) != STATUS_OK {
+        print("SOS latdeath: start refused")
+        return SosStatus.BadImage
+    }
+    // The parker is woken and queued behind it.
+    try fire_and_settle(&proc)
+    if WOKE != 0 {
+        print("SOS latdeath: the parker ran before the child")
+        return SosStatus.BadImage
+    }
+    let ds = sos_waiter_wait(wd, (&var MBUF) as UnsafePointer<UInt>,
+                             (RECORD_WORDS as UInt) * word_bytes())
+    let _ = try parker.join()
+    print("SOS latdeath: death wait status={} key={} payload={}; the parker's first read fires={}",
+          ds, MBUF[0], MBUF[2], P_FIRES)
+    if P_FIRES == 1 {
+        print("SOS latdeath: the waiter resumed after a death counts its fire on its first read")
+    }
+    return
+}

@@ -217,6 +217,16 @@ public(package) struct ThreadSlot {
     /// the resume asks again for the reason `wait_buf` gives.
     public(package) call_src: UInt,
     public(package) call_len: UInt,
+    /// The Interrupt (slot + 1; 0 = none) whose fire was delivered to this
+    /// thread and has not yet been stamped: the thread is owed a latency
+    /// reading, taken at its first return to user mode
+    /// (`stamp_interrupt_latency`).
+    public(package) latency_irq: Int,
+    /// The claim of that fire, in `hal.timer_now_ns()` time, taken from the
+    /// Interrupt at the mark. The thread holds it, so a second claim on the
+    /// Interrupt, or the slot's reuse, cannot change what this delivery
+    /// measures.
+    public(package) latency_from: UInt64,
     /// Handle entries naming this thread, plus the staged messages that carry
     /// it.
     public(package) refs: UInt16,
@@ -228,7 +238,7 @@ public(package) unsafe static var THREADS: Slab<ThreadSlot, MAX_THREADS> = Slab<
     inline: [ThreadSlot(state: ThreadState.Free, level: 0, process: 0,
                         exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
                         call_pipe: 0, call_claim: 0, call_src: 0,
-                        call_len: 0, refs: 0); MAX_THREADS],
+                        call_len: 0, latency_irq: 0, latency_from: 0, refs: 0); MAX_THREADS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
@@ -607,7 +617,7 @@ public(package) func free_thread_slot(t: Int) unsafe {
     THREADS[t] = ThreadSlot(state: ThreadState.Free, level: 0, process: 0,
                             exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
                             call_pipe: 0, call_claim: 0, call_src: 0,
-                            call_len: 0, refs: 0)
+                            call_len: 0, latency_irq: 0, latency_from: 0, refs: 0)
 }
 
 /// How many of a process's threads have not exited.
