@@ -32,11 +32,14 @@
 import sosabi.{BootHandleKind, HANDLE_KINDS, ObjType, ProcessStatusKind,
                QUOTA_KINDS, StatsRow}
 import kcore.limits.{
+    HANDLE_BLOCK,
     MAX_GRANT_ROWS,
     MAX_HANDLES,
+    MAX_HANDLE_BLOCKS,
     MAX_PROCESSES,
     MAX_PROCESS_RECORDS,
     MAX_SLAB_EXTENTS,
+    MAX_TABLE_BLOCKS,
     NO_BODY,
     NO_MEMORY,
 }
@@ -259,25 +262,36 @@ public(package) struct ProcessBody {
     public(package) region_top: UInt,
     public(package) grant_count: Int,
     public(package) grants: [GrantRow; MAX_GRANT_ROWS],
-    /// This process's handle table (spec §3). Handle index `i` (0-based) is
-    /// `handles[i]`, and the word the process holds carries `i + 1` in its low
-    /// byte ("handle 0 names nothing"). Generations start at zero, so a fresh
+    /// The first `MAX_HANDLES` entries of this process's handle table (spec
+    /// §3). Handle index `i` (0-based) below `MAX_HANDLES` is `handles[i]`,
+    /// and the word the process holds carries `i + 1` in its low byte
+    /// ("handle 0 names nothing"). Generations start at zero, so a fresh
     /// body's first word is the bare index and boot order hands root 1, 2, 3
     /// (spec §12).
     ///
-    /// `MAX_HANDLES` is the per-process ceiling: however many objects the
-    /// machine holds, one process can name at most this many at once.
+    /// The entries past these are the handle blocks `blocks` links. Only the
+    /// table's accessors in `kcore.objects` index either.
     ///
     /// The generations survive the body's reuse: the teardown unbinds every
     /// entry, bumping each, so the next process in this body starts with an
     /// empty table whose words differ from the last one's.
     public(package) handles: [HandleEntry; MAX_HANDLES],
-    /// This process's boot set: what was minted for it before it ran and has
-    /// not been handed over yet (spec §12).
+    /// The first `MAX_HANDLES` records of this process's boot set: what was
+    /// minted for it before it ran and has not been handed over yet (spec
+    /// §12). Record `i` is `boot_handles[i]` below `MAX_HANDLES` and in the
+    /// handle blocks past it.
     ///
-    /// `MAX_HANDLES` bounds it because every record names a handle in the same
-    /// table, so a larger boot set could never be drained.
+    /// The set is as long as the table because every record names a handle in
+    /// the same table, so a longer boot set could never be drained.
     public(package) boot_handles: [BootHandleSlot; MAX_HANDLES],
+    /// How many handle blocks this process holds, each lengthening its table
+    /// and its boot set by `HANDLE_BLOCK`. Only grows while the process lives;
+    /// the teardown frees them all. Zero in a zeroed body.
+    public(package) block_count: Int,
+    /// The blocks, in the order they were attached, each its slot in
+    /// `HANDLE_BLOCKS` plus one; the first `block_count` are links. Block `k`
+    /// holds table indexes `MAX_HANDLES + k * HANDLE_BLOCK` onward.
+    public(package) blocks: [Int; MAX_TABLE_BLOCKS],
     /// How many records are queued.
     public(package) boot_count: Int,
     /// How many have been collected. `boot_next == boot_count` is "drained".
@@ -294,6 +308,41 @@ public(package) struct ProcessBody {
     /// ever clears bits.
     public(package) ceilings: [UInt32; HANDLE_KINDS],
 }
+
+/// One handle block: `HANDLE_BLOCK` more entries of one process's handle
+/// table, and the boot-set records of the same positions (spec §3).
+///
+/// A block is a slot of `HANDLE_BLOCKS`, linked from the body that holds it
+/// (`ProcessBody.blocks`). The two arrays are `ProcessBody.handles` and
+/// `.boot_handles` continued, and the same functions in `kcore.objects` read
+/// and write them. A freed block keeps its entries' generations, as a reused
+/// body does, so a word from an earlier life names nothing in the next one.
+public(package) struct HandleBlock {
+    // The body that holds this block, plus one; 0 is free, so a zeroed
+    // block, a donated or linked extent's included, is free.
+    public(package) owner: Int,
+    public(package) entries: [HandleEntry; HANDLE_BLOCK],
+    public(package) boot: [BootHandleSlot; HANDLE_BLOCK],
+}
+
+/// The handle-block slab: extent 0 is `MAX_HANDLE_BLOCKS` long, which is
+/// none, and an image's area or a donation (`SlabKind.HandleBlocks`) appends.
+/// Every block is free until a `QuotaSet` attaches it (`kcore.objects`'
+/// `attach_handle_blocks`).
+public(package) unsafe static var HANDLE_BLOCKS: Slab<HandleBlock, MAX_HANDLE_BLOCKS> = Slab<HandleBlock, MAX_HANDLE_BLOCKS>(
+    inline: [HandleBlock(owner: 0,
+                         entries: [HandleEntry(obj_type: ObjType.Unbound,
+                                               rights: 0, target: 0, gen: 0);
+                                   HANDLE_BLOCK],
+                         boot: [BootHandleSlot(tag: 0,
+                                               kind: BootHandleKind.Memory,
+                                               handle: 0, taken: false);
+                                HANDLE_BLOCK]); MAX_HANDLE_BLOCKS],
+    ext_base: [0; MAX_SLAB_EXTENTS],
+    ext_slots: [0; MAX_SLAB_EXTENTS],
+    ext_side: [0; MAX_SLAB_EXTENTS],
+    ext_count: 0,
+    total: MAX_HANDLE_BLOCKS)
 
 // A live process's trap counters (`syscalls`, `interrupts`, `faults`) are not
 // fields of its body. They are rows of `kcore.stats`' published region, keyed
@@ -346,6 +395,8 @@ public(package) unsafe static var PROCESSES: Slab<ProcessBody, MAX_PROCESSES> = 
                                                        handle: 0, taken: false);
                                         MAX_HANDLES],
                          boot_count: 0, boot_next: 0,
+                         block_count: 0,
+                         blocks: [0; MAX_TABLE_BLOCKS],
                          ceilings: [0; HANDLE_KINDS]); MAX_PROCESSES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],

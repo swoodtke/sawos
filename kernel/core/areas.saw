@@ -36,7 +36,8 @@
 //! kernel reads it, so the link discards it.
 
 import hal
-import sosabi.{QUOTA_KINDS, QUOTA_UNLIMITED, QuotaKind, SlabKind}
+import sosabi.{BOOT_SET_CAPACITY, QUOTA_KINDS, QUOTA_UNLIMITED, QuotaKind,
+               SlabKind}
 import kcore.limits.{
     DEFAULT_QUOTA_EVENTS,
     DEFAULT_QUOTA_HANDLES,
@@ -47,11 +48,13 @@ import kcore.limits.{
     DEFAULT_QUOTA_THREADS,
     DEFAULT_QUOTA_TIMERS,
     DEFAULT_QUOTA_WAITERS,
+    HANDLE_BLOCK,
     IMAGE_GRANT_ROWS,
     MAX_ATTACHMENTS,
     MAX_EVENTS,
     MAX_FREE_RANGES,
     MAX_HANDLES,
+    MAX_HANDLE_BLOCKS,
     MAX_INTERRUPTS,
     MAX_IOMEMORIES,
     MAX_MAPPINGS,
@@ -61,6 +64,7 @@ import kcore.limits.{
     MAX_PROCESS_RECORDS,
     MAX_SLAB_CAPACITY,
     MAX_SLAB_EXTENTS,
+    MAX_TABLE_BLOCKS,
     MAX_THREADS,
     MAX_TIMERS,
     MAX_WAITERS,
@@ -70,7 +74,7 @@ import kcore.limits.{
 }
 import kcore.mem.{zero_bytes}
 import kcore.diag.{console, fatal_image, fatal_kernel}
-import kcore.pslot.{PROCESSES, PROCESS_RECORDS}
+import kcore.pslot.{HANDLE_BLOCKS, PROCESSES, PROCESS_RECORDS}
 import kcore.objects.{
     EXCHANGES,
     FREE_RANGES,
@@ -145,6 +149,9 @@ public(package) func slab_geometry(kind: SlabKind) unsafe -> (Int, Int, Int, Int
         // A record unit is a slot of its own chain, the same one-array shape.
         // Records have no domain behind them, so the slab is the whole bound.
         case ProcessRecords -> (PROCESS_RECORDS.slot_bytes(), PROCESS_RECORDS.slot_align(), PROCESS_RECORDS.extents_left(), MAX_SLAB_CAPACITY - PROCESS_RECORDS.capacity()),
+        // A handle block is a slot, its entries and its boot-set records
+        // inside it: the same one-array shape.
+        case HandleBlocks -> (HANDLE_BLOCKS.slot_bytes(), HANDLE_BLOCKS.slot_align(), HANDLE_BLOCKS.extents_left(), MAX_SLAB_CAPACITY - HANDLE_BLOCKS.capacity()),
     }
 }
 
@@ -198,6 +205,7 @@ public(package) func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe
         },
         case Processes -> PROCESSES.donate(base, slots),
         case ProcessRecords -> PROCESS_RECORDS.donate(base, slots),
+        case HandleBlocks -> HANDLE_BLOCKS.donate(base, slots),
     }
 }
 
@@ -206,9 +214,9 @@ public(package) func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe
 // =============================================================================
 
 /// How many `SlabKind`s there are: one past the largest kind's value.
-static SLAB_KINDS: Int = 13
+static SLAB_KINDS: Int = 14
 
-static_assert(SLAB_KINDS == (SlabKind.ProcessRecords as Int) + 1,
+static_assert(SLAB_KINDS == (SlabKind.HandleBlocks as Int) + 1,
               "the block's per-kind tables have one entry per SlabKind")
 
 /// 'S','L','A','B' as a little-endian word.
@@ -415,6 +423,7 @@ func boot_capacity(kind: SlabKind, raised: &[Int; SLAB_KINDS]) unsafe -> Int {
         case Pipes -> PIPES.capacity(),
         case Processes -> PROCESSES.capacity(),
         case ProcessRecords -> PROCESS_RECORDS.capacity(),
+        case HandleBlocks -> HANDLE_BLOCKS.capacity(),
     }
     held + raised[kind as Int]
 }
@@ -449,7 +458,9 @@ func check_relations(raised: &[Int; SLAB_KINDS]) unsafe {
 }
 
 /// The slab a quota kind draws from, for the bound a default must stay under.
-/// `Handle` has no slab: its bound is the table, `MAX_HANDLES`.
+/// `Handle` answers none: a default's bound is the body's table,
+/// `MAX_HANDLES`, which `check_quota_defaults` holds it below, and only a row
+/// raised past the body draws `HandleBlocks`.
 func quota_slab(kind: QuotaKind) -> SlabKind? {
     match kind {
         case Thread -> SlabKind.Threads,
@@ -513,16 +524,32 @@ func check_quota_defaults(header: &SlabBlockHeader,
 // =============================================================================
 
 /// How the builder recognizes the record's layout.
-static IMAGE_LIMITS_VERSION: UInt = 1
+static IMAGE_LIMITS_VERSION: UInt = 2
+
+/// A handle block's bytes (`kcore.pslot.HandleBlock`), for the record.
+///
+/// The builder sizes every other kind's unit from its slab's symbol over the
+/// slab's floor, and the `HandleBlocks` floor is zero, so the record carries
+/// this one. A static's initializer cannot measure a struct, so the layout is
+/// spelled in machine words: the owner word, then per position an entry (a
+/// word, two `UInt32`s and its kind: two words and eight bytes) and a boot
+/// record (three words and a `Bool`: four words). What holds the spelling to
+/// the struct is the boot's own geometry: `install_image_slabs` measures a
+/// `HandleBlocks` area in `slab_geometry`'s bytes, the struct's, and stops an
+/// image whose area is not whole blocks of them.
+static HANDLE_BLOCK_BYTES: Int = (sizeof<UInt>()
+                                  + HANDLE_BLOCK * (6 * sizeof<UInt>() + 8))
 
 /// The numbers an image's areas are sized and checked against, in a fixed
 /// order the builder reads by index: the record's version, the slab ceiling,
-/// the extents a slab may take, records per body, the handle table, the grant
-/// rows an image spends, the board's grant-row budget and domain pool, the
-/// thread frame stride and the staging ring's depth; then each slab's floor in
-/// `SlabKind` order; then each compiled quota default in `QuotaKind` order.
+/// the extents a slab may take, records per body, a body's handle entries, the
+/// grant rows an image spends, the board's grant-row budget and domain pool,
+/// the thread frame stride, the staging ring's depth, a handle block's
+/// entries, the blocks one table may hold, a block's bytes and the records a
+/// `BootSet` holds; then each slab's floor in `SlabKind` order; then each
+/// compiled quota default in `QuotaKind` order.
 @export("sos_image_limits")
-static IMAGE_LIMITS: [UInt; 32] = [
+static IMAGE_LIMITS: [UInt; 37] = [
     IMAGE_LIMITS_VERSION,
     MAX_SLAB_CAPACITY as UInt,
     MAX_SLAB_EXTENTS as UInt,
@@ -533,6 +560,10 @@ static IMAGE_LIMITS: [UInt; 32] = [
     hal.PROT_DOMAIN_SLOTS as UInt,
     THREAD_FRAME_STRIDE as UInt,
     PIPE_INFLIGHT as UInt,
+    HANDLE_BLOCK as UInt,
+    MAX_TABLE_BLOCKS as UInt,
+    HANDLE_BLOCK_BYTES as UInt,
+    BOOT_SET_CAPACITY as UInt,
     MAX_EVENTS as UInt,
     MAX_WAITERS as UInt,
     MAX_INTERRUPTS as UInt,
@@ -546,6 +577,7 @@ static IMAGE_LIMITS: [UInt; 32] = [
     MAX_PIPES as UInt,
     MAX_PROCESSES as UInt,
     MAX_PROCESS_RECORDS as UInt,
+    MAX_HANDLE_BLOCKS as UInt,
     DEFAULT_QUOTA_THREADS as UInt,
     DEFAULT_QUOTA_EVENTS as UInt,
     DEFAULT_QUOTA_WAITERS as UInt,

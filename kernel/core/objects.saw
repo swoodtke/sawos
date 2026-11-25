@@ -68,6 +68,8 @@ import kcore.limits.{
     DEFAULT_QUOTA_THREADS,
     DEFAULT_QUOTA_TIMERS,
     DEFAULT_QUOTA_WAITERS,
+    HANDLE_BLOCK,
+    LONGEST_TABLE,
     MAX_EVENTS,
     MAX_FREE_RANGES,
     MAX_HANDLES,
@@ -95,6 +97,7 @@ import kcore.slab.{Slab}
 // functions can reach them.
 import kcore.pslot.{
     BootHandleSlot,
+    HANDLE_BLOCKS,
     HandleEntry,
     PROCESSES,
     PROCESS_RECORDS,
@@ -383,16 +386,17 @@ public(package) enum SlotState: UInt8 {
 // The handle table (spec §3) and the split word
 // -----------------------------------------------------------------------------
 
-// The table must fit the index field. `sosabi` owns the encoding and
-// `kcore.limits` owns the table size, so the bound tying them belongs here.
+// The longest table must fit the index field. `sosabi` owns the encoding and
+// `kcore.limits` owns the table's length, so the bound tying them belongs here.
 //
 // The comparison is `<=` because the field carries a 1-based index: the largest
-// value it must hold is `MAX_HANDLES` itself (naming slot `MAX_HANDLES - 1`).
-// Zero means "names nothing", so a field of `HANDLE_INDEX_BITS` bits addresses
-// `HANDLE_INDEX_MASK` slots and no more. Raising `MAX_HANDLES` past that fails
-// the build here rather than silently aliasing slot 1 onto slot 257.
-static_assert(MAX_HANDLES <= (1 << HANDLE_INDEX_BITS) - 1,
-              "MAX_HANDLES must fit the handle word's index field — raise HANDLE_INDEX_BITS")
+// value it must hold is `LONGEST_TABLE` itself (naming slot
+// `LONGEST_TABLE - 1`). Zero means "names nothing", so a field of
+// `HANDLE_INDEX_BITS` bits addresses `HANDLE_INDEX_MASK` slots and no more.
+// Raising the table past that fails the build here rather than silently
+// aliasing slot 1 onto slot 257.
+static_assert(LONGEST_TABLE <= (1 << HANDLE_INDEX_BITS) - 1,
+              "LONGEST_TABLE must fit the handle word's index field — raise HANDLE_INDEX_BITS")
 
 /// The Unbound answer: what a word that resolves to nothing looks like.
 ///
@@ -402,8 +406,8 @@ func unbound_entry() -> HandleEntry {
     HandleEntry(obj_type: ObjType.Unbound, rights: 0, target: 0, gen: 0)
 }
 
-/// The 0-based table index a handle word names, or a number past `MAX_HANDLES`
-/// when it names none.
+/// The 0-based table index a handle word names, or a number past the longest
+/// table when it names none.
 ///
 /// The index field is 1-based, so zero is not an index and "handle 0 names
 /// nothing". `NO_HANDLE` is the index field's zero at every generation, so a
@@ -412,8 +416,8 @@ func unbound_entry() -> HandleEntry {
 /// `NO_HANDLE` would miss that, testing the field cannot. The 1-based spelling
 /// also keeps slot 0 usable and generation 0 free to mean "first life".
 ///
-/// A zero field answers `MAX_HANDLES` rather than a separate signal, so the one
-/// range test in the caller covers both refusals.
+/// A zero field answers `LONGEST_TABLE` rather than a separate signal, so the
+/// one range test in the caller covers both refusals.
 ///
 /// `public(package)` for the release op, which has a word and a resolved entry
 /// and needs the index to unbind. It uses the same function as `lookup_handle`,
@@ -421,7 +425,7 @@ func unbound_entry() -> HandleEntry {
 public(package) func handle_word_index(word: UInt) unsafe -> Int {
     let byte = word & HANDLE_INDEX_MASK
     if byte == 0 {
-        return MAX_HANDLES
+        return LONGEST_TABLE
     }
     (byte as Int) - 1
 }
@@ -462,12 +466,18 @@ func handle_word(index: Int, gen: UInt32) unsafe -> UInt {
 /// no binding, and a slot whose generation has moved on since this word was
 /// handed out. In the last case the word points at a live slot with the wrong
 /// life, and the caller's `BadHandle` fault is the diagnosis.
+///
+/// An index below `MAX_HANDLES` is read from the body. One at or past it is
+/// read from the handle block that holds it, and is past the table when the
+/// process holds no such block (`block_entry`).
 public(package) func lookup_handle(p: Int, h: UInt) unsafe -> HandleEntry {
     let index = handle_word_index(h)
-    if index >= MAX_HANDLES {
-        return unbound_entry()
+    let b = body_of(p)
+    let entry = if index < MAX_HANDLES {
+        PROCESSES[b].handles[index]
+    } else {
+        block_entry(b, index)
     }
-    let entry = PROCESSES[body_of(p)].handles[index]
     match entry.obj_type {
         case Unbound -> unbound_entry(),
         case _ -> {
@@ -504,6 +514,22 @@ public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: 
                                                       rights: rights,
                                                       target: target,
                                                       gen: entry.gen)
+                quota_charge(p, QuotaKind.Handle)
+                return handle_word(h, entry.gen)
+            },
+            case _ -> {},
+        }
+        h = h + 1
+    }
+    // The blocks continue the body's entries in the order they were attached,
+    // so the lowest free index is still the one a mint takes.
+    let len = table_len(b)
+    while h < len {
+        let entry = entry_at(b, h)
+        match entry.obj_type {
+            case Unbound -> {
+                set_entry(b, h, HandleEntry(obj_type: kind, rights: rights,
+                                            target: target, gen: entry.gen))
                 quota_charge(p, QuotaKind.Handle)
                 return handle_word(h, entry.gen)
             },
@@ -581,10 +607,11 @@ public(package) func table_room(p: Int, n: Int) unsafe -> Bool {
         return false
     }
     let b = body_of(p)
+    let len = table_len(b)
     var free: Int = 0
     var h: Int = 0
-    while h < MAX_HANDLES {
-        match PROCESSES[b].handles[h].obj_type {
+    while h < len {
+        match entry_at(b, h).obj_type {
             case Unbound -> { free = free + 1 },
             case _ -> {},
         }
@@ -612,7 +639,7 @@ public(package) func table_room(p: Int, n: Int) unsafe -> Bool {
 /// so it is a kernel bug and stops the machine.
 public(package) func unbind_handle(p: Int, index: Int) unsafe {
     let b = body_of(p)
-    let entry = PROCESSES[b].handles[index]
+    let entry = entry_at(b, index)
     match entry.obj_type {
         case Unbound -> {
             fatal_kernel("an unbound handle slot was unbound", index as UInt)
@@ -620,12 +647,165 @@ public(package) func unbind_handle(p: Int, index: Int) unsafe {
         case _ -> {},
     }
     let next = (entry.gen + 1) % HANDLE_GENERATION_MODULUS
-    PROCESSES[b].handles[index] = HandleEntry(obj_type: ObjType.Unbound,
-                                              rights: 0, target: 0,
-                                              gen: next)
+    set_entry(b, index, HandleEntry(obj_type: ObjType.Unbound, rights: 0,
+                                    target: 0, gen: next))
     // Credited at the one place a binding is destroyed, so the entry count and
     // the quota count are the same fact.
     quota_credit(p, QuotaKind.Handle)
+}
+
+// -----------------------------------------------------------------------------
+// Where an entry lives: the body and the handle blocks (spec §3)
+// -----------------------------------------------------------------------------
+//
+// A table is the body's `MAX_HANDLES` entries and then, in the order they were
+// attached, the `HANDLE_BLOCK` entries of each block the body links. Index
+// `MAX_HANDLES + k * HANDLE_BLOCK + j` is entry `j` of block `k`. A block also
+// holds the boot-set records of its positions, so a boot set is exactly as
+// long as its table.
+//
+// `entry_at`, `set_entry`, `boot_record_at` and `set_boot_record` are the
+// only readers and writers of an entry or a record by index, and every table
+// and boot-set function goes through them, except that `lookup_handle` reads
+// the body's entries itself and `mint_handle` reads and writes them itself,
+// the path below `MAX_HANDLES` staying what it is without blocks, before
+// each turns to the blocks (`block_entry`, `entry_at`, `set_entry`). Each
+// takes an index the caller has held below `table_len`.
+
+/// How many entries the table in body `b` holds, and as many boot-set records:
+/// the body's and its blocks'.
+public(package) func table_len(b: Int) unsafe -> Int {
+    MAX_HANDLES + PROCESSES[b].block_count * HANDLE_BLOCK
+}
+
+/// Which block slot holds table index `i` of body `b`, and which entry of it,
+/// for an `i` at or past `MAX_HANDLES` and below `table_len(b)`.
+func block_place(b: Int, i: Int) unsafe -> (Int, Int) {
+    let rest = i - MAX_HANDLES
+    let link = PROCESSES[b].blocks[rest / HANDLE_BLOCK]
+    (link - 1, rest % HANDLE_BLOCK)
+}
+
+/// The entry at index `i` of body `b`'s table, `i` at or past `MAX_HANDLES`,
+/// or the Unbound answer when the table is not that long: the lookup's half
+/// past the body.
+func block_entry(b: Int, i: Int) unsafe -> HandleEntry {
+    if i >= table_len(b) {
+        return unbound_entry()
+    }
+    let (blk, j) = block_place(b, i)
+    HANDLE_BLOCKS[blk].entries[j]
+}
+
+/// The entry at index `i` of body `b`'s table.
+public(package) func entry_at(b: Int, i: Int) unsafe -> HandleEntry {
+    if i < MAX_HANDLES {
+        return PROCESSES[b].handles[i]
+    }
+    let (blk, j) = block_place(b, i)
+    HANDLE_BLOCKS[blk].entries[j]
+}
+
+/// Write the entry at index `i` of body `b`'s table.
+func set_entry(b: Int, i: Int, entry: HandleEntry) unsafe {
+    if i < MAX_HANDLES {
+        PROCESSES[b].handles[i] = entry
+        return
+    }
+    let (blk, j) = block_place(b, i)
+    HANDLE_BLOCKS[blk].entries[j] = entry
+}
+
+/// Boot-set record `i` of body `b`.
+public(package) func boot_record_at(b: Int, i: Int) unsafe -> BootHandleSlot {
+    if i < MAX_HANDLES {
+        return PROCESSES[b].boot_handles[i]
+    }
+    let (blk, j) = block_place(b, i)
+    HANDLE_BLOCKS[blk].boot[j]
+}
+
+/// Write boot-set record `i` of body `b`.
+func set_boot_record(b: Int, i: Int, record: BootHandleSlot) unsafe {
+    if i < MAX_HANDLES {
+        PROCESSES[b].boot_handles[i] = record
+        return
+    }
+    let (blk, j) = block_place(b, i)
+    HANDLE_BLOCKS[blk].boot[j] = record
+}
+
+/// The handle blocks a table of `limit` entries needs past the body's: none
+/// for a limit at or below `MAX_HANDLES`.
+public(package) func blocks_for(limit: Int) -> Int {
+    if limit <= MAX_HANDLES {
+        return 0
+    }
+    (limit - MAX_HANDLES + HANDLE_BLOCK - 1) / HANDLE_BLOCK
+}
+
+/// Attach handle blocks to process `p` until it holds `want` of them, or
+/// answer false and attach none. The caller holds `want` at or under
+/// `MAX_TABLE_BLOCKS`.
+///
+/// A process that already holds `want` or more is answered true with nothing
+/// attached: a table never shrinks while its process lives, which keeps every
+/// slot's generation rising through the process's life. Otherwise the free
+/// blocks are counted first, so a slab short of them changes nothing, and
+/// then the first free ones in slot order are linked in order. A free block's
+/// entries are all Unbound: a zeroed one is, and the teardown that freed a
+/// used one held every entry unbound.
+///
+/// No preemption point: both walks are bounded by the slab's capacity over an
+/// O(1) body, as every slab scan is (`kcore.limits`).
+public(package) func attach_handle_blocks(p: Int, want: Int) unsafe -> Bool {
+    let b = body_of(p)
+    let held = PROCESSES[b].block_count
+    if want <= held {
+        return true
+    }
+    let cap = HANDLE_BLOCKS.capacity()
+    var free: Int = 0
+    var s: Int = 0
+    while s < cap && free < want - held {
+        if HANDLE_BLOCKS[s].owner == 0 {
+            free = free + 1
+        }
+        s = s + 1
+    }
+    if free < want - held {
+        return false
+    }
+    var n = held
+    s = 0
+    while n < want {
+        if HANDLE_BLOCKS[s].owner == 0 {
+            HANDLE_BLOCKS[s].owner = b + 1
+            PROCESSES[b].blocks[n] = s + 1
+            n = n + 1
+        }
+        s = s + 1
+    }
+    PROCESSES[b].block_count = want
+    true
+}
+
+/// Give back every handle block process `p` holds. Called by the teardown,
+/// once the close-all has unbound every entry in them.
+///
+/// The entries keep their generations, as a reused body's do, so a word from
+/// this process's life names nothing in the next holder's.
+public(package) func free_handle_blocks(p: Int) unsafe {
+    let b = body_of(p)
+    let count = PROCESSES[b].block_count
+    var k: Int = 0
+    while k < count {
+        let blk = PROCESSES[b].blocks[k] - 1
+        HANDLE_BLOCKS[blk].owner = 0
+        PROCESSES[b].blocks[k] = 0
+        k = k + 1
+    }
+    PROCESSES[b].block_count = 0
 }
 
 // =============================================================================
@@ -2516,9 +2696,10 @@ public(package) func exchange_settle(x: Int) unsafe -> StagedRefs {
 // records are written at boot by the machinery a give uses, and their tags are
 // region ordinals because that is what the config root and the build agreed on.
 //
-// The set, its count and its cursor are `ProcessBody.boot_handles` /
-// `.boot_count` / `.boot_next`, three fields of the body beside `.handles`.
-// `MAX_HANDLES` is the right bound: every record names a handle in that
+// The set's count and cursor are `ProcessBody.boot_count` / `.boot_next`, and
+// its records are `ProcessBody.boot_handles` continued in the process's handle
+// blocks, read and written through `boot_record_at` and `set_boot_record`. The
+// table's length is the right bound: every record names a handle in that
 // process's table, so a boot set larger than the table it fills could never be
 // drained.
 //
@@ -2536,14 +2717,15 @@ public(package) func exchange_settle(x: Int) unsafe -> StagedRefs {
 /// first; the test is here because a silently dropped record is a capability a
 /// child was given and can never collect.
 public(package) func boot_handle_room(p: Int) unsafe -> Bool {
-    PROCESSES[body_of(p)].boot_count < MAX_HANDLES
+    let b = body_of(p)
+    PROCESSES[b].boot_count < table_len(b)
 }
 
 /// Does process `p`'s set already carry `tag`?
 ///
 /// The duplicate-tag check scans rather than indexes: a tag is the giver's own
 /// word and the kernel constrains it in no way, so there is nothing to index
-/// by; the array is bounded by `MAX_HANDLES` and the walk runs once per give.
+/// by; the set is bounded by the longest table and the walk runs once per give.
 /// It looks at the whole set and not only the undelivered part, because the tag
 /// is an identity for the process's whole boot set: a tag reused after the
 /// child drained the first one would still name two handles.
@@ -2552,7 +2734,7 @@ public(package) func boot_tag_used(p: Int, tag: UInt) unsafe -> Bool {
     let n = PROCESSES[b].boot_count
     var i: Int = 0
     while i < n {
-        if PROCESSES[b].boot_handles[i].tag == tag {
+        if boot_record_at(b, i).tag == tag {
             return true
         }
         i = i + 1
@@ -2576,13 +2758,13 @@ public(package) func boot_handle_take(p: Int, tag: UInt) unsafe -> UInt {
     let n = PROCESSES[b].boot_count
     var i: Int = 0
     while i < n {
-        // Read the record as one value rather than three place windows.
-        // `BootHandleSlot` is trivially copyable, so the test, the mark and the
-        // answer work on one loaded copy, which also keeps two place windows
-        // out of a single `&&`.
-        let rec = PROCESSES[b].boot_handles[i]
+        // Read the record as one value: `BootHandleSlot` is trivially
+        // copyable, so the test, the mark and the answer work on one loaded
+        // copy, and the mark writes that copy back.
+        var rec = boot_record_at(b, i)
         if rec.tag == tag && not rec.taken {
-            PROCESSES[b].boot_handles[i].taken = true
+            rec.taken = true
+            set_boot_record(b, i, rec)
             return rec.handle
         }
         i = i + 1
@@ -2597,9 +2779,8 @@ public(package) func queue_boot_handle(p: Int, tag: UInt, kind: BootHandleKind,
                                        handle: UInt) unsafe {
     let b = body_of(p)
     let n = PROCESSES[b].boot_count
-    PROCESSES[b].boot_handles[n] = BootHandleSlot(tag: tag, kind: kind,
-                                                  handle: handle,
-                                                  taken: false)
+    set_boot_record(b, n, BootHandleSlot(tag: tag, kind: kind, handle: handle,
+                                         taken: false))
     PROCESSES[b].boot_count = n + 1
 }
 
@@ -2614,7 +2795,7 @@ public(package) func boot_handle_cursor(p: Int) unsafe -> Int {
     let b = body_of(p)
     let n = PROCESSES[b].boot_count
     var at = PROCESSES[b].boot_next
-    while at < n && PROCESSES[b].boot_handles[at].taken {
+    while at < n && boot_record_at(b, at).taken {
         at = at + 1
     }
     PROCESSES[b].boot_next = at

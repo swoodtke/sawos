@@ -1,0 +1,64 @@
+// A `Handle` row needing more handle blocks than the machine has free
+// answers `NoResource`, and sets and attaches nothing (spec §2.7).
+//
+// The image holds one block. A row of 64 needs two, so child A's is refused
+// and still reads its default. A row of 48 needs one, and child B takes it:
+// the block A's refusal must not have kept.
+//
+//   SOS blocksshort: A limit 64: no room for what was asked
+//   SOS blocksshort: A's row still reads limit=12
+//   SOS blocksshort: B limit 48 taken
+//   SOS blocksshort: done
+
+import sos.{System, QuotaKind, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A row needing two blocks, and one needing one.
+static TWO_BLOCKS: UInt16 = 64
+static ONE_BLOCK: UInt16 = 48
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS blocksshort: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS blocksshort: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    // Rows: each child's image, then the RAM of each.
+    var a_image_rec = try proc.boot_handle_next()
+    var b_image_rec = try proc.boot_handle_next()
+    var a_ram_rec = try proc.boot_handle_next()
+    var b_ram_rec = try proc.boot_handle_next()
+    guard let a_image = a_image_rec.take_memory() else { return BUG }
+    guard let b_image = b_image_rec.take_memory() else { return BUG }
+    guard let a_ram = a_ram_rec.take_memory() else { return BUG }
+    guard let b_ram = b_ram_rec.take_memory() else { return BUG }
+    let a = try system.process_create(image: &a_image, memory: &a_ram)
+    let b = try system.process_create(image: &b_image, memory: &b_ram)
+
+    match a.quota_set(kind: QuotaKind.Handle, limit: TWO_BLOCKS) {
+        case Ok(_) -> {
+            print("SOS blocksshort: UNEXPECTED A limit {} taken\n", TWO_BLOCKS)
+            return BUG
+        },
+        case Err(why) -> print("SOS blocksshort: A limit {}: {}\n", TWO_BLOCKS,
+                               why),
+    }
+    let row = try a.quota_get(kind: QuotaKind.Handle)
+    print("SOS blocksshort: A's row still reads limit={}\n", row.limit)
+    try b.quota_set(kind: QuotaKind.Handle, limit: ONE_BLOCK)
+    print("SOS blocksshort: B limit {} taken\n", ONE_BLOCK)
+    return
+}

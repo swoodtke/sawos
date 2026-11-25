@@ -7,6 +7,8 @@
 //! table, `3 * MAX_SLAB_EXTENTS + 2` machine words, so the symbol's size less
 //! those words, over the floor, is one slot. A thread's unit adds its frame
 //! stride and a pipe's its staging ring, as the kernel's `slab_geometry` does.
+//! The handle-block slab's floor is zero, so its symbol holds no slot to
+//! measure, and the record carries a block's bytes.
 //! The kernel checks every area against its own geometry at boot, so a
 //! disagreement here stops the boot by name rather than misreading memory.
 //!
@@ -17,7 +19,7 @@ import sosimage.failure.{BuildError}
 import sosimage.tool.{read_file}
 
 /// How many `SlabKind`s there are, and how many `QuotaKind`s.
-public static SLAB_KINDS: Int = 13
+public static SLAB_KINDS: Int = 14
 public static QUOTA_KINDS: Int = 9
 
 // `SlabKind` values, as `kernel/abi/src/ops.saw` numbers them.
@@ -34,6 +36,7 @@ public static THREADS: Int = 9
 public static PIPES: Int = 10
 public static PROCESSES: Int = 11
 public static PROCESS_RECORDS: Int = 12
+public static HANDLE_BLOCKS: Int = 13
 
 // `QuotaKind` values, as `kernel/abi/src/ops.saw` numbers them.
 public static QUOTA_MEMORY: Int = 4
@@ -41,11 +44,13 @@ public static QUOTA_MAPPING: Int = 6
 public static QUOTA_HANDLE: Int = 7
 
 /// The record's layout version this builder reads, and its length in words.
-static LIMITS_VERSION: UInt64 = 1
-static LIMITS_WORDS: Int = 32
-/// Where the floors and the compiled quota defaults start in the record.
-static LIMITS_FLOORS_AT: Int = 10
-static LIMITS_QUOTAS_AT: Int = 23
+static LIMITS_VERSION: UInt64 = 2
+static LIMITS_WORDS: Int = 37
+/// Where a handle block's bytes are in the record, and where the floors and
+/// the compiled quota defaults start.
+static LIMITS_BLOCK_BYTES_AT: Int = 12
+static LIMITS_FLOORS_AT: Int = 14
+static LIMITS_QUOTAS_AT: Int = 28
 
 /// The alignment the builder links every area but a thread area at: at least
 /// any slot's alignment on every target. A thread area is aligned to its
@@ -68,6 +73,7 @@ public func slab_kind_name(kind: Int) -> String {
         case 10 -> "pipes",
         case 11 -> "processes",
         case 12 -> "process_records",
+        case 13 -> "handle-blocks",
         case _ -> "",
     }
 }
@@ -88,7 +94,8 @@ public func quota_kind_name(kind: Int) -> String {
     }
 }
 
-/// The kernel object's symbol for the slab holding `kind`.
+/// The kernel object's symbol for the slab holding `kind`. The handle-block
+/// slab's is not read: its floor is zero.
 func slab_symbol(kind: Int) -> String {
     match kind {
         case 0 -> "static kcore.waitables.EVENTS",
@@ -127,6 +134,11 @@ public struct KernelFacts {
     domains: Int
     stride: Int
     inflight: Int
+    /// A handle block's entries, the blocks one table may hold, and the
+    /// records a `BootSet` holds.
+    handle_block: Int
+    table_blocks: Int
+    boot_set: Int
     /// Each slab's floor, by `SlabKind` value.
     floors: Vector<Int>
     /// Each compiled quota default, by `QuotaKind` value.
@@ -160,7 +172,9 @@ extension KernelFacts {
         try! wanted.push(exchanges_symbol())
         var k = 0
         while k < SLAB_KINDS {
-            try! wanted.push(slab_symbol(k))
+            if k != HANDLE_BLOCKS {
+                try! wanted.push(slab_symbol(k))
+            }
             k = k + 1
         }
         let symbols = try object_symbols(&data, wide, &wanted, what)
@@ -168,18 +182,24 @@ extension KernelFacts {
         guard let limits = symbols.get(limits_symbol()) else {
             return BuildError(message: "{what} has no `{limits_symbol()}`: it is not a kernel this builder can size an image for")
         }
-        if limits.size != LIMITS_WORDS * word {
+        // The version first, so a record of another layout is refused by its
+        // version whatever its length.
+        if limits.size < word {
             return BuildError(message: "{what}: `{limits_symbol()}` is {limits.size} bytes; this builder reads {LIMITS_WORDS} words")
         }
         let at = try section_offset(&data, wide, limits.section, what) + limits.value
+        let version = try le(&data, at, word, what)
+        if version != LIMITS_VERSION {
+            return BuildError(message: "{what}: `{limits_symbol()}` is version {version}; this builder reads version {LIMITS_VERSION}")
+        }
+        if limits.size != LIMITS_WORDS * word {
+            return BuildError(message: "{what}: `{limits_symbol()}` is {limits.size} bytes; this builder reads {LIMITS_WORDS} words")
+        }
         var record = Vector<Int>()
         var w = 0
         while w < LIMITS_WORDS {
             try! record.push(try le(&data, at + w * word, word, what) as Int)
             w = w + 1
-        }
-        if (record.get(0) ?? 0) as UInt64 != LIMITS_VERSION {
-            return BuildError(message: "{what}: `{limits_symbol()}` is version {record.get(0) ?? 0}; this builder reads version {LIMITS_VERSION}")
         }
         var floors = Vector<Int>()
         k = 0
@@ -201,8 +221,12 @@ extension KernelFacts {
         var slots = Vector<Int>()
         k = 0
         while k < SLAB_KINDS {
-            let floor = floors.get(k) ?? 0
-            try! slots.push(try slot_bytes(&symbols, slab_symbol(k), floor, header, what))
+            if k == HANDLE_BLOCKS {
+                try! slots.push(record.get(LIMITS_BLOCK_BYTES_AT) ?? 0)
+            } else {
+                let floor = floors.get(k) ?? 0
+                try! slots.push(try slot_bytes(&symbols, slab_symbol(k), floor, header, what))
+            }
             k = k + 1
         }
         let exchange = try slot_bytes(&symbols, exchanges_symbol(),
@@ -233,6 +257,9 @@ extension KernelFacts {
                            budget: record.get(6) ?? 0,
                            domains: record.get(7) ?? 0,
                            stride: stride, inflight: inflight,
+                           handle_block: record.get(10) ?? 0,
+                           table_blocks: record.get(11) ?? 0,
+                           boot_set: record.get(13) ?? 0,
                            floors: move floors, defaults: move defaults,
                            units: move units, aligns: move aligns)
     }

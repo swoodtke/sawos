@@ -1,0 +1,75 @@
+// A child's handle blocks stay attached when its `Handle` row is set lower
+// (spec §2.7): its table never shrinks while it lives.
+//
+// The image holds two blocks. Child A's row goes to 48, taking one, then to
+// 64, which attaches the second beside the first, and then to 40, which one
+// block would serve. Child B's row of 48 needs one, and none is free,
+// because A kept both. Root then releases A, which never ran, so it is torn
+// down at once, and B's row of 64 takes both blocks A gave back:
+//
+//   SOS blockskept: A limit 48 taken
+//   SOS blockskept: A limit 64 taken
+//   SOS blockskept: A limit 40 taken
+//   SOS blockskept: B limit 48: no room for what was asked
+//   SOS blockskept: B limit 64 taken after A went
+//   SOS blockskept: done
+
+import sos.{System, QuotaKind, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The rows: one block past the body's entries, two, and one lowered to
+/// what one block would serve.
+static ONE_BLOCK: UInt16 = 48
+static A_HIGH: UInt16 = 64
+static A_LOW: UInt16 = 40
+static B_ROW: UInt16 = 48
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS blockskept: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS blockskept: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    // Rows: each child's image, then the RAM of each.
+    var a_image_rec = try proc.boot_handle_next()
+    var b_image_rec = try proc.boot_handle_next()
+    var a_ram_rec = try proc.boot_handle_next()
+    var b_ram_rec = try proc.boot_handle_next()
+    guard let a_image = a_image_rec.take_memory() else { return BUG }
+    guard let b_image = b_image_rec.take_memory() else { return BUG }
+    guard let a_ram = a_ram_rec.take_memory() else { return BUG }
+    guard let b_ram = b_ram_rec.take_memory() else { return BUG }
+    let a = try system.process_create(image: &a_image, memory: &a_ram)
+    let b = try system.process_create(image: &b_image, memory: &b_ram)
+
+    try a.quota_set(kind: QuotaKind.Handle, limit: ONE_BLOCK)
+    print("SOS blockskept: A limit {} taken\n", ONE_BLOCK)
+    try a.quota_set(kind: QuotaKind.Handle, limit: A_HIGH)
+    print("SOS blockskept: A limit {} taken\n", A_HIGH)
+    try a.quota_set(kind: QuotaKind.Handle, limit: A_LOW)
+    print("SOS blockskept: A limit {} taken\n", A_LOW)
+    match b.quota_set(kind: QuotaKind.Handle, limit: B_ROW) {
+        case Ok(_) -> {
+            print("SOS blockskept: UNEXPECTED B limit {} taken\n", B_ROW)
+            return BUG
+        },
+        case Err(why) -> print("SOS blockskept: B limit {}: {}\n", B_ROW, why),
+    }
+    let _ = move a
+    try b.quota_set(kind: QuotaKind.Handle, limit: A_HIGH)
+    print("SOS blockskept: B limit {} taken after A went\n", A_HIGH)
+    return
+}

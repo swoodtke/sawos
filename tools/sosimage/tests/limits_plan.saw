@@ -21,13 +21,14 @@ func ints(values: &[Int]) -> Vector<Int> {
 }
 
 func kernel() -> KernelFacts {
-    let floors: [Int; 13] = [8, 4, 4, 32, 8, 16, 8, 8, 32, 8, 4, 3, 12]
+    let floors: [Int; 14] = [8, 4, 4, 32, 8, 16, 8, 8, 32, 8, 4, 3, 12, 0]
     let defaults: [Int; 9] = [4, 4, 2, 4, 4, 2, 2, 12, 2]
-    let units: [Int; 13] = [24, 20, 20, 24, 48, 56, 20, 20, 16, 556, 3480, 1276, 104]
-    let aligns: [Int; 13] = [16, 16, 16, 16, 16, 16, 16, 16, 16, 512, 16, 16, 16]
+    let units: [Int; 14] = [24, 20, 20, 24, 48, 56, 20, 20, 16, 556, 3480, 1276, 104, 516]
+    let aligns: [Int; 14] = [16, 16, 16, 16, 16, 16, 16, 16, 16, 512, 16, 16, 16, 16]
     KernelFacts(word: 4, capacity: 1 << 20, extents: 4, records_per_body: 4,
                 handles: 32, image_rows: 4, budget: 8, domains: 256,
-                stride: 512, inflight: 16, floors: ints(&floors),
+                stride: 512, inflight: 16, handle_block: 16, table_blocks: 6,
+                boot_set: 64, floors: ints(&floors),
                 defaults: ints(&defaults), units: ints(&units),
                 aligns: ints(&aligns))
 }
@@ -87,6 +88,16 @@ func main() {
     let t = plan("\{\"slabs\": \{\"threads\": 2\}\}")
     let ta = t.areas.get(1)!
     assert(ta.kind == 9 && ta.bytes == 2 * 556 && ta.align == 512, "threads")
+
+    // Handle blocks, whose floor is zero: the area is the blocks stated, in
+    // the record's bytes for one, and it reads back under its own name.
+    let blocks = plan("\{\"slabs\": \{\"handle-blocks\": 3\}\}")
+    let hb = blocks.areas.get(blocks.areas.len() - 1)!
+    assert(hb.kind == 13 && hb.slots == 3 && hb.bytes == 3 * 516 && hb.align == 16,
+           "handle blocks")
+    let blocks_stated = stated("\{\"slabs\": \{\"handle-blocks\": 3\}\}")
+    assert(blocks_stated.json().equals("\{\"slabs\": \{\"handle-blocks\": 3\}, \"quotas\": \{\}\}"),
+           "handle blocks read back: {blocks_stated.json()}")
 
     // A derived total stated above its derivation is taken as stated.
     let above = plan("\{\"slabs\": \{\"processes\": 1, \"process_records\": 10\}\}")

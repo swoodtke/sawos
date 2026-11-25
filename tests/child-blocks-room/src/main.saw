@@ -1,0 +1,97 @@
+// Test child: takes a message carrying handles with its body's entries full,
+// so everything the take mints lands in its handle block.
+//
+// Its launcher set its `Handle` row to 48, one block past the body's 32,
+// gave it a System it can mint siblings of and the outlet of a connection,
+// and staged a message carrying three Events on it. The child drains the
+// outlet, then mints System siblings at the C altitude until it holds index
+// 31, the body's last entry: every one is a first life, so that sibling's
+// word is 32, its bare 1-based index. The take then mints the obligation and
+// the three Events, four entries the body has no room for:
+//
+//   SOS blocksroom: the body is full
+//   SOS blocksroom: took a message carrying 3 handles
+//
+// A take whose pre-flight counted only the body would answer `NoResource`.
+
+import sos.{System, PipeMsg, PIPE_MSG_HANDLES, sos_handle_mint, ALL_RIGHTS}
+
+/// What it ends with when a step went otherwise, and when the take went as
+/// expected, so the launcher's status word tells the two apart.
+static EXIT_MISMATCH: UInt = 98
+static EXIT_TOOK: UInt = 3
+
+/// The status word a successful op answers with (`SosStatus.Ok`), as a number
+/// because the mints work at the C altitude, where a status is one.
+static STATUS_OK: UInt = 0
+
+/// The word of the body's last entry, index 31, at its first life.
+static BODY_LAST: UInt = 32
+
+/// Mint a sibling of `handle`, answering its raw word, or 0, which names
+/// nothing, if the mint was refused.
+func mint(handle: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_handle_mint(handle, ALL_RIGHTS as UInt,
+                                 (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    out
+}
+
+/// How many of the message's handle slots arrived holding a handle.
+func carried(msg: &var PipeMsg) -> UInt {
+    var n: UInt = 0
+    var i: Int = 0
+    while i < PIPE_MSG_HANDLES {
+        if let h = msg.handles[i].take() {
+            let _ = move h
+            n = n + 1
+        }
+        i = i + 1
+    }
+    n
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS blocksroom: no process handle: {}\n", error)
+        return
+    }
+    var outlet_rec = try proc.boot_handle_next() catch {
+        print("SOS blocksroom: no outlet record: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    guard let outlet = outlet_rec.take_outlet() else {
+        print("SOS blocksroom: the record is not an outlet\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+
+    var word = mint(boot_handle)
+    while word != 0 && word < BODY_LAST {
+        word = mint(boot_handle)
+    }
+    if word != BODY_LAST {
+        print("SOS blocksroom: the body did not fill at its last entry\n")
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    print("SOS blocksroom: the body is full\n")
+
+    let got = try outlet.take() catch {
+        print("SOS blocksroom: the take was refused: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let (arrived, request) = move got
+    var msg = move arrived
+    let n = carried(&var msg)
+    let _ = move request
+    print("SOS blocksroom: took a message carrying {} handles\n", n)
+    let _ = proc.exit(EXIT_TOOK)
+}

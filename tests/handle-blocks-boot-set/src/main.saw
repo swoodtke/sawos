@@ -1,0 +1,106 @@
+// A boot set is as long as its table, its records past the body's
+// `MAX_HANDLES` held in the handle blocks (spec §3, §12).
+//
+// The image holds a block for each of two children. Root sets child A's
+// `Handle` row to 48, one block past the body's 32, gives it forty System
+// siblings under tags 1 to 40, and starts it with tag 36, a record in the
+// block. A (`child-blocks-drain`) drains the rest in order. Root then gives
+// child B, at the same row, the same forty records and tag 36 once more,
+// which its boot set already carries in the block: the duplicate tag ends
+// root.
+//
+//   SOS blocksbootset: gave A 40 records
+//   SOS blocksdrain: drained 39 records in order, tag 36 went at the start
+//   SOS blocksbootset: A ended status=65575    <- Exited << 16 | 39
+//   SOS blocksbootset: gave B 40 records, giving tag 36 again
+//   SOS: process fault: an attachment already uses that key process={zero}
+//
+// A boot set held to the body's entries would refuse the 33rd give with
+// `NoResource`.
+
+import sos.{System, Process, QuotaKind, AttachMode, SosStatus, SystemRight}
+
+static EXIT_FAILED: UInt = 1
+
+/// The children's row: one block past the body's entries.
+static ROW: UInt16 = 48
+
+/// The records root gives, under tags 1 to this, and the one A starts with.
+static GIVEN: UInt = 40
+static STARTED: UInt = 36
+
+/// The key root watches A's death under.
+static KEY: UInt = 7
+
+/// What a child may ask its System object for: print, and learn its own
+/// Process object; and `Transfer`, which the give spends.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS blocksbootset: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS blocksbootset: survived the duplicate tag, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    // Rows: each child's image, then the RAM of each.
+    var a_image_rec = try proc.boot_handle_next()
+    var b_image_rec = try proc.boot_handle_next()
+    var a_ram_rec = try proc.boot_handle_next()
+    var b_ram_rec = try proc.boot_handle_next()
+    guard let a_image = a_image_rec.take_memory() else { return BUG }
+    guard let b_image = b_image_rec.take_memory() else { return BUG }
+    guard let a_ram = a_ram_rec.take_memory() else { return BUG }
+    guard let b_ram = b_ram_rec.take_memory() else { return BUG }
+    let a = try system.process_create(image: &a_image, memory: &a_ram)
+    try a.quota_set(kind: QuotaKind.Handle, limit: ROW)
+    let b = try system.process_create(image: &b_image, memory: &b_ram)
+    try b.quota_set(kind: QuotaKind.Handle, limit: ROW)
+
+    try give_all(&system, &a)
+    print("SOS blocksbootset: gave A {} records\n", GIVEN)
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &a, key: KEY, mode: AttachMode.OneShot)
+    try a.start(boot_tag: STARTED)
+    let _ = try waiter.wait()
+    let status = try a.get_status()
+    print("SOS blocksbootset: A ended status={}\n", status)
+
+    try give_all(&system, &b)
+    print("SOS blocksbootset: gave B {} records, giving tag {} again\n", GIVEN,
+          STARTED)
+    let again = try system.mint(rights: CHILD_SYSTEM)
+    try b.give(system: move again, tag: STARTED) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Give `child` a System sibling under each tag from 1 to `GIVEN`.
+func give_all(system: &System, child: &Process) -> Result<Void, SosStatus> {
+    var tag: UInt = 1
+    while tag <= GIVEN {
+        let for_child = try system.mint(rights: CHILD_SYSTEM)
+        try child.give(system: move for_child, tag: tag) catch {
+            let (why, back) = move error
+            let _ = move back
+            print("SOS blocksbootset: give {} refused: {}\n", tag, why)
+            return why
+        }
+        tag = tag + 1
+    }
+    return
+}

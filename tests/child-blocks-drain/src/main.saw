@@ -1,0 +1,57 @@
+// Test child: drains a boot set longer than its body's entries.
+//
+// Its launcher set its `Handle` row to 48, one block past the body's 32, gave
+// it forty System siblings under tags 1 to 40, and started it with tag 36's,
+// a record in its block. The drain answers every other record, in the order
+// they were given, and steps over the one the start delivered:
+//
+//   SOS blocksdrain: drained 39 records in order, tag 36 went at the start
+//
+// It ends with the number it drained.
+
+import sos.{System, SosStatus}
+
+/// What it ends with when the drain went otherwise.
+static EXIT_MISMATCH: UInt = 98
+
+/// The tags its launcher gave, and the one it was started with.
+static GIVEN: UInt = 40
+static STARTED: UInt = 36
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS blocksdrain: no process handle: {}\n", error)
+        return
+    }
+    var drained: UInt = 0
+    var expect: UInt = 1
+    var in_order = true
+    while {
+        let record = try proc.boot_handle_next() catch {
+            if error == SosStatus.Drained {
+                break
+            }
+            print("SOS blocksdrain: the drain was refused: {}\n", error)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        if expect == STARTED {
+            expect = expect + 1
+        }
+        if record.tag != expect {
+            in_order = false
+        }
+        expect = expect + 1
+        drained = drained + 1
+    }
+    if not in_order || expect != GIVEN + 1 {
+        print("SOS blocksdrain: drained {} records out of order\n", drained)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    print("SOS blocksdrain: drained {} records in order, tag {} went at the start\n",
+          drained, STARTED)
+    let _ = proc.exit(drained)
+}

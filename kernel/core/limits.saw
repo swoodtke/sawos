@@ -39,6 +39,8 @@ import sosabi.{ClockType, BOOT_SET_CAPACITY}
 ///
 ///   - `MAX_HANDLES` handle entries in `ProcessBody.handles` and as many in
 ///     `ProcessBody.boot_handles`;
+///   - `MAX_TABLE_BLOCKS` links to handle blocks and their count, whether or
+///     not the process holds any (a block itself is `HANDLE_BLOCKS`' slot);
 ///   - one `MAX_GRANT_ROWS`-row grant record and one `ProcessBody`;
 ///   - `PROCESS_RECORDS_PER_BODY` records, which `MAX_PROCESS_RECORDS` derives
 ///     from it.
@@ -311,8 +313,9 @@ static_assert(PIPE_INFLIGHT >= 1,
 static_assert(PIPE_INFLIGHT <= 64,
               "the staging ring is inline per connection — keep the storage bounded")
 
-/// Handles one process's table can hold (§3): the board's number
-/// (`hal.MAX_HANDLES`), since a table is a field of every process body.
+/// The handle entries every process body holds (§3): the board's number
+/// (`hal.MAX_HANDLES`), since they are a field of every body. A process's
+/// table is longer by the handle blocks it holds.
 public(package) static MAX_HANDLES: Int = hal.MAX_HANDLES
 
 // Root's table takes a region table that fills the Memory and IoMemory floors,
@@ -324,17 +327,44 @@ static_assert(MAX_HANDLES >= 5 + MAX_MEMORIES + MAX_IOMEMORIES,
               "root's handle table must hold a region table filling the Memory and IoMemory floors beside its first handles")
 
 // A drain answers one record per handle in the table, and a process's
-// `BootSet` holds `BOOT_SET_CAPACITY` of them in storage of its own, so it
-// drains without allocating.
+// `BootSet` holds `BOOT_SET_CAPACITY` of them in storage of its own, so a
+// process with no handle blocks drains without allocating.
 static_assert(MAX_HANDLES <= BOOT_SET_CAPACITY,
-              "a process's BootSet must hold every record its handle table can")
+              "a process's BootSet must hold every record a body's handle entries can")
+
+/// The handle entries one handle block holds, with as many boot-set records.
+///
+/// A power of two, so an index past the body's entries splits into a block
+/// and an entry with a shift and a mask.
+public(package) static HANDLE_BLOCK: Int = 16
+
+static_assert(HANDLE_BLOCK > 0 && (HANDLE_BLOCK & (HANDLE_BLOCK - 1)) == 0,
+              "a handle block's length must be a power of two")
+
+/// The handle blocks one process may hold: the length of the body's array of
+/// links to them.
+public(package) static MAX_TABLE_BLOCKS: Int = 6
+
+/// The longest handle table: the body's entries and every block it may hold.
+/// A `Handle` limit past it answers `NoResource`, and every walk of a table
+/// (the lowest-free mint, a delivery's pre-flight, the teardown) is bounded by
+/// it. The handle word's index field must reach it (`kcore.objects`).
+public(package) static LONGEST_TABLE: Int = (MAX_HANDLES
+                                             + MAX_TABLE_BLOCKS * HANDLE_BLOCK)
+
+/// Handle blocks the kernel holds, compiled floor: none. A machine holds
+/// blocks only from its image's area or a donation (`SlabKind.HandleBlocks`),
+/// so a kernel whose image raises nothing pays for the slab's extent table and
+/// no block.
+public(package) static MAX_HANDLE_BLOCKS: Int = 0
 
 // =============================================================================
 // The extent chain
 // =============================================================================
 //
-// Every slab budget above (each `MAX_<KIND>` except `MAX_HANDLES` and
-// `MAX_GRANT_ROWS`, which are fixed array lengths) is a floor, not a ceiling:
+// Every slab budget above (each `MAX_<KIND>` except `MAX_HANDLES`,
+// `MAX_TABLE_BLOCKS` and `MAX_GRANT_ROWS`, which are fixed array lengths) is a
+// floor, not a ceiling:
 // it is extent 0's length, what the image is built with and what a machine that
 // never donates gets. `SlabDonate` raises the machine's actual capacity above
 // it.
@@ -357,14 +387,14 @@ public(package) static MAX_SLAB_EXTENTS: Int = 4
 /// `(generation, index)` where the index names a row of the caller's own handle
 /// table (spec §3), and the row names the slab slot in a full-width `Int` field
 /// (`HandleEntry.target`), so a slab may grow past `1 << HANDLE_INDEX_BITS`
-/// without an extra index bit. `HANDLE_INDEX_BITS` bounds `MAX_HANDLES`, the
+/// without an extra index bit. `HANDLE_INDEX_BITS` bounds `LONGEST_TABLE`, the
 /// per-process table (the assert lives with the decoder, in `kcore.objects`):
 /// however many Events the machine can hold, one process can name at most
-/// `MAX_HANDLES` of them at once. The relation pinned below is that the slab
+/// `LONGEST_TABLE` of them at once. The relation pinned below is that the slab
 /// ceiling never stops every process from filling its table.
 public(package) static MAX_SLAB_CAPACITY: Int = 1 << 20
 
-static_assert(MAX_SLAB_CAPACITY >= MAX_HANDLES * MAX_PROCESSES,
+static_assert(MAX_SLAB_CAPACITY >= LONGEST_TABLE * MAX_PROCESSES,
               "a slab must be able to back every handle every process could hold")
 
 static_assert(MAX_SLAB_CAPACITY < Int.max / 1024,
@@ -477,7 +507,7 @@ public(package) static DEFAULT_QUOTA_PIPES: Int = 2
 /// Handle-table entries a child may hold at once (spec §3).
 ///
 /// Below `MAX_HANDLES` on purpose, so a child meets its own budget rather than
-/// the table's.
+/// the table's, and a create attaches no handle block.
 public(package) static DEFAULT_QUOTA_HANDLES: Int = 12
 
 /// Grant rows a v1 image spends before its process runs: three loadable

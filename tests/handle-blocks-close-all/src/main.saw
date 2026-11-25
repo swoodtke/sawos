@@ -1,0 +1,101 @@
+// A teardown's close-all walks the handle blocks as well as the body's
+// entries (spec §2.10, §3).
+//
+// The image holds one block. Root sets its child's `Handle` row to 48, binds
+// a line, and fills the child's 32 body entries with gives: the System the
+// child starts with, then System siblings. The Interrupt goes last, so the
+// child's only handle on the bound line is the first entry of its block.
+// The child (`child-bye`) exits without touching it. Its teardown releases
+// the Interrupt, which returns the line, and root binds it again:
+//
+//   SOS blocksclose: the Interrupt is the child's 33rd handle
+//   SOS bye: exiting
+//   SOS blocksclose: child ended status=65541    <- Exited << 16 | 5
+//   SOS blocksclose: rebound line 5
+//   SOS blocksclose: done
+//
+// Were the block left out of the walk, the line would still be bound and the
+// second bind would end root with `LineBound`.
+
+import sos.{System, QuotaKind, AttachMode, SosStatus, SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The child's row: one block past the body's entries.
+static ROW: UInt16 = 48
+
+/// The body's entries on every board, `MAX_HANDLES`.
+static BODY: UInt = 32
+
+/// A line both machines wire and neither asserts unasked (`interrupt-unbind`
+/// makes the same choice), so nothing fires between the binds.
+static QUIET_LINE: UInt = 5
+
+/// Root's config: the tag the child's System travels under. The siblings that
+/// fill the body follow it at the next tags, and the Interrupt after them.
+static TAG_BOOT: UInt = 1
+
+/// The key root watches the child's death under.
+static KEY: UInt = 7
+
+/// What the child may ask its System object for: print, and learn its own
+/// Process object; and `Transfer`, which the give spends.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS blocksclose: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS blocksclose: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    let child = try system.process_create(image: &image, memory: &ram)
+    try child.quota_set(kind: QuotaKind.Handle, limit: ROW)
+
+    let line = try system.interrupt_bind(line: QUIET_LINE)
+    var tag = TAG_BOOT
+    while tag < TAG_BOOT + BODY {
+        let for_child = try system.mint(rights: CHILD_SYSTEM)
+        try child.give(system: move for_child, tag: tag) catch {
+            let (why, back) = move error
+            let _ = move back
+            return why
+        }
+        tag = tag + 1
+    }
+    try child.give(interrupt: move line, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    print("SOS blocksclose: the Interrupt is the child's {}rd handle\n",
+          BODY + 1)
+
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY, mode: AttachMode.OneShot)
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = try waiter.wait()
+    let status = try child.get_status()
+    print("SOS blocksclose: child ended status={}\n", status)
+
+    let again = try system.interrupt_bind(line: QUIET_LINE)
+    print("SOS blocksclose: rebound line {}\n", QUIET_LINE)
+    let _ = move again
+    return
+}

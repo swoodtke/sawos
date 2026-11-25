@@ -340,8 +340,8 @@ caller's the whole time and is still in hand when the Timer's key comes back.
 **A fused call mints nothing.** The claim is kernel-internal and tied to the
 parked thread — one reference on the exchange's claim column that no handle
 table holds — so a blocking client spends no table row and no quota on it, and
-`MAX_HANDLES` does not bound a client blocked in calls. `post` keeps minting
-the real handle for multiplexers.
+its handle table does not bound a client blocked in calls. `post` keeps
+minting the real handle for multiplexers.
 
 **`PipeRequestOp.ReplyWait` is the server's half, and it lives on the
 request:** a reply with a built-in wait, the reply being the act that consumes
@@ -1730,11 +1730,12 @@ dead process has to keep is small and what a live one needs is not.
   names it, and so does every object charged to the process (its `process`
   field, or a Mapping's `target`, §2.9), so a handle to a `Gone` process stays
   valid and reads the status word.
-- **The body** holds what only a live process needs: the handle table, the boot
-  set, the protection domain and its grant rows, the recorded entry and stack,
-  and the thread bookkeeping. A live record names its body. The body is freed at
-  the teardown (§2.10), which clears that link, so a `Gone` process holds a
-  record and no body.
+- **The body** holds what only a live process needs: the handle table's first
+  `MAX_HANDLES` entries and its links to the handle blocks it holds (§3), the
+  boot set, the protection domain and its grant rows, the recorded entry and
+  stack, and the thread bookkeeping. A live record names its body. The body is
+  freed at the teardown (§2.10), which clears that link and frees the handle
+  blocks with it, so a `Gone` process holds a record and no body.
 
 `ProcessCreate` takes one record and one body, and either table full answers
 `NoResource`, a status with no quota asked first (§2.9); a create that finds one
@@ -1959,7 +1960,8 @@ sets its own, and nobody sets a row once its process has started.
 - **The bound.** A limit is a number below the unlimited sentinel
   (`QUOTA_UNLIMITED`, the largest value a row holds), which only root's rows
   carry (§2.9). For every kind but `Mapping`, a limit is at most the caller's
-  own limit for that kind, and a `Handle` limit is at most `MAX_HANDLES`. A
+  own limit for that kind, and a `Handle` limit is at most the longest handle
+  table, `MAX_HANDLES` + `MAX_TABLE_BLOCKS` × `HANDLE_BLOCK` (§3). A
   `Mapping` limit is not bounded by the caller's row, because a mapping row
   prices the target's own domain (§2.9's creator-pays exception); it is
   bounded by the child's free grant rows, the board's grant-row budget less
@@ -1967,6 +1969,12 @@ sets its own, and nobody sets a row once its process has started.
   already applied to its default. A limit is never below what the child
   already holds of its kind: what a launcher gave it or created or mapped
   through its handle before the start is charged to it (§2.9).
+- **A `Handle` limit above `MAX_HANDLES` lengthens the table.** The set
+  attaches to the child, before it sets the row, as many handle blocks as
+  the limit needs beyond the body's `MAX_HANDLES` entries, from the
+  `HandleBlocks` slab (§2.8), so a child's table is never shorter than its
+  row. The blocks stay until the child's teardown, whatever its row is set
+  to afterwards. Nobody's row is charged for them.
 - **Its answers, in the order they are decided.** A word that names nothing
   is the `BadHandle` fault and a handle without `ProcessRight.QuotaSet` is
   `AccessDenied`, on §5.7's dispatch order. Then the kind: a number that is
@@ -1977,12 +1985,13 @@ sets its own, and nobody sets a row once its process has started.
   the caller's own for a kind other than `Mapping`, and a limit below what
   the child holds of its kind are each the `BadArg` fault: the caller chose
   the number and can read what bounds it. Then the machine's answer: a
-  `Mapping` limit above the child's free grant rows, and a `Handle` limit
-  above `MAX_HANDLES`, each answer `NoResource` and set nothing. They are
-  statuses because the caller could not have known the bound: how many rows
-  an image spends is a fact of an image the launcher never parses (§12), and
-  no op reports the size of a board's handle table. Otherwise the row is set
-  and the call answers `Ok`.
+  `Mapping` limit above the child's free grant rows, a `Handle` limit above
+  the longest table, and a `Handle` limit needing more handle blocks than
+  the slab has free each answer `NoResource`, and set and attach nothing.
+  They are statuses because the caller could not have known the bound: how
+  many rows an image spends is a fact of an image the launcher never parses
+  (§12), and no op reports the size of a board's handle table or the blocks
+  the machine has free. Otherwise the row is set and the call answers `Ok`.
 - **Reading.** `ProcessOp.QuotaGet(kind)` answers the named process's limit
   and use for one `QuotaKind` as one value word, the limit in bits 0 to 15
   and the use in bits 16 to 31. It is gated by `ProcessRight.Stats` on the
@@ -2088,9 +2097,12 @@ inside it.
 reads a dead process's handle table, boot set or domain, so none of them waits
 on a reference. `clear_domain` invalidates `LAST_PROT_PROCESS` as the body goes,
 so a later process landing in it cannot compare equal to a domain that is no
-longer installed. Where the kernel walks every handle table, the walk is over
-the body table's extent chain and is bounded by `process_slots_usable()` ×
-`MAX_HANDLES`.
+longer installed. The handle blocks go back to their slab with the body, each
+keeping its entries' generations as a reused body does. A walk of one table is
+bounded by the longest table, `MAX_HANDLES` + `MAX_TABLE_BLOCKS` ×
+`HANDLE_BLOCK` (§3), and where the kernel walks every handle table, the walk is
+over the body table's extent chain and is bounded by `process_slots_usable()` ×
+the longest table.
 
 **`Stats` — exact trap introspection, and the pid.** `ProcessOp.Stats` on
 `ProcessRight.Stats` answers through a four-doubleword copy-out record:
@@ -2199,7 +2211,9 @@ another process's counters. Three things about the region:
   protection-domain pool caps bodies, records still grow.
 
 Per-process state is never a parallel `MAX_PROCESSES ×` array: the handle table,
-the boot-handle queue and the grant record are fields of the body, and the quota
+the boot-handle queue and the grant record are fields of the body (the handle
+blocks that lengthen the first two are slots of a slab of their own, which the
+body links, §3), and the quota
 ledger, the status word, the pid and the final trap counters
 are fields of the record (`kcore.pslot`), because a table beside a slab would be
 left behind by a donation. `MAX_ATTACHMENTS` derives from the waitable slabs an
@@ -2311,11 +2325,15 @@ raising a set number raises what is derived from it.
   does. The grant record's length (`hal.MAX_GRANT_ROWS`) is the larger of
   the budget and every segment an image may have plus its stack, which the
   build asserts.
-- **The handle table's length is a board's number too.** `MAX_HANDLES` is
-  set in the HAL, and is at least five more than `MAX_MEMORIES` +
-  `MAX_IOMEMORIES`, so root's table holds a region table that fills those
-  two floors beside its first handles (§12). The build asserts that, and
-  that the handle word's index field can name every entry.
+- **The handle table's length.** `MAX_HANDLES` is set in the HAL: the
+  entries every body holds, at least five more than `MAX_MEMORIES` +
+  `MAX_IOMEMORIES`, so root's table holds a region table filling those two
+  floors beside its first handles (§12). A process's table is longer by the
+  handle blocks it holds (§3), from the `HandleBlocks` slab, whose floor is
+  zero: an image raises it with an area, and a donation adds to it.
+  `HANDLE_BLOCK` and `MAX_TABLE_BLOCKS` are the kernel's, the same on every
+  board. The build asserts that the longest table, `MAX_HANDLES` +
+  `MAX_TABLE_BLOCKS` × `HANDLE_BLOCK`, fits the handle word's index field.
 - **The slab floors are the kernel's** (`kcore.limits`: `MAX_PROCESSES`,
   `MAX_THREADS` and the rest), compiled into every kernel and the same on
   every board. Each is extent 0 of its slab, what a kind holds before
@@ -2535,7 +2553,7 @@ caller one, and the boot charges root one for each
   already costs the one thing quotas count on this axis: a Waiter to hold it,
   charged at `QuotaKind.Waiter`. A client that gives its claim to a
   subscription spends no `Handle` row while the request is outstanding, so
-  `MAX_HANDLES` is not the bound on a client's in-flight depth.
+  its handle table is not the bound on a client's in-flight depth.
 - **A handle in a staged message is charged to nobody.** The post unbinds the
   entry, which credits the sender at the one place a binding is destroyed, and
   the take or the delivery mints it, which charges the taker; the charge is
@@ -2755,7 +2773,7 @@ have no field.
   `(generation << HANDLE_INDEX_BITS) | (index + 1)` — the index field's width is
   one named constant in `sosabi` (`HANDLE_INDEX_BITS`) with every mask and shift
   derived from it, and the remaining bits of a portable 32-bit budget are
-  generation, identically on both profiles. Four properties:
+  generation, identically on both profiles. Five properties:
   - **Generation 0 stamps nothing.** A slot's first-life word is the bare
     1-based index, so §12's boot order holds verbatim.
   - **"Names nothing" is the index field's zero, at every generation.** A
@@ -2768,6 +2786,14 @@ have no field.
     held across a full wrap of one slot's generation aliases silently;
     tables are per-process, so such a collision crosses no boundary and
     grants nothing. This is not to be "fixed" into unbounded bookkeeping.
+  - **Where an entry lives.** A table is the `MAX_HANDLES` entries of its
+    process's body and, for a process whose `Handle` row was set above that
+    (§2.7), up to `MAX_TABLE_BLOCKS` handle blocks of `HANDLE_BLOCK` entries,
+    in the order they were attached: index `MAX_HANDLES` is the first entry
+    of the first block. A table never shrinks while its process lives. A
+    block also holds the boot-set records of its positions, so a process's
+    boot set is as long as its table. A freed block keeps its entries'
+    generations, as a body does.
 - **Rights are a bitmask, scoped per object kind.** Each kind defines its own
   backed rights enum — `SystemRight: UInt32`, whose cases include
   `Transfer = 1`, `Mint = 2`, `Debug = 256` and `Shutdown = 512`, or
@@ -4360,11 +4386,12 @@ death, its notification and its teardown holds for it.
 - **Cost.** A kill costs its caller one teardown inside its own call, the work
   an exit or a fault costs the dying process's trap: the owner sweeps over the
   slabs and the release of the target's handle table (§2.10), each bounded by
-  the slabs' capacities and `MAX_HANDLES`, then, root aside, the ends it owes
-  others at its switch point (above), each a teardown bounded the same way. None
-  of it has a preemption point, so for its length it is interrupt latency for
-  the whole machine. It counts as one syscall in the caller's `Stats`, and
-  nothing is charged to the target once its teardown has begun (§2.7).
+  the slabs' capacities and the longest table (§3), then, root aside, the
+  ends it owes others at its switch point (above), each a teardown bounded
+  the same way. None of it has a preemption point, so for its length it is
+  interrupt latency for the whole machine. It counts as one syscall in the
+  caller's `Stats`, and nothing is charged to the target once its teardown
+  has begun (§2.7).
 
 ## 9. Interrupt delivery
 

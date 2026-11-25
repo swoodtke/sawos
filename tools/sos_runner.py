@@ -453,6 +453,22 @@ QUOTA_SET_ABOVE_OWN_PKG = os.path.join(TESTS_DIR, "quota-set-above-own")
 QUOTA_SET_BELOW_HELD_PKG = os.path.join(TESTS_DIR, "quota-set-below-held")
 QUOTA_SET_ROWS_PKG = os.path.join(TESTS_DIR, "quota-set-rows")
 QUOTA_SET_HANDLES_PKG = os.path.join(TESTS_DIR, "quota-set-handles")
+HANDLE_BLOCKS_QUOTA_PKG = os.path.join(TESTS_DIR, "handle-blocks-quota")
+HANDLE_BLOCKS_SHORT_PKG = os.path.join(TESTS_DIR, "handle-blocks-short")
+HANDLE_BLOCKS_PAST_LONGEST_PKG = os.path.join(TESTS_DIR,
+                                              "handle-blocks-past-longest")
+HANDLE_BLOCKS_BOUNDARY_PKG = os.path.join(TESTS_DIR, "handle-blocks-boundary")
+HANDLE_BLOCKS_KEPT_PKG = os.path.join(TESTS_DIR, "handle-blocks-kept")
+HANDLE_BLOCKS_FREED_PKG = os.path.join(TESTS_DIR, "handle-blocks-freed")
+HANDLE_BLOCKS_CLOSE_ALL_PKG = os.path.join(TESTS_DIR,
+                                           "handle-blocks-close-all")
+HANDLE_BLOCKS_ROOM_PKG = os.path.join(TESTS_DIR, "handle-blocks-room")
+HANDLE_BLOCKS_BOOT_SET_PKG = os.path.join(TESTS_DIR, "handle-blocks-boot-set")
+HANDLE_BLOCKS_DONATE_PKG = os.path.join(TESTS_DIR, "handle-blocks-donate")
+CHILD_BLOCKS_FILL_PKG = os.path.join(TESTS_DIR, "child-blocks-fill")
+CHILD_BLOCKS_BOUNDARY_PKG = os.path.join(TESTS_DIR, "child-blocks-boundary")
+CHILD_BLOCKS_ROOM_PKG = os.path.join(TESTS_DIR, "child-blocks-room")
+CHILD_BLOCKS_DRAIN_PKG = os.path.join(TESTS_DIR, "child-blocks-drain")
 QUOTA_SET_ORDER_PKG = os.path.join(TESTS_DIR, "quota-set-order")
 QUOTA_SET_HELD_PKG = os.path.join(TESTS_DIR, "quota-set-held")
 QUOTA_GET_PKG = os.path.join(TESTS_DIR, "quota-get")
@@ -1832,8 +1848,10 @@ def expectations(arch):
         "ten": f"0x{10:0{width}x}",
         "eleven": f"0x{11:0{width}x}",
         "twelve": f"0x{12:0{width}x}",
+        "thirteen": f"0x{13:0{width}x}",
         "seventeen": f"0x{17:0{width}x}",
         "twenty_nine": f"0x{29:0{width}x}",
+        "thirty_four": f"0x{34:0{width}x}",
         "prio": f"0x{0x01010100:0{width}x}",
         "irq_line": f"0x{arch['selftest_line']:0{width}x}",
         # The byte `child-touch` writes into the page its launcher mapped and
@@ -6784,19 +6802,245 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
-        # The machine, the handle table: a `Handle` limit of `MAX_HANDLES`
-        # is taken and one more answers `NoResource`, setting nothing.
+        # The machine, the handle blocks: a `Handle` limit of `MAX_HANDLES`
+        # needs no block and is taken, and one more, on an image with no
+        # block, answers `NoResource`, setting nothing.
         "name": "quota_set_handles",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "root_pkg": QUOTA_SET_HANDLES_PKG,
         "children": [CHILD_BYE_PKG],
         "expect_out": ["{banner}",
                        "SOS quotahandles: child handle row limit=12 used=0",
-                       "SOS quotahandles: limit 32, the table, taken",
+                       "SOS quotahandles: limit 32, the body's entries, "
+                       "taken",
                        "SOS quotahandles: limit 33: no room for what was "
                        "asked",
-                       "SOS quotahandles: the row still reads limit=32",
+                       "SOS quotahandles: the row reads limit=32",
                        "SOS quotahandles: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same program on an image holding one handle block: the limit
+        # one past `MAX_HANDLES` attaches it and is taken.
+        "name": "quota_set_handles_block",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": QUOTA_SET_HANDLES_PKG,
+        "children": [CHILD_BYE_PKG],
+        "limits": {"slabs": {"handle-blocks": 1}},
+        "expect_out": ["{banner}",
+                       "SOS: slab area kind={thirteen} slots={one}",
+                       "SOS quotahandles: child handle row limit=12 used=0",
+                       "SOS quotahandles: limit 32, the body's entries, "
+                       "taken",
+                       "SOS quotahandles: limit 33: taken",
+                       "SOS quotahandles: the row reads limit=33",
+                       "SOS quotahandles: done"],
+        "expect_clean_exit": True,
+    },
+    # Handle blocks (spec §2.7, §3): a child's table past the body's
+    # `MAX_HANDLES` entries, attached by the `QuotaSet` that raises its
+    # `Handle` row and freed at its teardown. Each image states how many
+    # blocks the machine holds (`handle-blocks`).
+    {
+        # The row's blocks, the lookup's block half and the row's bound: the
+        # child holds 64 handles, prints through the last, and the next
+        # mint meets its row.
+        "name": "handle_blocks_quota",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_BLOCKS_QUOTA_PKG,
+        "children": [CHILD_BLOCKS_FILL_PKG],
+        "limits": {"slabs": {"handle-blocks": 2}},
+        "expect_out": ["{banner}",
+                       "SOS: slab area kind={thirteen} slots={two}",
+                       "SOS blocksquota: child handle row limit=64",
+                       "SOS blocksfill: held=64 limit=64, the last printed=1, "
+                       "then over its quota",
+                       "SOS blocksquota: child ended status=65600",
+                       "SOS blocksquota: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Short of blocks: refused, the row unmoved, and nothing kept that
+        # a second child's row would then miss.
+        "name": "handle_blocks_short",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_BLOCKS_SHORT_PKG,
+        "children": [CHILD_BYE_PKG, CHILD_BYE_PKG],
+        "limits": {"slabs": {"handle-blocks": 1}},
+        "expect_out": ["{banner}",
+                       "SOS blocksshort: A limit 64: no room for what was "
+                       "asked",
+                       "SOS blocksshort: A's row still reads limit=12",
+                       "SOS blocksshort: B limit 48 taken",
+                       "SOS blocksshort: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The longest table: with a block more than a table may take in
+        # the slab, 129 is refused by the bound and 128 taken; filled to its
+        # last index, the table still resolves a zero index field to nothing.
+        "name": "handle_blocks_past_longest",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_BLOCKS_PAST_LONGEST_PKG,
+        "children": [CHILD_BLOCKS_FILL_PKG],
+        "limits": {"slabs": {"handle-blocks": 7}},
+        "expect_out": ["{banner}",
+                       "SOS blockslongest: limit 129: no room for what was "
+                       "asked",
+                       "SOS blockslongest: the row still reads limit=12",
+                       "SOS blockslongest: limit 128 taken, reads limit=128",
+                       "SOS blocksfill: held=128 limit=128, the last "
+                       "printed=1, then over its quota",
+                       "SOS blocksfill: the table is full; releasing the "
+                       "word 0",
+                       "SOS: process fault: bad handle process={one}",
+                       "SOS blockslongest: child ended status=131073",
+                       "SOS blockslongest: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Across the body's edge: the lowest free index, a block entry's
+        # generation, which makes the released word stale, and a word whose
+        # index field is zero, which names nothing whatever the table's
+        # length, and a word one past a table its blocks lengthen. Three
+        # children and root need a body past the floor.
+        "name": "handle_blocks_boundary",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_BLOCKS_BOUNDARY_PKG,
+        "children": [CHILD_BLOCKS_BOUNDARY_PKG, CHILD_BLOCKS_BOUNDARY_PKG,
+                     CHILD_BLOCKS_BOUNDARY_PKG],
+        "limits": {"slabs": {"handle-blocks": 3, "processes": 1}},
+        "expect_out": ["{banner}",
+                       "SOS blocksedge: the body filled to index 32 "
+                       "first-life=1",
+                       "SOS blocksedge: reminted reused=1 lower-first=1",
+                       "SOS blocksedge: using the word released for index "
+                       "32",
+                       "SOS: process fault: bad handle process={one}",
+                       "SOS blocksboundary: stale ended status=131073",
+                       "SOS blocksedge: the body filled to index 32 "
+                       "first-life=1",
+                       "SOS blocksedge: reminted reused=1 lower-first=1",
+                       "SOS blocksedge: using index zero at the reminted "
+                       "generation",
+                       "SOS: process fault: bad handle process={two}",
+                       "SOS blocksboundary: zero ended status=131073",
+                       "SOS blocksedge: the body filled to index 32 "
+                       "first-life=1",
+                       "SOS blocksedge: reminted reused=1 lower-first=1",
+                       "SOS blocksedge: using index 48, one past the table",
+                       "SOS: process fault: bad handle process={three}",
+                       "SOS blocksboundary: past ended status=131073",
+                       "SOS blocksboundary: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A second attach links beside the first, a lowered row keeps its
+        # blocks, and a child torn down before it ran gives them back.
+        "name": "handle_blocks_kept",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_BLOCKS_KEPT_PKG,
+        "children": [CHILD_BYE_PKG, CHILD_BYE_PKG],
+        "limits": {"slabs": {"handle-blocks": 2}},
+        "expect_out": ["{banner}",
+                       "SOS blockskept: A limit 48 taken",
+                       "SOS blockskept: A limit 64 taken",
+                       "SOS blockskept: A limit 40 taken",
+                       "SOS blockskept: B limit 48: no room for what was "
+                       "asked",
+                       "SOS blockskept: B limit 64 taken after A went",
+                       "SOS blockskept: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The teardown gives a child's blocks back, and the body it ran in
+        # holds none for the next process made in it.
+        "name": "handle_blocks_freed",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_BLOCKS_FREED_PKG,
+        "children": [CHILD_BYE_PKG, CHILD_BYE_PKG, CHILD_BYE_PKG,
+                     CHILD_BYE_PKG],
+        "limits": {"slabs": {"handle-blocks": 2, "processes": 1}},
+        "expect_out": ["{banner}",
+                       "SOS blocksfreed: A limit 64 taken",
+                       "SOS bye: exiting",
+                       "SOS blocksfreed: A ended status=65541",
+                       "SOS blocksfreed: B limit 48 taken",
+                       "SOS blocksfreed: gave B 33 records",
+                       "SOS blocksfreed: C limit 48 taken",
+                       "SOS blocksfreed: D limit 48: no room for what was "
+                       "asked",
+                       "SOS blocksfreed: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The close-all walks the blocks: the child's only handle on a
+        # bound line is in its block, and its teardown returns the line.
+        "name": "handle_blocks_close_all",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_BLOCKS_CLOSE_ALL_PKG,
+        "children": [CHILD_BYE_PKG],
+        "limits": {"slabs": {"handle-blocks": 1}},
+        "expect_out": ["{banner}",
+                       "SOS blocksclose: the Interrupt is the child's 33rd "
+                       "handle",
+                       "SOS bye: exiting",
+                       "SOS: process teardown handles={thirty_four} "
+                       "threads={one} events={zero} waiters={zero} "
+                       "interrupts={one} timers={zero} process={one}",
+                       "SOS blocksclose: child ended status=65541",
+                       "SOS blocksclose: rebound line 5",
+                       "SOS blocksclose: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A take's pre-flight counts the block's free entries.
+        "name": "handle_blocks_room",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_BLOCKS_ROOM_PKG,
+        "children": [CHILD_BLOCKS_ROOM_PKG],
+        "limits": {"slabs": {"handle-blocks": 1}},
+        "expect_out": ["{banner}",
+                       "SOS blocksroom: the body is full",
+                       "SOS blocksroom: took a message carrying 3 handles",
+                       "SOS blocksroomroot: child ended status=65539",
+                       "SOS blocksroomroot: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The boot set extends with the table: forty records, the one the
+        # start delivers among the block's, and a tag the block's records
+        # carry is a duplicate, which ends root.
+        "name": "handle_blocks_boot_set",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_BLOCKS_BOOT_SET_PKG,
+        "children": [CHILD_BLOCKS_DRAIN_PKG, CHILD_BYE_PKG],
+        "limits": {"slabs": {"handle-blocks": 2}},
+        "expect_out": ["{banner}",
+                       "SOS blocksbootset: gave A 40 records",
+                       "SOS blocksdrain: drained 39 records in order, tag 36 "
+                       "went at the start",
+                       "SOS blocksbootset: A ended status=65575",
+                       "SOS blocksbootset: gave B 40 records, giving tag 36 "
+                       "again",
+                       "SOS: process fault: an attachment already uses that "
+                       "key process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A donation raises the handle-block slab from its floor of none.
+        "name": "handle_blocks_donate",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HANDLE_BLOCKS_DONATE_PKG,
+        "children": [CHILD_BYE_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS blocksdonate: limit 48: no room for what was "
+                       "asked",
+                       "SOS blocksdonate: donated a page of handle blocks",
+                       "SOS blocksdonate: limit 48 taken",
+                       "SOS blocksdonate: done"],
         "expect_clean_exit": True,
     },
     {
@@ -11136,7 +11380,7 @@ TEST_CASES = [
                "the slab block is cut short"),
     _slab_stop("slab_block_bytes_after", {"areas": [], "tail": 8},
                "bytes follow the slab block"),
-    _slab_stop("slab_area_unknown_kind", {"areas": [{"kind_raw": 13}]},
+    _slab_stop("slab_area_unknown_kind", {"areas": [{"kind_raw": 14}]},
                "a slab area names a kind this build cannot name"),
     _slab_stop("slab_area_kind_twice",        # and past the address space
                {"areas": [{"kind": "waiters"},
@@ -19137,7 +19381,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "heap_share_only", "heap_share_grain", "heap_refusals",
                      "heap_rights", "heap_missing_slot", "heap_slot_bound",
                      "heap_wrong_free", "heap_zero_spent", "heap_main_err",
-                     "heap_sizing"]
+                     "heap_sizing", "handle_blocks_quota"]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 

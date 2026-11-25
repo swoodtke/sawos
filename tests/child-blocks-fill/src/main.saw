@@ -1,0 +1,102 @@
+// Test child: fills its handle table to its `Handle` row with siblings of its
+// System, prints through the last of them, and exits with how many handles
+// it held.
+//
+// Its launcher set the row above the body's `MAX_HANDLES` entries, so the
+// siblings past the body land in the handle blocks the row attached. It
+// mints them at the C altitude and keeps each word in an array, so no frame
+// grows with the table. The refusal must be the row's (`QuotaExceeded`): a
+// full table (`NoResource`) or any other refusal ends it with
+// `EXIT_MISMATCH` instead of the count. At the refusal it prints a byte
+// through the last sibling, an entry of the last block, and reads its row,
+// whose use is what it held:
+//
+//   SOS blocksfill: held=64 limit=64, the last printed=1, then over its quota
+//
+// A child whose row is the longest table, 128, holds every entry at the
+// refusal, the last block's last, index 127, included. It then releases the
+// word 0, whose index field is zero and names nothing in any table, and the
+// kernel ends it with `BadHandle`:
+//
+//   SOS blocksfill: the table is full; releasing the word 0
+
+import sos.{System, QuotaKind, SosStatus, ALL_RIGHTS, sos_handle_mint,
+            sos_handle_release, sos_system_debug_print}
+
+/// What it ends with when a step went otherwise, and when the word 0 named
+/// something. Numbers that could not be a count, so the launcher's status
+/// word tells them apart from one.
+static EXIT_MISMATCH: UInt = 98
+static EXIT_NAMED: UInt = 97
+
+/// The status word a successful op answers with (`SosStatus.Ok`), as a number
+/// because the mints work at the C altitude, where a status is one.
+static STATUS_OK: UInt = 0
+
+/// The longest handle table, `MAX_HANDLES` + `MAX_TABLE_BLOCKS` x
+/// `HANDLE_BLOCK`, which no op publishes; the most words it can hold.
+static LONGEST: Int = 128
+
+/// The byte printed through the last sibling.
+static MARK: UInt = 0x2E
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+/// Mint a sibling of `handle`, answering the op's status and the word.
+func mint(handle: UInt) unsafe -> (UInt, UInt) {
+    var out: UInt = 0
+    let status = sos_handle_mint(handle, ALL_RIGHTS as UInt,
+                                 (&var out) as UnsafePointer<UInt>)
+    (status, out)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS blocksfill: no process handle: {}\n", error)
+        return
+    }
+
+    // Every sibling is held until the refusal: the words are never released,
+    // and the exit's teardown closes them.
+    var words: [UInt; LONGEST] = [0; LONGEST]
+    var n: Int = 0
+    var status = STATUS_OK
+    while n < LONGEST {
+        let (answer, word) = mint(boot_handle)
+        status = answer
+        if status != STATUS_OK {
+            break
+        }
+        words[n] = word
+        n = n + 1
+    }
+    if status != (SosStatus.QuotaExceeded as UInt) || n == 0 {
+        print("SOS blocksfill: refused otherwise after {}: status {}\n", n,
+              status)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let printed = sos_system_debug_print(words[n - 1], MARK) == STATUS_OK
+    let row = try proc.quota_get(kind: QuotaKind.Handle) catch {
+        print("\nSOS blocksfill: no row: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    print("\nSOS blocksfill: held={} limit={}, the last printed={}, {}\n",
+          row.used, row.limit, flag(printed), "then over its quota")
+    if (row.used as Int) == LONGEST {
+        print("SOS blocksfill: the table is full; releasing the word 0\n")
+        let _ = sos_handle_release(0)
+        print("SOS blocksfill: the word 0 named an entry\n")
+        let _ = proc.exit(EXIT_NAMED)
+        return
+    }
+    let _ = proc.exit(row.used as UInt)
+}

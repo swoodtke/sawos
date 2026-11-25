@@ -1,0 +1,93 @@
+// A delivery's pre-flight counts the free entries of the handle blocks as
+// well as the body's (spec §2.1, §3).
+//
+// The image holds one block. Root sets its child's `Handle` row to 48, one
+// block past the body's 32, stages a message carrying three Events on a
+// connection, and gives the child a System and the connection's outlet. The
+// child (`child-blocks-room`) fills its body's entries and then takes the
+// message, whose obligation and three Events land in its block:
+//
+//   SOS blocksroom: the body is full
+//   SOS blocksroom: took a message carrying 3 handles
+//   SOS blocksroomroot: child ended status=65539    <- Exited << 16 | 3
+//   SOS blocksroomroot: done
+
+import sos.{System, QuotaKind, AttachMode, PipeHandles, SosStatus,
+            SystemRight, PIPE_BODY_BYTES}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The child's row: one block past the body's entries.
+static ROW: UInt16 = 48
+
+/// The handles the message carries.
+static CARRIED: Int = 3
+
+/// Root's config: the tags the child's System and outlet travel under.
+static TAG_BOOT: UInt = 1
+static TAG_OUTLET: UInt = 2
+
+/// The key root watches the child's death under.
+static KEY: UInt = 7
+
+/// What the child may ask its System object for: print, learn its own
+/// Process object, and mint siblings; and `Transfer`, which the give spends.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Mint | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS blocksroomroot: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS blocksroomroot: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    let child = try system.process_create(image: &image, memory: &ram)
+    try child.quota_set(kind: QuotaKind.Handle, limit: ROW)
+
+    let (inlet, outlet) = try proc.pipe_create()
+    let event = try proc.event_create()
+    var carrier = PipeHandles.none()
+    var i: Int = 0
+    while i < CARRIED {
+        carrier.put(at: i, event: try event.mint())
+        i = i + 1
+    }
+    var body: [UInt8; PIPE_BODY_BYTES] = [0; PIPE_BODY_BYTES]
+    let claim = try inlet.post_with(body: &body, len: 0, handles: &var carrier)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.give(outlet: move outlet, tag: TAG_OUTLET) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY, mode: AttachMode.OneShot)
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = try waiter.wait()
+    let status = try child.get_status()
+    print("SOS blocksroomroot: child ended status={}\n", status)
+    let _ = move claim
+    return
+}

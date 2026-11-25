@@ -1,0 +1,123 @@
+// Test child: the lowest free index and a slot's generation across the edge
+// between the body's entries and the first handle block.
+//
+// Its launcher set its `Handle` row to 48, one block past the body's 32, and
+// gave it Systems it can mint siblings of, at the lowest indexes, starting it
+// with the last. It mints siblings at the C altitude until it holds index 32,
+// the first entry of the block. Every one is a first life, so each word is
+// its bare 1-based index (spec §12's boot order rests on the same encoding)
+// and each is one more than the last: index 31 is word 32 and index 32 is
+// word 33.
+//
+// It releases both, then mints twice more. The lowest free index is 31, so
+// the first lands there and the second at 32, and both carry a generation,
+// so each word is larger than any first-life word, and the first is the
+// smaller. Then it uses a word that names nothing, which ends it with
+// `BadHandle`. Started with word 1, it uses the word it released for index
+// 32, whose slot is bound again at a later life. Started with word 2, it uses
+// a word whose index field is zero at the generation the second mint
+// carries, which is that mint's word less its first-life word. Started with
+// any other, it uses the first-life word of index 48, the first past its
+// table:
+//
+//   SOS blocksedge: the body filled to index 32 first-life=1
+//   SOS blocksedge: reminted reused=1 lower-first=1
+//   SOS blocksedge: using the word released for index 32
+//   SOS: process fault: bad handle ...
+//
+// or, for the second ending and the third,
+//
+//   SOS blocksedge: using index zero at the reminted generation
+//   SOS blocksedge: using index 48, one past the table
+
+import sos.{System, sos_handle_mint, sos_handle_release, ALL_RIGHTS}
+
+static EXIT_FAILED: UInt = 1
+
+/// The status word a successful op answers with (`SosStatus.Ok`), as a number
+/// because this file works at the C altitude, where a status is one.
+static STATUS_OK: UInt = 0
+
+/// The body's entries on every board, `MAX_HANDLES`: index 32 is the first
+/// entry past them.
+static BODY: UInt = 32
+
+/// The table's length: the row its launcher set, one block past the body.
+static TABLE: UInt = 48
+
+/// The words that start the first ending and the second; any other starts
+/// the third.
+static STALE_ENDING: UInt = 1
+static ZERO_ENDING: UInt = 2
+
+static YES: UInt = 1
+static NO: UInt = 0
+
+func flag(b: Bool) -> UInt {
+    if b { YES } else { NO }
+}
+
+/// Mint a sibling of `handle`, answering its raw word, or 0, which names
+/// nothing, if the mint was refused.
+func mint(handle: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    let status = sos_handle_mint(handle, ALL_RIGHTS as UInt,
+                                 (&var out) as UnsafePointer<UInt>)
+    if status != STATUS_OK {
+        return 0
+    }
+    out
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    // Up to index 32, each a first life one past the last.
+    let last_body = BODY
+    let first_block = BODY + 1
+    var first_life = true
+    var expect = boot_handle + 1
+    var word = mint(boot_handle)
+    while word != 0 && word < first_block {
+        if word != expect {
+            first_life = false
+        }
+        expect = expect + 1
+        word = mint(boot_handle)
+    }
+    if word != first_block || expect != first_block {
+        first_life = false
+    }
+    print("SOS blocksedge: the body filled to index {} first-life={}\n", BODY,
+          flag(first_life))
+
+    // The last entry of the body and the first of the block.
+    let released = sos_handle_release(last_body)
+    if released != STATUS_OK || sos_handle_release(first_block) != STATUS_OK {
+        let _ = system.debug_print("SOS blocksedge: a release was refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let again = mint(boot_handle)
+    let next = mint(boot_handle)
+    print("SOS blocksedge: reminted reused={} lower-first={}\n",
+          flag(again > first_block && next > first_block),
+          flag(again < next))
+
+    if boot_handle == STALE_ENDING {
+        let _ = system.debug_print(
+            "SOS blocksedge: using the word released for index 32\n")
+        let _ = sos_handle_release(first_block)
+    } else if boot_handle == ZERO_ENDING {
+        let _ = system.debug_print(
+            "SOS blocksedge: using index zero at the reminted generation\n")
+        let _ = sos_handle_release(next - first_block)
+    } else {
+        let _ = system.debug_print(
+            "SOS blocksedge: using index 48, one past the table\n")
+        let _ = sos_handle_release(TABLE + 1)
+    }
+    let _ = system.debug_print("SOS blocksedge: survived, which is the bug\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

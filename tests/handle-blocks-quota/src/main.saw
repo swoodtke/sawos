@@ -1,0 +1,79 @@
+// A `Handle` row above the body's `MAX_HANDLES` entries lengthens the
+// child's table with handle blocks, and the child holds that many handles
+// (spec §2.7, §3).
+//
+// The image holds two blocks. Root sets its child's row to 64, two blocks
+// past the body's 32, and reads it back. The child (`child-blocks-fill`)
+// mints siblings of its System until its row refuses one, prints through the
+// last, and exits with how many it held:
+//
+//   SOS blocksquota: child handle row limit=64
+//   SOS blocksfill: held=64 limit=64, the last printed=1, then over its quota
+//   SOS blocksquota: child ended status=65600    <- Exited << 16 | 64
+//   SOS blocksquota: done
+//
+// Without the blocks the 33rd mint would meet the body's end (`NoResource`),
+// and without the block half of the lookup the print through the last word
+// would end the child with `BadHandle`.
+
+import sos.{System, Process, Memory, AttachMode, QuotaKind, SosStatus,
+            SystemRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The row root sets: two handle blocks past the body's entries.
+static ROW: UInt16 = 64
+
+/// Root's config: the tag the child's System travels under.
+static TAG_BOOT: UInt = 1
+
+/// The key root watches the child's death under.
+static KEY: UInt = 7
+
+/// What the child may ask its System object for: print, learn its own
+/// Process object and mint siblings; and `Transfer`, which the give spends.
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Mint | SystemRight.Transfer)
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS blocksquota: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS blocksquota: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    let child = try system.process_create(image: &image, memory: &ram)
+
+    try child.quota_set(kind: QuotaKind.Handle, limit: ROW)
+    let row = try child.quota_get(kind: QuotaKind.Handle)
+    print("SOS blocksquota: child handle row limit={}\n", row.limit)
+
+    let for_child = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move for_child, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY, mode: AttachMode.OneShot)
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = try waiter.wait()
+    let status = try child.get_status()
+    print("SOS blocksquota: child ended status={}\n", status)
+    return
+}

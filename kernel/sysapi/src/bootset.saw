@@ -8,10 +8,12 @@
 //!
 //! The drain allocates nothing, so a process with no heap can drain its set.
 //! Every record names a handle in the process's own table, so a drain meets
-//! at most `MAX_HANDLES` records, and the kernel holds that number under
-//! `BOOT_SET_CAPACITY` (`kcore.limits`). The set keeps each record as the
-//! kernel wrote it, its three words, in an inline array that many records
-//! long, and makes the record's wrapper only when it is taken.
+//! at most as many records as the table holds: the `MAX_HANDLES` entries of a
+//! body, which the kernel holds under `BOOT_SET_CAPACITY` (`kcore.limits`),
+//! and the handle blocks a launcher attached past them. The set keeps each
+//! record as the kernel wrote it, its three words, in an inline array
+//! `BOOT_SET_CAPACITY` records long, and makes the record's wrapper only when
+//! it is taken.
 //!
 //! That array is the set's size, a few words per record of the capacity, so
 //! each copy of a set is that much stack. `drain_into` builds a set in
@@ -80,9 +82,9 @@ extension BootSet {
     /// `SosStatus.Drained` answers that status, and the records drained
     /// before it are released.
     ///
-    /// More records than `BOOT_SET_CAPACITY` panic, naming the capacity: the
-    /// kernel's table cannot hold them, so only a kernel built past its own
-    /// assert could answer one.
+    /// More records than `BOOT_SET_CAPACITY` panic, naming the capacity. Only
+    /// a process whose handle blocks make its table longer can be given that
+    /// many; it drains them with `Process.boot_handle_next` instead.
     ///
     /// A pool given under a heap tag leaves the set: it becomes the pool of
     /// its slot's heap (`Heap`), and a right adoption needs that is missing

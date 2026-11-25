@@ -1,0 +1,66 @@
+// A donation of `SlabKind.HandleBlocks` adds handle blocks for the next
+// `Handle` row that needs them (spec §2.7, §2.8).
+//
+// The image holds no block and the compiled floor is none, so a row of 48,
+// one block past the body's 32, answers `NoResource`. Root donates a page of
+// its pool to the handle-block slab, and the same row is then taken:
+//
+//   SOS blocksdonate: limit 48: no room for what was asked
+//   SOS blocksdonate: donated a page of handle blocks
+//   SOS blocksdonate: limit 48 taken
+//   SOS blocksdonate: done
+
+import sos.{System, QuotaKind, SlabKind, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The child's row: one block past the body's entries.
+static ROW: UInt16 = 48
+
+/// The bytes donated: more than a block on every board.
+static PAGE: UInt = 0x1000
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    try run(&system) catch {
+        print("SOS blocksdonate: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS blocksdonate: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(system: &System) -> Result<Void, SosStatus> {
+    let proc = try system.process_self()
+    var image_rec = try proc.boot_handle_next()
+    var ram_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let ram = ram_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    let child = try system.process_create(image: &image, memory: &ram)
+
+    match child.quota_set(kind: QuotaKind.Handle, limit: ROW) {
+        case Ok(_) -> {
+            print("SOS blocksdonate: UNEXPECTED limit {} taken\n", ROW)
+            return BUG
+        },
+        case Err(why) -> print("SOS blocksdonate: limit {}: {}\n", ROW, why),
+    }
+    let page = try pool.allocate(len: PAGE)
+    try system.slab_donate(kind: SlabKind.HandleBlocks, memory: move page) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    print("SOS blocksdonate: donated a page of handle blocks\n")
+    try child.quota_set(kind: QuotaKind.Handle, limit: ROW)
+    print("SOS blocksdonate: limit {} taken\n", ROW)
+    return
+}

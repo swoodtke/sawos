@@ -3,8 +3,9 @@
 // profiles shaped as the runner writes them, and each disagreement is refused
 // naming both values, first against numbers given here and then against the
 // riscv32 HAL compiled (`hal_facts`, with the compiler `SAWC` names, as
-// `blade test` runs). The test runs in the package's directory, two below the
-// tree's top.
+// `blade test` runs). A compiled record of another version, the HAL's or a
+// kernel's limits, is refused by its version. The test runs in the package's
+// directory, two below the tree's top.
 
 import std.env.{Env}
 import sosimage.board.{Board}
@@ -393,16 +394,30 @@ func main() {
     }
     assert(v1.equals("{staging}/v1.o: `sosimage_hal_facts` is version 1; this builder reads version 4"), "another version: {v1}")
 
+    // A kernel whose limits record is of another version is refused by its
+    // version, whatever its length, before any slab is measured.
+    var old_limits = Vector<String>()
+    try! old_limits.push("@export(\"sos_image_limits\")")
+    try! old_limits.push("static LIMITS: [UInt; 32] = [1; 32]")
+    try! write_lines("{staging}/limits_v1.saw", &old_limits)
+    try! build_kernel(&profile, "{staging}/limits_v1.saw", "{staging}/limits_v1.o")
+    let limits_v1 = match KernelFacts.read("{staging}/limits_v1.o") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    assert(limits_v1.equals("the kernel object {staging}/limits_v1.o: `sos_image_limits` is version 1; this builder reads version 2"),
+           "a limits record of another version: {limits_v1}")
+
     // An image's limits over a board's defaults: totals become raises above
     // the floor, and a total below the floor is refused.
     var floors = Vector<Int>()
     var k = 0
-    while k < 13 {
+    while k < 14 {
         try! floors.push(4)
         k = k + 1
     }
     let kernel = KernelFacts(word: 4, capacity: 255, extents: 4, records_per_body: 4, handles: 32,
-                             image_rows: 4, budget: 8, domains: 256, stride: 0, inflight: 16,
+                             image_rows: 4, budget: 8, domains: 256, stride: 0, inflight: 16, handle_block: 16, table_blocks: 6, boot_set: 64,
                              floors: move floors, defaults: Vector<Int>(), units: Vector<Int>(),
                              aligns: Vector<Int>())
     var stated = Vector<LimitsSpec>()

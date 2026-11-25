@@ -138,7 +138,7 @@ import sosabi.{
     ENTRY_IMAGE,
 }
 import kcore.limits.{
-    MAX_HANDLES,
+    LONGEST_TABLE,
     NO_ATTACHMENT,
     NO_EVENT,
     NO_INTERRUPT,
@@ -208,7 +208,10 @@ import kcore.objects.{
     pool_cut,
     staged_count,
     table_room,
+    attach_handle_blocks,
+    blocks_for,
     boot_handle_cursor,
+    boot_record_at,
     boot_kind_of,
     msg_kind_of,
     exchange_body_addr,
@@ -223,7 +226,8 @@ import kcore.objects.{
     boot_handle_take,
     boot_tag_used,
     handle_kind,
-    handle_word_index,    install_quota_limits,
+    handle_word_index,
+    install_quota_limits,
     lookup_handle,
     mint_capped,
     mint_handle,
@@ -945,6 +949,12 @@ func process_ceiling(p: Int, target: Int, raw: UInt) unsafe -> SyscallResult {
 /// free grant rows, which keeps `install_row`'s stop unreachable. The sentinel
 /// bound comes first, so no limit set here reads as no cap and the narrowing to
 /// a row's width at the write is exact.
+///
+/// A `Handle` limit is held to the longest table, and one past the body's
+/// `MAX_HANDLES` entries attaches the handle blocks it needs before the row is
+/// set, so the child's table is never shorter than its row. The attach is the
+/// last answer: it takes every block it needs or none, so a `NoResource` here
+/// leaves the child as it found it. Nobody's row is charged for a block.
 func process_quota_set(p: Int, child: Int, raw: UInt,
                        limit: UInt) unsafe -> SyscallResult {
     guard let kind = QuotaKind.from(raw: raw) else {
@@ -975,7 +985,10 @@ func process_quota_set(p: Int, child: Int, raw: UInt,
             }
         },
         case Handle -> {
-            if limit > (MAX_HANDLES as UInt) {
+            if limit > (LONGEST_TABLE as UInt) {
+                return op_status(SosStatus.NoResource)
+            }
+            if not attach_handle_blocks(child, blocks_for(limit as Int)) {
                 return op_status(SosStatus.NoResource)
             }
         },
@@ -1672,7 +1685,7 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     if cursor >= PROCESSES[body].boot_count {
         return op_status(SosStatus.Drained)
     }
-    let queued = PROCESSES[body].boot_handles[cursor]
+    let queued = boot_record_at(body, cursor)
     var rec = BootHandleWire(tag: queued.tag, kind: queued.kind as UInt,
                              handle: queued.handle)
     if let why = copy_out(p, dst,
@@ -4184,7 +4197,7 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
 ///   - No claim is minted. The exchange's reply column starts at one for the
 ///     parked thread, not for a handle entry, so a fused RPC spends no table
 ///     row and no handle traffic, which matters for a client that meets
-///     `MAX_HANDLES` before it meets the ring. `Exchange.caller` is the tie;
+///     its handle table before it meets the ring. `Exchange.caller` is the tie;
 ///     `kcore.refs`' one wake arm reads it.
 ///   - A full ring parks rather than answering `WouldBlock`. `post` surfaces
 ///     the refusal because it never suspends; this op does, so it waits for the

@@ -1,15 +1,20 @@
-// A `Handle` limit is at most the handle table's size, `MAX_HANDLES` (spec
-// §2.7). A limit above it answers `NoResource` and sets nothing: no op reports
-// the size of a board's handle table, so the caller could not have known.
+// A `Handle` limit past the body's `MAX_HANDLES` entries needs a handle
+// block (spec §2.7): taken when the machine has one free, and otherwise
+// `NoResource`, setting nothing. No op reports the machine's free blocks, so
+// the caller could not have known.
 //
-// Root's own Handle row has no cap, so its own limit bounds nothing here, and
-// the table is the one bound the number meets. A limit of the table's size is
-// taken; one more is refused, and the row still reads the table's size.
+// Root's own Handle row has no cap, so its own limit bounds nothing here. A
+// limit of the body's entries needs no block and is taken. One more needs a
+// block, and the case runs twice: on an image with none, where the limit is
+// refused and the row still reads the body's entries, and on an image with
+// one, where it is taken.
 //
 //   SOS quotahandles: child handle row limit=12 used=0
-//   SOS quotahandles: limit 32, the table, taken
-//   SOS quotahandles: limit 33: no room for what was asked
-//   SOS quotahandles: the row still reads limit=32
+//   SOS quotahandles: limit 32, the body's entries, taken
+//   SOS quotahandles: limit 33: no room for what was asked    (no block)
+//   SOS quotahandles: the row reads limit=32
+//   SOS quotahandles: limit 33: taken                         (one block)
+//   SOS quotahandles: the row reads limit=33
 //   SOS quotahandles: done
 
 import sos.{System, QuotaKind, SosStatus}
@@ -17,9 +22,8 @@ import sos.{System, QuotaKind, SosStatus}
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// `MAX_HANDLES`, the same on every board (`hal.MAX_HANDLES`). No op
-/// publishes it, which is why a limit past it is a status.
-static TABLE: UInt16 = 32
+/// `MAX_HANDLES`, the same on every board (`hal.MAX_HANDLES`).
+static BODY: UInt16 = 32
 
 /// A status no arm of this case can produce honestly.
 static BUG: SosStatus = SosStatus.BadImage
@@ -47,18 +51,14 @@ func run(system: &System) -> Result<Void, SosStatus> {
     let before = try child.quota_get(kind: QuotaKind.Handle)
     print("SOS quotahandles: child handle row limit={} used={}\n", before.limit,
           before.used)
-    try child.quota_set(kind: QuotaKind.Handle, limit: TABLE)
-    print("SOS quotahandles: limit {}, the table, taken\n", TABLE)
-    match child.quota_set(kind: QuotaKind.Handle, limit: TABLE + 1) {
-        case Ok(_) -> {
-            print("SOS quotahandles: UNEXPECTED past the table, taken\n")
-            return BUG
-        },
-        case Err(why) -> {
-            print("SOS quotahandles: limit {}: {}\n", TABLE + 1, why)
-        },
+    try child.quota_set(kind: QuotaKind.Handle, limit: BODY)
+    print("SOS quotahandles: limit {}, the body's entries, taken\n", BODY)
+    match child.quota_set(kind: QuotaKind.Handle, limit: BODY + 1) {
+        case Ok(_) -> print("SOS quotahandles: limit {}: taken\n", BODY + 1),
+        case Err(why) -> print("SOS quotahandles: limit {}: {}\n", BODY + 1,
+                               why),
     }
     let after = try child.quota_get(kind: QuotaKind.Handle)
-    print("SOS quotahandles: the row still reads limit={}\n", after.limit)
+    print("SOS quotahandles: the row reads limit={}\n", after.limit)
     return
 }

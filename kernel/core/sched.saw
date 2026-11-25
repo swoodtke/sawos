@@ -26,7 +26,6 @@ import sosabi.{
 import kcore.limits.{
     MAX_ATTACHMENTS,
     MAX_EVENTS,
-    MAX_HANDLES,
     MAX_MAPPINGS,
     MAX_TIMERS,
     MAX_WAITERS,
@@ -46,6 +45,9 @@ import kcore.objects.{
     ROW_TARGET_DIED,
     SlotState,
     clear_boot_handles,
+    entry_at,
+    free_handle_blocks,
+    table_len,
     quota_clear,
     quota_credit,
     handle_word_index,
@@ -882,9 +884,14 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // is the handle in this table, so the line is masked and bindable again
     // here, and an attachment on another process's Waiter fires. The count of
     // those is the teardown line's `interrupts=`.
+    //
+    // The walk covers the whole table, the handle blocks' entries after the
+    // body's, and is bounded by the longest table. Nothing attaches a block to
+    // a dying process, so the length read here holds for the walk.
+    let len = if body != NO_BODY { table_len(body) } else { 0 }
     var h: Int = 0
-    while body != NO_BODY && h < MAX_HANDLES {
-        let entry = PROCESSES[body].handles[h]
+    while h < len {
+        let entry = entry_at(body, h)
         match entry.obj_type {
             case Unbound -> {},
             case _ -> {
@@ -961,11 +968,13 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // body's table as empty, so an entry still bound here would hand the next
     // process a capability it was never given. Nothing mints into a dying
     // table after the close-all, because no thread of this process is left on
-    // a list a delivery reads; this checks that rather than trusting it.
+    // a list a delivery reads; this checks that rather than trusting it, over
+    // the handle blocks too, which go back to their slab beside the body: a
+    // block's next holder takes its entries as empty in the same way.
     if body != NO_BODY {
         var e: Int = 0
-        while e < MAX_HANDLES {
-            match PROCESSES[body].handles[e].obj_type {
+        while e < len {
+            match entry_at(body, e).obj_type {
                 case Unbound -> {},
                 case _ -> {
                     fatal_kernel("a body went back with a bound handle entry",
@@ -974,6 +983,7 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
             }
             e = e + 1
         }
+        free_handle_blocks(p)
         PROCESSES[body].live = false
         unlink_body(p)
     }
