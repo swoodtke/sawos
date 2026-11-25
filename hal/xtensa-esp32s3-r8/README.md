@@ -62,7 +62,10 @@ heap's pool need, on board stage P8's result: `s32c1i` increments raced by
 preempted threads on PSRAM words, with the data cache evicting and filling
 their lines, kept every count (ABI.md §17g). So an image may place a
 process, or a heap's pool, in the PSRAM, unless it declares
-`ram = "fast"` (ABI.md §17e). Once published the kernel takes the PSRAM as
+`ram = "fast"` (ABI.md §17e): the smoke's `stock_heap_psram` runs a data
+heap there beside a default heap in the SRAM. A buffer there is slower to
+the kernel's copy doors, which read it with interrupts masked (ABI.md §11,
+stage P9). Once published the kernel takes the PSRAM as
 process RAM, so a launcher may also give a process a destination or a pool
 there, as the smoke's hand-assembled child and pool do; a process's code and
 read-only data are in flash, in place, as on the S3.

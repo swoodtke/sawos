@@ -262,6 +262,23 @@ func psram_r8() {
     }
     expect_text(heaps.join(" "), "logger.default:sram logger.data:psram",
                 "the data heap's pool in r8's psram")
+
+    // Its PSRAM states atomics, so a heap that declares `ram = "fast"` is
+    // refused there for the range's speed alone.
+    var fast_lines = logger_lines()
+    try! fast_lines.push("ram = \"fast\"")
+    var fast = Vector<Declaration>()
+    try! fast.push(decl(&fast_lines, "logger/process.toml"))
+    var in_psram = image_lines()
+    in_psram[3] = "board = \"esp32s3-r8\""
+    in_psram[4] = "tick = false\nheap-ram = \"psram\""
+    let fast_image = try! ImageFile.parse(join(&in_psram), "i.toml", &r8, 4)
+    let refusal = match bind(&fast_image, &r8, &fast, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+    expect_text(refusal, "i.toml: line 10, column 1: the heap `default` of the process logger declares ram = \"fast\", and its pool is placed in psram, a slow range",
+                "a fast heap's pool in r8's psram")
 }
 
 // An arm64 board, which translates: every process links at root's region's

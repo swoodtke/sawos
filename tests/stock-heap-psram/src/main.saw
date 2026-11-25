@@ -1,0 +1,113 @@
+// A child of `tests/images/stock_heap_psram_s3.toml`, written with `main`. Its
+// declaration states no built-in heap and two heaps over pools the stock root
+// gives it, a default heap and a data heap in slot 1; the image puts the
+// default heap's pool in the SRAM and the data heap's in the PSRAM.
+//
+// It proves where each heap lives by the addresses the heap serves:
+// - it makes an `Atomic<Int>` in the data heap, so in the PSRAM, and does
+//   read-modify-writes on it, `fetch_add` and `compare_exchange`, which are
+//   `s32c1i` on this board;
+// - it takes blocks from each heap until the heap refuses and holds every
+//   block's address inside the range the heap's pool was placed in.
+// It prints each check's verdict and never a count of blocks.
+
+import sos.{Heap, SosStatus}
+import sosmain
+
+/// The data heap's slot, as `process.toml` declares it.
+static DATA: Int = 1
+
+/// The PSRAM's range on `esp32s3-r8` (`[ram.psram]` of its board.toml).
+static PSRAM_BASE: UInt = 0x3D00_0000
+static PSRAM_LEN: UInt = 0x80_0000
+
+/// The SRAM process range (`[ram.sram]`).
+static SRAM_BASE: UInt = 0x3FCB_0000
+static SRAM_LEN: UInt = 0x4_0000
+
+/// The size of each block taken to fill a heap.
+static BLOCK: UInt = 256
+
+/// The blocks taken from the default heap, which the checks' own strings
+/// are served from, so it is not filled.
+static SAMPLE: UInt = 32
+
+/// A `limit` that no heap reaches.
+static NO_LIMIT: UInt = 0xFFFF_FFFF
+
+/// The increments the atomic word takes.
+static STEPS: Int = 1000
+
+/// Where a heap's blocks lie: the lowest address, the end of the highest
+/// block, and how many blocks there were.
+struct Span {
+    low: UInt,
+    high: UInt,
+    count: UInt,
+}
+
+func main() -> Result<Void, SosStatus> {
+    var word = try Box<Atomic<Int>, Heap<DATA>>.make(Atomic(0)) catch {
+        panic("SOS stockpsram: the data heap refused a word")
+    }
+    borrow let cell = word.value() {
+        let at = address_of(&cell)
+        print("SOS stockpsram: the atomic word is in the PSRAM: {}",
+              yes(at >= PSRAM_BASE && at + 4 <= PSRAM_BASE + PSRAM_LEN))
+        var steps = 0
+        while steps < STEPS {
+            let _ = cell.fetch_add(1)
+            steps = steps + 1
+        }
+        print("SOS stockpsram: {} fetch_adds on it read back {}", STEPS,
+              cell.load())
+        let took = cell.compare_exchange(STEPS, 7)
+        let refused = not cell.compare_exchange(STEPS, 9)
+        let swapped = took && refused && cell.load() == 7
+        print("SOS stockpsram: compare_exchange took the right value and refused a stale one: {}",
+              yes(swapped))
+    }
+
+    let data = fill(Heap<DATA>(), NO_LIMIT)
+    let normal = fill(Heap<0>(), SAMPLE)
+    print("SOS stockpsram: every block of the data heap is inside the PSRAM: {}",
+          yes(inside(&data, PSRAM_BASE, PSRAM_LEN)))
+    print("SOS stockpsram: every block of the default heap is inside the SRAM: {}",
+          yes(inside(&normal, SRAM_BASE, SRAM_LEN)))
+    return
+}
+
+/// Take `BLOCK`-byte blocks from `heap` until it answers null, or `limit`
+/// blocks.
+func fill<H: Allocator>(heap: H, limit: UInt) unsafe -> Span {
+    var span = Span(low: 0xFFFF_FFFF, high: 0, count: 0)
+    while span.count < limit {
+        guard let block = heap.alloc(Int.from(truncating: BLOCK), 8) else {
+            break
+        }
+        let at = block as UInt
+        if at < span.low {
+            span.low = at
+        }
+        if at + BLOCK > span.high {
+            span.high = at + BLOCK
+        }
+        span.count = span.count + 1
+    }
+    span
+}
+
+/// Whether `span` holds a block and lies in `[base, base + len)`.
+func inside(span: &Span, base: UInt, len: UInt) -> Bool {
+    span.count > 0 && span.low >= base && span.high <= base + len
+}
+
+/// `at`'s address.
+func address_of(at: &Atomic<Int>) unsafe -> UInt {
+    ((at) as UnsafePointer<Atomic<Int>>) as UInt
+}
+
+/// `yes` or `no`.
+func yes(b: Bool) -> String {
+    if b { "yes" } else { "no" }
+}

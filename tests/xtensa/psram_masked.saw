@@ -1,0 +1,164 @@
+// What a kernel copy door costs with interrupts masked when the process's
+// buffer is in PSRAM, on the `esp32s3-r8` board (../../hal/xtensa-esp32s3/
+// ABI.md §11, board stage P9): the PSRAM brought up as the shipping kernel
+// does, then the door's byte loop, timed by CCOUNT, over a buffer in PSRAM
+// whose lines a walk has evicted, and over one in SRAM as the control.
+//
+// The doors (`kcore.process.copy_in` and `copy_out`) move a record or a
+// message body one byte at a time (`kcore.mem.copy_bytes`) with the kernel's
+// interrupts masked. The longest single copy from a process's buffer is a
+// message body, `PIPE_BODY_BYTES` (128); a panic's text of up to
+// `PANIC_TEXT_BYTES` (256) is read through the door in chunks of 32. This
+// harness runs that same loop, which the kernel's package keeps to itself,
+// over those lengths. Each measurement is run `ROUNDS` times and prints the
+// fewest and the most cycles one run took.
+//
+//   SOS masked: clock sysclk=... cpu_per=...
+//   SOS masked: <door> <n> bytes, <where>: min ... max ... cycles
+//   SOS-S3: halt pass
+//
+// Every number is printed for the record and none is held: on the emulator
+// they follow host time and the cache has no lines to evict.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_ccount_read() -> UInt
+}
+
+/// How many times each measurement runs.
+static ROUNDS: UInt = 8
+
+/// The lengths a door copies: a panic's chunk, a message body (the longest
+/// single copy from a process's buffer) and a panic's whole text.
+static PANIC_CHUNK: UInt = 32
+static BODY: UInt = 128
+static PANIC_TEXT: UInt = 256
+
+/// The buffer in PSRAM, on a line boundary, and the walk that evicts it:
+/// four times the data cache's 32 KiB, twice its largest size, from another
+/// part of the PSRAM, one load in each `WALK_STRIDE` bytes.
+static PSRAM_BUFFER: UInt = 0x3D00_1000
+static WALK_BASE: UInt = 0x3D01_0000
+static WALK_BYTES: UInt = 0x2_0000
+static WALK_STRIDE: UInt = 16
+
+/// The control's buffer, in the process SRAM no process holds in a harness
+/// kernel, and the kernel's own side of each copy.
+static SRAM_BUFFER: UInt = 0x3FCB_0000
+static KERNEL_BUFFER: UInt = 0x3FCB_4000
+
+/// `v` in decimal.
+func decimal(v: UInt64) unsafe {
+    if v >= 10 {
+        decimal(v / 10)
+    }
+    hal.console_byte(((v % 10) + 48) as UInt8)
+}
+
+/// The door's loop: `len` bytes from `src` to `dst`, one at a time. Its views
+/// are `Device`, which the compiler neither drops nor moves across the
+/// CCOUNT reads, as it would a copy nothing reads back.
+func copy_bytes(dst: UInt, src: UInt, len: UInt) unsafe {
+    var i: UInt = 0
+    while i < len {
+        UnsafeMemory<UInt8, Device>(dst + i).write(
+            UnsafeMemory<UInt8, Device>(src + i).read())
+        i = i + 1
+    }
+}
+
+/// One load in each `WALK_STRIDE` bytes of the walk's range, which evicts
+/// the buffer's lines. The loads are of a `Device` view, which are not left
+/// out.
+func evict() unsafe {
+    var at: UInt = 0
+    while at < WALK_BYTES {
+        let _ = UnsafeMemory<UInt32, Device>(WALK_BASE + at).read()
+        at += WALK_STRIDE
+    }
+}
+
+/// A measurement's line: `name`, the fewest and the most cycles of its runs.
+func report(name: String, len: UInt, place: String, low: UInt,
+            high: UInt) unsafe {
+    console().write_str("SOS masked: ")
+    console().write_str(name)
+    console().write_str(" ")
+    decimal(len as UInt64)
+    console().write_str(" bytes, ")
+    console().write_str(place)
+    console().write_str(": min ")
+    decimal(low as UInt64)
+    console().write_str(" max ")
+    decimal(high as UInt64)
+    console().write_str(" cycles\n")
+}
+
+/// Run `ROUNDS` copies of `len` bytes from `src` to `dst`, each timed by
+/// CCOUNT around the loop alone, after a walk that evicts the PSRAM buffer
+/// when `cold`, and print the line.
+func measure(name: String, place: String, dst: UInt, src: UInt, len: UInt,
+             cold: Bool) unsafe {
+    var low: UInt = 0xFFFF_FFFF
+    var high: UInt = 0
+    var round: UInt = 0
+    while round < ROUNDS {
+        if cold {
+            evict()
+        }
+        let start = sos_ccount_read()
+        copy_bytes(dst, src, len)
+        let cycles = sos_ccount_read() - start
+        if cycles < low {
+            low = cycles
+        }
+        if cycles > high {
+            high = cycles
+        }
+        round += 1
+    }
+    report(name, len, place, low, high)
+}
+
+/// The door inward for `len` bytes, from the PSRAM buffer and from the
+/// control's.
+func door_in(len: UInt) unsafe {
+    measure("copy_in", "PSRAM, lines evicted", KERNEL_BUFFER, PSRAM_BUFFER,
+            len, true)
+    measure("copy_in", "SRAM", KERNEL_BUFFER, SRAM_BUFFER, len, false)
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.clock_init()
+    hal.memory_init()
+    let clock = hal.psram_clock()
+    console().write_str("SOS masked: clock sysclk=")
+    console().write_hex(clock.sysclk as UInt)
+    console().write_str(" cpu_per=")
+    console().write_hex(clock.cpu_per as UInt)
+    console().write_str("\n")
+
+    // Fill both sources so a read finds its bytes written, then measure.
+    var fill: UInt = 0
+    while fill < 256 {
+        UnsafeMemory<UInt8, Normal>(PSRAM_BUFFER + fill).write(fill as UInt8)
+        UnsafeMemory<UInt8, Normal>(SRAM_BUFFER + fill).write(fill as UInt8)
+        fill += 1
+    }
+    door_in(PANIC_CHUNK)
+    door_in(BODY)
+    door_in(PANIC_TEXT)
+    // The same body with the lines held (one copy to fill them), and the door
+    // outward into an evicted PSRAM buffer, which a write fills before it
+    // dirties.
+    copy_bytes(KERNEL_BUFFER, PSRAM_BUFFER, BODY)
+    measure("copy_in", "PSRAM, lines held", KERNEL_BUFFER, PSRAM_BUFFER, BODY,
+            false)
+    measure("copy_out", "PSRAM, lines evicted", PSRAM_BUFFER, KERNEL_BUFFER,
+            BODY, true)
+    measure("copy_out", "SRAM", SRAM_BUFFER, KERNEL_BUFFER, BODY, false)
+    hal.exit_pass()
+}

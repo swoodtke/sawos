@@ -1877,6 +1877,50 @@ a board" is the order to find out in.
   lost 1296 and 1535 of 16384, with about 196,800 PSRAM misses at each
   (§17g's table). *Unprobed on silicon:* any second core, and a bus master
   other than the core (DMA) writing a word a `s32c1i` reads.
+- **A buffer in PSRAM under the kernel's copy doors.** A heap's pool, or a
+  process's region, may be in the PSRAM (§17e), so a buffer a process hands the
+  kernel may be too. The doors (`copy_in`, `copy_out`) move a record or a
+  message body one byte at a time with interrupts masked, and a byte in a line
+  the data cache does not hold costs a fill from the chip, a burst on the
+  memory-SPI bus (the cache bullet above). What bounds the masked time is the
+  door's length: the longest single copy from a process's buffer is a message
+  body, at most `PIPE_BODY_BYTES` (128, `kernel/abi/src/ops.saw`), copied by
+  `Pipe` send, post and call; a panic's text is read through the same door in
+  chunks of 32 bytes, at most `PANIC_TEXT_BYTES` (256) in all, with the console
+  written between them. The records the other ops copy are a few words. A bulk
+  copy, the loader's of an image, moves no process's buffer and strides with
+  preemption points (`kcore.preempt`). So a PSRAM buffer adds, to a door's
+  masked time, a fill for each line its bytes touch, at most the lines 128 or
+  256 bytes cover. *Prepared for:* stage P9 (§17f), the door's byte loop over a
+  PSRAM buffer whose lines a walk of four times the cache has evicted, against
+  the same loop over SRAM, at `pll80` and `pll240`. *On silicon (rev v0.2):* P9
+  at both keys, in cycles of the CPU clock, the fewest and the most of 8 rounds
+  where they varied:
+
+```
+                                       pll80          pll240
+copy_in 32, PSRAM evicted              540-1869       908-6893
+copy_in 32, SRAM                       370-371        370-371
+copy_in 128, PSRAM evicted             2106           3410
+copy_in 128, SRAM                      1426           1426
+copy_in 256, PSRAM evicted             4194           6746
+copy_in 256, SRAM                      2834           2834
+copy_in 128, PSRAM lines held          1426-1427      1426-1427
+copy_out 128, PSRAM evicted            2074           3360
+copy_out 128, SRAM                     1426           1426-1428
+```
+
+  The clock lines read sysclk 0x00080400, cpu_per 0x4 and 0x6, and the cycles
+  convert at the key's clock, 80.00 and 240.02 MHz. The SRAM loop costs about 11
+  cycles a byte, the same at both clocks, so SRAM takes 3 times as long at 80
+  MHz as at 240. A body of 128 bytes from evicted PSRAM adds 680 cycles at 80
+  MHz and 1984 at 240, 8.5 and 8.3 us: the fill time is the memory-SPI bus's,
+  not the CPU's. In time, the masked copy of a body is 26 us from evicted PSRAM
+  against 18 us from SRAM at 80 MHz, and 14 us against 6 us at 240; a panic's
+  256 bytes read in chunks are 52 us against 35 us at 80 MHz and 28 us against
+  12 us at 240 (the console's writes between chunks come on top). A 32-byte
+  chunk from evicted PSRAM varied between 7 and 23 us at 80 MHz and 4 and 29 us
+  at 240; the harness does not say which round or what made the largest.
 
 ---
 
@@ -4234,6 +4278,13 @@ psram_boot_no_efuse         r8       the shipping kernel stopped at
                                      `memory_init` (0x51) before root
 <gate case>_r8              r8       every process case of the S3's again,
                                      the success line first (§17e)
+psram_masked                r8       P9: the copy door's byte loop over an
+                                     evicted PSRAM buffer and over SRAM,
+                                     CCOUNT around each; the lines only
+stock_heap_psram            r8       a data heap in the PSRAM and the
+                                     default heap in the SRAM: word atomics
+                                     on a block of the first, and every
+                                     block of each inside its range (§17e)
 psram_stress                r8       P8: `s32c1i` increments on PSRAM words
                                      from four threads under the tick, on
                                      the instruction-counted clock: every
@@ -4284,8 +4335,9 @@ kernel grants in PSRAM, and the pool and heap cases cut PSRAM. Two are left
 out, `pool_back` and `pool_odd_len`, whose package carries the `esp32s3`
 board's pool base (`tests/poolbase_xtensa.c`) and checks the pool's place
 against it, since both boards share their images; so is every case built
-from a hand-written image, which names its board, and every case whose
-build is refused. The smoke prints the list. A case that boots a harness
+from a hand-written image, which names its board, but for
+`stock_heap_psram`, whose image names this one, and every case whose build
+is refused. The smoke prints the list. A case that boots a harness
 kernel of its own runs with the PSRAM not brought up, unless the harness
 calls `memory_init`, as `psram_stress`'s does.
 
@@ -4343,6 +4395,29 @@ number.
 
 **P8, `psram_stress`.** The word atomics under stress; §17g has its text
 and how to read it. Its board images are built at `pll80` and `pll240`.
+
+**P9, `psram_masked`.** What a kernel copy door costs with interrupts
+masked over a buffer in PSRAM (§11). Built at `pll80` and `pll240`, its
+lines are
+
+```
+SOS masked: clock sysclk=<the key's> cpu_per=<the key's>
+SOS masked: copy_in 32 bytes, PSRAM, lines evicted: min <v> max <v> cycles
+SOS masked: copy_in 32 bytes, SRAM: min <v> max <v> cycles
+... (the same at 128 and 256 bytes)
+SOS masked: copy_in 128 bytes, PSRAM, lines held: min <v> max <v> cycles
+SOS masked: copy_out 128 bytes, PSRAM, lines evicted: min <v> max <v> cycles
+SOS masked: copy_out 128 bytes, SRAM: min <v> max <v> cycles
+SOS-S3: halt pass
+```
+
+The loop is the door's (`kcore.mem.copy_bytes`, which the kernel's package
+keeps to itself), run eight times for each line, and timed by CCOUNT around
+the loop alone; each count holds the two CCOUNT reads' own cycles, which the
+SRAM lines show. A count is in cycles of the key's CPU clock, 80.00 MHz at
+`pll80` and 240.02 MHz at `pll240` (the clock lines). The emulator's
+counts are host time and its cache has no lines, so the case holds the lines
+only.
 
 **P7, `psram_wrong_size`.**
 

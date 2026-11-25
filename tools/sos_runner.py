@@ -19229,6 +19229,20 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                 "write walk PSRAM 1 MiB", "hits PSRAM 16 KiB x 16",
                 "copy SRAM to PSRAM 4 KiB x 16")],
             "SOS psram: sum "]),
+        # P9: what a kernel copy door costs with interrupts masked over a
+        # buffer in PSRAM (ABI.md §11); every number is host time here, so
+        # only the lines are held. `--emit-flash psram_masked --clock KEY`
+        # builds it for the part.
+        r8("psram_masked", "psram_masked.saw", [
+            psram_up_line,
+            "SOS masked: clock sysclk=",
+            *[f"SOS masked: {door} {n} bytes, {place}: min "
+              for n in (32, 128, 256) for door, place in (
+                  ("copy_in", "PSRAM, lines evicted"),
+                  ("copy_in", "SRAM"))],
+            "SOS masked: copy_in 128 bytes, PSRAM, lines held: min ",
+            "SOS masked: copy_out 128 bytes, PSRAM, lines evicted: min ",
+            "SOS masked: copy_out 128 bytes, SRAM: min "]),
         # P7: a description of 16 MiB on the 8 MiB part's eFuse stops at
         # S0.1, before any command; nothing is published.
         r8_stop("psram_wrong_size", "psram_wrong_size.saw", 0x51, [
@@ -20408,6 +20422,34 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                ["SOS stress: no tick between a load and its store: fail"],
                False),
     ]
+    # A data heap in the PSRAM and the default heap in the SRAM, the owner's
+    # example (`tests/images/stock_heap_psram_s3.toml`): the child does word
+    # atomics on a block of the data heap and holds each heap's blocks to its
+    # pool's range. The kernel brings the PSRAM up first, so the case asserts
+    # that line after the banner as the `_r8` cases do.
+    process_cases.append({
+        "name": "stock_heap_psram",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "board": "r8",
+        "flash_commands": flash_once,
+        "image_file": {ESP32S3_R8_ARCH["name"]: "stock_heap_psram_s3.toml"},
+        "expect_out": ["{banner}",
+                       psram_up_line,
+                       # The image blob, the destination and the two heaps'
+                       # pools.
+                       "SOS: boot regions={four}",
+                       "SOS stockpsram: the atomic word is in the PSRAM: yes",
+                       "SOS stockpsram: 1000 fetch_adds on it read back 1000",
+                       "SOS stockpsram: compare_exchange took the right "
+                       "value and refused a stale one: yes",
+                       "SOS stockpsram: every block of the data heap is "
+                       "inside the PSRAM: yes",
+                       "SOS stockpsram: every block of the default heap is "
+                       "inside the SRAM: yes",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: heap ended status=65536"],
+        "expect_clean_exit": True,
+    })
     # The shipping kernel on this board stopped at `memory_init` by a part
     # whose eFuse names no PSRAM, before root is loaded: the transcript ends
     # at the stop's halt. Its boot with the PSRAM up is `psram_boot`, the
