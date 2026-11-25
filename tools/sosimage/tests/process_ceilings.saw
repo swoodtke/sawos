@@ -1,0 +1,284 @@
+// A declaration's `[ceilings]` and its records' `rights`: the table of rights
+// they are read against (held to the kernel's enums, case by case), what each
+// reads as, the keep word each record is given with, and each refusal, the
+// rights a program's runtime spends included.
+
+import bootplan.{KEEP_ALL}
+import sosimage.declaration.{Declaration, RecordKind}
+import sosimage.failure.{BuildError}
+import sosimage.rights.{CEILING_KINDS, ceiling_kind_at, ceiling_kind, right_word, has_right}
+import sosimage.tool.{read_text}
+
+// The kebab form of a case's name: `MapExecute` is `map-execute`.
+func kebab(name: String) -> String {
+    var out = StringBuilder()
+    var i = 0
+    while i < name.len() {
+        let b = name.byte_at(i)
+        if b >= 65 && b <= 90 {
+            if i > 0 {
+                try! out.append("-")
+            }
+            try! out.append(b + 32)
+        } else {
+            try! out.append(b)
+        }
+        i = i + 1
+    }
+    out.build()
+}
+
+// The cases of the enum `name` in the kernel's `rights.saw`, as `NAME N`
+// lines: the case's name in kebab case and the bit it shifts to.
+func kernel_cases(source: &Vector<String>, name: String) -> Vector<String> {
+    var out = Vector<String>()
+    var inside = false
+    var i = 0
+    while i < source.len() {
+        let line = (source.get(i) ?? "").trim()
+        i = i + 1
+        if line.equals("public enum {name}: UInt32 \{") {
+            inside = true
+            continue
+        }
+        if not inside {
+            continue
+        }
+        if line.equals("\}") {
+            return move out
+        }
+        if line.starts_with("case ") {
+            let parts = try! line.substring(5, line.len()).split(" = 1 << ")
+            let shift = (parts.get(1) ?? "").replace(",", "")
+            try! out.push("{kebab(parts.get(0) ?? "")} {shift}")
+        }
+    }
+    panic("the kernel has no enum {name}")
+}
+
+// The table's rights of kind `index`, as the same lines.
+func table_cases(index: Int) -> Vector<String> {
+    let info = ceiling_kind_at(index)
+    var out = Vector<String>()
+    var i = 0
+    while i < info.rights.len() {
+        let r = info.rights.get(i)!
+        try! out.push("{r.name} {r.shift}")
+        i = i + 1
+    }
+    move out
+}
+
+func holds_line(lines: &Vector<String>, line: String) -> Bool {
+    var i = 0
+    while i < lines.len() {
+        if (lines.get(i) ?? "").equals(line) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+// A window `mac` and a `system` record, a main program's declaration.
+func head(window: String) -> Vector<String> {
+    var lines: Vector<String> = ["format = 1",
+                                 "arena = 0x1000",
+                                 "[[boot]]",
+                                 "name = \"system\"",
+                                 "kind = \"system\"",
+                                 "tag = 1",
+                                 "[[boot]]",
+                                 "name = \"mac\"",
+                                 "kind = \"window\"",
+                                 "type = \"wifi-mac\"",
+                                 "tag = 3"]
+    if not window.is_empty() {
+        try! lines.push(window)
+    }
+    move lines
+}
+
+func text_of(lines: &Vector<String>) -> String {
+    "{lines.join("\n")}\n"
+}
+
+// What a main program's runtime spends, with a window's: `process`, `thread`
+// and `iomemory`, each from `extra`.
+func ceilings(process: String, thread: String, iomemory: String) -> String {
+    "[ceilings]\nprocess = [{process}]\nthread = [{thread}]\niomemory = [{iomemory}]\n"
+}
+
+func process_ok() -> String {
+    "\"boot-handles\", \"thread-self\", \"exit\", \"map\""
+}
+
+func parse_main(text: String) -> Result<Declaration, BuildError> {
+    Declaration.parse(text, "p.toml", main: true)
+}
+
+func refusal_of(text: String, main: Bool) -> String {
+    match Declaration.parse(text, "p.toml", main: main) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+unsafe static var MISMATCHES: Int = 0
+
+func expect(text: String, main: Bool, message: String) unsafe {
+    let got = refusal_of(text, main)
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+        MISMATCHES = MISMATCHES + 1
+    }
+}
+
+func with_ceilings(window: String, extra: String) -> String {
+    let lines = head(window)
+    "{text_of(&lines)}{extra}"
+}
+
+// The runtime of a program with one heap: every right its heap spends.
+func heap_ceilings(drop_kind: String, drop_right: String) -> String {
+    var rows: Vector<String> = ["process = [\"boot-handles\", \"thread-self\", \"exit\", \"mint\", \"map\"]",
+                                "thread = [\"control\"]",
+                                "memory = [\"map\", \"extend\"]",
+                                "mapping = [\"grow\", \"base\"]",
+                                "pool = [\"allocate\", \"map\", \"transfer\", \"mint\", \"extend\"]"]
+    var out = "[ceilings]\n"
+    var i = 0
+    while i < rows.len() {
+        var row = rows.get(i) ?? ""
+        i = i + 1
+        if row.starts_with(drop_kind) {
+            row = row.replace(", \"{drop_right}\"", "").replace("\"{drop_right}\", ", "").replace("\"{drop_right}\"", "")
+        }
+        if row.starts_with(drop_kind) && drop_right.equals("*") {
+            continue
+        }
+        out = "{out}{row}\n"
+    }
+    "{out}[heap.default]\nlen = 0x1000\n"
+}
+
+func main() unsafe {
+    // The table is the kernel's: every enum's cases, by name and bit, in the
+    // kernel's order, and no kind or right more.
+    let source = try! (try! read_text("../../kernel/abi/src/rights.saw")).split("\n")
+    var k = 0
+    while k < CEILING_KINDS {
+        let info = ceiling_kind_at(k)
+        let kernel = kernel_cases(&source, info.enum_name)
+        let table = table_cases(k)
+        assert(kernel.join(" | ").equals(table.join(" | ")), "the rights of {info.key}")
+        k = k + 1
+    }
+    assert(CEILING_KINDS == 15, "System excepted, every HandleKind has a ceiling")
+    assert(ceiling_kind("system").is_none(), "System is no kind of the table")
+    assert(ceiling_kind("iomemory")!.case_name.equals("IoMemory"), "a kind's bootplan name")
+    assert(right_word(&ceiling_kind("memory")!, "extend") == (1 as UInt32) << 11, "a right's word")
+    assert(not has_right(&ceiling_kind("event")!, "map"), "a right of another kind")
+
+    // What a declaration reads as: each key's word, a kind it leaves out none.
+    let own = ceilings(process_ok(), "\"control\"", "\"map\", \"carve\"")
+    let d = try! parse_main(with_ceilings("", own))
+    assert(d.has_ceilings, "has [ceilings]")
+    assert(d.ceiling_word("iomemory") == ((1 << 8) | (1 << 9)), "the window's rights")
+    assert(d.ceiling_word("thread") == (1 << 10), "the thread's")
+    assert(d.ceiling_word("process") == ((1 << 15) | (1 << 16) | (1 << 9) | (1 << 18)), "the process's")
+    assert(d.ceiling_word("event") == 0, "a kind it leaves out has none")
+    let plain = try! parse_main(text_of(&head("")))
+    assert(not plain.has_ceilings, "no [ceilings]")
+    assert(plain.ceiling_word("process") == 0, "no table, no word")
+
+    // The keep word of a record: its own rights, else its kind's ceiling when
+    // the declaration has one, else every right; the System record's is all
+    // ones, for root reads it from the child's `rights`.
+    let mac = d.record(RecordKind.Window, "mac")!
+    assert(d.keep_word(&mac) == ((1 << 8) | (1 << 9)), "a record with none is given the ceiling")
+    let narrower = try! parse_main(with_ceilings("rights = [\"map\"]", own))
+    assert(narrower.keep_word(&(narrower.record(RecordKind.Window, "mac")!)) == (1 << 9),
+           "a record's own rights")
+    let bare = try! parse_main(text_of(&head("")))
+    assert(bare.keep_word(&(bare.record(RecordKind.Window, "mac")!)) == KEEP_ALL,
+           "no ceilings, no rights: every right")
+    let named = try! parse_main(text_of(&head("rights = [\"carve\"]")))
+    assert(named.keep_word(&(named.record(RecordKind.Window, "mac")!)) == (1 << 8),
+           "rights without ceilings")
+    let system = d.record(RecordKind.System, "system")!
+    assert(d.keep_word(&system) == KEEP_ALL, "a system record is read for its System rights")
+    // A program with a heap and every right the heap spends reads.
+    let heap = try! parse_main(with_ceilings("", heap_ceilings("", "")))
+    assert(heap.ceiling_word("pool") == ((1 << 0) | (1 << 1) | (1 << 9) | (1 << 11) | (1 << 16)),
+           "the heap's pool rights")
+
+    // Not a table.
+    let scalar = text_of(&head("")).replace("arena = 0x1000", "arena = 0x1000\nceilings = 1")
+    expect(scalar, true, "p.toml: line 3, column 12: `ceilings` in the top-level table is an integer, not a table")
+
+    // A kind that is not one, `system`, a right the kind has not, one twice.
+    expect(with_ceilings("", "[ceilings]\nkernel = [\"map\"]\n"), true,
+           "p.toml: line 13, column 1: `kernel` in [ceilings] is not a kind of handle with a rights ceiling: it is one of `process`, `thread`, `event`, `waiter`, `interrupt`, `clock`, `timer`, `memory`, `iomemory`, `mapping`, `pool`, `pipe-inlet`, `pipe-outlet`, `pipe-reply`, `pipe-request`")
+    expect(with_ceilings("", "[ceilings]\nsystem = [\"debug\"]\n"), true,
+           "p.toml: line 13, column 1: `system` in [ceilings] is not a kind it narrows: a process's System rights are its `system` record's `rights`, which the launch convention bounds")
+    expect(with_ceilings("", "[ceilings]\nevent = [\"signal\", \"map\"]\n"), true,
+           "p.toml: line 13, column 20: `map` in [ceilings] `event` is not a right of an Event: it is one of `transfer`, `mint`, `signal`, `receive`, `wait`")
+    expect(with_ceilings("", "[ceilings]\nevent = [\"Signal\"]\n"), true,
+           "p.toml: line 13, column 10: `Signal` in [ceilings] `event` is not a right of an Event: it is one of `transfer`, `mint`, `signal`, `receive`, `wait`")
+    expect(with_ceilings("", "[ceilings]\nevent = [\"wait\", \"wait\"]\n"), true,
+           "p.toml: line 13, column 18: `wait` is in `event` twice")
+    expect(with_ceilings("", "[ceilings]\nevent = \"wait\"\n"), true,
+           "p.toml: line 13, column 9: `event` in [ceilings] is a string, not an array")
+
+    // A record's rights: a right its kind lacks, one outside the ceiling,
+    // and the ceiling of a kind the table leaves out is none.
+    expect(with_ceilings("rights = [\"signal\"]", ""), true,
+           "p.toml: line 12, column 11: `rights` of the window `mac` names `signal`, which is not a right of an IoMemory: it is one of `transfer`, `mint`, `carve`, `map`")
+    expect(with_ceilings("rights = [\"map\", \"carve\"]", ceilings(process_ok(), "\"control\"", "\"map\"")), true,
+           "p.toml: line 7, column 3: `rights` of the window `mac` names `carve`, which the `iomemory` ceiling in [ceilings] does not give: a record is given within its kind's ceiling")
+    expect(with_ceilings("rights = [\"map\"]", "[ceilings]\nprocess = [{process_ok()}]\nthread = [\"control\"]\n"), true,
+           "p.toml: line 7, column 3: `rights` of the window `mac` names `map`, which the `iomemory` ceiling in [ceilings] does not give: a record is given within its kind's ceiling")
+
+    // What a program written with `main` spends, each withheld in turn: a
+    // right missing from a kind it lists, and a kind it leaves out.
+    let uses = "{process_ok()}"
+    expect(with_ceilings("", ceilings("\"thread-self\", \"exit\"", "\"control\"", "\"map\"")), true,
+           "p.toml: line 13, column 1: `process` in [ceilings] lacks `boot-handles`: `sosmain`'s start-up drains the boot set through its Process handle")
+    expect(with_ceilings("", ceilings("\"boot-handles\", \"exit\"", "\"control\"", "\"map\"")), true,
+           "p.toml: line 13, column 1: `process` in [ceilings] lacks `thread-self`: `sosmain`'s start-up derives the main thread's own Thread handle through its Process handle")
+    expect(with_ceilings("", ceilings("\"boot-handles\", \"thread-self\"", "\"control\"", "\"map\"")), true,
+           "p.toml: line 13, column 1: `process` in [ceilings] lacks `exit`: `sosmain`'s start-up ends the process through its Process handle")
+    expect(with_ceilings("", ceilings(uses, "\"start\"", "\"map\"")), true,
+           "p.toml: line 14, column 1: `thread` in [ceilings] lacks `control`: `sosmain`'s start-up yields through the main thread's own Thread handle")
+    expect(with_ceilings("", "[ceilings]\nprocess = [{uses}]\n"), true,
+           "p.toml: line 12, column 2: [ceilings] lists no `thread`, which gives it no rights, and the process needs `control`: `sosmain`'s start-up yields through the main thread's own Thread handle")
+    // A program of its own `_start` spends none of these.
+    expect(with_ceilings("", "[ceilings]\nevent = [\"wait\"]\n"), false, "")
+
+    // What a heap spends, each right withheld in turn, a kind left out whole.
+    expect(with_ceilings("", heap_ceilings("", "")), true, "")
+    // A heap is adopted in the boot set's drain whether or not the program is
+    // written with `main`, so a `_start` program with a heap needs it too.
+    expect(with_ceilings("", heap_ceilings("", "")), false, "")
+    expect(with_ceilings("", heap_ceilings("process", "boot-handles")), false,
+           "p.toml: line 13, column 1: `process` in [ceilings] lacks `boot-handles`: the runtime's heap is adopted while the boot set is drained, which a Process handle without it cannot do")
+    expect(with_ceilings("", heap_ceilings("process", "mint")), true,
+           "p.toml: line 13, column 1: `process` in [ceilings] lacks `mint`: the runtime's heap mints its `Map`-only Process handle from the process's own")
+    expect(with_ceilings("", heap_ceilings("memory", "map")), true,
+           "p.toml: line 15, column 1: `memory` in [ceilings] lacks `map`: the runtime's heap maps the `Memory` it cuts from its pool")
+    expect(with_ceilings("", heap_ceilings("memory", "extend")), true,
+           "p.toml: line 15, column 1: `memory` in [ceilings] lacks `extend`: the runtime's heap extends the `Memory` it cuts from its pool")
+    expect(with_ceilings("", heap_ceilings("mapping", "grow")), true,
+           "p.toml: line 16, column 1: `mapping` in [ceilings] lacks `grow`: the runtime's heap grows its row")
+    expect(with_ceilings("", heap_ceilings("mapping", "base")), true,
+           "p.toml: line 16, column 1: `mapping` in [ceilings] lacks `base`: the runtime's heap reads where its row landed")
+    expect(with_ceilings("", heap_ceilings("pool", "allocate")), true,
+           "p.toml: line 17, column 1: `pool` in [ceilings] lacks `allocate`: the launch convention gives a heap's pool with it, and the runtime's heap reads it at its adoption")
+    expect(with_ceilings("", heap_ceilings("pool", "extend")), true,
+           "p.toml: line 17, column 1: `pool` in [ceilings] lacks `extend`: the launch convention gives a heap's pool with it, and the runtime's heap reads it at its adoption")
+    expect(with_ceilings("", heap_ceilings("memory", "*")), true,
+           "p.toml: line 12, column 2: [ceilings] lists no `memory`, which gives it no rights, and the process needs `map`: the runtime's heap maps the `Memory` it cuts from its pool")
+    assert(MISMATCHES == 0, "each refusal")
+}

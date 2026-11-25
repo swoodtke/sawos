@@ -33,6 +33,15 @@
 //! declaration's `[quota]`, each replaced by the image's `quota` for it,
 //! which may raise a row and not lower it.
 //!
+//! A declaration with `[ceilings]` gives its process one ceiling word for
+//! each kind of `sosimage.rights`, the rights the table lists for it and none
+//! for a kind it leaves out, which root narrows the process's to before it
+//! gives it anything; one without gives none. Each record carries a keep word
+//! (`Declaration.keep_word`): the rights its declaration names, else its
+//! kind's ceiling when it has `[ceilings]`, else every right. The console's
+//! inlet is the `pipe-inlet` ceiling's, which is refused when it lacks `post`
+//! (`check_console_inlet`).
+//!
 //! A `[[setup]]` write carves from its device's row the window of the board's
 //! grain (four bytes at least) that holds its register, and writes the
 //! register at its offset into that window.
@@ -80,18 +89,20 @@
 //!                  "len": 4, "at": 0, "op": "set", "value": 90}]
 //!     }
 //!
-//! A record's `from`, `offset` and `len`, a child's `quota`, `records` and
-//! `shutdown`, and `children`, `connections` and `setup` may be left out
-//! (zero, none, false); an unknown key is refused. A test plan may also state
+//! A record's `from`, `offset`, `len` and `keep` (every right), a child's
+//! `quota`, `ceilings` (an object of a kind's key and the word its ceiling is
+//! narrowed to, as the plan carries it), `records` and `shutdown`, and
+//! `children`, `connections` and `setup` may be left out (zero, none, false);
+//! an unknown key is refused. A test plan may also state
 //! `windows`, the count of windows root is given in place of the one the
 //! builder makes (`window_rows`), so a case can hand root a count that is
 //! short. A test image's child keeps
 //! the launch convention's System rights (`child_rights`).
 
 import toml.{TomlPosition}
-import bootplan.{CHILD_WORDS, QUOTA_WORDS, RECORD_WORDS, RIGHT_WORDS, SETUP_WORDS,
+import bootplan.{CHILD_WORDS, QUOTA_WORDS, CEILING_WORDS, RECORD_WORDS, RIGHT_WORDS, SETUP_WORDS,
                  PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS, ROW_WINDOW_WORDS, CONSOLE_TAG,
-                 HEAP_TAG}
+                 HEAP_TAG, KEEP_ALL}
 import sosimage.board.{Board, Window, quota_keys}
 import sosimage.declaration.{Declaration, RecordKind, child_rights}
 import sosimage.failure.{BuildError}
@@ -102,6 +113,7 @@ import sosimage.imagefile.{Bindings, ImageFile, SetupOp}
 import sosimage.kernel.{KernelFacts, QUOTA_HANDLE, QUOTA_KINDS, QUOTA_MAPPING, QUOTA_MEMORY}
 import sosimage.limits.{QUOTA_UNLIMITED}
 import sosimage.regions.{RegionKind}
+import sosimage.rights.{CEILING_KINDS, ceiling_kind_at, ceiling_kind, right_word}
 import sosimage.rules.{refused}
 
 /// The handles root holds at boot before its rows' (spec §12): System,
@@ -189,6 +201,14 @@ public struct PlanRecord {
     from: UInt64
     offset: UInt64
     len: UInt64
+    /// The rights the child keeps of it (`bootplan.Record`).
+    keep: UInt32
+}
+
+/// One of a child's rights ceilings, by `bootplan.CeilingKind`'s case.
+public struct PlanCeiling {
+    kind: String
+    rights: UInt32
 }
 
 /// One quota row, by `QuotaKind` value.
@@ -206,6 +226,9 @@ public struct PlanChild {
     image: Int
     destination: Int
     quota: Vector<PlanQuota>
+    /// The ceilings root narrows its own to: one for each kind of
+    /// `sosimage.rights` when its declaration has `[ceilings]`, else none.
+    ceilings: Vector<PlanCeiling>
     records: Vector<PlanRecord>
     /// The rights its System record keeps, by the names a declaration writes.
     rights: Vector<String>
@@ -427,7 +450,7 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
                 let record = d.records.get(r)!
                 r = r + 1
                 var made = PlanRecord(tag: record.tag, source: Source.System, from: 0, offset: 0,
-                                      len: 0)
+                                      len: 0, keep: d.keep_word(&record))
                 match record.kind {
                     case System -> { start = record.tag },
                     case Window -> {
@@ -481,8 +504,10 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
             var floor = d.handle_floor()
             if let index = console {
                 if not process.name.equals(console_server) {
+                    try check_console_inlet(&d, process.name, file, process.at)
                     try! records.push(PlanRecord(tag: CONSOLE_TAG as Int, source: Source.Inlet,
-                                                 from: index as UInt64, offset: 0, len: 0))
+                                                 from: index as UInt64, offset: 0, len: 0,
+                                                 keep: console_keep(&d)))
                     floor = floor + 1
                 }
             }
@@ -493,13 +518,14 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
                     try! records.push(PlanRecord(tag: (HEAP_TAG as Int) + b.heap.slot,
                                                  source: Source.Heap,
                                                  from: (heap_first + k) as UInt64, offset: 0,
-                                                 len: 0))
+                                                 len: 0, keep: KEEP_ALL))
                 }
                 k = k + 1
             }
             let quota = try quota_rows(&image, &d, process.name, process.at)
             try! children.push(PlanChild(name: process.name, image: p, destination: count + p,
-                                         quota: move quota, records: move records,
+                                         quota: move quota, ceilings: ceiling_rows(&d),
+                                         records: move records,
                                          rights: d.system_rights_or(&image.system_rights),
                                          start: start,
                                          shutdown: process.on_exit.equals("shutdown"),
@@ -525,6 +551,47 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
     }
     return ImagePlan(children: move children, setup: move setup,
                      connections: connections.len(), rows: move rows, windows: None)
+}
+
+/// The ceilings root narrows a child to for `d`: each kind's word, in the
+/// table's order, when `d` has `[ceilings]`.
+func ceiling_rows(d: &Declaration) -> Vector<PlanCeiling> {
+    var out = Vector<PlanCeiling>()
+    if not d.has_ceilings {
+        return move out
+    }
+    var i = 0
+    while i < CEILING_KINDS {
+        let info = ceiling_kind_at(i)
+        try! out.push(PlanCeiling(kind: info.case_name, rights: d.ceiling_word(info.key)))
+        i = i + 1
+    }
+    move out
+}
+
+/// The keep word of the console's inlet in `d`'s process: its `pipe-inlet`
+/// ceiling when it has one, as any inlet record without `rights` has, and
+/// every right the inlet holds otherwise.
+func console_keep(d: &Declaration) -> UInt32 {
+    if d.has_ceilings {
+        return d.ceiling_word("pipe-inlet")
+    }
+    KEEP_ALL
+}
+
+/// Refuses a process whose `pipe-inlet` ceiling withholds `post` in an image
+/// that gives it the console's inlet: its runtime posts every line it prints
+/// through it.
+func check_console_inlet(d: &Declaration, process: String, file: String,
+                         at: TomlPosition) -> Result<Void, BuildError> {
+    if not d.has_ceilings {
+        return
+    }
+    let info = ceiling_kind("pipe-inlet")!
+    if (d.ceiling_word("pipe-inlet") & (right_word(&info, "post") ?? 0)) == 0 {
+        return refused(file, at, "the process {process}'s `pipe-inlet` ceiling in [ceilings] lacks `post`: the runtime posts every line the process prints through the console's inlet, and this image gives it one")
+    }
+    return
 }
 
 /// The device bound to the need `need` of `process`.
@@ -579,14 +646,16 @@ func last_takers(children: &var Vector<PlanChild>) {
             count = child.records.len()
         }
         while r < count {
-            var record = PlanRecord(tag: 0, source: Source.System, from: 0, offset: 0, len: 0)
+            var record = PlanRecord(tag: 0, source: Source.System, from: 0, offset: 0, len: 0,
+                                    keep: KEEP_ALL)
             borrow let child = children[c] {
                 record = child.records.get(r)!
             }
             if record.source == Source.Row && later_use(&children, c, r, record.from) {
                 borrow var child = children[c] {
                     child.records[r] = PlanRecord(tag: record.tag, source: Source.Sibling,
-                                                  from: record.from, offset: 0, len: 0)
+                                                  from: record.from, offset: 0, len: 0,
+                                                  keep: record.keep)
                 }
             }
             r = r + 1
@@ -977,6 +1046,19 @@ func read_child(f: &var Fields) -> Result<PlanChild, BuildError> {
         }
         try q.finish()
     }
+    var ceilings = Vector<PlanCeiling>()
+    if var c = try f.object("ceilings", "a plan child's `ceilings`") {
+        var k = 0
+        while k < CEILING_KINDS {
+            let info = ceiling_kind_at(k)
+            if c.has(info.key) {
+                try! ceilings.push(PlanCeiling(kind: info.case_name,
+                                               rights: (try c.word(info.key)) as UInt32))
+            }
+            k = k + 1
+        }
+        try c.finish()
+    }
     var records = Vector<PlanRecord>()
     var given = try f.objects_or_empty("records", "a plan child's record")
     var r = 0
@@ -989,11 +1071,13 @@ func read_child(f: &var Fields) -> Result<PlanChild, BuildError> {
             var from: UInt64 = 0
             var offset: UInt64 = 0
             var len: UInt64 = 0
+            var keep: UInt64 = KEEP_ALL as UInt64
             if g.has("from") { from = try g.word("from") }
             if g.has("offset") { offset = try g.word("offset") }
             if g.has("len") { len = try g.word("len") }
+            if g.has("keep") { keep = try g.word("keep") }
             try! records.push(PlanRecord(tag: try g.integer("tag"), source: source, from: from,
-                                         offset: offset, len: len))
+                                         offset: offset, len: len, keep: keep as UInt32))
             try g.finish()
         }
         r = r + 1
@@ -1004,6 +1088,7 @@ func read_child(f: &var Fields) -> Result<PlanChild, BuildError> {
     }
     let child = PlanChild(name: name, image: try f.integer("image"),
                           destination: try f.integer("destination"), quota: move quota,
+                          ceilings: move ceilings,
                           records: move records, rights: child_rights(),
                           start: try f.integer("start"),
                           shutdown: shutdown, floor: 0, windows: 0, heaps: 0)
@@ -1089,6 +1174,7 @@ public func root_blocks(plan: &ImagePlan, word: Int) -> Int {
     while c < plan.children.len() {
         borrow let child = plan.children[c] {
             bytes = bytes + heap_block(child.quota.len(), QUOTA_WORDS, word) +
+                    heap_block(child.ceilings.len(), CEILING_WORDS, word) +
                     heap_block(child.records.len(), RECORD_WORDS, word) +
                     heap_block(child.rights.len(), RIGHT_WORDS, word)
         }
@@ -1140,7 +1226,8 @@ public func plan_module(plan: &ImagePlan, name: String) -> Vector<String> {
     var out = Vector<String>()
     try! out.push("//! Generated by sosimage: the stock root's plan for the image {name}.")
     try! out.push("")
-    try! out.push("import bootplan.\{Plan, Child, Record, Source, Setup, SetupOp, Quota, QuotaName, RightName\}")
+    try! out.push("import bootplan.\{Plan, Child, Record, Source, Setup, SetupOp, Quota, QuotaName, RightName,
+                 Ceiling, CeilingKind\}")
     try! out.push("")
     try! out.push("public func plan() -> Plan \{")
     try! out.push("    var children = try! Vector<Child>(capacity: {plan.children.len()})")
@@ -1182,11 +1269,18 @@ func child_function(child: &PlanChild, index: Int) -> Vector<String> {
         try! out.push("    try! quota.push(Quota(kind: QuotaName.{quota_name(row.kind)}, limit: {row.limit}))")
         q = q + 1
     }
+    try! out.push("    var ceilings = try! Vector<Ceiling>(capacity: {child.ceilings.len()})")
+    var c = 0
+    while c < child.ceilings.len() {
+        let ceiling = child.ceilings.get(c)!
+        try! out.push("    try! ceilings.push(Ceiling(kind: CeilingKind.{ceiling.kind}, rights: {hex(ceiling.rights as UInt64)}))")
+        c = c + 1
+    }
     try! out.push("    var records = try! Vector<Record>(capacity: {child.records.len()})")
     var r = 0
     while r < child.records.len() {
         let record = child.records.get(r)!
-        try! out.push("    try! records.push(Record(tag: {record.tag}, source: Source.{source_word(record.source)}, from: {hex(record.from)}, offset: {hex(record.offset)}, len: {hex(record.len)}))")
+        try! out.push("    try! records.push(Record(tag: {record.tag}, source: Source.{source_word(record.source)}, from: {hex(record.from)}, offset: {hex(record.offset)}, len: {hex(record.len)}, keep: {hex(record.keep as UInt64)}))")
         r = r + 1
     }
     try! out.push("    var rights = try! Vector<RightName>(capacity: {child.rights.len()})")
@@ -1196,7 +1290,8 @@ func child_function(child: &PlanChild, index: Int) -> Vector<String> {
         k = k + 1
     }
     try! out.push("    Child(name: {literal(child.name)}, image: {child.image}, destination: {child.destination},")
-    try! out.push("          quota: move quota, records: move records, rights: move rights,")
+    try! out.push("          quota: move quota, ceilings: move ceilings, records: move records,")
+    try! out.push("          rights: move rights,")
     try! out.push("          start: {child.start}, shutdown: {child.shutdown})")
     try! out.push("\}")
     move out

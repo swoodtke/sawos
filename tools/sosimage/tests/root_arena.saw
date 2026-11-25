@@ -8,7 +8,7 @@
 // large plan on riscv32 and arm64 at the size the builder gives it.
 
 import std.json.{JsonValue}
-import bootplan.{CHILD_WORDS, QUOTA_WORDS, RECORD_WORDS, RIGHT_WORDS, SETUP_WORDS,
+import bootplan.{CHILD_WORDS, QUOTA_WORDS, CEILING_WORDS, RECORD_WORDS, RIGHT_WORDS, SETUP_WORDS,
                  PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS, ROW_WINDOW_WORDS}
 import sosrt.heap.{UnsafeHeap}
 import sosimage.fields.{Fields}
@@ -42,7 +42,7 @@ func read_plan(text: String) -> ImagePlan {
 /// record, the server ends of the connections dealt to it in turn, carves and
 /// siblings of row 4 in turn, and last an inlet of a connection made
 /// already), over `connections` connections, with `setup` writes. Each child
-/// has every quota row and the four rights.
+/// has every quota row, four ceilings and the four rights.
 func plan_text(children: Int, records: Int, connections: Int, setup: Int) -> String {
     var out = "\{\"connections\": {connections}, \"children\": ["
     var c = 0
@@ -50,7 +50,7 @@ func plan_text(children: Int, records: Int, connections: Int, setup: Int) -> Str
         if c > 0 {
             out = "{out}, "
         }
-        out = "{out}\{\"name\": \"c{c}\", \"image\": {2 * c}, \"destination\": {2 * c + 1}, \"start\": 1, \"quota\": \{\"threads\": 1, \"events\": 1, \"waiters\": 1, \"timers\": 1, \"memories\": 1, \"iomemories\": 1, \"mappings\": 1, \"handles\": {TABLE}, \"pipes\": 1\}, \"records\": [\{\"tag\": 1, \"source\": \"system\"\}"
+        out = "{out}\{\"name\": \"c{c}\", \"image\": {2 * c}, \"destination\": {2 * c + 1}, \"start\": 1, \"quota\": \{\"threads\": 1, \"events\": 1, \"waiters\": 1, \"timers\": 1, \"memories\": 1, \"iomemories\": 1, \"mappings\": 1, \"handles\": {TABLE}, \"pipes\": 1\}, \"ceilings\": \{\"process\": 1, \"thread\": 2, \"event\": 3, \"pool\": 4\}, \"records\": [\{\"tag\": 1, \"source\": \"system\"\}"
         var r = 1
         while r < records {
             let tag = r + 1
@@ -98,6 +98,7 @@ func serves(plan: &ImagePlan, bytes: Int) unsafe -> Bool {
     while c < plan.children.len() {
         borrow let child = plan.children[c] {
             ok = ok && take(&heap, child.quota.len(), QUOTA_WORDS) &&
+                 take(&heap, child.ceilings.len(), CEILING_WORDS) &&
                  take(&heap, child.records.len(), RECORD_WORDS) &&
                  take(&heap, child.rights.len(), RIGHT_WORDS)
         }

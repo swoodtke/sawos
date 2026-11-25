@@ -15,12 +15,15 @@
 //!              its device row, map it, write the register (reading it first
 //!              for a `set` or a `clear`), unmap it and release both;
 //!   quota      set each child's declared quota rows;
+//!   ceilings   narrow each rights ceiling of a child whose plan lists them
+//!              to the plan's word (`restrict_rights`), so that nothing it
+//!              mints afterwards holds more; a child with none keeps root's;
 //!   give       give each child its records under their tags, in its declared
 //!              order: a System sibling keeping the rights the plan names
 //!              for the child, a row or a sibling of one, a carve of
 //!              one, an interrupt line it binds, a connection's server end or
-//!              an inlet minted from it; then each of its heaps' pools,
-//!              keeping `HEAP_POOL_KEEP`;
+//!              an inlet minted from it, each keeping the record's keep word;
+//!              then each of its heaps' pools, keeping `HEAP_POOL_KEEP`;
 //!   start      start every child with its System record's tag;
 //!   supervise  make a Waiter and attach every child to it, release every row
 //!              and connection end root still holds, and wait for the
@@ -58,7 +61,7 @@
 import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet,
             WaitResult, BootSet, BootHandle, SosStatus, SystemRight,
             PipeInletRight, PoolRight, QuotaKind}
-import bootplan.{Plan, Child, Record, Source, Setup, SetupOp, QuotaName, RightName,
+import bootplan.{Plan, Child, Record, Source, Setup, SetupOp, QuotaName, RightName, CeilingKind,
                  setup_word, reads_first, PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS,
                  ROW_WINDOW_WORDS}
 import imageplan
@@ -206,6 +209,9 @@ func run(system: &System, proc: &Process, plan: &Plan) -> Result<UInt, Stop> {
             borrow let child = children[i] {
                 try set_quota(&child, &c) catch {
                     return stop("quota", c.name, error)
+                }
+                try restrict(&child, &c) catch {
+                    return stop("ceilings", c.name, error)
                 }
                 let keep = system_mask(&c)
                 var r = 0
@@ -371,6 +377,36 @@ func set_quota(child: &Process, c: &Child) -> Result<Void, SosStatus> {
     return
 }
 
+/// A child's rights ceilings, narrowed to the plan's: each kind it lists, to
+/// the word it gives. A kind the kernel cannot restrict is a skew between the
+/// plan and the kernel, which `RestrictRights` answers as a fault.
+func restrict(child: &Process, c: &Child) -> Result<Void, SosStatus> {
+    var k = 0
+    while k < c.ceilings.len() {
+        let ceiling = c.ceilings.get(k)!
+        let word = ceiling.rights
+        match ceiling.kind {
+            case Process -> { try child.restrict_rights(process: word) },
+            case Thread -> { try child.restrict_rights(thread: word) },
+            case Event -> { try child.restrict_rights(event: word) },
+            case Waiter -> { try child.restrict_rights(waiter: word) },
+            case Interrupt -> { try child.restrict_rights(interrupt: word) },
+            case Clock -> { try child.restrict_rights(clock: word) },
+            case Timer -> { try child.restrict_rights(timer: word) },
+            case Memory -> { try child.restrict_rights(memory: word) },
+            case IoMemory -> { try child.restrict_rights(iomemory: word) },
+            case Mapping -> { try child.restrict_rights(mapping: word) },
+            case Pool -> { try child.restrict_rights(pool: word) },
+            case PipeInlet -> { try child.restrict_rights(inlet: word) },
+            case PipeOutlet -> { try child.restrict_rights(outlet: word) },
+            case PipeReply -> { try child.restrict_rights(reply: word) },
+            case PipeRequest -> { try child.restrict_rights(request: word) }
+        }
+        k = k + 1
+    }
+    return
+}
+
 /// `sos`'s bit for a plan's System right.
 func system_right(name: RightName) -> UInt32 {
     match name {
@@ -416,40 +452,52 @@ func connection(proc: &Process, ends: &var Vector<Ends, Exact>, index: Int) -> R
 }
 
 /// One record, made as its source says and given under its tag; a System
-/// record keeps the rights in `keep`.
+/// record keeps the rights in `system_keep`, and every other the record's own
+/// keep word.
 func give(system: &System, proc: &Process, child: &Process, rows: &var Rows,
-          ends: &var Vector<Ends, Exact>, r: &Record, keep: UInt32) -> Result<Void, SosStatus> {
+          ends: &var Vector<Ends, Exact>, r: &Record,
+          system_keep: UInt32) -> Result<Void, SosStatus> {
     match r.source {
         case System -> {
             // The give checks `Transfer` on the sibling, and its own keep mask
             // is what the child receives.
-            let sibling = try system.mint(rights: keep | (SystemRight.Transfer as UInt32))
-            try child.give(system: move sibling, tag: r.tag, keep: keep) catch { return error.0 }
+            let sibling = try system.mint(rights: system_keep | (SystemRight.Transfer as UInt32))
+            try child.give(system: move sibling, tag: r.tag, keep: system_keep) catch {
+                return error.0
+            }
         },
         case Row -> {
             let k = rows.find(r.from)
             if k >= 0 {
                 rows.held(k, r.from)
                 let w = rows.windows[k].take()!
-                try child.give(iomemory: move w, tag: r.tag) catch { return error.0 }
+                try child.give(iomemory: move w, tag: r.tag, keep: r.keep) catch {
+                    return error.0
+                }
             } else {
                 var record = rows.take(r.from)
-                try give_row(&child, &var record, r.tag)
+                try give_row(&child, &var record, r.tag, r.keep)
             }
         },
         case Sibling -> {
             let k = rows.window(r.from)
             let sibling = try rows.windows[k]!.mint()
-            try child.give(iomemory: move sibling, tag: r.tag) catch { return error.0 }
+            try child.give(iomemory: move sibling, tag: r.tag, keep: r.keep) catch {
+                return error.0
+            }
         },
         case Carve -> {
             let k = rows.window(r.from)
             let part = try rows.windows[k]!.carve(offset: r.offset, len: r.len)
-            try child.give(iomemory: move part, tag: r.tag) catch { return error.0 }
+            try child.give(iomemory: move part, tag: r.tag, keep: r.keep) catch {
+                return error.0
+            }
         },
         case Line -> {
             let line = try system.interrupt_bind(line: r.from)
-            try child.give(interrupt: move line, tag: r.tag) catch { return error.0 }
+            try child.give(interrupt: move line, tag: r.tag, keep: r.keep) catch {
+                return error.0
+            }
         },
         case Outlet -> {
             let index = r.from as Int
@@ -458,7 +506,9 @@ func give(system: &System, proc: &Process, child: &Process, rows: &var Rows,
                 guard let outlet = e.outlet.take() else {
                     panic("root: the plan gives connection {}'s server end twice", index)
                 }
-                try child.give(outlet: move outlet, tag: r.tag) catch { return error.0 }
+                try child.give(outlet: move outlet, tag: r.tag, keep: r.keep) catch {
+                    return error.0
+                }
             }
         },
         case Inlet -> {
@@ -466,7 +516,9 @@ func give(system: &System, proc: &Process, child: &Process, rows: &var Rows,
             try connection(&proc, &var ends, index)
             borrow let e = ends[index] {
                 let minted = try e.inlet!.mint(rights: CLIENT_INLET)
-                try child.give(inlet: move minted, tag: r.tag) catch { return error.0 }
+                try child.give(inlet: move minted, tag: r.tag, keep: r.keep) catch {
+                    return error.0
+                }
             }
         },
         case Heap -> {
@@ -482,17 +534,25 @@ func give(system: &System, proc: &Process, child: &Process, rows: &var Rows,
     return
 }
 
-/// A whole row given as it is: a device's window, a pool or an allocation.
-func give_row(child: &Process, record: &var BootHandle, tag: UInt) -> Result<Void, SosStatus> {
+/// A whole row given as it is, keeping `keep` of it: a device's window, a pool
+/// or an allocation.
+func give_row(child: &Process, record: &var BootHandle, tag: UInt,
+              keep: UInt32) -> Result<Void, SosStatus> {
     match record.kind {
         case IoMemory -> {
-            try child.give(iomemory: record.take_iomemory()!, tag: tag) catch { return error.0 }
+            try child.give(iomemory: record.take_iomemory()!, tag: tag, keep: keep) catch {
+                return error.0
+            }
         },
         case Pool -> {
-            try child.give(pool: record.take_pool()!, tag: tag) catch { return error.0 }
+            try child.give(pool: record.take_pool()!, tag: tag, keep: keep) catch {
+                return error.0
+            }
         },
         case Memory -> {
-            try child.give(memory: record.take_memory()!, tag: tag) catch { return error.0 }
+            try child.give(memory: record.take_memory()!, tag: tag, keep: keep) catch {
+                return error.0
+            }
         },
         case _ -> panic("root: the plan gives row {}, which is not a row's kind", record.tag)
     }

@@ -1,0 +1,47 @@
+//! A child of the gate's stock-root image `tests/images/stock_ceilings.toml`
+//! on the riscv32 `virt` board whose declaration gives its window record the
+//! one right `map`, within the `iomemory` ceiling it lists (`process.toml`):
+//! it prints whether the window it was given keeps `Map` and nothing more,
+//! and then carves it, which needs `Carve` and is an `AccessDenied` fault that
+//! ends the process.
+
+import sos.{System, BootSet, IoMemoryRight, ProcessRight}
+
+static EXIT_FAILED: UInt = 1
+
+/// The tag its declaration gives the window.
+static WINDOW: UInt = 2
+
+/// What its record keeps.
+static KEPT: UInt32 = (IoMemoryRight.Map as UInt32)
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS recright: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    var set = try BootSet(process: &proc) catch {
+        print("SOS recright: drain: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    var record = set.take(WINDOW)!
+    let window = record.take_iomemory()!
+    let rights = try window.rights() catch {
+        print("SOS recright: rights: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    if rights == KEPT {
+        print("SOS recright: the window keeps Map and no more: yes")
+    } else {
+        print("SOS recright: the window keeps Map and no more: no, it has {}", rights)
+    }
+    print("SOS recright: carving it")
+    let _ = window.carve(offset: 0, len: 4)
+    print("SOS recright: UNREACHABLE the carve")
+    let _ = proc.exit(EXIT_FAILED)
+}

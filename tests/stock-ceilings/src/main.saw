@@ -1,0 +1,75 @@
+//! A child of the gate's stock-root image `tests/images/stock_ceilings.toml`
+//! on the riscv32 `virt` board whose declaration narrows its rights ceilings
+//! (`process.toml`): it reads each ceiling back and prints whether it is
+//! exactly its declaration's, a kind the declaration leaves out reading none.
+//! It then makes an Event, whose ceiling withholds `Signal`, prints the rights
+//! the Event came with, and signals it, which is an `AccessDenied` fault that
+//! ends the process.
+
+import sos.{System, Process, SosStatus, ProcessRight, EventRight, ClockRight}
+
+static EXIT_FAILED: UInt = 1
+
+/// What the declaration gives each kind, as the kind's enum names them.
+static PROCESS: UInt32 = (ProcessRight.EventCreate | ProcessRight.Stats | ProcessRight.Exit)
+static EVENT: UInt32 = (EventRight.Receive | EventRight.Wait)
+static CLOCK: UInt32 = (ClockRight.Read as UInt32)
+
+/// Whether the ceiling `got` is `want`, printed under `kind`.
+func report(kind: String, got: Result<UInt32, SosStatus>, want: UInt32) {
+    match got {
+        case Ok(word) -> {
+            if word == want {
+                print("SOS ceilings: {} ceiling is its declaration's: yes", kind)
+            } else {
+                print("SOS ceilings: {} ceiling is its declaration's: no, it is {}", kind, word)
+            }
+        },
+        case Err(why) -> print("SOS ceilings: {} ceiling: {}", kind, why)
+    }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS ceilings: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    report("Process", proc.process_ceiling(), PROCESS)
+    report("Thread", proc.thread_ceiling(), 0)
+    report("Event", proc.event_ceiling(), EVENT)
+    report("Waiter", proc.waiter_ceiling(), 0)
+    report("Interrupt", proc.interrupt_ceiling(), 0)
+    report("Clock", proc.clock_ceiling(), CLOCK)
+    report("Timer", proc.timer_ceiling(), 0)
+    report("Memory", proc.memory_ceiling(), 0)
+    report("IoMemory", proc.iomemory_ceiling(), 0)
+    report("Mapping", proc.mapping_ceiling(), 0)
+    report("Pool", proc.pool_ceiling(), 0)
+    report("PipeInlet", proc.inlet_ceiling(), 0)
+    report("PipeOutlet", proc.outlet_ceiling(), 0)
+    report("PipeReply", proc.reply_ceiling(), 0)
+    report("PipeRequest", proc.request_ceiling(), 0)
+
+    let event = try proc.event_create() catch {
+        print("SOS ceilings: event: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let rights = try event.rights() catch {
+        print("SOS ceilings: event rights: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    if rights == EVENT {
+        print("SOS ceilings: the Event keeps Receive and Wait and no more: yes")
+    } else {
+        print("SOS ceilings: the Event keeps Receive and Wait and no more: no, it has {}", rights)
+    }
+    print("SOS ceilings: signalling it")
+    let _ = event.signal(1)
+    print("SOS ceilings: UNREACHABLE the signal")
+    let _ = proc.exit(EXIT_FAILED)
+}

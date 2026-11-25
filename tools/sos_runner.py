@@ -9711,6 +9711,91 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
 
+    # Two processes whose rights ceilings come from their declarations'
+    # `[ceilings]` (`tests/images/stock_ceilings.toml`), which root narrows
+    # before it gives anything. `ceilings` reads its ceiling of each kind
+    # back, each equal to its declaration's and a kind the declaration leaves
+    # out none, makes an Event whose ceiling withholds `signal`, and signals
+    # it: root reports its end as an `AccessDenied` fault (`Faulted` << 16 |
+    # 3). `heap` is a program written with `main` over a heap whose
+    # declaration lists exactly the rights its runtime spends, and its heap
+    # grows from its pool with nothing refused.
+    {
+        "name": "stock_ceilings",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_ceilings.toml"},
+        "expect_out": ["{banner}",
+                       "SOS ceilings: Process ceiling is its declaration's: yes",
+                       "SOS ceilings: Thread ceiling is its declaration's: yes",
+                       "SOS ceilings: Event ceiling is its declaration's: yes",
+                       "SOS ceilings: Waiter ceiling is its declaration's: yes",
+                       "SOS ceilings: Interrupt ceiling is its declaration's: yes",
+                       "SOS ceilings: Clock ceiling is its declaration's: yes",
+                       "SOS ceilings: Timer ceiling is its declaration's: yes",
+                       "SOS ceilings: Memory ceiling is its declaration's: yes",
+                       "SOS ceilings: IoMemory ceiling is its declaration's: yes",
+                       "SOS ceilings: Mapping ceiling is its declaration's: yes",
+                       "SOS ceilings: Pool ceiling is its declaration's: yes",
+                       "SOS ceilings: PipeInlet ceiling is its declaration's: yes",
+                       "SOS ceilings: PipeOutlet ceiling is its declaration's: yes",
+                       "SOS ceilings: PipeReply ceiling is its declaration's: yes",
+                       "SOS ceilings: PipeRequest ceiling is its declaration's: yes",
+                       "SOS ceilings: the Event keeps Receive and Wait and no "
+                       "more: yes",
+                       "SOS ceilings: signalling it",
+                       "SOS ceilheap: the heap grew from its pool: yes",
+                       "SOS ceilheap: it was never refused: yes",
+                       "root: ceilings ended status=131075",
+                       "root: heap ended status=65536"],
+        "expect_tail": "root: heap ended status=65536",
+        "expect_clean_exit": True,
+    },
+
+    # A process given a window with the one right its record names
+    # (`tests/images/stock_record_rights.toml`): the window it drains keeps
+    # `Map` and no more, and its carve, which needs `Carve`, is an
+    # `AccessDenied` fault that root reports.
+    {
+        "name": "stock_record_rights",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_record_rights.toml"},
+        "expect_out": ["{banner}",
+                       "SOS recright: the window keeps Map and no more: yes",
+                       "SOS recright: carving it",
+                       "root: rights ended status=131075"],
+        "expect_tail": "root: rights ended status=131075",
+        "expect_clean_exit": True,
+    },
+
+    # One record of each shape the stock root gives, each with the rights its
+    # declaration names (`tests/images/stock_record_shapes.toml`), and each
+    # child prints the rights it holds: `first` a sibling of the RTC's row
+    # (`Map`, 512) and its line (`Wait`, 256), `carve` a carve of one register
+    # (512), `last` the row itself, which root took for the others (512), and
+    # `pipes` the server end of a connection (`Take`, 256) and an inlet of it
+    # (`Post`, 256). Every one is narrower than what the source holds.
+    {
+        "name": "stock_record_shapes",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_record_shapes.toml"},
+        "expect_out": ["{banner}",
+                       "SOS first: rights of record 2 IoMemory: 512",
+                       "SOS first: rights of record 3 Interrupt: 256",
+                       "SOS carve: rights of record 2 IoMemory: 512",
+                       "SOS last: rights of record 2 IoMemory: 512",
+                       "SOS pipes: rights of record 2 PipeOutlet: 256",
+                       "SOS pipes: rights of record 3 PipeInlet: 256",
+                       "root: first ended status=65536",
+                       "root: pipes ended status=65536",
+                       "root: last ended status=65536",
+                       "root: carve ended status=65536"],
+        "expect_tail": "root: carve ended status=65536",
+        "expect_clean_exit": True,
+    },
+
     # Two processes taking the RTC whole (`tests/images/stock_takers.toml`):
     # the first is given a sibling of the row and the second the row itself,
     # which a setup write had put in root's hands; both see the word it set.

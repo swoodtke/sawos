@@ -280,6 +280,45 @@ public func ask(boot_handle: UInt, name: String, inlet_tag: UInt, byte: UInt8) {
     let _ = s.proc.exit(EXIT_OK)
 }
 
+/// Print the rights of each device window, interrupt line and connection end
+/// this child holds, `SOS NAME: rights of record TAG KIND: WORD`, in the order
+/// the drain meets them, and exit. Each is what its record's give kept.
+public func show_rights(boot_handle: UInt, name: String) {
+    guard var s = begin(boot_handle, name) else { return }
+    let entries = s.set.entries()
+    var i = 0
+    while i < entries.len() {
+        let e = entries.get(i)!
+        i = i + 1
+        var word: UInt32 = 0
+        var shown = true
+        var record = s.set.take(e.tag)!
+        match e.kind {
+            case IoMemory -> {
+                let held = record.take_iomemory()!
+                word = try held.rights() catch { 0 }
+            },
+            case Interrupt -> {
+                let held = record.take_interrupt()!
+                word = try held.rights() catch { 0 }
+            },
+            case PipeInlet -> {
+                let held = record.take_inlet()!
+                word = try held.rights() catch { 0 }
+            },
+            case PipeOutlet -> {
+                let held = record.take_outlet()!
+                word = try held.rights() catch { 0 }
+            },
+            case _ -> { shown = false }
+        }
+        if shown {
+            print("SOS {}: rights of record {} {}: {}", name, e.tag, kind_name(e.kind), word)
+        }
+    }
+    let _ = s.proc.exit(EXIT_OK)
+}
+
 /// Print the System handle's rights and exit.
 public func hold(boot_handle: UInt, name: String) {
     guard let s = begin(boot_handle, name) else { return }

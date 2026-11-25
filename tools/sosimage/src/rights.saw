@@ -1,0 +1,180 @@
+//! The rights a declaration may name, by kind: the table `[ceilings]` and a
+//! record's `rights` are read against.
+//!
+//! A process's rights ceiling is kept per `HandleKind` (spec §2.7), and a
+//! declaration narrows it by naming, for a kind in kebab case, the rights of
+//! that kind's enum (`kernel/abi/src/rights.saw`) the process may hold, each
+//! by its case in kebab case: `MapExecute` is `map-execute`. The builder
+//! turns the names into the words root narrows with, so the bit of every right
+//! is stated here, and the builder's tests hold the table to the kernel's
+//! enums, case by case.
+//!
+//! `system` is not a kind here: a process's System rights are its `system`
+//! record's, which the launch convention bounds (`sosimage.declaration`).
+//! `iomemory` is the kind of `IoMemory`, for which the kebab form of its
+//! name would be two words.
+
+import sosimage.rules.{holds}
+
+/// A right: its name and its bit's position in its kind's word.
+public struct RightBit {
+    name: String
+    shift: Int
+}
+
+/// A kind a declaration may narrow the ceiling of.
+public struct CeilingKindInfo {
+    /// The kind's name in a declaration.
+    key: String
+    /// Its case in `bootplan.CeilingKind`, and in `sos.HandleKind`.
+    case_name: String
+    /// The kernel's enum of its rights, and the article-and-name a refusal
+    /// calls it by.
+    enum_name: String
+    article: String
+    rights: Vector<RightBit>
+}
+
+extension CeilingKindInfo: NoCopy {}
+
+func bit(name: String, shift: Int) -> RightBit {
+    RightBit(name: name, shift: shift)
+}
+
+func kind(key: String, case_name: String, enum_name: String, article: String,
+          rights: Vector<RightBit>) -> CeilingKindInfo {
+    CeilingKindInfo(key: key, case_name: case_name, enum_name: enum_name,
+                    article: article, rights: move rights)
+}
+
+/// How many kinds a declaration may narrow the ceiling of.
+public static CEILING_KINDS: Int = 15
+
+/// The `index`th kind with a ceiling a declaration may narrow, in
+/// `HandleKind`'s order (System excepted); `index` is below `CEILING_KINDS`.
+public func ceiling_kind_at(index: Int) -> CeilingKindInfo {
+    match index {
+        case 0 -> kind("process", "Process", "ProcessRight", "a Process",
+          [bit("transfer", 0), bit("mint", 1), bit("thread-create", 8), bit("exit", 9),
+           bit("wait", 10), bit("event-create", 11), bit("waiter-create", 12),
+           bit("kill", 13), bit("start", 14), bit("boot-handles", 15),
+           bit("thread-self", 16), bit("give", 17), bit("map", 18),
+           bit("pipe-create", 19), bit("stats", 20), bit("restrict-rights", 21),
+           bit("quota-set", 22)]),
+        case 1 -> kind("thread", "Thread", "ThreadRight", "a Thread",
+          [bit("transfer", 0), bit("mint", 1), bit("start", 8), bit("join", 9),
+           bit("control", 10)]),
+        case 2 -> kind("event", "Event", "EventRight", "an Event",
+          [bit("transfer", 0), bit("mint", 1), bit("signal", 8), bit("receive", 9),
+           bit("wait", 10)]),
+        case 3 -> kind("waiter", "Waiter", "WaiterRight", "a Waiter",
+          [bit("transfer", 0), bit("mint", 1), bit("attach", 8), bit("wait", 9)]),
+        case 4 -> kind("interrupt", "Interrupt", "InterruptRight", "an Interrupt",
+          [bit("transfer", 0), bit("mint", 1), bit("wait", 8), bit("ack", 9)]),
+        case 5 -> kind("clock", "Clock", "ClockRight", "a Clock",
+          [bit("transfer", 0), bit("mint", 1), bit("read", 8), bit("timer-create", 9)]),
+        case 6 -> kind("timer", "Timer", "TimerRight", "a Timer",
+          [bit("transfer", 0), bit("mint", 1), bit("arm", 8), bit("wait", 9)]),
+        case 7 -> kind("memory", "Memory", "MemoryRight", "a Memory",
+          [bit("transfer", 0), bit("mint", 1), bit("map", 9), bit("map-execute", 10),
+           bit("extend", 11)]),
+        case 8 -> kind("iomemory", "IoMemory", "IoMemoryRight", "an IoMemory",
+          [bit("transfer", 0), bit("mint", 1), bit("carve", 8), bit("map", 9)]),
+        case 9 -> kind("mapping", "Mapping", "MappingRight", "a Mapping",
+          [bit("transfer", 0), bit("mint", 1), bit("unmap", 8), bit("base", 9),
+           bit("grow", 10)]),
+        case 10 -> kind("pool", "Pool", "PoolRight", "a Pool",
+          [bit("transfer", 0), bit("mint", 1), bit("map", 9), bit("map-execute", 10),
+           bit("extend", 11), bit("allocate", 16)]),
+        case 11 -> kind("pipe-inlet", "PipeInlet", "PipeInletRight", "a PipeInlet",
+          [bit("transfer", 0), bit("mint", 1), bit("post", 8), bit("wait", 9)]),
+        case 12 -> kind("pipe-outlet", "PipeOutlet", "PipeOutletRight", "a PipeOutlet",
+          [bit("transfer", 0), bit("mint", 1), bit("take", 8), bit("wait", 9)]),
+        case 13 -> kind("pipe-reply", "PipeReply", "PipeReplyRight", "a PipeReply",
+          [bit("transfer", 0), bit("mint", 1), bit("resolve", 8), bit("wait", 9)]),
+        case _ -> kind("pipe-request", "PipeRequest", "PipeRequestRight", "a PipeRequest",
+          [bit("transfer", 0), bit("mint", 1), bit("reply", 8), bit("wait", 9),
+           bit("sender", 10)])
+    }
+}
+
+/// The kind named `key` in a declaration.
+public func ceiling_kind(key: String) -> CeilingKindInfo? {
+    var i = 0
+    while i < CEILING_KINDS {
+        let k = ceiling_kind_at(i)
+        if k.key.equals(key) {
+            return move k
+        }
+        i = i + 1
+    }
+    None
+}
+
+/// The names of the kinds a declaration may narrow, in the table's order.
+public func ceiling_keys() -> Vector<String> {
+    var out = Vector<String>()
+    var i = 0
+    while i < CEILING_KINDS {
+        try! out.push(ceiling_kind_at(i).key)
+        i = i + 1
+    }
+    move out
+}
+
+/// The bit of the right `name` of `info`'s kind, as a word.
+public func right_word(info: &CeilingKindInfo, name: String) -> UInt32? {
+    var i = 0
+    while i < info.rights.len() {
+        let r = info.rights.get(i)!
+        if r.name.equals(name) {
+            return (1 as UInt32) << (r.shift as UInt32)
+        }
+        i = i + 1
+    }
+    None
+}
+
+/// The word of the rights `names` of `info`'s kind, each of which is one of
+/// the kind's.
+public func rights_word(info: &CeilingKindInfo, names: &Vector<String>) -> UInt32 {
+    var word: UInt32 = 0
+    var i = 0
+    while i < names.len() {
+        word = word | (right_word(&info, names.get(i) ?? "") ?? 0)
+        i = i + 1
+    }
+    word
+}
+
+/// The names of `info`'s kind's rights, in the table's order.
+public func right_names(info: &CeilingKindInfo) -> Vector<String> {
+    var out = Vector<String>()
+    var i = 0
+    while i < info.rights.len() {
+        try! out.push((info.rights.get(i)!).name)
+        i = i + 1
+    }
+    move out
+}
+
+/// The names of the rights of `info`'s kind that `word` holds, in the
+/// table's order.
+public func names_in(info: &CeilingKindInfo, word: UInt32) -> Vector<String> {
+    var out = Vector<String>()
+    var i = 0
+    while i < info.rights.len() {
+        let r = info.rights.get(i)!
+        if (word & ((1 as UInt32) << (r.shift as UInt32))) != 0 {
+            try! out.push(r.name)
+        }
+        i = i + 1
+    }
+    move out
+}
+
+/// Whether `info`'s kind has a right `name`.
+public func has_right(info: &CeilingKindInfo, name: String) -> Bool {
+    let names = right_names(&info)
+    holds(&names, name)
+}

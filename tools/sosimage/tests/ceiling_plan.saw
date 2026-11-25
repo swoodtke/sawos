@@ -1,0 +1,232 @@
+// What the plan makes of a declaration's `[ceilings]` and its records'
+// `rights`: a ceiling word for each kind of a process that has the table and
+// none for one that does not, each record's keep word, the console's inlet
+// held to the `pipe-inlet` ceiling, the module root is built with, and root's
+// arena with the ceilings counted.
+
+import bootplan.{CEILING_WORDS, KEEP_ALL}
+import sosimage.board.{Board}
+import sosimage.declaration.{Declaration}
+import sosimage.imagefile.{ImageFile, bind}
+import sosimage.plan.{ImagePlan, PlanCeiling, heap_block, plan_image, plan_module,
+                      root_blocks}
+import sosimage.rights.{CEILING_KINDS}
+
+func join(lines: &Vector<String>) -> String {
+    "{lines.join("\n")}\n"
+}
+
+// An ESP32-S3 board with two UARTs.
+func board() -> Board {
+    let lines: Vector<String> = [
+        "format = 1",
+        "[board]",
+        "name = \"esp32s3\"",
+        "triple = \"xtensa-esp-unknown-elf\"",
+        "tier = \"flat\"",
+        "hal = \"hal/xtensa-esp32s3\"",
+        "placement = \"copied\"",
+        "modules = []",
+        "cflags = []",
+        "[emulator]",
+        "program = \"qemu-system-xtensa\"",
+        "args = []",
+        "[ram.kernel]",
+        "use = \"kernel\"",
+        "speed = \"fast\"",
+        "base = 0x3FC8_C000",
+        "len = 0x2_4000",
+        "[ram.sram]",
+        "use = \"process\"",
+        "speed = \"fast\"",
+        "base = 0x3FCB_0000",
+        "len = 0x4_0000",
+        "atomics = true",
+        "[ram.default]",
+        "process = \"sram\"",
+        "pool = \"sram\"",
+        "[devices.UART0]",
+        "type = \"esp32s3-uart\"",
+        "base = 0x6000_0000",
+        "len = 0x1000",
+        "line = 27",
+        "kernel = true",
+        "[devices.UART1]",
+        "type = \"esp32s3-uart\"",
+        "base = 0x6001_0000",
+        "len = 0x1000",
+        "line = 28"]
+    try! Board.parse(join(&lines), "hal/xtensa-esp32s3/board.toml")
+}
+
+func decl(lines: &Vector<String>, file: String) -> Declaration {
+    try! Declaration.parse(join(&lines), file, main: true)
+}
+
+// A program written with `main`: its runtime's rights, and the three the
+// caller names for the process.
+func runtime(extra: String) -> String {
+    "[ceilings]\nprocess = [\"boot-handles\", \"thread-self\", \"exit\"{extra}]\nthread = [\"control\"]\n"
+}
+
+// A driver: a window and a serve, each with its own rights, in a process with
+// a table of ceilings that holds more.
+func driver(window: String, ceilings: String) -> Declaration {
+    let lines: Vector<String> = ["format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"port\"", "kind = \"window\"", "type = \"esp32s3-uart\"", "tag = 2",
+        window,
+        "[[boot]]", "name = \"uart\"", "kind = \"serve\"", "protocol = \"uartproto\"", "tag = 3",
+        ceilings]
+    decl(&lines, "driver/process.toml")
+}
+
+// A client of the driver's connection.
+func hello(ceilings: String) -> Declaration {
+    let lines: Vector<String> = ["format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"uart\"", "kind = \"client\"", "protocol = \"uartproto\"", "tag = 2",
+        ceilings]
+    decl(&lines, "hello/process.toml")
+}
+
+func image_text(console: Bool) -> String {
+    let named = if console { "console = \"console.uart\"\n" } else { "" }
+    "format = 1\n[image]\nname = \"c\"\nboard = \"esp32s3\"\ntick = true\n{named}[root]\npackage = \"stock\"\n[[process]]\nname = \"console\"\npackage = \"driver\"\ndevice = \{ port = \"UART1\" \}\n[[process]]\nname = \"hello\"\npackage = \"hello\"\nclients = \{ uart = \"console.uart\" \}\n"
+}
+
+func planned(console: Bool, d: &Vector<Declaration>) -> ImagePlan {
+    let b = board()
+    let image = try! ImageFile.parse(image_text(console), "i.toml", &b, 4)
+    let bound = try! bind(&image, &b, &d, 4)
+    try! plan_image(&image, &b, &d, &bound, 4)
+}
+
+func plan_refusal(console: Bool, d: &Vector<Declaration>) -> String {
+    let b = board()
+    let image = try! ImageFile.parse(image_text(console), "i.toml", &b, 4)
+    let bound = try! bind(&image, &b, &d, 4)
+    match plan_image(&image, &b, &d, &bound, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func pair(a: Declaration, b: Declaration) -> Vector<Declaration> {
+    var out = Vector<Declaration>()
+    try! out.push(move a)
+    try! out.push(move b)
+    move out
+}
+
+// Child `child`'s ceiling for the `PipeInlet` kind, or -1 when it has none.
+func ceiling_of(plan: &ImagePlan, child: Int, kind: String) -> Int {
+    var word = -1
+    borrow let c = plan.children[child] {
+        var i = 0
+        while i < c.ceilings.len() {
+            let row = c.ceilings.get(i)!
+            if row.kind.equals(kind) {
+                word = row.rights as Int
+            }
+            i = i + 1
+        }
+    }
+    word
+}
+
+func keep_of(plan: &ImagePlan, child: Int, record: Int) -> UInt32 {
+    var keep: UInt32 = 0
+    borrow let c = plan.children[child] {
+        keep = (c.records.get(record)!).keep
+    }
+    keep
+}
+
+func ceilings_len(plan: &ImagePlan, child: Int) -> Int {
+    var len = 0
+    borrow let c = plan.children[child] {
+        len = c.ceilings.len()
+    }
+    len
+}
+
+func main() {
+    let full = runtime(", \"map\"")
+    let with_post = "{full}iomemory = [\"carve\", \"map\"]\npipe-outlet = [\"take\", \"transfer\"]\npipe-inlet = [\"post\", \"transfer\"]\n"
+
+    // A process with `[ceilings]` has a word for each of the 15 kinds, in the
+    // table's order, none for a kind it leaves out; one without has none.
+    var d = pair(driver("", with_post), hello(with_post))
+    let plan = planned(false, &d)
+    assert(ceilings_len(&plan, 0) == CEILING_KINDS, "a word for each kind")
+    assert(ceiling_of(&plan, 0, "Process") == ((1 << 15) | (1 << 16) | (1 << 9) | (1 << 18)),
+           "the process word")
+    assert(ceiling_of(&plan, 0, "Thread") == (1 << 10), "the thread word")
+    assert(ceiling_of(&plan, 0, "IoMemory") == ((1 << 8) | (1 << 9)), "the window word")
+    assert(ceiling_of(&plan, 0, "Event") == 0, "a kind it leaves out: no rights")
+    assert(ceiling_of(&plan, 0, "PipeInlet") == ((1 << 8) | (1 << 0)), "the inlet word")
+    borrow let first = plan.children[0] {
+        assert((first.ceilings.get(0)!).kind.equals("Process") &&
+               (first.ceilings.get(14)!).kind.equals("PipeRequest"), "the table's order")
+    }
+    var none = pair(driver("", ""), hello(""))
+    let without = planned(false, &none)
+    assert(ceilings_len(&without, 0) == 0 && ceilings_len(&without, 1) == 0,
+           "no [ceilings]: no words")
+
+    // Each record's keep word: its own rights, else the kind's ceiling, else
+    // every right. The System record is read for its System rights, and the
+    // serve is the ceiling's whichever it is.
+    var own = pair(driver("rights = [\"map\"]", with_post), hello(with_post))
+    let owned = planned(false, &own)
+    assert(keep_of(&owned, 0, 1) == (1 << 9), "a window's own rights")
+    assert(keep_of(&owned, 0, 2) == ((1 << 8) | (1 << 0)), "a serve with none is the ceiling")
+    assert(keep_of(&plan, 0, 1) == ((1 << 8) | (1 << 9)), "a window with none: the ceiling")
+    assert(keep_of(&without, 0, 1) == KEEP_ALL, "no ceilings, no rights: every right")
+    assert(keep_of(&without, 0, 0) == KEEP_ALL, "a System record")
+    var rights_only = pair(driver("rights = [\"carve\"]", ""), hello(""))
+    let alone = planned(false, &rights_only)
+    assert(keep_of(&alone, 0, 1) == (1 << 8), "rights with no ceilings")
+
+    // The console's inlet is the `pipe-inlet` ceiling's, and the ceiling must
+    // let the runtime post: refused without `post`, and without the kind.
+    var console = pair(driver("", with_post), hello(with_post))
+    let consoled = planned(true, &console)
+    assert(keep_of(&consoled, 1, 2) == ((1 << 8) | (1 << 0)), "the console's inlet keeps the ceiling")
+    var plain_console = pair(driver("", ""), hello(""))
+    assert(keep_of(&planned(true, &plain_console), 1, 2) == KEEP_ALL, "no ceilings: every right")
+    let no_post = "{full}pipe-inlet = [\"transfer\", \"wait\"]\n"
+    var refused = pair(driver("", with_post), hello("{no_post}"))
+    assert(plan_refusal(true, &refused).equals("i.toml: line 14, column 1: the process hello's `pipe-inlet` ceiling in [ceilings] lacks `post`: the runtime posts every line the process prints through the console's inlet, and this image gives it one"),
+           "a ceiling without post, in a console image")
+    var unlisted = pair(driver("", with_post), hello(full))
+    assert(plan_refusal(true, &unlisted).equals("i.toml: line 14, column 1: the process hello's `pipe-inlet` ceiling in [ceilings] lacks `post`: the runtime posts every line the process prints through the console's inlet, and this image gives it one"),
+           "no pipe-inlet ceiling, in a console image")
+    assert(plan_refusal(false, &refused).is_empty(), "the same ceiling in an image with no console")
+
+    // The module root is built with carries each ceiling and keep word.
+    let module = plan_module(&owned, "c").join("\n")
+    assert(module.contains("    var ceilings = try! Vector<Ceiling>(capacity: 15)\n    try! ceilings.push(Ceiling(kind: CeilingKind.Process, rights: 0x58200))"),
+           "the first ceiling")
+    assert(module.contains("try! ceilings.push(Ceiling(kind: CeilingKind.Event, rights: 0x0))"),
+           "a kind left out is none")
+    assert(module.contains("try! ceilings.push(Ceiling(kind: CeilingKind.PipeRequest, rights: 0x0))"),
+           "the last")
+    assert(module.contains("source: Source.Row, from: 0x4, offset: 0x0, len: 0x0, keep: 0x200))"),
+           "a record's keep word")
+    let plain_module = plan_module(&without, "c").join("\n")
+    assert(plain_module.contains("    var ceilings = try! Vector<Ceiling>(capacity: 0)\n"),
+           "no ceilings")
+
+    // Root's arena counts the ceilings: the blocks differ by the one block of
+    // them a child with the table has.
+    var cleared = planned(false, &d)
+    borrow var child = cleared.children[0] {
+        child.ceilings = Vector<PlanCeiling>()
+    }
+    let with_blocks = root_blocks(&plan, 8)
+    let without_blocks = root_blocks(&cleared, 8)
+    assert(with_blocks - without_blocks == heap_block(CEILING_KINDS, CEILING_WORDS, 8),
+           "a child's ceilings are a block of root's arena")
+}

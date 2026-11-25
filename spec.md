@@ -4890,15 +4890,18 @@ reserved.
 - **The stock root's plan.** For an image whose root is the stock root
   (`root/`), the builder also writes the module `imageplan`, in the types of
   `bootplan`: for each child, the tags of its image and destination rows, its
-  quota rows, the records to give it (each with its tag, its source, and for a
-  carve the offset and length), the System rights its System record keeps, by
-  name, the tag it is started with and its exit policy;
+  quota rows, the rights word each of its ceilings is narrowed to when its
+  declaration has `[ceilings]`, the records to give it (each with its tag, its
+  source, for a carve the offset and length, and the keep word it is given
+  with), the System rights its System record keeps, by name, the tag it is
+  started with and its exit policy;
   the connections; and the setup writes. The stock root holds no device code,
   address or line of its own: it creates every child, makes the setup writes (a
   carve of the register's grain from its device's row, mapped, written, unmapped
   and released; a `set` or a `clear` reads the register first and changes only
-  its bits), sets each child's quota rows and gives its records under the launch
-  convention below, starts every child, and supervises. The builder refuses a
+  its bits), sets each child's quota rows, narrows its ceilings and gives its
+  records under the launch convention below, starts every child, and
+  supervises. The builder refuses a
   plan the stock root could not carry out: one at whose steps root's handle
   table would overflow, or the objects root makes of a kind would pass the
   image's slab of it: Process objects (root's and one per child), Pipe objects
@@ -5052,7 +5055,11 @@ reserved.
   lists (`process.toml`), under their tags, in declared order, before start,
   and in an image that names a console the console record after them
   (below). It sets the declared quota rows before any give (§2.7,
-  `QuotaSet`). It gives windows, lines and endpoints as capabilities: a client gets an inlet
+  `QuotaSet`). It narrows each of the child's rights ceilings (§2.7,
+  `RestrictRights`) to its declaration's `[ceilings]`, when it has one, after
+  the quota rows and before any give, and gives each record with the
+  record's rights, or its kind's ceiling (below). It gives windows, lines and
+  endpoints as capabilities: a client gets an inlet
   minted with `Post | Transfer`, a server the outlet. It starts the child
   with its System record's tag, a sibling masked with the System rights the
   record names (`rights`, by `SystemRight`'s names: `debug`, `process-self`,
@@ -5072,6 +5079,37 @@ reserved.
   A process that declares heaps gets one pool for each, under the runtime's
   heap tags, given with `PoolRight.Allocate | Map | Transfer | Mint |
   Extend` and nothing else.
+- **Ceilings and record rights** (userspace convention, not kernel surface).
+  A declaration may carry a `[ceilings]` table: a key is a handle kind in
+  kebab case (every kind but System: `process`, `thread`, `event`, `waiter`,
+  `interrupt`, `clock`, `timer`, `memory`, `iomemory`, `mapping`, `pool`,
+  `pipe-inlet`, `pipe-outlet`, `pipe-reply`, `pipe-request`), and its value
+  lists the rights of that kind's rights enum (§3) the process may hold, each
+  by its case in kebab case. The table is complete when present: a kind it
+  does not list gets no rights. A declaration with none leaves the child the
+  launcher's ceilings, as before. The launcher narrows the child's ceiling
+  for every kind to the table's word, and gives each record with its keep
+  mask, so what the launcher gives the process and every handle the process
+  mints are within its declaration. A ceiling bounds what a process obtains
+  from the kernel and not what it is sent: a handle that arrives in a pipe
+  message carries the rights its sender gave it (§2.7). A record
+  (any kind but `system`, whose rights are System's, bounded above) may
+  carry `rights`, a list of its kind's rights (a window's are `IoMemory`'s,
+  a line's `Interrupt`'s, a serve's `PipeOutlet`'s, a client's `PipeInlet`'s
+  and a `memory` record's `Pool`'s), which are the keep mask of its give; a
+  record with none is given with its kind's ceiling when the declaration has
+  `[ceilings]`, and with every right its source holds otherwise. With
+  `[ceilings]`, a record's rights lie within its kind's ceiling. The image
+  builder refuses, by name, an unknown kind or right, a right named twice, a
+  `system` key, a record's rights outside its ceiling, and a table that
+  withholds a right the process's runtime spends: for a program written with
+  `main`, its Process handle's `BootHandles`, `ThreadSelf` and `Exit` and its
+  main thread's `Control`; for a process with a heap (written with `main` or
+  not), the Process handle's `BootHandles`, `Mint` and `Map`, the heap's
+  `Memory`'s `Map` and `Extend`, its `Mapping`'s `Grow` and `Base`, and its
+  pool's `Allocate`, `Map`, `Transfer`, `Mint` and `Extend`; and in an image
+  that names a console, the inlet's `Post`. An image cannot widen or narrow a
+  declaration's ceilings.
 - **The console record** (userspace convention, not kernel surface). The
   tags from `0xFFFF_FF00` to `0xFFFF_FFFF` are the runtime's: a launcher
   gives a record under one for the runtime to take, and the image builder

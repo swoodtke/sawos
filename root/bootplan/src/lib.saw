@@ -8,18 +8,23 @@
 //! The numbers a plan does carry are the board's and the image's: a line's
 //! number, a carve's offset and length, a register's offset in its carve and
 //! the word written to it, and a quota row's limit. No op number, right or
-//! kind's encoding is among them. A child's System record keeps the rights its
-//! declaration names, which the plan carries by name (`RightName`) and root
-//! turns into its mask; every other record keeps what the launch convention
-//! gives its source, decided in root. So the plan carries no rights word.
+//! kind's encoding is among them, but for the rights words a declaration's
+//! `[ceilings]` and records' `rights` come to. A child's System record keeps
+//! the rights its declaration names, which the plan carries by name
+//! (`RightName`) and root turns into its mask. A child's rights ceilings are
+//! carried as words (`Ceiling`), each of the kind the declaration lists, and
+//! root narrows the child's to them before it gives anything; a child with
+//! none is left with root's. A record is given with its keep word (`Record`),
+//! whose all-ones value keeps everything the source holds.
 //!
 //! A process that declares heaps is given one pool for each, after its other
 //! records, under `HEAP_TAG` plus the heap's slot (`Source.Heap`), with the
 //! launch convention's mask for a heap's pool, which root states.
 //!
 //! The plan's order is the launch order (spec §12): every child is created,
-//! the setup writes are made, each child's quota rows are set and its records
-//! given in its declared order, and then every child is started.
+//! the setup writes are made, each child's quota rows are set, its ceilings
+//! narrowed and its records given in its declared order, and then every child
+//! is started.
 //!
 //! The tags from `RESERVED_TAG_FIRST` to `RESERVED_TAG_LAST` are the
 //! runtime's: a record under one is given by the builder for the runtime to
@@ -121,6 +126,10 @@ public enum Source {
 @synthesize
 extension Source: Equatable {}
 
+/// The keep word that keeps every right: what a record with no `rights` is
+/// given with when its child has no `[ceilings]`.
+public static KEEP_ALL: UInt32 = 0xFFFF_FFFF
+
 /// One record a child is given, under `tag`.
 public struct Record {
     tag: UInt
@@ -130,6 +139,11 @@ public struct Record {
     /// A carve's offset into its row, and its length; zero for the others.
     offset: UInt
     len: UInt
+    /// The rights the child keeps of what it is given, a mask of the record
+    /// kind's rights. A System record keeps the rights its child's `rights`
+    /// name, and a heap's pool the launch convention's mask for one; neither
+    /// reads this word.
+    keep: UInt32
 }
 
 /// A quota kind, by the name `sos.QuotaKind` gives it.
@@ -154,6 +168,34 @@ public enum RightName {
     case Transfer
 }
 
+/// A handle kind whose rights ceiling a declaration may narrow, by the name
+/// `sos.HandleKind` gives it. System is not among them: a child's System
+/// rights are its `system` record's.
+public enum CeilingKind {
+    case Process,
+    case Thread,
+    case Event,
+    case Waiter,
+    case Interrupt,
+    case Clock,
+    case Timer,
+    case Memory,
+    case IoMemory,
+    case Mapping,
+    case Pool,
+    case PipeInlet,
+    case PipeOutlet,
+    case PipeReply,
+    case PipeRequest
+}
+
+/// One of a child's rights ceilings: the rights word `kind`'s ceiling is
+/// narrowed to.
+public struct Ceiling {
+    kind: CeilingKind
+    rights: UInt32
+}
+
 /// One quota row root sets on a child before it gives it anything.
 public struct Quota {
     kind: QuotaName
@@ -167,6 +209,9 @@ public struct Child {
     image: UInt
     destination: UInt
     quota: Vector<Quota>
+    /// The rights ceilings root narrows the child's to, after its quota rows
+    /// and before its first give; none leaves the child root's.
+    ceilings: Vector<Ceiling>
     /// In the order the child's declaration lists them.
     records: Vector<Record>
     /// The rights its System record keeps, the sibling of root's System it is
@@ -203,11 +248,13 @@ extension Plan: NoCopy {}
 // root's own (`root/src/main.saw`) hold the bookkeeping's.
 
 /// A `Child`, in the plan's `children`.
-public static CHILD_WORDS: Int = 17
+public static CHILD_WORDS: Int = 21
 /// A `Quota` row, in a child's `quota`.
 public static QUOTA_WORDS: Int = 2
+/// A `Ceiling`, in a child's `ceilings`.
+public static CEILING_WORDS: Int = 2
 /// A `Record`, in a child's `records`.
-public static RECORD_WORDS: Int = 5
+public static RECORD_WORDS: Int = 6
 /// A `RightName`, in a child's `rights`.
 public static RIGHT_WORDS: Int = 1
 /// A `Setup` write, in the plan's `setup`.
@@ -224,6 +271,8 @@ public static ROW_WINDOW_WORDS: Int = 2
 
 static_assert(sizeof<Child>() <= CHILD_WORDS * sizeof<UInt>(), "a Child fits CHILD_WORDS")
 static_assert(sizeof<Quota>() <= QUOTA_WORDS * sizeof<UInt>(), "a Quota fits QUOTA_WORDS")
+static_assert(sizeof<Ceiling>() <= CEILING_WORDS * sizeof<UInt>(),
+              "a Ceiling fits CEILING_WORDS")
 static_assert(sizeof<Record>() <= RECORD_WORDS * sizeof<UInt>(), "a Record fits RECORD_WORDS")
 static_assert(sizeof<RightName>() <= RIGHT_WORDS * sizeof<UInt>(),
               "a RightName fits RIGHT_WORDS")
