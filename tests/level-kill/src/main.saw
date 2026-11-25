@@ -1,0 +1,203 @@
+// A process's end against the scheduler's levels (spec §7), from root's side.
+// Root's manifest puts `Normal` at level 2. `level-raw` is launched once per
+// round, its destination the RAM row and, for `doom`, a piece of the pool
+// mapped into it. No tick runs.
+//
+//   kill above  the child, its `Normal` at level 3, parks a thread on its own
+//               Process record. Root starts P at `Normal`, its own level,
+//               kills the child, prints M and joins P. The kill's teardown
+//               wakes the parked thread above root and then takes it off its
+//               list, and that wake must not leave root owing a switch: M,
+//               then P
+//   kill equal  the same with the child's `Normal` at root's level 2: M, then
+//               P, whatever the teardown's wakes ask for
+//   doom        the child, its `Normal` at 3, parks a thread on its own record
+//               and its main thread on root's Waiter with its wait record in
+//               the piece. Root starts P, unmaps the piece and signals: the
+//               delivery finds no record, and the child's death is paid
+//               before root's signal returns, from another process's trap.
+//               Its teardown wakes the thread on its record as the kill's
+//               does: M, then P
+//   denied      the child starts its own thread at band 8 through a handle
+//               without `Start`: the `AccessDenied` fault, not `BadArg`
+//
+//   SOS levelkill: <round> ended status=<word>
+
+import sos.{Process, Memory, Pool, Thread, Priority, SosStatus, SystemRight,
+            MapAccess, BootSet}
+import sosmain
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The boot set's rows: the child's image, its RAM, then the pool.
+static TAG_IMAGE: UInt = 0
+static TAG_RAM: UInt = 1
+static TAG_POOL: UInt = 2
+
+/// What root gives `level-raw`.
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_WAITER: UInt = 34
+
+static KEY_DEATH: UInt = 6
+static KEY_EVENT: UInt = 7
+
+static ROLE_PARK: UInt = 1
+static ROLE_DOOM: UInt = 2
+static ROLE_DENIED: UInt = 3
+
+/// The simple map with `Normal` at 3, and at 2.
+static NORMAL_AT_3: UInt32 = 0x1111_1310
+static NORMAL_AT_2: UInt32 = 0x1111_1210
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The piece mapped into the child: whole pages, so whole grains on every
+/// profile.
+static PIECE_LEN: UInt = 0x2000
+
+/// The code the kill ends the child with.
+static KILL_CODE: UInt = 9
+
+/// P's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let img = take_memory(&var set, TAG_IMAGE)
+    let ram = take_memory(&var set, TAG_RAM)
+    guard var pool_rec = set.take(TAG_POOL) else {
+        panic("SOS levelkill: no record under tag {}", TAG_POOL)
+    }
+    guard let pool = pool_rec.take_pool() else {
+        panic("SOS levelkill: the record under tag {} is no Pool", TAG_POOL)
+    }
+    try killed(&img, &ram, "kill above", NORMAL_AT_3)
+    try killed(&img, &ram, "kill equal", NORMAL_AT_2)
+    try doomed(&img, &ram, &pool)
+    try denied(&img, &ram)
+    print("SOS levelkill: done")
+    return
+}
+
+func take_memory(set: &var BootSet, tag: UInt) -> Memory {
+    guard var record = set.take(tag) else {
+        panic("SOS levelkill: no record under tag {}", tag)
+    }
+    guard let memory = record.take_memory() else {
+        panic("SOS levelkill: the record under tag {} is no Memory", tag)
+    }
+    move memory
+}
+
+/// P, made and not started: a thread at root's own level once it is.
+func p_thread() -> Result<Thread, SosStatus> {
+    sosmain.context().process().thread_create(run: says_p, arg: 0,
+                                              stack_top: top())
+}
+
+func says_p(arg: UInt) sync -> UInt {
+    print("SOS levelkill: P")
+    0
+}
+
+/// A `level-raw` mapped with `map`, given its role and a System, and started
+/// on the System. A child mapped above root runs at the start until it parks;
+/// one at root's level runs at root's yield.
+func launch(img: &Memory, ram: &Memory, role: UInt,
+            map: UInt32) -> Result<Process, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try child.band_map(map: map)
+    try tell(&child, TAG_ROLE, role)
+    return move child
+}
+
+func start(child: &Process) -> Result<Void, SosStatus> {
+    let boot = try sosmain.context().system().mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let me = try sosmain.context().process().thread_self()
+    try me.yield_now()
+    return
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(child: &Process, tag: UInt, value: UInt) -> Result<Void, SosStatus> {
+    let ev = try sosmain.context().process().event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// `kill above` and `kill equal`.
+func killed(img: &Memory, ram: &Memory, round: String,
+            map: UInt32) -> Result<Void, SosStatus> {
+    let child = try launch(&img, &ram, ROLE_PARK, map)
+    try start(&child)
+    let p = try p_thread()
+    try p.start(band: Priority.Normal)
+    try child.kill(code: KILL_CODE)
+    print("SOS levelkill: {}: M", round)
+    let _ = try p.join()
+    let status = try child.get_status()
+    print("SOS levelkill: {} ended status={}", round, status)
+    return
+}
+
+/// `doom`.
+func doomed(img: &Memory, ram: &Memory, pool: &Pool) -> Result<Void, SosStatus> {
+    let child = try launch(&img, &ram, ROLE_DOOM, NORMAL_AT_3)
+    let piece = try pool.allocate(len: PIECE_LEN)
+    let mapping = try child.map(memory: &piece, access: RW)
+    try tell(&child, TAG_ADDR, try mapping.base())
+    let ev = try sosmain.context().process().event_create()
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &ev, key: KEY_EVENT)
+    try child.give(waiter: move waiter, tag: TAG_WAITER) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try start(&child)
+    let p = try p_thread()
+    try p.start(band: Priority.Normal)
+    try mapping.unmap()
+    try ev.signal(bits: 1)
+    print("SOS levelkill: doom: M")
+    let _ = try p.join()
+    let status = try child.get_status()
+    print("SOS levelkill: doom ended status={}", status)
+    return
+}
+
+/// `denied`.
+func denied(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try launch(&img, &ram, ROLE_DENIED, NORMAL_AT_2)
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    try start(&child)
+    let _ = try waiter.wait()
+    let status = try child.get_status()
+    print("SOS levelkill: denied ended status={}", status)
+    return
+}

@@ -328,17 +328,21 @@ time-based case asserts that some time passed, never how much:
   `timer_masked_in_kernel`'s `ticks taken=0` is asserted: interrupts are
   masked in the kernel, so no length of section can raise it.
 
-A wake never preempts the running thread (only a tick, a yield, a block and a
-thread's exit request a reschedule). A wait answers at once for a Timer whose
-expiry has passed, so parking a launcher on a Timer orders nothing under a
-stalled host: the Timer can be expired at the wait, and the launcher never
+A wake preempts the running thread only when the woken thread's level is
+above it; at one level a wake never preempts (only a tick, a yield, a block
+and a thread's exit request a reschedule). A wait answers at once for a Timer
+whose expiry has passed, so parking a launcher on a Timer orders nothing under
+a stalled host: the Timer can be expired at the wait, and the launcher never
 parks. An ordering a case needs is made true by waiting on what the other side
 does: attach the child's `Process` to the Waiter and wait for its death, wait
-on an Event or a message it sends, or yield on an image with no tick. The ready
-list is one FIFO, so a yield returns once every thread that was runnable at
-the yield has run until it blocked, yielded or exited; a thread woken in those
-turns runs after the yielder, and one that yields hands back early. The
-Timer stays in a case that is about the Timer.
+on an Event or a message it sends, or yield on an image with no tick. There is
+one ready list per level, and every process is at one level unless its map
+says otherwise (every case's is, but the priority cases'). At one level a
+yield returns once every thread that was runnable at the yield has run until
+it blocked, yielded or exited; a thread woken in those turns runs after the
+yielder, and one that yields hands back early. A thread at a lower level does
+not run while one above it is ready, so a yield never reaches it. The Timer
+stays in a case that is about the Timer.
 `thread_preempt` asserts `AB`, `BA`, `AB` as ordered adjacent pairs, which is
 "the processor crossed between the two threads at least three times, whoever
 went first". Each worker spins until the other has printed, so the crossings

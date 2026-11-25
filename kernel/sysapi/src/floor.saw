@@ -14,7 +14,8 @@
 //! modules declaring one symbol is an ambiguity error at the importer. One
 //! declaration, one file, and the typed layer above calls the named seams.
 
-import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, EventOp, WaiterOp,
+import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, Priority, EventOp,
+               WaiterOp,
                InterruptOp, ClockOp, TimerOp, MemoryOp, PoolOp, IoMemoryOp,
                MappingOp,
                PipeInletOp, PipeOutletOp, PipeReplyOp, PipeRequestOp,
@@ -340,11 +341,21 @@ public func sos_process_get_status(handle: UInt,
     sos_syscall3(handle, ProcessOp.GetStatus as UInt, 0, 0, 0, value_out)
 }
 
-/// Make a created thread runnable. Requires `ThreadRight.Start`. A thread of a
-/// process that has not been started terminates the caller.
+/// Make a created thread runnable at its process's `Normal` band (spec §7).
+/// Requires `ThreadRight.Start`. A thread of a process that has not been
+/// started terminates the caller.
 @export("sos_thread_start")
 public func sos_thread_start(handle: UInt) -> UInt {
-    sos_syscall1(handle, ThreadOp.Start as UInt, 0)
+    sos_syscall1(handle, ThreadOp.Start as UInt, Priority.Normal as UInt)
+}
+
+/// Make a created thread runnable at `band`, a `Priority` tag (spec §7): the
+/// thread runs at the level its own process's band map gives `band`.
+/// Requires `ThreadRight.Start`. A band past `Priority.Rt3` terminates the
+/// caller, and so does a thread of a process that has not been started.
+@export("sos_thread_start_band")
+public func sos_thread_start_band(handle: UInt, band: UInt) -> UInt {
+    sos_syscall1(handle, ThreadOp.Start as UInt, band)
 }
 
 /// Wait for a thread and take its exit value. Requires `ThreadRight.Join`.
@@ -564,6 +575,20 @@ public func sos_process_quota_set(handle: UInt, kind: UInt,
     var ignored: UInt = 0
     sos_syscall3(handle, ProcessOp.QuotaSet as UInt, kind, limit, 0,
                  (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Set a process's band map to `map` (spec §7): band `b`'s system level in
+/// nibble `b`, low nibble first, in `Priority`'s order. Requires
+/// `ProcessRight.BandMap`, and the process must be `Created`: a launcher
+/// places its child's bands between the create and the start.
+///
+/// A process that is not `Created`, a nibble at or past 8, a bit past the
+/// eighth nibble, and a level above the caller's cap each terminate the
+/// caller. The cap is the highest level of the map the caller's own launcher
+/// set, or 7 for root.
+@export("sos_process_band_map")
+public func sos_process_band_map(handle: UInt, map: UInt) -> UInt {
+    sos_syscall1(handle, ProcessOp.BandMap as UInt, map)
 }
 
 /// Read a process's quota row for `kind`, a `QuotaKind`, into `value_out`: the

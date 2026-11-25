@@ -1790,7 +1790,7 @@ of the process or its record.
 `GetStatus` (on `Wait`), `Start`, `BootHandleNext` (on `BootHandles`), `Give`,
 `Kill` (§8), `Stats`, `RestrictRights` and `Ceiling` (on
 `Stats`; both below). `QuotaSet` sets and `QuotaGet` (on `Stats`) reads the
-named process's quota rows (below).
+named process's quota rows (below). `BandMap` sets its band map (§7).
 `ProcessRight.Map` is the target-side right `MemoryOp.Map` and `IoMemoryOp.Map`
 spend (§2.5). Creating a process is not an op on this object:
 `ProcessCreate` is on System, because a process is a machine-wide resource
@@ -1845,11 +1845,11 @@ process's own or its creator's handle (root's, `ProcessSelf`'s and
 pid, mint the observe set, below), named for its ops
 throughout: `ThreadCreate`, `ThreadSelf`, `Exit`, `Wait`, `EventCreate`,
 `WaiterCreate`, `Start`, `BootHandles`, `Give`, `Map`,
-`PipeCreate`, `Stats`, `RestrictRights`, `QuotaSet` (both below) and `Kill`
-(§8), plus the universal `Transfer | Mint`. A launcher keeps the child's
-handle — it is what supervises with — and the child derives its own authority
-from the masked System handle it was given (§12), so supervision and
-self-management are not alternatives.
+`PipeCreate`, `Stats`, `RestrictRights`, `QuotaSet` (both below), `BandMap`
+(below) and `Kill` (§8), plus the universal `Transfer | Mint`. A launcher keeps
+the child's handle — it is what supervises with — and the child derives its
+own authority from the masked System handle it was given (§12), so supervision
+and self-management are not alternatives.
 `Process.mint(rights:)` makes each bit attenuable at the typed tier: a
 supervisor may be handed a sibling that learns whether its child is alive and
 may not watch it work.
@@ -2001,6 +2001,9 @@ sets its own, and nobody sets a row once its process has started.
   not a `QuotaKind` is the `BadArg` fault, and through a `Gone` process's
   handle it answers `Revoked`, because the teardown clears the ledger
   (§2.9).
+
+**`BandMap`.** `BandMap(map)` sets the band map of a `Created` process (§7),
+on `ProcessRight.BandMap`, which the default set carries.
 
 **`Give` — the courier op.** `give(handle, tag:)` on the child's handle, gated
 by `ProcessRight.Give` there plus the universal `Transfer` right on the handle
@@ -2649,7 +2652,7 @@ handle to make the op that would answer `Revoked`.
 | Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. `Exit` releases the handle it is invoked through: only that handle goes, every other one still reads the slot, and a Thread that exits with no other handle naming it is freed at its exit. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
 | Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) and bound to no process: nothing names its binder's record, so the teardown has nothing to disown |
 | Event, Pipe, Pool, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them; an allocation also until its last grant row goes, and a pool until its last allocation comes home (§2.5) |
-| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7), and so does `QuotaSet` (§2.7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1). The process walk and the lookup by pid answer a `Gone` record for as long as something names it, and the handle they mint is one more name that holds it (§2.8); they answer no process before its start (§2.8). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
+| Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7), and so do `QuotaSet` (§2.7) and `BandMap` (§7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1). The process walk and the lookup by pid answer a `Gone` record for as long as something names it, and the handle they mint is one more name that holds it (§2.8); they answer no process before its start (§2.8). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
 | Clock, System | Never destroyed |
 
 **A free of a live object runs its last rites.** The last handle going is a
@@ -3915,16 +3918,17 @@ memory words, and nothing else.
 
 ## 7. Scheduling
 
-**What is built.** The kernel schedules one round-robin FIFO — no levels, no
-ready bitmap — on a one-tick slice. The tick's period is kernel policy (§2.6);
-the tick re-arms from now, so a late tick is one tick, never a burst of
-catch-up. The kernel arms the tick unless the image's boot flags say not to
-(§12): `kernel/main.saw` passes `TICK_PERIOD_US`, 10 ms, to the loader, which
-arms it as the last step before root's first entry to user mode. Interrupts are
-masked in the kernel on every board (§9), so the tick is taken from user mode
-only, but for the one instruction of the ESP32-S3's idle sleep, whose interrupt
-is returned from and left for the idle poll (§9). The harness kernels that test
-the tick and timers arm their own.
+**What is built.** The kernel schedules by fixed priority over 8 system
+levels, 0 the lowest, round-robin within a level on a one-tick slice. The
+tick's period is kernel policy (§2.6); the tick re-arms from now, so a late
+tick is one tick, never a burst of catch-up. The kernel arms the tick unless
+the image's boot flags say not to (§12): `kernel/main.saw` passes
+`TICK_PERIOD_US`, 10 ms, to the loader, which arms it as the last step before
+root's first entry to user mode. Interrupts are masked in the kernel on every
+board (§9), so the tick is taken from user mode only, but for the one
+instruction of the ESP32-S3's idle sleep, whose interrupt is returned from and
+left for the idle poll (§9). The harness kernels that test the tick and timers
+arm their own.
 
 - **The trap frame is the thread context**, so a context switch is `ktrap`
   returning a different frame than it was called with: one switch point, at the
@@ -3992,64 +3996,68 @@ the tick and timers arm their own.
   no running thread to charge, so it raises no reschedule. Stopping the tick
   while idle is not built (§11).
 
-**Not built: priorities.** The priority map is a loader artifact: the loader
-parses the image's priority field and reports it, no process stores it, no
-syscall carries a band tag, and there is therefore no enforcement point.
-`SystemOp.ProcessCreate` exists (§8) and takes no priority map. The rest of
-this section specifies the scheduler that is not yet built.
-
-- **Fixed-priority preemptive, 8 system levels (0–7).** Ready queue =
-  per-level FIFO + a one-byte ready bitmap; pick-next = find-first-set +
-  pop, O(1), a handful of instructions on both profiles. Idle is not
-  a level — a per-profile WFI loop runs when the bitmap is empty.
-- **Round-robin within a level**, fixed timeslice (provisionally 10 ms), tick
-  from the per-profile timer (CLINT mtimer / ARM generic timer — the same source
-  the Timer object uses). Preemption is immediate: readying a higher-priority
-  thread switches on the way out of the kernel; same-priority never preempts
-  mid-slice.
-- **Priority bands, not raw levels.** Processes never see or name
-  system levels. The only priority surface is
-  `enum Priority { Background, Low, Normal, High }` in the userspace
-  `sos` module, with fixed ABI tags 0–3 (the wire representation never
-  changes). The thread-spawn syscall carries the band tag; no syscall
-  accepts a raw system level.
-- **Per-process band→level map, kernel-side.** Each Process object
-  holds a 4-slot map resolving band → system level; the kernel
-  resolves at thread-spawn — the map is the enforcement point (a
-  process cannot escape its band with raw syscalls). A thread's
-  system priority is resolved once at spawn and stored plain — the
-  scheduler hot path is numeric-only. Initial default map:
-  `Background→0, Low/Normal/High→1` (apps cluster at 0–1; levels 2–7
-  are headroom for drivers/services). Low/Normal/High are declarative
-  until a deployment differentiates them — intended.
-- **The map comes from build-time metadata + launcher policy.** The process
-  image declares its requested map in `sosimg` metadata (a 4-byte header field;
-  Blade emits it from the package manifest, e.g.
-  `[sos] priorities = { background = 0, low = 1, normal = 1, high = 1 }` in
-  Saw.toml). Metadata is a request, not authority: the launcher reads it and may
-  honor, clamp, or override; the kernel stores whatever map the launcher passes
-  to `process_create` and never parses metadata for policy. The root server's
-  own map is applied verbatim from its image at boot (the kernel parses that
-  image anyway; root is trusted by construction).
+- **A ready list per level and a one-byte ready bitmap.** Pick-next takes
+  the head of the highest nonempty level: a table load and a pop, the
+  same code on every profile. Idle is not a level: the idle loop runs
+  when the bitmap is empty.
+- **Round-robin within a level.** A thread whose slice ends or that
+  yields goes to the tail of its level. A thread preempted by a higher one
+  goes to the head of its level, so it resumes ahead of the peers it was
+  ahead of. A lower level does not run while a higher one is ready: strict
+  priority, no aging, and a thread starved that way is runnable, not
+  deadlocked.
+- **Preemption on wake.** Readying a thread above the running thread's
+  level switches to it on the way out of the trap that readied it: at the
+  syscall's return, at the interrupt's return, or, for a wake made at a
+  preemption point, when the operation that polled returns. A wake at or
+  below the running level never preempts.
+- **Bands, not levels.** A process names its threads' priorities by band,
+  `enum Priority { Background, Low, Normal, High, Rt0, Rt1, Rt2, Rt3 }` in
+  the `sos` module, wire tags 0 to 7. `ThreadOp.Start` carries the band; a
+  tag past 7 is the `BadArg` fault, decided after the right and before the
+  thread's state. A process's first thread runs at `Normal`. No syscall
+  accepts a system level from the process that will run at it, and no op
+  tells a process its map.
+- **A band map per process, in the kernel.** Each process holds a map from
+  its eight bands to system levels, one nibble each in one word. A thread's
+  level is read from the map of the process it runs in when it is started,
+  which need not be the starter's, and stored plain. The simple map, every
+  process's until its launcher says otherwise, puts `Background` at 0 and
+  every other band at 1; full access puts band `b` at level `b`. Root's
+  map is its image header's, which carries `Background` to `High` (Blade
+  emits it from `[sos] priorities`), with `Rt0` to `Rt3` at `High`'s level,
+  and a level past 7 stops the boot naming the band. A launcher sets a
+  child's map with `ProcessOp.BandMap(map)`, on `ProcessRight.BandMap`,
+  between the create and the start; the last map set wins. Its answers, in
+  the order they are decided: a handle without the right is `AccessDenied`;
+  a child that is not `Created` (started, or `Gone`, which was always
+  started) is the `BadState` fault; a word with a bit past its eight nibbles
+  is the `BadArg` fault; a level above the caller's cap is the `BadArg`
+  fault and sets nothing. A child's cap is the highest level of the map its
+  launcher set, and so the most it may grant in turn; root's is 7, whatever
+  its own map says, so a nibble past 7 is above every caller's. The kernel
+  reads no child's header field: a launcher never reads an image (§12), so a
+  child's request has no run-time reader.
 - **Launching is a capability.** `process_create` requires the launch
   capability, `SystemRight.ProcessCreate`, minted at boot to the root
   server. Ordinary processes cannot create processes in v1 — they ask the
   launcher service over a pipe.
-- **The map is immutable after creation.** No remap syscall, no
-  self-modification, no visibility into the map from inside the
-  process (each process sees only its 4 named bands). Changing a
+- **The map is immutable from the start on.** A launcher sets it between
+  the create and the start, and nothing changes it after: no remap
+  syscall, no self-modification, no visibility into the map from inside
+  the process (each process sees only its eight bands). Changing a
   running process's priority = restart it. (A future dynamic
   re-prioritization design could add a launch-gated syscall without
   disturbing anything here.)
-- **No priority inheritance.** Inheritance chains through transferable
-  PipeReplyHandles are ill-defined (the reply obligation migrates). The
-  mitigations: (a) the convention that servers run at ≥ the max priority of
-  their clients (the launcher assigns both, so this is enforceable policy); (b)
-  the **direct-switch fastpath** — when a post or a reply readies a parked
-  receiver (a server parked on a Waiter its outlet is attached to, or a client
-  parked in a fused `Call`), switch straight to it when runnable, which removes
-  most incidental inversion with no donation semantics. MCS-style
-  budgets/inheritance remain possible later designs.
+- **No priority inheritance across pipes.** Inheritance chains through
+  transferable PipeReplyHandles are ill-defined (the reply obligation
+  migrates, and the thread that will answer may be in any process). The
+  mitigations: (a) the convention that servers run at ≥ the max priority
+  of their clients (the launcher assigns both, so this is enforceable
+  policy); (b) preemption on wake, which switches straight to a receiver a
+  post or a reply readies above the sender's level. **Not built:** the
+  direct switch at an equal level, which would run such a receiver ahead of
+  its level's list.
 - **Uniprocessor kernel in v1**, both profiles (the P4 is dual-core and
   QEMU can do SMP; SMP is its own future design — locking model,
   per-core queues — and nothing above precludes it).
@@ -4062,8 +4070,9 @@ the System, §12) takes two allocations (`Memory` handles, §2.5) — a read-onl
 image blob and the child's destination RAM — and returns a process with an
 address space, a recorded entry and stack, a pid (§2.7), and no thread.
 `ProcessOp.Start` (on the child's handle, gated by `ProcessRight.Start`) mints
-the first thread at that recorded entry and makes it runnable; the caller keeps
-running. The ordering is the soundness argument for the launch flow: whatever a
+the first thread at that recorded entry and makes it runnable at the child's
+`Normal` band (§7); the caller keeps running unless that band's level is above
+its own. The ordering is the soundness argument for the launch flow: whatever a
 launcher gives a child must be complete at its first instruction, and the start
 call is the barrier that makes a half-populated table unrepresentable — with no
 synchronization invented. The barrier covers threads too: a thread made through
@@ -4085,7 +4094,7 @@ preemption points included).
 **The fault rule, and how teardown ends.** A thread fault kills its process and
 the teardown runs unconditionally; what happens after forks. Process 0 — root,
 the one image the kernel loads (§12) — stops the machine. **Any other process
-reschedules**: its threads are removed from the ready queue (leaving everybody
+reschedules**: its threads are removed from the ready lists (leaving everybody
 else's), the objects bound to it are invalidated, its handles are released, its
 protection rows go back and its body is freed (§2.10), and the path ends in the
 scheduler rather than in a stopped machine. Children die with the machine when
@@ -4151,8 +4160,9 @@ reads one word for every such end, and what a panic does is the kernel's.
 **What is built.** The fault rule, whole. `get_status` as
 `ProcessOp.GetStatus`, gated on `ProcessRight.Wait`, answering the one
 fixed-width word (kind in the high bits — `Running` beside the three below —
-code in the low). Thread `Start`/`Join`/`Exit`/`Yield`: a joiner parks on the
-target's list and is answered exactly once through the funnel §2.2 describes.
+code in the low). Thread `Start`/`Join`/`Exit`/`Yield`; `Start` carries the
+thread's band (§7). A joiner parks on the target's list and is answered exactly
+once through the funnel §2.2 describes.
 Process waitability (below). Not built: a thread handle is not waitable —
 attaching one is a `NotWaitable` fault, and it is the last kind for which that
 arm is a scope line rather than a statement about the object.
@@ -4325,7 +4335,7 @@ death, its notification and its teardown holds for it.
   the `NotSelf` fault above. Each of its other threads is inert (made and not
   started), ready, blocked or parked, or has exited, and the teardown treats
   each as it does at an exit or a fault (§2.10's order). A ready thread comes
-  off the ready queue, and every other process's ready threads stay. A thread
+  off the ready lists, and every other process's ready threads stay. A thread
   blocked in a wait (on a Waiter, whoever owns it, in a `Join`, or parked in a
   fused `Call` or a `Resolve`) is taken off that list and never answered, since
   it never runs again. Every thread that has not exited is invalidated, and
@@ -4673,12 +4683,11 @@ static slabs. The `sosimg` header is concrete, the §7 priority-map field
 included, beside the build-emitted region table and its kind column (§5.6,
 §12).
 
-**Open pin:** the §7 priority map, and root's bootstrap band map, which the
-loader parses and reports while no process stores either.
-
 **Not built**, one area per line, with the section that specifies it:
 
-- **Priorities and the band map** (§7). The scheduler is one round-robin FIFO.
+- **The direct switch** at an equal level (§7).
+- **A declaration's request for full access** (§7). Every child the stock
+  root starts runs under the simple map.
 - **Tickless idle** (§7). The tick keeps firing while the machine is idle.
 - **Thread waitability** (§8). Attaching a thread is a `NotWaitable` fault. A
   supervisor learns a child died by reading `get_status` through the handle it
@@ -4776,7 +4785,7 @@ loader parses and reports while no process stores either.
 
 **The plan.** The standing tail, each item specified in its own section: the
 namespace and its path-attached acceptor object (§2.1), thread waitability
-(§8), priorities and the §7 band map, SMP with `IntrSpinLock` (§9b), the vDSO
+(§8), SMP with `IntrSpinLock` (§9b), the vDSO
 true-mapping (§5.7), and the IOMMU driver with critical processes (§2.5).
 Sub-pools and revoke extend the memory model, which is built; §2.5 gives their
 direction and they are specified when they are designed. Per-process limits
@@ -4800,10 +4809,11 @@ reserved.
   `SystemRight.ProcessCreate` (§7); root's memory — the RAM pools and
   allocations and the device windows the region table names (§2.5); and the
   authority to bind interrupt lines. Root's band map applies verbatim from its
-  image (§7, not built). Two of these are rights rather than objects, both bits
-  on the System handle: binding a line is `SystemRight.InterruptBind` rather
-  than a root IRQ table root is given, and the launch capability is
-  `SystemRight.ProcessCreate`. **The set is one handle wide at the register** —
+  image, and root may grant any level up to 7 (§7). Two of these are rights
+  rather than objects, both bits on the System handle: binding a line is
+  `SystemRight.InterruptBind` rather than a root IRQ table root is given, and
+  the launch capability is `SystemRight.ProcessCreate`. **The set is one
+  handle wide at the register** —
   the regions are collected, not passed: the build-emitted region table carries
   a kind column, a `Pool` row mints a `Pool`, a `Ram` row a `MemoryObject` (an
   allocation) and a `Device` row an `IoMemoryObject`, and each arrives

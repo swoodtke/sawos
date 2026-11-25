@@ -28,6 +28,7 @@ import sosabi.{
     ProcessStatusKind,
     BootHandleKind,
     HANDLE_KINDS,
+    Priority,
     root_system_rights,
     process_rights,
     memory_rights,
@@ -45,6 +46,7 @@ import kcore.limits.{
     NO_PROCESS,
     ROOT_BODY,
     ROOT_PROCESS,
+    SYSTEM_LEVELS,
 }
 import kcore.mem.{align_up, copy_bytes, word_bytes}
 import kcore.diag.{console, fatal_image, fatal_kernel}
@@ -78,11 +80,13 @@ import kcore.threads.{
     CURRENT_THREAD,
     LAST_PROT_PROCESS,
     SLICE_LEFT,
+    SIMPLE_BAND_MAP,
     SLICE_TICKS,
     THREADS,
     ThreadSlot,
     ThreadState,
     alloc_thread,
+    band_level,
     frame_slot,
 }
 
@@ -1395,8 +1399,14 @@ public(package) func fits_word(v: UInt64) -> Bool {
 /// leaves them masked (or masks them first thing, where reset does not) and
 /// its first entry to user mode opens them for user mode only. Each HAL's
 /// ABI.md states it under "Interrupts are masked in the kernel".
+///
+/// `bands` is root's band map (spec §7), which the loader reads out of root's
+/// image header; a harness kernel's payload has no header and runs under the
+/// simple map. Root's main thread runs at its `Normal` band, and root may give
+/// a child any level: root is init.
 public func start_process(entry: UInt, stack_top: UInt, region_top: UInt,
-                          tick_period_us: UInt = 0) unsafe -> Never {
+                          tick_period_us: UInt = 0,
+                          bands: UInt32 = SIMPLE_BAND_MAP) unsafe -> Never {
     let p: Int = ROOT_PROCESS
     claim_root()
     let b = body_of(p)
@@ -1418,6 +1428,8 @@ public func start_process(entry: UInt, stack_top: UInt, region_top: UInt,
         PROCESSES[b].ceilings[kind] = UInt32.max
         kind = kind + 1
     }
+    PROCESSES[b].bands = bands
+    PROCESSES[b].level_cap = (SYSTEM_LEVELS - 1) as UInt8
     // The trap columns open at zero. Root is reified here rather than through
     // `process_create`, so its body's row of the stats region is cleared here.
     // Boot-door traps a harness kernel takes before this line are unattributed
@@ -1451,8 +1463,9 @@ public func start_process(entry: UInt, stack_top: UInt, region_top: UInt,
     let main = alloc_thread()
     let _ = mint_handle(p, ObjType.Thread, thread_rights(), main)
     // The boot Thread handle is the main thread's one reference.
-    THREADS[main] = ThreadSlot(state: ThreadState.Running, process: p,
-                               exit_code: 0,
+    THREADS[main] = ThreadSlot(state: ThreadState.Running,
+                               level: band_level(bands, Priority.Normal as Int),
+                               process: p, exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
                                call_len: 0, refs: 1)

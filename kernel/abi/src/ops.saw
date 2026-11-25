@@ -419,6 +419,18 @@ public enum SystemOp: UInt {
 /// sets nothing. `QuotaGet(kind)` answers the limit and the use in one value
 /// word (`QUOTA_WORD_USE_SHIFT`); it is gated by `ProcessRight.Stats`, a bad
 /// `kind` is a `BadArg` fault, and a process that has ended answers `Revoked`.
+///
+/// `BandMap(map)` sets where the named process's priority bands sit among the
+/// system levels (spec §7): band `b`'s level is nibble `b` of `map`, low
+/// nibble first, `Priority`'s order. It acts on a `Created` process, as
+/// `QuotaSet` does, and is gated by `ProcessRight.BandMap`. Its answers are
+/// decided in this order: a process that is not `Created` is a `BadState`
+/// fault; a `map` with a bit set past its eight nibbles is a `BadArg` fault;
+/// a level above the caller's cap, which a nibble past the last level always
+/// is, is a `BadArg` fault and sets nothing. The caller's cap is the highest
+/// level of the map its own launcher set, or 7 for root, whatever root's map
+/// says. The last map set before the start is the one the process runs
+/// with.
 public enum ProcessOp: UInt {
     case ThreadCreate = 0,
     case ThreadSelf = 1,
@@ -436,6 +448,7 @@ public enum ProcessOp: UInt {
     case Kill = 13,
     case QuotaSet = 14,
     case QuotaGet = 15,
+    case BandMap = 16,
 }
 
 /// Whether `ProcessOp.Start`'s second argument carries a boot tag: the op's
@@ -493,12 +506,43 @@ public enum BootTagForm: UInt {
 /// already conceded the observation is needed (it proposed thread handles as
 /// waitables). A Thread is not a waitable (a Waiter cannot attach one), so
 /// `Join` is the only way to wait for one.
+///
+/// `Start(band)` names the thread's priority band, a `Priority` tag; one at or
+/// above `BANDS` is a `BadArg` fault, decided after the right and before the
+/// thread's state. The thread's level is read from the band map of the process
+/// the thread runs in, not the caller's (spec §7).
 public enum ThreadOp: UInt {
     case Start = 0,
     case Join = 1,
     case Exit = 2,
     case Yield = 3,
 }
+
+/// A thread's priority band (spec §7): a rank inside its process, which the
+/// process's band map places among the system levels. A process names bands
+/// and never levels. `Rt0` to `Rt3` are the realtime bands, `Rt3` the
+/// highest.
+///
+/// The tags are the wire's and never change. Backed by `UInt8`, a nibble's
+/// index in a band map; the kernel reads the band out of a whole register, so
+/// it compares the register against `BANDS` rather than decoding a narrowed
+/// one.
+public enum Priority: UInt8 {
+    case Background = 0,
+    case Low = 1,
+    case Normal = 2,
+    case High = 3,
+    case Rt0 = 4,
+    case Rt1 = 5,
+    case Rt2 = 6,
+    case Rt3 = 7,
+}
+
+/// How many `Priority` bands a process has: the nibbles of a band map.
+public static BANDS: Int = 8
+
+static_assert((Priority.Rt3 as Int) == BANDS - 1,
+              "BANDS must be one past the highest Priority")
 
 // =============================================================================
 // The Event object's op table (spec §2.4)
@@ -1090,7 +1134,7 @@ public enum ReplyWaitLeg: UInt {
 // passes while the table walks past `PANIC_OP`.
 static_assert((SystemOp.ProcessByPid as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
-static_assert((ProcessOp.QuotaGet as UInt) < PANIC_OP,
+static_assert((ProcessOp.BandMap as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
 static_assert((ThreadOp.Yield as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")

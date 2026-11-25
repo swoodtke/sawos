@@ -1,0 +1,304 @@
+// Test child written with `main`, for `levels`: the role its launcher gives
+// it, as the bits of an Event under `TAG_ROLE`, says what `main` does. Its
+// band map is the one `level-root` sets before the start, or the simple map
+// when it sets none. No tick runs, so every switch is one the role makes.
+//
+//   OWNER    starts root's thread, given under `TAG_THREAD`, at `Low`, prints
+//            and joins it. This process's map puts `Low` at 5 and root's at
+//            1, this main thread's level, so the thread runs at the join:
+//            "started", then root's thread's line
+//   SIMPLE   under the simple map, starts a thread at `Rt3`, prints, yields,
+//            prints again and joins it. `Rt3` is level 1 there, this main
+//            thread's: Y, then the thread's line at the yield, then the line
+//            after it
+//   FULL     under full access, from `Normal` (2) starts a thread at `High`,
+//            which starts one at `Rt0`, and so on to `Rt3`: each start runs
+//            the thread it starts before it returns, so each band's "up" line
+//            comes in rising order, and each band's "started" line, printed
+//            by its starter between the start and the join, in falling order
+//   KILL     under full access, readies a thread at `Low` (1) and one at
+//            `Background` (0), neither above this main thread, signals the
+//            Event under `TAG_READY` and parks joining the first; its
+//            launcher kills it there
+//   STARTED  sets its own band map, to one with `Normal` at 2, above its own
+//            highest: the `BadState` fault, which is decided first
+//   DENIED   sets its own band map through a sibling without `BandMap`: the
+//            `AccessDenied` fault
+//   GONE     launches the image under `TAG_IMAGE` into the RAM under
+//            `TAG_RAM`, waits for it to end, and sets its map: the
+//            `BadState` fault
+//   CAP      under the simple map, sets a created grandchild's map to the
+//            simple map (its own highest level, taken), then to one with
+//            `Normal` at 2: the `BadArg` fault
+//   NIBBLE   under full access, sets a created grandchild's map to full
+//            access (taken), then to one with a band at 8: the `BadArg` fault
+//   NIBBLE7  as `NIBBLE`, with the band at 8 in the last nibble, `Rt3`'s
+//   RTFAULT  under full access, starts a thread at `Rt3`, which starts a peer
+//            at `Rt3` and panics with the peer ready; the peer never runs
+//   FAULT    panics at once
+//
+// A role that comes back from what should have ended it panics naming it,
+// which the case reads as the wrong line. No thread of this program is ever
+// preempted while it prints: a thread prints only when no thread above it can
+// be readied before its print returns.
+
+import sos.{BootSet, Memory, Process, Thread, Priority, SosStatus,
+            ProcessRight, SystemRight, ALL_RIGHTS}
+import sosmain
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_THREAD: UInt = 41
+static TAG_READY: UInt = 42
+static TAG_IMAGE: UInt = 43
+static TAG_RAM: UInt = 44
+
+static KEY_DEATH: UInt = 6
+
+static ROLE_OWNER: UInt = 1
+static ROLE_SIMPLE: UInt = 2
+static ROLE_FULL: UInt = 3
+static ROLE_KILL: UInt = 4
+static ROLE_STARTED: UInt = 5
+static ROLE_DENIED: UInt = 6
+static ROLE_GONE: UInt = 7
+static ROLE_CAP: UInt = 8
+static ROLE_NIBBLE: UInt = 9
+static ROLE_NIBBLE7: UInt = 10
+static ROLE_RTFAULT: UInt = 11
+static ROLE_FAULT: UInt = 12
+
+static SIMPLE_MAP: UInt32 = 0x1111_1110
+static FULL_MAP: UInt32 = 0x7654_3210
+/// The simple map with `Normal` at 2.
+static NORMAL_AT_2: UInt32 = 0x1111_1120
+/// Full access with `Background` at 8, and with `Rt3` at 8.
+static BAND_AT_8: UInt32 = 0x7654_3218
+static RT3_AT_8: UInt32 = 0x8654_3210
+
+/// What the grandchild is given to print and exit with.
+static BYE_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                             | SystemRight.Transfer)
+
+/// One stack per band `FULL` climbs through, `High` to `Rt3`; the other roles
+/// use the first. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+static STACKS: Int = 5
+unsafe static var STACK: [UInt; STACK_WORDS * STACKS] = [0; STACK_WORDS * STACKS]
+
+/// The top of stack `i`.
+func top(i: Int) unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + ((i + 1) * STACK_WORDS) as UInt * (sizeof<UInt>() as UInt)
+}
+
+func main() -> Result<Int, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let role = try bits_under(&var set, TAG_ROLE)
+    if role == ROLE_OWNER {
+        try owner(&var set)
+        return 0
+    }
+    if role == ROLE_SIMPLE {
+        try simple()
+        return 0
+    }
+    if role == ROLE_FULL {
+        print("SOS levelchild: full: main at Normal")
+        try climb_from(Priority.High as UInt)
+        print("SOS levelchild: full: main back")
+        return 0
+    }
+    if role == ROLE_KILL {
+        try killed(&var set)
+    }
+    if role == ROLE_STARTED {
+        print("SOS levelchild: started: mapping itself")
+        let _ = sosmain.context().process().band_map(map: NORMAL_AT_2)
+    }
+    if role == ROLE_DENIED {
+        let narrow = try sosmain.context().process().mint(
+            rights: ALL_RIGHTS & ~(ProcessRight.BandMap as UInt32))
+        print("SOS levelchild: denied: mapping without BandMap")
+        let _ = narrow.band_map(map: SIMPLE_MAP)
+    }
+    if role == ROLE_GONE {
+        let gc = try grandchild(&var set)
+        try give_system(&gc)
+        try gc.start(boot_tag: TAG_BOOT)
+        let waiter = try sosmain.context().process().waiter_create()
+        try waiter.add(process: &gc, key: KEY_DEATH)
+        let _ = try waiter.wait()
+        print("SOS levelchild: gone: mapping a process that has ended")
+        let _ = gc.band_map(map: SIMPLE_MAP)
+    }
+    if role == ROLE_CAP {
+        let gc = try grandchild(&var set)
+        try gc.band_map(map: SIMPLE_MAP)
+        print("SOS levelchild: cap: the simple map, its own: taken")
+        print("SOS levelchild: cap: mapping Normal at 2, above its own")
+        let _ = gc.band_map(map: NORMAL_AT_2)
+    }
+    if role == ROLE_NIBBLE {
+        let gc = try grandchild(&var set)
+        try gc.band_map(map: FULL_MAP)
+        print("SOS levelchild: nibble: full access, its own: taken")
+        print("SOS levelchild: nibble: mapping a band at 8")
+        let _ = gc.band_map(map: BAND_AT_8)
+    }
+    if role == ROLE_NIBBLE7 {
+        let gc = try grandchild(&var set)
+        try gc.band_map(map: FULL_MAP)
+        print("SOS levelchild: nibble7: full access, its own: taken")
+        print("SOS levelchild: nibble7: mapping Rt3 at 8")
+        let _ = gc.band_map(map: RT3_AT_8)
+    }
+    if role == ROLE_RTFAULT {
+        let t = try thread(run: faults_beside_a_peer, arg: 0, i: 0)
+        try t.start(band: Priority.Rt3)
+    }
+    if role == ROLE_FAULT {
+        panic("SOS levelchild: fault: the child panicked")
+    }
+    panic("SOS levelchild: role {} came back", role)
+}
+
+/// The bits of the Event under `tag`, which is released once read.
+func bits_under(set: &var BootSet, tag: UInt) -> Result<UInt, SosStatus> {
+    guard var record = set.take(tag) else {
+        panic("SOS levelchild: no record under tag {}", tag)
+    }
+    guard let event = record.take_event() else {
+        panic("SOS levelchild: the record under tag {} is no Event", tag)
+    }
+    event.receive()
+}
+
+/// A thread of this process that runs `run(arg)` on stack `i`.
+func thread(run: FuncPointer<(UInt) sync -> UInt>, arg: UInt,
+            i: Int) -> Result<Thread, SosStatus> {
+    sosmain.context().process().thread_create(run: run, arg: arg,
+                                              stack_top: top(i))
+}
+
+/// `OWNER`.
+func owner(set: &var BootSet) -> Result<Void, SosStatus> {
+    guard var record = set.take(TAG_THREAD) else {
+        panic("SOS levelchild: no record under tag {}", TAG_THREAD)
+    }
+    guard let t = record.take_thread() else {
+        panic("SOS levelchild: the record under tag {} is no Thread",
+              TAG_THREAD)
+    }
+    try t.start(band: Priority.Low)
+    print("SOS levelchild: owner: started root's thread at Low")
+    let _ = try t.join()
+    print("SOS levelchild: owner: joined")
+    return
+}
+
+/// `SIMPLE`.
+func simple() -> Result<Void, SosStatus> {
+    let me = try sosmain.context().process().thread_self()
+    let t = try thread(run: says_rt3, arg: 0, i: 0)
+    try t.start(band: Priority.Rt3)
+    print("SOS levelchild: simple: Y")
+    try me.yield_now()
+    print("SOS levelchild: simple: after the yield")
+    let _ = try t.join()
+    return
+}
+
+func says_rt3(arg: UInt) sync -> UInt {
+    print("SOS levelchild: simple: the Rt3 thread ran")
+    0
+}
+
+/// `FULL`: start a thread at `band`, which climbs on from there, and join it.
+func climb_from(band: UInt) -> Result<Void, SosStatus> {
+    guard let priority = Priority.from(raw: band as UInt8) else {
+        panic("SOS levelchild: full: no band {}", band)
+    }
+    let stack = (band - (Priority.High as UInt)) as Int
+    let t = try thread(run: climbs, arg: band, i: stack)
+    try t.start(band: priority)
+    print("SOS levelchild: full: band {} started", band)
+    let _ = try t.join()
+    return
+}
+
+func climbs(band: UInt) sync -> UInt {
+    print("SOS levelchild: full: band {} up", band)
+    if band < (Priority.Rt3 as UInt) {
+        try climb_from(band + 1) catch {
+            panic("SOS levelchild: full: band {} refused: {}", band + 1,
+                  error)
+        }
+        print("SOS levelchild: full: band {} back", band)
+    }
+    0
+}
+
+/// `RTFAULT`'s thread at `Rt3`: a peer at its own level, ready, and a panic.
+func faults_beside_a_peer(arg: UInt) sync -> UInt {
+    let peer = try thread(run: dead, arg: 0, i: 1) catch {
+        panic("SOS levelchild: rtfault: no peer: {}", error)
+    }
+    try peer.start(band: Priority.Rt3) catch {
+        panic("SOS levelchild: rtfault: the peer's start was refused: {}",
+              error)
+    }
+    panic("SOS levelchild: rtfault: the Rt3 thread panicked with a peer ready")
+}
+
+/// `KILL`: two threads readied below this one, the launcher told, and a
+/// join that never returns.
+func killed(set: &var BootSet) -> Result<Void, SosStatus> {
+    guard var record = set.take(TAG_READY) else {
+        panic("SOS levelchild: no record under tag {}", TAG_READY)
+    }
+    guard let ready = record.take_event() else {
+        panic("SOS levelchild: the record under tag {} is no Event",
+              TAG_READY)
+    }
+    let a = try thread(run: dead, arg: 0, i: 0)
+    let b = try thread(run: dead, arg: 0, i: 1)
+    try a.start(band: Priority.Low)
+    try b.start(band: Priority.Background)
+    try ready.signal(bits: 1)
+    let _ = try a.join()
+    return
+}
+
+func dead(arg: UInt) sync -> UInt {
+    print("SOS levelchild: a thread of an ended process ran")
+    0
+}
+
+/// A process made from the image and RAM under `TAG_IMAGE` and `TAG_RAM`.
+func grandchild(set: &var BootSet) -> Result<Process, SosStatus> {
+    let image = take_memory(&var set, TAG_IMAGE)
+    let ram = take_memory(&var set, TAG_RAM)
+    sosmain.context().system().process_create(image: &image, memory: &ram)
+}
+
+func take_memory(set: &var BootSet, tag: UInt) -> Memory {
+    guard var record = set.take(tag) else {
+        panic("SOS levelchild: no record under tag {}", tag)
+    }
+    guard let memory = record.take_memory() else {
+        panic("SOS levelchild: the record under tag {} is no Memory", tag)
+    }
+    move memory
+}
+
+/// A System for the grandchild to print and exit with, under `TAG_BOOT`.
+func give_system(gc: &Process) -> Result<Void, SosStatus> {
+    let boot = try sosmain.context().system().mint(rights: BYE_SYSTEM)
+    try gc.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}

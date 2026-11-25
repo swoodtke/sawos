@@ -23,7 +23,9 @@ import kcore.mem.{align_up}
 import kcore.diag.{console, fatal_image}
 import kcore.stats.{stats_publish}
 import kcore.preempt.{long_copy, long_zero}
-import kcore.limits.{MAX_GRANT_ROWS, NO_MEMORY, ROOT_PROCESS}
+import sosabi.{BANDS, Priority}
+import kcore.limits.{MAX_GRANT_ROWS, NO_MEMORY, ROOT_PROCESS, SYSTEM_LEVELS}
+import kcore.threads.{band_level, with_band_level}
 import kcore.process.{claim_root, load_domain, record_grant, start_process}
 import kcore.areas.{install_image_slabs}
 
@@ -726,13 +728,59 @@ public func load_root_and_enter(tick_period_us: UInt = 0) unsafe {
     place_image(ROOT_PROCESS, base, &table, &dest, NO_MEMORY, NO_MEMORY)
     load_domain(ROOT_PROCESS)
 
-    // Spec §7: root's band map applies verbatim from its image. The scheduler
-    // is round-robin over one level, so the kernel parses and reports the map
-    // (which proves the Blade-emitted field arrives intact) but does not store
-    // it in the process record.
-    //
+    // Spec §7: root's band map applies verbatim from its image.
+    let bands = root_band_map(prio_map)
+
     // Spec §12: root's boot handle set. The entry register carries exactly one
     // handle, System; everything else the kernel minted for root is collected
     // through `ProcessOp.BootHandleNext` rather than passed.
-    start_process(entry, dest.link_top(), dest.link_top(), tick_period_us)
+    start_process(entry, dest.link_top(), dest.link_top(), tick_period_us,
+                  bands)
+}
+
+/// How many bands an image header's map carries: `Background` to `High`, a
+/// byte each, low byte first.
+static HEADER_BANDS: Int = 4
+
+/// Bits per band in an image header's map.
+static HEADER_BAND_BITS: Int = 8
+
+/// A header band's byte.
+static HEADER_BAND_MASK: UInt = 0xFF
+
+/// Root's band map, from the four bands its image header carries (spec §7,
+/// §12): each header band at the level its byte names, and the realtime bands
+/// `Rt0` to `Rt3` at `High`'s, which a header has no bytes for. A byte at or
+/// above `SYSTEM_LEVELS` stops the boot, naming the band, with the level as
+/// the detail. Blade refuses such a manifest, so only a hand-assembled image
+/// reaches the refusal.
+func root_band_map(header: UInt) unsafe -> UInt32 {
+    var map: UInt32 = 0
+    var band: Int = 0
+    while band < HEADER_BANDS {
+        let shift = (band * HEADER_BAND_BITS) as UInt
+        let level = (header >> shift) & HEADER_BAND_MASK
+        if level >= (SYSTEM_LEVELS as UInt) {
+            fatal_image(header_band_past_last(band), level)
+        }
+        map = with_band_level(map, band, level as UInt8)
+        band = band + 1
+    }
+    let high = band_level(map, Priority.High as Int)
+    band = Priority.Rt0 as Int
+    while band < BANDS {
+        map = with_band_level(map, band, high)
+        band = band + 1
+    }
+    map
+}
+
+/// The refusal of header band `band`'s level.
+func header_band_past_last(band: Int) -> String {
+    match band {
+        case 0 -> "band background is past the last level",
+        case 1 -> "band low is past the last level",
+        case 2 -> "band normal is past the last level",
+        case _ -> "band high is past the last level",
+    }
 }

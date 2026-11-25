@@ -1,0 +1,607 @@
+// The scheduler's levels (spec §7), from root's side. Root's manifest puts
+// `Background` at level 0, `Low` at 1, `Normal` at 2 and `High` at 3, so
+// root's main thread runs at 2 with a level below it and one above.
+//
+// This image's kernel arms no tick, so every switch is one a round makes: a
+// start, a signal, a yield, a park, an exit, or the one Timer interrupt
+// `irq` waits for. Each round's lines come in the order the rule makes:
+//
+//   start     a thread started above the starter runs before the start
+//             returns: A, B, C
+//   lower     a thread below the yielder does not run at a yield: Y, then L
+//   equal     a thread started with no band runs at `Normal`, the starter's
+//             level, so it waits for the starter's yield: A, B, C
+//   realtime  threads started at `Rt0` and at `Rt3` run at `High`'s level,
+//             which root's header gives the realtime bands: each thread's
+//             line, then A
+//   head      the thread a higher one took the processor from resumes ahead
+//             of its level's peer: H, M, P
+//   alone     the same with no peer: H, above the main thread, starts W at
+//             the main thread's level, where the main thread waits alone at
+//             the head: H, M, W
+//   event     a signal that wakes a thread above the signaller switches to it
+//             at the signal's return: the woken line, then A
+//   irq       a Timer's fire that wakes a thread above the running one
+//             switches to it at the interrupt's return; the running thread
+//             spins until it has: the woken line, then M
+//
+// Then `level-child` once per round (its own comment says what each prints),
+// each launch waited out and its status word printed:
+//
+//   SOS levels: <round> ended status=<word>
+//
+// `owner`, `full` and `simple` order the child's threads, `simple` in the
+// body `full` and `kill` mapped; `kill` kills the child with ready threads at
+// two levels between root's own two ready threads, which then run in their
+// order; `rtfault` ends a child with a thread ready at its top level, which
+// never runs; `after death` starts P at root's level as the first call after
+// a child's death woke root, and prints M before P runs; `started` and
+// `denied` are each a `BandMap` refusal, which faults the child.
+//
+// Given a second child's regions, `child-bye`'s ahead of `level-child`'s,
+// root runs the launchers' rounds instead: `gone`, `cap`, `nibble` and
+// `nibble7`, each a `BandMap` refusal of `level-child`'s on a process it made
+// of `child-bye`. `cap`'s launcher is mapped with full access and then with
+// the simple map, whose highest level is the one it may grant.
+
+import sos.{Process, Memory, Thread, Waiter, BootSet, Priority, SosStatus,
+            SystemRight, QuotaKind}
+import sosmain
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The boot set's regions, each child's image and then each child's RAM:
+/// `level-child`'s alone, or `child-bye`'s and then `level-child`'s.
+static ONE_CHILD: Int = 2
+static TAG_ONE_IMAGE: UInt = 0
+static TAG_ONE_RAM: UInt = 1
+static TAG_BYE_IMAGE: UInt = 0
+static TAG_CHILD_IMAGE: UInt = 1
+static TAG_BYE_RAM: UInt = 2
+static TAG_CHILD_RAM: UInt = 3
+
+/// What root gives `level-child`.
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_THREAD: UInt = 41
+static TAG_READY: UInt = 42
+static TAG_IMAGE: UInt = 43
+static TAG_RAM: UInt = 44
+
+static KEY_DEATH: UInt = 6
+static KEY_READY: UInt = 7
+static KEY_EVENT: UInt = 8
+
+/// The roles `level-child` knows.
+static ROLE_OWNER: UInt = 1
+static ROLE_SIMPLE: UInt = 2
+static ROLE_FULL: UInt = 3
+static ROLE_KILL: UInt = 4
+static ROLE_STARTED: UInt = 5
+static ROLE_DENIED: UInt = 6
+static ROLE_GONE: UInt = 7
+static ROLE_CAP: UInt = 8
+static ROLE_NIBBLE: UInt = 9
+static ROLE_NIBBLE7: UInt = 10
+static ROLE_RTFAULT: UInt = 11
+static ROLE_FAULT: UInt = 12
+
+/// Band maps, band `b`'s level in nibble `b`.
+static SIMPLE_MAP: UInt32 = 0x1111_1110
+static FULL_MAP: UInt32 = 0x7654_3210
+/// `Low` at level 5 and every other band but `Background` at 1.
+static LOW_HIGH_MAP: UInt32 = 0x1111_1150
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+static LAUNCHER_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                                  | SystemRight.Transfer
+                                  | SystemRight.ProcessCreate
+                                  | SystemRight.Mint)
+
+/// What `full`'s child holds at once: its main thread and five more, each
+/// made with two handles.
+static FULL_THREADS: UInt16 = 6
+static FULL_HANDLES: UInt16 = 20
+
+/// The code `kill` kills the child with.
+static KILL_CODE: UInt = 9
+
+/// Three threads' stacks. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_0: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_1: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_2: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_bytes() -> UInt {
+    (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func top_0() unsafe -> UInt {
+    ((&var STACK_0) as UnsafePointer<UInt>) as UInt + stack_bytes()
+}
+
+func top_1() unsafe -> UInt {
+    ((&var STACK_1) as UnsafePointer<UInt>) as UInt + stack_bytes()
+}
+
+func top_2() unsafe -> UInt {
+    ((&var STACK_2) as UnsafePointer<UInt>) as UInt + stack_bytes()
+}
+
+/// Set by `irq`'s thread once the Timer's fire has run it.
+static IRQ_WOKE: Atomic<Int> = Atomic(0)
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    if set.len() == ONE_CHILD {
+        let child_img = take_memory(&var set, TAG_ONE_IMAGE)
+        let child_ram = take_memory(&var set, TAG_ONE_RAM)
+        try scheduling(&child_img, &child_ram)
+    } else {
+        let bye_img = take_memory(&var set, TAG_BYE_IMAGE)
+        let child_img = take_memory(&var set, TAG_CHILD_IMAGE)
+        let bye_ram = take_memory(&var set, TAG_BYE_RAM)
+        let child_ram = take_memory(&var set, TAG_CHILD_RAM)
+        try launches(&child_img, &child_ram, &bye_img, &bye_ram)
+    }
+    print("SOS levels: done")
+    return
+}
+
+/// Every round but the launchers'.
+func scheduling(child_img: &Memory,
+                child_ram: &Memory) -> Result<Void, SosStatus> {
+    try start_preempts()
+    try lower_waits()
+    try equal_waits()
+    try realtime_at_high()
+    try preempted_head()
+    try preempted_alone()
+    try event_wakes()
+    try irq_wakes()
+
+    try owner_map(&child_img, &child_ram)
+    try full_map(&child_img, &child_ram)
+    try kill_two_levels(&child_img, &child_ram)
+    try with_role(&child_img, &child_ram, "simple", ROLE_SIMPLE, None)
+    try with_role(&child_img, &child_ram, "rtfault", ROLE_RTFAULT, FULL_MAP)
+    try after_death(&child_img, &child_ram)
+    try with_role(&child_img, &child_ram, "started", ROLE_STARTED, None)
+    try with_role(&child_img, &child_ram, "denied", ROLE_DENIED, None)
+    return
+}
+
+/// The launchers' rounds, each `level-child` given `child-bye`'s image and
+/// RAM to make its own child from.
+func launches(child_img: &Memory, child_ram: &Memory, bye_img: &Memory,
+              bye_ram: &Memory) -> Result<Void, SosStatus> {
+    try launcher(&child_img, &child_ram, &bye_img, &bye_ram, "gone",
+                 ROLE_GONE, None, None)
+    try launcher(&child_img, &child_ram, &bye_img, &bye_ram, "cap", ROLE_CAP,
+                 FULL_MAP, SIMPLE_MAP)
+    try launcher(&child_img, &child_ram, &bye_img, &bye_ram, "nibble",
+                 ROLE_NIBBLE, None, FULL_MAP)
+    try launcher(&child_img, &child_ram, &bye_img, &bye_ram, "nibble7",
+                 ROLE_NIBBLE7, None, FULL_MAP)
+    return
+}
+
+func take_memory(set: &var BootSet, tag: UInt) -> Memory {
+    guard var record = set.take(tag) else {
+        panic("SOS levels: no record under tag {}", tag)
+    }
+    guard let memory = record.take_memory() else {
+        panic("SOS levels: the record under tag {} is no Memory", tag)
+    }
+    move memory
+}
+
+/// A thread of this process that runs `run(arg)` on the stack below `top`.
+func thread(run: FuncPointer<(UInt) sync -> UInt>, arg: UInt,
+            top: UInt) -> Result<Thread, SosStatus> {
+    sosmain.context().process().thread_create(run: run, arg: arg,
+                                              stack_top: top)
+}
+
+// -----------------------------------------------------------------------------
+// Root's own threads
+// -----------------------------------------------------------------------------
+
+/// `start`: a thread started at `High` runs before the start returns.
+func start_preempts() -> Result<Void, SosStatus> {
+    let t = try thread(run: says_b, arg: 0, top: top_0())
+    print("SOS levels: start: A")
+    try t.start(band: Priority.High)
+    print("SOS levels: start: C")
+    let _ = try t.join()
+    return
+}
+
+func says_b(arg: UInt) sync -> UInt {
+    print("SOS levels: start: B")
+    0
+}
+
+/// `lower`: a thread started at `Low` does not run at the yield, and runs once
+/// the main thread parks in the join.
+func lower_waits() -> Result<Void, SosStatus> {
+    let me = try sosmain.context().process().thread_self()
+    let t = try thread(run: says_l, arg: 0, top: top_0())
+    try t.start(band: Priority.Low)
+    try me.yield_now()
+    print("SOS levels: lower: Y")
+    let _ = try t.join()
+    return
+}
+
+func says_l(arg: UInt) sync -> UInt {
+    print("SOS levels: lower: L")
+    0
+}
+
+/// `equal`: a thread started with no band, which is `Normal`, the starter's
+/// own level, waits for the starter's yield and then runs ahead of it.
+func equal_waits() -> Result<Void, SosStatus> {
+    let me = try sosmain.context().process().thread_self()
+    let t = try thread(run: says_equal, arg: 0, top: top_0())
+    try t.start()
+    print("SOS levels: equal: A")
+    try me.yield_now()
+    print("SOS levels: equal: C")
+    let _ = try t.join()
+    return
+}
+
+func says_equal(arg: UInt) sync -> UInt {
+    print("SOS levels: equal: B")
+    0
+}
+
+/// `realtime`: root's header names no realtime band, and a thread started at
+/// `Rt3` runs at `High`'s level, above the starter.
+func realtime_at_high() -> Result<Void, SosStatus> {
+    let t0 = try thread(run: says_rt, arg: 0, top: top_0())
+    let t3 = try thread(run: says_rt, arg: 3, top: top_1())
+    try t0.start(band: Priority.Rt0)
+    try t3.start(band: Priority.Rt3)
+    print("SOS levels: realtime: A")
+    let _ = try t0.join()
+    let _ = try t3.join()
+    return
+}
+
+func says_rt(n: UInt) sync -> UInt {
+    print("SOS levels: realtime: the Rt{} thread ran", n)
+    0
+}
+
+/// `alone`: H, at `High`, starts W at `Normal`; the main thread, which H took
+/// the processor from, is the only thread at its level when it goes back, and
+/// W queues behind it. The main thread's yield runs W.
+func preempted_alone() -> Result<Void, SosStatus> {
+    let me = try sosmain.context().process().thread_self()
+    let h = try thread(run: starts_w, arg: 0, top: top_0())
+    try h.start(band: Priority.High)
+    print("SOS levels: alone: M")
+    try me.yield_now()
+    let _ = try h.join()
+    return
+}
+
+func starts_w(arg: UInt) sync -> UInt {
+    print("SOS levels: alone: H")
+    let w = try thread(run: says_w, arg: 0, top: top_1()) catch {
+        panic("SOS levels: alone: no W: {}", error)
+    }
+    try w.start(band: Priority.Normal) catch {
+        panic("SOS levels: alone: W's start was refused: {}", error)
+    }
+    // W's handle goes with this thread; W runs whether or not anyone joins.
+    0
+}
+
+func says_w(arg: UInt) sync -> UInt {
+    print("SOS levels: alone: W")
+    0
+}
+
+/// `after death`: P is made, root parks on a child's death, and the start of
+/// P is the first call root makes once the death has woken it. The child runs
+/// below root, so its teardown's wake of root asked for a switch; that request
+/// was the dying thread's, and P, at root's own level, runs only when root
+/// parks in the join.
+func after_death(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    let p = try thread(run: says_after, arg: 0, top: top_0())
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try give_role(&child, ROLE_FAULT)
+    try give_system(&child, CHILD_SYSTEM)
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    try child.start(boot_tag: TAG_BOOT)
+    let wake = try waiter.wait()
+    try p.start(band: Priority.Normal)
+    print("SOS levels: after death: M")
+    let _ = try p.join()
+    let _ = move wake
+    let status = try child.get_status()
+    print("SOS levels: after death ended status={}", status)
+    return
+}
+
+func says_after(arg: UInt) sync -> UInt {
+    print("SOS levels: after death: P")
+    0
+}
+
+/// `head`: P is ready at the main thread's level when H, above both, takes the
+/// processor at its start; the main thread resumes ahead of P.
+func preempted_head() -> Result<Void, SosStatus> {
+    let p = try thread(run: says_p, arg: 0, top: top_0())
+    let h = try thread(run: says_h, arg: 0, top: top_1())
+    try p.start(band: Priority.Normal)
+    try h.start(band: Priority.High)
+    print("SOS levels: head: M")
+    let _ = try p.join()
+    let _ = try h.join()
+    return
+}
+
+func says_p(arg: UInt) sync -> UInt {
+    print("SOS levels: head: P")
+    0
+}
+
+func says_h(arg: UInt) sync -> UInt {
+    print("SOS levels: head: H")
+    0
+}
+
+/// `event`: H parks on a Waiter at `High`; the signal of the Event attached to
+/// it readies H above the signaller.
+func event_wakes() unsafe -> Result<Void, SosStatus> {
+    var waiter = try sosmain.context().process().waiter_create()
+    let event = try sosmain.context().process().event_create()
+    try waiter.add(event: &event, key: KEY_EVENT)
+    let at = ((&var waiter) as UnsafePointer<Waiter>) as UInt
+    let h = try thread(run: waits_on, arg: at, top: top_0())
+    try h.start(band: Priority.High)
+    try event.signal(bits: 1)
+    print("SOS levels: event: A")
+    let _ = try h.join()
+    return
+}
+
+func waits_on(at: UInt) sync -> UInt {
+    wait_at(at)
+    print("SOS levels: event: the signal woke H")
+    0
+}
+
+func wait_at(at: UInt) unsafe sync {
+    let waiter = at as UnsafePointer<Waiter>
+    let _ = try waiter[0].wait() catch {
+        panic("SOS levels: event: the wait was refused: {}", error)
+    }
+}
+
+/// `irq`: H parks at `High` on a one-shot Timer; the main thread spins until
+/// H has run, which only the switch at the fire's interrupt return can make
+/// happen with no tick.
+func irq_wakes() -> Result<Void, SosStatus> {
+    let h = try thread(run: sleeps, arg: 0, top: top_0())
+    try h.start(band: Priority.High)
+    while IRQ_WOKE.load() == 0 { }
+    print("SOS levels: irq: M")
+    let _ = try h.join()
+    return
+}
+
+func sleeps(arg: UInt) sync -> UInt {
+    sleep_once()
+    print("SOS levels: irq: the fire woke H")
+    IRQ_WOKE.store(1)
+    0
+}
+
+/// One millisecond, a delay the main thread is spinning through when it ends.
+static SLEEP_NS: UInt64 = 1_000_000
+
+func sleep_once() unsafe sync {
+    let clock = try sosmain.context().system().clock_get() catch {
+        panic("SOS levels: irq: no clock: {}", error)
+    }
+    let timer = try clock.timer_create() catch {
+        panic("SOS levels: irq: no timer: {}", error)
+    }
+    let waiter = try sosmain.context().process().waiter_create() catch {
+        panic("SOS levels: irq: no waiter: {}", error)
+    }
+    try waiter.add(timer: &timer, key: KEY_EVENT) catch {
+        panic("SOS levels: irq: the attach was refused: {}", error)
+    }
+    try timer.arm(after_ns: SLEEP_NS) catch {
+        panic("SOS levels: irq: the arm was refused: {}", error)
+    }
+    let _ = try waiter.wait() catch {
+        panic("SOS levels: irq: the wait was refused: {}", error)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The child's rounds
+// -----------------------------------------------------------------------------
+
+/// `owner`: a thread of root's, given to the child, which starts it at `Low`.
+/// The child's map puts `Low` at 5, above the child's main thread; root's puts
+/// it at 1, the child's main thread's own level. The level is the owner's.
+func owner_map(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try child.band_map(map: LOW_HIGH_MAP)
+    let t = try thread(run: says_t, arg: 0, top: top_0())
+    try child.give(thread: move t, tag: TAG_THREAD) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try give_role(&child, ROLE_OWNER)
+    try give_system(&child, CHILD_SYSTEM)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(move child, "owner")
+}
+
+func says_t(arg: UInt) sync -> UInt {
+    print("SOS levels: owner: root's thread ran")
+    0
+}
+
+/// `full`: the child's map set twice, the simple map and then full access,
+/// with room for its six threads.
+func full_map(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try child.band_map(map: SIMPLE_MAP)
+    try child.band_map(map: FULL_MAP)
+    try child.quota_set(QuotaKind.Thread, limit: FULL_THREADS)
+    try child.quota_set(QuotaKind.Handle, limit: FULL_HANDLES)
+    try give_role(&child, ROLE_FULL)
+    try give_system(&child, CHILD_SYSTEM)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(move child, "full")
+}
+
+/// `kill`: R1 is ready at `Background`, level 0; the child, under full access,
+/// readies A at level 1 and B at level 0 and parks; R2 is readied at level 0
+/// behind B. The kill takes A and B off their lists, and R1 and R2 then run
+/// in their order.
+func kill_two_levels(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    let r1 = try thread(run: says_r1, arg: 0, top: top_0())
+    let r2 = try thread(run: says_r2, arg: 0, top: top_1())
+    try r1.start(band: Priority.Background)
+
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try child.band_map(map: FULL_MAP)
+    let ready = try sosmain.context().process().event_create()
+    let ready_given = try ready.mint()
+    try child.give(event: move ready_given, tag: TAG_READY) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try give_role(&child, ROLE_KILL)
+    try give_system(&child, CHILD_SYSTEM)
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &ready, key: KEY_READY)
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = try waiter.wait()
+
+    try r2.start(band: Priority.Background)
+    try child.kill(code: KILL_CODE)
+    let status = try child.get_status()
+    print("SOS levels: kill ended status={}", status)
+    let _ = try r1.join()
+    let _ = try r2.join()
+    return
+}
+
+func says_r1(arg: UInt) sync -> UInt {
+    print("SOS levels: kill: R1")
+    0
+}
+
+func says_r2(arg: UInt) sync -> UInt {
+    print("SOS levels: kill: R2")
+    0
+}
+
+/// A `level-child` given its role and a System under `TAG_BOOT`, mapped with
+/// `map` when there is one, started on the System and waited out.
+func with_role(img: &Memory, ram: &Memory, round: String, role: UInt,
+               map: UInt32?) -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    if let m = map {
+        try child.band_map(map: m)
+    }
+    try give_role(&child, role)
+    try give_system(&child, CHILD_SYSTEM)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(move child, round)
+}
+
+/// A `level-child` that launches: a System that may create processes, and
+/// siblings of `child-bye`'s image and RAM.
+func launcher(img: &Memory, ram: &Memory, bye_img: &Memory, bye_ram: &Memory,
+              round: String, role: UInt, first: UInt32?,
+              map: UInt32?) -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    if let f = first {
+        try child.band_map(map: f)
+    }
+    if let m = map {
+        try child.band_map(map: m)
+    }
+    let image = try bye_img.mint()
+    try child.give(memory: move image, tag: TAG_IMAGE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let memory = try bye_ram.mint()
+    try child.give(memory: move memory, tag: TAG_RAM) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try give_role(&child, role)
+    try give_system(&child, LAUNCHER_SYSTEM)
+    try child.start(boot_tag: TAG_BOOT)
+    try ended(move child, round)
+}
+
+/// The child's role, as the bits of an Event under `TAG_ROLE`.
+func give_role(child: &Process, role: UInt) -> Result<Void, SosStatus> {
+    let ev = try sosmain.context().process().event_create()
+    try ev.signal(bits: role)
+    try child.give(event: move ev, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// A System narrowed to `rights`, under `TAG_BOOT`.
+func give_system(child: &Process, rights: UInt32) -> Result<Void, SosStatus> {
+    let boot = try sosmain.context().system().mint(rights: rights)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Wait for `child`'s death and print its status word; the handle goes with
+/// it, so the next round's child takes the same region.
+func ended(child: Process, round: String) -> Result<Void, SosStatus> {
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH {
+                return BUG
+            }
+            print("SOS levels: {} ended status={}", round, status)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

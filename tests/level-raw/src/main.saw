@@ -1,0 +1,192 @@
+// Test child for `levels_kill`, at the C altitude: its buffers and handle words
+// are its own to pick, which the typed tier never lets a caller name. The role
+// its launcher gives it, as the bits of an Event under `TAG_ROLE`, says what
+// it does:
+//
+//   PARK      parks its main thread on a Waiter attached to its own Process
+//             record, which the teardown of a kill wakes
+//   DOOM      starts a second thread at `Normal`, which parks as `PARK`
+//             does, then parks its main thread on the launcher's Waiter
+//             (under `TAG_WAITER`) with its wait record at the address under
+//             `TAG_ADDR`, in memory the launcher mapped into it
+//   DENIED    starts its own main thread at band 8 through a sibling of its
+//             handle without `ThreadRight.Start`: the `AccessDenied` fault,
+//             which is decided before the band
+//
+// Every thread of this image enters at `_start`: the main thread is the one
+// that has not yet parked the boot handle. A wait that comes back, where the
+// launcher was to end this process, exits with `EXIT_SURVIVED`.
+
+import sos.{System, ThreadRight, ALL_RIGHTS, sos_system_process_self,
+            sos_process_boot_handle_next, sos_process_exit,
+            sos_process_waiter_create, sos_process_thread_create,
+            sos_process_thread_self, sos_waiter_add, sos_waiter_wait,
+            sos_event_receive, sos_handle_mint, sos_thread_start,
+            sos_thread_start_band}
+
+static TAG_ROLE: UInt = 32
+static TAG_ADDR: UInt = 33
+static TAG_WAITER: UInt = 34
+
+static ROLE_PARK: UInt = 1
+static ROLE_DOOM: UInt = 2
+static ROLE_DENIED: UInt = 3
+
+/// The key this process's own record is attached under.
+static KEY_SELF: UInt = 61
+
+/// A wait came back where the launcher was to end this process.
+static EXIT_SURVIVED: UInt = 99
+/// A step before the one under test was refused, or no role was given.
+static EXIT_SETUP: UInt = 97
+
+static STATUS_OK: UInt = 0
+
+/// A word that names nothing.
+static NONE: UInt = 0
+
+/// The image entry, as `ProcessOp.ThreadCreate` takes it.
+static ENTRY_IMAGE: UInt = 0
+
+/// One past `Priority.Rt3`.
+static PAST_LAST: UInt = 8
+
+/// The words in a boot-handle record, and in a wait record's buffer (more
+/// than any record the kernel writes).
+static BOOT_WORDS: Int = 3
+static RECORD_WORDS: Int = 64
+
+unsafe static var BOOT: UInt = 0
+unsafe static var PROC: UInt = 0
+unsafe static var ROLE: UInt = 0
+unsafe static var ADDR: UInt = 0
+unsafe static var WAITER: UInt = 0
+
+/// The second thread's stack, in this process's own zero-init data.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+func stack_top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * word_bytes()
+}
+
+/// The word an Event holds, drained.
+func event_word(handle: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let _ = sos_event_receive(handle, (&var word) as UnsafePointer<UInt>)
+    word
+}
+
+/// Take every record of the boot set and keep what each tag names.
+func drain(proc: UInt) unsafe {
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let bytes = (BOOT_WORDS as UInt) * word_bytes()
+    while sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                       bytes) == STATUS_OK {
+        let tag = rec[0]
+        let word = rec[2]
+        if tag == TAG_ROLE {
+            ROLE = event_word(word)
+        } else if tag == TAG_ADDR {
+            ADDR = event_word(word)
+        } else if tag == TAG_WAITER {
+            WAITER = word
+        }
+    }
+}
+
+/// Park on a Waiter of this process's own, with this process's record
+/// attached. Nothing but the record's end wakes it.
+func park_on_self() unsafe {
+    var waiter: UInt = NONE
+    if sos_process_waiter_create(PROC,
+                                 (&var waiter) as UnsafePointer<UInt>) != STATUS_OK {
+        return
+    }
+    if sos_waiter_add(waiter, PROC, KEY_SELF, 0) != STATUS_OK {
+        return
+    }
+    var record: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let _ = sos_waiter_wait(waiter, (&var record) as UnsafePointer<UInt>,
+                            (RECORD_WORDS as UInt) * word_bytes())
+}
+
+/// `DOOM`: the second thread, then the wait into the launcher's memory.
+func doom() unsafe -> UInt {
+    var worker: UInt = NONE
+    let made = sos_process_thread_create(PROC, ENTRY_IMAGE, stack_top(), 1,
+                                         (&var worker) as UnsafePointer<UInt>)
+    if made != STATUS_OK {
+        return EXIT_SETUP
+    }
+    if sos_thread_start(worker) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    let _ = sos_waiter_wait(WAITER, ADDR as UnsafePointer<UInt>,
+                            (RECORD_WORDS as UInt) * word_bytes())
+    EXIT_SURVIVED
+}
+
+/// `DENIED`: the start does not return.
+func denied() unsafe -> UInt {
+    var me: UInt = NONE
+    if sos_process_thread_self(PROC, (&var me) as UnsafePointer<UInt>) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var narrow: UInt = NONE
+    let keep = (ALL_RIGHTS & ~(ThreadRight.Start as UInt32)) as UInt
+    if sos_handle_mint(me, keep, (&var narrow) as UnsafePointer<UInt>) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    print("SOS levelraw: denied: starting at band 8 without Start\n")
+    let _ = sos_thread_start_band(narrow, PAST_LAST)
+    EXIT_SURVIVED
+}
+
+func first(boot_handle: UInt) unsafe {
+    BOOT = boot_handle
+    let system = System(boot_handle: boot_handle)
+    var proc: UInt = NONE
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        let _ = system.debug_print("SOS levelraw: no process handle\n")
+        return
+    }
+    PROC = proc
+    drain(proc)
+    var code = EXIT_SETUP
+    if ROLE == ROLE_PARK {
+        park_on_self()
+        code = EXIT_SURVIVED
+    } else if ROLE == ROLE_DOOM {
+        code = doom()
+    } else if ROLE == ROLE_DENIED {
+        code = denied()
+    }
+    let _ = sos_process_exit(proc, code)
+}
+
+/// Whether this thread is the second one: the first parks the boot handle.
+func is_worker() unsafe -> Bool {
+    BOOT != 0
+}
+
+/// The second thread: it parks as `PARK` does.
+func worker() unsafe {
+    park_on_self()
+    let _ = sos_process_exit(PROC, EXIT_SURVIVED)
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if not is_worker() {
+        first(arg)
+    } else {
+        worker()
+    }
+}

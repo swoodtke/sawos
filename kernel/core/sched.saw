@@ -61,7 +61,7 @@ import kcore.threads.{
     LAST_PROT_PROCESS,
     NEED_RESCHED,
     PENDING_FREE,
-    READY_HEAD,
+    READY_BITS,
     SLICE_LEFT,
     SLICE_TICKS,
     THREADS,
@@ -69,8 +69,10 @@ import kcore.threads.{
     ThreadState,
     frame_slot,
     live_threads,
+    ready_above,
     ready_pop,
     ready_push,
+    ready_push_head,
     ready_remove_process,
     unjoin_process,
 }
@@ -120,10 +122,16 @@ func stays_running(slot: Int) unsafe -> Bool {
 /// in two places, `pick_next` at the trap-return boundary and
 /// `resume_after_death` after the running thread has ceased to exist. A reload
 /// written in only one of them would be missing from the other.
+///
+/// The incoming thread starts with a fresh slice and no reschedule asked of
+/// it: a flag raised for the thread that left (its slice's end, a wake above
+/// it, a wake made while its process was torn down) is not the incoming
+/// thread's.
 func run_thread(next: Int) unsafe -> UInt {
     CURRENT_THREAD = next
     THREADS[next].state = ThreadState.Running
     SLICE_LEFT = SLICE_TICKS
+    NEED_RESCHED = false
     let np = THREADS[next].process
     if np != LAST_PROT_PROCESS {
         load_domain(np)
@@ -168,17 +176,23 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
         return current_frame
     }
 
-    // A thread leaving the processor while still runnable goes to the tail
-    // (round-robin). One that blocked or exited is already on the list it
-    // belongs to, or on none.
+    // A thread leaving the processor while still runnable goes back on its
+    // level's list: at the head when a higher level is ready, which is the
+    // thread a wake preempted (spec §7), and at the tail otherwise, which is
+    // round-robin after a slice's end or a yield. A tick and a wake in one
+    // trap read as the preemption. One that blocked or exited is already on
+    // the list it belongs to, or on none.
     match THREADS[cur].state {
         case Running -> {
             THREADS[cur].state = ThreadState.Runnable
-            ready_push(cur)
+            if ready_above(THREADS[cur].level) {
+                ready_push_head(cur)
+            } else {
+                ready_push(cur)
+            }
         },
         case _ -> {},
     }
-    NEED_RESCHED = false
 
     // The outgoing thread's floating-point state is saved before anything can
     // wait, while the thread is still its process's. The idle wait below runs
@@ -216,7 +230,7 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
 
 /// Park the core until something is runnable again.
 ///
-/// The exit condition is the ready queue, not the poll (`idle_once` says why).
+/// The exit condition is the ready lists, not the poll (`idle_once` says why).
 /// The callers ask `has_external_wake_source` before they start, but the answer
 /// can change while the kernel idles: a one-shot Timer that fires disarms
 /// itself, and if nobody was parked on it nothing becomes runnable. So each
@@ -233,10 +247,10 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
 /// (`has_external_wake_source`) are `MAX_INTERRUPTS` + `MAX_TIMERS` iterations
 /// of O(1) work.
 func idle_until_runnable() unsafe {
-    while READY_HEAD == 0 {
+    while READY_BITS == 0 {
         idle_once()
         drain_deaths()
-        if READY_HEAD == 0 && not has_external_wake_source() {
+        if READY_BITS == 0 && not has_external_wake_source() {
             fatal_deadlock()
         }
     }
@@ -346,7 +360,7 @@ func invalidate_thread(t: Int, p: Int) unsafe {
     }
     quota_credit(p, QuotaKind.Thread)
     let refs = THREADS[t].refs
-    THREADS[t] = ThreadSlot(state: ThreadState.Invalid, process: p,
+    THREADS[t] = ThreadSlot(state: ThreadState.Invalid, level: 0, process: p,
                             exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
                             call_pipe: 0, call_claim: 0, call_src: 0,
                             call_len: 0, refs: refs)
@@ -656,7 +670,7 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // A parked supervisor is told here, the earliest point at which the wait
     // record (the three fields above) is honest. The wake only queues:
     // `notify_ready` reaches `wake_one_waiter`, which writes the record into
-    // the supervisor's memory and pushes its thread onto the ready queue
+    // the supervisor's memory and pushes its thread onto its ready list
     // without switching. The whole teardown below runs to completion first and
     // the woken thread is picked up by `resume_after_death`, so no observer
     // sees a half-dead process. The call is unconditional, root included:
@@ -707,7 +721,7 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // Then the dying process's threads come off every list a thread parks on,
     // so no wake can find one of them:
     //
-    //   - The ready queue is edited, not emptied: other processes' runnable
+    //   - The ready lists are edited, not emptied: other processes' runnable
     //     threads stay.
     //   - Every joiner list, so that an invalidation's wake reaches only other
     //     processes' joiners and no surviving thread names one of these.
@@ -1038,7 +1052,7 @@ func report_teardown(counts: TeardownCounts, p: Int) unsafe {
 ///   - Process 0 (root, init) stops the machine. Its children die with it,
 ///     uncounted, and a `Created` process nothing names any more is not torn
 ///     down first.
-///   - A child reschedules. Its threads leave the ready queue by removal, its
+///   - A child reschedules. Its threads leave the ready lists by removal, its
 ///     body goes back, and the path ends in `resume_after_death`, so root is
 ///     simply the next thing picked. A supervisor parked on the child's Process
 ///     handle is woken by the `notify_ready` at the top of the teardown. The

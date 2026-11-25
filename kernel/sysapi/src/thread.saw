@@ -5,10 +5,12 @@
 //! `Process.thread_self` and arrives by a give or a message, all of which live
 //! above this file, so nothing here reaches upward.
 
-import sosabi.{SosStatus, ThreadOp, ThreadHandle, NO_HANDLE, MINT_OP}
+import sosabi.{SosStatus, ThreadOp, ThreadHandle, Priority, NO_HANDLE,
+               MINT_OP}
 
 import sos.floor.{call_value, checked, sos_handle_release, sos_thread_exit,
-                  sos_thread_start, sos_thread_yield, ALL_RIGHTS, handle_rights}
+                  sos_thread_start_band, sos_thread_yield, ALL_RIGHTS,
+                  handle_rights}
 
 /// A handle to a Thread, a kernel-scheduled execution context in a process.
 ///
@@ -53,13 +55,22 @@ extension Thread {
         handle_rights(self.handle)
     }
 
-    /// Make a created thread runnable. It runs when the scheduler next picks
-    /// it, which is not necessarily before this call returns. Requires
-    /// `ThreadRight.Start`. A thread of a child that has not been started
-    /// (`Process.start`) cannot run before it: starting one terminates the
-    /// caller, and the launcher starts it after the child.
-    public func start(&self) -> Result<Void, SosStatus> {
-        checked(sos_thread_start(self.handle))
+    /// Make a created thread runnable at `band` (spec §7). Requires
+    /// `ThreadRight.Start`.
+    ///
+    /// The band is a rank inside the thread's own process: the level the
+    /// thread runs at is the one that process's band map gives `band`, which
+    /// its launcher chose and nobody in the process can read. A thread whose
+    /// level is above the caller's runs before this call returns; one at or
+    /// below it runs when the scheduler next picks it.
+    ///
+    /// A thread of a child that has not been started (`Process.start`) cannot
+    /// run before it: starting one terminates the caller, and the launcher
+    /// starts it after the child.
+    public func start(
+        &self, band: Priority = Priority.Normal
+    ) -> Result<Void, SosStatus> {
+        checked(sos_thread_start_band(self.handle, band as UInt))
     }
 
     /// Wait for this thread to exit and take its exit value. Requires
@@ -91,7 +102,9 @@ extension Thread {
     }
 
     /// Give the processor up to the next runnable thread, and go to the back of
-    /// the queue. Requires `ThreadRight.Control` on the caller's own handle.
+    /// this thread's level. A thread at a lower level does not run while this
+    /// one is ready, so a yield never reaches it. Requires
+    /// `ThreadRight.Control` on the caller's own handle.
     ///
     /// Named for `std.task`'s `yield_now` so that the kernel-thread and
     /// cooperative-task spellings read alike.

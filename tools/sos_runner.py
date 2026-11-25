@@ -237,6 +237,16 @@ CHILD_FP_IDLE_PKG = os.path.join(TESTS_DIR, "child-fp-idle")
 # The scheduler tick taking the processor from a process that never yields.
 TICK_SPINNER_PKG = os.path.join(TESTS_DIR, "tick-spinner")
 CHILD_SPIN_PKG = os.path.join(TESTS_DIR, "child-spin")
+# The scheduler's levels (spec §7): a root with threads at its own bands and a
+# child it maps, launches and kills, the same against the tick, a process's
+# end against them, and the refusals only the C floor can spell.
+LEVEL_ROOT_PKG = os.path.join(TESTS_DIR, "level-root")
+LEVEL_CHILD_PKG = os.path.join(TESTS_DIR, "level-child")
+LEVEL_TICK_PKG = os.path.join(TESTS_DIR, "level-tick")
+LEVEL_KILL_PKG = os.path.join(TESTS_DIR, "level-kill")
+LEVEL_RAW_PKG = os.path.join(TESTS_DIR, "level-raw")
+START_BAND_PAST_PKG = os.path.join(TESTS_DIR, "start-band-past")
+BAND_MAP_WIDE_PKG = os.path.join(TESTS_DIR, "band-map-wide")
 # Event and Waiter objects.
 EVENT_BASICS_PKG = os.path.join(TESTS_DIR, "event-basics")
 EVENT_WAKE_PKG = os.path.join(TESTS_DIR, "event-wake")
@@ -2900,6 +2910,27 @@ TEST_CASES = [
         "expect_out": "bad root image: segment loads below the root region",
         "expect_clean_exit": False,
     },
+    {
+        # Root's band map applies verbatim from its image (spec §7, §12), and
+        # a level past the last stops the boot naming the band, with the
+        # level as the detail. Blade refuses such a manifest, so the image is
+        # assembled by hand. Each band of the header is checked: the last,
+        # here, and the first, below.
+        "name": "root_image_bad_band",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_badband.S",
+        "expect_out": "bad root image: band high is past the last level "
+                      "({eight})",
+        "expect_clean_exit": False,
+    },
+    {
+        "name": "root_image_bad_band_background",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "asm": "payload_badband_background.S",
+        "expect_out": "bad root image: band background is past the last "
+                      "level ({eight})",
+        "expect_clean_exit": False,
+    },
     # --- a segment already where it is linked -------------------------------
     # Each image states its segment's load address and its entry as the
     # address of its own bytes, through a relocation, so it is in place
@@ -3297,6 +3328,204 @@ TEST_CASES = [
                        "SOS tickspin: the tick took the processor from the "
                        "child"],
         "expect_clean_exit": True,
+    },
+    {
+        # The scheduler's levels (spec §7), with no tick: every switch is one
+        # a round makes, so each round's order is the rule's. Root's `Normal`
+        # is level 2, `Low` 1 and `High` 3. `tests/level-root` says what each
+        # round does and `tests/level-child` what the child prints for it.
+        #
+        # A status word is the child's §8 status: `Exited` (1) << 16 for 0,
+        # `Faulted` (2) << 16 with the reason (`BadState` 5, `AccessDenied` 3,
+        # `Panic` 14) for a refused `BandMap` or a panic, and `Killed` (3) <<
+        # 16 with the code 9.
+        "name": "levels",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LEVEL_ROOT_PKG,
+        "children": [LEVEL_CHILD_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS levels: start: A\n",
+            "SOS levels: start: B\n",
+            "SOS levels: start: C\n",
+            "SOS levels: lower: Y\n",
+            "SOS levels: lower: L\n",
+            "SOS levels: equal: A\n",
+            "SOS levels: equal: B\n",
+            "SOS levels: equal: C\n",
+            "SOS levels: realtime: the Rt0 thread ran\n",
+            "SOS levels: realtime: the Rt3 thread ran\n",
+            "SOS levels: realtime: A\n",
+            "SOS levels: head: H\n",
+            "SOS levels: head: M\n",
+            "SOS levels: head: P\n",
+            "SOS levels: alone: H\n",
+            "SOS levels: alone: M\n",
+            "SOS levels: alone: W\n",
+            "SOS levels: event: the signal woke H\n",
+            "SOS levels: event: A\n",
+            "SOS levels: irq: the fire woke H\n",
+            "SOS levels: irq: M\n",
+            "SOS levelchild: owner: started root's thread at Low\n",
+            "SOS levels: owner: root's thread ran\n",
+            "SOS levelchild: owner: joined\n",
+            "SOS levels: owner ended status=65536\n",
+            "SOS levelchild: full: main at Normal\n",
+            *[f"SOS levelchild: full: band {b} up\n" for b in range(3, 8)],
+            "SOS levelchild: full: band 7 started\n",
+            *[line for b in range(6, 2, -1)
+              for line in (f"SOS levelchild: full: band {b} back\n",
+                           f"SOS levelchild: full: band {b} started\n")],
+            "SOS levelchild: full: main back\n",
+            "SOS levels: full ended status=65536\n",
+            "SOS levels: kill ended status=196617\n",
+            "SOS levels: kill: R1\n",
+            "SOS levels: kill: R2\n",
+            "SOS levelchild: simple: Y\n",
+            "SOS levelchild: simple: the Rt3 thread ran\n",
+            "SOS levelchild: simple: after the yield\n",
+            "SOS levels: simple ended status=65536\n",
+            *_panic_fault("{one}", "panic at main.saw:",
+                          ": SOS levelchild: rtfault: the Rt3 thread panicked "
+                          "with a peer ready"),
+            f"SOS levels: rtfault ended status={STATUS_PANICKED}\n",
+            *_panic_fault("{one}", "panic at main.saw:",
+                          ": SOS levelchild: fault: the child panicked"),
+            "SOS levels: after death: M\n",
+            "SOS levels: after death: P\n",
+            f"SOS levels: after death ended status={STATUS_PANICKED}\n",
+            "SOS levelchild: started: mapping itself\n",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS levels: started ended status=131077\n",
+            "SOS levelchild: denied: mapping without BandMap\n",
+            "SOS: process fault: access denied process={one}",
+            "SOS levels: denied ended status=131075\n",
+            "SOS levels: done\n",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # `BandMap`'s refusals that need a process the child launches, from
+        # the root of `levels` given `child-bye`'s regions too: a `Gone`
+        # grandchild (`BadState` 5); under the simple map, set after full
+        # access, a level above the launcher's own highest (`BadArg` 9); and
+        # under full access a band at 8, in the first nibble and in the last
+        # (`BadArg` 9). Each faults the launcher, `level-child`.
+        #
+        # Not on the ESP32-S3: its profile has one child RAM region, and a
+        # second child's would begin at the pool's base and run past the top
+        # of RAM.
+        "name": "levels_launch",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LEVEL_ROOT_PKG,
+        "children": [CHILD_BYE_PKG, LEVEL_CHILD_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS bye: exiting\n",
+            "SOS levelchild: gone: mapping a process that has ended\n",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS levels: gone ended status=131077\n",
+            "SOS levelchild: cap: the simple map, its own: taken\n",
+            "SOS levelchild: cap: mapping Normal at 2, above its own\n",
+            "SOS: process fault: argument outside its domain process={one}",
+            "SOS levels: cap ended status=131081\n",
+            "SOS levelchild: nibble: full access, its own: taken\n",
+            "SOS levelchild: nibble: mapping a band at 8\n",
+            "SOS: process fault: argument outside its domain process={one}",
+            "SOS levels: nibble ended status=131081\n",
+            "SOS levelchild: nibble7: full access, its own: taken\n",
+            "SOS levelchild: nibble7: mapping Rt3 at 8\n",
+            "SOS: process fault: argument outside its domain process={one}",
+            "SOS levels: nibble7 ended status=131081\n",
+            "SOS levels: done\n",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A process's end against the levels (spec §7): a teardown's wakes of
+        # the ending process's own threads ask for no switch, whether a kill
+        # or a delivery that found a buffer gone ended it, so the thread that
+        # ended it keeps the processor over a peer at its level. The equal
+        # round is the control: its wake is at root's level and asks for
+        # nothing either way. Then a start through a handle without `Start`,
+        # at band 8: the right is decided before the band.
+        # `tests/level-kill` says how each round is made.
+        #
+        # A status word is the child's §8 status: `Killed` (3) << 16 with the
+        # code 9, and `Faulted` (2) << 16 with `BadBuffer` (11) or
+        # `AccessDenied` (3).
+        "name": "levels_kill",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LEVEL_KILL_PKG,
+        "children": [LEVEL_RAW_PKG],
+        "pool": True,
+        "expect_out": [
+            "{banner}",
+            "SOS levelkill: kill above: M\n",
+            "SOS levelkill: P\n",
+            "SOS levelkill: kill above ended status=196617\n",
+            "SOS levelkill: kill equal: M\n",
+            "SOS levelkill: P\n",
+            "SOS levelkill: kill equal ended status=196617\n",
+            "SOS: process fault: ",
+            "process={one}",
+            "SOS levelkill: doom: M\n",
+            "SOS levelkill: P\n",
+            "SOS levelkill: doom ended status=131083\n",
+            "SOS levelraw: denied: starting at band 8 without Start\n",
+            "SOS: process fault: access denied process={one}",
+            "SOS levelkill: denied ended status=131075\n",
+            "SOS levelkill: done\n",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # The tick against the levels (spec §7): it round-robins two threads
+        # at one level, and a slice's end never runs a lower level while the
+        # spinner is ready. `tests/level-tick` says how each round is made.
+        "name": "levels_tick",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "tick": True,
+        "root_pkg": LEVEL_TICK_PKG,
+        "expect_out": ["{banner}",
+                       "SOS levelstick: same level: each worker saw the "
+                       "other print\n",
+                       "SOS levelstick: not down: S\n",
+                       "SOS levelstick: not down: L\n",
+                       "SOS levelstick: done\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A band past the last is a `BadArg` fault decided before the thread's
+        # state: the thread is the caller's own and running, which the state
+        # check would answer with `BadState`.
+        "name": "start_band_past",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": START_BAND_PAST_PKG,
+        "expect_out": ["{banner}",
+                       "SOS startband: starting this thread at band 8\n",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A band map is the whole register: on a 64-bit profile, the simple
+        # map with bit 32 set is the `BadArg` fault, not the simple map. A
+        # 32-bit register cannot carry the word.
+        "name": "band_map_wide",
+        "arches": ["arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": BAND_MAP_WIDE_PKG,
+        "children": [CHILD_BYE_PKG],
+        "expect_out": ["{banner}",
+                       "SOS bandwide: the simple map status=0\n",
+                       "SOS bandwide: setting the simple map with bit 32 "
+                       "set\n",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
     {
         # A caller's mistake on a handle the process never held ends the
@@ -4982,7 +5211,7 @@ TEST_CASES = [
         # `INFO_OP` reads a handle's rights and kind. The default sets of an
         # Event, a boot Memory and the Process handle are the bits their kinds
         # mint (1795 is Transfer, Mint and the three Event bits, 1539
-        # Transfer, Mint and the two Memory bits, 8388355 the Process set); a
+        # Transfer, Mint and the two Memory bits, 16776963 the Process set); a
         # sibling minted through a keep mask
         # reports exactly the narrowed set and not the keep bit the source
         # never held; the floor's kind selector answers the published kind
@@ -4999,7 +5228,7 @@ TEST_CASES = [
                        "SOS: boot regions={two}",
                        "SOS handleinfo: event rights=1795",
                        "SOS handleinfo: memory rights=1539",
-                       "SOS handleinfo: process rights=8388355",
+                       "SOS handleinfo: process rights=16776963",
                        "SOS handleinfo: a narrowed sibling reports exactly "
                        "the narrowed set",
                        "SOS handleinfo: a keep bit the source lacks is not "
@@ -5082,7 +5311,7 @@ TEST_CASES = [
         # the Memory default set 1539, `PoolRight.Extend` and
         # `PoolRight.Allocate`), what it allocates reads 515, the Mapping
         # that installs that 258 (the
-        # Mapping default set is 770), and the process it creates 8371971,
+        # Mapping default set is 770), and the process it creates 16760579,
         # the Process default set without `Start`.
         "name": "rights_ceiling_derived",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
@@ -5094,7 +5323,7 @@ TEST_CASES = [
                        "SOS ceilderived: pool rights=69123",
                        "SOS ceilderived: allocation rights=515",
                        "SOS ceilderived: mapping rights=258",
-                       "SOS ceilderived: created process rights=8371971",
+                       "SOS ceilderived: created process rights=16760579",
                        "SOS ceilderived: done"],
         "expect_clean_exit": True,
     },
@@ -13474,7 +13703,7 @@ TEST_CASES = [
             "00020009 process={one}\n",
             "SOS mainstart: exit ended status=65545\n",
             "SOS mainchild: the System's rights 5377, the Process's "
-            "8388355\n",
+            "16776963\n",
             "SOS mainchild: took the Event under tag 43; a second take found "
             "nothing\n",
             *_panic_fault("{one}", "panic at lib.saw:",
@@ -19283,6 +19512,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #   thread_basics      threads of one process, switched as frames
     #   thread_preempt     the same under a tick harness kernel: preemption
     #   lock_owner         each thread its own lock owner, kept in THREADPTR
+    #   levels             the scheduler's levels: preemption on a start, a
+    #                      signal and a Timer's interrupt, and a child's map
     #   timer_oneshot      a Timer fire through a Waiter, with the kernel idle
     #                      on `irq_poll` in between
     #   tier_word          the platform says `Flat`
@@ -19371,7 +19602,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # A case asserting a hardware denial does not belong on a Flat board; the
     # check below refuses one named here by mistake, with the gate's reason.
     process_names = ["root_server_boot", "thread_basics", "thread_preempt",
-                     "lock_owner",
+                     "lock_owner", "levels",
                      "timer_oneshot", "tier_word", "process_lifecycle",
                      "death_fault", "pipe_pingpong", "map_into_child",
                      "iomemory_carve", "interrupt_give", "tick_spinner",

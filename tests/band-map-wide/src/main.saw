@@ -1,0 +1,86 @@
+// A `BandMap` map is the whole register (spec §7), on a 64-bit profile (the
+// case runs on arm64 alone). The simple map is taken; the simple map with bit
+// 32 set, whose low 32 bits are the simple map, is the `BadArg` fault, not
+// the simple map.
+//
+//   SOS bandwide: the simple map status=0
+//   SOS bandwide: setting the simple map with bit 32 set
+//   SOS: process fault: argument outside its domain
+//
+// It is asked through the C floor: the typed method takes a `UInt32`, so a
+// map this wide cannot be written there.
+
+import sos.{System, ALL_RIGHTS, sos_system_process_self,
+            sos_process_boot_handle_next, sos_system_process_create,
+            sos_process_band_map}
+
+static EXIT_FAILED: UInt = 1
+
+static STATUS_OK: UInt = 0
+
+/// `NO_HANDLE`: no ceiling source.
+static NO_WORD: UInt = 0
+
+/// The boot-handle record: tag, kind, handle.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+static SIMPLE_MAP: UInt = 0x1111_1110
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    probe(&system, boot_handle)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// The simple map with bit 32 set, computed at run time so the source also
+/// builds for a 32-bit profile, where the case does not run.
+func wide_map() -> UInt {
+    var bit: UInt = 1
+    var i: Int = 0
+    while i < 32 {
+        bit = bit * 2
+        i = i + 1
+    }
+    bit | SIMPLE_MAP
+}
+
+/// The handle word of the next record of `me`'s boot set, or `NO_WORD`.
+func next_word(me: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS * sizeof<UInt>()) as UInt
+    let status = sos_process_boot_handle_next(me,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+/// Create the child, map it with the simple map, then with the wide word. The
+/// second map does not return.
+func probe(system: &System, boot_handle: UInt) unsafe {
+    var me: UInt = 0
+    let made = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                       (&var me) as UnsafePointer<UInt>)
+    if made != STATUS_OK {
+        let _ = system.debug_print("SOS bandwide: no process handle\n")
+        return
+    }
+    let image = next_word(me)
+    let ram = next_word(me)
+    var child: UInt = 0
+    let created = sos_system_process_create(boot_handle, image, ram, NO_WORD,
+                                            (&var child) as UnsafePointer<UInt>)
+    if created != STATUS_OK {
+        let _ = system.debug_print("SOS bandwide: create refused\n")
+        return
+    }
+    let simple = sos_process_band_map(child, SIMPLE_MAP)
+    print("SOS bandwide: the simple map status={}\n", simple)
+    print("SOS bandwide: setting the simple map with bit 32 set\n")
+    let answer = sos_process_band_map(child, wide_map())
+    print("SOS bandwide: UNREACHABLE status={}\n", answer)
+}

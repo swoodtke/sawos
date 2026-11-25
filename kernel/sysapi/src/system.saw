@@ -57,7 +57,7 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_process_pipe_create,
                   sos_process_start, sos_process_stats,
                   sos_process_restrict_rights, ceiling_word,
-                  sos_process_quota_set,
+                  sos_process_quota_set, sos_process_band_map,
                   sos_system_debug_print, sos_system_shutdown,
                   sos_system_slab_donate, sos_system_process_next,
                   sos_system_process_by_pid, sos_waiter_add, handle_rights}
@@ -2052,6 +2052,27 @@ extension Process {
     /// ended it is `SosStatus.Revoked`: its rows went with it.
     public func quota_get(&self, kind: QuotaKind) -> Result<QuotaRow, SosStatus> {
         quota_row(self.handle, kind)
+    }
+
+    // -------------------------------------------------------------------------
+    // The band map (spec §7)
+    // -------------------------------------------------------------------------
+
+    /// Place this process's priority bands among the system levels: band
+    /// `b`'s level is nibble `b` of `map`, low nibble first, in `Priority`'s
+    /// order (`0x7654_3210` is every band at its own number). Requires
+    /// `ProcessRight.BandMap`, and the process must be `Created`: a launcher
+    /// places its child between `process_create` and `start`, and the map
+    /// holds from the start on. The last one set wins.
+    ///
+    /// A process nobody maps runs `Background` at level 0 and every other
+    /// band at level 1. A launcher grants at most what it holds: a level above
+    /// the caller's cap, the highest level of the map its own launcher set
+    /// (7 for root, whatever root's map says), terminates the caller, as does
+    /// a nibble at or past 8, and so does naming a process that is not
+    /// `Created`, which is decided first.
+    public func band_map(&self, map: UInt32) -> Result<Void, SosStatus> {
+        checked(sos_process_band_map(self.handle, map as UInt))
     }
 }
 

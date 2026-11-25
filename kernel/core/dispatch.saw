@@ -136,6 +136,8 @@ import sosabi.{
     HandleInfo,
     HandleKind,
     ENTRY_IMAGE,
+    BANDS,
+    Priority,
 }
 import kcore.limits.{
     LONGEST_TABLE,
@@ -255,10 +257,13 @@ import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment,
 import kcore.threads.{
     CURRENT_THREAD,
     NEED_RESCHED,
+    SIMPLE_BAND_MAP,
     THREADS,
     ThreadSlot,
     ThreadState,
     alloc_thread,
+    band_level,
+    band_map_highest,
     block_on_join,
     calling_process,
     frame_slot,
@@ -888,7 +893,49 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             process_quota_get(p, obj.slot, arg0)
         },
+        // Sets the named process's band map (§7). It acts on the process the
+        // handle names, which must be `Created`, as for `QuotaSet`.
+        case BandMap -> {
+            if not obj.allows(ProcessRight.BandMap) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            process_band_map(p, obj.slot, arg0)
+        },
     }
+}
+
+/// `ProcessOp.BandMap`: process `child`'s band map becomes `raw` (spec §7).
+///
+/// The answers are decided in the spec's order, and nothing is written until
+/// all of them are behind: the state, a `BadState` fault unless the child is
+/// `Created` (a `Gone` one was always started); then the map, a `BadArg`
+/// fault for a word with a bit past its eight nibbles, and a `BadArg` fault
+/// for a level above the caller's own cap, because a launcher grants at most
+/// what it holds, as a quota row's limit is bounded by the caller's. No cap is
+/// above the last level, so a nibble past it is refused there. Each `BadArg`
+/// is the caller's choice of number, and the caller can read what bounds
+/// it.
+///
+/// The child's cap becomes the highest level of its new map, so what the
+/// child may grant is what it was granted. The last map set before the start
+/// is the one its threads' levels are read from.
+func process_band_map(p: Int, child: Int, raw: UInt) unsafe -> SyscallResult {
+    match PROCESS_RECORDS[child].state {
+        case Created -> {},
+        case _ -> fault_process(p, FaultReason.BadState),
+    }
+    if raw > (UInt32.max as UInt) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    let map = raw as UInt32
+    let highest = band_map_highest(map)
+    if highest > PROCESSES[body_of(p)].level_cap {
+        fault_process(p, FaultReason.BadArg)
+    }
+    let b = body_of(child)
+    PROCESSES[b].bands = map
+    PROCESSES[b].level_cap = highest
+    op_ok()
 }
 
 /// The ceiling-table index `raw` names, or terminate the caller: a number that
@@ -1377,6 +1424,11 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
                                           & PROCESSES[body_of(source)].ceilings[kind])
         kind = kind + 1
     }
+    // The simple map, until the launcher sets another before the start
+    // (`process_band_map`): a child no launcher maps runs its bands at levels
+    // 0 and 1 and can grant no higher.
+    PROCESSES[body].bands = SIMPLE_BAND_MAP
+    PROCESSES[body].level_cap = band_map_highest(SIMPLE_BAND_MAP)
     // Every address on a process body is a user address: the entry goes into a
     // program counter, the stack top into a stack pointer, and the region's
     // top is where mappings start. The frames behind them live in the grant
@@ -1455,8 +1507,9 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
 /// or `NO_HANDLE` for `Absent`; its own Process handle is derived through its
 /// `ProcessSelf` right, and its boot set is drained from there.
 ///
-/// Root keeps running. The thread goes on the ready queue and the caller
-/// returns normally; the child runs when the scheduler next picks it, as with
+/// The thread goes on its level's ready list and the caller returns normally:
+/// the child runs when the scheduler next picks it, which is at once when its
+/// first thread's level is above the caller's (spec §7), as with
 /// `Thread.start`.
 ///
 /// A second start is a `BadState` fault; the caller could have known, since it
@@ -1508,9 +1561,11 @@ func process_start(caller: Int, child: Int,
     hal.frame_init(frame_slot(slot), PROCESSES[body].entry,
                    PROCESSES[body].stack_top, boot_word)
     // No handle names the child's first thread, so its count starts at zero:
-    // it runs in its slot, and the child's `ThreadSelf` is what names it.
-    THREADS[slot] = ThreadSlot(state: ThreadState.Runnable, process: child,
-                               exit_code: 0,
+    // it runs in its slot, and the child's `ThreadSelf` is what names it. It
+    // runs at the child's `Normal` band, under the map its launcher left it.
+    let level = band_level(PROCESSES[body].bands, Priority.Normal as Int)
+    THREADS[slot] = ThreadSlot(state: ThreadState.Runnable, level: level,
+                               process: child, exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
                                call_len: 0, refs: 0)
@@ -1936,9 +1991,10 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
     }
 
     hal.frame_init(frame_slot(slot), start, stack_top, arg)
-    // The handle just minted is the first reference.
-    THREADS[slot] = ThreadSlot(state: ThreadState.Created, process: owner,
-                               exit_code: 0,
+    // The handle just minted is the first reference. The level is the start's
+    // to read.
+    THREADS[slot] = ThreadSlot(state: ThreadState.Created, level: 0,
+                               process: owner, exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
                                call_len: 0, refs: 1)
@@ -1958,11 +2014,15 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
 /// onto the thread keeps naming the `Exited` slot, and a thread nothing else
 /// names is freed once it is off the processor.
 ///
+/// `Start` carries the thread's band in `arg0` (spec §7): a band past the last
+/// is a `BadArg` fault, decided after the rights check and before the state.
+///
 /// An invalid thread (its process died before it exited, spec §2.10) answers
-/// `Start` and `Join` with `Revoked`, after the rights check and the self-join
-/// check fault as they would on a live thread. `Exit` and `Yield` through its
-/// handle stay the `NotSelf` fault: an invalid thread never runs, so its handle
-/// never names the caller, the rule a `Gone` process's self-only ops follow.
+/// `Start` and `Join` with `Revoked`, after the rights check, the band check
+/// and the self-join check fault as they would on a live thread. `Exit` and
+/// `Yield` through its handle stay the `NotSelf` fault: an invalid thread
+/// never runs, so its handle never names the caller, the rule a `Gone`
+/// process's self-only ops follow.
 func thread_op(raw_op: UInt, obj: &ThreadObject, arg0: UInt) unsafe -> SyscallResult {
     let p = calling_process()
     guard let op = ThreadOp.from(raw: raw_op) else { fault_process(p, FaultReason.BadOp) }
@@ -1978,6 +2038,9 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             if not obj.allows(ThreadRight.Start) {
                 fault_process(p, FaultReason.AccessDenied)
             }
+            if arg0 >= (BANDS as UInt) {
+                fault_process(p, FaultReason.BadArg)
+            }
             match THREADS[target].state {
                 case Created -> {},
                 case Invalid -> { return op_status(SosStatus.Revoked) },
@@ -1992,6 +2055,11 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
                 case Created -> fault_process(p, FaultReason.BadState),
                 case _ -> {},
             }
+            // The level is the band's in the map of the process the thread
+            // runs in, which need not be the caller's (spec §7).
+            let owner = body_of(THREADS[target].process)
+            THREADS[target].level = band_level(PROCESSES[owner].bands,
+                                               arg0 as Int)
             THREADS[target].state = ThreadState.Runnable
             ready_push(target)
             op_ok()
@@ -2037,7 +2105,7 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             }
             // The yielder does resume, right after the trapping instruction, so
             // its pair is written now; the requeue is `pick_next`'s, the one
-            // place a thread is put back on the ready queue.
+            // place a thread is put back on a ready list.
             NEED_RESCHED = true
             op_ok()
         },

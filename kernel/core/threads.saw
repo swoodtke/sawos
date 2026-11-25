@@ -1,24 +1,28 @@
-//! The thread table, the frame arena and the ready queue: a thread's state,
+//! The thread table, the frame arena and the ready lists: a thread's state,
 //! held below everything that acts on it.
 //!
 //! The switch (`sched`) and the exit (`sched` again, because retiring the last
 //! thread ends the process) are not here. This module is the storage and the
 //! queue discipline, so the seams that wake a thread (a waiter's delivery, a
-//! timer's expiry) can push one onto the ready queue without reaching for the
-//! scheduler that will pick it up.
+//! timer's expiry) can push one onto a ready list without reaching for the
+//! scheduler that will pick it up. Preemption on wake is decided here too,
+//! because every wake is a push.
 
 import hal
 
+import sosabi.{BANDS}
 import kcore.limits.{
     FRAME_ARENA_WORDS,
     MAX_SLAB_EXTENTS,
     MAX_THREADS,
     NO_PROCESS,
     NO_THREAD,
+    SYSTEM_LEVELS,
     THREAD_FRAME_STRIDE,
 }
 import kcore.mem.{align_up}
 import kcore.slab.{Slab}
+import kcore.pslot.{PROCESS_RECORDS, ProcessState}
 
 // =============================================================================
 // Threads and the scheduler (spec §2, §7, §8)
@@ -143,9 +147,9 @@ public(package) enum ThreadState: UInt8 {
 /// One thread (spec §2 table row).
 ///
 /// `link` is the one list pointer a thread needs, because a thread is on at
-/// most one list at a time: the ready queue when it is runnable, or the joiner
-/// list of the thread it is waiting for when it is blocked. Slot indices are
-/// stored plus one so that zero means "no thread", which is what a zeroed
+/// most one list at a time: its level's ready list when it is runnable, or the
+/// joiner list of the thread it is waiting for when it is blocked. Slot indices
+/// are stored plus one so that zero means "no thread", which is what a zeroed
 /// static already says.
 ///
 /// The slot is counted (`refs`), and the count is handle entries and staged
@@ -158,6 +162,10 @@ public(package) struct ThreadSlot {
     /// `waitables` blocks one on a Waiter's list. The state machine is
     /// described here and nowhere else.
     public(package) state: ThreadState,
+    /// The system level the scheduler runs this thread at (spec §7), read from
+    /// its process's band map at its start and stored plain, so nothing on the
+    /// switch path reads a map. It means nothing before the start.
+    public(package) level: UInt8,
     /// The process the thread runs in and is charged to, or `NO_PROCESS` once
     /// that process has died and disowned it (an `Exited` or `Invalid` slot
     /// still named elsewhere, spec §2.10). Test for that before using it as an
@@ -217,7 +225,7 @@ public(package) struct ThreadSlot {
 /// The thread slab: an extent chain, with the frame arena riding the extent
 /// table's side column (see `frame_slot`). Loop bounds read `capacity()`.
 public(package) unsafe static var THREADS: Slab<ThreadSlot, MAX_THREADS> = Slab<ThreadSlot, MAX_THREADS>(
-    inline: [ThreadSlot(state: ThreadState.Free, process: 0,
+    inline: [ThreadSlot(state: ThreadState.Free, level: 0, process: 0,
                         exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
                         call_pipe: 0, call_claim: 0, call_src: 0,
                         call_len: 0, refs: 0); MAX_THREADS],
@@ -235,15 +243,46 @@ public(package) unsafe static var THREADS: Slab<ThreadSlot, MAX_THREADS> = Slab<
 /// the only writer is the trap path and nothing can interleave with it.
 public(package) unsafe static var CURRENT_THREAD: Int = NO_THREAD
 
-/// The ready queue: a FIFO of runnable threads, head and tail as slot + 1.
-/// The running thread is not on it: round-robin puts the outgoing thread at the
-/// tail and takes the head, and both halves happen in `pick_next`.
-public(package) unsafe static var READY_HEAD: Int = 0
+/// The ready lists (spec §7): one FIFO of runnable threads per level, head
+/// and tail as slot + 1. The running thread is on none: round-robin puts the
+/// outgoing thread at the tail of its level, or at the head when a higher
+/// level took the processor from it, and takes the head of the highest level;
+/// both halves happen in `pick_next`.
+public(package) unsafe static var READY_HEAD: [Int; SYSTEM_LEVELS] = [0; SYSTEM_LEVELS]
 
-public(package) unsafe static var READY_TAIL: Int = 0
+public(package) unsafe static var READY_TAIL: [Int; SYSTEM_LEVELS] = [0; SYSTEM_LEVELS]
 
-/// Set by the tick when a thread's slice runs out, and by `Yield`. Read and
-/// cleared at the user-return boundary, which is the only place it can act.
+/// Bit `l` is set exactly when level `l`'s ready list is not empty, so nothing
+/// is runnable when this is zero.
+public(package) unsafe static var READY_BITS: UInt8 = 0
+
+/// The highest set bit of each byte: the level a pick takes, out of
+/// `READY_BITS`, in one load. A table rather than a count-leading-zeros seam,
+/// because not every profile has such an instruction and one table serves
+/// them all. Entry 0 is never read: an empty bitmap is tested first.
+static HIGHEST_LEVEL: [UInt8; 256] = [
+    0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+]
+
+/// Set by the tick when a thread's slice runs out, by `Yield`, and by a wake
+/// that readies a thread above the running one. Read at the user-return
+/// boundary, which is the only place it can act, and cleared as a thread is
+/// put on the processor.
 public(package) unsafe static var NEED_RESCHED: Bool = false
 
 /// The slot of an `Exited` thread nothing names, waiting for the switch away
@@ -289,67 +328,197 @@ public static TICK_PERIOD_US: UInt = 10_000
 public(package) unsafe static var LAST_PROT_PROCESS: Int = NO_PROCESS
 
 // -----------------------------------------------------------------------------
-// The ready queue
+// The ready lists
 // -----------------------------------------------------------------------------
 
-public(package) func ready_push(slot: Int) unsafe {
-    THREADS[slot].link = 0
-    if READY_TAIL == 0 {
-        READY_HEAD = slot + 1
-        READY_TAIL = slot + 1
-    } else {
-        THREADS[READY_TAIL - 1].link = slot + 1
-        READY_TAIL = slot + 1
+/// Is a thread on the processor? `CURRENT_THREAD` keeps naming the thread that
+/// last ran while the kernel idles, and that thread is blocked or gone, so
+/// neither a tick taken then nor a wake made then has a running thread to act
+/// against. A tick charged anyway would raise `NEED_RESCHED` with nothing left
+/// to take the processor from.
+public(package) func a_thread_is_running() unsafe -> Bool {
+    if CURRENT_THREAD == NO_THREAD {
+        return false
+    }
+    match THREADS[CURRENT_THREAD].state {
+        case Running -> true,
+        case _ -> false,
     }
 }
 
+func level_bit(level: Int) -> UInt8 {
+    (1 << level) as UInt8
+}
+
+/// Ready `slot` at the tail of its level, and ask for a switch when that level
+/// is above the running thread's (spec §7's preemption on wake).
+///
+/// Every wake comes through here, so this is the one place the compare is
+/// made; the switch is `pick_next`'s, at the user-return boundary of the trap
+/// that made the wake. A wake at or below the running level asks for nothing,
+/// and so does `pick_next`'s requeue of the outgoing thread, which is no
+/// longer `Running` when it is pushed.
+///
+/// Nor does a wake of a thread whose process is being torn down. The
+/// teardown marks the record `Gone` before anything it does can wake a
+/// thread (its notify of the record's watchers, the claims it drops), and
+/// takes that process's threads off the ready lists before it returns, so
+/// such a thread never runs. A flag raised for it would outlive it and take
+/// the processor from the thread that ended the process, in favour of one
+/// at that thread's own level.
+public(package) func ready_push(slot: Int) unsafe {
+    let level = THREADS[slot].level as Int
+    THREADS[slot].link = 0
+    if READY_TAIL[level] == 0 {
+        READY_HEAD[level] = slot + 1
+    } else {
+        THREADS[READY_TAIL[level] - 1].link = slot + 1
+    }
+    READY_TAIL[level] = slot + 1
+    READY_BITS = READY_BITS | level_bit(level)
+    if a_thread_is_running() && not process_ending(THREADS[slot].process) {
+        let running = THREADS[CURRENT_THREAD].level
+        if THREADS[slot].level > running {
+            NEED_RESCHED = true
+        }
+    }
+}
+
+/// Whether process `p`'s teardown has begun: its record is `Gone`.
+func process_ending(p: Int) unsafe -> Bool {
+    match PROCESS_RECORDS[p].state {
+        case Gone -> true,
+        case _ -> false,
+    }
+}
+
+/// Ready `slot` at the head of its level: where a thread that a higher level
+/// took the processor from resumes, ahead of the peers it was ahead of.
+public(package) func ready_push_head(slot: Int) unsafe {
+    let level = THREADS[slot].level as Int
+    THREADS[slot].link = READY_HEAD[level]
+    READY_HEAD[level] = slot + 1
+    if READY_TAIL[level] == 0 {
+        READY_TAIL[level] = slot + 1
+    }
+    READY_BITS = READY_BITS | level_bit(level)
+}
+
+/// Whether a ready thread waits at a level above `level`.
+public(package) func ready_above(level: UInt8) unsafe -> Bool {
+    READY_BITS != 0 && HIGHEST_LEVEL[READY_BITS as Int] > level
+}
+
+/// Take the head of the highest nonempty level, or `NO_THREAD`.
 public(package) func ready_pop() unsafe -> Int {
-    if READY_HEAD == 0 {
+    if READY_BITS == 0 {
         return NO_THREAD
     }
-    let slot = READY_HEAD - 1
-    READY_HEAD = THREADS[slot].link
-    if READY_HEAD == 0 {
-        READY_TAIL = 0
+    let level = HIGHEST_LEVEL[READY_BITS as Int] as Int
+    let slot = READY_HEAD[level] - 1
+    READY_HEAD[level] = THREADS[slot].link
+    if READY_HEAD[level] == 0 {
+        READY_TAIL[level] = 0
+        READY_BITS = READY_BITS & ~level_bit(level)
     }
     THREADS[slot].link = 0
     slot
 }
 
-/// Take every thread of process `p` off the ready queue, leaving everybody
+/// Take every thread of process `p` off the ready lists, leaving everybody
 /// else's where they were.
 ///
-/// A singly-linked walk with a trailing pointer, because `link` is the one list
-/// pointer a thread has (see `ThreadSlot`): there is no back pointer to unlink
-/// through. `READY_TAIL` follows the removal rather than being recomputed; it
-/// is wrong exactly when the removed node was the last one.
+/// A singly-linked walk of each level with a trailing pointer, because `link`
+/// is the one list pointer a thread has (see `ThreadSlot`): there is no back
+/// pointer to unlink through. A level's tail follows the removal rather than
+/// being recomputed; it is wrong exactly when the removed node was the last
+/// one. A level the walk empties loses its bit.
 ///
-/// No preemption point: at most as many iterations as the thread slab is long
-/// (`MAX_THREADS` plus whatever was donated; finite), of an O(1) body. The
-/// ready queue is state the IRQ path writes (`ready_push` from a wake), so a
-/// delivery landing mid-walk would be an in-flight invariant.
+/// No preemption point: a thread is on at most one list, so the walks together
+/// visit at most as many nodes as the thread slab is long (`MAX_THREADS` plus
+/// whatever was donated; finite), each an O(1) body. The ready lists are state
+/// the IRQ path writes (`ready_push` from a wake), so a delivery landing
+/// mid-walk would be an in-flight invariant.
 public(package) func ready_remove_process(p: Int) unsafe {
-    // Slot + 1 throughout, matching the list's own encoding: 0 means "no node".
-    var prev: Int = 0
-    var cur = READY_HEAD
-    while cur != 0 {
-        let slot = cur - 1
-        let next = THREADS[slot].link
-        if THREADS[slot].process == p {
-            if prev == 0 {
-                READY_HEAD = next
+    var level: Int = 0
+    while level < SYSTEM_LEVELS {
+        // Slot + 1 throughout, matching the list's own encoding: 0 means "no
+        // node".
+        var prev: Int = 0
+        var cur = READY_HEAD[level]
+        while cur != 0 {
+            let slot = cur - 1
+            let next = THREADS[slot].link
+            if THREADS[slot].process == p {
+                if prev == 0 {
+                    READY_HEAD[level] = next
+                } else {
+                    THREADS[prev - 1].link = next
+                }
+                if READY_TAIL[level] == cur {
+                    READY_TAIL[level] = prev
+                }
+                THREADS[slot].link = 0
             } else {
-                THREADS[prev - 1].link = next
+                prev = cur
             }
-            if READY_TAIL == cur {
-                READY_TAIL = prev
-            }
-            THREADS[slot].link = 0
-        } else {
-            prev = cur
+            cur = next
         }
-        cur = next
+        if READY_HEAD[level] == 0 {
+            READY_BITS = READY_BITS & ~level_bit(level)
+        }
+        level = level + 1
     }
+}
+
+// -----------------------------------------------------------------------------
+// Band maps (spec §7)
+// -----------------------------------------------------------------------------
+//
+// A band map is one word: band `b`'s level in nibble `b`, low nibble first, in
+// `Priority`'s order. A map the kernel keeps names no level above its
+// setter's highest, which is at most `SYSTEM_LEVELS - 1`, so every level in it
+// indexes the ready lists.
+
+static_assert(SYSTEM_LEVELS == 8,
+              "a band map's nibble holds a level only while there are 8")
+static_assert(BANDS == 8, "a band map is one 32-bit word, a nibble a band")
+
+/// Bits per band in a map.
+static BAND_BITS: Int = 4
+
+/// A nibble's mask.
+static BAND_MASK: UInt32 = 0xF
+
+/// The map every process has until its launcher sets another: `Background`
+/// at level 0 and every other band at level 1.
+public(package) static SIMPLE_BAND_MAP: UInt32 = 0x1111_1110
+
+/// The level `map` gives `band`.
+public(package) func band_level(map: UInt32, band: Int) -> UInt8 {
+    ((map >> ((band * BAND_BITS) as UInt32)) & BAND_MASK) as UInt8
+}
+
+/// `map` with `band` at `level`.
+public(package) func with_band_level(map: UInt32, band: Int,
+                                     level: UInt8) -> UInt32 {
+    let shift = (band * BAND_BITS) as UInt32
+    (map & ~(BAND_MASK << shift)) | ((level as UInt32) << shift)
+}
+
+/// The highest level `map` gives any band: the most a process holding it may
+/// grant.
+public(package) func band_map_highest(map: UInt32) -> UInt8 {
+    var highest: UInt8 = 0
+    var band: Int = 0
+    while band < BANDS {
+        let level = band_level(map, band)
+        if level > highest {
+            highest = level
+        }
+        band = band + 1
+    }
+    highest
 }
 
 // -----------------------------------------------------------------------------
@@ -376,9 +545,10 @@ public(package) func alloc_thread() unsafe -> Int {
 /// Give thread slot `t` back to the pool. The caller has established that
 /// nothing runs in it and nothing names it.
 public(package) func free_thread_slot(t: Int) unsafe {
-    THREADS[t] = ThreadSlot(state: ThreadState.Free, process: 0, exit_code: 0,
-                            joiners: 0, link: 0, wait_buf: 0, call_pipe: 0,
-                            call_claim: 0, call_src: 0, call_len: 0, refs: 0)
+    THREADS[t] = ThreadSlot(state: ThreadState.Free, level: 0, process: 0,
+                            exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
+                            call_pipe: 0, call_claim: 0, call_src: 0,
+                            call_len: 0, refs: 0)
 }
 
 /// How many of a process's threads have not exited.

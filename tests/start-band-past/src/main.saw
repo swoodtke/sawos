@@ -1,0 +1,47 @@
+// `ThreadOp.Start` with a band past the last is a `BadArg` fault (spec §7),
+// decided after the right and before the thread's state. The thread started
+// is root's own main thread, which is running, so a kernel that asked the
+// state first would answer `BadState` instead.
+//
+//   SOS startband: starting this thread at band 8
+//   SOS: process fault: argument outside its domain
+//
+// It is asked through the C floor: the typed method takes a `Priority`, so a
+// band past `Rt3` cannot be written there.
+
+import sos.{System, ALL_RIGHTS, sos_system_process_self,
+            sos_process_thread_self, sos_thread_start_band}
+
+static EXIT_FAILED: UInt = 1
+
+static STATUS_OK: UInt = 0
+
+/// One past `Priority.Rt3`.
+static PAST_LAST: UInt = 8
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    probe(&system, boot_handle)
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// Start this thread at `PAST_LAST`. The start does not return.
+func probe(system: &System, boot_handle: UInt) unsafe {
+    var me: UInt = 0
+    let made = sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                                       (&var me) as UnsafePointer<UInt>)
+    if made != STATUS_OK {
+        let _ = system.debug_print("SOS startband: no process handle\n")
+        return
+    }
+    var thread: UInt = 0
+    let own = sos_process_thread_self(me, (&var thread) as UnsafePointer<UInt>)
+    if own != STATUS_OK {
+        let _ = system.debug_print("SOS startband: no thread handle\n")
+        return
+    }
+    print("SOS startband: starting this thread at band {}\n", PAST_LAST)
+    let answer = sos_thread_start_band(thread, PAST_LAST)
+    print("SOS startband: UNREACHABLE status={}\n", answer)
+}

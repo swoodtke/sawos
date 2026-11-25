@@ -1,0 +1,98 @@
+// The tick against the scheduler's levels (spec §7). Root's manifest puts
+// `Low` at level 1 and `Normal` at 2, and this image's kernel arms the tick.
+//
+//   same level  two threads at root's own level each print and then spin until
+//               the other has printed, with no call that gives the processor
+//               up: only a slice's end that requeues the outgoing thread at
+//               its level's tail lets the other run, so both finishing says
+//               the tick round-robins within a level
+//   not down    a thread at `Low` is ready while the main thread spins until
+//               its process's `interrupts` column has risen, which is a tick
+//               ending its slice; the `Low` thread still does not run until
+//               the main thread parks: S, then L
+//
+// Neither round asserts how many ticks it took.
+
+import sos.{Thread, Priority, SosStatus}
+import sosmain
+
+/// Two threads' stacks. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_A: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_B: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func stack_bytes() -> UInt {
+    (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func top_a() unsafe -> UInt {
+    ((&var STACK_A) as UnsafePointer<UInt>) as UInt + stack_bytes()
+}
+
+func top_b() unsafe -> UInt {
+    ((&var STACK_B) as UnsafePointer<UInt>) as UInt + stack_bytes()
+}
+
+static PRINTED_A: Atomic<Int> = Atomic(0)
+static PRINTED_B: Atomic<Int> = Atomic(0)
+
+static WORKER_A: UInt = 1
+static WORKER_B: UInt = 2
+
+func main() -> Result<Void, SosStatus> {
+    try same_level()
+    try not_down()
+    print("SOS levelstick: done")
+    return
+}
+
+func thread(run: FuncPointer<(UInt) sync -> UInt>, arg: UInt,
+            top: UInt) -> Result<Thread, SosStatus> {
+    sosmain.context().process().thread_create(run: run, arg: arg,
+                                              stack_top: top)
+}
+
+/// `same level`.
+func same_level() -> Result<Void, SosStatus> {
+    let a = try thread(run: spins, arg: WORKER_A, top: top_a())
+    let b = try thread(run: spins, arg: WORKER_B, top: top_b())
+    try a.start(band: Priority.Normal)
+    try b.start(band: Priority.Normal)
+    let _ = try a.join()
+    let _ = try b.join()
+    print("SOS levelstick: same level: each worker saw the other print")
+    return
+}
+
+/// Print, then spin until the other worker has printed.
+func spins(worker: UInt) sync -> UInt {
+    if worker == WORKER_A {
+        print("SOS levelstick: same level: A")
+        PRINTED_A.store(1)
+        while PRINTED_B.load() == 0 { }
+    } else {
+        print("SOS levelstick: same level: B")
+        PRINTED_B.store(1)
+        while PRINTED_A.load() == 0 { }
+    }
+    0
+}
+
+/// `not down`.
+func not_down() -> Result<Void, SosStatus> {
+    let l = try thread(run: says_l, arg: 0, top: top_a())
+    try l.start(band: Priority.Low)
+    let before = try sosmain.context().process().stats()
+    var now = try sosmain.context().process().stats()
+    while now.interrupts == before.interrupts {
+        now = try sosmain.context().process().stats()
+    }
+    print("SOS levelstick: not down: S")
+    let _ = try l.join()
+    return
+}
+
+func says_l(arg: UInt) sync -> UInt {
+    print("SOS levelstick: not down: L")
+    0
+}
