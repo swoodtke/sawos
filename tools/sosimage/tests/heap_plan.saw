@@ -17,14 +17,15 @@ import sosimage.plan.{ImagePlan, PlanSlabs, Source, check_plan, plan_image, plan
 import sosimage.boardcheck.{HalFacts}
 import sosimage.product.{DEFAULT_ARENA, check_windows, process_arena}
 import sosimage.regions.{RegionKind}
+import sosimage.tool.{read_text}
 
 func join(lines: &Vector<String>) -> String {
     "{lines.join("\n")}\n"
 }
 
-// An ESP32-S3 board with a slow range without atomics, as a PSRAM range is
-// until word atomics are shown to work there, and a second fast range with
-// them.
+// An ESP32-S3 board with a slow range that states no word atomics, as a
+// board's PSRAM range does until a part has shown them there, and a second
+// fast range with them.
 func board() -> Board {
     try! Board.parse(board_text(), "hal/xtensa-esp32s3/board.toml")
 }
@@ -235,6 +236,32 @@ func main() {
     arenas()
     growth()
     windows()
+    psram_r8()
+}
+
+// The tree's `esp32s3-r8` board, whose PSRAM range states word atomics: a
+// process placed in it, and a heap's pool, are bound there. The test runs in
+// the package's directory, two below the tree's top.
+func psram_r8() {
+    let file = "../../hal/xtensa-esp32s3-r8/board.toml"
+    let r8 = try! Board.parse(try! read_text(file), file)
+    assert((r8.range("psram")!).atomics, "r8's psram states atomics")
+    var lines = image_lines()
+    lines[3] = "board = \"esp32s3-r8\""
+    lines[10] = "pools = \{ scratch = \"spare\" \}\nram = \"psram\"\nheap-ram = \{ data = \"psram\" \}"
+    let image = try! ImageFile.parse(join(&lines), "i.toml", &r8, 4)
+    let decls = loggers()
+    let bound = try! bind(&image, &r8, &decls, 4)
+    expect_text(bound.ranges.join(" "), "psram", "the logger in r8's psram")
+    var heaps = Vector<String>()
+    var h = 0
+    while h < bound.heaps.len() {
+        let one = bound.heaps.get(h)!
+        try! heaps.push("{one.process}.{one.heap.name}:{one.range}")
+        h = h + 1
+    }
+    expect_text(heaps.join(" "), "logger.default:sram logger.data:psram",
+                "the data heap's pool in r8's psram")
 }
 
 // An arm64 board, which translates: every process links at root's region's
@@ -448,8 +475,8 @@ func images() {
     var no_heap = image_lines()
     no_heap[10] = "pools = \{ scratch = \"spare\" \}\nheap-ram = \{ log = \"sram\" \}"
     bind_refusal(move no_heap, &decls, "i.toml: line 12, column 14: `log` in the `heap-ram` of the process logger is no heap of logger, whose heaps are `default`, `data`")
-    // A pool in a range without atomics: an ESP32-S3's PSRAM until word
-    // atomics are shown to work there.
+    // A pool in a range without atomics, on a board whose PSRAM states none
+    // (`psram_r8` binds one where it does).
     var in_psram = image_lines()
     in_psram[10] = "pools = \{ scratch = \"spare\" \}\nheap-ram = \{ data = \"psram\" \}"
     bind_refusal(move in_psram, &decls, "i.toml: line 9, column 1: the heap `data` of the process logger has its pool placed in psram, which does not state `atomics = true` on the board esp32s3: what a program allocates may hold atomic words, so a heap's pool lies where word atomics work")

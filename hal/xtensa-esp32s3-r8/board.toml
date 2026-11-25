@@ -49,16 +49,18 @@ atomics = true              # word atomics: `s32c1i` on DRAM (ABI.md §8)
 
 # The PSRAM, as the cache maps it once `memory_init` has brought it up
 # (`PSRAM_BASE`): every byte reached through the data cache, a miss a burst
-# on the memory-SPI bus. No `atomics` until a part has shown `s32c1i` there
-# (board stage P4, ABI.md §17).
+# on the memory-SPI bus. Word atomics: `s32c1i` on a cached PSRAM word keeps
+# every count under preemption and the cache's evictions and fills (board
+# stage P8, ABI.md §17g).
 [ram.psram]
 use = "process"
 speed = "slow"
 base = 0x3D00_0000
 len = 0x80_0000             # 8 MiB
+atomics = true
 
 # Root's region is in the SRAM (`ROOT_LOAD_BASE`), so the default process
-# range is; so is the pool, which a heap needs word atomics in.
+# range is; so is the default pool, a fast range's.
 [ram.default]
 process = "sram"
 pool = "sram"
@@ -136,6 +138,14 @@ base = 0x600C_0000
 len = 0x1000
 registers.PERIP_CLK_EN0 = { offset = 0x018 }
 registers.PERIP_RST_EN0 = { offset = 0x020 }
+
+# EXTMEM: the caches' control and their access and miss counters, the page
+# below the MMU table (0x600C_5000), which it does not reach. The PSRAM
+# stress (ABI.md §17g) reads the data cache's counters through it.
+[devices.EXTMEM]
+type = "esp32s3-extmem"
+base = 0x600C_4000
+len = 0x1000
 
 # SYSTIMER target 0's source, the kernel's tick.
 [lines]

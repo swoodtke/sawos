@@ -1,0 +1,561 @@
+// Word atomics on the PSRAM, under preemption and cache pressure, on the
+// `esp32s3-r8` board (../../hal/xtensa-esp32s3/ABI.md §17g, board stage P8).
+//
+// Root takes its pool, which this case puts in the PSRAM, cuts
+// `STRESS_BYTES` from its front and maps them; and takes EXTMEM, whose data
+// cache counters it clears first and reads last. The cut holds the counters
+// in its first page and the walk, `WALK_BYTES` of other lines, after it:
+//
+//   psram line 0-3     one word each on a line of its own, `LINE_SPAN` apart
+//   psram shared 0-3   four words on one line
+//   plain psram        a word on a line of its own, the control
+//   cold psram         a word on a line of its own, the cold swaps'
+//
+// and two counters on lines of their own in the process's SRAM.
+//
+// First the cold swaps, from the initial thread alone: `COLD_ROUNDS` times
+// the word is loaded (and, every other round, stored back, so its line is
+// dirty), a walk evicts its line, and one `s32c1i` swaps the loaded value
+// for one more, on a line the cache no longer holds: a dirty line written
+// back and a clean one dropped, by turns. Then `WORKERS` threads each run
+// `ROUNDS` rounds: a burst of `BURST` passes, each one compare-and-swap
+// increment of every atomic counter (`sos_stress_cas`, which counts its
+// retries) and one plain increment of the control, with no call into the
+// kernel; a walk, a write walk and a read walk by turns, which evicts the
+// counters' lines, so the next burst's first loads fill them again; and a
+// barrier, which waits by yielding until every worker has ended the round,
+// so the workers' bursts run beside each other. A tick that lands between a
+// thread's load and its store lets the other threads move the word in
+// between, and a walk of theirs may evict its line there: the `s32c1i` then
+// misses and retries, and the plain store loses their increments.
+//
+//   SOS stress: 4 threads x 4096 increments of 11 counters, spin 8
+//   SOS stress: 128 KiB walked between bursts
+//   SOS stress: the verdict refused 4 of 4 faults; clean tally: pass
+//   SOS stress: cold s32c1i on an evicted line: 16 of 16, the word 16
+//   SOS stress: psram line 0 at 0x3d040000: 16384 of 16384
+//   ... each atomic counter
+//   SOS stress: plain psram at 0x3d040200: <v> of 16384, <v> lost
+//   SOS stress: thread 0 retried psram=<v> sram=<v>   ... each thread
+//   SOS stress: retries psram=<v> sram=<v>
+//   SOS stress: data cache: <v> accesses, <v> PSRAM misses
+//   SOS stress: every atomic count exact, <v> plain lost: pass
+//
+// The verdict (`verdict`) passes only if every atomic counter holds
+// `WORKERS` times the increments each thread made, every cold swap answered
+// the loaded word, the cold word counts them, and the plain counter lost
+// counts. A plain counter that lost nothing means no tick reached the window
+// between a load and its store, so the run raced nothing: it says so and
+// fails. Before the run the verdict is held to a tally with each fault in
+// turn, and to a clean one (`check_verdict`). The counts are exact on every
+// run; how many retries and losses there are, and the cache's counts, are
+// the part's record (the cache's read 0 on the emulator).
+
+import sos.{System, Process, Pool, IoMemory, Thread, AllocateFrom, MapAccess,
+            SosStatus}
+
+extern "C" {
+    func sos_stress_cas(addr: UInt, spin: UInt, bound: UInt) -> UInt
+    func sos_stress_plain(addr: UInt, spin: UInt)
+    func sos_stress_swap(addr: UInt, expected: UInt, v: UInt) -> UInt
+}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+static WORKERS: UInt = 4
+static ROUNDS: UInt = 8
+static BURST: UInt = 512
+
+/// The spin between a load and its store (`stress.c`), at least one pass:
+/// it makes the window a large share of a pass's instructions, so many of
+/// the ticks that land in a burst land in one.
+static SPIN: UInt = 8
+
+/// Retries after which one increment gives up, unmade. On one core a retry
+/// needs a tick inside the window, so a run of this many is no race: it is
+/// an `s32c1i` that never swaps, and the counter it leaves short fails the
+/// verdict where the loop would otherwise never end.
+static RETRY_BOUND: UInt = 1000
+
+static COLD_ROUNDS: UInt = 16
+
+/// The cut: the counters' page, then the walk.
+static PAGE: UInt = 0x1000
+static WALK_BYTES: UInt = 0x2_0000
+static STRESS_BYTES: UInt = PAGE + WALK_BYTES
+
+/// The walk touches one word in each `WALK_STRIDE` bytes, the part's data
+/// cache line, and spans four times that cache's 32 KiB and twice the
+/// largest it can be set to (ABI.md §15c, §17c).
+static WALK_STRIDE: UInt = 16
+
+/// Where each PSRAM counter is, from the cut's base.
+static LINE_COUNTERS: UInt = 4
+static LINE_SPAN: UInt = 0x40
+static SHARED_AT: UInt = 0x100
+static SHARED_COUNTERS: UInt = 4
+static PLAIN_AT: UInt = 0x200
+static COLD_AT: UInt = 0x300
+static WORD: UInt = 4
+
+/// The SRAM counters: words 0 and 8 of `SRAM_WORDS`, 32 bytes apart.
+static SRAM_COUNTERS: UInt = 2
+static SRAM_STEP: UInt = 8
+
+static ATOMIC_COUNTERS: UInt = LINE_COUNTERS + SHARED_COUNTERS + SRAM_COUNTERS
+
+/// What each atomic counter ends at.
+static WANT: UInt = WORKERS * ROUNDS * BURST
+
+/// The faults `check_verdict` holds the verdict to.
+static FAULTS: UInt = 4
+
+/// EXTMEM's data cache counters, from its window's base (IDF
+/// extmem_reg.h): EXTMEM_CACHE_ACS_CNT_CLR_REG, whose DCACHE_ACS_CNT_CLR
+/// [0] clears them; EXTMEM_DBUS_ACS_SPIRAM_MISS_CNT_REG, each a PSRAM line
+/// filled, which evicts one once the cache is full; EXTMEM_DBUS_ACS_CNT_REG.
+static ACS_CNT_CLR: UInt = 0xC4
+static DCACHE_ACS_CNT_CLR: UInt32 = 1
+static SPIRAM_MISS_CNT: UInt = 0xD4
+static DBUS_ACS_CNT: UInt = 0xD8
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The boot handle, parked for the workers, and the witness that says which
+/// thread `_start` is running as, as in `frame-hold`.
+unsafe static var BOOT_HANDLE: UInt = 0
+
+/// The cut's base, set before any worker starts.
+unsafe static var BASE: UInt = 0
+
+unsafe static var SRAM_WORDS: [UInt32; 16] = [0; 16]
+
+/// Each worker's retries and whether an increment gave up, each written by
+/// its own worker and read once every worker has been joined.
+unsafe static var RETRIES_PSRAM: [UInt; 4] = [0; 4]
+unsafe static var RETRIES_SRAM: [UInt; 4] = [0; 4]
+unsafe static var GAVE_UP: [UInt; 4] = [0; 4]
+
+/// How many workers have ended a round, over every round so far: the
+/// barrier's count, in SRAM, incremented by `s32c1i` as the SRAM counters
+/// are.
+unsafe static var ARRIVED: UInt32 = 0
+
+static STACK_WORDS: Int = 512
+unsafe static var STACK_0: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_1: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_2: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_3: [UInt64; STACK_WORDS] = [0; STACK_WORDS]
+
+static BYTES_PER_WORD: UInt = 8
+static STACK_ALIGN: UInt = 16
+static NO_VALUE: UInt = 0xFFFF_FFFF
+
+/// What a run's verdict reads.
+struct Tally {
+    // Each atomic counter's final value.
+    counts: Vector<UInt>
+    // How many cold swaps answered the loaded word, and the cold word.
+    cold_swapped: UInt
+    cold_word: UInt
+    // How many increments the plain counter lost.
+    lost: UInt
+}
+
+extension Tally: NoCopy {}
+
+/// Why a tally fails, or "" when it passes.
+func verdict(t: &Tally) -> String {
+    var i = 0
+    while i < t.counts.len() {
+        if (t.counts.get(i) ?? NO_VALUE) != WANT {
+            return "an atomic count is wrong"
+        }
+        i += 1
+    }
+    if t.cold_swapped != COLD_ROUNDS {
+        return "a cold swap did not swap"
+    }
+    if t.cold_word != COLD_ROUNDS {
+        return "the cold word is wrong"
+    }
+    if t.lost == 0 {
+        return "no tick between a load and its store"
+    }
+    ""
+}
+
+/// A tally that passes, with the last atomic count `last`: every other
+/// count exact, every cold swap made, a loss.
+func tally_with(last: UInt) -> Tally {
+    var counts = Vector<UInt>()
+    var i: UInt = 0
+    while i < ATOMIC_COUNTERS {
+        try! counts.push(if i + 1 == ATOMIC_COUNTERS { last } else { WANT })
+        i += 1
+    }
+    Tally(counts: move counts, cold_swapped: COLD_ROUNDS,
+          cold_word: COLD_ROUNDS, lost: 1)
+}
+
+/// Does the verdict refuse `t` for `why`?
+func refuses(t: Tally, why: String) -> UInt {
+    if verdict(&t).equals(why) { 1 } else { 0 }
+}
+
+/// How many of the `FAULTS` faults the verdict refuses, each for its own
+/// reason.
+func faults_refused() -> UInt {
+    var refused = refuses(tally_with(WANT - 1), "an atomic count is wrong")
+    var missed = tally_with(WANT)
+    missed.cold_swapped = COLD_ROUNDS - 1
+    refused += refuses(move missed, "a cold swap did not swap")
+    var word = tally_with(WANT)
+    word.cold_word = COLD_ROUNDS - 1
+    refused += refuses(move word, "the cold word is wrong")
+    var raced = tally_with(WANT)
+    raced.lost = 0
+    refused += refuses(move raced, "no tick between a load and its store")
+    refused
+}
+
+func stack_top(base: UInt) -> UInt {
+    let top = base + (STACK_WORDS as UInt) * BYTES_PER_WORD
+    top - (top % STACK_ALIGN)
+}
+
+func worker_stack(index: UInt) unsafe -> UInt {
+    let base = if index == 0 {
+        ((&var STACK_0) as UnsafePointer<UInt64>) as UInt
+    } else if index == 1 {
+        ((&var STACK_1) as UnsafePointer<UInt64>) as UInt
+    } else if index == 2 {
+        ((&var STACK_2) as UnsafePointer<UInt64>) as UInt
+    } else {
+        ((&var STACK_3) as UnsafePointer<UInt64>) as UInt
+    }
+    stack_top(base)
+}
+
+func park_boot_handle(word: UInt) unsafe {
+    BOOT_HANDLE = word
+}
+
+func parked_boot_handle() unsafe -> UInt {
+    BOOT_HANDLE
+}
+
+func set_base(base: UInt) unsafe {
+    BASE = base
+}
+
+func cut_base() unsafe -> UInt {
+    BASE
+}
+
+func sram_counter(index: UInt) unsafe -> UInt {
+    let words = ((&var SRAM_WORDS) as UnsafePointer<UInt32>) as UInt
+    words + index * SRAM_STEP * WORD
+}
+
+func line_counter(index: UInt) unsafe -> UInt {
+    cut_base() + index * LINE_SPAN
+}
+
+func shared_counter(index: UInt) unsafe -> UInt {
+    cut_base() + SHARED_AT + index * WORD
+}
+
+func load(addr: UInt) unsafe -> UInt {
+    UnsafeMemory<UInt32, Device>(addr).read() as UInt
+}
+
+func store(addr: UInt, v: UInt) unsafe {
+    UnsafeMemory<UInt32, Device>(addr).write(v as UInt32)
+}
+
+/// Load one word in each `WALK_STRIDE` bytes of the walk; answer their sum,
+/// so no load is left out.
+func read_walk() unsafe -> UInt {
+    let walk = cut_base() + PAGE
+    var sum: UInt = 0
+    var at: UInt = 0
+    while at < WALK_BYTES {
+        sum = sum &+ load(walk + at)
+        at += WALK_STRIDE
+    }
+    sum
+}
+
+/// Store one word in each `WALK_STRIDE` bytes of the walk.
+func write_walk() unsafe {
+    let walk = cut_base() + PAGE
+    var at: UInt = 0
+    while at < WALK_BYTES {
+        store(walk + at, at)
+        at += WALK_STRIDE
+    }
+}
+
+/// One burst: `BURST` passes over every counter. Answers false when an
+/// increment gave up, which ends the burst.
+func burst(index: UInt) unsafe -> Bool {
+    var pass: UInt = 0
+    while pass < BURST {
+        var c: UInt = 0
+        while c < LINE_COUNTERS + SHARED_COUNTERS {
+            let addr = if c < LINE_COUNTERS { line_counter(c) } else {
+                shared_counter(c - LINE_COUNTERS)
+            }
+            let took = sos_stress_cas(addr, SPIN, RETRY_BOUND)
+            if took == RETRY_BOUND {
+                return false
+            }
+            RETRIES_PSRAM[index as Int] += took
+            c += 1
+        }
+        c = 0
+        while c < SRAM_COUNTERS {
+            let took = sos_stress_cas(sram_counter(c), SPIN, RETRY_BOUND)
+            if took == RETRY_BOUND {
+                return false
+            }
+            RETRIES_SRAM[index as Int] += took
+            c += 1
+        }
+        sos_stress_plain(cut_base() + PLAIN_AT, SPIN)
+        pass += 1
+    }
+    true
+}
+
+/// Wait until every worker has ended round `round`: arrive, then yield
+/// until the last has. The count is SRAM's, so the barrier works whatever
+/// the PSRAM does. A yield the kernel refuses is a panic: on a kernel with
+/// no tick the wait could never end.
+func barrier(me: &Thread, round: UInt) unsafe {
+    let arrived = ((&var ARRIVED) as UnsafePointer<UInt32>) as UInt
+    let _ = sos_stress_cas(arrived, 1, NO_VALUE)
+    while load(arrived) < WORKERS * (round + 1) {
+        try me.yield_now() catch {
+            panic("SOS stress: a yield was refused: {}", error)
+        }
+    }
+}
+
+/// A worker's rounds: a burst, a walk, a write walk and a read walk by
+/// turns, and the barrier, so every worker's burst runs beside the others'.
+/// A worker whose increment gave up makes no more bursts, and still walks
+/// and meets every barrier.
+func rounds(index: UInt, me: &Thread) unsafe {
+    var round: UInt = 0
+    while round < ROUNDS {
+        if GAVE_UP[index as Int] == 0 && not burst(index) {
+            GAVE_UP[index as Int] = 1
+        }
+        if round % 2 == 0 {
+            write_walk()
+        } else {
+            let _ = read_walk()
+        }
+        barrier(&me, round)
+        round += 1
+    }
+}
+
+func worker(index: UInt) unsafe {
+    let system = System(boot_handle: parked_boot_handle())
+    let proc = try system.process_self() catch { return }
+    let me = try proc.thread_self() catch { return }
+    rounds(index, &me)
+    let _ = (move me).exit(0)
+}
+
+/// `v` as eight hex digits after `0x`.
+func hex(v: UInt) -> String {
+    let digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b",
+                  "c", "d", "e", "f"]
+    var out = "0x"
+    var left: UInt = 8
+    while left > 0 {
+        left -= 1
+        let digit = digits[((v >> (left * 4)) & 0xF) as Int]
+        out = "{out}{digit}"
+    }
+    out
+}
+
+/// Print the atomic counter `name` `index`, and push its value to `counts`.
+func report(counts: &var Vector<UInt>, name: String, index: UInt,
+            addr: UInt) unsafe {
+    let got = load(addr)
+    print("SOS stress: {} {} at {}: {} of {}", name, index, hex(addr), got,
+          WANT)
+    try! counts.push(got)
+}
+
+/// The cold swaps; answer how many swapped, and print them with the word.
+func cold() unsafe -> UInt {
+    let word = cut_base() + COLD_AT
+    store(word, 0)
+    var swapped: UInt = 0
+    var k: UInt = 0
+    while k < COLD_ROUNDS {
+        let v = load(word)
+        if k % 2 == 0 {
+            store(word, v)
+            let _ = read_walk()
+        } else {
+            write_walk()
+        }
+        if sos_stress_swap(word, v, v + 1) == v {
+            swapped += 1
+        }
+        k += 1
+    }
+    print("SOS stress: cold s32c1i on an evicted line: {} of {}, the word {}",
+          swapped, COLD_ROUNDS, load(word))
+    swapped
+}
+
+func run(system: &System, proc: &Process) unsafe -> Result<Bool, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    var extmem_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    guard let extmem = extmem_rec.take_iomemory() else { return BUG }
+    let cut = try pool.allocate(len: STRESS_BYTES, from: AllocateFrom.Front)
+    let view = try proc.map(memory: &cut, access: RW)
+    let window = try proc.map(iomemory: &extmem)
+    let cache = try window.base()
+    set_base(try view.base())
+
+    var c: UInt = 0
+    while c < LINE_COUNTERS {
+        store(line_counter(c), 0)
+        store(shared_counter(c), 0)
+        c += 1
+    }
+    store(cut_base() + PLAIN_AT, 0)
+    UnsafeMemory<UInt32, Device>(cache + ACS_CNT_CLR).write(DCACHE_ACS_CNT_CLR)
+
+    print("SOS stress: {} threads x {} increments of {} counters, spin {}",
+          WORKERS, ROUNDS * BURST, ATOMIC_COUNTERS + 1, SPIN)
+    print("SOS stress: {} KiB walked between bursts", WALK_BYTES / 1024)
+    let refused = faults_refused()
+    let clean = tally_with(WANT)
+    let clean_passes = verdict(&clean).is_empty()
+    print("SOS stress: the verdict refused {} of {} faults; clean tally: {}",
+          refused, FAULTS, if clean_passes { "pass" } else { "fail" })
+    let cold_swapped = cold()
+    let cold_word = load(cut_base() + COLD_AT)
+
+    var threads = Vector<Thread>()
+    var w: UInt = 0
+    while w < WORKERS {
+        let t = try proc.thread_create(stack_top: worker_stack(w), arg: w)
+        try threads.push(move t) catch { return SosStatus.NoResource }
+        w += 1
+    }
+    w = 0
+    while w < WORKERS {
+        try threads[w as Int].start()
+        w += 1
+    }
+    var ended = true
+    w = 0
+    while w < WORKERS {
+        let code: UInt = try threads[w as Int].join() catch { NO_VALUE }
+        if code != 0 {
+            print("SOS stress: thread {} ended {}", w, code)
+            ended = false
+        }
+        w += 1
+    }
+
+    var counts = Vector<UInt>()
+    c = 0
+    while c < LINE_COUNTERS {
+        report(&var counts, "psram line", c, line_counter(c))
+        c += 1
+    }
+    c = 0
+    while c < SHARED_COUNTERS {
+        report(&var counts, "psram shared", c, shared_counter(c))
+        c += 1
+    }
+    c = 0
+    while c < SRAM_COUNTERS {
+        report(&var counts, "sram", c, sram_counter(c))
+        c += 1
+    }
+    let plain = load(cut_base() + PLAIN_AT)
+    let lost = if plain < WANT { WANT - plain } else { 0 }
+    print("SOS stress: plain psram at {}: {} of {}, {} lost",
+          hex(cut_base() + PLAIN_AT), plain, WANT, lost)
+
+    var psram_retries: UInt = 0
+    var sram_retries: UInt = 0
+    w = 0
+    while w < WORKERS {
+        print("SOS stress: thread {} retried psram={} sram={}", w,
+              RETRIES_PSRAM[w as Int], RETRIES_SRAM[w as Int])
+        if GAVE_UP[w as Int] != 0 {
+            print("SOS stress: thread {} gave up an increment after {} tries",
+                  w, RETRY_BOUND)
+        }
+        psram_retries += RETRIES_PSRAM[w as Int]
+        sram_retries += RETRIES_SRAM[w as Int]
+        w += 1
+    }
+    print("SOS stress: retries psram={} sram={}", psram_retries, sram_retries)
+    print("SOS stress: data cache: {} accesses, {} PSRAM misses",
+          UnsafeMemory<UInt32, Device>(cache + DBUS_ACS_CNT).read(),
+          UnsafeMemory<UInt32, Device>(cache + SPIRAM_MISS_CNT).read())
+
+    if refused != FAULTS || not clean_passes {
+        print("SOS stress: the verdict cannot be trusted: fail")
+        return false
+    }
+    if not ended {
+        print("SOS stress: a thread did not end: fail")
+        return false
+    }
+    let tally = Tally(counts: move counts, cold_swapped: cold_swapped,
+                      cold_word: cold_word, lost: lost)
+    let why = verdict(&tally)
+    if not why.is_empty() {
+        print("SOS stress: {}: fail", why)
+        return false
+    }
+    print("SOS stress: every atomic count exact, {} plain lost: pass", lost)
+    return true
+}
+
+func initial(boot_handle: UInt) {
+    park_boot_handle(boot_handle)
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS stress: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let passed = try run(&system, &proc) catch {
+        print("SOS stress: refused: {}", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.shutdown(if passed { EXIT_OK } else { EXIT_FAILED })
+}
+
+@export("_start")
+func _start(arg: UInt) {
+    if parked_boot_handle() == 0 {
+        initial(arg)
+    } else {
+        worker(arg)
+    }
+}

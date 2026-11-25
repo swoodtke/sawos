@@ -1864,13 +1864,19 @@ a board" is the order to find out in.
   PSRAM "hardware ... does not support this operation" (the FreeRTOS port's
   `uxPortCompareSetExtram`, ESP-IDF v3.0), and was carried into the
   architecture-wide code every Xtensa target with PSRAM takes; the ESP32-S3
-  errata name no fault of atomics or of `s32c1i`. *Prepared for:* the
-  `esp32s3-r8` board's PSRAM range states no word atomics, so the image
-  builder places neither a process nor a heap's pool there (§17e). *On
-  silicon (rev v0.2, ROM `esp32s3-20210327`):* P4's `s32c1i` at
-  0x3d000010, under ATOMCTL 0x15, answered the old word 5 and left 7, on
-  the one core the kernel runs. *Unprobed on silicon:* `s32c1i` racing a
-  line's eviction or fill, and any second core.
+  errata name no fault of atomics or of `s32c1i`. *Prepared for:* stage
+  P8 (§17g) races `s32c1i` increments on PSRAM words from four threads
+  under a 1 ms tick, with the data cache made to evict and refill their
+  lines between bursts and swaps made on evicted lines, beside a plain
+  increment that must lose counts; the `esp32s3-r8` board's PSRAM range
+  states word atomics on its result, so the image builder may place a
+  process or a heap's pool there (§17e). *On silicon (rev v0.2, ROM
+  `esp32s3-20210327`):* P4's `s32c1i` at 0x3d000010, under ATOMCTL 0x15,
+  answered the old word 5 and left 7, on the one core the kernel runs; P8
+  at `pll80` and `pll240` kept every count exact while the plain control
+  lost 1296 and 1535 of 16384, with about 196,800 PSRAM misses at each
+  (§17g's table). *Unprobed on silicon:* any second core, and a bus master
+  other than the core (DMA) writing a word a `s32c1i` reads.
 
 ---
 
@@ -4228,6 +4234,14 @@ psram_boot_no_efuse         r8       the shipping kernel stopped at
                                      `memory_init` (0x51) before root
 <gate case>_r8              r8       every process case of the S3's again,
                                      the success line first (§17e)
+psram_stress                r8       P8: `s32c1i` increments on PSRAM words
+                                     from four threads under the tick, on
+                                     the instruction-counted clock: every
+                                     count exact, the plain control short
+                                     (§17g)
+psram_stress_no_tick        r8       the same image with no tick: every
+                                     count exact, the control loses
+                                     nothing, and the run fails for it
 clock_registers_clean       -        `check_clock_registers` passes the tree
 clock_registers_<slip>      -        it refuses a store in `mspi.c`, in this
                                      HAL and in the facade, and `memory_init`
@@ -4238,7 +4252,7 @@ clock_registers_<slip>      -        it refuses a store in `mspi.c`, in this
 What the emulator cannot show: S11's words taking effect, any fill or
 write-back, the cost of a miss, `s32c1i` on cached external memory (it
 allows it, as it does at DRAM), and the instruction cache filling from the
-chip; stages P3 to P5 are the part's.
+chip; stages P3 to P5 and P8 are the part's.
 
 ### 17e. The PSRAM as process RAM
 
@@ -4251,28 +4265,29 @@ flash instruction window. Before `memory_init` has published it, and on the
 `esp32s3` board always, the PSRAM is none of these (`process_ram`,
 `psram_ranges`).
 
-The board's `[ram.psram]` range is `slow` and states no word atomics, so
-the image builder places neither a process nor a heap's pool in it: a
-process's region holds the runtime's own atomic words, its locks, its heap
-table and its start-up flag, and a heap's pool may hold a program's. P4
-shows `s32c1i` swapping a cached PSRAM word on the part, and whether the
-range states them is the owner's call. The PSRAM's pads, 33 to 37, are
-refused to every driver's configuration on every board, as the flash bus's
-are (`drivers/esp32s3io`'s `check_pin`): on a part with octal PSRAM in its
-package they are wired to the RAM chip. Root's region is in SRAM
-(`ROOT_LOAD_BASE`), so the default process range is, and so is the default
-pool. In the smoke the Blade-built processes
-are placed in SRAM as on the `esp32s3` board, and the two boards share their
-images; a hand-assembled child's destination (`asm_child_region_base`
-0x3D00_0000) and the pool (`pool_base` 0x3D04_0000) are PSRAM, so
-`image_held_r8` runs a child whose stack the kernel grants in PSRAM, and the
-pool and heap cases cut PSRAM. Two are left out, `pool_back` and
-`pool_odd_len`, whose package carries the `esp32s3` board's pool base
-(`tests/poolbase_xtensa.c`) and checks the pool's place against it, since
-both boards share their images; so is every case built from a hand-written
-image, which names its board, and every case whose build is refused. The
-smoke prints the list. A case that boots
-a harness kernel of its own runs with the PSRAM not brought up.
+The board's `[ram.psram]` range is `slow` and states word atomics, on
+stage P8's result (§17g). A process's region holds the runtime's own atomic
+words, its locks, its heap table and its start-up flag, and a heap's pool
+may hold a program's, so the image builder places a process or a heap's
+pool only in a range where word atomics work, and on this board the PSRAM
+is one; being slow, it takes no process or heap that declares
+`ram = "fast"`. The PSRAM's pads, 33 to 37, are refused to every driver's
+configuration on every board, as the flash bus's are (`drivers/esp32s3io`'s
+`check_pin`): on a part with octal PSRAM in its package they are wired to
+the RAM chip. Root's region is in SRAM (`ROOT_LOAD_BASE`), so the default
+process range is, and so is the default pool. In the smoke the Blade-built
+processes are placed in SRAM as on the `esp32s3` board, and the two boards
+share their images; a hand-assembled child's destination
+(`asm_child_region_base` 0x3D00_0000) and the pool (`pool_base`
+0x3D04_0000) are PSRAM, so `image_held_r8` runs a child whose stack the
+kernel grants in PSRAM, and the pool and heap cases cut PSRAM. Two are left
+out, `pool_back` and `pool_odd_len`, whose package carries the `esp32s3`
+board's pool base (`tests/poolbase_xtensa.c`) and checks the pool's place
+against it, since both boards share their images; so is every case built
+from a hand-written image, which names its board, and every case whose
+build is refused. The smoke prints the list. A case that boots a harness
+kernel of its own runs with the PSRAM not brought up, unless the harness
+calls `memory_init`, as `psram_stress`'s does.
 
 ### 17f. The board stages
 
@@ -4326,6 +4341,9 @@ and the board's PSRAM range keeps stating none.
 lists, each `<v> ticks, <v> accesses, <v> misses`; the record keeps every
 number.
 
+**P8, `psram_stress`.** The word atomics under stress; §17g has its text
+and how to read it. Its board images are built at `pll80` and `pll240`.
+
 **P7, `psram_wrong_size`.**
 
 ```
@@ -4337,3 +4355,120 @@ SOS-S3: halt fail code=0x00000051
 
 Then the `esp32s3` board's `root_server_boot` runs as README's stage 5: a
 stop leaves nothing behind.
+
+### 17g. Word atomics on the PSRAM: board stage P8
+
+`s32c1i` is the core's one word atomic, and the compiler's word atomics are
+inline `s32c1i` (§8): a process's runtime keeps its locks, its heap table
+and its start-up flag with them, and a program's own atomics are the same
+instruction. On the part the PSRAM is external memory behind the data cache,
+where ESP-IDF never uses `s32c1i` (§11), and P4 showed one swap there. P8 is
+the stress the board's `[ram.psram]` `atomics = true` rests on: increments
+raced by threads that the tick preempts between their load and their
+`s32c1i`, on words whose lines the cache evicts and fills around them.
+
+The case is `psram_stress`. Its kernel, `tests/xtensa/psram_stress.saw`, is
+the shipping kernel's boot with `memory_init`, and a 1 ms tick unless the
+image's boot flags ask for none. Root, `tests/psram-stress`, is given a pool
+row of PSRAM at 0x3D04_0000, 0x2_1000 bytes, and the EXTMEM device (the
+board's `[devices.EXTMEM]`), whose data cache counters it clears first and
+reads last. It cuts the pool's bytes and maps them: the counters in the
+first page, and 128 KiB of other lines after it, the walk, four times the
+part's 32 KiB data cache and twice the largest it can be set to (§15c):
+
+```
+counter           where                          increments
+psram line 0-3    0x3d040000 + 0x40 n, a line    compare-and-swap
+                  of its own each
+psram shared 0-3  0x3d040100 + 4 n, one line     compare-and-swap
+sram 0-1          the process's SRAM, 32 bytes   compare-and-swap
+                  apart
+plain psram       0x3d040200, a line of its own  load, spin, store
+cold psram        0x3d040300, a line of its own  16 single swaps
+```
+
+The compare-and-swap (`sos_stress_cas`, `stress.c`) loads the word, spins 8
+times, writes the loaded word to SCOMPARE1 and `s32c1i`s it plus one, then
+`memw`; when the answer is not the loaded word it counts a retry and starts
+again from the load, and after 1000 in a row gives the increment up, so an
+`s32c1i` that never swaps ends in a short count rather than a hung loop.
+The plain increment is the same loop with `s32i` in place of `s32c1i` and
+no retry. The spin makes the window between the load and the store most of
+a pass's instructions, so many ticks that land in a burst land in one.
+
+1. **The cold swaps**, from root's initial thread alone, 16 times: the cold
+   word is loaded, stored back on even rounds so its line is dirty, a walk
+   evicts the line (a read walk after a store, a write walk after a load),
+   and one `s32c1i` swaps the loaded word for one more on a line the cache
+   no longer holds: a dirty line written back first, or a clean one
+   dropped, by turns.
+2. **The race**: four threads, 8 rounds each of a burst of 512 passes (one
+   compare-and-swap increment of each of the ten atomic counters and one
+   plain increment, with no call into the kernel), a walk (a write walk and
+   a read walk by turns), and a barrier in SRAM that waits by yielding until
+   all four have ended the round, so the bursts run beside each other. A
+   tick inside a window lets the other threads move the word, and a walk of
+   theirs may evict its line, before the `s32c1i`: it then misses and
+   retries, and the plain store loses their increments. Each counter ends
+   at 4 x 8 x 512 = 16384.
+
+The verdict passes only if every atomic counter holds 16384, all 16 cold
+swaps answered the loaded word, the cold word is 16, and the plain counter
+lost counts: one that lost nothing means no tick reached a window, so the
+run raced nothing and fails for it. Before the race the verdict is held to
+a tally with each of those four faults and to a clean one, and says so.
+
+On the emulator the case runs on the instruction-counted clock (`icount`),
+where the ticks land at the same instructions on every run, so the plain
+counter's losses do not depend on the host; the counts are exact on any
+clock. `psram_stress_no_tick` boots the same image with no tick: each
+thread's burst runs alone, the control loses nothing, and the run fails
+with `no tick between a load and its store`. EXTMEM's counters read 0
+here.
+
+On the part, at `pll80` and at `pll240`
+(`python3 tools/sos_runner.py --board esp32s3 --emit-flash psram_stress
+--clock KEY --out PATH`):
+
+```
+SOS stress: kernel up, tick 1000 us
+SOS-S3: psram 8 MiB at 0x3d000000, MR0=0x28 MR1=0x0d MR2=<v> MR3=<v>,
+read-back ok
+SOS: root image ok segments=0x00000003 entry=<v> prio=0x01010100
+SOS: boot regions=0x00000002
+SOS: console handover
+SOS stress: 4 threads x 4096 increments of 11 counters, spin 8
+SOS stress: 128 KiB walked between bursts
+SOS stress: the verdict refused 4 of 4 faults; clean tally: pass
+SOS stress: cold s32c1i on an evicted line: 16 of 16, the word 16
+SOS stress: psram line 0 at 0x3d040000: 16384 of 16384
+... (each atomic counter: 16384 of 16384)
+SOS stress: plain psram at 0x3d040200: <v> of 16384, <v> lost
+SOS stress: thread 0 retried psram=<v> sram=<v>
+... (each thread)
+SOS stress: retries psram=<v> sram=<v>
+SOS stress: data cache: <v> accesses, <v> PSRAM misses
+SOS stress: every atomic count exact, <v> plain lost: pass
+SOS-S3: halt pass
+```
+
+(each wrapped line is one line; `pll80` and `pll240` print their clock lines
+before the first). The PSRAM misses are at least the cold walks' own lines,
+16 x 8192 = 131072, since each of those walks spans four times the cache;
+the four threads' walks add more. Any other ending is a fail, and the
+range states no atomics: a count other than 16384, a cold swap that missed
+or a `gave up an increment` line (an `s32c1i` that answered a word other
+than the one in memory), a kernel fault whose EPC1 is the `s32c1i` (one the
+part refuses), or a `fail` line for no loss (a run that raced nothing,
+which says nothing either way).
+
+On the part (rev v0.2) both keys passed, in one capture session:
+
+| | `pll80` | `pll240` |
+|---|---|---|
+| clock | 20.00 -> 80.00 MHz | 20.00 -> 240.02 MHz |
+| cold `s32c1i` on an evicted line | 16 of 16, the word 16 | 16 of 16, the word 16 |
+| every atomic counter | 16384 of 16384 | 16384 of 16384 |
+| plain PSRAM control | 15088, 1296 lost | 14849, 1535 lost |
+| retries, PSRAM / SRAM | 148 / 14 | 32 / 1 |
+| data cache accesses / PSRAM misses | 823768 / 196774 | 823494 / 196799 |

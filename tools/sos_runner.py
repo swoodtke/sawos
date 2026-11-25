@@ -20088,6 +20088,82 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                    or case["name"] in s3_only]
     process_cases += [on_r8(case) for case in process_cases
                       if case["name"] not in r8_left_out]
+    # Board stage P8, the PSRAM's word atomics under stress (ABI.md §17g):
+    # four threads of root race `s32c1i` increments on PSRAM words, on lines
+    # of their own and on one shared line, under a 1 ms tick
+    # (`psram_stress.saw`), with walks between bursts that make the data
+    # cache evict and refill the words' lines; beside them the same loop on
+    # SRAM words, a plain increment that must lose counts, and swaps on an
+    # evicted line. The pool row is the PSRAM the stress cuts, its
+    # `STRESS_BYTES`; EXTMEM gives root the data cache's counters. It runs on
+    # the instruction-counted clock (`icount`), so where the ticks land in the
+    # program, and so whether the plain increment loses counts, is the same
+    # on every run whatever the host does. The counts it holds are exact on
+    # any clock; the retries, the losses and the cache's counts are printed
+    # for the record, and the cache's read 0 here.
+    stress_want = 4 * 8 * 512
+
+    def stress(name, tick, plain, retries, verdict, clean_exit):
+        counters = (
+            [f"SOS stress: psram line {i} at 0x{0x3D04_0000 + i * 0x40:08x}: "
+             f"{stress_want} of {stress_want}" for i in range(4)]
+            + [f"SOS stress: psram shared {i} at "
+               f"0x{0x3D04_0100 + i * 4:08x}: {stress_want} of {stress_want}"
+               for i in range(4)]
+            # The SRAM counters' place is the linker's.
+            + [line for i in range(2)
+               for line in (f"SOS stress: sram {i} at 0x",
+                            f": {stress_want} of {stress_want}\n")])
+        return {
+            "name": name,
+            "board": "r8",
+            "src": os.path.join(s3_tests, "psram_stress.saw"),
+            "root_pkg": os.path.join(TESTS_DIR, "psram-stress"),
+            "tick": tick,
+            "pool": True,
+            "pool_bytes": 0x2_1000,
+            "devices": ["EXTMEM"],
+            "icount": True,
+            "flash_commands": flash_once,
+            "expect_out": [
+                "SOS stress: kernel up, "
+                + ("tick 1000 us" if tick else "no tick"),
+                psram_up_line,
+                "SOS: boot regions={two}",
+                "SOS stress: 4 threads x 4096 increments of 11 counters, "
+                "spin 8",
+                "SOS stress: 128 KiB walked between bursts",
+                "SOS stress: the verdict refused 4 of 4 faults; clean tally: "
+                "pass",
+                "SOS stress: cold s32c1i on an evicted line: 16 of 16, the "
+                "word 16",
+                *counters,
+                *plain,
+                *[f"SOS stress: thread {i} retried psram=" for i in range(4)],
+                retries,
+                "SOS stress: data cache: 0 accesses, 0 PSRAM misses",
+                *verdict],
+            "expect_tail": ("SOS-S3: halt pass" if clean_exit
+                            else "SOS-S3: halt fail code=0x00000001"),
+            "expect_clean_exit": clean_exit,
+        }
+    process_cases += [
+        stress("psram_stress", True,
+               ["SOS stress: plain psram at 0x3d040200: ",
+                f" of {stress_want}, "],
+               "SOS stress: retries psram=",
+               ["SOS stress: every atomic count exact, ", " plain lost: pass"],
+               True),
+        # The same image with no tick: each thread runs its burst alone, so
+        # every count is exact and the plain counter loses nothing, and the
+        # run says it raced nothing and fails.
+        stress("psram_stress_no_tick", False,
+               ["SOS stress: plain psram at 0x3d040200: "
+                f"{stress_want} of {stress_want}, 0 lost"],
+               "SOS stress: retries psram=0 sram=0",
+               ["SOS stress: no tick between a load and its store: fail"],
+               False),
+    ]
     # The shipping kernel on this board stopped at `memory_init` by a part
     # whose eFuse names no PSRAM, before root is loaded: the transcript ends
     # at the stop's halt. Its boot with the PSRAM up is `psram_boot`, the

@@ -1,0 +1,52 @@
+// The kernel for the PSRAM atomics stress on the `esp32s3-r8` board
+// (../../hal/xtensa-esp32s3/ABI.md §17g, board stage P8): the shipping
+// kernel's boot, the PSRAM brought up and published by `hal.memory_init`,
+// with a tick shorter than the shipping kernel's (`TICK_PERIOD_US` in
+// `kernel/core/threads.saw`), so many land while root's threads increment
+// their counters. Root is `tests/psram-stress`, whose threads race `s32c1i`
+// increments on PSRAM words; what it proves is its own lines.
+//
+//   SOS stress: kernel up, tick 1000 us
+//   SOS-S3: psram 8 MiB at 0x3d000000, MR0=... MR1=... MR2=... MR3=...,
+//   read-back ok
+//   ... root's lines
+//
+// The tick is armed as the shipping kernel arms its own, unless the image's
+// boot flags ask for none (`boot_tick_enabled`): then nothing preempts the
+// threads, and root's control shows it.
+//
+// A tick is a slice: each one that lands between a thread's load and its
+// `s32c1i` lets the other threads move the counter in between. The period
+// is not shorter because the kernel's own tick, taken from flash through
+// the instruction cache on the part, must stay a small share of it: a
+// period the tick's path fills leaves the threads no time at all.
+
+import kcore.{console, load_root_and_enter, boot_tick_enabled}
+import hal
+
+/// The tick period, in microseconds.
+static TICK_PERIOD_US: UInt = 1000
+
+/// `v` in decimal.
+func decimal(v: UInt) unsafe {
+    if v >= 10 {
+        decimal(v / 10)
+    }
+    hal.console_byte(((v % 10) + 48) as UInt8)
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.clock_init()
+    let period = if boot_tick_enabled() { TICK_PERIOD_US } else { 0 }
+    if period == 0 {
+        console().write_str("SOS stress: kernel up, no tick\n")
+    } else {
+        console().write_str("SOS stress: kernel up, tick ")
+        decimal(period)
+        console().write_str(" us\n")
+    }
+    hal.memory_init()
+    hal.intc_init()
+    load_root_and_enter(period)
+}

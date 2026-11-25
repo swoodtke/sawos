@@ -55,11 +55,17 @@ S3 HALs' sources to it.
 
 ## RAM
 
-Root's region, the default process range and the pool stay in SRAM: root's
-region is fixed there, and the PSRAM's range states no word atomics, which
-the runtime's own statics in every process's region and a heap's pool need,
-so the image builder places neither a process nor a heap's pool in it
-(ABI.md §17e). Once published the kernel takes the PSRAM as process RAM, so
-a launcher may still give a process a destination or a pool there, as the
-smoke's hand-assembled child and pool do; a process's code and read-only
-data are in flash, in place, as on the S3.
+Root's region, the default process range and the default pool stay in
+SRAM, since root's region is fixed there. The PSRAM's range states word
+atomics, which the runtime's own statics in every process's region and a
+heap's pool need, on board stage P8's result: `s32c1i` increments raced by
+preempted threads on PSRAM words, with the data cache evicting and filling
+their lines, kept every count (ABI.md §17g). So an image may place a
+process, or a heap's pool, in the PSRAM, unless it declares
+`ram = "fast"` (ABI.md §17e). Once published the kernel takes the PSRAM as
+process RAM, so a launcher may also give a process a destination or a pool
+there, as the smoke's hand-assembled child and pool do; a process's code and
+read-only data are in flash, in place, as on the S3.
+
+The board's `EXTMEM` device is the caches' control and counters; the
+stress gives it to its root to read the data cache's PSRAM misses.
