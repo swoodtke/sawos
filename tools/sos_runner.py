@@ -1692,7 +1692,21 @@ def _builder_only(case):
     can build: one that states `limits` or carries a hand-made `slab_block`,
     which this path's region tables cannot hold, a PSRAM harness's `psram`
     description, which this path does not write, or an image for another
-    board of the S3 smoke (`board`), which this path does not stitch."""
+    board of the S3 smoke (`board`), which this path does not stitch. A case
+    whose `limits` state the handle blocks (`handle-blocks` under `slabs`) or
+    root's table (`root-handles`) is refused by that key's name."""
+    limits = case.get("limits")
+    if isinstance(limits, dict):
+        named = []
+        if "handle-blocks" in (limits.get("slabs") or {}):
+            named.append("handle-blocks")
+        if "root-handles" in limits:
+            named.append("root-handles")
+        if named:
+            keys = " and ".join(f"`{k}`" for k in named)
+            raise ToolError(f"case {case['name']!r} states {keys} in its "
+                            "`limits`, which only the image builder builds "
+                            "(unset SOS_IMAGE_BUILDER=python)")
     for key in ("limits", "slab_block", "psram", "board"):
         if case.get(key):
             raise ToolError(f"case {case['name']!r} has `{key}`, which only "
@@ -10346,8 +10360,8 @@ TEST_CASES = [
         "arches": ["riscv32"],
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "image_file": {"riscv32": "stock_refused.toml"},
-        "expect_build_error": "the process client's `handles` row is 33, "
-                              "past MAX_HANDLES (32)",
+        "expect_build_error": "the process client's `handles` row is 129, "
+                              "past the longest handle table (128)",
         "expect_out": [],
         "expect_clean_exit": False,
     },
@@ -10434,6 +10448,45 @@ TEST_CASES = [
                        "SOS recright: carving it",
                        "root: rights ended status=131075"],
         "expect_tail": "root: rights ended status=131075",
+        "expect_clean_exit": True,
+    },
+
+    # A process whose declaration gives it a `Handle` row of 48, past the 32
+    # entries its body holds (`tests/images/stock_handles_wide.toml`). The
+    # image states no limits: the builder derives the handle block the row
+    # needs from the plan, the kernel links it, and root's `QuotaSet` for the
+    # row attaches it. The child mints until it holds 40 handles, the last
+    # eight in the block, and reads its row through the last. Without the
+    # derivation root's `QuotaSet` answers `NoResource` and root stops.
+    {
+        "name": "stock_handles_wide",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_handles_wide.toml"},
+        "expect_out": ["{banner}",
+                       "SOS: slab area kind={thirteen} slots={one}",
+                       "SOS wide: held=40 limit=48, read through the last: yes",
+                       "root: wide ended status=65536"],
+        "expect_tail": "root: wide ended status=65536",
+        "expect_clean_exit": True,
+    },
+
+    # A process that serves thirty connections (`tests/images/
+    # stock_root_wide.toml`): root holds more handles than its body's table
+    # while it makes them. The image states no root table and no blocks; the
+    # builder derives root's table (48) and the blocks, and the kernel
+    # attaches root's before its first handle. Without the derivation root's
+    # table fills at a connection and root stops.
+    {
+        "name": "stock_root_wide",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_root_wide.toml"},
+        "expect_out": ["{banner}",
+                       "SOS: slab area kind={thirteen} slots={two}",
+                       "SOS rootwide: up",
+                       "root: wide ended status=65536"],
+        "expect_tail": "root: wide ended status=65536",
         "expect_clean_exit": True,
     },
 
@@ -20848,6 +20901,20 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "SOS stockheap: the share reads back its mark: yes",
                            "SOS: process exit: code={zero} process={one}",
                            "root: heap ended status=65536"],
+            "expect_clean_exit": True,
+        },
+        {
+            # The gate's `stock_handles_wide` on this board
+            # (`tests/images/stock_handles_wide_s3.toml`): a process whose
+            # `Handle` row is 48, past the 32 its body holds, and that holds
+            # 40. The builder derives the handle block the row needs.
+            "name": "stock_handles_wide",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "stock_handles_wide_s3.toml"},
+            "expect_out": ["{banner}",
+                           "SOS: slab area kind={thirteen} slots={one}",
+                           "SOS wide: held=40 limit=48, read through the last: yes",
+                           "root: wide ended status=65536"],
             "expect_clean_exit": True,
         },
         {

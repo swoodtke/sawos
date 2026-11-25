@@ -78,10 +78,10 @@ import sosimage.hex.{hex}
 import sosimage.image.{BLOB_ALIGN, FlashOutput, ImageSpec, RowSpec}
 import sosimage.imagefile.{Bindings, ImageFile, InputSource, ProcessEntry, bind, image_board}
 import sosimage.kernel.{
-    ATTACHMENTS, EVENTS, INTERRUPTS, IOMEMORIES, KernelFacts, MAPPINGS, MEMORIES,
-    PIPES, PROCESSES, PROCESS_RECORDS, QUOTA_KINDS, THREADS, TIMERS, WAITERS,
+    ATTACHMENTS, EVENTS, HANDLE_BLOCKS, INTERRUPTS, IOMEMORIES, KernelFacts, MAPPINGS,
+    MEMORIES, PIPES, PROCESSES, PROCESS_RECORDS, QUOTA_KINDS, THREADS, TIMERS, WAITERS,
 }
-import sosimage.limits.{ImageLimits, plan_limits}
+import sosimage.limits.{ImageLimits, PlanNeeds, plan_limits}
 import sosimage.profile.{Profile}
 import sosimage.regions.{BOOT_FLAG_NO_TICK, RegionKind}
 import sosimage.tool.{read_file, read_text}
@@ -159,6 +159,7 @@ func slab_of(key: String) -> Int {
     if key.equals("pipes") { return PIPES }
     if key.equals("records") { return PROCESS_RECORDS }
     if key.equals("attachments") { return ATTACHMENTS }
+    if key.equals("handle-blocks") { return HANDLE_BLOCKS }
     MAPPINGS
 }
 
@@ -175,6 +176,10 @@ public func image_limits(stated: &Vector<LimitsSpec>, facts: &KernelFacts,
             while i < spec.totals.len() {
                 let total = spec.totals.get(i)!
                 i = i + 1
+                if total.name.equals("root-handles") {
+                    limits.root_handles = total.value
+                    continue
+                }
                 let kind = slab_of(total.name)
                 let floor = facts.floors.get(kind) ?? 0
                 if total.value < floor {
@@ -208,7 +213,7 @@ public func board_defaults(board: &Board, facts: &KernelFacts) -> Result<ImageLi
     var stated = Vector<LimitsSpec>()
     try! stated.push(board.limits.copy())
     let limits = try image_limits(&stated, &facts, what)
-    let _ = try plan_limits(&facts, &limits, what, 0, 0)
+    let _ = try plan_limits(&facts, &limits, &PlanNeeds.none(), what, 0, 0)
     return move limits
 }
 
@@ -255,6 +260,8 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
 
     let kernel = "{out}/kernel-main.o"
     var limits = ImageLimits.none()
+    var needs = PlanNeeds.none()
+    var wants_blocks = false
     var extras = Vector<Extras>()
     var root_extras = Extras.none()
     var plan_rows = Vector<RowSpec>()
@@ -279,7 +286,8 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
         }
         let defaults = quota_defaults(&limits, &kernel_facts)
         let slabs = plan_slabs(&limits, &kernel_facts)
-        try check_plan(&plan, &kernel_facts, &defaults, &slabs, path)
+        needs = try check_plan(&plan, &kernel_facts, &defaults, &slabs, path)
+        wants_blocks = needs.wants_blocks(&kernel_facts)
 
         var i = 0
         while i < count {
@@ -402,8 +410,8 @@ public func build_image(profile: &Profile, sawos: String, product: String, path:
     }
 
     var spec = described_spec(&image, kernel, out, root.image, move children, move rows,
-                              stated.len() > 0, move limits, profile.flash != None,
-                              facts.grain, board.placement)
+                              stated.len() > 0 || wants_blocks, move limits, move needs,
+                              profile.flash != None, facts.grain, board.placement)
     if for_board {
         var a = 0
         while a < profile.board_link_args.len() {
@@ -481,12 +489,13 @@ public func key_line(image: &ImageFile) -> String {
 
 /// The image description `link` reads for the image `image` describes, built
 /// into `out` from the kernel object `kernel`, root's image, the children's
-/// and the region table's `rows`, with its limits when `has_limits`, a flash
-/// image when `flash`, and each child's blob placed as a board whose grain is
-/// `grain` and whose placement is `placement` needs (`blob_align`).
+/// and the region table's `rows`, with its limits when `has_limits`, which
+/// derive from what its stock root's plan asks (`needs`), a flash image when
+/// `flash`, and each child's blob placed as a board whose grain is `grain`
+/// and whose placement is `placement` needs (`blob_align`).
 public func described_spec(image: &ImageFile, kernel: String, out: String, root_image: String,
                            children: Vector<String>, rows: Vector<RowSpec>, has_limits: Bool,
-                           limits: ImageLimits, flash: Bool, grain: UInt64,
+                           limits: ImageLimits, needs: PlanNeeds, flash: Bool, grain: UInt64,
                            placement: String) -> ImageSpec {
     var written: FlashOutput? = None
     if flash {
@@ -496,7 +505,8 @@ public func described_spec(image: &ImageFile, kernel: String, out: String, root_
               output: "{out}/{image.name}.elf", asm: "", child_asm: "",
               root_image: root_image, children: move children, has_regions: true,
               flags: if image.tick { 0 } else { BOOT_FLAG_NO_TICK }, rows: move rows,
-              has_limits: has_limits, limits: move limits, link_args: Vector<String>(),
+              has_limits: has_limits, limits: move limits, needs: move needs,
+              link_args: Vector<String>(),
               flash: written, blob_align: blob_align(grain, placement))
 }
 

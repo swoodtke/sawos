@@ -5,7 +5,7 @@
 
 import std.json.{JsonValue}
 import bootplan
-import sosimage.board.{Board}
+import sosimage.board.{Board, LimitsSpec}
 import sosimage.declaration.{Declaration}
 import sosimage.fields.{Fields}
 import sosimage.imagefile.{ImageFile, InputSource, SetupOp, bind}
@@ -19,9 +19,9 @@ import sosimage.image.{RowSpec}
 import sosimage.imagefile.{Bindings, Bound, BoundHeap, InputValue}
 import sosimage.plan.{ImagePlan, PlanRecord, PlanSlabs, Source, check_plan, plan_image,
                       plan_module, root_windows, window_rows}
-import sosimage.limits.{ImageLimits}
+import sosimage.limits.{ImageLimits, PlanNeeds, plan_limits}
 import sosimage.product.{described_spec, image_declarations, input_path, plan_slabs,
-                         process_extras, quota_defaults, slab_total, stock_region_rows}
+                         image_limits, process_extras, quota_defaults, slab_total, stock_region_rows}
 import sosimage.regions.{RegionKind}
 import sosimage.tool.{write_lines}
 
@@ -205,6 +205,12 @@ func record_is(plan: &ImagePlan, child: Int, index: Int, tag: Int, source: Sourc
 // A kernel whose root table holds `table` handles, whose budget leaves 12
 // grant rows, and whose children start with 16 handles.
 func facts(table: Int) -> KernelFacts {
+    facts_with(table, 0)
+}
+
+// The same kernel with a table of `table` and, past it, `blocks` blocks of 16
+// that a process's table may hold.
+func facts_with(table: Int, blocks: Int) -> KernelFacts {
     var zeros = Vector<Int>()
     var k = 0
     while k < 14 {
@@ -218,7 +224,7 @@ func facts(table: Int) -> KernelFacts {
         k = k + 1
     }
     KernelFacts(word: 4, capacity: 255, extents: 4, records_per_body: 4, handles: table,
-                image_rows: 4, budget: 16, domains: 16, stride: 0, inflight: 2, handle_block: 16, table_blocks: 6, boot_set: 64,
+                image_rows: 4, budget: 16, domains: 16, stride: 0, inflight: 2, handle_block: 16, table_blocks: blocks, boot_set: 64,
                 floors: zeros.copy(), defaults: move defaults, units: zeros.copy(),
                 aligns: move zeros)
 }
@@ -332,8 +338,224 @@ func main_program_plan() {
     assert(got.equals(want), "a main program's plan counts its main thread's handle")
 }
 
+// A kernel as riscv32's, whose slab floors and unit sizes `plan_limits` sizes
+// an image's areas from, with a handle table of 32 and blocks of 16.
+func full_facts() -> KernelFacts {
+    let floors: [Int; 14] = [8, 4, 4, 32, 8, 16, 8, 8, 32, 8, 4, 3, 12, 0]
+    let defaults: [Int; 9] = [4, 4, 2, 4, 4, 2, 2, 12, 2]
+    let units: [Int; 14] = [24, 20, 20, 24, 48, 56, 20, 20, 16, 556, 3480, 1276, 104, 516]
+    let aligns: [Int; 14] = [16, 16, 16, 16, 16, 16, 16, 16, 16, 512, 16, 16, 16, 16]
+    KernelFacts(word: 4, capacity: 1 << 20, extents: 4, records_per_body: 4, handles: 32,
+                image_rows: 4, budget: 8, domains: 256, stride: 512, inflight: 16,
+                handle_block: 16, table_blocks: 6, boot_set: 64, floors: ints(&floors),
+                defaults: ints(&defaults), units: ints(&units), aligns: ints(&aligns))
+}
+
+func ints(values: &[Int]) -> Vector<Int> {
+    var out = Vector<Int>()
+    var i = 0
+    while i < values.len() {
+        try! out.push(values[i])
+        i = i + 1
+    }
+    move out
+}
+
+// A radio's declaration: its System and `serves` more records, each the
+// server end of a connection, and a `Handle` row of `handles`.
+func radio_lines(serves: Int, handles: Int) -> Vector<String> {
+    var lines: Vector<String> = ["format = 1", "arena = 0x1000",
+                                 "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1"]
+    var t = 2
+    while t <= serves + 1 {
+        try! lines.push("[[boot]]")
+        try! lines.push("name = \"s{t}\"")
+        try! lines.push("kind = \"serve\"")
+        try! lines.push("protocol = \"gpioproto\"")
+        try! lines.push("tag = {t}")
+        t = t + 1
+    }
+    try! lines.push("[quota]")
+    try! lines.push("handles = {handles}")
+    move lines
+}
+
+// The useless box with a radio beside it, a process declaring 64 handles and
+// 20 records, held to a kernel as riscv32's: what the plan asks of the
+// tables, and what an image of it comes to.
+func radio_box() {
+    var decls = box_decls()
+    try! decls.push(decl(radio_lines(19, 64), "radio/process.toml"))
+    var lines = box_lines()
+    try! lines.push("[[process]]")
+    try! lines.push("name = \"radio\"")
+    try! lines.push("package = \"radio\"")
+    let plan = match planned(join(&lines), &decls, 4) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the radio box did not plan: {m}")
+    }
+    let kernel = full_facts()
+    let defaults = quota_defaults(&ImageLimits.none(), &kernel)
+    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100, memories: 100)
+    let needs = match check_plan(&plan, &kernel, &defaults, &slabs, "box.toml") {
+        case Ok(n) -> move n,
+        case Err(e) -> panic("the radio box was refused: {e.message}")
+    }
+    assert(needs.stock, "a stock root's plan")
+    assert(needs.names.len() == 5 && needs.names.get(4)!.equals("radio"), "five children")
+    assert(needs.rows.get(4)! == 64 && needs.records.get(4)! == 20, "the radio's row and records")
+    assert(needs.rows.get(0)! == 11 && needs.records.get(0)! == 5, "gpio's")
+    var memory_rows = 2 * plan.children.len()
+    var device_rows = 0
+    var r = 0
+    while r < plan.rows.len() {
+        if plan.rows.get(r)!.kind == RegionKind.Device {
+            device_rows = device_rows + 1
+        } else {
+            memory_rows = memory_rows + 1
+        }
+        r = r + 1
+    }
+    let none = ImageLimits.none()
+    let slab_plan = match plan_limits(&kernel, &none, &needs, "box.toml", memory_rows, device_rows) {
+        case Ok(p) -> move p,
+        case Err(e) -> panic("the radio box's limits were refused: {e.message}")
+    }
+    assert(slab_plan.root_blocks == 1, "root's table is 48: {needs.held} held at {needs.step}")
+    var blocks = 0
+    var a = 0
+    while a < slab_plan.areas.len() {
+        if slab_plan.areas.get(a)!.kind == 13 {
+            blocks = slab_plan.areas.get(a)!.slots
+        }
+        a = a + 1
+    }
+    assert(blocks == 3, "root's one block and the radio's two: {blocks}")
+}
+
+// What `check_plan` answers of root's most and each child's row, and its
+// bound on a child's `Handle` row, which is the longest table.
+func handle_tables() {
+    // The box peaks at 19 handles at its first create.
+    let decls = box_decls()
+    let box = match planned(join(&box_lines()), &decls, 4) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the box did not plan: {m}")
+    }
+    let f = facts_with(32, 0)
+    let d = defaults(28)
+    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100, memories: 100)
+    let needs = match check_plan(&box, &f, &d, &slabs, "box.toml") {
+        case Ok(n) -> move n,
+        case Err(e) -> panic("{e.message}")
+    }
+    assert(needs.held == 19 && needs.step.equals("create gpio"), "the peak: {needs.held} at {needs.step}")
+    assert(needs.names.len() == 4 && needs.names.get(0)!.equals("gpio"), "the children")
+    assert(needs.rows.get(0)! == 11 && needs.rows.get(1)! == 10 && needs.rows.get(2)! == 28,
+           "declared rows, else the image's default")
+    assert(needs.records.get(0)! == 5 && needs.records.get(2)! == 4 && needs.records.get(3)! == 1,
+           "each child's records")
+
+    // The peak is the first step to hold the most: a child's create holds 8,
+    // which the connection made for its server end ties and does not move.
+    let tie = needs_of_json(one_child("\{\"tag\": 2, \"source\": \"outlet\", \"from\": 0\}", 1),
+                            facts_with(32, 0))
+    assert(tie.held == 8 && tie.step.equals("create c"), "a tie: {tie.held} at {tie.step}")
+
+    // The peak at each kind of step, above every step after it.
+    let empty = needs_of_json("\{\"children\": []\}", facts_with(32, 0))
+    assert(empty.held == 6 && empty.step.equals("supervise"), "the peak at supervise: {empty.held} at {empty.step}")
+    let setup = needs_of_json("\{\"setup\": [\{\"register\": \"R\", \"row\": 0, \"offset\": 0, \"len\": 4, \"at\": 0, \"op\": \"write\", \"value\": 1\}]\}", facts_with(32, 0))
+    assert(setup.held == 7 && setup.step.equals("setup R"), "the peak at setup: {setup.held} at {setup.step}")
+    let given = needs_of_json(one_child("\{\"tag\": 2, \"source\": \"outlet\", \"from\": 0\}, \{\"tag\": 3, \"source\": \"outlet\", \"from\": 1\}, \{\"tag\": 4, \"source\": \"row\", \"from\": 0\}, \{\"tag\": 5, \"source\": \"row\", \"from\": 0\}", 2), facts_with(32, 0))
+    assert(given.held == 9 && given.step.equals("give c record 3"), "the peak at connect: {given.held} at {given.step}")
+    let inlet = needs_of_json(one_child("\{\"tag\": 2, \"source\": \"inlet\", \"from\": 0\}, \{\"tag\": 3, \"source\": \"row\", \"from\": 0\}, \{\"tag\": 4, \"source\": \"row\", \"from\": 0\}", 1), facts_with(32, 0))
+    assert(inlet.held == 9 && inlet.step.equals("give c record 2"), "the peak at inlet: {inlet.held} at {inlet.step}")
+
+    // A child's row is bound by the longest table, which blocks lengthen.
+    let quota_plan = "\{\"children\": [\{\"name\": \"q\", \"image\": 0, \"destination\": 1, \"start\": 1, \"quota\": QUOTA, \"records\": []\}]\}"
+    let at_longest = checked_with(quota_plan.replace("QUOTA", "\{\"handles\": 128\}"), facts_with(32, 6))
+    assert(at_longest.is_empty(), "the longest table: {at_longest}")
+    let past_longest = checked_with(quota_plan.replace("QUOTA", "\{\"handles\": 129\}"), facts_with(32, 6))
+    assert(past_longest.equals("p.json: the process q's `handles` row is 129, past the longest handle table (128)"),
+           "one past it: {past_longest}")
+    let past_one_block = checked_with(quota_plan.replace("QUOTA", "\{\"handles\": 49\}"), facts_with(32, 1))
+    assert(past_one_block.equals("p.json: the process q's `handles` row is 49, past the longest handle table (48)"),
+           "one block: {past_one_block}")
+
+    // Root's table is held to the longest too: with 8 children root holds 22
+    // at its first create, past a table of 5 and one block of 16.
+    var many = "\{\"children\": ["
+    var c = 0
+    while c < 8 {
+        let comma = if c > 0 { ", " } else { "" }
+        many = "{many}{comma}\{\"name\": \"c{c}\", \"image\": {c}, \"destination\": {8 + c}, \"start\": 1\}"
+        c = c + 1
+    }
+    many = "{many}]\}"
+    let long_root = checked_with(many, facts_with(5, 1))
+    assert(long_root.equals("p.json: the stock root would hold 22 handles at `create c0`, past the longest handle table (21)"),
+           "root past the longest: {long_root}")
+    assert(checked_with(many, facts_with(5, 2)).is_empty(), "a table of 37 holds it")
+}
+
+// What `check_plan` finds a test plan's JSON to need on `f`, with children
+// starting at 16 handles.
+func needs_of_json(json: String, f: KernelFacts) -> PlanNeeds {
+    let plan = match read_plan(json) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the plan did not read: {m}")
+    }
+    let d = defaults(16)
+    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100, memories: 100)
+    match check_plan(&plan, &f, &d, &slabs, "p.json") {
+        case Ok(n) -> move n,
+        case Err(e) -> panic("{e.message}")
+    }
+}
+
+// What `check_plan` says of a test plan's JSON against `f`, with children
+// starting at 16 handles; "" when it holds.
+func checked_with(json: String, f: KernelFacts) -> String {
+    let plan = match read_plan(json) {
+        case Ok(p) -> move p,
+        case Err(m) -> panic("the plan did not read: {m}")
+    }
+    let d = defaults(16)
+    let slabs = PlanSlabs(processes: 100, pipes: 100, interrupts: 100, iomemories: 100, memories: 100)
+    match check_plan(&plan, &f, &d, &slabs, "p.json") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+// An image's `[limits]` states the blocks and root's table by the names a
+// board's `[limits.default]` and a test image's JSON use, and a later table
+// over an earlier one.
+func limits_keys() {
+    let text = join(&box_lines()).replace("[root]", "[limits]\nhandle-blocks = 2\nroot-handles = 48\n[root]")
+    let b = board()
+    let image = try! ImageFile.parse(text, "box.toml", &b, 4)
+    let kernel = full_facts()
+    var stated = Vector<LimitsSpec>()
+    try! stated.push(image.limits.copy())
+    let limits = try! image_limits(&stated, &kernel, "box.toml")
+    assert(limits.root_handles == 48, "root's table")
+    assert(limits.raise.get(13)! == 2, "the handle blocks")
+    assert(limits.json().equals("\{\"slabs\": \{\"handle-blocks\": 2\}, \"quotas\": \{\}, \"root-handles\": 48\}"),
+           "as a test image's JSON: {limits.json()}")
+    let over = try! ImageFile.parse(join(&box_lines()).replace("[root]", "[limits]\nroot-handles = 64\n[root]"),
+                               "box.toml", &b, 4)
+    try! stated.push(over.limits.copy())
+    let both = try! image_limits(&stated, &kernel, "box.toml")
+    assert(both.root_handles == 64 && both.raise.get(13)! == 2, "the image's over the board's")
+}
+
 func main() {
     main_program_plan()
+    limits_keys()
+    handle_tables()
+    radio_box()
 
     // The box: rows, records, connections, setup writes, quota rows.
     let decls = box_decls()
@@ -507,7 +729,7 @@ func main() {
     // first create, and a table of 18 refuses it there.
     assert(fits(&box, 32, 28).is_empty(), "the box fits 32")
     assert(fits(&box, 19, 28).is_empty(), "the box fits 19")
-    assert(fits(&box, 18, 28).equals("box.toml: the stock root would hold 19 handles at `create gpio`, past MAX_HANDLES (18)"), "19 at the first create")
+    assert(fits(&box, 18, 28).equals("box.toml: the stock root would hold 19 handles at `create gpio`, past the longest handle table (18)"), "19 at the first create")
     // A child whose `Handle` row is short of what it holds when it starts:
     // the controller holds 5 (its four records and its Process handle).
     assert(fits(&box, 32, 4).equals("box.toml: the process controller's `Handle` row is 4, short of the 5 handles it holds when it starts"), "a short row")
@@ -516,7 +738,7 @@ func main() {
     // Each quota row's bound.
     let quota_plan = "\{\"children\": [\{\"name\": \"q\", \"image\": 0, \"destination\": 1, \"start\": 1, \"quota\": QUOTA, \"records\": []\}]\}"
     expect_checked(quota_plan.replace("QUOTA", "\{\"handles\": 33\}"), 32,
-                   "p.json: the process q's `handles` row is 33, past MAX_HANDLES (32)")
+                   "p.json: the process q's `handles` row is 33, past the longest handle table (32)")
     expect_checked(quota_plan.replace("QUOTA", "\{\"handles\": 32\}"), 32, "")
     expect_checked(quota_plan.replace("QUOTA", "\{\"mappings\": 13\}"), 32,
                    "p.json: the process q's `mappings` row is 13, past the 12 grant rows an image leaves of this board's 16")
@@ -531,18 +753,18 @@ func main() {
     // handles, and the Process handle and main thread's own Thread handle its
     // start-up derives), 6 with the Waiter.
     expect_checked("\{\"children\": []\}", 4,
-                   "p.json: the stock root would hold 5 handles at `derive`, past MAX_HANDLES (4)")
+                   "p.json: the stock root would hold 5 handles at `derive`, past the longest handle table (4)")
     expect_checked("\{\"children\": []\}", 5,
-                   "p.json: the stock root would hold 6 handles at `supervise`, past MAX_HANDLES (5)")
+                   "p.json: the stock root would hold 6 handles at `supervise`, past the longest handle table (5)")
     expect_checked("\{\"children\": []\}", 6, "")
     // A child: two rows, 7 after derive, 8 as it is created, then 6.
     expect_checked(one_child("", 0), 7,
-                   "p.json: the stock root would hold 8 handles at `create c`, past MAX_HANDLES (7)")
+                   "p.json: the stock root would hold 8 handles at `create c`, past the longest handle table (7)")
     // Two: 9, 10 at the first create, then 8; 9 at the second, then 7.
     expect_checked("\{\"children\": [\{\"name\": \"a\", \"image\": 0, \"destination\": 2, \"start\": 1\}, \{\"name\": \"b\", \"image\": 1, \"destination\": 3, \"start\": 1\}]\}", 10, "")
     // A setup write's carve and mapping: 7.
     expect_checked("\{\"setup\": [\{\"register\": \"R\", \"row\": 0, \"offset\": 0, \"len\": 4, \"at\": 0, \"op\": \"write\", \"value\": 1\}]\}", 6,
-                   "p.json: the stock root would hold 7 handles at `setup R`, past MAX_HANDLES (6)")
+                   "p.json: the stock root would hold 7 handles at `setup R`, past the longest handle table (6)")
     // A server end made (8) and given (7): with a second (9, then 8) root
     // fits 9, and the Waiter is its ninth.
     let outlets = "\{\"tag\": 2, \"source\": \"outlet\", \"from\": 0\}, \{\"tag\": 3, \"source\": \"outlet\", \"from\": 1\}"
@@ -551,12 +773,12 @@ func main() {
     expect_checked(one_child("\{\"tag\": 4, \"source\": \"row\", \"from\": 0\}, {outlets}", 2), 8, "")
     // An inlet: the connection made (8) and an inlet minted from it (9).
     expect_checked(one_child("\{\"tag\": 2, \"source\": \"inlet\", \"from\": 0\}", 1), 8,
-                   "p.json: the stock root would hold 9 handles at `give c record 2`, past MAX_HANDLES (8)")
+                   "p.json: the stock root would hold 9 handles at `give c record 2`, past the longest handle table (8)")
     // A connection is made once, whoever takes its ends.
     expect_checked(one_child("\{\"tag\": 2, \"source\": \"outlet\", \"from\": 0\}, \{\"tag\": 3, \"source\": \"inlet\", \"from\": 0\}, \{\"tag\": 4, \"source\": \"inlet\", \"from\": 0\}", 1), 8, "")
     // The second connection made: 9.
     expect_checked(one_child(outlets, 2), 8,
-                   "p.json: the stock root would hold 9 handles at `give c record 3`, past MAX_HANDLES (8)")
+                   "p.json: the stock root would hold 9 handles at `give c record 3`, past the longest handle table (8)")
 
     // A test image's plan, read: every key, and each refusal.
     let full = match read_plan("\{\"connections\": 1, \"children\": [\{\"name\": \"a\", \"image\": 2, \"destination\": 3, \"start\": 5, \"shutdown\": true, \"quota\": \{\"waiters\": 1, \"handles\": 6\}, \"records\": [\{\"tag\": 5, \"source\": \"system\"\}, \{\"tag\": 6, \"source\": \"carve\", \"from\": 4, \"offset\": 12, \"len\": 8\}]\}], \"setup\": [\{\"register\": \"D.R\", \"row\": 4, \"offset\": 16, \"len\": 4, \"at\": 0, \"op\": \"clear\", \"value\": 2\}]\}") {
@@ -796,14 +1018,14 @@ func more() {
     // The image description: on a board that runs images in place at a
     // page's grain, each blob is padded to the page; on another, not.
     let paged = described_spec(&image, "/k.o", "/out", "/root.sosimg", Vector<String>(),
-                               Vector<RowSpec>(), false, ImageLimits.none(), true, 0x1000,
+                               Vector<RowSpec>(), false, ImageLimits.none(), PlanNeeds.none(), true, 0x1000,
                                "in-place")
     assert(paged.blob_align == 0x1000, "padded")
     assert(paged.output.equals("/out/useless-box.elf"), "its ELF")
     assert(paged.flash != None, "a flash image")
     assert(paged.flags == 0, "the tick")
     let copied = described_spec(&image, "/k.o", "/out", "/root.sosimg", Vector<String>(),
-                                Vector<RowSpec>(), false, ImageLimits.none(), false, 0x1000,
+                                Vector<RowSpec>(), false, ImageLimits.none(), PlanNeeds.none(), false, 0x1000,
                                 "copied")
     assert(copied.blob_align == 16 && copied.flash == None, "not padded, no flash")
 

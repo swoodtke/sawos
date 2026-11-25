@@ -5015,9 +5015,25 @@ reserved.
   and released; a `set` or a `clear` reads the register first and changes only
   its bits), sets each child's quota rows, narrows its ceilings and gives its
   records under the launch convention below, starts every child, and
-  supervises. The builder refuses a
-  plan the stock root could not carry out: one at whose steps root's handle
-  table would overflow, or the objects root makes of a kind would pass the
+  supervises. The builder sizes the tables the plan needs, from the plan and
+  the kernel's numbers. Root's table is the most handles root holds at any
+  step, rounded up to whole handle blocks past the body's `MAX_HANDLES`
+  entries; an image's `root-handles`, rounded up the same way, may state it
+  longer and never shorter.
+  The handle blocks the image links are root's and each child's, for its
+  `Handle` row past `MAX_HANDLES`; an image's `handle-blocks` may state the
+  total larger and never smaller, and the slab block carries root's count.
+  A hand-written root has no plan to read: the image or its board's
+  `[limits.default]` states both keys, and with neither root's table is
+  `MAX_HANDLES` and the machine holds no blocks.
+  Each boot set is held to `BOOT_SET_CAPACITY`: root's, one record per row
+  of the region table, and each child's, its records, the console's inlet and
+  its heaps' pools among them. The builder refuses a
+  plan the stock root could not carry out: one at whose steps root would hold
+  more handles than the longest table, `MAX_HANDLES` + `MAX_TABLE_BLOCKS` ×
+  `HANDLE_BLOCK`, naming the step; a child whose `Handle` row is past the
+  longest table; a boot set past `BOOT_SET_CAPACITY`; or one at whose steps
+  the objects root makes of a kind would pass the
   image's slab of it: Process objects (root's and one per child), Pipe objects
   (one per connection), Interrupt objects (one per line), and IoMemory objects
   (one per device row, one per carve given, and one for each setup write's carve

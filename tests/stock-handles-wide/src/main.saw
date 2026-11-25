@@ -1,0 +1,98 @@
+//! A child of the stock-root images `tests/images/stock_handles_wide.toml`
+//! and `tests/images/stock_handles_wide_s3.toml` whose declaration gives it a
+//! `Handle` row of 48 (`process.toml`), past the 32 entries its body holds.
+//! It mints siblings of a Process handle of its own until it holds 40
+//! handles, which puts the last eight in a handle block, reads its row
+//! through the last of them and prints what it found:
+//!
+//!     SOS wide: held=40 limit=48, read through the last: yes
+//!
+//! The mints work at the C altitude and keep each word in an array, so no
+//! frame grows with the table. A mint refused before 40, or a row that is not
+//! 48, ends it with a number that could not be a count.
+
+import sos.{System, QuotaKind, ALL_RIGHTS, sos_handle_mint, sos_process_quota_get,
+            sos_system_process_self}
+
+/// What it ends with when a step went otherwise.
+static EXIT_MISMATCH: UInt = 98
+
+/// The handles it holds when the loop ends, and the row it was given.
+static WANTED: Int = 40
+static ROW: UInt16 = 48
+
+/// The status word a successful op answers with (`SosStatus.Ok`), as a
+/// number because the mints work at the C altitude.
+static STATUS_OK: UInt = 0
+
+func yes(b: Bool) -> String {
+    if b { "yes" } else { "no" }
+}
+
+/// Mint a sibling of `handle`, answering the op's status and the word.
+func mint(handle: UInt) unsafe -> (UInt, UInt) {
+    var out: UInt = 0
+    let status = sos_handle_mint(handle, ALL_RIGHTS as UInt,
+                                 (&var out) as UnsafePointer<UInt>)
+    (status, out)
+}
+
+/// A Process handle onto the caller, as a word.
+func own_process(system: UInt) unsafe -> (UInt, UInt) {
+    var out: UInt = 0
+    let status = sos_system_process_self(system, ALL_RIGHTS as UInt,
+                                         (&var out) as UnsafePointer<UInt>)
+    (status, out)
+}
+
+/// The Handle row `handle`, a Process handle, reads: its limit and its use.
+func row_of(handle: UInt) unsafe -> (UInt, UInt, UInt) {
+    var out: UInt = 0
+    let status = sos_process_quota_get(handle, QuotaKind.Handle as UInt,
+                                       (&var out) as UnsafePointer<UInt>)
+    (status, out & 0xFFFF, out >> 16)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        print("SOS wide: no process handle: {}\n", error)
+        return
+    }
+    let before = try proc.quota_get(kind: QuotaKind.Handle) catch {
+        print("SOS wide: no row: {}\n", error)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let (made, own) = own_process(boot_handle)
+    if made != STATUS_OK {
+        print("SOS wide: no word for its process: status {}\n", made)
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    var words: [UInt; 40] = [0; 40]
+    var n: Int = 0
+    var last = own
+    var held = (before.used as Int) + 1
+    while held < WANTED {
+        let (status, word) = mint(own)
+        if status != STATUS_OK {
+            print("SOS wide: refused after {} handles: status {}\n", held, status)
+            let _ = proc.exit(EXIT_MISMATCH)
+            return
+        }
+        words[n] = word
+        last = word
+        n = n + 1
+        held = held + 1
+    }
+    let (read, limit, used) = row_of(last)
+    print("SOS wide: held={} limit={}, read through the last: {}\n", used, limit,
+          yes(read == STATUS_OK))
+    if limit != (ROW as UInt) || used != (WANTED as UInt) {
+        let _ = proc.exit(EXIT_MISMATCH)
+        return
+    }
+    let _ = proc.exit(0)
+}

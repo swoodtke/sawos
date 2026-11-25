@@ -17,11 +17,19 @@
 //! leaves the rows an image spends before it runs. A default the image does
 //! not state is the compiled one.
 //!
-//! Root's handle table is `MAX_HANDLES` entries and the handle blocks the
-//! image gives it, which the slab block carries and the kernel attaches before
-//! root's first handle. An image states root's table as `root-handles`,
-//! rounded up to a whole block, at most the longest table; the
-//! `handle-blocks` total is at least root's blocks, which are taken first.
+//! Root's handle table is `MAX_HANDLES` entries and the handle blocks the image
+//! gives it, which the slab block carries and the kernel attaches before root's
+//! first handle. An image states root's table as `root-handles`, rounded up to
+//! a whole block, at most the longest table. For a stock root the builder reads
+//! the table off the plan (`PlanNeeds`): the most root holds at any step of it,
+//! rounded up to a block, which a stated `root-handles` may raise and never
+//! lower. The `handle-blocks` total is at least root's blocks, which are taken
+//! first, and each child's, for its `Handle` row past `MAX_HANDLES`. A
+//! hand-written root has no plan: the image or its board's `[limits.default]`
+//! states the table and the total, and with none root's table is `MAX_HANDLES`
+//! and the machine holds no blocks. Each boot set of a stock root's plan,
+//! root's rows and each child's records, is held to `BOOT_SET_CAPACITY`, the
+//! most a `BootSet` holds.
 //!
 //! The region table's rows are held against the image's Memory and IoMemory
 //! capacities, and against root's handle table: the kernel mints root's
@@ -163,6 +171,50 @@ extension ImageLimits {
     }
 }
 
+/// What a stock root's plan asks of the machine's handle tables and boot
+/// sets, as `check_plan` finds it: the most handles root holds at any step and
+/// the first step it holds them at, and each child's name, `Handle` row and
+/// the records its boot set is given. An image whose root is not the stock
+/// root has no plan to read, and `PlanNeeds.none()` asks nothing.
+public struct PlanNeeds {
+    stock: Bool
+    held: Int
+    step: String
+    names: Vector<String>
+    rows: Vector<Int>
+    records: Vector<Int>
+}
+
+@synthesize
+extension PlanNeeds: ExplicitCopy {}
+
+extension PlanNeeds {
+    /// The needs of an image with no plan to read.
+    public static func none() -> PlanNeeds {
+        PlanNeeds(stock: false, held: 0, step: "", names: Vector<String>(),
+                  rows: Vector<Int>(), records: Vector<Int>())
+    }
+
+    /// Whether the plan needs handle blocks beyond the body's `MAX_HANDLES`
+    /// entries, for root's table or for a child's row.
+    public func wants_blocks(&self, facts: &KernelFacts) -> Bool {
+        if not self.stock {
+            return false
+        }
+        if self.held > facts.handles {
+            return true
+        }
+        var c = 0
+        while c < self.rows.len() {
+            if (self.rows.get(c) ?? 0) > facts.handles {
+                return true
+            }
+            c = c + 1
+        }
+        false
+    }
+}
+
 /// One area the build links: the kind it raises, by how many slots, how many
 /// bytes that is, and the alignment its base needs.
 public struct SlabArea {
@@ -195,10 +247,12 @@ extension SlabPlan {
 
 /// The totals and the areas `limits` asks of the kernel `facts` describes,
 /// for an image of `name` whose region table mints `memory_rows` Memory
-/// objects and `device_rows` IoMemory objects at boot. Every refusal names
-/// the image, the number and the bound it breaks.
-public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, name: String,
-                        memory_rows: Int, device_rows: Int) -> Result<SlabPlan, BuildError> {
+/// objects and `device_rows` IoMemory objects at boot, and whose stock root's
+/// plan asks `needs`. Every refusal names the image, the number and the bound
+/// it breaks.
+public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, needs: &PlanNeeds,
+                        name: String, memory_rows: Int,
+                        device_rows: Int) -> Result<SlabPlan, BuildError> {
     var total = Vector<Int>()
     var k = 0
     while k < SLAB_KINDS {
@@ -211,18 +265,31 @@ public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, name: String,
         k = k + 1
     }
 
+    // Root's table is the body's entries, or what the plan holds at its
+    // fullest, or what the image states, whichever is longest, in whole
+    // blocks.
     let longest = facts.handles + facts.table_blocks * facts.handle_block
     if limits.root_handles > longest {
         return BuildError(message: "{name}: the image's root handle table is {limits.root_handles}, past the longest handle table ({longest})")
     }
-    var root_blocks = 0
-    if limits.root_handles > facts.handles {
-        root_blocks = ((limits.root_handles - facts.handles + facts.handle_block - 1)
-                       / facts.handle_block)
+    if needs.stock && needs.held > longest {
+        return BuildError(message: "{name}: the stock root would hold {needs.held} handles at `{needs.step}`, past the longest handle table ({longest})")
     }
-    let root_table = facts.handles + root_blocks * facts.handle_block
-    try derive(&var total, &limits, HANDLE_BLOCKS, root_blocks, name,
-               "root's handle table of {limits.root_handles} takes {root_blocks}")
+    let derived = if needs.stock { table_of(&facts, needs.held) } else { facts.handles }
+    let stated_table = table_of(&facts, limits.root_handles)
+    if limits.root_handles >= 0 && stated_table < derived {
+        return BuildError(message: "{name}: the image's root handle table is {limits.root_handles}, below {derived}: the stock root would hold {needs.held} handles at `{needs.step}`")
+    }
+    let root_table = if stated_table > derived { stated_table } else { derived }
+    let root_blocks = (root_table - facts.handles) / facts.handle_block
+    var child_blocks = 0
+    var n = 0
+    while needs.stock && n < needs.rows.len() {
+        child_blocks = child_blocks + blocks_of(&facts, needs.rows.get(n) ?? 0)
+        n = n + 1
+    }
+    try derive(&var total, &limits, HANDLE_BLOCKS, root_blocks + child_blocks, name,
+               "root's handle table of {root_table} takes {root_blocks} and the processes' Handle rows {child_blocks}")
 
     let bodies = total.get(PROCESSES) ?? 0
     try derive(&var total, &limits, PROCESS_RECORDS,
@@ -273,6 +340,21 @@ public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, name: String,
         }
         return BuildError(message: "{name}: root holds {boot_handles} handles at boot, its System, Process and Thread and one for each of the region table's {memory_rows + device_rows} rows, past {bound}")
     }
+    if needs.stock {
+        let rows = memory_rows + device_rows
+        if rows > facts.boot_set {
+            return BuildError(message: "{name}: root's boot set holds {rows} records, one for each of the region table's rows, past BOOT_SET_CAPACITY ({facts.boot_set})")
+        }
+        var c = 0
+        while c < needs.records.len() {
+            let records = needs.records.get(c) ?? 0
+            let who = needs.names.get(c) ?? ""
+            if records > facts.boot_set {
+                return BuildError(message: "{name}: the process {who}'s boot set holds {records} records, past BOOT_SET_CAPACITY ({facts.boot_set}): its declared records, the console's inlet and its heaps' pools")
+            }
+            c = c + 1
+        }
+    }
 
     var defaults = Vector<Int>()
     var q = 0
@@ -322,6 +404,20 @@ public func plan_limits(facts: &KernelFacts, limits: &ImageLimits, name: String,
     }
     return SlabPlan(block: true, areas: move areas, defaults: move defaults,
                     root_blocks: root_blocks)
+}
+
+/// The handle table that holds `count` entries: the body's, and as many
+/// whole blocks as the rest takes.
+func table_of(facts: &KernelFacts, count: Int) -> Int {
+    facts.handles + blocks_of(&facts, count) * facts.handle_block
+}
+
+/// The handle blocks a table of `count` entries takes beyond the body's.
+func blocks_of(facts: &KernelFacts, count: Int) -> Int {
+    if count <= facts.handles {
+        return 0
+    }
+    (count - facts.handles + facts.handle_block - 1) / facts.handle_block
 }
 
 /// Settle derived kind `kind`'s total against `derivation`: the derivation

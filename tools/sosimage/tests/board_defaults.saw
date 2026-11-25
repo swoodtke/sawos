@@ -9,7 +9,7 @@ import std.json.{JsonValue}
 import sosimage.board.{Board}
 import sosimage.fields.{Fields}
 import sosimage.kernel.{KernelFacts}
-import sosimage.limits.{ImageLimits, SlabPlan, plan_limits}
+import sosimage.limits.{ImageLimits, PlanNeeds, SlabPlan, plan_limits}
 import sosimage.product.{board_defaults}
 import sosimage.tool.{read_text}
 
@@ -65,7 +65,7 @@ func plan_of(json: String, facts: &KernelFacts) -> SlabPlan {
     let doc = try! JsonValue.parse(json)
     var fields = try! Fields(move doc, "limits")
     let limits = try! ImageLimits.read(&var fields)
-    try! plan_limits(&facts, &limits, "img", 0, 0)
+    try! plan_limits(&facts, &limits, &PlanNeeds.none(), "img", 0, 0)
 }
 
 // The slots `plan` raises `kind` by; 0 when it links no area for it.
@@ -137,10 +137,26 @@ func main() {
     assert(zeros.json().equals("\{\"slabs\": \{\"interrupts\": 0\}, \"quotas\": \{\"thread\": 0\}\}"),
            "zeros: {zeros.json()}")
 
+    // A board states the handle blocks the machine boots with and root's
+    // table, spelled as an image states them.
+    let blocked = board_of("riscv32", board_text("riscv32").replace("processes = 16", "processes = 16\nhandle-blocks = 3\nroot-handles = 48"))
+    let blocked_limits = match board_defaults(&blocked, &pmp) {
+        case Ok(l) -> move l,
+        case Err(e) -> panic("{e.message}")
+    }
+    assert(blocked_limits.json().equals(virt.replace("\"processes\": 13", "\"processes\": 13, \"handle-blocks\": 3").replace("\}\}", "\}, \"root-handles\": 48\}")),
+           "blocks and root's table: {blocked_limits.json()}")
+    assert(slots(&plan_of(blocked_limits.json(), &pmp), 13) == 3, "three blocks linked")
+
     // Each refusal names the file's table.
     let file = "../../hal/riscv32/board.toml: [limits.default]"
     expect_refusal("processes = 16", "processes = 2", &pmp,
                    "{file}: `processes` is 2, below the kernel's floor of 3: an image raises a limit and never lowers one")
+    expect_refusal("processes = 16", "processes = 16\nhandle-blocks = 0\nroot-handles = 48", &pmp,
+                   "{file}: the image's handle-blocks come to 0, below 1: root's handle table of 48 takes 1 and the processes' Handle rows 0")
+    expect_refusal("processes = 16", "processes = 16\nroot-handles = 129", &pmp,
+                   "{file}: the image's root handle table is 129, past the longest handle table (128)")
+    expect_refusal("processes = 16", "processes = 16\nhandle-blocks = 7\nroot-handles = 128", &pmp, "")
     expect_refusal("processes = 16", "processes = 16\nrecords = 63", &pmp,
                    "{file}: the image's process_records come to 63, below 64: 4 records per process body, for 16 bodies")
     expect_refusal("processes = 16", "processes = 16\nthreads = 15", &pmp,

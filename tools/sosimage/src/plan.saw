@@ -46,26 +46,25 @@
 //! grain (four bytes at least) that holds its register, and writes the
 //! register at its offset into that window.
 //!
-//! Refused by name: a line two processes need, which the kernel binds once;
-//! a `line` need bound to a device with no line; an image `quota` row below
-//! its declaration's; and an image `threads` row of 0, since a process's
-//! first thread is charged to it. Against the kernel (`check_plan`): a
-//! `handles` row past `MAX_HANDLES`, a `mappings` row past the grant rows an
-//! image leaves, a row at the ledger's unlimited mark, a row the image alone
-//! gives below the row the image's children start with (an image raises a
-//! row and never lowers one), a child whose `Handle` row is short of what it
-//! holds when it starts and once its heaps have grown (the console's inlet
-//! included, so a row at the declaration's own floor is short in an image
-//! that names a console), a child whose `Mapping` row is short of a row for
-//! each window and each heap, or whose `Memory` row is short of one for each
-//! heap; a step at which root would hold more handles than its table has or
-//! make more objects of a kind than the image's slab of it holds: Process
-//! objects (root and each child), Pipe objects (one per connection),
-//! Interrupt objects (one per line) and IoMemory objects (one per device row,
-//! carve given and setup write's carve); and more Memory objects than the
-//! image's slab holds, one per row of the region table that is not a device's
-//! and one for each heap's `Memory`. A heap's shares are its program's to
-//! budget, and are not counted.
+//! Refused by name: a line two processes need, which the kernel binds once; a
+//! `line` need bound to a device with no line; an image `quota` row below its
+//! declaration's; and an image `threads` row of 0, since a process's first
+//! thread is charged to it. Against the kernel (`check_plan`): a `handles` row
+//! past the longest handle table, a `mappings` row past the grant rows an image
+//! leaves, a row at the ledger's unlimited mark, a row the image alone gives
+//! below the row the image's children start with (an image raises a row and
+//! never lowers one), a child whose `Handle` row is short of what it holds when
+//! it starts and once its heaps have grown (the console's inlet included, so a
+//! row at the declaration's own floor is short in an image that names a
+//! console), a child whose `Mapping` row is short of a row for each window and
+//! each heap, or whose `Memory` row is short of one for each heap; a step at
+//! which root would hold more handles than the longest table has or make more
+//! objects of a kind than the image's slab of it holds: Process objects (root
+//! and each child), Pipe objects (one per connection), Interrupt objects (one
+//! per line) and IoMemory objects (one per device row, carve given and setup
+//! write's carve); and more Memory objects than the image's slab holds, one per
+//! row of the region table that is not a device's and one for each heap's
+//! `Memory`. A heap's shares are its program's to budget, and are not counted.
 //!
 //! Root's arena (`root_arena`) is what its heap takes for the plan: each of
 //! the plan's vectors and of root's own bookkeeping is made once at its
@@ -111,7 +110,7 @@ import sosimage.heapsize.{HEAP_CLASS_WORDS, HEAP_CONTROL_FIXED, heap_classes}
 import sosimage.hex.{hex}
 import sosimage.imagefile.{Bindings, ImageFile, SetupOp}
 import sosimage.kernel.{KernelFacts, QUOTA_HANDLE, QUOTA_KINDS, QUOTA_MAPPING, QUOTA_MEMORY}
-import sosimage.limits.{QUOTA_UNLIMITED}
+import sosimage.limits.{PlanNeeds, QUOTA_UNLIMITED}
 import sosimage.regions.{RegionKind}
 import sosimage.rights.{CEILING_KINDS, ceiling_kind_at, ceiling_kind, right_word}
 import sosimage.rules.{refused}
@@ -745,21 +744,30 @@ func quota_rows(image: &ImageFile, d: &Declaration, process: String,
 /// child's `Handle` row against what it holds when it starts and once its
 /// heaps have grown, its `Mapping` row against its windows and heaps and its
 /// `Memory` row against its heaps; root at every step of the plan, its
-/// handle table and the objects it has made of each kind `slabs` counts; and
-/// the Memory objects of the region table's rows and the heaps against the
-/// image's slab.
+/// handle table against the longest one and the objects it has made of each
+/// kind `slabs` counts; and the Memory objects of the region table's rows and
+/// the heaps against the image's slab. Answers what the plan asks of the
+/// handle tables and boot sets (`PlanNeeds`).
 public func check_plan(plan: &ImagePlan, facts: &KernelFacts, defaults: &Vector<Int>,
-                       slabs: &PlanSlabs, what: String) -> Result<Void, BuildError> {
+                       slabs: &PlanSlabs, what: String) -> Result<PlanNeeds, BuildError> {
+    var needs = PlanNeeds.none()
+    needs.stock = true
     var c = 0
     var heaps = 0
     while c < plan.children.len() {
         borrow let child = plan.children[c] {
-            try check_child(&child, &facts, &defaults, what)
+            let row = try check_child(&child, &facts, &defaults, what)
             heaps = heaps + child.heaps
+            try! needs.names.push(child.name)
+            try! needs.rows.push(row)
+            try! needs.records.push(child.records.len())
         }
         c = c + 1
     }
-    try root_steps(&plan, facts.handles, &slabs, what)
+    let longest = facts.handles + facts.table_blocks * facts.handle_block
+    let peak = try root_steps(&plan, longest, &slabs, what)
+    needs.held = peak.held
+    needs.step = peak.step
     var rows = 2 * plan.children.len()
     var r = 0
     while r < plan.rows.len() {
@@ -771,12 +779,12 @@ public func check_plan(plan: &ImagePlan, facts: &KernelFacts, defaults: &Vector<
     if rows + heaps > slabs.memories {
         return BuildError(message: "{what}: the region table mints {rows} Memory objects at boot and the processes' {heaps} heaps make one each, {rows + heaps} in all, past the image's {slabs.memories}")
     }
-    return
+    return move needs
 }
 
-/// `check_plan` for one child.
+/// `check_plan` for one child; answers its `Handle` row.
 func check_child(child: &PlanChild, facts: &KernelFacts, defaults: &Vector<Int>,
-                 what: String) -> Result<Void, BuildError> {
+                 what: String) -> Result<Int, BuildError> {
     let mapping_bound = facts.budget - facts.image_rows
     var handles = defaults.get(QUOTA_HANDLE) ?? 0
     var mappings = defaults.get(QUOTA_MAPPING) ?? 0
@@ -794,8 +802,9 @@ func check_child(child: &PlanChild, facts: &KernelFacts, defaults: &Vector<Int>,
             return BuildError(message: "{what}: the image gives the process {child.name} `{key}` = {row.limit}, below the {boots} the image's children start with: an image raises a row and never lowers one")
         }
         if row.kind == QUOTA_HANDLE {
-            if row.limit > facts.handles {
-                return BuildError(message: "{what}: the process {child.name}'s `handles` row is {row.limit}, past MAX_HANDLES ({facts.handles})")
+            let longest = facts.handles + facts.table_blocks * facts.handle_block
+            if row.limit > longest {
+                return BuildError(message: "{what}: the process {child.name}'s `handles` row is {row.limit}, past the longest handle table ({longest})")
             }
             handles = row.limit
         }
@@ -824,7 +833,7 @@ func check_child(child: &PlanChild, facts: &KernelFacts, defaults: &Vector<Int>,
         }
         return BuildError(message: "{what}: the process {child.name}'s `Handle` row is {handles}, short of the {child.floor} handles it holds when it starts")
     }
-    return
+    return handles
 }
 
 /// Whether `child` is given the console's inlet.
@@ -840,19 +849,20 @@ func has_console(child: &PlanChild) -> Bool {
     false
 }
 
-/// Refuses a step of `plan` at which root would hold more than `table`
-/// handles, as `root/` takes them: its boot handles and one per row, the
-/// Process handle and the main thread's own Thread handle its start-up
-/// derives, each child created and its two rows released, each setup
-/// write's carve and mapping, each record made and given, and its Waiter,
-/// made before it releases what is left of the rows and connections. Refuses
-/// one at which the objects of a kind would number more than `slabs` holds:
-/// Process objects, root's and one for each child created; IoMemory objects,
-/// one per device row, made at boot, one for each setup write's carve while
-/// it is written, and one for each carve given; a Pipe for each connection
-/// made; and an Interrupt for each line bound.
+/// Refuses a step of `plan` at which root would hold more than `table` handles,
+/// the longest handle table, and answers the most it holds at any step and the
+/// first step it holds that at. Root takes handles as `root/` does: its boot
+/// handles and one per row, the Process handle and the main thread's own Thread
+/// handle its start-up derives, each child created and its two rows released,
+/// each setup write's carve and mapping, each record made and given, and its
+/// Waiter, made before it releases what is left of the rows and connections.
+/// Refuses one at which the objects of a kind would number more than `slabs`
+/// holds: Process objects, root's and one for each child created; IoMemory
+/// objects, one per device row, made at boot, one for each setup write's carve
+/// while it is written, and one for each carve given; a Pipe for each
+/// connection made; and an Interrupt for each line bound.
 func root_steps(plan: &ImagePlan, table: Int, slabs: &PlanSlabs,
-                what: String) -> Result<Void, BuildError> {
+                what: String) -> Result<Peak, BuildError> {
     let count = plan.children.len()
     var devices = 0
     var d = 0
@@ -865,13 +875,13 @@ func root_steps(plan: &ImagePlan, table: Int, slabs: &PlanSlabs,
     var steps = Steps(held: ROOT_BOOT_HANDLES + 2 * count + plan.rows.len() +
                             ROOT_START_HANDLES,
                       made: Vector<Bool>(), iomemories: devices, pipes: 0, interrupts: 0,
-                      slabs: slabs)
-    try within(steps.held, table, what, "derive")
+                      slabs: slabs, peak: 0, step: "")
+    try steps.within(0, table, what, "derive")
     var c = 0
     while c < count {
         borrow let child = plan.children[c] {
             let step = "create {child.name}"
-            try within(steps.held + 1, table, what, step)
+            try steps.within(1, table, what, step)
             try objects_within(c + 2, slabs.processes, "Process", what, step)
         }
         steps.held = steps.held - 1
@@ -880,7 +890,7 @@ func root_steps(plan: &ImagePlan, table: Int, slabs: &PlanSlabs,
     var s = 0
     while s < plan.setup.len() {
         let step = "setup {(plan.setup.get(s)!).register}"
-        try within(steps.held + 2, table, what, step)
+        try steps.within(2, table, what, step)
         try objects_within(steps.iomemories + 1, slabs.iomemories, "IoMemory", what,
                            step)
         s = s + 1
@@ -903,7 +913,15 @@ func root_steps(plan: &ImagePlan, table: Int, slabs: &PlanSlabs,
         }
         c = c + 1
     }
-    return within(steps.held + 1, table, what, "supervise")
+    try steps.within(1, table, what, "supervise")
+    return Peak(held: steps.peak, step: steps.step)
+}
+
+/// The most handles root holds at any step, and the first step it holds that
+/// many at.
+struct Peak {
+    held: Int
+    step: String
 }
 
 /// What root holds as `root_steps` walks the plan, which connections it has
@@ -916,6 +934,10 @@ struct Steps {
     pipes: Int
     interrupts: Int
     slabs: PlanSlabs
+    /// The most root has held at a step so far, and the first step that held
+    /// it.
+    peak: Int
+    step: String
 }
 
 @synthesize
@@ -933,7 +955,7 @@ func give_step(steps: &var Steps, record: &PlanRecord, table: Int, what: String,
         },
         case Inlet -> {
             try connect(&var steps, record.from as Int, table, what, step)
-            try within(steps.held + 1, table, what, step)
+            try steps.within(1, table, what, step)
         },
         case Carve -> {
             steps.iomemories = steps.iomemories + 1
@@ -963,7 +985,7 @@ func connect(steps: &var Steps, index: Int, table: Int, what: String,
     }
     steps.made[index] = true
     steps.held = steps.held + 2
-    try within(steps.held, table, what, step)
+    try steps.within(0, table, what, step)
     steps.pipes = steps.pipes + 1
     objects_within(steps.pipes, steps.slabs.pipes, "Pipe", what, step)
 }
@@ -977,12 +999,21 @@ func objects_within(objects: Int, slab: Int, kind: String, what: String,
     return
 }
 
-/// Refuses `held` handles past `table` at `step`.
-func within(held: Int, table: Int, what: String, step: String) -> Result<Void, BuildError> {
-    if held > table {
-        return BuildError(message: "{what}: the stock root would hold {held} handles at `{step}`, past MAX_HANDLES ({table})")
+extension Steps {
+    /// Notes root holding `extra` handles more than it does now at `step`,
+    /// and refuses them past `table`, the longest handle table.
+    func within(&var self, extra: Int, table: Int, what: String,
+                step: String) -> Result<Void, BuildError> {
+        let held = self.held + extra
+        if held > table {
+            return BuildError(message: "{what}: the stock root would hold {held} handles at `{step}`, past the longest handle table ({table})")
+        }
+        if held > self.peak {
+            self.peak = held
+            self.step = step
+        }
+        return
     }
-    return
 }
 
 extension ImagePlan {

@@ -125,8 +125,8 @@ func manifest(name: String) -> Vector<String> {
     ["[package]", "name = \"{name}\"", "version = \"0.1.0\""]
 }
 
-// A kernel whose handle table holds 32, whose budget leaves 12 grant rows,
-// and whose slabs an image may raise to 255.
+// A kernel whose handle table holds 32 and whose longest holds 128, whose
+// budget leaves 12 grant rows, and whose slabs an image may raise to 255.
 func facts() -> KernelFacts {
     KernelFacts(word: 4, capacity: 255, extents: 4, records_per_body: 4, handles: 32,
                 image_rows: 4, budget: 16, domains: 16, stride: 0, inflight: 2, handle_block: 16, table_blocks: 6, boot_set: 64,
@@ -330,8 +330,8 @@ func main() {
     remove_if("{pdir}/tests/product/images/u.toml")
 
     // A declaration held to a kernel's numbers.
-    expect(quota_refusal("handles = 32"), "")
-    expect(quota_refusal("handles = 33"), "q.toml: `handles` in [quota] is 33, past the 32 the board b's handle table holds")
+    expect(quota_refusal("handles = 128"), "")
+    expect(quota_refusal("handles = 129"), "q.toml: `handles` in [quota] is 129, past the 128 the board b's longest handle table holds")
     expect(quota_refusal("mappings = 12"), "")
     expect(quota_refusal("mappings = 13"), "q.toml: `mappings` in [quota] is 13, past the 12 grant rows an image leaves of the board b's 16")
     expect(quota_refusal("waiters = 255"), "")
@@ -339,8 +339,10 @@ func main() {
     expect(quota_refusal("events = 65535"), "q.toml: `events` in [quota] is 65535, which the ledger's row cannot hold below its unlimited mark (65535)")
     expect(quota_refusal("events = 65534"), "q.toml: `events` in [quota] is 65534, past the 255 an image on the board b can raise any slab to")
     // What it holds when it starts, against the handle table.
-    expect(start_refusal(31), "")
-    expect(start_refusal(32), "big.toml: the process holds 33 handles when it starts, past the 32 the board b's handle table holds")
+    expect(start_refusal(127), "")
+    expect(start_refusal(128), "big.toml: the process holds 129 handles when it starts, past the 128 the board b's longest handle table holds")
+    expect(start_refusal_with(123, true), "")
+    expect(start_refusal_with(124, true), "big.toml: the process holds 129 handles once its heaps have grown, past the 128 the board b's longest handle table holds")
 }
 
 /// What `check_tree_board` says of the tree at `dir` on `board` against the
@@ -359,8 +361,18 @@ func board_refusal(dir: String, board: &Board, f: &KernelFacts) -> String {
 /// What `hold_quota` says of a declaration with `records` records, which it
 /// holds when it starts with its Process handle.
 func start_refusal(records: Int) -> String {
+    start_refusal_with(records, false)
+}
+
+/// `start_refusal` for a declaration that has a heap when `heap` says so,
+/// which holds four handles more once the heap has grown.
+func start_refusal_with(records: Int, heap: Bool) -> String {
     var lines: Vector<String> = ["format = 1", "arena = 0x1000",
                                  "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1"]
+    if heap {
+        try! lines.push("[heap.default]")
+        try! lines.push("len = 0x1000")
+    }
     var t = 2
     while t <= records {
         try! lines.push("[[boot]]")

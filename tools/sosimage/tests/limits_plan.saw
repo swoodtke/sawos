@@ -6,7 +6,7 @@
 import sosimage.failure.{BuildError}
 import sosimage.fields.{Fields}
 import sosimage.kernel.{KernelFacts}
-import sosimage.limits.{ImageLimits, SlabPlan, plan_limits}
+import sosimage.limits.{ImageLimits, PlanNeeds, SlabPlan, plan_limits}
 import sosimage.regions.{encode_block}
 import std.json.{JsonValue}
 
@@ -44,7 +44,7 @@ func stated(text: String) -> ImageLimits {
 func refusal(text: String) -> String {
     let facts = kernel()
     let limits = stated(text)
-    match plan_limits(&facts, &limits, "img", 2, 1) {
+    match plan_limits(&facts, &limits, &PlanNeeds.none(), "img", 2, 1) {
         case Ok(_) -> "",
         case Err(e) -> e.message
     }
@@ -62,10 +62,216 @@ func expect_refusal(text: String, message: String) {
 func plan(text: String) -> SlabPlan {
     let facts = kernel()
     let limits = stated(text)
-    try! plan_limits(&facts, &limits, "img", 2, 1)
+    try! plan_limits(&facts, &limits, &PlanNeeds.none(), "img", 2, 1)
+}
+
+// What a stock root's plan asks: root holds at most `held` handles, first at
+// `step`, and the children `names` have these `Handle` rows and boot sets.
+func needs_of(held: Int, step: String, names: &[String], rows: &[Int],
+              records: &[Int]) -> PlanNeeds {
+    var n = Vector<String>()
+    var i = 0
+    while i < names.len() {
+        try! n.push(names[i])
+        i = i + 1
+    }
+    PlanNeeds(stock: true, held: held, step: step, names: move n,
+              rows: ints(&rows), records: ints(&records))
+}
+
+// A stock root's plan with no children that holds `held` handles at most.
+func root_needs(held: Int) -> PlanNeeds {
+    let none: [String; 0] = []
+    let zero: [Int; 0] = []
+    needs_of(held, "give radio record 12", &none, &zero, &zero)
+}
+
+// The message `text`'s limits are refused with against `needs`, with
+// `memory_rows` Memory rows and no IoMemory rows, on `facts`; "" when they
+// are taken.
+func refusal_of(facts: &KernelFacts, text: String, needs: &PlanNeeds,
+                memory_rows: Int) -> String {
+    let limits = stated(text)
+    match plan_limits(&facts, &limits, &needs, "img", memory_rows, 0) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func expect_refusal_of(facts: &KernelFacts, text: String, needs: &PlanNeeds,
+                       memory_rows: Int, message: String) {
+    let got = refusal_of(&facts, text, &needs, memory_rows)
+    if not got.equals(message) {
+        print("expected: {message}")
+        print("got:      {got}")
+    }
+    assert(got.equals(message), "the refusal's message")
+}
+
+// The plan `text`'s limits come to against `needs`.
+func plan_needing(text: String, needs: &PlanNeeds) -> SlabPlan {
+    let facts = kernel()
+    let limits = stated(text)
+    try! plan_limits(&facts, &limits, &needs, "img", 2, 1)
+}
+
+// A stock root's plan of `count` children, each with a `Handle` row of `row`.
+func same_children(count: Int, row: Int) -> PlanNeeds {
+    var needs = root_needs(5)
+    var c = 0
+    while c < count {
+        try! needs.names.push("p{c}")
+        try! needs.rows.push(row)
+        try! needs.records.push(1)
+        c = c + 1
+    }
+    move needs
+}
+
+// The HandleBlocks slots `plan` links; 0 for no area.
+func block_slots(plan: &SlabPlan) -> Int {
+    var i = 0
+    while i < plan.areas.len() {
+        if plan.areas.get(i)!.kind == 13 {
+            return plan.areas.get(i)!.slots
+        }
+        i = i + 1
+    }
+    0
+}
+
+// What a stock root's plan asks of the tables: root's table from the most it
+// holds, the blocks from the children's rows, and each boot set.
+func stock_derivations() {
+    // Root's table is the most the plan holds at any step, in whole blocks.
+    let held45 = plan_needing("\{\}", &root_needs(45))
+    assert(held45.root_blocks == 1 && block_slots(&held45) == 1,
+           "45 held: a table of 48, one block")
+    assert(plan_needing("\{\}", &root_needs(33)).root_blocks == 1, "33 held: one block")
+    assert(plan_needing("\{\}", &root_needs(48)).root_blocks == 1, "48 held: one block")
+    assert(plan_needing("\{\}", &root_needs(49)).root_blocks == 2, "49 held: two blocks")
+    assert(plan_needing("\{\}", &root_needs(128)).root_blocks == 6, "128 held: six blocks")
+    let held32 = plan_needing("\{\}", &root_needs(32))
+    assert(held32.root_blocks == 0 && block_slots(&held32) == 0,
+           "32 held: the body's table, no blocks")
+    assert(plan_needing("\{\}", &root_needs(5)).root_blocks == 0, "5 held: no blocks")
+
+    // Past the longest table, naming the step.
+    let facts = kernel()
+    expect_refusal_of(&facts, "\{\}", &root_needs(129), 2,
+                      "img: the stock root would hold 129 handles at `give radio record 12`, past the longest handle table (128)")
+
+    // A stated table raises the derivation and never lowers it.
+    let stated_up = plan_needing("\{\"root-handles\": 64\}", &root_needs(45))
+    assert(stated_up.root_blocks == 2, "64 stated over 45 held: two blocks")
+    let stated_same = plan_needing("\{\"root-handles\": 48\}", &root_needs(45))
+    assert(stated_same.root_blocks == 1, "48 stated over 45 held: one block")
+    let stated_rounded = plan_needing("\{\"root-handles\": 40\}", &root_needs(45))
+    assert(stated_rounded.root_blocks == 1, "40 stated rounds up to the 48 held needs")
+    expect_refusal_of(&facts, "\{\"root-handles\": 32\}", &root_needs(45), 2,
+                      "img: the image's root handle table is 32, below 48: the stock root would hold 45 handles at `give radio record 12`")
+    expect_refusal_of(&facts, "\{\"root-handles\": 129\}", &root_needs(45), 2,
+                      "img: the image's root handle table is 129, past the longest handle table (128)")
+
+    // The blocks are root's and each child's, for its `Handle` row past the
+    // body's table.
+    let names: [String; 3] = ["radio", "gpio", "log"]
+    let rows: [Int; 3] = [64, 20, 33]
+    let records: [Int; 3] = [20, 5, 1]
+    let box = needs_of(45, "give radio record 12", &names, &rows, &records)
+    let blocks = plan_needing("\{\}", &box)
+    assert(blocks.root_blocks == 1 && block_slots(&blocks) == 4,
+           "root's one, the radio's two and the log's one")
+    let radio_names: [String; 1] = ["radio"]
+    let radio_rows: [Int; 1] = [64]
+    let radio_records: [Int; 1] = [20]
+    let radio = needs_of(45, "give radio record 12", &radio_names, &radio_rows, &radio_records)
+    assert(block_slots(&plan_needing("\{\}", &radio)) == 3, "root's one and the radio's two")
+    let at_body: [Int; 1] = [32]
+    let body = needs_of(5, "derive", &radio_names, &at_body, &radio_records)
+    assert(block_slots(&plan_needing("\{\}", &body)) == 0, "a row at the body's table: none")
+    let one_past: [Int; 1] = [33]
+    let past_body = needs_of(5, "derive", &radio_names, &one_past, &radio_records)
+    assert(block_slots(&plan_needing("\{\}", &past_body)) == 1, "a row one past it: one")
+    let at_longest: [Int; 1] = [128]
+    let longest_row = needs_of(5, "derive", &radio_names, &at_longest, &radio_records)
+    assert(block_slots(&plan_needing("\{\}", &longest_row)) == 6, "the longest row: six")
+    var not_stock = radio.copy()
+    not_stock.stock = false
+    assert(block_slots(&plan_needing("\{\}", &not_stock)) == 0,
+           "a root that is not the stock root asks nothing")
+
+    // A stated total is taken above the derivation and refused below it.
+    let above = plan_needing("\{\"slabs\": \{\"handle-blocks\": 5\}\}", &radio)
+    assert(block_slots(&above) == 5, "five stated over three")
+    let exact = plan_needing("\{\"slabs\": \{\"handle-blocks\": 3\}\}", &radio)
+    assert(block_slots(&exact) == 3, "three stated over three")
+    expect_refusal_of(&facts, "\{\"slabs\": \{\"handle-blocks\": 2\}\}", &radio, 2,
+                      "img: the image's handle-blocks come to 2, below 3: root's handle table of 48 takes 1 and the processes' Handle rows 2")
+
+    // The derivation past MAX_SLAB_CAPACITY, as every kind is: eleven
+    // children at the longest row take 66 blocks of a machine whose slabs
+    // hold 64, and ten take 60.
+    var small = kernel()
+    small.capacity = 64
+    let many = same_children(11, 128)
+    expect_refusal_of(&small, "\{\}", &many, 2,
+                      "img: the image's handle-blocks come to 66, past MAX_SLAB_CAPACITY (64)")
+    let ten = same_children(10, 128)
+    assert(refusal_of(&small, "\{\}", &ten, 2).is_empty(), "60 blocks of 64 are taken")
+
+    // Root's boot handles against the table the plan gives it.
+    let rows_raised = "\{\"slabs\": \{\"memories\": 40\}\}"
+    expect_refusal_of(&facts, rows_raised, &root_needs(40), 46,
+                      "img: root holds 49 handles at boot, its System, Process and Thread and one for each of the region table's 46 rows, past root's handle table (48)")
+    assert(refusal_of(&facts, rows_raised, &root_needs(48), 45).is_empty(),
+           "45 rows fill a table of 48")
+
+    // Each boot set against the most a `BootSet` holds: root's rows and each
+    // child's records.
+    let wide = "\{\"slabs\": \{\"memories\": 49\}\}"
+    assert(refusal_of(&facts, wide, &root_needs(70), 64).is_empty(), "root's 64 rows")
+    expect_refusal_of(&facts, wide, &root_needs(70), 65,
+                      "img: root's boot set holds 65 records, one for each of the region table's rows, past BOOT_SET_CAPACITY (64)")
+    let full_records: [Int; 1] = [64]
+    let full = needs_of(45, "derive", &radio_names, &radio_rows, &full_records)
+    assert(refusal_of(&facts, "\{\}", &full, 2).is_empty(), "a child's 64 records")
+    let over_records: [Int; 1] = [65]
+    let over = needs_of(45, "derive", &radio_names, &radio_rows, &over_records)
+    expect_refusal_of(&facts, "\{\}", &over, 2,
+                      "img: the process radio's boot set holds 65 records, past BOOT_SET_CAPACITY (64): its declared records, the console's inlet and its heaps' pools")
+
+    // The loops over the children reach the second one.
+    let two_names: [String; 2] = ["log", "radio"]
+    let two_rows: [Int; 2] = [20, 64]
+    let two_over: [Int; 2] = [1, 65]
+    let second = needs_of(45, "derive", &two_names, &two_rows, &two_over)
+    expect_refusal_of(&facts, "\{\}", &second, 2,
+                      "img: the process radio's boot set holds 65 records, past BOOT_SET_CAPACITY (64): its declared records, the console's inlet and its heaps' pools")
+    let two_body: [Int; 2] = [20, 33]
+    let two_ok: [Int; 2] = [1, 1]
+    assert(needs_of(5, "derive", &two_names, &two_body, &two_ok).wants_blocks(&facts), "the second child's row")
+
+    // A hand-written root's boot set is its own to drain, past the `BootSet`.
+    var hand_over = over.copy()
+    hand_over.stock = false
+    assert(refusal_of(&facts, "\{\}", &hand_over, 2).is_empty(), "a hand-written child's records")
+    let hand_wide = "\{\"slabs\": \{\"memories\": 49\}, \"root-handles\": 128\}"
+    assert(refusal_of(&facts, hand_wide, &PlanNeeds.none(), 65).is_empty(),
+           "a hand-written root's 65 rows")
+
+    // What a plan wants of the blocks.
+    assert(root_needs(33).wants_blocks(&facts), "root past the body's table")
+    assert(not root_needs(32).wants_blocks(&facts), "root within it")
+    assert(past_body.wants_blocks(&facts), "a child's row past it, root within")
+    assert(not body.wants_blocks(&facts), "every row within it")
+    assert(not not_stock.wants_blocks(&facts), "no plan")
+    assert(not PlanNeeds.none().wants_blocks(&facts), "none")
 }
 
 func main() {
+    stock_derivations()
+
     // A process body raised: the derived totals follow it, each area in kind
     // order, each length whole slots of its unit.
     let p = plan("\{\"slabs\": \{\"processes\": 1, \"waiters\": 1\}\}")
@@ -186,7 +392,7 @@ func main() {
     }
     let facts_rows = kernel()
     let quiet_rows = stated("\{\}")
-    let filled = try! plan_limits(&facts_rows, &quiet_rows, "img", 16, 8)
+    let filled = try! plan_limits(&facts_rows, &quiet_rows, &PlanNeeds.none(), "img", 16, 8)
     assert(filled.block, "rows filling both slabs")
 
     // Each quota kind's bound is its own slab's capacity. Over slabs raised so
@@ -241,7 +447,7 @@ func main() {
     expect_refusal("\{\"root-handles\": 129\}",
                    "img: the image's root handle table is 129, past the longest handle table (128)")
     expect_refusal("\{\"slabs\": \{\"handle-blocks\": 1\}, \"root-handles\": 49\}",
-                   "img: the image's handle-blocks come to 1, below 2: root's handle table of 49 takes 2")
+                   "img: the image's handle-blocks come to 1, below 2: root's handle table of 64 takes 2 and the processes' Handle rows 0")
     let negative_doc = try! JsonValue.parse("\{\"root-handles\": -1\}")
     var negative_fields = try! Fields(move negative_doc, "limits")
     let negative = match ImageLimits.read(&var negative_fields) {
@@ -256,13 +462,13 @@ func main() {
     // The rows the region table mints are held against the image's slabs.
     let facts = kernel()
     let quiet = stated("\{\}")
-    let rows = match plan_limits(&facts, &quiet, "img", 17, 0) {
+    let rows = match plan_limits(&facts, &quiet, &PlanNeeds.none(), "img", 17, 0) {
         case Ok(_) -> "",
         case Err(e) -> e.message
     }
     assert(rows.equals("img: the region table mints 17 Memory objects at boot, past the image's 16"),
            "the Memory rows")
-    let devices = match plan_limits(&facts, &quiet, "img", 0, 9) {
+    let devices = match plan_limits(&facts, &quiet, &PlanNeeds.none(), "img", 0, 9) {
         case Ok(_) -> "",
         case Err(e) -> e.message
     }
@@ -273,17 +479,17 @@ func main() {
     // the Memory slab raised past the table, 29 rows fill it and 30 are
     // refused, whichever slab they mint into.
     let memories_raised = stated("\{\"slabs\": \{\"memories\": 17\}\}")
-    let full_table = try! plan_limits(&facts, &memories_raised, "img", 29, 0)
+    let full_table = try! plan_limits(&facts, &memories_raised, &PlanNeeds.none(), "img", 29, 0)
     assert(full_table.block, "29 rows beside root's three handles")
-    let mixed = try! plan_limits(&facts, &memories_raised, "img", 25, 4)
+    let mixed = try! plan_limits(&facts, &memories_raised, &PlanNeeds.none(), "img", 25, 4)
     assert(mixed.block, "25 Memory and 4 IoMemory rows")
-    let past = match plan_limits(&facts, &memories_raised, "img", 30, 0) {
+    let past = match plan_limits(&facts, &memories_raised, &PlanNeeds.none(), "img", 30, 0) {
         case Ok(_) -> "",
         case Err(e) -> e.message
     }
     assert(past.equals("img: root holds 33 handles at boot, its System, Process and Thread and one for each of the region table's 30 rows, past MAX_HANDLES (32)"),
            "30 rows: {past}")
-    let past_mixed = match plan_limits(&facts, &memories_raised, "img", 25, 5) {
+    let past_mixed = match plan_limits(&facts, &memories_raised, &PlanNeeds.none(), "img", 25, 5) {
         case Ok(_) -> "",
         case Err(e) -> e.message
     }
@@ -293,9 +499,9 @@ func main() {
     // Root's rows against root's table, the blocks its image gives it
     // included: 45 rows fill a table of 48 and 46 are refused, naming it.
     let longer = stated("\{\"slabs\": \{\"memories\": 40\}, \"root-handles\": 48\}")
-    let longer_full = try! plan_limits(&facts, &longer, "img", 45, 0)
+    let longer_full = try! plan_limits(&facts, &longer, &PlanNeeds.none(), "img", 45, 0)
     assert(longer_full.root_blocks == 1, "45 rows beside root's three handles")
-    let longer_past = match plan_limits(&facts, &longer, "img", 46, 0) {
+    let longer_past = match plan_limits(&facts, &longer, &PlanNeeds.none(), "img", 46, 0) {
         case Ok(_) -> "",
         case Err(e) -> e.message
     }
