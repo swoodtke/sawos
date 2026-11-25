@@ -1,0 +1,146 @@
+// The section word (spec §7) against the tick. Root's manifest states the
+// default priorities, so its main thread and the threads it starts at
+// `Normal` run at level 1, and this image's kernel arms the tick.
+//
+//   sibling   root registers, enters and starts S at `Normal`, its own
+//             level, then spins until its process's `interrupts` column has
+//             risen, which is a tick ending its slice with S ready. The
+//             section keeps root on the processor at that tick, so S has not
+//             run when root prints; root's leave runs it: H, then S
+//   confined  `section-child`, at root's level, enters its section, signals
+//             root and spins inside it for good. Root, woken at its own level,
+//             runs at a tick's end all the same, because the section holds
+//             back none but the child's own threads: it kills the child and
+//             prints K
+//   confined peer  the same, with a sibling of the holder's started at their
+//             level inside the section, ahead of root on that level's list.
+//             At each slice's end the sibling is charged the slice the holder
+//             ran in its place and goes behind root, so root gets its turn
+//   confined low   the same, with the holder at level 0 and its sibling at
+//             root's level 1, ahead of root: the sibling's charge lets root,
+//             above the holder, take the processor from it
+//
+// Neither round asserts how many ticks it took: each waits on a count the
+// kernel keeps or on the child's signal, never on the clock.
+
+import sos.{Memory, Process, Event, Thread, Priority, Section, SosStatus,
+            SystemRight, BootSet}
+import sosmain
+
+static TAG_IMAGE: UInt = 0
+static TAG_RAM: UInt = 1
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_GO: UInt = 41
+
+static KEY_EVENT: UInt = 7
+
+static ROLE_CONFINED: UInt = 8
+static ROLE_CONFINED_PEER: UInt = 10
+static ROLE_CONFINED_LOW: UInt = 11
+
+/// `Normal` at 0, below root, and `High` at 1, root's level.
+static HIGH_AT_ROOT: UInt32 = 0x1111_1000
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+/// The code the kill ends the child with.
+static KILL_CODE: UInt = 9
+
+/// S's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let img = take_memory(&var set, TAG_IMAGE)
+    let ram = take_memory(&var set, TAG_RAM)
+    try sosmain.context().process().section_register()
+    try sibling()
+    try confined(&img, &ram, "confined", ROLE_CONFINED, None)
+    try confined(&img, &ram, "confined peer", ROLE_CONFINED_PEER, None)
+    try confined(&img, &ram, "confined low", ROLE_CONFINED_LOW, HIGH_AT_ROOT)
+    print("SOS sectiontick: done")
+    return
+}
+
+func take_memory(set: &var BootSet, tag: UInt) -> Memory {
+    guard var record = set.take(tag) else {
+        panic("SOS sectiontick: no record under tag {}", tag)
+    }
+    guard let memory = record.take_memory() else {
+        panic("SOS sectiontick: the record under tag {} is no Memory", tag)
+    }
+    move memory
+}
+
+/// `sibling`.
+func sibling() -> Result<Void, SosStatus> {
+    let s = try sosmain.context().process().thread_create(run: says_s, arg: 0,
+                                                          stack_top: top())
+    Section.enter()
+    try s.start(band: Priority.Normal)
+    let before = try sosmain.context().process().stats()
+    var now = try sosmain.context().process().stats()
+    while now.interrupts == before.interrupts {
+        now = try sosmain.context().process().stats()
+    }
+    print("SOS sectiontick: sibling: H")
+    Section.leave()
+    let _ = try s.join()
+    return
+}
+
+func says_s(arg: UInt) sync -> UInt {
+    print("SOS sectiontick: sibling: S")
+    0
+}
+
+/// A `confined` round: the child given `role`, and mapped with `map` when
+/// there is one.
+func confined(img: &Memory, ram: &Memory, round: String, role_bits: UInt,
+              map: UInt32?) -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    if let m = map {
+        try child.band_map(map: m)
+    }
+    let role = try sosmain.context().process().event_create()
+    try role.signal(bits: role_bits)
+    try give_event(&child, move role, TAG_ROLE)
+    let held = try sosmain.context().process().event_create()
+    let held_given = try held.mint()
+    try give_event(&child, move held_given, TAG_GO)
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &held, key: KEY_EVENT)
+    let boot = try sosmain.context().system().mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    let _ = try waiter.wait()
+    try child.kill(code: KILL_CODE)
+    print("SOS sectiontick: {}: K", round)
+    let status = try child.get_status()
+    print("SOS sectiontick: {} ended status={}", round, status)
+    return
+}
+
+func give_event(child: &Process, event: Event,
+                tag: UInt) -> Result<Void, SosStatus> {
+    try child.give(event: move event, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}

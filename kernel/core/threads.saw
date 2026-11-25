@@ -285,6 +285,12 @@ static HIGHEST_LEVEL: [UInt8; 256] = [
 /// put on the processor.
 public(package) unsafe static var NEED_RESCHED: Bool = false
 
+/// Set by the tick beside `NEED_RESCHED` when a thread's slice runs out, and
+/// cleared with it, so the switch can tell a slice's end from a yield or a
+/// wake: a section's holder that keeps the processor at a slice's end
+/// charges that slice to the sibling it ran in place of (`kcore.sched`).
+public(package) unsafe static var SLICE_ENDED: Bool = false
+
 /// The slot of an `Exited` thread nothing names, waiting for the switch away
 /// from it, or `NO_THREAD`.
 ///
@@ -423,6 +429,59 @@ public(package) func ready_pop() unsafe -> Int {
     }
     THREADS[slot].link = 0
     slot
+}
+
+/// The thread `ready_pop` would take, left where it is, or `NO_THREAD`.
+public(package) func ready_peek() unsafe -> Int {
+    if READY_BITS == 0 {
+        return NO_THREAD
+    }
+    READY_HEAD[HIGHEST_LEVEL[READY_BITS as Int] as Int] - 1
+}
+
+/// Take ready thread `slot` off its level's list, leaving the others where
+/// they were, and answer whether it was there.
+///
+/// A walk of that one list with a trailing pointer, as `ready_remove_process`
+/// makes of each: at most as many nodes as the thread slab is long, each an
+/// O(1) body, and no preemption point, for that function's reason.
+public(package) func ready_remove(slot: Int) unsafe -> Bool {
+    let level = THREADS[slot].level as Int
+    var prev: Int = 0
+    var cur = READY_HEAD[level]
+    while cur != 0 {
+        let next = THREADS[cur - 1].link
+        if cur == slot + 1 {
+            if prev == 0 {
+                READY_HEAD[level] = next
+            } else {
+                THREADS[prev - 1].link = next
+            }
+            if READY_TAIL[level] == cur {
+                READY_TAIL[level] = prev
+            }
+            if READY_HEAD[level] == 0 {
+                READY_BITS = READY_BITS & ~level_bit(level)
+            }
+            THREADS[slot].link = 0
+            return true
+        }
+        prev = cur
+        cur = next
+    }
+    false
+}
+
+/// Move ready thread `slot`, the head of its level, to that level's tail.
+public(package) func ready_rotate(slot: Int) unsafe {
+    let level = THREADS[slot].level as Int
+    if READY_TAIL[level] == slot + 1 {
+        return
+    }
+    READY_HEAD[level] = THREADS[slot].link
+    THREADS[READY_TAIL[level] - 1].link = slot + 1
+    READY_TAIL[level] = slot + 1
+    THREADS[slot].link = 0
 }
 
 /// Take every thread of process `p` off the ready lists, leaving everybody

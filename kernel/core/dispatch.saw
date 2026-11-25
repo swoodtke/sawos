@@ -320,7 +320,9 @@ import kcore.process.{
     copy_out_check,
     domain_changed,
     executable_at,
+    in_image_row,
     stack_top_ok,
+    translate_user,
     free_user_va,
     meets_row,
     record_grant,
@@ -342,7 +344,9 @@ import kcore.sched.{
     fault_process,
     fault_trap,
     pick_next,
+    section_held,
 }
+import kcore.mem.{word_bytes}
 
 /// The System object's ops (§2.8). Returns a status; `shutdown` does not
 /// return.
@@ -901,7 +905,57 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             }
             process_band_map(p, obj.slot, arg0)
         },
+        // Registers the caller's section word (§7). Self-only: the word
+        // orders the caller's own threads. Gated by `ThreadCreate`, because
+        // only a process that can make threads has several to order, and the
+        // word grants nothing its band map did not.
+        case SectionWord -> {
+            if not obj.allows(ProcessRight.ThreadCreate) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if obj.slot != p {
+                fault_process(p, FaultReason.NotSelf)
+            }
+            process_section_word(p, arg0)
+        },
     }
+}
+
+/// `ProcessOp.SectionWord`: process `p`'s section word becomes the pair of
+/// machine words at user address `addr` (spec §7).
+///
+/// The answers are decided in the spec's order, each a fault because the
+/// process chose the address: one that is not word-aligned is `BadAlign`; a
+/// pair that is not in one row of `p`'s image permitting write is `BadArg`;
+/// and a second registration is `BadState`. The pair must lie in an image row
+/// because the kernel keeps the resolved address for the body's life
+/// (`ProcessBody.section_at`), and an image row lasts as long, where a row
+/// `map` installed can be unmapped. The row test is the destination test of
+/// the copy doors (`translate_user`): one row, no device, nothing the process
+/// may execute.
+///
+/// The pending flag is cleared as the pair is taken, so nothing the process
+/// wrote there before reads as a sibling held back.
+func process_section_word(p: Int, addr: UInt) unsafe -> SyscallResult {
+    let word = word_bytes()
+    if (addr % word) != 0 {
+        fault_process(p, FaultReason.BadAlign)
+    }
+    let pa = try translate_user(p, addr, word * 2,
+                                SegFlag.Write as UInt8) catch {
+        fault_process(p, FaultReason.BadArg)
+    }
+    if not in_image_row(p, addr) {
+        fault_process(p, FaultReason.BadArg)
+    }
+    let b = body_of(p)
+    if PROCESSES[b].section_at != 0 {
+        fault_process(p, FaultReason.BadState)
+    }
+    let at = hal.phys_to_virt(pa)
+    UnsafeMemory<UInt, Normal>(at + word).write(0)
+    PROCESSES[b].section_at = at
+    op_ok()
 }
 
 /// `ProcessOp.BandMap`: process `child`'s band map becomes `raw` (spec §7).
@@ -2091,6 +2145,11 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             }
             if target != CURRENT_THREAD {
                 fault_process(p, FaultReason.NotSelf)
+            }
+            // A thread that ends itself inside its process's section leaves
+            // it held for good (§7).
+            if section_held(p) {
+                fault_process(p, FaultReason.SectionHeld)
             }
             exit_thread(target, arg0, obj.handle)
             // No pair is ever written: this thread does not resume.
@@ -5378,8 +5437,26 @@ public func ktrap(frame_addr: UInt, cause: UInt, tval: UInt) unsafe -> UInt {
     // second time when the wake wrote the real pair.
     if not result.blocked {
         write_result(frame_addr, result)
+    } else if parked_in_section() {
+        fault_process(calling_process(), FaultReason.SectionHeld)
     }
     pick_next(frame_addr)
+}
+
+/// Whether the syscall just dispatched parked its caller while the caller's
+/// process holds its section (spec §7): no sibling could run until the
+/// caller's wake, and a wake that only a sibling could make would never
+/// come. Every park answers `blocked` with the caller `Blocked`, whichever op
+/// made it, so this one test covers them all; `Exit` answers `blocked` too,
+/// with the caller `Exited`, and is decided at its own arm.
+func parked_in_section() unsafe -> Bool {
+    if CURRENT_THREAD == NO_THREAD {
+        return false
+    }
+    match THREADS[CURRENT_THREAD].state {
+        case Blocked -> section_held(THREADS[CURRENT_THREAD].process),
+        case _ -> false,
+    }
 }
 
 static BYTE_MASK: UInt = 0xFF

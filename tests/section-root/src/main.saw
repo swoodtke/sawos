@@ -1,0 +1,513 @@
+// The section word (spec §7), from root's side. Root's manifest puts `Low` at
+// level 1, `Normal` at 2 and `High` at 3, so root's main thread runs at 2 with
+// a level below it and one above. This image's kernel arms no tick, so every
+// switch is one a round makes: a start, a signal, a yield, a park, an exit, or
+// the one Timer interrupt `irq` waits for. No round waits on the clock, and
+// none can be reordered by a stalled host: each line comes after what it waits
+// for has happened.
+//
+//   defer     root registers its section word, enters and starts H at `High`:
+//             no switch, and the section reads pending. The leave yields, and
+//             H runs; afterwards nothing is pending: held, H, after
+//   nested    two enters, a start at `High` and one leave: the section is
+//             still held, so the start and the leave switch to nothing. The
+//             second leave runs H: N, then H
+//   lower     inside the section, a start at `Low` and a yield: the only
+//             sibling ready is below root, so the yield takes root again and
+//             holds nothing back, and nothing reads pending: held pending=0,
+//             then L at the join
+//   irq       H, at `High`, parks on a Waiter attached to a Timer. Root enters,
+//             arms the Timer and spins until the section reads pending, which
+//             only the fire's wake of H, held back at the interrupt's return,
+//             writes: D, then H
+//
+// Then `section-child` once per round (its own comment says what each does),
+// each launch waited out and its status word printed:
+//
+//   SOS section: <round> ended status=<word>
+//
+//   other     the child, its `Normal` at 3, parks on an Event; root enters its
+//             section and signals it: the child's line, then R. A section
+//             holds back no other process
+//   away      the child's holder at `Normal` (1) enters, and its signal readies
+//             root's Q above it; Q readies the child's two `High` threads (3)
+//             in order and exits. The pick takes the first, and the holder
+//             runs in its place: A's lines, then the `High` threads' in their
+//             order, the first having kept its place at the head. The holder's
+//             leave yields, because the pick that ran it in the first `High`
+//             thread's place wrote the pending flag, so its last line comes
+//             after theirs
+//   yield     the child, its `Normal` at root's 2, parks a sibling Y on an
+//             Event, readies root's Q and then two siblings, S and X, at its
+//             level, behind Q, and yields inside its section: Q is no sibling,
+//             so the holder goes behind X. Q readies Y, behind the holder, and
+//             exits; the pick takes S, and the holder runs in S's place, taken
+//             off its level's list between X and Y. Its leave yields to S, X
+//             and Y: Q, A, S, X, Y, then A again
+//   yield tail  the same with no Y, so the holder is taken off its level's
+//             list from its tail: Q, A, S, X, then A again
+//   park      the child parks inside its section: the `SectionHeld` fault
+//   exit      the child's second thread exits inside its section: the same
+//   twice     the child registers twice: the `BadState` fault
+//   denied    the child registers through a handle without `ThreadCreate`:
+//             the `AccessDenied` fault
+//   unregistered  the child enters a section it never registered: a panic
+//   unbalanced    the child leaves a section it never entered: a panic
+//
+// Given the pool as a third region, root runs the raw rounds instead, each a
+// `section-raw` launch (its own comment says what each registers):
+// `unaligned`, `outside`, `odd mapped` and `second mapped`, the last three
+// each with a piece of the pool mapped into the child; `readonly`, `straddle`
+// and `wake timer`.
+
+import sos.{Process, Memory, Pool, Thread, Waiter, Event, BootSet, Priority,
+            Section, SosStatus, SystemRight, MapAccess, QuotaKind}
+import sosmain
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The boot set's regions: the child's image and RAM, then the pool when the
+/// raw rounds run.
+static TAG_IMAGE: UInt = 0
+static TAG_RAM: UInt = 1
+static TAG_POOL: UInt = 2
+static RAW_ROUNDS: Int = 3
+
+/// What root gives the children.
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_GO: UInt = 41
+static TAG_TO_ROOT: UInt = 42
+static TAG_TO_HIGH: UInt = 43
+static TAG_ADDR: UInt = 44
+static TAG_TO_HIGH2: UInt = 45
+
+static KEY_DEATH: UInt = 6
+static KEY_EVENT: UInt = 7
+
+/// The roles `section-child` knows.
+static ROLE_OTHER: UInt = 1
+static ROLE_AWAY: UInt = 2
+static ROLE_PARK: UInt = 3
+static ROLE_EXIT: UInt = 4
+static ROLE_TWICE: UInt = 5
+static ROLE_DENIED: UInt = 6
+static ROLE_UNREGISTERED: UInt = 7
+static ROLE_UNBALANCED: UInt = 9
+static ROLE_YIELD: UInt = 12
+static ROLE_YIELD_TAIL: UInt = 13
+
+/// What `away`'s child holds at once: its main thread and two more, each
+/// made with two handles, and the Events and Waiters it is given and makes.
+static AWAY_THREADS: UInt16 = 3
+static AWAY_HANDLES: UInt16 = 20
+/// What `yield`'s child holds at once: its main thread and three more, on the
+/// same terms.
+static YIELD_THREADS: UInt16 = 4
+static YIELD_HANDLES: UInt16 = 24
+
+/// The roles `section-raw` knows.
+static ROLE_UNALIGNED: UInt = 1
+static ROLE_OUTSIDE: UInt = 2
+static ROLE_ODD_MAPPED: UInt = 3
+static ROLE_SECOND_MAPPED: UInt = 4
+static ROLE_READONLY: UInt = 5
+static ROLE_STRADDLE: UInt = 6
+static ROLE_WAKE_TIMER: UInt = 7
+
+/// Every band but `Background` at 3, above root's main thread.
+static NORMAL_AT_3: UInt32 = 0x3333_3330
+/// `Normal` at 1, below root's main thread, and `High` at 3.
+static HIGH_AT_3: UInt32 = 0x3333_3110
+/// Every band but `Background` at 2, root's main thread's level.
+static NORMAL_AT_2: UInt32 = 0x2222_2220
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer | SystemRight.ClockGet)
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The piece of the pool mapped into a mapped round's child: whole pages, so
+/// whole grains on every profile.
+static PIECE_LEN: UInt = 0x2000
+
+/// One thread's stack at a time. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let raw = set.len() == RAW_ROUNDS
+    let img = take_memory(&var set, TAG_IMAGE)
+    let ram = take_memory(&var set, TAG_RAM)
+    if raw {
+        guard var pool_rec = set.take(TAG_POOL) else {
+            panic("SOS section: no record under tag {}", TAG_POOL)
+        }
+        guard let pool = pool_rec.take_pool() else {
+            panic("SOS section: the record under tag {} is no Pool", TAG_POOL)
+        }
+        try raw_rounds(&img, &ram, &pool)
+    } else {
+        try rounds(&img, &ram)
+    }
+    print("SOS section: done")
+    return
+}
+
+/// Every round but the raw ones.
+func rounds(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    try sosmain.context().process().section_register()
+    try deferred()
+    try nested()
+    try lower()
+    try irq()
+    try other(&img, &ram)
+    try away(&img, &ram)
+    try yielding(&img, &ram, "yield", ROLE_YIELD)
+    try yielding(&img, &ram, "yield tail", ROLE_YIELD_TAIL)
+    try with_role(&img, &ram, "park", ROLE_PARK)
+    try with_role(&img, &ram, "exit", ROLE_EXIT)
+    try with_role(&img, &ram, "twice", ROLE_TWICE)
+    try with_role(&img, &ram, "denied", ROLE_DENIED)
+    try with_role(&img, &ram, "unregistered", ROLE_UNREGISTERED)
+    try with_role(&img, &ram, "unbalanced", ROLE_UNBALANCED)
+    return
+}
+
+/// The raw rounds.
+func raw_rounds(img: &Memory, ram: &Memory,
+                pool: &Pool) -> Result<Void, SosStatus> {
+    try with_role(&img, &ram, "unaligned", ROLE_UNALIGNED)
+    try mapped(&img, &ram, &pool, "outside", ROLE_OUTSIDE)
+    try mapped(&img, &ram, &pool, "odd mapped", ROLE_ODD_MAPPED)
+    try mapped(&img, &ram, &pool, "second mapped", ROLE_SECOND_MAPPED)
+    try with_role(&img, &ram, "readonly", ROLE_READONLY)
+    try with_role(&img, &ram, "straddle", ROLE_STRADDLE)
+    try with_role(&img, &ram, "wake timer", ROLE_WAKE_TIMER)
+    return
+}
+
+func take_memory(set: &var BootSet, tag: UInt) -> Memory {
+    guard var record = set.take(tag) else {
+        panic("SOS section: no record under tag {}", tag)
+    }
+    guard let memory = record.take_memory() else {
+        panic("SOS section: the record under tag {} is no Memory", tag)
+    }
+    move memory
+}
+
+/// A thread of this process that runs `run(arg)` on the one stack.
+func thread(run: FuncPointer<(UInt) sync -> UInt>,
+            arg: UInt) -> Result<Thread, SosStatus> {
+    sosmain.context().process().thread_create(run: run, arg: arg,
+                                              stack_top: top())
+}
+
+/// 1 when the section reads pending, else 0.
+func pending() -> Int {
+    if Section.pending() { 1 } else { 0 }
+}
+
+// -----------------------------------------------------------------------------
+// Root's own rounds
+// -----------------------------------------------------------------------------
+
+/// `defer`.
+func deferred() -> Result<Void, SosStatus> {
+    let h = try thread(run: says, arg: SAYS_DEFER)
+    Section.enter()
+    try h.start(band: Priority.High)
+    print("SOS section: defer: held pending={}", pending())
+    Section.leave()
+    print("SOS section: defer: after pending={}", pending())
+    let _ = try h.join()
+    return
+}
+
+/// The line a round's other thread prints, by round.
+static SAYS_DEFER: UInt = 0
+static SAYS_NESTED: UInt = 1
+static SAYS_LOWER: UInt = 2
+
+func says(round: UInt) sync -> UInt {
+    if round == SAYS_DEFER {
+        print("SOS section: defer: H")
+    } else if round == SAYS_NESTED {
+        print("SOS section: nested: H")
+    } else {
+        print("SOS section: lower: L")
+    }
+    0
+}
+
+/// `lower`: a yield inside the section with a sibling ready only below: the
+/// pick takes root again, ahead of it, so nothing was held back and nothing
+/// reads pending.
+func lower() -> Result<Void, SosStatus> {
+    let me = try sosmain.context().process().thread_self()
+    let l = try thread(run: says, arg: SAYS_LOWER)
+    Section.enter()
+    try l.start(band: Priority.Low)
+    try me.yield_now()
+    print("SOS section: lower: held pending={}", pending())
+    Section.leave()
+    let _ = try l.join()
+    return
+}
+
+/// `nested`.
+func nested() -> Result<Void, SosStatus> {
+    let h = try thread(run: says, arg: SAYS_NESTED)
+    Section.enter()
+    Section.enter()
+    try h.start(band: Priority.High)
+    Section.leave()
+    print("SOS section: nested: N")
+    Section.leave()
+    let _ = try h.join()
+    return
+}
+
+/// `irq`: the Waiter H parks on, by address, as the thread's argument.
+func irq() unsafe -> Result<Void, SosStatus> {
+    let clock = try sosmain.context().system().clock_get()
+    let timer = try clock.timer_create()
+    var waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(timer: &timer, key: KEY_EVENT)
+    let at = ((&var waiter) as UnsafePointer<Waiter>) as UInt
+    let h = try thread(run: fired, arg: at)
+    try h.start(band: Priority.High)
+    Section.enter()
+    try timer.arm(after_ns: FIRE_NS)
+    while not Section.pending() { }
+    print("SOS section: irq: D")
+    Section.leave()
+    let _ = try h.join()
+    return
+}
+
+/// One millisecond: whenever it ends, root is inside the section.
+static FIRE_NS: UInt64 = 1_000_000
+
+func fired(at: UInt) sync -> UInt {
+    wait_at(at, "irq")
+    print("SOS section: irq: H")
+    0
+}
+
+func wait_at(at: UInt, round: String) unsafe sync {
+    let waiter = at as UnsafePointer<Waiter>
+    let _ = try waiter[0].wait() catch {
+        panic("SOS section: {}: the wait was refused: {}", round, error)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The child's rounds
+// -----------------------------------------------------------------------------
+
+/// `other`: the child parks on `go` at the start, which runs it at once.
+func other(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try launch(&img, &ram, ROLE_OTHER, NORMAL_AT_3)
+    let go = try sosmain.context().process().event_create()
+    let kept = try go.mint()
+    try give_event(&child, move go, TAG_GO)
+    try start(&child)
+    Section.enter()
+    try kept.signal(bits: 1)
+    print("SOS section: other: R")
+    Section.leave()
+    try ended(move child, "other")
+}
+
+/// `away`: Q parks on `to_root` at `High` before the child is made; the child
+/// holds `to_root`'s signalling sibling and its `High` thread parks on
+/// `to_high`, which Q signals.
+func away(img: &Memory, ram: &Memory) unsafe -> Result<Void, SosStatus> {
+    let to_root = try sosmain.context().process().event_create()
+    let to_root_given = try to_root.mint()
+    var waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &to_root, key: KEY_EVENT)
+    let to_high = try sosmain.context().process().event_create()
+    var to_high_kept = try to_high.mint()
+    let to_high2 = try sosmain.context().process().event_create()
+    var to_high2_kept = try to_high2.mint()
+    var q_args = QArgs(
+        waiter: ((&var waiter) as UnsafePointer<Waiter>) as UInt,
+        to_high: ((&var to_high_kept) as UnsafePointer<Event>) as UInt,
+        to_high2: ((&var to_high2_kept) as UnsafePointer<Event>) as UInt)
+    let q = try thread(run: q_runs,
+                       arg: ((&var q_args) as UnsafePointer<QArgs>) as UInt)
+    try q.start(band: Priority.High)
+
+    let child = try launch(&img, &ram, ROLE_AWAY, HIGH_AT_3)
+    try child.quota_set(QuotaKind.Thread, limit: AWAY_THREADS)
+    try child.quota_set(QuotaKind.Handle, limit: AWAY_HANDLES)
+    try give_event(&child, move to_root_given, TAG_TO_ROOT)
+    try give_event(&child, move to_high, TAG_TO_HIGH)
+    try give_event(&child, move to_high2, TAG_TO_HIGH2)
+    try start(&child)
+    try ended(move child, "away")
+    let _ = try q.join()
+    return
+}
+
+/// What Q is handed: the Waiter it parks on and the two Events it signals,
+/// in order, by address.
+struct QArgs {
+    waiter: UInt,
+    to_high: UInt,
+    to_high2: UInt,
+}
+
+func q_runs(at: UInt) sync -> UInt {
+    q_body(at)
+    0
+}
+
+func q_body(at: UInt) unsafe sync {
+    let args = (at as UnsafePointer<QArgs>)[0]
+    wait_at(args.waiter, "away")
+    print("SOS section: away: Q ran above the holder")
+    let to_high = args.to_high as UnsafePointer<Event>
+    try to_high[0].signal(bits: 1) catch {
+        panic("SOS section: away: Q's signal was refused: {}", error)
+    }
+    let to_high2 = args.to_high2 as UnsafePointer<Event>
+    try to_high2[0].signal(bits: 1) catch {
+        panic("SOS section: away: Q's second signal was refused: {}", error)
+    }
+}
+
+/// A raw round with a piece of the pool mapped into the child, its address
+/// told.
+func mapped(img: &Memory, ram: &Memory, pool: &Pool, round: String,
+            role: UInt) -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try tell(&child, TAG_ROLE, role)
+    let piece = try pool.allocate(len: PIECE_LEN)
+    let mapping = try child.map(memory: &piece, access: RW)
+    try tell(&child, TAG_ADDR, try mapping.base())
+    try start(&child)
+    try ended(move child, round)
+}
+
+/// `yield` and `yield tail`: Q waits at root's level on `to_root`, which the
+/// child signals, and signals `to_y`, on which `yield`'s Y waits; the child's
+/// main thread runs once root parks and Q has parked.
+func yielding(img: &Memory, ram: &Memory, round: String,
+              role: UInt) unsafe -> Result<Void, SosStatus> {
+    let to_root = try sosmain.context().process().event_create()
+    let to_root_given = try to_root.mint()
+    var waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &to_root, key: KEY_EVENT)
+    let to_y = try sosmain.context().process().event_create()
+    var to_y_kept = try to_y.mint()
+    var q_args = QArgs(
+        waiter: ((&var waiter) as UnsafePointer<Waiter>) as UInt,
+        to_high: ((&var to_y_kept) as UnsafePointer<Event>) as UInt,
+        to_high2: 0)
+    let q = try thread(run: q_yields,
+                       arg: ((&var q_args) as UnsafePointer<QArgs>) as UInt)
+    try q.start(band: Priority.Normal)
+    let child = try launch(&img, &ram, role, NORMAL_AT_2)
+    try child.quota_set(QuotaKind.Thread, limit: YIELD_THREADS)
+    try child.quota_set(QuotaKind.Handle, limit: YIELD_HANDLES)
+    try give_event(&child, move to_root_given, TAG_TO_ROOT)
+    try give_event(&child, move to_y, TAG_TO_HIGH)
+    try start(&child)
+    try ended(move child, round)
+    let _ = try q.join()
+    return
+}
+
+func q_yields(at: UInt) sync -> UInt {
+    q_yield_body(at)
+    0
+}
+
+func q_yield_body(at: UInt) unsafe sync {
+    let args = (at as UnsafePointer<QArgs>)[0]
+    wait_at(args.waiter, "yield")
+    print("SOS section: yield: Q ran")
+    let to_y = args.to_high as UnsafePointer<Event>
+    try to_y[0].signal(bits: 1) catch {
+        panic("SOS section: yield: Q's signal was refused: {}", error)
+    }
+}
+
+/// A child given its role, mapped with `map` when there is one.
+func launch(img: &Memory, ram: &Memory, role: UInt,
+            map: UInt32?) -> Result<Process, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    if let m = map {
+        try child.band_map(map: m)
+    }
+    try tell(&child, TAG_ROLE, role)
+    return move child
+}
+
+/// A child given its role and started under the simple map, waited out.
+func with_role(img: &Memory, ram: &Memory, round: String,
+               role: UInt) -> Result<Void, SosStatus> {
+    let child = try launch(&img, &ram, role, None)
+    try start(&child)
+    try ended(move child, round)
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(child: &Process, tag: UInt, value: UInt) -> Result<Void, SosStatus> {
+    let ev = try sosmain.context().process().event_create()
+    try ev.signal(bits: value)
+    try give_event(&child, move ev, tag)
+}
+
+func give_event(child: &Process, event: Event,
+                tag: UInt) -> Result<Void, SosStatus> {
+    try child.give(event: move event, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Give `child` a System under `TAG_BOOT` and start it on it.
+func start(child: &Process) -> Result<Void, SosStatus> {
+    let boot = try sosmain.context().system().mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return
+}
+
+/// Wait for `child`'s death and print its status word.
+func ended(child: Process, round: String) -> Result<Void, SosStatus> {
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH {
+                return BUG
+            }
+            print("SOS section: {} ended status={}", round, status)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}

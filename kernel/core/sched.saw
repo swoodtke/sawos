@@ -35,6 +35,7 @@ import kcore.limits.{
     ROOT_PROCESS,
 }
 import kcore.result.{op_status, op_value, write_result}
+import kcore.mem.{word_bytes}
 import kcore.diag.{ExitCode, console, fatal_deadlock, fatal_kernel}
 import kcore.stats.{stats_read}
 import kcore.pslot.{PROCESSES, PROCESS_RECORDS, ProcessState, body_of,
@@ -62,6 +63,7 @@ import kcore.threads.{
     NEED_RESCHED,
     PENDING_FREE,
     READY_BITS,
+    SLICE_ENDED,
     SLICE_LEFT,
     SLICE_TICKS,
     THREADS,
@@ -70,10 +72,13 @@ import kcore.threads.{
     frame_slot,
     live_threads,
     ready_above,
+    ready_peek,
     ready_pop,
     ready_push,
     ready_push_head,
+    ready_remove,
     ready_remove_process,
+    ready_rotate,
     unjoin_process,
 }
 import kcore.time.{TIMERS, TimerState, reprogram_timer}
@@ -132,6 +137,7 @@ func run_thread(next: Int) unsafe -> UInt {
     THREADS[next].state = ThreadState.Running
     SLICE_LEFT = SLICE_TICKS
     NEED_RESCHED = false
+    SLICE_ENDED = false
     let np = THREADS[next].process
     if np != LAST_PROT_PROCESS {
         load_domain(np)
@@ -182,8 +188,16 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     // round-robin after a slice's end or a yield. A tick and a wake in one
     // trap read as the preemption. One that blocked or exited is already on
     // the list it belongs to, or on none.
+    //
+    // A thread whose process's section is held stays on the processor instead
+    // when the thread the pick would take is a sibling (`section_keeps`).
     match THREADS[cur].state {
         case Running -> {
+            if section_keeps(cur) {
+                NEED_RESCHED = false
+                SLICE_ENDED = false
+                return current_frame
+            }
             THREADS[cur].state = ThreadState.Runnable
             if ready_above(THREADS[cur].level) {
                 ready_push_head(cur)
@@ -202,20 +216,7 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     // what a teardown leaves of the slot.
     hal.fp_switch_out(current_frame)
 
-    var next = ready_pop()
-    if next == NO_THREAD {
-        // Nothing runnable. With a bound IRQ line or an armed Timer
-        // (`has_external_wake_source`), readiness can still arrive from outside
-        // the set of runnable threads, so the kernel waits for it in the idle
-        // path. With neither, every thread is blocked on something no thread
-        // can now deliver: a deadlock, which stops the machine. No process is
-        // ended, since which thread blocked last is timing.
-        if not has_external_wake_source() {
-            fatal_deadlock()
-        }
-        idle_until_runnable()
-        next = ready_pop()
-    }
+    let next = take_next()
 
     // The outgoing thread is not read past this point. An exited thread that
     // nothing names goes now (`PENDING_FREE`).
@@ -226,6 +227,28 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     }
 
     run_thread(next)
+}
+
+/// Take the thread to run next off the ready lists, waiting in the idle path
+/// for one when none is ready, and give way to its process's section
+/// (`section_displaces`).
+///
+/// Nothing runnable is one of two things. With a bound IRQ line or an armed
+/// Timer (`has_external_wake_source`), readiness can still arrive from outside
+/// the set of runnable threads, so the kernel waits for it in the idle path.
+/// With neither, every thread is blocked on something no thread can now
+/// deliver: a deadlock, which stops the machine. No process is ended, since
+/// which thread blocked last is timing.
+func take_next() unsafe -> Int {
+    var next = ready_pop()
+    if next == NO_THREAD {
+        if not has_external_wake_source() {
+            fatal_deadlock()
+        }
+        idle_until_runnable()
+        next = ready_pop()
+    }
+    section_displaces(next)
 }
 
 /// Park the core until something is runnable again.
@@ -269,15 +292,178 @@ func idle_until_runnable() unsafe {
 /// notifies before tearing down), so `ready_pop` finds root and this arm is not
 /// reached. What does reach it is a genuine deadlock.
 func resume_after_death() unsafe -> Never {
-    var next = ready_pop()
-    if next == NO_THREAD {
-        if not has_external_wake_source() {
-            fatal_deadlock()
-        }
-        idle_until_runnable()
-        next = ready_pop()
+    hal.resume_frame(run_thread(take_next()))
+}
+
+// =============================================================================
+// The section word (spec §7)
+// =============================================================================
+//
+// A process that registered a section word (`ProcessOp.SectionWord`) holds its
+// section while the word's depth is nonzero, and then no thread of it runs but
+// its holder. The process writes the depth with plain stores and no trap, so
+// the kernel reads it where it decides who runs: in `pick_next` as a thread
+// leaves the processor, and in `take_next` as one is taken off the ready
+// lists. Those are the two places the scheduler could run a thread of the
+// process other than the one that entered.
+//
+// The holder is the thread that was running when the scheduler last found the
+// section held as that thread left the processor, or the running thread while
+// it runs. Its own threads raise the depth only while running, and while it
+// is raised no sibling runs, so the holder is never in doubt for them. It is
+// recorded (`ProcessBody.section_holder`) only for the case where it leaves
+// the processor holding the section: a thread of another process took it, at
+// a higher level or at a slice's end. The depth can also be raised while no
+// thread of the process runs, by a write into the pair the process did not
+// make itself (a wake's record delivered into a buffer the process placed on
+// the pair, or a launcher writing through the memory it keeps); then there is
+// no holder, and the first thread of the process to run becomes it.
+//
+// Where the scheduler would run a sibling, it runs the holder instead and
+// writes the pending flag, the word above the depth. The holder thereby runs
+// in the sibling's place, against every other process, so it finishes the
+// section ahead of whatever the sibling would have been ahead of: the
+// immediate ceiling, applied only when a sibling is waiting. The sibling keeps
+// its place at the head of its level, but for the slice the holder runs in its
+// place, which it is charged at the slice's end, so that another process's
+// threads at its level keep their turns. The process leaves by lowering the
+// depth to zero and, if the flag is set, yielding, and the scheduler clears
+// the flag when it finds the depth zero.
+//
+// A section never decides between two other processes' threads, and never
+// keeps one off the processor: the checks below act only when the thread in
+// question is the section's own process's.
+//
+// A thread that parks or exits holding the section faults its process
+// (`FaultReason.SectionHeld`, decided in `kcore.dispatch`): no sibling could
+// ever run again, and the section could never be left.
+
+/// Whether process `p` holds its section: it registered a word, and the
+/// depth reads nonzero. `p` is live.
+public(package) func section_held(p: Int) unsafe -> Bool {
+    let at = PROCESSES[body_of(p)].section_at
+    at != 0 && UnsafeMemory<UInt, Normal>(at).read() != 0
+}
+
+/// Whether live process `p` holds its section, and when it does not, clear
+/// its pending flag and forget its holder: the scheduler found the section
+/// left, so nothing is held back by it any more.
+func section_check(p: Int) unsafe -> Bool {
+    let b = body_of(p)
+    let at = PROCESSES[b].section_at
+    if at == 0 {
+        return false
     }
-    hal.resume_frame(run_thread(next))
+    if UnsafeMemory<UInt, Normal>(at).read() != 0 {
+        return true
+    }
+    UnsafeMemory<UInt, Normal>(at + word_bytes()).write(0)
+    PROCESSES[b].section_holder = 0
+    false
+}
+
+/// Tell body `b`'s process that its section held a sibling back.
+func section_defer(b: Int) unsafe {
+    UnsafeMemory<UInt, Normal>(PROCESSES[b].section_at + word_bytes()).write(1)
+}
+
+/// The first place: running thread `cur` is leaving the processor. Whether it
+/// stays on it instead, because its process's section is held and the thread
+/// the pick would take is a sibling at or above its level.
+///
+/// A held section records `cur` as its holder either way. A sibling below
+/// `cur`'s level is no deferral: the pick takes `cur` again, ahead of it, so
+/// the flag is not written for it.
+///
+/// At a slice's end the sibling at the head is charged for the slice the
+/// holder ran in its place: it goes to the tail of its level, as it would
+/// have after a slice of its own, and the pick is asked again. A thread of
+/// another process queued behind it at that level is then the one the pick
+/// takes, and the holder leaves the processor for it as for any other
+/// process's thread. Without the charge the same sibling would head its level
+/// at every slice's end for as long as the section is held, and that thread
+/// would never get its turn.
+func section_keeps(cur: Int) unsafe -> Bool {
+    let p = THREADS[cur].process
+    if not section_check(p) {
+        return false
+    }
+    let b = body_of(p)
+    PROCESSES[b].section_holder = cur + 1
+    if not defers_to(cur, ready_peek()) {
+        return false
+    }
+    if SLICE_ENDED {
+        ready_rotate(ready_peek())
+        if not defers_to(cur, ready_peek()) {
+            return false
+        }
+    }
+    section_defer(b)
+    true
+}
+
+/// Whether `next`, the thread the pick would take, is a sibling of running
+/// thread `cur` at or above its level: one a held section keeps `cur` on the
+/// processor in place of.
+func defers_to(cur: Int, next: Int) unsafe -> Bool {
+    if next == NO_THREAD {
+        return false
+    }
+    let p = THREADS[cur].process
+    if THREADS[next].process != p {
+        return false
+    }
+    let own = THREADS[cur].level
+    THREADS[next].level >= own
+}
+
+/// The second place: `next` was taken off the ready lists. The thread to run
+/// in its place: `next` itself, or, when its process's section is held by
+/// another thread, that holder, taken off its own level's list, while `next`
+/// goes back to the head of its level.
+///
+/// A holder that is not a ready thread of the process names nothing the
+/// scheduler can run: the depth was raised while no thread of the process
+/// ran, by a write the process did not make itself (a wake's record
+/// delivered into a buffer it placed on the pair, or a launcher writing
+/// through the memory it keeps). `next` runs, and is the holder from here.
+///
+/// A ready holder is always on its level's list: every write of `Runnable` is
+/// followed by a push, so `ready_remove` finds it, and its `fatal_kernel` is a
+/// kernel bug's stop, which no process can reach.
+func section_displaces(next: Int) unsafe -> Int {
+    let p = THREADS[next].process
+    if not section_check(p) {
+        return next
+    }
+    let b = body_of(p)
+    let h = PROCESSES[b].section_holder - 1
+    if h == next {
+        return next
+    }
+    if h < 0 || not ready_sibling(h, p) {
+        PROCESSES[b].section_holder = next + 1
+        return next
+    }
+    if not ready_remove(h) {
+        fatal_kernel("a runnable section holder was on no ready list",
+                     h as UInt)
+    }
+    ready_push_head(next)
+    section_defer(b)
+    h
+}
+
+/// Whether slot `t` is a ready thread of process `p`.
+func ready_sibling(t: Int, p: Int) unsafe -> Bool {
+    if THREADS[t].process != p {
+        return false
+    }
+    match THREADS[t].state {
+        case Runnable -> true,
+        case _ -> false,
+    }
 }
 
 /// Retire the running thread with `code`, waking everything that joined it, and

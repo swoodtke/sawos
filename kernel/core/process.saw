@@ -182,6 +182,10 @@ func free_body() unsafe -> Int {
 public(package) func link_process(p: Int, b: Int) unsafe {
     link_body(p, b)
     PROCESSES[b].live = true
+    // A body starts with no section word: the last occupant's pointed into
+    // memory that is no longer its process's.
+    PROCESSES[b].section_at = 0
+    PROCESSES[b].section_holder = 0
 }
 
 /// Give root its record and its body, the first of each table.
@@ -621,6 +625,24 @@ public(package) func translate_user(
         i = i + 1
     }
     return FaultReason.BadBuffer
+}
+
+/// Whether user address `va` lies in one of the rows process `p`'s image was
+/// placed with (`ProcessBody.image_rows`): a row that lasts as long as the
+/// body, where a row `map` installed can be unmapped. No two rows of a process
+/// meet, so a range `translate_user` resolved at `va` lies in the row this
+/// finds.
+public(package) func in_image_row(p: Int, va: UInt) unsafe -> Bool {
+    let b = body_of(p)
+    var i: Int = 0
+    while i < PROCESSES[b].image_rows {
+        let row = PROCESSES[b].grants[i]
+        if va >= row.base && va < row.top {
+            return true
+        }
+        i = i + 1
+    }
+    false
 }
 
 /// May a thread of process `p` start with its stack pointer at `stack_top`?

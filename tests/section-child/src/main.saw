@@ -1,0 +1,329 @@
+// Test child written with `main`, for `section` and `section_tick`: the role
+// its launcher gives it, as the bits of an Event under `TAG_ROLE`, says what
+// `main` does. Its band map is the one its launcher sets, or the simple map.
+//
+//   OTHER     under `Normal` at 3, parks on the Event under `TAG_GO` at its
+//             start; the launcher signals it from inside its own section, and
+//             this prints at once
+//   AWAY      under `Normal` at 1 and `High` at 3: registers and starts two
+//             threads at `High`, which park on the Events under `TAG_TO_HIGH`
+//             and `TAG_TO_HIGH2`. Then this main thread enters, prints and
+//             signals the Event under `TAG_TO_ROOT`, which readies the
+//             launcher's Q above it. Q signals the two Events in order and
+//             exits, and the pick takes the first `High` thread: this main
+//             thread, the holder, runs in its place, and prints again before
+//             it leaves. The first `High` thread kept its place ahead of the
+//             second, so the two print in their order after it, and the
+//             holder's last line after both, its leave having yielded to them
+//   YIELD     under `Normal` at its launcher's level: registers, parks Y at
+//             `Normal` on the Event under `TAG_TO_HIGH`, makes S and X at
+//             `Normal`, enters, signals the Event under `TAG_TO_ROOT`, which
+//             readies the launcher's Q, starts S and X behind Q, and yields.
+//             Q readies Y and exits; then this thread runs in S's place, and
+//             its leave yields to S, X and Y
+//   YIELD TAIL    as `YIELD`, with no Y
+//   PARK      registers, enters and parks on an Event nobody signals: the
+//             `SectionHeld` fault
+//   EXIT      registers and joins a second thread, which enters and exits:
+//             the `SectionHeld` fault
+//   TWICE     writes its pending flag, registers, prints the flag (the
+//             registration clears it), and registers again: the `BadState`
+//             fault
+//   DENIED    registers through a sibling of its own handle without
+//             `ThreadCreate`: the `AccessDenied` fault
+//   UNREGISTERED  enters a section it never registered: a panic
+//   UNBALANCED    registers and leaves a section it never entered: a panic
+//   CONFINED  under the simple map, beside a launcher at its own level, with
+//             the tick on: registers, enters, signals the Event under
+//             `TAG_GO` and spins inside its section until it is killed
+//   CONFINED PEER  as `CONFINED`, with a sibling started at its own level
+//             inside the section, ahead of the launcher it then readies
+//   CONFINED LOW   as `CONFINED`, under `Normal` at 0 and `High` at 1, with a
+//             sibling started at `High`, its launcher's level, inside the
+//             section, ahead of the launcher it then readies
+//
+// A sibling of a `CONFINED` role panics if it ever runs: its process is
+// killed with the section held, so it never should.
+//
+// A role that comes back from what should have ended it panics naming it,
+// which the case reads as the wrong line. Every print inside a section goes
+// out through the kernel's debug print, which never parks, and no sibling
+// holds the runtime's output lock while one is made: a print waits for that
+// lock by yielding, and a held section hands the processor straight back to
+// its holder, so a print inside a section waits for good on a sibling that
+// holds it.
+
+import sos.{BootSet, Event, Thread, Waiter, Priority, Section, SosStatus,
+            ProcessRight, ALL_RIGHTS}
+import sosmain
+import sosrt.{section_word}
+
+static TAG_ROLE: UInt = 40
+static TAG_GO: UInt = 41
+static TAG_TO_ROOT: UInt = 42
+static TAG_TO_HIGH: UInt = 43
+static TAG_TO_HIGH2: UInt = 45
+
+static KEY_EVENT: UInt = 7
+
+static ROLE_OTHER: UInt = 1
+static ROLE_AWAY: UInt = 2
+static ROLE_PARK: UInt = 3
+static ROLE_EXIT: UInt = 4
+static ROLE_TWICE: UInt = 5
+static ROLE_DENIED: UInt = 6
+static ROLE_UNREGISTERED: UInt = 7
+static ROLE_CONFINED: UInt = 8
+static ROLE_UNBALANCED: UInt = 9
+static ROLE_CONFINED_PEER: UInt = 10
+static ROLE_CONFINED_LOW: UInt = 11
+static ROLE_YIELD: UInt = 12
+static ROLE_YIELD_TAIL: UInt = 13
+
+/// Three threads' stacks. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+static STACKS: Int = 3
+unsafe static var STACK: [UInt; STACK_WORDS * STACKS] = [0; STACK_WORDS * STACKS]
+
+/// The top of stack `i`.
+func top(i: Int) unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + ((i + 1) * STACK_WORDS) as UInt * (sizeof<UInt>() as UInt)
+}
+
+func main() -> Result<Int, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let role = try bits_under(&var set, TAG_ROLE)
+    if role == ROLE_OTHER {
+        let go = take_event(&var set, TAG_GO)
+        try wait_on(&go)
+        print("SOS sectionchild: other: the child ran")
+        return 0
+    }
+    if role == ROLE_AWAY {
+        try away(&var set)
+        return 0
+    }
+    if role == ROLE_PARK {
+        let never = try sosmain.context().process().event_create()
+        try sosmain.context().process().section_register()
+        Section.enter()
+        print("SOS sectionchild: park: waiting inside the section")
+        try wait_on(&never)
+    }
+    if role == ROLE_EXIT {
+        try sosmain.context().process().section_register()
+        let t = try thread(run: exits_inside, arg: 0, i: 0)
+        try t.start()
+        let _ = try t.join()
+        print("SOS sectionchild: exit: joined")
+    }
+    if role == ROLE_TWICE {
+        twice()
+        try sosmain.context().process().section_register()
+        print("SOS sectionchild: twice: pending after the registration={}",
+              if Section.pending() { 1 } else { 0 })
+        print("SOS sectionchild: twice: registering again")
+        let _ = sosmain.context().process().section_register()
+    }
+    if role == ROLE_DENIED {
+        let narrow = try sosmain.context().process().mint(
+            rights: ALL_RIGHTS & ~(ProcessRight.ThreadCreate as UInt32))
+        print("SOS sectionchild: denied: registering without ThreadCreate")
+        let _ = narrow.section_register()
+    }
+    if role == ROLE_UNREGISTERED {
+        print("SOS sectionchild: unregistered: entering")
+        Section.enter()
+    }
+    if role == ROLE_UNBALANCED {
+        try sosmain.context().process().section_register()
+        print("SOS sectionchild: unbalanced: leaving")
+        Section.leave()
+    }
+    if role == ROLE_YIELD || role == ROLE_YIELD_TAIL {
+        try yielding(&var set, role == ROLE_YIELD)
+        return 0
+    }
+    if role == ROLE_CONFINED {
+        let go = take_event(&var set, TAG_GO)
+        try sosmain.context().process().section_register()
+        Section.enter()
+        try go.signal(bits: 1)
+        while { }
+    }
+    if role == ROLE_CONFINED_PEER || role == ROLE_CONFINED_LOW {
+        let go = take_event(&var set, TAG_GO)
+        try sosmain.context().process().section_register()
+        let s = try thread(run: never_runs, arg: 0, i: 0)
+        Section.enter()
+        let band = if role == ROLE_CONFINED_PEER {
+            Priority.Normal
+        } else {
+            Priority.High
+        }
+        try s.start(band: band)
+        try go.signal(bits: 1)
+        while { }
+    }
+    panic("SOS sectionchild: role {} came back", role)
+}
+
+/// The bits of the Event under `tag`, which is released once read.
+func bits_under(set: &var BootSet, tag: UInt) -> Result<UInt, SosStatus> {
+    let event = take_event(&var set, tag)
+    event.receive()
+}
+
+func take_event(set: &var BootSet, tag: UInt) -> Event {
+    guard var record = set.take(tag) else {
+        panic("SOS sectionchild: no record under tag {}", tag)
+    }
+    guard let event = record.take_event() else {
+        panic("SOS sectionchild: the record under tag {} is no Event", tag)
+    }
+    move event
+}
+
+/// Park until `event` is signalled.
+func wait_on(event: &Event) -> Result<Void, SosStatus> {
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &event, key: KEY_EVENT)
+    let _ = try waiter.wait()
+    return
+}
+
+/// A thread of this process that runs `run(arg)` on stack `i`.
+func thread(run: FuncPointer<(UInt) sync -> UInt>, arg: UInt,
+            i: Int) -> Result<Thread, SosStatus> {
+    sosmain.context().process().thread_create(run: run, arg: arg,
+                                              stack_top: top(i))
+}
+
+/// What a `High` thread of `AWAY` is handed: the Waiter it parks on, by
+/// address, and which of the two it is.
+struct HighArgs {
+    waiter: UInt,
+    which: UInt,
+}
+
+/// `AWAY`.
+func away(set: &var BootSet) unsafe -> Result<Void, SosStatus> {
+    let to_root = take_event(&var set, TAG_TO_ROOT)
+    let to_high = take_event(&var set, TAG_TO_HIGH)
+    let to_high2 = take_event(&var set, TAG_TO_HIGH2)
+    try sosmain.context().process().section_register()
+    var waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &to_high, key: KEY_EVENT)
+    var waiter2 = try sosmain.context().process().waiter_create()
+    try waiter2.add(event: &to_high2, key: KEY_EVENT)
+    var args = HighArgs(
+        waiter: ((&var waiter) as UnsafePointer<Waiter>) as UInt, which: 1)
+    var args2 = HighArgs(
+        waiter: ((&var waiter2) as UnsafePointer<Waiter>) as UInt, which: 2)
+    let h = try thread(run: high_runs,
+                       arg: ((&var args) as UnsafePointer<HighArgs>) as UInt,
+                       i: 0)
+    let h2 = try thread(run: high_runs,
+                        arg: ((&var args2) as UnsafePointer<HighArgs>) as UInt,
+                        i: 1)
+    try h.start(band: Priority.High)
+    try h2.start(band: Priority.High)
+    Section.enter()
+    print("SOS sectionchild: away: A entered")
+    try to_root.signal(bits: 1)
+    print("SOS sectionchild: away: A resumed held")
+    Section.leave()
+    print("SOS sectionchild: away: A left")
+    let _ = try h.join()
+    let _ = try h2.join()
+    return
+}
+
+/// `YIELD`.
+func yielding(set: &var BootSet,
+              with_y: Bool) unsafe -> Result<Void, SosStatus> {
+    let to_root = take_event(&var set, TAG_TO_ROOT)
+    let to_y = take_event(&var set, TAG_TO_HIGH)
+    try sosmain.context().process().section_register()
+    let me = try sosmain.context().process().thread_self()
+    var waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &to_y, key: KEY_EVENT)
+    var args = HighArgs(
+        waiter: ((&var waiter) as UnsafePointer<Waiter>) as UInt, which: 0)
+    // Y's handle goes at the end of this block, and Y runs all the same: it
+    // is ahead of this thread on its level's list when it prints.
+    if with_y {
+        let y = try thread(run: y_runs,
+                           arg: ((&var args) as UnsafePointer<HighArgs>) as UInt,
+                           i: 2)
+        try y.start()
+        try me.yield_now()
+    }
+    let s = try thread(run: says_yield, arg: YIELD_S, i: 0)
+    let x = try thread(run: says_yield, arg: YIELD_X, i: 1)
+    Section.enter()
+    try to_root.signal(bits: 1)
+    try s.start()
+    try x.start()
+    try me.yield_now()
+    print("SOS sectionchild: yield: A resumed held")
+    Section.leave()
+    print("SOS sectionchild: yield: A left")
+    let _ = try s.join()
+    let _ = try x.join()
+    return
+}
+
+/// `YIELD`'s Y: parks on the Event under `TAG_TO_HIGH` before the section is
+/// entered.
+func y_runs(at: UInt) sync -> UInt {
+    let _ = high_body(at)
+    print("SOS sectionchild: yield: Y ran")
+    0
+}
+
+static YIELD_S: UInt = 0
+static YIELD_X: UInt = 1
+
+func says_yield(which: UInt) sync -> UInt {
+    if which == YIELD_S {
+        print("SOS sectionchild: yield: S ran")
+    } else {
+        print("SOS sectionchild: yield: X ran")
+    }
+    0
+}
+
+/// A `CONFINED` sibling: its process is killed with the section held.
+func never_runs(arg: UInt) sync -> UInt {
+    panic("SOS sectionchild: confined: a sibling ran inside the section")
+}
+
+func high_runs(at: UInt) sync -> UInt {
+    let which = high_body(at)
+    print("SOS sectionchild: away: High thread {} ran", which)
+    0
+}
+
+func high_body(at: UInt) unsafe sync -> UInt {
+    let args = (at as UnsafePointer<HighArgs>)[0]
+    let waiter = args.waiter as UnsafePointer<Waiter>
+    let _ = try waiter[0].wait() catch {
+        panic("SOS sectionchild: away: the wait was refused: {}", error)
+    }
+    args.which
+}
+
+/// `EXIT`'s second thread.
+func exits_inside(arg: UInt) sync -> UInt {
+    Section.enter()
+    print("SOS sectionchild: exit: ending inside the section")
+    0
+}
+
+/// `TWICE`: the pending flag, written before the registration.
+func twice() unsafe {
+    let pair = section_word() as UnsafePointer<UInt>
+    pair[1] = 1
+}

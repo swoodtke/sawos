@@ -21,6 +21,8 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, Priority, EventOp,
                PipeInletOp, PipeOutletOp, PipeReplyOp, PipeRequestOp,
                RELEASE_OP, MINT_OP, INFO_OP, PANIC_OP, NO_HANDLE, HandleInfo,
                HandleKind}
+import sosrt.{section_enter, section_leave, section_registered,
+             section_word}
 
 // The per-arch HAL's whole surface: the one instruction in the system that
 // crosses the trap boundary. Fixed arity on purpose: a varargs call across a
@@ -589,6 +591,59 @@ public func sos_process_quota_set(handle: UInt, kind: UInt,
 @export("sos_process_band_map")
 public func sos_process_band_map(handle: UInt, map: UInt) -> UInt {
     sos_syscall1(handle, ProcessOp.BandMap as UInt, map)
+}
+
+/// Register the two machine words at `addr` as the calling process's section
+/// word (spec §7): a depth the process writes, and above it a pending flag the
+/// kernel writes. While the depth is nonzero no other thread of the process
+/// runs. Requires `ProcessRight.ThreadCreate` on the caller's own handle.
+///
+/// The runtime keeps the pair a program and its runtime share, which
+/// `sos_process_section_register` registers; this form names any address. A
+/// handle without `ThreadCreate`, a handle naming another process, an `addr`
+/// that is not word-aligned, a pair that is not in one writable row the
+/// process's image was placed with, and a second registration each terminate
+/// the caller, decided in that order.
+@export("sos_process_section_word")
+public func sos_process_section_word(handle: UInt, addr: UInt) -> UInt {
+    sos_syscall1(handle, ProcessOp.SectionWord as UInt, addr)
+}
+
+/// Register the runtime's section word through `handle`, the caller's own
+/// Process handle, after which `sos_section_enter` may be called. The terms
+/// are `sos_process_section_word`'s.
+@export("sos_process_section_register")
+public func sos_process_section_register(handle: UInt) unsafe -> UInt {
+    let status = sos_process_section_word(handle, section_word())
+    if status == (SosStatus.Ok as UInt) {
+        section_registered()
+    }
+    status
+}
+
+/// Enter the calling process's critical section, or enter it once more:
+/// until the matching `sos_section_leave`, no other thread of the process
+/// runs (spec §7). No trap. The section word must be registered
+/// (`sos_process_section_register`), or this panics.
+///
+/// A thread that parks, or exits, inside the section ends its process, so
+/// what runs inside one never waits: no wait, join or call, and no print
+/// through a console driver. A print waits for the runtime's output lock by
+/// yielding, which a held section answers at once, so a print inside one
+/// is safe only while no sibling holds that lock.
+@export("sos_section_enter")
+public func sos_section_enter() {
+    section_enter()
+}
+
+/// Leave the calling process's critical section once. The last leave yields
+/// when the section held a thread back, so that thread runs now, unless the
+/// calling thread has no Thread handle of its own where the runtime keeps
+/// one, in which case the held-back thread runs at the next switch. A leave
+/// with the section not held panics.
+@export("sos_section_leave")
+public func sos_section_leave() {
+    section_leave()
 }
 
 /// Read a process's quota row for `kind`, a `QuotaKind`, into `value_out`: the

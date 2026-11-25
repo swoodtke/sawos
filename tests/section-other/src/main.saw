@@ -1,0 +1,169 @@
+// The section word's registration through a handle naming another process
+// (spec §7): the two orderings of its answers that only such a handle can
+// show. Root launches `section-raw` twice, each time giving it a sibling of
+// root's own Process handle, and waits each launch out:
+//
+//   target denied  the sibling lacks `ThreadCreate`: `AccessDenied`, decided
+//                  before the handle's process
+//   target odd     the sibling holds `ThreadCreate`, and the address is one
+//                  byte past a word: `NotSelf`, decided before the address
+//
+//   SOS sectionother: <round> ended status=<word>
+//
+// Root works at the C altitude, as `tests/process-kill-root` does, because the
+// handle it gives is a raw word: the typed tier has no Process give.
+
+import sos.{System, SystemRight, ProcessRight, ALL_RIGHTS,
+            sos_system_process_self, sos_system_process_create,
+            sos_process_boot_handle_next, sos_process_start, sos_process_give,
+            sos_process_event_create, sos_process_waiter_create,
+            sos_process_get_status, sos_handle_mint, sos_handle_release,
+            sos_event_signal, sos_waiter_add, sos_waiter_wait}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// The tags the child's boot records travel under.
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_TARGET: UInt = 46
+
+/// `section-raw`'s roles.
+static ROLE_TARGET_DENIED: UInt = 8
+static ROLE_TARGET_ODD: UInt = 9
+
+/// The key the child's death is attached under.
+static KEY_DEATH: UInt = 6
+
+/// What the child may ask its System object for.
+static CHILD_SYSTEM: UInt = ((SystemRight.Debug | SystemRight.ProcessSelf
+                              | SystemRight.Transfer) as UInt)
+
+/// The status word a successful op answers with (`SosStatus.Ok`).
+static STATUS_OK: UInt = 0
+
+/// The `BootTagForm` that names a tag.
+static TAG_PRESENT: UInt = 1
+
+/// The boot-handle record: tag, kind, handle.
+static RECORD_WORDS: Int = 3
+static RECORD_HANDLE_WORD: Int = 2
+
+/// A wait record's buffer: more than any record the kernel writes.
+static WAIT_WORDS: Int = 64
+
+/// A raw word naming nothing.
+static NO_WORD: UInt = 0
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+/// The handle word of the next boot record, or `NO_WORD` when the set is
+/// drained.
+func next_word(process: UInt) unsafe -> UInt {
+    var buf: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let bytes = (RECORD_WORDS as UInt) * word_bytes()
+    let status = sos_process_boot_handle_next(process,
+                                              (&var buf) as UnsafePointer<UInt>,
+                                              bytes)
+    if status != STATUS_OK {
+        return NO_WORD
+    }
+    buf[RECORD_HANDLE_WORD]
+}
+
+/// A sibling of `handle` carrying `keep`'s rights, or `NO_WORD`.
+func sibling(handle: UInt, keep: UInt) unsafe -> UInt {
+    var out: UInt = 0
+    if sos_handle_mint(handle, keep, (&var out) as UnsafePointer<UInt>) != STATUS_OK {
+        return NO_WORD
+    }
+    out
+}
+
+/// Give `child` `word` under `tag`.
+func give(child: UInt, word: UInt, tag: UInt) unsafe -> Bool {
+    word != NO_WORD && sos_process_give(child, word, tag,
+                                        ALL_RIGHTS as UInt) == STATUS_OK
+}
+
+/// One launch: `section-raw` made from `image` into `ram`, given `role` and a
+/// sibling of `me` carrying `keep`, started and waited out. Answers whether
+/// every step before the wait was taken.
+func round(system: UInt, me: UInt, image: UInt, ram: UInt, name: String,
+           role: UInt, keep: UInt) unsafe -> Bool {
+    var child: UInt = NO_WORD
+    if sos_system_process_create(system, image, ram, NO_WORD,
+                                 (&var child) as UnsafePointer<UInt>) != STATUS_OK {
+        return false
+    }
+    var ev: UInt = NO_WORD
+    if sos_process_event_create(me, 0, (&var ev) as UnsafePointer<UInt>) != STATUS_OK {
+        return false
+    }
+    let _ = sos_event_signal(ev, role)
+    if not give(child, ev, TAG_ROLE) {
+        return false
+    }
+    if not give(child, sibling(me, keep), TAG_TARGET) {
+        return false
+    }
+    if not give(child, sibling(system, CHILD_SYSTEM), TAG_BOOT) {
+        return false
+    }
+    var waiter: UInt = NO_WORD
+    if sos_process_waiter_create(me, (&var waiter) as UnsafePointer<UInt>) != STATUS_OK {
+        return false
+    }
+    if sos_waiter_add(waiter, child, KEY_DEATH, 0) != STATUS_OK {
+        return false
+    }
+    if sos_process_start(child, TAG_PRESENT, TAG_BOOT) != STATUS_OK {
+        return false
+    }
+    var record: [UInt; WAIT_WORDS] = [0; WAIT_WORDS]
+    if sos_waiter_wait(waiter, (&var record) as UnsafePointer<UInt>,
+                       (WAIT_WORDS as UInt) * word_bytes()) != STATUS_OK {
+        return false
+    }
+    var status: UInt = 0
+    if sos_process_get_status(child, (&var status) as UnsafePointer<UInt>) != STATUS_OK {
+        return false
+    }
+    print("SOS sectionother: {} ended status={}", name, status)
+    let _ = sos_handle_release(waiter)
+    let _ = sos_handle_release(child)
+    true
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    var me: UInt = NO_WORD
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var me) as UnsafePointer<UInt>) != STATUS_OK {
+        let _ = system.debug_print("SOS sectionother: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let image = next_word(me)
+    let ram = next_word(me)
+    if ram == NO_WORD {
+        let _ = system.debug_print("SOS sectionother: boot regions missing\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let all = ALL_RIGHTS as UInt
+    let without = (ALL_RIGHTS & ~(ProcessRight.ThreadCreate as UInt32)) as UInt
+    if not round(boot_handle, me, image, ram, "target denied",
+                 ROLE_TARGET_DENIED, without) ||
+       not round(boot_handle, me, image, ram, "target odd", ROLE_TARGET_ODD,
+                 all) {
+        let _ = system.debug_print("SOS sectionother: a launch step was refused\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    print("SOS sectionother: done")
+    let _ = system.shutdown(EXIT_OK)
+}

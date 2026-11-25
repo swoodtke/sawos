@@ -431,6 +431,17 @@ public enum SystemOp: UInt {
 /// level of the map its own launcher set, or 7 for root, whatever root's map
 /// says. The last map set before the start is the one the process runs
 /// with.
+///
+/// `SectionWord(addr)` registers the caller's section word (spec §7): two
+/// machine words at `addr`, a depth the process writes and a pending flag the
+/// kernel writes. While the depth is nonzero no other thread of the process
+/// runs. It is self-only and gated by `ProcessRight.ThreadCreate`, because it
+/// orders a process's own threads. Its answers are decided in this order: a
+/// handle without the right is `AccessDenied`; a handle naming another
+/// process is a `NotSelf` fault; an `addr` that is not word-aligned is a
+/// `BadAlign` fault; a pair that does not lie in one writable row the
+/// process's image was placed with is a `BadArg` fault; and a second
+/// registration is a `BadState` fault. It answers a status alone.
 public enum ProcessOp: UInt {
     case ThreadCreate = 0,
     case ThreadSelf = 1,
@@ -449,6 +460,7 @@ public enum ProcessOp: UInt {
     case QuotaSet = 14,
     case QuotaGet = 15,
     case BandMap = 16,
+    case SectionWord = 17,
 }
 
 /// Whether `ProcessOp.Start`'s second argument carries a boot tag: the op's
@@ -1134,7 +1146,7 @@ public enum ReplyWaitLeg: UInt {
 // passes while the table walks past `PANIC_OP`.
 static_assert((SystemOp.ProcessByPid as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
-static_assert((ProcessOp.BandMap as UInt) < PANIC_OP,
+static_assert((ProcessOp.SectionWord as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")
 static_assert((ThreadOp.Yield as UInt) < PANIC_OP,
               "an op table must stay below the panic and universal ops")

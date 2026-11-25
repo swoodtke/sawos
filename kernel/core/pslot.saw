@@ -318,6 +318,25 @@ public(package) struct ProcessBody {
     /// The highest level this process may give a child's band: the highest
     /// level of its own map, or the top level for root. Written with `bands`.
     public(package) level_cap: UInt8,
+    /// How many of the first grant rows are the image's: its segments' and
+    /// its stack's, which `place_image` records before any other row and
+    /// which stay until the teardown. Only `unmap` removes a row, and only a
+    /// row `map` installed, so the compaction never moves one of these.
+    public(package) image_rows: Int,
+    /// Where this process's section word is (spec §7), as the kernel
+    /// reaches it: the address of the depth, with the pending flag one word
+    /// above it, or 0 when the process registered none.
+    ///
+    /// It is the one pointer into a process's memory the kernel keeps. It
+    /// stays good while the body lives because the pair lies in an image row
+    /// (`image_rows`), and a new occupant of the body starts with none
+    /// (`link_process`).
+    public(package) section_at: UInt,
+    /// The thread the section holds the processor for (slot + 1; 0 = none
+    /// recorded): the thread of this process that was running when the
+    /// scheduler last found the section held as that thread left the
+    /// processor (`kcore.sched`'s section rules).
+    public(package) section_holder: Int,
 }
 
 /// One handle block: `HANDLE_BLOCK` more entries of one process's handle
@@ -409,7 +428,8 @@ public(package) unsafe static var PROCESSES: Slab<ProcessBody, MAX_PROCESSES> = 
                          block_count: 0,
                          blocks: [0; MAX_TABLE_BLOCKS],
                          ceilings: [0; HANDLE_KINDS],
-                         bands: 0, level_cap: 0); MAX_PROCESSES],
+                         bands: 0, level_cap: 0, image_rows: 0,
+                         section_at: 0, section_holder: 0); MAX_PROCESSES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],

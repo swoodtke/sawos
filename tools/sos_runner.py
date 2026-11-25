@@ -247,6 +247,14 @@ LEVEL_KILL_PKG = os.path.join(TESTS_DIR, "level-kill")
 LEVEL_RAW_PKG = os.path.join(TESTS_DIR, "level-raw")
 START_BAND_PAST_PKG = os.path.join(TESTS_DIR, "start-band-past")
 BAND_MAP_WIDE_PKG = os.path.join(TESTS_DIR, "band-map-wide")
+# The section word (spec §7): a root with threads of its own and children it
+# launches into each rule, the same against the tick, and a child at the C
+# altitude for the addresses the typed tier cannot name.
+SECTION_ROOT_PKG = os.path.join(TESTS_DIR, "section-root")
+SECTION_CHILD_PKG = os.path.join(TESTS_DIR, "section-child")
+SECTION_RAW_PKG = os.path.join(TESTS_DIR, "section-raw")
+SECTION_TICK_PKG = os.path.join(TESTS_DIR, "section-tick")
+SECTION_OTHER_PKG = os.path.join(TESTS_DIR, "section-other")
 # Event and Waiter objects.
 EVENT_BASICS_PKG = os.path.join(TESTS_DIR, "event-basics")
 EVENT_WAKE_PKG = os.path.join(TESTS_DIR, "event-wake")
@@ -3513,6 +3521,174 @@ TEST_CASES = [
                        "process={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The section word (spec §7), with no tick: every switch is one a
+        # round makes, and every ordering is made by what the other side has
+        # done, never by the clock. `tests/section-root` says what each round
+        # does and `tests/section-child` what the child does for it.
+        #
+        # A status word is the child's §8 status: `Exited` (1) << 16 for 0,
+        # and `Faulted` (2) << 16 with the reason: `SectionHeld` 15,
+        # `BadState` 5, `AccessDenied` 3, `Panic` 14.
+        "name": "section",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SECTION_ROOT_PKG,
+        "children": [SECTION_CHILD_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS section: defer: held pending=1\n",
+            "SOS section: defer: H\n",
+            "SOS section: defer: after pending=0\n",
+            "SOS section: nested: N\n",
+            "SOS section: nested: H\n",
+            "SOS section: lower: held pending=0\n",
+            "SOS section: lower: L\n",
+            "SOS section: irq: D\n",
+            "SOS section: irq: H\n",
+            "SOS sectionchild: other: the child ran\n",
+            "SOS section: other: R\n",
+            "SOS section: other ended status=65536\n",
+            "SOS sectionchild: away: A entered\n",
+            "SOS section: away: Q ran above the holder\n",
+            "SOS sectionchild: away: A resumed held\n",
+            "SOS sectionchild: away: High thread 1 ran\n",
+            "SOS sectionchild: away: High thread 2 ran\n",
+            "SOS sectionchild: away: A left\n",
+            "SOS section: away ended status=65536\n",
+            "SOS section: yield: Q ran\n",
+            "SOS sectionchild: yield: A resumed held\n",
+            "SOS sectionchild: yield: S ran\n",
+            "SOS sectionchild: yield: X ran\n",
+            "SOS sectionchild: yield: Y ran\n",
+            "SOS sectionchild: yield: A left\n",
+            "SOS section: yield ended status=65536\n",
+            "SOS section: yield: Q ran\n",
+            "SOS sectionchild: yield: A resumed held\n",
+            "SOS sectionchild: yield: S ran\n",
+            "SOS sectionchild: yield: X ran\n",
+            "SOS sectionchild: yield: A left\n",
+            "SOS section: yield tail ended status=65536\n",
+            "SOS sectionchild: park: waiting inside the section\n",
+            "SOS: process fault: parked inside its critical section "
+            "process={one}",
+            "SOS section: park ended status=131087\n",
+            "SOS sectionchild: exit: ending inside the section\n",
+            "SOS: process fault: parked inside its critical section "
+            "process={one}",
+            "SOS section: exit ended status=131087\n",
+            "SOS sectionchild: twice: pending after the registration=0\n",
+            "SOS sectionchild: twice: registering again\n",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS section: twice ended status=131077\n",
+            "SOS sectionchild: denied: registering without ThreadCreate\n",
+            "SOS: process fault: access denied process={one}",
+            "SOS section: denied ended status=131075\n",
+            "SOS sectionchild: unregistered: entering\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: Section.enter: the section word is not "
+                          "registered; Process.section_register() registers "
+                          "it"),
+            f"SOS section: unregistered ended status={STATUS_PANICKED}\n",
+            "SOS sectionchild: unbalanced: leaving\n",
+            *_panic_fault("{one}", "panic at lib.saw:",
+                          ": sos: Section.leave: the section is not held"),
+            f"SOS section: unbalanced ended status={STATUS_PANICKED}\n",
+            "SOS section: done\n",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # The section word's registrations that need an address of the
+        # child's own choosing, from the root of `section` given the pool too,
+        # each a launch of `section-raw`, whose comment says what each
+        # registers. A status word is the child's §8 status: `Faulted` (2) <<
+        # 16 with `BadAlign` 10 or `BadArg` 9, and for `wake timer`, whose
+        # fire raised the depth with no thread of the child running, `Exited`
+        # (1) << 16 for 0.
+        "name": "section_raw",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SECTION_ROOT_PKG,
+        "children": [SECTION_RAW_PKG],
+        "pool": True,
+        "expect_out": [
+            "{banner}",
+            "SOS sectionraw: unaligned: registering a pair at an odd "
+            "address\n",
+            "SOS: process fault: buffer is not word-aligned process={one}",
+            "SOS section: unaligned ended status=131082\n",
+            "SOS sectionraw: outside: registering a pair in a mapped row\n",
+            "SOS: process fault: argument outside its domain process={one}",
+            "SOS section: outside ended status=131081\n",
+            "SOS sectionraw: odd mapped: registering one byte into a mapped "
+            "row\n",
+            "SOS: process fault: buffer is not word-aligned process={one}",
+            "SOS section: odd mapped ended status=131082\n",
+            "SOS sectionraw: second mapped: registering a mapped row again\n",
+            "SOS: process fault: argument outside its domain process={one}",
+            "SOS section: second mapped ended status=131081\n",
+            "SOS sectionraw: readonly: registering a pair in a string "
+            "literal\n",
+            "SOS: process fault: argument outside its domain process={one}",
+            "SOS section: readonly ended status=131081\n",
+            "SOS sectionraw: straddle: registering a pair past its row's "
+            "end\n",
+            "SOS: process fault: argument outside its domain process={one}",
+            "SOS section: straddle ended status=131081\n",
+            "SOS sectionraw: wake timer: woken depth=7\n",
+            "SOS section: wake timer ended status=65536\n",
+            "SOS section: done\n",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # The section word's registration through a handle naming another
+        # process: `section-raw` is given a sibling of its launcher's own
+        # Process handle. Without `ThreadCreate` it is `AccessDenied` (3),
+        # decided before the handle's process; with it, at an odd address, it
+        # is `NotSelf` (4), decided before the address. Each faults the child,
+        # whose status word is `Faulted` (2) << 16 with the reason.
+        "name": "section_other",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": SECTION_OTHER_PKG,
+        "children": [SECTION_RAW_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS sectionraw: target denied: registering through the "
+            "launcher's handle without ThreadCreate\n",
+            "SOS: process fault: access denied process={one}",
+            "SOS sectionother: target denied ended status=131075\n",
+            "SOS sectionraw: target odd: registering one byte off through the "
+            "launcher's handle\n",
+            "SOS: process fault: not the caller process={one}",
+            "SOS sectionother: target odd ended status=131076\n",
+            "SOS sectionother: done\n",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # The section word against the tick (spec §7): a slice's end keeps
+        # the holder on the processor over a sibling at its level, and never
+        # over another process's thread, a thread queued behind a held-back
+        # sibling included. `tests/section-tick` says how each round is made.
+        # The child is killed with the code 9: `Killed` (3) << 16 | 9.
+        "name": "section_tick",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "tick": True,
+        "root_pkg": SECTION_TICK_PKG,
+        "children": [SECTION_CHILD_PKG],
+        "expect_out": ["{banner}",
+                       "SOS sectiontick: sibling: H\n",
+                       "SOS sectiontick: sibling: S\n",
+                       "SOS sectiontick: confined: K\n",
+                       "SOS sectiontick: confined ended status=196617\n",
+                       "SOS sectiontick: confined peer: K\n",
+                       "SOS sectiontick: confined peer ended "
+                       "status=196617\n",
+                       "SOS sectiontick: confined low: K\n",
+                       "SOS sectiontick: confined low ended status=196617\n",
+                       "SOS sectiontick: done\n"],
+        "expect_clean_exit": True,
     },
     {
         # A band map is the whole register: on a 64-bit profile, the simple
@@ -20175,6 +20351,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #   lock_owner         each thread its own lock owner, kept in THREADPTR
     #   levels             the scheduler's levels: preemption on a start, a
     #                      signal and a Timer's interrupt, and a child's map
+    #   section            the section word: a wake, a Timer's fire and another
+    #                      process's thread held off a sibling, and its faults
     #   timer_oneshot      a Timer fire through a Waiter, with the kernel idle
     #                      on `irq_poll` in between
     #   tier_word          the platform says `Flat`
@@ -20263,7 +20441,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # A case asserting a hardware denial does not belong on a Flat board; the
     # check below refuses one named here by mistake, with the gate's reason.
     process_names = ["root_server_boot", "thread_basics", "thread_preempt",
-                     "lock_owner", "levels",
+                     "lock_owner", "levels", "section",
                      "timer_oneshot", "tier_word", "process_lifecycle",
                      "death_fault", "pipe_pingpong", "map_into_child",
                      "iomemory_carve", "interrupt_give", "tick_spinner",

@@ -1791,6 +1791,7 @@ of the process or its record.
 `Kill` (§8), `Stats`, `RestrictRights` and `Ceiling` (on
 `Stats`; both below). `QuotaSet` sets and `QuotaGet` (on `Stats`) reads the
 named process's quota rows (below). `BandMap` sets its band map (§7).
+`SectionWord` (on `ThreadCreate`) registers the caller's section word (§7).
 `ProcessRight.Map` is the target-side right `MemoryOp.Map` and `IoMemoryOp.Map`
 spend (§2.5). Creating a process is not an op on this object:
 `ProcessCreate` is on System, because a process is a machine-wide resource
@@ -1823,12 +1824,13 @@ three groups:
   thread created in a `Created` child is inert: `ThreadOp.Start` on it is a
   `BadState` fault until the child has been started, and the launcher starts it
   after `ProcessOp.Start`.
-- **`Exit`, `ThreadSelf` and `BootHandleNext` are self-only**: through a handle
-  naming another process the kernel faults the caller (`NotSelf`). `Exit` ends
-  the calling process, `ThreadSelf` names the caller's running thread, and
-  `BootHandleNext` drains the caller's own boot set. A `Gone` process's handle
-  never names the live caller, so through one these are the same `NotSelf`
-  fault. The right on the handle used is checked first, so a handle without it
+- **`Exit`, `ThreadSelf`, `BootHandleNext` and `SectionWord` are
+  self-only**: through a handle naming another process the kernel faults the
+  caller (`NotSelf`). `Exit` ends the calling process, `ThreadSelf` names the
+  caller's running thread, `BootHandleNext` drains the caller's own boot set,
+  and `SectionWord` registers the caller's own section word. A `Gone`
+  process's handle never names the live caller, so through one these are the
+  same `NotSelf` fault. The right on the handle used is checked first, so a handle without it
   is `AccessDenied`.
 - **`Start`, `Give`, `GetStatus`, `Stats` and `Kill` act on the named
   process**, which is what supervision is; `Kill` naming the caller's own
@@ -2004,6 +2006,10 @@ sets its own, and nobody sets a row once its process has started.
 
 **`BandMap`.** `BandMap(map)` sets the band map of a `Created` process (§7),
 on `ProcessRight.BandMap`, which the default set carries.
+
+**`SectionWord`.** `SectionWord(addr)` registers the caller's section word
+(§7), on `ProcessRight.ThreadCreate` and only through the caller's own
+handle.
 
 **`Give` — the courier op.** `give(handle, tag:)` on the child's handle, gated
 by `ProcessRight.Give` there plus the universal `Transfer` right on the handle
@@ -4039,6 +4045,69 @@ arm their own.
   its own map says, so a nibble past 7 is above every caller's. The kernel
   reads no child's header field: a launcher never reads an image (§12), so a
   child's request has no run-time reader.
+- **The section word.** A process may register one pair of machine words
+  in its own memory with `ProcessOp.SectionWord(addr)`, on
+  `ProcessRight.ThreadCreate`, through its own handle: a depth it writes
+  and a pending flag the kernel writes. While the depth is nonzero no
+  thread of the process runs but the holder, the one that was running when
+  the kernel last found it nonzero. Where the scheduler would run another
+  thread of the process, as the holder leaves the processor or as a
+  sibling is taken off its list, it runs the holder instead, at that
+  thread's level, and sets the pending flag; the other thread keeps its
+  place at the head of its level. A sibling below the holder's level is
+  no deferral: the holder runs ahead of it anyway, and the flag is not
+  set for it. A process leaves by clearing the depth and, if the flag is
+  set, yielding; the kernel clears the flag, and forgets the holder, when
+  it finds the depth zero.
+- **The section holds back no other process.** A thread of another
+  process above the holder takes the processor from it, and the holder,
+  back at the head of its level with the section held, runs in place of
+  whichever of its siblings is picked next. At a slice's end the sibling
+  the holder kept the processor in place of is charged that slice: it
+  goes to the tail of its level, as it would have after a slice of its
+  own, so a thread of another process at that level gets its turn, and
+  takes the processor from the holder as it would from any other
+  process's thread. A section held for good starves only its own
+  process, and a supervisor at a level the section's siblings share runs
+  to kill it.
+- **What a section forbids.** A thread that parks, or ends itself with
+  `ThreadOp.Exit`, while its process's depth is nonzero faults the
+  process (`FaultReason.SectionHeld`, 15, the line `SOS: process fault:
+  parked inside its critical section`): no sibling could run again. A
+  print inside a section parks only through a console driver whose ring
+  is full, and waits for good, without a fault, while a sibling holds the
+  runtime's output lock: the wait yields, and the held section hands the
+  processor straight back to its holder. Until that lock wait parks, a
+  print inside a section is safe only while no sibling holds the lock.
+- **Its registration.** The answers to `SectionWord`, in the order they
+  are decided: a handle without the right is `AccessDenied`; a handle
+  naming another process is the `NotSelf` fault; an address that is not
+  word-aligned is the `BadAlign` fault; a pair that does not lie in one
+  writable row placed with the image (non-device, nothing the process may
+  execute) is the `BadArg` fault, because the kernel keeps the address
+  for the process's life and a row `map` installed can be unmapped; a
+  second registration is the `BadState` fault. The registration clears
+  the pending flag.
+- **A depth raised from outside.** Only a running thread of the process
+  raises the depth itself, but the pair is memory the kernel's own
+  deliveries and a launcher's mappings can write: a wait record delivered
+  into a buffer placed on the pair, or a launcher writing through the
+  memory it keeps. A depth raised while no thread of the process runs has
+  no holder, and the first thread of the process the scheduler picks
+  runs as the holder.
+- **Its cost, and what it grants.** Entering and leaving cost no trap, and
+  leaving one trap when a sibling was held back, for a thread that holds
+  its own Thread handle where the runtime keeps it (every thread a `main`
+  program or `thread_create(run:)` makes). A thread with no such handle
+  cannot yield, so its leave does not, and the sibling it held back runs
+  at the next switch. It grants nothing: the holder runs at most at a
+  level the launcher gave the process, so a process that never clears it
+  starves only itself. The runtime owns the pair a program shares with
+  it; `sos.Section` enters and leaves it, and a leave with the section
+  not held panics, since the depth would go below zero, which reads as
+  held; `Process.section_register()` registers it; and the floor exports
+  `sos_section_enter`, `sos_section_leave`, `sos_process_section_register`
+  and `sos_process_section_word`.
 - **Launching is a capability.** `process_create` requires the launch
   capability, `SystemRight.ProcessCreate`, minted at boot to the root
   server. Ordinary processes cannot create processes in v1 — they ask the

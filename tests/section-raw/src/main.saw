@@ -1,0 +1,231 @@
+// Test child for `section_raw` and `section_other`, at the C altitude: the
+// address it registers as its section word, and the handle it registers
+// through, are its own to pick, which the typed tier never lets a caller
+// name. The role its launcher gives it, as the bits of an Event under
+// `TAG_ROLE`, says what it registers:
+//
+//   UNALIGNED  a pair one byte past a word boundary, in its own data: the
+//              `BadAlign` fault
+//   OUTSIDE    the pair at the address under `TAG_ADDR`, in a writable row
+//              its launcher mapped into it: the `BadArg` fault, because only
+//              a row its image was placed with lasts as long as the process
+//   ODD MAPPED one byte past the address under `TAG_ADDR`: the `BadAlign`
+//              fault, which is decided before the row
+//   SECOND MAPPED  a pair in its own data, taken, and then the address under
+//              `TAG_ADDR`: the `BadArg` fault, which is decided before the
+//              second registration's `BadState`
+//   READONLY   a pair inside a string literal, in its read-only data: the
+//              `BadArg` fault, since the kernel writes the pair
+//   STRADDLE   a pair whose first word is the last word of its writable
+//              segment's row, and whose second is past it: the `BadArg` fault
+//   WAKE TIMER the first two words of its wait buffer as its pair, and a wait
+//              on its own one-shot Timer, attached under the key 7. The fire's
+//              wait record writes the key into the depth while no thread of
+//              this process runs, so the section is held with no holder, and
+//              the scheduler runs this thread as its holder. It prints the
+//              depth it finds, lowers it and exits
+//   TARGET DENIED  through the handle under `TAG_TARGET`, which names its
+//              launcher and lacks `ThreadCreate`: the `AccessDenied` fault,
+//              which is decided before the handle's process
+//   TARGET ODD through the handle under `TAG_TARGET`, which names its launcher
+//              and holds `ThreadCreate`, one byte past a word: the `NotSelf`
+//              fault, which is decided before the address
+//
+// A registration that comes back where it was to end this process exits with
+// `EXIT_SURVIVED`.
+
+import sos.{System, ALL_RIGHTS, sos_system_process_self,
+            sos_process_boot_handle_next, sos_process_exit,
+            sos_event_receive, sos_process_section_word,
+            sos_system_clock_get, sos_clock_timer_create, sos_timer_arm,
+            sos_process_waiter_create, sos_waiter_add, sos_waiter_wait}
+
+extern "C" {
+    func sos_arena_base() -> UInt
+    func sos_arena_size() -> UInt
+}
+
+static TAG_ROLE: UInt = 40
+static TAG_ADDR: UInt = 44
+static TAG_TARGET: UInt = 46
+
+static ROLE_UNALIGNED: UInt = 1
+static ROLE_OUTSIDE: UInt = 2
+static ROLE_ODD_MAPPED: UInt = 3
+static ROLE_SECOND_MAPPED: UInt = 4
+static ROLE_READONLY: UInt = 5
+static ROLE_STRADDLE: UInt = 6
+static ROLE_WAKE_TIMER: UInt = 7
+static ROLE_TARGET_DENIED: UInt = 8
+static ROLE_TARGET_ODD: UInt = 9
+
+/// A registration came back where it was to end this process.
+static EXIT_SURVIVED: UInt = 99
+/// A step before the one under test was refused, or no role was given.
+static EXIT_SETUP: UInt = 97
+
+static STATUS_OK: UInt = 0
+
+/// A word that names nothing.
+static NONE: UInt = 0
+
+/// The words in a boot-handle record, and in a wait record's buffer (more
+/// than any record the kernel writes).
+static BOOT_WORDS: Int = 3
+static RECORD_WORDS: Int = 64
+
+/// The key the Timer is attached under, which its fire writes into the depth.
+static KEY_TIMER: UInt = 7
+
+/// The Timer's delay. Whenever it ends, this thread is parked on it.
+static FIRE_NS: UInt64 = 1_000_000
+
+/// `ClockType.Monotonic`.
+static MONOTONIC: UInt = 0
+
+unsafe static var ROLE: UInt = 0
+unsafe static var ADDR: UInt = 0
+unsafe static var TARGET: UInt = 0
+
+/// Room for a pair, at a word or one byte past it, in this process's data.
+unsafe static var PAIR: [UInt; 3] = [0; 3]
+
+/// `WAKE TIMER`'s wait buffer, its first two words the pair.
+unsafe static var WAIT_BUF: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+/// The word an Event holds, drained.
+func event_word(handle: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let _ = sos_event_receive(handle, (&var word) as UnsafePointer<UInt>)
+    word
+}
+
+/// Take every record of the boot set and keep what each tag names.
+func drain(proc: UInt) unsafe {
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let bytes = (BOOT_WORDS as UInt) * word_bytes()
+    while sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                       bytes) == STATUS_OK {
+        let tag = rec[0]
+        let word = rec[2]
+        if tag == TAG_ROLE {
+            ROLE = event_word(word)
+        } else if tag == TAG_ADDR {
+            ADDR = event_word(word)
+        } else if tag == TAG_TARGET {
+            TARGET = word
+        }
+    }
+}
+
+func pair() unsafe -> UInt {
+    ((&var PAIR) as UnsafePointer<UInt>) as UInt
+}
+
+/// A word-aligned address inside a string literal, in read-only data, with a
+/// pair's room after it.
+func readonly_pair() unsafe -> UInt {
+    let literal = "a string literal, which lives in this image's read-only data"
+    let at = literal.c_string()! as UInt
+    at - (at % word_bytes())
+}
+
+/// The last word of the row this image's writable segment was placed as.
+/// The segment ends at the runtime's arena, padded to the profile's grain:
+/// 4096 bytes on the 64-bit profile, and on the 32-bit ones the arena's own
+/// 16-byte-aligned end.
+func last_writable_word() unsafe -> UInt {
+    let grain: UInt = if word_bytes() == 8 { 4096 } else { 16 }
+    let end = sos_arena_base() + sos_arena_size()
+    let top = (end + grain - 1) - ((end + grain - 1) % grain)
+    top - word_bytes()
+}
+
+/// `WAKE TIMER`.
+func wake_timer(boot: UInt, proc: UInt) unsafe -> UInt {
+    var clock: UInt = NONE
+    if sos_system_clock_get(boot, MONOTONIC,
+                            (&var clock) as UnsafePointer<UInt>) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var timer: UInt = NONE
+    if sos_clock_timer_create(clock,
+                              (&var timer) as UnsafePointer<UInt>) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var waiter: UInt = NONE
+    if sos_process_waiter_create(proc,
+                                 (&var waiter) as UnsafePointer<UInt>) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    if sos_waiter_add(waiter, timer, KEY_TIMER, 0) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    let buf = ((&var WAIT_BUF) as UnsafePointer<UInt>)
+    if sos_process_section_word(proc, buf as UInt) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var arm: [UInt64; 2] = [FIRE_NS, 0]
+    if sos_timer_arm(timer, (&var arm) as UnsafePointer<UInt64>,
+                     2 * sizeof<UInt64>() as UInt) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    if sos_waiter_wait(waiter, buf,
+                       (RECORD_WORDS as UInt) * word_bytes()) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    print("SOS sectionraw: wake timer: woken depth={}", buf[0])
+    buf[0] = 0
+    0
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    let system = System(boot_handle: boot_handle)
+    var proc: UInt = NONE
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        let _ = system.debug_print("SOS sectionraw: no process handle\n")
+        return
+    }
+    drain(proc)
+    var code = EXIT_SURVIVED
+    if ROLE == ROLE_UNALIGNED {
+        print("SOS sectionraw: unaligned: registering a pair at an odd address")
+        let _ = sos_process_section_word(proc, pair() + 1)
+    } else if ROLE == ROLE_OUTSIDE {
+        print("SOS sectionraw: outside: registering a pair in a mapped row")
+        let _ = sos_process_section_word(proc, ADDR)
+    } else if ROLE == ROLE_ODD_MAPPED {
+        print("SOS sectionraw: odd mapped: registering one byte into a mapped row")
+        let _ = sos_process_section_word(proc, ADDR + 1)
+    } else if ROLE == ROLE_SECOND_MAPPED {
+        if sos_process_section_word(proc, pair()) != STATUS_OK {
+            code = EXIT_SETUP
+        } else {
+            print("SOS sectionraw: second mapped: registering a mapped row again")
+            let _ = sos_process_section_word(proc, ADDR)
+        }
+    } else if ROLE == ROLE_READONLY {
+        print("SOS sectionraw: readonly: registering a pair in a string literal")
+        let _ = sos_process_section_word(proc, readonly_pair())
+    } else if ROLE == ROLE_STRADDLE {
+        print("SOS sectionraw: straddle: registering a pair past its row's end")
+        let _ = sos_process_section_word(proc, last_writable_word())
+    } else if ROLE == ROLE_WAKE_TIMER {
+        code = wake_timer(boot_handle, proc)
+    } else if ROLE == ROLE_TARGET_DENIED {
+        print("SOS sectionraw: target denied: registering through the launcher's handle without ThreadCreate")
+        let _ = sos_process_section_word(TARGET, pair())
+    } else if ROLE == ROLE_TARGET_ODD {
+        print("SOS sectionraw: target odd: registering one byte off through the launcher's handle")
+        let _ = sos_process_section_word(TARGET, pair() + 1)
+    } else {
+        code = EXIT_SETUP
+    }
+    let _ = sos_process_exit(proc, code)
+}

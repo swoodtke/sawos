@@ -1,0 +1,60 @@
+//! `Section`: a process's critical section against its own threads (spec §7).
+//!
+//! The section word is the runtime's (`sosrt`), one per process, and the
+//! kernel learns where it is from `Process.section_register()`. Entering and
+//! leaving are the runtime's adds on it, so this file holds no state and makes
+//! no trap of its own.
+
+import sosrt.{section_enter, section_leave, section_pending}
+
+/// The calling process's critical section: while a thread of the process is
+/// inside it, no other thread of the process runs, and threads of other
+/// processes run as they would.
+///
+/// It is the ceiling a process takes against its own threads, for state they
+/// share that is short to touch and is touched by threads at several levels:
+/// a sibling that would have run is held back without being run, and the
+/// thread inside runs in its place until it leaves, so a higher sibling never
+/// waits behind a lower thread that a third thread took the processor from.
+/// Nothing traps to enter or leave, but the leave that lets a held-back sibling
+/// run.
+///
+/// Nothing inside may wait. A thread that parks inside the section (a `wait`,
+/// a `join`, a call, a print through a console driver whose ring is full), or
+/// exits inside it, ends its process, because no sibling could run again.
+///
+/// A print inside the section is safe only while no sibling holds the
+/// runtime's output lock. A print waits for that lock by yielding, and the
+/// held section gives the processor straight back to the waiting holder, so
+/// a print behind a sibling that holds the lock waits for good. With the
+/// lock free, a print through the kernel's debug print never parks.
+///
+/// The section word must be registered first (`Process.section_register()`):
+/// entering one the kernel was never given panics, since it would hold
+/// nothing back.
+public struct Section {}
+
+extension Section {
+    /// Enter the section, or enter it once more: sections nest, and the
+    /// section is left at the last `leave`.
+    public static func enter() {
+        section_enter()
+    }
+
+    /// Leave the section once. The last leave gives the processor up when
+    /// the section held a thread back, so that thread runs now. A thread
+    /// with no Thread handle of its own where the runtime keeps one (one a
+    /// `main` program or `thread_create(run:)` did not make) cannot give the
+    /// processor up, so its leave does not, and the thread it held back runs
+    /// at the next switch. Leaving a section that is not held panics.
+    public static func leave() {
+        section_leave()
+    }
+
+    /// Whether the section held a thread back since the kernel last found it
+    /// left: what the last `leave` reads to decide whether to give the
+    /// processor up.
+    public static func pending() -> Bool {
+        section_pending()
+    }
+}

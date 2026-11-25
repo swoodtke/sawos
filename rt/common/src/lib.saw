@@ -540,6 +540,79 @@ func output_take(me: Int) -> Bool {
 }
 
 // -----------------------------------------------------------------------------
+// The section word
+// -----------------------------------------------------------------------------
+//
+// A process's critical section against its own threads (spec §7): two machine
+// words the kernel reads, a depth this side writes and a pending flag the
+// kernel writes. Once the kernel has the pair's address
+// (`ProcessOp.SectionWord`, which `sos`'s `Process.section_register()` makes),
+// no other thread of the process runs while the depth is nonzero, and the
+// kernel sets the flag when that held a thread back. Entering and leaving are
+// an add each, with no trap; leaving yields through the fourth per-side hook
+// when the depth reaches zero with the flag set, so the thread held back runs
+// at once.
+//
+// The pair is the runtime's, one per process, so a program and the runtime
+// under it share one section, and entering nests as a depth.
+//
+// Each add is an atomic read-modify-write, for its ordering and not for
+// another processor: no access the section guards moves before the enter or
+// after the leave. The kernel reads the depth only inside a trap, so the
+// plain word it reads is the one these adds wrote.
+//
+// A thread with no block cannot yield (`kernel/sysapi/src/rt.saw`), so its
+// leave does not: the thread it held back runs at the next switch, a tick or
+// the leaver's next park.
+
+/// The depth, then the pending flag.
+static SECTION: [Atomic<Int>; 2]
+
+/// Nonzero once the kernel has taken the pair's address.
+static SECTION_REGISTERED: Atomic<Int>
+
+static SECTION_DEPTH: Int = 0
+static SECTION_PENDING: Int = 1
+
+/// The pair's address, which `ProcessOp.SectionWord` takes.
+public func section_word() unsafe -> UInt {
+    ((&SECTION) as UnsafePointer<Atomic<Int>>) as UInt
+}
+
+/// Record that the kernel took the pair: the registration's last step.
+public func section_registered() {
+    SECTION_REGISTERED.store(1)
+}
+
+/// Enter the section, or enter it once more. A section the kernel was never
+/// given would hold nothing back, so entering one panics.
+public func section_enter() {
+    if SECTION_REGISTERED.load() == 0 {
+        panic("sos: Section.enter: the section word is not registered; Process.section_register() registers it")
+    }
+    let _ = SECTION[SECTION_DEPTH].fetch_add(1)
+}
+
+/// Leave the section once. The last leave yields when the kernel held a
+/// thread back while the section was held. A leave with the section not held
+/// panics: the depth would go below zero, which reads as held for good.
+public func section_leave() {
+    if SECTION[SECTION_DEPTH].load() <= 0 {
+        panic("sos: Section.leave: the section is not held")
+    }
+    let before = SECTION[SECTION_DEPTH].fetch_add(-1)
+    if before == 1 && SECTION[SECTION_PENDING].load() != 0 {
+        sos_rt_yield()
+    }
+}
+
+/// Whether the kernel held a thread back since it last found the section
+/// left: the flag the last leave reads.
+public func section_pending() -> Bool {
+    SECTION[SECTION_PENDING].load() != 0
+}
+
+// -----------------------------------------------------------------------------
 // The line
 // -----------------------------------------------------------------------------
 
