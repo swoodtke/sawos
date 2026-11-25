@@ -1,12 +1,14 @@
-// SOS Xtensa kernel HAL: the octal PSRAM's command layer, on the memory-SPI
-// controller the flash shares (../ABI.md §16).
+// SOS Xtensa kernel HAL: the memory-SPI controller's command layer, for the
+// octal PSRAM on chip select 1 (../ABI.md §16) and for the flash's reads on
+// chip select 0 (../ABI.md §18).
 //
 // C because the whole of it must run without one instruction or one byte of
 // data fetched from flash: while SPI1 holds the chip-select gate, or a
-// command to the RAM chip is under way, nothing may ask SPI0 to fetch from
+// command to either chip is under way, nothing may ask SPI0 to fetch from
 // the flash. Saw code runs in place from flash, so the bring-up is one call
 // into this file, which makes every check between its steps and returns at
-// the first that fails. Saw prints what the record says afterwards.
+// the first that fails, and so is each read of the flash. Saw prints what
+// the record says afterwards.
 //
 // The rules that keep it out of flash, held by the runner's `check_iram`
 // (tools/sos_runner.py) on every S3 image that links it:
@@ -16,21 +18,24 @@
 //      no struct or array initializer large enough to become `memset` or
 //      `memcpy`, no 64-bit division: anything that is not an immediate or a
 //      literal-pool word lives in a non-const static, in DRAM;
-//   3. no call out of this file: the one line it writes itself (`short_line`)
-//      goes to UART0 through its own loop.
+//   3. no call out of this file: the lines it writes itself (`short_line`,
+//      `flash_short_line`) go to UART0 through its own loop.
 //
 // Every register address and value is cited where it is defined, from
 // ESP-IDF v5.4.1 ("IDF", components/ of that tag) or from the mask ROM's
 // disassembly (`esp32s3_rev0_rom.elf`, "ROM"). The step names (S0.1 to S12)
 // and the stop codes (0x50 to 0x5F, 0x61 and 0x62) are ../ABI.md §16's and
-// §17's.
+// §17's, and the flash's stops (0x73 to 0x75, 0x79 to 0x7B) §18's.
 //
 // Nothing here writes non-volatile state: the eFuse is only read
-// (EFUSE_RD_*), no RTC register is written, no command is ever sent with chip
-// select 0 enabled, and the commands sent to the RAM chip read its mode
-// registers and its array and write its mode register 0, which it loses at
-// power-off. The cache's map of the PSRAM (S12) is MMU entries from 256 up,
-// which a chip reset gives back to the flash.
+// (EFUSE_RD_*), no RTC register is written, the commands sent with chip
+// select 0 enabled are the flash's five reads (`flash_read_bits`) and no
+// other, and the commands sent to the RAM chip read its mode registers and
+// its array and write its mode register 0, which it loses at power-off. The
+// cache's map of the PSRAM (S12) is MMU entries from 256 up, which a chip
+// reset gives back to the flash. SPI_MEM_MISC(1), which says which chip
+// select a command goes to, is written by the PSRAM's gate alone; a flash
+// read compares it and never writes it.
 //
 // Built call0 with no FPU like the rest of the kernel (`-windowed`, `-fp`).
 //
@@ -138,6 +143,37 @@ struct sos_psram_record {
 #define STOP_BUS_OFF        0x5Fu
 #define STOP_MEASUREMENT    0x61u
 #define STOP_STILL_BUSY     0x62u
+
+// What a flash read found (../ABI.md §18a). The first five words are a
+// stop's, as the PSRAM's record has them; `answer` is the read's bytes, the
+// first received in [7:0]; `saved` is 1 once SPI1's words are saved, so a
+// stop after it has put them back; `misc` is SPI_MEM_MISC(1) as the gate
+// read it. Mirrored by `lib.saw`'s `FlashRecord`.
+struct sos_flash_record {
+    u32 stop;
+    u32 read;
+    u32 expect;
+    u32 command;            // the read's opcode
+    u32 address;            // its address, for SFDP
+    u32 answer;
+    u32 saved;
+    u32 misc;
+};
+
+// A flash read's steps, as the fault record names a read. The command's own
+// reads are the PSRAM's S7 steps, the primitive being the same.
+#define STEP_F_GATE 0xF1u
+#define STEP_F_DDR  0xF2u
+#define STEP_F_IDLE 0xF3u
+#define STEP_F_SAVE 0xF4u
+
+// A flash read's stops (../ABI.md §18a).
+#define STOP_FLASH_GATE         0x73u
+#define STOP_FLASH_BUSY         0x74u
+#define STOP_FLASH_STUCK        0x75u
+#define STOP_FLASH_NOT_DRAM     0x79u
+#define STOP_FLASH_NOT_READ     0x7Au
+#define STOP_FLASH_DDR          0x7Bu
 
 // ---- registers ------------------------------------------------------------
 //
@@ -254,6 +290,12 @@ struct sos_psram_record {
 #define MISC_CS_MASK        3u
 #define MISC_GATE           1u
 
+// The flash's: [1:0] = 0b10, chip select 1 disabled and chip select 0, the
+// flash's, enabled. It is the word the ROM's boot leaves (../ABI.md §15c)
+// and the one the PSRAM's S10 puts back; a flash read requires it and does
+// not write it.
+#define MISC_FLASH          2u
+
 // SPI_MEM_SPI_SMEM_AC(0), the PSRAM's chip-select timing, shared by SPI0 and
 // SPI1 (IDF `s_set_psram_cs_timing`): CS_SETUP [0], CS_HOLD [1],
 // CS_SETUP_TIME [6:2] = 3, CS_HOLD_TIME [11:7] = 3, CS_HOLD_DELAY [30:25] = 2
@@ -276,6 +318,12 @@ struct sos_psram_record {
 #define CTRL_KEEP           0xFE6F9C0Fu
 #define CTRL_OCTAL          0x00002270u
 
+// SPI_MEM_CTRL(1) for a flash read: every bit clear but WP [21], as IDF's
+// `bootloader_flash_execute_command_common` writes it (`ctrl.val = 0`, then
+// `spimem_flash_ll_set_wp_level(true)`): command, address and data on one
+// line, no fast-read mode, no two-byte status write.
+#define CTRL_WP             (1u << 21)
+
 // SPI_MEM_USER(1): USR_COMMAND [31], USR_ADDR [30], USR_DUMMY [29],
 // USR_MISO [28], USR_MOSI [27]; [15:12] are the FWRITE_* line modes and
 // [31:24] the phases, both cleared; the rest kept.
@@ -291,9 +339,33 @@ struct sos_psram_record {
 // USR_COMMAND_BITLEN [31:28] = 15, a 16-bit command, and the command in
 // [15:0]. SPI_MEM_CACHE_FCTRL(1) bit 1, CACHE_USR_CMD_4BYTE: the ROM's
 // `esp_rom_spi_cmd_config` sets it for a 32-bit address.
-#define USER1_ADDR_32       (31u << 26)
-#define USER2_CMD_16        (15u << 28)
+#define USER1_ADDR_SHIFT    26u
+#define USER2_CMD_SHIFT     28u
 #define FCTRL_ADDR_32       (1u << 1)
+
+// SPI_MEM_CACHE_FCTRL(1)'s line modes for SPI1's commands: FDIN_DUAL [3],
+// FDOUT_DUAL [4], FADDR_DUAL [5], FDIN_QUAD [6], FDOUT_QUAD [7], FADDR_QUAD
+// [8] ("When SPI1 accesses to flash or Ext_RAM, set this bit to enable 2-bm
+// / 4-bm in DIN / DOUT / ADDR phase"). A flash read clears CACHE_USR_CMD_4BYTE
+// as IDF's `spimem_flash_ll_set_addr_bitlen` does for any address but a
+// 32-bit one, and clears these six as well. That second clear is this
+// file's own, stricter than IDF, whose helper sets only CACHE_USR_CMD_4BYTE,
+// USER1's address length and USER's USR_ADDR: with any of them set, a read
+// meant for one line would go out on two or four.
+#define FCTRL_LINES         (0x3Fu << 3)
+
+// The flash's reads, the only commands sent with chip select 0 enabled
+// (IDF spi_flash/include/spi_flash/spi_flash_defs.h, bootloader_flash.c,
+// flash_qio_mode.c): the JEDEC ID, status registers 1, 2 and 3, and SFDP,
+// which takes a 24-bit address and 8 dummy cycles
+// (`bootloader_flash_read_sfdp`).
+#define FLASH_RDID          0x9Fu
+#define FLASH_RDSR          0x05u
+#define FLASH_RDSR2         0x35u
+#define FLASH_RDSR3         0x15u
+#define FLASH_RDSFDP        0x5Au
+#define SFDP_ADDR_BITS      24u
+#define SFDP_DUMMY          8u
 
 // The RAM chip's commands and mode registers (IDF esp_psram_impl_octal.c:
 // OPI_PSRAM_REG_READ, OPI_PSRAM_REG_WRITE, OPI_PSRAM_SYNC_READ;
@@ -446,20 +518,27 @@ static u32 command_number;
 static u32 saved_spi1[SAVED];
 
 // S5's registers, in the order S10 writes them back: MISC last, so the gate
-// is the last thing undone. In `.data` by name, as `short_line` is.
+// is the last thing undone. A flash read saves the same words and writes
+// back all but the last, `SAVED_BUT_MISC`, since it never writes MISC. In
+// `.data` by name, as `short_line` is.
+#define SAVED_BUT_MISC (SAVED - 1u)
 __attribute__((section(".data.sos_psram_saved_offsets")))
 static u32 saved_offsets[SAVED] = {
     SPI_CLOCK, SPI_CTRL, SPI_USER, SPI_USER1, SPI_USER2, SPI_ADDR,
     SPI_MOSI_DLEN, SPI_MISO_DLEN, SPI_CACHE_FCTRL, SPI_DDR, SPI_MISC,
 };
 
-// The line written by S7.9 before it returns, the command's four hex digits
+// The lines written by a command that does not finish, before the call
+// returns: the PSRAM's command in four hex digits, the flash's in two, both
 // at `SHORT_LINE_DIGITS`. In `.data` by name: a static nothing writes may
 // otherwise be promoted to `.rodata`, which is flash.
 #define SHORT_LINE_DIGITS   30u
 __attribute__((section(".data.sos_psram_short_line")))
 static char short_line[] =
     "SOS-S3: psram: SPI1 command 0x.... did not finish\n";
+__attribute__((section(".data.sos_flash_short_line")))
+static char flash_short_line[] =
+    "SOS-S3: flash: SPI1 command 0x.. did not finish\n";
 
 // ---- access -----------------------------------------------------------------
 
@@ -507,7 +586,7 @@ static IRAM u32 stop(struct sos_psram_record *r, u32 code, u32 read,
     return code;
 }
 
-// ---- the short line ---------------------------------------------------------
+// ---- the short lines --------------------------------------------------------
 
 static IRAM void uart_byte(u32 b) {
     for (u32 polls = 0; polls < UART_POLLS; polls++) {
@@ -520,23 +599,26 @@ static IRAM void uart_byte(u32 b) {
     *(volatile u32 *)UART0_FIFO = b;
 }
 
-static IRAM void short_line_out(u32 command) {
-    for (u32 i = 0; i < 4; i++) {
-        u32 d = (command >> (12 - 4 * i)) & 0xFu;
-        short_line[SHORT_LINE_DIGITS + i] = (char)(d < 10 ? '0' + d
-                                                          : 'a' + d - 10);
+// `line`, `len` bytes, with `command`'s low `digits` hex digits written in at
+// `SHORT_LINE_DIGITS`.
+static IRAM void short_line_out(char *line, u32 len, u32 digits,
+                                u32 command) {
+    for (u32 i = 0; i < digits; i++) {
+        u32 d = (command >> (4 * (digits - 1 - i))) & 0xFu;
+        line[SHORT_LINE_DIGITS + i] = (char)(d < 10 ? '0' + d
+                                                    : 'a' + d - 10);
     }
-    for (u32 i = 0; i < sizeof(short_line) - 1; i++) {
-        uart_byte((u32)(unsigned char)short_line[i]);
+    for (u32 i = 0; i < len; i++) {
+        uart_byte((u32)(unsigned char)line[i]);
     }
 }
 
 // ---- the steps --------------------------------------------------------------
 
 // The bounded wait: SPI_MEM_CMD(1) read until it is 0, at most POLL_BOUND
-// times. Answers 1 when idle; otherwise leaves the last word read in
-// `r->read` and answers 0.
-static IRAM u32 wait_idle(struct sos_psram_record *r, u32 step) {
+// times. Answers 1 when idle; otherwise leaves the last word read in `*read`
+// and answers 0.
+static IRAM u32 poll_idle(u32 step, u32 *read) {
     u32 v = 0;
     for (u32 n = 0; n < POLL_BOUND; n++) {
         v = rd(step, SPI1 + SPI_CMD);
@@ -544,15 +626,25 @@ static IRAM u32 wait_idle(struct sos_psram_record *r, u32 step) {
             return 1;
         }
     }
-    r->read = v;
+    *read = v;
     return 0;
+}
+
+// The same, leaving the last word in `r->read`.
+static IRAM u32 wait_idle(struct sos_psram_record *r, u32 step) {
+    return poll_idle(step, &r->read);
+}
+
+// Every word of `saved_offsets` read into `saved_spi1`.
+static IRAM void save_spi1(u32 step) {
+    for (u32 i = 0; i < SAVED; i++) {
+        saved_spi1[i] = rd(step, SPI1 + saved_offsets[i]);
+    }
 }
 
 // S5: save SPI1, put the commands' clock word and DTR mode on it.
 static IRAM void prepare_spi1(u32 clock, struct sos_psram_record *r) {
-    for (u32 i = 0; i < SAVED; i++) {
-        saved_spi1[i] = rd(STEP_S5, SPI1 + saved_offsets[i]);
-    }
+    save_spi1(STEP_S5);
     r->saved = 1;
     wr(SPI1 + SPI_CLOCK, clock);
     r->spi1_clock = rd(STEP_S5, SPI1 + SPI_CLOCK);
@@ -560,9 +652,10 @@ static IRAM void prepare_spi1(u32 clock, struct sos_psram_record *r) {
     wr(SPI1 + SPI_DDR, (ddr & ~DDR_CLEAR) | DDR_SET);
 }
 
-// S10: every word S5 saved written back, MISC last.
-static IRAM void restore_spi1(void) {
-    for (u32 i = 0; i < SAVED; i++) {
+// The first `count` words `save_spi1` saved, written back in its order: all
+// of them (`SAVED`, S10), MISC last, or all but MISC (`SAVED_BUT_MISC`).
+static IRAM void restore_spi1(u32 count) {
+    for (u32 i = 0; i < count; i++) {
         wr(SPI1 + saved_offsets[i], saved_spi1[i]);
     }
 }
@@ -580,69 +673,106 @@ static IRAM u32 take_gate(struct sos_psram_record *r) {
     return 1;
 }
 
-// S7.1 to S7.9's start: one SPI1 user command to chip select 1, set up and
-// started. `dummy` is in cycles, 0 for none; `out_bits` and `in_bits` are
-// the data phases, 0 for none. Answers 0, or the stop code with the record
-// filled in.
-static IRAM u32 command_start(struct sos_psram_record *r, u32 cmd, u32 addr,
-                              u32 dummy, u32 out_bits, u32 out,
-                              u32 in_bits) {
+// One SPI1 user command, as `link_start` sends it. `cs` is the chip select
+// it goes to, as MISC(1) [1:0] must read for it: `MISC_GATE`, the PSRAM's,
+// or `MISC_FLASH`; `link_start` compares MISC(1) with it and never writes
+// MISC(1). CTRL(1) and CACHE_FCTRL(1) become (word & keep) | set. The
+// command, the address and the dummy are `cmd_bits`, `addr_bits` (0: no
+// address phase) and `dummy` cycles (0: none); `out_bits` and `in_bits` are
+// the data phases, 0 for none. The callers set every field one by one, so
+// no initializer becomes a copy from `.rodata`.
+struct cmd {
+    u32 cs;
+    u32 ctrl_keep;
+    u32 ctrl_set;
+    u32 fctrl_keep;
+    u32 fctrl_set;
+    u32 cmd;
+    u32 cmd_bits;
+    u32 addr;
+    u32 addr_bits;
+    u32 dummy;
+    u32 out_bits;
+    u32 out;
+    u32 in_bits;
+};
+
+// What `link_start` and `link_finish` answer besides 0: SPI1 busy before
+// the command (nothing started), MISC(1) not reading the command's chip
+// select (nothing started), the command not finished.
+#define LINK_BUSY   1u
+#define LINK_GATE   2u
+#define LINK_STUCK  3u
+
+// S7.1 to S7.9's start: the command `c` set up and started. Answers 0, or
+// `LINK_BUSY` or `LINK_GATE` with the word it read in `*read`.
+static IRAM u32 link_start(struct cmd *c, u32 *read) {
     command_number++;
-    r->command = cmd;
-    r->address = addr;
     // S7.1
-    if (!wait_idle(r, STEP_S7_1)) {
-        return stop(r, STOP_BUSY_COMMAND, r->read, 0);
+    if (!poll_idle(STEP_S7_1, read)) {
+        return LINK_BUSY;
     }
     // S7.2
     u32 ctrl = rd(STEP_S7, SPI1 + SPI_CTRL);
-    wr(SPI1 + SPI_CTRL, (ctrl & CTRL_KEEP) | CTRL_OCTAL);
+    wr(SPI1 + SPI_CTRL, (ctrl & c->ctrl_keep) | c->ctrl_set);
     // S7.3
-    u32 phases = USR_COMMAND | USR_ADDR;
-    if (dummy != 0) {
+    u32 phases = USR_COMMAND;
+    if (c->addr_bits != 0) {
+        phases |= USR_ADDR;
+    }
+    if (c->dummy != 0) {
         phases |= USR_DUMMY;
     }
-    if (in_bits != 0) {
+    if (c->in_bits != 0) {
         phases |= USR_MISO;
     }
-    if (out_bits != 0) {
+    if (c->out_bits != 0) {
         phases |= USR_MOSI;
     }
     u32 user = rd(STEP_S7, SPI1 + SPI_USER);
     wr(SPI1 + SPI_USER, (user & USER_KEEP) | phases);
     // S7.4, S7.5
-    wr(SPI1 + SPI_USER1, USER1_ADDR_32 | (dummy != 0 ? dummy - 1 : 0));
-    wr(SPI1 + SPI_USER2, USER2_CMD_16 | cmd);
+    u32 addr_field = c->addr_bits != 0 ? c->addr_bits - 1 : 0;
+    wr(SPI1 + SPI_USER1, (addr_field << USER1_ADDR_SHIFT)
+                         | (c->dummy != 0 ? c->dummy - 1 : 0));
+    wr(SPI1 + SPI_USER2, ((c->cmd_bits - 1) << USER2_CMD_SHIFT) | c->cmd);
     // S7.6
-    wr(SPI1 + SPI_ADDR, addr);
-    u32 fctrl = rd(STEP_S7, SPI1 + SPI_CACHE_FCTRL);
-    wr(SPI1 + SPI_CACHE_FCTRL, fctrl | FCTRL_ADDR_32);
-    // S7.7
-    if (out_bits != 0) {
-        wr(SPI1 + SPI_MOSI_DLEN, out_bits - 1);
-        wr(SPI1 + SPI_W0, out);
+    if (c->addr_bits != 0) {
+        wr(SPI1 + SPI_ADDR, c->addr);
     }
-    if (in_bits != 0) {
-        wr(SPI1 + SPI_MISO_DLEN, in_bits - 1);
+    u32 fctrl = rd(STEP_S7, SPI1 + SPI_CACHE_FCTRL);
+    wr(SPI1 + SPI_CACHE_FCTRL, (fctrl & c->fctrl_keep) | c->fctrl_set);
+    // S7.7
+    if (c->out_bits != 0) {
+        wr(SPI1 + SPI_MOSI_DLEN, c->out_bits - 1);
+        wr(SPI1 + SPI_W0, c->out);
+    }
+    if (c->in_bits != 0) {
+        wr(SPI1 + SPI_MISO_DLEN, c->in_bits - 1);
     }
     // S7.8
     u32 misc = rd(STEP_S7_8, SPI1 + SPI_MISC);
-    if ((misc & MISC_CS_MASK) != MISC_GATE) {
-        return stop(r, STOP_GATE_LOST, misc, MISC_GATE);
+    if ((misc & MISC_CS_MASK) != c->cs) {
+        *read = misc;
+        return LINK_GATE;
     }
     wr(SPI1 + SPI_CMD, SPI_MEM_USR);
     return 0;
 }
 
-// S7.9's wait and S7.10, for the command `command_start` started: a command
-// that does not finish leaves the gate as it is, so a transfer still under
-// way cannot be turned towards the flash by a restore, and says so from here
-// first. The answer is W0(1), read when `answer` is not 0.
-static IRAM u32 command_finish(struct sos_psram_record *r, u32 cmd,
-                               u32 *answer) {
-    if (!wait_idle(r, STEP_S7_9)) {
-        short_line_out(cmd);
-        return stop(r, STOP_NOT_FINISHED, r->read, 0);
+// S7.9's wait and S7.10, for the command `link_start` started. A command that
+// does not finish says so from here first, in its chip select's line, and
+// answers `LINK_STUCK` with the word read in `*read`. The answer is W0(1),
+// read when `answer` is not 0.
+static IRAM u32 link_finish(struct cmd *c, u32 *read, u32 *answer) {
+    if (!poll_idle(STEP_S7_9, read)) {
+        if (c->cs == MISC_FLASH) {
+            short_line_out(flash_short_line, sizeof(flash_short_line) - 1,
+                           2, c->cmd);
+        } else {
+            short_line_out(short_line, sizeof(short_line) - 1, 4, c->cmd);
+        }
+        return LINK_STUCK;
     }
     // S7.10
     if (answer != 0) {
@@ -651,15 +781,59 @@ static IRAM u32 command_finish(struct sos_psram_record *r, u32 cmd,
     return 0;
 }
 
+// S7.1 to S7.9's start for the PSRAM: one command to chip select 1 in octal
+// DTR, a 16-bit command and a 32-bit address, described in `c`. Answers 0,
+// or the stop code with the record filled in.
+static IRAM u32 command_start(struct sos_psram_record *r, struct cmd *c,
+                              u32 cmd, u32 addr, u32 dummy, u32 out_bits,
+                              u32 out, u32 in_bits) {
+    r->command = cmd;
+    r->address = addr;
+    c->cs = MISC_GATE;
+    c->ctrl_keep = CTRL_KEEP;
+    c->ctrl_set = CTRL_OCTAL;
+    c->fctrl_keep = 0xFFFFFFFFu;
+    c->fctrl_set = FCTRL_ADDR_32;
+    c->cmd = cmd;
+    c->cmd_bits = 16;
+    c->addr = addr;
+    c->addr_bits = 32;
+    c->dummy = dummy;
+    c->out_bits = out_bits;
+    c->out = out;
+    c->in_bits = in_bits;
+    u32 code = link_start(c, &r->read);
+    if (code == LINK_BUSY) {
+        return stop(r, STOP_BUSY_COMMAND, r->read, 0);
+    }
+    if (code == LINK_GATE) {
+        return stop(r, STOP_GATE_LOST, r->read, MISC_GATE);
+    }
+    return 0;
+}
+
+// S7.9's wait and S7.10 for the PSRAM's command: one that does not finish
+// leaves the gate as it is, so a transfer still under way cannot be turned
+// towards the flash by a restore.
+static IRAM u32 command_finish(struct sos_psram_record *r, struct cmd *c,
+                               u32 *answer) {
+    if (link_finish(c, &r->read, answer)) {
+        return stop(r, STOP_NOT_FINISHED, r->read, 0);
+    }
+    return 0;
+}
+
 // S7: one command, started and waited for. Answers 0 or the stop code.
 static IRAM u32 command(struct sos_psram_record *r, u32 cmd, u32 addr,
                        u32 dummy, u32 out_bits, u32 out, u32 in_bits,
                        u32 *answer) {
-    u32 code = command_start(r, cmd, addr, dummy, out_bits, out, in_bits);
+    struct cmd c;
+    u32 code = command_start(r, &c, cmd, addr, dummy, out_bits, out,
+                             in_bits);
     if (code) {
         return code;
     }
-    return command_finish(r, cmd, answer);
+    return command_finish(r, &c, answer);
 }
 
 // The checks before anything is written: the entry check, then S0.1 to
@@ -876,7 +1050,8 @@ static IRAM u32 map_psram(struct sos_psram_expect *e,
 // the stop code.
 static IRAM u32 probe(struct sos_psram_record *r, u32 cmd, u32 dummy,
                       u32 in_bits, u32 spin, u32 *done) {
-    u32 code = command_start(r, cmd, 0, dummy, 0, 0, in_bits);
+    struct cmd c;
+    u32 code = command_start(r, &c, cmd, 0, dummy, 0, 0, in_bits);
     if (code) {
         return code;
     }
@@ -885,7 +1060,7 @@ static IRAM u32 probe(struct sos_psram_record *r, u32 cmd, u32 dummy,
     }
     u32 v = rd(STEP_S7_PROBE, SPI1 + SPI_CMD);
     *done = v == 0;
-    code = command_finish(r, cmd, 0);
+    code = command_finish(r, &c, 0);
     if (code) {
         return code;
     }
@@ -963,7 +1138,7 @@ static IRAM u32 under_gate(struct sos_psram_expect *e,
                            struct gated *g) {
     prepare_spi1(clock, r);
     if (!take_gate(r)) {
-        restore_spi1();
+        restore_spi1(SAVED);
         return r->stop;
     }
     u32 code = g->what == GATED_TIMING
@@ -972,7 +1147,7 @@ static IRAM u32 under_gate(struct sos_psram_expect *e,
     if (code == STOP_NOT_FINISHED) {
         return code;
     }
-    restore_spi1();
+    restore_spi1(SAVED);
     return code;
 }
 
@@ -1075,4 +1250,109 @@ IRAM u32 sos_psram_time_reads(u32 expect_addr, u32 record_addr, u32 which,
         return stop(r, STOP_MEASUREMENT, which, TIME_MR_SLOW);
     }
     return under_gate(e, r, clock, &g);
+}
+
+// ---- the flash's reads ------------------------------------------------------
+
+// The answer's length in bits of each read the flash is sent, and 0 for any
+// other opcode: these five are the only commands this file sends with chip
+// select 0 enabled. None changes the flash, sets its write-enable latch or
+// powers it down.
+static IRAM u32 flash_read_bits(u32 op) {
+    if (op == FLASH_RDID) {
+        return 24;
+    }
+    if (op == FLASH_RDSR || op == FLASH_RDSR2 || op == FLASH_RDSR3) {
+        return 8;
+    }
+    if (op == FLASH_RDSFDP) {
+        return 32;
+    }
+    return 0;
+}
+
+static IRAM u32 flash_stop(struct sos_flash_record *f, u32 code, u32 read,
+                           u32 expect) {
+    f->stop = code;
+    f->read = read;
+    f->expect = expect;
+    return code;
+}
+
+// One read of the flash (../ABI.md §18a): `op`, one of `flash_read_bits`'
+// five, and for SFDP its address `addr`, sent on SPI1 as IDF's
+// `bootloader_flash_execute_command_common` sends it, at the clock SPI1
+// holds. Every check is made before SPI1 is written: the opcode is a read
+// (0x7A), MISC(1) reads chip select 0 alone (0x73), DDR(1) reads 0, single
+// data rate (0x7B), and SPI1 is idle (0x74). Then SPI1's words are saved,
+// the command is sent and waited for, and every saved word but MISC(1) is
+// written back; MISC(1) is never written. A command that does not finish
+// (0x75) writes its line from here and leaves SPI1 as it is, chip select 0
+// possibly still low, and the caller halts. Answers 0, with the answer's
+// bytes in the record, the first received in [7:0]; or the stop code; for
+// 0x79, the record not in DRAM, nothing is written to it.
+IRAM u32 sos_flash_read(u32 record_addr, u32 op, u32 addr) {
+    if (!in_dram(record_addr, sizeof(struct sos_flash_record))) {
+        return STOP_FLASH_NOT_DRAM;
+    }
+    struct sos_flash_record *f =
+        (struct sos_flash_record *)(unsigned long)record_addr;
+    command_number = 0;
+    f->stop = 0;
+    f->read = 0;
+    f->expect = 0;
+    f->command = op;
+    f->address = addr;
+    f->answer = 0;
+    f->saved = 0;
+    f->misc = 0;
+    u32 bits = flash_read_bits(op);
+    if (bits == 0) {
+        return flash_stop(f, STOP_FLASH_NOT_READ, op, 0);
+    }
+    u32 misc = rd(STEP_F_GATE, SPI1 + SPI_MISC);
+    f->misc = misc;
+    if ((misc & MISC_CS_MASK) != MISC_FLASH) {
+        return flash_stop(f, STOP_FLASH_GATE, misc, MISC_FLASH);
+    }
+    u32 ddr = rd(STEP_F_DDR, SPI1 + SPI_DDR);
+    if (ddr != 0) {
+        return flash_stop(f, STOP_FLASH_DDR, ddr, 0);
+    }
+    if (!poll_idle(STEP_F_IDLE, &f->read)) {
+        return flash_stop(f, STOP_FLASH_BUSY, f->read, 0);
+    }
+    save_spi1(STEP_F_SAVE);
+    f->saved = 1;
+    struct cmd c;
+    c.cs = MISC_FLASH;
+    c.ctrl_keep = 0;
+    c.ctrl_set = CTRL_WP;
+    c.fctrl_keep = ~(FCTRL_ADDR_32 | FCTRL_LINES);
+    c.fctrl_set = 0;
+    c.cmd = op;
+    c.cmd_bits = 8;
+    c.addr = addr;
+    c.addr_bits = op == FLASH_RDSFDP ? SFDP_ADDR_BITS : 0;
+    c.dummy = op == FLASH_RDSFDP ? SFDP_DUMMY : 0;
+    c.out_bits = 0;
+    c.out = 0;
+    c.in_bits = bits;
+    u32 w = 0;
+    u32 code = link_start(&c, &f->read);
+    if (code == 0) {
+        code = link_finish(&c, &f->read, &w);
+        if (code == LINK_STUCK) {
+            return flash_stop(f, STOP_FLASH_STUCK, f->read, 0);
+        }
+    }
+    restore_spi1(SAVED_BUT_MISC);
+    if (code == LINK_BUSY) {
+        return flash_stop(f, STOP_FLASH_BUSY, f->read, 0);
+    }
+    if (code == LINK_GATE) {
+        return flash_stop(f, STOP_FLASH_GATE, f->read, MISC_FLASH);
+    }
+    f->answer = bits < 32 ? w & ((1u << bits) - 1u) : w;
+    return 0;
 }

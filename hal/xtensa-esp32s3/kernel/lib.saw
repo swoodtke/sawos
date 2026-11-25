@@ -1912,6 +1912,156 @@ public func psram_spi1_line(before: &[UInt32; 11]) unsafe {
     console_str("\n")
 }
 
+// =============================================================================
+// The flash's reads, Saw half
+// =============================================================================
+//
+// `mspi.c`'s `sos_flash_read` sends one of the flash's five reads from IRAM,
+// with every check before it writes SPI1, and fills in a record; this half
+// passes it the record and prints the line a stop's record says (../ABI.md
+// §18). It writes nothing to the memory-SPI controller itself.
+
+extern "C" {
+    func sos_flash_read(record: UInt, op: UInt, addr: UInt) -> UInt
+}
+
+/// What a read found, as `mspi.c`'s `struct sos_flash_record` lays it out:
+/// a stop's words, the answer (its first byte in [7:0]), whether SPI1's
+/// words had been saved when it stopped, and MISC(1) as the gate read it.
+public struct FlashRecord {
+    stop: UInt32,
+    read: UInt32,
+    expect: UInt32,
+    command: UInt32,
+    address: UInt32,
+    answer: UInt32,
+    saved: UInt32,
+    misc: UInt32,
+}
+
+static_assert(sizeof<FlashRecord>() == 32, "FlashRecord is mspi.c's layout")
+
+/// The flash's reads, the only commands `sos_flash_read` sends (`mspi.c`'s
+/// FLASH_*, IDF spi_flash_defs.h): the JEDEC ID (3 bytes), status registers
+/// 1, 2 and 3 (a byte each) and SFDP (4 bytes at a 24-bit address).
+public static FLASH_RDID: UInt = 0x9F
+public static FLASH_RDSR: UInt = 0x05
+public static FLASH_RDSR2: UInt = 0x35
+public static FLASH_RDSR3: UInt = 0x15
+public static FLASH_RDSFDP: UInt = 0x5A
+
+/// The stops' codes (../ABI.md §18a).
+static FLASH_STOP_GATE: UInt = 0x73
+static FLASH_STOP_BUSY: UInt = 0x74
+static FLASH_STOP_STUCK: UInt = 0x75
+static FLASH_STOP_NOT_DRAM: UInt = 0x79
+static FLASH_STOP_NOT_READ: UInt = 0x7A
+static FLASH_STOP_DDR: UInt = 0x7B
+
+/// Send the flash the read `op` (one of FLASH_*), at `addr` for SFDP,
+/// filling in the record at `record`, which must be DRAM. Answers 0, or the
+/// stop code, whose line `flash_stop_line` prints; after 0x75 the caller
+/// halts.
+public func flash_read(record: UInt, op: UInt, addr: UInt) unsafe -> UInt {
+    sos_flash_read(record, op, addr)
+}
+
+/// The tail of a stop's line: whether SPI1 was written before it, and so
+/// put back.
+func flash_untouched(saved: UInt32) unsafe {
+    if saved != 0 {
+        console_str("; nothing was sent, SPI1 put back\n")
+    } else {
+        console_str("; nothing was sent\n")
+    }
+}
+
+/// Print the line for the stop `stop` that `flash_read` answered, from the
+/// record at `record`. For 0x79 the record is not read: the line names its
+/// address.
+public func flash_stop_line(record: UInt, stop: UInt) unsafe {
+    console_str("SOS-S3: flash stop: ")
+    if stop == FLASH_STOP_NOT_DRAM {
+        console_str("the record at 0x")
+        console_hex(record)
+        console_str(" is not in DRAM\n")
+        return
+    }
+    let r = UnsafeMemory<FlashRecord, Normal>(record)
+    let read = r.read.read() as UInt
+    let command = r.command.read() as UInt
+    let saved = r.saved.read()
+    if stop == FLASH_STOP_NOT_READ {
+        psram_hex(read, 2)
+        console_str(" is not one of the flash's reads (0x9f 0x05 0x35 0x15 ")
+        console_str("0x5a)")
+        flash_untouched(saved)
+    } else if stop == FLASH_STOP_GATE {
+        console_str("SPI1 MISC=0x")
+        console_hex(read)
+        console_str(" before command ")
+        psram_hex(command, 2)
+        console_str(", the flash's commands need chip select 0 alone ")
+        console_str("(0x00000002)")
+        flash_untouched(saved)
+    } else if stop == FLASH_STOP_DDR {
+        console_str("SPI1 DDR=0x")
+        console_hex(read)
+        console_str(" before command ")
+        psram_hex(command, 2)
+        console_str(", the flash's reads need single data rate (0)")
+        flash_untouched(saved)
+    } else if stop == FLASH_STOP_BUSY {
+        console_str("SPI1 busy before command ")
+        psram_hex(command, 2)
+        console_str(", SPI_MEM_CMD=0x")
+        console_hex(read)
+        psram_polls()
+        flash_untouched(saved)
+    } else if stop == FLASH_STOP_STUCK {
+        console_str("SPI1 command ")
+        psram_hex(command, 2)
+        console_str(" did not finish, SPI_MEM_CMD=0x")
+        console_hex(read)
+        psram_polls()
+        console_str("; SPI1 left as it is\n")
+    } else {
+        console_str("code 0x")
+        console_hex(stop)
+        console_str(", which this kernel does not name\n")
+    }
+}
+
+/// Print, for a harness, `lead`, then SPI1's MISC and clock as they read
+/// now, and whether every word the reads save reads as it did in `before`
+/// (`psram_spi1_words`), naming each one that does not.
+public func flash_spi1_line(lead: String, before: &[UInt32; 11]) unsafe {
+    var after: [UInt32; 11] = [0; 11]
+    psram_spi1_words(&var after)
+    console_str(lead)
+    console_str("SPI1 MISC=0x")
+    console_hex(after[10] as UInt)
+    console_str(" clock=0x")
+    console_hex(after[0] as UInt)
+    var same = true
+    var i = 0
+    while i < PSRAM_SPI1_WORDS {
+        if after[i] != before[i] {
+            if same { console_str(" after the reads, differing:") }
+            same = false
+            console_str(" ")
+            console_str(psram_spi1_name(i))
+            console_str("=0x")
+            console_hex(before[i] as UInt)
+            console_str("->0x")
+            console_hex(after[i] as UInt)
+        }
+        i += 1
+    }
+    if same { console_str(" after the reads, as before them") }
+    console_str("\n")
+}
+
 /// One past the highest user address a RAM row may take. A row's address is
 /// its bytes' on this board, so it is RAM's end.
 public static USER_RAM_TOP: UInt = RAM_TOP

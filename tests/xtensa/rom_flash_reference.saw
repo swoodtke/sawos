@@ -1,0 +1,42 @@
+// A kernel that names the ROM's `esp_rom_spiflash_config_readmode` in each
+// section the runner scans (`check_rom_flash_references`,
+// ../../hal/xtensa-esp32s3/ABI.md §18b): its jump-table entry and its body's
+// address as literals in `.text`, the entry in a writable static (`.data`),
+// in a read-only table (`.drom`) and in `rom_flash_reference.S`'s IRAM
+// function (`.iram`). The runner refuses its image, so it never boots; were
+// the check gone, it would print the words and call nothing.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_romref_iram() -> UInt
+}
+
+/// esp32s3.rom.ld's `esp_rom_spiflash_config_readmode`, and the routine's
+/// address in the ROM's ELF.
+static CONFIG_READMODE_ENTRY: UInt = 0x4000_0AA4
+static CONFIG_READMODE: UInt = 0x4004_A820
+
+/// The entry in a table read at an index known only at run time, so the
+/// table stays read-only data.
+static TABLE: [UInt; 2] = [0x4000_0AA4, 0]
+
+/// The entry in a static the kernel writes, so it stays writable data.
+unsafe static var WRITABLE: UInt = 0x4000_0AA4
+
+@export("kmain")
+func kmain() unsafe {
+    let index = sos_romref_iram()
+    console().write_str("SOS romref: ")
+    console().write_hex(CONFIG_READMODE_ENTRY)
+    console().write_str(" ")
+    console().write_hex(CONFIG_READMODE)
+    console().write_str(" ")
+    console().write_hex(TABLE[(index & 1) as Int])
+    console().write_str(" ")
+    console().write_hex(WRITABLE)
+    console().write_str("\n")
+    WRITABLE = index
+    hal.exit_pass()
+}

@@ -1,0 +1,152 @@
+// A flash read's stops, each reached through the real call
+// (../../hal/xtensa-esp32s3/ABI.md §18b). Built only with `mspi.c`'s fault
+// record (`-DSOS_PSRAM_FAULT`, the case key `psram_fault`): the case's block
+// (`sos_flash_case`, written by the runner beside the image) says which read
+// to send and at what address, which one read of the call lies, and how, and
+// may name an address to pass for the record in place of the block's own.
+// `sos_flash_case_setup` stores the case's SPI_MEM_MISC(1) word first, as in
+// `s3_flash_probe.saw`.
+//
+//   (the call's own line, for a command that did not finish)
+//   SOS-S3: flash stop: ...                     the stop's line
+//   SOS flash: fault hits=... starts=... w0_reads=...
+//   SOS flash: answer=...                       (a read that finished)
+//   SOS flash: SPI1 MISC=... clock=... after the reads, ...
+//   SOS-S3: halt pass, or fail code=...
+//
+// `hits` is how many reads the record answered, `starts` how many commands
+// the call started, `w0_reads` how many answers it read.
+//
+// With the block's `sweep` set it sends instead every byte that is not one
+// of the five reads (`hal.FLASH_*`), one call each, and prints how many it
+// sent and how many the call refused with 0x7A, after a line for each it did
+// not refuse:
+//
+//   SOS flash: sweep 0x... answered stop=0x...
+//   SOS flash: sweep sent=... refused=...
+//
+// A board image of this harness is refused: the runner allows the fault
+// record in a fault harness's emulator image only.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_flash_case() -> UInt
+    func sos_flash_case_setup()
+    func sos_psram_fault_record() -> UInt
+}
+
+/// The case's block, as the runner's `_flash_case_asm` lays it out: this,
+/// then the record.
+struct CaseHarness {
+    step: UInt32,
+    command: UInt32,
+    addr: UInt32,
+    value: UInt32,
+    count: UInt32,
+    record_at: UInt32,          // 0: the block's own record
+    opcode: UInt32,
+    address: UInt32,
+    sweep: UInt32,              // 0: the one read `opcode` names
+    jedec: UInt32,              // the probe's; not read here
+}
+
+static RECORD_OFFSET: UInt = 40
+
+/// `flash_read`'s stop for an opcode that is not a read.
+static NOT_READ: UInt = 0x7A
+
+/// Whether `op` is one of the five reads `flash_read` sends.
+func is_read(op: UInt) -> Bool {
+    op == hal.FLASH_RDID || op == hal.FLASH_RDSR || op == hal.FLASH_RDSR2 ||
+        op == hal.FLASH_RDSR3 || op == hal.FLASH_RDSFDP
+}
+
+/// Every opcode but the five reads, each through `flash_read`, counted.
+func sweep(record: UInt) unsafe {
+    var sent: UInt32 = 0
+    var refused: UInt32 = 0
+    var op: UInt = 0
+    while op < 256 {
+        if not is_read(op) {
+            sent += 1
+            let stop = hal.flash_read(record, op, 0)
+            if stop == NOT_READ {
+                refused += 1
+            } else {
+                console().write_str("SOS flash: sweep ")
+                console().write_hex(op)
+                console().write_str(" answered stop=")
+                console().write_hex(stop)
+                console().write_str("\n")
+            }
+        }
+        op += 1
+    }
+    word("SOS flash: sweep sent=", sent)
+    word(" refused=", refused)
+    console().write_str("\n")
+}
+
+/// `mspi.c`'s `struct sos_psram_fault`.
+struct FaultRecord {
+    step: UInt32,
+    command: UInt32,
+    addr: UInt32,
+    value: UInt32,
+    count: UInt32,
+    hits: UInt32,
+    starts: UInt32,
+    w0_reads: UInt32,
+}
+
+func word(name: String, v: UInt32) unsafe {
+    console().write_str(name)
+    console().write_hex(v as UInt)
+}
+
+@export("kmain")
+func kmain() unsafe {
+    sos_flash_case_setup()
+    let block = sos_flash_case()
+    let h = UnsafeMemory<CaseHarness, Normal>(block)
+    let f = UnsafeMemory<FaultRecord, Normal>(sos_psram_fault_record())
+    f.step.write(h.step.read())
+    f.command.write(h.command.read())
+    f.addr.write(h.addr.read())
+    f.value.write(h.value.read())
+    f.count.write(h.count.read())
+    f.hits.write(0)
+    f.starts.write(0)
+    f.w0_reads.write(0)
+    let record = if h.record_at.read() != 0 { h.record_at.read() as UInt }
+                 else { block + RECORD_OFFSET }
+
+    var before: [UInt32; 11] = [0; 11]
+    hal.psram_spi1_words(&var before)
+    if h.sweep.read() != 0 {
+        sweep(record)
+        hal.flash_spi1_line("SOS flash: ", &before)
+        hal.exit_pass()
+    }
+    let stop = hal.flash_read(record, h.opcode.read() as UInt,
+                              h.address.read() as UInt)
+    if stop != 0 {
+        hal.flash_stop_line(record, stop)
+    }
+    word("SOS flash: fault hits=", f.hits.read())
+    word(" starts=", f.starts.read())
+    word(" w0_reads=", f.w0_reads.read())
+    console().write_str("\n")
+    if stop == 0 {
+        let r = UnsafeMemory<hal.FlashRecord, Normal>(record)
+        word("SOS flash: answer=", r.answer.read())
+        console().write_str("\n")
+    }
+    hal.flash_spi1_line("SOS flash: ", &before)
+    if stop != 0 {
+        hal.exit_fail(stop)
+    }
+    hal.exit_pass()
+}

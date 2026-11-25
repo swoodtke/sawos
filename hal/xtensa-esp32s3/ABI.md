@@ -1972,6 +1972,15 @@ copy_out 128, SRAM                     1426           1426-1428
   12 us at 240 (the console's writes between chunks come on top). A 32-byte
   chunk from evicted PSRAM varied between 7 and 23 us at 80 MHz and 4 and 29 us
   at 240; the harness does not say which round or what made the largest.
+- **The flash's reads.** The emulator's flash is a 4 MiB GigaDevice model
+  with no SFDP and no status register 2, and its SPI1 reads MISC 0 at boot
+  (§18b); the part's flash is an 8 MiB XMC part by esptool's ID, and its
+  MISC reads `0b10`. *Prepared for:* a read compares MISC(1) with `0b10` and
+  never writes it, so the emulator's images store the part's word first and
+  a board image does not (§18b); the probe prints every word it reads, and
+  reads past `9Fh` only a flash of the part's ID (§18c). *On silicon (rev
+  v0.2, ROM `esp32s3-20210327`):* F0 read the part's ID, status registers
+  and SFDP tables and put SPI1 back (§18c).
 
 ---
 
@@ -3474,7 +3483,7 @@ flash. This section is the command layer: the bring-up's checks and its
 commands, steps S0 to S10, and the measurement that settles the memory-SPI
 core clock. SPI0's PSRAM side, the cache's map, the read-back test and the
 `esp32s3-r8` board that brings the PSRAM up at every boot (S11 to S15) are
-§17's.
+§17's. The flash's reads share its command primitive (§18a).
 
 - `kernel/mspi.c` makes every step and every check, in one call from IRAM
   (`sos_psram_bringup`), and returns at the first check that fails with a
@@ -3898,8 +3907,9 @@ first), of that address, returns the record's value that many times. Writes
 always reach the register. The record also counts the reads it answered,
 the commands started and the answers read. The case key `psram_fault`
 builds an image's profile with the define; the runner refuses any image
-that defines `sos_psram_fault` unless it is `psram_fault.saw`'s, and any
-board image that defines it (`check_psram_fault`; the cases
+that defines `sos_psram_fault` unless it is `psram_fault.saw`'s or the
+flash read's harness, `flash_fault.saw` (§18b), and any board image that
+defines it (`check_psram_fault`; the cases
 `psram_fault_outside_harness` and `psram_fault_board_image`). An image
 the checks refuse is deleted from the build directory, and the board
 image's case requires that it is gone.
@@ -4600,3 +4610,443 @@ On the part (rev v0.2) both keys passed, in one capture session:
 | plain PSRAM control | 15088, 1296 lost | 14849, 1535 lost |
 | retries, PSRAM / SRAM | 148 / 14 | 32 / 1 |
 | data cache accesses / PSRAM misses | 823768 / 196774 | 823494 / 196799 |
+---
+
+## 18. The flash's reads
+
+The module's flash sits on chip select 0 of the memory-SPI controller the
+PSRAM's command layer drives (§16). Reading what the flash says of itself,
+its JEDEC ID, its status registers and its SFDP tables, means sending it
+commands on SPI1 with chip select 0 enabled, which no image did before. This
+section is how that is done, and that nothing else is: the read, its checks
+and its stores (§18a); what holds it on the emulator and in every image
+(§18b); and the probe that reads the part, board stage F0 (§18c).
+
+- `kernel/mspi.c`'s `sos_flash_read` sends one read, from IRAM, under the
+  rules of §16d, and returns at the first check that fails with a record of
+  what it read. It shares the PSRAM's command primitive (S7.1 to S7.10),
+  whose chip select is a parameter it compares with SPI_MEM_MISC(1) and
+  never writes.
+- `kernel/lib.saw`'s flash section passes the record and prints the line a
+  stop's record says (`flash_stop_line`).
+- `tests/xtensa/s3_flash_probe.saw` is the probe, F0; `flash_fault.saw` is
+  the fault build's harness (§18b).
+
+### 18a. The read, its checks and its stores
+
+**The commands.** `sos_flash_read(record, op, addr)` sends `op` if it is one
+of five reads and refuses any other opcode before it reads a register:
+
+```
+op   what it returns                    IDF's name and source
+9Fh  JEDEC ID, 3 bytes                  CMD_RDID, bootloader_read_flash_id
+05h  status register 1                  CMD_RDSR
+35h  status register 2 (QE is bit 1)    CMD_RDSR2; bootloader_flash_qe_
+                                        support_list's default entry
+15h  status register 3                  flash_qio_mode.c, bootloader_read_
+                                        status_8b_rdsr3
+5Ah  SFDP: a 24-bit address, 8 dummy    CMD_RDSFDP, bootloader_flash_read_
+     cycles, 4 bytes                    sfdp
+```
+
+`9Fh` is every flash's, and ESP-IDF sends it to whatever part it meets.
+The other four are not: IDF marks `CMD_RDSR2` "Not all SPI flash uses this
+command" (`spi_flash_defs.h`), and its QE table reads MXIC and ISSI parts
+with `05h` alone (`flash_qio_mode.c`). So the one caller, the probe, sends
+`9Fh` first and the others only to a flash whose ID is `0x00204017` and
+whose eFuse FLASH_TYPE is 0, the part's (§18c); and the claim that follows
+is a claim about that part. On it, none of the five changes the flash, sets
+its write-enable latch or powers it down. Nothing in this tree sends `06h`
+(write enable), so the flash's latch stays clear and a write opcode sent by
+mistake would be ignored by the chip; `50h` (write enable for the volatile
+status register), `B9h` and `79h` (deep and ultra-deep power-down) are
+never sent either. The answer's first byte is in [7:0] of the record's
+`answer`, the bits past the answer's length cleared, as IDF's
+`bootloader_flash_execute_command_common` returns it.
+
+**The checks**, in order, every one before SPI1 is written:
+
+```
+code  check                                      line (after "SOS-S3: flash
+                                                 stop: ")
+0x79  the record lies in DRAM, by its address    the record at 0x........ is
+                                                 not in DRAM
+0x7A  the opcode is one of the five              0x.. is not one of the
+                                                 flash's reads (...); nothing
+                                                 was sent
+0x73  SPI_MEM_MISC(1) [1:0] reads 0b10: chip     SPI1 MISC=0x........ before
+      select 1 disabled, chip select 0, the      command 0x.., the flash's
+      flash's, enabled                           commands need chip select 0
+                                                 alone (0x00000002); nothing
+                                                 was sent
+0x7B  SPI_MEM_DDR(1) reads 0: single data rate   SPI1 DDR=0x........ before
+                                                 command 0x.., the flash's
+                                                 reads need single data rate
+                                                 (0); nothing was sent
+0x74  SPI_MEM_CMD(1) reads 0 within 100000       SPI1 busy before command
+      polls                                      0x.., SPI_MEM_CMD=0x........
+                                                 after 100000 polls; nothing
+                                                 was sent
+```
+
+MISC(1) at `0b10` is the word the ROM's boot leaves on the part (§15c) and
+the one the PSRAM's S10 puts back (§16c); a read compares it and never
+writes it, so a read can only reach the flash when nothing has turned the
+controller towards the PSRAM. DDR(1) at 0 is the ROM's word too: with
+DDR_EN set the command would go out on both clock edges, and a flash
+sampling one edge would see another opcode.
+
+**The stores**, IDF's `bootloader_flash_execute_command_common` with the
+S3's `spimem_flash_ll` helpers, through the primitive's S7.2 to S7.9:
+
+```
+step   register (SPI1)       value
+save   CLOCK, CTRL, USER, USER1, USER2, ADDR, MOSI_DLEN, MISO_DLEN,
+       CACHE_FCTRL, DDR, MISC read (§16c's S5 list)
+S7.2   CTRL       0x00200000: WP [21] alone (`ctrl.val = 0`, then
+                  `spimem_flash_ll_set_wp_level(true)`): command, address
+                  and data on one line, no fast-read bit, no WRSR_2B
+S7.3   USER       (USER & 0x00FF0FFF) | USR_COMMAND [31] | USR_MISO [28],
+                  and for 5Ah USR_ADDR [30] and USR_DUMMY [29]
+S7.4   USER1      5Ah: 0x5c000007, a 24-bit address and 8 dummy cycles;
+                  the others 0
+S7.5   USER2      0x70000000 | op: an 8-bit command
+S7.6   ADDR       5Ah only: the address, in [23:0] (`spimem_flash_ll_set_
+                  usr_address`, which on the S3 takes it unshifted)
+       CACHE_     CACHE_USR_CMD_4BYTE [1] cleared, as IDF's
+       FCTRL      `spimem_flash_ll_set_addr_bitlen` clears it, and the SPI1
+                  line modes [8:3] cleared too: that second clear is this
+                  code's own, stricter than IDF, whose helper sets only
+                  CACHE_USR_CMD_4BYTE, USER1's address length and USER's
+                  USR_ADDR; with any of the six set, a read meant for one
+                  line would go out on two or four
+S7.7   MISO_DLEN  the answer's bits less one: 23, 7 or 31
+S7.8   MISC read again; it must still read 0b10 (0x73, SPI1 put back)
+S7.9   CMD        SPI_MEM_USR [18] alone; then CMD read until 0
+S7.10  W0 read: the answer
+put    every saved word but MISC written back, in the save's order
+back
+```
+
+The only word ever written to SPI_MEM_CMD(1) is SPI_MEM_USR. The bits beside
+it start the controller's built-in flash commands (§16c), write enable,
+write status, the erases, page program and deep power-down among them; none
+is written. SPI1's clock is not written: a read runs at the divider SPI1
+holds, the ROM's divide by 4 (§16b), 5 MHz at `rom` and 20 MHz on the PLL
+keys. The ROM's extra dummy for SPI1 (§15c, 0 on the part), which IDF adds
+to every read's dummy, is not added.
+
+After the save, three ways out besides the answer:
+
+```
+0x74  S7.1   SPI1 busy before command 0x.., SPI_MEM_CMD=0x........ after
+             100000 polls; nothing was sent, SPI1 put back
+0x73  S7.8   SPI1 MISC=0x........ before command 0x.., ...; nothing was
+             sent, SPI1 put back
+0x75  S7.9   SOS-S3: flash: SPI1 command 0x.. did not finish   (from IRAM)
+             SOS-S3: flash stop: SPI1 command 0x.. did not finish,
+             SPI_MEM_CMD=0x........ after 100000 polls; SPI1 left as it is
+```
+
+A read that does not finish may still be on the bus with chip select 0 low:
+the call writes its own line from IRAM and leaves SPI1 alone, and the caller
+halts. A reset clears it.
+
+**The primitive.** The PSRAM's S7 is now one primitive (`link_start`,
+`link_finish`) given the chip select, CTRL(1)'s and CACHE_FCTRL(1)'s keep
+and set masks, and the command's, address's, dummy's and data's lengths.
+The PSRAM's commands pass the words S7 always used (§16c), so its stores are
+unchanged and §16e's cases hold them as before. The primitive compares
+MISC(1) with the command's chip select before every start and writes MISC(1)
+never; the PSRAM's gate (S6) is the one store to it in this file.
+
+### 18b. The emulator, and what holds the reads
+
+**The emulator** (espressif/qemu `esp-develop-9.2.2-20250817`, by its
+source and these runs):
+
+- The flash is QEMU's `m25p80` model on SPI1's chip select 0, chosen by the
+  image's size: a 4 MiB smoke image gets `gd25q32`, a GigaDevice part, JEDEC
+  `0xc84016`. It answers `9Fh` with that ID and `05h` with its status, 0 at
+  boot, and `15h` with its configuration byte, 0. It does not answer `35h`
+  for a GigaDevice part: the command leaves it idle, so the byte clocked in
+  for the answer is decoded as a command of its own, `00h`, and status
+  register 2 reads 0. `5Ah` is an unknown command to it and reads 0, so the
+  probe's SFDP signature reads 0 and it reads no further.
+- SPI1 runs a user command inside the store to SPI_MEM_CMD and reads
+  SPI_MEM_CMD 0 at once (§16e). It sends the address phase from ADDR's low
+  bits, as the S3's IDF writes it for a 24-bit address. It routes a
+  command to each chip select MISC(1) leaves enabled.
+- MISC(1) reads 0 at boot, where the part reads `0x00000002` (§15c): the
+  emulator does not take the word from its ROM's boot. A read compares it
+  with `0b10` and would stop at once, so a flash harness's emulator image
+  first stores the case's word (`sos_flash_case_setup`, which
+  `_flash_case_asm` in `tools/sos_runner.py` writes: `0x2` unless the case
+  says otherwise). In a board image the setup stores nothing, whatever the
+  case says, and the part's ROM has left `0b10`.
+- After its boot SPI1 holds CLOCK `0x00030103`, CTRL `0x00208000`, USER
+  `0x800000c0`, USER1 `0x5c000007`, USER2 `0x70000000`, and 0 in ADDR,
+  MOSI_DLEN, MISO_DLEN, CACHE_FCTRL and DDR: the words a read writes back.
+- SPI0, the IO MUX and the GPIO matrix are not modelled and read 0; the
+  caches' autoload words read `0x00000008` (DONE); the eFuse reads 0 with
+  no file.
+
+**What holds it**, in every image or every run of the smoke:
+
+- *The flash's own view.* Every run of the S3 smoke traces the commands the
+  flash model decodes (`-trace m25p80_command_decoded`), and a run in which
+  it decodes anything but `ABh`, the ROM's at boot, the five reads and the
+  `00h` the model makes of the byte after `35h` fails, whatever its case
+  asserts (`FLASH_COMMANDS_HEARD`). A case's `flash_commands` is the whole
+  list in order. With the eFuse's FLASH_TYPE set the emulator's ROM takes
+  the flash for an octal one and, before the kernel runs, sends it eight
+  `00h`, octal resets (`66h`, `99h`), `06h` twice and `FFh` in place of its
+  `ABh`, and leaves SPI1's CTRL at `0x0020a000`; the one case that boots so
+  names those commands (`flash_rom_commands`), the trace must begin with
+  them, and the rest is held as any run's.
+- *SPI1's stores.* A flash case's `expect_spi1_stores` is every store the
+  kernel makes to SPI1's page, from `_start`'s first store on, in order
+  (`check_spi1_stores`): the setup's MISC(1) word, then each read's stores
+  as §18a gives them, its one start with SPI_MEM_USR alone, and the words it
+  writes back. A store to MISC(1) from the read, a built-in command bit in
+  SPI_MEM_CMD, a word not put back or a CTRL(1) other than WP alone is a
+  difference. The emulator does not decode the built-in bits beside
+  SPI_MEM_USR, so this list, not the flash's trace, is what holds them.
+- *Nothing in flash.* `check_iram` (§16d) covers the read as it covers the
+  bring-up: its functions are `mspi.c`'s, all in `.text.iram`, and the
+  mutants' link is rooted at `sos_flash_read` too; `iram_mutant_script_flash`
+  requires the check to name it when the script's IRAM line is removed.
+- *No ROM routine that writes the flash.* `check_rom_flash_references`
+  refuses any S3 image whose kernel sections (`.entry`, `.iram`, `.text`,
+  `.data`, `.drom`) hold as an aligned word the jump-table entry or the
+  body's address of a ROM routine that sends the flash anything but a read
+  (`ROM_FLASH_WRITERS`): the status, array and write-enable writers and the
+  write-enable clear, the protection setters (`SPILock`, which sets the
+  block-protect bits), the wake and the resume, the quad, octal, reset and
+  read-mode setters (`esp_rom_spiflash_config_readmode` calls
+  `Enable_QMode` or `Disable_QMode`, which write QE), the routines that send
+  a command they are given, and the attaches: every one of
+  `esp32s3.rom.ld`'s flash groups (opi_flash, spiflash_legacy, hal_soc,
+  spi_flash_chips, memspi_host, esp_flash) that does, with its body from
+  the ROM's ELF. The check looks for addresses, so a routine is listed
+  even when the routines it calls are. This core has no 32-bit immediate,
+  so a call of one, through the windowed-call stub or otherwise, loads its
+  address from such a word. A refused image is deleted, as for the other
+  checks. `rom_flash_reference.saw` holds one routine's entry as a literal
+  (`.text`), in a static it writes (`.data`), in a table (`.drom`) and, in
+  `rom_flash_reference.S`, after an IRAM function's return (`.iram`), and
+  its body's address as a literal: a case for each requires the check to
+  name it there. `.entry` has no case: it is `boot.S`'s jump to `_start`
+  alone, and no test kernel can put a word in it without changing the boot
+  path every image shares.
+- *The fault build.* Every register read of the read goes through `rd`
+  (§16e), and `flash_fault.saw` is a fault harness beside `psram_fault.saw`:
+  the only two kernels that may hold `sos_psram_fault`, and only in an
+  emulator image (`check_psram_fault`). A read's steps for the fault record
+  are `0xF1` (MISC), `0xF2` (DDR), `0xF3` (the wait before the save), `0xF4`
+  (the save), then the primitive's S7 steps.
+
+**The cases**, each with its console, its flash trace and its SPI1 stores:
+
+```
+case                          how                                   stop
+s3_flash_probe                F0 on the emulator (below)             -
+flash_probe_misc_reset        the probe, MISC(1) at the emulator's 0 0x73
+flash_probe_misc_psram        MISC(1) at 0b01, the PSRAM's gate      0x73
+flash_probe_misc_neither      MISC(1) at 0b11                        0x73
+flash_read_rdid               9Fh: answer 0x001640c8, 1 start, 1     -
+                              answer read
+flash_read_rdsr2              35h: the flash decodes 35h, 00h        -
+flash_read_sfdp               5Ah at 0x30: the address phase         -
+flash_stop_not_read_NN        06h, 01h, 31h, 50h, B9h, 79h, 02h,     0x7A
+                              C7h, 03h: refused, nothing stored
+flash_read_sweep              every other byte, 251 calls in one     0x7A
+                              boot: each refused, nothing stored,    each
+                              the flash hears `ABh` alone
+flash_read_user_kept          S7's load of USER read with [31:24]    -
+                              and [15:12] set: the stores as ever
+flash_read_fctrl_cleared      S7's load of CACHE_FCTRL read with     -
+                              [8:3] and [1] set: the stores as ever
+flash_probe_other_id          the probe told to read past the        0x7C
+                              part's ID on the emulator's flash:
+                              9Fh alone sent
+flash_probe_flash_type_8      the probe with eFuse FLASH_TYPE set:   0x7C
+                              9Fh alone sent
+flash_stop_record_in_flash    the record at 0x3c200000               0x79
+flash_stop_record_past_dram   the record at 0x3fcffff0               0x79
+flash_stop_ddr                0xF2's read: DDR_EN set                0x7B
+flash_stop_busy_before        0xF3's reads: busy; nothing stored     0x74
+flash_stop_busy_command       S7.1's reads: busy; SPI1 put back      0x74
+flash_stop_gate_lost          S7.8's read: 0b01; set up, not         0x73
+                              started, put back
+flash_stop_not_finished       S7.9's reads: busy; the call's line,   0x75
+                              SPI1 left as the read set it
+flash_fault_board_image       the harness as a board image           build
+rom_flash_reference_entry     a kernel holding config_readmode's     build
+                              jump-table entry in `.text`
+rom_flash_reference_body      ... its body's address in `.text`      build
+rom_flash_reference_data      ... the entry in `.data`               build
+rom_flash_reference_drom      ... the entry in `.drom`               build
+rom_flash_reference_iram      ... the entry in `.iram`               build
+iram_mutant_script_flash      the read linked in flash               finding
+```
+
+`s3_flash_probe` on the emulator prints:
+
+```
+SOS flashprobe: efuse repeat_data3=0x00000000 flash_type=0
+SOS flashprobe: id jedec=0x00c84016 sr1=0x00 sr2=0x00 sr3=0x00
+SOS flashprobe: sfdp signature=0x00000000 sfdp=none
+SOS flashprobe: decoded sfdp=none qe=clear
+SOS flashprobe: spi0 clock=0x00000000 ... core_clk_sel=0x00000000
+SOS flashprobe: pads 27=0x00000000 ... insel 2=0x00000000 3=0x00000000
+SOS flashprobe: cache icache_autoload=0x00000008 dcache_autoload=0x00000008
+SOS flashprobe: SPI1 MISC=0x00000002 clock=0x00030103 after the reads, as
+                before them
+SOS-S3: halt pass
+```
+
+and the flash decodes `ab 9f 05 35 00 15 5a`.
+
+**What the emulator cannot show**, and only a part can: the reads on the
+wire at the part's clock, the part's answers (its ID, its status registers,
+its SFDP tables), and SPI0's, the pads' and the input selects' words.
+
+### 18c. The flash probe, board stage F0
+
+`tests/xtensa/s3_flash_probe.saw`, the smoke's `s3_flash_probe`, reads what
+the module's flash says of itself and what the ROM leaves in SPI0 for it,
+and prints both. Every command it sends the flash is one of §18a's reads,
+each one call of `hal.flash_read`; every other load goes through one
+accessor whose view is a `ReadOnly` field, as `s3_mem_probe`'s does (§15),
+so the file stores to no register of its own. It runs the image's clock
+key first, as `kmain` does; F0 is built at `rom`, where the reads run at
+5 MHz (§16b).
+
+```
+python3 tools/sos_runner.py --board esp32s3 --emit-flash s3_flash_probe \
+    --out PATH
+```
+
+builds the board image: the case block's setup stores nothing, its ID is
+the part's, and the image is held to every check of §16d and §18b.
+
+**The ID gate.** The probe sends `9Fh` and then nothing more unless the ID
+is the one its case block names and the eFuse's FLASH_TYPE is 0: a board
+image's block names the part's, `0x00204017` (`FLASH_PART_JEDEC`), and an
+emulator image's its flash model's, `0x00c84016`, unless the case names
+another. Otherwise it prints
+
+```
+SOS flashprobe: id jedec=0x........ stop: the probe reads further only a
+                flash of ID 0x00204017 and flash_type 0
+```
+
+then the SPI1 line, and halts with 0x7C, the probe's own code. `05h`,
+`35h`, `15h` and `5Ah` are not every flash's commands (§18a), so no other
+part is sent them.
+
+**The reads**, in order: `9Fh`; past the gate, `05h`, `35h`, `15h`; then
+SFDP, 4 bytes a read, at 0 (the header's signature, "SFDP" as the
+little-endian word `0x50444653`), 4 (its minor and major revision and the
+0-based count of parameter headers), 8 and 12 (the first parameter header:
+the ID's low byte, its revision, the table's length in DWORDs; the table's
+24-bit pointer and the ID's high byte), then the basic table's DWORDs 1, 3,
+4, 15 and 16 at the pointer plus 4 x (n - 1): nine SFDP reads in all
+(JESD216's layouts as Linux's `drivers/mtd/spi-nor/sfdp.c` and `sfdp.h`
+quote them). A signature other than `0x50444653` ends the SFDP reads; a
+first parameter header whose ID is not `0xFF00`, the basic table's, ends
+them too; a table shorter than 15 or 16 DWORDs has no DWORD 15 or 16, and
+the line prints `none` for it.
+
+**The lines** (each wrapped line is one line):
+
+```
+SOS flashprobe: efuse repeat_data3= flash_type=
+SOS flashprobe: id jedec= sr1= sr2= sr3=
+SOS flashprobe: sfdp signature= rev= nph= bfpt rev= len= ptr=
+SOS flashprobe: bfpt dw1= dw3= dw4= dw15= dw16=
+SOS flashprobe: decoded dio= op= wait= qio= op= wait= qer= qe=
+SOS flashprobe: spi0 clock= ctrl= ctrl1= ctrl2= user= user1= user2= fctrl=
+                ddr= cali= din_mode= din_num= date= core_clk_sel=
+SOS flashprobe: pads 27= 28= 29= 30= 31= 32= insel 2= 3=
+SOS flashprobe: cache icache_autoload= dcache_autoload=
+SOS flashprobe: SPI1 MISC= clock= after the reads, as before them
+SOS-S3: halt pass
+```
+
+- `repeat_data3`: EFUSE_RD_REPEAT_DATA3_REG; `flash_type` its bit 9,
+  EFUSE_FLASH_TYPE, 0 for a four-line flash.
+- `jedec`: the ID as IDF's `bootloader_read_flash_id` forms it, manufacturer
+  in [23:16]. esptool read 0x20 0x4017 on the part, an XMC part ESP-IDF's
+  `is_xmc_chip_strict` takes.
+- `sr1`, `sr2`, `sr3`: the status registers. `sr2` bit 1 is QE, where
+  ESP-IDF looks for this ID; `sr1` bit 7 (SRP0) and `sr2` bit 0 (SRP1) would
+  lock the status register against a write.
+- `rev`, `nph`, the basic table's `rev`, `len` and `ptr`: the header's and
+  the first parameter header's fields.
+- `dw1`, `dw3`, `dw4`, `dw15`, `dw16`: the basic table's DWORDs, whole.
+- `decoded`: `dio` and `qio` are DWORD 1's bits 20 (1-2-2 fast read) and 21
+  (1-4-4); each read's `op` and `wait`, the mode clocks plus the wait
+  states, are DWORD 4's [31:16] for 1-2-2 and DWORD 3's [15:0] for 1-4-4
+  (opcode [15:8], mode clocks [7:5], wait states [4:0] of the half); `qer`
+  is DWORD 15's [22:20], how QE is set; `qe` is `sr2` bit 1. With no basic
+  table the line is `decoded sfdp=none qe=...`.
+- `spi0`: SPI_MEM_<NAME>_REG(0) for CLOCK, CTRL, CTRL1, CTRL2, USER, USER1,
+  USER2, CACHE_FCTRL, DDR, TIMING_CALI, DIN_MODE, DIN_NUM, DATE and
+  CORE_CLK_SEL: the ROM's words for its slow read, including those §15c did
+  not read.
+- `pads`: IO_MUX_GPIO27 to 32, the flash's HD, WP, CS0, CLK, Q and D;
+  `insel 2`, `3`: GPIO_FUNC2_IN_SEL_CFG and FUNC3, SPIHD's and SPIWP's
+  input selects.
+- `cache`: EXTMEM_ICACHE_AUTOLOAD_CTRL_REG and
+  EXTMEM_DCACHE_AUTOLOAD_CTRL_REG; AUTOLOAD_ENA is bit 2.
+- The SPI1 line: MISC(1) and CLOCK(1) after the reads, and whether every
+  word a read saves reads as it did before the first.
+
+A stop prints its line (§18a), then the SPI1 line, and halts with its code.
+
+**On the part** (ESP32-S3 rev v0.2, the module of §15c), at `rom`, F0
+printed (each wrapped line is one line):
+
+```
+SOS flashprobe: efuse repeat_data3=0x00000100 flash_type=0
+SOS flashprobe: id jedec=0x00204017 sr1=0x00 sr2=0x02 sr3=0x20
+SOS flashprobe: sfdp signature=0x50444653 rev=1.6 nph=2 bfpt rev=1.6
+                len=16 ptr=0x000030
+SOS flashprobe: bfpt dw1=0xfff920e5 dw3=0x6b08eb44 dw4=0xbb423b08
+                dw15=0xff4df619 dw16=0x80c010e9
+SOS flashprobe: decoded dio=yes op=0xbb wait=4 qio=yes op=0xeb wait=6
+                qer=0b100 qe=set
+SOS flashprobe: spi0 clock=0x00030103 ctrl=0x00200000 ctrl1=0x00000000
+                ctrl2=0x00002c41 user=0x000000c0 user1=0x5c000007
+                user2=0x70000003 fctrl=0x00000005 ddr=0x00000000
+                cali=0x00000000 din_mode=0x00000000 din_num=0x00000000
+                date=0x02101040 core_clk_sel=0x00000000
+SOS flashprobe: pads 27=0x00001b00 28=0x00001b00 29=0x00000b00
+                30=0x00000b00 31=0x00000b00 32=0x00000b00 insel
+                2=0x0000003c 3=0x0000003c
+SOS flashprobe: cache icache_autoload=0x00000008 dcache_autoload=0x00000008
+SOS flashprobe: SPI1 MISC=0x00000002 clock=0x00030103 after the reads, as
+                before them
+SOS-S3: halt pass
+```
+
+- The ID is the part's, `0x00204017`, and the flash four-line by the
+  eFuse.
+- SR1 is 0: no block-protect bit, SRP0 clear. SR2 is `0x02`: QE set, SRP1
+  clear. SR3 is `0x20`.
+- The basic table: DWORD 1's bits 20 and 21 set (1-2-2 and 1-4-4); DWORD
+  4's [31:16] `0xbb42`, `BBh` with 2 mode clocks and 2 wait states; DWORD
+  3's [15:0] `0xeb44`, `EBh` with 2 and 4; DWORD 15's QER 100b, QE bit 1 of
+  status register 2, written with two bytes.
+- The SPI0 words are §15c's where it read them; CTRL2 reads `0x00002c41`,
+  CTRL1, TIMING_CALI, DIN_MODE and DIN_NUM 0. Signals 2's and 3's input
+  selects read `0x3c`, bit 7 clear.
+
+That run was of an image built before the ID gate, whose passing text is
+the same. A JEDEC ID other than `0x00204017`, `flash_type` 1, SRP0 or SRP1
+set, a QER outside 001b, 100b and 101b, SPI0 words other than §15c's, or a
+SPI1 line that is not `as before them` is a finding to understand before
+anything changes the flash's mode; the first two the probe stops on
+itself.

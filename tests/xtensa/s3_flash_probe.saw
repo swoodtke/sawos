@@ -1,0 +1,370 @@
+// The flash probe: what the module's flash says of itself, and what the ROM
+// leaves in SPI0 for it, read and printed, with nothing written to the flash
+// (../../hal/xtensa-esp32s3/ABI.md §18c, board stage F0).
+//
+// Every command it sends the flash is one of the five reads `hal.flash_read`
+// sends and nothing else: the JEDEC ID (9Fh), status registers 1 to 3 (05h,
+// 35h, 15h) and SFDP (5Ah). Each read is one call into `mspi.c`, which
+// requires SPI_MEM_MISC(1) to read chip select 0 alone and never writes it,
+// saves SPI1's words, sends the read and writes them back. Every other load
+// here goes through `load`, whose view is a `ReadOnly` field, so this file
+// stores to no register of its own.
+//
+// It sends 9Fh first and nothing more unless the ID is the one the case's
+// block names and the eFuse's flash_type is 0: then it prints the ID, the
+// line `stop: ...` and the SPI1 line, and halts with `ID_STOP`. Every board
+// image's block names the part's ID, `0x00204017`; an emulator image's names
+// its flash model's, unless the case says otherwise
+// (`_flash_case_asm`). Status register 2, 3 and SFDP are not every flash's
+// commands, so no other part is sent them.
+//
+// `sos_flash_case_setup` is the runner's (`_flash_case_asm`): in a board
+// image it does nothing, and the ROM has left MISC(1) at 0b10; in an
+// emulator image it stores the case's MISC(1) word, since the emulator's
+// SPI1 reads 0 there at boot (ABI.md §18b).
+//
+//   SOS flashprobe: efuse repeat_data3=... flash_type=N
+//   SOS flashprobe: id jedec=... sr1=0x.. sr2=0x.. sr3=0x..
+//   SOS flashprobe: sfdp signature=... rev=M.N nph=N bfpt rev=M.N len=N
+//                   ptr=0x......
+//   SOS flashprobe: bfpt dw1=... dw3=... dw4=... dw15=... dw16=...
+//   SOS flashprobe: decoded dio=yes|no op=0x.. wait=N qio=yes|no op=0x..
+//                   wait=N qer=0bNNN qe=set|clear
+//   SOS flashprobe: spi0 clock=... ctrl=... ctrl1=... ctrl2=... user=...
+//                   user1=... user2=... fctrl=... ddr=... cali=...
+//                   din_mode=... din_num=... date=... core_clk_sel=...
+//   SOS flashprobe: pads 27=... 28=... 29=... 30=... 31=... 32=... insel
+//                   2=... 3=...
+//   SOS flashprobe: cache icache_autoload=... dcache_autoload=...
+//   SOS flashprobe: SPI1 MISC=... clock=... after the reads, as before them
+//   SOS-S3: halt pass
+//
+// A signature that is not "SFDP" ends the SFDP reads: the sfdp line says
+// `sfdp=none` and the bfpt line is left out. A first parameter header that
+// is not the basic table's ends them too, and a table shorter than 15 or 16
+// DWORDs has no DWORD 15 or 16, which the bfpt line prints as `none`. A
+// stop prints its line, then the SPI1 line, and halts with its code.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_flash_case() -> UInt
+    func sos_flash_case_setup()
+}
+
+/// Where the case's block holds the ID to read past and the record, after
+/// the fault harness's words: the runner's `_flash_case_asm` lays it out.
+static JEDEC_OFFSET: UInt = 36
+static RECORD_OFFSET: UInt = 40
+
+/// The probe's own stop: the ID or the flash type is not the one it reads
+/// past (../../hal/xtensa-esp32s3/ABI.md §18c).
+static ID_STOP: UInt = 0x7C
+
+/// One word of the case's block.
+struct BlockWord {
+    v: UInt32,
+}
+
+/// One register as a read-only word.
+struct Reg {
+    v: ReadOnly<UInt32>,
+}
+
+/// The only access this file makes to a peripheral address.
+func load(addr: UInt) unsafe -> UInt32 {
+    UnsafeMemory<Reg, Device>(addr).v.read()
+}
+
+// -- efuse_reg.h: EFUSE_RD_REPEAT_DATA3_REG, EFUSE_FLASH_TYPE [9]
+// ("0: four lines. 1: eight lines").
+static EFUSE_REPEAT_DATA3: UInt = 0x6000_703C
+static FLASH_TYPE_SHIFT: UInt32 = 9
+
+// -- spi_mem_reg.h: SPI_MEM_<NAME>_REG(0), DR_REG_SPI0_BASE plus the offset.
+static SPI0_CTRL: UInt = 0x6000_3008
+static SPI0_CTRL1: UInt = 0x6000_300C
+static SPI0_CTRL2: UInt = 0x6000_3010
+static SPI0_CLOCK: UInt = 0x6000_3014
+static SPI0_USER: UInt = 0x6000_3018
+static SPI0_USER1: UInt = 0x6000_301C
+static SPI0_USER2: UInt = 0x6000_3020
+static SPI0_CACHE_FCTRL: UInt = 0x6000_303C
+static SPI0_TIMING_CALI: UInt = 0x6000_30A8
+static SPI0_DIN_MODE: UInt = 0x6000_30AC
+static SPI0_DIN_NUM: UInt = 0x6000_30B0
+static SPI0_DDR: UInt = 0x6000_30E0
+static SPI0_CORE_CLK_SEL: UInt = 0x6000_30EC
+static SPI0_DATE: UInt = 0x6000_33FC
+
+// -- io_mux_reg.h: IO_MUX_GPIOn_REG is IO_MUX + 4 + 4n; gpio_reg.h:
+// GPIO_FUNCn_IN_SEL_CFG_REG is GPIO + 0x154 + 4n. Pads 27 to 32 are the
+// flash's (HD, WP, CS0, CLK, Q, D); signals 2 and 3 are SPIHD and SPIWP in.
+static IO_MUX_GPIO0: UInt = 0x6000_9004
+static GPIO_FUNC0_IN_SEL: UInt = 0x6000_4154
+static FIRST_PAD: UInt = 27
+static LAST_PAD: UInt = 32
+
+// -- extmem_reg.h: EXTMEM_ICACHE_AUTOLOAD_CTRL_REG and
+// EXTMEM_DCACHE_AUTOLOAD_CTRL_REG.
+static ICACHE_AUTOLOAD: UInt = 0x600C_40A0
+static DCACHE_AUTOLOAD: UInt = 0x600C_404C
+
+// -- SFDP (JESD216 as Linux's drivers/mtd/spi-nor/sfdp.c and sfdp.h quote
+// it): the header at 0, its signature "SFDP" as a little-endian word, then
+// the minor and major revision and the 0-based count of parameter headers;
+// the first parameter header at 8, the basic table's (ID 0xFF00): the ID's
+// low byte, the minor and major revision, the length in DWORDs, then the
+// table's 24-bit pointer and the ID's high byte.
+static SFDP_SIGNATURE: UInt = 0x5044_4653
+static SFDP_HEADER: UInt = 0
+static SFDP_REVISION: UInt = 4
+static SFDP_PARAM: UInt = 8
+static SFDP_PARAM_POINTER: UInt = 12
+static SFDP_BFPT_ID: UInt = 0xFF00
+/// The DWORDs the probe reads: 1 (the fast reads supported), 3 and 4 (the
+/// 1-4-4 and 1-2-2 reads' settings), 15 (QER) and 16.
+static BFPT_DW15: UInt = 15
+static BFPT_DW16: UInt = 16
+/// DWORD 1: FAST_READ_1_2_2 [20], FAST_READ_1_4_4 [21]. DWORD 15: QER
+/// [22:20]. A read's settings are a half-word, the 1-2-2 read's DWORD 4
+/// [31:16] and the 1-4-4 read's DWORD 3 [15:0]: opcode [15:8], mode clocks
+/// [7:5], wait states [4:0].
+static DIO_BIT: UInt = 20
+static QIO_BIT: UInt = 21
+static QER_SHIFT: UInt = 20
+/// Status register 2's QE, bit 1.
+static SR2_QE: UInt = 0x2
+
+/// `v`'s low `digits` hex digits after `0x`.
+func hex(v: UInt, digits: Int) unsafe {
+    console().write_str("0x")
+    var shift: Int = (digits - 1) * 4
+    while shift >= 0 {
+        let d = (v >> shift) & 0xF
+        let c = if d < 10 { d + 48 } else { d + 87 }
+        hal.console_byte(c as UInt8)
+        shift -= 4
+    }
+}
+
+func decimal(v: UInt) unsafe {
+    var digits: [UInt8; 10] = [0; 10]
+    var n = 0
+    var rest = v
+    while true {
+        digits[n] = UInt8.from(truncating: rest % 10) + 48
+        n += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    while n > 0 {
+        n -= 1
+        hal.console_byte(digits[n])
+    }
+}
+
+func word(name: String, v: UInt) unsafe {
+    console().write_str(name)
+    console().write_hex(v)
+}
+
+/// The word at `addr`, by name.
+func reg(name: String, addr: UInt) unsafe {
+    word(name, load(addr) as UInt)
+}
+
+func yes_no(v: UInt) unsafe {
+    if v != 0 { console().write_str("yes") } else { console().write_str("no") }
+}
+
+/// A revision: major, a dot, minor.
+func revision(major: UInt, minor: UInt) unsafe {
+    decimal(major)
+    console().write_str(".")
+    decimal(minor)
+}
+
+/// One read of the flash, its answer; a stop prints its line and the SPI1
+/// line and halts.
+func flash(record: UInt, op: UInt, addr: UInt,
+           before: &[UInt32; 11]) unsafe -> UInt {
+    let stop = hal.flash_read(record, op, addr)
+    if stop != 0 {
+        hal.flash_stop_line(record, stop)
+        hal.flash_spi1_line("SOS flashprobe: ", &before)
+        hal.exit_fail(stop)
+    }
+    UnsafeMemory<hal.FlashRecord, Normal>(record).answer.read() as UInt
+}
+
+/// A read's settings half-word: its opcode and its mode clocks plus wait
+/// states.
+func read_settings(name: String, supported: UInt, half: UInt) unsafe {
+    console().write_str(name)
+    yes_no(supported)
+    console().write_str(" op=")
+    hex((half >> 8) & 0xFF, 2)
+    console().write_str(" wait=")
+    decimal(((half >> 5) & 0x7) + (half & 0x1F))
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.clock_init()
+    sos_flash_case_setup()
+    let block = sos_flash_case()
+    let record = block + RECORD_OFFSET
+    let want = UnsafeMemory<BlockWord, Normal>(block + JEDEC_OFFSET).v.read()
+    var before: [UInt32; 11] = [0; 11]
+    hal.psram_spi1_words(&var before)
+
+    let repeat3 = load(EFUSE_REPEAT_DATA3)
+    word("SOS flashprobe: efuse repeat_data3=", repeat3 as UInt)
+    console().write_str(" flash_type=")
+    decimal(((repeat3 >> FLASH_TYPE_SHIFT) & 1) as UInt)
+    console().write_str("\n")
+
+    // The JEDEC ID's three bytes arrive manufacturer first, in [7:0]; IDF's
+    // `bootloader_read_flash_id` turns them into 0xMMTTCC.
+    let id = flash(record, hal.FLASH_RDID, 0, &before)
+    let jedec = ((id & 0xFF) << 16) | ((id >> 16) & 0xFF) | (id & 0xFF00)
+    let flash_type = ((repeat3 >> FLASH_TYPE_SHIFT) & 1) as UInt
+    if jedec != (want as UInt) || flash_type != 0 {
+        console().write_str("SOS flashprobe: id jedec=")
+        hex(jedec, 8)
+        console().write_str(" stop: the probe reads further only a flash of")
+        console().write_str(" ID ")
+        hex(want as UInt, 8)
+        console().write_str(" and flash_type 0\n")
+        hal.flash_spi1_line("SOS flashprobe: ", &before)
+        hal.exit_fail(ID_STOP)
+    }
+    let sr1 = flash(record, hal.FLASH_RDSR, 0, &before)
+    let sr2 = flash(record, hal.FLASH_RDSR2, 0, &before)
+    let sr3 = flash(record, hal.FLASH_RDSR3, 0, &before)
+    console().write_str("SOS flashprobe: id jedec=")
+    hex(jedec, 8)
+    console().write_str(" sr1=")
+    hex(sr1, 2)
+    console().write_str(" sr2=")
+    hex(sr2, 2)
+    console().write_str(" sr3=")
+    hex(sr3, 2)
+    console().write_str("\n")
+
+    let signature = flash(record, hal.FLASH_RDSFDP, SFDP_HEADER, &before)
+    console().write_str("SOS flashprobe: sfdp signature=")
+    hex(signature, 8)
+    var bfpt_len: UInt = 0
+    var bfpt_ptr: UInt = 0
+    var have_bfpt = false
+    if signature != SFDP_SIGNATURE {
+        console().write_str(" sfdp=none\n")
+    } else {
+        let rev = flash(record, hal.FLASH_RDSFDP, SFDP_REVISION, &before)
+        let param = flash(record, hal.FLASH_RDSFDP, SFDP_PARAM, &before)
+        let pointer = flash(record, hal.FLASH_RDSFDP, SFDP_PARAM_POINTER,
+                            &before)
+        console().write_str(" rev=")
+        revision((rev >> 8) & 0xFF, rev & 0xFF)
+        console().write_str(" nph=")
+        decimal((rev >> 16) & 0xFF)
+        let id_bfpt = ((pointer >> 24) << 8) | (param & 0xFF)
+        if id_bfpt != SFDP_BFPT_ID {
+            console().write_str(" bfpt=none id=")
+            hex(id_bfpt, 4)
+            console().write_str("\n")
+        } else {
+            bfpt_len = (param >> 24) & 0xFF
+            bfpt_ptr = pointer & 0xFF_FFFF
+            have_bfpt = true
+            console().write_str(" bfpt rev=")
+            revision((param >> 16) & 0xFF, (param >> 8) & 0xFF)
+            console().write_str(" len=")
+            decimal(bfpt_len)
+            console().write_str(" ptr=")
+            hex(bfpt_ptr, 6)
+            console().write_str("\n")
+        }
+    }
+
+    let qe = if (sr2 & SR2_QE) != 0 { "set" } else { "clear" }
+    if have_bfpt {
+        let dw1 = flash(record, hal.FLASH_RDSFDP, bfpt_ptr, &before)
+        let dw3 = flash(record, hal.FLASH_RDSFDP, bfpt_ptr + 8, &before)
+        let dw4 = flash(record, hal.FLASH_RDSFDP, bfpt_ptr + 12, &before)
+        word("SOS flashprobe: bfpt dw1=", dw1)
+        word(" dw3=", dw3)
+        word(" dw4=", dw4)
+        var dw15: UInt = 0
+        if bfpt_len >= BFPT_DW15 {
+            dw15 = flash(record, hal.FLASH_RDSFDP,
+                         bfpt_ptr + 4 * (BFPT_DW15 - 1), &before)
+            word(" dw15=", dw15)
+        } else {
+            console().write_str(" dw15=none")
+        }
+        if bfpt_len >= BFPT_DW16 {
+            let dw16 = flash(record, hal.FLASH_RDSFDP,
+                             bfpt_ptr + 4 * (BFPT_DW16 - 1), &before)
+            word(" dw16=", dw16)
+        } else {
+            console().write_str(" dw16=none")
+        }
+        console().write_str("\n")
+        read_settings("SOS flashprobe: decoded dio=", (dw1 >> DIO_BIT) & 1,
+                      dw4 >> 16)
+        read_settings(" qio=", (dw1 >> QIO_BIT) & 1, dw3 & 0xFFFF)
+        if bfpt_len >= BFPT_DW15 {
+            let qer = (dw15 >> QER_SHIFT) & 0x7
+            console().write_str(" qer=0b")
+            decimal((qer >> 2) & 1)
+            decimal((qer >> 1) & 1)
+            decimal(qer & 1)
+        } else {
+            console().write_str(" qer=none")
+        }
+    } else {
+        console().write_str("SOS flashprobe: decoded sfdp=none")
+    }
+    console().write_str(" qe=")
+    console().write_str(qe)
+    console().write_str("\n")
+
+    reg("SOS flashprobe: spi0 clock=", SPI0_CLOCK)
+    reg(" ctrl=", SPI0_CTRL)
+    reg(" ctrl1=", SPI0_CTRL1)
+    reg(" ctrl2=", SPI0_CTRL2)
+    reg(" user=", SPI0_USER)
+    reg(" user1=", SPI0_USER1)
+    reg(" user2=", SPI0_USER2)
+    reg(" fctrl=", SPI0_CACHE_FCTRL)
+    reg(" ddr=", SPI0_DDR)
+    reg(" cali=", SPI0_TIMING_CALI)
+    reg(" din_mode=", SPI0_DIN_MODE)
+    reg(" din_num=", SPI0_DIN_NUM)
+    reg(" date=", SPI0_DATE)
+    reg(" core_clk_sel=", SPI0_CORE_CLK_SEL)
+    console().write_str("\n")
+
+    console().write_str("SOS flashprobe: pads")
+    var pad = FIRST_PAD
+    while pad <= LAST_PAD {
+        console().write_str(" ")
+        decimal(pad)
+        reg("=", IO_MUX_GPIO0 + 4 * pad)
+        pad += 1
+    }
+    reg(" insel 2=", GPIO_FUNC0_IN_SEL + 4 * 2)
+    reg(" 3=", GPIO_FUNC0_IN_SEL + 4 * 3)
+    console().write_str("\n")
+
+    reg("SOS flashprobe: cache icache_autoload=", ICACHE_AUTOLOAD)
+    reg(" dcache_autoload=", DCACHE_AUTOLOAD)
+    console().write_str("\n")
+
+    hal.flash_spi1_line("SOS flashprobe: ", &before)
+    hal.exit_pass()
+}

@@ -17,17 +17,20 @@ kernel/boot.S       the direct-boot entry, the reset path out of the ROM's
 kernel/sink.c       the special-register leaves (INTENABLE, INTERRUPT,
                     INTCLEAR, CCOUNT), `simcall` SYS_exit, the linker-symbol
                     accessors, and `kernel_fault`
-kernel/mspi.c       the octal PSRAM's command layer: the bring-up's checks,
-                    its pads and mode-register commands on SPI1 with the
-                    flash's chip select held off, SPI0's PSRAM side and the
-                    cache's map, all in IRAM (ABI.md §16, §17)
+kernel/mspi.c       the memory-SPI command layer: the octal PSRAM's
+                    bring-up, its pads and mode-register commands on SPI1
+                    with the flash's chip select held off, SPI0's PSRAM side
+                    and the cache's map (ABI.md §16, §17), and the flash's
+                    five reads, which require its chip select and never
+                    write it (§18), all in IRAM
 kernel/lib.saw      the `hal` module: the trap frame and its accessors, the
                     cause decoding, the Flat protection seam, UART0,
-                    SYSTIMER, the interrupt matrix, the memory map, and the
+                    SYSTIMER, the interrupt matrix, the memory map, the
                     PSRAM bring-up's Saw half: its description, the
                     read-back test and its lines; a no-op `memory_init`,
                     which the `esp32s3-r8` board's facade
-                    (`../xtensa-esp32s3-r8/`) answers with the bring-up
+                    (`../xtensa-esp32s3-r8/`) answers with the bring-up; and
+                    the flash reads' stop lines
 kernel/esp32s3.ld   the flash layout across the two bus windows, with an image
                     slot for root and the image's slots for the other
                     processes (generated per image), IRAM for the vectors,
@@ -53,7 +56,8 @@ dbias/              `s3dbias`, the LDO settings ESP-IDF chooses from the
 ABI.md              every board fact, with the probe that produced it; §13 is
                     the process layout, §14 the system clock, §15 the board
                     probe, §16 the PSRAM's command layer, §17 the PSRAM
-                    mapped, tested and published on the `esp32s3-r8` board
+                    mapped, tested and published on the `esp32s3-r8` board,
+                    §18 the flash's reads
 ```
 
 **Read `ABI.md` before changing anything here.** It is the record of what

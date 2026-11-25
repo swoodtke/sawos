@@ -16797,13 +16797,13 @@ def check_read_only_probe(path, pure_modules):
 
 
 # The S3 kernel's two SRAM ranges, `esp32s3.ld`'s MEMORY: IRAM, where the
-# vectors and the PSRAM's command layer run, and DRAM, the kernel's `.data`
-# and `.bss`. Nothing in either is fetched through the flash cache.
+# vectors and the memory-SPI command layer run, and DRAM, the kernel's
+# `.data` and `.bss`. Nothing in either is fetched through the flash cache.
 S3_IRAM = (0x40378000, 0x40378000 + 16 * 1024)
 S3_DRAM = (0x3FC8C000, 0x3FC8C000 + 144 * 1024)
 
-# The sections the PSRAM's command layer may have: its code and literal pool
-# in IRAM, its data in DRAM (`esp32s3.ld` places each by name).
+# The sections the memory-SPI command layer may have: its code and literal
+# pool in IRAM, its data in DRAM (`esp32s3.ld` places each by name).
 IRAM_CHECK_SECTIONS = (".text.iram", ".literal.iram", ".data", ".bss")
 
 
@@ -16836,9 +16836,10 @@ def _elf32_symbols(data, sections):
 
 
 def check_iram(obj, elf=None):
-    """Refuse the PSRAM's command layer, `obj` (`mspi.c`'s object), if any of
-    it can be fetched through the flash cache while SPI1 holds the gate
-    (ABI.md §16d). Every finding is named, one per line, when the object
+    """Refuse the memory-SPI command layer, `obj` (`mspi.c`'s object), if
+    any of it can be fetched through the flash cache while SPI1 holds the
+    gate or a command is under way (ABI.md §16d, §18b). Every finding is
+    named, one per line, when the object
       * has an allocated section of non-zero size outside
         `IRAM_CHECK_SECTIONS` (a `.rodata` table, a switch's jump table, a
         string, a function that lost its section);
@@ -16874,8 +16875,8 @@ def check_iram(obj, elf=None):
                 findings.append(f"{os.path.basename(elf)}: {name} is at "
                                 f"{value:#010x}, outside IRAM and DRAM")
     if findings:
-        raise ToolError("the PSRAM command layer can be fetched from flash:\n"
-                        + "\n".join(findings))
+        raise ToolError("the memory-SPI command layer can be fetched from "
+                        "flash:\n" + "\n".join(findings))
 
 
 # The registers that set the S3's system clock and its memory-SPI core clock,
@@ -16996,25 +16997,166 @@ def check_clock_registers(overrides=None):
 
 
 # The fault record `mspi.c` defines in its fault build. Only the fault
-# harness's emulator image may hold it: a board image, or any other kernel,
-# is refused.
+# harnesses' emulator images may hold it, the PSRAM bring-up's and the flash
+# read's: a board image, or any other kernel, is refused.
 PSRAM_FAULT_SYMBOL = "sos_psram_fault"
-PSRAM_FAULT_HARNESS = os.path.join(TESTS_DIR, "xtensa", "psram_fault.saw")
+PSRAM_FAULT_HARNESSES = (
+    os.path.join(TESTS_DIR, "xtensa", "psram_fault.saw"),
+    os.path.join(TESTS_DIR, "xtensa", "flash_fault.saw"),
+)
 
 
 def check_psram_fault(name, symbols, src, board):
-    """Refuse an image that defines `mspi.c`'s fault record unless it is the
+    """Refuse an image that defines `mspi.c`'s fault record unless it is a
     fault harness's emulator image."""
     if PSRAM_FAULT_SYMBOL not in symbols:
         return
     if board:
         raise ToolError(f"{name}: a board image defines {PSRAM_FAULT_SYMBOL}, "
-                        "the PSRAM bring-up's fault record, which only a "
+                        "the command layer's fault record, which only a "
                         "harness image for the emulator may hold")
-    if os.path.abspath(src) != PSRAM_FAULT_HARNESS:
-        raise ToolError(f"{name}: {os.path.relpath(src, REPO_ROOT)} is not the "
-                        f"PSRAM fault harness and defines "
-                        f"{PSRAM_FAULT_SYMBOL}, the bring-up's fault record")
+    if os.path.abspath(src) not in PSRAM_FAULT_HARNESSES:
+        raise ToolError(f"{name}: {os.path.relpath(src, REPO_ROOT)} is not a "
+                        f"fault harness of the command layer and defines "
+                        f"{PSRAM_FAULT_SYMBOL}, its fault record")
+
+
+# The mask ROM's routines that send the flash chip anything but a read: that
+# write its status registers or its array, set or clear its write-enable
+# latch, protect it, wake it, resume it, change its mode (quad, octal,
+# continuous read, a reset), or send a command they are given, which may be
+# any of those (ABI.md §18b). They are every such routine of
+# `esp32s3.rom.ld`'s flash groups (opi_flash, spiflash_legacy, hal_soc,
+# spi_flash_chips, memspi_host, esp_flash), the attaches, whose read-mode
+# setting may call `Disable_QMode`, and three the table does not export that
+# those call. `Enable_QMode` and `Disable_QMode` write QE themselves, and
+# `esp_rom_spiflash_config_readmode` calls them; `SPILock` sets the
+# block-protect bits. The check looks for addresses, so a routine is listed
+# even when every routine it calls is. Each is (name, its jump-table entry
+# in ESP-IDF v5.4.1's `components/esp_rom/esp32s3/ld/esp32s3.rom.ld` or
+# None, its body's address in the ROM's ELF, `esp32s3_rev0_rom.elf`). A
+# kernel image that holds either address of any of them as a word is
+# refused (`check_rom_flash_references`).
+ROM_FLASH_WRITERS = (
+    ("esp_rom_spi_cmd_config", 0x4000087C, 0x4004DD9C),
+    ("esp_rom_spi_cmd_start", 0x40000888, 0x4004E0D0),
+    ("esp_rom_opiflash_mode_reset", 0x400008AC, 0x4004D628),
+    ("esp_rom_opiflash_exec_cmd", 0x400008B8, 0x4004E058),
+    ("esp_rom_opiflash_soft_reset", 0x400008C4, 0x4004D5B4),
+    ("esp_rom_opiflash_wren", 0x400008F4, 0x4004D85C),
+    ("esp_rom_opiflash_erase_sector", 0x40000900, 0x4004D8C0),
+    ("esp_rom_opiflash_erase_block_64k", 0x4000090C, 0x4004D910),
+    ("esp_rom_opiflash_erase_area", 0x40000918, 0x4004D960),
+    ("esp_rom_opiflash_write", 0x40000930, 0x4004DB58),
+    ("esp_rom_opiflash_exit_continuous_read_mode", 0x40000948, 0x4004D52C),
+    ("esp_rom_opiflash_legacy_driver_init", 0x40000954, 0x4004D65C),
+    ("esp_rom_spiflash_write_encrypted", 0x4000096C, 0x4004C520),
+    ("esp_rom_spiflash_write_encrypted_dest", 0x40000978, 0x4004C3DC),
+    ("esp_rom_spiflash_erase_chip", 0x4000099C, 0x4004A9F0),
+    ("_esp_rom_spiflash_erase_sector", 0x400009A8, 0x4004AA80),
+    ("_esp_rom_spiflash_erase_block", 0x400009B4, 0x4004AA10),
+    ("_esp_rom_spiflash_write", 0x400009C0, 0x4004AAF0),
+    ("_esp_rom_spiflash_unlock", 0x400009D8, 0x4004A76C),
+    ("_SPIEraseArea", 0x400009E4, 0x4004ADD8),
+    ("_SPI_write_enable", 0x400009F0, 0x40049F14),
+    ("esp_rom_spiflash_erase_sector", 0x400009FC, 0x4004AAD4),
+    ("esp_rom_spiflash_erase_block", 0x40000A08, 0x4004AA64),
+    ("esp_rom_spiflash_write", 0x40000A14, 0x4004ABBC),
+    ("esp_rom_spiflash_unlock", 0x40000A2C, 0x4004A7B8),
+    ("SPIEraseArea", 0x40000A38, 0x4004AE7C),
+    ("SPI_write_enable", 0x40000A44, 0x40049F60),
+    ("esp_rom_spiflash_read_user_cmd", 0x40000A5C, 0x400499B4),
+    ("esp_rom_spi_flash_send_resume", 0x40000A80, 0x4004AF28),
+    ("esp_rom_spiflash_config_readmode", 0x40000AA4, 0x4004A820),
+    ("esp_rom_spiflash_write_status", 0x40000AC8, 0x40049C40),
+    ("spi_flash_attach", 0x40000AEC, 0x4004A928),
+    ("spi_flash_unlock", 0x40000B40, 0x4004CD5C),
+    ("spi_flash_erase_range", 0x40000B4C, 0x4004CDF4),
+    ("spi_flash_erase_sector", 0x40000B58, 0x4004CEF8),
+    ("spi_flash_write", 0x40000B64, 0x4004CF10),
+    ("spi_flash_write_encrypted", 0x40000B7C, 0x4004D2D4),
+    ("SPILock", 0x40000C78, 0x4004A7D4),
+    ("SPI_Common_Command", 0x40000C90, 0x40049C9C),
+    ("SPI_WakeUp", 0x40000C9C, 0x40049B10),
+    ("SPI_block_erase", 0x40000CA8, 0x40049BE0),
+    ("SPI_chip_erase", 0x40000CB4, 0x40049B60),
+    ("SPI_page_program", 0x40000CCC, 0x40049F84),
+    ("SPI_sector_erase", 0x40000CE4, 0x40049B98),
+    ("Disable_QMode", 0x40000D20, 0x4004A128),
+    ("Enable_QMode", 0x40000D2C, 0x4004A0D4),
+    ("spi_flash_hal_common_command", 0x40000D5C, 0x40046EE8),
+    ("spi_flash_hal_erase_chip", 0x40000D74, 0x4004707C),
+    ("spi_flash_hal_erase_sector", 0x40000D80, 0x400470A8),
+    ("spi_flash_hal_erase_block", 0x40000D8C, 0x40047100),
+    ("spi_flash_hal_program_page", 0x40000D98, 0x4004714C),
+    ("spi_flash_hal_set_write_protect", 0x40000DA4, 0x400471C0),
+    ("spi_flash_chip_generic_write", 0x40000EE8, 0x4004BEFC),
+    ("spi_flash_chip_generic_write_encrypted", 0x40000EF4, 0x4004BF98),
+    ("spi_flash_chip_generic_set_write_protect", 0x40000F00, 0x4004BFA0),
+    ("spi_flash_common_write_status_16b_wrsr", 0x40000F0C, 0x4004BC3C),
+    ("spi_flash_chip_generic_reset", 0x40000F18, 0x4004BCBC),
+    ("spi_flash_chip_generic_erase_chip", 0x40000F24, 0x4004BD48),
+    ("spi_flash_chip_generic_erase_sector", 0x40000F30, 0x4004BDB4),
+    ("spi_flash_chip_generic_erase_block", 0x40000F3C, 0x4004BE24),
+    ("spi_flash_chip_generic_page_program", 0x40000F48, 0x4004BE94),
+    ("spi_flash_common_write_status_8b_wrsr", 0x40000FD8, 0x4004C2BC),
+    ("spi_flash_common_write_status_8b_wrsr2", 0x40000FE4, 0x4004C2D0),
+    ("spi_flash_common_set_io_mode", 0x40000FF0, 0x4004C2E4),
+    ("spi_flash_chip_generic_set_io_mode", 0x40000FFC, 0x4004C36C),
+    ("spi_flash_chip_gd_set_io_mode", 0x40001020, 0x4004BBB4),
+    ("memspi_host_erase_chip", 0x40001050, 0x40049398),
+    ("memspi_host_erase_sector", 0x4000105C, 0x400493B8),
+    ("memspi_host_erase_block", 0x40001068, 0x400493E0),
+    ("memspi_host_program_page", 0x40001074, 0x40049408),
+    ("memspi_host_set_write_protect", 0x4000108C, 0x40049460),
+    ("esp_flash_erase_chip", 0x400010E0, 0x4004B248),
+    # Its body's symbol is `esp_flash_erase_region`.
+    ("rom_esp_flash_erase_region", 0x400010EC, 0x4004B2E4),
+    ("esp_flash_set_chip_write_protect", 0x40001104, 0x4004B510),
+    ("esp_flash_set_protected_region", 0x40001128, 0x4004B634),
+    ("esp_flash_write", 0x40001140, 0x4004B7D4),
+    ("esp_flash_write_encrypted", 0x4000114C, 0x4004B8FC),
+    ("esp_flash_set_io_mode", 0x40001170, 0x4004B9A8),
+    ("spi_flash_boot_attach", 0x4000117C, 0x4004A8CC),
+    ("esp_rom_spiflash_write_disable", 0x400011D0, 0x40049AF8),
+    # Routines with no jump-table entry, which the ones above call.
+    ("opi_flash_erase_internal", None, 0x4004D874),
+    ("opi_flash_page_program_internal", None, 0x4004DA7C),
+    ("spi_flash_common_write_qe_sr", None, 0x4004BC0C),
+)
+
+# The kernel's own sections of a linked S3 image (`esp32s3.ld`): its entry,
+# IRAM code, flash code, `.data` and read-only data. Root's and each child's
+# images are a process's, not the kernel's.
+ROM_REFERENCE_SECTIONS = (".entry", ".iram", ".text", ".data", ".drom")
+
+
+def check_rom_flash_references(name, elf):
+    """Refuse a linked S3 image whose kernel holds, as an aligned word in one
+    of `ROM_REFERENCE_SECTIONS`, the jump-table entry or the body's address
+    of any routine of `ROM_FLASH_WRITERS`: a call of one, through the
+    windowed-call stub or otherwise, loads its address from such a word,
+    since no instruction of this core carries a 32-bit immediate. Every
+    finding is named, one per line."""
+    with open(elf, "rb") as f:
+        data = f.read()
+    named = {}
+    for routine, entry, body in ROM_FLASH_WRITERS:
+        if entry is not None:
+            named[entry] = f"{routine}'s jump-table entry {entry:#010x}"
+        named[body] = f"{routine} at {body:#010x}"
+    findings = []
+    for sec, kind, _flags, offset, size, _link, _entsize in \
+            _elf32_sections(data):
+        if sec not in ROM_REFERENCE_SECTIONS or kind != 1:   # SHT_PROGBITS
+            continue
+        for at in range(0, size - size % 4, 4):
+            word, = struct.unpack_from("<I", data, offset + at)
+            if word in named:
+                findings.append(f"{sec} holds {named[word]} (at +{at:#x})")
+    if findings:
+        raise ToolError(f"{name}: the kernel refers to a ROM routine that can "
+                        "write the flash:\n" + "\n".join(findings))
 
 
 # What the S3 part's in-package PSRAM is (ABI.md §16a): the eFuse's codes
@@ -17105,6 +17247,85 @@ def _psram_case_asm(case, clock, board):
               "sos_psram_case:",
               "    l32r a2, .Lsos_psram_case_lit",
               "    ret", ""]
+    return "\n".join(lines)
+
+
+# The commands any run of the smoke may have the flash model decode
+# (`m25p80_command_decoded`, ABI.md §18b): the ROM's wake at boot (ABh), the
+# five reads `mspi.c` sends (9Fh, 05h, 35h, 15h, 5Ah), and 00h, which the
+# model decodes from the byte clocked in after 35h, a command its GigaDevice
+# part does not answer. Anything else, a write above all, fails the run.
+FLASH_COMMANDS_HEARD = ("0xab", "0x9f", "0x5", "0x35", "0x15", "0x5a", "0x0")
+
+# The flash harnesses' words (`s3_flash_probe.saw`, `flash_fault.saw`), in
+# `flash_fault.saw`'s `CaseHarness` order, then room for the record,
+# `mspi.c`'s `struct sos_flash_record`.
+FLASH_HARNESS_WORDS = ("step", "command", "addr", "value", "count",
+                       "record_at", "opcode", "address", "sweep", "jedec")
+FLASH_RECORD_BYTES = 32
+
+# The JEDEC ID the probe reads past (ABI.md §18c): the part's, which every
+# board image carries, and the emulator's flash model's, which an emulator
+# image carries unless its case names another.
+FLASH_PART_JEDEC = 0x0020_4017
+FLASH_EMULATOR_JEDEC = 0x00C8_4016
+
+# SPI1's registers (DR_REG_SPI1_BASE, one 1 KiB page); SPI_MEM_MISC_REG(1),
+# and the word the ROM leaves in it on the part (ABI.md §15c): chip select
+# 0, the flash's, enabled alone.
+SPI1_BLOCK = (0x6000_2000, 0x6000_2400)
+SPI1_MISC = 0x6000_2034
+MISC_FLASH = 0x2
+
+
+def _flash_case_asm(case, board):
+    """A flash harness's case block, as assembly: the fault harness's words
+    and room for the record, in `.data` (DRAM), `sos_flash_case`, which
+    answers the block's address, and `sos_flash_case_setup`. In an emulator
+    image the setup stores the case's `flash["misc"]` (`MISC_FLASH` unless
+    the case says otherwise; None stores nothing) to SPI_MEM_MISC(1), whose
+    word the emulator does not take from its ROM's boot (ABI.md §18b); in a
+    board image it stores nothing, whatever the case says. The block's
+    `jedec` is the ID the probe reads past: `FLASH_PART_JEDEC` in a board
+    image, whatever the case says, and the case's `flash["jedec"]` or
+    `FLASH_EMULATOR_JEDEC` in an emulator image."""
+    spec = case["flash"]
+    misc = None if board else spec.get("misc", MISC_FLASH)
+    harness = dict(spec.get("fault", {}))
+    for key in ("record_at", "opcode", "address", "sweep"):
+        if key in spec:
+            harness[key] = spec[key]
+    harness["jedec"] = (FLASH_PART_JEDEC if board
+                        else spec.get("jedec", FLASH_EMULATOR_JEDEC))
+    lines = ["/* Written by tools/sos_runner.py: a flash harness's case block "
+             "(ABI.md §18b). */",
+             '    .section .data.sos_flash_case_block, "aw"',
+             "    .balign 4",
+             "sos_flash_case_block:"]
+    lines += [f"    .word {harness.get(k, 0):#x}" for k in FLASH_HARNESS_WORDS]
+    lines += [f"    .space {FLASH_RECORD_BYTES}",
+              '    .section .text.sos_flash_case, "ax"',
+              "    .literal .Lsos_flash_case_lit, sos_flash_case_block",
+              "    .align 4",
+              "    .global sos_flash_case",
+              "    .type sos_flash_case, @function",
+              "sos_flash_case:",
+              "    l32r a2, .Lsos_flash_case_lit",
+              "    ret",
+              '    .section .text.sos_flash_case_setup, "ax"']
+    if misc is not None:
+        lines += [f"    .literal .Lsos_flash_misc_addr, {SPI1_MISC:#x}",
+                  f"    .literal .Lsos_flash_misc_word, {misc:#x}"]
+    lines += ["    .align 4",
+              "    .global sos_flash_case_setup",
+              "    .type sos_flash_case_setup, @function",
+              "sos_flash_case_setup:"]
+    if misc is not None:
+        lines += ["    l32r a2, .Lsos_flash_misc_addr",
+                  "    l32r a3, .Lsos_flash_misc_word",
+                  "    s32i a3, a2, 0",
+                  "    memw"]
+    lines += ["    ret", ""]
     return "\n".join(lines)
 
 
@@ -17786,6 +18007,32 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             return False, (f"{want['after']!r} is followed by {v}, outside "
                            f"{want['at_least']} to {want['at_most']}")
         return True, ""
+
+    def check_spi1_stores(case, stores):
+        """Hold a traced run to its case's `expect_spi1_stores`, the whole
+        list of (address, value) stores to SPI1's registers (`SPI1_BLOCK`)
+        from the kernel's first store on, in order: for a flash read, its
+        setup, its one start and the words it puts back, and no store to
+        MISC(1) or of a built-in command bit. Returns (ok, reason)."""
+        first = next((i for i, x in enumerate(stores)
+                      if x == kernel_first_store), None)
+        if first is None:
+            return False, ("no store of the kernel's: the watchdog key "
+                           "`_start` writes first is missing")
+        made = [(a, v) for a, v in stores[first:]
+                if SPI1_BLOCK[0] <= a < SPI1_BLOCK[1]]
+        want = case["expect_spi1_stores"]
+        if made == want:
+            return True, ""
+        at = next((i for i, (x, y) in enumerate(zip(made, want)) if x != y),
+                  min(len(made), len(want)))
+
+        def show(pairs):
+            return [f"{a:#010x}={v:#010x}" for a, v in pairs]
+        return False, (f"the kernel's stores to SPI1 differ from the "
+                       f"expected at store {at}: made {show(made[at:at + 4])}"
+                       f", expected {show(want[at:at + 4])} ({len(made)} "
+                       f"made, {len(want)} expected)")
 
     def check_stores(case, stores):
         """Hold a traced run to its case's `expect_stores`, (address, value)
@@ -19193,8 +19440,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "src": os.path.join(s3_tests, "psram_identity.saw"),
             "psram": {},
             "psram_fault": True,
-            "expect_build_error": "is not the PSRAM fault harness and "
-                                  "defines sos_psram_fault",
+            "expect_build_error": "is not a fault harness of the command "
+                                  "layer and defines sos_psram_fault",
             "expect_out": [],
             "expect_clean_exit": False,
         },
@@ -19233,6 +19480,349 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         {"name": "iram_mutant_script", "iram_mutant": "SCRIPT",
          "expect_finding": "sos_psram_bringup is at 0x42",
          "expect_out": [], "expect_clean_exit": True},
+        # The flash's read, held as the bring-up is.
+        {"name": "iram_mutant_script_flash", "iram_mutant": "SCRIPT",
+         "expect_finding": "sos_flash_read is at 0x42",
+         "expect_out": [], "expect_clean_exit": True},
+    ]
+
+    # The flash's reads (ABI.md §18): the probe, F0, then every stop the
+    # read makes, the gate by MISC(1)'s real word and the rest through the
+    # fault build (`flash_fault.saw`). Each case holds the console, the
+    # commands the flash model decoded (`flash_commands`) and every store
+    # the kernel made to SPI1 (`expect_spi1_stores`): a read's setup, its
+    # one start, SPI_MEM_USR alone, and the words it puts back, with no
+    # store to MISC(1) but the setup's own (`_flash_case_asm`).
+    spi1_reg = {name: 0x6000_2000 + offset for name, offset in (
+        ("cmd", 0x00), ("addr", 0x04), ("ctrl", 0x08), ("clock", 0x14),
+        ("user", 0x18), ("user1", 0x1C), ("user2", 0x20), ("mosi_dlen", 0x24),
+        ("miso_dlen", 0x28), ("misc", 0x34), ("fctrl", 0x3C),
+        ("ddr", 0xE0))}
+    # SPI1's words as the emulator's boot leaves them, in the order a read
+    # writes them back: §16c's S5 list less MISC. The ROM's flash driver
+    # writes CLOCK, CTRL and USER here; MISC reads 0 (ABI.md §18b).
+    spi1_booted = [(spi1_reg[n], v) for n, v in (
+        ("clock", 0x0003_0103), ("ctrl", 0x0020_8000), ("user", 0x8000_00C0),
+        ("user1", 0x5C00_0007), ("user2", 0x7000_0000), ("addr", 0),
+        ("mosi_dlen", 0), ("miso_dlen", 0), ("fctrl", 0), ("ddr", 0))]
+    flash_bits = {0x9F: 24, 0x05: 8, 0x35: 8, 0x15: 8, 0x5A: 32}
+
+    def flash_stores(op, addr=0, started=True, put_back=True):
+        """The stores one flash read makes to SPI1 on the emulator
+        (ABI.md §18a): CTRL with WP alone; USER's phases over the booted
+        word's kept bits; USER1 with SFDP's 24-bit address and 8 dummy
+        cycles, else 0; USER2's 8-bit command; SFDP's address; CACHE_FCTRL
+        with its 4-byte and line bits clear; the answer's length; the start;
+        then the words put back."""
+        sfdp = op == 0x5A
+        user = ((0x8000_00C0 & 0x00FF_0FFF) | (1 << 31) | (1 << 28)
+                | ((1 << 30) | (1 << 29) if sfdp else 0))
+        made = [(spi1_reg["ctrl"], 0x0020_0000), (spi1_reg["user"], user),
+                (spi1_reg["user1"], 0x5C00_0007 if sfdp else 0),
+                (spi1_reg["user2"], 0x7000_0000 | op)]
+        if sfdp:
+            made.append((spi1_reg["addr"], addr))
+        made += [(spi1_reg["fctrl"], 0),
+                 (spi1_reg["miso_dlen"], flash_bits[op] - 1)]
+        if started:
+            made.append((spi1_reg["cmd"], 0x0004_0000))
+        if put_back:
+            made += spi1_booted
+        return made
+
+    misc_setup = [(spi1_reg["misc"], 0x2)]
+    rom_entry = ("esp_rom_spiflash_config_readmode's jump-table entry "
+                 "0x40000aa4")
+    # What the emulator's ROM sends the flash at boot with the eFuse's
+    # FLASH_TYPE set, an eight-line flash, in place of its one ABh: eight
+    # 00h, then the octal reset and write-enable commands it sends a flash it
+    # takes for octal (66h, 99h in both orders; 06h; FFh). It leaves SPI1's
+    # CTRL at 0x0020a000, the word a read writes back.
+    octal_rom_heard = (["0x0"] * 8 + ["0x66", "0x99", "0x99", "0x66", "0x66",
+                                      "0x99", "0x99", "0x66", "0x66", "0x99",
+                                      "0x6", "0x6", "0xff"])
+    probe_spi1_as_before = ("SOS flashprobe: SPI1 MISC=0x00000002 "
+                            "clock=0x00030103 after the reads, as before them")
+    flash_spi1_as_before = ("SOS flash: SPI1 MISC=0x00000002 clock=0x00030103 "
+                            "after the reads, as before them")
+
+    def flash_stop(name, stop, lines, stores, heard=("0xab",), **flash):
+        """A read through the fault harness that stops at `stop`."""
+        return {
+            "name": name,
+            "src": os.path.join(s3_tests, "flash_fault.saw"),
+            "flash": flash,
+            "psram_fault": True,
+            "flash_commands": list(heard),
+            "expect_spi1_stores": misc_setup + stores,
+            "expect_out": [rom, *lines,
+                           f"SOS-S3: halt fail code={stop:#010x}"],
+            "expect_clean_exit": False,
+            "expect_status": stop,
+        }
+
+    def flash_answer(name, op, addr, answer, heard):
+        """A read through the fault harness that finishes, counted."""
+        return {
+            "name": name,
+            "src": os.path.join(s3_tests, "flash_fault.saw"),
+            "flash": {"opcode": op, "address": addr},
+            "psram_fault": True,
+            "flash_commands": ["0xab", *heard],
+            "expect_spi1_stores": misc_setup + flash_stores(op, addr),
+            "expect_out": [
+                rom,
+                "SOS flash: fault hits=0x00000000 starts=0x00000001 "
+                "w0_reads=0x00000001",
+                f"SOS flash: answer={answer:#010x}",
+                flash_spi1_as_before,
+                halt_pass],
+            "expect_clean_exit": True,
+        }
+
+    def probe_gate(name, misc):
+        """The probe with MISC(1) at a word that is not the flash's: its
+        first read stops before SPI1 is written, and nothing reaches the
+        flash but the ROM's command."""
+        return {
+            "name": name,
+            "src": os.path.join(s3_tests, "s3_flash_probe.saw"),
+            "flash": {"misc": misc},
+            "flash_commands": ["0xab"],
+            "expect_spi1_stores": ([] if misc is None
+                                   else [(spi1_reg["misc"], misc)]),
+            "expect_out": [
+                rom,
+                "SOS flashprobe: efuse repeat_data3=0x00000000 flash_type=0",
+                f"SOS-S3: flash stop: SPI1 MISC={misc or 0:#010x} before "
+                "command 0x9f, the flash's commands need chip select 0 alone "
+                "(0x00000002); nothing was sent",
+                f"SOS flashprobe: SPI1 MISC={misc or 0:#010x} "
+                "clock=0x00030103 after the reads, as before them",
+                "SOS-S3: halt fail code=0x00000073"],
+            "expect_clean_exit": False,
+            "expect_status": 0x73,
+        }
+
+    kernel_cases += [
+        {
+            # F0 on the emulator: the flash model is a GigaDevice part
+            # (JEDEC 0xc84016) with its status at 0, no answer to 35h (the
+            # byte clocked in after it decodes as 00h) and no SFDP; SPI0,
+            # the IO MUX and the GPIO matrix are not modelled and read 0,
+            # and the caches' autoload words read DONE. Board stage F0 at
+            # `--emit-flash` (ABI.md §18c).
+            "name": "s3_flash_probe",
+            "src": os.path.join(s3_tests, "s3_flash_probe.saw"),
+            "flash": {},
+            "flash_commands": ["0xab", "0x9f", "0x5", "0x35", "0x0", "0x15",
+                               "0x5a"],
+            "expect_spi1_stores": misc_setup + [
+                store for op in (0x9F, 0x05, 0x35, 0x15, 0x5A)
+                for store in flash_stores(op)],
+            "expect_out": [
+                rom,
+                "SOS flashprobe: efuse repeat_data3=0x00000000 flash_type=0",
+                "SOS flashprobe: id jedec=0x00c84016 sr1=0x00 sr2=0x00 "
+                "sr3=0x00",
+                "SOS flashprobe: sfdp signature=0x00000000 sfdp=none",
+                "SOS flashprobe: decoded sfdp=none qe=clear",
+                "SOS flashprobe: spi0 clock=0x00000000 ctrl=0x00000000 "
+                "ctrl1=0x00000000 ctrl2=0x00000000 user=0x00000000 "
+                "user1=0x00000000 user2=0x00000000 fctrl=0x00000000 "
+                "ddr=0x00000000 cali=0x00000000 din_mode=0x00000000 "
+                "din_num=0x00000000 date=0x00000000 core_clk_sel=0x00000000",
+                "SOS flashprobe: pads 27=0x00000000 28=0x00000000 "
+                "29=0x00000000 30=0x00000000 31=0x00000000 32=0x00000000 "
+                "insel 2=0x00000000 3=0x00000000",
+                "SOS flashprobe: cache icache_autoload=0x00000008 "
+                "dcache_autoload=0x00000008",
+                probe_spi1_as_before,
+                halt_pass],
+            "expect_clean_exit": True,
+        },
+        # 0x73 from MISC(1)'s own word: the emulator's 0 (both chip selects
+        # enabled), the PSRAM's gate (0b01) and neither (0b11).
+        probe_gate("flash_probe_misc_reset", None),
+        probe_gate("flash_probe_misc_psram", 0x1),
+        probe_gate("flash_probe_misc_neither", 0x3),
+        # The probe reads past 9Fh only for the ID its block names and a
+        # four-line flash by the eFuse: the part's ID named on the
+        # emulator's flash, and the eFuse's FLASH_TYPE set. Nothing after
+        # 9Fh reaches the flash.
+        *[{
+            "name": name,
+            "src": os.path.join(s3_tests, "s3_flash_probe.saw"),
+            "flash": flash,
+            "efuse": efuse,
+            "expect_spi1_stores": (misc_setup
+                                   + flash_stores(0x9F, put_back=False)
+                                   + [(a, ctrl if a == spi1_reg["ctrl"]
+                                       else v) for a, v in spi1_booted]),
+            "expect_out": [
+                rom,
+                f"SOS flashprobe: efuse repeat_data3={repeat3:#010x} "
+                f"flash_type={repeat3 >> 9 & 1}",
+                "SOS flashprobe: id jedec=0x00c84016 stop: the probe reads "
+                f"further only a flash of ID {want:#010x} and flash_type 0",
+                probe_spi1_as_before,
+                "SOS-S3: halt fail code=0x0000007c"],
+            "expect_clean_exit": False,
+            "expect_status": 0x7C,
+            "flash_rom_commands": rom_heard,
+            "flash_commands": [*rom_heard, "0x9f"],
+        } for name, flash, efuse, repeat3, want, rom_heard, ctrl in (
+            ("flash_probe_other_id", {"jedec": FLASH_PART_JEDEC}, None, 0,
+             FLASH_PART_JEDEC, ["0xab"], 0x0020_8000),
+            ("flash_probe_flash_type_8", {}, {0x6000_703C: 1 << 9}, 1 << 9,
+             FLASH_EMULATOR_JEDEC, octal_rom_heard, 0x0020_A000))],
+        # Reads that finish, each with its setup and its answer: the JEDEC
+        # ID, manufacturer first in [7:0]; status register 2, which this
+        # model does not answer; and SFDP at an address, which only it
+        # sends.
+        flash_answer("flash_read_rdid", 0x9F, 0, 0x0016_40C8,
+                     ["0x9f"]),
+        flash_answer("flash_read_rdsr2", 0x35, 0, 0, ["0x35", "0x0"]),
+        flash_answer("flash_read_sfdp", 0x5A, 0x30, 0, ["0x5a"]),
+        # The read's S7 loads of USER(1) and CACHE_FCTRL(1) lied to with
+        # every bit the read clears set: USER's phases [31:24] and FWRITE
+        # modes [15:12] over the booted word, CACHE_FCTRL's 4-byte bit [1]
+        # and line modes [8:3]. The stores are the read's own all the same.
+        *[{
+            **flash_answer(name, 0x9F, 0, 0x0016_40C8, ["0x9f"]),
+            "flash": {"opcode": 0x9F,
+                      "fault": {"step": 0x70, "command": 1, "addr": addr,
+                                "value": value, "count": 1}},
+            "expect_out": [
+                rom,
+                "SOS flash: fault hits=0x00000001 starts=0x00000001 "
+                "w0_reads=0x00000001",
+                "SOS flash: answer=0x001640c8",
+                flash_spi1_as_before,
+                halt_pass],
+        } for name, addr, value in (
+            ("flash_read_user_kept", spi1_reg["user"], 0xFF00_F0C0),
+            ("flash_read_fctrl_cleared", spi1_reg["fctrl"], 0x0000_01FA))],
+        # Every byte that is not one of the five reads, each through the
+        # call in one boot: each is refused with 0x7A, nothing is stored to
+        # SPI1 but the setup's MISC word, and the flash hears only the ROM.
+        {
+            "name": "flash_read_sweep",
+            "src": os.path.join(s3_tests, "flash_fault.saw"),
+            "flash": {"sweep": 1},
+            "psram_fault": True,
+            "flash_commands": ["0xab"],
+            "expect_spi1_stores": misc_setup,
+            "expect_out": [
+                rom,
+                "SOS flash: sweep sent=0x000000fb refused=0x000000fb",
+                flash_spi1_as_before,
+                halt_pass],
+            "expect_clean_exit": True,
+        },
+        # 0x7A: write enable, write status, write status 2, the volatile
+        # status register's write enable, deep and ultra-deep power-down,
+        # page program, chip erase and a plain read, none of them sent.
+        *[flash_stop(f"flash_stop_not_read_{op:02x}", 0x7A, [
+            f"SOS-S3: flash stop: {op:#04x} is not one of the flash's reads "
+            "(0x9f 0x05 0x35 0x15 0x5a); nothing was sent",
+            "SOS flash: fault hits=0x00000000 starts=0x00000000 "
+            "w0_reads=0x00000000",
+            flash_spi1_as_before], [], opcode=op)
+          for op in (0x06, 0x01, 0x31, 0x50, 0xB9, 0x79, 0x02, 0xC7, 0x03)],
+        # 0x79: the record in flash, and one that starts in DRAM and runs
+        # past its end.
+        flash_stop("flash_stop_record_in_flash", 0x79, [
+            "SOS-S3: flash stop: the record at 0x3c200000 is not in DRAM",
+            "SOS flash: fault hits=0x00000000 starts=0x00000000",
+            flash_spi1_as_before], [], opcode=0x9F, record_at=0x3C20_0000),
+        flash_stop("flash_stop_record_past_dram", 0x79, [
+            "SOS-S3: flash stop: the record at 0x3fcffff0 is not in DRAM",
+            "SOS flash: fault hits=0x00000000 starts=0x00000000",
+            flash_spi1_as_before], [], opcode=0x9F, record_at=0x3FCF_FFF0),
+        # 0x7B: DDR(1) read with DDR_EN set. Nothing written.
+        flash_stop("flash_stop_ddr", 0x7B, [
+            "SOS-S3: flash stop: SPI1 DDR=0x00000001 before command 0x9f, "
+            "the flash's reads need single data rate (0); nothing was sent",
+            "SOS flash: fault hits=0x00000001 starts=0x00000000",
+            flash_spi1_as_before], [], opcode=0x9F,
+            fault={"step": 0xF2, "addr": spi1_reg["ddr"], "value": 1,
+                   "count": 1}),
+        # 0x74 before the save, nothing written; and at S7.1, after it,
+        # every saved word but MISC put back.
+        flash_stop("flash_stop_busy_before", 0x74, [
+            "SOS-S3: flash stop: SPI1 busy before command 0x9f, "
+            "SPI_MEM_CMD=0x00040000 after 100000 polls; nothing was sent",
+            "SOS flash: fault hits=0x000186a0 starts=0x00000000",
+            flash_spi1_as_before], [], opcode=0x9F,
+            fault={"step": 0xF3, "addr": spi1_reg["cmd"], "value": 0x40000,
+                   "count": 0xFFFF_FFFF}),
+        flash_stop("flash_stop_busy_command", 0x74, [
+            "SOS-S3: flash stop: SPI1 busy before command 0x9f, "
+            "SPI_MEM_CMD=0x00040000 after 100000 polls; nothing was sent, "
+            "SPI1 put back",
+            "SOS flash: fault hits=0x000186a0 starts=0x00000000",
+            flash_spi1_as_before], spi1_booted, opcode=0x9F,
+            fault={"step": 0x71, "command": 1, "addr": spi1_reg["cmd"],
+                   "value": 0x40000, "count": 0xFFFF_FFFF}),
+        # 0x73 at S7.8: MISC(1) read as the PSRAM's gate just before the
+        # start. The setup is made, the start is not, SPI1 is put back.
+        flash_stop("flash_stop_gate_lost", 0x73, [
+            "SOS-S3: flash stop: SPI1 MISC=0x00000001 before command 0x9f, "
+            "the flash's commands need chip select 0 alone (0x00000002); "
+            "nothing was sent, SPI1 put back",
+            "SOS flash: fault hits=0x00000001 starts=0x00000000 "
+            "w0_reads=0x00000000",
+            flash_spi1_as_before], flash_stores(0x9F, started=False),
+            opcode=0x9F,
+            fault={"step": 0x78, "command": 1, "addr": spi1_reg["misc"],
+                   "value": 0x1, "count": 1}),
+        # 0x75: the read never finishes. The call's own line first, then
+        # the stop's; SPI1 is left as the read set it.
+        flash_stop("flash_stop_not_finished", 0x75, [
+            "SOS-S3: flash: SPI1 command 0x9f did not finish",
+            "SOS-S3: flash stop: SPI1 command 0x9f did not finish, "
+            "SPI_MEM_CMD=0x00040000 after 100000 polls; SPI1 left as it is",
+            "SOS flash: fault hits=0x000186a0 starts=0x00000001",
+            "SOS flash: SPI1 MISC=0x00000002 clock=0x00030103 after the "
+            "reads, differing: ctrl=0x00208000->0x00200000 "
+            "user=0x800000c0->0x900000c0 user1=0x5c000007->0x00000000 "
+            "user2=0x70000000->0x7000009f miso_dlen=0x00000000->0x00000017"],
+            flash_stores(0x9F, put_back=False), heard=("0xab", "0x9f"),
+            opcode=0x9F,
+            fault={"step": 0x79, "command": 1, "addr": spi1_reg["cmd"],
+                   "value": 0x40000, "count": 0xFFFF_FFFF}),
+        {
+            # The fault record in the flash harness's board image.
+            "name": "flash_fault_board_image",
+            "src": os.path.join(s3_tests, "flash_fault.saw"),
+            "flash": {"opcode": 0x9F},
+            "psram_fault": True,
+            "board_image": True,
+            "expect_build_error": "a board image defines sos_psram_fault",
+            "expect_out": [],
+            "expect_clean_exit": False,
+        },
+        # A kernel naming a ROM routine that can write the flash, by its
+        # jump-table entry and by its body, in each section the check scans
+        # but `.entry` (`check_rom_flash_references`): one image, each case
+        # requiring the check to name one finding. `.entry` is `boot.S`'s
+        # jump to `_start` alone, which no test kernel can add a word to
+        # without changing the boot path every image shares.
+        *[{
+            "name": name,
+            "src": os.path.join(s3_tests, "rom_flash_reference.saw"),
+            "asm": "rom_flash_reference.S",
+            "expect_build_error": finding,
+            "expect_out": [],
+            "expect_clean_exit": False,
+        } for name, finding in (
+            ("rom_flash_reference_entry", f".text holds {rom_entry}"),
+            ("rom_flash_reference_body",
+             ".text holds esp_rom_spiflash_config_readmode at 0x4004a820"),
+            ("rom_flash_reference_data", f".data holds {rom_entry}"),
+            ("rom_flash_reference_drom", f".drom holds {rom_entry}"),
+            ("rom_flash_reference_iram", f".iram holds {rom_entry}"))],
     ]
     # `check_clock_registers` on the tree, then with each slip it must
     # refuse: a store to a clock register outside `clock_init`'s files, in
@@ -20913,9 +21503,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         with no `simcall` in its stops."""
         made, elf = link_flash(case, board, check)
         _check_drom(elf, case["name"], case_arch(case))
-        # The PSRAM's command layer is linked into every image and kept only
-        # where it is called; where it is, none of it may be in flash, and
-        # its fault record only in the fault harness's emulator image. A
+        # The memory-SPI command layer is linked into every image and kept
+        # only where it is called; where it is, none of it may be in flash,
+        # and its fault record only in a fault harness's emulator image. No
+        # kernel may refer to a ROM routine that can write the flash. A
         # refused image is deleted, so nothing refused can be written to a
         # board from the build directory.
         try:
@@ -20923,6 +21514,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             with open(elf, "rb") as f:
                 check_psram_fault(case["name"], elf_symbols(f.read()),
                                   case.get("src", ""), board)
+            check_rom_flash_references(case["name"], elf)
         except ToolError:
             for path in (made[0], elf):
                 if os.path.exists(path):
@@ -20960,6 +21552,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         payload = None
         if "psram" in case:
             payload = _psram_case_asm(case, key[0], board)
+        if "flash" in case:
+            payload = _flash_case_asm(case, board)
         printed = _link_image(
             builder, profiles[key], case, variant_arch(key), elf,
             flash={"output": flash, "check": check},
@@ -21023,18 +21617,18 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
 
     def boot_args(case):
         """The emulator's extra arguments for one run, and the file its
-        trace goes to (None for a run that traces nothing). A PSRAM
-        harness's run, and every run on the `esp32s3-r8` board, gets the
-        part's PSRAM (`psram_qemu_args`) unless the case names its own
-        `qemu_args`, and the trace of every command the flash model decodes.
-        A run gets a fresh eFuse file holding the case's `efuse` words
-        (`_efuse_file`; a PSRAM run the part's, `8M`, unless it says
-        otherwise; None, and any other case that names none, gives the model
-        no file, and every word reads 0); and, for a case that watches
-        devices (`watches_devices`) or names `expect_stores` or
-        `expect_counter_span`, the trace of every store to a device
-        register, and for the last, of every load. A case with `icount` runs
-        on the emulator's instruction-counted clock."""
+        trace goes to. A PSRAM harness's run, and every run on the
+        `esp32s3-r8` board, gets the part's PSRAM (`psram_qemu_args`) unless
+        the case names its own `qemu_args`. A run gets a fresh eFuse file
+        holding the case's `efuse` words (`_efuse_file`; a PSRAM run the
+        part's, `8M`, unless it says otherwise; None, and any other case that
+        names none, gives the model no file, and every word reads 0); and,
+        for a case that watches devices (`watches_devices`) or names
+        `expect_stores`, `expect_spi1_stores` or `expect_counter_span`, the
+        trace of every store to a device register, and for the last, of
+        every load. Every run traces the commands the flash model decodes
+        (`flash_commands`). A case with `icount` runs on the emulator's
+        instruction-counted clock."""
         psram = "psram" in case or variant(case)[3]
         args = list(case.get("qemu_args", arch["psram_qemu_args"])) \
             if psram else []
@@ -21051,15 +21645,13 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "-global",
                      "driver=nvram.esp32s3.efuse,property=drive,value=efuse"]
         stores = (watches_devices(case) or case.get("expect_stores")
+                  or case.get("expect_spi1_stores") is not None
                   or case.get("expect_counter_span"))
         loads = case.get("expect_counter_span")
-        if not psram and not stores:
-            return args, None
         trace = os.path.join(s3_build, f"{case['name']}.trace.txt")
         if os.path.exists(trace):
             os.remove(trace)
-        if psram:
-            args += ["-trace", "m25p80_command_decoded"]
+        args += ["-trace", "m25p80_command_decoded"]
         if stores:
             args += ["-trace", "memory_region_ops_write"]
         if loads:
@@ -21115,7 +21707,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         (`tests/xtensa/iram_mutants.c`, `MUT_<name>`), or with its link
         script's IRAM line removed (`SCRIPT`), and answer (ok, reason): the
         check must refuse it with the case's finding, or, for `NONE`, pass.
-        The object is linked alone, rooted at the two entries and the
+        The object is linked alone, rooted at the three entries and the
         mutant, with the board's script, as a kernel would link it."""
         which = case["iram_mutant"]
         name = case["name"]
@@ -21139,7 +21731,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             return False, f"the mutant did not build: {e}"
         try:
             check_iram(obj)
-            roots = ["-u", "sos_psram_bringup", "-u", "sos_psram_time_reads"]
+            roots = ["-u", "sos_psram_bringup", "-u", "sos_psram_time_reads",
+                     "-u", "sos_flash_read"]
             if define not in ("MUT_NONE",):
                 roots += ["-u", "sos_psram_mutant"]
             slots = _write_image_slots(
@@ -21248,18 +21841,36 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                                 f"{timeout_s}s"
         else:
             ok, reason = _check(case, case_arch(case), status, out, False)
-        # The flash's own view of the run: every command it decoded, which
-        # for a PSRAM harness must be the ROM's one at boot and nothing the
-        # bring-up sent (`flash_commands`).
-        if ok and case.get("flash_commands") is not None:
+        # The flash's own view of the run: every command it decoded. In
+        # every run each is the ROM's wake at boot or one of the reads
+        # (`FLASH_COMMANDS_HEARD`), so no image of the smoke sends the flash
+        # a write; and a case's `flash_commands` is the whole list, in
+        # order: for a PSRAM harness the ROM's one and nothing the bring-up
+        # sent, for a flash harness the reads it sent. A case whose eFuse
+        # has the ROM's boot send the flash more names those commands
+        # (`flash_rom_commands`): the list must begin with them, and the
+        # rest is held as any run's.
+        if ok:
             try:
                 heard = flash_commands(trace)
             except ToolError as e:
                 ok, reason = False, str(e)
             else:
-                if heard != case["flash_commands"]:
+                booted = case.get("flash_rom_commands", [])
+                after = heard[len(booted):]
+                foreign = [c for c in after if c not in FLASH_COMMANDS_HEARD]
+                want = case.get("flash_commands")
+                if heard[:len(booted)] != booted:
+                    ok, reason = False, (f"the flash decoded {heard}, which "
+                                         f"does not begin with the ROM's "
+                                         f"{booted}")
+                elif foreign:
+                    ok, reason = False, (f"the flash decoded {foreign}, "
+                                         "which no image may send it, in "
+                                         f"{heard}")
+                elif want is not None and heard != want:
                     ok, reason = False, (f"the flash decoded {heard}, not "
-                                         f"{case['flash_commands']}")
+                                         f"{want}")
         # The words the run left in registers the emulator does not read
         # back (the IO MUX): the last store to each address must be the
         # case's (`device_writes`), and for `kernel_writes` one the kernel's
@@ -21308,6 +21919,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         # the emulator drops and never reads back.
         if ok and case.get("expect_stores"):
             ok, reason = check_stores(case, traced_stores(trace))
+        # Every store the kernel's side made to SPI1, in order
+        # (`expect_spi1_stores`).
+        if ok and case.get("expect_spi1_stores") is not None:
+            ok, reason = check_spi1_stores(case, traced_stores(trace))
         # A wait the run must make (`expect_counter_span`), read off the
         # counter's loads.
         if ok and case.get("expect_counter_span"):
