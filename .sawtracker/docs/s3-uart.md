@@ -3,6 +3,12 @@
 Revision 3, Nov 26. A design only: nothing here is built until the owner and
 the reviewer have read it.
 
+**Changes in this edit (3.1)**, from the owner's answers to revision 3:
+killing a stalled console checked every second stands; `Lost` and `Garbled`
+stay two statuses carrying every count; the watchdog runs at root's `Rt1`
+(level 5), given by a realtime-band word in root's image header that only
+the stock root's manifest fills, instead of moving root's `High` (§4.6).
+
 **Changes from revision 2**, from the owner's rulings and the reviewer's
 threads on `SO:s3-uart`:
 
@@ -627,16 +633,57 @@ client's is [read root/src/main.saw:22-33, 55-58].
   print.
 
 **The console watchdog.** A claimant that is alive and not serving leaves
-root's oldest line unanswered. Root runs a second thread at its `High` band,
-which the stock root's header moves from level 3 to 5 [read root/Saw.toml:30;
-spec.md:4117-4121], above the driver's `Rt0` (4). It sleeps on a periodic
+root's oldest line unanswered. Root runs a second thread at its `Rt1` band,
+level 5, above the driver's `Rt0` (level 4 under its full map); the next
+paragraphs say how root gets that level. It sleeps on a periodic
 Timer of `CONSOLE_STALL_PERIOD` (1 s) only while root has a line
 unanswered. At each wake it reads the console process's `Stats` [read
 spec.md:2195-2198]. When the oldest unanswered line is the same as at the
 previous wake and the process's syscall count has not moved since, two wakes
 in a row, the console is stalled. Root kills it with the code
 `CONSOLE_STALLED`; the teardown ends the claim, and root writes `root:
-console stalled, killed` and its held lines through the debug print.
+console stalled, killed` and its held lines through the debug print. Killing
+it, checked every second, is the owner's ruling.
+
+**How root's realtime bands get above the driver.**
+
+- **Today.** Root's map comes from its image header, which carries four
+  bands, `Background` to `High`, a byte each (the stock root's reads
+  `prio=0x03020100`); the kernel puts `Rt0` to `Rt3` at `High`'s level,
+  because the header has no bytes for them [read
+  kernel/core/loader.saw:736-785; spec.md:4117-4121]. Blade writes those four
+  bytes from `[sos] priorities` [read root/Saw.toml:30; the pinned Blade,
+  `blade/src/sosimg.saw:277-280, 744`]. So root's `Rt1` is level 3 today,
+  below the driver.
+- **Root cannot set its own map.** `ProcessOp.BandMap` applies only to a
+  `Created` process and is the `BadState` fault on any other [read
+  kernel/core/dispatch.saw:980-998]; root is `Running` from its first
+  instruction [read kernel/core/process.saw:1459]. The spec also rules out
+  the shape: no syscall accepts a level from the process that will run at it
+  [read spec.md:4111-4113].
+- **A boot grant from the kernel alone would move an existing root's
+  threads.** `tests/level-root` starts threads at `Rt0` and `Rt3` and asserts
+  that they run at `High`'s level [read tests/level-root/src/main.saw:14,
+  266-271]; giving every root identity realtime bands would break it.
+- **So the header names the realtime bands.** The header's `reserved0` word,
+  which imgformat keeps "so a later version can spend it without moving
+  anything" [read the pinned `libs/imgformat/src/lib.saw:92-94`], becomes
+  `rt_map`: `Rt0` to `Rt3`, a byte each. Blade writes it from `[sos]
+  priorities` keys `rt0` to `rt3`, and writes 0 when a manifest names none.
+  The kernel's `root_band_map` reads 0 as today's rule (every realtime band
+  at `High`'s level) and any other word as four levels, refusing one past
+  the last as it refuses a header band now. The stock root's manifest names
+  all eight bands, `rt0 = 4, rt1 = 5, rt2 = 6, rt3 = 7`: root's full map.
+- **No existing root thread changes level.** No manifest in the tree names
+  `rt0` to `rt3` (a search of every `Saw.toml` finds none), and Blade knows
+  only the four keys today,
+  so Blade writes 0 for each and the kernel's rule is today's; `level-root`'s
+  `Rt0` and `Rt3` threads stay at `High`'s level. The stock root's
+  `Background` to `High` stay 0 to 3, its main thread stays at `Normal`, and
+  it starts no other thread today [read root/src/main.saw: no `thread_create`
+  or `start(band:)`].
+- **The cost** is a sawlang change, imgformat's field and Blade's keys, and
+  a toolchain pin bump before U0b; the kernel's half is a few lines in U0.
 
 - **Why the test is sound.** The driver runs above every thread but the
   watchdog, so a driver able to run takes root's staged message before
@@ -1076,7 +1123,7 @@ In order; sizes are rough.
 | unit | what | size |
 |---|---|---|
 | U0 | the kernel: `SystemOp.ConsoleClaim`/`ConsoleRelease`, `SystemRight.Console`, `SosStatus.Claimed`; the console under the claim (held lines, the refused debug print, the returned line, `hal.console_reclaim` and each HAL's console line on every stop); the death record and `ProcessOp.Death`, the panic text kept in it; root's panic, faults and kill as kernel panics; `sos` wrappers; the cases `console_claim` and `death_record` on every profile | L |
-| U0b | root and the builder: `console` as a System record right granted only to the image's console, and its refusals; the plan's inlet for root; root's non-parking console writer, its record printing, its watchdog thread and its header's `High` at 5; `svc-console`'s `EXIT_CLAIMED`; `tests/console-staller` and `console_stall` | M |
+| U0b | root and the builder: `console` as a System record right granted only to the image's console, and its refusals; the plan's inlet for root; root's non-parking console writer, its record printing, its watchdog thread at `Rt1` and its manifest's `rt0` to `rt3`; `svc-console`'s `EXIT_CLAIMED`; `tests/console-staller` and `console_stall` | M |
 | U1 | `uartproto`: `Lost`, `Stats`, the new `Write`/`Sync` wording ("answered once queued", "once every byte before it has left the device"); every driver answers `Stats`; hosted tests | S |
 | U2 | `drivers/uartcore`: rings, gap marks, holds, sync marks, the serve state machine over a `UartDevice` trait; the fake UART; hosted tests (§9) | M |
 | U3 | the S3 UART block in `esp32s3io` (offsets, bring-up words, the arm's register order) with hosted tests through its `RegisterPort`; `ABI.md` §4b, the driver's use of UART0 and §6's findings | S |
@@ -1121,14 +1168,6 @@ needs U0; U4 needs all of them.
 
 ## 12. Questions for the owner
 
-1. **The watchdog (§4.6).** Root kills a console that serves none of root's
-   lines and makes no syscall across two 1-second checks, from a thread its
-   header puts above the driver. Is killing the console the way back you
-   want, and is a 1-second period right for the part?
-2. **The mark's names (§2).** One mark, two statuses: `Lost` when a byte was
-   lost, `Garbled` when only an error was seen, both carrying every count.
-   Or one status for both?
-3. **Root's `High` at level 5.** The watchdog needs a thread above the
-   console's `Rt0`; moving the stock root's `High` from 3 to 5 is the
-   smallest change that gives one. Acceptable, or should the watchdog use a
-   band the header names separately?
+None new from this revision. The realtime-band header field (§4.6) needs a
+sawlang change, imgformat's `rt_map` and Blade's `rt0` to `rt3` keys, filed
+for the sawlang lead before U0b, and a pin bump.
