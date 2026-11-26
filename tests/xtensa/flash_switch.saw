@@ -1,0 +1,185 @@
+// The flash switch, each of its stores and stops reached through the real
+// call on the emulator (../../hal/xtensa-esp32s3/ABI.md §18f). Built only
+// with `mspi.c`'s fault build (`-DSOS_PSRAM_FAULT`, the case key
+// `psram_fault`), whose table of lies stands in for the machine the
+// emulator does not model: SPI0, the IO MUX and the GPIO matrix read 0
+// there, and its flash is not the part's.
+//
+// The case's block (`sos_flash_switch_case`, written by the runner beside the
+// image, `_flash_switch_case_asm`) says which switch to make (`mode`: DIO or
+// QIO, at 80 or 40 MHz), which description to make it against (the
+// emulator's or the part's, as `s3flashkit` states them, with any word
+// replaced by the block's), where the description and the record lie (the
+// block's own, unless it names other addresses), and the reads to lie to; a
+// lie's address of 0xCA0000NN is the canary's byte NN, placed here, since
+// only the link knows where the canary is. The image's clock key runs
+// first, as `kmain` runs it; its flash key is `rom`, so the switch here is
+// the block's alone. Then the lies go in the table and
+// `sos_flash_case_setup` stores the case's SPI_MEM_MISC(1) word, as in
+// `s3_flash_probe.saw`.
+//
+//   (the clock key's line)
+//   (the switch's own lines from IRAM: for a canary that read wrong, a
+//   command that did not finish, or a cache that did not report its
+//   unfreeze)
+//   SOS-S3: flash KEY ...                        the switch's line
+//   SOS flashswitch: starts=... w0_reads=... table_hits=...
+//   SOS flashswitch: SPI1 MISC=... clock=... after the reads, ...
+//   SOS-S3: halt pass, or fail code=...
+//
+// `starts` is how many commands the call started, `w0_reads` how many
+// answers it read and `table_hits` how many reads the table answered.
+//
+// A board image of this harness is refused: the runner allows the fault
+// record in a fault harness's emulator image only.
+
+import kcore.{console}
+import hal
+import s3flashkit.{FlashExpect, flash_expect, flash_switch, MODE_HALF,
+                   MODE_QUAD}
+
+extern "C" {
+    func sos_flash_switch_case() -> UInt
+    func sos_flash_case_setup()
+    func sos_psram_fault_record() -> UInt
+    func sos_flash_fault_words() -> UInt
+    func sos_flash_regions() -> UInt
+}
+
+/// One lie: the read at `step`, in command `command`, of `addr` (0 in any:
+/// any) answers `value`. `mspi.c`'s `struct sos_flash_fault_word`.
+struct FaultWord {
+    step: UInt32,
+    command: UInt32,
+    addr: UInt32,
+    value: UInt32,
+}
+
+/// The table's room, `mspi.c`'s FAULT_WORDS.
+static FAULT_WORDS: Int = 16
+
+/// `mspi.c`'s `struct sos_flash_fault_table`.
+struct FaultTable {
+    count: UInt32,
+    hits: UInt32,
+    words: [FaultWord; 16],
+}
+
+/// The counts `mspi.c`'s `struct sos_psram_fault` keeps, after its five
+/// words of lie.
+struct FaultCounts {
+    step: UInt32,
+    command: UInt32,
+    addr: UInt32,
+    value: UInt32,
+    count: UInt32,
+    hits: UInt32,
+    starts: UInt32,
+    w0_reads: UInt32,
+}
+
+/// A lie's address that names the canary's byte NN: 0xCA0000NN.
+static CANARY_TAG: UInt32 = 0xCA00_0000
+static CANARY_TAG_MASK: UInt32 = 0xFF00_0000
+static CANARY_OFFSET_MASK: UInt32 = 0xFF
+
+/// The block's lies, each address that names a canary byte made the byte's.
+func placed(faults: [FaultWord; 16]) unsafe -> [FaultWord; 16] {
+    var out = faults
+    let canary = sos_flash_regions() as UInt32
+    var i = 0
+    while i < FAULT_WORDS {
+        if (out[i].addr & CANARY_TAG_MASK) == CANARY_TAG {
+            out[i].addr = canary + (out[i].addr & CANARY_OFFSET_MASK)
+        }
+        i += 1
+    }
+    out
+}
+
+/// The case's block, as the runner's `_flash_switch_case_asm` lays it out:
+/// this, then room for the description and the record.
+struct CaseBlock {
+    mode: UInt32,
+    part: UInt32,               // 1: the part's description, 0: the emulator's
+    replace: UInt32,            // bit i: `FlashExpect`'s word i from `words`
+    words: FlashExpect,
+    expect_at: UInt32,          // 0: the block's own description
+    record_at: UInt32,          // 0: the block's own record
+    fault_count: UInt32,
+    faults: [FaultWord; 16],
+}
+
+static_assert(sizeof<CaseBlock>() == 312, "the runner's block")
+static EXPECT_OFFSET: UInt = 312
+static RECORD_OFFSET: UInt = 344
+
+/// The description the block names: the kit's, with each word whose bit is
+/// set in `replace` taken from `words`.
+func described(b: &CaseBlock) -> FlashExpect {
+    var e = flash_expect(b.part != 0)
+    let w = b.words
+    if (b.replace & 0x01) != 0 { e.sysclk = w.sysclk }
+    if (b.replace & 0x02) != 0 { e.cpu_per = w.cpu_per }
+    if (b.replace & 0x04) != 0 { e.core_clk_sel = w.core_clk_sel }
+    if (b.replace & 0x08) != 0 { e.jedec = w.jedec }
+    if (b.replace & 0x10) != 0 { e.clock = w.clock }
+    if (b.replace & 0x20) != 0 { e.ctrl = w.ctrl }
+    if (b.replace & 0x40) != 0 { e.user1 = w.user1 }
+    if (b.replace & 0x80) != 0 { e.user2 = w.user2 }
+    e
+}
+
+/// The key the block's `mode` makes, as its line names it.
+func key_name(mode: UInt) -> String {
+    let quad = (mode & MODE_QUAD) != 0
+    if (mode & MODE_HALF) != 0 {
+        return if quad { "qio40" } else { "dio40" }
+    }
+    if quad { "qio80" } else { "dio80" }
+}
+
+func word(name: String, v: UInt32) unsafe {
+    console().write_str(name)
+    console().write_hex(v as UInt)
+}
+
+@export("kmain")
+func kmain() unsafe {
+    hal.clock_init()
+    let block = sos_flash_switch_case()
+    let b = UnsafeMemory<CaseBlock, Normal>(block).read()
+    let table = UnsafeMemory<FaultTable, Normal>(sos_flash_fault_words())
+    let count = if (b.fault_count as Int) < FAULT_WORDS {
+        b.fault_count
+    } else {
+        FAULT_WORDS as UInt32
+    }
+    table.words.write(placed(b.faults))
+    table.hits.write(0)
+    table.count.write(count)
+    let expect = if b.expect_at != 0 { b.expect_at as UInt }
+                 else { block + EXPECT_OFFSET }
+    let record = if b.record_at != 0 { b.record_at as UInt }
+                 else { block + RECORD_OFFSET }
+    if b.expect_at == 0 {
+        UnsafeMemory<FlashExpect, Normal>(expect).write(described(&b))
+    }
+    sos_flash_case_setup()
+
+    var before: [UInt32; 11] = [0; 11]
+    hal.psram_spi1_words(&var before)
+    let mode = b.mode as UInt
+    let stop = flash_switch(key_name(mode), mode, expect, record)
+    table.count.write(0)
+    let counts = UnsafeMemory<FaultCounts, Normal>(sos_psram_fault_record())
+    word("SOS flashswitch: starts=", counts.starts.read())
+    word(" w0_reads=", counts.w0_reads.read())
+    word(" table_hits=", table.hits.read())
+    console().write_str("\n")
+    hal.flash_spi1_line("SOS flashswitch: ", &before)
+    if stop != 0 {
+        hal.exit_fail(stop)
+    }
+    hal.exit_pass()
+}

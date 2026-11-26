@@ -1,0 +1,485 @@
+//! What the flash keys that switch share: the description, the call into
+//! `mspi.c`'s switch, and the lines it prints.
+//!
+//! The `s3flashkit` module. The profile maps it for every image, but only a
+//! flash key that switches imports it (`../flash-dio80/`, `../flash-qio80/`,
+//! `../flash-dio40/`, `../flash-qio40/`), so an image at the `rom` flash key
+//! compiles nothing from it. Like the clock keys, it names nothing in
+//! `../../kernel/lib.saw`: it reaches the switch through `mspi.c`'s entry and
+//! prints with `s3clockkit`'s writer, which every clock key on the PLL
+//! compiles in. `../../ABI.md` §18d to §18f is the source of every number.
+//!
+//! The switch itself is one call from IRAM (`sos_flash_switch`): every check
+//! before any store, the stores, the canary read through the data cache, and
+//! SPI0 put back when the canary reads wrong. This half chooses the
+//! description, passes it, and prints what the record says.
+
+import s3clock.{PART_CORE_CLK_SEL, PART_CPU_PER, PART_SYSCLK}
+import s3clockkit.{write_byte, write_centi, write_hex, write_str}
+
+extern "C" {
+    func sos_board_image() -> UInt
+    func sos_flash_regions() -> UInt
+    func sos_flash_switch(expect: UInt, record: UInt, mode: UInt,
+                          regions: UInt) -> UInt
+}
+
+/// The switch's `mode` bits (`mspi.c`'s MODE_*): the cache's reads on four
+/// lines (QIO) rather than two (DIO), and the flash at half the memory-SPI
+/// core clock, 40 MHz, rather than the whole of it, 80.
+public static MODE_QUAD: UInt = 1
+public static MODE_HALF: UInt = 2
+
+/// What the switch compares before it stores anything, as `mspi.c`'s
+/// `struct sos_flash_expect` lays it out: the three clock words, masked as
+/// the PSRAM's S0.3 masks them; the flash's JEDEC ID, manufacturer in
+/// [23:16]; and SPI0's CLOCK, CTRL, USER1 and USER2 as the ROM leaves them.
+public struct FlashExpect {
+    sysclk: UInt32,
+    cpu_per: UInt32,
+    core_clk_sel: UInt32,
+    jedec: UInt32,
+    clock: UInt32,
+    ctrl: UInt32,
+    user1: UInt32,
+    user2: UInt32,
+}
+
+static_assert(sizeof<FlashExpect>() == 32, "FlashExpect is mspi.c's layout")
+
+/// The words the switch reads before its stores and after them, as
+/// `mspi.c`'s `struct sos_flash_words` lays them out: SPI0's CLOCK, CTRL,
+/// CTRL2, USER, USER1, USER2, DDR, TIMING_CALI, DIN_MODE and DIN_NUM; pads 27
+/// and 28; the input selects of signals 2 and 3.
+public struct FlashWords {
+    clock: UInt32,
+    ctrl: UInt32,
+    ctrl2: UInt32,
+    user: UInt32,
+    user1: UInt32,
+    user2: UInt32,
+    ddr: UInt32,
+    cali: UInt32,
+    din_mode: UInt32,
+    din_num: UInt32,
+    pad_hd: UInt32,
+    pad_wp: UInt32,
+    insel_hd: UInt32,
+    insel_wp: UInt32,
+}
+
+static_assert(sizeof<FlashWords>() == 56, "FlashWords is mspi.c's layout")
+
+/// A flash read's record, `mspi.c`'s `struct sos_flash_record`: its stop's
+/// words, its opcode and address, its answer, whether SPI1 was saved, and
+/// MISC(1) as its gate read it.
+public struct FlashReadRecord {
+    stop: UInt32,
+    read: UInt32,
+    expect: UInt32,
+    command: UInt32,
+    address: UInt32,
+    answer: UInt32,
+    saved: UInt32,
+    misc: UInt32,
+}
+
+static_assert(sizeof<FlashReadRecord>() == 32,
+              "FlashReadRecord is mspi.c's layout")
+
+/// What the switch found, `mspi.c`'s `struct sos_flash_switch_record`: the
+/// stop's words (`at` is the word's index in `FlashWords` for 0x71 and the
+/// canary's offset for 0x78), the clock and autoload words W2 read, the ID
+/// and status register 2 W3 read, `STATE_*` (what was done to SPI0, and each
+/// cache's freeze and unfreeze that did not report), the two timed reads in
+/// SYSTIMER's ticks, the canary's first word that read wrong, the freeze
+/// words a freeze and each cache's unfreeze last read when they did not
+/// report, the words before and after, and the last read's record.
+public struct FlashSwitchRecord {
+    stop: UInt32,
+    read: UInt32,
+    expect: UInt32,
+    at: UInt32,
+    sysclk: UInt32,
+    cpu_per: UInt32,
+    core_clk_sel: UInt32,
+    icache_autoload: UInt32,
+    dcache_autoload: UInt32,
+    jedec: UInt32,
+    sr2: UInt32,
+    state: UInt32,
+    ticks_before: UInt32,
+    ticks_after: UInt32,
+    canary_at: UInt32,
+    canary_read: UInt32,
+    canary_want: UInt32,
+    freeze_word: UInt32,
+    thaw_word_i: UInt32,
+    thaw_word_d: UInt32,
+    before: FlashWords,
+    after: FlashWords,
+    flash: FlashReadRecord,
+}
+
+static_assert(sizeof<FlashSwitchRecord>() == 224,
+              "FlashSwitchRecord is mspi.c's layout")
+
+/// The switch's stops (../../ABI.md §18e), and a flash read's that W3 can
+/// make.
+public static STOP_CLOCK: UInt = 0x70
+public static STOP_SPI0: UInt = 0x71
+public static STOP_AUTOLOAD: UInt = 0x72
+public static STOP_GATE: UInt = 0x73
+public static STOP_BUSY: UInt = 0x74
+public static STOP_STUCK: UInt = 0x75
+public static STOP_ID: UInt = 0x76
+public static STOP_QE: UInt = 0x77
+public static STOP_CANARY: UInt = 0x78
+public static STOP_NOT_DRAM: UInt = 0x79
+public static STOP_DDR: UInt = 0x7B
+public static STOP_FREEZE: UInt = 0x7D
+public static STOP_THAW: UInt = 0x7E
+
+/// The record's `state` (`mspi.c`'s STATE_*): W5's stores made, W7's
+/// put-back made, the canary read wrong; each cache's freeze that did not
+/// report, and was undone; each cache's unfreeze, or undo, that did not.
+static STATE_STORED: UInt32 = 0x01
+static STATE_PUT_BACK: UInt32 = 0x02
+static STATE_CANARY: UInt32 = 0x04
+static STATE_FREEZE_I: UInt32 = 0x10
+static STATE_FREEZE_D: UInt32 = 0x20
+static STATE_THAW_I: UInt32 = 0x40
+static STATE_THAW_D: UInt32 = 0x80
+
+/// The part's flash, as board stage F0 read it (../../ABI.md §18c): the
+/// JEDEC ID of an XMC quad part of 8 MiB, and SPI0 as the part's ROM leaves
+/// it for its slow read: divide by 4, `03h` on one line, a 24-bit address
+/// and an 8-bit command.
+public static PART_JEDEC: UInt32 = 0x0020_4017
+public static PART_SPI0_CLOCK: UInt32 = 0x0003_0103
+public static PART_SPI0_CTRL: UInt32 = 0x0020_0000
+public static PART_SPI0_USER1: UInt32 = 0x5C00_0007
+public static PART_SPI0_USER2: UInt32 = 0x7000_0003
+
+/// The emulator's (../../ABI.md §14e, §18b): its clock words whatever a key
+/// stores, its flash model's ID (a GigaDevice part, chosen by the image's
+/// size), and SPI0, which it does not model and which reads 0.
+public static EMULATOR_SYSCLK: UInt32 = 0x0008_0401
+public static EMULATOR_CPU_PER: UInt32 = 0
+public static EMULATOR_CORE_CLK_SEL: UInt32 = 0
+public static EMULATOR_JEDEC: UInt32 = 0x00C8_4016
+
+/// The description of the machine an image is linked for: the part's in a
+/// board image, at the clock words the image's clock key leaves on it
+/// (`s3clock`), and the emulator's otherwise.
+public func flash_expect(board: Bool) -> FlashExpect {
+    if board {
+        return FlashExpect(sysclk: PART_SYSCLK, cpu_per: PART_CPU_PER,
+                           core_clk_sel: PART_CORE_CLK_SEL, jedec: PART_JEDEC,
+                           clock: PART_SPI0_CLOCK, ctrl: PART_SPI0_CTRL,
+                           user1: PART_SPI0_USER1, user2: PART_SPI0_USER2)
+    }
+    FlashExpect(sysclk: EMULATOR_SYSCLK, cpu_per: EMULATOR_CPU_PER,
+                core_clk_sel: EMULATOR_CORE_CLK_SEL, jedec: EMULATOR_JEDEC,
+                clock: 0, ctrl: 0, user1: 0, user2: 0)
+}
+
+/// Is this image linked for the part rather than the emulator? A board image
+/// is linked with `_sos_semihosting` at 0 (`../../kernel/sink.c`), the one
+/// link-time fact that tells the two machines apart.
+public func board_image() -> Bool {
+    sos_board_image() != 0
+}
+
+/// The key's own description and record: kernel statics, so DRAM, as the
+/// switch's entry check requires.
+unsafe static var FLASH_EXPECT: FlashExpect
+unsafe static var FLASH_RECORD: FlashSwitchRecord
+
+/// A flash key's switch, `name` its line's name and `mode` its bits: the
+/// description of the machine the image is linked for, the switch, its line.
+/// A switch not taken leaves the flash at the ROM's slow read and the boot
+/// goes on; a read that did not finish stops the machine in a quiet loop,
+/// with SPI1 possibly still mid-command, and so does a cache that did not
+/// report its unfreeze.
+public func flash_init_at(name: String, mode: UInt) unsafe {
+    FLASH_EXPECT = flash_expect(board_image())
+    let expect = ((&var FLASH_EXPECT) as UnsafePointer<FlashExpect>) as UInt
+    let at = (&var FLASH_RECORD) as UnsafePointer<FlashSwitchRecord>
+    let record = at as UInt
+    let stop = flash_switch(name, mode, expect, record)
+    if stop == STOP_STUCK || stop == STOP_THAW {
+        while { }
+    }
+}
+
+/// The switch at `mode` against the description at `expect`, filling the
+/// record at `record`, both of which must be DRAM; then its line, `name` the
+/// key's: the words before and after when taken, else why not. Answers 0 or
+/// the stop's code.
+public func flash_switch(name: String, mode: UInt, expect: UInt,
+                         record: UInt) unsafe -> UInt {
+    let stop = sos_flash_switch(expect, record, mode, sos_flash_regions())
+    if stop == 0 {
+        taken_line(name, mode, record)
+    } else {
+        not_taken_line(name, stop, expect, record)
+    }
+    stop
+}
+
+/// `v`'s low `digits` hex digits after `0x`.
+func write_hex_digits(v: UInt32, digits: Int) unsafe {
+    write_str("0x")
+    var shift: Int = (digits - 1) * 4
+    while shift >= 0 {
+        let d = UInt8.from(truncating: (v >> shift) & 0xF)
+        write_byte(if d < 10 { d + 48 } else { d + 87 })
+        shift -= 4
+    }
+}
+
+/// ` name=0x........`.
+func write_word(name: String, v: UInt32) unsafe {
+    write_str(" ")
+    write_str(name)
+    write_str("=0x")
+    write_hex(v)
+}
+
+/// ` name=0x........->0x........`.
+func write_change(name: String, before: UInt32, after: UInt32) unsafe {
+    write_word(name, before)
+    write_str("->0x")
+    write_hex(after)
+}
+
+/// SYSTIMER's ticks of 1/16 us as microseconds, to the hundredth.
+func write_us(ticks: UInt32) unsafe {
+    write_centi((ticks as UInt) * 100 / 16)
+    write_str("us")
+}
+
+/// The line of a switch taken: the ID, status register 2, each word the
+/// stores change before and after (the pads and input selects for four
+/// lines), the canary, and the two timed reads, which follow the machine's
+/// clock and are printed, not judged (../../ABI.md §18e).
+func taken_line(name: String, mode: UInt, record: UInt) unsafe {
+    let r = UnsafeMemory<FlashSwitchRecord, Normal>(record)
+    let before = r.before.read()
+    let after = r.after.read()
+    write_str("SOS-S3: flash ")
+    write_str(name)
+    write_word("jedec", r.jedec.read())
+    write_str(" sr2=")
+    write_hex_digits(r.sr2.read(), 2)
+    write_change("clock", before.clock, after.clock)
+    write_change("ctrl", before.ctrl, after.ctrl)
+    write_change("ctrl2", before.ctrl2, after.ctrl2)
+    write_change("user", before.user, after.user)
+    write_change("user1", before.user1, after.user1)
+    write_change("user2", before.user2, after.user2)
+    if (mode & MODE_QUAD) != 0 {
+        write_change("pad27", before.pad_hd, after.pad_hd)
+        write_change("pad28", before.pad_wp, after.pad_wp)
+        write_change("insel2", before.insel_hd, after.insel_hd)
+        write_change("insel3", before.insel_wp, after.insel_wp)
+    }
+    write_str(" canary=ok read4k=")
+    write_us(r.ticks_before.read())
+    write_str("->")
+    write_us(r.ticks_after.read())
+    write_byte(10)
+}
+
+/// One cache's part of a 0x7D or 0x7E line: a freeze that did not report
+/// and was undone, or whose undo did not report either, or an unfreeze that
+/// did not report, each with the freeze word it last read.
+func write_cache(name: String, freeze: Bool, thaw: Bool, freeze_word: UInt32,
+                 thaw_word: UInt32) unsafe {
+    write_str(name)
+    if freeze {
+        write_str(" cache did not report its freeze done, its freeze word ")
+        write_str("reading 0x")
+        write_hex(freeze_word)
+        write_str(" after 100000 polls, and ")
+        if thaw {
+            write_str("did not report the undo either, reading 0x")
+            write_hex(thaw_word)
+        } else {
+            write_str("was unfrozen again")
+        }
+    } else {
+        write_str(" cache did not report its unfreeze, its freeze word ")
+        write_str("reading 0x")
+        write_hex(thaw_word)
+        write_str(" after 100000 polls")
+    }
+}
+
+/// A 0x7D or 0x7E line's reason, from the record's `state`: the canary's
+/// first wrong word when W7 was putting SPI0 back, each cache that did not
+/// report, and what was left of SPI0. SPI0 put back after a freeze that did
+/// not report was put back with the caches running only if every undo and
+/// unfreeze reported; otherwise a cache may still be frozen, and the line
+/// says no more than which.
+func write_caches(r: &FlashSwitchRecord) unsafe {
+    let state = r.state
+    if (state & STATE_CANARY) != 0 {
+        write_str("the canary read 0x")
+        write_hex(r.canary_read)
+        write_str(" at +")
+        write_hex_digits(r.canary_at, 2)
+        write_str(" where 0x")
+        write_hex(r.canary_want)
+        write_str(" was expected; then ")
+    }
+    let freeze_i = (state & STATE_FREEZE_I) != 0
+    let thaw_i = (state & STATE_THAW_I) != 0
+    let freeze_d = (state & STATE_FREEZE_D) != 0
+    let thaw_d = (state & STATE_THAW_D) != 0
+    if freeze_i || thaw_i {
+        write_cache("the instruction", freeze_i, thaw_i, r.freeze_word,
+                    r.thaw_word_i)
+        if freeze_d || thaw_d {
+            write_str("; ")
+        }
+    }
+    if freeze_d || thaw_d {
+        write_cache("the data", freeze_d, thaw_d, r.freeze_word, r.thaw_word_d)
+    }
+    if (state & STATE_PUT_BACK) != 0 {
+        write_str("; SPI0 put back to the ROM's words")
+        if (freeze_i || freeze_d) && not (thaw_i || thaw_d) {
+            write_str(" with the caches running")
+        }
+    } else if (state & STATE_STORED) != 0 {
+        write_str("; SPI0 left switched, the canary not read")
+    } else {
+        write_str("; nothing was stored to SPI0")
+    }
+}
+
+/// The tail of a stop W3's read made: whether it had saved SPI1, and so put
+/// it back.
+func write_put_back(saved: UInt32) unsafe {
+    if saved != 0 {
+        write_str("; SPI1 put back")
+    }
+}
+
+/// The line of a switch not taken, for the stop `stop` (../../ABI.md §18e),
+/// from the description at `expect` and the record at `record`. For 0x79
+/// neither is read: the line names their addresses. Every stop before W5's
+/// stores leaves SPI0 as it was; 0x78 has put it back; and 0x7D and 0x7E
+/// say what was done to it (`write_caches`).
+func not_taken_line(name: String, stop: UInt, expect: UInt,
+                    record: UInt) unsafe {
+    write_str("SOS-S3: flash ")
+    write_str(name)
+    write_str(" not taken: ")
+    if stop == STOP_NOT_DRAM {
+        write_str("the description at 0x")
+        write_hex(expect as UInt32)
+        write_str(" or the record at 0x")
+        write_hex(record as UInt32)
+        write_str(" is not in DRAM")
+        write_byte(10)
+        return
+    }
+    let e = UnsafeMemory<FlashExpect, Normal>(expect).read()
+    let r = UnsafeMemory<FlashSwitchRecord, Normal>(record)
+    let read = r.read.read()
+    let command = r.flash.command.read()
+    let saved = r.flash.saved.read()
+    if stop == STOP_CLOCK {
+        write_str("the memory-SPI core clock is not the one the key is for:")
+        write_word("sysclk", r.sysclk.read())
+        write_word("cpu_per", r.cpu_per.read())
+        write_word("mspi_core", r.core_clk_sel.read())
+        write_str(", the description says")
+        write_word("sysclk", e.sysclk)
+        write_word("cpu_per", e.cpu_per)
+        write_word("mspi_core", e.core_clk_sel)
+        write_str(" under the masks 0x00080fff, 0x7 and 0x3")
+    } else if stop == STOP_SPI0 {
+        let b = r.before.read()
+        write_str("SPI0 is not as the ROM leaves it:")
+        write_word("clock", b.clock)
+        write_word("ctrl", b.ctrl)
+        write_word("user1", b.user1)
+        write_word("user2", b.user2)
+        write_word("ddr", b.ddr)
+        write_word("cali", b.cali)
+        write_word("din_mode", b.din_mode)
+        write_word("din_num", b.din_num)
+        write_str(", the description says")
+        write_word("clock", e.clock)
+        write_word("ctrl", e.ctrl)
+        write_word("user1", e.user1)
+        write_word("user2", e.user2)
+        write_str(" and 0 for the rest")
+    } else if stop == STOP_AUTOLOAD {
+        write_str("a cache autoload is on:")
+        write_word("icache", r.icache_autoload.read())
+        write_word("dcache", r.dcache_autoload.read())
+    } else if stop == STOP_GATE {
+        write_str("SPI1 MISC=0x")
+        write_hex(read)
+        write_str(" before command ")
+        write_hex_digits(command, 2)
+        write_str(", the flash's commands need chip select 0 alone ")
+        write_str("(0x00000002); nothing was sent")
+        write_put_back(saved)
+    } else if stop == STOP_DDR {
+        write_str("SPI1 DDR=0x")
+        write_hex(read)
+        write_str(" before command ")
+        write_hex_digits(command, 2)
+        write_str(", the flash's reads need single data rate (0); nothing ")
+        write_str("was sent")
+    } else if stop == STOP_BUSY {
+        write_str("SPI1 busy before command ")
+        write_hex_digits(command, 2)
+        write_str(", SPI_MEM_CMD=0x")
+        write_hex(read)
+        write_str(" after 100000 polls; nothing was sent")
+        write_put_back(saved)
+    } else if stop == STOP_STUCK {
+        write_str("SPI1 command ")
+        write_hex_digits(command, 2)
+        write_str(" did not finish, SPI_MEM_CMD=0x")
+        write_hex(read)
+        write_str(" after 100000 polls; halted")
+    } else if stop == STOP_ID {
+        write_str("the flash's JEDEC ID is 0x")
+        write_hex(read)
+        write_str(", the description says 0x")
+        write_hex(r.expect.read())
+        write_put_back(saved)
+    } else if stop == STOP_QE {
+        write_str("status register 2 is ")
+        write_hex_digits(read, 2)
+        write_str(", QE (bit 1) clear; QIO needs it set and this kernel ")
+        write_str("never writes it")
+        write_put_back(saved)
+    } else if stop == STOP_FREEZE || stop == STOP_THAW {
+        write_caches(&r.read())
+        if stop == STOP_THAW {
+            write_str("; halted")
+        }
+    } else if stop == STOP_CANARY {
+        write_str("the canary read 0x")
+        write_hex(read)
+        write_str(" at +")
+        write_hex_digits(r.at.read(), 2)
+        write_str(" where 0x")
+        write_hex(r.expect.read())
+        write_str(" was expected; SPI0 put back to the ROM's words")
+    } else {
+        write_str("code 0x")
+        write_hex(stop as UInt32)
+        write_str(", which this kernel does not name")
+    }
+    write_byte(10)
+}

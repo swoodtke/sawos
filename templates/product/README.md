@@ -41,11 +41,21 @@ An image chooses its board's build keys in `[keys]`: on the ESP32-S3,
 clock = "xtal40"
 ```
 
-builds its kernel to run the CPU at 40 MHz from the crystal. A board's keys
-and their values are listed in its `board.toml` in the sawos tree
-(`.sawos/hal/xtensa-esp32s3/board.toml`); a key an image leaves out keeps
-its default, on the ESP32-S3 the clock the ROM left (`rom`) and the console
-uncounted (`stall = "off"`).
+builds its kernel to run the CPU at 40 MHz from the crystal, and
+
+```toml
+[keys]
+clock = "pll240"
+flash = "dio80"
+```
+
+at 240 MHz with the cache reading the flash on two lines at 80 MHz; a
+flash key needs a clock key on the PLL, and the build refuses one without.
+A board's keys and their values are listed in its `board.toml` in the sawos
+tree (`.sawos/hal/xtensa-esp32s3/board.toml`); a key an image leaves out
+keeps its default, on the ESP32-S3 the clock the ROM left (`rom`), the
+flash read as the ROM left it (`flash = "rom"`) and the console uncounted
+(`stall = "off"`).
 
 `tools/sawos.py` needs Python 3.11 or later. It links `.sawos` to the sawos
 tree and runs that tree's `tools/product.py`, which says what each command

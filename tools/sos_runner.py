@@ -1724,9 +1724,10 @@ def _builder_only(case):
     """Refuse, on the runner's own image path, a case only the image builder
     can build: one that states `limits` or carries a hand-made `slab_block`,
     which this path's region tables cannot hold, a PSRAM harness's `psram`
-    description, which this path does not write, or an image for another
-    board of the S3 smoke (`board`), which this path does not stitch. A case
-    whose `limits` state the handle blocks (`handle-blocks` under `slabs`) or
+    description, or the flash switch harness's block (`flash_switch`),
+    which this path does not write, or an image for another board of the
+    S3 smoke (`board`), which this path does not stitch. A case whose
+    `limits` state the handle blocks (`handle-blocks` under `slabs`) or
     root's table (`root-handles`) is refused by that key's name."""
     limits = case.get("limits")
     if isinstance(limits, dict):
@@ -1740,7 +1741,7 @@ def _builder_only(case):
             raise ToolError(f"case {case['name']!r} states {keys} in its "
                             "`limits`, which only the image builder builds "
                             "(unset SOS_IMAGE_BUILDER=python)")
-    for key in ("limits", "slab_block", "psram", "board"):
+    for key in ("limits", "slab_block", "psram", "flash_switch", "board"):
         if case.get(key):
             raise ToolError(f"case {case['name']!r} has `{key}`, which only "
                             "the image builder builds (unset "
@@ -17859,14 +17860,15 @@ def _build_image_file(packager, profile, arch, case, env, board=False):
     image is named for the case.
 
     A build key is stated in one place: a description that states `[keys]`
-    for a case that names a key too (`"clock"` or `"console_stall"`, which
-    `--emit-flash CASE --clock KEY` sets) is refused, naming both, rather than
-    built at one of them (hal/xtensa-esp32s3/ABI.md §14d)."""
+    for a case that names a key too (`"clock"`, `"flash_key"` or
+    `"console_stall"`, which `--emit-flash CASE --clock KEY` and `--flash
+    KEY` set) is refused, naming both, rather than built at one of them
+    (hal/xtensa-esp32s3/ABI.md §14d)."""
     import tomllib
 
     description = os.path.join(TESTS_DIR, "images",
                                case["image_file"][arch["name"]])
-    named = [k for k in ("clock", "console_stall") if k in case]
+    named = [k for k in ("clock", "flash_key", "console_stall") if k in case]
     if named:
         with open(description, "rb") as f:
             stated = tomllib.load(f).get("keys")
@@ -18202,12 +18204,15 @@ def check_clock_registers(overrides=None):
 
 
 # The fault record `mspi.c` defines in its fault build. Only the fault
-# harnesses' emulator images may hold it, the PSRAM bring-up's and the flash
-# read's: a board image, or any other kernel, is refused.
+# harnesses' emulator images may hold it, the PSRAM bring-up's, the flash
+# read's and the flash switch's: a board image, or any other kernel, is
+# refused.
 PSRAM_FAULT_SYMBOL = "sos_psram_fault"
 PSRAM_FAULT_HARNESSES = (
     os.path.join(TESTS_DIR, "xtensa", "psram_fault.saw"),
     os.path.join(TESTS_DIR, "xtensa", "flash_fault.saw"),
+    os.path.join(TESTS_DIR, "xtensa", "flash_switch.saw"),
+    os.path.join(TESTS_DIR, "xtensa", "flash_key_halt.saw"),
 )
 
 
@@ -18482,6 +18487,15 @@ SPI1_BLOCK = (0x6000_2000, 0x6000_2400)
 SPI1_MISC = 0x6000_2034
 MISC_FLASH = 0x2
 
+# What the flash switch may store to (ABI.md §18e): SPI0's registers
+# (DR_REG_SPI0_BASE, one 1 KiB page), pads 27 and 28 (IO_MUX_GPIO27_REG,
+# IO_MUX_GPIO28_REG) and the input selects of signals 2 and 3
+# (GPIO_FUNC2_IN_SEL_CFG_REG, GPIO_FUNC3_IN_SEL_CFG_REG); and the two
+# caches' freeze words, EXTMEM_ICACHE_FREEZE_REG and EXTMEM_DCACHE_FREEZE_REG.
+SPI0_BLOCK = (0x6000_3000, 0x6000_3400)
+SWITCH_PADS = (0x6000_9070, 0x6000_9074, 0x6000_415C, 0x6000_4160)
+SWITCH_FREEZE = (0x600C_4154, 0x600C_4150)
+
 
 def _flash_case_asm(case, board):
     """A flash harness's case block, as assembly: the fault harness's words
@@ -18516,6 +18530,84 @@ def _flash_case_asm(case, board):
               "    .type sos_flash_case, @function",
               "sos_flash_case:",
               "    l32r a2, .Lsos_flash_case_lit",
+              "    ret",
+              '    .section .text.sos_flash_case_setup, "ax"']
+    if misc is not None:
+        lines += [f"    .literal .Lsos_flash_misc_addr, {SPI1_MISC:#x}",
+                  f"    .literal .Lsos_flash_misc_word, {misc:#x}"]
+    lines += ["    .align 4",
+              "    .global sos_flash_case_setup",
+              "    .type sos_flash_case_setup, @function",
+              "sos_flash_case_setup:"]
+    if misc is not None:
+        lines += ["    l32r a2, .Lsos_flash_misc_addr",
+                  "    l32r a3, .Lsos_flash_misc_word",
+                  "    s32i a3, a2, 0",
+                  "    memw"]
+    lines += ["    ret", ""]
+    return "\n".join(lines)
+
+
+# The flash switch harness's block (`flash_switch.saw`'s `CaseBlock`, ABI.md
+# §18f): the switch's mode by its key's name (`mspi.c`'s MODE_QUAD bit 0,
+# MODE_HALF bit 1); the description's words, in `s3flashkit`'s `FlashExpect`
+# order, any of which a case replaces; the table of lies' room; and the
+# room for the description and the record after the block.
+FLASH_SWITCH_MODES = {"dio80": 0, "qio80": 1, "dio40": 2, "qio40": 3}
+FLASH_SWITCH_EXPECT = ("sysclk", "cpu_per", "core_clk_sel", "jedec", "clock",
+                       "ctrl", "user1", "user2")
+FLASH_SWITCH_FAULT_WORDS = 16
+FLASH_SWITCH_EXPECT_BYTES = 32
+FLASH_SWITCH_RECORD_BYTES = 224
+
+
+def _flash_switch_case_asm(case, board):
+    """The flash switch harness's case block, as assembly, in `.data`
+    (DRAM): the case's `flash_switch` spec as `flash_switch.saw`'s
+    `CaseBlock` lays it out, room for the description and the record, and
+    `sos_flash_switch_case`, which answers the block's address; and
+    `sos_flash_case_setup`, which stores the spec's `misc` (`MISC_FLASH`
+    unless it says otherwise; None stores nothing) to SPI_MEM_MISC(1) as
+    `_flash_case_asm`'s does. The spec names its `mode` by key, the part's
+    description with `part`, replaced words by name in `expect`, the
+    description's and the record's addresses in `expect_at` and
+    `record_at`, and its lies in `faults`, each a `step`, `command`, `addr`
+    and `value` (an absent one: any, or 0; an `addr` of 0xCA0000NN, the
+    canary's byte NN, which the harness places)."""
+    spec = case["flash_switch"]
+    misc = None if board else spec.get("misc", MISC_FLASH)
+    replaced = spec.get("expect", {})
+    faults = spec.get("faults", [])
+    if len(faults) > FLASH_SWITCH_FAULT_WORDS:
+        raise ToolError(f"{case['name']}: {len(faults)} lies, more than the "
+                        f"table's {FLASH_SWITCH_FAULT_WORDS}")
+    unknown = [k for k in replaced if k not in FLASH_SWITCH_EXPECT]
+    if unknown:
+        raise ToolError(f"{case['name']}: no description word {unknown}")
+    words = [FLASH_SWITCH_MODES[spec["mode"]], 1 if spec.get("part") else 0,
+             sum(1 << i for i, k in enumerate(FLASH_SWITCH_EXPECT)
+                 if k in replaced)]
+    words += [replaced.get(k, 0) for k in FLASH_SWITCH_EXPECT]
+    words += [spec.get("expect_at", 0), spec.get("record_at", 0), len(faults)]
+    for i in range(FLASH_SWITCH_FAULT_WORDS):
+        lie = faults[i] if i < len(faults) else {}
+        words += [lie.get(k, 0) for k in ("step", "command", "addr", "value")]
+    lines = ["/* Written by tools/sos_runner.py: the flash switch harness's "
+             "case block (ABI.md §18f). */",
+             '    .section .data.sos_flash_switch_case_block, "aw"',
+             "    .balign 4",
+             "sos_flash_switch_case_block:"]
+    lines += [f"    .word {w:#x}" for w in words]
+    lines += [f"    .space {FLASH_SWITCH_EXPECT_BYTES}",
+              f"    .space {FLASH_SWITCH_RECORD_BYTES}",
+              '    .section .text.sos_flash_switch_case, "ax"',
+              "    .literal .Lsos_flash_switch_case_lit, "
+              "sos_flash_switch_case_block",
+              "    .align 4",
+              "    .global sos_flash_switch_case",
+              "    .type sos_flash_switch_case, @function",
+              "sos_flash_switch_case:",
+              "    l32r a2, .Lsos_flash_switch_case_lit",
               "    ret",
               '    .section .text.sos_flash_case_setup, "ax"']
     if misc is not None:
@@ -18576,9 +18668,9 @@ ESP32S3_MAGIC_OFFSET = 0x400
 ESP32S3_MAGIC = 0xAEDB041D
 
 # The S3's default build keys: the ROM's clock, the console's stall count
-# off, the PSRAM command layer's own build, not its fault build, and the
-# `esp32s3` board, not `esp32s3-r8`.
-ESP32S3_DEFAULT_KEYS = ("rom", False, False, False)
+# off, the PSRAM command layer's own build, not its fault build, the
+# `esp32s3` board, not `esp32s3-r8`, and the flash as the ROM reads it.
+ESP32S3_DEFAULT_KEYS = ("rom", False, False, False, "rom")
 
 # The `xtal40` clock line as the emulator prints it, in two parts around
 # its two measured speeds, which follow host time and are not asserted.
@@ -18653,10 +18745,10 @@ def _esp32s3_tools():
 def _esp32s3_module_paths(key):
     """The S3 kernel's module paths at the build keys `key`, (clock, whether
     the console counts its stalls, whether the PSRAM's command layer is its
-    fault build, and whether the board is `esp32s3-r8`): `_esp32s3_smoke`
-    says what each is. The `esp32s3-r8` board's `hal` is its facade, which
-    reaches the S3 HAL as `s3hal`."""
-    clock, stall, r8 = key[0], key[1], key[3]
+    fault build, whether the board is `esp32s3-r8`, and the flash key):
+    `_esp32s3_smoke` says what each is. The `esp32s3-r8` board's `hal` is its
+    facade, which reaches the S3 HAL as `s3hal`."""
+    clock, stall, r8, flash = key[0], key[1], key[3], key[4]
     s3_hal = os.path.join(HAL_DIR, "xtensa-esp32s3")
     keys_dir = os.path.join(s3_hal, "keys")
     hal = [f"hal={os.path.join(s3_hal, 'kernel')}"]
@@ -18668,7 +18760,9 @@ def _esp32s3_module_paths(key):
             tc().module_path_arg("imgformat"), SOSRT_MODULE,
             SOSABI_MODULE,
             f"s3clock={os.path.join(keys_dir, 'clock-' + clock)}",
+            f"s3flash={os.path.join(keys_dir, 'flash-' + flash)}",
             f"s3clockkit={os.path.join(keys_dir, 'clock-common')}",
+            f"s3flashkit={os.path.join(keys_dir, 'flash-common')}",
             f"s3dbias={os.path.join(s3_hal, 'dbias', 'src')}",
             "s3stall=" + os.path.join(
                 keys_dir, "stall-on" if stall else "stall-off")]
@@ -18836,13 +18930,14 @@ def _pwm_driver_plan(quota):
                           {"tag": 5, "source": "outlet", "from": 0}]}]}
 
 
-def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
+def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
+                   emit_flash=None):
     """The ESP32-S3 board smoke: Xtensa, call0, the `Flat` tier. Returns the
     process exit status. `wanted` is the `--case` names (underscored), or
     empty for every case. `emit`, a case name, builds that case's board image
     into `emit_out` instead of running anything, at the clock key
     `emit_clock` when one is given (`--clock`) and at the case's own
-    otherwise.
+    otherwise, and the same way at the flash key `emit_flash` (`--flash`).
 
     It is not part of `make sos-test`: `make sos-smoke-esp32s3` runs it
     against the Espressif QEMU, beside the C3's smoke and on the same terms.
@@ -18876,10 +18971,12 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     transcript is asserted in order as well. A run that never reaches the
     door is killed at the deadline and fails.
 
-    Each image is built at its build keys: two modules the HAL imports and
+    Each image is built at its build keys: three modules the HAL imports and
     the runner maps to a directory under `hal/xtensa-esp32s3/keys/`, the CPU
-    clock (`"clock"`, `rom` unless a case says otherwise; ABI.md §14) and the
-    console's stall count (`"console_stall"`, off unless a case asks); and
+    clock (`"clock"`, `rom` unless a case says otherwise; ABI.md §14), how
+    the cache reads the flash (`"flash_key"`, `rom` unless a case says
+    otherwise; ABI.md §18d) and the console's stall count
+    (`"console_stall"`, off unless a case asks); and
     the PSRAM command layer's fault build (`"psram_fault"`, `mspi.c` with
     `-DSOS_PSRAM_FAULT`; ABI.md §16e). A key changes the kernel's compile, so
     each combination the cases use is its own profile, with its own build
@@ -18933,6 +19030,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # (`keys/clock-common`), mapped for every image and compiled only into
     # one whose key imports it (`_esp32s3_module_paths`).
     clock_keys = _board_key_values("xtensa-esp32s3", "clock")
+    flash_keys = _board_key_values("xtensa-esp32s3", "flash")
     # The LDO settings from the eFuse, for every image: plain Saw that only
     # an image whose source imports it compiles.
     s3_dbias_dir = os.path.join(s3_hal, "dbias", "src")
@@ -18940,21 +19038,24 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     def variant(case):
         """A case's build keys: its clock, whether the console counts its
         stalls, whether the PSRAM's command layer is its fault build
-        (`psram_fault`, `mspi.c` compiled with `-DSOS_PSRAM_FAULT`), and
-        whether its board is `esp32s3-r8` (`board`, `"r8"`)."""
+        (`psram_fault`, `mspi.c` compiled with `-DSOS_PSRAM_FAULT`), whether
+        its board is `esp32s3-r8` (`board`, `"r8"`), and its flash key
+        (`flash_key`, `rom` unless a case says otherwise)."""
         return (case.get("clock", "rom"), bool(case.get("console_stall")),
-                bool(case.get("psram_fault")), case.get("board") == "r8")
+                bool(case.get("psram_fault")), case.get("board") == "r8",
+                case.get("flash_key", "rom"))
 
     def variant_arch(key):
         """The arch entry an image at these keys builds under: its board's,
         with a build directory of the keys' own unless they are the
         board's defaults."""
-        clock, stall, fault, r8 = key
+        clock, stall, fault, r8, flash = key
         board = ESP32S3_R8_ARCH if r8 else arch
-        if key[:3] == ("rom", False, False):
+        if (clock, stall, fault, flash) == ("rom", False, False, "rom"):
             return board
         tag = (f"{board['build_tag']}-{clock}" + ("-stall" if stall else "")
-               + ("-fault" if fault else ""))
+               + ("-fault" if fault else "")
+               + (f"-flash-{flash}" if flash != "rom" else ""))
         return dict(board, build_tag=tag)
 
     def case_arch(case):
@@ -19238,6 +19339,36 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                        f"expected at store {at}: made {show(made[at:at + 4])}"
                        f", expected {show(want[at:at + 4])} ({len(made)} "
                        f"made, {len(want)} expected)")
+
+    def check_switch_stores(case, stores):
+        """Hold a traced run to its case's `expect_switch_stores`, the whole
+        list of (address, value) stores the kernel made, from its first
+        store on and in order, to SPI0's registers (`SPI0_BLOCK`), pads 27
+        and 28 and their input selects (`SWITCH_PADS`) and the caches'
+        freeze words (`SWITCH_FREEZE`): the flash switch's stores between
+        its freeze and its unfreeze, and any put-back. Returns (ok,
+        reason)."""
+        first = next((i for i, x in enumerate(stores)
+                      if x == kernel_first_store), None)
+        if first is None:
+            return False, ("no store of the kernel's: the watchdog key "
+                           "`_start` writes first is missing")
+        made = [(a, v) for a, v in stores[first:]
+                if SPI0_BLOCK[0] <= a < SPI0_BLOCK[1] or a in SWITCH_PADS
+                or a in SWITCH_FREEZE]
+        want = case["expect_switch_stores"]
+        if made == want:
+            return True, ""
+        at = next((i for i, (x, y) in enumerate(zip(made, want)) if x != y),
+                  min(len(made), len(want)))
+
+        def show(pairs):
+            return [f"{a:#010x}={v:#010x}" for a, v in pairs]
+        return False, (f"the kernel's stores to SPI0 and the flash's pads "
+                       f"differ from the expected at store {at}: made "
+                       f"{show(made[at:at + 4])}, expected "
+                       f"{show(want[at:at + 4])} ({len(made)} made, "
+                       f"{len(want)} expected)")
 
     def check_stores(case, stores):
         """Hold a traced run to its case's `expect_stores`, (address, value)
@@ -20485,6 +20616,19 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             spi1_as_before],
             fault={"step": 0x04, "addr": spi1_cmd, "value": 0x40000,
                    "count": every_time}),
+        # S0.3 compares CORE_CLK_SEL's [1:0] alone: read with every bit
+        # above them set, the bring-up runs on through S8.
+        {
+            "name": "psram_core_clk_sel_masked",
+            "src": os.path.join(s3_tests, "psram_fault.saw"),
+            "psram": {"fault": {"step": 0x03, "addr": 0x6000_30EC,
+                                "value": 0xFFFF_FFFC, "count": every_time}},
+            "psram_fault": True,
+            "flash_commands": flash_once,
+            "expect_out": [rom, "SOS psram: fault hits=0x00000001 starts=",
+                           spi1_as_before, halt_pass],
+            "expect_clean_exit": True,
+        },
         # 0x55: ECC on at S3, and still on after the clear.
         fault_stop("psram_stop_ecc", 0x55, [
             "SOS-S3: psram stop: SYSCON_SRAM_ACE0_ATTR = 0x000001ff still has "
@@ -20685,9 +20829,12 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         {"name": "iram_mutant_script", "iram_mutant": "SCRIPT",
          "expect_finding": "sos_psram_bringup is at 0x42",
          "expect_out": [], "expect_clean_exit": True},
-        # The flash's read, held as the bring-up is.
+        # The flash's read and its switch, held as the bring-up is.
         {"name": "iram_mutant_script_flash", "iram_mutant": "SCRIPT",
          "expect_finding": "sos_flash_read is at 0x42",
+         "expect_out": [], "expect_clean_exit": True},
+        {"name": "iram_mutant_script_switch", "iram_mutant": "SCRIPT",
+         "expect_finding": "sos_flash_switch is at 0x42",
          "expect_out": [], "expect_clean_exit": True},
     ]
 
@@ -21029,6 +21176,813 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             ("rom_flash_reference_drom", f".drom holds {rom_entry}"),
             ("rom_flash_reference_iram", f".iram holds {rom_entry}"))],
     ]
+
+    # The flash switch (ABI.md §18e, §18f). The shipping kernel at each flash
+    # key boots on the emulator to its first read, whose gate stops it: the
+    # emulator's MISC(1) reads 0, where the part's ROM leaves chip select 0
+    # alone (§18b), and nothing in the kernel writes MISC(1). So the switch
+    # is not taken, nothing is stored to SPI0, SPI1 or the pads, and the boot
+    # goes on at the ROM's slow read. On the part each is a board stage
+    # (`--emit-flash`, §18g).
+    def flash_gate_line(key):
+        return (f"SOS-S3: flash {key} not taken: SPI1 MISC=0x00000000 before "
+                "command 0x9f, the flash's commands need chip select 0 alone "
+                "(0x00000002); nothing was sent")
+    kernel_cases += [{
+        "name": f"boot_flash_{key}",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "clock": "pll80",
+        "flash_key": key,
+        "flash_commands": ["0xab"],
+        "expect_spi1_stores": [],
+        "expect_switch_stores": [],
+        "expect_out": [rom, *clock_pll80_lines, flash_gate_line(key), banner,
+                       "SOS: bad root image: no root image appended",
+                       "SOS-S3: halt fail code=0x00000004"],
+        "expect_clean_exit": False,
+        "expect_status": 4,
+    } for key in ("dio80", "qio80", "dio40", "qio40")]
+    # A flash key but `rom` needs a clock key on the PLL: at `rom` or
+    # `xtal40` the kernel's compile stops at the key's assertion.
+    kernel_cases += [{
+        "name": f"flash_key_{key}_at_{clock}_refused",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "clock": clock,
+        "flash_key": key,
+        "expect_build_error": f"{key} needs a clock key on the PLL: pll80, "
+                              "pll160 or pll240",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    } for key, clock in (("dio80", "rom"), ("qio80", "xtal40"),
+                         ("dio40", "xtal40"), ("qio40", "rom"))]
+
+    # The switch through its harness (`flash_switch.saw`), with the part's
+    # MISC(1) word set up first and the reads the emulator cannot answer as
+    # the part does lied to (`flash_switch`'s `faults`). Each case holds the
+    # console, the flash's commands, every store the kernel made to SPI1
+    # (`expect_spi1_stores`) and every one to SPI0, pads 27 and 28 and
+    # their input selects (`expect_switch_stores`), in order, and that no
+    # other of the flash bus's pads or the PSRAM's signals was stored to.
+    spi0_reg = {name: 0x6000_3000 + offset for name, offset in (
+        ("ctrl", 0x08), ("ctrl2", 0x10), ("clock", 0x14), ("user", 0x18),
+        ("user1", 0x1C), ("user2", 0x20), ("cali", 0xA8), ("din_mode", 0xAC),
+        ("din_num", 0xB0), ("ddr", 0xE0))}
+    pad27, pad28, insel2, insel3 = SWITCH_PADS
+    spi1_w0 = 0x6000_2058
+    switch_untouched = ([0x6000_9004 + 4 * pad
+                         for pad in (26, 29, 30, 31, 32, 33, 34, 35, 36, 37)]
+                        + [0x6000_4154 + 4 * sig for sig in range(7, 12)])
+    switch_reads = misc_setup + flash_stores(0x9F) + flash_stores(0x35)
+    switch_heard = ["0xab", "0x9f", "0x35", "0x0"]
+    switch_spi1_as_before = ("SOS flashswitch: SPI1 MISC=0x00000002 "
+                             "clock=0x00030103 after the reads, as before "
+                             "them")
+    # Status register 2 read with QE set, and the JEDEC ID read as the
+    # part's (0x20 0x40 0x17, first byte in [7:0]): W0(1) at S7.10 in the
+    # switch's second command and its first.
+    qe_set = {"step": 0x7A, "command": 2, "addr": spi1_w0, "value": 0x02}
+    part_id = {"step": 0x7A, "command": 1, "addr": spi1_w0,
+               "value": 0x0017_4020}
+    # The part's words where the emulator reads 0 (§18c, F0), for W2: the
+    # clock words at `pll80`, then SPI0, the pads and the input selects.
+    part_words = [
+        {"step": 0xE1, "addr": 0x600C_0060, "value": 0x000A_8400},
+        {"step": 0xE1, "addr": 0x600C_0010, "value": 0x0000_000C},
+        *[{"step": 0xE2, "addr": addr, "value": value}
+          for addr, value in ((spi0_reg["clock"], 0x0003_0103),
+                              (spi0_reg["ctrl"], 0x0020_0000),
+                              (spi0_reg["ctrl2"], 0x0000_2C41),
+                              (spi0_reg["user"], 0x0000_00C0),
+                              (spi0_reg["user1"], 0x5C00_0007),
+                              (spi0_reg["user2"], 0x7000_0003),
+                              (pad27, 0x0000_1B00), (pad28, 0x0000_1B00),
+                              (insel2, 0x0000_003C), (insel3, 0x0000_003C))],
+        part_id]
+
+    # W5's freeze of both caches and their unfreeze as the emulator answers
+    # them (§18e): each freeze word read 0, FREEZE_MODE cleared in one
+    # store and FREEZE_ENA set in a second, the instruction cache's first;
+    # then, after the stores, each read with FREEZE_DONE and FREEZE_ENA set
+    # and stored with FREEZE_ENA clear.
+    icache_freeze, dcache_freeze = SWITCH_FREEZE
+    caches_frozen = [(icache_freeze, 0x0), (icache_freeze, 0x1),
+                     (dcache_freeze, 0x0), (dcache_freeze, 0x1)]
+    caches_thawed = [(icache_freeze, 0x4), (dcache_freeze, 0x4)]
+
+    def switch_stores(key, words=None):
+        """The switch's stores for the key `key` from the words W2 read
+        (`words`, by name, 0 for any not named), in order, between the
+        caches' freeze and their unfreeze (§18e)."""
+        w = dict.fromkeys(("clock", "ctrl", "ctrl2", "user", "user1",
+                           "user2", "pad27", "pad28", "insel2", "insel3"), 0)
+        w.update(words or {})
+        quad = key.startswith("qio")
+        ctrl = w["ctrl"] | 0x000C_0008
+        made = [(spi0_reg["ctrl"], ctrl)]
+        if w["ctrl2"] & 0x3FF:
+            made.append((spi0_reg["ctrl2"], w["ctrl2"] & ~0x3FF))
+        if quad:
+            made += [(pad27, w["pad27"] & ~0x7000),
+                     (pad28, w["pad28"] & ~0x7000),
+                     (insel2, w["insel2"] & ~0x80),
+                     (insel3, w["insel3"] & ~0x80)]
+        made += [(spi0_reg["ctrl"], (ctrl & 0xFE6F_9C0F)
+                  | (0x0100_2000 if quad else 0x0080_2000)),
+                 (spi0_reg["user"], (w["user"] & 0xF7FF_FFFF) | 0x7000_0000),
+                 (spi0_reg["user1"], (w["user1"] & 0x03FF_FFC0) | 0x5C00_0000
+                  | (5 if quad else 3)),
+                 (spi0_reg["user2"], (w["user2"] & 0xFFFF_0000)
+                  | (0xEB if quad else 0xBB)),
+                 (spi0_reg["clock"], 0x0001_0001 if key.endswith("40")
+                  else 0x8000_0000)]
+        return caches_frozen + made + caches_thawed
+
+    def put_back_words(key, words=None):
+        """W7's stores of SPI0's words, the pads and the input selects:
+        every word W5 stored, back to what W2 read, the clock first."""
+        w = dict.fromkeys(("clock", "ctrl", "ctrl2", "user", "user1",
+                           "user2", "pad27", "pad28", "insel2", "insel3"), 0)
+        w.update(words or {})
+        made = [(spi0_reg[n], w[n]) for n in ("clock", "user2", "user1",
+                                              "user", "ctrl")]
+        if key.startswith("qio"):
+            made += [(insel2, w["insel2"]), (insel3, w["insel3"]),
+                     (pad27, w["pad27"]), (pad28, w["pad28"])]
+        if w["ctrl2"] & 0x3FF:
+            made.append((spi0_reg["ctrl2"], w["ctrl2"]))
+        return made
+
+    def switch_put_back(key, words=None):
+        """The stores the switch's W7 makes after a canary that read wrong:
+        `put_back_words`, between the caches' freeze and their unfreeze as
+        for W5."""
+        return caches_frozen + put_back_words(key, words) + caches_thawed
+
+    part_named = {"clock": 0x0003_0103, "ctrl": 0x0020_0000,
+                  "ctrl2": 0x0000_2C41, "user": 0x0000_00C0,
+                  "user1": 0x5C00_0007, "user2": 0x7000_0003,
+                  "pad27": 0x0000_1B00, "pad28": 0x0000_1B00,
+                  "insel2": 0x0000_003C, "insel3": 0x0000_003C}
+
+    def switch_line(key, jedec, sr2, before=None, after=None):
+        """The switch's line when taken, up to its first timed read, which
+        is not asserted: the words before as `before` names them, 0 for any
+        not named, and after as `after` names them, else as the emulator
+        reads them back, 0."""
+        b = dict.fromkeys(("clock", "ctrl", "ctrl2", "user", "user1",
+                           "user2", "pad27", "pad28", "insel2", "insel3"), 0)
+        b.update(before or {})
+        a = dict.fromkeys(b, 0)
+        a.update(after or {})
+        names = ["clock", "ctrl", "ctrl2", "user", "user1", "user2"]
+        if key.startswith("qio"):
+            names += ["pad27", "pad28", "insel2", "insel3"]
+        words = " ".join(f"{n}=0x{b[n]:08x}->0x{a[n]:08x}" for n in names)
+        return (f"SOS-S3: flash {key} jedec=0x{jedec:08x} sr2=0x{sr2:02x} "
+                f"{words} canary=ok read4k=")
+
+    def switch_counts(starts, w0_reads, hits):
+        return (f"SOS flashswitch: starts=0x{starts:08x} "
+                f"w0_reads=0x{w0_reads:08x} table_hits=0x{hits:08x}")
+
+    def switch_case(name, key, lines, stores, spi1=None, heard=None,
+                    stop=None, after_clock=False, **spec):
+        """The switch at `key` through its harness, at `pll80`: the clock
+        key's line, `lines`, then the halt, a pass or `stop`'s fail. With
+        `after_clock`, `lines`' first begins where the clock key's line
+        ends."""
+        lines = list(lines)
+        clock = list(clock_pll80_lines)
+        if after_clock:
+            clock[-1] += lines.pop(0)
+        return {
+            "name": name,
+            "src": os.path.join(s3_tests, "flash_switch.saw"),
+            "clock": "pll80",
+            "psram_fault": True,
+            "flash_switch": dict(spec, mode=key),
+            "flash_commands": switch_heard if heard is None else heard,
+            "expect_spi1_stores": switch_reads if spi1 is None else spi1,
+            "expect_switch_stores": stores,
+            "device_untouched": switch_untouched,
+            "expect_out": [rom, *clock, *lines,
+                           halt_pass if stop is None
+                           else f"SOS-S3: halt fail code={stop:#010x}"],
+            "expect_clean_exit": stop is None,
+            **({} if stop is None else {"expect_status": stop}),
+        }
+
+    def switch_stop(name, stop, line, stores=(), spi1=None, heard=None,
+                    counts=(0, 0, 0), spi1_line=switch_spi1_as_before,
+                    key="dio80", whole=True, **spec):
+        """The switch at `key` stopping at `stop`: its lines `line` (one, or
+        a list), held whole: right after the clock key's line, each ending
+        at its newline, nothing between them and nothing after the last but
+        the harness's own lines. With `whole` false, `line` is the parts of
+        one line, matched in order."""
+        parts = line if isinstance(line, list) else [line]
+        if whole:
+            parts = ["\n".join(parts) + "\n"]
+        return switch_case(
+            name, key, [*parts, switch_counts(*counts), spi1_line],
+            list(stores), spi1=misc_setup if spi1 is None else spi1,
+            heard=["0xab"] if heard is None else heard, stop=stop,
+            after_clock=whole, **spec)
+
+    def not_taken(key, why):
+        return f"SOS-S3: flash {key} not taken: {why}"
+
+    kernel_cases += [
+        # Each key taken on the emulator's words: DIO with no lie, QIO with
+        # status register 2 read with QE set. Every store W5 makes, in order,
+        # and the canary read whole.
+        *[switch_case(
+            f"flash_switch_{key}", key,
+            [switch_line(key, FLASH_EMULATOR_JEDEC,
+                         2 if key.startswith("qio") else 0),
+             "us->", "us\n",
+             switch_counts(2, 2, 1 if key.startswith("qio") else 0),
+             switch_spi1_as_before],
+            switch_stores(key),
+            faults=[qe_set] if key.startswith("qio") else [])
+          for key in ("dio80", "qio80", "dio40", "qio40")],
+        # The same against the part's description, W2's reads lied to with
+        # the words F0 read on the part: the stores are §18e's for the part,
+        # word for word.
+        *[switch_case(
+            f"flash_switch_part_words_{key}", key,
+            [switch_line(key, FLASH_PART_JEDEC,
+                         2 if key.startswith("qio") else 0, part_named),
+             "us->", "us\n",
+             switch_counts(2, 2, 14 if key.startswith("qio") else 13),
+             switch_spi1_as_before],
+            switch_stores(key, part_named), part=True,
+            faults=part_words + ([qe_set] if key.startswith("qio") else []))
+          for key in ("dio80", "qio80")],
+        # 0x77: QIO with status register 2 as the emulator reads it, 0:
+        # both reads sent, nothing stored.
+        switch_stop(
+            "flash_switch_qio80_qe_clear", 0x77,
+            not_taken("qio80", "status register 2 is 0x00, QE (bit 1) "
+                      "clear; QIO needs it set and this kernel never writes "
+                      "it; SPI1 put back"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 0),
+            key="qio80"),
+        # 0x79: the description, then the record, in flash and past DRAM's
+        # end. Nothing read, nothing stored.
+        *[switch_stop(name, 0x79, line, whole=False, **where)
+          for name, line, where in (
+              ("flash_switch_stop_description_in_flash",
+               [not_taken("dio80", "the description at 0x3c200000 or the "
+                          "record at 0x"), " is not in DRAM"],
+               {"expect_at": 0x3C20_0000}),
+              ("flash_switch_stop_description_past_dram",
+               [not_taken("dio80", "the description at 0x3fcffff0 or the "
+                          "record at 0x"), " is not in DRAM"],
+               {"expect_at": 0x3FCF_FFF0}),
+              ("flash_switch_stop_record_in_flash",
+               [not_taken("dio80", "the description at 0x"),
+                " or the record at 0x3c200000 is not in DRAM"],
+               {"record_at": 0x3C20_0000}),
+              ("flash_switch_stop_record_past_dram",
+               [not_taken("dio80", "the description at 0x"),
+                " or the record at 0x3fcfff40 is not in DRAM"],
+               {"record_at": 0x3FCF_FF40}))],
+        # 0x70: each clock word described otherwise than the emulator reads
+        # it.
+        *[switch_stop(
+            f"flash_switch_stop_clock_{word}", 0x70,
+            not_taken("dio80", "the memory-SPI core clock is not the one the "
+                      "key is for: sysclk=0x000a8401 cpu_per=0x00000000 "
+                      "mspi_core=0x00000000, the description says "
+                      f"sysclk=0x{described['sysclk']:08x} "
+                      f"cpu_per=0x{described['cpu_per']:08x} "
+                      f"mspi_core=0x{described['core_clk_sel']:08x} under "
+                      "the masks 0x00080fff, 0x7 and 0x3"),
+            expect={word: described[word]})
+          for word, described in (
+              ("sysclk", {"sysclk": 0x0008_0400, "cpu_per": 0,
+                          "core_clk_sel": 0}),
+              ("cpu_per", {"sysclk": 0x0008_0401, "cpu_per": 4,
+                           "core_clk_sel": 0}),
+              ("core_clk_sel", {"sysclk": 0x0008_0401, "cpu_per": 0,
+                                "core_clk_sel": 1}))],
+        # 0x71: each of SPI0's words W2 compares read otherwise: the four
+        # the description names, and the four that must read 0.
+        *[switch_stop(
+            f"flash_switch_stop_spi0_{word}", 0x71,
+            not_taken("dio80", "SPI0 is not as the ROM leaves it: " + " ".join(
+                f"{n}=0x{value if n == word else 0:08x}"
+                for n in ("clock", "ctrl", "user1", "user2", "ddr", "cali",
+                          "din_mode", "din_num"))
+                + ", the description says clock=0x00000000 ctrl=0x00000000 "
+                "user1=0x00000000 user2=0x00000000 and 0 for the rest"),
+            counts=(0, 0, 1),
+            faults=[{"step": 0xE2, "addr": spi0_reg[word], "value": value}])
+          for word, value in (("clock", 0x0003_0103), ("ctrl", 0x0000_2000),
+                              ("user1", 0x5C00_0007), ("user2", 0x7000_0003),
+                              ("ddr", 1), ("cali", 1), ("din_mode", 1),
+                              ("din_num", 1))],
+        # 0x72: each cache's autoload word read with AUTOLOAD_ENA set.
+        *[switch_stop(
+            f"flash_switch_stop_autoload_{cache}", 0x72,
+            not_taken("dio80", "a cache autoload is on: "
+                      f"icache=0x{0xC if cache == 'icache' else 8:08x} "
+                      f"dcache=0x{0xC if cache == 'dcache' else 8:08x}"),
+            counts=(0, 0, 1),
+            faults=[{"step": 0xE3, "addr": addr, "value": 0xC}])
+          for cache, addr in (("icache", 0x600C_40A0),
+                              ("dcache", 0x600C_404C))],
+        # 0x73: the first read's gate, MISC(1) set up as the PSRAM's.
+        switch_stop(
+            "flash_switch_stop_gate", 0x73,
+            not_taken("dio80", "SPI1 MISC=0x00000001 before command 0x9f, "
+                      "the flash's commands need chip select 0 alone "
+                      "(0x00000002); nothing was sent"),
+            spi1=[(spi1_reg["misc"], 0x1)],
+            spi1_line=("SOS flashswitch: SPI1 MISC=0x00000001 "
+                       "clock=0x00030103 after the reads, as before them"),
+            misc=0x1),
+        # 0x7B: the first read's DDR(1) read with DDR_EN set.
+        switch_stop(
+            "flash_switch_stop_ddr", 0x7B,
+            not_taken("dio80", "SPI1 DDR=0x00000001 before command 0x9f, "
+                      "the flash's reads need single data rate (0); nothing "
+                      "was sent"),
+            counts=(0, 0, 1),
+            faults=[{"step": 0xF2, "addr": spi1_reg["ddr"], "value": 1}]),
+        # 0x74: SPI1 busy before the first read, and in the second read's
+        # S7.1, after it has saved SPI1, which it puts back.
+        switch_stop(
+            "flash_switch_stop_busy", 0x74,
+            not_taken("dio80", "SPI1 busy before command 0x9f, "
+                      "SPI_MEM_CMD=0x00040000 after 100000 polls; nothing "
+                      "was sent"),
+            counts=(0, 0, 100000),
+            faults=[{"step": 0xF3, "addr": spi1_reg["cmd"],
+                     "value": 0x40000}]),
+        switch_stop(
+            "flash_switch_stop_busy_second_read", 0x74,
+            not_taken("dio80", "SPI1 busy before command 0x35, "
+                      "SPI_MEM_CMD=0x00040000 after 100000 polls; nothing "
+                      "was sent; SPI1 put back"),
+            spi1=misc_setup + flash_stores(0x9F) + spi1_booted,
+            heard=["0xab", "0x9f"], counts=(1, 1, 100000),
+            faults=[{"step": 0x71, "command": 2, "addr": spi1_reg["cmd"],
+                     "value": 0x40000}]),
+        # 0x75: the ID's read never finishes. The read's line from IRAM, the
+        # switch's, and SPI1 left as the read set it.
+        switch_stop(
+            "flash_switch_stop_not_finished", 0x75,
+            ["SOS-S3: flash: SPI1 command 0x9f did not finish",
+             not_taken("dio80", "SPI1 command 0x9f did not finish, "
+                       "SPI_MEM_CMD=0x00040000 after 100000 polls; halted")],
+            spi1=misc_setup + flash_stores(0x9F, put_back=False),
+            heard=["0xab", "0x9f"], counts=(1, 0, 100000),
+            spi1_line=("SOS flashswitch: SPI1 MISC=0x00000002 "
+                       "clock=0x00030103 after the reads, differing: "
+                       "ctrl=0x00208000->0x00200000 "
+                       "user=0x800000c0->0x900000c0 "
+                       "user1=0x5c000007->0x00000000 "
+                       "user2=0x70000000->0x7000009f "
+                       "miso_dlen=0x00000000->0x00000017"),
+            faults=[{"step": 0x79, "command": 1, "addr": spi1_reg["cmd"],
+                     "value": 0x40000}]),
+        # 0x76: the emulator's flash against the part's ID.
+        switch_stop(
+            "flash_switch_stop_identity", 0x76,
+            not_taken("dio80", "the flash's JEDEC ID is 0x00c84016, the "
+                      "description says 0x00204017; SPI1 put back"),
+            spi1=misc_setup + flash_stores(0x9F), heard=["0xab", "0x9f"],
+            counts=(1, 1, 0), expect={"jedec": FLASH_PART_JEDEC}),
+        # 0x78: the canary's first word read wrong, after every store: W7
+        # puts each word back, the clock first, and the line from IRAM comes
+        # before the switch's. DIO and QIO on the emulator's words, and QIO
+        # on the part's, whose CTRL2 W5 changed and W7 puts back.
+        *[switch_stop(
+            f"flash_switch_stop_canary_{name}", 0x78,
+            [f"SOS-S3: flash {key}: canary mismatch",
+             not_taken(key, "the canary read 0xdeadbeef at +0x00 where "
+                       "0xff00aa55 was expected; SPI0 put back to the ROM's "
+                       "words")],
+            stores=(switch_stores(key, words) + switch_put_back(key, words)),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, hits),
+            key=key, part=bool(words), faults=lies + [
+                {"step": 0xE6, "value": 0xDEAD_BEEF}])
+          for name, key, words, lies, hits in (
+              ("dio80", "dio80", None, [], 1),
+              ("qio80", "qio80", None, [qe_set], 2),
+              ("part_words_qio80", "qio80", part_named,
+               part_words + [qe_set], 15))],
+        # 0x7D at W5: a cache's freeze word read 0 throughout. Its freeze is
+        # undone, and the instruction cache's too when the data cache did
+        # not report; nothing is stored to SPI0.
+        *[switch_stop(
+            f"flash_switch_stop_freeze_{cache}", 0x7D,
+            not_taken("dio80", f"the {which} cache did not report its freeze "
+                      "done, its freeze word reading 0x00000000 after 100000 "
+                      "polls, and was unfrozen again; nothing was stored to "
+                      "SPI0"),
+            stores=frozen, spi1=switch_reads, heard=switch_heard,
+            counts=(2, 2, 100002),
+            faults=[{"step": 0xE5, "addr": addr, "value": 0x0}])
+          for cache, which, addr, frozen in (
+              ("icache", "instruction", icache_freeze,
+               caches_frozen[:2] + caches_thawed[:1]),
+              ("dcache", "data", dcache_freeze,
+               caches_frozen + caches_thawed[::-1]))],
+        # 0x7E at W5: a freeze not reported whose undo is not reported
+        # either, the instruction cache's own and, after the data cache's
+        # freeze, the instruction cache's: the line from the call, then the
+        # switch's, naming each.
+        switch_stop(
+            "flash_switch_stop_freeze_icache_undo", 0x7E,
+            ["SOS-S3: flash: a cache did not report its unfreeze",
+             not_taken("dio80", "the instruction cache did not report its "
+                       "freeze done, its freeze word reading 0x00000000 after "
+                       "100000 polls, and did not report the undo either, "
+                       "reading 0x00000005; nothing was stored to SPI0; "
+                       "halted")],
+            stores=caches_frozen[:2] + caches_thawed[:1], spi1=switch_reads,
+            heard=switch_heard, counts=(2, 2, 200003),
+            faults=[{"step": 0xE5, "addr": icache_freeze, "value": 0x0},
+                    {"step": 0xE7, "addr": icache_freeze, "value": 0x5}]),
+        switch_stop(
+            "flash_switch_stop_freeze_dcache_undo_icache", 0x7E,
+            ["SOS-S3: flash: a cache did not report its unfreeze",
+             not_taken("dio80", "the instruction cache did not report its "
+                       "unfreeze, its freeze word reading 0x00000005 after "
+                       "100000 polls; the data cache did not report its "
+                       "freeze done, its freeze word reading 0x00000000 "
+                       "after 100000 polls, and was unfrozen again; nothing "
+                       "was stored to SPI0; halted")],
+            stores=caches_frozen + caches_thawed[::-1], spi1=switch_reads,
+            heard=switch_heard, counts=(2, 2, 200003),
+            faults=[{"step": 0xE5, "addr": dcache_freeze, "value": 0x0},
+                    {"step": 0xE7, "addr": icache_freeze, "value": 0x5}]),
+        # 0x7E at W5: a cache's unfreeze after the stores not reported. Both
+        # unfreezes are tried; SPI0 is left switched and the canary is not
+        # read.
+        *[switch_stop(
+            name, 0x7E,
+            ["SOS-S3: flash: a cache did not report its unfreeze",
+             not_taken("dio80", f"the {which} cache did not report its "
+                       "unfreeze, its freeze word reading 0x00000005 after "
+                       "100000 polls; SPI0 left switched, the canary not "
+                       "read; halted")],
+            stores=switch_stores("dio80"), spi1=switch_reads,
+            heard=switch_heard, counts=(2, 2, 100001),
+            faults=[{"step": 0xE7, "addr": addr, "value": 0x5}])
+          for name, which, addr in (
+              ("flash_switch_stop_thaw", "instruction", icache_freeze),
+              ("flash_switch_stop_thaw_dcache", "data", dcache_freeze))],
+        # W7, after a canary that read wrong, at its own steps (0xEA, 0xEB):
+        # a cache's freeze not reported, undone, and SPI0 put back with the
+        # caches running (0x7D); and the instruction cache's unfreeze not
+        # reported after the put-back (0x7E). Each line names the canary's
+        # word and what was left.
+        *[switch_stop(
+            f"flash_switch_stop_w7_freeze_{cache}", 0x7D,
+            ["SOS-S3: flash dio80: canary mismatch",
+             not_taken("dio80", "the canary read 0xdeadbeef at +0x00 where "
+                       f"0xff00aa55 was expected; then the {which} cache did "
+                       "not report its freeze done, its freeze word reading "
+                       "0x00000000 after 100000 polls, and was unfrozen "
+                       "again; SPI0 put back to the ROM's words with the "
+                       "caches running")],
+            stores=switch_stores("dio80") + frozen + put_back_words("dio80"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 100003),
+            faults=[{"step": 0xE6, "value": 0xDEAD_BEEF},
+                    {"step": 0xEA, "addr": addr, "value": 0x0}])
+          for cache, which, addr, frozen in (
+              ("icache", "instruction", icache_freeze,
+               caches_frozen[:2] + caches_thawed[:1]),
+              ("dcache", "data", dcache_freeze,
+               caches_frozen + caches_thawed[::-1]))],
+        switch_stop(
+            "flash_switch_stop_w7_thaw", 0x7E,
+            ["SOS-S3: flash dio80: canary mismatch",
+             "SOS-S3: flash: a cache did not report its unfreeze",
+             not_taken("dio80", "the canary read 0xdeadbeef at +0x00 where "
+                       "0xff00aa55 was expected; then the instruction cache "
+                       "did not report its unfreeze, its freeze word reading "
+                       "0x00000005 after 100000 polls; SPI0 put back to the "
+                       "ROM's words; halted")],
+            stores=switch_stores("dio80") + switch_put_back("dio80"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 100002),
+            faults=[{"step": 0xE6, "value": 0xDEAD_BEEF},
+                    {"step": 0xEB, "addr": icache_freeze, "value": 0x5}]),
+        # Status register 2 every bit but QE, at qio80; QE clear at qio40.
+        switch_stop(
+            "flash_switch_qio80_qe_fd", 0x77,
+            not_taken("qio80", "status register 2 is 0xfd, QE (bit 1) "
+                      "clear; QIO needs it set and this kernel never writes "
+                      "it; SPI1 put back"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 1),
+            key="qio80", faults=[dict(qe_set, value=0xFD)]),
+        switch_stop(
+            "flash_switch_qio40_qe_clear", 0x77,
+            not_taken("qio40", "status register 2 is 0x00, QE (bit 1) "
+                      "clear; QIO needs it set and this kernel never writes "
+                      "it; SPI1 put back"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 0),
+            key="qio40"),
+        # W2's words with bits W5 must clear set: the input selects'
+        # SIG_IN_SEL, the pads' whole MCU_SEL, USER's USR_MOSI.
+        *[switch_case(
+            name, key,
+            [switch_line(key, FLASH_EMULATOR_JEDEC,
+                         2 if key.startswith("qio") else 0, words),
+             "us->", "us\n",
+             switch_counts(2, 2, len(lies)),
+             switch_spi1_as_before],
+            switch_stores(key, words), faults=lies)
+          for name, key, words, lies in (
+              ("flash_switch_insel_bit7_qio80", "qio80",
+               {"insel2": 0xBC, "insel3": 0xBC},
+               [qe_set, {"step": 0xE2, "addr": insel2, "value": 0xBC},
+                {"step": 0xE2, "addr": insel3, "value": 0xBC}]),
+              ("flash_switch_pads_mcu_sel_7_qio80", "qio80",
+               {"pad27": 0x7B00, "pad28": 0x7B00},
+               [qe_set, {"step": 0xE2, "addr": pad27, "value": 0x7B00},
+                {"step": 0xE2, "addr": pad28, "value": 0x7B00}]),
+              ("flash_switch_user_bit27_dio80", "dio80",
+               {"user": 0x0800_00C0},
+               [{"step": 0xE2, "addr": spi0_reg["user"],
+                 "value": 0x0800_00C0}]))],
+        # W2's CORE_CLK_SEL read with every bit above the mask set: the
+        # comparison is of [1:0] alone, and the switch is taken.
+        switch_case(
+            "flash_switch_core_clk_sel_masked", "dio80",
+            [switch_line("dio80", FLASH_EMULATOR_JEDEC, 0), "us->", "us\n",
+             switch_counts(2, 2, 1), switch_spi1_as_before],
+            switch_stores("dio80"),
+            faults=[{"step": 0xE1, "addr": 0x6000_30EC,
+                     "value": 0xFFFF_FFFC}]),
+        # W5's freeze word read with FREEZE_MODE (and FREEZE_DONE) set: the
+        # first store clears FREEZE_MODE, the second sets FREEZE_ENA over
+        # what it reads.
+        switch_case(
+            "flash_switch_freeze_mode_cleared", "dio80",
+            [switch_line("dio80", FLASH_EMULATOR_JEDEC, 0), "us->", "us\n",
+             switch_counts(2, 2, 3), switch_spi1_as_before],
+            [(icache_freeze, 0x4), (icache_freeze, 0x7),
+             *switch_stores("dio80")[2:]],
+            faults=[{"step": 0xE5, "addr": icache_freeze, "value": 0x6}]),
+        # W9's read-back, the clock word read as other than the emulator
+        # reads it.
+        switch_case(
+            "flash_switch_read_back", "dio80",
+            [switch_line("dio80", FLASH_EMULATOR_JEDEC, 0,
+                         after={"clock": 0x1234_5678}),
+             "us->", "us\n", switch_counts(2, 2, 1), switch_spi1_as_before],
+            switch_stores("dio80"),
+            faults=[{"step": 0xE9, "addr": spi0_reg["clock"],
+                     "value": 0x1234_5678}]),
+        # The canary: every word read as the first word's, so the second
+        # differs; the last word alone read wrong; a mismatch at dio40,
+        # whose IRAM line names the 40.
+        switch_stop(
+            "flash_switch_stop_canary_second_word", 0x78,
+            ["SOS-S3: flash dio80: canary mismatch",
+             not_taken("dio80", "the canary read 0xff00aa55 at +0x04 where "
+                       "0xcc33f00f was expected; SPI0 put back to the ROM's "
+                       "words")],
+            stores=switch_stores("dio80") + switch_put_back("dio80"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 2),
+            faults=[{"step": 0xE6, "value": 0xFF00_AA55}]),
+        switch_stop(
+            "flash_switch_stop_canary_last_word", 0x78,
+            ["SOS-S3: flash dio80: canary mismatch",
+             not_taken("dio80", "the canary read 0x00000000 at +0x3c where "
+                       "0x3f3e3d3c was expected; SPI0 put back to the ROM's "
+                       "words")],
+            stores=switch_stores("dio80") + switch_put_back("dio80"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 1),
+            faults=[{"step": 0xE6, "addr": 0xCA00_003C, "value": 0x0}]),
+        switch_stop(
+            "flash_switch_stop_canary_dio40", 0x78,
+            ["SOS-S3: flash dio40: canary mismatch",
+             not_taken("dio40", "the canary read 0xdeadbeef at +0x00 where "
+                       "0xff00aa55 was expected; SPI0 put back to the ROM's "
+                       "words")],
+            stores=switch_stores("dio40") + switch_put_back("dio40"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 1),
+            key="dio40", faults=[{"step": 0xE6, "value": 0xDEAD_BEEF}]),
+        # The shipping kernel at dio80 as a board image, on the emulator: the
+        # part's description, so W2's clock words stop it, and the boot goes
+        # on.
+        {
+            "name": "boot_flash_dio80_board_image",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "clock": "pll80",
+            "flash_key": "dio80",
+            "board_image": True,
+            "quiet_halt": True,
+            "flash_commands": ["0xab"],
+            "expect_spi1_stores": [],
+            "expect_switch_stores": [],
+            "expect_out": [rom, *clock_pll80_lines,
+                           not_taken("dio80", "the memory-SPI core clock is "
+                                     "not the one the key is for: "
+                                     "sysclk=0x000a8401 cpu_per=0x00000000 "
+                                     "mspi_core=0x00000000, the description "
+                                     "says sysclk=0x00080400 "
+                                     "cpu_per=0x00000004 "
+                                     "mspi_core=0x00000000 under the masks "
+                                     "0x00080fff, 0x7 and 0x3"),
+                           banner],
+            "expect_clean_exit": True,
+        },
+    ]
+    # Each flash key's own `flash_init`, through `flash_key_halt.saw`, which
+    # runs `hal.clock_init()` at the case's clock and flash key with MISC(1)
+    # set up and the table of lies filled first: the key's mode, held by its
+    # stores, and the halt after 0x75 and 0x7E, whose boot must end at the
+    # switch's line (`expect_tail`).
+    def key_case(name, key, lines, stores, tail=None, faults=(), spi1=None,
+                 heard=None):
+        case = {
+            "name": name,
+            "src": os.path.join(s3_tests, "flash_key_halt.saw"),
+            "clock": "pll80",
+            "flash_key": key,
+            "psram_fault": True,
+            "quiet_halt": True,
+            "flash_switch": {"mode": key, "faults": list(faults)},
+            "flash_commands": switch_heard if heard is None else heard,
+            "expect_spi1_stores": switch_reads if spi1 is None else spi1,
+            "expect_switch_stores": stores,
+            "device_untouched": switch_untouched,
+            "expect_out": [rom, *clock_pll80_lines, *lines],
+            "expect_clean_exit": True,
+        }
+        if tail is not None:
+            case["expect_tail"] = tail
+        return case
+
+    key_went_on = "SOS flashkey: the boot went on"
+    kernel_cases += [
+        *[key_case(
+            f"flash_key_{key}", key,
+            [switch_line(key, FLASH_EMULATOR_JEDEC,
+                         2 if key.startswith("qio") else 0),
+             "us->", "us\n", key_went_on, halt_pass],
+            switch_stores(key),
+            faults=[qe_set] if key.startswith("qio") else [])
+          for key in ("dio80", "qio80", "dio40", "qio40")],
+        key_case(
+            "flash_key_halt_not_finished", "dio80",
+            ["SOS-S3: flash: SPI1 command 0x9f did not finish"],
+            [], tail=not_taken("dio80", "SPI1 command 0x9f did not finish, "
+                               "SPI_MEM_CMD=0x00040000 after 100000 polls; "
+                               "halted"),
+            spi1=misc_setup + flash_stores(0x9F, put_back=False),
+            heard=["0xab", "0x9f"],
+            faults=[{"step": 0x79, "command": 1, "addr": spi1_reg["cmd"],
+                     "value": 0x40000}]),
+        key_case(
+            "flash_key_halt_thaw", "dio80",
+            ["SOS-S3: flash: a cache did not report its unfreeze"],
+            switch_stores("dio80"),
+            tail=not_taken("dio80", "the instruction cache did not report "
+                           "its unfreeze, its freeze word reading 0x00000005 "
+                           "after 100000 polls; SPI0 left switched, the "
+                           "canary not read; halted"),
+            faults=[{"step": 0xE7, "addr": icache_freeze, "value": 0x5}]),
+    ]
+
+    # The paths around W5's and W7's freezes the cases above leave: each
+    # held whole, as `switch_stop` holds every stop's lines.
+    kernel_cases += [
+        # W5's data-cache freeze not reported, and its own undo not reported
+        # either (0xE5 and 0xE7 on the data cache's word).
+        switch_stop(
+            "flash_switch_stop_freeze_dcache_undo_dcache", 0x7E,
+            ["SOS-S3: flash: a cache did not report its unfreeze",
+             not_taken("dio80", "the data cache did not report its freeze "
+                       "done, its freeze word reading 0x00000000 after 100000 "
+                       "polls, and did not report the undo either, reading "
+                       "0x00000005; nothing was stored to SPI0; halted")],
+            stores=caches_frozen + caches_thawed[::-1], spi1=switch_reads,
+            heard=switch_heard, counts=(2, 2, 200003),
+            faults=[{"step": 0xE5, "addr": dcache_freeze, "value": 0x0},
+                    {"step": 0xE7, "addr": dcache_freeze, "value": 0x5}]),
+        # A freeze not reported whose word reads other than 0: the word is
+        # the record's, and the stores are made from it.
+        switch_stop(
+            "flash_switch_stop_freeze_word_nonzero", 0x7D,
+            not_taken("dio80", "the instruction cache did not report its "
+                      "freeze done, its freeze word reading 0x00000001 after "
+                      "100000 polls, and was unfrozen again; nothing was "
+                      "stored to SPI0"),
+            stores=[(icache_freeze, 0x1), (icache_freeze, 0x1),
+                    (icache_freeze, 0x4)],
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 100002),
+            faults=[{"step": 0xE5, "addr": icache_freeze, "value": 0x1}]),
+        # W7's instruction-cache freeze not reported after a canary wrong at
+        # +0x04: the canary's offset is the record's.
+        switch_stop(
+            "flash_switch_stop_w7_freeze_canary_second_word", 0x7D,
+            ["SOS-S3: flash dio80: canary mismatch",
+             not_taken("dio80", "the canary read 0xff00aa55 at +0x04 where "
+                       "0xcc33f00f was expected; then the instruction cache "
+                       "did not report its freeze done, its freeze word "
+                       "reading 0x00000000 after 100000 polls, and was "
+                       "unfrozen again; SPI0 put back to the ROM's words "
+                       "with the caches running")],
+            stores=switch_stores("dio80") + caches_frozen[:2]
+            + caches_thawed[:1] + put_back_words("dio80"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 100004),
+            faults=[{"step": 0xE6, "value": 0xFF00_AA55},
+                    {"step": 0xEA, "addr": icache_freeze, "value": 0x0}]),
+        # W7's freeze not reported and its undo, or the instruction cache's
+        # unfreeze after the data cache's freeze, not reported either: SPI0
+        # put back with a cache that may still be frozen, so the line does
+        # not say the caches run.
+        switch_stop(
+            "flash_switch_stop_w7_freeze_undo_icache", 0x7E,
+            ["SOS-S3: flash dio80: canary mismatch",
+             "SOS-S3: flash: a cache did not report its unfreeze",
+             not_taken("dio80", "the canary read 0xdeadbeef at +0x00 where "
+                       "0xff00aa55 was expected; then the instruction cache "
+                       "did not report its freeze done, its freeze word "
+                       "reading 0x00000000 after 100000 polls, and did not "
+                       "report the undo either, reading 0x00000005; SPI0 put "
+                       "back to the ROM's words; halted")],
+            stores=switch_stores("dio80") + caches_frozen[:2]
+            + caches_thawed[:1] + put_back_words("dio80"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 200004),
+            faults=[{"step": 0xE6, "value": 0xDEAD_BEEF},
+                    {"step": 0xEA, "addr": icache_freeze, "value": 0x0},
+                    {"step": 0xEB, "addr": icache_freeze, "value": 0x5}]),
+        switch_stop(
+            "flash_switch_stop_w7_freeze_dcache_ithaw", 0x7E,
+            ["SOS-S3: flash dio80: canary mismatch",
+             "SOS-S3: flash: a cache did not report its unfreeze",
+             not_taken("dio80", "the canary read 0xdeadbeef at +0x00 where "
+                       "0xff00aa55 was expected; then the instruction cache "
+                       "did not report its unfreeze, its freeze word reading "
+                       "0x00000005 after 100000 polls; the data cache did "
+                       "not report its freeze done, its freeze word reading "
+                       "0x00000000 after 100000 polls, and was unfrozen "
+                       "again; SPI0 put back to the ROM's words; halted")],
+            stores=switch_stores("dio80") + caches_frozen
+            + caches_thawed[::-1] + put_back_words("dio80"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 200004),
+            faults=[{"step": 0xE6, "value": 0xDEAD_BEEF},
+                    {"step": 0xEA, "addr": dcache_freeze, "value": 0x0},
+                    {"step": 0xEB, "addr": icache_freeze, "value": 0x5}]),
+        switch_stop(
+            "flash_switch_stop_w7_freeze_undo_dcache", 0x7E,
+            ["SOS-S3: flash dio80: canary mismatch",
+             "SOS-S3: flash: a cache did not report its unfreeze",
+             not_taken("dio80", "the canary read 0xdeadbeef at +0x00 where "
+                       "0xff00aa55 was expected; then the data cache did not "
+                       "report its freeze done, its freeze word reading "
+                       "0x00000000 after 100000 polls, and did not report "
+                       "the undo either, reading 0x00000005; SPI0 put back "
+                       "to the ROM's words; halted")],
+            stores=switch_stores("dio80") + caches_frozen
+            + caches_thawed[::-1] + put_back_words("dio80"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 200004),
+            faults=[{"step": 0xE6, "value": 0xDEAD_BEEF},
+                    {"step": 0xEA, "addr": dcache_freeze, "value": 0x0},
+                    {"step": 0xEB, "addr": dcache_freeze, "value": 0x5}]),
+        # W7's data-cache unfreeze not reported (0xEB on its word).
+        switch_stop(
+            "flash_switch_stop_w7_thaw_dcache", 0x7E,
+            ["SOS-S3: flash dio80: canary mismatch",
+             "SOS-S3: flash: a cache did not report its unfreeze",
+             not_taken("dio80", "the canary read 0xdeadbeef at +0x00 where "
+                       "0xff00aa55 was expected; then the data cache did not "
+                       "report its unfreeze, its freeze word reading "
+                       "0x00000005 after 100000 polls; SPI0 put back to the "
+                       "ROM's words; halted")],
+            stores=switch_stores("dio80") + switch_put_back("dio80"),
+            spi1=switch_reads, heard=switch_heard, counts=(2, 2, 100002),
+            faults=[{"step": 0xE6, "value": 0xDEAD_BEEF},
+                    {"step": 0xEB, "addr": dcache_freeze, "value": 0x5}]),
+        # A key's boot goes on after 0x7D at W5 and after 0x78.
+        key_case(
+            "flash_key_freeze_goes_on", "dio80",
+            [not_taken("dio80", "the instruction cache did not report its "
+                       "freeze done, its freeze word reading 0x00000000 after "
+                       "100000 polls, and was unfrozen again; nothing was "
+                       "stored to SPI0"),
+             key_went_on, halt_pass],
+            caches_frozen[:2] + caches_thawed[:1],
+            faults=[{"step": 0xE5, "addr": icache_freeze, "value": 0x0}]),
+        key_case(
+            "flash_key_canary_goes_on", "dio80",
+            ["SOS-S3: flash dio80: canary mismatch",
+             not_taken("dio80", "the canary read 0xdeadbeef at +0x00 where "
+                       "0xff00aa55 was expected; SPI0 put back to the ROM's "
+                       "words"),
+             key_went_on, halt_pass],
+            switch_stores("dio80") + switch_put_back("dio80"),
+            faults=[{"step": 0xE6, "value": 0xDEAD_BEEF}]),
+    ]
     # `check_clock_registers` on the tree, then with each slip it must
     # refuse: a store to a clock register outside `clock_init`'s files, in
     # the command layer, the HAL and the r8 facade, and `memory_init` called
@@ -21069,6 +22023,17 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                            "    UnsafeMemory<UInt32, Device>(0x600C_0010)"
                            ".write(0)\n}\n"),
              None),
+            # The flash keys are not `clock_init`'s files: a store to the
+            # memory-SPI core clock's select from the flash kit is found.
+            ("flash_kit_store", ("hal/xtensa-esp32s3/keys/flash-common/"
+                                 "lib.saw",
+                                 "    FLASH_EXPECT = flash_expect("
+                                 "board_image())\n",
+                                 "    UnsafeMemory<UInt32, Device>(0x6000_30EC)"
+                                 ".write(0)\n"
+                                 "    FLASH_EXPECT = flash_expect("
+                                 "board_image())\n"),
+             "lib.saw: 0x600030ec"),
             # The command layer's reader exemption, use by use: a read
             # inside a store, and a macro that names a register beside the
             # register's own `#define`.
@@ -22044,6 +23009,45 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             "expect_clean_exit": False,
         },
         {
+            # The same for a case that names the flash key.
+            "name": "keys_stated_twice_flash",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "keys_twice_s3.toml"},
+            "clock": "pll80",
+            "flash_key": "dio80",
+            "expect_build_error": "keys_twice_s3.toml states the build keys "
+                                  "clock in [keys], and the case "
+                                  "keys_stated_twice_flash names clock, "
+                                  "flash_key too",
+            "expect_out": [],
+            "expect_clean_exit": False,
+        },
+        {
+            # A description that states a flash key and a clock key on the
+            # PLL: built at both, it boots with the clock line and the
+            # switch's, not taken on the emulator at the first read's gate,
+            # and runs `launch_all` on.
+            "name": "flash_keyed_image",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "flash_keyed_s3.toml"},
+            "expect_out": [*clock_pll80_lines, flash_gate_line("dio80"),
+                           "{banner}",
+                           "SOS launch: 3 children, 1 pool",
+                           "SOS launch: done"],
+            "expect_clean_exit": True,
+        },
+        {
+            # A description that states a flash key with no clock key, so
+            # at the default `rom`: the kernel's compile refuses it.
+            "name": "flash_key_without_pll_image",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "flash_no_pll_s3.toml"},
+            "expect_build_error": "dio80 needs a clock key on the PLL: "
+                                  "pll80, pll160 or pll240",
+            "expect_out": [],
+            "expect_clean_exit": False,
+        },
+        {
             # The same for a case that names the console's stall key.
             "name": "keys_stated_twice_stall",
             "src": os.path.join(KERNEL_DIR, "main.saw"),
@@ -22089,6 +23093,13 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
              expect_out=[*clock_ldo_lines(
                              "pll160",
                              "ldo=default dig=0x0000001b rtc=0x0000001b"),
+                         *by_name["kill_churn"]["expect_out"]]),
+        # And at the `pll80` clock key with the `dio80` flash key, on the
+        # emulator's path (`boot_flash_dio80`): the switch not taken at its
+        # first read's gate, and the boot on at the ROM's slow read.
+        dict(by_name["kill_churn"], name="kill_churn_flash_dio80",
+             clock="pll80", flash_key="dio80",
+             expect_out=[*clock_pll80_lines, flash_gate_line("dio80"),
                          *by_name["kill_churn"]["expect_out"]]),
         # And at the `pll240` clock key, on the emulator's path
         # (`boot_pll240`).
@@ -22556,15 +23567,25 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             return 2
         cases = [c for c in cases if c["name"] in wanted]
         process_cases = [c for c in process_cases if c["name"] in wanted]
-    # `--clock` gives the one emitted image its clock key.
-    if emit_clock is not None:
-        clocked = dict(cases[0], clock=emit_clock)
-        cases = [clocked]
-        process_cases = [clocked] if process_cases else []
+    # `--clock` and `--flash` give the one emitted image its clock and flash
+    # keys.
+    if emit_clock is not None or emit_flash is not None:
+        keyed = dict(cases[0])
+        if emit_clock is not None:
+            keyed["clock"] = emit_clock
+        if emit_flash is not None:
+            keyed["flash_key"] = emit_flash
+        cases = [keyed]
+        process_cases = [keyed] if process_cases else []
     for case in cases:
         if variant(case)[0] not in clock_keys:
             print(f"{RED}{case['name']}: unknown clock key "
                   f"{variant(case)[0]!r}; known: {', '.join(clock_keys)}"
+                  f"{RESET}", file=sys.stderr)
+            return 2
+        if variant(case)[4] not in flash_keys:
+            print(f"{RED}{case['name']}: unknown flash key "
+                  f"{variant(case)[4]!r}; known: {', '.join(flash_keys)}"
                   f"{RESET}", file=sys.stderr)
             return 2
     # A smoke run builds nothing for a board-only case; its row says why.
@@ -22686,10 +23707,19 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # that boots it.
     kernel_failures = {}
     # The first set of keys of each board the cases use also compiles the
-    # shipping kernel, which the board's descriptions are held to below.
+    # shipping kernel, which the board's descriptions are held to below: the
+    # first whose cases build, since a set whose every case must be refused
+    # (a flash key with no clock key on the PLL) compiles no kernel. No case
+    # holds the skip: a full run's first set is the defaults', which build.
+    # It is for a run narrowed to refused cases (`--case
+    # flash_key_dio80_at_rom_refused`), which without it fails at the
+    # shipping kernel's compile instead of reporting the refusal.
     main_src = os.path.join(KERNEL_DIR, "main.saw")
     firsts = {}
     for key in keys_used:
+        if all(c.get("expect_build_error") for c in built
+               if variant(c) == key):
+            continue
         firsts.setdefault(key[3], key)
     for key in ([] if python_path else keys_used):
         entries = [c for c in built if variant(c) == key and "src" in c]
@@ -22781,6 +23811,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             payload = _psram_case_asm(case, key[0], board)
         if "flash" in case:
             payload = _flash_case_asm(case, board)
+        if "flash_switch" in case:
+            payload = _flash_switch_case_asm(case, board)
         printed = _link_image(
             builder, profiles[key], case, variant_arch(key), elf,
             flash={"output": flash, "check": check},
@@ -22828,6 +23860,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         print(f"{CHECK} {case['name']}: {emit_out}  ({end} bytes, written "
               f"at flash offset 0x0; magic checked at 0x400)")
         print(f"  clock key {variant(case)[0]}")
+        print(f"  flash key {variant(case)[4]}")
         print(f"  sha256 {hashlib.sha256(image).hexdigest()}")
         print("  write it with:")
         print(f"    python3 -m esptool --chip esp32s3 --port PORT "
@@ -22842,6 +23875,13 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                     or case.get("device_stores")
                     or case.get("device_untouched"))
 
+    def watches_stores(case):
+        """Whether a case holds the run's stores in order (`expect_stores`,
+        `expect_spi1_stores`, `expect_switch_stores`)."""
+        return bool(case.get("expect_stores")
+                    or case.get("expect_spi1_stores") is not None
+                    or case.get("expect_switch_stores") is not None)
+
     def boot_args(case):
         """The emulator's extra arguments for one run, and the file its
         trace goes to. A PSRAM harness's run, and every run on the
@@ -22850,10 +23890,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         holding the case's `efuse` words (`_efuse_file`; a PSRAM run the
         part's, `8M`, unless it says otherwise; None, and any other case that
         names none, gives the model no file, and every word reads 0); and,
-        for a case that watches devices (`watches_devices`) or names
-        `expect_stores`, `expect_spi1_stores` or `expect_counter_span`, the
-        trace of every store to a device register, and for the last, of
-        every load. Every run traces the commands the flash model decodes
+        for a case that watches devices (`watches_devices`) or stores
+        (`watches_stores`) or names `expect_counter_span`, the trace of every
+        store to a device register, and for the last, of every load. Every run traces the commands the flash model decodes
         (`flash_commands`). A case with `icount` runs on the emulator's
         instruction-counted clock."""
         psram = "psram" in case or variant(case)[3]
@@ -22871,8 +23910,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
             args += ["-drive", f"file={efuse},if=none,format=raw,id=efuse",
                      "-global",
                      "driver=nvram.esp32s3.efuse,property=drive,value=efuse"]
-        stores = (watches_devices(case) or case.get("expect_stores")
-                  or case.get("expect_spi1_stores") is not None
+        stores = (watches_devices(case) or watches_stores(case)
                   or case.get("expect_counter_span"))
         loads = case.get("expect_counter_span")
         trace = os.path.join(s3_build, f"{case['name']}.trace.txt")
@@ -22934,7 +23972,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         (`tests/xtensa/iram_mutants.c`, `MUT_<name>`), or with its link
         script's IRAM line removed (`SCRIPT`), and answer (ok, reason): the
         check must refuse it with the case's finding, or, for `NONE`, pass.
-        The object is linked alone, rooted at the three entries and the
+        The object is linked alone, rooted at the four entries and the
         mutant, with the board's script, as a kernel would link it."""
         which = case["iram_mutant"]
         name = case["name"]
@@ -22959,7 +23997,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         try:
             check_iram(obj)
             roots = ["-u", "sos_psram_bringup", "-u", "sos_psram_time_reads",
-                     "-u", "sos_flash_read"]
+                     "-u", "sos_flash_read", "-u", "sos_flash_switch"]
             if define not in ("MUT_NONE",):
                 roots += ["-u", "sos_psram_mutant"]
             slots = _write_image_slots(
@@ -23150,6 +24188,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
         # (`expect_spi1_stores`).
         if ok and case.get("expect_spi1_stores") is not None:
             ok, reason = check_spi1_stores(case, traced_stores(trace))
+        # Every store the kernel made to SPI0 and the flash's pads, in order
+        # (`expect_switch_stores`).
+        if ok and case.get("expect_switch_stores") is not None:
+            ok, reason = check_switch_stores(case, traced_stores(trace))
         # A wait the run must make (`expect_counter_span`), read off the
         # counter's loads.
         if ok and case.get("expect_counter_span"):
@@ -23766,20 +24808,23 @@ def _product_rows_esp32s3(scratch, builder_before):
         if emulated[:len(board)] == board:
             return (f"{board_bin} is the emulator's image: it was not linked "
                     "for a part")
-        # Built at the S3's default build keys, the ROM's clock with the
-        # console uncounted, held to a literal so that `ESP32S3_DEFAULT_KEYS`,
-        # which product.py writes the profile at, cannot drift unseen.
+        # Built at the S3's default build keys, the ROM's clock and flash with
+        # the console uncounted, held to a literal so that
+        # `ESP32S3_DEFAULT_KEYS`, which product.py writes the profile at,
+        # cannot drift unseen.
         with open(os.path.join(product, "build", ESP32S3_ARCH["name"],
                                "sosimage.profile.json")) as f:
             built = json.load(f)
         keys = sorted(os.path.relpath(path.split("=", 1)[1],
                                       os.path.join(product, ".sawos"))
                       for path in built["module_paths"]
-                      if path.startswith(("s3clock=", "s3stall=")))
+                      if path.startswith(("s3clock=", "s3flash=",
+                                          "s3stall=")))
         want = sorted(os.path.relpath(path.split("=", 1)[1], REPO_ROOT)
                       for path in _esp32s3_module_paths(
-                          ("rom", False, False, False))
-                      if path.startswith(("s3clock=", "s3stall=")))
+                          ("rom", False, False, False, "rom"))
+                      if path.startswith(("s3clock=", "s3flash=",
+                                          "s3stall=")))
         if keys != want or built.get("kernel_c_args"):
             return (f"the product's S3 profile is at the keys {keys} with "
                     f"{built.get('kernel_c_args')!r}, not the default's "
@@ -23882,12 +24927,18 @@ def _product_rows_esp32s3(scratch, builder_before):
         ("product_key_unknown", key_refused(
             "x-speed", 'speed = "fast"',
             "`speed` in [keys] is no build key of the board esp32s3; its "
-            "keys are `clock`, `stall`")),
+            "keys are `clock`, `flash`, `stall`")),
         ("product_key_value_unknown", key_refused(
             "x-pll320", 'clock = "pll320"',
             '`clock` in [keys] is "pll320", which is not one of the board '
             'esp32s3\'s values for it, "rom", "xtal40", "pll80", "pll160", '
             '"pll240"')),
+        # A flash key but `rom` needs a clock key on the PLL: at the
+        # profile's `rom` clock the kernel's compile refuses it, by the
+        # key's assertion (hal/xtensa-esp32s3/ABI.md §18d).
+        ("product_flash_key_needs_pll", key_refused(
+            "x-dio80", 'flash = "dio80"',
+            "dio80 needs a clock key on the PLL: pll80, pll160 or pll240")),
         ("product_builder_unchanged", builder_unchanged),
     ]
 
@@ -24018,6 +25069,13 @@ def main():
                              "(`rom`, the default, `xtal40`, `pll80`, "
                              "`pll160` or `pll240`; "
                              "hal/xtensa-esp32s3/ABI.md §14)")
+    parser.add_argument("--flash", metavar="KEY",
+                        help="with --emit-flash: the flash key the image is "
+                             "built with, in place of the case's own "
+                             "(`rom`, the default, `dio80`, `qio80`, "
+                             "`dio40` or `qio40`, each but `rom` with a "
+                             "clock key on the PLL; "
+                             "hal/xtensa-esp32s3/ABI.md §18d)")
     args = parser.parse_args()
 
     if args.emit_flash is not None and (args.board != "esp32s3"
@@ -24028,6 +25086,9 @@ def main():
     if args.clock is not None and args.emit_flash is None:
         print(f"{RED}--clock needs --emit-flash{RESET}", file=sys.stderr)
         sys.exit(2)
+    if args.flash is not None and args.emit_flash is None:
+        print(f"{RED}--flash needs --emit-flash{RESET}", file=sys.stderr)
+        sys.exit(2)
 
     if args.board == "esp32s3":
         # Board section: esp32s3, all of it in `_esp32s3_smoke`. `--case`
@@ -24037,7 +25098,8 @@ def main():
                   if w.strip()]
         emit = (args.emit_flash.strip().replace("-", "_")
                 if args.emit_flash is not None else None)
-        sys.exit(_esp32s3_smoke(wanted, emit, args.out, args.clock))
+        sys.exit(_esp32s3_smoke(wanted, emit, args.out, args.clock,
+                                args.flash))
 
     if args.board != "virt":
         # ------------------------------------------------------------------

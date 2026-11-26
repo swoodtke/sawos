@@ -1393,11 +1393,12 @@ public func irq_raise_selftest_line() unsafe -> UInt {
 // The build keys
 // =============================================================================
 //
-// An image's build keys (../ABI.md §14) are two modules the runner maps to a
-// key's directory under `../keys/`: `s3clock`, the CPU clock, and `s3stall`,
-// whether the console counts its stalls. In an image built at the defaults
-// (`rom`, the count off) every reference to a key's code folds away, and the
-// image is the bytes it is without the keys. Two things keep it so. The
+// An image's build keys (../ABI.md §14, §18d) are three modules the runner
+// maps to a key's directory under `../keys/`: `s3clock`, the CPU clock;
+// `s3flash`, how the cache reads the flash; and `s3stall`, whether the
+// console counts its stalls. In an image built at the defaults (`rom`, `rom`,
+// the count off) every reference to a key's code folds away, and the image
+// is the bytes it is without the keys. Two things keep it so. The
 // compiler lays out functions and statics in the order the code it lowers
 // first names them, even code an image folds away, so a key's code names
 // nothing in this file: its modules reach their registers through views of
@@ -1406,14 +1407,26 @@ public func irq_raise_selftest_line() unsafe -> UInt {
 // and `console_byte` and `exit_pass` name the stall count on the line that
 // was there. Nothing else in this file is keyed.
 //
-// `clock_init` is the clock key's, and `kmain` calls it first, before
-// anything prints or is timed; the `rom` key's writes nothing. When the
-// stall count is on, `console_byte` writes through the count's own path,
-// which times each wait for FIFO room once the tick is armed, and
-// `exit_pass` prints the count before its own line.
+// `clock_init` is the clock key's, then the flash key's, and `kmain` calls
+// it first, before anything prints or is timed; each `rom` key writes
+// nothing. The flash key comes second because its switch is made for the
+// memory-SPI core clock the clock key leaves, and it comes before
+// `memory_init`, after which nothing moves that clock. When the stall count
+// is on, `console_byte` writes through the count's own path, which times
+// each wait for FIFO room once the tick is armed, and `exit_pass` prints the
+// count before its own line.
 
-public import s3clock.{clock_init}
+import s3clock
+import s3flash
 import s3stall
+
+/// Set the clocks this image is built for: the CPU's (the clock key), then
+/// how the cache reads the flash at the memory-SPI core clock that leaves
+/// (the flash key).
+public func clock_init() unsafe {
+    s3clock.clock_init()
+    s3flash.flash_init()
+}
 
 // =============================================================================
 // The kernel's own zeroed memory

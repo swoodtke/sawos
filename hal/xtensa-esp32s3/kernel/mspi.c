@@ -1,6 +1,7 @@
 // SOS Xtensa kernel HAL: the memory-SPI controller's command layer, for the
-// octal PSRAM on chip select 1 (../ABI.md §16) and for the flash's reads on
-// chip select 0 (../ABI.md §18).
+// octal PSRAM on chip select 1 (../ABI.md §16), for the flash's reads on
+// chip select 0 (../ABI.md §18) and for the switch of the flash's cache
+// reads to two or four lines at 80 or 40 MHz (../ABI.md §18e).
 //
 // C because the whole of it must run without one instruction or one byte of
 // data fetched from flash: while SPI1 holds the chip-select gate, or a
@@ -25,7 +26,8 @@
 // ESP-IDF v5.4.1 ("IDF", components/ of that tag) or from the mask ROM's
 // disassembly (`esp32s3_rev0_rom.elf`, "ROM"). The step names (S0.1 to S12)
 // and the stop codes (0x50 to 0x5F, 0x61 and 0x62) are ../ABI.md §16's and
-// §17's, and the flash's stops (0x73 to 0x75, 0x79 to 0x7B) §18's.
+// §17's, the flash's stops (0x73 to 0x75, 0x79 to 0x7B) §18's, and the
+// switch's steps (W1 to W9) and stops (0x70 to 0x79, 0x7D, 0x7E) §18e's.
 //
 // Nothing here writes non-volatile state: the eFuse is only read
 // (EFUSE_RD_*), no RTC register is written, the commands sent with chip
@@ -35,7 +37,9 @@
 // cache's map of the PSRAM (S12) is MMU entries from 256 up, which a chip
 // reset gives back to the flash. SPI_MEM_MISC(1), which says which chip
 // select a command goes to, is written by the PSRAM's gate alone; a flash
-// read compares it and never writes it.
+// read compares it and never writes it. The switch writes SPI0's flash-side
+// words, and for four lines two pads and two input selects, all of which a
+// chip reset puts back; the flash chip itself is sent its reads alone.
 //
 // Built call0 with no FPU like the rest of the kernel (`-windowed`, `-fp`).
 //
@@ -43,9 +47,10 @@
 // `-DSOS_PSRAM_FAULT` (a harness image only: the runner refuses any other
 // image that defines `sos_psram_fault`), `rd` first consults the DRAM record
 // `sos_psram_fault` the harness fills in: when the call is at that step, in
-// that command, and reads that address, it gets the record's value instead.
-// Writes always reach the real register, so the whole real call runs with
-// one read lied to.
+// that command, and reads that address, it gets the record's value instead,
+// and then the table `sos_flash_fault_table`, whose every entry answers each
+// read it matches. Writes always reach the real register, so the whole real
+// call runs with the reads lied to.
 
 typedef unsigned int u32;
 
@@ -175,6 +180,146 @@ struct sos_flash_record {
 #define STOP_FLASH_NOT_READ     0x7Au
 #define STOP_FLASH_DDR          0x7Bu
 
+// The switch's description (../ABI.md §18e): the three clock words the
+// switch is for, masked as S0.3 masks them; the flash's JEDEC ID; and SPI0's
+// flash-side words as the ROM leaves them. Mirrored by the `s3flashkit`
+// module's `FlashExpect`.
+struct sos_flash_expect {
+    u32 sysclk;             // SYSTEM_SYSCLK_CONF & SYSCLK_MASK
+    u32 cpu_per;            // SYSTEM_CPU_PER_CONF & CPU_PER_MASK
+    u32 core_clk_sel;       // SPI_MEM_CORE_CLK_SEL(0) & CORE_CLK_SEL_MASK
+    u32 jedec;              // manufacturer in [23:16], as IDF forms it
+    u32 clock;              // SPI_MEM_CLOCK(0)
+    u32 ctrl;               // SPI_MEM_CTRL(0)
+    u32 user1;              // SPI_MEM_USER1(0)
+    u32 user2;              // SPI_MEM_USER2(0)
+};
+
+// The words the switch reads before its stores and again after them, in
+// `switch_addrs`' order: SPI0's CLOCK, CTRL, CTRL2, USER, USER1, USER2, DDR,
+// TIMING_CALI, DIN_MODE and DIN_NUM, pads 27 and 28, and the input selects
+// of signals 2 and 3.
+struct sos_flash_words {
+    u32 clock;
+    u32 ctrl;
+    u32 ctrl2;
+    u32 user;
+    u32 user1;
+    u32 user2;
+    u32 ddr;
+    u32 cali;
+    u32 din_mode;
+    u32 din_num;
+    u32 pad_hd;
+    u32 pad_wp;
+    u32 insel_hd;
+    u32 insel_wp;
+};
+
+#define SWITCH_WORDS 14u
+#define W_CLOCK     0u
+#define W_CTRL      1u
+#define W_CTRL2     2u
+#define W_USER      3u
+#define W_USER1     4u
+#define W_USER2     5u
+#define W_DDR       6u
+#define W_CALI      7u
+#define W_DIN_MODE  8u
+#define W_DIN_NUM   9u
+#define W_PAD_HD    10u
+#define W_PAD_WP    11u
+#define W_INSEL_HD  12u
+#define W_INSEL_WP  13u
+
+// What the switch found. `stop` is 0 when it was made, else the stop code;
+// `read`, `expect` and `at` are the stop's own words (`at`: the word's index
+// in `sos_flash_words` for 0x71, the byte's offset for 0x78). `state` is
+// `STATE_*`: what the switch did to SPI0 and what each cache's freeze and
+// unfreeze reported. `ticks_before` and `ticks_after` are the timed reads,
+// in SYSTIMER's ticks of 1/16 us. `canary_*` is the canary's first word that
+// read wrong, with `STATE_CANARY`; `freeze_word` the freeze word a freeze
+// that did not report last read, and `thaw_word_i` and `thaw_word_d` each
+// cache's, for an unfreeze that did not report. `flash` is the record of
+// the last read the switch sent. Mirrored by `s3flashkit`'s
+// `FlashSwitchRecord`.
+struct sos_flash_switch_record {
+    u32 stop;
+    u32 read;
+    u32 expect;
+    u32 at;
+    u32 sysclk;             // W2's three words, whole
+    u32 cpu_per;
+    u32 core_clk_sel;
+    u32 icache_autoload;    // W2's two autoload words
+    u32 dcache_autoload;
+    u32 jedec;              // W3's ID, manufacturer in [23:16]
+    u32 sr2;                // W3's status register 2
+    u32 state;
+    u32 ticks_before;
+    u32 ticks_after;
+    u32 canary_at;
+    u32 canary_read;
+    u32 canary_want;
+    u32 freeze_word;
+    u32 thaw_word_i;
+    u32 thaw_word_d;
+    struct sos_flash_words before;
+    struct sos_flash_words after;
+    struct sos_flash_record flash;
+};
+
+// The switch's steps, as the fault record names a read: W2's clock words,
+// SPI0's words and the autoload words; W4's and W8's SYSTIMER; W5's freeze
+// and its unfreeze (the undo of a freeze that did not report is an
+// unfreeze); W6's canary; W9's read-back; W7's freeze and unfreeze. W3's
+// reads are a flash read's own steps (`STEP_F_*`, then the primitive's S7
+// steps), the ID's in command 1 and status register 2's in command 2.
+#define STEP_W_CLOCK    0xE1u
+#define STEP_W_SPI0     0xE2u
+#define STEP_W_CACHE    0xE3u
+#define STEP_W_TIME     0xE4u
+#define STEP_W_FREEZE   0xE5u
+#define STEP_W_CANARY   0xE6u
+#define STEP_W_THAW     0xE7u
+#define STEP_W_AFTER    0xE9u
+#define STEP_W7_FREEZE  0xEAu
+#define STEP_W7_THAW    0xEBu
+
+// The record's `state`: W5's stores made; W7's put-back made; W6's canary
+// read wrong; a cache's freeze that did not report FREEZE_DONE, and was
+// undone; a cache's unfreeze, or the undo of its freeze, that did not
+// report FREEZE_DONE clear.
+#define STATE_STORED        0x01u
+#define STATE_PUT_BACK      0x02u
+#define STATE_CANARY        0x04u
+#define STATE_FREEZE_I      0x10u
+#define STATE_FREEZE_D      0x20u
+#define STATE_THAW_I        0x40u
+#define STATE_THAW_D        0x80u
+#define STATE_THAWS         (STATE_THAW_I | STATE_THAW_D)
+
+// Status register 2's QE bit, which four lines need set.
+#define SR2_QE          0x2u
+
+// The switch's stops (../ABI.md §18e). A flash read's own (0x73 to 0x75,
+// 0x7B) are W3's.
+#define STOP_SWITCH_CLOCK       0x70u
+#define STOP_SWITCH_SPI0        0x71u
+#define STOP_SWITCH_AUTOLOAD    0x72u
+#define STOP_SWITCH_ID          0x76u
+#define STOP_SWITCH_QE          0x77u
+#define STOP_SWITCH_CANARY      0x78u
+#define STOP_SWITCH_NOT_DRAM    0x79u
+#define STOP_SWITCH_FREEZE      0x7Du
+#define STOP_SWITCH_THAW        0x7Eu
+
+// The switch's `mode`: bit 0, the cache reads on four lines (QIO, EBh) and
+// not two (DIO, BBh); bit 1, the flash at half the memory-SPI core clock and
+// not the whole of it.
+#define MODE_QUAD           1u
+#define MODE_HALF           2u
+
 // ---- registers ------------------------------------------------------------
 //
 // Bases from IDF soc/esp32s3/register/soc/reg_base.h; offsets from the header
@@ -260,6 +405,7 @@ struct sos_flash_record {
 #define SPI_CMD             0x00u
 #define SPI_ADDR            0x04u
 #define SPI_CTRL            0x08u
+#define SPI_CTRL2           0x10u
 #define SPI_CLOCK           0x14u
 #define SPI_USER            0x18u
 #define SPI_USER1           0x1Cu
@@ -274,6 +420,9 @@ struct sos_flash_record {
 #define SPI_SRAM_DWR_CMD    0x4Cu
 #define SPI_SRAM_CLK        0x50u
 #define SPI_W0              0x58u
+#define SPI_TIMING_CALI     0xA8u
+#define SPI_DIN_MODE        0xACu
+#define SPI_DIN_NUM         0xB0u
 #define SPI_SMEM_AC         0xDCu
 #define SPI_DDR             0xE0u
 #define SPI_SMEM_DDR        0xE4u
@@ -317,6 +466,89 @@ struct sos_flash_record {
 // FDIN_OCT [5], FDOUT_OCT [4] (0x4004_DD3D's literal 0x2270).
 #define CTRL_KEEP           0xFE6F9C0Fu
 #define CTRL_OCTAL          0x00002270u
+
+// SPI_MEM_CTRL(0) for the cache's reads (W5.1, W5.5): FDUMMY_OUT [3], Q_POL
+// [18] and D_POL [19], IDF's `bootloader_flash_set_dummy_out`: in the dummy
+// phase the controller drives the lines, high, so the read's mode bits
+// M5..M4 go out as 11b and never ask the flash for continuous read. Then the
+// read mode, over `CTRL_KEEP` (the ROM's `esp_rom_spiflash_config_readmode`
+// mask, which keeps those three bits): FASTRD_MODE [13] with FREAD_DIO [23]
+// or FREAD_QIO [24], the ROM's `CSWTCH$195` words for DIO and QIO
+// (0x3FF1_E060).
+#define CTRL_DUMMY_OUT      ((1u << 3) | (1u << 18) | (1u << 19))
+#define CTRL_DIO            0x00802000u
+#define CTRL_QIO            0x01002000u
+
+// SPI_MEM_CTRL2(0) (W5): CS_SETUP_TIME [4:0] and CS_HOLD_TIME [9:5], both
+// 0 in IDF's `bootloader_flash_cs_timing_config` for a flash that is not
+// octal; written only when either reads otherwise.
+#define CTRL2_CS_TIMES      0x3FFu
+
+// SPI0's USER, USER1 and USER2 for the cache's reads (W5.6 to W5.8), the ROM's
+// `spi_cache_mode_switch` (0x4004_A190) for QIO and DIO: USER's USR_MOSI
+// [27] cleared and USR_ADDR, USR_DUMMY and USR_MISO [30:28] set; USER1's
+// address length [31:26] 23, a 24-bit address, over the rest of its word
+// but the dummy, and its dummy [5:0] the wait less one, 5 for QIO's 6 and 3
+// for DIO's 4 (the ROM adds its extra dummy for SPI0, 0 on the part); and
+// USER2's command [15:0] EBh or BBh over its 16-bit length.
+#define USER_CACHE_SET      0x70000000u
+#define USER1_CACHE_KEEP    0x03FFFFC0u
+#define USER1_CACHE_ADDR    0x5C000000u
+#define USER1_DUMMY_QIO     5u
+#define USER1_DUMMY_DIO     3u
+#define USER2_CACHE_KEEP    0xFFFF0000u
+#define FLASH_FAST_QIO      0xEBu
+#define FLASH_FAST_DIO      0xBBu
+
+// SPI_MEM_CLOCK(0) for the flash (W5.9, the last store), as IDF's
+// `mspi_timing_ll_set_flash_clock` encodes a divider: CLK_EQU_SYSCLK [31]
+// alone for 1, the ROM's `esp_rom_spiflash_config_clk(1, 0)` word too; for
+// 2, CLKCNT_N [23:16] and CLKCNT_L [7:0] 1 and CLKCNT_H [15:8] 0.
+#define CLOCK_DIV_1         0x80000000u
+#define CLOCK_DIV_2         0x00010001u
+
+// EXTMEM_ICACHE_AUTOLOAD_CTRL_REG and EXTMEM_DCACHE_AUTOLOAD_CTRL_REG
+// (extmem_reg.h), AUTOLOAD_ENA bit 2: a cache that fetches on its own. Read
+// only.
+#define ICACHE_AUTOLOAD     0x600C40A0u
+#define DCACHE_AUTOLOAD     0x600C404Cu
+#define AUTOLOAD_ENA        (1u << 2)
+
+// EXTMEM_ICACHE_FREEZE_REG (0x600C_4154) and EXTMEM_DCACHE_FREEZE_REG
+// (0x600C_4150) (extmem_reg.h): FREEZE_ENA [0] freezes the cache, so no
+// miss of it, the CPU's, a preload's or an autoload's, reaches SPI0;
+// FREEZE_MODE [1], 0, answers a CPU's miss busy until the cache is
+// unfrozen, IDF's CACHE_FREEZE_ACK_BUSY (rom/cache.h); FREEZE_DONE [2],
+// read only, is set once the cache has stopped and clear once it runs again.
+// The ROM's `Cache_Freeze_ICache_Enable` (0x4004_E8A8) clears FREEZE_MODE
+// for ACK_BUSY in one store, sets FREEZE_ENA in a second and reads until
+// FREEZE_DONE is set; `Cache_Freeze_ICache_Disable` (0x4004_E8E8) clears
+// FREEZE_ENA and reads until FREEZE_DONE is clear; the DCache's
+// (0x4004_E910, 0x4004_E950) are the same on their own word.
+#define ICACHE_FREEZE       0x600C4154u
+#define DCACHE_FREEZE       0x600C4150u
+#define FREEZE_ENA          (1u << 0)
+#define FREEZE_MODE_ERROR   (1u << 1)
+#define FREEZE_DONE         (1u << 2)
+
+// The canary and the timed regions (../ABI.md §18e): the caller's block in
+// the flash's data window, 64 bytes of canary, then two regions of 4 KiB,
+// each read at 16-byte strides. The canary's bytes are `canary_byte`'s.
+#define CANARY_BYTES        64u
+#define TIMED_BYTES         4096u
+#define TIMED_STRIDE        16u
+// The canary's first eight bytes in pairs, each byte then its complement:
+// 0x55 0xAA, 0x00 0xFF, 0x0F 0xF0, 0x33 0xCC.
+#define CANARY_PAIRS        0x330F0055u
+#define CANARY_PATTERN      8u
+
+// SYSTIMER (systimer_reg.h): UNIT0_OP's UPDATE [30] latches UNIT0's count,
+// VALUE_VALID [29] says it is latched, and UNIT0_VALUE_LO holds its low
+// word, ticks of 1/16 us. The clock keys start the counter.
+#define SYSTIMER_UNIT0_OP   0x60023004u
+#define SYSTIMER_UPDATE     (1u << 30)
+#define SYSTIMER_VALID      (1u << 29)
+#define SYSTIMER_UNIT0_LO   0x60023044u
 
 // SPI_MEM_CTRL(1) for a flash read: every bit clear but WP [21], as IDF's
 // `bootloader_flash_execute_command_common` writes it (`ctrl.val = 0`, then
@@ -508,6 +740,31 @@ struct sos_psram_fault sos_psram_fault;
 IRAM u32 sos_psram_fault_record(void) {
     return (u32)(unsigned long)&sos_psram_fault;
 }
+
+// More reads to lie to, for a harness that needs a whole machine's words
+// (the switch's, ../ABI.md §18f): each of the first `count` entries answers
+// every read that matches its `step`, `command` and `addr` (0 in any of the
+// three: any) with its `value`, after the record above has had its turn.
+// The call counts the reads it answered.
+#define FAULT_WORDS 16u
+struct sos_flash_fault_word {
+    u32 step;
+    u32 command;
+    u32 addr;
+    u32 value;
+};
+
+struct sos_flash_fault_table {
+    u32 count;
+    u32 hits;
+    struct sos_flash_fault_word words[FAULT_WORDS];
+};
+
+struct sos_flash_fault_table sos_flash_fault_table;
+
+IRAM u32 sos_flash_fault_words(void) {
+    return (u32)(unsigned long)&sos_flash_fault_table;
+}
 #endif
 
 // The number of the command under way in this call: 1 for the first.
@@ -540,7 +797,51 @@ __attribute__((section(".data.sos_flash_short_line")))
 static char flash_short_line[] =
     "SOS-S3: flash: SPI1 command 0x.. did not finish\n";
 
+// The line the switch writes when its canary reads wrong, once SPI0 is put
+// back, with the key's name written in: `d` or `q` at `CANARY_LINE_LINES`
+// and `8` or `4` at `CANARY_LINE_SPEED`.
+#define CANARY_LINE_LINES   14u
+#define CANARY_LINE_SPEED   17u
+__attribute__((section(".data.sos_flash_canary_line")))
+static char canary_line[] =
+    "SOS-S3: flash dio80: canary mismatch\n";
+
+// The line the switch writes when a cache does not report its unfreeze:
+// the caller's next fetch from flash may then never be answered.
+__attribute__((section(".data.sos_flash_thaw_line")))
+static char thaw_line[] =
+    "SOS-S3: flash: a cache did not report its unfreeze\n";
+
+// The words `sos_flash_switch` reads before and after its stores, in
+// `struct sos_flash_words`' order. In `.data` by name, as `short_line` is.
+__attribute__((section(".data.sos_flash_switch_addrs")))
+static u32 switch_addrs[SWITCH_WORDS] = {
+    SPI0 + SPI_CLOCK, SPI0 + SPI_CTRL, SPI0 + SPI_CTRL2, SPI0 + SPI_USER,
+    SPI0 + SPI_USER1, SPI0 + SPI_USER2, SPI0 + SPI_DDR, SPI0 + SPI_TIMING_CALI,
+    SPI0 + SPI_DIN_MODE, SPI0 + SPI_DIN_NUM, IO_MUX_GPIO(PAD_HD),
+    IO_MUX_GPIO(PAD_WP), GPIO_IN_SEL(SIG_HD), GPIO_IN_SEL(SIG_WP),
+};
+
 // ---- access -----------------------------------------------------------------
+
+#ifdef SOS_PSRAM_FAULT
+// The fault table's answer for the read at `step` of `addr`, or `v`, what
+// the register read.
+static __attribute__((noinline)) IRAM u32 fault_word(u32 step, u32 addr,
+                                                     u32 v) {
+    struct sos_flash_fault_table *t = &sos_flash_fault_table;
+    for (u32 i = 0; i < t->count && i < FAULT_WORDS; i++) {
+        struct sos_flash_fault_word *w = &t->words[i];
+        if ((w->step == 0 || w->step == step)
+            && (w->command == 0 || w->command == command_number)
+            && (w->addr == 0 || w->addr == addr)) {
+            t->hits++;
+            return w->value;
+        }
+    }
+    return v;
+}
+#endif
 
 static inline IRAM u32 rd(u32 step, u32 addr) {
     u32 v = *(volatile u32 *)(unsigned long)addr;
@@ -556,6 +857,9 @@ static inline IRAM u32 rd(u32 step, u32 addr) {
         }
         f->hits++;
         return f->value;
+    }
+    if (sos_flash_fault_table.count != 0) {
+        return fault_word(step, addr, v);
     }
 #else
     (void)step;
@@ -1279,6 +1583,8 @@ static IRAM u32 flash_stop(struct sos_flash_record *f, u32 code, u32 read,
     return code;
 }
 
+static IRAM u32 flash_read_in(struct sos_flash_record *f, u32 op, u32 addr);
+
 // One read of the flash (../ABI.md §18a): `op`, one of `flash_read_bits`'
 // five, and for SFDP its address `addr`, sent on SPI1 as IDF's
 // `bootloader_flash_execute_command_common` sends it, at the clock SPI1
@@ -1295,9 +1601,14 @@ IRAM u32 sos_flash_read(u32 record_addr, u32 op, u32 addr) {
     if (!in_dram(record_addr, sizeof(struct sos_flash_record))) {
         return STOP_FLASH_NOT_DRAM;
     }
-    struct sos_flash_record *f =
-        (struct sos_flash_record *)(unsigned long)record_addr;
     command_number = 0;
+    return flash_read_in((struct sos_flash_record *)(unsigned long)record_addr,
+                         op, addr);
+}
+
+// `sos_flash_read`'s read, into the DRAM record `f`, as the next command of
+// the call under way.
+static IRAM u32 flash_read_in(struct sos_flash_record *f, u32 op, u32 addr) {
     f->stop = 0;
     f->read = 0;
     f->expect = 0;
@@ -1355,4 +1666,393 @@ IRAM u32 sos_flash_read(u32 record_addr, u32 op, u32 addr) {
     }
     f->answer = bits < 32 ? w & ((1u << bits) - 1u) : w;
     return 0;
+}
+
+// ---- the flash switch -------------------------------------------------------
+
+static IRAM u32 switch_stop(struct sos_flash_switch_record *r, u32 code,
+                            u32 read, u32 expect) {
+    r->stop = code;
+    r->read = read;
+    r->expect = expect;
+    return code;
+}
+
+// The canary's byte at offset `i`: the four pairs of `CANARY_PAIRS`, low
+// byte first, then each byte its own offset.
+static IRAM u32 canary_byte(u32 i) {
+    if (i >= CANARY_PATTERN) {
+        return i;
+    }
+    u32 b = (CANARY_PAIRS >> (8u * (i >> 1))) & 0xFFu;
+    return (i & 1u) ? b ^ 0xFFu : b;
+}
+
+// SYSTIMER's UNIT0, its low word once latched; 0 if the latch is not
+// reported within POLL_BOUND reads.
+static IRAM u32 systimer_low(void) {
+    wr(SYSTIMER_UNIT0_OP, SYSTIMER_UPDATE);
+    for (u32 n = 0; n < POLL_BOUND; n++) {
+        if (rd(STEP_W_TIME, SYSTIMER_UNIT0_OP) & SYSTIMER_VALID) {
+            return rd(STEP_W_TIME, SYSTIMER_UNIT0_LO);
+        }
+    }
+    return 0;
+}
+
+// `TIMED_BYTES` from `base` read at `TIMED_STRIDE`, each load a line the
+// data cache has not held: how many of SYSTIMER's ticks the loads took.
+static IRAM u32 timed_read(u32 base) {
+    u32 start = systimer_low();
+    for (u32 off = 0; off < TIMED_BYTES; off += TIMED_STRIDE) {
+        (void)*(volatile u32 *)(unsigned long)(base + off);
+    }
+    return systimer_low() - start;
+}
+
+// Every word of `switch_addrs`, read at `step` into `w`.
+static IRAM void read_words(u32 step, struct sos_flash_words *w) {
+    u32 *out = (u32 *)w;
+    for (u32 i = 0; i < SWITCH_WORDS; i++) {
+        out[i] = rd(step, switch_addrs[i]);
+    }
+}
+
+// W2's comparison of one of SPI0's words: 0 when `read` is `expect`, else
+// stop 0x71 naming the word by its index `at`.
+static IRAM u32 spi0_differs(struct sos_flash_switch_record *r, u32 at,
+                             u32 read, u32 expect) {
+    if (read == expect) {
+        return 0;
+    }
+    r->at = at;
+    return switch_stop(r, STOP_SWITCH_SPI0, read, expect);
+}
+
+// W2's SPI0 check: CLOCK, CTRL, USER1 and USER2 as described, and DDR,
+// TIMING_CALI, DIN_MODE and DIN_NUM 0: single data rate, no input delay and
+// no extra input cycle. Answers 0 or 0x71.
+static IRAM u32 check_spi0(struct sos_flash_expect *e,
+                           struct sos_flash_switch_record *r) {
+    struct sos_flash_words *b = &r->before;
+    u32 *w = (u32 *)b;
+    u32 code = spi0_differs(r, W_CLOCK, b->clock, e->clock);
+    if (code == 0) {
+        code = spi0_differs(r, W_CTRL, b->ctrl, e->ctrl);
+    }
+    if (code == 0) {
+        code = spi0_differs(r, W_USER1, b->user1, e->user1);
+    }
+    if (code == 0) {
+        code = spi0_differs(r, W_USER2, b->user2, e->user2);
+    }
+    for (u32 i = W_DDR; code == 0 && i <= W_DIN_NUM; i++) {
+        code = spi0_differs(r, i, w[i], 0);
+    }
+    return code;
+}
+
+// A line written from here: the caller's next fetch from flash may not be
+// answered.
+static IRAM void iram_line(char *line, u32 len) {
+    for (u32 i = 0; i < len; i++) {
+        uart_byte((u32)(unsigned char)line[i]);
+    }
+}
+
+// The unfreeze of the cache `cache` (0 the instruction cache, 1 the data
+// cache), whose EXTMEM freeze word is `reg`, as the ROM's
+// `Cache_Freeze_*Cache_Disable` makes it: FREEZE_ENA cleared, then
+// FREEZE_DONE read until clear, at most POLL_BOUND times, at W5's step or,
+// with `w7`, W7's. Answers 1 once it reads clear; else 0, with
+// `STATE_THAW_I` or `_D` set and the last word in `thaw_word_i` or `_d`.
+static IRAM u32 cache_thaw(struct sos_flash_switch_record *r, u32 reg,
+                           u32 cache, u32 w7) {
+    u32 step = w7 ? STEP_W7_THAW : STEP_W_THAW;
+    u32 v = rd(step, reg);
+    wr(reg, v & ~FREEZE_ENA);
+    for (u32 n = 0; n < POLL_BOUND; n++) {
+        v = rd(step, reg);
+        if (!(v & FREEZE_DONE)) {
+            return 1;
+        }
+    }
+    if (cache) {
+        r->state |= STATE_THAW_D;
+        r->thaw_word_d = v;
+    } else {
+        r->state |= STATE_THAW_I;
+        r->thaw_word_i = v;
+    }
+    return 0;
+}
+
+// The freeze of the cache `cache` (as `cache_thaw`), as the ROM's
+// `Cache_Freeze_*Cache_Enable(CACHE_FREEZE_ACK_BUSY)` makes it: FREEZE_MODE
+// cleared, FREEZE_ENA set, then FREEZE_DONE read for, at most POLL_BOUND
+// times, at W5's step or, with `w7`, W7's. Answers 1 once it reads set.
+// Otherwise the freeze is undone, as an unfreeze, since the cache may yet
+// freeze after the bound, and the answer is 0, with `STATE_FREEZE_I` or
+// `_D` set and the last word read in `freeze_word`.
+static IRAM u32 cache_freeze(struct sos_flash_switch_record *r, u32 reg,
+                             u32 cache, u32 w7) {
+    u32 step = w7 ? STEP_W7_FREEZE : STEP_W_FREEZE;
+    u32 v = rd(step, reg);
+    wr(reg, v & ~FREEZE_MODE_ERROR);
+    v = rd(step, reg);
+    wr(reg, v | FREEZE_ENA);
+    for (u32 n = 0; n < POLL_BOUND; n++) {
+        v = rd(step, reg);
+        if (v & FREEZE_DONE) {
+            return 1;
+        }
+    }
+    r->state |= cache ? STATE_FREEZE_D : STATE_FREEZE_I;
+    r->freeze_word = v;
+    (void)cache_thaw(r, reg, cache, w7);
+    return 0;
+}
+
+// The freeze of both caches, the instruction cache first, as IDF's
+// `cache_ll_freeze_cache(.., CACHE_TYPE_ALL, ..)` orders them. When one does
+// not report, its freeze is undone (`cache_freeze`) and so is the
+// instruction cache's if it was the data cache's. Answers 0; 0x7D when every
+// undo reported; or 0x7E when one did not, whose line the caller writes.
+static IRAM u32 caches_freeze(struct sos_flash_switch_record *r, u32 w7) {
+    if (cache_freeze(r, ICACHE_FREEZE, 0, w7)) {
+        if (cache_freeze(r, DCACHE_FREEZE, 1, w7)) {
+            return 0;
+        }
+        (void)cache_thaw(r, ICACHE_FREEZE, 0, w7);
+    }
+    return switch_stop(r, (r->state & STATE_THAWS) ? STOP_SWITCH_THAW
+                                                   : STOP_SWITCH_FREEZE,
+                       r->freeze_word, FREEZE_DONE);
+}
+
+// The unfreeze of both, in the same order (`cache_ll_unfreeze_cache`), each
+// tried whatever the other reported. Answers 0, or 0x7E, whose line the
+// caller writes.
+static IRAM u32 caches_thaw(struct sos_flash_switch_record *r, u32 w7) {
+    u32 ok = cache_thaw(r, ICACHE_FREEZE, 0, w7);
+    ok &= cache_thaw(r, DCACHE_FREEZE, 1, w7);
+    if (ok) {
+        return 0;
+    }
+    return switch_stop(r, STOP_SWITCH_THAW, 0, 0);
+}
+
+// W5: the stores, in order, each word made from what W2 read (../ABI.md
+// §18e), between the caches' freeze and their unfreeze. No flash read is
+// made between them, and none can be: the kernel runs from IRAM here, on
+// DRAM data, with interrupts masked, both caches' autoload off and both
+// caches frozen, so no fill begun before the freeze is still on the bus.
+static IRAM void switch_stores(struct sos_flash_switch_record *r, u32 mode) {
+    struct sos_flash_words *b = &r->before;
+    u32 quad = mode & MODE_QUAD;
+    r->state |= STATE_STORED;
+    // W5.1: the dummy phase driven high, before any read mode that has one.
+    u32 ctrl = b->ctrl | CTRL_DUMMY_OUT;
+    wr(SPI0 + SPI_CTRL, ctrl);
+    // W5.2: no extra chip-select setup or hold.
+    if (b->ctrl2 & CTRL2_CS_TIMES) {
+        wr(SPI0 + SPI_CTRL2, b->ctrl2 & ~CTRL2_CS_TIMES);
+    }
+    if (quad) {
+        // W5.3: pads 27 and 28 to SPIHD and SPIWP; W5.4: their input
+        // signals straight from the IO MUX (the ROM's
+        // `esp_rom_spiflash_select_qio_pins`, 0x4004_95C4).
+        wr(IO_MUX_GPIO(PAD_HD), (b->pad_hd & ~MCU_SEL_MASK)
+                                | (FUNC_SPIHD_WP << MCU_SEL_SHIFT));
+        wr(IO_MUX_GPIO(PAD_WP), (b->pad_wp & ~MCU_SEL_MASK)
+                                | (FUNC_SPIHD_WP << MCU_SEL_SHIFT));
+        wr(GPIO_IN_SEL(SIG_HD), b->insel_hd & ~SIG_IN_SEL);
+        wr(GPIO_IN_SEL(SIG_WP), b->insel_wp & ~SIG_IN_SEL);
+    }
+    // W5.5: the read mode.
+    wr(SPI0 + SPI_CTRL, (ctrl & CTRL_KEEP) | (quad ? CTRL_QIO : CTRL_DIO));
+    // W5.6 to W5.8: the phases, the address and the wait, the command.
+    wr(SPI0 + SPI_USER, (b->user & ~USR_MOSI) | USER_CACHE_SET);
+    wr(SPI0 + SPI_USER1, (b->user1 & USER1_CACHE_KEEP) | USER1_CACHE_ADDR
+                         | (quad ? USER1_DUMMY_QIO : USER1_DUMMY_DIO));
+    wr(SPI0 + SPI_USER2, (b->user2 & USER2_CACHE_KEEP)
+                         | (quad ? FLASH_FAST_QIO : FLASH_FAST_DIO));
+    // W5.9: the clock, last.
+    wr(SPI0 + SPI_CLOCK, (mode & MODE_HALF) ? CLOCK_DIV_2 : CLOCK_DIV_1);
+}
+
+// W7's stores: every word W5 stored put back to what W2 read, the clock
+// first.
+static IRAM void switch_put_back(struct sos_flash_switch_record *r,
+                                 u32 mode) {
+    struct sos_flash_words *b = &r->before;
+    r->state |= STATE_PUT_BACK;
+    wr(SPI0 + SPI_CLOCK, b->clock);
+    wr(SPI0 + SPI_USER2, b->user2);
+    wr(SPI0 + SPI_USER1, b->user1);
+    wr(SPI0 + SPI_USER, b->user);
+    wr(SPI0 + SPI_CTRL, b->ctrl);
+    if (mode & MODE_QUAD) {
+        wr(GPIO_IN_SEL(SIG_HD), b->insel_hd);
+        wr(GPIO_IN_SEL(SIG_WP), b->insel_wp);
+        wr(IO_MUX_GPIO(PAD_HD), b->pad_hd);
+        wr(IO_MUX_GPIO(PAD_WP), b->pad_wp);
+    }
+    if (b->ctrl2 & CTRL2_CS_TIMES) {
+        wr(SPI0 + SPI_CTRL2, b->ctrl2);
+    }
+}
+
+// W6: the canary at `canary`, read through the data cache, word by word
+// against `canary_byte`. At the first word that differs, recorded in
+// `canary_*` with `STATE_CANARY`, W7: both caches frozen as for W5, at
+// W7's own steps; every word W5 stored put back; both caches unfrozen; then
+// the line from here. A freeze that does not report is undone and SPI0 is
+// put back all the same: with the caches running when the undo reports, and
+// with a cache that may still be frozen when it does not. Answers 0; 0x78
+// when every freeze and unfreeze reported; 0x7D when a freeze did not and
+// every undo did; 0x7E, once its line is written, when an unfreeze or an
+// undo did not.
+static IRAM u32 check_canary(struct sos_flash_switch_record *r, u32 mode,
+                             u32 canary) {
+    for (u32 at = 0; at < CANARY_BYTES; at += 4) {
+        u32 want = canary_byte(at) | (canary_byte(at + 1) << 8)
+                   | (canary_byte(at + 2) << 16) | (canary_byte(at + 3) << 24);
+        u32 got = rd(STEP_W_CANARY, canary + at);
+        if (got != want) {
+            r->state |= STATE_CANARY;
+            r->canary_at = at;
+            r->canary_read = got;
+            r->canary_want = want;
+            u32 code = caches_freeze(r, 1);
+            switch_put_back(r, mode);
+            if (code == 0) {
+                code = caches_thaw(r, 1);
+            }
+            canary_line[CANARY_LINE_LINES] = (mode & MODE_QUAD) ? 'q' : 'd';
+            canary_line[CANARY_LINE_SPEED] = (mode & MODE_HALF) ? '4' : '8';
+            iram_line(canary_line, sizeof(canary_line) - 1);
+            if (code == STOP_SWITCH_THAW) {
+                iram_line(thaw_line, sizeof(thaw_line) - 1);
+            }
+            if (code) {
+                return code;
+            }
+            r->at = at;
+            return switch_stop(r, STOP_SWITCH_CANARY, got, want);
+        }
+    }
+    return 0;
+}
+
+// The switch of the cache's flash reads (../ABI.md §18e): from the ROM's
+// slow read at divide by 4 to DIO (BBh) or, with `MODE_QUAD`, QIO (EBh), at
+// divide by 1 of the memory-SPI core clock or, with `MODE_HALF`, by 2.
+// `regions` is the canary and the two timed regions, in the flash's data
+// window, which no load has reached. In order:
+//   W1  the description and the record lie in DRAM (0x79; nothing is
+//       written to the record);
+//   W2  the clock words as described (0x70); SPI0's words as described,
+//       and DDR, TIMING_CALI, DIN_MODE and DIN_NUM 0 (0x71); neither
+//       cache's autoload on (0x72);
+//   W3  the flash's JEDEC ID (9Fh) as described (0x76), then status
+//       register 2 (35h), whose QE bit `MODE_QUAD` needs set (0x77): each a
+//       flash read, with its own stops (0x73 to 0x75, 0x7B);
+//   W4  the first timed read;
+//   W5  both caches frozen (0x7D, its freeze undone and nothing stored to
+//       SPI0), the stores, both caches unfrozen (0x7E, also for an undo
+//       that did not report, its line written from here: the caller's next
+//       fetch from flash may never be answered);
+//   W6  the canary (0x78, once W7 has put SPI0 back; or W7's own 0x7D or
+//       0x7E);
+//   W8  the second timed read; W9 the words read back.
+// No stop before W5's stores writes to SPI0. Answers 0 or the stop code;
+// after 0x75 or 0x7E the caller halts.
+IRAM u32 sos_flash_switch(u32 expect_addr, u32 record_addr, u32 mode,
+                          u32 regions) {
+    // W1
+    if (!in_dram(expect_addr, sizeof(struct sos_flash_expect))
+        || !in_dram(record_addr, sizeof(struct sos_flash_switch_record))) {
+        return STOP_SWITCH_NOT_DRAM;
+    }
+    struct sos_flash_expect *e =
+        (struct sos_flash_expect *)(unsigned long)expect_addr;
+    struct sos_flash_switch_record *r =
+        (struct sos_flash_switch_record *)(unsigned long)record_addr;
+    r->stop = 0;
+    r->read = 0;
+    r->expect = 0;
+    r->at = 0;
+    r->jedec = 0;
+    r->sr2 = 0;
+    r->state = 0;
+    r->ticks_before = 0;
+    r->ticks_after = 0;
+    r->canary_at = 0;
+    r->canary_read = 0;
+    r->canary_want = 0;
+    r->freeze_word = 0;
+    r->thaw_word_i = 0;
+    r->thaw_word_d = 0;
+    command_number = 0;
+    // W2
+    r->sysclk = rd(STEP_W_CLOCK, SYSCLK_CONF);
+    r->cpu_per = rd(STEP_W_CLOCK, CPU_PER_CONF);
+    r->core_clk_sel = rd(STEP_W_CLOCK, CORE_CLK_SEL);
+    if ((r->sysclk & SYSCLK_MASK) != e->sysclk
+        || (r->cpu_per & CPU_PER_MASK) != e->cpu_per
+        || (r->core_clk_sel & CORE_CLK_SEL_MASK) != e->core_clk_sel) {
+        return switch_stop(r, STOP_SWITCH_CLOCK, r->sysclk, e->sysclk);
+    }
+    read_words(STEP_W_SPI0, &r->before);
+    u32 code = check_spi0(e, r);
+    if (code) {
+        return code;
+    }
+    r->icache_autoload = rd(STEP_W_CACHE, ICACHE_AUTOLOAD);
+    r->dcache_autoload = rd(STEP_W_CACHE, DCACHE_AUTOLOAD);
+    if ((r->icache_autoload | r->dcache_autoload) & AUTOLOAD_ENA) {
+        return switch_stop(r, STOP_SWITCH_AUTOLOAD, r->icache_autoload,
+                           r->dcache_autoload);
+    }
+    // W3
+    code = flash_read_in(&r->flash, FLASH_RDID, 0);
+    if (code) {
+        return switch_stop(r, code, r->flash.read, r->flash.expect);
+    }
+    u32 id = r->flash.answer;
+    r->jedec = ((id & 0xFFu) << 16) | (id & 0xFF00u) | ((id >> 16) & 0xFFu);
+    if (r->jedec != e->jedec) {
+        return switch_stop(r, STOP_SWITCH_ID, r->jedec, e->jedec);
+    }
+    code = flash_read_in(&r->flash, FLASH_RDSR2, 0);
+    if (code) {
+        return switch_stop(r, code, r->flash.read, r->flash.expect);
+    }
+    r->sr2 = r->flash.answer;
+    if ((mode & MODE_QUAD) && !(r->sr2 & SR2_QE)) {
+        return switch_stop(r, STOP_SWITCH_QE, r->sr2, SR2_QE);
+    }
+    // W4, W5
+    r->ticks_before = timed_read(regions + CANARY_BYTES);
+    code = caches_freeze(r, 0);
+    if (code == 0) {
+        switch_stores(r, mode);
+        code = caches_thaw(r, 0);
+    }
+    if (code == STOP_SWITCH_THAW) {
+        iram_line(thaw_line, sizeof(thaw_line) - 1);
+    }
+    if (code) {
+        return code;
+    }
+    // W6, W7
+    code = check_canary(r, mode, regions);
+    if (code == 0) {
+        // W8
+        r->ticks_after = timed_read(regions + CANARY_BYTES + TIMED_BYTES);
+    }
+    // W9
+    read_words(STEP_W_AFTER, &r->after);
+    return code;
 }

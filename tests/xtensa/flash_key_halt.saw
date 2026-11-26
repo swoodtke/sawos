@@ -1,0 +1,100 @@
+// A flash key's own `flash_init`, as `kmain` runs it, on the emulator
+// (../../hal/xtensa-esp32s3/ABI.md §18f). Built at the case's clock key
+// and flash key, and only with `mspi.c`'s fault build (`-DSOS_PSRAM_FAULT`,
+// the case key `psram_fault`). It holds what `flash_switch.saw`, which calls
+// the switch itself, cannot: the mode each key passes, by the stores it
+// makes, and the key's halt after a read that did not finish (0x75) or an
+// unfreeze that did not report (0x7E).
+//
+// The case's block is `flash_switch.saw`'s (`_flash_switch_case_asm`); only
+// its lies are read, a lie's address of 0xCA0000NN being the canary's byte
+// NN. They go in the table, and `sos_flash_case_setup` stores the case's
+// SPI_MEM_MISC(1) word, both before `hal.clock_init()`: the clock key, then
+// the flash key against the emulator's description.
+//
+//   (the clock key's line)
+//   (the switch's own line from IRAM, for a stop that writes one)
+//   SOS-S3: flash KEY ...                        the switch's line
+//   SOS flashkey: the boot went on               unless the key halted
+//   SOS-S3: halt pass
+//
+// After a halt the run ends at the emulator's deadline, its last line the
+// switch's. A board image of this harness is refused: the runner allows the
+// fault record in a fault harness's emulator image only.
+
+import kcore.{console}
+import hal
+
+extern "C" {
+    func sos_flash_switch_case() -> UInt
+    func sos_flash_case_setup()
+    func sos_flash_fault_words() -> UInt
+    func sos_flash_regions() -> UInt
+}
+
+/// One lie, `mspi.c`'s `struct sos_flash_fault_word`.
+struct FaultWord {
+    step: UInt32,
+    command: UInt32,
+    addr: UInt32,
+    value: UInt32,
+}
+
+/// The table's room, `mspi.c`'s FAULT_WORDS.
+static FAULT_WORDS: Int = 16
+
+/// `mspi.c`'s `struct sos_flash_fault_table`.
+struct FaultTable {
+    count: UInt32,
+    hits: UInt32,
+    words: [FaultWord; 16],
+}
+
+/// The case's block up to its lies, as `_flash_switch_case_asm` lays it
+/// out: the mode, the description's words and addresses, which this harness
+/// does not read, then the lies.
+struct CaseBlock {
+    unread: [UInt32; 13],
+    fault_count: UInt32,
+    faults: [FaultWord; 16],
+}
+
+static_assert(sizeof<CaseBlock>() == 312, "the runner's block")
+
+/// A lie's address that names the canary's byte NN: 0xCA0000NN.
+static CANARY_TAG: UInt32 = 0xCA00_0000
+static CANARY_TAG_MASK: UInt32 = 0xFF00_0000
+static CANARY_OFFSET_MASK: UInt32 = 0xFF
+
+/// The block's lies, each address that names a canary byte made the byte's.
+func placed(faults: [FaultWord; 16]) unsafe -> [FaultWord; 16] {
+    var out = faults
+    let canary = sos_flash_regions() as UInt32
+    var i = 0
+    while i < FAULT_WORDS {
+        if (out[i].addr & CANARY_TAG_MASK) == CANARY_TAG {
+            out[i].addr = canary + (out[i].addr & CANARY_OFFSET_MASK)
+        }
+        i += 1
+    }
+    out
+}
+
+@export("kmain")
+func kmain() unsafe {
+    let b = UnsafeMemory<CaseBlock, Normal>(sos_flash_switch_case()).read()
+    let table = UnsafeMemory<FaultTable, Normal>(sos_flash_fault_words())
+    let count = if (b.fault_count as Int) < FAULT_WORDS {
+        b.fault_count
+    } else {
+        FAULT_WORDS as UInt32
+    }
+    table.words.write(placed(b.faults))
+    table.hits.write(0)
+    table.count.write(count)
+    sos_flash_case_setup()
+    hal.clock_init()
+    table.count.write(0)
+    console().write_str("SOS flashkey: the boot went on\n")
+    hal.exit_pass()
+}

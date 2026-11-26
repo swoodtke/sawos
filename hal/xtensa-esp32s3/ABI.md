@@ -2634,10 +2634,11 @@ clock = "xtal40"
 stall = "on"
 ```
 
-The names and values are this board's: `board.toml`'s `[keys.clock]` and
-`[keys.stall]` list each key's module (`s3clock`, `s3stall`) and its values.
-A value names a directory: the module's path in `modules` with the value in
-place of its `*`, so `xtal40` is `keys/clock-xtal40` and `on` is
+The names and values are this board's: `board.toml`'s `[keys.clock]`,
+`[keys.flash]` and `[keys.stall]` list each key's module (`s3clock`,
+`s3flash`, `s3stall`) and its values; the flash key is §18d's. A value
+names a directory: the module's path in `modules` with the value in place
+of its `*`, so `xtal40` is `keys/clock-xtal40` and `on` is
 `keys/stall-on`. `sosimage build` and `sosimage flash` refuse a key or a
 value the board does not list, by name, and compile the kernel with each
 stated key's module mapped to its value's directory (`keyed_profile` in
@@ -2796,8 +2797,10 @@ the chip-select timing (`bootloader_init_flash_configure`,
 read (SPI_MEM_CTRL 0x0020_0000: no fast-read or multi-line bit) with no
 extra dummy bytes from the ROM (the part's run of `s3_mem_probe` read
 `rom_dummy_spi0` 0; §15a describes the line); the sources give
-no reading that those settings hold at 40 or 80 MHz, so the flash stays at
-the 20 MHz the ROM's own divider names.
+no reading that those settings hold at 40 or 80 MHz, so the clock keys
+leave the flash at the 20 MHz the ROM's own divider names. Raising it means
+changing the read mode with the divider, the dummy output and the
+chip-select timing, which is the flash key's switch (§18d, §18e).
 
 The TIMG watchdogs count APB-derived clocks (`TIMER_SRC_CLK_APB` is the
 timer groups' default, soc/esp32s3/include/soc/clk_tree_defs.h); `_start`
@@ -4620,7 +4623,11 @@ its JEDEC ID, its status registers and its SFDP tables, means sending it
 commands on SPI1 with chip select 0 enabled, which no image did before. This
 section is how that is done, and that nothing else is: the read, its checks
 and its stores (§18a); what holds it on the emulator and in every image
-(§18b); and the probe that reads the part, board stage F0 (§18c).
+(§18b); and the probe that reads the part, board stage F0 (§18c). Then the
+switch of the cache's reads from the ROM's slow read to DIO or QIO at 80 or
+40 MHz, which those reads guard: the flash key that chooses it (§18d), the
+switch's checks, stores and canary (§18e), what holds it on the emulator
+(§18f), and its board stages, F1 to F3 (§18g).
 
 - `kernel/mspi.c`'s `sos_flash_read` sends one read, from IRAM, under the
   rules of §16d, and returns at the first check that fails with a record of
@@ -4631,6 +4638,11 @@ and its stores (§18a); what holds it on the emulator and in every image
   stop's record says (`flash_stop_line`).
 - `tests/xtensa/s3_flash_probe.saw` is the probe, F0; `flash_fault.saw` is
   the fault build's harness (§18b).
+- `kernel/mspi.c`'s `sos_flash_switch` makes the switch, from IRAM, every
+  check before its first store; `keys/flash-*/` are the flash key's values
+  and `keys/flash-common/` (`s3flashkit`) their description, call and
+  lines; `tests/xtensa/flash_switch.saw` is its fault build's harness
+  (§18f).
 
 ### 18a. The read, its checks and its stores
 
@@ -5050,3 +5062,650 @@ set, a QER outside 001b, 100b and 101b, SPI0 words other than §15c's, or a
 SPI1 line that is not `as before them` is a finding to understand before
 anything changes the flash's mode; the first two the probe stops on
 itself.
+
+### 18d. The flash key
+
+The cache reads the flash as the mask ROM leaves it: `03h`, slow read, on
+one line, at divide by 4 of the memory-SPI core clock (§14d, §15c), 20 MHz
+on the PLL. The flash key (`s3flash`, `keys/flash-*/`) chooses how the
+cache reads it instead, for the image it is built into:
+
+```
+key    the cache's read                       clock          needs
+rom    03h on one line, the ROM's             core / 4       -
+dio80  BBh, address and data on two lines,    core / 1:      a clock key on
+       2 mode and 2 wait clocks               80 MHz         the PLL
+qio80  EBh, address and data on four lines,   core / 1:      a clock key on
+       2 mode and 4 wait clocks               80 MHz         the PLL; QE set
+dio40  dio80's                                core / 2:      as dio80
+                                              40 MHz
+qio40  qio80's                                core / 2:      as qio80
+                                              40 MHz
+```
+
+`rom` is the default everywhere and writes nothing: an image at it compiles
+none of the switch, and its kernel's code is the bytes it is without the
+key. The two 40 MHz keys make the 80 MHz keys' stores at half the clock:
+they are built beside them to tell a failure of timing at 80 MHz from a
+failure of the sequence (§18g). The read modes, their opcodes and their
+wait clocks are ESP-IDF's for this part and what its SFDP table claims
+(§18c): `BBh` with 4 clocks of mode and wait, `EBh` with 6.
+
+**The seam.** The HAL's `clock_init`, which `kmain` calls first, is the
+clock key's `clock_init`, then the flash key's `flash_init`
+(`kernel/lib.saw`). The switch is made for the memory-SPI core clock the
+clock key leaves, before anything else reads the flash for long, and before
+`memory_init`, after which nothing moves that clock (§17a). It writes none
+of SYSTEM_SYSCLK_CONF, SYSTEM_CPU_PER_CONF and SPI_MEM_CORE_CLK_SEL, so the
+PSRAM's contract holds as it is: the PSRAM's divider was chosen for a core
+clock the flash key does not move (§16b, §17b). It moves SPI0's flash
+divider alone; SPI1's, which the flash's reads and the PSRAM's commands run
+at, and SPI0's PSRAM divider stay as they were:
+
+```
+clock                 register         rom flash key   any other
+core                  CORE_CLK_SEL 0   80 MHz          80 MHz
+the cache's flash     CLOCK(0)         / 4: 20 MHz     / 1: 80, / 2: 40
+SPI1's commands       CLOCK(1)         / 4: 20 MHz     / 4: 20 MHz
+the cache's PSRAM     SRAM_CLK(0)      the PSRAM's     the PSRAM's
+```
+
+(at a clock key on the PLL). `check_clock_registers` holds the flash keys
+to it as it holds every file but the clock keys' (§17a): the flash kit is
+not `clock_init`'s file, and `mspi.c` reads the three words with `rd`
+alone.
+
+**On the PLL only.** At divide by 1 the flash runs at the memory-SPI core
+clock itself: 80 MHz on the PLL at 480 MHz with CORE_CLK_SEL 0, the speed
+ESP-IDF runs this part's flash at with no timing tuning, since it tunes a
+flash in STR mode only above 80 MHz (`MSPI_TIMING_FLASH_NEEDS_TUNING`,
+esp_hw_support/port/esp32s3/mspi_timing_tuning_configs.h). On the crystal
+the core clock is not the PLL's (§16b). Each clock key states the core
+clock it leaves, `MSPI_CORE_MHZ` (§16b), and each flash key but `rom`
+asserts it is 80, so with `rom` or `xtal40` the kernel's compile stops at
+the key's assertion:
+
+```
+static assertion failed: dio80 needs a clock key on the PLL: pll80, pll160
+or pll240
+```
+
+(one line). At boot the switch holds the clock words to its description
+(0x70, §18e), so a clock key that was not taken leaves the flash as the ROM
+left it.
+
+**Choosing it.** board.toml's `[keys.flash]` lists the values. A product's
+image chooses one in its `[keys]`, beside a clock key on the PLL, and
+`sosimage` maps `s3flash` to the value's directory as it maps `s3clock`
+(§14d):
+
+```toml
+[keys]
+clock = "pll240"
+flash = "dio80"
+```
+
+The smoke's case key is `"flash_key"`, since a flash harness's `"flash"` is
+its block (§18b), and `--emit-flash CASE --flash KEY` overrides it for a
+board image, as `--clock` overrides the clock key. A description that
+states `[keys]` for a case that names a flash key is refused, as for the
+others (§14d). The keys that switch share `s3flashkit`
+(`keys/flash-common/`): the description, the call and the lines, written
+with `s3clockkit`'s console writer, which every clock key on the PLL
+compiles in.
+
+### 18e. The switch
+
+`kernel/mspi.c`'s `sos_flash_switch(expect, record, mode, regions)` makes
+every check and every store in one call from IRAM, under §16d's rules, and
+returns at the first check that fails with a record of what it read.
+`mode` is the key's: bit 0 the four lines, bit 1 half the clock. `regions`
+is the canary and the timed regions (below). `s3flashkit`'s `flash_switch`
+passes the description and prints the line; its `flash_init_at` is each
+key's `flash_init`.
+
+**The description** is eight words (`struct sos_flash_expect`,
+`FlashExpect`): the three clock words, masked as the PSRAM's S0.3 masks
+them; the flash's JEDEC ID; and SPI0's CLOCK, CTRL, USER1 and USER2 as the
+ROM leaves them. A board image carries the part's: its clock key's words
+(`s3clock`'s `PART_SYSCLK`, `PART_CPU_PER`, `PART_CORE_CLK_SEL`, §17b) and
+F0's (§18c). An image for the emulator carries the emulator's. The linker
+constant that tells the two apart, `_sos_semihosting` (§10), chooses
+(`board_image`), so the image's destination decides: a product's `flash`
+links the part's and its `run` and `test` the emulator's, as the smoke's
+`--emit-flash` and its runs do.
+
+```
+word              the part (F0)               the emulator
+SYSCLK & 0x80FFF  the clock key's (§17b)      0x00080401
+CPU_PER & 7       the clock key's             0
+CORE_CLK_SEL & 3  0                           0
+JEDEC ID          0x00204017                  0x00c84016
+SPI0 CLOCK        0x00030103                  0
+SPI0 CTRL         0x00200000                  0
+SPI0 USER1        0x5c000007                  0
+SPI0 USER2        0x70000003                  0
+```
+
+**The steps**, in order:
+
+```
+step  what                                                 stop
+W1    the description and the record lie in DRAM, by       0x79
+      their addresses
+W2    the three clock words as described                   0x70
+      SPI0's CLOCK, CTRL, USER1 and USER2 as described,    0x71
+      and DDR, TIMING_CALI, DIN_MODE and DIN_NUM 0:
+      single data rate, no input delay; CTRL2, USER, pads
+      27 and 28 and the input selects of signals 2 and 3
+      read for W5
+      neither cache's autoload on: AUTOLOAD_ENA [2] of     0x72
+      EXTMEM_ICACHE_AUTOLOAD_CTRL_REG (0x600C_40A0) and
+      EXTMEM_DCACHE_AUTOLOAD_CTRL_REG (0x600C_404C) clear
+W3    9Fh, the JEDEC ID, as described: a flash read        0x76
+      (§18a), with its own stops, 0x73, 0x74, 0x75, 0x7B
+      35h, status register 2, read the same way; for four  0x77
+      lines its QE (bit 1) must be set
+W4    the first timed read
+W5    both caches frozen, the instruction cache's first    0x7D
+      (below); the stores, below; both caches unfrozen     0x7E
+W6    the canary, read through the data cache              0x78
+W7    when the canary differs: both caches frozen, every    0x7D
+      word W5 stored put back to what W2 read, the clock   0x7E
+      first, both unfrozen, then the line from IRAM
+W8    the second timed read
+W9    the words read again, for the line
+```
+
+No stop before W5's stores stores anything to SPI0, the pads or the input
+selects.
+W3's reads are §18a's, the ID first and status register 2 only to the ID
+described, which on a board image is the part's (§18a says why). The flash
+is sent those two reads and nothing else: no write enable, no status
+write, no power-down. A QIO key finding QE clear stops at 0x77, and the
+boot goes on at the ROM's reads: no image writes the flash's status
+register.
+
+**The stores** (W5), each word made from what W2 read, in order:
+
+```
+#     register             value                                  keys
+W5.1  SPI0 CTRL (0x08)     | FDUMMY_OUT [3], Q_POL [18], D_POL    all
+                           [19]
+W5.2  SPI0 CTRL2 (0x10)    CS_HOLD_TIME [9:5] and CS_SETUP_TIME   all
+                           [4:0] 0, stored only if either is not
+W5.3  IO_MUX_GPIO27, 28    MCU_SEL [14:12] 0: SPIHD, SPIWP        QIO
+      (0x6000_9070, _9074)
+W5.4  GPIO_FUNC2_IN_SEL_   SIG_IN_SEL [7] cleared: straight from  QIO
+      CFG, FUNC3 (0x6000_  the IO MUX
+      415C, _4160)
+W5.5  SPI0 CTRL            W5.1's word & 0xFE6F_9C0F, | 0x0080_   all
+                           2000 (DIO: FREAD_DIO [23],
+                           FASTRD_MODE [13]) or 0x0100_2000 (QIO:
+                           FREAD_QIO [24], FASTRD_MODE)
+W5.6  SPI0 USER (0x18)     USR_MOSI [27] cleared; USR_ADDR,       all
+                           USR_DUMMY, USR_MISO [30:28] set
+W5.7  SPI0 USER1 (0x1C)    [31:26] 23, a 24-bit address; [5:0]    all
+                           3 (DIO, 4 clocks) or 5 (QIO, 6)
+W5.8  SPI0 USER2 (0x20)    [15:0] 0xBB (DIO) or 0xEB (QIO)        all
+W5.9  SPI0 CLOCK (0x14)    0x80000000, CLK_EQU_SYSCLK, divide by  all
+                           1; or 0x00010001, divide by 2
+```
+
+The sources: W5.1 ESP-IDF's `bootloader_flash_set_dummy_out`; W5.2 its
+`bootloader_flash_cs_timing_config` for a flash that is not octal; W5.3
+and W5.4 the ROM's `esp_rom_spiflash_select_qio_pins` (0x4004_95C4); W5.5
+the ROM's `esp_rom_spiflash_config_readmode` (0x4004_A820), its mask and
+its table `CSWTCH$195` (0x3FF1_E060); W5.6 to W5.8 the ROM's
+`spi_cache_mode_switch` (0x4004_A190), with the ROM's extra dummy for SPI0
+at 0 (§15c); W5.9 ESP-IDF's `mspi_timing_ll_set_flash_clock`, whose divide
+by 1 is the ROM's `esp_rom_spiflash_config_clk(1, 0)` word too. No ROM
+routine is called for any of them: `config_readmode` writes QE itself
+(`Enable_QMode`, `Disable_QMode`), and `check_rom_flash_references` refuses
+an image that names it (§18b).
+
+**The order.** No flash read is made between the stores, so the order is
+what a trace holds. Each group leaves a configuration ESP-IDF itself runs:
+the dummy output and the chip-select timing are its in every mode; the
+read mode with the clock still at divide by 4 is its low-speed mode; and
+the clock, the one store that makes it fast, is last. W5.1 precedes W5.5 for
+a reason of its own: in DIO and QIO the read's mode bits M7 to M0 follow
+the address on the data lines, and a flash takes M5..M4 = 10b as
+"continuous read", after which it takes the next command's first byte for
+an address until a power cycle. With FDUMMY_OUT and both polarities set the
+controller drives those lines high, so M5..M4 go out as 11b; without it they
+would float on the pads' pull-ups.
+
+From the part's words these are, for DIO: CTRL 0x002C_0008 after W5.1 and
+0x00AC_2008 after W5.5, CTRL2 0x0000_2C00, USER 0x7000_00C0, USER1
+0x5C00_0003, USER2 0x7000_00BB, CLOCK 0x8000_0000. For QIO: CTRL
+0x012C_2008 after W5.5, USER1 0x5C00_0005, USER2 0x7000_00EB, pads 27 and
+28 0x0000_0B00, the input selects 0x0000_003C (bit 7 already clear), the
+rest as DIO. The part read USER back as 0x0000_00C0 after the ROM had
+stored its USR_ADDR and USR_MISO bits too (§15c), so the line may show
+SPI0 keeping only some of W5.6's bits; it prints what it reads.
+
+**The freeze.** Both caches are frozen around the stores, as ESP-IDF
+freezes them around its own MSPI speed change
+(`mspi_timing_change_speed_mode_cache_safe`, esp_hw_support/
+mspi_timing_tuning.c: `cache_hal_freeze` and `cache_hal_unfreeze` of
+`CACHE_TYPE_ALL`, which hal/esp32s3/include/hal/cache_ll.h makes
+`Cache_Freeze_ICache_Enable(CACHE_FREEZE_ACK_BUSY)`, then the DCache's, and
+the two `Disable`s in the same order). A frozen cache sends SPI0 no miss of
+its own, the CPU's, a preload's or an autoload's, and reports FREEZE_DONE
+once nothing of it is left on the bus, so no fill begun before W5, the
+last of W4's included, is still on SPI0 when its words change. Without it
+the part hung with nothing printed after the clock key's line at every
+flash key, and switched cleanly when each step of the switch was followed
+by a console line and a wait for UART0 to go idle, time enough for the
+last fill to end. The switch writes the two EXTMEM words itself, as the
+ROM's routines do (disassembled from the ROM's ELF), and calls none of
+them:
+
+```
+register                     store                              ROM
+EXTMEM_ICACHE_FREEZE_REG     read; FREEZE_MODE [1] cleared       Cache_Freeze_
+(0x600C_4154)                (CACHE_FREEZE_ACK_BUSY: a miss is   ICache_Enable
+                             answered busy); read; FREEZE_ENA    (0x4004_E8A8)
+                             [0] set; read until FREEZE_DONE
+                             [2] is set
+EXTMEM_DCACHE_FREEZE_REG     the same                            Cache_Freeze_
+(0x600C_4150)                                                    DCache_Enable
+                                                                 (0x4004_E910)
+EXTMEM_ICACHE_FREEZE_REG     read; FREEZE_ENA cleared; read      Cache_Freeze_
+                             until FREEZE_DONE is clear          ICache_Disable
+                                                                 (0x4004_E8E8)
+EXTMEM_DCACHE_FREEZE_REG     the same                            Cache_Freeze_
+                                                                 DCache_Disable
+                                                                 (0x4004_E950)
+```
+
+(the fields from soc/esp32s3/register/soc/extmem_reg.h). Each wait reads
+at most 100000 times; the ROM's own waits have no bound, so the way out
+of each is this code's. A cache that does not report its freeze may yet
+freeze after the bound, so its freeze is undone, as an unfreeze, and so is
+the instruction cache's when it was the data cache that did not report;
+then the switch stops at 0x7D before any store to SPI0. An unfreeze that
+does not report, after the stores or as such an undo, is 0x7E: both
+caches' unfreezes are tried, the line is written from IRAM, since the
+caller's next fetch from flash may then never be answered, and the key
+halts. W7 freezes and unfreezes the same way, at steps of its own: a
+freeze that does not report there is undone and SPI0 is put back all the
+same, with the caches running when the undo reports (0x7D) and with a
+cache that may still be frozen when it does not (0x7E, whose line then
+does not say the caches run); an unfreeze that does not report is 0x7E. The
+record's `state` keeps what was done to SPI0 (stored, put back) and which
+cache's freeze or unfreeze did not report, with the freeze words they last
+read, and the canary's first wrong word; the 0x7D and 0x7E lines say all
+of it. While the caches are frozen nothing of the call reads flash: a miss
+would wait until the unfreeze.
+
+**Why IRAM.** From W5.1 to W5.9 the flash is readable in no one mode, and
+the kernel's code is in flash (`esp32s3.ld`): so every instruction and
+literal of the call is in IRAM, and every datum it reads in DRAM or, for
+the canary and the timed regions, read only after W5.9. Interrupts are
+masked in the kernel (§7f), one core runs (§11), and W2 has found both
+caches' autoload off, so nothing fetches from the flash between the
+stores. `check_iram` holds the call to §16d's rules, and its mutants' link
+is rooted at `sos_flash_switch` too.
+
+**The canary and the timed reads.** `boot.S`'s `sos_flash_regions` names a
+block in `.drom` that starts on a 64-byte boundary and is a multiple of 64
+bytes long, so no line of the data cache holds a byte of it and a byte of
+anything else, and nothing but the switch reads it. It is 64 bytes of
+canary, then two regions of 4 KiB. The canary's bytes are 0x55 0xAA, 0x00
+0xFF, 0x0F 0xF0, 0x33 0xCC, each data line low then high from one byte to
+the next, then each byte its own offset; W6 compares them word by word
+with the same formula (`canary_byte`, no table: §16d). A wrong mode,
+wrong data or a flash paused on HOLD# reads as a mismatch: the cache loads
+whatever the lines carry and does not hang on it. W4 and W8 each read 4
+KiB at 16-byte strides of a region no load has reached, between two
+SYSTIMER snapshots (the clock key started SYSTIMER), the first before W5
+and the second after W6. Each region is read once, by its own pass and by
+nothing else, so every line of it is a miss when the pass reaches it: a
+16-byte stride touches every line at any of the data cache's line sizes,
+and the two passes make the same number of fills, one for each line of 4
+KiB. Nothing else may run between the snapshots: the time any other step
+takes there, a console line above all, is counted as the reads'. The block
+is in an image only when a flash key other than `rom` names it; the link
+drops it from every other.
+
+**Every write is volatile.** SPI0's words, the two pads and the two input
+selects are reset by a chip reset, and the ROM's attach rewrites SPI0's
+clock and read mode at every boot (`SPI_init`, then
+`esp_rom_spiflash_config_readmode(5, 0)`), whose mask keeps FDUMMY_OUT and
+the polarities, which slow read ignores. A CPU-only reset would leave SPI0
+as the key set it; none happens here (§2e, §14d).
+
+**The lines.** Taken, one line after the clock key's:
+
+```
+SOS-S3: flash dio80 jedec=0x00204017 sr2=0x02 clock=0x00030103->0x80000000
+ctrl=0x00200000->0x... ctrl2=0x00002c41->0x... user=0x000000c0->0x...
+user1=0x5c000007->0x... user2=0x70000003->0x... canary=ok
+read4k=<v>us-><v>us
+```
+
+(one line), each word before W5 and read again at W9, and for four lines
+`pad27=`, `pad28=`, `insel2=` and `insel3=` before `canary=`. `read4k` is
+the two timed reads in microseconds, before and after; they follow the
+machine's clock and are printed, never judged. Not taken, the boot goes on
+at the ROM's reads after one line, `SOS-S3: flash KEY not taken: ` and
+the reason:
+
+```
+0x79  the description at 0x... or the record at 0x... is not in DRAM
+0x70  the memory-SPI core clock is not the one the key is for: sysclk=
+      cpu_per= mspi_core=, the description says sysclk= cpu_per=
+      mspi_core= under the masks 0x00080fff, 0x7 and 0x3
+0x71  SPI0 is not as the ROM leaves it: clock= ctrl= user1= user2= ddr=
+      cali= din_mode= din_num=, the description says clock= ctrl= user1=
+      user2= and 0 for the rest
+0x72  a cache autoload is on: icache= dcache=
+0x73  SPI1 MISC=0x... before command 0x.., the flash's commands need chip
+      select 0 alone (0x00000002); nothing was sent
+0x7B  SPI1 DDR=0x... before command 0x.., the flash's reads need single
+      data rate (0); nothing was sent
+0x74  SPI1 busy before command 0x.., SPI_MEM_CMD=0x... after 100000 polls;
+      nothing was sent[; SPI1 put back]
+0x76  the flash's JEDEC ID is 0x..., the description says 0x...; SPI1 put
+      back
+0x77  status register 2 is 0x.., QE (bit 1) clear; QIO needs it set and
+      this kernel never writes it; SPI1 put back
+0x78  the canary read 0x... at +0x.. where 0x... was expected; SPI0 put
+      back to the ROM's words
+0x7D  [the canary read 0x... at +0x.. where 0x... was expected; then ]
+      the instruction|data cache did not report its freeze done, its
+      freeze word reading 0x... after 100000 polls, and was unfrozen
+      again; nothing was stored to SPI0 | SPI0 put back to the ROM's words
+      with the caches running
+0x7E  [the canary ...; then ] for each cache that did not report: the
+      instruction|data cache did not report its unfreeze, its freeze word
+      reading 0x... after 100000 polls; or did not report its freeze done,
+      ..., and did not report the undo either, reading 0x...; then nothing
+      was stored to SPI0 | SPI0 left switched, the canary not read | SPI0
+      put back to the ROM's words; halted
+```
+
+0x78 follows `SOS-S3: flash KEY: canary mismatch`, written from IRAM once
+W7 has put SPI0 back. A read that does not finish stops the machine, as
+§18a's does: the read's own line from IRAM, then `SOS-S3: flash KEY not
+taken: SPI1 command 0x.. did not finish, SPI_MEM_CMD=0x... after 100000
+polls; halted`, and a quiet loop, since SPI1 may still be mid-command with
+chip select 0 low. A reset clears it. 0x7E follows `SOS-S3: flash: a
+cache did not report its unfreeze`, written from IRAM, and halts the same
+way.
+
+### 18f. The emulator and the smoke
+
+The emulator does not model SPI0, the IO MUX or the GPIO matrix: they read
+0 and drop what is stored (§18b). Its cache reads the image file directly,
+whatever SPI0 holds, so a switch there, right or wrong, changes nothing,
+and its MISC(1) reads 0 where the part's ROM leaves 0b10 (§18b). So on the
+emulator the shipping kernel at any flash key but `rom` stops at W3's gate
+(0x73), stores nothing to SPI0, SPI1 or the pads, and boots on: the
+`boot_flash_*` cases hold the seam, the clock key's line then the
+switch's, then the banner. The switch's decisions and its stores are held
+through a harness, and only the part shows whether its reads work.
+
+`tests/xtensa/flash_switch.saw` is that harness. It is built only with the
+fault build (`psram_fault`), and its block (`_flash_switch_case_asm`) says
+which switch to make, against which description (the kit's emulator or
+part description, any word of it replaced), at which addresses, and which
+reads lie. It runs the image's clock key, `pll80`, fills the table of lies,
+stores MISC(1)'s part word as `s3_flash_probe`'s does (§18b), and calls
+`s3flashkit`'s `flash_switch` as the key would. A lie's address of
+0xCA0000NN names the canary's byte NN, which the harness places, since only
+the link knows where the canary is. The lies go in the fault
+build's table, `sos_flash_fault_table`, after its one record (§16e): up to
+16 entries, each a step, a command, an address and a value (0 in any of
+the first three: any), each answering every read it matches. With it the
+emulator's 0s can read as the part's words, and status register 2 can read
+QE set. The switch's steps for the table are 0xE1 (W2's clock words), 0xE2
+(its SPI0 words, pads and input selects), 0xE3 (the autoload words), 0xE4
+(SYSTIMER), 0xE5 (W5's freeze), 0xE6 (the canary), 0xE7 (W5's unfreeze,
+and the undo of W5's freeze), 0xE9 (W9), 0xEA (W7's freeze) and 0xEB (W7's
+unfreeze, and the undo of W7's freeze); W3's reads are §18b's steps, the ID
+in command 1 and status register 2 in command 2.
+
+`tests/xtensa/flash_key_halt.saw` holds what that harness, which calls the
+switch itself, cannot: each key's own `flash_init`. Built at the case's
+clock and flash keys with the fault build, it fills the table from the same
+block, stores MISC(1)'s word, then runs `hal.clock_init()`, the clock key
+and then the flash key against the emulator's description, and prints
+`SOS flashkey: the boot went on` if the key returns. Each key's stores hold
+the mode it passes; a lie that makes a read never finish (0x75) or an
+unfreeze never report (0x7E) holds the key's halt, the run ending at the
+emulator's deadline with the switch's line last (`expect_tail`).
+
+**What holds it**, besides the console, each stop's lines held whole: right
+after the clock key's line, each to its newline, with nothing between them
+(`switch_stop`):
+
+- the flash's commands (`flash_commands`): the ROM's `ABh`, then `9Fh`,
+  `35h` and the model's `00h` after it, or fewer where a stop came first;
+  and every run's `FLASH_COMMANDS_HEARD` (§18b);
+- SPI1's stores (`expect_spi1_stores`): the setup's MISC(1) word and each
+  read's stores as §18a gives them;
+- the switch's stores (`expect_switch_stores`): every store the kernel made
+  to SPI0's page, pads 27 and 28, their input selects and the two caches'
+  freeze words, in order, from `_start`'s first store: W5's freeze, its
+  stores and its unfreeze, and W7's put-back between its own;
+- `device_untouched`: no other pad of the flash's bus or the PSRAM's, and
+  no other input select of the PSRAM's signals;
+- `check_iram`, rooted at `sos_flash_switch` (`iram_mutant_script_switch`
+  requires it to name the call when the script's IRAM line is removed);
+  `check_rom_flash_references` on every image; `check_clock_registers`
+  over the flash keys (`clock_registers_flash_kit_store`); and
+  `check_psram_fault`, which allows the fault record in this harness's
+  emulator image as in the other two.
+
+**The cases:**
+
+```
+case                                  how                             stop
+boot_flash_dio80, _qio80, _dio40,     the shipping kernel at pll80    -
+  _qio40                              and the key: W3's gate stops
+                                      it, no store, boot goes on
+flash_key_dio80_at_rom_refused,       a flash key with rom or xtal40  build
+  _qio80_at_xtal40, _dio40_at_xtal40,
+  _qio40_at_rom
+flash_switch_dio80, _qio80, _dio40,   the harness, every W5 store on  -
+  _qio40                              the emulator's words (QIO with
+                                      QE read set)
+flash_switch_part_words_dio80,        W2 read as F0's words on the    -
+  _qio80                              part, the part's description:
+                                      W5's words for the part
+flash_switch_qio80_qe_clear           QIO with status register 2 as   0x77
+                                      the emulator reads it, 0
+flash_switch_stop_description_in_     the description in flash, or    0x79
+  flash, _description_past_dram,      past DRAM's end; the record
+  _record_in_flash, _record_past_dram the same
+flash_switch_stop_clock_sysclk,       one clock word described        0x70
+  _cpu_per, _core_clk_sel             otherwise
+flash_switch_stop_spi0_clock, _ctrl,  one SPI0 word read otherwise    0x71
+  _user1, _user2, _ddr, _cali,
+  _din_mode, _din_num
+flash_switch_stop_autoload_icache,    one autoload word read with     0x72
+  _dcache                             AUTOLOAD_ENA
+flash_switch_stop_gate                MISC(1) set up as 0b01          0x73
+flash_switch_stop_ddr                 DDR(1) read with DDR_EN         0x7B
+flash_switch_stop_busy, _busy_        SPI1 busy before the first      0x74
+  second_read                         read; in the second's S7.1,
+                                      SPI1 put back
+flash_switch_stop_not_finished        the ID's read never finishes    0x75
+flash_switch_stop_identity            the part's ID described         0x76
+flash_switch_stop_canary_dio80,       the canary's first word read    0x78
+  _qio80, _part_words_qio80           wrong: W7's put-back, CTRL2's
+                                      on the part's words
+flash_switch_stop_freeze_icache,      a cache's freeze word read 0    0x7D
+  _dcache                             throughout: the freeze undone,
+                                      the instruction cache's too
+flash_switch_stop_freeze_icache_      the undo of the instruction     0x7E
+  undo, _dcache_undo_icache           cache's freeze, or its unfreeze
+                                      after the data cache's, not
+                                      reported
+flash_switch_stop_thaw, _thaw_dcache  a cache's unfreeze after the    0x7E
+                                      stores not reported
+flash_switch_stop_freeze_dcache_      the data cache's freeze and     0x7E
+  undo_dcache                         its own undo not reported
+flash_switch_stop_freeze_word_        a freeze not reported, its      0x7D
+  nonzero                             word read 0x1
+flash_switch_stop_w7_freeze_icache,   W7's freeze of a cache not      0x7D
+  _dcache, _canary_second_word        reported: put back unfrozen;
+                                      the canary wrong at +0x04
+flash_switch_stop_w7_freeze_undo_     W7's freeze, then its undo or   0x7E
+  icache, _undo_dcache,               the instruction cache's
+  _dcache_ithaw                       unfreeze, not reported: put
+                                      back, a cache maybe frozen
+flash_switch_stop_w7_thaw,            W7's unfreeze of a cache not    0x7E
+  _w7_thaw_dcache                     reported
+flash_switch_qio80_qe_fd,             SR2 every bit but QE; QIO at    0x77
+  _qio40_qe_clear                     40 MHz with QE clear
+flash_switch_insel_bit7_qio80,        W2's input selects, pads and    -
+  _pads_mcu_sel_7_qio80,              USER read with bits W5 clears
+  _user_bit27_dio80                   set
+flash_switch_core_clk_sel_masked      CORE_CLK_SEL read with [31:2]   -
+                                      set: [1:0] alone compared
+flash_switch_freeze_mode_cleared      the freeze word read with       -
+                                      FREEZE_MODE set
+flash_switch_read_back                W9's read of the clock lied to  -
+flash_switch_stop_canary_second_      every canary word read as the   0x78
+  word, _last_word, _dio40            first's; the last word alone
+                                      wrong; at dio40
+boot_flash_dio80_board_image          the shipping kernel's board     -
+                                      image: the part's description,
+                                      stopped at W2 (0x70)
+flash_key_dio80, _qio80, _dio40,      each key's own flash_init:      -
+  _qio40                              its mode's stores
+flash_key_halt_not_finished,          the key halts after 0x75 and    halt
+  _halt_thaw                          0x7E
+flash_key_freeze_goes_on,             the key's boot goes on after    -
+  _canary_goes_on                     0x7D and 0x78
+psram_core_clk_sel_masked             the PSRAM's S0.3 compares       -
+                                      CORE_CLK_SEL's [1:0] alone
+kill_churn_flash_dio80                the gate's kill_churn at pll80  -
+                                      and dio80
+flash_keyed_image                     a description stating pll80     -
+                                      and dio80, built and run
+flash_key_without_pll_image           one stating dio80 alone         build
+keys_stated_twice_flash               a description's [keys] and the  build
+                                      case's flash key
+```
+
+The product phase holds a product's image that states a flash key with no
+clock key to the same refusal (`product_flash_key_needs_pll`).
+
+### 18g. The board stages
+
+Each stage is a board image built from one commit and sent with its
+SHA-256 and the text it should print. The only write to the part is
+`write-flash 0x0`; no eFuse is burnt or written and nothing is erased. The
+images write SPI0's words, two pads and two input selects, all volatile;
+the flash chip is sent `9Fh` and `35h` and nothing else.
+
+```
+python3 tools/sos_runner.py --board esp32s3 --emit-flash boot_flash_dio80 \
+    --out PATH
+python3 tools/sos_runner.py --board esp32s3 --emit-flash kill_churn \
+    --clock pll240 --flash dio80 --out PATH
+```
+
+**F1, `boot_flash_dio80` at `pll80`.** The kernel alone with the key:
+`pll80`'s line, then
+
+```
+SOS-S3: flash dio80 jedec=0x00204017 sr2=0x02 clock=0x00030103->0x80000000
+ctrl=0x00200000->0x00ac2008 ctrl2=0x00002c41->0x00002c00
+user=0x000000c0->0x........ user1=0x5c000007->0x5c000003
+user2=0x70000003->0x700000bb canary=ok read4k=<v>us-><v>us
+```
+
+(one line), then the banner and the refusal of an empty image, as
+`boot_pll80`. It decides that DIO at 80 MHz reads the flash: the canary,
+and every line after it, printed by code the cache fetched at 80 MHz. A
+hang after `pll80`'s line, or the canary's line: then `boot_flash_dio40`,
+built beside it, whose line is the same with `dio40` and `clock=...->
+0x00010001`. 40 passing puts the fault in the timing at 80 MHz; 40 hanging
+too puts it in the sequence.
+
+**F2, `boot_flash_qio80` at `pll80`.** F1 with `qio80`: `ctrl=...->
+0x012c2008`, `user1=...->0x5c000005`, `user2=...->0x700000eb`, and
+`pad27=0x00001b00->0x00000b00 pad28=0x00001b00->0x00000b00
+insel2=0x0000003c->0x0000003c insel3=0x0000003c->0x0000003c` before
+`canary=ok`; `boot_flash_qio40` beside it. F0 read QE set (§18c), so the
+switch is taken with nothing written to the flash.
+
+**F3, the measure, at `pll240`.** `kill_churn` and `kill_churn_profile`,
+each at the `rom` flash key (the control), `dio80` and `qio80`, built from
+one commit and run one after another. Expected: each image's own text, the
+clock line, the flash line (none at `rom`), and `200 rounds, every create
+succeeded`; recorded, the time from reset to `200 rounds` and the profile's
+seven phases with the console's stall.
+
+**On the part** (the module of §15c), from one commit with the freeze
+(§18e):
+
+- F1, `dio80` at `pll80`: `pll80`'s line, then (one line)
+
+  ```
+  SOS-S3: flash dio80 jedec=0x00204017 sr2=0x02 clock=0x00030103->0x80000000
+  ctrl=0x00200000->0x00ac2008 ctrl2=0x00002c41->0x00002c00
+  user=0x000000c0->0x200000c0 user1=0x5c000007->0x5c000003
+  user2=0x70000003->0x700000bb canary=ok read4k=2127.25us->339.43us
+  ```
+
+  then the banner and the refusal of an empty image. Every word is §18e's;
+  USER reads back with USR_DUMMY [29] alone of W5.6's three bits, so SPI0
+  keeps that one of USER's [31:27]. The timed read is 6.3 times as fast.
+- F2, `qio80` at `pll80`: F1's words with `ctrl=...->0x012c2008`,
+  `user1=...->0x5c000005`, `user2=...->0x700000eb`, pads 27 and 28
+  `0x00001b00->0x00000b00` and the input selects `0x0000003c`, and
+  `read4k=2127.25us->224.56us`, 9.5 times as fast. QE was set (§18c), and
+  nothing was written to the flash.
+- The 40 MHz images were not needed.
+- Before the freeze, all four 80 and 40 MHz images hung with nothing after
+  the clock key's line; the same switch with a console line and a wait for
+  UART0 to go idle after each step took it, and so did every image once
+  the caches were frozen around the stores.
+
+F3, at `pll240`, in seconds from reset by the capture's clock, and the
+profile's phases in microseconds:
+
+```
+flash  clock   200     create   give     start   settle   kill     release
+key    line    rounds
+rom    0.179   6.345   1086239  1021893  263889  1656164  1738204  318174
+dio80  1.545   2.989    214562   140944   46582   582516  1647093   52790
+qio80  1.546   3.000    159957   100415   33584   560642  1800490   37372
+
+flash  all      console stalled
+rom    6084565   368371
+dio80  2684488  1371851
+qio80  2692463  1596960
+```
+
+The profile's phases are the measure of the flash's speed. Creating,
+giving, starting and releasing, which read the processes' code and data in
+flash, are 5 to 10 times as fast at `dio80` or `qio80`; settling 2.8 to 3
+times; killing hardly moves. QIO's gain over DIO is in the phases that read
+flash most (create 1.3, give 1.4, start 1.4 times). `all` falls 2.3 times
+and does not move between DIO and QIO.
+
+At either flash key `kill_churn` is bound by its console. From `kernel up`
+to `200 rounds` it prints 208 lines, 31,554 bytes, which take 2.739 s on
+the wire at 115200 baud, 8N1; a capture with timestamped crumbs at `dio80`
+stamped that span 2.753 s, the kernel's own crumbs on time throughout.
+So about 2.7 s is the floor for a `kill_churn` run, whatever the flash
+does, and the time from reset to `200 rounds` measures the wire, not the
+flash. The console's stall is that floor showing through: the kernel
+waiting for room in UART0's FIFO at the wire's rate, 6 percent of `all`
+at `rom` and 51 and 59 percent at `dio80` and `qio80`.
+
+A capture without crumbs stamped the first kernel line 1.545 s after reset
+at `pll240` with either flash key, against 0.179 s at `rom` and about
+0.2 s for F1 and F2 at `pll80`, and stamped the output from there to
+`200 rounds` over 1.44 s, less than the wire takes to carry it. Those
+lines left the part on time and were held between the part and the
+capture's reads, in the serial bridge or the capture itself; the crumbs,
+each sent before the kernel went on, were stamped in step with SYSTIMER.

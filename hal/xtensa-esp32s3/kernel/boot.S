@@ -1097,3 +1097,40 @@ sos_pll_bringup:
     l32i    a13, a1, 24
     addi    a1, a1, 32
     ret
+
+/* ---- the flash switch's canary and timed regions (flash) ----------------- */
+
+/* u32 sos_flash_regions(void)
+ *
+ * The data-bus address of the flash switch's block (../ABI.md §18e): 64
+ * bytes of canary, then two regions of 4 KiB that `mspi.c`'s
+ * `sos_flash_switch` times reading before and after its stores. The block
+ * starts on a 64-byte boundary and its length is a multiple of 64, so no
+ * line of the data cache holds a byte of it and a byte of anything else, and
+ * nothing but the switch reads it: before the switch, no line of it has
+ * been read. The canary's bytes are the switch's formula (`canary_byte`):
+ * 0x55 0xAA, 0x00 0xFF, 0x0F 0xF0, 0x33 0xCC, each data line low then high
+ * from one byte to the next, then each byte its own offset.
+ *
+ * Neither section is kept: only a flash key's module references the
+ * function, so an image built at the `rom` flash key drops both and is the
+ * bytes it would be without them. */
+    .section .rodata.sos_flash_regions, "a"
+    .balign 64
+sos_flash_regions_block:
+    .byte   0x55, 0xAA, 0x00, 0xFF, 0x0F, 0xF0, 0x33, 0xCC
+    .byte   8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+    .byte   22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35
+    .byte   36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49
+    .byte   50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+    .fill   4096, 1, 0xA5
+    .fill   4096, 1, 0x5A
+
+    .section .text.sos_flash_regions, "ax"
+    .literal .Lsos_flash_regions, sos_flash_regions_block
+    .align  4
+    .global sos_flash_regions
+    .type   sos_flash_regions, @function
+sos_flash_regions:
+    l32r    a2, .Lsos_flash_regions
+    ret

@@ -1,0 +1,26 @@
+//! The flash key `qio80`: the cache reads the flash in QIO, `EBh` with the
+//! address and data on four lines, at 80 MHz, the memory-SPI core clock
+//! divided by 1.
+//!
+//! One of the `s3flash` modules, mapped by a case's `flash_key` (the runner)
+//! or an image's `[keys]` (`sosimage`). The HAL's `clock_init` calls its
+//! `flash_init` after the clock key's (`../../kernel/lib.saw`). The switch is
+//! `s3flashkit`'s (`../flash-common/`; `../../ABI.md` §18d to §18f), which
+//! for four lines also gives pads 27 and 28 to the flash's IO3 and IO2.
+//!
+//! QIO needs the flash's QE bit set, which makes the chip's WP# and HOLD#
+//! pins IO2 and IO3. The switch reads status register 2 (`35h`) at every
+//! boot and stops before any store if QE is clear: nothing in this kernel
+//! writes the flash's status register.
+
+import s3clock.{MSPI_CORE_MHZ}
+import s3flashkit.{flash_init_at, MODE_QUAD}
+
+static_assert(MSPI_CORE_MHZ == 80,
+              "qio80 needs a clock key on the PLL: pll80, pll160 or pll240")
+
+/// Switch the flash's reads to QIO at 80 MHz, or say why not and leave them
+/// as the ROM left them.
+public func flash_init() unsafe {
+    flash_init_at("qio80", MODE_QUAD)
+}

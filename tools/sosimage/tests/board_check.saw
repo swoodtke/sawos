@@ -114,7 +114,7 @@ func s3_args() -> String {
 }
 
 func s3_modules(clock: String) -> String {
-    "\"kcore=../../kernel/core\", \"hal=../../hal/xtensa-esp32s3/kernel\", \"s3clock=../../hal/xtensa-esp32s3/keys/{clock}\", \"s3stall=../../hal/xtensa-esp32s3/keys/stall-off\", \"s3clockkit=../../hal/xtensa-esp32s3/keys/clock-common\", \"s3dbias=../../hal/xtensa-esp32s3/dbias/src\""
+    "\"kcore=../../kernel/core\", \"hal=../../hal/xtensa-esp32s3/kernel\", \"s3clock=../../hal/xtensa-esp32s3/keys/{clock}\", \"s3flash=../../hal/xtensa-esp32s3/keys/flash-rom\", \"s3stall=../../hal/xtensa-esp32s3/keys/stall-off\", \"s3clockkit=../../hal/xtensa-esp32s3/keys/clock-common\", \"s3flashkit=../../hal/xtensa-esp32s3/keys/flash-common\", \"s3dbias=../../hal/xtensa-esp32s3/dbias/src\""
 }
 
 func s3_flash(bytes: String, ibus: String, dbus: String, window: String) -> String {
@@ -289,11 +289,20 @@ func main() {
                 &s3_profile(s3_modules("clock-rom"), layout), &s3_facts,
                 "{s3_file}: [keys.clock] has the value pll320, whose directory keys/clock-pll320 is not in the HAL directory ",
                 "hal/xtensa-esp32s3")
-    // The second key's values are held too.
+    // The other keys' values are held too.
     expect_part(&s3_with("values = [\"off\", \"on\"]", "values = [\"off\", \"onn\"]"),
                 &s3_profile(s3_modules("clock-rom"), layout), &s3_facts,
                 "{s3_file}: [keys.stall] has the value onn, whose directory keys/stall-onn is not in the HAL directory ",
                 "hal/xtensa-esp32s3")
+    expect_part(&s3_with("values = [\"rom\", \"dio80\", \"qio80\", \"dio40\", \"qio40\"]",
+                         "values = [\"rom\", \"dio80\", \"qio120\"]"),
+                &s3_profile(s3_modules("clock-rom"), layout), &s3_facts,
+                "{s3_file}: [keys.flash] has the value qio120, whose directory keys/flash-qio120 is not in the HAL directory ",
+                "hal/xtensa-esp32s3")
+    // The flash key's module mapped to the kit's directory is no value's.
+    expect_part(&s3, &s3_profile(s3_modules("clock-rom").replace("keys/flash-rom", "keys/flash-common"), layout),
+                &s3_facts, "{s3_file}: the board's keyed module s3flash is ",
+                "keys/flash-common, the directory of none of its build key's values, \"rom\", \"dio80\", \"qio80\", \"dio40\", \"qio40\"")
 
     // An image's build keys: each it states maps its module to the value's
     // directory, and the rest stay the profile's.
@@ -310,6 +319,13 @@ func main() {
     let both_want = s3_profile(s3_modules("clock-pll80").replace("keys/stall-off", "keys/stall-on"), layout)
     assert(both_keyed.module_paths.join(" ").equals(both_want.module_paths.join(" ")),
            "both keys' modules mapped")
+    // The flash key beside the clock key: each module mapped to its value.
+    let keyed_flash = s3_image("[keys]\nclock = \"pll80\"\nflash = \"qio80\"\n", &s3)
+    assert(key_line(&keyed_flash).equals("keys clock=pll80 flash=qio80"), "the keys line with the flash key")
+    let flashed_keyed = try! keyed_profile(&rom_profile, &s3, &keyed_flash)
+    let flashed_want = s3_profile(s3_modules("clock-pll80").replace("keys/flash-rom", "keys/flash-qio80"), layout)
+    assert(flashed_keyed.module_paths.join(" ").equals(flashed_want.module_paths.join(" ")),
+           "the clock and flash keys' modules mapped")
     let none = s3_image("", &s3)
     let same = try! keyed_profile(&rom_profile, &s3, &none)
     assert(same.module_paths.join(" ").equals(rom_profile.module_paths.join(" ")), "no key stated, the profile's")

@@ -1,0 +1,25 @@
+//! The flash key `dio80`: the cache reads the flash in DIO, `BBh` with the
+//! address and data on two lines, at 80 MHz, the memory-SPI core clock
+//! divided by 1.
+//!
+//! One of the `s3flash` modules, mapped by a case's `flash_key` (the runner)
+//! or an image's `[keys]` (`sosimage`). The HAL's `clock_init` calls its
+//! `flash_init` after the clock key's, so the switch is made on the clock it
+//! is for, before anything else reads the flash for long and before
+//! `memory_init` (`../../kernel/lib.saw`). The switch is `s3flashkit`'s
+//! (`../flash-common/`): every check before any store, SPI0's stores from
+//! IRAM, the canary, and its line (`../../ABI.md` §18d to §18f). DIO uses the
+//! flash's IO0 and IO1 alone, so the flash's QE bit does not matter to it,
+//! and nothing is sent the flash chip but its reads.
+
+import s3clock.{MSPI_CORE_MHZ}
+import s3flashkit.{flash_init_at}
+
+static_assert(MSPI_CORE_MHZ == 80,
+              "dio80 needs a clock key on the PLL: pll80, pll160 or pll240")
+
+/// Switch the flash's reads to DIO at 80 MHz, or say why not and leave them
+/// as the ROM left them.
+public func flash_init() unsafe {
+    flash_init_at("dio80", 0)
+}
