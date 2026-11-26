@@ -408,7 +408,9 @@ public func pipe_create_record_bytes() -> Int {
 // =============================================================================
 
 /// Words in a `Pool.Available` answer: the bytes free, the longest allocation
-/// that could be served, and the granularities the pool accepts.
+/// that could be served, the granularities the pool accepts, the bytes of the
+/// pool's allocations that are pinned, and the part of those no handle and no
+/// grant row names.
 ///
 /// Machine words, by the boot-handle record's rule: a pool's bytes lie in the
 /// machine's address space, so a word holds any count of them, and a
@@ -418,14 +420,18 @@ public func pipe_create_record_bytes() -> Int {
 /// are a snapshot: another holder of the pool can change both before the
 /// caller acts. `granularities` is a bit set (bit `n` set: a granularity of
 /// `2^n` bytes is accepted), never empty, the same at every granularity asked
-/// and fixed for the pool's life.
-public static POOL_AVAILABLE_RECORD_WORDS: Int = 3
+/// and fixed for the pool's life. `pinned` and `quarantined` are the pool's
+/// own totals, in bytes, and not for any granularity: the lengths of its
+/// allocations that are pinned, and of those the ones nothing names.
+public static POOL_AVAILABLE_RECORD_WORDS: Int = 5
 
 /// Where each answer lives. Named rather than written, on both sides of the
 /// boundary.
 public static POOL_AVAILABLE_TOTAL_WORD: Int = 0
 public static POOL_AVAILABLE_LARGEST_WORD: Int = 1
 public static POOL_AVAILABLE_GRANULARITIES_WORD: Int = 2
+public static POOL_AVAILABLE_PINNED_WORD: Int = 3
+public static POOL_AVAILABLE_QUARANTINED_WORD: Int = 4
 
 /// Bytes in a `Pool.Available` record: the minimum capacity a caller must give
 /// the op, and what the kernel checks the buffer against. A function for
@@ -669,9 +675,18 @@ public func pipe_reply_wait_record_bytes() -> Int {
 // occupying the body (spec §2.7), written by the create that zeroes the row
 // and left in place at the death, and it reads zero for a body no process has
 // occupied. `Process.Stats` answers the pid its record holds.
+//
+// The fifth column, `pinned`, is a level and not a counter: the bytes of the
+// allocations this process's `Pin` took that are still pinned. A `Pin` raises
+// it by the allocation's length, and an `Unpin` lowers it by the same while the
+// process that pinned still occupies its body, through whichever handle made
+// the unpin. The death copies it into the record with the others, so a
+// supervisor reading a dead process's stats sees what it left pinned. It is
+// exact and may be asserted.
 
-/// Doublewords in a `Process.Stats` answer: syscalls, interrupts, faults, pid.
-public static PROCESS_STATS_RECORD_DOUBLEWORDS: Int = 4
+/// Doublewords in a `Process.Stats` answer: syscalls, interrupts, faults, pid,
+/// pinned.
+public static PROCESS_STATS_RECORD_DOUBLEWORDS: Int = 5
 
 /// Where each column sits. Named rather than written, on both sides of the
 /// boundary. The order is the one the paragraph above reads them in, which is
@@ -680,6 +695,7 @@ public static PROCESS_STATS_SYSCALLS_SLOT: Int = 0
 public static PROCESS_STATS_INTERRUPTS_SLOT: Int = 1
 public static PROCESS_STATS_FAULTS_SLOT: Int = 2
 public static PROCESS_STATS_PID_SLOT: Int = 3
+public static PROCESS_STATS_PINNED_SLOT: Int = 4
 
 /// Bytes in a `Process.Stats` record: the minimum capacity a caller must give
 /// the op, and what the kernel checks the buffer against.
@@ -690,7 +706,7 @@ public func process_stats_record_bytes() -> Int {
     PROCESS_STATS_RECORD_DOUBLEWORDS * sizeof<UInt64>()
 }
 
-/// The four columns as a record: the one declaration both doors read.
+/// The five columns as a record: the one declaration both doors read.
 ///
 /// Declaration order is the layout, so this struct and the doubleword slots
 /// above are one description of one thing: `Process.Stats` copies this record
@@ -704,14 +720,16 @@ public struct StatsRow {
     /// The pid of the process the row describes (spec §2.7); zero for a body
     /// no process has occupied.
     public pid: UInt64,
+    /// The bytes still pinned by the `Pin`s this process made (spec §2.7).
+    public pinned: UInt64,
 }
 
 static_assert(sizeof<StatsRow>()
               == PROCESS_STATS_RECORD_DOUBLEWORDS * sizeof<UInt64>(),
               "a stats row must be exactly the doublewords sosabi publishes")
 
-static_assert(sizeof<StatsRow>() == 32,
-              "a stats row is four doublewords, 32 bytes on every profile")
+static_assert(sizeof<StatsRow>() == 40,
+              "a stats row is five doublewords, 40 bytes on every profile")
 
 /// Bytes in one row. A function for `process_stats_record_bytes`' reason.
 public func stats_row_bytes() -> Int {

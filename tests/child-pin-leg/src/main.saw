@@ -9,7 +9,10 @@
 //   ROLE_RETURN  the same page, unpinned before the process exits;
 //   ROLE_GIVEN   the allocation it was given, pinned by its launcher: its
 //                unpin and a pin again are served, and a second pin is the
-//                `BadState` fault that ends the process.
+//                `BadState` fault that ends the process;
+//   ROLE_SIBLING the allocation it was given a sibling of: pinned, and the
+//                process exits holding the pin while its launcher's handle
+//                still names the allocation.
 //
 // A role that runs to its end exits with `EXIT_DONE`.
 
@@ -22,6 +25,7 @@ static TAG_MEM: UInt = 34
 static ROLE_STAY: UInt = 1
 static ROLE_RETURN: UInt = 2
 static ROLE_GIVEN: UInt = 3
+static ROLE_SIBLING: UInt = 4
 
 /// How this process ends when its role has run.
 static EXIT_DONE: UInt = 7
@@ -76,6 +80,12 @@ func _start(boot_handle: UInt) {
 
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     var given = try drain(&proc)
+    if given.role == ROLE_SIBLING {
+        guard let page = given.memory.take() else { return BUG }
+        let _ = try page.pin()
+        let _ = system.debug_print("SOS pinleg: pinned the given sibling\n")
+        return
+    }
     if given.role == ROLE_GIVEN {
         guard let page = given.memory.take() else { return BUG }
         try page.unpin()

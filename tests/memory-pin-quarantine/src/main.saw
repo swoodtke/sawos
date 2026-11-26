@@ -3,6 +3,8 @@
 //
 //   SOS pinleg: pinned a page, and exits with it pinned
 //   SOS pinquar: the child ended status=65543
+//   SOS pinquar: the child's record: pinned 4096
+//   SOS pinquar: the pool: pinned 4096 quarantined 4096
 //   SOS pinquar: a page after its death: at offset 4096
 //   SOS pinquar: another page: <NoMemory>
 //   SOS pinquar: done
@@ -12,7 +14,9 @@
 // with `Physical`, takes that first page, pins it, and exits without an
 // unpin: its handle goes in its teardown, it has no row, and the teardown does
 // not unpin, so the page stays out of the pool, quarantined. Root's next page
-// is the second, not the child's, and a page more is `NoMemory`.
+// is the second, not the child's, and a page more is `NoMemory`. The pool
+// reads the page as pinned and quarantined, and the dead child's record keeps
+// it as pinned.
 // `memory_unpin_returns` is the same program with the child's unpin before its
 // exit.
 
@@ -117,9 +121,9 @@ func outlive(proc: &Process, child: &Process) -> Result<UInt, SosStatus> {
 }
 
 /// Launch the child with `role` and a sibling of `pool`, and answer the §8
-/// status word it ends with.
+/// status word it ends with and the `pinned` column its record keeps.
 func pool_leg(system: &System, proc: &Process, image: &Memory, dests: &Pool,
-              pool: &Pool, role: UInt) -> Result<UInt, SosStatus> {
+              pool: &Pool, role: UInt) -> Result<(UInt, UInt64), SosStatus> {
     let child = try create(&system, &proc, &image, &dests, role)
     let sibling = try pool.mint()
     try child.give(pool: move sibling, tag: TAG_POOL, keep: CHILD_POOL) catch {
@@ -127,7 +131,9 @@ func pool_leg(system: &System, proc: &Process, image: &Memory, dests: &Pool,
         let _ = move back
         return why
     }
-    return outlive(&proc, &child)
+    let status = try outlive(&proc, &child)
+    let record = try child.stats()
+    return (status, record.pinned)
 }
 
 func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
@@ -145,8 +151,13 @@ func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
     try probe.unpin()
     let _ = move probe
 
-    let status = try pool_leg(&system, &proc, &image, &dests, &pool, ROLE_STAY)
+    let (status, kept) = try pool_leg(&system, &proc, &image, &dests, &pool,
+                                      ROLE_STAY)
     print("SOS pinquar: the child ended status={}\n", status)
+    print("SOS pinquar: the child's record: pinned {}\n", kept)
+    let now = try pool.available()
+    print("SOS pinquar: the pool: pinned {} quarantined {}\n", now.pinned,
+          now.quarantined)
 
     let after = try pool.allocate(len: PAGE, contiguous: true)
     let at = (try after.pin()).base

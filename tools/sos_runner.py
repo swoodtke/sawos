@@ -446,6 +446,8 @@ MEMORY_PIN_UNMAP_GIVE_PKG = os.path.join(TESTS_DIR, "memory-pin-unmap-give")
 MEMORY_PIN_QUARANTINE_PKG = os.path.join(TESTS_DIR, "memory-pin-quarantine")
 MEMORY_UNPIN_RETURNS_PKG = os.path.join(TESTS_DIR, "memory-unpin-returns")
 CHILD_PIN_LEG_PKG = os.path.join(TESTS_DIR, "child-pin-leg")
+POOL_AVAILABLE_PINNED_PKG = os.path.join(TESTS_DIR, "pool-available-pinned")
+PROCESS_STATS_PINNED_PKG = os.path.join(TESTS_DIR, "process-stats-pinned")
 POOL_ALLOCATE_FLAGS_PKG = os.path.join(TESTS_DIR, "pool-allocate-flags")
 POOL_PHYSICAL_CAPPED_PKG = os.path.join(TESTS_DIR, "pool-physical-capped")
 # The heaps over pools (`sos.Heap`): a launcher per case, each calling
@@ -6888,7 +6890,9 @@ TEST_CASES = [
         # A pinned allocation stays out of its pool once nothing names it
         # (spec §2.5). Root's pool is two pages; `child-pin-leg` pins the
         # first and exits without an unpin, and its teardown does not unpin,
-        # so root's next page is the second and one more is `NoMemory`.
+        # so root's next page is the second and one more is `NoMemory`. The
+        # pool reads that page as pinned and quarantined, and the dead
+        # child's record keeps it as pinned (spec §2.5, §2.7).
         # `memory_unpin_returns` is the control.
         "name": "memory_pin_quarantine",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
@@ -6901,6 +6905,8 @@ TEST_CASES = [
                        "SOS: boot regions={three}",
                        "SOS pinleg: pinned a page, and exits with it pinned",
                        "SOS pinquar: the child ended status=65543",
+                       "SOS pinquar: the child's record: pinned 4096",
+                       "SOS pinquar: the pool: pinned 4096 quarantined 4096",
                        "SOS pinquar: a page after its death: at offset 4096",
                        "SOS pinquar: another page: this pool has no free "
                        "range that long",
@@ -6949,6 +6955,86 @@ TEST_CASES = [
                        "process={zero}"],
         "expect_clean_exit": False,
         "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A pool's pinned and quarantined bytes (spec §2.5): Pin raises
+        # `pinned` and Unpin lowers it while `quarantined` stays zero under a
+        # handle, and a pinned page whose only handle is released reads in
+        # both.
+        "name": "pool_available_pinned",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_AVAILABLE_PINNED_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS poolpin: fresh: pinned 0 quarantined 0",
+                       "SOS poolpin: one page pinned: pinned 4096 "
+                       "quarantined 0",
+                       "SOS poolpin: two pages pinned: pinned 8192 "
+                       "quarantined 0",
+                       "SOS poolpin: the first unpinned: pinned 4096 "
+                       "quarantined 0",
+                       "SOS poolpin: the second unpinned: pinned 0 "
+                       "quarantined 0",
+                       "SOS poolpin: a pinned page, its handle released: "
+                       "pinned 4096 quarantined 4096",
+                       "SOS poolpin: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A process's `pinned` column (spec §2.7), through `Process.stats()`
+        # and its row of the stats region: it rises and falls with the pins
+        # and unpins, an unpin by another process lowers the pinner's column
+        # and not its own, and a dead pinner's record keeps what it left
+        # pinned, in the body a later child reuses too. An unpin after the
+        # pinner's death lowers the pool's pinned bytes and no column.
+        "name": "process_stats_pinned",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": PROCESS_STATS_PINNED_PKG,
+        "children": [CHILD_PIN_LEG_PKG],
+        "pool_destinations": [0],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS statspin: nothing pinned: 0 0",
+                       "SOS statspin: one page pinned: 4096 4096",
+                       "SOS statspin: two pages pinned: 8192 8192",
+                       "SOS statspin: the first unpinned: 4096 4096",
+                       "SOS statspin: the second unpinned: 0 0",
+                       "SOS statspin: first child: given while pinned: 4096",
+                       "SOS pinleg: the given page's unpin: served",
+                       "SOS pinleg: its pin: served",
+                       "SOS pinleg: a second pin",
+                       "SOS: process fault: object in the wrong state "
+                       "process={one}",
+                       "SOS statspin: first child: ended status=131077",
+                       "SOS statspin: first child: the unpin lowered the "
+                       "pinner's column: 0",
+                       "SOS statspin: first child: the dead child's record: "
+                       "pinned 4096",
+                       "SOS statspin: second child: given while pinned: 4096",
+                       "SOS pinleg: the given page's unpin: served",
+                       "SOS pinleg: its pin: served",
+                       "SOS pinleg: a second pin",
+                       "SOS: process fault: object in the wrong state "
+                       "process={one}",
+                       "SOS statspin: second child: ended status=131077",
+                       "SOS statspin: second child: the unpin lowered the "
+                       "pinner's column: 0",
+                       "SOS statspin: second child: the dead child's record: "
+                       "pinned 4096",
+                       "SOS pinleg: pinned the given sibling",
+                       "SOS statspin: dead pinner: ended status=65543",
+                       "SOS statspin: dead pinner: pool pinned 12288 "
+                       "quarantined 8192",
+                       "SOS statspin: dead pinner: after the unpin, pool "
+                       "pinned 8192",
+                       "SOS statspin: dead pinner: after the unpin, "
+                       "launcher column 0",
+                       "SOS statspin: dead pinner: after the unpin, "
+                       "record pinned 4096",
+                       "SOS statspin: done"],
+        "expect_clean_exit": True,
     },
     {
         # `Physical` on an allocation is capped as every bit of one is (spec

@@ -34,7 +34,8 @@ import hal
 import sosabi.{StatsRow, StatsRegionHeader, STATS_REGION_VERSION,
                PROCESS_STATS_RECORD_DOUBLEWORDS, PROCESS_STATS_SYSCALLS_SLOT,
                PROCESS_STATS_INTERRUPTS_SLOT, PROCESS_STATS_FAULTS_SLOT,
-               PROCESS_STATS_PID_SLOT}
+               PROCESS_STATS_PID_SLOT,
+               PROCESS_STATS_PINNED_SLOT}
 
 import kcore.mem.{align_up}
 import kcore.diag.{fatal_kernel}
@@ -203,19 +204,22 @@ public(package) func stats_bump(row: Int, column: Int) unsafe {
     STATS_STORAGE[at] = STATS_STORAGE[at] + 1
 }
 
-/// Read `row`'s four columns out of the region: what `ProcessOp.Stats` answers
+/// Read `row`'s five columns out of the region: what `ProcessOp.Stats` answers
 /// with, from the one storage rather than from a copy of it.
 public(package) func stats_read(row: Int) unsafe -> StatsRow {
     if not row_ok(row) {
         fatal_kernel("stats were asked for a process body with no row", row as UInt)
-        return StatsRow(syscalls: 0, interrupts: 0, faults: 0, pid: 0)
+        return StatsRow(syscalls: 0, interrupts: 0, faults: 0, pid: 0,
+                        pinned: 0)
     }
     let first = stats_first()
     StatsRow(syscalls: STATS_STORAGE[column_at(first, row, PROCESS_STATS_SYSCALLS_SLOT)],
              interrupts: STATS_STORAGE[column_at(first, row, PROCESS_STATS_INTERRUPTS_SLOT)],
              faults: STATS_STORAGE[column_at(first, row,
                                              PROCESS_STATS_FAULTS_SLOT)],
-             pid: STATS_STORAGE[column_at(first, row, PROCESS_STATS_PID_SLOT)])
+             pid: STATS_STORAGE[column_at(first, row, PROCESS_STATS_PID_SLOT)],
+             pinned: STATS_STORAGE[column_at(first, row,
+                                             PROCESS_STATS_PINNED_SLOT)])
 }
 
 /// Zero `row`'s columns. A process create does this so a reused body never
@@ -230,6 +234,36 @@ public(package) func stats_clear(row: Int) unsafe {
     STATS_STORAGE[column_at(first, row, PROCESS_STATS_SYSCALLS_SLOT)] = 0
     STATS_STORAGE[column_at(first, row, PROCESS_STATS_INTERRUPTS_SLOT)] = 0
     STATS_STORAGE[column_at(first, row, PROCESS_STATS_FAULTS_SLOT)] = 0
+    STATS_STORAGE[column_at(first, row, PROCESS_STATS_PINNED_SLOT)] = 0
+}
+
+/// Raise `row`'s `pinned` column by `bytes`: a `Pin` by the process in the
+/// body.
+public(package) func stats_pin_raise(row: Int, bytes: UInt) unsafe {
+    if not row_ok(row) {
+        fatal_kernel("a pin was charged to a process body with no stats row",
+                     row as UInt)
+        return
+    }
+    let at = column_at(stats_first(), row, PROCESS_STATS_PINNED_SLOT)
+    STATS_STORAGE[at] = STATS_STORAGE[at] + (bytes as UInt64)
+}
+
+/// Lower `row`'s `pinned` column by `bytes`: an `Unpin` of an allocation the
+/// process in the body pinned. The column only ever holds what its own pins
+/// raised, so a lowering past zero is the kernel disagreeing with itself.
+public(package) func stats_pin_lower(row: Int, bytes: UInt) unsafe {
+    if not row_ok(row) {
+        fatal_kernel("an unpin was charged to a process body with no stats row",
+                     row as UInt)
+        return
+    }
+    let at = column_at(stats_first(), row, PROCESS_STATS_PINNED_SLOT)
+    if STATS_STORAGE[at] < (bytes as UInt64) {
+        fatal_kernel("an unpin lowered a pinned column below zero", row as UInt)
+        return
+    }
+    STATS_STORAGE[at] = STATS_STORAGE[at] - (bytes as UInt64)
 }
 
 /// Write `pid` into `row`'s pid column: the process now occupying the body.

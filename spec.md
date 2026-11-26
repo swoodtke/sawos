@@ -1120,10 +1120,10 @@ no more than the pool holds, and what it releases it can allocate again.
   So a pool shared between processes is shared state, and any allocation from
   it may answer that status whatever any holder knew a moment before. No other
   op answers it.
-- **`available(granularity) -> (total, largest, granularities)`.**
-  `PoolOp.Available` (op 1) answers three words about the pool. The first two
-  are for the granularity it is asked about, accepted and spelled as
-  `allocate`'s, and count only what an `allocate` at that granularity could take
+- **`available(granularity) -> (total, largest, granularities, pinned,
+  quarantined)`.** `PoolOp.Available` (op 1) answers five words about the pool.
+  The first two are for the granularity it is asked about, accepted and
+  spelled as `allocate`'s, and count only what an `allocate` at that granularity could take
   at the moment of the call. A range's aligned run is the longest part of it
   that starts and ends on multiples of the granularity.
   - `total` is the bytes free: the aligned runs of the ranges on the pool's free
@@ -1148,18 +1148,29 @@ no more than the pool holds, and what it releases it can allocate again.
     whose memory can be mapped in one unit only, or is too small or misaligned
     for a coarse one. It does not depend on the granularity asked, and it does
     not change over the pool's life.
+  - `pinned` is the bytes of the pool's allocations that are pinned (`Pin`,
+    below), and `quarantined` the part of them that no handle and no grant row
+    names: the pinned allocations whose last name has gone, which stay out of
+    the pool until a holder of a `Physical` handle unpins them, and none can
+    be made. Both are the pool's own totals, the same at every granularity
+    asked, kept on the pool: `Pin` raises `pinned`, the release that finds a
+    pinned allocation with no name raises `quarantined`, and `Unpin` lowers
+    both for that allocation's length. A quarantined allocation stays charged
+    to its creator while the creator lives, and is disowned at its death
+    (below); its bytes stay in both words.
 
   At the grain, with a pool whose base lies on it, every free range is a whole
   number of grains already, so the alignment drops only the frontier's tail,
   which no allocation is ever served from.
 
   It takes the granularity, then the address and capacity of a record in the
-  caller's memory (three argument words), and writes the three words there,
-  `total`, `largest` and `granularities`, one machine word each (a pool's bytes
-  lie in the machine's address space, so a word holds them). Three words do not
-  fit the one value register, so the op answers through a record as `PipeCreate`
-  does (§2.1), and `sosabi` publishes the record's size. The record is a
-  destination under §2.2's buffer rule like any other. Its answers, in order: a
+  caller's memory (three argument words), and writes the five words there,
+  `total`, `largest`, `granularities`, `pinned` and `quarantined`, one machine
+  word each (a pool's bytes lie in the machine's address space, so a word holds
+  them). Five words do not fit the one value register, so the op answers
+  through a record as `PipeCreate` does (§2.1), and `sosabi` publishes the
+  record's size. The record is a destination under §2.2's buffer rule like any
+  other. Its answers, in order: a
   handle without `PoolRight.Allocate` is the `AccessDenied` fault, a granularity
   not accepted and a capacity below the record's size the `BadArg` fault, and a
   destination the copy-out door refuses its fault (`BadAlign`, `BadBuffer`);
@@ -1601,7 +1612,9 @@ owns those bytes.
   teardown does not unpin, so a pinned allocation whose last handle and last
   row a dying process takes with it stays as it is, a live slot nothing names,
   charged to nobody once its creator's death has disowned it, its range
-  outstanding in its pool: quarantined, never handed out again.
+  outstanding in its pool: quarantined, never handed out again. The pool's
+  `Available` answer counts it in `pinned` and `quarantined`, and its pinner's
+  `Stats` column counts it in `pinned` (§2.7).
 - A pool has a count of its own besides `refs`: its outstanding bytes
   (`out_bytes`), what it has allocated and not had back, donations to the
   kernel included (above). It frees only when both are zero, so the pool
@@ -2193,9 +2206,17 @@ over the body table's extent chain and is bounded by `process_slots_usable()` ×
 the longest table.
 
 **`Stats` — exact trap introspection, and the pid.** `ProcessOp.Stats` on
-`ProcessRight.Stats` answers through a four-doubleword copy-out record:
+`ProcessRight.Stats` answers through a five-doubleword copy-out record:
 `syscalls`, `interrupts` and `faults`, split by the cause class the trap entry
-decides on, then `pid`, the named process's pid (below).
+decides on, then `pid`, the named process's pid (below), then `pinned`.
+
+- **`pinned` is a level, not a count:** the bytes still pinned by the `Pin`s
+  this process made. `Pin` raises it by the allocation's length, and `Unpin`
+  lowers it by the same, through whichever handle unpins, while the pinner
+  still occupies its body. At the pinner's death the column is copied into its
+  record with the others, so a supervisor reading a dead driver's `Stats` sees
+  what it left pinned; an `Unpin` after the death lowers the pool's words (§2.5)
+  and no column. Unlike the counts it is exact, and a test may assert it.
 
 - **The pid rides the stats record** because reading it needs a doubleword
   copy-out on a 32-bit profile anyway, which this record already is, and
@@ -2255,9 +2276,10 @@ another process's counters. Three things about the region:
   build can hand out, not for every record. A row for an unoccupied body reads
   whatever its last occupant left until a create zeroes it, and v1 publishes no
   liveness column.
-- **A row names its process by pid.** A row is the stats record's own layout,
-  so its fourth column is the pid of the process occupying the body, written by
-  the create that zeroes the row and left in place at the death, and zero for a
+- **A row names its process by pid.** A row is the stats record's own layout
+  (five doublewords, 40 bytes, `row_bytes` in the header), so its fourth column
+  is the pid of the process occupying the body, written by the create that
+  zeroes the row and left in place at the death, and zero for a
   body no process has occupied. The op answers the caller's own row index; a
   general `top` finds any other process's row by matching the pid that
   process's handle reads through `Stats`. A row whose process has died keeps

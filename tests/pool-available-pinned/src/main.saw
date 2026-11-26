@@ -1,0 +1,74 @@
+// A pool's pinned and quarantined bytes, as `Pool.available` reads them
+// (spec §2.5).
+//
+//   SOS poolpin: fresh: pinned 0 quarantined 0
+//   SOS poolpin: one page pinned: pinned 4096 quarantined 0
+//   SOS poolpin: two pages pinned: pinned 8192 quarantined 0
+//   SOS poolpin: the first unpinned: pinned 4096 quarantined 0
+//   SOS poolpin: the second unpinned: pinned 0 quarantined 0
+//   SOS poolpin: a pinned page, its handle released: pinned 4096 quarantined 4096
+//   SOS poolpin: done
+//
+// Pin raises `pinned` by the allocation's length and Unpin lowers it, and
+// `quarantined` stays zero while a handle names the allocation. Releasing the
+// only handle of a pinned page leaves it in both words.
+
+import sos.{System, Process, Pool, SosStatus}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS poolpin: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS poolpin: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS poolpin: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// Print what `pool` says it has pinned and quarantined.
+func say(what: String, pool: &Pool) -> Result<Void, SosStatus> {
+    let now = try pool.available()
+    print("SOS poolpin: {}: pinned {} quarantined {}\n", what, now.pinned,
+          now.quarantined)
+    return
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    try say("fresh", &pool)
+    let first = try pool.allocate(len: PAGE, contiguous: true)
+    let _ = try first.pin()
+    try say("one page pinned", &pool)
+    let second = try pool.allocate(len: PAGE, contiguous: true)
+    let _ = try second.pin()
+    try say("two pages pinned", &pool)
+    try first.unpin()
+    try say("the first unpinned", &pool)
+    try second.unpin()
+    try say("the second unpinned", &pool)
+
+    let third = try pool.allocate(len: PAGE, contiguous: true)
+    let _ = try third.pin()
+    let _ = move third
+    try say("a pinned page, its handle released", &pool)
+    return
+}

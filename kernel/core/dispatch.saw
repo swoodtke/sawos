@@ -187,6 +187,7 @@ import kcore.objects.{
     IoMemorySlot,
     MAPPINGS,
     MEMORIES,
+    memory_pin_account,
     memory_retire_donated,
     MappingObject,
     MappingSlot,
@@ -257,7 +258,7 @@ import kcore.objects.{
 }
 import kcore.diag.{ExitCode, console, fatal_kernel}
 import kcore.stats.{stats_bump, stats_clear, stats_name, stats_read,
-                    stats_region_phys, stats_region_len}
+                    stats_pin_raise, stats_pin_lower, stats_region_phys, stats_region_len}
 import kcore.refs.{PipeMsgPrefix, PipeTakePrefix, deliver_attachment,
                    hold_staged, is_outlet_of, mint_staged, move_entry, msg_prefix,
                    notify_claim, notify_if_ready,
@@ -1529,7 +1530,8 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     // `Gone` record, so a stale copy here could not be read; it is reset with
     // the rest.
     PROCESS_RECORDS[slot].final_stats = StatsRow(syscalls: 0, interrupts: 0,
-                                                 faults: 0, pid: 0)
+                                                 faults: 0, pid: 0,
+                                                 pinned: 0)
     // The columns open at zero. The body may be a reused one, and this is the
     // line that keeps a child from inheriting its predecessor's traffic and
     // reading a first `stats()` that describes a program it never was. It
@@ -3835,19 +3837,28 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             }
             MEMORIES[obj.slot].pinned = true
             MEMORIES[obj.slot].pinner = PROCESS_RECORDS[p].pid
+            memory_pin_account(obj.slot, true)
+            stats_pin_raise(body_of(p), len)
             op_ok()
         },
         // Unpin: drop the hardware reference, through any handle that carries
         // `Physical`, whoever pinned. No right is `AccessDenied` and an
         // allocation not pinned is `BadState`. Nothing frees here: the handle
         // the op came through names the allocation, which goes home at the
-        // release of its last handle or row.
+        // release of its last handle or row. The pool's pinned bytes come
+        // down, and so does the pinner's column while the pinner still has
+        // its body; a dead pinner's record keeps what it left.
         case Unpin -> {
             if not obj.allows(MemoryRight.Physical) {
                 fault_process(p, FaultReason.AccessDenied)
             }
             if not MEMORIES[obj.slot].pinned {
                 fault_process(p, FaultReason.BadState)
+            }
+            memory_pin_account(obj.slot, false)
+            let owner = record_of_pid(MEMORIES[obj.slot].pinner)
+            if owner != NO_PROCESS && has_body(owner) {
+                stats_pin_lower(body_of(owner), MEMORIES[obj.slot].len)
             }
             MEMORIES[obj.slot].pinned = false
             MEMORIES[obj.slot].pinner = 0
@@ -3867,12 +3878,14 @@ static_assert(sizeof<MemoryPinRecord>()
               == MEMORY_PIN_RECORD_WORDS * sizeof<UInt>(),
               "a pin record must be exactly the words sosabi publishes")
 
-/// What `PoolOp.Available` copies out: `sosabi`'s three published words, in
+/// What `PoolOp.Available` copies out: `sosabi`'s five published words, in
 /// their published order.
 struct PoolAvailableRecord {
     total: UInt,
     largest: UInt,
     granularities: UInt,
+    pinned: UInt,
+    quarantined: UInt,
 }
 
 static_assert(sizeof<PoolAvailableRecord>()
@@ -4005,7 +4018,8 @@ func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
                                         lent_len: 0, depth: 0, free_head: 0,
                                         out_bytes: 0,
                                         contiguous: contiguous,
-                                        pinned: false, pinner: 0)
+                                        pinned: false, pinner: 0,
+                                        pinned_bytes: 0, quarantined_bytes: 0)
             quota_charge(p, QuotaKind.Memory)
             op_value(handle)
         },
@@ -4033,8 +4047,10 @@ func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
             }
             let (total, largest) = pool_available(obj.slot, unit)
             let set = pool_granularities(obj.slot)
-            var rec = PoolAvailableRecord(total: total, largest: largest,
-                                          granularities: set)
+            var rec = PoolAvailableRecord(
+                total: total, largest: largest, granularities: set,
+                pinned: MEMORIES[obj.slot].pinned_bytes,
+                quarantined: MEMORIES[obj.slot].quarantined_bytes)
             let src = (&var rec) as UnsafePointer<PoolAvailableRecord>
             if let why = copy_out(p, dst, src as UInt, bytes) {
                 // Unreachable for `PipeCreate`'s reason: the same destination

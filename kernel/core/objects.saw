@@ -1195,6 +1195,14 @@ public(package) struct MemorySlot {
     public(package) pinned: Bool,
     /// The pid of the process whose `Pin` set `pinned`, zero while it is clear.
     public(package) pinner: UInt64,
+    /// Pool only: the bytes of this pool's allocations that are pinned, and of
+    /// those the bytes that are quarantined, which no handle and no row names.
+    /// They are what `Pool.Available` answers in its last two words, raised by
+    /// `Pin` and by the release that quarantines. `Unpin` lowers `pinned`
+    /// only: it spends a handle, and a quarantined allocation has none. An
+    /// allocation minted at boot has no pool and counts in none.
+    public(package) pinned_bytes: UInt,
+    public(package) quarantined_bytes: UInt,
 }
 
 extension MemorySlot {
@@ -1204,7 +1212,8 @@ extension MemorySlot {
         MemorySlot(state: SlotState.Free, process: 0, base: 0, len: 0, refs: 0,
                    maps: 0, pool: NO_MEMORY, granularity: 0, parent: NO_MEMORY,
                    lent_base: 0, lent_len: 0, depth: 0, free_head: 0,
-                   out_bytes: 0, contiguous: false, pinned: false, pinner: 0)
+                   out_bytes: 0, contiguous: false, pinned: false, pinner: 0,
+                   pinned_bytes: 0, quarantined_bytes: 0)
     }
 }
 
@@ -1217,7 +1226,8 @@ public(package) unsafe static var MEMORIES: Slab<MemorySlot, MAX_MEMORIES> = Sla
                         parent: NO_MEMORY, lent_base: 0, lent_len: 0,
                         depth: 0, free_head: 0, out_bytes: 0,
                         contiguous: false, pinned: false,
-                        pinner: 0); MAX_MEMORIES],
+                        pinner: 0, pinned_bytes: 0,
+                        quarantined_bytes: 0); MAX_MEMORIES],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
@@ -1682,6 +1692,38 @@ public(package) func unref_region_row(region: Int) unsafe {
     memory_release_if_idle(region)
 }
 
+/// Count the pinned allocation `slot`, whose last name has just gone, in its
+/// pool's quarantined bytes. The release reaches this once: after it nothing
+/// names the slot, so nothing releases it again.
+func memory_quarantine(slot: Int) unsafe {
+    let pool = MEMORIES[slot].pool
+    if pool != NO_MEMORY {
+        MEMORIES[pool].quarantined_bytes = (MEMORIES[pool].quarantined_bytes
+                                            + MEMORIES[slot].len)
+    }
+}
+
+/// Count `slot` in its pool's pinned bytes, or take it out of them: the pool's
+/// side of `MemoryOp.Pin` and `MemoryOp.Unpin`.
+public(package) func memory_pin_account(slot: Int, pinning: Bool) unsafe {
+    let pool = MEMORIES[slot].pool
+    let len = MEMORIES[slot].len
+    if pinning {
+        if pool != NO_MEMORY {
+            MEMORIES[pool].pinned_bytes = MEMORIES[pool].pinned_bytes + len
+        }
+        return
+    }
+    if pool != NO_MEMORY {
+        if MEMORIES[pool].pinned_bytes < len {
+            fatal_kernel("an unpin lowered a pool's pinned bytes below zero",
+                         pool as UInt)
+            return
+        }
+        MEMORIES[pool].pinned_bytes = MEMORIES[pool].pinned_bytes - len
+    }
+}
+
 /// Give region `slot` back (its range to its pool, its slot to the slab) if and
 /// only if nothing names it any more and nothing pins it: no handle, no
 /// installed row and no pin (§2.5).
@@ -1729,6 +1771,8 @@ public(package) func memory_release_if_idle(slot: Int) unsafe {
             return
         }
         if MEMORIES[at].pinned {
+            // Nothing names it any more: it is quarantined, once.
+            memory_quarantine(at)
             return
         }
         let pool = MEMORIES[at].pool

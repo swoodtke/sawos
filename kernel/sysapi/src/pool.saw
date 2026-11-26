@@ -13,6 +13,7 @@ import sosabi.{SosStatus, PoolHandle, PoolOp, AllocateFrom, AllocateFlag,
                MINT_OP, NO_HANDLE,
                POOL_AVAILABLE_RECORD_WORDS, POOL_AVAILABLE_TOTAL_WORD,
                POOL_AVAILABLE_LARGEST_WORD, POOL_AVAILABLE_GRANULARITIES_WORD,
+               POOL_AVAILABLE_PINNED_WORD, POOL_AVAILABLE_QUARANTINED_WORD,
                pool_available_record_bytes}
 
 import sos.floor.{ALL_RIGHTS, call_value, checked, sos_handle_release,
@@ -51,7 +52,7 @@ extension Pool: NoCopy {
     }
 }
 
-/// What `Pool.available` answers: three plain numbers about a pool.
+/// What `Pool.available` answers: five plain numbers about a pool.
 ///
 /// `total` and `largest` are for the granularity asked about and are a
 /// snapshot: another holder of the pool, or another thread of this process,
@@ -61,10 +62,19 @@ extension Pool: NoCopy {
 /// as a bit set (bit `n` set: `2^n` bytes accepted); it is never empty, its
 /// lowest set bit is the granularity zero names, and it does not change over
 /// the pool's life.
+///
+/// `pinned` is the bytes of this pool's allocations that are pinned
+/// (`Memory.pin`), at any granularity, and `quarantined` the part of them no
+/// handle and no grant row names: bytes a device may hold, which no
+/// allocation can reach until a holder of a `Physical` handle unpins them, and
+/// which no handle can now be made to. Both are totals and not bounded by
+/// `total`.
 public struct PoolAvailable {
     total: UInt,
     largest: UInt,
     granularities: UInt,
+    pinned: UInt,
+    quarantined: UInt,
 }
 
 extension Pool {
@@ -193,5 +203,7 @@ public(package) func available_into_frame(
                                    pool_available_record_bytes() as UInt))
     return PoolAvailable(total: buf[POOL_AVAILABLE_TOTAL_WORD],
                          largest: buf[POOL_AVAILABLE_LARGEST_WORD],
-                         granularities: buf[POOL_AVAILABLE_GRANULARITIES_WORD])
+                         granularities: buf[POOL_AVAILABLE_GRANULARITIES_WORD],
+                         pinned: buf[POOL_AVAILABLE_PINNED_WORD],
+                         quarantined: buf[POOL_AVAILABLE_QUARANTINED_WORD])
 }

@@ -35,7 +35,8 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, PipeRequestOp, MemoryOp,
                PIPE_CREATE_OUTLET_WORD, pipe_create_record_bytes,
                PROCESS_STATS_RECORD_DOUBLEWORDS, PROCESS_STATS_SYSCALLS_SLOT,
                PROCESS_STATS_INTERRUPTS_SLOT, PROCESS_STATS_FAULTS_SLOT,
-               PROCESS_STATS_PID_SLOT, process_stats_record_bytes,
+               PROCESS_STATS_PID_SLOT, PROCESS_STATS_PINNED_SLOT,
+               process_stats_record_bytes,
                StatsRow, StatsRegionHeader, STATS_REGION_VERSION,
                STATS_REGION_MAP_RECORD_WORDS, STATS_REGION_MAP_ROW_WORD,
                stats_region_map_record_bytes}
@@ -710,7 +711,12 @@ func read_stats_row(at: UInt) unsafe -> StatsRow {
 /// every reading of one process, and zero is never a pid, so a row of the stats
 /// region reads zero only for a body no process has occupied.
 ///
-/// Plain data: four integers, no handle, nothing owned. It is on the automatic
+/// The fifth column, `pinned`, is a level and not a count: the bytes still
+/// pinned (`Memory.pin`) by the pins this process made. Another holder's
+/// `Memory.unpin` lowers it, while this process lives; at its death the
+/// record keeps what it left pinned.
+///
+/// Plain data: five integers, no handle, nothing owned. It is on the automatic
 /// `Copy` tier and needs no policy; a reading is a fact you took, not a
 /// capability you hold.
 ///
@@ -722,6 +728,7 @@ public struct ProcessStats {
     public interrupts: UInt64,
     public faults: UInt64,
     public pid: UInt64,
+    public pinned: UInt64,
 }
 
 /// One of a process's quota rows (spec §2.9), as `Process.quota_get` reads it:
@@ -2477,7 +2484,8 @@ func process_stats_into_frame(handle: ProcessHandle) unsafe -> Result<ProcessSta
     return ProcessStats(syscalls: buf[PROCESS_STATS_SYSCALLS_SLOT],
                         interrupts: buf[PROCESS_STATS_INTERRUPTS_SLOT],
                         faults: buf[PROCESS_STATS_FAULTS_SLOT],
-                        pid: buf[PROCESS_STATS_PID_SLOT])
+                        pid: buf[PROCESS_STATS_PID_SLOT],
+                        pinned: buf[PROCESS_STATS_PINNED_SLOT])
 }
 
 /// The `unsafe` half of `Process.boot_handle_next`, confined to one small named
@@ -2535,7 +2543,7 @@ public struct StatsRegion {
 extension StatsRegion: NoCopy {}
 
 extension StatsRegion {
-    /// Row `index`'s four columns, read out of the mapped page with no syscall
+    /// Row `index`'s five columns, read out of the mapped page with no syscall
     /// at all.
     ///
     /// The numbers mean exactly what `Process.stats()` means (see
@@ -2559,7 +2567,7 @@ extension StatsRegion {
         let at = self.base + self.rows_offset + (index as UInt) * self.row_bytes
         let raw = read_stats_row(at)
         ProcessStats(syscalls: raw.syscalls, interrupts: raw.interrupts,
-                     faults: raw.faults, pid: raw.pid)
+                     faults: raw.faults, pid: raw.pid, pinned: raw.pinned)
     }
 
     /// This process's own row, `row(self.self_row)`. It is named because it is
