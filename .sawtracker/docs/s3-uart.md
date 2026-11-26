@@ -1,23 +1,27 @@
 # SO-165 design: the ESP32-S3 UART0 driver, interrupt-driven both ways
 
-Revision 2, Nov 26. A design only: nothing here is built until the owner and
+Revision 3, Nov 26. A design only: nothing here is built until the owner and
 the reviewer have read it.
 
-**Changes from revision 1**, from the owner's answers and rulings:
+**Changes from revision 2**, from the owner's rulings and the reviewer's
+threads on `SO:s3-uart`:
 
-- Loss is reported in band (`Lost`) and counted (`Stats`), as proposed; B2 is
-  `console_share_profile`; ns16550 and pl011 move later (U5).
-- §4 is new. A generic **device claim** (`IoMemoryOp.Claim`/`Release`,
-  `IoMemoryRight.Claim`) replaces revision 1's shared FIFO: while the
-  console is claimed the kernel does not write to it, its debug print answers
-  a new `SosStatus.Claimed`, its routine lines go into a **death record**
-  (`ProcessOp.Death`) root prints through the console's inlet, and a panic or
-  any machine stop takes the console back. A process's panic text reaches
-  root only through the record (no runtime fallback). Root's panic is a
-  kernel panic. The spec gains the SMP requirement that a panic stops every
-  other core first.
-- Revision 1's two-writer analysis, its count-then-store window and its
-  questions 3 and 6 are gone with it.
+- The claim is a console-specific system op, `SystemOp.ConsoleClaim` and
+  `ConsoleRelease` behind `SystemRight.Console`, granted only to the image's
+  console process (§4.1). The generic IoMemory claim, its right, its overlap
+  rule and its refusal are gone; `Claimed` stays as the debug print's
+  answer and a second claimant's.
+- Root's console never parks, and a watchdog above the driver kills a
+  claimant that stops serving (§4.6, thread 5). Threads 6 and 7 are moot
+  (§4.1a).
+- Receive enables parity, frame and break errors and reports them at the
+  mark as `Garbled` (thread 1); one mark at a time, bytes dropped behind it
+  (thread 2) (§2). The `Sync` threshold yields to `TX_EMPTY` whenever the
+  ring holds a byte (thread 3, §3). The B row and B1's input are worded as
+  thread 4 asks (§10, §11).
+- The owner's answers: a 256-byte panic text; teardown lines only for faults
+  and panics; root's faults and kill are kernel panics; `svc-console` exits
+  `EXIT_CLAIMED`.
 
 Markers. **[read F:L]** is taken from that file and those lines (paths from
 the sawos root at `so161`, `a87d0886`; `IDF/` is ESP-IDF tag v5.4.1).
@@ -34,8 +38,8 @@ raw.githubusercontent.com/espressif/esp-idf into scratch:
 
 1. A new package, `drivers/svc-uart-esp32s3`, serves `uartproto` from UART0's
    window and line 27, declares `bands = "full"`, and serves from one thread
-   at `Rt0`. Its main thread brings the device up, claims it, and joins the
-   serving thread.
+   at `Rt0`. Its main thread brings the device up, claims the console, and
+   joins the serving thread.
 2. Its logic lives in a new hosted package, `drivers/uartcore` (rings, holds,
    the serve decisions, over a device trait), which `blade test` runs against
    a fake UART, so every ordering property is proved without an emulator.
@@ -46,18 +50,20 @@ raw.githubusercontent.com/espressif/esp-idf into scratch:
    spins and there is no transmit thread.
 4. `Sync` is answered when every byte queued before it has left the FIFO,
    which with no other writer is "the ring and the FIFO drained".
-5. Receive: RX-full plus the RX timeout into a ring. `Read` is unchanged (one
-   byte per request, held when none). A loss is reported in band, at the gap,
-   as `Lost`, and counted in a new `Stats` op.
-6. **The device claim** (§4.1): `IoMemoryOp.Claim` and `Release` on any
-   window, behind the opt-in `IoMemoryRight.Claim`. A claim is ownership:
-   an intersecting claim by another process answers `SosStatus.Claimed`. It
-   does not gate `Map`. It ends at release, the object's free, or the
-   claimant's death.
-7. **A claim on the console's window hands the console over** (§4.2): the
-   kernel writes nothing to UART0, its debug print answers `Claimed`, it
-   counts what it held back and says so when the console returns. Panics and
-   every machine stop take it back; no FIFO is reset.
+5. Receive: RX-full plus the RX timeout into a ring, with parity, frame and
+   break errors enabled. `Read` is unchanged (one byte per request, held
+   when none). A loss or an error is reported in band at one mark, as `Lost`
+   or `Garbled`, with bytes dropped behind an unreported mark, and counted in
+   a new `Stats` op.
+6. **The console claim** (§4.1): `SystemOp.ConsoleClaim` and
+   `ConsoleRelease` on the System handle, behind `SystemRight.Console`, which
+   the builder grants only to the image's console process. The claim belongs
+   to the claimant process and ends at its release or its death. It is
+   interim, until a device object exists.
+7. **While it stands the kernel does not write the console** (§4.2): its
+   debug print answers `SosStatus.Claimed`, it counts what it held back and
+   says so when the console returns. Panics and every machine stop take it
+   back; no FIFO is reset.
 8. **The kernel's routine lines move to root** while a claim stands (§4.3 to
    §4.5): a death record, read with `ProcessOp.Death`, keeps the status, the
    trap, the panic text (256 bytes, from the panic op that already carries
@@ -65,13 +71,14 @@ raw.githubusercontent.com/espressif/esp-idf into scratch:
    kernel printed them. Root prints what the kernel did not. There is no
    runtime fallback for panic text: the record carries it.
 9. **Root holds the console's inlet** in every image that names one, prints
-   through the debug print until it is refused, then through the driver, and
-   back again if the driver dies (§4.6).
+   through the debug print until it is refused, then through a writer of its
+   own that never parks, and back again if the driver dies. A watchdog thread
+   above the driver kills a claimant that stops serving root (§4.6).
 10. **Scope: claimed images, on every profile** (§4.8). No existing case
     changes: 233 cases assert the kernel's lines, none of them in a claimed
     image.
-11. **Root's panic is a kernel panic**, and so is every root end but an exit;
-    root's exit stays as it is (§4.9).
+11. **Root's panic, faults and kill are kernel panics**; root's exit stays as
+    it is (§4.9).
 12. The S3 product template takes the new driver; `svc-console` stays.
 13. Finding: `kill_churn_profile`'s console stall is the **kernel's own
     teardown line**, not `svc-console`'s, so no driver can move it (§10).
@@ -91,17 +98,16 @@ ram = "fast"                # it services the UART's interrupt
 bands = "full"              # its serving thread runs at Rt0 (§5)
 
 [[boot]]                    # its own lines, at its end, through the debug
-name = "system"             # print; and its Process
-kind = "system"
-tag = 21
-rights = ["debug", "process-self"]
+name = "system"             # print; its Process; and the console claim,
+kind = "system"             # which the plan grants it only as the image's
+tag = 21                    # console (§4.1)
+rights = ["debug", "process-self", "console"]
 
 [[boot]]
 name = "uart"
 kind = "window"
 type = "esp32s3-uart"
 tag = 22
-rights = ["map", "claim"]   # claim: the opt-in right (§4.1)
 
 [[boot]]
 name = "uart"
@@ -174,11 +180,16 @@ rebuilt against the package anyway.
   `RX_TOUT_THRHD` [26:17] = `RX_TIMEOUT_BITS` [read IDF/uart_reg.h:1268,
   1293-1301], in bit times [read IDF/uart_ll.h:933-946].
 - `INT_CLR` (+0x10) the receive bits, then `INT_ENA` (+0x0C) =
-  `RXFIFO_FULL` (bit 0) | `RXFIFO_OVF` (4) | `RXFIFO_TOUT` (8) [read
-  IDF/uart_ll.h:39-60].
-- **Then the claim** (§4.1), once the line is attached and the receive
-  interrupt enabled, and only then the serving thread's start (§5): every
-  `Write` the driver serves comes after the kernel's last line.
+  `RXFIFO_FULL` (bit 0) | `PARITY_ERR` (2) | `FRM_ERR` (3) | `RXFIFO_OVF`
+  (4) | `BRK_DET` (7) | `RXFIFO_TOUT` (8) [read IDF/uart_ll.h:39-60]. The
+  three error bits answer the reviewer's thread 1; ESP-IDF's own driver
+  enables parity and break by default (UNVERIFIED here: the reviewer's
+  citation, `components/esp_driver_uart/src/uart.c:83-94`, is a file I did
+  not fetch).
+- **Then the claim** (`SystemOp.ConsoleClaim`, §4.1), once the line is
+  attached and the receive interrupt enabled, and only then the serving
+  thread's start (§5): every `Write` the driver serves comes after the
+  kernel's last line.
 - **Not touched:** `CLKDIV` and `CLK_CONF`, which are the console key's
   [read hal/xtensa-esp32s3/ABI.md:3266-3330]; and `CONF0`'s FIFO resets. The
   TX FIFO may hold the kernel's bytes, and the RX FIFO bytes typed before the
@@ -188,8 +199,9 @@ rebuilt against the package anyway.
 requires [read spec.md:4663-4669]. Read `INT_ST` (+0x08). For any receive bit:
 read `STATUS.RXFIFO_CNT` [9:0] and pop that many bytes from `FIFO` (+0x00)
 into the ring [read IDF/uart_reg.h:17-21, 672-679; IDF/uart_ll.h:337-342],
-then read the count again until it is 0; count `RXFIFO_OVF` as a loss (below);
-`INT_CLR` the receive bits. The transmit half follows (§3). Then `ack`. After
+then read the count again until it is 0; count `RXFIFO_OVF` as a loss and
+`PARITY_ERR`, `FRM_ERR` and `BRK_DET` as errors (below); `INT_CLR` the
+receive bits. The transmit half follows (§3). Then `ack`. After
 the ack, the held reads are answered oldest first, from bytes already taken.
 
 **A single typed byte arrives promptly.** It is below `RX_FULL`, so
@@ -209,26 +221,36 @@ is the ns16550 driver's logic, lifted into `uartcore` [read
 drivers/svc-uart-ns16550/src/main.saw:163-176, 191-252, 520-532, 556-585,
 660-682].
 
-**Overflow is counted and reported, never silent.** A byte that finds the
-ring full is dropped and counted, as `InBuf` does today [read
+**Loss and damage are counted and reported, never silent.** A byte that
+finds the ring full is dropped and counted, as `InBuf` does today [read
 drivers/svc-uart-ns16550/src/main.saw:125-161]. An `RXFIFO_OVF` means the
-hardware dropped bytes it does not count, so it counts as at least one. It is
+hardware dropped bytes it does not count, so it counts as at least one. A
+parity error, a frame error (a bad stop bit: the usual sign of a terminal at
+the wrong rate) and a break each count as an error; the damaged byte is still
+delivered, since the hardware flags the event and not the byte. They are
 reported three ways:
 
-- **In band, where it happened.** `uartproto` gains `UartStatus.Lost = 4`,
-  whose reply carries a 4-byte count ("at least this many bytes were lost
-  here"), and `UartError.Lost(at_least: UInt32)`. The ring keeps a gap mark
-  at the position of the first unreported loss; the reader gets every byte
-  before it, then one `Read` answered `Lost`, then the bytes after it. A
-  second loss before the first is reported merges its count into the first
-  mark, so the report is never late and never silent, though a merged count
-  is placed at the earlier gap. The mark consumes no byte, so a reader that
-  treats `Lost` as an error and reads on loses nothing more.
+- **In band, at a mark.** The ring keeps one mark, at the position of the
+  first unreported event: after the last byte accepted before a loss, or
+  after the bytes drained at the interrupt that reported an error, among
+  which the damaged byte lies. The reader gets every byte before the mark,
+  then one `Read` answered with the mark, then the bytes after it.
+  `uartproto` gains two statuses for it, `Lost = 4` when any byte was lost
+  and `Garbled = 5` when none was but an error was seen, and both replies
+  carry the same counts: bytes lost ("at least"), then frame, parity and
+  break errors, little-endian. The client sees `UartError.Lost` or
+  `UartError.Garbled`, each with the counts. The mark consumes no byte.
+- **One mark at a time (the reviewer's thread 2).** While a mark is
+  unreported, every byte that arrives is dropped and counted into it, and
+  any further error is counted into it, until the reader passes it. So
+  every loss or error sits at the one position the mark names, and the bytes
+  after a mark arrived whole and contiguous. Revision 2's merged count could
+  leave a silent second gap behind the first mark; this cannot.
 - **On request.** A new op, `Stats = 5`, a call answered `Ok` and fixed
-  counters, little-endian `u32`s: bytes received, bytes lost, bytes queued,
-  bytes sent, writes held. Every driver answers it (`svc-console` with its
-  printed count and zeros). It also gives the cases an observable that is not
-  a clock (§9).
+  counters, little-endian `u32`s: bytes received, bytes lost, frame errors,
+  parity errors, breaks, bytes queued, bytes sent, writes held. Every driver
+  answers it (`svc-console` with its printed count and zeros). It also gives
+  the cases an observable that is not a clock (§9).
 - **At the end**, in the report the driver prints when its last client goes.
 
 **Line editing does not belong in the driver.** The driver is bytes; a client
@@ -295,12 +317,14 @@ a trap of microseconds.
 
 **`Sync`.** At its take it is marked with `queued`. It is answered when
 `pushed - TXFIFO_CNT >= mark`, that is, when every byte queued before it has
-left the FIFO. The count includes any kernel bytes in the FIFO, so the test
-can only answer late, never early. It is checked at every top-up. With the
-ring empty and `Sync`s waiting, the driver sets `TXFIFO_EMPTY_THRHD` to
-`pushed - mark + 1` for the oldest (a value in 1..128; past 128 it is already
-reached) and keeps the interrupt on, so the line rises exactly when the mark
-is passed, then puts the threshold back. Up to `MAX_SYNCS` are held; at the
+left the FIFO; the test can only answer late, never early. It is checked at
+every top-up. **The threshold is `TX_EMPTY` whenever the ring holds a byte,
+and the oldest waiting `Sync`'s value, `pushed - mark + 1` (1 to 128; past
+128 it is already reached), only while the ring is empty** (the reviewer's
+thread 3). So the line rises exactly when the mark is passed, and a `Write`
+taken while a `Sync` waits puts `TX_EMPTY` back as it queues, so the next
+top-up comes at 32 bytes and the wire does not idle for the interrupt's
+latency. Up to `MAX_SYNCS` are held; at the
 limit intake pauses.
 
 Compared with the brief's "once the ring and the FIFO have drained": the
@@ -313,101 +337,71 @@ bytes have left the FIFO, and the line about its end, root's under a claim
 
 **`Mark`** is answered at once, as today. **`Stats`** answers the counters.
 
-## 4. The device claim, and UART0 between the kernel and the driver
+## 4. The console claim, and UART0 between the kernel and the driver
 
-Revision 1's §4 (two writers in one FIFO, lines split at a fill, a
-count-then-store window) is gone. Under the owner's ruling one writer holds
-the console at a time, so none of it arises.
+### 4.1 The claim
 
-### 4.1 The claim, on any device
+**The ops and the right.** `SystemOp.ConsoleClaim = 11` and
+`SystemOp.ConsoleRelease = 12`, after `ProcessByPid` [read
+kernel/abi/src/ops.saw:316-326], on the System handle, and
+`SystemRight.Console = 1 << 18`, after `ProcessObserve` at bit 17 [read
+kernel/abi/src/rights.saw:166-178]. Neither op takes an argument.
 
-**The ops and the right.** `IoMemoryOp.Claim = 2` and `IoMemoryOp.Release =
-3`, after `Carve` and `Map` [read kernel/abi/src/ops.saw:912-915], and
-`IoMemoryRight.Claim = 1 << 10`, after `Map` at bit 9 [read
-kernel/abi/src/rights.saw:746-751]. Neither takes an argument.
+**What it is.** A claim says the calling process writes the console and the
+kernel does not. It names no device and no window: it is a fact about the
+console the kernel keeps, the claimant's record index and pid, so a reused
+record is never taken for the claimant [read spec.md:468-475]. The op is
+interim: it is console-specific, and claiming devices in general belongs to
+a device object, which is a separate design and not built. The spec says so
+in those terms.
 
-**What it is.** A claim says the calling process owns the registers the
-window covers until it releases them, the window's object is freed, or the
-process dies. It is kept on the IoMemory slot (the claimant's record index and
-pid, as a pipe exchange keeps its sender's, so a reused record is never taken
-for the claimant [read spec.md:468-475]), and the overlap test is a scan of the
-IoMemory slab, which is bounded (`MAX_IOMEMORIES`, raised only by an image's
-limits [read kernel/core/limits.saw:151]); bounded slab scans take no
-preemption point [read spec.md:4750-4753].
+**Its answers, in the order they are decided.**
 
-**The overlap rule.** Two claims conflict when their byte ranges intersect
-and their claimants differ:
+- `ConsoleClaim`: a word that names nothing is the `BadHandle` fault and a
+  handle without `Console` is `AccessDenied`, on §5.7's dispatch order. A
+  caller that already holds the claim is the `BadState` fault. A claim held
+  by another live process answers `SosStatus.Claimed` (12), a status because
+  the caller could not have known; it is the debug print's answer too
+  (§4.2), the same fact from the other side.
+- `ConsoleRelease` needs no right: giving the console back is never
+  authority. A word that names nothing is the `BadHandle` fault; a caller
+  that is not the claimant is the `BadState` fault. So a claimant can always
+  end its claim through whatever System handle it holds.
 
-- a carved part and the whole it was cut from intersect, so either refuses the
-  other;
-- two parts conflict only if they share a byte, so two drivers can own two
-  disjoint register groups of one block (a `part = true` window [read
-  tools/sosimage/src/declaration.saw:44-45]);
-- two objects naming the same range (a second carve of it) intersect;
-- a process may hold claims that overlap each other: it is one owner.
+**It belongs to the claimant process.** It ends at `ConsoleRelease` and at the
+claimant's teardown, whatever ended it, a kill included; a panic and every
+machine stop override it (§4.2). Giving away a System handle neither moves
+nor strands it.
 
-**Its answers, in the order they are decided.** `Claim`: a word that names
-nothing is the `BadHandle` fault and a handle without `Claim` is
-`AccessDenied`, on §5.7's dispatch order; a caller that already holds this
-object's claim is the `BadState` fault; an intersecting claim held by another
-live process answers the new status `SosStatus.Claimed` (12), a status
-because the caller could not have known. `Release`: the same two faults, then
-a caller that does not hold this object's claim is the `BadState` fault.
+**Who holds the right.**
 
-**The refusal status.** None of the existing words fits. `NoResource` means
-no room [read kernel/abi/src/status.saw:171], `WouldBlock` invites a retry
-[:180], and `Revoked` says the object is gone [:175]; here the object is
-live and another process owns it. `Claimed` also answers a debug print while
-the console is claimed (§4.2), the same fact from the other side.
+- Root's System carries every `SystemRight` [read
+  kernel/abi/src/rights.saw:1024-1034], so `Console` too. What a
+  hand-written root gives at run time is its own business, as with every
+  right.
+- In a stock image, a declaration's `system` record may name `console`
+  beside the launch convention's four [read spec.md:5420-5425], and the
+  plan grants it only to the image's console process, the one whose serve
+  `[image] console` names. The builder refuses it, by name, in any other
+  declaration of the image.
+- An image with a hand-written root cannot name a console [read
+  tools/sosimage/src/imagefile.saw:362-364], so the builder refuses every
+  declaration of such an image that names `console`.
 
-**A claim does not limit `Map`.** The lead's reading holds against the code.
-`Map` is already the right on the handle, and a launcher maps windows into
-its children through their Process handles [read spec.md:1622-1626], so a
-claim that gated `Map` would make every launcher order its maps against its
-children's claims. On the flat tier a mapping protects nothing anyway [read
-hal/xtensa-esp32s3/kernel/lib.saw:356-358]. A claim is a statement to the
-kernel and to other claimants, not a lock on a mapping.
+### 4.1a The reviewer's threads 6 and 7
 
-**When it ends.** At `Release`; when the object is freed with its last handle
-[read spec.md:2740]; and at the claimant's teardown, which ends every claim
-the process holds before it closes the process's handles, so whatever the
-teardown prints comes after the claim has ended. A kill is a teardown too.
-
-**On a device the kernel uses.** A claim whose range intersects the HAL's
-console window (`DEVICE_GRANT_BASE`, `DEVICE_GRANT_LEN`, which kcore already
-reads [read kernel/core/loader.saw:329-333] and to which the builder holds the
-board's one `kernel = true` row [read
-tools/sosimage/src/boardcheck.saw:296-310])
-is a console claim (§4.2). The lead's two semantics hold, with one statement
-of scope: the console is the only device the kernel drives that is a board
-row. The tick's timer and the interrupt controller are not rows, so no window
-names them (the S3's tick source is a reserved line [read
-hal/xtensa-esp32s3/board.toml:122-124]). Every claim is ownership, the
-console's included; a console claim also hands the console over.
-
-**Which handles carry the right.** `Claim` is opt-in, as `physical` is on
-Memory and Pool [read tools/sosimage/src/rights.saw:17-21, 110-112]:
-
-- The kernel's default IoMemory set gains it [read
-  kernel/abi/src/rights.saw:1283-1286], so root's device rows carry it and a
-  launcher can pass it on; a carve keeps the carving handle's rights [read
-  spec.md:1480-1482].
-- The stock root narrows every child's IoMemory ceiling to every right but
-  `claim`, as it narrows Memory and Pool to every right but `physical` [read
-  spec.md:5405-5409], unless the plan grants it.
-- A declaration asks for it in its window record's `rights` (or its
-  `[ceilings]`), and the image grants it: implicitly, to the image's console
-  process on its window of the `kernel = true` device; through the image's
-  per-process `ceilings` for any other device [read
-  tools/sosimage/src/imagefile.saw:65-72]. The builder refuses, by name,
-  `claim` on a `kernel = true` window for any process but the image's
-  console.
-- A hand-written root gives what it holds, as with every right.
+- **t6** (a claim excludes claims, not writers): moot. The claim names no
+  window, so there is no `Map` for it to gate; who can write UART0's registers
+  is decided by who is given its window, which a stock image gives only to the
+  process its `device` names [read tools/sosimage/src/imagefile.saw:1093-1095].
+- **t7** (a claimant that gives away its last handle keeps the claim): moot.
+  The claim belongs to the process, not to a handle, and `ConsoleRelease`
+  needs no right, so a claimant can always end it and its death always does.
 
 ### 4.2 The console under a claim
 
-**The kernel writes nothing to the console while another process holds a
-console claim.**
+**The kernel writes nothing to the console while another process holds the
+claim.**
 
 - **The debug print answers `Claimed`** to every caller, the claimant
   included: the driver prints its own report after it releases (§5). Today
@@ -436,8 +430,10 @@ count line, and then write as today.
 
 - **The driver's interrupt.** The kernel runs to a stop with interrupts
   masked [read spec.md:4020-4021], so no driver code runs again; the seam
-  masks the console's line at the controller as well, so the state is the
-  same whatever the stop path does next.
+  masks the console's line at the controller as well (each HAL names that
+  line, as the S3's `CONSOLE_IRQ` already does [read
+  hal/xtensa-esp32s3/kernel/lib.saw:1080-1082]), so the state is the same
+  whatever the stop path does next.
 - **No FIFO reset.** The bytes the driver stored are the run's last output,
   and they go out first; the kernel's poll appends behind them [read
   hal/xtensa-esp32s3/kernel/lib.saw:469-478]. A reset would cut the output
@@ -455,7 +451,8 @@ count line, and then write as today.
 
 **No line is ever half on each side of a claim.** A kernel line is written
 inside one kernel entry with interrupts masked, and the console loops take no
-preemption point [read spec.md:4750-4753]. `Claim`, `Release` and the
+preemption point [read spec.md:4750-4753]. `ConsoleClaim`,
+`ConsoleRelease` and the
 teardown that ends a claim are kernel entries too, on one core, so each line
 is wholly before or wholly after them, and it decides once, at its first byte,
 whether it prints. A line written just before a claim is in the FIFO ahead of
@@ -478,7 +475,7 @@ written directly; **4**, held back and counted (§4.2).
 | `SOS: process fault: panic process=P text=TEXT` | [read kernel/core/dispatch.saw:3346-3373] | 2: the text |
 | `SOS: fault TAG cause= epc= tval=` (a trap in a process) | [read sched.saw:1656-1670] | 2: cause, pc and address; its status code is 0 [read sched.saw:1667] |
 | `SOS: lock wait: the owner is a thread of another process waiter=W holder=H`, then the `BadArg` fault line | [read dispatch.saw:2361-2368] | 2: the holder's pid |
-| `SOS: process teardown handles= threads= events= waiters= interrupts= timers= process=P`, at every end | [read sched.saw:1397-1418, 1444, 1476, 1498, 1556] | 2: the six counts |
+| `SOS: process teardown handles= threads= events= waiters= interrupts= timers= process=P`, at every end | [read sched.saw:1397-1418, 1444, 1476, 1498, 1556] | 2 after a fault, a trap or a panic; after an exit or a kill the counts stay in the record and root does not print them (owner's answer) |
 | the teardown of a process never started | [read sched.saw:1474-1477] | 4: its record is reclaimed as the teardown ends, so no handle can read it |
 | `SOS: external irq LINE`, a line nothing is bound to | [read kernel/core/irq.saw:275-280] | 4 |
 | `SOS: spurious interrupt`, the first only | [read irq.saw:312-318] | 4 |
@@ -537,7 +534,7 @@ not, so there is one path and `printed` says which way the console went. It
 lives in the process record, which outlives the body [read spec.md:48]. With
 `PANIC_TEXT_BYTES` at 256 [read kernel/abi/src/ops.saw:200] it is 384 bytes a
 record, about 3 KiB at the S3's default of 8 processes [read
-hal/xtensa-esp32s3/board.toml:130-133] (question 1).
+hal/xtensa-esp32s3/board.toml:130-133].
 
 **How the panic text gets there.** The panic op already takes it: the runtime
 copies at most `PANIC_TEXT_BYTES` into a word-aligned buffer and calls the op
@@ -576,50 +573,100 @@ root: X fault: lock owner is a thread of process PID  cause 5
 root: X teardown handles=.. threads=.. events=.. waiters=.. interrupts=.. timers=..
 ```
 
-An exit or a kill adds only the teardown line; the code is in `status=`.
+The teardown line follows a fault, a trap, a panic or a lock fault only
+(owner's answer); an exit or a kill is the `ended` line alone, its code in
+`status=`.
 Root does not need to know whether a claim stood: the record says whether the
 kernel printed. Root reads it after its wait returns, which is after the
 teardown [read spec.md:4463-4467].
 
-### 4.6 Root's console, before and after the driver
+### 4.6 Root's console, and a claimant that stops taking
 
-**Root holds the console's inlet** in every image that names a console. Root
-creates the image's connections and holds their ends [read
-root/src/main.saw:22-33, 55-58]; the plan has it keep one inlet of the
-console's connection for itself, minted as a client's is.
+This answers the reviewer's thread 5. Revision 2 had root print through the
+runtime's console path, where a post refused for room becomes a call that
+parks [read drivers/uartpipe/src/lib.saw:9-17;
+kernel/sysapi/src/rt.saw:405-420].
+Behind a claimant that has stopped taking, root would park there, stop
+waiting on deaths, and the machine would hang with nothing printed. Root's
+console now never parks, and root can take the console back.
 
-- **Before the driver claims**, root prints through the debug print, as
-  today, so a launch step's failure line is always printed.
-- **On the first `Claimed` answer** the runtime adopts the inlet and sends the
-  rest of the line, and every later one, through it. A claim can fall between
-  two of root's bytes; the line's first part is already in the FIFO ahead of
-  the driver's, so it reads in order. This is a standby mode in `sos.rt`: an
-  inlet held but not adopted until the debug print is refused.
-- **If the driver dies**, the inlet answers `PeerClosed` and root goes back to
-  the debug print, which the kernel honours again: the claim ended at the
-  teardown, before the driver's handles closed (§4.1). So `root: console
-  ended status=N` and the driver's detail lines print directly.
-- **At the end**, root drops its inlet once the console's process is the only
-  child it still waits for, after a `Sync`, so the driver sees every inlet
-  gone and ends. Without that the driver would serve root's inlet for ever
-  and root would wait for it for ever.
-- **Before a stop**, root syncs its console. Root stops the machine itself
-  rather than exiting [read root/src/main.saw:36-40], so the exit path's sync
-  [read rt/main/src/lib.saw:29-31] does not run for it; with the sync its
-  last line is out before the kernel's halt line.
+**Root holds the console's inlet** in every image that names a console: the
+plan keeps one inlet of the console's connection for root, minted as a
+client's is [read root/src/main.saw:22-33, 55-58].
 
-In an image whose console is `svc-console`, nothing claims, root's debug print
-is never refused, and root never adopts the inlet: those transcripts do not
-move.
+- **Before the claim**, root prints through the debug print, as today, so a
+  launch step's failure line is always printed.
+- **From the first `Claimed` answer**, root's lines go to the inlet through a
+  writer of the stock root's own, not `uartpipe` or the runtime's `print`:
+  - each line is posted with its claim kept, and the claim attached to
+    root's supervise Waiter, so the driver's answer arrives as a delivery
+    beside the deaths, and a delivered reply is the resolve [read
+    spec.md:301-308; kernel/sysapi/src/pipe.saw:1742-1745];
+  - root keeps every line until its answer arrives: at most
+    `ROOT_CONSOLE_OUTSTANDING` (4) posted, each a claim and a handle, and
+    behind them a backlog of `ROOT_CONSOLE_BACKLOG` bytes (2 KiB);
+  - a post refused for room, quota or a table row leaves the line in the
+    backlog, and root attaches the inlet's room level one-shot, so it posts
+    again when the ring has room [read spec.md:293-296;
+    kernel/sysapi/src/pipe.saw:1714-1716];
+  - a line that finds the backlog full is dropped and counted, and root
+    prints `root: N lines dropped` once its console moves again.
+- **Root's one wait is its supervise Waiter**, which carries the deaths, the
+  answers and the room level. Root never waits on the console alone, so it
+  goes on reading every death record whatever the console does.
+- **If the driver dies**, its outstanding claims are delivered as
+  `PeerClosed`, the claim ended at its teardown (§4.1), and root writes every
+  line it still holds, in order, through the debug print, then goes on there.
+  So `root: console ended status=N` prints directly.
+- **At the end**, once the console's process is the only child left and
+  every line root posted is answered, root drops its inlet, so the driver
+  sees every inlet gone and ends.
+- **Before a stop**, root waits on the same Waiter for its lines' answers, so
+  its last line is out before the halt line. If they do not come (below),
+  root kills the console's process first and writes them through the debug
+  print.
+
+**The console watchdog.** A claimant that is alive and not serving leaves
+root's oldest line unanswered. Root runs a second thread at its `High` band,
+which the stock root's header moves from level 3 to 5 [read root/Saw.toml:30;
+spec.md:4117-4121], above the driver's `Rt0` (4). It sleeps on a periodic
+Timer of `CONSOLE_STALL_PERIOD` (1 s) only while root has a line
+unanswered. At each wake it reads the console process's `Stats` [read
+spec.md:2195-2198]. When the oldest unanswered line is the same as at the
+previous wake and the process's syscall count has not moved since, two wakes
+in a row, the console is stalled. Root kills it with the code
+`CONSOLE_STALLED`; the teardown ends the claim, and root writes `root:
+console stalled, killed` and its held lines through the debug print.
+
+- **Why the test is sound.** The driver runs above every thread but the
+  watchdog, so a driver able to run takes root's staged message before
+  anything below it runs. One whose syscall count stands still across two
+  whole periods, with root's line waiting, is blocked on something that is
+  not coming, or spinning: a spinner makes no syscalls and starves everything
+  below `Rt0`, which is why the watchdog sits above it.
+- **A healthy driver keeps moving.** Holding a `Write` while the wire
+  drains, it makes a syscall at every top-up, at most 32 byte times apart
+  (2.8 ms at 115200), far inside the period. On the emulator it never waits
+  on the wire at all (§6).
+- **The residue.** The period is the guest clock, which follows host time. A
+  false kill needs the host to stall across a whole period inside the few
+  instructions between the watchdog's block and the driver's next syscall,
+  twice in a row; I name it rather than claim it cannot happen. A claimant
+  that stalls while root has nothing to print goes unnoticed until root next
+  prints, which is at the next death, the moment it matters.
+
+**In an image whose console is `svc-console`**, nothing claims, root's debug
+print is never refused, and none of this runs: those transcripts do not move.
 
 ### 4.7 What each caller of the debug print does with `Claimed`
 
-- **Root**: switches to the inlet (§4.6).
+- **Root**: switches to its own writer on the inlet (§4.6).
 - **`svc-console`** writes every byte through the debug print and fails its
   serve on any error [read drivers/svc-console/src/main.saw:174-184]. In a
-  stock image it never meets `Claimed`: nothing in such an image can claim
-  the console's window (§4.1). In a hand-written image that lets another
-  process claim it, it ends with a new exit code, `EXIT_CLAIMED = 3`, so its
+  stock image it never meets `Claimed`: only the image's console process
+  holds the right, and `svc-console`, when it is that process, asks for none
+  (§4.1). In a hand-written image whose root lets another process claim, it
+  ends with a new exit code, `EXIT_CLAIMED = 3` (owner's answer), so its
   supervisor's status names why; its clients' calls answer `PeerClosed`.
 - **The runtime's `print`** in a process with no console record drops a byte
   the debug print refuses, and keeps no status, on purpose [read
@@ -669,14 +716,13 @@ reads the same whichever side raised it" [read kernel/core/diag.saw:135-138;
 dispatch.saw:3346-3373]; and a kill with `KilledRoot` (8) [read
 sched.saw:1496-1503].
 
-**After (owner's ruling).** Root's panic is a kernel panic: the panic path
-takes the console back over any claim (§4.2) and writes root's text in the
-kernel's panic output. I recommend the same for every other end of root that
-is not an exit: a syscall fault, a trap, a delivery's fault, and a kill. Root
-holds the system's supervision, so any of them leaves nothing to report the
-rest, and each already stops the machine with a failing status of the
-kernel's own vocabulary. Making them system faults adds only the reclaim; the
-lines and the statuses stay what they are, so no case asserting them moves.
+**After (owner's rulings).** Root's panic, its faults (a syscall fault, a
+trap, a delivery's fault) and its kill are kernel panics: the panic path
+takes the console back over any claim (§4.2) and writes root's line, its
+panic text included, in the kernel's panic output. Each already stops the
+machine with a failing status of the kernel's own vocabulary, so the change
+is the reclaim; the lines and the statuses stay what they are, and no case
+asserting them moves.
 
 **Root's exit stays exactly as it is**: its teardown line, then the halt with
 its code. It is a stop, so under a claim it reclaims first, and the bytes
@@ -686,10 +732,10 @@ the driver had stored go out before the kernel's lines.
 
 **Two threads.** The main thread starts at `Normal` [read spec.md:4111]. It
 maps the window, makes the Waiter, attaches the line and the outlet, brings
-the UART up (§2), claims the window (§4.1), starts the serving thread at
+the UART up (§2), claims the console (§4.1), starts the serving thread at
 `Rt0`, and joins it. When every client is gone the serving thread drains its
 ring and the FIFO (its `Sync` mechanism, with the mark at `queued`) and
-returns; the main thread releases the claim and prints the report through
+returns; the main thread releases the console and prints the report through
 the debug print, which the kernel honours again. If the driver dies instead,
 its teardown ends the claim (§4.1), and the kernel prints its end directly.
 The serving thread does everything else: messages, the line, the
@@ -817,7 +863,7 @@ The S3 smoke gates too, and `uartcore`'s hosted tests run in every full
 owner would rather keep the emulators' drivers as the completion-queue
 examples they are, they can wait.
 
-**The claim comes with them.** Each claims its window as the S3 driver does.
+**The claim comes with them.** Each claims the console as the S3 driver does.
 Under the claim the hand-written roots and clients of the 9 cases that use
 these drivers (§4.8) can no longer print through the debug print while the
 driver serves: their prints must go through the connection or come after the
@@ -855,14 +901,14 @@ driver suits a product that prints little" [read
 drivers/svc-console/src/main.saw:22-23] gains the pointer to the new driver.
 Hand-written roots (`kill_churn` and the rest) are untouched.
 
-**The grant.** In such an image the builder grants `claim` on UART0's window
-to the console's process, whose declaration asks for it (§1), and refuses it
-on a `kernel = true` window to any other process (§4.1).
+**The grant.** In such an image the plan grants `console` on the driver's
+System record, which its declaration asks for (§1), and the builder refuses
+it, by name, in any other declaration (§4.1).
 
 **Root's inlet.** The plan keeps one inlet of the console's connection for
 root in every image that names a console, and root's handle count and arena
 grow by what that needs (`sosimage.plan` sizes both [read
-root/src/main.saw:55-62]). Root holds it on standby and adopts it only when
+root/src/main.saw:55-62]). Root uses it, through its own writer, only once
 its debug print is refused (§4.6), so the `svc-console` images, where nothing
 claims, print as they do today. Root drops it when the console's process is
 the last child left, so the console's driver ends as it does today.
@@ -882,7 +928,10 @@ live, since the emulator drains at once:
 | every byte out, in order, for many write sizes, ring sizes and fill caps | a byte is dropped, doubled or reordered |
 | a `Write` larger than the room is held, intake paused, released at the top-up that makes room, answered only when wholly queued | it is answered early, intake keeps running, or the remainder is copied out of order |
 | `Sync` is answered exactly when `pushed - count` passes its mark; with the ring empty the threshold is `pushed - mark + 1` | it answers at the take, or at ring-empty with bytes still ahead of the mark in the FIFO |
-| receive: drops counted, `Lost` at the gap, merged counts, `received = delivered + lost` | a drop goes uncounted, or `Lost` is placed after bytes that came later |
+| a `Write` taken while a `Sync` waits puts the threshold back to `TX_EMPTY` | the fake UART's next top-up comes at the `Sync`'s lowered level |
+| receive: drops counted, the mark where the first event was, `received = delivered + lost` | a drop goes uncounted, or the mark is placed after bytes that came later |
+| a second loss while a mark is unreported is dropped behind the mark, never after bytes the reader has not passed | a silent second gap among the bytes after a mark |
+| an error drained with bytes puts a `Garbled` mark after them; a loss with it makes the mark `Lost`, carrying both counts | an error delivered with no mark, or a count missing from the reply |
 | held reads answered oldest first; a reply that does not land puts its byte back | as the ns16550 cases check today |
 
 **On the emulator:**
@@ -927,33 +976,42 @@ live, since the emulator drains at once:
   exits, one panics with a 300-byte text, one faults on a syscall, one calls
   `debug_print_byte` and prints the answer through its console before it
   exits. Expected, through the driver: `debug print: the console is
-  claimed`; root's lines for each, the panic's text cut to 256 bytes on its
-  `ended` line; then the returned line with `lines held=` the kernel's own
-  count of what it did not write and `debug bytes refused=1`. The order
-  between the clients is the scheduler's, so the case matches each client's
-  lines as a group, not their interleaving. Red: a kernel line written under
-  the claim; a record field wrong; a panic text lost or uncut; the refusal
-  silent.
+  claimed`; root's `ended` line for each, the panic's text cut to 256 bytes
+  on its own; a `teardown` line for the panic and the fault only; then the
+  returned line with `lines held=` the kernel's own count of what it did not
+  write and `debug bytes refused=1`. The order between the clients is the
+  scheduler's, so the case matches each client's lines as a group, not their
+  interleaving. Red: a kernel line written under the claim; a record field
+  wrong; a panic text lost or uncut; a teardown line after an exit; the
+  refusal silent.
+- **No error case on the emulator.** The runner's terminal sends whole bytes,
+  so it cannot produce a parity or frame error, and whether the model would
+  report one is UNVERIFIED. The hosted rows carry the logic, and B1 the part
+  (§10).
+- **`uart_s3_stall`.** `uartconfig`'s test-only `STALL_AFTER = 1`: the driver
+  serves one message and then stops taking, alive. A client exits. Expected:
+  root's watchdog kills the console; the kernel's returned line; then,
+  through the debug print, `root: console stalled, killed`, `root: client
+  ended status=...` and `root: console ended status=...` (the kill). No time
+  is asserted. Red: root parked behind the stalled driver (the case hangs to
+  the harness timeout); the client's death unreported.
 
 **On the gate's three profiles, and the S3 smoke's shared list** (a
 hand-written root, no driver; these are the kernel's own cases):
 
-- **`device_claim`.** Root carves the RTC row [read
-  hal/riscv32/board.toml:50-55; hal/arm64/board.toml:51] into two disjoint
-  parts and gives a child the whole and one part. The child claims a part:
-  `Ok`. Root claims the whole: `Claimed`. Root claims the other part: `Ok`.
-  The child claims its part again: the `BadState` fault, and its death ends
-  its claim, after which root's claim of the whole answers `Ok`. A release by
-  a non-claimant and a claim without the right each fault a further child.
-  Red: an intersection missed, a disjoint pair refused, a claim surviving its
-  release or its claimant's death, a wrong answer's order.
-- **`console_claim`.** Root claims the console's window itself, starts a
-  child that faults, calls the debug print (it answers `Claimed`), waits for
-  the child, releases, then prints what it recorded and the child's death
-  record. Expected: no `SOS:` line between the claim and the release; then
-  `SOS: console returned, lines held=2, debug bytes refused=1`; then root's
-  lines with the record's fields. Red: the kernel writing under the claim; a
-  count wrong; the release not giving the console back.
+- **`console_claim`.** Root claims the console itself (root's System holds
+  every right), starts a child that faults, calls the debug print (it
+  answers `Claimed`), waits for the child, releases, then prints what it
+  recorded and the child's death record. A second child given a System with
+  `console` claims while root holds it: `Claimed`; a third releases without
+  holding it: the `BadState` fault. Expected: no `SOS:` line between the
+  claim and the release; then `SOS: console returned, lines held=N, debug
+  bytes refused=1`; then root's lines with the record's fields. Red: the
+  kernel writing under the claim; a count wrong; the release not giving the
+  console back; a claim surviving its claimant's death.
+- **`console_stall`.** A test claimant (`tests/console-staller`) that
+  claims, takes one message and stops taking, with a stock root naming it as
+  the console. The same expectations as `uart_s3_stall`, on every profile.
 - **`death_record`.** No claim. Root reads the record of children that exit,
   are killed, fault on a syscall, trap, panic (a 300-byte text) and wait on a
   lock another child owns, and prints every field. Each record reads
@@ -978,6 +1036,15 @@ prompt, echoes each byte it reads, and on CR or LF prints `line: TEXT` and the
 then pastes a 200-character line, at `rom` (115200) and at `b921600`.
 Expected: each key echoed as typed, the line back whole, `lost=0` at both.
 The paste is the receive path's real load: at 921600 the FIFO fills in 1.4 ms.
+Then, with the image at `b921600`, the owner types a few keys from a terminal
+opened at 115200. Expected: the client reports `Garbled` with frame errors
+counted, which is the failure the reviewer's thread 1 names, never `lost=0`
+with garbage.
+
+**Who sends B1's input.** The owner types it at the bridge's terminal. No
+tool sends bytes to the board in this design; if the lead wants the reviewer
+to send them, the reviewer asks the owner before the first one, since the
+standing grant has covered flashing and capturing only.
 
 **B2, the console's share.** `kill_churn_profile` cannot show it. Its stall
 is the kernel's own 156-byte teardown line in every kill, and "during the
@@ -1008,31 +1075,30 @@ In order; sizes are rough.
 
 | unit | what | size |
 |---|---|---|
-| U0 | the kernel: `IoMemoryOp.Claim`/`Release`, `IoMemoryRight.Claim` (opt-in), `SosStatus.Claimed`; the console under a claim (held lines, the refused debug print, the returned line, `hal.console_reclaim` on every stop); the death record and `ProcessOp.Death`, the panic text kept in it; root's non-exit ends as system faults; `sos` wrappers; the cases `device_claim`, `console_claim`, `death_record` on every profile | L |
-| U0b | root and the runtime: the plan's inlet for root and the builder's `claim` grant and refusal; `sos.rt`'s standby console; root prints from the record, drops its inlet when only the console is left, syncs before a stop; `svc-console`'s `EXIT_CLAIMED` | M |
+| U0 | the kernel: `SystemOp.ConsoleClaim`/`ConsoleRelease`, `SystemRight.Console`, `SosStatus.Claimed`; the console under the claim (held lines, the refused debug print, the returned line, `hal.console_reclaim` and each HAL's console line on every stop); the death record and `ProcessOp.Death`, the panic text kept in it; root's panic, faults and kill as kernel panics; `sos` wrappers; the cases `console_claim` and `death_record` on every profile | L |
+| U0b | root and the builder: `console` as a System record right granted only to the image's console, and its refusals; the plan's inlet for root; root's non-parking console writer, its record printing, its watchdog thread and its header's `High` at 5; `svc-console`'s `EXIT_CLAIMED`; `tests/console-staller` and `console_stall` | M |
 | U1 | `uartproto`: `Lost`, `Stats`, the new `Write`/`Sync` wording ("answered once queued", "once every byte before it has left the device"); every driver answers `Stats`; hosted tests | S |
 | U2 | `drivers/uartcore`: rings, gap marks, holds, sync marks, the serve state machine over a `UartDevice` trait; the fake UART; hosted tests (§9) | M |
 | U3 | the S3 UART block in `esp32s3io` (offsets, bring-up words, the arm's register order) with hosted tests through its `RegisterPort`; `ABI.md` §4b, the driver's use of UART0 and §6's findings | S |
 | U4 | `drivers/svc-uart-esp32s3` and its `uartconfig`; the runner's S3 `stdin`; the S3 cases of §9; the product template's S3 image | L |
 | U5 | ns16550 and pl011 on `uartcore` with their claims (§7), their cases' trap counts and debug prints | M |
-| B | B1 and B2 on the part (the lead's, through the reviewer's standing approval) | |
+| B | B1 and B2 on the part, under the owner's standing grant to the reviewer; B1's input typed by the owner | |
 
 U0, U1, U2 and U3 can run in parallel within the concurrency limit; U0b
 needs U0; U4 needs all of them.
 
 **Spec text.**
 
-- §2.5, `IoMemory`: the ops `Claim` and `Release`, the right, the overlap
-  rule, the ends of a claim, and that a claim does not gate `Map`; the
-  console claim.
-- §3's rights tables and the default IoMemory set; §12's launch convention:
-  the stock root narrows `claim` as it narrows `physical`, and the builder's
-  grant and refusal.
+- §2.8, `System`: the ops `ConsoleClaim` and `ConsoleRelease` and the right
+  `Console`, said as they work: the claim is console-specific and interim,
+  and claiming devices belongs to a device object, a separate design that is
+  not built. §12's launch convention: `console` as a System record right the
+  stock root gives only to the image's console, beside the four.
 - §5.7's statuses: `Claimed`. §2.8's `DebugPrint` row [read spec.md:2326]:
-  it answers `Claimed` under a console claim.
+  it answers `Claimed` while the console is claimed.
 - §2.7 and §8: `ProcessOp.Death` and the record, replacing "fault forensics
   a supervisor can read is a later design" [read spec.md:4476-4477]; root's
-  ends that are system faults, and root's exit unchanged.
+  panic, faults and kill as kernel panics, and root's exit unchanged.
 - §9: the transmit half of "a driver is a service" (a `Write` answered once
   queued, the transmit interrupt, the held `Write`, the paused intake).
 - §9a, rewritten around the claim: boot, then the kernel writes until a
@@ -1046,22 +1112,23 @@ needs U0; U4 needs all of them.
   stops every other core before it prints or takes any device back**, by a
   stop IPI the other core cannot mask, a bounded wait for each core's
   acknowledgement, and the core held in reset where the board can do that.
-- §12's console record: root holds the console's inlet on standby; its
-  `Sync` promise unchanged.
+- §12's console record: root holds the console's inlet, writes to it without
+  parking once the console is claimed, and watches the claimant; the
+  `Sync` promise is unchanged. `uartproto`'s doc: `Lost`, `Garbled`,
+  `Stats`.
 - §11: B2's open number. `uartproto`'s own doc carries `Lost`, `Stats` and
   the new wording.
 
 ## 12. Questions for the owner
 
-1. **The record's size.** 384 bytes a process record (about 3 KiB at the
-   S3's default of 8 processes), most of it the 256-byte panic text. Keep the
-   text at the panic op's bound, or cut the record's copy to 128?
-2. **Root's lines in a claimed image.** Root prints the teardown counts for
-   every death the kernel did not print, as the kernel does today. Keep them,
-   or print them only for faults and panics?
-3. **`svc-console` meeting a claim** (only in a hand-written image that lets
-   another process claim the console): end with `EXIT_CLAIMED` (proposed), or
-   keep serving and answer each `Write` `Unsupported`?
-4. **Root's other ends.** Your ruling makes root's panic a kernel panic. I
-   recommend the same for its faults and its kill, with today's lines and
-   statuses (§4.9). Agreed?
+1. **The watchdog (§4.6).** Root kills a console that serves none of root's
+   lines and makes no syscall across two 1-second checks, from a thread its
+   header puts above the driver. Is killing the console the way back you
+   want, and is a 1-second period right for the part?
+2. **The mark's names (§2).** One mark, two statuses: `Lost` when a byte was
+   lost, `Garbled` when only an error was seen, both carrying every count.
+   Or one status for both?
+3. **Root's `High` at level 5.** The watchdog needs a thread above the
+   console's `Rt0`; moving the stock root's `High` from 3 to 5 is the
+   smallest change that gives one. Acceptable, or should the watchdog use a
+   band the header names separately?
