@@ -1,0 +1,312 @@
+// An image's per-process `ceilings`: how it reads, the effective ceiling it
+// makes with the declaration's (an intersection, a kind it omits left as the
+// declaration says), the opt-in `physical` that both must name, each refusal,
+// and what the plan carries: a ceiling word for each kind whose effective
+// word is not every right, and each record's keep word within it.
+
+import bootplan.{KEEP_ALL}
+import sosimage.board.{Board}
+import sosimage.declaration.{Declaration}
+import sosimage.imagefile.{ImageFile, bind}
+import sosimage.plan.{ImagePlan, plan_image}
+
+static PHYSICAL: UInt32 = 1 << 12
+
+func join(lines: &Vector<String>) -> String {
+    "{lines.join("\n")}\n"
+}
+
+// An ESP32-S3 board with a process range and a pool range.
+func board() -> Board {
+    let lines: Vector<String> = [
+        "format = 1",
+        "[board]",
+        "name = \"esp32s3\"",
+        "triple = \"xtensa-esp-unknown-elf\"",
+        "tier = \"flat\"",
+        "hal = \"hal/xtensa-esp32s3\"",
+        "placement = \"copied\"",
+        "modules = []",
+        "cflags = []",
+        "[emulator]",
+        "program = \"qemu-system-xtensa\"",
+        "args = []",
+        "[ram.kernel]",
+        "use = \"kernel\"",
+        "speed = \"fast\"",
+        "base = 0x3FC8_C000",
+        "len = 0x2_4000",
+        "[ram.sram]",
+        "use = \"process\"",
+        "speed = \"fast\"",
+        "base = 0x3FCB_0000",
+        "len = 0x4_0000",
+        "atomics = true",
+        "[ram.default]",
+        "process = \"sram\"",
+        "pool = \"sram\""]
+    try! Board.parse(join(&lines), "hal/xtensa-esp32s3/board.toml")
+}
+
+// The runtime of a program written with `main`.
+func runtime() -> String {
+    "process = [\"boot-handles\", \"thread-self\", \"exit\", \"map\"]\nthread = [\"control\"]\n"
+}
+
+// A program written with `main` with a `memory` record `queues`, which names
+// `record_rights` when it is not empty, and the declaration's `extra` at its
+// end.
+func declaration(record_rights: String, extra: String) -> Declaration {
+    let own = if record_rights.is_empty() { "" } else { "rights = [{record_rights}]\n" }
+    let text = "format = 1\narena = 0x1000\n[[boot]]\nname = \"system\"\nkind = \"system\"\ntag = 1\n[[boot]]\nname = \"queues\"\nkind = \"memory\"\ntag = 2\n{own}{extra}"
+    try! Declaration.parse(text, "net/process.toml", main: true)
+}
+
+// The declaration of a driver that asks for `physical` on `memory` and `pool`.
+func asking() -> Declaration {
+    declaration("\"allocate\", \"map\", \"physical\"",
+                "[ceilings]\n{runtime()}memory = [\"transfer\", \"mint\", \"map\", \"physical\"]\npool = [\"allocate\", \"map\", \"physical\"]\n")
+}
+
+// An image that launches the one process `net`, whose `ceilings` is `table`
+// (an inline table, or empty for none).
+func image_text(table: String) -> String {
+    let own = if table.is_empty() { "" } else { "ceilings = {table}\n" }
+    "format = 1\n[image]\nname = \"c\"\nboard = \"esp32s3\"\ntick = true\n[root]\npackage = \"stock\"\n[[process]]\nname = \"net\"\npackage = \"net\"\npools = \{ queues = \"netq\" \}\n{own}[[pool]]\nname = \"netq\"\nlen = 0x1000\n"
+}
+
+// What reading the image refuses, or "".
+func read_refusal(table: String) -> String {
+    let b = board()
+    match ImageFile.parse(image_text(table), "i.toml", &b, 4) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+// What planning `d` under the image with `table` refuses, or "".
+func refusal(d: &Declaration, table: String) -> String {
+    let b = board()
+    let image = try! ImageFile.parse(image_text(table), "i.toml", &b, 4)
+    var decls = Vector<Declaration>()
+    try! decls.push(d.copy())
+    let bound = try bind(&image, &b, &decls, 4) catch {
+        return error.message
+    }
+    try plan_image(&image, &b, &decls, &bound, 4) catch {
+        return error.message
+    }
+    return ""
+}
+
+func planned(d: &Declaration, table: String) -> ImagePlan {
+    let b = board()
+    let image = try! ImageFile.parse(image_text(table), "i.toml", &b, 4)
+    var decls = Vector<Declaration>()
+    try! decls.push(d.copy())
+    let bound = try! bind(&image, &b, &decls, 4)
+    try! plan_image(&image, &b, &decls, &bound, 4)
+}
+
+// The process's ceiling word for the `CeilingKind` case `kind`, or -1 when
+// its plan has none.
+func ceiling_of(plan: &ImagePlan, kind: String) -> Int {
+    var word = -1
+    borrow let c = plan.children[0] {
+        var i = 0
+        while i < c.ceilings.len() {
+            let row = c.ceilings.get(i)!
+            if row.kind.equals(kind) {
+                word = row.rights as Int
+            }
+            i = i + 1
+        }
+    }
+    word
+}
+
+// The keep word of the process's record `index`.
+func keep_of(plan: &ImagePlan, index: Int) -> UInt32 {
+    var keep: UInt32 = 0
+    borrow let c = plan.children[0] {
+        keep = (c.records.get(index)!).keep
+    }
+    keep
+}
+
+func ceilings_len(plan: &ImagePlan) -> Int {
+    var len = 0
+    borrow let c = plan.children[0] {
+        len = c.ceilings.len()
+    }
+    len
+}
+
+func check(got: String, want: String, what: String) {
+    if not got.contains(want) {
+        print("expected: ...{want}")
+        print("got:      {got}")
+    }
+    assert(got.contains(want), what)
+}
+
+// what binding alone refuses, or "".
+func bind_refusal(d: &Declaration, table: String) -> String {
+    let b = board()
+    let image = try! ImageFile.parse(image_text(table), "i.toml", &b, 4)
+    var decls = Vector<Declaration>()
+    try! decls.push(d.copy())
+    let _ = try bind(&image, &b, &decls, 4) catch {
+        return error.message
+    }
+    return ""
+}
+
+static ALL_BUT_PHYSICAL: UInt32 = KEEP_ALL & ~PHYSICAL
+
+func main() {
+    let granted = "\{ memory = [\"transfer\", \"mint\", \"map\", \"physical\"], pool = [\"allocate\", \"map\", \"physical\"] \}"
+
+    // Asked at both ends: the effective ceilings and the record carry it.
+    let plan = planned(&asking(), granted)
+    assert(ceiling_of(&plan, "Memory") == ((1 << 0) | (1 << 1) | (1 << 9) | (1 << 12)),
+           "a granted Memory ceiling holds physical")
+    assert(ceiling_of(&plan, "Pool") == ((1 << 9) | (1 << 12) | (1 << 16)),
+           "a granted Pool ceiling holds physical")
+    assert(keep_of(&plan, 1) == ((1 << 9) | (1 << 12) | (1 << 16)), "the pool record keeps physical")
+    assert(refusal(&asking(), granted).is_empty(), "asked and granted is built")
+
+    // physical_not_granted: the declaration asks, and the image grants
+    // nothing, or the other kind alone, or a list without the right.
+    let ungranted_memory = "the process net asks for `physical` on `memory` in its declaration, and the image does not grant it: add it to the process's `ceilings` in the image"
+    check(refusal(&asking(), ""), ungranted_memory, "no image ceilings")
+    check(refusal(&asking(), "\{ memory = [\"map\"], pool = [\"allocate\", \"map\", \"physical\"] \}"),
+          ungranted_memory, "memory listed without physical")
+    check(refusal(&asking(), "\{ pool = [\"allocate\", \"map\", \"physical\"] \}"),
+          ungranted_memory, "only the pool granted")
+    check(refusal(&asking(), "\{ memory = [\"map\", \"physical\"] \}"),
+          "the process net asks for `physical` on `pool` in its declaration, and the image does not grant it: add it to the process's `ceilings` in the image",
+          "only memory granted: the pool needs its own grant")
+    assert(refusal(&asking(), "\{ memory = [\"map\", \"physical\"] \}").starts_with("i.toml: line 9, column 1: "),
+           "an ungranted ask is placed at the process")
+
+    // physical_not_asked: the image grants it, and the declaration has no
+    // `[ceilings]`, or a row without it.
+    let plain = declaration("", "")
+    check(refusal(&plain, "\{ memory = [\"map\", \"physical\"] \}"),
+          "the image grants `physical` on `memory` to the process net, whose declaration does not ask for it",
+          "no [ceilings]")
+    check(refusal(&plain, "\{ pool = [\"allocate\", \"physical\"] \}"),
+          "the image grants `physical` on `pool` to the process net, whose declaration does not ask for it",
+          "no [ceilings], on the pool")
+    let memory_only = declaration("\"allocate\", \"map\"",
+                                  "[ceilings]\n{runtime()}memory = [\"map\", \"physical\"]\npool = [\"allocate\", \"map\"]\n")
+    check(refusal(&memory_only, "\{ memory = [\"map\", \"physical\"], pool = [\"allocate\", \"map\", \"physical\"] \}"),
+          "the image grants `physical` on `pool` to the process net, whose declaration does not ask for it",
+          "asked on memory alone, granted on pool too")
+    assert(refusal(&memory_only, "\{ memory = [\"map\", \"physical\"] \}").is_empty(),
+           "asked and granted on memory alone")
+
+    // physical_default: no `[ceilings]`, no record `rights`, no image
+    // ceilings: every right but `physical`, in the ceilings and the record.
+    let defaults = planned(&plain, "")
+    assert(ceilings_len(&defaults) == 2, "a word for Memory and Pool alone")
+    assert(ceiling_of(&defaults, "Memory") == ALL_BUT_PHYSICAL as Int, "the default Memory ceiling")
+    assert(ceiling_of(&defaults, "Pool") == ALL_BUT_PHYSICAL as Int, "the default Pool ceiling")
+    assert(keep_of(&defaults, 1) == ALL_BUT_PHYSICAL, "the default record keep")
+
+    // ceiling_intersection: the declaration lists `map` and `mint`, the image
+    // `map` and `transfer`: `map` alone; a kind the image omits stays as the
+    // declaration says.
+    let two = declaration("", "[ceilings]\n{runtime()}memory = [\"map\", \"mint\"]\npool = [\"allocate\", \"map\"]\nevent = [\"wait\"]\n")
+    let meet = planned(&two, "\{ memory = [\"map\", \"transfer\"] \}")
+    assert(ceiling_of(&meet, "Memory") == (1 << 9), "the intersection is map alone")
+    assert(ceiling_of(&meet, "Pool") == ((1 << 9) | (1 << 16)), "a kind the image omits")
+    assert(ceiling_of(&meet, "Event") == (1 << 10), "another kind the image omits")
+    assert(ceiling_of(&meet, "Thread") == (1 << 10), "a kind the runtime lists")
+    assert(ceiling_of(&meet, "Timer") == 0, "a kind the declaration leaves out stays none")
+    assert(ceilings_len(&meet) == 15, "a declaration with [ceilings]: a word for every kind")
+
+    // The image never widens: a right it lists the declaration lacks is not
+    // gained, and with no `[ceilings]` the image narrows the default.
+    let wider = planned(&two, "\{ memory = [\"map\", \"mint\", \"extend\", \"transfer\"] \}")
+    assert(ceiling_of(&wider, "Memory") == ((1 << 9) | (1 << 1)), "an image never widens")
+    let narrowed = planned(&plain, "\{ pool = [\"allocate\", \"map\", \"transfer\"] \}")
+    assert(ceiling_of(&narrowed, "Pool") == ((1 << 0) | (1 << 9) | (1 << 16)),
+           "an image narrows the default")
+    assert(ceiling_of(&narrowed, "Memory") == ALL_BUT_PHYSICAL as Int, "a kind it omits is the default")
+    assert(ceilings_len(&narrowed) == 2, "narrowing a default kind adds no row")
+    // A record with no `rights` keeps its kind's effective ceiling.
+    assert(keep_of(&narrowed, 1) == ((1 << 0) | (1 << 9) | (1 << 16)),
+           "a record with none keeps the effective ceiling")
+    // A kind the image lists gets a row though it was every right before.
+    let kept = planned(&plain, "\{ event = [\"transfer\", \"mint\", \"signal\", \"receive\", \"wait\"] \}")
+    assert(ceiling_of(&kept, "Event") == (0x700 | 3), "a listed kind narrows the default to the listed bits")
+    assert(ceilings_len(&kept) == 3, "a row for the listed kind, not every right")
+
+    // ceiling_strips_kept: the image's `pool` list removes `map`, which the
+    // record `queues` keeps; and `allocate`, with the same refusal.
+    check(refusal(&asking(), "\{ memory = [\"transfer\", \"mint\", \"map\", \"physical\"], pool = [\"allocate\", \"physical\"] \}"),
+          "the image's `pool` ceiling for the process net removes `map`, which its record `queues` keeps",
+          "the image strips what a record keeps")
+    check(refusal(&declaration("\"allocate\", \"map\"", ""), "\{ pool = [\"map\"] \}"),
+          "the image's `pool` ceiling for the process net removes `allocate`, which its record `queues` keeps",
+          "the same with no [ceilings]")
+    assert(refusal(&declaration("\"allocate\", \"map\"", ""), "\{ pool = [\"allocate\", \"map\"] \}").is_empty(),
+           "a list that keeps both is built")
+    // A record with no `rights` takes the effective ceiling, so nothing is
+    // stripped from it.
+    assert(refusal(&declaration("", ""), "\{ pool = [\"map\"] \}").is_empty(),
+           "a record with no rights is not refused")
+
+    // ceiling_strips_runtime: the runtime's rights, on the effective ceiling.
+    check(refusal(&declaration("", ""), "\{ process = [\"exit\"] \}"),
+          "`process` in the effective ceilings of the process net lacks `boot-handles`: `sosmain`'s start-up drains the boot set through its Process handle",
+          "the image removes boot-handles")
+    check(refusal(&declaration("", ""), "\{ process = [\"boot-handles\", \"thread-self\", \"exit\"], thread = [\"start\"] \}"),
+          "`thread` in the effective ceilings of the process net lacks `control`: `sosmain`'s start-up yields through the main thread's own Thread handle",
+          "the image removes control")
+    assert(refusal(&declaration("", ""), "\{ process = [\"boot-handles\", \"thread-self\", \"exit\"] \}").is_empty(),
+           "a list that leaves the runtime its rights is built")
+    // A declaration that is not written with `main` spends none of them.
+    let bare = try! Declaration.parse("format = 1\narena = 0x1000\n[[boot]]\nname = \"system\"\nkind = \"system\"\ntag = 1\n[[boot]]\nname = \"queues\"\nkind = \"memory\"\ntag = 2\n", "net/process.toml", main: false)
+    assert(refusal(&bare, "\{ process = [\"exit\"] \}").is_empty(), "no main, no runtime to withhold")
+
+    check(bind_refusal(&plain, "\{ memory = [\"map\", \"physical\"] \}"),
+          "the image grants `physical` on `memory` to the process net, whose declaration does not ask for it",
+          "binding alone refuses an unasked grant")
+    check(read_refusal("[\"map\"]"), "not a table", "a list where the ceilings table goes")
+    let heapy = declaration("", "[heap.default]\nlen = 0x2000\n")
+    let heapy_clean = refusal(&heapy, "")
+    if not heapy_clean.is_empty() { print("got: {heapy_clean}") }
+    assert(heapy_clean.is_empty(), "a heap process builds")
+    check(refusal(&heapy, "\{ pool = [\"allocate\", \"map\"] \}"),
+          "`pool` in the effective ceilings of the process net lacks `transfer`: the launch convention gives a heap's pool with it",
+          "the image withholds a heap's pool right")
+    let pos_ungranted = refusal(&asking(), "\{ memory = [\"map\"], pool = [\"allocate\", \"map\", \"physical\"] \}")
+    assert(pos_ungranted.starts_with("i.toml: line 9, column 1: "), "an ungranted ask on a listed kind is placed at the process")
+    let pos_unasked = refusal(&plain, "\{ memory = [\"map\", \"physical\"] \}")
+    assert(pos_unasked.starts_with("i.toml: line 12, "), "an unasked grant is placed at the image's list")
+    let pos_strip = refusal(&declaration("\"allocate\", \"map\"", ""), "\{ pool = [\"map\"] \}")
+    assert(pos_strip.starts_with("i.toml: line 12, "), "a strip is placed at the image's list")
+    // ceiling_unknown: each by name, as for a declaration.
+    assert(read_refusal("\{ kernel = [\"map\"] \}").contains("`kernel` in the `ceilings` of the process net is not a kind of handle with a rights ceiling: it is one of `process`, `thread`, `event`, `waiter`, `interrupt`, `clock`, `timer`, `memory`, `iomemory`, `mapping`, `pool`, `pipe-inlet`, `pipe-outlet`, `pipe-reply`, `pipe-request`"),
+           "an unknown kind")
+    assert(read_refusal("\{ memory = [\"signal\"] \}").contains("`signal` in the `ceilings` of the process net `memory` is not a right of a Memory: it is one of `transfer`, `mint`, `map`, `map-execute`, `extend`, `physical`"),
+           "an unknown right")
+    assert(read_refusal("\{ memory = [\"map\", \"map\"] \}").contains("`map` is in `memory` twice, in the `ceilings` of the process net"),
+           "a right twice")
+    assert(read_refusal("\{ system = [\"debug\"] \}").contains("`system` in the `ceilings` of the process net is not a kind it narrows: a process's System rights are its `system` record's `rights`, which the launch convention bounds"),
+           "a system key")
+    check(read_refusal("\{ memory = \"map\" \}"), "`memory` in the inline table `process.ceilings` is a string, not an array", "a string for a list")
+    assert(read_refusal("\{ memory = [\"map\", \"physical\"] \}").is_empty(),
+           "physical reads, to be held to the declaration")
+    assert(read_refusal("").is_empty(), "no ceilings")
+    let hand_written = "format = 1\n[image]\nname = \"c\"\nboard = \"esp32s3\"\ntick = true\n[root]\npackage = \"x\"\n[[process]]\nname = \"net\"\npackage = \"net\"\nceilings = \{ memory = [\"map\"] \}\n"
+    let b = board()
+    match ImageFile.parse(hand_written, "i.toml", &b, 4) {
+        case Ok(_) -> assert(false, "a hand-written root's process takes no ceilings"),
+        case Err(e) -> assert(e.message.contains("`ceilings` is a stock root's process's"),
+                              "a hand-written root's process takes no ceilings")
+    }
+}

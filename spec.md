@@ -1976,6 +1976,12 @@ The two exceptions:
 A ceiling therefore bounds what a process can obtain from the kernel, not what
 it can be given.
 
+**The opt-in right.** A launcher that follows §12's convention leaves
+`MemoryRight.Physical` and `PoolRight.Physical` out of a child's ceilings and
+records unless the child's declaration asks for them and its image grants them,
+so a process that did not both ask and be granted can neither pin an allocation
+nor obtain a handle that could. Root's own ceilings stay unrestricted.
+
 **A ceiling may leave no rights.** If the intersection is empty, the op still
 succeeds and the handle carries no rights. It names its object and nothing more.
 A ceiling caps what a mint carries; it is not the authority to mint. That
@@ -5186,9 +5192,10 @@ reserved.
   `bootplan`: for each child, the tags of its image and destination rows, its
   quota rows, its band map (the packed word `BandMap` takes: the simple map,
   or the full map its declaration's `bands = "full"` asks for), the rights word
-  each of its ceilings is narrowed to (every kind's when its declaration has
-  `[ceilings]`, and otherwise its `Memory` and `Pool` ceilings', every right
-  but the opt-in `Physical`), the records to give it (each with its tag, its
+  each of its ceilings is narrowed to (the declaration's `[ceilings]` word, or
+  every right but the opt-in `Physical` without one, intersected with its
+  image's `ceilings` for the kind; a word for every kind whose result is not
+  every right), the records to give it (each with its tag, its
   source, for a carve the offset and length, and the keep word it is given
   with), the System rights its System record keeps, by name, the tag it is
   started with and its exit policy;
@@ -5397,9 +5404,10 @@ reserved.
   map a launcher writes itself), and a child whose image header states a band map, which only
   root's is read from. It narrows each of the child's rights ceilings (§2.7,
   `RestrictRights`) to its declaration's `[ceilings]`, when it has one, and
-  otherwise its `Memory` and `Pool` ceilings to every right but the opt-in
-  `Physical`, after the quota rows and the band map and before any give, and gives each record
-  with the record's rights, or its kind's ceiling (below). It gives windows,
+  otherwise to every right but the opt-in `Physical`, each intersected with the
+  image's `ceilings` for the kind (below), after the quota rows and the band
+  map and before any give, and gives each record with the record's rights, or
+  its kind's effective ceiling (below). It gives windows,
   lines and endpoints as capabilities: a client gets an inlet minted with
   `Post | Transfer`, a server the outlet. It starts the child with its System
   record's tag, a sibling masked with the System rights the
@@ -5449,19 +5457,40 @@ reserved.
   and a `memory` record's `Pool`'s), which are the keep mask of its give; a
   record with none is given with its kind's ceiling when the declaration has
   `[ceilings]`, and with every right its source holds but the opt-in ones
-  otherwise. With `[ceilings]`, a record's rights lie within its kind's
-  ceiling. The image builder refuses, by name, an unknown kind or right, a
-  right named twice, a `system` key, a record's rights outside its ceiling,
-  an opt-in right in `[ceilings]` or in a record's rights, which the image
-  must grant and which no image description grants, and a table that
-  withholds a right the process's runtime spends: for a program written with
+  otherwise. A record's rights lie within its kind's ceiling, the default
+  one when there is no `[ceilings]`. The image builder refuses, by name, an
+  unknown kind or right, a right named twice, a `system` key, a record's
+  rights outside its ceiling, an opt-in right in a record's rights that
+  `[ceilings]` does not ask for, and a table that withholds a right the
+  process's runtime spends: for a program written with
   `main`, its Process handle's `BootHandles`, `ThreadSelf` and `Exit` and its
   main thread's `Control`; for a process with a heap (written with `main` or
   not), the Process handle's `BootHandles`, `Mint` and `Map`, the heap's
   `Memory`'s `Map` and `Extend`, its `Mapping`'s `Grow` and `Base`, and its
   pool's `Allocate`, `Map`, `Transfer`, `Mint` and `Extend`; and in an image
-  that names a console, the inlet's `Post`. An image cannot widen or narrow a
-  declaration's ceilings.
+  that names a console, the inlet's `Post`.
+
+  An image narrows a declaration's ceilings with the `ceilings` table of a
+  process's entry (`ceilings = { memory = ["map", "physical"] }`), which has
+  the same kind and right names as `[ceilings]` and is the image's ceiling for
+  each kind it lists. A process's effective ceiling for a kind is its
+  declaration's, or every right but the opt-in ones when it has no
+  `[ceilings]`, intersected with the image's; a kind the image does not list
+  is left as the declaration says. An image never widens a declaration's
+  ceilings, and grants an opt-in right only to a process whose declaration
+  asks for it. An opt-in right (`physical`) must be in both ends, on each kind
+  that has one: `[ceilings]` asks for it and the image's `ceilings` grants it,
+  separately for `memory` and `pool`. The builder refuses, naming the process,
+  the kind and the right, an opt-in right the declaration asks for and the
+  image does not grant, one the image grants and the declaration does not ask
+  for, a list of the image's that removes a right one of the process's own
+  records keeps (a `memory` record's against the image's `pool` list, a
+  window's against `iomemory`, a line's against `interrupt`, a serve's
+  against `pipe-outlet`, a client's against `pipe-inlet`), a list that
+  withholds a right the process's runtime spends, applied to the effective
+  ceiling, and an unknown kind or right, a right named twice or a `system` key
+  in the image's table. A record with no `rights` of its own keeps what the
+  effective ceiling allows, so an image's list narrows it without a refusal.
 - **The console record** (userspace convention, not kernel surface). The
   tags from `0xFFFF_FF00` to `0xFFFF_FFFF` are the runtime's: a launcher
   gives a record under one for the runtime to take, and the image builder

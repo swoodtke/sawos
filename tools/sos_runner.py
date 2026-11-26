@@ -11206,8 +11206,9 @@ TEST_CASES = [
     # `[ceilings]` gets `Memory` and `Pool` ceilings of
     # every right but `Physical` (4294963199, all ones less bit 12), and its
     # pool record, which names no rights, keeps every right of the boot pool
-    # but `Physical` (69123). A page it allocates there does not carry it
-    # either (1539).
+    # but `Physical` (69123). Its image narrows the `Pool` ceiling to every
+    # right but `Extend` and `Physical` (67075), and the record follows. A page
+    # it allocates there does not carry `Physical` either (1539).
     {
         "name": "stock_physical_default",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
@@ -11217,15 +11218,108 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS physdefault: Memory ceiling=4294963199 holds "
                        "Physical: no",
-                       "SOS physdefault: Pool ceiling=4294963199 holds "
+                       "SOS physdefault: Pool ceiling=67075 holds "
                        "Physical: no",
-                       "SOS physdefault: the pool record's rights=69123 hold "
+                       "SOS physdefault: the pool record's rights=67075 hold "
                        "Physical: no",
                        "SOS physdefault: a page from it rights=1539 holds "
                        "Physical: no",
                        "root: physdefault ended status=65536"],
         "expect_tail": "root: physdefault ended status=65536",
         "expect_clean_exit": True,
+    },
+
+    # The opt-in `physical` granted (`tests/images/stock_physical_granted*`):
+    # a process whose declaration asks for it on `Memory` and `Pool`, in an
+    # image that grants it on both. Its ceilings and its pool record hold it,
+    # a contiguous page of that pool pins and answers its physical range
+    # (one page, aligned to it), and a page allocated without the flag is
+    # `NoResource`, which prints as its message. Without the grant, or without
+    # either ask, the builder refuses the image (`stock_physical_not_granted`,
+    # `stock_physical_not_asked`).
+    {
+        "name": "stock_physical_granted",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_physical_granted.toml",
+                       "riscv32-flat": "stock_physical_granted_flat.toml",
+                       "arm64": "stock_physical_granted_arm64.toml"},
+        "expect_out": ["{banner}",
+                       "SOS physgrant: Memory ceiling holds Physical: yes",
+                       "SOS physgrant: Pool ceiling holds Physical: yes",
+                       "SOS physgrant: the pool record's rights hold "
+                       "Physical: yes",
+                       "SOS physgrant: a contiguous page holds Physical: yes",
+                       "SOS physgrant: pinned: len=4096 base aligned to the "
+                       "page=yes",
+                       "SOS physgrant: unpinned",
+                       "SOS physgrant: a page allocated without the flag: "
+                       "pin no room for what was asked",
+                       "root: physgrant ended status=65536"],
+        "expect_tail": "root: physgrant ended status=65536",
+        "expect_clean_exit": True,
+    },
+
+    # A declaration that asks for `physical` and an image that grants it on
+    # neither kind (`tests/images/refused/stock_physical_not_granted.toml`):
+    # the builder refuses the image, naming the process, the kind and the
+    # right.
+    {
+        "name": "stock_physical_not_granted",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "refused/stock_physical_not_granted.toml"},
+        "expect_build_error": "the process physgrant asks for `physical` on "
+                              "`memory` in its declaration, and the image "
+                              "does not grant it: add it to the process's "
+                              "`ceilings` in the image",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+
+    # An image that grants `physical` to a process whose declaration has no
+    # `[ceilings]` (`tests/images/refused/stock_physical_not_asked.toml`).
+    {
+        "name": "stock_physical_not_asked",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "refused/stock_physical_not_asked.toml"},
+        "expect_build_error": "the image grants `physical` on `memory` to "
+                              "the process physdefault, whose declaration "
+                              "does not ask for it",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+
+    # An image whose `pool` ceiling removes `map`, which the process's pool
+    # record keeps
+    # (`tests/images/refused/stock_ceiling_strips_kept.toml`).
+    {
+        "name": "stock_ceiling_strips_kept",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "refused/stock_ceiling_strips_kept.toml"},
+        "expect_build_error": "the image's `pool` ceiling for the process "
+                              "physgrant removes `map`, which its record "
+                              "`dma` keeps",
+        "expect_out": [],
+        "expect_clean_exit": False,
+    },
+
+    # An image whose `process` ceiling for a program written with `main`
+    # removes rights its start-up spends
+    # (`tests/images/refused/stock_ceiling_strips_runtime.toml`).
+    {
+        "name": "stock_ceiling_strips_runtime",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32":
+                       "refused/stock_ceiling_strips_runtime.toml"},
+        "expect_build_error": "`process` in the effective ceilings of the "
+                              "process lines lacks `boot-handles`: "
+                              "`sosmain`'s start-up drains the boot set "
+                              "through its Process handle",
+        "expect_out": [],
+        "expect_clean_exit": False,
     },
 
     # A process given a window with the one right its record names

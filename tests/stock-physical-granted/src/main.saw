@@ -1,0 +1,83 @@
+//! A child of a stock-root image whose declaration asks for the opt-in
+//! `Physical` on `Memory` and `Pool` and whose image grants it
+//! (`process.toml`, spec §12). It prints its ceilings and its pool record's
+//! rights, each holding `Physical`, pins a contiguous page it allocates there
+//! and gets its physical range back, unpins it, and pins a page allocated
+//! without the flag, which answers `NoResource`.
+
+import sos.{System, Process, SosStatus, MemoryRight, PoolRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this program can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// The pool record's tag in the declaration.
+static TAG_DMA: UInt = 2
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+func holds(word: UInt32, bit: UInt32) -> String {
+    if (word & bit) != 0 { "yes" } else { "no" }
+}
+
+func yes_no(b: Bool) -> String {
+    if b { "yes" } else { "no" }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS physgrant: no process handle\n")
+        return
+    }
+    try run(&proc) catch {
+        print("SOS physgrant: refused: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let _ = proc.exit(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    let memory = try proc.memory_ceiling()
+    print("SOS physgrant: Memory ceiling holds Physical: {}",
+          holds(memory, MemoryRight.Physical as UInt32))
+    let pool_ceiling = try proc.pool_ceiling()
+    print("SOS physgrant: Pool ceiling holds Physical: {}",
+          holds(pool_ceiling, PoolRight.Physical as UInt32))
+
+    var rec = try proc.boot_handle_next()
+    if rec.tag != TAG_DMA {
+        return BUG
+    }
+    guard let pool = rec.take_pool() else { return BUG }
+    let rights = try pool.rights()
+    print("SOS physgrant: the pool record's rights hold Physical: {}",
+          holds(rights, PoolRight.Physical as UInt32))
+
+    let page = try pool.allocate(len: PAGE, contiguous: true)
+    let page_rights = try page.rights()
+    print("SOS physgrant: a contiguous page holds Physical: {}",
+          holds(page_rights, MemoryRight.Physical as UInt32))
+    let at = try page.pin()
+    print("SOS physgrant: pinned: len={} base aligned to the page={}", at.len,
+          yes_no(at.base % PAGE == 0))
+    try page.unpin()
+    print("SOS physgrant: unpinned")
+
+    let plain = try pool.allocate(len: PAGE)
+    match plain.pin() {
+        case Ok(_) -> {
+            print("SOS physgrant: a page allocated without the flag pinned")
+            return BUG
+        },
+        case Err(why) -> {
+            print("SOS physgrant: a page allocated without the flag: pin {}", why)
+        },
+    }
+    return
+}

@@ -259,14 +259,22 @@ func main() unsafe {
     expect(with_ceilings("rights = [\"map\"]", "[ceilings]\nprocess = [{process_ok()}]\nthread = [\"control\"]\n"), true,
            "p.toml: line 7, column 3: `rights` of the window `mac` names `map`, which the `iomemory` ceiling in [ceilings] does not give: a record is given within its kind's ceiling")
 
-    // The opt-in right, which only an image can grant, in a ceiling and in a
-    // record's rights.
-    expect(with_ceilings("", "[ceilings]\nmemory = [\"map\", \"physical\"]\n"), false,
-           "p.toml: line 13, column 18: `physical` in [ceilings] `memory` is an opt-in right, which the image must grant, and this builder reads no grant from an image")
-    expect(with_ceilings("", "[ceilings]\npool = [\"physical\"]\n"), false,
-           "p.toml: line 13, column 9: `physical` in [ceilings] `pool` is an opt-in right, which the image must grant, and this builder reads no grant from an image")
+    // The opt-in right: a declaration asks for it in `[ceilings]`, which it may
+    // name, and its record may keep it only within such a ceiling; the image
+    // grants it (`image_ceilings`).
+    let asks = "{ceilings(process_ok(), "\"control\"", "\"map\"")}memory = [\"map\", \"physical\"]\npool = [\"allocate\", \"physical\"]\n"
+    let asked = try! parse_main("{text_of(&head(""))}{dma("rights = [\"allocate\", \"physical\"]")}{asks}")
+    assert(asked.ceiling_word("memory") == ((1 << 9) | (1 << 12)), "a declaration asks for physical on memory")
+    assert(asked.ceiling_word("pool") == ((1 << 16) | (1 << 12)), "and on pool")
+    assert(asked.keep_word(&(asked.record(RecordKind.Memory, "dma")!)) == ((1 << 16) | (1 << 12)),
+           "a record keeps physical within the ceiling")
+    let asked_all = try! parse_main("{text_of(&head(""))}{dma("")}{asks}")
+    assert(asked_all.keep_word(&(asked_all.record(RecordKind.Memory, "dma")!)) == ((1 << 16) | (1 << 12)),
+           "a record with none keeps the ceiling, physical included")
     expect("{text_of(&head(""))}{dma("rights = [\"allocate\", \"physical\"]")}", false,
-           "p.toml: line 16, column 23: `rights` of the memory `dma` names `physical`, an opt-in right, which the image must grant, and this builder reads no grant from an image")
+           "p.toml: line 12, column 3: `rights` of the memory `dma` names `physical`, an opt-in right, which `pool` in [ceilings] must ask for first")
+    expect("{text_of(&head(""))}{dma("rights = [\"allocate\", \"physical\"]")}{ceilings(process_ok(), "\"control\"", "\"map\"")}pool = [\"allocate\", \"map\"]\n", true,
+           "p.toml: line 12, column 3: `rights` of the memory `dma` names `physical`, which the `pool` ceiling in [ceilings] does not give: a record is given within its kind's ceiling")
 
     // What a program written with `main` spends, each withheld in turn: a
     // right missing from a kind it lists, and a kind it leaves out.

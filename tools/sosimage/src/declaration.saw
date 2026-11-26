@@ -62,9 +62,9 @@
 //! rights enum in kebab case (`map-execute`). The table is complete when
 //! present: a kind it does not list gets no rights, and without the table the
 //! process keeps the launcher's ceilings but for the opt-in rights
-//! (`sosimage.rights.is_opt_in`), which it gets only when it asks and its
-//! image grants. The System rights are not among them: they stay on the
-//! `system` record.
+//! (`sosimage.rights.is_opt_in`), which it asks for here and its image must
+//! grant (`Declaration.within_image`). The System rights
+//! are not among them: they stay on the `system` record.
 //!
 //! A record's `rights` is its give's keep mask, a list of its kind's rights
 //! (a window's are `iomemory`'s, a line's `interrupt`'s, a serve's
@@ -74,7 +74,8 @@
 //! none is given with every right its source holds but the opt-in ones
 //! (`Declaration.keep_word`).
 //! A `[ceilings]` that withholds a right the program's runtime spends is
-//! refused by name (`check_runtime`).
+//! refused by name (`check_runtime`), and so is an image's `ceilings` that
+//! leaves it one that does (`Declaration.within_image`).
 //!
 //! A `system` record's `rights` names the `SystemRight`s its System handle
 //! keeps, each by its name in kebab case, and the process gets exactly those:
@@ -92,8 +93,8 @@
 //! for: a `[ceilings]` key that is no kind, is `system`, or lists a right the
 //! kind does not have or one twice; a `bands` that is not `simple` or `full`;
 //! a record's `rights` that names a right its kind does not have, or one
-//! outside the kind's ceiling; an opt-in right in either, which only an image
-//! can grant and no image grants; a `count` on a record (the list form,
+//! outside the kind's ceiling, an opt-in right included when `[ceilings]` does
+//! not ask for it; a `count` on a record (the list form,
 //! reserved); a tag in the range
 //! the runtime reserves (`bootplan.RESERVED_TAG_FIRST` up, whose first is
 //! `CONSOLE_TAG`); a right in `rights` that is not one of the four, or one
@@ -148,8 +149,9 @@ import sosimage.board.{Board, NamedCount, expect_table, quota_keys, read_counts,
 import bootplan.{KEEP_ALL, MAX_HEAPS, RESERVED_TAG_FIRST, RESERVED_TAG_LAST, is_reserved_tag}
 import sosimage.failure.{BuildError}
 import sosimage.hex.{hex}
-import sosimage.rights.{CeilingKindInfo, ceiling_keys, ceiling_kind, has_right, is_opt_in,
-                        names_in, opt_in_word, right_names, right_word, rights_word}
+import sosimage.rights.{CEILING_KINDS, CeilingKindInfo, ceiling_keys, ceiling_kind,
+                        ceiling_kind_at, has_right, is_opt_in, names_in, opt_in_word,
+                        right_names, right_word, rights_word}
 import sosimage.tool.{read_text}
 import sosimage.rules.{
     check_format, check_input_name, check_name, check_path, count, element_at, fits_board_word, flag, holds,
@@ -238,6 +240,30 @@ public struct CeilingRow {
     key: String
     rights: UInt32
     at: TomlPosition
+}
+
+/// One kind of one process's `ceilings` in an image description: the rights
+/// its list names, as a word.
+public struct ImageCeiling {
+    process: String
+    key: String
+    rights: UInt32
+    at: TomlPosition
+}
+
+/// The `ceilings` entry of `process` for the kind `key`; none when the image
+/// lists none.
+func image_ceiling(listed: &Vector<ImageCeiling>, process: String,
+                   key: String) -> ImageCeiling? {
+    var i = 0
+    while i < listed.len() {
+        let entry = listed.get(i)!
+        if entry.process.equals(process) && entry.key.equals(key) {
+            return entry
+        }
+        i = i + 1
+    }
+    None
 }
 
 /// One `[heap.NAME]`: a heap over a pool the launcher gives.
@@ -444,9 +470,12 @@ extension Declaration {
         try expect_table(&root, "ceilings", file)
         if let c = root.table("ceilings") {
             has_ceilings = true
-            ceilings = try read_ceilings(&c, file)
-            try check_record_rights(&records, &ceilings, file)
-            try check_runtime(&ceilings, main, heaps.len(), file, where_is(&root, "ceilings"))
+            ceilings = try read_ceilings(&c, file, "[ceilings]")
+        }
+        try check_record_rights(&records, &ceilings, has_ceilings, file)
+        if has_ceilings {
+            try check_runtime(&ceilings, main, heaps.len(), file, where_is(&root, "ceilings"),
+                              "[ceilings]")
         }
 
         var quota = Vector<NamedCount>()
@@ -533,6 +562,92 @@ extension Declaration {
             i = i + 1
         }
         0
+    }
+
+    /// This declaration's process under its image's `ceilings` (`listed`,
+    /// the whole image's, of which `process`'s are the ones read), as a
+    /// declaration whose `[ceilings]` is the effective one, a row for every
+    /// kind: the declaration's word, or every right but the opt-in ones when
+    /// it has no `[ceilings]`, intersected with the image's word for each
+    /// kind the image lists. `at` is the process's position in the image
+    /// `file`, where a refusal that is the image's is placed.
+    ///
+    /// An opt-in right must be in both: the declaration's `[ceilings]` asks
+    /// for it and the image grants it, on each kind that has one. Refused by
+    /// name, the process, the kind and the right: an ask the image does not
+    /// grant, a grant the declaration does not ask for, a right of a record's
+    /// own `rights` that the image's list removes, and a right the program's
+    /// runtime spends that the effective ceiling lacks (`check_runtime`).
+    public func within_image(&self, process: String, listed: &Vector<ImageCeiling>,
+                             file: String, at: TomlPosition) -> Result<Declaration, BuildError> {
+        var rows = Vector<CeilingRow>()
+        var i = 0
+        while i < CEILING_KINDS {
+            let info = ceiling_kind_at(i)
+            i = i + 1
+            let opt_in = opt_in_word(&info)
+            var word = KEEP_ALL & ~opt_in
+            var asked: UInt32 = 0
+            if self.has_ceilings {
+                word = self.ceiling_word(info.key)
+                asked = word & opt_in
+            }
+            var granted: UInt32 = 0
+            var row_at = at
+            if let image = image_ceiling(&listed, process, info.key) {
+                granted = image.rights & opt_in
+                word = word & image.rights
+                row_at = image.at
+            }
+            let unasked = granted & ~asked
+            if unasked != 0 {
+                let right = names_in(&info, unasked).get(0) ?? ""
+                return refused(file, row_at,
+                               "the image grants `{right}` on `{info.key}` to the process {process}, whose declaration does not ask for it")
+            }
+            let ungranted = asked & ~granted
+            if ungranted != 0 {
+                let right = names_in(&info, ungranted).get(0) ?? ""
+                return refused(file, at,
+                               "the process {process} asks for `{right}` on `{info.key}` in its declaration, and the image does not grant it: add it to the process's `ceilings` in the image")
+            }
+            try! rows.push(CeilingRow(key: info.key, rights: word, at: row_at))
+        }
+        var r = 0
+        while r < self.records.len() {
+            let record = self.records.get(r)!
+            r = r + 1
+            guard let own = record.rights else {
+                continue
+            }
+            guard let key = ceiling_key_of(record.kind) else {
+                continue
+            }
+            var kept: UInt32 = 0
+            var row_at = at
+            var k = 0
+            while k < rows.len() {
+                let row = rows.get(k)!
+                if row.key.equals(key) {
+                    kept = row.rights
+                    row_at = row.at
+                }
+                k = k + 1
+            }
+            let stripped = own & ~kept
+            if stripped != 0 {
+                let info = ceiling_kind(key)!
+                let right = names_in(&info, stripped).get(0) ?? ""
+                return refused(file, row_at,
+                               "the image's `{key}` ceiling for the process {process} removes `{right}`, which its record `{record.name}` keeps")
+            }
+        }
+        try check_runtime(&rows, self.main, self.heaps.len(), file, at,
+                          "the effective ceilings of the process {process}")
+        var out = self.copy()
+        out.ceilings = move rows
+        out.has_ceilings = true
+        return move out
     }
 
     /// The rights the record `r` is given with, a mask of its kind's rights:
@@ -973,17 +1088,16 @@ func read_record_rights(r: &TomlTable, kind: RecordKind, name: String,
             return refused(file, element_at(&r, "rights", i),
                            "`rights` of the {kind_word(kind)} `{name}` names `{right}`, which is not a right of {info.article}: it is one of {rights_listed(&info)}")
         }
-        if is_opt_in(right) {
-            return refused(file, element_at(&r, "rights", i),
-                           "`rights` of the {kind_word(kind)} `{name}` names `{right}`, an opt-in right, which the image must grant, and this builder reads no grant from an image")
-        }
         i = i + 1
     }
     return rights_word(&info, &names)
 }
 
-/// `[ceilings]`: a kind each key, and the rights its value lists.
-func read_ceilings(c: &TomlTable, file: String) -> Result<Vector<CeilingRow>, BuildError> {
+/// A `ceilings` table, a declaration's `[ceilings]` or the `ceilings` of an
+/// image's process: a kind each key, and the rights its value lists. `scope`
+/// says which it is, for a refusal.
+public func read_ceilings(c: &TomlTable, file: String,
+                          scope: String) -> Result<Vector<CeilingRow>, BuildError> {
     var out = Vector<CeilingRow>()
     let keys = try! c.keys()
     var i = 0
@@ -992,10 +1106,10 @@ func read_ceilings(c: &TomlTable, file: String) -> Result<Vector<CeilingRow>, Bu
         i = i + 1
         let at = where_is(&c, key)
         if key.equals("system") {
-            return refused(file, at, "`system` in [ceilings] is not a kind it narrows: a process's System rights are its `system` record's `rights`, which the launch convention bounds")
+            return refused(file, at, "`system` in {scope} is not a kind it narrows: a process's System rights are its `system` record's `rights`, which the launch convention bounds")
         }
         guard let info = ceiling_kind(key) else {
-            return refused(file, at, "`{key}` in [ceilings] is not a kind of handle with a rights ceiling: it is one of {kinds_listed()}")
+            return refused(file, at, "`{key}` in {scope} is not a kind of handle with a rights ceiling: it is one of {kinds_listed()}")
         }
         let names = try name_list(&c, key, file, "a right's name")
         var n = 0
@@ -1003,11 +1117,7 @@ func read_ceilings(c: &TomlTable, file: String) -> Result<Vector<CeilingRow>, Bu
             let right = names.get(n) ?? ""
             if not has_right(&info, right) {
                 return refused(file, element_at(&c, key, n),
-                               "`{right}` in [ceilings] `{key}` is not a right of {info.article}: it is one of {rights_listed(&info)}")
-            }
-            if is_opt_in(right) {
-                return refused(file, element_at(&c, key, n),
-                               "`{right}` in [ceilings] `{key}` is an opt-in right, which the image must grant, and this builder reads no grant from an image")
+                               "`{right}` in {scope} `{key}` is not a right of {info.article}: it is one of {rights_listed(&info)}")
             }
             n = n + 1
         }
@@ -1016,9 +1126,11 @@ func read_ceilings(c: &TomlTable, file: String) -> Result<Vector<CeilingRow>, Bu
     return move out
 }
 
-/// Refuses a record whose `rights` lie outside its kind's ceiling.
+/// Refuses a record whose `rights` lie outside its kind's ceiling: the one
+/// `[ceilings]` states, else the default, every right but the opt-in ones
+/// (`has_ceilings` says which).
 func check_record_rights(records: &Vector<BootRecord>, ceilings: &Vector<CeilingRow>,
-                         file: String) -> Result<Void, BuildError> {
+                         has_ceilings: Bool, file: String) -> Result<Void, BuildError> {
     var i = 0
     while i < records.len() {
         let r = records.get(i)!
@@ -1027,7 +1139,11 @@ func check_record_rights(records: &Vector<BootRecord>, ceilings: &Vector<Ceiling
             continue
         }
         let key = ceiling_key_of(r.kind) ?? ""
-        var ceiling: UInt32 = 0
+        let info = ceiling_kind(key)!
+        var ceiling: UInt32 = KEEP_ALL & ~opt_in_word(&info)
+        if has_ceilings {
+            ceiling = 0
+        }
         var k = 0
         while k < ceilings.len() {
             let row = ceilings.get(k)!
@@ -1038,44 +1154,48 @@ func check_record_rights(records: &Vector<BootRecord>, ceilings: &Vector<Ceiling
         }
         let outside = own & ~ceiling
         if outside != 0 {
-            let info = ceiling_kind(key)!
             let names = names_in(&info, outside)
+            let first = names.get(0) ?? ""
+            if is_opt_in(first) && not has_ceilings {
+                return refused(file, r.at,
+                               "`rights` of the {kind_word(r.kind)} `{r.name}` names `{first}`, an opt-in right, which `{key}` in [ceilings] must ask for first")
+            }
             return refused(file, r.at,
-                           "`rights` of the {kind_word(r.kind)} `{r.name}` names `{names.get(0) ?? ""}`, which the `{key}` ceiling in [ceilings] does not give: a record is given within its kind's ceiling")
+                           "`rights` of the {kind_word(r.kind)} `{r.name}` names `{first}`, which the `{key}` ceiling in [ceilings] does not give: a record is given within its kind's ceiling")
         }
     }
     return
 }
 
-/// Refuses a `[ceilings]` that withholds a right the program's runtime
-/// spends, naming the right and its use: `main` says the program is written
-/// with `main` (`sosmain`), and `heaps` how many heaps it has. The runtime
-/// reads its Process handle's and its heaps' rights at its start, and spends
-/// the rest on the first growth of a heap.
+/// Refuses `ceilings`, which `scope` names in the refusal, when they withhold
+/// a right the program's runtime spends, naming the right and its use: `main`
+/// says the program is written with `main` (`sosmain`), and `heaps` how many
+/// heaps it has. The runtime reads its Process handle's and its heaps' rights
+/// at its start, and spends the rest on the first growth of a heap.
 func check_runtime(ceilings: &Vector<CeilingRow>, main: Bool, heaps: Int, file: String,
-                   at: TomlPosition) -> Result<Void, BuildError> {
+                   at: TomlPosition, scope: String) -> Result<Void, BuildError> {
     if main {
         let own = "`sosmain`'s start-up"
-        try needs(&ceilings, "process", "boot-handles", "{own} drains the boot set through its Process handle", file, at)
-        try needs(&ceilings, "process", "thread-self", "{own} derives the main thread's own Thread handle through its Process handle", file, at)
-        try needs(&ceilings, "process", "exit", "{own} ends the process through its Process handle", file, at)
-        try needs(&ceilings, "thread", "control", "{own} yields through the main thread's own Thread handle", file, at)
+        try needs(&ceilings, "process", "boot-handles", "{own} drains the boot set through its Process handle", file, at, scope)
+        try needs(&ceilings, "process", "thread-self", "{own} derives the main thread's own Thread handle through its Process handle", file, at, scope)
+        try needs(&ceilings, "process", "exit", "{own} ends the process through its Process handle", file, at, scope)
+        try needs(&ceilings, "thread", "control", "{own} yields through the main thread's own Thread handle", file, at, scope)
     }
     if heaps > 0 {
         let own = "the runtime's heap"
-        try needs(&ceilings, "process", "boot-handles", "{own} is adopted while the boot set is drained, which a Process handle without it cannot do", file, at)
-        try needs(&ceilings, "process", "mint", "{own} mints its `Map`-only Process handle from the process's own", file, at)
-        try needs(&ceilings, "process", "map", "{own} maps its memory through that Process handle", file, at)
-        try needs(&ceilings, "memory", "map", "{own} maps the `Memory` it cuts from its pool", file, at)
-        try needs(&ceilings, "memory", "extend", "{own} extends the `Memory` it cuts from its pool", file, at)
-        try needs(&ceilings, "mapping", "grow", "{own} grows its row", file, at)
-        try needs(&ceilings, "mapping", "base", "{own} reads where its row landed", file, at)
+        try needs(&ceilings, "process", "boot-handles", "{own} is adopted while the boot set is drained, which a Process handle without it cannot do", file, at, scope)
+        try needs(&ceilings, "process", "mint", "{own} mints its `Map`-only Process handle from the process's own", file, at, scope)
+        try needs(&ceilings, "process", "map", "{own} maps its memory through that Process handle", file, at, scope)
+        try needs(&ceilings, "memory", "map", "{own} maps the `Memory` it cuts from its pool", file, at, scope)
+        try needs(&ceilings, "memory", "extend", "{own} extends the `Memory` it cuts from its pool", file, at, scope)
+        try needs(&ceilings, "mapping", "grow", "{own} grows its row", file, at, scope)
+        try needs(&ceilings, "mapping", "base", "{own} reads where its row landed", file, at, scope)
         let pool = "the launch convention gives a heap's pool with it, and the runtime's heap reads it at its adoption"
-        try needs(&ceilings, "pool", "allocate", pool, file, at)
-        try needs(&ceilings, "pool", "map", pool, file, at)
-        try needs(&ceilings, "pool", "transfer", pool, file, at)
-        try needs(&ceilings, "pool", "mint", pool, file, at)
-        try needs(&ceilings, "pool", "extend", pool, file, at)
+        try needs(&ceilings, "pool", "allocate", pool, file, at, scope)
+        try needs(&ceilings, "pool", "map", pool, file, at, scope)
+        try needs(&ceilings, "pool", "transfer", pool, file, at, scope)
+        try needs(&ceilings, "pool", "mint", pool, file, at, scope)
+        try needs(&ceilings, "pool", "extend", pool, file, at, scope)
     }
     return
 }
@@ -1083,7 +1203,7 @@ func check_runtime(ceilings: &Vector<CeilingRow>, main: Bool, heaps: Int, file: 
 /// Refuses `ceilings` unless the `right` of `key`'s kind is in it, for the
 /// `use` the runtime has for it.
 func needs(ceilings: &Vector<CeilingRow>, key: String, right: String, use: String,
-           file: String, at: TomlPosition) -> Result<Void, BuildError> {
+           file: String, at: TomlPosition, scope: String) -> Result<Void, BuildError> {
     let info = ceiling_kind(key)!
     let want = right_word(&info, right) ?? 0
     var i = 0
@@ -1093,11 +1213,11 @@ func needs(ceilings: &Vector<CeilingRow>, key: String, right: String, use: Strin
         if row.key.equals(key) {
             if (row.rights & want) == 0 {
                 return refused(file, row.at,
-                               "`{key}` in [ceilings] lacks `{right}`: {use}")
+                               "`{key}` in {scope} lacks `{right}`: {use}")
             }
             return
         }
     }
     return refused(file, at,
-                   "[ceilings] lists no `{key}`, which gives it no rights, and the process needs `{right}`: {use}")
+                   "{scope} lists no `{key}`, which gives it no rights, and the process needs `{right}`: {use}")
 }

@@ -33,15 +33,16 @@
 //! declaration's `[quota]`, each replaced by the image's `quota` for it,
 //! which may raise a row and not lower it.
 //!
-//! A declaration with `[ceilings]` gives its process one ceiling word for
-//! each kind of `sosimage.rights`, the rights the table lists for it and none
-//! for a kind it leaves out, which root narrows the process's to before it
-//! gives it anything; one without gives a word for each kind with an opt-in
-//! right (`sosimage.rights.is_opt_in`), every right but those. Each record
-//! carries a keep word (`Declaration.keep_word`): the rights its declaration
-//! names, else its kind's ceiling when it has `[ceilings]`, else every right
-//! but its kind's opt-in ones. The console's inlet is the `pipe-inlet`
-//! ceiling's, which is refused when it lacks `post` (`check_console_inlet`).
+//! A process has an effective ceiling for each kind of `sosimage.rights`: its
+//! declaration's `[ceilings]` word (none for a kind the table leaves out), or
+//! without one every right but the opt-in ones (`sosimage.rights.is_opt_in`),
+//! intersected with its image's `ceilings` for the kind
+//! (`Declaration.within_image`). Its plan has a ceiling word for each kind
+//! whose effective word is not every right, which root narrows the process's to
+//! before it gives it anything. Each record carries a keep word
+//! (`Declaration.keep_word`): the rights its declaration names, else its
+//! kind's effective ceiling. The console's inlet is the `pipe-inlet` ceiling's,
+//! which is refused when it lacks `post` (`check_console_inlet`).
 //!
 //! A declaration's `bands` gives its process's band map, carried as the
 //! packed word the kernel's `BandMap` op takes: `bootplan.FULL_BANDS` for
@@ -124,7 +125,7 @@ import sosimage.kernel.{KernelFacts, MEMORIES, QUOTA_HANDLE, QUOTA_KINDS,
                         QUOTA_MAPPING, QUOTA_MEMORY, SLAB_KINDS, THREADS}
 import sosimage.limits.{PlanNeeds, QUOTA_UNLIMITED, quota_slab}
 import sosimage.regions.{RegionKind}
-import sosimage.rights.{CEILING_KINDS, ceiling_kind_at, ceiling_kind, opt_in_word, right_word}
+import sosimage.rights.{CEILING_KINDS, ceiling_kind_at, ceiling_kind, right_word}
 import sosimage.rules.{refused}
 
 /// The handles root holds at boot before its rows' (spec §12): System,
@@ -238,7 +239,7 @@ public struct PlanChild {
     destination: Int
     quota: Vector<PlanQuota>
     /// The ceilings root narrows its own to: one for each kind of
-    /// `sosimage.rights` when its declaration has `[ceilings]`, else none.
+    /// `sosimage.rights` whose effective word is not every right.
     ceilings: Vector<PlanCeiling>
     /// The band map root sets on it: `SIMPLE_BANDS` sets none.
     bands: UInt32
@@ -370,12 +371,30 @@ func row_tag(rows: &Vector<PlanRow>, first: Int, device: String, pool: String) -
     None
 }
 
-/// The plan of a stock-root image, from its processes' declarations (`decls`,
-/// one per process, in order) and what binding them found (`bound`), on
-/// `board`, whose protection grain is `grain`.
-public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
+/// `declared`, one declaration per process of `image` in order, each under the
+/// image's `ceilings` for it (`Declaration.within_image`).
+func effective_declarations(image: &ImageFile,
+                            declared: &Vector<Declaration>) -> Result<Vector<Declaration>, BuildError> {
+    var out = Vector<Declaration>()
+    var p = 0
+    while p < image.processes.len() {
+        let process = image.processes.get(p)!
+        p = p + 1
+        borrow let d = declared[p - 1] {
+            try! out.push(try d.within_image(process.name, &image.ceilings, image.file,
+                                             process.at))
+        }
+    }
+    return move out
+}
+
+/// The plan of a stock-root image, from its processes' declarations
+/// (`declared`, one per process, in order) and what binding them found
+/// (`bound`), on `board`, whose protection grain is `grain`.
+public func plan_image(image: &ImageFile, board: &Board, declared: &Vector<Declaration>,
                        bound: &Bindings, grain: UInt64) -> Result<ImagePlan, BuildError> {
     let file = image.file
+    let decls = try effective_declarations(&image, &declared)
     let count = image.processes.len()
     let first = 2 * count
 
@@ -641,35 +660,27 @@ public func check_bands(image: &ImageFile, decls: &Vector<Declaration>, maps: &V
     return
 }
 
-/// The ceilings root narrows a child to for `d`, in the table's order: each
-/// kind's word when `d` has `[ceilings]`, and otherwise, for each kind with
-/// an opt-in right, every right but those.
+/// The ceilings root narrows a child to for `d`, a declaration under its
+/// image's ceilings (`effective_declarations`), in the table's order: each
+/// kind's effective word, for each kind whose word is not every right.
 func ceiling_rows(d: &Declaration) -> Vector<PlanCeiling> {
     var out = Vector<PlanCeiling>()
     var i = 0
     while i < CEILING_KINDS {
         let info = ceiling_kind_at(i)
         i = i + 1
-        if d.has_ceilings {
-            try! out.push(PlanCeiling(kind: info.case_name, rights: d.ceiling_word(info.key)))
-            continue
-        }
-        let opt_in = opt_in_word(&info)
-        if opt_in != 0 {
-            try! out.push(PlanCeiling(kind: info.case_name, rights: KEEP_ALL & ~opt_in))
+        let word = d.ceiling_word(info.key)
+        if word != KEEP_ALL {
+            try! out.push(PlanCeiling(kind: info.case_name, rights: word))
         }
     }
     move out
 }
 
-/// The keep word of the console's inlet in `d`'s process: its `pipe-inlet`
-/// ceiling when it has one, as any inlet record without `rights` has, and
-/// every right the inlet holds otherwise.
+/// The keep word of the console's inlet in `d`'s process: its effective
+/// `pipe-inlet` ceiling, as any inlet record without `rights` has.
 func console_keep(d: &Declaration) -> UInt32 {
-    if d.has_ceilings {
-        return d.ceiling_word("pipe-inlet")
-    }
-    KEEP_ALL
+    d.ceiling_word("pipe-inlet")
 }
 
 /// Refuses a process whose `pipe-inlet` ceiling withholds `post` in an image
@@ -677,12 +688,9 @@ func console_keep(d: &Declaration) -> UInt32 {
 /// through it.
 func check_console_inlet(d: &Declaration, process: String, file: String,
                          at: TomlPosition) -> Result<Void, BuildError> {
-    if not d.has_ceilings {
-        return
-    }
     let info = ceiling_kind("pipe-inlet")!
     if (d.ceiling_word("pipe-inlet") & (right_word(&info, "post") ?? 0)) == 0 {
-        return refused(file, at, "the process {process}'s `pipe-inlet` ceiling in [ceilings] lacks `post`: the runtime posts every line the process prints through the console's inlet, and this image gives it one")
+        return refused(file, at, "the process {process}'s `pipe-inlet` ceiling lacks `post`: the runtime posts every line the process prints through the console's inlet, and this image gives it one")
     }
     return
 }

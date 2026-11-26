@@ -36,6 +36,7 @@
 //!     clients = { log = "logger.log" }   client record to PROCESS.RECORD
 //!     pools = { buffer = "frames" }      memory record to pool
 //!     heap-ram = { data = "psram" }      heap to its pool's range
+//!     ceilings = { memory = ["map"] }    kind to the rights it keeps
 //!     on-exit = "report"                 or "shutdown"
 //!
 //!     [[pool]]
@@ -61,6 +62,15 @@
 //! (`console_rights()`), since a program written with `main` prints through
 //! the console there.
 //!
+//! `ceilings` is the image's ceiling for each kind it lists, by the kind and
+//! right names of a declaration's `[ceilings]`: the process's effective ceiling
+//! for the kind is its declaration's intersected with it (every right but the
+//! opt-in ones when the declaration has no `[ceilings]`), and a kind it does
+//! not list is left as the declaration says. An opt-in right
+//! (`sosimage.rights.is_opt_in`) is in the effective ceiling only when the
+//! declaration asks for it and the image grants it, on each kind that has
+//! one (`Declaration.within_image`).
+//!
 //! `console` names the image's console, a stock root's: a serve record of
 //! `uartproto` (`console_protocol()`), in the grammar `clients` uses. Every
 //! process but the one serving it is given an inlet of that connection under
@@ -85,23 +95,26 @@
 //! but for case, or `root` in any case; a pool name given twice; a reference
 //! outside its grammar; a `[[setup]]` or `[rows]` reference naming what the
 //! board does not have; `[system]` or `console` for a hand-written root, and
-//! a right in `[system]` outside the ceiling or named twice; a list where
-//! one value goes (the list forms, reserved); a RAM name that is reserved or
-//! not a process range of the board; a package or an input that is not a
-//! path (`check_path`); a pool length the board's word cannot hold; a pool
-//! bound twice or bound to nothing; a key of `[keys]` that is no build key
-//! of the board, or a value that is not one of the key's. Binding a stock
-//! root's processes to their declarations (`bind`) is the rest of it, a
-//! `device` reference against the board included: device needs to devices,
-//! by type; client records to serves; memory records to pools; every input
-//! to its value; each process to a RAM range (`choose_range`); each heap to
-//! its pool's range (`bind_heaps`); and `console` to a serve of `uartproto`.
+//! a right in `[system]` outside the ceiling or named twice; a `ceilings` key
+//! that is no kind, is `system`, or lists a right the kind does not have or
+//! one twice; a list where one value goes (the list forms, reserved); a RAM
+//! name that is reserved or not a process range of the board; a package or an
+//! input that is not a path (`check_path`); a pool length the board's word
+//! cannot hold; a pool bound twice or bound to nothing; a key of `[keys]` that
+//! is no build key of the board, or a value that is not one of the key's.
+//! Binding a stock root's processes to their declarations (`bind`) is the rest
+//! of it, a `device` reference against the board included: device needs to
+//! devices, by type; client records to serves; memory records to pools; every
+//! input to its value; each process to a RAM range (`choose_range`); each heap
+//! to its pool's range (`bind_heaps`); and `console` to a serve of
+//! `uartproto`.
 
 import toml.{TomlKind, TomlPosition, TomlTable}
 import sosimage.board.{Board, LimitsSpec, NamedCount, RefUse, Window, expect_table,
                        quota_keys, read_counts, require_table}
-import sosimage.declaration.{BootRecord, Declaration, HeapDecl, RecordKind, child_rights,
-                             console_rights, kind_word, read_rights}
+import sosimage.declaration.{BootRecord, Declaration, HeapDecl, ImageCeiling, RecordKind,
+                             child_rights, console_rights, kind_word, read_ceilings,
+                             read_rights}
 import sosimage.failure.{BuildError}
 import sosimage.heapsize.{first_growth}
 import sosimage.hex.{hex}
@@ -219,6 +232,9 @@ public struct ImageFile {
     quotas: Vector<Entry>
     /// Each process's `heap-ram`: a heap's name to its pool's range.
     heap_rams: Vector<Entry>
+    /// Each process's `ceilings`: a kind and the rights the image leaves it,
+    /// in file order.
+    ceilings: Vector<ImageCeiling>
     pools: Vector<PoolEntry>
     row_devices: Vector<RowDevice>
     row_pools: Vector<String>
@@ -378,7 +394,7 @@ extension ImageFile {
         var parts = Parts(processes: Vector<ProcessEntry>(), devices: Vector<NeedRef>(),
                           inputs: Vector<Entry>(), clients: Vector<Entry>(),
                           pool_bindings: Vector<Entry>(), quotas: Vector<Entry>(),
-                          heap_rams: Vector<Entry>())
+                          heap_rams: Vector<Entry>(), ceilings: Vector<ImageCeiling>())
         try root.require("process", TomlKind.Array) catch {
             return toml_refused(file, error)
         }
@@ -516,6 +532,7 @@ extension ImageFile {
                          clients: parts.clients.copy(),
                          pool_bindings: parts.pool_bindings.copy(),
                          quotas: parts.quotas.copy(), heap_rams: parts.heap_rams.copy(),
+                         ceilings: parts.ceilings.copy(),
                          pools: move pools,
                          row_devices: move row_devices, row_pools: move row_pools)
     }
@@ -544,6 +561,7 @@ struct Parts {
     pool_bindings: Vector<Entry>
     quotas: Vector<Entry>
     heap_rams: Vector<Entry>
+    ceilings: Vector<ImageCeiling>
 }
 
 @synthesize
@@ -601,7 +619,7 @@ func check_ram(board: &Board, what: String, ram: String, file: String,
 func read_process(p: &TomlTable, stock: Bool, board: &Board, parts: &var Parts,
                   file: String) -> Result<Void, BuildError> {
     let known: Vector<String> = ["name", "package", "device", "inputs", "ram", "quota", "clients",
-                                 "pools", "heap-ram", "on-exit"]
+                                 "pools", "heap-ram", "on-exit", "ceilings"]
     try only_keys(&p, &known, file, "[[process]]")
     let keys = try! p.keys()
     var k = 0
@@ -673,6 +691,23 @@ func read_process(p: &TomlTable, stock: Bool, board: &Board, parts: &var Parts,
         if given.process.equals(name) {
             try check_ram(&board, "`{given.key}` in the `heap-ram` of the process {name}",
                           given.value, file, given.at)
+        }
+    }
+    try expect_table(&p, "ceilings", file)
+    if let c = p.table("ceilings") {
+        let scope = "the `ceilings` of the process {name}"
+        let rows = try read_ceilings(&c, file, scope) catch {
+            if error.message.contains("` twice") {
+                return BuildError(message: "{error.message}, in {scope}")
+            }
+            return error
+        }
+        var n = 0
+        while n < rows.len() {
+            let row = rows.get(n)!
+            n = n + 1
+            try! parts.ceilings.push(ImageCeiling(process: name, key: row.key,
+                                                  rights: row.rights, at: row.at))
         }
     }
     try expect_table(&p, "quota", file)
@@ -861,6 +896,7 @@ public func bind(image: &ImageFile, board: &Board, decls: &Vector<Declaration>,
             try! ranges.push(try bind_process(&image, &board, &d, &decls, &process, grain,
                                               &var windows, &var values, &var notes))
             try bind_heaps(&image, &board, &d, &process, grain, &var heaps)
+            let _ = try d.within_image(process.name, &image.ceilings, file, process.at)
         }
     }
     if let target = image.console {

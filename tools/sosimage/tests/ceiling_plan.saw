@@ -152,6 +152,60 @@ func ceilings_len(plan: &ImagePlan, child: Int) -> Int {
     len
 }
 
+// a driver whose window, line and serve each name rights.
+func driver_rights() -> Declaration {
+    let lines: Vector<String> = ["format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"port\"", "kind = \"window\"", "type = \"esp32s3-uart\"", "tag = 2",
+        "rights = [\"carve\", \"map\"]",
+        "[[boot]]", "name = \"port\"", "kind = \"line\"", "type = \"esp32s3-uart\"", "tag = 3",
+        "rights = [\"wait\", \"ack\"]",
+        "[[boot]]", "name = \"uart\"", "kind = \"serve\"", "protocol = \"uartproto\"", "tag = 4",
+        "rights = [\"take\", \"transfer\"]"]
+    decl(&lines, "driver/process.toml")
+}
+
+// a client that names its rights.
+func hello_rights() -> Declaration {
+    let lines: Vector<String> = ["format = 1", "arena = 0x1000",
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"uart\"", "kind = \"client\"", "protocol = \"uartproto\"", "tag = 2",
+        "rights = [\"post\", \"transfer\"]"]
+    decl(&lines, "hello/process.toml")
+}
+
+func probe_text(console: Bool, mine: String, theirs: String) -> String {
+    let named = if console { "console = \"console.uart\"\n" } else { "" }
+    "format = 1\n[image]\nname = \"c\"\nboard = \"esp32s3\"\ntick = true\n{named}[root]\npackage = \"stock\"\n[[process]]\nname = \"console\"\npackage = \"driver\"\ndevice = \{ port = \"UART1\" \}\n{mine}[[process]]\nname = \"hello\"\npackage = \"hello\"\nclients = \{ uart = \"console.uart\" \}\n{theirs}"
+}
+
+func probe_refusal(console: Bool, d: &Vector<Declaration>, mine: String, theirs: String) -> String {
+    let b = board()
+    let image = try! ImageFile.parse(probe_text(console, mine, theirs), "i.toml", &b, 4)
+    let bound = try bind(&image, &b, &d, 4) catch {
+        return error.message
+    }
+    try plan_image(&image, &b, &d, &bound, 4) catch {
+        return error.message
+    }
+    return ""
+}
+
+func probe_plan(d: &Vector<Declaration>, mine: String, theirs: String) -> ImagePlan {
+    let b = board()
+    let image = try! ImageFile.parse(probe_text(false, mine, theirs), "i.toml", &b, 4)
+    let bound = try! bind(&image, &b, &d, 4)
+    try! plan_image(&image, &b, &d, &bound, 4)
+}
+
+func probe_check(got: String, want: String, what: String) {
+    if not got.contains(want) {
+        print("expected: ...{want}")
+        print("got:      {got}")
+    }
+    assert(got.contains(want), what)
+}
+
 func main() {
     let full = runtime(", \"map\"")
     let with_post = "{full}iomemory = [\"carve\", \"map\"]\npipe-outlet = [\"take\", \"transfer\"]\npipe-inlet = [\"post\", \"transfer\"]\n"
@@ -206,13 +260,35 @@ func main() {
     assert(keep_of(&planned(true, &plain_console), 1, 2) == KEEP_ALL, "no ceilings: every right")
     let no_post = "{full}pipe-inlet = [\"transfer\", \"wait\"]\n"
     var refused = pair(driver("", with_post), hello("{no_post}"))
-    assert(plan_refusal(true, &refused).equals("i.toml: line 14, column 1: the process hello's `pipe-inlet` ceiling in [ceilings] lacks `post`: the runtime posts every line the process prints through the console's inlet, and this image gives it one"),
+    assert(plan_refusal(true, &refused).equals("i.toml: line 14, column 1: the process hello's `pipe-inlet` ceiling lacks `post`: the runtime posts every line the process prints through the console's inlet, and this image gives it one"),
            "a ceiling without post, in a console image")
     var unlisted = pair(driver("", with_post), hello(full))
-    assert(plan_refusal(true, &unlisted).equals("i.toml: line 14, column 1: the process hello's `pipe-inlet` ceiling in [ceilings] lacks `post`: the runtime posts every line the process prints through the console's inlet, and this image gives it one"),
+    assert(plan_refusal(true, &unlisted).equals("i.toml: line 14, column 1: the process hello's `pipe-inlet` ceiling lacks `post`: the runtime posts every line the process prints through the console's inlet, and this image gives it one"),
            "no pipe-inlet ceiling, in a console image")
     assert(plan_refusal(false, &refused).is_empty(), "the same ceiling in an image with no console")
 
+    var kinds = pair(driver_rights(), hello_rights())
+    let kinds_clean = probe_refusal(false, &kinds, "ceilings = \{ iomemory = [\"carve\", \"map\"], interrupt = [\"wait\", \"ack\"], pipe-outlet = [\"take\", \"transfer\"] \}\n", "ceilings = \{ pipe-inlet = [\"post\", \"transfer\"] \}\n")
+    if not kinds_clean.is_empty() { print("got: {kinds_clean}") }
+    assert(kinds_clean.is_empty(), "lists that keep every record's rights build")
+    probe_check(probe_refusal(false, &kinds, "ceilings = \{ iomemory = [\"map\"] \}\n", ""),
+                "the image's `iomemory` ceiling for the process console removes `carve`, which its record `port` keeps", "a window")
+    probe_check(probe_refusal(false, &kinds, "ceilings = \{ interrupt = [\"wait\"] \}\n", ""),
+                "the image's `interrupt` ceiling for the process console removes `ack`, which its record `port` keeps", "a line")
+    probe_check(probe_refusal(false, &kinds, "ceilings = \{ pipe-outlet = [\"take\"] \}\n", ""),
+                "the image's `pipe-outlet` ceiling for the process console removes `transfer`, which its record `uart` keeps", "a serve")
+    probe_check(probe_refusal(false, &kinds, "", "ceilings = \{ pipe-inlet = [\"post\"] \}\n"),
+                "the image's `pipe-inlet` ceiling for the process hello removes `transfer`, which its record `uart` keeps", "a client")
+    var plain_pair = pair(driver("", ""), hello(""))
+    probe_check(probe_refusal(true, &plain_pair, "", "ceilings = \{ pipe-inlet = [\"transfer\", \"wait\"] \}\n"),
+                "the process hello's `pipe-inlet` ceiling lacks `post`", "the image withholds the console inlet's post")
+    let console_ok = probe_refusal(true, &plain_pair, "", "ceilings = \{ pipe-inlet = [\"post\", \"wait\"] \}\n")
+    if not console_ok.is_empty() { print("got: {console_ok}") }
+    assert(console_ok.is_empty(), "a list keeping post builds")
+    var split_pair = pair(driver("", ""), hello(""))
+    let split = probe_plan(&split_pair, "ceilings = \{ iomemory = [\"carve\", \"map\"] \}\n", "")
+    assert(ceiling_of(&split, 0, "IoMemory") == ((1 << 8) | (1 << 9)), "the listed process's word")
+    assert(ceiling_of(&split, 1, "IoMemory") == -1, "the other process has no IoMemory word")
     // The module root is built with carries each ceiling and keep word.
     let module = plan_module(&owned, "c").join("\n")
     assert(module.contains("    var ceilings = try! Vector<Ceiling>(capacity: 15)\n    try! ceilings.push(Ceiling(kind: CeilingKind.Process, rights: 0x58200))"),
