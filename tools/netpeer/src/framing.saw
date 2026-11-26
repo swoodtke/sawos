@@ -1,0 +1,63 @@
+//! The stream's framing: a four-byte big-endian length, then the frame.
+
+import std.data.{Data}
+import netpeer.wire.{be32, put32, put_from}
+
+/// The longest frame the peer reads, well past any the gate's guests send.
+public static FRAME_MAX: Int = 65_536
+
+public struct FrameError {
+    length: Int,
+}
+
+extension FrameError: Error {
+    public func format(&self, into: &var StringBuilder) {
+        let max = FRAME_MAX
+        try! into.append(
+            "a frame of {self.length} bytes, past the {max} the peer reads")
+    }
+}
+
+/// Bytes read from the stream that do not yet make a whole frame.
+public struct Reassembler {
+    held: Data,
+}
+
+extension Reassembler: NoCopy {}
+
+extension Reassembler {
+    public init() -> Reassembler {
+        Reassembler(held: Data())
+    }
+
+    public func add(&var self, chunk: &Data) {
+        try! self.held.append(chunk)
+    }
+
+    /// The next whole frame, or `None` when more bytes are wanted. A length
+    /// past `FRAME_MAX` is an error: the stream is not what the peer reads.
+    public func next(&var self) -> Result<Data?, FrameError> {
+        if self.held.len() < 4 {
+            return None
+        }
+        let length = be32(&self.held, 0) as Int
+        if length > FRAME_MAX {
+            return FrameError(length: length)
+        }
+        if self.held.len() < 4 + length {
+            return None
+        }
+        let frame = try! self.held.slice(4, 4 + length)!.detached()
+        let rest = self.held.slice(4 + length, self.held.len())!
+        self.held = try! rest.detached()
+        frame
+    }
+}
+
+/// `frame` as the stream carries it.
+public func length_prefixed(frame: &Data) -> Data {
+    var out = Data()
+    put32(&var out, frame.len() as UInt)
+    put_from(&var out, &frame, 0, frame.len())
+    out
+}

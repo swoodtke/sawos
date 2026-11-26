@@ -1,0 +1,431 @@
+//! What the peer answers: one guest frame in, the frames to send back and the
+//! lines to log out.
+//!
+//! The peer is 10.0.2.2 with MAC 52:55:0a:00:02:02 on 10.0.2.0/24. It only
+//! answers: every frame it sends is caused by a frame it was given, so the
+//! guest's run does not depend on any clock. A script says how much it
+//! answers.
+//!
+//!     ping     ARP requests for the peer and ICMP echo requests to it
+//!     burst    `ping`, and `N` UDP datagrams to a sender of `burst N` to
+//!              port 7
+//!     log      `ping`, and a line for every frame's length
+//!     silent   nothing, but a line for every frame's length
+//!
+//! Anything else a script handles is logged as `peer: unexpected: ...`,
+//! naming what was wrong. Frames are written and checked with this file's
+//! own code and `wire`, never the guest's stack's, so an encoding mistake the
+//! two share cannot pass.
+
+import std.data.{Data}
+import netpeer.wire.{byte_at, be16, be32, mac_at, put8, put16, put32, put_mac,
+                     put_from, sum16, checksum, mac_text, ip_text}
+
+public static PEER_MAC: UInt = 0x5255_0A00_0202
+public static PEER_IP: UInt = 0x0A00_0202
+
+static BROADCAST: UInt = 0xFFFF_FFFF_FFFF
+
+static ETHER_BYTES: Int = 14
+static IPV4_BYTES: Int = 20
+static ARP_BYTES: Int = 28
+static MIN_FRAME: Int = 60
+
+static ETHER_ARP: UInt = 0x0806
+static ETHER_IPV4: UInt = 0x0800
+
+static PROTO_ICMP: UInt = 1
+static PROTO_UDP: UInt = 17
+static ECHO_PORT: UInt = 7
+
+/// The most datagrams one `burst` may ask for.
+public static BURST_MAX: UInt = 64
+
+public enum Script {
+    case Ping,
+    case Burst,
+    case Log,
+    case Silent
+}
+
+extension Script {
+    /// The script a name on the command line gives, or `None`.
+    public static func named(name: String) -> Script? {
+        if name.equals("ping") { return Script.Ping }
+        if name.equals("burst") { return Script.Burst }
+        if name.equals("log") { return Script.Log }
+        if name.equals("silent") { return Script.Silent }
+        None
+    }
+
+    func answers(&self) -> Bool {
+        match self {
+            case Silent -> false,
+            case _ -> true,
+        }
+    }
+
+    func logs_lengths(&self) -> Bool {
+        match self {
+            case Log -> true,
+            case Silent -> true,
+            case _ -> false,
+        }
+    }
+
+    func bursts(&self) -> Bool {
+        match self {
+            case Burst -> true,
+            case _ -> false,
+        }
+    }
+}
+
+/// What one frame caused: the frames to send, and the lines to log.
+public struct Handled {
+    replies: Vector<Data>,
+    lines: Vector<String>,
+}
+
+extension Handled: NoCopy {}
+
+extension Handled {
+    init() -> Handled {
+        Handled(replies: Vector(), lines: Vector())
+    }
+
+    func line(&var self, text: String) {
+        try! self.lines.push("peer: {text}")
+    }
+
+    func unexpected(&var self, what: String) {
+        self.line("unexpected: {what}")
+    }
+
+    func reply(&var self, frame: Data) {
+        try! self.replies.push(frame)
+    }
+}
+
+public struct Peer {
+    script: Script,
+    frames: Int,
+}
+
+extension Peer {
+    public init(script: Script) -> Peer {
+        Peer(script: script, frames: 0)
+    }
+
+    /// The frames received so far.
+    public func count(&self) -> Int {
+        self.frames
+    }
+
+    /// Takes one frame from the guest.
+    public func handle(&var self, frame: &Data) -> Handled {
+        self.frames = self.frames + 1
+        var out = Handled()
+        let n = frame.len()
+        if self.script.logs_lengths() {
+            out.line("frame {n} bytes")
+        }
+        if not self.script.answers() {
+            return move out
+        }
+        if n < ETHER_BYTES {
+            out.unexpected("a frame of {n} bytes, under an Ethernet header")
+            return move out
+        }
+        let kind = be16(&frame, 12)
+        if kind == ETHER_ARP {
+            self.arp(&frame, &var out)
+        } else if kind == ETHER_IPV4 {
+            self.ipv4(&frame, &var out)
+        } else {
+            out.unexpected("ethertype {kind}")
+        }
+        move out
+    }
+
+    func arp(&self, frame: &Data, out: &var Handled) {
+        let n = frame.len()
+        if n < ETHER_BYTES + ARP_BYTES {
+            out.unexpected("an ARP frame of {n} bytes")
+            return
+        }
+        if be16(&frame, 14) != 1 || be16(&frame, 16) != ETHER_IPV4 ||
+           byte_at(&frame, 18) != 6 || byte_at(&frame, 19) != 4 {
+            out.unexpected("an ARP packet that is not Ethernet and IPv4")
+            return
+        }
+        let op = be16(&frame, 20)
+        if op != 1 {
+            out.unexpected("an ARP operation {op}")
+            return
+        }
+        let dst = mac_at(&frame, 0)
+        if dst != BROADCAST && dst != PEER_MAC {
+            out.unexpected("an ARP request to {mac_text(dst)}")
+            return
+        }
+        let smac = mac_at(&frame, 22)
+        let sip = be32(&frame, 28)
+        let tip = be32(&frame, 38)
+        if sip == tip {
+            out.line("arp announce {ip_text(sip)} at {mac_text(smac)}")
+            return
+        }
+        if tip != PEER_IP {
+            out.unexpected("an ARP request for {ip_text(tip)}")
+            return
+        }
+        var r = Data()
+        ether(&var r, smac, ETHER_ARP)
+        put16(&var r, 1)
+        put16(&var r, ETHER_IPV4)
+        put8(&var r, 6)
+        put8(&var r, 4)
+        put16(&var r, 2)
+        put_mac(&var r, PEER_MAC)
+        put32(&var r, PEER_IP)
+        put_mac(&var r, smac)
+        put32(&var r, sip)
+        pad(&var r)
+        out.reply(r)
+        let who = "{ip_text(sip)} at {mac_text(smac)}"
+        out.line("arp request for {ip_text(PEER_IP)} from {who}, answered")
+    }
+
+    func ipv4(&self, frame: &Data, out: &var Handled) {
+        let n = frame.len()
+        if n < ETHER_BYTES + IPV4_BYTES {
+            out.unexpected("an IPv4 frame of {n} bytes")
+            return
+        }
+        let dst_mac = mac_at(&frame, 0)
+        if dst_mac != PEER_MAC {
+            out.unexpected("an IPv4 frame to {mac_text(dst_mac)}")
+            return
+        }
+        let vihl = byte_at(&frame, 14)
+        if vihl != 0x45 {
+            out.unexpected("an IPv4 version and header length byte {vihl}")
+            return
+        }
+        let total = be16(&frame, 16) as Int
+        if total < IPV4_BYTES || ETHER_BYTES + total > n {
+            out.unexpected("an IPv4 length {total} in a frame of {n} bytes")
+            return
+        }
+        if sum16(&frame, ETHER_BYTES, IPV4_BYTES) != 0xFFFF {
+            out.unexpected("an IPv4 header checksum")
+            return
+        }
+        if (be16(&frame, 20) & 0x3FFF) != 0 {
+            out.unexpected("a fragmented IPv4 packet")
+            return
+        }
+        let dst = be32(&frame, 30)
+        if dst != PEER_IP {
+            out.unexpected("an IPv4 packet to {ip_text(dst)}")
+            return
+        }
+        let src = be32(&frame, 26)
+        let proto = byte_at(&frame, 23)
+        let body = total - IPV4_BYTES
+        if proto == PROTO_ICMP {
+            self.icmp(&frame, src, body, &var out)
+        } else if proto == PROTO_UDP {
+            self.udp(&frame, src, body, &var out)
+        } else {
+            out.unexpected("IPv4 protocol {proto}")
+        }
+    }
+
+    func icmp(&self, frame: &Data, src: UInt, body: Int, out: &var Handled) {
+        let at = ETHER_BYTES + IPV4_BYTES
+        if body < 8 {
+            out.unexpected("an ICMP message of {body} bytes")
+            return
+        }
+        if sum16(&frame, at, body) != 0xFFFF {
+            out.unexpected("an ICMP checksum")
+            return
+        }
+        let kind = byte_at(&frame, at)
+        let code = byte_at(&frame, at + 1)
+        if kind != 8 || code != 0 {
+            out.unexpected("ICMP type {kind} code {code}")
+            return
+        }
+        let seq = be16(&frame, at + 6)
+        let data = body - 8
+        // The message with its checksum zero, then with the checksum.
+        var message = Data()
+        put16(&var message, 0)
+        put16(&var message, 0)
+        put_from(&var message, &frame, at + 4, body - 4)
+        let sum = checksum(&message, 0, body)
+        var sealed = Data()
+        put16(&var sealed, 0)
+        put16(&var sealed, sum)
+        put_from(&var sealed, &frame, at + 4, body - 4)
+        out.reply(ipv4_frame(mac_at(&frame, 6), PROTO_ICMP, src, &sealed))
+        let from = ip_text(src)
+        out.line("echo request {seq} from {from}, {data} bytes, answered")
+    }
+
+    func udp(&self, frame: &Data, src: UInt, body: Int, out: &var Handled) {
+        let at = ETHER_BYTES + IPV4_BYTES
+        if body < 8 {
+            out.unexpected("a UDP datagram of {body} bytes")
+            return
+        }
+        let sport = be16(&frame, at)
+        let dport = be16(&frame, at + 2)
+        let length = be16(&frame, at + 4) as Int
+        if length != body {
+            out.unexpected("a UDP length {length} in {body} bytes")
+            return
+        }
+        if be16(&frame, at + 6) != 0 &&
+           udp_sum(&frame, at, body, src, PEER_IP) != 0xFFFF {
+            out.unexpected("a UDP checksum")
+            return
+        }
+        if not self.script.bursts() || dport != ECHO_PORT {
+            out.unexpected("a UDP datagram to port {dport}")
+            return
+        }
+        guard let count = burst_count(&frame, at + 8, body - 8) else {
+            out.unexpected("a UDP payload that is not `burst N`")
+            return
+        }
+        let smac = mac_at(&frame, 6)
+        var k: UInt = 1
+        while k <= count {
+            let text = "frame {k} of {count}"
+            var payload = Data()
+            put_from_text(&var payload, text)
+            out.reply(udp_frame(smac, src, sport, &payload))
+            k = k + 1
+        }
+        out.line("burst of {count} to {ip_text(src)}:{sport}")
+    }
+}
+
+/// The `N` of a payload `burst N`: decimal digits only, 1 to `BURST_MAX`.
+func burst_count(frame: &Data, at: Int, len: Int) -> UInt? {
+    let prefix = "burst "
+    let plen = prefix.len()
+    if len < plen {
+        return None
+    }
+    var i = 0
+    while i < plen {
+        if byte_at(&frame, at + i) != (prefix.byte_at(i) as UInt) {
+            return None
+        }
+        i = i + 1
+    }
+    var n: UInt = 0
+    while i < len {
+        let c = byte_at(&frame, at + i)
+        if c < 0x30 || c > 0x39 {
+            return None
+        }
+        n = n * 10 + (c - 0x30)
+        if n > BURST_MAX {
+            return None
+        }
+        i = i + 1
+    }
+    if n == 0 {
+        return None
+    }
+    n
+}
+
+func put_from_text(out: &var Data, text: String) {
+    var i = 0
+    while i < text.len() {
+        put8(&var out, text.byte_at(i) as UInt)
+        i = i + 1
+    }
+}
+
+/// The Ethernet header to `dst` from the peer.
+func ether(out: &var Data, dst: UInt, kind: UInt) {
+    put_mac(&var out, dst)
+    put_mac(&var out, PEER_MAC)
+    put16(&var out, kind)
+}
+
+func pad(out: &var Data) {
+    while out.len() < MIN_FRAME {
+        put8(&var out, 0)
+    }
+}
+
+/// The checksum sum of a UDP datagram of `len` bytes at `at`, with its
+/// pseudo-header; 0xFFFF when the datagram's checksum field is good.
+func udp_sum(frame: &Data, at: Int, len: Int, src: UInt, dst: UInt) -> UInt {
+    var sum = sum16(&frame, at, len) + (src >> 16) + (src & 0xFFFF) +
+              (dst >> 16) + (dst & 0xFFFF) + PROTO_UDP + (len as UInt)
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16)
+    }
+    sum
+}
+
+/// An Ethernet frame to `dst_mac` carrying `payload` in an IPv4 packet from
+/// the peer to `dst`.
+func ipv4_frame(dst_mac: UInt, proto: UInt, dst: UInt, payload: &Data) -> Data {
+    let total = IPV4_BYTES + payload.len()
+    var header = Data()
+    ip_header(&var header, total, proto, dst, 0)
+    let sum = checksum(&header, 0, IPV4_BYTES)
+    var r = Data()
+    ether(&var r, dst_mac, ETHER_IPV4)
+    ip_header(&var r, total, proto, dst, sum)
+    put_from(&var r, &payload, 0, payload.len())
+    pad(&var r)
+    r
+}
+
+func ip_header(out: &var Data, total: Int, proto: UInt, dst: UInt, sum: UInt) {
+    put8(&var out, 0x45)
+    put8(&var out, 0)
+    put16(&var out, total as UInt)
+    put16(&var out, 0)
+    put16(&var out, 0x4000)
+    put8(&var out, 64)
+    put8(&var out, proto)
+    put16(&var out, sum)
+    put32(&var out, PEER_IP)
+    put32(&var out, dst)
+}
+
+/// A frame to `dst_mac` carrying a UDP datagram from the peer's port 7 to
+/// `dst`:`dport`.
+func udp_frame(dst_mac: UInt, dst: UInt, dport: UInt, payload: &Data) -> Data {
+    let length = 8 + payload.len()
+    var datagram = Data()
+    put16(&var datagram, ECHO_PORT)
+    put16(&var datagram, dport)
+    put16(&var datagram, length as UInt)
+    put16(&var datagram, 0)
+    put_from(&var datagram, &payload, 0, payload.len())
+    var sum = 0xFFFF - udp_sum(&datagram, 0, length, PEER_IP, dst)
+    if sum == 0 {
+        sum = 0xFFFF
+    }
+    var sealed = Data()
+    put16(&var sealed, ECHO_PORT)
+    put16(&var sealed, dport)
+    put16(&var sealed, length as UInt)
+    put16(&var sealed, sum)
+    put_from(&var sealed, &payload, 0, payload.len())
+    ipv4_frame(dst_mac, PROTO_UDP, dst, &sealed)
+}

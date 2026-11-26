@@ -1,0 +1,60 @@
+// Reads a virtio-mmio transport's identity registers and prints them.
+//
+// The transport is whichever the image's `device` names; its window arrives
+// under `TAG_WINDOW`, and SOS does not translate, so the registers are at the
+// mapping's base, which is where the board says the window is. The program
+// reads four read-only registers (`MagicValue`, `Version`, `DeviceID`,
+// `VendorID`) and stops: it writes nothing, so what it prints is the
+// emulator's answer and no state of its own.
+
+import sos.{BootSet, IoMemory, SosStatus}
+import sosmain
+
+static TAG_WINDOW: UInt = 2
+
+static EXIT_OK: Int = 0
+static EXIT_FAILED: Int = 1
+
+/// The identity registers, at their offsets in the transport's window.
+struct Identity {
+    magic: ReadOnly<UInt32>,        // +0x000
+    version: ReadOnly<UInt32>,      // +0x004
+    device: ReadOnly<UInt32>,       // +0x008
+    vendor: ReadOnly<UInt32>,       // +0x00c
+}
+
+static_assert(sizeof<Identity>() == 16, "four 32-bit registers")
+
+func main() -> Int {
+    var set = sosmain.take_boot_set()
+    guard let window = take_window(&var set) else {
+        print("SOS virtio probe: no IoMemory under tag {}\n", TAG_WINDOW)
+        return EXIT_FAILED
+    }
+    let _mapping = try sosmain.context().process().map(
+        iomemory: &window) catch {
+        print("SOS virtio probe: map failed: {}\n", error)
+        return EXIT_FAILED
+    }
+    let at = try _mapping.base() catch {
+        print("SOS virtio probe: base failed: {}\n", error)
+        return EXIT_FAILED
+    }
+    let (magic, version, device, vendor) = read_identity(at)
+    print("SOS virtio probe: magic={} version={} device={} vendor={}\n",
+          magic, version, device, vendor)
+    let _ = move window
+    EXIT_OK
+}
+
+func read_identity(at: UInt) unsafe -> (UInt32, UInt32, UInt32, UInt32) {
+    let regs = UnsafeMemory<Identity, Device>(at)
+    (regs.magic.read(), regs.version.read(), regs.device.read(),
+     regs.vendor.read())
+}
+
+/// The transport's window, under `TAG_WINDOW`.
+func take_window(set: &var BootSet) -> IoMemory? {
+    guard var record = set.take(TAG_WINDOW) else { return None }
+    record.take_iomemory()
+}

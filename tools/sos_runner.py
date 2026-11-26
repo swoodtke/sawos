@@ -75,7 +75,9 @@ import glob
 import json
 import os
 import re
+import select
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -1141,6 +1143,10 @@ ARCHES = [
         "tier": TIER_ISOLATED,
         # `-bios none`: no OpenSBI, the kernel IS the reset target.
         "qemu_args": ["-M", "virt", "-bios", "none"],
+        # The virtio-mmio bus a network device is placed at (`-device ...,
+        # bus=virtio-mmio-bus.N`): the last transport, which is the board's
+        # `VIRTIO7` (`hal/riscv32/board.toml`).
+        "net_bus": 7,
         # A triple names the architecture but not which optional extensions the
         # part has: without `+m` the Saw half is built for base rv32i and
         # formatting an integer emits `__divsi3` calls this link cannot satisfy.
@@ -1302,6 +1308,7 @@ ARCHES = [
         "triple": "riscv32-unknown-none-elf",
         "qemu": "qemu-system-riscv32",
         "qemu_args": ["-M", "virt", "-bios", "none"],
+        "net_bus": 7,
         "cc_args": ["-march=rv32imac_zicsr", "-mabi=ilp32"],
         "features": "+m,+a,+c",
         # `hal=` is this profile's own module; `rv32core` and `rv32virt` are
@@ -15428,6 +15435,79 @@ TEST_CASES = [
                        "SOS heaplaunch: done"],
         "expect_clean_exit": True,
     },
+    {
+        # The first virtio-mmio transport a process is given: the image names
+        # `VIRTIO7`, where QEMU puts the network device, and the probe reads
+        # its identity registers (`tests/virtio-probe`). The case boots with
+        # the network path (`_run_net_qemu`), so it also holds that start-up:
+        # the peer's port, the stream connected before the guest runs, and a
+        # peer that sees no frame and closes when QEMU does. The registers
+        # are QEMU's answer, not a clock's: "virt" (0x74726976), version 2
+        # (the transports are modern), DeviceID 1 (a network card) and the
+        # vendor "QEMU" (0x554D4551).
+        "name": "virtio_probe",
+        "arches": ["riscv32", "riscv32-flat"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "virtio_probe.toml",
+                       "riscv32-flat": "virtio_probe_flat.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       "SOS virtio probe: magic=1953655158 version=2 "
+                       "device=1 vendor=1431127377",
+                       "root: probe ended status=65536"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The same image with no device on the bus: the transport still
+        # answers its magic, version and vendor, and reads DeviceID 0, which
+        # is how a driver tells an empty transport from a card.
+        "name": "virtio_probe_empty",
+        "arches": ["riscv32", "riscv32-flat"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "virtio_probe_empty.toml",
+                       "riscv32-flat": "virtio_probe_empty_flat.toml"},
+        "net": {"script": "ping", "device": "none"},
+        "expect_out": ["{banner}",
+                       "SOS virtio probe: magic=1953655158 version=2 "
+                       "device=0 vendor=1431127377",
+                       "root: probe ended status=65536"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The transports left legacy, as QEMU has them without
+        # `force-legacy=false`: the same registers read version 1, which is
+        # what a driver refuses.
+        "name": "virtio_probe_legacy",
+        "arches": ["riscv32", "riscv32-flat"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "virtio_probe_legacy.toml",
+                       "riscv32-flat": "virtio_probe_legacy_flat.toml"},
+        "net": {"script": "ping", "legacy": True},
+        "expect_out": ["{banner}",
+                       "SOS virtio probe: magic=1953655158 version=1 "
+                       "device=1 vendor=1431127377",
+                       "root: probe ended status=65536"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # Another device on the bus, which `device` places without a netdev
+        # (a random-number generator, DeviceID 4).
+        "name": "virtio_probe_wrong_device",
+        "arches": ["riscv32", "riscv32-flat"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "virtio_probe_wrong_device.toml",
+                       "riscv32-flat": "virtio_probe_wrong_device_flat.toml"},
+        "net": {"script": "ping", "device": "virtio-rng-device"},
+        "expect_out": ["{banner}",
+                       "SOS virtio probe: magic=1953655158 version=2 "
+                       "device=4 vendor=1431127377",
+                       "root: probe ended status=65536"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
 ]
 
 INSTALL_HINTS = {
@@ -16485,6 +16565,9 @@ def _startup_frame_lines(case, arch, build_dir, clang):
 
 SOSIMAGE_DIR = os.path.join(REPO_ROOT, "tools", "sosimage")
 
+# The network peer a case with a `net` key boots beside QEMU (`_run_net_qemu`).
+NETPEER_DIR = os.path.join(REPO_ROOT, "tools", "netpeer")
+
 # Packages whose own tests run on the host in a full run, beside the
 # builder's: `blade test` in each.
 HOSTED_TESTS = [os.path.join(DRIVERS_DIR, "esp32s3io"),
@@ -16499,6 +16582,7 @@ HOSTED_TESTS = [os.path.join(DRIVERS_DIR, "esp32s3io"),
                 os.path.join(DRIVERS_DIR, "sockproto"),
                 os.path.join(DRIVERS_DIR, "netstack"),
                 os.path.join(DRIVERS_DIR, "virtio"),
+                NETPEER_DIR,
                 os.path.dirname(SOSRT_DIR)]
 
 # The link the builder's manifest reaches the sawlang checkout's packages
@@ -17057,6 +17141,241 @@ def _run_qemu(qemu, arch, elf, feed=None, at_once=False):
         return None, out, True
 
 
+# The network path (`_run_net_qemu`).
+#
+# A case with a `net` key boots a guest whose virtio-net device is wired to a
+# peer process (`tools/netpeer`) over a loopback stream, so a driver has
+# something to talk to and nothing leaves the host. Every case has a peer of
+# its own on a port the system picks, and a QMP socket of its own passed by
+# descriptor, so cases running in parallel share nothing.
+#
+# QEMU's stream backend connects after it starts, and delivers nothing
+# through a netdev that has not connected, so a guest that transmitted at once
+# could lose its first frame to the host's speed. QEMU therefore starts
+# paused (`-S`), the runner waits until the netdev reports it is connected,
+# and only then resumes the guest: its first instruction runs with the
+# stream up, whatever the load. Nothing here asserts or waits on a duration;
+# `QEMU_TIMEOUT_S` only bounds a case that has hung.
+#
+# A `net` key is a dict:
+#   script   the peer's script (`tools/netpeer/src/peer.saw`), default `ping`
+#   device   the `-device` driver, default `virtio-net-device`; `none` leaves
+#            the device out, so the transport reads empty
+#   props    extra `-device` properties, as `key=value,key=value`
+#   legacy   leave the transports legacy (version 1), which QEMU does by
+#            default; without it they are modern (version 2)
+# and a case's `expect_peer` is the peer's log, line for line.
+
+NET_MAC = "52:54:00:12:34:56"
+NET_DEVICE = "virtio-net-device"
+
+
+class _Qmp:
+    """The runner's end of QEMU's QMP socket: newline-delimited JSON."""
+
+    def __init__(self, sock, deadline):
+        self.sock = sock
+        self.deadline = deadline
+        self.buf = b""
+        self.events = []
+
+    def _message(self):
+        while b"\n" not in self.buf:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise ToolError("QEMU's QMP socket said nothing in time")
+            self.sock.settimeout(left)
+            try:
+                chunk = self.sock.recv(4096)
+            except socket.timeout:
+                raise ToolError("QEMU's QMP socket said nothing in time")
+            if not chunk:
+                raise ToolError("QEMU closed its QMP socket")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return json.loads(line)
+
+    def greeting(self):
+        msg = self._message()
+        if "QMP" not in msg:
+            raise ToolError(f"QEMU's QMP socket opened with {msg!r}")
+
+    def event_seen(self, name):
+        return any(e.get("event") == name for e in self.events)
+
+    def wait_event(self, name):
+        while not self.event_seen(name):
+            msg = self._message()
+            if "event" in msg:
+                self.events.append(msg)
+
+    def command(self, execute, **arguments):
+        request = {"execute": execute}
+        if arguments:
+            request["arguments"] = arguments
+        self.sock.sendall(json.dumps(request).encode() + b"\n")
+        while True:
+            msg = self._message()
+            if "event" in msg:
+                self.events.append(msg)
+            elif "return" in msg:
+                return msg["return"]
+            elif "error" in msg:
+                raise ToolError(f"QMP {execute}: {msg['error']}")
+
+
+def _net_command(qemu, arch, elf, net, port, qmp_fd):
+    """QEMU's command line for a `net` case: the arch's own, paused, with QMP
+    on the inherited descriptor `qmp_fd` and the stream to the peer's `port`."""
+    cmd = [qemu, *arch["qemu_args"], "-nographic", "-kernel", elf, "-S",
+           "-chardev", f"socket,id=qmp0,fd={qmp_fd}",
+           "-object", "monitor-qmp,id=qmp,chardev=qmp0"]
+    if not net.get("legacy"):
+        cmd += ["-global", "virtio-mmio.force-legacy=false"]
+    cmd += ["-netdev", "stream,id=net0,server=off,addr.type=inet,"
+                       f"addr.host=127.0.0.1,addr.port={port}"]
+    device = net.get("device", NET_DEVICE)
+    props = net.get("props")
+    if device == NET_DEVICE:
+        cmd += ["-device", f"{device},netdev=net0,"
+                           f"bus=virtio-mmio-bus.{arch['net_bus']},"
+                           f"mac={NET_MAC}" + (f",{props}" if props else "")]
+    elif device != "none":
+        # Any other device is only placed on the bus: it has no netdev.
+        cmd += ["-device", f"{device},bus=virtio-mmio-bus.{arch['net_bus']}" +
+                           (f",{props}" if props else "")]
+    return cmd
+
+
+def _start_peer(netpeer, script):
+    """Start `netpeer serve` and return (process, its port): the port is the
+    first line it prints."""
+    peer = subprocess.Popen([netpeer, "serve", "--script", script],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            bufsize=0)
+    deadline = time.monotonic() + QEMU_TIMEOUT_S
+    line = b""
+    while not line.endswith(b"\n"):
+        left = deadline - time.monotonic()
+        ready = select.select([peer.stdout], [], [], max(left, 0))[0]
+        byte = peer.stdout.read(1) if ready else b""
+        if not byte:
+            peer.kill()
+            _out, err = peer.communicate()
+            raise ToolError("netpeer did not announce a port: "
+                            f"{(line + err).decode(errors='replace').strip()}")
+        line += byte
+    words = line.decode().split()
+    if len(words) != 2 or words[0] != "port" or not words[1].isdigit():
+        peer.kill()
+        peer.communicate()
+        raise ToolError(f"netpeer's first line was {line!r}, not `port N`")
+    return peer, int(words[1])
+
+
+def _run_net_qemu(qemu, arch, elf, net, netpeer):
+    """Run the ELF under QEMU with the peer of `net` wired to its network
+    device, as the comment above says.
+
+    Returns (exit_status, stdout, timed_out, peer) where `peer` is
+    (exit_status, log_lines, stderr): the lines the peer printed after its
+    port, once QEMU's end of the stream had closed. A start-up failure raises
+    `ToolError`, which is the case's build error.
+    """
+    parent, child = socket.socketpair()
+    read_fd, write_fd = os.pipe()
+    proc = None
+    peer = None
+    try:
+        peer, port = _start_peer(netpeer, net.get("script", "ping"))
+        cmd = _net_command(qemu, arch, elf, net, port, child.fileno())
+        proc = subprocess.Popen(cmd, stdin=read_fd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                pass_fds=(child.fileno(),))
+        child.close()
+        qmp = _Qmp(parent, time.monotonic() + QEMU_TIMEOUT_S)
+        qmp.greeting()
+        qmp.command("qmp_capabilities")
+        # An event raised before `qmp_capabilities` is not delivered, so the
+        # state is asked for, and the event waited for only if it is not yet.
+        shown = qmp.command("human-monitor-command",
+                            **{"command-line": "info network"})
+        if "connecting" in shown:
+            qmp.wait_event("NETDEV_STREAM_CONNECTED")
+        # A connect the peer refused is neither `connecting` nor an event:
+        # the guest runs only when the netdev reads connected to the peer's
+        # port and QEMU is still paused.
+        shown = qmp.command("human-monitor-command",
+                            **{"command-line": "info network"})
+        if f"tcp:127.0.0.1:{port}" not in shown:
+            raise ToolError("the netdev is not connected to the peer: "
+                            f"{shown.strip()}")
+        if qmp.command("query-status").get("status") != "prelaunch":
+            raise ToolError("QEMU is running before the netdev connected")
+        qmp.command("cont")
+        try:
+            out, _err = proc.communicate(timeout=QEMU_TIMEOUT_S)
+            status, timed_out = proc.returncode, False
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _err = proc.communicate()
+            status, timed_out = None, True
+    except BaseException as e:
+        said = ""
+        if proc is not None:
+            proc.kill()
+            _out, said = proc.communicate()
+        if peer is not None:
+            peer.kill()
+            peer.communicate()
+        if isinstance(e, ToolError) and said.strip():
+            raise ToolError(f"{e}\nQEMU said: {said.strip()}")
+        raise
+    finally:
+        parent.close()
+        child.close()
+        os.close(read_fd)
+        os.close(write_fd)
+    try:
+        peer_out, peer_err = peer.communicate(timeout=QEMU_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        peer.kill()
+        peer_out, peer_err = peer.communicate()
+        raise ToolError("netpeer did not end when QEMU did")
+    lines = peer_out.decode(errors="replace").splitlines()
+    return status, out, timed_out, (peer.returncode, lines, peer_err.decode(
+        errors="replace"))
+
+
+def _check_peer(case, peer):
+    """Return (ok, reason) for the peer's end of a `net` case: it exited 0
+    and its log is `expect_peer`, line for line."""
+    status, lines, err = peer
+    if status != 0:
+        return False, (f"netpeer exited {status}: "
+                       f"{(' '.join(lines) + ' ' + err).strip()}")
+    want = case.get("expect_peer")
+    if want is None:
+        return False, "a `net` case states `expect_peer`, the peer's log"
+    if lines != want:
+        return False, f"the peer logged {lines!r}, expected {want!r}"
+    return True, ""
+
+
+def _netpeer_binary(blade_bin):
+    """`blade build --force` the network peer; return its binary's path. The
+    previous binary is deleted first, as `_build_sosimage` does."""
+    binary = os.path.join(NETPEER_DIR, ".build", "host", "netpeer")
+    if os.path.exists(binary):
+        os.remove(binary)
+    env = dict(os.environ)
+    env["SAWC"] = tc().sawc_env_value()
+    _run([blade_bin, "build", "--force"], cwd=NETPEER_DIR, env=env)
+    if not os.path.exists(binary):
+        raise ToolError(f"blade built the network peer and left no {binary}")
+    return binary
+
+
 # The letters-only projection.
 #
 # The kernel and a user process share one serial port with no locking, so the
@@ -17360,6 +17679,16 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
                   f"{arch['name']} board\n{e}", file=sys.stderr)
             return 0, len(cases)
 
+    # The network peer, built once for the cases that boot one.
+    netpeer = None
+    if any(case.get("net") for case in cases):
+        try:
+            netpeer = _netpeer_binary(blade_bin)
+        except ToolError as e:
+            print(f"{CROSS} failed to build the network peer\n{e}",
+                  file=sys.stderr)
+            return 0, len(cases)
+
     # One case = one unit of work: link it, boot it, judge it. A worker
     # returns its verdict and the lines it owns and prints nothing, so the
     # console is written by one thread walking `cases` in order and a parallel
@@ -17402,9 +17731,21 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
         if refusal is not None:
             return (False, f"{CROSS} {name}  (the build succeeded; it must "
                            f"refuse: {refusal})", [])
-        status, out, timed_out = _run_qemu(qemu, arch, elf, case.get("stdin"),
-                                           case.get("stdin_at_once", False))
-        ok, reason = _check(case, arch, status, out, timed_out)
+        if case.get("net"):
+            try:
+                status, out, timed_out, peer = _run_net_qemu(
+                    qemu, arch, elf, case["net"], netpeer)
+            except ToolError as e:
+                return (False, f"{CROSS} {name}  (network start-up)",
+                        [f"    {line}" for line in str(e).splitlines()])
+            ok, reason = _check(case, arch, status, out, timed_out)
+            if ok:
+                ok, reason = _check_peer(case, peer)
+        else:
+            status, out, timed_out = _run_qemu(qemu, arch, elf,
+                                               case.get("stdin"),
+                                               case.get("stdin_at_once", False))
+            ok, reason = _check(case, arch, status, out, timed_out)
         if ok:
             return True, f"{CHECK} {name}", frames
         return False, f"{CROSS} {name}  ({reason})", frames

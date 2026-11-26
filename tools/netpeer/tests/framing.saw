@@ -1,0 +1,104 @@
+// The stream's framing: a four-byte big-endian length, then the frame. The
+// stream hands over bytes in chunks of any size, so a frame arrives whole,
+// split or beside the next one.
+
+import std.data.{Data}
+import netpeer.framing.{Reassembler, length_prefixed, FRAME_MAX}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func bytes(values: Vector<UInt8>) -> Data {
+    var d = Data()
+    var i = 0
+    while i < values.len() {
+        try! d.push(values.get(i) ?? 0)
+        i = i + 1
+    }
+    d
+}
+
+func frame_is(d: &Data, first: UInt8, len: Int) -> Bool {
+    d.len() == len && (d.get(0) ?? 0) == first
+}
+
+func main() {
+    // A frame as the stream carries it.
+    let f = bytes([7, 8, 9])
+    let wire = length_prefixed(&f)
+    check(wire.len() == 7, "four bytes of length and the frame")
+    check((wire.get(3) ?? 0) == 3, "the length, big-endian")
+    check((wire.get(4) ?? 0) == 7, "then the frame")
+
+    // One whole frame.
+    var r = Reassembler()
+    r.add(&wire)
+    let a = try! r.next()
+    check(a != None && frame_is(&(a ?? Data()), 7, 3), "a whole frame")
+    let none = try! r.next()
+    check(none == None, "and nothing after it")
+
+    // Split inside the length, then inside the frame.
+    r.add(&bytes([0, 0]))
+    check(try! r.next() == None, "half a length")
+    r.add(&bytes([0, 2, 5]))
+    check(try! r.next() == None, "a length and part of its frame")
+    r.add(&bytes([6]))
+    let b = try! r.next()
+    check(b != None && frame_is(&(b ?? Data()), 5, 2), "the rest arrives")
+
+    // Two frames and the start of a third in one chunk.
+    var both = Data()
+    try! both.append(length_prefixed(&bytes([1])))
+    try! both.append(length_prefixed(&bytes([2, 2])))
+    try! both.append(bytes([0, 0, 0, 1]))
+    r.add(&both)
+    let one = try! r.next()
+    check(one != None && frame_is(&(one ?? Data()), 1, 1), "the first")
+    let two = try! r.next()
+    check(two != None && frame_is(&(two ?? Data()), 2, 2), "the second")
+    check(try! r.next() == None, "the third is not whole")
+    r.add(&bytes([9]))
+    let three = try! r.next()
+    check(three != None && frame_is(&(three ?? Data()), 9, 1), "the third")
+
+    // An empty frame is a frame.
+    r.add(&bytes([0, 0, 0, 0]))
+    let empty = try! r.next()
+    check(empty != None && (empty ?? bytes([1])).len() == 0, "an empty frame")
+
+    // Part of a length is not a length: its missing bytes are not zeros.
+    var part = Reassembler()
+    part.add(&bytes([1, 0]))
+    check(try! part.next() == None, "half a large length waits")
+
+    // A length past the most the peer reads is an error, not a wait.
+    var big = Reassembler()
+    var header = Data()
+    let over = (FRAME_MAX + 1) as UInt
+    try! header.push(((over >> 24) & 0xFF) as UInt8)
+    try! header.push(((over >> 16) & 0xFF) as UInt8)
+    try! header.push(((over >> 8) & 0xFF) as UInt8)
+    try! header.push((over & 0xFF) as UInt8)
+    big.add(&header)
+    let refused = match big.next() {
+        case Ok(_) -> false,
+        case Err(_) -> true,
+    }
+    check(refused, "a length past FRAME_MAX is refused")
+
+    // The most it reads is taken.
+    var ok = Reassembler()
+    var full = Data()
+    let most = FRAME_MAX as UInt
+    try! full.push(((most >> 24) & 0xFF) as UInt8)
+    try! full.push(((most >> 16) & 0xFF) as UInt8)
+    try! full.push(((most >> 8) & 0xFF) as UInt8)
+    try! full.push((most & 0xFF) as UInt8)
+    ok.add(&full)
+    check(try! ok.next() == None, "FRAME_MAX is a frame to wait for")
+}

@@ -94,6 +94,10 @@ tools/             # sos_runner.py (the harness: packages, cases, QEMU, every
                    # profile) + toolchain.py (the sawlang resolver) +
                    # product.py (a product's commands, run through its
                    # `.sawos` link, and `new`) + sosimg_dump.py
+tools/netpeer/     # the network peer a `net` case boots beside QEMU: a hosted
+                   # Saw package that answers the guest's frames over a
+                   # loopback stream (ARP, ICMP echo, the scripts of
+                   # src/peer.saw), with hosted tests in tests/
 tools/sosimage/    # the image builder, a hosted Saw package Blade builds: it
                    # builds each process's package through a script of the
                    # process's own (its region and flash slot, the runner's
@@ -149,10 +153,10 @@ and image description in the tree read clean) and the hosted packages'
 `drivers/pwmproto/`, `drivers/uartproto/`, `drivers/consolecore/`,
 `drivers/pktring/`, `drivers/netdevproto/`, `drivers/hciproto/`,
 `drivers/wlanproto/`, `drivers/sockproto/`, `drivers/netstack/`,
-`drivers/virtio/` and `rt/common/`, the runtime's heap), which need no
-emulator and print nothing when they pass. Per profile it writes a profile
-description (JSON) and calls `sosimage native`, then `sosimage board` on the
-profile's `hal/<profile>/board.toml`,
+`drivers/virtio/`, `tools/netpeer/` and `rt/common/`, the runtime's heap),
+which need no emulator and print nothing when they pass. Per profile it writes
+a profile description (JSON) and calls `sosimage native`, then `sosimage board`
+on the profile's `hal/<profile>/board.toml`,
 then `sosimage package` once for
 each package and role (root, or child i) the cases give it, which writes the
 process's script (its region, and on the S3 its flash slot, from
@@ -205,6 +209,16 @@ case the images and regions it placed; after the case passes, it fails the
 profile unless the description's ELF is the case's, byte for byte
 (`FROM_FILES`), which holds the rows, the limits and the link the two make
 apart, the images and their placements being shared; a match prints nothing.
+
+A case with a `net` key boots with a network peer (`_run_net_qemu`): the runner
+builds `tools/netpeer` once, starts one peer per case on a loopback port the
+system picks, and starts QEMU paused (`-S`) with QMP on a socketpair it
+passes by descriptor. It resumes the guest only once the netdev reports it is
+connected, so the guest's first frame reaches the peer whatever the host's
+speed. `net` names the peer's script, and `device` (`none` leaves the
+transport empty), `props` and `legacy` for QEMU's `-device`; the case's
+`expect_peer` is the peer's log, line for line. The case table's `net_bus` is
+the virtio-mmio bus QEMU places the device at.
 
 A case may name devices of its board (`devices`), each a device row of its
 table in the case's order, read with `sosimage devices`, and give the build

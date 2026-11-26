@@ -1,0 +1,617 @@
+// The peer's answers, one frame at a time. Every check in src/peer.saw has a
+// frame here that only it refuses, so a check removed or inverted turns a
+// line or a reply in this file wrong. The frames are written by this file's
+// own byte code, not by src/wire.saw.
+
+import std.data.{Data}
+import netpeer.peer.{Peer, Script, Handled}
+
+static GUEST_MAC: UInt = 0x5254_0012_3456
+static PEER_MAC: UInt = 0x5255_0A00_0202
+static BROADCAST: UInt = 0xFFFF_FFFF_FFFF
+static GUEST_IP: UInt = 0x0A00_020F
+static PEER_IP: UInt = 0x0A00_0202
+
+static ARP: UInt = 0x0806
+static IPV4: UInt = 0x0800
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+// ---- bytes -----------------------------------------------------------------
+
+func put(d: &var Data, v: UInt, bytes: Int) {
+    var shift = (bytes - 1) * 8
+    while shift >= 0 {
+        try! d.push(((v >> shift) & 0xFF) as UInt8)
+        shift = shift - 8
+    }
+}
+
+func put_text(d: &var Data, text: String) {
+    var i = 0
+    while i < text.len() {
+        put(&var d, text.byte_at(i) as UInt, 1)
+        i = i + 1
+    }
+}
+
+func at(d: &Data, off: Int, bytes: Int) -> UInt {
+    var v: UInt = 0
+    var i = 0
+    while i < bytes {
+        v = (v << 8) | ((d.get(off + i) ?? 0) as UInt)
+        i = i + 1
+    }
+    v
+}
+
+/// The Internet checksum of `len` bytes at `off`, written out from the
+/// definition: the complement of the folded sum.
+func inet(d: &Data, off: Int, len: Int, seed: UInt) -> UInt {
+    var sum = seed
+    var i = 0
+    while i < len {
+        let hi = (d.get(off + i) ?? 0) as UInt
+        let lo = if i + 1 < len { (d.get(off + i + 1) ?? 0) as UInt } else { 0 }
+        sum = sum + ((hi << 8) | lo)
+        i = i + 2
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16)
+    }
+    0xFFFF - sum
+}
+
+func ether(d: &var Data, dst: UInt, src: UInt, kind: UInt) {
+    put(&var d, dst, 6)
+    put(&var d, src, 6)
+    put(&var d, kind, 2)
+}
+
+// ---- ARP -------------------------------------------------------------------
+
+struct ArpSpec {
+    dst: UInt,
+    htype: UInt,
+    ptype: UInt,
+    hlen: UInt,
+    plen: UInt,
+    op: UInt,
+    sip: UInt,
+    tip: UInt,
+    pad_to: Int,
+}
+
+extension ArpSpec {
+    static func request(tip: UInt) -> ArpSpec {
+        ArpSpec(dst: BROADCAST, htype: 1, ptype: IPV4, hlen: 6, plen: 4, op: 1,
+                sip: GUEST_IP, tip: tip, pad_to: 60)
+    }
+
+    func frame(&self) -> Data {
+        var d = Data()
+        ether(&var d, self.dst, GUEST_MAC, ARP)
+        put(&var d, self.htype, 2)
+        put(&var d, self.ptype, 2)
+        put(&var d, self.hlen, 1)
+        put(&var d, self.plen, 1)
+        put(&var d, self.op, 2)
+        put(&var d, GUEST_MAC, 6)
+        put(&var d, self.sip, 4)
+        put(&var d, 0, 6)
+        put(&var d, self.tip, 4)
+        while d.len() < self.pad_to {
+            put(&var d, 0, 1)
+        }
+        d
+    }
+}
+
+// ---- IPv4 ------------------------------------------------------------------
+
+struct IpSpec {
+    dst_mac: UInt,
+    vihl: UInt,
+    length_delta: Int,
+    flags: UInt,
+    break_sum: Bool,
+    src: UInt,
+    dst: UInt,
+    proto: UInt,
+}
+
+extension IpSpec {
+    static func to_peer(proto: UInt) -> IpSpec {
+        IpSpec(dst_mac: PEER_MAC, vihl: 0x45, length_delta: 0, flags: 0x4000,
+               break_sum: false, src: GUEST_IP, dst: PEER_IP, proto: proto)
+    }
+
+    func frame(&self, payload: &Data) -> Data {
+        let total = ((20 + payload.len()) as Int + self.length_delta) as UInt
+        var header = Data()
+        put(&var header, self.vihl, 1)
+        put(&var header, 0, 1)
+        put(&var header, total, 2)
+        put(&var header, 0, 2)
+        put(&var header, self.flags, 2)
+        put(&var header, 64, 1)
+        put(&var header, self.proto, 1)
+        put(&var header, 0, 2)
+        put(&var header, self.src, 4)
+        put(&var header, self.dst, 4)
+        var sum = inet(&header, 0, 20, 0)
+        if self.break_sum {
+            sum = sum ^ 0x0100
+        }
+        var d = Data()
+        ether(&var d, self.dst_mac, GUEST_MAC, IPV4)
+        var i = 0
+        while i < 20 {
+            if i == 10 {
+                put(&var d, sum, 2)
+                i = i + 2
+            } else {
+                put(&var d, (header.get(i) ?? 0) as UInt, 1)
+                i = i + 1
+            }
+        }
+        i = 0
+        while i < payload.len() {
+            put(&var d, (payload.get(i) ?? 0) as UInt, 1)
+            i = i + 1
+        }
+        while d.len() < 60 {
+            put(&var d, 0, 1)
+        }
+        d
+    }
+}
+
+/// An ICMP message of `kind`, `code`, `id` and `seq` with `data` bytes of
+/// 0, 1, 2, ..., its checksum broken when `break_sum`.
+func icmp(kind: UInt, code: UInt, id: UInt, seq: UInt, data: Int,
+          break_sum: Bool) -> Data {
+    var m = Data()
+    put(&var m, kind, 1)
+    put(&var m, code, 1)
+    put(&var m, 0, 2)
+    put(&var m, id, 2)
+    put(&var m, seq, 2)
+    var i = 0
+    while i < data {
+        put(&var m, (i as UInt) & 0xFF, 1)
+        i = i + 1
+    }
+    var sum = inet(&m, 0, m.len(), 0)
+    if break_sum {
+        sum = sum ^ 0x0100
+    }
+    var out = Data()
+    put(&var out, kind, 1)
+    put(&var out, code, 1)
+    put(&var out, sum, 2)
+    i = 4
+    while i < m.len() {
+        put(&var out, (m.get(i) ?? 0) as UInt, 1)
+        i = i + 1
+    }
+    out
+}
+
+/// A UDP datagram from `sport` to `dport` carrying `text`. `length_delta`
+/// moves the length field off the truth; `sum` is 0 (none), 1 (correct) or 2
+/// (broken).
+func udp(sport: UInt, dport: UInt, text: String, length_delta: Int,
+         sum: Int) -> Data {
+    let length = ((8 + text.len()) as Int + length_delta) as UInt
+    var u = Data()
+    put(&var u, sport, 2)
+    put(&var u, dport, 2)
+    put(&var u, length, 2)
+    put(&var u, 0, 2)
+    put_text(&var u, text)
+    var field: UInt = 0
+    if sum != 0 {
+        let seed = (GUEST_IP >> 16) + (GUEST_IP & 0xFFFF) + (PEER_IP >> 16) +
+                   (PEER_IP & 0xFFFF) + 17 + ((8 + text.len()) as UInt)
+        field = inet(&u, 0, u.len(), seed)
+        if field == 0 {
+            field = 0xFFFF
+        }
+        if sum == 2 {
+            field = field ^ 0x0100
+        }
+    }
+    var out = Data()
+    put(&var out, sport, 2)
+    put(&var out, dport, 2)
+    put(&var out, length, 2)
+    put(&var out, field, 2)
+    put_text(&var out, text)
+    out
+}
+
+// ---- what the peer did -----------------------------------------------------
+
+func run(script: Script, frame: &Data) -> Handled {
+    var peer = Peer(script: script)
+    peer.handle(&frame)
+}
+
+func lines_are(h: &Handled, want: &Vector<String>, what: String) {
+    check(h.lines.len() == want.len(), "{what}: {h.lines.len()} lines")
+    var i = 0
+    while i < want.len() {
+        let got = h.lines.get(i) ?? ""
+        let expected = want.get(i) ?? ""
+        if not got.equals(expected) {
+            print("got:  {got}\nwant: {expected}")
+        }
+        check(got.equals(expected), "{what}: line {i}")
+        i = i + 1
+    }
+}
+
+func one(a: String) -> Vector<String> {
+    var v = Vector<String>()
+    try! v.push(a)
+    move v
+}
+
+func arp_line() -> String {
+    let who = "10.0.2.15 at 52:54:00:12:34:56"
+    "peer: arp request for 10.0.2.2 from {who}, answered"
+}
+
+func known(name: String) -> Bool {
+    match Script.named(name) {
+        case Some(_) -> true,
+        case None -> false,
+    }
+}
+
+/// The peer logged `line` alone and sent nothing.
+func refused(script: Script, frame: &Data, line: String, what: String) {
+    let h = run(script, &frame)
+    lines_are(&h, &one("peer: unexpected: {line}"), what)
+    check(h.replies.len() == 0, "{what}: nothing sent")
+}
+
+func arp_tests() {
+    // A request for the peer is answered, and logged.
+    let ask = ArpSpec.request(PEER_IP).frame()
+    let h = run(Script.Ping, &ask)
+    lines_are(&h, &one(arp_line()), "arp answered")
+    check(h.replies.len() == 1, "one ARP reply")
+    let r = h.replies.get(0) ?? Data()
+    check(r.len() == 60, "the reply is a whole minimum frame")
+    check(at(&r, 0, 6) == GUEST_MAC, "to the asker")
+    check(at(&r, 6, 6) == PEER_MAC, "from the peer")
+    check(at(&r, 12, 2) == ARP, "an ARP frame")
+    check(at(&r, 14, 8) == 0x0001_0800_0604_0002, "Ethernet, IPv4, a reply")
+    check(at(&r, 22, 6) == PEER_MAC, "the peer's address")
+    check(at(&r, 28, 4) == PEER_IP, "at the peer's IP")
+    check(at(&r, 32, 6) == GUEST_MAC, "to the asker's address")
+    check(at(&r, 38, 4) == GUEST_IP, "and IP")
+
+    // A request sent to the peer's own address is answered too.
+    var direct = ArpSpec.request(PEER_IP)
+    direct.dst = PEER_MAC
+    let d = direct.frame()
+    check(run(Script.Ping, &d).replies.len() == 1, "unicast request answered")
+
+    // The same request, for every script that answers.
+    check(run(Script.Burst, &ask).replies.len() == 1, "burst answers ARP")
+    check(run(Script.Log, &ask).replies.len() == 1, "log answers ARP")
+    check(run(Script.Silent, &ask).replies.len() == 0, "silent answers nothing")
+
+    // An announcement is logged and not answered.
+    let announce = ArpSpec.request(GUEST_IP).frame()
+    let a = run(Script.Ping, &announce)
+    lines_are(&a, &one("peer: arp announce 10.0.2.15 at 52:54:00:12:34:56"),
+              "announce")
+    check(a.replies.len() == 0, "an announcement is not answered")
+
+    // The refusals, each by one check.
+    let other = ArpSpec.request(0x0A00_0203).frame()
+    refused(Script.Ping, &other, "an ARP request for 10.0.2.3", "other target")
+    var short = ArpSpec.request(PEER_IP)
+    short.pad_to = 0
+    let s = short.frame()
+    let cut = trimmed(&s, 41)
+    refused(Script.Ping, &cut, "an ARP frame of 41 bytes", "short ARP")
+    var htype = ArpSpec.request(PEER_IP)
+    htype.htype = 6
+    let ht = htype.frame()
+    refused(Script.Ping, &ht, "an ARP packet that is not Ethernet and IPv4",
+            "hardware type")
+    var ptype = ArpSpec.request(PEER_IP)
+    ptype.ptype = 0x86DD
+    let pt = ptype.frame()
+    refused(Script.Ping, &pt, "an ARP packet that is not Ethernet and IPv4",
+            "protocol type")
+    var hlen = ArpSpec.request(PEER_IP)
+    hlen.hlen = 8
+    let hl = hlen.frame()
+    refused(Script.Ping, &hl, "an ARP packet that is not Ethernet and IPv4",
+            "hardware length")
+    var plen = ArpSpec.request(PEER_IP)
+    plen.plen = 16
+    let pl = plen.frame()
+    refused(Script.Ping, &pl, "an ARP packet that is not Ethernet and IPv4",
+            "protocol length")
+    var reply = ArpSpec.request(PEER_IP)
+    reply.op = 2
+    let rp = reply.frame()
+    refused(Script.Ping, &rp, "an ARP operation 2", "operation")
+    var elsewhere = ArpSpec.request(PEER_IP)
+    elsewhere.dst = 0x5255_0A00_0203
+    let el = elsewhere.frame()
+    refused(Script.Ping, &el, "an ARP request to 52:55:0a:00:02:03",
+            "destination")
+}
+
+/// The first `n` bytes of `d`.
+func trimmed(d: &Data, n: Int) -> Data {
+    var out = Data()
+    var i = 0
+    while i < n {
+        put(&var out, (d.get(i) ?? 0) as UInt, 1)
+        i = i + 1
+    }
+    out
+}
+
+func echo_tests() {
+    let m = icmp(8, 0, 0x1234, 7, 56, false)
+    let f = IpSpec.to_peer(1).frame(&m)
+    let h = run(Script.Ping, &f)
+    let echoed = "peer: echo request 7 from 10.0.2.15, 56 bytes, answered"
+    lines_are(&h, &one(echoed), "echo")
+    check(h.replies.len() == 1, "one echo reply")
+    let r = h.replies.get(0) ?? Data()
+    check(r.len() == 14 + 20 + 8 + 56, "the reply's length")
+    check(at(&r, 0, 6) == GUEST_MAC, "to the sender")
+    check(at(&r, 6, 6) == PEER_MAC, "from the peer")
+    check(at(&r, 12, 2) == IPV4, "an IPv4 frame")
+    check(at(&r, 14, 2) == 0x4500, "version, header length, type of service")
+    check(at(&r, 16, 2) == 20 + 8 + 56, "total length")
+    check(at(&r, 20, 2) == 0x4000, "don't fragment")
+    check(at(&r, 22, 1) == 64, "time to live")
+    check(at(&r, 23, 1) == 1, "ICMP")
+    check(inet(&r, 14, 20, 0) == 0, "a good header checksum")
+    check(at(&r, 26, 4) == PEER_IP, "from the peer's IP")
+    check(at(&r, 30, 4) == GUEST_IP, "to the sender's IP")
+    check(at(&r, 34, 2) == 0, "an echo reply, code 0")
+    check(inet(&r, 34, 64, 0) == 0, "a good ICMP checksum")
+    check(at(&r, 38, 2) == 0x1234, "the identifier")
+    check(at(&r, 40, 2) == 7, "the sequence")
+    var i = 0
+    while i < 56 {
+        check(at(&r, 42 + i, 1) == (i as UInt), "data byte {i}")
+        i = i + 1
+    }
+
+    // An odd-length body sums with its last byte padded.
+    let odd = icmp(8, 0, 1, 2, 5, false)
+    let of = IpSpec.to_peer(1).frame(&odd)
+    let oh = run(Script.Ping, &of)
+    check(oh.replies.len() == 1, "an odd-length echo is answered")
+    let or = oh.replies.get(0) ?? Data()
+    check(inet(&or, 34, 13, 0) == 0, "its checksum is good")
+
+    check(run(Script.Burst, &f).replies.len() == 1, "burst answers echo")
+    check(run(Script.Log, &f).replies.len() == 1, "log answers echo")
+    check(run(Script.Silent, &f).replies.len() == 0, "silent answers nothing")
+
+    let bad = icmp(8, 0, 1, 1, 56, true)
+    let bf = IpSpec.to_peer(1).frame(&bad)
+    refused(Script.Ping, &bf, "an ICMP checksum", "ICMP checksum")
+    let reply = icmp(0, 0, 1, 1, 56, false)
+    let rf = IpSpec.to_peer(1).frame(&reply)
+    refused(Script.Ping, &rf, "ICMP type 0 code 0", "ICMP type")
+    let code = icmp(8, 1, 1, 1, 56, false)
+    let cf = IpSpec.to_peer(1).frame(&code)
+    refused(Script.Ping, &cf, "ICMP type 8 code 1", "ICMP code")
+    var tiny = Data()
+    put(&var tiny, 0x0800, 2)
+    put(&var tiny, 0, 4)
+    let tf = IpSpec.to_peer(1).frame(&tiny)
+    refused(Script.Ping, &tf, "an ICMP message of 6 bytes", "short ICMP")
+}
+
+func ip_tests() {
+    let m = icmp(8, 0, 1, 1, 56, false)
+    var spec = IpSpec.to_peer(1)
+    spec.dst_mac = GUEST_MAC
+    let wrong_mac = spec.frame(&m)
+    refused(Script.Ping, &wrong_mac, "an IPv4 frame to 52:54:00:12:34:56",
+            "destination MAC")
+    spec = IpSpec.to_peer(1)
+    spec.vihl = 0x46
+    let version = spec.frame(&m)
+    refused(Script.Ping, &version,
+            "an IPv4 version and header length byte 70", "header length")
+    spec = IpSpec.to_peer(1)
+    spec.length_delta = 100
+    let long = spec.frame(&m)
+    refused(Script.Ping, &long, "an IPv4 length 184 in a frame of 98 bytes",
+            "length past the frame")
+    spec = IpSpec.to_peer(1)
+    spec.length_delta = -70
+    let small = spec.frame(&m)
+    refused(Script.Ping, &small, "an IPv4 length 14 in a frame of 98 bytes",
+            "length under the header")
+    spec = IpSpec.to_peer(1)
+    spec.break_sum = true
+    let sum = spec.frame(&m)
+    refused(Script.Ping, &sum, "an IPv4 header checksum", "header checksum")
+    spec = IpSpec.to_peer(1)
+    spec.flags = 0x2000
+    let more = spec.frame(&m)
+    refused(Script.Ping, &more, "a fragmented IPv4 packet", "more fragments")
+    spec = IpSpec.to_peer(1)
+    spec.flags = 0x0001
+    let offset = spec.frame(&m)
+    refused(Script.Ping, &offset, "a fragmented IPv4 packet", "fragment offset")
+    spec = IpSpec.to_peer(1)
+    spec.dst = 0x0A00_0203
+    let elsewhere = spec.frame(&m)
+    refused(Script.Ping, &elsewhere, "an IPv4 packet to 10.0.2.3", "address")
+    spec = IpSpec.to_peer(6)
+    let tcp = spec.frame(&m)
+    refused(Script.Ping, &tcp, "IPv4 protocol 6", "protocol")
+
+    // A short IPv4 frame, and another ethertype.
+    var d = Data()
+    ether(&var d, PEER_MAC, GUEST_MAC, IPV4)
+    put(&var d, 0x45, 1)
+    refused(Script.Ping, &d, "an IPv4 frame of 15 bytes", "short IPv4")
+    var v6 = Data()
+    ether(&var v6, PEER_MAC, GUEST_MAC, 0x86DD)
+    refused(Script.Ping, &v6, "ethertype 34525", "ethertype")
+    var runt = Data()
+    put(&var runt, 0, 6)
+    put(&var runt, 0, 6)
+    put(&var runt, 0, 1)
+    refused(Script.Ping, &runt,
+            "a frame of 13 bytes, under an Ethernet header", "runt")
+}
+
+func udp_tests() {
+    let ask = udp(4000, 7, "burst 3", 0, 1)
+    let f = IpSpec.to_peer(17).frame(&ask)
+
+    // A burst is N datagrams from port 7 to the sender's port.
+    let h = run(Script.Burst, &f)
+    lines_are(&h, &one("peer: burst of 3 to 10.0.2.15:4000"), "burst")
+    check(h.replies.len() == 3, "three datagrams")
+    var k = 0
+    while k < 3 {
+        let r = h.replies.get(k) ?? Data()
+        let text = "frame {k + 1} of 3"
+        check(r.len() == 60, "padded to the minimum")
+        check(at(&r, 0, 6) == GUEST_MAC, "to the sender")
+        check(at(&r, 12, 2) == IPV4, "IPv4")
+        check(at(&r, 23, 1) == 17, "UDP")
+        check(inet(&r, 14, 20, 0) == 0, "a good header checksum")
+        check(at(&r, 26, 4) == PEER_IP, "from the peer")
+        check(at(&r, 30, 4) == GUEST_IP, "to the sender")
+        check(at(&r, 34, 2) == 7, "from port 7")
+        check(at(&r, 36, 2) == 4000, "to the sender's port")
+        let length = (8 + text.len()) as UInt
+        check(at(&r, 38, 2) == length, "the datagram's length")
+        let seed = (PEER_IP >> 16) + (PEER_IP & 0xFFFF) + (GUEST_IP >> 16) +
+                   (GUEST_IP & 0xFFFF) + 17 + ((8 + text.len()) as UInt)
+        check(inet(&r, 34, 8 + text.len(), seed) == 0, "a good UDP checksum")
+        var i = 0
+        while i < text.len() {
+            check(at(&r, 42 + i, 1) == (text.byte_at(i) as UInt),
+                  "payload byte {i} of datagram {k}")
+            i = i + 1
+        }
+        k = k + 1
+    }
+
+    // The most it may ask for, and one more.
+    let most = udp(4000, 7, "burst 64", 0, 1)
+    let mf = IpSpec.to_peer(17).frame(&most)
+    check(run(Script.Burst, &mf).replies.len() == 64, "the most")
+    let over = udp(4000, 7, "burst 65", 0, 1)
+    let of = IpSpec.to_peer(17).frame(&over)
+    refused(Script.Burst, &of, "a UDP payload that is not `burst N`", "over")
+
+    // A datagram with no checksum is taken.
+    let bare = udp(4000, 7, "burst 1", 0, 0)
+    let bf = IpSpec.to_peer(17).frame(&bare)
+    check(run(Script.Burst, &bf).replies.len() == 1, "no checksum")
+
+    // The scripts that do not burst log it as what it is.
+    refused(Script.Ping, &f, "a UDP datagram to port 7", "ping does not burst")
+
+    // The refusals.
+    let broken = udp(4000, 7, "burst 3", 0, 2)
+    let brf = IpSpec.to_peer(17).frame(&broken)
+    refused(Script.Burst, &brf, "a UDP checksum", "UDP checksum")
+    let longer = udp(4000, 7, "burst 3", 4, 1)
+    let lf = IpSpec.to_peer(17).frame(&longer)
+    refused(Script.Burst, &lf, "a UDP length 19 in 15 bytes",
+            "UDP length")
+    let port = udp(4000, 9, "burst 3", 0, 1)
+    let pf = IpSpec.to_peer(17).frame(&port)
+    refused(Script.Burst, &pf, "a UDP datagram to port 9", "port")
+    let word = udp(4000, 7, "bursts 3", 0, 1)
+    let wf = IpSpec.to_peer(17).frame(&word)
+    refused(Script.Burst, &wf, "a UDP payload that is not `burst N`", "prefix")
+    let letter = udp(4000, 7, "xurst 3", 0, 1)
+    let lf2 = IpSpec.to_peer(17).frame(&letter)
+    refused(Script.Burst, &lf2, "a UDP payload that is not `burst N`",
+            "first letter")
+    let colon = udp(4000, 7, "burst 1:", 0, 1)
+    let cf2 = IpSpec.to_peer(17).frame(&colon)
+    refused(Script.Burst, &cf2, "a UDP payload that is not `burst N`",
+            "a character past 9")
+    let digit = udp(4000, 7, "burst 3x", 0, 1)
+    let df = IpSpec.to_peer(17).frame(&digit)
+    refused(Script.Burst, &df, "a UDP payload that is not `burst N`", "digit")
+    let zero = udp(4000, 7, "burst 0", 0, 1)
+    let zf = IpSpec.to_peer(17).frame(&zero)
+    refused(Script.Burst, &zf, "a UDP payload that is not `burst N`", "zero")
+    let empty = udp(4000, 7, "burst ", 0, 1)
+    let ef = IpSpec.to_peer(17).frame(&empty)
+    refused(Script.Burst, &ef, "a UDP payload that is not `burst N`",
+            "no count")
+    var tiny = Data()
+    put(&var tiny, 0, 6)
+    let tf = IpSpec.to_peer(17).frame(&tiny)
+    refused(Script.Burst, &tf, "a UDP datagram of 6 bytes", "short UDP")
+}
+
+func script_tests() {
+    // `log` and `silent` say each frame's length first; `ping` and `burst`
+    // do not.
+    let ask = ArpSpec.request(PEER_IP).frame()
+    var want = Vector<String>()
+    try! want.push("peer: frame 60 bytes")
+    try! want.push(arp_line())
+    let logged = run(Script.Log, &ask)
+    lines_are(&logged, &want, "log")
+    let quiet = run(Script.Silent, &ask)
+    lines_are(&quiet, &one("peer: frame 60 bytes"), "silent")
+    check(run(Script.Ping, &ask).lines.len() == 1, "ping logs the row only")
+    check(run(Script.Burst, &ask).lines.len() == 1, "burst logs the row only")
+
+    // Log names what it does not answer, after the length.
+    let m = icmp(8, 0, 1, 1, 56, true)
+    let bf = IpSpec.to_peer(1).frame(&m)
+    var two = Vector<String>()
+    try! two.push("peer: frame 98 bytes")
+    try! two.push("peer: unexpected: an ICMP checksum")
+    let both = run(Script.Log, &bf)
+    lines_are(&both, &two, "log, then the refusal")
+
+    // The count is every frame handed to it.
+    var peer = Peer(script: Script.Ping)
+    let _ = peer.handle(&ask)
+    let _ = peer.handle(&bf)
+    check(peer.count() == 2, "two frames")
+
+    check(known("ping"), "ping")
+    check(known("burst"), "burst")
+    check(known("log"), "log")
+    check(known("silent"), "silent")
+    check(not known("loud"), "no other")
+}
+
+func main() {
+    arp_tests()
+    echo_tests()
+    ip_tests()
+    udp_tests()
+    script_tests()
+}

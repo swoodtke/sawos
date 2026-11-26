@@ -1,0 +1,103 @@
+//! Byte-level reading and writing of frames: big-endian words, addresses as
+//! text, and the Internet checksum.
+//!
+//! A frame is a `Data`. A reader is bounded by its caller, which checks the
+//! frame's length before it reads a field; a read past the end answers 0
+//! here, which no caller reaches.
+
+import std.data.{Data}
+
+/// The byte at `off`, or 0 past the end.
+public func byte_at(d: &Data, off: Int) -> UInt {
+    (d.get(off) ?? 0) as UInt
+}
+
+public func be16(d: &Data, off: Int) -> UInt {
+    (byte_at(&d, off) << 8) | byte_at(&d, off + 1)
+}
+
+public func be32(d: &Data, off: Int) -> UInt {
+    (be16(&d, off) << 16) | be16(&d, off + 2)
+}
+
+public func put8(out: &var Data, v: UInt) {
+    try! out.push((v & 0xFF) as UInt8)
+}
+
+public func put16(out: &var Data, v: UInt) {
+    put8(&var out, v >> 8)
+    put8(&var out, v)
+}
+
+public func put32(out: &var Data, v: UInt) {
+    put16(&var out, v >> 16)
+    put16(&var out, v)
+}
+
+/// `len` bytes of `d` from `off`, appended to `out`.
+public func put_from(out: &var Data, d: &Data, off: Int, len: Int) {
+    var i = 0
+    while i < len {
+        put8(&var out, byte_at(&d, off + i))
+        i = i + 1
+    }
+}
+
+/// A MAC address as the six bytes of `d` at `off`, packed into the low 48 bits
+/// of a word.
+public func mac_at(d: &Data, off: Int) -> UInt {
+    (be16(&d, off) << 32) | be32(&d, off + 2)
+}
+
+public func put_mac(out: &var Data, mac: UInt) {
+    put16(&var out, mac >> 32)
+    put32(&var out, mac)
+}
+
+/// The ones-complement sum of the 16-bit words of `len` bytes of `d` from
+/// `off`, folded to 16 bits, an odd last byte padded with a zero. A header
+/// whose checksum field is included sums to 0xFFFF when the checksum is good.
+public func sum16(d: &Data, off: Int, len: Int) -> UInt {
+    var sum: UInt = 0
+    var i = 0
+    while i + 1 < len {
+        sum = sum + be16(&d, off + i)
+        i = i + 2
+    }
+    if i < len {
+        sum = sum + (byte_at(&d, off + i) << 8)
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16)
+    }
+    sum
+}
+
+/// The checksum field to write over bytes whose checksum field reads zero.
+public func checksum(d: &Data, off: Int, len: Int) -> UInt {
+    0xFFFF - sum16(&d, off, len)
+}
+
+/// Lowercase hexadecimal of one byte, two digits.
+public func hex_byte(v: UInt) -> String {
+    let digits = "0123456789abcdef"
+    let hi = ((v >> 4) & 0xF) as Int
+    let lo = (v & 0xF) as Int
+    "{digits.substring(hi, hi + 1)}{digits.substring(lo, lo + 1)}"
+}
+
+/// `52:54:00:12:34:56`.
+public func mac_text(mac: UInt) -> String {
+    var out = hex_byte(mac >> 40)
+    var shift = 32
+    while shift >= 0 {
+        out = "{out}:{hex_byte(mac >> (shift as UInt))}"
+        shift = shift - 8
+    }
+    out
+}
+
+/// `10.0.2.15`.
+public func ip_text(ip: UInt) -> String {
+    "{(ip >> 24) & 0xFF}.{(ip >> 16) & 0xFF}.{(ip >> 8) & 0xFF}.{ip & 0xFF}"
+}

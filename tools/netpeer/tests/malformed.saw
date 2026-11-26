@@ -1,0 +1,390 @@
+// Reviewer's probe: malformed guest frames. Every frame here must be refused
+// or ignored by a line, never panic. Each valid frame is cut at every length
+// and has every byte replaced, under every script; then named frames check
+// the line each refusal gives.
+
+import std.data.{Data}
+import netpeer.peer.{Peer, Script, Handled}
+import netpeer.framing.{Reassembler, FRAME_MAX}
+import netpeer.wire.{sum16}
+
+static GUEST_MAC: UInt = 0x5254_0012_3456
+static PEER_MAC: UInt = 0x5255_0A00_0202
+static BROADCAST: UInt = 0xFFFF_FFFF_FFFF
+static GUEST_IP: UInt = 0x0A00_020F
+static PEER_IP: UInt = 0x0A00_0202
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func put(d: &var Data, v: UInt, bytes: Int) {
+    var shift = (bytes - 1) * 8
+    while shift >= 0 {
+        try! d.push(((v >> shift) & 0xFF) as UInt8)
+        shift = shift - 8
+    }
+}
+
+func put_text(d: &var Data, text: String) {
+    var i = 0
+    while i < text.len() {
+        put(&var d, text.byte_at(i) as UInt, 1)
+        i = i + 1
+    }
+}
+
+func inet(d: &Data, off: Int, len: Int, seed: UInt) -> UInt {
+    var sum = seed
+    var i = 0
+    while i < len {
+        let hi = (d.get(off + i) ?? 0) as UInt
+        let lo = if i + 1 < len { (d.get(off + i + 1) ?? 0) as UInt } else { 0 }
+        sum = sum + ((hi << 8) | lo)
+        i = i + 2
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16)
+    }
+    0xFFFF - sum
+}
+
+func ether(d: &var Data, dst: UInt, kind: UInt) {
+    put(&var d, dst, 6)
+    put(&var d, GUEST_MAC, 6)
+    put(&var d, kind, 2)
+}
+
+func arp_request() -> Data {
+    var d = Data()
+    ether(&var d, BROADCAST, 0x0806)
+    put(&var d, 1, 2)
+    put(&var d, 0x0800, 2)
+    put(&var d, 6, 1)
+    put(&var d, 4, 1)
+    put(&var d, 1, 2)
+    put(&var d, GUEST_MAC, 6)
+    put(&var d, GUEST_IP, 4)
+    put(&var d, 0, 6)
+    put(&var d, PEER_IP, 4)
+    d
+}
+
+/// An IPv4 frame to the peer carrying `payload`, its total length field
+/// `total` (the true one when negative), unpadded.
+func ipv4(proto: UInt, payload: &Data, total: Int, vihl: UInt) -> Data {
+    let length = if total < 0 { 20 + payload.len() } else { total }
+    var header = Data()
+    put(&var header, vihl, 1)
+    put(&var header, 0, 1)
+    put(&var header, length as UInt, 2)
+    put(&var header, 0, 2)
+    put(&var header, 0x4000, 2)
+    put(&var header, 64, 1)
+    put(&var header, proto, 1)
+    put(&var header, 0, 2)
+    put(&var header, GUEST_IP, 4)
+    put(&var header, PEER_IP, 4)
+    let sum = inet(&header, 0, 20, 0)
+    var d = Data()
+    ether(&var d, PEER_MAC, 0x0800)
+    var i = 0
+    while i < 20 {
+        if i == 10 {
+            put(&var d, sum, 2)
+            i = i + 2
+        } else {
+            put(&var d, (header.get(i) ?? 0) as UInt, 1)
+            i = i + 1
+        }
+    }
+    i = 0
+    while i < payload.len() {
+        put(&var d, (payload.get(i) ?? 0) as UInt, 1)
+        i = i + 1
+    }
+    d
+}
+
+func echo(data: Int) -> Data {
+    var m = Data()
+    put(&var m, 8, 1)
+    put(&var m, 0, 1)
+    put(&var m, 0, 2)
+    put(&var m, 0x1234, 2)
+    put(&var m, 1, 2)
+    var i = 0
+    while i < data {
+        put(&var m, (i as UInt) & 0xFF, 1)
+        i = i + 1
+    }
+    let sum = inet(&m, 0, m.len(), 0)
+    var out = Data()
+    put(&var out, 8, 1)
+    put(&var out, 0, 1)
+    put(&var out, sum, 2)
+    i = 4
+    while i < m.len() {
+        put(&var out, (m.get(i) ?? 0) as UInt, 1)
+        i = i + 1
+    }
+    out
+}
+
+/// A UDP datagram to port 7 with `length` in its length field (the true one
+/// when negative) and no checksum.
+func udp(text: String, length: Int) -> Data {
+    let field = if length < 0 { 8 + text.len() } else { length }
+    var u = Data()
+    put(&var u, 4000, 2)
+    put(&var u, 7, 2)
+    put(&var u, field as UInt, 2)
+    put(&var u, 0, 2)
+    put_text(&var u, text)
+    u
+}
+
+func cut(d: &Data, n: Int) -> Data {
+    var out = Data()
+    var i = 0
+    while i < n {
+        put(&var out, (d.get(i) ?? 0) as UInt, 1)
+        i = i + 1
+    }
+    out
+}
+
+func replaced(d: &Data, at: Int, v: UInt) -> Data {
+    var out = Data()
+    var i = 0
+    while i < d.len() {
+        if i == at {
+            put(&var out, v, 1)
+        } else {
+            put(&var out, (d.get(i) ?? 0) as UInt, 1)
+        }
+        i = i + 1
+    }
+    out
+}
+
+func padded(d: &Data, with: UInt, to: Int) -> Data {
+    var out = cut(&d, d.len())
+    while out.len() < to {
+        put(&var out, with, 1)
+    }
+    out
+}
+
+func every_script(frame: &Data) -> Int {
+    var lines = 0
+    var p = Peer(script: Script.Ping)
+    lines = lines + p.handle(&frame).lines.len()
+    var b = Peer(script: Script.Burst)
+    lines = lines + b.handle(&frame).lines.len()
+    var l = Peer(script: Script.Log)
+    lines = lines + l.handle(&frame).lines.len()
+    var s = Peer(script: Script.Silent)
+    lines = lines + s.handle(&frame).lines.len()
+    lines
+}
+
+/// Cut at every length and every byte replaced by four values: no panic,
+/// and every frame gives at least one line under every script.
+func shake(name: String, frame: &Data) {
+    var n = 0
+    while n <= frame.len() {
+        let c = cut(&frame, n)
+        check(every_script(&c) >= 4, "{name} cut to {n}: a line per script")
+        n = n + 1
+    }
+    var at = 0
+    while at < frame.len() {
+        let old = (frame.get(at) ?? 0) as UInt
+        var values = Vector<UInt>()
+        try! values.push(0)
+        try! values.push(0xFF)
+        try! values.push(old ^ 0x01)
+        try! values.push(old ^ 0x80)
+        var k = 0
+        while k < 4 {
+            let m = replaced(&frame, at, values.get(k) ?? 0)
+            check(every_script(&m) >= 4, "{name} byte {at} replaced")
+            k = k + 1
+        }
+        at = at + 1
+    }
+}
+
+func one_line(script: Script, frame: &Data, want: String) {
+    var peer = Peer(script: script)
+    let h = peer.handle(&frame)
+    let got = h.lines.get(0) ?? "(none)"
+    if not got.equals(want) {
+        print("got:  {got}\nwant: {want}")
+    }
+    check(h.lines.len() == 1 && got.equals(want), want)
+    check(h.replies.len() == 0, "{want}: nothing sent")
+}
+
+func named() {
+    let empty = Data()
+    one_line(Script.Ping, &empty,
+             "peer: unexpected: a frame of 0 bytes, under an Ethernet header")
+
+    let m = echo(56)
+    let full = ipv4(1, &m, -1, 0x45)
+    let short_ip = cut(&full, 33)
+    one_line(Script.Ping, &short_ip,
+             "peer: unexpected: an IPv4 frame of 33 bytes")
+
+    let ihl15 = ipv4(1, &m, -1, 0x4F)
+    one_line(Script.Ping, &ihl15,
+             "peer: unexpected: an IPv4 version and header length byte 79")
+    let ihl0 = ipv4(1, &m, -1, 0x40)
+    one_line(Script.Ping, &ihl0,
+             "peer: unexpected: an IPv4 version and header length byte 64")
+
+    let huge_total = ipv4(1, &m, 0xFFFF, 0x45)
+    one_line(Script.Ping, &huge_total,
+             "peer: unexpected: an IPv4 length 65535 in a frame of 98 bytes")
+    let total19 = ipv4(1, &m, 19, 0x45)
+    one_line(Script.Ping, &total19,
+             "peer: unexpected: an IPv4 length 19 in a frame of 98 bytes")
+    let total0 = ipv4(1, &m, 0, 0x45)
+    one_line(Script.Ping, &total0,
+             "peer: unexpected: an IPv4 length 0 in a frame of 98 bytes")
+
+    // A UDP length field past the frame, and under a UDP header.
+    let past = udp("burst 3", 0xFFFF)
+    let pf = ipv4(17, &past, -1, 0x45)
+    one_line(Script.Burst, &pf,
+             "peer: unexpected: a UDP length 65535 in 15 bytes")
+    let under = udp("burst 3", 7)
+    let uf = ipv4(17, &under, -1, 0x45)
+    one_line(Script.Burst, &uf, "peer: unexpected: a UDP length 7 in 15 bytes")
+
+    // An empty UDP payload in an unpadded 42-byte frame: `burst_count` reads
+    // six bytes past the end of the frame.
+    let bare = udp("", -1)
+    let bf = ipv4(17, &bare, -1, 0x45)
+    check(bf.len() == 42, "the bare datagram's frame is 42 bytes")
+    one_line(Script.Burst, &bf,
+             "peer: unexpected: a UDP payload that is not `burst N`")
+
+    // `burst` in the datagram and the rest of the word, and a count, in the
+    // Ethernet padding past the IPv4 packet: never taken.
+    let word = udp("burst", -1)
+    let wf = padded(&ipv4(17, &word, -1, 0x45), 0x20, 60)
+    one_line(Script.Burst, &wf,
+             "peer: unexpected: a UDP payload that is not `burst N`")
+    var tail = ipv4(17, &word, -1, 0x45)
+    put_text(&var tail, " 3")
+    one_line(Script.Burst, &tail,
+             "peer: unexpected: a UDP payload that is not `burst N`")
+
+    // A count with a character below `0`: refused, not subtracted.
+    let space = udp("burst  3", -1)
+    let sf = ipv4(17, &space, -1, 0x45)
+    one_line(Script.Burst, &sf,
+             "peer: unexpected: a UDP payload that is not `burst N`")
+    let slash = udp("burst 3/", -1)
+    let slf = ipv4(17, &slash, -1, 0x45)
+    one_line(Script.Burst, &slf,
+             "peer: unexpected: a UDP payload that is not `burst N`")
+
+    // One byte under each minimum, and a total one byte past the frame.
+    let e8 = echo(0)
+    let e7 = cut(&e8, 7)
+    let e7f = ipv4(1, &e7, -1, 0x45)
+    one_line(Script.Ping, &e7f, "peer: unexpected: an ICMP message of 7 bytes")
+    let u8 = udp("", -1)
+    let u7 = cut(&u8, 7)
+    let u7f = ipv4(17, &u7, -1, 0x45)
+    one_line(Script.Burst, &u7f, "peer: unexpected: a UDP datagram of 7 bytes")
+    let one_past = ipv4(1, &m, 85, 0x45)
+    one_line(Script.Ping, &one_past,
+             "peer: unexpected: an IPv4 length 85 in a frame of 98 bytes")
+
+    // A reply whose computed UDP checksum is zero is sent as 0xFFFF: the
+    // guest's port 63990 makes `frame 1 of 1`'s checksum zero.
+    var z = Data()
+    put(&var z, 63990, 2)
+    put(&var z, 7, 2)
+    put(&var z, 15, 2)
+    put(&var z, 0, 2)
+    put_text(&var z, "burst 1")
+    let zf = ipv4(17, &z, -1, 0x45)
+    var zp = Peer(script: Script.Burst)
+    let zh = zp.handle(&zf)
+    check(zh.replies.len() == 1, "one datagram to port 63990")
+    let zr = zh.replies.get(0) ?? Data()
+    let field = (((zr.get(40) ?? 0) as UInt) << 8) | ((zr.get(41) ?? 0) as UInt)
+    check(field == 0xFFFF, "a zero checksum is sent as 0xFFFF, got {field}")
+
+    // A sum that needs a second fold.
+    var words = Data()
+    put(&var words, 0xFFFF_FFFF_0001, 6)
+    check(sum16(&words, 0, 6) == 1, "two folds: 0x1FFFF is 0x0001")
+
+    // A very long count is refused, not wrapped.
+    let long = udp("burst 99999999999999999999999999", -1)
+    let lf = ipv4(17, &long, -1, 0x45)
+    one_line(Script.Burst, &lf,
+             "peer: unexpected: a UDP payload that is not `burst N`")
+
+    // The largest IPv4 packet: an echo of 65507 bytes of data is answered.
+    let big = echo(65535 - 28)
+    let bigf = ipv4(1, &big, -1, 0x45)
+    var peer = Peer(script: Script.Ping)
+    let h = peer.handle(&bigf)
+    check(h.replies.len() == 1, "the largest echo is answered")
+    check((h.replies.get(0) ?? Data()).len() == 14 + 65535, "whole")
+}
+
+func framing() {
+    // A length of 0xFFFFFFFF is an error, not a wait or a panic.
+    var r = Reassembler()
+    var head = Data()
+    put(&var head, 0xFFFF_FFFF, 4)
+    r.add(&head)
+    let refused = match r.next() {
+        case Ok(_) -> false,
+        case Err(_) -> true,
+    }
+    check(refused, "a length of 2^32 - 1")
+
+    // FRAME_MAX bytes exactly, given a byte at a time at the end.
+    var w = Reassembler()
+    var all = Data()
+    put(&var all, FRAME_MAX as UInt, 4)
+    var i = 0
+    while i < FRAME_MAX - 1 {
+        put(&var all, 0x55, 1)
+        i = i + 1
+    }
+    w.add(&all)
+    check(try! w.next() == None, "one byte short")
+    var last = Data()
+    put(&var last, 0x55, 1)
+    w.add(&last)
+    let got = try! w.next()
+    check((got ?? Data()).len() == FRAME_MAX, "FRAME_MAX bytes are a frame")
+}
+
+func main() {
+    let a = arp_request()
+    shake("arp", &a)
+    let m = echo(56)
+    let e = ipv4(1, &m, -1, 0x45)
+    shake("echo", &e)
+    let u = udp("burst 3", -1)
+    let b = ipv4(17, &u, -1, 0x45)
+    shake("burst", &b)
+    named()
+    framing()
+
+}

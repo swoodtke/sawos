@@ -1,0 +1,128 @@
+//! netpeer: the gate's network peer.
+//!
+//!     netpeer serve --script NAME
+//!         listens on a loopback port the system picks and prints `port N` as
+//!         its first line, accepts the one connection QEMU's `-netdev stream`
+//!         makes, and answers the guest's frames as the script NAME (`ping`,
+//!         `burst`, `log` or `silent`; src/peer.saw) says. It prints a line
+//!         for each thing it saw, and `peer: closed after N frames` when the
+//!         guest's end of the stream closes, then exits 0
+//!
+//! A frame crosses the stream as a four-byte big-endian length and the frame.
+//! The peer sends only what a guest frame caused, so a run does not depend
+//! on any clock. A refusal is a line `error: ...` and a nonzero exit.
+
+import std.data.{Data}
+import std.env.{Env}
+import std.net.{TcpListener, TcpStream, IoErrorKind}
+import netpeer.peer.{Peer, Script}
+import netpeer.framing.{Reassembler, length_prefixed}
+
+/// Why the peer stopped, in words a reader can act on.
+struct Failure {
+    message: String
+}
+
+extension Failure: Error {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.message)
+    }
+}
+
+func usage() -> String {
+    "usage: netpeer serve --script ping|burst|log|silent"
+}
+
+func main() -> Int {
+    try run() catch {
+        print("error: {error}")
+        return 1
+    }
+    0
+}
+
+func run() -> Result<Void, Failure> {
+    let args = try Env.args() catch {
+        return Failure(message: "could not read the arguments: {error}")
+    }
+    if args.len() != 4 || not (args.get(1) ?? "").equals("serve") ||
+       not (args.get(2) ?? "").equals("--script") {
+        return Failure(message: usage())
+    }
+    let name = args.get(3) ?? ""
+    guard let script = Script.named(name) else {
+        return Failure(message: "no script named `{name}`: {usage()}")
+    }
+    try serve(script)
+}
+
+/// Listens, announces the port and serves the one connection to its end.
+func serve(script: Script) -> Result<Void, Failure> {
+    let listener = try TcpListener.listen(port: 0) catch {
+        return Failure(message: "listen: {error}")
+    }
+    let port = try listener.local_port() catch {
+        return Failure(message: "local port: {error}")
+    }
+    print("port {port}")
+    let stream = try listener.accept() catch {
+        return Failure(message: "accept: {error}")
+    }
+    var peer = Peer(script: script)
+    var pending = Reassembler()
+    while true {
+        let chunk = try stream.read() catch {
+            return Failure(message: "read: {error}")
+        }
+        if chunk.is_empty() {
+            break
+        }
+        pending.add(&chunk)
+        while true {
+            let next = try pending.next() catch {
+                return Failure(message: "{error}")
+            }
+            guard let frame = next else { break }
+            let sent = try answer(&stream, &var peer, &frame)
+            if not sent {
+                // The guest has ended and closed its end: nothing was waiting
+                // for this answer.
+                print("peer: closed after {peer.count()} frames")
+                return
+            }
+        }
+    }
+    print("peer: closed after {peer.count()} frames")
+}
+
+/// Logs what `frame` caused and sends the replies; false when the other end
+/// has gone, which is how a guest that has finished looks to a peer answering
+/// its last frame.
+func answer(stream: &TcpStream, peer: &var Peer,
+            frame: &Data) -> Result<Bool, Failure> {
+    let handled = peer.handle(&frame)
+    var i = 0
+    while i < handled.lines.len() {
+        let text = handled.lines.get(i) ?? ""
+        print("{text}")
+        i = i + 1
+    }
+    i = 0
+    while i < handled.replies.len() {
+        let reply = handled.replies.get(i) ?? Data()
+        let wire = length_prefixed(&reply)
+        let wrote = stream.write(wire)
+        match wrote {
+            case Ok(_) -> {},
+            case Err(e) -> {
+                match e.kind() {
+                    case BrokenPipe -> { return false },
+                    case ConnectionReset -> { return false },
+                    case _ -> { return Failure(message: "write: {e}") },
+                }
+            },
+        }
+        i = i + 1
+    }
+    true
+}
