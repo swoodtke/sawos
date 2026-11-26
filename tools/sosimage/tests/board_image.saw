@@ -1,15 +1,16 @@
 // A board image's parts: the chip a board's flash names, and a board with no
 // flash refused; the flash image trimmed to its end, and an end past it
 // refused; the digest `shasum` prints, read from its standard output alone,
-// and output of another shape refused; and the three lines `sosimage flash`
-// prints, for the S3 and for a board whose name and chip are two other
-// words. The test runs in the package's directory, two below the tree's top.
+// and output of another shape refused; the console's rate a key value
+// gives, and an image's; and the lines `sosimage flash` prints, for the S3
+// and for a board whose name and chip are two other words. The test runs in
+// the package's directory, two below the tree's top.
 
 import std.data.{Data}
 import sosimage.board.{Board}
 import sosimage.failure.{BuildError}
-import sosimage.board_image.{board_lines, digest_of, digest_with, flash_chip, flash_lines,
-                             sha256_of, trimmed}
+import sosimage.board_image.{board_lines, console_rate, digest_of, digest_with, flash_chip,
+                             flash_lines, image_console_rate, sha256_of, trimmed}
 import sosimage.tool.{read_text, write_file}
 
 // The SHA-256 of `abc`.
@@ -101,11 +102,38 @@ func main() {
     assert(refusal(sha256_of(".build/no-such-file")).starts_with("command failed"),
            "a file shasum cannot read")
 
-    let lines = flash_lines(abc_sha256(), "/p/b.board.bin", "plank", "oak")
+    let lines = flash_lines(abc_sha256(), "/p/b.board.bin", "plank", "oak", None)
     assert(lines.len() == 3, "three lines")
     expect(lines.get(0)!, "sha256 {abc_sha256()}  /p/b.board.bin")
     expect(lines.get(1)!, "board plank")
     expect(lines.get(2)!, "python3 -m esptool --chip oak --port PORT write-flash 0x0 /p/b.board.bin")
+
+    // A board with a console key states the rate a capture opens.
+    let rated = flash_lines(abc_sha256(), "/p/b.board.bin", "plank", "oak", "921600")
+    assert(rated.len() == 4, "four lines")
+    expect(rated.get(0)!, "sha256 {abc_sha256()}  /p/b.board.bin")
+    expect(rated.get(1)!, "board plank")
+    expect(rated.get(2)!, "console 921600 baud 8N1")
+    expect(rated.get(3)!, "python3 -m esptool --chip oak --port PORT write-flash 0x0 /p/b.board.bin")
+
+    // The rate a value of the console key gives.
+    expect(try! console_rate("rom"), "115200")
+    expect(try! console_rate("b921600"), "921600")
+    expect(try! console_rate("b3000000"), "3000000")
+    expect(refusal(console_rate("b")), "the console key value `b` is neither `rom` nor `b` and a rate")
+    expect(refusal(console_rate("921600")), "the console key value `921600` is neither `rom` nor `b` and a rate")
+    expect(refusal(console_rate("b9x")), "the console key value `b9x` is neither `rom` nor `b` and a rate")
+    // An image's rate: the one its `[keys]` states, the ROM's when it states
+    // none, and none for a board with no console key.
+    var s3_board = board_at("xtensa-esp32s3")
+    let none = "[image]\nname = \"i\"\nboard = \"esp32s3\"\n"
+    assert((try! image_console_rate(&s3_board, none, "i.toml"))! == "115200", "the ROM's rate by default")
+    assert((try! image_console_rate(&s3_board, "{none}[keys]\nclock = \"pll240\"\n", "i.toml"))! == "115200",
+           "the ROM's rate with other keys")
+    assert((try! image_console_rate(&s3_board, "{none}[keys]\nconsole = \"b2000000\"\n", "i.toml"))! == "2000000",
+           "the key's rate")
+    var virt_board = board_at("riscv32")
+    assert((try! image_console_rate(&virt_board, none, "i.toml")) == None, "no rate for a board with no console key")
 
     // A board whose name and chip are two other words: the chip is the
     // board's own, read through, and each line names what it should.
@@ -117,7 +145,7 @@ func main() {
         case Err(e) -> panic("{e.message}")
     }
     assert((try! flash_chip(&other)).equals("oak"), "the other board's chip")
-    let other_lines = try! board_lines(&other, abc_sha256(), "/p/o.board.bin")
+    let other_lines = try! board_lines(&other, abc_sha256(), "/p/o.board.bin", None)
     expect(other_lines.get(1)!, "board plank")
     expect(other_lines.get(2)!, "python3 -m esptool --chip oak --port PORT write-flash 0x0 /p/o.board.bin")
 }

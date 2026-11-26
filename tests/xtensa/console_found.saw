@@ -1,0 +1,99 @@
+// A console key handed the CLK_CONF words a part could read, one at a time:
+// UART0 clocked by APB (SCLK_SEL 1, the emulator's own word), by RC_FAST (2)
+// and by a select no clock answers to (0); and the crystal with a pre-divide,
+// one word for each of SCLK_DIV_NUM [19:12], SCLK_DIV_A [11:6] and
+// SCLK_DIV_B [5:0], whose divisor would not be the key's. The console key
+// refuses each, printing its `not taken` line and writing nothing. Then the
+// ROM's own word, 0x03700000, SCLK_SEL 3 with no pre-divide, which it takes:
+// the drain, the one store to UART_CLKDIV and the line. The words are handed
+// in because the emulator's word at UART0 + 0x78 is a date, not CLK_CONF
+// (ABI.md §14i). Built at each console key that writes.
+//
+// The emulator's UART0 always reads idle, so the drain's two tests are held
+// on a stand-in that lies: `drain`, the kit's loop over `UartState`, is
+// run on a UART whose FIFO reads occupied for a number of polls, and on one
+// whose transmitter reads busy for a number, and each must poll until its
+// lie ends, so each test is read and used. The line gives the polls made of
+// each read, in hex. The real UART's two fields are held on crafted words
+// (`fifo_count_of`, `tx_state_of`): the field alone set, its neighbours
+// alone set, and the field full.
+//
+//   SOS-S3: console KEY not taken: UART0's clock is not the undivided ...
+//   (six of them)
+//   SOS consolefound: drain fifo_busy=0x00000003 tx_busy=0x00000000 ...
+//   SOS consolefound: drain fifo_busy=0x00000000 tx_busy=0x00000004 ...
+//   SOS consolefound: fields fifo=0x...,0x...,0x...,0x... tx=0x...,...
+//   SOS-S3: console KEY clkdiv=0x0030015b->0x... uart_clk=0x03700000
+//   SOS consolefound: the boot goes on
+
+import kcore.{console}
+import hal
+import s3console.{console_init_found}
+import s3consolekit.{UartState, drain, fifo_count_of, tx_state_of}
+
+/// A UART whose FIFO reads occupied for `fifo_busy` polls and whose
+/// transmitter reads busy for `tx_busy`, counting each read.
+struct LyingUart {
+    fifo_busy: UInt32,
+    tx_busy: UInt32,
+    fifo_reads: UInt32,
+    tx_reads: UInt32,
+}
+
+extension LyingUart: UartState {
+    func fifo_count(&var self) unsafe -> UInt32 {
+        self.fifo_reads = self.fifo_reads + 1
+        if self.fifo_reads <= self.fifo_busy { 5 } else { 0 }
+    }
+
+    func tx_state(&var self) unsafe -> UInt32 {
+        self.tx_reads = self.tx_reads + 1
+        if self.tx_reads <= self.tx_busy { 1 } else { 0 }
+    }
+}
+
+func word(name: String, v: UInt32) unsafe {
+    console().write_str(name)
+    console().write_hex(v as UInt)
+}
+
+/// Drain a UART with the given lies and print the polls it took.
+func lie(fifo_busy: UInt32, tx_busy: UInt32) unsafe {
+    var uart = LyingUart(fifo_busy: fifo_busy, tx_busy: tx_busy,
+                         fifo_reads: 0, tx_reads: 0)
+    drain(&var uart)
+    word("SOS consolefound: drain fifo_busy=", fifo_busy)
+    word(" tx_busy=", tx_busy)
+    word(" polls=", uart.fifo_reads)
+    word(",", uart.tx_reads)
+    console().write_str("\n")
+}
+
+/// The two fields decoded from crafted words.
+func fields() unsafe {
+    word("SOS consolefound: fields fifo=", fifo_count_of(0x0005_0000))
+    word(",", fifo_count_of(0x0400_8000))
+    word(",", fifo_count_of(0xFC00_FFFF))
+    word(",", fifo_count_of(0x03FF_0000))
+    word(" tx=", tx_state_of(0x0000_0010))
+    word(",", tx_state_of(0x0000_0108))
+    word(",", tx_state_of(0xFFFF_FF0F))
+    word(",", tx_state_of(0x0000_00F0))
+    console().write_str("\n")
+}
+
+@export("kmain")
+func kmain() unsafe {
+    console_init_found(0x1512_2500)
+    console_init_found(0x0360_0000)
+    console_init_found(0x0340_0000)
+    console_init_found(0x0370_1000)
+    console_init_found(0x0370_0040)
+    console_init_found(0x0370_0001)
+    lie(3, 0)
+    lie(0, 4)
+    fields()
+    console_init_found(0x0370_0000)
+    console().write_str("SOS consolefound: the boot goes on\n")
+    hal.exit_pass()
+}

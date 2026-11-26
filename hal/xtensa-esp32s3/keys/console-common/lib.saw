@@ -1,0 +1,150 @@
+//! What the console keys that write share: the switch of UART0's divisor to
+//! a faster rate, the stop that leaves the console where it is when UART0 is
+//! not on the crystal, and the line that names the rate.
+//!
+//! The `s3consolekit` module. The profile maps it for every image, but only a
+//! console key that writes imports it (`../console-b921600/` and the rest),
+//! so an image at the `rom` key compiles nothing from it. Like the keys, it
+//! reaches every register through views of its own and names nothing in
+//! `../../kernel/lib.saw`. `../../ABI.md` §14i is the source of every number.
+
+import s3clockkit.{device_word, write_byte, write_str, write_hex}
+
+/// UART0: the status word with the FIFO's occupancy in [25:16], the divisor,
+/// FSM_STATUS with ST_UTX_OUT in [7:4] (zero with the transmitter idle), and
+/// CLK_CONF with SCLK_SEL in [21:20] (1 APB, 2 RC_FAST, 3 the crystal) and the
+/// pre-divide below it: SCLK_DIV_B [5:0], SCLK_DIV_A [11:6] and SCLK_DIV_NUM
+/// [19:12], all 0 as the ROM leaves them.
+static UART0_CLKDIV: UInt = 0x6000_0014
+static UART0_STATUS: UInt = 0x6000_001C
+static UART0_FSM_STATUS: UInt = 0x6000_006C
+static UART0_CLK_CONF: UInt = 0x6000_0078
+static TXFIFO_CNT_SHIFT: UInt32 = 16
+static TXFIFO_CNT_MASK: UInt32 = 0x3FF
+static ST_UTX_OUT_SHIFT: UInt32 = 4
+static ST_UTX_OUT_MASK: UInt32 = 0xF
+static SCLK_SEL_SHIFT: UInt32 = 20
+static SCLK_SEL_MASK: UInt32 = 0x3
+static SCLK_XTAL: UInt32 = 3
+static SCLK_DIV_MASK: UInt32 = 0xF_FFFF
+
+/// The crystal UART0 divides, and where the divisor's sixteenths sit: the
+/// integer part is in [11:0], the sixteenths in [23:20].
+static XTAL_HZ: UInt = 40_000_000
+static CLKDIV_FRAG_SHIFT: UInt = 20
+
+/// The divisor word for `baud` from the crystal, as ESP-IDF v5.4.1's
+/// `uart_ll_set_baudrate` computes it for the S3 (components/hal/esp32s3/
+/// include/hal/uart_ll.h): the quotient of 16 times the clock over the baud,
+/// truncated, its low four bits the sixteenths and the rest the integer part.
+/// ESP-IDF first divides the clock down by `ceil(clock / (4095 * baud))` into
+/// SCLK_DIV_NUM, which is 1 (no pre-divide, as the ROM leaves it) for every
+/// baud from 9,768 up, so this writes the divisor alone.
+public func clkdiv_for(baud: UInt) -> UInt32 {
+    let quotient = (XTAL_HZ << 4) / baud
+    (((quotient & 0xF) << CLKDIV_FRAG_SHIFT) | (quotient >> 4)) as UInt32
+}
+
+/// What the drain reads of UART0: the transmit FIFO's occupancy and the
+/// transmitter's state, 0 when idle. `Uart0` reads the device; the harness
+/// `tests/xtensa/console_found.saw` answers busy for a number of polls.
+public trait UartState {
+    func fifo_count(&var self) unsafe -> UInt32
+    func tx_state(&var self) unsafe -> UInt32
+}
+
+/// UART0's two words the drain reads.
+public struct Uart0 {
+    status: UnsafeMemory<UInt32, Device>,
+    fsm: UnsafeMemory<UInt32, Device>,
+}
+
+/// UART0's views.
+public func uart0() unsafe -> Uart0 {
+    Uart0(status: device_word(UART0_STATUS), fsm: device_word(UART0_FSM_STATUS))
+}
+
+/// The FIFO's occupancy in the UART_STATUS word `status`: TXFIFO_CNT, [25:16].
+public func fifo_count_of(status: UInt32) -> UInt32 {
+    (status >> TXFIFO_CNT_SHIFT) & TXFIFO_CNT_MASK
+}
+
+/// The transmitter's state in the UART_FSM_STATUS word `fsm`: ST_UTX_OUT,
+/// [7:4], 0 when idle.
+public func tx_state_of(fsm: UInt32) -> UInt32 {
+    (fsm >> ST_UTX_OUT_SHIFT) & ST_UTX_OUT_MASK
+}
+
+extension Uart0: UartState {
+    func fifo_count(&var self) unsafe -> UInt32 {
+        fifo_count_of(self.status.read())
+    }
+
+    func tx_state(&var self) unsafe -> UInt32 {
+        tx_state_of(self.fsm.read())
+    }
+}
+
+/// Wait until `uart` has sent every byte it holds, the test the ROM's
+/// `uart_tx_wait_idle` makes: the FIFO empty and the transmitter idle, both
+/// read on every poll.
+///
+/// No preemption point: it runs once, at boot, before anything else.
+public func drain<S: UartState>(uart: &var S) unsafe {
+    while {
+        let fifo = uart.fifo_count()
+        let tx = uart.tx_state()
+        if fifo == 0 && tx == 0 {
+            break
+        }
+    }
+}
+
+/// Wait until UART0 has sent every byte it holds.
+public func console_drain() unsafe {
+    var uart = uart0()
+    drain(&var uart)
+}
+
+/// Switch the console to the key `name`, whose rate is `baud`, on the part:
+/// `console_switch_found` on UART0's CLK_CONF as it reads now.
+public func console_switch(name: String, baud: UInt) unsafe {
+    console_switch_found(name, baud, device_word(UART0_CLK_CONF).read())
+}
+
+/// Switch the console to `baud`, the key's `name`, given UART0's CLK_CONF as
+/// found, `clk_conf`. UART0 not on the crystal, or on it through a pre-divide
+/// (any of SCLK_DIV_NUM, DIV_A and DIV_B set), prints the `not taken` line,
+/// at the rate the console has, and writes nothing: the divisor is for the
+/// undivided crystal, and neither field is this key's to move. Otherwise it
+/// drains UART0, so no byte of the ROM's or the kernel's is cut off at the
+/// old rate, stores the divisor, the one store, and prints one line at the
+/// new rate: the divisor before and after, and CLK_CONF.
+///
+/// No preemption point: it runs once, at boot, before anything else.
+public func console_switch_found(name: String, baud: UInt,
+                                 clk_conf: UInt32) unsafe {
+    let select = (clk_conf >> SCLK_SEL_SHIFT) & SCLK_SEL_MASK
+    if select != SCLK_XTAL || (clk_conf & SCLK_DIV_MASK) != 0 {
+        write_str("SOS-S3: console ")
+        write_str(name)
+        write_str(" not taken: UART0's clock is not the undivided crystal, ")
+        write_str("uart_clk=0x")
+        write_hex(clk_conf)
+        write_str("; the console stays at the rate it has\n")
+        return
+    }
+    let clkdiv = device_word(UART0_CLKDIV)
+    let before = clkdiv.read()
+    console_drain()
+    clkdiv.write(clkdiv_for(baud))
+    write_str("SOS-S3: console ")
+    write_str(name)
+    write_str(" clkdiv=0x")
+    write_hex(before)
+    write_str("->0x")
+    write_hex(clkdiv.read())
+    write_str(" uart_clk=0x")
+    write_hex(clk_conf)
+    write_byte(10)
+}

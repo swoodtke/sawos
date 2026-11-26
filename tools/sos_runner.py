@@ -18202,14 +18202,15 @@ def _build_image_file(packager, profile, arch, case, env, board=False):
 
     A build key is stated in one place: a description that states `[keys]`
     for a case that names a key too (`"clock"`, `"flash_key"` or
-    `"console_stall"`, which `--emit-flash CASE --clock KEY` and `--flash
-    KEY` set) is refused, naming both, rather than built at one of them
+    `"console"` or `"console_stall"`, which `--emit-flash CASE --clock KEY`,
+    `--flash KEY` and `--console KEY` set) is refused, naming both, rather than built at one of them
     (hal/xtensa-esp32s3/ABI.md §14d)."""
     import tomllib
 
     description = os.path.join(TESTS_DIR, "images",
                                case["image_file"][arch["name"]])
-    named = [k for k in ("clock", "flash_key", "console_stall") if k in case]
+    named = [k for k in ("clock", "flash_key", "console", "console_stall")
+             if k in case]
     if named:
         with open(description, "rb") as f:
             stated = tomllib.load(f).get("keys")
@@ -18837,6 +18838,17 @@ SPI0_BLOCK = (0x6000_3000, 0x6000_3400)
 SWITCH_PADS = (0x6000_9070, 0x6000_9074, 0x6000_415C, 0x6000_4160)
 SWITCH_FREEZE = (0x600C_4154, 0x600C_4150)
 
+# What the console key may store to (ABI.md §14i): UART0's registers (one page
+# in the emulator's map), of which the FIFO at +0x00 is the console's own
+# every byte; UART_CLKDIV, the divisor the key stores; and the two words the
+# drain reads, UART_STATUS (the FIFO's occupancy) and UART_FSM_STATUS (the
+# transmitter's state).
+UART0_BLOCK = (0x6000_0000, 0x6000_0100)
+UART0_FIFO = 0x6000_0000
+UART0_CLKDIV = 0x6000_0014
+UART0_STATUS = 0x6000_001C
+UART0_FSM_STATUS = 0x6000_006C
+
 
 def _flash_case_asm(case, board):
     """A flash harness's case block, as assembly: the fault harness's words
@@ -19010,8 +19022,9 @@ ESP32S3_MAGIC = 0xAEDB041D
 
 # The S3's default build keys: the ROM's clock, the console's stall count
 # off, the PSRAM command layer's own build, not its fault build, the
-# `esp32s3` board, not `esp32s3-r8`, and the flash as the ROM reads it.
-ESP32S3_DEFAULT_KEYS = ("rom", False, False, False, "rom")
+# `esp32s3` board, not `esp32s3-r8`, the flash as the ROM reads it and the
+# console at the ROM's baud rate.
+ESP32S3_DEFAULT_KEYS = ("rom", False, False, False, "rom", "rom")
 
 # The `xtal40` clock line as the emulator prints it, in two parts around
 # its two measured speeds, which follow host time and are not asserted.
@@ -19024,6 +19037,12 @@ ESP32S3_CLOCK_XTAL40_LINES = [
     "cpu_per=0x00000000->0x00000000 mhz=",
     " uart_clk=0x15122500 mspi_core=0x00000000 mspi_clock=0x00000000 "
     "rtc_date=0x00000000\n"]
+
+
+def console_baud(value):
+    """The rate, in baud, of the S3's console key value `value`: `rom` is the
+    mask ROM's 115200 and `bN` is N (hal/xtensa-esp32s3/ABI.md §14i)."""
+    return "115200" if value == "rom" else value[1:]
 
 
 def _board_key_values(hal, key):
@@ -19086,10 +19105,12 @@ def _esp32s3_tools():
 def _esp32s3_module_paths(key):
     """The S3 kernel's module paths at the build keys `key`, (clock, whether
     the console counts its stalls, whether the PSRAM's command layer is its
-    fault build, whether the board is `esp32s3-r8`, and the flash key):
+    fault build, whether the board is `esp32s3-r8`, the flash key and the
+    console key):
     `_esp32s3_smoke` says what each is. The `esp32s3-r8` board's `hal` is its
     facade, which reaches the S3 HAL as `s3hal`."""
-    clock, stall, r8, flash = key[0], key[1], key[3], key[4]
+    clock, stall, r8, flash, console = (key[0], key[1], key[3], key[4],
+                                        key[5])
     s3_hal = os.path.join(HAL_DIR, "xtensa-esp32s3")
     keys_dir = os.path.join(s3_hal, "keys")
     hal = [f"hal={os.path.join(s3_hal, 'kernel')}"]
@@ -19104,6 +19125,8 @@ def _esp32s3_module_paths(key):
             f"s3flash={os.path.join(keys_dir, 'flash-' + flash)}",
             f"s3clockkit={os.path.join(keys_dir, 'clock-common')}",
             f"s3flashkit={os.path.join(keys_dir, 'flash-common')}",
+            f"s3console={os.path.join(keys_dir, 'console-' + console)}",
+            f"s3consolekit={os.path.join(keys_dir, 'console-common')}",
             f"s3dbias={os.path.join(s3_hal, 'dbias', 'src')}",
             "s3stall=" + os.path.join(
                 keys_dir, "stall-on" if stall else "stall-off")]
@@ -19272,13 +19295,14 @@ def _pwm_driver_plan(quota):
 
 
 def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
-                   emit_flash=None):
+                   emit_flash=None, emit_console=None):
     """The ESP32-S3 board smoke: Xtensa, call0, the `Flat` tier. Returns the
     process exit status. `wanted` is the `--case` names (underscored), or
     empty for every case. `emit`, a case name, builds that case's board image
     into `emit_out` instead of running anything, at the clock key
     `emit_clock` when one is given (`--clock`) and at the case's own
-    otherwise, and the same way at the flash key `emit_flash` (`--flash`).
+    otherwise, and the same way at the flash key `emit_flash` (`--flash`)
+    and the console key `emit_console` (`--console`).
 
     It is not part of `make sos-test`: `make sos-smoke-esp32s3` runs it
     against the Espressif QEMU, beside the C3's smoke and on the same terms.
@@ -19372,6 +19396,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
     # one whose key imports it (`_esp32s3_module_paths`).
     clock_keys = _board_key_values("xtensa-esp32s3", "clock")
     flash_keys = _board_key_values("xtensa-esp32s3", "flash")
+    console_keys = _board_key_values("xtensa-esp32s3", "console")
     # The LDO settings from the eFuse, for every image: plain Saw that only
     # an image whose source imports it compiles.
     s3_dbias_dir = os.path.join(s3_hal, "dbias", "src")
@@ -19380,23 +19405,26 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
         """A case's build keys: its clock, whether the console counts its
         stalls, whether the PSRAM's command layer is its fault build
         (`psram_fault`, `mspi.c` compiled with `-DSOS_PSRAM_FAULT`), whether
-        its board is `esp32s3-r8` (`board`, `"r8"`), and its flash key
-        (`flash_key`, `rom` unless a case says otherwise)."""
+        its board is `esp32s3-r8` (`board`, `"r8"`), its flash key
+        (`flash_key`, `rom` unless a case says otherwise) and its console
+        key (`console`, `rom` unless a case says otherwise)."""
         return (case.get("clock", "rom"), bool(case.get("console_stall")),
                 bool(case.get("psram_fault")), case.get("board") == "r8",
-                case.get("flash_key", "rom"))
+                case.get("flash_key", "rom"), case.get("console", "rom"))
 
     def variant_arch(key):
         """The arch entry an image at these keys builds under: its board's,
         with a build directory of the keys' own unless they are the
         board's defaults."""
-        clock, stall, fault, r8, flash = key
+        clock, stall, fault, r8, flash, console = key
         board = ESP32S3_R8_ARCH if r8 else arch
-        if (clock, stall, fault, flash) == ("rom", False, False, "rom"):
+        if (clock, stall, fault, flash, console) == (
+                "rom", False, False, "rom", "rom"):
             return board
         tag = (f"{board['build_tag']}-{clock}" + ("-stall" if stall else "")
                + ("-fault" if fault else "")
-               + (f"-flash-{flash}" if flash != "rom" else ""))
+               + (f"-flash-{flash}" if flash != "rom" else "")
+               + (f"-console-{console}" if console != "rom" else ""))
         return dict(board, build_tag=tag)
 
     def case_arch(case):
@@ -19680,6 +19708,56 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                        f"expected at store {at}: made {show(made[at:at + 4])}"
                        f", expected {show(want[at:at + 4])} ({len(made)} "
                        f"made, {len(want)} expected)")
+
+    def check_uart_stores(case, stores):
+        """Hold a traced run to its case's `expect_uart_stores`, the whole
+        list of (address, value) stores the kernel made, from its first
+        store on and in order, to UART0's registers (`UART0_BLOCK`) other
+        than its FIFO, which every console byte stores to: the console key's
+        one store of the divisor, and a clock key's put-back of the ROM's
+        words. Returns (ok, reason)."""
+        first = next((i for i, x in enumerate(stores)
+                      if x == kernel_first_store), None)
+        if first is None:
+            return False, ("no store of the kernel's: the watchdog key "
+                           "`_start` writes first is missing")
+        made = [(a, v) for a, v in stores[first:]
+                if UART0_BLOCK[0] <= a < UART0_BLOCK[1] and a != UART0_FIFO]
+        want = case["expect_uart_stores"]
+        if made == want:
+            return True, ""
+
+        def show(pairs):
+            return [f"{a:#010x}={v:#010x}" for a, v in pairs]
+        return False, (f"the kernel's stores to UART0 (its FIFO aside) were "
+                       f"{show(made)}, not {show(want)}")
+
+    def check_uart_drain(accesses):
+        """Hold a traced run's stores to UART_CLKDIV from the kernel's first
+        store on each to the drain: after the last console byte before it,
+        UART_STATUS and UART_FSM_STATUS were both read, the test the ROM's
+        `uart_tx_wait_idle` makes. Returns (ok, reason)."""
+        first = next((i for i, (kind, a, v) in enumerate(accesses)
+                      if (a, v) == kernel_first_store and kind == "w"), None)
+        if first is None:
+            return False, ("no store of the kernel's: the watchdog key "
+                           "`_start` writes first is missing")
+        stores = [i for i, (kind, a, _v) in enumerate(accesses)
+                  if i > first and kind == "w" and a == UART0_CLKDIV]
+        if not stores:
+            return False, "no store to UART_CLKDIV, to hold to a drain"
+        for at in stores:
+            last = max((i for i in range(at) if accesses[i][0] == "w"
+                        and accesses[i][1] == UART0_FIFO), default=-1)
+            read = {a for kind, a, _v in accesses[last + 1:at]
+                    if kind == "r"}
+            missing = [f"{a:#010x}" for a in (UART0_STATUS, UART0_FSM_STATUS)
+                       if a not in read]
+            if missing:
+                return False, (f"UART_CLKDIV was stored with {missing} not "
+                               "read since the last console byte: the "
+                               "transmitter was not drained first")
+        return True, ""
 
     def check_switch_stores(case, stores):
         """Hold a traced run to its case's `expect_switch_stores`, the whole
@@ -21557,6 +21635,102 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
     } for key, clock in (("dio80", "rom"), ("qio80", "xtal40"),
                          ("dio40", "xtal40"), ("qio40", "rom"))]
 
+    # The console keys (ABI.md §14i). The console key is the first of
+    # `clock_init`, and the emulator's UART0 + 0x78 reads a date word, not
+    # CLK_CONF, whose SCLK_SEL (1, as it reads) is not the crystal: the
+    # shipping kernel at a key that writes prints its `not taken` line and
+    # stores nothing to UART0 but console bytes, and boots on. The emulator's
+    # serial is not rate-limited, so the transcript is the default's apart
+    # from that line.
+    console_bauds = {"b921600": "921600", "b2000000": "2000000",
+                     "b3000000": "3000000"}
+
+    def console_refused(key, clk_conf=0x15122500):
+        return (f"SOS-S3: console {key} not taken: UART0's clock is not the "
+                f"undivided crystal, uart_clk={clk_conf:#010x}; the console "
+                "stays at the rate it has")
+    kernel_cases += [{
+        "name": f"boot_console_{key}",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "console": key,
+        "expect_uart_stores": [],
+        "expect_out": [rom, console_refused(key), banner,
+                       "SOS: bad root image: no root image appended",
+                       "SOS-S3: halt fail code=0x00000004"],
+        "expect_clean_exit": False,
+        "expect_status": 4,
+    } for key in console_bauds]
+    # A console key that is refused, before a clock key that writes: the
+    # clock key finds UART0 not on the crystal as the key did, and puts it
+    # back on the ROM's words, the divisor last, so the console is the ROM's
+    # whatever the key asked for.
+    kernel_cases += [{
+        "name": "boot_console_b921600_xtal40",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "clock": "xtal40",
+        "console": "b921600",
+        "expect_uart_stores": [(0x6000_0078, 0x0370_0000),
+                               (0x6000_0014, 0x0030_015B)],
+        "expect_out": [rom, console_refused("b921600"), *clock_xtal40_lines,
+                       banner, "SOS: bad root image: no root image appended",
+                       "SOS-S3: halt fail code=0x00000004"],
+        "expect_clean_exit": False,
+        "expect_status": 4,
+    }]
+    # The switch through its harness (`console_found.saw`), handed the
+    # CLK_CONF words a part could read: three selects the key refuses, which
+    # store nothing, then the ROM's own word, which it takes. Every store
+    # the kernel made to UART0 but its FIFO is held, in order: the one
+    # divisor, each key's own (the ESP-IDF quotient of 16 times 40 MHz over
+    # the baud, its low four bits in [23:20] and the rest in [11:0]); and the
+    # divisor is stored only after UART_STATUS and UART_FSM_STATUS were
+    # read, the drain (`expect_uart_drain`).
+    console_divisors = {"b921600": 0x0060_002B, "b2000000": 0x0000_0014,
+                        "b3000000": 0x0050_000D}
+    kernel_cases += [{
+        "name": f"console_found_{key}",
+        "src": os.path.join(s3_tests, "console_found.saw"),
+        "console": key,
+        "expect_uart_stores": [(0x6000_0014, divisor)],
+        "expect_uart_drain": True,
+        "expect_out": [rom,
+                       console_refused(key, 0x15122500),
+                       console_refused(key, 0x03600000),
+                       console_refused(key, 0x03400000),
+                       console_refused(key, 0x03701000),
+                       console_refused(key, 0x03700040),
+                       console_refused(key, 0x03700001),
+                       "SOS consolefound: drain fifo_busy=0x00000003 "
+                       "tx_busy=0x00000000 polls=0x00000004,0x00000004",
+                       "SOS consolefound: drain fifo_busy=0x00000000 "
+                       "tx_busy=0x00000004 polls=0x00000005,0x00000005",
+                       "SOS consolefound: fields fifo=0x00000005,"
+                       "0x00000000,0x00000000,0x000003ff tx=0x00000001,"
+                       "0x00000000,0x00000000,0x0000000f",
+                       f"SOS-S3: console {key} clkdiv=0x0030015b->"
+                       f"{divisor:#010x} uart_clk=0x03700000",
+                       "SOS consolefound: the boot goes on", halt_pass],
+        "expect_clean_exit": True,
+    } for key, divisor in console_divisors.items()]
+    # A long line at each key, on the emulator for its bytes and for a board
+    # (`--emit-flash console_line --clock pll240 --flash dio80 --console
+    # KEY`), where the capture opened at the key's rate must read it whole.
+    console_long_line = "0123456789ABCDEF" * 16
+    kernel_cases += [{
+        "name": "console_line",
+        "src": os.path.join(s3_tests, "console_line.saw"),
+        "expect_out": [rom, f"SOS consoleline: {console_long_line}",
+                       halt_pass],
+        "expect_clean_exit": True,
+    }] + [{
+        "name": f"console_line_{key}",
+        "src": os.path.join(s3_tests, "console_line.saw"),
+        "console": key,
+        "expect_out": [rom, console_refused(key),
+                       f"SOS consoleline: {console_long_line}", halt_pass],
+        "expect_clean_exit": True,
+    } for key in console_bauds]
+
     # The switch through its harness (`flash_switch.saw`), with the part's
     # MISC(1) word set up first and the reads the emulator cannot answer as
     # the part does lied to (`flash_switch`'s `faults`). Each case holds the
@@ -23402,6 +23576,32 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
             "expect_clean_exit": False,
         },
         {
+            # The same for a case that names the console key.
+            "name": "keys_stated_twice_console",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "keys_twice_s3.toml"},
+            "console": "b921600",
+            "expect_build_error": "keys_twice_s3.toml states the build keys "
+                                  "clock in [keys], and the case "
+                                  "keys_stated_twice_console names "
+                                  "console too",
+            "expect_out": [],
+            "expect_clean_exit": False,
+        },
+        {
+            # A description that states a console key: built at it, it boots
+            # with the key's line (not taken on the emulator, whose UART0
+            # is not on the crystal by its CLK_CONF word) and runs
+            # `launch_all` on.
+            "name": "console_keyed_image",
+            "src": os.path.join(KERNEL_DIR, "main.saw"),
+            "image_file": {arch["name"]: "console_keyed_s3.toml"},
+            "expect_out": [console_refused("b921600"), "{banner}",
+                           "SOS launch: 3 children, 1 pool",
+                           "SOS launch: done"],
+            "expect_clean_exit": True,
+        },
+        {
             # A root image linked for child 0's slot (`root_link`), stitched
             # into root's: the build reads it back and refuses it, naming
             # where the code is linked and where its bytes sit. Every number
@@ -23908,14 +24108,17 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
             return 2
         cases = [c for c in cases if c["name"] in wanted]
         process_cases = [c for c in process_cases if c["name"] in wanted]
-    # `--clock` and `--flash` give the one emitted image its clock and flash
-    # keys.
-    if emit_clock is not None or emit_flash is not None:
+    # `--clock`, `--flash` and `--console` give the one emitted image its
+    # clock, flash and console keys.
+    if (emit_clock is not None or emit_flash is not None
+            or emit_console is not None):
         keyed = dict(cases[0])
         if emit_clock is not None:
             keyed["clock"] = emit_clock
         if emit_flash is not None:
             keyed["flash_key"] = emit_flash
+        if emit_console is not None:
+            keyed["console"] = emit_console
         cases = [keyed]
         process_cases = [keyed] if process_cases else []
     for case in cases:
@@ -23927,6 +24130,11 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
         if variant(case)[4] not in flash_keys:
             print(f"{RED}{case['name']}: unknown flash key "
                   f"{variant(case)[4]!r}; known: {', '.join(flash_keys)}"
+                  f"{RESET}", file=sys.stderr)
+            return 2
+        if variant(case)[5] not in console_keys:
+            print(f"{RED}{case['name']}: unknown console key "
+                  f"{variant(case)[5]!r}; known: {', '.join(console_keys)}"
                   f"{RESET}", file=sys.stderr)
             return 2
     # A smoke run builds nothing for a board-only case; its row says why.
@@ -24202,7 +24410,10 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
               f"at flash offset 0x0; magic checked at 0x400)")
         print(f"  clock key {variant(case)[0]}")
         print(f"  flash key {variant(case)[4]}")
+        print(f"  console key {variant(case)[5]}")
         print(f"  sha256 {hashlib.sha256(image).hexdigest()}")
+        print(f"  console {console_baud(variant(case)[5])} baud 8N1: open "
+              "the capture at this rate")
         print("  write it with:")
         print(f"    python3 -m esptool --chip esp32s3 --port PORT "
               f"write-flash 0x0 {emit_out}")
@@ -24218,10 +24429,12 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
 
     def watches_stores(case):
         """Whether a case holds the run's stores in order (`expect_stores`,
-        `expect_spi1_stores`, `expect_switch_stores`)."""
+        `expect_spi1_stores`, `expect_switch_stores`,
+        `expect_uart_stores`)."""
         return bool(case.get("expect_stores")
                     or case.get("expect_spi1_stores") is not None
-                    or case.get("expect_switch_stores") is not None)
+                    or case.get("expect_switch_stores") is not None
+                    or case.get("expect_uart_stores") is not None)
 
     def boot_args(case):
         """The emulator's extra arguments for one run, and the file its
@@ -24253,7 +24466,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                      "driver=nvram.esp32s3.efuse,property=drive,value=efuse"]
         stores = (watches_devices(case) or watches_stores(case)
                   or case.get("expect_counter_span"))
-        loads = case.get("expect_counter_span")
+        loads = (case.get("expect_counter_span")
+                 or case.get("expect_uart_drain"))
         trace = os.path.join(s3_build, f"{case['name']}.trace.txt")
         if os.path.exists(trace):
             os.remove(trace)
@@ -24533,6 +24747,13 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
         # (`expect_switch_stores`).
         if ok and case.get("expect_switch_stores") is not None:
             ok, reason = check_switch_stores(case, traced_stores(trace))
+        # Every store the kernel made to UART0 but its FIFO, in order
+        # (`expect_uart_stores`), and each of the console key's to its divisor
+        # preceded by a drain (`expect_uart_drain`).
+        if ok and case.get("expect_uart_stores") is not None:
+            ok, reason = check_uart_stores(case, traced_stores(trace))
+        if ok and case.get("expect_uart_drain"):
+            ok, reason = check_uart_drain(traced_accesses(trace))
         # A wait the run must make (`expect_counter_span`), read off the
         # counter's loads.
         if ok and case.get("expect_counter_span"):
@@ -25088,7 +25309,7 @@ PRODUCT_GREETER = ["{banner}",
 def _product_rows_esp32s3(scratch, builder_before):
     """The S3 smoke's product phase's rows, as `_product_rows`' are: the
     template's ESP32-S3 image tested, and written as a board image by
-    `flash`, whose three lines are held to the file, the SHA-256 recomputed
+    `flash`, whose four lines are held to the file, the SHA-256 recomputed
     here, and the image to one linked for a part rather than the emulator;
     and its build, which states no keys, printing no `keys` line.
     Then the same image with a `[keys]` of its own (`keyed_image`): tested at
@@ -25120,7 +25341,7 @@ def _product_rows_esp32s3(scratch, builder_before):
         r = _sawos_py(product, ["flash", image], tree)
         if r.returncode != 0:
             return f"flash failed ({r.returncode}): {r.stdout}{r.stderr}"
-        lines = r.stdout.splitlines()[-3:]
+        lines = r.stdout.splitlines()[-4:]
         placed = re.search(r"^flash used=\d+ end=(\d+)$", r.stdout, re.M)
         if not placed:
             return f"it did not say where its placed bytes end: {r.stdout}"
@@ -25129,11 +25350,11 @@ def _product_rows_esp32s3(scratch, builder_before):
         if not os.path.isfile(board_bin):
             return f"flash wrote no board image at {board_bin}: {r.stdout}"
         want = [f"sha256 {_file_sha256(board_bin)}  {board_bin}",
-                "board esp32s3",
+                "board esp32s3", "console 115200 baud 8N1",
                 "python3 -m esptool --chip esp32s3 --port PORT write-flash "
                 f"0x0 {board_bin}"]
         if lines != want:
-            return f"its last three lines are {lines!r}, not {want!r}"
+            return f"its last four lines are {lines!r}, not {want!r}"
         with open(board_bin, "rb") as f:
             board = f.read()
         with open(os.path.join(out, f"{image}.flash.bin"), "rb") as f:
@@ -25160,12 +25381,12 @@ def _product_rows_esp32s3(scratch, builder_before):
                                       os.path.join(product, ".sawos"))
                       for path in built["module_paths"]
                       if path.startswith(("s3clock=", "s3flash=",
-                                          "s3stall=")))
+                                          "s3stall=", "s3console=")))
         want = sorted(os.path.relpath(path.split("=", 1)[1], REPO_ROOT)
                       for path in _esp32s3_module_paths(
-                          ("rom", False, False, False, "rom"))
+                          ESP32S3_DEFAULT_KEYS)
                       if path.startswith(("s3clock=", "s3flash=",
-                                          "s3stall=")))
+                                          "s3stall=", "s3console=")))
         if keys != want or built.get("kernel_c_args"):
             return (f"the product's S3 profile is at the keys {keys} with "
                     f"{built.get('kernel_c_args')!r}, not the default's "
@@ -25223,12 +25444,12 @@ def _product_rows_esp32s3(scratch, builder_before):
         if not os.path.isfile(board_bin):
             return f"flash wrote no board image at {board_bin}: {r.stdout}"
         want = [f"sha256 {_file_sha256(board_bin)}  {board_bin}",
-                "board esp32s3",
+                "board esp32s3", "console 115200 baud 8N1",
                 "python3 -m esptool --chip esp32s3 --port PORT write-flash "
                 f"0x0 {board_bin}"]
-        lines = r.stdout.splitlines()[-3:]
+        lines = r.stdout.splitlines()[-4:]
         if lines != want:
-            return f"its last three lines are {lines!r}, not {want!r}"
+            return f"its last four lines are {lines!r}, not {want!r}"
         with open(board_bin, "rb") as f:
             if xtal40_code not in f.read():
                 return (f"{board_bin} has no {xtal40_code!r}: it was not "
@@ -25239,6 +25460,30 @@ def _product_rows_esp32s3(scratch, builder_before):
             if xtal40_code in f.read():
                 return (f"{unkeyed}, built at the default keys, has "
                         f"{xtal40_code!r} too")
+        return None
+
+    def console_flashes():
+        name = "x-console"
+        path = keyed_image(name, 'console = "b921600"')
+        try:
+            r = _sawos_py(product, ["flash", name], tree)
+        finally:
+            os.remove(path)
+        if r.returncode != 0:
+            return f"flash failed ({r.returncode}): {r.stdout}{r.stderr}"
+        if "keys console=b921600" not in r.stdout.splitlines():
+            return f"it did not print the keys it built at: {r.stdout}"
+        board_bin = os.path.join(product, "build", f"{name}.board",
+                                 f"{name}.board.bin")
+        if not os.path.isfile(board_bin):
+            return f"flash wrote no board image at {board_bin}: {r.stdout}"
+        want = [f"sha256 {_file_sha256(board_bin)}  {board_bin}",
+                "board esp32s3", "console 921600 baud 8N1",
+                "python3 -m esptool --chip esp32s3 --port PORT write-flash "
+                f"0x0 {board_bin}"]
+        lines = r.stdout.splitlines()[-4:]
+        if lines != want:
+            return f"its last four lines are {lines!r}, not {want!r}"
         return None
 
     def key_refused(name, keys, text):
@@ -25268,7 +25513,13 @@ def _product_rows_esp32s3(scratch, builder_before):
         ("product_key_unknown", key_refused(
             "x-speed", 'speed = "fast"',
             "`speed` in [keys] is no build key of the board esp32s3; its "
-            "keys are `clock`, `flash`, `stall`")),
+            "keys are `clock`, `flash`, `stall`, `console`")),
+        ("product_console_flash", console_flashes),
+        ("product_console_value_unknown", key_refused(
+            "x-b115200", 'console = "b115200"',
+            '`console` in [keys] is "b115200", which is not one of the board '
+            'esp32s3\'s values for it, "rom", "b921600", "b2000000", '
+            '"b3000000"')),
         ("product_key_value_unknown", key_refused(
             "x-pll320", 'clock = "pll320"',
             '`clock` in [keys] is "pll320", which is not one of the board '
@@ -25410,6 +25661,13 @@ def main():
                              "(`rom`, the default, `xtal40`, `pll80`, "
                              "`pll160` or `pll240`; "
                              "hal/xtensa-esp32s3/ABI.md §14)")
+    parser.add_argument("--console", metavar="KEY",
+                        help="with --emit-flash: the console key the image "
+                             "is built with, in place of the case's own "
+                             "(`rom`, the default, which leaves the console "
+                             "at 115200, `b921600`, `b2000000` or "
+                             "`b3000000`, the baud rate the capture opens; "
+                             "hal/xtensa-esp32s3/ABI.md §14i)")
     parser.add_argument("--flash", metavar="KEY",
                         help="with --emit-flash: the flash key the image is "
                              "built with, in place of the case's own "
@@ -25430,6 +25688,9 @@ def main():
     if args.flash is not None and args.emit_flash is None:
         print(f"{RED}--flash needs --emit-flash{RESET}", file=sys.stderr)
         sys.exit(2)
+    if args.console is not None and args.emit_flash is None:
+        print(f"{RED}--console needs --emit-flash{RESET}", file=sys.stderr)
+        sys.exit(2)
 
     if args.board == "esp32s3":
         # Board section: esp32s3, all of it in `_esp32s3_smoke`. `--case`
@@ -25440,7 +25701,7 @@ def main():
         emit = (args.emit_flash.strip().replace("-", "_")
                 if args.emit_flash is not None else None)
         sys.exit(_esp32s3_smoke(wanted, emit, args.out, args.clock,
-                                args.flash))
+                                args.flash, args.console))
 
     if args.board != "virt":
         # ------------------------------------------------------------------

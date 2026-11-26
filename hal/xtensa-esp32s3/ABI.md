@@ -2635,8 +2635,9 @@ stall = "on"
 ```
 
 The names and values are this board's: `board.toml`'s `[keys.clock]`,
-`[keys.flash]` and `[keys.stall]` list each key's module (`s3clock`,
-`s3flash`, `s3stall`) and its values; the flash key is §18d's. A value
+`[keys.flash]`, `[keys.stall]` and `[keys.console]` list each key's module
+(`s3clock`, `s3flash`, `s3stall`, `s3console`) and its values; the flash key
+is §18d's and the console key §14i's. A value
 names a directory: the module's path in `modules` with the value in place
 of its `*`, so `xtal40` is `keys/clock-xtal40` and `on` is
 `keys/stall-on`. `sosimage build` and `sosimage flash` refuse a key or a
@@ -2644,14 +2645,15 @@ value the board does not list, by name, and compile the kernel with each
 stated key's module mapped to its value's directory (`keyed_profile` in
 tools/sosimage/src/product.saw); a key the image leaves out keeps the
 profile's directory, which in the profile `tools/product.py` writes is the
-default, `rom` and `off`. So `tools/sawos.py build`, `run`, `test` and
+default, `rom`, `rom`, `off` and `rom`. So `tools/sawos.py build`, `run`, `test` and
 `flash` all build a product's image at its keys, and the build prints them
 first (`keys clock=xtal40`).
 
 A key is stated in one place. The smoke's cases give theirs in the case
-(`"clock"`, `"console_stall"`) or by `--emit-flash CASE --clock KEY`, and the
-runner refuses a case whose hand-written description states `[keys]` while
-the case, or `--clock`, names a key as well, rather than pick one
+(`"clock"`, `"flash_key"`, `"console"`, `"console_stall"`) or by
+`--emit-flash CASE --clock KEY`, and the runner refuses a case whose
+hand-written description states `[keys]` while the case, or `--clock`, names
+a key as well, rather than pick one
 (`_build_image_file`, the smoke's `keys_stated_twice`). A description's
 `[keys]` with a case that names none is built at the description's keys.
 
@@ -3260,6 +3262,105 @@ longer. So the run is bound by something the CPU's clock does not move. The
 flash, which stays at 20 MHz under every key (§14c) and holds the code the
 kernel and every process run through the cache, is the likely candidate; how
 much of each phase waits on it has not been measured.
+
+### 14i. The console key
+
+The console's rate is a build key, `s3console` (`keys/console-*/`), with
+`s3consolekit` (`keys/console-common/`) for the keys that write. `rom`, the
+default, writes nothing: UART0 stays at the 115200 the mask ROM left (§4a).
+`b921600`, `b2000000` and `b3000000` put the console at that rate. The case
+key `"console"` sets it, `--emit-flash CASE --console KEY` overrides it for
+a board image, and an image's `[keys] console = "b2000000"` chooses it;
+§14d says how a key is stated and refused.
+
+**Why a rate.** The board's console goes through a USB-UART bridge on UART0's
+two pins, and at 115200 an image that prints much is bound by the wire: the
+console's stall is over half of `kill_churn_profile`'s round at the faster
+flash keys (§14f, §18g). The bridge is a WCH CH343P (USB 1A86:55D3), at USB
+full speed and rated by WCH into the megabaud range, so the part's UART0 is
+the limit; a board run says which of the rates works end to end (below).
+
+**The divisor.** UART0's clock is the crystal (§14a), 40 MHz, and stays so
+under every clock key. UART_CLKDIV holds the integer part of the divisor in
+[11:0] and its sixteenths in [23:20]. ESP-IDF v5.4.1's `uart_ll_set_baudrate`
+for the S3 (components/hal/esp32s3/include/hal/uart_ll.h) divides the source
+clock by `ceil(clock / (4095 * baud))` into SCLK_DIV_NUM, which is 1 for every
+baud from 9,768 up (so SCLK_SEL and CLK_CONF are left alone: the key writes
+the divisor alone), then stores `(clock << 4) / (baud * sclk_div)`, truncated,
+as the divisor, its low four bits the sixteenths. The S3's UART has no
+register-update step, so the store is the whole switch. `clkdiv_for` is that
+quotient; the ROM's own 115200 is the same arithmetic (§14a).
+
+```
+key       16 * 40 MHz / baud   integer  sixteenths  UART_CLKDIV   actual baud  error
+rom       5555.6 -> 5555       347      3           0x0030_015B   115,211.5    +0.010 %
+b921600   694.4  -> 694       43       6           0x0060_002B   922,190.2    +0.064 %
+b2000000  320                  20       0           0x0000_0014   2,000,000    0
+b3000000  213.3  -> 213       13       5           0x0050_000D   3,004,695    +0.157 %
+```
+
+A UART tolerates a few percent between the ends; the largest error here is
+0.157 percent.
+
+**The switch, and where it runs.** `clock_init` is the console key's first,
+then the clock key's, then the flash key's. The console key is first so that
+every line the keys and the kernel print is at its rate, the clock key's and
+the flash key's too, and because it needs nothing from them: UART0 is on the
+crystal, which no CPU clock key moves, so the divisor holds through the clock
+key's switch, and the clock key's own drain and `console_on_crystal` then
+find UART0 on the crystal and write nothing. The sequence:
+
+1. Read UART0's CLK_CONF (+0x78). If its SCLK_SEL ([21:20]) is not 3, the
+   crystal, or any of SCLK_DIV_NUM [19:12], SCLK_DIV_A [11:6] and SCLK_DIV_B
+   [5:0] is set (the divisor assumes the crystal undivided, as the ROM leaves
+   it; the field resets to 1, so a word read is checked), print `SOS-S3:
+   console KEY not taken: UART0's clock is not the undivided crystal,
+   uart_clk=0x...; the console stays at the rate it has` at the rate the
+   console has and write nothing. A clock key that follows puts the console
+   back on the ROM's words (§14d) as it does under `rom`, so the console is
+   at 115200 in that case.
+2. Drain: wait until UART_STATUS's TXFIFO_CNT is 0 and UART_FSM_STATUS's
+   ST_UTX_OUT is 0, the test the ROM's `uart_tx_wait_idle` makes, so no byte
+   of the ROM's banner or the kernel's is cut off at the old rate.
+3. Store the key's divisor to UART_CLKDIV, the one store.
+4. Print one line at the new rate: `SOS-S3: console KEY clkdiv=0x0030015b->0x...
+   uart_clk=0x03700000`, the divisor before and after, and CLK_CONF.
+
+The ROM's own output (its `ESP-ROM:` banner) stays at 115200, so a capture
+opened at the key's rate sees it as noise before the key's line.
+
+**On the emulator.** The emulator's serial is not rate-limited, so the key
+changes no transcript but for its line. Its UART0 + 0x78 reads a date word,
+`0x15122500` (§14e), whose SCLK_SEL reads 1, so the shipping kernel at a key
+that writes prints the `not taken` line and stores nothing to UART0 but console
+bytes (`boot_console_*`). The words are handed in through the harness
+`tests/xtensa/console_found.saw` (the key's `console_init_found`): three
+selects refused, the crystal with each pre-divide field set refused
+(`0x03701000`, `0x03700040`, `0x03700001`), then the ROM's `0x03700000` taken
+(`console_found_*`). The emulator's UART0 always reads idle, so the drain's
+two tests are held on a stand-in UART the harness lies with: the kit's
+`drain` runs over `UartState`, once with the FIFO reading occupied for 3 polls
+and once with the transmitter reading busy for 4, and must poll until each
+lie ends; the two fields' decoding (`fifo_count_of`, `tx_state_of`) is held on
+crafted words: each field alone set, its neighbours alone set, and the field
+full. Every
+store the kernel makes to UART0 but its FIFO is held in order
+(`expect_uart_stores`), and the drain is held by the loads of UART_STATUS and
+UART_FSM_STATUS between the last console byte and the store (`expect_uart_drain`).
+`boot_console_b921600_xtal40` holds a refused key before a clock key that
+writes: the clock key's two stores put the ROM's words back.
+
+**On the part.** `sosimage flash` prints the rate a capture opens beside the
+SHA-256, the board and the `esptool` line (`console 921600 baud 8N1`; 115200
+for an image with no console key stated), and `--emit-flash` prints it too.
+The stages, which need the board and are the lead's:
+
+```
+C1  `console_line` at each key that writes (pll240, dio80), captured at its
+    rate: the key's line, then the 256-character line whole, every byte
+C2  `kill_churn_profile` at each of the four keys: the stall share of `all`
+    against the key's rate
+```
 
 ---
 

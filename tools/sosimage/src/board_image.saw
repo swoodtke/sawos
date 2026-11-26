@@ -6,15 +6,19 @@
 //! `for_board`: the profile's `board_link_args` after the image's own),
 //! trims its flash image to the offset one past its last placed byte into
 //! `OUT/NAME.board.bin`, and prints `flash used=USED end=END` as `link`
-//! does (END is the board image's length), then three lines:
+//! does (END is the board image's length), then three lines, or four for a
+//! board with a `console` build key:
 //!
 //!     sha256 HEX  FILE
 //!     board NAME
+//!     console BAUD baud 8N1
 //!     python3 -m esptool --chip CHIP --port PORT write-flash 0x0 FILE
 //!
 //! the file's SHA-256, as `shasum -a 256` prints it; the board the image is
-//! for; and the command that writes it at the part's flash offset 0, its
-//! `CHIP` the board's `[flash] chip` and `PORT` the reader's to fill in.
+//! for; the rate the console is at once the image boots, which a capture of
+//! it opens (the image's `[keys] console`, `console_rate`); and the command
+//! that writes it at the part's flash offset 0, its `CHIP` the board's
+//! `[flash] chip` and `PORT` the reader's to fill in.
 //! Nothing is written to a part: the builder runs no tool but `shasum` beyond
 //! what a build runs. A board with no `[flash]` is refused by name before
 //! anything is built.
@@ -22,7 +26,7 @@
 import std.data.{Data}
 import sosimage.board.{Board}
 import sosimage.failure.{BuildError}
-import sosimage.imagefile.{image_board}
+import sosimage.imagefile.{image_board, image_key}
 import sosimage.product.{build_image, find_board}
 import sosimage.profile.{Profile}
 import sosimage.tool.{read_file, read_text, tool_stdout, write_file}
@@ -84,21 +88,57 @@ public func digest_of(printed: String, what: String) -> Result<String, BuildErro
 /// How many hexadecimal digits a SHA-256 is.
 static DIGEST_DIGITS: Int = 64
 
-/// The three lines `sosimage flash` prints for `board`'s board image `file`,
-/// whose SHA-256 is `sha` (`flash_lines`).
-public func board_lines(board: &Board, sha: String,
-                        file: String) -> Result<Vector<String>, BuildError> {
-    return flash_lines(sha, file, board.name, try flash_chip(&board))
+/// The console's rate, in baud, that the value `value` of a board's
+/// `console` build key gives, as digits: `rom` is the mask ROM's 115200, and
+/// `bN` is N. Any other value is refused.
+public func console_rate(value: String) -> Result<String, BuildError> {
+    if value.equals("rom") {
+        // The rate the mask ROM leaves UART0 at, which this key keeps.
+        return "115200"
+    }
+    var ok = value.len() > 1 && value.byte_at(0) == 98
+    var i = 1
+    while ok && i < value.len() {
+        let b = value.byte_at(i)
+        ok = b >= 48 && b <= 57
+        i = i + 1
+    }
+    if not ok {
+        return BuildError(message: "the console key value `{value}` is neither `rom` nor `b` and a rate")
+    }
+    return value.substring(1, value.len())
 }
 
-/// The three lines `sosimage flash` prints for the board image `file`.
+/// The rate the image the description `text` (from `file`) states, built for
+/// `board`, has its console at, as digits: `console_rate` of its
+/// `[keys] console`, `rom` when it states none; none for a board with no
+/// `console` build key.
+public func image_console_rate(board: &Board, text: String,
+                               file: String) -> Result<String?, BuildError> {
+    if board.key("console") == None {
+        return None
+    }
+    return try console_rate(try image_key(text, file, "console", "rom"))
+}
+
+/// The lines `sosimage flash` prints for `board`'s board image `file`, whose
+/// SHA-256 is `sha` and whose console is at `baud` (`flash_lines`).
+public func board_lines(board: &Board, sha: String, file: String,
+                        baud: String?) -> Result<Vector<String>, BuildError> {
+    return flash_lines(sha, file, board.name, try flash_chip(&board), baud)
+}
+
+/// The lines `sosimage flash` prints for the board image `file`: the SHA-256,
+/// the board, the console's rate if `baud` names one, and the command that
+/// writes the image.
 public func flash_lines(sha: String, file: String, board: String,
-                        chip: String) -> Vector<String> {
-    [
-        "sha256 {sha}  {file}",
-        "board {board}",
-        "python3 -m esptool --chip {chip} --port PORT write-flash 0x0 {file}",
-    ]
+                        chip: String, baud: String?) -> Vector<String> {
+    var lines: Vector<String> = ["sha256 {sha}  {file}", "board {board}"]
+    if let rate = baud {
+        try! lines.push("console {rate} baud 8N1")
+    }
+    try! lines.push("python3 -m esptool --chip {chip} --port PORT write-flash 0x0 {file}")
+    return move lines
 }
 
 /// Builds the board image the description at `path` states into `out` and
@@ -106,7 +146,8 @@ public func flash_lines(sha: String, file: String, board: String,
 /// flash, then how to write it (`flash_lines`).
 public func board_image(profile: &Profile, sawos: String, product: String, path: String,
                         out: String) -> Result<Vector<String>, BuildError> {
-    let board = try find_board(sawos, try image_board(try read_text(path), path))
+    let text = try read_text(path)
+    let board = try find_board(sawos, try image_board(text, path))
     // A board with no flash is refused before anything is built.
     let _ = try flash_chip(&board)
     let linked = try build_image(&profile, sawos, product, path, out, true)
@@ -114,7 +155,8 @@ public func board_image(profile: &Profile, sawos: String, product: String, path:
     let file = "{linked.flash.substring(0, linked.flash.len() - suffix.len())}.board.bin"
     let image = try read_file(linked.flash)
     try write_file(file, try trimmed(&image, linked.end, linked.flash))
-    let how = try board_lines(&board, try sha256_of(file), file)
+    let baud = try image_console_rate(&board, text, path)
+    let how = try board_lines(&board, try sha256_of(file), file, baud)
     var lines: Vector<String> = ["flash used={linked.used} end={linked.end}"]
     try! lines.append(&how)
     return move lines

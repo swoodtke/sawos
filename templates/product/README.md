@@ -25,8 +25,9 @@ python3 tools/sawos.py flash IMAGE        # build it for a part
 `run` hands the terminal to the emulator and exits with its status; `test`
 prints each console and `test IMAGE: passed` or `failed`. `flash`, for a
 board with a flash, writes `build/IMAGE.board/NAME.board.bin` and prints its
-SHA-256, its board and the `esptool` command that writes it; it runs
-nothing, so connecting and writing the part is yours.
+SHA-256, its board, the baud rate the console is at (for a board with a
+console key) and the `esptool` command that writes it; it runs nothing,
+so connecting and writing the part is yours.
 
 `images/hello-riscv32.toml` launches sawos's UART driver and `hello`, its
 client; `images/hello-esp32s3.toml`, on a board with no UART driver,
@@ -54,8 +55,11 @@ flash key needs a clock key on the PLL, and the build refuses one without.
 A board's keys and their values are listed in its `board.toml` in the sawos
 tree (`.sawos/hal/xtensa-esp32s3/board.toml`); a key an image leaves out
 keeps its default, on the ESP32-S3 the clock the ROM left (`rom`), the
-flash read as the ROM left it (`flash = "rom"`) and the console uncounted
-(`stall = "off"`).
+flash read as the ROM left it (`flash = "rom"`), the console uncounted
+(`stall = "off"`) and the console at the ROM's 115200 (`console = "rom"`).
+`console = "b921600"`, `"b2000000"` or `"b3000000"` puts the console at that
+rate once the kernel is up; `flash` prints the rate a capture of the image
+opens, beside the SHA-256.
 
 `tools/sawos.py` needs Python 3.11 or later. It links `.sawos` to the sawos
 tree and runs that tree's `tools/product.py`, which says what each command

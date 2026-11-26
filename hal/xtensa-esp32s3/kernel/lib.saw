@@ -1405,37 +1405,44 @@ public func irq_raise_selftest_line() unsafe -> UInt {
 // The build keys
 // =============================================================================
 //
-// An image's build keys (../ABI.md §14, §18d) are three modules the runner
-// maps to a key's directory under `../keys/`: `s3clock`, the CPU clock;
-// `s3flash`, how the cache reads the flash; and `s3stall`, whether the
-// console counts its stalls. In an image built at the defaults (`rom`, `rom`,
-// the count off) every reference to a key's code folds away, and the image
-// is the bytes it is without the keys. Two things keep it so. The
-// compiler lays out functions and statics in the order the code it lowers
-// first names them, even code an image folds away, so a key's code names
-// nothing in this file: its modules reach their registers through views of
-// their own. And the line of every overflow check in this file is compiled
-// into the image, so the keys are imported down here, below the last one,
-// and `console_byte` and `exit_pass` name the stall count on the line that
-// was there. Nothing else in this file is keyed.
+// An image's build keys (../ABI.md §14, §18d) are four modules the runner maps
+// to a key's directory under `../keys/`: `s3console`, the console's baud rate;
+// `s3clock`, the CPU clock; `s3flash`, how the cache reads the flash; and
+// `s3stall`, whether the console counts its stalls. In an image built at the
+// defaults (`rom`, `rom`, `rom`, the count off) every reference to a key's code
+// folds away, and the image is the bytes it is without the keys. Two things
+// keep it so. The compiler lays out functions and statics in the order the code
+// it lowers first names them, even code an image folds away, so a key's code
+// names nothing in this file: its modules reach their registers through views
+// of their own. And the line of every overflow check in this file is compiled
+// into the image, so the keys are imported down here, below the last one, and
+// `console_byte` and `exit_pass` name the stall count on the line that was
+// there. Nothing else in this file is keyed.
 //
-// `clock_init` is the clock key's, then the flash key's, and `kmain` calls
-// it first, before anything prints or is timed; each `rom` key writes
-// nothing. The flash key comes second because its switch is made for the
+// `clock_init` is the console key's, then the clock key's, then the flash
+// key's, and `kmain` calls it first, before anything prints or is timed; each
+// `rom` key writes nothing. The console key comes first so that every line
+// the keys and the kernel print after it is at its rate: UART0 is clocked
+// by the crystal, which no CPU clock key moves, so the divisor it writes
+// holds through the clock key's switch, whose own drain and
+// `console_on_crystal` then find UART0 on the crystal and write nothing. The
+// flash key comes after the clock key because its switch is made for the
 // memory-SPI core clock the clock key leaves, and it comes before
 // `memory_init`, after which nothing moves that clock. When the stall count
 // is on, `console_byte` writes through the count's own path, which times
 // each wait for FIFO room once the tick is armed, and `exit_pass` prints the
 // count before its own line.
 
+import s3console
 import s3clock
 import s3flash
 import s3stall
 
-/// Set the clocks this image is built for: the CPU's (the clock key), then
-/// how the cache reads the flash at the memory-SPI core clock that leaves
-/// (the flash key).
+/// Set the console's rate this image is built for (the console key), then
+/// the clocks: the CPU's (the clock key), then how the cache reads the flash
+/// at the memory-SPI core clock that leaves (the flash key).
 public func clock_init() unsafe {
+    s3console.console_init()
     s3clock.clock_init()
     s3flash.flash_init()
 }

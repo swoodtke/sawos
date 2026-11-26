@@ -47,13 +47,16 @@ keys/               an image's build keys, each a module mapped to one of
                     default, `clock-xtal40`, `clock-pll80`, `clock-pll160`
                     and `clock-pll240`), `s3flash` (`flash-rom`, the
                     default, `flash-dio80`, `flash-qio80`, `flash-dio40`
-                    and `flash-qio40`) and `s3stall` (`stall-off`, the
-                    default, and `stall-on`), which board.toml's `[keys]`
+                    and `flash-qio40`), `s3stall` (`stall-off`, the
+                    default, and `stall-on`) and `s3console` (`console-rom`,
+                    the default, `console-b921600`, `console-b2000000` and
+                    `console-b3000000`), which board.toml's `[keys]`
                     lists and a product's image chooses from in its own
-                    `[keys]`; ABI.md §14d, §18d. `clock-common` is
-                    `s3clockkit`, what the clock keys that write share, and
+                    `[keys]`; ABI.md §14d, §14i, §18d. `clock-common` is
+                    `s3clockkit`, what the clock keys that write share,
                     `flash-common` is `s3flashkit`, what the flash keys
-                    that switch share
+                    that switch share, and `console-common` is
+                    `s3consolekit`, what the console keys that write share
 dbias/              `s3dbias`, the LDO settings ESP-IDF chooses from the
                     eFuse's calibration: a package of plain Saw that the
                     clock keys' `s3clockkit` and a read-only probe compile
