@@ -19,7 +19,8 @@ import sosabi.{SosStatus, SystemOp, ProcessOp, ThreadOp, Priority, EventOp,
                InterruptOp, ClockOp, TimerOp, MemoryOp, PoolOp, IoMemoryOp,
                MappingOp,
                PipeInletOp, PipeOutletOp, PipeReplyOp, PipeRequestOp,
-               RELEASE_OP, MINT_OP, INFO_OP, PANIC_OP, NO_HANDLE, HandleInfo,
+               RELEASE_OP, MINT_OP, INFO_OP, PANIC_OP, THREAD_ID_OP,
+               LOCK_WAIT_OP, LOCK_WAKE_OP, NO_HANDLE, HandleInfo,
                HandleKind}
 import sosrt.{section_enter, section_leave, section_registered,
              section_word}
@@ -384,6 +385,55 @@ public func sos_thread_exit(handle: UInt, code: UInt) -> UInt {
 @export("sos_thread_yield")
 public func sos_thread_yield(handle: UInt) -> UInt {
     sos_syscall1(handle, ThreadOp.Yield as UInt, 0)
+}
+
+/// The calling thread's own ID (spec §7): a number naming the thread, which
+/// grants nothing. It is made with no handle, needs no right and cannot fail.
+/// The ID of a thread that has exited and whose slot was freed names no later
+/// thread. A lock's owner word is its holder's ID.
+@export("sos_thread_id")
+public func sos_thread_id() unsafe -> UInt {
+    var id: UInt = 0
+    let _ = sos_syscall3(NO_HANDLE, THREAD_ID_OP, 0, 0, 0,
+                         (&var id) as UnsafePointer<UInt>)
+    id
+}
+
+/// Wait for the in-process lock whose two words are at `lock`, which the
+/// caller found held (spec §7): the holder's thread ID, or 0, then the waiters
+/// flag the kernel writes. It is made with no handle and needs no right: it
+/// acts only on the calling thread and a lock of its own process.
+/// `sos_lock_take` is the whole take, swap included.
+///
+/// A holder that is a thread of this process is raised to the caller's level
+/// while the caller parks, and the answer is `SosStatus.Ok` once it gives the
+/// lock back, after which the caller swaps again. A lock already free answers
+/// `Ok` at once. A holder that has exited answers `SosStatus.Revoked`, and so
+/// does a wait parked on one when it exits.
+///
+/// Terminating the caller, decided in this order: a `lock` that is not
+/// word-aligned, a pair the kernel cannot write, an owner word that is the
+/// caller's own ID (`BadState`: the lock is not recursive), an owner word that
+/// names no thread there ever was, a thread never started or another
+/// process's thread (`BadArg`; for another process's thread the kernel first
+/// writes a line naming both processes), and a chain of holders, each parked
+/// on a lock the next holds, that comes back to the caller or passes four
+/// holders (`LockChain`). A park while the caller's section is held ends it
+/// too.
+@export("sos_lock_wait")
+public func sos_lock_wait(lock: UInt) -> UInt {
+    sos_syscall1(NO_HANDLE, LOCK_WAIT_OP, lock)
+}
+
+/// Answer every thread of this process parked on the lock at `lock`, which
+/// the caller gave back and found its waiters flag set (spec §7), clear the
+/// flag, and bring each holder they named back to the level its remaining
+/// waiters owe it. Made with no handle, as `sos_lock_wait` is; a `lock` that
+/// is not word-aligned, or a pair the kernel cannot write, terminates the
+/// caller. `sos_lock_give` is the whole give.
+@export("sos_lock_wake")
+public func sos_lock_wake(lock: UInt) -> UInt {
+    sos_syscall1(NO_HANDLE, LOCK_WAKE_OP, lock)
 }
 
 /// Make an Event owned by the process the handle names, with its handle in the

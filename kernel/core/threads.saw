@@ -20,6 +20,7 @@ import kcore.limits.{
     SYSTEM_LEVELS,
     THREAD_FRAME_STRIDE,
 }
+import kcore.diag.{fatal_kernel}
 import kcore.mem.{align_up}
 import kcore.slab.{Slab}
 import kcore.pslot.{PROCESS_RECORDS, ProcessState}
@@ -162,10 +163,18 @@ public(package) struct ThreadSlot {
     /// `waitables` blocks one on a Waiter's list. The state machine is
     /// described here and nowhere else.
     public(package) state: ThreadState,
-    /// The system level the scheduler runs this thread at (spec §7), read from
-    /// its process's band map at its start and stored plain, so nothing on the
-    /// switch path reads a map. It means nothing before the start.
+    /// The system level the scheduler runs this thread at (spec §7): the
+    /// highest of `base_level` and the level of every thread parked on a lock
+    /// with `lock_holder` naming this one. Stored plain, so nothing on the
+    /// switch path reads a map or a lock. It means nothing before the start.
+    ///
+    /// Written only through `set_level` once the thread is started, because a
+    /// ready thread's level says which list it is on.
     public(package) level: UInt8,
+    /// The level its process's band map gave the band it was started at, read
+    /// once at its start: what `level` comes back to when no lock waiter
+    /// raises it.
+    public(package) base_level: UInt8,
     /// The process the thread runs in and is charged to, or `NO_PROCESS` once
     /// that process has died and disowned it (an `Exited` or `Invalid` slot
     /// still named elsewhere, spec §2.10). Test for that before using it as an
@@ -227,18 +236,34 @@ public(package) struct ThreadSlot {
     /// Interrupt, or the slot's reuse, cannot change what this delivery
     /// measures.
     public(package) latency_from: UInt64,
+    /// The lock this thread is parked on (`LOCK_WAIT_OP`), as the user
+    /// address of its pair; it means nothing unless `lock_holder` is set. A
+    /// thread parked on a lock is on no list: the wake that answers it scans
+    /// for this address.
+    public(package) lock_at: UInt,
+    /// The thread the lock's owner word named at the park (slot + 1; 0 =
+    /// parked on no lock): the holder this thread raises for as long as it
+    /// is parked there.
+    public(package) lock_holder: Int,
     /// Handle entries naming this thread, plus the staged messages that carry
     /// it.
     public(package) refs: UInt16,
+    /// The slot's generation, the high part of the ID of the thread in it
+    /// (`thread_id`). It moves on when the slot is freed, and is kept across
+    /// every other write of the slot, so an ID names one occupant of the slot
+    /// until the generation wraps (`GENERATION_MODULUS`).
+    public(package) generation: UInt32,
 }
 
 /// The thread slab: an extent chain, with the frame arena riding the extent
 /// table's side column (see `frame_slot`). Loop bounds read `capacity()`.
 public(package) unsafe static var THREADS: Slab<ThreadSlot, MAX_THREADS> = Slab<ThreadSlot, MAX_THREADS>(
-    inline: [ThreadSlot(state: ThreadState.Free, level: 0, process: 0,
-                        exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
-                        call_pipe: 0, call_claim: 0, call_src: 0,
-                        call_len: 0, latency_irq: 0, latency_from: 0, refs: 0); MAX_THREADS],
+    inline: [ThreadSlot(state: ThreadState.Free, level: 0, base_level: 0,
+                        process: 0, exit_code: 0, joiners: 0, link: 0,
+                        wait_buf: 0, call_pipe: 0, call_claim: 0, call_src: 0,
+                        call_len: 0, latency_irq: 0, latency_from: 0,
+                        lock_at: 0, lock_holder: 0,
+                        refs: 0, generation: 0); MAX_THREADS],
     ext_base: [0; MAX_SLAB_EXTENTS],
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
@@ -494,6 +519,39 @@ public(package) func ready_rotate(slot: Int) unsafe {
     THREADS[slot].link = 0
 }
 
+/// Give started thread `slot` the level `level`, moving it to the tail of that
+/// level's list when it is ready (spec §7's inheritance lock raising or
+/// lowering it).
+///
+/// A ready thread's push asks for a switch when the new level is above the
+/// running thread's, as any wake does. A running thread is on no list, so its
+/// level is only written; the caller that lowered it asks for the switch
+/// itself, since a lowered running thread can be below a ready one. A parked
+/// thread is written too, and its wake pushes it at the level it has then.
+public(package) func set_level(slot: Int, level: UInt8) unsafe {
+    if THREADS[slot].level == level {
+        return
+    }
+    match THREADS[slot].state {
+        case Runnable -> ready_move(slot, level),
+        case _ -> { THREADS[slot].level = level },
+    }
+}
+
+/// Unlink ready thread `slot` from its level's list and push it at the tail
+/// of `level`'s.
+///
+/// A ready thread is always on its level's list: every write of `Runnable` is
+/// followed by a push, and every level change of a ready thread comes here.
+/// So the removal finds it, and its `fatal_kernel` is a kernel bug's stop.
+func ready_move(slot: Int, level: UInt8) unsafe {
+    if not ready_remove(slot) {
+        fatal_kernel("a ready thread was on no ready list", slot as UInt)
+    }
+    THREADS[slot].level = level
+    ready_push(slot)
+}
+
 /// Take every thread of process `p` off the ready lists, leaving everybody
 /// else's where they were.
 ///
@@ -615,11 +673,59 @@ public(package) func alloc_thread() unsafe -> Int {
 
 /// Give thread slot `t` back to the pool. The caller has established that
 /// nothing runs in it and nothing names it.
+///
+/// The slot's generation moves on here and nowhere else, so the ID of the
+/// thread that was in it no longer names the slot's next occupant.
 public(package) func free_thread_slot(t: Int) unsafe {
-    THREADS[t] = ThreadSlot(state: ThreadState.Free, level: 0, process: 0,
-                            exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
-                            call_pipe: 0, call_claim: 0, call_src: 0,
-                            call_len: 0, latency_irq: 0, latency_from: 0, refs: 0)
+    let next = ((THREADS[t].generation as UInt) + 1) % GENERATION_MODULUS
+    THREADS[t] = ThreadSlot(state: ThreadState.Free, level: 0, base_level: 0,
+                            process: 0, exit_code: 0, joiners: 0, link: 0,
+                            wait_buf: 0, call_pipe: 0, call_claim: 0,
+                            call_src: 0, call_len: 0, latency_irq: 0,
+                            latency_from: 0, lock_at: 0, lock_holder: 0,
+                            refs: 0,
+                            generation: next as UInt32)
+}
+
+// -----------------------------------------------------------------------------
+// Thread IDs (spec §7)
+// -----------------------------------------------------------------------------
+//
+// An ID is a slot's index plus one in the low `hal.THREAD_ID_INDEX_BITS` bits
+// and the slot's generation in the `hal.THREAD_ID_GENERATION_BITS` above
+// them, the board's split. It is opaque outside the kernel, which alone
+// decodes it, and never leaves the machine, so it needs no portable layout.
+
+/// The index field's mask, and how many generations a slot has before its
+/// generation wraps.
+public(package) static ID_INDEX_MASK: UInt = ((1 as UInt) << hal.THREAD_ID_INDEX_BITS) - 1
+public(package) static GENERATION_MODULUS: UInt = (1 as UInt) << hal.THREAD_ID_GENERATION_BITS
+
+static_assert(hal.THREAD_ID_GENERATION_BITS <= 32,
+              "a slot's generation is kept in 32 bits")
+
+/// The generation a new thread in free slot `t` takes: the slot's own, which
+/// its last free moved on. Every write that puts a thread in a slot reads it
+/// here, so no occupant takes an ID an earlier one had.
+public(package) func slot_generation(t: Int) unsafe -> UInt32 {
+    THREADS[t].generation
+}
+
+/// The ID of the thread in slot `t`. It names the thread and grants nothing.
+public(package) func thread_id(t: Int) unsafe -> UInt {
+    ((THREADS[t].generation as UInt) << hal.THREAD_ID_INDEX_BITS) |
+        ((t + 1) as UInt)
+}
+
+/// The slot field of ID `id`: a slot's index plus one, or 0, no slot.
+public(package) func id_index(id: UInt) -> UInt {
+    id & ID_INDEX_MASK
+}
+
+/// The generation field of ID `id`, and whatever lies above it, so that a
+/// word wider than an ID reads as a generation no slot has.
+public(package) func id_generation(id: UInt) -> UInt {
+    id >> hal.THREAD_ID_INDEX_BITS
 }
 
 /// How many of a process's threads have not exited.

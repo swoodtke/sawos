@@ -1,0 +1,133 @@
+//! `Lock`: a lock inside one process whose holder inherits the level of the
+//! threads waiting for it (spec §7).
+//!
+//! A lock is two machine words in the process's memory: the holder's thread
+//! ID, or 0 while it is free, and a waiters flag the kernel writes. Taking a
+//! free lock and giving back one nobody waits for are a compare-and-swap each,
+//! with no trap. A thread that finds the lock held parks in the kernel
+//! (`LOCK_WAIT_OP`), which raises the holder to the waiter's level until it
+//! gives the lock back; a give that finds the flag set traps once
+//! (`LOCK_WAKE_OP`) to answer the waiters. Both are made with no handle, so
+//! every thread can take a lock, one with no Thread handle of its own
+//! included.
+//!
+//! A thread's identity here is its ID, which its block keeps, read once at
+//! the thread's start (every thread a `main` program or `thread_create(run:)`
+//! makes); a thread with no block asks the kernel for it at each take.
+//!
+//! The C floor is `sos_lock_take` and `sos_lock_give`, over the address of
+//! the two words; `Lock` is the same two calls on a pair of its own.
+
+import sosabi.{SosStatus}
+import sos.floor.{checked, sos_lock_wait, sos_lock_wake}
+import sos.rt.{own_thread_id}
+
+/// The owner word, then the waiters flag.
+static OWNER: Int = 0
+static WAITERS: Int = 1
+
+static STATUS_OK: UInt = SosStatus.Ok as UInt
+
+/// A lock between the threads of one process, whose holder runs at the
+/// level of the highest thread waiting for it until it gives it back.
+///
+/// It is for state threads at several levels share across something long or
+/// something that parks, such as a print: a waiter parks rather than spins,
+/// and a thread between the waiter's level and the holder's cannot keep the
+/// holder off the processor, because the holder runs at the waiter's level.
+/// For short state that never parks, `Section` is cheaper and holds every
+/// sibling back.
+///
+/// The lock is not recursive: a thread that takes a lock it holds ends its
+/// process. A thread that exits holding a lock answers every thread waiting
+/// for it with `SosStatus.Revoked`, and so does every later wait for it.
+/// Waiting inside a held section ends the process (`SectionHeld`), since the
+/// holder could never run to give the lock back. A lock is the process's own:
+/// one whose owner is another process's thread, through memory the two share,
+/// ends the process that waits for it.
+///
+/// Zero is a free lock, so a `static` needs no initializer.
+///
+/// The kernel knows a lock by its address, yet `Lock` is not `NoMove`, for
+/// the reason std's `Mutex` is not: nothing can move it while the address
+/// matters. The kernel keeps the address only while a thread waits, and a
+/// waiting thread is inside `take`, which borrows the lock for the whole
+/// wait. A move needs exclusive ownership, which no lock threads share
+/// through a reference has. A held lock nobody waits for may move: the owner
+/// word and the waiters flag move with it, and the give finds them at the new
+/// address. Being movable is what lets a lock be a field of a value that
+/// moves. The C floor (`sos_lock_take`, `sos_lock_give`) takes a bare
+/// address, so a C caller keeps the pair in place itself.
+public struct Lock {
+    private words: [Atomic<Int>; 2],
+}
+
+extension Lock: NoCopy {}
+
+extension Lock: ZeroInit {}
+
+extension Lock {
+    /// A free lock.
+    public init() -> Lock {
+        Lock(words: [Atomic(0), Atomic(0)])
+    }
+
+    /// Take the lock, waiting while another thread holds it, raised to the
+    /// calling thread's level while it does.
+    ///
+    /// `Err(SosStatus.Revoked)` when the holder exited without giving it
+    /// back: nothing ever will. Taking a lock the calling thread holds, or
+    /// waiting inside a held section, ends the process.
+    public func take(&self) -> Result<Void, SosStatus> {
+        checked(sos_lock_take(self.pair()))
+    }
+
+    /// Give the lock back, answering the threads waiting for it. Giving back
+    /// a lock the calling thread does not hold panics.
+    public func give(&self) {
+        let status = sos_lock_give(self.pair())
+        if status != STATUS_OK {
+            panic("sos: Lock.give: the kernel refused the wake: {}", status)
+        }
+    }
+
+    /// The address of the two words.
+    func pair(&self) unsafe -> UInt {
+        ((&self.words) as UnsafePointer<Atomic<Int>>) as UInt
+    }
+}
+
+/// Take the lock whose two words are at `lock` (spec §7): swap the owner word
+/// from 0 to the caller's ID, and while another thread holds it, wait in the
+/// kernel (`sos_lock_wait`), which raises the holder. Answers `SosStatus.Ok`
+/// once the caller holds it, or `SosStatus.Revoked` when its holder exited
+/// holding it. Taking a lock the caller holds ends the process.
+@export("sos_lock_take")
+public func sos_lock_take(lock: UInt) unsafe -> UInt {
+    let words = lock as UnsafePointer<Atomic<Int>>
+    let me = Int.from(truncating: own_thread_id())
+    while not words[OWNER].compare_exchange(0, me) {
+        let status = sos_lock_wait(lock)
+        if status != STATUS_OK {
+            return status
+        }
+    }
+    STATUS_OK
+}
+
+/// Give back the lock whose two words are at `lock` (spec §7): swap the owner
+/// word from the caller's ID to 0, and if the waiters flag is set, trap once
+/// to answer the waiters (`sos_lock_wake`). Answers `SosStatus.Ok`. Giving
+/// back a lock the caller does not hold panics.
+@export("sos_lock_give")
+public func sos_lock_give(lock: UInt) unsafe -> UInt {
+    let words = lock as UnsafePointer<Atomic<Int>>
+    let me = Int.from(truncating: own_thread_id())
+    if not words[OWNER].compare_exchange(me, 0) {
+        panic("sos: Lock.give: the calling thread does not hold the lock")
+    }
+    if words[WAITERS].load() == 0 {
+        return STATUS_OK
+    }
+    sos_lock_wake(lock)
+}

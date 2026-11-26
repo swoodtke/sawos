@@ -34,7 +34,7 @@ import kcore.limits.{
     NO_THREAD,
     ROOT_PROCESS,
 }
-import kcore.result.{op_status, op_value, write_result}
+import kcore.result.{SyscallResult, op_ok, op_status, op_value, write_result}
 import kcore.mem.{word_bytes}
 import kcore.diag.{ExitCode, console, fatal_deadlock, fatal_kernel}
 import kcore.stats.{stats_read}
@@ -79,6 +79,7 @@ import kcore.threads.{
     ready_remove,
     ready_remove_process,
     ready_rotate,
+    set_level,
     unjoin_process,
 }
 import kcore.time.{TIMERS, TimerState, reprogram_timer}
@@ -517,8 +518,136 @@ func ready_sibling(t: Int, p: Int) unsafe -> Bool {
     }
 }
 
-/// Retire the running thread with `code`, waking everything that joined it, and
-/// release `handle`, the word the exit was invoked through.
+// =============================================================================
+// The inheritance lock (spec §7)
+// =============================================================================
+//
+// A lock is a pair of machine words in a process's memory: its holder's
+// thread ID, or 0, and a waiters flag the kernel writes. The process takes
+// and gives back a free lock with compare-and-swaps and no trap; the kernel
+// sees a lock only when a thread finds it held (`LOCK_WAIT_OP`) and when a
+// holder gives it back with the flag set (`LOCK_WAKE_OP`).
+//
+// The kernel keeps no record per lock. A thread parked on one names the lock
+// (`ThreadSlot.lock_at`) and the holder its owner word resolved to
+// (`ThreadSlot.lock_holder`), and a thread's level is the highest of its base
+// level and the levels of the threads parked naming it as their holder. A
+// wait raises the holder to the waiter's level, and the holder of whatever
+// lock that holder is parked on, and so on along the chain; a wake answers
+// the lock's waiters and brings each holder they named back to what its
+// remaining waiters owe it. Every thread involved is of one process, so a
+// thread is never raised above a level its own process's map gives.
+//
+// No wait closes a cycle: the wait's walk refuses one that would come back to
+// the caller, and one that would pass `LOCK_CHAIN_MAX` holders, as the
+// `LockChain` fault. So every walk below, which follows the chain from a
+// thread to the holder it is parked behind, ends. A raise stops within
+// `LOCK_CHAIN_MAX` holders, its wait's own walk; a lowering follows the chain
+// as far as levels change, which can be further, since the bound is on each
+// wait's walk and not on a chain's length.
+
+/// Raise thread `holder`, and each holder along the chain it is parked in, to
+/// at least `level`.
+///
+/// It stops at the first thread already at or above `level`: a holder is
+/// always at least the level of every thread parked behind it, so the rest of
+/// the chain is too.
+public(package) func lock_raise(holder: Int, level: UInt8) unsafe {
+    var h = holder
+    while THREADS[h].level < level {
+        set_level(h, level)
+        if THREADS[h].lock_holder == 0 {
+            return
+        }
+        h = THREADS[h].lock_holder - 1
+    }
+}
+
+/// The level thread `t` is owed: the highest of its base level and the level
+/// of every thread parked on a lock naming it as the holder. A scan of the
+/// thread slab, since the kernel keeps no list of a holder's waiters.
+func lock_owed(t: Int) unsafe -> UInt8 {
+    var level = THREADS[t].base_level
+    var w: Int = 0
+    while w < THREADS.capacity() {
+        if THREADS[w].lock_holder == t + 1 && THREADS[w].level > level {
+            level = THREADS[w].level
+        }
+        w = w + 1
+    }
+    level
+}
+
+/// Bring thread `t`'s level to what it is owed, and so on along the chain it
+/// is parked in, until a thread's level does not change.
+func lock_recompute(t: Int) unsafe {
+    var h = t
+    while {
+        let owed = lock_owed(h)
+        if owed == THREADS[h].level {
+            return
+        }
+        set_level(h, owed)
+        if THREADS[h].lock_holder == 0 {
+            return
+        }
+        h = THREADS[h].lock_holder - 1
+    }
+}
+
+/// Answer thread `w`, parked on a lock, with `result`, and ready it.
+///
+/// The pair is written into its frame here, once, as a joiner's is: the wait
+/// wrote nothing when it parked. It goes onto the list of the level it has
+/// now, raised by its own waiters if it holds another lock.
+func lock_unpark(w: Int, result: SyscallResult) unsafe {
+    write_result(frame_slot(w), result)
+    THREADS[w].lock_at = 0
+    THREADS[w].lock_holder = 0
+    THREADS[w].state = ThreadState.Runnable
+    ready_push(w)
+}
+
+/// `LOCK_WAKE_OP`'s work: answer `Ok` to every thread of process `p`
+/// parked on the lock at user address `addr`, in slot order, and bring each
+/// holder one of them named back to what its remaining waiters owe it.
+///
+/// Every waiter is answered, not only those naming the caller: the caller
+/// writes the waiters flag to zero after this, so a thread left parked would
+/// never be answered. One parked behind a thread that took the lock between
+/// the caller's give and its trap finds it held again and waits again,
+/// raising that holder anew.
+public(package) func lock_wake(p: Int, addr: UInt) unsafe {
+    var w: Int = 0
+    while w < THREADS.capacity() {
+        if THREADS[w].lock_holder != 0 && THREADS[w].lock_at == addr &&
+           THREADS[w].process == p {
+            let holder = THREADS[w].lock_holder - 1
+            lock_unpark(w, op_ok())
+            lock_recompute(holder)
+        }
+        w = w + 1
+    }
+}
+
+/// Answer every thread parked on a lock thread `slot` holds with `Revoked`:
+/// `slot` is exiting, and nothing will give the lock back.
+///
+/// The exiting thread is running, so it is parked on no lock and raised
+/// nobody along a chain; its own raise ends with it.
+func lock_revoke_waiters(slot: Int) unsafe {
+    var w: Int = 0
+    while w < THREADS.capacity() {
+        if THREADS[w].lock_holder == slot + 1 {
+            lock_unpark(w, op_status(SosStatus.Revoked))
+        }
+        w = w + 1
+    }
+}
+
+/// Retire the running thread with `code`, waking everything that joined it and
+/// everything parked on a lock it holds, and release `handle`, the word the
+/// exit was invoked through.
 ///
 /// A joiner's return is written here, into its frame. A thread that blocks in a
 /// syscall must not have its result written when it blocks, or the resume would
@@ -550,6 +679,10 @@ public(package) func exit_thread(slot: Int, code: UInt, handle: UInt) unsafe {
         THREADS[waiter].state = ThreadState.Runnable
         ready_push(waiter)
     }
+    // A thread that exits holding a lock others are parked on leaves them
+    // nothing to wait for (spec §7). The kernel cannot see a lock nobody
+    // waits on, so the exit itself is no fault.
+    lock_revoke_waiters(slot)
 
     // The process is read once, here: the slot may be freed before the switch.
     let p = THREADS[slot].process
@@ -597,10 +730,13 @@ func invalidate_thread(t: Int, p: Int) unsafe {
     }
     quota_credit(p, QuotaKind.Thread)
     let refs = THREADS[t].refs
-    THREADS[t] = ThreadSlot(state: ThreadState.Invalid, level: 0, process: p,
-                            exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
-                            call_pipe: 0, call_claim: 0, call_src: 0,
-                            call_len: 0, latency_irq: 0, latency_from: 0, refs: refs)
+    THREADS[t] = ThreadSlot(state: ThreadState.Invalid, level: 0,
+                            base_level: 0, process: p, exit_code: 0,
+                            joiners: 0, link: 0, wait_buf: 0, call_pipe: 0,
+                            call_claim: 0, call_src: 0, call_len: 0,
+                            latency_irq: 0, latency_from: 0, lock_at: 0,
+                            lock_holder: 0, refs: refs,
+                            generation: THREADS[t].generation)
 }
 
 /// Invalidate Waiter `w` of dying process `p` (spec §2.10): it stays, for the

@@ -1,0 +1,530 @@
+// The inheritance lock (spec §7), from root's side. Root's manifest puts its
+// main thread at level 2, with `High` at 3 above it. This image's kernel arms
+// no tick, so every switch is one a thread makes, and each line comes after
+// what it waits for has happened.
+//
+// Root launches a child once per round, waits for its death and prints its
+// status word:
+//
+//   SOS lock: <round> ended status=<word>
+//
+// Given `lock-child`'s regions alone, root runs `inherit`. Given
+// `lock-child`'s and then `lock-raw`'s, it runs the rest of `lock-child`'s
+// rounds and then `lock-raw`'s (each child's own comment says what each
+// does). `lock-child` is mapped with `Normal` at 7, above every band it
+// starts its threads at, and `Rt0` to `Rt2` at 4 to 6; `lock-raw` keeps the
+// simple map but for `raw thread`, which it shares, and is told root's main
+// thread's ID.
+//
+// Given `lock-raw`'s regions and the pool, root runs `foreign wake`. It maps a
+// piece of the pool into itself and takes a lock there through the C floor,
+// and its thread W, at `High`, waits for it and parks. The child, given the
+// same piece, wakes the lock's words at its own address for them, which on a
+// profile that places both at one address is the address W waits on. The
+// wake answers threads of the waker's process only, so W stays parked until
+// root gives the lock back: the child's line and root's, then W's. The
+// child's wake writes the waiters flag the two share to zero, so root gives
+// the lock back by hand and wakes it. R, a thread of root's at `Low`, is
+// ready across the give, which brings root back to its own level, above R:
+// root's line after W's, then R's.
+//
+// Then `torn`: `lock-raw`, mapped with `Normal` at 7, holds a lock and sends
+// root a stack top; root makes W in it on that stack and starts it, and W
+// waits for the lock and parks. Root kills the child holding W's handle, so
+// W's slot outlives the child, `Invalid`. Root's next thread, R, takes the
+// slot the child's holder had, which the slab hands out lowest first, and
+// exits: a torn-down waiter names no holder, so R's exit answers nobody.
+// Then root joins B, at `Background`, which the pick finds first at that
+// level only because R's exit readied nothing there: B's line. W sent root
+// its ID before it parked, and with W's slot still held, invalid and
+// disowned, `dead held` has another child wait with that ID as its owner: an
+// invalid thread holds nothing, so the child's wait is the `BadArg` fault,
+// with no line, since W names no process that runs.
+//
+// `dead exited`: root makes W in a child, W sends its ID and exits, and root
+// kills the child holding W's handle, so W's slot is held, exited and
+// disowned; another child's wait with W's ID answers `Revoked` (8), as an
+// exited holder's does.
+//
+// `foreign exited`: the same, but another child waits with W's ID while W's
+// child still runs, so W is an exited thread of a live process: the line
+// naming both processes, then the waiter's `BadArg` fault.
+//
+// `reuse`: a first child sends root its main thread's ID and exits; a second,
+// whose main thread takes the freed slot, parks, and root's wait with the
+// first's ID answers `Revoked` (8): the slot's generation moved on. Root kills
+// the second, a third takes the slot, and root's wait with that slot's ID at
+// generation 1 answers `Revoked` too: the kill's invalidation kept the slot's
+// generation, and the free after it moved it on.
+
+import sos.{Process, Memory, Pool, Thread, Event, BootSet, Priority,
+            SosStatus, SystemRight, MapAccess, QuotaKind, sos_lock_take,
+            sos_lock_give, sos_lock_wait, sos_lock_wake, sos_thread_id}
+import sosmain
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+/// The boot set's shapes: `lock-child`'s image and RAM; `lock-child`'s and
+/// `lock-raw`'s images and then their RAM; `lock-raw`'s image, RAM and the
+/// pool.
+static INHERIT_ONLY: Int = 2
+static FOREIGN_WAKE: Int = 3
+static TAG_IMAGE: UInt = 0
+static TAG_RAM: UInt = 1
+static TAG_POOL: UInt = 2
+static TAG_CHILD_IMAGE: UInt = 0
+static TAG_RAW_IMAGE: UInt = 1
+static TAG_CHILD_RAM: UInt = 2
+static TAG_RAW_RAM: UInt = 3
+
+/// What root gives the children.
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 40
+static TAG_ROOT_ID: UInt = 41
+static TAG_ADDR: UInt = 44
+static TAG_STACK: UInt = 45
+
+static KEY_DEATH: UInt = 6
+
+/// The code `torn` kills its child with.
+static KILL_CODE: UInt = 9
+
+/// `lock-child`'s map: `Background` 0, `Low` 1, `Normal` 7, `High` 3, `Rt0`
+/// 4, `Rt1` 5, `Rt2` 6, `Rt3` 7.
+static LOCK_MAP: UInt32 = 0x7654_3710
+
+/// What `lock-child` holds at once at most: its main thread and six more,
+/// each made with two handles, and two gates.
+static CHILD_THREADS: UInt16 = 7
+static CHILD_HANDLES: UInt16 = 24
+
+/// `lock-child`'s roles.
+static ROLE_INHERIT: UInt = 1
+static ROLE_CHAIN: UInt = 2
+static ROLE_TWO_LOCKS: UInt = 3
+static ROLE_WAKE_ALL: UInt = 4
+static ROLE_HOLDER_EXITS: UInt = 5
+static ROLE_CYCLE: UInt = 6
+static ROLE_FOUR: UInt = 7
+static ROLE_FIVE: UInt = 8
+static ROLE_IN_SECTION: UInt = 9
+static ROLE_RELOCK: UInt = 10
+static ROLE_GIVE_UNHELD: UInt = 11
+static ROLE_UNCONTENDED: UInt = 12
+static ROLE_STALE: UInt = 13
+static ROLE_WAKE_ADDRESS: UInt = 15
+static ROLE_HIGHEST: UInt = 16
+
+/// `lock-raw`'s roles.
+static RAW_FREE_WAIT: UInt = 1
+static RAW_EXITED: UInt = 2
+static RAW_FREED: UInt = 3
+static RAW_UNSTARTED: UInt = 4
+static RAW_AHEAD: UInt = 5
+static RAW_NO_SLOT: UInt = 6
+static RAW_PAST_SLAB: UInt = 7
+static RAW_WIDE: UInt = 8
+static RAW_FOREIGN: UInt = 9
+static RAW_UNALIGNED: UInt = 10
+static RAW_READONLY: UInt = 11
+static RAW_STRADDLE: UInt = 12
+static RAW_WAKE_UNALIGNED: UInt = 13
+static RAW_FOREIGN_WAKE: UInt = 14
+static RAW_RAW_THREAD: UInt = 15
+static RAW_TORN: UInt = 16
+static RAW_LAST_SLOT: UInt = 17
+static RAW_DEAD_EXITED: UInt = 18
+static RAW_ID_AND_EXIT: UInt = 19
+static RAW_ID_AND_PARK: UInt = 20
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
+                               | SystemRight.Transfer)
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// The piece of the pool `foreign wake` shares: whole pages, so whole grains
+/// on every profile.
+static PIECE_LEN: UInt = 0x2000
+
+/// W's and R's stacks. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_R: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+
+func top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func top_r() unsafe -> UInt {
+    let base = ((&var STACK_R) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func main() -> Result<Void, SosStatus> {
+    var set = sosmain.take_boot_set()
+    if set.len() == INHERIT_ONLY {
+        let img = take_memory(&var set, TAG_IMAGE)
+        let ram = take_memory(&var set, TAG_RAM)
+        try typed(&img, &ram, "inherit", ROLE_INHERIT)
+    } else if set.len() == FOREIGN_WAKE {
+        let img = take_memory(&var set, TAG_IMAGE)
+        let ram = take_memory(&var set, TAG_RAM)
+        guard var pool_rec = set.take(TAG_POOL) else {
+            panic("SOS lock: no record under tag {}", TAG_POOL)
+        }
+        guard let pool = pool_rec.take_pool() else {
+            panic("SOS lock: the record under tag {} is no Pool", TAG_POOL)
+        }
+        try foreign_wake(&img, &ram, &pool)
+        try torn(&img, &ram)
+        try dead_exited(&img, &ram)
+        try foreign_exited(&img, &ram)
+        try reuse(&img, &ram)
+    } else {
+        let child_img = take_memory(&var set, TAG_CHILD_IMAGE)
+        let raw_img = take_memory(&var set, TAG_RAW_IMAGE)
+        let child_ram = take_memory(&var set, TAG_CHILD_RAM)
+        let raw_ram = take_memory(&var set, TAG_RAW_RAM)
+        try typed_rounds(&child_img, &child_ram)
+        try raw_rounds(&raw_img, &raw_ram)
+    }
+    print("SOS lock: done")
+    return
+}
+
+func typed_rounds(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    try typed(&img, &ram, "chain", ROLE_CHAIN)
+    try typed(&img, &ram, "two locks", ROLE_TWO_LOCKS)
+    try typed(&img, &ram, "wake all", ROLE_WAKE_ALL)
+    try typed(&img, &ram, "holder exits", ROLE_HOLDER_EXITS)
+    try typed(&img, &ram, "cycle", ROLE_CYCLE)
+    try typed(&img, &ram, "four", ROLE_FOUR)
+    try typed(&img, &ram, "five", ROLE_FIVE)
+    try typed(&img, &ram, "in section", ROLE_IN_SECTION)
+    try typed(&img, &ram, "relock", ROLE_RELOCK)
+    try typed(&img, &ram, "give unheld", ROLE_GIVE_UNHELD)
+    try typed(&img, &ram, "uncontended", ROLE_UNCONTENDED)
+    try typed(&img, &ram, "stale", ROLE_STALE)
+    try typed(&img, &ram, "wake address", ROLE_WAKE_ADDRESS)
+    try typed(&img, &ram, "highest", ROLE_HIGHEST)
+    return
+}
+
+func raw_rounds(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    try raw(&img, &ram, "free wait", RAW_FREE_WAIT, false)
+    try raw(&img, &ram, "exited", RAW_EXITED, false)
+    try raw(&img, &ram, "freed", RAW_FREED, false)
+    try raw(&img, &ram, "unstarted", RAW_UNSTARTED, false)
+    try raw(&img, &ram, "ahead", RAW_AHEAD, false)
+    try raw(&img, &ram, "no slot", RAW_NO_SLOT, false)
+    try raw(&img, &ram, "last slot", RAW_LAST_SLOT, false)
+    try raw(&img, &ram, "past slab", RAW_PAST_SLAB, false)
+    try raw(&img, &ram, "wide", RAW_WIDE, false)
+    try raw(&img, &ram, "foreign", RAW_FOREIGN, false)
+    try raw(&img, &ram, "unaligned", RAW_UNALIGNED, false)
+    try raw(&img, &ram, "readonly", RAW_READONLY, false)
+    try raw(&img, &ram, "straddle", RAW_STRADDLE, false)
+    try raw(&img, &ram, "wake unaligned", RAW_WAKE_UNALIGNED, false)
+    try raw(&img, &ram, "raw thread", RAW_RAW_THREAD, true)
+    return
+}
+
+func take_memory(set: &var BootSet, tag: UInt) -> Memory {
+    guard var record = set.take(tag) else {
+        panic("SOS lock: no record under tag {}", tag)
+    }
+    guard let memory = record.take_memory() else {
+        panic("SOS lock: the record under tag {} is no Memory", tag)
+    }
+    move memory
+}
+
+/// A `lock-child` round: the child mapped with `LOCK_MAP`, given its role and
+/// room for its threads, started and waited out.
+func typed(img: &Memory, ram: &Memory, round: String,
+           role: UInt) -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try child.band_map(map: LOCK_MAP)
+    try child.quota_set(QuotaKind.Thread, limit: CHILD_THREADS)
+    try child.quota_set(QuotaKind.Handle, limit: CHILD_HANDLES)
+    try tell(&child, TAG_ROLE, role)
+    try start(&child)
+    try ended(move child, round)
+}
+
+/// A `lock-raw` round: the child given its role and root's main thread's ID,
+/// mapped with `LOCK_MAP` when `mapped` says, else under the simple map, and
+/// with room for its threads, started and waited out.
+func raw(img: &Memory, ram: &Memory, round: String, role: UInt,
+         mapped: Bool) unsafe -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    if mapped {
+        try child.band_map(map: LOCK_MAP)
+    }
+    try child.quota_set(QuotaKind.Thread, limit: CHILD_THREADS)
+    try child.quota_set(QuotaKind.Handle, limit: CHILD_HANDLES)
+    try tell(&child, TAG_ROLE, role)
+    try tell(&child, TAG_ROOT_ID, sos_thread_id())
+    try start(&child)
+    try ended(move child, round)
+}
+
+/// Give `child` an Event that carries `value`, under `tag`.
+func tell(child: &Process, tag: UInt, value: UInt) -> Result<Void, SosStatus> {
+    let ev = try sosmain.context().process().event_create()
+    try ev.signal(bits: value)
+    try child.give(event: move ev, tag: tag) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}
+
+/// Give `child` a System under `TAG_BOOT` and start it on it.
+func start(child: &Process) -> Result<Void, SosStatus> {
+    let boot = try sosmain.context().system().mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try child.start(boot_tag: TAG_BOOT)
+    return
+}
+
+/// Wait for `child`'s death and print its status word.
+func ended(child: Process, round: String) -> Result<Void, SosStatus> {
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH {
+                return BUG
+            }
+            print("SOS lock: {} ended status={}", round, status)
+        },
+        case _ -> { return BUG },
+    }
+    return
+}
+
+// -----------------------------------------------------------------------------
+// foreign wake
+// -----------------------------------------------------------------------------
+
+func foreign_wake(img: &Memory, ram: &Memory,
+                  pool: &Pool) unsafe -> Result<Void, SosStatus> {
+    let piece = try pool.allocate(len: PIECE_LEN)
+    let mine = try sosmain.context().process().map(memory: &piece, access: RW)
+    let at = try mine.base()
+    try taken(sos_lock_take(at))
+    let w = try sosmain.context().process().thread_create(run: foreign_w,
+                                                         arg: at,
+                                                         stack_top: top())
+    try w.start(band: Priority.High)
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try tell(&child, TAG_ROLE, RAW_FOREIGN_WAKE)
+    let theirs = try child.map(memory: &piece, access: RW)
+    try tell(&child, TAG_ADDR, try theirs.base())
+    try start(&child)
+    try ended(move child, "foreign wake")
+    // The child's wake wrote the waiters flag both share to zero, so root
+    // gives the lock back by hand: the owner word to zero, then the wake.
+    print("SOS lock: foreign wake: root gives the lock back")
+    let r = try sosmain.context().process().thread_create(run: foreign_r,
+                                                         arg: 0,
+                                                         stack_top: top_r())
+    try r.start(band: Priority.Low)
+    let words = at as UnsafePointer<UInt>
+    words[0] = 0
+    try taken(sos_lock_wake(at))
+    print("SOS lock: foreign wake: root after the give")
+    let _ = try w.join()
+    let _ = try r.join()
+    return
+}
+
+// -----------------------------------------------------------------------------
+// torn
+// -----------------------------------------------------------------------------
+
+func torn(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try child.band_map(map: LOCK_MAP)
+    try tell(&child, TAG_ROLE, RAW_TORN)
+    let stack = try sosmain.context().process().event_create()
+    let kept = try stack.mint()
+    try child.give(event: move stack, tag: TAG_STACK) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    // The child's first thread runs above root from the start's return, and
+    // has sent the stack top and parked by the time root runs again.
+    try start(&child)
+    let top = try kept.receive()
+    let w = try child.thread_create(stack_top: top, arg: 0)
+    try w.start()
+    let wid = try kept.receive()
+    try child.kill(code: KILL_CODE)
+    try ended(move child, "torn")
+    let r = try sosmain.context().process().thread_create(run: torn_r, arg: 0,
+                                                         stack_top: top_r())
+    try r.start(band: Priority.High)
+    let _ = try r.join()
+    print("SOS lock: torn: R exited in the holder's old slot")
+    let _ = move r
+    let b = try sosmain.context().process().thread_create(run: torn_b, arg: 0,
+                                                         stack_top: top_r())
+    try b.start(band: Priority.Background)
+    let _ = try b.join()
+    try dead_owner(&img, &ram, wid, "dead held")
+    let _ = move w
+    return
+}
+
+/// A `lock-raw` child waits with `wid` as its lock's owner word.
+func dead_owner(img: &Memory, ram: &Memory, wid: UInt,
+                round: String) -> Result<Void, SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try tell(&child, TAG_ROLE, RAW_FOREIGN)
+    try tell(&child, TAG_ROOT_ID, wid)
+    try start(&child)
+    try ended(move child, round)
+}
+
+/// A child mapped with `LOCK_MAP`, told `role`, given an Event under
+/// `TAG_STACK` and started, and root's sibling of the Event.
+func launch_telling(img: &Memory, ram: &Memory,
+                    role: UInt) -> Result<(Process, Event), SosStatus> {
+    let child = try sosmain.context().system().process_create(image: &img,
+                                                             memory: &ram)
+    try child.band_map(map: LOCK_MAP)
+    try tell(&child, TAG_ROLE, role)
+    let told = try sosmain.context().process().event_create()
+    let kept = try told.mint()
+    try child.give(event: move told, tag: TAG_STACK) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    try start(&child)
+    return (move child, move kept)
+}
+
+/// `dead exited`: W, made by root in the child, sends its ID and exits; the
+/// child is killed while root holds W's handle, and another child waits with
+/// W's ID as the owner.
+func dead_exited(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    let (child, kept) = try launch_telling(&img, &ram, RAW_DEAD_EXITED)
+    let top = try kept.receive()
+    let w = try child.thread_create(stack_top: top, arg: 1)
+    try w.start()
+    let wid = try kept.receive()
+    try child.kill(code: KILL_CODE)
+    try ended(move child, "dead exited")
+    try dead_owner(&img, &ram, wid, "dead exited owner")
+    let _ = move w
+    return
+}
+
+/// `foreign exited`: as `dead exited`, but another child waits with W's ID
+/// while W's child lives, so W is an exited thread of a live process: the
+/// line naming both processes, and the waiter's `BadArg` fault.
+func foreign_exited(img: &Memory, ram: &Memory) -> Result<Void, SosStatus> {
+    let (child, kept) = try launch_telling(&img, &ram, RAW_DEAD_EXITED)
+    let top = try kept.receive()
+    let w = try child.thread_create(stack_top: top, arg: 1)
+    try w.start()
+    let wid = try kept.receive()
+    let _ = try w.join()
+    try dead_owner(&img, &ram, wid, "foreign exited owner")
+    try child.kill(code: KILL_CODE)
+    try ended(move child, "foreign exited")
+    let _ = move w
+    return
+}
+
+/// Wait with `owner` as a pair's owner word, and print the answer.
+func root_waits(round: String, owner: UInt) unsafe {
+    var pair: [UInt; 2] = [owner, 0]
+    let at = ((&var pair) as UnsafePointer<UInt>) as UInt
+    let status = sos_lock_wait(at)
+    print("SOS lock: {}: root's wait answered {}", round, status)
+}
+
+/// `reuse`: a first child sends its main thread's ID and exits; a second,
+/// whose main thread takes the freed slot, sends its own and parks, and root
+/// waits with the first's ID. Then the second is killed, a third takes the
+/// slot again, and root waits with the slot's ID at generation 1, which an
+/// earlier occupant of it had, since the slot has been freed twice since.
+func reuse(img: &Memory, ram: &Memory) unsafe -> Result<Void, SosStatus> {
+    let (first, kept1) = try launch_telling(&img, &ram, RAW_ID_AND_EXIT)
+    let id1 = try kept1.receive()
+    try ended(move first, "reuse first")
+    let (second, kept2) = try launch_telling(&img, &ram, RAW_ID_AND_PARK)
+    let _ = try kept2.receive()
+    root_waits("reuse", id1)
+    try second.kill(code: KILL_CODE)
+    try ended(move second, "reuse second")
+    let (third, kept3) = try launch_telling(&img, &ram, RAW_ID_AND_PARK)
+    let _ = try kept3.receive()
+    root_waits("reuse again", (1 << ID_INDEX_BITS) | (id1 & ID_INDEX_MASK))
+    try third.kill(code: KILL_CODE)
+    try ended(move third, "reuse third")
+}
+
+/// The bits of a thread ID that carry its slot, as every board splits an ID
+/// today; root builds an ID an earlier occupant of a slot had.
+static ID_INDEX_BITS: Int = 12
+static ID_INDEX_MASK: UInt = (1 << ID_INDEX_BITS) - 1
+
+func torn_r(arg: UInt) sync -> UInt {
+    0
+}
+
+/// The thread the pick takes at `Background` once root parks: the first one
+/// ready at that level.
+func torn_b(arg: UInt) sync -> UInt {
+    print("SOS lock: torn: B ran")
+    0
+}
+
+func foreign_r(arg: UInt) sync -> UInt {
+    print("SOS lock: foreign wake: R")
+    0
+}
+
+func taken(status: UInt) -> Result<Void, SosStatus> {
+    if status != (SosStatus.Ok as UInt) {
+        return BUG
+    }
+    return
+}
+
+/// W: one wait for the lock at `at`, which root holds, and then a take.
+func foreign_w(at: UInt) sync -> UInt {
+    foreign_w_body(at)
+    0
+}
+
+func foreign_w_body(at: UInt) unsafe sync {
+    let status = sos_lock_wait(at)
+    print("SOS lock: foreign wake: W's wait answered {}", status)
+    if sos_lock_take(at) != (SosStatus.Ok as UInt) {
+        panic("SOS lock: foreign wake: W's take was refused")
+    }
+    print("SOS lock: foreign wake: W took the lock")
+    let _ = sos_lock_give(at)
+}

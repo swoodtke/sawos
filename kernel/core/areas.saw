@@ -73,6 +73,7 @@ import kcore.limits.{
     PIPE_INFLIGHT,
     PROCESS_RECORDS_PER_BODY,
     THREAD_FRAME_STRIDE,
+    THREAD_SLAB_MAX,
 }
 import kcore.mem.{zero_bytes}
 import kcore.diag.{console, fatal_image, fatal_kernel}
@@ -130,10 +131,13 @@ public(package) func slab_geometry(kind: SlabKind) unsafe -> (Int, Int, Int, Int
         // extent's alignment: it is the strictest of the two and so serves
         // both, since `THREAD_FRAME_STRIDE` is a multiple of every slot
         // alignment.
+        //
+        // Its ceiling is the thread ID's index field, not `MAX_SLAB_CAPACITY`:
+        // a slot past it would have no ID.
         case Threads -> (THREADS.slot_bytes() + THREAD_FRAME_STRIDE,
                          THREAD_FRAME_STRIDE,
                          THREADS.extents_left(),
-                         MAX_SLAB_CAPACITY - THREADS.capacity()),
+                         THREAD_SLAB_MAX - THREADS.capacity()),
         // A pipe unit is a connection plus its whole staging ring. Both chains
         // must have an extent free, and the exchange ceiling binds:
         // `PIPE_INFLIGHT` exchanges are spent per connection, so the headroom
@@ -354,7 +358,7 @@ public func install_image_slabs() unsafe {
         // whole slots is refused below, and one too long for the ceiling is
         // refused here whatever its remainder.
         if count_here > (headroom as UInt) {
-            fatal_image("a slab area would take its slab past MAX_SLAB_CAPACITY",
+            fatal_image("a slab area would take its slab past its ceiling (MAX_SLAB_CAPACITY, or for threads the thread ID's index field)",
                         k as UInt)
         }
         if base % (align_i as UInt) != 0 {
@@ -551,7 +555,7 @@ func check_root_blocks(header: &SlabBlockHeader,
 // =============================================================================
 
 /// How the builder recognizes the record's layout.
-static IMAGE_LIMITS_VERSION: UInt = 2
+static IMAGE_LIMITS_VERSION: UInt = 3
 
 /// A handle block's bytes (`kcore.pslot.HandleBlock`), for the record.
 ///
@@ -574,9 +578,10 @@ static HANDLE_BLOCK_BYTES: Int = (sizeof<UInt>()
 /// the thread frame stride, the staging ring's depth, a handle block's
 /// entries, the blocks one table may hold, a block's bytes and the records a
 /// `BootSet` holds; then each slab's floor in `SlabKind` order; then each
-/// compiled quota default in `QuotaKind` order.
+/// compiled quota default in `QuotaKind` order; then the longest the thread
+/// slab may grow, which a thread ID's index field bounds.
 @export("sos_image_limits")
-static IMAGE_LIMITS: [UInt; 37] = [
+static IMAGE_LIMITS: [UInt; 38] = [
     IMAGE_LIMITS_VERSION,
     MAX_SLAB_CAPACITY as UInt,
     MAX_SLAB_EXTENTS as UInt,
@@ -614,4 +619,5 @@ static IMAGE_LIMITS: [UInt; 37] = [
     DEFAULT_QUOTA_MAPPINGS as UInt,
     DEFAULT_QUOTA_HANDLES as UInt,
     DEFAULT_QUOTA_PIPES as UInt,
+    THREAD_SLAB_MAX as UInt,
 ]

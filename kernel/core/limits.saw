@@ -222,6 +222,29 @@ public(package) static SYSTEM_LEVELS: Int = 8
 static_assert(SYSTEM_LEVELS <= 8,
               "the ready bitmap is one byte, one bit a level")
 
+/// The longest the thread slab may grow, floor, image areas and donations
+/// together: every slot's index plus one fits a thread ID's index field, as
+/// the board splits it (`hal.THREAD_ID_INDEX_BITS`). The image builder holds
+/// an image's thread total to it, and a donation past it is refused.
+public(package) static THREAD_SLAB_MAX: Int = (1 << hal.THREAD_ID_INDEX_BITS) - 1
+
+static_assert(hal.THREAD_ID_INDEX_BITS + hal.THREAD_ID_GENERATION_BITS
+              <= (sizeof<UInt>() as Int) * 8,
+              "a thread ID's two fields must fit the board's owner word")
+static_assert(hal.THREAD_ID_INDEX_BITS >= 1 && hal.THREAD_ID_GENERATION_BITS >= 1,
+              "a thread ID needs an index field and a generation field")
+static_assert(MAX_THREADS <= THREAD_SLAB_MAX,
+              "the thread slab's floor must fit a thread ID's index field")
+
+/// The most holders one `LOCK_WAIT_OP` walks (spec §7): the lock's
+/// holder, the holder of the lock that one is parked on, and so on. A wait
+/// whose walk would pass this many is the `LockChain` fault, so a wait raises
+/// at most this many threads. It bounds each wait's walk forward from its own
+/// holder, not a chain's length: a chain grows past it when a thread others
+/// wait on parks behind another chain, since that wait walks from its own
+/// holder on.
+public(package) static LOCK_CHAIN_MAX: Int = 4
+
 /// Events the kernel can hold, across all processes (spec §2.4).
 public(package) static MAX_EVENTS: Int = 8
 
@@ -400,6 +423,9 @@ public(package) static MAX_SLAB_EXTENTS: Int = 4
 /// `LONGEST_TABLE` of them at once. The relation pinned below is that the slab
 /// ceiling never stops every process from filling its table.
 public(package) static MAX_SLAB_CAPACITY: Int = 1 << 20
+
+static_assert(THREAD_SLAB_MAX <= MAX_SLAB_CAPACITY,
+              "the thread slab's bound is no wider than any slab's")
 
 static_assert(MAX_SLAB_CAPACITY >= LONGEST_TABLE * MAX_PROCESSES,
               "a slab must be able to back every handle every process could hold")

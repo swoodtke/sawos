@@ -34,7 +34,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | Object | Role |
 |---|---|
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global and external-memory-only, not per-process). Paging targets: page-table root. There is no AddressSpace object: the domain is the process (see below). |
-| `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. Ops `Start`/`Join`/`Exit`/`Yield`; `Exit` releases the handle it is invoked through; rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame is the context, so a switch is the trap handler returning a different frame (§7). Lifecycle: §8. |
+| `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. Ops `Start`/`Join`/`Exit`/`Yield`; `Exit` releases the handle it is invoked through; every thread has an ID, and the in-process inheritance lock's two traps are made with no handle (§7); rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame is the context, so a switch is the trap handler returning a different frame (§7). Lifecycle: §8. |
 | `Pool` | RAM not yet allocated: what a `MemoryObject` is allocated from. Two ops (`Allocate`, and `Available`, which reads how much it can allocate); rights `PoolRight.Allocate` and the bits it hands down to what it allocates, `.Map`/`.MapExecute`/`.Extend`/`.Physical`. It has two ends: an allocation is cut from its front or its back. Minted at boot from the region table. A pool is never mapped and holds no row. Splitting a pool into a smaller one and a revoke are reserved, not built. §2.5. |
 | `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. Four ops (`Map`; `Extend`, which grows it in place; `Pin`, which answers its physical range for a device and keeps it out of its pool until `Unpin`); rights `MemoryRight.Map`/`.MapExecute`/`.Extend`/`.Physical`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5. |
 | `IoMemoryObject` | Physical memory-mapped device registers; the kind is `IoMemory`. A distinct kind rather than a flag on `MemoryObject`, so a driver cannot obtain a cacheable view of a register block by construction. Ops `Carve`/`Map`; rights `IoMemoryRight.Carve`/`.Map`. §2.5. |
@@ -3057,6 +3057,9 @@ have no field.
   it names no object and is intercepted before the lookup, with `NO_HANDLE`
   in the handle register (§8). It takes its number from the band so that no
   per-kind table can grow into it, and every table stays below it.
+  `THREAD_ID_OP` (`0xFFFB`), `LOCK_WAIT_OP` (`0xFFFA`) and `LOCK_WAKE_OP`
+  (`0xFFF9`) continue the band on the same terms (§7), and every table stays
+  below the lowest of them.
 
   **The typed tier spells every mask.** Every kind's rights enum is public in
   the `sos` module, because a keep mask is assembled from its bits at a mint, a
@@ -3538,7 +3541,8 @@ and `debug_print` / `shutdown(status)` are among its ops (§2.8 lists them),
 rights-gated (`SystemRight.Debug`/`.Shutdown`) — a process without the System
 handle cannot even print. Process exit is a Process op. A panic names no
 object: `PANIC_OP` with `NO_HANDLE` in the handle register is intercepted
-before the table lookup and ends the caller (§8). Ops map 1:1 onto the
+before the table lookup and ends the caller (§8). The thread ID op and the
+lock's two ops are intercepted the same way (§7). Ops map 1:1 onto the
 `sos` module's typed wrappers (`system.debug_print(...)`,
 `-> Result<T, SosStatus>`). Op tables and rights sets are named for the §2
 object, spelled out (`SystemOp`, `ProcessOp`, `ThreadOp` beside `SystemRight`,
@@ -3553,7 +3557,9 @@ a per-line capability: a right is the cheaper answer whenever an "object" would
 have been a table with no state and one verb (§2.8). The one op that names no
 object, `PANIC_OP` (§8), is not a facility: it ends its caller, which a process
 can already do by naming a handle it does not hold, and it reaches nothing
-else.
+else. Nor are the ops that name no object for the lock (§7): the thread ID op
+answers the caller's own ID, which grants nothing, and the lock's wait and
+wake act only on the calling thread and a lock of its own process.
 
 **The boot set is one handle wide at the entry register.** A process enters user
 mode with exactly one word in its first argument register — root's System
@@ -3609,9 +3615,9 @@ register.
 
 **Growing an op costs no register and no ABI.** Because the numbers are not ABI,
 a new op takes the next value in its own table and displaces nothing, and each
-table's `< PANIC_OP` assert sits on its highest case — one assert per table, on
-its top — which keeps a growing table from ever reaching a universal op number
-or the panic op's, the lowest of the band. An op's argument list may grow the
+table's assert below the band sits on its highest case — one assert per table,
+on its top — which keeps a growing table from ever reaching a universal op
+number or a no-handle op's, the lowest of the band. An op's argument list may grow the
 same way, up to the three argument registers: the raw form is fixed-arity, so a
 grown argument rides a register the raw form already passes, and the
 convention does not move. An op that needs more than three argument words
@@ -4183,6 +4189,95 @@ arm their own.
   held; `Process.section_register()` registers it; and the floor exports
   `sos_section_enter`, `sos_section_leave`, `sos_process_section_register`
   and `sos_process_section_word`.
+- **Every thread has an ID.** A thread ID names a thread and grants
+  nothing: its slot's index plus one in the low `THREAD_ID_INDEX_BITS` bits
+  and the slot's generation in the `THREAD_ID_GENERATION_BITS` above them,
+  each board's HAL choosing the split within its owner word (12 and 20 on
+  every board today, so 4,095 threads). An ID is opaque: only the kernel
+  decodes it, and it is never stored outside the machine or sent anywhere,
+  so it needs no portable layout. The generation moves on when the slot is
+  freed, so a freed thread's ID does not name the next thread in its slot
+  until the slot has been reused 2^20 times. `THREAD_ID_OP`, made with
+  `NO_HANDLE` as `PANIC_OP` is, answers the caller's own ID; it needs no
+  right and cannot fail. Each board's kernel asserts at compile time that
+  the two fields fit its word and that the thread slab's floor fits the
+  index field; the slab never grows past the index field, by an image's
+  areas or a donation, and the image builder refuses an image whose thread
+  total would, naming the bound.
+- **Inheritance inside a process: the lock.** A lock is two machine words
+  in a process's memory: the holder's thread ID, or 0 while it is free, and
+  a waiters flag the kernel writes. Taking and giving back a free lock are
+  compare-and-swaps the process makes, with no syscall. A thread that finds
+  the lock held waits with `LOCK_WAIT_OP(addr)`: the kernel decodes the
+  owner ID, parks the caller and raises the holder to the caller's level,
+  and the holder of whatever lock that holder is parked on, and so on along
+  the chain, until it gives the lock back. A thread's level is the highest
+  of the level its band gave it at its start and the levels of the threads
+  parked naming it as their holder; a raised thread that is ready moves to
+  its new level's list, and one raised while parked elsewhere is woken onto
+  it. A holder that finds the flag set gives back with `LOCK_WAKE_OP(addr)`,
+  which answers every thread of the caller's process parked on the lock with
+  `Ok`, in slot order, clears the flag, and brings each holder they named
+  back to the highest of its base level and its remaining waiters'. The
+  woken go onto their levels' lists, so the highest runs first and takes the
+  lock with its swap; the others find it held and wait again. A give that
+  lowers the giver below a ready thread gives the processor up at its
+  return. Both ops are made with `NO_HANDLE` and need no right: they act
+  only on the calling thread and a lock of its own process, and a thread
+  that holds no Thread handle of its own must still be able to wait and to
+  give back. A holder is always a thread of the waiter's own process, and a
+  raise is to a waiter's own level, so a thread is never raised above a
+  level its own process's map gives. The kernel keeps no record per lock:
+  each waiter names its holder. The read of the owner and the park are one
+  trap, so a give cannot be lost between them.
+- **The lock's answers.** `LOCK_WAIT_OP` first refuses a pair the kernel
+  cannot write: an address that is not word-aligned is the `BadAlign` fault,
+  and a pair outside one writable row is the copy-out door's fault.
+  `LOCK_WAKE_OP` checks only the waiters word it writes, with the same two
+  faults, after answering the threads parked on the pair, of which there are
+  none on a pair the door refuses. Then
+  `LOCK_WAIT_OP` reads the owner word: 0 answers `Ok` at once, and the
+  caller swaps again; the caller's own ID is the `BadState` fault, since the
+  lock is not recursive. An ID whose generation is its slot's names that
+  slot's thread: one that has run and not exited is the holder if it is the
+  caller's process's; one that has exited answers `Revoked` if it is the
+  caller's process's or its process has died, since an exited holder
+  answers `Revoked` whether or not its slot is still held; another live
+  process's thread, live or exited, is the waiter's fault (below); and
+  anything else (a free slot, a thread never started, an invalid thread)
+  holds nothing, the `BadArg` fault. An ID whose generation is behind its slot's,
+  by less than half the generation's range, names a thread that exited and
+  whose slot was freed: `Revoked`. Any other ID (a slot field of zero, one
+  naming a slot the slab does not have, a generation ahead of its slot's or
+  wider than the field) names no thread there ever was: the `BadArg` fault.
+  A chain of holders, each parked on a lock the next holds, that comes back
+  to the caller or would pass `LOCK_CHAIN_MAX` (4) holders is the
+  `LockChain` fault (16, the line `SOS: process fault: a lock wait closes a
+  cycle or passes the bound`). The bound is on each wait's walk forward
+  from its own holder, not on a chain's length: a chain grows past it when
+  a thread others wait on parks behind another chain. Every other wait
+  parks. A holder that exits with `ThreadOp.Exit` answers every thread
+  parked naming it with `Revoked`; the kernel cannot see a lock nobody
+  waits on, so the exit itself is no fault. While the caller's section is
+  held, a wait that would park is the `SectionHeld` fault: no sibling, the
+  holder included, could run to give the lock back.
+- **Locks are process-local.** The kernel does not check whether a pair's
+  memory is mapped by another process. A wait that finds a thread of
+  another live process as the owner is the `BadArg` fault of the waiter
+  alone, after the line `SOS: lock wait: the owner is a thread of another
+  process waiter=W holder=H`; the holder's process runs on. So a lock
+  shared across processes is caught loudly, though only once a wait meets
+  such an owner. A dead process's threads name no process: one that exited
+  answers `Revoked` and an invalid one is the `BadArg` fault, with no line.
+  A wake answers only the waker's own process's threads.
+- **The lock's `sos` side.** `sos.Lock` takes and gives back a pair of its
+  own with the calling thread's ID, which the runtime reads once at the
+  thread's start and keeps in its block (every thread a `main` program or
+  `thread_create(run:)` makes); a thread with no block asks the kernel at
+  each take. The floor exports `sos_lock_take` and `sos_lock_give` over any
+  pair's address, and `sos_thread_id`, `sos_lock_wait` and `sos_lock_wake`.
+  `Revoked` comes back from `take` as the error, and a give of a lock the
+  caller does not hold panics.
 - **Launching is a capability.** `process_create` requires the launch
   capability, `SystemRight.ProcessCreate`, minted at boot to the root
   server. Ordinary processes cannot create processes in v1 — they ask the
@@ -4200,9 +4295,10 @@ arm their own.
   mitigations: (a) the convention that servers run at ≥ the max priority
   of their clients (the launcher assigns both, so this is enforceable
   policy); (b) preemption on wake, which switches straight to a receiver a
-  post or a reply readies above the sender's level. **Not built:** the
-  direct switch at an equal level, which would run such a receiver ahead of
-  its level's list.
+  post or a reply readies above the sender's level. Inside one process the
+  lock above inherits, because there the holder is named and the levels are
+  the process's own. **Not built:** the direct switch at an equal level,
+  which would run such a receiver ahead of its level's list.
 - **Uniprocessor kernel in v1**, both profiles (the P4 is dual-core and
   QEMU can do SMP; SMP is its own future design — locking model,
   per-core queues — and nothing above precludes it).
@@ -4306,8 +4402,10 @@ reads one word for every such end, and what a panic does is the kernel's.
 `ProcessOp.GetStatus`, gated on `ProcessRight.Wait`, answering the one
 fixed-width word (kind in the high bits — `Running` beside the three below —
 code in the low). Thread `Start`/`Join`/`Exit`/`Yield`; `Start` carries the
-thread's band (§7). A joiner parks on the target's list and is answered exactly
-once through the funnel §2.2 describes.
+thread's band (§7). Every thread has an ID, and `LOCK_WAIT_OP` and
+`LOCK_WAKE_OP` are the in-process lock (§7).
+A joiner parks on the target's list and is answered exactly once through the
+funnel §2.2 describes.
 Process waitability (below). Not built: a thread handle is not waitable —
 attaching one is a `NotWaitable` fault, and it is the last kind for which that
 arm is a scope line rather than a statement about the object.

@@ -1,0 +1,949 @@
+// Test child written with `main`, for `lock_inherit` and `lock`: the role its
+// launcher gives it, as the bits of an Event under `TAG_ROLE`, says what
+// `main` does. Its launcher maps `Background` at 0, `Low` at 1, `Normal` at
+// 7, `High` at 3, `Rt0` at 4, `Rt1` at 5 and `Rt2` at 6, so this main thread
+// runs above every thread it starts or signals, and none of those takes the
+// processor from it.
+//
+// The image's kernel arms no tick, so every switch is one a thread makes.
+// Most roles set their scene through a driver thread at `Background`, which
+// runs only while every other thread is parked: each thread it starts runs
+// until it parks, and the driver goes on only then. Once the scene is set the
+// driver exits, which the main thread joined. The main thread then readies in
+// one turn the threads whose order is the check, which cannot take the
+// processor from it, and parks; so the pick sees them all at once, and each
+// line below comes from the levels alone.
+//
+//   INHERIT   L (`Low`) takes A and signals the main thread, which starts M
+//             (`High`) and H (`Rt0`) and joins H. H waits for A, which raises
+//             L to 4, above M: L's lines come before M's, and its give lowers
+//             it below H and M: L releases, H, M, L after
+//   CHAIN     L holds A and is parked; M (`High`) holds B and waits for A; H
+//             (`Rt1`) waits for B, which raises M and, through M, L to 5. The
+//             main thread readies L and N (`Rt0`): L releases, then M, H, N
+//   TWO LOCKS L holds A and B and is parked; M (`Rt0`) waits for A and H
+//             (`Rt1`) for B. The main thread readies L, X (`High`) and Z
+//             (`Low`). L's give of B runs H, and L stays at M's level, above
+//             X; its give of A brings it back to `Low`, and M takes the
+//             processor from it, so it resumes at the head of `Low`, ahead of
+//             Z: L gives B, H, L gives A, M, X, L done, Z
+//   WAKE ALL  L holds A and is parked; W1 (`Rt0`) and W2 (`Rt1`) wait for
+//             it. L's give answers both, and the higher runs first: L gives,
+//             W2, W1
+//   HOLDER EXITS  L holds A and is parked; H (`Rt0`) waits for it through
+//             the raw op. L exits holding it: H's wait answers `Revoked`
+//             (8), and so does its next take
+//   CYCLE     A holds the first lock and is parked; B (`High`) holds the
+//             second and waits for the first. The driver readies A, which
+//             waits for the second: the `LockChain` fault
+//   FOUR      T0 to T3 (`Low`) each hold a lock and wait for the one before;
+//             T0 is parked on the driver's join. The main thread waits for
+//             T3's lock, at the end of a chain of four holders: it parks,
+//             and takes the lock once the driver's exit has let the chain
+//             unwind
+//   FIVE      the same with five holders: the `LockChain` fault
+//   IN SECTION  L holds A and is parked; the main thread enters its section
+//             and waits for A: the `SectionHeld` fault
+//   RELOCK    the main thread takes A twice: the `BadState` fault
+//   GIVE UNHELD   the main thread gives back a lock it does not hold: a panic
+//   UNCONTENDED   W (`Low`) waits for A while the main thread holds it, and
+//             the main thread's give answers it, which sets the waiters flag
+//             and clears it; the give leaves the main thread at its own
+//             level, above W, so its line comes first. Then 100 takes and
+//             gives make no syscall
+//   STALE     A (`Low`) takes K and writes its owner word back to 0, as a
+//             give does before it traps. U (`High`) takes B and parks; X
+//             (`Rt0`) takes K and waits for B, raising U to 4; V (`Rt1`)
+//             waits for K, raising X and, through X, U to 5. A's wake
+//             answers V, whose holder is X, not A, and V does not wait
+//             again: X comes back to 4, and U, still waited for by X alone,
+//             to 4 too. The main thread readies U and then Y (`Rt1`): the
+//             raise V's wait made ended with it, down the chain, so Y runs
+//             before U, and U's give then runs X
+//   HIGHEST   L holds A, B and C and is parked; M (`Rt0`) waits for A, N
+//             (`High`) for B and H (`Rt1`) for C. The main thread readies L
+//             and X (`Rt0`). L's give of C runs H and leaves L the highest of
+//             its two remaining waiters' levels, M's 4, not N's 3: at the head
+//             of level 4, ahead of X. L gives C, H, L gives B, L gives A, then
+//             X and M at 4, N at 3
+//   WAKE ADDRESS  the main thread holds A, and W (`Rt0`) waits for A through
+//             the raw op. The driver prints its first line and readies the
+//             main thread, which wakes B, a lock nobody waits for, and parks
+//             until the driver's second line: a wake answers only the
+//             threads parked on its own lock, so W stays parked until the
+//             main thread gives A back: D first, the wake of B, D second,
+//             then W's line
+//
+// A role that comes back from what should have ended it panics naming it.
+// Every line goes out through the kernel's debug print, which never parks,
+// and no thread is preempted inside one: nothing wakes a thread while one
+// prints.
+
+import sos.{BootSet, Event, Thread, Waiter, Lock, Priority, Section,
+            SosStatus, sos_lock_wait, sos_lock_wake}
+import sosmain
+
+static TAG_ROLE: UInt = 40
+static KEY_GATE: UInt = 7
+
+static ROLE_INHERIT: UInt = 1
+static ROLE_CHAIN: UInt = 2
+static ROLE_TWO_LOCKS: UInt = 3
+static ROLE_WAKE_ALL: UInt = 4
+static ROLE_HOLDER_EXITS: UInt = 5
+static ROLE_CYCLE: UInt = 6
+static ROLE_FOUR: UInt = 7
+static ROLE_FIVE: UInt = 8
+static ROLE_IN_SECTION: UInt = 9
+static ROLE_RELOCK: UInt = 10
+static ROLE_GIVE_UNHELD: UInt = 11
+static ROLE_UNCONTENDED: UInt = 12
+static ROLE_STALE: UInt = 13
+static ROLE_WAKE_ADDRESS: UInt = 15
+static ROLE_HIGHEST: UInt = 16
+
+static LOCK_A: Lock
+static LOCK_B: Lock
+static LOCK_C: Lock
+static LOCK_K: Lock
+/// `FOUR` and `FIVE`'s chain, one lock a holder.
+static CHAIN: [Lock; 5]
+
+/// Six threads' stacks, besides the main thread's. A thread that prints
+/// wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+static STACKS: Int = 6
+unsafe static var STACK: [UInt; STACK_WORDS * STACKS] = [0; STACK_WORDS * STACKS]
+
+/// The threads the driver starts, by address, and the band of each.
+unsafe static var CAST: [UInt; STACKS] = [0; STACKS]
+unsafe static var CAST_BAND: [Priority; STACKS] = [Priority.Background; STACKS]
+unsafe static var CAST_COUNT: Int = 0
+/// The Event the driver signals once it has started its cast, by address,
+/// or 0.
+unsafe static var CAST_THEN: UInt = 0
+/// The driver's Thread, by address, which `FOUR`'s and `FIVE`'s T0 joins.
+unsafe static var DRIVER: UInt = 0
+
+/// The gate a parked thread waits on, and the one the main thread waits on
+/// until a thread has set its part of the scene, by address.
+unsafe static var GO: UInt = 0
+unsafe static var READY: UInt = 0
+
+/// How many holders `FOUR` and `FIVE` chain.
+unsafe static var HOLDERS: Int = 0
+
+/// The top of stack `i`.
+func top(i: Int) unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + ((i + 1) * STACK_WORDS) as UInt * (sizeof<UInt>() as UInt)
+}
+
+func main() -> Result<Int, SosStatus> {
+    var set = sosmain.take_boot_set()
+    let role = try bits_under(&var set, TAG_ROLE)
+    if role == ROLE_INHERIT {
+        try inherit()
+        return 0
+    }
+    if role == ROLE_CHAIN {
+        try chain()
+        return 0
+    }
+    if role == ROLE_TWO_LOCKS {
+        try two_locks()
+        return 0
+    }
+    if role == ROLE_WAKE_ALL {
+        try wake_all()
+        return 0
+    }
+    if role == ROLE_HOLDER_EXITS {
+        try holder_exits()
+        return 0
+    }
+    if role == ROLE_CYCLE {
+        try cycle()
+    }
+    if role == ROLE_FOUR {
+        try chain_of("four", 4)
+        return 0
+    }
+    if role == ROLE_FIVE {
+        try chain_of("five", 5)
+    }
+    if role == ROLE_IN_SECTION {
+        try in_section()
+    }
+    if role == ROLE_RELOCK {
+        take(&LOCK_A, "relock")
+        print("SOS lockchild: relock: taking the lock again")
+        take(&LOCK_A, "relock")
+    }
+    if role == ROLE_GIVE_UNHELD {
+        print("SOS lockchild: give unheld: giving back a free lock")
+        LOCK_A.give()
+    }
+    if role == ROLE_UNCONTENDED {
+        try uncontended()
+        return 0
+    }
+    if role == ROLE_STALE {
+        try stale()
+        return 0
+    }
+    if role == ROLE_WAKE_ADDRESS {
+        try wake_address()
+        return 0
+    }
+    if role == ROLE_HIGHEST {
+        try highest()
+        return 0
+    }
+    panic("SOS lockchild: role {} came back", role)
+}
+
+/// The bits of the Event under `tag`, which is released once read.
+func bits_under(set: &var BootSet, tag: UInt) -> Result<UInt, SosStatus> {
+    guard var record = set.take(tag) else {
+        panic("SOS lockchild: no record under tag {}", tag)
+    }
+    guard let event = record.take_event() else {
+        panic("SOS lockchild: the record under tag {} is no Event", tag)
+    }
+    event.receive()
+}
+
+/// A thread of this process that runs `run(arg)` on stack `i`.
+func spawn(run: FuncPointer<(UInt) sync -> UInt>, arg: UInt,
+           i: Int) -> Result<Thread, SosStatus> {
+    sosmain.context().process().thread_create(run: run, arg: arg,
+                                              stack_top: top(i))
+}
+
+/// An Event and a Waiter attached to it: a thread parks on the Waiter until
+/// another signals the Event.
+struct Gate {
+    event: Event,
+    waiter: Waiter,
+}
+
+extension Gate: NoCopy {}
+
+func gate() -> Result<Gate, SosStatus> {
+    let event = try sosmain.context().process().event_create()
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &event, key: KEY_GATE)
+    return Gate(event: move event, waiter: move waiter)
+}
+
+func gate_at(gate: &var Gate) unsafe -> UInt {
+    ((&var gate) as UnsafePointer<Gate>) as UInt
+}
+
+/// Park on the gate at `at` until it is signalled.
+func pass(at: UInt, who: String) unsafe sync {
+    let g = at as UnsafePointer<Gate>
+    let _ = try g[0].waiter.wait() catch {
+        panic("SOS lockchild: {}: the wait was refused: {}", who, error)
+    }
+}
+
+/// Signal the gate at `at`.
+func open(at: UInt, who: String) unsafe sync {
+    let g = at as UnsafePointer<Gate>
+    try g[0].event.signal(bits: 1) catch {
+        panic("SOS lockchild: {}: the signal was refused: {}", who, error)
+    }
+}
+
+func take(lock: &Lock, who: String) sync {
+    try lock.take() catch {
+        panic("SOS lockchild: {}: the take was refused: {}", who, error)
+    }
+}
+
+/// Put `thread` in the driver's cast at `i`, to be started at `band`.
+func cast(i: Int, thread: &var Thread, band: Priority) unsafe {
+    CAST[i] = ((&var thread) as UnsafePointer<Thread>) as UInt
+    CAST_BAND[i] = band
+    CAST_COUNT = i + 1
+}
+
+/// The driver: start the cast in order, each running until it parks, then
+/// signal `CAST_THEN` if there is one, and exit.
+func driver(arg: UInt) sync -> UInt {
+    drive()
+    0
+}
+
+func drive() unsafe sync {
+    var i: Int = 0
+    while i < CAST_COUNT {
+        let t = CAST[i] as UnsafePointer<Thread>
+        try t[0].start(band: CAST_BAND[i]) catch {
+            panic("SOS lockchild: the driver's start was refused: {}", error)
+        }
+        i = i + 1
+    }
+    if CAST_THEN != 0 {
+        open(CAST_THEN, "driver")
+    }
+}
+
+/// Make the driver on stack `i`, start it and wait for its exit: the scene is
+/// set.
+func drive_scene(i: Int) -> Result<Thread, SosStatus> {
+    let d = try spawn(driver, 0, i)
+    try d.start(band: Priority.Background)
+    let _ = try d.join()
+    return move d
+}
+
+func join(t: &Thread) -> Result<Void, SosStatus> {
+    let _ = try t.join()
+    return
+}
+
+// -----------------------------------------------------------------------------
+// INHERIT
+// -----------------------------------------------------------------------------
+
+func inherit() unsafe -> Result<Void, SosStatus> {
+    var took = try gate()
+    READY = gate_at(&var took)
+    let l = try spawn(inherit_l, 0, 0)
+    let m = try spawn(inherit_m, 0, 1)
+    let h = try spawn(inherit_h, 0, 2)
+    try l.start(band: Priority.Low)
+    let _ = try took.waiter.wait()
+    try m.start(band: Priority.High)
+    try h.start(band: Priority.Rt0)
+    try join(&h)
+    try join(&m)
+    try join(&l)
+}
+
+func inherit_l(arg: UInt) sync -> UInt {
+    inherit_l_body()
+    0
+}
+
+func inherit_l_body() unsafe sync {
+    take(&LOCK_A, "inherit")
+    open(READY, "inherit")
+    print("SOS lockchild: inherit: L releases")
+    LOCK_A.give()
+    print("SOS lockchild: inherit: L after")
+}
+
+func inherit_m(arg: UInt) sync -> UInt {
+    print("SOS lockchild: inherit: M")
+    0
+}
+
+func inherit_h(arg: UInt) sync -> UInt {
+    take(&LOCK_A, "inherit")
+    print("SOS lockchild: inherit: H")
+    LOCK_A.give()
+    0
+}
+
+// -----------------------------------------------------------------------------
+// CHAIN
+// -----------------------------------------------------------------------------
+
+func chain() unsafe -> Result<Void, SosStatus> {
+    var go = try gate()
+    GO = gate_at(&var go)
+    var l = try spawn(chain_l, 0, 0)
+    var m = try spawn(chain_m, 0, 1)
+    var h = try spawn(chain_h, 0, 2)
+    let n = try spawn(chain_n, 0, 3)
+    cast(0, &var l, Priority.Low)
+    cast(1, &var m, Priority.High)
+    cast(2, &var h, Priority.Rt1)
+    let d = try drive_scene(4)
+    try n.start(band: Priority.Rt0)
+    try go.event.signal(bits: 1)
+    try join(&l)
+    try join(&m)
+    try join(&h)
+    try join(&n)
+    try join(&d)
+}
+
+func chain_l(arg: UInt) sync -> UInt {
+    chain_l_body()
+    0
+}
+
+func chain_l_body() unsafe sync {
+    take(&LOCK_A, "chain")
+    pass(GO, "chain")
+    print("SOS lockchild: chain: L releases")
+    LOCK_A.give()
+}
+
+func chain_m(arg: UInt) sync -> UInt {
+    take(&LOCK_B, "chain")
+    take(&LOCK_A, "chain")
+    print("SOS lockchild: chain: M")
+    LOCK_A.give()
+    LOCK_B.give()
+    0
+}
+
+func chain_h(arg: UInt) sync -> UInt {
+    take(&LOCK_B, "chain")
+    print("SOS lockchild: chain: H")
+    LOCK_B.give()
+    0
+}
+
+func chain_n(arg: UInt) sync -> UInt {
+    print("SOS lockchild: chain: N")
+    0
+}
+
+// -----------------------------------------------------------------------------
+// TWO LOCKS
+// -----------------------------------------------------------------------------
+
+func two_locks() unsafe -> Result<Void, SosStatus> {
+    var go = try gate()
+    GO = gate_at(&var go)
+    var l = try spawn(two_l, 0, 0)
+    var m = try spawn(two_m, 0, 1)
+    var h = try spawn(two_h, 0, 2)
+    let x = try spawn(two_x, 0, 3)
+    let z = try spawn(two_z, 0, 5)
+    cast(0, &var l, Priority.Low)
+    cast(1, &var m, Priority.Rt0)
+    cast(2, &var h, Priority.Rt1)
+    let d = try drive_scene(4)
+    try x.start(band: Priority.High)
+    try z.start(band: Priority.Low)
+    try go.event.signal(bits: 1)
+    try join(&l)
+    try join(&m)
+    try join(&h)
+    try join(&x)
+    try join(&z)
+    try join(&d)
+}
+
+func two_l(arg: UInt) sync -> UInt {
+    two_l_body()
+    0
+}
+
+func two_l_body() unsafe sync {
+    take(&LOCK_A, "two locks")
+    take(&LOCK_B, "two locks")
+    pass(GO, "two locks")
+    print("SOS lockchild: two locks: L gives B")
+    LOCK_B.give()
+    print("SOS lockchild: two locks: L gives A")
+    LOCK_A.give()
+    print("SOS lockchild: two locks: L done")
+}
+
+func two_m(arg: UInt) sync -> UInt {
+    take(&LOCK_A, "two locks")
+    print("SOS lockchild: two locks: M")
+    LOCK_A.give()
+    0
+}
+
+func two_h(arg: UInt) sync -> UInt {
+    take(&LOCK_B, "two locks")
+    print("SOS lockchild: two locks: H")
+    LOCK_B.give()
+    0
+}
+
+func two_x(arg: UInt) sync -> UInt {
+    print("SOS lockchild: two locks: X")
+    0
+}
+
+func two_z(arg: UInt) sync -> UInt {
+    print("SOS lockchild: two locks: Z")
+    0
+}
+
+// -----------------------------------------------------------------------------
+// WAKE ALL
+// -----------------------------------------------------------------------------
+
+func wake_all() unsafe -> Result<Void, SosStatus> {
+    var go = try gate()
+    GO = gate_at(&var go)
+    var l = try spawn(all_l, 0, 0)
+    var w1 = try spawn(all_w, 1, 1)
+    var w2 = try spawn(all_w, 2, 2)
+    cast(0, &var l, Priority.Low)
+    cast(1, &var w1, Priority.Rt0)
+    cast(2, &var w2, Priority.Rt1)
+    let d = try drive_scene(3)
+    try go.event.signal(bits: 1)
+    try join(&l)
+    try join(&w1)
+    try join(&w2)
+    try join(&d)
+}
+
+func all_l(arg: UInt) sync -> UInt {
+    all_l_body()
+    0
+}
+
+func all_l_body() unsafe sync {
+    take(&LOCK_A, "wake all")
+    pass(GO, "wake all")
+    print("SOS lockchild: wake all: L gives")
+    LOCK_A.give()
+}
+
+func all_w(which: UInt) sync -> UInt {
+    take(&LOCK_A, "wake all")
+    print("SOS lockchild: wake all: W{}", which)
+    LOCK_A.give()
+    0
+}
+
+// -----------------------------------------------------------------------------
+// HOLDER EXITS
+// -----------------------------------------------------------------------------
+
+func holder_exits() unsafe -> Result<Void, SosStatus> {
+    var go = try gate()
+    GO = gate_at(&var go)
+    var l = try spawn(exits_l, 0, 0)
+    var h = try spawn(exits_h, 0, 1)
+    cast(0, &var l, Priority.Low)
+    cast(1, &var h, Priority.Rt0)
+    let d = try drive_scene(2)
+    try go.event.signal(bits: 1)
+    try join(&l)
+    try join(&h)
+    try join(&d)
+}
+
+func exits_l(arg: UInt) sync -> UInt {
+    exits_l_body()
+    0
+}
+
+func exits_l_body() unsafe sync {
+    take(&LOCK_A, "holder exits")
+    pass(GO, "holder exits")
+    print("SOS lockchild: holder exits: L exits holding the lock")
+}
+
+func exits_h(arg: UInt) sync -> UInt {
+    print("SOS lockchild: holder exits: H's raw wait answered {}",
+          raw_wait_a())
+    let second = LOCK_A.take()
+    print("SOS lockchild: holder exits: H's next take answered {}",
+          answer(second))
+    0
+}
+
+func answer(r: Result<Void, SosStatus>) -> String {
+    match r {
+        case Ok(_) -> "Ok",
+        case Err(e) -> {
+            match e {
+                case Revoked -> "Revoked",
+                case _ -> "another status",
+            }
+        },
+    }
+}
+
+// -----------------------------------------------------------------------------
+// CYCLE
+// -----------------------------------------------------------------------------
+
+func cycle() unsafe -> Result<Void, SosStatus> {
+    var go = try gate()
+    GO = gate_at(&var go)
+    var a = try spawn(cycle_a, 0, 0)
+    var b = try spawn(cycle_b, 0, 1)
+    cast(0, &var a, Priority.Low)
+    cast(1, &var b, Priority.High)
+    CAST_THEN = GO
+    let _ = try drive_scene(2)
+    return
+}
+
+func cycle_a(arg: UInt) sync -> UInt {
+    cycle_a_body()
+    0
+}
+
+func cycle_a_body() unsafe sync {
+    take(&LOCK_A, "cycle")
+    pass(GO, "cycle")
+    print("SOS lockchild: cycle: A waits for the lock B holds")
+    take(&LOCK_B, "cycle")
+}
+
+func cycle_b(arg: UInt) sync -> UInt {
+    take(&LOCK_B, "cycle")
+    take(&LOCK_A, "cycle")
+    0
+}
+
+// -----------------------------------------------------------------------------
+// FOUR and FIVE
+// -----------------------------------------------------------------------------
+
+/// A chain of `n` holders, T0 to T(n - 1), on stacks 0 to n - 1, and the
+/// main thread waiting at its end.
+func chain_of(round: String, n: Int) unsafe -> Result<Void, SosStatus> {
+    var ready = try gate()
+    READY = gate_at(&var ready)
+    HOLDERS = n
+    var t0 = try spawn(holder, 0, 0)
+    var t1 = try spawn(holder, 1, 1)
+    var t2 = try spawn(holder, 2, 2)
+    var t3 = try spawn(holder, 3, 3)
+    cast(0, &var t0, Priority.Low)
+    cast(1, &var t1, Priority.Low)
+    cast(2, &var t2, Priority.Low)
+    cast(3, &var t3, Priority.Low)
+    if n == 5 {
+        var t4 = try spawn(holder, 4, 4)
+        cast(4, &var t4, Priority.Low)
+        try wait_at_the_end(round, n, &var ready)
+        try join(&t4)
+    } else {
+        try wait_at_the_end(round, n, &var ready)
+    }
+    try join(&t0)
+    try join(&t1)
+    try join(&t2)
+    try join(&t3)
+    return
+}
+
+/// Start the driver, which starts the holders and signals `ready`; then wait
+/// for the last holder's lock.
+func wait_at_the_end(round: String, n: Int,
+                     ready: &var Gate) unsafe -> Result<Void, SosStatus> {
+    CAST_THEN = READY
+    var d = try spawn(driver, 0, STACKS - 1)
+    DRIVER = ((&var d) as UnsafePointer<Thread>) as UInt
+    try d.start(band: Priority.Background)
+    let _ = try ready.waiter.wait()
+    print("SOS lockchild: {}: waiting at the end of a chain of {} holders",
+          round, n)
+    take(&CHAIN[n - 1], round)
+    print("SOS lockchild: {}: took the lock", round)
+    CHAIN[n - 1].give()
+    try join(&d)
+}
+
+/// Holder `i`: hold lock `i`, and wait for lock `i - 1`, or for the driver's
+/// exit when `i` is 0; then give both back.
+func holder(i: UInt) sync -> UInt {
+    holder_body(i as Int)
+    0
+}
+
+func holder_body(i: Int) unsafe sync {
+    take(&CHAIN[i], "chain of holders")
+    if i == 0 {
+        let d = DRIVER as UnsafePointer<Thread>
+        let _ = try d[0].join() catch {
+            panic("SOS lockchild: the join of the driver was refused: {}",
+                  error)
+        }
+    } else {
+        take(&CHAIN[i - 1], "chain of holders")
+        CHAIN[i - 1].give()
+    }
+    CHAIN[i].give()
+}
+
+// -----------------------------------------------------------------------------
+// IN SECTION
+// -----------------------------------------------------------------------------
+
+func in_section() unsafe -> Result<Void, SosStatus> {
+    try sosmain.context().process().section_register()
+    var go = try gate()
+    GO = gate_at(&var go)
+    var l = try spawn(section_l, 0, 0)
+    cast(0, &var l, Priority.Low)
+    let _ = try drive_scene(1)
+    Section.enter()
+    print("SOS lockchild: in section: waiting for a held lock inside the section")
+    take(&LOCK_A, "in section")
+    return
+}
+
+func section_l(arg: UInt) sync -> UInt {
+    section_l_body()
+    0
+}
+
+func section_l_body() unsafe sync {
+    take(&LOCK_A, "in section")
+    pass(GO, "in section")
+}
+
+// -----------------------------------------------------------------------------
+// UNCONTENDED
+// -----------------------------------------------------------------------------
+
+/// The takes and gives counted.
+static ROUNDS: Int = 100
+
+func uncontended() unsafe -> Result<Void, SosStatus> {
+    take(&LOCK_A, "uncontended")
+    var w = try spawn(uncontended_w, 0, 0)
+    cast(0, &var w, Priority.Low)
+    let d = try drive_scene(1)
+    LOCK_A.give()
+    print("SOS lockchild: uncontended: the main thread gave the lock back")
+    try join(&w)
+    try join(&d)
+    let before = try sosmain.context().process().stats()
+    var i: Int = 0
+    while i < ROUNDS {
+        take(&LOCK_A, "uncontended")
+        LOCK_A.give()
+        i = i + 1
+    }
+    let after = try sosmain.context().process().stats()
+    // The second reading's own trap is counted in it.
+    print("SOS lockchild: uncontended: {} takes and gives made {} syscalls",
+          ROUNDS, after.syscalls - before.syscalls - 1)
+    return
+}
+
+func uncontended_w(arg: UInt) sync -> UInt {
+    take(&LOCK_A, "uncontended")
+    print("SOS lockchild: uncontended: W took the lock")
+    LOCK_A.give()
+    0
+}
+
+// -----------------------------------------------------------------------------
+// STALE
+// -----------------------------------------------------------------------------
+
+func stale() unsafe -> Result<Void, SosStatus> {
+    var go = try gate()
+    GO = gate_at(&var go)
+    var ready = try gate()
+    READY = gate_at(&var ready)
+    let a = try spawn(stale_a, 0, 0)
+    var x = try spawn(stale_x, 0, 1)
+    var v = try spawn(stale_v, 0, 2)
+    let y = try spawn(stale_y, 0, 3)
+    var u = try spawn(stale_u, 0, 4)
+    cast(0, &var u, Priority.High)
+    cast(1, &var x, Priority.Rt0)
+    cast(2, &var v, Priority.Rt1)
+    try a.start(band: Priority.Low)
+    let _ = try ready.waiter.wait()
+    try go.event.signal(bits: 1)
+    try y.start(band: Priority.Rt1)
+    try join(&y)
+    try join(&x)
+    try join(&v)
+    try join(&a)
+    try join(&u)
+}
+
+func lock_k() unsafe -> UInt {
+    ((&LOCK_K) as UnsafePointer<Lock>) as UInt
+}
+
+func stale_a(arg: UInt) sync -> UInt {
+    stale_a_body()
+    0
+}
+
+/// A takes K and puts its owner word back to 0 without a trap, then starts U,
+/// X and V in turn, each running until it parks, and wakes K's waiters.
+func stale_a_body() unsafe sync {
+    take(&LOCK_K, "stale")
+    (lock_k() as UnsafePointer<UInt>)[0] = 0
+    drive()
+    let status = sos_lock_wake(lock_k())
+    if status != (SosStatus.Ok as UInt) {
+        panic("SOS lockchild: stale: the wake answered {}", status)
+    }
+    open(READY, "stale")
+}
+
+func stale_x(arg: UInt) sync -> UInt {
+    stale_x_body()
+    0
+}
+
+func stale_x_body() unsafe sync {
+    take(&LOCK_K, "stale")
+    take(&LOCK_B, "stale")
+    LOCK_B.give()
+    LOCK_K.give()
+    print("SOS lockchild: stale: X")
+}
+
+func stale_u(arg: UInt) sync -> UInt {
+    stale_u_body()
+    0
+}
+
+/// U holds B, parked until the main thread readies it.
+func stale_u_body() unsafe sync {
+    take(&LOCK_B, "stale")
+    pass(GO, "stale")
+    print("SOS lockchild: stale: U")
+    LOCK_B.give()
+}
+
+func stale_v(arg: UInt) sync -> UInt {
+    stale_v_body()
+    0
+}
+
+/// One wait for K, which X holds, and no second one.
+func stale_v_body() unsafe sync {
+    let status = sos_lock_wait(lock_k())
+    print("SOS lockchild: stale: V's wait answered {}", status)
+}
+
+func stale_y(arg: UInt) sync -> UInt {
+    print("SOS lockchild: stale: Y")
+    0
+}
+
+func lock_a() unsafe -> UInt {
+    ((&LOCK_A) as UnsafePointer<Lock>) as UInt
+}
+
+// -----------------------------------------------------------------------------
+// WAKE ADDRESS
+// -----------------------------------------------------------------------------
+
+func wake_address() unsafe -> Result<Void, SosStatus> {
+    var go = try gate()
+    GO = gate_at(&var go)
+    var ready = try gate()
+    READY = gate_at(&var ready)
+    take(&LOCK_A, "wake address")
+    let w = try spawn(address_w, 0, 0)
+    let d = try spawn(address_d, 0, 1)
+    try w.start(band: Priority.Rt0)
+    try d.start(band: Priority.Background)
+    let _ = try go.waiter.wait()
+    let status = sos_lock_wake(lock_b())
+    print("SOS lockchild: wake address: the main thread woke B: {}", status)
+    let _ = try ready.waiter.wait()
+    LOCK_A.give()
+    try join(&w)
+    try join(&d)
+}
+
+func lock_b() unsafe -> UInt {
+    ((&LOCK_B) as UnsafePointer<Lock>) as UInt
+}
+
+/// One wait for A through the raw op, as a parked thread the main thread's
+/// wake of another lock must not answer.
+func raw_wait_a() unsafe sync -> UInt {
+    sos_lock_wait(lock_a())
+}
+
+func address_w(arg: UInt) sync -> UInt {
+    print("SOS lockchild: wake address: W's wait for A answered {}",
+          raw_wait_a())
+    0
+}
+
+func address_d(arg: UInt) sync -> UInt {
+    address_d_body()
+    0
+}
+
+func address_d_body() unsafe sync {
+    print("SOS lockchild: wake address: D first")
+    open(GO, "wake address")
+    print("SOS lockchild: wake address: D second")
+    open(READY, "wake address")
+}
+
+// -----------------------------------------------------------------------------
+// HIGHEST
+// -----------------------------------------------------------------------------
+
+func highest() unsafe -> Result<Void, SosStatus> {
+    var go = try gate()
+    GO = gate_at(&var go)
+    var l = try spawn(highest_l, 0, 0)
+    var m = try spawn(highest_w, 0, 1)
+    var n = try spawn(highest_w, 1, 2)
+    var h = try spawn(highest_w, 2, 3)
+    let x = try spawn(highest_x, 0, 4)
+    cast(0, &var l, Priority.Low)
+    cast(1, &var m, Priority.Rt0)
+    cast(2, &var n, Priority.High)
+    cast(3, &var h, Priority.Rt1)
+    let d = try drive_scene(5)
+    try x.start(band: Priority.Rt0)
+    try go.event.signal(bits: 1)
+    try join(&l)
+    try join(&m)
+    try join(&n)
+    try join(&h)
+    try join(&x)
+    try join(&d)
+}
+
+func highest_l(arg: UInt) sync -> UInt {
+    highest_l_body()
+    0
+}
+
+func highest_l_body() unsafe sync {
+    take(&LOCK_A, "highest")
+    take(&LOCK_B, "highest")
+    take(&LOCK_C, "highest")
+    pass(GO, "highest")
+    print("SOS lockchild: highest: L gives C")
+    LOCK_C.give()
+    print("SOS lockchild: highest: L gives B")
+    LOCK_B.give()
+    print("SOS lockchild: highest: L gives A")
+    LOCK_A.give()
+}
+
+/// M (0) waits for A, N (1) for B and H (2) for C.
+func highest_w(which: UInt) sync -> UInt {
+    if which == 0 {
+        take(&LOCK_A, "highest")
+        print("SOS lockchild: highest: M")
+        LOCK_A.give()
+    } else if which == 1 {
+        take(&LOCK_B, "highest")
+        print("SOS lockchild: highest: N")
+        LOCK_B.give()
+    } else {
+        take(&LOCK_C, "highest")
+        print("SOS lockchild: highest: H")
+        LOCK_C.give()
+    }
+    0
+}
+
+func highest_x(arg: UInt) sync -> UInt {
+    print("SOS lockchild: highest: X")
+    0
+}

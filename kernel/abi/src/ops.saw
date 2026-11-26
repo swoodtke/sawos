@@ -162,10 +162,37 @@ public static INFO_OP: UInt = 0xFFFD
 /// Made with any other word in the handle register it is looked up as every
 /// op is: a word that names nothing is `BadHandle`, and a handle naming an
 /// object is `BadOp`, since no kind's table reaches the number. `0xFFFC` is
-/// the next number down from `INFO_OP`, so it is the lowest number of the
-/// band, and every per-object table stays below it, which the `static_assert`s
-/// below hold.
+/// the next number down from `INFO_OP`, and the other ops made with
+/// `NO_HANDLE` continue the band below it; every per-object table stays below
+/// the band, which the `static_assert`s below hold.
 public static PANIC_OP: UInt = 0xFFFC
+
+/// THREAD ID: answer the calling thread's own ID (spec §7), which names the
+/// thread and grants nothing. It is opaque: the kernel alone decodes it, by its
+/// board's split (`hal.THREAD_ID_INDEX_BITS`). The ID of a freed thread does
+/// not name the next thread in its slot until the slot's generation wraps.
+///
+/// Made with `NO_HANDLE`, as `PANIC_OP` is, and intercepted before the
+/// handle-table lookup: it names no object, needs no right and cannot fail,
+/// since it reaches nothing but its caller. Made with any other word it is
+/// looked up as every op is, and no kind's table reaches it.
+public static THREAD_ID_OP: UInt = 0xFFFB
+
+/// LOCK WAIT: wait for the in-process lock whose pair of machine words is at
+/// the address in the first argument, which the caller found held (spec §7):
+/// the holder's thread ID, or 0, then the waiters flag the kernel writes. The
+/// caller parks and the holder is raised to its level until it gives the lock
+/// back.
+///
+/// LOCK WAKE: the caller gave the lock at that address back and found the
+/// waiters flag set; every thread of its process parked on it is answered.
+///
+/// Both are made with `NO_HANDLE`, as `THREAD_ID_OP` is, and take no handle
+/// and no right: they act only on the calling thread and a lock of its own
+/// process, which no handle would add to, and a thread that holds no Thread
+/// handle of its own must still be able to wait and to give back.
+public static LOCK_WAIT_OP: UInt = 0xFFFA
+public static LOCK_WAKE_OP: UInt = 0xFFF9
 
 /// The most of a panic's text the kernel reads, in bytes. A longer text is cut
 /// there. The kernel writes its console with interrupts masked, so the bound
@@ -1177,10 +1204,10 @@ public enum ReplyWaitLeg: UInt {
 }
 
 // Every op table is dense from zero, and stays below the universal ops and the
-// panic op. That is what makes those numbers safe: none can collide with a
-// per-kind op, because no kind is allowed to reach it. The bound tested is
-// `PANIC_OP`, the lowest of the band, so one assert per table covers all, and
-// adding another number below it tightens every one of these at once. There is
+// no-handle ops. That is what makes those numbers safe: none can collide with
+// a per-kind op, because no kind is allowed to reach it. The bound tested is
+// `OP_BAND_FLOOR`, the lowest of the band, so one assert per table covers all,
+// and adding another number below it tightens every one of these at once. There is
 // one assert per table, on its highest case, in the spirit of the rights
 // asserts above: the repetition is the check, and a table growing toward the
 // top of the space fails to build rather than failing as a band op that
@@ -1188,41 +1215,45 @@ public enum ReplyWaitLeg: UInt {
 //
 // When an op is added to a table, re-point that table's assert at the new
 // highest case. A bound tested against a case that is no longer the highest
-// passes while the table walks past `PANIC_OP`.
-static_assert((SystemOp.ProcessByPid as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((ProcessOp.SectionWord as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((ThreadOp.Yield as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((EventOp.Receive as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((WaiterOp.Wait as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((InterruptOp.Latency as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((ClockOp.TimerCreate as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((TimerOp.Disarm as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((MemoryOp.Unpin as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((PoolOp.Available as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((IoMemoryOp.Map as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
+// passes while the table walks past `OP_BAND_FLOOR`.
+
+/// The lowest number of the band no op table may reach: the universal ops and
+/// the ops made with `NO_HANDLE`.
+static OP_BAND_FLOOR: UInt = LOCK_WAKE_OP
+static_assert((SystemOp.ProcessByPid as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((ProcessOp.SectionWord as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((ThreadOp.Yield as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((EventOp.Receive as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((WaiterOp.Wait as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((InterruptOp.Latency as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((ClockOp.TimerCreate as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((TimerOp.Disarm as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((MemoryOp.Unpin as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((PoolOp.Available as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((IoMemoryOp.Map as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
 // Re-point this assert at the highest case when an op is added (see the note on
 // the System table's assert above).
-static_assert((MappingOp.Len as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((PipeInletOp.Call as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((PipeOutletOp.Take as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((PipeReplyOp.Ready as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
-static_assert((PipeRequestOp.ReplyWait as UInt) < PANIC_OP,
-              "an op table must stay below the panic and universal ops")
+static_assert((MappingOp.Len as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((PipeInletOp.Call as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((PipeOutletOp.Take as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((PipeReplyOp.Ready as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
+static_assert((PipeRequestOp.ReplyWait as UInt) < OP_BAND_FLOOR,
+              "an op table must stay below the no-handle and universal ops")
 
 // ...and the band's numbers are distinct and ordered, which is the fact the
 // asserts above lean on when they test the lowest one.

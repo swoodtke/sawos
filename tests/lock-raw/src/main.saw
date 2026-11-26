@@ -1,0 +1,593 @@
+// Test child for `lock` and `lock_foreign_wake`, at the C altitude: the owner
+// word a lock holds and the address handed to the lock's ops are its own to
+// pick, which the typed tier never lets a caller name, and its threads have
+// no block, so each asks the kernel for its ID at each take. It runs under
+// the simple map, alone but for `EXITED`'s, `FREED`'s and `UNSTARTED`'s
+// thread, but for `RAW THREAD` and `TORN`, which its launcher maps with
+// `Normal` at 7 and `Low` 1, `High` 3, `Rt0` 4. The role its launcher gives
+// it, as the bits of an Event under `TAG_ROLE`, says what it does:
+//
+//   FREE WAIT  waits for a free lock: `Ok` at once, and the syscalls column
+//              moves by that one call
+//   EXITED     T runs, keeps its ID and exits; this thread joins it through a
+//              handle that still names it, so its slot is held. A wait whose
+//              owner is T's ID answers `Revoked` (8)
+//   FREED      the same, with that handle released first, so T's slot is
+//              freed and its generation moves on: `Revoked` (8)
+//   UNSTARTED  the same, then a thread made in T's freed slot, the lowest
+//              free one, and never started: a wait for T's ID still answers
+//              `Revoked`, since the new thread took the slot's next
+//              generation, and one for T's ID a generation on names the new
+//              thread, which is the `BadArg` fault
+//   AHEAD      an owner one generation ahead of this thread's own: an ID no
+//              thread had yet, the `BadArg` fault
+//   NO SLOT    an owner with a slot field of zero: the `BadArg` fault
+//   LAST SLOT  T made after five threads that fill the slots below it, so in
+//              the thread slab's last slot, the eighth on every gate profile:
+//              its slot field is printed, and a wait for its ID once it has
+//              exited answers `Revoked`, as for any slot the slab has
+//   PAST SLAB  an owner naming the slot one past the slab's eighth: the
+//              `BadArg` fault
+//   WIDE       on a 64-bit profile, this thread's own ID with a bit set above
+//              the ID's 32 bits; on a 32-bit one, which cannot carry it, an
+//              ID ahead as in `AHEAD`: the `BadArg` fault either way
+//   FOREIGN    an owner that is its launcher's main thread's ID, under
+//              `TAG_ROOT_ID`: the kernel's line naming both processes, then
+//              the `BadArg` fault
+//   UNALIGNED  a wait one byte past a word: the `BadAlign` fault
+//   READONLY   a wait for a pair inside a string literal: the `BadBuffer`
+//              fault, since the kernel writes the waiters flag
+//   STRADDLE   a wait for a pair whose first word is the last word of its
+//              writable segment's row, and whose second is past it: the
+//              `BadBuffer` fault, though only the first word is read
+//   WAKE UNALIGNED  a wake one byte past a word: the `BadAlign` fault
+//   FOREIGN WAKE  a wake at the address under `TAG_ADDR`, in memory its
+//              launcher shares with it, where a thread of its launcher waits
+//              on a lock at the same physical words: `Ok`, and the launcher's
+//              thread stays parked
+//   RAW THREAD  L (`Low`), with no block, takes A through the kernel's ID
+//              and starts W (`Rt0`) and M (`High`). W waits for A, which
+//              raises L to 4, so M's start does not take the processor from
+//              L. L's give lowers it below both: L releases, W, M, L after
+//   TORN       holds a lock, sends its launcher a stack top under
+//              `TAG_STACK`, and parks joining a thread it never starts. Its
+//              launcher makes W in it at this image's entry and starts it
+//              above itself; W, which finds `PROC` set, sends its ID under
+//              `TAG_STACK`, waits for the lock and parks. The launcher then
+//              kills this process, holding W's handle, so W's slot outlives it,
+//              invalid and disowned
+//   DEAD EXITED  sends a stack top and parks for good, as `TORN` does. Its
+//              launcher makes W in it at this image's entry with the argument
+//              1, and W sends its ID and exits; the launcher then kills this
+//              process holding W's handle, so W's slot outlives it, exited and
+//              disowned
+//   ID AND EXIT   sends its main thread's ID under `TAG_STACK` and exits
+//   ID AND PARK   sends its main thread's ID under `TAG_STACK` and parks for
+//              good
+//
+// A call that comes back where it was to end this process exits with
+// `EXIT_SURVIVED`.
+
+import sos.{System, SosStatus, ThreadRight, ALL_RIGHTS, Priority,
+            sos_system_process_self, sos_process_boot_handle_next,
+            sos_process_exit, sos_process_thread_create, sos_event_receive,
+            sos_handle_mint, sos_handle_release, sos_thread_start,
+            sos_thread_start_band, sos_thread_join, sos_thread_exit,
+            sos_thread_id, sos_lock_wait, sos_lock_wake, sos_lock_take,
+            sos_lock_give, sos_process_stats, sos_event_signal,
+            sos_process_thread_self}
+
+static TAG_ROLE: UInt = 40
+static TAG_ROOT_ID: UInt = 41
+static TAG_ADDR: UInt = 44
+static TAG_STACK: UInt = 45
+
+static ROLE_FREE_WAIT: UInt = 1
+static ROLE_EXITED: UInt = 2
+static ROLE_FREED: UInt = 3
+static ROLE_UNSTARTED: UInt = 4
+static ROLE_AHEAD: UInt = 5
+static ROLE_NO_SLOT: UInt = 6
+static ROLE_PAST_SLAB: UInt = 7
+static ROLE_WIDE: UInt = 8
+static ROLE_FOREIGN: UInt = 9
+static ROLE_UNALIGNED: UInt = 10
+static ROLE_READONLY: UInt = 11
+static ROLE_STRADDLE: UInt = 12
+static ROLE_WAKE_UNALIGNED: UInt = 13
+static ROLE_FOREIGN_WAKE: UInt = 14
+static ROLE_RAW_THREAD: UInt = 15
+static ROLE_TORN: UInt = 16
+static ROLE_LAST_SLOT: UInt = 17
+static ROLE_DEAD_EXITED: UInt = 18
+static ROLE_ID_AND_EXIT: UInt = 19
+static ROLE_ID_AND_PARK: UInt = 20
+
+/// The threads `LAST SLOT` makes and never starts, below T.
+static FILLERS: Int = 5
+
+/// A call came back where it was to end this process.
+static EXIT_SURVIVED: UInt = 99
+/// A step before the one under test was refused, or no role was given.
+static EXIT_SETUP: UInt = 97
+
+static STATUS_OK: UInt = 0
+
+/// A word that names nothing.
+static NONE: UInt = 0
+
+/// The bits of a thread ID that carry its slot, as every board splits an ID
+/// today (`hal.THREAD_ID_INDEX_BITS`); one generation is the next bit up. A
+/// program never decodes an ID: this one builds owner words no thread has.
+static ID_SLOT_BITS: Int = 12
+static ONE_GENERATION: UInt = 1 << ID_SLOT_BITS
+static ID_SLOT_MASK: UInt = ONE_GENERATION - 1
+
+/// The words in a boot-handle record.
+static BOOT_WORDS: Int = 3
+
+/// `ProcessStats`' record, and where its syscalls column is.
+static STATS_WORDS: Int = 4
+static STATS_SYSCALLS: Int = 0
+
+unsafe static var ROLE: UInt = 0
+unsafe static var ROOT_ID: UInt = 0
+unsafe static var ADDR: UInt = 0
+unsafe static var STACK_EVENT: UInt = 0
+/// This process's handle, set before `TORN`'s W is made: W's entry is the
+/// image's, and this is how it tells itself from the first thread.
+unsafe static var PROC: UInt = 0
+
+/// A lock's pair, at a word or one byte past it, in this process's data.
+unsafe static var PAIR: [UInt; 3] = [0; 3]
+
+/// The handle `T` exits through, and the ID it keeps before it does.
+unsafe static var EXIT_WORD: UInt = 0
+unsafe static var T_ID: UInt = 0
+
+/// `T`'s stack.
+static STACK_WORDS: Int = 256
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+/// `TORN`'s W's stack, and `RAW THREAD`'s three. A thread that prints wants
+/// 4 KiB at least.
+static W_STACK_WORDS: Int = 1024
+unsafe static var W_STACK: [UInt; W_STACK_WORDS] = [0; W_STACK_WORDS]
+static WORKERS: Int = 3
+unsafe static var WORKER_STACK: [UInt; W_STACK_WORDS * WORKERS] = [0; W_STACK_WORDS * WORKERS]
+
+/// `RAW THREAD`'s workers, by index: the handle each was made with, and a
+/// sibling it exits through.
+static WORKER_L: Int = 0
+static WORKER_M: Int = 1
+static WORKER_W: Int = 2
+unsafe static var WORKER_MADE: [UInt; WORKERS] = [0; WORKERS]
+unsafe static var WORKER_EXIT: [UInt; WORKERS] = [0; WORKERS]
+
+static STACK_ALIGN: UInt = 16
+
+extern "C" {
+    func sos_arena_base() -> UInt
+    func sos_arena_size() -> UInt
+}
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+/// The word an Event holds, drained.
+func event_word(handle: UInt) unsafe -> UInt {
+    var word: UInt = 0
+    let _ = sos_event_receive(handle, (&var word) as UnsafePointer<UInt>)
+    word
+}
+
+/// Take every record of the boot set and keep what each tag names.
+func drain(proc: UInt) unsafe {
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let bytes = (BOOT_WORDS as UInt) * word_bytes()
+    while sos_process_boot_handle_next(proc, (&var rec) as UnsafePointer<UInt>,
+                                       bytes) == STATUS_OK {
+        let tag = rec[0]
+        let word = rec[2]
+        if tag == TAG_ROLE {
+            ROLE = event_word(word)
+        } else if tag == TAG_ADDR {
+            ADDR = event_word(word)
+        } else if tag == TAG_ROOT_ID {
+            ROOT_ID = event_word(word)
+        } else if tag == TAG_STACK {
+            STACK_EVENT = word
+        }
+    }
+}
+
+func pair() unsafe -> UInt {
+    ((&var PAIR) as UnsafePointer<UInt>) as UInt
+}
+
+/// Set the pair's owner word.
+func own(owner: UInt) unsafe {
+    PAIR[0] = owner
+}
+
+/// Wait for the pair with `owner` as its owner word, and print the answer.
+func wait_for(round: String, owner: UInt) unsafe {
+    own(owner)
+    let status = sos_lock_wait(pair())
+    print("SOS lockraw: {}: status={}", round, status)
+}
+
+/// A word-aligned address inside a string literal, in read-only data, with a
+/// pair's room after it.
+func readonly_pair() unsafe -> UInt {
+    let literal = "a string literal, which lives in this image's read-only data"
+    let at = literal.c_string()! as UInt
+    at - (at % word_bytes())
+}
+
+/// The last word of the row this image's writable segment was placed as.
+/// The segment ends at the runtime's arena, padded to the profile's grain:
+/// 4096 bytes on the 64-bit profile, and on the 32-bit ones the arena's own
+/// 16-byte-aligned end.
+func last_writable_word() unsafe -> UInt {
+    let grain: UInt = if word_bytes() == 8 { 4096 } else { 16 }
+    let end = sos_arena_base() + sos_arena_size()
+    let top = (end + grain - 1) - ((end + grain - 1) % grain)
+    top - word_bytes()
+}
+
+func top_of(base: UInt, words: Int) -> UInt {
+    let top = base + (words as UInt) * word_bytes()
+    top - (top % STACK_ALIGN)
+}
+
+func stack_top() unsafe -> UInt {
+    top_of(((&var STACK) as UnsafePointer<UInt>) as UInt, STACK_WORDS)
+}
+
+func w_stack_top() unsafe -> UInt {
+    top_of(((&var W_STACK) as UnsafePointer<UInt>) as UInt, W_STACK_WORDS)
+}
+
+func worker_stack_top(i: Int) unsafe -> UInt {
+    let base = ((&var WORKER_STACK) as UnsafePointer<UInt>) as UInt
+    top_of(base + (i * W_STACK_WORDS) as UInt * word_bytes(), W_STACK_WORDS)
+}
+
+/// A thread of this process at `entry`, not started, or `NONE`.
+func made_thread(proc: UInt, entry: UInt, top: UInt, arg: UInt) unsafe -> UInt {
+    var t: UInt = NONE
+    if sos_process_thread_create(proc, entry, top, arg,
+                                 (&var t) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    t
+}
+
+/// A sibling of `t` holding `Control`, for the thread to exit through.
+func control_sibling(t: UInt) unsafe -> UInt {
+    var sibling: UInt = NONE
+    if sos_handle_mint(t, ThreadRight.Control as UInt,
+                       (&var sibling) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    sibling
+}
+
+/// T: keep this thread's ID and exit through `EXIT_WORD`, which releases it.
+func exits(arg: UInt) sync -> Never {
+    exit_through()
+}
+
+func exit_through() unsafe sync -> Never {
+    T_ID = sos_thread_id()
+    let _ = sos_thread_exit(EXIT_WORD, 0)
+    while { }
+}
+
+/// Make T, run it to its exit and join it: answers the handle it was made
+/// with, which still names it, or `NONE`.
+func t_exited(proc: UInt) unsafe -> UInt {
+    let entry: FuncPointer<(UInt) sync -> Never> = exits
+    let t = made_thread(proc, entry.address(), stack_top(), 0)
+    if t == NONE {
+        return NONE
+    }
+    EXIT_WORD = control_sibling(t)
+    if EXIT_WORD == NONE || sos_thread_start(t) != STATUS_OK {
+        return NONE
+    }
+    var code: UInt = 0
+    if sos_thread_join(t, (&var code) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    t
+}
+
+/// This process's syscalls column.
+func syscalls(proc: UInt) unsafe -> UInt64 {
+    var rec: [UInt64; STATS_WORDS] = [0; STATS_WORDS]
+    let _ = sos_process_stats(proc, (&var rec) as UnsafePointer<UInt64>,
+                              (STATS_WORDS * 8) as UInt)
+    rec[STATS_SYSCALLS]
+}
+
+/// `FREE WAIT`.
+func free_wait(proc: UInt) unsafe -> UInt {
+    own(0)
+    let before = syscalls(proc)
+    let status = sos_lock_wait(pair())
+    let after = syscalls(proc)
+    // The second reading's own trap is counted in it.
+    print("SOS lockraw: free wait: status={} syscalls={}", status,
+          after - before - 1)
+    0
+}
+
+/// `EXITED`, `FREED` and `UNSTARTED`.
+func t_rounds(proc: UInt) unsafe -> UInt {
+    let t = t_exited(proc)
+    if t == NONE {
+        return EXIT_SETUP
+    }
+    if ROLE == ROLE_EXITED {
+        wait_for("exited", T_ID)
+        return 0
+    }
+    if sos_handle_release(t) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    if ROLE == ROLE_FREED {
+        wait_for("freed", T_ID)
+        return 0
+    }
+    let entry: FuncPointer<(UInt) sync -> Never> = exits
+    if made_thread(proc, entry.address(), stack_top(), 0) == NONE {
+        return EXIT_SETUP
+    }
+    wait_for("unstarted", T_ID)
+    print("SOS lockraw: unstarted: an owner naming a thread never started")
+    wait_for("unstarted", T_ID + ONE_GENERATION)
+    EXIT_SURVIVED
+}
+
+/// `WIDE`'s owner: past the ID's 32 bits where a word has room, else one
+/// generation ahead.
+func wide_owner() unsafe -> UInt {
+    let me = sos_thread_id()
+    if word_bytes() == 8 {
+        return me | ((1 << 20) << 20)
+    }
+    me + ONE_GENERATION
+}
+
+/// `RAW THREAD`'s workers, each made at `worker` and exiting through its
+/// sibling.
+func raw_thread(proc: UInt) unsafe -> UInt {
+    PROC = proc
+    let entry: FuncPointer<(UInt) sync -> Never> = worker
+    var i: Int = 0
+    while i < WORKERS {
+        let t = made_thread(proc, entry.address(), worker_stack_top(i),
+                            i as UInt)
+        if t == NONE {
+            return EXIT_SETUP
+        }
+        WORKER_MADE[i] = t
+        WORKER_EXIT[i] = control_sibling(t)
+        if WORKER_EXIT[i] == NONE {
+            return EXIT_SETUP
+        }
+        i = i + 1
+    }
+    if sos_thread_start_band(WORKER_MADE[WORKER_L],
+                             Priority.Low as UInt) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var code: UInt = 0
+    i = 0
+    while i < WORKERS {
+        let _ = sos_thread_join(WORKER_MADE[i],
+                                (&var code) as UnsafePointer<UInt>)
+        i = i + 1
+    }
+    0
+}
+
+func worker(arg: UInt) sync -> Never {
+    work(arg as Int)
+}
+
+func work(i: Int) unsafe sync -> Never {
+    if i == WORKER_L {
+        raw_l()
+    } else if i == WORKER_W {
+        if sos_lock_take(pair()) != STATUS_OK {
+            print("SOS lockraw: raw thread: W's take was refused")
+        }
+        print("SOS lockraw: raw thread: W took the lock")
+        let _ = sos_lock_give(pair())
+    } else {
+        print("SOS lockraw: raw thread: M")
+    }
+    let _ = sos_thread_exit(WORKER_EXIT[i], 0)
+    while { }
+}
+
+/// L: take A, then start W, which waits for it and raises L, and M, which
+/// does not take the processor from L so raised.
+func raw_l() unsafe sync {
+    if sos_lock_take(pair()) != STATUS_OK {
+        print("SOS lockraw: raw thread: L's take was refused")
+    }
+    let _ = sos_thread_start_band(WORKER_MADE[WORKER_W], Priority.Rt0 as UInt)
+    let _ = sos_thread_start_band(WORKER_MADE[WORKER_M], Priority.High as UInt)
+    print("SOS lockraw: raw thread: L releases")
+    let _ = sos_lock_give(pair())
+    print("SOS lockraw: raw thread: L after")
+}
+
+/// `TORN`'s first thread: hold the lock, tell the launcher W's stack, and
+/// park for good.
+func torn(proc: UInt) unsafe -> UInt {
+    PROC = proc
+    own(sos_thread_id())
+    let entry: FuncPointer<(UInt) sync -> Never> = exits
+    let parked = made_thread(proc, entry.address(), stack_top(), 0)
+    if parked == NONE {
+        return EXIT_SETUP
+    }
+    print("SOS lockraw: torn: H holds the lock")
+    if sos_event_signal(STACK_EVENT, w_stack_top()) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var code: UInt = 0
+    let _ = sos_thread_join(parked, (&var code) as UnsafePointer<UInt>)
+    EXIT_SURVIVED
+}
+
+/// `TORN`'s W: wait for the lock H holds.
+func torn_w() unsafe -> Never {
+    let _ = sos_event_signal(STACK_EVENT, sos_thread_id())
+    print("SOS lockraw: torn: W waits for H's lock")
+    let status = sos_lock_wait(pair())
+    print("SOS lockraw: torn: W's wait answered {}", status)
+    while { }
+}
+
+/// The argument `DEAD EXITED`'s W is made with.
+static DEAD_EXITED_W: UInt = 1
+
+/// `TORN` and `DEAD EXITED`'s first thread: send W's stack top, and park for
+/// good.
+func stack_and_park(proc: UInt) unsafe -> UInt {
+    PROC = proc
+    let entry: FuncPointer<(UInt) sync -> Never> = exits
+    let parked = made_thread(proc, entry.address(), stack_top(), 0)
+    if parked == NONE {
+        return EXIT_SETUP
+    }
+    if sos_event_signal(STACK_EVENT, w_stack_top()) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    var code: UInt = 0
+    let _ = sos_thread_join(parked, (&var code) as UnsafePointer<UInt>)
+    EXIT_SURVIVED
+}
+
+/// `DEAD EXITED`'s W: send its ID and exit through a handle of its own.
+func dead_exited_w() unsafe -> Never {
+    let _ = sos_event_signal(STACK_EVENT, sos_thread_id())
+    var me: UInt = NONE
+    let _ = sos_process_thread_self(PROC, (&var me) as UnsafePointer<UInt>)
+    let _ = sos_thread_exit(me, 0)
+    while { }
+}
+
+/// `ID AND EXIT` and `ID AND PARK`.
+func id_rounds(proc: UInt) unsafe -> UInt {
+    if sos_event_signal(STACK_EVENT, sos_thread_id()) != STATUS_OK {
+        return EXIT_SETUP
+    }
+    if ROLE == ROLE_ID_AND_EXIT {
+        return 0
+    }
+    let entry: FuncPointer<(UInt) sync -> Never> = exits
+    let parked = made_thread(proc, entry.address(), stack_top(), 0)
+    var code: UInt = 0
+    let _ = sos_thread_join(parked, (&var code) as UnsafePointer<UInt>)
+    EXIT_SURVIVED
+}
+
+/// `LAST SLOT`.
+func last_slot(proc: UInt) unsafe -> UInt {
+    let entry: FuncPointer<(UInt) sync -> Never> = exits
+    var i: Int = 0
+    while i < FILLERS {
+        if made_thread(proc, entry.address(), stack_top(), 0) == NONE {
+            return EXIT_SETUP
+        }
+        i = i + 1
+    }
+    if t_exited(proc) == NONE {
+        return EXIT_SETUP
+    }
+    print("SOS lockraw: last slot: T's slot field {}", T_ID & ID_SLOT_MASK)
+    wait_for("last slot", T_ID)
+    0
+}
+
+/// `FOREIGN WAKE`.
+func foreign_wake() unsafe -> UInt {
+    let status = sos_lock_wake(ADDR)
+    print("SOS lockraw: foreign wake: the wake answered {}", status)
+    0
+}
+
+@export("_start")
+func _start(boot_handle: UInt) unsafe {
+    if PROC != NONE {
+        if boot_handle == DEAD_EXITED_W {
+            dead_exited_w()
+        }
+        torn_w()
+    }
+    let system = System(boot_handle: boot_handle)
+    var proc: UInt = NONE
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        let _ = system.debug_print("SOS lockraw: no process handle\n")
+        return
+    }
+    drain(proc)
+    var code = EXIT_SURVIVED
+    if ROLE == ROLE_FREE_WAIT {
+        code = free_wait(proc)
+    } else if ROLE == ROLE_EXITED || ROLE == ROLE_FREED ||
+              ROLE == ROLE_UNSTARTED {
+        code = t_rounds(proc)
+    } else if ROLE == ROLE_AHEAD {
+        print("SOS lockraw: ahead: an owner one generation ahead of its own")
+        wait_for("ahead", sos_thread_id() + ONE_GENERATION)
+    } else if ROLE == ROLE_NO_SLOT {
+        print("SOS lockraw: no slot: an owner with no slot")
+        wait_for("no slot", ONE_GENERATION)
+    } else if ROLE == ROLE_PAST_SLAB {
+        print("SOS lockraw: past slab: an owner past the thread slab")
+        wait_for("past slab", 9)
+    } else if ROLE == ROLE_WIDE {
+        print("SOS lockraw: wide: an owner wider than an ID")
+        wait_for("wide", wide_owner())
+    } else if ROLE == ROLE_FOREIGN {
+        print("SOS lockraw: foreign: an owner naming the launcher's thread")
+        wait_for("foreign", ROOT_ID)
+        code = 0
+    } else if ROLE == ROLE_UNALIGNED {
+        print("SOS lockraw: unaligned: waiting for a pair one byte off")
+        let _ = sos_lock_wait(pair() + 1)
+    } else if ROLE == ROLE_READONLY {
+        print("SOS lockraw: readonly: waiting for a pair in a string literal")
+        let _ = sos_lock_wait(readonly_pair())
+    } else if ROLE == ROLE_STRADDLE {
+        print("SOS lockraw: straddle: waiting for a pair past its row's end")
+        let _ = sos_lock_wait(last_writable_word())
+    } else if ROLE == ROLE_WAKE_UNALIGNED {
+        print("SOS lockraw: wake unaligned: waking a pair one byte off")
+        let _ = sos_lock_wake(pair() + 1)
+    } else if ROLE == ROLE_FOREIGN_WAKE {
+        code = foreign_wake()
+    } else if ROLE == ROLE_RAW_THREAD {
+        code = raw_thread(proc)
+    } else if ROLE == ROLE_TORN {
+        code = torn(proc)
+    } else if ROLE == ROLE_DEAD_EXITED {
+        code = stack_and_park(proc)
+    } else if ROLE == ROLE_ID_AND_EXIT || ROLE == ROLE_ID_AND_PARK {
+        code = id_rounds(proc)
+    } else if ROLE == ROLE_LAST_SLOT {
+        code = last_slot(proc)
+    } else {
+        code = EXIT_SETUP
+    }
+    let _ = sos_process_exit(proc, code)
+}

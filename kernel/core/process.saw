@@ -90,6 +90,7 @@ import kcore.threads.{
     alloc_thread,
     band_level,
     frame_slot,
+    slot_generation,
 }
 
 // `ProcessState`, `GrantRow`, `ProcessRecord`, `ProcessBody` and their tables
@@ -1504,12 +1505,14 @@ public func start_process(entry: UInt, stack_top: UInt, region_top: UInt,
     let main = alloc_thread()
     let _ = mint_handle(p, ObjType.Thread, thread_rights(), main)
     // The boot Thread handle is the main thread's one reference.
-    THREADS[main] = ThreadSlot(state: ThreadState.Running,
-                               level: band_level(bands, Priority.Normal as Int),
-                               process: p, exit_code: 0,
+    let level = band_level(bands, Priority.Normal as Int)
+    THREADS[main] = ThreadSlot(state: ThreadState.Running, level: level,
+                               base_level: level, process: p, exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
-                               call_len: 0, latency_irq: 0, latency_from: 0, refs: 1)
+                               call_len: 0, latency_irq: 0, latency_from: 0,
+                               lock_at: 0, lock_holder: 0, refs: 1,
+                               generation: slot_generation(main))
     quota_charge(p, QuotaKind.Thread)
     CURRENT_THREAD = main
     SLICE_LEFT = SLICE_TICKS

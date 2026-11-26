@@ -257,6 +257,11 @@ SECTION_CHILD_PKG = os.path.join(TESTS_DIR, "section-child")
 SECTION_RAW_PKG = os.path.join(TESTS_DIR, "section-raw")
 SECTION_TICK_PKG = os.path.join(TESTS_DIR, "section-tick")
 SECTION_OTHER_PKG = os.path.join(TESTS_DIR, "section-other")
+# The inheritance lock (spec §7): a root that launches a child into each rule,
+# and a child at the C altitude for the words the typed tier cannot name.
+LOCK_ROOT_PKG = os.path.join(TESTS_DIR, "lock-root")
+LOCK_CHILD_PKG = os.path.join(TESTS_DIR, "lock-child")
+LOCK_RAW_PKG = os.path.join(TESTS_DIR, "lock-raw")
 # Event and Waiter objects.
 EVENT_BASICS_PKG = os.path.join(TESTS_DIR, "event-basics")
 EVENT_WAKE_PKG = os.path.join(TESTS_DIR, "event-wake")
@@ -3746,6 +3751,231 @@ TEST_CASES = [
                        "SOS sectiontick: confined low: K\n",
                        "SOS sectiontick: confined low ended status=196617\n",
                        "SOS sectiontick: done\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The inheritance lock's raise and its lowering at the give (spec §7),
+        # with no tick: `tests/lock-child`'s `INHERIT` says how the order is
+        # made. L's lines come before M's only because H's wait raised L
+        # above M, and H's before L's last only because the give lowered L
+        # below H.
+        "name": "lock_inherit",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LOCK_ROOT_PKG,
+        "children": [LOCK_CHILD_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS lockchild: inherit: L releases\n",
+            "SOS lockchild: inherit: H\n",
+            "SOS lockchild: inherit: M\n",
+            "SOS lockchild: inherit: L after\n",
+            "SOS lock: inherit ended status=65536\n",
+            "SOS lock: done\n",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # The inheritance lock (spec §7), with no tick: every switch is one a
+        # thread makes, and each scene is set by a driver thread that runs
+        # only while every other thread is parked. `tests/lock-root` says
+        # what each round is, `tests/lock-child` and `tests/lock-raw` how
+        # each is made and why its order is forced.
+        #
+        # A status word is the child's §8 status: `Exited` (1) << 16 for 0,
+        # and `Faulted` (2) << 16 with the reason: `LockChain` 16,
+        # `SectionHeld` 15, `Panic` 14, `BadBuffer` 11, `BadAlign` 10,
+        # `BadArg` 9, `BadState` 5. A status a wait answers is `Ok` 0 or
+        # `Revoked` 8.
+        "name": "lock",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LOCK_ROOT_PKG,
+        "children": [LOCK_CHILD_PKG, LOCK_RAW_PKG],
+        "expect_out": [
+            "{banner}",
+            "SOS lockchild: chain: L releases\n",
+            "SOS lockchild: chain: M\n",
+            "SOS lockchild: chain: H\n",
+            "SOS lockchild: chain: N\n",
+            "SOS lock: chain ended status=65536\n",
+            "SOS lockchild: two locks: L gives B\n",
+            "SOS lockchild: two locks: H\n",
+            "SOS lockchild: two locks: L gives A\n",
+            "SOS lockchild: two locks: M\n",
+            "SOS lockchild: two locks: X\n",
+            "SOS lockchild: two locks: L done\n",
+            "SOS lockchild: two locks: Z\n",
+            "SOS lock: two locks ended status=65536\n",
+            "SOS lockchild: wake all: L gives\n",
+            "SOS lockchild: wake all: W2\n",
+            "SOS lockchild: wake all: W1\n",
+            "SOS lock: wake all ended status=65536\n",
+            "SOS lockchild: holder exits: L exits holding the lock\n",
+            "SOS lockchild: holder exits: H's raw wait answered 8\n",
+            "SOS lockchild: holder exits: H's next take answered Revoked\n",
+            "SOS lock: holder exits ended status=65536\n",
+            "SOS lockchild: cycle: A waits for the lock B holds\n",
+            "SOS: process fault: a lock wait closes a cycle or passes "
+            "the bound process={one}",
+            "SOS lock: cycle ended status=131088\n",
+            "SOS lockchild: four: waiting at the end of a chain of 4 "
+            "holders\n",
+            "SOS lockchild: four: took the lock\n",
+            "SOS lock: four ended status=65536\n",
+            "SOS lockchild: five: waiting at the end of a chain of 5 "
+            "holders\n",
+            "SOS: process fault: a lock wait closes a cycle or passes "
+            "the bound process={one}",
+            "SOS lock: five ended status=131088\n",
+            "SOS lockchild: in section: waiting for a held lock inside "
+            "the section\n",
+            "SOS: process fault: parked inside its critical section "
+            "process={one}",
+            "SOS lock: in section ended status=131087\n",
+            "SOS lockchild: relock: taking the lock again\n",
+            "SOS: process fault: object in the wrong state process={one}",
+            "SOS lock: relock ended status=131077\n",
+            "SOS lockchild: give unheld: giving back a free lock\n",
+            *_panic_fault("{one}", "panic at lock.saw:",
+                          ": sos: Lock.give: the calling thread does not "
+                          "hold the lock"),
+            f"SOS lock: give unheld ended status={STATUS_PANICKED}\n",
+            "SOS lockchild: uncontended: the main thread gave the lock back\n",
+            "SOS lockchild: uncontended: W took the lock\n",
+            "SOS lockchild: uncontended: 100 takes and gives made 0 "
+            "syscalls\n",
+            "SOS lock: uncontended ended status=65536\n",
+            "SOS lockchild: stale: V's wait answered 0\n",
+            "SOS lockchild: stale: Y\n",
+            "SOS lockchild: stale: U\n",
+            "SOS lockchild: stale: X\n",
+            "SOS lock: stale ended status=65536\n",
+            "SOS lockchild: wake address: D first\n",
+            "SOS lockchild: wake address: the main thread woke B: 0\n",
+            "SOS lockchild: wake address: D second\n",
+            "SOS lockchild: wake address: W's wait for A answered 0\n",
+            "SOS lock: wake address ended status=65536\n",
+            "SOS lockchild: highest: L gives C\n",
+            "SOS lockchild: highest: H\n",
+            "SOS lockchild: highest: L gives B\n",
+            "SOS lockchild: highest: L gives A\n",
+            "SOS lockchild: highest: X\n",
+            "SOS lockchild: highest: M\n",
+            "SOS lockchild: highest: N\n",
+            "SOS lock: highest ended status=65536\n",
+            "SOS lockraw: free wait: status=0 syscalls=1\n",
+            "SOS lock: free wait ended status=65536\n",
+            "SOS lockraw: exited: status=8\n",
+            "SOS lock: exited ended status=65536\n",
+            "SOS lockraw: freed: status=8\n",
+            "SOS lock: freed ended status=65536\n",
+            "SOS lockraw: unstarted: status=8\n",
+            "SOS lockraw: unstarted: an owner naming a thread never started\n",
+            "SOS: process fault: argument outside its domain "
+            "process={one}",
+            "SOS lock: unstarted ended status=131081\n",
+            "SOS lockraw: ahead: an owner one generation ahead of its own\n",
+            "SOS: process fault: argument outside its domain "
+            "process={one}",
+            "SOS lock: ahead ended status=131081\n",
+            "SOS lockraw: no slot: an owner with no slot\n",
+            "SOS: process fault: argument outside its domain "
+            "process={one}",
+            "SOS lock: no slot ended status=131081\n",
+            "SOS lockraw: last slot: T's slot field 8\n",
+            "SOS lockraw: last slot: status=8\n",
+            "SOS lock: last slot ended status=65536\n",
+            "SOS lockraw: past slab: an owner past the thread slab\n",
+            "SOS: process fault: argument outside its domain "
+            "process={one}",
+            "SOS lock: past slab ended status=131081\n",
+            "SOS lockraw: wide: an owner wider than an ID\n",
+            "SOS: process fault: argument outside its domain "
+            "process={one}",
+            "SOS lock: wide ended status=131081\n",
+            "SOS lockraw: foreign: an owner naming the launcher's thread\n",
+            "SOS: lock wait: the owner is a thread of another process "
+            "waiter={one} holder={zero}\n",
+            "SOS: process fault: argument outside its domain "
+            "process={one}",
+            "SOS lock: foreign ended status=131081\n",
+            "SOS lockraw: unaligned: waiting for a pair one byte off\n",
+            "SOS: process fault: buffer is not word-aligned "
+            "process={one}",
+            "SOS lock: unaligned ended status=131082\n",
+            "SOS lockraw: readonly: waiting for a pair in a string literal\n",
+            "SOS: process fault: buffer is outside the process's memory "
+            "process={one}",
+            "SOS lock: readonly ended status=131083\n",
+            "SOS lockraw: straddle: waiting for a pair past its row's end\n",
+            "SOS: process fault: buffer is outside the process's memory "
+            "process={one}",
+            "SOS lock: straddle ended status=131083\n",
+            "SOS lockraw: wake unaligned: waking a pair one byte off\n",
+            "SOS: process fault: buffer is not word-aligned "
+            "process={one}",
+            "SOS lock: wake unaligned ended status=131082\n",
+            "SOS lockraw: raw thread: L releases\n",
+            "SOS lockraw: raw thread: W took the lock\n",
+            "SOS lockraw: raw thread: M\n",
+            "SOS lockraw: raw thread: L after\n",
+            "SOS lock: raw thread ended status=65536\n",
+            "SOS lock: done\n",
+        ],
+        "expect_clean_exit": True,
+    },
+    {
+        # A wake answers only threads of the waker's process (spec §7): root
+        # and `lock-raw` share a piece of the pool, root's thread W waits on
+        # a lock there, and the child wakes the lock's words at its own
+        # address for them, which on riscv32 and the flat profile is W's. W
+        # stays parked until root gives the lock back. Then `torn`: a thread
+        # parked on a lock, whose process is killed while root holds its
+        # handle, names no holder, so the exit of the next thread in its
+        # holder's old slot answers nobody. Then waits whose owner is a dead
+        # process's thread: invalid, the `BadArg` fault with no line naming a
+        # process; exited, `Revoked`; and a slot reused by later processes,
+        # `Revoked`. `tests/lock-root` says how each round is made. A killed
+        # child's status word is `Killed` (3) << 16 with the code 9, and a
+        # faulted one `Faulted` (2) << 16 with `BadArg` 9.
+        "name": "lock_foreign_wake",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": LOCK_ROOT_PKG,
+        "children": [LOCK_RAW_PKG],
+        "pool": True,
+        "expect_out": [
+            "{banner}",
+            "SOS lockraw: foreign wake: the wake answered 0\n",
+            "SOS lock: foreign wake ended status=65536\n",
+            "SOS lock: foreign wake: root gives the lock back\n",
+            "SOS lock: foreign wake: W's wait answered 0\n",
+            "SOS lock: foreign wake: W took the lock\n",
+            "SOS lock: foreign wake: root after the give\n",
+            "SOS lock: foreign wake: R\n",
+            "SOS lockraw: torn: H holds the lock\n",
+            "SOS lockraw: torn: W waits for H's lock\n",
+            "SOS lock: torn ended status=196617\n",
+            "SOS lock: torn: R exited in the holder's old slot\n",
+            "SOS lock: torn: B ran\n",
+            "SOS lockraw: foreign: an owner naming the launcher's thread\n",
+            "SOS: process fault: argument outside its domain process={one}",
+            "SOS lock: dead held ended status=131081\n",
+            "SOS lock: dead exited ended status=196617\n",
+            "SOS lockraw: foreign: an owner naming the launcher's thread\n",
+            "SOS lockraw: foreign: status=8\n",
+            "SOS lock: dead exited owner ended status=65536\n",
+            "SOS lockraw: foreign: an owner naming the launcher's thread\n",
+            "SOS: lock wait: the owner is a thread of another process "
+            "waiter=",
+            "SOS: process fault: argument outside its domain process=",
+            "SOS lock: foreign exited owner ended status=131081\n",
+            "SOS lock: foreign exited ended status=196617\n",
+            "SOS lock: reuse first ended status=65536\n",
+            "SOS lock: reuse: root's wait answered 8\n",
+            "SOS lock: reuse second ended status=196617\n",
+            "SOS lock: reuse again: root's wait answered 8\n",
+            "SOS lock: reuse third ended status=196617\n",
+            "SOS lock: done\n",
+        ],
         "expect_clean_exit": True,
     },
     {
@@ -12508,11 +12738,27 @@ TEST_CASES = [
     _slab_stop("slab_area_past_ceiling",      # and misaligned
                {"areas": [{"kind": "waiters", "storage": 16, "skew": 1,
                            "slots": lambda f: f["limits"]["capacity"] - 3}]},
-               "a slab area would take its slab past MAX_SLAB_CAPACITY"),
+               "a slab area would take its slab past its ceiling "
+               "(MAX_SLAB_CAPACITY, or for threads the thread ID's index field)"),
     # Exactly at the ceiling is taken by that check, and met by the next.
     _slab_stop("slab_area_at_ceiling",
                {"areas": [{"kind": "waiters", "storage": 16,
                            "slots": lambda f: f["limits"]["capacity"] - 4}]},
+               "a slab area lies outside the kernel's slab region"),
+    # A thread area's ceiling is the thread ID's index field, far below
+    # `MAX_SLAB_CAPACITY`: one slot past it is refused there, and exactly at
+    # it the check is passed and the next one met.
+    _slab_stop("slab_area_threads_past_ids",
+               {"areas": [{"kind": "threads", "storage": 16,
+                           "slots": lambda f: (f["limits"]["thread_slab"]
+                                               - f["slabs"]["threads"]["floor"]
+                                               + 1)}]},
+               "a slab area would take its slab past its ceiling "
+               "(MAX_SLAB_CAPACITY, or for threads the thread ID's index field)"),
+    _slab_stop("slab_area_threads_at_ids",
+               {"areas": [{"kind": "threads", "storage": 16,
+                           "slots": lambda f: (f["limits"]["thread_slab"]
+                                               - f["slabs"]["threads"]["floor"])}]},
                "a slab area lies outside the kernel's slab region"),
     # A pipe area's ceiling is its exchange chain's: `PIPE_INFLIGHT` exchanges
     # a connection reach `MAX_SLAB_CAPACITY` at a smaller count than the
@@ -12524,7 +12770,8 @@ TEST_CASES = [
                                                - f["slabs"]["pipes"]["floor"]
                                                * f["limits"]["inflight"])
                                               // f["limits"]["inflight"] + 1}]},
-               "a slab area would take its slab past MAX_SLAB_CAPACITY"),
+               "a slab area would take its slab past its ceiling "
+               "(MAX_SLAB_CAPACITY, or for threads the thread ID's index field)"),
     _slab_stop("slab_area_pipes_at_exchanges",
                {"areas": [{"kind": "pipes", "storage": 16,
                            "slots": lambda f: (f["limits"]["capacity"]
@@ -22386,7 +22633,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
     # A case asserting a hardware denial does not belong on a Flat board; the
     # check below refuses one named here by mistake, with the gate's reason.
     process_names = ["root_server_boot", "thread_basics", "thread_preempt",
-                     "lock_owner", "levels", "section",
+                     "lock_owner", "levels", "section", "lock_inherit",
                      "timer_oneshot", "tier_word", "process_lifecycle",
                      "death_fault", "pipe_pingpong", "map_into_child",
                      "iomemory_carve", "interrupt_give", "tick_spinner",
