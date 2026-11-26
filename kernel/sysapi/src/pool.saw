@@ -4,11 +4,12 @@
 //! `Memory`, and no other `sos` module.
 //!
 //! A pool is a capability rather than a description, as a region is: there is
-//! no way to read its bounds. What a holder may learn is what it could
-//! allocate (`available`), and what it gets back from `allocate` is another
-//! capability.
+//! no way to read its bounds, where an allocation's are read by its pin alone.
+//! What a holder may learn is what it could allocate (`available`), and what
+//! it gets back from `allocate` is another capability.
 
-import sosabi.{SosStatus, PoolHandle, PoolOp, AllocateFrom, MemoryHandle,
+import sosabi.{SosStatus, PoolHandle, PoolOp, AllocateFrom, AllocateFlag,
+               MemoryHandle,
                MINT_OP, NO_HANDLE,
                POOL_AVAILABLE_RECORD_WORDS, POOL_AVAILABLE_TOTAL_WORD,
                POOL_AVAILABLE_LARGEST_WORD, POOL_AVAILABLE_GRANULARITIES_WORD,
@@ -90,6 +91,12 @@ extension Pool {
     /// The bytes leave the pool until the allocation comes home: its last
     /// handle and its last grant row gone, it returns to this pool whole.
     ///
+    /// `contiguous` promises that the allocation is one physical range, now
+    /// and in any future kernel, and that its `extend` grows it in place or
+    /// answers `NoMemory`. Every allocation is one range today, so the flag
+    /// changes no placement; `Memory.pin` answers only for an allocation made
+    /// with it.
+    ///
     /// `granularity` is the unit the allocation is made of: its base and its
     /// length are multiples of it. Zero names the pool's finest accepted
     /// granularity, and any other value must be one of the set `available`
@@ -100,9 +107,11 @@ extension Pool {
     /// The allocation carries this handle's rights intersected with the bits
     /// a `Memory` has but `MemoryRight.Extend`, capped by the caller's
     /// `Memory` ceiling: a pool sibling minted without `MapExecute` allocates
-    /// memory that cannot be mapped executable either. A `Front` allocation
-    /// carries this handle's `Map`, `MapExecute` and `Extend` instead, and
-    /// never `Transfer` or `Mint`, so it stays in this process.
+    /// memory that cannot be mapped executable either, and one without
+    /// `Physical` memory that cannot be pinned. A `Front` allocation carries
+    /// this handle's `Map`, `MapExecute` and `Extend` instead, and never
+    /// `Transfer`, `Mint` or `Physical`, so it stays in this process and is
+    /// never pinned.
     ///
     /// A caller at its Memory or handle quota gets `SosStatus.QuotaExceeded`.
     /// A pool with no range `from` allows that long is `SosStatus.NoMemory`,
@@ -113,10 +122,14 @@ extension Pool {
     /// the pool.
     public func allocate(
         &self, len: UInt, granularity: UInt = 0,
-        from: AllocateFrom = AllocateFrom.Any
+        from: AllocateFrom = AllocateFrom.Any, contiguous: Bool = false
     ) -> Result<Memory, SosStatus> {
+        var word = from as UInt
+        if contiguous {
+            word = word | (AllocateFlag.Contiguous as UInt)
+        }
         let raw = try call_value(self.handle, PoolOp.Allocate as UInt, len,
-                                 granularity, from as UInt)
+                                 granularity, word)
         return Memory(handle: MemoryHandle(raw))
     }
 

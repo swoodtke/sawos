@@ -13,6 +13,12 @@
 //! record's, which the launch convention bounds (`sosimage.declaration`).
 //! `iomemory` is the kind of `IoMemory`, for which the kebab form of its
 //! name would be two words.
+//!
+//! An opt-in right (`is_opt_in`: `physical`, of `memory` and `pool`) is
+//! one a process holds only when its declaration asks for it and its image
+//! grants it, so it is left out of every default: a process with no
+//! `[ceilings]` and a record with no `rights` get every right but the
+//! opt-in ones (spec §12).
 
 import sosimage.rules.{holds}
 
@@ -77,7 +83,7 @@ public func ceiling_kind_at(index: Int) -> CeilingKindInfo {
           [bit("transfer", 0), bit("mint", 1), bit("arm", 8), bit("wait", 9)]),
         case 7 -> kind("memory", "Memory", "MemoryRight", "a Memory",
           [bit("transfer", 0), bit("mint", 1), bit("map", 9), bit("map-execute", 10),
-           bit("extend", 11)]),
+           bit("extend", 11), bit("physical", 12)]),
         case 8 -> kind("iomemory", "IoMemory", "IoMemoryRight", "an IoMemory",
           [bit("transfer", 0), bit("mint", 1), bit("carve", 8), bit("map", 9)]),
         case 9 -> kind("mapping", "Mapping", "MappingRight", "a Mapping",
@@ -85,7 +91,7 @@ public func ceiling_kind_at(index: Int) -> CeilingKindInfo {
            bit("grow", 10)]),
         case 10 -> kind("pool", "Pool", "PoolRight", "a Pool",
           [bit("transfer", 0), bit("mint", 1), bit("map", 9), bit("map-execute", 10),
-           bit("extend", 11), bit("allocate", 16)]),
+           bit("extend", 11), bit("physical", 12), bit("allocate", 16)]),
         case 11 -> kind("pipe-inlet", "PipeInlet", "PipeInletRight", "a PipeInlet",
           [bit("transfer", 0), bit("mint", 1), bit("post", 8), bit("wait", 9)]),
         case 12 -> kind("pipe-outlet", "PipeOutlet", "PipeOutletRight", "a PipeOutlet",
@@ -96,6 +102,27 @@ public func ceiling_kind_at(index: Int) -> CeilingKindInfo {
           [bit("transfer", 0), bit("mint", 1), bit("reply", 8), bit("wait", 9),
            bit("sender", 10)])
     }
+}
+
+/// Whether the right `name` is opt-in: one a process holds only when its
+/// declaration asks for it and its image grants it. A right of an opt-in name
+/// is opt-in in every kind that has one.
+public func is_opt_in(name: String) -> Bool {
+    name.equals("physical")
+}
+
+/// The word of `info`'s kind's opt-in rights: none for a kind without one.
+public func opt_in_word(info: &CeilingKindInfo) -> UInt32 {
+    var word: UInt32 = 0
+    var i = 0
+    while i < info.rights.len() {
+        let r = info.rights.get(i)!
+        if is_opt_in(r.name) {
+            word = word | ((1 as UInt32) << (r.shift as UInt32))
+        }
+        i = i + 1
+    }
+    word
 }
 
 /// The kind named `key` in a declaration.

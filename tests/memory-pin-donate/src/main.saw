@@ -1,0 +1,64 @@
+// A pinned allocation never backs a slab (spec §2.5, §2.8).
+//
+//   SOS pindonate: pinned and unpinned, donated: accepted
+//   SOS pindonate: pinned, donated
+//   SOS: process fault: object in the wrong state process=0
+//
+// A device may write a pinned allocation's bytes, so the kernel never keeps its
+// own objects there. A page pinned and unpinned again is an ordinary page, its
+// only handle and no row, and its donation is accepted. A second page, pinned
+// and donated in the same shape, is the `BadState` fault that ends the case.
+
+import sos.{System, Process, Pool, SlabKind, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pindonate: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS pindonate: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS pindonate: UNREACHABLE the donation returned\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let unpinned = try pool.allocate(len: PAGE, contiguous: true)
+    let _ = try unpinned.pin()
+    try unpinned.unpin()
+    try system.slab_donate(kind: SlabKind.Events, memory: move unpinned) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let _ = system.debug_print(
+        "SOS pindonate: pinned and unpinned, donated: accepted\n")
+
+    let pinned = try pool.allocate(len: PAGE, contiguous: true)
+    let _ = try pinned.pin()
+    let _ = system.debug_print("SOS pindonate: pinned, donated\n")
+    try system.slab_donate(kind: SlabKind.Events, memory: move pinned) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return
+}

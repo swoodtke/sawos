@@ -1,0 +1,62 @@
+//! A child of a stock-root image whose declaration has no `[ceilings]` and
+//! whose pool record names no rights (`process.toml`): the launch convention
+//! leaves the opt-in `Physical` out of both (spec §12). It prints its `Memory`
+//! and `Pool` ceilings and its pool record's rights, each every right but
+//! `Physical`, and the rights of a page it allocates from the pool, which
+//! carry none of it either, and exits.
+
+import sos.{System, Process, SosStatus, MemoryRight, PoolRight}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this program can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// The pool record's tag in the declaration.
+static TAG_DMA: UInt = 2
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+func holds(word: UInt32, bit: UInt32) -> String {
+    if (word & bit) != 0 { "yes" } else { "no" }
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS physdefault: no process handle\n")
+        return
+    }
+    try run(&proc) catch {
+        print("SOS physdefault: refused: {}", error)
+        let _ = proc.exit(EXIT_FAILED)
+        return
+    }
+    let _ = proc.exit(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    let memory = try proc.memory_ceiling()
+    print("SOS physdefault: Memory ceiling={} holds Physical: {}", memory,
+          holds(memory, MemoryRight.Physical as UInt32))
+    let pool_ceiling = try proc.pool_ceiling()
+    print("SOS physdefault: Pool ceiling={} holds Physical: {}", pool_ceiling,
+          holds(pool_ceiling, PoolRight.Physical as UInt32))
+
+    var rec = try proc.boot_handle_next()
+    if rec.tag != TAG_DMA {
+        return BUG
+    }
+    guard let pool = rec.take_pool() else { return BUG }
+    let rights = try pool.rights()
+    print("SOS physdefault: the pool record's rights={} hold Physical: {}",
+          rights, holds(rights, PoolRight.Physical as UInt32))
+    let page = try pool.allocate(len: PAGE, contiguous: true)
+    let page_rights = try page.rights()
+    print("SOS physdefault: a page from it rights={} holds Physical: {}",
+          page_rights, holds(page_rights, MemoryRight.Physical as UInt32))
+    return
+}

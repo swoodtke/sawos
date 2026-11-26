@@ -1,0 +1,136 @@
+// `Allocate`'s third word: an `AllocateFrom` in its low byte and the
+// `AllocateFlag` bits above it (spec §2.5).
+//
+//   SOS allocflags: from anywhere, contiguous: ok, pinned: ok
+//   SOS allocflags: from the front, contiguous: ok, carries Physical: no
+//   SOS allocflags: from the back, contiguous: ok, pinned: ok
+//   SOS allocflags: bit 9, which no flag names
+//   SOS: process fault: argument outside its domain process=0
+//
+// The contiguous flag beside each `AllocateFrom` is served, and is recorded:
+// an allocation from anywhere or from the back made with it pins. One from the
+// front is minted without `Physical`, so no allocation that can grow is ever
+// pinned. A bit above the low byte that no `AllocateFlag` names is the
+// `BadArg` fault, which ends the case. (A low byte that names no
+// `AllocateFrom` is `pool_from_bad`'s.)
+//
+// It works at the C altitude, where the word is the caller's to write.
+
+import sos.{System, SosStatus, MemoryRight, HandleInfo, AllocateFrom,
+            AllocateFlag, ALL_RIGHTS, sos_system_process_self,
+            sos_process_boot_handle_next, sos_pool_allocate, sos_memory_pin,
+            sos_memory_unpin, sos_handle_info, sos_handle_release}
+
+static EXIT_FAILED: UInt = 1
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+/// A bit above `Allocate`'s `AllocateFrom` byte that no `AllocateFlag` names.
+static UNNAMED: UInt = 1 << 9
+
+static RECORD_WORDS: Int = 2
+static BOOT_WORDS: Int = 3
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+/// A raw status word in the typed vocabulary's words.
+func status_of(raw: UInt) -> SosStatus {
+    if raw > (UInt8.max as UInt) {
+        return SosStatus.Unknown
+    }
+    SosStatus.from(raw: raw as UInt8) ?? SosStatus.Unknown
+}
+
+/// The pool word of the one boot record, or `NONE`.
+func boot_pool(boot_handle: UInt) unsafe -> UInt {
+    var proc: UInt = NONE
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let drained = sos_process_boot_handle_next(
+        proc, (&var rec) as UnsafePointer<UInt>,
+        (BOOT_WORDS as UInt) * word_bytes())
+    if drained != STATUS_OK {
+        return NONE
+    }
+    rec[2]
+}
+
+/// Allocate a page from `pool` with the third word `word`: the raw status and
+/// the allocation's word.
+func allocate(pool: UInt, word: UInt) unsafe -> (UInt, UInt) {
+    var page: UInt = NONE
+    let status = sos_pool_allocate(pool, PAGE, 0, word,
+                                   (&var page) as UnsafePointer<UInt>)
+    (status, page)
+}
+
+/// Pin `page` and unpin it again: the pin's raw status.
+func pin_once(page: UInt) unsafe -> UInt {
+    var rec: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    let status = sos_memory_pin(page, (&var rec) as UnsafePointer<UInt>,
+                                (RECORD_WORDS as UInt) * word_bytes())
+    if status == STATUS_OK {
+        let _ = sos_memory_unpin(page)
+    }
+    status
+}
+
+/// Whether `page`'s rights hold `Physical`.
+func holds_physical(page: UInt) unsafe -> Bool {
+    var rights: UInt = 0
+    let _ = sos_handle_info(page, HandleInfo.Rights as UInt,
+                            (&var rights) as UnsafePointer<UInt>)
+    (rights & (MemoryRight.Physical as UInt)) != 0
+}
+
+/// A page allocated from `from` with the contiguous flag, pinned and released.
+func pinned_from(pool: UInt, what: String, from: AllocateFrom) unsafe {
+    let (status, page) = allocate(pool, (from as UInt)
+                                        | (AllocateFlag.Contiguous as UInt))
+    if status != STATUS_OK {
+        print("SOS allocflags: {}, contiguous: {}\n", what, status_of(status))
+        return
+    }
+    print("SOS allocflags: {}, contiguous: ok, pinned: {}\n", what,
+          status_of(pin_once(page)))
+    let _ = sos_handle_release(page)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let pool = boot_pool(boot_handle)
+    if pool == NONE {
+        let _ = system.debug_print("SOS allocflags: no pool\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    pinned_from(pool, "from anywhere", AllocateFrom.Any)
+
+    let (status, front) = allocate(pool, (AllocateFrom.Front as UInt)
+                                         | (AllocateFlag.Contiguous as UInt))
+    if status == STATUS_OK {
+        let physical = if holds_physical(front) { "yes" } else { "no" }
+        print("SOS allocflags: from the front, contiguous: ok, carries Physical: {}\n",
+              physical)
+        let _ = sos_handle_release(front)
+    } else {
+        print("SOS allocflags: from the front, contiguous: {}\n",
+              status_of(status))
+    }
+
+    pinned_from(pool, "from the back", AllocateFrom.Back)
+
+    let _ = system.debug_print("SOS allocflags: bit 9, which no flag names\n")
+    let _ = allocate(pool, UNNAMED)
+    let _ = system.debug_print("SOS allocflags: UNREACHABLE the allocate returned\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

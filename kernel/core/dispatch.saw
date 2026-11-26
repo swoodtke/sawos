@@ -58,6 +58,8 @@ import sosabi.{
     MemoryOp,
     PoolOp,
     AllocateFrom,
+    ALLOCATE_FROM_BITS,
+    AllocateFlag,
     IoMemoryOp,
     MappingOp,
     PipeInletOp,
@@ -90,6 +92,8 @@ import sosabi.{
     pipe_create_record_bytes,
     POOL_AVAILABLE_RECORD_WORDS,
     pool_available_record_bytes,
+    MEMORY_PIN_RECORD_WORDS,
+    memory_pin_record_bytes,
     PipeMsgRecord,
     PipeSendRecord,
     PipeReplyWaitRecord,
@@ -1228,6 +1232,11 @@ func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
         fault_process(p, FaultReason.BadState)
     }
     if MEMORIES[slot].maps != 0 {
+        fault_process(p, FaultReason.BadState)
+    }
+    // A pinned allocation's bytes are a device's to write, so they never back
+    // a slab.
+    if MEMORIES[slot].pinned {
         fault_process(p, FaultReason.BadState)
     }
     if MEMORIES[slot].pool == slot && MEMORIES[slot].out_bytes != 0 {
@@ -3485,8 +3494,10 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
         // Extend: grow this allocation in place by `arg0` bytes, the front of
         // its pool's unspent frontier. The answers, in spec §2.5's order: no
         // `Extend` right (`AccessDenied`); a `len` of zero or off the
-        // allocation's granularity (`BadArg`); the bytes after the allocation
-        // not the frontier's front, or the frontier shorter than `len`
+        // allocation's granularity (`BadArg`); a pinned allocation
+        // (`BadState`, which no handle reaches, below); the bytes after the
+        // allocation not the frontier's front, or the frontier shorter than
+        // `len`
         // (`NoMemory`), a status because the pool may be shared and another
         // holder's cut changes it between any read of it and this call.
         //
@@ -3503,6 +3514,14 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             let len = arg0
             if len == 0 || (len % MEMORIES[obj.slot].granularity) != 0 {
                 fault_process(p, FaultReason.BadArg)
+            }
+            // A pinned allocation's range is what a device was told, so it
+            // does not grow. No handle reaches this refusal: a `Front` cut,
+            // the one kind of allocation minted with `Extend`, is never minted
+            // with `Physical` and has no sibling, so nothing could have pinned
+            // it. The guard keeps the promise if that ever changes.
+            if MEMORIES[obj.slot].pinned {
+                fault_process(p, FaultReason.BadState)
             }
             // Only a `Front` cut is minted with `Extend`, and no derivation
             // adds it, so an allocation that carries it names a live pool: a
@@ -3525,8 +3544,83 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
             MEMORIES[obj.slot].len = MEMORIES[obj.slot].len + len
             op_ok()
         },
+        // Pin: take this allocation's one hardware reference and copy its
+        // physical range into the caller's record at `arg0` of capacity
+        // `arg1`. The answers, in spec §2.5's order: no `Physical` right
+        // (`AccessDenied`); a capacity below the record (`BadArg`); a
+        // destination the copy-out door refuses (its fault); an allocation
+        // already pinned (`BadState`, the caller's own to know, as an `Unmap`
+        // of an unmapped row is); an allocation not made contiguous, or in
+        // memory the board cannot give a process, such as flash an image is
+        // used from in place (`NoResource`, with nothing pinned or written):
+        // a device is given only an address it could be given a row over.
+        // The record is written before the pin is taken, and a copy that
+        // passed the door cannot fail, so no answer leaves a pin behind.
+        case Pin -> {
+            if not obj.allows(MemoryRight.Physical) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            let dst = arg0
+            let bytes = memory_pin_record_bytes() as UInt
+            if arg1 < bytes {
+                fault_process(p, FaultReason.BadArg)
+            }
+            if let why = copy_out_check(p, dst, bytes) {
+                fault_process(p, why)
+            }
+            if MEMORIES[obj.slot].pinned {
+                fault_process(p, FaultReason.BadState)
+            }
+            if not MEMORIES[obj.slot].contiguous {
+                return op_status(SosStatus.NoResource)
+            }
+            let base = MEMORIES[obj.slot].base
+            let len = MEMORIES[obj.slot].len
+            if (len == 0 || region_wraps(base, len)
+                || not hal.map_source_ok(base, base + len)) {
+                return op_status(SosStatus.NoResource)
+            }
+            var rec = MemoryPinRecord(base: base, len: len)
+            let src = (&var rec) as UnsafePointer<MemoryPinRecord>
+            if let why = copy_out(p, dst, src as UInt, bytes) {
+                // Unreachable for `PipeCreate`'s reason: the same destination
+                // passed `copy_out_check` above and nothing between can move a
+                // process's rows.
+                fault_process(p, why)
+            }
+            MEMORIES[obj.slot].pinned = true
+            MEMORIES[obj.slot].pinner = PROCESS_RECORDS[p].pid
+            op_ok()
+        },
+        // Unpin: drop the hardware reference, through any handle that carries
+        // `Physical`, whoever pinned. No right is `AccessDenied` and an
+        // allocation not pinned is `BadState`. Nothing frees here: the handle
+        // the op came through names the allocation, which goes home at the
+        // release of its last handle or row.
+        case Unpin -> {
+            if not obj.allows(MemoryRight.Physical) {
+                fault_process(p, FaultReason.AccessDenied)
+            }
+            if not MEMORIES[obj.slot].pinned {
+                fault_process(p, FaultReason.BadState)
+            }
+            MEMORIES[obj.slot].pinned = false
+            MEMORIES[obj.slot].pinner = 0
+            op_ok()
+        },
     }
 }
+
+/// What `MemoryOp.Pin` copies out: `sosabi`'s two published words, in their
+/// published order.
+struct MemoryPinRecord {
+    base: UInt,
+    len: UInt,
+}
+
+static_assert(sizeof<MemoryPinRecord>()
+              == MEMORY_PIN_RECORD_WORDS * sizeof<UInt>(),
+              "a pin record must be exactly the words sosabi publishes")
 
 /// What `PoolOp.Available` copies out: `sosabi`'s three published words, in
 /// their published order.
@@ -3586,14 +3680,16 @@ func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
     match op {
         // Allocate: a new `Memory` over `arg0` bytes of this pool, made of
         // units of the granularity `arg1` names, from where the
-        // `AllocateFrom` word `arg2` says. The answers come in §2.5's order,
-        // and every one of them is decided before anything is cut, so a
-        // refusal changes nothing:
+        // `AllocateFrom` in `arg2`'s low byte says, with the `AllocateFlag`
+        // bits above it. The answers come in §2.5's order, and every one of
+        // them is decided before anything is cut, so a refusal changes
+        // nothing:
         //
         //   - the faults the caller could have avoided: no `Allocate` right
         //     (`AccessDenied`), a granularity the pool does not accept, a
-        //     `from` word that names no `AllocateFrom`, a `len` of zero and a
-        //     `len` that is not a multiple of the granularity (`BadArg`);
+        //     `from` byte that names no `AllocateFrom` or a flag bit that
+        //     names no `AllocateFlag`, a `len` of zero and a `len` that is not
+        //     a multiple of the granularity (`BadArg`);
         //   - the caller's budget: its `Memory` quota (`QuotaExceeded`);
         //   - the resource it named: a pool with no range that long where
         //     `from` allows (`NoMemory`), a status because a pool may be
@@ -3612,17 +3708,24 @@ func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
         // the cut's own mask, then capped by the caller's `Memory` ceiling
         // (`mint_capped`): an allocation is never wider than the pool handle it
         // came through. A `Front` cut's mask is `front_allocation_rights()`,
-        // which holds `Extend` and neither `Transfer` nor `Mint`; every other
-        // cut's is `memory_rights()`, the bits a `Memory` has but `Extend`. It
-        // names this pool, which its range returns to, and it is charged to
-        // the caller whoever's pool it is.
+        // which holds `Extend` and none of `Transfer`, `Mint` and `Physical`;
+        // every other cut's is `memory_rights()`, the bits a `Memory` has but
+        // `Extend`. It names this pool, which its range returns to, records
+        // whether it was made contiguous, and is charged to the caller
+        // whoever's pool it is.
         case Allocate -> {
             if not obj.allows(PoolRight.Allocate) {
                 fault_process(p, FaultReason.AccessDenied)
             }
             let len = arg0
             let unit = pool_granularity(p, obj.slot, arg1)
-            guard let from = AllocateFrom.from(raw: arg2) else {
+            guard let from = AllocateFrom.from(raw: arg2 & ALLOCATE_FROM_BITS)
+            else {
+                fault_process(p, FaultReason.BadArg)
+            }
+            let flags = arg2 & ~ALLOCATE_FROM_BITS
+            let contiguous_bit = AllocateFlag.Contiguous as UInt
+            if (flags & ~contiguous_bit) != 0 {
                 fault_process(p, FaultReason.BadArg)
             }
             if len == 0 || (len % unit) != 0 {
@@ -3649,12 +3752,15 @@ func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
                 return op_status(mint_refusal(p))
             }
             let base = pool_cut(obj.slot, len, from)
+            let contiguous = (flags & contiguous_bit) != 0
             MEMORIES[slot] = MemorySlot(state: SlotState.Live, process: p,
                                         base: base, len: len, refs: 1, maps: 0,
                                         pool: obj.slot, granularity: unit,
                                         parent: NO_MEMORY, lent_base: 0,
                                         lent_len: 0, depth: 0, free_head: 0,
-                                        out_bytes: 0)
+                                        out_bytes: 0,
+                                        contiguous: contiguous,
+                                        pinned: false, pinner: 0)
             quota_charge(p, QuotaKind.Memory)
             op_value(handle)
         },

@@ -423,6 +423,24 @@ CHILD_GROW_LEG_PKG = os.path.join(TESTS_DIR, "child-grow-leg")
 RING_SHORT_PKG = os.path.join(TESTS_DIR, "ring-short")
 CHILD_RING_SERVER_PKG = os.path.join(TESTS_DIR, "child-ring-server")
 EXTEND_ISOLATION_PKG = os.path.join(TESTS_DIR, "extend-isolation")
+# Pins: an allocation's physical range for a device, the pin that keeps it out
+# of its pool, the contiguous flag a pin needs, and what each refuses.
+MEMORY_PIN_PKG = os.path.join(TESTS_DIR, "memory-pin")
+MEMORY_PIN_NOT_CONTIGUOUS_PKG = os.path.join(TESTS_DIR,
+                                             "memory-pin-not-contiguous")
+MEMORY_PIN_TWICE_PKG = os.path.join(TESTS_DIR, "memory-pin-twice")
+MEMORY_UNPIN_UNPINNED_PKG = os.path.join(TESTS_DIR, "memory-unpin-unpinned")
+MEMORY_PIN_DENIED_PKG = os.path.join(TESTS_DIR, "memory-pin-denied")
+MEMORY_UNPIN_DENIED_PKG = os.path.join(TESTS_DIR, "memory-unpin-denied")
+MEMORY_PIN_RECORD_PKG = os.path.join(TESTS_DIR, "memory-pin-record")
+MEMORY_PIN_COPY_DOOR_PKG = os.path.join(TESTS_DIR, "memory-pin-copy-door")
+MEMORY_PIN_DONATE_PKG = os.path.join(TESTS_DIR, "memory-pin-donate")
+MEMORY_PIN_UNMAP_GIVE_PKG = os.path.join(TESTS_DIR, "memory-pin-unmap-give")
+MEMORY_PIN_QUARANTINE_PKG = os.path.join(TESTS_DIR, "memory-pin-quarantine")
+MEMORY_UNPIN_RETURNS_PKG = os.path.join(TESTS_DIR, "memory-unpin-returns")
+CHILD_PIN_LEG_PKG = os.path.join(TESTS_DIR, "child-pin-leg")
+POOL_ALLOCATE_FLAGS_PKG = os.path.join(TESTS_DIR, "pool-allocate-flags")
+POOL_PHYSICAL_CAPPED_PKG = os.path.join(TESTS_DIR, "pool-physical-capped")
 # The heaps over pools (`sos.Heap`): a launcher per case, each calling
 # `heapkit` with its case, and the children `heapkit` drives by role.
 HEAP_GROW_PKG = os.path.join(TESTS_DIR, "heap-grow")
@@ -5576,8 +5594,9 @@ TEST_CASES = [
     {
         # `INFO_OP` reads a handle's rights and kind. The default sets of an
         # Event, a boot Memory and the Process handle are the bits their kinds
-        # mint (1795 is Transfer, Mint and the three Event bits, 1539
-        # Transfer, Mint and the two Memory bits, 16776963 the Process set); a
+        # mint (1795 is Transfer, Mint and the three Event bits, 5635
+        # Transfer, Mint, Map, MapExecute and Physical, 16776963 the Process
+        # set); a
         # sibling minted through a keep mask
         # reports exactly the narrowed set and not the keep bit the source
         # never held; the floor's kind selector answers the published kind
@@ -5593,7 +5612,7 @@ TEST_CASES = [
         "expect_out": ["{banner}",
                        "SOS: boot regions={two}",
                        "SOS handleinfo: event rights=1795",
-                       "SOS handleinfo: memory rights=1539",
+                       "SOS handleinfo: memory rights=5635",
                        "SOS handleinfo: process rights=16776963",
                        "SOS handleinfo: a narrowed sibling reports exactly "
                        "the narrowed set",
@@ -5672,9 +5691,9 @@ TEST_CASES = [
     },
     {
         # Ceilings cap the handles minted from a held object. Root narrows its
-        # Memory (no `MapExecute`), Mapping (no `Base`) and Process (no `Start`)
-        # ceilings; the pool it already held reads 69123 (`pool_rights()`,
-        # the Memory default set 1539, `PoolRight.Extend` and
+        # Memory (no `MapExecute` or `Physical`), Mapping (no `Base`) and
+        # Process (no `Start`) ceilings; the pool it already held reads 73219
+        # (`pool_rights()`, the Memory default set 5635, `PoolRight.Extend` and
         # `PoolRight.Allocate`), what it allocates reads 515, the Mapping
         # that installs that 258 (the
         # Mapping default set is 770), and the process it creates 16760579,
@@ -5686,7 +5705,7 @@ TEST_CASES = [
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={three}",
-                       "SOS ceilderived: pool rights=69123",
+                       "SOS ceilderived: pool rights=73219",
                        "SOS ceilderived: allocation rights=515",
                        "SOS ceilderived: mapping rights=258",
                        "SOS ceilderived: created process rights=16760579",
@@ -5811,8 +5830,8 @@ TEST_CASES = [
         # its whole length twice and the grain's one bit as its set; the set's
         # lowest bit as the granularity answers what zero does. Four pages
         # allocated take four pages off both numbers, and an allocation's
-        # rights are the pool's word (69123) less `Extend` and `Allocate`
-        # (1539) under root's unrestricted ceiling. More than the pool holds
+        # rights are the pool's word (73219) less `Extend` and `Allocate`
+        # (5635) under root's unrestricted ceiling. More than the pool holds
         # is `NoMemory` and changes nothing the next report sees. With the
         # frontier spent and the first and third page home, two pages are free
         # in two ranges: one unit past `largest` and the two pages in one piece
@@ -5831,7 +5850,7 @@ TEST_CASES = [
                        "same=1",
                        "SOS poolops: four allocations: total fell by 16384 "
                        "largest fell by 16384",
-                       "SOS poolops: rights pool=69123 allocation=1539",
+                       "SOS poolops: rights pool=73219 allocation=5635",
                        "SOS poolops: more than the pool holds: this pool has "
                        "no free range that long unchanged=1",
                        "SOS poolops: fragmented total=8192 largest=4096",
@@ -5937,7 +5956,7 @@ TEST_CASES = [
         # refused for a different reason (`BadState`: a running process takes
         # no give). Then the roles that run to their end: `INFO_OP` names a
         # pool 15 and an allocation 8; a child's narrowed `Memory` ceiling caps
-        # what it allocates (515) under a pool word of 69123; a child takes
+        # what it allocates (515) under a pool word of 73219; a child takes
         # all the pool holds and is refused one unit more; a child at its
         # `Memory` quota is answered `QuotaExceeded` before the pool is asked;
         # and a child at its handle budget with the Memory slab full (root
@@ -5989,7 +6008,7 @@ TEST_CASES = [
                        "status=131077",
                        "SOS poolleg: kinds pool=15 given=8 own=8",
                        "SOS poolfaults: kinds: status=65543",
-                       "SOS poolleg: capped rights pool=69123 allocation=515",
+                       "SOS poolleg: capped rights pool=73219 allocation=515",
                        "SOS poolfaults: a capped allocation: status=65543",
                        "SOS poolleg: all it holds: ok; one unit more: this "
                        "pool has no free range that long",
@@ -6265,7 +6284,7 @@ TEST_CASES = [
         # `Transfer` or `Mint`: 3584 through the whole pool, 2560 through a
         # sibling without `MapExecute`, 512 through one without `Extend` or
         # `MapExecute`. A cut from anywhere or from the back never carries
-        # `Extend`: 1539 through the whole pool, 515 through the narrowest
+        # `Extend`: 5635 through the whole pool, 515 through the narrowest
         # sibling.
         "name": "pool_cut_rights",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
@@ -6273,8 +6292,8 @@ TEST_CASES = [
         "pool": True,
         "expect_out": ["{banner}",
                        "SOS: boot regions={one}",
-                       "SOS cutrights: whole pool: front=3584 any=1539 "
-                       "back=1539",
+                       "SOS cutrights: whole pool: front=3584 any=5635 "
+                       "back=5635",
                        "SOS cutrights: no MapExecute: front=2560",
                        "SOS cutrights: no Extend: front=512 any=515 back=515",
                        "SOS cutrights: done"],
@@ -6417,6 +6436,305 @@ TEST_CASES = [
                        "SOS maplen: grown by a page, len: 12288",
                        "SOS maplen: done"],
         "expect_clean_exit": True,
+    },
+    {
+        # A pin answers an allocation's physical range (spec §2.5). The first
+        # contiguous allocation from a fresh pool pins at the pool's first
+        # frame (`tests/poolframes_<arch>.c`) with the length asked, and the
+        # next at the page after it. Where a row is at its memory's own
+        # address the row's base is the pinned base and a second row is
+        # refused; where the kernel places rows two rows land at two
+        # addresses and the pin still answers one base. A pin dropped is
+        # taken again at the same base, and a boot allocation (the
+        # destination row of a child never created) pins too. The child's
+        # image row pins where it is RAM and is `NoResource` where it is flash
+        # used in place (the ESP32-S3's `flash_dbus`), memory `map` refuses
+        # too. Last, a page root pins and lets go of is quarantined and stays
+        # charged to root, its live creator.
+        "name": "memory_pin",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_PIN_PKG,
+        "children": [CHILD_BYE_PKG],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS memorypin: pinned: at the pool's frames=yes "
+                       "len=8192",
+                       "SOS memorypin: the next allocation: at the page "
+                       "after it=yes",
+                       lambda arch: (
+                           ["SOS memorypin: two rows at two addresses=yes, "
+                            "one base=yes"]
+                           if arch.get("map_places") else
+                           ["SOS memorypin: its row at its base=yes, a second "
+                            "row: no room for what was asked"]),
+                       "SOS memorypin: unpinned and pinned again: same "
+                       "base=yes",
+                       lambda arch: [
+                           "SOS memorypin: a boot allocation: pinned "
+                           f"len={_child_region_len(arch)}",
+                           "SOS memorypin: the child's image row: "
+                           + ("no room for what was asked"
+                              if arch.get("flash_dbus") else "ok")],
+                       "SOS memorypin: quarantined, still charged: yes",
+                       "SOS memorypin: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A pin answers only for an allocation made contiguous (spec §2.5):
+        # a page allocated without the flag answers `NoResource` with its
+        # record untouched, and the unpin that follows finds nothing pinned,
+        # the `BadState` fault.
+        "name": "memory_pin_not_contiguous",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_PIN_NOT_CONTIGUOUS_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS pinloose: a pin: no room for what was asked "
+                       "(record kept=yes)",
+                       "SOS pinloose: an unpin",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # One pin per allocation (spec §2.5): a second pin, through a sibling
+        # that carries `Physical`, is the `BadState` fault.
+        "name": "memory_pin_twice",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_PIN_TWICE_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS pintwice: pinned",
+                       "SOS pintwice: a second pin, through a sibling",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # An unpin needs a pin (spec §2.5): a contiguous page never pinned
+        # answers its unpin with the `BadState` fault.
+        "name": "memory_unpin_unpinned",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_UNPIN_UNPINNED_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS unpinbare: an unpin of a page never pinned",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A pin spends `MemoryRight.Physical` (spec §2.5): through a sibling
+        # minted without it, the `AccessDenied` fault. The page is pinned
+        # already, so the right is asked before the pin's state (`BadState`).
+        "name": "memory_pin_denied",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_PIN_DENIED_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS pindenied: a pin through a sibling without "
+                       "Physical",
+                       "SOS: process fault: access denied process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # An unpin spends `MemoryRight.Physical` too (spec §2.5): a sibling
+        # minted without it may not unpin, the `AccessDenied` fault. The page
+        # was never pinned, so the right is asked before the pin's state
+        # (`BadState`).
+        "name": "memory_unpin_denied",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_UNPIN_DENIED_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS unpindenied: never pinned",
+                       "SOS unpindenied: an unpin through a sibling without "
+                       "Physical",
+                       "SOS: process fault: access denied process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A pin's record must hold its two words (spec §2.5): a capacity of
+        # one word is the `BadArg` fault, asked before the allocation's state,
+        # so a pinned page's sibling meets it rather than `BadState`.
+        "name": "memory_pin_record",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_PIN_RECORD_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS pinrecord: pinned",
+                       "SOS pinrecord: a pin through a sibling, with a "
+                       "capacity of one word",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A pin's record is a destination under the buffer rule (spec §2.2,
+        # §2.5): a record a byte past a word is the copy-out door's
+        # `BadAlign`, asked before the allocation's state, so a pinned page's
+        # sibling meets it rather than `BadState`.
+        "name": "memory_pin_copy_door",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_PIN_COPY_DOOR_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS pindoor: pinned",
+                       "SOS pindoor: a pin through a sibling, into a record "
+                       "off the word",
+                       "SOS: process fault: buffer is not word-aligned "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # A pinned allocation never backs a slab (spec §2.5, §2.8): a page
+        # pinned and unpinned is donated, and a pinned one, its only handle
+        # and no row, is the `BadState` fault.
+        "name": "memory_pin_donate",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_PIN_DONATE_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS pindonate: pinned and unpinned, donated: "
+                       "accepted",
+                       "SOS pindonate: pinned, donated",
+                       "SOS: process fault: object in the wrong state "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # The pin is the allocation's (spec §2.5): root pins a page, maps and
+        # unmaps it, and gives its only handle to `child-pin-leg`, whose unpin
+        # is served because the page is still pinned; its pin again is served
+        # and a second pin is `BadState` (`Faulted` << 16 | 5). The page,
+        # quarantined at the child's death, stays charged to root, its live
+        # creator.
+        "name": "memory_pin_unmap_give",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_PIN_UNMAP_GIVE_PKG,
+        "children": [CHILD_PIN_LEG_PKG],
+        "pool_destinations": [0],
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS pingive: pinned, mapped and unmapped",
+                       "SOS pingive: given",
+                       "SOS pinleg: the given page's unpin: served",
+                       "SOS pinleg: its pin: served",
+                       "SOS pinleg: a second pin",
+                       "SOS: process fault: object in the wrong state "
+                       "process={one}",
+                       "SOS pingive: the child ended status=131077",
+                       "SOS pingive: root still charged for the page: yes",
+                       "SOS pingive: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A pinned allocation stays out of its pool once nothing names it
+        # (spec §2.5). Root's pool is two pages; `child-pin-leg` pins the
+        # first and exits without an unpin, and its teardown does not unpin,
+        # so root's next page is the second and one more is `NoMemory`.
+        # `memory_unpin_returns` is the control.
+        "name": "memory_pin_quarantine",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_PIN_QUARANTINE_PKG,
+        "children": [CHILD_PIN_LEG_PKG],
+        "pool_destinations": [0],
+        "pool": True,
+        "pool_bytes": 0x2000,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS pinleg: pinned a page, and exits with it pinned",
+                       "SOS pinquar: the child ended status=65543",
+                       "SOS pinquar: a page after its death: at offset 4096",
+                       "SOS pinquar: another page: this pool has no free "
+                       "range that long",
+                       "SOS pinquar: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The control for `memory_pin_quarantine` (spec §2.5): the child
+        # unpins its page before it exits, so the page comes home at its
+        # teardown, root's next page is the child's and one more is served.
+        "name": "memory_unpin_returns",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": MEMORY_UNPIN_RETURNS_PKG,
+        "children": [CHILD_PIN_LEG_PKG],
+        "pool_destinations": [0],
+        "pool": True,
+        "pool_bytes": 0x2000,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS pinleg: pinned and unpinned a page",
+                       "SOS pinback: the child ended status=65543",
+                       "SOS pinback: a page after its death: at offset 0",
+                       "SOS pinback: another page: ok",
+                       "SOS pinback: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # `Allocate`'s third word (spec §2.5): the contiguous flag beside each
+        # `AllocateFrom` is served and recorded (a page from anywhere or the
+        # back pins; one from the front is minted without `Physical`), and
+        # bit 9, which no `AllocateFlag` names, is the `BadArg` fault.
+        "name": "pool_allocate_flags",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_ALLOCATE_FLAGS_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS allocflags: from anywhere, contiguous: ok, "
+                       "pinned: ok",
+                       "SOS allocflags: from the front, contiguous: ok, "
+                       "carries Physical: no",
+                       "SOS allocflags: from the back, contiguous: ok, "
+                       "pinned: ok",
+                       "SOS allocflags: bit 9, which no flag names",
+                       "SOS: process fault: argument outside its domain "
+                       "process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
+    },
+    {
+        # `Physical` on an allocation is capped as every bit of one is (spec
+        # §2.5, §2.7): a pool sibling without it allocates pages without it,
+        # and so does the whole pool under a `Memory` ceiling without it,
+        # whose page's pin is the `AccessDenied` fault. That page is made
+        # without the contiguous flag, so the right is asked before its shape
+        # (`NoResource`).
+        "name": "pool_physical_capped",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": POOL_PHYSICAL_CAPPED_PKG,
+        "pool": True,
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={one}",
+                       "SOS physcap: through a pool sibling without "
+                       "Physical: carries Physical=no",
+                       "SOS physcap: through the whole pool: carries "
+                       "Physical=yes",
+                       "SOS physcap: under a Memory ceiling without "
+                       "Physical: carries Physical=no",
+                       "SOS physcap: its pin",
+                       "SOS: process fault: access denied process={zero}"],
+        "expect_clean_exit": False,
+        "expect_status": EXIT_PROCESS_FAULT,
     },
     {
         # A row grows over its allocation's bytes and no others (spec §2.5).
@@ -10643,6 +10961,33 @@ TEST_CASES = [
                               "priorities`",
         "expect_out": [],
         "expect_clean_exit": False,
+    },
+
+    # The opt-in `physical` off by default
+    # (`tests/images/stock_physical_default*`): a process with no
+    # `[ceilings]` gets `Memory` and `Pool` ceilings of
+    # every right but `Physical` (4294963199, all ones less bit 12), and its
+    # pool record, which names no rights, keeps every right of the boot pool
+    # but `Physical` (69123). A page it allocates there does not carry it
+    # either (1539).
+    {
+        "name": "stock_physical_default",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_physical_default.toml",
+                       "riscv32-flat": "stock_physical_default_flat.toml",
+                       "arm64": "stock_physical_default_arm64.toml"},
+        "expect_out": ["{banner}",
+                       "SOS physdefault: Memory ceiling=4294963199 holds "
+                       "Physical: no",
+                       "SOS physdefault: Pool ceiling=4294963199 holds "
+                       "Physical: no",
+                       "SOS physdefault: the pool record's rights=69123 hold "
+                       "Physical: no",
+                       "SOS physdefault: a page from it rights=1539 holds "
+                       "Physical: no",
+                       "root: physdefault ended status=65536"],
+        "expect_tail": "root: physdefault ended status=65536",
+        "expect_clean_exit": True,
     },
 
     # A process given a window with the one right its record names
@@ -20711,6 +21056,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     #   memory_extend_met  an extension refused at the back's allocation
     #                      and past the frontier
     #   memory_extend_two  an extension refused at the next front cut
+    #   memory_pin         a pin's physical range, a boot allocation's, and
+    #                      an image row in flash refused
     #   mapping_len        a row's length, apart from its allocation's
     #   mapping_grow_past  a growth refused past its allocation
     #   mapping_grow_gone  a growth refused once its target died
@@ -20749,7 +21096,7 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
                      "pool_meet", "pool_cut_rights", "pool_odd_len",
                      "pool_from_bad", "memory_extend",
                      "memory_extend_met", "memory_extend_two",
-                     "mapping_len", "mapping_grow_past", "mapping_grow_gone",
+                     "memory_pin", "mapping_len", "mapping_grow_past", "mapping_grow_gone",
                      "map_room_identity", "grow_faults", "ring_short",
                      "heap_grow",
                      "heap_named", "heap_fallback", "heap_dirty_pool",
@@ -21700,11 +22047,11 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None):
     # `memory_init`, runs with the PSRAM not brought up, and asserts no such
     # line. Left out: a case built from a hand-written image description,
     # which names its board; a case whose build is refused, which nothing
-    # of the board's PSRAM reaches; and the two whose package reads the
+    # of the board's PSRAM reaches; and the three whose package reads the
     # pool's place against the number it carries for the `esp32s3` board's
-    # pool (`tests/poolbase_xtensa.c`), since both boards share their
-    # images.
-    s3_only = ("pool_back", "pool_odd_len")
+    # pool (`tests/poolbase_xtensa.c`, `tests/poolframes_xtensa.c`), since
+    # both boards share their images.
+    s3_only = ("pool_back", "pool_odd_len", "memory_pin")
 
     def on_r8(case):
         out = case["expect_out"]

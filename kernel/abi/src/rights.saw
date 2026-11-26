@@ -627,12 +627,20 @@ static_assert((TimerRight.Wait as UInt32) >= (1 << 8),
 /// still carries the bit can map them executable. There is no aliasing
 /// bookkeeping, and a region-level immutable flag would be a second mechanism
 /// doing overlapping work.
+///
+/// `Physical` is the authority to pin an allocation and learn its physical
+/// range, and to unpin it (`MemoryOp.Pin`, `MemoryOp.Unpin`): what a driver
+/// spends to hand the bytes to a device. It is minted at boot like every bit,
+/// and a launcher that follows the launch convention leaves it out of a child's
+/// ceilings and records unless the child asks for it (spec §12). A `Front`
+/// allocation never carries it, so no allocation can both grow and be pinned.
 public enum MemoryRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
     case Map = 1 << 9,
     case MapExecute = 1 << 10,
     case Extend = 1 << 11,
+    case Physical = 1 << 12,
 }
 
 static_assert((MemoryRight.Transfer as UInt32) == (1 << 0),
@@ -645,6 +653,8 @@ static_assert((MemoryRight.MapExecute as UInt32) >= (1 << 8),
               "kind-specific right MapExecute must start at bit 8 or above")
 static_assert((MemoryRight.Extend as UInt32) >= (1 << 8),
               "kind-specific right Extend must start at bit 8 or above")
+static_assert((MemoryRight.Physical as UInt32) >= (1 << 8),
+              "kind-specific right Physical must start at bit 8 or above")
 
 /// A right on a Pool object (spec §2.5).
 ///
@@ -660,17 +670,19 @@ static_assert((MemoryRight.Extend as UInt32) >= (1 << 8),
 /// families from ever colliding.
 ///
 /// `Transfer` and `Mint` are the universal pair here as everywhere, and are
-/// handed down too. `Map`, `MapExecute` and `Extend` are spent on nothing at
-/// the pool: they are named here so a launcher can write a pool's keep mask in
-/// this enum, as in `pool.mint(rights: PoolRight.Allocate | PoolRight.Map)`,
-/// which gives a child memory it can allocate, map, read and write and never
-/// execute from. `Extend` reaches only a `Front` allocation.
+/// handed down too. `Map`, `MapExecute`, `Extend` and `Physical` are spent on
+/// nothing at the pool: they are named here so a launcher can write a pool's
+/// keep mask in this enum, as in
+/// `pool.mint(rights: PoolRight.Allocate | PoolRight.Map)`, which gives a
+/// child memory it can allocate, map, read and write and never execute from.
+/// `Extend` reaches only a `Front` allocation, and `Physical` every other.
 public enum PoolRight: UInt32 {
     case Transfer = 1 << 0,
     case Mint = 1 << 1,
     case Map = 1 << 9,
     case MapExecute = 1 << 10,
     case Extend = 1 << 11,
+    case Physical = 1 << 12,
     case Allocate = 1 << 16,
 }
 
@@ -685,6 +697,9 @@ static_assert((PoolRight.MapExecute as UInt32)
               "a pool carries MapExecute at MemoryRight's number")
 static_assert((PoolRight.Extend as UInt32) == (MemoryRight.Extend as UInt32),
               "a pool carries Extend at MemoryRight's number")
+static_assert((PoolRight.Physical as UInt32)
+              == (MemoryRight.Physical as UInt32),
+              "a pool carries Physical at MemoryRight's number")
 static_assert((PoolRight.Allocate as UInt32) >= (1 << 16),
               "a pool's own rights must start at bit 16")
 
@@ -702,6 +717,9 @@ static_assert((MemoryRight.MapExecute as UInt32)
               < (PoolRight.Allocate as UInt32),
               "a Memory right must lie below a pool's own rights")
 static_assert((MemoryRight.Extend as UInt32) < (PoolRight.Allocate as UInt32),
+              "a Memory right must lie below a pool's own rights")
+static_assert((MemoryRight.Physical as UInt32)
+              < (PoolRight.Allocate as UInt32),
               "a Memory right must lie below a pool's own rights")
 
 /// A right on an IoMemory object (spec §2.5).
@@ -1203,14 +1221,16 @@ public func process_observe_rights() -> UInt32 {
 /// cut from the front of the pool's frontier takes
 /// `front_allocation_rights()` in place of this set.
 ///
-/// The kind-specific bits are named for what they gate (`Map`, `MapExecute`)
-/// rather than a generic authority.
+/// The kind-specific bits are named for what they gate (`Map`, `MapExecute`,
+/// `Physical`) rather than a generic authority.
 ///
-/// `MapExecute` is in the set, and it has to be. §3's attenuation is monotonic:
-/// a bit not minted at boot could never appear later by any sequence of ops, so
-/// a default set that withheld it would make an executable mapping unreachable
-/// in the whole system rather than merely restricted. The narrowing is the
-/// holder's, done with `MINT_OP` and a keep mask that omits the bit.
+/// `MapExecute` and `Physical` are in the set, and they have to be. §3's
+/// attenuation is monotonic: a bit not minted at boot could never appear later
+/// by any sequence of ops, so a default set that withheld one would make an
+/// executable mapping, or a pin, unreachable in the whole system rather than
+/// merely restricted. The narrowing is the holder's, done with `MINT_OP` and a
+/// keep mask that omits the bit, and for `Physical` the launch convention's
+/// (spec §12).
 ///
 /// So the default is permissive and the policy is written where the capability
 /// is handed over, not here. Root holds everything, and what a child holds is
@@ -1218,7 +1238,8 @@ public func process_observe_rights() -> UInt32 {
 public func memory_rights() -> UInt32 {
     ((MemoryRight.Transfer as UInt32) | (MemoryRight.Mint as UInt32)
      | (MemoryRight.Map as UInt32)
-     | (MemoryRight.MapExecute as UInt32))
+     | (MemoryRight.MapExecute as UInt32)
+     | (MemoryRight.Physical as UInt32))
 }
 
 /// What the kernel mints for a boot pool (spec §2.5): `PoolRight.Allocate` and
@@ -1243,7 +1264,8 @@ public func pool_rights() -> UInt32 {
 /// It holds `Extend`, which no other allocation carries, and it holds neither
 /// `Transfer` nor `Mint`: an allocation that can grow over its pool's next
 /// bytes cannot be given, sent or minted out of the process that allocated it,
-/// so no other process can spend that pool's frontier through it.
+/// so no other process can spend that pool's frontier through it. It does not
+/// hold `Physical` either, so no allocation is both growable and pinned.
 public func front_allocation_rights() -> UInt32 {
     ((MemoryRight.Map as UInt32) | (MemoryRight.MapExecute as UInt32)
      | (MemoryRight.Extend as UInt32))

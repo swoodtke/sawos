@@ -818,26 +818,29 @@ public func sos_timer_disarm(handle: UInt) -> UInt {
 // Memory, IoMemory and Mapping (spec §2.5)
 // -----------------------------------------------------------------------------
 //
-// Six ops across four kinds. A pool allocates and reports what it could; an
-// allocation is installed; a device window is carved and installed; and a
-// Mapping is what an install produces. The derivation verbs differ because
-// the kinds do: an allocation consumes what it hands out and a carve does
-// not.
+// The ops of four kinds. A pool allocates and reports what it could; an
+// allocation is installed, grown, pinned and unpinned; a device window is
+// carved and installed; and a Mapping is what an install produces. The
+// derivation verbs differ because the kinds do: an allocation consumes what it
+// hands out and a carve does not.
 
 /// Allocate: a new Memory over `len` bytes of this pool, made of units of
 /// `granularity` (zero names the pool's finest accepted one), from where the
-/// `AllocateFrom` word `from` says. Requires `PoolRight.Allocate`.
+/// `AllocateFrom` in the low byte of `from` says, with the `AllocateFlag` bits
+/// above it. Requires `PoolRight.Allocate`.
 ///
 /// `from` is the op's third argument word. `AllocateFrom.Any` (0) is served
 /// first fit from the pool's free list, and only when no free range holds it,
 /// off the front of the pool's unspent frontier; `Front` off the frontier's
 /// front alone; `Back` off the top of the highest free range that holds it,
-/// and only when none does, off the frontier's top. A granularity the pool
-/// does not accept, a `from` that names no `AllocateFrom`, a `len` of zero and
-/// a `len` that is not a multiple of the granularity terminate the caller with
-/// `BadArg`. A caller at its Memory or handle quota gets
-/// `SosStatus.QuotaExceeded`; a pool with no range `from` allows that long is
-/// `SosStatus.NoMemory`; a full Memory slab or handle table is
+/// and only when none does, off the frontier's top. `AllocateFlag.Contiguous`
+/// (bit 8) makes the allocation one physical range by promise, which
+/// `sos_memory_pin` needs. A granularity the pool does not accept, a low byte
+/// that names no `AllocateFrom`, a bit above it that names no `AllocateFlag`,
+/// a `len` of zero and a `len` that is not a multiple of the granularity
+/// terminate the caller with `BadArg`. A caller at its Memory or handle quota
+/// gets `SosStatus.QuotaExceeded`; a pool with no range `from` allows that
+/// long is `SosStatus.NoMemory`; a full Memory slab or handle table is
 /// `SosStatus.NoResource`.
 @export("sos_pool_allocate")
 public func sos_pool_allocate(handle: UInt, len: UInt, granularity: UInt,
@@ -880,9 +883,9 @@ public func sos_pool_available(handle: UInt, granularity: UInt,
 /// range that meets a row the target already holds (spec §2.5), a full
 /// Mapping slab or a full handle table is `SosStatus.NoResource`.
 ///
-/// The caller supplies no addresses. No op on a Memory reads its bounds;
-/// `MappingOp.Base` and `MappingOp.Len` read where a mapping landed and how
-/// long it is.
+/// The caller supplies no addresses. No op on a Memory reads its bounds but
+/// `sos_memory_pin`; `MappingOp.Base` and `MappingOp.Len` read where a mapping
+/// landed and how long it is.
 ///
 /// `room` is address space the kernel keeps free above the row, where the
 /// target translates, for the row to grow into (`sos_mapping_grow`); zero
@@ -913,6 +916,35 @@ public func sos_memory_extend(handle: UInt, len: UInt) unsafe -> UInt {
     var ignored: UInt = 0
     sos_syscall3(handle, MemoryOp.Extend as UInt, len, 0, 0,
                  (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Pin: take this allocation's one hardware reference and copy its physical
+/// range into `buf`. Requires `MemoryRight.Physical`.
+///
+/// `cap` is the buffer's size in bytes and must be at least
+/// `memory_pin_record_bytes()`. The record's layout is public: word 0 the
+/// physical base, word 1 the length in bytes. A pinned allocation returns to
+/// no pool until it is unpinned, whoever holds it and whatever names it. An
+/// allocation not made contiguous (`AllocateFlag.Contiguous`, or at boot), or
+/// in memory the board cannot give a process (flash), is
+/// `SosStatus.NoResource`, with nothing pinned or written. A short `cap`, a
+/// buffer that is misaligned or outside the caller's writable memory, and an
+/// allocation already pinned terminate the caller.
+@export("sos_memory_pin")
+public func sos_memory_pin(handle: UInt, buf: UnsafePointer<UInt>,
+                           cap: UInt) unsafe -> UInt {
+    var ignored: UInt = 0
+    sos_syscall3(handle, MemoryOp.Pin as UInt, buf as UInt, cap, 0,
+                 (&var ignored) as UnsafePointer<UInt>)
+}
+
+/// Unpin: drop this allocation's hardware reference. Requires
+/// `MemoryRight.Physical`, through any handle that carries it, whoever
+/// pinned. An allocation that is not pinned terminates the caller. Unpinned,
+/// the allocation goes home at the release of its last handle or row.
+@export("sos_memory_unpin")
+public func sos_memory_unpin(handle: UInt) -> UInt {
+    sos_syscall1(handle, MemoryOp.Unpin as UInt, 0)
 }
 
 /// Carve: a sub-window of this device window, leaving the parent whole.

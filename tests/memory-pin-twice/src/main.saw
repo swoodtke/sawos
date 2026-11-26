@@ -1,0 +1,48 @@
+// One pin per allocation (spec §2.5).
+//
+//   SOS pintwice: pinned
+//   SOS pintwice: a second pin, through a sibling
+//   SOS: process fault: object in the wrong state process=0
+//
+// The pin is the allocation's, not a handle's, so a sibling minted with every
+// right, `Physical` included, still finds the allocation pinned, and its pin
+// is the `BadState` fault that ends the case.
+import sos.{System, Process, Pool, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pintwice: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS pintwice: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS pintwice: UNREACHABLE the second pin returned\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    let page = try pool.allocate(len: PAGE, contiguous: true)
+    let _ = try page.pin()
+    let _ = system.debug_print("SOS pintwice: pinned\n")
+    let sibling = try page.mint()
+    let _ = system.debug_print("SOS pintwice: a second pin, through a sibling\n")
+    let _ = try sibling.pin()
+    return
+}

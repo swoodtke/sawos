@@ -1,0 +1,157 @@
+// A pinned allocation never returns to its pool, even once nothing names it
+// (spec §2.5).
+//
+//   SOS pinleg: pinned a page, and exits with it pinned
+//   SOS pinquar: the child ended status=65543
+//   SOS pinquar: a page after its death: at offset 4096
+//   SOS pinquar: another page: <NoMemory>
+//   SOS pinquar: done
+//
+// Root's pool is two pages. Root learns where it begins by pinning its first
+// page and letting it go home. `child-pin-leg`, given a sibling of the pool
+// with `Physical`, takes that first page, pins it, and exits without an
+// unpin: its handle goes in its teardown, it has no row, and the teardown does
+// not unpin, so the page stays out of the pool, quarantined. Root's next page
+// is the second, not the child's, and a page more is `NoMemory`.
+// `memory_unpin_returns` is the same program with the child's unpin before its
+// exit.
+
+import sos.{System, Process, Memory, Pool, PoolRight, MapAccess, SosStatus,
+            SystemRight, ALL_RIGHTS}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.BadImage
+
+static TAG_BOOT: UInt = 31
+static TAG_ROLE: UInt = 32
+static TAG_POOL: UInt = 33
+static TAG_MEM: UInt = 34
+
+static KEY_DEATH: UInt = 6
+
+/// The roles `child-pin-leg` knows.
+static ROLE_STAY: UInt = 1
+static ROLE_RETURN: UInt = 2
+static ROLE_GIVEN: UInt = 3
+
+static CHILD_SYSTEM: UInt32 = (SystemRight.Transfer | SystemRight.ProcessSelf
+                               | SystemRight.Debug)
+
+/// The child's pool sibling: it allocates, maps and pins.
+static CHILD_POOL: UInt32 = (PoolRight.Allocate | PoolRight.Map
+                             | PoolRight.Physical)
+
+/// The child's destination: the whole of its region, which is this long on
+/// every profile this case runs on.
+static REGION_LEN: UInt = 0x4_0000
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pinquar: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS pinquar: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS pinquar: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+/// What an allocation answered, as a status: `Ok` when it was served.
+func answer(result: Result<Memory, SosStatus>) -> SosStatus {
+    match result {
+        case Ok(_) -> SosStatus.Ok,
+        case Err(why) -> why,
+    }
+}
+
+/// Create the child, give it its role and its System sibling, and answer it.
+func create(system: &System, proc: &Process, image: &Memory, dests: &Pool,
+            role: UInt) -> Result<Process, SosStatus> {
+    let dst = try dests.allocate(len: REGION_LEN)
+    let child = try system.process_create(image: &image, memory: &dst)
+    let _ = move dst
+    let ev = try proc.event_create()
+    try ev.signal(bits: role)
+    try child.give(event: move ev, tag: TAG_ROLE) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    let boot = try system.mint(rights: CHILD_SYSTEM)
+    try child.give(system: move boot, tag: TAG_BOOT) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return move child
+}
+
+/// Start the child and answer the §8 status word it ends with.
+func outlive(proc: &Process, child: &Process) -> Result<UInt, SosStatus> {
+    let waiter = try proc.waiter_create()
+    try waiter.add(process: &child, key: KEY_DEATH)
+    try child.start(boot_tag: TAG_BOOT)
+    let wake = try waiter.wait()
+    let (key, what) = (move wake).open()
+    match what {
+        case Process(status) -> {
+            if key != KEY_DEATH { return BUG }
+            return status
+        },
+        case _ -> { return BUG },
+    }
+}
+
+/// Launch the child with `role` and a sibling of `pool`, and answer the §8
+/// status word it ends with.
+func pool_leg(system: &System, proc: &Process, image: &Memory, dests: &Pool,
+              pool: &Pool, role: UInt) -> Result<UInt, SosStatus> {
+    let child = try create(&system, &proc, &image, &dests, role)
+    let sibling = try pool.mint()
+    try child.give(pool: move sibling, tag: TAG_POOL, keep: CHILD_POOL) catch {
+        let (why, back) = move error
+        let _ = move back
+        return why
+    }
+    return outlive(&proc, &child)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var dests_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let dests = dests_rec.take_pool() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    // Where the pool begins: its first page, pinned for its base and home
+    // again.
+    let probe = try pool.allocate(len: PAGE, contiguous: true)
+    let base = (try probe.pin()).base
+    try probe.unpin()
+    let _ = move probe
+
+    let status = try pool_leg(&system, &proc, &image, &dests, &pool, ROLE_STAY)
+    print("SOS pinquar: the child ended status={}\n", status)
+
+    let after = try pool.allocate(len: PAGE, contiguous: true)
+    let at = (try after.pin()).base
+    print("SOS pinquar: a page after its death: at offset {}\n", at - base)
+    print("SOS pinquar: another page: {}\n", answer(pool.allocate(len: PAGE)))
+    try after.unpin()
+    return
+}

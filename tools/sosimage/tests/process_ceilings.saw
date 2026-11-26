@@ -6,7 +6,8 @@
 import bootplan.{KEEP_ALL}
 import sosimage.declaration.{Declaration, RecordKind}
 import sosimage.failure.{BuildError}
-import sosimage.rights.{CEILING_KINDS, ceiling_kind_at, ceiling_kind, right_word, has_right}
+import sosimage.rights.{CEILING_KINDS, ceiling_kind_at, ceiling_kind, right_word, has_right,
+                        is_opt_in, opt_in_word}
 import sosimage.tool.{read_text}
 
 // The kebab form of a case's name: `MapExecute` is `map-execute`.
@@ -103,6 +104,12 @@ func text_of(lines: &Vector<String>) -> String {
     "{lines.join("\n")}\n"
 }
 
+// A `memory` record `dma`, with `rights` when it is not empty.
+func dma(rights: String) -> String {
+    let own = if rights.is_empty() { "" } else { "{rights}\n" }
+    "[[boot]]\nname = \"dma\"\nkind = \"memory\"\ntag = 4\n{own}"
+}
+
 // What a main program's runtime spends, with a window's: `process`, `thread`
 // and `iomemory`, each from `extra`.
 func ceilings(process: String, thread: String, iomemory: String) -> String {
@@ -180,6 +187,11 @@ func main() unsafe {
     assert(ceiling_kind("iomemory")!.case_name.equals("IoMemory"), "a kind's bootplan name")
     assert(right_word(&ceiling_kind("memory")!, "extend") == (1 as UInt32) << 11, "a right's word")
     assert(not has_right(&ceiling_kind("event")!, "map"), "a right of another kind")
+    // `physical` is the opt-in right, of `memory` and `pool` alone.
+    assert(is_opt_in("physical") && not is_opt_in("map"), "the opt-in right")
+    assert(opt_in_word(&ceiling_kind("memory")!) == (1 as UInt32) << 12, "memory's opt-in")
+    assert(opt_in_word(&ceiling_kind("pool")!) == (1 as UInt32) << 12, "pool's opt-in")
+    assert(opt_in_word(&ceiling_kind("iomemory")!) == 0, "a kind with none")
 
     // What a declaration reads as: each key's word, a kind it leaves out none.
     let own = ceilings(process_ok(), "\"control\"", "\"map\", \"carve\"")
@@ -209,6 +221,12 @@ func main() unsafe {
            "rights without ceilings")
     let system = d.record(RecordKind.System, "system")!
     assert(d.keep_word(&system) == KEEP_ALL, "a system record is read for its System rights")
+    // A `memory` record with no rights and no ceilings keeps every right but
+    // the opt-in `physical`.
+    let pooled = try! parse_main("{text_of(&head(""))}{dma("")}")
+    assert(pooled.keep_word(&(pooled.record(RecordKind.Memory, "dma")!))
+           == (KEEP_ALL & ~((1 as UInt32) << 12)),
+           "no ceilings, no rights: every right but physical")
     // A program with a heap and every right the heap spends reads.
     let heap = try! parse_main(with_ceilings("", heap_ceilings("", "")))
     assert(heap.ceiling_word("pool") == ((1 << 0) | (1 << 1) | (1 << 9) | (1 << 11) | (1 << 16)),
@@ -240,6 +258,15 @@ func main() unsafe {
            "p.toml: line 7, column 3: `rights` of the window `mac` names `carve`, which the `iomemory` ceiling in [ceilings] does not give: a record is given within its kind's ceiling")
     expect(with_ceilings("rights = [\"map\"]", "[ceilings]\nprocess = [{process_ok()}]\nthread = [\"control\"]\n"), true,
            "p.toml: line 7, column 3: `rights` of the window `mac` names `map`, which the `iomemory` ceiling in [ceilings] does not give: a record is given within its kind's ceiling")
+
+    // The opt-in right, which only an image can grant, in a ceiling and in a
+    // record's rights.
+    expect(with_ceilings("", "[ceilings]\nmemory = [\"map\", \"physical\"]\n"), false,
+           "p.toml: line 13, column 18: `physical` in [ceilings] `memory` is an opt-in right, which the image must grant, and this builder reads no grant from an image")
+    expect(with_ceilings("", "[ceilings]\npool = [\"physical\"]\n"), false,
+           "p.toml: line 13, column 9: `physical` in [ceilings] `pool` is an opt-in right, which the image must grant, and this builder reads no grant from an image")
+    expect("{text_of(&head(""))}{dma("rights = [\"allocate\", \"physical\"]")}", false,
+           "p.toml: line 16, column 23: `rights` of the memory `dma` names `physical`, an opt-in right, which the image must grant, and this builder reads no grant from an image")
 
     // What a program written with `main` spends, each withheld in turn: a
     // right missing from a kind it lists, and a kind it leaves out.

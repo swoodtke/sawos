@@ -1,0 +1,78 @@
+// `Physical` on an allocation comes from its pool handle and its allocator's
+// `Memory` ceiling, as every bit of an allocation does (spec §2.5, §2.7).
+//
+//   SOS physcap: through a pool sibling without Physical: carries Physical=no
+//   SOS physcap: through the whole pool: carries Physical=yes
+//   SOS physcap: under a Memory ceiling without Physical: carries Physical=no
+//   SOS physcap: its pin
+//   SOS: process fault: access denied process=0
+//
+// A pool sibling minted without `Physical` allocates contiguous pages that do
+// not carry it, while the whole pool's do. With its own `Memory` ceiling
+// narrowed to every right but `Physical`, root's allocation through the whole
+// pool does not carry it either, and its pin is the `AccessDenied` fault that
+// ends the case. That page is made without the contiguous flag, so the right
+// is asked before the page's shape, which would be the `NoResource` status.
+
+import sos.{System, Process, Pool, Memory, MemoryRight, PoolRight, SosStatus,
+            ALL_RIGHTS}
+
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+/// Every right but `Physical`, as a pool's keep mask and as a ceiling.
+static POOL_NO_PHYSICAL: UInt32 = ALL_RIGHTS ^ PoolRight.Physical
+static MEMORY_NO_PHYSICAL: UInt32 = ALL_RIGHTS ^ MemoryRight.Physical
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS physcap: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS physcap: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS physcap: UNREACHABLE the pin returned\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+/// Whether `page`'s rights hold `Physical`, as the line prints it.
+func physical(page: &Memory) -> Result<String, SosStatus> {
+    let rights = try page.rights()
+    if (rights & (MemoryRight.Physical as UInt32)) != 0 {
+        return "yes"
+    }
+    return "no"
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let narrow = try pool.mint(rights: POOL_NO_PHYSICAL)
+    let through_narrow = try narrow.allocate(len: PAGE, contiguous: true)
+    print("SOS physcap: through a pool sibling without Physical: carries Physical={}\n",
+          try physical(&through_narrow))
+    let through_whole = try pool.allocate(len: PAGE, contiguous: true)
+    print("SOS physcap: through the whole pool: carries Physical={}\n",
+          try physical(&through_whole))
+
+    try proc.restrict_rights(memory: MEMORY_NO_PHYSICAL)
+    let capped = try pool.allocate(len: PAGE)
+    print("SOS physcap: under a Memory ceiling without Physical: carries Physical={}\n",
+          try physical(&capped))
+    let _ = system.debug_print("SOS physcap: its pin\n")
+    let _ = try capped.pin()
+    return
+}

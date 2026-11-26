@@ -1,0 +1,102 @@
+// Test child: pins in the pool or the allocation its launcher gives it, by
+// the role the launcher signalled, for the pin cases (spec §2.5).
+//
+// The launcher gives it a System sibling as its boot tag, an Event carrying
+// the role, and a pool sibling or one allocation:
+//
+//   ROLE_STAY    a page from the pool, contiguous, pinned, and the process
+//                exits holding the pin;
+//   ROLE_RETURN  the same page, unpinned before the process exits;
+//   ROLE_GIVEN   the allocation it was given, pinned by its launcher: its
+//                unpin and a pin again are served, and a second pin is the
+//                `BadState` fault that ends the process.
+//
+// A role that runs to its end exits with `EXIT_DONE`.
+
+import sos.{System, Process, Memory, Pool, SosStatus}
+
+static TAG_ROLE: UInt = 32
+static TAG_POOL: UInt = 33
+static TAG_MEM: UInt = 34
+
+static ROLE_STAY: UInt = 1
+static ROLE_RETURN: UInt = 2
+static ROLE_GIVEN: UInt = 3
+
+/// How this process ends when its role has run.
+static EXIT_DONE: UInt = 7
+/// Something the role needs was refused, or the boot set lacked it.
+static EXIT_SETUP: UInt = 97
+
+/// A status no arm of this program can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+/// What the launcher gave, by tag.
+struct Given {
+    role: UInt,
+    pool: Pool?,
+    memory: Memory?,
+}
+
+extension Given: NoCopy {}
+
+func drain(proc: &Process) -> Result<Given, SosStatus> {
+    var given = Given(role: 0, pool: None, memory: None)
+    while {
+        var rec = try proc.boot_handle_next() catch { break }
+        if rec.tag == TAG_ROLE {
+            guard let event = rec.take_event() else { return BUG }
+            given.role = try event.receive()
+        } else if rec.tag == TAG_POOL {
+            given.pool = rec.take_pool()
+        } else if rec.tag == TAG_MEM {
+            given.memory = rec.take_memory()
+        }
+    }
+    return move given
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS pinleg: no process handle\n")
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS pinleg: refused: {}\n", error)
+        let _ = proc.exit(EXIT_SETUP)
+        return
+    }
+    let _ = proc.exit(EXIT_DONE)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var given = try drain(&proc)
+    if given.role == ROLE_GIVEN {
+        guard let page = given.memory.take() else { return BUG }
+        try page.unpin()
+        let _ = system.debug_print("SOS pinleg: the given page's unpin: served\n")
+        let _ = try page.pin()
+        let _ = system.debug_print("SOS pinleg: its pin: served\n")
+        let _ = system.debug_print("SOS pinleg: a second pin\n")
+        let _ = try page.pin()
+        return BUG
+    }
+    guard let pool = given.pool.take() else { return BUG }
+    let page = try pool.allocate(len: PAGE, contiguous: true)
+    let _ = try page.pin()
+    if given.role == ROLE_RETURN {
+        try page.unpin()
+        let _ = system.debug_print("SOS pinleg: pinned and unpinned a page\n")
+        return
+    }
+    if given.role != ROLE_STAY {
+        return BUG
+    }
+    let _ = system.debug_print("SOS pinleg: pinned a page, and exits with it pinned\n")
+    return
+}

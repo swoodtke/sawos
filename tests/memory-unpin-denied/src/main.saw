@@ -1,0 +1,50 @@
+// An unpin spends `MemoryRight.Physical` (spec §2.5).
+//
+//   SOS unpindenied: never pinned
+//   SOS unpindenied: an unpin through a sibling without Physical
+//   SOS: process fault: access denied process=0
+//
+// A sibling minted with every right but `Physical` may not unpin: its unpin
+// is the `AccessDenied` fault that ends the case. The page was never pinned,
+// so the right is asked before the pin's state, which would be `BadState`.
+import sos.{System, Process, Pool, MemoryRight, SosStatus, ALL_RIGHTS}
+
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+/// Every right but `Physical`.
+static NO_PHYSICAL: UInt32 = ALL_RIGHTS ^ MemoryRight.Physical
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS unpindenied: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS unpindenied: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS unpindenied: UNREACHABLE the unpin returned\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    let page = try pool.allocate(len: PAGE, contiguous: true)
+    let _ = system.debug_print("SOS unpindenied: never pinned\n")
+    let sibling = try page.mint(rights: NO_PHYSICAL)
+    let _ = system.debug_print("SOS unpindenied: an unpin through a sibling without Physical\n")
+    try sibling.unpin()
+    return
+}

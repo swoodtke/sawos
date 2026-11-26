@@ -1,0 +1,98 @@
+// A pin's record must hold its two words (spec §2.5).
+//
+//   SOS pinrecord: pinned
+//   SOS pinrecord: a pin through a sibling, with a capacity of one word
+//   SOS: process fault: argument outside its domain process=0
+//
+// A capacity below the record is the `BadArg` fault. The allocation is already
+// pinned, which would be `BadState`, and the capacity is the caller's own word
+// and is asked first, so `BadArg` is what ends the case.
+//
+// It works at the C altitude, where a record's capacity is the caller's to
+// write.
+
+import sos.{System, ALL_RIGHTS, AllocateFlag, sos_system_process_self,
+            sos_process_boot_handle_next, sos_pool_allocate, sos_handle_mint,
+            sos_memory_pin}
+
+static EXIT_FAILED: UInt = 1
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+static RECORD_WORDS: Int = 2
+static BOOT_WORDS: Int = 3
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+/// The pool word of the one boot record, or `NONE`.
+func boot_pool(boot_handle: UInt) unsafe -> UInt {
+    var proc: UInt = NONE
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let drained = sos_process_boot_handle_next(
+        proc, (&var rec) as UnsafePointer<UInt>,
+        (BOOT_WORDS as UInt) * word_bytes())
+    if drained != STATUS_OK {
+        return NONE
+    }
+    rec[2]
+}
+
+/// A contiguous page from `pool`, pinned, or `NONE`.
+func pinned_page(pool: UInt) unsafe -> UInt {
+    var page: UInt = NONE
+    if sos_pool_allocate(pool, PAGE, 0, AllocateFlag.Contiguous as UInt,
+                         (&var page) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    var rec: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    if sos_memory_pin(page, (&var rec) as UnsafePointer<UInt>,
+                      (RECORD_WORDS as UInt) * word_bytes()) != STATUS_OK {
+        return NONE
+    }
+    page
+}
+
+/// A sibling of `page` with every right, or `NONE`.
+func sibling_of(page: UInt) unsafe -> UInt {
+    var out: UInt = NONE
+    if sos_handle_mint(page, ALL_RIGHTS as UInt,
+                       (&var out) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    out
+}
+
+/// Pin through `sibling` into a record of two words whose capacity is given
+/// as one.
+func pin_short(sibling: UInt) unsafe -> UInt {
+    var rec: [UInt; RECORD_WORDS] = [0; RECORD_WORDS]
+    sos_memory_pin(sibling, (&var rec) as UnsafePointer<UInt>, word_bytes())
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let pool = boot_pool(boot_handle)
+    let page = if pool == NONE { NONE } else { pinned_page(pool) }
+    let sibling = if page == NONE { NONE } else { sibling_of(page) }
+    if sibling == NONE {
+        let _ = system.debug_print("SOS pinrecord: no pinned page\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS pinrecord: pinned\n")
+    let _ = system.debug_print(
+        "SOS pinrecord: a pin through a sibling, with a capacity of one word\n")
+    let _ = pin_short(sibling)
+    let _ = system.debug_print("SOS pinrecord: UNREACHABLE the pin returned\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}

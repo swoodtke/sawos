@@ -1,0 +1,43 @@
+// An unpin needs a pin (spec §2.5).
+//
+//   SOS unpinbare: an unpin of a page never pinned
+//   SOS: process fault: object in the wrong state process=0
+//
+// A contiguous page that was never pinned has no pin to drop, and its unpin is
+// the `BadState` fault that ends the case.
+import sos.{System, Process, Pool, SosStatus}
+
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS unpinbare: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&system, &proc) catch {
+        print("SOS unpinbare: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS unpinbare: UNREACHABLE the unpin returned\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
+
+func run(system: &System, proc: &Process) -> Result<Void, SosStatus> {
+    var pool_rec = try proc.boot_handle_next()
+    guard let pool = pool_rec.take_pool() else { return BUG }
+    let page = try pool.allocate(len: PAGE, contiguous: true)
+    let _ = system.debug_print("SOS unpinbare: an unpin of a page never pinned\n")
+    try page.unpin()
+    return
+}

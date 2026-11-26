@@ -1,0 +1,142 @@
+// A pin answers an allocation's physical range (spec §2.5).
+//
+//   SOS memorypin: pinned: at the pool's frames=yes len=8192
+//   SOS memorypin: the next allocation: at the page after it=yes
+//   SOS memorypin: its row at its base=yes, a second row: <NoResource>
+//                                          (where a row is at its memory's own
+//                                          address)
+//   SOS memorypin: two rows at two addresses=yes, one base=yes
+//                                          (where the kernel places a row)
+//   SOS memorypin: unpinned and pinned again: same base=yes
+//   SOS memorypin: a boot allocation: pinned len=<its region's>
+//   SOS memorypin: the child's image row: ok   (<NoResource> where it is
+//                                               flash used in place)
+//   SOS memorypin: quarantined, still charged: yes
+//   SOS memorypin: done
+//
+// The first allocation from a fresh pool is cut at the pool's front, so its
+// pin answers the pool's first frame (`sos_test_pool_frames`, the board's
+// number) and the length asked; the next one is the page after it. A pin is
+// the allocation's, not a row's: where a mapping takes its memory's own
+// address the row's base is the pinned base and a second row over it is
+// refused, and where the kernel places rows two rows of the allocation land
+// at two addresses while its pin answers one base. A pin dropped can be taken
+// again, and answers what it did. A boot allocation, the destination row of a
+// child this case never creates, is contiguous by construction and pins too.
+// So does the child's image row where it is RAM; where the image is used in
+// place from flash, the row is memory no process can be given and no device
+// should be handed, and its pin is `NoResource`. Last, a page root pins and
+// lets go of is quarantined, and stays charged to root, its live creator.
+
+import sos.{System, Process, Memory, Pool, MapAccess, SosStatus, QuotaKind}
+
+extern "C" {
+    func sos_test_pool_frames() -> UInt
+}
+
+static EXIT_OK: UInt = 0
+static EXIT_FAILED: UInt = 1
+
+/// A status no arm of this case can produce honestly.
+static BUG: SosStatus = SosStatus.Unknown
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+func yes_no(b: Bool) -> String {
+    if b { "yes" } else { "no" }
+}
+
+/// The pool's first frame, from the board's number.
+func frames() -> UInt {
+    sos_test_pool_frames()
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+
+    let proc = try system.process_self() catch {
+        let _ = system.debug_print("SOS memorypin: no process handle\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    try run(&proc) catch {
+        print("SOS memorypin: refused: {}\n", error)
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let _ = system.debug_print("SOS memorypin: done\n")
+    let _ = system.shutdown(EXIT_OK)
+}
+
+func run(proc: &Process) -> Result<Void, SosStatus> {
+    var image_rec = try proc.boot_handle_next()
+    var dest_rec = try proc.boot_handle_next()
+    var pool_rec = try proc.boot_handle_next()
+    guard let image = image_rec.take_memory() else { return BUG }
+    guard let dest = dest_rec.take_memory() else { return BUG }
+    guard let pool = pool_rec.take_pool() else { return BUG }
+
+    let first = try pool.allocate(len: 2 * PAGE, contiguous: true)
+    let at = try first.pin()
+    print("SOS memorypin: pinned: at the pool's frames={} len={}\n",
+          yes_no(at.base == frames()), at.len)
+
+    let next = try pool.allocate(len: PAGE, contiguous: true)
+    let next_at = try next.pin()
+    print("SOS memorypin: the next allocation: at the page after it={}\n",
+          yes_no(next_at.base == at.base + 2 * PAGE))
+    try next.unpin()
+
+    let row = try proc.map(memory: &first, access: RW)
+    let row_at = try row.base()
+    match proc.map(memory: &first, access: RW) {
+        case Ok(second) -> {
+            let second_at = try second.base()
+            try first.unpin()
+            let again = try first.pin()
+            print("SOS memorypin: two rows at two addresses={}, one base={}\n",
+                  yes_no(second_at != row_at), yes_no(again.base == at.base))
+            try second.unmap()
+        },
+        case Err(why) -> {
+            print("SOS memorypin: its row at its base={}, a second row: {}\n",
+                  yes_no(row_at == at.base), why)
+        },
+    }
+    try row.unmap()
+
+    try first.unpin()
+    let repinned = try first.pin()
+    print("SOS memorypin: unpinned and pinned again: same base={}\n",
+          yes_no(repinned.base == at.base && repinned.len == at.len))
+    try first.unpin()
+
+    let boot_at = try dest.pin()
+    print("SOS memorypin: a boot allocation: pinned len={}\n", boot_at.len)
+    try dest.unpin()
+    print("SOS memorypin: the child's image row: {}\n", pin_and_drop(&image))
+
+    // A page pinned and let go of, quarantined, stays charged to root.
+    let held = (try proc.quota_get(kind: QuotaKind.Memory)).used
+    let lost = try pool.allocate(len: PAGE, contiguous: true)
+    let _ = try lost.pin()
+    let _ = move lost
+    let now = (try proc.quota_get(kind: QuotaKind.Memory)).used
+    print("SOS memorypin: quarantined, still charged: {}\n",
+          yes_no(now == held + 1))
+    return
+}
+
+/// What a pin of `region` answered, the pin dropped again when it was taken.
+func pin_and_drop(region: &Memory) -> SosStatus {
+    match region.pin() {
+        case Ok(_) -> {
+            try region.unpin() catch { return error }
+            SosStatus.Ok
+        },
+        case Err(why) -> why,
+    }
+}

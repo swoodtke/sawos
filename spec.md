@@ -35,8 +35,8 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 |---|---|
 | `AddressSpace` | Isolation domain, defined abstractly. P4: PMP region set + APM/REE security context (see §5.5 — the P4's MMU is real but global and external-memory-only, not per-process). Paging targets: page-table root. There is no AddressSpace object: the domain is the process (see below). |
 | `Thread` | Kernel-scheduled execution context bound to an AddressSpace. Saw's cooperative TaskGroups run *inside* a thread, in userspace — the kernel never sees tasks. Ops `Start`/`Join`/`Exit`/`Yield`; `Exit` releases the handle it is invoked through; rights `ThreadRight.Start`/`.Join`/`.Control`. The saved trap frame is the context, so a switch is the trap handler returning a different frame (§7). Lifecycle: §8. |
-| `Pool` | RAM not yet allocated: what a `MemoryObject` is allocated from. Two ops (`Allocate`, and `Available`, which reads how much it can allocate); rights `PoolRight.Allocate` and the bits it hands down to what it allocates, `.Map`/`.MapExecute`/`.Extend`. It has two ends: an allocation is cut from its front or its back. Minted at boot from the region table. A pool is never mapped and holds no row. Splitting a pool into a smaller one and a revoke are reserved, not built. §2.5. |
-| `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. Two ops (`Map`, and `Extend`, which grows it in place); rights `MemoryRight.Map`/`.MapExecute`/`.Extend`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5. |
+| `Pool` | RAM not yet allocated: what a `MemoryObject` is allocated from. Two ops (`Allocate`, and `Available`, which reads how much it can allocate); rights `PoolRight.Allocate` and the bits it hands down to what it allocates, `.Map`/`.MapExecute`/`.Extend`/`.Physical`. It has two ends: an allocation is cut from its front or its back. Minted at boot from the region table. A pool is never mapped and holds no row. Splitting a pool into a smaller one and a revoke are reserved, not built. §2.5. |
+| `MemoryObject` | An allocation: a range of RAM that can be mapped into AddressSpaces, used as a process's image or destination, given and donated; the kind is `Memory`. Four ops (`Map`; `Extend`, which grows it in place; `Pin`, which answers its physical range for a device and keeps it out of its pool until `Unpin`); rights `MemoryRight.Map`/`.MapExecute`/`.Extend`/`.Physical`. Allocated from a `Pool`, or minted at boot from the region table. Never cut. §2.5. |
 | `IoMemoryObject` | Physical memory-mapped device registers; the kind is `IoMemory`. A distinct kind rather than a flag on `MemoryObject`, so a driver cannot obtain a cacheable view of a register block by construction. Ops `Carve`/`Map`; rights `IoMemoryRight.Carve`/`.Map`. §2.5. |
 | `Mapping` | One installed protection row, with its own handle. Ops `Unmap`/`Base`/`Len`/`Grow`; rights `MappingRight.Unmap`/`.Base`/`.Grow`. Not givable. §2.5. |
 | `Pipe` | Synchronous message IPC with request/reply built in. Four kinds: `PipeInlet` and `PipeOutlet` (the client and server ends of a connection) and `PipeReply` and `PipeRequest` (the client's claim on one reply and the server's obligation to send it). §2.1. |
@@ -1006,8 +1006,9 @@ kinds wherever they appear.
 - **Refcount invariant:** a Mapping holds a reference to the physical pages
   (not merely to a MemoryObject handle). The pages are freed only when the
   last reference of either kind — any MemoryObject handle or any Mapping —
-  drops. This is what makes multi-mapping safe: no mapping can outlive its
-  backing.
+  drops, and the allocation is not pinned (`Pin`, below). This is what makes
+  multi-mapping safe: no mapping can outlive its backing, and no device can
+  be left holding the address of bytes handed to somebody else.
 
 **The pool attribute is a kind.** RAM is a `Pool` or a `Memory` and device
 memory is an `IoMemory`, decided by a kind column in the build-emitted region
@@ -1017,9 +1018,17 @@ and there is no other op on the kind, so "a Device MemoryObject can only
 produce Device mappings" holds by construction. The attribute travels with the
 handle because the attribute is the handle's kind.
 
-**A region is a capability, not a description.** There is no op on a
-pool or an allocation that reads its bounds: a process that holds one hands it
-to the kernel, and what it gets back is another capability. The numbers a
+**A region is a capability, not a description.** One op on an allocation
+reads its bounds, `MemoryOp.Pin`, for a driver that hands the bytes to a
+device: it needs a right that root holds from boot and that any other process
+holds only when its launcher grants it, it answers only for an allocation made
+contiguous in memory the board can give a process, and it pins the
+allocation, so the address it answers names that allocation for as long as
+the pin holds, whoever else holds it. On a profile that translates it is the
+only way to learn an allocation's address; where a row's address is its
+memory's own, a mapping's `Base` answers it too (below). No op on a pool reads
+its bounds: a process that holds one hands it to the kernel, and what it gets
+back is another capability. The numbers a
 holder learns are about its own rows, once it has mapped: a `Mapping` answers
 where its row is and how long it is (`Base`, `Len`, below), which a program
 needs to use the memory and a receiver needs to check memory it was given
@@ -1038,8 +1047,8 @@ handle's kind says so (`INFO_OP`'s `Kind`, §3; a typed wrapper is one or the
 other).
 
 **`Pool`: two ops, `Allocate` and `Available`; rights `PoolRight.Allocate` and
-three bits it hands down, `.Map`, `.MapExecute` and `.Extend`**, beside the
-universal `Transfer` and `Mint`. A pool cannot be mapped, passed to
+four bits it hands down, `.Map`, `.MapExecute`, `.Extend` and `.Physical`**,
+beside the universal `Transfer` and `Mint`. A pool cannot be mapped, passed to
 `process_create` as an image or a destination, or attached to a Waiter, and no
 grant row is ever counted on one. Root receives the build's pools at boot
 (§12), and a pool, or a narrowed sibling of one, can be given to another process
@@ -1048,7 +1057,8 @@ no more than the pool holds, and what it releases it can allocate again.
 
 - **`allocate(len, granularity, from) -> Memory`.** `PoolOp.Allocate` (op 0)
   takes the length in its first argument, the granularity in its second and
-  `from` in its third, and answers a new `Memory` handle in the caller's table.
+  `from` with its flags in its third, and answers a new `Memory` handle in the
+  caller's table.
   The granularity is the unit the allocation is made of: its base and its
   length are multiples of it, it is recorded on the allocation for its life (a
   field of the Memory slot), and anything that later divides the allocation is
@@ -1058,26 +1068,33 @@ no more than the pool holds, and what it releases it can allocate again.
   a page on Profile B, four bytes on Profile A, §5.6). Zero spells the pool's
   finest accepted granularity, the set's lowest bit, which is the grain, so zero
   and the grain's own value are the only legal words. The typed
-  `Pool.allocate(len:granularity:from:)` takes it as a defaulted parameter,
-  zero, as `mint` takes its keep mask, and `from` as a defaulted trailing one,
-  `AllocateFrom.Any`.
+  `Pool.allocate(len:granularity:from:contiguous:)` takes it as a defaulted
+  parameter, zero, as `mint` takes its keep mask, `from` as a defaulted one,
+  `AllocateFrom.Any`, and `contiguous` as a defaulted trailing one, `false`.
 
-  `allocate(len, granularity, from)`: `from` says where the bytes come from.
-  `Any` (0) is the rule below. `Front` (1) takes the front of the pool's
-  unspent frontier and nothing else. `Back` (2) takes the top of the highest
-  free range that holds `len`, and only when none does the top of the
-  frontier. Any other word is the `BadArg` fault. A `Front` allocation is
-  minted with its pool handle's `Map`, `MapExecute` and `Extend` bits and
-  never `Transfer` or `Mint`, so it stays in the process that allocated it;
-  every other allocation is minted with the bits a `Memory` has, never
-  `Extend`.
+  `allocate(len, granularity, from)`: the third word is `from | flags`. Its
+  low byte, `from`, says where the bytes come from. `Any` (0) is the rule
+  below. `Front` (1) takes the front of the pool's unspent frontier and
+  nothing else. `Back` (2) takes the top of the highest free range that holds
+  `len`, and only when none does the top of the frontier. Any other low byte is
+  the `BadArg` fault. The bits above it are `AllocateFlag`s, and a bit no flag
+  names is the `BadArg` fault. `AllocateFlag.Contiguous` (bit 8) promises that
+  the allocation is one physical range, now and in any future kernel, and that
+  its `extend` grows it in place or answers `NoMemory`. Every allocation is
+  one range today, so the flag changes no placement; it is recorded on the
+  allocation, and `Pin` (below) answers only for an allocation that has it. A
+  `Front` allocation is minted with its pool handle's `Map`, `MapExecute` and
+  `Extend` bits and never `Transfer`, `Mint` or `Physical`, so it stays in the
+  process that allocated it and is never pinned; every other allocation is
+  minted with the bits a `Memory` has, never `Extend`.
 
   Its answers, in the order they are decided, after §5.7's dispatch order has
   answered a word that names nothing:
   - a handle without `PoolRight.Allocate` is the `AccessDenied` fault;
   - a granularity that is neither zero nor in the pool's accepted set, a
-    `from` that names none of the three, a `len` of zero, and a `len` that is
-    not a multiple of the granularity asked are each the `BadArg` fault:
+    `from` that names none of the three, a flag bit that names no
+    `AllocateFlag`, a `len` of zero, and a `len` that is not a multiple of the
+    granularity asked are each the `BadArg` fault:
     `available` with a granularity of zero is legal through any handle that
     may allocate and answers the set, so the caller could have read which
     granularities it may name and the unit its `len` must be a multiple of;
@@ -1191,14 +1208,16 @@ no more than the pool holds, and what it releases it can allocate again.
   to nobody: they are the pool's outstanding bytes until they come home.
 - **An allocation's rights come from the pool handle it was allocated
   through.** The bits a `Memory` has are `Transfer`, `Mint`, `Map`,
-  `MapExecute` and `Extend`. An allocation is minted with that handle's rights
-  word intersected with all of them but `Extend` (`memory_rights()`), or, for
-  a `Front` allocation, with `Map`, `MapExecute` and `Extend` alone
-  (`front_allocation_rights()`), then capped by the caller's `Memory` ceiling
-  (§2.7). So `Extend` reaches only a `Front` allocation, which can never be
-  given, sent or minted out of the process that allocated it. A pool handle
-  carries those five bits on behalf of what it allocates, at the bit numbers
-  `MemoryRight` gives them, and its own `Allocate` is not among them. So
+  `MapExecute`, `Extend` and `Physical`. An allocation is minted with that
+  handle's rights word intersected with all of them but `Extend`
+  (`memory_rights()`), or, for a `Front` allocation, with `Map`, `MapExecute`
+  and `Extend` alone (`front_allocation_rights()`), then capped by the
+  caller's `Memory` ceiling (§2.7). So `Extend` reaches only a `Front`
+  allocation, which can never be given, sent or minted out of the process that
+  allocated it, and `Physical` never does: no allocation can both grow and be
+  pinned. A pool handle carries those six bits on behalf of what it allocates,
+  at the bit numbers `MemoryRight` gives them, and its own `Allocate` is not
+  among them. So
   narrowing a pool handle narrows everything allocated through it: a launcher
   that gives a
   child a pool sibling minted without `MapExecute` has given it memory it can
@@ -1209,20 +1228,23 @@ no more than the pool holds, and what it releases it can allocate again.
 - **The rights, bit by bit.** `PoolRight.Transfer` (bit 0) and `.Mint` (bit 1)
   are the universal pair (§3), and they are handed down as well. Bits 8 to 15
   are `MemoryRight`'s bits, carried for allocations and spent on nothing here:
-  `.Map` (bit 9), `.MapExecute` (bit 10) and `.Extend` (bit 11). A pool's own
+  `.Map` (bit 9), `.MapExecute` (bit 10), `.Extend` (bit 11) and `.Physical`
+  (bit 12). A pool's own
   rights start at bit 16, so no bit of `MemoryRight`'s can ever be one of them:
   `.Allocate` (bit 16) gates `allocate` and `available`, and bits 17 and 18 are
   reserved for `Split` and `Revoke` (below). `pool_rights()`, the set a boot
   pool is minted with, is
-  `Transfer | Mint | Allocate | Map | MapExecute | Extend`: every defined bit,
-  because attenuation is monotonic and a bit not minted at boot could never
-  appear later. It names `Extend` on its own, since `memory_rights()` does not
-  hold it.
+  `Transfer | Mint | Allocate | Map | MapExecute | Extend | Physical`: every
+  defined bit, because attenuation is monotonic and a bit not minted at boot
+  could never appear later. It names `Extend` on its own, since
+  `memory_rights()` does not hold it.
 - **What holds a pool.** Its handles (and references in staged messages, §2)
   and its outstanding bytes, and nothing else. Its outstanding bytes are the
-  lengths of its live allocations plus the length of every allocation from it
-  donated to the kernel (§2.8), which never comes back, so a pool from which
-  anything was donated never frees. When its last handle has gone and the
+  lengths of its live allocations, a pinned one included whether or not
+  anything still names it (`Pin`, below), plus the length of every allocation
+  from it donated to the kernel (§2.8), which never comes back, so a pool from
+  which anything was donated, or holding a quarantined allocation, never
+  frees. When its last handle has gone and the
   last allocation from it has come home, its slot frees, its free
   list's nodes go back to their slab (`SlabKind.FreeRanges`), and its bytes go
   nowhere: a pool minted at boot has no pool above it. A pool whose handles
@@ -1235,8 +1257,9 @@ no more than the pool holds, and what it releases it can allocate again.
   (`HandleKind.Pool`, 15), it is read and narrowed as every kind's is, and a
   sub-pool's mint will be capped by it (below).
 
-**`Memory`: two ops, `Map` and `Extend`; rights `MemoryRight.Map`,
-`.MapExecute` and `.Extend`** beside the universal `Transfer` and `Mint`. A
+**`Memory`: four ops, `Map`, `Extend`, `Pin` and `Unpin`; rights
+`MemoryRight.Map`, `.MapExecute`, `.Extend` and `.Physical`** beside the
+universal `Transfer` and `Mint`. A
 `Memory` is an allocation: it is mapped, used as a process's image or
 destination (§8, §12), given, sent in a message, minted and donated, and it is
 never cut. It comes from a pool's `allocate`, or from a row of the region
@@ -1244,17 +1267,22 @@ table typed as an allocation (§12).
 
 - **It records its pool and goes back whole.** An allocation's range returns
   to the pool it was allocated from, all of it at once, when no handle and no
-  grant row names it (the refcount invariant, below); nothing returns part of
-  one. An allocation minted at boot came from no pool, and when it frees its
-  bytes go nowhere; its granularity is the profile's grain.
+  grant row names it and it is not pinned (the refcount invariant, below);
+  nothing returns part of one. An allocation minted at boot came from no pool,
+  and when it frees its bytes go nowhere; its granularity is the profile's
+  grain, and it is contiguous by construction, a row of the region table.
 - **The rights, bit by bit.** `MemoryRight.Transfer` (bit 0) and `.Mint`
   (bit 1) are the universal pair; `.Map` (bit 9) gates `map`, and
   `.MapExecute` (bit 10) gates an executable `map` (below). `.Extend` (bit 11)
   is the authority to grow the allocation in place over its pool's next bytes,
-  and only a `Front` allocation carries it (above). Bit 8 is not assigned.
-  `memory_rights()`, the set a boot allocation is minted with, is the first
-  four bits, without `Extend`: a boot allocation came from no pool. An
-  allocation from a pool carries what its pool handle handed down (above).
+  and only a `Front` allocation carries it (above). `.Physical` (bit 12) is
+  spent by `Pin` and `Unpin` and by nothing else. Bit 8 is not assigned.
+  `memory_rights()`, the set a boot allocation is minted with, is every bit
+  but `Extend`: a boot allocation came from no pool. It holds `Physical`
+  because attenuation is monotonic and a bit not minted at boot could never
+  appear later; leaving it out of a process that did not ask for it is the
+  launcher's, by the launch convention (§12). An allocation from a pool
+  carries what its pool handle handed down (above).
 - **`map(process, access, room)` installs a protection row and answers with a
   `Mapping`.** It spends `MemoryRight.Map` on the allocation and
   `ProcessRight.Map` on the target, because possession of bytes must not
@@ -1392,11 +1420,48 @@ table typed as an allocation (§12).
   bounds. Only a `Front` allocation carries the right, and a boot
   allocation never does. Its answers, in order: a handle without `Extend` is
   the `AccessDenied` fault; a `len` of zero or off the allocation's
-  granularity is `BadArg`; bytes after the allocation that are not the front
-  of the frontier (another `Front` allocation, or the back side, took them)
-  or a frontier shorter than `len` is `NoMemory`. Then the allocation's
-  length grows, the frontier's front moves up, and the pool's outstanding
-  bytes grow by `len`, so the whole grown range goes home together.
+  granularity is `BadArg`; a pinned allocation is the `BadState` fault, a
+  refusal no handle reaches, since an allocation that carries `Extend` never
+  carries `Physical` and has no sibling to pin it through; bytes after the
+  allocation that are not the front of the frontier (another `Front`
+  allocation, or the back side, took them) or a frontier shorter than `len`
+  is `NoMemory`. Then the allocation's length grows, the frontier's front
+  moves up, and the pool's outstanding bytes grow by `len`, so the whole grown
+  range goes home together. An allocation made contiguous grows in place or
+  answers `NoMemory`, now and in any future kernel.
+- **`pin()` answers the allocation's physical range and pins it.**
+  `MemoryOp.Pin` (op 2) spends `MemoryRight.Physical`. It takes the address
+  and capacity of a record in the caller's memory and writes two words there,
+  the allocation's physical `base` and its `len`, machine words, as
+  `available` answers through a record; `sosabi` publishes the record's size
+  (`MEMORY_PIN_RECORD_WORDS`). It is the only op that reads an allocation's
+  address, and it adds the allocation's one hardware reference: a pinned
+  allocation does not return to its pool, whatever names it, until it is
+  unpinned. A driver pins each allocation before any address in it reaches
+  its device, and unpins it only after a reset of the device it has seen
+  complete. Its answers, in order: a handle without `Physical` is the
+  `AccessDenied` fault; a capacity below the record is `BadArg`; a
+  destination the copy-out door refuses is its fault (`BadAlign`,
+  `BadBuffer`); an allocation already pinned is the `BadState` fault, since
+  there is one pin per allocation; an allocation not made contiguous (one
+  allocated without `AllocateFlag.Contiguous`; a boot allocation is contiguous
+  by construction), or in memory the board cannot give a process (a boot
+  allocation in flash an image is used from in place, which `map` refuses
+  too), is the `NoResource` status, with nothing pinned or written. Then the
+  record is written and the pin taken.
+- **`unpin()` drops the pin.** `MemoryOp.Unpin` (op 3) spends `Physical` too,
+  and takes no argument. The pin is the allocation's, not a handle's: any
+  handle carrying the right unpins it, whoever pinned. Its answers: a handle
+  without `Physical` is the `AccessDenied` fault, and an allocation not
+  pinned the `BadState` fault. Unpinned, an allocation goes home at the
+  release of its last handle or row, as any other does.
+- **Pinned, an allocation is still an allocation.** It may be mapped,
+  unmapped, given, sent and minted, and the pin goes with it. It may not be
+  extended (above) or donated (§2.8). Pin twice and unpin with no pin are
+  faults rather than statuses, as an `Unmap` of an unmapped row is: the
+  right is held only by a process whose launcher granted it, and a driver
+  gives its clients siblings without it, so the pin's state is the caller's
+  own to know.
 
 **`IoMemory`: ops `Carve` and `Map`, rights `IoMemoryRight.Carve` and `.Map`**
 beside the universal pair.
@@ -1529,6 +1594,14 @@ owns those bytes.
   `remove_grant` and `clear_domain` are the only two things that take one
   away. The row leaves the record and the hardware before its count drops, so
   a range is never handed out again while a domain still grants it.
+- A pin (`MemorySlot.pinned`) is a third hold: a pinned allocation goes back
+  at neither zero, and an unpinned one at the later of the two, as before. A
+  pinned allocation nothing names stays charged to its creator while its
+  creator lives, so the `Memory` quota bounds how many a process can strand. A
+  teardown does not unpin, so a pinned allocation whose last handle and last
+  row a dying process takes with it stays as it is, a live slot nothing names,
+  charged to nobody once its creator's death has disowned it, its range
+  outstanding in its pool: quarantined, never handed out again.
 - A pool has a count of its own besides `refs`: its outstanding bytes
   (`out_bytes`), what it has allocated and not had back, donations to the
   kernel included (above). It frees only when both are zero, so the pool
@@ -2297,8 +2370,9 @@ a whole.
   answers, in order: a kind that is not a `SlabKind` is the `BadArg` fault; a
   word naming nothing, or naming neither a pool nor an allocation, is
   `BadHandle`; memory with bytes the board cannot give a process, such as
-  flash, is `BadArg`; a sibling reference, an allocation's row and a pool's
-  outstanding allocation are each `BadState`. Then the machine's answers,
+  flash, is `BadArg`; a sibling reference, an allocation's row, a pinned
+  allocation (whose bytes a device may write) and a pool's outstanding
+  allocation are each `BadState`. Then the machine's answers,
   each `NoResource` with nothing consumed: memory too small to hold one slot
   of the kind (an empty one included), and a slab with no room for another
   extent or at its ceiling. The bytes never come back: a donated pool's
@@ -2657,7 +2731,7 @@ handle to make the op that would answer `Revoked`.
 |---|---|
 | Thread, Timer, Waiter, Mapping | **Bound** to the process that owns it: invalidated when that process dies, freed when the last handle goes. A Mapping's owner is the process whose domain holds its row (the target of its `map`), not the process holding its handle. A Thread that exited before its process died is not invalidated: `Exited` wins, and a late `Join` through any handle reads its exit code from the slot, even after the process is `Gone`, the slot being held while a handle names it. `Exit` releases the handle it is invoked through: only that handle goes, every other one still reads the slot, and a Thread that exits with no other handle naming it is freed at its exit. A Thread that has not exited when its process dies is invalid, so `Join` answers `Revoked` and the slot keeps nothing for it. A Thread frees once it has exited or been invalidated and nothing names it |
 | Interrupt | **One name, its handle.** No `Mint` in its default set, and attenuation is monotonic, so no handle can regain it (§3). Releasing the handle, explicitly or by its holder's teardown, destroys the Interrupt: it unbinds and masks the line. A give or a staged message moves the one name and is not a release. An attachment does not extend its life; it holds the invalid Interrupt until it is removed, and fires as an invalidated waitable does. A consuming attach of an Interrupt is refused as a caller error (`BadArg`, §2.2), so the driver keeps the one handle it acks with. Charged to no quota (§2.9) and bound to no process: nothing names its binder's record, so the teardown has nothing to disown |
-| Event, Pipe, Pool, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them; an allocation also until its last grant row goes, and a pool until its last allocation comes home (§2.5) |
+| Event, Pipe, Pool, Memory, IoMemory | **Shared:** live until the last handle goes, whatever happens to the process charged for them; an allocation also until its last grant row goes and while it is pinned, and a pool until its last allocation comes home (§2.5) |
 | Process | `Gone` is its invalid state (§8), and a `Gone` process is a record with no body. `GetStatus` and an attachment read the status word the record keeps, and `Stats` reads the final trap counters the teardown copied into it and the pid it keeps (§2.7). `Start` and `Give` naming a `Gone` child stay `BadState` faults, because a `Gone` child was always started and its launcher knows (§2.7), and so do `QuotaSet` (§2.7) and `BandMap` (§7). Every other op that acts on the process answers `Revoked`, a `map` naming it as the target included: the mapper did not cause the death. So does `PipeRequestOp.Sender` when the request's sender is `Gone` or its record reclaimed, minting nothing (§2.1). The process walk and the lookup by pid answer a `Gone` record for as long as something names it, and the handle they mint is one more name that holds it (§2.8); they answer no process before its start (§2.8). The teardown frees the body; the record is reclaimed when it is `Gone` and its count is zero (§2.7) |
 | Clock, System | Never destroyed |
 
@@ -5014,8 +5088,9 @@ reserved.
   `bootplan`: for each child, the tags of its image and destination rows, its
   quota rows, its band map (the packed word `BandMap` takes: the simple map,
   or the full map its declaration's `bands = "full"` asks for), the rights word
-  each of its ceilings is narrowed to when its declaration has `[ceilings]`,
-  the records to give it (each with its tag, its
+  each of its ceilings is narrowed to (every kind's when its declaration has
+  `[ceilings]`, and otherwise its `Memory` and `Pool` ceilings', every right
+  but the opt-in `Physical`), the records to give it (each with its tag, its
   source, for a carve the offset and length, and the keep word it is given
   with), the System rights its System record keeps, by name, the tag it is
   started with and its exit policy;
@@ -5223,8 +5298,9 @@ reserved.
   server's (the two stock maps both put `Normal` at 2, so the rule guards a
   map a launcher writes itself), and a child whose image header states a band map, which only
   root's is read from. It narrows each of the child's rights ceilings (§2.7,
-  `RestrictRights`) to its declaration's `[ceilings]`, when it has one, after
-  the quota rows and the band map and before any give, and gives each record
+  `RestrictRights`) to its declaration's `[ceilings]`, when it has one, and
+  otherwise its `Memory` and `Pool` ceilings to every right but the opt-in
+  `Physical`, after the quota rows and the band map and before any give, and gives each record
   with the record's rights, or its kind's ceiling (below). It gives windows,
   lines and endpoints as capabilities: a client gets an inlet minted with
   `Post | Transfer`, a server the outlet. It starts the child with its System
@@ -5259,7 +5335,11 @@ reserved.
   lists the rights of that kind's rights enum (§3) the process may hold, each
   by its case in kebab case. The table is complete when present: a kind it
   does not list gets no rights. A declaration with none leaves the child the
-  launcher's ceilings, as before. The launcher narrows the child's ceiling
+  launcher's ceilings but for the opt-in rights, `MemoryRight.Physical` and
+  `PoolRight.Physical` (`physical`), which a process holds only when its
+  declaration asks for them and its image grants them: the launcher narrows
+  its `Memory` and `Pool` ceilings to every right but those. The launcher
+  narrows the child's ceiling
   for every kind to the table's word, and gives each record with its keep
   mask, so what the launcher gives the process and every handle the process
   mints are within its declaration. A ceiling bounds what a process obtains
@@ -5270,10 +5350,12 @@ reserved.
   a line's `Interrupt`'s, a serve's `PipeOutlet`'s, a client's `PipeInlet`'s
   and a `memory` record's `Pool`'s), which are the keep mask of its give; a
   record with none is given with its kind's ceiling when the declaration has
-  `[ceilings]`, and with every right its source holds otherwise. With
-  `[ceilings]`, a record's rights lie within its kind's ceiling. The image
-  builder refuses, by name, an unknown kind or right, a right named twice, a
-  `system` key, a record's rights outside its ceiling, and a table that
+  `[ceilings]`, and with every right its source holds but the opt-in ones
+  otherwise. With `[ceilings]`, a record's rights lie within its kind's
+  ceiling. The image builder refuses, by name, an unknown kind or right, a
+  right named twice, a `system` key, a record's rights outside its ceiling,
+  an opt-in right in `[ceilings]` or in a record's rights, which the image
+  must grant and which no image description grants, and a table that
   withholds a right the process's runtime spends: for a program written with
   `main`, its Process handle's `BootHandles`, `ThreadSelf` and `Exit` and its
   main thread's `Control`; for a process with a heap (written with `main` or

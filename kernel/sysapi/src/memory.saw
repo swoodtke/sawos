@@ -5,14 +5,19 @@
 //! imports this file. See `Process.map` there for the shape that cycle forces.
 //! `extend` is here: it names nothing but the allocation.
 //!
-//! A region is authority over bytes, not a description of them: there is no way
-//! to read a Memory's base or length. `map` names a target and answers with a
-//! capability rather than a number.
+//! A region is authority over bytes, not a description of them: `map` names a
+//! target and answers with a capability rather than a number. The one way to
+//! read a Memory's base and length is `pin`, which spends a right a process
+//! holds only when its launcher grants it, and pins the allocation so that the
+//! address can never come to name somebody else's bytes.
 
-import sosabi.{SosStatus, MemoryHandle, MINT_OP, NO_HANDLE}
+import sosabi.{SosStatus, MemoryHandle, MINT_OP, NO_HANDLE,
+               MEMORY_PIN_RECORD_WORDS, MEMORY_PIN_BASE_WORD,
+               MEMORY_PIN_LEN_WORD, memory_pin_record_bytes}
 
 import sos.floor.{ALL_RIGHTS, call_value, checked, sos_handle_release,
-                  sos_memory_extend, handle_rights}
+                  sos_memory_extend, sos_memory_pin, sos_memory_unpin,
+                  handle_rights}
 
 /// A handle to a Memory: an allocation, a sealed range of physical memory.
 ///
@@ -24,9 +29,9 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, sos_handle_release,
 /// allocation from the front of its pool's frontier can grow in place
 /// (`extend`).
 ///
-/// There is no way to read the bounds. What a caller names is a target
-/// (`map`), and what it gets back is another capability, whose `len()` says
-/// how many bytes its row grants.
+/// What a caller names is a target (`map`), and what it gets back is another
+/// capability, whose `len()` says how many bytes its row grants. The bounds
+/// themselves are read only by `pin`.
 ///
 /// Dropping the last handle gives back the slot and the bytes: the release
 /// that takes a region's last reference to zero returns its kernel slab slot,
@@ -56,6 +61,14 @@ import sos.floor.{ALL_RIGHTS, call_value, checked, sos_handle_release,
 /// not a field it would have to partially move out of.
 public struct Memory {
     public(package) handle: MemoryHandle,
+}
+
+/// Where an allocation is: what `Memory.pin` answers. `base` is a physical
+/// address, the one a device is given, and `len` the allocation's length in
+/// bytes.
+public struct PhysicalRange {
+    base: UInt,
+    len: UInt,
 }
 
 extension Memory: NoCopy {
@@ -101,15 +114,47 @@ extension Memory {
         checked(sos_memory_extend(self.handle, len))
     }
 
+    /// Pin this allocation for a device, and answer where it is. Requires
+    /// `MemoryRight.Physical`.
+    ///
+    /// The pin is the allocation's one hardware reference: until `unpin`, the
+    /// allocation returns to no pool, even once every handle onto it and every
+    /// row that maps it is gone, so the address answered here never comes to
+    /// name somebody else's bytes. A holder that dies without unpinning leaves
+    /// the bytes out of its pool for good. A driver pins each allocation
+    /// before any address in it reaches its device, and unpins it only once
+    /// the device is known to have stopped.
+    ///
+    /// It answers only for an allocation made contiguous
+    /// (`Pool.allocate(contiguous: true)`, or minted at boot) in memory the
+    /// board can give a process, and `Err(SosStatus.NoResource)`, pinning
+    /// nothing, for any other: a boot allocation in flash an image is used
+    /// from in place, say. An
+    /// allocation already pinned terminates the caller with `BadState`: there
+    /// is one pin per allocation.
+    public func pin(&self) -> Result<PhysicalRange, SosStatus> {
+        pin_into_frame(self.handle)
+    }
+
+    /// Drop this allocation's pin. Requires `MemoryRight.Physical`.
+    ///
+    /// The pin is the allocation's, not a handle's, so any handle carrying the
+    /// right unpins it, whoever pinned. An allocation that is not pinned
+    /// terminates the caller with `BadState`.
+    public func unpin(&self) -> Result<Void, SosStatus> {
+        checked(sos_memory_unpin(self.handle))
+    }
+
     /// Mint a sibling of this region handle, narrowed by a keep mask: the
     /// universal `MINT_OP`, on `System.mint`'s exact terms. Requires the
     /// universal `MemoryRight.Mint` on this handle.
     ///
     /// This is where a launcher's memory policy is written. A region's default
     /// set is permissive (`memory_rights()` carries `Transfer | Mint | Map |
-    /// MapExecute`, because attenuation is monotonic and a bit not minted at
-    /// boot could never appear later), so what a child may do with the RAM
-    /// it is handed is decided here, once, by the mask the launcher writes:
+    /// MapExecute | Physical`, because attenuation is monotonic and a bit not
+    /// minted at boot could never appear later), so what a child may do with
+    /// the RAM it is handed is decided here, once, by the mask the launcher
+    /// writes:
     ///
     /// ```saw
     /// let for_child = pool_page.mint(rights: MemoryRight.Transfer
@@ -138,4 +183,16 @@ extension Memory {
         let raw = try call_value(self.handle, MINT_OP, rights as UInt, 0, 0)
         return Memory(handle: MemoryHandle(raw))
     }
+}
+
+/// The `unsafe` half of `Memory.pin`, confined to one small named helper. The
+/// record buffer's address never leaves it.
+public(package) func pin_into_frame(
+    handle: MemoryHandle
+) unsafe -> Result<PhysicalRange, SosStatus> {
+    var buf: [UInt; MEMORY_PIN_RECORD_WORDS] = [0; MEMORY_PIN_RECORD_WORDS]
+    try checked(sos_memory_pin(handle, (&var buf) as UnsafePointer<UInt>,
+                               memory_pin_record_bytes() as UInt))
+    return PhysicalRange(base: buf[MEMORY_PIN_BASE_WORD],
+                         len: buf[MEMORY_PIN_LEN_WORD])
 }

@@ -1,6 +1,7 @@
 // What the plan makes of a declaration's `[ceilings]` and its records'
-// `rights`: a ceiling word for each kind of a process that has the table and
-// none for one that does not, each record's keep word, the console's inlet
+// `rights`: a ceiling word for each kind of a process that has the table, and
+// for one that does not a word for each kind with an opt-in right, every right
+// but those; each record's keep word, the console's inlet
 // held to the `pipe-inlet` ceiling, the module root is built with, and root's
 // arena with the ceilings counted.
 
@@ -156,7 +157,9 @@ func main() {
     let with_post = "{full}iomemory = [\"carve\", \"map\"]\npipe-outlet = [\"take\", \"transfer\"]\npipe-inlet = [\"post\", \"transfer\"]\n"
 
     // A process with `[ceilings]` has a word for each of the 15 kinds, in the
-    // table's order, none for a kind it leaves out; one without has none.
+    // table's order, none for a kind it leaves out; one without has a word
+    // for `Memory` and `Pool`, the kinds with an opt-in right, each every
+    // right but `physical`.
     var d = pair(driver("", with_post), hello(with_post))
     let plan = planned(false, &d)
     assert(ceilings_len(&plan, 0) == CEILING_KINDS, "a word for each kind")
@@ -172,8 +175,13 @@ func main() {
     }
     var none = pair(driver("", ""), hello(""))
     let without = planned(false, &none)
-    assert(ceilings_len(&without, 0) == 0 && ceilings_len(&without, 1) == 0,
-           "no [ceilings]: no words")
+    assert(ceilings_len(&without, 0) == 2 && ceilings_len(&without, 1) == 2,
+           "no [ceilings]: the opt-in kinds' words")
+    assert(ceiling_of(&without, 0, "Memory") == (KEEP_ALL & ~((1 as UInt32) << 12)) as Int,
+           "no [ceilings]: every Memory right but physical")
+    assert(ceiling_of(&without, 1, "Pool") == (KEEP_ALL & ~((1 as UInt32) << 12)) as Int,
+           "no [ceilings]: every Pool right but physical")
+    assert(ceiling_of(&without, 0, "Event") == -1, "no [ceilings]: no other word")
 
     // Each record's keep word: its own rights, else the kind's ceiling, else
     // every right. The System record is read for its System rights, and the
@@ -216,8 +224,8 @@ func main() {
     assert(module.contains("source: Source.Row, from: 0x4, offset: 0x0, len: 0x0, keep: 0x200))"),
            "a record's keep word")
     let plain_module = plan_module(&without, "c").join("\n")
-    assert(plain_module.contains("    var ceilings = try! Vector<Ceiling>(capacity: 0)\n"),
-           "no ceilings")
+    assert(plain_module.contains("    var ceilings = try! Vector<Ceiling>(capacity: 2)\n    try! ceilings.push(Ceiling(kind: CeilingKind.Memory, rights: 0xffffefff))"),
+           "no ceilings: the opt-in kinds'")
 
     // Root's arena counts the ceilings: the blocks differ by the one block of
     // them a child with the table has.

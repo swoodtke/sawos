@@ -8,9 +8,10 @@
 // file in the manifest's `native` list is the established spelling.
 //
 // A test knows this at all because a region is a capability, not a
-// description: there is no op that reads a Memory's bounds. What a process
-// knows about where its memory is, it knows from the config that handed it the
-// region, as the uart-echo driver knows `UART_BASE`.
+// description: the one op that reads a Memory's bounds is a pin, which a
+// process may make only when its launcher grants it. What a process knows
+// about where its memory is, it otherwise knows from the config that handed it
+// the region, as the uart-echo driver knows `UART_BASE`.
 //
 // It mirrors `tools/sos_runner.py`'s `pool_base` / `pool_len` for this
 // architecture. The two agree rather than one deriving from the other: the

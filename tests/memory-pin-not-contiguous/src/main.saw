@@ -1,0 +1,98 @@
+// A pin answers only for an allocation made contiguous (spec §2.5).
+//
+//   SOS pinloose: a pin: <NoResource> (record kept=yes)
+//   SOS pinloose: an unpin
+//   SOS: process fault: object in the wrong state process=0
+//
+// A page allocated without the contiguous flag is promised to be nothing, so
+// its pin is the `NoResource` status, and neither the record nor the pin is
+// touched: the record still holds the words it was filled with, and the unpin
+// that follows finds nothing pinned, which is the `BadState` fault that ends
+// the case.
+//
+// It works at the C altitude, where a record of the caller's choosing can be
+// filled before the call and read after it.
+
+import sos.{System, SosStatus, ALL_RIGHTS, sos_system_process_self,
+            sos_process_boot_handle_next, sos_pool_allocate, sos_memory_pin,
+            sos_memory_unpin}
+
+static EXIT_FAILED: UInt = 1
+static STATUS_OK: UInt = 0
+static NONE: UInt = 0
+
+/// A page: a whole number of grains on every profile.
+static PAGE: UInt = 0x1000
+
+/// What the record holds before the pin, which a pin that wrote would change.
+static FILL: UInt = 0x5A5A_5A5A
+
+static RECORD_WORDS: Int = 2
+static BOOT_WORDS: Int = 3
+
+func word_bytes() -> UInt {
+    sizeof<UInt>() as UInt
+}
+
+/// A raw status word in the typed vocabulary's words.
+func status_of(raw: UInt) -> SosStatus {
+    if raw > (UInt8.max as UInt) {
+        return SosStatus.Unknown
+    }
+    SosStatus.from(raw: raw as UInt8) ?? SosStatus.Unknown
+}
+
+/// The pool word of the one boot record, or `NONE`.
+func boot_pool(boot_handle: UInt) unsafe -> UInt {
+    var proc: UInt = NONE
+    if sos_system_process_self(boot_handle, ALL_RIGHTS as UInt,
+                               (&var proc) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    var rec: [UInt; BOOT_WORDS] = [0; BOOT_WORDS]
+    let drained = sos_process_boot_handle_next(
+        proc, (&var rec) as UnsafePointer<UInt>,
+        (BOOT_WORDS as UInt) * word_bytes())
+    if drained != STATUS_OK {
+        return NONE
+    }
+    rec[2]
+}
+
+/// A page from `pool`, allocated without the contiguous flag, or `NONE`.
+func loose_page(pool: UInt) unsafe -> UInt {
+    var page: UInt = NONE
+    if sos_pool_allocate(pool, PAGE, 0, 0,
+                         (&var page) as UnsafePointer<UInt>) != STATUS_OK {
+        return NONE
+    }
+    page
+}
+
+/// Pin `page` into a filled record: the raw status, and whether the record
+/// still holds its fill.
+func pin_kept(page: UInt) unsafe -> (UInt, Bool) {
+    var rec: [UInt; RECORD_WORDS] = [FILL; RECORD_WORDS]
+    let status = sos_memory_pin(page, (&var rec) as UnsafePointer<UInt>,
+                                (RECORD_WORDS as UInt) * word_bytes())
+    (status, rec[0] == FILL && rec[1] == FILL)
+}
+
+@export("_start")
+func _start(boot_handle: UInt) {
+    let system = System(boot_handle: boot_handle)
+    let pool = boot_pool(boot_handle)
+    let page = if pool == NONE { NONE } else { loose_page(pool) }
+    if page == NONE {
+        let _ = system.debug_print("SOS pinloose: no page\n")
+        let _ = system.shutdown(EXIT_FAILED)
+        return
+    }
+    let (status, kept) = pin_kept(page)
+    print("SOS pinloose: a pin: {} (record kept={})\n", status_of(status),
+          if kept { "yes" } else { "no" })
+    let _ = system.debug_print("SOS pinloose: an unpin\n")
+    let _ = sos_memory_unpin(page)
+    let _ = system.debug_print("SOS pinloose: UNREACHABLE the unpin returned\n")
+    let _ = system.shutdown(EXIT_FAILED)
+}
