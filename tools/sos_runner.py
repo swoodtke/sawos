@@ -3310,7 +3310,7 @@ TEST_CASES = [
     },
     {
         # The arena's allocations under preemption. Two workers of one process
-        # take thousands of blocks each from `sosrt`'s arena under the
+        # take a pass of blocks each from `sosrt`'s arena under the
         # short-tick preemption kernel (`tests/threads_fast_tick.saw`), and the
         # initial thread then checks that no two blocks share a granule and
         # that every block still holds its worker's marker. A heap entered by
@@ -3321,15 +3321,15 @@ TEST_CASES = [
         # match runs on the projection `thread_preempt` uses; neither expected
         # line begins `SOS: `.
         #
-        # It runs on the isolated riscv32 profile only, because that is the
-        # profile where it can fail: arm64 and riscv32-flat run the workload so
-        # fast that too few ticks land inside the allocator, and a shorter
-        # period does not add enough. A case that cannot fail there would pass
-        # whatever the allocator did, so it is not run there.
+        # Each worker first allocates and frees until `sosrt`'s count of the
+        # arena lock's contended acquisitions (`sos_arena_contended`) is above
+        # zero, so the case runs until a second thread has reached the lock
+        # while the first held it, however many ticks that takes and whatever
+        # the host's speed. An arena with no lock never moves the count, and
+        # the case then runs to the harness's timeout.
         "name": "arena_race",
         "src": os.path.join(TESTS_DIR, "threads_fast_tick.saw"),
         "root_pkg": ARENA_RACE_PKG,
-        "arches": ["riscv32"],
         "strip_kernel_lines": True,
         "expect_out": ["SOS M2: preemptive kernel up on",
                        "SOS arenarace: two allocators, no yields",
@@ -3348,11 +3348,12 @@ TEST_CASES = [
         # impossible: the request then answers null, and the program's
         # unwrap panics.
         #
-        # The kernel's tick narration and the profile are as `arena_race`'s.
+        # The kernel's tick narration is as `arena_race`'s, and so is the
+        # count of the arena lock's contended acquisitions: the workers run
+        # past their rounds until it is above zero.
         "name": "arena_churn",
         "src": os.path.join(TESTS_DIR, "threads_fast_tick.saw"),
         "root_pkg": ARENA_CHURN_PKG,
-        "arches": ["riscv32"],
         "strip_kernel_lines": True,
         "expect_out": ["SOS M2: preemptive kernel up on",
                        "SOS arenachurn: two threads, no yields",

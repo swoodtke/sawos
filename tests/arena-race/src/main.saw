@@ -3,18 +3,22 @@
 // Two workers of one process each take BLOCKS blocks from `sosrt`'s arena,
 // through the `__saw_rt_alloc` seam itself (declared `extern "C"` below, the
 // same symbol the compiler's allocation path calls). Neither yields: a burn
-// between two allocations keeps each worker running across many ticks, so the
+// between two allocations keeps each worker running across ticks, so the
 // preemption harness kernel with a short tick (`tests/threads_fast_tick.saw`)
 // takes the processor away at arbitrary points, inside the heap's lock
 // included. Each worker records every block's offset in a table of its own.
 //
-// The runner runs this case on the isolated riscv32 profile only: on arm64
-// and riscv32-flat a boot's ticks land too rarely inside the allocator (see the
-// case's comment in `tools/sos_runner.py`), so a pass there would prove
-// nothing.
+// Before its pass, each worker allocates and frees one granule in a loop
+// until `sos_arena_contended` reads above zero: a thread has reached the
+// arena's lock while another held it, so the lock's window was entered by
+// two threads at once and the lock kept them apart. The wait is on that
+// count and not on the clock, whatever the number of ticks, and a count that
+// never moves, which is what an arena with no lock gives, leaves the workers
+// looping until the harness's timeout.
 //
-// After both are joined the initial thread checks two things:
+// After both are joined the initial thread checks three things:
 //
+//   * contention: the count is above zero.
 //   * disjointness: every 4-byte granule of the arena is claimed by at most
 //     one block, whichever worker took it. A free-list update lost to a
 //     switch hands the same granule out twice.
@@ -47,7 +51,9 @@ import sos.{System, Process}
 // declarations of one symbol must agree; `sosrt` defines it.
 extern "C" {
     func __saw_rt_alloc(size: Int, align: Int) -> UnsafePointer<Int8>?
+    func __saw_rt_dealloc(ptr: UnsafePointer<Int8>, size: Int, align: Int)
     func sos_arena_base() -> UInt
+    func sos_arena_contended() -> Int
     func sos_arena_size() -> UInt
 }
 
@@ -68,24 +74,24 @@ static ROLE_B: UInt = 2
 
 /// A block asks for one granule, the smallest request, and costs the smallest
 /// block the heap makes: four words. Both workers' blocks together
-/// (`2 * BLOCKS` of them) must fit the `ARENA_SIZE` the riscv32 linker script
-/// sets, after the heap's control block, on the one profile the case runs on;
-/// arm64's four-word blocks are twice the size and would not fit its script's.
-/// The root image's region bounds the arena, the tables and the stacks
-/// together.
+/// (`2 * BLOCKS` of them) must fit the `ARENA_SIZE` the target's linker script
+/// sets, after the heap's control block; arm64's four-word blocks are twice
+/// the size, so its script's is the larger. The map below has a byte per
+/// granule of the larger. The root image's region bounds the arena, the
+/// tables and the stacks together.
 static GRANULE: UInt = 4
-static BLOCKS: Int = 3000
+static BLOCKS: Int = 1500
 
 /// Iterations between two allocations, so a worker spans many ticks.
 static SPIN: Int = 60
 
 /// The granule index of every block, worker A's then worker B's. A worker
 /// writes only its own half.
-static TABLE_LEN: Int = 6000
+static TABLE_LEN: Int = 3000
 unsafe static var BLOCK_GRANULES: [UInt16; TABLE_LEN] = [0; TABLE_LEN]
 
 /// Which worker claimed each granule of the arena (0 = nobody).
-static MAP_LEN: Int = 24_576
+static MAP_LEN: Int = 28_672
 unsafe static var OWNER: [UInt8; MAP_LEN] = [0; MAP_LEN]
 
 /// A block's offset from the arena's base.
@@ -147,6 +153,12 @@ func worker(role: UInt) unsafe {
     let me = try proc.thread_self() catch { return }
     let base = sos_arena_base()
     let first = table_base(role)
+
+    while sos_arena_contended() == 0 {
+        let probe = __saw_rt_alloc(4, 4)!
+        __saw_rt_dealloc(probe, 4, 4)
+        burn(SPIN)
+    }
 
     var i = 0
     while i < BLOCKS {
@@ -250,6 +262,12 @@ func initial(boot_handle: UInt) unsafe {
     let rb: UInt = try b.join() catch { NO_VALUE }
     if ra != EXIT_A || rb != EXIT_B {
         print("SOS arenarace: workers ended a={} b={}\n", ra, rb)
+        let _ = system.shutdown(1)
+        return
+    }
+
+    if sos_arena_contended() == 0 {
+        let _ = system.debug_print("SOS arenarace: the arena's lock never met a second thread\n")
         let _ = system.shutdown(1)
         return
     }

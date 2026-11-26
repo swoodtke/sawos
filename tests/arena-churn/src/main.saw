@@ -23,8 +23,12 @@
 //     can give. A free lost to a switch leaves a hole, and the request answers
 //     null, which the unwrap panics on.
 //
-// Like `arena-race`, it runs on the isolated riscv32 profile only, where the
-// short tick lands inside the heap's few hundred instructions often enough.
+// A worker runs its ROUNDS and then more rounds until `sos_arena_contended`
+// reads above zero: a thread has reached the arena's lock while another held
+// it. The wait is on that count and not on the clock, whatever the number of
+// ticks, and a count that never moves, which is what an arena with no lock
+// gives, leaves the workers looping until the harness's timeout. The initial
+// thread checks the count is above zero once both are joined.
 
 import sos.{System, Process}
 
@@ -32,6 +36,7 @@ extern "C" {
     func __saw_rt_alloc(size: Int, align: Int) -> UnsafePointer<Int8>?
     func __saw_rt_dealloc(ptr: UnsafePointer<Int8>, size: Int, align: Int)
     func sos_arena_size() -> UInt
+    func sos_arena_contended() -> Int
 }
 
 /// The boot handle, parked for the workers; see `thread-preempt`.
@@ -148,7 +153,7 @@ func worker(role: UInt) unsafe {
     var seed = role
     var round = 0
     var code = if role == ROLE_A { EXIT_A } else { EXIT_B }
-    while round < ROUNDS {
+    while round < ROUNDS || sos_arena_contended() == 0 {
         let slot = first + round % LIVE
         if not release(role, slot) {
             print("SOS arenachurn: block lost at round {}: worker {} slot {}\n",
@@ -210,6 +215,12 @@ func initial(boot_handle: UInt) unsafe {
     let rb: UInt = try b.join() catch { NO_VALUE }
     if ra != EXIT_A || rb != EXIT_B {
         print("SOS arenachurn: workers ended a={} b={}\n", ra, rb)
+        let _ = system.shutdown(1)
+        return
+    }
+
+    if sos_arena_contended() == 0 {
+        let _ = system.debug_print("SOS arenachurn: the arena's lock never met a second thread\n")
         let _ = system.shutdown(1)
         return
     }

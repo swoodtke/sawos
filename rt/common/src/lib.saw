@@ -386,6 +386,26 @@ extern "C" {
 /// its own thread.
 static ARENA: SpinLock<UnsafeHeap>
 
+/// How many times a thread reached the arena's lock while another held it:
+/// the arena's contended acquisitions, counted from the process's start.
+static ARENA_CONTENDED: Atomic<Int>
+
+/// The arena's contended acquisitions so far. A count above zero says two
+/// threads were inside the arena's allocation path at once, and the lock
+/// kept them apart. It only grows, and a stalled host cannot lower it.
+@export("sos_arena_contended")
+public func arena_contended() -> Int {
+    ARENA_CONTENDED.load()
+}
+
+/// Count an arrival at the arena's lock that finds it held. It runs before
+/// every acquisition of that lock, so the lock is taken one way only.
+func arena_arrive() unsafe {
+    if ARENA.is_locked() {
+        let _ = ARENA_CONTENDED.fetch_add(1)
+    }
+}
+
 func arena() unsafe -> UnsafeHeap {
     let size = sos_arena_size()
     UnsafeHeap(base: sos_arena_base(), size: size, largest: size)
@@ -411,6 +431,7 @@ func rt_lock_owner() -> Int {
 func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
     var block = heap_alloc(DEFAULT_HEAP, size, align)
     if block == 0 {
+        arena_arrive()
         block = borrow var heap = ARENA.lock() {
             if heap.size == 0 {
                 heap = arena()
@@ -441,6 +462,7 @@ func rt_dealloc(ptr: UnsafePointer<Int8>, size: UInt, align: UInt) unsafe {
         return
     }
     let held = if in_arena(block) {
+        arena_arrive()
         borrow var heap = ARENA.lock() {
             let live = heap.holds(block)
             if live {
@@ -731,6 +753,25 @@ public struct PoolHeap {
 /// One lock per slot.
 static HEAPS: [SpinLock<PoolHeap>; HEAP_SLOTS]
 
+/// How many times a thread reached a pool heap's lock while another held it,
+/// across every slot.
+static HEAP_CONTENDED: Atomic<Int>
+
+/// Count an arrival at `slot`'s lock that finds it held. It runs before every
+/// acquisition of a slot's lock.
+func heap_arrive(slot: Int) unsafe {
+    if HEAPS[slot].is_locked() {
+        let _ = HEAP_CONTENDED.fetch_add(1)
+    }
+}
+
+/// The pool heaps' contended acquisitions so far, as `arena_contended` counts
+/// the arena's.
+@export("sos_heap_contended")
+public func heap_contended() -> Int {
+    HEAP_CONTENDED.load()
+}
+
 /// Whether each slot has a pool, set once its heap is installed and never
 /// cleared: the global allocator asks a process with no default heap's arena
 /// without taking a lock it would find empty.
@@ -756,6 +797,7 @@ func in_arena(block: UInt) unsafe -> Bool {
 /// nothing: the first allocation the heap cannot serve grows it.
 public func adopt_heap(slot: Int, pool: UInt, process: UInt, total: UInt,
                        grain: UInt) {
+    heap_arrive(slot)
     borrow var h = HEAPS[slot].lock() {
         h.pool = pool
         h.process = process
@@ -773,6 +815,7 @@ public func heap_alloc(slot: Int, size: UInt, align: UInt) unsafe -> UInt {
     if ADOPTED[slot].load() == 0 {
         return 0
     }
+    heap_arrive(slot)
     borrow var h = HEAPS[slot].lock() {
         if h.adopted { serve(&var h, size, align) } else { 0 }
     }
@@ -781,6 +824,7 @@ public func heap_alloc(slot: Int, size: UInt, align: UInt) unsafe -> UInt {
 /// Free `block` to `slot`'s heap when the heap holds it as a live block, and
 /// answer whether it did.
 public func heap_free(slot: Int, block: UInt) unsafe -> Bool {
+    heap_arrive(slot)
     borrow var h = HEAPS[slot].lock() {
         let live = h.heap.size != 0 && h.heap.holds(block)
         if live {
@@ -792,6 +836,7 @@ public func heap_free(slot: Int, block: UInt) unsafe -> Bool {
 
 /// `slot`'s size, adoption total and last refusal.
 public func heap_state(slot: Int) unsafe -> HeapState {
+    heap_arrive(slot)
     borrow var h = HEAPS[slot].lock() {
         HeapState(size: h.heap.size, total: h.total, adopted: h.adopted,
                   refusal: h.refusal, quota: h.quota)
@@ -802,6 +847,7 @@ public func heap_state(slot: Int) unsafe -> HeapState {
 /// once, at adoption, and the share's allocation is made with the lock given
 /// back. A slot with no pool answers `NO_HANDLE`, zero.
 public func heap_pool(slot: Int) unsafe -> (UInt, UInt) {
+    heap_arrive(slot)
     borrow var h = HEAPS[slot].lock() {
         (h.pool, h.grain)
     }

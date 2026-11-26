@@ -71,10 +71,16 @@ MEMORY {
 SECTIONS {
     . = SOS_REGION_BASE;
 
-    /* Code: one R+X segment. `_text_end` is the first address past it. */
+    /* Code: one R+X segment. `_text_end` is the first address past it, and
+     * it lies on a page boundary. A PMP row covers `.text` on the 4-byte
+     * grain, so without the alignment the page holding the code's tail also
+     * holds the start of `.rodata`, which another row covers, and QEMU runs
+     * code fetched from a page a rule covers only partly many times slower.
+     * The padding is zero bytes in the image, so it costs a process up to one
+     * page of file and region. */
     .text : {
         *(.text .text.*)
-        . = ALIGN(4);
+        . = ALIGN(4096);
         _text_end = .;
     } > REGION
 
