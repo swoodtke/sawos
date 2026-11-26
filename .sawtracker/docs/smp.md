@@ -1,951 +1,577 @@
 # Using the ESP32-S3's second core: a design
 
-Revision 2, Nov 26. A design only: nothing here is built until the owner and
+Revision 3, Nov 26. A design only: nothing here is built until the owner and
 the reviewer have read it. Written against main at `76460836`, with SO-148's
 inheritance lock (`.p4` r6, approved, in the merge queue) taken as landed.
+Revisions 1 and 2 are kept in scratch.
 
-**Changes from revision 1**, from the owner's answers (SO-170):
+**Changes in revision 3**, from the owner's rulings (SO-170):
 
-- **Process affinity is the model**: the projects run separate programs on
-  separate cores. A process spanning cores is out of scope and stays a
-  not-built note (§1, §11).
-- **One big lock**, its cross-core waiting measured on the board, not
-  designed away: board stage S1 says what is measured and the shape that
-  would justify a split (§10.3).
-- **Timers**: core 0 serves every Timer in the units built first, as
-  revision 1 had it; §4.3 now states what that adds to a core-1 process's
-  Timer (stage S2 measures it), and per-core Timers are a later unit (U8),
-  designed in §4.3 with what a radio on core 1 gains. The tick is per core.
-- **riscv32 runs every gate case on two harts**; riscv32-flat stays on one;
-  arm64 SMP is later (§9).
-- **Decided as recommended**: placement on `ProcessRight.BandMap`; the second
-  kernel stack sized from U0's measurement; stall, then reset only without an
-  acknowledgement; unplaced children on their launcher's core.
-- The two probes (§13).
+- **Nothing may rely on the limits of the first stage.** Placing a process on
+  one core is policy, not a guarantee: no kernel, runtime or driver code may
+  assume two threads of one process never run at once. §3 says what each
+  mechanism promises on full SMP, and what changes so it holds.
+- **The first stage is trimmed** to: core 1 up on the S3 and two harts on
+  riscv32 in the gate; one big lock and one shared kernel stack; per-core
+  ready lists, tick and idle, and the reschedule IPI; processes placed by
+  their launcher; core 0 serving every Timer and every device line; the
+  panic stop. Everything else is the "later" list (§11).
+- **One shared kernel stack, and a small entry stack per core** (the owner's
+  proposal). It holds against the code, with two changes it needs: the idle
+  loop leaves `pick_next`'s call chain, and a teardown whose process is
+  running on the other core is never waited for with frames live (§2).
 
 Markers. **[read F:L]** is taken from that file and those lines (paths from
-the sawos root; `ROM ELF` is the mask ROM's ELF, by address; `IDF/` is ESP-IDF tag v5.4.1, `EQ/` is espressif/qemu tag
+the sawos root; `IDF/` is ESP-IDF tag v5.4.1, `EQ/` is espressif/qemu tag
 `esp-develop-9.2.2-20250817`, the build installed here, both fetched into
-scratch; `PS:` is the tracker doc `SO:priority-scheduler`,
-`.sawtracker/docs/priority-scheduler.md`). **[probed]** is something I ran;
-§13 says how. **UNVERIFIED** is neither.
+scratch; `ROM` is the mask ROM's ELF, `esp32s3_rev0_rom.elf` from
+esp-rom-elfs 20241011, by address; `PS:` is the tracker doc
+`SO:priority-scheduler`). **[probed]** is something I ran. **UNVERIFIED** is
+neither.
 
 ---
 
-## 0. Verdict
+## 0. The first stage
 
-**SMP with process affinity.** One kernel image runs on both cores under one
-big kernel lock. Each process is placed on one core by its launcher, between
-the create and the start, as the band map is, and never moves; every thread
-of the process runs there. Each core has its own ready lists, tick, idle and
-IPI line. A launcher that places nothing gets today's machine: every process
-on core 0, core 1 idle.
+- **One kernel image on both cores, under one big kernel lock.** Every
+  kernel entry takes it; the user-return and the idle sleep give it back.
+- **One full kernel stack**, used only by the lock holder, and **an entry
+  stack per core** for saving the user context, spinning for the lock,
+  idling and stopping (§2).
+- **Per core:** ready lists (the eight levels and the bitmap), the running
+  thread, the tick, idle, and a reschedule IPI.
+- **Placement is a launcher's policy:** `ProcessOp.Core(core)` between the
+  create and the start; unset, a child runs on its launcher's core, so an
+  image that places nothing is today's machine with core 1 idle. In this
+  stage every thread of a process runs on the process's core, but nothing
+  relies on it (§3).
+- **Core 0 serves every Timer and every device line;** a wake for a thread on
+  core 1 is an IPI.
+- **The panic stops the other core first** (§6).
 
-The deciding fact is the section word. It is a ceiling enforced by *not
-scheduling* a sibling, entered by a plain store with no trap [read
-spec.md:4123-4136]; a sibling already running on the other core is not
-stopped by a store, so the moment one process's threads run on two cores at
-once the section is no lock at all, and the runtime's heaps, which U5 moves
-into the section [read PS:842-848], corrupt. The inheritance lock's no-lost-
-wake argument also rests on the process not running while the kernel reads
-the owner word [read PS:673-678]. Confining a process to one core keeps both
-exactly as specified, and keeps every PSRAM atomic contended from one core,
-which is the only case the board has shown [read
-hal/xtensa-esp32s3/ABI.md:1929-1930]. A process whose threads span cores is
-out of scope (the owner's ruling: the projects run separate programs on
-separate cores) and stays a not-built note (§11).
-
-It gives a user program: a core to itself (the radio alone on core 1, its
-realtime levels competing with nothing of core 0's), and two processes
-running at once. It does not give one process's threads in parallel.
+What it gives the projects: separate programs on separate cores.
 
 ---
 
-## 1. The model
+## 1. Locking
 
-| | Full SMP | Asymmetric | **Affinity: process** | Affinity: thread |
-|---|---|---|---|---|
-| What runs where | any thread, any core | core 1: pinned threads, a restricted loop | a process's threads on its core | a thread on its core |
-| Kernel change | shared ready structure, global pick of the two highest, migration, every lock | a second kernel personality, or syscall forwarding | per-core ready lists, one lock, IPIs, remote kill | as process, plus every in-process cross-core case |
-| Section word | broken (§0) | n/a on core 1 or broken | **unchanged** | broken for a spanning process |
-| Inheritance lock | needs a re-check after publishing `waiters` | as full | **unchanged** | needs the re-check |
-| PSRAM atomics | two-core `s32c1i` on PSRAM, unproven; IDF refuses it [read IDF/components/esp_hw_support/cpu.c:203-218] | as full | **one core per word** | as full |
-| RT isolation | none unless pinned | best if core 1 makes no syscall, worse than affinity if it does (forwarding is two IPIs plus core 0's kernel) | good: a core of its own; bounded by core 0's longest kernel section (§2) | good |
-| Throughput | best (balancing) | none for general work | across processes | within a process |
-| Risk | highest: every ordering in the suite changes meaning | medium, and a spec surface nobody else uses | **lowest that gives both cores** | medium |
+**One lock**, a ticket (`next`, `serving`) in kernel DRAM, taken at every
+kernel entry and given back at every exit. The kernel is not preemptible,
+its sections are short but for a child's load, a teardown and a console
+line, and the object graph is one web (one wake walks a Waiter, an
+attachment, a thread, a ready list and a process's memory [read
+kernel/core/preempt.saw:11-14]). One lock turns each `unsafe static var`'s
+"uniprocessor" argument [read kernel/core/threads.saw:252-253,
+kernel/core/irq.saw:110-120] into "under the kernel lock" and nothing else.
+Its cost is that a core waits for the other core's longest section; that is
+measured later (§11). A preemption point keeps the lock: it delivers this
+core's lines and asserts nothing about another core's syscall [read
+spec.md:4633-4635].
 
-**Asymmetric is dropped.** A radio's realtime work waits on interrupts and
-pipes, so its threads make syscalls. Forwarding them to core 0 puts core 0's
-kernel and two IPIs inside every realtime path; running a restricted kernel
-on core 1 is a second kernel to specify and test. Affinity gives the same
-"core 1 is the radio's" with one kernel: place the radio there alone.
+**Per core, written by its own core only:** `CURRENT_THREAD`, `SLICE_LEFT`,
+`SLICE_ENDED`, `PENDING_FREE`, `LAST_PROT_PROCESS` [read
+kernel/core/threads.saw], the tick's `NEXT_TICK_NS` [read
+kernel/core/time.saw], `RUNNING_PROCESS` (§2.3), and the HAL's per-core
+register shadows (the S3's `INTENABLE_SHADOW`, `LINE_CPU_INT` [read
+hal/xtensa-esp32s3/kernel/lib.saw]; riscv's PMP shadows).
+**Per core, written by either under the lock:** `READY_HEAD`, `READY_TAIL`,
+`READY_BITS`, `NEED_RESCHED`. **Shared, under the lock:** every slab, the
+pending-death lists, the stats region, the Timer comparator and its shadows,
+the console. `IN_DELIVERY` [read kernel/core/irq.saw:162-168] stays one
+flag: only the holder delivers.
 
-**Full SMP is dropped for now.** It costs everything thread affinity costs and
-adds migration and a global pick, for load balancing that the box's fixed set
-of processes does not need.
+**`IntrSpinLock` grows** [read spec.md:4739-4760]: a failed acquire spins
+when the other core holds it and still panics when this core does (the word
+holds the holder's core plus one); the spin polls the stop word (§6). The
+kernel lock is not closure-scoped, because it is given back on paths that do
+not return to the taker (`hal.resume_frame` is `Never`); the save-and-mask
+half is the identity, since the kernel always runs masked [read
+spec.md:4008-4009, 4617-4622].
 
-**Thread affinity is out of scope.** The owner's projects run separate
-programs on separate cores, which process affinity gives. A process whose
-threads span cores would need the section refused for it, the inheritance
-lock's wait to re-check the owner after publishing `waiters`, and two-core
-`s32c1i` on PSRAM shown on the board; none of that is designed further, and
-§11 lists it as not built.
-
-**Fit for the S3.** The kernel code is shared, the vector table is shared
-(each core points `VECBASE` at it), and per-core state is a few hundred
-bytes. The real cost is a second kernel stack: `KERNEL_STACK_SIZE` is 64 KiB
-of a 144 KiB kernel DRAM [read hal/xtensa-esp32s3/kernel/esp32s3.ld:92,106],
-and nothing measures how much of it is used (U0). In-place flash adds
-contention, not work: both cores fetch through one shared cache (§5), so core
-0's misses can evict core 1's lines, which only a board can measure.
-
----
-
-## 2. Locking
-
-### 2.1 What needs a lock
-
-Every mutable kernel global is an `unsafe static var` whose comment argues
-"uniprocessor, interrupts taken from user mode only" [read
-kernel/core/threads.saw:252-253, kernel/core/irq.saw:110-120]. Under process
-affinity they split three ways.
-
-**One per core, written by its own core only** (an array indexed by
-`hal.core_id()`): `CURRENT_THREAD`, `SLICE_LEFT`, `SLICE_ENDED`,
-`PENDING_FREE`, `LAST_PROT_PROCESS` [read kernel/core/threads.saw], `IN_DELIVERY`
-[read kernel/core/irq.saw:162-168], the tick's `NEXT_TICK_NS` [read
-kernel/core/time.saw], and the HAL's per-core registers' shadows: the S3's `INTENABLE_SHADOW` and `LINE_CPU_INT` [read
-hal/xtensa-esp32s3/kernel/lib.saw], arm64's `EL0_FP_ON` and `CURRENT_SET`,
-riscv's `PMPCFG*` shadows. The other core reads `CURRENT_THREAD` only under
-the lock (§3.4, §3.5).
-
-**One per core, written by either core** (under the lock): `READY_HEAD`,
-`READY_TAIL`, `READY_BITS` and `NEED_RESCHED`. A wake made on core 0 readies a
-thread on core 1's lists and raises core 1's flag.
-
-**Shared** (under the lock): every slab (`THREADS`, `PROCESSES`,
-`PROCESS_RECORDS`, `HANDLE_BLOCKS`, the memory, pipe, exchange, event,
-waiter, interrupt, attachment, clock and timer slabs), `NEXT_PID`,
-`UNSTARTED_PENDING`, `DOOM_PENDING`, `STATS_STORAGE`, `TIMER_TICKS`,
-`SPURIOUS_IRQS`, the Timers' comparator and its shadows (`PROGRAMMED_NS`,
-the S3's `TIMER_PROGRAMMED`), and the console.
-
-Boot-only state (`IMAGE_QUOTA_*`, the PSRAM records) is written before core 1
-starts and read after, so it needs none.
-
-### 2.2 One lock
-
-**A big kernel lock, taken at every kernel entry and given back at every
-exit.** Entry is the trap entry from user mode (`ktrap`'s top [read
-kernel/core/dispatch.saw:5535]) and the secondary core's first entry; exit is
-`ktrap`'s return after `pick_next` and `stamp_interrupt_latency`, and
-`resume_after_death`'s `hal.resume_frame` [read
-kernel/core/sched.saw:343-347]. The idle wait gives it back around the sleep
-and takes it again to poll (§3.5).
-
-Why one, and not finer:
-
-- The kernel is not preemptible and its sections are short except three
-  known ones (the loader's placement, a teardown, a console line), so one
-  lock costs little throughput on two cores.
-- The object graph is one web. A single wake runs `notify_ready` →
-  `wake_one_waiter` → `deliver_attachment` → `copy_out` and touches a Waiter,
-  an attachment, a thread, a ready list and a process's memory in one walk
-  [read kernel/core/preempt.saw:11-14]. Finer locks need an order across that
-  web and a re-audit of every serialization comment; one lock turns each
-  comment's "uniprocessor" into "under the kernel lock" and nothing else.
-- What it costs is latency on the other core: a realtime thread on core 1
-  waits, at its next kernel entry, for the longest section core 0 can be in.
-  That is measured on the board, not designed away (the owner's ruling):
-  stage S1 (§10.3) says what is measured and the shape of result that would
-  justify a split. On the gate the per-core `lock_waits` column (§8.3) is
-  printed, never asserted.
-
-**A preemption point does not give the lock back.** A point asserts that no
-in-flight invariant spans state the IRQ path touches [read spec.md:4633-4635],
-which is weaker than "no syscall on the other core can see a half-built
-object": a `process_create` mid-load is invisible to an interrupt and visible
-to a kill. Points stay what they are: delivery of this core's lines.
-
-### 2.3 How `IntrSpinLock` grows
-
-§9b specifies `lock` as save-and-mask, then compare-and-swap, panicking on a
-failed acquire because on one core that is reentrancy [read
-spec.md:4739-4750]. It grows three ways:
-
-- **A failed acquire spins when the holder is the other core**, and panics
-  only when the holder is this core. The word holds the holder's core plus
-  one, so reentrancy stays a loud stop.
-- **A ticket, not a test-and-set.** Two words, `next` and `serving`; a taker
-  fetch-adds `next` and spins until `serving` reaches its ticket. Two cores
-  cannot starve each other.
-- **The spin polls the stop word** (§7), so a core spinning masked still
-  answers a stop on a board with no NMI.
-
-The big lock is that type over `()`, but it is not closure-scoped, because it
-is released on paths that do not return to the taker (`hal.resume_frame` is
-`Never`): `kcore` gets `kernel_enter()` and `kernel_leave()` around it. The
-save-and-mask half is the identity in the kernel, which always runs masked
-[read spec.md:4008-4009, 4617-4622]; it matters for a future lock taken from a context
-that is not.
-
-### 2.4 What the atomics allow
-
-- **The S3.** `s32c1i` is the core's one word atomic, the compiler inlines it
-  [read hal/xtensa-esp32s3/ABI.md:269-270], it works under `ATOMCTL` 0x15 on
-  DRAM on silicon [read hal/xtensa-esp32s3/ABI.md:1380-1410], and there is no
-  `L32EX/S32EX` [read IDF/components/xtensa/esp32s3/include/xtensa/config/core-isa.h:71,79].
-  Two cores contending `s32c1i` on internal SRAM is what IDF's own spinlock
-  does [read IDF/components/esp_hw_support/include/spinlock.h:123,132], so
-  the kernel's lock words live in kernel DRAM. On PSRAM, IDF never uses the
-  native compare-and-swap and takes an interrupts-off lock in internal RAM
-  instead [read IDF/components/esp_hw_support/cpu.c:203-218]. Under process
-  affinity a user lock word in PSRAM is contended from one core only, which
-  board stage P8 showed exact [read hal/xtensa-esp32s3/ABI.md:1925-1930];
-  two cores on one PSRAM word stays unproven, and only a process spanning
-  cores, which is not built, would meet it. Ordering: `memw` after a releasing store, and `L32AI`/`S32RI`
-  are present [read core-isa.h:78].
-- **`ATOMCTL` on core 1 is the ROM's 0x15, as on core 0.** Core 0 inherits
-  it [read hal/xtensa-esp32s3/ABI.md:1390-1400]; the ROM's reset handler,
-  which both CPUs run, writes 21 to `ATOMCTL` and its own table to `VECBASE`
-  before either reaches `main` [read ROM ELF `esp32s3_rev0_rom.elf`
-  (esp-rom-elfs 20241011), 0x4000_0484-0x4000_048C]. The emulator reads only
-  bits [1:0] [read ABI.md:1398-1400], so only a board shows the part's.
-- **riscv32** is `rv32imac` [read hal/riscv32/board.toml:13]: `amoadd.w`
-  and `lr/sc`. **arm64** is a Cortex-A53 [read tools/sos_runner.py:1216],
-  ARMv8.0, so exclusives and no LSE; the compiler chooses.
-- `rt/common_c/support.c`'s plain read-modify-write atomics are for targets
-  with no atomic instruction only, and say SMP voids them [read
-  rt/common_c/support.c:7-11,21-28]; no SMP board uses them.
+**Atomics.** The S3's word atomic is `s32c1i`, inline in compiled code [read
+hal/xtensa-esp32s3/ABI.md:269-270], working under `ATOMCTL` 0x15 on DRAM on
+silicon [read ABI.md:1380-1410]. The ROM's reset handler writes 0x15 on both
+CPUs [read ROM 0x4000_0484-0x4000_048C]. Two cores contending `s32c1i` on
+internal SRAM is what IDF's own spinlock does [read
+IDF/components/esp_hw_support/include/spinlock.h:123,132]; on PSRAM IDF
+refuses the native compare-and-swap [read
+IDF/components/esp_hw_support/cpu.c:203-218], and two cores on one PSRAM word
+are unproven (board stage P8 is one core [read ABI.md:1925-1930]), so a word
+two cores contend stays in SRAM until a board stage shows otherwise.
+Ordering is `memw` on the S3, `fence` on riscv [read hal/riscv32/board.toml:13,
+`rv32imac`].
 
 ---
 
-## 3. The scheduler
+## 2. One full kernel stack, an entry stack per core
 
-### 3.1 Per-core ready structures
+### 2.1 The shape
 
-Each core owns eight lists and a one-byte bitmap: today's `READY_*`, one per
-core. A thread's core is its process's, read when it is pushed, so
-`ready_push`, `ready_pop`, `ready_remove`, `ready_rotate` and
-`ready_remove_process` take the core from the thread and the code is
-otherwise today's [read kernel/core/threads.saw:385-540]. Nothing is shared
-because nothing migrates; strict priority holds per core, and a level-7
-thread on core 1 holds back nothing on core 0, which is the point of putting
-it there.
+Each HAL's trap entry saves the user context into the thread's frame with no
+stack (the frame address is the save area: `EXCSAVE1` on the S3 [read
+hal/xtensa-esp32s3/kernel/boot.S:49-56,585-650], `mscratch` on riscv [read
+hal/riscv32-common/kernel/trap.S:50-108], `SP_EL1` on arm64 [read
+hal/arm64/kernel/boot.S:295-311]), then loads the one kernel stack and calls
+`ktrap` [read boot.S:664; trap.S:112]. The new entry, after the save:
 
-### 3.2 What carries across cores unchanged
+1. switch to this core's entry stack; clear this core's `RUNNING_PROCESS`
+   (§2.3);
+2. take the lock, spinning on the entry stack, polling the stop word;
+3. switch to the full stack (`_stack_top`, as today) and call `ktrap`;
+4. `ktrap` returns a frame, or the idle sentinel (§2.2), or the retry
+   sentinel (§2.3);
+5. for a frame: set `RUNNING_PROCESS`, give the lock back, restore the frame,
+   return to user mode.
 
-- **The eight levels, head-and-tail placement, round-robin**: per core, as
-  built.
-- **The section word**: a process is on one core, so "no thread of the
-  process runs but the holder" [read spec.md:4123-4136] stays a statement
-  about one core's scheduler, and `section_keeps`/`section_displaces` [read
-  kernel/core/sched.saw:437-508] read that core's lists.
-- **The inheritance lock**: holder and waiters are one process's threads, so
-  one core's; the raise moves a thread between that core's lists
-  (`ready_move`), and the give-and-wait argument [read PS:673-678] holds
-  because none of the process's user code runs while its core is in the
-  trap.
-- **The latency record**: the claim is stamped on the core that took the line
-  and the stamp at the woken thread's first return to user mode on its own
-  core [read kernel/core/irq.saw:273-284, sched.saw:173-199]. The interval now
-  includes an IPI when the two differ, which is what it should measure. Both
-  ends read one clock: the S3's SYSTIMER unit is one counter, riscv's `mtime`
-  is one register; arm64's virtual counter is architecturally common to all
-  cores, UNVERIFIED under QEMU.
+Step 5 gives the lock back before the restore reads the frame, which is safe
+because nothing but a thread's own core writes a running thread's frame: a
+blocked thread's result is written by its wake, and a running one is never
+blocked [read kernel/core/dispatch.saw:5577-5586]. The full stack is used by
+nothing after `ktrap` returns, so it is empty at every release.
 
-### 3.3 Preemption on wake, across cores
+`resume_after_death` and `start_process` enter user mode through
+`hal.resume_frame` with frames still on the full stack [read
+kernel/core/sched.saw:343-347; kernel/core/process.saw:1540-1542]; those
+frames are abandoned there today, and the next holder starts the full stack
+from its top, so they stay abandoned. The restore path gives the lock back
+in all three ways in.
 
-`ready_push` compares against the **target core's** running thread [read
-kernel/core/threads.saw:385-404 for today's compare]. When the target is this
-core, today's rule. When it is the other core and the thread is above that
-core's running level, or that core is idle, the waker raises the target's
-`NEED_RESCHED` under the lock and sends the target its reschedule IPI. The
-target takes the IPI from user mode (or it ends the idle sleep), enters the
-kernel, waits for the lock if the waker still holds it, and switches at its
-own user-return boundary, where every switch happens. The IPI's service does
-nothing but clear the source: the flag was raised by the sender. An IPI that
-finds the target already in the kernel costs one extra trap at that core's
-return, counted (§8.3).
+At boot core 0 holds the lock from `kmain` on the full stack, which is
+today's boot stack [read boot.S:183,308], until root's first entry. Core 1
+starts on its entry stack, spins for the lock, and gets it at that first
+release.
 
-### 3.4 Kill, start and domain edits across cores
+### 2.2 The idle loop leaves `pick_next`
 
-- **Start.** `ProcessOp.Start` and `ThreadOp.Start` push onto the child's core
-  and may IPI it: §3.3.
-- **Kill.** A kill answers `Ok` "once the teardown is done" [read
-  spec.md:4437-4438]. When a victim's thread is running on the other core in
-  user mode, the killer marks the process doomed, IPIs that core, gives the
-  lock back and spins until that core has left the victim (its
-  `CURRENT_THREAD` names no thread of the process), then takes the lock and
-  tears down as today. The other core leaves at its next entry: the IPI's
-  trap finds its current process doomed and picks another thread. The spin is
-  bounded by one kernel section and an IPI; it polls the stop word.
-- **Faults and exits** happen on the process's own core and stay local.
-- **Domain edits.** On riscv's replay tier, an edit to a process installed on
-  the other core marks that core's installed domain stale and IPIs it, and
-  that core reloads at its user-return (today's `domain_changed` reloads only
-  the running process [read kernel/core/process.saw:809]). arm64's per-ASID
-  flush is already broadcast, `tlbi aside1is` with `dsb ish` [read
-  hal/arm64/kernel/sink.c:219-222]. The S3 is `Flat` and loads no domain.
+Today the idle loop runs deep in `ktrap` → `pick_next` → `take_next` →
+`idle_until_runnable` → `idle_once` [read kernel/core/sched.saw:209-330], and
+`resume_after_death` reaches it too. Under the proposal that wait is a release
+with frames live, so it moves:
 
-### 3.5 Idle and deadlock
+- `take_next` with nothing ready makes the deadlock check (§4) and returns
+  no thread; `pick_next` then marks the core idle and `ktrap` returns the
+  idle sentinel. `resume_after_death` does the same.
+- The entry stub gives the lock back and runs the idle loop on the entry
+  stack: `hal.wait_for_irq()`, then take the lock, switch to the full stack
+  and call `kidle()`: the poll, `drain_deaths`, the deadlock check and
+  `take_next`; it returns a frame or the idle sentinel again.
+- `wait_for_irq` runs without the lock, so it may touch only this core's
+  registers and HAL state. The S3's reads its comparator's raw state and
+  sleeps in `waiti` [read hal/xtensa-esp32s3/kernel/lib.saw:1361-1372]; the
+  interrupt that ends the sleep returns to the poll using no stack [read
+  ABI.md:914-925]. riscv's and arm64's are `wfi`.
 
-**A core idles alone.** A core whose lists are empty gives the lock back and
-sleeps in its HAL's `wait_for_irq`; its tick, its IPI and any line routed to
-it end the sleep, and it takes the lock again to poll and to recheck its
-lists [read kernel/core/sched.saw:321-330, irq.saw idle path]. On the S3 the
-IPI is a level-1 CPU interrupt like every other the kernel enables, so
-`waiti 0` lets it in [read hal/xtensa-esp32s3/ABI.md:903-913].
+### 2.3 No wait for the other core with frames live
 
-**Deadlock is machine-wide.** Today a core that finds nothing runnable and no
-external wake source stops the machine [read kernel/core/sched.saw:291-301].
-Under two cores "nothing runnable here" is not deadlock while the other core
-runs a thread that can wake one. The predicate, read under the lock: every
-core's lists are empty, **no core is running a thread**, and there is no
-bound line or armed Timer. A core that finds its own lists empty but the
-other core running idles; the last core to block makes the check and reports.
-The tick still does not count [read spec.md:4054-4063].
+The waits the design has, each settled:
 
-### 3.6 The tick
+- **A teardown of a process whose thread is running on the other core**
+  (`Kill`, and a doomed process drained by `drain_deaths` [read
+  kernel/core/sched.saw:1413-1497]). Each core publishes `RUNNING_PROCESS`,
+  the process whose user code it is executing: set under the lock just
+  before the release that returns to user mode, cleared by the entry stub
+  after the save, before the spin. A teardown may proceed whenever no core's
+  `RUNNING_PROCESS` names the process. Otherwise:
+  - `drain_deaths` leaves that process doomed and IPIs the core; it is ended
+    at the next drain after that core's entry.
+  - `Kill` must answer `Ok` "once the teardown is done" [read
+    spec.md:4437-4438]. It IPIs the core and answers the retry sentinel,
+    writing nothing. The stub gives the lock back, spins on the entry stack
+    until that core's `RUNNING_PROCESS` no longer names the process (or the
+    stop word is set), takes the lock, and calls `ktrap` again on the same
+    frame with the trap not counted a second time (the `syscalls` column stays
+    exact [read spec.md:2203-2206]). `dispatch` reads its arguments from the
+    frame [read kernel/core/dispatch.saw:5570-5574], so the op decides again
+    from scratch, and finds the target gone if someone else ended it.
+  - **Two cores killing each other's processes do not deadlock:** a core in
+    the retry spin has cleared its `RUNNING_PROCESS`, so the other's kill
+    proceeds; the first core then finds its own thread dead (below).
+- **A core's current thread can die while the core waits for the lock** (a
+  teardown made by the other core after this core cleared `RUNNING_PROCESS`).
+  So every lock acquisition, in `ktrap`, the retry and `kidle`, first asks
+  whether its current thread is still alive, and if not runs
+  `resume_after_death`'s choice instead of the trap. The dead thread's slot
+  is not freed while it is any core's current thread: the teardown leaves it
+  for that core's `PENDING_FREE`, as `exit_thread` already does for its own
+  core [read kernel/core/threads.saw `PENDING_FREE`].
+- **Bring-up:** core 0 waits for core 1's up word while holding the lock;
+  core 1 writes the word before it spins, so nothing deadlocks and nothing is
+  released with frames live.
+- **The stop** waits for an acknowledgement; it is §6's.
 
-Each core has its own tick at `TICK_PERIOD_US`, charging its own running
-thread's slice [read kernel/core/irq.saw:224-245]. Timers stay on core 0's
-comparator (§4.3).
+Nothing else waits for the other core: an IPI is sent, never answered.
 
----
+### 2.4 Preemption points
 
-## 4. Interrupts
+They keep the lock and stay on the full stack: a point polls this core's
+lines through the same delivery [read kernel/core/irq.saw idle and preempt
+paths]; a delivery may wake a thread on the other core, which is an IPI and
+no wait.
 
-### 4.1 The S3's matrix
+### 2.5 The entry stubs, per architecture
 
-Each CPU has its own map register per source: the PRO CPU's at `0x600C_2000 +
-4*source`, the APP CPU's at `+0x800` [read hal/xtensa-esp32s3/ABI.md:760-762];
-the emulator keeps a map per CPU and drives every CPU whose map routes the
-source [read EQ/hw/xtensa/esp32s3_intc.c:27-41]. Each core has its own 32 CPU
-interrupts and its own `INTENABLE`, so the HAL's table of CPU interrupts a
-line may be given (`DEVICE_CPU_INTS`, nine of them [read ABI.md:855-857])
-becomes one table per core.
+- **S3 (call0).** The kernel runs with `PS.WOE` = 0 and the whole register
+  file saved into the frame before `PS` drops `EXCM` [read boot.S:585-660;
+  ABI.md:1258-1300], so changing `a1` raises no window exception and spills
+  nothing: the switch is one `rsr a1, misc0` for the entry stack and today's
+  `l32r a1, .Lkstack` for the full one. The only windowed code the kernel
+  runs is a ROM call through `sos_windowed_call`, before the loader [read
+  ABI.md:1317-1340], which is before core 1 starts, on the boot stack. The
+  user Alloca path runs on the frame, not a stack [read boot.S:545-556].
+  `vec_fatal` loads the kernel stack today [read boot.S:451-457]; it loads
+  this core's entry stack instead, since the other core may hold the full
+  one (§6).
+- **riscv32.** The save uses the frame as `sp` and `mscratch` as the mode
+  witness [read trap.S:50-108]; the entry stack's top is found by `mhartid`
+  in a table, as there is one scratch register. A trap during the spin has
+  the witness at zero and goes to `kernel_fault` [read trap.S:56-62], which
+  needs no stack.
+- **arm64** is later (§11); `TPIDR_EL1` would hold the entry stack.
 
-### 4.2 Which core takes a line, and who decides
+### 2.6 The entry stack's size
 
-**The kernel decides: a line goes to the core of the process whose Waiter it
-is attached to.** It is routed to the binder's core at `InterruptBind` and
-moved, masked, when an attachment to a Waiter is made from another core. The
-driver that will be woken is then on the core that takes the fire, so a
-device interrupt crosses no core in the steady state; a fire before the
-attach marks the Interrupt pending and wakes nobody, wherever it lands. A new
-HAL seam, `irq_route(line, core)`: on the S3, the old core's map register to
-6 and a CPU interrupt from the new core's table; on riscv, the PLIC enable
-bit in the other hart's context; on arm64, the SPI's `ITARGETSR` byte [read
-hal/arm64/kernel/lib.saw:2010,2089].
-
-The move is made masked because the emulator does not lower a CPU interrupt
-when its source is routed away [read ABI.md:803-850]; the S3 HAL's
-quiet-entry take-back already handles that, per core.
-
-### 4.3 The tick and the Timers
-
-**The tick is per core.** One period, `TICK_PERIOD_US`, kernel-wide policy;
-each core keeps its own `NEXT_TICK_NS`, re-arms from now, and charges only its
-own running thread [read kernel/core/irq.saw:193-245]. Core 0's tick is armed
-where it is today, before root's first entry (`start_process`); core 1's in
-`secondary_main`; both only when the image's boot flags ask for a tick. The
-two ticks are not in phase and nothing depends on their phase. While a core
-idles its tick keeps firing [read spec.md:4075-4078].
-
-- **S3:** core 0's tick on SYSTIMER TARGET0 (source 57 [read
-  ABI.md:766-770]), core 1's on TARGET1 (source 58 [read
-  IDF/components/soc/esp32s3/include/soc/interrupts.h:73-75]), each source
-  routed only in its own core's map. That is IDF's own assignment, an OS tick
-  alarm per core and TARGET2 for its `esp_timer` [read
-  IDF/components/esp_hw_support/include/esp_private/systimer.h:14-16;
-  IDF/components/freertos/port_systick.c:93]. One counter, UNIT0, serves
-  both. The emulator models three comparators, each with a source of its own
-  [read EQ/include/hw/timer/esp_systimer.h:56,66; EQ/hw/xtensa/esp32s3.c:740-742].
-- **riscv32:** each hart's own `mtimecmp` in the CLINT's compare array, which
-  the HAL addresses at `0x0200_4000` for hart 0 [read
-  hal/riscv32/kernel/lib.saw:145]; hart 1's at `+8` is the CLINT's layout,
-  UNVERIFIED here.
-- **arm64** (U7): each core's own physical timer.
-
-**Every Timer is served by core 0, in the units built first** (the owner's
-ruling for the first stage). Core 0's comparator carries core 0's tick and
-the whole Timer schedule, exactly today's funnel (`reprogram_timer` [read
-kernel/core/time.saw:455-480]); core 1's comparator carries its tick only. A
-core-1 process that arms or disarms a Timer, or whose wait looks at one,
-reprograms core 0's comparator under the lock: SYSTIMER and the CLINT are
-memory-mapped, so either core can write them. A fire for a core-1 process is
-a cross-core wake (§3.3).
-
-**What that adds to a core-1 process's Timer.** The path from the deadline to
-the core-1 thread back in user mode is:
-
-1. core 0 takes its comparator's interrupt: at once from user mode or idle,
-   but only after its current kernel section if it is in one (the kernel runs
-   masked), so **core 0's longest kernel section** (a child's load, a
-   teardown, a console line) is in front of every core-1 fire;
-2. core 0's trap, the kernel lock (a wait if core 1 holds it), the scan of
-   the Timer slab, the wake and the IPI;
-3. **one IPI**: core 1 takes it from user mode or idle, or after its own
-   current section;
-4. core 1's trap, **a second lock acquisition** (core 0 still holds it until
-   its own return), the switch, the return to user mode.
-
-Against a core-0 process's Timer, steps 3 and 4 and the core-0 load in step 1
-are the extra. The board stage measures exactly that (§10.3, stage S2).
-
-**Per-core Timers are a later unit (U8), designed here so it can be built
-when the radio needs it.**
-
-- **A Timer's core is its owner's, for life.** A Timer records the process
-  that created it and is charged for it, and keeps it until the Timer is
-  invalidated [read kernel/core/time.saw:82-85]; `Clock.TimerCreate` acts on
-  the caller [read kernel/core/dispatch.saw:2346-2397], which is a running
-  thread of a started process, so the owner was placed before the Timer
-  existed, and a placement never changes (§8.1). So **no Timer ever crosses
-  cores.** Its handle can travel (given, or carried in a message), and the
-  Waiter it is attached to can be anywhere; the comparator that serves it
-  never changes. When its owner dies it goes invalid, disarmed and ownerless
-  [read kernel/core/time.saw:46,82-85], and owes no core anything.
-- **Each core's queue** is the Timer slab filtered by owner's core:
-  `earliest_timer_deadline(core)` and `expire_timers(now, core)` are today's
-  scans with one compare added, bounded by the slab as today [read
-  kernel/core/irq.saw expire_timers]. No new list.
-- **Each core's comparator:** `hal.timer_set_deadline_ns(core, at)`, with
-  `PROGRAMMED_NS` per core; `reprogram_timer(core)` is today's funnel over
-  that core's tick and Timers. TARGET1 then serves core 1's tick and its
-  Timers; riscv's hart-1 `mtimecmp` likewise. Either core may program either
-  comparator under the lock (memory-mapped, as above); the interrupt still
-  arrives only on the owner's core, because only its map routes the source.
-  arm64's timers are core-local registers, so there a cross-core program is
-  an IPI (U7).
-- **A Timer attached to a Waiter on the other core** fires on its owner's
-  core; the fire's wake reaches the parked thread through §3.3's IPI. A wait's
-  look at it runs on the waiter's core and counts by the same division; "a
-  period is counted once, whichever saw it first" [read spec.md:1759-1762]
-  holds because both run under the one lock. It is legal and correct, and
-  slower by one IPI; a process that wants its Timer fast creates it itself.
-- **What a radio on core 1 gains:** its Timers fire on core 1 with only core
-  1's own kernel sections in front of them, and a lock wait only if core 0
-  holds the lock at that moment. Step 1's core-0 section, step 3's IPI and
-  step 4's second trap leave the path, and core 0's load stops gating the
-  radio's timing except through the lock. Core 0 also stops scanning core 1's
-  Timers on every fire.
-- **What it needs:** the HAL seam with a core argument, the per-core
-  `PROGRAMMED_NS`, the core filter in the two scans, `has_external_wake_source`
-  unchanged (an armed Timer on any core counts), spec §2.6's "one hardware
-  timer, two customers" [read spec.md:1776-1789] rewritten as "a comparator
-  per core, each with its core's tick and its core's Timers", and the cases
-  `timer_core1` (a core-1 process's Timer fires with core 0 spinning in user
-  mode, tick off on core 0's side of the image) and `timer_cross_attach` (a
-  core-0 Timer on a core-1 Waiter).
-
-### 4.4 The IPIs the S3 offers
-
-`FROM_CPU_INTR0` to `3` are sources 79 to 82 (counted from the source table
-[read IDF/components/soc/esp32s3/include/soc/interrupts.h:17-101]; the same
-count gives UART0 27 and SYSTIMER 57, as probed [read ABI.md:762-770]). Each is
-raised by writing bit 0 of `SYSTEM_CPU_INTR_FROM_CPU_n_REG`, `0x600C_0030 +
-4n`, and lowered by writing 0 [read
-IDF/components/soc/esp32s3/register/soc/system_reg.h:681-708]; they are
-level sources. The emulator wires all four into the matrix from the SYSTEM
-block's model [read EQ/hw/xtensa/esp32s3.c:698-703;
-EQ/hw/xtensa/esp32s3_clk.c:26-42,64-67].
-
-| source | routed in | to | use |
-|---|---|---|---|
-| 79 | PRO map | a level-1 CPU int | reschedule core 0 |
-| 80 | APP map | a level-1 CPU int | reschedule core 1 |
-| 81 | PRO map | CPU int 14, the NMI | stop core 0 |
-| 82 | APP map | CPU int 14, the NMI | stop core 1 |
-
-Routing a source to CPU interrupt 14 took the NMI vector at once [read
-ABI.md:780]. The NMI is level 7 [read core-isa.h:371,417], above
-`PS.INTLEVEL` 15's reach, so a core masked in the kernel, or spinning on the
-lock, still takes it. That the APP CPU takes it at `INTLEVEL` 15 is
-UNVERIFIED: §13's probe checks it and has not run.
-
-**riscv:** each hart's CLINT `msip` word, a machine software interrupt.
-That `wfi` ends on it with only `mie.MSIE` set and `mstatus.MIE` clear is the
-privileged architecture's rule, UNVERIFIED here (§13's probe). No NMI. **arm64:**
-GICv2 SGIs through `GICD_SGIR`, which the HAL already writes [read
-hal/arm64/kernel/lib.saw:2011,2113]; no NMI on GICv2.
+On it run: the lock spin and the retry spin (leaves, no frames worth
+counting), the idle loop with `hal.wait_for_irq` (a few frames of Saw and a
+C leaf), and the first half of a stop (§6: the claim, the signal, the bounded
+wait, the hold, a few frames reading the clock). Nothing nests on it: every
+interrupt is masked there, the S3's idle wake and stop NMI use no stack, and
+a fault there goes to `vec_fatal` or `kernel_fault`, which restart the entry
+stack from its top. **1 KiB per core**, held by U0's paint extended to the
+entry stacks; the worst case is the stop's first half on top of a spin's
+frame, which the restart removes.
 
 ---
 
-## 5. Memory and protection
+## 3. What holds on full SMP
 
-- **PMS.** The S3 profile is `Flat`: the core has no privilege and the kernel
-  does not program the PMS [read ABI.md:660-676]. Nothing per core to load.
-  The PMS's per-core registers matter only to a future isolated S3 tier and
-  were not read.
-- **What a switch on core 1 loads.** What core 0's does: the frame, all 64
-  address registers and `WINDOWBASE`/`WINDOWSTART` through the restore path,
-  `EXCSAVE1` set to the frame [read hal/xtensa-esp32s3/kernel/boot.S:49-56].
-  `CPENABLE` stays 0. What core 1 sets once, at bring-up: `VECBASE` (the
-  same table), `INTENABLE`, and **its kernel stack top in
-  `MISC0`**: the trap entry loads the stack from a literal today [read
-  boot.S:316,456,664], which names one stack; `rsr a1, misc0` names each
-  core's. The S3 has four `MISC` registers [read core-isa.h:83]. riscv keeps
-  it in a second scratch word indexed by `mhartid`, arm64 in `TPIDR_EL1`.
-- **The caches are shared.** The S3 has one instruction cache and one data
-  cache; each core has its own bus into each, opened or shut by
-  `EXTMEM_{I,D}CACHE_SHUT_CORE{0,1}_BUS` [read
-  IDF/components/hal/esp32s3/include/hal/cache_ll.h:559-579]. So there is no
-  coherence to maintain between the cores' views of flash, PSRAM or each
-  other's stores; there is contention. IDF suspends both caches once for a
-  flash operation [read IDF/components/spi_flash/cache_utils.c:365-372].
-- **Core 1's buses.** IDF opens core 1's buses to match core 0's, with the
-  cache disabled around the write [read
-  IDF/components/esp_system/port/cpu_start.c:365-372]. Whether the ROM's direct
-  boot leaves them open is UNVERIFIED; the bring-up copies core 0's mask
-  regardless, from an IRAM routine that freezes both caches around the write
-  with the flash switch's own freeze and unfreeze (§6).
-- **`sos_flash_switch` and its freeze.** It runs once, at boot, from
-  `clock_init` [read kernel/main.saw:26; hal/xtensa-esp32s3/keys/flash-dio80/
-  lib.saw:6-9], before `memory_init` and long before core 1 exists. So its
-  freeze needs nothing from core 1, and the rule that keeps it so is an
-  order: **core 1 starts after `memory_init`, and the switch and the PSRAM
-  bring-up stop the machine if core 1 is out of reset** (a new stop code,
-  checked by reading `SYSTEM_CORE_1_CONTROL_0`). A freeze at run time, which
-  nothing does today (no image writes flash), would need IDF's shape: the
-  other core parked in IRAM with interrupts masked until the operation ends
-  [read IDF/components/spi_flash/cache_utils.c:114-136,150-210]; here every
-  user instruction is in flash, so the park would be a kernel IRAM loop
-  reached by the stop NMI with a resume. Not built.
-- **PSRAM.** Behind the shared data cache; one core per contended word (§2.4).
+Placement on one core is the first stage's policy. The spec says so, and
+says that threads of one process may run at once (§9). Each mechanism, held to
+that:
+
+- **The section word is preemption deferral, never mutual exclusion.** Its
+  rule, "while the depth is nonzero no thread of the process runs but the
+  holder" [read spec.md:4123-4136], becomes: while the depth is nonzero the
+  scheduler does not *start* a sibling in the holder's place; a sibling
+  already running on another core runs on. The spec says data a section
+  covers is protected by a real lock as well. The runtime already does that:
+  its heap windows are `SpinLock` windows inside the section [read
+  rt/common/src/lib.saw:371-387; PS:844-847]. What changes is the comment's
+  claim that no in-process contention is left to spin on, which is true only
+  on one core. `SectionHeld` keeps its meaning.
+- **The inheritance lock, two threads of one process on two cores.** Its
+  no-lost-wake argument today is "the kernel reads `owner` and parks in one
+  trap with interrupts masked" [read PS:673-678], which another core
+  executing the give does not respect: the waiter's core reads `owner` = H;
+  H's core swaps `owner` to 0 and loads `waiters`, still 0; the waiter writes
+  `waiters` and parks, and no one wakes it. It becomes futex-like:
+  - **`LOCK_WAIT_OP`** writes `waiters` nonzero first, fences, then reads
+    `owner`: zero answers `Ok` without parking (step 2's answer, decided
+    later); otherwise it parks naming the holder it read. All of it is under
+    the big lock.
+  - **The give** is a compare-and-swap of `owner` to 0 followed by a load of
+    `waiters`, sequentially consistent (a fence between them where the
+    target's compare-and-swap does not order a later load).
+  - Either the waiter's store comes before the giver's load, so the giver
+    traps to `LOCK_WAKE_OP`, which needs the big lock and so finds the waiter
+    parked; or the giver's load came first, so its swap did too, and the
+    waiter's read finds `owner` changed.
+  - **Step 4's `Running` holder** [read PS:630-634] is today always the
+    caller; on two cores it can be a sibling running elsewhere, and it is
+    raised like a ready one.
+  - `LOCK_WAKE_OP`'s write of `waiters` to zero stays under the big lock, as
+    every kernel write of it is; only the user's load races.
+- **The runtime and drivers.** Code written for one core, found by reading
+  for the assumption:
+  - `drivers/pktring`: "the kernel is uniprocessor and every shared access is
+    volatile, so the peer sees the stores in program order" [read
+    drivers/pktring/src/lib.saw:42-45]. Two processes on two cores share a
+    ring even in this stage, so the head and tail advances become release
+    stores and their reads acquire loads.
+  - `kernel/sysapi/src/floor.saw`'s `SYSTEM_HANDLE` rests on "spec §7's
+    uniprocessor argument" [read kernel/sysapi/src/floor.saw:1530-1533]; it
+    is written before any second thread exists, and the kernel lock orders
+    that write before the new thread runs on either core. The comment
+    changes.
+  - `rt/common_c/support.c`'s plain atomics serve only targets with no atomic
+    instruction and say SMP voids them [read rt/common_c/support.c:7-11,
+    21-28]; no two-core board uses them.
+  - The audit is U4 (§10): every comment in `rt/`, `drivers/` and the kernel
+    that argues from one core.
+- **The kernel** keeps a thread's core in its slot, set from its process at
+  its start, and the ready lists key on the thread's core, not the process's,
+  so thread placement later changes the setter and nothing else.
 
 ---
 
-## 6. Bring-up
+## 4. The scheduler
 
-### 6.1 Order
+- **Per-core lists**: today's eight lists and bitmap, one set per core;
+  `ready_push`, `ready_pop`, `ready_remove`, `ready_rotate` and
+  `ready_remove_process` take the thread's core [read
+  kernel/core/threads.saw:385-540]. Strict priority holds per core.
+- **Preemption on wake** compares against the target core's running thread
+  [read kernel/core/threads.saw:385-404]. For the other core, when the thread
+  is above that core's running level or the core is idle, the waker raises
+  that core's `NEED_RESCHED` and sends its IPI; the core switches at its own
+  user-return. The IPI's service only clears it.
+- **The tick is per core**: one period [read kernel/core/threads.saw:327], each
+  core's own `NEXT_TICK_NS`, charging only its own running thread [read
+  kernel/core/irq.saw:224-245]. Core 0's is armed before root's first entry
+  as today, core 1's when it first enters its scheduler, both only when the
+  image asks for a tick.
+- **Idle per core** (§2.2). **Deadlock is machine-wide**: every core's lists
+  empty, no core running a thread, no bound line and no armed Timer [read
+  kernel/core/sched.saw:291-301 for today's one-core form; spec.md:4054-4063].
+- **Kill and doom across cores**: §2.3.
+- **Domain edits** on riscv's replay tier: an edit to a process installed on
+  the other core marks that core's domain stale and IPIs it [read
+  kernel/core/process.saw:809].
+- **The latency record** carries across: the claim is stamped where the line
+  is taken, the stamp at the woken thread's return to user mode on its own
+  core [read kernel/core/irq.saw:273-284; kernel/core/sched.saw:173-199]; one
+  clock serves both (SYSTIMER's UNIT0, riscv's `mtime`).
 
-`kmain`: `clock_init` (the flash switch inside), the banner, `memory_init`,
-`intc_init`, **`start_cores`**, `load_root_and_enter` [read
-kernel/main.saw:22-52]. Core 1 is up before root runs, so a child placed on
-it can start; it prints `SOS: core 1 up` before the handover, a boot line.
+---
 
-### 6.2 The S3
+## 5. Interrupts, Timers and the IPI
 
-Core 0, from IRAM with both caches frozen by the flash switch's freeze and
-unfreeze: open core 1's cache buses to core 0's mask. Then, in IDF's order [read
+- **Every device line and every Timer is core 0's.** Lines are routed in the
+  PRO map only, as today; a fire for a driver on core 1 is a cross-core wake.
+  Core 0's comparator (SYSTIMER TARGET0, source 57 [read ABI.md:766-770];
+  riscv hart 0's `mtimecmp` [read hal/riscv32/kernel/lib.saw:145]) carries
+  core 0's tick and the whole Timer schedule, today's funnel [read
+  kernel/core/time.saw:455-480]. A core-1 process arming a Timer reprograms
+  it under the lock (SYSTIMER and the CLINT are memory-mapped).
+- **Core 1's tick**: SYSTIMER TARGET1 (source 58 [read
+  IDF/components/soc/esp32s3/include/soc/interrupts.h:73-75]), IDF's own
+  per-core tick alarm [read IDF/components/esp_hw_support/include/
+  esp_private/systimer.h:14-16]; the emulator models three comparators [read
+  EQ/include/hw/timer/esp_systimer.h:56,66; EQ/hw/xtensa/esp32s3.c:740-742].
+  riscv hart 1's `mtimecmp` at `+8`, UNVERIFIED.
+- **The S3's IPIs** are `FROM_CPU_INTR0..3`, sources 79 to 82 (counted from
+  [read IDF/components/soc/esp32s3/include/soc/interrupts.h:17-101], which
+  gives UART0 27 and SYSTIMER 57 as probed), raised and lowered by bit 0 of
+  `0x600C_0030 + 4n` [read IDF/components/soc/esp32s3/register/soc/
+  system_reg.h:681-708], wired in the emulator [read EQ/hw/xtensa/
+  esp32s3.c:698-703]. 79 and 80, in the PRO and APP maps (the APP map is at
+  `+0x800` [read ABI.md:760-762]), at a level-1 CPU interrupt, reschedule
+  core 0 and core 1; 81 and 82 at CPU interrupt 14, the NMI, stop them.
+  Routing a source to 14 took the NMI vector at once [read ABI.md:780]; that
+  the APP CPU takes it at `INTLEVEL` 15 is UNVERIFIED (§12's probe).
+- **riscv**: each hart's CLINT `msip`; no NMI.
+
+---
+
+## 6. The panic stop
+
+Every machine stop (`fatal`, `fatal_kernel`, `fatal_deadlock`, `fatal_image`
+[read kernel/core/diag.saw:150-206], a kernel panic, root's end and kill, the
+S3's `kernel_fault` [read hal/xtensa-esp32s3/kernel/sink.c:207-211]) stops
+the other core before it prints or takes a device back; SO-165's console
+reclaim comes after [read .leadwork/SO-165/design.md:446-450].
+
+1. **Claim** the stop word by compare-and-swap; a loser acknowledges and
+   parks.
+2. **Signal**: on the S3 the other core's NMI. Its vector, `vec_fatal` today
+   [read boot.S:425-427], writes the acknowledgement with `EPC7`, the stopped
+   core's PC, and loops, using no stack. On riscv the reschedule IPI with the
+   stop word set; the target acknowledges at its next entry, idle poll,
+   preemption point or spin.
+3. **Wait**, bounded by the clock (one millisecond).
+4. **Hold**, on the S3: the RTC software stall [read
+   IDF/components/hal/esp32s3/include/hal/cpu_utility_ll.h:29-48], as IDF's
+   panic does [read IDF/components/esp_system/port/panic_handler.c:181-189];
+   a core 1 that did not acknowledge is also held in reset (`RESETING`, and
+   the `SW_APPCPU_RST` pulse [read IDF/components/soc/esp32s3/register/soc/
+   rtc_cntl_reg.h:137-139]). The emulator's stall is a no-op [read
+   EQ/hw/xtensa/esp32s3.c:226-228]; its `SW_APPCPU_RST` resets core 1 to the
+   ROM [read EQ/hw/misc/esp32s3_rtc_cntl.c:91-94].
+5. **Print**, on the full stack.
+
+**With the shared stack.** A core that stops while holding the lock is on the
+full stack already and keeps it. One that stops without it (a fault in its
+spin or idle, a stop raised there) runs steps 1 to 4 on its entry stack, then
+takes the full stack from its top, abandoning whatever frames the stopped
+core had there. **What the stop may read** after that: its own registers and
+its own thread's frame; the stop and acknowledgement words, the stopped
+core's PC among them; and the constants of its line. Not the kernel's slabs
+or lists, which the stopped core may have left mid-update, and not the
+abandoned frames. Every stop line already prints only its own cause and
+registers [read kernel/core/diag.saw:150-206].
+
+---
+
+## 7. Bring-up
+
+**Order in `kmain`**: `clock_init` (the flash switch inside), the banner,
+`memory_init`, `intc_init`, **`start_cores`**, `load_root_and_enter` [read
+kernel/main.saw:22-52]. Core 1 starts after the flash switch and the PSRAM
+bring-up, so the switch's cache freeze needs nothing from it; the switch and
+the PSRAM bring-up stop the machine if core 1 is out of reset.
+
+**The S3**, core 0, in IDF's order [read
 IDF/components/esp_system/port/cpu_start.c:293,307-311,322]:
 
-1. clear any software stall of core 1 [read
-   IDF/components/hal/esp32s3/include/hal/cpu_utility_ll.h:50-65];
-2. `SYSTEM_CORE_1_CONTROL_0` (`0x600C_0000`): set `CLKGATE_EN` (bit 1),
-   clear `RUNSTALL` (bit 0), set then clear `RESETING` (bit 2) [read
-   system_reg.h:15-30]; on silicon core 1 leaves reset held in reset with its
-   clock gated [read ABI.md:1841-1845], and the part's clock-gate bit does
-   not hold the core by itself (`SOC_APPCPU_HAS_CLOCK_GATING_BUG` [read
-   IDF/components/soc/esp32s3/include/soc/soc_caps.h:91; cpu_start.c:637-642]);
-3. write the entry to `SYSTEM_CORE_1_CONTROL_1` (`0x600C_0004`). The ROM's
-   `main`, on `PRID` 0xABAB, polls that word and `callx8`s it [read ROM ELF
-   0x4004_3A2F-0x4004_3A43; ABI.md:246-249], and `ets_set_appcpu_boot_addr`
-   is one store to it [read ROM ELF 0x4004_3664-0x4004_366F]. The ROM's reset
-   handler also takes a word with bit 31 set as a `call0` entry before it sets
-   `VECBASE` or `ATOMCTL` [read ROM ELF 0x4000_045A-0x4000_0472]; an IRAM
-   address has bit 31 clear, so the kernel takes the `main` path. The
-   emulator's SYSTEM model keeps exactly that one word and nothing of
+1. core 1's cache buses opened to core 0's mask, from IRAM with both caches
+   frozen by the flash switch's freeze [read
+   IDF/components/hal/esp32s3/include/hal/cache_ll.h:559-579;
+   cpu_start.c:365-372]: the two cores share one instruction and one data
+   cache, each through its own bus;
+2. core 1 unstalled; `SYSTEM_CORE_1_CONTROL_0`: `CLKGATE_EN` set, `RUNSTALL`
+   cleared, `RESETING` set then cleared [read system_reg.h:15-30], which on
+   this part is what releases the core (`SOC_APPCPU_HAS_CLOCK_GATING_BUG`
+   [read IDF/components/soc/esp32s3/include/soc/soc_caps.h:91]);
+3. the entry written to `0x600C_0004`: the ROM's `main` on `PRID` 0xABAB
+   polls it and `callx8`s it [read ROM 0x4004_3A2F-0x4004_3A43; ABI.md:246-249],
+   and `ets_set_appcpu_boot_addr` is one store to it [read ROM
+   0x4004_3664-0x4004_366F]; the emulator keeps that word and nothing of
    `CONTROL_0` [read EQ/hw/xtensa/esp32s3_clk.c:55-57,88-90];
-4. wait, bounded by the clock, for core 1's up word; none is a boot stop,
-   `SOS: core 1 did not start`, with core 1 put back in reset.
+4. a bounded wait for core 1's up word; none stops the boot, `SOS: core 1
+   did not start`.
 
-Core 1's entry, `sos_core1_entry` in `boot.S`'s IRAM section, entered by the
-ROM's `callx8` with a windowed PS as core 0's handover is [read
-ABI.md:182-206]: PS = `0x0F` first, then `WINDOWSTART`/`WINDOWBASE` (core 0's
-own sequence [read ABI.md:221-224]); `VECBASE`; `MISC0` and
-`a1` to core 1's stack; `INTENABLE` 0; every APP map register to 6, as IDF
-clears its APP matrix [read cpu_start.c:250-251]; the entry word cleared, so
-a later reset leaves the ROM polling rather than re-entering (the emulator's
-reset returns core 1 to the ROM [read EQ/hw/misc/esp32s3_rtc_cntl.c:91-94;
-EQ/hw/xtensa/esp32s3.c:218-222]). Then it calls `kcore`'s
-`secondary_main(1)`.
+**Core 1's entry**, in IRAM: PS `0x0F`, then `WINDOWSTART` and `WINDOWBASE`
+as core 0's `_start` [read ABI.md:221-224]; `VECBASE` to the one table;
+`MISC0` and `a1` to its entry stack; `INTENABLE` 0; every APP map register
+to 6; the entry word cleared, so a reset leaves it in the ROM's loop; then
+`secondary_main(1)`: its IPI and tick sources, the up word, the spin for
+the lock, its tick, and idle. It prints `SOS: core 1 up`, a boot line.
 
-### 6.3 What core 1 does before the scheduler takes it
-
-`secondary_main`: its HAL half (`intc_init_core`: its reschedule and stop
-sources, its tick source), its per-core state, the up word, then
-`kernel_enter`, its tick armed if the image's tick is, and the idle loop.
-It has no thread until a launcher places one; idle on its own lists, it is
-not a deadlock while core 0 runs (§3.5).
-
-### 6.4 riscv32 and arm64
-
-- **riscv32 `virt`**, `-bios none`: every hart enters the ELF entry,
-  UNVERIFIED (§13's probe). `_start` reads `mhartid`; a hart other than 0 enables only `MSIE`,
-  parks in `wfi` until core 0's release word, then takes its own stack and
-  calls `secondary_main`.
-- **arm64 `virt`**: secondary cores start powered off and are started by PSCI
-  `CPU_ON`, which QEMU provides when it boots a kernel directly; UNVERIFIED for
-  this boot path (the HAL stops through semihosting, not PSCI [read
-  hal/arm64/kernel/lib.saw:327-329]). Its unit is later (U7).
-
----
-
-## 7. Panic
-
-**Every machine stop stops the other core before it prints or takes a device
-back.** The stops are `fatal`, `fatal_kernel`, `fatal_deadlock`,
-`fatal_image` [read kernel/core/diag.saw:150-206], a kernel panic, root's end
-and kill, and the HALs' C stops (the S3's `kernel_fault` [read
-hal/xtensa-esp32s3/kernel/sink.c:207-211]). SO-165's `console_reclaim` runs
-after this, not before [read .leadwork/SO-165/design.md:446-450,1046-1048].
-The stop never takes the kernel lock: the core being stopped may hold it.
-
-1. **Claim.** Compare-and-swap the stop word (kernel DRAM) from 0 to this
-   core plus one. A core that loses is the one being stopped: it writes
-   its acknowledgement and parks, masked.
-2. **Signal.** Raise the other core's stop source. On the S3 that is the NMI
-   (§4.4), which neither `INTLEVEL` 15 nor a spin masks. The NMI vector, today
-   `vec_fatal` [read boot.S:425-427], becomes: if the stop word names another core
-   than this one, write this core's acknowledgement, `memw`, and loop; otherwise fatal
-   as today. It is a few IRAM instructions touching no kernel state. On
-   riscv and arm64, which have no NMI here, the signal is the reschedule IPI
-   with the stop word set, and the acknowledgement is made at the target's
-   next trap entry, idle poll, preemption point or lock-spin iteration, all
-   of which read the stop word; every kernel section is bounded, so only a
-   kernel loop bug misses it.
-3. **Wait** for the acknowledgement, bounded by the clock
-   (`STOP_ACK_NS`, one millisecond), not a loop count, because the clock key
-   changes the CPU's speed.
-4. **Hold.** On the S3 the stopped core is also stalled by the RTC software
-   stall, which needs no cooperation: `0x86` split across
-   `RTC_CNTL_OPTIONS0` and `RTC_CNTL_SW_CPU_STALL` [read
-   cpu_utility_ll.h:29-48; rtc_cntl_reg.h:150-153,2175-2184], what IDF's panic
-   does to every other core [read
-   IDF/components/esp_system/port/panic_handler.c:181-189]. A core 1 that did
-   not acknowledge is held in reset as well (`RESETING` set, and the
-   write-only `SW_APPCPU_RST` pulse [read rtc_cntl_reg.h:137-139]); a core 0
-   that did not can only be stalled, since resetting the PRO CPU restarts the
-   chip. On the emulator the stall is a no-op [read
-   EQ/hw/xtensa/esp32s3.c:226-228] and `CONTROL_0` is not modelled, while
-   `SW_APPCPU_RST` does reset core 1 back to the ROM [read
-   EQ/hw/misc/esp32s3_rtc_cntl.c:91-94], where the cleared entry word keeps
-   it. On riscv and arm64 under QEMU there is no per-core hold.
-5. **Print.** Reclaim the console and write the stop's line; a core that did
-   not acknowledge adds `SOS: core N did not stop`.
-
-Two cores stopping at once are ordered by step 1. An acknowledged core is
-stalled rather than reset so a debugger can still read it (the owner's
-ruling).
+**riscv32 `virt`**, `-bios none`: every hart enters the ELF entry (UNVERIFIED,
+§12); a hart other than 0 parks in `wfi` with only `MSIE` set until core 0's
+release, then `secondary_main`.
 
 ---
 
 ## 8. The API and the image
 
-### 8.1 A process asks; its launcher grants
-
-- **`ProcessOp.Core(core, cores)`**, between the create and the start, on
-  `ProcessRight.BandMap`: placement is the same authority as priority, how
-  and where a launcher's child runs, and a new right bit buys nothing (the
-  owner's ruling).
-  `core` is where the child's threads run; `cores` is the set the child may
-  in turn grant, which must hold `core`. The last call wins. Answers, in
-  order: no right is `AccessDenied`; a child that is not `Created` is the
-  `BadState` fault; a core the board does not have, a `cores` without
-  `core`, or a set not inside the caller's own is the `BadArg` fault and sets
-  nothing. Unset, a child runs on its launcher's core and may grant only it.
-  Root runs on core 0 and may grant every core.
-- **No per-thread core.** `ThreadOp.Start` keeps its band only.
+- **`ProcessOp.Core(core)`**, between the create and the start, on
+  `ProcessRight.BandMap`. Answers in order: no right is `AccessDenied`; a
+  child not `Created` is the `BadState` fault; a core the board does not have
+  is the `BadArg` fault. The last call wins; unset, the launcher's core. No
+  per-thread core in this stage.
 - **`CORE_OP`**, a no-handle op as `THREAD_ID_OP` is [read PS:603-606],
-  answers the caller's core. It grants nothing, the launcher chose it, and a
-  program needs it for per-core data and the tests need it to observe
-  placement.
-
-### 8.2 The declaration and the builder
-
-- `board.toml` gains `cores` (2 on both S3 boards, 1 on the C3 and the flat
-  profile, 2 on riscv32, 1 on arm64 until U7), held to the HAL's `CORES`
-  constant by `sosimage board` as the other numbers are [CLAUDE.md, "`sosimage
-  board` holds a board file ... to the HAL's numbers"].
-- `process.toml` gains `core = N` (absent: the launcher's core, which for a
-  stock-root child is core 0). The builder refuses a
-  core the board does not have, naming the board's `cores`, in `check-tree`
-  too. A child that launches and places children declares `cores = [...]`.
-  An image description has no key that overrides either, as for `bands`
-  [read PS:907-920].
-- `bootplan.Child` gains `core` and `cores`; the stock root calls
-  `child.core(...)` after `band_map`, before `restrict`, and stops on a
-  refusal as every step does (`root: core NAME: STATUS`) [read PS:943-951].
-- The rights table gains nothing.
-
-### 8.3 What `Stats` reports per core
-
-The process record is unchanged: its `interrupts` column is still charged to
-the process current at trap entry, on whichever core trapped [read
-spec.md:2212-2219]. The stats region gains a block after the process rows, a
-row per core, its header's version moving:
-
-| column | moves with | asserted |
-|---|---|---|
-| `interrupts` taken through `ktrap` on this core | the host | never |
-| `ipis` received | the program, in a case built so each wake IPIs | yes, as a lower bound only |
-| `lock_waits`, entries that found the lock held | the host | never |
-| `lock_wait_worst`, in this core's cycles | the host | never |
-| `lock_hold_worst`, in this core's cycles, and `lock_hold_what`, what held it then | the host | never |
-| `idle_sleeps` | the host | never |
-
-The cycle columns are this core's own counter (`CCOUNT`, `mcycle`), read
-twice per kernel entry; a reader turns them into time with the CPU clock.
-They exist for board stage S1 (§10.3) and are always kept, since two counter
-reads per entry cost less than a build key would.
-
-`ProcessOp.Stats` stays per process; the core rows are read through the
-region, which a `top` already maps.
+  answers the core the caller is running on at that trap. It grants nothing;
+  under later thread placement it stays true for the moment it answers.
+- **The builder**: `board.toml` `cores` (2 on both S3 boards and riscv32, 1
+  on riscv32-flat, arm64 and the C3), held to the HAL's `CORES`;
+  `process.toml` `core = N`, refused past the board's `cores`;
+  `bootplan.Child.core`; the stock root's `child.core(...)` after
+  `band_map` [read PS:943-951].
 
 ---
 
-## 9. The other profiles
+## 9. Spec text that changes
 
-Decided (the owner's ruling):
-
-- **riscv32 runs every gate case on two harts** (`-smp 2`). Every existing case
-  places nothing, so its processes run on core 0 and its transcript does not
-  change; the second hart idles, and every case then also checks the
-  machine-wide deadlock predicate and that a silent core 1 stays silent. The
-  SMP cases run here too. Whether this QEMU runs the two harts on two host
-  threads (multi-threaded TCG) by default is UNVERIFIED; the profile passes
-  `-accel tcg,thread=multi` so races are real ones.
-- **riscv32-flat stays one hart**, `cores = 1`. It keeps a one-core kernel
-  build on the gate, so a `CORES = 1` regression is caught, and the flat
-  profile's exclusions are about the tier, not the core count.
-- **arm64 stays one core**; its SMP is later, U7 (PSCI, SGIs, GIC routing).
-- **The ESP32-S3 smoke** runs the SMP cases on the emulator with two cores
-  (the machine always has two [read EQ/hw/xtensa/esp32s3.c:956-957]).
-  Whether Espressif's Xtensa emulator runs its two CPUs on two host threads
-  is UNVERIFIED; if not, it shows the protocol and not the races.
-- **The C3** is single-core; `cores = 1`.
+- §7: "Uniprocessor kernel in v1" [read spec.md:4206-4208] becomes the
+  model: one kernel, a lock, per-core lists, tick and idle, the IPI, the
+  machine-wide deadlock; **placement is a launcher's policy, and threads of
+  one process may run at once**; nothing above relies on them not.
+- §7's section word: preemption deferral, not mutual exclusion; data it
+  covers is under a real lock too (§3).
+- §7's inheritance lock: the wait's order and the give's ordering (§3).
+- §8: kill and doom across cores (§2.3). §9: the IPI and the stop. §9b: the
+  lock. §2.6: core 0's comparator carries every Timer, each core its tick.
+  §2.7: `ProcessOp.Core`, `CORE_OP`. §11: the later list. §12: root's core
+  and the plan's step.
+- CLAUDE.md: riscv32's two harts, and the cross-core construction rule
+  (§10.1).
 
 ---
 
-## 10. Tests
+## 10. Gate, tests and units
 
-### 10.1 Construction
+**The gate.** riscv32 runs every case on two harts (`-smp 2`,
+`-accel tcg,thread=multi`; whether multi-threaded TCG is this QEMU's default
+is UNVERIFIED). Existing cases place nothing, so their transcripts do not
+change. riscv32-flat stays on one hart, keeping a one-core build on the gate.
+The S3 smoke runs the SMP cases with the emulator's two CPUs [read
+EQ/hw/xtensa/esp32s3.c:956-957].
 
-Each cross-core ordering is made true by waiting on what the other side does:
-a word in a shared Memory the other core writes, an Event, a death. No case
-reads the clock to order cores. Spinners run with the image's tick off, so on
-one core a case that needs both to progress cannot pass (it times out),
-which is what makes "both ran at once" a construction and not a timing.
-
-### 10.2 Cases on riscv32 and the S3 smoke
+**10.1 Construction.** A cross-core ordering is made true by waiting on what
+the other side does (a word in a shared Memory, an Event, a death), never by
+the clock; spinners run with the tick off, so on one core a case that needs
+both to progress times out.
 
 | case | shows |
 |---|---|
-| `smp_up` | `SOS: core 1 up` at boot, before the handover |
-| `core_place` | children placed on 0 and 1 read their core with `CORE_OP`; a child placed with no call reads its launcher's |
-| `core_refused` | each `ProcessOp.Core` refusal, in order; a started child's is `BadState` |
-| `core_parallel` | two children on two cores, tick off, each spins until it sees the other's counter move: both progress or the case times out |
-| `core_wake_preempt` | a core-1 child's spinner at `Normal`, tick off; root signals an Event a `High` thread of that child waits on; the waiter runs (it writes a word root waits for) though the spinner never traps: the IPI preempts |
-| `core_wake_idle` | core 1 idle; root's signal wakes a core-1 waiter |
-| `core_timer` | a core-1 child arms a one-shot Timer and waits on it while root, on core 0, spins in user mode until the child's word says it woke: core 0's comparator fires, its wake IPIs core 1 |
-| `core_tick` | two children on core 1 at one level, each spinning until the other has printed, with the image's tick on: core 1's own tick takes the processor between them (the `thread_preempt` shape on core 1) |
-| `core_pipe_call` | a client on core 0 calls a server on core 1 and back; core 1's `ipis` at least one |
-| `core_kill_running` | root kills a core-1 child spinning in user mode, tick off: `Ok`, status `Killed`, the eviction path |
-| `core_deadlock` | both cores' threads block, nothing bound or armed: one deadlock line |
-| `core_not_deadlock` | core 0's threads all block while core 1 spins and then signals: no deadlock |
-| `core_irq_route` | a driver on core 1 attaches its line; the fire is delivered on core 1 (`CORE_OP` in the driver, the line's latency record counts it) |
-| `core_section`, `core_lock` | SO-148's section and lock cases with the child placed on core 1, transcripts unchanged |
-| `core_stop` | a harness kernel stops the machine from core 0 with core 1 spinning masked in the kernel, and prints the acknowledgement it read before the stop's line |
-| `core_stop_unanswered` | the same with core 1's stop source unrouted (a harness seam): `SOS: core 1 did not stop`, then the line |
-| `core_lock_churn` | both cores hammer shared objects (Event ping-pong, pipe calls, create-and-kill churn) a fixed number of rounds; every count exact |
+| `smp_up` | `SOS: core 1 up`, before the handover |
+| `core_place` | children placed on 0 and 1 read their core with `CORE_OP`; an unplaced one reads its launcher's |
+| `core_refused` | `ProcessOp.Core`'s refusals in order |
+| `core_parallel` | two children on two cores, tick off, each spins until the other's counter moves |
+| `core_wake` | a core-1 child's `High` thread, parked on an Event, preempts its own `Normal` spinner when root signals: the IPI; and the same with core 1 idle |
+| `core_timer` | a core-1 child's Timer fires through core 0's comparator and wakes it |
+| `core_kill` | root kills a core-1 child spinning in user mode: `Ok`, `Killed` (the retry); and two children on two cores killing each other's siblings: both kills answer, nothing deadlocks |
+| `core_deadlock`, `core_not_deadlock` | one deadlock line when both cores block; none while core 1 still runs |
+| `core_stop` | a harness kernel stops from core 0 with core 1 spinning masked, and from core 1 without the lock; the acknowledgement and the line |
+| `core_lock_churn` | both cores hammer shared objects for a fixed count; every count exact (a net for a missing lock, never a flaky pass) |
+| `core_section`, `core_lock`, `pktring` | SO-148's section and lock cases and a ring between processes on two cores |
 
-`core_lock_churn` never fails on correct code; a removed `kernel_enter` on
-one path fails it only when the race lands, so it is a net, not a proof.
-`ipis` is asserted as a lower bound only, since an IPI that finds its core
-already in the kernel still counts.
+**Board stages** (U3): core 1 comes up (its handover state, its cache buses,
+a core-1 process in place from flash); the stop holds it (a word core 1
+increments stays put after the stall and after the reset hold).
 
-### 10.3 Only the board: the stages
-
-What the emulator cannot show is shown by board stages, run on the reviewer's
-board under the standing approval, each a stage image whose lines are printed
-and read, never asserted by the gate. They land with U5.
-
-**S0, core 1 comes up.** `SOS: core 1 up`; core 1's `PRID`, `PS` and window
-state at its entry; its cache buses equal to core 0's; a core-1 process
-running its code in place from flash. Shows IDF's start sequence on this
-part, the clock-gating bug included.
-
-**S1, the kernel lock.** The kernel counts, per core, in cycles of that core's
-own counter (`CCOUNT`; a SYSTIMER read costs too much to take on every
-entry [read hal/xtensa-esp32s3/ABI.md:722-734]):
-
-- every acquisition that found the lock held, and the cycles it waited:
-  count, worst, and a histogram in powers of two;
-- the cycles each holding lasted, worst, and **what held it at the worst**:
-  the syscall's object kind and op, the interrupt line, the idle poll, or a
-  teardown.
-
-They are the per-core stats rows' diagnostic columns (§8.3), which the stage
-reads through the stats region. The stage image puts a probe process on core
-1 at `Rt0` that round-trips the kernel as fast as it can (two of its threads
-ping-pong an Event) and records each round's cycles, and drives core 0
-through phases of about a second each: idle; a thread spinning in user mode;
-pipe calls with a server of its own; `process_create` and `kill` of a child
-with the largest image the board holds (the loader's copy and the teardown);
-long debug-print lines. Per phase it prints core 1's lock waits (count,
-worst, histogram), core 0's worst hold and what held it, and core 1's worst
-round. At `pll80` and `pll240`.
-
-**The shape that would justify splitting the lock:** all three of
-
-1. core 1's worst wait in a steady phase (pipe calls, not only create and
-   kill) is a large part of the radio's latency budget (Q1);
-2. the holds behind it are core-0 work that touches nothing core 1 needs: a
-   core-0 process's load, teardown or print;
-3. the histogram's tail is populated, not one outlier.
-
-Waits large only in the create-and-kill phase justify something smaller: the
-lock given back around the loader's bulk copy, whose child no other core can
-reach yet. Rounds slow while waits stay small say cache contention (both
-cores fetching through the one cache), which no lock split helps; that points
-at placement and at what runs from IRAM.
-
-**S2, a core-1 process's Timer, served by core 0.** A probe process on core 1
-and one on core 0 each arm a 1 ms periodic Timer and, at each wake, read the
-Monotonic clock and record the lateness against the deadline they computed.
-The same phases on core 0 as S1. Per phase, each prints its worst lateness and
-a histogram. The difference between the two is §4.3's path: core 0's section
-at the deadline, the IPI, the second trap and lock acquisition. It is the
-number U8 (per-core Timers) would remove.
-
-**S3, the stop.** A stage kernel stops the machine from core 0 while core 1
-spins (a) in user mode and (b) masked in the kernel, incrementing a word in
-SRAM; after the stall, core 0 reads the word twice a millisecond apart and
-prints both (unchanged if the stall holds). The same with core 1's stop
-source left unrouted: no acknowledgement, the reset hold, `SOS: core 1 did
-not stop`, the word unchanged.
-
-**S4, atomics across the cores.** Both cores increment one SRAM word with
-`s32c1i` and one with a plain add, as P8 does on one core [read
-hal/xtensa-esp32s3/ABI.md:4500-4520]: every count exact against the lost
-counts of the control.
-
-## 11. Units
+**Units.**
 
 ```
-U0  S  Sonnet  The kernel stack's depth: paint the stack at boot, a harness
-               kernel reports the deepest word after the suite's heaviest
-               paths, per profile; KERNEL_STACK_SIZE set from it. First,
-               independent; it decides whether a second S3 stack fits.
-U1  L  Opus    Per-core state and the kernel lock with CORES = 1 everywhere:
-               hal.core_id() and hal.CORES, the per-core arrays, the ticket
-               lock and kernel_enter/kernel_leave, the stop word and
-               stop_machine's one-core form; IntrSpinLock's growth; spec §7,
-               §9b, §11. No transcript changes. After SO-148 U3 and U5.
-U2  L  Opus    riscv32 on two harts: the parked hart and its release, the
-               CLINT IPI, a tick per hart, PLIC routing, cross-core wake,
-               kill and domain reload, the machine-wide deadlock, the
-               poll-based stop, ProcessOp.Core, CORE_OP, the floor and
-               sysapi; core 0 serving every Timer, hart 1's comparator its
-               tick only; the riscv32 profile at -smp 2; §10's cases; spec
-               §2.6, §2.7, §7, §8, §9, §12. After U1.
-U3  S  Sonnet  The builder and the stock root: board `cores`, `core` and
-               `cores` in process.toml and their refusals, bootplan,
-               root's step. After U2's op, beside U4.
-U4  S  Sonnet  The per-core stats rows, the lock's cycle columns among
-               them. After U2.
-U5  L  Opus    The S3: core 1's entry and stack (MISC0), its cache buses in
-               the frozen window, IDF's start sequence, per-core HAL state,
-               the FROM_CPU IPIs, TARGET1 for core 1's tick, irq_route, the
-               NMI stop, stall and reset hold, the switch and PSRAM guards;
-               the smoke's cases; ABI.md's second-core section rewritten;
-               board stages S0 to S4 (§10.3). After U0 and U2.
-U6  S  Sonnet  SO-165's console reclaim placed after the stop, if it lands
-               first; otherwise SO-165 lands on top of U1's stop.
-U7  M  Opus    Later: arm64 on two cores (PSCI CPU_ON, SGIs, ITARGETSR).
-U8  M  Opus    Later, when the radio's timing asks for it (stage S2):
-               per-core Timers (§4.3): the comparator seam with a core, the
-               per-core PROGRAMMED_NS, the core filter in the two scans,
-               spec §2.6's comparator paragraph, `timer_core1` and
-               `timer_cross_attach`; S2 again to show the path gone. After
-               U5.
+U0  S  Sonnet  The full kernel stack's depth: paint at boot, report the
+               deepest word after the heaviest paths, per profile; the
+               entry stacks painted too. First, independent.
+U1  L  Opus    The lock, the shared stack and entry stacks, per-core state
+               with CORES = 1 on every board: the stubs, the idle loop out
+               of pick_next, RUNNING_PROCESS, the dead-current check, the
+               retry, the stop word; spec §7, §9b. No transcript changes.
+               After SO-148's lock and runtime-locks units.
+U2  L  Opus    riscv32 on two harts: release, msip IPI, per-hart tick, the
+               machine-wide deadlock, kill and doom across cores, the
+               riscv stop, ProcessOp.Core, CORE_OP, the builder's `core`
+               and the stock root's step; §10's cases; spec §2.6, §2.7, §8,
+               §9, §12. After U1.
+U3  L  Opus    The S3: core 1's start, entry and entry stack, the FROM_CPU
+               IPIs, TARGET1, the NMI stop, stall and reset hold, the switch
+               and PSRAM guards; the smoke's cases; ABI.md's second-core
+               section; the two board stages. After U0 and U2.
+U4  M  Opus    Full-SMP soundness: the section's spec text, the inheritance
+               lock's wait order and give ordering, pktring's release and
+               acquire, and the audit of one-core comments in rt/, drivers/
+               and the kernel. Beside U2; before U3's cases.
 ```
 
-**Not built, and out of scope:** a process whose threads span cores (thread
-placement). The projects run separate programs on separate cores (the
-owner's ruling); §1 says what it would cost.
+---
 
-Order: U0 beside U1; then U2; then U3 with U4; then U5. What must land first:
-SO-148's U3 and U5 (U1 restates their serialization comments), and nothing
-of SO-165, which only needs the stop to exist before its reclaim runs.
+## 11. Later
 
-**Spec text that changes.**
+Not designed now; each gets a design when it is next.
 
-- §7: "Uniprocessor kernel in v1" [read spec.md:4206-4208] becomes the model:
-  one kernel, a core per process, per-core lists, tick and idle, preemption
-  on wake across cores by IPI, the machine-wide deadlock, and the stop rule.
-- §8: kill across cores (eviction before teardown); `ProcessOp.Core`.
-- §9: the IPI line, which core takes a line, the stop NMI; "interrupts
-  masked in the kernel" holds per core.
-- §9b: "Not built, and correctly so" [read spec.md:4752-4760] becomes the
-  big lock, the ticket, the cross-core spin.
-- §2.7: the op, its answers, the default; `CORE_OP`; the region's core rows.
-- §2.6: "one hardware timer, two customers" becomes a comparator per core,
-  core 0's carrying every Timer, each core's carrying its own tick.
-- §11: the uniprocessor line goes; a process spanning cores, per-core Timers
-  and arm64 SMP are listed as not built.
-- §12: root's core and the plan's step. CLAUDE.md's timing section gains the
-  cross-core construction rule (§10.1) and the riscv32 profile's two harts.
+- Per-core Timers, a Timer firing on its owner's core (revision 2's §4.3 has
+  a sketch, in scratch).
+- Device lines routed to their driver's core.
+- Measuring the lock and the cross-core Timer path on the board, and what
+  result would justify splitting the lock.
+- Per-core stats rows.
+- arm64 on two cores.
+- Placing threads, not just processes, and other placement policies.
+- A grant cap on which cores a launcher may place on.
 
 ---
 
-## 12. What was not settled here
+## 12. What was checked
 
-- Whether the kernel lock's waiting and the Timer path are acceptable for the
-  radio is a measurement (stages S1 and S2), not a design question; §10.3
-  says what result would change the design.
-- The PMS on the S3, which this design does not need.
-
----
-
-## 13. What was checked
-
-- **ESP-IDF v5.4.1**, fetched from GitHub into scratch:
-  `esp_system/port/cpu_start.c`, `esp_system/port/panic_handler.c`,
-  `esp_hw_support/cpu.c`, `esp_hw_support/include/spinlock.h`,
-  `hal/esp32s3/include/hal/cpu_utility_ll.h`, `hal/esp32s3/include/hal/
-  cache_ll.h`, `spi_flash/cache_utils.c`, `soc/esp32s3/register/soc/
-  {system_reg,rtc_cntl_reg,extmem_reg}.h`, `soc/esp32s3/include/soc/
-  {interrupts,soc_caps}.h`, `xtensa/esp32s3/include/xtensa/config/core-isa.h`.
-- **Espressif QEMU** at the installed build's tag: `hw/xtensa/esp32s3.c`,
-  `esp32s3_intc.c`, `esp32s3_clk.c`, `hw/misc/esp32s3_rtc_cntl.c`,
-  `include/hw/timer/esp_systimer.h`.
-- **ESP-IDF, for revision 2:** `esp_hw_support/include/esp_private/
-  systimer.h` and `freertos/port_systick.c` (the per-core tick alarms).
-- **Probes**, built in scratch (`smp/probe/`): `s3core1.S`, a flash image
-  that starts the APP CPU through `0x600C_0004`, prints its `PRID`,
-  `ATOMCTL`, `VECBASE`, `PS` and `INTENABLE`, raises source 80 at its CPU
-  interrupt 2 and source 81 at its NMI while it spins at `INTLEVEL` 15, then
-  resets it through `SW_APPCPU_RST` and gives it the entry again; `rv2.S`,
-  two harts under `-smp 2 -bios none` and a CLINT `msip` ending hart 1's
-  `wfi` with `MIE` clear. **Neither has run**: the suite lock was held by
-  another run (pids 38850 and 86081 for revision 1, 63667 for revision 2)
-  whenever this work could take it, so no
-  claim here is marked [probed]. Each is a single QEMU boot of a few seconds
-  under the lock; the files are in scratch for the lead to run, and every
-  UNVERIFIED pointing at §13 is what they settle.
-- **The mask ROM**, disassembled from `esp32s3_rev0_rom.elf` (esp-rom-elfs
-  20241011): the reset handler (0x4000_045A-0x4000_048C), `main`'s APP-CPU
-  loop (0x4004_3A2F-0x4004_3A43) and `ets_set_appcpu_boot_addr`
-  (0x4004_3664-0x4004_366F).
+- **ESP-IDF v5.4.1** and **Espressif QEMU** files, fetched into scratch, and
+  the **mask ROM** disassembled, as cited above.
+- **Probes**, built in scratch (`smp/probe/`): `s3core1.S` (the APP CPU
+  started through `0x600C_0004`, its registers printed, source 80 raised at
+  its CPU interrupt 2 and source 81 at its NMI while it spins at `INTLEVEL`
+  15, then reset through `SW_APPCPU_RST` and started again) and `rv2.S` (two
+  harts under `-smp 2 -bios none`, and `msip` ending hart 1's `wfi` with
+  `MIE` clear). **Neither has run:** another run held the suite lock every
+  time this work checked (pids 38850, 86081, then 63667, last at 18:09). Each
+  is a few seconds of QEMU; the UNVERIFIED marks pointing here are what they
+  settle.
 
 ---
 
-## 14. Questions for the owner
+## 13. Questions for the owner
 
-Revision 1's nine are answered (SO-170). New ones:
-
-1. **The number stages S1 and S2 are read against.** The radio's latency
-   requirement (SO-103's 4.2) records the worst case per line but names no
-   budget. What worst lock wait, and what worst Timer lateness, on core 1
-   would be too much: a figure in microseconds, or a fraction of the Wi-Fi
-   and BT interrupt deadlines once those are measured?
-2. **When U8 (per-core Timers) is built**: when S2 shows a core-1 Timer's
-   lateness past that budget, as proposed, or as soon as the radio is placed
-   on core 1, whatever S2 shows?
-3. **The lock's cycle columns always kept** (two counter reads per kernel
-   entry on every board), as proposed, or only in a diagnostic build chosen by
-   a build key, as the clock keys are chosen?
+None new from revision 3. The coordinator holds revision 2's three (the
+budgets, when per-core Timers are built, the lock counters), which the trim
+moves to the later list.
