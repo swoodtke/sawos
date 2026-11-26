@@ -14,16 +14,21 @@
 //! (`RightName`) and root turns into its mask. A child's rights ceilings are
 //! carried as words (`Ceiling`), each of the kind the declaration lists, and
 //! root narrows the child's to them before it gives anything; a child with
-//! none is left with root's. A record is given with its keep word (`Record`),
-//! whose all-ones value keeps everything the source holds.
+//! none is left with root's. A child's band map is carried as the packed word
+//! the kernel's `BandMap` op takes (`Child.bands`): the simple map every
+//! created process has until a launcher sets one (`SIMPLE_BANDS`), or the
+//! full map (`FULL_BANDS`) a declaration's `bands = "full"` asks for. A
+//! record is given with its keep word (`Record`), whose all-ones value keeps
+//! everything the source holds.
 //!
 //! A process that declares heaps is given one pool for each, after its other
 //! records, under `HEAP_TAG` plus the heap's slot (`Source.Heap`), with the
 //! launch convention's mask for a heap's pool, which root states.
 //!
 //! The plan's order is the launch order (spec §12): every child is created,
-//! the setup writes are made, each child's quota rows are set, its ceilings
-//! narrowed and its records given in its declared order, and then every child
+//! the setup writes are made, each child's quota rows are set, its band map
+//! set when it is not the simple one, its ceilings narrowed and its records
+//! given in its declared order, and then every child
 //! is started.
 //!
 //! The tags from `RESERVED_TAG_FIRST` to `RESERVED_TAG_LAST` are the
@@ -126,6 +131,15 @@ public enum Source {
 @synthesize
 extension Source: Equatable {}
 
+/// The band map every created process has until a launcher sets one: band
+/// `b`'s level in nibble `b`, the four application bands at levels 0 to 3 and
+/// each realtime band at 3 (spec §7). A plan that carries it makes root set
+/// nothing.
+public static SIMPLE_BANDS: UInt32 = 0x3333_3210
+/// The full-access band map: each band at the level of its own rank, the
+/// identity (spec §7).
+public static FULL_BANDS: UInt32 = 0x7654_3210
+
 /// The keep word that keeps every right: what a record with no `rights` is
 /// given with when its child has no `[ceilings]`.
 public static KEEP_ALL: UInt32 = 0xFFFF_FFFF
@@ -212,6 +226,9 @@ public struct Child {
     /// The rights ceilings root narrows the child's to, after its quota rows
     /// and before its first give; none leaves the child root's.
     ceilings: Vector<Ceiling>
+    /// The band map root sets on the child, after its quota rows and before
+    /// its ceilings, unless it is `SIMPLE_BANDS`.
+    bands: UInt32
     /// In the order the child's declaration lists them.
     records: Vector<Record>
     /// The rights its System record keeps, the sibling of root's System it is
@@ -248,7 +265,7 @@ extension Plan: NoCopy {}
 // root's own (`root/src/main.saw`) hold the bookkeeping's.
 
 /// A `Child`, in the plan's `children`.
-public static CHILD_WORDS: Int = 21
+public static CHILD_WORDS: Int = 22
 /// A `Quota` row, in a child's `quota`.
 public static QUOTA_WORDS: Int = 2
 /// A `Ceiling`, in a child's `ceilings`.

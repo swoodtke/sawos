@@ -35,18 +35,25 @@
 //! refuse. `inputs` are the process's build inputs: each file is
 //! the module of its name (`write_input`). `plan` and `inputs` may be left
 //! out; every other key is required, and an unknown key is refused.
+//!
+//! A child's image header carries the default band map (`check_header_bands`):
+//! the header's map is root's, which the kernel applies verbatim, and nothing
+//! reads a child's, so a child asks for its bands in its declaration.
 
+import std.data.{Data}
 import std.file.{File}
 import std.path.{Path}
 import std.json.{JsonValue}
-import toml.{TomlDoc}
+import toml.{TomlDoc, TomlPosition}
 import sosimage.board.{Span}
 import sosimage.build.{ensure_directory}
 import sosimage.failure.{BuildError}
 import sosimage.fields.{Fields}
+import sosimage.hex.{hex}
 import sosimage.layout.{Placement, process_script}
 import sosimage.plan.{ImagePlan, plan_module, root_arena}
 import sosimage.profile.{Profile}
+import sosimage.rules.{refused}
 import sosimage.tool.{read_file, read_text, run_tool, write_file, write_lines}
 
 public static PROCESS_VERSION: Int = 1
@@ -291,4 +298,29 @@ public func build_process(profile: &Profile, name: String, package: String, out:
     }
     try write_file(image, try read_file(made))
     return Built(image: image, elf: "{blade_out}/{pkg}.elf")
+}
+
+/// The header's `prio_map`, by offset (`imgformat`'s `SosimgHeader`).
+static HEADER_PRIO_MAP: Int = 8
+/// The map a manifest with no `[sos] priorities` writes: one byte a band, low
+/// byte first, background at 0 and the others at 1.
+static DEFAULT_PRIO_MAP: UInt32 = 0x0101_0100
+
+/// Refuses a child whose built image, `image`, carries a header band map
+/// other than the default: the map is root's, and nothing reads a child's.
+public func check_header_bands(image: &Data, process: String, file: String,
+                               at: TomlPosition) -> Result<Void, BuildError> {
+    var map: UInt32 = 0
+    var b = 3
+    while b >= 0 {
+        guard let byte = image.get(HEADER_PRIO_MAP + b) else {
+            return BuildError(message: "the image of the process {process} is truncated before its header's band map")
+        }
+        map = (map << 8) | (byte as UInt32)
+        b = b - 1
+    }
+    if map != DEFAULT_PRIO_MAP {
+        return refused(file, at, "the package of the process {process} states a band map of {hex(map as UInt64)} in its `Saw.toml` `[sos] priorities`, which is root's band map and is not read for a child: a child asks for bands in its process.toml")
+    }
+    return
 }

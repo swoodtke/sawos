@@ -42,6 +42,15 @@
 //! inlet is the `pipe-inlet` ceiling's, which is refused when it lacks `post`
 //! (`check_console_inlet`).
 //!
+//! A declaration's `bands` gives its process's band map, carried as the
+//! packed word the kernel's `BandMap` op takes: `bootplan.FULL_BANDS` for
+//! `full`, `bootplan.SIMPLE_BANDS` otherwise, for which root sets nothing.
+//! A client whose `Normal` level is above its server's, a declared client or
+//! the console's inlet's holder, is refused (`check_bands`): the convention
+//! that stands in for a server inheriting its client's level across a pipe is
+//! that no client outranks its server. The two stock maps put `Normal` at 2,
+//! so the check holds a map the plan carries from elsewhere.
+//!
 //! A `[[setup]]` write carves from its device's row the window of the board's
 //! grain (four bytes at least) that holds its register, and writes the
 //! register at its offset into that window.
@@ -90,7 +99,8 @@
 //!
 //! A record's `from`, `offset`, `len` and `keep` (every right), a child's
 //! `quota`, `ceilings` (an object of a kind's key and the word its ceiling is
-//! narrowed to, as the plan carries it), `records` and `shutdown`, and
+//! narrowed to, as the plan carries it), `bands` (the packed map root sets,
+//! the simple one when left out), `records` and `shutdown`, and
 //! `children`, `connections` and `setup` may be left out (zero, none, false);
 //! an unknown key is refused. A test plan may also state
 //! `windows`, the count of windows root is given in place of the one the
@@ -99,7 +109,7 @@
 //! the launch convention's System rights (`child_rights`).
 
 import toml.{TomlPosition}
-import bootplan.{CHILD_WORDS, QUOTA_WORDS, CEILING_WORDS, RECORD_WORDS, RIGHT_WORDS, SETUP_WORDS,
+import bootplan.{FULL_BANDS, SIMPLE_BANDS, CHILD_WORDS, QUOTA_WORDS, CEILING_WORDS, RECORD_WORDS, RIGHT_WORDS, SETUP_WORDS,
                  PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS, ROW_WINDOW_WORDS, CONSOLE_TAG,
                  HEAP_TAG, KEEP_ALL}
 import sosimage.board.{Board, Window, quota_keys}
@@ -229,6 +239,8 @@ public struct PlanChild {
     /// The ceilings root narrows its own to: one for each kind of
     /// `sosimage.rights` when its declaration has `[ceilings]`, else none.
     ceilings: Vector<PlanCeiling>
+    /// The band map root sets on it: `SIMPLE_BANDS` sets none.
+    bands: UInt32
     records: Vector<PlanRecord>
     /// The rights its System record keeps, by the names a declaration writes.
     rights: Vector<String>
@@ -435,6 +447,16 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
         console_server = target.substring(0, target.index_of(46)!)
     }
 
+    var maps = Vector<UInt32>()
+    p = 0
+    while p < count {
+        borrow let d = decls[p] {
+            try! maps.push(bands_word(&d))
+        }
+        p = p + 1
+    }
+    try check_bands(&image, &decls, &maps, console_server, file)
+
     var children = Vector<PlanChild>()
     var lines = Vector<String>()
     var line_holders = Vector<String>()
@@ -524,6 +546,7 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
             let quota = try quota_rows(&image, &d, process.name, process.at)
             try! children.push(PlanChild(name: process.name, image: p, destination: count + p,
                                          quota: move quota, ceilings: ceiling_rows(&d),
+                                         bands: bands_word(&d),
                                          records: move records,
                                          rights: d.system_rights_or(&image.system_rights),
                                          start: start,
@@ -550,6 +573,71 @@ public func plan_image(image: &ImageFile, board: &Board, decls: &Vector<Declarat
     }
     return ImagePlan(children: move children, setup: move setup,
                      connections: connections.len(), rows: move rows, windows: None)
+}
+
+/// The packed band map `d`'s mode gives.
+func bands_word(d: &Declaration) -> UInt32 {
+    if d.full_bands {
+        return FULL_BANDS
+    }
+    SIMPLE_BANDS
+}
+
+/// `Normal`'s level in the band map `map`.
+func normal_level(map: UInt32) -> Int {
+    ((map >> 8) & 0xF) as Int
+}
+
+/// The process of `image` named `name`'s index, or -1.
+func process_index(image: &ImageFile, name: String) -> Int {
+    var s = 0
+    while s < image.processes.len() {
+        if (image.processes.get(s)!).name.equals(name) {
+            return s
+        }
+        s = s + 1
+    }
+    -1
+}
+
+/// Refuses a client whose `Normal` level is above its server's, the
+/// convention that stands in for a server inheriting its client's level across
+/// a pipe. `maps` is each process's band map, in image order; a client is a
+/// declared `client` record and, in an image that names a console, every
+/// process but the one serving it (`console_server`, "" when there is none).
+/// The two stock maps put `Normal` at 2, so no declaration's mode can fail it;
+/// it guards a map the plan carries from elsewhere.
+public func check_bands(image: &ImageFile, decls: &Vector<Declaration>, maps: &Vector<UInt32>,
+                        console_server: String, file: String) -> Result<Void, BuildError> {
+    var p = 0
+    while p < image.processes.len() {
+        let process = image.processes.get(p)!
+        let mine = normal_level(maps.get(p)!)
+        borrow let d = decls[p] {
+            var r = 0
+            while r < d.records.len() {
+                let record = d.records.get(r)!
+                r = r + 1
+                if record.kind != RecordKind.Client {
+                    continue
+                }
+                let target = image.entry(&image.clients, process.name, record.name)!
+                let server = target.value.substring(0, target.value.index_of(46)!)
+                let theirs = normal_level(maps.get(process_index(&image, server))!)
+                if mine > theirs {
+                    return refused(file, process.at, "the process {process.name}'s `Normal` band is at level {mine}, above level {theirs}, its server {server}'s, which it is a client of through {target.value}: a client's `Normal` level may not be above its server's")
+                }
+            }
+        }
+        if not console_server.is_empty() && not process.name.equals(console_server) {
+            let theirs = normal_level(maps.get(process_index(&image, console_server))!)
+            if mine > theirs {
+                return refused(file, process.at, "the process {process.name}'s `Normal` band is at level {mine}, above level {theirs}, the console server {console_server}'s, whose connection it is given an inlet of: a client's `Normal` level may not be above its server's")
+            }
+        }
+        p = p + 1
+    }
+    return
 }
 
 /// The ceilings root narrows a child to for `d`: each kind's word, in the
@@ -1110,6 +1198,10 @@ func read_child(f: &var Fields) -> Result<PlanChild, BuildError> {
         }
         try c.finish()
     }
+    var bands: UInt64 = SIMPLE_BANDS as UInt64
+    if f.has("bands") {
+        bands = try f.word("bands")
+    }
     var records = Vector<PlanRecord>()
     var given = try f.objects_or_empty("records", "a plan child's record")
     var r = 0
@@ -1139,7 +1231,7 @@ func read_child(f: &var Fields) -> Result<PlanChild, BuildError> {
     }
     let child = PlanChild(name: name, image: try f.integer("image"),
                           destination: try f.integer("destination"), quota: move quota,
-                          ceilings: move ceilings,
+                          ceilings: move ceilings, bands: bands as UInt32,
                           records: move records, rights: child_rights(),
                           start: try f.integer("start"),
                           shutdown: shutdown, floor: 0, windows: 0, heaps: 0)
@@ -1341,7 +1433,8 @@ func child_function(child: &PlanChild, index: Int) -> Vector<String> {
         k = k + 1
     }
     try! out.push("    Child(name: {literal(child.name)}, image: {child.image}, destination: {child.destination},")
-    try! out.push("          quota: move quota, ceilings: move ceilings, records: move records,")
+    try! out.push("          quota: move quota, ceilings: move ceilings, bands: {hex(child.bands as UInt64)},")
+    try! out.push("          records: move records,")
     try! out.push("          rights: move rights,")
     try! out.push("          start: {child.start}, shutdown: {child.shutdown})")
     try! out.push("\}")

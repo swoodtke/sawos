@@ -15,6 +15,9 @@
 //!              its device row, map it, write the register (reading it first
 //!              for a `set` or a `clear`), unmap it and release both;
 //!   quota      set each child's declared quota rows;
+//!   bands      set the band map of a child whose plan carries a map other
+//!              than the simple one (`band_map`), which every created process
+//!              has until then;
 //!   ceilings   narrow each rights ceiling of a child whose plan lists them
 //!              to the plan's word (`restrict_rights`), so that nothing it
 //!              mints afterwards holds more; a child with none keeps root's;
@@ -63,7 +66,7 @@ import sos.{System, Process, Memory, IoMemory, PipeInlet, PipeOutlet,
             PipeInletRight, PoolRight, QuotaKind}
 import bootplan.{Plan, Child, Record, Source, Setup, SetupOp, QuotaName, RightName, CeilingKind,
                  setup_word, reads_first, PROCESS_WORDS, ENDS_WORDS, ROW_TAG_WORDS,
-                 ROW_WINDOW_WORDS}
+                 ROW_WINDOW_WORDS, SIMPLE_BANDS}
 import imageplan
 import sosmain
 import std.alloc.{GlobalAllocator}
@@ -209,6 +212,11 @@ func run(system: &System, proc: &Process, plan: &Plan) -> Result<UInt, Stop> {
             borrow let child = children[i] {
                 try set_quota(&child, &c) catch {
                     return stop("quota", c.name, error)
+                }
+                if c.bands != SIMPLE_BANDS {
+                    try child.band_map(c.bands) catch {
+                        return stop("bands", c.name, error)
+                    }
                 }
                 try restrict(&child, &c) catch {
                     return stop("ceilings", c.name, error)

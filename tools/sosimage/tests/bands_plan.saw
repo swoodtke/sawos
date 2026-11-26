@@ -1,0 +1,279 @@
+// A declaration's `bands`, and what the plan and the builder make of it: the
+// value's refusal, the packed map the plan carries for each mode, the module
+// root is built with, a client held to its server's map, a test plan's
+// `bands`, and a child's image header held to the default band map.
+
+import std.data.{Data}
+import std.json.{JsonValue}
+import bootplan.{FULL_BANDS, SIMPLE_BANDS}
+import toml.{TomlPosition}
+import sosimage.board.{Board}
+import sosimage.declaration.{Declaration}
+import sosimage.fields.{Fields}
+import sosimage.imagefile.{ImageFile, bind}
+import sosimage.package.{check_header_bands}
+import sosimage.plan.{ImagePlan, check_bands, plan_image, plan_module}
+
+func join(lines: &Vector<String>) -> String {
+    "{lines.join("\n")}\n"
+}
+
+// An ESP32-S3 board with two UARTs.
+func board() -> Board {
+    let lines: Vector<String> = [
+        "format = 1",
+        "[board]",
+        "name = \"esp32s3\"",
+        "triple = \"xtensa-esp-unknown-elf\"",
+        "tier = \"flat\"",
+        "hal = \"hal/xtensa-esp32s3\"",
+        "placement = \"copied\"",
+        "modules = []",
+        "cflags = []",
+        "[emulator]",
+        "program = \"qemu-system-xtensa\"",
+        "args = []",
+        "[ram.kernel]",
+        "use = \"kernel\"",
+        "speed = \"fast\"",
+        "base = 0x3FC8_C000",
+        "len = 0x2_4000",
+        "[ram.sram]",
+        "use = \"process\"",
+        "speed = \"fast\"",
+        "base = 0x3FCB_0000",
+        "len = 0x4_0000",
+        "atomics = true",
+        "[ram.default]",
+        "process = \"sram\"",
+        "pool = \"sram\"",
+        "[devices.UART0]",
+        "type = \"esp32s3-uart\"",
+        "base = 0x6000_0000",
+        "len = 0x1000",
+        "line = 27",
+        "kernel = true",
+        "[devices.UART1]",
+        "type = \"esp32s3-uart\"",
+        "base = 0x6001_0000",
+        "len = 0x1000",
+        "line = 28"]
+    try! Board.parse(join(&lines), "hal/xtensa-esp32s3/board.toml")
+}
+
+func decl(lines: &Vector<String>, file: String) -> Declaration {
+    try! Declaration.parse(join(&lines), file, main: true)
+}
+
+// The declaration's refusal, or "".
+func refusal(text: String) -> String {
+    match Declaration.parse(text, "p.toml") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+// A server, whose `bands` is a line of its declaration or "".
+func driver(bands: String) -> Declaration {
+    let lines: Vector<String> = ["format = 1", "arena = 0x1000", bands,
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"port\"", "kind = \"window\"", "type = \"esp32s3-uart\"", "tag = 2",
+        "[[boot]]", "name = \"uart\"", "kind = \"serve\"", "protocol = \"uartproto\"", "tag = 3"]
+    decl(&lines, "driver/process.toml")
+}
+
+// A client of the server's connection.
+func hello(bands: String) -> Declaration {
+    let lines: Vector<String> = ["format = 1", "arena = 0x1000", bands,
+        "[[boot]]", "name = \"system\"", "kind = \"system\"", "tag = 1",
+        "[[boot]]", "name = \"uart\"", "kind = \"client\"", "protocol = \"uartproto\"", "tag = 2"]
+    decl(&lines, "hello/process.toml")
+}
+
+func pair(a: Declaration, b: Declaration) -> Vector<Declaration> {
+    var out = Vector<Declaration>()
+    try! out.push(move a)
+    try! out.push(move b)
+    move out
+}
+
+func image_text(console: Bool) -> String {
+    let named = if console { "console = \"console.uart\"\n" } else { "" }
+    "format = 1\n[image]\nname = \"c\"\nboard = \"esp32s3\"\ntick = true\n{named}[root]\npackage = \"stock\"\n[[process]]\nname = \"console\"\npackage = \"driver\"\ndevice = \{ port = \"UART1\" \}\n[[process]]\nname = \"hello\"\npackage = \"hello\"\nclients = \{ uart = \"console.uart\" \}\n"
+}
+
+func plan_of(console: Bool, d: &Vector<Declaration>) -> Result<ImagePlan, String> {
+    let b = board()
+    let image = try! ImageFile.parse(image_text(console), "i.toml", &b, 4)
+    let bound = try! bind(&image, &b, &d, 4)
+    match plan_image(&image, &b, &d, &bound, 4) {
+        case Ok(plan) -> Result<ImagePlan, String>.Ok(value: move plan),
+        case Err(e) -> Result<ImagePlan, String>.Err(error: e.message)
+    }
+}
+
+func bands_refusal(image: &ImageFile, d: &Vector<Declaration>, maps: &Vector<UInt32>,
+                   console_server: String) -> String {
+    match check_bands(&image, &d, &maps, console_server, "i.toml") {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+func bands_of(plan: &ImagePlan, child: Int) -> UInt32 {
+    var bands: UInt32 = 0
+    borrow let c = plan.children[child] {
+        bands = c.bands
+    }
+    bands
+}
+
+func planned(d: &Vector<Declaration>) -> ImagePlan {
+    match plan_of(false, &d) {
+        case Ok(plan) -> move plan,
+        case Err(m) -> panic("the plan was refused: {m}")
+    }
+}
+
+func plan_refusal(console: Bool, d: &Vector<Declaration>) -> String {
+    match plan_of(console, &d) {
+        case Ok(_) -> "",
+        case Err(m) -> m
+    }
+}
+
+// A sosimg header with `map` as its band map and no segments.
+func header(map: UInt32) -> Data {
+    var image = Data()
+    var n = 0
+    while n < 24 {
+        try! image.push(0)
+        n = n + 1
+    }
+    n = 0
+    while n < 4 {
+        try! image.set(8 + n, ((map >> (8 * n)) & 0xFF) as UInt8)
+        n = n + 1
+    }
+    move image
+}
+
+func header_refusal(image: &Data) -> String {
+    match check_header_bands(&image, "hello", "i.toml", TomlPosition(line: 3, column: 1)) {
+        case Ok(_) -> "",
+        case Err(e) -> e.message
+    }
+}
+
+// The `bands` a test plan's one child reads as, `tail` being the rest of its
+// object.
+func read_child_bands(tail: String) -> UInt32 {
+    let text = "\{\"children\": [\{\"name\": \"c\", \"image\": 0, \"destination\": 1, \"start\": 1{tail}\}]\}"
+    let doc = try! JsonValue.parse(text)
+    var fields = try! Fields(move doc, "the plan")
+    let plan = try! ImagePlan.read(&var fields)
+    bands_of(&plan, 0)
+}
+
+// A declaration of the System record alone, with the top-level lines `top`
+// before it and the table lines `tail` after it.
+func minimal(top: Vector<String>, tail: Vector<String>) -> String {
+    var lines: Vector<String> = ["format = 1"]
+    try! lines.append(&top.copy())
+    try! lines.push("[[boot]]")
+    try! lines.push("name = \"system\"")
+    try! lines.push("kind = \"system\"")
+    try! lines.push("tag = 1")
+    try! lines.append(&tail.copy())
+    join(&lines)
+}
+
+func none() -> Vector<String> {
+    Vector<String>()
+}
+
+func full_of(text: String) -> Bool {
+    (try! Declaration.parse(text, "p.toml")).full_bands
+}
+
+func main() {
+    // The declaration: absent and `simple` are the simple map, `full` is the
+    // full one, and any other value is refused by name.
+    assert(full_of(minimal(["bands = \"full\""], none())), "bands = \"full\"")
+    assert(not full_of(minimal(["bands = \"simple\""], none())), "bands = \"simple\"")
+    assert(not full_of(minimal(none(), none())), "no bands")
+    assert(refusal(minimal(["bands = \"rt\""], none())).equals("p.toml: line 2, column 1: `bands` is \"rt\": a declaration's `bands` is \"simple\", the default, or \"full\""),
+           "a bands value that is neither")
+    assert(not refusal(minimal(["bands = 2"], none())).is_empty(), "a bands value that is no string")
+
+    // The ceiling table lists `band-map`, a right of the process kind.
+    assert(refusal(minimal(none(), ["[ceilings]", "process = [\"band-map\", \"exit\"]"])).is_empty(),
+           "band-map is a process right a declaration may name")
+
+    // The plan: the full map for `full`, the simple one otherwise; the module
+    // carries each word.
+    var both = pair(driver("bands = \"full\""), hello("bands = \"full\""))
+    let plan = planned(&both)
+    assert(bands_of(&plan, 0) == FULL_BANDS && bands_of(&plan, 1) == FULL_BANDS,
+           "full is the identity map")
+    assert(FULL_BANDS == 0x7654_3210, "the identity map's word")
+    var plain = pair(driver(""), hello(""))
+    let simple = planned(&plain)
+    assert(bands_of(&simple, 0) == SIMPLE_BANDS && bands_of(&simple, 1) == SIMPLE_BANDS,
+           "no bands is the simple map")
+    assert(SIMPLE_BANDS == 0x3333_3210, "the simple map's word")
+    let module = plan_module(&plan, "c").join("\n")
+    assert(module.contains("ceilings: move ceilings, bands: 0x76543210,"), "the module carries full")
+    let plain_module = plan_module(&simple, "c").join("\n")
+    assert(plain_module.contains("ceilings: move ceilings, bands: 0x33333210,"),
+           "the module carries simple")
+    assert(not plain_module.contains("0x76543210"), "a simple child names no full map")
+
+    // The stock maps put `Normal` at 2 both ways, so no mode is refused as a
+    // client of the other, declared or through the console's inlet.
+    var above = pair(driver(""), hello("bands = \"full\""))
+    assert(plan_refusal(false, &above).is_empty(), "a full client of a simple server")
+    assert(plan_refusal(true, &above).is_empty(), "a full process beside a simple console")
+    var below = pair(driver("bands = \"full\""), hello(""))
+    assert(plan_refusal(false, &below).is_empty(), "a simple client of a full server")
+    assert(plan_refusal(true, &below).is_empty(), "a simple process beside a full console")
+    assert(plan_refusal(false, &plain).is_empty(), "both simple")
+    assert(plan_refusal(false, &both).is_empty(), "both full")
+
+    // The check holds a map the plan carries from elsewhere: a server whose
+    // `Normal` is at 1 refuses a client whose `Normal` is at 2, declared or
+    // through the console's inlet, and the console server itself is no client.
+    let low: UInt32 = 0x1111_1110
+    let b = board()
+    let image = try! ImageFile.parse(image_text(true), "i.toml", &b, 4)
+    var maps = Vector<UInt32>()
+    try! maps.push(low)
+    try! maps.push(FULL_BANDS)
+    assert(bands_refusal(&image, &above, &maps, "").equals("i.toml: line 14, column 1: the process hello's `Normal` band is at level 2, above level 1, its server console's, which it is a client of through console.uart: a client's `Normal` level may not be above its server's"),
+           "a declared client above its server")
+    assert(bands_refusal(&image, &plain, &maps, "console").equals("i.toml: line 14, column 1: the process hello's `Normal` band is at level 2, above level 1, its server console's, which it is a client of through console.uart: a client's `Normal` level may not be above its server's"),
+           "the declared client is checked first")
+    var no_clients = pair(driver(""), driver(""))
+    assert(bands_refusal(&image, &no_clients, &maps, "console").equals("i.toml: line 14, column 1: the process hello's `Normal` band is at level 2, above level 1, the console server console's, whose connection it is given an inlet of: a client's `Normal` level may not be above its server's"),
+           "the console's inlet above its server")
+    var even = Vector<UInt32>()
+    try! even.push(FULL_BANDS)
+    try! even.push(FULL_BANDS)
+    assert(bands_refusal(&image, &above, &even, "console").is_empty(), "equal levels")
+
+    // A test plan states a child's map, the simple one when it does not.
+    assert(read_child_bands("") == SIMPLE_BANDS, "a test plan's child is simple")
+    assert(read_child_bands(", \"bands\": 1985229328") == FULL_BANDS, "a test plan's bands")
+
+    // A child's image header carries the default band map.
+    let ok = header(0x0101_0100)
+    assert(header_refusal(&ok).is_empty(), "the default header map")
+    let asks = header(0x0302_0100)
+    assert(header_refusal(&asks).equals("i.toml: line 3, column 1: the package of the process hello states a band map of 0x3020100 in its `Saw.toml` `[sos] priorities`, which is root's band map and is not read for a child: a child asks for bands in its process.toml"),
+           "a header map that asks for more")
+    let off = header(0x0101_0200)
+    assert(not header_refusal(&off).is_empty(), "one band off the default")
+    var short = Data()
+    try! short.push(0)
+    assert(header_refusal(&short).contains("truncated"), "a header too short")
+}

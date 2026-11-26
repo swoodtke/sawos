@@ -1,0 +1,61 @@
+// A child of the gate's stock-root image `tests/images/stock_full_bands.toml`
+// on the riscv32 `virt` board, written with `main`, whose declaration says
+// `bands = "full"`. Root sets the full band map between the child's creation
+// and its start, which puts `High` at level 3 and `Rt0` at level 4. Under the
+// simple map every process has otherwise, both are level 3.
+//
+// The main thread starts a thread H at `High`, which preempts it, and H
+// starts a thread R at `Rt0` and prints the next line. A wake preempts a
+// lower level at once, and a thread started at the starter's own level waits
+// for the starter to yield or block (spec §7), so R's line comes first under
+// the full map and after H's line under the simple one. The order is the
+// kernel's and no clock is read; the image runs with no tick, so nothing
+// else takes the processor between the starts and the prints.
+
+import sos.{Priority, SosStatus, Thread}
+import sosmain
+
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_0: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_1: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top_0() unsafe -> UInt {
+    ((&var STACK_0) as UnsafePointer<UInt>) as UInt +
+        (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func top_1() unsafe -> UInt {
+    ((&var STACK_1) as UnsafePointer<UInt>) as UInt +
+        (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func thread(run: FuncPointer<(UInt) sync -> UInt>,
+            top: UInt) -> Result<Thread, SosStatus> {
+    sosmain.context().process().thread_create(run: run, arg: 0, stack_top: top)
+}
+
+func starts_rt(arg: UInt) sync -> UInt {
+    print("SOS fullbands: the High thread starts an Rt0 thread")
+    let r = try thread(run: says_rt, top: top_1()) catch {
+        panic("SOS fullbands: no Rt0 thread: {}", error)
+    }
+    try r.start(band: Priority.Rt0) catch {
+        panic("SOS fullbands: the Rt0 start was refused: {}", error)
+    }
+    print("SOS fullbands: the start returned")
+    // R's handle goes with this thread; R runs whether or not anyone joins.
+    0
+}
+
+func says_rt(arg: UInt) sync -> UInt {
+    print("SOS fullbands: the Rt0 thread ran")
+    0
+}
+
+func main() -> Result<Void, SosStatus> {
+    let h = try thread(run: starts_rt, top: top_0())
+    print("SOS fullbands: starting the High thread")
+    try h.start(band: Priority.High)
+    let _ = try h.join()
+    return
+}

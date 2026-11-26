@@ -4,6 +4,8 @@
 //!     format = 1
 //!     arena = 0x1000                     optional: the built-in heap's size
 //!     ram = "fast"                       optional: it needs fast memory
+//!     bands = "full"                     optional: "simple" (the default)
+//!                                        or "full"
 //!
 //!     [[boot]]                           in the order the launcher gives them
 //!     name = "system"
@@ -45,6 +47,11 @@
 //! them but `system` may also have `rights`, which is the rights it is given
 //! with (below). A path is relative to the package's directory.
 //!
+//! `bands` asks the launcher for the process's band map (spec §7): `simple`,
+//! the default, is the map every created process has, and `full` is the
+//! identity map, each band at the level of its own rank. The value is a mode,
+//! and the stock root grants it (`Declaration.full_bands`, `sosimage.plan`).
+//!
 //! `[ceilings]` narrows, per kind of handle, the rights of the handles the
 //! kernel mints into the process's table below the launcher's (spec §2.7: a
 //! ceiling does not cap a handle the process is sent in a message). A key is
@@ -80,7 +87,8 @@
 //!
 //! Beyond the rules of `sosimage.rules`, a declaration is refused by name
 //! for: a `[ceilings]` key that is no kind, is `system`, or lists a right the
-//! kind does not have or one twice; a record's `rights` that names a right
+//! kind does not have or one twice; a `bands` that is not `simple` or `full`;
+//! a record's `rights` that names a right
 //! its kind does not have, or one outside the kind's ceiling; a `count` on a
 //! record (the list form, reserved); a tag in the range
 //! the runtime reserves (`bootplan.RESERVED_TAG_FIRST` up, whose first is
@@ -260,6 +268,9 @@ public struct Declaration {
     arena_at: TomlPosition
     /// `ram = "fast"`.
     fast: Bool
+    /// `bands = "full"`: the process asks for the full band map; otherwise it
+    /// has the simple one.
+    full_bands: Bool
     /// A program written with `main`, whose start-up holds one handle more.
     main: Bool
     records: Vector<BootRecord>
@@ -370,7 +381,7 @@ extension Declaration {
     public static func read(root: &TomlTable, file: String,
                             main: Bool) -> Result<Declaration, BuildError> {
         let top_keys: Vector<String> = ["format", "arena", "ram", "boot", "ceilings", "quota",
-                                        "build", "heap"]
+                                        "build", "heap", "bands"]
         try only_keys(&root, &top_keys, file, "a process declaration")
         try check_format(&root, file)
         let arena = try optional_size(&root, "arena", 8, file, "the declaration")
@@ -382,6 +393,17 @@ extension Declaration {
                                "`ram` is \"{ram}\": a declaration's `ram` is \"fast\", for a program that needs fast memory, or absent")
             }
             fast = true
+        }
+
+        var full_bands = false
+        if root.contains("bands") {
+            let mode = try text(&root, "bands", file)
+            if mode.equals("full") {
+                full_bands = true
+            } else if not mode.equals("simple") {
+                return refused(file, where_is(&root, "bands"),
+                               "`bands` is \"{mode}\": a declaration's `bands` is \"simple\", the default, or \"full\"")
+            }
         }
 
         var heaps = Vector<HeapDecl>()
@@ -477,6 +499,7 @@ extension Declaration {
 
         let dir = Path(s: file).parent()?.as_string() ?? "."
         return Declaration(file: file, dir: dir, arena: arena, arena_at: where_is(&root, "arena"), fast: fast,
+                           full_bands: full_bands,
                            main: main, records: move records, system_rights: move system_rights,
                            ceilings: move ceilings, has_ceilings: has_ceilings,
                            quota: move quota,

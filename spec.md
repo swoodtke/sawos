@@ -4029,8 +4029,9 @@ arm their own.
   its eight bands to system levels, one nibble each in one word. A thread's
   level is read from the map of the process it runs in when it is started,
   which need not be the starter's, and stored plain. The simple map, every
-  process's until its launcher says otherwise, puts `Background` at 0 and
-  every other band at 1; full access puts band `b` at level `b`. Root's
+  process's until its launcher says otherwise, puts `Background`, `Low`,
+  `Normal` and `High` at 0 to 3 and each realtime band at 3, so its cap is 3;
+  full access puts band `b` at level `b`, and only it reaches levels 4 to 7. Root's
   map is its image header's, which carries `Background` to `High` (Blade
   emits it from `[sos] priorities`), with `Rt0` to `Rt3` at `High`'s level,
   and a level past 7 stops the boot naming the band. A launcher sets a
@@ -4765,8 +4766,6 @@ included, beside the build-emitted region table and its kind column (§5.6,
 **Not built**, one area per line, with the section that specifies it:
 
 - **The direct switch** at an equal level (§7).
-- **A declaration's request for full access** (§7). Every child the stock
-  root starts runs under the simple map.
 - **Tickless idle** (§7). The tick keeps firing while the machine is idle.
 - **Thread waitability** (§8). Attaching a thread is a `NotWaitable` fault. A
   supervisor learns a child died by reading `get_status` through the handle it
@@ -5013,8 +5012,10 @@ reserved.
 - **The stock root's plan.** For an image whose root is the stock root
   (`root/`), the builder also writes the module `imageplan`, in the types of
   `bootplan`: for each child, the tags of its image and destination rows, its
-  quota rows, the rights word each of its ceilings is narrowed to when its
-  declaration has `[ceilings]`, the records to give it (each with its tag, its
+  quota rows, its band map (the packed word `BandMap` takes: the simple map,
+  or the full map its declaration's `bands = "full"` asks for), the rights word
+  each of its ceilings is narrowed to when its declaration has `[ceilings]`,
+  the records to give it (each with its tag, its
   source, for a carve the offset and length, and the keep word it is given
   with), the System rights its System record keeps, by name, the tag it is
   started with and its exit policy;
@@ -5022,10 +5023,11 @@ reserved.
   address or line of its own: it creates every child, makes the setup writes (a
   carve of the register's grain from its device's row, mapped, written, unmapped
   and released; a `set` or a `clear` reads the register first and changes only
-  its bits), sets each child's quota rows, narrows its ceilings and gives its
-  records under the launch convention below, starts every child, and
-  supervises. The builder sizes the tables the plan needs, from the plan and
-  the kernel's numbers. Root's table is the most handles root holds at any
+  its bits), sets each child's quota rows and band map, narrows its ceilings
+  and gives its records under the launch convention below, starts every
+  child, and supervises. The builder sizes the tables the plan needs, from
+  the plan and the kernel's numbers. Root's table is the most handles root
+  holds at any
   step, rounded up to whole handle blocks past the body's `MAX_HANDLES`
   entries; an image's `root-handles`, rounded up the same way, may state it
   longer and never shorter.
@@ -5213,13 +5215,20 @@ reserved.
   lists (`process.toml`), under their tags, in declared order, before start,
   and in an image that names a console the console record after them
   (below). It sets the declared quota rows before any give (§2.7,
-  `QuotaSet`). It narrows each of the child's rights ceilings (§2.7,
+  `QuotaSet`). It sets the band map its declaration's `bands` gives (§7,
+  `BandMap`) after the quota rows, when that is not the simple map every
+  created process has: `bands = "full"` asks for the identity map, and the
+  builder refuses a process with the full map that is a declared client of one
+  with the simple map, since a client's `Normal` level may not be above its
+  server's (the two stock maps both put `Normal` at 2, so the rule guards a
+  map a launcher writes itself), and a child whose image header states a band map, which only
+  root's is read from. It narrows each of the child's rights ceilings (§2.7,
   `RestrictRights`) to its declaration's `[ceilings]`, when it has one, after
-  the quota rows and before any give, and gives each record with the
-  record's rights, or its kind's ceiling (below). It gives windows, lines and
-  endpoints as capabilities: a client gets an inlet
-  minted with `Post | Transfer`, a server the outlet. It starts the child
-  with its System record's tag, a sibling masked with the System rights the
+  the quota rows and the band map and before any give, and gives each record
+  with the record's rights, or its kind's ceiling (below). It gives windows,
+  lines and endpoints as capabilities: a client gets an inlet minted with
+  `Post | Transfer`, a server the outlet. It starts the child with its System
+  record's tag, a sibling masked with the System rights the
   record names (`rights`, by `SystemRight`'s names: `debug`, `process-self`,
   `clock-get`, `transfer`), and keeps the child's Process handle. A record
   that names none keeps the image's default, the `rights` of its image

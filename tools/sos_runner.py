@@ -1898,6 +1898,9 @@ def expectations(arch):
         "thirty_four": f"0x{34:0{width}x}",
         "forty_one": f"0x{41:0{width}x}",
         "prio": f"0x{0x01010100:0{width}x}",
+        # The map of a root built by Blade from a manifest that states
+        # `normal = 2, high = 3`.
+        "root_prio": f"0x{0x03020100:0{width}x}",
         "irq_line": f"0x{arch['selftest_line']:0{width}x}",
         # The byte `child-touch` writes into the page its launcher mapped and
         # reads back; it is also its exit code, so `map_into_child` can assert
@@ -3087,7 +3090,7 @@ TEST_CASES = [
         "root_pkg": ROOT_PKG,
         "expect_out": ["{banner}",
                        "root image ok segments={three}",
-                       "prio={prio}",
+                       "prio={root_prio}",
                        # The typed Saw altitude: a method on a handle.
                        "SOS root: hello from U-mode via a System op",
                        # The runtime seam altitude, end to end: `print` ->
@@ -3416,8 +3419,10 @@ TEST_CASES = [
             "SOS levels: kill ended status=196617\n",
             "SOS levels: kill: R1\n",
             "SOS levels: kill: R2\n",
-            "SOS levelchild: simple: Y\n",
+            "SOS levelchild: simple: the High thread ran\n",
+            "SOS levelchild: simple: High started\n",
             "SOS levelchild: simple: the Rt3 thread ran\n",
+            "SOS levelchild: simple: Y\n",
             "SOS levelchild: simple: after the yield\n",
             "SOS levels: simple ended status=65536\n",
             *_panic_fault("{one}", "panic at main.saw:",
@@ -3443,7 +3448,8 @@ TEST_CASES = [
         # `BandMap`'s refusals that need a process the child launches, from
         # the root of `levels` given `child-bye`'s regions too: a `Gone`
         # grandchild (`BadState` 5); under the simple map, set after full
-        # access, a level above the launcher's own highest (`BadArg` 9); and
+        # access or never set, a level above the launcher's own highest, 3
+        # (`BadArg` 9); and
         # under full access a band at 8, in the first nibble and in the last
         # (`BadArg` 9). Each faults the launcher, `level-child`.
         #
@@ -3461,9 +3467,13 @@ TEST_CASES = [
             "SOS: process fault: object in the wrong state process={one}",
             "SOS levels: gone ended status=131077\n",
             "SOS levelchild: cap: the simple map, its own: taken\n",
-            "SOS levelchild: cap: mapping Normal at 2, above its own\n",
+            "SOS levelchild: cap: mapping Rt0 at 4, above its own\n",
             "SOS: process fault: argument outside its domain process={one}",
             "SOS levels: cap ended status=131081\n",
+            "SOS levelchild: cap: the simple map, its own: taken\n",
+            "SOS levelchild: cap: mapping Rt0 at 4, above its own\n",
+            "SOS: process fault: argument outside its domain process={one}",
+            "SOS levels: defaultcap ended status=131081\n",
             "SOS levelchild: nibble: full access, its own: taken\n",
             "SOS levelchild: nibble: mapping a band at 8\n",
             "SOS: process fault: argument outside its domain process={one}",
@@ -10593,6 +10603,46 @@ TEST_CASES = [
                        "root: heap ended status=65536"],
         "expect_tail": "root: heap ended status=65536",
         "expect_clean_exit": True,
+    },
+
+    # A process whose declaration says `bands = "full"`
+    # (`tests/images/stock_full_bands.toml`), which root grants with the
+    # identity band map between the child's creation and its start. Its main
+    # thread starts a thread at `High`, which starts one at `Rt0` and prints a
+    # line: the full map puts `Rt0` (4) above `High` (3), so the `Rt0`
+    # thread's line comes first, ahead of the start's return. Under the simple
+    # map both bands are level 3, the thread waits for the `High` thread to
+    # end and its line comes last. The image has no tick, so the order is the
+    # kernel's preemption on a wake and no clock.
+    {
+        "name": "stock_full_bands",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_full_bands.toml"},
+        "expect_out": ["{banner}",
+                       "SOS fullbands: starting the High thread\n"
+                       "SOS fullbands: the High thread starts an Rt0 thread\n"
+                       "SOS fullbands: the Rt0 thread ran\n"
+                       "SOS fullbands: the start returned",
+                       "root: bands ended status=65536"],
+        "expect_tail": "root: bands ended status=65536",
+        "expect_clean_exit": True,
+    },
+
+    # A stock-root image whose child's manifest states a band map
+    # (`tests/images/stock_header_bands.toml`): the header's map is root's and
+    # nothing reads a child's, so the builder refuses the image once it has
+    # built the child (`sosimage.package.check_header_bands`).
+    {
+        "name": "stock_header_bands",
+        "arches": ["riscv32"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "stock_header_bands.toml"},
+        "expect_build_error": "the package of the process asks states a band "
+                              "map of 0x3020100 in its `Saw.toml` `[sos] "
+                              "priorities`",
+        "expect_out": [],
+        "expect_clean_exit": False,
     },
 
     # A process given a window with the one right its record names

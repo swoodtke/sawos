@@ -7,10 +7,12 @@
 //            and joins it. This process's map puts `Low` at 5 and root's at
 //            1, this main thread's level, so the thread runs at the join:
 //            "started", then root's thread's line
-//   SIMPLE   under the simple map, starts a thread at `Rt3`, prints, yields,
-//            prints again and joins it. `Rt3` is level 1 there, this main
-//            thread's: Y, then the thread's line at the yield, then the line
-//            after it
+//   SIMPLE   under the simple map, starts a thread at `High`, prints and
+//            joins it, then starts one at `Rt3`, prints, yields, prints
+//            again and joins it. `High` and `Rt3` are level 3 there, above
+//            this main thread's `Normal`, level 2: each thread's line comes
+//            before its start returns, so the `Rt3` thread's line, then Y,
+//            then the line after the yield
 //   FULL     under full access, from `Normal` (2) starts a thread at `High`,
 //            which starts one at `Rt0`, and so on to `Rt3`: each start runs
 //            the thread it starts before it returns, so each band's "up" line
@@ -20,7 +22,7 @@
 //            `Background` (0), neither above this main thread, signals the
 //            Event under `TAG_READY` and parks joining the first; its
 //            launcher kills it there
-//   STARTED  sets its own band map, to one with `Normal` at 2, above its own
+//   STARTED  sets its own band map, to one with `Rt0` at 4, above its own
 //            highest: the `BadState` fault, which is decided first
 //   DENIED   sets its own band map through a sibling without `BandMap`: the
 //            `AccessDenied` fault
@@ -28,8 +30,8 @@
 //            `TAG_RAM`, waits for it to end, and sets its map: the
 //            `BadState` fault
 //   CAP      under the simple map, sets a created grandchild's map to the
-//            simple map (its own highest level, taken), then to one with
-//            `Normal` at 2: the `BadArg` fault
+//            simple map (its own highest level, 3, taken), then to one with
+//            `Rt0` at 4: the `BadArg` fault
 //   NIBBLE   under full access, sets a created grandchild's map to full
 //            access (taken), then to one with a band at 8: the `BadArg` fault
 //   NIBBLE7  as `NIBBLE`, with the band at 8 in the last nibble, `Rt3`'s
@@ -68,10 +70,10 @@ static ROLE_NIBBLE7: UInt = 10
 static ROLE_RTFAULT: UInt = 11
 static ROLE_FAULT: UInt = 12
 
-static SIMPLE_MAP: UInt32 = 0x1111_1110
+static SIMPLE_MAP: UInt32 = 0x3333_3210
 static FULL_MAP: UInt32 = 0x7654_3210
-/// The simple map with `Normal` at 2.
-static NORMAL_AT_2: UInt32 = 0x1111_1120
+/// The simple map with `Rt0` at 4, above its highest level, 3.
+static RT0_AT_4: UInt32 = 0x3334_3210
 /// Full access with `Background` at 8, and with `Rt3` at 8.
 static BAND_AT_8: UInt32 = 0x7654_3218
 static RT3_AT_8: UInt32 = 0x8654_3210
@@ -114,7 +116,7 @@ func main() -> Result<Int, SosStatus> {
     }
     if role == ROLE_STARTED {
         print("SOS levelchild: started: mapping itself")
-        let _ = sosmain.context().process().band_map(map: NORMAL_AT_2)
+        let _ = sosmain.context().process().band_map(map: RT0_AT_4)
     }
     if role == ROLE_DENIED {
         let narrow = try sosmain.context().process().mint(
@@ -136,8 +138,8 @@ func main() -> Result<Int, SosStatus> {
         let gc = try grandchild(&var set)
         try gc.band_map(map: SIMPLE_MAP)
         print("SOS levelchild: cap: the simple map, its own: taken")
-        print("SOS levelchild: cap: mapping Normal at 2, above its own")
-        let _ = gc.band_map(map: NORMAL_AT_2)
+        print("SOS levelchild: cap: mapping Rt0 at 4, above its own")
+        let _ = gc.band_map(map: RT0_AT_4)
     }
     if role == ROLE_NIBBLE {
         let gc = try grandchild(&var set)
@@ -200,6 +202,10 @@ func owner(set: &var BootSet) -> Result<Void, SosStatus> {
 /// `SIMPLE`.
 func simple() -> Result<Void, SosStatus> {
     let me = try sosmain.context().process().thread_self()
+    let h = try thread(run: says_high, arg: 0, i: 1)
+    try h.start(band: Priority.High)
+    print("SOS levelchild: simple: High started")
+    let _ = try h.join()
     let t = try thread(run: says_rt3, arg: 0, i: 0)
     try t.start(band: Priority.Rt3)
     print("SOS levelchild: simple: Y")
@@ -207,6 +213,11 @@ func simple() -> Result<Void, SosStatus> {
     print("SOS levelchild: simple: after the yield")
     let _ = try t.join()
     return
+}
+
+func says_high(arg: UInt) sync -> UInt {
+    print("SOS levelchild: simple: the High thread ran")
+    0
 }
 
 func says_rt3(arg: UInt) sync -> UInt {
