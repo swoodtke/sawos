@@ -501,7 +501,7 @@ both to progress times out.
 | `core_wake` | a core-1 child's `High` thread, parked on an Event, preempts its own `Normal` spinner when root signals: the IPI; and the same with core 1 idle |
 | `core_timer` | a core-1 child's Timer fires through core 0's comparator and wakes it |
 | `core_kill` | root kills a core-1 child spinning in user mode: `Ok`, `Killed` (the retry); and two children on two cores killing each other's siblings: both kills answer, nothing deadlocks |
-| `core_kill_exit` | a kill racing the victim's own exit: a core-1 child's thread blocks on an Event, root signals it and kills at once; once signalled the thread exits. Whichever ends the process first, the other finds it gone: the kill answers as for a process already dead, the teardown runs once (one teardown line), and nothing deadlocks |
+| `core_kill_exit` | a kill racing the victim's own exit: a core-1 child's thread blocks on an Event, root signals it and kills at once; once signalled the thread exits. Whichever ends the process first, the other finds it gone: the teardown runs once (one teardown line) and nothing deadlocks. The kill's answer (`Ok` or already dead) depends on which core wins, so it is printed and left out of the expected text |
 | `core_deadlock`, `core_not_deadlock` | one deadlock line when both cores block; none while core 1 still runs |
 | `core_stop` | a harness kernel stops from core 0 with core 1 spinning masked, and from core 1 without the lock; the acknowledgement and the line |
 | `core_lock_churn` | both cores hammer shared objects for a fixed count; every count exact (a net for a missing lock, never a flaky pass) |
