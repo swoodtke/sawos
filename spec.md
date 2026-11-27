@@ -42,7 +42,7 @@ The kernel's object kinds, each a slab-allocated kernel struct:
 | `Pipe` | Synchronous message IPC with request/reply built in. Four kinds: `PipeInlet` and `PipeOutlet` (the client and server ends of a connection) and `PipeReply` and `PipeRequest` (the client's claim on one reply and the server's obligation to send it). §2.1. |
 | `Event` | Accumulating non-blocking notification (OR / saturating-sum); a waitable. Ops `Signal`/`Receive`, the mode chosen by the caller at creation (`event_create(mode:)`). The word is consumed by whoever takes it, through either door — `receive` is the non-blocking poll, a `Waiter.wait` delivery is the blocking one, and both read and clear, so a value is reported exactly once. §2.2, §2.4. |
 | `Clock` | A granted time source — time is a capability, not an ambient facility. §2.6. |
-| `Timer` | Deadline object bound to the Clock that created it; directly waitable. The process-sleep primitive. §2.6. |
+| `Timer` | Deadline object bound to the Clock that created it; directly waitable, so a Waiter's wait can end on time, once or on an interval. §2.6. |
 | `Interrupt` | Binds an IRQ line to a waitable; userspace drivers wait on it and ack through the handle. Two ops (`Ack` and `Latency`), two rights (`InterruptRight.Wait`/`.Ack`), created by `SystemOp.InterruptBind` on `SystemRight.InterruptBind`, because a line is a machine-wide resource (§2.8). The binding is the object's existence (creation takes the line, there is no rebind), which stops one handle naming two devices over its life. It has one name, its handle, and releasing that handle destroys it (§2.10). A line the board does not have, the timer's line, and a line already bound are all faults. §9. |
 | `Waiter` | Generic wait aggregator (epoll/Port-style). Ops `Add`/`Remove`/`Wait`; rights `WaiterRight.Attach`/`.Wait`; the wait answer is a copy-out record. §2.2. |
 | `Process` | Two entries: a small record (the state, the status word, the pid, the quota ledger, the references naming it) that outlives the process, and a body (AddressSpace + handle table + threads) that the teardown frees. Handles name the record. No kernel Job or hierarchy. The kernel guarantees teardown on exit, fault or kill (§8) — invalidating the objects bound to it, releasing every handle it holds, clearing its domain and freeing its body (§2.10). Supervision (restart, kill-trees, launchd-style) is a userspace concern. §2.7, §8, §12. |
@@ -245,7 +245,8 @@ A full ring at `Post` and an empty one at `Take` both answer
 and `post` carry no Optionals, and a genuine poller declares itself with a
 `WouldBlock` arm. `PipeReplyOp.Resolve` and `PipeRequestOp.Reply` each spend
 their own right (`PipeReplyRight.Resolve`, `PipeRequestRight.Reply`) and each
-destroy the caller's handle entry. `PipeInletOp.Call`,
+destroy the caller's handle entry, a wakeable `Resolve` only at the end that
+answers it and never at an early end (below). `PipeInletOp.Call`,
 `PipeRequestOp.ReplyWait`, `PipeReplyOp.Ready` and `PipeRequestOp.Sender` are
 described below.
 
@@ -267,12 +268,13 @@ lives until the exchange settles rather than until its bytes are taken, so
 client, read literally).
 
 **Single use is the ledger and the compiler both.** `Reply` and `Resolve`
-destroy the caller's entry, so the kernel's check stands for a raw-altitude
-caller; above it `PipeRequest.reply`, `reply_with`, `reply_wait`,
-`reply_wait_with` and `PipeReply.resolve` are all `consumes` methods whose
-callers spell `(move …)`, so a second use is a compile error before the ledger
-is ever asked. Both one-shots are transferable — the delegation primitive — and
-the zero-copy example runs end to end.
+destroy the caller's entry (a wakeable `Resolve` at the end that answers it,
+below), so the kernel's check stands for a raw-altitude caller; above it
+`PipeRequest.reply`, `reply_with`, `reply_wait`, `reply_wait_with` and
+`PipeReply.resolve` are all `consumes` methods whose callers spell `(move …)`,
+so a second use is a compile error before the ledger is ever asked. Both
+one-shots are transferable — the delegation primitive — and the zero-copy
+example runs end to end.
 
 **A one-shot has one name.** `Mint` is absent from `pipe_reply_rights()` and
 `pipe_request_rights()` (the enum bits stay declared, since §3's universal low
@@ -307,16 +309,19 @@ exist — and a one-shot kind's delivery detaches whatever mode was passed, sinc
 a subscription to something that has happened for the last time is a promise
 nothing can keep.
 
-**`Resolve` parks and consumes on every path.** A pending exchange blocks the
-calling thread on the claim's ready level, so the op ends the exchange
-whichever way it returns; it is the waiter-free blocking receive, and it is
-what lets `PipeReply.resolve` carry `consumes`. The non-consuming poll is
-`PipeReplyOp.Ready`, gated on `PipeReplyRight.Wait` because the level question
-is the same question attaching asks: `Ok(true)` means the answer is there
-(readiness is monotonic, so check-then-act has no race), `Ok(false)` means not
-yet and the exchange is live, and the terminal rides the error channel —
-`Err(PeerClosed)` means no answer can arrive, at which point the claim is
-dropped rather than resolved.
+**`Resolve` parks, and consumes on every path that answers it.** A pending
+exchange blocks the calling thread on the claim's ready level, so the op ends
+the exchange whichever way it is answered; it is the waiter-free blocking
+receive, and it is what lets `PipeReply.resolve` carry `consumes`. The
+non-consuming poll is `PipeReplyOp.Ready`, gated on `PipeReplyRight.Wait`
+because the level question is the same question attaching asks: `Ok(true)` means
+the answer is there (readiness is monotonic, so check-then-act has no race),
+`Ok(false)` means not yet and the exchange is live, and the terminal rides the
+error channel — `Err(PeerClosed)` means no answer can arrive, at which point the
+claim is dropped rather than resolved. A wakeable `Resolve` that ends early,
+with `TimedOut` or `Woken`, is not answered: it consumes nothing and leaves the
+claim bound under the same word (below). That is the only end of a `Resolve`
+that does not consume its claim.
 
 **`send(msg)` is one kernel call.** `PipeInletOp.Call` is post, park and
 resolve behind one trap — the composition run without returning to userspace,
@@ -324,24 +329,26 @@ so every rule the composed path obeys applies verbatim (same ring, same body
 maximum, same peer-gone answer), and it is gated by the existing
 `PipeInletRight.Post`, because what it adds is a park and a park is mechanics
 rather than authority. It never answers `WouldBlock`: a full ring parks on the
-inlet's room-to-post level, reached from inside the op. It takes no duration —
-the kernel never learns what a timeout is. The typed spelling is
-`PipeInlet.send`.
+inlet's room-to-post level, reached from inside the op. It takes no duration
+argument: a `Call` is bounded, when it is, by its caller's wait word (§7), as
+every park is (below). The typed spelling is `PipeInlet.send`.
 
 **`send(msg, timeout:)` is the caller's own composition, and there is
 deliberately no library wrapper for it.** The shape is post + attach + wait plus
 a Timer on the same Waiter, which `tests/pipe-send-manual` writes out inline. A
 wrapper type would freeze a shape the fused call replaces with a single kernel
-call, and a kernel-side timeout, if a consumer ever names one, arrives as an op
-rather than as a method. `TimedOut(pending:)`'s substance holds without a type
-to carry it: the composition uses the non-consuming attach, so the claim is the
-caller's the whole time and is still in hand when the Timer's key comes back.
+call, and the kernel's own bound on a call is the caller's wait word (§7)
+rather than an argument or a method. `TimedOut(pending:)`'s substance holds
+without a type to carry it: the composition uses the non-consuming attach, so
+the claim is the caller's the whole time and is still in hand when the Timer's
+key comes back.
 
-**A fused call mints nothing.** The claim is kernel-internal and tied to the
-parked thread — one reference on the exchange's claim column that no handle
+**A plain fused call mints nothing.** The claim is kernel-internal and tied to
+the parked thread — one reference on the exchange's claim column that no handle
 table holds — so a blocking client spends no table row and no quota on it, and
 its handle table does not bound a client blocked in calls. `post` keeps
-minting the real handle for multiplexers.
+minting the real handle for multiplexers. A wakeable call is the exception: it
+mints its claim at the stage, so that an early end can hand it back (below).
 
 **`PipeRequestOp.ReplyWait` is the server's half, and it lives on the
 request:** a reply with a built-in wait, the reply being the act that consumes
@@ -367,6 +374,82 @@ process dying with a thread parked in a call or a resolve has that claim
 abandoned by its teardown, and the server's later `reply()` answers
 `Err(PeerClosed)` by the rule above (`tests/pipe-resolve-park`,
 `tests/pipe-resolve-orphan`).
+
+**A pipe op's park can have a deadline, and can be woken.** `Call`, `Resolve`
+and the wait leg of `ReplyWait` park as every op does, so each reads its
+caller's wait word (§7). A word of 0 parks as this section describes. A
+wakeable word lets the park end at the word's deadline, answering `TimedOut`,
+or at another thread's wake, answering `Woken` (§5.7). Readiness comes first,
+as at every park: a ring with room stages the message at once, and a settled
+reply and a peer gone answer as they would with no word. The word is read once
+per op, at its first park (§7), so a wakeable `Call` whose deadline has passed
+still stages into a ring with room, then answers `TimedOut`, with its claim,
+where the reply park would begin. A `Call` that room-parked read its word at
+the room park, and the kernel recorded the park's deadline and wakeability in
+the thread's slot. The stage at its resume, and the reply park that follows,
+run in the trap of whichever thread freed the slot, so they carry the recorded
+deadline and wakeability over and do not read the word again.
+An early end takes the thread off what it is parked on, as the op's own wake
+would, and leaves the exchange as follows.
+
+- **`Call`'s room park.** Nothing was staged. The message is still in the
+  caller's memory and was never posted, its carried handles are still the
+  caller's, the call's parked state is cleared, and the value register is
+  `NO_HANDLE`.
+- **`Call`'s reply park.** A wakeable `Call` is a `Post` and a wakeable
+  `Resolve` made in one trap, because a park that can end early has to give
+  the claim back:
+  - At the stage it mints the claim into the caller's table as a `PipeReply`
+    handle, as `Post` does, so it spends one `Handle` row (§2.9) while it
+    waits. The table is checked before anything is staged, where the stage
+    happens: at the op, or at the room park's resume.
+  - A table with no row for the claim answers `QuotaExceeded` at the caller's
+    `Handle` quota, or `NoResource` with the table full, as `Post` does.
+    Nothing is staged and the carried handles stay the caller's: a transient
+    refusal takes nothing, on `Post`'s terms. A thread resumed from the room
+    park is answered the same way. A plain `Call` on the same table goes
+    through, since it mints no claim.
+  - It then parks on that claim as a wakeable `Resolve` does (below). On
+    `TimedOut` or `Woken` the value register carries the claim's handle word:
+    the request is staged, and the caller holds the claim and resolves it,
+    waits on it or drops it later, as after a `Post`. So a wakeable `Call`
+    never loses its reply to its deadline.
+  - Every other end is a plain `Call`'s: the claim handle is spent, and the
+    answer is the one a plain `Call` gives.
+- **`Resolve`.** A wakeable `Resolve` borrows its claim and spends it only at
+  the end that answers it. A plain `Resolve` unbinds the claim's handle at the
+  park and hands its reference to the parked thread (above). A wakeable one
+  instead takes a reference of its own for the parked thread and keeps the
+  handle bound, recording which handle it is, so on `TimedOut` or `Woken` the
+  claim is still the caller's under the same word. While it is parked:
+  - the reply's arrival, or the exchange's abandonment, unbinds the handle if
+    it still names the exchange (its index and generation agree), and answers
+    as a plain `Resolve` does;
+  - another thread's `Resolve` on that handle is the `BadState` fault: a claim
+    has one resolver;
+  - the claim is the parked thread's, so the handle can be neither attached
+    nor transferred while the park holds it: attaching it to a Waiter,
+    borrowing (`Waiter.add`) or consuming (`Waiter.give`), giving it
+    (`ProcessOp.Give`) and carrying it in a message are each the `BadState`
+    fault that attaching an object already attached is (§2.2, §3), since the
+    parked thread's answer would otherwise land on a handle another process,
+    or an attachment, now holds;
+  - another thread may release it, which drops only the handle's reference.
+    The parked thread's reference keeps the exchange alive, and an answer
+    finds the handle gone and is delivered all the same. An early end after
+    such a release drops the parked thread's reference too, so the exchange
+    is abandoned, as a release of a claim's last handle abandons it, and a
+    later `Resolve` on that word is the `BadHandle` fault, since the word
+    names nothing.
+
+  A wakeable `Resolve` of a claim that is attached detaches it first, as a plain
+  `Resolve` does (§2.2). If it then ends early, the handle stays bound (unless
+  another thread released it, above) and stays detached. All of this holds as
+  well for the claim a wakeable `Call` parks on.
+- **`ReplyWait`.** Its reply leg never parks, so the word changes nothing
+  there. Its wait leg is a `WaiterOp.Wait` park and ends early as one does
+  (§2.2): the reply was delivered, no record is written, and the value
+  register reads `ReplyWaitLeg.Wait`.
 
 **Messages carry handles.** A message carries up to `PIPE_MSG_HANDLES`
 handles on `Post`, `Call`, `Reply` and `ReplyWait` alike — `send` is one
@@ -559,7 +642,7 @@ with no added op, kind, right or status:
   byte spends a fused `Call` and parks. The driver, finding no input, holds
   the obligation — a transferable one-shot is state a server may simply keep —
   and answers it when its interrupt line delivers something. The kernel never
-  learns what a UART is, exactly as it never learns what a timeout is.
+  learns what a UART is.
 - **Cancellation is the drop, and the server is told by a level it was
   already watching.** A client that gives up composes its own deadline — a
   Waiter with the claim and a Timer on it — and drops the claim when the timer
@@ -673,6 +756,22 @@ a reply delivery carries, which is why there is one type and not two — and
   there is no idle-and-doomed state for it to see. The typed surface needs
   nothing new, since `Waiter.wait` already answers `Result<WaitResult,
   SosStatus>`.
+- **A wait can have a deadline, and can be woken.** `Wait` reads its caller's
+  wait word (§7) when it would park. Readiness comes first: a wait that finds
+  a record to deliver delivers it whatever the word says, the Timers it looks
+  at brought up to the clock first (§2.6). A word of 0 then parks as above. On
+  a wakeable word, a latched wake answers `Woken` at once and clears the
+  latch, and otherwise a deadline at or before the clock's reading answers
+  `TimedOut` at once; neither is a park. Otherwise the thread parks with the
+  deadline recorded, and the park ends at the first of a delivery, a
+  revocation, the deadline (`TimedOut`) and another thread's wake (`Woken`).
+  An early end has the revocation's shape: the thread is unlinked from the
+  blocked list, no record is written and the buffer is as it was left, and
+  nothing is consumed, so an attachment that becomes ready afterwards is
+  delivered to the next wait as any ready attachment is. The wait leg of
+  `ReplyWait` (below) is this park. The runtime's `Waiter.wait` makes the
+  wakeable form only while the thread has tasks to run, and hands neither
+  status to its caller (§10.1).
 - **Copy-out is checked, and it is one door.** The destination must be a
   buffer the kernel may write (the buffer rule, below); one that is not
   terminates the process (§5.7's faults ruling — a process knows its own
@@ -710,7 +809,8 @@ a reply delivery carries, which is why there is one type and not two — and
   call's (§2.1), is asked at its second reading in the call's order (the
   record, its length, the body, then the connection's state) and held to the
   call's rules, but for a handle word the call would have faulted on, which
-  arrives empty because the caller is not running to be faulted. A wake that
+  arrives empty because the caller is not running to be faulted (a word
+  naming a claim a wakeable park holds, §2.1, among them). A wake that
   writes a buffer asks it before anything else that could answer the thread with
   a status (room in its table, for one), so a process whose buffer is gone ends
   with `BadBuffer` whether or not that answer was owed. A wake that carries only
@@ -841,8 +941,10 @@ a reply delivery carries, which is why there is one type and not two — and
   an object that is already attached faults the caller (`BadState`), through
   any holder's handle: the rule binds every holder of the object, so holders
   must agree which of them attaches it, and a giver that attaches an object
-  itself withholds `Wait` when it gives the object on. `WaiterOp.Add` takes a
-  target, a key and a flags word (§5.7).
+  itself withholds `Wait` when it gives the object on. A claim a wakeable
+  park holds (§2.1) is refused the same way, `BadState`, whether attached
+  borrowing or consuming. `WaiterOp.Add` takes a target, a key and a flags
+  word (§5.7).
 - **One-shot is an opt-in property of the attachment.** `AttachMode.OneShot`
   detaches at delivery — when the record for its key is copied out, never at
   mere readiness — and the delivery is otherwise identical. It is the
@@ -1745,8 +1847,9 @@ facility. Obtained through `SystemOp.ClockGet` on `SystemRight.ClockGet`; ops
   rather than a row in this table. Not implemented: virtual clocks.
 
 **Timer.** A deadline object bound to the Clock that created it, and directly
-waitable; it is the process-sleep primitive (without it a wait either returns
-at once or blocks forever). Ops `Arm`/`Disarm`; rights `TimerRight.Arm`
+waitable: it is how a wait on a Waiter ends on time, once or on an interval,
+beside whatever else the Waiter watches. A thread's own deadline on a park is
+its wait word instead (below, §7). Ops `Arm`/`Disarm`; rights `TimerRight.Arm`
 (gating both) and `.Wait`.
 
 - `arm(after_ns, interval_ns)` arrives through the copy-in record (§2.2),
@@ -1799,18 +1902,39 @@ at once or blocks forever). Ops `Arm`/`Disarm`; rights `TimerRight.Arm`
   to §9's ack-with-no-fire — a one-shot disarms itself, so cancelling a
   timeout that just expired is an ordinary race rather than a caller error.
 
-**One hardware timer, two customers.** Both machines have a single
-comparator, and the scheduler tick (§7) and every armed Timer want it. The
+**One hardware timer, three customers.** Both machines have a single
+comparator, and the scheduler tick (§7), every armed Timer and every parked
+thread's deadline (below) want it. The
 per-arch seam is absolute (`timer_now_ns()` + `timer_set_deadline_ns(at)`) — a
 periodic seam can express exactly one customer — and the tick's period lives
 in the arch-free kernel, where scheduler policy belongs. The kernel keeps every
 deadline it owes in nanoseconds and programs the earliest; a fire means
 "something may be due", and one reading of the clock answers for every
 customer with the tick asked first. The tick is inviolate by construction: a
-Timer deadline can only ever move the hardware earlier, never later. The two
+Timer's or a parked thread's deadline can only ever move the hardware earlier,
+never later. The two
 re-arm rules are opposite, deliberately: the tick re-arms from now (a late tick
 is one tick, never a burst of catch-up), a Timer from its own deadline — a
 timeslice has no history to be faithful to and an interval does.
+
+**Deadlines are on the Monotonic clock.** A thread's wait word (§7) holds an
+instant in the Monotonic domain: nanoseconds of the machine counter
+`timer_now_ns()` reads, the reading `ClockOp.Now` answers and the time every
+Timer is armed in. A parked thread's deadline is the comparator's third customer
+(above). The kernel keeps it beside the Timers' and the tick's and programs the
+earliest of them by the rules above, the floor included, so a deadline, like a
+Timer, can only move the hardware earlier. Each fire expires every parked thread
+whose deadline is at or before its reading, answering it `TimedOut`, beside the
+Timers it expires.
+
+**A deadline is the Clock's capability too.** A thread that could park until
+an instant it chose and see whether the park ended `TimedOut` could read the
+clock by bisection. So a thread registers its wait word with a Monotonic
+Clock handle carrying `ClockRight.Read`, or with none (§7), and only a thread
+registered with a Clock may write a finite deadline. One registered with none
+may write only `0` and `UInt64.max`, which name no instant, and a finite
+deadline from it is the `AccessDenied` fault at the park. The right is
+checked once, at the registration, so a bounded park still costs one trap.
 
 ### 2.7 Process
 
@@ -2658,6 +2782,15 @@ caller one, and the boot charges root one for each
   on one process, not a share of its launcher's. A child's mapping row is
   clamped at its create to the grant rows its domain has left after its
   image, as root's is. There is no per-create quota argument.
+- **The compiled `Handle` default is 16**, below every board's `MAX_HANDLES`,
+  so a child meets its own budget before the table. It leaves room for what
+  the runtime's task executor spends (§10.1): one row per process for its
+  Clock, and one for each bounded `send` in flight. A thread's bounded `send`
+  holds its claim while it drives, so a task's own bounded `send` nested
+  inside it adds another, and the rows grow with each thread's send-nesting
+  depth. The default leaves room for the default four threads each to have
+  one in flight; past that, `send` falls back to a plain `Call` and keeps
+  working, losing only the bound.
 - **`Pipe` counts a connection.** `ProcessOp.PipeCreate` charges it once, and
   the credit lands when both of the connection's reference columns reach zero
   and the slot goes back. Charging per endpoint would be wrong: two ends of
@@ -2670,8 +2803,10 @@ caller one, and the boot charges root one for each
   the creator was already charged for, so `QuotaKind.Pipe` covers the row and
   its whole staging ring. An exchange spends `QuotaKind.Handle` twice — one
   entry for the claim at the post and one for the obligation at the take —
-  the ordinary rule that a capability costs a table row; a fused `Call` mints
-  neither, a difference of handle traffic and of nothing else.
+  the ordinary rule that a capability costs a table row; a plain fused `Call`
+  mints neither, a difference of handle traffic and of nothing else. A
+  wakeable `Call` mints the claim at the stage, as a `Post` does, so a table
+  with no row for it refuses the call before anything is staged (§2.1).
 - **Attachments have no column.** They are bounded by `MAX_ATTACHMENTS` — a
   floor, since `Attachments` is a donatable kind — because an attachment
   already costs the one thing quotas count on this axis: a Waiter to hold it,
@@ -3098,9 +3233,10 @@ have no field.
   it names no object and is intercepted before the lookup, with `NO_HANDLE`
   in the handle register (§8). It takes its number from the band so that no
   per-kind table can grow into it, and every table stays below it.
-  `THREAD_ID_OP` (`0xFFFB`), `LOCK_WAIT_OP` (`0xFFFA`) and `LOCK_WAKE_OP`
-  (`0xFFF9`) continue the band on the same terms (§7), and every table stays
-  below the lowest of them.
+  `THREAD_ID_OP` (`0xFFFB`), `LOCK_WAIT_OP` (`0xFFFA`), `LOCK_WAKE_OP`
+  (`0xFFF9`), `WAIT_WORD_OP` (`0xFFF8`), `THREAD_WAKE_OP` (`0xFFF7`) and
+  `PARK_OP` (`0xFFF6`) continue the band on the same terms (§7), and every
+  table stays below the lowest of them.
 
   **The typed tier spells every mask.** Every kind's rights enum is public in
   the `sos` module, because a keep mask is assembled from its bits at a mint, a
@@ -3223,8 +3359,9 @@ have no field.
     the caller for a handle that names nothing (`BadHandle`), a caller handle
     without `ProcessRight.Give` or a given handle without `Transfer`
     (`AccessDenied`), a kind no boot record can carry (`BadArg`), a child
-    already started (`BadState`) and a duplicate tag (`DuplicateKey`), and it
-    checks every fault before touching either table. It answers a status —
+    already started or a given claim a wakeable park holds (`BadState`,
+    §2.1) and a duplicate tag (`DuplicateKey`), and it checks every fault
+    before touching either table. It answers a status —
     `NoResource` when the child's table or boot set is full, `QuotaExceeded`
     when the child is at its handle budget — and then the give has not happened:
     the child-side binding is made first, so a refusal leaves the caller's entry
@@ -3233,8 +3370,9 @@ have no field.
     flags word outside the published set or a consuming flag on an Interrupt
     target (`BadArg`, §2.2), a target that names
     nothing (`BadHandle`), is not waitable (`NotWaitable`) or lacks its `Wait`
-    right (`AccessDenied`), a target already attached to a Waiter (`BadState`)
-    and a duplicate key (`DuplicateKey`), and answers `NoResource` when the
+    right (`AccessDenied`), a target already attached to a Waiter or a claim
+    a wakeable park holds (`BadState`, §2.1) and a duplicate key
+    (`DuplicateKey`), and answers `NoResource` when the
     attachment slab is full, having consumed nothing.
   - **What the typed tier does on a status.** A status refusal (`NoResource`,
     `QuotaExceeded`) is a resource condition, and the caller keeps what it had:
@@ -3252,7 +3390,8 @@ have no field.
     the caller's table and its reference dropped, so an object whose last handle
     this was is destroyed (a pipe end reaching zero tells its peer, for
     example). The typed tier empties the carrier on those outcomes. A bad
-    carried handle faults the caller before anything is taken, and so does a
+    carried handle faults the caller before anything is taken, a claim a
+    wakeable park holds among them (`BadState`, §2.1), and so does a
     carried word equal to the handle the op is invoked through when the op
     consumes that handle: `Reply` and `ReplyWait` consume the request handle,
     which therefore cannot travel in their own message (`BadArg`). Nor can
@@ -3265,12 +3404,16 @@ have no field.
     gone, nothing could reach the connection to free it. A `Call` that parked
     for room is checked again when it resumes, from a record a sibling thread
     may have rewritten; there is no running caller to fault, so the slot naming
-    such an outlet arrives empty and the outlet stays in the caller's table. A
+    such an outlet arrives empty and the outlet stays in the caller's table,
+    as does a slot naming a claim a wakeable park holds. A
     reply is unaffected, since it carries handles back to the client and not
     into the request's own ring. No new status marks the difference; the status
-    says which half applies. The fused `send_with` never refuses the send itself
-    transiently, since it parks for room and mints no claim, so its `PeerClosed`
-    consumes the handles whether or not the message was staged. A `NoResource`
+    says which half applies. A plain fused `Call` never refuses the send
+    itself transiently, since it parks for room and mints no claim, so its
+    `PeerClosed` consumes the handles whether or not the message was staged.
+    A wakeable `Call` refuses transiently only for its claim's row
+    (`QuotaExceeded`, `NoResource`, §2.1), before anything is staged, and
+    leaves the carried handles in the caller's table. A `NoResource`
     or `QuotaExceeded` answered at the reply's delivery comes after the carried
     handles were staged, so it consumes them too. A reply refuses nothing
     transiently either: `reply_with` and `reply_wait_with` consume their handles
@@ -3573,8 +3716,14 @@ process walk, §2.8), `Revoked` (§2.2, every op on an invalid
 object, §2.10, a sender handle asked of a dead sender, §2.1, and a lookup of a
 pid the record table does not hold or holds for a process not yet started,
 §2.8), `PeerClosed` and
-`WouldBlock` (§2.1) — with `Unknown` the userspace mapping artifact. A dynamic
-resource condition answers with a status; broken code faults.
+`WouldBlock` (§2.1), `TimedOut` (12: a wakeable park's deadline came first, or
+had passed at the op, §7) and `Woken` (13: another thread of the process ended
+a wakeable park, or a wake was latched at the op, §7) — with `Unknown` the
+userspace mapping artifact. A dynamic resource condition answers with a
+status; broken code faults. `TimedOut` and `Woken` are statuses because the
+clock or another thread decided, and neither consumes what the op waited for.
+They are not `WouldBlock`, which is a poll op's "not now" with no park, nor
+`Revoked` (what was waited on is gone), nor `PeerClosed` (the far end gone).
 
 **Dispatch** is §3's shape verbatim: handle-table lookup → object type → op
 table → rights check → op. The System object (§2.8) is minted to root at boot,
@@ -3582,9 +3731,9 @@ and `debug_print` / `shutdown(status)` are among its ops (§2.8 lists them),
 rights-gated (`SystemRight.Debug`/`.Shutdown`) — a process without the System
 handle cannot even print. Process exit is a Process op. A panic names no
 object: `PANIC_OP` with `NO_HANDLE` in the handle register is intercepted
-before the table lookup and ends the caller (§8). The thread ID op and the
-lock's two ops are intercepted the same way (§7). Ops map 1:1 onto the
-`sos` module's typed wrappers (`system.debug_print(...)`,
+before the table lookup and ends the caller (§8). The thread ID op, the
+lock's two ops and the wait word's three are intercepted the same way (§7).
+Ops map 1:1 onto the `sos` module's typed wrappers (`system.debug_print(...)`,
 `-> Result<T, SosStatus>`). Op tables and rights sets are named for the §2
 object, spelled out (`SystemOp`, `ProcessOp`, `ThreadOp` beside `SystemRight`,
 …).
@@ -3600,7 +3749,42 @@ object, `PANIC_OP` (§8), is not a facility: it ends its caller, which a process
 can already do by naming a handle it does not hold, and it reaches nothing
 else. Nor are the ops that name no object for the lock (§7): the thread ID op
 answers the caller's own ID, which grants nothing, and the lock's wait and
-wake act only on the calling thread and a lock of its own process.
+wake act only on the calling thread and a lock of its own process. Nor are
+the wait word's: `WAIT_WORD_OP` and `PARK_OP` act only on the calling thread,
+and `THREAD_WAKE_OP` only on a thread of the caller's own process, whose
+threads already share every byte. The one authority they touch is the
+clock's: a finite deadline is a reading of time, so `WAIT_WORD_OP` takes a
+Clock handle as an argument and spends its `ClockRight.Read` (§2.6, §7).
+
+**The no-handle band, in full.** Each of these ops is made with `NO_HANDLE` in
+the handle register and intercepted before the lookup; made with any other
+word it is looked up as every op is, and no kind's table reaches it.
+
+| op | number | what it does |
+|---|---|---|
+| `PANIC_OP` | `0xFFFC` | ends the caller as a panic (§8) |
+| `THREAD_ID_OP` | `0xFFFB` | answers the calling thread's ID (§7) |
+| `LOCK_WAIT_OP` | `0xFFFA` | waits for an in-process lock found held (§7) |
+| `LOCK_WAKE_OP` | `0xFFF9` | answers the threads parked on a lock given back (§7) |
+| `WAIT_WORD_OP` | `0xFFF8` | registers, or with 0 unregisters, the calling thread's wait word, with a Monotonic Clock handle carrying `ClockRight.Read` or with none (§7) |
+| `THREAD_WAKE_OP` | `0xFFF7` | wakes a thread of the caller's process by its ID (§7) |
+| `PARK_OP` | `0xFFF6` | parks the caller on nothing, until its deadline or a wake (§7) |
+
+`OP_BAND_FLOOR`, the number every per-object table stays below, is
+`PARK_OP`'s. The numbers are not ABI (below).
+
+**A park's bound is a word in memory, not an argument.** A deadline and a
+wake apply to every park the kernel offers, and none of those ops takes a
+deadline: the thread registers one wait word, and the kernel reads it at
+each park (§7). An absolute 64-bit deadline is two registers on the 32-bit
+profiles, and `Call` already fills its three, so an argument would have meant
+a wide form of every parking op. As a word, no op changes shape, a bounded
+wait is one trap (the deadline is a store to the thread's own memory, and
+the Clock's right was checked once, at the registration), and a word of 0, or
+none registered, is the unbounded park, so a caller of the other parking ops
+that never writes a word sees neither new status. `PARK_OP` is the exception
+by construction: it is always wakeable, so its caller always sees
+`TimedOut` or `Woken`, word or no word.
 
 **The boot set is one handle wide at the entry register.** A process enters user
 mode with exactly one word in its first argument register — root's System
@@ -3733,7 +3917,8 @@ copy-out record:
   unlikely. A caller error ends the caller by the faults ruling. One path asks
   twice, and it has to: a `Call` that met a full ring re-reads its argument
   record at the resume, since a sibling thread may have rewritten it. The three
-  questions are asked again there, and a slot that fails one simply arrives
+  questions are asked again there, with a fourth, whether the word names a
+  claim a wakeable park holds (§2.1), and a slot that fails one simply arrives
   empty — there is no honest fault to raise at a resume, because the caller is
   not the running process. The record's length is the exception, because it
   sizes the body copy: one past `PIPE_BODY_BYTES` at the resume is owed
@@ -4102,11 +4287,14 @@ arm their own.
   its grant record is edited, and the switch is one table-base write. A
   same-process switch reloads nothing.
 - **Nothing runnable is idle or deadlock.** The kernel idles iff something
-  outside the thread set can still wake somebody — a bound interrupt line or an
-  armed Timer (an unarmed Timer is not one: it will never fire) — and reports
-  deadlock otherwise (§9). The tick is not such a source: with every thread
-  blocked and nothing bound or armed, the machine is deadlocked whether or not
-  a tick is running. The test is made again whenever the idle finds nothing
+  outside the thread set can still wake somebody — a bound interrupt line, an
+  armed Timer (an unarmed Timer is not one: it will never fire), or a thread
+  parked with a deadline (below), which the clock will ready as it readies an
+  armed Timer's waiter — and reports deadlock otherwise (§9). A thread parked
+  wakeable with no deadline is no such source: only another thread can wake
+  it. The tick is not such a source either: with every thread blocked and
+  nothing bound, armed or due, the machine is deadlocked whether or not a
+  tick is running. The test is made again whenever the idle finds nothing
   runnable after a delivery, so the last source going without waking anybody
   (a one-shot Timer that fires with nothing attached to it) is a deadlock at
   that moment, not a sleep for good.
@@ -4338,6 +4526,154 @@ arm their own.
   `LOCK_WAKE_OP`. A wait that answers `Revoked`, the holder having exited
   holding the lock, panics, naming the output lock. The panic sink takes the
   lock and never gives it back.
+- **The one-word lock.** Saw's runtime lock seams (`__saw_rt_lock_acquire`
+  and `_release`, which std's channels take) lock one word, zero while free,
+  and inherit through this section's lock:
+  - **The word.** While the lock is held it holds the holder's runtime record
+    (§10.1), or on a thread with no block its odd lock-owner identity.
+  - **Acquire** swaps the word from 0 to the caller's own and raises the
+    thread's lock depth, kept in its record. When the depth goes from 0 to 1
+    the thread takes its record's own inheritance pair with its thread ID. No
+    other thread takes that pair, so this never waits.
+  - **Contention.** An acquire that finds the word held reads the holder. A
+    record is waited on with `LOCK_WAIT_OP` on that record's pair, made
+    while the thread's wait word is 0, so the park is plain and a latched
+    wake never surfaces there as `Woken`. The kernel raises the holder to
+    the waiter's level and answers once the holder has given back every
+    runtime lock it holds, and the waiter swaps again. A holder with no
+    block has no record and no pair, and is spun on: the waiter yields and
+    swaps again, and a waiter with no block of its own holds no Thread
+    handle to yield through (the section word's cost, above), so it spins.
+  - **Release** swaps the caller's own back to 0 and drops the depth. At 0 it
+    gives the pair back, with `LOCK_WAKE_OP` when the waiters flag is set.
+  - **What it leaves stated.** Records are never freed, so a stale holder read
+    is still a record. One given to another thread since makes the waiter wait
+    for that thread instead, which is spurious and ends. The lock is not
+    recursive: before it swaps, an acquire compares the word with the caller's
+    own identity, and a match panics, naming the lock, whether the thread has a
+    block or not, so no thread waits on itself. A wait that answers `Revoked`,
+    the holder having exited holding a runtime lock, panics, naming the lock, as
+    the output lock's wait does; a thread that ends holding one keeps its record
+    for good.
+- **Deadlines and wakes: the wait word.** A thread may register one doubleword
+  in its own memory with `WAIT_WORD_OP(addr, clock)`, made with `NO_HANDLE` as
+  the lock's ops are, and so are `PARK_OP` and `THREAD_WAKE_OP` (below). The
+  second argument is a Monotonic Clock handle carrying `ClockRight.Read`, or
+  `NO_HANDLE`: a deadline is a reading of time, which is the Clock's capability
+  (§2.6), so only a thread registered with a Clock may write a finite one. The
+  wake and the bare park need no right. The kernel keeps the address and reads
+  the word, through the copy-in door, once per op, at the op's first park, for
+  every park the kernel offers: `Wait` (and the wait leg of `ReplyWait`),
+  `Join`, `LOCK_WAIT_OP`, `Call`'s room park and reply park, `Resolve`, and
+  `PARK_OP`. Its values:
+
+  | word | the park is |
+  |---|---|
+  | `0` | **plain**: no deadline, and a wake does not end it; a wake latches for later |
+  | `UInt64.max` (`NEVER_NS`) | **wakeable**, with no deadline |
+  | any other | **wakeable**, with that deadline on the Monotonic clock (§2.6); only for a thread registered with a Clock |
+
+  A thread with no word registered parks plain, so a plain park is exactly
+  the park a thread that never writes a word makes.
+- **The order at an op that would park.**
+  1. An op that can answer now answers as it would with no word: readiness
+     wins over every deadline (a ready attachment, an exited thread, a
+     settled reply, a lock found free).
+  2. Otherwise the word is read. A finite deadline from a thread registered with
+     no Clock is the `AccessDenied` fault: by the faults ruling (§5.7) it is a
+     caller error, since the thread knows how it registered, and `AccessDenied`
+     is what using a handle without its right is. Otherwise, on a wakeable word,
+     a latched wake (below) is cleared and answers `Woken` without parking.
+     `PARK_OP` is wakeable whatever its word, 0 and no word included, so it
+     always reads the latch. Failing that, a deadline at or before the clock's
+     reading answers `TimedOut` without parking. Neither is a park, so neither
+     meets the section rule (above); a park inside a held section is still the
+     `SectionHeld` fault.
+  3. Otherwise the thread parks. The kernel records the park's deadline and
+     whether it is wakeable in the thread's slot, beside its latch: the word
+     is read once per op, at its first park, and a write to it while the
+     thread is parked changes nothing for that op. A `Call` whose room park
+     ends in a stage goes on to its reply park inside the trap of whichever
+     thread freed the slot, which cannot read the parked thread's memory as
+     its own, so the reply park carries over the room park's recorded
+     deadline and wakeability without reading the word again (§2.1).
+
+  A park ends early at its deadline with `TimedOut` (§2.6), or at a wake with
+  `Woken`. Either way the kernel takes the thread off whatever it is parked
+  on, as the op's own wake would, and consumes nothing the op waited for.
+  Each op's section says what its early end leaves: `Wait` (§2.2), `Call`,
+  `Resolve` and `ReplyWait` (§2.1), `Join` (§8). A `LOCK_WAIT_OP` that ends
+  early is taken off its holder, and the holder is brought back to the
+  highest of its base level and its remaining waiters'; the waiters flag
+  stays set, so the holder's give makes one `LOCK_WAKE_OP` that answers
+  nobody, which is harmless.
+- **The wait word's answers.** `WAIT_WORD_OP(addr, clock)` registers the
+  calling thread's word; a later registration replaces the earlier one, its
+  Clock or the lack of one included. In the order they are decided:
+  - an address of 0 unregisters the word, and the `clock` word is not read;
+  - the `clock` word: `NO_HANDLE` registers with no Clock; a word that names
+    nothing, or names an object that is not a Clock, is the `BadHandle`
+    fault; a Clock handle without `ClockRight.Read` is the `AccessDenied`
+    fault;
+  - the address: one that is not eight-aligned is the `BadAlign` fault, and
+    a doubleword the copy-in door refuses at the registration is that door's
+    fault.
+
+  It answers `Ok`. The right is checked here, once: the kernel keeps the
+  address and whether a Clock came with it, and nothing at a park asks
+  about the handle again, so a bounded park stays one trap, and releasing
+  the Clock handle later changes nothing for the registration. The word is
+  read again at each op's first park, so a word whose row has gone by then
+  is the door's fault at that park, as for any buffer (§2.2).
+- **A bare park.** `PARK_OP` parks the caller on nothing. It is always
+  wakeable, since a park on nothing that no wake could end would end only at
+  its deadline, or never. It takes its deadline from the word, where no word,
+  0 and `NEVER_NS` all mean none, and it reads the latch whatever its word.
+  It answers `TimedOut` or `Woken`, never `Ok`, so its caller sees both
+  statuses whether or not it registered a word.
+- **The wake.** `THREAD_WAKE_OP(id)` wakes the thread `id` names. A thread
+  parked wakeable has that park ended with `Woken` and is readied. A thread
+  parked plain, or not parked, has its latch set, and its next wakeable park
+  answers `Woken` at once. It answers `Ok`. The ID is decoded as
+  `LOCK_WAIT_OP` decodes an owner (above): a thread of the caller's process
+  that has run and not exited is woken; one that has exited, whether or not
+  its slot has been freed since, answers `Revoked`, as an exited thread of a
+  process that has died does; a thread of another live process, live or
+  exited, and anything that names no thread there is (a free slot, a thread
+  never started, an invalid thread, an ID naming no thread there ever was)
+  is the `BadArg` fault. The wake writes no line of its own before that
+  fault, unlike `LOCK_WAIT_OP`'s cross-process line: no memory is shared
+  that the line would diagnose, and the fault line names the process. A
+  thread may wake itself, which sets its own latch.
+- **Who may wake whom.** A thread of the same process, by ID, with no handle
+  and no right, on `LOCK_WAKE_OP`'s terms: the op acts only inside the
+  caller's process, whose threads already share every byte, and a thread
+  that holds no Thread handle of its own must still be able to wake and be
+  woken.
+- **The latch** is one flag per thread, in the kernel. A wake that finds its
+  thread parked wakeable ends that park and leaves no latch; any other wake
+  sets it. It is cleared only when it ends a wakeable park, at the op, which
+  answers `Woken` without parking. Plain parks neither read nor clear it, so
+  a wait a thread makes with its word at 0 is never cut short, the runtime's
+  lock waits and the output lock's among them (§10.1), and a wake made
+  meanwhile is kept for the thread's next wakeable park. A thread starts with
+  no word registered and its latch clear (§8).
+- **Nothing here assumes one core.** Today the kernel runs on one core
+  (below), and a wake's "set the latch, or end the park" and a park's
+  "check the latch, then park" are two kernel sections that cannot
+  interleave because the kernel runs with interrupts masked. The
+  second-core design keeps that true: every kernel entry there holds its
+  one big lock, so the two sections still cannot interleave, on one core or
+  two. The word is read only by its own thread's trap, on whichever core
+  that thread runs. A wake that readies a thread on the other core raises
+  that core's reschedule flag and sends its reschedule IPI, which that
+  design provides. There, expiry rides core 0's comparator with every
+  Timer, so a core-1 thread's expiry is such a cross-core wake; when Timers
+  become per core, thread deadlines move with them.
+- **The wait word's `sos` side.** The floor exports `sos_wait_word`,
+  `sos_thread_wake` and `sos_park`. The runtime registers each thread's word
+  as the thread enters its block, with the process's Clock once it holds one,
+  and its task executor writes it around the waits it bounds (§10.1).
 - **Launching is a capability.** `process_create` requires the launch
   capability, `SystemRight.ProcessCreate`, minted at boot to the root
   server. Ordinary processes cannot create processes in v1 — they ask the
@@ -4463,9 +4799,15 @@ reads one word for every such end, and what a panic does is the kernel's.
 fixed-width word (kind in the high bits — `Running` beside the three below —
 code in the low). Thread `Start`/`Join`/`Exit`/`Yield`; `Start` carries the
 thread's band (§7). Every thread has an ID, and `LOCK_WAIT_OP` and
-`LOCK_WAKE_OP` are the in-process lock (§7).
+`LOCK_WAKE_OP` are the in-process lock (§7). Not built yet: the wait word's
+ops, `WAIT_WORD_OP`, `THREAD_WAKE_OP` and `PARK_OP` (§7, §11).
 A joiner parks on the target's list and is answered exactly once through the
-funnel §2.2 describes.
+funnel §2.2 describes. A joiner whose wait word is wakeable (§7) can be
+answered `TimedOut` or `Woken` instead: it is taken off the target's list and
+the target is untouched, so a later `Join` reads its code as any join does. A
+thread starts with no wait word registered and its wake latch clear: a slot's
+latch is reset when the slot is reused, so a wake latched for a thread never
+reaches the next thread in its slot.
 Process waitability (below). Not built: a thread handle is not waitable —
 attaching one is a `NotWaitable` fault, and it is the last kind for which that
 arm is a scope line rather than a statement about the object.
@@ -4489,6 +4831,21 @@ counters in its body's row until a create reuses the body.
   thread shares mutable state with its process — "keep running minus
   one thread" is silent corruption). Kernel teardown-on-exit/fault
   runs unconditionally (§2.10).
+- **A thread's tasks end with it.** The runtime closes a thread's background
+  tasks (§10.1) as the thread ends, through `sos.exec.end_thread_tasks()`,
+  which cancels and joins every task the thread still holds (Saw's
+  `__saw_background_close`) and gives the thread's runtime record back.
+  `sosmain` calls it after `main` returns, and a `thread_create(run:)` thread
+  after `run` returns. An `@export _start` program owns its threads' ends and
+  calls it as each thread's last Saw code; a thread that ends without it
+  abandons its tasks with it. `Process.exit` does not close: the teardown
+  frees every object and the whole region at once, so nothing a close would
+  release outlives it; a close runs program code, since a cancelled task
+  finishes through its own; it can wait without bound, on a task that ignores
+  its cancel or is parked in a join; and an exit is often made inside a
+  task's turn, where a close panics. `Thread.exit` does not close either, for
+  the last two reasons, and a thread that ends that way leaves its executor
+  record and its runtime record claimed.
 - **No thread kill.** Threads are expected to be pool workers: created at
   startup, draining task queues, dying at process exit. Work completion is a
   task-level concept (channels/Events), not a thread concept. A
@@ -4917,14 +5274,222 @@ whose boot flags turn the tick off.
   contexts share. SMP is what will force the lock (§11), and the point
   placements are a real map of where it must go.
 
-## 10. Userspace runtime: HandlerGroup + the wake bridge
+## 10. Userspace runtime: the task executor, and HandlerGroup
+
+### 10.1 The task executor
+
+Not built yet (§11): what follows specifies it.
+
+Saw's tasks run on a cooperative executor in std, which reaches the machine
+through a set of runtime seams (sawlang's `runtime/ABI.md` at the pinned
+toolchain, its "Freestanding executor set"), and outside `main` is driven by
+two entries the compiler defines once a runtime declares both:
+`__saw_background_drive`, which runs the calling thread's tasks for one
+bounded turn and answers when to drive again, and `__saw_background_close`,
+which cancels and joins them as the thread ends. The `sos` module is that
+runtime. `sos.floor` declares both entries, so every program built on `sos`
+owns its threads' background groups and `Task.spawn` compiles in it, and
+`sos.exec` writes the seams. The kernel compiles `kcore`, `sosrt`, `sosabi`,
+`imgformat` and `hal`, and never `sos`, so it declares neither entry, and a
+`Task.spawn` in a kernel source is refused at compile time
+(`spawn.freestanding`).
+
+**Which threads run tasks.** A thread's executor word, where std keeps the
+address of its executor record, is a field of the thread's block
+(`ThreadBlock`, §5c), which the thread register names, so reading it is one
+register read and one load. A block is `{thread, id, executor, record,
+wait}`: the thread's own Thread handle, its ID, the executor word, its runtime
+record (below), and its wait word (§7), one doubleword, eight-aligned.
+`enter_thread_block` registers the wait word with `WAIT_WORD_OP`, one trap at
+each thread's start, with the process's Clock (below) if the runtime holds it
+by then and with none otherwise, so a program that never runs a task needs no
+`ClockGet`. Before a thread writes any finite word, the past instant `1` a
+wrapper writes for a drive's `0` included (below), a thread registered with
+none registers again with the process's Clock, getting the Clock first if the
+process holds none: one trap more, once per thread, and its record notes that
+it has. So a process that runs tasks needs `SystemRight.ClockGet` (below). A
+word registered with no Clock still serves `0` and `NEVER_NS`, the unbounded
+and the wakeable-forever parks (§2.6, §7).
+
+- **Who has a block:** the main thread of every `main` program, root's
+  included, in `sosmain`'s start-up frame, and every `thread_create(run:)`
+  thread, at the head of its start record.
+- **Who has none:** a `thread_create(entry:)` thread, and an `@export _start`
+  program's main thread, unless its code calls `sos.rt.enter_thread_block`
+  with a block it keeps for the thread's life.
+- **A spawn on a thread with no block panics.** There `thread_executor`
+  answers 0, and `set_thread_executor` panics with `sos: this thread has no
+  block; a thread that runs tasks enters one with sos.rt.enter_thread_block
+  before it spawns`. The panic is the runtime's own, not program code.
+
+**The runtime record.** Each thread with a block that parks or locks through
+the runtime has one record, holding its thread ID, `parked` and `seen`
+(below), its lock pair and its lock depth (§7's one-word lock). It keeps no
+kernel object. Records live on a process-wide list that only grows: a thread
+takes a free one, or makes one with the runtime's allocator, the first time
+it needs one, keeps its address in its block, and gives it back at its close
+(§8). A record is never freed, so a stale pointer another thread holds always
+lands in a valid record.
+
+**The process-wide state** is two words:
+
+- one Monotonic Clock handle, got with `ClockGet` the first time the runtime
+  needs it and published by compare-and-swap; a thread that loses the race
+  releases its spare. Before asking, the runtime reads the System handle's
+  kind and rights with `INFO_OP`, as `rt_write` does before it prints, and
+  without `SystemRight.ClockGet` there it panics, naming the missing right,
+  before any op that would fault; it reads the minted Clock's rights the same
+  way and panics, naming `ClockRight.Read`, if a narrowed ceiling left it
+  out. Any other refusal of `ClockGet` (a full table, the quota) panics,
+  naming the refusal;
+- `REACTOR`, a static wake generation.
+
+**The seams.** Each body makes floor ops, atomics and calls to the runtime's
+allocator, and nothing else. No seam runs program code (sawlang's rule, which
+the compiler's window fence relies on), so none calls a typed `sos` wrapper,
+since the wrappers drive (below).
+
+- **`thread_executor` / `set_thread_executor`:** the block's field.
+- **`clock_monotonic_nanos`:** `ClockOp.Now` on the process's Clock, in
+  nanoseconds, one trap.
+- **`sleep_ns(ns)`:** zero returns at once. Otherwise:
+  1. The deadline `D` is the clock's reading plus `ns`, saturating to
+     `NEVER_NS`.
+  2. The thread sets `parked` and writes `D` to its wait word.
+  3. It makes `PARK_OP` until the answer is `TimedOut`. A `Woken` answer is a
+     reactor wake: the sleep sets `seen` to none, so the thread's next poll
+     returns at once, and parks again with the same `D`. Nothing cuts the
+     sleep short, as the seam's contract says, and the wake is not lost.
+  4. It writes 0 to the word and clears `parked`.
+
+  A thread with no block registers a word on its own stack for the sleep,
+  with the process's Clock, parks and unregisters it, three traps more. It
+  has no other word, so nothing is overwritten.
+- **`reactor_create`** stores `REACTOR`'s address and makes nothing;
+  **`reactor_destroy`** does nothing.
+- **`reactor_poll(r, timeout_ms, count_out)`:**
+  1. If the generation has moved from `seen`, set `seen` to it and answer a
+     count of 1.
+  2. A `timeout_ms` of 0 answers a count of 0, with no trap. It is the
+     drive's poll in every turn.
+  3. Otherwise set `parked`, then read the generation again; if it moved,
+     clear `parked` and take the first step's answer.
+  4. Write the wait word: the clock's reading plus `timeout_ms` × 10^6 ns,
+     saturating to `NEVER_NS` as `sleep_ns`'s sum does, or `NEVER_NS` for a
+     negative timeout.
+  5. Make `PARK_OP`.
+  6. Write 0 to the word, clear `parked`, and set `seen` to the generation.
+  7. Answer a count of 1 for `Woken` and 0 for `TimedOut`.
+
+  It makes two traps, the clock read and the park, and none for a zero
+  timeout.
+- **`reactor_wake(r)`** adds one to the generation, then makes
+  `THREAD_WAKE_OP` with the ID of every record whose `parked` is set, one
+  trap per parked thread. A `Revoked` answer is ignored: that thread is gone.
+  It may be made from any thread, one with no block included, since it
+  touches no record of its own.
+  - **`parked` and the generation are a Dekker pair**, sequentially
+    consistent: a parker sets `parked` and then reads the generation, a
+    waker moves the generation and then reads `parked`, so at least one sees
+    the other. A thread that is not parked meets the generation at its next
+    poll.
+  - **The latch catches the race.** A wake that lands as a thread returns
+    from its park is latched (§7), so that thread's next wakeable park
+    returns early, which a poll is allowed to do.
+- **`lock_acquire` / `lock_release`:** §7's one-word lock.
+
+**The drive in the typed wrappers.** Each wrapper that parks for a program
+drives the thread's tasks around its op: `Waiter.wait`,
+`PipeRequest.reply_wait` (and `_with`), `PipeInlet.send` (and `_with`),
+`PipeReply.resolve` and `Thread.join`. Each ends at the floor's syscall
+stubs, which are not seams, so the window fence already counts every wrapper
+as running tasks. A wrapper bounds its wait in its one trap:
+
+1. It calls `background_drive()`. On `-1`, no task is live: it makes the op
+   with the word at 0, a plain park, and stops.
+2. Otherwise it writes the wait word from the answer: `1`, a past instant,
+   for `0`, so a ready op answers and anything else answers `TimedOut` at
+   once, and the event the program waits for is still served once per turn;
+   `NEVER_NS` for `INT64_MAX`; and the answer itself for a deadline, which is
+   already an absolute instant on the Monotonic clock.
+3. It sets `parked` and checks the generation, as the poll does; if it moved,
+   it clears `parked` and drives again. Then it makes the op, the one trap,
+   and writes 0 to the word and clears `parked`.
+4. On `TimedOut` or `Woken` it goes back to step 1.
+5. Anything else is the op's answer, and the wrapper's.
+
+| wrapper | after `TimedOut` or `Woken`, re-issued as |
+|---|---|
+| `Waiter.wait` | the same `Wait` |
+| `PipeRequest.reply_wait(_with)` | a driving `Waiter.wait`, since the reply was delivered (§2.1) |
+| `PipeInlet.send(_with)` | after the room park, which staged nothing, the same `Call`; after the reply park, a driving `Resolve` of the claim it handed back (§2.1) |
+| `PipeReply.resolve` | the same `Resolve`; the typed `consumes` wrapper spends the claim only at the end that answers it |
+| `Thread.join` | the same `Join` |
+
+**`send` on a full table.** A wakeable `Call` that finds no row for its claim
+answers `QuotaExceeded` or `NoResource`, with nothing staged and the carried
+handles still the caller's (§2.1). `send` then makes the same `Call` again
+with the word at 0: a plain `Call`, which mints no claim and goes through.
+That one call is unbounded, and the thread's tasks wait with it; the next
+`send` tries the wakeable form again. Nothing was staged, so the message goes
+out exactly once, and the caller sees no status it would not have seen
+without tasks: only the bound is lost. Returning the status instead would make
+a program's sends fail because a task was spawned somewhere on its thread.
+Each fallback adds one to `sos_exec_send_fallbacks()`, a count the runtime
+exports so that a test or a program can see it happened.
+
+**Waits that do not drive.** `Lock.take` does not: the thread may hold
+another `sos.Lock` that its tasks would take. Its park is plain. Nor do the
+seams' own parks — the output lock, the console's calls, the lock seam and
+heap growth — which are plain and never drive, since a seam runs no program
+code.
+
+**Nesting.** A wrapper reached inside a task's turn makes a nested drive,
+which skips the tasks further up the thread's stack and never answers `-1`
+while the calling task lives, so a task's wait is always bounded. Each level
+of nesting holds a turn's frames on the thread's stack.
+
+**The hazards, stated rather than guarded.**
+
+- **A held `sos.Lock` or `Section` across a driving wrapper.** The thread runs
+  its tasks inside the wrapper. A task that takes a `sos.Lock` the thread
+  holds waits on its own thread, the `BadState` fault, and a task that parks
+  inside the section faults the process (`SectionHeld`), as any park there
+  does (§7).
+- **A task that never parks** keeps every drive answering `0`. The wrapper
+  still makes its op once per turn, so the event it waits for is served, but
+  the thread never parks, and holds the processor as any thread that never
+  blocks does (§7).
+
+**Its quota.** The executor costs a child `Handle` rows and no other kernel
+object: one per process, for its Clock, and one for each bounded `send` in
+flight, for the claim a wakeable `Call` mints (§2.1). A bounded `send` holds
+its claim while it drives, so a task's own bounded `send` nested inside it
+mints another: a thread's rows grow with its send-nesting depth, not one per
+thread. A bounded `Resolve` uses the claim the caller already holds, and no
+other wait spends a row. Root's rows are unlimited, and the compiled child
+default leaves room for one bounded `send` on each of the default threads
+(§2.9). Past that, the fallback above keeps every `send` working: a table
+that is full costs only the bound.
+
+**A process whose tasks all wait for good** parks: each of its threads waits
+in a poll or a wrapper with nothing that will end it. When nothing else in the
+machine can run, the kernel's deadlock line is the report (§7); the runtime
+reports nothing of its own.
+
+**What the executor does not reach** is std's thread gate: a
+`Channel.receive` made in thread context, outside any task, and a
+`TaskGroup(threads:)` need seams no runtime here writes (§11).
+
+### 10.2 HandlerGroup and the wake bridge
 
 Not built: `HandlerGroup` is userspace runtime work rather than kernel
 surface, and a process wires a Waiter by hand. What follows specifies it.
 
-Saw's sequential surface stays as it is: `pipe.send()`, `receive()`,
-`read()` suspend in place on plain tasks — colorless straight-line
-code stays the substrate, and TaskGroup remains exactly what it is
+Saw's sequential surface stays as it is: `pipe.send()`, `receive()` and
+`read()` are straight-line calls, which on a thread with live tasks drive
+those tasks while they wait (§10.1) — colorless straight-line code stays the
+substrate, and TaskGroup remains exactly what it is
 (a lifetime/join scope for tasks on a thread pool). The
 event-driven edge of a process gets a second, distinct construct:
 
@@ -4977,9 +5542,9 @@ event-driven edge of a process gets a second, distinct construct:
   calls, and raw waits all ride the same path (this is what §2.2's
   word-sized key was designed for). Implementation freedom (runtime
   design, not spec): whether a HandlerGroup owns its own kernel Waiter
-  or registers through the process runtime's reactor Waiter — the
-  kernel permits both (one Waiter per object; many Waiters per
-  process).
+  or shares one Waiter per process — the kernel permits both (one
+  Waiter per object; many Waiters per process). The task executor's
+  reactor is a wake generation and holds no Waiter (§10.1).
 
 ## 11. What is not built, known limits, and the plan
 
@@ -5005,8 +5570,23 @@ included, beside the build-emitted region table and its kind column (§5.6,
 - **`IntrSpinLock` and SMP** (§9b, §7). A preemption point is the assertion
   that state is consistent, so nothing yet has a critical section for the type
   to protect.
-- **`HandlerGroup`** (§10): userspace runtime work; a process wires a Waiter by
-  hand.
+- **`HandlerGroup`** (§10.2): userspace runtime work; a process wires a Waiter
+  by hand.
+- **Deadlines and wakes on parks** (§7): the wait word, `WAIT_WORD_OP`,
+  `THREAD_WAKE_OP` and `PARK_OP`, the `TimedOut` and `Woken` statuses (§5.7),
+  each park's early end (§2.1, §2.2, §8), the wakeable `Call`'s claim, and
+  the compiled `Handle` default of 16 (§2.9). Specified, not built yet.
+- **The task executor** (§10.1): `sos.exec`'s seams, the drive in the typed
+  wrappers, `send`'s fallback, the one-word lock (§7) and the close at a
+  thread's end (§8). Specified, not built yet; until it is, nothing in `sos`
+  declares the background entries, so a `Task.spawn` in a program is refused
+  at compile time (`spawn.freestanding`).
+- **The thread gate** (§10.1). A `Channel.receive` made in thread context,
+  outside any task, and a `TaskGroup(threads:)` reach std's thread gate, the
+  `__saw_rt_pthread_*` mutex and condition-variable seams, and a
+  `TaskGroup(threads:)` reaches the thread seams (`__saw_rt_thread_spawn` and
+  `_join`) too. No runtime here writes them, so such a program fails at link,
+  naming a missing seam.
 - **The combined wait-and-ack**, `waiter.wait(ack:)` (§9).
 - **DMA confinement — the userspace IOMMU driver, and critical processes**
   (§2.5). On the isolated tiers a `map` fences a driver's CPU and not its
