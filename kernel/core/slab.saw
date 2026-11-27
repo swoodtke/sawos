@@ -196,7 +196,13 @@ extension Slab<T, N> {
     /// Append a donated extent of `slots` slots based at `base`.
     ///
     /// The caller has already validated the region, checked the alignment,
-    /// worked out the slot count and zeroed the bytes; this only records.
+    /// worked out the slot count and zeroed the bytes; this only records. That
+    /// is the trust: every later access to a donated slot reaches through
+    /// `base`, so it is an unsafe pointer, and the caller owes that it is
+    /// physical memory nothing else uses, `slots` slots long. It is physical,
+    /// so it is recorded and never dereferenced as it is (`extent_addr`
+    /// converts).
+    ///
     /// Answers `false` when the extent table is full or the donation would take
     /// the slab past `MAX_SLAB_CAPACITY`, which the caller turns into
     /// `NoResource`.
@@ -206,22 +212,23 @@ extension Slab<T, N> {
     /// is the runtime half of `MAX_SLAB_CAPACITY`'s asserts, which pin the
     /// constant against the handle table and against `Int` overflow; this keeps
     /// a real chain under it.
-    public(package) func donate(&var self, base: UInt, slots: Int) -> Bool {
+    public(package) func donate(&var self, base: UnsafePointer<T>,
+                                slots: Int) unsafe -> Bool {
         self.donate_paired(base, slots, 0)
     }
 
     /// `donate` for a kind that carries a side arena: the same extent, plus the
-    /// arena's base recorded in the same row.
+    /// arena's base recorded in the same row, trusted on `base`'s terms.
     ///
     /// One function writes both columns, so an extent either exists with its
     /// arena or does not exist, and there is no ordering in which a slot is
     /// reachable and its frame is not. `donate` is this with `side = 0`.
-    public(package) func donate_paired(&var self, base: UInt, slots: Int,
-                                       side: UInt) -> Bool {
+    public(package) func donate_paired(&var self, base: UnsafePointer<T>,
+                                       slots: Int, side: UInt) unsafe -> Bool {
         if slots <= 0 { return false }
         if self.ext_count >= MAX_SLAB_EXTENTS { return false }
         if slots > MAX_SLAB_CAPACITY - self.total { return false }
-        self.ext_base[self.ext_count] = base
+        self.ext_base[self.ext_count] = base as UInt
         self.ext_slots[self.ext_count] = slots
         self.ext_side[self.ext_count] = side
         self.ext_count = self.ext_count + 1

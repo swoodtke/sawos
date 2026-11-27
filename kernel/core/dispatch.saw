@@ -178,7 +178,7 @@ import kcore.result.{
     op_value,
     write_result,
 }
-import kcore.pslot.{HandleEntry, PROCESSES, PROCESS_RECORDS, ProcessState,
+import kcore.pslot.{HandleEntry, processes, process_records, ProcessState,
                     body_of, has_body}
 import kcore.objects.{
     ClockObject,
@@ -271,7 +271,7 @@ import kcore.threads.{
     CURRENT_THREAD,
     NEED_RESCHED,
     SIMPLE_BAND_MAP,
-    THREADS,
+    threads,
     ThreadSlot,
     ThreadState,
     alloc_thread,
@@ -584,7 +584,7 @@ func process_next(p: Int, at: UInt) unsafe -> SyscallResult {
     if handle == NO_HANDLE {
         return op_status(mint_refusal(p))
     }
-    var next = PROCESS_RECORDS.at(r).pid
+    var next = process_records().at(r).pid
     if let why = copy_out(ProcessIndex(p), at, ((&var next) as UnsafePointer<UInt64>) as UInt,
                           PID_BYTES) {
         fault_process(p, why)
@@ -771,7 +771,7 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if obj.slot == p {
                 fault_process(p, FaultReason.NotSelf)
             }
-            match PROCESS_RECORDS.at(ProcessIndex(obj.slot)).state {
+            match process_records().at(ProcessIndex(obj.slot)).state {
                 case Gone -> {
                     return op_status(SosStatus.Revoked)
                 },
@@ -791,8 +791,9 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if not obj.allows(ProcessRight.Wait) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            op_value(process_status_word(PROCESS_RECORDS.at(ProcessIndex(obj.slot)).exit_kind,
-                                      PROCESS_RECORDS.at(ProcessIndex(obj.slot)).exit_code))
+            borrow var record = process_records().at(ProcessIndex(obj.slot)) {
+                op_value(process_status_word(record.exit_kind, record.exit_code))
+            }
         },
         // The creation authority for §2's plain objects flows through a handle
         // the process holds (§3's derivation rule). See `ProcessRight`.
@@ -971,12 +972,12 @@ func process_section_word(p: Int, addr: UInt) unsafe -> SyscallResult {
         fault_process(p, FaultReason.BadArg)
     }
     let b = body_of(ProcessIndex(p))
-    if PROCESSES.at(b).section_at != 0 {
+    if processes().at(b).section_at != 0 {
         fault_process(p, FaultReason.BadState)
     }
     let at = hal.phys_to_virt(pa)
     UnsafeMemory<UInt, Normal>(at + word).write(0)
-    PROCESSES.at(b).section_at = at
+    processes().at(b).section_at = at
     op_ok()
 }
 
@@ -995,8 +996,11 @@ func process_section_word(p: Int, addr: UInt) unsafe -> SyscallResult {
 /// The child's cap becomes the highest level of its new map, so what the
 /// child may grant is what it was granted. The last map set before the start
 /// is the one its threads' levels are read from.
+///
+/// `unsafe` though it names nothing unsafe: `p` must be the calling process,
+/// the one `fault_process` ends.
 func process_band_map(p: Int, child: Int, raw: UInt) unsafe -> SyscallResult {
-    match PROCESS_RECORDS.at(ProcessIndex(child)).state {
+    match process_records().at(ProcessIndex(child)).state {
         case Created -> {},
         case _ -> fault_process(p, FaultReason.BadState),
     }
@@ -1005,12 +1009,14 @@ func process_band_map(p: Int, child: Int, raw: UInt) unsafe -> SyscallResult {
     }
     let map = raw as UInt32
     let highest = band_map_highest(map)
-    if highest > PROCESSES.at(body_of(ProcessIndex(p))).level_cap {
+    if highest > processes().at(body_of(ProcessIndex(p))).level_cap {
         fault_process(p, FaultReason.BadArg)
     }
     let b = body_of(ProcessIndex(child))
-    PROCESSES.at(b).bands = map
-    PROCESSES.at(b).level_cap = highest
+    borrow var body = processes().at(b) {
+        body.bands = map
+        body.level_cap = highest
+    }
     op_ok()
 }
 
@@ -1032,6 +1038,9 @@ func ceiling_index(p: Int, raw: UInt) unsafe -> Int {
 /// target's state; a `Gone` target has no ceilings and answers `Revoked`. The
 /// narrowing of `mask` is truncating, for `mint_sibling`'s reason: rights are
 /// 32 bits and the register is wider.
+///
+/// `unsafe` though it names nothing unsafe: `p` must be the calling process,
+/// the one `fault_process` ends.
 func process_restrict_rights(p: Int, target: Int, raw: UInt,
                              mask: UInt) unsafe -> SyscallResult {
     let kind = ceiling_index(p, raw)
@@ -1039,19 +1048,23 @@ func process_restrict_rights(p: Int, target: Int, raw: UInt,
         return op_status(SosStatus.Revoked)
     }
     let b = body_of(ProcessIndex(target))
-    PROCESSES.at(b).ceilings[kind] = (PROCESSES.at(b).ceilings[kind]
-                                   & UInt32.from(truncating: mask))
+    borrow var body = processes().at(b) {
+        body.ceilings[kind] = body.ceilings[kind] & UInt32.from(truncating: mask)
+    }
     op_ok()
 }
 
 /// `ProcessOp.Ceiling`: process `target`'s ceiling for the kind `raw` names, as
 /// a rights word. Faults and `Revoked` as for `process_restrict_rights`.
+///
+/// `unsafe` though it names nothing unsafe: `p` must be the calling process,
+/// the one `fault_process` ends.
 func process_ceiling(p: Int, target: Int, raw: UInt) unsafe -> SyscallResult {
     let kind = ceiling_index(p, raw)
     if not has_body(ProcessIndex(target)) {
         return op_status(SosStatus.Revoked)
     }
-    op_value(PROCESSES.at(body_of(ProcessIndex(target))).ceilings[kind] as UInt)
+    op_value(processes().at(body_of(ProcessIndex(target))).ceilings[kind] as UInt)
 }
 
 /// `ProcessOp.QuotaSet`: process `child`'s limit for the kind `raw` names
@@ -1078,12 +1091,15 @@ func process_ceiling(p: Int, target: Int, raw: UInt) unsafe -> SyscallResult {
 /// set, so the child's table is never shorter than its row. The attach is the
 /// last answer: it takes every block it needs or none, so a `NoResource` here
 /// leaves the child as it found it. Nobody's row is charged for a block.
+///
+/// `unsafe` though it names nothing unsafe: `p` must be the calling process,
+/// the one `fault_process` ends.
 func process_quota_set(p: Int, child: Int, raw: UInt,
                        limit: UInt) unsafe -> SyscallResult {
     guard let kind = QuotaKind.from(raw: raw) else {
         fault_process(p, FaultReason.BadArg)
     }
-    match PROCESS_RECORDS.at(ProcessIndex(child)).state {
+    match process_records().at(ProcessIndex(child)).state {
         case Created -> {},
         case _ -> fault_process(p, FaultReason.BadState),
     }
@@ -1127,8 +1143,8 @@ func process_quota_set(p: Int, child: Int, raw: UInt,
 /// The rows a process holds beyond its image's are exactly the ones its
 /// `Mapping` row is charged for (see `install_row`), so the image's are the
 /// difference, whatever was mapped into the process since its create.
-func free_grant_rows(p: Int) unsafe -> UInt {
-    let image_rows = (PROCESSES.at(body_of(ProcessIndex(p))).grant_count
+func free_grant_rows(p: Int) -> UInt {
+    let image_rows = (processes().at(body_of(ProcessIndex(p))).grant_count
                       - (quota_used_of(p, QuotaKind.Mapping) as Int))
     let free = (hal.GRANT_ROW_BUDGET as Int) - image_rows
     if free < 0 { 0 } else { free as UInt }
@@ -1138,11 +1154,14 @@ func free_grant_rows(p: Int) unsafe -> UInt {
 /// `quota_word` packs it. The kind is decoded first, as for
 /// `process_quota_set`. A `Gone` target answers `Revoked`: its teardown cleared
 /// the ledger, and a cleared row would read as a limit of zero.
+///
+/// `unsafe` though it names nothing unsafe: `p` must be the calling process,
+/// the one `fault_process` ends.
 func process_quota_get(p: Int, target: Int, raw: UInt) unsafe -> SyscallResult {
     guard let kind = QuotaKind.from(raw: raw) else {
         fault_process(p, FaultReason.BadArg)
     }
-    match PROCESS_RECORDS.at(ProcessIndex(target)).state {
+    match process_records().at(ProcessIndex(target)).state {
         case Gone -> { return op_status(SosStatus.Revoked) },
         case _ -> {},
     }
@@ -1488,52 +1507,55 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     // running out of it. Each goes back when the child dies.
     place_image(slot, img_base, &table, &dest, dst, img)
 
-    PROCESS_RECORDS.at(slot).state = ProcessState.Created
+    process_records().at(slot).state = ProcessState.Created
     // A child's table starts empty and `give` fills it. There is nothing to
     // record here: a process's own Process handle is minted when asked for, and
     // a child cannot ask (`ProcessSelf` needs a System handle it has not been
     // given). Every handle a child holds arrives through `ProcessOp.Give`
     // between this call and `Start`; a child given nothing is a legal sandboxed
     // compute process.
-    PROCESSES.at(body).entry = table.entry()
+    processes().at(body).entry = table.entry()
     // The child's ceilings are the creator's narrowed by the source's, written
     // word by word: the body may be a reused one, and no create inherits what a
     // previous occupant was bounded to.
     var kind: Int = 0
     while kind < HANDLE_KINDS {
-        PROCESSES.at(body).ceilings[kind] = (PROCESSES.at(body_of(ProcessIndex(p))).ceilings[kind]
-                                          & PROCESSES.at(body_of(ProcessIndex(source))).ceilings[kind])
+        processes().at(body).ceilings[kind] = (processes().at(body_of(ProcessIndex(p))).ceilings[kind]
+                                          & processes().at(body_of(ProcessIndex(source))).ceilings[kind])
         kind = kind + 1
     }
-    // The simple map, until the launcher sets another before the start
-    // (`process_band_map`): a child no launcher maps runs its bands at levels
-    // 0 and 1 and can grant no higher.
-    PROCESSES.at(body).bands = SIMPLE_BAND_MAP
-    PROCESSES.at(body).level_cap = band_map_highest(SIMPLE_BAND_MAP)
-    // Every address on a process body is a user address: the entry goes into a
-    // program counter, the stack top into a stack pointer, and the region's
-    // top is where mappings start. The frames behind them live in the grant
-    // rows.
-    PROCESSES.at(body).stack_top = dest.link_top()
-    PROCESSES.at(body).region_top = dest.link_top()
-    PROCESS_RECORDS.at(slot).exit_kind = ProcessStatusKind.Running
-    PROCESS_RECORDS.at(slot).exit_code = 0
-    // The launcher's handle is the child's first reference. It outlives the
-    // child so that reading how the child died stays possible, and its release
-    // frees the record.
-    PROCESS_RECORDS.at(slot).refs = 1
-    // Nobody is watching a process that does not exist yet. This record may be
-    // a reclaimed one, so every field a previous occupant wrote is reset here.
-    // It cannot arrive non-zero (an attachment is a counted reference, so a
-    // watched record never reaches zero and never reclaims), but the reset is
-    // where a reader looks to find that out.
-    PROCESS_RECORDS.at(slot).attachment = 0
-    // The final counters are written at the teardown and read only through a
-    // `Gone` record, so a stale copy here could not be read; it is reset with
-    // the rest.
-    PROCESS_RECORDS.at(slot).final_stats = StatsRow(syscalls: 0, interrupts: 0,
-                                                 faults: 0, pid: 0,
-                                                 pinned: 0)
+    borrow var child = processes().at(body) {
+        // The simple map, until the launcher sets another before the start
+        // (`process_band_map`): a child no launcher maps runs its bands at
+        // levels 0 and 1 and can grant no higher.
+        child.bands = SIMPLE_BAND_MAP
+        child.level_cap = band_map_highest(SIMPLE_BAND_MAP)
+        // Every address on a process body is a user address: the entry goes
+        // into a program counter, the stack top into a stack pointer, and the
+        // region's top is where mappings start. The frames behind them live in
+        // the grant rows.
+        child.stack_top = dest.link_top()
+        child.region_top = dest.link_top()
+    }
+    borrow var record = process_records().at(slot) {
+        record.exit_kind = ProcessStatusKind.Running
+        record.exit_code = 0
+        // The launcher's handle is the child's first reference. It outlives the
+        // child so that reading how the child died stays possible, and its
+        // release frees the record.
+        record.refs = 1
+        // Nobody is watching a process that does not exist yet. This record may
+        // be a reclaimed one, so every field a previous occupant wrote is reset
+        // here. It cannot arrive non-zero (an attachment is a counted
+        // reference, so a watched record never reaches zero and never
+        // reclaims), but the reset is where a reader looks to find that out.
+        record.attachment = 0
+        // The final counters are written at the teardown and read only through
+        // a `Gone` record, so a stale copy here could not be read; it is reset
+        // with the rest.
+        record.final_stats = StatsRow(syscalls: 0, interrupts: 0, faults: 0,
+                                      pid: 0, pinned: 0)
+    }
     // The columns open at zero. The body may be a reused one, and this is the
     // line that keeps a child from inheriting its predecessor's traffic and
     // reading a first `stats()` that describes a program it never was. It
@@ -1549,7 +1571,7 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     // carries none; there is no per-create argument, and the launcher sets
     // any row it wants otherwise before the start (`process_quota_set`).
     install_quota_limits(slot, false,
-                         (hal.GRANT_ROW_BUDGET as Int) - PROCESSES.at(body).grant_count)
+                         (hal.GRANT_ROW_BUDGET as Int) - processes().at(body).grant_count)
 
     op_value(handle)
 }
@@ -1598,6 +1620,9 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
 /// started the child the first time. The same state word freezes the boot set:
 /// a give after this point is the same `BadState`, which makes a half-populated
 /// table unrepresentable.
+///
+/// `unsafe` though it names nothing unsafe: `caller` must be the calling
+/// process, the one `fault_process` ends.
 func process_start(caller: Int, child: Int,
                    raw_form: UInt, tag: UInt) unsafe -> SyscallResult {
     // The form is a raw register word the process chose, so it is decoded (as
@@ -1606,7 +1631,7 @@ func process_start(caller: Int, child: Int,
     guard let form = BootTagForm.from(raw: raw_form) else {
         fault_process(caller, FaultReason.BadArg)
     }
-    match PROCESS_RECORDS.at(ProcessIndex(child)).state {
+    match process_records().at(ProcessIndex(child)).state {
         case Created -> {},
         case _ -> fault_process(caller, FaultReason.BadState),
     }
@@ -1640,13 +1665,13 @@ func process_start(caller: Int, child: Int,
     }
 
     let body = body_of(ProcessIndex(child))
-    hal.frame_init(frame_slot(slot), PROCESSES.at(body).entry,
-                   PROCESSES.at(body).stack_top, boot_word)
+    hal.frame_init(frame_slot(slot), processes().at(body).entry,
+                   processes().at(body).stack_top, boot_word)
     // No handle names the child's first thread, so its count starts at zero:
     // it runs in its slot, and the child's `ThreadSelf` is what names it. It
     // runs at the child's `Normal` band, under the map its launcher left it.
-    let level = band_level(PROCESSES.at(body).bands, Priority.Normal as Int)
-    THREADS.at(slot) = ThreadSlot(state: ThreadState.Runnable, level: level,
+    let level = band_level(processes().at(body).bands, Priority.Normal as Int)
+    threads().at(slot) = ThreadSlot(state: ThreadState.Runnable, level: level,
                                base_level: level, process: child,
                                exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
@@ -1655,7 +1680,7 @@ func process_start(caller: Int, child: Int,
                                generation: slot_generation(slot))
     quota_charge(child, QuotaKind.Thread)
     ready_push(slot)
-    PROCESS_RECORDS.at(ProcessIndex(child)).state = ProcessState.Running
+    process_records().at(ProcessIndex(child)).state = ProcessState.Running
     op_ok()
 }
 
@@ -1720,6 +1745,9 @@ func process_give(p: Int, child: Int, word: UInt, tag: UInt,
 /// It is split out of `process_give` so that the fault set and the effect read
 /// as two separate things: everything here happens before anything below
 /// `move_handle` touches a table.
+///
+/// `unsafe` though it names nothing unsafe: `p` must be the calling process,
+/// the one `fault_process` ends.
 func give_faults(p: Int, child: Int, entry: HandleEntry,
                  tag: UInt) unsafe -> BootHandleKind {
     match entry.obj_type {
@@ -1732,7 +1760,7 @@ func give_faults(p: Int, child: Int, entry: HandleEntry,
     guard let kind = boot_kind_of(entry.obj_type) else {
         fault_process(p, FaultReason.BadArg)
     }
-    match PROCESS_RECORDS.at(ProcessIndex(child)).state {
+    match process_records().at(ProcessIndex(child)).state {
         case Created -> {},
         case _ -> fault_process(p, FaultReason.BadState),
     }
@@ -1821,7 +1849,7 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     // went out of.
     let cursor = boot_handle_cursor(p)
     let body = body_of(ProcessIndex(p))
-    if cursor >= PROCESSES.at(body).boot_count {
+    if cursor >= processes().at(body).boot_count {
         return op_status(SosStatus.Drained)
     }
     let queued = boot_record_at(body, cursor)
@@ -1832,7 +1860,7 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
                           boot_handle_record_bytes() as UInt) {
         fault_process(p, why)
     }
-    PROCESSES.at(body).boot_next = cursor + 1
+    processes().at(body).boot_next = cursor + 1
     op_ok()
 }
 
@@ -1878,11 +1906,11 @@ func process_stats(p: Int, target: Int, dst: UInt, cap: UInt) unsafe -> SyscallR
     var rec = if has_body(ProcessIndex(target)) {
         stats_read(body_of(ProcessIndex(target)))
     } else {
-        PROCESS_RECORDS.at(ProcessIndex(target)).final_stats
+        process_records().at(ProcessIndex(target)).final_stats
     }
     // The pid is the record's: it is what a `Gone` process keeps, and a live
     // row's copy of it is written once at the create.
-    rec.pid = PROCESS_RECORDS.at(ProcessIndex(target)).pid
+    rec.pid = process_records().at(ProcessIndex(target)).pid
     if let why = copy_out(ProcessIndex(p), dst,
                           ((&var rec) as UnsafePointer<StatsRow>) as UInt,
                           process_stats_record_bytes() as UInt) {
@@ -2042,13 +2070,16 @@ func waiter_create(p: Int, owner: Int) unsafe -> SyscallResult {
 /// entry and the stack are checked: the check needs a body to read the grant
 /// rows from, and a `Gone` process has none. This is the one argument check
 /// that follows `Revoked`; the rights check comes first as for every op.
+///
+/// `unsafe` though it names nothing unsafe: `p` must be the calling process,
+/// the one `fault_process` ends.
 func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
                    arg: UInt) unsafe -> SyscallResult {
     if not has_body(ProcessIndex(owner)) {
         return op_status(SosStatus.Revoked)
     }
     let body = body_of(ProcessIndex(owner))
-    let start = if entry == ENTRY_IMAGE { PROCESSES.at(body).entry } else { entry }
+    let start = if entry == ENTRY_IMAGE { processes().at(body).entry } else { entry }
     if not executable_at(ProcessIndex(owner), start) {
         fault_process(p, FaultReason.BadEntry)
     }
@@ -2079,7 +2110,7 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
     hal.frame_init(frame_slot(slot), start, stack_top, arg)
     // The handle just minted is the first reference. The level is the start's
     // to read.
-    THREADS.at(slot) = ThreadSlot(state: ThreadState.Created, level: 0,
+    threads().at(slot) = ThreadSlot(state: ThreadState.Created, level: 0,
                                base_level: 0, process: owner, exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
@@ -2129,7 +2160,7 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             if arg0 >= (BANDS as UInt) {
                 fault_process(p, FaultReason.BadArg)
             }
-            match THREADS.at(ThreadIndex(target)).state {
+            match threads().at(ThreadIndex(target)).state {
                 case Created -> {},
                 case Invalid -> { return op_status(SosStatus.Revoked) },
                 case _ -> fault_process(p, FaultReason.BadState),
@@ -2139,17 +2170,19 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             // the child is started, so starting it earlier is a caller error.
             // This is also why a `Created` child never ends by itself and a
             // `Gone` one was always started.
-            match PROCESS_RECORDS.at(ProcessIndex(THREADS.at(ThreadIndex(target)).process)).state {
+            match process_records().at(ProcessIndex(threads().at(ThreadIndex(target)).process)).state {
                 case Created -> fault_process(p, FaultReason.BadState),
                 case _ -> {},
             }
             // The level is the band's in the map of the process the thread
             // runs in, which need not be the caller's (spec §7).
-            let owner = body_of(ProcessIndex(THREADS.at(ThreadIndex(target)).process))
-            let level = band_level(PROCESSES.at(owner).bands, arg0 as Int)
-            THREADS.at(ThreadIndex(target)).level = level
-            THREADS.at(ThreadIndex(target)).base_level = level
-            THREADS.at(ThreadIndex(target)).state = ThreadState.Runnable
+            let owner = body_of(ProcessIndex(threads().at(ThreadIndex(target)).process))
+            let level = band_level(processes().at(owner).bands, arg0 as Int)
+            borrow var thread = threads().at(ThreadIndex(target)) {
+                thread.level = level
+                thread.base_level = level
+                thread.state = ThreadState.Runnable
+            }
             ready_push(ThreadIndex(target))
             op_ok()
         },
@@ -2160,10 +2193,10 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             if target == CURRENT_THREAD {
                 fault_process(p, FaultReason.BadState)
             }
-            match THREADS.at(ThreadIndex(target)).state {
+            match threads().at(ThreadIndex(target)).state {
                 // Already gone: the answer is in the slot, so nothing parks.
                 // `Exited` wins over the process's death (spec §2.10).
-                case Exited -> op_value(THREADS.at(ThreadIndex(target)).exit_code),
+                case Exited -> op_value(threads().at(ThreadIndex(target)).exit_code),
                 // Its process died before it exited: there is no code to read
                 // and nothing will ever exit.
                 case Invalid -> op_status(SosStatus.Revoked),
@@ -2284,11 +2317,14 @@ func lock_wait(p: Int, addr: UInt) unsafe -> SyscallResult {
                           word_bytes()) {
         fault_process(p, why)
     }
-    THREADS.at(me).lock_at = addr
-    THREADS.at(me).lock_holder = holder + 1
-    THREADS.at(me).state = ThreadState.Blocked
-    NEED_RESCHED = true
-    lock_raise(ThreadIndex(holder), THREADS.at(me).level)
+    let level = borrow var thread = threads().at(me) {
+        thread.lock_at = addr
+        thread.lock_holder = holder + 1
+        thread.state = ThreadState.Blocked
+        NEED_RESCHED = true
+        thread.level
+    }
+    lock_raise(ThreadIndex(holder), level)
     op_blocked()
 }
 
@@ -2316,15 +2352,18 @@ func lock_wait(p: Int, addr: UInt) unsafe -> SyscallResult {
 /// The running thread is the caller, whose own ID is answered before this,
 /// and no other word decodes to its slot at its generation, so the `Running`
 /// arm is never taken; it is there because a running thread is live.
+///
+/// `unsafe` though it names nothing unsafe: `p` must be the calling process,
+/// the one `fault_process` ends.
 func lock_holder_of(p: Int, owner: UInt) unsafe -> Int {
     let index = id_index(owner) as Int
     let generation = id_generation(owner)
-    if index == 0 || index > THREADS.capacity() ||
+    if index == 0 || index > threads().capacity() ||
        generation >= GENERATION_MODULUS {
         fault_process(p, FaultReason.BadArg)
     }
     let t = ThreadIndex(index - 1)
-    let current = THREADS.at(t).generation as UInt
+    let current = threads().at(t).generation as UInt
     if generation != current {
         let behind = (current + GENERATION_MODULUS - generation) %
                      GENERATION_MODULUS
@@ -2333,8 +2372,10 @@ func lock_holder_of(p: Int, owner: UInt) unsafe -> Int {
         }
         fault_process(p, FaultReason.BadArg)
     }
-    let q = THREADS.at(t).process
-    match THREADS.at(t).state {
+    let (q, state) = borrow var thread = threads().at(t) {
+        (thread.process, thread.state)
+    }
+    match state {
         case Runnable -> lock_live_holder(p, q, t),
         case Running -> lock_live_holder(p, q, t),
         case Blocked -> lock_live_holder(p, q, t),
@@ -2388,13 +2429,13 @@ func lock_chain_check(p: Int, holder: Int) unsafe {
         if h == CURRENT_THREAD {
             fault_process(p, FaultReason.LockChain)
         }
-        if THREADS.at(ThreadIndex(h)).lock_holder == 0 {
+        if threads().at(ThreadIndex(h)).lock_holder == 0 {
             return
         }
         if holders == LOCK_CHAIN_MAX {
             fault_process(p, FaultReason.LockChain)
         }
-        h = THREADS.at(ThreadIndex(h)).lock_holder - 1
+        h = threads().at(ThreadIndex(h)).lock_holder - 1
         holders = holders + 1
     }
 }
@@ -2428,7 +2469,7 @@ func lock_wake_op(p: Int, addr: UInt) unsafe -> SyscallResult {
                           word_bytes()) {
         fault_process(p, why)
     }
-    if ready_above(THREADS.at(CURRENT_THREAD).level) {
+    if ready_above(threads().at(CURRENT_THREAD).level) {
         NEED_RESCHED = true
     }
     op_ok()
@@ -3206,7 +3247,7 @@ func release_handle(p: Int, word: UInt, entry: HandleEntry) unsafe -> SyscallRes
 /// invalid state has an arm here; a `Gone` Process is not one.
 func object_invalid(kind: ObjType, slot: Int) unsafe -> Bool {
     match kind {
-        case Thread -> THREADS.at(ThreadIndex(slot)).state == ThreadState.Invalid,
+        case Thread -> threads().at(ThreadIndex(slot)).state == ThreadState.Invalid,
         case Mapping -> MAPPINGS[slot].row == ROW_TARGET_DIED,
         case Waiter -> waiter_invalid(slot),
         case Timer -> timer_invalid(slot),
@@ -3516,6 +3557,9 @@ func map_access(p: Int, raw: UInt) unsafe -> UInt32 {
 /// body to install into, and `install_row` answers `Revoked` for it once the
 /// caller's own arguments have been checked, as spec §2.10 orders. Any other
 /// state is a `BadState` fault.
+///
+/// `unsafe` though it names nothing unsafe: `p` must be the calling process,
+/// the one `fault_process` ends.
 func map_target(p: Int, handle: UInt) unsafe -> Int {
     let entry = lookup_handle(p, handle)
     match entry.obj_type {
@@ -3525,7 +3569,7 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
             if not target.allows(ProcessRight.Map) {
                 fault_process(p, FaultReason.AccessDenied)
             }
-            match PROCESS_RECORDS.at(ProcessIndex(target.slot)).state {
+            match process_records().at(ProcessIndex(target.slot)).state {
                 case Created -> {},
                 case Running -> {},
                 case Gone -> {},
@@ -3589,7 +3633,7 @@ func map_target(p: Int, handle: UInt) unsafe -> Int {
 func install_row(p: Int, t: Int, base: UInt, top: UInt, room: UInt,
                  perms: UInt8, device: Bool,
                  region: Int) unsafe -> SyscallResult {
-    match PROCESS_RECORDS.at(ProcessIndex(t)).state {
+    match process_records().at(ProcessIndex(t)).state {
         case Gone -> { return op_status(SosStatus.Revoked) },
         case _ -> {},
     }
@@ -3600,9 +3644,9 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, room: UInt,
         return op_status(SosStatus.QuotaExceeded)
     }
     let target_body = body_of(ProcessIndex(t))
-    if (PROCESSES.at(target_body).grant_count as UInt) >= hal.GRANT_ROW_BUDGET {
+    if (processes().at(target_body).grant_count as UInt) >= hal.GRANT_ROW_BUDGET {
         fatal_kernel("a map met the row budget with quota headroom left",
-                     PROCESSES.at(target_body).grant_count as UInt)
+                     processes().at(target_body).grant_count as UInt)
         // `fatal_kernel` stops the machine but is not declared `-> Never`, so
         // the scope has to exit itself. Nothing reaches this line.
         return op_status(SosStatus.NoResource)
@@ -3654,9 +3698,9 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, room: UInt,
     // Nothing is written until every refusal is behind us (the all-or-nothing
     // shape of `event_create`): a half-installed row is a protection domain
     // that disagrees with its own record.
-    let row = PROCESSES.at(target_body).grant_count
+    let row = processes().at(target_body).grant_count
     record_grant(ProcessIndex(t), va_base, va_top, base, perms, device, region)
-    PROCESSES.at(target_body).grants[row].room = kept
+    processes().at(target_body).grants[row].room = kept
     MAPPINGS[slot] = MappingSlot(state: SlotState.Live, process: p, target: t,
                                  row: row, refs: 1)
     quota_charge(t, QuotaKind.Mapping)
@@ -3838,7 +3882,7 @@ func memory_op_decoded(op: MemoryOp, obj: &MemoryObject, arg0: UInt, arg1: UInt,
                 fault_process(p, why)
             }
             MEMORIES[obj.slot].pinned = true
-            MEMORIES[obj.slot].pinner = PROCESS_RECORDS.at(ProcessIndex(p)).pid
+            MEMORIES[obj.slot].pinner = process_records().at(ProcessIndex(p)).pid
             memory_pin_account(obj.slot, true)
             stats_pin_raise(body_of(ProcessIndex(p)), len)
             op_ok()
@@ -4262,7 +4306,7 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject, arg0: UInt,
             // authoritative, and the row's user base is the number the target's
             // own instructions will issue.
             let t = MAPPINGS[obj.slot].target
-            op_value(PROCESSES.at(body_of(ProcessIndex(t))).grants[row].base)
+            op_value(processes().at(body_of(ProcessIndex(t))).grants[row].base)
         },
         // Len: how many bytes the row grants from its base, the answer a
         // receiver of memory checks before it touches a byte. It spends
@@ -4278,7 +4322,7 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject, arg0: UInt,
                 return op_status(SosStatus.Revoked)
             }
             let t = MAPPINGS[obj.slot].target
-            let g = PROCESSES.at(body_of(ProcessIndex(t))).grants[row]
+            let g = processes().at(body_of(ProcessIndex(t))).grants[row]
             op_value(g.top - g.base)
         },
         // Grow: raise the row's top by `arg0` bytes, over its allocation's
@@ -4326,7 +4370,7 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject, arg0: UInt,
             }
             let t = MAPPINGS[obj.slot].target
             let b = body_of(ProcessIndex(t))
-            let grant = PROCESSES.at(b).grants[row]
+            let grant = processes().at(b).grants[row]
             if grant.region == NO_MEMORY {
                 fault_process(p, FaultReason.BadArg)
             }
@@ -5764,7 +5808,7 @@ func count_trap(kind: TrapKind) unsafe {
     // and a supervisor holding a read-only mapping sees this store land with
     // no syscall of its own. A current thread's process is live, so it has a
     // body.
-    let row = body_of(ProcessIndex(THREADS.at(CURRENT_THREAD).process))
+    let row = body_of(ProcessIndex(threads().at(CURRENT_THREAD).process))
     match kind {
         case Syscall -> { stats_bump(row, PROCESS_STATS_SYSCALLS_SLOT) },
         case Interrupt -> { stats_bump(row, PROCESS_STATS_INTERRUPTS_SLOT) },
@@ -5876,8 +5920,8 @@ func parked_in_section() unsafe -> Bool {
     if CURRENT_THREAD == NO_THREAD {
         return false
     }
-    match THREADS.at(CURRENT_THREAD).state {
-        case Blocked -> section_held(THREADS.at(CURRENT_THREAD).process),
+    match threads().at(CURRENT_THREAD).state {
+        case Blocked -> section_held(threads().at(CURRENT_THREAD).process),
         case _ -> false,
     }
 }

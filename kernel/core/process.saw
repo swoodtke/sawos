@@ -57,8 +57,8 @@ import kcore.stats.{stats_clear, stats_name}
 import kcore.time.{start_tick}
 import kcore.pslot.{
     GrantRow,
-    PROCESSES,
-    PROCESS_RECORDS,
+    processes,
+    process_records,
     ProcessState,
     body_of,
     link_body,
@@ -87,7 +87,7 @@ import kcore.threads.{
     SLICE_LEFT,
     SIMPLE_BAND_MAP,
     SLICE_TICKS,
-    THREADS,
+    threads,
     ThreadSlot,
     ThreadState,
     alloc_thread,
@@ -107,7 +107,7 @@ import kcore.threads.{
 /// How many process bodies this machine can actually run: the body slab's
 /// capacity, capped by the protection domains the tier has to put them in.
 ///
-/// Donation raises `PROCESSES.capacity()` past the compiled floor, but a tier
+/// Donation raises `processes().capacity()` past the compiled floor, but a tier
 /// that keeps a persistent per-process table set draws it from a static pool
 /// that donation does not reach. `hal.PROT_DOMAIN_SLOTS` is that pool's size
 /// (every profile publishes it), and a body's index is its domain's number.
@@ -120,8 +120,8 @@ import kcore.threads.{
 /// binds only the floor (extent 0 must fit the pool); this function enforces
 /// the limit above the floor at run time. Records have no domain, so their
 /// table is bounded by its capacity alone.
-public(package) func process_slots_usable() unsafe -> Int {
-    let held = PROCESSES.capacity()
+public(package) func process_slots_usable() -> Int {
+    let held = processes().capacity()
     if held > hal.PROT_DOMAIN_SLOTS {
         return hal.PROT_DOMAIN_SLOTS
     }
@@ -156,10 +156,10 @@ public(package) func alloc_process() unsafe -> (ProcessIndex, BodyIndex) {
 }
 
 /// The lowest free record, or `NO_PROCESS`.
-func free_record() unsafe -> ProcessIndex {
+func free_record() -> ProcessIndex {
     var r = ProcessIndex(0)
-    while r < PROCESS_RECORDS.capacity() {
-        match PROCESS_RECORDS.at(r).state {
+    while r < process_records().capacity() {
+        match process_records().at(r).state {
             case Free -> { return r },
             case _ -> {},
         }
@@ -169,11 +169,11 @@ func free_record() unsafe -> ProcessIndex {
 }
 
 /// The lowest free body this machine can run, or `NO_BODY`.
-func free_body() unsafe -> BodyIndex {
+func free_body() -> BodyIndex {
     let usable = process_slots_usable()
     var b = BodyIndex(0)
     while b < usable {
-        if not PROCESSES.at(b).live {
+        if not processes().at(b).live {
             return b
         }
         b = BodyIndex(b + 1)
@@ -182,14 +182,18 @@ func free_body() unsafe -> BodyIndex {
 }
 
 /// Give record `p` body `b`, both found free by `alloc_process`. From here on
-/// `body_of(p)` answers `b`, until the teardown frees it.
+/// `body_of(p)` answers `b`, until the teardown frees it. `unsafe` though it
+/// names nothing unsafe: a body two records shared would have its grant rows'
+/// counts dropped twice.
 public(package) func link_process(p: ProcessIndex, b: BodyIndex) unsafe {
     link_body(p, b)
-    PROCESSES.at(b).live = true
-    // A body starts with no section word: the last occupant's pointed into
-    // memory that is no longer its process's.
-    PROCESSES.at(b).section_at = 0
-    PROCESSES.at(b).section_holder = 0
+    borrow var body = processes().at(b) {
+        body.live = true
+        // A body starts with no section word: the last occupant's pointed into
+        // memory that is no longer its process's.
+        body.section_at = 0
+        body.section_holder = 0
+    }
 }
 
 /// Give root its record and its body, the first of each table.
@@ -199,9 +203,9 @@ public(package) func link_process(p: ProcessIndex, b: BodyIndex) unsafe {
 /// the two are known. The loader calls this before it records root's grant
 /// rows and `start_process` calls it again for the harness kernels that enter
 /// user mode without the loader; linking twice writes the same two fields.
-public(package) func claim_root() unsafe {
+public(package) func claim_root() {
     link_process(ROOT_PROCESS, ROOT_BODY)
-    PROCESS_RECORDS.at(ROOT_PROCESS).pid = ROOT_PID
+    process_records().at(ROOT_PROCESS).pid = ROOT_PID
 }
 
 /// Root's pid (spec §2.7). Zero is never a pid, so the counter's first value
@@ -225,7 +229,7 @@ public(package) func assign_pid(p: ProcessIndex) unsafe -> UInt64 {
         return 0
     }
     NEXT_PID = pid + 1
-    PROCESS_RECORDS.at(p).pid = pid
+    process_records().at(p).pid = pid
     pid
 }
 
@@ -239,17 +243,17 @@ public(package) func assign_pid(p: ProcessIndex) unsafe -> UInt64 {
 /// pid is never reused, so the answer depends on `after` and on what the table
 /// holds and on nothing else; no state outlives the call. The scan is bounded
 /// by the record slab's capacity and its body is O(1).
-public(package) func record_above_pid(after: UInt64) unsafe -> ProcessIndex {
+public(package) func record_above_pid(after: UInt64) -> ProcessIndex {
     var best = NO_PROCESS
     var r = ProcessIndex(0)
-    while r < PROCESS_RECORDS.capacity() {
-        match PROCESS_RECORDS.at(r).state {
+    while r < process_records().capacity() {
+        match process_records().at(r).state {
             case Free -> {},
             case Created -> {},
             case _ -> {
-                let pid = PROCESS_RECORDS.at(r).pid
+                let pid = process_records().at(r).pid
                 if pid > after && (best == NO_PROCESS
-                                   || pid < PROCESS_RECORDS.at(best).pid) {
+                                   || pid < process_records().at(best).pid) {
                     best = r
                 }
             },
@@ -272,20 +276,22 @@ public(package) func record_above_pid(after: UInt64) unsafe -> ProcessIndex {
 /// a free record's pid is zero and must not match. A `Created` record is
 /// filtered as the walk filters it, so the lookup answers nothing the walk
 /// would not.
-public(package) func record_of_pid(pid: UInt64) unsafe -> ProcessIndex {
+public(package) func record_of_pid(pid: UInt64) -> ProcessIndex {
     if pid == 0 {
         return NO_PROCESS
     }
     var r = ProcessIndex(0)
-    while r < PROCESS_RECORDS.capacity() {
-        match PROCESS_RECORDS.at(r).state {
-            case Free -> {},
-            case Created -> {},
-            case _ -> {
-                if PROCESS_RECORDS.at(r).pid == pid {
-                    return r
-                }
-            },
+    while r < process_records().capacity() {
+        borrow var record = process_records().at(r) {
+            match record.state {
+                case Free -> {},
+                case Created -> {},
+                case _ -> {
+                    if record.pid == pid {
+                        return r
+                    }
+                },
+            }
         }
         r = ProcessIndex(r + 1)
     }
@@ -316,8 +322,10 @@ public(package) unsafe static var DOOM_PENDING: Bool = false
 /// The first fault stands. A second delivery to the same process, before its
 /// end, finds the same record and changes nothing.
 public(package) func doom_process(p: ProcessIndex, why: FaultReason) unsafe {
-    if PROCESS_RECORDS.at(p).doom == 0 {
-        PROCESS_RECORDS.at(p).doom = (why as UInt8) + 1
+    borrow var record = process_records().at(p) {
+        if record.doom == 0 {
+            record.doom = (why as UInt8) + 1
+        }
     }
     DOOM_PENDING = true
 }
@@ -350,21 +358,23 @@ public(package) func doom_process(p: ProcessIndex, why: FaultReason) unsafe {
 /// teardown reclaims the record. A running process is never reclaimed however
 /// far its count falls: its record is what it is running as.
 public(package) func reclaim_process_record(p: ProcessIndex) unsafe {
-    match PROCESS_RECORDS.at(p).state {
-        case Gone -> {},
-        case Created -> {
-            if PROCESS_RECORDS.at(p).refs == 0 {
-                UNSTARTED_PENDING = true
-            }
+    borrow var record = process_records().at(p) {
+        match record.state {
+            case Gone -> {},
+            case Created -> {
+                if record.refs == 0 {
+                    UNSTARTED_PENDING = true
+                }
+                return
+            },
+            case _ -> { return },
+        }
+        if record.refs != 0 {
             return
-        },
-        case _ -> { return },
+        }
+        record.pid = 0
+        record.state = ProcessState.Free
     }
-    if PROCESS_RECORDS.at(p).refs != 0 {
-        return
-    }
-    PROCESS_RECORDS.at(p).pid = 0
-    PROCESS_RECORDS.at(p).state = ProcessState.Free
 }
 
 // -----------------------------------------------------------------------------
@@ -399,19 +409,24 @@ public(package) func reclaim_process_record(p: ProcessIndex) unsafe {
 /// record never has an empty row to step around: the loader records no row
 /// for a segment of no bytes, `map` refuses an empty region, `carve` an empty
 /// window, and the stack grant and the stats region's row are whole grains.
+///
+/// `unsafe` though it names nothing unsafe: the row grants `p` the bytes at
+/// `pa`, so the caller owes that they are memory `p` may be given.
 public(package) func record_grant(p: ProcessIndex, base: UInt, top: UInt, pa: UInt,
                                   perms: UInt8,
                                   device: Bool, region: Int) unsafe {
     let b = body_of(p)
-    if PROCESSES.at(b).grant_count >= MAX_GRANT_ROWS {
+    if processes().at(b).grant_count >= MAX_GRANT_ROWS {
         fatal_image("more grants than a process's record can hold",
-                    PROCESSES.at(b).grant_count as UInt)
+                    processes().at(b).grant_count as UInt)
     }
-    let n = PROCESSES.at(b).grant_count
-    PROCESSES.at(b).grants[n] = GrantRow(base: base, top: top, pa: pa, room: 0,
-                                      perms: perms, device: device,
-                                      region: region)
-    PROCESSES.at(b).grant_count = n + 1
+    borrow var body = processes().at(b) {
+        let n = body.grant_count
+        body.grants[n] = GrantRow(base: base, top: top, pa: pa, room: 0,
+                                  perms: perms, device: device,
+                                  region: region)
+        body.grant_count = n + 1
+    }
     ref_region_row(region)
     // The hardware learns here, on a tier that keeps a standing image. This is
     // the single funnel every grant row is appended through (the loader's at
@@ -455,35 +470,37 @@ public(package) func record_grant(p: ProcessIndex, base: UInt, top: UInt, pa: UI
 /// The answer is not checked against the tier's window here: `install_row` asks
 /// `hal.map_target_ok` about the returned range, the one place a refusal has
 /// somewhere to go.
-public(package) func free_user_va(p: ProcessIndex, len: UInt) unsafe -> UInt {
+public(package) func free_user_va(p: ProcessIndex, len: UInt) -> UInt {
     let b = body_of(p)
-    var va = PROCESSES.at(b).region_top
-    var pass: Int = 0
-    while pass <= PROCESSES.at(b).grant_count {
-        // Checked before the addition that computes the candidate's top:
-        // overflow checks are always on, so a length that would run off the end
-        // of the address space must become a refusal upstairs (`install_row`'s
-        // window check) rather than a panic here.
-        if len > UInt.max - va {
-            return va
-        }
-        var bumped = false
-        var i: Int = 0
-        while i < PROCESSES.at(b).grant_count {
-            let row = PROCESSES.at(b).grants[i]
-            let claimed = row.top + row.room
-            if not row.device && va < claimed && row.base < va + len {
-                va = align_up(claimed, hal.PROT_GRAIN)
-                bumped = true
+    borrow var body = processes().at(b) {
+        var va = body.region_top
+        var pass: Int = 0
+        while pass <= body.grant_count {
+            // Checked before the addition that computes the candidate's top:
+            // overflow checks are always on, so a length that would run off the
+            // end of the address space must become a refusal upstairs
+            // (`install_row`'s window check) rather than a panic here.
+            if len > UInt.max - va {
+                return va
             }
-            i = i + 1
+            var bumped = false
+            var i: Int = 0
+            while i < body.grant_count {
+                let row = body.grants[i]
+                let claimed = row.top + row.room
+                if not row.device && va < claimed && row.base < va + len {
+                    va = align_up(claimed, hal.PROT_GRAIN)
+                    bumped = true
+                }
+                i = i + 1
+            }
+            if not bumped {
+                return va
+            }
+            pass = pass + 1
         }
-        if not bumped {
-            return va
-        }
-        pass = pass + 1
+        va
     }
-    va
 }
 
 /// Does the row's permission set include execute?
@@ -497,15 +514,17 @@ func row_executes(row: GrantRow) -> Bool {
 /// No device row is asked about: a device row never permits execute. An image's
 /// device segment that asks for it is refused by `imgformat`'s permission
 /// check, and a mapped `IoMemory` is installed read and write.
-public(package) func executable_at(p: ProcessIndex, va: UInt) unsafe -> Bool {
+public(package) func executable_at(p: ProcessIndex, va: UInt) -> Bool {
     let b = body_of(p)
     var i: Int = 0
-    while i < PROCESSES.at(b).grant_count {
-        let row = PROCESSES.at(b).grants[i]
-        if row_executes(row) && va >= row.base && va < row.top {
-            return true
+    borrow var body = processes().at(b) {
+        while i < body.grant_count {
+            let row = body.grants[i]
+            if row_executes(row) && va >= row.base && va < row.top {
+                return true
+            }
+            i = i + 1
         }
-        i = i + 1
     }
     false
 }
@@ -519,20 +538,22 @@ public(package) func executable_at(p: ProcessIndex, va: UInt) unsafe -> Bool {
 /// the process may fetch from at the other address is memory it may execute.
 /// On the tiers that do not translate a row's two halves are one number, so
 /// the comparison is the same there either way.
-func grants_execute(p: ProcessIndex, pa: UInt, bytes: UInt) unsafe -> Bool {
+func grants_execute(p: ProcessIndex, pa: UInt, bytes: UInt) -> Bool {
     let b = body_of(p)
     var end = UInt.max
     if bytes <= UInt.max - pa {
         end = pa + bytes
     }
     var i: Int = 0
-    while i < PROCESSES.at(b).grant_count {
-        let row = PROCESSES.at(b).grants[i]
-        if row_executes(row) && pa < row_pa_end(row) &&
-           (row.pa <= pa || row.pa < end) {
-            return true
+    borrow var body = processes().at(b) {
+        while i < body.grant_count {
+            let row = body.grants[i]
+            if row_executes(row) && pa < row_pa_end(row) &&
+               (row.pa <= pa || row.pa < end) {
+                return true
+            }
+            i = i + 1
         }
-        i = i + 1
     }
     false
 }
@@ -548,15 +569,17 @@ func grants_execute(p: ProcessIndex, pa: UInt, bytes: UInt) unsafe -> Bool {
 /// it. Every row holds at least one byte (`record_grant`).
 ///
 /// No preemption point: one pass over at most `MAX_GRANT_ROWS` rows.
-public(package) func meets_row(p: ProcessIndex, base: UInt, top: UInt) unsafe -> Bool {
+public(package) func meets_row(p: ProcessIndex, base: UInt, top: UInt) -> Bool {
     let b = body_of(p)
     var i: Int = 0
-    while i < PROCESSES.at(b).grant_count {
-        let row = PROCESSES.at(b).grants[i]
-        if base < row.top && row.base < top {
-            return true
+    borrow var body = processes().at(b) {
+        while i < body.grant_count {
+            let row = body.grants[i]
+            if base < row.top && row.base < top {
+                return true
+            }
+            i = i + 1
         }
-        i = i + 1
     }
     false
 }
@@ -611,11 +634,11 @@ public(package) func translate_user(
     va: UInt,
     bytes: UInt,
     need: UInt8
-) unsafe -> Result<UInt, FaultReason> {
+) -> Result<UInt, FaultReason> {
     let b = body_of(p)
     var i: Int = 0
-    while i < PROCESSES.at(b).grant_count {
-        let row = PROCESSES.at(b).grants[i]
+    while i < processes().at(b).grant_count {
+        let row = processes().at(b).grants[i]
         // Ordered so the subtraction cannot underflow: `row.top - va` is
         // computed only once `va` is known to be inside the row.
         if not row.device && (row.perms & need) == need &&
@@ -636,15 +659,17 @@ public(package) func translate_user(
 /// body, where a row `map` installed can be unmapped. No two rows of a process
 /// meet, so a range `translate_user` resolved at `va` lies in the row this
 /// finds.
-public(package) func in_image_row(p: ProcessIndex, va: UInt) unsafe -> Bool {
+public(package) func in_image_row(p: ProcessIndex, va: UInt) -> Bool {
     let b = body_of(p)
     var i: Int = 0
-    while i < PROCESSES.at(b).image_rows {
-        let row = PROCESSES.at(b).grants[i]
-        if va >= row.base && va < row.top {
-            return true
+    borrow var body = processes().at(b) {
+        while i < body.image_rows {
+            let row = body.grants[i]
+            if va >= row.base && va < row.top {
+                return true
+            }
+            i = i + 1
         }
-        i = i + 1
     }
     false
 }
@@ -695,8 +720,8 @@ public(package) func load_domain(p: ProcessIndex) unsafe {
     if hal.prot_replay_at_switch() {
         hal.prot_reset()
         var i: Int = 0
-        while i < PROCESSES.at(b).grant_count {
-            let row = PROCESSES.at(b).grants[i]
+        while i < processes().at(b).grant_count {
+            let row = processes().at(b).grants[i]
             // The replay programs the physical range. A replay tier filters
             // addresses the processor actually issues, where a user address is
             // its physical address, so `row.pa` and `row.base` are equal here
@@ -734,12 +759,16 @@ public(package) func load_domain(p: ProcessIndex) unsafe {
 /// time they may go back on the pool's free list. The reverse order would let
 /// an `Allocate` hand a range to a new owner while the old protection row still
 /// reached it.
+///
+/// `unsafe` though it names nothing unsafe: a row out of range would drop a
+/// count on a region nobody holds, and the region could go back to its pool
+/// while another row still grants it.
 public(package) func remove_grant(p: ProcessIndex, row: Int) unsafe {
     // Read once, and both consumers see that read: the hardware revoke (issued
     // first, here) and `region` (dropped last, below). The compaction is about
     // to move this storage.
     let b = body_of(p)
-    let gone = PROCESSES.at(b).grants[row]
+    let gone = processes().at(b).grants[row]
     // Revoked from the hardware before the range can move. Removing the row
     // from the record suffices where the hardware image is rebuilt from the
     // record at the next switch; where the tables persist, the record no longer
@@ -755,11 +784,13 @@ public(package) func remove_grant(p: ProcessIndex, row: Int) unsafe {
     // a row that permits nothing.
     hal.prot_update(b as UInt, gone.base, gone.top, gone.pa, 0, gone.device)
     var i = row
-    while i + 1 < PROCESSES.at(b).grant_count {
-        PROCESSES.at(b).grants[i] = PROCESSES.at(b).grants[i + 1]
-        i = i + 1
+    borrow var body = processes().at(b) {
+        while i + 1 < body.grant_count {
+            body.grants[i] = body.grants[i + 1]
+            i = i + 1
+        }
+        body.grant_count = body.grant_count - 1
     }
-    PROCESSES.at(b).grant_count = PROCESSES.at(b).grant_count - 1
     unref_region_row(gone.region)
 }
 
@@ -775,16 +806,21 @@ public(package) func remove_grant(p: ProcessIndex, row: Int) unsafe {
 /// has checked the new range against the row's allocation and the target's
 /// other rows, and reloads the domain if it is the installed one.
 ///
-/// The row's region keeps its count: the row is still one row.
+/// The row's region keeps its count: the row is still one row. `unsafe` though
+/// it names nothing unsafe: the caller's check of the new range is what keeps
+/// it inside the row's allocation.
 public(package) func grow_grant(p: ProcessIndex, row: Int, len: UInt) unsafe {
     let b = body_of(p)
-    let old = PROCESSES.at(b).grants[row]
-    let top = old.top + len
-    PROCESSES.at(b).grants[row].top = top
-    PROCESSES.at(b).grants[row].room = if old.room > len {
-        old.room - len
-    } else {
-        0
+    let (old, top) = borrow var body = processes().at(b) {
+        let old = body.grants[row]
+        let top = old.top + len
+        body.grants[row].top = top
+        body.grants[row].room = if old.room > len {
+            old.room - len
+        } else {
+            0
+        }
+        (old, top)
     }
     hal.prot_update(b as UInt, old.top, top, old.pa + (old.top - old.base),
                     old.perms, old.device)
@@ -838,8 +874,11 @@ public(package) func domain_changed(p: ProcessIndex) unsafe {
 /// overwritten by the next grant.
 public(package) func clear_domain(p: ProcessIndex) unsafe {
     let b = body_of(p)
-    let rows = PROCESSES.at(b).grant_count
-    PROCESSES.at(b).grant_count = 0
+    let rows = borrow var body = processes().at(b) {
+        let rows = body.grant_count
+        body.grant_count = 0
+        rows
+    }
     // The standing image goes with the record, before the walk below can return
     // a range to its pool (the same composition as `remove_grant`). Zeroing the
     // count stops a replay tier from granting these bytes again; this call
@@ -854,7 +893,7 @@ public(package) func clear_domain(p: ProcessIndex) unsafe {
     hal.prot_clear(b as UInt)
     var i: Int = 0
     while i < rows {
-        unref_region_row(PROCESSES.at(b).grants[i].region)
+        unref_region_row(processes().at(b).grants[i].region)
         i = i + 1
     }
     if LAST_PROT_PROCESS == p {
@@ -1461,28 +1500,32 @@ public func start_process(entry: UInt, stack_top: UInt, region_top: UInt,
     // Field by field rather than a whole-entry literal: the loader has already
     // recorded root's grant rows in the body, and a struct literal would erase
     // them.
-    PROCESS_RECORDS.at(p).state = ProcessState.Running
-    PROCESS_RECORDS.at(p).exit_kind = ProcessStatusKind.Running
-    PROCESS_RECORDS.at(p).exit_code = 0
-    PROCESS_RECORDS.at(p).refs = 0
-    PROCESSES.at(b).entry = entry
-    PROCESSES.at(b).stack_top = stack_top
-    PROCESSES.at(b).region_top = region_top
-    // Root is unrestricted: every ceiling is all-ones, so the boot mints below
-    // are uncapped whichever helper makes them.
-    var kind: Int = 0
-    while kind < HANDLE_KINDS {
-        PROCESSES.at(b).ceilings[kind] = UInt32.max
-        kind = kind + 1
+    borrow var record = process_records().at(p) {
+        record.state = ProcessState.Running
+        record.exit_kind = ProcessStatusKind.Running
+        record.exit_code = 0
+        record.refs = 0
     }
-    PROCESSES.at(b).bands = bands
-    PROCESSES.at(b).level_cap = (SYSTEM_LEVELS - 1) as UInt8
+    borrow var body = processes().at(b) {
+        body.entry = entry
+        body.stack_top = stack_top
+        body.region_top = region_top
+        // Root is unrestricted: every ceiling is all-ones, so the boot mints
+        // below are uncapped whichever helper makes them.
+        var kind: Int = 0
+        while kind < HANDLE_KINDS {
+            body.ceilings[kind] = UInt32.max
+            kind = kind + 1
+        }
+        body.bands = bands
+        body.level_cap = (SYSTEM_LEVELS - 1) as UInt8
+    }
     // The trap columns open at zero. Root is reified here rather than through
     // `process_create`, so its body's row of the stats region is cleared here.
     // Boot-door traps a harness kernel takes before this line are unattributed
     // by `ktrap`, so nothing has been counted against root's row yet.
     stats_clear(b)
-    stats_name(b, PROCESS_RECORDS.at(p).pid)
+    stats_name(b, process_records().at(p).pid)
 
     // The ledger opens before the first mint, because `mint_handle` consults
     // the handle row and a record with no limits installed can allocate
@@ -1493,7 +1536,7 @@ public func start_process(entry: UInt, stack_top: UInt, region_top: UInt,
     // already recorded root's grant rows, so the free-row count can be read
     // here.
     install_quota_limits(p, true,
-                         (hal.GRANT_ROW_BUDGET as Int) - PROCESSES.at(b).grant_count)
+                         (hal.GRANT_ROW_BUDGET as Int) - processes().at(b).grant_count)
 
     // Spec §12's order is the contract: the three are minted into a virgin
     // table, so each lands at generation 0 and its word is the bare index (1 =
@@ -1505,13 +1548,15 @@ public func start_process(entry: UInt, stack_top: UInt, region_top: UInt,
     let _ = mint_handle(p, ObjType.Process, process_rights(), p)
     // Root's own Process handle is a reference to root's record, counted like
     // any other. It makes root's count start at one.
-    PROCESS_RECORDS.at(p).refs = PROCESS_RECORDS.at(p).refs + 1
+    borrow var record = process_records().at(p) {
+        record.refs = record.refs + 1
+    }
 
     let main = alloc_thread()
     let _ = mint_handle(p, ObjType.Thread, thread_rights(), main)
     // The boot Thread handle is the main thread's one reference.
     let level = band_level(bands, Priority.Normal as Int)
-    THREADS.at(main) = ThreadSlot(state: ThreadState.Running, level: level,
+    threads().at(main) = ThreadSlot(state: ThreadState.Running, level: level,
                                base_level: level, process: p, exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,

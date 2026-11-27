@@ -11,7 +11,8 @@
 //! and the questions asked of them stay below it.
 //!
 //! The Process waitable's per-kind answers (who is watching it, is it dead,
-//! what does the record say) are reads of `PROCESS_RECORDS` in `pslot`.
+//! what does the record say) are reads of the record table, through
+//! `process_records()` in `pslot`.
 //! `process` imports nothing from here, so there is no cycle.
 
 import hal
@@ -42,11 +43,11 @@ import kcore.objects.{
     exchange_pipe,
     pipe_has_room,
 }
-import kcore.threads.{NEED_RESCHED, THREADS, ThreadState}
+import kcore.threads.{NEED_RESCHED, threads, ThreadState}
 import kcore.time.{TIMERS, catch_up_timer, saturating_add}
 // Process is a waitable kind, so the per-kind matrix below reads the process
 // slot. `process` must not import this module.
-import kcore.pslot.{PROCESS_RECORDS, ProcessState}
+import kcore.pslot.{process_records, ProcessState}
 
 /// The kinds that can be attached to a Waiter: the waitable kinds, and only
 /// those.
@@ -466,7 +467,7 @@ public(package) func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -
         case Event -> EVENTS[slot].attachment,
         case Interrupt -> INTERRUPTS[slot].attachment,
         case Timer -> TIMERS[slot].attachment,
-        case Process -> PROCESS_RECORDS.at(ProcessIndex(slot)).attachment,
+        case Process -> process_records().at(ProcessIndex(slot)).attachment,
         // Two kinds over one connection row; the kind says which field, as in
         // `ref_object` for the two reference columns.
         case PipeOutlet -> PIPES[slot].outlet_attachment,
@@ -483,7 +484,7 @@ public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: I
         case Event -> { EVENTS[slot].attachment = a },
         case Interrupt -> { INTERRUPTS[slot].attachment = a },
         case Timer -> { TIMERS[slot].attachment = a },
-        case Process -> { PROCESS_RECORDS.at(ProcessIndex(slot)).attachment = a },
+        case Process -> { process_records().at(ProcessIndex(slot)).attachment = a },
         case PipeOutlet -> { PIPES[slot].outlet_attachment = a },
         case PipeInlet -> { PIPES[slot].inlet_attachment = a },
         case PipeReply -> { EXCHANGES[slot].reply_attach = a },
@@ -527,7 +528,7 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
             }
         },
         case Process -> {
-            match PROCESS_RECORDS.at(ProcessIndex(slot)).state {
+            match process_records().at(ProcessIndex(slot)).state {
                 case Gone -> true,
                 // `Created` is not ready: a process that was made and never
                 // started has not ended, so a supervisor parked on one waits
@@ -615,8 +616,9 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
                                  body_len: 0, body_src: 0),
         case Process -> WaitAnswer(
             tag: WaitTag.Process,
-            payload: process_status_word(PROCESS_RECORDS.at(ProcessIndex(slot)).exit_kind,
-                                         PROCESS_RECORDS.at(ProcessIndex(slot)).exit_code),
+            payload: borrow var record = process_records().at(ProcessIndex(slot)) {
+                process_status_word(record.exit_kind, record.exit_code)
+            },
             body_len: 0, body_src: 0),
         // Drain-first, so a staged message is `Msg` whatever became of the
         // sender; this matches the order of the readiness test above, so the
@@ -794,14 +796,16 @@ public(package) func unblock_process(p: Int) unsafe {
                 var cur = WAITERS[w].blocked
                 while cur != 0 {
                     let slot = ThreadIndex(cur - 1)
-                    let next = THREADS.at(slot).link
-                    if THREADS.at(slot).process == p {
+                    let (next, theirs) = borrow var node = threads().at(slot) {
+                        (node.link, node.process == p)
+                    }
+                    if theirs {
                         if prev == 0 {
                             WAITERS[w].blocked = next
                         } else {
-                            THREADS.at(ThreadIndex(prev - 1)).link = next
+                            threads().at(ThreadIndex(prev - 1)).link = next
                         }
-                        THREADS.at(slot).link = 0
+                        threads().at(slot).link = 0
                     } else {
                         prev = cur
                     }
@@ -820,9 +824,11 @@ public(package) func unblock_process(p: Int) unsafe {
 /// Park the running thread on `w`'s blocked list, remembering where its record
 /// goes. `dst` has already been through `copy_out_check`.
 public(package) func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
-    THREADS.at(ThreadIndex(slot)).state = ThreadState.Blocked
-    THREADS.at(ThreadIndex(slot)).wait_buf = dst
-    THREADS.at(ThreadIndex(slot)).link = WAITERS[w].blocked
+    borrow var thread = threads().at(ThreadIndex(slot)) {
+        thread.state = ThreadState.Blocked
+        thread.wait_buf = dst
+        thread.link = WAITERS[w].blocked
+    }
     WAITERS[w].blocked = slot + 1
     NEED_RESCHED = true
 }
@@ -853,12 +859,14 @@ public(package) func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
 /// the caller was the running process, and are validated again at the wake.
 public(package) func block_on_call_room(slot: Int, c: Int, src: UInt, len: UInt,
                                         dst: UInt) unsafe {
-    THREADS.at(ThreadIndex(slot)).state = ThreadState.Blocked
-    THREADS.at(ThreadIndex(slot)).wait_buf = dst
-    THREADS.at(ThreadIndex(slot)).call_pipe = c + 1
-    THREADS.at(ThreadIndex(slot)).call_claim = 0
-    THREADS.at(ThreadIndex(slot)).call_src = src
-    THREADS.at(ThreadIndex(slot)).call_len = len
+    borrow var thread = threads().at(ThreadIndex(slot)) {
+        thread.state = ThreadState.Blocked
+        thread.wait_buf = dst
+        thread.call_pipe = c + 1
+        thread.call_claim = 0
+        thread.call_src = src
+        thread.call_len = len
+    }
     NEED_RESCHED = true
 }
 
@@ -873,12 +881,14 @@ public(package) func block_on_call_room(slot: Int, c: Int, src: UInt, len: UInt,
 /// parked and wants one, and by the room resume, which runs in whichever thread
 /// freed the slot and must not preempt itself for somebody else's park.
 public(package) func tie_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
-    THREADS.at(ThreadIndex(slot)).state = ThreadState.Blocked
-    THREADS.at(ThreadIndex(slot)).wait_buf = dst
-    THREADS.at(ThreadIndex(slot)).call_pipe = 0
-    THREADS.at(ThreadIndex(slot)).call_claim = x + 1
-    THREADS.at(ThreadIndex(slot)).call_src = 0
-    THREADS.at(ThreadIndex(slot)).call_len = 0
+    borrow var thread = threads().at(ThreadIndex(slot)) {
+        thread.state = ThreadState.Blocked
+        thread.wait_buf = dst
+        thread.call_pipe = 0
+        thread.call_claim = x + 1
+        thread.call_src = 0
+        thread.call_len = 0
+    }
     EXCHANGES[x].caller = slot + 1
 }
 
@@ -892,14 +902,16 @@ public(package) func block_on_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
 /// the tie, and the buffer. It does not touch the reference the claim held;
 /// each caller owns that decision.
 public(package) func clear_pending_call(slot: Int) unsafe {
-    if THREADS.at(ThreadIndex(slot)).call_claim != 0 {
-        EXCHANGES[THREADS.at(ThreadIndex(slot)).call_claim - 1].caller = 0
+    borrow var thread = threads().at(ThreadIndex(slot)) {
+        if thread.call_claim != 0 {
+            EXCHANGES[thread.call_claim - 1].caller = 0
+        }
+        thread.call_pipe = 0
+        thread.call_claim = 0
+        thread.call_src = 0
+        thread.call_len = 0
+        thread.wait_buf = 0
     }
-    THREADS.at(ThreadIndex(slot)).call_pipe = 0
-    THREADS.at(ThreadIndex(slot)).call_claim = 0
-    THREADS.at(ThreadIndex(slot)).call_src = 0
-    THREADS.at(ThreadIndex(slot)).call_len = 0
-    THREADS.at(ThreadIndex(slot)).wait_buf = 0
 }
 
 /// The thread waiting for room on connection `c`, or `NO_THREAD`.
@@ -907,10 +919,10 @@ public(package) func clear_pending_call(slot: Int) unsafe {
 /// This is the scan the park comment above describes. It answers the
 /// lowest-indexed waiter rather than the longest-waiting one, the same fairness
 /// a ready list's push order has.
-public(package) func call_room_waiter(c: Int) unsafe -> Int {
+public(package) func call_room_waiter(c: Int) -> Int {
     var t: Int = 0
-    while t < THREADS.capacity() {
-        if THREADS.at(ThreadIndex(t)).call_pipe == c + 1 {
+    while t < threads().capacity() {
+        if threads().at(ThreadIndex(t)).call_pipe == c + 1 {
             return t
         }
         t = t + 1

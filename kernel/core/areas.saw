@@ -77,21 +77,29 @@ import kcore.limits.{
 }
 import kcore.mem.{zero_bytes}
 import kcore.diag.{console, fatal_image, fatal_kernel}
-import kcore.pslot.{HANDLE_BLOCKS, PROCESSES, PROCESS_RECORDS}
+import kcore.pslot.{HANDLE_BLOCKS, HandleBlock, ProcessBody, ProcessRecord,
+                   process_records, processes}
 import kcore.objects.{
     EXCHANGES,
+    Exchange,
     FREE_RANGES,
+    FreeRange,
     IOMEMORIES,
+    IoMemorySlot,
     MAPPINGS,
     MEMORIES,
+    MappingSlot,
+    MemorySlot,
     PIPES,
+    PipeSlot,
     compiled_quota_default,
     set_image_quota_defaults,
     set_image_root_blocks,
 }
-import kcore.threads.{THREADS}
-import kcore.time.{TIMERS}
-import kcore.waitables.{ATTACHMENTS, EVENTS, INTERRUPTS, WAITERS}
+import kcore.threads.{ThreadSlot, threads}
+import kcore.time.{TIMERS, TimerSlot}
+import kcore.waitables.{ATTACHMENTS, Attachment, EVENTS, EventSlot, INTERRUPTS,
+                        InterruptSlot, WAITERS, WaiterSlot}
 import kcore.process.{fits_word, region_table}
 
 // =============================================================================
@@ -134,10 +142,10 @@ public(package) func slab_geometry(kind: SlabKind) unsafe -> (Int, Int, Int, Int
         //
         // Its ceiling is the thread ID's index field, not `MAX_SLAB_CAPACITY`:
         // a slot past it would have no ID.
-        case Threads -> (THREADS.slot_bytes() + THREAD_FRAME_STRIDE,
+        case Threads -> (threads().slot_bytes() + THREAD_FRAME_STRIDE,
                          THREAD_FRAME_STRIDE,
-                         THREADS.extents_left(),
-                         THREAD_SLAB_MAX - THREADS.capacity()),
+                         threads().extents_left(),
+                         THREAD_SLAB_MAX - threads().capacity()),
         // A pipe unit is a connection plus its whole staging ring. Both chains
         // must have an extent free, and the exchange ceiling binds:
         // `PIPE_INFLIGHT` exchanges are spent per connection, so the headroom
@@ -152,10 +160,10 @@ public(package) func slab_geometry(kind: SlabKind) unsafe -> (Int, Int, Int, Int
         // chain and needs neither a side arena nor a second ceiling. The
         // domain-pool ceiling is not the slab's business: the allocator
         // applies it (`process_slots_usable`).
-        case Processes -> (PROCESSES.slot_bytes(), PROCESSES.slot_align(), PROCESSES.extents_left(), MAX_SLAB_CAPACITY - PROCESSES.capacity()),
+        case Processes -> (processes().slot_bytes(), processes().slot_align(), processes().extents_left(), MAX_SLAB_CAPACITY - processes().capacity()),
         // A record unit is a slot of its own chain, the same one-array shape.
         // Records have no domain behind them, so the slab is the whole bound.
-        case ProcessRecords -> (PROCESS_RECORDS.slot_bytes(), PROCESS_RECORDS.slot_align(), PROCESS_RECORDS.extents_left(), MAX_SLAB_CAPACITY - PROCESS_RECORDS.capacity()),
+        case ProcessRecords -> (process_records().slot_bytes(), process_records().slot_align(), process_records().extents_left(), MAX_SLAB_CAPACITY - process_records().capacity()),
         // A handle block is a slot, its entries and its boot-set records
         // inside it: the same one-array shape.
         case HandleBlocks -> (HANDLE_BLOCKS.slot_bytes(), HANDLE_BLOCKS.slot_align(), HANDLE_BLOCKS.extents_left(), MAX_SLAB_CAPACITY - HANDLE_BLOCKS.capacity()),
@@ -175,44 +183,53 @@ func min_int(a: Int, b: Int) -> Int { if a < b { a } else { b } }
 /// `donate` has run the second cannot fail. If it did, the chains would skew,
 /// so that refusal is `fatal_kernel`: a kernel invariant, not a caller
 /// condition.
+///
+/// This is where a donated region's address becomes the unsafe pointer each
+/// slab's `donate` takes, the one place a raw base is trusted. The caller has
+/// held the region to the `Memory` capability a `SlabDonate` consumes, or to
+/// the image's own slab areas (`install_image_slabs`), so it is physical
+/// memory, aligned for the kind and `slots` long, that nothing else uses.
 public(package) func slab_install(kind: SlabKind, base: UInt, slots: Int) unsafe -> Bool {
     match kind {
-        case Events -> EVENTS.donate(base, slots),
-        case Waiters -> WAITERS.donate(base, slots),
-        case Interrupts -> INTERRUPTS.donate(base, slots),
-        case Attachments -> ATTACHMENTS.donate(base, slots),
-        case Timers -> TIMERS.donate(base, slots),
-        case Memories -> MEMORIES.donate(base, slots),
-        case IoMemories -> IOMEMORIES.donate(base, slots),
-        case Mappings -> MAPPINGS.donate(base, slots),
-        case FreeRanges -> FREE_RANGES.donate(base, slots),
+        case Events -> EVENTS.donate(base as UnsafePointer<EventSlot>, slots),
+        case Waiters -> WAITERS.donate(base as UnsafePointer<WaiterSlot>, slots),
+        case Interrupts -> INTERRUPTS.donate(base as UnsafePointer<InterruptSlot>, slots),
+        case Attachments -> ATTACHMENTS.donate(base as UnsafePointer<Attachment>, slots),
+        case Timers -> TIMERS.donate(base as UnsafePointer<TimerSlot>, slots),
+        case Memories -> MEMORIES.donate(base as UnsafePointer<MemorySlot>, slots),
+        case IoMemories -> IOMEMORIES.donate(base as UnsafePointer<IoMemorySlot>, slots),
+        case Mappings -> MAPPINGS.donate(base as UnsafePointer<MappingSlot>, slots),
+        case FreeRanges -> FREE_RANGES.donate(base as UnsafePointer<FreeRange>, slots),
         // Frames first, at the extent's own base: the base is aligned to
         // `THREAD_FRAME_STRIDE` (the geometry says so) and each frame is
         // exactly a stride, so every frame is stride-aligned, which
         // `frame_slot` requires. The slots follow at
         // `slots * THREAD_FRAME_STRIDE`, itself a multiple of the stride and
         // therefore of any slot alignment.
-        case Threads -> THREADS.donate_paired(
-            base + ((slots * THREAD_FRAME_STRIDE) as UInt), slots, base),
+        case Threads -> threads().donate_paired(
+            (base + ((slots * THREAD_FRAME_STRIDE) as UInt)) as UnsafePointer<ThreadSlot>,
+            slots, base),
         // Connections first, then their exchanges. `slots * sizeof(PipeSlot)`
         // is a multiple of the slot's alignment, which is the alignment
         // `Exchange` wants too (the geometry took the larger of the two for the
         // base), so the second array lands aligned with no pad.
         case Pipes -> {
             let ex_base = base + ((slots * PIPES.slot_bytes()) as UInt)
-            if not PIPES.donate(base, slots) {
+            if not PIPES.donate(base as UnsafePointer<PipeSlot>, slots) {
                 return false
             }
-            if not EXCHANGES.donate(ex_base, slots * PIPE_INFLIGHT) {
+            if not EXCHANGES.donate(ex_base as UnsafePointer<Exchange>,
+                                    slots * PIPE_INFLIGHT) {
                 fatal_kernel("a pipe donation installed connections without exchanges",
                              slots as UInt)
                 return false
             }
             true
         },
-        case Processes -> PROCESSES.donate(base, slots),
-        case ProcessRecords -> PROCESS_RECORDS.donate(base, slots),
-        case HandleBlocks -> HANDLE_BLOCKS.donate(base, slots),
+        case Processes -> processes().donate(base as UnsafePointer<ProcessBody>, slots),
+        case ProcessRecords -> process_records().donate(base as UnsafePointer<ProcessRecord>,
+                                                        slots),
+        case HandleBlocks -> HANDLE_BLOCKS.donate(base as UnsafePointer<HandleBlock>, slots),
     }
 }
 
@@ -431,10 +448,10 @@ func boot_capacity(kind: SlabKind, raised: &[Int; SLAB_KINDS]) unsafe -> Int {
         case IoMemories -> IOMEMORIES.capacity(),
         case Mappings -> MAPPINGS.capacity(),
         case FreeRanges -> FREE_RANGES.capacity(),
-        case Threads -> THREADS.capacity(),
+        case Threads -> threads().capacity(),
         case Pipes -> PIPES.capacity(),
-        case Processes -> PROCESSES.capacity(),
-        case ProcessRecords -> PROCESS_RECORDS.capacity(),
+        case Processes -> processes().capacity(),
+        case ProcessRecords -> process_records().capacity(),
         case HandleBlocks -> HANDLE_BLOCKS.capacity(),
     }
     held + raised[kind as Int]

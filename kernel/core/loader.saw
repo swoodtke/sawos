@@ -28,7 +28,7 @@ import kcore.limits.{MAX_GRANT_ROWS, NO_MEMORY, ProcessIndex, ROOT_PROCESS,
                      SYSTEM_LEVELS}
 import kcore.threads.{band_level, with_band_level}
 import kcore.process.{claim_root, load_domain, record_grant, start_process}
-import kcore.pslot.{PROCESSES, body_of}
+import kcore.pslot.{processes, body_of}
 import kcore.areas.{install_image_slabs}
 
 /// What a refused too-high address reports: its top 32 bits. The low half is
@@ -603,6 +603,10 @@ func entry_is_executable(table: &ImageTable, entry: UInt) -> Bool {
 /// `validate_image`, so no two of them meet, and no later mapping may meet
 /// any of them (`kcore.process.meets_row`). A segment of no bytes records no
 /// row, so every row here holds at least one byte.
+///
+/// `unsafe` though it names nothing unsafe: it copies from `img_base` and
+/// grants what `dest` describes, so the caller owes that `validate_image`
+/// passed both.
 public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
                                  dest: &LoadRegion, region: Int,
                                  image: Int) unsafe {
@@ -671,7 +675,9 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
 
     // Every row so far is the image's, and no row is recorded before them.
     let b = body_of(ProcessIndex(p))
-    PROCESSES.at(b).image_rows = PROCESSES.at(b).grant_count
+    borrow var body = processes().at(b) {
+        body.image_rows = body.grant_count
+    }
 }
 
 // -----------------------------------------------------------------------------

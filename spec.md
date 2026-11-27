@@ -2310,7 +2310,7 @@ another process's counters. Three things about the region:
   (§2.8, §12). A deployment donates memory to back
   more (`SlabKind.Processes`, through `SystemOp.SlabDonate`, §2.8), and the
   running bound is `process_slots_usable()` =
-  `min(PROCESSES.capacity(), hal.PROT_DOMAIN_SLOTS)`. The second term exists
+  `min(processes().capacity(), hal.PROT_DOMAIN_SLOTS)`. The second term exists
   because a per-process translation-table set comes out of a static HAL pool
   (donation does not reach HAL-internal storage), so a translating tier has a
   lower ceiling than its slab does, and a create past it answers `NoResource` —
