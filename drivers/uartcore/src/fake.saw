@@ -1,0 +1,303 @@
+//! A fake UART for hosted tests: it behaves as the hardware does, and a test
+//! then breaks one thing about it.
+//!
+//! The transmit FIFO drains only when the test says so (`drain`), and what it
+//! drains goes to `wire`, so the test holds the order bytes left in. The
+//! receive FIFO fills only when the test says so (`feed`), and a byte that
+//! finds it full is dropped with the overrun cause raised, as a device does.
+//!
+//! # The causes are latches
+//!
+//! A cause is set when its condition comes true and stays set until
+//! `clear_events` drops it, so a clear wipes a wakeup the driver has not yet
+//! acted on, as a device's does. The receive cause is set by an arriving
+//! byte (at the full level, or at any level while the idle timeout is on);
+//! the error causes by `inject_*` and by an overrun. The transmit cause is
+//! set when the FIFO falls below the programmed level: as the wire drains it,
+//! when the level is programmed and when the cause is enabled with the FIFO
+//! already below it, and, on the emulator, as every store is transmitted. It
+//! is reported only while enabled.
+//!
+//! # Between two reads
+//!
+//! `arm` schedules one action at the start of the n-th call of one kind (a
+//! count read, a clear): some bytes arrive, a cause is raised, the wire takes
+//! bytes. A driver reads a count and then acts on it, and what the device
+//! does between the two is exactly what such a call changes.
+//!
+//! It refuses what a driver must never do, by panicking: a pop from an empty
+//! receive FIFO, a transmit level outside one to the FIFO's depth. It counts
+//! what a test asserts is zero: stores to a full FIFO (`tx_overflow`).
+//!
+//! # The ways it misbehaves
+//!
+//!   - `FakeUart.emulator()`: the count reads zero and every store goes to the
+//!     wire at once, as an emulator's UART does, so only the core's fill cap
+//!     paces a fill;
+//!   - `stuck_count`: the transmit count reads a fixed value whatever the
+//!     FIFO holds, a device whose count lags;
+//!   - `no_timeout`: a byte below the full level raises no receive cause, a
+//!     device whose idle timeout is not enabled.
+
+import uartcore.device.{EV_BREAK, EV_FRAME, EV_OVERRUN, EV_PARITY, EV_RX, EV_TX,
+                        UartDevice}
+
+/// The transmit FIFO's depth, and the receive FIFO's.
+public static FIFO_BYTES: Int = 128
+
+/// The wire's capacity: a test that overflows it fails loudly.
+static WIRE_MAX: Int = 16384
+
+/// The levels the fake remembers.
+static LEVELS_MAX: Int = 64
+
+/// The calls `arm` can wait for.
+public static CALL_RX_COUNT: Int = 1
+public static CALL_TX_COUNT: Int = 2
+public static CALL_CLEAR: Int = 3
+
+public struct FakeUart {
+    // Transmit.
+    tx_fifo: [UInt8; FIFO_BYTES],
+    tx_head: Int,
+    public tx_n: Int,
+    public tx_enabled: Bool,
+    public tx_level: Int,
+    /// Bytes the core stored to a full FIFO, which the device drops.
+    public tx_overflow: Int,
+    /// Bytes stored, and level and enable writes, in total.
+    public stored: UInt32,
+    public enables: UInt32,
+    public disables: UInt32,
+    /// Every level written, in order.
+    public levels: [Int; LEVELS_MAX],
+    public level_writes: Int,
+    /// Every byte the wire took, in order.
+    public wire: [UInt8; WIRE_MAX],
+    public wire_len: Int,
+    // Receive.
+    rx_fifo: [UInt8; FIFO_BYTES],
+    rx_head: Int,
+    public rx_n: Int,
+    // The latched causes.
+    raw: UInt32,
+    // The scheduled action.
+    armed_call: Int,
+    armed_at: Int,
+    armed_seen: Int,
+    arm_feed_n: Int,
+    arm_feed_first: UInt8,
+    arm_raw: UInt32,
+    arm_drain: Int,
+    // Misbehaviors.
+    public instant: Bool,
+    public stuck_count: Int,
+    public no_timeout: Bool,
+    public full_level: Int,
+}
+
+extension FakeUart {
+    /// A device as the hardware is: a 128-byte FIFO each way, nothing
+    /// enabled, a receive level of 64.
+    public static func hardware() -> FakeUart {
+        FakeUart(tx_fifo: [0; FIFO_BYTES], tx_head: 0, tx_n: 0,
+                 tx_enabled: false, tx_level: 0, tx_overflow: 0, stored: 0,
+                 enables: 0, disables: 0, levels: [0; LEVELS_MAX],
+                 level_writes: 0, wire: [0; WIRE_MAX], wire_len: 0,
+                 rx_fifo: [0; FIFO_BYTES], rx_head: 0, rx_n: 0, raw: 0,
+                 armed_call: 0, armed_at: 0, armed_seen: 0, arm_feed_n: 0,
+                 arm_feed_first: 0, arm_raw: 0, arm_drain: 0,
+                 instant: false, stuck_count: -1, no_timeout: false,
+                 full_level: 64)
+    }
+
+    /// The emulator's UART: the count reads zero and the wire takes every
+    /// byte at once.
+    public static func emulator() -> FakeUart {
+        var u = FakeUart.hardware()
+        u.instant = true
+        u
+    }
+
+    // The test's side: what the wire and the line do.
+
+    /// Sets the transmit cause when the FIFO is below the programmed level.
+    func latch_tx(&var self) {
+        if self.tx_level > 0 && self.tx_n < self.tx_level {
+            self.raw = self.raw | EV_TX
+        }
+    }
+
+    /// The wire takes `n` bytes out of the transmit FIFO, or what it holds.
+    public func drain(&var self, n: Int) {
+        var i = 0
+        while i < n && self.tx_n > 0 {
+            self.to_wire(self.tx_fifo[self.tx_head])
+            self.tx_head = (self.tx_head + 1) % FIFO_BYTES
+            self.tx_n = self.tx_n - 1
+            self.latch_tx()
+            i = i + 1
+        }
+    }
+
+    /// The wire takes every byte the FIFO holds.
+    public func drain_all(&var self) {
+        self.drain(FIFO_BYTES)
+    }
+
+    func to_wire(&var self, b: UInt8) {
+        if self.wire_len >= WIRE_MAX {
+            panic("the fake wire is full")
+        }
+        self.wire[self.wire_len] = b
+        self.wire_len = self.wire_len + 1
+    }
+
+    /// A byte arrives on the line. A full FIFO drops it and raises the
+    /// overrun cause.
+    public func feed(&var self, b: UInt8) {
+        if self.rx_n >= FIFO_BYTES {
+            self.raw = self.raw | EV_OVERRUN
+            return
+        }
+        self.rx_fifo[(self.rx_head + self.rx_n) % FIFO_BYTES] = b
+        self.rx_n = self.rx_n + 1
+        if self.rx_n >= self.full_level || not self.no_timeout {
+            self.raw = self.raw | EV_RX
+        }
+    }
+
+    /// `n` bytes arrive, `first`, `first + 1`, and so on.
+    public func feed_run(&var self, first: UInt8, n: Int) {
+        var i = 0
+        while i < n {
+            self.feed((((first as Int) + i) % 256) as UInt8)
+            i = i + 1
+        }
+    }
+
+    /// The receiver sees a parity error.
+    public func inject_parity(&var self) { self.raw = self.raw | EV_PARITY }
+
+    /// The receiver sees a frame error.
+    public func inject_frame(&var self) { self.raw = self.raw | EV_FRAME }
+
+    /// The line is held in break.
+    public func inject_break(&var self) { self.raw = self.raw | EV_BREAK }
+
+    /// Schedules one action for the start of the `at`-th call of kind `call`
+    /// from now (`CALL_RX_COUNT`, `CALL_TX_COUNT` or `CALL_CLEAR`): `feed_n`
+    /// bytes arrive, counting up from `feed_first`; the causes in `raw` are
+    /// raised; and the wire takes `drain` bytes. The call then runs as it
+    /// would have.
+    public func arm(&var self, call: Int, at: Int, feed_n: Int, feed_first: UInt8,
+                    raw: UInt32, drain: Int) {
+        self.armed_call = call
+        self.armed_at = at
+        self.armed_seen = 0
+        self.arm_feed_n = feed_n
+        self.arm_feed_first = feed_first
+        self.arm_raw = raw
+        self.arm_drain = drain
+    }
+
+    /// Counts a call of kind `call`, and runs the scheduled action when it is
+    /// the one.
+    func tick(&var self, call: Int) {
+        if self.armed_call != call { return }
+        self.armed_seen = self.armed_seen + 1
+        if self.armed_seen < self.armed_at { return }
+        self.armed_call = 0
+        self.feed_run(self.arm_feed_first, self.arm_feed_n)
+        self.raw = self.raw | self.arm_raw
+        self.drain(self.arm_drain)
+    }
+
+    /// The bytes on the wire so far equal `first`, `first + 1`, and so on
+    /// for `n` of them.
+    public func wire_is_run(&self, first: UInt8, n: Int) -> Bool {
+        if self.wire_len != n { return false }
+        var i = 0
+        while i < n {
+            if self.wire[i] != (((first as Int) + i) % 256) as UInt8 { return false }
+            i = i + 1
+        }
+        true
+    }
+}
+
+extension FakeUart: UartDevice {
+    func rx_count(&var self) -> Int {
+        self.tick(CALL_RX_COUNT)
+        self.rx_n
+    }
+
+    func rx_pop(&var self) -> UInt8 {
+        if self.rx_n == 0 {
+            panic("rx_pop: the receive FIFO is empty")
+        }
+        let b = self.rx_fifo[self.rx_head]
+        self.rx_head = (self.rx_head + 1) % FIFO_BYTES
+        self.rx_n = self.rx_n - 1
+        b
+    }
+
+    func tx_count(&var self) -> Int {
+        self.tick(CALL_TX_COUNT)
+        if self.instant { return 0 }
+        if self.stuck_count >= 0 { return self.stuck_count }
+        self.tx_n
+    }
+
+    func tx_capacity(&var self) -> Int { FIFO_BYTES }
+
+    func tx_push(&var self, b: UInt8) {
+        self.stored = self.stored + 1
+        if self.instant {
+            self.to_wire(b)
+            self.latch_tx()
+            return
+        }
+        if self.tx_n >= FIFO_BYTES {
+            self.tx_overflow = self.tx_overflow + 1
+            return
+        }
+        self.tx_fifo[(self.tx_head + self.tx_n) % FIFO_BYTES] = b
+        self.tx_n = self.tx_n + 1
+    }
+
+    func events(&var self) -> UInt32 {
+        if self.tx_enabled {
+            self.raw
+        } else {
+            self.raw & (0xFFFF_FFFF ^ EV_TX)
+        }
+    }
+
+    func clear_events(&var self, bits: UInt32) {
+        self.tick(CALL_CLEAR)
+        self.raw = self.raw & (0xFFFF_FFFF ^ bits)
+    }
+
+    func tx_interrupt(&var self, on: Bool) {
+        self.tx_enabled = on
+        if on {
+            self.enables = self.enables + 1
+            self.latch_tx()
+        } else {
+            self.disables = self.disables + 1
+        }
+    }
+
+    func set_tx_threshold(&var self, level: Int) {
+        if level < 1 || level > FIFO_BYTES {
+            panic("set_tx_threshold: {} is outside 1 to the FIFO's depth", level)
+        }
+        self.tx_level = level
+        if self.level_writes < LEVELS_MAX {
+            self.levels[self.level_writes] = level
+        }
+        self.level_writes = self.level_writes + 1
+        self.latch_tx()
+    }
+}

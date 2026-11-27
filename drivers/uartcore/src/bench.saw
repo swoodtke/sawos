@@ -1,0 +1,260 @@
+//! A model of a driver's loop over the core and the fake UART, for hosted
+//! tests.
+//!
+//! `Bench` does what a driver process does with the pieces the core leaves to
+//! it: a connection that holds posted messages while the driver takes none, an
+//! obligation per held request, and replies that may or may not land. Each
+//! message gets an id when it is posted, and every reply is logged against the
+//! id of the request it answers, in the order it was made, so a test reads
+//! which request was answered, when, and with what.
+//!
+//! The loop is the one `serve` documents and no other: messages are taken
+//! only while `Core.intake_open` is true, a request is answered at once or
+//! held, and held requests are answered only after `Core.service`, in the
+//! interrupt. Nothing here calls `next_answer` after a request, so a request
+//! the core holds without arranging an interrupt for it stays held, as it
+//! would in a driver. Written bytes continue one counting sequence (`first`,
+//! then each next byte, wrapping at 256) so the fake's wire can be checked
+//! against it.
+
+import uartcore.device.{UartDevice}
+import uartcore.fake.{FakeUart}
+import uartcore.serve.{Answered, Config, Core, KIND_READ, KIND_SYNC, KIND_WRITE,
+                       MAX_HELD_READS, Served}
+import uartcore.tx.{MAX_SYNCS}
+import uartproto.{BODY_BYTES, Frame, MAX_PAYLOAD, UartBody}
+
+/// Messages the connection holds.
+static INBOX_MAX: Int = 64
+
+/// Replies the log holds.
+static REPLIES_MAX: Int = 256
+
+/// The reply bytes the log keeps.
+static REPLY_KEEP: Int = 40
+
+public struct Reply {
+    /// The id of the request this answers.
+    public id: Int,
+    public kind: Int,
+    public len: UInt,
+    public bytes: [UInt8; REPLY_KEEP],
+    /// Whether the reply found its client.
+    public landed: Bool,
+}
+
+public struct Bench<const T: Int, const R: Int> {
+    public core: Core<T, R>,
+    public uart: FakeUart,
+    /// Whether replies land. A test clears it for the replies it wants to
+    /// fail.
+    public lands: Bool,
+    inbox: [Frame; INBOX_MAX],
+    inbox_ids: [Int; INBOX_MAX],
+    in_head: Int,
+    in_n: Int,
+    read_ids: [Int; MAX_HELD_READS],
+    write_id: Int,
+    sync_ids: [Int; MAX_SYNCS],
+    public replies: [Reply; REPLIES_MAX],
+    public reply_n: Int,
+    next_id: Int,
+    next_byte: Int,
+    body: UartBody,
+}
+
+extension Bench<T, R> {
+    public static func over(cfg: Config, uart: FakeUart) -> Bench<T, R> {
+        let blank = Frame(len: 0, bytes: [0; BODY_BYTES])
+        let none = Reply(id: -1, kind: 0, len: 0, bytes: [0; REPLY_KEEP],
+                         landed: true)
+        Bench<T, R>(core: Core<T, R>.new(cfg), uart: uart, lands: true,
+                    inbox: [blank; INBOX_MAX], inbox_ids: [0; INBOX_MAX],
+                    in_head: 0, in_n: 0,
+                    read_ids: [-1; MAX_HELD_READS], write_id: -1,
+                    sync_ids: [-1; MAX_SYNCS], replies: [none; REPLIES_MAX],
+                    reply_n: 0, next_id: 0, next_byte: 0,
+                    body: UartBody.empty())
+    }
+
+    /// The standard tuning over a hardware-like UART.
+    public static func standard() -> Bench<T, R> {
+        Bench<T, R>.over(Config.standard(), FakeUart.hardware())
+    }
+
+    /// Posts a message and answers its id. It is taken when the driver takes
+    /// messages.
+    public func post(&var self, frame: Frame) -> Int {
+        if self.in_n >= INBOX_MAX {
+            panic("the connection's ring is full")
+        }
+        let id = self.next_id
+        self.next_id = self.next_id + 1
+        let at = (self.in_head + self.in_n) % INBOX_MAX
+        self.inbox[at] = frame
+        self.inbox_ids[at] = id
+        self.in_n = self.in_n + 1
+        id
+    }
+
+    func bare(&var self, op: UInt8) -> Int {
+        var f = Frame(len: 1, bytes: [0; BODY_BYTES])
+        f.bytes[0] = op
+        self.post(f)
+    }
+
+    /// A `Write` of `n` bytes, continuing the counting sequence.
+    public func post_write(&var self, n: Int) -> Int {
+        assert(n >= 0 && n <= MAX_PAYLOAD, "a Write carries at most MAX_PAYLOAD")
+        var f = Frame(len: (n + 1) as UInt, bytes: [0; BODY_BYTES])
+        f.bytes[0] = 2
+        var i = 0
+        while i < n {
+            f.bytes[1 + i] = (self.next_byte % 256) as UInt8
+            self.next_byte = self.next_byte + 1
+            i = i + 1
+        }
+        self.post(f)
+    }
+
+    public func post_read(&var self) -> Int { self.bare(1) }
+    public func post_sync(&var self) -> Int { self.bare(3) }
+    public func post_mark(&var self) -> Int { self.bare(4) }
+    public func post_pending(&var self) -> Int { self.bare(5) }
+    public func post_stats(&var self) -> Int { self.bare(6) }
+
+    /// The client behind request `id` gave up its held `Read`: the driver
+    /// frees the slot, as it does on the abandoned level.
+    public func abandon(&var self, id: Int) {
+        var i = 0
+        while i < MAX_HELD_READS {
+            if self.read_ids[i] == id {
+                self.read_ids[i] = -1
+                self.core.abandon(i)
+            }
+            i = i + 1
+        }
+    }
+
+    /// The messages still posted.
+    public func posted(&self) -> Int { self.in_n }
+
+    /// Takes messages while intake is open.
+    public func pump(&var self) {
+        while self.in_n > 0 && self.core.intake_open() {
+            let id = self.inbox_ids[self.in_head]
+            let frame = self.inbox[self.in_head]
+            self.in_head = (self.in_head + 1) % INBOX_MAX
+            self.in_n = self.in_n - 1
+            self.dispatch(id, &frame)
+        }
+    }
+
+    func dispatch(&var self, id: Int, frame: &Frame) {
+        match self.core.request(&var self.uart, &frame, &var self.body) {
+            case Now(a) -> self.record(id, &a),
+            case Held(kind, slot) -> {
+                if kind == KIND_READ {
+                    self.read_ids[slot] = id
+                } else if kind == KIND_WRITE {
+                    self.write_id = id
+                } else {
+                    self.sync_ids[slot] = id
+                }
+            },
+        }
+    }
+
+    /// Makes every answer that is ready; whether any was.
+    func deliver(&var self) -> Bool {
+        var any = false
+        var more = true
+        while more {
+            if let a = self.core.next_answer(&var self.body) {
+                var id = -1
+                if a.kind == KIND_READ {
+                    id = self.read_ids[a.slot]
+                } else if a.kind == KIND_WRITE {
+                    id = self.write_id
+                } else {
+                    id = self.sync_ids[a.slot]
+                }
+                self.record(id, &a)
+                any = true
+            } else {
+                more = false
+            }
+        }
+        any
+    }
+
+    /// Logs the reply in `body` for request `id`, and puts the input back
+    /// when it did not land.
+    func record(&var self, id: Int, a: &Answered) {
+        if self.reply_n >= REPLIES_MAX {
+            panic("the reply log is full")
+        }
+        var r = Reply(id: id, kind: a.kind, len: a.len,
+                      bytes: [0; REPLY_KEEP], landed: self.lands)
+        var i = 0
+        while i < REPLY_KEEP && (i as UInt) < a.len {
+            r.bytes[i] = self.body.bytes[i]
+            i = i + 1
+        }
+        self.replies[self.reply_n] = r
+        self.reply_n = self.reply_n + 1
+        if not self.lands {
+            self.core.undeliver(&a)
+        }
+    }
+
+    /// The line's interrupt, if it is asserted: the core's device half, then
+    /// every answer that is ready, then the messages the driver can take.
+    public func interrupt(&var self) {
+        if self.uart.events() != 0 {
+            self.core.service(&var self.uart)
+            let _ = self.deliver()
+        }
+        self.pump()
+    }
+
+    /// The reply to request `id`, as an index into `replies`, or -1.
+    public func find(&self, id: Int) -> Int {
+        var i = 0
+        while i < self.reply_n {
+            if self.replies[i].id == id { return i }
+            i = i + 1
+        }
+        -1
+    }
+
+    /// Whether request `id` has been answered.
+    public func answered(&self, id: Int) -> Bool { self.find(id) >= 0 }
+
+    /// Byte `at` of the reply to request `id`; zero when there is none.
+    public func reply_byte(&self, id: Int, at: Int) -> UInt8 {
+        let i = self.find(id)
+        if i < 0 || at >= REPLY_KEEP { return 0 }
+        self.replies[i].bytes[at]
+    }
+
+    /// The length of the reply to request `id`; zero when there is none.
+    public func reply_len(&self, id: Int) -> UInt {
+        let i = self.find(id)
+        if i < 0 { return 0 }
+        self.replies[i].len
+    }
+
+    /// The little-endian `u32` at `at` of the reply to request `id`.
+    public func reply_word(&self, id: Int, at: Int) -> UInt32 {
+        let b0 = self.reply_byte(id, at) as UInt32
+        let b1 = self.reply_byte(id, at + 1) as UInt32
+        let b2 = self.reply_byte(id, at + 2) as UInt32
+        let b3 = self.reply_byte(id, at + 3) as UInt32
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+
+    /// The position of request `id`'s reply among all replies: the order
+    /// replies were made in.
+    public func order(&self, id: Int) -> Int { self.find(id) }
+}

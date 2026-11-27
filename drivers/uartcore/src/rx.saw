@@ -1,0 +1,208 @@
+//! The receive ring and its one gap mark.
+//!
+//! Bytes come in at the tail and go out at the head. Anything that is not a
+//! clean byte (a byte the ring had no room for, bytes the device dropped, a
+//! parity, frame or break error) is an event, and an event is reported in
+//! band, at one place, by a mark.
+//!
+//! # One mark at a time
+//!
+//! The mark sits at the tail: after the last byte accepted before the first
+//! event. While it stands every byte that arrives is dropped and counted into
+//! it, and every further event is counted into it, so each loss sits at the
+//! one position the mark names and the bytes after a mark arrived whole and
+//! contiguous. A reader gets every byte before the mark, then one answer that
+//! is the mark, then the bytes that arrive after it. Because nothing is
+//! accepted behind a standing mark, every byte in the ring is before it.
+//!
+//! A mark is `Lost` when any byte was lost and `Garbled` when none was and an
+//! error was seen; the damaged byte of an error is delivered, among those
+//! before the mark.
+
+/// `a + by`, held at the type's top rather than wrapping: a count the wire
+/// drives must not be able to end the driver.
+public func sat(a: UInt32, by: UInt32) -> UInt32 {
+    if a > 0xFFFF_FFFF - by { 0xFFFF_FFFF } else { a + by }
+}
+
+/// What a mark carries: the events counted since the previous mark.
+public struct Counts {
+    /// Bytes lost, at least: a device overrun counts as one.
+    public lost: UInt32,
+    public frame: UInt32,
+    public parity: UInt32,
+    public breaks: UInt32,
+}
+
+extension Counts {
+    public static func zero() -> Counts {
+        Counts(lost: 0, frame: 0, parity: 0, breaks: 0)
+    }
+
+    public func is_zero(&self) -> Bool {
+        self.lost == 0 && self.frame == 0 && self.parity == 0 && self.breaks == 0
+    }
+
+    /// `self` and `other` counted together.
+    public func plus(&self, other: &Counts) -> Counts {
+        Counts(lost: sat(self.lost, other.lost),
+               frame: sat(self.frame, other.frame),
+               parity: sat(self.parity, other.parity),
+               breaks: sat(self.breaks, other.breaks))
+    }
+}
+
+/// What a read takes from the ring.
+public enum Input {
+    /// Nothing: the ring is empty and no mark stands.
+    case Nothing,
+    case Byte(b: UInt8),
+    /// The mark, when bytes were lost.
+    case Lost(counts: Counts),
+    /// The mark, when none were lost and input was damaged.
+    case Garbled(counts: Counts),
+}
+
+/// The totals since the ring was made, which a `Stats` reports.
+public struct RxTotals {
+    /// Bytes taken out of the device, kept or dropped.
+    public received: UInt32,
+    /// Bytes dropped by the ring, and one per overrun the device reported.
+    public lost: UInt32,
+    public frame: UInt32,
+    public parity: UInt32,
+    public breaks: UInt32,
+    /// Bytes the ring dropped itself (a subset of `lost`).
+    public dropped: UInt32,
+    /// Bytes handed to readers.
+    public delivered: UInt32,
+}
+
+public struct Rx<const N: Int> {
+    bytes: [UInt8; N],
+    head: Int,
+    count: Int,
+    /// Whether a mark stands at the tail.
+    marked: Bool,
+    /// The events the standing mark carries.
+    pend: Counts,
+    public totals: RxTotals,
+}
+
+extension Rx<N> {
+    public static func empty() -> Rx<N> {
+        static_assert(N > 0, "a receive ring holds at least one byte")
+        Rx<N>(bytes: [0; N], head: 0, count: 0, marked: false,
+              pend: Counts.zero(),
+              totals: RxTotals(received: 0, lost: 0, frame: 0, parity: 0,
+                               breaks: 0, dropped: 0, delivered: 0))
+    }
+
+    /// The bytes buffered, which no read has taken.
+    public func buffered(&self) -> Int { self.count }
+
+    /// Whether a mark stands.
+    public func has_mark(&self) -> Bool { self.marked }
+
+    /// What a read would find at once: the buffered bytes and the mark.
+    public func readable(&self) -> Int {
+        if self.marked { self.count + 1 } else { self.count }
+    }
+
+    /// A byte the device delivered. It is kept when there is room and no mark
+    /// stands; otherwise it is dropped and counted into the mark, which this
+    /// places at the tail when it is the first event.
+    public func accept(&var self, b: UInt8) {
+        self.totals.received = sat(self.totals.received, 1)
+        if self.marked || self.count >= N {
+            self.marked = true
+            self.pend.lost = sat(self.pend.lost, 1)
+            self.totals.lost = sat(self.totals.lost, 1)
+            self.totals.dropped = sat(self.totals.dropped, 1)
+            return
+        }
+        var at = self.head + self.count
+        if at >= N { at = at - N }
+        self.bytes[at] = b
+        self.count = self.count + 1
+    }
+
+    /// The device reported that it dropped bytes. It does not say how many, so
+    /// this is at least one.
+    public func overrun(&var self) {
+        self.marked = true
+        self.pend.lost = sat(self.pend.lost, 1)
+        self.totals.lost = sat(self.totals.lost, 1)
+    }
+
+    public func frame_error(&var self) {
+        self.marked = true
+        self.pend.frame = sat(self.pend.frame, 1)
+        self.totals.frame = sat(self.totals.frame, 1)
+    }
+
+    public func parity_error(&var self) {
+        self.marked = true
+        self.pend.parity = sat(self.pend.parity, 1)
+        self.totals.parity = sat(self.totals.parity, 1)
+    }
+
+    public func break_seen(&var self) {
+        self.marked = true
+        self.pend.breaks = sat(self.pend.breaks, 1)
+        self.totals.breaks = sat(self.totals.breaks, 1)
+    }
+
+    /// Takes what a read gets: the oldest byte, else the mark (which then
+    /// ends, its counts reset), else nothing.
+    public func take(&var self) -> Input {
+        if self.count > 0 {
+            let b = self.bytes[self.head]
+            var next = self.head + 1
+            if next >= N { next = 0 }
+            self.head = next
+            self.count = self.count - 1
+            self.totals.delivered = sat(self.totals.delivered, 1)
+            return Input.Byte(b)
+        }
+        if self.marked {
+            let counts = self.pend
+            self.pend = Counts.zero()
+            self.marked = false
+            if counts.lost > 0 {
+                return Input.Lost(counts)
+            }
+            return Input.Garbled(counts)
+        }
+        Input.Nothing
+    }
+
+    /// Puts back a byte whose reply found nobody home, at the front, so the
+    /// next reader gets it. It is called straight after the `take` that
+    /// returned it, before the ring changes again; a ring with no room is a
+    /// byte lost and counted.
+    public func put_back(&var self, b: UInt8) {
+        if self.count >= N {
+            self.totals.lost = sat(self.totals.lost, 1)
+            self.totals.dropped = sat(self.totals.dropped, 1)
+            self.pend.lost = sat(self.pend.lost, 1)
+            self.marked = true
+            return
+        }
+        var at = self.head - 1
+        if at < 0 { at = N - 1 }
+        self.bytes[at] = b
+        self.head = at
+        self.count = self.count + 1
+        if self.totals.delivered > 0 {
+            self.totals.delivered = self.totals.delivered - 1
+        }
+    }
+
+    /// Puts back a mark whose reply found nobody home, with the counts it
+    /// carried, as `put_back` does a byte.
+    public func put_back_mark(&var self, counts: &Counts) {
+        self.pend = self.pend.plus(&counts)
+        self.marked = true
+    }
+}

@@ -1,0 +1,42 @@
+// The emulator's UART: the transmit count reads zero and the wire takes every
+// byte at once, so nothing the FIFO says paces the driver and only the fill
+// cap does. Every byte still leaves once, in order, through the same held
+// Writes, and no interrupt stores more than two fills' worth.
+
+import uartcore.{Config, MAX_HELD_READS, MAX_SYNCS, TxConfig}
+import uartcore.bench.{Bench}
+import uartcore.fake.{FakeUart}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func main() {
+    let cfg = Config(tx: TxConfig(tx_empty: 32, fill_cap: 4, max_syncs: MAX_SYNCS),
+                     held_reads: MAX_HELD_READS)
+    var b = Bench<16, 16>.over(cfg, FakeUart.emulator())
+    let w0 = b.post_write(100)
+    let w1 = b.post_write(100)
+    let w2 = b.post_write(27)
+    let s = b.post_sync()
+    b.pump()
+    check(b.core.tx.holds_write(), "a 100-byte Write cannot fit a 16-byte ring")
+    var rounds = 0
+    while not b.answered(s) && rounds < 10000 {
+        let before = b.uart.stored
+        b.interrupt()
+        check(b.uart.stored - before <= 8, "an interrupt stores two fills at most")
+        rounds = rounds + 1
+    }
+    check(rounds < 10000, "the writes and the Sync finish")
+    check(b.uart.wire_is_run(0, 227), "every byte out once, in order")
+    check(b.uart.tx_overflow == 0, "nothing was stored to a full FIFO")
+    check(b.core.tx.totals.writes_held >= 2, "the large Writes were held")
+    check(b.core.tx.totals.queued == b.core.tx.totals.pushed,
+          "every byte queued was sent")
+    check(b.order(w0) < b.order(w1) && b.order(w1) < b.order(w2)
+              && b.order(w2) < b.order(s), "answered in order")
+}

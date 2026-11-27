@@ -1,0 +1,116 @@
+// The transmit level: while the ring holds a byte it is `tx_empty`, whatever
+// waits, so the next top-up comes with the wire still busy; only with the ring
+// empty is it lowered to a waiting Sync's mark. A Write taken while a Sync
+// waits therefore puts the level back, and the fake's next cause rises at
+// `tx_empty` and not at the Sync's lowered level.
+
+import uartcore.{EV_TX}
+import uartcore.{Config, MAX_HELD_READS, MAX_SYNCS, TxConfig}
+import uartcore.bench.{Bench}
+import uartcore.fake.{FakeUart}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// The service clears the transmit cause, so a latch set while the FIFO was
+/// low is gone once the top-up has filled it.
+func cleared_by_service() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(127)
+    let _ = b.post_write(127)
+    let _ = b.post_write(127)
+    b.pump()
+    check(b.core.tx.in_ring() == 253, "253 bytes wait behind a full FIFO")
+    b.uart.drain(100)
+    check((b.uart.events() & EV_TX) != 0, "the FIFO fell below the level")
+    b.interrupt()
+    check(b.uart.tx_n == 128, "the top-up filled it")
+    check(b.core.tx.in_ring() == 153, "with bytes still waiting")
+    check((b.uart.events() & EV_TX) == 0, "and the cause is cleared")
+}
+
+/// Enabling the cause keeps a wakeup the FIFO's low fill has earned: the
+/// clear comes before the enable, so the enable's own check stands.
+func enable_keeps_cause() {
+    let cfg = Config(tx: TxConfig(tx_empty: 32, fill_cap: 4, max_syncs: MAX_SYNCS),
+                     held_reads: MAX_HELD_READS)
+    var b = Bench<256, 16>.over(cfg, FakeUart.hardware())
+    let _ = b.post_write(20)
+    b.pump()
+    check(b.uart.tx_n == 4 && b.core.tx.in_ring() == 16, "a fill of four")
+    check(b.uart.tx_enabled, "the cause is enabled")
+    check((b.uart.events() & EV_TX) != 0,
+          "and asserted, the FIFO being below the level")
+    var rounds = 0
+    while b.core.tx.in_ring() > 0 && rounds < 100 {
+        b.uart.drain(1)
+        b.interrupt()
+        rounds = rounds + 1
+    }
+    b.uart.drain_all()
+    check(b.uart.wire_is_run(0, 20), "every byte out")
+}
+
+/// Enabling the cause drops a stale latch the FIFO's high fill has not
+/// earned.
+func stale_latch_dropped() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(40)
+    b.pump()
+    let a = b.post_sync()
+    b.pump()
+    b.uart.drain_all()
+    b.interrupt()
+    check(b.answered(a) && not b.uart.tx_enabled, "idle again, level 1 set")
+    let _ = b.post_write(5)
+    b.pump()
+    b.uart.drain_all()
+    let _ = b.post_write(127)
+    let _ = b.post_write(100)
+    b.pump()
+    check(b.core.tx.is_busy() && b.core.tx.in_ring() == 99,
+          "busy behind a full FIFO")
+    check((b.uart.events() & EV_TX) == 0, "the stale latch was dropped")
+}
+
+func main() {
+    cleared_by_service()
+    stale_latch_dropped()
+    enable_keeps_cause()
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(100)
+    b.pump()
+    let s = b.post_sync()
+    b.pump()
+    check(b.uart.tx_level == 1, "a waiting Sync lowers the level")
+
+    let _ = b.post_write(10)
+    b.pump()
+    check(b.core.tx.in_ring() == 10, "the Write waits in the ring")
+    check(b.uart.tx_level == 32, "a Write put the level back to tx_empty")
+
+    // The cause rises at 31 bytes, not at the Sync's lowered level.
+    b.uart.drain(68)
+    check(b.uart.tx_n == 32, "the FIFO holds tx_empty bytes")
+    check((b.uart.events() & EV_TX) == 0, "no cause at tx_empty bytes")
+    b.uart.drain(1)
+    check((b.uart.events() & EV_TX) != 0, "the cause rises below tx_empty")
+
+    // The top-up empties the ring, and the level goes down to the mark again.
+    b.interrupt()
+    check(b.core.tx.in_ring() == 0, "the top-up moved the ring")
+    check(not b.answered(s), "the mark has not passed")
+    check(b.uart.tx_level == 11, "ring empty: the Sync's level again")
+    check(b.uart.level_writes == 3,
+          "the level was written for each change and no other time")
+    b.uart.drain(30)
+    b.interrupt()
+    check(not b.answered(s), "one byte before the mark is still in the FIFO")
+    b.uart.drain(1)
+    b.interrupt()
+    check(b.answered(s), "the Sync is answered once its mark has passed")
+}

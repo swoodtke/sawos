@@ -1,0 +1,123 @@
+// Receive damage: a parity error, a frame error or a break is counted and
+// reported at a mark placed after the bytes drained at the interrupt that saw
+// it, among which the damaged byte lies (it is delivered). The mark is
+// `Garbled` when no byte was lost and `Lost` when one was, and either way it
+// carries every count: bytes lost, frame errors, parity errors, breaks.
+
+import uartcore.bench.{Bench}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func read<const R: Int>(b: &var Bench<64, R>) -> Int {
+    let id = b.post_read()
+    b.pump()
+    id
+}
+
+/// The four counters of the reply to request `id`: lost, frame, parity,
+/// breaks.
+func counts<const R: Int>(b: &Bench<64, R>, id: Int, lost: UInt32, frame: UInt32,
+                          parity: UInt32, breaks: UInt32) -> Bool {
+    let ok = b.reply_word(id, 1) == lost && b.reply_word(id, 5) == frame
+    ok && b.reply_word(id, 9) == parity && b.reply_word(id, 13) == breaks
+}
+
+func parity_after_bytes() {
+    var b = Bench<64, 16>.standard()
+    b.uart.feed_run(10, 3)
+    b.uart.inject_parity()
+    b.interrupt()
+    check(b.uart.events() == 0, "the interrupt cleared every cause it handled")
+    b.interrupt()
+    check(b.core.rx.totals.parity == 1, "an error is counted once")
+    var i = 0
+    while i < 3 {
+        let id = read(&var b)
+        check(b.reply_byte(id, 1) == (10 + i) as UInt8,
+              "the damaged byte is delivered with its neighbours")
+        i = i + 1
+    }
+    let m = read(&var b)
+    check(b.answered(m), "the mark answers after the bytes")
+    check(b.reply_byte(m, 0) == 5, "Garbled: no byte was lost")
+    check(counts(&b, m, 0, 0, 1, 0), "one parity error")
+}
+
+func frame_and_break() {
+    var b = Bench<64, 16>.standard()
+    b.uart.feed_run(0, 2)
+    b.uart.inject_frame()
+    b.uart.inject_break()
+    b.interrupt()
+    let r0 = read(&var b)
+    let r1 = read(&var b)
+    check(b.reply_byte(r0, 1) == 0 && b.reply_byte(r1, 1) == 1, "two bytes")
+    let m = read(&var b)
+    check(b.reply_byte(m, 0) == 5, "Garbled")
+    check(counts(&b, m, 0, 1, 0, 1), "one frame error and one break, one mark")
+    let after = read(&var b)
+    check(not b.answered(after), "no second mark")
+}
+
+/// A loss in the same interrupt as an error makes the mark Lost, with both
+/// counts.
+func loss_and_error() {
+    var b = Bench<64, 4>.standard()
+    b.uart.feed_run(0, 6)
+    b.uart.inject_parity()
+    b.interrupt()
+    var i = 0
+    while i < 4 {
+        let id = read(&var b)
+        check(b.reply_byte(id, 1) == i as UInt8, "the kept bytes")
+        i = i + 1
+    }
+    let m = read(&var b)
+    check(b.reply_byte(m, 0) == 4, "Lost, because a byte was lost")
+    check(counts(&b, m, 2, 0, 1, 0), "both counts: two lost and a parity error")
+}
+
+/// The device's overrun means it dropped bytes it does not count: at least
+/// one lost, after the bytes it did deliver.
+func overrun() {
+    var b = Bench<64, 256>.standard()
+    b.uart.feed_run(0, 130)
+    b.interrupt()
+    check(b.core.rx.buffered() == 128, "the FIFO's 128 bytes were drained")
+    var i = 0
+    while i < 128 {
+        let id = read(&var b)
+        check(b.reply_byte(id, 1) == i as UInt8, "in order")
+        i = i + 1
+    }
+    let m = read(&var b)
+    check(b.reply_byte(m, 0) == 4, "Lost")
+    check(counts(&b, m, 1, 0, 0, 0), "at least one")
+    check(b.core.rx.totals.lost == 1, "and the total counts it")
+}
+
+/// An error with no byte behind it is a mark by itself, which answers a
+/// held Read.
+func break_alone() {
+    var b = Bench<64, 16>.standard()
+    let held = read(&var b)
+    check(not b.answered(held), "the Read is held")
+    b.uart.inject_break()
+    b.interrupt()
+    check(b.answered(held), "the mark answers it")
+    check(b.reply_byte(held, 0) == 5 && counts(&b, held, 0, 0, 0, 1),
+          "Garbled with one break")
+}
+
+func main() {
+    parity_after_bytes()
+    frame_and_break()
+    loss_and_error()
+    overrun()
+    break_alone()
+}

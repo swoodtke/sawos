@@ -1,0 +1,86 @@
+// The receive half of the interrupt, against a device that does things
+// between two reads: a byte that arrives after the last count read and
+// before the level clear has its cause cleared with it, an error raised
+// during the drain is a new event that stays raised for the next service,
+// and an overrun is a position in the stream, so bytes that arrive after it
+// are dropped behind its mark and not kept before it.
+
+import uartcore.{EV_PARITY}
+import uartcore.bench.{Bench}
+import uartcore.fake.{CALL_CLEAR, CALL_RX_COUNT}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func read<const R: Int>(b: &var Bench<64, R>) -> Int {
+    let id = b.post_read()
+    b.pump()
+    id
+}
+
+/// The byte arrives after the count read that found nothing more, and the
+/// clear that follows wipes its cause. One interrupt still delivers it.
+func byte_before_clear() {
+    var b = Bench<64, 16>.standard()
+    b.uart.feed_run(0, 3)
+    b.uart.arm(CALL_CLEAR, 1, 1, 77, 0, 0)
+    b.interrupt()
+    check(b.uart.rx_n == 0, "the late byte was taken by the same interrupt")
+    check(b.core.rx.buffered() == 4, "four bytes are buffered")
+    check(b.uart.events() == 0, "and no cause is left behind")
+    var i = 0
+    while i < 3 {
+        let id = read(&var b)
+        check(b.reply_byte(id, 1) == i as UInt8, "in order")
+        i = i + 1
+    }
+    let last = read(&var b)
+    check(b.reply_byte(last, 1) == 77, "the late byte last")
+}
+
+/// An error raised during the drain is a new event: it stays raised, is
+/// not counted by this service (the snapshot's own error is, once), and is
+/// counted by the next, once.
+func error_during_the_drain() {
+    var b = Bench<64, 16>.standard()
+    b.uart.feed_run(0, 2)
+    b.uart.inject_parity()
+    // Raised again after the service cleared the one it saw.
+    b.uart.arm(CALL_RX_COUNT, 2, 0, 0, EV_PARITY, 0)
+    b.interrupt()
+    check(b.core.rx.totals.parity == 1, "the snapshot's error is counted once")
+    check((b.uart.events() & EV_PARITY) != 0, "the new one is still raised")
+    b.interrupt()
+    check(b.core.rx.totals.parity == 2, "and the next service counts it")
+    check(b.uart.events() == 0, "once")
+}
+
+/// The overrun is at the end of the first batch: bytes that arrive while the
+/// rest is drained are dropped behind its mark.
+func later_bytes_behind_the_mark() {
+    var b = Bench<64, 256>.standard()
+    b.uart.feed_run(0, 129)
+    b.uart.arm(CALL_RX_COUNT, 2, 3, 200, 0, 0)
+    b.interrupt()
+    check(b.core.rx.buffered() == 128, "only the first batch is before the mark")
+    check(b.core.rx.totals.lost == 4, "the overrun and the three that came after")
+    check(b.core.rx.totals.dropped == 3, "three were dropped by the ring")
+    var i = 0
+    while i < 128 {
+        let id = read(&var b)
+        check(b.reply_byte(id, 1) == i as UInt8, "the first batch in order")
+        i = i + 1
+    }
+    let m = read(&var b)
+    check(b.reply_byte(m, 0) == 4 && b.reply_word(m, 1) == 4, "then a mark of four")
+}
+
+func main() {
+    byte_before_clear()
+    error_during_the_drain()
+    later_bytes_behind_the_mark()
+}

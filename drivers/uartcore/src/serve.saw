@@ -1,0 +1,396 @@
+//! The serve state machine.
+//!
+//! `Core` decides everything a UART driver decides and touches no kernel
+//! object: a request is a `Frame` in and a reply in a `UartBody` out. The
+//! driver owns the obligations, the `PipeRequest`s a reply is made through,
+//! and the core names each one by a kind and a slot: a request that cannot be
+//! answered yet is `Served.Held(kind, slot)`, the driver stores its obligation
+//! under that name, and the core later returns the answer for that name from
+//! `next_answer`.
+//!
+//! # The driver's loop
+//!
+//! ```text
+//! take messages while core.intake_open():
+//!     match core.request(dev, frame, body):
+//!         Now(a)         reply with body[0..a.len]; if it does not land,
+//!                        core.undeliver(a)
+//!         Held(kind, s)  keep the obligation under (kind, s)
+//! on the interrupt:
+//!     core.service(dev)            every device access
+//!     acknowledge the line
+//!     while let a = core.next_answer(body):
+//!         reply with body[0..a.len] to the obligation (a.kind, a.slot);
+//!         if it does not land, core.undeliver(a)
+//! when a client abandons a held read: core.abandon(slot)
+//! ```
+//!
+//! A held request is answered only from `next_answer` after an interrupt, so
+//! `Held` is a promise that one will come: a `Read` waits for input, whose
+//! arrival raises the receive cause; a `Write` for room, a `Sync` for its
+//! mark, and both have the transmit cause enabled at a level that rises when
+//! the FIFO has drained enough, immediately if it already has.
+//!
+//! `undeliver` must follow its answer at once, before the core is used
+//! again: it puts the byte or the mark back at the front, and a call between
+//! would let newer input slip ahead of it.
+//!
+//! # The states
+//!
+//! Receive has a ring and at most one standing mark (`Rx`); a `Read` is
+//! answered from the ring or held, up to `held_reads` of them, oldest first.
+//! Transmit is idle or busy (the transmit cause disabled or enabled), with
+//! the held `Write` and the held `Sync`s (`Tx`). Intake is open unless a
+//! `Write` is held or unanswered, or the `Sync` set is full.
+
+import uartcore.device.{EV_BREAK, EV_ERRORS, EV_FRAME, EV_OVERRUN, EV_PARITY,
+                        EV_RECEIVE, EV_RX, UartDevice}
+import uartcore.rx.{Counts, Input, Rx}
+import uartcore.tx.{MAX_SYNCS, SyncTake, Tx, TxConfig}
+import uartproto.{Frame, UartBody, UartCounts, UartStats, UartStatus}
+
+/// How many `Read`s are held at once; past it a `Read` is answered `Busy`.
+public static MAX_HELD_READS: Int = 4
+
+/// What an answer is for.
+public static KIND_READ: Int = 0
+public static KIND_WRITE: Int = 1
+public static KIND_SYNC: Int = 2
+
+/// A request that is none of those: `Mark`, `Pending`, `Stats`, or a refusal.
+public static KIND_OTHER: Int = 3
+
+/// The most `Pending` reports: its reply is one byte.
+static PENDING_MAX: Int = 255
+
+public struct Config {
+    public tx: TxConfig,
+    /// The `Read`s held, at most `MAX_HELD_READS`.
+    public held_reads: Int,
+}
+
+extension Config {
+    /// The shipping tuning: a transmit level of 32 of the FIFO's 128, a fill
+    /// as large as the FIFO, the full sets of held requests.
+    public static func standard() -> Config {
+        Config(tx: TxConfig(tx_empty: 32, fill_cap: 128, max_syncs: MAX_SYNCS),
+               held_reads: MAX_HELD_READS)
+    }
+}
+
+/// A reply made, in the body the caller gave: which request it answers and
+/// how many bytes of the body it is.
+public struct Answered {
+    /// The kind of request this answers: `KIND_READ`, `KIND_WRITE`,
+    /// `KIND_SYNC` or `KIND_OTHER`.
+    public kind: Int,
+    /// The held request's slot, or -1 for a request answered at once.
+    public slot: Int,
+    /// The reply's length.
+    public len: UInt,
+    /// What a `Read` took, which `undeliver` puts back.
+    public input: Input,
+}
+
+/// What a request comes to.
+public enum Served {
+    /// Answered: the reply is in the body.
+    case Now(answer: Answered),
+    /// Kept: the driver holds the obligation under this name.
+    case Held(kind: Int, slot: Int),
+}
+
+public struct Core<const T: Int, const R: Int> {
+    cfg: Config,
+    public tx: Tx<T>,
+    public rx: Rx<R>,
+    read_used: [Bool; MAX_HELD_READS],
+    read_seq: [UInt; MAX_HELD_READS],
+    next_seq: UInt,
+}
+
+extension Core<T, R> {
+    public static func new(cfg: Config) -> Core<T, R> {
+        assert(cfg.held_reads >= 1 && cfg.held_reads <= MAX_HELD_READS,
+               "the held Reads are one to MAX_HELD_READS")
+        Core<T, R>(cfg: cfg, tx: Tx<T>.empty(cfg.tx), rx: Rx<R>.empty(),
+                   read_used: [false; MAX_HELD_READS],
+                   read_seq: [0; MAX_HELD_READS], next_seq: 0)
+    }
+
+    /// Whether the driver may take another message.
+    public func intake_open(&self) -> Bool { self.tx.intake_open() }
+
+    /// The `Read`s held.
+    public func reads_held(&self) -> Int {
+        var n = 0
+        var i = 0
+        while i < MAX_HELD_READS {
+            if self.read_used[i] { n = n + 1 }
+            i = i + 1
+        }
+        n
+    }
+
+    /// A client gave up the `Read` held in `slot`: the slot is free.
+    public func abandon(&var self, slot: Int) {
+        if slot >= 0 && slot < MAX_HELD_READS {
+            self.read_used[slot] = false
+        }
+    }
+
+    /// Decides one request. The reply, when there is one now, is in `body`.
+    public func request<D: UartDevice>(&var self, dev: &var D, frame: &Frame,
+                                       body: &var UartBody) -> Served {
+        guard let op = frame.request() else {
+            return Core<T, R>.refuse(&var body, UartStatus.BadOp, KIND_OTHER)
+        }
+        match op {
+            case Read -> self.read_request(&var body),
+            case Write -> self.write_request(&var dev, &frame, &var body),
+            case Sync -> self.sync_request(&var dev, &var body),
+            case Pending -> {
+                var n = self.rx.readable()
+                if n > PENDING_MAX { n = PENDING_MAX }
+                let len = body.ok_byte(n as UInt8)
+                Served.Now(Answered(kind: KIND_OTHER, slot: -1, len: len,
+                                    input: Input.Nothing))
+            },
+            case Mark -> Core<T, R>.ok(&var body, KIND_OTHER),
+            case Stats -> self.stats_request(&var body),
+        }
+    }
+
+    static func ok(body: &var UartBody, kind: Int) -> Served {
+        let len = body.ok()
+        Served.Now(Answered(kind: kind, slot: -1, len: len,
+                            input: Input.Nothing))
+    }
+
+    static func refuse(body: &var UartBody, status: UartStatus,
+                       kind: Int) -> Served {
+        let len = body.refuse(status)
+        Served.Now(Answered(kind: kind, slot: -1, len: len,
+                            input: Input.Nothing))
+    }
+
+    /// A `Stats` request: the counters.
+    func stats_request(&self, body: &var UartBody) -> Served {
+        let stats = UartStats(received: self.rx.totals.received,
+                              lost: self.rx.totals.lost,
+                              frame_errors: self.rx.totals.frame,
+                              parity_errors: self.rx.totals.parity,
+                              breaks: self.rx.totals.breaks,
+                              queued: clamp32(self.tx.totals.queued),
+                              sent: clamp32(self.tx.totals.pushed),
+                              writes_held: self.tx.totals.writes_held)
+        let len = body.ok_stats(&stats)
+        Served.Now(Answered(kind: KIND_OTHER, slot: -1, len: len,
+                            input: Input.Nothing))
+    }
+
+    /// A mark's counts as the wire carries them.
+    static func wire(c: &Counts) -> UartCounts {
+        UartCounts(lost: c.lost, frame: c.frame, parity: c.parity,
+                   breaks: c.breaks)
+    }
+
+    /// The reply for what a read took.
+    static func input_reply(body: &var UartBody, input: Input) -> UInt {
+        match input {
+            case Byte(b) -> body.ok_byte(b),
+            case Lost(c) -> body.mark(UartStatus.Lost, &Core<T, R>.wire(&c)),
+            case Garbled(c) -> body.mark(UartStatus.Garbled,
+                                         &Core<T, R>.wire(&c)),
+            case Nothing -> body.refuse(UartStatus.Busy),
+        }
+    }
+
+    /// A `Read`: answered from the ring, held when nothing is there, `Busy`
+    /// when as many are held as will be.
+    func read_request(&var self, body: &var UartBody) -> Served {
+        if self.rx.readable() > 0 {
+            let input = self.rx.take()
+            let len = Core<T, R>.input_reply(&var body, input)
+            return Served.Now(Answered(kind: KIND_READ, slot: -1, len: len,
+                                       input: input))
+        }
+        var i = 0
+        while i < self.cfg.held_reads {
+            if not self.read_used[i] {
+                self.read_used[i] = true
+                self.read_seq[i] = self.next_seq
+                self.next_seq = self.next_seq + 1
+                return Served.Held(KIND_READ, i)
+            }
+            i = i + 1
+        }
+        Core<T, R>.refuse(&var body, UartStatus.Busy, KIND_READ)
+    }
+
+    /// A `Write`: answered once wholly queued, which is at once when it fits.
+    func write_request<D: UartDevice>(&var self, dev: &var D, frame: &Frame,
+                                      body: &var UartBody) -> Served {
+        if not self.tx.intake_open() {
+            return Core<T, R>.refuse(&var body, UartStatus.Busy, KIND_WRITE)
+        }
+        let whole = self.tx.write(&frame)
+        self.tx.start(&var dev)
+        if whole {
+            return Core<T, R>.ok(&var body, KIND_WRITE)
+        }
+        Served.Held(KIND_WRITE, 0)
+    }
+
+    /// A `Sync`: answered once every byte queued before it has left the FIFO.
+    func sync_request<D: UartDevice>(&var self, dev: &var D,
+                                     body: &var UartBody) -> Served {
+        if not self.tx.intake_open() {
+            return Core<T, R>.refuse(&var body, UartStatus.Busy, KIND_SYNC)
+        }
+        match self.tx.sync(&var dev) {
+            case Reached -> Core<T, R>.ok(&var body, KIND_SYNC),
+            case Waits(slot) -> {
+                self.tx.start(&var dev)
+                Served.Held(KIND_SYNC, slot)
+            },
+            case Full -> Core<T, R>.refuse(&var body, UartStatus.Busy, KIND_SYNC),
+        }
+    }
+
+    /// The interrupt's device half: drains the receiver into the ring, counts
+    /// what the device reported, and tops the transmitter up. Every device
+    /// access of the interrupt is here, before the driver acknowledges.
+    ///
+    /// Receive reads the causes once and works from that snapshot:
+    ///
+    ///   1. It clears the error causes it saw (overrun, parity, frame,
+    ///      break) before any pop. An error is an event, raised once; one
+    ///      that is raised during the drain is a new event and stays raised
+    ///      for the next service, which marks it after the bytes popped
+    ///      here. The bytes after a mark still arrived whole.
+    ///   2. It pops what the count names, the first batch, and counts the
+    ///      snapshot's errors there: an overrun or an error is a position in
+    ///      the stream, so a byte that arrives during the rest of the drain
+    ///      is dropped behind its mark.
+    ///   3. It drains until the count is zero.
+    ///   4. It clears the level cause it saw (the receive level), and drains
+    ///      again into the same batch. The clear wipes the wakeup of a byte
+    ///      that arrived after the last count read, and this second drain
+    ///      takes it; a byte that arrives after it raises the cause again.
+    ///
+    /// Clearing the errors after the drain instead would pop a damaged byte
+    /// that arrived between the clear and the drain into this batch, whose
+    /// error the snapshot already counted, and its raised bit would make a
+    /// second mark at the next service.
+    public func service<D: UartDevice>(&var self, dev: &var D) {
+        let ev = dev.events()
+        if (ev & EV_RECEIVE) != 0 {
+            let errors = ev & EV_ERRORS
+            if errors != 0 { dev.clear_events(errors) }
+            let first = dev.rx_count()
+            var i = 0
+            while i < first {
+                self.rx.accept(dev.rx_pop())
+                i = i + 1
+            }
+            if (ev & EV_OVERRUN) != 0 { self.rx.overrun() }
+            if (ev & EV_PARITY) != 0 { self.rx.parity_error() }
+            if (ev & EV_FRAME) != 0 { self.rx.frame_error() }
+            if (ev & EV_BREAK) != 0 { self.rx.break_seen() }
+            self.drain_rx(&var dev)
+            if (ev & EV_RX) != 0 {
+                dev.clear_events(EV_RX)
+                self.drain_rx(&var dev)
+            }
+        }
+        self.tx.service(&var dev)
+    }
+
+    /// Pops the receive FIFO until its count reads zero.
+    func drain_rx<D: UartDevice>(&var self, dev: &var D) {
+        var n = dev.rx_count()
+        while n > 0 {
+            var j = 0
+            while j < n {
+                self.rx.accept(dev.rx_pop())
+                j = j + 1
+            }
+            n = dev.rx_count()
+        }
+    }
+
+    /// The next answer that is ready, in `body`: a held `Write` that is wholly
+    /// queued, then each `Sync` whose mark has passed, oldest first, then a
+    /// held `Read` for each byte or mark there is, oldest first.
+    public func next_answer(&var self, body: &var UartBody) -> Answered? {
+        if self.tx.take_write_answer() {
+            let len = body.ok()
+            return Answered(kind: KIND_WRITE, slot: 0, len: len,
+                            input: Input.Nothing)
+        }
+        let s = self.tx.take_sync_answer()
+        if s >= 0 {
+            let len = body.ok()
+            return Answered(kind: KIND_SYNC, slot: s, len: len,
+                            input: Input.Nothing)
+        }
+        if self.rx.readable() > 0 {
+            let slot = self.oldest_read()
+            if slot >= 0 {
+                self.read_used[slot] = false
+                let input = self.rx.take()
+                let len = Core<T, R>.input_reply(&var body, input)
+                return Answered(kind: KIND_READ, slot: slot, len: len,
+                                input: input)
+            }
+        }
+        None
+    }
+
+    /// The held `Read` asked for longest ago, or -1.
+    func oldest_read(&self) -> Int {
+        var best = -1
+        var i = 0
+        while i < MAX_HELD_READS {
+            if self.read_used[i] {
+                if best < 0 || self.read_seq[i] < self.read_seq[best] {
+                    best = i
+                }
+            }
+            i = i + 1
+        }
+        best
+    }
+
+    /// A reply that did not land: what a `Read` took goes back at the front,
+    /// so the next reader gets it. A `Write` or `Sync` answer that lands
+    /// nowhere is not an error (a tell drops its claim), so nothing is put
+    /// back for those.
+    public func undeliver(&var self, answer: &Answered) {
+        match answer.input {
+            case Byte(b) -> self.rx.put_back(b),
+            case Lost(c) -> self.rx.put_back_mark(&c),
+            case Garbled(c) -> self.rx.put_back_mark(&c),
+            case Nothing -> {},
+        }
+    }
+
+    /// Starts waiting for the transmitter to send everything queued so far, a
+    /// held `Write`'s remainder included, for the driver that is ending.
+    /// Answers whether that is already so; when it is not, the interrupt
+    /// that sees the last byte leave makes `drained` true.
+    public func begin_drain<D: UartDevice>(&var self, dev: &var D) -> Bool {
+        self.tx.begin_drain(&var dev)
+    }
+
+    /// Whether that wait is over: the ring and the FIFO are empty.
+    public func drained<D: UartDevice>(&self, dev: &var D) -> Bool {
+        self.tx.drained(&var dev)
+    }
+}
+
+/// `v` as a `u32`, held at the type's top.
+func clamp32(v: UInt64) -> UInt32 {
+    if v > 0xFFFF_FFFF { 0xFFFF_FFFF } else { v as UInt32 }
+}

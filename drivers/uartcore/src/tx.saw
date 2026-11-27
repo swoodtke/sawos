@@ -1,0 +1,403 @@
+//! The transmit ring, the held `Write` and the `Sync` marks.
+//!
+//! # State
+//!
+//! The ring, `queued` (every byte ever accepted into it), `pushed` (every byte
+//! ever stored to the FIFO), and whether the transmit cause is enabled
+//! (`busy`). A byte leaves the FIFO when the wire has taken it, so
+//! `pushed - tx_count` is the bytes that have gone out.
+//!
+//! # A full ring holds the `Write`
+//!
+//! A `Write` that does not wholly fit has its first part put in the ring and
+//! the rest kept, with its place in the message, as the held `Write`. While
+//! one is held `intake_open` is false: a driver that took another message
+//! would answer it ahead of bytes still to be queued, so it takes none, and
+//! the connection's own ring fills. The copy moves into the ring as the FIFO
+//! drains, and the `Write` is answered once it is wholly queued.
+//!
+//! # Sync
+//!
+//! A `Sync` is marked with `queued` when it is taken and is answered when
+//! `pushed - tx_count` reaches the mark, that is, when every byte queued
+//! before it has left the FIFO. A count read that is stale can only make the
+//! answer late, never early. The transmit level is `tx_empty` whenever the
+//! ring holds a byte, so the next top-up comes with the wire still busy; only
+//! with the ring empty is it lowered to the oldest waiting mark, so the
+//! cause rises exactly when the mark is passed.
+
+import uartcore.device.{EV_TX, UartDevice}
+import uartcore.rx.{sat}
+import uartproto.{Frame, MAX_PAYLOAD}
+
+/// How many `Sync`s are held at once; at the limit intake pauses.
+public static MAX_SYNCS: Int = 4
+
+/// The transmit path's tuning.
+public struct TxConfig {
+    /// The FIFO level below which the transmit cause rises while the ring
+    /// holds bytes.
+    public tx_empty: Int,
+    /// The most bytes one fill stores, whatever the FIFO's room.
+    public fill_cap: Int,
+    /// The `Sync`s held before intake pauses, at most `MAX_SYNCS`.
+    public max_syncs: Int,
+}
+
+/// What a `Sync` finds when it is taken.
+public enum SyncTake {
+    /// Every byte before it has left already.
+    case Reached,
+    /// It waits, in this slot.
+    case Waits(slot: Int),
+    /// The set is full: intake should have been paused.
+    case Full,
+}
+
+/// The totals a `Stats` reports.
+public struct TxTotals {
+    public queued: UInt64,
+    public pushed: UInt64,
+    public writes_held: UInt32,
+}
+
+public struct Tx<const N: Int> {
+    cfg: TxConfig,
+    bytes: [UInt8; N],
+    head: Int,
+    count: Int,
+    busy: Bool,
+    /// The level last programmed; zero when none has been.
+    level: Int,
+    public totals: TxTotals,
+    // The held `Write`: its copy, how much of it is in the ring, whether it
+    // still waits for room, and whether it is wholly queued and unanswered.
+    hold: [UInt8; MAX_PAYLOAD],
+    hold_len: Int,
+    hold_off: Int,
+    hold_active: Bool,
+    hold_done: Bool,
+    // The held `Sync`s: occupied, passed, mark, and order.
+    sync_used: [Bool; MAX_SYNCS],
+    sync_ready: [Bool; MAX_SYNCS],
+    sync_mark: [UInt64; MAX_SYNCS],
+    sync_seq: [UInt; MAX_SYNCS],
+    next_seq: UInt,
+    // The end-of-service drain: a mark nobody answers.
+    draining: Bool,
+    drain_mark: UInt64,
+    drain_passed: Bool,
+}
+
+extension Tx<N> {
+    public static func empty(cfg: TxConfig) -> Tx<N> {
+        static_assert(N > 0, "a transmit ring holds at least one byte")
+        assert(cfg.tx_empty >= 1, "the transmit level is at least one byte")
+        assert(cfg.fill_cap >= 1, "a fill stores at least one byte")
+        assert(cfg.max_syncs >= 1 && cfg.max_syncs <= MAX_SYNCS,
+               "the held Syncs are one to MAX_SYNCS")
+        Tx<N>(cfg: cfg, bytes: [0; N], head: 0, count: 0, busy: false,
+              level: 0,
+              totals: TxTotals(queued: 0, pushed: 0, writes_held: 0),
+              hold: [0; MAX_PAYLOAD], hold_len: 0, hold_off: 0,
+              hold_active: false, hold_done: false,
+              sync_used: [false; MAX_SYNCS], sync_ready: [false; MAX_SYNCS],
+              sync_mark: [0; MAX_SYNCS], sync_seq: [0; MAX_SYNCS],
+              next_seq: 0, draining: false, drain_mark: 0,
+              drain_passed: false)
+    }
+
+    /// The bytes in the ring.
+    public func in_ring(&self) -> Int { self.count }
+
+    /// Whether the transmit cause is enabled.
+    public func is_busy(&self) -> Bool { self.busy }
+
+    /// The level last programmed, zero when none has been.
+    public func programmed_level(&self) -> Int { self.level }
+
+    /// Whether a `Write` is held.
+    public func holds_write(&self) -> Bool { self.hold_active }
+
+    /// The `Sync`s held, answered or not yet taken back.
+    public func syncs_held(&self) -> Int {
+        var n = 0
+        var i = 0
+        while i < MAX_SYNCS {
+            if self.sync_used[i] { n = n + 1 }
+            i = i + 1
+        }
+        n
+    }
+
+    /// Whether the driver may take another message: no `Write` is held or
+    /// waiting to be answered, and the `Sync` set has room.
+    public func intake_open(&self) -> Bool {
+        let idle = not self.hold_active && not self.hold_done
+        idle && self.syncs_held() < self.cfg.max_syncs
+    }
+
+    func push_ring(&var self, b: UInt8) {
+        var at = self.head + self.count
+        if at >= N { at = at - N }
+        self.bytes[at] = b
+        self.count = self.count + 1
+        self.totals.queued = self.totals.queued + 1
+    }
+
+    /// Queues `frame`'s payload. A payload that fits is wholly in the ring and
+    /// this answers true; otherwise what fits is in the ring, the rest is held
+    /// and this answers false.
+    public func write(&var self, frame: &Frame) -> Bool {
+        let len = frame.payload_len() as Int
+        var room = N - self.count
+        if room > len { room = len }
+        var i = 0
+        while i < room {
+            self.push_ring(frame.payload_byte(i))
+            i = i + 1
+        }
+        if room == len { return true }
+        var j = 0
+        while room + j < len {
+            self.hold[j] = frame.payload_byte(room + j)
+            j = j + 1
+        }
+        self.hold_len = j
+        self.hold_off = 0
+        self.hold_active = true
+        self.totals.writes_held = sat(self.totals.writes_held, 1)
+        false
+    }
+
+    /// Moves the held `Write`'s remainder into the ring's room. Answers the
+    /// bytes moved.
+    func admit(&var self) -> Int {
+        if not self.hold_active { return 0 }
+        var moved = 0
+        while self.hold_off < self.hold_len && self.count < N {
+            self.push_ring(self.hold[self.hold_off])
+            self.hold_off = self.hold_off + 1
+            moved = moved + 1
+        }
+        if self.hold_off >= self.hold_len {
+            self.hold_active = false
+            self.hold_done = true
+        }
+        moved
+    }
+
+    /// Stores ring bytes in the FIFO: as many as its room, the fill cap and
+    /// the ring allow, the FIFO's count read once. Each store is a write the
+    /// device is told of, never a read.
+    func fill<D: UartDevice>(&var self, dev: &var D) -> Int {
+        if self.count == 0 { return 0 }
+        var n = dev.tx_capacity() - dev.tx_count()
+        if n > self.cfg.fill_cap { n = self.cfg.fill_cap }
+        if n > self.count { n = self.count }
+        if n <= 0 { return 0 }
+        var i = 0
+        while i < n {
+            dev.tx_push(self.bytes[self.head])
+            self.head = self.head + 1
+            if self.head >= N { self.head = 0 }
+            self.count = self.count - 1
+            self.totals.pushed = self.totals.pushed + 1
+            i = i + 1
+        }
+        n
+    }
+
+    /// Takes a `Sync`: marks it with `queued` and finds it passed or held.
+    ///
+    /// It is passed at once only when no `Sync` is held before it, whatever
+    /// the count says, so a newer `Sync` is never answered ahead of an older
+    /// one. A `Sync` that waits is flagged and answered only by `service`,
+    /// and `settle` programs the level so the cause is asserted by then if
+    /// its mark has already passed.
+    public func sync<D: UartDevice>(&var self, dev: &var D) -> SyncTake {
+        let mark = self.totals.queued
+        if self.syncs_held() == 0 && self.passed(&var dev, mark) {
+            return SyncTake.Reached
+        }
+        var i = 0
+        while i < self.cfg.max_syncs {
+            if not self.sync_used[i] {
+                self.sync_used[i] = true
+                self.sync_ready[i] = false
+                self.sync_mark[i] = mark
+                self.sync_seq[i] = self.next_seq
+                self.next_seq = self.next_seq + 1
+                return SyncTake.Waits(i)
+            }
+            i = i + 1
+        }
+        SyncTake.Full
+    }
+
+    /// Whether every byte up to `mark` has left the FIFO.
+    func passed<D: UartDevice>(&self, dev: &var D, mark: UInt64) -> Bool {
+        let count = self.fifo_count(&var dev)
+        self.totals.pushed >= mark + count
+    }
+
+    func fifo_count<D: UartDevice>(&self, dev: &var D) -> UInt64 {
+        let c = dev.tx_count()
+        if c < 0 { 0 } else { c as UInt64 }
+    }
+
+    /// Starts waiting for everything queued, a held `Write`'s remainder
+    /// included, to leave the FIFO, with no message to answer: how a driver
+    /// whose clients are gone knows its last bytes are out. Answers whether
+    /// that is already so. When it is not, the cause is enabled and rises
+    /// once the mark has passed, and `drained` is true from the interrupt
+    /// that sees it.
+    public func begin_drain<D: UartDevice>(&var self, dev: &var D) -> Bool {
+        var mark = self.totals.queued
+        if self.hold_active {
+            mark = mark + ((self.hold_len - self.hold_off) as UInt64)
+        }
+        self.draining = true
+        self.drain_mark = mark
+        self.drain_passed = self.passed(&var dev, mark)
+        self.settle(&var dev)
+        self.drain_passed
+    }
+
+    /// Whether the drain `begin_drain` started is over.
+    public func drained<D: UartDevice>(&self, dev: &var D) -> Bool {
+        let over = self.drain_passed || self.passed(&var dev, self.drain_mark)
+        self.draining && over
+    }
+
+    /// Flags every held `Sync` whose mark the FIFO has passed, and the drain,
+    /// from one read of the count.
+    func pass_syncs<D: UartDevice>(&var self, dev: &var D) {
+        let count = self.fifo_count(&var dev)
+        let drain_waits = self.draining && not self.drain_passed
+        if drain_waits && self.totals.pushed >= self.drain_mark + count {
+            self.drain_passed = true
+        }
+        var i = 0
+        while i < MAX_SYNCS {
+            let waiting = self.sync_used[i] && not self.sync_ready[i]
+            if waiting && self.totals.pushed >= self.sync_mark[i] + count {
+                self.sync_ready[i] = true
+            }
+            i = i + 1
+        }
+    }
+
+    /// The oldest mark still waited for, a drain's included.
+    func waiting_mark(&self) -> UInt64? {
+        var found = false
+        var best: UInt64 = 0
+        var i = 0
+        while i < MAX_SYNCS {
+            if self.sync_used[i] && not self.sync_ready[i] {
+                if not found || self.sync_mark[i] < best {
+                    best = self.sync_mark[i]
+                    found = true
+                }
+            }
+            i = i + 1
+        }
+        let drain_waits = self.draining && not self.drain_passed
+        if drain_waits && (not found || self.drain_mark < best) {
+            best = self.drain_mark
+            found = true
+        }
+        if found { best } else { None }
+    }
+
+    /// Brings the transmit cause in line with what is waiting: enabled at
+    /// `tx_empty` while the ring or the held `Write` has bytes, enabled at
+    /// the oldest waiting mark's level with the ring empty, and disabled when
+    /// nothing waits.
+    public func settle<D: UartDevice>(&var self, dev: &var D) {
+        var want = false
+        var level = self.cfg.tx_empty
+        if self.count > 0 || self.hold_active {
+            want = true
+        } else if let mark = self.waiting_mark() {
+            want = true
+            // The cause rises while the FIFO holds fewer bytes than this: once
+            // `pushed - mark + 1` is passed, `pushed - count >= mark`.
+            if self.totals.pushed >= mark {
+                level = (self.totals.pushed - mark + 1) as Int
+            } else {
+                level = 1
+            }
+        }
+        if want {
+            if level != self.level {
+                dev.set_tx_threshold(level)
+                self.level = level
+            }
+            if not self.busy {
+                dev.clear_events(EV_TX)
+                dev.tx_interrupt(true)
+                self.busy = true
+            }
+        } else if self.busy {
+            dev.tx_interrupt(false)
+            self.busy = false
+        }
+    }
+
+    /// After a `Write` was queued or a `Sync` taken: starts the transmitter
+    /// when it is idle, and retunes it when it is not.
+    public func start<D: UartDevice>(&var self, dev: &var D) {
+        if not self.busy {
+            let _ = self.fill(&var dev)
+        }
+        self.settle(&var dev)
+    }
+
+    /// The transmit half of the interrupt: clears the cause, tops the FIFO
+    /// up, moves the held `Write`'s remainder into the ring room that freed,
+    /// tops up again, flags the `Sync`s whose marks have passed, and retunes
+    /// the cause. Called with every device access before the acknowledgement.
+    ///
+    /// The cause is cleared before the stores, not after: a device that
+    /// raises it as the stores drain (an emulator's, which transmits at once)
+    /// would have that wakeup cleared with the stale one.
+    public func service<D: UartDevice>(&var self, dev: &var D) {
+        if self.busy {
+            dev.clear_events(EV_TX)
+            let _ = self.fill(&var dev)
+            let _ = self.admit()
+            let _ = self.fill(&var dev)
+        }
+        self.pass_syncs(&var dev)
+        self.settle(&var dev)
+    }
+
+    /// Whether a held `Write` is wholly queued; takes the answer.
+    public func take_write_answer(&var self) -> Bool {
+        if self.hold_done {
+            self.hold_done = false
+            return true
+        }
+        false
+    }
+
+    /// The slot of the oldest `Sync` whose mark has passed, freed; or -1.
+    public func take_sync_answer(&var self) -> Int {
+        var best = -1
+        var i = 0
+        while i < MAX_SYNCS {
+            if self.sync_used[i] && self.sync_ready[i] {
+                if best < 0 || self.sync_seq[i] < self.sync_seq[best] {
+                    best = i
+                }
+            }
+            i = i + 1
+        }
+        if best >= 0 {
+            self.sync_used[best] = false
+            self.sync_ready[best] = false
+        }
+        best
+    }
+}

@@ -1,0 +1,74 @@
+// The held Write: one that does not fit the ring is kept, with its place in
+// the message, and the driver takes no message behind it, so a later message
+// is never answered, and a later Write's bytes never queued, ahead of it. The
+// Write moves into the ring as the FIFO drains and is answered only once it
+// is wholly queued, at the top-up that made the room.
+
+import uartcore.{Config, MAX_HELD_READS, MAX_SYNCS, TxConfig}
+import uartcore.bench.{Bench}
+import uartcore.fake.{FakeUart}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func cfg(fill_cap: Int) -> Config {
+    Config(tx: TxConfig(tx_empty: 32, fill_cap: fill_cap, max_syncs: MAX_SYNCS),
+           held_reads: MAX_HELD_READS)
+}
+
+func main() {
+    // A 16-byte ring and a fill cap of 8: a 100-byte Write cannot fit, and
+    // the first fill moves only half of what the ring holds.
+    var b = Bench<16, 16>.over(cfg(8), FakeUart.hardware())
+    let w1 = b.post_write(100)
+    let w2 = b.post_write(5)
+    let s = b.post_sync()
+    b.pump()
+
+    check(b.core.tx.holds_write(), "the Write that does not fit is held")
+    check(not b.core.intake_open(), "intake is paused while a Write is held")
+    check(b.posted() == 2, "the messages behind the held Write are not taken")
+    check(not b.answered(w1), "a held Write is not answered when it is taken")
+    check(b.core.tx.totals.writes_held == 1, "the hold is counted")
+    check(b.core.tx.totals.queued == 16, "what fits is queued at once")
+
+    // Each interrupt moves what the drained FIFO has room for. The Write is
+    // answered at the interrupt that queues its last byte, never before, and
+    // nothing behind it is taken until then.
+    var rounds = 0
+    while b.core.tx.holds_write() && rounds < 1000 {
+        b.uart.drain(3)
+        b.interrupt()
+        if b.core.tx.holds_write() {
+            check(not b.answered(w1), "a Write is answered only once queued")
+            check(b.posted() == 2, "intake stays paused until it is")
+            check(not b.core.intake_open(), "intake is closed while held")
+        }
+        rounds = rounds + 1
+    }
+    check(rounds < 1000, "the held Write is released")
+    check(b.answered(w1), "the Write is answered when wholly queued")
+    check(b.core.tx.totals.queued >= 100, "all of it was queued")
+    check(b.reply_len(w1) == 1 && b.reply_byte(w1, 0) == 0,
+          "the answer is an Ok")
+    check(b.posted() == 0, "the messages behind are taken once it is released")
+    check(b.order(w1) < b.order(w2), "answered in the order they were posted")
+
+    // The rest drains in order, and the Sync behind the Writes waits for
+    // every byte of them.
+    var more = 0
+    while not b.answered(s) && more < 1000 {
+        b.uart.drain(5)
+        b.interrupt()
+        more = more + 1
+    }
+    check(more < 1000, "the Sync is answered")
+    check(b.uart.wire_len == 105, "the Sync waited for every byte to leave")
+    b.uart.drain_all()
+    check(b.uart.wire_is_run(0, 105), "every byte out once, in order")
+    check(b.uart.tx_overflow == 0, "no store reached a full FIFO")
+}

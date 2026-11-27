@@ -1,0 +1,197 @@
+// Sync: a Sync is marked with the bytes queued before it and answered exactly
+// when every one of them has left the FIFO, that is, when `pushed - count`
+// passes the mark. With the ring empty the transmit level is lowered to
+// `pushed - mark + 1`, so the cause rises at the very byte that passes the
+// mark and not before. The fake's FIFO drains only when the test says, so
+// "exactly" is checkable one byte at a time.
+
+import uartcore.bench.{Bench}
+import uartcore.fake.{CALL_TX_COUNT}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// The FIFO holds all of a Write, and a Sync behind it waits for the last
+/// byte to leave.
+func ring_empty() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(40)
+    b.pump()
+    check(b.uart.tx_n == 40 && b.core.tx.in_ring() == 0,
+          "the Write is in the FIFO")
+    let s = b.post_sync()
+    b.pump()
+    check(not b.answered(s), "a Sync is not answered when it is taken")
+    check(b.uart.tx_level == 1,
+          "with the ring empty the level is pushed - mark + 1")
+    b.uart.drain(39)
+    b.interrupt()
+    check(not b.answered(s), "one byte still in the FIFO")
+    b.uart.drain(1)
+    b.interrupt()
+    check(b.answered(s), "answered when the last byte has gone")
+    check(b.uart.wire_len == 40, "exactly the bytes before it were out")
+    check(not b.uart.tx_enabled, "nothing waits: the cause is disabled")
+}
+
+/// A Sync whose mark is in the middle of the FIFO, with more bytes behind it,
+/// is answered when the bytes before it are gone and not when the FIFO is
+/// empty.
+func mark_in_the_middle() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(100)
+    b.pump()
+    let s = b.post_sync()
+    b.pump()
+    let _ = b.post_write(10)
+    b.pump()
+    check(b.core.tx.in_ring() == 10, "the second Write waits in the ring")
+    b.uart.drain(70)
+    b.interrupt()
+    check(b.uart.tx_n == 40, "the interrupt topped the FIFO up")
+    check(not b.answered(s), "70 of the 100 bytes before the mark are out")
+    check(b.uart.tx_level == 11,
+          "ring empty again: the level is pushed - mark + 1")
+    b.uart.drain(29)
+    b.interrupt()
+    check(not b.answered(s), "one byte before the mark is still in the FIFO")
+    b.uart.drain(1)
+    b.interrupt()
+    check(b.answered(s), "answered at the byte that passes the mark")
+    check(b.uart.wire_len == 100, "with the later bytes still in the FIFO")
+    check(b.uart.tx_n == 10, "the ten after the mark were not waited for")
+}
+
+/// Bytes still in the ring when the Sync is taken are before its mark, even
+/// though the FIFO has not seen them.
+func bytes_in_the_ring() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(100)
+    let _ = b.post_write(100)
+    b.pump()
+    check(b.uart.tx_n == 128 && b.core.tx.in_ring() == 72,
+          "the FIFO is full and 72 bytes wait in the ring")
+    let s = b.post_sync()
+    b.pump()
+    check(b.uart.tx_level == 32, "the ring holds bytes: the level is tx_empty")
+    b.uart.drain(128)
+    b.interrupt()
+    check(b.uart.tx_n == 72, "the ring moved into the FIFO")
+    check(not b.answered(s), "72 bytes before the mark are still in the FIFO")
+    b.uart.drain(71)
+    b.interrupt()
+    check(not b.answered(s), "one byte before the mark is still in the FIFO")
+    b.uart.drain(1)
+    b.interrupt()
+    check(b.answered(s), "answered when the last of them has gone")
+    check(b.uart.wire_len == 200, "every byte before it was out")
+}
+
+/// A Sync with nothing ahead of it is answered at once.
+func nothing_ahead() {
+    var b = Bench<256, 16>.standard()
+    let s0 = b.post_sync()
+    b.pump()
+    check(b.answered(s0), "a Sync on a fresh driver is answered at once")
+    let _ = b.post_write(20)
+    b.pump()
+    b.uart.drain_all()
+    let s1 = b.post_sync()
+    b.pump()
+    check(b.answered(s1), "a Sync after the wire has taken everything is too")
+}
+
+/// A mark that passes between two reads of the count must not strand the
+/// Sync: whichever read the wire takes the bytes before, the Sync is either
+/// answered at once or has the cause on, and a driver that waits for the
+/// interrupt gets it.
+func passes_between_reads() {
+    var k = 1
+    while k <= 3 {
+        var b = Bench<256, 16>.standard()
+        let _ = b.post_write(40)
+        b.pump()
+        b.uart.arm(CALL_TX_COUNT, k, 0, 0, 0, 40)
+        let s = b.post_sync()
+        b.pump()
+        var rounds = 0
+        while not b.answered(s) && rounds < 3 {
+            b.interrupt()
+            rounds = rounds + 1
+        }
+        // A read the core did not make leaves the bytes where they were; the
+        // wire takes them now.
+        if not b.answered(s) {
+            b.uart.drain_all()
+            b.interrupt()
+        }
+        check(b.answered(s), "the Sync is answered, whenever the bytes left")
+        k = k + 1
+    }
+}
+
+/// A Sync taken while an older one waits is answered after it, even when the
+/// wire has already taken every byte before both.
+func newer_not_ahead() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(40)
+    b.pump()
+    let older = b.post_sync()
+    b.pump()
+    b.uart.drain_all()
+    let newer = b.post_sync()
+    b.pump()
+    check(not b.answered(newer), "a newer Sync does not pass an older one")
+    check(not b.answered(older), "the older one waits for the interrupt")
+    b.interrupt()
+    check(b.answered(older) && b.answered(newer), "both are answered")
+    check(b.order(older) < b.order(newer), "oldest first")
+}
+
+/// The level follows the oldest mark waited for, whichever slot it is in and
+/// however many are held.
+func oldest_mark_sets_level() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(40)
+    b.pump()
+    let a = b.post_sync()
+    b.pump()
+    check(b.uart.tx_level == 1, "A waits at mark 40")
+    let _ = b.post_write(30)
+    b.pump()
+    b.uart.drain(10)
+    b.interrupt()
+    check(b.uart.tx_level == 31, "ring empty: 70 pushed, mark 40: level 31")
+    let bb = b.post_sync()
+    b.pump()
+    check(b.uart.tx_level == 31, "a second Sync at mark 70 does not move it")
+    b.uart.drain(30)
+    b.interrupt()
+    check(b.answered(a), "A is answered when 30 bytes remain")
+    check(not b.answered(bb), "B is not")
+    check(b.uart.tx_level == 1, "B is the oldest now: pushed - 70 + 1")
+
+    // The newest Sync takes the lowest slot, A's, which is free.
+    let _ = b.post_write(10)
+    b.pump()
+    let c = b.post_sync()
+    b.pump()
+    b.interrupt()
+    check(not b.answered(bb) && not b.answered(c), "both wait")
+    check(b.uart.tx_level == 11,
+          "B at 70 is older than C at 80 though C holds the lower slot")
+}
+
+func main() {
+    passes_between_reads()
+    newer_not_ahead()
+    oldest_mark_sets_level()
+    ring_empty()
+    mark_in_the_middle()
+    bytes_in_the_ring()
+    nothing_ahead()
+}

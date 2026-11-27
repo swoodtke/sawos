@@ -1,0 +1,89 @@
+//! The driver's whole view of the hardware.
+//!
+//! A device is a receive FIFO, a transmit FIFO and one interrupt line shared
+//! by both directions. The core reads and writes them only through this
+//! trait, so a process implements it over a register window and the tests
+//! over a fake.
+//!
+//! # Events
+//!
+//! `events` answers the interrupt causes as the core's own bits, not the
+//! device's: an implementation maps its status register onto them, and
+//! `clear_events` maps them back. A cause is reported only while the device
+//! has it enabled, so a masked cause is never seen. The transmit cause is a
+//! level the hardware derives from the FIFO's fill, so clearing it never
+//! stops it recurring while the condition holds; the core therefore fills the
+//! FIFO before it clears the cause.
+//!
+//! A cause that is a latch (the device sets it when its condition becomes
+//! true and `clear_events` drops it) is why the core orders its clears
+//! around its reads (`Core.service` says how). The core also relies on
+//! the device raising the transmit cause when it is enabled, or its level
+//! programmed, with the FIFO already below the level, so a `Sync` whose mark
+//! has passed is never left waiting for a transition that already happened.
+//!
+//! # Order
+//!
+//! Every access the core makes comes before the driver acknowledges the
+//! interrupt line (`Core.service` makes them all), because a register read
+//! after the acknowledgement races the line's next assertion.
+
+/// The receive FIFO reached its level, or its idle timeout expired with bytes
+/// in it.
+public static EV_RX: UInt32 = 1
+
+/// The transmit FIFO holds fewer bytes than the programmed level.
+public static EV_TX: UInt32 = 2
+
+/// The receive FIFO overran: the device dropped bytes it does not count.
+public static EV_OVERRUN: UInt32 = 4
+
+/// A received byte had a bad parity bit.
+public static EV_PARITY: UInt32 = 8
+
+/// A received byte had a bad stop bit.
+public static EV_FRAME: UInt32 = 16
+
+/// The line was held in break.
+public static EV_BREAK: UInt32 = 32
+
+/// The causes that report damage or loss and not bytes: overrun, parity,
+/// frame and break.
+public static EV_ERRORS: UInt32 = 4 | 8 | 16 | 32
+
+/// Every receive-side cause: what `Core.service` handles on the receive path
+/// and clears.
+public static EV_RECEIVE: UInt32 = 1 | 4 | 8 | 16 | 32
+
+public trait UartDevice {
+    /// The bytes the receive FIFO holds.
+    func rx_count(&var self) -> Int
+
+    /// Takes the oldest byte out of the receive FIFO. Called only when
+    /// `rx_count` is above zero.
+    func rx_pop(&var self) -> UInt8
+
+    /// The bytes the transmit FIFO holds. A device that cannot say answers
+    /// zero, and the core's fill cap is what paces it then.
+    func tx_count(&var self) -> Int
+
+    /// The transmit FIFO's depth.
+    func tx_capacity(&var self) -> Int
+
+    /// Stores one byte in the transmit FIFO. Called only with the FIFO below
+    /// its depth by `tx_count`.
+    func tx_push(&var self, b: UInt8)
+
+    /// The causes that are asserted and enabled, as `EV_*` bits.
+    func events(&var self) -> UInt32
+
+    /// Clears the causes in `bits`.
+    func clear_events(&var self, bits: UInt32)
+
+    /// Enables or disables the transmit cause.
+    func tx_interrupt(&var self, on: Bool)
+
+    /// Programs the transmit cause to assert while the FIFO holds fewer than
+    /// `level` bytes.
+    func set_tx_threshold(&var self, level: Int)
+}

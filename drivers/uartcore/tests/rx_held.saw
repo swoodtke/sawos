@@ -1,0 +1,156 @@
+// Held reads: a Read with no byte to give is held, up to the limit and then
+// answered Busy; held reads are answered oldest first, by the order they were
+// asked in and not by the slot they sit in; an abandoned one frees its slot;
+// and a reply that does not land puts its byte, or its mark, back at the front
+// so the next reader gets it.
+
+import uartcore.{Config, MAX_SYNCS, TxConfig}
+import uartcore.bench.{Bench}
+import uartcore.fake.{FakeUart}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func read<const R: Int>(b: &var Bench<64, R>) -> Int {
+    let id = b.post_read()
+    b.pump()
+    id
+}
+
+/// Whether request `id` was answered `Ok` with byte `v`.
+func got<const R: Int>(b: &Bench<64, R>, id: Int, v: UInt8) -> Bool {
+    let ok = b.answered(id) && b.reply_len(id) == 2 && b.reply_byte(id, 0) == 0
+    ok && b.reply_byte(id, 1) == v
+}
+
+/// Oldest first: a read that took a lower slot later is not served before an
+/// older one in a higher slot.
+func oldest_first() {
+    var b = Bench<64, 16>.standard()
+    let r0 = read(&var b)
+    let r1 = read(&var b)
+    let r2 = read(&var b)
+    check(not b.answered(r0) && not b.answered(r1) && not b.answered(r2),
+          "no byte: all three are held")
+    b.abandon(r0)
+    let r3 = read(&var b)
+    check(b.core.reads_held() == 3, "the abandoned slot was reused")
+    b.uart.feed_run(20, 3)
+    b.interrupt()
+    check(got(&b, r1, 20), "the oldest held read gets the first byte")
+    check(got(&b, r2, 21), "the next oldest the second")
+    check(got(&b, r3, 22), "the newest, in the lowest slot, the third")
+    check(b.order(r1) < b.order(r2) && b.order(r2) < b.order(r3),
+          "answered in that order")
+    check(not b.answered(r0), "an abandoned read is never answered")
+    check(b.core.reads_held() == 0, "every slot is free")
+}
+
+/// Past the limit a Read is answered Busy at once, and may ask again.
+func busy() {
+    var b = Bench<64, 16>.standard()
+    let r0 = read(&var b)
+    let r1 = read(&var b)
+    let r2 = read(&var b)
+    let r3 = read(&var b)
+    check(b.core.reads_held() == 4, "four are held")
+    let r4 = read(&var b)
+    check(b.answered(r4) && b.reply_len(r4) == 1 && b.reply_byte(r4, 0) == 3,
+          "the fifth is answered Busy at once")
+    check(b.core.reads_held() == 4, "and holds nothing")
+    b.abandon(r1)
+    let r5 = read(&var b)
+    check(not b.answered(r5), "with a slot free it is held")
+    b.uart.feed_run(70, 4)
+    b.interrupt()
+    check(got(&b, r0, 70) && got(&b, r2, 71) && got(&b, r3, 72)
+              && got(&b, r5, 73), "all four answered, oldest first")
+}
+
+/// A reply that found nobody home puts its byte back, in order, whether the
+/// Read was held or answered at once.
+func put_back() {
+    var b = Bench<64, 16>.standard()
+    let held = read(&var b)
+    b.lands = false
+    b.uart.feed_run(30, 2)
+    b.interrupt()
+    check(b.answered(held) && not b.replies[b.find(held)].landed,
+          "the held Read was answered and did not land")
+    check(b.core.rx.buffered() == 2, "the byte went back")
+    b.lands = true
+    let a = read(&var b)
+    let c = read(&var b)
+    check(got(&b, a, 30) && got(&b, c, 31), "the bytes come out in order")
+
+    // Two held reads that both fail: the byte is offered to each in turn and
+    // goes back each time.
+    let h0 = read(&var b)
+    let h1 = read(&var b)
+    b.lands = false
+    b.uart.feed_run(40, 2)
+    b.interrupt()
+    check(b.answered(h0) && b.answered(h1), "both were answered")
+    check(b.core.rx.buffered() == 2, "nothing was lost")
+    b.lands = true
+    let d = read(&var b)
+    let e = read(&var b)
+    check(got(&b, d, 40) && got(&b, e, 41), "in order")
+
+    // A Read answered at once.
+    b.uart.feed_run(50, 2)
+    b.interrupt()
+    b.lands = false
+    let lost_reply = read(&var b)
+    check(b.answered(lost_reply), "answered at once")
+    check(b.core.rx.buffered() == 2, "and put back")
+    b.lands = true
+    let f = read(&var b)
+    check(got(&b, f, 50), "the next reader gets it")
+}
+
+/// A mark whose reply found nobody home stands again, with its counts.
+func mark_put_back() {
+    var b = Bench<64, 2>.standard()
+    b.uart.feed_run(0, 5)
+    b.interrupt()
+    let a = read(&var b)
+    let c = read(&var b)
+    check(got(&b, a, 0) && got(&b, c, 1), "the two bytes that fit")
+    b.lands = false
+    let m0 = read(&var b)
+    check(b.answered(m0) && b.reply_byte(m0, 0) == 4, "the mark was sent")
+    check(b.core.rx.has_mark(), "and stands again, since it did not land")
+    b.lands = true
+    let m1 = read(&var b)
+    check(b.reply_byte(m1, 0) == 4 && b.reply_word(m1, 1) == 3,
+          "with the three lost bytes it carried")
+    check(not b.core.rx.has_mark(), "now it is spent")
+}
+
+/// The limit is the configured one.
+func busy_configured() {
+    let cfg = Config(tx: TxConfig(tx_empty: 32, fill_cap: 128, max_syncs: MAX_SYNCS),
+                     held_reads: 2)
+    var b = Bench<64, 16>.over(cfg, FakeUart.hardware())
+    let r0 = read(&var b)
+    let r1 = read(&var b)
+    let r2 = read(&var b)
+    check(b.core.reads_held() == 2, "two are held")
+    check(b.answered(r2) && b.reply_byte(r2, 0) == 3, "the third is Busy")
+    b.uart.feed_run(5, 2)
+    b.interrupt()
+    check(got(&b, r0, 5) && got(&b, r1, 6), "the two are answered")
+}
+
+func main() {
+    busy_configured()
+    oldest_first()
+    busy()
+    put_back()
+    mark_put_back()
+}

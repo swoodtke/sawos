@@ -1,0 +1,163 @@
+// The fake UART itself behaves as the hardware does, so the other tests'
+// results mean something. Its causes are latches: the transmit cause is set
+// as the FIFO falls below the programmed level (or when the level is
+// programmed or the cause enabled with it already below), reported only
+// while enabled, and held until cleared; the receive cause is set by an
+// arriving byte (and by its idle timeout, which a knob turns off); a byte
+// that finds the receive FIFO full is dropped with the overrun cause raised;
+// the error causes hold until cleared. `arm` runs an action at the start of
+// a chosen call. Then the one way a test breaks it that touches the core: a
+// transmit count that lags.
+
+import uartcore.{EV_OVERRUN, EV_PARITY, EV_RX, EV_TX, UartDevice}
+import uartcore.bench.{Bench}
+import uartcore.fake.{CALL_CLEAR, CALL_RX_COUNT, CALL_TX_COUNT, FakeUart}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func transmit_cause() {
+    var u = FakeUart.hardware()
+    var i = 0
+    while i < 40 {
+        u.tx_push(i as UInt8)
+        i = i + 1
+    }
+    u.set_tx_threshold(32)
+    u.drain(20)
+    check((u.events() & EV_TX) == 0,
+          "a disabled cause is not reported, though 20 bytes are below 32")
+    u.tx_interrupt(true)
+    check((u.events() & EV_TX) != 0, "enabled, the latched cause is reported")
+    u.clear_events(EV_TX)
+    check((u.events() & EV_TX) == 0,
+          "a clear drops the latch though the condition still holds")
+    u.drain(1)
+    check((u.events() & EV_TX) != 0, "the wire draining sets it again")
+    u.clear_events(EV_TX)
+
+    // Enabling with the FIFO already below the level sets it, and so does
+    // programming a level above the FIFO's fill.
+    u.tx_interrupt(false)
+    u.tx_interrupt(true)
+    check((u.events() & EV_TX) != 0, "enabling below the level sets it")
+    u.clear_events(EV_TX)
+    u.set_tx_threshold(64)
+    check((u.events() & EV_TX) != 0, "programming a level above the fill sets it")
+    check(u.wire_len == 21, "the wire took bytes in the order they were stored")
+}
+
+func transmit_level() {
+    var u = FakeUart.hardware()
+    var i = 0
+    while i < 32 {
+        u.tx_push(i as UInt8)
+        i = i + 1
+    }
+    u.set_tx_threshold(32)
+    u.tx_interrupt(true)
+    check((u.events() & EV_TX) == 0, "32 bytes are not below 32")
+    u.drain(1)
+    check((u.events() & EV_TX) != 0, "31 bytes are")
+}
+
+func receive_cause() {
+    var u = FakeUart.hardware()
+    check(u.events() == 0, "nothing arrived")
+    u.feed(7)
+    check((u.events() & EV_RX) != 0, "one byte: the idle timeout raises it")
+    u.clear_events(EV_RX)
+    check(u.rx_count() == 1, "a clear does not take the byte")
+    check((u.events() & EV_RX) == 0, "and the cause is gone with it")
+    check(u.rx_pop() == 7, "the first byte typed is the first out")
+
+    var v = FakeUart.hardware()
+    v.no_timeout = true
+    v.feed_run(0, 63)
+    check((v.events() & EV_RX) == 0, "without the timeout, below the full level")
+    v.feed(63)
+    check((v.events() & EV_RX) != 0, "at the full level")
+    check(v.rx_count() == 64, "64 bytes")
+}
+
+func overrun_and_errors() {
+    var u = FakeUart.hardware()
+    u.feed_run(0, 128)
+    check((u.events() & EV_OVERRUN) == 0, "a full FIFO is not an overrun")
+    u.feed(1)
+    check((u.events() & EV_OVERRUN) != 0, "the next byte overruns it")
+    check(u.rx_count() == 128, "and is dropped")
+    u.inject_parity()
+    check((u.events() & EV_PARITY) != 0, "an error is reported")
+    u.clear_events(EV_PARITY | EV_OVERRUN)
+    check((u.events() & (EV_PARITY | EV_OVERRUN)) == 0, "until it is cleared")
+}
+
+/// `arm` runs its action at the start of the chosen call, once.
+func armed_actions() {
+    var u = FakeUart.hardware()
+    u.arm(CALL_RX_COUNT, 2, 3, 40, 0, 0)
+    check(u.rx_count() == 0, "the first call is untouched")
+    check(u.rx_count() == 3, "three bytes arrived at the start of the second")
+    check(u.rx_pop() == 40, "counting up from the first")
+    check(u.rx_count() == 2, "and nothing more arrives")
+
+    var w = FakeUart.hardware()
+    w.tx_push(1)
+    w.tx_push(2)
+    w.arm(CALL_TX_COUNT, 1, 0, 0, 0, 1)
+    check(w.tx_count() == 1, "the wire took a byte before the count was read")
+    check(w.wire_len == 1, "onto the wire")
+
+    var c = FakeUart.hardware()
+    c.arm(CALL_CLEAR, 1, 0, 0, EV_PARITY, 0)
+    c.clear_events(EV_RX)
+    check((c.events() & EV_PARITY) != 0,
+          "a cause raised at the start of a clear survives a clear of another")
+}
+
+/// A count that lags: the FIFO is reported full whatever it holds. The core
+/// stores nothing, loses nothing, and answers no Sync early; when the count
+/// is honest again everything leaves in order.
+func lagging_count() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(100)
+    b.pump()
+    b.uart.stuck_count = 128
+    let w = b.post_write(50)
+    b.pump()
+    check(b.uart.stored == 100, "no room is reported, so nothing more is stored")
+    check(b.core.tx.in_ring() == 50, "the bytes wait in the ring")
+    check(b.answered(w), "the Write was queued, so it is answered")
+    let s = b.post_sync()
+    b.pump()
+    b.uart.drain(75)
+    b.interrupt()
+    check(b.uart.stored == 100, "still no room reported")
+    check(not b.answered(s), "a Sync is not answered on a full count")
+    b.uart.stuck_count = -1
+    var rounds = 0
+    while not b.answered(s) && rounds < 100 {
+        b.uart.drain(10)
+        b.interrupt()
+        rounds = rounds + 1
+    }
+    check(b.answered(s), "when the count is honest the Sync is answered")
+    check(b.uart.wire_len == 150, "after every byte before it")
+    b.uart.drain_all()
+    check(b.uart.wire_is_run(0, 150), "in order")
+    check(b.uart.tx_overflow == 0, "and nothing was stored to a full FIFO")
+}
+
+func main() {
+    transmit_cause()
+    transmit_level()
+    receive_cause()
+    overrun_and_errors()
+    armed_actions()
+    lagging_count()
+}

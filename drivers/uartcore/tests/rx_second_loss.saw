@@ -1,0 +1,63 @@
+// One mark at a time: while a mark is unreported every byte that arrives is
+// dropped behind it and counted into it, even when the reader has made room,
+// so a loss never leaves a silent second gap among the bytes after a mark. A
+// later error is counted into the same mark.
+
+import uartcore.bench.{Bench}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func read<const R: Int>(b: &var Bench<64, R>) -> Int {
+    let id = b.post_read()
+    b.pump()
+    id
+}
+
+func main() {
+    var b = Bench<64, 4>.standard()
+    b.uart.feed_run(0, 6)
+    b.interrupt()
+    check(b.core.rx.has_mark(), "two bytes did not fit: a mark")
+
+    // The reader takes two bytes, which leaves room for two more.
+    let a = read(&var b)
+    let c = read(&var b)
+    check(b.reply_byte(a, 1) == 0 && b.reply_byte(c, 1) == 1, "bytes 0 and 1")
+    check(b.core.rx.buffered() == 2, "two bytes are still before the mark")
+
+    // Bytes that arrive now would fit, and are dropped all the same: they
+    // would sit after the mark, among bytes the reader has not passed.
+    b.uart.feed_run(100, 3)
+    b.interrupt()
+    check(b.core.rx.buffered() == 2, "nothing was kept behind the mark")
+    check(b.core.rx.totals.lost == 5, "the three are counted lost")
+
+    // An error is counted into the same mark.
+    b.uart.inject_frame()
+    b.interrupt()
+    check(b.core.rx.totals.frame == 1, "the frame error is counted")
+
+    let r2 = read(&var b)
+    let r3 = read(&var b)
+    check(b.reply_byte(r2, 1) == 2 && b.reply_byte(r3, 1) == 3,
+          "the bytes before the mark are delivered first")
+    let m = read(&var b)
+    check(b.reply_byte(m, 0) == 4, "then one mark, Lost")
+    check(b.reply_word(m, 1) == 5, "carrying all five lost bytes")
+    check(b.reply_word(m, 5) == 1, "and the frame error")
+
+    // The mark is spent; what comes next is delivered whole.
+    let held = read(&var b)
+    check(not b.answered(held), "nothing is buffered after the mark")
+    b.uart.feed_run(200, 2)
+    b.interrupt()
+    check(b.answered(held) && b.reply_byte(held, 1) == 200,
+          "the bytes after the mark are the ones that arrived after it")
+    let next = read(&var b)
+    check(b.reply_byte(next, 1) == 201, "contiguous")
+}

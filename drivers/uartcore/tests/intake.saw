@@ -1,0 +1,219 @@
+// Intake: the driver takes messages only while `intake_open`, which a held
+// Write closes (tx_hold) and so does a full set of held Syncs, and the
+// end-of-service drain that waits for the transmitter to send everything
+// queued.
+
+import uartcore.{Config, KIND_WRITE, MAX_HELD_READS, MAX_SYNCS, Served, TxConfig}
+import uartcore.bench.{Bench}
+import uartcore.fake.{CALL_TX_COUNT, FakeUart}
+import uartproto.{BODY_BYTES, Frame, UartBody}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+/// A full set of held Syncs pauses intake, and the Sync behind them waits,
+/// posted, until one is answered.
+func syncs_full() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(100)
+    b.pump()
+    var s = [0; 5]
+    var i = 0
+    while i < 5 {
+        s[i] = b.post_sync()
+        i = i + 1
+    }
+    let after = b.post_write(3)
+    b.pump()
+    check(b.core.tx.syncs_held() == MAX_SYNCS, "four Syncs are held")
+    check(not b.core.intake_open(), "intake is paused with the set full")
+    check(b.posted() == 2, "the fifth Sync and the Write behind it wait")
+    check(not b.answered(s[4]) && not b.answered(after), "unanswered")
+
+    // Draining the FIFO answers all four, oldest first, and then intake
+    // takes the rest.
+    b.uart.drain_all()
+    b.interrupt()
+    check(b.answered(s[0]) && b.answered(s[1]) && b.answered(s[2])
+              && b.answered(s[3]), "the held Syncs are answered")
+    check(b.order(s[0]) < b.order(s[1]) && b.order(s[1]) < b.order(s[2])
+              && b.order(s[2]) < b.order(s[3]), "oldest first")
+    check(b.core.intake_open(), "intake is open again")
+    check(b.posted() == 0, "the messages that waited were taken")
+    check(b.answered(s[4]), "the fifth Sync was answered, its bytes gone")
+    check(b.answered(after), "and the Write")
+}
+
+/// The limit is the configured one.
+func syncs_configured() {
+    let cfg = Config(tx: TxConfig(tx_empty: 32, fill_cap: 128, max_syncs: 2),
+                     held_reads: MAX_HELD_READS)
+    var b = Bench<256, 16>.over(cfg, FakeUart.hardware())
+    let _ = b.post_write(100)
+    let _ = b.post_sync()
+    let _ = b.post_sync()
+    let third = b.post_sync()
+    b.pump()
+    check(b.core.tx.syncs_held() == 2, "two Syncs are held")
+    check(not b.core.intake_open(), "intake is paused at the configured limit")
+    check(b.posted() == 1 && not b.answered(third), "the third waits")
+}
+
+/// The drain finishes when everything queued has left, and not before.
+func drain() {
+    var b = Bench<64, 16>.standard()
+    let _ = b.post_write(40)
+    b.pump()
+    let _ = b.core.begin_drain(&var b.uart)
+    check(not b.core.drained(&var b.uart), "40 bytes are in the FIFO")
+    check(b.uart.tx_level == 1, "the cause waits for the last byte")
+    b.uart.drain(39)
+    b.interrupt()
+    check(not b.core.drained(&var b.uart), "one byte is left")
+    b.uart.drain(1)
+    b.interrupt()
+    check(b.core.drained(&var b.uart), "the last byte has gone")
+    check(not b.uart.tx_enabled, "and the cause is disabled")
+}
+
+/// A drain with bytes in the ring waits for them too.
+func drain_with_ring() {
+    var b = Bench<256, 16>.standard()
+    let _ = b.post_write(100)
+    let _ = b.post_write(100)
+    b.pump()
+    check(b.core.tx.in_ring() == 72, "72 bytes wait in the ring")
+    let _ = b.core.begin_drain(&var b.uart)
+    b.uart.drain(128)
+    b.interrupt()
+    check(not b.core.drained(&var b.uart), "the ring's bytes are in the FIFO")
+    b.uart.drain(72)
+    b.interrupt()
+    check(b.core.drained(&var b.uart), "everything queued has left")
+    check(b.uart.wire_is_run(0, 200), "in order")
+}
+
+/// A driver that took a Write while intake was closed is answered Busy, not
+/// served out of order.
+func refused_when_closed() {
+    var b = Bench<16, 16>.standard()
+    let _ = b.post_write(100)
+    b.pump()
+    check(not b.core.intake_open(), "intake is closed")
+    var f = Frame(len: 2, bytes: [0; BODY_BYTES])
+    f.bytes[0] = 2
+    f.bytes[1] = 9
+    var body = UartBody.empty()
+    match b.core.request(&var b.uart, &f, &var body) {
+        case Now(a) -> {
+            check(a.len == 1 && body.bytes[0] == 3, "Busy")
+        },
+        case Held(_, _) -> { check(false, "a Write was taken while closed") },
+    }
+    check(b.core.tx.totals.queued == 16, "and nothing was queued")
+}
+
+/// A Sync taken while intake is closed is refused Busy, as a Write is: it
+/// would be answered ahead of bytes still held.
+func sync_refused_when_closed() {
+    var b = Bench<16, 16>.standard()
+    let _ = b.post_write(100)
+    b.pump()
+    check(not b.core.intake_open(), "intake is closed")
+    var f = Frame(len: 1, bytes: [0; BODY_BYTES])
+    f.bytes[0] = 3
+    var body = UartBody.empty()
+    match b.core.request(&var b.uart, &f, &var body) {
+        case Now(a) -> {
+            check(a.len == 1 && body.bytes[0] == 3, "Busy")
+        },
+        case Held(_, _) -> { check(false, "a Sync was taken while closed") },
+    }
+    check(b.core.tx.syncs_held() == 0, "and nothing is held for it")
+}
+
+/// Once a held Write is wholly queued intake stays closed until its answer is
+/// taken, so the slot it is answered through cannot be reused.
+func answer_pending_closes_intake() {
+    var b = Bench<16, 16>.standard()
+    let _ = b.post_write(40)
+    b.pump()
+    var rounds = 0
+    while b.core.tx.holds_write() && rounds < 100 {
+        b.uart.drain_all()
+        b.core.service(&var b.uart)
+        rounds = rounds + 1
+    }
+    check(not b.core.tx.holds_write(), "the Write is wholly queued")
+    check(not b.core.intake_open(), "its answer has not been taken: closed")
+    var body = UartBody.empty()
+    if let a = b.core.next_answer(&var body) {
+        check(a.kind == KIND_WRITE, "the Write's answer")
+    } else {
+        check(false, "the answer is ready")
+    }
+    check(b.core.intake_open(), "taken: open")
+}
+
+/// The drain waits for a held Write's remainder as well as for the FIFO and
+/// the ring.
+func drain_with_hold() {
+    var b = Bench<16, 16>.standard()
+    let _ = b.post_write(100)
+    b.pump()
+    check(b.core.tx.holds_write(), "84 bytes are held")
+    check(not b.core.begin_drain(&var b.uart), "not drained")
+    b.uart.drain_all()
+    check(b.core.tx.in_ring() == 0 && b.uart.tx_n == 0,
+          "the FIFO and the ring are empty")
+    check(not b.core.drained(&var b.uart), "the held remainder is not out")
+    var rounds = 0
+    while not b.core.drained(&var b.uart) && rounds < 100 {
+        b.interrupt()
+        b.uart.drain_all()
+        rounds = rounds + 1
+    }
+    check(b.core.drained(&var b.uart), "drained once every byte is out")
+    check(b.uart.wire_len == 100, "all 100")
+}
+
+/// `begin_drain` says when there is nothing to wait for, and otherwise the
+/// cause is on, whichever read of the count the wire's bytes left between.
+func drain_between_reads() {
+    var fresh = Bench<64, 16>.standard()
+    check(fresh.core.begin_drain(&var fresh.uart), "nothing queued: drained")
+    var k = 1
+    while k <= 3 {
+        var b = Bench<256, 16>.standard()
+        let _ = b.post_write(40)
+        b.pump()
+        b.uart.arm(CALL_TX_COUNT, k, 0, 0, 0, 40)
+        let done = b.core.begin_drain(&var b.uart)
+        check(done || b.uart.tx_enabled, "not drained: the cause is on")
+        var rounds = 0
+        while not done && not b.core.drained(&var b.uart) && rounds < 3 {
+            b.interrupt()
+            rounds = rounds + 1
+        }
+        b.uart.drain_all()
+        b.interrupt()
+        check(b.core.drained(&var b.uart), "drained")
+        k = k + 1
+    }
+}
+
+func main() {
+    sync_refused_when_closed()
+    answer_pending_closes_intake()
+    drain_with_hold()
+    drain_between_reads()
+    refused_when_closed()
+    syncs_full()
+    syncs_configured()
+    drain()
+    drain_with_ring()
+}

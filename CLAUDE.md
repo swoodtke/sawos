@@ -75,6 +75,11 @@ drivers/           # userspace device drivers and the protocol packages their
                    # behind `Registers` and `Dma` traits, with a fake device
                    # for its hosted tests, and svc-virtio-net/ the network
                    # driver over it, serving netdevproto from memory it pins
+                   # uartcore/ is the UART drivers' hosted core: the receive
+                   # and transmit rings, gap marks, held reads and writes,
+                   # sync marks and the serve state machine, over a
+                   # `UartDevice` trait, with a fake UART and a model of a
+                   # driver's loop for its hosted tests
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 rt/main/           # `sosmain`: the `_start` of a program written with `main`
@@ -152,6 +157,7 @@ them, the in-place check, the slab-region check, and every board, process
 and image description in the tree read clean) and the hosted packages'
 (`HOSTED_TESTS`: `drivers/esp32s3io/`, `drivers/gpioproto/`,
 `drivers/pwmproto/`, `drivers/uartproto/`, `drivers/consolecore/`,
+`drivers/uartcore/`,
 `drivers/pktring/`, `drivers/netdevproto/`, `drivers/hciproto/`,
 `drivers/wlanproto/`, `drivers/sockproto/`, `drivers/netstack/`,
 `drivers/virtio/`, `tools/netpeer/` and `rt/common/`, the runtime's heap),

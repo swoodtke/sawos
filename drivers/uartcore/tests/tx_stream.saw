@@ -1,0 +1,82 @@
+// Transmit order: every byte a client writes leaves the FIFO once, in the
+// order it was written, whatever the write sizes, the ring's size, the fill
+// cap and how fast the wire drains. The fake's FIFO drains only when the test
+// says, so a ring that overflowed, a top-up that stored a byte twice and a
+// remainder copied out of order all show on the wire.
+
+import uartcore.{Config, MAX_HELD_READS, MAX_SYNCS, TxConfig}
+import uartcore.bench.{Bench}
+import uartcore.fake.{FakeUart}
+
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func cfg(fill_cap: Int) -> Config {
+    Config(tx: TxConfig(tx_empty: 32, fill_cap: fill_cap, max_syncs: MAX_SYNCS),
+           held_reads: MAX_HELD_READS)
+}
+
+/// Whether anything is still to move: messages posted, bytes in the ring, a
+/// held `Write`, bytes in the FIFO.
+func unfinished<const T: Int>(b: &Bench<T, 16>) -> Bool {
+    let queued = b.posted() > 0 || b.core.tx.in_ring() > 0
+    queued || b.core.tx.holds_write() || b.uart.tx_n > 0
+}
+
+/// Writes of every interesting size through a ring of `T` bytes, the wire
+/// taking `step` bytes between interrupts.
+func stream<const T: Int>(fill_cap: Int, step: Int) {
+    var b = Bench<T, 16>.over(cfg(fill_cap), FakeUart.hardware())
+    let sizes = [1, 5, 31, 32, 33, 64, 100, 127, 0, 127, 2, 9]
+    var ids = [0; 12]
+    var total = 0
+    var i = 0
+    while i < 12 {
+        ids[i] = b.post_write(sizes[i])
+        total = total + sizes[i]
+        i = i + 1
+    }
+    b.pump()
+    var rounds = 0
+    while unfinished(&b) && rounds < 200000 {
+        b.uart.drain(step)
+        b.interrupt()
+        rounds = rounds + 1
+    }
+    check(rounds < 200000, "the writes finish")
+    b.uart.drain_all()
+    check(b.uart.tx_overflow == 0, "no store reached a full FIFO")
+    check(b.uart.wire_is_run(0, total), "every byte out once, in order")
+    check(b.core.tx.totals.queued == total as UInt64, "every byte was queued")
+    check(b.core.tx.totals.pushed == total as UInt64, "every byte was stored")
+    var k = 0
+    while k < 12 {
+        check(b.answered(ids[k]), "every write is answered")
+        if k > 0 {
+            check(b.order(ids[k - 1]) < b.order(ids[k]),
+                  "writes are answered in the order they were posted")
+        }
+        k = k + 1
+    }
+}
+
+func over_caps<const T: Int>() {
+    stream<T>(1, 1)
+    stream<T>(1, 128)
+    stream<T>(8, 7)
+    stream<T>(8, 128)
+    stream<T>(128, 1)
+    stream<T>(128, 7)
+    stream<T>(128, 128)
+}
+
+func main() {
+    over_caps<16>()
+    over_caps<33>()
+    over_caps<128>()
+    over_caps<1024>()
+}
