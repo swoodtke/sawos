@@ -1,6 +1,6 @@
 # SO-141 design: sosrt runs Saw's background tasks
 
-Revision 2. This is a design only: no tracked file changed. Claims are marked
+Revision 2.1. This is a design only: no tracked file changed. Claims are marked
 three ways:
 
 - **[read F:L]**: read in the tree at that file and those lines.
@@ -12,6 +12,26 @@ Abbreviations: `ABI` is sawlang v0.24.5's `runtime/ABI.md` and `LS` its
 `LANGUAGE_SPEC.md`, in `.toolchains/cb66b632…/`. Main pins v0.24.5. `SMP` is
 the tracker doc `SO:smp` r3. No QEMU probe was run: every item checked in this
 revision was settled by reading.
+
+## Changes in 2.1
+
+The reviewer's t3 holds: a bounded `send` holds its claim as a handle, so a
+thread that has live tasks spends one Handle row while that `send` waits.
+
+- **The row is counted** in Q1's line below, in §4's state, and in S0's spec
+  text, and the child default for Handles rises from 12 to 16.
+- **The full table is handled in the kernel and the runtime.** A wakeable
+  `Call` that finds no row for its claim answers `QuotaExceeded` or
+  `NoResource`, with nothing staged and the carried handles still the caller's
+  (§3). The runtime's `send` then falls back to a plain `Call`, which needs no
+  row (§5). The fallback is honest: nothing was staged, so the message goes
+  out once, the send still works, and the only thing lost is the bound. While
+  it waits, that thread's tasks wait with it.
+- **New cases.** K-4 gains a step that holds the kernel half, and a new case,
+  R-10 `bounded_send_table_full`, holds the runtime half. Each has its
+  mutants.
+
+Nothing else changed.
 
 ## Changes in revision 2
 
@@ -36,11 +56,23 @@ revision was settled by reading.
   itself; writing the deadline is a memory store. That covers `Waiter.wait`,
   `PipeInlet.send`, `PipeReply.resolve`, `PipeRequest.reply_wait` and
   `Thread.join`. `reactor_wake` wakes each parked thread by its ID.
-- **Q1, quotas (lead's call: raise the defaults).** The premise is gone.
-  The executor now costs a child one Handle row per process (its Clock) and
-  nothing per thread. So **no default changes**: Handles stays 12 and the
-  rest as they are **[read kernel/core/limits.saw:506-544]**. This differs
-  from the call as written, which assumed per-thread objects.
+- **Q1, quotas (lead's call: raise the defaults; corrected in 2.1).** The
+  executor costs a child Handle rows, and no other kernel object:
+  - **one row per process**, for its Clock;
+  - **one row per thread while that thread's bounded `send` waits**, for the
+    claim a wakeable `Call` mints (§3). A bounded `Resolve` uses the claim
+    handle the caller already holds, and no other wait spends a row.
+
+  The child default for Handles therefore rises **from 12 to 16**, enough
+  for the default four threads to each have a bounded `send` in flight.
+  Every other default stays as it is
+  **[read kernel/core/limits.saw:506-544]**. 16 is under every board's
+  `MAX_HANDLES` of 32 **[read hal/riscv32/kernel/lib.saw:335;
+  hal/arm64/kernel/lib.saw:568; hal/xtensa-esp32s3/kernel/lib.saw:159]**. The
+  `quotahandles` case prints `limit=12` and moves to 16
+  **[read tools/sos_runner.py:8091, 8110]**.
+
+  A table that is full anyway costs only the bound (§5).
 - **Q4 (lead's call), the thread gate, is a follow-up out of scope.** The
   missing seams are named in §9.
 - **Q5 (lead's call), deadlock reports:** a process whose tasks all wait
@@ -274,8 +306,16 @@ threads.saw:205-225]**. A park that can end early has to give the claim back,
 so a wakeable `Call` is a `Post` and a wakeable `Resolve` made in one trap:
 
 - At the stage it mints the claim into the caller's table as a `PipeReply`
-  handle, as `Post` does. A table with no room is refused as `Post` refuses
-  it (`QuotaExceeded` or `NoResource`), with nothing staged.
+  handle, as `Post` does. The table is checked before anything is staged,
+  whether the stage happens at the op or at the room park's resume
+  (`table_room`, **[read kernel/core/objects.saw:607-622]**).
+- **A table with no free row** (2.1) answers `QuotaExceeded` at the caller's
+  Handle quota, or `NoResource` with the table full, as `Post` does.
+  - Nothing is staged, and the carried handles stay the caller's: a
+    transient refusal takes nothing, on `Post`'s terms
+    **[read kernel/sysapi/src/pipe.saw:833-835]**.
+  - From a room park's resume, the parked thread is answered the same way.
+  - A plain `Call` on the same table goes through, since it mints no claim.
 - It then parks on that claim as a wakeable `Resolve` does.
 - On `TimedOut` or `Woken` the value register carries the claim's handle
   word. The caller holds the claim, and resolves it later.
@@ -283,7 +323,8 @@ so a wakeable `Call` is a `Post` and a wakeable `Resolve` made in one trap:
   answer differs from a plain `Call`.
 
 So a bounded `send` never loses a reply to a timeout. Its cost is the handle
-row a `Post` costs, which is why a plain `Call` keeps no claim.
+row a `Post` costs, which is why a plain `Call` keeps no claim. The runtime
+falls back to a plain `Call` on a full table (§5).
 
 **A wakeable `Resolve` borrows its claim and spends it only at delivery.**
 A plain `Resolve` unbinds the claim's handle at the park and hands its
@@ -326,7 +367,8 @@ over raw floor ops.
 **The process-wide state:**
 
 - one Monotonic Clock handle, got with `ClockGet` on the first clock read
-  and published by compare-and-swap; it is the only quota the executor costs
+  and published by compare-and-swap. With the claim of each bounded `send`
+  in flight (one per thread at most), it is all the quota the executor costs
   (Q1, above);
 - `REACTOR`, a static wake generation.
 
@@ -413,9 +455,32 @@ object.
 |---|---|
 | `Waiter.wait` | the same `Wait` |
 | `PipeRequest.reply_wait(_with)` | after a `TimedOut` or `Woken` wait leg, a bounded `Waiter.wait`, because the reply was delivered |
-| `PipeInlet.send(_with)` | a bounded `Resolve` of the claim handed back (§3) |
+| `PipeInlet.send(_with)` | a bounded `Resolve` of the claim handed back (§3); on a full table, the plain `Call` below |
 | `PipeReply.resolve` | the same `Resolve` on the same word; the typed `consumes` wrapper spends the claim only at delivery |
 | `Thread.join` | the same `Join` |
+
+**`send` on a full table** (2.1). A wakeable `Call` answers `QuotaExceeded`
+or `NoResource` with nothing staged and the carried handles still the
+caller's (§3).
+
+- **What the runtime does.** `send` then makes the same `Call` again with the
+  word at 0: a plain `Call`, which mints no claim and goes through.
+- **What it costs.** That one call is unbounded. The thread's tasks wait
+  with it, as every thread's tasks waited before this design, and the next
+  `send` tries the bounded form again.
+- **Why the fallback is honest.**
+  - Nothing was staged, so the message goes out exactly once.
+  - The caller's `send` still works, and sees no status it would not have
+    seen without tasks.
+  - Only the bound is lost.
+- **The count.** Each fallback adds one to `sos_exec_send_fallbacks()`, a
+  count exported as `sos_arena_contended` is
+  **[read rt/common/src/lib.saw:395-401]**, so a test or a program can see
+  that it happened.
+- **Why not return the status.** `send`'s callers today never see
+  `QuotaExceeded` from a full table, since a plain `Call` takes no row.
+  Returning it would make a program's sends fail because a task was spawned
+  somewhere on the thread.
 
 **Waits that do not drive:**
 
@@ -505,10 +570,19 @@ rule]**.
      and nothing staged: the server's later take finds only the messages
      before it;
   6. `ReplyWait` with a wakeable word answers the `Wait` leg's `TimedOut`.
+  7. (2.1) The client child runs at its Handle quota. It mints siblings of
+     one handle until a mint answers `QuotaExceeded`. Then:
+     - a wakeable `Call` answers `QuotaExceeded`;
+     - a plain `Call` of the same message gets its reply;
+     - the server prints each message it took, and takes exactly one.
 
-  **Mutants:** a wakeable `Call` that mints no claim loses the reply (step 3
-  reads `PeerClosed`); a wakeable `Resolve` that unbinds at the park makes
-  step 4's handle `BadHandle`.
+  **Mutants:**
+  - A wakeable `Call` that mints no claim loses the reply: step 3 reads
+    `PeerClosed`.
+  - A wakeable `Resolve` that unbinds at the park makes step 4's handle a
+    `BadHandle` fault.
+  - A stage that runs before the table check stages the message and then
+    refuses it, and the server prints two takes in step 7.
 - **K-5 `thread_wake`:** thread T, at main's level.
   1. T parks wakeable in `Waiter.Wait`. Main yields (so T is parked), wakes
      T, and T prints `woken`.
@@ -571,6 +645,30 @@ These are r1's cases, each kept with the mutant r1 named for it.
   **Mutants:** a wrapper that skips the drive, or writes the word as 0,
   parks with nothing armed, and the case ends in the deadlock line.
 - **R-9 `kernel_spawn_refused`.**
+- **R-10 `bounded_send_table_full`** (2.1): `send` on a full table falls
+  back and loses only the bound.
+  - **Who plays which part.** Root is the server and prints each request it
+    takes. A stock child is the client: it has a Handle quota of its own and
+    one task live for the whole case (parked on a channel nobody sends to, so
+    the drive answers `INT64_MAX` and every `send` takes the bounded path).
+  - **Steps:**
+    1. The child mints siblings of a handle until a mint answers
+       `QuotaExceeded`.
+    2. It calls `send(1)` and prints `reply 1`, then `fallbacks=1`, read from
+       `sos_exec_send_fallbacks()`.
+    3. It releases one sibling.
+    4. It calls `send(2)` and prints `reply 2`, then `fallbacks=1`: with a
+       row free, the bounded path served it.
+  - **Expected:** root prints `took 1`, then `took 2`.
+  - **Order:** fixed by construction. Each `send` returns only after root
+    replied.
+  - **Mutants:**
+    - The runtime returns the status instead of falling back: the child
+      prints `send: QuotaExceeded` in place of `reply 1`.
+    - The fallback is taken on a table with room: step 4 reads
+      `fallbacks=2`.
+    - A wakeable `Call` that stages before its table check makes root print
+      `took 1` twice.
 
 Every runtime case also runs in the S3 smoke.
 
@@ -579,11 +677,11 @@ Every runtime case also runs in the S3 smoke.
 | unit | what | size | model | after |
 |---|---|---|---|---|
 | S0 | spec text: the kernel's half (§2.2, §2.1, §5.7's ops and statuses, §2.6, §7, §8) and the runtime's half (§10's executor, §7's one-word lock, §8's thread end) | M | Opus | — |
-| K1 | the two statuses, the three ops, the `ThreadSlot` fields, the schedule and the deadlock test, wakeable `Waiter.Wait`, `Join`, `LOCK_WAIT` and `PARK`, and the floor exports (`sos_wait_word`, `sos_thread_wake`, `sos_park`); K-1, K-2, K-3, K-5 | L | Opus | S0 |
+| K1 | the Handle default (12 to 16, and `quotahandles`' line); the two statuses, the three ops, the `ThreadSlot` fields, the schedule and the deadlock test, wakeable `Waiter.Wait`, `Join`, `LOCK_WAIT` and `PARK`, and the floor exports (`sos_wait_word`, `sos_thread_wake`, `sos_park`); K-1, K-2, K-3, K-5 | L | Opus | S0 |
 | K2 | wakeable `Call` (the room park, and the claim minted at the stage), the borrowing `Resolve`, and `ReplyWait`; K-4 | M | Opus | K1 |
 | R1 | `sos.floor`'s declarations; `sos.exec`'s records, the eight seams over `PARK_OP` and `THREAD_WAKE_OP`, `end_thread_tasks`, the two counters, and the block's growth and registration; the close calls; R-1, R-2, R-4, R-5, R-6, R-7, R-9 | M (it was L) | Opus | K1 |
 | R2 | the lock seams; R-3 | M | Sonnet | R1 |
-| R3 | the wrapper drives (§5); R-8 | S–M (it was M) | Sonnet | R1, K2 |
+| R3 | the wrapper drives (§5), and `send`'s fallback with its count; R-8, R-10 | S–M (it was M) | Sonnet | R1, K2 |
 
 R2 and R3 touch different files and can run at once.
 
@@ -593,12 +691,20 @@ R2 and R3 touch different files and can run at once.
   - §2.2 `Wait` and §2.1's `Call`, `Resolve` and `ReplyWait` each get their
     deadline and wake paragraph (§3's table).
   - §5.7 gets the three no-handle ops and the two statuses.
+  - §2.1's `Call` says a wakeable `Call` mints its claim at the stage, so it
+    spends one Handle row while it waits. With no row free it answers
+    `QuotaExceeded` or `NoResource` with nothing staged, where a plain `Call`
+    goes through.
+  - §2.9 (quotas) gets the child Handle default of 16 (from 12).
   - §2.6 says deadlines are on the Monotonic clock.
   - §7 gets the wait word, the wake and its latch, the same-process rule, and
     a line in "Nothing runnable" for parked deadlines.
   - §8 says `Join`'s early end and that a slot's latch resets.
 - **The runtime half:** §10's "The task executor", without r1's bridge or
-  reserved keys, and the hazards. §11 lists the thread gate below.
+  reserved keys, and the hazards. It also states the executor's quota: one
+  Handle row per process for the Clock, and one per thread while that
+  thread's bounded `send` waits, for the claim. On a full table, `send`
+  falls back to a plain `Call` and loses only the bound. §11 lists the thread gate below.
 
 **Left out, as decided:**
 
@@ -619,11 +725,11 @@ R2 and R3 touch different files and can run at once.
    also give programs a typed form, for example `Waiter.wait(until:
    Instant)` and `Thread.wake()`, now or as a follow-up?
 2. **The cost of a bounded `send`.** A wakeable `Call` mints its claim at
-   the stage (§3), so a bounded `send` costs one handle row while it waits,
-   and a full table refuses it before anything is staged, as `Post` does.
-   Accept that, or keep the `Call` reply park unbounded and let the runtime
-   compose `Post` and `Resolve` itself? That costs the same row, in one more
-   trap.
+   the stage (§3), so a bounded `send` costs one handle row while it waits.
+   A full table refuses it before anything is staged, as `Post` does, and the
+   runtime then falls back to a plain `Call` (2.1, §5). Accept that, or keep
+   the `Call` reply park unbounded and let the runtime compose `Post` and
+   `Resolve` itself? That costs the same row, in one more trap.
 3. **The t2 reading.** ABI says nothing cuts `sleep_ns` short. R-7 pins that
    a mid-sleep wake ends the kernel park, is absorbed, is kept for the next
    poll, and does not shorten the sleep. If the reviewer meant the wake to
