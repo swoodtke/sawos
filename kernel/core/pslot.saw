@@ -17,6 +17,12 @@
 //! in `kcore.objects`, the grant record's, the copy doors' and the link's in
 //! `kcore.process`, and the body's free in the teardown (`kcore.sched`).
 //!
+//! The two indexes are distinct types, `ProcessIndex` for a record and
+//! `BodyIndex` for a body, and each table is reached only by its own:
+//! `PROCESS_RECORDS.at(p)` and `PROCESSES.at(b)` lend the entry in place, and
+//! the slab under each is private to this module, so nothing subscripts it
+//! with the other kind of index or a bare `Int`.
+//!
 //! Both tables are `Slab`s, so a deployment can donate records and bodies
 //! separately. A slab is one array keyed by its index, so every per-process
 //! table is a field of one entry or the other (all inner dimensions are
@@ -42,6 +48,8 @@ import kcore.limits.{
     MAX_TABLE_BLOCKS,
     NO_BODY,
     NO_MEMORY,
+    BodyIndex,
+    ProcessIndex,
 }
 import kcore.diag.{fatal_kernel}
 import kcore.slab.{Slab}
@@ -383,10 +391,76 @@ public(package) unsafe static var HANDLE_BLOCKS: Slab<HandleBlock, MAX_HANDLE_BL
 // `ProcessBody` because a mapped page needs the columns contiguous and
 // grain-aligned. The teardown copies them into `ProcessRecord.final_stats`.
 
-/// The record slab: extent 0 is `MAX_PROCESS_RECORDS` long and a donation
+/// The record table: the record slab, reached only by a `ProcessIndex`.
+///
+/// The slab is private, so no subscript outside this module can hand it a
+/// body's index or a bare `Int`: a record is reached through `at`, and the
+/// slab's geometry through the methods below. One field and nothing else, so
+/// the table is laid out as its slab is, which the image builder measures a
+/// slot by.
+public(package) struct ProcessRecordTable {
+    private slab: Slab<ProcessRecord, MAX_PROCESS_RECORDS>,
+}
+
+extension ProcessRecordTable {
+    /// Record `p`, lent where it sits.
+    public(package) func at(&var self, p: ProcessIndex) unsafe borrows -> &var ProcessRecord {
+        lend self.slab[p]
+    }
+
+    /// How many records the table holds now, donations included: the bound
+    /// of every scan.
+    public(package) func capacity(&self) -> Int { self.slab.capacity() }
+
+    /// One record's bytes, which turn a donated region's length into a count.
+    public(package) func slot_bytes(&self) -> Int { self.slab.slot_bytes() }
+
+    /// What a donated extent's base must be aligned to.
+    public(package) func slot_align(&self) -> Int { self.slab.slot_align() }
+
+    /// How many more extents the table can accept.
+    public(package) func extents_left(&self) -> Int { self.slab.extents_left() }
+
+    /// Append a donated extent of `slots` records at `base`; `Slab.donate`.
+    public(package) func donate(&var self, base: UInt, slots: Int) -> Bool {
+        self.slab.donate(base, slots)
+    }
+}
+
+/// The body table: the body slab, reached only by a `BodyIndex`, as the record
+/// table is by a `ProcessIndex`.
+public(package) struct ProcessBodyTable {
+    private slab: Slab<ProcessBody, MAX_PROCESSES>,
+}
+
+extension ProcessBodyTable {
+    /// Body `b`, lent where it sits.
+    public(package) func at(&var self, b: BodyIndex) unsafe borrows -> &var ProcessBody {
+        lend self.slab[b]
+    }
+
+    /// How many bodies the table holds now, donations included.
+    public(package) func capacity(&self) -> Int { self.slab.capacity() }
+
+    /// One body's bytes.
+    public(package) func slot_bytes(&self) -> Int { self.slab.slot_bytes() }
+
+    /// What a donated extent's base must be aligned to.
+    public(package) func slot_align(&self) -> Int { self.slab.slot_align() }
+
+    /// How many more extents the table can accept.
+    public(package) func extents_left(&self) -> Int { self.slab.extents_left() }
+
+    /// Append a donated extent of `slots` bodies at `base`; `Slab.donate`.
+    public(package) func donate(&var self, base: UInt, slots: Int) -> Bool {
+        self.slab.donate(base, slots)
+    }
+}
+
+/// The record table: extent 0 is `MAX_PROCESS_RECORDS` long and a donation
 /// (`SlabKind.ProcessRecords`) appends. `capacity()` is the record allocator's
 /// whole bound.
-public(package) unsafe static var PROCESS_RECORDS: Slab<ProcessRecord, MAX_PROCESS_RECORDS> = Slab<ProcessRecord, MAX_PROCESS_RECORDS>(
+public(package) unsafe static var PROCESS_RECORDS: ProcessRecordTable = ProcessRecordTable(slab: Slab<ProcessRecord, MAX_PROCESS_RECORDS>(
     inline: [ProcessRecord(state: ProcessState.Free,
                            exit_kind: ProcessStatusKind.Running, exit_code: 0,
                            pid: 0,
@@ -400,16 +474,16 @@ public(package) unsafe static var PROCESS_RECORDS: Slab<ProcessRecord, MAX_PROCE
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
-    total: MAX_PROCESS_RECORDS)
+    total: MAX_PROCESS_RECORDS))
 
-/// The body slab: extent 0 is `MAX_PROCESSES` long and a donation
+/// The body table: extent 0 is `MAX_PROCESSES` long and a donation
 /// (`SlabKind.Processes`) appends.
 ///
 /// `capacity()` is what every scan reads, but it does not by itself bound a
 /// creation: a tier that keeps a persistent protection domain per body
 /// publishes how many it has (`hal.PROT_DOMAIN_SLOTS`), and `alloc_process`
 /// takes the smaller of the two. See `kcore.process.process_slots_usable`.
-public(package) unsafe static var PROCESSES: Slab<ProcessBody, MAX_PROCESSES> = Slab<ProcessBody, MAX_PROCESSES>(
+public(package) unsafe static var PROCESSES: ProcessBodyTable = ProcessBodyTable(slab: Slab<ProcessBody, MAX_PROCESSES>(
     inline: [ProcessBody(live: false, entry: 0,
                          stack_top: 0, region_top: 0,
                          grant_count: 0,
@@ -434,34 +508,34 @@ public(package) unsafe static var PROCESSES: Slab<ProcessBody, MAX_PROCESSES> = 
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
-    total: MAX_PROCESSES)
+    total: MAX_PROCESSES))
 
 /// The body process `p` runs in.
 ///
 /// Every caller acts on a live process, so a record with no body is a kernel
 /// bug here and stops the machine rather than indexing the body table with
 /// `NO_BODY`. A site that can meet a `Gone` process asks `has_body` first.
-public(package) func body_of(p: Int) unsafe -> Int {
-    let link = PROCESS_RECORDS[p].body_link
+public(package) func body_of(p: ProcessIndex) unsafe -> BodyIndex {
+    let link = PROCESS_RECORDS.at(p).body_link
     if link == 0 {
         fatal_kernel("a process with no body was asked for one", p as UInt)
         return NO_BODY
     }
-    link - 1
+    BodyIndex(link - 1)
 }
 
 /// Whether process `p` still has its body: false once its teardown has freed
 /// it, and for a record no create has linked yet.
-public(package) func has_body(p: Int) unsafe -> Bool {
-    PROCESS_RECORDS[p].body_link != 0
+public(package) func has_body(p: ProcessIndex) unsafe -> Bool {
+    PROCESS_RECORDS.at(p).body_link != 0
 }
 
 /// Record that process `p` runs in body `b`.
-public(package) func link_body(p: Int, b: Int) unsafe {
-    PROCESS_RECORDS[p].body_link = b + 1
+public(package) func link_body(p: ProcessIndex, b: BodyIndex) unsafe {
+    PROCESS_RECORDS.at(p).body_link = b + 1
 }
 
 /// Record that process `p` has no body any more.
-public(package) func unlink_body(p: Int) unsafe {
-    PROCESS_RECORDS[p].body_link = 0
+public(package) func unlink_body(p: ProcessIndex) unsafe {
+    PROCESS_RECORDS.at(p).body_link = 0
 }

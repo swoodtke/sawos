@@ -24,7 +24,8 @@ import kcore.diag.{console, fatal_image}
 import kcore.stats.{stats_publish}
 import kcore.preempt.{long_copy, long_zero}
 import sosabi.{BANDS, Priority}
-import kcore.limits.{MAX_GRANT_ROWS, NO_MEMORY, ROOT_PROCESS, SYSTEM_LEVELS}
+import kcore.limits.{MAX_GRANT_ROWS, NO_MEMORY, ProcessIndex, ROOT_PROCESS,
+                     SYSTEM_LEVELS}
 import kcore.threads.{band_level, with_band_level}
 import kcore.process.{claim_root, load_domain, record_grant, start_process}
 import kcore.pslot.{PROCESSES, body_of}
@@ -628,14 +629,14 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
         // own address on every tier, so its row's two halves are one number (as
         // `hal.map_place` does for a mapped `IoMemory`).
         if seg.is_device_grant() {
-            record_grant(p, load_addr, top, load_addr, seg.flags, true,
+            record_grant(ProcessIndex(p), load_addr, top, load_addr, seg.flags, true,
                          NO_MEMORY)
         } else if used_in_place(&seg, img_base) {
             // Nothing moves: the row names the image's own bytes, read where
             // the kernel holds them, and the user sees them at the link
             // address, which `same_bytes` said names the same bytes.
             // `check_in_place` held the rounded grant inside the image.
-            record_grant(p, load_addr, top, img_base + (seg.file_off as UInt),
+            record_grant(ProcessIndex(p), load_addr, top, img_base + (seg.file_off as UInt),
                          seg.flags, false, image)
         } else {
             // The segment loads at a frame and is mapped at its link address.
@@ -654,7 +655,7 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
             // The sosimg flag bits are the protection vocabulary (`imgformat`
             // states the encoding; each HAL translates it), so a segment's
             // permissions become its grant with nothing in between.
-            record_grant(p, load_addr, top, load_pa, seg.flags, false,
+            record_grant(ProcessIndex(p), load_addr, top, load_pa, seg.flags, false,
                          region)
         }
         s = s + 1
@@ -663,14 +664,14 @@ public(package) func place_image(p: Int, img_base: UInt, table: &ImageTable,
     // The stack is the kernel's grant, not the image's. Its two ranges sit at
     // their own ends of the destination: the user sees the top of the linked
     // region, the bytes are the top of the frames.
-    record_grant(p, dest.link_top() - dest.stack_len, dest.link_top(),
+    record_grant(ProcessIndex(p), dest.link_top() - dest.stack_len, dest.link_top(),
                  dest.top - dest.stack_len,
                  (SegFlag.Read as UInt8) | (SegFlag.Write as UInt8), false,
                  region)
 
     // Every row so far is the image's, and no row is recorded before them.
-    let b = body_of(p)
-    PROCESSES[b].image_rows = PROCESSES[b].grant_count
+    let b = body_of(ProcessIndex(p))
+    PROCESSES.at(b).image_rows = PROCESSES.at(b).grant_count
 }
 
 // -----------------------------------------------------------------------------

@@ -81,7 +81,7 @@ import sosabi.{EventMode, FaultReason, NO_HANDLE, ObjType, OutletLevel,
                pipe_msg_record_bytes, wait_meta_end_bytes, wait_prefix_bytes,
                wait_record_bytes}
 import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES,
-                     NO_PROCESS, NO_THREAD, PIPE_INFLIGHT}
+                     NO_PROCESS, NO_THREAD, PIPE_INFLIGHT, ProcessIndex}
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
 import kcore.result.{op_ok, op_status, op_value, write_result}
 import kcore.threads.{THREADS, ThreadState, frame_slot, free_thread_slot,
@@ -183,7 +183,7 @@ public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
         case IoMemory -> { IOMEMORIES[slot].refs = IOMEMORIES[slot].refs + 1 },
         case Mapping -> { MAPPINGS[slot].refs = MAPPINGS[slot].refs + 1 },
         case Process -> {
-            PROCESS_RECORDS[slot].refs = PROCESS_RECORDS[slot].refs + 1
+            PROCESS_RECORDS.at(ProcessIndex(slot)).refs = PROCESS_RECORDS.at(ProcessIndex(slot)).refs + 1
         },
         // Two kinds, one slot, two columns. `slot` is the connection's index;
         // the kind says which end the handle names and therefore which column
@@ -411,9 +411,9 @@ public(package) func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
             exchange_can_settle(slot)
         },
         case Process -> {
-            if PROCESS_RECORDS[slot].refs == 0 { return false }
-            PROCESS_RECORDS[slot].refs = PROCESS_RECORDS[slot].refs - 1
-            PROCESS_RECORDS[slot].refs == 0
+            if PROCESS_RECORDS.at(ProcessIndex(slot)).refs == 0 { return false }
+            PROCESS_RECORDS.at(ProcessIndex(slot)).refs = PROCESS_RECORDS.at(ProcessIndex(slot)).refs - 1
+            PROCESS_RECORDS.at(ProcessIndex(slot)).refs == 0
         },
         case Thread -> {
             if THREADS[slot].refs == 0 {
@@ -724,7 +724,7 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             // watcher is a reference. This is what makes attach-after-death
             // sound against the reclaim below; if it fired, a supervisor would
             // be parked on a record already given away.
-            if PROCESS_RECORDS[slot].attachment != 0 {
+            if PROCESS_RECORDS.at(ProcessIndex(slot)).attachment != 0 {
                 fatal_kernel("a process reached zero references while attached",
                              slot as UInt)
             }
@@ -740,7 +740,7 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             // The ledger is not credited: the teardown already zeroed this
             // record's rows, and a process is not something another process is
             // charged for.
-            reclaim_process_record(slot)
+            reclaim_process_record(ProcessIndex(slot))
         },
         // Both ends are gone, so the connection is too. The two arms are one
         // act written twice, because the matrix is over `ObjType`: either kind
@@ -1362,7 +1362,7 @@ func deliver_wait_record(p: Int, dst: UInt, rec: &var WaitPrefix,
     if message {
         bytes = wait_prefix_bytes() as UInt
     }
-    if let why = copy_out(p, dst, ((&var rec) as UnsafePointer<WaitPrefix>) as UInt,
+    if let why = copy_out(ProcessIndex(p), dst, ((&var rec) as UnsafePointer<WaitPrefix>) as UInt,
                           bytes) {
         fatal("wait record refused by the copy door", (why as UInt8) as UInt,
               dst, p as UInt, ExitCode.ProcessFault)
@@ -1371,7 +1371,7 @@ func deliver_wait_record(p: Int, dst: UInt, rec: &var WaitPrefix,
     // ring slot that holds the bytes, so a reply never transits a kernel
     // buffer.
     if rec.meta.len != 0 {
-        if let why = copy_out(p, dst + (wait_prefix_bytes() as UInt), body_src,
+        if let why = copy_out(ProcessIndex(p), dst + (wait_prefix_bytes() as UInt), body_src,
                               rec.meta.len as UInt) {
             fatal("wait record body refused by the copy door",
                   (why as UInt8) as UInt, dst, p as UInt, ExitCode.ProcessFault)
@@ -1660,11 +1660,11 @@ public(package) func wake_one_waiter(w: Int, a: Int) unsafe {
         let p = THREADS[slot].process
         let dst = THREADS[slot].wait_buf
         THREADS[slot].wait_buf = 0
-        if PROCESS_RECORDS[p].doom != 0 {
+        if PROCESS_RECORDS.at(ProcessIndex(p)).doom != 0 {
             continue
         }
-        if let why = copy_out_check(p, dst, wait_record_bytes() as UInt) {
-            doom_process(p, why)
+        if let why = copy_out_check(ProcessIndex(p), dst, wait_record_bytes() as UInt) {
+            doom_process(ProcessIndex(p), why)
             continue
         }
 
@@ -1812,8 +1812,8 @@ func wake_call_reply(t: Int, x: Int) unsafe {
         // is being ended, so nothing is minted for it and no refusal status is
         // answered to a thread that will not run again.
         let reply_bytes = pipe_msg_record_bytes() as UInt
-        if let why = copy_out_check(p, dst, reply_bytes) {
-            doom_process(p, why)
+        if let why = copy_out_check(ProcessIndex(p), dst, reply_bytes) {
+            doom_process(ProcessIndex(p), why)
             waitable_consume(WaitableKind.PipeReply, x)
             clear_pending_call(t)
             unref_waitable(WaitableKind.PipeReply, x)
@@ -1842,7 +1842,7 @@ func wake_call_reply(t: Int, x: Int) unsafe {
             let moved = mint_staged(x, p)
             var rec = msg_prefix(answer.body_len, EXCHANGES[x].sender_pid,
                                  &moved)
-            if let why = copy_out(p, dst,
+            if let why = copy_out(ProcessIndex(p), dst,
                                   ((&var rec) as UnsafePointer<PipeMsgPrefix>) as UInt,
                                   sizeof<PipeMsgPrefix>() as UInt) {
                 fatal("fused call reply refused by the copy door",
@@ -1850,7 +1850,7 @@ func wake_call_reply(t: Int, x: Int) unsafe {
                       ExitCode.ProcessFault)
             }
             if answer.body_len != 0 {
-                if let why = copy_out(p, dst + (pipe_msg_body_offset() as UInt),
+                if let why = copy_out(ProcessIndex(p), dst + (pipe_msg_body_offset() as UInt),
                                       answer.body_src, answer.body_len) {
                     fatal("fused call reply body refused by the copy door",
                           (why as UInt8) as UInt, dst, p as UInt,
@@ -1936,8 +1936,8 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     var args = PipeSendRecord(body: 0, len: 0,
                               handles: [NO_HANDLE; PIPE_MSG_HANDLES])
     let args_at = ((&var args) as UnsafePointer<PipeSendRecord>) as UInt
-    if let why = copy_in(p, args_at, src, THREADS[t].call_len) {
-        doom_process(p, why)
+    if let why = copy_in(ProcessIndex(p), args_at, src, THREADS[t].call_len) {
+        doom_process(ProcessIndex(p), why)
         clear_pending_call(t)
         return true
     }
@@ -1946,14 +1946,14 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     // below and the exchange's length field, both of which assume one slot's
     // worth.
     if args.len > (PIPE_BODY_BYTES as UInt) {
-        doom_process(p, FaultReason.BadArg)
+        doom_process(ProcessIndex(p), FaultReason.BadArg)
         clear_pending_call(t)
         return true
     }
     let len = args.len
     if len != 0 {
-        if let why = copy_in_check(p, args.body, len) {
-            doom_process(p, why)
+        if let why = copy_in_check(ProcessIndex(p), args.body, len) {
+            doom_process(ProcessIndex(p), why)
             clear_pending_call(t)
             return true
         }
@@ -1977,7 +1977,7 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     // The body was checked just above, in the same step: a refusal here is a
     // kernel bug.
     if len != 0 {
-        if let why = copy_in(p, exchange_body_addr(x), args.body, len) {
+        if let why = copy_in(ProcessIndex(p), exchange_body_addr(x), args.body, len) {
             fatal("parked call body refused by the copy door",
                   (why as UInt8) as UInt, args.body, p as UInt,
                   ExitCode.ProcessFault)

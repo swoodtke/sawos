@@ -33,6 +33,8 @@ import kcore.limits.{
     NO_PROCESS,
     NO_THREAD,
     ROOT_PROCESS,
+    BodyIndex,
+    ProcessIndex,
 }
 import kcore.result.{SyscallResult, op_ok, op_status, op_value, write_result}
 import kcore.mem.{word_bytes}
@@ -142,7 +144,7 @@ func run_thread(next: Int) unsafe -> UInt {
     SLICE_ENDED = false
     let np = THREADS[next].process
     if np != LAST_PROT_PROCESS {
-        load_domain(np)
+        load_domain(ProcessIndex(np))
     }
     let frame = frame_slot(next)
     hal.fp_switch_in(frame)
@@ -393,7 +395,7 @@ func resume_after_death() unsafe -> Never {
 /// Whether process `p` holds its section: it registered a word, and the
 /// depth reads nonzero. `p` is live.
 public(package) func section_held(p: Int) unsafe -> Bool {
-    let at = PROCESSES[body_of(p)].section_at
+    let at = PROCESSES.at(body_of(ProcessIndex(p))).section_at
     at != 0 && UnsafeMemory<UInt, Normal>(at).read() != 0
 }
 
@@ -401,8 +403,8 @@ public(package) func section_held(p: Int) unsafe -> Bool {
 /// its pending flag and forget its holder: the scheduler found the section
 /// left, so nothing is held back by it any more.
 func section_check(p: Int) unsafe -> Bool {
-    let b = body_of(p)
-    let at = PROCESSES[b].section_at
+    let b = body_of(ProcessIndex(p))
+    let at = PROCESSES.at(b).section_at
     if at == 0 {
         return false
     }
@@ -410,13 +412,13 @@ func section_check(p: Int) unsafe -> Bool {
         return true
     }
     UnsafeMemory<UInt, Normal>(at + word_bytes()).write(0)
-    PROCESSES[b].section_holder = 0
+    PROCESSES.at(b).section_holder = 0
     false
 }
 
 /// Tell body `b`'s process that its section held a sibling back.
 func section_defer(b: Int) unsafe {
-    UnsafeMemory<UInt, Normal>(PROCESSES[b].section_at + word_bytes()).write(1)
+    UnsafeMemory<UInt, Normal>(PROCESSES.at(BodyIndex(b)).section_at + word_bytes()).write(1)
 }
 
 /// The first place: running thread `cur` is leaving the processor. Whether it
@@ -440,8 +442,8 @@ func section_keeps(cur: Int) unsafe -> Bool {
     if not section_check(p) {
         return false
     }
-    let b = body_of(p)
-    PROCESSES[b].section_holder = cur + 1
+    let b = body_of(ProcessIndex(p))
+    PROCESSES.at(b).section_holder = cur + 1
     if not defers_to(cur, ready_peek()) {
         return false
     }
@@ -489,13 +491,13 @@ func section_displaces(next: Int) unsafe -> Int {
     if not section_check(p) {
         return next
     }
-    let b = body_of(p)
-    let h = PROCESSES[b].section_holder - 1
+    let b = body_of(ProcessIndex(p))
+    let h = PROCESSES.at(b).section_holder - 1
     if h == next {
         return next
     }
     if h < 0 || not ready_sibling(h, p) {
-        PROCESSES[b].section_holder = next + 1
+        PROCESSES.at(b).section_holder = next + 1
         return next
     }
     if not ready_remove(h) {
@@ -1029,14 +1031,14 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
                       is_caller: Bool) unsafe -> TeardownCounts {
     // Whatever end this process was owed, it is having one: a fault left
     // pending must not outlive the record it was written on.
-    PROCESS_RECORDS[p].doom = 0
-    PROCESS_RECORDS[p].state = ProcessState.Gone
-    PROCESS_RECORDS[p].exit_kind = kind
-    PROCESS_RECORDS[p].exit_code = code
+    PROCESS_RECORDS.at(ProcessIndex(p)).doom = 0
+    PROCESS_RECORDS.at(ProcessIndex(p)).state = ProcessState.Gone
+    PROCESS_RECORDS.at(ProcessIndex(p)).exit_kind = kind
+    PROCESS_RECORDS.at(ProcessIndex(p)).exit_code = code
     // The teardown's own reference, dropped at the end (see above). It is taken
     // before the notify, which is the first thing that can drop another.
     ref_object(ObjType.Process, p)
-    let body = if has_body(p) { body_of(p) } else { NO_BODY }
+    let body = if has_body(ProcessIndex(p)) { body_of(ProcessIndex(p)) } else { NO_BODY }
     var counts = TeardownCounts(closed: 0, threads: 0, events: 0, waiters: 0,
                                 interrupts: 0, timers: 0)
 
@@ -1323,13 +1325,13 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
         // teardown has begun (`ktrap` attributes to the current thread, and
         // this process has none left), so the copy is final. The row itself
         // stays as it is until a create reuses the body and clears it.
-        PROCESS_RECORDS[p].final_stats = stats_read(body)
+        PROCESS_RECORDS.at(ProcessIndex(p)).final_stats = stats_read(body)
 
         // The protection rows go with the body, and `LAST_PROT_PROCESS` is
         // invalidated with them, so a later process landing in this record or
         // this body cannot compare equal to a domain that is no longer
         // installed.
-        clear_domain(p)
+        clear_domain(ProcessIndex(p))
 
         // The boot set, undrained records included. Every record names a
         // handle in the table the close-all already emptied, so what remains is
@@ -1371,8 +1373,8 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
             e = e + 1
         }
         free_handle_blocks(p)
-        PROCESSES[body].live = false
-        unlink_body(p)
+        PROCESSES.at(body).live = false
+        unlink_body(ProcessIndex(p))
     }
 
     // The teardown's own reference goes, which reclaims the record if nothing
@@ -1519,9 +1521,9 @@ public(package) func drain_unstarted() unsafe {
         UNSTARTED_PENDING = false
         var r: Int = 0
         while r < PROCESS_RECORDS.capacity() {
-            match PROCESS_RECORDS[r].state {
+            match PROCESS_RECORDS.at(ProcessIndex(r)).state {
                 case Created -> {
-                    if PROCESS_RECORDS[r].refs == 0 {
+                    if PROCESS_RECORDS.at(ProcessIndex(r)).refs == 0 {
                         end_unstarted(r)
                     }
                 },
@@ -1567,9 +1569,9 @@ func owns_current_thread(p: Int) unsafe -> Bool {
 /// Take the fault process `r` is owed and end it with it. A record that is not
 /// `Running` owes nothing: its own end already cleared the debt.
 func pay_doom(r: Int) unsafe {
-    let owed = PROCESS_RECORDS[r].doom
-    PROCESS_RECORDS[r].doom = 0
-    match PROCESS_RECORDS[r].state {
+    let owed = PROCESS_RECORDS.at(ProcessIndex(r)).doom
+    PROCESS_RECORDS.at(ProcessIndex(r)).doom = 0
+    match PROCESS_RECORDS.at(ProcessIndex(r)).state {
         case Running -> {
             let known = FaultReason.from(raw: owed - 1)
             end_doomed(r, known ?? FaultReason.BadBuffer)
@@ -1599,14 +1601,14 @@ func drain_doomed() unsafe {
         DOOM_PENDING = false
         var r: Int = 0
         while r < PROCESS_RECORDS.capacity() {
-            if PROCESS_RECORDS[r].doom != 0 && not owns_current_thread(r) {
+            if PROCESS_RECORDS.at(ProcessIndex(r)).doom != 0 && not owns_current_thread(r) {
                 pay_doom(r)
             }
             r = r + 1
         }
         if CURRENT_THREAD != NO_THREAD {
             let running = THREADS[CURRENT_THREAD].process
-            if running != NO_PROCESS && PROCESS_RECORDS[running].doom != 0 {
+            if running != NO_PROCESS && PROCESS_RECORDS.at(ProcessIndex(running)).doom != 0 {
                 pay_doom(running)
             }
         }

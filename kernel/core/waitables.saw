@@ -18,6 +18,7 @@ import hal
 import sosabi.{EventMode, InletLevel, OutletLevel, ReplyLevel, WaitTag,
                process_status_word}
 import kcore.limits.{
+    ProcessIndex,
     MAX_ATTACHMENTS,
     MAX_EVENTS,
     MAX_INTERRUPTS,
@@ -464,7 +465,7 @@ public(package) func waitable_attachment(kind: WaitableKind, slot: Int) unsafe -
         case Event -> EVENTS[slot].attachment,
         case Interrupt -> INTERRUPTS[slot].attachment,
         case Timer -> TIMERS[slot].attachment,
-        case Process -> PROCESS_RECORDS[slot].attachment,
+        case Process -> PROCESS_RECORDS.at(ProcessIndex(slot)).attachment,
         // Two kinds over one connection row; the kind says which field, as in
         // `ref_object` for the two reference columns.
         case PipeOutlet -> PIPES[slot].outlet_attachment,
@@ -481,7 +482,7 @@ public(package) func set_waitable_attachment(kind: WaitableKind, slot: Int, a: I
         case Event -> { EVENTS[slot].attachment = a },
         case Interrupt -> { INTERRUPTS[slot].attachment = a },
         case Timer -> { TIMERS[slot].attachment = a },
-        case Process -> { PROCESS_RECORDS[slot].attachment = a },
+        case Process -> { PROCESS_RECORDS.at(ProcessIndex(slot)).attachment = a },
         case PipeOutlet -> { PIPES[slot].outlet_attachment = a },
         case PipeInlet -> { PIPES[slot].inlet_attachment = a },
         case PipeReply -> { EXCHANGES[slot].reply_attach = a },
@@ -525,7 +526,7 @@ public(package) func waitable_ready(kind: WaitableKind, slot: Int) unsafe -> Boo
             }
         },
         case Process -> {
-            match PROCESS_RECORDS[slot].state {
+            match PROCESS_RECORDS.at(ProcessIndex(slot)).state {
                 case Gone -> true,
                 // `Created` is not ready: a process that was made and never
                 // started has not ended, so a supervisor parked on one waits
@@ -613,8 +614,8 @@ public(package) func waitable_answer(kind: WaitableKind, slot: Int) unsafe -> Wa
                                  body_len: 0, body_src: 0),
         case Process -> WaitAnswer(
             tag: WaitTag.Process,
-            payload: process_status_word(PROCESS_RECORDS[slot].exit_kind,
-                                         PROCESS_RECORDS[slot].exit_code),
+            payload: process_status_word(PROCESS_RECORDS.at(ProcessIndex(slot)).exit_kind,
+                                         PROCESS_RECORDS.at(ProcessIndex(slot)).exit_code),
             body_len: 0, body_src: 0),
         // Drain-first, so a staged message is `Msg` whatever became of the
         // sender; this matches the order of the readiness test above, so the
