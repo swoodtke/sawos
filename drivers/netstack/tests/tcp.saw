@@ -1,0 +1,300 @@
+// TCP's wire format: golden segments, their checksums worked independently
+// of the stack, parsed to their fields and built back byte for byte; the
+// options a SYN may carry, the maximum segment size read and every other
+// kind stepped over; and every refusal of a segment by its reason.
+//
+// A is 10.0.0.1, port 80; B is 10.0.0.2, port 5000.
+
+import netstack.addr.{Ipv4Addr}
+import netstack.bytes.{checksum, put16, sum16}
+import netstack.tcp
+import netstack.tcp.{ACK, FIN, Header, PSH, RST, SYN, TcpDrop}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func same(a: &[UInt8], b: &[UInt8]) -> Bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+func ip_a() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 1) }
+func ip_b() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 2) }
+
+// -----------------------------------------------------------------------------
+// Golden bytes
+// -----------------------------------------------------------------------------
+
+/// A's SYN to B: seq 1000, window 4096, MSS 1460. Checksum 0x5C64.
+static A_SYN: [UInt8; 24] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x00, 0x00, 0x00,
+    0x60, 0x02, 0x10, 0x00, 0x5C, 0x64, 0x00, 0x00, 0x02, 0x04, 0x05, 0xB4,
+]
+
+/// B's SYN to A: seq 9000, window 65535, and options MSS 1200, NOP, window
+/// scale 7, SACK-permitted, timestamps 1 and 0, NOP, NOP, end and its pad.
+/// Checksum 0xECFB.
+static B_SYN_OPTIONS: [UInt8; 44] = [
+    0x13, 0x88, 0x00, 0x50, 0x00, 0x00, 0x23, 0x28, 0x00, 0x00, 0x00, 0x00,
+    0xB0, 0x02, 0xFF, 0xFF, 0xEC, 0xFB, 0x00, 0x00, 0x02, 0x04, 0x04, 0xB0,
+    0x01, 0x03, 0x03, 0x07, 0x04, 0x02, 0x08, 0x0A, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
+]
+
+/// B's ACK,PSH to A carrying "hello", an odd length: seq 9001, ack 1001,
+/// window 8192. Checksum 0xFD08.
+static B_DATA: [UInt8; 25] = [
+    0x13, 0x88, 0x00, 0x50, 0x00, 0x00, 0x23, 0x29, 0x00, 0x00, 0x03, 0xE9,
+    0x50, 0x18, 0x20, 0x00, 0xFD, 0x08, 0x00, 0x00, 0x68, 0x65, 0x6C, 0x6C,
+    0x6F,
+]
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// A segment the tests assemble by hand.
+struct Built {
+    len: Int,
+    bytes: [UInt8; 64],
+}
+
+/// Rewrites the checksum of `s`, a segment from B to A, to verify.
+func fix(s: &var Built) {
+    put16(&var s.bytes, 16, 0)
+    let sum = checksum(sum16(tcp.pseudo_sum(ip_b(), ip_a(), s.len),
+                             &s.bytes[..s.len]))
+    put16(&var s.bytes, 16, sum)
+}
+
+/// `bytes` from B to A with byte `at` set to `value` and the checksum made
+/// to verify again.
+func with(bytes: &[UInt8], at: Int, value: UInt8) -> Built {
+    var s = Built(len: bytes.len(), bytes: [0; 64])
+    var i = 0
+    while i < bytes.len() {
+        s.bytes[i] = bytes[i]
+        i = i + 1
+    }
+    s.bytes[at] = value
+    fix(&var s)
+    s
+}
+
+/// A SYN from B to A, seq 9000, with `options` padded with zeros to a whole
+/// word, and `flags` in place of the SYN when it is not one.
+func with_options(options: &[UInt8], flags: UInt8) -> Built {
+    let words = (options.len() + 3) / 4
+    var s = Built(len: 20 + words * 4, bytes: [0; 64])
+    let h = Header(src_port: 5000, dst_port: 80, seq: 9000, ack: 0,
+                   flags: flags, window: 1024, mss: None)
+    let _ = tcp.write_segment(&var s.bytes, ip_b(), ip_a(), &h, 0)
+    s.bytes[12] = ((5 + words) as UInt8) << 4
+    var i = 0
+    while i < options.len() {
+        s.bytes[20 + i] = options[i]
+        i = i + 1
+    }
+    fix(&var s)
+    s
+}
+
+func parse(bytes: &[UInt8]) -> Result<tcp.Received, TcpDrop> {
+    tcp.Received(segment: &bytes, src: ip_b(), dst: ip_a())
+}
+
+func refused(bytes: &[UInt8], reason: TcpDrop) -> Bool {
+    match parse(&bytes) {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+func parses(bytes: &[UInt8]) -> Bool {
+    match parse(&bytes) { case Ok(_) -> true, case Err(_) -> false }
+}
+
+/// The maximum segment size `bytes` parses to.
+func mss_of(bytes: &[UInt8]) -> UInt16? {
+    let r = try! parse(&bytes)
+    r.header.mss
+}
+
+// -----------------------------------------------------------------------------
+// The tests
+// -----------------------------------------------------------------------------
+
+func headers() {
+    let syn = try! tcp.Received(segment: &A_SYN, src: ip_a(), dst: ip_b())
+    check(syn.header == Header(src_port: 80, dst_port: 5000, seq: 1000, ack: 0,
+                               flags: SYN, window: 4096, mss: 1460) &&
+          syn.data_at() == 24 && syn.data_bytes() == 0,
+          "A's SYN parses to its fields")
+    var built: [UInt8; 24] = [0; 24]
+    let n = tcp.write_segment(&var built, ip_a(), ip_b(), &syn.header, 0)
+    check(n == 24 && same(&built, &A_SYN), "A's SYN builds byte for byte")
+
+    let data = try! parse(&B_DATA)
+    check(data.header == Header(src_port: 5000, dst_port: 80, seq: 9001,
+                                ack: 1001, flags: ACK | PSH, window: 8192,
+                                mss: None) &&
+          data.data_at() == 20 && data.data_bytes() == 5,
+          "B's data segment parses, its data after the header")
+    var with_data: [UInt8; 25] = [0; 25]
+    with_data[20] = 0x68
+    with_data[21] = 0x65
+    with_data[22] = 0x6C
+    with_data[23] = 0x6C
+    with_data[24] = 0x6F
+    let m = tcp.write_segment(&var with_data, ip_b(), ip_a(), &data.header, 5)
+    check(m == 25 && same(&with_data, &B_DATA),
+          "a segment of odd length builds, its last byte padded in the sum")
+
+    check(data.header.has(ACK) && data.header.has(PSH) &&
+          not data.header.has(FIN) && not data.header.has(SYN) &&
+          not data.header.has(RST) && data.header.has(ACK | PSH) &&
+          not data.header.has(ACK | FIN),
+          "a flag is set only when its bit is")
+    check(tcp.OFFERED_MSS == 1460, "the offered size fits the link's MTU")
+}
+
+func options() {
+    let syn = try! parse(&B_SYN_OPTIONS)
+    check(syn.header.mss == 1200 && syn.header.window == 65535 &&
+          syn.data_at() == 44 && syn.data_bytes() == 0,
+          "the MSS is read past window scale, SACK-permitted and timestamps")
+
+    // The same options after an ACK alone: a size is read only from a SYN.
+    let ack = with(&B_SYN_OPTIONS, 13, ACK)
+    check(parses(&ack.bytes[..ack.len]) && mss_of(&ack.bytes[..ack.len]) == None,
+          "an MSS on a segment without SYN is ignored")
+
+    let none_options: [UInt8; 4] = [1, 1, 1, 0]
+    let none = with_options(&none_options, SYN)
+    check(mss_of(&none.bytes[..none.len]) == None, "pads and an end, no size")
+    let after_end_options: [UInt8; 5] = [0, 2, 4, 1, 0]
+    let after_end = with_options(&after_end_options, SYN)
+    check(mss_of(&after_end.bytes[..after_end.len]) == None,
+          "nothing after the end of the list is read")
+    let last_options: [UInt8; 5] = [1, 2, 4, 2, 0]
+    let last = with_options(&last_options, SYN)
+    check(mss_of(&last.bytes[..last.len]) == 512,
+          "a size that ends the header is read")
+    let unknown_options: [UInt8; 8] = [0xFE, 4, 0xAA, 0xBB, 2, 4, 1, 0]
+    let unknown = with_options(&unknown_options, SYN)
+    check(mss_of(&unknown.bytes[..unknown.len]) == 256,
+          "an unknown kind is stepped over by its length")
+
+    let zero_options: [UInt8; 4] = [3, 0, 7, 0]
+    let zero = with_options(&zero_options, SYN)
+    check(refused(&zero.bytes[..zero.len], TcpDrop.BadOption),
+          "an option length of zero")
+    let one_options: [UInt8; 4] = [3, 1, 1, 0]
+    let one = with_options(&one_options, SYN)
+    check(refused(&one.bytes[..one.len], TcpDrop.BadOption),
+          "an option length of one")
+    let past_options: [UInt8; 4] = [1, 8, 6, 0]
+    let past = with_options(&past_options, SYN)
+    check(refused(&past.bytes[..past.len], TcpDrop.BadOption),
+          "an option past the header")
+    let no_length_options: [UInt8; 4] = [1, 1, 1, 2]
+    let no_length = with_options(&no_length_options, SYN)
+    check(refused(&no_length.bytes[..no_length.len], TcpDrop.BadOption),
+          "an option with no length byte")
+    let short_mss_options: [UInt8; 4] = [2, 3, 5, 0]
+    let short_mss = with_options(&short_mss_options, SYN)
+    check(refused(&short_mss.bytes[..short_mss.len], TcpDrop.BadOption),
+          "an MSS of three bytes")
+    let overrun_options: [UInt8; 8] = [1, 1, 1, 1, 1, 2, 4, 5]
+    let overrun = with_options(&overrun_options, SYN)
+    check(refused(&overrun.bytes[..overrun.len], TcpDrop.BadOption),
+          "an MSS one byte past the options")
+    let long_mss_options: [UInt8; 8] = [2, 6, 1, 0, 0, 0, 0, 0]
+    let long_mss = with_options(&long_mss_options, SYN)
+    check(refused(&long_mss.bytes[..long_mss.len], TcpDrop.BadOption),
+          "an MSS of six bytes")
+    let ack_zero_options: [UInt8; 4] = [3, 0, 7, 0]
+    let ack_zero = with_options(&ack_zero_options, ACK)
+    check(refused(&ack_zero.bytes[..ack_zero.len], TcpDrop.BadOption),
+          "options are checked on any segment")
+}
+
+func refusals() {
+    check(refused(&B_DATA[..19], TcpDrop.Truncated), "19 bytes")
+    check(refused(&B_DATA[..0], TcpDrop.Truncated), "no bytes")
+    let short = with(&B_DATA, 12, 0x40)
+    check(refused(&short.bytes[..short.len], TcpDrop.DataOffset),
+          "a data offset of four words")
+    let none = with(&B_DATA, 12, 0x00)
+    check(refused(&none.bytes[..none.len], TcpDrop.DataOffset),
+          "a data offset of zero")
+    let five = with(&B_DATA, 12, 0x50)
+    check(parses(&five.bytes[..five.len]), "a data offset of five words")
+    let seven = with(&B_DATA, 12, 0x70)
+    check(refused(&seven.bytes[..seven.len], TcpDrop.DataOffset),
+          "a data offset of seven words in 25 bytes")
+    let whole = with(&B_SYN_OPTIONS, 12, 0xB0)
+    check(parses(&whole.bytes[..whole.len]), "a data offset of the whole segment")
+    var odd = with(&B_DATA, 12, 0x70)
+    odd.len = 27
+    fix(&var odd)
+    check(refused(&odd.bytes[..odd.len], TcpDrop.DataOffset),
+          "a data offset of seven words in 27 bytes")
+    var huge: [UInt8; 65536] = [0; 65536]
+    huge[12] = 0x50
+    check(refused(&huge, TcpDrop.Oversize), "a segment of 65536 bytes")
+    let over = with(&B_SYN_OPTIONS, 12, 0xC0)
+    check(refused(&over.bytes[..over.len], TcpDrop.DataOffset),
+          "a data offset one word past the segment")
+
+    var bad = B_DATA
+    bad[17] = bad[17] ^ 0x01
+    check(refused(&bad, TcpDrop.Checksum), "a checksum off by one bit")
+    var changed = B_DATA
+    changed[24] = 0x70
+    check(refused(&changed, TcpDrop.Checksum), "data changed under the checksum")
+    let elsewhere = tcp.Received(segment: &B_DATA, src: ip_b(),
+                                 dst: Ipv4Addr(a: 10, b: 0, c: 0, d: 3))
+    check(match elsewhere { case Err(e) -> e == TcpDrop.Checksum, case Ok(_) -> false },
+          "the pseudo-header's addresses are under the checksum")
+    let padded = with(&B_DATA, 12, 0x50)
+    check(not refused(&padded.bytes[..padded.len], TcpDrop.Checksum),
+          "a checksum made to verify, verifies")
+}
+
+func reasons() {
+    var a: UInt8 = 0
+    while a <= 16 {
+        let x = TcpDrop.from(raw: a)!
+        var b = a + 1
+        while b <= 16 {
+            let y = TcpDrop.from(raw: b)!
+            check(x != y && x.describe() != y.describe(),
+                  "reasons {x} and {y} differ")
+            b = b + 1
+        }
+        a = a + 1
+    }
+    check(TcpDrop.from(raw: 17) == None, "seventeen reasons")
+}
+
+func main() {
+    headers()
+    options()
+    refusals()
+    reasons()
+}

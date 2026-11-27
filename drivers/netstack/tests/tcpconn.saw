@@ -1,0 +1,1209 @@
+// TCP's connection state machine, one table driven segment by segment: each
+// transition of RFC 9293's state diagram, with the segment in, the segment
+// out against golden bytes and the state after; the resets, sent and
+// accepted; every refusal of a segment and of a call by its reason; TIME-WAIT
+// ending on the caller's clock; sequence numbers across zero; and two tables
+// talking to each other through the simultaneous open and close.
+//
+// A is the table under test at 10.0.0.1, its connections on port 80 and its
+// initial sequence number 1000. B is the peer at 10.0.0.2, port 5000, its
+// initial sequence number 9000. B's segments offer a window of 8192.
+
+import netstack.addr.{Ipv4Addr, SocketAddr}
+import netstack.tcp
+import netstack.tcp.{ACK, FIN, Header, RST, SYN, TcpDrop}
+import netstack.tcpconn.{
+    CONNECTIONS, CallError, ConnId, IsnSource, OpenError, RECEIVE_WINDOW, SegmentSink,
+    State, TIME_WAIT_MS, Table, seq_le, seq_lt,
+}
+
+/// Holds `ok`, naming what failed when it does not.
+func check(ok: Bool, what: String) {
+    if not ok {
+        print("failed: {what}")
+    }
+    assert(ok, what)
+}
+
+func same(a: &[UInt8], b: &[UInt8]) -> Bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i = 0
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+func ip_a() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 1) }
+func ip_b() -> Ipv4Addr { Ipv4Addr(a: 10, b: 0, c: 0, d: 2) }
+func end_a() -> SocketAddr { SocketAddr(addr: ip_a(), port: 80) }
+func end_b() -> SocketAddr { SocketAddr(addr: ip_b(), port: 5000) }
+
+// -----------------------------------------------------------------------------
+// Golden bytes: what A sends B
+// -----------------------------------------------------------------------------
+
+/// A's SYN: seq 1000, window 4096, MSS 1460. Checksum 0x5C64.
+static A_SYN: [UInt8; 24] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x00, 0x00, 0x00,
+    0x60, 0x02, 0x10, 0x00, 0x5C, 0x64, 0x00, 0x00, 0x02, 0x04, 0x05, 0xB4,
+]
+
+/// A's SYN,ACK: seq 1000, ack 9001, window 4096, MSS 1460. Checksum 0x392B.
+static A_SYN_ACK: [UInt8; 24] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x00, 0x23, 0x29,
+    0x60, 0x12, 0x10, 0x00, 0x39, 0x2B, 0x00, 0x00, 0x02, 0x04, 0x05, 0xB4,
+]
+
+/// A's ACK: seq 1001, ack 9001. Checksum 0x50E8.
+static A_ACK_1001_9001: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE9, 0x00, 0x00, 0x23, 0x29,
+    0x50, 0x10, 0x10, 0x00, 0x50, 0xE8, 0x00, 0x00,
+]
+
+/// A's FIN,ACK: seq 1001, ack 9001. Checksum 0x50E7.
+static A_FIN_1001_9001: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE9, 0x00, 0x00, 0x23, 0x29,
+    0x50, 0x11, 0x10, 0x00, 0x50, 0xE7, 0x00, 0x00,
+]
+
+/// A's ACK of B's FIN: seq 1001, ack 9002. Checksum 0x50E7.
+static A_ACK_1001_9002: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE9, 0x00, 0x00, 0x23, 0x2A,
+    0x50, 0x10, 0x10, 0x00, 0x50, 0xE7, 0x00, 0x00,
+]
+
+/// A's FIN,ACK after B's FIN: seq 1001, ack 9002. Checksum 0x50E6.
+static A_FIN_1001_9002: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE9, 0x00, 0x00, 0x23, 0x2A,
+    0x50, 0x11, 0x10, 0x00, 0x50, 0xE6, 0x00, 0x00,
+]
+
+/// A's ACK of B's FIN after its own: seq 1002, ack 9002. Checksum 0x50E6.
+static A_ACK_1002_9002: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xEA, 0x00, 0x00, 0x23, 0x2A,
+    0x50, 0x10, 0x10, 0x00, 0x50, 0xE6, 0x00, 0x00,
+]
+
+/// A's ACK after its FIN, of nothing new: seq 1002, ack 9001. Checksum 0x50E7.
+static A_ACK_1002_9001: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xEA, 0x00, 0x00, 0x23, 0x29,
+    0x50, 0x10, 0x10, 0x00, 0x50, 0xE7, 0x00, 0x00,
+]
+
+/// A's ACK of two bytes after an old SYN: seq 1001, ack 9003. Checksum
+/// 0x50E6.
+static A_ACK_1001_9003: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE9, 0x00, 0x00, 0x23, 0x2B,
+    0x50, 0x10, 0x10, 0x00, 0x50, 0xE6, 0x00, 0x00,
+]
+
+/// A's ACK of ten bytes: seq 1001, ack 9011. Checksum 0x50DE.
+static A_ACK_1001_9011: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE9, 0x00, 0x00, 0x23, 0x33,
+    0x50, 0x10, 0x10, 0x00, 0x50, 0xDE, 0x00, 0x00,
+]
+
+/// A's ACK of five more: seq 1001, ack 9016. Checksum 0x50D9.
+static A_ACK_1001_9016: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE9, 0x00, 0x00, 0x23, 0x38,
+    0x50, 0x10, 0x10, 0x00, 0x50, 0xD9, 0x00, 0x00,
+]
+
+/// A's reset on ABORT: seq 1001, no ACK, window 0. Checksum 0x841D.
+static A_RST_1001: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE9, 0x00, 0x00, 0x00, 0x00,
+    0x50, 0x04, 0x00, 0x00, 0x84, 0x1D, 0x00, 0x00,
+]
+
+/// A's reset of an ACK of 1002: seq 1002, window 0. Checksum 0x841C.
+static A_RST_1002: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xEA, 0x00, 0x00, 0x00, 0x00,
+    0x50, 0x04, 0x00, 0x00, 0x84, 0x1C, 0x00, 0x00,
+]
+
+/// A's reset of an ACK of 1000: seq 1000, window 0. Checksum 0x841E.
+static A_RST_1000: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x00, 0x00, 0x00,
+    0x50, 0x04, 0x00, 0x00, 0x84, 0x1E, 0x00, 0x00,
+]
+
+/// A's reset of an ACK of 777: seq 777, window 0. Checksum 0x84FD.
+static A_RST_777: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x03, 0x09, 0x00, 0x00, 0x00, 0x00,
+    0x50, 0x04, 0x00, 0x00, 0x84, 0xFD, 0x00, 0x00,
+]
+
+/// A's reset of a SYN at 9000: seq 0, ack 9001, RST,ACK. Checksum 0x64CD.
+static A_RST_ACK_9001: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x29,
+    0x50, 0x14, 0x00, 0x00, 0x64, 0xCD, 0x00, 0x00,
+]
+
+/// A's reset of a SYN at 9001: seq 0, ack 9002, RST,ACK. Checksum 0x64CC.
+static A_RST_ACK_9002: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x2A,
+    0x50, 0x14, 0x00, 0x00, 0x64, 0xCC, 0x00, 0x00,
+]
+
+/// A's reset of a FIN with ten bytes at 9002: seq 0, ack 9013, RST,ACK.
+/// Checksum 0x64C1.
+static A_RST_ACK_9013: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x35,
+    0x50, 0x14, 0x00, 0x00, 0x64, 0xC1, 0x00, 0x00,
+]
+
+/// A's SYN at 0xFFFFFFFF. Checksum 0x604C.
+static A_SYN_WRAP: [UInt8; 24] = [
+    0x00, 0x50, 0x13, 0x88, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+    0x60, 0x02, 0x10, 0x00, 0x60, 0x4C, 0x00, 0x00, 0x02, 0x04, 0x05, 0xB4,
+]
+
+/// A's ACK: seq 0, ack 0xFFFFFFF9. Checksum 0x7800.
+static A_ACK_WRAP: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xF9,
+    0x50, 0x10, 0x10, 0x00, 0x78, 0x00, 0x00, 0x00,
+]
+
+/// A's ACK of sixteen bytes across zero: seq 0, ack 9. Checksum 0x77F1.
+static A_ACK_WRAP_DATA: [UInt8; 20] = [
+    0x00, 0x50, 0x13, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09,
+    0x50, 0x10, 0x10, 0x00, 0x77, 0xF1, 0x00, 0x00,
+]
+
+// -----------------------------------------------------------------------------
+// The sink, the initial sequence numbers, and B's segments
+// -----------------------------------------------------------------------------
+
+static RECORDED: Int = 4
+
+/// Records what the table sends, in order.
+struct Recorder {
+    count: Int,
+    src: [Ipv4Addr; RECORDED],
+    dst: [Ipv4Addr; RECORDED],
+    lens: [Int; RECORDED],
+    bytes: [[UInt8; 64]; RECORDED],
+}
+
+extension Recorder {
+    static func fresh() -> Recorder {
+        Recorder(count: 0, src: [ip_a(); RECORDED], dst: [ip_a(); RECORDED],
+                 lens: [0; RECORDED], bytes: [[0; 64]; RECORDED])
+    }
+
+    /// Whether exactly one segment went out since the last look, from A to
+    /// B, and it is `golden`. Forgets it.
+    func sent_only(&var self, golden: &[UInt8]) -> Bool {
+        let ok = self.count == 1 && self.src[0] == ip_a() &&
+            self.dst[0] == ip_b() && same(&self.bytes[0][..self.lens[0]], &golden)
+        if not ok {
+            self.show()
+        }
+        self.count = 0
+        ok
+    }
+
+    /// Whether nothing went out since the last look.
+    func silent(&var self) -> Bool {
+        let ok = self.count == 0
+        if not ok {
+            self.show()
+        }
+        self.count = 0
+        ok
+    }
+
+    func show(&self) {
+        print("sent {} segments", self.count)
+        var i = 0
+        while i < self.count && i < RECORDED {
+            var line = StringBuilder()
+            var j = 0
+            while j < self.lens[i] {
+                try! line.append(" ")
+                try! line.append(value: self.bytes[i][j] as Int)
+                j = j + 1
+            }
+            print("  {}", line.build())
+            i = i + 1
+        }
+    }
+}
+
+extension Recorder: SegmentSink {
+    func send(&var self, src: Ipv4Addr, dst: Ipv4Addr, segment: &[UInt8]) {
+        if self.count < RECORDED {
+            let i = self.count
+            self.src[i] = src
+            self.dst[i] = dst
+            self.lens[i] = segment.len()
+            var j = 0
+            while j < segment.len() {
+                self.bytes[i][j] = segment[j]
+                j = j + 1
+            }
+        }
+        self.count = self.count + 1
+    }
+}
+
+/// Answers `value`, and records whom it was asked for.
+struct FixedIsn {
+    value: UInt32,
+    asked: Int,
+    local: SocketAddr,
+    remote: SocketAddr,
+}
+
+extension FixedIsn {
+    static func of(value: UInt32) -> FixedIsn {
+        FixedIsn(value: value, asked: 0, local: end_a(), remote: end_a())
+    }
+}
+
+extension FixedIsn: IsnSource {
+    func isn(&var self, local: SocketAddr, remote: SocketAddr) -> UInt32 {
+        self.asked = self.asked + 1
+        self.local = local
+        self.remote = remote
+        self.value
+    }
+}
+
+/// A segment B sends A.
+struct Seg {
+    len: Int,
+    bytes: [UInt8; 64],
+}
+
+/// B's segment of `flags` at `seq` acknowledging `ack`, with `data` bytes,
+/// offering `window`.
+func from_b(seq: UInt32, ack: UInt32, flags: UInt8, data: Int = 0,
+            window: UInt16 = 8192) -> Seg {
+    var s = Seg(len: 0, bytes: [0; 64])
+    var i = 0
+    while i < data {
+        s.bytes[tcp.HEADER_BYTES + i] = 0x61
+        i = i + 1
+    }
+    let h = Header(src_port: 5000, dst_port: 80, seq: seq, ack: ack,
+                   flags: flags, window: window, mss: None)
+    s.len = tcp.write_segment(&var s.bytes, ip_b(), ip_a(), &h, data)
+    s
+}
+
+/// B's SYN at 9000 offering `mss`.
+func syn_from_b(mss: UInt16?) -> Seg {
+    var s = Seg(len: 0, bytes: [0; 64])
+    let h = Header(src_port: 5000, dst_port: 80, seq: 9000, ack: 0,
+                   flags: SYN, window: 8192, mss: mss)
+    s.len = tcp.write_segment(&var s.bytes, ip_b(), ip_a(), &h, 0)
+    s
+}
+
+/// A table, the connection under test, the listener it came from, and what
+/// drives it.
+struct Rig {
+    table: Table,
+    id: ConnId,
+    listener: ConnId,
+    out: Recorder,
+    isn: FixedIsn,
+}
+
+extension Rig {
+    /// An empty table. Its ids name nothing yet: a listener that was opened
+    /// and closed again.
+    static func fresh() -> Rig {
+        var table = Table.empty()
+        var out = Recorder.fresh()
+        let gone = try! table.listen(1)
+        let _ = table.close(gone, &var out)
+        Rig(table: table, id: gone, listener: gone, out: out,
+            isn: FixedIsn.of(1000))
+    }
+
+    /// Hands A a segment between `src` and `dst` other than B's and A's.
+    func feed_between(&var self, src: SocketAddr, dst: SocketAddr, seq: UInt32,
+                      ack: UInt32, flags: UInt8) -> Result<Void, TcpDrop> {
+        var bytes: [UInt8; 20] = [0; 20]
+        let h = Header(src_port: src.port, dst_port: dst.port, seq: seq,
+                       ack: ack, flags: flags, window: 8192, mss: None)
+        let n = tcp.write_segment(&var bytes, src.addr, dst.addr, &h, 0)
+        self.table.receive(src.addr, dst.addr, &bytes[..n], 0, &var self.isn,
+                           &var self.out)
+    }
+
+    /// Hands A `s` at `now`.
+    func feed_at(&var self, s: &Seg, now: UInt64) -> Result<Void, TcpDrop> {
+        self.table.receive(ip_b(), ip_a(), &s.bytes[..s.len], now,
+                           &var self.isn, &var self.out)
+    }
+
+    func feed(&var self, s: &Seg) -> Result<Void, TcpDrop> {
+        self.feed_at(&s, 0)
+    }
+
+    func state(&self) -> State {
+        self.table.state(self.id)
+    }
+
+    func received(&self) -> UInt64 {
+        let s = try! self.table.status(self.id)
+        s.received
+    }
+
+    func window(&self) -> UInt16 {
+        let s = try! self.table.status(self.id)
+        s.snd_wnd
+    }
+}
+
+/// Whether a segment or a call was taken.
+func taken<E>(r: Result<Void, E>) -> Bool {
+    match r { case Ok(_) -> true, case Err(_) -> false }
+}
+
+func dropped(r: Result<Void, TcpDrop>, reason: TcpDrop) -> Bool {
+    match r {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Fixtures: a connection brought to a state the way the diagram goes
+// -----------------------------------------------------------------------------
+
+/// A listener on port 80.
+func listening() -> Rig {
+    var r = Rig.fresh()
+    r.id = try! r.table.listen(80)
+    r.listener = r.id
+    r
+}
+
+/// A connection a listener spawned for B's SYN, no MSS offered.
+func syn_received() -> Rig {
+    var r = listening()
+    let _ = r.feed(&syn_from_b(None))
+    r.id = r.table.find(end_a(), end_b())!
+    let _ = r.out.silent()
+    r
+}
+
+/// The passive open, done.
+func established() -> Rig {
+    var r = syn_received()
+    let _ = r.feed(&from_b(9001, 1001, ACK))
+    r
+}
+
+/// An active open, SYN sent.
+func syn_sent() -> Rig {
+    var r = Rig.fresh()
+    r.id = try! r.table.connect(end_a(), end_b(), &var r.isn, &var r.out)
+    let _ = r.out.silent()
+    r
+}
+
+func fin_wait_1() -> Rig {
+    var r = established()
+    let _ = r.table.close(r.id, &var r.out)
+    let _ = r.out.silent()
+    r
+}
+
+func fin_wait_2() -> Rig {
+    var r = fin_wait_1()
+    let _ = r.feed(&from_b(9001, 1002, ACK))
+    r
+}
+
+func closing() -> Rig {
+    var r = fin_wait_1()
+    let _ = r.feed(&from_b(9001, 1001, FIN | ACK))
+    let _ = r.out.silent()
+    r
+}
+
+func time_wait() -> Rig {
+    var r = fin_wait_2()
+    let _ = r.feed_at(&from_b(9001, 1002, FIN | ACK), 500)
+    let _ = r.out.silent()
+    r
+}
+
+func close_wait() -> Rig {
+    var r = established()
+    let _ = r.feed(&from_b(9001, 1001, FIN | ACK))
+    let _ = r.out.silent()
+    r
+}
+
+func last_ack() -> Rig {
+    var r = close_wait()
+    let _ = r.table.close(r.id, &var r.out)
+    let _ = r.out.silent()
+    r
+}
+
+// -----------------------------------------------------------------------------
+// Opening
+// -----------------------------------------------------------------------------
+
+func opening() {
+    // CLOSED -> LISTEN, passive OPEN; LISTEN -> CLOSED, CLOSE.
+    var l = Rig.fresh()
+    l.id = try! l.table.listen(80)
+    check(l.state() == State.Listen && l.out.silent(), "CLOSED -> LISTEN")
+    check(taken(l.table.close(l.id, &var l.out)), "a listener closes")
+    check(l.state() == State.Closed && l.out.silent(), "LISTEN -> CLOSED")
+
+    // CLOSED -> SYN-SENT, active OPEN, with the ISN asked for its addresses.
+    var a = Rig.fresh()
+    a.id = try! a.table.connect(end_a(), end_b(), &var a.isn, &var a.out)
+    check(a.out.sent_only(&A_SYN) && a.state() == State.SynSent,
+          "CLOSED -> SYN-SENT, sending SYN")
+    check(a.isn.asked == 1 && a.isn.local == end_a() && a.isn.remote == end_b(),
+          "the ISN is asked for the connection's addresses")
+
+    // SYN-SENT -> CLOSED, CLOSE.
+    var c = syn_sent()
+    check(taken(c.table.close(c.id, &var c.out)) && c.out.silent() &&
+          c.state() == State.Closed, "SYN-SENT -> CLOSED")
+
+    // SYN-SENT -> ESTABLISHED, on SYN,ACK.
+    var e = syn_sent()
+    var synack = Seg(len: 0, bytes: [0; 64])
+    let h = Header(src_port: 5000, dst_port: 80, seq: 9000, ack: 1001,
+                   flags: SYN | ACK, window: 8192, mss: 1200)
+    synack.len = tcp.write_segment(&var synack.bytes, ip_b(), ip_a(), &h, 0)
+    check(taken(e.feed(&synack)) && e.out.sent_only(&A_ACK_1001_9001) &&
+          e.state() == State.Established, "SYN-SENT -> ESTABLISHED, sending ACK")
+    let st = try! e.table.status(e.id)
+    check(st.snd_una == 1001 && st.snd_nxt == 1001 && st.rcv_nxt == 9001 &&
+          st.snd_wnd == 8192 && st.send_mss == 1200,
+          "the SYN,ACK's sequence number, window and size are taken")
+
+    // SYN-SENT -> SYN-RECEIVED on a SYN alone: the simultaneous open.
+    var s = syn_sent()
+    check(taken(s.feed(&syn_from_b(None))) && s.out.sent_only(&A_SYN_ACK) &&
+          s.state() == State.SynReceived, "SYN-SENT -> SYN-RECEIVED, sending SYN,ACK")
+    check(taken(s.feed(&from_b(9000, 1001, SYN | ACK))) && s.out.silent() &&
+          s.state() == State.Established,
+          "SYN-RECEIVED -> ESTABLISHED on the peer's SYN,ACK")
+
+    // LISTEN -> SYN-RECEIVED: a connection is spawned, the listener stays.
+    var p = listening()
+    let listener = p.id
+    check(taken(p.feed(&syn_from_b(None))) && p.out.sent_only(&A_SYN_ACK),
+          "LISTEN answers a SYN with SYN,ACK")
+    let spawned = p.table.find(end_a(), end_b())!
+    check(spawned != listener && p.table.state(spawned) == State.SynReceived &&
+          p.table.state(listener) == State.Listen,
+          "LISTEN -> SYN-RECEIVED, the listener listening on")
+    let sp = try! p.table.status(spawned)
+    check(sp.send_mss == tcp.DEFAULT_MSS && sp.local == end_a() &&
+          sp.remote == end_b(), "a SYN offering no size is sent the default")
+    check(p.isn.local == end_a() && p.isn.remote == end_b(),
+          "a spawned connection's ISN is asked for its addresses")
+
+    var big = listening()
+    let _ = big.feed(&syn_from_b(9000))
+    let bs = try! big.table.status(big.table.find(end_a(), end_b())!)
+    check(bs.send_mss == tcp.OFFERED_MSS, "a size above ours is cut to ours")
+
+    // A SYN again in SYN-RECEIVED is answered with the SYN,ACK again.
+    var again = syn_received()
+    check(taken(again.feed(&syn_from_b(None))) && again.out.sent_only(&A_SYN_ACK) &&
+          again.state() == State.SynReceived, "a repeated SYN is answered again")
+
+    // SYN-RECEIVED -> ESTABLISHED, on the ACK of the SYN.
+    var r = syn_received()
+    check(taken(r.feed(&from_b(9001, 1001, ACK))) && r.out.silent() &&
+          r.state() == State.Established, "SYN-RECEIVED -> ESTABLISHED")
+
+    // LISTEN -> SYN-SENT, SEND.
+    var ls = listening()
+    check(taken(ls.table.connect_listener(ls.id, ip_a(), end_b(), &var ls.isn,
+                                          &var ls.out)) &&
+          ls.out.sent_only(&A_SYN) && ls.state() == State.SynSent,
+          "LISTEN -> SYN-SENT, sending SYN")
+    check(ls.table.find(end_a(), end_b()) == ls.id,
+          "the listener is the connection now")
+}
+
+// -----------------------------------------------------------------------------
+// Closing
+// -----------------------------------------------------------------------------
+
+func closing_transitions() {
+    var sr = syn_received()
+    check(taken(sr.table.close(sr.id, &var sr.out)) &&
+          sr.out.sent_only(&A_FIN_1001_9001) && sr.state() == State.FinWait1,
+          "SYN-RECEIVED -> FIN-WAIT-1, sending FIN")
+
+    var e = established()
+    check(taken(e.table.close(e.id, &var e.out)) &&
+          e.out.sent_only(&A_FIN_1001_9001) && e.state() == State.FinWait1,
+          "ESTABLISHED -> FIN-WAIT-1, sending FIN")
+
+    var f1 = fin_wait_1()
+    check(taken(f1.feed(&from_b(9001, 1002, ACK))) && f1.out.silent() &&
+          f1.state() == State.FinWait2, "FIN-WAIT-1 -> FIN-WAIT-2 on the FIN's ACK")
+    var not_yet = fin_wait_1()
+    check(taken(not_yet.feed(&from_b(9001, 1001, ACK))) && not_yet.out.silent() &&
+          not_yet.state() == State.FinWait1,
+          "FIN-WAIT-1 holds on an ACK short of the FIN")
+
+    var f2 = fin_wait_2()
+    check(taken(f2.feed(&from_b(9001, 1002, FIN | ACK))) &&
+          f2.out.sent_only(&A_ACK_1002_9002) && f2.state() == State.TimeWait,
+          "FIN-WAIT-2 -> TIME-WAIT, sending ACK")
+
+    var c = fin_wait_1()
+    check(taken(c.feed(&from_b(9001, 1001, FIN | ACK))) &&
+          c.out.sent_only(&A_ACK_1002_9002) && c.state() == State.Closing,
+          "FIN-WAIT-1 -> CLOSING on the peer's FIN, sending ACK")
+    var cl = closing()
+    check(taken(cl.feed(&from_b(9002, 1002, ACK))) && cl.out.silent() &&
+          cl.state() == State.TimeWait, "CLOSING -> TIME-WAIT on the FIN's ACK")
+    var cl_hold = closing()
+    check(taken(cl_hold.feed(&from_b(9002, 1001, ACK))) && cl_hold.out.silent() &&
+          cl_hold.state() == State.Closing, "CLOSING holds on an ACK short of the FIN")
+
+    var both = fin_wait_1()
+    check(taken(both.feed(&from_b(9001, 1002, FIN | ACK))) &&
+          both.out.sent_only(&A_ACK_1002_9002) && both.state() == State.TimeWait,
+          "FIN-WAIT-1 -> TIME-WAIT on a FIN that acknowledges ours")
+
+    var tw = time_wait()
+    tw.table.poll(500 + TIME_WAIT_MS - 1)
+    check(tw.state() == State.TimeWait, "TIME-WAIT lasts 2MSL")
+    tw.table.poll(500 + TIME_WAIT_MS)
+    check(tw.state() == State.Closed && tw.out.silent(),
+          "TIME-WAIT -> CLOSED after 2MSL")
+    var tw_back = time_wait()
+    tw_back.table.poll(100)
+    check(tw_back.state() == State.TimeWait, "a clock run backwards ends nothing")
+    var tw_fin = time_wait()
+    check(dropped(tw_fin.feed(&from_b(9001, 1002, FIN | ACK)), TcpDrop.OutOfWindow) &&
+          tw_fin.out.sent_only(&A_ACK_1002_9002) && tw_fin.state() == State.TimeWait,
+          "TIME-WAIT acknowledges the peer's FIN again")
+
+    var cw = established()
+    check(taken(cw.feed(&from_b(9001, 1001, FIN | ACK))) &&
+          cw.out.sent_only(&A_ACK_1001_9002) && cw.state() == State.CloseWait,
+          "ESTABLISHED -> CLOSE-WAIT on the peer's FIN, sending ACK")
+
+    var la = close_wait()
+    check(taken(la.table.close(la.id, &var la.out)) &&
+          la.out.sent_only(&A_FIN_1001_9002) && la.state() == State.LastAck,
+          "CLOSE-WAIT -> LAST-ACK, sending FIN")
+    var done = last_ack()
+    check(taken(done.feed(&from_b(9002, 1002, ACK))) && done.out.silent() &&
+          done.state() == State.Closed, "LAST-ACK -> CLOSED on the FIN's ACK")
+    var la_hold = last_ack()
+    check(taken(la_hold.feed(&from_b(9002, 1001, ACK))) && la_hold.out.silent() &&
+          la_hold.state() == State.LastAck, "LAST-ACK holds on an ACK short of the FIN")
+
+    // A segment with the FIN and data together: the data, then the FIN.
+    var df = established()
+    check(taken(df.feed(&from_b(9001, 1001, FIN | ACK, 10))) &&
+          df.state() == State.CloseWait && df.received() == 10,
+          "data and a FIN in one segment")
+    let dfs = try! df.table.status(df.id)
+    check(dfs.rcv_nxt == 9012, "the FIN follows the data")
+}
+
+// -----------------------------------------------------------------------------
+// Resets
+// -----------------------------------------------------------------------------
+
+func resets() {
+    // A reset in the window ends every synchronized state.
+    let fixtures = [established(), fin_wait_1(), fin_wait_2(), close_wait(),
+                    closing(), last_ack(), time_wait()]
+    let next = [9001u32, 9001, 9001, 9002, 9002, 9002, 9002]
+    var k = 0
+    while k < 7 {
+        var f = fixtures[k]
+        let before = f.state()
+        check(dropped(f.feed(&from_b(next[k], 0, RST)), TcpDrop.Reset) &&
+              f.out.silent() &&
+              f.state() == State.Closed, "a reset ends {before}")
+        k = k + 1
+    }
+    var edge = established()
+    let last = 9001 + (RECEIVE_WINDOW as UInt32) - 1
+    check(dropped(edge.feed(&from_b(last, 0, RST)), TcpDrop.Reset) &&
+          edge.state() == State.Closed,
+          "a reset at the window's last number is in it")
+
+    // SYN-RECEIVED from a listener: freed, and the listener goes on.
+    var p = syn_received()
+    check(dropped(p.feed(&from_b(9001, 0, RST)), TcpDrop.Reset) &&
+          p.out.silent() &&
+          p.state() == State.Closed && p.table.find(end_a(), end_b()) == None &&
+          p.table.state(p.listener) == State.Listen,
+          "SYN-RECEIVED -> LISTEN on a reset, for a passive open")
+    var again = syn_received()
+    let _ = again.feed(&from_b(9001, 0, RST))
+    check(taken(again.feed(&syn_from_b(None))) && again.out.sent_only(&A_SYN_ACK),
+          "the listener answers the next SYN")
+
+    // SYN-RECEIVED from a simultaneous open: the connection is refused.
+    var s = syn_sent()
+    let _ = s.feed(&syn_from_b(None))
+    let _ = s.out.silent()
+    check(dropped(s.feed(&from_b(9001, 0, RST)), TcpDrop.Reset) &&
+          s.state() == State.Closed,
+          "SYN-RECEIVED -> CLOSED on a reset, for an active open")
+
+    // SYN-SENT: a reset counts only with an ACK of the SYN.
+    var ss = syn_sent()
+    check(dropped(ss.feed(&from_b(0, 1001, RST | ACK)), TcpDrop.Reset) &&
+          ss.out.silent() &&
+          ss.state() == State.Closed, "SYN-SENT -> CLOSED on a reset of the SYN")
+    var bare = syn_sent()
+    check(dropped(bare.feed(&from_b(0, 0, RST)), TcpDrop.ResetIgnored) &&
+          bare.out.silent() && bare.state() == State.SynSent,
+          "SYN-SENT ignores a reset without ACK")
+    var wrong = syn_sent()
+    check(dropped(wrong.feed(&from_b(0, 1002, RST | ACK)), TcpDrop.AckUnsent) &&
+          wrong.out.silent() && wrong.state() == State.SynSent,
+          "SYN-SENT ignores a reset whose ACK is not of the SYN")
+
+    // A reset to a listener does nothing.
+    var l = listening()
+    check(dropped(l.feed(&from_b(9000, 0, RST)), TcpDrop.ResetIgnored) &&
+          l.out.silent() && l.state() == State.Listen, "LISTEN ignores a reset")
+
+    // ABORT: the peer of a synchronized connection is sent a reset.
+    var ab = established()
+    check(taken(ab.table.abort(ab.id, &var ab.out)) &&
+          ab.out.sent_only(&A_RST_1001) && ab.state() == State.Closed,
+          "ABORT resets an established connection")
+    var ab_cw = close_wait()
+    check(taken(ab_cw.table.abort(ab_cw.id, &var ab_cw.out)) &&
+          ab_cw.out.sent_only(&A_RST_1001) && ab_cw.state() == State.Closed,
+          "ABORT resets a connection in CLOSE-WAIT")
+    var ab_sr = syn_received()
+    check(taken(ab_sr.table.abort(ab_sr.id, &var ab_sr.out)) &&
+          ab_sr.out.sent_only(&A_RST_1001), "ABORT resets SYN-RECEIVED")
+    var ab_f1 = fin_wait_1()
+    check(taken(ab_f1.table.abort(ab_f1.id, &var ab_f1.out)) &&
+          ab_f1.out.sent_only(&A_RST_1002), "ABORT resets FIN-WAIT-1 past its FIN")
+    var ab_f2 = fin_wait_2()
+    check(taken(ab_f2.table.abort(ab_f2.id, &var ab_f2.out)) &&
+          ab_f2.out.sent_only(&A_RST_1002), "ABORT resets FIN-WAIT-2")
+    var ab_ss = syn_sent()
+    check(taken(ab_ss.table.abort(ab_ss.id, &var ab_ss.out)) &&
+          ab_ss.out.silent() && ab_ss.state() == State.Closed,
+          "ABORT in SYN-SENT sends nothing")
+    var ab_tw = time_wait()
+    check(taken(ab_tw.table.abort(ab_tw.id, &var ab_tw.out)) &&
+          ab_tw.out.silent() && ab_tw.state() == State.Closed,
+          "ABORT in TIME-WAIT sends nothing")
+    var ab_l = listening()
+    check(taken(ab_l.table.abort(ab_l.id, &var ab_l.out)) &&
+          ab_l.out.silent() && ab_l.state() == State.Closed,
+          "ABORT of a listener")
+
+    // No connection: answered with a reset the sender will accept.
+    var none = Rig.fresh()
+    check(dropped(none.feed(&syn_from_b(None)), TcpDrop.NoConnection) &&
+          none.out.sent_only(&A_RST_ACK_9001),
+          "a SYN to a closed port is reset with ACK of the SYN")
+    check(dropped(none.feed(&from_b(9001, 777, ACK)), TcpDrop.NoConnection) &&
+          none.out.sent_only(&A_RST_777),
+          "an ACK to a closed port is reset at its ACK")
+    check(dropped(none.feed(&from_b(9002, 0, FIN, 10)), TcpDrop.NoConnection) &&
+          none.out.sent_only(&A_RST_ACK_9013),
+          "a reset acknowledges a segment's data and FIN")
+    check(dropped(none.feed(&from_b(9001, 0, RST)), TcpDrop.NoConnection) &&
+          none.out.silent(), "a reset to a closed port is not answered")
+}
+
+// -----------------------------------------------------------------------------
+// Data, counted and acknowledged
+// -----------------------------------------------------------------------------
+
+func data() {
+    var e = established()
+    check(taken(e.feed(&from_b(9001, 1001, ACK, 10))) &&
+          e.out.sent_only(&A_ACK_1001_9011) && e.received() == 10 &&
+          e.state() == State.Established, "ten bytes are counted and acknowledged")
+    check(taken(e.feed(&from_b(9006, 1001, ACK, 10))) &&
+          e.out.sent_only(&A_ACK_1001_9016) && e.received() == 15,
+          "only the new part of an overlapping segment counts")
+    check(dropped(e.feed(&from_b(9001, 1001, ACK, 10)), TcpDrop.OutOfWindow) &&
+          e.out.sent_only(&A_ACK_1001_9016) && e.received() == 15,
+          "data already taken is acknowledged again, not counted")
+    check(dropped(e.feed(&from_b(9100, 1001, ACK, 10)), TcpDrop.OutOfOrder) &&
+          e.out.sent_only(&A_ACK_1001_9016) && e.received() == 15,
+          "data past the next expected is acknowledged with what is expected")
+    var gap_fin = established()
+    check(dropped(gap_fin.feed(&from_b(9002, 1001, FIN | ACK)), TcpDrop.OutOfOrder) &&
+          gap_fin.out.sent_only(&A_ACK_1001_9001) &&
+          gap_fin.state() == State.Established, "a FIN past a gap is not taken")
+    check(taken(e.feed(&from_b(9016, 1001, ACK))) && e.out.silent(),
+          "an ACK alone is not acknowledged")
+    check(taken(e.feed(&from_b(9016, 1000, ACK))) && e.out.silent() &&
+          e.state() == State.Established, "a duplicate ACK is taken and moves nothing")
+
+    var w = established()
+    check(taken(w.feed(&from_b(9001, 1001, ACK, 0, 2048))) && w.window() == 2048,
+          "an acknowledgment updates the send window")
+    check(taken(w.feed(&from_b(9001, 1000, ACK, 0, 100))) && w.window() == 2048,
+          "a duplicate acknowledgment does not")
+    let _ = w.feed(&from_b(9001, 1001, ACK, 10, 2048))
+    check(taken(w.feed(&from_b(9011, 1001, ACK, 0, 3000))) && w.window() == 3000,
+          "a later segment updates the send window")
+    check(taken(w.feed(&from_b(9006, 1001, ACK, 10, 100))) && w.window() == 3000,
+          "an older segment does not")
+    let _ = w.out.silent()
+
+    var f2 = fin_wait_2()
+    check(taken(f2.feed(&from_b(9001, 1002, ACK, 10))) && f2.received() == 10 &&
+          f2.state() == State.FinWait2, "FIN-WAIT-2 still takes data")
+    let _ = f2.out.silent()
+    var cw = close_wait()
+    check(taken(cw.feed(&from_b(9002, 1001, ACK, 10))) && cw.out.silent() &&
+          cw.received() == 0, "CLOSE-WAIT ignores data after the FIN")
+    check(taken(cw.feed(&from_b(9100, 1001, ACK, 10))) && cw.out.silent() &&
+          cw.received() == 0, "CLOSE-WAIT ignores data past a gap, unanswered")
+
+    // Data on the SYN,ACK of an active open is taken with it.
+    var s = syn_sent()
+    var synack = Seg(len: 0, bytes: [0; 64])
+    let h = Header(src_port: 5000, dst_port: 80, seq: 9000, ack: 1001,
+                   flags: SYN | ACK, window: 8192, mss: None)
+    synack.len = tcp.write_segment(&var synack.bytes, ip_b(), ip_a(), &h, 10)
+    check(taken(s.feed(&synack)) && s.out.sent_only(&A_ACK_1001_9011) &&
+          s.received() == 10, "data on a SYN,ACK is taken")
+}
+
+// -----------------------------------------------------------------------------
+// Refusals of segments
+// -----------------------------------------------------------------------------
+
+func refused_segments() {
+    // Malformed: refused before any connection sees them.
+    var e = established()
+    var bad = from_b(9001, 1001, ACK, 10)
+    bad.bytes[25] = bad.bytes[25] ^ 0x01
+    check(dropped(e.feed(&bad), TcpDrop.Checksum) && e.out.silent() &&
+          e.received() == 0, "a bad checksum")
+    var offset = from_b(9001, 1001, ACK)
+    offset.bytes[12] = 0x40
+    check(dropped(e.feed(&offset), TcpDrop.DataOffset) && e.out.silent(),
+          "a bad data offset")
+    let short = from_b(9001, 1001, ACK)
+    check(dropped(e.table.receive(ip_b(), ip_a(), &short.bytes[..19], 0,
+                                  &var e.isn, &var e.out), TcpDrop.Truncated) &&
+          e.out.silent(), "a truncated header")
+    var port0 = Seg(len: 0, bytes: [0; 64])
+    let h = Header(src_port: 0, dst_port: 80, seq: 9000, ack: 0, flags: SYN,
+                   window: 8192, mss: None)
+    port0.len = tcp.write_segment(&var port0.bytes, ip_b(), ip_a(), &h, 0)
+    var l = listening()
+    check(dropped(l.feed(&port0), TcpDrop.BadPort) && l.out.silent(),
+          "a source port of zero")
+    var to0 = Seg(len: 0, bytes: [0; 64])
+    let h0 = Header(src_port: 5000, dst_port: 0, seq: 9000, ack: 0, flags: SYN,
+                    window: 8192, mss: None)
+    to0.len = tcp.write_segment(&var to0.bytes, ip_b(), ip_a(), &h0, 0)
+    check(dropped(l.feed(&to0), TcpDrop.BadPort) && l.out.silent(),
+          "a destination port of zero")
+
+    // Out of the window: answered with an ACK of what is expected.
+    var w = established()
+    let beyond = 9001 + (RECEIVE_WINDOW as UInt32)
+    check(dropped(w.feed(&from_b(beyond, 1001, ACK)), TcpDrop.OutOfWindow) &&
+          w.out.sent_only(&A_ACK_1001_9001) && w.state() == State.Established,
+          "a segment just past the window")
+    check(dropped(w.feed(&from_b(9000, 1001, ACK)), TcpDrop.OutOfWindow) &&
+          w.out.sent_only(&A_ACK_1001_9001), "a segment just before the window")
+    check(taken(w.feed(&from_b(beyond - 1, 1001, ACK))) && w.out.silent(),
+          "an empty segment at the window's last number is in it")
+    check(dropped(w.feed(&from_b(9001 - 10, 1001, ACK, 10)), TcpDrop.OutOfWindow) &&
+          w.out.sent_only(&A_ACK_1001_9001), "data ending just before the window")
+
+    // A reset outside the window: dropped, not answered.
+    var rw = established()
+    check(dropped(rw.feed(&from_b(beyond, 0, RST)), TcpDrop.ResetOutOfWindow) &&
+          rw.out.silent() && rw.state() == State.Established,
+          "a reset just past the window")
+    check(dropped(rw.feed(&from_b(9000, 0, RST)), TcpDrop.ResetOutOfWindow) &&
+          rw.out.silent() && rw.state() == State.Established,
+          "a reset just before the window")
+
+    // An ACK of nothing sent.
+    var ae = established()
+    check(dropped(ae.feed(&from_b(9001, 1002, ACK)), TcpDrop.AckUnsent) &&
+          ae.out.sent_only(&A_ACK_1001_9001) && ae.state() == State.Established,
+          "ESTABLISHED: an ACK past what was sent is answered with an ACK")
+    let st = try! ae.table.status(ae.id)
+    check(st.snd_una == 1001, "and moves nothing")
+    var asr = syn_received()
+    check(dropped(asr.feed(&from_b(9001, 1002, ACK)), TcpDrop.AckUnsent) &&
+          asr.out.sent_only(&A_RST_1002) && asr.state() == State.SynReceived,
+          "SYN-RECEIVED: an ACK past the SYN is reset")
+    check(dropped(asr.feed(&from_b(9001, 1000, ACK)), TcpDrop.AckUnsent) &&
+          asr.out.sent_only(&A_RST_1000) && asr.state() == State.SynReceived,
+          "SYN-RECEIVED: an ACK short of the SYN is reset")
+    var ass = syn_sent()
+    check(dropped(ass.feed(&from_b(9000, 1002, SYN | ACK)), TcpDrop.AckUnsent) &&
+          ass.out.sent_only(&A_RST_1002) && ass.state() == State.SynSent,
+          "SYN-SENT: an ACK past the SYN is reset")
+    check(dropped(ass.feed(&from_b(9000, 1000, SYN | ACK)), TcpDrop.AckUnsent) &&
+          ass.out.sent_only(&A_RST_1000) && ass.state() == State.SynSent,
+          "SYN-SENT: an ACK of the ISS is reset")
+    var al = listening()
+    check(dropped(al.feed(&from_b(9001, 777, ACK)), TcpDrop.AckUnsent) &&
+          al.out.sent_only(&A_RST_777) && al.state() == State.Listen,
+          "LISTEN: any ACK is reset")
+    var af = fin_wait_1()
+    check(dropped(af.feed(&from_b(9001, 1003, ACK)), TcpDrop.AckUnsent) &&
+          af.out.sent_only(&A_ACK_1002_9001) &&
+          af.state() == State.FinWait1, "FIN-WAIT-1: an ACK past the FIN")
+
+    // A reset counts by its own sequence number, not by where its data or
+    // FIN ends.
+    var rd = established()
+    check(dropped(rd.feed(&from_b(9000, 0, RST, 2)), TcpDrop.ResetOutOfWindow) &&
+          rd.out.silent() && rd.state() == State.Established,
+          "a reset before the window, its data reaching into it")
+    check(dropped(rd.feed(&from_b(9000, 0, RST | FIN, 1)),
+                  TcpDrop.ResetOutOfWindow) &&
+          rd.out.silent() && rd.state() == State.Established,
+          "a reset before the window, its FIN reaching into it")
+
+    // A SYN before the window, its data or FIN reaching in, is trimmed off.
+    var sd = established()
+    check(taken(sd.feed(&from_b(9000, 1001, SYN | ACK, 2))) &&
+          sd.out.sent_only(&A_ACK_1001_9003) && sd.received() == 2 &&
+          sd.state() == State.Established,
+          "an old SYN's data is taken and the SYN ignored")
+    var sf = established()
+    check(taken(sf.feed(&from_b(9000, 1001, SYN | FIN | ACK))) &&
+          sf.out.sent_only(&A_ACK_1001_9002) && sf.state() == State.CloseWait,
+          "an old SYN's FIN is taken and the SYN ignored")
+
+    // In SYN-RECEIVED a SYN at the peer's ISN with RST is a reset, not a SYN
+    // again.
+    var sr = syn_received()
+    check(dropped(sr.feed(&from_b(9000, 0, SYN | RST)), TcpDrop.ResetOutOfWindow) &&
+          sr.out.silent() && sr.state() == State.SynReceived,
+          "SYN,RST at the peer's ISN is not answered with SYN,ACK")
+
+    // A segment for any other four addresses is not this connection's.
+    var t = syn_sent()
+    var synack = Seg(len: 0, bytes: [0; 64])
+    let sh = Header(src_port: 5000, dst_port: 80, seq: 9000, ack: 1001,
+                    flags: SYN | ACK, window: 8192, mss: None)
+    synack.len = tcp.write_segment(&var synack.bytes, ip_b(), ip_a(), &sh, 0)
+    let _ = t.feed(&synack)
+    let _ = t.out.silent()
+    let other_ip = SocketAddr(addr: Ipv4Addr(a: 10, b: 0, c: 0, d: 3), port: 80)
+    check(dropped(t.feed_between(end_b(), other_ip, 9001, 1001, RST | ACK),
+                  TcpDrop.NoConnection) && t.state() == State.Established,
+          "a reset to another local address")
+    let other_port = SocketAddr(addr: ip_a(), port: 81)
+    check(dropped(t.feed_between(end_b(), other_port, 9001, 1001, RST | ACK),
+                  TcpDrop.NoConnection) && t.state() == State.Established,
+          "a reset to another local port")
+    let other_peer = SocketAddr(addr: Ipv4Addr(a: 10, b: 0, c: 0, d: 4),
+                                port: 5000)
+    check(dropped(t.feed_between(other_peer, end_a(), 9001, 1001, RST | ACK),
+                  TcpDrop.NoConnection) && t.state() == State.Established,
+          "a reset from another remote address")
+    let other_peer_port = SocketAddr(addr: ip_b(), port: 5001)
+    check(dropped(t.feed_between(other_peer_port, end_a(), 9001, 1001, RST | ACK),
+                  TcpDrop.NoConnection) && t.state() == State.Established &&
+          t.out.silent(), "a reset from another remote port")
+
+    // A SYN in ESTABLISHED, in the window: the connection is reset.
+    var se = established()
+    check(dropped(se.feed(&from_b(9001, 0, SYN)), TcpDrop.UnexpectedSyn) &&
+          se.out.sent_only(&A_RST_ACK_9002) && se.state() == State.Closed,
+          "a SYN in ESTABLISHED")
+    var sa = established()
+    check(dropped(sa.feed(&from_b(9001, 1001, SYN | ACK)), TcpDrop.UnexpectedSyn) &&
+          sa.out.sent_only(&A_RST_1001) && sa.state() == State.Closed,
+          "a SYN,ACK in ESTABLISHED is reset at its ACK")
+    var so = established()
+    check(dropped(so.feed(&from_b(9000, 0, SYN)), TcpDrop.OutOfWindow) &&
+          so.out.sent_only(&A_ACK_1001_9001) && so.state() == State.Established,
+          "a SYN before the window is answered with an ACK")
+    var sp = syn_received()
+    check(dropped(sp.feed(&from_b(9005, 0, SYN)), TcpDrop.UnexpectedSyn) &&
+          sp.out.silent() && sp.state() == State.Closed &&
+          sp.table.state(sp.listener) == State.Listen,
+          "a new SYN in a spawned SYN-RECEIVED frees it unanswered")
+
+    // No ACK on a synchronized connection; no SYN where one is needed.
+    var na = established()
+    check(dropped(na.feed(&from_b(9001, 0, 0, 10)), TcpDrop.NoAck) &&
+          na.out.silent() && na.received() == 0, "data without ACK")
+    var ns = syn_sent()
+    check(dropped(ns.feed(&from_b(9000, 0, 0)), TcpDrop.NoSyn) && ns.out.silent() &&
+          ns.state() == State.SynSent, "SYN-SENT: neither SYN nor RST")
+    var nl = listening()
+    check(dropped(nl.feed(&from_b(9000, 0, FIN)), TcpDrop.NoSyn) &&
+          nl.out.silent() && nl.state() == State.Listen,
+          "LISTEN: neither SYN, ACK nor RST")
+
+    // A full table: the SYN is dropped, and the peer will repeat it.
+    var full = listening()
+    var port: UInt16 = 81
+    while port < 80 + (CONNECTIONS as UInt16) {
+        let _ = try! full.table.listen(port)
+        port = port + 1
+    }
+    check(dropped(full.feed(&syn_from_b(None)), TcpDrop.TableFull) &&
+          full.out.silent() && full.table.find(end_a(), end_b()) == None,
+          "a SYN with every slot in use")
+}
+
+// -----------------------------------------------------------------------------
+// Refusals of calls
+// -----------------------------------------------------------------------------
+
+func open_refused(r: Result<ConnId, OpenError>, reason: OpenError) -> Bool {
+    match r {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+func call_refused(r: Result<Void, CallError>, reason: CallError) -> Bool {
+    match r {
+        case Err(e) -> e == reason,
+        case Ok(_) -> false,
+    }
+}
+
+func refused_calls() {
+    var r = Rig.fresh()
+    check(open_refused(r.table.listen(0), OpenError.BadAddress), "listen on port 0")
+    let _ = try! r.table.listen(80)
+    check(open_refused(r.table.listen(80), OpenError.InUse), "a second listener")
+    let nowhere = SocketAddr(addr: Ipv4Addr.unspecified(), port: 5000)
+    check(open_refused(r.table.connect(end_a(), nowhere, &var r.isn, &var r.out),
+                       OpenError.BadAddress), "connect to 0.0.0.0")
+    let port0 = SocketAddr(addr: ip_b(), port: 0)
+    check(open_refused(r.table.connect(end_a(), port0, &var r.isn, &var r.out),
+                       OpenError.BadAddress), "connect to port 0")
+    let from0 = SocketAddr(addr: ip_a(), port: 0)
+    check(open_refused(r.table.connect(from0, end_b(), &var r.isn, &var r.out),
+                       OpenError.BadAddress), "connect from port 0")
+    let _ = try! r.table.connect(end_a(), end_b(), &var r.isn, &var r.out)
+    check(open_refused(r.table.connect(end_a(), end_b(), &var r.isn, &var r.out),
+                       OpenError.InUse), "a second connection on four addresses")
+    check(r.out.sent_only(&A_SYN), "only the first SYN went out")
+    var i = 2
+    while i < CONNECTIONS {
+        let other = SocketAddr(addr: ip_b(), port: (6000 + i) as UInt16)
+        let _ = try! r.table.connect(end_a(), other, &var r.isn, &var r.out)
+        i = i + 1
+    }
+    let one_more = SocketAddr(addr: ip_b(), port: 7000)
+    check(open_refused(r.table.connect(end_a(), one_more, &var r.isn, &var r.out),
+                       OpenError.Full), "connect with every slot in use")
+    check(open_refused(r.table.listen(81), OpenError.Full),
+          "listen with every slot in use")
+
+    var c = syn_sent()
+    let not_listener = c.table.connect_listener(c.id, ip_a(), end_b(), &var c.isn,
+                                                &var c.out)
+    check(match not_listener {
+              case Err(e) -> e == OpenError.NotListening, case Ok(_) -> false },
+          "SEND to a connection that is not a listener")
+    var gone = listening()
+    let _ = gone.table.close(gone.id, &var gone.out)
+    let _ = try! gone.table.listen(80)
+    let stale = gone.table.connect_listener(gone.id, ip_a(), end_b(),
+                                            &var gone.isn, &var gone.out)
+    check(match stale {
+              case Err(e) -> e == OpenError.NotListening, case Ok(_) -> false } &&
+          gone.out.silent(), "SEND to a listener that was closed")
+    var dup = syn_received()
+    let in_use = dup.table.connect_listener(dup.listener, ip_a(), end_b(),
+                                            &var dup.isn, &var dup.out)
+    check(match in_use { case Err(e) -> e == OpenError.InUse, case Ok(_) -> false } &&
+          dup.table.state(dup.listener) == State.Listen && dup.out.silent(),
+          "SEND from a listener to addresses in use")
+
+    var f = fin_wait_1()
+    check(call_refused(f.table.close(f.id, &var f.out), CallError.Closing) &&
+          f.out.silent(), "CLOSE while closing")
+    var t = time_wait()
+    check(call_refused(t.table.close(t.id, &var t.out), CallError.Closing),
+          "CLOSE in TIME-WAIT")
+    var free = Rig.fresh()
+    check(call_refused(free.table.close(free.id, &var free.out),
+                       CallError.NoConnection), "CLOSE of an ended listener")
+    check(call_refused(free.table.abort(free.id, &var free.out),
+                       CallError.NoConnection), "ABORT of an ended listener")
+    check(free.table.state(free.id) == State.Closed, "an ended listener is CLOSED")
+    check(match free.table.status(free.id) {
+              case Err(e) -> e == CallError.NoConnection, case Ok(_) -> false },
+          "the status of an ended listener")
+
+    // An id names one occupant of its slot: once the slot is taken again, a
+    // call on the old id reaches nothing.
+    var reused = syn_sent()
+    let old = reused.id
+    let _ = reused.table.abort(old, &var reused.out)
+    let fresh = try! reused.table.connect(end_a(), end_b(), &var reused.isn,
+                                          &var reused.out)
+    let _ = reused.out.silent()
+    check(fresh != old, "a reused slot's id is new")
+    let closed = reused.table.close(old, &var reused.out)
+    let aborted = reused.table.abort(old, &var reused.out)
+    check(call_refused(closed, CallError.NoConnection) &&
+          call_refused(aborted, CallError.NoConnection) &&
+          reused.table.state(old) == State.Closed &&
+          reused.table.state(fresh) == State.SynSent && reused.out.silent(),
+          "a stale id cannot close the slot's next connection")
+    check(match reused.table.status(old) {
+              case Err(e) -> e == CallError.NoConnection, case Ok(_) -> false },
+          "a stale id has no status")
+}
+
+// -----------------------------------------------------------------------------
+// Sequence numbers across zero
+// -----------------------------------------------------------------------------
+
+func wraparound() {
+    check(seq_lt(0xFFFF_FFFF, 0) && not seq_lt(0, 0xFFFF_FFFF) &&
+          seq_lt(1, 2) && not seq_lt(2, 2) && seq_le(2, 2) &&
+          seq_lt(0x7FFF_FFFF, 0x8000_0000) && seq_le(0xFFFF_FFF0, 5),
+          "sequence order wraps")
+    var r = Rig.fresh()
+    r.isn = FixedIsn.of(0xFFFF_FFFF)
+    r.id = try! r.table.connect(end_a(), end_b(), &var r.isn, &var r.out)
+    check(r.out.sent_only(&A_SYN_WRAP), "a SYN at the last number")
+    let synack = from_b(0xFFFF_FFF8, 0, SYN | ACK)
+    check(taken(r.feed(&synack)) && r.out.sent_only(&A_ACK_WRAP) &&
+          r.state() == State.Established, "its SYN,ACK acknowledges zero")
+    check(taken(r.feed(&from_b(0xFFFF_FFF9, 0, ACK, 16))) &&
+          r.out.sent_only(&A_ACK_WRAP_DATA) && r.received() == 16,
+          "data across zero is counted and acknowledged")
+    check(dropped(r.feed(&from_b(0xFFFF_FFF0, 0, RST)), TcpDrop.ResetOutOfWindow) &&
+          r.state() == State.Established, "a reset before zero is outside")
+}
+
+// -----------------------------------------------------------------------------
+// Two tables
+// -----------------------------------------------------------------------------
+
+/// One end of a conversation between two tables.
+struct End {
+    table: Table,
+    out: Recorder,
+    isn: FixedIsn,
+}
+
+/// Delivers what `sent` holds to `to`, in order, at `now`, and empties it.
+func deliver(sent: &var Recorder, to: &var End, now: UInt64) {
+    var i = 0
+    while i < sent.count {
+        let _ = to.table.receive(sent.src[i], sent.dst[i],
+                                 &sent.bytes[i][..sent.lens[i]], now,
+                                 &var to.isn, &var to.out)
+        i = i + 1
+    }
+    sent.count = 0
+}
+
+func pair() {
+    var a = End(table: Table.empty(), out: Recorder.fresh(),
+                isn: FixedIsn.of(1000))
+    var b = End(table: Table.empty(), out: Recorder.fresh(),
+                isn: FixedIsn.of(9000))
+    let a_end = SocketAddr(addr: ip_a(), port: 80)
+    let b_end = SocketAddr(addr: ip_b(), port: 5000)
+
+    // The simultaneous open: both SYNs cross, each answers with SYN,ACK.
+    let ia = try! a.table.connect(a_end, b_end, &var a.isn, &var a.out)
+    let ib = try! b.table.connect(b_end, a_end, &var b.isn, &var b.out)
+    var a_syn = a.out
+    var b_syn = b.out
+    a.out.count = 0
+    b.out.count = 0
+    deliver(&var a_syn, &var b, 0)
+    deliver(&var b_syn, &var a, 0)
+    check(a.table.state(ia) == State.SynReceived &&
+          b.table.state(ib) == State.SynReceived, "both SYN-RECEIVED")
+    var a_synack = a.out
+    var b_synack = b.out
+    a.out.count = 0
+    b.out.count = 0
+    deliver(&var a_synack, &var b, 0)
+    deliver(&var b_synack, &var a, 0)
+    check(a.table.state(ia) == State.Established &&
+          b.table.state(ib) == State.Established && a.out.count == 0 &&
+          b.out.count == 0, "both ESTABLISHED, with nothing more to send")
+
+    // The simultaneous close: both FINs cross, each acknowledges the other.
+    let _ = a.table.close(ia, &var a.out)
+    let _ = b.table.close(ib, &var b.out)
+    var a_fin = a.out
+    var b_fin = b.out
+    a.out.count = 0
+    b.out.count = 0
+    deliver(&var a_fin, &var b, 10)
+    deliver(&var b_fin, &var a, 10)
+    check(a.table.state(ia) == State.Closing && b.table.state(ib) == State.Closing,
+          "both CLOSING")
+    deliver(&var a.out, &var b, 20)
+    deliver(&var b.out, &var a, 20)
+    check(a.table.state(ia) == State.TimeWait &&
+          b.table.state(ib) == State.TimeWait, "both TIME-WAIT")
+    a.table.poll(20 + TIME_WAIT_MS)
+    b.table.poll(20 + TIME_WAIT_MS)
+    check(a.table.state(ia) == State.Closed && b.table.state(ib) == State.Closed,
+          "both CLOSED")
+
+    // The ordinary open and close, A listening and B connecting.
+    let la = try! a.table.listen(80)
+    let ib2 = try! b.table.connect(b_end, a_end, &var b.isn, &var b.out)
+    deliver(&var b.out, &var a, 30)
+    deliver(&var a.out, &var b, 30)
+    deliver(&var b.out, &var a, 30)
+    let ia2 = a.table.find(a_end, b_end)!
+    check(a.table.state(ia2) == State.Established &&
+          b.table.state(ib2) == State.Established &&
+          a.table.state(la) == State.Listen, "the three-way handshake")
+    let _ = b.table.close(ib2, &var b.out)
+    deliver(&var b.out, &var a, 40)
+    deliver(&var a.out, &var b, 40)
+    check(a.table.state(ia2) == State.CloseWait &&
+          b.table.state(ib2) == State.FinWait2, "the first FIN")
+    let _ = a.table.close(ia2, &var a.out)
+    deliver(&var a.out, &var b, 50)
+    deliver(&var b.out, &var a, 50)
+    check(a.table.state(ia2) == State.Closed &&
+          b.table.state(ib2) == State.TimeWait, "the second FIN")
+}
+
+func main() {
+    opening()
+    closing_transitions()
+    resets()
+    data()
+    refused_segments()
+    refused_calls()
+    wraparound()
+    pair()
+}

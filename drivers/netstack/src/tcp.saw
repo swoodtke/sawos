@@ -1,0 +1,306 @@
+//! TCP segments (RFC 9293 §3.1): the header with its pseudo-header checksum,
+//! and its options.
+//!
+//! ```text
+//! offset  bytes  field
+//! 0       2      source port
+//! 2       2      destination port
+//! 4       4      sequence number
+//! 8       4      acknowledgment number
+//! 12      1      data offset in words (high nibble), reserved (low)
+//! 13      1      flags: CWR ECE URG ACK PSH RST SYN FIN, high bit first
+//! 14      2      window
+//! 16      2      checksum
+//! 18      2      urgent pointer
+//! 20             options, to the data offset; then data
+//! ```
+//!
+//! The checksum covers a pseudo-header (source and destination address, a
+//! zero byte, the protocol and the segment's length), the header and the
+//! data, and is always present.
+//!
+//! The one option sent is the maximum segment size, on a SYN only. A received
+//! one is read only from a SYN (RFC 9293 §3.7.1). Every other option, window
+//! scale, SACK-permitted and timestamps among them, is stepped over by its
+//! length and never offered, so a peer does not use it (RFC 7323 §1.3, RFC
+//! 2018 §2). The urgent pointer is sent as zero and ignored.
+
+import netstack.addr.{Ipv4Addr}
+import netstack.bytes.{
+    be16, be32, checksum, put16, put32, sum16, sum_word, verifies,
+}
+import netstack.ether.{MTU}
+import netstack.ipv4
+
+/// The header's bytes without options: the least a header has.
+public static HEADER_BYTES: Int = 20
+
+/// The most a header has: a data offset of fifteen words.
+public static MAX_HEADER_BYTES: Int = 60
+
+/// The flag bits of byte 13.
+public static FIN: UInt8 = 0x01
+public static SYN: UInt8 = 0x02
+public static RST: UInt8 = 0x04
+public static PSH: UInt8 = 0x08
+public static ACK: UInt8 = 0x10
+public static URG: UInt8 = 0x20
+
+/// The option kinds the parser knows by name: the end of the list, a pad,
+/// and the maximum segment size, whose length is `MSS_OPTION_BYTES`.
+public static OPTION_END: UInt8 = 0
+public static OPTION_NOP: UInt8 = 1
+public static OPTION_MSS: UInt8 = 2
+public static MSS_OPTION_BYTES: Int = 4
+
+/// The segment size a peer that sends no option is taken to accept (RFC 9293
+/// §3.7.1).
+public static DEFAULT_MSS: UInt16 = 536
+
+/// The segment size this stack offers: the link's MTU less the IPv4 and TCP
+/// headers, neither with options.
+public static OFFERED_MSS: UInt16 = (
+    MTU - ipv4.HEADER_BYTES - HEADER_BYTES) as UInt16
+
+/// Why a segment was not taken as it came: dropped, or a control that ended
+/// its connection. Raw-backed so each reason has a stable index into a count.
+public enum TcpDrop: UInt8 {
+    /// A segment shorter than the fixed header.
+    case Truncated = 0,
+    /// A segment longer than the 16 bits of the pseudo-header's length.
+    case Oversize = 1,
+    /// A data offset under five words, or past the segment.
+    case DataOffset = 2,
+    /// A checksum that does not verify.
+    case Checksum = 3,
+    /// An option with no length byte, a length under two, a length past
+    /// the header, or a maximum segment size whose length is not four.
+    case BadOption = 4,
+    /// A source or destination port of zero.
+    case BadPort = 5,
+    /// No connection and no listener for the segment. Unless it is a reset
+    /// it is answered with one.
+    case NoConnection = 6,
+    /// A SYN for a listener while every connection is in use.
+    case TableFull = 7,
+    /// A sequence number outside the receive window. It is answered with an
+    /// acknowledgment of what is expected.
+    case OutOfWindow = 8,
+    /// A reset whose sequence number is outside the receive window.
+    case ResetOutOfWindow = 9,
+    /// A reset that resets nothing: to a listener, or in SYN-SENT without an
+    /// acknowledgment of the SYN.
+    case ResetIgnored = 10,
+    /// An acknowledgment of a sequence number not sent: past what was sent,
+    /// or, before the SYN is acknowledged, not of the SYN.
+    case AckUnsent = 11,
+    /// A segment without ACK on a synchronized connection.
+    case NoAck = 12,
+    /// A segment with neither SYN nor RST to a listener, or with neither to
+    /// a connection in SYN-SENT.
+    case NoSyn = 13,
+    /// A SYN inside the window of a synchronized connection, which ends it.
+    case UnexpectedSyn = 14,
+    /// Data or a FIN past the next sequence number expected, in the window:
+    /// it is acknowledged with what is expected and not kept.
+    case OutOfOrder = 15,
+    /// A reset that was accepted: it ended its connection.
+    case Reset = 16,
+}
+
+@synthesize
+extension TcpDrop: Equatable {}
+
+extension TcpDrop {
+    /// What a transcript should call this reason.
+    public func describe(&self) -> String {
+        match self {
+            case Truncated -> "tcp truncated",
+            case Oversize -> "tcp oversize",
+            case DataOffset -> "tcp data offset",
+            case Checksum -> "tcp checksum",
+            case BadOption -> "tcp bad option",
+            case BadPort -> "tcp port zero",
+            case NoConnection -> "tcp no connection",
+            case TableFull -> "tcp table full",
+            case OutOfWindow -> "tcp out of window",
+            case ResetOutOfWindow -> "tcp reset out of window",
+            case ResetIgnored -> "tcp reset ignored",
+            case AckUnsent -> "tcp ack of unsent",
+            case NoAck -> "tcp no ack",
+            case NoSyn -> "tcp no syn",
+            case UnexpectedSyn -> "tcp unexpected syn",
+            case OutOfOrder -> "tcp out of order",
+            case Reset -> "tcp reset",
+        }
+    }
+}
+
+extension TcpDrop: Printable {
+    public func format(&self, into: &var StringBuilder) {
+        try! into.append(self.describe())
+    }
+}
+
+/// A segment's header fields, as received or to be sent.
+public struct Header {
+    public src_port: UInt16,
+    public dst_port: UInt16,
+    public seq: UInt32,
+    public ack: UInt32,
+    /// The flag bits, `FIN` to `URG` and the two above them.
+    public flags: UInt8,
+    public window: UInt16,
+    /// The maximum segment size option. A received one is kept only from a
+    /// SYN.
+    public mss: UInt16?,
+}
+
+@synthesize
+extension Header: Equatable {}
+
+extension Header {
+    /// Whether every bit of `flag` is set.
+    public func has(&self, flag: UInt8) -> Bool {
+        (self.flags & flag) == flag
+    }
+
+    /// The bytes this header is sent in: the fixed header, and the maximum
+    /// segment size option when there is one.
+    public func header_bytes(&self) -> Int {
+        if self.mss != None {
+            HEADER_BYTES + MSS_OPTION_BYTES
+        } else {
+            HEADER_BYTES
+        }
+    }
+}
+
+/// The longest segment: its length is 16 bits in the pseudo-header.
+public static MAX_SEGMENT_BYTES: Int = 65535
+
+/// The pseudo-header's part of the checksum (RFC 9293 §3.1), for a segment
+/// of at most `MAX_SEGMENT_BYTES`.
+public func pseudo_sum(src: Ipv4Addr, dst: Ipv4Addr, length: Int) -> UInt32 {
+    var sum: UInt32 = 0
+    sum = sum_word(sum, (src.value >> 16) as UInt16)
+    sum = sum_word(sum, (src.value & 0xFFFF) as UInt16)
+    sum = sum_word(sum, (dst.value >> 16) as UInt16)
+    sum = sum_word(sum, (dst.value & 0xFFFF) as UInt16)
+    sum = sum_word(sum, (ipv4.Protocol.Tcp as UInt8) as UInt16)
+    sum_word(sum, length as UInt16)
+}
+
+/// A received segment: its header, and where its data lies. Only parsing
+/// makes one, so the data's bounds are ones the segment was checked to hold.
+public struct Received {
+    public header: Header,
+    /// Where the data starts: the data offset in bytes.
+    private data_from: Int,
+    /// Where the data ends: the segment's length.
+    private data_to: Int,
+}
+
+extension Received {
+    /// The segment `segment`, the whole IP payload of a datagram from `src` to
+    /// `dst`, or why it is refused.
+    public init(segment: &[UInt8], src: Ipv4Addr,
+                dst: Ipv4Addr) -> Result<Received, TcpDrop> {
+        let received = segment.len()
+        if received < HEADER_BYTES {
+            return TcpDrop.Truncated
+        }
+        if received > MAX_SEGMENT_BYTES {
+            return TcpDrop.Oversize
+        }
+        let header_bytes = ((segment[12] >> 4) as Int) * 4
+        if header_bytes < HEADER_BYTES || header_bytes > received {
+            return TcpDrop.DataOffset
+        }
+        if not verifies(sum16(pseudo_sum(src, dst, received), &segment)) {
+            return TcpDrop.Checksum
+        }
+        let flags = segment[13]
+        let mss = try read_options(&segment[HEADER_BYTES..header_bytes],
+                                   (flags & SYN) != 0)
+        let header = Header(src_port: be16(&segment, 0),
+                            dst_port: be16(&segment, 2),
+                            seq: be32(&segment, 4), ack: be32(&segment, 8),
+                            flags: flags, window: be16(&segment, 14), mss: mss)
+        return Received(header: header, data_from: header_bytes,
+                        data_to: received)
+    }
+
+    /// Where the data starts in the segment.
+    public func data_at(&self) -> Int {
+        self.data_from
+    }
+
+    /// The data's bytes.
+    public func data_bytes(&self) -> Int {
+        self.data_to - self.data_from
+    }
+}
+
+/// The maximum segment size `options` carries, read only when `syn`, or
+/// `None`; or why the options are malformed. Each option but the end of the
+/// list and a pad states its length, and the walk steps over the ones it
+/// does not use by it.
+func read_options(options: &[UInt8], syn: Bool) -> Result<UInt16?, TcpDrop> {
+    var mss: UInt16? = None
+    var i = 0
+    let n = options.len()
+    while i < n {
+        let kind = options[i]
+        if kind == OPTION_END {
+            break
+        }
+        if kind == OPTION_NOP {
+            i = i + 1
+            continue
+        }
+        if i + 1 >= n {
+            return TcpDrop.BadOption
+        }
+        let length = options[i + 1] as Int
+        if length < 2 || i + length > n {
+            return TcpDrop.BadOption
+        }
+        if kind == OPTION_MSS {
+            if length != MSS_OPTION_BYTES {
+                return TcpDrop.BadOption
+            }
+            if syn {
+                mss = be16(&options, i + 2)
+            }
+        }
+        i = i + length
+    }
+    return mss
+}
+
+/// Writes `header` at the front of `segment`, whose data of `data_bytes` is
+/// already in place after it (`Header.header_bytes`), with the checksum for
+/// a segment from `src` to `dst`. Answers the segment's length.
+public func write_segment(segment: &var [UInt8], src: Ipv4Addr, dst: Ipv4Addr,
+                          header: &Header, data_bytes: Int) -> Int {
+    let header_bytes = header.header_bytes()
+    put16(&var segment, 0, header.src_port)
+    put16(&var segment, 2, header.dst_port)
+    put32(&var segment, 4, header.seq)
+    put32(&var segment, 8, header.ack)
+    segment[12] = ((header_bytes / 4) as UInt8) << 4
+    segment[13] = header.flags
+    put16(&var segment, 14, header.window)
+    put16(&var segment, 16, 0)
+    put16(&var segment, 18, 0)
+    if let mss = header.mss {
+        segment[20] = OPTION_MSS
+        segment[21] = MSS_OPTION_BYTES as UInt8
+        put16(&var segment, 22, mss)
+    }
+    let length = header_bytes + data_bytes
+    let sum = checksum(sum16(pseudo_sum(src, dst, length), &segment[..length]))
+    put16(&var segment, 16, sum)
+    length
+}
