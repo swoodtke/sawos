@@ -3,7 +3,14 @@
 Revision 3, Nov 26. A design only: nothing here is built until the owner and
 the reviewer have read it.
 
-**Changes in this edit (3.1)**, from the owner's answers to revision 3:
+**Changes in edit 3.2**, for the reviewer's thread 8: the watchdog no longer
+measures the console's syscalls, which a claimant looping in syscalls keeps
+moving. It asks whether the console connection has had a message taken since
+its last wake, from a `taken` count on the pipe that root reads through its
+inlet with a new `PipeInletOp.Taken` (§4.6). Dropping the measure instead
+would kill a healthy driver whose root line waits behind other clients'.
+
+**Changes in edit 3.1**, from the owner's answers to revision 3:
 killing a stalled console checked every second stands; `Lost` and `Garbled`
 stay two statuses carrying every count; the watchdog runs at root's `Rt1`
 (level 5), given by a realtime-band word in root's image header that only
@@ -637,13 +644,69 @@ root's oldest line unanswered. Root runs a second thread at its `Rt1` band,
 level 5, above the driver's `Rt0` (level 4 under its full map); the next
 paragraphs say how root gets that level. It sleeps on a periodic
 Timer of `CONSOLE_STALL_PERIOD` (1 s) only while root has a line
-unanswered. At each wake it reads the console process's `Stats` [read
-spec.md:2195-2198]. When the oldest unanswered line is the same as at the
-previous wake and the process's syscall count has not moved since, two wakes
-in a row, the console is stalled. Root kills it with the code
+unanswered. Its question at each wake is "has the console's process taken a
+message from the console connection since the last wake?", read from a count
+the kernel keeps (below). When the oldest unanswered line is the same as at
+the previous wake and the count has not moved since, two wakes in a row, the
+console is stalled. Root kills it with the code
 `CONSOLE_STALLED`; the teardown ends the claim, and root writes `root:
 console stalled, killed` and its held lines through the debug print. Killing
 it, checked every second, is the owner's ruling.
+
+**The count: messages taken from the connection.**
+
+- **Where it lives.** A `taken` word on the connection's row, `PipeSlot`
+  [read kernel/core/objects.saw:2088-2108], added by one each time a staged
+  message is handed over. Both ways a message leaves the staged list, the
+  `Take` op and a delivery under a consuming attach, go through one function,
+  `stage_pop` [read objects.saw:2586-2593; its two callers,
+  kernel/core/dispatch.saw:4934 and kernel/core/refs.saw:1608], so it is one
+  line in one place. It wraps, and a reader compares two readings for
+  equality only.
+- **How root reads it.** A new op on the client end, `PipeInletOp.Taken = 2`
+  after `Post` and `Call` [read kernel/abi/src/ops.saw:1017-1018], gated by
+  `PipeInletRight.Post`: a poster may learn how far the server has taken, and
+  root's inlet is minted with `Post` (§12's client mint [read
+  spec.md:5410-5412]). It answers the word as its value.
+- **Why not a `Stats` column.** `Stats` answers a published four-doubleword
+  record [read spec.md:2195-2198], so a fifth column changes a record every
+  reader sizes, and it would count takes from every outlet the process holds.
+  The pipe's word counts exactly the console connection, and root reads it
+  through the inlet it already holds.
+
+**The bound that makes two periods safe.** While root's line waits and
+anything is staged, a healthy driver goes without taking only while intake
+is paused (§3): behind a held `Write`, until its remainder fits, or with
+`MAX_SYNCS` waiting, until the oldest `Sync`'s mark passes. Either ends once
+the wire has carried what is ahead of it, at most the ring and the FIFO:
+`TX_RING_BYTES + 128` = 1,152 bytes, 100 ms at 115200 (10 bits a byte), the
+slowest rate any console key gives [read hal/xtensa-esp32s3/board.toml:155-157].
+Two periods are 2 s, twenty times that.
+
+**A `Write` held longer than a period cannot happen to a healthy driver.** A
+held `Write`'s remainder is at most 127 bytes (`MAX_PAYLOAD` [read
+drivers/uartproto/src/lib.saw:132]), and room for it appears as the FIFO takes
+from the ring at the wire's rate, at least 96 bytes a top-up (§3). So a hold
+lasts at most the wire time of the ring and FIFO ahead of it, the same 100 ms.
+A hold longer than two periods means the transmit interrupt is not coming, and
+killing that claimant is right.
+
+**The cases** (period fixed at the default, no duration asserted):
+
+- **`console_stall_looping`.** The test claimant takes one message and then
+  loops in syscalls (a yield and a `Stats` read each turn), taking nothing; a
+  client exits. Expected: root's watchdog kills it, and root's lines arrive
+  through the debug print. Red: a watchdog that measured syscalls, which this
+  claimant keeps moving.
+- **`console_backpressure_kept`.** On the S3 smoke, with `uartconfig`'s hold
+  config (16-byte ring, 8-byte fill cap) and the serving band lowered as in
+  `uart_s3_backpressure`, several clients flood while one exits. Root's line
+  waits behind theirs, the driver holds `Write` after `Write`, and every hold
+  ends at the next top-up. Expected: every line, root's `ended` line among
+  them, and no `console stalled` line. Red: a watchdog that killed a driver
+  under back-pressure. The emulator transmits at once, so this case holds
+  that the count moves under holds; the 100 ms bound itself is the part's,
+  checked in B1's paste.
 
 **How root's realtime bands get above the driver.**
 
@@ -686,20 +749,20 @@ it, checked every second, is the owner's ruling.
   a toolchain pin bump before U0b; the kernel's half is a few lines in U0.
 
 - **Why the test is sound.** The driver runs above every thread but the
-  watchdog, so a driver able to run takes root's staged message before
-  anything below it runs. One whose syscall count stands still across two
-  whole periods, with root's line waiting, is blocked on something that is
-  not coming, or spinning: a spinner makes no syscalls and starves everything
-  below `Rt0`, which is why the watchdog sits above it.
-- **A healthy driver keeps moving.** Holding a `Write` while the wire
-  drains, it makes a syscall at every top-up, at most 32 byte times apart
-  (2.8 ms at 115200), far inside the period. On the emulator it never waits
-  on the wire at all (§6).
+  watchdog, so a driver able to take root's staged message takes it, or
+  another ahead of it, before anything below runs. A claimant that takes
+  nothing across two whole periods, with root's line waiting, is stalled,
+  whether it is blocked, spinning, or looping in syscalls; the count does not
+  care which. A spinner starves everything below `Rt0`, which is why the
+  watchdog sits above it.
+- **What it does not see.** A claimant that takes messages and answers them
+  `Ok` without writing a byte. No count in the kernel can see the wire, and
+  this design does not try.
 - **The residue.** The period is the guest clock, which follows host time. A
   false kill needs the host to stall across a whole period inside the few
-  instructions between the watchdog's block and the driver's next syscall,
-  twice in a row; I name it rather than claim it cannot happen. A claimant
-  that stalls while root has nothing to print goes unnoticed until root next
+  instructions between the watchdog's block and the driver's next take, twice
+  in a row; I name it rather than claim it cannot happen. A claimant that
+  stalls while root has nothing to print goes unnoticed until root next
   prints, which is at the next death, the moment it matters.
 
 **In an image whose console is `svc-console`**, nothing claims, root's debug
@@ -1059,6 +1122,10 @@ hand-written root, no driver; these are the kernel's own cases):
 - **`console_stall`.** A test claimant (`tests/console-staller`) that
   claims, takes one message and stops taking, with a stock root naming it as
   the console. The same expectations as `uart_s3_stall`, on every profile.
+- **`console_stall_looping`** and, on the S3 smoke,
+  **`console_backpressure_kept`**: the watchdog's two edges, a claimant
+  looping in syscalls without taking (killed) and a healthy driver under
+  back-pressure (kept); §4.6 has both.
 - **`death_record`.** No claim. Root reads the record of children that exit,
   are killed, fault on a syscall, trap, panic (a 300-byte text) and wait on a
   lock another child owns, and prints every field. Each record reads
@@ -1122,8 +1189,8 @@ In order; sizes are rough.
 
 | unit | what | size |
 |---|---|---|
-| U0 | the kernel: `SystemOp.ConsoleClaim`/`ConsoleRelease`, `SystemRight.Console`, `SosStatus.Claimed`; the console under the claim (held lines, the refused debug print, the returned line, `hal.console_reclaim` and each HAL's console line on every stop); the death record and `ProcessOp.Death`, the panic text kept in it; root's panic, faults and kill as kernel panics; `sos` wrappers; the cases `console_claim` and `death_record` on every profile | L |
-| U0b | root and the builder: `console` as a System record right granted only to the image's console, and its refusals; the plan's inlet for root; root's non-parking console writer, its record printing, its watchdog thread at `Rt1` and its manifest's `rt0` to `rt3`; `svc-console`'s `EXIT_CLAIMED`; `tests/console-staller` and `console_stall` | M |
+| U0 | the kernel: `SystemOp.ConsoleClaim`/`ConsoleRelease`, `SystemRight.Console`, `SosStatus.Claimed`; the console under the claim (held lines, the refused debug print, the returned line, `hal.console_reclaim` and each HAL's console line on every stop); the death record and `ProcessOp.Death`, the panic text kept in it; the pipe's `taken` count and `PipeInletOp.Taken`; root's panic, faults and kill as kernel panics; `sos` wrappers; the cases `console_claim` and `death_record` on every profile | L |
+| U0b | root and the builder: `console` as a System record right granted only to the image's console, and its refusals; the plan's inlet for root; root's non-parking console writer, its record printing, its watchdog thread at `Rt1` and its manifest's `rt0` to `rt3`; `svc-console`'s `EXIT_CLAIMED`; `tests/console-staller` and the cases `console_stall`, `console_stall_looping` and `console_backpressure_kept` | M |
 | U1 | `uartproto`: `Lost`, `Stats`, the new `Write`/`Sync` wording ("answered once queued", "once every byte before it has left the device"); every driver answers `Stats`; hosted tests | S |
 | U2 | `drivers/uartcore`: rings, gap marks, holds, sync marks, the serve state machine over a `UartDevice` trait; the fake UART; hosted tests (§9) | M |
 | U3 | the S3 UART block in `esp32s3io` (offsets, bring-up words, the arm's register order) with hosted tests through its `RegisterPort`; `ABI.md` §4b, the driver's use of UART0 and §6's findings | S |
@@ -1141,6 +1208,7 @@ needs U0; U4 needs all of them.
   and claiming devices belongs to a device object, a separate design that is
   not built. §12's launch convention: `console` as a System record right the
   stock root gives only to the image's console, beside the four.
+- §2.1: the `taken` count and `PipeInletOp.Taken`, on `Post`.
 - §5.7's statuses: `Claimed`. §2.8's `DebugPrint` row [read spec.md:2326]:
   it answers `Claimed` while the console is claimed.
 - §2.7 and §8: `ProcessOp.Death` and the record, replacing "fault forensics
