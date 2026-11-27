@@ -65,6 +65,29 @@ u32 sos_kernel_slabs_end(void) {
     return (u32)(unsigned long)_sos_slabs_end;
 }
 
+// ---- the kernel stack -----------------------------------------------------
+//
+// C because: a linker symbol's address (reason 2), and the stack pointer
+// (reason 1). `[_stack_bottom, _stack_top)` is the stack the boot shim loads
+// and every trap reloads. `sos_stack_pointer` is a leaf that reads `a1` as it
+// stands inside it, so a caller learns an address below its own frame.
+
+extern unsigned char _stack_bottom[];
+extern unsigned char _stack_top[];
+
+u32 sos_kernel_stack_bottom(void) {
+    return (u32)(unsigned long)_stack_bottom;
+}
+u32 sos_kernel_stack_top(void) {
+    return (u32)(unsigned long)_stack_top;
+}
+
+u32 sos_stack_pointer(void) {
+    u32 sp;
+    __asm__ volatile("mov %0, a1" : "=a"(sp));
+    return sp;
+}
+
 // ---- the core's interrupt registers ---------------------------------------
 //
 // C because: special registers (reason 1). INTENABLE gates each CPU interrupt

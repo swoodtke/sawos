@@ -70,6 +70,25 @@ extern unsigned char _sos_slabs_end[];
 u32 sos_kernel_slabs_start(void) { return (u32)(unsigned long)_sos_slabs_start; }
 u32 sos_kernel_slabs_end(void)   { return (u32)(unsigned long)_sos_slabs_end; }
 
+// ---- the kernel stack -----------------------------------------------------
+//
+// C because: a linker symbol's address, and the stack pointer, which Saw has
+// no spelling for. `[_stack_bottom, _stack_top)` is the stack the boot shim
+// loads and every trap reloads. `sos_stack_pointer` is a leaf that reads `sp`
+// as it stands inside it, so a caller learns an address below its own frame.
+
+extern unsigned char _stack_bottom[];
+extern unsigned char _stack_top[];
+
+u32 sos_kernel_stack_bottom(void) { return (u32)(unsigned long)_stack_bottom; }
+u32 sos_kernel_stack_top(void)    { return (u32)(unsigned long)_stack_top; }
+
+u32 sos_stack_pointer(void) {
+    u32 sp;
+    __asm__ volatile("mv %0, sp" : "=r"(sp));
+    return sp;
+}
+
 // ---- PMP register access --------------------------------------------------
 //
 // C because: the CSR number is an assembly-time immediate (reason 1 above),

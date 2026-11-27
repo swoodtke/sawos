@@ -1,0 +1,62 @@
+// The stack scan pinned exactly, and the overflow stop driven once.
+//
+// A buffer this file owns is painted, written to a known depth and read back
+// with `used`, which must answer that depth to the byte: nothing written
+// answers 0, one word the word's size, and the whole buffer its size. Then
+// `check_peak`, the check the report ends in, is handed a peak that has
+// reached its size and must stop the machine with the kernel-bug report. A
+// line that is not printed, or a wrong depth, ends the run with a status of
+// its own, so each claim is a line the case expects.
+
+import kcore.{console}
+import kcore.stackdepth.{paint, used, check_peak}
+import hal
+
+static WORDS: Int = 64
+static WORD_BYTES: UInt = 4
+static MARK: UInt32 = 0x11223344
+
+unsafe static var BUF: [UInt32; WORDS] = [0; WORDS]
+
+func base() unsafe -> UInt {
+    ((&var BUF) as UnsafePointer<UInt32>) as UInt
+}
+
+// Write `depth` bytes down from the buffer's top, as a stack's use does.
+func write_depth(depth: UInt) unsafe {
+    let top = base() + (WORDS as UInt) * WORD_BYTES
+    var at = top - depth
+    while at < top {
+        UnsafeMemory<UInt32, Normal>(at).write(MARK)
+        at = at + WORD_BYTES
+    }
+}
+
+func expect_used(depth: UInt, line: String) unsafe {
+    let size = (WORDS as UInt) * WORD_BYTES
+    paint(base(), base() + size)
+    write_depth(depth)
+    if used(base(), base() + size) != depth {
+        hal.exit_fail(9)
+    }
+    console().write_str(line)
+}
+
+@export("kmain")
+func kmain() {
+    let uart = console()
+    uart.write_str("SOS stack: scan check on ")
+    uart.write_str(hal.arch_name())
+    uart.write_str("\n")
+
+    let size = (WORDS as UInt) * WORD_BYTES
+    expect_used(0, "SOS stack: nothing written reads 0\n")
+    expect_used(WORD_BYTES, "SOS stack: one word reads 4\n")
+    expect_used(40, "SOS stack: forty bytes read 40\n")
+    expect_used(size - WORD_BYTES, "SOS stack: all but the last word reads 252\n")
+    expect_used(size, "SOS stack: the whole buffer reads 256\n")
+
+    // A peak that reached its size: the stop.
+    check_peak(size, size)
+    hal.exit_pass()
+}

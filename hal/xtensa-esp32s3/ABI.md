@@ -5916,3 +5916,21 @@ at `pll240` with either flash key, against 0.179 s at `rom` and about
 lines left the part on time and were held between the part and the
 capture's reads, in the serial bridge or the capture itself; the crumbs,
 each sent before the kernel went on, were stamped in step with SYSTIMER.
+
+## 19. The kernel stack's depth
+
+`[_stack_bottom, _stack_top)` (`esp32s3.ld`, `KERNEL_STACK_SIZE`) is the one
+stack the boot shim loads and every trap reloads. `kmain` paints it before
+anything else uses it (`kcore.stackdepth.paint_kernel_stack`), below the
+frame it runs in, and `kernel_stack_peak()` scans from `_stack_bottom` for the
+first word that is no longer the paint and answers the bytes from there to
+`_stack_top`. `sos_kernel_stack_bottom()`, `sos_kernel_stack_top()` and
+`sos_stack_pointer()` in `sink.c` give Saw the two bounds and `a1`, none of
+which it can name; `sos_stack_pointer` is a leaf, so the address it reads lies
+below its caller's frame.
+
+A harness kernel that calls `enable_stack_report` has the machine's last act
+print `SOS: kernel stack peak=0x... size=0x...` and stop with a kernel-bug
+report if the peak reached the stack's size. The runner's `stack_peak_*` cases
+run gate cases on such a kernel (`tests/stack_peak.saw`) and print the peak
+under the case's row; the number is printed and never matched.

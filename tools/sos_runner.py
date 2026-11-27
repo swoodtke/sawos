@@ -16878,6 +16878,61 @@ TEST_CASES = [
     },
 ]
 
+# The kernel stack's depth, measured on cases that exercise the heaviest
+# paths. Each name below is an existing case, run again on `stack_peak.saw`,
+# the shipping kernel with the stack report on: the run ends with the stack's
+# peak printed and fails if the stack's far end was reached. The peak is
+# printed, never matched. The ESP32-S3 smoke runs the ones in
+# `STACK_PEAK_S3_BASES` too.
+STACK_PEAK_PREFIX = "SOS: kernel stack peak="
+
+STACK_PEAK_S3_BASES = [
+    "kill_churn",           # kills and teardowns, repeated
+    "kill_runnable",        # a runnable process killed
+    "death_fault",          # a fault ends a process
+    "process_lifecycle",    # processes created, started and ended
+    "map_into_child",       # a map into another process
+    "pipe_pingpong",        # a pipe's round trips
+    "tick_spinner",         # ticks arriving while a process runs
+]
+STACK_PEAK_BASES = [
+    "process_kill",         # a process killed, its teardown run
+    "process_stats",        # a fault ends a process
+    "pipe_handles",         # a pipe transfer carrying handles
+    "slab_donate_mapped",   # donation with mappings to tear down
+    "levels_tick",          # ticks arriving while processes run and call in
+    *STACK_PEAK_S3_BASES,
+]
+
+_STACK_PEAK_BY_NAME = {c["name"]: c for c in TEST_CASES}
+TEST_CASES += [
+    dict(_STACK_PEAK_BY_NAME[base], name=f"stack_peak_{base}",
+         src=os.path.join(TESTS_DIR, "stack_peak.saw"), stack_peak=True)
+    for base in STACK_PEAK_BASES
+]
+
+# The stack scan pinned exactly and the overflow stop driven once
+# (`tests/stack_scan.saw`): a buffer the harness owns is painted and written
+# to known depths, `used` must answer each exactly, and `check_peak` handed a
+# peak equal to its size must stop with the kernel-bug report (exit 6).
+STACK_SCAN_LINES = [
+    "SOS stack: scan check on",
+    "SOS stack: nothing written reads 0\n",
+    "SOS stack: one word reads 4\n",
+    "SOS stack: forty bytes read 40\n",
+    "SOS stack: all but the last word reads 252\n",
+    "SOS stack: the whole buffer reads 256\n",
+    "SOS: kernel stack peak=",
+    "SOS: kernel bug: kernel stack overflow",
+]
+TEST_CASES.append({
+    "name": "stack_scan",
+    "src": os.path.join(TESTS_DIR, "stack_scan.saw"),
+    "expect_out": STACK_SCAN_LINES,
+    "expect_clean_exit": False,
+    "expect_status": 6,
+})
+
 INSTALL_HINTS = {
     "qemu-system-riscv32": "brew install qemu   (macOS)  |  apt install qemu-system-misc   (Debian/Ubuntu)",
     "qemu-system-aarch64": "brew install qemu   (macOS)  |  apt install qemu-system-arm    (Debian/Ubuntu)",
@@ -18891,6 +18946,11 @@ def _check(case, arch, status, out, timed_out):
                 return False, (f"{where} expected output {want!r} "
                                f"(got {out!r})")
             cursor = at + (1 if step_one else len(want))
+    # A `stack_peak` case must have printed its report line: a kernel that
+    # never reports would otherwise pass for one that measured. The prefix is
+    # matched and the number never is.
+    if case.get("stack_peak") and STACK_PEAK_PREFIX not in hay:
+        return False, f"the report line {STACK_PEAK_PREFIX!r} is missing (got {out!r})"
     # A case may say how the console ends: the transcript, trailing whitespace
     # aside, must end with this text. It asserts that nothing was written after
     # the last line a case expects, which matching in order cannot.
@@ -18911,6 +18971,24 @@ def _check(case, arch, status, out, timed_out):
     if want_status is not None and status != want_status:
         return False, f"expected exit status {want_status}, got {status}"
     return True, ""
+
+
+_STACK_PEAK_LINE = re.compile(
+    re.escape(STACK_PEAK_PREFIX) + r"0x([0-9a-f]+) size=0x([0-9a-f]+)")
+
+
+def _stack_peak_lines(case, out):
+    """The kernel stack's peak a `stack_peak` case printed, as a row's detail
+    line. It is reported, never matched: the number moves with the kernel."""
+    if not case.get("stack_peak"):
+        return []
+    if isinstance(out, bytes):
+        out = out.decode(errors="replace")
+    found = _STACK_PEAK_LINE.search(out)
+    if found is None:
+        return ["    kernel stack peak: not reported"]
+    peak, size = int(found.group(1), 16), int(found.group(2), 16)
+    return [f"    kernel stack peak {peak} of {size} bytes"]
 
 
 def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
@@ -19193,7 +19271,7 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
                                                case.get("stdin_at_once", False))
             ok, reason = _check(case, arch, status, out, timed_out)
         if ok:
-            return True, f"{CHECK} {name}", frames
+            return True, f"{CHECK} {name}", frames + _stack_peak_lines(case, out)
         return False, f"{CROSS} {name}  ({reason})", frames
 
     # The excluded cases, by name, with the reason. Printed here rather than
@@ -21005,6 +21083,15 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
     # too. The exit status is the kernel's own semihosting exit, so a failing
     # stop is non-zero and carries its code.
     kernel_cases = [
+        {
+            # The stack scan and the overflow stop (`STACK_SCAN_LINES`).
+            "name": "stack_scan",
+            "src": os.path.join(TESTS_DIR, "stack_scan.saw"),
+            "expect_out": [rom, *STACK_SCAN_LINES,
+                           "SOS-S3: halt fail code=0x00000006"],
+            "expect_clean_exit": False,
+            "expect_status": 6,
+        },
         {
             # No image appended: the kernel must say so and fail. Direct boot,
             # the split flash layout, the vectors and the console in one.
@@ -24032,7 +24119,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                      "heap_rights", "heap_missing_slot", "heap_slot_bound",
                      "heap_wrong_free", "heap_zero_spent", "heap_main_err",
                      "heap_sizing", "handle_blocks_quota",
-                     "root_blocks_rows", "latency_counts"]
+                     "root_blocks_rows", "latency_counts",
+                     *[f"stack_peak_{b}" for b in STACK_PEAK_S3_BASES]]
     by_name = {c["name"]: c for c in TEST_CASES}
     process_cases = [by_name[n] for n in process_names]
 
@@ -25057,7 +25145,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
         if isinstance(out, str):
             out = [out]
         out = list(out)
-        if case["src"] == os.path.join(KERNEL_DIR, "main.saw"):
+        if case["src"] in (os.path.join(KERNEL_DIR, "main.saw"),
+                           os.path.join(TESTS_DIR, "stack_peak.saw")):
             at = out.index("{banner}") + 1 if "{banner}" in out else 0
             out.insert(at, psram_up_line)
         name = ("psram_boot" if case["name"] == "root_server_boot"
@@ -25875,6 +25964,8 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                   f"({size} bytes of flash)")
             for line in frames:
                 print(f"    {line}")
+            for line in _stack_peak_lines(case, out):
+                print(line)
             continue
         failed += 1
         # `_check`'s reason quotes the whole console; the console is printed

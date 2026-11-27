@@ -1,0 +1,116 @@
+//! How deep a stack has been used: a painted stack and the scan that reads it.
+//!
+//! A stack is painted with a known word before anything uses its far end, and
+//! the deepest use is the lowest word that no longer holds it. The scan starts
+//! at the far end and stops at the first word that was written, so it answers
+//! the bytes between that word and the stack's top. A word the code happened to
+//! write with the paint's own value reads as untouched, which can only
+//! under-report by that word.
+//!
+//! `paint` and `used` take a stack's bounds, so any stack the kernel owns is
+//! measured by the same two functions. The running stack is painted by
+//! `paint_kernel_stack`, which stops short of its own frame; a stack that is
+//! not in use is painted whole by `paint`.
+//!
+//! This module names the HAL and `kcore.diag` and nothing else, which is what
+//! lets the teardown and the shutdown path report from it.
+//!
+//! # Reading the peak
+//!
+//! `kernel_stack_peak` answers the kernel stack's deepest use so far, and
+//! `kernel_stack_size` its length. A harness kernel that calls
+//! `enable_stack_report` has the machine's last act print both, and stops with
+//! a kernel-bug report if the peak reached the stack's far end. The number is a
+//! measurement and moves with the code; only the bound is a claim.
+
+import hal
+import kcore.diag.{console, fatal_kernel}
+
+/// The word a painted stack holds until something writes it. Not zero, which
+/// is what a freshly cleared stack and most of what the kernel stores look
+/// like, and not a pattern the kernel stores on purpose.
+public static STACK_PAINT: UInt32 = 0x5AFE57AC
+
+/// Bytes in a painted word.
+static PAINT_WORD_BYTES: UInt = 4
+
+/// Paint `[bottom, limit)` word by word. Both ends are word-aligned and no
+/// frame in use lies below `limit`: use this on a stack nothing is running on.
+public func paint(bottom: UInt, limit: UInt) unsafe {
+    var at = bottom
+    while at < limit {
+        UnsafeMemory<UInt32, Normal>(at).write(STACK_PAINT)
+        at = at + PAINT_WORD_BYTES
+    }
+}
+
+/// Bytes of the stack `[bottom, top)` that have been written: the distance from
+/// `top` down to the lowest word that is no longer paint. A stack nothing has
+/// reached answers 0.
+public func used(bottom: UInt, top: UInt) unsafe -> UInt {
+    var at = bottom
+    while at < top {
+        if UnsafeMemory<UInt32, Normal>(at).read() != STACK_PAINT {
+            return top - at
+        }
+        at = at + PAINT_WORD_BYTES
+    }
+    0
+}
+
+/// Slack kept between the paint and the stack pointer read inside this call,
+/// so that nothing this function's own frame holds is painted over whatever
+/// the compiler does with it.
+static PAINT_MARGIN: UInt = 64
+
+/// Paint the kernel stack, below the frame this runs in. Call it first in the
+/// kernel's entry: the stack above the entry's own frame is already in use and
+/// is left as it is, so its words read as written.
+public func paint_kernel_stack() unsafe {
+    let limit = (hal.stack_pointer() - PAINT_MARGIN) & ~(PAINT_WORD_BYTES - 1)
+    paint(hal.kernel_stack_bottom(), limit)
+}
+
+/// Bytes of the kernel stack used so far.
+public func kernel_stack_peak() unsafe -> UInt {
+    used(hal.kernel_stack_bottom(), hal.kernel_stack_top())
+}
+
+/// The kernel stack's length in bytes.
+public func kernel_stack_size() -> UInt {
+    hal.kernel_stack_top() - hal.kernel_stack_bottom()
+}
+
+/// Whether the machine's last act reports the peak. Off unless a harness
+/// kernel turns it on: the shipping kernel says nothing it was not asked to.
+unsafe static var STACK_REPORT: Bool = false
+
+/// Turn the report on. Harness kernels that measure the stack call this.
+public func enable_stack_report() unsafe {
+    STACK_REPORT = true
+}
+
+/// Print a peak and a size, and stop the machine if the peak reached the far
+/// end (a stack that overflowed has written past its bottom word, and the peak
+/// then equals its size).
+public func check_peak(peak: UInt, size: UInt) {
+    let uart = console()
+    uart.write_str("SOS: kernel stack peak=")
+    uart.write_hex(peak)
+    uart.write_str(" size=")
+    uart.write_hex(size)
+    uart.write_str("\n")
+    if peak >= size {
+        fatal_kernel("kernel stack overflow", peak)
+    }
+}
+
+/// Report the kernel stack's peak and size through `check_peak`. Does nothing
+/// unless `enable_stack_report` ran. The machine's exits call it just before
+/// they stop, so the number covers everything the run did.
+public func report_stack_peak() unsafe {
+    if not STACK_REPORT {
+        return
+    }
+    check_peak(kernel_stack_peak(), kernel_stack_size())
+}

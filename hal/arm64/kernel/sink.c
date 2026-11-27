@@ -156,6 +156,23 @@ extern unsigned char _sos_slabs_end[];
 u64 sos_kernel_slabs_start(void) { return (u64)_sos_slabs_start & SOS_LINMAP_PHYS_MASK; }
 u64 sos_kernel_slabs_end(void)   { return (u64)_sos_slabs_end   & SOS_LINMAP_PHYS_MASK; }
 
+// The kernel stack, `[_stack_bottom, _stack_top)`, as the high addresses the
+// stack pointer holds (not masked to physical: the kernel reads and writes the
+// stack through them). `sos_stack_pointer` is a leaf that reads `sp` as it
+// stands inside it, so a caller learns an address below its own frame.
+
+extern unsigned char _stack_bottom[];
+extern unsigned char _stack_top[];
+
+u64 sos_kernel_stack_bottom(void) { return (u64)_stack_bottom; }
+u64 sos_kernel_stack_top(void)    { return (u64)_stack_top; }
+
+u64 sos_stack_pointer(void) {
+    u64 sp;
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    return sp;
+}
+
 // ---- the real translation tables -------------------------------------------
 //
 // `boot.S` brings the machine up on a two-descriptor boot table, jumps into the
