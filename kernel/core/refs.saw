@@ -81,7 +81,8 @@ import sosabi.{EventMode, FaultReason, NO_HANDLE, ObjType, OutletLevel,
                pipe_msg_record_bytes, wait_meta_end_bytes, wait_prefix_bytes,
                wait_record_bytes}
 import kcore.limits.{MAX_IOMEMORIES, MAX_MEMORIES,
-                     NO_PROCESS, NO_THREAD, PIPE_INFLIGHT, ProcessIndex}
+                     NO_PROCESS, NO_THREAD, PIPE_INFLIGHT, ProcessIndex,
+                     ThreadIndex}
 import kcore.diag.{ExitCode, fatal, fatal_kernel}
 import kcore.result.{op_ok, op_status, op_value, write_result}
 import kcore.threads.{THREADS, ThreadState, frame_slot, free_thread_slot,
@@ -198,7 +199,7 @@ public(package) func ref_object(kind: ObjType, slot: Int) unsafe {
         case PipeRequest -> {
             EXCHANGES[slot].request_refs = EXCHANGES[slot].request_refs + 1
         },
-        case Thread -> { THREADS[slot].refs = THREADS[slot].refs + 1 },
+        case Thread -> { THREADS.at(ThreadIndex(slot)).refs = THREADS.at(ThreadIndex(slot)).refs + 1 },
         case System -> {},
         case Clock -> {},
         case Unbound -> {},
@@ -416,12 +417,12 @@ public(package) func drop_reference(kind: ObjType, slot: Int) unsafe -> Bool {
             PROCESS_RECORDS.at(ProcessIndex(slot)).refs == 0
         },
         case Thread -> {
-            if THREADS[slot].refs == 0 {
+            if THREADS.at(ThreadIndex(slot)).refs == 0 {
                 fatal_kernel("a thread reference was dropped twice",
                              slot as UInt)
             }
-            THREADS[slot].refs = THREADS[slot].refs - 1
-            THREADS[slot].refs == 0
+            THREADS.at(ThreadIndex(slot)).refs = THREADS.at(ThreadIndex(slot)).refs - 1
+            THREADS.at(ThreadIndex(slot)).refs == 0
         },
         case System -> false,
         case Clock -> false,
@@ -518,14 +519,14 @@ public(package) func revoke_blocked(w: Int) unsafe {
     var cur = WAITERS[w].blocked
     WAITERS[w].blocked = 0
     while cur != 0 {
-        let slot = cur - 1
+        let slot = ThreadIndex(cur - 1)
         // Read the link before `ready_push` takes the field for the ready
         // queue: a thread is on at most one list at a time, and this is the
         // moment it changes lists.
-        cur = THREADS[slot].link
-        THREADS[slot].wait_buf = 0
+        cur = THREADS.at(slot).link
+        THREADS.at(slot).wait_buf = 0
         write_result(frame_slot(slot), op_status(SosStatus.Revoked))
-        THREADS[slot].state = ThreadState.Runnable
+        THREADS.at(slot).state = ThreadState.Runnable
         ready_push(slot)
     }
 }
@@ -785,13 +786,13 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
             // names them. The free gives the charge back to the owner, or to
             // nobody once its death has disowned the slot (`credit_shared`).
             // An `Invalid` slot's charge came back at the invalidation.
-            match THREADS[slot].state {
+            match THREADS.at(ThreadIndex(slot)).state {
                 case Exited -> {
-                    let owner = THREADS[slot].process
-                    free_thread_slot(slot)
+                    let owner = THREADS.at(ThreadIndex(slot)).process
+                    free_thread_slot(ThreadIndex(slot))
                     credit_shared(owner, QuotaKind.Thread)
                 },
-                case Invalid -> { free_thread_slot(slot) },
+                case Invalid -> { free_thread_slot(ThreadIndex(slot)) },
                 case _ -> {},
             }
         },
@@ -1540,8 +1541,8 @@ func mark_interrupt_latency(kind: WaitableKind, target: Int, t: Int) unsafe {
     }
     match kind {
         case Interrupt -> {
-            THREADS[t].latency_irq = target + 1
-            THREADS[t].latency_from = INTERRUPTS[target].fired_at
+            THREADS.at(ThreadIndex(t)).latency_irq = target + 1
+            THREADS.at(ThreadIndex(t)).latency_from = INTERRUPTS[target].fired_at
             INTERRUPTS[target].fired_at = 0
         },
         case _ -> {},
@@ -1654,12 +1655,12 @@ func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
 /// this function has already finished.
 public(package) func wake_one_waiter(w: Int, a: Int) unsafe {
     while WAITERS[w].blocked != 0 {
-        let slot = WAITERS[w].blocked - 1
-        WAITERS[w].blocked = THREADS[slot].link
-        THREADS[slot].link = 0
-        let p = THREADS[slot].process
-        let dst = THREADS[slot].wait_buf
-        THREADS[slot].wait_buf = 0
+        let slot = ThreadIndex(WAITERS[w].blocked - 1)
+        WAITERS[w].blocked = THREADS.at(slot).link
+        THREADS.at(slot).link = 0
+        let p = THREADS.at(slot).process
+        let dst = THREADS.at(slot).wait_buf
+        THREADS.at(slot).wait_buf = 0
         if PROCESS_RECORDS.at(ProcessIndex(p)).doom != 0 {
             continue
         }
@@ -1675,7 +1676,7 @@ public(package) func wake_one_waiter(w: Int, a: Int) unsafe {
         // and its level raised, so waiting again is handed it.
         let answered = deliver_attachment(p, slot, dst, a)
         write_result(frame_slot(slot), op_status(answered))
-        THREADS[slot].state = ThreadState.Runnable
+        THREADS.at(slot).state = ThreadState.Runnable
         ready_push(slot)
         return
     }
@@ -1802,8 +1803,8 @@ public(package) func notify_claim(x: Int) unsafe {
 /// The copies that follow the check are `deliver_wait_record`'s kind of door:
 /// the same step, no user code between, and a refusal there is a kernel bug.
 func wake_call_reply(t: Int, x: Int) unsafe {
-    let p = THREADS[t].process
-    let dst = THREADS[t].wait_buf
+    let p = THREADS.at(ThreadIndex(t)).process
+    let dst = THREADS.at(ThreadIndex(t)).wait_buf
     let answer = waitable_answer(WaitableKind.PipeReply, x)
     var result = op_status(SosStatus.PeerClosed)
     if answer.payload == (ReplyLevel.Data as UInt) {
@@ -1862,9 +1863,9 @@ func wake_call_reply(t: Int, x: Int) unsafe {
     }
     waitable_consume(WaitableKind.PipeReply, x)
     clear_pending_call(t)
-    write_result(frame_slot(t), result)
-    THREADS[t].state = ThreadState.Runnable
-    ready_push(t)
+    write_result(frame_slot(ThreadIndex(t)), result)
+    THREADS.at(ThreadIndex(t)).state = ThreadState.Runnable
+    ready_push(ThreadIndex(t))
     unref_waitable(WaitableKind.PipeReply, x)
 }
 
@@ -1926,8 +1927,8 @@ public(package) func notify_room(c: Int) unsafe {
 /// thread, `Exchange.reply_refs` starts at one for it, and no handle row is
 /// spent.
 func resume_call_room(t: Int, c: Int) unsafe -> Bool {
-    let p = THREADS[t].process
-    let src = THREADS[t].call_src
+    let p = THREADS.at(ThreadIndex(t)).process
+    let src = THREADS.at(ThreadIndex(t)).call_src
     // The message is re-read out of its args record. `call_src` and `call_len`
     // name the record, so the handle words and the body address come back
     // together. The caller is blocked, so no thread of its own moves them, but
@@ -1936,7 +1937,7 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     var args = PipeSendRecord(body: 0, len: 0,
                               handles: [NO_HANDLE; PIPE_MSG_HANDLES])
     let args_at = ((&var args) as UnsafePointer<PipeSendRecord>) as UInt
-    if let why = copy_in(ProcessIndex(p), args_at, src, THREADS[t].call_len) {
+    if let why = copy_in(ProcessIndex(p), args_at, src, THREADS.at(ThreadIndex(t)).call_len) {
         doom_process(ProcessIndex(p), why)
         clear_pending_call(t)
         return true
@@ -1963,9 +1964,9 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
         // released, exactly as `pipe_call` releases them when it meets a closed
         // outlet without parking.
         clear_pending_call(t)
-        write_result(frame_slot(t), op_status(SosStatus.PeerClosed))
-        THREADS[t].state = ThreadState.Runnable
-        ready_push(t)
+        write_result(frame_slot(ThreadIndex(t)), op_status(SosStatus.PeerClosed))
+        THREADS.at(ThreadIndex(t)).state = ThreadState.Runnable
+        ready_push(ThreadIndex(t))
         release_carried(p, &args)
         return true
     }
@@ -1973,7 +1974,7 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     if x == NO_EXCHANGE {
         return false
     }
-    let dst = THREADS[t].wait_buf
+    let dst = THREADS.at(ThreadIndex(t)).wait_buf
     // The body was checked just above, in the same step: a refusal here is a
     // kernel bug.
     if len != 0 {
@@ -2031,15 +2032,15 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
 public(package) func release_pending_calls(p: Int) unsafe {
     var t: Int = 0
     while t < THREADS.capacity() {
-        if THREADS[t].process == p && THREADS[t].call_pipe != 0 {
+        if THREADS.at(ThreadIndex(t)).process == p && THREADS.at(ThreadIndex(t)).call_pipe != 0 {
             clear_pending_call(t)
         }
         t = t + 1
     }
     var u: Int = 0
     while u < THREADS.capacity() {
-        if THREADS[u].process == p && THREADS[u].call_claim != 0 {
-            let x = THREADS[u].call_claim - 1
+        if THREADS.at(ThreadIndex(u)).process == p && THREADS.at(ThreadIndex(u)).call_claim != 0 {
+            let x = THREADS.at(ThreadIndex(u)).call_claim - 1
             clear_pending_call(u)
             unref_waitable(WaitableKind.PipeReply, x)
         }

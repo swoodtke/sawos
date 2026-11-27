@@ -19,6 +19,7 @@ import sosabi.{EventMode, InletLevel, OutletLevel, ReplyLevel, WaitTag,
                process_status_word}
 import kcore.limits.{
     ProcessIndex,
+    ThreadIndex,
     MAX_ATTACHMENTS,
     MAX_EVENTS,
     MAX_INTERRUPTS,
@@ -792,15 +793,15 @@ public(package) func unblock_process(p: Int) unsafe {
                 var prev: Int = 0
                 var cur = WAITERS[w].blocked
                 while cur != 0 {
-                    let slot = cur - 1
-                    let next = THREADS[slot].link
-                    if THREADS[slot].process == p {
+                    let slot = ThreadIndex(cur - 1)
+                    let next = THREADS.at(slot).link
+                    if THREADS.at(slot).process == p {
                         if prev == 0 {
                             WAITERS[w].blocked = next
                         } else {
-                            THREADS[prev - 1].link = next
+                            THREADS.at(ThreadIndex(prev - 1)).link = next
                         }
-                        THREADS[slot].link = 0
+                        THREADS.at(slot).link = 0
                     } else {
                         prev = cur
                     }
@@ -819,9 +820,9 @@ public(package) func unblock_process(p: Int) unsafe {
 /// Park the running thread on `w`'s blocked list, remembering where its record
 /// goes. `dst` has already been through `copy_out_check`.
 public(package) func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
-    THREADS[slot].state = ThreadState.Blocked
-    THREADS[slot].wait_buf = dst
-    THREADS[slot].link = WAITERS[w].blocked
+    THREADS.at(ThreadIndex(slot)).state = ThreadState.Blocked
+    THREADS.at(ThreadIndex(slot)).wait_buf = dst
+    THREADS.at(ThreadIndex(slot)).link = WAITERS[w].blocked
     WAITERS[w].blocked = slot + 1
     NEED_RESCHED = true
 }
@@ -852,12 +853,12 @@ public(package) func block_on_wait(slot: Int, w: Int, dst: UInt) unsafe {
 /// the caller was the running process, and are validated again at the wake.
 public(package) func block_on_call_room(slot: Int, c: Int, src: UInt, len: UInt,
                                         dst: UInt) unsafe {
-    THREADS[slot].state = ThreadState.Blocked
-    THREADS[slot].wait_buf = dst
-    THREADS[slot].call_pipe = c + 1
-    THREADS[slot].call_claim = 0
-    THREADS[slot].call_src = src
-    THREADS[slot].call_len = len
+    THREADS.at(ThreadIndex(slot)).state = ThreadState.Blocked
+    THREADS.at(ThreadIndex(slot)).wait_buf = dst
+    THREADS.at(ThreadIndex(slot)).call_pipe = c + 1
+    THREADS.at(ThreadIndex(slot)).call_claim = 0
+    THREADS.at(ThreadIndex(slot)).call_src = src
+    THREADS.at(ThreadIndex(slot)).call_len = len
     NEED_RESCHED = true
 }
 
@@ -872,12 +873,12 @@ public(package) func block_on_call_room(slot: Int, c: Int, src: UInt, len: UInt,
 /// parked and wants one, and by the room resume, which runs in whichever thread
 /// freed the slot and must not preempt itself for somebody else's park.
 public(package) func tie_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
-    THREADS[slot].state = ThreadState.Blocked
-    THREADS[slot].wait_buf = dst
-    THREADS[slot].call_pipe = 0
-    THREADS[slot].call_claim = x + 1
-    THREADS[slot].call_src = 0
-    THREADS[slot].call_len = 0
+    THREADS.at(ThreadIndex(slot)).state = ThreadState.Blocked
+    THREADS.at(ThreadIndex(slot)).wait_buf = dst
+    THREADS.at(ThreadIndex(slot)).call_pipe = 0
+    THREADS.at(ThreadIndex(slot)).call_claim = x + 1
+    THREADS.at(ThreadIndex(slot)).call_src = 0
+    THREADS.at(ThreadIndex(slot)).call_len = 0
     EXCHANGES[x].caller = slot + 1
 }
 
@@ -891,14 +892,14 @@ public(package) func block_on_call_reply(slot: Int, x: Int, dst: UInt) unsafe {
 /// the tie, and the buffer. It does not touch the reference the claim held;
 /// each caller owns that decision.
 public(package) func clear_pending_call(slot: Int) unsafe {
-    if THREADS[slot].call_claim != 0 {
-        EXCHANGES[THREADS[slot].call_claim - 1].caller = 0
+    if THREADS.at(ThreadIndex(slot)).call_claim != 0 {
+        EXCHANGES[THREADS.at(ThreadIndex(slot)).call_claim - 1].caller = 0
     }
-    THREADS[slot].call_pipe = 0
-    THREADS[slot].call_claim = 0
-    THREADS[slot].call_src = 0
-    THREADS[slot].call_len = 0
-    THREADS[slot].wait_buf = 0
+    THREADS.at(ThreadIndex(slot)).call_pipe = 0
+    THREADS.at(ThreadIndex(slot)).call_claim = 0
+    THREADS.at(ThreadIndex(slot)).call_src = 0
+    THREADS.at(ThreadIndex(slot)).call_len = 0
+    THREADS.at(ThreadIndex(slot)).wait_buf = 0
 }
 
 /// The thread waiting for room on connection `c`, or `NO_THREAD`.
@@ -909,7 +910,7 @@ public(package) func clear_pending_call(slot: Int) unsafe {
 public(package) func call_room_waiter(c: Int) unsafe -> Int {
     var t: Int = 0
     while t < THREADS.capacity() {
-        if THREADS[t].call_pipe == c + 1 {
+        if THREADS.at(ThreadIndex(t)).call_pipe == c + 1 {
             return t
         }
         t = t + 1

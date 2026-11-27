@@ -164,6 +164,7 @@ import kcore.limits.{
     LOCK_CHAIN_MAX,
     PIPE_INFLIGHT,
     ProcessIndex,
+    ThreadIndex,
 }
 import kcore.preempt.{long_zero}
 import kcore.areas.{slab_geometry, slab_install}
@@ -1645,7 +1646,7 @@ func process_start(caller: Int, child: Int,
     // it runs in its slot, and the child's `ThreadSelf` is what names it. It
     // runs at the child's `Normal` band, under the map its launcher left it.
     let level = band_level(PROCESSES.at(body).bands, Priority.Normal as Int)
-    THREADS[slot] = ThreadSlot(state: ThreadState.Runnable, level: level,
+    THREADS.at(slot) = ThreadSlot(state: ThreadState.Runnable, level: level,
                                base_level: level, process: child,
                                exit_code: 0, joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
@@ -2078,7 +2079,7 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
     hal.frame_init(frame_slot(slot), start, stack_top, arg)
     // The handle just minted is the first reference. The level is the start's
     // to read.
-    THREADS[slot] = ThreadSlot(state: ThreadState.Created, level: 0,
+    THREADS.at(slot) = ThreadSlot(state: ThreadState.Created, level: 0,
                                base_level: 0, process: owner, exit_code: 0,
                                joiners: 0, link: 0, wait_buf: 0,
                                call_pipe: 0, call_claim: 0, call_src: 0,
@@ -2128,7 +2129,7 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             if arg0 >= (BANDS as UInt) {
                 fault_process(p, FaultReason.BadArg)
             }
-            match THREADS[target].state {
+            match THREADS.at(ThreadIndex(target)).state {
                 case Created -> {},
                 case Invalid -> { return op_status(SosStatus.Revoked) },
                 case _ -> fault_process(p, FaultReason.BadState),
@@ -2138,18 +2139,18 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             // the child is started, so starting it earlier is a caller error.
             // This is also why a `Created` child never ends by itself and a
             // `Gone` one was always started.
-            match PROCESS_RECORDS.at(ProcessIndex(THREADS[target].process)).state {
+            match PROCESS_RECORDS.at(ProcessIndex(THREADS.at(ThreadIndex(target)).process)).state {
                 case Created -> fault_process(p, FaultReason.BadState),
                 case _ -> {},
             }
             // The level is the band's in the map of the process the thread
             // runs in, which need not be the caller's (spec §7).
-            let owner = body_of(ProcessIndex(THREADS[target].process))
+            let owner = body_of(ProcessIndex(THREADS.at(ThreadIndex(target)).process))
             let level = band_level(PROCESSES.at(owner).bands, arg0 as Int)
-            THREADS[target].level = level
-            THREADS[target].base_level = level
-            THREADS[target].state = ThreadState.Runnable
-            ready_push(target)
+            THREADS.at(ThreadIndex(target)).level = level
+            THREADS.at(ThreadIndex(target)).base_level = level
+            THREADS.at(ThreadIndex(target)).state = ThreadState.Runnable
+            ready_push(ThreadIndex(target))
             op_ok()
         },
         case Join -> {
@@ -2159,16 +2160,16 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             if target == CURRENT_THREAD {
                 fault_process(p, FaultReason.BadState)
             }
-            match THREADS[target].state {
+            match THREADS.at(ThreadIndex(target)).state {
                 // Already gone: the answer is in the slot, so nothing parks.
                 // `Exited` wins over the process's death (spec §2.10).
-                case Exited -> op_value(THREADS[target].exit_code),
+                case Exited -> op_value(THREADS.at(ThreadIndex(target)).exit_code),
                 // Its process died before it exited: there is no code to read
                 // and nothing will ever exit.
                 case Invalid -> op_status(SosStatus.Revoked),
                 case Free -> fault_process(p, FaultReason.BadState),
                 case _ -> {
-                    block_on_join(CURRENT_THREAD, target)
+                    block_on_join(CURRENT_THREAD, ThreadIndex(target))
                     op_blocked()
                 },
             }
@@ -2185,7 +2186,7 @@ func thread_op_decoded(op: ThreadOp, obj: &ThreadObject, arg0: UInt,
             if section_held(p) {
                 fault_process(p, FaultReason.SectionHeld)
             }
-            exit_thread(target, arg0, obj.handle)
+            exit_thread(ThreadIndex(target), arg0, obj.handle)
             // No pair is ever written: this thread does not resume.
             op_blocked()
         },
@@ -2283,11 +2284,11 @@ func lock_wait(p: Int, addr: UInt) unsafe -> SyscallResult {
                           word_bytes()) {
         fault_process(p, why)
     }
-    THREADS[me].lock_at = addr
-    THREADS[me].lock_holder = holder + 1
-    THREADS[me].state = ThreadState.Blocked
+    THREADS.at(me).lock_at = addr
+    THREADS.at(me).lock_holder = holder + 1
+    THREADS.at(me).state = ThreadState.Blocked
     NEED_RESCHED = true
-    lock_raise(holder, THREADS[me].level)
+    lock_raise(ThreadIndex(holder), THREADS.at(me).level)
     op_blocked()
 }
 
@@ -2322,8 +2323,8 @@ func lock_holder_of(p: Int, owner: UInt) unsafe -> Int {
        generation >= GENERATION_MODULUS {
         fault_process(p, FaultReason.BadArg)
     }
-    let t = index - 1
-    let current = THREADS[t].generation as UInt
+    let t = ThreadIndex(index - 1)
+    let current = THREADS.at(t).generation as UInt
     if generation != current {
         let behind = (current + GENERATION_MODULUS - generation) %
                      GENERATION_MODULUS
@@ -2332,8 +2333,8 @@ func lock_holder_of(p: Int, owner: UInt) unsafe -> Int {
         }
         fault_process(p, FaultReason.BadArg)
     }
-    let q = THREADS[t].process
-    match THREADS[t].state {
+    let q = THREADS.at(t).process
+    match THREADS.at(t).state {
         case Runnable -> lock_live_holder(p, q, t),
         case Running -> lock_live_holder(p, q, t),
         case Blocked -> lock_live_holder(p, q, t),
@@ -2387,13 +2388,13 @@ func lock_chain_check(p: Int, holder: Int) unsafe {
         if h == CURRENT_THREAD {
             fault_process(p, FaultReason.LockChain)
         }
-        if THREADS[h].lock_holder == 0 {
+        if THREADS.at(ThreadIndex(h)).lock_holder == 0 {
             return
         }
         if holders == LOCK_CHAIN_MAX {
             fault_process(p, FaultReason.LockChain)
         }
-        h = THREADS[h].lock_holder - 1
+        h = THREADS.at(ThreadIndex(h)).lock_holder - 1
         holders = holders + 1
     }
 }
@@ -2427,7 +2428,7 @@ func lock_wake_op(p: Int, addr: UInt) unsafe -> SyscallResult {
                           word_bytes()) {
         fault_process(p, why)
     }
-    if ready_above(THREADS[CURRENT_THREAD].level) {
+    if ready_above(THREADS.at(CURRENT_THREAD).level) {
         NEED_RESCHED = true
     }
     op_ok()
@@ -3205,7 +3206,7 @@ func release_handle(p: Int, word: UInt, entry: HandleEntry) unsafe -> SyscallRes
 /// invalid state has an arm here; a `Gone` Process is not one.
 func object_invalid(kind: ObjType, slot: Int) unsafe -> Bool {
     match kind {
-        case Thread -> THREADS[slot].state == ThreadState.Invalid,
+        case Thread -> THREADS.at(ThreadIndex(slot)).state == ThreadState.Invalid,
         case Mapping -> MAPPINGS[slot].row == ROW_TARGET_DIED,
         case Waiter -> waiter_invalid(slot),
         case Timer -> timer_invalid(slot),
@@ -5763,7 +5764,7 @@ func count_trap(kind: TrapKind) unsafe {
     // and a supervisor holding a read-only mapping sees this store land with
     // no syscall of its own. A current thread's process is live, so it has a
     // body.
-    let row = body_of(ProcessIndex(THREADS[CURRENT_THREAD].process))
+    let row = body_of(ProcessIndex(THREADS.at(CURRENT_THREAD).process))
     match kind {
         case Syscall -> { stats_bump(row, PROCESS_STATS_SYSCALLS_SLOT) },
         case Interrupt -> { stats_bump(row, PROCESS_STATS_INTERRUPTS_SLOT) },
@@ -5875,8 +5876,8 @@ func parked_in_section() unsafe -> Bool {
     if CURRENT_THREAD == NO_THREAD {
         return false
     }
-    match THREADS[CURRENT_THREAD].state {
-        case Blocked -> section_held(THREADS[CURRENT_THREAD].process),
+    match THREADS.at(CURRENT_THREAD).state {
+        case Blocked -> section_held(THREADS.at(CURRENT_THREAD).process),
         case _ -> false,
     }
 }

@@ -35,6 +35,7 @@ import kcore.limits.{
     ROOT_PROCESS,
     BodyIndex,
     ProcessIndex,
+    ThreadIndex,
 }
 import kcore.result.{SyscallResult, op_ok, op_status, op_value, write_result}
 import kcore.mem.{word_bytes}
@@ -107,8 +108,8 @@ import kcore.irq.{has_external_wake_source, idle_once}
 // =============================================================================
 
 /// Whether the currently running thread should be left running.
-func stays_running(slot: Int) unsafe -> Bool {
-    match THREADS[slot].state {
+func stays_running(slot: ThreadIndex) unsafe -> Bool {
+    match THREADS.at(slot).state {
         case Running -> not NEED_RESCHED,
         case _ -> false,
     }
@@ -136,13 +137,13 @@ func stays_running(slot: Int) unsafe -> Bool {
 /// it: a flag raised for the thread that left (its slice's end, a wake above
 /// it, a wake made while its process was torn down) is not the incoming
 /// thread's.
-func run_thread(next: Int) unsafe -> UInt {
+func run_thread(next: ThreadIndex) unsafe -> UInt {
     CURRENT_THREAD = next
-    THREADS[next].state = ThreadState.Running
+    THREADS.at(next).state = ThreadState.Running
     SLICE_LEFT = SLICE_TICKS
     NEED_RESCHED = false
     SLICE_ENDED = false
-    let np = THREADS[next].process
+    let np = THREADS.at(next).process
     if np != LAST_PROT_PROCESS {
         load_domain(ProcessIndex(np))
     }
@@ -178,12 +179,12 @@ public(package) func stamp_interrupt_latency() unsafe {
     if t == NO_THREAD {
         return
     }
-    let mark = THREADS[t].latency_irq
+    let mark = THREADS.at(t).latency_irq
     if mark == 0 {
         return
     }
-    let from = THREADS[t].latency_from
-    THREADS[t].latency_irq = 0
+    let from = THREADS.at(t).latency_from
+    THREADS.at(t).latency_irq = 0
     let i = mark - 1
     if from < INTERRUPTS[i].bound_at {
         return
@@ -223,7 +224,7 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     // The outgoing thread's frame is written below (`fp_switch_out`), so its
     // slot must still be live: an exiting thread's slot is freed after the
     // switch (`PENDING_FREE`), never before.
-    match THREADS[cur].state {
+    match THREADS.at(cur).state {
         case Free -> {
             fatal_kernel("the outgoing slot was freed before the switch",
                          cur as UInt)
@@ -243,15 +244,15 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
     //
     // A thread whose process's section is held stays on the processor instead
     // when the thread the pick would take is a sibling (`section_keeps`).
-    match THREADS[cur].state {
+    match THREADS.at(cur).state {
         case Running -> {
             if section_keeps(cur) {
                 NEED_RESCHED = false
                 SLICE_ENDED = false
                 return current_frame
             }
-            THREADS[cur].state = ThreadState.Runnable
-            if ready_above(THREADS[cur].level) {
+            THREADS.at(cur).state = ThreadState.Runnable
+            if ready_above(THREADS.at(cur).level) {
                 ready_push_head(cur)
             } else {
                 ready_push(cur)
@@ -291,7 +292,7 @@ public(package) func pick_next(current_frame: UInt) unsafe -> UInt {
 /// With neither, every thread is blocked on something no thread can now
 /// deliver: a deadlock, which stops the machine. No process is ended, since
 /// which thread blocked last is timing.
-func take_next() unsafe -> Int {
+func take_next() unsafe -> ThreadIndex {
     var next = ready_pop()
     if next == NO_THREAD {
         if not has_external_wake_source() {
@@ -437,8 +438,8 @@ func section_defer(b: Int) unsafe {
 /// process's thread. Without the charge the same sibling would head its level
 /// at every slice's end for as long as the section is held, and that thread
 /// would never get its turn.
-func section_keeps(cur: Int) unsafe -> Bool {
-    let p = THREADS[cur].process
+func section_keeps(cur: ThreadIndex) unsafe -> Bool {
+    let p = THREADS.at(cur).process
     if not section_check(p) {
         return false
     }
@@ -460,16 +461,16 @@ func section_keeps(cur: Int) unsafe -> Bool {
 /// Whether `next`, the thread the pick would take, is a sibling of running
 /// thread `cur` at or above its level: one a held section keeps `cur` on the
 /// processor in place of.
-func defers_to(cur: Int, next: Int) unsafe -> Bool {
+func defers_to(cur: ThreadIndex, next: ThreadIndex) unsafe -> Bool {
     if next == NO_THREAD {
         return false
     }
-    let p = THREADS[cur].process
-    if THREADS[next].process != p {
+    let p = THREADS.at(cur).process
+    if THREADS.at(next).process != p {
         return false
     }
-    let own = THREADS[cur].level
-    THREADS[next].level >= own
+    let own = THREADS.at(cur).level
+    THREADS.at(next).level >= own
 }
 
 /// The second place: `next` was taken off the ready lists. The thread to run
@@ -486,13 +487,13 @@ func defers_to(cur: Int, next: Int) unsafe -> Bool {
 /// A ready holder is always on its level's list: every write of `Runnable` is
 /// followed by a push, so `ready_remove` finds it, and its `fatal_kernel` is a
 /// kernel bug's stop, which no process can reach.
-func section_displaces(next: Int) unsafe -> Int {
-    let p = THREADS[next].process
+func section_displaces(next: ThreadIndex) unsafe -> ThreadIndex {
+    let p = THREADS.at(next).process
     if not section_check(p) {
         return next
     }
     let b = body_of(ProcessIndex(p))
-    let h = PROCESSES.at(b).section_holder - 1
+    let h = ThreadIndex(PROCESSES.at(b).section_holder - 1)
     if h == next {
         return next
     }
@@ -510,11 +511,11 @@ func section_displaces(next: Int) unsafe -> Int {
 }
 
 /// Whether slot `t` is a ready thread of process `p`.
-func ready_sibling(t: Int, p: Int) unsafe -> Bool {
-    if THREADS[t].process != p {
+func ready_sibling(t: ThreadIndex, p: Int) unsafe -> Bool {
+    if THREADS.at(t).process != p {
         return false
     }
-    match THREADS[t].state {
+    match THREADS.at(t).state {
         case Runnable -> true,
         case _ -> false,
     }
@@ -554,26 +555,26 @@ func ready_sibling(t: Int, p: Int) unsafe -> Bool {
 /// It stops at the first thread already at or above `level`: a holder is
 /// always at least the level of every thread parked behind it, so the rest of
 /// the chain is too.
-public(package) func lock_raise(holder: Int, level: UInt8) unsafe {
+public(package) func lock_raise(holder: ThreadIndex, level: UInt8) unsafe {
     var h = holder
-    while THREADS[h].level < level {
+    while THREADS.at(h).level < level {
         set_level(h, level)
-        if THREADS[h].lock_holder == 0 {
+        if THREADS.at(h).lock_holder == 0 {
             return
         }
-        h = THREADS[h].lock_holder - 1
+        h = ThreadIndex(THREADS.at(h).lock_holder - 1)
     }
 }
 
 /// The level thread `t` is owed: the highest of its base level and the level
 /// of every thread parked on a lock naming it as the holder. A scan of the
 /// thread slab, since the kernel keeps no list of a holder's waiters.
-func lock_owed(t: Int) unsafe -> UInt8 {
-    var level = THREADS[t].base_level
+func lock_owed(t: ThreadIndex) unsafe -> UInt8 {
+    var level = THREADS.at(t).base_level
     var w: Int = 0
     while w < THREADS.capacity() {
-        if THREADS[w].lock_holder == t + 1 && THREADS[w].level > level {
-            level = THREADS[w].level
+        if THREADS.at(ThreadIndex(w)).lock_holder == t + 1 && THREADS.at(ThreadIndex(w)).level > level {
+            level = THREADS.at(ThreadIndex(w)).level
         }
         w = w + 1
     }
@@ -582,18 +583,18 @@ func lock_owed(t: Int) unsafe -> UInt8 {
 
 /// Bring thread `t`'s level to what it is owed, and so on along the chain it
 /// is parked in, until a thread's level does not change.
-func lock_recompute(t: Int) unsafe {
+func lock_recompute(t: ThreadIndex) unsafe {
     var h = t
     while {
         let owed = lock_owed(h)
-        if owed == THREADS[h].level {
+        if owed == THREADS.at(h).level {
             return
         }
         set_level(h, owed)
-        if THREADS[h].lock_holder == 0 {
+        if THREADS.at(h).lock_holder == 0 {
             return
         }
-        h = THREADS[h].lock_holder - 1
+        h = ThreadIndex(THREADS.at(h).lock_holder - 1)
     }
 }
 
@@ -602,11 +603,11 @@ func lock_recompute(t: Int) unsafe {
 /// The pair is written into its frame here, once, as a joiner's is: the wait
 /// wrote nothing when it parked. It goes onto the list of the level it has
 /// now, raised by its own waiters if it holds another lock.
-func lock_unpark(w: Int, result: SyscallResult) unsafe {
+func lock_unpark(w: ThreadIndex, result: SyscallResult) unsafe {
     write_result(frame_slot(w), result)
-    THREADS[w].lock_at = 0
-    THREADS[w].lock_holder = 0
-    THREADS[w].state = ThreadState.Runnable
+    THREADS.at(w).lock_at = 0
+    THREADS.at(w).lock_holder = 0
+    THREADS.at(w).state = ThreadState.Runnable
     ready_push(w)
 }
 
@@ -622,10 +623,10 @@ func lock_unpark(w: Int, result: SyscallResult) unsafe {
 public(package) func lock_wake(p: Int, addr: UInt) unsafe {
     var w: Int = 0
     while w < THREADS.capacity() {
-        if THREADS[w].lock_holder != 0 && THREADS[w].lock_at == addr &&
-           THREADS[w].process == p {
-            let holder = THREADS[w].lock_holder - 1
-            lock_unpark(w, op_ok())
+        if THREADS.at(ThreadIndex(w)).lock_holder != 0 && THREADS.at(ThreadIndex(w)).lock_at == addr &&
+           THREADS.at(ThreadIndex(w)).process == p {
+            let holder = ThreadIndex(THREADS.at(ThreadIndex(w)).lock_holder - 1)
+            lock_unpark(ThreadIndex(w), op_ok())
             lock_recompute(holder)
         }
         w = w + 1
@@ -637,11 +638,11 @@ public(package) func lock_wake(p: Int, addr: UInt) unsafe {
 ///
 /// The exiting thread is running, so it is parked on no lock and raised
 /// nobody along a chain; its own raise ends with it.
-func lock_revoke_waiters(slot: Int) unsafe {
+func lock_revoke_waiters(slot: ThreadIndex) unsafe {
     var w: Int = 0
     while w < THREADS.capacity() {
-        if THREADS[w].lock_holder == slot + 1 {
-            lock_unpark(w, op_status(SosStatus.Revoked))
+        if THREADS.at(ThreadIndex(w)).lock_holder == slot + 1 {
+            lock_unpark(ThreadIndex(w), op_status(SosStatus.Revoked))
         }
         w = w + 1
     }
@@ -668,17 +669,17 @@ func lock_revoke_waiters(slot: Int) unsafe {
 ///
 /// When this was the process's last thread the process ends here, carrying the
 /// code, and the teardown frees the slot if nothing names it.
-public(package) func exit_thread(slot: Int, code: UInt, handle: UInt) unsafe {
-    THREADS[slot].state = ThreadState.Exited
-    THREADS[slot].exit_code = code
+public(package) func exit_thread(slot: ThreadIndex, code: UInt, handle: UInt) unsafe {
+    THREADS.at(slot).state = ThreadState.Exited
+    THREADS.at(slot).exit_code = code
 
-    var j = THREADS[slot].joiners
-    THREADS[slot].joiners = 0
+    var j = THREADS.at(slot).joiners
+    THREADS.at(slot).joiners = 0
     while j != 0 {
-        let waiter = j - 1
-        j = THREADS[waiter].link
+        let waiter = ThreadIndex(j - 1)
+        j = THREADS.at(waiter).link
         write_result(frame_slot(waiter), op_value(code))
-        THREADS[waiter].state = ThreadState.Runnable
+        THREADS.at(waiter).state = ThreadState.Runnable
         ready_push(waiter)
     }
     // A thread that exits holding a lock others are parked on leaves them
@@ -687,7 +688,7 @@ public(package) func exit_thread(slot: Int, code: UInt, handle: UInt) unsafe {
     lock_revoke_waiters(slot)
 
     // The process is read once, here: the slot may be freed before the switch.
-    let p = THREADS[slot].process
+    let p = THREADS.at(slot).process
     unbind_handle(p, handle_word_index(handle))
     let _ = drop_reference(ObjType.Thread, slot)
 
@@ -698,7 +699,7 @@ public(package) func exit_thread(slot: Int, code: UInt, handle: UInt) unsafe {
     if live_threads(p) == 0 {
         end_process(p, ProcessStatusKind.Exited, code, code)
     }
-    if THREADS[slot].refs == 0 {
+    if THREADS.at(slot).refs == 0 {
         PENDING_FREE = slot
     }
     NEED_RESCHED = true
@@ -721,24 +722,24 @@ public(package) func exit_thread(slot: Int, code: UInt, handle: UInt) unsafe {
 /// list. The owner stays until the teardown disowns what survives its release,
 /// so that the release can tell `p`'s own threads from others' when it counts
 /// what it freed. The caller frees the slot if the count is zero.
-func invalidate_thread(t: Int, p: Int) unsafe {
-    var j = THREADS[t].joiners
+func invalidate_thread(t: ThreadIndex, p: Int) unsafe {
+    var j = THREADS.at(t).joiners
     while j != 0 {
-        let waiter = j - 1
-        j = THREADS[waiter].link
+        let waiter = ThreadIndex(j - 1)
+        j = THREADS.at(waiter).link
         write_result(frame_slot(waiter), op_status(SosStatus.Revoked))
-        THREADS[waiter].state = ThreadState.Runnable
+        THREADS.at(waiter).state = ThreadState.Runnable
         ready_push(waiter)
     }
     quota_credit(p, QuotaKind.Thread)
-    let refs = THREADS[t].refs
-    THREADS[t] = ThreadSlot(state: ThreadState.Invalid, level: 0,
+    let refs = THREADS.at(t).refs
+    THREADS.at(t) = ThreadSlot(state: ThreadState.Invalid, level: 0,
                             base_level: 0, process: p, exit_code: 0,
                             joiners: 0, link: 0, wait_buf: 0, call_pipe: 0,
                             call_claim: 0, call_src: 0, call_len: 0,
                             latency_irq: 0, latency_from: 0, lock_at: 0,
                             lock_holder: 0, refs: refs,
-                            generation: THREADS[t].generation)
+                            generation: THREADS.at(t).generation)
 }
 
 /// Invalidate Waiter `w` of dying process `p` (spec §2.10): it stays, for the
@@ -839,7 +840,7 @@ extension TeardownCounts {
 /// the teardown line counts, and `NO_PROCESS` for any other kind.
 func counted_owner(kind: ObjType, slot: Int) unsafe -> Int {
     match kind {
-        case Thread -> THREADS[slot].process,
+        case Thread -> THREADS.at(ThreadIndex(slot)).process,
         case Event -> EVENTS[slot].process,
         case Waiter -> WAITERS[slot].process,
         case Timer -> TIMERS[slot].process,
@@ -869,13 +870,13 @@ func release_held(kind: ObjType, slot: Int, p: Int, is_caller: Bool,
     }
     match kind {
         case Thread -> {
-            if spared(slot, is_caller) {
+            if spared(ThreadIndex(slot), is_caller) {
                 return
             }
             // A thread that has not exited is not freed by losing its last
             // handle (`free_object`'s Thread arm), so there is nothing to
             // count.
-            match THREADS[slot].state {
+            match THREADS.at(ThreadIndex(slot)).state {
                 case Exited -> {},
                 case Invalid -> {},
                 case _ -> { return },
@@ -907,15 +908,15 @@ func release_held(kind: ObjType, slot: Int, p: Int, is_caller: Bool,
 func disown_bound(p: Int) unsafe {
     var t: Int = 0
     while t < THREADS.capacity() {
-        match THREADS[t].state {
+        match THREADS.at(ThreadIndex(t)).state {
             case Exited -> {
-                if THREADS[t].process == p {
-                    THREADS[t].process = NO_PROCESS
+                if THREADS.at(ThreadIndex(t)).process == p {
+                    THREADS.at(ThreadIndex(t)).process = NO_PROCESS
                 }
             },
             case Invalid -> {
-                if THREADS[t].process == p {
-                    THREADS[t].process = NO_PROCESS
+                if THREADS.at(ThreadIndex(t)).process == p {
+                    THREADS.at(ThreadIndex(t)).process = NO_PROCESS
                 }
             },
             case _ -> {},
@@ -1149,19 +1150,19 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     //     second to the switch.
     var t: Int = 0
     while t < THREADS.capacity() {
-        if THREADS[t].process == p {
-            match THREADS[t].state {
+        if THREADS.at(ThreadIndex(t)).process == p {
+            match THREADS.at(ThreadIndex(t)).state {
                 case Free -> {},
                 case Invalid -> {},
                 case Exited -> {
-                    if THREADS[t].refs == 0 && not spared(t, is_caller) {
+                    if THREADS.at(ThreadIndex(t)).refs == 0 && not spared(ThreadIndex(t), is_caller) {
                         free_object(ObjType.Thread, t)
                         counts.count_freed(ObjType.Thread)
                     }
                 },
                 case _ -> {
-                    invalidate_thread(t, p)
-                    if THREADS[t].refs == 0 {
+                    invalidate_thread(ThreadIndex(t), p)
+                    if THREADS.at(ThreadIndex(t)).refs == 0 {
                         free_object(ObjType.Thread, t)
                         counts.count_freed(ObjType.Thread)
                     }
@@ -1391,7 +1392,7 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
 
 /// Whether thread slot `t` is the caller's, and so must not be freed by the
 /// teardown of some other process (`teardown_process`'s `is_caller`).
-func spared(t: Int, is_caller: Bool) unsafe -> Bool {
+func spared(t: ThreadIndex, is_caller: Bool) unsafe -> Bool {
     not is_caller && (t == CURRENT_THREAD || t == PENDING_FREE)
 }
 
@@ -1563,7 +1564,7 @@ func owns_current_thread(p: Int) unsafe -> Bool {
     if CURRENT_THREAD == NO_THREAD {
         return false
     }
-    THREADS[CURRENT_THREAD].process == p
+    THREADS.at(CURRENT_THREAD).process == p
 }
 
 /// Take the fault process `r` is owed and end it with it. A record that is not
@@ -1607,7 +1608,7 @@ func drain_doomed() unsafe {
             r = r + 1
         }
         if CURRENT_THREAD != NO_THREAD {
-            let running = THREADS[CURRENT_THREAD].process
+            let running = THREADS.at(CURRENT_THREAD).process
             if running != NO_PROCESS && PROCESS_RECORDS.at(ProcessIndex(running)).doom != 0 {
                 pay_doom(running)
             }
@@ -1667,7 +1668,7 @@ public(package) func fault_trap(tag: String, cause: UInt, epc: UInt, tval: UInt)
     uart.write_hex(tval)
     uart.write_str("\n")
     if CURRENT_THREAD != NO_THREAD {
-        end_process(THREADS[CURRENT_THREAD].process, ProcessStatusKind.Faulted, 0,
+        end_process(THREADS.at(CURRENT_THREAD).process, ProcessStatusKind.Faulted, 0,
                     ExitCode.UmodeFault as UInt)
     }
     // No process object yet: the harness kernels that enter user mode directly.

@@ -20,6 +20,7 @@ import kcore.limits.{
     NO_THREAD,
     SYSTEM_LEVELS,
     THREAD_FRAME_STRIDE,
+    ThreadIndex,
 }
 import kcore.diag.{fatal_kernel}
 import kcore.mem.{align_up}
@@ -109,7 +110,7 @@ unsafe static var THREAD_FRAMES: [UInt64; FRAME_ARENA_WORDS] = [0; FRAME_ARENA_W
 /// is address-as-data) and the `hal.phys_to_virt` below is the moment of
 /// dereference. A missed conversion is a hard fault on a translating target and
 /// invisible on the others.
-public(package) func frame_slot(index: Int) unsafe -> UInt {
+public(package) func frame_slot(index: ThreadIndex) unsafe -> UInt {
     let stride = THREAD_FRAME_STRIDE as UInt
     if index < MAX_THREADS {
         let base = align_up(((&var THREAD_FRAMES) as UnsafePointer<UInt64>) as UInt, stride)
@@ -256,9 +257,49 @@ public(package) struct ThreadSlot {
     public(package) generation: UInt32,
 }
 
-/// The thread slab: an extent chain, with the frame arena riding the extent
-/// table's side column (see `frame_slot`). Loop bounds read `capacity()`.
-public(package) unsafe static var THREADS: Slab<ThreadSlot, MAX_THREADS> = Slab<ThreadSlot, MAX_THREADS>(
+/// The thread table: an extent chain, reached only by a `ThreadIndex`, with
+/// the frame arena riding the extent table's side column (see `frame_slot`).
+/// The slab under it is private to this module, so nothing subscripts it with
+/// another kind of index or a bare `Int`.
+public(package) struct ThreadTable {
+    private slab: Slab<ThreadSlot, MAX_THREADS>,
+}
+
+extension ThreadTable {
+    /// Thread slot `t`, lent where it sits.
+    public(package) func at(&var self, t: ThreadIndex) unsafe borrows -> &var ThreadSlot {
+        lend self.slab[t]
+    }
+
+    /// How many slots the table holds now, donations included: the bound of
+    /// every scan.
+    public(package) func capacity(&self) -> Int { self.slab.capacity() }
+
+    /// One slot's bytes, which turn a donated region's length into a count.
+    public(package) func slot_bytes(&self) -> Int { self.slab.slot_bytes() }
+
+    /// How many more extents the table can accept.
+    public(package) func extents_left(&self) -> Int { self.slab.extents_left() }
+
+    /// Append a donated extent of `slots` slots at `base`, with its frames at
+    /// `side`; `Slab.donate_paired`.
+    public(package) func donate_paired(&var self, base: UInt, slots: Int,
+                                       side: UInt) -> Bool {
+        self.slab.donate_paired(base, slots, side)
+    }
+
+    /// The extent holding donated slot `t`, and its offset in it;
+    /// `Slab.locate`.
+    public(package) func locate(&self, t: ThreadIndex) -> (Int, Int) {
+        self.slab.locate(t)
+    }
+
+    /// Extent `e`'s frame arena base; `Slab.side_base`.
+    public(package) func side_base(&self, e: Int) -> UInt { self.slab.side_base(e) }
+}
+
+/// The thread table. Loop bounds read `capacity()`.
+public(package) unsafe static var THREADS: ThreadTable = ThreadTable(slab: Slab<ThreadSlot, MAX_THREADS>(
     inline: [ThreadSlot(state: ThreadState.Free, level: 0, base_level: 0,
                         process: 0, exit_code: 0, joiners: 0, link: 0,
                         wait_buf: 0, call_pipe: 0, call_claim: 0, call_src: 0,
@@ -269,7 +310,7 @@ public(package) unsafe static var THREADS: Slab<ThreadSlot, MAX_THREADS> = Slab<
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
-    total: MAX_THREADS)
+    total: MAX_THREADS))
 
 /// The running thread's slot, or `NO_THREAD`.
 ///
@@ -277,7 +318,7 @@ public(package) unsafe static var THREADS: Slab<ThreadSlot, MAX_THREADS> = Slab<
 /// kernels that enter user mode without one; every `NO_THREAD` guard below is
 /// for those. Uniprocessor kernel with interrupts taken from user mode only, so
 /// the only writer is the trap path and nothing can interleave with it.
-public(package) unsafe static var CURRENT_THREAD: Int = NO_THREAD
+public(package) unsafe static var CURRENT_THREAD: ThreadIndex = NO_THREAD
 
 /// The ready lists (spec §7): one FIFO of runnable threads per level, head
 /// and tail as slot + 1. The running thread is on none: round-robin puts the
@@ -336,7 +377,7 @@ public(package) unsafe static var SLICE_ENDED: Bool = false
 /// `fp_switch_out` save the thread's floating-point state into its frame, which
 /// lives in the slot. So the slot is freed there, after that save and the
 /// choice of the next thread, and not by the op.
-public(package) unsafe static var PENDING_FREE: Int = NO_THREAD
+public(package) unsafe static var PENDING_FREE: ThreadIndex = NO_THREAD
 
 /// Ticks left in the running thread's slice.
 public(package) unsafe static var SLICE_LEFT: UInt = 0
@@ -382,7 +423,7 @@ public(package) func a_thread_is_running() unsafe -> Bool {
     if CURRENT_THREAD == NO_THREAD {
         return false
     }
-    match THREADS[CURRENT_THREAD].state {
+    match THREADS.at(CURRENT_THREAD).state {
         case Running -> true,
         case _ -> false,
     }
@@ -408,19 +449,19 @@ func level_bit(level: Int) -> UInt8 {
 /// such a thread never runs. A flag raised for it would outlive it and take
 /// the processor from the thread that ended the process, in favour of one
 /// at that thread's own level.
-public(package) func ready_push(slot: Int) unsafe {
-    let level = THREADS[slot].level as Int
-    THREADS[slot].link = 0
+public(package) func ready_push(slot: ThreadIndex) unsafe {
+    let level = THREADS.at(slot).level as Int
+    THREADS.at(slot).link = 0
     if READY_TAIL[level] == 0 {
         READY_HEAD[level] = slot + 1
     } else {
-        THREADS[READY_TAIL[level] - 1].link = slot + 1
+        THREADS.at(ThreadIndex(READY_TAIL[level] - 1)).link = slot + 1
     }
     READY_TAIL[level] = slot + 1
     READY_BITS = READY_BITS | level_bit(level)
-    if a_thread_is_running() && not process_ending(THREADS[slot].process) {
-        let running = THREADS[CURRENT_THREAD].level
-        if THREADS[slot].level > running {
+    if a_thread_is_running() && not process_ending(THREADS.at(slot).process) {
+        let running = THREADS.at(CURRENT_THREAD).level
+        if THREADS.at(slot).level > running {
             NEED_RESCHED = true
         }
     }
@@ -436,9 +477,9 @@ func process_ending(p: Int) unsafe -> Bool {
 
 /// Ready `slot` at the head of its level: where a thread that a higher level
 /// took the processor from resumes, ahead of the peers it was ahead of.
-public(package) func ready_push_head(slot: Int) unsafe {
-    let level = THREADS[slot].level as Int
-    THREADS[slot].link = READY_HEAD[level]
+public(package) func ready_push_head(slot: ThreadIndex) unsafe {
+    let level = THREADS.at(slot).level as Int
+    THREADS.at(slot).link = READY_HEAD[level]
     READY_HEAD[level] = slot + 1
     if READY_TAIL[level] == 0 {
         READY_TAIL[level] = slot + 1
@@ -452,27 +493,27 @@ public(package) func ready_above(level: UInt8) unsafe -> Bool {
 }
 
 /// Take the head of the highest nonempty level, or `NO_THREAD`.
-public(package) func ready_pop() unsafe -> Int {
+public(package) func ready_pop() unsafe -> ThreadIndex {
     if READY_BITS == 0 {
         return NO_THREAD
     }
     let level = HIGHEST_LEVEL[READY_BITS as Int] as Int
-    let slot = READY_HEAD[level] - 1
-    READY_HEAD[level] = THREADS[slot].link
+    let slot = ThreadIndex(READY_HEAD[level] - 1)
+    READY_HEAD[level] = THREADS.at(slot).link
     if READY_HEAD[level] == 0 {
         READY_TAIL[level] = 0
         READY_BITS = READY_BITS & ~level_bit(level)
     }
-    THREADS[slot].link = 0
+    THREADS.at(slot).link = 0
     slot
 }
 
 /// The thread `ready_pop` would take, left where it is, or `NO_THREAD`.
-public(package) func ready_peek() unsafe -> Int {
+public(package) func ready_peek() unsafe -> ThreadIndex {
     if READY_BITS == 0 {
         return NO_THREAD
     }
-    READY_HEAD[HIGHEST_LEVEL[READY_BITS as Int] as Int] - 1
+    ThreadIndex(READY_HEAD[HIGHEST_LEVEL[READY_BITS as Int] as Int] - 1)
 }
 
 /// Take ready thread `slot` off its level's list, leaving the others where
@@ -481,17 +522,17 @@ public(package) func ready_peek() unsafe -> Int {
 /// A walk of that one list with a trailing pointer, as `ready_remove_process`
 /// makes of each: at most as many nodes as the thread slab is long, each an
 /// O(1) body, and no preemption point, for that function's reason.
-public(package) func ready_remove(slot: Int) unsafe -> Bool {
-    let level = THREADS[slot].level as Int
+public(package) func ready_remove(slot: ThreadIndex) unsafe -> Bool {
+    let level = THREADS.at(slot).level as Int
     var prev: Int = 0
     var cur = READY_HEAD[level]
     while cur != 0 {
-        let next = THREADS[cur - 1].link
+        let next = THREADS.at(ThreadIndex(cur - 1)).link
         if cur == slot + 1 {
             if prev == 0 {
                 READY_HEAD[level] = next
             } else {
-                THREADS[prev - 1].link = next
+                THREADS.at(ThreadIndex(prev - 1)).link = next
             }
             if READY_TAIL[level] == cur {
                 READY_TAIL[level] = prev
@@ -499,7 +540,7 @@ public(package) func ready_remove(slot: Int) unsafe -> Bool {
             if READY_HEAD[level] == 0 {
                 READY_BITS = READY_BITS & ~level_bit(level)
             }
-            THREADS[slot].link = 0
+            THREADS.at(slot).link = 0
             return true
         }
         prev = cur
@@ -509,15 +550,15 @@ public(package) func ready_remove(slot: Int) unsafe -> Bool {
 }
 
 /// Move ready thread `slot`, the head of its level, to that level's tail.
-public(package) func ready_rotate(slot: Int) unsafe {
-    let level = THREADS[slot].level as Int
+public(package) func ready_rotate(slot: ThreadIndex) unsafe {
+    let level = THREADS.at(slot).level as Int
     if READY_TAIL[level] == slot + 1 {
         return
     }
-    READY_HEAD[level] = THREADS[slot].link
-    THREADS[READY_TAIL[level] - 1].link = slot + 1
+    READY_HEAD[level] = THREADS.at(slot).link
+    THREADS.at(ThreadIndex(READY_TAIL[level] - 1)).link = slot + 1
     READY_TAIL[level] = slot + 1
-    THREADS[slot].link = 0
+    THREADS.at(slot).link = 0
 }
 
 /// Give started thread `slot` the level `level`, moving it to the tail of that
@@ -529,13 +570,13 @@ public(package) func ready_rotate(slot: Int) unsafe {
 /// level is only written; the caller that lowered it asks for the switch
 /// itself, since a lowered running thread can be below a ready one. A parked
 /// thread is written too, and its wake pushes it at the level it has then.
-public(package) func set_level(slot: Int, level: UInt8) unsafe {
-    if THREADS[slot].level == level {
+public(package) func set_level(slot: ThreadIndex, level: UInt8) unsafe {
+    if THREADS.at(slot).level == level {
         return
     }
-    match THREADS[slot].state {
+    match THREADS.at(slot).state {
         case Runnable -> ready_move(slot, level),
-        case _ -> { THREADS[slot].level = level },
+        case _ -> { THREADS.at(slot).level = level },
     }
 }
 
@@ -545,11 +586,11 @@ public(package) func set_level(slot: Int, level: UInt8) unsafe {
 /// A ready thread is always on its level's list: every write of `Runnable` is
 /// followed by a push, and every level change of a ready thread comes here.
 /// So the removal finds it, and its `fatal_kernel` is a kernel bug's stop.
-func ready_move(slot: Int, level: UInt8) unsafe {
+func ready_move(slot: ThreadIndex, level: UInt8) unsafe {
     if not ready_remove(slot) {
         fatal_kernel("a ready thread was on no ready list", slot as UInt)
     }
-    THREADS[slot].level = level
+    THREADS.at(slot).level = level
     ready_push(slot)
 }
 
@@ -575,18 +616,18 @@ public(package) func ready_remove_process(p: Int) unsafe {
         var prev: Int = 0
         var cur = READY_HEAD[level]
         while cur != 0 {
-            let slot = cur - 1
-            let next = THREADS[slot].link
-            if THREADS[slot].process == p {
+            let slot = ThreadIndex(cur - 1)
+            let next = THREADS.at(slot).link
+            if THREADS.at(slot).process == p {
                 if prev == 0 {
                     READY_HEAD[level] = next
                 } else {
-                    THREADS[prev - 1].link = next
+                    THREADS.at(ThreadIndex(prev - 1)).link = next
                 }
                 if READY_TAIL[level] == cur {
                     READY_TAIL[level] = prev
                 }
-                THREADS[slot].link = 0
+                THREADS.at(slot).link = 0
             } else {
                 prev = cur
             }
@@ -656,11 +697,11 @@ public(package) func band_map_highest(map: UInt32) -> UInt8 {
 // -----------------------------------------------------------------------------
 
 /// Take a free thread slot, or `NO_THREAD` when the slab is empty.
-public(package) func alloc_thread() unsafe -> Int {
+public(package) func alloc_thread() unsafe -> ThreadIndex {
     var i: Int = 0
     while i < THREADS.capacity() {
-        match THREADS[i].state {
-            case Free -> { return i },
+        match THREADS.at(ThreadIndex(i)).state {
+            case Free -> { return ThreadIndex(i) },
             case _ -> {},
         }
         i = i + 1
@@ -677,9 +718,9 @@ public(package) func alloc_thread() unsafe -> Int {
 ///
 /// The slot's generation moves on here and nowhere else, so the ID of the
 /// thread that was in it no longer names the slot's next occupant.
-public(package) func free_thread_slot(t: Int) unsafe {
-    let next = ((THREADS[t].generation as UInt) + 1) % GENERATION_MODULUS
-    THREADS[t] = ThreadSlot(state: ThreadState.Free, level: 0, base_level: 0,
+public(package) func free_thread_slot(t: ThreadIndex) unsafe {
+    let next = ((THREADS.at(t).generation as UInt) + 1) % GENERATION_MODULUS
+    THREADS.at(t) = ThreadSlot(state: ThreadState.Free, level: 0, base_level: 0,
                             process: 0, exit_code: 0, joiners: 0, link: 0,
                             wait_buf: 0, call_pipe: 0, call_claim: 0,
                             call_src: 0, call_len: 0, latency_irq: 0,
@@ -708,13 +749,13 @@ static_assert(hal.THREAD_ID_GENERATION_BITS <= 32,
 /// The generation a new thread in free slot `t` takes: the slot's own, which
 /// its last free moved on. Every write that puts a thread in a slot reads it
 /// here, so no occupant takes an ID an earlier one had.
-public(package) func slot_generation(t: Int) unsafe -> UInt32 {
-    THREADS[t].generation
+public(package) func slot_generation(t: ThreadIndex) unsafe -> UInt32 {
+    THREADS.at(t).generation
 }
 
 /// The ID of the thread in slot `t`. It names the thread and grants nothing.
-public(package) func thread_id(t: Int) unsafe -> UInt {
-    ((THREADS[t].generation as UInt) << hal.THREAD_ID_INDEX_BITS) |
+public(package) func thread_id(t: ThreadIndex) unsafe -> UInt {
+    ((THREADS.at(t).generation as UInt) << hal.THREAD_ID_INDEX_BITS) |
         ((t + 1) as UInt)
 }
 
@@ -734,8 +775,8 @@ public(package) func live_threads(p: Int) unsafe -> Int {
     var live: Int = 0
     var i: Int = 0
     while i < THREADS.capacity() {
-        if THREADS[i].process == p {
-            match THREADS[i].state {
+        if THREADS.at(ThreadIndex(i)).process == p {
+            match THREADS.at(ThreadIndex(i)).state {
                 case Free -> {},
                 case Exited -> {},
                 case Invalid -> {},
@@ -761,17 +802,17 @@ public(package) func unjoin_process(p: Int) unsafe {
     while t < THREADS.capacity() {
         // Slot + 1 throughout, matching the list's own encoding.
         var prev: Int = 0
-        var cur = THREADS[t].joiners
+        var cur = THREADS.at(ThreadIndex(t)).joiners
         while cur != 0 {
-            let slot = cur - 1
-            let next = THREADS[slot].link
-            if THREADS[slot].process == p {
+            let slot = ThreadIndex(cur - 1)
+            let next = THREADS.at(slot).link
+            if THREADS.at(slot).process == p {
                 if prev == 0 {
-                    THREADS[t].joiners = next
+                    THREADS.at(ThreadIndex(t)).joiners = next
                 } else {
-                    THREADS[prev - 1].link = next
+                    THREADS.at(ThreadIndex(prev - 1)).link = next
                 }
-                THREADS[slot].link = 0
+                THREADS.at(slot).link = 0
             } else {
                 prev = cur
             }
@@ -782,10 +823,10 @@ public(package) func unjoin_process(p: Int) unsafe {
 }
 
 /// Park the running thread on `target`'s joiner list.
-public(package) func block_on_join(slot: Int, target: Int) unsafe {
-    THREADS[slot].state = ThreadState.Blocked
-    THREADS[slot].link = THREADS[target].joiners
-    THREADS[target].joiners = slot + 1
+public(package) func block_on_join(slot: ThreadIndex, target: ThreadIndex) unsafe {
+    THREADS.at(slot).state = ThreadState.Blocked
+    THREADS.at(slot).link = THREADS.at(target).joiners
+    THREADS.at(target).joiners = slot + 1
     NEED_RESCHED = true
 }
 
@@ -796,5 +837,5 @@ public(package) func calling_process() unsafe -> Int {
     if CURRENT_THREAD == NO_THREAD {
         return 0
     }
-    THREADS[CURRENT_THREAD].process
+    THREADS.at(CURRENT_THREAD).process
 }
