@@ -3967,7 +3967,7 @@ and every process — is the arena accessors and the word atomics. Each user HAL
 its syscall instruction and its thread register's two accessors, and nothing
 else. The arena's heap, taken under std's `SpinLock`, and the frozen
 `__saw_rt_*` seams are Saw in `rt/common/src/`, one copy serving the
-kernel and every process; the process side's four hooks and its parked boot
+kernel and every process; the process side's hooks and its parked boot
 handle are Saw in `kernel/sysapi/`, beside the System object whose authority
 they spend. A free the heap can tell is bad (a block freed twice while its
 header still says free, a pointer outside the arena, before its first block,
@@ -3989,14 +3989,17 @@ per thread on every profile, and the kernel, one context, answers one
 constant. A thread that has a block (the main thread of a program written
 with `main`) answers with the block's address, which its start-up writes
 there first; any other is numbered on first ask, with an odd number, so no
-number is a block's address. The fourth is the output lock's wait: a process
-yields through the calling thread's own Thread handle, which its block
-holds, and the kernel does nothing, never finding the lock held by another.
-`print`'s lines and a task dump are written whole under that lock, which is
-recursive and which a panic takes and keeps. A thread context
-is built in Saw (`frame_init`, and a `resume_frame` that branches into the trap
-entry's own restore path), so no register-clearing prologue is needed in
-assembly.
+number is a block's address. The output lock's hooks answer the caller's
+thread ID (a process's block keeps it, and a thread with none asks the
+kernel), a wait on the lock's words and a wake of their waiters: a process
+makes the two kernel ops, and the kernel refuses the wait and does nothing
+for the wake, never finding the lock held by another. A section's last
+leave yields through the calling thread's own Thread handle, which its block
+holds. `print`'s lines and a task dump are written whole under the output
+lock, which is recursive and which a panic takes and keeps (§7). A thread
+context is built in Saw (`frame_init`, and a `resume_frame` that branches
+into the trap entry's own restore path), so no register-clearing prologue is
+needed in assembly.
 
 **The panic path is check-free by construction.** The console writer the runtime
 seams call is Saw, and it is check-free by construction rather than by
@@ -4183,11 +4186,10 @@ arm their own.
   `ThreadOp.Exit`, while its process's depth is nonzero faults the
   process (`FaultReason.SectionHeld`, 15, the line `SOS: process fault:
   parked inside its critical section`): no sibling could run again. A
-  print inside a section parks only through a console driver whose ring
-  is full, and waits for good, without a fault, while a sibling holds the
-  runtime's output lock: the wait yields, and the held section hands the
-  processor straight back to its holder. Until that lock wait parks, a
-  print inside a section is safe only while no sibling holds the lock.
+  print inside a section parks through a console driver whose ring is
+  full, and when a sibling holds the runtime's output lock, which it waits
+  for by parking: both fault the process. A print inside a section is safe
+  only while no sibling holds the lock and the console does not park.
 - **Its registration.** The answers to `SectionWord`, in the order they
   are decided: a handle without the right is `AccessDenied`; a handle
   naming another process is the `NotSelf` fault; an address that is not
@@ -4306,6 +4308,23 @@ arm their own.
   pair's address, and `sos_thread_id`, `sos_lock_wait` and `sos_lock_wake`.
   `Revoked` comes back from `take` as the error, and a give of a lock the
   caller does not hold panics.
+- **The runtime's locks.** Each window of the runtime's arena and of its
+  pool heaps keeps its spin lock, which excludes, and runs inside the
+  process's section once the word is registered, which defers the holder's
+  preemption: a thread above a preempted allocator is not left spinning on
+  it. Nothing relies on a process's threads never running at once. The runtime
+  registers the word itself, the first time the program makes a thread
+  through `thread_create(run:)`, so a program with one thread makes no extra
+  call; a program that makes threads another way calls
+  `Process.section_register()` itself before it makes them, and until it
+  does its windows run unguarded. The output lock is this section's lock:
+  its owner word is the holder's thread ID, for every thread, a thread with
+  no block included; the recursion depth is the runtime's and only the
+  holder touches it; every waiter parks with `LOCK_WAIT_OP`; and the last
+  give of a lock whose waiters flag is set answers them with
+  `LOCK_WAKE_OP`. A wait that answers `Revoked`, the holder having exited
+  holding the lock, panics, naming the output lock. The panic sink takes the
+  lock and never gives it back.
 - **Launching is a capability.** `process_create` requires the launch
   capability, `SystemRight.ProcessCreate`, minted at boot to the root
   server. Ordinary processes cannot create processes in v1 — they ask the

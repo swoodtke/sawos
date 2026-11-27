@@ -50,7 +50,7 @@ import sosabi
 
 // The scalar-to-console-byte rule, shared with the kernel's own console so the
 // two cannot disagree about what a non-ASCII scalar becomes.
-import sosrt.{ascii_byte}
+import sosrt.{ascii_byte, section_claim}
 
 import sos.floor.{ALL_RIGHTS, call_value, checked, park_system_handle,
                   sos_handle_release, sos_process_boot_handle_next,
@@ -926,6 +926,14 @@ extension Process {
                               stack_top: UInt) -> Result<thread.Thread, SosStatus> {
         if not self.names_caller {
             panic("sos: thread_create(run:) works only through the caller's own Process handle, from System.process_self()")
+        }
+        // The runtime's locks take the section once the process has a second
+        // thread to hold back, so the first create registers it.
+        if section_claim() {
+            let status = sos_process_section_register(self.handle)
+            if status != (SosStatus.Ok as UInt) {
+                panic("sos: thread_create(run:) could not register the section word: {}", status)
+            }
         }
         create_thread(self.handle, run.address(), arg, stack_top)
     }

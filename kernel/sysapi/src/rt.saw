@@ -1,14 +1,15 @@
-//! The runtime's five hooks, process side.
+//! The runtime's hooks, process side.
 //!
-//! `sosrt` implements the frozen `__saw_rt_*` seams over five per-side hooks:
+//! `sosrt` implements the frozen `__saw_rt_*` seams over per-side hooks:
 //! where a byte goes, how a run ends with a text, which thread asks, how a
-//! thread waiting for the output lock gives the processor up, and how a pool
-//! heap grows. The kernel HAL answers "the UART", "write the text, stop the
-//! board" and "no growth". A process owns no device, so it answers with kernel
-//! ops: a byte goes to the console's driver over a pipe, or out through a
-//! System op in a process with no console (the console's section), the end is
-//! the kernel's panic op, which puts the text on its fault line and ends the
-//! process, and a growth is its pool's ops (the last section). If `panic()`
+//! thread's section gives the processor up, how a thread waits for the output
+//! lock and answers its waiters, and how a pool heap grows. The kernel HAL
+//! answers "the UART", "write the text, stop the board" and "no growth". A
+//! process owns no device, so it answers with kernel ops: a byte goes to the
+//! console's driver over a pipe, or out through a System op in a process with
+//! no console (the console's section), the end is the kernel's panic op, which
+//! puts the text on its fault line and ends the process, and a growth is its
+//! pool's ops (the last section). If `panic()`
 //! could reach a UART from userspace, the user/kernel split would be claimed
 //! rather than real. Which thread asks, and the yield, it answers from the
 //! thread register, whose layout this file also keeps: the blocks, and the
@@ -27,7 +28,8 @@
 
 import sos.floor.{SYSTEM_HANDLE, PRINT_ANSWER, PRINT_UNASKED, PRINT_DEBUG,
                   PRINT_SILENT, sos_handle_info, sos_system_debug_print,
-                  sos_panic, sos_thread_yield, sos_thread_id}
+                  sos_panic, sos_thread_yield, sos_thread_id, sos_lock_wait,
+                  sos_lock_wake}
 import sos.thread.{Thread}
 import sosabi.{PANIC_TEXT_BYTES, NO_HANDLE, ThreadHandle, HandleInfo,
                HandleKind, SystemRight}
@@ -211,14 +213,12 @@ func rt_lock_owner() unsafe -> Int {
     Int.from(truncating: fresh)
 }
 
-/// Give the processor up while the output lock is held by another thread: the
-/// output lock's yield hook.
+/// Give the processor up when the section held a thread back: the section's
+/// yield hook.
 ///
 /// It yields through the calling thread's own Thread handle, which its block
 /// holds. A thread with no block, or a block holding no handle yet, does
-/// nothing, and its wait spins until a tick moves it. That cannot hang: a
-/// holder parks inside the lock only on a console's ring, and only a thread
-/// with a block writes to one.
+/// nothing, and the thread it held back runs at the next switch.
 @export("sos_rt_yield")
 func rt_yield() unsafe {
     let thread = own_thread_handle()
@@ -238,6 +238,28 @@ func own_thread_handle() unsafe -> UInt {
     UnsafeMemory<ThreadBlock, Normal>(word).read().thread
 }
 
+/// The output lock's ID hook: the calling thread's ID, which the lock's owner
+/// word holds while the thread holds it.
+@export("sos_rt_thread_id")
+func rt_thread_id() unsafe -> Int {
+    Int.from(truncating: own_thread_id())
+}
+
+/// The output lock's wait hook: park until the holder gives the lock at
+/// `lock` back, raising it meanwhile (`LOCK_WAIT_OP`). Answers `Ok` to swap
+/// again, or a refusal when the holder is gone.
+@export("sos_rt_lock_wait")
+func rt_lock_wait(lock: UInt) -> UInt {
+    sos_lock_wait(lock)
+}
+
+/// The output lock's wake hook: answer the threads parked on the lock at
+/// `lock` (`LOCK_WAKE_OP`).
+@export("sos_rt_lock_wake")
+func rt_lock_wake(lock: UInt) -> UInt {
+    sos_lock_wake(lock)
+}
+
 /// The calling thread's ID (spec §7): the one its block keeps, read at the
 /// thread's start, or for a thread with no block, the kernel's answer now.
 public(package) func own_thread_id() unsafe -> UInt {
@@ -249,7 +271,7 @@ public(package) func own_thread_id() unsafe -> UInt {
 }
 
 /// A thread's block: the per-thread place its thread register names, holding
-/// the thread's own Thread handle, through which the output lock's wait
+/// the thread's own Thread handle, through which a section's last leave
 /// yields, and its ID, which it takes locks with.
 ///
 /// The block lives for its thread's life wherever the thread put it: the main
@@ -592,10 +614,11 @@ func console_call(at: UInt, len: UInt) unsafe -> UInt {
 // A pool heap's growth
 // -----------------------------------------------------------------------------
 //
-// `sosrt`'s fifth hook. It runs inside the heap's lock, so it is check-free on
-// `rt_write`'s terms: raw floor calls, wrapping arithmetic, no allocation and
-// no panic. Every op it makes answers at once, or ends the process inside the
-// kernel, which the rights read before each spend rule out.
+// `sosrt`'s pool heap hook. It runs inside the heap's lock, so it is
+// check-free on `rt_write`'s terms: raw floor calls, wrapping arithmetic, no
+// allocation and no panic. Every op it makes answers at once, or ends the
+// process inside the kernel, which the rights read before each spend rule
+// out.
 
 import sosrt.{PoolHeap, GrowRefusal}
 import sosabi.{MemoryRight, MappingRight, MappingOp, MapAccess,

@@ -475,6 +475,10 @@ CHILD_HEAP_ARENA_PKG = os.path.join(TESTS_DIR, "child-heap-arena")
 CHILD_HEAP_BOUND_PKG = os.path.join(TESTS_DIR, "child-heap-bound")
 CHILD_HEAP_MAIN_PKG = os.path.join(TESTS_DIR, "child-heap-main")
 CHILD_HEAP_RACE_PKG = os.path.join(TESTS_DIR, "child-heap-race")
+HEAP_TWO_LEVELS_PKG = os.path.join(TESTS_DIR, "heap-two-levels")
+CHILD_RT_HEAP_PKG = os.path.join(TESTS_DIR, "child-rt-heap")
+HEAP_REVOKED_PKG = os.path.join(TESTS_DIR, "heap-revoked")
+CHILD_RT_REVOKED_PKG = os.path.join(TESTS_DIR, "child-rt-revoked")
 MAP_BASICS_PKG = os.path.join(TESTS_DIR, "map-basics")
 MAP_UNMAP_PKG = os.path.join(TESTS_DIR, "map-unmap")
 MAP_INTO_CHILD_PKG = os.path.join(TESTS_DIR, "map-into-child")
@@ -1047,6 +1051,9 @@ CHILD_MAIN_LEND_PROCESS_PKG = os.path.join(TESTS_DIR,
 # refuses; and a `_start` root whose second thread waits on the output lock.
 MAIN_UNIMPORTED_PKG = os.path.join(TESTS_DIR, "main-unimported")
 LOCK_WAIT_PKG = os.path.join(TESTS_DIR, "lock-wait")
+RT_ARENA_PKG = os.path.join(TESTS_DIR, "rt-arena")
+RT_LAZY_PKG = os.path.join(TESTS_DIR, "rt-lazy")
+RT_OUTPUT_PKG = os.path.join(TESTS_DIR, "rt-output")
 # A `main` program reading fields `sos` keeps to itself (handle words, a boot
 # set's records, a boot record's slots), which the compile refuses.
 HANDLE_SEALED_PKG = os.path.join(TESTS_DIR, "handle-sealed")
@@ -2367,7 +2374,7 @@ def _console_print_cases(files):
             # lines with the `Handle` row full each go as a call, which mints
             # no claim. The first thread fills the ring inside a line and
             # parks in a call holding the output lock, so the second waits
-            # for the lock, yielding, and its lines come after.
+            # for the lock, parked, and its lines come after.
             #
             # Root and the driver print through the kernel's debug print.
             # The driver counts the messages: the record's line, the
@@ -15248,11 +15255,11 @@ TEST_CASES = [
         # The output lock's wait in a `_start` package (`lock-wait`): the
         # initial thread takes the lock and prints, a worker's `print` then
         # waits for it, and the initial thread prints again and gives it
-        # back before the worker's line arrives. The worker has no block, and
-        # its lock-owner number is odd, so the yield hook does nothing and
-        # the tick hands the processor back; an even number would be read as
-        # a block's address. The tick moves the processor and the lock makes
-        # the order, so nothing here depends on how many ticks pass.
+        # back before the worker's line arrives. Neither thread has a block:
+        # each asks the kernel for its ID, which is the lock's owner word, and
+        # the worker parks on the lock and is answered at the give. The tick
+        # moves the processor and the lock makes the order, so nothing here
+        # depends on how many ticks pass.
         "name": "output_lock_wait",
         "src": os.path.join(KERNEL_DIR, "main.saw"),
         "tick": True,
@@ -15263,6 +15270,55 @@ TEST_CASES = [
                        "back\n",
                        "SOS lockwait: the waiter's line\n",
                        "SOS lockwait: joined the waiter, which exited 7\n"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The runtime's arena under two levels (`rt-arena`): a Low thread
+        # takes and gives back blocks while a High thread, woken by a Timer
+        # once a round, takes its own. Each arena window runs inside the
+        # section, so the High thread never finds the lock a preempted Low
+        # thread holds; with the window outside the section it spins for good
+        # and the case times out. No tick: the Timer's wakes are the only
+        # preemptions, and what is asserted is that both threads finish, not
+        # how long they take or how many blocks the Low thread took.
+        "name": "rt_arena_two_levels",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": RT_ARENA_PKG,
+        "expect_out": ["SOS rtarena: the High thread took and checked 100 "
+                       "blocks\n",
+                       "SOS rtarena: the Low thread ended\n",
+                       "SOS rtarena: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The runtime registers the section word at the first
+        # `thread_create(run:)` (`rt-lazy`): that create costs one call more
+        # than the second, whose count is the same without it. Registration
+        # at start-up reads 0, and one at every create ends the process at
+        # the second with the kernel's refusal of a second registration.
+        "name": "rt_register_lazy",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": RT_LAZY_PKG,
+        "expect_out": ["SOS rtlazy: the first create cost 1 more call than "
+                       "the second\n",
+                       "SOS rtlazy: both threads ran\n",
+                       "SOS rtlazy: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The runtime's output lock raises its holder (`rt-output`), with no
+        # tick: L, at Low, holds the lock and is left ready; M, at Normal,
+        # spins on a word; H, at High, prints, which waits for L's lock and
+        # raises L above M. L's line comes first, then H's, which sets M's
+        # word, then M's. With a lock that does not raise its holder, H waits
+        # above L and M spins above it for good, and the case times out.
+        "name": "rt_output_inherit",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": RT_OUTPUT_PKG,
+        "expect_out": ["SOS rtout: L holds the lock, and its line is whole\n"
+                       "SOS rtout: H's line\n"
+                       "SOS rtout: M's line\n"
+                       "SOS rtout: done"],
         "expect_clean_exit": True,
     },
     {
@@ -15869,6 +15925,49 @@ TEST_CASES = [
                        "yields",
                        "SOS heaprace: blocks disjoint, markers intact",
                        "SOS heaplaunch: race ended status=65536",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The runtime's pool heap under two levels (`child-rt-heap`): a Low
+        # thread takes and gives back blocks from a default heap over a pool,
+        # growth included, while a High thread, woken by a Timer once a
+        # round, takes its own. Each heap window runs inside the section, so
+        # the High thread never finds the lock a preempted Low thread holds;
+        # with the windows outside the section it spins for good and the case
+        # times out. No tick: the Timer's wakes are the only preemptions, and
+        # what is asserted is that both threads finish.
+        "name": "rt_heap_two_levels",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_TWO_LEVELS_PKG,
+        "children": [CHILD_RT_HEAP_PKG],
+        "heap_pools": [0x8000],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={three}",
+                       "SOS rtheap: the High thread took and checked 100 "
+                       "blocks\n",
+                       "SOS rtheap: the Low thread ended\n",
+                       "SOS heaplaunch: two levels ended status=65536\n",
+                       "SOS heaplaunch: done"],
+        "expect_clean_exit": True,
+    },
+    {
+        # The output lock's holder exits holding it (`child-rt-revoked`), and
+        # another thread prints: the wait answers `Revoked`, and the runtime
+        # panics, naming the output lock. The panic sink takes the lock too;
+        # its wait finds the same dead holder and goes on without the lock,
+        # so the report reaches the kernel's fault line.
+        "name": "rt_output_revoked",
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "root_pkg": HEAP_REVOKED_PKG,
+        "children": [CHILD_RT_REVOKED_PKG],
+        "expect_out": ["{banner}",
+                       "SOS: boot regions={two}",
+                       *_panic_fault("{one}", "panic at lib.saw:",
+                                     ": sos: the output lock's holder exited "
+                                     "holding it"),
+                       f"SOS heaplaunch: revoked ended "
+                       f"status={STATUS_PANICKED}\n",
                        "SOS heaplaunch: done"],
         "expect_clean_exit": True,
     },
@@ -23067,7 +23166,9 @@ def _esp32s3_smoke(wanted, emit=None, emit_out=None, emit_clock=None,
                      "boot_set_release", "main_start", "main_no_heap",
                      "main_no_system", "main_no_system_lend_system",
                      "main_no_system_lend_process", "main_not_imported",
-                     "output_lock_wait", "start_print", "thread_run",
+                     "output_lock_wait", "rt_output_inherit",
+                     "rt_heap_two_levels", "rt_output_revoked",
+                     "start_print", "thread_run",
                      "thread_take", "pool_back", "pool_back_reuse",
                      "pool_meet", "pool_cut_rights", "pool_odd_len",
                      "pool_from_bad", "memory_extend",

@@ -56,8 +56,9 @@ value register takes a buffer argument and the kernel copies its answer out
 (`Waiter.Wait` is the first, spec §2.2), so the `svc` operand list keeps its
 shape. Same contract as the riscv32 twin, which states the reasoning.
 
-The runtime's four hooks (`sos_rt_write`, `sos_rt_abort`,
-`sos_rt_lock_owner`, `sos_rt_yield`) and the parked boot
+The runtime's hooks (`sos_rt_write`, `sos_rt_abort`, `sos_rt_lock_owner`,
+`sos_rt_thread_id`, `sos_rt_lock_wait`, `sos_rt_lock_wake`, `sos_rt_yield`,
+`sos_rt_grow`) and the parked boot
 handle are part of a process's contract but are not this directory's. See
 `kernel/sysapi/src/lib.saw`.
 

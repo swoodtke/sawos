@@ -81,8 +81,9 @@ keeps the syscall instruction's operand list the same shape, which is the only
 part of a process that has to know it is riscv32 — a per-answer register
 convention would make this file grow with the object model.
 
-The runtime's four hooks (`sos_rt_write`, `sos_rt_abort`,
-`sos_rt_lock_owner`, `sos_rt_yield`) and the parked boot
+The runtime's hooks (`sos_rt_write`, `sos_rt_abort`, `sos_rt_lock_owner`,
+`sos_rt_thread_id`, `sos_rt_lock_wait`, `sos_rt_lock_wake`, `sos_rt_yield`,
+`sos_rt_grow`) and the parked boot
 handle are part of a process's contract but are not this directory's. See
 `kernel/sysapi/src/lib.saw`, and `rt/common/src/lib.saw` for what calls them.
 

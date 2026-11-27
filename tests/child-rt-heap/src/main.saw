@@ -1,0 +1,140 @@
+// The runtime's pool heap under two levels (spec §7): `rt-arena`'s round in
+// a child whose only heap is a default heap over a pool, which grows as the
+// threads take blocks. The launcher (`heapkit`, `Case.TwoLevels`) gives the
+// child the pool and a System that holds the Clock. The child's map is the
+// simple one: `Low` at level 1, `Normal` at 2 and `High` at 3, with no tick.
+//
+// A Low thread takes a block and gives it back in a loop that ends when the
+// High thread says it is done. The High thread arms a one-shot Timer, parks on
+// a Waiter attached to it, and on each fire takes a block, writes it, reads it
+// back and gives it back, for `ROUNDS` rounds. A fire lands wherever the Low
+// thread is, most often inside the heap's window, which includes its growth.
+// Each window runs inside the section, so the High thread finds the heap free.
+// Were the windows outside the section, the High thread would preempt the Low
+// thread inside one, find the lock held and spin above the only thread that
+// could give it back, for good. What decides the case is that both threads
+// finish, so nothing here reads the clock but the Timer's delay:
+//
+//   SOS rtheap: the High thread took and checked 100 blocks
+//   SOS rtheap: the Low thread ended
+
+import sos.{Priority, SosStatus, Thread}
+import sosmain
+
+// Declared as `std.alloc` declares them, since a program's declarations of one
+// symbol must agree; `sosrt` defines them.
+extern "C" {
+    func __saw_rt_alloc(size: Int, align: Int) -> UnsafePointer<Int8>?
+    func __saw_rt_dealloc(ptr: UnsafePointer<Int8>, size: Int, align: Int)
+}
+
+/// How many fires the High thread waits for.
+static ROUNDS: Int = 100
+
+/// The Timer's delay. Whenever it ends, the Low thread is running or about to.
+static FIRE_NS: UInt64 = 100_000
+
+static KEY_FIRE: UInt = 7
+
+static LOW_BYTES: Int = 48
+static HIGH_BYTES: Int = 64
+static BLOCK_ALIGN: Int = 8
+static FILL: UInt8 = 0xA5u8
+
+/// Set by the High thread when its rounds are over.
+static DONE: Atomic<Int> = Atomic(0)
+
+/// Each thread's stack.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_HIGH: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_LOW: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top_of(base: UInt) -> UInt {
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func top_high() unsafe -> UInt {
+    top_of(((&var STACK_HIGH) as UnsafePointer<UInt>) as UInt)
+}
+
+func top_low() unsafe -> UInt {
+    top_of(((&var STACK_LOW) as UnsafePointer<UInt>) as UInt)
+}
+
+func main() -> Result<Void, SosStatus> {
+    let high = try sosmain.context().process().thread_create(
+        run: high_runs, arg: 0, stack_top: top_high())
+    let low = try sosmain.context().process().thread_create(
+        run: low_runs, arg: 0, stack_top: top_low())
+    try high.start(band: Priority.High)
+    try low.start(band: Priority.Low)
+    let rounds = try high.join()
+    print("SOS rtheap: the High thread took and checked {} blocks", rounds)
+    let _ = try low.join()
+    print("SOS rtheap: the Low thread ended")
+    return
+}
+
+/// The High thread: one block a fire.
+func high_runs(arg: UInt) sync -> UInt {
+    fires()
+    ROUNDS as UInt
+}
+
+func fires() unsafe sync {
+    let clock = try sosmain.context().system().clock_get() catch {
+        panic("SOS rtheap: no clock: {}", error)
+    }
+    let timer = try clock.timer_create() catch {
+        panic("SOS rtheap: no timer: {}", error)
+    }
+    let waiter = try sosmain.context().process().waiter_create() catch {
+        panic("SOS rtheap: no waiter: {}", error)
+    }
+    try waiter.add(timer: &timer, key: KEY_FIRE) catch {
+        panic("SOS rtheap: the timer was not attached: {}", error)
+    }
+    var round = 0
+    while round < ROUNDS {
+        try timer.arm(after_ns: FIRE_NS) catch {
+            panic("SOS rtheap: the timer was not armed: {}", error)
+        }
+        let _ = try waiter.wait() catch {
+            panic("SOS rtheap: the wait was refused: {}", error)
+        }
+        take_and_check()
+        round = round + 1
+    }
+    DONE.store(1)
+}
+
+/// A block, written and read back, and given back.
+func take_and_check() unsafe sync {
+    let block = __saw_rt_alloc(HIGH_BYTES, BLOCK_ALIGN)! as UInt
+    var at: UInt = 0
+    while at < (HIGH_BYTES as UInt) {
+        UnsafeMemory<UInt8, Normal>(block + at).write(FILL)
+        at = at + 1
+    }
+    at = 0
+    while at < (HIGH_BYTES as UInt) {
+        if UnsafeMemory<UInt8, Normal>(block + at).read() != FILL {
+            panic("SOS rtheap: a block lost its bytes")
+        }
+        at = at + 1
+    }
+    __saw_rt_dealloc(block as UnsafePointer<Int8>, HIGH_BYTES, BLOCK_ALIGN)
+}
+
+/// The Low thread: a block and its return, until the High thread is done.
+func low_runs(arg: UInt) sync -> UInt {
+    churn()
+    0
+}
+
+func churn() unsafe sync {
+    while DONE.load() == 0 {
+        let block = __saw_rt_alloc(LOW_BYTES, BLOCK_ALIGN)! as UInt
+        __saw_rt_dealloc(block as UnsafePointer<Int8>, LOW_BYTES, BLOCK_ALIGN)
+    }
+}

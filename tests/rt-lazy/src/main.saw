@@ -1,0 +1,63 @@
+// The runtime registers its section word the first time the program makes a
+// thread through `thread_create(run:)` (spec §7), and not before and not
+// again. Root reads its own `syscalls` column around its first create and
+// around its second, and the first costs exactly one call more than the
+// second: the registration. A program that registered at start-up would show
+// no difference, and one that registered at every create would have its
+// second refused, ending the process.
+//
+//   SOS rtlazy: the first create cost 1 more call than the second
+//   SOS rtlazy: both threads ran
+//   SOS rtlazy: done
+//
+// Each `stats()` is charged before it answers, so the difference between the
+// three readings holds that call in both stretches alike. Nothing between the
+// readings prints, which would make calls of its own, and the threads are
+// started only after the last reading.
+
+import sos.{SosStatus}
+import sosmain
+
+/// Each thread's stack.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_FIRST: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_SECOND: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top_of(base: UInt) -> UInt {
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func top_first() unsafe -> UInt {
+    top_of(((&var STACK_FIRST) as UnsafePointer<UInt>) as UInt)
+}
+
+func top_second() unsafe -> UInt {
+    top_of(((&var STACK_SECOND) as UnsafePointer<UInt>) as UInt)
+}
+
+func main() -> Result<Void, SosStatus> {
+    let before = try sosmain.context().process().stats()
+    let first = try sosmain.context().process().thread_create(
+        run: runs, arg: 1, stack_top: top_first())
+    let between = try sosmain.context().process().stats()
+    let second = try sosmain.context().process().thread_create(
+        run: runs, arg: 2, stack_top: top_second())
+    let after = try sosmain.context().process().stats()
+    let cost_first = between.syscalls - before.syscalls
+    let cost_second = after.syscalls - between.syscalls
+    print("SOS rtlazy: the first create cost {} more call than the second",
+          cost_first - cost_second)
+    try first.start()
+    try second.start()
+    let a = try first.join()
+    let b = try second.join()
+    if a == 1 && b == 2 {
+        print("SOS rtlazy: both threads ran")
+    }
+    print("SOS rtlazy: done")
+    return
+}
+
+func runs(n: UInt) sync -> UInt {
+    n
+}

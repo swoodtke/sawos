@@ -374,12 +374,14 @@ extern "C" {
 /// The lock guards the heap's descriptor, zero until the first allocation
 /// fills it from the linker's bounds, and holding it is what entitles a thread
 /// to the region the descriptor names: the control block and every block in
-/// it. A thread that finds it held spins until the holder runs again and gives
-/// it back. The loop is std's and spins without yielding. Under one
-/// round-robin level, as the scheduler runs today, the holder runs once the
-/// spinner's slice ends. Under the fixed-priority levels the spec gives, a
-/// spinner above a preempted holder spins for good, and a yield that returns
-/// the spinner to its own level does not change that.
+/// it. The lock is what excludes: a thread that finds it held spins, on
+/// whatever processor it runs, and nothing relies on a process's threads
+/// never running at once. Every window also runs inside the process's section
+/// (`window_open`) once the section word is registered, which only defers
+/// preemption: the holder is not switched away for a sibling while siblings
+/// would spin on the lock. In a process that has not registered, std's spin
+/// does not yield: under one level the holder runs once the spinner's slice
+/// ends, and a spinner above a preempted holder spins for good.
 ///
 /// Nothing in the window can panic or allocate: the heap is check-free and the
 /// window calls nothing else, so the panic path never meets the lock held by
@@ -422,7 +424,7 @@ func rt_lock_owner() -> Int {
 /// Hand out `size` bytes aligned to `align`: from the default heap, growing
 /// it as it needs, and then from the arena; or a null pointer when neither
 /// holds such a block. Each heap's lock is given back before the next is
-/// taken.
+/// taken. The arena's window is inside the process's section (`window_open`).
 ///
 /// A refusal is the caller's to handle, as sawlang's allocator ABI has it: the
 /// seam never panics or aborts on one, and std turns the null pointer into
@@ -431,6 +433,7 @@ func rt_lock_owner() -> Int {
 func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
     var block = heap_alloc(DEFAULT_HEAP, size, align)
     if block == 0 {
+        let entered = window_open()
         arena_arrive()
         block = borrow var heap = ARENA.lock() {
             if heap.size == 0 {
@@ -438,6 +441,7 @@ func rt_alloc(size: UInt, align: UInt) unsafe -> UnsafePointer<Int8> {
             }
             heap.alloc(size, align)
         }
+        window_close(entered)
     }
     block as UnsafePointer<Int8>
 }
@@ -462,14 +466,17 @@ func rt_dealloc(ptr: UnsafePointer<Int8>, size: UInt, align: UInt) unsafe {
         return
     }
     let held = if in_arena(block) {
+        let entered = window_open()
         arena_arrive()
-        borrow var heap = ARENA.lock() {
+        let live = borrow var heap = ARENA.lock() {
             let live = heap.holds(block)
             if live {
                 heap.free(block)
             }
             live
         }
+        window_close(entered)
+        live
     } else {
         heap_free(DEFAULT_HEAP, block)
     }
@@ -488,76 +495,103 @@ func rt_dealloc(ptr: UnsafePointer<Int8>, size: UInt, align: UInt) unsafe {
 // are each written whole under it, so no other thread's output lands inside
 // them.
 //
-// std's `SpinLock` cannot be the lock itself: its window is one block, so it
-// cannot be taken in one call and given back in another; it is not reentrant,
-// and a panic report takes the lock its own thread already holds; and its
-// window always gives the lock back, where the panic sink keeps it. So the
-// `SpinLock` guards the lock's state, an owner and a depth, for a few compares
-// and stores, and the recursion is this module's.
+// It is the inheritance lock of spec §7: two words, an owner and a waiters
+// flag. The owner is the holder's thread ID, which every thread has
+// (`sos_rt_thread_id`, a per-side hook), and the waiters flag is the kernel's.
+// Taking a free lock and giving back one nobody waits for are a
+// compare-and-swap each with no trap. A thread that finds the lock held
+// parks through the `sos_rt_lock_wait` hook, which raises the holder to the
+// waiter's level and answers when the holder gives the lock back; the last
+// give of a lock whose flag is set answers its waiters through
+// `sos_rt_lock_wake`. Every waiter parks, a thread with no block included.
+// This is `sos.Lock`'s protocol, written here because `sos` sits above this
+// module.
 //
-// A thread that finds the lock held by another gives the `SpinLock` back and
-// yields through the fourth per-side hook before it tries again: the holder
-// may be parked, and only giving the processor up lets it run. The kernel
-// answers the hook with nothing, being one context that never waits; a
-// process yields through the calling thread's own Thread handle
-// (`kernel/sysapi/src/rt.saw`). That relies on the scheduler's one ready
-// list: a waiter in a higher priority band than the holder would never let
-// it run.
+// The recursion depth is this module's, and only the holder touches it: a
+// thread that finds its own ID in the owner word counts a take, and the
+// give that brings the depth to zero frees the lock. A give by a thread that
+// does not hold the lock changes nothing.
+//
+// A wait that finds the holder gone (`Revoked`: it exited holding the lock,
+// and nothing will give it back) panics, naming the lock. The panic sink
+// takes this lock, so the report waits again; that wait finds the same dead
+// holder, and the report goes on without the lock, once.
+//
+// The kernel answers the wait with a refusal, being one context that never
+// finds the lock held by another, and the wake with nothing.
 //
 // The ABI's claim priority (a claim is served before plain writes) and its
 // bound on a claim's wait are not kept: the only claimer is the panic sink,
 // and it waits only for a line already being written.
 
 extern "C" {
-    func sos_rt_yield()
+    func sos_rt_thread_id() -> Int
+    func sos_rt_lock_wait(lock: UInt) -> UInt
+    func sos_rt_lock_wake(lock: UInt) -> UInt
 }
 
-/// Who holds the output lock, and how many times over: an owner of zero and a
-/// depth of zero is a free lock.
-struct OutputState {
-    owner: Int
-    depth: UInt
-}
+/// The owner word, then the waiters flag.
+static OUTPUT: [Atomic<Int>; 2]
 
-/// The output lock's state, behind std's `SpinLock`. Nothing in its window can
-/// panic, allocate or trap, so the window is never re-entered, and a thread
-/// loses the processor inside it only to a tick.
-static OUTPUT: SpinLock<OutputState>
+/// How many times the holder has taken the lock; meaningful only while it
+/// holds it.
+static OUTPUT_DEPTH: Atomic<Int>
+
+/// Nonzero once a wait has found the holder gone.
+static OUTPUT_REVOKED: Atomic<Int>
+
+static OUTPUT_OWNER: Int = 0
+static OUTPUT_WAITERS: Int = 1
+
+/// The lock's two words, which the kernel's ops take.
+func output_words() unsafe -> UInt {
+    ((&OUTPUT) as UnsafePointer<Atomic<Int>>) as UInt
+}
 
 /// Take the output lock, waiting while another thread holds it. A thread that
 /// holds it already takes it again.
 @export("__saw_rt_output_lock")
-public func rt_output_lock() {
-    let me = sos_rt_lock_owner()
-    while not output_take(me) {
-        sos_rt_yield()
+public func rt_output_lock() unsafe {
+    let me = sos_rt_thread_id()
+    if OUTPUT[OUTPUT_OWNER].load() == me {
+        OUTPUT_DEPTH.store(OUTPUT_DEPTH.load() &+ 1)
+        return
+    }
+    while not OUTPUT[OUTPUT_OWNER].compare_exchange(0, me) {
+        if sos_rt_lock_wait(output_words()) != 0 {
+            output_revoked()
+            return
+        }
+    }
+    OUTPUT_DEPTH.store(1)
+}
+
+/// The holder is gone: panic, once. A later wait, the panic sink's included,
+/// goes on without the lock.
+func output_revoked() {
+    if OUTPUT_REVOKED.compare_exchange(0, 1) {
+        panic("sos: the output lock's holder exited holding it")
     }
 }
 
-/// Give the output lock back once: the last give of a holder frees it. A give
-/// with the lock free changes nothing.
+/// Give the output lock back once: the last give of a holder frees it, and
+/// answers the threads waiting for it. A give by a thread that does not hold
+/// the lock changes nothing.
 @export("__saw_rt_output_unlock")
-public func rt_output_unlock() {
-    borrow var state = OUTPUT.lock() {
-        if state.depth != 0 {
-            state.depth = state.depth &- 1
-            if state.depth == 0 {
-                state.owner = 0
-            }
-        }
+public func rt_output_unlock() unsafe {
+    let me = sos_rt_thread_id()
+    if OUTPUT[OUTPUT_OWNER].load() != me {
+        return
     }
-}
-
-/// Take the output lock for `me` if it is free or `me` holds it already.
-func output_take(me: Int) -> Bool {
-    borrow var state = OUTPUT.lock() {
-        if state.depth == 0 || state.owner == me {
-            state.owner = me
-            state.depth = state.depth &+ 1
-            true
-        } else {
-            false
-        }
+    let depth = OUTPUT_DEPTH.load()
+    if depth > 1 {
+        OUTPUT_DEPTH.store(depth - 1)
+        return
+    }
+    OUTPUT_DEPTH.store(0)
+    let _ = OUTPUT[OUTPUT_OWNER].compare_exchange(me, 0)
+    if OUTPUT[OUTPUT_WAITERS].load() != 0 {
+        let _ = sos_rt_lock_wake(output_words())
     }
 }
 
@@ -571,12 +605,22 @@ func output_take(me: Int) -> Bool {
 // (`ProcessOp.SectionWord`, which `sos`'s `Process.section_register()` makes),
 // no other thread of the process runs while the depth is nonzero, and the
 // kernel sets the flag when that held a thread back. Entering and leaving are
-// an add each, with no trap; leaving yields through the fourth per-side hook
+// an add each, with no trap; leaving yields through the `sos_rt_yield` hook
 // when the depth reaches zero with the flag set, so the thread held back runs
 // at once.
 //
 // The pair is the runtime's, one per process, so a program and the runtime
 // under it share one section, and entering nests as a depth.
+//
+// The runtime's own locks take it: each window of the arena and of the pool
+// heaps keeps its `SpinLock` and runs inside the section (`window_open`): the
+// lock excludes, and the section defers preemption of the holder. The runtime
+// registers the word itself the first time the program makes a thread through
+// `thread_create(run:)` (`section_claim`): a process with one thread meets no
+// sibling, so it makes no extra trap, and its windows run unguarded. A program
+// that makes threads another way calls `Process.section_register()` itself,
+// before it makes them; without it the windows run unguarded, as in a process
+// with one thread.
 //
 // Each add is an atomic read-modify-write, for its ordering and not for
 // another processor: no access the section guards moves before the enter or
@@ -586,6 +630,10 @@ func output_take(me: Int) -> Bool {
 // A thread with no block cannot yield (`kernel/sysapi/src/rt.saw`), so its
 // leave does not: the thread it held back runs at the next switch, a tick or
 // the leaver's next park.
+
+extern "C" {
+    func sos_rt_yield()
+}
 
 /// The depth, then the pending flag.
 static SECTION: [Atomic<Int>; 2]
@@ -604,6 +652,38 @@ public func section_word() unsafe -> UInt {
 /// Record that the kernel took the pair: the registration's last step.
 public func section_registered() {
     SECTION_REGISTERED.store(1)
+}
+
+/// Nonzero once a thread has taken the right to register the word.
+static SECTION_CLAIMED: Atomic<Int>
+
+/// Whether the caller is to register the section word now: true for the one
+/// thread that finds it unregistered and unclaimed, false for every other
+/// call, and for every call once the word is registered. The thread that
+/// gets true makes the registration (`sos_process_section_register`).
+public func section_claim() -> Bool {
+    SECTION_REGISTERED.load() == 0 && SECTION_CLAIMED.compare_exchange(0, 1)
+}
+
+/// Open a window of one of this module's locks: enter the section when the word
+/// is registered, and answer whether it did, for `window_close`. The section
+/// defers the holder's preemption; the window's own lock is what excludes other
+/// threads, and is taken inside it. A window opened unregistered stays
+/// unguarded to its close, even if the word is registered meanwhile.
+func window_open() -> Bool {
+    if SECTION_REGISTERED.load() == 0 {
+        return false
+    }
+    let _ = SECTION[SECTION_DEPTH].fetch_add(1)
+    true
+}
+
+/// Close a window `window_open` opened: leave the section if it entered one.
+/// The leave yields when the kernel held a sibling back meanwhile.
+func window_close(entered: Bool) {
+    if entered {
+        section_leave()
+    }
 }
 
 /// Enter the section, or enter it once more. A section the kernel was never
@@ -673,7 +753,7 @@ func line_put(buf: UInt, fill: UInt, byte: UInt8) unsafe -> UInt {
 // region whatever its size. It only grows, and keeps its memory for the
 // process's life.
 //
-// The kernel ops a growth makes are the fifth per-side hook:
+// The kernel ops a growth makes are a per-side hook:
 //
 //     sos_rt_grow(heap, by)    // supplied per side
 //
@@ -684,11 +764,13 @@ func line_put(buf: UInt, fill: UInt, byte: UInt8) unsafe -> UInt {
 // (`kernel/sysapi/src/rt.saw`); the kernel, which adopts no heap, answers no.
 //
 // Each slot has a lock of its own, so two heaps never contend, and no path
-// holds two locks. A growth runs inside its heap's lock: every op it makes
+// holds two locks. Every window runs inside the process's section
+// (`window_open`), which defers preemption of the holder; the slot's lock is
+// what excludes. A growth runs inside its heap's lock: every op it makes
 // answers at once or ends the process inside the kernel, none suspends, and
-// none allocates, so nothing in the window can panic, allocate or re-enter
-// the lock. The lock is what the table's safety rests on, not a single
-// thread: a program may make threads before it drains its boot set.
+// none allocates, so nothing in the window can panic, allocate or re-enter the
+// lock. The lock is what the table's safety rests on, not a single thread: a
+// program may make threads before it drains its boot set.
 
 extern "C" {
     func sos_rt_grow(heap: UInt, by: UInt) -> UInt
@@ -797,6 +879,7 @@ func in_arena(block: UInt) unsafe -> Bool {
 /// nothing: the first allocation the heap cannot serve grows it.
 public func adopt_heap(slot: Int, pool: UInt, process: UInt, total: UInt,
                        grain: UInt) {
+    let entered = window_open()
     heap_arrive(slot)
     borrow var h = HEAPS[slot].lock() {
         h.pool = pool
@@ -805,6 +888,7 @@ public func adopt_heap(slot: Int, pool: UInt, process: UInt, total: UInt,
         h.grain = grain
         h.adopted = true
     }
+    window_close(entered)
     ADOPTED[slot].store(1)
 }
 
@@ -815,42 +899,54 @@ public func heap_alloc(slot: Int, size: UInt, align: UInt) unsafe -> UInt {
     if ADOPTED[slot].load() == 0 {
         return 0
     }
+    let entered = window_open()
     heap_arrive(slot)
-    borrow var h = HEAPS[slot].lock() {
+    let block = borrow var h = HEAPS[slot].lock() {
         if h.adopted { serve(&var h, size, align) } else { 0 }
     }
+    window_close(entered)
+    block
 }
 
 /// Free `block` to `slot`'s heap when the heap holds it as a live block, and
 /// answer whether it did.
 public func heap_free(slot: Int, block: UInt) unsafe -> Bool {
+    let entered = window_open()
     heap_arrive(slot)
-    borrow var h = HEAPS[slot].lock() {
+    let live = borrow var h = HEAPS[slot].lock() {
         let live = h.heap.size != 0 && h.heap.holds(block)
         if live {
             h.heap.free(block)
         }
         live
     }
+    window_close(entered)
+    live
 }
 
 /// `slot`'s size, adoption total and last refusal.
 public func heap_state(slot: Int) unsafe -> HeapState {
+    let entered = window_open()
     heap_arrive(slot)
-    borrow var h = HEAPS[slot].lock() {
+    let state = borrow var h = HEAPS[slot].lock() {
         HeapState(size: h.heap.size, total: h.total, adopted: h.adopted,
                   refusal: h.refusal, quota: h.quota)
     }
+    window_close(entered)
+    state
 }
 
 /// `slot`'s pool handle and grain, for a share. The pool's word is written
 /// once, at adoption, and the share's allocation is made with the lock given
 /// back. A slot with no pool answers `NO_HANDLE`, zero.
 public func heap_pool(slot: Int) unsafe -> (UInt, UInt) {
+    let entered = window_open()
     heap_arrive(slot)
-    borrow var h = HEAPS[slot].lock() {
+    let pair = borrow var h = HEAPS[slot].lock() {
         (h.pool, h.grain)
     }
+    window_close(entered)
+    pair
 }
 
 /// Serve from `h`, growing it once when it cannot.

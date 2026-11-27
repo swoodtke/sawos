@@ -24,14 +24,22 @@ import sosrt.{section_enter, section_leave, section_pending}
 /// exits inside it, ends its process, because no sibling could run again.
 ///
 /// A print inside the section is safe only while no sibling holds the
-/// runtime's output lock. A print waits for that lock by yielding, and the
-/// held section gives the processor straight back to the waiting holder, so
-/// a print behind a sibling that holds the lock waits for good. With the
-/// lock free, a print through the kernel's debug print never parks.
+/// runtime's output lock. A print behind a holder parks on the lock, and a
+/// park inside the section ends the process. With the lock free, a print
+/// through the kernel's debug print never parks.
+///
+/// The runtime's own locks (the arena's and the pool heaps') keep their spin
+/// locks, which exclude, and take this section for each window, which defers
+/// the holder's preemption: an allocation is legal inside one, and a thread
+/// above a preempted allocator is not left spinning on the heap.
 ///
 /// The section word must be registered first (`Process.section_register()`):
 /// entering one the kernel was never given panics, since it would hold
-/// nothing back.
+/// nothing back. The runtime registers it the first time the program makes a
+/// thread through `thread_create(run:)`, and a program that makes threads
+/// another way registers it itself, before it makes them. A program that
+/// registers after `thread_create(run:)` has registered it twice, which ends
+/// the process.
 public struct Section {}
 
 extension Section {

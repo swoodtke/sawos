@@ -1,0 +1,48 @@
+// The runtime's output lock when its holder exits holding it (spec §7). A
+// thread takes the output lock and returns, which ends it with the lock still
+// held; the main thread joins it and prints. The print's wait finds the
+// holder gone, which the kernel answers `Revoked`, and the runtime panics,
+// naming the output lock. The panic sink takes the output lock too: its wait
+// finds the same dead holder, and the report goes on without the lock, so
+// the kernel's fault line comes with the panic's text:
+//
+//   SOS: process fault: the program panicked ... text=panic at lib.saw:...:
+//   sos: the output lock's holder exited holding it
+//
+// A sink that waited for the lock again, or panicked again, would never end
+// the process, and the case would time out.
+
+import sos.{SosStatus}
+import sosmain
+
+extern "C" {
+    func __saw_rt_output_lock()
+}
+
+/// The holder's stack, which a thread that panics would want 4 KiB of.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top() unsafe -> UInt {
+    let base = ((&var STACK) as UnsafePointer<UInt>) as UInt
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func main() -> Result<Void, SosStatus> {
+    let holder = try sosmain.context().process().thread_create(
+        run: holds, arg: 0, stack_top: top())
+    try holder.start()
+    let _ = try holder.join()
+    print("SOS rtrevoked: this line is never written")
+    return
+}
+
+/// Take the output lock and end without giving it back.
+func holds(arg: UInt) sync -> UInt {
+    take()
+    0
+}
+
+func take() unsafe sync {
+    __saw_rt_output_lock()
+}

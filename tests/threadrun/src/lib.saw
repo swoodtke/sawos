@@ -6,11 +6,10 @@
 //! Every order here is made by the output lock and the scheduler's one FIFO
 //! ready list, on an image with no tick: a thread runs until it parks, yields
 //! or exits, and a yield hands the processor to every thread that was ready
-//! before it. A wait on the output lock gives the processor up through the
-//! `sos_rt_yield` hook, with the waiter's own Thread handle from its block:
-//! the main thread's, which the start-up wrote, or a made thread's, in its
-//! start record. Were the hook to do nothing, the waiter would spin with no
-//! tick to move it, and the case would hang to the harness's timeout.
+//! before it. A wait on the output lock parks the waiter on it, and the
+//! holder's give answers it onto the tail of its level. Were the wait to spin,
+//! the waiter would hold the processor with no tick to move it, and the case
+//! would hang to the harness's timeout.
 
 import sos.{SosStatus, QuotaKind, ThreadRight, Waiter, ALL_RIGHTS}
 import sosmain
@@ -79,10 +78,10 @@ public func join_two() -> Result<Void, SosStatus> {
 ///   SOS threadrun: a thread's line waited for it
 ///
 /// The main thread takes the lock, writes half its line and yields through a
-/// handle onto itself; the thread's `print` finds the lock held and yields
-/// through the handle in its start record, so the main thread finishes its
-/// line and gives the lock back before the thread's line is written. Its stack
-/// top is three bytes off, so only the rounding keeps its record a block.
+/// handle onto itself; the thread's `print` finds the lock held and parks on
+/// it, so the main thread finishes its line and gives the lock back before
+/// the thread's line is written. Its stack top is three bytes off, so only
+/// the rounding keeps its record a block.
 public func main_holds() -> Result<Void, SosStatus> {
     let me = try sosmain.context().process().thread_self()
     let waiter = try sosmain.context().process().thread_create(
@@ -109,8 +108,8 @@ func waiting_line(arg: UInt) sync -> UInt {
 ///
 /// The thread takes the lock, writes half its line and yields through a
 /// handle onto itself; the main thread's `print` finds the lock held and
-/// yields through the handle in its block, which the start-up wrote, so the
-/// thread finishes its line and gives the lock back first.
+/// parks on it, so the thread finishes its line and gives the lock back
+/// first.
 public func thread_holds() -> Result<Void, SosStatus> {
     let me = try sosmain.context().process().thread_self()
     let holder = try sosmain.context().process().thread_create(

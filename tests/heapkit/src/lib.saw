@@ -44,10 +44,10 @@ static KEY_GO: UInt = 9
 static EXIT_OK: UInt = 0
 static EXIT_FAILED: UInt = 1
 
-/// What a child may ask its System for: print, learn its own Process, and
-/// `Transfer`, the bit a give checks.
+/// What a child may ask its System for: print, learn its own Process, read
+/// its Clock, and `Transfer`, the bit a give checks.
 static CHILD_SYSTEM: UInt32 = (SystemRight.Debug | SystemRight.ProcessSelf
-                               | SystemRight.Transfer)
+                               | SystemRight.ClockGet | SystemRight.Transfer)
 
 /// The launch convention's keep mask for a heap's pool.
 public static HEAP_KEEP: UInt32 = (PoolRight.Allocate | PoolRight.Map
@@ -102,6 +102,8 @@ public enum Case {
     case MainErr,
     case Race,
     case Sizing,
+    case TwoLevels,
+    case Revoked,
 }
 
 // =============================================================================
@@ -172,6 +174,8 @@ func run_case(kit: &var Kit, which: Case) -> Result<Void, SosStatus> {
         case MainErr -> try bare(&var kit, "main err", ROLE_ZERO),
         case Race -> try one_heap(&var kit, "race", ROLE_ZERO),
         case Sizing -> try one_heap(&var kit, "sizing", ROLE_SIZING),
+        case TwoLevels -> try two_levels(&var kit),
+        case Revoked -> try bare(&var kit, "revoked", ROLE_ZERO),
     }
     return
 }
@@ -254,6 +258,19 @@ func one_heap(kit: &var Kit, round: String,
     let pool = pool_row(&var kit, 0)
     try give_heap(&child, move pool, 0, HEAP_KEEP)
     try finish(&var kit, move child, round)
+}
+
+/// `rt_heap_two_levels`: the first pool row as the default heap's, and rows
+/// for the child's four threads' handles, its Timer and its Waiter.
+func two_levels(kit: &var Kit) -> Result<Void, SosStatus> {
+    let child = try create(&var kit, ROLE_ZERO)
+    try child.quota_set(QuotaKind.Thread, limit: 3)
+    try child.quota_set(QuotaKind.Waiter, limit: 1)
+    try child.quota_set(QuotaKind.Timer, limit: 1)
+    try child.quota_set(QuotaKind.Handle, limit: 32)
+    let pool = pool_row(&var kit, 0)
+    try give_heap(&child, move pool, 0, HEAP_KEEP)
+    try finish(&var kit, move child, "two levels")
 }
 
 /// A round with no heap but the child's arena.

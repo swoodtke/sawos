@@ -1,0 +1,120 @@
+// The runtime's output lock raises its holder (spec §7). Root's manifest puts
+// `Low` at level 1, `Normal` at 2 and `High` at 3, and this image's kernel
+// arms no tick, so every switch is one a thread makes or a wake causes, and
+// each line comes after what it waits for has happened.
+//
+//   SOS rtout: L holds the lock, and its line is whole
+//   SOS rtout: H's line
+//   SOS rtout: M's line
+//   SOS rtout: done
+//
+// Root, at `Normal`, starts L at `Low` and parks on an Event. L takes the
+// output lock, writes half its line and signals the Event, which readies root
+// above it: L is left holding the lock, ready and not running. Root starts M
+// at `Normal`, which spins on a word and so would keep L off the processor for
+// good, and then H at `High`. H's `print` finds the lock held and parks on
+// it, raising L to level 3, above M. L finishes its line and gives the lock
+// back, which answers H, and falls back to `Low`. H takes the lock, prints,
+// sets M's word and ends; M, which root's join lets run, sees the word and
+// prints its line.
+//
+// With a lock that does not raise its holder, H waits above L for good and M
+// spins above it: L never runs again. Neither the order nor its cause reads
+// the clock.
+
+import sos.{Event, Priority, SosStatus, Waiter}
+import sosmain
+
+extern "C" {
+    func __saw_rt_output_lock()
+    func __saw_rt_output_unlock()
+    func __saw_rt_write(ptr: UnsafePointer<Int8>, len: Int) -> Int
+}
+
+static KEY_HELD: UInt = 7
+
+/// M's word, which H sets once its line is out.
+static GO: Atomic<Int> = Atomic(0)
+
+/// Each thread's stack. A thread that prints wants 4 KiB at least.
+static STACK_WORDS: Int = 1024
+unsafe static var STACK_L: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_M: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+unsafe static var STACK_H: [UInt; STACK_WORDS] = [0; STACK_WORDS]
+
+func top_of(base: UInt) -> UInt {
+    base + (STACK_WORDS as UInt) * (sizeof<UInt>() as UInt)
+}
+
+func top_l() unsafe -> UInt {
+    top_of(((&var STACK_L) as UnsafePointer<UInt>) as UInt)
+}
+
+func top_m() unsafe -> UInt {
+    top_of(((&var STACK_M) as UnsafePointer<UInt>) as UInt)
+}
+
+func top_h() unsafe -> UInt {
+    top_of(((&var STACK_H) as UnsafePointer<UInt>) as UInt)
+}
+
+func main() unsafe -> Result<Void, SosStatus> {
+    let held = try sosmain.context().process().event_create()
+    var signal = try held.mint()
+    let waiter = try sosmain.context().process().waiter_create()
+    try waiter.add(event: &held, key: KEY_HELD)
+    let at = ((&var signal) as UnsafePointer<Event>) as UInt
+
+    let l = try sosmain.context().process().thread_create(
+        run: l_runs, arg: at, stack_top: top_l())
+    let m = try sosmain.context().process().thread_create(
+        run: m_runs, arg: 0, stack_top: top_m())
+    let h = try sosmain.context().process().thread_create(
+        run: h_runs, arg: 0, stack_top: top_h())
+    try l.start(band: Priority.Low)
+    let _ = try waiter.wait()
+    try m.start(band: Priority.Normal)
+    try h.start(band: Priority.High)
+    let _ = try h.join()
+    let _ = try m.join()
+    let _ = try l.join()
+    print("SOS rtout: done")
+    return
+}
+
+/// Write `text` to the console as it is, with no line break, under the output
+/// lock the caller holds.
+func write(text: String) unsafe sync {
+    let _ = __saw_rt_write(text.c_string()!, text.len())
+}
+
+/// L: half a line under the output lock, the signal that leaves it holding
+/// the lock with root running, then the rest.
+func l_runs(at: UInt) sync -> UInt {
+    hold(at)
+    0
+}
+
+func hold(at: UInt) unsafe sync {
+    __saw_rt_output_lock()
+    write("SOS rtout: L holds the lock, ")
+    try (at as UnsafePointer<Event>)[0].signal(bits: 1) catch {
+        panic("SOS rtout: L's signal was refused: {}", error)
+    }
+    write("and its line is whole\n")
+    __saw_rt_output_unlock()
+}
+
+/// M: spin until H has printed, then print.
+func m_runs(arg: UInt) sync -> UInt {
+    while GO.load() == 0 { }
+    print("SOS rtout: M's line")
+    0
+}
+
+/// H: print, which waits for L's lock, and then let M go.
+func h_runs(arg: UInt) sync -> UInt {
+    print("SOS rtout: H's line")
+    GO.store(1)
+    0
+}
