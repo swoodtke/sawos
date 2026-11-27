@@ -9,6 +9,9 @@ import virtio.fake.{EVENT_CONFIG16, EVENT_CONFIG8, EVENT_READ32, EVENT_WRITE32, 
 import virtio.transport.{CONFIG_READS, F_MAC, F_MTU, F_STATUS, F_VERSION_1,
                          REGISTER_CONFIG_GENERATION, REGISTER_INTERRUPT_ACK, STATUS_DEVICE_NEEDS_RESET}
 
+/// The frame each receive buffer holds: a ring slot.
+static FRAME_BYTES: UInt32 = 2048
+
 func check(ok: Bool, what: String) {
     if not ok {
         print("failed: {what}")
@@ -21,7 +24,7 @@ func negotiated(offered: UInt64) -> Negotiated {
     var f = Fake.qemu()
     f.offered = offered
     var lc = Lifecycle()
-    try! lc.begin(&var f)
+    try! lc.begin(&var f, FRAME_BYTES)
 }
 
 static BASE: UInt64 = F_VERSION_1 | F_MAC
@@ -40,17 +43,14 @@ func is_config_error(r: Result<NetConfig, SetupError>, want: SetupError) -> Bool
 func fields_at_their_width() {
     let n = negotiated(BASE | F_STATUS | F_MTU)
     var f = Fake.qemu()
-    f.config[10] = 0xDC
-    f.config[11] = 0x05
     let c = try! config_of(&var f, &n)
     check(c.mac[0] == 0x52 && c.mac[1] == 0x54 && c.mac[2] == 0x00 && c.mac[3] == 0x12 &&
           c.mac[4] == 0x34 && c.mac[5] == 0x56, "the MAC, a byte at a time")
     check(c.link_up, "LINK_UP")
-    check(c.mtu == 1500, "mtu is the 16 bit little-endian field")
+    check(c.mtu == 1500, "mtu is the one negotiation read")
     check(f.count(EVENT_CONFIG8) == 6, "six byte reads for the MAC")
-    check(f.count(EVENT_CONFIG16) == 2, "a 16 bit read each for status and mtu")
-    check(f.find(EVENT_CONFIG16, 6) != None && f.find(EVENT_CONFIG16, 10) != None,
-          "at their own offsets")
+    check(f.count(EVENT_CONFIG16) == 1, "a 16 bit read for status, and mtu is not read again")
+    check(f.find(EVENT_CONFIG16, 6) != None, "status at its own offset")
 }
 
 func link_down() {
@@ -74,28 +74,71 @@ func without_status_or_mtu() {
     check(f.count(EVENT_CONFIG16) == 0, "neither field is read")
 }
 
-func mtu_checks() {
-    let n = negotiated(BASE | F_MTU)
+
+/// A device offering `MTU` with `mtu` in its configuration.
+func offering_mtu(mtu: UInt16) -> Fake {
     var f = Fake.qemu()
-    f.config[10] = 67
-    check(is_config_error(config_of(&var f, &n), SetupError.MtuTooSmall(67)), "an mtu of 67")
-    f.config[10] = 68
-    check((try! config_of(&var f, &n)).mtu == 68, "68 is the least")
-    check((try! config_of(&var f, &n)).reported_mtu() == 68, "and is what is reported")
-    f.config[10] = 0x28
-    f.config[11] = 0x23
-    check((try! config_of(&var f, &n)).reported_mtu() == 1500, "no more than the stack's 1500 is reported")
-    f.config[10] = 0xDC
-    f.config[11] = 0x05
-    check((try! config_of(&var f, &n)).reported_mtu() == 1500, "1500 is itself")
-    f.config[10] = 0
-    f.config[11] = 0
-    check(is_config_error(config_of(&var f, &n), SetupError.MtuTooSmall(0)), "an mtu of 0 is below 68")
+    f.offered = BASE | F_MTU
+    f.config[10] = (mtu & 0xFF) as UInt8
+    f.config[11] = (mtu >> 8) as UInt8
+    f
+}
+
+/// The negotiation of `f`, or its refusal.
+func negotiate(f: &var Fake) -> Result<Negotiated, SetupError> {
+    var lc = Lifecycle()
+    lc.begin(&var f, FRAME_BYTES)
+}
+
+func is_refused(r: Result<Negotiated, SetupError>, want: SetupError) -> Bool {
+    match r {
+        case Ok(_) -> false,
+        case Err(e) -> e == want,
+    }
+}
+
+func mtu_checks() {
+    var tiny = offering_mtu(67)
+    check(is_refused(negotiate(&var tiny), SetupError.MtuTooSmall(67)), "an mtu of 67")
+    var zero = offering_mtu(0)
+    check(is_refused(negotiate(&var zero), SetupError.MtuTooSmall(0)), "an mtu of 0 is below 68")
+    var least = offering_mtu(68)
+    let n68 = try! negotiate(&var least)
+    check(n68.mtu == 68, "68 is the least")
+    check((try! config_of(&var least, &n68)).reported_mtu() == 68, "and is what is reported")
+    var big = offering_mtu(0x2328)
+    let n9000 = try! negotiate(&var big)
+    check(n9000.mtu == 0, "an mtu past a slot is not taken")
+    check((try! config_of(&var big, &n9000)).reported_mtu() == 1500, "and the stack's 1500 is reported")
+    var stack = offering_mtu(1500)
+    let n1500 = try! negotiate(&var stack)
+    check((try! config_of(&var stack, &n1500)).reported_mtu() == 1500, "1500 is itself")
+    var over = offering_mtu(1800)
+    let n1800 = try! negotiate(&var over)
+    check(n1800.mtu == 1800 && (try! config_of(&var over, &n1800)).reported_mtu() == 1500,
+          "an mtu that fits a slot past the stack's reports the stack's")
     // An mtu the driver did not negotiate is not read, so not checked.
     let plain = negotiated(BASE)
     var g = Fake.qemu()
     g.config[10] = 1
     check((try! config_of(&var g, &plain)).mtu == 0, "an mtu not negotiated is not read")
+}
+
+func mtu_changed_after_negotiation() {
+    // The device answers 1400 to negotiation's read, then changes its mtu.
+    // The driver acts on the value it read and checked once: a second read
+    // would carry 9000 to the client, or 67 past the floor.
+    var f = offering_mtu(1400)
+    let n = try! negotiate(&var f)
+    check(n.mtu == 1400, "negotiation read 1400")
+    f.config[10] = 0x28
+    f.config[11] = 0x23
+    let c = try! config_of(&var f, &n)
+    check(c.mtu == 1400 && c.reported_mtu() == 1400, "a later 9000 changes nothing")
+    f.config[10] = 67
+    f.config[11] = 0
+    let low = try! config_of(&var f, &n)
+    check(low.mtu == 1400, "nor does a later 67")
 }
 
 func generation() {
@@ -120,19 +163,17 @@ func generation() {
     check(forever.count(EVENT_CONFIG8) == 6 * CONFIG_READS, "is bounded")
 }
 
+
 func torn_mtu() {
     // The mtu read before the generation changed is below the floor; after it
     // the device holds a good one. A read that tore is read again, not refused.
-    let n = negotiated(BASE | F_MTU)
-    var f = Fake.qemu()
-    f.config[10] = 10
-    f.config[11] = 0
+    var f = offering_mtu(10)
     f.config_after_change[10] = 0xDC
     f.config_after_change[11] = 0x05
     f.changes_config = true
-    let c = try! config_of(&var f, &n)
-    check(c.mtu == 1500, "the settled read's mtu is the one used")
-    check(f.count(EVENT_CONFIG16) == 2, "after reading the whole configuration twice")
+    let n = try! negotiate(&var f)
+    check(n.mtu == 1500, "the settled read's mtu is the one used")
+    check(f.count(EVENT_CONFIG16) == 2, "after reading mtu twice")
 }
 
 func link_generation_bound() {
@@ -231,6 +272,7 @@ func main() {
     generation()
     link_events()
     torn_mtu()
+    mtu_changed_after_negotiation()
     link_generation_bound()
     interrupts()
     undefined_bits()

@@ -73,7 +73,8 @@ drivers/           # userspace device drivers and the protocol packages their
                    # buffers, with no device and no clock of its own;
                    # virtio/ is the virtio-mmio transport and split queues
                    # behind `Registers` and `Dma` traits, with a fake device
-                   # for its hosted tests
+                   # for its hosted tests, and svc-virtio-net/ the network
+                   # driver over it, serving netdevproto from memory it pins
 rt/common/         # `sosrt`: the SOS runtime, arch-free + role-free Saw
 rt/common_c/       # support.c — the arena accessors + word atomics, one copy
 rt/main/           # `sosmain`: the `_start` of a program written with `main`

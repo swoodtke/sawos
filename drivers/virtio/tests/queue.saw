@@ -5,9 +5,13 @@
 // ring, and the order chains are acted on in.
 
 import virtio.{Completion, DeviceFault, Lifecycle, MemoryPlan, NotCompleted, Queue, QueueFull,
-               Queues}
-import virtio.fake.{EVENT_BARRIER, EVENT_LOAD16, EVENT_LOAD32, EVENT_STORE16, EVENT_STORE32, Fake}
-import virtio.transport.{REGISTER_QUEUE_NOTIFY}
+               Queues, take_interrupt}
+import virtio.fake.{EVENT_BARRIER, EVENT_LOAD16, EVENT_LOAD32, EVENT_READ32, EVENT_STORE16, EVENT_STORE32,
+                    EVENT_WRITE32, Fake}
+import virtio.transport.{REGISTER_INTERRUPT_ACK, REGISTER_INTERRUPT_STATUS, REGISTER_QUEUE_NOTIFY}
+
+/// The frame each receive buffer holds: a ring slot.
+static FRAME_BYTES: UInt32 = 2048
 
 func check(ok: Bool, what: String) {
     if not ok {
@@ -34,7 +38,7 @@ func up_with(entries: UInt32) -> Up {
     var f = Fake.qemu()
     f.max_entries = [entries, entries]
     var lc = Lifecycle()
-    let _ = try! lc.begin(&var f)
+    let _ = try! lc.begin(&var f, FRAME_BYTES)
     let q = try! lc.setup_queues(&var f)
     lc.go_live(&var f)
     try! lc.pin_ring(&var f)
@@ -448,6 +452,17 @@ func receive_checks() {
           "a length past the bytes posted, within the largest buffer")
     check(is_receive_fault(receive_result(2048, 100, 2), DeviceFault.NumBuffers(2)), "num_buffers 2")
     check(is_receive_fault(receive_result(2048, 100, 0), DeviceFault.NumBuffers(0)), "num_buffers 0")
+    // QEMU's device, without `MRG_RXBUF`, leaves `num_buffers` as the driver
+    // wrote it. A header the device writes nothing into reads 1, even where
+    // the memory held something else before the chain was posted.
+    var quiet = up()
+    set_count(&var quiet.f, 2, 0xABCD)
+    quiet.q.rx.post_rx(&var quiet.f, 2, quiet.lc.ring_address(0, 2048))
+    quiet.q.rx.kick(&var quiet.f)
+    quiet.f.complete(0, 4, 100)
+    let _ = try! quiet.q.rx.pending(&var quiet.f)
+    check(is_receive_ok(quiet.q.rx.next(&var quiet.f)),
+          "a device that writes no num_buffers is taken at its one buffer")
     check(is_receive_fault(receive_result(2048, 11, 2), DeviceFault.ReceiveLength(11)),
           "the length is checked before the header is read")
     var u = up()
@@ -474,6 +489,26 @@ func chain_past_the_mask() {
     check(not u.q.rx.is_busy(32), "and is not busy")
 }
 
+func interrupt_fenced_from_used_ring() {
+    // An interrupt's status read and acknowledgement are the device's
+    // registers and the used ring is memory: a barrier lies between them and
+    // the read of the used `idx`.
+    var u = up()
+    u.q.rx.post_rx(&var u.f, 2, u.lc.ring_address(0, 2048))
+    u.q.rx.kick(&var u.f)
+    u.f.complete(0, 4, 100)
+    u.f.interrupt_status = 1
+    u.f.clear_log()
+    let _ = take_interrupt(&var u.f)
+    let _ = try! u.q.rx.pending(&var u.f)
+    let status = u.f.find(EVENT_READ32, REGISTER_INTERRUPT_STATUS as UInt64)!
+    let ack = u.f.find(EVENT_WRITE32, REGISTER_INTERRUPT_ACK as UInt64)!
+    let idx = u.f.find(EVENT_LOAD16, (u.f.used_offset(0) + 2) as UInt64)!
+    let barrier = u.f.find_after(ack, EVENT_BARRIER, 0)
+    check(status < ack && barrier != None && barrier! < idx,
+          "a barrier lies between the interrupt's registers and the used index")
+}
+
 func main() {
     receive_chain()
     transmit_chain()
@@ -491,4 +526,5 @@ func main() {
     element_ids()
     receive_checks()
     chain_past_the_mask()
+    interrupt_fenced_from_used_ring()
 }

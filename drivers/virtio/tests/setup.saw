@@ -4,12 +4,16 @@
 // address.
 
 import virtio.{Lifecycle, MemoryPlan, Queues, SetupError}
-import virtio.fake.{EVENT_PIN, EVENT_READ32, EVENT_STORE16, EVENT_STORE32, EVENT_WRITE32, Fake}
+import virtio.fake.{EVENT_BARRIER, EVENT_PIN, EVENT_READ32, EVENT_STORE16, EVENT_STORE32, EVENT_WRITE32,
+                    Fake}
 import virtio.transport.{REGISTER_QUEUE_DESC_HIGH, REGISTER_QUEUE_DESC_LOW, REGISTER_QUEUE_DEVICE_HIGH,
                          REGISTER_QUEUE_DEVICE_LOW, REGISTER_QUEUE_DRIVER_HIGH, REGISTER_QUEUE_DRIVER_LOW,
                          REGISTER_QUEUE_NUM, REGISTER_QUEUE_NUM_MAX, REGISTER_QUEUE_READY, REGISTER_QUEUE_SEL,
                          REGISTER_STATUS, STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK,
                          STATUS_FEATURES_OK}
+
+/// The frame each receive buffer holds: a ring slot.
+static FRAME_BYTES: UInt32 = 2048
 
 func check(ok: Bool, what: String) {
     if not ok {
@@ -20,7 +24,7 @@ func check(ok: Bool, what: String) {
 
 func setup(f: &var Fake) -> Result<Queues, SetupError> {
     var lc = Lifecycle()
-    let _ = try! lc.begin(&var f)
+    let _ = try! lc.begin(&var f, FRAME_BYTES)
     lc.setup_queues(&var f)
 }
 
@@ -143,7 +147,7 @@ func misaligned_memory() {
 func driver_ok() {
     var f = Fake.qemu()
     var lc = Lifecycle()
-    let _ = try! lc.begin(&var f)
+    let _ = try! lc.begin(&var f, FRAME_BYTES)
     let _ = try! lc.setup_queues(&var f)
     lc.go_live(&var f)
     check(f.status == (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK),
@@ -202,7 +206,29 @@ func pin_refusals() {
     check(short.writes_to(REGISTER_QUEUE_READY) == 0, "no queue is made ready")
 }
 
+func zeroing_fenced_from_registers() {
+    // The zeroing stores are to memory and the queue registers are the
+    // device's: a barrier lies between the last store and the first address
+    // or `QueueReady` written.
+    var f = Fake.qemu()
+    let _ = try! setup(&var f)
+    let first_register = f.find(EVENT_WRITE32, REGISTER_QUEUE_DESC_LOW as UInt64)!
+    var last_store = -1
+    var i = 0
+    while i < first_register {
+        if f.kind_at(i) == EVENT_STORE32 { last_store = i }
+        i = i + 1
+    }
+    check(last_store >= 0, "the plan is zeroed before the registers are written")
+    let barrier = f.find_after(last_store, EVENT_BARRIER, 0)
+    check(barrier != None && barrier! < first_register,
+          "a barrier lies between the zeroing and the queue registers")
+    let ready = f.find_write(REGISTER_QUEUE_READY, 1)!
+    check(barrier! < ready, "and before QueueReady")
+}
+
 func main() {
+    zeroing_fenced_from_registers()
     queue_sizes()
     registers()
     the_plan_is_zeroed()

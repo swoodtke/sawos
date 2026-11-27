@@ -127,6 +127,9 @@ public static MTU_MIN: UInt16 = 68
 /// of it and the device's.
 public static MTU_STACK: UInt16 = 1500
 
+/// An Ethernet header's bytes, which a received frame carries beside its MTU.
+public static ETHERNET_HEADER_BYTES: UInt32 = 14
+
 // =============================================================================
 // Bounds
 // =============================================================================
@@ -298,6 +301,10 @@ public func reset_device<R: Registers>(registers: &var R) -> Result<Void, SetupE
 public struct Negotiated {
     /// What the driver wrote to `DriverFeatures`.
     public features: UInt64,
+    /// The device's `mtu` as read and checked before the features were
+    /// accepted, when `MTU` was taken; 0 otherwise. It is the one read of
+    /// the field the driver acts on.
+    public mtu: UInt16,
 }
 
 extension Negotiated {
@@ -319,8 +326,10 @@ public func read_device_features<R: Registers>(registers: &var R) -> UInt64 {
 
 /// Chooses from `offered`: the required bits must all be there and
 /// `ACCESS_PLATFORM` must not be; of the optional bits it takes those the
-/// device offers. It writes nothing.
-public func choose_features(offered: UInt64) -> Result<Negotiated, SetupError> {
+/// device offers, but `MTU` only when `mtu_fits` says `mtu`, the device's as
+/// read before (`read_offered_mtu`), fits a receive buffer. It writes nothing.
+public func choose_features(offered: UInt64, mtu: UInt16,
+                            mtu_fits: Bool) -> Result<Negotiated, SetupError> {
     if (offered & F_ACCESS_PLATFORM) != 0 { return SetupError.AccessPlatform }
     let missing = FEATURES_REQUIRED & ~offered
     if missing != 0 {
@@ -329,7 +338,38 @@ public func choose_features(offered: UInt64) -> Result<Negotiated, SetupError> {
         while (missing & bit) == 0 { bit = bit << 1 }
         return SetupError.MissingFeature(bit)
     }
-    return Negotiated(features: FEATURES_REQUIRED | (FEATURES_OPTIONAL & offered))
+    var optional = FEATURES_OPTIONAL & offered
+    if not mtu_fits { optional = optional & ~F_MTU }
+    let taken: UInt16 = if (optional & F_MTU) != 0 { mtu } else { 0 }
+    return Negotiated(features: FEATURES_REQUIRED | optional, mtu: taken)
+}
+
+/// Whether a driver whose receive buffers hold `frame_bytes` bytes of frame
+/// each can take a device's `mtu`. With `MTU` negotiated it must post room
+/// for one packet of `mtu` and its Ethernet header (5.1.4.2), so a larger
+/// one is declined, and the device runs at the stack's MTU as one that
+/// offers none does.
+public func mtu_fits(mtu: UInt16, frame_bytes: UInt32) -> Bool {
+    ETHERNET_HEADER_BYTES + (mtu as UInt32) <= frame_bytes
+}
+
+/// Reads `mtu` from a device that offers `MTU`, before the driver accepts a
+/// feature (3.1.1 step 4 lets it read configuration space to check that it
+/// can support the device): at its own width, and repeated while
+/// `ConfigGeneration` changes across it, at most `CONFIG_READS` times. Below
+/// `MTU_MIN` is a refusal (5.1.4.1).
+public func read_offered_mtu<R: Registers>(registers: &var R) -> Result<UInt16, SetupError> {
+    var attempt: UInt32 = 0
+    while attempt < CONFIG_READS {
+        attempt = attempt + 1
+        let before = registers.read32(REGISTER_CONFIG_GENERATION)
+        let mtu = registers.config_read16(CONFIG_MTU)
+        if registers.read32(REGISTER_CONFIG_GENERATION) == before {
+            if mtu < MTU_MIN { return SetupError.MtuTooSmall(mtu) }
+            return mtu
+        }
+    }
+    return SetupError.ConfigUnstable
 }
 
 /// Writes `features` to `DriverFeatures`, word 0 then word 1, each behind its
@@ -351,7 +391,8 @@ public struct NetConfig {
     /// The link state: `LINK_UP`, or up when `STATUS` is not negotiated
     /// (5.1.4.2).
     public link_up: Bool,
-    /// The device's `mtu`, or 0 when `MTU` is not negotiated.
+    /// The device's `mtu` as `begin` read it, or 0 when `MTU` is not
+    /// negotiated.
     public mtu: UInt16,
 }
 
@@ -370,8 +411,9 @@ func read_link_bit<R: Registers>(registers: &var R) -> Bool {
 
 /// Reads the configuration the driver uses, each field once at its own width
 /// and the whole read repeated while `ConfigGeneration` changes across it,
-/// at most `CONFIG_READS` times (2.5.1, 4.2.2). `mtu` below `MTU_MIN` is a
-/// refusal (5.1.4.1).
+/// at most `CONFIG_READS` times (2.5.1, 4.2.2). `mtu` is not read again: it
+/// is the one `begin` read and checked, carried in `negotiated`, so a device
+/// that changes it afterwards changes nothing the driver acts on.
 public func read_config<R: Registers>(registers: &var R,
                                       negotiated: &Negotiated) -> Result<NetConfig, SetupError> {
     var attempt: UInt32 = 0
@@ -385,11 +427,9 @@ public func read_config<R: Registers>(registers: &var R,
             i = i + 1
         }
         let link_up = if negotiated.has(F_STATUS) { read_link_bit(&var registers) } else { true }
-        let mtu: UInt16 = if negotiated.has(F_MTU) { registers.config_read16(CONFIG_MTU) } else { 0 }
         let after = registers.read32(REGISTER_CONFIG_GENERATION)
         if before == after {
-            if negotiated.has(F_MTU) && mtu < MTU_MIN { return SetupError.MtuTooSmall(mtu) }
-            return NetConfig(mac: mac, link_up: link_up, mtu: mtu)
+            return NetConfig(mac: mac, link_up: link_up, mtu: negotiated.mtu)
         }
     }
     return SetupError.ConfigUnstable

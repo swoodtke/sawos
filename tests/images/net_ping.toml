@@ -1,0 +1,33 @@
+# The virtio network driver and a pinger on the riscv32 `virt` board. The
+# driver holds the last transport (`VIRTIO7`, where the runner places the
+# network device) and is granted `physical` on `memory` and `pool`, which its
+# declaration asks for, to pin what its device addresses. The pinger attaches
+# to it and pings the runner's network peer. The gate's `net_ping` case
+# builds it with `sosimage build`.
+format = 1
+
+[image]
+name = "net_ping"
+board = "riscv32-virt"
+tick = false
+
+[root]
+package = "stock"
+
+# The driver's queue memory (one page) and one client's ring (eight slots
+# each way: 32,896 bytes, and a page-rounded 0x9000 on arm64).
+[[pool]]
+name = "netq"
+len = 0xA000
+
+[[process]]
+name = "net"
+package = "sawos:drivers/svc-virtio-net"
+device = { net = "VIRTIO7" }
+pools = { queues = "netq" }
+ceilings = { memory = ["transfer", "mint", "map", "physical"], pool = ["allocate", "map", "physical", "mint", "transfer"] }
+
+[[process]]
+name = "ping"
+package = "sawos:tests/net-ping"
+clients = { netdev = "net.netdev" }

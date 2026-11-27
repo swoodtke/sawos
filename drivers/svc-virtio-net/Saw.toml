@@ -1,0 +1,31 @@
+[package]
+name = "svc-virtio-net"
+version = "0.1.0"
+
+# This image carries its own `__saw_rt_*` seams, from the `sosrt` module its
+# `sos` dependency pulls in; see root/Saw.toml.
+runtime = true
+
+# The virtio network driver: a virtio-mmio network card as a `netdevproto`
+# server. The transport and queue logic is `virtio`'s, a hosted library; this
+# package is the process around it: the window, the line, the queue memory and
+# each client's ring, pinned while the device may address them, and the serve
+# loop. `native/` holds the barrier, one instruction per architecture.
+[dependencies]
+sos = { path = "../../kernel/sysapi" }
+sosmain = { path = "../../rt/main" }
+virtio = { path = "../virtio" }
+pktring = { path = "../pktring" }
+netdevproto = { path = "../netdevproto" }
+
+[sos]
+emit = "sosimg"
+priorities = { background = 0, low = 1, normal = 1, high = 1 }
+
+[sos.riscv32-unknown-none-elf]
+linker-script = "../../hal/riscv32/user/user.ld"
+native = "../../hal/riscv32-common/user/syscall.c ../../rt/common_c/support.c native/fence-riscv32.c"
+
+[sos.aarch64-unknown-none-elf]
+linker-script = "../../hal/arm64/user/user.ld"
+native = "../../hal/arm64/user/syscall.c ../../rt/common_c/support.c native/fence-arm64.c"

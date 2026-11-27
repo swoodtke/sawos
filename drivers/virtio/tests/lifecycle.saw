@@ -11,6 +11,9 @@ import virtio.transport.{REGISTER_QUEUE_DESC_HIGH, REGISTER_QUEUE_DESC_LOW,
                          REGISTER_QUEUE_READY, REGISTER_QUEUE_SEL, REGISTER_STATUS, RESET_READS, STATUS_ACKNOWLEDGE, STATUS_DRIVER,
                          STATUS_DRIVER_OK, STATUS_FAILED, STATUS_FEATURES_OK}
 
+/// The frame each receive buffer holds: a ring slot.
+static FRAME_BYTES: UInt32 = 2048
+
 func check(ok: Bool, what: String) {
     if not ok {
         print("failed: {what}")
@@ -20,7 +23,7 @@ func check(ok: Bool, what: String) {
 
 /// A device with its queues live and a client's ring pinned.
 func running(f: &var Fake, lc: &var Lifecycle) -> Queues {
-    let _ = try! lc.begin(&var f)
+    let _ = try! lc.begin(&var f, FRAME_BYTES)
     let q = try! lc.setup_queues(&var f)
     lc.go_live(&var f)
     try! lc.pin_ring(&var f)
@@ -143,7 +146,7 @@ func refusal_after_the_queues_are_pinned() {
     var f = Fake.qemu()
     f.queues_len = 1024
     var lc = Lifecycle()
-    let _ = try! lc.begin(&var f)
+    let _ = try! lc.begin(&var f, FRAME_BYTES)
     match lc.setup_queues(&var f) {
         case Ok(_) -> check(false, "the queues are too short"),
         case Err(e) -> check(e == SetupError.QueuesTooShort(1024), "too short"),
@@ -164,7 +167,7 @@ func refusal_before_any_pin() {
     var f = Fake.qemu()
     f.offered = 0
     var lc = Lifecycle()
-    match lc.begin(&var f) {
+    match lc.begin(&var f, FRAME_BYTES) {
         case Ok(_) -> check(false, "VERSION_1 is missing"),
         case Err(_) -> {},
     }
@@ -213,7 +216,7 @@ func queue_ready_addresses() {
     // ranges, in a pinned object.
     var f = Fake.qemu()
     var lc = Lifecycle()
-    let _ = try! lc.begin(&var f)
+    let _ = try! lc.begin(&var f, FRAME_BYTES)
     let _ = try! lc.setup_queues(&var f)
     check(f.stray_addresses == 0, "the library's own queues are in the pinned memory")
     // The same registers, written to an address in no pinned object.
@@ -225,7 +228,7 @@ func queue_ready_addresses() {
     // An area that begins inside and runs past the end.
     var g = Fake.qemu()
     var lc2 = Lifecycle()
-    let _ = try! lc2.begin(&var g)
+    let _ = try! lc2.begin(&var g, FRAME_BYTES)
     let _ = try! lc2.setup_queues(&var g)
     g.write32(REGISTER_QUEUE_SEL, 1)
     g.write32(REGISTER_QUEUE_NUM, 64)
@@ -256,7 +259,7 @@ func ring_pin() {
     check(g.stray_addresses == 0, "ranges from the pinned ring are not stray")
     var refused = Fake.qemu()
     var lc3 = Lifecycle()
-    let _ = try! lc3.begin(&var refused)
+    let _ = try! lc3.begin(&var refused, FRAME_BYTES)
     let _ = try! lc3.setup_queues(&var refused)
     refused.pin_refused = true
     match lc3.pin_ring(&var refused) {

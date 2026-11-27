@@ -89,6 +89,16 @@ public trait Dma {
 
     /// A full barrier: every store and load before it is ordered before every
     /// one after it, for the device as well as for the processor (2.7.13).
+    /// The library places one:
+    ///
+    ///   - after `setup_queues` zeroes the queue memory, before the registers
+    ///     that give the device its addresses and `QueueReady`;
+    ///   - in `kick`, after the descriptors and ring entries and before the
+    ///     available `idx`, and after that `idx` and before the used ring's
+    ///     flags are read (2.7.13.4.1);
+    ///   - in `pending`, before the used `idx` is read, so after an
+    ///     interrupt's status read and acknowledgement, and after it, before
+    ///     any used element is read (2.7.14).
     func barrier(&var self)
 
     func load16(&var self, offset: UInt32) -> UInt16
@@ -346,11 +356,18 @@ extension Queue {
     /// frame buffer `frame`, device-written (2.7.5, 5.1.6.3). The length
     /// posted is what a completion is checked against. A chain already in
     /// flight is a caller's bug.
+    ///
+    /// The header's `num_buffers` is stored 1 first. Without `MRG_RXBUF` a
+    /// packet is one chain and the device must report 1 (5.1.6.4.1), and
+    /// QEMU's leaves the field as the driver wrote it, so a device that writes
+    /// nothing there reads as the 1 it means, and one that writes another
+    /// value is still refused (`next`).
     public func post_rx<D: Dma>(&var self, dma: &var D, chain: UInt32, frame: RingSpan) {
         if chain >= self.chains() || self.is_busy(chain) {
             panic("post_rx: chain {} is not free", chain)
         }
         let header = self.headers + NET_HEADER_BYTES * chain
+        dma.store16(header + NUM_BUFFERS_OFFSET, 1)
         self.describe(&var dma, 2 * chain, self.address(header), NET_HEADER_BYTES,
                       DESC_NEXT | DESC_WRITE, (2 * chain + 1) as UInt16)
         self.describe(&var dma, 2 * chain + 1, frame.device_address, frame.byte_count,
@@ -389,9 +406,12 @@ extension Queue {
 
     /// Reads the used ring's `idx` once and answers how many elements the
     /// device added since the last one taken, checked against the chains in
-    /// flight (2.7.8: `idx` is modulo 2^16). The barrier follows the read,
-    /// before any element is (2.7.14).
+    /// flight (2.7.8: `idx` is modulo 2^16). A barrier precedes the read, so
+    /// it follows what told the driver to look (an interrupt's status read
+    /// and acknowledgement, `take_interrupt`), and one follows it, before any
+    /// element is read (2.7.14).
     public func pending<D: Dma>(&var self, dma: &var D) -> Result<UInt16, DeviceFault> {
+        dma.barrier()
         let idx = dma.load16(self.layout.used + 2)
         dma.barrier()
         let advance = idx &- self.taken

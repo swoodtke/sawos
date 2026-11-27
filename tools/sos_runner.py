@@ -1077,6 +1077,19 @@ CHILD_THREAD_TAKE_PKG = os.path.join(TESTS_DIR, "child-thread-take")
 # since the guest's serial input is a pipe rather than a terminal.
 ECHO_INPUT = "Zq7#"
 
+# The network peer's log for a pinger's three pings (`tests/net-ping`): the
+# guest announces its address, asks for the gateway's, and sends three echo
+# requests, each answered.
+NET_PING_PEER = [
+    "peer: arp announce 10.0.2.15 at 52:54:00:12:34:56",
+    "peer: arp request for 10.0.2.2 from 10.0.2.15 at 52:54:00:12:34:56, "
+    "answered",
+    "peer: echo request 1 from 10.0.2.15, 56 bytes, answered",
+    "peer: echo request 2 from 10.0.2.15, 56 bytes, answered",
+    "peer: echo request 3 from 10.0.2.15, 56 bytes, answered",
+    "peer: closed after 5 frames",
+]
+
 # How long the harness waits before each byte it types.
 #
 # The delay is the test. Handed the whole string up front, the emulator buffers
@@ -16081,6 +16094,219 @@ TEST_CASES = [
         "expect_clean_exit": True,
     },
     {
+        # The virtio network driver (`drivers/svc-virtio-net`) and a pinger
+        # (`tests/net-ping`), which attaches, takes the ring the driver
+        # allocated and pinned, and pings the peer three times.
+        #
+        # Every line is ordered by what causes it. The driver prints its two
+        # start lines before it answers any request, so before the pinger's
+        # `attached`; each reply follows the peer's answer to its request; and
+        # the driver's counts are read after the last reply, by which time the
+        # device has used every transmit chain (a frame is sent before the
+        # peer can answer it, and the driver drains both used rings at each
+        # interrupt) and every reply is published. The pinger ends its process
+        # still holding its end, so the teardown after the kernel's exit line
+        # releases it, and its terminal level is the driver's `client gone`;
+        # the driver's exit line precedes root's report of it. Root's report
+        # of the pinger is left out: when it lands beside the driver's lines
+        # is the scheduler's choice, not a cause's.
+        #
+        # TX is the gratuitous ARP, the ARP request for the gateway and three
+        # echo requests; RX the ARP reply and three echo replies.
+        #
+        # On arm64 the cases that take interrupts hold the board's four
+        # transport rows between them, this one `VIRTIO16`, so a row whose
+        # base or line is wrong stops one: its driver finds no network card,
+        # or waits on a line that never fires.
+        "name": "net_ping",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_ping.toml",
+                       "riscv32-flat": "net_ping_flat.toml",
+                       "arm64": "net_ping_arm64.toml"},
+        "net": {"script": "ping"},
+        "net_bus": {"arm64": 16},
+        "expect_out": ["{banner}",
+                       "SOS netdrv: virtio-mmio version 2, network device, "
+                       "features version_1 mac status\n",
+                       "SOS netdrv: mac 52:54:00:12:34:56, link up, mtu 1500, "
+                       "queues 64 and 64",
+                       "SOS netping: attached, mac 52:54:00:12:34:56, "
+                       "mtu 1500, slots 8 and 8",
+                       "SOS netping: link up",
+                       "SOS netping: 10.0.2.15 pinging 10.0.2.2",
+                       "SOS netping: reply 1 from 10.0.2.2, 56 bytes",
+                       "SOS netping: reply 2 from 10.0.2.2, 56 bytes",
+                       "SOS netping: reply 3 from 10.0.2.2, 56 bytes",
+                       "SOS netping: driver rx=4 rx_dropped=0 tx=5 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS netping: stack drops=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       "SOS netdrv: client gone: device reset, ring unmapped",
+                       "SOS netdrv: rx=4 tx=5 tx_errors=0 ring_faults=0 "
+                       "abandoned=0",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": NET_PING_PEER,
+        "expect_clean_exit": True,
+    },
+    {
+        # `net_ping` with a device that does not offer `STATUS`
+        # (`status=off`): the driver takes the link to be up, as virtio says
+        # a driver without the feature should, and says so. On arm64 it holds
+        # `VIRTIO8`.
+        "name": "net_no_status",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_no_status.toml",
+                       "riscv32-flat": "net_no_status_flat.toml",
+                       "arm64": "net_no_status_arm64.toml"},
+        "net": {"script": "ping", "props": "status=off"},
+        "net_bus": {"arm64": 8},
+        "expect_out": ["{banner}",
+                       "SOS netdrv: virtio-mmio version 2, network device, "
+                       "features version_1 mac\n",
+                       "SOS netdrv: mac 52:54:00:12:34:56, link assumed up, "
+                       "mtu 1500, queues 64 and 64",
+                       "SOS netping: attached, mac 52:54:00:12:34:56, "
+                       "mtu 1500, slots 8 and 8",
+                       "SOS netping: link up",
+                       "SOS netping: 10.0.2.15 pinging 10.0.2.2",
+                       "SOS netping: reply 1 from 10.0.2.2, 56 bytes",
+                       "SOS netping: reply 2 from 10.0.2.2, 56 bytes",
+                       "SOS netping: reply 3 from 10.0.2.2, 56 bytes",
+                       "SOS netping: driver rx=4 rx_dropped=0 tx=5 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS netping: stack drops=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       "SOS netdrv: client gone: device reset, ring unmapped",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": NET_PING_PEER,
+        "expect_clean_exit": True,
+    },
+    {
+        # `net_ping` with a device that offers `MTU` (`host_mtu=1400`): a
+        # frame of 1400 and its Ethernet header fits a slot, so the driver
+        # takes the feature and reports the device's MTU, and the pinger is
+        # told it. On arm64 it holds `VIRTIO0`.
+        "name": "net_mtu",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_mtu.toml",
+                       "riscv32-flat": "net_mtu_flat.toml",
+                       "arm64": "net_mtu_arm64.toml"},
+        "net": {"script": "ping", "props": "host_mtu=1400"},
+        "net_bus": {"arm64": 0},
+        "expect_out": ["{banner}",
+                       "SOS netdrv: virtio-mmio version 2, network device, "
+                       "features version_1 mac status mtu\n",
+                       "SOS netdrv: mac 52:54:00:12:34:56, link up, mtu 1400, "
+                       "queues 64 and 64",
+                       "SOS netping: attached, mac 52:54:00:12:34:56, "
+                       "mtu 1400, slots 8 and 8",
+                       "SOS netping: link up",
+                       "SOS netping: 10.0.2.15 pinging 10.0.2.2",
+                       "SOS netping: reply 1 from 10.0.2.2, 56 bytes",
+                       "SOS netping: reply 2 from 10.0.2.2, 56 bytes",
+                       "SOS netping: reply 3 from 10.0.2.2, 56 bytes",
+                       "SOS netping: driver rx=4 rx_dropped=0 tx=5 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS netping: stack drops=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       "SOS netdrv: client gone: device reset, ring unmapped",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": NET_PING_PEER,
+        "expect_clean_exit": True,
+    },
+    {
+        # `net_ping` with a pinger that first tells a `WaitEvent`: it posts the
+        # request and drops the claim, so the driver's answer, the link's
+        # state, goes nowhere. The driver keeps the event for the next
+        # `WaitEvent`, which the pinger calls; one that dropped it would hold
+        # that call for an event that never comes. On arm64 it holds the
+        # profile's own `VIRTIO24`.
+        "name": "net_wait_told",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_wait_told.toml",
+                       "riscv32-flat": "net_wait_told_flat.toml",
+                       "arm64": "net_wait_told_arm64.toml"},
+        "net": {"script": "ping"},
+        "expect_out": ["{banner}",
+                       "SOS netping: attached, mac 52:54:00:12:34:56, "
+                       "mtu 1500, slots 8 and 8",
+                       "SOS netping: told a wait_event",
+                       "SOS netping: link up",
+                       "SOS netping: 10.0.2.15 pinging 10.0.2.2",
+                       "SOS netping: reply 3 from 10.0.2.2, 56 bytes",
+                       "SOS netping: driver rx=4 rx_dropped=0 tx=5 "
+                       "tx_errors=0 ring_faults=0",
+                       "SOS: process exit: code={zero} process={two}",
+                       "SOS netdrv: client gone: device reset, ring unmapped",
+                       "SOS: process exit: code={zero} process={one}",
+                       "root: net ended status=65536"],
+        "expect_peer": NET_PING_PEER,
+        "expect_clean_exit": True,
+    },
+    {
+        # The transports left legacy (version 1): the driver refuses the
+        # transport by its version, having written no register, and exits 1
+        # with nothing pinned. The pinger's `Attach` then answers
+        # `PeerClosed`, and it ends too, so root stops the machine; whether
+        # the pinger's line lands before root's report of the driver is the
+        # scheduler's choice, so the case asserts the driver's side.
+        "name": "net_legacy",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_legacy.toml",
+                       "riscv32-flat": "net_legacy_flat.toml",
+                       "arm64": "net_legacy_arm64.toml"},
+        "net": {"script": "ping", "legacy": True},
+        "expect_out": ["{banner}",
+                       "SOS netdrv: refused: virtio-mmio version 1, not 2",
+                       "SOS: process exit: code={one} process={one}",
+                       "root: net ended status=65537"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # A device that is not a network card on the transport (a
+        # random-number generator, DeviceID 4): refused by its DeviceID.
+        "name": "net_wrong_device",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_wrong_device.toml",
+                       "riscv32-flat": "net_wrong_device_flat.toml",
+                       "arm64": "net_wrong_device_arm64.toml"},
+        "net": {"script": "ping", "device": "virtio-rng-device"},
+        "expect_out": ["{banner}",
+                       "SOS netdrv: refused: device 4, not a network device",
+                       "SOS: process exit: code={one} process={one}",
+                       "root: net ended status=65537"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
+        # No device on the transport (DeviceID 0). The driver was bound to
+        # this transport by its image, so an empty one is said, against
+        # virtio's rule for a driver that probes, which must stay quiet.
+        "name": "net_no_device",
+        "arches": ["riscv32", "riscv32-flat", "arm64"],
+        "src": os.path.join(KERNEL_DIR, "main.saw"),
+        "image_file": {"riscv32": "net_no_device.toml",
+                       "riscv32-flat": "net_no_device_flat.toml",
+                       "arm64": "net_no_device_arm64.toml"},
+        "net": {"script": "ping", "device": "none"},
+        "expect_out": ["{banner}",
+                       "SOS netdrv: no device at this transport",
+                       "SOS: process exit: code={one} process={one}",
+                       "root: net ended status=65537"],
+        "expect_peer": ["peer: closed after 0 frames"],
+        "expect_clean_exit": True,
+    },
+    {
         # What a device grant in the transports' block reaches and leaves
         # behind, on arm64 (`tests/set-reuse`, `tests/child-window-probe`).
         # The first child is given VIRTIO24's page, maps it and reads it, then
@@ -17767,7 +17993,10 @@ def _run_qemu(qemu, arch, elf, feed=None, at_once=False):
 #   props    extra `-device` properties, as `key=value,key=value`
 #   legacy   leave the transports legacy (version 1), which QEMU does by
 #            default; without it they are modern (version 2)
-# and a case's `expect_peer` is the peer's log, line for line.
+# and a case's `expect_peer` is the peer's log, line for line. The device sits
+# on the profile's `net_bus` unless the case's own `net_bus`, a profile's name
+# to a bus, names another (`_net_bus`), so a case can hold a board row other
+# than the profile's.
 
 NET_MAC = "52:54:00:12:34:56"
 NET_DEVICE = "virtio-net-device"
@@ -17827,9 +18056,10 @@ class _Qmp:
                 raise ToolError(f"QMP {execute}: {msg['error']}")
 
 
-def _net_command(qemu, arch, elf, net, port, qmp_fd):
+def _net_command(qemu, arch, elf, net, port, qmp_fd, bus):
     """QEMU's command line for a `net` case: the arch's own, paused, with QMP
-    on the inherited descriptor `qmp_fd` and the stream to the peer's `port`."""
+    on the inherited descriptor `qmp_fd`, the stream to the peer's `port`, and
+    the device on virtio-mmio bus `bus`."""
     cmd = [qemu, *arch["qemu_args"], "-nographic", "-kernel", elf, "-S",
            "-chardev", f"socket,id=qmp0,fd={qmp_fd}",
            "-object", "monitor-qmp,id=qmp,chardev=qmp0"]
@@ -17841,13 +18071,19 @@ def _net_command(qemu, arch, elf, net, port, qmp_fd):
     props = net.get("props")
     if device == NET_DEVICE:
         cmd += ["-device", f"{device},netdev=net0,"
-                           f"bus=virtio-mmio-bus.{arch['net_bus']},"
+                           f"bus=virtio-mmio-bus.{bus},"
                            f"mac={NET_MAC}" + (f",{props}" if props else "")]
     elif device != "none":
         # Any other device is only placed on the bus: it has no netdev.
-        cmd += ["-device", f"{device},bus=virtio-mmio-bus.{arch['net_bus']}" +
+        cmd += ["-device", f"{device},bus=virtio-mmio-bus.{bus}" +
                            (f",{props}" if props else "")]
     return cmd
+
+
+def _net_bus(case, arch):
+    """The virtio-mmio bus a `net` case's device sits on: the case's
+    `net_bus` for this profile, else the profile's own."""
+    return case.get("net_bus", {}).get(arch["name"], arch["net_bus"])
 
 
 def _start_peer(netpeer, script):
@@ -17876,7 +18112,7 @@ def _start_peer(netpeer, script):
     return peer, int(words[1])
 
 
-def _run_net_qemu(qemu, arch, elf, net, netpeer):
+def _run_net_qemu(qemu, arch, elf, net, netpeer, bus):
     """Run the ELF under QEMU with the peer of `net` wired to its network
     device, as the comment above says.
 
@@ -17891,7 +18127,7 @@ def _run_net_qemu(qemu, arch, elf, net, netpeer):
     peer = None
     try:
         peer, port = _start_peer(netpeer, net.get("script", "ping"))
-        cmd = _net_command(qemu, arch, elf, net, port, child.fileno())
+        cmd = _net_command(qemu, arch, elf, net, port, child.fileno(), bus)
         proc = subprocess.Popen(cmd, stdin=read_fd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True,
                                 pass_fds=(child.fileno(),))
@@ -17954,6 +18190,9 @@ def _check_peer(case, peer):
     """Return (ok, reason) for the peer's end of a `net` case: it exited 0
     and its log is `expect_peer`, line for line."""
     status, lines, err = peer
+    # A peer that fails prints an `error:` line, which the log comparison
+    # below sees too, so this check is the only one that sees a peer that
+    # dies after its last line.
     if status != 0:
         return False, (f"netpeer exited {status}: "
                        f"{(' '.join(lines) + ' ' + err).strip()}")
@@ -18337,7 +18576,8 @@ def _run_arch(arch, qemu, lld, clang, blade_bin, builder, packager,
         if case.get("net"):
             try:
                 status, out, timed_out, peer = _run_net_qemu(
-                    qemu, arch, elf, case["net"], netpeer)
+                    qemu, arch, elf, case["net"], netpeer,
+                    _net_bus(case, arch))
             except ToolError as e:
                 return (False, f"{CROSS} {name}  (network start-up)",
                         [f"    {line}" for line in str(e).splitlines()])

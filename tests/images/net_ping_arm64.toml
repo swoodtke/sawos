@@ -1,0 +1,31 @@
+# `net_ping.toml` on the arm64 `virt` board: the driver holds the transports'
+# page that starts at transport 16 (`VIRTIO16`, 0x0A00_2000), where the case
+# places the network device; each row of the board is held by a case that
+# takes interrupts. The ring is a page-rounded 0x9000 here, so the pool
+# holds it and the queue memory's page exactly. The gate's `net_ping` case
+# builds it with `sosimage build`.
+format = 1
+
+[image]
+name = "net_ping"
+board = "arm64-virt"
+tick = false
+
+[root]
+package = "stock"
+
+[[pool]]
+name = "netq"
+len = 0xA000
+
+[[process]]
+name = "net"
+package = "sawos:drivers/svc-virtio-net"
+device = { net = "VIRTIO16" }
+pools = { queues = "netq" }
+ceilings = { memory = ["transfer", "mint", "map", "physical"], pool = ["allocate", "map", "physical", "mint", "transfer"] }
+
+[[process]]
+name = "ping"
+package = "sawos:tests/net-ping"
+clients = { netdev = "net.netdev" }

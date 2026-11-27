@@ -2,12 +2,16 @@
 // taken-when-offered, refused and declined bits, what is written to the
 // device, and each refusal's class.
 
-import virtio.{Lifecycle, Negotiated, SetupError, Shutdown}
-import virtio.fake.{EVENT_WRITE32, Fake}
+import virtio.{Lifecycle, Negotiated, SetupError, Shutdown, read_config}
+import virtio.fake.{EVENT_CONFIG16, EVENT_WRITE32, Fake}
 import virtio.transport.{F_ACCESS_PLATFORM, F_MAC, F_MTU, F_ORDER_PLATFORM, F_STATUS,
                          F_VERSION_1, REGISTER_DEVICE_FEATURES_SEL, REGISTER_DRIVER_FEATURES,
                          REGISTER_DRIVER_FEATURES_SEL, REGISTER_STATUS,
-                         STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_FAILED, STATUS_FEATURES_OK}
+                         STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED,
+                         STATUS_FEATURES_OK}
+
+/// The frame each receive buffer holds: a ring slot.
+static FRAME_BYTES: UInt32 = 2048
 
 func check(ok: Bool, what: String) {
     if not ok {
@@ -19,7 +23,7 @@ func check(ok: Bool, what: String) {
 /// What the driver chose, or the refusal.
 func begin(f: &var Fake) -> Result<Negotiated, SetupError> {
     var lc = Lifecycle()
-    lc.begin(&var f)
+    lc.begin(&var f, FRAME_BYTES)
 }
 
 func chose(f: &var Fake) -> UInt64 {
@@ -138,7 +142,7 @@ func status_writes_after(f: &Fake, from: Int) -> [UInt32; 4] {
 /// then a reset, and the driver exits 1: nothing else is written to `Status`.
 func fails_then_resets(f: &var Fake, why: String) {
     var lc = Lifecycle()
-    let refusal = lc.begin(&var f)
+    let refusal = lc.begin(&var f, FRAME_BYTES)
     check(not is_ok(refusal), why)
     let before = f.log_len
     let code = lc.give_up(&var f, Shutdown.Refused)
@@ -162,7 +166,7 @@ func refusals_fail_then_reset() {
     var f = Fake.qemu()
     f.offered = F_VERSION_1 | F_STATUS
     var lc = Lifecycle()
-    let _ = lc.begin(&var f)
+    let _ = lc.begin(&var f, FRAME_BYTES)
     let before = f.log_len
     let _ = lc.give_up(&var f, Shutdown.Refused)
     check(status_writes_after(&f, before)[0] == (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FAILED),
@@ -176,13 +180,13 @@ func reset_that_never_completes() {
     stuck.status = 3
     stuck.reset_never = true
     var lc = Lifecycle()
-    check(is_refused(lc.begin(&var stuck), SetupError.ResetTimeout), "a first reset that never completes")
+    check(is_refused(lc.begin(&var stuck, FRAME_BYTES), SetupError.ResetTimeout), "a first reset that never completes")
     check(lc.give_up(&var stuck, Shutdown.Refused) == 4, "giving up a device still stuck is exit 4")
     var settles = Fake.qemu()
     settles.status = 3
     settles.reset_never = true
     var lc2 = Lifecycle()
-    check(is_refused(lc2.begin(&var settles), SetupError.ResetTimeout), "the same first reset")
+    check(is_refused(lc2.begin(&var settles, FRAME_BYTES), SetupError.ResetTimeout), "the same first reset")
     settles.reset_never = false
     check(lc2.give_up(&var settles, Shutdown.Refused) == 1, "a device that then settles is exit 1")
 }
@@ -207,15 +211,65 @@ func second_begin_starts_from_zero() {
     var f = Fake.qemu()
     f.offered = F_STATUS
     var lc = Lifecycle()
-    let _ = lc.begin(&var f)
+    let _ = lc.begin(&var f, FRAME_BYTES)
     f.offered = Fake.qemu().offered
     let from = f.log_len
-    let _ = try! lc.begin(&var f)
+    let _ = try! lc.begin(&var f, FRAME_BYTES)
     let w = status_writes_after(&f, from)
     check(w[0] == 0 && w[1] == STATUS_ACKNOWLEDGE, "reset, then ACKNOWLEDGE alone")
 }
 
+/// A device offering `MTU` with `mtu` in its configuration.
+func offering_mtu(mtu: UInt16) -> Fake {
+    var f = Fake.qemu()
+    f.offered = F_VERSION_1 | F_MAC | F_STATUS | F_MTU
+    f.config[10] = (mtu & 0xFF) as UInt8
+    f.config[11] = (mtu >> 8) as UInt8
+    f
+}
+
+func mtu_past_a_slot() {
+    // 9000 and its Ethernet header do not fit a 2048-byte slot: `MTU` is
+    // declined, and the device is brought up and runs at the stack's 1500, as
+    // one offering no `MTU` does.
+    var f = offering_mtu(9000)
+    var lc = Lifecycle()
+    let n = try! lc.begin(&var f, FRAME_BYTES)
+    check(n.features == (F_VERSION_1 | F_MAC | F_STATUS), "an mtu past a slot declines MTU")
+    check(f.driver_features == n.features, "and the device is not given it")
+    let _ = try! lc.setup_queues(&var f)
+    lc.go_live(&var f)
+    let c = try! read_config(&var f, &n)
+    check(c.mtu == 0 && c.reported_mtu() == 1500, "the device runs at the stack's 1500")
+    check((f.status & STATUS_DRIVER_OK) != 0, "and is live")
+    // The bound: 14 + mtu is the slot exactly, and one past it.
+    var at = offering_mtu(2034)
+    check(chose(&var at) == (F_VERSION_1 | F_MAC | F_STATUS | F_MTU), "an mtu whose frame fills a slot is taken")
+    var past = offering_mtu(2035)
+    check(chose(&var past) == (F_VERSION_1 | F_MAC | F_STATUS), "one byte more is declined")
+}
+
+func mtu_read_before_features() {
+    // `mtu` is read before any feature is written back (3.1.1 step 4), and
+    // one below 68 refuses the device before it is given a feature.
+    var f = offering_mtu(1400)
+    let _ = chose(&var f)
+    check(f.find(EVENT_CONFIG16, 10)! < f.find_any_write(REGISTER_DRIVER_FEATURES)!,
+          "the offered mtu is read before DriverFeatures is written")
+    var plain = Fake.qemu()
+    let _ = chose(&var plain)
+    check(plain.count(EVENT_CONFIG16) == 0, "a device not offering MTU has no mtu read")
+    var tiny = offering_mtu(67)
+    check(is_refused(begin(&var tiny), SetupError.MtuTooSmall(67)), "an offered mtu of 67 is refused")
+    check(tiny.writes_to(REGISTER_DRIVER_FEATURES) == 0, "before a feature is written")
+    var unstable = offering_mtu(1400)
+    unstable.generation_bumps = 1000
+    check(is_refused(begin(&var unstable), SetupError.ConfigUnstable), "an mtu that never settles")
+}
+
 func main() {
+    mtu_past_a_slot()
+    mtu_read_before_features()
     qemu_defaults()
     required_features()
     access_platform()

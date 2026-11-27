@@ -1,0 +1,70 @@
+# What the virtio network driver needs from a stock root:
+# tools/sosimage/src/declaration.saw states the format.
+format = 1
+arena = 0x1000
+ram = "fast"                # it services the transport's interrupt
+
+# `debug` for its own lines, which go through the kernel's debug print, and
+# `process-self` for its Process handle.
+[[boot]]
+name = "system"
+kind = "system"
+tag = 1
+rights = ["debug", "process-self"]
+
+# The transport the image names, which the driver checks is a network card.
+[[boot]]
+name = "net"
+kind = "window"
+type = "virtio-mmio"
+tag = 2
+
+[[boot]]
+name = "net"
+kind = "line"
+type = "virtio-mmio"
+tag = 3
+
+[[boot]]
+name = "netdev"
+kind = "serve"
+protocol = "netdevproto"
+tag = 4
+
+# The pool its queue memory and every client's ring are allocated from, each
+# contiguous and pinned while the device may address it. An allocation carries
+# its pool handle's rights: `physical` for the pin, and `mint` and `transfer`
+# for the sibling of a ring the driver sends its client in the reply to
+# `Attach`.
+[[boot]]
+name = "queues"
+kind = "memory"
+tag = 5
+rights = ["allocate", "map", "physical", "mint", "transfer"]
+
+# Complete, so it lists every right the driver spends. `physical` is an opt-in
+# on `memory` and `pool`, which the image must grant on each. A server end
+# given to a Waiter spends `wait` alone.
+[ceilings]
+process = ["boot-handles", "thread-self", "exit", "waiter-create", "map"]
+thread = ["control"]
+waiter = ["attach", "wait"]
+interrupt = ["wait", "ack"]
+memory = ["transfer", "mint", "map", "physical"]
+iomemory = ["map"]
+mapping = ["unmap", "base"]
+pool = ["allocate", "map", "physical", "mint", "transfer"]
+pipe-outlet = ["wait"]
+pipe-request = ["reply", "wait"]
+
+# Handles, at their most: its records but the server end, which its Waiter
+# owns (four); its Process and its main thread's Thread; three Mappings (the
+# window, the queues, the ring); its Waiter; the queues' and the ring's Memory,
+# kept for their unpin; one held `WaitEvent`; the request being served and the
+# handles it may carry, `PIPE_MSG_HANDLES`, which a delivery mints before the
+# driver releases them.
+[quota]
+mappings = 3
+memories = 2
+waiters = 1
+handles = 18

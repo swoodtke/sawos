@@ -1655,9 +1655,22 @@ IOMMU driver can stop a dead process's device operations and release its memory
 deliberately rather than by teardown. The second is not: **critical processes**
 — a process root marks at launch whose exit for any reason faults the system,
 checked at the top of teardown ahead of any release, because the halt must
-preempt the free or the window it exists to close reopens inside it. Both v1
-boards' consoles are programmed I/O, so no case in the suite is a DMA driver and
-no capability in the tree is a lie about one.
+preempt the free or the window it exists to close reopens inside it.
+
+What a DMA driver can be held to without an IOMMU is the memory it gives its
+device. It takes each address it gives the device from `Pin`, the one op that
+answers an allocation's physical bounds, which answers for an allocation made
+contiguous and for a boot allocation, one range by construction. `Pin` spends
+`Physical`, which root holds from boot and any other process only when its
+launcher grants it (§2.7's opt-in right). The driver pins each allocation
+before any address in it reaches the device, and unpins it only once a reset of
+the device has read as complete, so the device has stopped using it; until
+then the allocation returns to no pool, however its holders end.
+`svc-virtio-net` on the QEMU `virt` boards is the suite's DMA driver, and a TCB
+member. Every byte its device is given lies in an allocation it pinned first,
+which returns to no pool until the driver unpins it after a confirmed reset, so
+a driver that dies with its device live leaves those bytes quarantined, never
+handed out again.
 
 **The direction: sub-pools and revoke (reserved, not built).** The model is a
 hierarchy of pools, and what is built is its first level. This paragraph says

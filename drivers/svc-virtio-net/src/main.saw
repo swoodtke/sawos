@@ -1,0 +1,1216 @@
+//! The virtio network driver: a virtio-mmio network card (virtio 1.2,
+//! modern transport) served as `netdevproto`.
+//!
+//! Every decision about the device is `virtio`'s: the probe, the negotiation,
+//! the queues and the checks of what the device writes, and the order the
+//! memory it addresses is pinned, unpinned and unmapped in (`Lifecycle`). This
+//! file is the process around it. `Hardware` gives the library the mapped
+//! window and the queue memory; the serve loop answers the client.
+//!
+//! # Start
+//!
+//! The window is mapped and probed, writing no register (`probe`). The queue
+//! memory is allocated contiguous from the pool record `queues` and mapped,
+//! then the device is reset, negotiated (`Lifecycle.begin`), the memory
+//! pinned and the queues set up (`setup_queues`), the configuration read and
+//! `DRIVER_OK` set. Two lines report what was negotiated and read. A refusal
+//! is a line, and exits 1 (`virtio.transport`'s exit codes).
+//!
+//! # The client's ring
+//!
+//! `Attach` allocates the ring from the same pool, contiguous, maps it, pins
+//! it, lays it out (`Endpoint.server_laid_out`) and answers with a sibling of
+//! its Memory carrying `Map` and `Transfer` alone, so the client can map it
+//! and can neither pin nor unpin it. The pool's `NoMemory`, `QuotaExceeded`
+//! or `NoResource`, at the allocation, the map or the sibling's mint, is the
+//! status `NoMemory`, and the connection stays.
+//!
+//! Frames are zero copy. Each receive chain's frame descriptor is a free
+//! `ToClient` slot (`reserve`), published in posting order once the device has
+//! used it (`fill`, `publish`); each `ToServer` slot the client publishes is a
+//! transmit chain's frame (`take`), released in ring order once the device has
+//! read it (`release_taken`). The driver reads the ring's index and length
+//! words once each, through `pktring`, and never a frame's bytes: a
+//! descriptor's address is the pin's base and the checked slot's offset, and
+//! its length the checked length word. A frame the client sends that is shorter
+//! than an Ethernet header, or longer than one and the MTU, is not sent: it
+//! counts in `tx_errors` and its slot completes as sent.
+//!
+//! # The loop
+//!
+//! A completion-queue server, as the UART drivers are: the server end is
+//! given to the Waiter, the line is attached to it, and every delivery
+//! arrives through `wait`. An interrupt is acknowledged at the device, a
+//! configuration change re-reads the link, both used rings are drained and
+//! the freed slots posted again, a held `WaitEvent` is answered if an event is
+//! pending, and only then is the line acknowledged, after every device access.
+//!
+//! # The end
+//!
+//! Every way the driver stops goes through `Lifecycle.give_up`, which resets
+//! the device and unpins only once the reset reads as complete: the client
+//! gone (exit 0), a value of the client's ring that fails a check (exit 2,
+//! after the server end is released, so every claim answers `PeerClosed`), a
+//! value of the device's that fails one (exit 3), and a reset that never reads
+//! as complete (exit 4, leaving every pin). A kernel call that fails while
+//! serving stops the device as a device fault does.
+
+import sos.{AttachMode, BootSet, Interrupt, IoMemory, MapAccess, Mapping, Memory, MemoryRight,
+            OutletLevel, PhysicalRange, PipeHandles, PipeMsg, PipeOutlet, PipeRequest, Pool,
+            ReplyWaitError, SosStatus, WaitPayload, WaitResult, Waiter, PIPE_BODY_BYTES,
+            PIPE_MSG_HANDLES}
+import virtio.{DeviceFault, Dma, DmaObject, Lifecycle, NET_HEADER_BYTES, Negotiated, NetConfig,
+               PinError, Pinned, ProbeError, Queues, Registers, SetupError, Shutdown,
+               EXIT_REFUSED, EXIT_RESET_UNCONFIRMED, probe, read_config, read_link,
+               take_interrupt}
+import virtio.transport.{F_MTU, F_ORDER_PLATFORM, F_STATUS, REGISTER_CONFIG}
+import pktring.{Endpoint, Layout, MAX_SLOTS, Ring, RingError, SharedWindow, SlotRange}
+import netdevproto.{AttachInfo, BODY_BYTES, ETHERNET_HEADER_BYTES, Frame, NetdevBody, NetdevEvent,
+                    NetdevRequest, NetdevStats, NetdevStatus, SLOT_BYTES, layout}
+import sosmain
+
+static_assert(BODY_BYTES == PIPE_BODY_BYTES, "the wire's body is the kernel's")
+
+// =============================================================================
+// The declaration's records, and the Waiter's keys
+// =============================================================================
+
+static TAG_WINDOW: UInt = 2
+static TAG_LINE: UInt = 3
+static TAG_OUTLET: UInt = 4
+static TAG_QUEUES: UInt = 5
+
+static KEY_OUTLET: UInt = 1
+static KEY_IRQ: UInt = 2
+/// The one `WaitEvent` the driver holds, attached one-shot for its abandonment.
+static KEY_HELD: UInt = 3
+
+// =============================================================================
+// Sizes and rights
+// =============================================================================
+
+/// The queue memory: both queues at `MAX_QUEUE` and their headers fit one page
+/// (`virtio.MemoryPlan`, which `setup_queues` checks against the pin).
+static QUEUE_BYTES: UInt = 0x1000
+
+static RW: UInt32 = MapAccess.Read | MapAccess.Write
+
+/// What the client's sibling of its ring carries: it maps the ring, and may
+/// hand it on, and cannot pin it, unpin it or mint another.
+static CLIENT_RIGHTS: UInt32 = MemoryRight.Map | MemoryRight.Transfer
+
+/// A taken `ToServer` slot that no transmit chain carries: a frame refused for
+/// its length, complete at once.
+static NO_CHAIN: UInt8 = 0xFF
+
+/// The most chains a queue holds: half `MAX_QUEUE`.
+static MAX_CHAINS: Int = 32
+
+/// The most slots a ring has, as an array length.
+static RING_SLOTS: Int = 256
+
+static_assert(MAX_SLOTS == 256, "a ring's taken slots fit `RING_SLOTS`")
+
+// =============================================================================
+// The hardware, as `virtio` reaches it
+// =============================================================================
+
+// `native/fence-*.c`: the full barrier, for the device as well as for the
+// processor.
+extern "C" {
+    func sos_netdrv_fence()
+}
+
+/// The transport's registers, at the mapped window's base. Every access is
+/// one volatile load or store of the width `virtio.Registers` names.
+struct Regs {
+    base: UInt,
+}
+
+extension Regs: Registers {
+    func read32(&var self, offset: UInt32) unsafe -> UInt32 {
+        UnsafeMemory<UInt32, Device>(self.base + (offset as UInt)).read()
+    }
+
+    func write32(&var self, offset: UInt32, value: UInt32) unsafe {
+        UnsafeMemory<UInt32, Device>(self.base + (offset as UInt)).write(value)
+    }
+
+    func config_read8(&var self, offset: UInt32) unsafe -> UInt8 {
+        UnsafeMemory<UInt8, Device>(self.base + ((REGISTER_CONFIG + offset) as UInt)).read()
+    }
+
+    func config_read16(&var self, offset: UInt32) unsafe -> UInt16 {
+        UnsafeMemory<UInt16, Device>(self.base + ((REGISTER_CONFIG + offset) as UInt)).read()
+    }
+}
+
+/// The registers and the memory the device addresses: the queue memory from
+/// start, and the client's ring once one is attached, each with the Memory
+/// handle its pin and unpin go through and the Mapping that shows it here.
+struct Hardware {
+    regs: Regs,
+    queues: Memory,
+    queues_view: Mapping,
+    /// Where the queue memory is mapped in this process.
+    queues_at: UInt,
+    ring: Memory?,
+    ring_view: Mapping?,
+}
+
+extension Hardware: NoCopy {}
+
+extension Hardware: Registers {
+    func read32(&var self, offset: UInt32) -> UInt32 {
+        self.regs.read32(offset)
+    }
+
+    func write32(&var self, offset: UInt32, value: UInt32) {
+        self.regs.write32(offset, value)
+    }
+
+    func config_read8(&var self, offset: UInt32) -> UInt8 {
+        self.regs.config_read8(offset)
+    }
+
+    func config_read16(&var self, offset: UInt32) -> UInt16 {
+        self.regs.config_read16(offset)
+    }
+}
+
+extension Hardware {
+    func pin_ring(&self) -> Result<PhysicalRange, SosStatus> {
+        match self.ring {
+            case Some(m) -> { return m.pin() },
+            case None -> { return SosStatus.Unknown },
+        }
+    }
+
+    func unpin_ring(&self) -> Result<Void, SosStatus> {
+        match self.ring {
+            case Some(m) -> { return m.unpin() },
+            case None -> { return SosStatus.Unknown },
+        }
+    }
+
+    func unmap_ring(&self) -> Result<Void, SosStatus> {
+        match self.ring_view {
+            case Some(v) -> { return v.unmap() },
+            case None -> { return SosStatus.Unknown },
+        }
+    }
+
+    /// The queue memory's byte at `offset`, as one volatile access.
+    func queue_word(&self, offset: UInt32) -> UInt {
+        self.queues_at + (offset as UInt)
+    }
+}
+
+extension Hardware: Dma {
+    func pin(&var self, object: DmaObject) -> Result<Pinned, PinError> {
+        let answer = match object {
+            case Queues -> self.queues.pin(),
+            case Ring -> self.pin_ring(),
+        }
+        let range = try answer catch {
+            print("SOS netdrv: pin refused: {}", error)
+            return PinError.NoResource
+        }
+        return Pinned(base: range.base as UInt64, len: range.len as UInt64)
+    }
+
+    func unpin(&var self, object: DmaObject) {
+        let answer = match object {
+            case Queues -> self.queues.unpin(),
+            case Ring -> self.unpin_ring(),
+        }
+        try answer catch { print("SOS netdrv: unpin refused: {}", error) }
+    }
+
+    func unmap(&var self, object: DmaObject) {
+        let answer = match object {
+            case Queues -> self.queues_view.unmap(),
+            case Ring -> self.unmap_ring(),
+        }
+        try answer catch { print("SOS netdrv: unmap refused: {}", error) }
+    }
+
+    func barrier(&var self) unsafe {
+        sos_netdrv_fence()
+    }
+
+    func load16(&var self, offset: UInt32) unsafe -> UInt16 {
+        UnsafeMemory<UInt16, Device>(self.queue_word(offset)).read()
+    }
+
+    func load32(&var self, offset: UInt32) unsafe -> UInt32 {
+        UnsafeMemory<UInt32, Device>(self.queue_word(offset)).read()
+    }
+
+    func store16(&var self, offset: UInt32, value: UInt16) unsafe {
+        UnsafeMemory<UInt16, Device>(self.queue_word(offset)).write(value)
+    }
+
+    func store32(&var self, offset: UInt32, value: UInt32) unsafe {
+        UnsafeMemory<UInt32, Device>(self.queue_word(offset)).write(value)
+    }
+}
+
+// =============================================================================
+// The transcript's words
+// =============================================================================
+
+/// A MAC address as six colon-separated pairs of hex digits.
+struct MacText {
+    octets: [UInt8; 6],
+}
+
+func hex_digit(nibble: UInt8) -> Byte {
+    if nibble < 10 { Byte(0x30 + nibble) } else { Byte(0x61 + nibble - 10) }
+}
+
+extension MacText: Printable {
+    func format(&self, into: &var StringBuilder) {
+        var i = 0
+        while i < 6 {
+            if i > 0 { try! into.append(b: Byte(0x3A)) }
+            try! into.append(b: hex_digit(self.octets[i] >> 4))
+            try! into.append(b: hex_digit(self.octets[i] & 0x0F))
+            i = i + 1
+        }
+    }
+}
+
+// Each refusal is said by a `Printable` and printed from one place: a
+// `print` renders into scratch in its own function's frame, and a reporter
+// with a `print` per case would hold all of them in the frame it is inlined
+// into.
+
+func put(into: &var StringBuilder, text: String) {
+    try! into.append(text)
+}
+
+func put_number(into: &var StringBuilder, n: UInt64) {
+    try! into.append(value: n)
+}
+
+/// Why the transport is not a network card, as the driver's line says it.
+struct ProbeText {
+    why: ProbeError,
+}
+
+extension ProbeText: Printable {
+    func format(&self, into: &var StringBuilder) {
+        match self.why {
+            case BadMagic(value) -> {
+                put(&var into, "refused: magic value ")
+                put_number(&var into, value as UInt64)
+                put(&var into, ", not virtio")
+            },
+            case BadVersion(version) -> {
+                put(&var into, "refused: virtio-mmio version ")
+                put_number(&var into, version as UInt64)
+                put(&var into, ", not 2")
+            },
+            case NoDevice -> put(&var into, "no device at this transport"),
+            case NotNetwork(id) -> {
+                put(&var into, "refused: device ")
+                put_number(&var into, id as UInt64)
+                put(&var into, ", not a network device")
+            },
+        }
+    }
+}
+
+/// Why the device cannot be brought up, as the driver's line says it.
+struct SetupText {
+    why: SetupError,
+}
+
+extension SetupText: Printable {
+    func format(&self, into: &var StringBuilder) {
+        put(&var into, "refused: ")
+        match self.why {
+            case MissingFeature(feature) -> {
+                put(&var into, "the device does not offer feature bit ")
+                var bit: UInt64 = 0
+                while bit < 64 && ((feature >> bit) & 1) == 0 { bit = bit + 1 }
+                put_number(&var into, bit)
+            },
+            case AccessPlatform -> put(&var into, "the device offers access_platform"),
+            case FeaturesRejected -> put(&var into, "the device cleared features_ok"),
+            case QueueBusy(queue) -> {
+                put(&var into, "queue ")
+                put_number(&var into, queue as UInt64)
+                put(&var into, " is ready before setup")
+            },
+            case QueueTooSmall(queue, max) -> {
+                put(&var into, "queue ")
+                put_number(&var into, queue as UInt64)
+                put(&var into, " holds at most ")
+                put_number(&var into, max as UInt64)
+                put(&var into, " entries")
+            },
+            case QueuesTooShort(len) -> {
+                put(&var into, "the queue memory is ")
+                put_number(&var into, len)
+                put(&var into, " bytes")
+            },
+            case QueuesMisaligned(base) -> {
+                put(&var into, "the queue memory is at ")
+                put_number(&var into, base)
+            },
+            case PinRefused -> put(&var into, "an allocation made contiguous would not pin"),
+            case MtuTooSmall(mtu) -> {
+                put(&var into, "mtu ")
+                put_number(&var into, mtu as UInt64)
+                put(&var into, ", below 68")
+            },
+            case ConfigUnstable -> put(&var into, "the configuration never settled"),
+            case ResetTimeout -> put(&var into, "the reset never completed"),
+        }
+    }
+}
+
+/// A value the device wrote that failed its check, as the driver's line says
+/// it.
+struct FaultText {
+    why: DeviceFault,
+}
+
+extension FaultText: Printable {
+    func format(&self, into: &var StringBuilder) {
+        put(&var into, "device fault: ")
+        match self.why {
+            case UsedIndexAdvance(advance) -> {
+                put(&var into, "a used index advanced by ")
+                put_number(&var into, advance as UInt64)
+            },
+            case UsedIdInvalid(id) -> {
+                put(&var into, "a used id ")
+                put_number(&var into, id as UInt64)
+            },
+            case UsedIdNotInFlight(id) -> {
+                put(&var into, "a used id ")
+                put_number(&var into, id as UInt64)
+                put(&var into, " not in flight")
+            },
+            case ReceiveLength(len) -> {
+                put(&var into, "a receive length ")
+                put_number(&var into, len as UInt64)
+            },
+            case NumBuffers(count) -> {
+                put(&var into, "num_buffers ")
+                put_number(&var into, count as UInt64)
+            },
+            case NeedsReset -> put(&var into, "the device needs a reset"),
+            case ConfigUnstable -> put(&var into, "the configuration never settled"),
+        }
+    }
+}
+
+/// One line of the driver's: `SOS netdrv: ` and `what`.
+func say<T: Printable>(what: &T) {
+    print("SOS netdrv: {}", what)
+}
+
+func report_probe(why: ProbeError) {
+    say(&ProbeText(why: why))
+}
+
+func report_setup(why: SetupError) {
+    say(&SetupText(why: why))
+}
+
+func report_fault(why: DeviceFault) {
+    say(&FaultText(why: why))
+}
+
+
+/// The word a feature line names when `feature` was negotiated, or nothing.
+func named(negotiated: &Negotiated, feature: UInt64, name: String) -> String {
+    if negotiated.has(feature) { name } else { "" }
+}
+
+// =============================================================================
+// The serving state
+// =============================================================================
+
+/// The `ToServer` slots taken and not yet released, in ring order: each the
+/// transmit chain carrying it, or `NO_CHAIN`.
+struct Taken {
+    chains: [UInt8; RING_SLOTS],
+    head: Int,
+    count: Int,
+}
+
+extension Taken {
+    static func empty() -> Taken {
+        Taken(chains: [0; RING_SLOTS], head: 0, count: 0)
+    }
+
+    func push(&var self, chain: UInt8) {
+        if self.count >= RING_SLOTS { panic("Taken.push: more slots than a ring has") }
+        self.chains[(self.head + self.count) % RING_SLOTS] = chain
+        self.count = self.count + 1
+    }
+
+    func front(&self) -> UInt8 {
+        self.chains[self.head]
+    }
+
+    func pop(&var self) {
+        self.head = (self.head + 1) % RING_SLOTS
+        self.count = self.count - 1
+    }
+}
+
+/// The attached client's ring.
+struct Attached {
+    end: Endpoint<SharedWindow>,
+    to_server: UInt32,
+    to_client: UInt32,
+    taken: Taken,
+}
+
+// There is one ring, and its cursors are the ring's state: a copy would act
+// on cursors the ring has moved past. `NoCopy` also makes a `match` arm over
+// `Attached?` bind the ring itself rather than a copy of it.
+extension Attached: NoCopy {}
+
+/// No slots.
+func no_range() -> SlotRange {
+    SlotRange(first: 0, count: 0)
+}
+
+/// `pending` with `later` reported after it. The count stops at the ring's
+/// `slots`: a doorbell need not be acted on, since the ring's index words say
+/// the same or more.
+func merge(pending: SlotRange, later: SlotRange, slots: UInt32) -> SlotRange {
+    if pending.count == 0 { return later }
+    let total = (pending.count as UInt32) + (later.count as UInt32)
+    let count: UInt16 = if total > slots { slots as UInt16 } else { total as UInt16 }
+    SlotRange(first: pending.first, count: count)
+}
+
+/// Everything the loop keeps but the ring.
+struct Server {
+    hw: Hardware,
+    lc: Lifecycle,
+    queues: Queues,
+    negotiated: Negotiated,
+    pool: Pool,
+    /// The pool's finest granularity: a ring is a whole number of it.
+    grain: UInt,
+    mac: [UInt8; 6],
+    /// The MTU reported to the client, which bounds the frames it sends.
+    mtu: UInt16,
+    link_up: Bool,
+    /// The link changed since the last report, or a client just attached.
+    link_pending: Bool,
+    /// `ToClient` slots published and `ToServer` slots released since the
+    /// last report.
+    rx_pending: SlotRange,
+    tx_pending: SlotRange,
+    /// Each receive chain's frame length, as the device's completion said.
+    rx_len: [UInt32; MAX_CHAINS],
+    held: PipeRequest?,
+    stats: NetdevStats,
+    abandoned: UInt32,
+}
+
+extension Server: NoCopy {}
+
+/// Why the loop stopped.
+enum Stop {
+    /// The terminal level: every client end is gone.
+    case ClientGone,
+    /// A value of the client's ring failed a check.
+    case RingFault(error: RingError),
+    /// A value of the device's failed a check.
+    case DeviceFault(fault: DeviceFault),
+    /// A pin of an allocation made contiguous was refused: a kernel bug.
+    case PinRefused,
+    /// A kernel call failed, or answered what it cannot.
+    case Kernel(status: SosStatus),
+}
+
+// =============================================================================
+// Start
+// =============================================================================
+
+
+// Every line is printed by a function of its own: a `print` renders its
+// arguments into scratch in the frame of the function it is written in, so
+// a function holding many of them would hold all their scratch at once.
+
+func main() -> Int {
+    var set = sosmain.take_boot_set()
+    guard let window = take_window(&var set) else { return no_record("IoMemory", TAG_WINDOW) }
+    guard let irq = take_line(&var set) else { return no_record("Interrupt", TAG_LINE) }
+    guard let outlet = take_outlet(&var set) else { return no_record("PipeOutlet", TAG_OUTLET) }
+    guard let pool = take_pool(&var set) else { return no_record("Pool", TAG_QUEUES) }
+    let code = start(&window, move irq, move outlet, move pool)
+    let _ = move window
+    code as Int
+}
+
+/// A record the declaration names and the boot set does not hold: its line,
+/// and exit 1.
+func no_record(kind: String, tag: UInt) -> Int {
+    print("SOS netdrv: no {} under tag {}", kind, tag)
+    EXIT_REFUSED as Int
+}
+
+/// A kernel call that refused the driver's start: its line, and exit 1.
+func refused(what: String, status: SosStatus) -> UInt32 {
+    print("SOS netdrv: {}: {}", what, status)
+    EXIT_REFUSED
+}
+
+func take_window(set: &var BootSet) -> IoMemory? {
+    guard var record = set.take(TAG_WINDOW) else { return None }
+    record.take_iomemory()
+}
+
+func take_line(set: &var BootSet) -> Interrupt? {
+    guard var record = set.take(TAG_LINE) else { return None }
+    record.take_interrupt()
+}
+
+func take_outlet(set: &var BootSet) -> PipeOutlet? {
+    guard var record = set.take(TAG_OUTLET) else { return None }
+    record.take_outlet()
+}
+
+func take_pool(set: &var BootSet) -> Pool? {
+    guard var record = set.take(TAG_QUEUES) else { return None }
+    record.take_pool()
+}
+
+/// `len` rounded up to a whole number of `grain`, a power of two.
+func round_up(len: UInt, grain: UInt) -> UInt {
+    (len + grain - 1) & ~(grain - 1)
+}
+
+/// The two lines that say what was negotiated and read.
+func report_up(negotiated: &Negotiated, config: &NetConfig, queues: &Queues) {
+    print("SOS netdrv: virtio-mmio version 2, network device, features version_1 mac{}{}{}",
+          named(&negotiated, F_STATUS, " status"), named(&negotiated, F_MTU, " mtu"),
+          named(&negotiated, F_ORDER_PLATFORM, " order_platform"))
+    let link = if not negotiated.has(F_STATUS) {
+        "link assumed up"
+    } else if config.link_up {
+        "link up"
+    } else {
+        "link down"
+    }
+    print("SOS netdrv: mac {}, {}, mtu {}, queues {} and {}", MacText(octets: config.mac), link,
+          config.reported_mtu(), queues.rx.size(), queues.tx.size())
+}
+
+/// Maps the window and probes it, allocates and maps the queue memory, and
+/// brings the device up: the serving state, or the exit code.
+func bring_up(window: &IoMemory, pool: Pool) -> Result<Server, UInt32> {
+    let regs_view = try sosmain.context().process().map(iomemory: &window) catch {
+        return refused("the window", error)
+    }
+    let regs_at = try regs_view.base() catch { return refused("the window's base", error) }
+    var regs = Regs(base: regs_at)
+    try probe(&var regs) catch {
+        report_probe(error)
+        return error.exit_code()
+    }
+    let available = try pool.available() catch { return refused("the pool", error) }
+    // The lowest set bit: the granularity zero names, which is the grain.
+    let grain = available.granularities & (0 &- available.granularities)
+    let queues = try pool.allocate(len: round_up(QUEUE_BYTES, grain), contiguous: true) catch {
+        return refused("the queue memory", error)
+    }
+    let queues_view = try sosmain.context().process().map(memory: &queues, access: RW) catch {
+        return refused("the queue memory's mapping", error)
+    }
+    let queues_at = try queues_view.base() catch {
+        return refused("the queue memory's base", error)
+    }
+    var hw = Hardware(regs: regs, queues: move queues, queues_view: move queues_view,
+                      queues_at: queues_at, ring: None, ring_view: None)
+    var lc = Lifecycle()
+    let negotiated = try lc.begin(&var hw, SLOT_BYTES) catch {
+        report_setup(error)
+        return give_up(&var lc, &var hw, Shutdown.Refused)
+    }
+    let queues_set = try lc.setup_queues(&var hw) catch {
+        report_setup(error)
+        return give_up(&var lc, &var hw, Shutdown.Refused)
+    }
+    let config = try read_config(&var hw, &negotiated) catch {
+        report_setup(error)
+        return give_up(&var lc, &var hw, Shutdown.Refused)
+    }
+    lc.go_live(&var hw)
+    report_up(&negotiated, &config, &queues_set)
+    return Server(hw: move hw, lc: move lc, queues: queues_set, negotiated: negotiated,
+                  pool: move pool, grain: grain, mac: config.mac, mtu: config.reported_mtu(),
+                  link_up: config.link_up, link_pending: false, rx_pending: no_range(),
+                  tx_pending: no_range(), rx_len: [0; MAX_CHAINS], held: None,
+                  stats: NetdevStats(rx_frames: 0, rx_dropped: 0, tx_frames: 0, tx_errors: 0,
+                                     ring_faults: 0),
+                  abandoned: 0)
+}
+
+/// Brings the device up, wires the Waiter and serves until the loop stops;
+/// then gives the device up. Answers the exit code.
+func start(window: &IoMemory, irq: Interrupt, outlet: PipeOutlet, pool: Pool) -> UInt32 {
+    var s = try bring_up(&window, move pool) catch { return error }
+    var att: Attached? = None
+    let waiter = try sosmain.context().process().waiter_create() catch {
+        return finish(&var s, &var att, Stop.Kernel(error))
+    }
+    try waiter.add(&irq, KEY_IRQ) catch {
+        return finish(&var s, &var att, Stop.Kernel(error))
+    }
+    try waiter.give(outlet: move outlet, key: KEY_OUTLET, mode: AttachMode.Persistent) catch {
+        let (why, back) = move error
+        let _ = move back
+        return finish(&var s, &var att, Stop.Kernel(why))
+    }
+    let stop = serve(&var s, &var att, &waiter, &irq)
+    if is_ring_fault(&stop) {
+        // The connection ends for every client: with the server end gone,
+        // every claim on it answers `PeerClosed`.
+        try waiter.remove(KEY_OUTLET) catch { let _ = refused("the server end", error) }
+        let _ = s.held.take()
+    }
+    finish(&var s, &var att, stop)
+}
+
+
+/// `Lifecycle.give_up`, and the line for exit 4: what is left pinned.
+func give_up(lc: &var Lifecycle, hw: &var Hardware, why: Shutdown) -> UInt32 {
+    let code = lc.give_up(&var hw, why)
+    if code == EXIT_RESET_UNCONFIRMED {
+        print("SOS netdrv: the reset did not complete: left pinned: queues {}, ring {}",
+              if lc.queues_pinned() { "yes" } else { "no" },
+              if lc.ring_pinned() { "yes" } else { "no" })
+    }
+    code
+}
+
+func is_ring_fault(stop: &Stop) -> Bool {
+    match stop {
+        case RingFault(_) -> true,
+        case _ -> false,
+    }
+}
+
+/// Gives the device up by the class of `stop`, reports it and the counts, and
+/// answers the exit code.
+func finish(s: &var Server, att: &var Attached?, stop: Stop) -> UInt32 {
+    let attached = att.is_some()
+    let _ = s.held.take()
+    match stop {
+        case ClientGone -> {
+            let code = give_up(&var s.lc, &var s.hw, Shutdown.ClientGone)
+            if code != EXIT_RESET_UNCONFIRMED {
+                if attached {
+                    print("SOS netdrv: client gone: device reset, ring unmapped")
+                } else {
+                    print("SOS netdrv: client gone: device reset")
+                }
+            }
+            report_counts(&s)
+            return code
+        },
+        case RingFault(error) -> {
+            s.stats.ring_faults = s.stats.ring_faults + 1
+            let code = give_up(&var s.lc, &var s.hw, Shutdown.RingFault)
+            print("SOS netdrv: connection ended: {}, ring_faults={}", error, s.stats.ring_faults)
+            report_counts(&s)
+            return code
+        },
+        case DeviceFault(fault) -> {
+            report_fault(fault)
+            let code = give_up(&var s.lc, &var s.hw, Shutdown.DeviceFault)
+            report_counts(&s)
+            return code
+        },
+        case PinRefused -> {
+            print("SOS netdrv: refused: an allocation made contiguous would not pin")
+            let code = give_up(&var s.lc, &var s.hw, Shutdown.Refused)
+            report_counts(&s)
+            return code
+        },
+        case Kernel(status) -> {
+            print("SOS netdrv: stopped: {}", status)
+            let code = give_up(&var s.lc, &var s.hw, Shutdown.DeviceFault)
+            report_counts(&s)
+            return code
+        },
+    }
+}
+
+func report_counts(s: &Server) {
+    print("SOS netdrv: rx={} tx={} tx_errors={} ring_faults={} abandoned={}", s.stats.rx_frames,
+          s.stats.tx_frames, s.stats.tx_errors, s.stats.ring_faults, s.abandoned)
+}
+
+// =============================================================================
+// The loop
+// =============================================================================
+
+static KIND_MESSAGE: Int = 0
+static KIND_IRQ: Int = 1
+static KIND_ABANDONED: Int = 2
+static KIND_GONE: Int = 3
+static KIND_OTHER: Int = 4
+
+func kind_of(r: &WaitResult) -> Int {
+    match r.what {
+        case Message(_, _) -> KIND_MESSAGE,
+        case Interrupt(_) -> KIND_IRQ,
+        case Abandoned -> KIND_ABANDONED,
+        case Readable(state) -> match state {
+            case PeerGone -> KIND_GONE,
+            case Msg -> KIND_OTHER,
+        },
+        case _ -> KIND_OTHER,
+    }
+}
+
+/// Every delivery, until one stops the loop. The loop is the only place that
+/// waits: a handler answers with `reply` and returns, so no delivery record
+/// is passed back up through it.
+func serve(s: &var Server, att: &var Attached?, waiter: &Waiter, irq: &Interrupt) -> Stop {
+    while {
+        let wake = try waiter.wait() catch { return Stop.Kernel(error) }
+        let kind = kind_of(&wake)
+        if kind == KIND_GONE { return Stop.ClientGone }
+        if kind == KIND_OTHER { return Stop.Kernel(SosStatus.Unknown) }
+        if kind == KIND_IRQ {
+            try interrupt(&var s, &var att, &irq) catch { return error }
+            continue
+        }
+        if kind == KIND_ABANDONED {
+            // The client dropped its claim on the held `WaitEvent`: the
+            // obligation is discarded, and the next one is served.
+            if wake.key == KEY_HELD && s.held.is_some() {
+                let _ = s.held.take()
+                s.abandoned = s.abandoned + 1
+            }
+            continue
+        }
+        let (_, what) = (move wake).open()
+        match what {
+            case Message(m, r) -> {
+                try message(&var s, &var att, move m, move r, &waiter) catch { return error }
+            },
+            case _ -> { return Stop.Kernel(SosStatus.Unknown) },
+        }
+    }
+}
+
+/// How many handles `m` carried.
+func carried(m: &PipeMsg) -> UInt {
+    var n: UInt = 0
+    var i = 0
+    while i < PIPE_MSG_HANDLES {
+        if m.handles[i].is_some() { n = n + 1 }
+        i = i + 1
+    }
+    n
+}
+
+/// Answers `request` with the first `n` bytes of `body`. A reply that does
+/// not land (a tell's, or a claim the client dropped) has discharged the
+/// obligation all the same: `PeerClosed` is its one answer, and the loop goes
+/// on.
+func answer(request: PipeRequest, body: &NetdevBody, n: UInt) {
+    var r = move request
+    let _ = (move r).reply(body: &body.bytes, len: n)
+}
+
+/// Answers `request` with `status` alone.
+func answer_status(request: PipeRequest, status: NetdevStatus) {
+    var body = NetdevBody.empty()
+    let n = body.refuse(status)
+    answer(move request, &body, n)
+}
+
+/// One request: decoded, refused or acted on, and answered.
+func message(s: &var Server, att: &var Attached?, m: PipeMsg, request: PipeRequest,
+             waiter: &Waiter) -> Result<Void, Stop> {
+    let handles = carried(&m)
+    let decoded = Frame(len: m.len, body: m.bytes, handles: handles)
+    // The bytes are copied out, so whatever handles the message carried are
+    // released before anything acts on it.
+    let _ = move m
+    let frame = try decoded catch {
+        answer_status(move request, error.status())
+        return
+    }
+    let op = try frame.request() catch {
+        answer_status(move request, error.status())
+        return
+    }
+    match op {
+        case Attach(to_server, to_client) -> {
+            try attach(&var s, &var att, to_server, to_client, move request)
+        },
+        case Tx(range) -> {
+            let status = try tx_doorbell(&var s, &var att, range)
+            answer_held(&var s)
+            answer_status(move request, status)
+        },
+        case RxReturn(range) -> {
+            let status = try rx_doorbell(&var s, &var att, range)
+            answer_held(&var s)
+            answer_status(move request, status)
+        },
+        case WaitEvent -> {
+            try wait_event(&var s, &att, move request, &waiter)
+        },
+        case Stats -> {
+            if att.is_none() {
+                answer_status(move request, NetdevStatus.NotAttached)
+            } else {
+                var body = NetdevBody.empty()
+                let n = body.ok_stats(&s.stats)
+                answer(move request, &body, n)
+            }
+        },
+    }
+    return
+}
+
+/// Why an `Attach` made no ring: a status to answer it with, the connection
+/// staying, or a reason to stop.
+enum Unmade {
+    case Refused(status: NetdevStatus),
+    case Stopped(stop: Stop),
+}
+
+/// What a refused allocation, map or mint makes of an `Attach`: the driver
+/// cannot hold the ring, `NoMemory`. Any other status is the kernel's.
+func refusal(status: SosStatus) -> Unmade {
+    if status == SosStatus.NoMemory || status == SosStatus.QuotaExceeded ||
+       status == SosStatus.NoResource {
+        return Unmade.Refused(NetdevStatus.NoMemory)
+    }
+    return Unmade.Stopped(Stop.Kernel(status))
+}
+
+/// A ring of `to_server` and `to_client` slots, allocated, mapped, pinned and
+/// laid out, and the client's sibling of its Memory.
+func make_ring(s: &var Server, to_server: UInt16,
+               to_client: UInt16) unsafe -> Result<(Attached, Memory), Unmade> {
+    let shape = try layout(to_server, to_client) catch {
+        return Unmade.Refused(NetdevStatus.BadArg)
+    }
+    let memory = try s.pool.allocate(len: round_up(shape.bytes(), s.grain), contiguous: true) catch {
+        return refusal(error)
+    }
+    let view = try sosmain.context().process().map(memory: &memory, access: RW) catch {
+        return refusal(error)
+    }
+    let at = try view.base() catch { return Unmade.Stopped(Stop.Kernel(error)) }
+    let len = try view.len() catch { return Unmade.Stopped(Stop.Kernel(error)) }
+    let window = try SharedWindow(at: at as UnsafePointer<UInt32>, len: len, layout: &shape) catch {
+        // The row is the allocation's whole length: a kernel that maps less
+        // answers what it cannot.
+        return Unmade.Stopped(Stop.Kernel(SosStatus.Unknown))
+    }
+    // The sibling is minted before the pin, so a refusal has pinned nothing
+    // and the allocation goes home once its row does.
+    let client = try memory.mint(rights: CLIENT_RIGHTS) catch {
+        let why = error
+        try view.unmap() catch { return Unmade.Stopped(Stop.Kernel(error)) }
+        return refusal(why)
+    }
+    s.hw.ring = move memory
+    s.hw.ring_view = move view
+    try s.lc.pin_ring(&var s.hw) catch { return Unmade.Stopped(Stop.PinRefused) }
+    let ring = Attached(end: Endpoint.server_laid_out(window, shape),
+                        to_server: to_server as UInt32, to_client: to_client as UInt32,
+                        taken: Taken.empty())
+    return (move ring, move client)
+}
+
+func attach(s: &var Server, att: &var Attached?, to_server: UInt16, to_client: UInt16,
+            request: PipeRequest) -> Result<Void, Stop> {
+    if att.is_some() {
+        answer_status(move request, NetdevStatus.Attached)
+        return
+    }
+    let (ring, client) = try make_ring(&var s, to_server, to_client) catch {
+        match error {
+            case Refused(status) -> {
+                answer_status(move request, status)
+                return
+            },
+            case Stopped(stop) -> { return stop },
+        }
+    }
+    att = move ring
+    try post_rx(&var s, &var att)
+    // The next `WaitEvent` is answered at once with the link's state.
+    s.link_pending = true
+    let info = AttachInfo(mac: s.mac, mtu: s.mtu, to_server: to_server, to_client: to_client)
+    var body = NetdevBody.empty()
+    let n = body.ok_attach(&info)
+    var handles = PipeHandles.none()
+    handles.put(at: 0, memory: move client)
+    var r = move request
+    // A reply that does not land is a claim the client dropped: the ring is
+    // made and attached, and the client's next request, or its end, settles
+    // it.
+    let _ = (move r).reply_with(body: &body.bytes, len: n, handles: &var handles)
+    return
+}
+
+/// A `Tx`: the range against the ring, then every published frame the
+/// transmit chains can take.
+func tx_doorbell(s: &var Server, att: &var Attached?,
+                 range: SlotRange) -> Result<NetdevStatus, Stop> {
+    match att {
+        case Some(var a) -> {
+            if not range.fits(a.to_server) { return NetdevStatus.BadArg }
+            try send_tx(&var s, &var a)
+            return NetdevStatus.Ok
+        },
+        case None -> { return NetdevStatus.NotAttached },
+    }
+}
+
+/// An `RxReturn`: the range against the ring, then every freed slot posted.
+func rx_doorbell(s: &var Server, att: &var Attached?,
+                 range: SlotRange) -> Result<NetdevStatus, Stop> {
+    match att {
+        case Some(var a) -> {
+            if not range.fits(a.to_client) { return NetdevStatus.BadArg }
+            try post_rx_into(&var s, &var a)
+            return NetdevStatus.Ok
+        },
+        case None -> { return NetdevStatus.NotAttached },
+    }
+}
+
+func wait_event(s: &var Server, att: &Attached?, request: PipeRequest,
+                waiter: &Waiter) -> Result<Void, Stop> {
+    if att.is_none() {
+        answer_status(move request, NetdevStatus.NotAttached)
+        return
+    }
+    if s.held.is_some() {
+        answer_status(move request, NetdevStatus.Busy)
+        return
+    }
+    if let event = take_event(&var s) {
+        answer_event(&var s, move request, event)
+        return
+    }
+    // Held until there is an event, attached one-shot so a claim the client
+    // drops is a delivery.
+    try waiter.add(request: &request, key: KEY_HELD, mode: AttachMode.OneShot) catch {
+        return Stop.Kernel(error)
+    }
+    s.held = move request
+    return
+}
+
+
+/// The next event to report, in order: a link change, frames received,
+/// slots sent. `None` when none is pending.
+func take_event(s: &var Server) -> NetdevEvent? {
+    if s.link_pending {
+        s.link_pending = false
+        return if s.link_up { NetdevEvent.LinkUp } else { NetdevEvent.LinkDown }
+    }
+    if s.rx_pending.count != 0 {
+        let range = s.rx_pending
+        s.rx_pending = no_range()
+        return NetdevEvent.RxReady(range)
+    }
+    if s.tx_pending.count != 0 {
+        let range = s.tx_pending
+        s.tx_pending = no_range()
+        return NetdevEvent.TxDone(range)
+    }
+    return None
+}
+
+/// Puts back an event whose reply did not land, ahead of what came since.
+func restore_event(s: &var Server, event: NetdevEvent) {
+    match event {
+        case LinkUp -> { s.link_pending = true },
+        case LinkDown -> { s.link_pending = true },
+        case RxReady(range) -> { s.rx_pending = merge(range, s.rx_pending, MAX_SLOTS) },
+        case TxDone(range) -> { s.tx_pending = merge(range, s.tx_pending, MAX_SLOTS) },
+    }
+}
+
+/// Answers the held `WaitEvent` when an event is pending.
+func answer_held(s: &var Server) {
+    if s.held.is_none() { return }
+    guard let event = take_event(&var s) else { return }
+    guard let request = s.held.take() else {
+        restore_event(&var s, event)
+        return
+    }
+    answer_event(&var s, move request, event)
+}
+
+/// Answers `request` with `event`. A reply that does not land, to a claim
+/// the client dropped or to a `WaitEvent` it told, reported nothing, so the
+/// event is put back for the next `WaitEvent`.
+func answer_event(s: &var Server, request: PipeRequest, event: NetdevEvent) {
+    var body = NetdevBody.empty()
+    let n = body.ok_event(&event)
+    var r = move request
+    try (move r).reply(body: &body.bytes, len: n) catch { restore_event(&var s, event) }
+}
+
+// =============================================================================
+// The device's side
+// =============================================================================
+
+/// One interrupt: the device's bits acknowledged, the link re-read on a
+/// configuration change, both used rings drained, the freed slots posted
+/// again, the held `WaitEvent` answered, and only then the line acknowledged.
+func interrupt(s: &var Server, att: &var Attached?, irq: &Interrupt) -> Result<Void, Stop> {
+    let events = take_interrupt(&var s.hw)
+    if events.config_change {
+        let up = try read_link(&var s.hw, &s.negotiated) catch { return Stop.DeviceFault(error) }
+        if up != s.link_up {
+            s.link_up = up
+            s.link_pending = true
+        }
+    }
+    try drain(&var s, &var att)
+    answer_held(&var s)
+    try irq.ack() catch { return Stop.Kernel(error) }
+    return
+}
+
+/// Takes every element both used rings hold, transmit first, and acts on
+/// them in posting order: transmit slots released, receive slots filled and
+/// published, the freed chains given new slots.
+func drain(s: &var Server, att: &var Attached?) -> Result<Void, Stop> {
+    let sent = try s.queues.tx.pending(&var s.hw) catch { return Stop.DeviceFault(error) }
+    var i: UInt16 = 0
+    while i < sent {
+        let _ = try s.queues.tx.next(&var s.hw) catch { return Stop.DeviceFault(error) }
+        i = i + 1
+    }
+    let received = try s.queues.rx.pending(&var s.hw) catch { return Stop.DeviceFault(error) }
+    i = 0
+    while i < received {
+        let done = try s.queues.rx.next(&var s.hw) catch { return Stop.DeviceFault(error) }
+        s.rx_len[done.chain as Int] = done.len - NET_HEADER_BYTES
+        i = i + 1
+    }
+    match att {
+        case Some(var a) -> {
+            try release_tx(&var s, &var a)
+            try publish_rx(&var s, &var a)
+            try post_rx_into(&var s, &var a)
+            try send_tx(&var s, &var a)
+        },
+        case None -> {},
+    }
+    return
+}
+
+func post_rx(s: &var Server, att: &var Attached?) -> Result<Void, Stop> {
+    match att {
+        case Some(var a) -> { try post_rx_into(&var s, &var a) },
+        case None -> {},
+    }
+    return
+}
+
+/// Posts a free `ToClient` slot to each free receive chain, and notifies.
+func post_rx_into(s: &var Server, a: &var Attached) -> Result<Void, Stop> {
+    var posted = false
+    while let chain = try? s.queues.rx.free_chain() {
+        let slot = try a.end.reserve() catch {
+            if error.is_fatal() { return Stop.RingFault(error) }
+            break
+        }
+        let span = s.lc.ring_address(slot.offset as UInt32, SLOT_BYTES)
+        s.queues.rx.post_rx(&var s.hw, chain, span)
+        posted = true
+    }
+    if posted { s.queues.rx.kick(&var s.hw) }
+    return
+}
+
+/// Fills and publishes the receive chains completed in posting order.
+func publish_rx(s: &var Server, a: &var Attached) -> Result<Void, Stop> {
+    var filled: UInt32 = 0
+    while let chain = try? s.queues.rx.take_in_order() {
+        let _ = try a.end.fill(s.rx_len[chain as Int] as UInt) catch { return Stop.RingFault(error) }
+        filled = filled + 1
+    }
+    if filled == 0 { return }
+    let range = try a.end.publish() catch { return Stop.RingFault(error) }
+    s.rx_pending = merge(s.rx_pending, range, a.to_client)
+    s.stats.rx_frames = s.stats.rx_frames + filled
+    return
+}
+
+/// Gives each published `ToServer` slot to a free transmit chain, in ring
+/// order, while chains are free, and notifies. A frame whose length no
+/// Ethernet frame of the MTU has is not sent: it counts in `tx_errors` and
+/// its slot completes at once.
+func send_tx(s: &var Server, a: &var Attached) -> Result<Void, Stop> {
+    let _ = try a.end.poll() catch {
+        if error.is_fatal() { return Stop.RingFault(error) }
+        no_range()
+    }
+    let least = ETHERNET_HEADER_BYTES as UInt
+    let most = least + (s.mtu as UInt)
+    var posted = false
+    while {
+        let chain = try s.queues.tx.free_chain() catch { break }
+        let slot = try a.end.take() catch {
+            if error.is_fatal() { return Stop.RingFault(error) }
+            break
+        }
+        if slot.len < least || slot.len > most {
+            s.stats.tx_errors = s.stats.tx_errors + 1
+            a.taken.push(NO_CHAIN)
+        } else {
+            let span = s.lc.ring_address(slot.offset as UInt32, slot.len as UInt32)
+            s.queues.tx.post_tx(&var s.hw, chain, span)
+            a.taken.push(chain as UInt8)
+            posted = true
+        }
+    }
+    if posted { s.queues.tx.kick(&var s.hw) }
+    try release_tx(&var s, &var a)
+    return
+}
+
+/// Releases the `ToServer` slots at the front of ring order whose frames are
+/// sent: each refused one, and each whose chain is the next completed in
+/// posting order.
+func release_tx(s: &var Server, a: &var Attached) -> Result<Void, Stop> {
+    var count: UInt32 = 0
+    while a.taken.count > 0 {
+        let head = a.taken.front()
+        if head != NO_CHAIN {
+            let chain = try s.queues.tx.take_in_order() catch { break }
+            if chain != (head as UInt32) {
+                panic("release_tx: chain {} completed where {} was posted", chain, head)
+            }
+            s.stats.tx_frames = s.stats.tx_frames + 1
+        }
+        a.taken.pop()
+        count = count + 1
+    }
+    if count == 0 { return }
+    let range = try a.end.release_taken(count) catch { return Stop.RingFault(error) }
+    s.tx_pending = merge(s.tx_pending, range, a.to_server)
+    return
+}

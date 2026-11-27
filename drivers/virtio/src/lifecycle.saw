@@ -20,8 +20,8 @@ import virtio.transport.{EXIT_CLEAN, EXIT_DEVICE_FAULT, EXIT_REFUSED, EXIT_RESET
                          EXIT_RING_FAULT, Negotiated, REGISTER_QUEUE_NUM_MAX, REGISTER_QUEUE_READY,
                          REGISTER_QUEUE_SEL, REGISTER_STATUS, Registers, SetupError, STATUS_ACKNOWLEDGE,
                          STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FAILED, STATUS_FEATURES_OK,
-                         choose_features, read_device_features, reset_device,
-                         write_driver_features}
+                         F_MTU, choose_features, mtu_fits, read_device_features,
+                         read_offered_mtu, reset_device, write_driver_features}
 
 /// Why the driver is giving the device up after it was set up.
 public enum Shutdown {
@@ -84,13 +84,24 @@ extension Lifecycle {
     /// reset, `ACKNOWLEDGE`, `DRIVER`, the offered features read, the ones
     /// chosen written back, `FEATURES_OK`, and `Status` read again to see it
     /// still set. A refusal leaves the caller to `give_up(Refused)`.
-    public func begin<R: Registers>(&var self, registers: &var R) -> Result<Negotiated, SetupError> {
+    ///
+    /// `frame_bytes` is the frame each receive buffer holds, beside its net
+    /// header. A device offering `MTU` has its `mtu` read first, and `MTU` is
+    /// taken only when a packet of it fits a buffer (`mtu_fits`).
+    public func begin<R: Registers>(&var self, registers: &var R,
+                                    frame_bytes: UInt32) -> Result<Negotiated, SetupError> {
         try reset_device(&var registers)
         self.status = 0
         self.add_status(&var registers, STATUS_ACKNOWLEDGE)
         self.add_status(&var registers, STATUS_DRIVER)
         let offered = read_device_features(&var registers)
-        let negotiated = try choose_features(offered)
+        var mtu: UInt16 = 0
+        var fits = false
+        if (offered & F_MTU) != 0 {
+            mtu = try read_offered_mtu(&var registers)
+            fits = mtu_fits(mtu, frame_bytes)
+        }
+        let negotiated = try choose_features(offered, mtu, fits)
         write_driver_features(&var registers, negotiated.features)
         self.add_status(&var registers, STATUS_FEATURES_OK)
         if (registers.read32(REGISTER_STATUS) & STATUS_FEATURES_OK) == 0 {
@@ -133,6 +144,9 @@ extension Lifecycle {
             hardware.store32(at, 0)
             at = at + 4
         }
+        // The zeroing is to memory and the programming to device registers,
+        // which neither architecture orders on its own.
+        hardware.barrier()
         let rx = Queue(0, plan.rx, plan.rx_headers, pinned.base)
         let tx = Queue(1, plan.tx, plan.tx_header, pinned.base)
         rx.program(&var hardware)
