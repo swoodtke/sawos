@@ -440,12 +440,12 @@ func system_op_decoded(op: SystemOp, obj: &SystemObject, arg0: UInt, arg1: UInt,
             // Process ceiling. The rights of the System handle do not enter
             // it; the derived set can never exceed the default one. The
             // narrowing is truncating, as in `mint_sibling`.
-            let handle = mint_capped(p, ObjType.Process,
+            let handle = mint_capped(ProcessIndex(p), ObjType.Process,
                                      process_rights()
                                          & UInt32.from(truncating: arg0),
                                      p)
             if handle == NO_HANDLE {
-                return op_status(mint_refusal(p))
+                return op_status(mint_refusal(ProcessIndex(p)))
             }
             // A second name for the same slot is a second reference, so asking
             // for yourself twice is visible to the ledger.
@@ -542,7 +542,7 @@ static_assert(sizeof<UInt64>() == 8, "a pid is one doubleword")
 /// `SystemOp.ProcessSelf`'s is, so a `Gone` record stays held and a `Created`
 /// process is not torn down for want of a name while the handle lives.
 func mint_observe(p: Int, r: Int) unsafe -> UInt {
-    let handle = mint_capped(p, ObjType.Process, process_observe_rights(), r)
+    let handle = mint_capped(ProcessIndex(p), ObjType.Process, process_observe_rights(), r)
     if handle != NO_HANDLE {
         ref_object(ObjType.Process, r)
     }
@@ -582,7 +582,7 @@ func process_next(p: Int, at: UInt) unsafe -> SyscallResult {
     }
     let handle = mint_observe(p, r)
     if handle == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
     var next = process_records().at(r).pid
     if let why = copy_out(ProcessIndex(p), at, ((&var next) as UnsafePointer<UInt64>) as UInt,
@@ -606,7 +606,7 @@ func process_by_pid(p: Int, at: UInt) unsafe -> SyscallResult {
     }
     let handle = mint_observe(p, r)
     if handle == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
     op_value(handle)
 }
@@ -689,9 +689,9 @@ func clock_get_typed(p: Int, type: ClockType) unsafe -> SyscallResult {
     // No reference is counted and no quota row is charged for the object: a
     // Clock is kernel-eternal and owned by nobody. The handle itself is charged
     // inside `mint_handle`.
-    let handle = mint_capped(p, ObjType.Clock, clock_rights(), slot)
+    let handle = mint_capped(ProcessIndex(p), ObjType.Clock, clock_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
     op_value(handle)
 }
@@ -729,10 +729,10 @@ func process_op_decoded(op: ProcessOp, obj: &ProcessObject,
             if CURRENT_THREAD == NO_THREAD {
                 fault_process(p, FaultReason.BadState)
             }
-            let handle = mint_capped(p, ObjType.Thread, thread_rights(),
+            let handle = mint_capped(ProcessIndex(p), ObjType.Thread, thread_rights(),
                                      CURRENT_THREAD)
             if handle == NO_HANDLE {
-                return op_status(mint_refusal(p))
+                return op_status(mint_refusal(ProcessIndex(p)))
             }
             // The new handle is a reference to the running thread: another
             // one, or the first for a child's main thread, which no handle
@@ -1109,12 +1109,12 @@ func process_quota_set(p: Int, child: Int, raw: UInt,
     match kind {
         case Mapping -> {},
         case _ -> {
-            if limit > (quota_limit_of(p, kind) as UInt) {
+            if limit > (quota_limit_of(ProcessIndex(p), kind) as UInt) {
                 fault_process(p, FaultReason.BadArg)
             }
         },
     }
-    if limit < (quota_used_of(child, kind) as UInt) {
+    if limit < (quota_used_of(ProcessIndex(child), kind) as UInt) {
         fault_process(p, FaultReason.BadArg)
     }
     match kind {
@@ -1127,13 +1127,13 @@ func process_quota_set(p: Int, child: Int, raw: UInt,
             if limit > (LONGEST_TABLE as UInt) {
                 return op_status(SosStatus.NoResource)
             }
-            if not attach_handle_blocks(child, blocks_for(limit as Int)) {
+            if not attach_handle_blocks(ProcessIndex(child), blocks_for(limit as Int)) {
                 return op_status(SosStatus.NoResource)
             }
         },
         case _ -> {},
     }
-    quota_set_limit(child, kind, limit as UInt16)
+    quota_set_limit(ProcessIndex(child), kind, limit as UInt16)
     op_ok()
 }
 
@@ -1145,7 +1145,7 @@ func process_quota_set(p: Int, child: Int, raw: UInt,
 /// difference, whatever was mapped into the process since its create.
 func free_grant_rows(p: Int) -> UInt {
     let image_rows = (processes().at(body_of(ProcessIndex(p))).grant_count
-                      - (quota_used_of(p, QuotaKind.Mapping) as Int))
+                      - (quota_used_of(ProcessIndex(p), QuotaKind.Mapping) as Int))
     let free = (hal.GRANT_ROW_BUDGET as Int) - image_rows
     if free < 0 { 0 } else { free as UInt }
 }
@@ -1165,7 +1165,7 @@ func process_quota_get(p: Int, target: Int, raw: UInt) unsafe -> SyscallResult {
         case Gone -> { return op_status(SosStatus.Revoked) },
         case _ -> {},
     }
-    op_value(quota_word(target, kind))
+    op_value(quota_word(ProcessIndex(target), kind))
 }
 
 // -----------------------------------------------------------------------------
@@ -1184,7 +1184,7 @@ func process_quota_get(p: Int, target: Int, raw: UInt) unsafe -> SyscallResult {
 /// these handles are the operation's arguments. Ops that do ask what a holder
 /// may do with a region (`Map`) go through `MemoryObject.allows`.
 func memory_arg(p: Int, handle: UInt) unsafe -> Int {
-    let entry = lookup_handle(p, handle)
+    let entry = lookup_handle(ProcessIndex(p), handle)
     match entry.obj_type {
         case Memory -> {
             let mem = MemoryObject(handle: MemoryHandle(handle),
@@ -1200,7 +1200,7 @@ func memory_arg(p: Int, handle: UInt) unsafe -> Int {
 /// `memory_arg` does for a region. No `ProcessRight` is spent: the handle is an
 /// argument, and naming a process can only restrict what it is used for.
 func process_arg(p: Int, handle: UInt) unsafe -> Int {
-    let entry = lookup_handle(p, handle)
+    let entry = lookup_handle(ProcessIndex(p), handle)
     match entry.obj_type {
         case Process -> entry.target,
         case Unbound -> fault_process(p, FaultReason.BadHandle),
@@ -1337,7 +1337,7 @@ func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
     // bytes never do, and a donated allocation's length stays charged to its
     // pool's `out_bytes` forever, so the pool can never be handed on with a
     // slab living inside it.
-    unbind_handle(p, handle_word_index(handle))
+    unbind_handle(ProcessIndex(p), handle_word_index(handle))
     memory_retire_donated(slot)
     op_ok()
 }
@@ -1347,7 +1347,7 @@ func slab_donate(p: Int, raw_kind: UInt, handle: UInt) unsafe -> SyscallResult {
 /// or names any other kind, is the `BadHandle` fault, as for `memory_arg`. No
 /// right of the handle is spent; `SystemRight.SlabDonate` is the authority.
 func donation_arg(p: Int, handle: UInt) unsafe -> Int {
-    let entry = lookup_handle(p, handle)
+    let entry = lookup_handle(ProcessIndex(p), handle)
     match entry.obj_type {
         case Memory -> entry.target,
         case Pool -> entry.target,
@@ -1490,9 +1490,9 @@ func process_create(p: Int, image_handle: UInt, memory_handle: UInt,
     // handle (it supervises the child with it) and the child derives its own
     // from the masked System handle it was given, so the width here is what a
     // launcher holds, and what it hands on is a keep mask's business.
-    let handle = mint_capped(p, ObjType.Process, process_rights(), slot)
+    let handle = mint_capped(ProcessIndex(p), ObjType.Process, process_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
     link_process(slot, body)
     let pid = assign_pid(slot)
@@ -1645,7 +1645,7 @@ func process_start(caller: Int, child: Int,
     // spending one of its own threads but the first of the child's. This is the
     // same rule every other row follows: the slot's `process` field is who
     // pays.
-    if not quota_room(child, QuotaKind.Thread) {
+    if not quota_room(ProcessIndex(child), QuotaKind.Thread) {
         return op_status(SosStatus.QuotaExceeded)
     }
     let slot = alloc_thread()
@@ -1656,7 +1656,7 @@ func process_start(caller: Int, child: Int,
     let boot_word = match form {
         case Absent -> NO_HANDLE,
         case Present -> {
-            let w = boot_handle_take(child, tag)
+            let w = boot_handle_take(ProcessIndex(child), tag)
             if w == NO_HANDLE {
                 fault_process(caller, FaultReason.BadArg)
             }
@@ -1678,7 +1678,7 @@ func process_start(caller: Int, child: Int,
                                call_len: 0, latency_irq: 0, latency_from: 0,
                                lock_at: 0, lock_holder: 0, refs: 0,
                                generation: slot_generation(slot))
-    quota_charge(child, QuotaKind.Thread)
+    quota_charge(ProcessIndex(child), QuotaKind.Thread)
     ready_push(slot)
     process_records().at(ProcessIndex(child)).state = ProcessState.Running
     op_ok()
@@ -1723,9 +1723,9 @@ func process_start(caller: Int, child: Int,
 /// as a give after start.
 func process_give(p: Int, child: Int, word: UInt, tag: UInt,
                   keep: UInt) unsafe -> SyscallResult {
-    let entry = lookup_handle(p, word)
+    let entry = lookup_handle(ProcessIndex(p), word)
     let kind = give_faults(p, child, entry, tag)
-    if not boot_handle_room(child) {
+    if not boot_handle_room(ProcessIndex(child)) {
         return op_status(SosStatus.NoResource)
     }
     let given = move_handle(p, child, word, entry, kind, tag, keep)
@@ -1733,7 +1733,7 @@ func process_give(p: Int, child: Int, word: UInt, tag: UInt,
         // The child's table refused it, either because it is full or because
         // the child is at its handle budget, which is what a launcher
         // furnishing too much needs to hear.
-        return op_status(mint_refusal(child))
+        return op_status(mint_refusal(ProcessIndex(child)))
     }
     op_ok()
 }
@@ -1764,7 +1764,7 @@ func give_faults(p: Int, child: Int, entry: HandleEntry,
         case Created -> {},
         case _ -> fault_process(p, FaultReason.BadState),
     }
-    if boot_tag_used(child, tag) {
+    if boot_tag_used(ProcessIndex(child), tag) {
         fault_process(p, FaultReason.DuplicateKey)
     }
     kind
@@ -1801,7 +1801,7 @@ func move_handle(p: Int, child: Int, word: UInt, entry: HandleEntry,
     if given == NO_HANDLE {
         return NO_HANDLE
     }
-    queue_boot_handle(child, tag, kind, given)
+    queue_boot_handle(ProcessIndex(child), tag, kind, given)
     given
 }
 
@@ -1847,7 +1847,7 @@ func boot_handle_next(p: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
     // The cursor first steps over anything `start(boot_tag:)` already delivered
     // through the register door: one record, one delivery, whichever door it
     // went out of.
-    let cursor = boot_handle_cursor(p)
+    let cursor = boot_handle_cursor(ProcessIndex(p))
     let body = body_of(ProcessIndex(p))
     if cursor >= processes().at(body).boot_count {
         return op_status(SosStatus.Drained)
@@ -1947,28 +1947,28 @@ func event_create_moded(p: Int, owner: Int, mode: EventMode) unsafe -> SyscallRe
     // difference: releasing something it already holds fixes the first and
     // cannot fix the second. The object row is the owner's and the `Handle`
     // row is the caller's.
-    if not quota_room(owner, QuotaKind.Event) {
+    if not quota_room(ProcessIndex(owner), QuotaKind.Event) {
         return op_status(SosStatus.QuotaExceeded)
     }
     // The caller's `Handle` row is policy too, so it is asked before the slab:
     // a caller at its budget facing a full slab hears `QuotaExceeded`.
-    if not quota_room(p, QuotaKind.Handle) {
+    if not quota_room(ProcessIndex(p), QuotaKind.Handle) {
         return op_status(SosStatus.QuotaExceeded)
     }
     let slot = alloc_event()
     if slot == NO_EVENT {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_capped(p, ObjType.Event, event_rights(), slot)
+    let handle = mint_capped(ProcessIndex(p), ObjType.Event, event_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
     // Written only once both allocations succeeded, so a refused handle leaves
     // the slab exactly as it found it. The charge joins that rule: a process
     // must not pay for an object it never got.
     EVENTS[slot] = EventSlot(state: SlotState.Live, process: owner, mode: mode,
                              word: 0, attachment: 0, refs: 1)
-    quota_charge(owner, QuotaKind.Event)
+    quota_charge(ProcessIndex(owner), QuotaKind.Event)
     op_value(handle)
 }
 
@@ -2011,9 +2011,9 @@ func interrupt_bind(p: Int, line: UInt) unsafe -> SyscallResult {
     if slot == NO_INTERRUPT {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_capped(p, ObjType.Interrupt, interrupt_rights(), slot)
+    let handle = mint_capped(ProcessIndex(p), ObjType.Interrupt, interrupt_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
     INTERRUPTS[slot] = InterruptSlot(state: InterruptState.Live, line: line,
                                      pending: false, fired_at: 0,
@@ -2031,25 +2031,25 @@ func waiter_create(p: Int, owner: Int) unsafe -> SyscallResult {
     if not has_body(ProcessIndex(owner)) {
         return op_status(SosStatus.Revoked)
     }
-    if not quota_room(owner, QuotaKind.Waiter) {
+    if not quota_room(ProcessIndex(owner), QuotaKind.Waiter) {
         return op_status(SosStatus.QuotaExceeded)
     }
     // The caller's `Handle` row is policy too, so it is asked before the slab:
     // a caller at its budget facing a full slab hears `QuotaExceeded`.
-    if not quota_room(p, QuotaKind.Handle) {
+    if not quota_room(ProcessIndex(p), QuotaKind.Handle) {
         return op_status(SosStatus.QuotaExceeded)
     }
     let slot = alloc_waiter()
     if slot == NO_WAITER {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_capped(p, ObjType.Waiter, waiter_rights(), slot)
+    let handle = mint_capped(ProcessIndex(p), ObjType.Waiter, waiter_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
     WAITERS[slot] = WaiterSlot(state: WaiterState.Live, process: owner,
                                attached: 0, blocked: 0, refs: 1)
-    quota_charge(owner, QuotaKind.Waiter)
+    quota_charge(ProcessIndex(owner), QuotaKind.Waiter)
     op_value(handle)
 }
 
@@ -2090,21 +2090,21 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
     // The thread row is credited when the slot is freed (`free_object`) or the
     // thread is invalidated (`invalidate_thread`), so it counts the slots the
     // process holds, exited ones still named included.
-    if not quota_room(owner, QuotaKind.Thread) {
+    if not quota_room(ProcessIndex(owner), QuotaKind.Thread) {
         return op_status(SosStatus.QuotaExceeded)
     }
     // The caller's `Handle` row is policy too, so it is asked before the slab:
     // a caller at its budget facing a full slab hears `QuotaExceeded`.
-    if not quota_room(p, QuotaKind.Handle) {
+    if not quota_room(ProcessIndex(p), QuotaKind.Handle) {
         return op_status(SosStatus.QuotaExceeded)
     }
     let slot = alloc_thread()
     if slot == NO_THREAD {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_capped(p, ObjType.Thread, thread_rights(), slot)
+    let handle = mint_capped(ProcessIndex(p), ObjType.Thread, thread_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
 
     hal.frame_init(frame_slot(slot), start, stack_top, arg)
@@ -2117,7 +2117,7 @@ func thread_create(p: Int, owner: Int, entry: UInt, stack_top: UInt,
                                call_len: 0, latency_irq: 0, latency_from: 0,
                                lock_at: 0, lock_holder: 0, refs: 1,
                                generation: slot_generation(slot))
-    quota_charge(owner, QuotaKind.Thread)
+    quota_charge(ProcessIndex(owner), QuotaKind.Thread)
     op_value(handle)
 }
 
@@ -2670,16 +2670,16 @@ func clock_now(p: Int, slot: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult 
 
 /// Make a Timer bound to clock `c` in process `p` (spec §2.6).
 func timer_create(p: Int, c: Int) unsafe -> SyscallResult {
-    if not quota_room(p, QuotaKind.Timer) {
+    if not quota_room(ProcessIndex(p), QuotaKind.Timer) {
         return op_status(SosStatus.QuotaExceeded)
     }
     let slot = alloc_timer()
     if slot == NO_TIMER {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_capped(p, ObjType.Timer, timer_rights(), slot)
+    let handle = mint_capped(ProcessIndex(p), ObjType.Timer, timer_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
     // Born disarmed and owing nothing: a Timer is a schedule not yet written,
     // so it is not ready, and attaching one to a Waiter before arming it parks
@@ -2687,7 +2687,7 @@ func timer_create(p: Int, c: Int) unsafe -> SyscallResult {
     TIMERS[slot] = TimerSlot(state: TimerState.Live, process: p, clock: c,
                              armed: false, deadline_ns: 0, interval_ns: 0,
                              fires: 0, attachment: 0, refs: 1)
-    quota_charge(p, QuotaKind.Timer)
+    quota_charge(ProcessIndex(p), QuotaKind.Timer)
     op_value(handle)
 }
 
@@ -2807,7 +2807,7 @@ func timer_invalid(slot: Int) unsafe -> Bool {
 /// would hide that entirely, since a kind moving from "not waitable" to
 /// "waitable" is not a new case at all.
 func waitable_slot(p: Int, handle: UInt) unsafe -> Waitable {
-    let entry = lookup_handle(p, handle)
+    let entry = lookup_handle(ProcessIndex(p), handle)
     match entry.obj_type {
         case Event -> {
             let ev = EventObject(handle: EventHandle(handle),
@@ -3063,7 +3063,7 @@ func waiter_add(p: Int, w: Int, handle: UInt, key: UInt,
     // through zero between the two. What is left is an object the attachment
     // owns and no handle names, an opt-in state rather than an accident.
     if (flags & WAITER_ADD_CONSUMING) != 0 {
-        unbind_handle(p, handle_word_index(handle))
+        unbind_handle(ProcessIndex(p), handle_word_index(handle))
         unref_object(waitable_obj_of(target.kind), target.slot)
     }
 
@@ -3197,7 +3197,7 @@ func waiter_wait(p: Int, w: Int, dst: UInt, cap: UInt) unsafe -> SyscallResult {
         // status and delivers nothing. The message stays staged and its level
         // stays raised, so a caller that frees a slot and waits again is handed
         // the same message.
-        return op_status(deliver_attachment(p, CURRENT_THREAD, dst, ready))
+        return op_status(deliver_attachment(ProcessIndex(p), CURRENT_THREAD, dst, ready))
     }
     if CURRENT_THREAD == NO_THREAD {
         fault_process(p, FaultReason.BadState)
@@ -3229,7 +3229,7 @@ func release_handle(p: Int, word: UInt, entry: HandleEntry) unsafe -> SyscallRes
         case Unbound -> fault_process(p, FaultReason.BadHandle),
         case _ -> {},
     }
-    unbind_handle(p, handle_word_index(word))
+    unbind_handle(ProcessIndex(p), handle_word_index(word))
     // The object loses a reference, which may be its last. `unref_object` is
     // the per-kind matrix: an Interrupt masks its line, a Timer gives the
     // comparator back, a Waiter detaches its list, a Memory returns its slot,
@@ -3312,9 +3312,9 @@ func mint_sibling(p: Int, entry: HandleEntry, keep: UInt) unsafe -> SyscallResul
     // answer. `handle_word_generation` refuses to narrow because its bits mean
     // something.
     let rights = entry.rights & UInt32.from(truncating: keep)
-    let word = mint_handle(p, entry.obj_type, rights, entry.target)
+    let word = mint_handle(ProcessIndex(p), entry.obj_type, rights, entry.target)
     if word == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
     // A sibling is a second name and so a second reference: releasing one of
     // two siblings leaves the object alive, and the second release ends it.
@@ -3561,7 +3561,7 @@ func map_access(p: Int, raw: UInt) unsafe -> UInt32 {
 /// `unsafe` though it names nothing unsafe: `p` must be the calling process,
 /// the one `fault_process` ends.
 func map_target(p: Int, handle: UInt) unsafe -> Int {
-    let entry = lookup_handle(p, handle)
+    let entry = lookup_handle(ProcessIndex(p), handle)
     match entry.obj_type {
         case Process -> {
             let target = ProcessObject(handle: ProcessHandle(handle),
@@ -3640,7 +3640,7 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, room: UInt,
     // The target is charged, not the caller. What a mapping consumes is the
     // target's grant-row budget, and charging the caller would let a launcher's
     // own allowance gate how big another process's domain may be.
-    if not quota_room(t, QuotaKind.Mapping) {
+    if not quota_room(ProcessIndex(t), QuotaKind.Mapping) {
         return op_status(SosStatus.QuotaExceeded)
     }
     let target_body = body_of(ProcessIndex(t))
@@ -3691,9 +3691,9 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, room: UInt,
     if slot == NO_MAPPING {
         return op_status(SosStatus.NoResource)
     }
-    let handle = mint_capped(p, ObjType.Mapping, mapping_rights(), slot)
+    let handle = mint_capped(ProcessIndex(p), ObjType.Mapping, mapping_rights(), slot)
     if handle == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
     // Nothing is written until every refusal is behind us (the all-or-nothing
     // shape of `event_create`): a half-installed row is a protection domain
@@ -3703,7 +3703,7 @@ func install_row(p: Int, t: Int, base: UInt, top: UInt, room: UInt,
     processes().at(target_body).grants[row].room = kept
     MAPPINGS[slot] = MappingSlot(state: SlotState.Live, process: p, target: t,
                                  row: row, refs: 1)
-    quota_charge(t, QuotaKind.Mapping)
+    quota_charge(ProcessIndex(t), QuotaKind.Mapping)
     domain_changed(ProcessIndex(t))
     op_value(handle)
 }
@@ -4035,7 +4035,7 @@ func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
             if len == 0 || (len % unit) != 0 {
                 fault_process(p, FaultReason.BadArg)
             }
-            if not quota_room(p, QuotaKind.Memory) {
+            if not quota_room(ProcessIndex(p), QuotaKind.Memory) {
                 return op_status(SosStatus.QuotaExceeded)
             }
             if not pool_can_serve(obj.slot, len, from) {
@@ -4050,10 +4050,10 @@ func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
                 case Any -> memory_rights(),
                 case Back -> memory_rights(),
             }
-            let handle = mint_capped(p, ObjType.Memory, obj.rights & mask,
+            let handle = mint_capped(ProcessIndex(p), ObjType.Memory, obj.rights & mask,
                                      slot)
             if handle == NO_HANDLE {
-                return op_status(mint_refusal(p))
+                return op_status(mint_refusal(ProcessIndex(p)))
             }
             let base = pool_cut(obj.slot, len, from)
             let contiguous = (flags & contiguous_bit) != 0
@@ -4066,7 +4066,7 @@ func pool_op_decoded(op: PoolOp, obj: &PoolObject, arg0: UInt, arg1: UInt,
                                         contiguous: contiguous,
                                         pinned: false, pinner: 0,
                                         pinned_bytes: 0, quarantined_bytes: 0)
-            quota_charge(p, QuotaKind.Memory)
+            quota_charge(ProcessIndex(p), QuotaKind.Memory)
             op_value(handle)
         },
         // Available: what this pool could serve at the granularity `arg0`
@@ -4150,7 +4150,7 @@ func iomemory_op_decoded(op: IoMemoryOp, obj: &IoMemoryObject, arg0: UInt,
             if not hal.device_window_ok(base, len) {
                 fault_process(p, FaultReason.BadArg)
             }
-            if not quota_room(p, QuotaKind.IoMemory) {
+            if not quota_room(ProcessIndex(p), QuotaKind.IoMemory) {
                 return op_status(SosStatus.QuotaExceeded)
             }
             let slot = alloc_iomemory()
@@ -4160,13 +4160,13 @@ func iomemory_op_decoded(op: IoMemoryOp, obj: &IoMemoryObject, arg0: UInt,
             // The window carries the rights of the handle the op came through,
             // for the reason an allocation carries its pool handle's: a
             // derivation never widens.
-            let handle = mint_capped(p, ObjType.IoMemory, obj.rights, slot)
+            let handle = mint_capped(ProcessIndex(p), ObjType.IoMemory, obj.rights, slot)
             if handle == NO_HANDLE {
-                return op_status(mint_refusal(p))
+                return op_status(mint_refusal(ProcessIndex(p)))
             }
             IOMEMORIES[slot] = IoMemorySlot(state: SlotState.Live, process: p,
                                             base: base, len: len, refs: 1)
-            quota_charge(p, QuotaKind.IoMemory)
+            quota_charge(ProcessIndex(p), QuotaKind.IoMemory)
             op_value(handle)
         },
         // Map: install a device-attribute row, always. There is no access
@@ -4282,7 +4282,7 @@ func mapping_op_decoded(op: MappingOp, obj: &MappingObject, arg0: UInt,
             // leave the row standing. An unmapped-but-referenced Mapping is a
             // husk that consumes nothing, and the ledger says so from this line
             // onward.
-            quota_credit(t, QuotaKind.Mapping)
+            quota_credit(ProcessIndex(t), QuotaKind.Mapping)
             compact_mapping_rows(t, row)
             domain_changed(ProcessIndex(t))
             op_ok()
@@ -4478,21 +4478,21 @@ func pipe_create(caller: Int, owner: Int, dst: UInt, cap: UInt) unsafe -> Syscal
     if not has_body(ProcessIndex(owner)) {
         return op_status(SosStatus.Revoked)
     }
-    if not quota_room(owner, QuotaKind.Pipe) {
+    if not quota_room(ProcessIndex(owner), QuotaKind.Pipe) {
         return op_status(SosStatus.QuotaExceeded)
     }
-    if not quota_room_for(caller, QuotaKind.Handle, 2) {
+    if not quota_room_for(ProcessIndex(caller), QuotaKind.Handle, 2) {
         return op_status(SosStatus.QuotaExceeded)
     }
     let slot = alloc_pipe()
     if slot == NO_PIPE {
         return op_status(SosStatus.NoResource)
     }
-    if not table_room(caller, 2) {
+    if not table_room(ProcessIndex(caller), 2) {
         return op_status(SosStatus.NoResource)
     }
-    let inlet = mint_capped(caller, ObjType.PipeInlet, pipe_inlet_rights(), slot)
-    let outlet = mint_capped(caller, ObjType.PipeOutlet, pipe_outlet_rights(),
+    let inlet = mint_capped(ProcessIndex(caller), ObjType.PipeInlet, pipe_inlet_rights(), slot)
+    let outlet = mint_capped(ProcessIndex(caller), ObjType.PipeOutlet, pipe_outlet_rights(),
                              slot)
     if inlet == NO_HANDLE || outlet == NO_HANDLE {
         // Unreachable: the pre-flight established room for both.
@@ -4507,7 +4507,7 @@ func pipe_create(caller: Int, owner: Int, dst: UInt, cap: UInt) unsafe -> Syscal
     PIPES[slot] = PipeSlot(state: SlotState.Live, process: owner, staged: 0,
                            inlet_attachment: 0, outlet_attachment: 0,
                            inlet_refs: 1, outlet_refs: 1)
-    quota_charge(owner, QuotaKind.Pipe)
+    quota_charge(ProcessIndex(owner), QuotaKind.Pipe)
 
     var rec = PipeCreateRecord(inlet: inlet, outlet: outlet)
     if let why = copy_out(ProcessIndex(caller), dst,
@@ -4633,7 +4633,7 @@ func check_send(p: Int, args: &PipeSendRecord, invoking: UInt, kept: UInt,
             if word == invoking || word == kept {
                 fault_process(p, FaultReason.BadArg)
             }
-            let entry = lookup_handle(p, word)
+            let entry = lookup_handle(ProcessIndex(p), word)
             match entry.obj_type {
                 case Unbound -> fault_process(p, FaultReason.BadHandle),
                 case _ -> {},
@@ -4705,7 +4705,7 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
     if PIPES[slot].outlet_refs == 0 {
         // Terminal: the carried handles are consumed, as they would have been
         // by a delivery.
-        release_carried(p, &args)
+        release_carried(ProcessIndex(p), &args)
         return op_status(SosStatus.PeerClosed)
     }
     let x = alloc_exchange(slot)
@@ -4728,9 +4728,9 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
     // handle budget is a status, and it must leave the ring untouched;
     // otherwise a refused post would have staged a message nobody can ever
     // answer.
-    let claim = mint_capped(p, ObjType.PipeReply, pipe_reply_rights(), x)
+    let claim = mint_capped(ProcessIndex(p), ObjType.PipeReply, pipe_reply_rights(), x)
     if claim == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
 
     // `as UInt16` is exact: the length was refused above unless it fits
@@ -4738,12 +4738,12 @@ func pipe_post(p: Int, slot: Int, args_src: UInt, args_bytes: UInt) unsafe -> Sy
     // width. An out-of-range value here would be a kernel bug, which is when
     // `as` is the right spelling.
     EXCHANGES[x].len = len as UInt16
-    stamp_sender(x, p)
+    stamp_sender(x, ProcessIndex(p))
     // The handles leave the sender here (take at post). This is the last line
     // that can change anything the caller owns and every refusal is already
     // behind it, so the message is committed from this point and nothing the
     // sender does afterwards (releasing, exiting) can make it arrive empty.
-    hold_staged(p, x, &args, slot)
+    hold_staged(ProcessIndex(p), x, &args, slot)
     // One column starts at one and the other at zero, and the asymmetry is the
     // state machine: the claim exists from the post, the obligation does not
     // exist until somebody takes the message. That is why `Staged` is a
@@ -4828,7 +4828,7 @@ func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
 
     if PIPES[slot].outlet_refs == 0 {
         // Terminal: the carried handles are consumed, as `pipe_post`'s are.
-        release_carried(p, &args)
+        release_carried(ProcessIndex(p), &args)
         return op_status(SosStatus.PeerClosed)
     }
     let x = alloc_exchange(slot)
@@ -4852,8 +4852,8 @@ func pipe_call(p: Int, slot: Int, args_src: UInt, args_bytes: UInt,
         }
     }
     EXCHANGES[x].len = len as UInt16
-    stamp_sender(x, p)
-    hold_staged(p, x, &args, slot)
+    stamp_sender(x, ProcessIndex(p))
+    hold_staged(ProcessIndex(p), x, &args, slot)
     // One column at one for a thread rather than for a handle: the only line
     // here that is not `pipe_post`'s. The asymmetry with the request column
     // means what it means there: the claim exists from the call, the obligation
@@ -4949,10 +4949,10 @@ func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt) unsafe -> Syscal
     // exists: the message stays staged with its references still held, the
     // readable level stays raised, and freeing a slot and taking again is
     // handed the same message carrying the same handles.
-    if not table_room(p, staged_count(x) + 1) {
-        return op_status(mint_refusal(p))
+    if not table_room(ProcessIndex(p), staged_count(x) + 1) {
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
-    let request = mint_capped(p, ObjType.PipeRequest, pipe_request_rights(), x)
+    let request = mint_capped(ProcessIndex(p), ObjType.PipeRequest, pipe_request_rights(), x)
     if request == NO_HANDLE {
         // Unreachable: `table_room` established the room one line up and
         // nothing between the two can spend it. Written rather than assumed.
@@ -4966,7 +4966,7 @@ func pipe_take(p: Int, slot: Int, rec_dst: UInt, rec_cap: UInt) unsafe -> Syscal
     // for each: the second half of a move whose first half ran in the sender's
     // own syscall. A slot arrives empty only if the sender left it empty;
     // staleness cannot exist under take-at-post.
-    let moved = mint_staged(x, p)
+    let moved = mint_staged(x, ProcessIndex(p))
 
     let len = EXCHANGES[x].len as UInt
     var rec = PipeTakePrefix(request: request as UInt64,
@@ -5111,12 +5111,12 @@ func pipe_resolve(p: Int, word: UInt, x: Int, dst: UInt,
             // makes room before it resolves. Everything below the pre-flight is
             // the delivery, and none of it can fail for a reason a caller could
             // act on.
-            if not table_room(p, staged_count(x)) {
-                let why = mint_refusal(p)
+            if not table_room(ProcessIndex(p), staged_count(x)) {
+                let why = mint_refusal(ProcessIndex(p))
                 consume_entry(p, word, ObjType.PipeReply, x)
                 return op_status(why)
             }
-            let moved = mint_staged(x, p)
+            let moved = mint_staged(x, ProcessIndex(p))
             var rec = msg_prefix(len, EXCHANGES[x].sender_pid, &moved)
             if let why = copy_out(ProcessIndex(p), dst,
                                   ((&var rec) as UnsafePointer<PipeMsgPrefix>) as UInt,
@@ -5207,7 +5207,7 @@ func park_resolve(p: Int, word: UInt, x: Int, dst: UInt) unsafe -> SyscallResult
         fault_process(p, FaultReason.BadState)
     }
     detach_consumed(ObjType.PipeReply, x)
-    unbind_handle(p, handle_word_index(word))
+    unbind_handle(ProcessIndex(p), handle_word_index(word))
     block_on_call_reply(CURRENT_THREAD, x, dst)
     op_blocked()
 }
@@ -5319,9 +5319,9 @@ func pipe_request_sender(p: Int, x: Int) unsafe -> SyscallResult {
         return op_status(SosStatus.Revoked)
     }
     let r = EXCHANGES[x].sender_rec
-    let handle = mint_capped(p, ObjType.Process, process_observe_rights(), r)
+    let handle = mint_capped(ProcessIndex(p), ObjType.Process, process_observe_rights(), r)
     if handle == NO_HANDLE {
-        return op_status(mint_refusal(p))
+        return op_status(mint_refusal(ProcessIndex(p)))
     }
     ref_object(ObjType.Process, r)
     op_value(handle)
@@ -5365,7 +5365,7 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
                 // which settles the slot. Nothing is staged either: the
                 // handles the reply meant to carry are released.
                 consume_entry(p, word, ObjType.PipeRequest, x)
-                release_carried(p, &args)
+                release_carried(ProcessIndex(p), &args)
                 return SosStatus.PeerClosed
             }
             if len != 0 {
@@ -5377,13 +5377,13 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
             // The replier is now the sender of what the slot holds. The
             // request's sender is read only through the obligation this reply
             // consumes.
-            stamp_sender(x, p)
+            stamp_sender(x, ProcessIndex(p))
             // The reply direction stages into the same slots the request used,
             // and they are provably empty: the take that produced this
             // obligation moved every handle the request carried and cleared the
             // note. §2.1's `send(data?, handles?)` is symmetric, so this is the
             // identical act one direction over.
-            hold_staged(p, x, &args, NO_PIPE)
+            hold_staged(ProcessIndex(p), x, &args, NO_PIPE)
             EXCHANGES[x].state = ExchangeState.Replied
             // The claim's level is now ready. A client parked on this claim is
             // woken here and its record carries the bytes just written; that is
@@ -5405,7 +5405,7 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
         },
         case Replied -> {
             consume_entry(p, word, ObjType.PipeRequest, x)
-            release_carried(p, &args)
+            release_carried(ProcessIndex(p), &args)
             SosStatus.PeerClosed
         },
         // A delivered reply, discharged through somebody's wait. It is
@@ -5415,7 +5415,7 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
         // happened.
         case Settled -> {
             consume_entry(p, word, ObjType.PipeRequest, x)
-            release_carried(p, &args)
+            release_carried(ProcessIndex(p), &args)
             SosStatus.PeerClosed
         },
         // Unreachable: an obligation is minted at the take, the same moment the
@@ -5442,7 +5442,7 @@ func pipe_reply_status(p: Int, word: UInt, x: Int,
 /// word that names nothing, or something that is not a Waiter, is the ordinary
 /// `BadHandle` fault.
 func reply_wait_waiter(p: Int, handle: UInt) unsafe -> Int {
-    let entry = lookup_handle(p, handle)
+    let entry = lookup_handle(ProcessIndex(p), handle)
     match entry.obj_type {
         case Waiter -> {
             let w = WaiterObject(handle: WaiterHandle(handle),
@@ -5538,7 +5538,7 @@ func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
         // delivered nothing. The value register stays zero, which is
         // `ReplyWaitLeg.Wait`: the reply was written, and it is the wait that
         // could not be served.
-        return op_status(deliver_attachment(p, CURRENT_THREAD, rec_dst,
+        return op_status(deliver_attachment(ProcessIndex(p), CURRENT_THREAD, rec_dst,
                                             ready))
     }
     if CURRENT_THREAD == NO_THREAD {
@@ -5571,7 +5571,7 @@ func pipe_reply_wait(p: Int, word: UInt, x: Int, args_src: UInt,
 /// reaches zero, and it is last.
 func consume_entry(p: Int, word: UInt, kind: ObjType, target: Int) unsafe {
     detach_consumed(kind, target)
-    unbind_handle(p, handle_word_index(word))
+    unbind_handle(ProcessIndex(p), handle_word_index(word))
     unref_object(kind, target)
 }
 
@@ -5647,7 +5647,7 @@ func dispatch(handle: UInt, op: UInt,
             return lock_wake_op(p, arg0)
         }
     }
-    let entry = lookup_handle(p, handle)
+    let entry = lookup_handle(ProcessIndex(p), handle)
     if op == RELEASE_OP {
         return release_handle(p, handle, entry)
     }

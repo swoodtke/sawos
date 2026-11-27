@@ -848,7 +848,7 @@ public(package) func free_object(kind: ObjType, slot: Int) unsafe {
 /// after this (a region whose last namer is a grant row in the dying domain,
 /// dropped when the teardown clears the domain) credits nobody, and the ledger
 /// is cleared either way.
-public(package) func disown_shared(p: Int) unsafe {
+public(package) func disown_shared(p: ProcessIndex) unsafe {
     var e: Int = 0
     while e < EVENTS.capacity() {
         disown_event(e, p)
@@ -875,7 +875,7 @@ public(package) func disown_shared(p: Int) unsafe {
 /// with no handle left may still be live: a mapped region keeps its slot, and
 /// so does a pool with allocations out. A pool is charged as an allocation is,
 /// so this covers both kinds of Memory slot.
-func disown_region(m: Int, p: Int) unsafe {
+func disown_region(m: Int, p: ProcessIndex) unsafe {
     match MEMORIES[m].state {
         case Free -> {},
         case Live -> {
@@ -885,7 +885,7 @@ func disown_region(m: Int, p: Int) unsafe {
 }
 
 /// Disown Event `e` if dying process `p` is still charged for it.
-func disown_event(e: Int, p: Int) unsafe {
+func disown_event(e: Int, p: ProcessIndex) unsafe {
     match EVENTS[e].state {
         case Free -> {},
         case Live -> {
@@ -895,7 +895,7 @@ func disown_event(e: Int, p: Int) unsafe {
 }
 
 /// Disown window `io` if dying process `p` is still charged for it.
-func disown_window(io: Int, p: Int) unsafe {
+func disown_window(io: Int, p: ProcessIndex) unsafe {
     match IOMEMORIES[io].state {
         case Free -> {},
         case Live -> {
@@ -907,7 +907,7 @@ func disown_window(io: Int, p: Int) unsafe {
 }
 
 /// Disown connection `c` if dying process `p` is still charged for it.
-func disown_pipe(c: Int, p: Int) unsafe {
+func disown_pipe(c: Int, p: ProcessIndex) unsafe {
     match PIPES[c].state {
         case Free -> {},
         case Live -> {
@@ -1097,12 +1097,12 @@ public(package) func msg_record_span(len: UInt) -> UInt {
 /// separated in time; the two share this function's rules, not its body.
 public(package) func move_entry(from: Int, to: Int, word: UInt,
                                 entry: HandleEntry, keep: UInt32) unsafe -> UInt {
-    let given = mint_handle(to, entry.obj_type, entry.rights & keep, entry.target)
+    let given = mint_handle(ProcessIndex(to), entry.obj_type, entry.rights & keep, entry.target)
     if given == NO_HANDLE {
         return NO_HANDLE
     }
     ref_object(entry.obj_type, entry.target)
-    unbind_handle(from, handle_word_index(word))
+    unbind_handle(ProcessIndex(from), handle_word_index(word))
     unref_object(entry.obj_type, entry.target)
     given
 }
@@ -1154,7 +1154,7 @@ public(package) func is_outlet_of(kind: ObjType, target: Int,
 /// its args record still in the caller's memory, and the record is re-read at
 /// the resume. A sibling thread may have rewritten it, so the words arriving
 /// here need not be the ones `check_send` blessed.
-public(package) func hold_staged(p: Int, x: Int, args: &PipeSendRecord,
+public(package) func hold_staged(p: ProcessIndex, x: Int, args: &PipeSendRecord,
                                  pipe: Int) unsafe {
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
@@ -1202,7 +1202,7 @@ public(package) func hold_staged(p: Int, x: Int, args: &PipeSendRecord,
 /// and there is no fault to raise for a caller that is not running. A slot that
 /// fails the questions, or that an earlier slot of the same record already
 /// released, is skipped.
-public(package) func release_carried(p: Int, args: &PipeSendRecord) unsafe {
+public(package) func release_carried(p: ProcessIndex, args: &PipeSendRecord) unsafe {
     var i: Int = 0
     while i < PIPE_MSG_HANDLES {
         let word = args.handles[i]
@@ -1244,7 +1244,7 @@ public(package) func release_carried(p: Int, args: &PipeSendRecord) unsafe {
 /// The batch is collected first, so the ledger is empty before the first mint:
 /// what lands in the taker's table is accounted for by the taker from then on,
 /// and the exchange's slots are free for the reply direction to stage into.
-public(package) func mint_staged(x: Int, p: Int) unsafe -> StagedHandles {
+public(package) func mint_staged(x: Int, p: ProcessIndex) unsafe -> StagedHandles {
     var out = StagedHandles(kinds: [0; PIPE_MSG_HANDLES],
                             words: [NO_HANDLE; PIPE_MSG_HANDLES])
     let held = take_staged(x)
@@ -1370,13 +1370,13 @@ static_assert(sizeof<WaitPrefix>() == sizeof<WaitBuffer>() - PIPE_BODY_BYTES,
 /// one included, or the delivery-as-take) writes the handle words and the
 /// sender, whatever else it carries, and a message with data writes a body. The
 /// meta, inside the short length, tells a decode which happened.
-func deliver_wait_record(p: Int, dst: UInt, rec: &var WaitPrefix,
+func deliver_wait_record(p: ProcessIndex, dst: UInt, rec: &var WaitPrefix,
                          body_src: UInt, message: Bool) unsafe {
     var bytes = wait_meta_end_bytes() as UInt
     if message {
         bytes = wait_prefix_bytes() as UInt
     }
-    if let why = copy_out(ProcessIndex(p), dst, ((&var rec) as UnsafePointer<WaitPrefix>) as UInt,
+    if let why = copy_out(p, dst, ((&var rec) as UnsafePointer<WaitPrefix>) as UInt,
                           bytes) {
         fatal("wait record refused by the copy door", (why as UInt8) as UInt,
               dst, p as UInt, ExitCode.ProcessFault)
@@ -1385,7 +1385,7 @@ func deliver_wait_record(p: Int, dst: UInt, rec: &var WaitPrefix,
     // ring slot that holds the bytes, so a reply never transits a kernel
     // buffer.
     if rec.meta.len != 0 {
-        if let why = copy_out(ProcessIndex(p), dst + (wait_prefix_bytes() as UInt), body_src,
+        if let why = copy_out(p, dst + (wait_prefix_bytes() as UInt), body_src,
                               rec.meta.len as UInt) {
             fatal("wait record body refused by the copy door",
                   (why as UInt8) as UInt, dst, p as UInt, ExitCode.ProcessFault)
@@ -1486,7 +1486,7 @@ func reply_carries_handles(kind: WaitableKind, answer: &WaitAnswer) -> Bool {
 /// written `Ok`, and a waiter that frees a slot and waits again gets the same
 /// message. This has `revoke_blocked`'s shape: a delivered wake with a
 /// distinguishable status and no record.
-public(package) func deliver_attachment(p: Int, t: Int, dst: UInt,
+public(package) func deliver_attachment(p: ProcessIndex, t: Int, dst: UInt,
                                          a: Int) unsafe -> SosStatus {
     let kind = ATTACHMENTS[a].kind
     let target = ATTACHMENTS[a].target
@@ -1582,7 +1582,7 @@ func mark_interrupt_latency(kind: WaitableKind, target: Int, t: Int) unsafe {
 /// The staged message leaves the list and stays in the ring, as with a `Take`:
 /// the exchange is `Taken`, its slot is held by the obligation just minted, and
 /// the reply travels back through the same slot.
-func deliver_take(p: Int, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
+func deliver_take(p: ProcessIndex, dst: UInt, key: UInt, waiter: Int, a: Int, c: Int,
                   ends: Bool) unsafe -> SosStatus {
     let x = stage_peek(c)
     if x == NO_EXCHANGE {
@@ -1692,7 +1692,7 @@ public(package) func wake_one_waiter(w: Int, a: Int) unsafe {
         // status and an untouched buffer (`revoke_blocked`'s shape): the wake
         // is delivered either way, never a strand. The message stays staged
         // and its level raised, so waiting again is handed it.
-        let answered = deliver_attachment(p, slot, dst, a)
+        let answered = deliver_attachment(ProcessIndex(p), slot, dst, a)
         write_result(frame_slot(slot), op_status(answered))
         threads().at(slot).state = ThreadState.Runnable
         ready_push(slot)
@@ -1856,10 +1856,10 @@ func wake_call_reply(t: Int, x: Int) unsafe {
         // client that must not lose a capability this way makes room before it
         // calls, or uses the composed path, whose claim is a handle. Nothing
         // half-moves and nothing leaks either way.
-        if not table_room(p, staged_count(x)) {
-            result = op_status(mint_refusal(p))
+        if not table_room(ProcessIndex(p), staged_count(x)) {
+            result = op_status(mint_refusal(ProcessIndex(p)))
         } else {
-            let moved = mint_staged(x, p)
+            let moved = mint_staged(x, ProcessIndex(p))
             var rec = msg_prefix(answer.body_len, EXCHANGES[x].sender_pid,
                                  &moved)
             if let why = copy_out(ProcessIndex(p), dst,
@@ -1987,7 +1987,7 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
         write_result(frame_slot(ThreadIndex(t)), op_status(SosStatus.PeerClosed))
         threads().at(ThreadIndex(t)).state = ThreadState.Runnable
         ready_push(ThreadIndex(t))
-        release_carried(p, &args)
+        release_carried(ProcessIndex(p), &args)
         return true
     }
     let x = alloc_exchange(c)
@@ -2007,7 +2007,7 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     EXCHANGES[x].len = len as UInt16
     // The caller is the process whose thread made the call, not whichever
     // process freed the room.
-    stamp_sender(x, p)
+    stamp_sender(x, ProcessIndex(p))
     // The handle words are re-validated here, and have to be. The record was
     // re-read from the caller's memory just above, so a sibling thread may have
     // rewritten it since `check_send` blessed it; `hold_staged` therefore asks
@@ -2015,7 +2015,7 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
     // running), so a failing slot arrives empty, and no rewritten record can
     // stage a handle its process does not hold or may not send, or an outlet
     // of this connection.
-    hold_staged(p, x, &args, c)
+    hold_staged(ProcessIndex(p), x, &args, c)
     EXCHANGES[x].reply_refs = 1
     EXCHANGES[x].request_refs = 0
     EXCHANGES[x].state = ExchangeState.Staged
@@ -2052,7 +2052,7 @@ func resume_call_room(t: Int, c: Int) unsafe -> Bool {
 ///
 /// `unsafe` though it names nothing unsafe: `p` must be dying, or its parked
 /// callers would be left parked with nothing to answer them.
-public(package) func release_pending_calls(p: Int) unsafe {
+public(package) func release_pending_calls(p: ProcessIndex) unsafe {
     var t: Int = 0
     while t < threads().capacity() {
         let calling = borrow var thread = threads().at(ThreadIndex(t)) {

@@ -54,6 +54,7 @@ import kcore.limits.{
     MAX_TABLE_BLOCKS,
     NO_BODY,
     NO_MEMORY,
+    BlockIndex,
     BodyIndex,
     ProcessIndex,
 }
@@ -302,9 +303,9 @@ public(package) struct ProcessBody {
     /// and its boot set by `HANDLE_BLOCK`. Only grows while the process lives;
     /// the teardown frees them all. Zero in a zeroed body.
     public(package) block_count: Int,
-    /// The blocks, in the order they were attached, each its slot in
-    /// `HANDLE_BLOCKS` plus one; the first `block_count` are links. Block `k`
-    /// holds table indexes `MAX_HANDLES + k * HANDLE_BLOCK` onward.
+    /// The blocks, in the order they were attached, each its slot in the
+    /// handle-block table plus one; the first `block_count` are links. Block
+    /// `k` holds table indexes `MAX_HANDLES + k * HANDLE_BLOCK` onward.
     public(package) blocks: [Int; MAX_TABLE_BLOCKS],
     /// How many records are queued.
     public(package) boot_count: Int,
@@ -356,11 +357,12 @@ public(package) struct ProcessBody {
 /// One handle block: `HANDLE_BLOCK` more entries of one process's handle
 /// table, and the boot-set records of the same positions (spec §3).
 ///
-/// A block is a slot of `HANDLE_BLOCKS`, linked from the body that holds it
-/// (`ProcessBody.blocks`). The two arrays are `ProcessBody.handles` and
-/// `.boot_handles` continued, and the same functions in `kcore.objects` read
-/// and write them. A freed block keeps its entries' generations, as a reused
-/// body does, so a word from an earlier life names nothing in the next one.
+/// A block is a slot of the handle-block table, linked from the body that
+/// holds it (`ProcessBody.blocks`). The two arrays are `ProcessBody.handles`
+/// and `.boot_handles` continued, and the same functions in `kcore.objects`
+/// read and write them. A freed block keeps its entries' generations, as a
+/// reused body does, so a word from an earlier life names nothing in the next
+/// one.
 public(package) struct HandleBlock {
     // The body that holds this block, plus one; 0 is free, so a zeroed
     // block, a donated or linked extent's included, is free.
@@ -369,11 +371,43 @@ public(package) struct HandleBlock {
     public(package) boot: [BootHandleSlot; HANDLE_BLOCK],
 }
 
-/// The handle-block slab: extent 0 is `MAX_HANDLE_BLOCKS` long, which is
+/// The handle-block table: the block slab, reached only by a `BlockIndex`, as
+/// the record table is by a `ProcessIndex`.
+public(package) struct HandleBlockTable {
+    private slab: Slab<HandleBlock, MAX_HANDLE_BLOCKS>,
+}
+
+extension HandleBlockTable {
+    /// Block `blk`, lent where it sits.
+    public(package) func at(&var self, blk: BlockIndex) borrows -> &var HandleBlock {
+        lend self.slab[blk]
+    }
+
+    /// How many blocks the table holds now, donations included: the bound of
+    /// every scan.
+    public(package) func capacity(&self) -> Int { self.slab.capacity() }
+
+    /// One block's bytes.
+    public(package) func slot_bytes(&self) -> Int { self.slab.slot_bytes() }
+
+    /// What a donated extent's base must be aligned to.
+    public(package) func slot_align(&self) -> Int { self.slab.slot_align() }
+
+    /// How many more extents the table can accept.
+    public(package) func extents_left(&self) -> Int { self.slab.extents_left() }
+
+    /// Append a donated extent of `slots` blocks at `base`; `Slab.donate`.
+    public(package) func donate(&var self, base: UnsafePointer<HandleBlock>,
+                                slots: Int) unsafe -> Bool {
+        self.slab.donate(base, slots)
+    }
+}
+
+/// The handle-block table: extent 0 is `MAX_HANDLE_BLOCKS` long, which is
 /// none, and an image's area or a donation (`SlabKind.HandleBlocks`) appends.
 /// Every block is free until a `QuotaSet` attaches it (`kcore.objects`'
-/// `attach_handle_blocks`).
-public(package) unsafe static var HANDLE_BLOCKS: Slab<HandleBlock, MAX_HANDLE_BLOCKS> = Slab<HandleBlock, MAX_HANDLE_BLOCKS>(
+/// `attach_handle_blocks`). Only `handle_blocks()` names it.
+unsafe static var HANDLE_BLOCKS: HandleBlockTable = HandleBlockTable(slab: Slab<HandleBlock, MAX_HANDLE_BLOCKS>(
     inline: [HandleBlock(owner: 0,
                          entries: [HandleEntry(obj_type: ObjType.Unbound,
                                                rights: 0, target: 0, gen: 0);
@@ -386,7 +420,7 @@ public(package) unsafe static var HANDLE_BLOCKS: Slab<HandleBlock, MAX_HANDLE_BL
     ext_slots: [0; MAX_SLAB_EXTENTS],
     ext_side: [0; MAX_SLAB_EXTENTS],
     ext_count: 0,
-    total: MAX_HANDLE_BLOCKS)
+    total: MAX_HANDLE_BLOCKS))
 
 // A live process's trap counters (`syscalls`, `interrupts`, `faults`) are not
 // fields of its body. They are rows of `kcore.stats`' published region, keyed
@@ -534,6 +568,12 @@ public(package) func process_records() unsafe sync borrows(sync, PROCESS_RECORDS
 /// `process_records()`'s terms.
 public(package) func processes() unsafe sync borrows(sync, PROCESSES) -> &var ProcessBodyTable {
     lend PROCESSES
+}
+
+/// The handle-block table, lent whole: the one function that names
+/// `HANDLE_BLOCKS`, on `process_records()`'s terms.
+public(package) func handle_blocks() unsafe sync borrows(sync, HANDLE_BLOCKS) -> &var HandleBlockTable {
+    lend HANDLE_BLOCKS
 }
 
 /// The body process `p` runs in.

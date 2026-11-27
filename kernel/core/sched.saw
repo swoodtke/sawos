@@ -34,6 +34,7 @@ import kcore.limits.{
     NO_THREAD,
     ROOT_PROCESS,
     BodyIndex,
+    HandleIndex,
     ProcessIndex,
     ThreadIndex,
 }
@@ -729,7 +730,7 @@ public(package) func exit_thread(slot: ThreadIndex, code: UInt, handle: UInt) un
 
     // The process is read once, here: the slot may be freed before the switch.
     let p = threads().at(slot).process
-    unbind_handle(p, handle_word_index(handle))
+    unbind_handle(ProcessIndex(p), handle_word_index(handle))
     let _ = drop_reference(ObjType.Thread, slot)
 
     // The last thread out ends the process, carrying its own exit code (the
@@ -774,7 +775,7 @@ func invalidate_thread(t: ThreadIndex, p: Int) unsafe {
         threads().at(waiter).state = ThreadState.Runnable
         ready_push(waiter)
     }
-    quota_credit(p, QuotaKind.Thread)
+    quota_credit(ProcessIndex(p), QuotaKind.Thread)
     borrow var thread = threads().at(t) {
         let refs = thread.refs
         thread = ThreadSlot(state: ThreadState.Invalid, level: 0,
@@ -815,7 +816,7 @@ func invalidate_thread(t: ThreadIndex, p: Int) unsafe {
 /// frees it.
 func invalidate_waiter(w: Int, p: Int, is_caller: Bool,
                        counts: &var TeardownCounts) unsafe {
-    quota_credit(p, QuotaKind.Waiter)
+    quota_credit(ProcessIndex(p), QuotaKind.Waiter)
     WAITERS[w].state = WaiterState.Invalid
     var cur = WAITERS[w].attached
     WAITERS[w].attached = 0
@@ -852,7 +853,7 @@ func invalidate_waiter(w: Int, p: Int, is_caller: Bool,
 /// thread does, and for the same reason.
 func invalidate_timer(t: Int, p: Int) unsafe {
     TIMERS[t].disarm()
-    quota_credit(p, QuotaKind.Timer)
+    quota_credit(ProcessIndex(p), QuotaKind.Timer)
     TIMERS[t].state = TimerState.Invalid
     notify_ready(WaitableKind.Timer, t)
 }
@@ -1144,7 +1145,7 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // abandoned-by-client and answers `Err(PeerClosed)`.
     // `release_pending_calls` carries the two-pass argument for why its own
     // unrefs cannot find a thread of this process either.
-    release_pending_calls(p)
+    release_pending_calls(ProcessIndex(p))
 
     // Then the dying process's threads come off every list a thread parks on,
     // so no wake can find one of them:
@@ -1331,13 +1332,13 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // body's, and is bounded by the longest table. Nothing attaches a block to
     // a dying process, so the length read here holds for the walk.
     let len = if body != NO_BODY { table_len(body) } else { 0 }
-    var h: Int = 0
+    var h = HandleIndex(0)
     while h < len {
         let entry = entry_at(body, h)
         match entry.obj_type {
             case Unbound -> {},
             case _ -> {
-                unbind_handle(p, h)
+                unbind_handle(ProcessIndex(p), h)
                 counts.closed = counts.closed + 1
                 match entry.obj_type {
                     case Interrupt -> {
@@ -1349,7 +1350,7 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
                              &var counts)
             },
         }
-        h = h + 1
+        h = HandleIndex(h + 1)
     }
 
     // ---- Step 3: disown what survives (spec §2.10). ----
@@ -1366,7 +1367,7 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // references and can free a region, so that free finds the region already
     // disowned.
     disown_bound(p)
-    disown_shared(p)
+    disown_shared(ProcessIndex(p))
 
     // ---- Step 4: the body's own parts, and the ledger. ----
     //
@@ -1391,7 +1392,7 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
         // a count and a cursor. It must be reset because the body is reused,
         // and the next process in it would otherwise drain handles that are
         // not its own.
-        clear_boot_handles(p)
+        clear_boot_handles(ProcessIndex(p))
     }
 
     // The quota ledger dies with the process. The charge of an object a peer
@@ -1403,7 +1404,7 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // next occupant of the record does not inherit an allowance. A mapping row
     // in another process's domain is credited to that target when its row goes
     // (its own `Unmap` or teardown).
-    quota_clear(p)
+    quota_clear(ProcessIndex(p))
 
     // The body goes back for the next create, and the record stops naming it
     // (spec §2.10's disown of the record's own link). A create takes a reused
@@ -1414,7 +1415,7 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
     // the handle blocks too, which go back to their slab beside the body: a
     // block's next holder takes its entries as empty in the same way.
     if body != NO_BODY {
-        var e: Int = 0
+        var e = HandleIndex(0)
         while e < len {
             match entry_at(body, e).obj_type {
                 case Unbound -> {},
@@ -1423,9 +1424,9 @@ func teardown_process(p: Int, kind: ProcessStatusKind, code: UInt,
                                  e as UInt)
                 },
             }
-            e = e + 1
+            e = HandleIndex(e + 1)
         }
-        free_handle_blocks(p)
+        free_handle_blocks(ProcessIndex(p))
         processes().at(body).live = false
         unlink_body(ProcessIndex(p))
     }

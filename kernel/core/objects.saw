@@ -88,7 +88,9 @@ import kcore.limits.{
     NO_PIPE,
     NO_PROCESS,
     PIPE_INFLIGHT,
+    BlockIndex,
     BodyIndex,
+    HandleIndex,
     ProcessIndex,
 }
 import kcore.diag.{fatal_kernel}
@@ -99,8 +101,8 @@ import kcore.slab.{Slab}
 // so these functions can reach them.
 import kcore.pslot.{
     BootHandleSlot,
-    HANDLE_BLOCKS,
     HandleEntry,
+    handle_blocks,
     processes,
     process_records,
     body_of,
@@ -424,12 +426,12 @@ func unbound_entry() -> HandleEntry {
 /// `public(package)` for the release op, which has a word and a resolved entry
 /// and needs the index to unbind. It uses the same function as `lookup_handle`,
 /// so the two can never disagree about which slot a word names.
-public(package) func handle_word_index(word: UInt) unsafe -> Int {
+public(package) func handle_word_index(word: UInt) -> HandleIndex {
     let byte = word & HANDLE_INDEX_MASK
     if byte == 0 {
-        return LONGEST_TABLE
+        return HandleIndex(LONGEST_TABLE)
     }
-    (byte as Int) - 1
+    HandleIndex((byte as Int) - 1)
 }
 
 /// The generation a handle word claims: everything above its index field.
@@ -445,7 +447,7 @@ public(package) func handle_word_index(word: UInt) unsafe -> Int {
 /// `HANDLE_GENERATION_MODULUS`, so a word claiming a wider generation equals no
 /// entry and names nothing. The top half of a 64-bit word is thereby enforced
 /// to be zero.
-func handle_word_generation(word: UInt) unsafe -> UInt {
+func handle_word_generation(word: UInt) -> UInt {
     word >> HANDLE_INDEX_BITS
 }
 
@@ -454,7 +456,7 @@ func handle_word_generation(word: UInt) unsafe -> UInt {
 /// `gen == 0` yields the bare 1-based index, so a slot's first-life word is the
 /// plain index. Spec §12's boot order (System, Process, Thread are words 1, 2,
 /// 3) and hand-assembled payloads depend on that.
-func handle_word(index: Int, gen: UInt32) unsafe -> UInt {
+func handle_word(index: HandleIndex, gen: UInt32) -> UInt {
     ((gen as UInt) << HANDLE_INDEX_BITS) | ((index as UInt) + 1)
 }
 
@@ -472,9 +474,9 @@ func handle_word(index: Int, gen: UInt32) unsafe -> UInt {
 /// An index below `MAX_HANDLES` is read from the body. One at or past it is
 /// read from the handle block that holds it, and is past the table when the
 /// process holds no such block (`block_entry`).
-public(package) func lookup_handle(p: Int, h: UInt) -> HandleEntry {
+public(package) func lookup_handle(p: ProcessIndex, h: UInt) -> HandleEntry {
     let index = handle_word_index(h)
-    let b = body_of(ProcessIndex(p))
+    let b = body_of(p)
     let entry = if index < MAX_HANDLES {
         processes().at(b).handles[index]
     } else {
@@ -506,12 +508,12 @@ public(package) func lookup_handle(p: Int, h: UInt) -> HandleEntry {
 /// `unsafe` though it names nothing unsafe: the entry takes no reference, so
 /// the caller owes the one it stands for, or the entry's release would drop a
 /// count nobody holds and free the object early.
-public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: Int) unsafe -> UInt {
+public(package) func mint_handle(p: ProcessIndex, kind: ObjType, rights: UInt32, target: Int) unsafe -> UInt {
     if not quota_room(p, QuotaKind.Handle) {
         return NO_HANDLE
     }
-    let b = body_of(ProcessIndex(p))
-    var h: Int = 0
+    let b = body_of(p)
+    var h = HandleIndex(0)
     borrow var body = processes().at(b) {
         while h < MAX_HANDLES {
             let entry = body.handles[h]
@@ -526,7 +528,7 @@ public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: 
                 },
                 case _ -> {},
             }
-            h = h + 1
+            h = HandleIndex(h + 1)
         }
     }
     // The blocks continue the body's entries in the order they were attached,
@@ -543,7 +545,7 @@ public(package) func mint_handle(p: Int, kind: ObjType, rights: UInt32, target: 
             },
             case _ -> {},
         }
-        h = h + 1
+        h = HandleIndex(h + 1)
     }
     NO_HANDLE
 }
@@ -592,9 +594,9 @@ public(package) func handle_kind(kind: ObjType) unsafe -> HandleKind {
 /// use `mint_handle` directly. Applying the intersection anywhere else by hand
 /// is the mistake this helper exists to prevent. `unsafe` on `mint_handle`'s
 /// terms.
-public(package) func mint_capped(p: Int, kind: ObjType, rights: UInt32,
+public(package) func mint_capped(p: ProcessIndex, kind: ObjType, rights: UInt32,
                                  target: Int) unsafe -> UInt {
-    let cap = processes().at(body_of(ProcessIndex(p))).ceilings[handle_kind(kind) as Int]
+    let cap = processes().at(body_of(p)).ceilings[handle_kind(kind) as Int]
     mint_handle(p, kind, rights & cap, target)
 }
 
@@ -611,20 +613,20 @@ public(package) func mint_capped(p: Int, kind: ObjType, rights: UInt32,
 /// on every path that does not use it, and the caller is inside a single
 /// syscall with interrupts masked, so nothing can take a slot between the count
 /// and the mints.
-public(package) func table_room(p: Int, n: Int) unsafe -> Bool {
+public(package) func table_room(p: ProcessIndex, n: Int) -> Bool {
     if not quota_room_for(p, QuotaKind.Handle, n) {
         return false
     }
-    let b = body_of(ProcessIndex(p))
+    let b = body_of(p)
     let len = table_len(b)
     var free: Int = 0
-    var h: Int = 0
+    var h = HandleIndex(0)
     while h < len {
         match entry_at(b, h).obj_type {
             case Unbound -> { free = free + 1 },
             case _ -> {},
         }
-        h = h + 1
+        h = HandleIndex(h + 1)
     }
     free >= n
 }
@@ -646,8 +648,8 @@ public(package) func table_room(p: Int, n: Int) unsafe -> Bool {
 /// The index must be bound. Unbinding an unbound slot would bump the
 /// generation and credit the handle quota for an entry that no longer exists,
 /// so it is a kernel bug and stops the machine.
-public(package) func unbind_handle(p: Int, index: Int) unsafe {
-    let b = body_of(ProcessIndex(p))
+public(package) func unbind_handle(p: ProcessIndex, index: HandleIndex) unsafe {
+    let b = body_of(p)
     let entry = entry_at(b, index)
     match entry.obj_type {
         case Unbound -> {
@@ -683,67 +685,86 @@ public(package) func unbind_handle(p: Int, index: Int) unsafe {
 
 /// How many entries the table in body `b` holds, and as many boot-set records:
 /// the body's and its blocks'.
-public(package) func table_len(b: Int) -> Int {
-    MAX_HANDLES + processes().at(BodyIndex(b)).block_count * HANDLE_BLOCK
+public(package) func table_len(b: BodyIndex) -> Int {
+    MAX_HANDLES + processes().at(b).block_count * HANDLE_BLOCK
 }
 
 /// Which block slot holds table index `i` of body `b`, and which entry of it,
 /// for an `i` at or past `MAX_HANDLES` and below `table_len(b)`.
 ///
-/// `unsafe` though it names nothing unsafe: the caller owes the range of `i`.
-func block_place(b: Int, i: Int) unsafe -> (Int, Int) {
+/// An index past the table's blocks names a link of zero, and the table's
+/// `at` stops the machine on slot -1, so any `i` is sound: one out of range
+/// stops the machine and touches nothing.
+func block_place(b: BodyIndex, i: HandleIndex) -> (BlockIndex, Int) {
     let rest = i - MAX_HANDLES
-    let link = processes().at(BodyIndex(b)).blocks[rest / HANDLE_BLOCK]
-    (link - 1, rest % HANDLE_BLOCK)
+    let link = processes().at(b).blocks[rest / HANDLE_BLOCK]
+    (BlockIndex(link - 1), rest % HANDLE_BLOCK)
 }
 
 /// The entry at index `i` of body `b`'s table, `i` at or past `MAX_HANDLES`,
 /// or the Unbound answer when the table is not that long: the lookup's half
 /// past the body.
-func block_entry(b: Int, i: Int) unsafe -> HandleEntry {
+func block_entry(b: BodyIndex, i: HandleIndex) -> HandleEntry {
     if i >= table_len(b) {
         return unbound_entry()
     }
     let (blk, j) = block_place(b, i)
-    HANDLE_BLOCKS[blk].entries[j]
+    borrow var block = handle_blocks().at(blk) {
+        block.entries[j]
+    }
 }
 
 /// The entry at index `i` of body `b`'s table.
-public(package) func entry_at(b: Int, i: Int) unsafe -> HandleEntry {
+public(package) func entry_at(b: BodyIndex, i: HandleIndex) -> HandleEntry {
     if i < MAX_HANDLES {
-        return processes().at(BodyIndex(b)).handles[i]
+        return processes().at(b).handles[i]
     }
     let (blk, j) = block_place(b, i)
-    HANDLE_BLOCKS[blk].entries[j]
+    borrow var block = handle_blocks().at(blk) {
+        block.entries[j]
+    }
 }
 
 /// Write the entry at index `i` of body `b`'s table.
-func set_entry(b: Int, i: Int, entry: HandleEntry) unsafe {
+///
+/// `unsafe` because the entry becomes whatever it is written as: an entry
+/// naming an object and rights no mint granted is a grant, and one written
+/// over a bound entry loses its reference.
+func set_entry(b: BodyIndex, i: HandleIndex, entry: HandleEntry) unsafe {
     if i < MAX_HANDLES {
-        processes().at(BodyIndex(b)).handles[i] = entry
+        processes().at(b).handles[i] = entry
         return
     }
     let (blk, j) = block_place(b, i)
-    HANDLE_BLOCKS[blk].entries[j] = entry
+    borrow var block = handle_blocks().at(blk) {
+        block.entries[j] = entry
+    }
 }
 
 /// Boot-set record `i` of body `b`.
-public(package) func boot_record_at(b: Int, i: Int) unsafe -> BootHandleSlot {
+public(package) func boot_record_at(b: BodyIndex, i: HandleIndex) -> BootHandleSlot {
     if i < MAX_HANDLES {
-        return processes().at(BodyIndex(b)).boot_handles[i]
+        return processes().at(b).boot_handles[i]
     }
     let (blk, j) = block_place(b, i)
-    HANDLE_BLOCKS[blk].boot[j]
+    borrow var block = handle_blocks().at(blk) {
+        block.boot[j]
+    }
 }
 
 /// Write boot-set record `i` of body `b`.
-func set_boot_record(b: Int, i: Int, record: BootHandleSlot) unsafe {
+///
+/// `unsafe` because a record names a handle word the child will collect, so a
+/// forged one is a grant.
+func set_boot_record(b: BodyIndex, i: HandleIndex, record: BootHandleSlot) unsafe {
     if i < MAX_HANDLES {
-        processes().at(BodyIndex(b)).boot_handles[i] = record
+        processes().at(b).boot_handles[i] = record
         return
     }
     let (blk, j) = block_place(b, i)
-    HANDLE_BLOCKS[blk].boot[j] = record
+    borrow var block = handle_blocks().at(blk) {
+        block.boot[j] = record
+    }
 }
 
 /// The handle blocks a table of `limit` entries needs past the body's: none
@@ -769,37 +790,37 @@ public(package) func blocks_for(limit: Int) -> Int {
 ///
 /// No preemption point: both walks are bounded by the slab's capacity over an
 /// O(1) body, as every slab scan is (`kcore.limits`).
-public(package) func attach_handle_blocks(p: Int, want: Int) unsafe -> Bool {
-    let b = body_of(ProcessIndex(p))
+public(package) func attach_handle_blocks(p: ProcessIndex, want: Int) -> Bool {
+    let b = body_of(p)
     let held = processes().at(b).block_count
     if want <= held {
         return true
     }
-    let cap = HANDLE_BLOCKS.capacity()
+    let cap = handle_blocks().capacity()
     var free: Int = 0
-    var s: Int = 0
+    var s = BlockIndex(0)
     while s < cap && free < want - held {
-        if HANDLE_BLOCKS[s].owner == 0 {
+        if handle_blocks().at(s).owner == 0 {
             free = free + 1
         }
-        s = s + 1
+        s = BlockIndex(s + 1)
     }
     if free < want - held {
         return false
     }
     var n = held
-    s = 0
-    borrow var body = processes().at(b) {
-        while n < want {
-            if HANDLE_BLOCKS[s].owner == 0 {
-                HANDLE_BLOCKS[s].owner = b + 1
+    s = BlockIndex(0)
+    while n < want {
+        borrow var body = processes().at(b), var blk = handle_blocks().at(s) {
+            if blk.owner == 0 {
+                blk.owner = b + 1
                 body.blocks[n] = s + 1
                 n = n + 1
             }
-            s = s + 1
         }
-        body.block_count = want
+        s = BlockIndex(s + 1)
     }
+    processes().at(b).block_count = want
     true
 }
 
@@ -808,14 +829,17 @@ public(package) func attach_handle_blocks(p: Int, want: Int) unsafe -> Bool {
 ///
 /// The entries keep their generations, as a reused body's do, so a word from
 /// this process's life names nothing in the next holder's.
-public(package) func free_handle_blocks(p: Int) unsafe {
-    let b = body_of(ProcessIndex(p))
+///
+/// `unsafe` because a block freed while its entries are bound loses the
+/// references they hold and hands the next holder a live binding.
+public(package) func free_handle_blocks(p: ProcessIndex) unsafe {
+    let b = body_of(p)
     borrow var body = processes().at(b) {
         let count = body.block_count
         var k: Int = 0
         while k < count {
-            let blk = body.blocks[k] - 1
-            HANDLE_BLOCKS[blk].owner = 0
+            let blk = BlockIndex(body.blocks[k] - 1)
+            handle_blocks().at(blk).owner = 0
             body.blocks[k] = 0
             k = k + 1
         }
@@ -860,18 +884,18 @@ func quota_column(kind: QuotaKind) -> Int {
 }
 
 /// What `p` may spend of `kind`: its limit, `QUOTA_UNLIMITED` for no cap.
-public(package) func quota_limit_of(p: Int, kind: QuotaKind) -> UInt16 {
-    process_records().at(ProcessIndex(p)).quota_limit[quota_column(kind)]
+public(package) func quota_limit_of(p: ProcessIndex, kind: QuotaKind) -> UInt16 {
+    process_records().at(p).quota_limit[quota_column(kind)]
 }
 
 /// What `p` has spent of `kind`.
-public(package) func quota_used_of(p: Int, kind: QuotaKind) -> UInt16 {
-    process_records().at(ProcessIndex(p)).quota_used[quota_column(kind)]
+public(package) func quota_used_of(p: ProcessIndex, kind: QuotaKind) -> UInt16 {
+    process_records().at(p).quota_used[quota_column(kind)]
 }
 
 /// `p`'s row for `kind` as `ProcessOp.QuotaGet` answers it: the limit in the
 /// low 16 bits and the use above it, at `QUOTA_WORD_USE_SHIFT`.
-public(package) func quota_word(p: Int, kind: QuotaKind) unsafe -> UInt {
+public(package) func quota_word(p: ProcessIndex, kind: QuotaKind) unsafe -> UInt {
     (((quota_used_of(p, kind) as UInt) << QUOTA_WORD_USE_SHIFT)
      | (quota_limit_of(p, kind) as UInt))
 }
@@ -880,9 +904,9 @@ public(package) func quota_word(p: Int, kind: QuotaKind) unsafe -> UInt {
 ///
 /// Asked before the slab is, at every allocation site, so a caller can tell "my
 /// budget" from "the machine's edge".
-public(package) func quota_room(p: Int, kind: QuotaKind) -> Bool {
+public(package) func quota_room(p: ProcessIndex, kind: QuotaKind) -> Bool {
     let at = quota_column(kind)
-    borrow var record = process_records().at(ProcessIndex(p)) {
+    borrow var record = process_records().at(p) {
         let limit = record.quota_limit[at]
         if limit == QUOTA_UNLIMITED {
             return true
@@ -897,9 +921,9 @@ public(package) func quota_room(p: Int, kind: QuotaKind) -> Bool {
 /// atomically (the message stays staged, the level stays ready, the answer is
 /// the table-full status), so the question is asked about the whole batch
 /// before any of it happens. `n == 0` is legal and answers true.
-public(package) func quota_room_for(p: Int, kind: QuotaKind, n: Int) -> Bool {
+public(package) func quota_room_for(p: ProcessIndex, kind: QuotaKind, n: Int) -> Bool {
     let at = quota_column(kind)
-    borrow var record = process_records().at(ProcessIndex(p)) {
+    borrow var record = process_records().at(p) {
         let limit = record.quota_limit[at]
         if limit == QUOTA_UNLIMITED {
             return true
@@ -912,9 +936,9 @@ public(package) func quota_room_for(p: Int, kind: QuotaKind, n: Int) -> Bool {
 ///
 /// Call only once every refusal is behind you: a charge made before a slab
 /// refusal would leave a process paying for an object it never got.
-public(package) func quota_charge(p: Int, kind: QuotaKind) {
+public(package) func quota_charge(p: ProcessIndex, kind: QuotaKind) {
     let at = quota_column(kind)
-    borrow var record = process_records().at(ProcessIndex(p)) {
+    borrow var record = process_records().at(p) {
         let spent = record.quota_used[at]
         record.quota_used[at] = spent + 1
     }
@@ -926,9 +950,9 @@ public(package) func quota_charge(p: Int, kind: QuotaKind) {
 /// shared object still charged to a dying process before it clears the ledger
 /// (`credit_shared`), so no credit is owed to a cleared row. Giving back what
 /// nobody is charged for does nothing rather than underflow.
-public(package) func quota_credit(p: Int, kind: QuotaKind) {
+public(package) func quota_credit(p: ProcessIndex, kind: QuotaKind) {
     let at = quota_column(kind)
-    borrow var record = process_records().at(ProcessIndex(p)) {
+    borrow var record = process_records().at(p) {
         let spent = record.quota_used[at]
         if spent != 0 {
             record.quota_used[at] = spent - 1
@@ -951,7 +975,7 @@ public(package) func credit_shared(owner: Int, kind: QuotaKind) unsafe {
     if owner == NO_PROCESS {
         return
     }
-    quota_credit(owner, kind)
+    quota_credit(ProcessIndex(owner), kind)
 }
 
 /// Forget process `p`'s ledger. Called by the teardown.
@@ -960,9 +984,9 @@ public(package) func credit_shared(owner: Int, kind: QuotaKind) unsafe {
 /// charged for is written off and the books balance by construction. Both rows
 /// go, not only the used ones: a record is reclaimable and the next occupant
 /// must not inherit a stranger's allowance.
-public(package) func quota_clear(p: Int) {
+public(package) func quota_clear(p: ProcessIndex) {
     var i: Int = 0
-    borrow var record = process_records().at(ProcessIndex(p)) {
+    borrow var record = process_records().at(p) {
         while i < QUOTA_KINDS {
             record.quota_used[i] = 0
             record.quota_limit[i] = 0
@@ -973,9 +997,9 @@ public(package) func quota_clear(p: Int) {
 
 /// Write one row of `p`'s allowance: at its create (`install_quota_limits`)
 /// and through `ProcessOp.QuotaSet` before its start.
-public(package) func quota_set_limit(p: Int, kind: QuotaKind,
+public(package) func quota_set_limit(p: ProcessIndex, kind: QuotaKind,
                                      value: UInt16) {
-    process_records().at(ProcessIndex(p)).quota_limit[quota_column(kind)] = value
+    process_records().at(p).quota_limit[quota_column(kind)] = value
 }
 
 /// `kcore.limits`' compiled default for `kind`: what a child starts with on an
@@ -1062,11 +1086,13 @@ func child_quota_default(kind: QuotaKind) unsafe -> UInt16 {
 /// Call once per process life (at boot for root, at `process_create` for a
 /// child), always after the image's rows are recorded, because `free_rows` is
 /// read from the record.
-public(package) func install_quota_limits(p: Int, root: Bool, free_rows: Int) unsafe {
+public(package) func install_quota_limits(p: ProcessIndex, root: Bool, free_rows: Int) unsafe {
     var i: Int = 0
-    while i < QUOTA_KINDS {
-        process_records().at(ProcessIndex(p)).quota_used[i] = 0
-        i = i + 1
+    borrow var record = process_records().at(p) {
+        while i < QUOTA_KINDS {
+            record.quota_used[i] = 0
+            i = i + 1
+        }
     }
 
     if root {
@@ -1115,7 +1141,7 @@ public(package) func install_quota_limits(p: Int, root: Bool, free_rows: Int) un
 /// question: a caller with no handle room left met its budget, anyone else met
 /// the table. Every mint site already tests for `NO_HANDLE`; this turns that
 /// test into the right status without changing its shape.
-public(package) func mint_refusal(p: Int) unsafe -> SosStatus {
+public(package) func mint_refusal(p: ProcessIndex) unsafe -> SosStatus {
     if quota_room(p, QuotaKind.Handle) {
         return SosStatus.NoResource
     }
@@ -2466,8 +2492,8 @@ public(package) unsafe static var EXCHANGES: Slab<Exchange, PIPE_EXCHANGES> = Sl
 /// Called by each op that sends, with the process whose thread made the op (a
 /// parked call's caller, not whoever is current when it is staged). Neither
 /// field is a counted reference.
-public(package) func stamp_sender(x: Int, p: Int) unsafe {
-    EXCHANGES[x].sender_pid = process_records().at(ProcessIndex(p)).pid
+public(package) func stamp_sender(x: Int, p: ProcessIndex) unsafe {
+    EXCHANGES[x].sender_pid = process_records().at(p).pid
     EXCHANGES[x].sender_rec = p
 }
 
@@ -2829,8 +2855,8 @@ public(package) func exchange_settle(x: Int) unsafe -> StagedRefs {
 /// beside a mint into the same process's table and the handle table fills
 /// first; the test is here because a silently dropped record is a capability a
 /// child was given and can never collect.
-public(package) func boot_handle_room(p: Int) -> Bool {
-    let b = body_of(ProcessIndex(p))
+public(package) func boot_handle_room(p: ProcessIndex) -> Bool {
+    let b = body_of(p)
     let count = processes().at(b).boot_count
     count < table_len(b)
 }
@@ -2843,15 +2869,15 @@ public(package) func boot_handle_room(p: Int) -> Bool {
 /// It looks at the whole set and not only the undelivered part, because the tag
 /// is an identity for the process's whole boot set: a tag reused after the
 /// child drained the first one would still name two handles.
-public(package) func boot_tag_used(p: Int, tag: UInt) -> Bool {
-    let b = body_of(ProcessIndex(p))
+public(package) func boot_tag_used(p: ProcessIndex, tag: UInt) -> Bool {
+    let b = body_of(p)
     let n = processes().at(b).boot_count
-    var i: Int = 0
+    var i = HandleIndex(0)
     while i < n {
         if boot_record_at(b, i).tag == tag {
             return true
         }
-        i = i + 1
+        i = HandleIndex(i + 1)
     }
     false
 }
@@ -2867,10 +2893,10 @@ public(package) func boot_tag_used(p: Int, tag: UInt) -> Bool {
 /// A record already taken answers `NO_HANDLE` too, the same answer a tag nobody
 /// gave gets: both mean "there is no word here to deliver", and the caller
 /// turns either into the `BadArg` fault.
-public(package) func boot_handle_take(p: Int, tag: UInt) -> UInt {
-    let b = body_of(ProcessIndex(p))
+public(package) func boot_handle_take(p: ProcessIndex, tag: UInt) -> UInt {
+    let b = body_of(p)
     let n = processes().at(b).boot_count
-    var i: Int = 0
+    var i = HandleIndex(0)
     while i < n {
         // Read the record as one value: `BootHandleSlot` is trivially
         // copyable, so the test, the mark and the answer work on one loaded
@@ -2881,7 +2907,7 @@ public(package) func boot_handle_take(p: Int, tag: UInt) -> UInt {
             set_boot_record(b, i, rec)
             return rec.handle
         }
-        i = i + 1
+        i = HandleIndex(i + 1)
     }
     NO_HANDLE
 }
@@ -2892,10 +2918,11 @@ public(package) func boot_handle_take(p: Int, tag: UInt) -> UInt {
 ///
 /// `unsafe` though it names nothing unsafe: the caller owes the room it asked
 /// about.
-public(package) func queue_boot_handle(p: Int, tag: UInt, kind: BootHandleKind,
+public(package) func queue_boot_handle(p: ProcessIndex, tag: UInt,
+                                       kind: BootHandleKind,
                                        handle: UInt) unsafe {
-    let b = body_of(ProcessIndex(p))
-    let n = processes().at(b).boot_count
+    let b = body_of(p)
+    let n = HandleIndex(processes().at(b).boot_count)
     set_boot_record(b, n, BootHandleSlot(tag: tag, kind: kind, handle: handle,
                                          taken: false))
     processes().at(b).boot_count = n + 1
@@ -2908,14 +2935,14 @@ public(package) func queue_boot_handle(p: Int, tag: UInt, kind: BootHandleKind,
 /// drain steps over, as it steps over one it delivered itself. A drained
 /// iterator stays drained, and no record is handed out twice however it left
 /// the set.
-public(package) func boot_handle_cursor(p: Int) -> Int {
-    let b = body_of(ProcessIndex(p))
+public(package) func boot_handle_cursor(p: ProcessIndex) -> HandleIndex {
+    let b = body_of(p)
     let (n, next) = borrow var body = processes().at(b) {
         (body.boot_count, body.boot_next)
     }
-    var at = next
+    var at = HandleIndex(next)
     while at < n && boot_record_at(b, at).taken {
-        at = at + 1
+        at = HandleIndex(at + 1)
     }
     processes().at(b).boot_next = at
     at
@@ -2928,8 +2955,8 @@ public(package) func boot_handle_cursor(p: Int) -> Int {
 /// close-all, so nothing is released here and nothing is leaked. The count and
 /// the cursor must be reset because the body is reused, and its next process
 /// would otherwise inherit a stranger's boot set.
-public(package) func clear_boot_handles(p: Int) {
-    let b = body_of(ProcessIndex(p))
+public(package) func clear_boot_handles(p: ProcessIndex) {
+    let b = body_of(p)
     borrow var body = processes().at(b) {
         body.boot_count = 0
         body.boot_next = 0
